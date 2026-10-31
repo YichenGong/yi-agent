@@ -104,11 +104,23 @@ enum Subcommand {
         state_dir: PathBuf,
         card_id: String,
     },
+    /// 模型声明一张卡的状态。`card_id` 为 `None` 时取 `SUPERPOWERS_KANBAN_CARD`。
+    State {
+        state_dir: PathBuf,
+        card_id: Option<String>,
+        state: String,
+        detail: Option<String>,
+    },
     MergeRequest {
         state_dir: PathBuf,
         card_id: String,
     },
     MergeFinish {
+        state_dir: PathBuf,
+        card_id: String,
+    },
+    /// 退出合并队列。只在 `merge_queued` 上成立——已经开跑的合并不能退。
+    MergeCancel {
         state_dir: PathBuf,
         card_id: String,
     },
@@ -130,7 +142,7 @@ enum Subcommand {
 }
 
 const USAGE: &str =
-    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest> [...]
+    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|merge-cancel|done|state|archive|purge|list|on|off|workdir|manifest> [...]
   run            --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
   add            <spec> <plan> [--state-dir <d>]
   add-prequeued  <title> [--state-dir <d>]
@@ -138,7 +150,9 @@ const USAGE: &str =
   add-merge      <source> [--base <ref>] [--state-dir <d>]
   merge-request <card-id> [--state-dir <d>]
   merge-finish  <card-id> [--state-dir <d>]
+  merge-cancel  <card-id> [--state-dir <d>]
   done          <card-id> [--state-dir <d>]
+  state         <card-id> <state> [--detail <t>] | --self <state> [--detail <t>] [--state-dir <d>]
   archive       <card-id>|--all-terminal [--state-dir <d>]
   purge         <card-id>|--all-archived [--state-dir <d>]
   list          [--all] [--state-dir <d>]
@@ -265,7 +279,51 @@ where
             }
             Ok(Subcommand::Done { state_dir, card_id })
         }
-        Some(verb @ ("merge-request" | "merge-finish")) => {
+        Some("state") => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut positional: Vec<String> = Vec::new();
+            let mut detail: Option<String> = None;
+            let mut self_card = false;
+            let mut tokens = rest.into_iter();
+            while let Some(token) = tokens.next() {
+                match token.as_str() {
+                    "--self" => self_card = true,
+                    "--detail" => {
+                        detail = Some(
+                            tokens
+                                .next()
+                                .ok_or_else(|| "--detail needs a value".to_string())?,
+                        );
+                    }
+                    other if other.starts_with("--") => {
+                        return Err(format!("unexpected flag: {other}"));
+                    }
+                    other => positional.push(other.to_string()),
+                }
+            }
+            // `--self` 只带状态名；否则要「卡号 + 状态名」。
+            let (card_id, state) = match (self_card, positional.as_slice()) {
+                (true, [state]) => (None, state.clone()),
+                (true, _) => {
+                    return Err(format!(
+                        "state --self takes exactly one state name\n{USAGE}"
+                    ));
+                }
+                (false, [card, state]) => (Some(card.clone()), state.clone()),
+                (false, _) => {
+                    return Err(format!(
+                        "state needs a card id and a state (or --self)\n{USAGE}"
+                    ));
+                }
+            };
+            Ok(Subcommand::State {
+                state_dir,
+                card_id,
+                state,
+                detail,
+            })
+        }
+        Some(verb @ ("merge-request" | "merge-finish" | "merge-cancel")) => {
             let (state_dir, rest) = parse_state_dir(args)?;
             let mut rest = rest.into_iter();
             let card_id = rest
@@ -274,10 +332,10 @@ where
             if let Some(extra) = rest.next() {
                 return Err(format!("{verb} takes one card id, got an extra: {extra}"));
             }
-            Ok(if verb == "merge-request" {
-                Subcommand::MergeRequest { state_dir, card_id }
-            } else {
-                Subcommand::MergeFinish { state_dir, card_id }
+            Ok(match verb {
+                "merge-request" => Subcommand::MergeRequest { state_dir, card_id },
+                "merge-finish" => Subcommand::MergeFinish { state_dir, card_id },
+                _ => Subcommand::MergeCancel { state_dir, card_id },
             })
         }
         Some("archive") => {
@@ -625,6 +683,12 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
         .copied()
         .collect();
     others.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    // `stale` 只从观测旁路派生：卡写着 running 但会话已经没了。它是**展示**，
+    // 不是状态——`state` 仍然是模型说了算（spec §3.3）。
+    let observations = superpowers_kanban_runner::observation::load(state_dir);
+    // 谁在合并也只从 holder 派生：合并是一次会话回合，卡在那期间仍是 running，
+    // 光看状态分不出「在写代码」和「在合并」。
+    let holder = superpowers_kanban_runner::merge_lock::read_holder(state_dir);
     for card in others {
         let where_ = card
             .workdir
@@ -632,9 +696,23 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
             .map(|path| format!(" @ {}", path.display()))
             .unwrap_or_default();
         let archived = if card.archived { " [archived]" } else { "" };
+        let stale = if superpowers_kanban_runner::observation::stale(card, &observations).is_some()
+        {
+            " [stale]"
+        } else {
+            ""
+        };
+        let merging = if holder
+            .as_ref()
+            .is_some_and(|holder| holder.card_id == card.id.0)
+        {
+            " [merging]"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "{} {:?}{}{}",
-            card.id.0, card.state, where_, archived
+            "{} {:?}{}{}{}{}",
+            card.id.0, card.state, where_, archived, stale, merging
         ));
     }
     // 待消费投递。
@@ -655,6 +733,31 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
         }
     }
     Ok(lines.join("\n"))
+}
+
+/// `state`：模型声明一张卡的状态。
+///
+/// `--self` 时卡号取自 `SUPERPOWERS_KANBAN_CARD`（宿主在驱动会话的 shell 里注入）。
+fn command_state(
+    state_dir: &std::path::Path,
+    card_id: Option<&str>,
+    state: &str,
+    detail: Option<&str>,
+) -> Result<String, String> {
+    let card_id = match card_id {
+        Some(id) => id.to_string(),
+        None => std::env::var("SUPERPOWERS_KANBAN_CARD").map_err(|_| {
+            "state --self needs SUPERPOWERS_KANBAN_CARD: this shell is not a kanban card session"
+                .to_string()
+        })?,
+    };
+    superpowers_kanban_runner::dispatch::dispatch(
+        state_dir,
+        "card.state",
+        &serde_json::json!({ "card_id": card_id, "state": state, "detail": detail }),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(format!("{card_id} -> {state}"))
 }
 
 /// `merge-request`：申请一次合并名额，把结果如实打印。
@@ -687,7 +790,32 @@ fn command_merge_request(state_dir: &std::path::Path, card_id: &str) -> Result<S
             ))
         }
         Some("busy") => {
-            Ok("busy: another merge is running in this project; wait for it to finish".to_string())
+            let holder = value
+                .get("card_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("card {id} is merging"))
+                .unwrap_or_else(|| "another merge is running in this project".to_string());
+            Ok(format!("busy: {holder}\nwait for it to finish"))
+        }
+        // 入队成功（含重复调用的幂等返回）：队列由 daemon 每拍推进，所以这里
+        // 只报排位，不报「合并已开始」。`position` 是前面还有几张，0 = 队首。
+        Some("queued") => {
+            let position = value
+                .get("position")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if position == 0 {
+                Ok(format!(
+                    "queued: {card_id} is at the head of the merge queue; \
+                     the daemon starts it on the next tick"
+                ))
+            } else {
+                Ok(format!(
+                    "queued: {card_id} has {position} merge(s) ahead of it; \
+                     the daemon starts it when it reaches the head"
+                ))
+            }
         }
         Some("denied") => Err(format!(
             "denied: {}",
@@ -700,7 +828,11 @@ fn command_merge_request(state_dir: &std::path::Path, card_id: &str) -> Result<S
     }
 }
 
-/// `merge-finish`：让插件以 git 复核收尾。
+/// `merge-finish`：释放合并名额。
+///
+/// 它**不**判断合并成没成——那要你自己看 git（例如
+/// `git merge-base --is-ancestor <source> <base>`），然后
+/// `superpowers-kanban state <card> done`。
 fn command_merge_finish(state_dir: &std::path::Path, card_id: &str) -> Result<String, String> {
     let value = superpowers_kanban_runner::dispatch::dispatch(
         state_dir,
@@ -709,8 +841,31 @@ fn command_merge_finish(state_dir: &std::path::Path, card_id: &str) -> Result<St
     )
     .map_err(|error| error.to_string())?;
     match value.get("status").and_then(serde_json::Value::as_str) {
-        Some(status @ ("done" | "needs_you" | "cleared")) => Ok(status.to_string()),
+        Some("released") => Ok(format!(
+            "released\nmerge gate is free again. If the merge actually landed, run \
+             `superpowers-kanban state {card_id} done`"
+        )),
+        Some("cleared") => Ok("cleared\nthe gate was not held by this process".to_string()),
         other => Err(format!("unexpected merge_finish result: {other:?}")),
+    }
+}
+
+/// `merge-cancel`：退出合并队列。
+///
+/// 只对 `merge_queued` 成立。已经排到队、开跑的那张不退——它已经是一轮在跑的
+/// 会话，改回去会和那次合并打架。
+fn command_merge_cancel(state_dir: &std::path::Path, card_id: &str) -> Result<String, String> {
+    let value = superpowers_kanban_runner::dispatch::dispatch(
+        state_dir,
+        "merge_cancel",
+        &serde_json::json!({ "card_id": card_id }),
+    )
+    .map_err(|error| error.to_string())?;
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("cancelled") => Ok(format!(
+            "cancelled\n{card_id} is back to awaiting_merge and out of the merge queue"
+        )),
+        other => Err(format!("unexpected merge_cancel result: {other:?}")),
     }
 }
 
@@ -867,11 +1022,20 @@ fn main() {
             let project_root = superpowers_kanban_core::layout::project_root(&state_dir);
             command_done(&state_dir, &card_id, &project_root)
         }
+        Subcommand::State {
+            state_dir,
+            card_id,
+            state,
+            detail,
+        } => command_state(&state_dir, card_id.as_deref(), &state, detail.as_deref()),
         Subcommand::MergeRequest { state_dir, card_id } => {
             command_merge_request(&state_dir, &card_id)
         }
         Subcommand::MergeFinish { state_dir, card_id } => {
             command_merge_finish(&state_dir, &card_id)
+        }
+        Subcommand::MergeCancel { state_dir, card_id } => {
+            command_merge_cancel(&state_dir, &card_id)
         }
         Subcommand::Archive {
             state_dir,
@@ -1021,9 +1185,11 @@ fn run_daemon(args: Args) {
         None,
     ));
 
-    // 启动迁移：回收重启后已死的卡片（`Running` 无 thread id → `NeedsYou`；
-    // 崩溃留下的 `Launching` 僵尸 → `Failed`），再为仍在 `Running` 的卡片补领
-    // 全局名额——重启后内存 lease 为空，不补领会让全局池少算这些在跑卡片。
+    // 启动迁移：只把「写着 running 但根本没有 thread id」的历史卡片收成
+    // `needs_you`（那不是「会话死了」，是旧数据从来没有会话）。有 thread id 的
+    // 卡片**一律不动**——宿主重启不等于会话死了，那正是过去误报的主因。
+    // 随后给还在跑的卡补领全局名额：重启后内存 lease 为空，不补领会让池子
+    // 少算这些真的还在烧 token 的会话。
     service.migrate_legacy_running();
     service.adopt_running_leases(calendar.limit_at(chrono::Local::now()));
 
@@ -1060,18 +1226,9 @@ fn run_daemon(args: Args) {
             }
         }
 
-        // 收敛：分支已并入 base 的 awaiting_merge 卡落 done；分支缺失则提示一次。
-        // 放在归档之前——刚 done 的卡 terminal_at 才写下，不会被同拍归档。
-        for report in service.reconcile_merged() {
-            eprintln!(
-                "superpowers-kanban: {}",
-                superpowers_kanban_runner::reconcile::report_line(&report)
-            );
-        }
-
-        // 合并轮不再由 runner 认领跑 git：它已是**会话里的一回合**——插件经
-        // `driver_step` 派发、模型动手、插件用 git 复核出判词（见 service 的
-        // `driver_step` 与 `merge_finish`）。这里只留收敛与归档。
+        // 合并轮不再由 runner 认领跑 git：它是**会话里的一回合**——插件经
+        // `driver_step` 起会话，模型自己取名额、合并、判成败并写状态。插件不
+        // 碰 git、不判结果。这里只留归档这类纯簿记。
 
         // 归档：真终止态过宽限期自动隐藏；awaiting_merge/needs_you 永不自动。
         let swept = service.archive_due(chrono::Local::now());
@@ -1090,9 +1247,9 @@ fn run_daemon(args: Args) {
 mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
-        command_list, command_manifest, command_merge_finish, command_merge_request,
-        command_prequeued, command_promote, command_purge, command_set_switch, effective_interval,
-        manifest_json, parse_subcommand, sweep_one_socket, sweep_stale_sockets,
+        command_list, command_manifest, command_merge_request, command_prequeued, command_promote,
+        command_purge, command_set_switch, effective_interval, manifest_json, parse_subcommand,
+        sweep_one_socket, sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1169,6 +1326,20 @@ mod tests {
         assert!(matches!(
             parse(&["done", "card-1", "--state-dir", "/s"]),
             Ok(Subcommand::Done { .. })
+        ));
+        assert!(matches!(
+            parse(&["state", "card-1", "needs_you"]),
+            Ok(Subcommand::State {
+                card_id: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["state", "card-1", "needs_you", "--detail", "blocked"]),
+            Ok(Subcommand::State {
+                detail: Some(_),
+                ..
+            })
         ));
         assert!(matches!(
             parse(&["archive", "card-1"]),
@@ -1392,6 +1563,37 @@ mod tests {
         drop(dir);
     }
 
+    /// `list` 的 `[stale]` 只来自观测旁路：会话没了要显眼，但**不改**卡片状态。
+    #[test]
+    fn list_marks_a_running_card_stale_without_touching_its_state() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        let id = CardId::new("card-1");
+        let mut board = Board::new();
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board.transition(&id, CardState::Running).unwrap();
+        board.set_thread_id(&id, "thread-1".into()).unwrap();
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+
+        // 还没观测过 ≠ 已经死了：不报警。
+        assert!(!command_list(state_dir, false).unwrap().contains("[stale]"));
+
+        let mut observations = superpowers_kanban_runner::observation::ObservationFile::default();
+        observations.observe("thread-1", false, chrono::Local::now());
+        superpowers_kanban_runner::observation::save(state_dir, &observations).unwrap();
+        let listing = command_list(state_dir, false).unwrap();
+        assert!(listing.contains("[stale]"), "{listing}");
+        assert_eq!(card_state(state_dir, "card-1"), "running", "观测不是迁移");
+    }
+
     #[test]
     fn add_delivers_into_the_inbox_and_list_shows_it_as_pending() {
         let dir = tempfile::tempdir().unwrap();
@@ -1451,6 +1653,11 @@ mod tests {
         assert!(parse(&["merge-request"]).is_err(), "缺 card id");
         assert!(parse(&["merge-finish"]).is_err(), "缺 card id");
         assert!(parse(&["merge-request", "a", "b"]).is_err(), "多参数");
+        assert!(matches!(
+            parse(&["merge-cancel", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::MergeCancel { .. })
+        ));
+        assert!(parse(&["merge-cancel"]).is_err(), "缺 card id");
     }
 
     #[test]
@@ -1458,6 +1665,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = command_merge_request(dir.path(), "nope").unwrap_err();
         assert!(err.contains("denied"), "{err}");
+    }
+
+    /// `merge-request` 现在只**入队**，CLI 必须把「排上了」如实打出来。
+    ///
+    /// 回归锁：早期实现只认 `granted`，入队成功会走进 `unexpected ...` 分支并以
+    /// 非零退出——用户以为申请失败，其实卡已经在队里了。
+    #[test]
+    fn merge_request_prints_the_queue_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        let id = superpowers_kanban_core::card::CardId::new("card-1");
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&id, superpowers_kanban_core::card::CardState::AwaitingMerge)
+            .unwrap();
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+
+        let out = command_merge_request(state_dir, "card-1").expect("enqueue succeeds");
+        assert!(out.starts_with("queued"), "{out}");
+        assert!(out.contains("card-1"), "{out}");
+        assert!(
+            out.contains("head"),
+            "first in the queue is the head: {out}"
+        );
+        // 重复调用是幂等的：仍在队里，不打错误、不重复入队。
+        let again = command_merge_request(state_dir, "card-1").expect("idempotent");
+        assert!(again.starts_with("queued"), "{again}");
+        let saved = superpowers_kanban_runner::persist::read_board(state_dir);
+        let card = saved.get(&id).expect("card survives");
+        assert_eq!(
+            card.state,
+            superpowers_kanban_core::card::CardState::MergeQueued
+        );
     }
 
     #[test]
@@ -1998,7 +2245,10 @@ mod tests {
             .filter_map(|line| line.split('(').next())
             .filter_map(|line| line.strip_suffix(','))
             .collect();
-        assert!(variants.len() > 8, "sanity: parsed variants = {variants:?}");
+        assert!(
+            !variants.is_empty(),
+            "sanity: parsed variants = {variants:?}"
+        );
         for variant in variants {
             assert!(
                 SKILL.contains(variant),

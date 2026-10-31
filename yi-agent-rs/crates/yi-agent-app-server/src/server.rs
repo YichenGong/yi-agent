@@ -710,6 +710,8 @@ pub(crate) fn attach_delegation(
     // 组长开关。逐调用传入，理由同 `anchor_sha`：装配期定值，会话存续期间不再变
     // （开关变更靠 resume 生效）。
     lead_agent_enabled: Option<bool>,
+    // 调用方额外注入给本会话 shell 的环境变量（见 `build_runtime_tooling`）。
+    extra_session_env: Vec<(String, String)>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -775,6 +777,7 @@ pub(crate) fn attach_delegation(
         lead_control_replies.clone(),
         anchor_sha,
         lead_agent_enabled,
+        extra_session_env,
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -1346,6 +1349,10 @@ fn build_runtime_tooling(
     // 组长开关。`None` = 装配方漏传，按关处理（fail closed）。这里不读
     // `yi_agent_flags::is_enabled`：那是进程级量，见 `lead_gate` 的模块文档。
     lead_agent_enabled: Option<bool>,
+    // 调用方额外注入给本会话 shell 的环境变量（目前只有被驱动的会话用：插件
+    // 在 `launch` 动作里给它自己起的那张卡一个句柄）。宿主不认识其中任何一个
+    // 键名——它只是把插件给的东西转交给 bash。
+    extra_session_env: Vec<(String, String)>,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -1375,7 +1382,9 @@ fn build_runtime_tooling(
         false,
         &roots,
         controller.clone(),
-        vec![("YI_AGENT_THREAD_ID".to_string(), thread_id.to_string())],
+        std::iter::once(("YI_AGENT_THREAD_ID".to_string(), thread_id.to_string()))
+            .chain(extra_session_env)
+            .collect(),
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
@@ -6121,6 +6130,12 @@ async fn driver_tick<F>(
             let state = drivers
                 .entry((project.clone(), plugin.clone()))
                 .or_default();
+            // 活着与否只能由宿主回答:`threads` 表的成员即活会话(会话结束就从表里
+            // 摘掉)。每拍刷新一次,插件据此持有/释放并发名额、判 stale——它**不能**
+            // 从 idle 推断(空闲的会话还活着),更不能从卡片状态推断。
+            for driven in &mut state.threads {
+                driven.alive = threads.contains_key(&driven.thread_id);
+            }
             let mut launcher = ServeLauncher {
                 threads,
                 pending_activation,
@@ -6330,6 +6345,7 @@ where
                 objective,
                 driver_project,
                 driver_ref,
+                env,
             } => self
                 // 归属由插件在动作里给出（`driver_project` 项目根 / `driver_ref` 驱动
                 // 方句柄），宿主原样落进 meta。缺字段（旧插件）时为 `None`，退化成
@@ -6340,6 +6356,7 @@ where
                     objective,
                     driver_project.as_deref(),
                     driver_ref.as_deref(),
+                    env.clone(),
                 )
                 .await
                 .inspect_err(|error| {
@@ -6394,6 +6411,9 @@ where
         objective: &str,
         driver_project: Option<&str>,
         driver_ref: Option<&str>,
+        // 插件要注入本会话 shell 的环境变量。宿主不解释任何一个键：它们的含义
+        // 属于插件（「这张卡是哪张」不是宿主的通用事实）。
+        env: Vec<(String, String)>,
     ) -> anyhow::Result<String> {
         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
         let built = (self.build_agent)(
@@ -6444,6 +6464,7 @@ where
             self.lead_control,
             self.lead_control_replies,
             Some(self.lead_agent_enabled),
+            env,
         )
         .await?;
 
@@ -6784,6 +6805,8 @@ where
             self.lead_control,
             self.lead_control_replies,
             Some(self.lead_agent_enabled),
+            // 组长会话不是驱动会话，没有插件句柄可注入。
+            Vec::new(),
         )
         .await?;
 
@@ -7055,6 +7078,9 @@ pub(crate) async fn start_thread_core(
     // 组长开关。由调用方从实例状态取好后传入（见 `lead_gate` 的模块文档：
     // 不在这里读全局量，那在并行测试里会互相污染）。
     lead_agent_enabled: Option<bool>,
+    // 调用方额外注入给本会话 shell 的环境变量。被驱动的会话用它带插件给的卡片
+    // 句柄；RPC 起的会话传空集（与改动前逐字一致）。
+    extra_session_env: Vec<(String, String)>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -7088,6 +7114,7 @@ pub(crate) async fn start_thread_core(
         // 新建路径：起点就是刚刚取的 HEAD。
         anchor_sha.clone(),
         lead_agent_enabled,
+        extra_session_env,
         built,
     );
     let BuiltAgent {
@@ -9418,6 +9445,62 @@ mod session_driver_tests {
         );
     }
 
+    /// `alive` 是宿主唯一能回答的并发事实:它必须跟着 `threads` 表走。会话还在
+    /// → 插件继续占名额;会话从表里消失(结束/被杀) → 下一拍报 `alive: false`,
+    /// 插件才会释放名额、把卡片标 stale。
+    ///
+    /// 若这里退化(比如每拍照写 `true`,或干脆不发),死会话会永久占着名额,而
+    /// 卡片永远显示「正在运行」——正是用户抱怨的那类误报。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_that_left_the_host_table_is_reported_dead_on_the_next_tick() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let work_path = workdir.path().to_string_lossy().to_string();
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_rounds = Arc::clone(&rounds);
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => {
+                if seen_rounds.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Ok(json!({ "action": null }));
+                }
+                Ok(json!({
+                    "action_id": "a1",
+                    "kind": "launch",
+                    "workdir": work_path,
+                    "title": "driven · card-1",
+                    "objective": "do the first thing",
+                }))
+            }
+            _ => Ok(json!({ "ok": true })),
+        });
+
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        let key = (daemon.project.clone(), DRIVER_PLUGIN.to_string());
+
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+        let started = drivers[&key].threads.clone();
+        assert_eq!(started.len(), 1, "the launch must be recorded");
+        assert!(started[0].alive, "a session we just started is alive");
+
+        // 模拟会话结束:主循环把它从 `threads` 表里摘掉。
+        let thread_id = started[0].thread_id.clone();
+        host.threads.remove(&thread_id);
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert_eq!(
+            drivers[&key].threads[0].thread_id, thread_id,
+            "the host still remembers it is chasing this thread"
+        );
+        assert!(
+            !drivers[&key].threads[0].alive,
+            "a thread no longer in the host table must be reported dead"
+        );
+    }
+
     /// 真主循环接线:启动 `serve` 后,3s tick 把插件经 `driver/next` 交出的动作
     /// 落成会话——证明驱动器确实挂在主循环上,而不是只在单测里可调。
     ///
@@ -9502,6 +9585,7 @@ mod session_driver_tests {
                     objective: objective.to_string(),
                     driver_project: origin.0.map(str::to_string),
                     driver_ref: origin.1.map(str::to_string),
+                    env: Vec::new(),
                 },
             },
         )

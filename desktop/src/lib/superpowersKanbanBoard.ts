@@ -25,8 +25,6 @@ export function columnForState(state: string): BoardColumnKey {
     case "pre_queued":
       return "preQueued";
     case "queued":
-    case "launching":
-    case "paused":
       return "queued";
     case "needs_you":
     case "awaiting_merge":
@@ -36,7 +34,6 @@ export function columnForState(state: string): BoardColumnKey {
     case "cancelled":
       return "done";
     case "running":
-    case "merging":
       return "doing";
     default:
       // 未知（未来新增 / 拼错）：保守放进 doing，绝不放进 done。

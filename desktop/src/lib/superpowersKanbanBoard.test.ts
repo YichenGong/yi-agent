@@ -13,16 +13,21 @@ function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardC
 
 describe("columnForState", () => {
   it("maps every known state to its column", () => {
+    // 状态集已收缩到 8 个：launching / paused / merging 都被删掉了。它们现在
+    // 落到 unknown 分支（doing），而不是继续骗读者「这里有一条真分支」。
     expect(columnForState("queued")).toBe("queued");
-    expect(columnForState("launching")).toBe("queued");
-    expect(columnForState("paused")).toBe("queued");
     expect(columnForState("running")).toBe("doing");
-    expect(columnForState("merging")).toBe("doing");
     expect(columnForState("needs_you")).toBe("needDecision");
     expect(columnForState("awaiting_merge")).toBe("needDecision");
     expect(columnForState("done")).toBe("done");
     expect(columnForState("failed")).toBe("done");
     expect(columnForState("cancelled")).toBe("done");
+  });
+
+  it("puts a card waiting for the merge slot in doing", () => {
+    // 用户已经确认要合，剩下的只是等名额；它既不该催人（needDecision），
+    // 也不该显示成完成。
+    expect(columnForState("merge_queued")).toBe("doing");
   });
 
   it("maps pre_queued to its own column", () => {

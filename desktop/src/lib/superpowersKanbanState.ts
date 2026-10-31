@@ -29,6 +29,20 @@ export interface BoardCard {
   enqueuedAt?: string;
   /** 队列顺序（越小越前）。插件未提供则不设。 */
   order?: number;
+  /**
+   * 卡写着 running，但宿主报这个会话已经不在了。**只是角标**：插件不会因此
+   * 改状态，卡片仍是 running，等人或模型决定下一步。
+   */
+  stale?: boolean;
+  /** 该会话最后一次被看到还活着的时刻（ISO 串）。只用于 stale 卡的说明。 */
+  lastAliveAt?: string;
+  /** 排进合并队列的时刻（ISO 串）。插件未提供则不设。 */
+  mergeQueuedAt?: string;
+  /**
+   * 本项目此刻的合并名额在它手里。合并是一次会话回合，所以这时卡仍是
+   * `running`——光看状态分不出「在写代码」和「在合并」。
+   */
+  merging?: boolean;
 }
 
 export function boardJsonPath(stateDir: string): string {
@@ -102,6 +116,10 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     terminalAt: optionalString(record.terminal_at),
     enqueuedAt: optionalString(record.enqueued_at),
     order,
+    stale: record.stale === true,
+    lastAliveAt: optionalString(record.last_alive_at),
+    mergeQueuedAt: optionalString(record.merge_queued_at),
+    merging: record.merging === true,
   };
 }
 

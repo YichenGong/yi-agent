@@ -61,7 +61,6 @@ impl Board {
             task_id: None,
             thread_id: None,
             origin_thread_id: None,
-            base_commit: None,
             kind: CardKind::Implementation,
             source_ref: None,
             base_ref: None,
@@ -70,11 +69,18 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: None,
+            merge_queued_at: None,
         });
         &self.cards[index]
     }
 
     /// 排入一张合并卡。载荷是 `source`/`base` 两个分支名；`origin` 仅自动派生时非空。
+    ///
+    /// **直接进 `MergeQueued`**，不进 `Queued`。独立合并卡没有「先干活」的阶段：
+    /// 投递它的人已经确认要合了，所以它一出生就排在合并队列里，由 daemon 的队列
+    /// 推进开跑。留在 `Queued` 反而会走 `next_launch` 那条实现卡通路——那轮会话
+    /// 手里没有名额，唯一能拿名额的 `merge-request` 又只收 `awaiting_merge`，
+    /// 于是一张永远合不进来的卡。
     pub fn enqueue_merge(
         &mut self,
         id: CardId,
@@ -90,14 +96,13 @@ impl Board {
             id,
             spec_path: PathBuf::new(),
             plan_path: PathBuf::new(),
-            state: CardState::Queued,
+            state: CardState::MergeQueued,
             enqueued_at: now,
             order,
             workdir: None,
             task_id: None,
             thread_id: None,
             origin_thread_id: None,
-            base_commit: None,
             kind: CardKind::Merge,
             source_ref: Some(source),
             base_ref: Some(base),
@@ -106,6 +111,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: None,
+            merge_queued_at: Some(now),
         });
         &self.cards[index]
     }
@@ -133,7 +139,6 @@ impl Board {
             task_id: None,
             thread_id: None,
             origin_thread_id,
-            base_commit: None,
             kind: CardKind::Implementation,
             source_ref: None,
             base_ref: None,
@@ -142,6 +147,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: Some(title),
+            merge_queued_at: None,
         });
         &self.cards[index]
     }
@@ -182,9 +188,9 @@ impl Board {
             .find(|card| &card.id == id)
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
         // 守卫必须严格盯「当前就是 PreQueued」，不能只问转移合法性：
-        // `(Paused, Queued)` 与 `(NeedsYou, Queued)` 都是合法边（那是卡回队列的
-        // 正常通路），拿它们当守卫会让一次 id 搞错的 promote 直接覆写一张真卡的
-        // spec/plan 并把它甩到队尾——静默数据丢失。`Queued` 输入仍然报
+        // 任何非终态都能转到 `Queued`（那是卡回队列的正常通路），拿它当守卫会让
+        // 一次 id 搞错的 promote 直接覆写一张真卡的 spec/plan 并把它甩到队尾——
+        // 静默数据丢失。`Queued` 输入仍然报
         // `Illegal { from: Queued, to: Queued }`（与非 PreQueued 输入一致）。
         if card.state != CardState::PreQueued {
             return Err(TransitionError::Illegal {
@@ -203,6 +209,12 @@ impl Board {
         Ok(())
     }
 
+    /// 可变借用一张卡。仅给「就地改一个字段」的场景（入队时刻、workdir），
+    /// 状态迁移仍然必须走 `transition`，否则 `cards` 的不变式就没人看着了。
+    pub fn get_mut(&mut self, id: &CardId) -> Option<&mut Card> {
+        self.cards.iter_mut().find(|card| &card.id == id)
+    }
+
     pub fn get(&self, id: &CardId) -> Option<&Card> {
         self.cards.iter().find(|card| &card.id == id)
     }
@@ -219,18 +231,6 @@ impl Board {
 
     pub fn is_empty(&self) -> bool {
         self.cards.is_empty()
-    }
-
-    /// 本看板内占着会话槽的卡片数。
-    ///
-    /// **不再参与配额判定**：限的是全机总流量，看板内的数只是全局数的一个子集，
-    /// 拿它去减峰值会把同一批会话扣两遍（见 `claim_next_launch`）。
-    /// 留着是因为对账、迁移与测试都要看「本看板有几个在跑」。
-    pub fn running_count(&self) -> usize {
-        self.cards
-            .iter()
-            .filter(|card| card.state.occupies_slot())
-            .count()
     }
 
     /// 记下某张卡片会话要跑在哪个 worktree。插件在启动前调用。
@@ -266,21 +266,6 @@ impl Board {
         Ok(())
     }
 
-    /// 记下某张卡片启动时 worktree 的 HEAD，供对账判断「有无新提交」。
-    pub fn set_base_commit(
-        &mut self,
-        id: &CardId,
-        base_commit: String,
-    ) -> Result<(), TransitionError> {
-        let card = self
-            .cards
-            .iter_mut()
-            .find(|c| &c.id == id)
-            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
-        card.base_commit = Some(base_commit);
-        Ok(())
-    }
-
     /// 记下这张卡**为什么**落到当前状态（启动失败的 `error` 等），供 `list` 读出。
     ///
     /// `None` 是显式的「无判词」——进入新一轮尝试或无关结局时清掉，免得旧原因
@@ -307,22 +292,23 @@ impl Board {
     ///
     /// 只认领实现卡的会话通路：合并卡走的是合并轮（`driver_step` 的候选集，
     /// 见 `superpowers_kanban_runner`），绝不能经这里启动。
-    pub fn claim_next_launch(&mut self, budget: usize) -> Option<CardId> {
-        if budget == 0 {
-            return None;
-        }
+    pub fn claim_next_launch(&mut self) -> Option<CardId> {
         let next = self.next_startable()?;
         if let Some(card) = self.cards.iter_mut().find(|c| c.id == next) {
-            card.state = CardState::Launching;
+            card.state = CardState::Running;
         }
         Some(next)
     }
 
-    /// 队首（`order` 最小）可启动的实现卡。合并卡不走会话通路，故排除。
+    /// 队首（`order` 最小）可启动的卡。
+    ///
+    /// 合并卡也走会话通路：会话照 §2b 的流程自己去 `merge-request` 取名额。
+    /// 名额是项目级锁，因此「同一时刻只有一个进程在合并」仍由 `merge.lock`
+    /// 保证——不靠「合并卡不启动」这种隐式串行。
     pub fn next_startable(&self) -> Option<CardId> {
         self.cards
             .iter()
-            .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Implementation)
+            .filter(|card| card.state == CardState::Queued)
             .min_by_key(|card| card.order)
             .map(|card| card.id.clone())
     }
@@ -358,6 +344,7 @@ impl Board {
         queued.into_iter().map(|card| card.id.clone()).collect()
     }
 
+    /// 在 `limit` 之内启动尽可能多的排队卡片，返回本次启动的卡片（按启动顺序）。
     /// 迁移一张卡片的状态，非法迁移一律拒绝且不改动队列。
     pub fn transition(&mut self, id: &CardId, next: CardState) -> Result<(), TransitionError> {
         let card = self
@@ -403,10 +390,7 @@ impl Board {
             .iter_mut()
             .find(|card| &card.id == id)
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
-        if matches!(
-            card.state,
-            CardState::Queued | CardState::Launching | CardState::Running | CardState::Merging
-        ) {
+        if matches!(card.state, CardState::Queued | CardState::Running) {
             return Err(TransitionError::Illegal {
                 from: card.state,
                 to: card.state,
@@ -575,23 +559,6 @@ mod tests {
         );
     }
 
-    /// 测试用的「按槽位批量启动」：`limit` 是**本看板**的槽位总数。
-    ///
-    /// 生产路径已不再这样判定（配额看全机余量，见 `claim_next_launch`），
-    /// 但状态机本身的语义——Running 占槽、离开 Running 立刻腾槽——仍然成立，
-    /// 这些既有测试要的正是那部分语义。
-    fn start_due(board: &mut Board, limit: usize) -> Vec<CardId> {
-        let mut started = Vec::new();
-        while board.running_count() < limit {
-            let Some(next) = board.next_startable() else {
-                break;
-            };
-            board.transition(&next, CardState::Running).unwrap();
-            started.push(next);
-        }
-        started
-    }
-
     fn at(day: u32, hour: u32) -> chrono::DateTime<Local> {
         Local
             .with_ymd_and_hms(2026, 10, day, hour, 0, 0)
@@ -613,52 +580,24 @@ mod tests {
     }
 
     #[test]
-    fn starts_the_oldest_queued_card_first() {
+    fn claim_takes_the_oldest_queued_card() {
         let mut board = board_with(&["a", "b", "c"]);
-        let started = start_due(&mut board, 2);
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
         assert_eq!(
-            started,
-            vec![CardId::new("a"), CardId::new("b")],
-            "FIFO by enqueue time"
+            board.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
         );
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("b")));
     }
 
+    /// 名额由 service 的租约说了算：`claim_next_launch` 只管取队首。
     #[test]
-    fn never_exceeds_the_slot_limit() {
+    fn claim_does_not_consult_a_slot_count() {
         let mut board = board_with(&["a", "b", "c"]);
-        start_due(&mut board, 1);
-        assert_eq!(board.running_count(), 1);
-        start_due(&mut board, 1);
-        assert_eq!(
-            board.running_count(),
-            1,
-            "no free slot, nothing else starts"
-        );
-    }
-
-    #[test]
-    fn when_a_running_card_finishes_its_slot_is_reused_by_the_next() {
-        let mut board = board_with(&["a", "b", "c"]);
-        start_due(&mut board, 1);
-        board
-            .transition(&CardId::new("a"), CardState::AwaitingMerge)
-            .unwrap();
-        assert_eq!(board.running_count(), 0, "跑完的卡不再占槽");
-        assert_eq!(start_due(&mut board, 1), vec![CardId::new("b")]);
-    }
-
-    #[test]
-    fn needs_you_does_not_hold_the_queue_back() {
-        let mut board = board_with(&["a", "b"]);
-        start_due(&mut board, 1);
-        board
-            .transition(&CardId::new("a"), CardState::NeedsYou)
-            .unwrap();
-        assert_eq!(
-            start_due(&mut board, 1),
-            vec![CardId::new("b")],
-            "a blocked card frees its slot immediately"
-        );
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("b")));
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("c")));
+        assert_eq!(board.claim_next_launch(), None);
     }
 
     #[test]
@@ -668,58 +607,57 @@ mod tests {
         assert_eq!(board.next_startable(), Some(CardId::new("c")));
     }
 
+    /// 迁移表已经放开，只剩「终态不复活」这一条：它必须仍然从 `transition` 返回错误。
     #[test]
-    fn an_illegal_transition_is_rejected() {
+    fn reviving_a_terminal_card_is_rejected() {
         let mut board = board_with(&["a"]);
+        board
+            .transition(&CardId::new("a"), CardState::Done)
+            .unwrap();
         let error = board
-            .transition(&CardId::new("a"), CardState::AwaitingMerge)
+            .transition(&CardId::new("a"), CardState::Queued)
             .unwrap_err();
         assert_eq!(
             error,
             TransitionError::Illegal {
-                from: CardState::Queued,
-                to: CardState::AwaitingMerge,
+                from: CardState::Done,
+                to: CardState::Queued,
             }
         );
     }
 
     #[test]
-    fn a_terminal_card_is_never_started_again() {
+    fn a_terminal_card_is_never_claimed_again() {
         let mut board = board_with(&["a", "b"]);
-        start_due(&mut board, 1);
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
         board
             .transition(&CardId::new("a"), CardState::Failed)
             .unwrap();
-        start_due(&mut board, 1);
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("b")));
         assert_eq!(
             board.get(&CardId::new("a")).unwrap().state,
             CardState::Failed
         );
-        assert_eq!(
-            board.get(&CardId::new("b")).unwrap().state,
-            CardState::Running
-        );
     }
 
     #[test]
-    fn a_paused_card_returns_to_the_queue() {
+    fn a_card_that_went_back_to_the_queue_is_claimable_again() {
         let mut board = board_with(&["a"]);
-        start_due(&mut board, 1);
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
         board
-            .transition(&CardId::new("a"), CardState::Paused)
+            .transition(&CardId::new("a"), CardState::NeedsYou)
             .unwrap();
-        assert_eq!(board.running_count(), 0);
         board
             .transition(&CardId::new("a"), CardState::Queued)
             .unwrap();
-        assert_eq!(start_due(&mut board, 1), vec![CardId::new("a")]);
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
     }
 
     #[test]
     fn a_board_survives_a_serialization_round_trip() {
         // 控制面靠这个文件渲染看板：队列必须能完整地写出去再读回来。
         let mut board = board_with(&["a", "b"]);
-        start_due(&mut board, 1);
+        board.claim_next_launch();
         board
             .set_workdir(&CardId::new("a"), PathBuf::from("/w/a"))
             .unwrap();
@@ -734,11 +672,14 @@ mod tests {
             restored.get(&CardId::new("a")).unwrap().workdir,
             Some(PathBuf::from("/w/a"))
         );
-        assert_eq!(restored.running_count(), 1);
+        assert_eq!(
+            restored.get(&CardId::new("a")).unwrap().state,
+            CardState::Running
+        );
     }
 
     #[test]
-    fn the_session_path_never_claims_a_merge_card() {
+    fn a_delivered_merge_card_is_born_queued_for_merge() {
         let mut board = Board::new();
         board.enqueue_merge(
             CardId::new("m1"),
@@ -753,9 +694,13 @@ mod tests {
             "a.plan.md".into(),
             at(1, 1),
         );
-        // 即使合并卡 order 更小、名额充足，会话通路也只能拿到实现卡。
-        assert_eq!(board.claim_next_launch(3), Some(CardId::new("a")));
-        assert_eq!(board.claim_next_launch(3), None);
+        let merge = board.get(&CardId::new("m1")).unwrap();
+        // 投递它的人已经确认要合了，所以它不经过「先开一轮会话干活」那段。
+        assert_eq!(merge.state, CardState::MergeQueued);
+        assert_eq!(merge.merge_queued_at, Some(at(1, 0)));
+        // 起点就比实现卡靠前，也不会抢走实现卡的会话通路。
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
+        assert_eq!(board.claim_next_launch(), None);
     }
 
     #[test]
@@ -797,9 +742,8 @@ mod tests {
         assert!(card.spec_path.as_os_str().is_empty());
         assert!(card.plan_path.as_os_str().is_empty());
         // 不占槽、不会被 claim 起来跑（它压根不是 Queued）。
-        assert_eq!(board.running_count(), 0);
         assert_eq!(board.next_startable(), None);
-        assert_eq!(board.claim_next_launch(3), None);
+        assert_eq!(board.claim_next_launch(), None);
     }
 
     #[test]
@@ -932,13 +876,12 @@ mod tests {
     }
 
     #[test]
-    fn promoting_a_needs_you_or_paused_card_leaves_it_untouched() {
-        // 这些状态都能合法地转回 `Queued`（见 `can_transition_to` 的
-        // `(Paused, Queued)` / `(NeedsYou, Queued)`）。若 `promote_prequeued`
+    fn promoting_a_needs_you_or_awaiting_merge_card_leaves_it_untouched() {
+        // 这些状态都能合法地转回 `Queued`（见 `can_transition_to`）。若 `promote_prequeued`
         // 拿转移合法性当守卫，一次 id 搞错的提升就会覆写真卡的 spec/plan 并把它
         // 甩到队尾——静默数据丢失。这里把「拒绝且原封不动」钉死。
         let mut board = board_with(&["a", "b"]);
-        start_due(&mut board, 1); // a -> Running
+        board.claim_next_launch(); // a -> Running
         board
             .transition(&CardId::new("a"), CardState::NeedsYou)
             .unwrap();
@@ -968,11 +911,11 @@ mod tests {
         // 队列秩序不受影响：b 仍是队首。
         assert_eq!(board.next_startable(), Some(CardId::new("b")));
 
-        // Paused 同样必须被拒（`(Paused, Queued)` 也是合法边）。
+        // AwaitingMerge 同样必须被拒（转 `Queued` 也是合法边）。
         let mut board = board_with(&["c"]);
-        start_due(&mut board, 1); // c -> Running
+        board.claim_next_launch(); // c -> Running
         board
-            .transition(&CardId::new("c"), CardState::Paused)
+            .transition(&CardId::new("c"), CardState::AwaitingMerge)
             .unwrap();
         let before = board.get(&CardId::new("c")).unwrap().clone();
         let error = board
@@ -981,12 +924,12 @@ mod tests {
         assert_eq!(
             error,
             TransitionError::Illegal {
-                from: CardState::Paused,
+                from: CardState::AwaitingMerge,
                 to: CardState::Queued,
             }
         );
         let after = board.get(&CardId::new("c")).unwrap();
-        assert_eq!(after.state, CardState::Paused);
+        assert_eq!(after.state, CardState::AwaitingMerge);
         assert_eq!(after.spec_path, before.spec_path);
         assert_eq!(after.plan_path, before.plan_path);
         assert_eq!(after.order, before.order);

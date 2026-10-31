@@ -198,6 +198,17 @@ describe("normalizeCard", () => {
     expect(card!.terminalAt).toBe("2026-10-03T00:00:00+08:00");
   });
 
+  it("carries the merge-queue timestamp and the gate flag", () => {
+    const card = normalizeCard({
+      id: "c", state: "merge_queued",
+      merge_queued_at: "2026-10-31T10:00:00+08:00", merging: false,
+    });
+    expect(card!.mergeQueuedAt).toBe("2026-10-31T10:00:00+08:00");
+    expect(card!.merging).toBe(false);
+    const merging = normalizeCard({ id: "c", state: "running", merging: true });
+    expect(merging!.merging).toBe(true);
+  });
+
   it("returns null only when id or state is missing", () => {
     expect(normalizeCard({ state: "queued" })).toBeNull();
     expect(normalizeCard({ id: "c" })).toBeNull();
@@ -217,5 +228,29 @@ describe("normalizeCard", () => {
   it("defaults a missing origin_thread_id to null", () => {
     const card = normalizeCard({ id: "idea", state: "pre_queued" });
     expect(card?.originThreadId).toBeNull();
+  });
+
+  it("carries the stale flag and the last live timestamp", () => {
+    const [card] = parseBoard(
+      JSON.stringify({
+        cards: [
+          {
+            id: "a",
+            state: "running",
+            spec_path: "a.spec.md",
+            stale: true,
+            last_alive_at: "2026-10-22T10:00:00+08:00",
+          },
+        ],
+      }),
+    );
+    expect(card.stale).toBe(true);
+    expect(card.lastAliveAt).toBe("2026-10-22T10:00:00+08:00");
+  });
+
+  it("treats a missing stale flag as false", () => {
+    const [card] = parseBoard(JSON.stringify({ cards: [{ id: "a", state: "running" }] }));
+    expect(card.stale).toBe(false);
+    expect(card.lastAliveAt).toBeUndefined();
   });
 });

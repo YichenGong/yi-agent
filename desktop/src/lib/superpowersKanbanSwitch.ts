@@ -38,6 +38,10 @@ export interface BoardCardDto {
   thread_id?: string | null;
   /** 该卡关联的讨论会话（pre-queued 卡）。 */
   origin_thread_id?: string | null;
+  /** 排进合并队列的时刻（ISO 串）；不在队列里则为 null/缺省。 */
+  merge_queued_at?: string | null;
+  /** 本项目此刻的合并名额是不是这张卡拿着。 */
+  merging?: boolean;
 }
 
 export type BoardRpc = RpcCall;
