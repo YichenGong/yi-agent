@@ -49,7 +49,7 @@ spec——先 `add-prequeued` 记一张预排队卡持续追踪，等文件齐�
 | `superpowers-kanban state <id> <state> [--detail <t>]` | **声明卡片状态**（见 §4） | 结束回合 / 等人决策 / 完成时 |
 | `superpowers-kanban state --self <state> [--detail <t>]` | 同上，卡号取环境变量 | 卡片会话里最常用 |
 | `superpowers-kanban merge-request <id>` | 把 `awaiting_merge` 的卡**排进**合并队列 | 用户确认要合并时 |
-| `superpowers-kanban merge-finish <id>` | 释放合并名额（不判成败） | 合并执行完之后 |
+| `superpowers-kanban merge-finish <id>` | 释放合并名额（不判成败） | 会话外手工合并收尾；队列推进的回合由 daemon 自己回收 |
 | `superpowers-kanban merge-cancel <id>` | 退出合并队列（仅在 `merge_queued`） | 用户反悔不想合了 |
 | `superpowers-kanban done <id>` | 把 `awaiting_merge` 的卡结算为 `done` | 等价于 `state <id> done`，保留兼容 |
 | `superpowers-kanban archive <id>｜--all-terminal` | 归档（隐藏，保留） | 想让卡从看板上消失 |
@@ -178,8 +178,10 @@ superpowers-kanban promote <card-id> <spec> <plan> [--title "<新标题>"]
    只在 `merge_queued` 上成立，退回 `awaiting_merge`。卡已经排到队、合并回合
    开跑之后就不能退了——那会与一轮在跑的合并打架。
 
-那轮合并会话拿到的是**已持有**的合并名额，它按自己的提示词合并、`merge-finish`，
-然后自己 `state --self done`（成功）或 `needs_you`（冲突解决不了）。
+那轮合并会话拿到的是**已持有**的合并名额，它按自己的提示词合并，然后自己
+`state --self done`（成功）或 `needs_you`（冲突解决不了）。**它一离开 `running`，
+daemon 下一拍就把名额还回去**——名额是 daemon 进程里的 `flock`，别的进程放不掉，
+所以那句 `merge-finish` 在回合里只会回 `cleared`，写不写都不影响。
 **你不要**替它判断成败，也不要在原会话里再跑一遍 `git merge`。
 
 **绝不绕过名额直接 `git merge`。** 名额（每项目一把 `merge.lock`）由 daemon 在
@@ -296,9 +298,9 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 
 裁决顺序：
 
-1. 会话跑的是**看板卡片的实现 worktree**（路径含 `.worktrees/kanban/…`）→ 走 §2b：
-   `merge-request` → 合并 → `merge-finish` → 自己 `state <card> done`，
-   即使对方 skill 要求直接 merge 也不执行。
+1. 会话跑的是**看板卡片的 worktree**（路径含 `.worktrees/kanban/…`）→ 走 §2b：
+   用户确认后 `merge-request` 入队，等 daemon 开合并回合去合并；
+   你自己**不**执行 `git merge`。
 2. 用户明确要在看板之外手工合并 → 让用户自己执行，再走 §4 的 `done` 登记。
 3. 不涉及看板卡片的普通分支 → 按 `finishing-a-development-branch` 走，本 skill 不插手。
 
