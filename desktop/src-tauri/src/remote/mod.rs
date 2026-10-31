@@ -3,4 +3,5 @@
 //! 依据 `docs/superpowers/specs/2026-10-31-remote-ssh-execution-design.md`。
 
 pub mod argv;
+pub mod config;
 pub mod profile;

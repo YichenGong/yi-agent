@@ -4,6 +4,7 @@
 //! `host` / `remote_path` 会被拼进 ssh 命令行。三者都必须是白名单校验，
 //! 而不是"看起来没问题就放过去"。
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -52,7 +53,7 @@ impl fmt::Display for ProfileError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteProfile {
     pub id: String,
     pub label: String,

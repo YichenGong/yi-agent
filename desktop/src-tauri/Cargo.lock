@@ -739,6 +739,7 @@ name = "desktop"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
@@ -748,6 +749,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

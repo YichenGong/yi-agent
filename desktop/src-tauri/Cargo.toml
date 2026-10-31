@@ -32,6 +32,10 @@ tokio = { version = "1", features = ["time"] }
 # `set_relay_url` has the handle, but the pure `configured_relay_in` used by
 # tests does not. `dirs` reads `$HOME`, which is what Tauri returns on macOS.
 dirs = "6"
+# remote.json / remote-status.json 的唯一临时名需要它（并发写者不得共用同一路径）。
+uuid = { version = "1", features = ["v4"] }
+# flock 用于跨进程的读-改-写互斥。
+libc = "0.2"
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.
