@@ -4624,7 +4624,7 @@ instance_home() {
   fi
 }
 
-models_path="$instance_home/models.json"
+models_path="$(instance_home)/models.json"
 
 if [ ! -f "$models_path" ]; then
   printf 'export-model-env: 没有找到 %s；真实 LLM 测试将跳过\n' "$models_path" >&2

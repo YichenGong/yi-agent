@@ -89,19 +89,25 @@ build-env:
 # === 真实 LLM 测试(需 API key,默认跳过) ===
 
 # 跑真实 LLM provider 层测试
-# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
+# 配置源：`~/.yi-agent/models.json` 的默认条目（见 scripts/export-model-env.sh）
 test-real-llm:
     #!/usr/bin/env bash
     set -e
-    # 清除 shell 环境变量污染(如 ~/.zshrc 里的全局 key),让 .env 成为唯一配置源
+    # 清除 shell 环境变量污染(如 ~/.zshrc 里的全局 key),让 models.json 成为唯一配置源
     unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
-    # 加载 .env(强制覆盖: .env 里的空值也会覆盖已设变量)
-    if [ -f .env ]; then
-        set -a; . ./.env; set +a
-    fi
-    if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
-        echo "SKIPPED: no provider API key configured (ANTHROPIC_API_KEY or OPENAI_API_KEY)"
+    # 从 models.json 的默认条目导出;无 key / 无 python3 时它自己会提示并 exit 0
+    eval "$(bash scripts/export-model-env.sh)"
+    if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$MODEL_API_KEY" ]; then
+        echo "SKIPPED: no provider API key configured (models.json has no usable default entry)"
         exit 0
+    fi
+    # 通用键优先:models.json 给的是 MODEL_API_KEY + provider/model 三件套,
+    # 而 provider 层测试认的是各家专属变量名。出厂 provider 只按它分派。
+    if [ -n "$MODEL_API_KEY" ] && [ -n "$YI_AGENT_PROVIDER" ]; then
+        case "$YI_AGENT_PROVIDER" in
+            anthropic) export ANTHROPIC_API_KEY="$MODEL_API_KEY" ;;
+            openai) export OPENAI_API_KEY="$MODEL_API_KEY" ;;
+        esac
     fi
     if [ -n "$ANTHROPIC_API_KEY" ]; then
         cargo test -p yi-agent-llm --test real_integration real_anthropic_ -- --ignored --test-threads=1
@@ -111,31 +117,27 @@ test-real-llm:
     fi
 
 # 跑真实 LLM 端到端测试(经 `yi-agent run`)
-# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
+# 配置源：`~/.yi-agent/models.json` 的默认条目（见 scripts/export-model-env.sh）
 test-real-e2e:
     #!/usr/bin/env bash
     set -e
     unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
-    if [ -f .env ]; then
-        set -a; . ./.env; set +a
-    fi
+    eval "$(bash scripts/export-model-env.sh)"
     if [ -z "$MODEL_API_KEY" ]; then
-        echo "SKIPPED: no headless configuration (MODEL_API_KEY)"
+        echo "SKIPPED: no headless configuration (models.json has no usable default entry)"
         exit 0
     fi
     cargo test -p yi-agent --test e2e_real -- --ignored --test-threads=1
 
 # 跑复杂 one-shot 任务测试(Tier 3)
-# 配置源:yi-agent-rs/.env(优先,强制覆盖 shell 环境变量)
+# 配置源：`~/.yi-agent/models.json` 的默认条目（见 scripts/export-model-env.sh）
 test-real-complex:
     #!/usr/bin/env bash
     set -e
     unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
-    if [ -f .env ]; then
-        set -a; . ./.env; set +a
-    fi
+    eval "$(bash scripts/export-model-env.sh)"
     if [ -z "$MODEL_API_KEY" ]; then
-        echo "SKIPPED: no headless configuration (MODEL_API_KEY)"
+        echo "SKIPPED: no headless configuration (models.json has no usable default entry)"
         exit 0
     fi
     cargo test -p yi-agent --test e2e_complex -- --ignored --test-threads=1
@@ -145,12 +147,7 @@ test-real-subagent:
     #!/usr/bin/env bash
     set -e
     unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
-    if [ -f "$HOME/.yi-agent/.env" ]; then
-        set -a; . "$HOME/.yi-agent/.env"; set +a
-    fi
-    if [ -f .env ]; then
-        set -a; . ./.env; set +a
-    fi
+    eval "$(bash scripts/export-model-env.sh)"
     cargo test -p yi-agent --test subagent_real_e2e -- --ignored --test-threads=1
 
 # 跑所有真实 LLM 测试(Tier 1 + 2 + 3)

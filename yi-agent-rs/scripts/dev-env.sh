@@ -37,16 +37,16 @@ ensure_instance() {
   local home
   home="$(instance_home)"
   mkdir -p "$home"
-  if [ ! -f "$home/.env" ] && [ -f "$HOME/.yi-agent/.env" ]; then
-    cp "$HOME/.yi-agent/.env" "$home/.env"
-    printf 'dev-env: 已从 ~/.yi-agent/.env 复制到 %s/.env\n' "$home" >&2
-    printf 'dev-env: 这是**真实凭据的副本**；实验跑量会消耗同一份额度，需要隔离请改用它。\n' >&2
-  fi
-  # 模型清单同样在实例外：不复制的话实例开箱就是「尚未配置模型」。
-  if [ ! -f "$home/models.json" ] && [ -f "$HOME/.yi-agent/models.json" ]; then
-    cp "$HOME/.yi-agent/models.json" "$home/models.json"
-    printf 'dev-env: 已复制 models.json 到 %s/models.json\n' "$home" >&2
-  fi
+  # 三份配置都在实例外：不复制的话实例开箱就是「尚未配置模型 / 运行参数全默认 /
+  # 没有网页搜索 key」。`.env` 已不再是配置载体，故不再复制。
+  local file
+  for file in models.json settings.json websearch.json; do
+    if [ ! -f "$home/$file" ] && [ -f "$HOME/.yi-agent/$file" ]; then
+      cp "$HOME/.yi-agent/$file" "$home/$file"
+      printf 'dev-env: 已复制 %s 到 %s/%s\n' "$file" "$home" "$file" >&2
+    fi
+  done
+  printf 'dev-env: models.json 里是**真实凭据的副本**；实验跑量会消耗同一份额度。\n' >&2
   printf '%s\n' "$home"
 }
 
