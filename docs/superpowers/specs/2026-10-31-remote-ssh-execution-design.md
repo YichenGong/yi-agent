@@ -564,6 +564,33 @@ ssh host "cd '<远端项目路径>' && exec env YI_AGENT_HOME='<实例根>' '<bi
 session id 由 `(本机实例, profile.id)` 派生，稳定可预测，例如
 `<本地 session>-<profile.id>`。本机用同一个派生函数生成，手机端据此建连。
 
+**两个必须先解决的坑（已核对 `docs/relay-deploy.md` 与 `relay/src/lib.rs`）**：
+
+1. **"本地 session" 不是程序生成的，是用户配置的**。中继 URL（含 `session` 参数）
+   存在用户配置里（`bridge.rs:161` 的 `sidecar_args` /
+   `resolve_relay`），`docs/relay-deploy.md` 明确要求用
+   `openssl rand -hex 16` 生成后**两端手填**。因此"派生"只能建立在
+   **用户已配好的那个 session 字符串**之上，不能凭空造一个。
+   → 派生函数的真实签名是 `derive(configured_session: &str, profile_id: &str)`,
+   而不是从零生成。
+
+2. **`profile.id` 的字符集必须能安全拼进 URL**。`remote.json` 已限定
+   `^[a-z0-9][a-z0-9-]{0,31}$`（§4.9），是 URL 安全的，可直接拼。若日后放宽这个
+   正则，派生逻辑会立刻产生非法 URL——两者是耦合的，必须一起改。
+
+**撞车的后果是静默的**（这条必须写进代码注释）：中继的规则是"每个 session 只保留
+一条最新的电脑连接"（`docs/relay-deploy.md` 端点表、`relay/src/lib.rs` 的
+`agents: HashMap<String, Slot>`）。两个远端项目若派生出同一个 session，
+**后连上的会顶掉先连上的，且不报错**——表现为"某个项目随机连不上/手机看到的是
+另一个项目"。因此派生时必须保证 profile.id 全局唯一（`remote.json` 已约束
+全文件唯一，§4.9），并把"相同 configured_session + 相同 profile.id ⇒ 必须得到
+相同 session"写成单测。
+
+另有一个现成的陷阱：中继 `session` **缺省为 `"default"`**（`docs/relay-deploy.md`
+第 90 行）。若用户配置里没写 `session` 参数就直连，本地与所有远端会全部挤进
+`"default"` 这一条 session，互相顶掉。→ 合成远端 URL 时必须**显式**带上
+`session=<派生值>`，不允许走缺省。这条也要有单测。
+
 为什么不在本地做多路复用（手机连一条、本地转发到多个远端）：本地 app-server
 不认识远端进程，要它按项目路由就得改 app-server，违背 §3.2 的分层。
 多连接下服务端只多一个只读 RPC（`remote/relayTargets`），隔离性天然成立。
@@ -735,7 +762,7 @@ C 的具体行为：
 | `host` | `^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$`（§6 第 2 条） | 拼进 ssh 命令行，故严格白名单 |
 | `local_path` | 绝对路径，且必须是已存在的目录 | 本机侧的键。UI 上按它显示 |
 | `remote_path` | 绝对路径，不含 shell 元字符（§6 第 3 条） | 拼进远端 `cd` |
-| `instance_root` | 绝对路径，**必须以 `.yi-agent` 结尾** | 由 App 派生为 `<远端 home>/.yi-agent-projects/<id>/.yi-agent`，**不由用户输入**；直接传给 `YI_AGENT_HOME`。末尾 `.yi-agent` 不是装饰——`instance_home_from` 的归一化要求如此，见 §4.6 的实测表 |
+| `instance_root` | 绝对路径，**统一以 `.yi-agent` 结尾** | 由 App 派生为 `<远端 home>/.yi-agent-projects/<id>/.yi-agent`，**不由用户输入**；直接传给 `YI_AGENT_HOME`。注意：末尾不写 `.yi-agent` 也**不会**出错——`instance_home_from` 会自动补一层，两种写法隔离效果相同（§4.6 实测表）。这里要求写全，只是为了让"配置值、验收命令、实际路径"三者一致，避免排障时对不上 |
 | `binary_version` | semver 字符串 | 与 App 版本解耦：远端可以跑旧版 |
 | `remote_arch` | `uname -sm` 的归一化结果 | 缓存探测结果，避免每次重连都探测（§4.2） |
 | `relay_session` | 可为 `null` | 由 `(本地 session, profile.id)` 派生（§4.6）。`null` 仅在未配置中继时出现 |
@@ -1030,12 +1057,18 @@ flag 是闸门，不是数据清除。重新打开即恢复。
     20s 内必须报「无法连接」并给出重试，UI 不能永远停在"连接中"（§4.1）
 26. **并发安装不产生半截文件**：同时触发两个 `(host, version)` 相同的安装，
     只有一个真正执行；远端 `<bin>` 可执行且 `--version` 正确（§4.1）
-27. **`remote/relayTargets` 契约**：手机 scope 调用返回
+27. **session 派生不撞车（必测，静默故障）**：连两个远端项目后，中继侧
+    **同时存在**两条电脑连接，且各自对应的项目没有互顶；额外用单测断言
+    "同 configured_session + 同 profile.id ⇒ 同 session"、
+    "同 configured_session + 不同 profile.id ⇒ 不同 session"
+28. **不落 `default` session**：用户配置的 relay URL 里**不带** `session` 参数时，
+    合成出的远端 URL 必须显式注入派生值，中继侧看到的不是 `default`（§4.6）
+29. **`remote/relayTargets` 契约**：手机 scope 调用返回
     `[{profileId,label,session,available}]`；`Observe` scope 可读、不可建会话；
     未开 flag 时该方法**不存在**（`method_not_found`，与 §5.1 一致）（§4.6）
-28. **中继失败不拖垮主通道**：把 `relay_url` 指向不可达地址，远端项目仍然能正常
+30. **中继失败不拖垮主通道**：把 `relay_url` 指向不可达地址，远端项目仍然能正常
     对话（stdio 主通道不受影响），只是 `available=false`（§4.6）
-29. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+31. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1070,8 +1103,8 @@ bug 分不清"的泥潭。
     （含 flag 关闭时 `method_not_found`、scope 校验），再接前端（§4.6）
 12. **手机端多连接** — iOS 端从单连接改为按 profile 多连接；列表按项目分组；
     消费 `remote/relayTargets` 拿清单。这是本设计唯一的非 Rust 客户端改动（§4.6）
-13. **端到端真机验证** — 走完 §9 的 **29 条**判据。并行相关的
-    15–19、23 必须**双项目同时开**才测得出来；25 需指向不可达地址；
+13. **端到端真机验证** — 走完 §9 的 **31 条**判据。并行相关的
+    15–19、23、27 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
 
