@@ -118,6 +118,183 @@ pub(crate) fn relative_luminance(color: Color) -> f32 {
     0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
 }
 
+/// Resolve the theme from an explicit override and/or a raw OSC 11 reply.
+///
+/// Pure so the decision table is testable without a terminal. Precedence:
+/// valid env override, then the reply's luminance, then `Dark`.
+pub fn detect_theme_kind(env_override: Option<&str>, reply: Option<&str>) -> TuiThemeKind {
+    match env_override
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("light") => return TuiThemeKind::Light,
+        Some("dark") => return TuiThemeKind::Dark,
+        Some(other) if !other.is_empty() => {
+            tracing::warn!(
+                value = %other,
+                "ignoring unknown YI_AGENT_THEME; falling back to background detection"
+            );
+        }
+        _ => {}
+    }
+
+    let Some(parsed) = reply.and_then(|r| parse_osc11_reply(r.as_bytes())) else {
+        return TuiThemeKind::Dark;
+    };
+    if relative_luminance(Color::Rgb(parsed.0, parsed.1, parsed.2)) > 0.5 {
+        TuiThemeKind::Light
+    } else {
+        TuiThemeKind::Dark
+    }
+}
+
+/// Parse `ESC ] 11 ; rgb:RRRR/GGGG/BBBB <ST|BEL>` into 8-bit components.
+///
+/// Accepts 1- to 4-digit hex per channel (the xterm protocol allows any width
+/// in that range; xterm itself writes 4) and both `ST` and `BEL` terminators.
+///
+/// The `ESC ] 11 ;` preamble is optional: callers that only keep the `rgb:`
+/// tail can pass that too, so the decision is made on the `rgb:` marker
+/// (`rgba:` also accepted) rather than on the wire preamble.
+pub fn parse_osc11_reply(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let body = text
+        .split_once("rgb:")
+        .or_else(|| text.split_once("rgba:"))
+        .map(|(_, rest)| rest)?;
+    // Strip the trailing ST (ESC \) / BEL / C1 ST, and any stray bytes that
+    // follow the reply in a batched read.
+    let body = body.split(['\x1b', '\x07', '\u{9c}']).next()?.trim();
+
+    let mut parts = body.split('/');
+    let mut channel = || -> Option<u8> {
+        let raw = parts.next()?.trim();
+        if raw.is_empty() || raw.len() > 4 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(raw, 16).ok()?;
+        // `ffff` → 255 and `ff` → 255: scale by the width actually written.
+        let scale = 16u32.pow(raw.len() as u32) - 1;
+        Some(((value * 255 + scale / 2) / scale) as u8)
+    };
+    Some((channel()?, channel()?, channel()?))
+}
+
+/// Detect the terminal background, falling back to `Dark` on any failure.
+///
+/// Must run in raw mode (see the OSC 11 note in
+/// `docs/superpowers/specs/2026-10-31-tui-light-terminal-theme-design.md`
+/// §3.3): without it the tty line-buffers and the reply never arrives.
+///
+/// Never writes to stdout/stderr on a failure path: a stray byte during TUI
+/// startup corrupts the frame.
+// Task 3 wires this into `run_tui` (after raw mode, before the alternate
+// screen); until then nothing calls it and dead-code lint would fail `just lint`.
+#[allow(dead_code)]
+pub fn detect_theme_from_terminal() -> TuiThemeKind {
+    let env_override = std::env::var("YI_AGENT_THEME").ok();
+    if let Some(value) = env_override.as_deref() {
+        let lowered = value.trim().to_ascii_lowercase();
+        if lowered == "light" || lowered == "dark" {
+            // A valid override needs no probe: skip the 200ms wait entirely.
+            return detect_theme_kind(Some(value), None);
+        }
+    }
+    let reply = query_osc11();
+    detect_theme_kind(env_override.as_deref(), reply.as_deref())
+}
+
+/// Ask the terminal for its background color, bounded to 200ms.
+///
+/// Returns the raw reply text for `detect_theme_kind`. `None` on timeout, on a
+/// non-tty, or when the terminal does not implement OSC 11.
+///
+/// Uses `libc::poll` on fd 0 rather than `crossterm::event::poll`/`read`: the
+/// latter *consumes* the reply byte, so a following `Read` would block forever
+/// and blow the 200ms budget.
+#[allow(dead_code)] // Reached only through `detect_theme_from_terminal`.
+fn query_osc11() -> Option<String> {
+    use std::io::{IsTerminal, Read, Write};
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+    const POLL_SLICE_MS: u128 = 10;
+    const MAX_REPLY_BYTES: usize = 256;
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+
+    {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if out.write_all(b"\x1b]11;?\x1b\\").is_err() || out.flush().is_err() {
+            tracing::warn!("OSC 11 probe could not write the query");
+            return None;
+        }
+    }
+
+    let deadline = std::time::Instant::now() + BUDGET;
+    let mut stdin = std::io::stdin();
+    let mut collected: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!("OSC 11 probe timed out; assuming a dark background");
+            return None;
+        }
+        // Poll in short slices so a terminal that ignores OSC 11 cannot hang
+        // startup, and so the deadline is honoured even if poll overshoots.
+        let remaining = deadline.saturating_duration_since(now);
+        let slice_ms = remaining.as_millis().clamp(1, POLL_SLICE_MS) as libc::c_int;
+
+        let mut pollfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is one initialized entry and nfds is 1, so poll
+        // reads and writes exactly that element.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, slice_ms) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(%error, "OSC 11 probe poll failed");
+            return None;
+        }
+
+        match stdin.read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::warn!(%error, "OSC 11 probe read failed");
+                return None;
+            }
+        }
+
+        collected.push(byte[0]);
+        // BEL terminates; ST is ESC \ (the ESC itself is just accumulated).
+        if byte[0] == 0x07 || (byte[0] == b'\\' && collected.len() >= 2) {
+            break;
+        }
+        if collected.len() > MAX_REPLY_BYTES {
+            tracing::warn!("OSC 11 probe overshot {MAX_REPLY_BYTES} bytes; giving up");
+            return None;
+        }
+    }
+
+    String::from_utf8(collected)
+        .inspect_err(|error| tracing::warn!(%error, "OSC 11 probe reply was not UTF-8"))
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +358,110 @@ mod tests {
         assert_eq!(TuiTheme::of(TuiThemeKind::Dark).kind, TuiThemeKind::Dark);
         assert_eq!(TuiTheme::of(TuiThemeKind::Light).kind, TuiThemeKind::Light);
         assert_eq!(TuiTheme::of(TuiThemeKind::Light).fg, TuiTheme::LIGHT.fg);
+    }
+
+    #[test]
+    fn env_var_overrides_probe() {
+        // Even if the terminal says dark, an explicit override wins.
+        assert_eq!(
+            detect_theme_kind(Some("light"), Some("rgb:1e1e/1e1e/1e1e")),
+            TuiThemeKind::Light
+        );
+        assert_eq!(
+            detect_theme_kind(Some("dark"), Some("rgb:ffff/ffff/ffff")),
+            TuiThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn env_var_is_trimmed_and_case_insensitive() {
+        assert_eq!(
+            detect_theme_kind(Some("  LIGHT  "), None),
+            TuiThemeKind::Light
+        );
+        assert_eq!(detect_theme_kind(Some("Dark"), None), TuiThemeKind::Dark);
+    }
+
+    #[test]
+    fn invalid_env_var_falls_through_to_probe() {
+        // A typo must not lock the user into the wrong theme silently; fall
+        // through to the terminal's own answer.
+        assert_eq!(
+            detect_theme_kind(Some("purple"), Some("rgb:ffff/ffff/ffff")),
+            TuiThemeKind::Light
+        );
+        assert_eq!(
+            detect_theme_kind(Some("purple"), Some("rgb:1e1e/1e1e/1e1e")),
+            TuiThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn osc11_reply_parsed_as_light() {
+        assert_eq!(
+            parse_osc11_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some((0xff, 0xff, 0xff))
+        );
+        assert_eq!(
+            detect_theme_kind(None, Some("rgb:ffff/ffff/ffff")),
+            TuiThemeKind::Light
+        );
+    }
+
+    #[test]
+    fn osc11_reply_parsed_as_dark() {
+        assert_eq!(
+            detect_theme_kind(None, Some("rgb:1e1e/1e1e/1e1e")),
+            TuiThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn osc11_bel_terminator_is_accepted() {
+        // xterm answers with BEL instead of ST depending on the version.
+        assert_eq!(
+            parse_osc11_reply(b"\x1b]11;rgb:0000/0000/0000\x07"),
+            Some((0x00, 0x00, 0x00))
+        );
+    }
+
+    #[test]
+    fn four_digit_components_are_scaled() {
+        // `rgb:ffff/ffff/ffff` is 4 hex digits per channel, not 2.
+        assert_eq!(
+            parse_osc11_reply(b"\x1b]11;rgb:8080/8080/8080\x1b\\"),
+            Some((0x80, 0x80, 0x80))
+        );
+        assert_eq!(
+            parse_osc11_reply(b"\x1b]11;rgb:ff/ff/ff\x1b\\"),
+            Some((0xff, 0xff, 0xff))
+        );
+    }
+
+    #[test]
+    fn probe_timeout_falls_back_to_dark() {
+        // No reply at all: startup must not hang or panic.
+        assert_eq!(detect_theme_kind(None, None), TuiThemeKind::Dark);
+    }
+
+    #[test]
+    fn unparseable_reply_falls_back_to_dark() {
+        assert_eq!(detect_theme_kind(None, Some("garbage")), TuiThemeKind::Dark);
+        assert_eq!(
+            detect_theme_kind(None, Some("rgb:zz/zz/zz")),
+            TuiThemeKind::Dark
+        );
+    }
+
+    #[test]
+    fn mid_gray_lands_on_the_dark_side() {
+        // Threshold is luminance > 0.5. #808080 is ~0.216, so it must be Dark:
+        // a grayish terminal should keep the historical look rather than flip
+        // to a light theme with weak contrast.
+        assert_eq!(
+            detect_theme_kind(None, Some("rgb:8080/8080/8080")),
+            TuiThemeKind::Dark
+        );
     }
 
     /// WCAG 2.1 contrast ratio. Local (12 lines) instead of pulling a palette
