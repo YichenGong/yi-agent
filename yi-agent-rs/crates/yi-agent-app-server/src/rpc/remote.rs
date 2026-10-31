@@ -119,7 +119,9 @@ pub fn build_targets(
                     // Observe 只拿到「看得见」，拿不到凭据。
                     let session = match (scope >= Scope::Control, relay_url) {
                         (true, Some(base)) => {
-                            json!(crate::remote_session::derive_session(base, id))
+                            // **手机侧端点**：必须是 `/ws`，不是电脑侧的 `/connect`。
+                            // 见 `remote_session::client_endpoint` 的注释。
+                            json!(crate::remote_session::client_endpoint(base, id))
                         }
                         _ => Value::Null,
                     };
@@ -182,7 +184,8 @@ mod tests {
         let target = &value["targets"][0];
         assert_eq!(target["profileId"], "proj-foo");
         assert_eq!(target["available"], true);
-        assert_eq!(target["session"], "wss://relay/?session=base-proj-foo");
+        // `/ws` 而不是 `/connect`：手机连的是转发端点。见 `client_endpoint`。
+        assert_eq!(target["session"], "wss://relay/ws?session=base-proj-foo");
     }
 
     /// session 就是凭据，只读设备拿到它等于拿到「动」的能力。
@@ -203,7 +206,7 @@ mod tests {
     fn admin_sees_the_session_too() {
         assert_eq!(
             one_target(Scope::Admin)["targets"][0]["session"],
-            "wss://relay/?session=base-proj-foo"
+            "wss://relay/ws?session=base-proj-foo"
         );
     }
 
@@ -331,7 +334,7 @@ mod tests {
         assert_eq!(value["targets"][0]["available"], true);
         assert_eq!(
             value["targets"][0]["session"],
-            "wss://r/?session=s-proj-foo"
+            "wss://r/ws?session=s-proj-foo"
         );
     }
 

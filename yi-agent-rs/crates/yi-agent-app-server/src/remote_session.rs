@@ -52,6 +52,91 @@ pub(crate) const SHARED_CASES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// 手机侧要连的地址：**`/ws` 端点，session 与远端进程相同**。
+///
+/// 桌面派生出的 `derive_session` 结果指向中继的**电脑侧**端点（`/connect`，
+/// 反向 pairer：电脑主动出站注册）。手机不能连它——实测 `/connect?session=x`
+/// 能握手（`OPEN`）但收不到任何帧，因为电脑侧的 socket 是「注册」用的，不是
+/// 「转发」用的；手机必须连 `/ws?session=x`（spec §4.6、§8.9）。
+///
+/// 两者**session 值必须一致**，这正是本函数只改路径、不改 session 的原因：
+/// 改 session 会让手机连到一个没人监听的 channel，而两边日志都正常。
+pub fn client_endpoint(relay_url: &str, profile_id: &str) -> String {
+    let derived = derive_session(relay_url, profile_id);
+    replace_endpoint(&derived, "/ws")
+}
+
+/// 把 URL 的路径换成 `endpoint`，其余（scheme/host/query）原样保留。
+///
+/// 手写而非引 `url` crate：这里只处理两种形态（带 `://` 的完整 URL、以及
+/// 拿来兜底的裸串），引一个依赖只为改一段路径不值当。解析不出来就原样返回——
+/// 派生结果本身已经可用，不该因为路径改写失败而让手机拿不到 session。
+fn replace_endpoint(url: &str, endpoint: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    // authority 到下一个 `/`（或 query 的 `?`）为止。
+    let path_start = rest.find(['/', '?']).map(|i| authority_start + i);
+    match path_start {
+        // 只有 `?`：没有路径，直接插端点。
+        Some(i) if url[i..].starts_with('?') => {
+            format!("{}{}{}", &url[..i], endpoint, &url[i..])
+        }
+        Some(i) => {
+            let tail_start = url[i..].find(['?']).map(|j| i + j).unwrap_or(url.len());
+            format!("{}{}{}", &url[..i], endpoint, &url[tail_start..])
+        }
+        None => format!("{url}{endpoint}"),
+    }
+}
+
+#[cfg(test)]
+mod client_endpoint_tests {
+    use super::client_endpoint;
+
+    /// 手机侧**必须**连 `/ws`：`/connect` 是电脑侧注册端点，握手能成但收不到帧
+    /// （实测：`OPEN` 后 20s 无任何消息）。
+    #[test]
+    fn the_phone_gets_the_ws_endpoint() {
+        let url = client_endpoint("wss://relay.example/connect?session=base", "proj-a");
+        assert_eq!(url, "wss://relay.example/ws?session=base-proj-a");
+    }
+
+    /// session 值必须与 `derive_session` 逐字相同，否则手机连到没人监听的 channel。
+    #[test]
+    fn the_session_value_survives_the_endpoint_rewrite() {
+        let base = "wss://relay.example/connect?session=base";
+        let derived = super::derive_session(base, "proj-a");
+        let client = client_endpoint(base, "proj-a");
+        let d = derived.split("session=").nth(1).unwrap();
+        let c = client.split("session=").nth(1).unwrap();
+        assert_eq!(d, c);
+    }
+
+    /// 端点已是 `/ws` 时不得重复改写，也不得二次派生 session。
+    #[test]
+    fn an_already_ws_endpoint_is_stable() {
+        let url = client_endpoint("wss://relay.example/ws?session=base-proj-a", "proj-a");
+        assert_eq!(url, "wss://relay.example/ws?session=base-proj-a");
+    }
+
+    /// 多段路径要整段替换，不能把 `/a/b` 变成 `/ws/b`。
+    #[test]
+    fn a_multi_segment_path_is_replaced_wholesale() {
+        let url = client_endpoint("wss://relay.example/a/b?session=s", "p");
+        assert_eq!(url, "wss://relay.example/ws?session=s-p");
+    }
+
+    /// 没有路径时补上端点。
+    #[test]
+    fn a_bare_host_gets_the_endpoint_appended() {
+        let url = client_endpoint("wss://relay.example?session=s", "p");
+        assert_eq!(url, "wss://relay.example/ws?session=s-p");
+    }
+}
+
 pub fn derive_session(relay_url: &str, profile_id: &str) -> String {
     let seed = session_seed(relay_url);
     // **幂等**：已经带着本项目后缀的 session 原样返回。
