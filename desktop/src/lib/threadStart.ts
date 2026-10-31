@@ -9,7 +9,10 @@ import { LOCAL_SLOT, type Slot } from "./slots";
  * 失败」且完全看不出原因。省略后服务端走 `None => cfg.workdir`，即 ssh 会话
  * 自己的工作目录——那才是用户想打开的「这个项目的目录」。
  */
-export function threadStartParams(cwd?: string, slot: Slot = LOCAL_SLOT): Record<string, string> {
+export function threadStartParams(
+  cwd?: string,
+  slot: Slot = LOCAL_SLOT,
+): Record<string, string> {
   if (slot !== LOCAL_SLOT) return {};
   return cwd ? { cwd } : {};
 }

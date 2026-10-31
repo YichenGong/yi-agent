@@ -715,8 +715,11 @@ pub fn remote_remove(app: AppHandle, profile_id: String) -> Result<(), String> {
     if config.profiles.len() == before {
         return Err(format!("unknown remote profile `{profile_id}`"));
     }
-    // 顺序：先断开再落盘。反过来的话，落盘成功后到断开之间若监督循环重启一次，
-    // 它会去 `remote.json` 里找不到这个 profile 并报错。
+    // 顺序：先断开再落盘。断开撤销「希望连着」的意图并杀掉进程；此时 profile
+    // 还在 `remote.json` 里，所以即使监督循环恰好在这一刻醒来，它拉起的也是一
+    // 个已知 profile（随后被 kill_sidecar 收掉）。反过来的话，落盘成功后到断开
+    // 之间会有一个窗口：槽位仍被标记为 desired，而 `remote.json` 里已经找不到
+    // 它，重连表现为「unknown remote profile」这种看不出因果的错误。
     remote_disconnect(app, profile_id)?;
     crate::remote::config::save(&path, &config).map_err(|error| error.to_string())?;
     Ok(())
