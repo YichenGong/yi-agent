@@ -717,8 +717,67 @@ session id 由 `(本机实例, profile.id)` 派生，稳定可预测，例如
 不认识远端进程，要它按项目路由就得改 app-server，违背 §3.2 的分层。
 多连接下服务端只多一个只读 RPC（`remote/relayTargets`），隔离性天然成立。
 
-**手机端成本（明确记录）**：iOS 端现在是单连接，要改成支持多连接 + 按项目分组
-的列表。这是展示层工作，不动协议。
+**手机端成本（已核实代码，比原先估计的具体）**：**没有独立的 iOS 原生项目**。
+iOS 跑的就是同一份 React bundle，由 `transportFactory`（`desktop/src/transportFactory.ts`）
+按"有没有持久化"选择传输：
+
+```ts
+export function transportFactory(opts = {}): Transport {
+  const config = opts.config ?? storedRemoteConfig(...);
+  return config ? wsTransport(config.url, config.token) : tauriTransport();
+}
+```
+
+关键事实：
+
+- **决策只有一处**：有 `{url, token}` 配置 → `wsTransport`（手机）；
+  没有 → `tauriTransport`（桌面）。返回类型是**单个 `Transport`**
+- 配置存在 `localStorage["yi-agent.remote"]`，形状是 `{url, token}`
+  （`lib/remoteConfig.ts` 的 `RemoteConfig`），**只有一个**，没有"多台"的概念
+- `storedRemoteConfig` 解析失败一律降级为 `null`（即当成桌面），不抛错
+
+因此"手机多连接"的真实改动是**改这个共用函数**，不是改某个 iOS 客户端：
+
+1. `RemoteConfig` 从单条扩成列表（或在原有单条之上加一个列表字段），
+   且**必须保持向后兼容**：老版本 App 读到新存储要能继续用第一条，
+   新版本读到老存储要能当成"只有一条"
+2. `transportFactory` 的返回值语义要变：从"给我唯一的 transport"变成
+   "给我这台的 transport / 给我某个项目的 transport"。**这是破坏性签名变更**，
+   调用点（`App.tsx:1777`）必须一起改
+3. 因为桌面与手机共用这份代码，改动**同时影响两端**——`tauriTransport()`
+   那条分支不能被新逻辑破坏。这是最容易出事的地方：为手机加多连接，
+   把桌面走单 transport 的路径改错
+
+**多连接在鉴权上是否可行（已核实，可行）**：`ws.rs` 第 1 行的模块文档写着
+"Tier 1:多客户端 + token 认证 + **每连接 scope**"。这意味着：
+
+- 同一台设备的 token 可以支撑**多条** ws 连接，每条独立登记 scope
+  （`ws.rs:282` 用 `pairing.authenticate(&token)` 拿到 device，再按连接处理）
+- 手机要连 N 个项目 = 建 N 条 ws 连接到**不同的中继 session**，但**用同一个 token**。
+  这是可行的，因为 token 标识的是"哪台设备"，不是"哪条会话"
+- 注意：不同项目的连接连的是**不同中继 session**（§4.6），不是同一个 app-server。
+  token 校验发生在每个远端 app-server 上——而远端是**另一台机器**，
+  它的设备表里**没有**这台手机的 token
+
+  **这是必须写清的一点**：远端 app-server 不认识手机。手机连的是
+  `wss://<relay>/ws?session=<远端项目 session>`，中继把帧转发给远端的
+  `/connect` 连接——**中继本身不鉴权**（§4.6 前提 3），所以帧能到达远端，
+  但远端 app-server 的 ws 侧若要求 token，会 4401 拒绝。
+
+  因此需要明确：远端 app-server 的手机接入路径是怎么认证的。两种可能：
+  a) 远端不启用 ws 手机接入（只有中继侧的 `/connect`），手机帧经中继直接进入
+     远端的 stdio/relay 通道，不经过远端 ws 的 token 校验
+  b) 远端也要有设备表，那就需要把手机 token 同步到远端——**这会引入凭据分发**，
+     与 §6 第 1 条冲突
+
+  **本设计的取态是 a**，但这一条**必须在实现第一步就验证**：连一个远端项目，
+  手机经中继发起一次 `thread/list`，确认不被 4401 拒绝。若不成立，整个手机-远端
+  链路需要重新设计（可能是 b，需要单独评估凭据分发）。**这是本设计剩余风险中
+  优先级最高的一条。**
+
+**一个反向的好消息**：`opts.config` 本来就是注入点（注释写着"tests, and by a
+future paired-URL deep link"），所以给 `transportFactory` 加参数不需要动
+它的测试架构，只需要补用例。
 
 **已具备的能力**（无需新增）：
 
@@ -1101,6 +1160,10 @@ flag 是闸门，不是数据清除。重新打开即恢复。
   这是本设计最省力的地方，也是最容易被破坏的地方——见 §8.3。
 - **不改 app-server 的连接逻辑**：唯一例外是只读的 `remote/relayTargets`
   （§4.6）。**不允许**实现时顺手把连接管理、安装、中继等逻辑塞进 app-server
+- **不做 scope 透传到远端**：所有经中继进入远端的帧，在远端都是同一台
+  `relay-bridge` 的 Control 设备（§8.9）。`Observe` 手机在远端侧也是 Control。
+  这是已接受的副作用，**不修**（要修需引入凭据分发，违背 §6 第 1 条）
+- **不做 per-device 审计/按设备撤销**：同上，远端无法区分是哪个手机（§8.9）
 - **不做会话恢复**（session resume）：断线即重启进程、状态不保留（§4.3）。
   codex 有 `client_recovery` / `client_refresh` 两层，本设计两者都不做，
   只做最朴素的"进程退出就重启"
@@ -1191,6 +1254,45 @@ flag 是闸门，不是数据清除。重新打开即恢复。
 
 缓解：手机端必须把 `-32000` 解释为"该项目暂不可用"并提供刷新，**不能**无限重试
 （那会变成 §4.3 里同样的问题，只是换到手机侧）。刷新入口至少要有一个。
+
+### 8.9 手机 → 远端项目的鉴权链路（原为最高风险，已实证并可接受）
+
+**结论先说：链路是通的，方案 a 成立，但有一个必须记录的 scope 副作用。**
+
+原先的疑问是：手机连中继用本机发的 device token（`wsTransport.ts`），而每个远端
+app-server 是另一台机器、有独立的设备表，它凭什么信任这条经中继来的连接？
+
+已核实的答案（不是假设，是读代码确认的）：
+
+- 远端以 `--relay` 启动时走 `serve_stdio_with_relay`（`server.rs:2019`）
+- 它在**远端本机**调 `pairing.seed_local_device("relay-bridge")`
+  （`server.rs:2961`）铸一枚 **`Scope::Control`** 设备（`pairing.rs:288`），
+  然后用这枚 token 连**自己的环回 ws**（`ws://127.0.0.1:<port>/ws`）
+- 中继客户端（`yi_agent_relay::run_client`）带这枚 token 连环回 ws，
+  再出站连中继的 `/connect?session=<id>`
+
+也就是说：**远端始终用"自己的本地设备"身份处理所有经中继来的帧**。
+手机的真实 token 在中继那一层就结束了，从不被远端校验。因此：
+
+- ✅ 手机经中继访问远端**不需要**把 token 分发到远端，与 §6 第 1 条不冲突
+- ✅ 不需要远端的设备表里有这台手机
+
+**但必须记录一个副作用（这是本节的真正价值）**：
+
+所有经中继进入远端的帧，在远端看来都来自**同一台 Control 设备**
+（`relay-bridge`）。这意味着：
+
+1. **手机的 scope 被"压平"成 Control**。一个 `Observe` 只读手机，经中继连到远端
+   后，在远端侧是 Control —— 它**有能力**执行写操作。当前是否可被利用取决于
+   手机端是否自己限制，但**远端不再提供第二道防线**
+2. **无法区分"哪个手机发的"**。多条手机连接在远端是同一个人。若未来要做
+   per-device 审计或按设备撤销权限，这条链路做不到
+3. `remote/relayTargets` 的 `Observe` 不返回 `session`（§4.6）因此**更重要**了：
+   它是唯一拦住只读设备拿到凭据的地方，不能省
+
+本设计接受这个副作用，理由是：中继本就不鉴权、session 即凭据（§4.6 前提 3），
+安全边界已经在"谁知道 session"上。但要在 §7 非目标里明确写"不做 per-device
+audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 
 ## 9. 验收判据
 
@@ -1294,7 +1396,14 @@ flag 是闸门，不是数据清除。重新打开即恢复。
     同一项目（验证 `project_key` 没有因拼写差异分裂，§4.4）
 41. **`settings.json` 缺失不致病**：隔离后的远端没有 `settings.json` 时，
     连接与对话正常（逐字段回默认），说明页里明确指出"远端配置独立、当前为空"（§4.8）
-42. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+42. **`transportFactory` 向后兼容（必测，两端共用代码）**：
+    ① 老存储（单条 `{url,token}`）+ 新版 App → 仍能用，且威胁不到桌面路径；
+    ② 新存储（列表）+ 老版 App → 至少第一条可用，不崩；
+    ③ 桌面（无存储）仍走 `tauriTransport`，多连接改动**未**让它走进 ws 分支（§4.6）
+43. **手机经中继访问远端可用**：连一个远端项目，手机经
+    `wss://<relay>/ws?session=<远端>` 发起 `thread/list`，成功返回（§8.9 已实证
+    链路通，此判据防止实现时把 `--relay` 参数接错而回归）
+44. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1304,6 +1413,10 @@ sidecar 的情况下把单例改成槽位表、把事件名改成带 slot、把 
 偏移，验证本地功能零回归，再往这个骨架上挂远端。反过来做会陷入"远端 bug 与重构
 bug 分不清"的泥潭。
 
+0. **冒烟验证 §8.9 的链路** — 手动起一个远端 app-server 带 `--relay`，
+   用现有 iOS 端经中继发一次 `thread/list`。§8.9 已通过读代码确认链路成立
+   （`seed_local_device("relay-bridge")`），这一步是防止环境性偏差，成本低
+   但不再阻塞设计
 1. **flag 注册 + stable 闸门测试** — 最小可验证单元，先落地
 2. **`remote.json` 读写与校验** — 纯逻辑（host 白名单、路径校验、项目映射），无 IO
    依赖，最好测
@@ -1334,9 +1447,12 @@ bug 分不清"的泥潭。
 10. **关开关时杀进程**（必须杀**全部**远端 slot）
 11. **`remote/relayTargets`** — app-server 侧唯一新增方法（只读）。先写契约测试
     （含 flag 关闭时 `method_not_found`、scope 校验），再接前端（§4.6）
-12. **手机端多连接** — iOS 端从单连接改为按 profile 多连接；列表按项目分组；
-    消费 `remote/relayTargets` 拿清单。这是本设计唯一的非 Rust 客户端改动（§4.6）
-13. **端到端真机验证** — 走完 §9 的 **42 条**判据。并行相关的
+12. **手机端多连接** — 改的是共用的 `transportFactory`（无独立 iOS 项目，
+    桌面与手机同一份 React 代码，§4.6）。`RemoteConfig` 扩成列表且向后兼容；
+    `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
+    列表按项目分组；消费 `remote/relayTargets` 拿清单。
+    **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
+13. **端到端真机验证** — 走完 §9 的 **44 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
