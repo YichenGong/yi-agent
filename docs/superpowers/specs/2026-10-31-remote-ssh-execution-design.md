@@ -29,7 +29,8 @@ yi-agent 现在的工具层全部是**本地执行**：
 stdin/stdout 当作 JSON-RPC 通道。
 
 依据（调研 codex 源码）：codex 采用完全相同的形态。其 environment 配置结构
-（`codex-rs/exec-server/src/environment_toml.rs:41-57` 的 `EnvironmentToml`）包含：
+（`codex-rs/exec-server/src/environment_toml.rs:41-57` 的 `EnvironmentToml`，
+共 10 个字段，这里只列与本设计相关的 6 个）：
 
 ```rust
 program: Option<String>,        // 可执行程序，如 "ssh"
@@ -38,14 +39,19 @@ env: Option<HashMap<String, String>>,
 cwd: Option<PathBuf>,           // 绝对路径，spawn 时直接作为子进程 cwd
 connect_timeout_sec: Option<Duration>,
 initialize_timeout_sec: Option<Duration>,
+// 另有 id / skills / url / auth_bearer_token，与本设计无关
 ```
 
 四件值得直接借鉴的事：
 
 1. **`cwd` 是 spawn 参数**，不是拼进 args 的 `cd`（`environment_toml.rs:190-196`
    把 `cwd` 传给 spawn，`:215-231` 的 `normalize_stdio_cwd` 强制它必须是绝对路径）。
-   这比 shell 拼接更安全——无需引号、天然免疫注入。本设计采用这个思路，
-   而不是 `cd xxx &&` 的写法（见 §4.4 的修订）。
+   这比 shell 拼接更安全——无需引号、天然免疫注入。
+
+   **但这招对本设计只能借鉴一半**：codex 的 `cwd` 管的是**本机 ssh 子进程**，
+   管不到远端。我们需要的是"远端 app-server 的 cwd = 项目目录"，而 ssh 协议
+   没有这个参数，只能靠远端 shell 的 `cd`。详见 §4.4 的说明与
+   §4.1 第 8 步的完整命令。**别照抄。**
 2. **`env` 可注入环境变量**。本设计用它传 `YI_AGENT_HOME` 做状态隔离（§4.6）。
 3. **每个 environment 有独立的连接与初始化超时**（§4.1 的超时表参照此项）。
 4. codex 还有一个明确的区分：**recovery（瞬断后恢复同一会话）vs refresh
@@ -490,14 +496,14 @@ stdio 传输有硬上限 `MAX_FRAME_BYTES = 1 MiB`
 
 好消息：**分片上传机制已经存在，不需要新增**。
 `image/upload/begin` → `image/upload/chunk` → `image/upload/commit`
-（`rpc/image.rs:270-460`），分片大小 `UPLOAD_CHUNK_BYTES = 512 KiB`
+（`app-server/src/rpc/image.rs:270-460`），分片大小 `UPLOAD_CHUNK_BYTES = 512 KiB`
 （`image_upload.rs:30`）。512 KiB base64 编码后约 683 KiB，**安全落在 1 MiB 帧限制内**。
 
 因此远端模式下附件/图片**无需特殊处理**，只要走既有的分片路径。本设计只需钉住：
 **不得**为远端模式引入任何"一次性发送整个文件"的捷径——那会立刻撞上 1 MiB 上限。
 
 另一个已确认的点：`view_image` 走的是 `image/read`，它**本来就是逐页返回**的
-（`rpc/image.rs:31` 的注释明确写着"由客户端逐页…与全量读再切片相对"），因此远端
+（`app-server/src/rpc/image.rs:31` 的注释明确写着"由客户端逐页…与全量读再切片相对"），因此远端
 读图同样不会撞帧上限，无需改动。
 
 结论：附件与图片两条路径都天然可用，本设计在这一点上**不需要任何新增代码**。
@@ -1279,7 +1285,7 @@ FlagDef {
 **必须作用在"整个功能"上**，不是"部分 UI 可见性"。关闭时必须同时满足：
 
 1. 设置页的「远程」入口不渲染
-2. `remote/*` 的 Tauri 命令返回错误（与 `flags_rpc.rs:36` 对 stable 的处理同构：
+2. `remote/*` 的 Tauri 命令返回错误（与 `app-server/src/flags_rpc.rs:36` 对 stable 的处理同构：
    **命令不存在**，而不是"存在但拒绝"）
 3. **全部**远端 slot 的 ssh 子进程被终止，回落到本地 sidecar。
    并行后这里容易只杀"当前活动的那个"，必须遍历整个进程表逐个杀
