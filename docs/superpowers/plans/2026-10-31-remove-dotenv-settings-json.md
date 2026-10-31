@@ -32,7 +32,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `yi-agent-rs/crates/yi-agent-runtime/src/settings.rs` | `Settings` 类型（全部 `Option<T>`）、`FIELD_META` 元数据表、`load_from` / `load`、`write_to` / `write`、`FieldSpec`、值校验、`.env` 行解析纯函数 |
+| `yi-agent-rs/crates/yi-agent-runtime/src/settings.rs` | `Settings` 类型（全部 `Option<T>`）、`FIELDS` 元数据表、`load_from` / `load`、`write_to` / `write`、`FieldSpec`、值校验、`.env` 行解析纯函数 |
 | `yi-agent-rs/crates/yi-agent-runtime/src/settings/migrate.rs`（或并入 `migrate.rs`，见 Task 6） | `migrate_env_settings` 与 `EnvMigrationOutcome` |
 | `yi-agent-rs/crates/yi-agent-app-server/src/settings_rpc.rs` | `settings/read` / `settings/write` 的 handler |
 | `yi-agent-rs/scripts/export-model-env.sh` | 从 `models.json` 导出 real-test 所需环境变量 |
