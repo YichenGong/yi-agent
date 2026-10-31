@@ -158,6 +158,29 @@ pub fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+/// The window-visibility policy, wired to the app's event loop.
+///
+/// Kept as a named function so a test can drive the real policy instead of
+/// re-writing the match. `lib.rs` does nothing but forward to it.
+#[cfg(target_os = "macos")]
+pub fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &tauri::RunEvent) {
+    match event {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } => hide_on_close(app, label, api),
+        // `has_visible_windows == true` means the app is merely behind
+        // another one: macOS already brings it forward, and calling `show()`
+        // there would steal focus the user is in the middle of moving.
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => reveal_main_window(app),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
