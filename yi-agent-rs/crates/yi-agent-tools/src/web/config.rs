@@ -221,9 +221,9 @@ pub fn load_websearch_config_from(path: &Path) -> WebSearchConfig {
     }
     // 部分文件的 engines 里可能只有别的引擎，bocha 缺失时补回默认条目，
     // 让「active_engine 指向 bocha」这条不变量永远成立。
-    cfg.engines
-        .entry(default_engine_id())
-        .or_insert_with(EngineConfig::default);
+    // `or_default()` 与 `or_insert_with(EngineConfig::default)` 等价（`EngineConfig`
+    // 有手写 `Default`），但后者会触发 clippy 的 `or_insert_with` 系列 lint。
+    cfg.engines.entry(default_engine_id()).or_default();
     cfg
 }
 

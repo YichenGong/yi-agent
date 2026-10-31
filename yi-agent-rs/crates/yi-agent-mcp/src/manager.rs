@@ -908,6 +908,10 @@ mod tests {
 
     /// 配置没变时 `reload` 不得重新探测——探测会 spawn 子进程并可能耗时 55s。
     #[tokio::test]
+    // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
+    // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
+    // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn reload_does_not_reprobe_an_unchanged_server() {
         let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
@@ -945,6 +949,10 @@ mod tests {
 
     /// 改了配置就必须重新探测,并把失败原文带上(不静默)。
     #[tokio::test]
+    // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
+    // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
+    // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn reload_reprobes_a_changed_server_and_reports_the_error() {
         let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
@@ -986,7 +994,13 @@ mod tests {
 
     /// 删除一个 server 后,它的工具名必须从 registry 消失。
     #[tokio::test]
+    // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
+    // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
+    // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
+    // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn reload_removes_a_deleted_server() {
+        let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
@@ -1029,7 +1043,16 @@ mod tests {
 
     /// 每轮检查:磁盘没变就不该说"变了",否则每轮都会白跑一次 reload。
     #[tokio::test]
+    // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
+    // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
+    // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
+    // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_is_false_when_nothing_changed() {
+        let _serial = seam_guard();
+        // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
+        // 免得持锁期间真去 spawn `npx` 子进程。
+        install_failing_connector();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
@@ -1047,7 +1070,16 @@ mod tests {
     }
 
     #[tokio::test]
+    // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
+    // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
+    // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
+    // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_detects_an_external_edit() {
+        let _serial = seam_guard();
+        // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
+        // 免得持锁期间真去 spawn `npx` 子进程。
+        install_failing_connector();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
@@ -1076,7 +1108,16 @@ mod tests {
 
     /// 配置从有到无:server 全被删掉,必须触发一次收尾 reload。
     #[tokio::test]
+    // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
+    // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
+    // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
+    // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_is_true_when_the_file_disappears() {
+        let _serial = seam_guard();
+        // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
+        // 免得持锁期间真去 spawn `npx` 子进程。
+        install_failing_connector();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         let path = dir.path().join(".yi-agent/mcp.json");
@@ -1104,6 +1145,10 @@ mod tests {
     /// 反向约束:TUI 的 `/mcp disable` 只改内存,磁盘上的 `enabled` 没变;
     /// 之后因为**别的**原因触发一次 reload,那个运行时开关不能被冲掉。
     #[tokio::test]
+    // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
+    // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
+    // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn reload_keeps_an_in_memory_switch_when_disk_did_not_change() {
         // 整进程共享的连接接缝:冷缓存探测会读它,必须与其它 seam 测试串行。
         let _serial = seam_guard();
@@ -1155,6 +1200,10 @@ mod tests {
     /// `mcp/set`(只写盘)与 `mcp_reload disable`(只写盘)的效果会在下一次
     /// reload 时被悄悄撤销——用户看到"已停用",工具却照旧可用。
     #[tokio::test]
+    // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
+    // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
+    // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn reload_honors_a_server_disabled_on_disk() {
         // 整进程共享的连接接缝:冷缓存探测会读它,必须与其它 seam 测试串行。
         let _serial = seam_guard();
@@ -1355,10 +1404,21 @@ mod tests {
         *TEST_CONNECTOR.lock().unwrap() = Some(factory);
     }
 
+    /// 装一个「立即失败」的 connector：探测必然失败并落成空工具列表，
+    /// 但不会 spawn 真实子进程，适合只关心配置行为的用例。
+    fn install_failing_connector() {
+        let factory: TestConnector = Arc::new(|| Box::pin(async { Err(anyhow!("no server")) }));
+        *TEST_CONNECTOR.lock().unwrap() = Some(factory);
+    }
+
     /// `TEST_CONNECTOR` 是进程级全局量,并行测试会互相清空/覆盖。
     /// 所有用到这个缝的测试都先拿这把锁,保证同一时刻只有一个在跑。
     static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 拿跨测试串行锁。
+    ///
+    /// 调用它的异步测试要带 `#[allow(clippy::await_holding_lock)]`——lint 在**调用点**
+    /// 触发，加在这里不生效。那是有意为之：锁必须保住整个 await 区间。
     fn seam_guard() -> std::sync::MutexGuard<'static, ()> {
         SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1373,6 +1433,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
+    // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
+    // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn probe_then_call_over_duplex() {
         let _serial = seam_guard();
         let _seam = SeamGuard;

@@ -374,12 +374,14 @@ async fn contract_error_status_mapping() {
                 .call(request(vec![]))
                 .await
                 .expect_err("must fail");
-            let ok = match (label, &err) {
-                ("auth", ProviderError::Auth(_)) => true,
-                ("rate", ProviderError::RateLimited) => true,
-                ("server", ProviderError::Server(_)) => true,
-                _ => false,
-            };
+            // `matches!` 而不是 `match`：三个分支只产出布尔值，写成 match 会触发
+            // clippy 的 `match_like_matches_macro`，而它正是 CI 的 `-D warnings` 门禁。
+            let ok = matches!(
+                (label, &err),
+                ("auth", ProviderError::Auth(_))
+                    | ("rate", ProviderError::RateLimited)
+                    | ("server", ProviderError::Server(_))
+            );
             assert!(ok, "{kind:?} {status}: unexpected {err:?}");
         }
     }

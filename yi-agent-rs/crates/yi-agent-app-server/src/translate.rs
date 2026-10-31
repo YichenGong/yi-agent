@@ -183,7 +183,13 @@ impl Translator {
     ///
     /// 由 driver 调用而非 children watch 任务自己发通知：那个任务拿不到
     /// `total_*`，自行构造 `TokenUsage` 会把客户端已正确的主会话累计覆盖成零。
-    pub fn set_subagent_totals(&mut self, totals: crate::protocol::SubagentTotals) -> Notification {
+    ///
+    /// `pub(crate)` 而非 `pub`：参数 `SubagentTotals` 是 crate 内部类型（刻意不带
+    /// `TS` derive，不进入前端协议），公开方法签名会泄漏更私有的类型。
+    pub(crate) fn set_subagent_totals(
+        &mut self,
+        totals: crate::protocol::SubagentTotals,
+    ) -> Notification {
         self.subagent = totals;
         self.usage_notification()
     }

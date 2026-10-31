@@ -2091,51 +2091,6 @@ impl Harness {
         )
     }
 
-    /// 自定义 config + 组长开关：`with_config_lead_and_scope` 的 config 版。
-    fn with_config_and_flags<F>(
-        cfg: RuntimeConfig,
-        build: F,
-        permission_timeout: Duration,
-        scope: Scope,
-        lead_agent_enabled: bool,
-    ) -> Self
-    where
-        F: Fn(
-                Option<yi_agent_core::Session>,
-                &std::path::Path,
-                crate::thread_store::ThreadMode,
-            ) -> anyhow::Result<BuiltAgent>
-            + Send
-            + Sync
-            + 'static,
-    {
-        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
-        let install_calls = Arc::clone(&calls);
-        let uninstall_calls = Arc::clone(&calls);
-        Self::with_config_and_scope_and_watchman(
-            cfg,
-            build,
-            permission_timeout,
-            scope,
-            Arc::new(move |_exe: &Path, home: &Path| {
-                install_calls
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push((true, home.to_path_buf()));
-                Ok(())
-            }),
-            Arc::new(move |home: &Path| {
-                uninstall_calls
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push((false, home.to_path_buf()));
-                Ok(())
-            }),
-            calls,
-            lead_agent_enabled,
-        )
-    }
-
     /// 自定义 config + 组长开关：需要指定 cwd 的用例用它。
     pub(crate) async fn with_cfg_and_lead(cfg: RuntimeConfig, enabled: bool) -> Self {
         Self::with_config_lead_and_scope(
