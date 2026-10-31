@@ -71,7 +71,7 @@ fn main() -> Result<()> {
                     &yi_agent_tools::websearch_path(),
                 );
                 yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
-                yi_agent_web::serve(host, *port, env_path).await
+                yi_agent_web::serve(host, *port, yi_agent_runtime::settings::settings_path()).await
             })
         }
         Some(Command::Run {

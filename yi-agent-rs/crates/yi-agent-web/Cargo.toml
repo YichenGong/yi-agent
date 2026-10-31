@@ -15,9 +15,9 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 yi-agent-store = { workspace = true }
+yi-agent-runtime = { path = "../yi-agent-runtime" }
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-yi-agent-runtime = { path = "../yi-agent-runtime" }
