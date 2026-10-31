@@ -20714,3 +20714,41 @@ async fn diff_read_does_not_block_the_main_loop() {
     assert!(v["result"].is_object(), "diff/read must still answer: {v}");
     h.shutdown().await;
 }
+
+/// `thread/diff/read` 的 panic 兜底必须按**调用方期望的形状**返回。
+///
+/// 整线程请求（只带 `threadId`，`useDiffState` 的 `loadThreadDiff` 发的就是
+/// 这个）期望 `ThreadDiffResult`；带 `commit` / `path` 的单文件请求期望
+/// `DiffTextResult`。两者字段不同，而前端 `setThreadDiff` 不做形状检查、
+/// `GitDiffView` 直接解引用 `files.length`——整线程请求若收到单文件形状，
+/// 面板必然崩。故钉死这两条兜底形状。
+#[test]
+fn diff_read_panic_fallback_matches_the_callers_shape() {
+    // 单文件请求：原样保留 DiffTextResult 形状。
+    let text = crate::rpc::thread::diff_read_fallback(true, Some("origin/main"));
+    assert_eq!(
+        text,
+        serde_json::json!({ "unifiedDiff": "", "truncated": false }),
+        "commit/path requests expect DiffTextResult and nothing else"
+    );
+
+    // 整线程请求：必须是字段齐全的空 ThreadDiffResult。
+    let whole = crate::rpc::thread::diff_read_fallback(false, Some("origin/main"));
+    assert_eq!(
+        whole,
+        serde_json::json!({
+            "base": "origin/main",
+            "baseKind": "none",
+            "mergeBase": serde_json::Value::Null,
+            "commits": [],
+            "files": [],
+            "unifiedDiff": "",
+            "truncated": false,
+        }),
+        "whole-thread requests expect a well-formed ThreadDiffResult"
+    );
+
+    // 无 `base` 时必须显式给 `null`，而不是把这个字段整个省掉。
+    let whole_no_base = crate::rpc::thread::diff_read_fallback(false, None);
+    assert_eq!(whole_no_base["base"], serde_json::Value::Null);
+}

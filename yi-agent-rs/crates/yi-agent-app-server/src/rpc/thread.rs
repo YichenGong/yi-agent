@@ -1940,6 +1940,11 @@ pub(crate) async fn handle(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            // 兜底应答的形状取决于请求种类(`commit` / `path` = 单文件,其余 =
+            // 整线程)。必须在参数被移进阻塞闭包之前定下来,否则 panic 分支只剩
+            // 一个通用形状可选,而两个调用方的契约并不相同。
+            let wants_text = commit.is_some() || path.is_some();
+            let fallback_base = base.clone();
             let hub = Arc::clone(state.hub);
             let client = state.client.clone();
             tokio::spawn(async move {
@@ -1970,7 +1975,7 @@ pub(crate) async fn handle(
                         // 只在 panic 时到这里。回一个合法形状的空结果,而不是
                         // 静默丢响应——后者会让客户端一直等。
                         eprintln!("[app-server] thread/diff/read task failed: {error}");
-                        json!({ "unifiedDiff": "", "truncated": false })
+                        diff_read_fallback(wants_text, fallback_base.as_deref())
                     }
                 };
                 let _ = write_response(&hub, &client, ok_response(id, body)).await;
@@ -2249,6 +2254,34 @@ pub(crate) fn scan_workspace_metas_for_test(
     seed_lead: bool,
 ) -> Vec<(String, Option<Vec<crate::thread_store::ThreadMeta>>)> {
     scan_workspace_metas(dirs, seed_lead)
+}
+
+/// `thread/diff/read` 在阻塞计算 panic 时的兜底应答体。
+///
+/// 两个调用方的契约不同,不能共用一种形状:
+/// - 带 `commit` / `path` 的**单文件**请求 → `DiffTextResult`
+///   (`{unifiedDiff, truncated}`,`desktop/src/lib/protocol.ts`)。
+/// - 只带 `threadId` 的**整线程**请求(前端 `loadThreadDiff` 发的就是这个)
+///   → `ThreadDiffResult`。前端不做形状检查,直接 `setThreadDiff(r)` 后由
+///   `GitDiffView` 解引用 `diff.files.length`;少给字段不是「显示无改动」而是
+///   渲染期抛错。
+///
+/// 只在 `spawn_blocking` panic 时走到,属降级路径,故 `baseKind` 取 `"none"`。
+pub(crate) fn diff_read_fallback(wants_text: bool, base: Option<&str>) -> serde_json::Value {
+    if wants_text {
+        return json!({ "unifiedDiff": "", "truncated": false });
+    }
+    // 字段必须是**齐的**:`ThreadDiff` 带 `#[serde(rename_all = "camelCase")]`,
+    // 故这里是 camelCase 而非 snake_case。
+    json!({
+        "base": base,
+        "baseKind": "none",
+        "mergeBase": serde_json::Value::Null,
+        "commits": [],
+        "files": [],
+        "unifiedDiff": "",
+        "truncated": false,
+    })
 }
 
 /// 构造 `thread/listAll` 的应答体（纯函数，可离开主循环执行）。
