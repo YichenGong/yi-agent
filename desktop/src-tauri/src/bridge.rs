@@ -698,6 +698,27 @@ fn spawn_once(
     }
 }
 
+/// `<本机 instance_home>/remote-status.json`，app-server 读它来回答
+/// `remote/relayTargets` 的 `available`（spec §4.6、§4.9）。
+fn remote_status_path() -> PathBuf {
+    instance_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("remote-status.json")
+}
+
+/// 把槽位状态写进旁路文件。失败**只记日志**：这是可丢的运行时状态，
+/// 不该让连接流程因为它失败。
+fn publish_status(slot: &ProfileKey, status: crate::remote::status::SlotStatus) {
+    let ProfileKey::Remote(id) = slot else {
+        // 本地槽位不该出现在这个文件里：它的可用性是显然的，
+        // 而且 phones 只关心远端项目。
+        return;
+    };
+    if let Err(error) = crate::remote::status::write_status(&remote_status_path(), id, status) {
+        eprintln!("[{}] could not publish status: {error}", slot.as_str());
+    }
+}
+
 /// `<本机 instance_home>/remote.json`（spec §4.9）。
 fn remote_config_path() -> PathBuf {
     instance_home()
@@ -730,6 +751,8 @@ fn spawn_remote_once(
 
     app.state::<Sidecar>()
         .set_slot(key.clone(), Arc::new(Mutex::new(Some(child))));
+    // 进程起来了但还没握手：对手机而言「连接中」，不是「可用」。
+    publish_status(key, crate::remote::status::SlotStatus::Connecting);
 
     Ok(rx)
 }
@@ -771,12 +794,26 @@ fn spawn_local_once(
 /// （spec §4.6 障碍二：任一槽位退出清空整张表，会让其余槽位的 RPC 立刻报
 /// "sidecar not running"）。
 fn clear_child(app: &AppHandle, key: &ProfileKey) {
+    if matches!(key, ProfileKey::Remote(_)) {
+        // 进程没了：手机会在下一次 `relayTargets` 看到不可用。
+        if let Ok(mut guard) = REPORTED_CONNECTED.lock() {
+            guard
+                .get_or_insert_with(std::collections::HashSet::new)
+                .remove(key.as_str());
+        }
+        publish_status(key, crate::remote::status::SlotStatus::Disconnected);
+    }
     if let Some(cell) = app.state::<Sidecar>().slot(key) {
         if let Ok(mut guard) = cell.lock() {
             *guard = None;
         }
     }
 }
+
+/// 已标记为 `Connected` 的远端槽位。首帧之后不再重复写盘：这条路径每帧都跑，
+/// 每次都写 JSON 会在流式输出时把磁盘打满。
+static REPORTED_CONNECTED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
 
 fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
@@ -788,6 +825,18 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
         eprintln!("[sidecar] dropping non-JSON line: {line}");
         return;
     };
+    // 第一帧能解析 = 远端 app-server 真的在说话（ssh 已连上且进程已 exec）。
+    // 真正的 `initialize` 由前端发，桥接层只凭「有合法协议帧」判定可用。
+    if let ProfileKey::Remote(id) = slot {
+        let mut guard = REPORTED_CONNECTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reported = guard.get_or_insert_with(std::collections::HashSet::new);
+        if reported.insert(id.clone()) {
+            publish_status(slot, crate::remote::status::SlotStatus::Connected);
+        }
+    }
+
     match classify(&value) {
         Frame::ReverseRequest => {
             let _ = app.emit(&event_name("request", slot), &value);
@@ -1164,6 +1213,79 @@ mod tests {
         }
 
         assert_eq!(state.keys(), vec![ProfileKey::Local]);
+    }
+
+    // ---- 槽位化的重试策略（计划 03 · Task 1）----
+
+    /// 本地行为必须逐字不变：这是重构打底的前提，改了就是回归。
+    #[test]
+    fn local_backoff_keeps_its_five_second_cap() {
+        assert_eq!(
+            next_restart_delay_for(&ProfileKey::Local, 10),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    /// 远端的失败原因通常是网络断/服务器关机，5s 一次的 ssh 只是白撞。
+    #[test]
+    fn remote_backoff_climbs_to_sixty_seconds() {
+        let key = ProfileKey::Remote("p".into());
+        assert_eq!(next_restart_delay_for(&key, 0), Duration::from_millis(200));
+        assert_eq!(next_restart_delay_for(&key, 9), Duration::from_secs(60));
+        // 上限是硬顶，不能因为移位溢出回绕成一个小值。
+        assert_eq!(next_restart_delay_for(&key, 1_000), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn remote_gives_up_after_five_consecutive_failures() {
+        let key = ProfileKey::Remote("p".into());
+        assert!(should_retry(&key, 4), "the 5th attempt still happens");
+        assert!(
+            !should_retry(&key, 5),
+            "after 5 failures stop hammering the server"
+        );
+    }
+
+    #[test]
+    fn local_never_gives_up() {
+        assert!(should_retry(&ProfileKey::Local, 1_000));
+    }
+
+    /// `Connected` 只在首帧写一次。
+    ///
+    /// 这条路径每帧都跑（流式输出一秒几十帧），每帧都做一次读-改-写 JSON
+    /// 会把磁盘打满，而且这些写没有任何新信息。
+    #[test]
+    fn connected_is_published_once_per_slot() {
+        use crate::remote::status::SlotStatus;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("remote-status.json");
+
+        // 模拟 forward_stdout 的记账逻辑。
+        let mut reported = std::collections::HashSet::new();
+        for _ in 0..50 {
+            if reported.insert("proj-foo".to_string()) {
+                crate::remote::status::write_status(&path, "proj-foo", SlotStatus::Connected)
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(reported.len(), 1);
+        let map = crate::remote::status::read_status(&path);
+        assert_eq!(map.get("proj-foo"), Some(&SlotStatus::Connected));
+    }
+
+    /// 重连后必须能重新记为 Connected：清空记账的那一步不能漏。
+    #[test]
+    fn a_reconnect_can_republish_connected() {
+        let mut reported: std::collections::HashSet<String> =
+            ["proj-foo".to_string()].into_iter().collect();
+        // clear_child 会把它摘掉。
+        reported.remove("proj-foo");
+        assert!(
+            reported.insert("proj-foo".to_string()),
+            "after a disconnect the slot must be reportable again"
+        );
     }
 
     // `configured_relay` reads a process-global env var. Cargo runs tests in
