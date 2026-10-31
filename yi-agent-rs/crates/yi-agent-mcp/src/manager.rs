@@ -2273,6 +2273,87 @@ mod tests {
             "连续两轮后 needs_reload 必须为 false"
         );
     }
+
+    // ---- 放大路径防线 ----
+
+    /// 连续 10 轮 needs_reload + reload,坏 server 的探测次数必须是 1~2 次。
+    #[tokio::test]
+    async fn a_permanently_dead_server_is_probed_once_per_backoff_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        // 先把过期缓存写好,**再**建 manager:否则启动探测失败会在
+        // load_and_probe 里写下 failed_at,掩盖「reload 有没有记失败」这件事。
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不该探测(缓存只看指纹)"
+        );
+        // 清掉 failed_at,把起点固定成「已过期、未退避」
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let mut probes = 0usize;
+        for round in 0..10 {
+            let t = now + round; // 10 秒内跑完 10 轮
+            if mgr.needs_reload(dir.path(), t) {
+                let report = mgr.reload(dir.path(), t).await;
+                probes += report.servers.iter().filter(|s| s.probed).count();
+            }
+        }
+        assert!(
+            (1..=2).contains(&probes),
+            "10 轮内应只探 1~2 次,实际 {probes} 次(退避失效会变成 10 次,每轮 55s)"
+        );
+        assert!(
+            (1..=2).contains(&calls.load(std::sync::atomic::Ordering::SeqCst)),
+            "连接尝试次数应与探测次数一致"
+        );
+    }
+
+    /// 同一进程内先建立快照,把缓存时间戳改旧,再 reload ⇒ 必须重探。
+    #[tokio::test]
+    async fn reload_reprobes_when_the_in_memory_snapshot_has_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_echo_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+        let built = mgr.enabled_tools().len();
+        assert!(built > 0);
+
+        // 把磁盘缓存时间戳改到 25h 前(配置指纹不变)
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        let tools = cache
+            .cached_tools_ignoring_freshness("fs", &sc)
+            .expect("cache hit")
+            .to_vec();
+        cache.put("fs", &sc, tools, now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(
+            report.servers[0].probed,
+            "内存快照过期后必须重探(否则永远拿不到新工具名)"
+        );
+    }
 }
 
 #[cfg(test)]
