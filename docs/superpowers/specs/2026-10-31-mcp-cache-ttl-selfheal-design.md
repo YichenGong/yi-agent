@@ -101,8 +101,10 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 - 不做漂移告警、不做缓存格式版本号治理（方案 C 的内容）。
 - 不新增 `mcp_reload refresh` 动作或设置页「重新探测」按钮（方案 B 的内容）。
 - 不修正 `-32603` 被误分类为传输错误的问题（见 §8，独立缺陷）。
-- 不修其他与缓存判据无关的 MCP 缺陷；唯一例外是 §4.3.1.1(a) 的 `enabled` 短路——它
-  与本设计改的是同一条判据，留着会让两条路径行为分裂，故一并统一。
+- 不修其他与缓存判据无关的 MCP 缺陷；例外是 §4.3.1.1(a) 的单 server `enabled` 短路与
+  §4.3.1.1(d) 的顶层 `cfg.enabled` 短路——它们与本设计改的是同一条判据（「什么时候该
+  探测」），留着会让 `needs_reload` 与 `reload` 行为分裂，故一并统一。
+  另外 §4.3.4 的 `cache::save` 原子写也是例外：`failed_at` 的可靠性直接依赖它。
 - 不解决 stdio server 的工具清单变化实时感知。
 - 不让 headless（`yi-agent run`）在进程内自愈：它没有每轮检查，且启动路径刻意不校验
   TTL（§3 决策 1、§4.2）。
@@ -154,8 +156,12 @@ server 逐个判断新鲜度，未过期的零成本复用。**但在正常使�
 | 引入的短路 | 若 `needs_reload` 不同步 | 后果 |
 |---|---|---|
 | 退避窗口（`BackedOff`） | 用 `!is_fresh` 判过期 | 窗口内每轮真 → 每轮白做一遍 |
-| `enabled == false` 不探测 | 不排除停用 server | **永久**每轮真（条目永不刷新） |
+| 单 server `sc.enabled == false` 不探测（§4.3.1.1(a)） | 不排除停用 server | **永久**每轮真（条目永不刷新） |
+| 顶层 `cfg.enabled == false` 不探测（§4.3.1.1(d)） | 不排除总开关关闭 | **永久**每轮真（所有条目都不刷新） |
 | 手动 reload 的 `force` 之类 | 同上 | 同上 |
+
+后两条是同一形状的两个粒度（单 server / 全局）。不要把 `cfg.enabled` 当成「循环外
+一次判断」就以为覆盖了——`needs_reload` 是**另一个函数**，它必须自己再判一次。
 
 于是有一条可机械检查的规则：
 
@@ -163,7 +169,8 @@ server 逐个判断新鲜度，未过期的零成本复用。**但在正常使�
 
 实现时用一个函数承载这个对齐关系（例如 `fn needs_attention(cache, name, sc, now) -> bool`），
 让 `reload` 的短路分支与它共用同一个真值来源，而不是两处各写一遍条件。凡是新增
-「跳过探测」的理由，都必须同时进入这个函数。
+「跳过探测」的理由，都必须同时进入这个函数。签名里要带上 `cfg.enabled`——否则
+§4.3.1.1(d) 的全局短路无处安放，又会变成两处各写一遍。
 
 判据分叉的代价不只是性能：每轮 `refresh_registry` 会 clone 整个工具表并重建 `Agent`，
 在 10 个 server、几百个工具的配置下是一笔真实的 CPU 与分配开销，且会打断 prompt cache
@@ -251,6 +258,19 @@ struct CachedServer {
 「过期且刚失败」只能二选一——回 `Some` 会让它永远不再重探（过期状态被固化成命中），
 回 `None` 会与「从未探测」混同并清空已有清单，且必然破坏退避。
 
+**判定的顺序是有语义的，不能重排。** 表格第一行写「指纹不匹配 ⇒ 重探（不受退避
+约束）」，若把退避检查放在指纹检查之前，就会得到相反的行为：
+
+```
+用户改了 mcp.json 的 url（指纹不匹配）
+但该 server 1 分钟前刚探测失败过（failed_at 在 5 分钟窗口内）
+```
+
+此时若先判退避，`lookup` 返回 `BackedOff` ⇒ **配置改动要等 5 分钟才生效**，用户会
+看到「改了配置没反应」，并怀疑设置页坏了。实测这个分支确实会走成 `BackedOff`，所以
+实现时必须先比指纹：指纹不匹配一律 `Stale`，退避只对「同一份配置」有意义——它记录的
+是「这个配置刚才探不通」，配置变了这个结论就不适用了。
+
 ```rust
 /// 一次缓存查找的结果。「旧值是否保留」是 reload 的策略，不属于查找语义，
 /// 故不塞进枚举。
@@ -287,9 +307,11 @@ impl CacheLookup<'_> {
 
 ```rust
 impl McpCache {
-    /// `Fresh` 条件：指纹匹配且 `probed_at` 在 TTL 内。
-    /// `BackedOff` 条件：不新鲜，但 `failed_at` 在退避窗口内。
-    /// 其余（指纹不匹配 / 从未探测 / 过期且可重试）⇒ `Stale`。
+    /// 判定顺序**严格如下**（顺序本身就是语义，见下）：
+    ///   1. 指纹不匹配 或 无条目 ⇒ `Stale`（配置变了，退避对它无效）
+    ///   2. `probed_at` 在 TTL 内 ⇒ `Fresh`
+    ///   3. `failed_at` 在退避窗口内 ⇒ `BackedOff`
+    ///   4. 其余 ⇒ `Stale`
     pub fn lookup<'a>(
         &'a self,
         name: &str,
@@ -375,9 +397,8 @@ const RETRY_AFTER_SECS: i64 = 5 * 60;
 `put_at = now ± jitter(name)` 再传进去——时钟注入的意义正是「时间由调用方决定」。
 
 **`get_for` 不能直接删掉，它在设置页有一条语义不同的读路径。** 它是 `&self` 方法
-（不是自由函数），因此 `reload` 里 `cache.lookup(...)` 的借用与
-`cache.cached_tools_ignoring_freshness(...)` 的比较可以共存——前者只比指纹、不返回
-引用给 `put` 之后的代码，后者要 `.to_vec()` 才能在 `&mut cache` 上继续写（见上）。
+（不是自由函数），返回值要 `.to_vec()` 才能在 `&mut cache` 上继续写——`note_failure`
+也取 `&mut self`，所以旧清单必须在调用它之前克隆出来（§4.2 的失败分支示例即如此）。
 决策改为：
 
 - 重命名 `get_for` → `cached_tools_ignoring_freshness`（`lib.rs` 的 `cached_tools_for`、
@@ -433,12 +454,22 @@ const RETRY_AFTER_SECS: i64 = 5 * 60;
 
 ```rust
 pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
-    // 1. 配置指纹变了 ⇒ 一定重载（既有逻辑，先于缓存判断）
-    if self.fingerprint_changed(workdir) { return true; }
+    // 整个函数只读一次 mcp.json：解析结果同时用于指纹比较与逐 server 判定。
+    let current = self.fingerprint_and_config(workdir); // Option<(String, McpConfig)>
+
+    // 1. 指纹变了 ⇒ 一定重载（既有逻辑，先于缓存判断）
+    let last = self.last_seen_fingerprint();
+    let changed = match (&current, &last) {
+        (None, None) => false,
+        (Some((fp, _)), Some(prev)) => fp != prev,
+        _ => true,   // 文件出现 / 消失
+    };
+    if changed { return true; }
 
     // 2. 配置没变，但某个 server 的缓存条目已过期且允许重试 ⇒ 也要重载。
-    //    复用第 1 步已解析出的配置，不重复读盘（见下）。
-    let Some((_, cfg)) = self.fingerprint_and_config(workdir) else { return false };
+    let Some((_, cfg)) = current else { return false };
+    // 总开关关闭 ⇒ reload 整段跳过（§4.3.1.1(d)），不能成为触发条件。
+    if !cfg.enabled { return false; }
     let cache = McpCache::load(workdir);
     cfg.mcp_servers.iter().any(|(name, sc)| {
         // 停用的 server 由 reload 短路、永不探测 ⇒ 不能让它触发 reload，
@@ -452,11 +483,37 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
 }
 ```
 
-**实现要点：把现有的 `config_fingerprint` 拆成「读一次盘、同时拿到指纹和配置」**
-（`fingerprint_and_config`），`needs_reload` 内部只读一次。既有的
-`config_fingerprint` 每轮已经 `read_to_string` + `serde_json::from_str` 一次，
-若按最直观的写法再调一次 `McpConfig::load`，每轮就要多读多解析一遍 `mcp.json`。
-把解析结果传下去，比多读一次省事得多——这是纯重构，行为不变。
+**实现要点：把现有的 `config_fingerprint` 改成「读一次盘、同时拿到指纹和配置」。**
+
+现状（`manager.rs:310`）它只返回 `Option<String>`——配置解析完、算完指纹就丢掉：
+
+```rust
+pub fn config_fingerprint(&self, workdir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(crate::config::config_path(workdir)).ok()?;
+    let cfg: McpConfig = serde_json::from_str(&text).ok()?;
+    Some(crate::cache::fingerprint_for_manager(&cfg))
+}
+```
+
+因此不能像我初稿那样写「第 1 步调用 `fingerprint_changed`、第 2 步复用它的解析结果」
+——第 1 步内部没有把结果留下来。正确做法是新增
+`fingerprint_and_config(workdir) -> Option<(String, McpConfig)>`，让 `needs_reload`
+**只调用它一次**，指纹比较与逐 server 判定都用同一份；旧的 `config_fingerprint`
+改为它的薄包装（`map(|(fp, _)| fp)`），保留给其他调用方。
+
+若不这样做，每轮就要 `read_to_string` + `serde_json::from_str` 两遍 `mcp.json`。这是
+纯重构，行为不变。`_ => true` 分支的等价性已逐情形验证（旧实现 `match (current, last)`
+vs 新实现）：
+
+| 情形 | 旧 | 新 |
+|---|---|---|
+| 从未有配置（`None`/`None`） | false | false |
+| 配置从无到有 | true | true |
+| 配置从有到无 | true | true |
+| 指纹未变 | false | false |
+| 指纹变了 | true | true |
+
+五种情形全部一致。
 
 两条注意：
 
@@ -566,6 +623,14 @@ Some(e) => {
 即「内存快照非空就用它；只有内存里也没有（server 刚加进来、从未成功探测过）时，
 才回落到磁盘缓存」。
 
+**`Fresh` / `BackedOff` 也必须走同一个「内存快照优先」规则，不要写成「`Fresh` 时用
+磁盘清单」。** 二者都有 `probed_at`/`failed_at` 记录，说明磁盘上有条目，但磁盘清单
+可能落后于内存——`cache.save` 失败只 `warn` 不中断（`manager.rs:171`、`manager.rs:296`
+都是 `if let Err(e) = cache.save(..) { warn!(..) }`），磁盘满或只读文件系统下内存
+已经更新、磁盘仍是旧的；用户手工删掉 `mcp-cache.json` 也会造成同样分叉。agent 手上
+跑的是内存那批，按磁盘清单回填会让工具集在两轮之间抖动。数据流图与 §4.2 的 `match`
+分支现在写的是同一条规则。
+
 ### 4.3 数据流
 
 ```
@@ -574,9 +639,12 @@ Some(e) => {
        ├─ 否（未变 / 全 Fresh / 全 BackedOff）→ 继续本轮
        └─ 是 → reload()
                 ├─ 对每个 server（顺序执行，见下）:
-                │    ├─ enabled==false       → 不探测;工具=内存快照→磁盘缓存→空
-                │    ├─ lookup()==Fresh      → 用 tools.to_vec()(磁盘清单),probed=false
-                │    ├─ lookup()==BackedOff  → 沿用旧清单(内存快照优先),不探测
+                │    ├─ !cfg.enabled || !sc.enabled
+                │    │                       → 不探测;工具=内存快照→磁盘缓存→空
+                │    │                          （§4.3.1.1(a)(d)）
+                │    ├─ lookup().is_settled() (Fresh / BackedOff)
+                │    │                        → 不探测;工具=内存快照→磁盘缓存→空
+                │    │                          （与 §4.2 的 match 分支逐字一致；probed=false）
                 │    └─ lookup()==Stale      → probe_tools()
                 │         ├─ 成功 → put(tools, now)  → probed=true
                 │         └─ 失败 → 回退:内存快照(非空)→磁盘缓存(否则)
@@ -600,6 +668,10 @@ Some(e) => {
 CONNECT_TIMEOUT 30s + PROBE_TIMEOUT 20s + REAP_TIMEOUT 5s = 55s     （每轮，每个坏 server）
 ```
 
+三个常量都在 `manager.rs:34-42`，相加关系与该文件的注释一致。**探测是串行的**，所以
+k 个坏 server 的每轮代价是 `k * 55s`：3 个坏 server 就是 165 秒，用户会认为整个应用
+卡死。这也是「必须退避」而非「失败后立刻重试」的根本原因。
+
 当前 main 上不会有这个问题：`config_changed_on_disk` 只比指纹，坏 server 不触发
 reload。所以这是**新增**的回归，不是既有缺陷。方向必须反过来。
 
@@ -617,7 +689,9 @@ reload。所以这是**新增**的回归，不是既有缺陷。方向必须反�
 | `fresh` | 24h（`TTL_SECS`） | 旧工具名还能不能继续用 |
 | `backed_off` | 5min（`RETRY_AFTER_SECS`） | 现在允不允许再试一次 |
 
-`Stale`（= `!fresh && !backed_off`）才会真正触发探测；否则沿用旧清单、不探测。于是：
+`Stale` 才会真正触发探测；否则沿用旧清单、不探测。`Stale` 的完整定义是
+**「指纹不匹配」或「指纹匹配 && `!fresh` && `!backed_off`」**——不能只写
+`!fresh && !backed_off`，那会把「用户改了配置」漏成「不探」（§4.1 的顺序表）。于是：
 
 | 场景 | 行为 |
 |---|---|
@@ -630,9 +704,9 @@ reload。所以这是**新增**的回归，不是既有缺陷。方向必须反�
 `RETRY_AFTER_SECS = 5min` 的依据：自愈延迟从 24h 变成「24h + 最多 5 分钟」，用户不可感知；
 而最坏情况开销从「每轮 55s」降到「每 5 分钟 55s」。
 
-### 4.3.1.1 三个尚未被覆盖的放大路径
+### 4.3.1.1 四个尚未被覆盖的放大路径
 
-上面那句「每 5 分钟一次」只在「单个坏 server、每轮间隔大于 0」时成立。以下三种情形会
+上面那句「每 5 分钟一次」只在「单个坏 server、每轮间隔大于 0」时成立。以下四种情形会
 放大它，实现时必须处理，否则这个防回归措施本身会变成新的回归。
 
 **（a）`reload` 不检查 `enabled`，停用的坏 server 照样占满探测预算。**
@@ -714,6 +788,50 @@ probed_at` 已远超 24h，于是**开机第一轮就探一次**。这是预期�
 
 为什么失败也要写盘（`note_failure`）：`failed_at` 若不落盘，进程重启后又会立刻重试一次
 ——重启频繁时同样会放大代价。落盘后重启不会重置退避。
+
+**（d）顶层总开关关闭时，`reload` 仍然逐个探测。**
+
+这一条是 (a) 的上一级，容易被漏掉：`(a)` 处理的是单个 server 的 `sc.enabled`，但配置
+里还有一个顶层 `cfg.enabled`（「MCP 总开关」）。`reload` 的循环体（`manager.rs:226`
+起）**两者都不看**——它遍历 `cfg.mcp_servers` 逐个判定，顶层开关只在函数末尾被存进
+`master_enabled`（`manager.rs:299`），不影响是否探测。
+
+于是「用户把整个 MCP 关掉」之后，所有 server 的过期条目仍会各自到期、各自探测：坏端点
+每 5 分钟付一次 `k * 55s`，而这段时间**一个工具都没注册**（`refresh_registry` 在 master
+关闭时给空表）。用户明确关掉了功能，后台却还在为它付最贵的代价。
+
+修法与 (a) 同形：**把「允不允许探测」收敛成一个表达式，两个开关一起看**。不要用
+「函数开头 `if !cfg.enabled { return .. }`」提前返回——那样会绕过 `next` 的构建、
+`last_seen` 的更新与 `cache.save`，下一轮立刻因为指纹没更新而再次 `reload`，把短路
+变成新的空转源。正确写法是在每个 server 的判定前算一次：
+
+```rust
+for (name, sc) in &cfg.mcp_servers {
+    // 总开关或单 server 开关关闭 ⇒ 一律不探测（§4.3.1.1(a)(d)）
+    let probe_allowed = cfg.enabled && sc.enabled;
+    let reusable = old.get(name).filter(|e| e.config == *sc);
+    let (tools, probed, error) = match reusable {
+        Some(e) if !probe_allowed || cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS).is_settled() => {
+            // 沿用：内存快照 → 磁盘缓存 → 空
+            let t = if e.tools.is_empty() {
+                cache.cached_tools_ignoring_freshness(name, sc).map(<[CachedTool]>::to_vec)
+            } else { Some(e.tools.clone()) };
+            (t.unwrap_or_default(), false, None)
+        }
+        // …其余与 §4.2 相同…
+    };
+}
+```
+
+`needs_reload` 也必须同步短路：`cfg.enabled == false` 时直接返回 `false`，否则
+「某 server 过期 ⇒ 每轮 reload」的空转仍在。这与 (a) 那条总原则完全一致——**`reload`
+不会做任何事的 server，就不能成为触发条件**，只是这里「不会做任何事」的范围是全局。
+
+**`probe_allowed == false` 时不要调 `note_failure`。** 没探测就没有失败，写 `failed_at`
+会让重新启用后白等 5 分钟。
+
+**不要顺手在 master 关闭时清空磁盘缓存。** 保留清单才能让「关掉再打开」零成本；清空
+的话重新打开要重探全部 server，等于把开关变成一次全量重启。
 
 ### 4.3.1.1.1 首次迁移是最坏情况，必须单独处理
 
@@ -967,7 +1085,10 @@ TTL（§4.2），删掉缓存文件后重启，`get_for` 查不到条目 ⇒ 走
 | `backfill_does_not_touch_the_fingerprint` | 指纹不匹配的存量条目被 backfill 后 `lookup` 仍返回 `Stale`（防止「顺手修正指纹」把旧清单冒充成新清单） |
 | `a_future_probed_at_is_treated_as_stale` | `probed_at = now + 1h` → `Stale` |
 | `a_failed_probe_does_not_make_the_entry_fresh` | 探测失败后 `probed_at` 不变（不能假装新鲜） |
-| `retry_is_skipped_within_the_backoff_window` | `failed_at = now - 1min` → 不探测、旧清单照旧 |
+| `retry_is_skipped_within_the_backoff_window` | 指纹匹配 + `failed_at = now - 1min` → 不探测、旧清单照旧 |
+| `a_fingerprint_change_ignores_the_backoff_window` | 指纹**不**匹配 + `failed_at = now - 1min` → `lookup` 返回 `Stale`（不是 `BackedOff`），配置改动立即生效 |
+| `master_off_probes_nothing_even_when_stale` | `cfg.enabled=false` + 条目过期 → `reload` 不探测、`probed=false`、`failed_at` 不被写、旧清单保留 |
+| `master_off_suppresses_needs_reload` | `cfg.enabled=false` + 某 server 过期 → `needs_reload` 返回 `false`（否则每轮空转） |
 | `retry_happens_after_the_backoff_window` | `failed_at = now - 6min` → 再试一次 |
 | `a_failure_persists_the_backoff_across_restarts` | 失败后重新 `McpCache::load`，`failed_at` 仍在 |
 | `a_permanently_dead_server_is_probed_once_per_backoff_window` | 连续 10 轮 `needs_reload`，探测次数为 1~2，不是 10 |
@@ -1044,7 +1165,7 @@ TTL（§4.2），删掉缓存文件后重启，`get_for` 查不到条目 ⇒ 走
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-mcp              # 期望：全绿，新增 26 例
+cargo test -p yi-agent-mcp              # 期望：全绿，新增 29 例
 cargo test -p yi-agent-mcp --test http_transport -- --ignored   # 真实端点
 cargo test -p yi-agent-app-server --lib # 下游未受影响（1068+）
 cargo test -p yi-agent-runtime --lib
@@ -1060,6 +1181,10 @@ cargo fmt --all -- --check
   `needs_reload_is_false_while_a_stale_entry_is_backed_off` 变红。
 - 去掉 `needs_reload` 里的 `sc.enabled &&` → `needs_reload_is_false_for_a_disabled_expired_server`
   变红（守卫「停用 server 导致永久空转」）。
+- 把 `lookup` 里的退避判定挪到指纹判定之前 → `a_fingerprint_change_ignores_the_backoff_window`
+  变红（守卫「改配置后要等 5 分钟」）。
+- 把 `probe_allowed` 里的 `cfg.enabled` 去掉 → `master_off_probes_nothing_even_when_stale`
+  变红（守卫「关掉总开关后仍在付 55s」）。
 - 把 `is_backed_off` 改成恒 `false` → `a_permanently_dead_server_is_probed_once_per_backoff_window`、
   `needs_reload_is_false_while_a_stale_entry_is_backed_off` 变红
   （这条专门守护性能回归，是 §4.3.1 的直接防线）。
@@ -1074,6 +1199,9 @@ cargo fmt --all -- --check
    配置不启用限额），而是留一个可观测基线。
 3. **升级路径**：用一份不含 `probed_at` 的旧缓存启动，确认**没有任何探测**发生
    （R1 已处理），且 `mcp-cache.json` 里被补上了 `probed_at`。
+4. **总开关关闭**：把顶层 `enabled` 设为 `false`，其余 server 保持「过期 + 上次探测
+   失败」状态，发几条消息并观察日志。**不应出现任何探测**，且 `failed_at` 不被刷新。
+   然后把总开关打开，确认工具立刻按 `Stale` 路径正常探测一次。
 
 ## 8. 范围外的已知缺陷（记录，不在本 spec 处理）
 
