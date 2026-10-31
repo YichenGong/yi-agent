@@ -40,6 +40,8 @@ libc = "0.2"
 sha2 = "0.10"
 # 复用 tauri 已经拉进来的 reqwest（0.13）做阻塞下载，避免再多一棵依赖树。
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# 远端没有 gzip 时要在本机先把 .tar.gz 解成 .tar（复用 tauri 已引入的 flate2）。
+flate2 = "1"
 # 开关判定的唯一真源。本 crate 刻意不依赖 `yi-agent-store`（它带 bundled
 # rusqlite），所以引入它不会把 SQLite 链进桌面二进制。
 yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }

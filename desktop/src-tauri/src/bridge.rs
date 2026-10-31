@@ -8,6 +8,7 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 use crate::remote::profile::ProfileKey;
+use crate::remote::{run_remote, sh_quote};
 
 /// `preferences.json` key the sidecar reads its relay URL from. Mirrors
 /// `yi_agent_app_server::settings_store::RELAY_URL_KEY`.
@@ -507,6 +508,7 @@ fn kill_sidecar(app: &AppHandle, slot: &ProfileKey) {
 
 /// 杀全部槽位。**只给 App 退出用**，不要变成默认可调用的
 /// （spec §4.6 障碍一：改个中继配置就把所有远端项目一起断开是用户可见事故）。
+#[allow(dead_code)]
 pub fn kill_all_slots(app: &AppHandle) {
     for key in app.state::<Sidecar>().keys() {
         kill_sidecar(app, &key);
@@ -566,12 +568,81 @@ fn remote_gate() -> Result<(), String> {
 
 /// 开始连一个远端项目。启动后由监督循环维持（断线自动重连、退避到 60s）。
 #[tauri::command]
-pub fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), String> {
+pub async fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), String> {
     remote_gate()?;
     crate::remote::profile::validate_profile_id(&profile_id).map_err(|e| e.to_string())?;
-    let key = ProfileKey::Remote(profile_id);
+    let key = ProfileKey::Remote(profile_id.clone());
+
+    // 首次连接自动安装（用户选定的方案 A：不给用户一个手装步骤）。安装是
+    // 阻塞的 ssh/scp/下载，绝不能跑在 Tauri 的异步执行器线程上——那会让整个
+    // 窗口在一次 20 秒的连接超时里僵住。
+    let profile = crate::remote::config::load(&remote_config_path())
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("unknown remote profile `{profile_id}`"))?;
+    let home = instance_home().ok_or_else(|| "home directory is unavailable".to_string())?;
+    let connect_key = key.clone();
+    let app_for_spawn = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_installed(&home, &profile)
+            .map(|_| connect_key)
+            .map_err(|error| {
+                let _ = &app_for_spawn;
+                error
+            })
+    })
+    .await
+    .map_err(|error| format!("install task failed: {error}"))??;
+
     app.state::<Sidecar>().mark_desired(&key);
     spawn(&app, key)
+}
+
+/// 远端已经有匹配版本的二进制就跳过，否则按决策表装一次。
+///
+/// 「先查后装」而不是「每次连接都装」：`--version` 一次 ssh 往返，比再传一次
+/// 十几 MB 便宜一个数量级，而且重连是常态（断线重连、切回前台）。
+fn ensure_installed(
+    home: &std::path::Path,
+    profile: &crate::remote::profile::RemoteProfile,
+) -> Result<(), String> {
+    let binary =
+        crate::remote::cache::remote_binary_path(&profile.instance_root, &profile.binary_version);
+    let probe = format!(
+        "if [ -x {binary} ]; then {binary} --version; fi",
+        binary = sh_quote(&binary)
+    );
+    if let Ok(output) = run_remote(&profile.host, &probe) {
+        let reported = output.trim();
+        if !reported.is_empty() && reported.contains(&profile.binary_version) {
+            return Ok(());
+        }
+    }
+
+    let probe_output = run_remote(&profile.host, crate::remote::probe::probe_command())?;
+    let caps = crate::remote::probe::parse_caps(&probe_output, &probe_output)?;
+    if caps.target != profile.remote_arch {
+        return Err(format!(
+            "profile `{}` is configured for {} but the remote is {}; refusing to upload a              binary built for another architecture",
+            profile.id, profile.remote_arch, caps.target
+        ));
+    }
+
+    let fetcher = crate::remote::fetch::HttpFetcher;
+    crate::remote::install::install(
+        &fetcher,
+        home,
+        &profile.instance_root,
+        caps.target,
+        &profile.binary_version,
+        &caps,
+        &profile.host,
+        None,
+    )?;
+    // 装完立刻清旧版本缓存，避免每次升级多留十几 MB。
+    let _ = crate::remote::cache::prune(home, &profile.binary_version);
+    Ok(())
 }
 
 /// 用户主动断开：撤销「希望连着」再杀进程。

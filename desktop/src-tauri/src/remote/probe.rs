@@ -36,6 +36,7 @@ pub fn probe_command() -> &'static str {
 /// 远端 home 的绝对路径。
 ///
 /// `~` 在非交互 ssh 里通常可用但不保证；`$HOME` 更可靠，两者都试一遍。
+#[allow(dead_code)]
 pub fn expand_home_probe_command() -> &'static str {
     r#"printf '%s\n' "${HOME:-$(cd ~ && pwd)}""#
 }

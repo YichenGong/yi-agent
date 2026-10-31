@@ -68,6 +68,7 @@ pub fn load(path: &Path) -> RemoteConfig {
 
 /// 唯一临时名：并发写者不得共用同一个临时路径，否则一个 `rename` 会
 /// `ENOENT` 另一个的（`device_store.rs:120-128` 的同一考量）。
+#[allow(dead_code)]
 fn temp_path(path: &Path) -> PathBuf {
     path.with_extension(format!(
         "json.{}.{}.tmp",
@@ -77,6 +78,7 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 /// 原子写。`flock` 覆盖整个读-改-写窗口。
+#[allow(dead_code)]
 pub fn save(path: &Path, config: &RemoteConfig) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -93,6 +95,7 @@ pub fn save(path: &Path, config: &RemoteConfig) -> io::Result<()> {
 }
 
 /// `flock(LOCK_EX)`，被信号打断则重试。
+#[allow(dead_code)]
 fn lock_exclusive(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     loop {
