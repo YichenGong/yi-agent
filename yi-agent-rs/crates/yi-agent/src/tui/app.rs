@@ -35,7 +35,7 @@ use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar_with};
 use super::theme::TuiTheme;
 use super::trace::{
-    SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list,
+    SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list_with,
 };
 
 const HISTORY_WHEEL_LINES: usize = 3;
@@ -427,7 +427,10 @@ fn run_loop<B: Backend, E: EventSource>(
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let initial_queued_lines = crate::tui::queued::render_queued_preview(queued.items(), width);
+        // Task 7 threads the detected theme into `run_loop`; until then the
+        // loop renders with the historical dark palette.
+        let initial_queued_lines =
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, TuiTheme::DARK);
         let initial_layout = compute_layout(
             area,
             input,
@@ -465,8 +468,12 @@ fn run_loop<B: Backend, E: EventSource>(
             })
             .count()
             .min(queued.len());
-        let final_queued_lines =
-            crate::tui::queued::render_queued_preview(&queued.items()[promotion_count..], width);
+        // Task 7 threads the detected theme here too.
+        let final_queued_lines = crate::tui::queued::render_queued_preview_with(
+            &queued.items()[promotion_count..],
+            width,
+            TuiTheme::DARK,
+        );
         let final_layout = compute_layout(
             area,
             input,
@@ -537,7 +544,9 @@ fn run_loop<B: Backend, E: EventSource>(
             .capture_viewport_anchor(final_text_width, final_history_area.height)
             .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
-        let queued_lines = crate::tui::queued::render_queued_preview(queued.items(), width);
+        // Task 7 threads the detected theme here too.
+        let queued_lines =
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, TuiTheme::DARK);
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
@@ -1040,8 +1049,15 @@ fn render_runtime_popup(
         }
         RuntimePopup::Processes(ProcessPopup::List(p)) => {
             f.render_widget(Clear, area);
+            // Task 7 threads the detected theme; `Clear` above stays so the
+            // raised surface fills a cleared cell instead of ghosting.
             f.render_widget(
-                super::process_popup::render_process_list_popup(p, process_snapshots, area),
+                super::process_popup::render_process_list_popup_with(
+                    p,
+                    process_snapshots,
+                    area,
+                    TuiTheme::DARK,
+                ),
                 area,
             );
         }
@@ -1051,12 +1067,14 @@ fn render_runtime_popup(
                 .find(|p2| p2.process_id == p.process_id)
             {
                 f.render_widget(Clear, area);
+                // Task 7 threads the detected theme.
                 f.render_widget(
-                    super::process_popup::render_process_detail_popup(
+                    super::process_popup::render_process_detail_popup_with(
                         p,
                         process,
                         process_outputs.get(&p.process_id),
                         area,
+                        TuiTheme::DARK,
                     ),
                     area,
                 );
@@ -1066,8 +1084,14 @@ fn render_runtime_popup(
             f.render_widget(Clear, area);
             match &agents.detail {
                 None => {
+                    // Task 7 threads the detected theme.
                     f.render_widget(
-                        render_subagent_list(&agents.list, &agents.children, area),
+                        render_subagent_list_with(
+                            &agents.list,
+                            &agents.children,
+                            area,
+                            TuiTheme::DARK,
+                        ),
                         area,
                     );
                 }
@@ -1077,12 +1101,14 @@ fn render_runtime_popup(
                         awaiting_cancel: agents.awaiting_cancel.is_some(),
                         status: agents.status.as_deref(),
                     };
-                    super::trace::render_subagent_detail(
+                    // Task 7 threads the detected theme.
+                    super::trace::render_subagent_detail_with(
                         f,
                         detail,
                         &agents.children,
                         &prompt,
                         area,
+                        TuiTheme::DARK,
                     );
                 }
             }
@@ -1094,12 +1120,14 @@ fn render_runtime_popup(
             {
                 f.render_widget(Clear, area);
                 let detail = ProcessDetailPopup::new(ck.process_id.clone());
+                // Task 7 threads the detected theme.
                 f.render_widget(
-                    super::process_popup::render_process_detail_popup(
+                    super::process_popup::render_process_detail_popup_with(
                         &detail,
                         process,
                         process_outputs.get(&ck.process_id),
                         area,
+                        TuiTheme::DARK,
                     ),
                     area,
                 );
@@ -1128,23 +1156,39 @@ fn render_existing_bash_popup(
                     .min((p.task_ids.len() as u16 + 2).max(6)),
             };
             f.render_widget(Clear, list_area);
+            // Task 7 threads the detected theme.
             f.render_widget(
-                super::bash_popup::render_list_popup(p, task_registry, list_area),
+                super::bash_popup::render_list_popup_with(
+                    p,
+                    task_registry,
+                    list_area,
+                    TuiTheme::DARK,
+                ),
                 list_area,
             );
         }
         BashPopup::Detail(p) => {
             if let Some(task) = task_registry.get(&p.task_id) {
                 f.render_widget(Clear, area);
-                f.render_widget(super::bash_popup::render_detail_popup(p, task, area), area);
+                // Task 7 threads the detected theme.
+                f.render_widget(
+                    super::bash_popup::render_detail_popup_with(p, task, area, TuiTheme::DARK),
+                    area,
+                );
             }
         }
         BashPopup::ConfirmKill(ck) => {
             if let Some(task) = task_registry.get(&ck.task_id) {
                 f.render_widget(Clear, area);
                 let detail = DetailPopup::new(ck.task_id.clone());
+                // Task 7 threads the detected theme.
                 f.render_widget(
-                    super::bash_popup::render_detail_popup(&detail, task, area),
+                    super::bash_popup::render_detail_popup_with(
+                        &detail,
+                        task,
+                        area,
+                        TuiTheme::DARK,
+                    ),
                     area,
                 );
             }

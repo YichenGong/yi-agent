@@ -4,8 +4,9 @@
 //! shows full stdout/stderr for a single task with a kill shortcut.
 
 use crate::tui::state::{RunningTaskRegistry, TaskState, TaskStatus};
+use crate::tui::theme::TuiTheme;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -93,10 +94,25 @@ pub struct ConfirmKill {
 }
 
 /// Render the list-mode popup as a `Paragraph`.
+///
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_list_popup_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_list_popup<'a>(
     popup: &'a ListPopup,
     tasks: &'a RunningTaskRegistry,
     area: Rect,
+) -> Paragraph<'a> {
+    render_list_popup_with(popup, tasks, area, TuiTheme::DARK)
+}
+
+/// Theme-aware [`render_list_popup`]. Also paints the raised surface, so the
+/// card has an edge on a light terminal and `Clear` leaves no ghost.
+pub fn render_list_popup_with<'a>(
+    popup: &'a ListPopup,
+    tasks: &'a RunningTaskRegistry,
+    area: Rect,
+    theme: TuiTheme,
 ) -> Paragraph<'a> {
     // `area.width` is the real budget (the block borders take 2 columns).
     // Rows are padded/truncated to it: a wider `Line` is right-clipped by
@@ -117,14 +133,14 @@ pub fn render_list_popup<'a>(
                 }
             };
             let (sym, color) = match t.status {
-                TaskStatus::Running => ("●", Color::Yellow),
-                TaskStatus::Done => ("✓", Color::Green),
-                TaskStatus::Failed => ("✗", Color::Red),
-                TaskStatus::Timeout => ("✗", Color::Red),
-                TaskStatus::Aborted => ("■", Color::DarkGray),
+                TaskStatus::Running => ("●", theme.warn),
+                TaskStatus::Done => ("✓", theme.success),
+                TaskStatus::Failed => ("✗", theme.danger),
+                TaskStatus::Timeout => ("✗", theme.danger),
+                TaskStatus::Aborted => ("■", theme.fg_faint),
             };
             let style = if i == popup.selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.sel_bg).fg(theme.sel_fg)
             } else {
                 Style::new().fg(color)
             };
@@ -152,38 +168,63 @@ pub fn render_list_popup<'a>(
             )
         })
         .collect();
-    Paragraph::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("bash tasks (↑↓ select, Enter open, q close)"),
-    )
+    Paragraph::new(items)
+        .style(Style::new().bg(theme.bg_raised))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("bash tasks (↑↓ select, Enter open, q close)"),
+        )
 }
 
 /// Render the detail-mode popup as a `Paragraph` with header + stdout/stderr.
+///
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_detail_popup_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_detail_popup(
     popup: &DetailPopup,
     task: &TaskState,
     area: Rect,
 ) -> Paragraph<'static> {
-    Paragraph::new(detail_lines(task, area.width))
+    render_detail_popup_with(popup, task, area, TuiTheme::DARK)
+}
+
+/// Theme-aware [`render_detail_popup`]. The raised surface is painted under the
+/// text so `Clear` leaves a card rather than a hole in the terminal.
+pub fn render_detail_popup_with(
+    popup: &DetailPopup,
+    task: &TaskState,
+    area: Rect,
+    theme: TuiTheme,
+) -> Paragraph<'static> {
+    Paragraph::new(detail_lines_with(task, area.width, theme))
+        .style(Style::new().bg(theme.bg_raised))
         .alignment(Alignment::Left)
         .scroll((popup.scroll as u16, 0))
 }
 
 /// Number of visual detail lines at the given terminal width.
 pub fn detail_line_count(task: &TaskState, width: u16) -> usize {
+    // Folding depends on the width only, so the line count is theme-independent
+    // and this can stay on the `DARK` default.
     detail_lines(task, width).len()
 }
 
+/// Detail lines with the colors of [`TuiTheme::DARK`].
 fn detail_lines(task: &TaskState, width: u16) -> Vec<Line<'static>> {
+    detail_lines_with(task, width, TuiTheme::DARK)
+}
+
+fn detail_lines_with(task: &TaskState, width: u16, theme: TuiTheme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let (sym, color) = match task.status {
-        TaskStatus::Running => ("●", Color::Yellow),
-        TaskStatus::Done => ("✓", Color::Green),
-        TaskStatus::Failed => ("✗", Color::Red),
-        TaskStatus::Timeout => ("✗", Color::Red),
-        TaskStatus::Aborted => ("■", Color::DarkGray),
+        TaskStatus::Running => ("●", theme.warn),
+        TaskStatus::Done => ("✓", theme.success),
+        TaskStatus::Failed => ("✗", theme.danger),
+        TaskStatus::Timeout => ("✗", theme.danger),
+        TaskStatus::Aborted => ("■", theme.fg_faint),
     };
     let secs = task.elapsed().as_secs_f32();
     let status_word = match task.status {
@@ -202,26 +243,26 @@ fn detail_lines(task: &TaskState, width: u16) -> Vec<Line<'static>> {
     if task.exceeds_expected() {
         lines.push(Line::styled(
             " ! exceeds expected timeout",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.danger).add_modifier(Modifier::BOLD),
         ));
     }
 
     lines.extend(wrap_text(&task.command, width, " $ ", "   "));
     lines.push(Line::raw(""));
 
-    lines.push(Line::styled("stdout:", Style::new().fg(Color::DarkGray)));
+    lines.push(Line::styled("stdout:", Style::new().fg(theme.fg_faint)));
     let stdout_str = String::from_utf8_lossy(&task.stdout);
     if stdout_str.is_empty() {
-        lines.push(Line::raw("(empty)").style(Style::new().fg(Color::DarkGray)));
+        lines.push(Line::raw("(empty)").style(Style::new().fg(theme.fg_faint)));
     } else {
         lines.extend(wrap_text(&stdout_str, width, "", ""));
     }
     lines.push(Line::raw(""));
 
-    lines.push(Line::styled("stderr:", Style::new().fg(Color::DarkGray)));
+    lines.push(Line::styled("stderr:", Style::new().fg(theme.fg_faint)));
     let stderr_str = String::from_utf8_lossy(&task.stderr);
     if stderr_str.is_empty() {
-        lines.push(Line::raw("(empty)").style(Style::new().fg(Color::DarkGray)));
+        lines.push(Line::raw("(empty)").style(Style::new().fg(theme.fg_faint)));
     } else {
         lines.extend(wrap_text(&stderr_str, width, "", ""));
     }
@@ -229,7 +270,7 @@ fn detail_lines(task: &TaskState, width: u16) -> Vec<Line<'static>> {
 
     let footer = Line::styled(
         " [q] back  [k] kill  [↑↓] scroll  [f] follow",
-        Style::new().fg(Color::DarkGray),
+        Style::new().fg(theme.fg_faint),
     );
     lines.push(footer);
 
@@ -266,7 +307,9 @@ fn truncate_str(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::tui::state::RunningTaskRegistry;
+    use crate::tui::theme::TuiTheme;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use ratatui::widgets::Widget;
     use std::time::Duration;
 
@@ -331,6 +374,44 @@ mod tests {
         // We can't easily introspect Paragraph lines without rendering; just
         // verify the function returns without panic.
         let _ = para;
+    }
+
+    /// Popup cards used `Clear` alone, which leaves the terminal's own
+    /// background: on light terminals the card has no edge at all.
+    #[test]
+    fn detail_popup_paints_the_theme_raised_surface() {
+        let mut tasks = RunningTaskRegistry::new();
+        tasks.on_tool_call("t1", "bash", "echo hello", 120);
+        tasks.on_exit("t1", Some(0));
+        let task = tasks.get("t1").unwrap();
+        let popup = DetailPopup::new("t1".into());
+        let area = Rect::new(0, 0, 60, 10);
+        let para = render_detail_popup_with(&popup, task, area, TuiTheme::LIGHT);
+        let mut buf = Buffer::empty(area);
+        Widget::render(para, area, &mut buf);
+        assert_eq!(buf[(59, 9)].bg, TuiTheme::LIGHT.bg_raised);
+    }
+
+    /// The selected row used a hardcoded ANSI `Blue` background, whose actual
+    /// shade is the terminal's choice: on a light palette it reads as "some
+    /// other blue", not as the selection.
+    #[test]
+    fn list_popup_selected_row_uses_the_theme_selection() {
+        let mut tasks = RunningTaskRegistry::new();
+        tasks.on_tool_call("t1", "bash", "echo hello", 120);
+        let p = ListPopup::new(vec!["t1".into(), "t2".into()]);
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            render_list_popup_with(&p, &tasks, area, TuiTheme::LIGHT),
+            area,
+            &mut buf,
+        );
+        // Row 0 is the top border, so the first (selected) task sits on row 1.
+        assert_eq!(buf[(1, 1)].bg, TuiTheme::LIGHT.sel_bg);
+        assert_ne!(buf[(1, 1)].bg, Color::Blue);
+        // The row below is not selected: it keeps the raised surface.
+        assert_eq!(buf[(1, 2)].bg, TuiTheme::LIGHT.bg_raised);
     }
 
     #[test]
