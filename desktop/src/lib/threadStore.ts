@@ -329,6 +329,20 @@ export class ThreadStore {
   }
 
   /**
+   * 清空全部会话视图，回到刚构造的状态。
+   *
+   * 重配到另一台电脑时用：`sess`/`proc` 持有的是**这个实例**的引用
+   * （`store` 在 `App.tsx` 被解构成常量后传下去），换实例不会让它们换，
+   * 只能就地清。`statusSource` 必须一起清——留着的 `"live"` 标记会让下一份
+   * `listAll` 的快照被忽略，新机器的会话被当成「仍在跑，别 resume」。
+   */
+  reset(): void {
+    this.views.clear();
+    this.statusSource.clear();
+    this.currentId = null;
+  }
+
+  /**
    * 作废所有「来自推送」的运行状态：宿主进程已死，其推送不再成立。
    *
    * 侧车退出后新进程对任何会话都不再持有内存 agent（全部退化为冷会话）。

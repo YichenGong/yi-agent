@@ -386,6 +386,7 @@ vi.mock("./lib/platform", async (importOriginal) => {
 
 import App, { REPAIR_REMOVED_TEXT } from "./App";
 import { MemoryContentStore } from "./lib/contentStore";
+import { __setClearThreadContent } from "./lib/cacheScope";
 import { nextReconnectDelay } from "./lib/reconnect";
 
 // jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
@@ -3171,6 +3172,108 @@ describe("App mobile repair path", () => {
     await settle();
     expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
   });
+
+  it("drops A's sessions from memory after re-pairing to B", async () => {
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: { code: number }) => void) | null = null;
+      onerror: unknown = null;
+      constructor(readonly url: string) {
+        queueMicrotask(() => this.onopen?.());
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { id?: number };
+        // `redeemPairCodeViaRelay` 的握手是两帧：
+        //   1) 连上后发 id=1 `initialize`，收到回包才发 id=2 `pair/redeem`。
+        // 少回 id=1 的话兑换会一直等到 15s 超时，用例以「配对超时」失败。
+        if (frame.id === 1) {
+          queueMicrotask(() =>
+            this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) }),
+          );
+        } else if (frame.id === 2) {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: { device_id: "dev-2", token: "yia_new", scope: "control" },
+              }),
+            }),
+          );
+        }
+      }
+      close() {}
+    }
+
+    // A：已配对的手机 + 一条有内容的会话 `a1`（打开过 ⇒ 进了 warm）。
+    state.platformUa = IPHONE_UA;
+    localStorage.setItem("yi-agent.remote", JSON.stringify({ url: RELAY, token: "yia_tok" }));
+    state.threads = [{ thread_id: "a1", title: "from-A", permission_mode: "normal" as const }];
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "a1", savedAt: 1, lastServerItemId: "x",
+      items: [{ type: "agentMessage", id: "x", text: "A content" }],
+      trimmed: false, bytes: 9,
+    });
+
+    // jsdom 没有 indexedDB，`cacheScope` 的真实清理是 no-op；而本文件的
+    // `createContentStore` 被替换成了每个用例一份的内存库。两者必须接上，
+    // 否则「盘上属于 A 的内容被清掉」这一条在本环境里永远观测不到（不是实现
+    // 有 bug，而是测试替身与真实副作用脱钩）。`__setClearThreadContent` 正是
+    // 为这种场景留的注入点。
+    __setClearThreadContent(async () => {
+      for (const k of await contentStore.current!.keys()) {
+        await contentStore.current!.delete(k);
+      }
+    });
+
+    vi.stubGlobal("WebSocket", FakeSocket);
+    try {
+      render(<App />);
+      await settle();
+      expect(screen.getByText("from-A")).toBeTruthy();
+      expect(screen.getByText("A content")).toBeTruthy();
+
+      // B 上**同一个 thread_id** 是另一台机器的另一条会话（还是空的）。
+      // 这正是用户报的「换电脑后看到上一台的会话内容」：id 相同，`store` 里
+      // 那条 A 的视图若没被清，`selectThread` 会因 `warm` 命中而早退，
+      // 既不 resume 也不换内容，屏上就是 A 的旧对话。
+      state.threads = [{ thread_id: "a1", title: "from-B", permission_mode: "normal" as const }];
+      const URL_B = "wss://relay-b.test/ws?session=def";
+
+      // 连接正常时「重新配对」按钮不出现，靠服务端 4401 拉起重配界面
+      // （与 "re-arms the automatic offer after a successful connection" 同一条
+      // 路径），正是「A 撤销了这台设备、用户改连 B」的真实情形。
+      act(() => {
+        for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+      });
+      await settle();
+      fireEvent.change(screen.getByLabelText("服务器地址"), { target: { value: URL_B } });
+      fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "ABCD-EFGH" } });
+      fireEvent.click(screen.getByRole("button", { name: "配对" }));
+      await settle();
+      await settle();
+
+      // 标题换成了 B 的（列表来自新服务端）。
+      expect(screen.getByText("from-B")).toBeTruthy();
+      // **A 的内容必须离场**：这条是本用例的核心。`warm` 不清则 a1 被判
+      // 「已 resume 过」，早退分支留下 A 的对话在屏上。
+      expect(screen.queryByText("A content")).toBeNull();
+      // 且必须真的对 a1 重新 resume 一次（新服务端的新会话，得重建 agent）。
+      const latest = clients[clients.length - 1];
+      expect(
+        latest.requests.some(
+          (r: { method: string; params: unknown }) =>
+            r.method === "thread/resume" && (r.params as { threadId: string }).threadId === "a1",
+        ),
+      ).toBe(true);
+      // 盘上属于 A 的内容也必须没了（resetCacheScope 的异步段清 IndexedDB）。
+      expect(await contentStore.current!.keys()).not.toContain("a1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("deleting a thread that still runs subagents", () => {
@@ -4861,6 +4964,17 @@ describe("App mobile local cache", () => {
       }),
     );
 
+  /**
+   * 派发一次「切到后台」。**必须在函数内复位**：jsdom 的 `document` 是整个文件
+   * 共用的，`visibilityState` 被改成 `hidden` 后若不还原，后面的用例（前台重连、
+   * 补齐尾部）会按「仍在后台」走，失败原因与缓存毫无关系，极难归因。
+   */
+  const hidePage = () => {
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+  };
+
   it("paints the cached list before thread/listAll resolves", async () => {
     asRemote();
     seedListCache([{ thread_id: "t1", title: "cached-one" }], null);
@@ -5345,6 +5459,108 @@ describe("App mobile local cache", () => {
     // 该会话是当前选中：它会被 drop、缓存被删、屏上不留内容。
     await waitFor(() => expect(screen.queryByText("deleted transcript")).toBeNull());
     await waitFor(async () => expect(await contentStore.current!.read("t1")).toBeNull());
+  });
+
+  it("keeps a real thread's content when many empty threads are flushed", async () => {
+    asRemote();
+    // 12 个空会话 + 1 个有内容的会话，塞满 store。
+    const ids = Array.from({ length: 12 }, (_, i) => `empty${i}`);
+    const allThreads = [
+      ...ids.map((id) => ({ thread_id: id, title: id, permission_mode: "normal" as const })),
+      { thread_id: "real", title: "real", permission_mode: "normal" as const },
+    ];
+    state.threads = allThreads;
+    seedListCache(allThreads.map((t) => ({ thread_id: t.thread_id, title: t.title })), null);
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "real", savedAt: 1, lastServerItemId: "A",
+      items: [{ type: "agentMessage", id: "A", text: "precious" }],
+      trimmed: false, bytes: 10,
+    });
+    state.dataSources["thread/listAll"] = () => ({
+      groups: [{
+        workspace: "/w", exists: true,
+        threads: allThreads.map((t) => ({
+          thread_id: t.thread_id, cwd: "/w", model: "m", created_at: 0, updated_at: 0,
+          title: t.title, permission_mode: "normal", status: "idle",
+        })),
+      }],
+      pinned: [],
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
+    // 触发页面隐藏 → flushAll
+    act(() => hidePage());
+    await waitFor(async () => {
+      const keys = await contentStore.current!.keys();
+      expect(keys).toContain("real");
+      // 空会话一个都不该落盘（无论 12 个都写还是只写部分，只要不挤掉 real）
+      expect(keys.length).toBe(1);
+    });
+  });
+
+  it("writes a session with unchanged content only once across two flushes", async () => {
+    asRemote();
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" as const }];
+    seedListCache([{ thread_id: "t1", title: "one" }], "t1");
+    contentStore.current = new MemoryContentStore();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    // **必须先有真实内容**：空会话的 `persistContent` 走 `skipped`（Task 2），
+    // 一次 `write()` 都不会发生，`writes` 恒为 0，这条用例会以「一次都没写」假绿。
+    // 用一条 `item/completed` 通知把内容放进会话。
+    act(() => {
+      for (const h of state.notifHandlers) {
+        h({
+          method: "item/completed",
+          params: { thread_id: "t1", item: { type: "agentMessage", id: "s1", text: "hello" } },
+        });
+      }
+    });
+    await waitFor(() => expect(screen.getByText("hello")).toBeTruthy());
+
+    const before = (contentStore.current as unknown as MemoryContentStore).writes;
+    act(() => hidePage());
+    await waitFor(() =>
+      expect((contentStore.current as unknown as MemoryContentStore).writes).toBeGreaterThan(before),
+    );
+    const afterFirst = (contentStore.current as unknown as MemoryContentStore).writes;
+    act(() => hidePage());   // 内容没变：不应再写
+    await new Promise((r) => setTimeout(r, 20));
+    expect((contentStore.current as unknown as MemoryContentStore).writes).toBe(afterFirst);
+  });
+
+  it("flushes a cold thread whose content arrived only via resume replay", async () => {
+    asRemote();
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" as const }];
+    seedListCache([{ thread_id: "t1", title: "one" }], null);
+    contentStore.current = new MemoryContentStore();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    // 冷会话走 `thread/resume`（plan 缺失 ⇒ full）。测试替身的 resume **不投递
+    // 任何回放帧**（见本文件既有用例的注释），所以内容必须由测试自己派发一条
+    // `item/completed` 送进来。resume 成功后的 `flushContent`（App.tsx:913）是
+    // 直接调用的，**不经** `schedulePersist` 的防抖——本用例钉的就是这条路径。
+    act(() => {
+      for (const h of state.notifHandlers) {
+        h({
+          method: "item/completed",
+          params: { thread_id: "t1", item: { type: "agentMessage", id: "A", text: "server text" } },
+        });
+      }
+    });
+    await waitFor(() => expect(screen.getByText("server text")).toBeTruthy());
+    act(() => hidePage());
+    await waitFor(async () => {
+      const entry = await contentStore.current!.read("t1");
+      expect(entry?.items.map((i) => i.id)).toEqual(["A"]);
+    });
   });
 });
 

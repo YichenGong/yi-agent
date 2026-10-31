@@ -1,4 +1,6 @@
 import type { Item } from "./protocol";
+import { DB_NAME, DB_VERSION, STORE_NAME } from "./cacheDb";
+import { ensureCacheScopeClean } from "./cacheScope";
 
 /** Per-entry cap: how large a single thread's cached transcript may get. */
 export const MAX_ENTRY_BYTES = 1024 * 1024;
@@ -101,15 +103,28 @@ export interface AsyncContentStore {
 /** In-memory implementation: the test double and the no-IndexedDB fallback. */
 export class MemoryContentStore implements AsyncContentStore {
   private entries = new Map<string, ContentEntry>();
+  /**
+   * 调用次数。**仅供测试观测**，不参与任何存储语义，也绝不写进 `ContentEntry`
+   * （那是被 `toEqual` 逐字段比对的对象，加字段会让既有断言全挂）。
+   *
+   * 注意 `deletes` 会混入 `evict` 的淘汰删除——`persistContent` 写完就
+   * `await evict(store)`，后者也调 `delete`。要区分「业务删除」请改用
+   * `keys()` 断言。
+   */
+  writes = 0;
+  deletes = 0;
+
   async read(threadId: string): Promise<ContentEntry | null> {
     return this.entries.get(threadId) ?? null;
   }
   async write(entry: ContentEntry): Promise<void> {
+    this.writes += 1;
     // Deep-copy so a caller mutating its arrays afterwards cannot alter what was
     // "stored" — the real store serializes, so this mirrors that boundary.
     this.entries.set(entry.threadId, JSON.parse(JSON.stringify(entry)) as ContentEntry);
   }
   async delete(threadId: string): Promise<void> {
+    this.deletes += 1;
     this.entries.delete(threadId);
   }
   async keys(): Promise<string[]> {
@@ -117,9 +132,9 @@ export class MemoryContentStore implements AsyncContentStore {
   }
 }
 
-const DB_NAME = "yi-agent-cache";
-const DB_VERSION = 1;
-const STORE_NAME = "threadContent";
+// 常量已抽到 cacheDb.ts（打断与 cacheScope.ts 的循环依赖）。这里重导出，
+// 保持既有 import 路径可用。
+export { DB_NAME, DB_VERSION, STORE_NAME };
 
 /** IndexedDB-backed store. Opens lazily on first use. */
 export function createIndexedDbStore(): AsyncContentStore {
@@ -138,7 +153,13 @@ export function createIndexedDbStore(): AsyncContentStore {
       req.onerror = () => reject(req.error);
     });
 
-  const db = (): Promise<IDBDatabase> => (dbPromise ??= open());
+  // 打开库之前先等「失配清理」完成：所有读写都经 run() → db()，故这是唯一
+  // 收口点。用 `??=` 一次写完，避免「清理完成」与「开始建库」之间的空档被
+  // 另一个调用插进来，各自建一个库句柄。
+  //
+  // 不能写成 `const d = await ensureCacheScopeClean(); dbPromise ??= open()`：
+  // 那样两个并发调用都会走到 open()。
+  const db = (): Promise<IDBDatabase> => (dbPromise ??= ensureCacheScopeClean().then(open));
 
   const run = async <T>(
     mode: IDBTransactionMode,
@@ -177,12 +198,16 @@ export function createContentStore(): AsyncContentStore {
 export async function evict(
   store: AsyncContentStore,
   limits: { maxCount: number; maxBytes: number } = CONTENT_LIMITS,
-): Promise<void> {
+): Promise<string[]> {
   const keys = await store.keys();
   const metas = (await Promise.all(keys.map((k) => store.read(k))))
     .filter((e): e is ContentEntry => e !== null)
     .map((e) => ({ threadId: e.threadId, savedAt: e.savedAt, bytes: e.bytes }));
-  for (const id of selectEvictions(metas, limits)) await store.delete(id);
+  const gone = selectEvictions(metas, limits);
+  for (const id of gone) await store.delete(id);
+  // 返回被删掉的 id：调用方（`persistContent` → `flushContent`）要把它们从
+  // `persistedFp` 里删掉，否则内存会以为那些会话「仍与盘上一致」而永不重写。
+  return gone;
 }
 
 /**
@@ -197,6 +222,61 @@ export interface PersistSource {
   contentEpoch?: number | null;
 }
 
+/** `persistContent` 的选项：把「没内容」的处置权交给调用点。 */
+export interface PersistOptions {
+  /**
+   * 该会话的内容已与服务端对账完成（全量 resume 成功）。
+   * true 时 items 为空 = 服务端确认此会话无内容 ⇒ 删除条目；
+   * false（默认）时 items 为空 = 我们还没有内容可写 ⇒ 不写也不删。
+   *
+   * **注意**：`session.items` 非空（本地回显 / notice）时，即使 authoritative
+   * 也只跳过、不删除——「服务端确认无内容」在有在途回显时不成立。
+   */
+  authoritative?: boolean;
+}
+
+/**
+ * `persistContent` 到底动了盘上什么。调用方据此决定 `persistedFp` 的 set/delete。
+ *
+ * `evicted` 是**写入成功后 LRU 淘汰掉的其它会话 id**。调用方必须把它们从
+ * `persistedFp` 里删掉：否则那些会话在盘上已经没了，而内存还以为「已落盘且内容
+ * 没变」，`flushAll` 会一直判「没变」而跳过，它们从此再也写不回去——表现为
+ * 「用着用着，十几个会话里只有最近几条还有缓存」。这是内存镜像与盘上状态脱钩，
+ * 只有 `persistContent` 自己知道发生了什么，必须由它回报。
+ */
+export type PersistOutcome =
+  | { action: "written"; fingerprint: string; evicted: string[] }
+  | { action: "deleted" }
+  | { action: "skipped" };
+
+/**
+ * 归一化：与 `persistContent` 内部完全同一套（先剔 notice / `local-*`，
+ * 再按 `MAX_ENTRY_BYTES` 从头部裁剪）。
+ *
+ * 指纹必须基于归一化结果，不能基于 `session.items`——否则含 notice 或有本地
+ * 回显的会话两侧条目数永远不等，指纹永远判「变了」，等于没有优化。
+ */
+export function normalizeForCache(session: PersistSource): { items: Item[]; trimmed: boolean } {
+  const serverItems = session.items.filter(
+    (i): i is Item => i.type !== "notice" && !i.id.startsWith("local-"),
+  );
+  return applyTrim(serverItems, MAX_ENTRY_BYTES);
+}
+
+/**
+ * 指纹：盘上条目的身份。入参必须是**归一化后**的条目列表。
+ *
+ * 已知盲区：同 id 就地替换且长度/游标/世代都不变时判「没变」。这种情形是
+ * 服务端权威值的幂等重放，与已落盘内容等价。**它不是内容哈希**。
+ */
+export function contentFingerprintOf(
+  items: Item[],
+  lastServerItemId: string | null,
+  contentEpoch: number | null | undefined,
+): string {
+  return `${items.length}:${lastServerItemId ?? ""}:${contentEpoch ?? ""}`;
+}
+
 /**
  * Serialize a session and write it under the per-entry budget, then evict to
  * the global budget. Errors propagate so the caller can swallow them: a failed
@@ -206,12 +286,25 @@ export async function persistContent(
   store: AsyncContentStore,
   threadId: string,
   session: PersistSource,
-): Promise<void> {
+  options: PersistOptions = {},
+): Promise<PersistOutcome> {
+  // 复用与 normalizeForCache 同一套过滤：判据只能有一套，两套迟早漂移。
   const serverItems = session.items.filter(
     (i): i is Item => i.type !== "notice" && !i.id.startsWith("local-"),
   );
+
+  // 空内容守卫。位置在 applyTrim 之前：对空数组做裁剪只会得到空数组。
+  if (serverItems.length === 0) {
+    // 还有本地回显 / notice 时**绝不删**：那说明用户刚发了一条、服务端尚未回帧，
+    // 内容正在流动，此刻「服务端确认无内容」这个结论不成立。删了会把盘上已有的
+    // 好历史抹掉，而 resume 只补锚点之后的项，补不回来。
+    if (!options.authoritative || session.items.length > 0) return { action: "skipped" };
+    await store.delete(threadId);
+    return { action: "deleted" };
+  }
+
   const { items, trimmed } = applyTrim(serverItems, MAX_ENTRY_BYTES);
-  await store.write({
+  const entry: ContentEntry = {
     threadId,
     savedAt: Date.now(),
     lastServerItemId: session.lastServerItemId,
@@ -219,6 +312,15 @@ export async function persistContent(
     trimmed,
     bytes: estimateItemsBytes(items),
     contentEpoch: session.contentEpoch,
-  });
-  await evict(store);
+  };
+  await store.write(entry);
+  // `evict` 现在返回它删掉的 id：调用方必须同步清掉这些指纹（见 PersistOutcome）。
+  const evicted = await evict(store);
+  // 指纹取自写入的 entry（已 trim），与冷启时 contentFingerprintOf(entry.items, …)
+  // 是同一个函数作用于同一份数据，天然相等；用 session.items 会因裁剪而永不相等。
+  return {
+    action: "written",
+    fingerprint: contentFingerprintOf(entry.items, entry.lastServerItemId, entry.contentEpoch),
+    evicted,
+  };
 }
