@@ -403,7 +403,7 @@ fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
                 b.iter().filter(|&&c| c == b'\n').count() as u64,
                 looks_binary(b),
             ),
-            // 超上限或读不到：视为二进制，(0 行新增)。
+            // 超上限 / 非普通文件 / 读不到：视为二进制，(0 行新增)。
             None => (0, true),
         };
         out.push(FileStat {
@@ -502,11 +502,13 @@ fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
         let Some(bytes) = read_untracked_capped(&root.join(path)) else {
-            // 超上限 / 读不到：给一行明确说明，而不是留下一个空白条目
-            // (D1 的另一半：清单里有、点开却是空的)。
+            // 超上限 / 非普通文件 / 读不到：给一行明确说明，而不是留下一个
+            // 空白条目 (D1 的另一半：清单里有、点开却是空的)。措辞不写
+            // 「too large」——拒绝的原因也可能是 FIFO/设备，见 `read_untracked_capped`。
             out.push_str(&format!(
                 "diff --git a/{path} b/{path}\nnew file mode 100644\n\
-                 Binary files /dev/null and b/{path} differ (too large to render)\n"
+                 Binary files /dev/null and b/{path} differ (not shown: too large \
+                 or not a regular file)\n"
             ));
             continue;
         };
@@ -1494,7 +1496,8 @@ mod tests {
             "an oversized untracked file must be reported as binary, not read as text"
         );
         assert!(
-            d.unified_diff.contains("too large to render"),
+            d.unified_diff
+                .contains("not shown: too large or not a regular file"),
             "the body must say why it is not rendered: {}",
             &d.unified_diff[..d.unified_diff.len().min(400)]
         );

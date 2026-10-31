@@ -1611,15 +1611,21 @@ pub(crate) async fn handle(
                 .unwrap_or(false);
             // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
             // 顺手把 driver_project 拷到局部变量：会话文件随后即被删除，
-            // 到执行删除时再 load 只会失败，故必须在此刻留下。
+            // 到执行删除时再读只会失败，故必须在此刻留下。
+            //
+            // 用 `read_meta` 而不是 `load`：这里只要 meta 的三个字段，
+            // 而 `load` 会把整份对话 jsonl 解析一遍（主循环上的无谓阻塞 IO，
+            // 与 `thread/diff/read` 同类）。计数语义不变：`load` 在 meta 缺失
+            // 时走 `rebuild_meta`，其对 `driver_ref` / `driver_project` 都填
+            // `None`，与 `read_meta` 返回 `None` 落到同一分支。
             let mut driver_project: Option<String> = None;
-            let reclaim = match thread_store.load(&thread_id) {
-                Ok(Some(loaded)) => {
-                    driver_project = loaded.meta.driver_project.clone();
+            let reclaim = match thread_store.read_meta(&thread_id) {
+                Ok(Some(meta)) => {
+                    driver_project = meta.driver_project.clone();
                     crate::worktree_reclaim::decide(
-                        loaded.meta.driver_ref.as_deref(),
-                        loaded.meta.driver_project.as_deref(),
-                        Path::new(&loaded.meta.cwd),
+                        meta.driver_ref.as_deref(),
+                        meta.driver_project.as_deref(),
+                        Path::new(&meta.cwd),
                     )
                 }
                 _ => crate::worktree_reclaim::WorktreeReclaim::None,
@@ -1915,13 +1921,16 @@ pub(crate) async fn handle(
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| state.cfg.workdir.display().to_string());
             // 计算搬到**独立 task** 里做,而不是在本臂内联等待。理由与
-            // `thread/listAll` 逐字相同:这一臂要跑 5+ 次 git 子进程,并全量读
-            // 每个未跟踪文件(数换行 / 判二进制 / 合成 unified diff)。盘慢、
-            // 目录多时这段同步 IO 会把主循环整个占住,期间收到的
-            // `turn/interrupt` 只能干等,用户看到的是「点了 Stop 没反应」。
+            // `thread/listAll` 逐字相同:这一臂要跑 5+ 次 git 子进程,并读每个
+            // 未跟踪文件(判二进制 / 合成 unified diff;每个文件只读一趟、超过
+            // `MAX_UNTRACKED_FILE_BYTES` 就不读正文)。盘慢、目录多时这段同步
+            // IO 会把主循环整个占住,期间收到的 `turn/interrupt` 只能干等,
+            // 用户看到的是「点了 Stop 没反应」。
             //
-            // 主 runtime 是多线程的(`#[tokio::main(flavor = "multi_thread")]`),
-            // 把计算挪到别的 worker 后,主循环立刻回到 `select!`。
+            // 主 runtime 是多线程的(`crates/yi-agent/src/main.rs` 里用
+            // `tokio::runtime::Runtime::new()` 建的就是多线程 runtime;本 crate
+            // 没有 `#[tokio::main]` 属性)。把计算挪到别的 worker 后,主循环
+            // 立刻回到 `select!`。
             //
             // 代价是计算期间不能借 `AppState`:故先把参数快照成纯值。
             let repo = std::path::PathBuf::from(&cwd);
