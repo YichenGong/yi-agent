@@ -179,3 +179,64 @@ async fn get_config_reports_a_label_for_every_field() {
         );
     }
 }
+
+/// 显式 `value: null` 必须表示「删掉这个键」，而不是报错或写成 null 字面量。
+#[tokio::test]
+async fn put_config_with_null_value_deletes_the_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"agent":{"max_turns":500,"system_prompt":"keep"},"my_note":"keep me"}"#,
+    )
+    .unwrap();
+
+    let response = app(path.clone())
+        .oneshot(
+            Request::put("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":[{"key":"agent.max_turns","value":null}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        value["agent"].get("max_turns").is_none(),
+        "null 必须删键，实际内容: {text}"
+    );
+    assert_eq!(
+        value["agent"]["system_prompt"], "keep",
+        "同组其它键必须保留"
+    );
+    assert_eq!(value["my_note"], "keep me", "未知顶层键必须保留");
+}
+
+/// 省略 `value` 字段等价于发 null（serde 对 Option 缺字段即 None）。
+/// 这条固定该行为，避免日后被误当 bug 改来改去。
+#[tokio::test]
+async fn put_config_treats_a_missing_value_as_null() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"agent":{"max_turns":500}}"#).unwrap();
+
+    let response = app(path.clone())
+        .oneshot(
+            Request::put("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"updates":[{"key":"agent.max_turns"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(value.get("agent").is_none(), "空壳分组应被清掉: {value}");
+}
