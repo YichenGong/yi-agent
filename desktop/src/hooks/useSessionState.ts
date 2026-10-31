@@ -48,6 +48,7 @@ export function useSessionState({
   setCurrentError,
   railStore,
   initialListCache,
+  pairingVersion,
 }: {
   /** 取当前的 RPC 客户端；未连接即 null（各动作据此静默返回）。 */
   rpc: () => RpcClient | null;
@@ -61,6 +62,8 @@ export function useSessionState({
   railStore: SubagentRailStore;
   /** 手机端首屏列表缓存；桌面端为 null（初值保持空，行为与从前逐字节一致）。 */
   initialListCache: ThreadListCache | null;
+  /** 配对版本号；每次成功配对/重配自增。用于丢弃上一个服务端的会话列表。 */
+  pairingVersion: number;
 }) {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [groups, setGroups] = useState<WorkspaceGroup[]>(initialListCache?.groups ?? []);
@@ -110,6 +113,39 @@ export function useSessionState({
    * 天然不需要驱动渲染。
    */
   const viewAnchors = useRef(new Map<string, ViewAnchor | null>());
+
+  // 重配后必须丢掉上一个服务端的列表：这是同一个 App 实例续跑，不是冷启动，
+  // `store` 换成新的了，但这些 state 属于本 hook，跟着一起清。
+  //
+  // 判据是「版本号变了」，不是「首帧已过」：
+  //   - groups/pinned 的初值来自 initialListCache（首屏画缓存的来源），首帧
+  //     执行本 effect 时**不能**清掉它；
+  //   - `main.tsx` 用 `<React.StrictMode>` 包着 `<App/>`，开发模式下 effect 会
+  //     跑两遍（挂载 → 清理 → 再挂载）。若用 `useRef(false)` 记「首帧已过」，
+  //     第二遍就会把首屏缓存清空——手机上表现为「开发构建首屏永远是空的」，
+  //     而生产构建不复现，极难排查。
+  //   - 版本号比对对两种情形都安全：挂载时相等 → 直接返回；自增时不等 → 清一次
+  //     并把新值记下来，重复跑不再清。
+  //
+  // 也不能判断 `pairingVersion === 0`：那把语义绑在「0 是特殊值」上，将来若
+  // 持久化该值，初值不再是 0，就会静默失效且无任何报错。
+  const lastPairingVersion = useRef(pairingVersion);
+  useEffect(() => {
+    if (lastPairingVersion.current === pairingVersion) return;
+    lastPairingVersion.current = pairingVersion;
+    // 列表与选中项。`workspaces` 是最近目录，同样属于上一台机器。
+    setCurrentId(null);
+    setGroups([]);
+    setPinned([]);
+    setWorkspaces([]);
+    // 详情栈与轨迹行里存的是上一台机器的 subagent id：不清就会点进一个
+    // 在 B 上不存在的任务，一路报 -32602。
+    setDetailStack([]);
+    setTraceRows([]);
+    setPanelOpen(false);
+    // 阅读位置按 thread_id 记，A 的 id 在 B 上没有意义，留着只是占内存。
+    viewAnchors.current.clear();
+  }, [pairingVersion]);
 
   const refreshThreads = async (): Promise<WorkspaceGroup[] | null> => {
     const c = rpc();

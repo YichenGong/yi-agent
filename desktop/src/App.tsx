@@ -81,6 +81,7 @@ import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
+import { resetCacheScope } from "./lib/cacheScope";
 import {
   contentFingerprintOf,
   createContentStore,
@@ -418,6 +419,20 @@ export default function App() {
     if (s) s.lastError = msg;
   };
 
+  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
+  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
+  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
+  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
+  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
+  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
+  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
+  //
+  // **必须排在 `sess` 之前**：`useSessionState` 要拿 `prefs.pairingVersion` 判断
+  // 「服务端换了没有」，写在后面会踩 TDZ。反过来 `useSettingsState` 只依赖
+  // `rpc`/`force`/`setCurrentError`，三者此刻都已可用，不依赖 `sess`/`proc`/
+  // `diff`/`board`——两者没有循环，只是原先的书写顺序恰好相反。
+  const prefs = useSettingsState({ rpc, force, setCurrentError });
+
   // 会话关注点（当前会话 id/会话列表与置顶/最近目录/侧栏抽屉/详情栈与右侧
   // 详情栏开合，连同它们的 ref 影子与读取器）整体搬进 hook，见
   // `hooks/useSessionState.ts`。跨关注点的编排不在这里：`selectThread`/
@@ -425,7 +440,15 @@ export default function App() {
   // 只把引用改成 `sess.*`。顺序：`sess` 必须排在 `proc`/`diff` 之前——
   // `proc` 取它的 `currentId`、`diff` 取它的 `currentIdRef`，二者都是「此刻
   // 选中谁」的判据，而这份状态正是本 hook 持有的。
-  const sess = useSessionState({ rpc, store, force, setCurrentError, railStore, initialListCache });
+  const sess = useSessionState({
+    rpc,
+    store,
+    force,
+    setCurrentError,
+    railStore,
+    initialListCache,
+    pairingVersion: prefs.pairingVersion,
+  });
   // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
   // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
   // 由下面切 Tab 与 `selectThread` 几处调用点自己收起详情。
@@ -441,15 +464,6 @@ export default function App() {
   //  `kanbanEnabled` 传 `=== true`：`null`（还不知道）时按关处理，一个请求都不发。
   //  开关值在握手后读取，读回来会让本 hook 的两个 callback 换新，从而重挂计时器。
   const board = useBoardState({ clientRef, kanbanEnabled: kanbanEnabled === true });
-
-  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
-  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
-  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
-  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
-  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
-  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
-  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
-  const prefs = useSettingsState({ rpc, force, setCurrentError });
 
   /**
    * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
@@ -2366,7 +2380,13 @@ export default function App() {
         // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
         // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
         // transportFactory 选中的是 ws。
-        onPaired={() => prefs.setPairingVersion((v) => v + 1)}
+        onPaired={() => {
+          void resetCacheScope().catch(() => {
+            /* 清理失败：scope 键保持旧值，下次启动会重试。
+               不能让配对本身失败——否则用户卡在配对界面连不上。 */
+          });
+          prefs.setPairingVersion((v) => v + 1);
+        }}
         redeem={defaultRedeem}
       />
     );
@@ -2394,6 +2414,24 @@ export default function App() {
           // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
           // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
           inited.current = false;
+          // 内存层的串数据必须一起清：resetCacheScope 只清存储，不清 store/warm。
+          //
+          // 不能写 `storeRef.current = new ThreadStore()`：`store` 是
+          // `storeRef.current` 的一次性快照，已经作为参数传给了 useSessionState /
+          // useProcessState，换 ref 不会让它们换实例——旧会话仍在 `sess`/`proc`
+          // 手里。必须就地清空同一个实例。
+          store.reset();
+          warm.current.clear();
+          inFlightResume.current.clear();
+          cacheMetaRef.current.clear();
+          cachedAt.current.clear();
+          syncPlanRef.current.clear();
+          persistTimers.current.clear();
+          toppedUp.current.clear();
+          persistedFp.current.clear();
+          // SubscriptionWindow 没有 clear()，整体换新（与该重连路径保持一致）。
+          subWindow.current = new SubscriptionWindow();
+          void resetCacheScope().catch(() => {});
           prefs.setRepairing(false);
           prefs.setRepairNotice(null);
           prefs.setPairingVersion((v) => v + 1);

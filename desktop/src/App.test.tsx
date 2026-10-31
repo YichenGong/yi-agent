@@ -386,6 +386,7 @@ vi.mock("./lib/platform", async (importOriginal) => {
 
 import App, { REPAIR_REMOVED_TEXT } from "./App";
 import { MemoryContentStore } from "./lib/contentStore";
+import { __setClearThreadContent } from "./lib/cacheScope";
 import { nextReconnectDelay } from "./lib/reconnect";
 
 // jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
@@ -3170,6 +3171,108 @@ describe("App mobile repair path", () => {
     render(<App />);
     await settle();
     expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
+  });
+
+  it("drops A's sessions from memory after re-pairing to B", async () => {
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: { code: number }) => void) | null = null;
+      onerror: unknown = null;
+      constructor(readonly url: string) {
+        queueMicrotask(() => this.onopen?.());
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { id?: number };
+        // `redeemPairCodeViaRelay` 的握手是两帧：
+        //   1) 连上后发 id=1 `initialize`，收到回包才发 id=2 `pair/redeem`。
+        // 少回 id=1 的话兑换会一直等到 15s 超时，用例以「配对超时」失败。
+        if (frame.id === 1) {
+          queueMicrotask(() =>
+            this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) }),
+          );
+        } else if (frame.id === 2) {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: { device_id: "dev-2", token: "yia_new", scope: "control" },
+              }),
+            }),
+          );
+        }
+      }
+      close() {}
+    }
+
+    // A：已配对的手机 + 一条有内容的会话 `a1`（打开过 ⇒ 进了 warm）。
+    state.platformUa = IPHONE_UA;
+    localStorage.setItem("yi-agent.remote", JSON.stringify({ url: RELAY, token: "yia_tok" }));
+    state.threads = [{ thread_id: "a1", title: "from-A", permission_mode: "normal" as const }];
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "a1", savedAt: 1, lastServerItemId: "x",
+      items: [{ type: "agentMessage", id: "x", text: "A content" }],
+      trimmed: false, bytes: 9,
+    });
+
+    // jsdom 没有 indexedDB，`cacheScope` 的真实清理是 no-op；而本文件的
+    // `createContentStore` 被替换成了每个用例一份的内存库。两者必须接上，
+    // 否则「盘上属于 A 的内容被清掉」这一条在本环境里永远观测不到（不是实现
+    // 有 bug，而是测试替身与真实副作用脱钩）。`__setClearThreadContent` 正是
+    // 为这种场景留的注入点。
+    __setClearThreadContent(async () => {
+      for (const k of await contentStore.current!.keys()) {
+        await contentStore.current!.delete(k);
+      }
+    });
+
+    vi.stubGlobal("WebSocket", FakeSocket);
+    try {
+      render(<App />);
+      await settle();
+      expect(screen.getByText("from-A")).toBeTruthy();
+      expect(screen.getByText("A content")).toBeTruthy();
+
+      // B 上**同一个 thread_id** 是另一台机器的另一条会话（还是空的）。
+      // 这正是用户报的「换电脑后看到上一台的会话内容」：id 相同，`store` 里
+      // 那条 A 的视图若没被清，`selectThread` 会因 `warm` 命中而早退，
+      // 既不 resume 也不换内容，屏上就是 A 的旧对话。
+      state.threads = [{ thread_id: "a1", title: "from-B", permission_mode: "normal" as const }];
+      const URL_B = "wss://relay-b.test/ws?session=def";
+
+      // 连接正常时「重新配对」按钮不出现，靠服务端 4401 拉起重配界面
+      // （与 "re-arms the automatic offer after a successful connection" 同一条
+      // 路径），正是「A 撤销了这台设备、用户改连 B」的真实情形。
+      act(() => {
+        for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+      });
+      await settle();
+      fireEvent.change(screen.getByLabelText("服务器地址"), { target: { value: URL_B } });
+      fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "ABCD-EFGH" } });
+      fireEvent.click(screen.getByRole("button", { name: "配对" }));
+      await settle();
+      await settle();
+
+      // 标题换成了 B 的（列表来自新服务端）。
+      expect(screen.getByText("from-B")).toBeTruthy();
+      // **A 的内容必须离场**：这条是本用例的核心。`warm` 不清则 a1 被判
+      // 「已 resume 过」，早退分支留下 A 的对话在屏上。
+      expect(screen.queryByText("A content")).toBeNull();
+      // 且必须真的对 a1 重新 resume 一次（新服务端的新会话，得重建 agent）。
+      const latest = clients[clients.length - 1];
+      expect(
+        latest.requests.some(
+          (r: { method: string; params: unknown }) =>
+            r.method === "thread/resume" && (r.params as { threadId: string }).threadId === "a1",
+        ),
+      ).toBe(true);
+      // 盘上属于 A 的内容也必须没了（resetCacheScope 的异步段清 IndexedDB）。
+      expect(await contentStore.current!.keys()).not.toContain("a1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

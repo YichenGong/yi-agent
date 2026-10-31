@@ -17,6 +17,7 @@ const mount = () =>
       setCurrentError: vi.fn(),
       railStore: new SubagentRailStore(),
       initialListCache: null,
+      pairingVersion: 0,
     }),
   );
 
