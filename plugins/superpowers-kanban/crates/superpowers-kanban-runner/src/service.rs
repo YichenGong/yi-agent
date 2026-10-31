@@ -267,6 +267,8 @@ impl BoardService {
         self.consume_results(results);
         // 2) 观测：只写旁路文件，绝不回写卡片状态。
         self.write_observations(threads);
+        // 合并回合一结束就还名额：这一步只能由持有 flock 的本进程做。
+        self.release_gate_when_the_merge_is_over();
         let limit = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
             &self.state_dir,
         )
@@ -1035,6 +1037,14 @@ impl BoardService {
     pub fn merge_finish(&self, card_id: &str) -> Result<MergeFinish, String> {
         let mut inner = self.lock();
         let Some(gate) = inner.merge_gate.take() else {
+            // 本进程没有名额。但记录的持有者可能已经死了（崩溃、或被换掉了）：
+            // 那是条无从释放的残留，留着只会让 `list` 永远显示 `[merging]`、
+            // 让用户以为还有人在合。`flock` 本身由内核释放，清记录是安全的。
+            if crate::merge_lock::read_holder(&self.state_dir).is_some_and(|holder| {
+                holder.card_id == card_id && !crate::merge_lock::holder_alive(&holder)
+            }) {
+                crate::merge_lock::clear_holder(&self.state_dir);
+            }
             return Ok(MergeFinish::Cleared);
         };
         // 只清自己那份记录：holder 若已指向别人，别把别人的账抹了。
@@ -1045,6 +1055,40 @@ impl BoardService {
         }
         drop(gate);
         Ok(MergeFinish::Released)
+    }
+
+    /// 合并回合结束后放掉本进程持有的名额。
+    ///
+    /// **必须由 daemon 自己做。** 名额是 `flock` 的 fd，只能被持有它的进程释放；
+    /// 合并回合一跑完，会话里那句 `merge-finish` 落在**另一个进程**里，只会拿到
+    /// `cleared`，锁还在 daemon 手里。若这里不回收，本项目此后再也合并不了，
+    /// 而界面上只会看到一张「没在合并」的卡和一个永远被占的名额。
+    ///
+    /// 判定只看卡片自己写下的状态：模型把合并收尾成 `done` / `failed` /
+    /// `needs_you`（或退回 `awaiting_merge`）就说明这一轮结束了。
+    fn release_gate_when_the_merge_is_over(&self) {
+        let held = self.lock().merge_gate.is_some();
+        if !held {
+            return;
+        }
+        let card_id = match crate::merge_lock::read_holder(&self.state_dir) {
+            Some(holder) => holder.card_id,
+            None => return,
+        };
+        // holder 记录缺失时无从判断是哪张卡：宁可再等一拍，也不误放别人的名额。
+        if card_id.is_empty() {
+            return;
+        }
+        let board = persist::read_board(&self.state_dir);
+        let Some(card) = board.get(&CardId::new(card_id.clone())) else {
+            let _ = self.merge_finish(&card_id);
+            return;
+        };
+        // 合并回合期间卡就是 `Running`（队列推进时置的）。模型一收尾——`done`、
+        // `needs_you`、`failed`，或干脆退回别的状态——这一轮就结束了。
+        if card.state != CardState::Running {
+            let _ = self.merge_finish(&card_id);
+        }
     }
 
     /// 模型声明这张卡现在处于什么状态。这是除启动之外**唯一**写状态的入口。
@@ -1828,6 +1872,28 @@ mod tests {
         );
     }
 
+    /// 记录在、人已死：`merge-finish` 要顺手清掉这条残留，否则界面永远显示
+    /// `[merging]`。`flock` 本身早由内核释放，清记录不会制造「假免费」。
+    #[test]
+    fn merge_finish_clears_a_holder_record_left_by_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        std::fs::write(
+            service.state_dir.join("merge.lock.holder"),
+            r#"{"card_id":"card-1","pid":0,"since":"2026-10-01T00:00:00+08:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            service.merge_finish("card-1").unwrap(),
+            MergeFinish::Cleared
+        );
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_none(),
+            "a dead holder's note must not outlive it"
+        );
+    }
+
     #[test]
     fn merge_finish_reports_cleared_when_nothing_was_held() {
         let dir = tempfile::tempdir().unwrap();
@@ -1899,15 +1965,11 @@ mod tests {
             .driver_step(&[], &[])
             .unwrap()
             .expect("a merge turn");
-        match action {
-            DriverAction::Launch {
-                card_id, objective, ..
-            } => {
-                assert_eq!(card_id, merge_id);
-                assert!(objective.contains("feat/manual"), "{objective}");
-            }
-            other => panic!("expected a merge launch, got {other:?}"),
-        }
+        let DriverAction::Launch {
+            card_id, objective, ..
+        } = action;
+        assert_eq!(card_id, merge_id);
+        assert!(objective.contains("feat/manual"), "{objective}");
         assert_eq!(state_of(&service, &merge_id), "running");
     }
 
@@ -1934,6 +1996,45 @@ mod tests {
         assert_eq!(card(&service)["merging"], true);
         // 已经开跑，队列时间就清掉了。
         assert!(card(&service)["merge_queued_at"].is_null());
+    }
+
+    /// 名额只能由持有 flock 的进程放掉。合并回合一跑完，会话里那句
+    /// `merge-finish` 落在**另一个进程**里、只会回 `cleared`；若 daemon 自己不回收，
+    /// 本项目此后再也合并不了。
+    #[test]
+    fn the_daemon_releases_the_gate_once_the_merge_turn_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("a merge turn");
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_some());
+
+        // 回合还没收尾（卡仍是 running）→ 名额继续握着。
+        service.driver_step(&[], &[]).unwrap();
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_some(),
+            "a merge still in flight must keep the gate"
+        );
+
+        // 模型判定合并成功并落 `done` → 下一拍名额归还。
+        service.set_state("card-1", CardState::Done, None).unwrap();
+        service.driver_step(&[], &[]).unwrap();
+        assert!(
+            wait_until(|| crate::merge_lock::read_holder(&service.state_dir).is_none()),
+            "the settled merge must hand the gate back"
+        );
+        assert!(
+            wait_until(|| matches!(
+                crate::merge_lock::acquire_with_holder(&service.state_dir, "next"),
+                crate::merge_lock::MergeAttempt::Granted(_)
+            )),
+            "the next project merge must be able to take the gate"
+        );
     }
 
     #[test]

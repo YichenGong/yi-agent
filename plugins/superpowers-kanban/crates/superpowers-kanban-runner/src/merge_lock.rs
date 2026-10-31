@@ -85,6 +85,11 @@ fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// holder 记录里的进程还活着吗。给「记录在、但没人真持有」的残留判定用。
+pub fn holder_alive(holder: &Holder) -> bool {
+    pid_alive(holder.pid)
+}
+
 /// 取名额并记下持有者。
 ///
 /// 拿到 `flock` 说明没有活着的进程在合并；此时若 holder 记录里的 pid 已经消失，
