@@ -194,11 +194,12 @@ describe("SettingsDialog", () => {
     expect(saveTagName).toHaveBeenCalledWith("red", "紧急");
   });
 
-  it("lists all eight categories on the desktop", () => {
+  it("lists all nine categories on the desktop", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     const names = screen.getAllByRole("tab").map((t) => t.textContent);
     expect(names).toEqual([
       "通用",
+      "运行参数",
       "远程访问",
       "插件",
       "模型",
@@ -305,7 +306,8 @@ describe("SettingsDialog focus management & tab wiring", () => {
   it("moves selection with ArrowRight and keeps roving tabIndex", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     const generalTab = screen.getByRole("tab", { name: "通用" });
-    const remoteTab = screen.getByRole("tab", { name: "远程访问" });
+    // 「运行参数」紧跟在「通用」之后，故 ArrowRight 落在这里。
+    const remoteTab = screen.getByRole("tab", { name: "运行参数" });
     // tablist 只占一个 Tab 停靠点：选中的是 0，其余是 -1。
     expect(generalTab.getAttribute("tabindex")).toBe("0");
     expect(remoteTab.getAttribute("tabindex")).toBe("-1");
@@ -377,6 +379,7 @@ describe("SettingsDialog phone layout hooks", () => {
     const rows = Array.from(document.querySelectorAll("[data-settings-category]"));
     expect(rows.map((r) => r.getAttribute("data-settings-category"))).toEqual([
       "general",
+      "runtime",
       "remote",
       "plugins",
       "models",
@@ -452,6 +455,22 @@ describe("SettingsDialog phone layout hooks", () => {
   it("keeps the vertical orientation on the desktop", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("vertical");
+  });
+
+  it("renders the runtime tab and reads settings on open", async () => {
+    const call = vi.fn(async () => ({ fields: [], path: "" }));
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        runtimeSettingsCall={call}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "运行参数" }));
+    await screen.findByText("读取中…");
+    expect(call).toHaveBeenCalledWith("settings/read", {});
   });
 
   it("keeps the close button reachable on the phone (44px touch target)", () => {

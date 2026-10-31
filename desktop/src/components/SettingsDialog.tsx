@@ -9,6 +9,8 @@ import { SettingsModelsTab } from "./SettingsModelsTab";
 import { SettingsSkillsTab } from "./SettingsSkillsTab";
 import { SettingsMcpTab } from "./SettingsMcpTab";
 import { SettingsWebSearchTab } from "./SettingsWebSearchTab";
+import { SettingsRuntimeTab } from "./SettingsRuntimeTab";
+import type { RuntimeSettingsCall } from "../lib/runtimeSettings";
 import type { McpCall } from "../lib/mcp";
 import type { WebSearchCall } from "../lib/websearch";
 import type { SkillsCall } from "../lib/skills";
@@ -19,6 +21,7 @@ import { DEFAULT_TAG_NAMES, type TagId } from "../lib/threadTags";
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
 const TABS = [
   { id: "general", label: "通用" },
+  { id: "runtime", label: "运行参数" },
   { id: "remote", label: "远程访问" },
   { id: "plugins", label: "插件" },
   { id: "models", label: "模型" },
@@ -53,6 +56,7 @@ export function SettingsDialog({
   skillsDefaultProject,
   mcpCall,
   websearchCall,
+  runtimeSettingsCall,
   mcpProjects,
   mcpDefaultProject,
   pluginProjects,
@@ -105,6 +109,8 @@ export function SettingsDialog({
   mcpCall?: McpCall;
   /** 「网页搜索」Tab 的宿主 RPC 接缝（websearch/get|set|test）。 */
   websearchCall?: WebSearchCall;
+  /** 「运行参数」Tab 的宿主 RPC 接缝（settings/read、settings/write）。 */
+  runtimeSettingsCall?: RuntimeSettingsCall;
   /** 「MCP」Tab 可选的配置项目（绝对路径）。 */
   mcpProjects?: string[];
   /** 「MCP」Tab 首选项目（当前对话的工作目录）。 */
@@ -355,6 +361,8 @@ export function SettingsDialog({
                 projects={mcpProjects ?? []}
                 defaultProject={mcpDefaultProject}
               />
+            ) : active === "runtime" && runtimeSettingsCall ? (
+              <SettingsRuntimeTab call={runtimeSettingsCall} />
             ) : active === "websearch" && websearchCall ? (
               <SettingsWebSearchTab call={websearchCall} />
             ) : active === "tags" ? (
