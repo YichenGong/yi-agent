@@ -36,9 +36,31 @@ pub struct FlagView {
     pub source: Source,
 }
 
-/// `$YI_AGENT_HOME/flags.json`。
+/// `$YI_AGENT_HOME/flags.json`（未设置时 `$HOME/.yi-agent/flags.json`）。
 pub fn flags_path() -> Option<PathBuf> {
-    yi_agent_store::paths::home_join("flags.json")
+    instance_home().map(|home| home.join("flags.json"))
+}
+
+/// 实例状态根。与 `yi_agent_store::paths::instance_home` **逐字一致**
+/// （含「覆盖值不以 `.yi-agent` 结尾就补一层」的归一化），有对照测试钉住。
+///
+/// 刻意不依赖 `yi-agent-store`：那个 crate 带 `rusqlite`（bundled），桌面壳
+/// 一旦依赖本 crate 做开关判定，就会把整个 SQLite 链进 Tauri 二进制。
+fn instance_home() -> Option<PathBuf> {
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty());
+    if let Some(dir) = override_value {
+        let dir = PathBuf::from(dir);
+        if dir.as_os_str().is_empty() {
+            // fall through to the default
+        } else if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+            return Some(dir);
+        } else {
+            return Some(dir.join(".yi-agent"));
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".yi-agent"))
 }
 
 /// 文件里只存开着的键与否；缺省一律视为关。
@@ -146,6 +168,52 @@ mod tests {
     // 说明：以下用例通过 `set_at` / `read_at` 注入路径，不改进程环境变量
     // （cargo 并行跑测试，全局量会让用例互相竞态）。唯一例外是环境变量层，
     // 那几个用例用 `serial` 风格的互斥量串行。
+
+    /// 改环境变量是进程级副作用，cargo 并行跑测试时必须串行。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 路径解析必须与 `yi-agent-store` 逐字一致——两侧读的必须是同一个文件，
+    /// 否则桌面壳看到的开关永远与 app-server 写的不一致。
+    #[test]
+    fn instance_home_matches_the_store_crate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for value in [
+            None,
+            Some("/tmp/x"),
+            Some("/tmp/x/.yi-agent"),
+            Some("/tmp/x/"),
+        ] {
+            // SAFETY: 本用例独占地改环境变量，并立刻恢复。
+            let previous = std::env::var_os("YI_AGENT_HOME");
+            match value {
+                Some(v) => unsafe { std::env::set_var("YI_AGENT_HOME", v) },
+                None => unsafe { std::env::remove_var("YI_AGENT_HOME") },
+            }
+            let ours = instance_home();
+            let theirs = if value.is_some() {
+                Some(yi_agent_store::paths::instance_home().expect("store resolves an override"))
+            } else {
+                // 无覆盖时两者都退化为 `$HOME/.yi-agent`；比较尾段即可，
+                // 避免测试受真实 HOME 影响。
+                None
+            };
+            match value {
+                Some(raw) => assert_eq!(
+                    ours.as_deref(),
+                    theirs.as_deref(),
+                    "`{raw}` must resolve identically"
+                ),
+                None => assert!(
+                    ours.as_ref().is_some_and(|p| p.ends_with(".yi-agent")),
+                    "unset must fall back to $HOME/.yi-agent"
+                ),
+            }
+            match previous {
+                Some(v) => unsafe { std::env::set_var("YI_AGENT_HOME", v) },
+                None => unsafe { std::env::remove_var("YI_AGENT_HOME") },
+            }
+        }
+    }
 
     #[test]
     fn a_missing_file_means_everything_is_off() {

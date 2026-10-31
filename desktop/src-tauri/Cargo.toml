@@ -36,6 +36,9 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 # flock 用于跨进程的读-改-写互斥。
 libc = "0.2"
+# 开关判定的唯一真源。本 crate 刻意不依赖 `yi-agent-store`（它带 bundled
+# rusqlite），所以引入它不会把 SQLite 链进桌面二进制。
+yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.

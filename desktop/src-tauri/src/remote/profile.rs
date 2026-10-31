@@ -85,6 +85,54 @@ pub fn validate_profile_id(id: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
+/// 由（本机 relay URL, profile id）派生远端要连的 session。
+///
+/// **不能用 `.push_str("&session=")` 追加**：`relay_url` 本身可能已经带
+/// `?session=`，追加会得到 `?session=a&session=b`，中继取哪个取决于实现
+/// （spec §4.6 前提 2）。这里模拟 URL 的 `searchParams.set` 语义。
+///
+/// 派生规则：`<原有 session 或 "remote">-<profile_id>`。目的只是「不同 profile
+/// 得到不同 session」，不需要密码学强度——但**必须**稳定，否则同一项目每次
+/// 重连都会在手机上多出一个 session。
+pub fn derive_relay(configured: Option<&str>, profile_id: &str) -> Option<String> {
+    let base = configured?;
+    let session = format!("{}-{profile_id}", session_seed(base));
+    Some(set_query_param(base, "session", &session))
+}
+
+fn session_seed(url: &str) -> String {
+    get_query_param(url, "session").unwrap_or_else(|| "remote".to_string())
+}
+
+fn get_query_param(url: &str, key: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    query
+        .split('&')
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_string())
+        })
+        .filter(|v| !v.is_empty())
+}
+
+fn set_query_param(url: &str, key: &str, value: &str) -> String {
+    let (head, query) = match url.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (url, None),
+    };
+    let mut pairs: Vec<String> = query
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|pair| !pair.is_empty() && !pair.starts_with(&format!("{key}=")))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    pairs.push(format!("{key}={value}"));
+    format!("{head}?{}", pairs.join("&"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +162,59 @@ mod tests {
                 "`{bad}` should be rejected"
             );
         }
+    }
+
+    /// 既有 session 参数必须被**替换**，不是追加。
+    ///
+    /// 断言解析后的参数对，而不是对整串做子串匹配：派生值本身以旧 session
+    /// 为前缀（`old-proj-foo`），子串匹配会把正确的输出误判成"还留着旧的"。
+    #[test]
+    fn derive_relay_replaces_an_existing_session_param_exactly_once() {
+        let out = derive_relay(Some("wss://r/?session=old"), "proj-foo").unwrap();
+        let (_, query) = out.split_once('?').expect("query present");
+        let sessions: Vec<&str> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(|(k, _)| *k == "session")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(sessions.len(), 1, "exactly one session param: {out}");
+        assert_eq!(sessions[0], "old-proj-foo", "replaced, not appended: {out}");
+    }
+
+    #[test]
+    fn derive_relay_appends_a_query_when_there_is_none() {
+        let out = derive_relay(Some("wss://r/connect"), "p").unwrap();
+        assert!(out.starts_with("wss://r/connect?session="), "{out}");
+    }
+
+    #[test]
+    fn derive_relay_keeps_unrelated_query_params() {
+        let out = derive_relay(Some("wss://r/?token=t&session=s"), "p").unwrap();
+        assert!(out.contains("token=t"), "{out}");
+        assert_eq!(out.matches("session=").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn derive_relay_is_stable_for_the_same_input() {
+        let a = derive_relay(Some("wss://r/?session=s"), "p").unwrap();
+        let b = derive_relay(Some("wss://r/?session=s"), "p").unwrap();
+        assert_eq!(
+            a, b,
+            "an unstable session would leak a phone session per reconnect"
+        );
+    }
+
+    #[test]
+    fn derive_relay_differs_per_profile() {
+        let a = derive_relay(Some("wss://r/?session=s"), "a").unwrap();
+        let b = derive_relay(Some("wss://r/?session=s"), "b").unwrap();
+        assert_ne!(a, b, "two projects must not share a relay session");
+    }
+
+    #[test]
+    fn derive_relay_is_none_without_a_configured_url() {
+        assert_eq!(derive_relay(None, "p"), None);
     }
 
     #[test]

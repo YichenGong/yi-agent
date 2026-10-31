@@ -45,12 +45,19 @@ pub fn classify(value: &Value) -> Frame {
 /// 「整个 App 卡死」（spec §4.6 障碍三）。
 pub struct Sidecar {
     slots: Mutex<HashMap<ProfileKey, Arc<Mutex<Option<CommandChild>>>>>,
+    /// 用户**希望**连着的槽位。
+    ///
+    /// 监督循环靠它区分「进程意外退出，应当重连」与「用户点了断开，应当安静
+    /// 地待着」。没有这一层，`remote_disconnect` 杀掉进程后监督循环会立刻
+    /// 重新拉起，按钮看起来完全无效。
+    desired: Mutex<std::collections::HashSet<ProfileKey>>,
 }
 
 impl Sidecar {
     pub fn new() -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
+            desired: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -86,6 +93,38 @@ impl Sidecar {
                 Ok(_) => "connecting",
                 Err(_) => "disconnected",
             },
+        }
+    }
+}
+
+impl Sidecar {
+    /// 标记为「用户希望连着」。
+    fn mark_desired(&self, key: &ProfileKey) {
+        if let Ok(mut guard) = self.desired.lock() {
+            guard.insert(key.clone());
+        }
+    }
+
+    /// 是否仍然希望连着。监督循环每次重试前都问一次。
+    fn is_desired(&self, key: &ProfileKey) -> bool {
+        self.desired
+            .lock()
+            .map(|guard| guard.contains(key))
+            .unwrap_or(false)
+    }
+
+    /// 撤销「希望连着」并返回它此前是否存在过。
+    fn unmark_desired(&self, key: &ProfileKey) -> bool {
+        self.desired
+            .lock()
+            .map(|mut guard| guard.remove(key))
+            .unwrap_or(false)
+    }
+
+    /// 摘掉槽位登记（连同内层句柄一起）。
+    fn remove_slot(&self, key: &ProfileKey) {
+        if let Ok(mut guard) = self.slots.lock() {
+            guard.remove(key);
         }
     }
 }
@@ -158,6 +197,7 @@ pub fn rpc_respond(
 /// keeps retrying forever because a transient cause (a still-closing socket, a
 /// temporary disk issue) resolves on its own and a permanent one should surface
 /// as a visible, retried error rather than a dead app.
+#[cfg(test)]
 fn next_restart_delay(consecutive_restarts: u32) -> Duration {
     next_restart_delay_for(&ProfileKey::Local, consecutive_restarts)
 }
@@ -191,6 +231,10 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         let mut consecutive_restarts: u32 = 0;
         loop {
+            if !app.state::<Sidecar>().is_desired(&key) {
+                eprintln!("[{}] no longer desired; supervisor stops", key.as_str());
+                return;
+            }
             match spawn_once(&app, &key) {
                 Ok(mut rx) => {
                     // A successful launch resets the backoff: the previous exit
@@ -482,6 +526,83 @@ pub fn kill_remote_slots(app: AppHandle) {
     }
 }
 
+/// `remote_ssh` 是否开启，**且**这是 dev 构建。
+///
+/// 两层判定缺一不可：
+/// - `yi_agent_flags::is_enabled` 已经内含「非 dev 构建恒关」，但那是库的
+///   硬闸；这里再显式看一次构建类型，让「为什么关着」在错误信息里说清楚。
+/// - 本机判定（spec §5.2）：绝不能问 sidecar 的 `flags/list`——远端连接建立
+///   后，那个 RPC 读到的是**远端机器**的 `flags.json`。
+fn remote_enabled_now() -> bool {
+    gate(
+        yi_agent_flags::is_enabled(yi_agent_flags::registry::REMOTE_SSH_FLAG),
+        yi_agent_flags::build_kind(),
+    )
+}
+
+/// 闸门：开关开着**且**构建是 dev（spec §5.3.1）。
+///
+/// 抽成纯函数才能测——真实调用里的两个输入都来自进程全局状态。
+fn gate(flag_on: bool, build_kind: &str) -> bool {
+    flag_on && build_kind == "dev"
+}
+
+fn remote_gate() -> Result<(), String> {
+    if remote_enabled_now() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` is off (build kind: {}, see 实验开关)",
+            yi_agent_flags::registry::REMOTE_SSH_FLAG,
+            yi_agent_flags::build_kind()
+        ))
+    }
+}
+
+/// 开始连一个远端项目。启动后由监督循环维持（断线自动重连、退避到 60s）。
+#[tauri::command]
+pub fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), String> {
+    remote_gate()?;
+    crate::remote::profile::validate_profile_id(&profile_id).map_err(|e| e.to_string())?;
+    let key = ProfileKey::Remote(profile_id);
+    app.state::<Sidecar>().mark_desired(&key);
+    spawn(&app, key)
+}
+
+/// 用户主动断开：撤销「希望连着」再杀进程。
+///
+/// **顺序很重要**：先撤销意图，监督循环才不会在下一轮立刻把进程拉回来。
+#[tauri::command]
+pub fn remote_disconnect(app: AppHandle, profile_id: String) -> Result<(), String> {
+    let key = ProfileKey::Remote(profile_id);
+    app.state::<Sidecar>().unmark_desired(&key);
+    kill_sidecar(&app, &key);
+    app.state::<Sidecar>().remove_slot(&key);
+    Ok(())
+}
+
+/// 当前所有槽位状态。只在远端开关开着时可用。
+#[tauri::command]
+pub fn remote_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    remote_gate()?;
+    let state = app.state::<Sidecar>();
+    let slots: serde_json::Map<String, serde_json::Value> = state
+        .keys()
+        .into_iter()
+        .map(|key| {
+            let status = state.status_of(&key).to_string();
+            (key.as_str().to_string(), serde_json::json!(status))
+        })
+        .collect();
+    Ok(serde_json::json!({ "slots": slots }))
+}
+
+/// 前端渲染入口用：开关关着就不渲染任何远端 UI（spec §5.3.1）。
+#[tauri::command]
+pub fn remote_enabled() -> bool {
+    remote_enabled_now()
+}
+
 /// Launch one `yi-agent app-server` and return its event stream.
 fn spawn_once(
     app: &AppHandle,
@@ -489,9 +610,52 @@ fn spawn_once(
 ) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
     match key {
         ProfileKey::Local => spawn_local_once(app, key),
-        // 远端槽位在计划 1 的 Task 7 接入；此处先明确报错而不是静默起本地进程。
-        ProfileKey::Remote(id) => Err(format!("remote profile `{id}` is not wired up yet")),
+        ProfileKey::Remote(id) => {
+            let config = crate::remote::config::load(&remote_config_path());
+            let profile = config
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == id)
+                .ok_or_else(|| format!("unknown remote profile `{id}`"))?;
+            spawn_remote_once(app, key, profile)
+        }
     }
+}
+
+/// `<本机 instance_home>/remote.json`（spec §4.9）。
+fn remote_config_path() -> PathBuf {
+    instance_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("remote.json")
+}
+
+/// 远端槽位的启动：一条 `ssh <host> '<command>'`，stdio 即 RPC 通道。
+///
+/// 之所以能直接复用 stdio 协议：ssh 只负责把本地管道接到远端进程的
+/// stdin/stdout，对上层完全等价于本地 sidecar。**代价**是 stderr 会混入 ssh
+/// 自己的诊断信息（`Connection closed by ...`），所以远端日志必须能区分来源。
+fn spawn_remote_once(
+    app: &AppHandle,
+    key: &ProfileKey,
+    profile: &crate::remote::profile::RemoteProfile,
+) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
+    let binary =
+        crate::remote::cache::remote_binary_path(&profile.instance_root, &profile.binary_version);
+    let relay = crate::remote::profile::derive_relay(configured_relay().as_deref(), &profile.id);
+    let argv = crate::remote::argv::remote_argv(profile, &binary, relay.as_deref())
+        .map_err(|error| error.to_string())?;
+
+    let (rx, child) = app
+        .shell()
+        .command("ssh")
+        .args(argv)
+        .spawn()
+        .map_err(|error| format!("ssh spawn failed: {error}"))?;
+
+    app.state::<Sidecar>()
+        .set_slot(key.clone(), Arc::new(Mutex::new(Some(child))));
+
+    Ok(rx)
 }
 
 fn spawn_local_once(
@@ -807,6 +971,78 @@ mod tests {
         assert_eq!(
             state.status_of(&ProfileKey::Remote("alpha".into())),
             "disconnected"
+        );
+    }
+
+    // ---- 远端闸门（计划 01 · Task 7）----
+
+    /// 不需要开关也能一眼看出：正式版永远不给这个功能开口子。
+    #[test]
+    fn a_release_build_never_enables_remote_even_with_the_flag_on() {
+        assert!(!gate(true, "release"));
+    }
+
+    #[test]
+    fn a_nogit_build_is_treated_like_release() {
+        assert!(!gate(true, "nogit"));
+    }
+
+    /// 开关关着时，dev 构建也不启用。
+    #[test]
+    fn the_flag_must_be_on_even_in_a_dev_build() {
+        assert!(!gate(false, "dev"));
+    }
+
+    #[test]
+    fn a_dev_build_with_the_flag_on_enables_remote() {
+        assert!(gate(true, "dev"));
+    }
+
+    /// 槽位键不能因为 id 恰好叫 `local` 就撞上本地槽位。
+    #[test]
+    fn a_remote_slot_key_is_never_the_local_key() {
+        assert_ne!(ProfileKey::Remote("local".into()), ProfileKey::Local);
+        assert_eq!(slot_key("local"), ProfileKey::Local);
+        assert_eq!(slot_key("local"), slot_key("local"));
+        assert_ne!(slot_key("proj-foo"), ProfileKey::Local);
+    }
+
+    #[test]
+    fn remote_status_starts_disconnected_for_an_unknown_profile() {
+        let state = Sidecar::new();
+        assert_eq!(
+            state.status_of(&ProfileKey::Remote("nope".into())),
+            "disconnected"
+        );
+    }
+
+    /// 用户主动断开后，监督循环必须能看出「这次不该重连」。
+    #[test]
+    fn disconnecting_revokes_the_desired_flag() {
+        let state = Sidecar::new();
+        let key = ProfileKey::Remote("proj-foo".into());
+        state.mark_desired(&key);
+        assert!(state.is_desired(&key));
+        assert!(state.unmark_desired(&key));
+        assert!(
+            !state.is_desired(&key),
+            "a disconnected slot must stay down"
+        );
+    }
+
+    /// 一个槽位的断开不得影响另一个槽位——多项目并行时这是数据完整性问题。
+    #[test]
+    fn revoking_one_slot_leaves_the_others_desired() {
+        let state = Sidecar::new();
+        let a = ProfileKey::Remote("a".into());
+        let b = ProfileKey::Remote("b".into());
+        state.mark_desired(&a);
+        state.mark_desired(&b);
+        state.unmark_desired(&a);
+        assert!(!state.is_desired(&a));
+        assert!(
+            state.is_desired(&b),
+            "another project must keep reconnecting"
         );
     }
 

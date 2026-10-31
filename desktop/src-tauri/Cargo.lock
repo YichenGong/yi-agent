@@ -750,6 +750,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "yi-agent-flags",
 ]
 
 [[package]]
@@ -5055,6 +5056,13 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "yi-agent-flags"
+version = "0.1.12"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
