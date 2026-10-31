@@ -16,7 +16,6 @@ yi-agent-supervisors = { workspace = true }
 yi-agent-flags = { workspace = true }
 anyhow.workspace = true
 chrono.workspace = true
-dotenvy.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio.workspace = true
