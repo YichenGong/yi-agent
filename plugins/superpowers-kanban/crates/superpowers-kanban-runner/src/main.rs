@@ -686,6 +686,9 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
     // `stale` 只从观测旁路派生：卡写着 running 但会话已经没了。它是**展示**，
     // 不是状态——`state` 仍然是模型说了算（spec §3.3）。
     let observations = superpowers_kanban_runner::observation::load(state_dir);
+    // 谁在合并也只从 holder 派生：合并是一次会话回合，卡在那期间仍是 running，
+    // 光看状态分不出「在写代码」和「在合并」。
+    let holder = superpowers_kanban_runner::merge_lock::read_holder(state_dir);
     for card in others {
         let where_ = card
             .workdir
@@ -699,9 +702,17 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
         } else {
             ""
         };
+        let merging = if holder
+            .as_ref()
+            .is_some_and(|holder| holder.card_id == card.id.0)
+        {
+            " [merging]"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "{} {:?}{}{}{}",
-            card.id.0, card.state, where_, archived, stale
+            "{} {:?}{}{}{}{}",
+            card.id.0, card.state, where_, archived, stale, merging
         ));
     }
     // 待消费投递。

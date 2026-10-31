@@ -242,7 +242,8 @@ superpowers-kanban list --all  # 连归档卡一起列（行尾标 [archived]）
 - `1. <id> queued` —— 排队中，按顺序编号，看板会依次启动它们；
 - `<id> <State> [@ <worktree>] [archived]` —— 其他状态的卡。`<State>` 是 Rust 枚举名：
   `PreQueued` / `Queued` / `Running` / `NeedsYou` / `AwaitingMerge` / `MergeQueued` /
-  `Done` / `Failed` / `Cancelled`（行尾另有 `[stale]` 表示卡写着 running 但会话已经不在了）；
+  `Done` / `Failed` / `Cancelled`（行尾另有 `[stale]` 表示卡写着 running 但会话已经不在了，
+  `[merging]` 表示本项目此刻的合并名额在它手里）；
 - `<id> pending (waiting for the next tick)` —— 刚投递、还没被插件消费的卡。
   刚 `add` 完看到这条是**正常**的，不是失败。
 
