@@ -275,7 +275,11 @@ Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注�
 
 降级必须可见。用户在配置里写的是 `unfocused`、实际行为是 `always`，若不显示，这个差异永远无法自查。
 
-`TuiConfigSnapshot` 新增五个字段：`notifications: bool`、`method: String`（配置值）、`effective_backend: String`（解析结果）、`condition: String`（生效条件）、`focus_degraded: bool`。由 `run_tui` 组装处填充；`app.rs:220` 的 `snapshot_for_tests()` 需同步补齐，否则测试构造点会编译失败——这正好保证新字段不会漏填。
+`TuiConfigSnapshot` 新增**四个**字段：`notifications: bool`、`notification_method: String`（配置值）、`notification_condition: String`（配置值）、`effective_backend: String`（`auto` 解析结果）。`app.rs:220` 的 `snapshot_for_tests()` 需同步补齐，否则测试构造点会编译失败——这正好保证新字段不会漏填。
+
+`effective_backend` 必须在 `main.rs` 构造快照时就算出来（用 `Notifier::new(.., &TerminalEnv::from_process()).effective_backend()`），因为 `TuiConfigSnapshot` 以 `&` 传给 `run_loop`，循环内无法回填。
+
+焦点降级**不进快照**：它由 `run_tui` 里 `execute!(stdout, EnableFocusChange)` 的结果决定，那时快照已构造完毕。放进去只能恒为 `false`，是死字段。改为 `run_loop` 的值参，在 `/config` 渲染后追加提示行。
 
 ## 7. 正文摘要与消毒
 
