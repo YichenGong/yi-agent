@@ -20655,3 +20655,62 @@ async fn image_read_does_not_scale_with_file_size() {
     );
     h.shutdown().await;
 }
+
+/// `thread/diff/read` 不得把主循环占住。
+///
+/// 该臂在 async handler 里同步跑 git(5+ 次子进程)并全量读所有未跟踪文件。
+/// 判据:一条需要扫大量未跟踪文件的 diff 读取之后,紧随其后的 `thread/list`
+/// 必须很快应答——它证明主循环已经回到 `select!`。
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_read_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 一个没写进 .gitignore 的产物目录：60 个 8 MiB 未跟踪文件。
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+
+    // 先量基线：空载下一条 thread/list 的往返。
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":70,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(70)))
+        .await;
+    let baseline = t0.elapsed();
+
+    // 发一条 diff 读取，紧接着发 list：后者必须不被前者挡住。
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":71,"method":"thread/diff/read","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":72,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(72)))
+        .await;
+    let blocked = t1.elapsed();
+
+    // 相对判据：同一进程同一磁盘上，被挡住时是 1000 倍量级（实测 1101x）。
+    // 用 50 倍留足 CI 抖动余量，同时远小于阻塞量级。
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a diff read must not block the main loop: \
+         baseline={baseline:?} list_behind_diff={blocked:?}"
+    );
+    // 两条响应都得回来，确认 diff 本身也没被弄坏。
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(71)))
+        .await;
+    assert!(v["result"].is_object(), "diff/read must still answer: {v}");
+    h.shutdown().await;
+}

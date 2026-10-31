@@ -1914,22 +1914,68 @@ pub(crate) async fn handle(
                 .map(|t| t.cwd.clone())
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| state.cfg.workdir.display().to_string());
-            let repo = Path::new(&cwd);
-            let base = req.params.get("base").and_then(|v| v.as_str());
-            let result = if let Some(commit) = req.params.get("commit").and_then(|v| v.as_str()) {
-                let (unified_diff, truncated) = crate::git_diff::commit_diff(repo, commit);
-                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
-            } else if let Some(path) = req.params.get("path").and_then(|v| v.as_str()) {
-                // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
-                let d = crate::git_diff::thread_diff(repo, base, None);
-                let (unified_diff, truncated) =
-                    crate::git_diff::file_diff(repo, d.merge_base.as_deref(), path);
-                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
-            } else {
-                serde_json::to_value(crate::git_diff::thread_diff(repo, base, None))
-                    .unwrap_or(json!(null))
-            };
-            write_response(state.hub, state.client, ok_response(id, result)).await?;
+            // 计算搬到**独立 task** 里做,而不是在本臂内联等待。理由与
+            // `thread/listAll` 逐字相同:这一臂要跑 5+ 次 git 子进程,并全量读
+            // 每个未跟踪文件(数换行 / 判二进制 / 合成 unified diff)。盘慢、
+            // 目录多时这段同步 IO 会把主循环整个占住,期间收到的
+            // `turn/interrupt` 只能干等,用户看到的是「点了 Stop 没反应」。
+            //
+            // 主 runtime 是多线程的(`#[tokio::main(flavor = "multi_thread")]`),
+            // 把计算挪到别的 worker 后,主循环立刻回到 `select!`。
+            //
+            // 代价是计算期间不能借 `AppState`:故先把参数快照成纯值。
+            let repo = std::path::PathBuf::from(&cwd);
+            let base = req
+                .params
+                .get("base")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let commit = req
+                .params
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let path = req
+                .params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let hub = Arc::clone(state.hub);
+            let client = state.client.clone();
+            tokio::spawn(async move {
+                let computed = tokio::task::spawn_blocking(move || {
+                    if let Some(commit) = commit {
+                        let (unified_diff, truncated) =
+                            crate::git_diff::commit_diff(&repo, &commit);
+                        json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                    } else if let Some(path) = path {
+                        // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
+                        let d = crate::git_diff::thread_diff(&repo, base.as_deref(), None);
+                        let (unified_diff, truncated) =
+                            crate::git_diff::file_diff(&repo, d.merge_base.as_deref(), &path);
+                        json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                    } else {
+                        serde_json::to_value(crate::git_diff::thread_diff(
+                            &repo,
+                            base.as_deref(),
+                            None,
+                        ))
+                        .unwrap_or(json!(null))
+                    }
+                })
+                .await;
+                let body = match computed {
+                    Ok(body) => body,
+                    Err(error) => {
+                        // 只在 panic 时到这里。回一个合法形状的空结果,而不是
+                        // 静默丢响应——后者会让客户端一直等。
+                        eprintln!("[app-server] thread/diff/read task failed: {error}");
+                        json!({ "unifiedDiff": "", "truncated": false })
+                    }
+                };
+                let _ = write_response(&hub, &client, ok_response(id, body)).await;
+            });
+            return Ok(Flow::Continue);
         }
         "thread/view/read" => {
             // 读回**帧**（模型给命令 / 结构化默认），与 `thread/diff/read` 的
