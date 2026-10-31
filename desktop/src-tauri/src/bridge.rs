@@ -52,6 +52,12 @@ pub struct Sidecar {
     /// 地待着」。没有这一层，`remote_disconnect` 杀掉进程后监督循环会立刻
     /// 重新拉起，按钮看起来完全无效。
     desired: Mutex<std::collections::HashSet<ProfileKey>>,
+    /// 每个远端槽位最近一次失败原因。
+    ///
+    /// 只存**最后一次**：设置页要回答的是「现在为什么没连上」，历史原因对用户
+    /// 没有可操作性。成功起进程时清空——留着一条旧错误会让界面在已连上时仍
+    /// 显示红字。
+    last_errors: Mutex<HashMap<ProfileKey, String>>,
 }
 
 impl Sidecar {
@@ -59,6 +65,7 @@ impl Sidecar {
         Self {
             slots: Mutex::new(HashMap::new()),
             desired: Mutex::new(std::collections::HashSet::new()),
+            last_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -86,6 +93,27 @@ impl Sidecar {
     }
 
     /// 某槽位的粗粒度状态。只用于 UI 展示与 `remote/relayTargets` 的 `available`。
+    /// 记下最近一次失败原因（覆盖旧值）。
+    fn note_error(&self, key: &ProfileKey, error: impl Into<String>) {
+        if let Ok(mut guard) = self.last_errors.lock() {
+            guard.insert(key.clone(), error.into());
+        }
+    }
+
+    /// 起进程成功、或用户主动断开时清掉错误。
+    fn clear_error(&self, key: &ProfileKey) {
+        if let Ok(mut guard) = self.last_errors.lock() {
+            guard.remove(key);
+        }
+    }
+
+    fn last_error(&self, key: &ProfileKey) -> Option<String> {
+        self.last_errors
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(key).cloned())
+    }
+
     fn status_of(&self, key: &ProfileKey) -> &'static str {
         match self.slot(key) {
             None => "disconnected",
@@ -241,6 +269,9 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
                     // A successful launch resets the backoff: the previous exit
                     // was a one-off, not a start-up loop.
                     consecutive_restarts = 0;
+                    // 起来过就不再显示上一次的原因：设置页的红字要回答「现在
+                    // 为什么没连上」，进程已经在跑时答案是「没有」。
+                    app.state::<Sidecar>().clear_error(&key);
                     while let Some(event) = rx.recv().await {
                         match event {
                             CommandEvent::Stdout(bytes) => forward_stdout(&app, &key, &bytes),
@@ -264,15 +295,20 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
                 }
                 Err(e) => {
                     eprintln!("[{}] spawn failed: {e}", key.as_str());
+                    app.state::<Sidecar>().note_error(&key, e);
                 }
             }
             if !should_retry(&key, consecutive_restarts) {
+                let last = app.state::<Sidecar>().last_error(&key);
+                let reason = match &last {
+                    Some(detail) => {
+                        format!("gave up after {REMOTE_MAX_RETRIES} attempts: {detail}")
+                    }
+                    None => format!("gave up after {REMOTE_MAX_RETRIES} attempts"),
+                };
                 let _ = app.emit(
                     &event_name("status", &key),
-                    serde_json::json!({
-                        "state": "disconnected",
-                        "reason": format!("gave up after {REMOTE_MAX_RETRIES} attempts")
-                    }),
+                    serde_json::json!({ "state": "disconnected", "reason": reason }),
                 );
                 eprintln!(
                     "[{}] giving up after {REMOTE_MAX_RETRIES} attempts",
@@ -639,6 +675,8 @@ pub fn remote_disconnect(app: AppHandle, profile_id: String) -> Result<(), Strin
     app.state::<Sidecar>().unmark_desired(&key);
     kill_sidecar(&app, &key);
     app.state::<Sidecar>().remove_slot(&key);
+    // 用户主动断开不是故障：清掉原因，否则设置页会一直挂着上一次的红字。
+    app.state::<Sidecar>().clear_error(&key);
     Ok(())
 }
 
@@ -652,7 +690,14 @@ pub fn remote_status(app: AppHandle) -> Result<serde_json::Value, String> {
         .into_iter()
         .map(|key| {
             let status = state.status_of(&key).to_string();
-            (key.as_str().to_string(), serde_json::json!(status))
+            let error = state.last_error(&key);
+            (
+                key.as_str().to_string(),
+                serde_json::json!({
+                    "status": status,
+                    "lastError": error,
+                }),
+            )
         })
         .collect();
     Ok(serde_json::json!({ "slots": slots }))
@@ -1164,6 +1209,39 @@ mod tests {
             state.status_of(&ProfileKey::Remote("nope".into())),
             "disconnected"
         );
+    }
+
+    /// 设置页的红字要回答「现在为什么没连上」，所以只留最后一次原因。
+    #[test]
+    fn the_last_error_is_overwritten_by_a_newer_one() {
+        let state = Sidecar::new();
+        let key = ProfileKey::Remote("a".into());
+        state.note_error(&key, "ssh: connect: timed out");
+        state.note_error(&key, "permission denied");
+        assert_eq!(state.last_error(&key).as_deref(), Some("permission denied"));
+    }
+
+    /// 起进程成功后必须清掉：留着旧原因会让已连上的项目一直显示红字。
+    #[test]
+    fn a_successful_spawn_clears_the_previous_error() {
+        let state = Sidecar::new();
+        let key = ProfileKey::Remote("a".into());
+        state.note_error(&key, "ssh: connect: timed out");
+        state.clear_error(&key);
+        assert_eq!(state.last_error(&key), None);
+    }
+
+    /// 一个项目的错误不得显示在另一个项目上——多项目并行时这是误导性最强的
+    /// 一类 bug：用户点 A 却看到 B 的报错。
+    #[test]
+    fn errors_do_not_leak_between_slots() {
+        let state = Sidecar::new();
+        let a = ProfileKey::Remote("a".into());
+        let b = ProfileKey::Remote("b".into());
+        state.note_error(&a, "boom");
+        assert_eq!(state.last_error(&b), None);
+        state.clear_error(&b);
+        assert_eq!(state.last_error(&a).as_deref(), Some("boom"));
     }
 
     /// 用户主动断开后，监督循环必须能看出「这次不该重连」。
