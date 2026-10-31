@@ -25,7 +25,7 @@ TUI 里跑一个长回合时，用户会切到别的窗口。回合结束时没�
 
 ## 2. 参照实现
 
-本设计以本地 Codex 源码（`OpenSource/codex`，HEAD `67f0994b53`）为基准，逐项对齐其架构与行为。相对它共有六处差异：**三处是缺陷修正**（Windows 焦点、正文消毒、zellij 透传），**三处是范围减法**（不做 OSC 777、不做按类型白名单、不做热更新）。汇总见 §8。
+本设计以本地 Codex 源码（`OpenSource/codex`，HEAD `67f0994b53`）为基准，逐项对齐其架构与行为。相对它共有六处差异：**三处是缺陷修正**（Windows 焦点、正文消毒、zellij 透传），**三处是范围减法**（不做 OSC 777、不做按类型白名单、不做热更新）。另有若干处是**主动加严**：markdown 剥离（Codex 无）、截断按字素（Codex 已按字素，此项一致）。汇总见 §8。
 
 Codex 的实现分布：
 
@@ -118,7 +118,7 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 
 ### 5.2 auto 选择
 
-严格对齐 Codex `notifications/mod.rs:53-63` 的**五家白名单**：
+严格对齐 Codex `notifications/mod.rs:53-62` 的**五家白名单**：
 
 ```rust
 matches!(name,
@@ -126,6 +126,8 @@ matches!(name,
 ```
 
 不扩表。这张表是「实测能弹出系统通知」的集合，不是「协议支持」的集合；扩表必须先实测，本次没有实测预算。显式 `method = osc9` 可让任何终端走 OSC 9。
+
+与 `supports_osc9`（`notifications/mod.rs:53-62`）逐字对齐：恰好这五家，其余一律 BEL。Codex 的测试 `supports_osc9_for_unsupported_terminals`（`notifications/mod.rs:117-131`）把 `Alacritty`、`Dumb`、`GnomeTerminal`、`Konsole`、`Vte`、`VsCode`、`WindowsTerminal`、`Unknown` 全部钉在 false 上。
 
 #### 5.2.1 终端识别判据
 
@@ -150,9 +152,13 @@ Codex 把识别做成独立的 `terminal-detection` crate（`codex-rs/terminal-d
 | 3 | `WEZTERM_VERSION` 存在 | WezTerm |
 | 4 | `ITERM_SESSION_ID` / `ITERM_PROFILE` / `ITERM_PROFILE_NAME` 存在 | iTerm2 |
 | 5 | `KITTY_WINDOW_ID` 存在，或 `TERM` 含 `kitty` | Kitty |
+| 6 | `ALACRITTY_SOCKET` 存在，或 `TERM == "alacritty"` | Alacritty（→ BEL） |
+| 7 | `WT_SESSION` 存在 | Windows Terminal（→ BEL） |
 | — | 都不匹配 | Unknown → BEL |
 
-归一化规则照 `lib.rs:415-417`：剔除空格、`-`、`_`、`.`，转小写。因此 `WarpTerminal` 与 `warp` 等价。
+第 6、7 条不产生 OSC 9（两家都不在白名单），写出来是为了让「Unknown 回退 BEL」这条路径走得准：Alacritty 与 Windows Terminal 的 `TERM` 常用 `xterm-256color`，若不先识别成具体终端，就只是碰巧落到 BEL——将来若把某家加进白名单，缺这两条会静默错判。`VTE_VERSION` / `KONSOLE_VERSION` / `GNOME_TERMINAL_SCREEN` 同样只影响识别精度、不影响后端选择，本次**不实现**（见 §3 的 YAGNI 判断）。
+
+归一化规则照 `lib.rs:412-418`：`trim` 后剔除空格、`-`、`_`、`.`，转小写。因此 `WarpTerminal` 与 `warp` 等价。Codex 还把 `appleterminal`/`rex`/`vscode`/`konsole`/`gnometerminal`/`vte`/`dumb`/`windowsterminal` 归一化到各自的 `TerminalName`（`lib.rs:419-434`）——这些都不在白名单，我们统一归为「非白名单」即可，不必逐一区分。
 
 **注意**：`TERM=xterm-kitty` 不是主判据，`KITTY_WINDOW_ID` 优先；`TERM` 匹配只是兜底。早期版本的 Codex 曾用 `TERM=xterm-ghostty`（`lib.rs:142`），现在 `GHOSTTY_RESOURCES_DIR` 更可靠。
 
@@ -160,8 +166,10 @@ Codex 把识别做成独立的 `terminal-detection` crate（`codex-rs/terminal-d
 
 | 判据 | 结论 |
 |---|---|
-| `TERM_PROGRAM=tmux` 或 `TMUX` 存在 | tmux |
-| `ZELLIJ` 存在 | zellij（第 3 处修正） |
+| `TMUX` 或 `TMUX_PANE` 非空 | tmux |
+| `ZELLIJ` / `ZELLIJ_SESSION_NAME` / `ZELLIJ_VERSION` 任一非空 | zellij（第 3 处修正） |
+
+三者都判「非空」而非「存在」：`TMUX=` 空串在部分 shell 里是残留，按存在判会误判成 tmux 环境（`lib.rs:368-385` 用的正是 `has_non_empty`）。
 
 `TERM_PROGRAM=tmux` 时第 1 条识别被跳过（`is_tmux_term_program`），否则会把 tmux 本身当成终端名——此时真实终端信息要靠 `TERM` 兜底（第 5 条仍可能命中 kitty）。
 
@@ -175,8 +183,8 @@ Codex 把识别做成独立的 `terminal-detection` crate（`codex-rs/terminal-d
 
 | AgentEvent | 类型 | 优先级 | 文案 |
 |---|---|---|---|
-| `Done { reason: EndTurn }` | `TurnComplete` | 0 | 正文首行摘要（截 60 字素） |
-| `PermissionRequest { tool_name, tool_input, .. }` | `ApprovalRequested` | 1 | `等待批准: <命令或工具名，截 30 字素>` |
+| `Done { reason: EndTurn }` | `TurnComplete` | 0 | 正文摘要（空白折叠后截 200 字素，见 §7.1） |
+| `PermissionRequest { tool_name, tool_input, .. }` | `ApprovalRequested` | 1 | `等待批准: <permission_summary 结果>`（截 200 字素，见下） |
 | `Done { reason: MaxTurns }` / `Done { reason: Interrupted { .. } }` / `Error` / `Cancelled` | — | — | 不发 |
 
 `PermissionRequest` 的文案**复用既有 `permission_summary`**（`tui/history.rs:119-141`），不另写摘要逻辑。
@@ -191,7 +199,7 @@ Codex 把识别做成独立的 `terminal-detection` crate（`codex-rs/terminal-d
 
 复用的理由不是省代码，而是**一致性**：同一个权限请求在转录里和在通知里必须说同一件事。若通知另写一套，`write` 场景就会把 500 字节的正文塞进通知（`history.rs:3980` 的测试正是防这个）。
 
-通知文案 = `format!("等待批准: {}", permission_summary(tool_name, tool_input))`，再经 §7 的 `summarize`（会剥掉 `path:` 这类前缀中的标记并截断）与 `sanitize`。截断取 60 字素，与其他通知统一，不单独设 30。
+通知文案 = `format!("等待批准: {}", permission_summary(tool_name, tool_input))`，再经 §7 的 `summarize`（会剥掉 `path:` 这类前缀中的标记并截断）与 `sanitize`。截断取 200 字素，与其他通知统一（Codex 对命令用 30，见 `chatwidget/notifications.rs:43-47`；我们的 `permission_summary` 对 `write`/`edit` 已压成「路径 + 字节数」，30 字素会连路径都截断，故放宽到 200）。
 
 需要把 `permission_summary` 从 `tui/history.rs` 的私有函数提升为 `pub(crate)`，或移到 `tui/cell.rs` 旁的公共位置——实现时择一，以不破坏 `history.rs` 现有测试为准。
 
@@ -222,7 +230,7 @@ if let AgentEvent::Done { reason: DoneReason::EndTurn } = &event {
 
 ### 6.2 去抖
 
-`pending_notification: Option<PendingNotification>`。新候选优先级 ≤ 已有则丢弃，> 则替换（对齐 Codex `notifications.rs:11-16`）。同一帧内多个 `PermissionRequest` 只留第一个。
+`pending_notification: Option<PendingNotification>`。新候选优先级 ≤ 已有则丢弃，> 则替换（对齐 Codex `chatwidget/notifications.rs:6-16`）。同一帧内多个 `PermissionRequest` 只留第一个。
 
 ### 6.3 绘制间隙 flush
 
@@ -275,19 +283,23 @@ Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注�
 
 ### 7.1 summarize
 
-顺序固定：
+顺序固定，前四步与 Codex **不同**（Codex 没有 markdown 剥离，只做空白折叠），后两步对齐 `chatwidget/notifications.rs:101-114` 与 `text_formatting.rs:70-92`：
 
 1. 丢弃代码围栏块（``` 之间的内容整体跳过）
-2. 取首个非空行
-3. 去掉行首 markdown 标记：`#`、`>`、`-`、`*`、`1.`
-4. 去掉行内标记：`**`、`*`、`` ` ``、`[text](url)` → `text`
-5. 空白折叠为单空格
-6. 按**字素簇**截 60（不是字节、不是 `char`——中文与 emoji 不会被切半）
+2. 去掉行首 markdown 标记：`#`、`>`、`-`、`*`、`1.`
+3. 去掉行内标记：`**`、`*`、`` ` ``、`[text](url)` → `text`
+4. **空白折叠为单空格**（含换行——不是「只取首行」）
+5. 按**字素簇**截 **200**（不是字节、不是 `char`——中文与 emoji 不会被切半）
+6. 截断时保留总量：留前 **197** 个再补 `...`，使可见字素总数恰为 200
 7. 空结果 → 回退固定文案 `yi-agent 回合完成`
+
+**第 4 步与 Codex 一致的原因**：Codex 用 `response.split_whitespace()` 折叠（`notifications.rs:101-113`），换行因此变成空格。若只取首行，多行回复会丢掉用户最想看的结论段——模型常以「以上/结论」收尾。折叠保留全部语义，代价是通知里只有一行，这本来就是系统通知的形态。
+
+**第 5、6 步的数字来自 Codex**：`AGENT_NOTIFICATION_PREVIEW_GRAPHEMES = 200`（`chatwidget/notifications.rs:134`），`truncate_text` 在 `max_graphemes >= 3` 时截到 `max_graphemes - 3` 再补 `...`（`text_formatting.rs:70-92`）。注意是 ASCII 三个点，不是 `…` 单字符。
 
 **字素簇的实现**：`unicode-segmentation` 已在 `Cargo.lock`（v1.13.3，经 `unicode-truncate` 传递引入），但**不在** `yi-agent` 的直接依赖里。本项目现有截断（`tui/bash_popup.rs:296`、`tui/cell.rs:525`、`tui/wrap.rs:94`）全部用 `chars()`，按 `char` 而非字素。
 
-本模块**新增直接依赖** `unicode-segmentation = "1"`（workspace 已有该 crate 的锁定版本，不引入新的下载）。理由：`chars().take(60)` 会把 `👨‍👩‍👧` 这类 ZWJ 序列切断，产生半个 emoji 显示为乱码方块——通知里出现方块比少显示几个字更糟。依赖面很小，且该 crate 已在构建图内。
+本模块**新增直接依赖** `unicode-segmentation = "1"`（workspace 已有该 crate 的锁定版本，不引入新的下载）。理由：`chars().take(200)` 会把 `👨‍👩‍👧` 这类 ZWJ 序列切断，产生半个 emoji 显示为乱码方块——通知里出现方块比少显示几个字更糟。依赖面很小，且该 crate 已在构建图内。
 
 ### 7.2 sanitize
 
@@ -305,7 +317,7 @@ Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注�
 | 2 | OSC 9 非 tmux 路径也执行控制字符消毒 | Codex 该路径直接拼接消息，消息含模型输出与命令文本，是真实注入面 |
 | 3 | zellij 复用 tmux 的 DCS 包裹 | Codex 只认 tmux，zellij 里 OSC 9 静默丢失 |
 | 4 | 不做 OSC 777 | 目标终端只有 urxvt 与 WezTerm 支持，而 WezTerm 也支持 OSC 9；收益仅剩 urxvt 一家 |
-| 5 | 不做按类型白名单（`Notifications` 只到 `bool`） | 本次只有两类事件，白名单不产生价值；将来加数组形态向后兼容 |
+| 5 | 不做按类型白名单（`Notifications` 只到 `bool`） | Codex 有 `Notifications::Custom(Vec<String>)` 按 `type_name()` 过滤（`chatwidget/notifications.rs:94-100`）；我们只有两类事件，白名单不产生价值，将来加数组形态向后兼容 |
 | 6 | 不做配置热更新 | 我们没有设置面板，`/config` 是只读快照，没有触发源 |
 
 其余（配置键名与取值、两张协议字节、五家白名单、优先级与去抖、绘制间隙 flush、失败自禁）与 Codex 一致。
@@ -321,7 +333,7 @@ Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注�
 - 输入含 `\x1b]0;pwned\x07`、`\n`、`\t`、C1 区字符，`summarize` → `sanitize` 后输出不含任何 `< 0x20` 或 `0x7f`–`0x9f` 字节
 - 代码围栏跳过、行首标记剥离、空白折叠
 - 空输入 → 固定文案
-- 60 字素边界：中文与 emoji 不被切半
+- 200 字素边界：中文与 emoji 不被切半；截断后可见字素恰为 200（含 `...`）
 
 `notify/osc9.rs`（用 `Command::write_ansi` 断言字节，与 Codex 同法）：
 
