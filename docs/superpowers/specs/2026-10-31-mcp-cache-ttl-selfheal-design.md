@@ -63,10 +63,19 @@ pub fn get_for(&self, name: &str, cfg: &ServerConfig) -> Option<&[CachedTool]> {
 `CallOutcome::Transport`（`manager.rs` 的 `call_once`），于是触发了一次无意义的重连
 再重试一次，最终把错误透传给模型。
 
-即便修正这个分类，`-32603` 的 message 是网关的泛化文案（`upstream MCP server
-'x' failed to call tool`），**不是**标准的「工具不存在」（`-32602` invalid params）。
-把「调用失败」当作「工具被改名」的信号会把上游临时故障、限流、超时一起误判成
-改名，并引发无谓的重探风暴。故本设计不采用失败驱动。
+即便修正这个分类，这条路仍然不可行——实测证伪了「工具不存在会回标准错误码」这个
+假设：
+
+| 请求 | 实际返回 |
+|---|---|
+| `tools/call` `SearchPro`（旧名） | `-32603 upstream MCP server 'x' failed to call tool` |
+| `tools/call` `definitely_no_such_tool_xyz`（根本不存在） | **同样是 `-32603`**，一字不差 |
+| `tools/call` `tencent-websearch__SearchPro`（正确名） | 200，正常结果 |
+
+网关把所有上游失败都折成同一个 `-32603` 泛化文案，**不区分**「工具不存在」与
+「上游临时故障」。所以调用失败无法作为「工具被改名」的信号：把它当信号会把限流、
+超时、上游 5xx 一起误判成改名，并引发重探风暴；不把它当信号则只能靠时间自愈。
+本设计选择后者。
 
 ### 1.4 探测成本实测
 
@@ -107,6 +116,10 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 在每轮开跑前都已调用 `config_changed_on_disk` → `reload` → `refresh_registry` →
 重建 agent。扩展这个判据即可复用整条链路，无需新机制。
 
+注意这个触发条件的代价：`needs_reload` 为真时，`reload` 会对**所有** server 逐个
+判断新鲜度。未过期的仍然零成本复用，只有过期的那个付 2~3s——所以"一天一次"的开销
+不会随 server 数量线性放大。
+
 ### 决策 2：TTL 记录在缓存文件里，而非进程内存
 
 判据取值 **24 小时**，时间戳存进缓存文件：
@@ -118,17 +131,35 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 24h 的依据：搜索类 MCP 的工具改名不是分钟级事件；一天一次的 2~3s 可接受，且能
 挡住「同一分钟内反复重探」。
 
-### 决策 3：TTL 到期只重探，不改「配置没变就不重探」的既有优化
+### 决策 3：过期要能覆盖内存快照的复用，不能只改缓存判据
 
-`reload` 当前的复用逻辑必须保留：
+`reload` 当前有一段「配置没变就直接复用内存快照」的短路：
 
 ```rust
 let reusable = previous.filter(|e| e.config == *sc);
+match reusable {
+    Some(e) => (e.tools.clone(), false, None),   // 完全不看缓存
+    ...
+}
 ```
 
-原设计意图是「配置没变就不 spawn 子进程」（stdio 首次 `npx` 拉包最坏 55s）。
-TTL 校验是在这个判定**之前**插入的一次「缓存条目是否过期」检查，让过期条目走
-现有的 `probe_tools` 分支，而不是绕开 `reusable`。
+它的原意是「配置没变就不 spawn 子进程」（stdio 首次 `npx` 拉包最坏 55s）。但它
+**先于**缓存判据执行，所以只改 `cache.rs` 的判据对本 bug 无效：进程内第二次及以后
+的 `reload` 会命中这条短路，永远走不到 TTL 检查，也就永远拿不到新工具名。
+
+因此过期判定必须**同时**作用在这条短路上：
+
+```rust
+let reusable = previous.filter(|e| e.config == *sc);
+match reusable {
+    // 新增「且缓存未过期」：否则 24h 后仍会复用旧快照
+    Some(e) if cache.has_fresh(name, sc, now, TTL) => (e.tools.clone(), false, None),
+    Some(e) => /* 快照在但已过期：走探测，失败则回落到 e.tools */,
+    None => ...
+}
+```
+
+这是本设计最容易漏的一处，也是「只改 cache.rs」这种最小改动必然失败的原因。
 
 ## 4. 详细设计
 
@@ -146,7 +177,7 @@ struct CachedServer {
 }
 ```
 
-**判定必须用三态枚举，不能用 `Option`。** 这是本设计最容易写错的一处：
+**判定必须用明确的枚举，不能用 `Option`。** 这是本设计最容易写错的一处：
 
 | 情况 | 含义 | 期望行为 |
 |---|---|---|
@@ -160,7 +191,8 @@ struct CachedServer {
 命中）；若回 `None`，则与「从未探测」不可区分，探测失败会顺带清空已有工具清单。
 
 ```rust
-/// 一次缓存查找的结果。三态：可用 / 需重探 / 保留旧值但需重探。
+/// 一次缓存查找的结果。两个变体足够：「旧值是否保留」是 reload 的策略，
+/// 不属于查找语义，故不塞进枚举。
 pub enum CacheLookup<'a> {
     /// 指纹匹配且未过期：直接用。
     Fresh(&'a [CachedTool]),
@@ -191,8 +223,21 @@ impl McpCache {
 ```
 
 `put` 保留原语义（供既有测试与既有调用点使用），内部转调 `put_probed` 并打上 `now`。
-`get_for` 一并删除：它的「只比指纹」语义正是本 bug 的源头，留着会被后续改动重新用上。
-受影响测试改用 `lookup` 或 `has_fresh`。
+
+**`get_for` 不能直接删掉，它在设置页有一条语义不同的读路径。** 决策改为：
+
+- 重命名 `get_for` → `cached_tools_ignoring_freshness`（`lib.rs` 的 `cached_tools_for`
+  与 `reload` 的失败回退都用它），名字里写明「不看新鲜度」，杜绝被误当成命中判据。
+- 注册/探测路径（`load_and_probe`、`reload`）只用 `lookup` / `has_fresh`。
+
+原因是设置页 `mcp_rpc::list` 用它回答的是**另一个问题**：「这块缓存是否仍然对应
+当前配置」。`None` ⇒ 面板显示 `tools: null`（「尚未探测」）。若改成 TTL 判据，一份
+25 小时前的缓存会让面板显示「尚未探测」，而 agent 手上明明还有那批工具在跑——
+面板与真实状态分叉，且每次开着设置页超过 24h 都会看到工具列表凭空消失。
+
+面板展示的是「磁盘上有什么」，不是「运行时是否新鲜」，所以它继续忽略新鲜度；
+`stale_cache_fingerprint_reports_unprobed_instead_of_stale_tools` 这条既有测试也
+因此保持不变（它钉的是指纹不匹配，与 TTL 无关）。
 
 **时钟注入**：`now` 通过参数传入而非在函数内取 `SystemTime::now()`，让 TTL 判定可被
 单测直接驱动，不必 sleep。
@@ -201,17 +246,14 @@ impl McpCache {
 
 `config_changed_on_disk` 改名为语义更准确的 `needs_reload`（该名字现有 12 处引用，
 分布在 `manager.rs`、`yi-agent/src/main.rs`、`yi-agent-app-server/src/server.rs`；
-两个调用点均为 `if ... { reload() ... }` 形态，新增 `now` 参数即可），并在
-「配置指纹变了」之外增加「任一 server 缓存过期」：
+两个调用点均为 `if ... { reload() ... }` 形态），并增加「缓存过期」这个触发条件。
 
-```rust
-pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
-    // 1) 已有判据：磁盘配置与上次见到的指纹不同
-    // 2) 新增判据：某 server 的缓存条目超过 TTL 或从未记录 probed_at
-}
-```
+**TTL 判定只有一处实现**：`needs_reload` 不自己算 TTL，而是调用与 `reload` 相同的
+`cache.has_fresh(...)`；`reload` 的每个 server 分支也用同一个 `has_fresh` 决定是否
+复用快照。两处共用同一个函数，避免「判据说要 reload、reload 却认为都能复用」的
+不一致（那会让 `needs_reload` 每轮返回真、`reload` 每轮什么都不做，形成空转）。
 
-`load_and_probe` 与 `reload` 都改用 `lookup`，三分支处理：
+`reload` 的三分支（`load_and_probe` 同构）：
 
 | `lookup` 结果 | 行为 |
 |---|---|
@@ -228,8 +270,9 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
 （§4.4）。
 
 需要区分「缓存里有旧条目」与「完全没缓存」：前者失败回退到旧清单，后者失败只能给
-空清单。实现上 `lookup` 的 `Stale` 变体不携带载荷，因此 `reload` 需要额外调用一次
-内部的 `cached_tools_ignoring_freshness(name, cfg)` 取旧值——它只比指纹、不看时间。
+空清单。实现上 `lookup` 的 `Stale` 变体不携带载荷，因此 `reload` 额外调用
+`cached_tools_ignoring_freshness(name, cfg)` 取旧值——它只比指纹、不看时间，与
+设置页共用同一函数（见 §4.1）。
 
 ### 4.3 数据流
 
@@ -246,8 +289,33 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
                      └─ refresh_registry() → 重建 agent,新工具名进入工具表
 ```
 
-自愈的用户可见效果：进程长驻满 24h 后的下一次对话开头，工具名更新为远端现值。
-在那之前，旧名调用仍会失败——这是「不做人工入口」这个范围选择必然接受的延迟。
+### 4.3.1 恢复耗时上限是 24h + 一次探测，且失败会立即重试
+
+TTL 是「距离上次成功探测」计的，而探测失败不刷新时间戳：
+
+```
+T0       成功探测，工具名 X 正确
+T0+1min  上游把 X 改名成 Y
+T0+1min → T0+24h   旧名调用一直失败（缓存未过期，不会重探）
+T0+24h   下一轮开头 needs_reload 为真 → 探测 → 拿到 Y，自愈
+```
+
+如果 T0+24h 那次探测恰好碰上上游抖动/限流，探测失败 → 时间戳不变 → **下一轮立刻
+再试**（判据是「已过期」，不是「距上次尝试超过 N」）。所以失败不会把恢复再推迟一个
+TTL，这是刻意的：换来的是端点持续不可用期间，每轮对话开头都要付一次探测超时代价。
+
+需要明确这是一个**权衡**而不是缺陷：
+
+| 选择 | 端点长期挂掉时的行为 |
+|---|---|
+| 失败不刷新时间戳（本设计） | 每轮都试，每轮 +2~3s；端点一恢复立刻自愈 |
+| 失败也刷新时间戳 | 每 24h 只试一次，代价小；但端点恢复后最长还要等 24h |
+
+本设计选前者，因为「每轮 +2~3s」只在缓存已过期**且**端点不可用时发生，是局部而非
+全局降级；而「恢复后还等 24h」是用户可感知的功能性延迟。
+
+自愈的用户可见效果：TTL 到期后的下一次对话开头，工具名更新为远端现值。在那之前，
+旧名调用仍会失败——这是「不做人工入口」这个范围选择必然接受的延迟。
 
 ### 4.4 报错文案
 
@@ -255,10 +323,15 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
 但模型侧看到的 `-32603` 失败应带上一句可操作提示，避免用户像本次一样无从下手：
 
 ```
-MCP call failed: ... (after reconnect). 
-If the remote tool list may have changed, delete <workdir>/.yi-agent/mcp-cache.json 
-and retry on the next turn.
+MCP call failed: ... (after reconnect).
+The remote tool list may have changed. Delete <workdir>/.yi-agent/mcp-cache.json
+and restart yi-agent; the list is re-probed on startup.
 ```
+
+**文案必须写「重启」而不是「下一轮」，因为删缓存对常驻进程无效。** 缓存是在
+`load_and_probe` / `reload` 时读进内存快照的，删掉磁盘文件不会让运行中的进程
+重新探测——它手上那批 `McpTool` 已经是旧名。只写「删掉并重试」会让用户照做后
+仍然失败，比不给提示更糟。
 
 只在 `CallOutcome::Transport` 的最终失败分支追加，不改 JSON-RPC 错误分类（那是 §8 的独立缺陷）。
 
@@ -290,8 +363,16 @@ and retry on the next turn.
 | `needs_reload_is_false_when_the_cache_is_fresh` | 配置未变 + 缓存新鲜 → `false`（防回归：不能每轮都重探） |
 | `reload_refreshes_a_renamed_tool_after_the_ttl` | 预置旧名缓存 + 过期 → reload 后工具名变为新名 |
 
-最后一条是本 bug 的直接回归测试，也是「回退即红」的变异验证对象：把 `needs_reload`
-里的 TTL 判据删掉，该测试必须变红。
+再加一条专钉 §3 决策 3 那个命门的测试（它覆盖的是「跳过缓存判据」这条路径，
+只用缓存单测测不出来）：
+
+| 测试 | 断言 |
+|---|---|
+| `reload_reprobes_when_the_in_memory_snapshot_has_expired` | 同一进程内先 `load_and_probe` 建立快照，把缓存时间戳改到 25h 前，再 `reload` → 必须重新探测且工具名更新（删掉 `Some(e) if cache.has_fresh(...)` 那个 guard 即变红） |
+
+`reload_refreshes_a_renamed_tool_after_the_ttl` 与上一条都是本 bug 的直接回归测试。
+变异验证对象：把 `needs_reload` 里的 TTL 判据删掉 → 第一条变红；把 `reusable` 分支
+的 `has_fresh` guard 删掉 → 上表这条变红。两条守护的是不同路径，缺一不可。
 
 同时修正真实端点冒烟测试（`tests/http_transport.rs`）——它已在 `a89b23f6` 中改为按
 `__SearchPro` 后缀匹配，本轮只需确认它仍绿。
@@ -300,7 +381,7 @@ and retry on the next turn.
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-mcp              # 期望：全绿，新增 9 例
+cargo test -p yi-agent-mcp              # 期望：全绿，新增 10 例
 cargo test -p yi-agent-mcp --test http_transport -- --ignored   # 真实端点
 cargo test -p yi-agent-app-server --lib # 下游未受影响（1068+）
 cargo test -p yi-agent-runtime --lib
