@@ -141,3 +141,41 @@ async fn the_real_llm_test_routes_are_gone() {
         );
     }
 }
+
+/// 每个字段都必须带 `label`，且与 runtime 的 FIELDS 同源。
+/// 漏一个键会让前端回退成显示机器键名（`agent.max_turns`），
+/// 故按 FIELDS 遍历断言，而不是抽查几个。
+#[tokio::test]
+async fn get_config_reports_a_label_for_every_field() {
+    use yi_agent_runtime::settings;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    let response = app(path)
+        .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let value = body_json(response).await;
+
+    let vars: Vec<serde_json::Value> = value["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["vars"].as_array().unwrap().clone())
+        .collect();
+
+    assert_eq!(vars.len(), settings::FIELDS.len(), "每个字段都要出现");
+
+    for spec in settings::FIELDS {
+        let var = vars
+            .iter()
+            .find(|v| v["key"] == spec.key)
+            .unwrap_or_else(|| panic!("missing field {}", spec.key));
+        assert_eq!(
+            var["label"], spec.label,
+            "{} 的 label 必须来自 FIELDS，不得另写一份",
+            spec.key
+        );
+    }
+}

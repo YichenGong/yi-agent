@@ -41,6 +41,7 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
                 let value = field_value(&current, spec);
                 json!({
                     "key": spec.key,
+                    "label": spec.label,
                     "value": value,
                     "default": spec.default_display,
                     "type": match spec.field_type {
