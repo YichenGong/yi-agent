@@ -453,43 +453,42 @@ malformed line
     /// 回归网：改了常量却忘了改文案，这里会红。
     #[test]
     fn default_display_matches_the_runtime_constants() {
-        use crate::config::{DIRECT_CHILDREN_DEFAULT, RESIDENT_SUBAGENTS_DEFAULT};
-        assert_eq!(
-            find_spec("agent.max_resident_subagents")
-                .unwrap()
-                .default_display,
-            RESIDENT_SUBAGENTS_DEFAULT.to_string()
-        );
-        assert_eq!(
-            find_spec("agent.max_direct_children")
-                .unwrap()
-                .default_display,
-            DIRECT_CHILDREN_DEFAULT.to_string()
-        );
-        // 这三个在 config.rs 里是行内字面量，Task 3 会把它们提成常量后再回来改这里。
-        assert_eq!(find_spec("agent.max_turns").unwrap().default_display, "200");
-        assert_eq!(find_spec("compact.ratio").unwrap().default_display, "80");
-        assert_eq!(
-            find_spec("compact.user_budget_tokens")
-                .unwrap()
-                .default_display,
-            "20000"
-        );
-        assert_eq!(
-            find_spec("compact.tool_budget_tokens")
-                .unwrap()
-                .default_display,
-            "12000"
-        );
-        assert_eq!(
-            find_spec("agent.skills_catalog_budget")
-                .unwrap()
-                .default_display,
-            "8192"
-        );
+        use crate::config::{
+            COMPACT_RATIO_DEFAULT, COMPACT_TOOL_BUDGET_DEFAULT, COMPACT_USER_BUDGET_DEFAULT,
+            DIRECT_CHILDREN_DEFAULT, MAX_TURNS_DEFAULT, RESIDENT_SUBAGENTS_DEFAULT,
+            SKILLS_CATALOG_BUDGET_DEFAULT,
+        };
+        let cases: &[(&str, String)] = &[
+            ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
+            (
+                "agent.max_direct_children",
+                DIRECT_CHILDREN_DEFAULT.to_string(),
+            ),
+            (
+                "agent.max_resident_subagents",
+                RESIDENT_SUBAGENTS_DEFAULT.to_string(),
+            ),
+            (
+                "agent.skills_catalog_budget",
+                SKILLS_CATALOG_BUDGET_DEFAULT.to_string(),
+            ),
+            ("compact.ratio", COMPACT_RATIO_DEFAULT.to_string()),
+            (
+                "compact.user_budget_tokens",
+                COMPACT_USER_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "compact.tool_budget_tokens",
+                COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(find_spec(key).unwrap().default_display, *expected);
+        }
         assert_eq!(
             find_spec("startup.sandbox").unwrap().default_display,
-            "workspace-write"
+            yi_agent_tools::SandboxMode::default().as_str(),
+            "the sandbox default must come from SandboxMode::default(), not a literal"
         );
     }
 

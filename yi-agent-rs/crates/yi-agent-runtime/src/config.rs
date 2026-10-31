@@ -73,6 +73,21 @@ pub const RESIDENT_SUBAGENTS_DEFAULT: u16 = 64;
 /// not override it and a config that does not set it agree.
 pub const DIRECT_CHILDREN_DEFAULT: u16 = 8;
 
+/// 一次对话里 agent 最多执行的轮数。
+pub const MAX_TURNS_DEFAULT: u32 = 200;
+
+/// 触发自动压缩的上下文占比（百分数）。
+pub const COMPACT_RATIO_DEFAULT: u32 = 80;
+
+/// 压缩时保留的真实用户输入 token 数。
+pub const COMPACT_USER_BUDGET_DEFAULT: usize = 20_000;
+
+/// 压缩时保留的完整工具交互 token 数。
+pub const COMPACT_TOOL_BUDGET_DEFAULT: usize = 12_000;
+
+/// 注入系统提示词的技能目录字节预算。
+pub const SKILLS_CATALOG_BUDGET_DEFAULT: usize = 8_192;
+
 /// 运行时配置,由调用方覆盖项和环境变量合并而来。
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -303,7 +318,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
-            .unwrap_or(200);
+            .unwrap_or(MAX_TURNS_DEFAULT);
 
         let max_resident_subagents = std::env::var("YI_AGENT_MAX_RESIDENT_SUBAGENTS")
             .ok()
@@ -336,7 +351,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
-            .unwrap_or(80);
+            .unwrap_or(COMPACT_RATIO_DEFAULT);
 
         let effective_context_length = model_context_length.unwrap_or(200_000);
         let compact_threshold = effective_context_length * compact_ratio / 100;
@@ -354,14 +369,14 @@ impl RuntimeConfig {
         let compact_user_budget_tokens = overrides
             .compact_user_budget_tokens
             .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
-            .unwrap_or(20_000);
+            .unwrap_or(COMPACT_USER_BUDGET_DEFAULT);
         if compact_user_budget_tokens == 0 {
             bail!("compact user budget tokens must be greater than zero");
         }
         let compact_tool_budget_tokens = overrides
             .compact_tool_budget_tokens
             .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
-            .unwrap_or(12_000);
+            .unwrap_or(COMPACT_TOOL_BUDGET_DEFAULT);
 
         let yolo = overrides.yolo
             || overrides.skip_permissions
@@ -405,7 +420,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
-            .unwrap_or(8192);
+            .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
 
         Ok(RuntimeConfig {
             provider,
@@ -636,6 +651,54 @@ mod tests {
             api_key: Some("test-key".into()),
             workdir: Some(PathBuf::from(".")),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn defaults_are_constants_not_scattered_literals() {
+        // 提常量之前，这几行会编译失败——这正是本测试的用途：它钉住
+        // 「默认值只有一个名字」，防止有人再往函数体里写裸字面量。
+        assert_eq!(MAX_TURNS_DEFAULT, 200);
+        assert_eq!(COMPACT_RATIO_DEFAULT, 80);
+        assert_eq!(COMPACT_USER_BUDGET_DEFAULT, 20_000);
+        assert_eq!(COMPACT_TOOL_BUDGET_DEFAULT, 12_000);
+        assert_eq!(SKILLS_CATALOG_BUDGET_DEFAULT, 8_192);
+    }
+
+    /// `settings.json` 的默认值文案必须与这里同源。两个常量组一旦漂移，这条测试先红。
+    #[test]
+    fn settings_metadata_defaults_track_these_constants() {
+        use crate::settings::find_spec;
+        let cases: &[(&str, String)] = &[
+            ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
+            (
+                "agent.max_direct_children",
+                DIRECT_CHILDREN_DEFAULT.to_string(),
+            ),
+            (
+                "agent.max_resident_subagents",
+                RESIDENT_SUBAGENTS_DEFAULT.to_string(),
+            ),
+            (
+                "agent.skills_catalog_budget",
+                SKILLS_CATALOG_BUDGET_DEFAULT.to_string(),
+            ),
+            ("compact.ratio", COMPACT_RATIO_DEFAULT.to_string()),
+            (
+                "compact.user_budget_tokens",
+                COMPACT_USER_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "compact.tool_budget_tokens",
+                COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                find_spec(key).unwrap().default_display,
+                *expected,
+                "default_display for {key} drifted from the runtime constant"
+            );
         }
     }
 
