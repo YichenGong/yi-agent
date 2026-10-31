@@ -219,6 +219,10 @@ pub(crate) async fn handle(
                 .min(IMAGE_READ_CHUNK_BYTES);
             // 越界 offset 落在文件尾之后:返回空块且 `nextOffset: null`,
             // 与「全量读后 `start.min(len)`」的旧行为一致(客户端据此结束循环)。
+            // 此处刻意不再复核「实际字节」(旧实现是 `bytes.len() > IMAGE_READ_MAX_BYTES`):
+            // `want` 被 `declared_len.saturating_sub(start)` 从结构上夹住,任何读取都不可能
+            // 超出 metadata 阶段已过闸的长度,复核无可查。仅剩 metadata 与读取之间的收缩/增长
+            // 竞态:最坏是短一页,或文件变长后 `size` 不再等于当前磁盘长度。
             let start = offset.min(declared_len);
             let want = max_bytes.min(declared_len.saturating_sub(start));
             let bytes = match read_range(&canonical, start, want) {
