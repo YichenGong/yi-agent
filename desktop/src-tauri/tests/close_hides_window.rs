@@ -3,6 +3,12 @@
 //! These live outside the crate so they exercise the same `RunEvent` path the
 //! real app uses, rather than a re-implementation of it.
 
+// The whole crate is macOS-only: it drives `window::handle_run_event`, which
+// only exists under `cfg(target_os = "macos")`. Elsewhere the real app runs the
+// framework's default `RunEvent` handling, so there is no policy to assert and
+// this file compiles to zero tests.
+#![cfg(target_os = "macos")]
+
 use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, RunEvent};
