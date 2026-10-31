@@ -258,7 +258,16 @@ impl McpCache {
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+        // 先写同目录临时文件再 rename:rename 在同一文件系统上是原子的,读方要么
+        // 看到旧文件、要么看到完整新文件,不会读到半截 JSON。缓存坏了会被当成
+        // 空缓存,下一轮全体重探,代价很高。
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // 失败时清掉临时文件,别在 `.yi-agent/` 里留垃圾。
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("rename to {}", path.display()));
+        }
         Ok(())
     }
 }
@@ -620,5 +629,59 @@ mod tests {
             !c.lookup("fs", &server("npx"), NOW, TTL_SECS, RETRY_AFTER_SECS)
                 .is_settled()
         );
+    }
+
+    // ---- save 原子写 ----
+
+    #[test]
+    fn save_leaves_no_tmp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = McpCache::default();
+        c.put("fs", &server("npx"), vec![], NOW);
+        c.save(dir.path()).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".yi-agent"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
+    }
+
+    /// 覆盖写:旧内容必须被完整替换,且文件仍可解析。
+    #[test]
+    fn save_overwrites_atomically_and_stays_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = McpCache::default();
+        c.put("fs", &server("npx"), vec![], NOW);
+        c.save(dir.path()).unwrap();
+
+        let mut c2 = McpCache::default();
+        c2.put("ws", &server("uvx"), vec![], NOW);
+        c2.save(dir.path()).unwrap();
+
+        let loaded = McpCache::load(dir.path());
+        assert!(
+            loaded
+                .lookup("ws", &server("uvx"), NOW, TTL_SECS, RETRY_AFTER_SECS)
+                .is_settled()
+        );
+        assert!(
+            matches!(
+                loaded.lookup("fs", &server("npx"), NOW, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::Stale
+            ),
+            "旧条目应被整体替换掉"
+        );
+    }
+
+    #[test]
+    fn save_creates_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        let mut c = McpCache::default();
+        c.put("fs", &server("npx"), vec![], NOW);
+        c.save(&nested).unwrap();
+        assert!(nested.join(".yi-agent").join("mcp-cache.json").exists());
     }
 }
