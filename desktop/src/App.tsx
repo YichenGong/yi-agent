@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
+import {
+  connectableTargets,
+  parseRelayTargets,
+  relayUrlForTarget,
+} from "./lib/relayTargets";
+import { wsTransport } from "./wsTransport";
 import { useIsMobile } from "./lib/useIsMobile";
 import { SearchBar } from "./components/SearchBar";
 import {
@@ -1944,6 +1950,14 @@ export default function App() {
             list.pinned ?? [],
             store.currentId,
           );
+        // 手机端：为每个可用远端项目各建一条连接（spec §4.6）。
+        //
+        // 桌面机上有 N 个远端项目，各自一个 app-server、各占一条 relay session。
+        // 只连主 session 的话手机上只能看到第一个项目，与「手机上看到的跟电脑上
+        // 一样」不符。**不 await**：多建 N 条 ws 不该推迟首屏；失败只影响它自己。
+        if (isRemoteClient()) {
+          void connectRemoteTargets(client);
+        }
         // 已有会话的项目目录不会被服务端的 `listAll` 懒创建覆盖（那会改写它既
         // 有的分组语义），故这类项目的组长入口要靠客户端补：对「一个组长都没
         // 有」且确实存在的目录组逐个 `thread/lead`，再重取一次列表把新组长带出
@@ -2061,6 +2075,52 @@ export default function App() {
       registryRef.current.put(slot, client);
       wireClient(client);
       return client;
+    };
+
+    /**
+     * 手机端：把 `remote/relayTargets` 里的每个可用项目各连一条。
+     *
+     * 三条约束（spec §4.6）：
+     * - 只连 `available` 且带 `session` 的项。不可用 = 那台远端的进程还没握手；
+     *   `session` 为 null = 本设备是 `Observe` 域，凭据根本没发给它。
+     * - **单个失败不影响其它**：多连接的全部价值就在于此。某个 target 建连失败
+     *   只是它自己缺席，不抛、不回退、不删已建好的连接。
+     * - 已经在册的槽位**不重建**：握手里会跑多次（重连、切回前台），每次重建
+     *   都会掐掉一条正在用的连接，用户看到的是流式输出中断。
+     */
+    const connectRemoteTargets = async (overLocal: RpcClient) => {
+      let raw: unknown;
+      try {
+        raw = await overLocal.request("remote/relayTargets", {});
+      } catch {
+        // 旧宿主 / stable 上这个方法不存在（-32601）。手机不该因为对面版本老
+        // 就连本地会话都用不了，静默当「没有远端项目」。
+        return;
+      }
+      const targets = parseRelayTargets(raw);
+      const config = storedRemoteConfig(localStorage);
+      for (const target of connectableTargets(targets)) {
+        if (disposed) return;
+        if (registryRef.current.get(target.profileId)) continue;
+        try {
+          const url = config
+            ? relayUrlForTarget(config.url, target.session)
+            : target.session;
+          if (!config) continue;
+          const next = new RpcClient(wsTransport(url, config.token), (r) =>
+            recoveryRef.current!(r),
+          );
+          registryRef.current.put(target.profileId, next);
+          wireClient(next);
+          // 与主连接同样握手：不做 `initialize` 的话该连接上任何 `thread/*` 都
+          // 会得到 `-32010 not initialized`。
+          await next.request("initialize", {});
+        } catch (e) {
+          // 只记这个项目：把它从注册表摘掉，避免留一条半死连接反复报错。
+          registryRef.current.remove(target.profileId);
+          console.warn(`remote project ${target.profileId} unavailable:`, e);
+        }
+      }
     };
 
     /** 让 `clientRef` 指向当前活动槽位的客户端。切槽位/重连后都要调一次。 */

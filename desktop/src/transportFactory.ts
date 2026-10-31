@@ -1,5 +1,9 @@
 import type { Transport } from "./lib/rpc";
-import { type RemoteConfig, type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
+import {
+  type RemoteConfig,
+  type StorageLike,
+  storedRemoteConfig,
+} from "./lib/remoteConfig";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import { tauriTransport } from "./tauriTransport";
 import { wsTransport } from "./wsTransport";
@@ -35,11 +39,53 @@ export interface TransportFactoryOptions {
   slot?: Slot;
 }
 
-export function transportFactory(opts: TransportFactoryOptions = {}): Transport {
+export function transportFactory(
+  opts: TransportFactoryOptions = {},
+): Transport {
+  const slot = opts.slot ?? LOCAL_SLOT;
   const config =
     opts.config ??
-    storedRemoteConfig(opts.storage ?? (globalThis.localStorage as StorageLike | undefined) ?? emptyStorage);
-  return config ? wsTransport(config.url, config.token) : tauriTransport(opts.slot ?? LOCAL_SLOT);
+    storedRemoteConfig(
+      opts.storage ??
+        (globalThis.localStorage as StorageLike | undefined) ??
+        emptyStorage,
+    );
+  if (!config) return tauriTransport(slot);
+
+  // A remote client asked for one project's slot: dial that project's own
+  // relay session. Falling back to the base URL here would open a second
+  // connection to the *default* session — two slots silently sharing one
+  // app-server, which is the exact failure multi-connection exists to prevent.
+  if (slot !== LOCAL_SLOT) {
+    const binding = config.projects?.find((entry) => entry.profileId === slot);
+    if (!binding) {
+      throw new Error(
+        `no relay binding for remote project \`${slot}\` (re-pair to refresh the project list)`,
+      );
+    }
+    return wsTransport(
+      relayUrlForSession(config.url, binding.session),
+      config.token,
+    );
+  }
+  return wsTransport(config.url, config.token);
 }
 
-const emptyStorage: StorageLike = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+/**
+ * Put `session` in the relay URL's `session` query parameter.
+ *
+ * The stored `url` may already carry a `?session=` (the desktop's own), so this
+ * replaces rather than appends — `?session=a&session=b` leaves the relay to
+ * pick one, and which one it picks is not ours to guess.
+ */
+export function relayUrlForSession(url: string, session: string): string {
+  const parsed = new URL(url);
+  parsed.searchParams.set("session", session);
+  return parsed.toString();
+}
+
+const emptyStorage: StorageLike = {
+  getItem: () => null,
+  setItem: () => {},
+  removeItem: () => {},
+};
