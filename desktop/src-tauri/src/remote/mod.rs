@@ -10,6 +10,7 @@ pub mod fetch;
 pub mod install;
 pub mod probe;
 pub mod profile;
+pub mod rpc;
 pub mod status;
 
 pub use install::{run_remote, sh_quote};

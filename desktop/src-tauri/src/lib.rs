@@ -47,7 +47,10 @@ pub fn run() {
             bridge::remote_connect,
             bridge::remote_disconnect,
             bridge::remote_status,
-            bridge::remote_enabled
+            bridge::remote_enabled,
+            bridge::remote_list,
+            bridge::remote_upsert,
+            bridge::remote_remove
         ])
         .setup(|app| {
             bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;

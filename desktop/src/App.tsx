@@ -973,6 +973,10 @@ export default function App() {
     }
   };
 
+  /**
+   * 新建会话。`cwd` 只在**本地**槽位下发送（见 `threadStartParams`）：远端
+   * 模式下本机路径在远端机器上不存在，送过去只会让 `canonicalize` 失败。
+   */
   const newThread = async (cwd?: string) => {
     const c = clientRef.current;
     if (!c) return;
@@ -983,7 +987,7 @@ export default function App() {
         model: string;
         permission_mode?: ThreadMode;
         reasoning_effort?: string | null;
-      }>("thread/start", threadStartParams(cwd));
+      }>("thread/start", threadStartParams(cwd, activeSlotRef.current));
       warm.current.add(t.thread_id);
       store.view(t.thread_id).info = { cwd: t.cwd, model: t.model, model_ref: null };
       // 新会话无覆盖 ⇒ 回包报的是实际**生效值**（解析出的条目默认，或条目/配置都没有
@@ -1744,7 +1748,9 @@ export default function App() {
         // 来。**不 await 在首屏关键路径上**——补组长是锦上添花，绝不能推迟首屏
         // 渲染或扣住后续的 selectThread；失败一律忽略。只在整个进程里补一次
         // （`leadEnsured`），服务端创建本身幂等。
-        if (!leadEnsured.current && leadOn) {
+        // 组长只在本地槽位补：`thread/lead` 对远端项目**不做**（spec §7），
+        // 且 `cwd` 是本机路径，送到远端必然失败。
+        if (!leadEnsured.current && leadOn && activeSlotRef.current === LOCAL_SLOT) {
           const needsLead = list.groups.filter(
             (g) => g.exists && !g.threads.some((t) => t.role === "lead"),
           );

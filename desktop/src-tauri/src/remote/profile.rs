@@ -231,12 +231,28 @@ mod tests {
     /// 时，手机拿到的地址没有一个进程在监听——而两端各自的日志都正常。这条
     /// 测试是唯一能钉住这个跨 crate 约定的手段。
     const SHARED_CASES: &[(&str, &str, &str)] = &[
-        ("wss://r/?session=base", "proj-foo", "wss://r/?session=base-proj-foo"),
+        (
+            "wss://r/?session=base",
+            "proj-foo",
+            "wss://r/?session=base-proj-foo",
+        ),
         ("wss://r/connect", "p", "wss://r/connect?session=remote-p"),
-        ("wss://r/?token=t&session=s", "p", "wss://r/?token=t&session=s-p"),
-        ("wss://r/?session=old", "proj-foo", "wss://r/?session=old-proj-foo"),
+        (
+            "wss://r/?token=t&session=s",
+            "p",
+            "wss://r/?token=t&session=s-p",
+        ),
+        (
+            "wss://r/?session=old",
+            "proj-foo",
+            "wss://r/?session=old-proj-foo",
+        ),
         ("wss://r/?token=t", "p", "wss://r/?token=t&session=remote-p"),
-        ("ws://127.0.0.1:8080/ws", "a", "ws://127.0.0.1:8080/ws?session=remote-a"),
+        (
+            "ws://127.0.0.1:8080/ws",
+            "a",
+            "ws://127.0.0.1:8080/ws?session=remote-a",
+        ),
         // 幂等：远端 app-server 对自己已派生过的 session 再派生一次必须是 no-op。
         (
             "wss://r/?session=base-proj-foo",
@@ -259,7 +275,10 @@ mod tests {
     #[test]
     fn deriving_twice_for_the_same_profile_is_a_noop() {
         let once = derive_relay(Some("wss://r/?session=base"), "proj-foo").unwrap();
-        assert_eq!(derive_relay(Some(&once), "proj-foo").as_deref(), Some(&*once));
+        assert_eq!(
+            derive_relay(Some(&once), "proj-foo").as_deref(),
+            Some(&*once)
+        );
     }
 
     #[test]

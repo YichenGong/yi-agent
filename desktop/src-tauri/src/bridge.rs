@@ -541,17 +541,10 @@ pub fn kill_remote_slots(app: AppHandle) {
 /// - 本机判定（spec §5.2）：绝不能问 sidecar 的 `flags/list`——远端连接建立
 ///   后，那个 RPC 读到的是**远端机器**的 `flags.json`。
 fn remote_enabled_now() -> bool {
-    gate(
+    crate::remote::rpc::gate(
         yi_agent_flags::is_enabled(yi_agent_flags::registry::REMOTE_SSH_FLAG),
         yi_agent_flags::build_kind(),
     )
-}
-
-/// 闸门：开关开着**且**构建是 dev（spec §5.3.1）。
-///
-/// 抽成纯函数才能测——真实调用里的两个输入都来自进程全局状态。
-fn gate(flag_on: bool, build_kind: &str) -> bool {
-    flag_on && build_kind == "dev"
 }
 
 fn remote_gate() -> Result<(), String> {
@@ -582,18 +575,9 @@ pub async fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), St
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| format!("unknown remote profile `{profile_id}`"))?;
     let home = instance_home().ok_or_else(|| "home directory is unavailable".to_string())?;
-    let connect_key = key.clone();
-    let app_for_spawn = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        ensure_installed(&home, &profile)
-            .map(|_| connect_key)
-            .map_err(|error| {
-                let _ = &app_for_spawn;
-                error
-            })
-    })
-    .await
-    .map_err(|error| format!("install task failed: {error}"))??;
+    tauri::async_runtime::spawn_blocking(move || ensure_installed(&home, &profile))
+        .await
+        .map_err(|error| format!("install task failed: {error}"))??;
 
     app.state::<Sidecar>().mark_desired(&key);
     spawn(&app, key)
@@ -624,7 +608,8 @@ fn ensure_installed(
     let caps = crate::remote::probe::parse_caps(&probe_output, &probe_output)?;
     if caps.target != profile.remote_arch {
         return Err(format!(
-            "profile `{}` is configured for {} but the remote is {}; refusing to upload a              binary built for another architecture",
+            "profile `{}` is configured for {} but the remote is {}; \
+             refusing to upload a binary built for another architecture",
             profile.id, profile.remote_arch, caps.target
         ));
     }
@@ -677,6 +662,64 @@ pub fn remote_status(app: AppHandle) -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub fn remote_enabled() -> bool {
     remote_enabled_now()
+}
+
+/// 已配置的远端项目 + 功能是否可用。
+///
+/// 闸门关时返回 `{enabled:false, profiles:[]}` 而**不是**报错：设置页需要知道
+/// 「这个功能不可用」才能不渲染入口，报错只会让它显示一条红色异常。
+#[tauri::command]
+pub fn remote_list() -> Result<serde_json::Value, String> {
+    if !remote_enabled_now() {
+        return Ok(serde_json::json!({ "enabled": false, "profiles": [] }));
+    }
+    let config = crate::remote::config::load(&remote_config_path());
+    Ok(serde_json::json!({
+        "enabled": true,
+        "profiles": config.profiles,
+    }))
+}
+
+/// 新增或覆盖一个远端项目（按 `id` 匹配）。
+///
+/// 覆盖而不是新增是刻意的：设置页「编辑」与「新增」走同一个入口，用 id 判断
+/// 语义，避免出现两份同 id 的配置——那会让 `remote.json` 里的槽位概念失效。
+#[tauri::command]
+pub fn remote_upsert(profile: serde_json::Value) -> Result<serde_json::Value, String> {
+    remote_gate()?;
+    let validated = crate::remote::rpc::validate_profile_payload(&profile)?;
+    let path = remote_config_path();
+    let mut config = crate::remote::config::load(&path);
+    match config
+        .profiles
+        .iter()
+        .position(|existing| existing.id == validated.id)
+    {
+        Some(index) => config.profiles[index] = validated.clone(),
+        None => config.profiles.push(validated.clone()),
+    }
+    crate::remote::config::save(&path, &config).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "id": validated.id }))
+}
+
+/// 删掉一个远端项目：先断开（否则监督循环会继续为重连而持有它），再落盘。
+#[tauri::command]
+pub fn remote_remove(app: AppHandle, profile_id: String) -> Result<(), String> {
+    remote_gate()?;
+    crate::remote::profile::validate_profile_id(&profile_id).map_err(|e| e.to_string())?;
+
+    let path = remote_config_path();
+    let mut config = crate::remote::config::load(&path);
+    let before = config.profiles.len();
+    config.profiles.retain(|profile| profile.id != profile_id);
+    if config.profiles.len() == before {
+        return Err(format!("unknown remote profile `{profile_id}`"));
+    }
+    // 顺序：先断开再落盘。反过来的话，落盘成功后到断开之间若监督循环重启一次，
+    // 它会去 `remote.json` 里找不到这个 profile 并报错。
+    remote_disconnect(app, profile_id)?;
+    crate::remote::config::save(&path, &config).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Launch one `yi-agent app-server` and return its event stream.
@@ -1099,29 +1142,8 @@ mod tests {
         );
     }
 
-    // ---- 远端闸门（计划 01 · Task 7）----
-
-    /// 不需要开关也能一眼看出：正式版永远不给这个功能开口子。
-    #[test]
-    fn a_release_build_never_enables_remote_even_with_the_flag_on() {
-        assert!(!gate(true, "release"));
-    }
-
-    #[test]
-    fn a_nogit_build_is_treated_like_release() {
-        assert!(!gate(true, "nogit"));
-    }
-
-    /// 开关关着时，dev 构建也不启用。
-    #[test]
-    fn the_flag_must_be_on_even_in_a_dev_build() {
-        assert!(!gate(false, "dev"));
-    }
-
-    #[test]
-    fn a_dev_build_with_the_flag_on_enables_remote() {
-        assert!(gate(true, "dev"));
-    }
+    // 闸门本身的真值表在 `remote::rpc` 里测（它现在是纯函数，注入两个输入
+    // 就能穷举）；这里只留槽位语义。
 
     /// 槽位键不能因为 id 恰好叫 `local` 就撞上本地槽位。
     #[test]
