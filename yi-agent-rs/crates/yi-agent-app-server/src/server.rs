@@ -1597,8 +1597,7 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         decision_rx,
         catalog,
         yolo,
-        // 委派用的是新工具集自带的 manager,旧的随之丢弃。
-        mcp: _,
+        // 委派用的是新工具集自带的 manager，旧的 `mcp` / `process_manager` 随之丢弃。
         ..
     } = built;
     // Reuse the live session `Arc` so the delegation tools' `CallerContext`,
