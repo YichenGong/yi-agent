@@ -204,21 +204,101 @@ pub fn detect_theme_from_terminal() -> TuiThemeKind {
     detect_theme_kind(env_override.as_deref(), reply.as_deref())
 }
 
+/// `poll` for readability on a raw fd, bounded to `timeout_ms`.
+///
+/// `Some(true)` = readable, `Some(false)` = nothing yet (also what `EINTR`
+/// maps to: no data arrived, keep looping), `None` = the wait itself failed or
+/// the platform has no `poll`, in which case the caller falls back to `Dark`.
+///
+/// Platform-gated on purpose: `libc::poll` does not exist on Windows, and this
+/// module is not otherwise unix-only.
+#[cfg(unix)]
+fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> Option<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` is one initialized entry and nfds is 1, so poll reads
+    // and writes exactly that element.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    if ready >= 0 {
+        return Some(ready > 0);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        return Some(false);
+    }
+    tracing::warn!(%error, "OSC 11 probe poll failed");
+    None
+}
+
+/// No `libc::poll` here: report "cannot wait" so the probe is skipped and the
+/// caller keeps the `Dark` default.
+#[cfg(not(unix))]
+fn poll_readable(_fd: libc::c_int, _timeout_ms: libc::c_int) -> Option<bool> {
+    None
+}
+
+/// fd 0 where `libc` names it; libc's windows-msvc build does not.
+#[cfg(unix)]
+const STDIN_FD: libc::c_int = libc::STDIN_FILENO;
+#[cfg(not(unix))]
+const STDIN_FD: libc::c_int = 0;
+
+/// Read one byte straight from fd 0. `Ok(None)` means EOF.
+///
+/// This deliberately bypasses `std::io::Stdin`: that handle is a
+/// `BufReader<StdinRaw>` with an 8 KiB buffer, so a 1-byte `read` takes the
+/// `fill_buf()` path and pulls *every* pending byte into userspace while fd 0
+/// becomes empty. The next `poll` would then see no data and spin to the
+/// deadline, throwing away a perfectly good OSC 11 reply.
+#[cfg(unix)]
+fn read_stdin_byte() -> std::io::Result<Option<u8>> {
+    let mut byte = 0u8;
+    // SAFETY: `byte` is one writable byte and the count is 1, so the kernel
+    // writes at most that byte.
+    let read = unsafe { libc::read(STDIN_FD, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+    if read == 0 {
+        return Ok(None);
+    }
+    if read < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(byte))
+}
+
+/// Unreachable in practice (`poll_readable` never reports readable without a
+/// `poll`), kept so the probe body type-checks on every platform.
+#[cfg(not(unix))]
+fn read_stdin_byte() -> std::io::Result<Option<u8>> {
+    Ok(None)
+}
+
 /// Ask the terminal for its background color, bounded to 200ms.
 ///
 /// Returns the raw reply text for `detect_theme_kind`. `None` on timeout, on a
 /// non-tty, or when the terminal does not implement OSC 11.
 ///
-/// Uses `libc::poll` on fd 0 rather than `crossterm::event::poll`/`read`: the
-/// latter *consumes* the reply byte, so a following `Read` would block forever
-/// and blow the 200ms budget.
+/// Uses `libc::poll`/`libc::read` on fd 0 rather than `crossterm::event::poll`
+/// / `read` (which *consumes* the reply byte, so a following `Read` would block
+/// past the 200ms budget) and rather than `std::io::Stdin` (whose `BufReader`
+/// desynchronizes our reader from `poll`; see `read_stdin_byte`).
 #[allow(dead_code)] // Reached only through `detect_theme_from_terminal`.
 fn query_osc11() -> Option<String> {
-    use std::io::{IsTerminal, Read, Write};
+    use std::io::{IsTerminal, Write};
 
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
     const POLL_SLICE_MS: u128 = 10;
     const MAX_REPLY_BYTES: usize = 256;
+
+    if !cfg!(unix) {
+        // Without `poll`/`read` on fd 0 the reply could never be collected, so
+        // do not even ask: a written query would land in the input queue
+        // unread and show up later as phantom input.
+        tracing::warn!("OSC 11 probe is unsupported on this platform; assuming dark");
+        return None;
+    }
 
     if !std::io::stdin().is_terminal() {
         return None;
@@ -234,9 +314,7 @@ fn query_osc11() -> Option<String> {
     }
 
     let deadline = std::time::Instant::now() + BUDGET;
-    let mut stdin = std::io::stdin();
     let mut collected: Vec<u8> = Vec::new();
-    let mut byte = [0u8; 1];
 
     loop {
         let now = std::time::Instant::now();
@@ -249,44 +327,43 @@ fn query_osc11() -> Option<String> {
         let remaining = deadline.saturating_duration_since(now);
         let slice_ms = remaining.as_millis().clamp(1, POLL_SLICE_MS) as libc::c_int;
 
-        let mut pollfd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pollfd` is one initialized entry and nfds is 1, so poll
-        // reads and writes exactly that element.
-        let ready = unsafe { libc::poll(&mut pollfd, 1, slice_ms) };
-        if ready == 0 {
-            continue;
-        }
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            tracing::warn!(%error, "OSC 11 probe poll failed");
-            return None;
+        match poll_readable(STDIN_FD, slice_ms) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => return None,
         }
 
-        match stdin.read(&mut byte) {
-            Ok(0) => return None,
-            Ok(_) => {}
+        let byte = match read_stdin_byte() {
+            // EOF: the tty went away mid-probe, nothing more will arrive.
+            Ok(Some(byte)) => byte,
+            Ok(None) => return None,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 tracing::warn!(%error, "OSC 11 probe read failed");
                 return None;
             }
-        }
+        };
 
-        collected.push(byte[0]);
-        // BEL terminates; ST is ESC \ (the ESC itself is just accumulated).
-        if byte[0] == 0x07 || (byte[0] == b'\\' && collected.len() >= 2) {
-            break;
-        }
-        if collected.len() > MAX_REPLY_BYTES {
+        // Cap before pushing so the buffer never exceeds the bound.
+        if collected.len() >= MAX_REPLY_BYTES {
             tracing::warn!("OSC 11 probe overshot {MAX_REPLY_BYTES} bytes; giving up");
             return None;
+        }
+        // C1 ST (0x9c) also terminates. A bare 0x9c is invalid standalone
+        // UTF-8, so it must not enter the buffer or `String::from_utf8` below
+        // would reject a valid reply; a UTF-8-encoded U+009C (c2 9c) is kept
+        // and stripped by `parse_osc11_reply`.
+        if byte == 0x9c {
+            if collected.last() == Some(&0xc2) {
+                collected.push(byte);
+            }
+            break;
+        }
+        collected.push(byte);
+
+        // BEL terminates; ST is ESC \ (the ESC itself is just accumulated).
+        if byte == 0x07 || (byte == b'\\' && collected.len() >= 2) {
+            break;
         }
     }
 
