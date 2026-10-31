@@ -9,6 +9,15 @@ use std::time::Duration;
 
 pub const MAX_DIFF_BYTES: usize = 256 * 1024;
 
+/// 未跟踪文件参与 diff 合成的单文件上限。
+///
+/// 超过它的文件在清单里标 `binary: true`、正文给一行说明,**不读内容**。
+/// 为什么是 1 MiB:`MAX_DIFF_BYTES` 是 256 KiB,一个超过 1 MiB 的未跟踪文件
+/// 无论如何都不可能完整出现在最终 diff 里(前面还有 `truncate`);继续读它
+/// 只是白白占用时间与内存。前端对 `binary: true` 已有占位渲染
+/// (`desktop/src/components/GitDiffView.tsx:187`)。
+pub const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
+
 /// 视图命令的超时。与 bash 的「预期运行时长」无关：这里是展示用命令，
 /// 只读且应当很快；挂住比失败更糟（面板会一直转）。
 pub const VIEW_TIMEOUT: Duration = Duration::from_secs(10);
@@ -358,10 +367,17 @@ fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
     }
     for path in untracked_paths(repo) {
         let full = root.join(&path);
-        let additions = std::fs::read(&full)
-            .map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64)
-            .unwrap_or(0);
-        let binary = is_binary(&full);
+        // 一次读取服务两件事：数换行、判二进制。原实现为此各做一次
+        // 全量 `std::fs::read`，纯粹是重复 IO。
+        let bytes = read_untracked_capped(&full);
+        let (additions, binary) = match bytes.as_deref() {
+            Some(b) => (
+                b.iter().filter(|&&c| c == b'\n').count() as u64,
+                looks_binary(b),
+            ),
+            // 超上限或读不到：视为二进制，(0 行新增)。
+            None => (0, true),
+        };
         out.push(FileStat {
             path,
             status: "A".into(),
@@ -419,11 +435,16 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|&b| b == 0)
 }
 
-fn is_binary(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    looks_binary(&bytes)
+/// 读未跟踪文件；超过 [`MAX_UNTRACKED_FILE_BYTES`] 或读失败返回 `None`。
+///
+/// `None` 的语义 = 「不参与内容合成」：调用方据此标 binary / 跳过正文。
+/// 先看 `metadata` 再读，故超大文件不会被读进内存。
+fn read_untracked_capped(full: &Path) -> Option<Vec<u8>> {
+    let len = std::fs::metadata(full).ok()?.len();
+    if len > MAX_UNTRACKED_FILE_BYTES {
+        return None;
+    }
+    std::fs::read(full).ok()
 }
 
 /// 未跟踪文件合成一份「整文件新增」的 unified diff（避免触碰用户索引）。
@@ -433,7 +454,13 @@ fn is_binary(path: &Path) -> bool {
 fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
-        let Ok(bytes) = std::fs::read(root.join(path)) else {
+        let Some(bytes) = read_untracked_capped(&root.join(path)) else {
+            // 超上限 / 读不到：给一行明确说明，而不是留下一个空白条目
+            // (D1 的另一半：清单里有、点开却是空的)。
+            out.push_str(&format!(
+                "diff --git a/{path} b/{path}\nnew file mode 100644\n\
+                 Binary files /dev/null and b/{path} differ (too large to render)\n"
+            ));
             continue;
         };
         out.push_str(&format!(
@@ -441,8 +468,8 @@ fn untracked_diff(root: &Path, paths: &[String]) -> String {
         ));
         // 二进制按 git 自己的约定给一行说明。此前这里是 `read_to_string` 失败就
         // `continue`，结果是面板把该文件列为 `A`、点开却是空白——D1 的另一半。
-        // 判据与 `is_binary` 共用 `looks_binary`，否则会出现「清单标 binary、
-        // 正文却当文本渲染」这类自相矛盾。
+        // 判据与 `files` 里的清单标志共用 `looks_binary`，否则会出现「清单标
+        // binary、正文却当文本渲染」这类自相矛盾。
         if looks_binary(&bytes) {
             out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
             continue;
@@ -1360,7 +1387,7 @@ mod tests {
 
     /// 「清单说它是二进制」与「点开后的正文」必须一致，且都不能是空白。
     ///
-    /// 判据若两处不同（`is_binary` 只看 NUL，正文却把非法 UTF-8 也当二进制），
+    /// 判据若两处不同（清单只看 NUL，正文却把非法 UTF-8 也当二进制），
     /// 就会出现清单标 text、正文说 binary 这类自相矛盾。这里同时钉住两种输入的
     /// 归属：含 NUL 的走二进制说明；非法 UTF-8 但无 NUL 的按文本有损渲染。
     #[test]
@@ -1389,5 +1416,60 @@ mod tests {
                 "body agrees with the list flag for {path}: {diff:?}"
             );
         }
+    }
+
+    /// 超过上限的未跟踪文件不读内容:清单标 binary,正文给一行说明。
+    ///
+    /// 原实现对每个未跟踪文件做三次全量 `std::fs::read`(数换行 / 判二进制 /
+    /// 合成 unified diff),没有大小上限。截断只在最后做,故 `MAX_DIFF_BYTES`
+    /// 只约束输出、不约束输入——一个 512 MiB 的未跟踪文件会被完整读进内存。
+    #[test]
+    fn untracked_file_over_the_cap_is_not_read_into_the_diff() {
+        let dir = repo();
+        let big = dir.path().join("huge.log");
+        // 2 MiB,超过 MAX_UNTRACKED_FILE_BYTES(1 MiB)。
+        let chunk = "x".repeat(1024 * 1024);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big).unwrap();
+            f.write_all(chunk.as_bytes()).unwrap();
+            f.write_all(chunk.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let d = thread_diff(dir.path(), Some("trunk"), None);
+        let stat = d
+            .files
+            .iter()
+            .find(|f| f.path == "huge.log")
+            .expect("the oversized untracked file must still be listed");
+        assert!(
+            stat.binary,
+            "an oversized untracked file must be reported as binary, not read as text"
+        );
+        assert!(
+            d.unified_diff.contains("too large to render"),
+            "the body must say why it is not rendered: {}",
+            &d.unified_diff[..d.unified_diff.len().min(400)]
+        );
+        // 正文里绝不能出现那 2 MiB 的内容。
+        assert!(
+            !d.unified_diff.contains(&"x".repeat(4096)),
+            "the file content must not be read"
+        );
+    }
+
+    /// 正常大小的未跟踪文件仍按文本合成 diff（不能被上限误伤）。
+    #[test]
+    fn untracked_file_under_the_cap_is_still_rendered_as_text() {
+        let dir = repo();
+        std::fs::write(dir.path().join("note.txt"), "hello\nworld\n").unwrap();
+        let d = thread_diff(dir.path(), Some("trunk"), None);
+        let stat = d.files.iter().find(|f| f.path == "note.txt").unwrap();
+        assert!(!stat.binary, "a small text file must not be marked binary");
+        assert!(
+            d.unified_diff.contains("+hello"),
+            "small untracked text must still be rendered: {}",
+            d.unified_diff
+        );
     }
 }
