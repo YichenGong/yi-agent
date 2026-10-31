@@ -31,6 +31,14 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on spawning a server and completing the MCP `initialize`
 /// handshake. Bounds a server that starts but never finishes handshaking.
+/// 当前 Unix 秒。整个 crate 只有这一处取真实时钟,其余全部接受 `now` 参数。
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the `tools/list` half of a cold cache probe.
@@ -142,11 +150,12 @@ impl McpManager {
         let mut cache_dirty = false;
 
         for (name, sc) in &cfg.mcp_servers {
-            let tools = match cache.get_for(name, sc) {
+            let now = now_unix();
+            let tools = match cache.cached_tools_ignoring_freshness(name, sc) {
                 Some(t) => t.to_vec(),
                 None => match probe_tools(sc).await {
                     Ok(probed) => {
-                        cache.put(name, sc, probed.clone());
+                        cache.put(name, sc, probed.clone(), now);
                         cache_dirty = true;
                         probed
                     }
@@ -229,11 +238,11 @@ impl McpManager {
             let reusable = previous.filter(|e| e.config == *sc);
             let (tools, probed, error) = match reusable {
                 Some(e) => (e.tools.clone(), false, None),
-                None => match cache.get_for(name, sc) {
+                None => match cache.cached_tools_ignoring_freshness(name, sc) {
                     Some(cached) => (cached.to_vec(), false, None),
                     None => match probe_tools(sc).await {
                         Ok(probed_tools) => {
-                            cache.put(name, sc, probed_tools.clone());
+                            cache.put(name, sc, probed_tools.clone(), now_unix());
                             (probed_tools, true, None)
                         }
                         Err(e) => (Vec::new(), true, Some(e.to_string())),
@@ -1018,7 +1027,7 @@ mod tests {
             headers: Default::default(),
             enabled: true,
         };
-        cache.put("fs", &sc, vec![]);
+        cache.put("fs", &sc, vec![], now_unix());
         cache.save(dir.path()).unwrap();
 
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
@@ -1159,7 +1168,7 @@ mod tests {
 
         let sc = cfg("npx");
         let mut cache = McpCache::default();
-        cache.put("fs", &sc, vec![]);
+        cache.put("fs", &sc, vec![], now_unix());
         cache.save(dir.path()).unwrap();
 
         let loaded = McpConfig::load(dir.path()).unwrap().unwrap();
@@ -1179,7 +1188,7 @@ mod tests {
             ..cfg("uvx")
         };
         let mut cache = McpCache::load(dir.path());
-        cache.put("other", &other, vec![]);
+        cache.put("other", &other, vec![], now_unix());
         cache.save(dir.path()).unwrap();
         std::fs::write(
             &cfg_path,
@@ -1224,6 +1233,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 read_only: true,
             }],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -1469,7 +1479,9 @@ mod tests {
             "probe must not call any tool"
         );
         let cached = McpCache::load(dir.path());
-        let hit = cached.get_for("s", &sc).expect("cache hit after probe");
+        let hit = cached
+            .cached_tools_ignoring_freshness("s", &sc)
+            .expect("cache hit after probe");
         assert_eq!(hit.len(), 1, "probe should list exactly one tool");
         assert_eq!(hit[0].name, "echo");
         assert_eq!(mgr.enabled_tools().len(), 1);

@@ -306,6 +306,7 @@ fn render_with_report(req: &ReloadRequest, report: &crate::manager::ReloadReport
 mod tests {
     use super::*;
     use crate::config::ServerKind;
+    use crate::manager::now_unix;
     use crate::reload::{ReloadAction, ReloadRequest};
     use tempfile::TempDir;
 
@@ -387,6 +388,7 @@ mod tests {
             "fs",
             &spec,
             vec![crate::test_support::cached_tool("read", true)],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -440,6 +442,7 @@ mod tests {
             "fs",
             &spec,
             vec![crate::test_support::cached_tool("read", true)],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 

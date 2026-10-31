@@ -46,16 +46,18 @@ pub fn cached_tools_for(
     cfg: &ServerConfig,
 ) -> Option<Vec<McpCacheEntry>> {
     let cache = cache::McpCache::load(workdir);
-    cache.get_for(name, cfg).map(|tools| {
-        tools
-            .iter()
-            .map(|t| McpCacheEntry {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                read_only: t.read_only,
-            })
-            .collect()
-    })
+    cache
+        .cached_tools_ignoring_freshness(name, cfg)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|t| McpCacheEntry {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    read_only: t.read_only,
+                })
+                .collect()
+        })
 }
 
 /// 测试支撑：让下游 crate 的测试能写入真实的缓存文件，而不必复刻 SHA-256 指纹
@@ -158,6 +160,7 @@ mod tests {
     use super::*;
     use crate::cache::{CachedTool, McpCache};
     use crate::config::ServerConfig;
+    use crate::manager::now_unix;
     use std::collections::BTreeMap;
 
     /// 没有任何 mcp.json 时也必须注册 `mcp_reload`:那是"第一次加 server"
@@ -203,6 +206,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 read_only: true,
             }],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -263,6 +267,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 read_only: true,
             }],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
