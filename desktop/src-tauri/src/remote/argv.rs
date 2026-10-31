@@ -142,6 +142,23 @@ mod tests {
         );
     }
 
+    /// 判据 34：远端进程只能以 `stdio://` 监听。
+    ///
+    /// 一旦有人把这里改成 `ws://`/`tcp://`，远端就自己开了一个端口——它既绕过
+    /// 了 ssh 的传输加密，也没做任何鉴权。所以这里断言「只能是 stdio」，
+    /// 而不只是「有 --listen」。
+    #[test]
+    fn listen_is_always_stdio() {
+        for relay in [None, Some("wss://relay.example/ws?session=s1")] {
+            let argv = remote_argv(&sample(), "/b/yi-agent", relay).unwrap();
+            let command = argv.last().unwrap();
+            assert!(command.contains("--listen stdio://"), "{command}");
+            assert!(!command.contains("--listen ws://"), "{command}");
+            assert!(!command.contains("--listen tcp://"), "{command}");
+            assert!(!command.contains("--listen relay://"), "{command}");
+        }
+    }
+
     #[test]
     fn argv_appends_relay_after_listen() {
         let argv =
