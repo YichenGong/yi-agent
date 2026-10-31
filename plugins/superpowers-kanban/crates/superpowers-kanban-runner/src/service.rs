@@ -880,6 +880,32 @@ impl BoardService {
         })
     }
 
+    /// 退队。**只在 `MergeQueued` 上生效**——这个前置条件是它与 `set_state` 的
+    /// 全部区别。队列由 daemon 每拍自动推进，若退队走无条件写，就会在「用户反悔」
+    /// 与「daemon 跑了下一拍」之间留下竞态：卡可能已被推进到 `Running`，那时再改
+    /// 回去会与一个正在跑的合并回合打架。两边对同一张卡的判定互斥，就没有这个窗口。
+    pub fn merge_cancel(&self, card_id: &str) -> Result<(), String> {
+        let id = CardId::new(card_id);
+        persist::with_board(&self.state_dir, |board| {
+            let Some(card) = board.get(&id).cloned() else {
+                return Err(format!("unknown card: {card_id}"));
+            };
+            if card.state != CardState::MergeQueued {
+                return Err(format!(
+                    "card {card_id} is {:?}, not merge_queued; there is nothing to cancel",
+                    card.state
+                ));
+            }
+            board
+                .transition(&id, CardState::AwaitingMerge)
+                .map_err(|error| error.to_string())?;
+            if let Some(card) = board.get_mut(&id) {
+                card.clear_merge_queued();
+            }
+            Ok(())
+        })
+    }
+
     /// 释放合并名额。**不碰 git、不改卡片状态**。
     ///
     /// 合并成没成由模型自己看 git 判断并 `state <card> done`；这里只回答「名额
@@ -1651,6 +1677,44 @@ mod tests {
             service.merge_finish("card-1").unwrap(),
             MergeFinish::Cleared
         );
+    }
+
+    #[test]
+    fn merge_cancel_returns_a_queued_card_to_awaiting_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        service.merge_cancel("card-1").unwrap();
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+        let card = service.list()["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == "card-1")
+            .cloned()
+            .unwrap();
+        assert!(
+            card["merge_queued_at"].is_null(),
+            "the timestamp must be cleared too"
+        );
+    }
+
+    /// 已经开跑的合并不能再退：那会与一个正在跑的回合打架（spec §4.2）。
+    #[test]
+    fn merge_cancel_refuses_a_card_that_is_already_running_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        service
+            .set_state("card-1", CardState::Running, None)
+            .unwrap();
+        let error = service.merge_cancel("card-1").unwrap_err();
+        assert!(error.contains("merge_queued"), "{error}");
     }
 
     #[test]
