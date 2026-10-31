@@ -5,7 +5,7 @@
 
 ## 问题
 
-`~/.yi-agent/.env` 目前承载着 agent 的可调参数（轮次、压缩预算、子 agent 容量、沙箱、yolo、
+`~/.yi-agent/.env` 目前承载着 agent 的可调参数（轮次、压缩预算、子 agent 容量、沙箱档位、
 技能目录预算、搜索 key）。它带来四个相互独立的问题，前三个已在 2026-10-31 的排查中实测确认。
 
 **1. `yi-agent web` 保存设置会删除它不认识的键。** `env_file::write`
@@ -93,8 +93,7 @@
     "user_budget_tokens": 20000,
     "tool_budget_tokens": 12000
   },
-  "permissions": {
-    "yolo": false,
+  "startup": {
     "sandbox": "workspace-write"
   }
 }
@@ -105,8 +104,43 @@
 - 默认值只在 Rust 常量里写一次（`config.rs` 现有的 `RESIDENT_SUBAGENTS_DEFAULT` 等）。
 - 「恢复默认」= 从 JSON 里删掉该键，而不是写回当前默认值。将来默认值改了，用户跟着变。
 
+上表是**可持久化的全部字段**。`workdir` 与 `yolo` 刻意不在其中，理由见下两段。
+
+**`yolo` 不进 `settings.json`。** 这是本次修复的一个关键收紧：
+
+- `yolo` 是**安全姿态**，必须每次启动显式给出（`--yolo` /
+  `--dangerously-skip-permissions` / `YI_AGENT_YOLO`，后者只认字面 `"true"`，
+  见 `config.rs:368-370`）。把它持久化会造出「用户某次开了 yolo，之后每次启动都是
+  yolo」的静默降级。
+- 更具体地说：`sandbox_promotable`（`config.rs:108`）的语义是「启动时非 yolo、
+  且沙箱未被显式指定」时才允许运行期提权。若 yolo 来自持久化配置，加载时就已是
+  yolo，`sandbox_promotable` 恒为 false，桌面端运行期切 yolo 的能力会被悄悄关掉。
+  这一条 `config.rs:1358-1420` 的五个测试（`sandbox_promotable_false_when_*`）钉的
+  正是这个不变量。
+
+因此 `settings.json` 里只有 `startup.sandbox`（非安全姿态，只是默认沙箱档位的选择）。
+
+**`startup` 这个组名是刻意选的，不是 `permissions`。** 仓库里已经有
+`<workdir>/.yi-agent/permissions.toml`（`yi-agent-core/src/permission.rs:347`），
+那是**工具级逐项授权规则**（`[tool_level] bash = false` 之类）。两者语义完全不同：
+`permissions.toml` 决定「哪些工具要问」，`settings.json.startup.sandbox` 决定
+「沙箱默认档位」。命名为 `permissions` 会让用户以为它们是一回事，故避开。
+
 **不含 `workdir` 字段。** 按已批准的决定，工作目录只由 `--workdir`、启动目录、桌面端选项目
 决定；`YI_AGENT_WORKDIR` 这一层从 `resolve_workdir` 删除，`config_meta.rs` 的对应条目一并删除。
+
+**空字符串等于未设置。** 这一条对**所有**类型生效，且必须在加载与写入两侧都实现：
+
+- 字符串字段：`""` 与 `"   "` 都按 `None` 处理（`config.rs` 现有的
+  `filter(|s| !s.is_empty())` 已是这个口径，保持）。
+- 数值字段：JSON 里不会有「空数字」，但 `settings/write` 收到空串时必须写成
+  `null`（删键），**不能**写 `0` 或留空串——否则一个 `max_turns: 0` 会让 agent
+  一轮都跑不了。
+- 枚举字段（`startup.sandbox`）：`""` 视为未设置；非法值见错误处理一节。
+
+这条规则直接来自对 `env_file::write` 的修复：旧实现会把未设置的键写成 `KEY=`，
+读回时是空串而非「未设置」，于是 `get_config` 的 `source` 判定全体失真
+（`api.rs:186`）。新实现必须在写入侧就保持区分——未设置就**不写这个键**。
 
 写入复用 `models.rs` 已验证的那套：临时文件 + `rename` 原子替换 + `0600` + 同目录文件锁
 （`update_catalog` 模式）。**不要**沿用 `env_file.rs:80` 的裸写。
@@ -122,16 +156,40 @@ CI、`just test-*`、部署脚本都在用它做临时覆盖。
 
 ### 迁移
 
-三个生产入口（CLI `run_agent`、`yi-agent web`、app-server 的 `run` 与
-`serve_stdio_with_relay`）在**读取配置之前**各调一次，与现有
-`migrate_model_keys` / `migrate_legacy_model_keys_on_startup` 同一位置、同一幂等性要求：
+**启动序是本节唯一必须做对的事。** 两条迁移（既有的 `migrate_model_keys` 与新的
+`migrate_env_settings`）必须**在同一处、按固定顺序、都在 `load_lenient` 之前**执行。
+理由：`load_inner`（`config.rs:242-248`）把「快照真实环境变量 → 加载 `.env` → 剔除
+`.env` 带来的模型键」放在同一步里。如果迁移发生在 `load_inner` **之后**，`.env` 已经被
+`dotenvy` 注入进程环境，而 `.env` 又被改名，则下一次启动时这些值会凭空消失——但
+`settings.json` 从未收到它们。那就是半迁移：配置看起来迁了，重启后没了。
+
+顺序（所有生产入口一致）：
+
+```
+1. migrate_model_keys(.env → models.json)        ← 既有，模型键
+2. migrate_env_settings(.env → settings.json)    ← 新增，A 类键
+3. load_lenient()                                 ← 才读配置
+```
+
+两个迁移都必须在 `onboarding_prompt::should_offer` 与任何 `RuntimeConfig` 构造之前完成，
+与现有 `main.rs:1301` / `main.rs:63` / `server.rs:1959,2047` / `ws.rs:64` 的接线位置相同。
+
+**五个入口，不是三个。** `migrate_legacy_model_keys_on_startup` 目前被四处调用
+（`server.rs:1959`、`server.rs:2047`、`ws.rs:64`，以及 CLI 的两个独立位置
+`main.rs:63` 的 `web` 与 `main.rs:1301` 的 `run_agent`）。新的迁移必须挂在**同一个**
+`migrate_legacy_model_keys_on_startup` 里，让它一并覆盖这四处——否则
+`app-server --listen ws://`（桌面端 relay 与手机配对走的就是这条）不会迁移 A 类键，
+表现为「桌面端正常、手机端配置丢失」。
+
+迁移逻辑：
 
 1. `<instance_home>/.env` 不存在 → 什么都不做（`NothingToDo`）。
 2. 存在 → 读出 A 类键：
    `YI_AGENT_MAX_TURNS`、`YI_AGENT_MAX_DIRECT_CHILDREN`、`YI_AGENT_MAX_RESIDENT_SUBAGENTS`、
    `YI_AGENT_SYSTEM_PROMPT`、`YI_AGENT_SKILLS_CATALOG_BUDGET`、`YI_AGENT_COMPACT_RATIO`、
    `YI_AGENT_COMPACT_USER_BUDGET_TOKENS`、`YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS`、
-   `YI_AGENT_YOLO`、`YI_AGENT_SANDBOX`、`BOCHA_API_KEY`。
+   `YI_AGENT_SANDBOX`、`BOCHA_API_KEY`。
+   （`YI_AGENT_YOLO` 不在此列，见上一节。）
 3. **只填充 `settings.json` 里尚未设置的字段**，绝不覆盖已有值。已有文件写不进去时
    （读不出来 / 解析不了）按 `models.rs` 的既有约定 **拒绝写入并保持 `.env` 原样**。
 4. `BOCHA_API_KEY` 优先进 `websearch.json` 的 `engines.bocha.api_key`（该文件已热读，
@@ -144,7 +202,31 @@ CI、`just test-*`、部署脚本都在用它做临时覆盖。
 `YI_AGENT_WORKDIR` 在迁移里**直接丢弃**：它的语义已被「启动目录」取代，没有可迁移的落点。
 丢弃时打一行 warning，让设置过它的用户知道。
 
-**取值口径必须与 dotenvy 一致。** 现有 `migrate.rs:23` 的 `active_model_keys` 用朴素行拆分，
+#### `BOCHA_API_KEY` 的 env 回退必须同时删除
+
+`yi-agent-tools/src/web/config.rs:94-101` 现在是三层：
+
+```rust
+pub fn resolved_api_key(&self) -> Option<String> {
+    if !self.api_key.is_empty() { return Some(self.api_key.clone()); }
+    std::env::var("BOCHA_API_KEY").ok().filter(|v| !v.is_empty())   // ← 回退层
+}
+```
+
+这层回退的**唯一**价值是「老用户不改配置也能继续用」，前提是那个 env 值来自 `.env`。
+`.env` 一旦不再加载，这层回退在下次启动时恒为 `None`，于是出现一个很难查的故障：
+搜索在迁移后的当前进程里能用（env 还在），重启后静默失效。
+
+所以本次必须**同时**做两件事：
+
+- 迁移把 key 写进 `websearch.json`（第 4 步）。
+- 删除 `resolved_api_key` 的 `std::env::var` 回退，只认文件。
+
+`sandbox` 与 `websearch` 的调用方各有四条（`websearch_rpc.rs:58,146`、
+`yi-agent-tools/src/lib.rs:159`），删除回退后要一并确认 `has_key` 的语义变成
+「文件里有没有 key」——这正是用户想要的答案。
+
+#### 取值口径必须与 dotenvy 一致 现有 `migrate.rs:23` 的 `active_model_keys` 用朴素行拆分，
 与 dotenvy 不一致（`bug-list.md:171` 未修，本次实测仍复现）：
 
 ```
@@ -162,8 +244,22 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 | 方法 | 语义 |
 |---|---|
 | `settings/read` | 返回每个字段的 `{key, group, label, type, value, default, description, options}`；`value: null` 表示未设置 |
-| `settings/write` | 部分更新；值为 `null` 表示删除该键（回退默认） |
-| `settings/test` | 可选：校验 `sandbox` 等枚举值的合法性，失败返回 `invalid_setting` |
+| `settings/write` | 部分更新；`null` 或空串表示删除该键（回退默认）；返回被拒绝的字段与原因 |
+| `settings/test` | 可选：只校验不落盘，供 UI 在输入时即时反馈 |
+
+`settings/write` 的拒绝规则（返回 `invalid_setting`，零写入）：
+
+- 数值字段超出合理范围：`max_turns` / `max_direct_children` 须 `> 0`，
+  `compact.ratio` 须 `1..=100`，`compact.user_budget_tokens` 须 `> 0`
+  （`config.rs:359` 现在就会对 0 报错，只是报在加载期而非写入期——提前到写入期，
+  用户填错时立刻看到，而不是下次启动失败）。
+- 枚举字段非法：`startup.sandbox` 只接受 `read-only` / `workspace-write` /
+  `danger-full-access`（与 `parse_sandbox_mode` 同一份映射，不另写一遍）。
+- 未知的 `key`：拒绝，而不是静默丢弃——静默丢弃会让用户以为保存成功了。
+
+**写入必须保留文件里的未知键。** 用户在 `settings.json` 里手写的任何
+`settings.rs` 不认识的顶层键，写入时原样保留（读-改-写，不是重建）。这是
+`env_file::write` 那个缺陷的直接教训：它的循环源是元数据表而不是文件内容。
 
 `config_meta.rs` 的 `ALL_VARS` 表删除，元数据改由 runtime 的
 `settings.rs` 定义（类型、默认值、分组、描述、可选项），web 与桌面端共用同一份。
@@ -174,11 +270,23 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 ### 桌面端
 
 `SettingsDialog.tsx` 新增「运行参数」Tab（不复用「通用」：后者的语义是宿主外观，已有主题与
-后台值守两节）。按 `agent` / `compact` / `permissions` 三组分节渲染，输入控件按类型
-（number / text / select / switch）选择。
+后台值守两节）。按 `agent` / `compact` / `startup` 三组分节渲染，输入控件按类型
+（number / text / select）选择。
 
 每项旁边显示「未设置 → 默认 X」；设置过则显示「已设为 Y」并提供「恢复默认」按钮
 （发 `value: null`）。
+
+三态必须真的有三态，不能退化成两态：
+
+| 数据 | 显示 | 「恢复默认」按钮 |
+|---|---|---|
+| `value: null` | 「未设置 · 默认 200」 | 禁用（已经是默认） |
+| `value: 500` | 「已设为 500」 | 可用 → 发 `null` |
+| `value: ""`（字符串字段） | 与 `null` 同视（见「空字符串等于未设置」） | 禁用 |
+
+`GET` 之后不要在前端把 `null` 归一成 `default`——那正是旧 `get_config` 的做法
+（`api.rs:186`），而它导致了「保存一次后所有字段都显示成已设置」。`default` 只用于
+展示提示文案，不参与值判定。
 
 ### `yi-agent web`
 
@@ -189,6 +297,11 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
   HTTP 外壳。`get_config` / `put_config` 改为调该模块的同源函数。
 - 依赖方向已验证不会成环：把 `yi-agent-runtime` 从 dev-dependency 提升为正式依赖即可
   （runtime 只依赖 core/llm/tools/mcp/skills/store/supervisors/flags，不依赖 web）。
+- **`source` 判定改成基于 `value === null`**，与桌面端同源。现有的
+  `local_vars.get(var.key)` 判定必须替换——`env_file::read` 返回的 map 会把
+  `KEY=` 也收成一个空串条目，于是「文件中存在但为空」与「已设置」无法区分。
+  `source: "local" | "default"` 的取值保留（前端已有依赖），但判定依据换成
+  新 `settings/read` 返回的 `value` 是否为 `null`。
 - **删除「真实 LLM 测试」面板**及其后端（`api.rs:41-154` 的
   `get_real_llm_test_config` / `put_real_llm_test_config` /
   `validate_real_llm_test_config` / `clear_real_llm_test_key` 四个 handler、
@@ -221,8 +334,14 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 | `settings.json` 存在但 `JSON` 非法 | 记 `tracing::warn`，回退全 `None`；**绝不**因此阻断启动（与 `models.json`、`preferences.json` 同一约定） |
 | 写入时 base 读不出来 | 返回错误、保持文件原样（沿用 `save_catalog_to` 的守卫，防静默覆盖） |
 | 枚举值非法（如 `sandbox: "bogus"`） | 加载时回退默认值并 warn；`settings/write` 侧直接拒绝 |
-| 迁移时 `settings.json` 不可写 | 不注释/不改名 `.env`，返回 `NotWritable` 并 warn |
+| 数值越界（如 `max_turns: 0`） | 加载时回退默认值并 warn；`settings/write` 侧直接拒绝 |
+| 迁移时 `settings.json` 不可写 | 不改名 `.env`，返回 `NotWritable` 并 warn；下次启动重试 |
+| 迁移时 `.env` 自身不可读 | 返回 `EnvUnreadable`，不动 `settings.json` |
 | `YI_AGENT_HOME` 缺失 | `home_join` 返回 `None`，退到 `./.yi-agent/settings.json`（与 `models_path` 同口径） |
+
+**迁移必须幂等**：连续启动两次，第二次应返回 `NothingToDo`（`.env` 已改名，不存在），
+且 `settings.json` 不被改写（mtime 不变）。这条要有测试钉住——否则每次启动都重写一遍
+配置，会让盯着文件的 watcher 白跑。
 
 ## 测试
 
@@ -233,13 +352,24 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 - **未知键保留**：写入 `agent.max_turns` 后，文件里用户自己加的 `"my_note": "x"` 仍在。
   这是本 spec 修的第一号缺陷的回归网。
 - **不再为未设置字段写空值**：`settings/write` 只改目标字段，其余键不出现。
+- **空串等于未设置**：`settings/write` 收到 `""` 时该键被删除（或从未出现），
+  读回是 `value: null` 而不是 `""`。
 - 迁移：`.env` 有值 → 落进 `settings.json`；`settings.json` 已有值 → **不被覆盖**；
-  `.env` 改名成功；`settings.json` 不可写 → `.env` 原样。
+  `.env` 改名成功；`settings.json` 不可写 → `.env` 原样；**连跑两次第二次是 `NothingToDo`
+  且 `settings.json` 的 mtime 不变**。
+- **启动序**：一条测试断言 `migrate_env_settings` 的调用点位于 `load_lenient` 之前
+  （静态扫源码，与 `main.rs:2909` 的 `only_the_lenient_loader_exists` 防回归测试同一手法）。
+- **ws 入口也迁移**：assert `ws.rs` 的启动段同时调了两个迁移（否则手机端配置丢失）。
 - `.env` 读取口径：`KEY=v #c` → `v`；`export KEY=v` → `v`；`KEY="v"` → `v`。
+- **BOCHA 回退已删**：`resolved_api_key()` 在 `websearch.json` 无 key 且
+  `BOCHA_API_KEY` 环境变量有值时返回 `None`（钉住「不再读 env」）。
 - `YI_AGENT_WORKDIR` 不再影响 `resolve_workdir`（设为任意值后断言仍用当前目录）。
 - `domain_for` 表补 `settings/read|write|test`。
-- web：`put_config` 不再产生空值行；未知键存活；`real-llm` 路由返回 404。
-- 桌面端：`SettingsRuntimeTab` 渲染三组、恢复默认发 `null`、未设置显示默认值。
+- web：`put_config` 不再产生空值行；未知键存活；`source` 基于 `null` 判定；`real-llm` 路由返回 404。
+- 桌面端：`SettingsRuntimeTab` 渲染三组、恢复默认发 `null`、未设置显示默认值、
+  **`value: null` 时「恢复默认」按钮禁用**。
+- **`sandbox_promotable` 不被持久化配置影响**：`settings.json` 里没有任何 yolo 字段可读，
+  启动时非 yolo 仍 `sandbox_promotable == true`。
 
 验证命令：
 
@@ -284,3 +414,45 @@ cd desktop && npx tsc --noEmit && npx vitest run --maxWorkers=1
 
 阶段一交付 `settings/*` RPC 面正是这三件事的前置条件 —— 所以本次改动不会被阶段二的待定决策
 绑死。
+
+## 附：本 spec 的自审记录
+
+初稿完成后做了一轮逐条核对（核实每条断言对应的代码/行号/行为，而非复查自己的措辞），
+发现并修掉五个问题。记录在此，便于审阅时判断改动是否到位。
+
+**1. 启动序没写死（会导致半迁移）。** 初稿只说「在读取配置之前」，但没说明两条迁移的
+相对顺序、也没说清 `load_inner` 里「环境快照 → 加载 `.env` → 剔除模型键」是同一段。
+若迁移落在 `load_inner` 之后，`.env` 已注入进程序环境又被改名，下次启动值就凭空消失。
+现已在「迁移」一节写死三步顺序，并要求两条迁移挂在同一个函数里。
+
+**2. 漏了 ws 入口（会让手机端丢配置）。** 初稿写「三个生产入口」，实际
+`migrate_legacy_model_keys_on_startup` 被四处调用（`server.rs:1959`、`server.rs:2047`、
+`ws.rs:64`，加 CLI 的两个独立位置）。`app-server --listen ws://` 正是桌面 relay 与手机
+配对走的路径，漏掉它表现为「桌面正常、手机配置丢失」。
+
+**3. `BOCHA_API_KEY` 的 env 回退没删。** `web/config.rs:94-101` 在文件无 key 时回退读
+`std::env::var("BOCHA_API_KEY")`。`.env` 不再加载后，该回退在重启时恒为 `None`，
+制造「当前进程能用、重启后静默失效」的难查故障。已明确要求同时删除回退。
+
+**4. `permissions` 组名与既有 `permissions.toml` 冲突。** 仓库已有
+`<workdir>/.yi-agent/permissions.toml`（逐工具授权规则），语义完全不同。已改名为
+`startup`，并在 spec 里写明两者区别，避免用户误以为是同一份配置。
+
+**5. `yolo` 不该持久化。** 它会破坏 `sandbox_promotable` 的不变量（启动时非 yolo 才允许
+运行期提权），且把「一次开过 yolo」变成「永久 yolo」。已从 `settings.json` 移除，
+并在测试一节加了钉住该不变量的用例。
+
+此外补了两处初稿含糊的地方：**空字符串等于未设置**（覆盖字符串/数值/枚举三类，且必须在
+写入侧实现，否则会重演 `env_file::write` 写空占位导致 `source` 失真的老问题）；
+**`value: null` 的三态渲染**（未设置 / 已设置 / 恢复默认按钮是否可用），避免前端又退化成
+两态。
+
+### 仍未解决、需要在实施时决定
+
+- `settings/test` 是否真的需要。UI 可以在前端校验，多一个 RPC 就多一处要维护的
+  校验逻辑。若前端校验足够，这一条可以砍掉。
+- `justfile` 的 `export-model-env.sh` 依赖 `jq` 或 `python3`。前者可能未装，
+  后者 macOS 自带但 `python3` 在某些精简环境缺失。实施时选定一种并加存在性检查。
+- 阶段二的「构建期嵌入 `desktop/dist`」会引入跨 crate 的构建依赖：
+  `yi-agent-web` 的 `build.rs` 若不产出 `dist` 就要报错，这会让「只改 Rust 不碰前端」
+  的开发者被迫装 Node。需要在阶段二单独权衡。
