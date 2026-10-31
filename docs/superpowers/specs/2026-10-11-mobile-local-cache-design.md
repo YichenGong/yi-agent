@@ -6,6 +6,10 @@
 >
 > 日期：2026-10-11
 
+> **部分内容已由 `2026-11-01-mobile-cache-hardening-design.md` 订正**：
+> 本文 §4.1 的函数名与写入时机、§8 的测试清单、§9 的超限兜底
+> 均与实现不符，请以新文档的「对旧文档的修正表」为准。（2026-11-01）
+
 ## 1. 问题
 
 手机端是 app-server 的**远程客户端**：通过中继（`wss://`）连桌面进程。
@@ -74,7 +78,7 @@ iOS 从后台切回前台会重建连接并重放整个握手（`App.tsx:1073` `
   `yi-agent.sidebarWidth` 命名一致）。
 - 存储经可注入的 `StorageLike`（沿用 `remoteConfig.ts` 惯例），默认
   `globalThis.localStorage`，不可用时退化为空操作。
-- 纯函数：`serializeCache` / `parseCache` / `pickCacheable`，全部可脱离 DOM 测试。
+- 纯函数：`parseListCache` / `readListCache` / `writeListCache`（`sessionCache.ts`）。
 
 格式：
 
@@ -92,8 +96,10 @@ iOS 从后台切回前台会重建连接并重放整个握手（`App.tsx:1073` `
 - 只存 `ThreadSummary` / `WorkspaceGroup` 这类纯数据；**不存** `approval`、
   `unread` 等瞬时值（状态徽标靠 `store.seed` 播种，`statusSource="snapshot"`
   已保证不被回滚，见 `threadStore.ts:seed`）。
-- 写入时机：`refreshThreads()` 成功、`handshake` 的 `thread/listAll` 成功后
-  （即拿到权威列表时）节流写一次；`selectThread(id)` 时更新 `selectedId`。
+- 写入时机：`thread/listAll` 成功后，两处——握手（`App.tsx` 的握手 effect）与
+  `refreshThreads`（`useSessionState.ts`）。快照里带 `selectedId`（写入时取
+  当时的 `store.currentId`，不随 `selectThread` 即时更新）；「最后看的会话」另有
+  独立键 `yi-agent.selectedThread`，两者用途不同。
 
 ### 4.2 `desktop/src/lib/contentStore.ts`（内容层，异步）
 
@@ -210,8 +216,8 @@ iOS 从后台切回前台会重建连接并重放整个握手（`App.tsx:1073` `
 
 **纯函数单测（不碰 DOM / 存储）**
 
-- `sessionCache.ts`：`serializeCache`/`parseCache` 往返；版本不符 / 坏 JSON /
-  缺字段 → `null`；`pickCacheable` 的裁剪选择。
+- `sessionCache.ts`：`parseListCache` 的坏值/版本/结构校验；`writeListCache` 的
+  截断上界（见新文档 §4.3）。
 - `contentStore.ts`：`applyTrim` 从头部丢到达标、`trimmed` 标记；LRU 淘汰选择
   （给定条数 / 字节上界选该删哪些）；`bytes` 估算稳定。
 - `formatRelativeTime(ms, now)`：秒 / 分 / 时 / 天边界；`now < ms` 防御。
@@ -255,5 +261,5 @@ cd desktop && npx vitest run   # 全量回归
 - **幽灵内容**：靠 §5.C 的 `dropStale` 兜底；测试锁定。
 - **缓存与 warm 混淆**：明确"预填不置 warm"，否则永不合流；测试锁定。
 - **桌面端回归**：所有分支 gate 在 `isRemoteClient()`；专门回归测试。
-- **localStorage 超限**：列表元数据小，仍有 `pickCacheable` + try/catch 兜底。
+- **localStorage 超限**：`writeListCache` 有 1000 条上界（见新文档 §4.3）+ try/catch 兜底。
 - **顺带修"切回前台跳回首个会话"**：属行为改进，单独测试锁定，仅手机端。
