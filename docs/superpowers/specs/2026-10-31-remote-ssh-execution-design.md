@@ -253,16 +253,26 @@ webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 
    只有 `x86_64-unknown-linux-gnu`、`aarch64-apple-darwin`、
    `x86_64-apple-darwin` 三类可继续；其余（尤其 `aarch64-unknown-linux-gnu`）
    在此**停下并给出可读原因**，不要进入下载。这一步与路径校验同为"失败要趁早"
-4. **校验远端项目路径存在**：`ssh <host> 'test -d <远端项目路径>'`。
+4. **探测远端 home，派生 `instance_root`**：`ssh <host> 'printf %s "$HOME"'`。
+   `instance_root = <远端 home>/.yi-agent-projects/<profile.id>/.yi-agent`（§4.9）。
+
+   **为什么要单独探测而不是猜**：`instance_home()` 靠 `os_home()`
+   （环境变量 `HOME`/`USERPROFILE`，`store/src/paths.rs:20-23`），本机猜不到远端的值。
+   特别注意**不要**用 `remote_path` 反推——项目可能在 `/srv/...`，与 home 毫无关系。
+
+   探测结果为**空**（极少见，如 `HOME` 未设）时必须失败并说明，不要退化成相对路径：
+   那会让 `instance_root` 落到 ssh 会话的 cwd 下，状态随项目目录漂移。
+
+5. **校验远端项目路径存在**：`ssh <host> 'test -d <远端项目路径>'`。
    不存在就**立即失败并说明**，不要等到起 app-server 时由
    `resolve_workdir` 报 `working directory does not exist`（§4.4 已说明这是必做步骤，
    因为 app-server 启动即会校验 `is_dir()`）
-5. 查 `~/.yi-agent/bin/<version>/` 是否已存在且 `--version` 匹配
-6. 不存在则安装（§2.4 的三级优先），进度以 `remote/install/progress` 事件回推
-7. 安装完起 ssh 会话：命令里 `cd '<远端项目路径>'` 让**远端进程**的 cwd 落在
+6. 查 `~/.yi-agent/bin/<version>/` 是否已存在且 `--version` 匹配
+7. 不存在则安装（§2.4 的三级优先），进度以 `remote/install/progress` 事件回推
+8. 安装完起 ssh 会话：命令里 `cd '<远端项目路径>'` 让**远端进程**的 cwd 落在
    项目目录（ssh 没有指定远端 cwd 的参数，见 §4.4），并用 `YI_AGENT_HOME` 做状态
    隔离（见 §4.6），接管 stdio
-8. 前端拿到 `remote/status` 的 `connected`，正常开始对话
+9. 前端拿到 `remote/status` 的 `connected`，正常开始对话
 
 **每一步都要有超时，不能无限等**。参考 codex 的做法
 （`exec-server/src/environment_toml.rs:53-56` 的 `connect_timeout_sec` /
@@ -271,9 +281,10 @@ webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 
 | 阶段 | 超时建议 | 超时后的行为 |
 |---|---|---|
 | ssh 建连（第 3 步） | 20s | 报「无法连接 <host>」，附 ssh stderr |
-| 路径校验（第 4 步） | 10s | 报「远端路径不可用」 |
-| 安装（第 6 步） | 不设总超时，但**每阶段有进度** | 用户可取消 |
-| app-server 握手（第 8 步） | 30s | 杀掉子进程，报「远端 app-server 未就绪」 |
+| home 探测（第 4 步） | 10s | 报「无法确定远端 home」 |
+| 路径校验（第 5 步） | 10s | 报「远端路径不可用」 |
+| 安装（第 7 步） | 不设总超时，但**每阶段有进度** | 用户可取消 |
+| app-server 握手（第 9 步） | 30s | 杀掉子进程，报「远端 app-server 未就绪」 |
 
 没有超时的后果是 UI 永远停在"连接中"，用户既不知道在等什么，也没法重试——
 这是这类功能最常见的坏体验。
@@ -1481,7 +1492,11 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 46. **远端 daemon 不失控**：连 3 个远端项目后，每台远端机器上
     `pgrep -fc 'yi-agent daemon serve'` 等于该项目数（不是 0，也不是 2 倍以上）；
     同一项目重复重连 3 次后数量**不增长**（`ensure_running` 幂等，§8.10）
-47. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+47. **instance_root 由探测的 home 派生**：远端 `HOME` 指向非常规路径
+    （如 `/home/dev` 之外的 `/data/dev`）时，`YI_AGENT_HOME` 落在
+    `/data/dev/.yi-agent-projects/<id>/.yi-agent`，而不是项目目录下、也不是本机猜的值；
+    另测 `HOME` 为空时连接**失败并说明**（§4.1）
+48. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1534,7 +1549,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **47 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **48 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
