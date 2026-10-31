@@ -267,12 +267,20 @@ impl BoardService {
         self.consume_results(results);
         // 2) 观测：只写旁路文件，绝不回写卡片状态。
         self.write_observations(threads);
-        // 3) 启动：队首、有名额、日历放行 → 交出 `launch`。
-        let cards = self.locked_cards();
         let limit = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
             &self.state_dir,
         )
         .limit_at(chrono::Local::now());
+        // 3) 合并队列：用户确认过的卡在这里排到队。放在启动之前——合并优先，
+        //    且它一拍最多开一个、开完即返回，本拍不会再起新会话。
+        {
+            let mut inner = self.lock();
+            if let Some(action) = self.promote_merge_queue(&mut inner, limit) {
+                return Ok(Some(action));
+            }
+        }
+        // 4) 启动：队首、有名额、日历放行 → 交出 `launch`。
+        let cards = self.locked_cards();
         match self.next_launch(limit, chrono::Local::now()) {
             Ok(Some(claim)) => {
                 let card = cards.iter().find(|card| card.id.0 == claim.card_id);
@@ -431,6 +439,118 @@ impl BoardService {
     ///
     /// 直接读盘（`persist::read_board`）而不是读内存：board.json 是唯一真相
     /// （单源点），别的进程（CLI、另一个 daemon）可能刚刚改过它。
+    /// 队列推进：名额空时把队首那张推进到 `Running` 并交出合并回合。
+    ///
+    /// **顺序是「先会话名额、后 merge.lock」**（spec §4.5）。反过来会占着合并锁
+    /// 等额度，期间本项目所有合并都被堵住，而它们本可以排在后面等着。
+    ///
+    /// 合并回合一律开**新会话**：旧的卡片会话早已跑完（甚至可能已经被回收），
+    /// 而合并要在一棵检出 base 的树里做，那棵树是 `merge::prepare` 现建的。
+    fn promote_merge_queue(&self, inner: &mut Inner, limit: u16) -> Option<DriverAction> {
+        let board = persist::read_board(&self.state_dir);
+        // 已经有人在合并：holder 指向任何卡，本拍就不动。锁本身是判定依据，
+        // 不另设 `Merging` 状态（spec §8）。
+        if crate::merge_lock::read_holder(&self.state_dir).is_some() {
+            return None;
+        }
+        let mut candidates: Vec<Card> = board
+            .cards()
+            .iter()
+            .filter(|card| card.state == CardState::MergeQueued)
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // FIFO 只看入队时刻；同一时刻（旧数据没有时间戳）按 order 再按 id 兜底，
+        // 保证每拍挑中的是同一张。
+        candidates.sort_by(|a, b| {
+            (a.merge_queued_at, a.order, &a.id).cmp(&(b.merge_queued_at, b.order, &b.id))
+        });
+        let Some(leases_dir) = inner.leases_dir.clone() else {
+            return None;
+        };
+        for card in candidates {
+            // a) 会话名额。拿不到就整拍不推进——名额是全机共享的，换一张卡也
+            //    一样拿不到，继续试只是白烧 CPU。
+            let Some(lease) = lease::acquire_in(&leases_dir, limit as usize) else {
+                return None;
+            };
+            // b) 合并锁。拿不到说明别的进程刚抢到：把会话名额放回，换下一张。
+            let gate = match crate::merge_lock::acquire_with_holder(&self.state_dir, &card.id.0) {
+                crate::merge_lock::MergeAttempt::Granted(lock)
+                | crate::merge_lock::MergeAttempt::Reclaimed(lock) => lock,
+                crate::merge_lock::MergeAttempt::Busy { .. } => {
+                    drop(lease);
+                    continue;
+                }
+            };
+            let base = card
+                .base_ref
+                .clone()
+                .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
+            let workdir = match merge::prepare(&self.project_root, &base) {
+                Ok(tree) => tree.path,
+                Err(error) => {
+                    eprintln!(
+                        "superpowers-kanban: cannot prepare a tree for {}: {error}",
+                        card.id.0
+                    );
+                    drop(gate);
+                    drop(lease);
+                    continue;
+                }
+            };
+            // 落到 `Running`：合并本来就是一次会话回合，执行态就是 running。
+            if persist::with_board(&self.state_dir, |board| {
+                board
+                    .transition(&card.id, CardState::Running)
+                    .map_err(|error| error.to_string())?;
+                if let Some(live) = board.get_mut(&card.id) {
+                    live.clear_merge_queued();
+                }
+                board
+                    .set_workdir(&card.id, workdir.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .is_err()
+            {
+                drop(gate);
+                drop(lease);
+                continue;
+            }
+            inner.merge_gate = Some(gate);
+            inner.leases.insert(card.id.clone(), lease);
+            // 动作 id 与待办条目就地写进 `inner`：`mint_action_id` /
+            // `remember_pending` 都会再取同一把锁，在这里调用就是自锁。
+            inner.next_action_seq += 1;
+            let action_id = format!("act-{}-{}", inner.action_nonce, inner.next_action_seq);
+            inner.pending_actions.insert(
+                action_id.clone(),
+                PendingAction {
+                    card_id: card.id.clone(),
+                    kind: PendingKind::LaunchForMerge,
+                },
+            );
+            let objective = crate::tick::merge_objective(
+                card.source_ref.as_deref().unwrap_or_default(),
+                &base,
+                &workdir,
+            );
+            return Some(DriverAction::Launch {
+                action_id,
+                driver_project: self.project_root.to_string_lossy().into_owned(),
+                driver_ref: card.id.0.clone(),
+                card_id: card.id.0.clone(),
+                workdir,
+                title: String::new(),
+                objective,
+                env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
+            });
+        }
+        None
+    }
+
     fn locked_cards(&self) -> Vec<Card> {
         persist::read_board(&self.state_dir).cards().to_vec()
     }
@@ -1166,6 +1286,24 @@ mod tests {
     }
 
     /// 把并发配额钉成 1（写进项目日历），用来验「名额限制」。
+    /// 有界轮询直到 `condition` 成立。
+    ///
+    /// 测试并行跑在**同一进程**里，任一处 `Command::new("git")` 都会 fork，
+    /// 把此刻全进程持有的 `flock` fd 一并复制给子进程；子进程 exec 前的这一
+    /// 小段窗口里，别的线程释放了锁也仍算被占。这是 flock 的既有性质，不是
+    /// 被测逻辑的问题，所以断言「名额已释放」时轮询即可（同 `merge_lock`
+    /// 自己那条 `one_project_admits_a_single_merger`）。
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        condition()
+    }
+
     fn one_slot_only(service: &BoardService) {
         let calendar = superpowers_kanban_core::calendar::ConcurrencyCalendar {
             default_max_tasks: 1,
@@ -1195,7 +1333,13 @@ mod tests {
             .unwrap();
         crate::persist::save_board(&state_dir.join("board.json"), &board).unwrap();
 
-        let service = BoardService::new(state_dir.clone(), dir.path().to_path_buf(), None);
+        // `home` 必须隔离：传 `None` 会落到真实的全局租约池，与同机
+        // 其它 cargo 测试抢同一批 slot，结果随并行度时过时不过。
+        let service = BoardService::new(
+            state_dir.clone(),
+            dir.path().to_path_buf(),
+            Some(dir.path().join("home")),
+        );
         // 默认宽限 24h；把「现在」推到 3 天后即超期。
         let swept = service.archive_due(chrono::Local::now() + chrono::Duration::days(3));
         assert_eq!(swept, vec![id], "超期终态卡被自动归档");
@@ -1352,10 +1496,11 @@ mod tests {
             .unwrap();
         assert_eq!(service.list()["cards"][0]["state"], "failed");
         service.enqueue_card_for_test("card-2");
-        let next = service.next_launch(1, at()).unwrap();
-        assert_eq!(
-            next.map(|claim| claim.card_id),
-            Some("card-2".to_string()),
+        assert!(
+            wait_until(|| service
+                .next_launch(1, at())
+                .unwrap()
+                .is_some_and(|claim| claim.card_id == "card-2")),
             "a failed launch must hand its slot to the next queued card"
         );
     }
@@ -1661,11 +1806,16 @@ mod tests {
         );
         // 状态一动不动：合没合上由模型自己判断并 `state ... done`。
         assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
-        // 名额已放掉，别人能拿到。
-        assert!(matches!(
-            crate::merge_lock::acquire_with_holder(&service.state_dir, "other"),
-            crate::merge_lock::MergeAttempt::Granted(_)
-        ));
+        // 名额已放掉，别人能拿到。`drop` 经内核解 flock 是同步的，但同一进程里
+        // 另一条线程若恰在扫描同名 slot 也不该影响这里——所以直接断言，失败时
+        // 把真实结局打出来。
+        assert!(
+            wait_until(|| matches!(
+                crate::merge_lock::acquire_with_holder(&service.state_dir, "other"),
+                crate::merge_lock::MergeAttempt::Granted(_)
+            )),
+            "the gate must be free after merge_finish"
+        );
     }
 
     #[test]
@@ -1677,6 +1827,81 @@ mod tests {
             service.merge_finish("card-1").unwrap(),
             MergeFinish::Cleared
         );
+    }
+
+    #[test]
+    fn the_queue_head_starts_merging_when_the_gate_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        let action = service
+            .driver_step(&[facts("thread-1", true, true)], &[])
+            .unwrap()
+            .expect("a merge turn");
+        let DriverAction::Launch {
+            card_id, objective, ..
+        } = action;
+        assert_eq!(card_id, "card-1");
+        assert!(objective.contains("merge"), "{objective}");
+        assert_eq!(state_of(&service, "card-1"), "running");
+        let holder = crate::merge_lock::read_holder(&service.state_dir).expect("holder");
+        assert_eq!(holder.card_id, "card-1");
+    }
+
+    #[test]
+    fn only_one_merge_starts_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.enqueue_card_for_test("card-2");
+        service
+            .set_state("card-2", CardState::AwaitingMerge, None)
+            .unwrap();
+        service.merge_request("card-1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        service.merge_request("card-2").unwrap();
+        assert_eq!(
+            service.merge_request("card-2").unwrap(),
+            MergeRequest::Queued { position: 1 }
+        );
+        let _ = service.driver_step(&[], &[]).unwrap().expect("first merge");
+        assert_eq!(state_of(&service, "card-2"), "merge_queued");
+        assert_eq!(state_of(&service, "card-1"), "running");
+    }
+
+    #[test]
+    fn a_held_gate_leaves_the_queue_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        let gate = crate::merge_lock::acquire_with_holder(&service.state_dir, "someone-else");
+        assert!(matches!(gate, crate::merge_lock::MergeAttempt::Granted(_)));
+        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        drop(gate);
+    }
+
+    /// 合并回合开在**新会话**里，所以旧会话忙不忙都不影响：一张排着队的卡
+    /// 不该因为「它原来的会话还在跑」而被无限期压住。
+    #[test]
+    fn a_busy_old_session_does_not_block_the_merge_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        let action = service
+            .driver_step(&[facts("thread-1", false, true)], &[])
+            .unwrap()
+            .expect("a merge turn");
+        let DriverAction::Launch { card_id, .. } = action;
+        assert_eq!(card_id, "card-1");
+        assert_eq!(state_of(&service, "card-1"), "running");
     }
 
     #[test]
@@ -1742,7 +1967,13 @@ mod tests {
             chrono::Local::now(),
         );
         crate::persist::save_board(&state_dir.join("board.json"), &board).unwrap();
-        let service = BoardService::new(state_dir.clone(), dir.path().to_path_buf(), None);
+        // `home` 必须隔离：传 `None` 会落到真实的全局租约池，与同机
+        // 其它 cargo 测试抢同一批 slot，结果随并行度时过时不过。
+        let service = BoardService::new(
+            state_dir.clone(),
+            dir.path().to_path_buf(),
+            Some(dir.path().join("home")),
+        );
         // 先建好 service（其内不再缓存看板），再由「外部写者」经 with_board 改盘。
         crate::persist::with_board(&state_dir, |board| {
             board
@@ -1901,11 +2132,15 @@ mod tests {
         assert!(service.driver_step(&threads, &[]).unwrap().is_none());
         // 会话死了 → 名额归还，第二张起得来。
         let threads = vec![facts("thread-1", false, false)];
-        let next = service
-            .driver_step(&threads, &[])
-            .unwrap()
-            .expect("the slot frees");
-        assert!(matches!(next, DriverAction::Launch { ref card_id, .. } if card_id == "card-2"));
+        assert!(
+            wait_until(|| service.driver_step(&threads, &[]).unwrap().is_some_and(
+                |action| matches!(
+                    action,
+                    DriverAction::Launch { ref card_id, .. } if card_id == "card-2"
+                )
+            )),
+            "the slot frees for card-2"
+        );
     }
 
     /// 模型可以设任意非终态，但终态不可复活。
