@@ -799,7 +799,6 @@ name = "desktop"
 version = "0.1.0"
 dependencies = [
  "dirs",
- "flate2",
  "libc",
  "reqwest",
  "serde",

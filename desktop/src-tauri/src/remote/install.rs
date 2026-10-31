@@ -4,7 +4,7 @@
 //! 每条降级分支都能在单测里走一遍，不用真的下载十几 MB 或连一台没有 gzip 的
 //! 机器；执行部分是 ssh/scp 编排，靠手工端到端验证。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::remote::probe::RemoteCaps;
 
@@ -49,8 +49,8 @@ pub fn sh_quote(raw: &str) -> String {
 /// 远端解压命令。
 ///
 /// **`-z` 只在确认远端 gzip 可用时才加**：GNU tar 的 `-z` 会 fork 外部 `gzip`，
-/// 极简镜像里没有它，`tar -xzf` 直接失败（spec §2.4.2）。没有 gzip 时上传的
-/// 产物必须是**已解压的 `.tar`**（见 `needs_local_decompress`）。
+/// 极简镜像里没有它，`tar -xzf` 直接失败（spec §2.4.2）。没有 gzip 的远端
+/// 根本不走这条命令（见 `needs_local_extract`）。
 pub fn unpack_command(caps: &RemoteCaps, tarball_remote: &str, dest: &str) -> String {
     let flag = if caps.tar_supports_gzip {
         "-xzf"
@@ -67,22 +67,33 @@ pub fn unpack_command(caps: &RemoteCaps, tarball_remote: &str, dest: &str) -> St
     )
 }
 
-/// 远端没有 gzip 时，上传前必须在本机把 `.tar.gz` 解成 `.tar`。
+/// 远端有 `tar` 但解不了 gzip 时，安装改走「本机解出二进制，只传那一个文件」。
 ///
 /// **这是计划里最容易漏的一处**：只用 `-xf` 去解一个 gzip 文件会立刻失败，
 /// 而错误信息（`tar: Unrecognized archive format`）离真正原因很远。
-pub fn needs_local_decompress(caps: &RemoteCaps) -> bool {
+///
+/// 为什么不是「本机解成 `.tar` 再传」：那要 37MB 上传，还得让远端的 `tar`
+/// 能用——可远端恰恰是那台「tar 在、gzip 不在」的机器，多传一层只是把同一
+/// 个风险换了个位置。只传二进制只有几十 MB 里的一小份，且远端一条 `cp` 就
+/// 完事，**远端连 tar 都不再需要**。
+///
+/// 解压在**本机用系统 `tar`** 做（macOS 的 bsdtar 自带 zlib，Linux 发行版
+/// 必有 gzip 二进制），因此 Rust 侧不引入任何解压依赖——spec 判据 10 要求
+/// `cargo tree` 里没有 `xz2`/`flate2`，为的就是不让 App 为一个可选降级路径
+/// 背一个解压库。
+pub fn needs_local_extract(caps: &RemoteCaps) -> bool {
     caps.has_tar && !caps.tar_supports_gzip
 }
 
-/// 远端要接收的文件名。没有 gzip 时上传未压缩的 `.tar`。
+/// 远端要接收的文件名。
+///
+/// 本机解出二进制时传的是裸二进制（无后缀）；否则传整个 `.tar.gz`。
 pub fn upload_name(target: &str, version: &str, caps: &RemoteCaps) -> String {
-    let suffix = if needs_local_decompress(caps) {
-        "tar"
+    if needs_local_extract(caps) {
+        "yi-agent".to_string()
     } else {
-        "tar.gz"
-    };
-    format!("yi-agent-{version}-{target}.{suffix}")
+        format!("yi-agent-{version}-{target}.tar.gz")
+    }
 }
 
 #[allow(dead_code)]
@@ -144,25 +155,34 @@ pub fn install(
                     &cached,
                 )?;
             }
-            // 远端没有 gzip 时先在本机解压：`-xf` 解不了 gzip。
-            let upload = if needs_local_decompress(caps) {
-                let plain = cached.with_extension("tar");
-                decompress_gzip(&cached, &plain)?;
-                plain
+            if needs_local_extract(caps) {
+                // 远端解不了 gzip：只把二进制解出来传过去，远端不必有 tar。
+                let staging = tempfile::TempDir::new().map_err(|e| e.to_string())?;
+                let local_bin = extract_binary(&cached, staging.path())?;
+                let remote_tmp = "/tmp/yi-agent-upload";
+                scp_to_remote(&local_bin, host, remote_tmp)?;
+                run_remote(
+                    host,
+                    &format!(
+                        "mkdir -p {dest} && cp {tmp} {binary} && chmod +x {binary} && rm -f {tmp}",
+                        dest = sh_quote(&dest),
+                        tmp = sh_quote(remote_tmp),
+                        binary = sh_quote(&binary),
+                    ),
+                )?;
             } else {
-                cached
-            };
-            let remote_tmp = format!("/tmp/{}", upload_name(target, version, caps));
-            scp_to_remote(&upload, host, &remote_tmp)?;
-            run_remote(host, &unpack_command(caps, &remote_tmp, &dest))?;
-            run_remote(
-                host,
-                &format!(
-                    "chmod +x {} && rm -f {}",
-                    sh_quote(&binary),
-                    sh_quote(&remote_tmp)
-                ),
-            )?;
+                let remote_tmp = format!("/tmp/{}", upload_name(target, version, caps));
+                scp_to_remote(&cached, host, &remote_tmp)?;
+                run_remote(host, &unpack_command(caps, &remote_tmp, &dest))?;
+                run_remote(
+                    host,
+                    &format!(
+                        "chmod +x {} && rm -f {}",
+                        sh_quote(&binary),
+                        sh_quote(&remote_tmp)
+                    ),
+                )?;
+            }
         }
         InstallRoute::RemoteDownload => {
             let url = format!(
@@ -188,19 +208,38 @@ pub fn install(
     Ok(binary)
 }
 
-/// `.tar.gz` → `.tar`。只在本机用（`flate2` 已在依赖树里，经 tauri 的压缩支持）。
-fn decompress_gzip(source: &Path, dest: &Path) -> Result<(), String> {
-    use std::io::Write;
-
-    let compressed =
-        std::fs::File::open(source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let mut decoder = flate2::read::GzDecoder::new(compressed);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// 从 `.tar.gz` 里解出 `yi-agent` 这一个成员，放在 `staging` 下。
+///
+/// 用**系统 `tar`** 而不是 Rust 解压库：判据 10 要求本机依赖树里不出现
+/// `gz`/`xz` 解压 crate。macOS 的 bsdtar 内置 zlib，Linux 发行版都有 `gzip`，
+/// 所以这条降级路径在两端都能走通。发布产物是 `tar -czf ... yi-agent` 打的，
+/// 成员名固定为 `yi-agent`（见 `desktop/scripts/release-dmg.sh`）。
+fn extract_binary(archive: &Path, staging: &Path) -> Result<PathBuf, String> {
+    let out = std::process::Command::new("tar")
+        .args([
+            "-xzf",
+            &archive.display().to_string(),
+            "-C",
+            &staging.display().to_string(),
+            "yi-agent",
+        ])
+        .output()
+        .map_err(|e| format!("tar failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "tar failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let mut plain = std::fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    std::io::copy(&mut decoder, &mut plain).map_err(|e| format!("{}: {e}", source.display()))?;
-    plain.flush().map_err(|e| e.to_string())
+    let binary = staging.join("yi-agent");
+    if !binary.exists() {
+        return Err(format!(
+            "{} does not contain a yi-agent member",
+            archive.display()
+        ));
+    }
+    Ok(binary)
 }
 
 /// 跑一条远端命令，失败时带上 stderr。
@@ -312,16 +351,16 @@ mod tests {
         assert!(!command.contains("-xzf"), "{command}");
     }
 
-    /// 远端有 tar 无 gzip 时，上传的必须是已解压的 `.tar`。
+    /// 远端有 tar 无 gzip 时，只上传解出来的那一个二进制。
     #[test]
-    fn a_gzipless_remote_gets_a_plain_tarball() {
-        assert!(needs_local_decompress(&caps(false, true)));
-        assert!(!needs_local_decompress(&caps(true, true)));
+    fn a_gzipless_remote_gets_only_the_binary() {
+        assert!(needs_local_extract(&caps(false, true)));
+        assert!(!needs_local_extract(&caps(true, true)));
         // 完全没有 tar 时走远端下载，与本机上传无关。
-        assert!(!needs_local_decompress(&caps(false, false)));
+        assert!(!needs_local_extract(&caps(false, false)));
         assert_eq!(
             upload_name("x86_64-unknown-linux-gnu", "0.1.10", &caps(false, true)),
-            "yi-agent-0.1.10-x86_64-unknown-linux-gnu.tar"
+            "yi-agent"
         );
         assert_eq!(
             upload_name("x86_64-unknown-linux-gnu", "0.1.10", &caps(true, true)),
@@ -349,32 +388,69 @@ mod tests {
         assert!(command.contains(r"/home/it'\''s/bin"), "{command}");
     }
 
-    /// 真实 gzip 往返：`needs_local_decompress` 的降级必须真的能解出内容。
+    /// 真实 gzip 往返：`needs_local_extract` 的降级必须真的解出可执行文件。
+    ///
+    /// 用系统 `tar` 打包（与 `release-dmg.sh` 同一命令），再用同一套系统 `tar`
+    /// 解回来——被测的正是那条真实路径，而不是一个模拟实现。
     #[test]
-    fn decompressing_a_real_gzip_yields_the_original_bytes() {
-        use std::io::Write;
-
+    fn extracting_a_real_tarball_yields_the_binary() {
         let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload = b"#!/bin/sh\necho hi\n";
+        std::fs::write(src.join("yi-agent"), payload).unwrap();
         let gz = dir.path().join("a.tar.gz");
-        let payload = b"pretend this is a tar stream";
-        {
-            let file = std::fs::File::create(&gz).unwrap();
-            let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
-            encoder.write_all(payload).unwrap();
-            encoder.finish().unwrap();
-        }
+        let status = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &gz.display().to_string(),
+                "-C",
+                &src.display().to_string(),
+                "yi-agent",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
 
-        let plain = dir.path().join("a.tar");
-        decompress_gzip(&gz, &plain).unwrap();
+        let staging = dir.path().join("out");
+        std::fs::create_dir_all(&staging).unwrap();
+        let binary = extract_binary(&gz, &staging).unwrap();
 
-        assert_eq!(std::fs::read(&plain).unwrap(), payload);
+        assert_eq!(std::fs::read(&binary).unwrap(), payload);
     }
 
     #[test]
-    fn decompressing_a_non_gzip_file_fails_loudly() {
+    fn extracting_a_non_gzip_file_fails_loudly() {
         let dir = tempfile::TempDir::new().unwrap();
         let bogus = dir.path().join("a.tar.gz");
         std::fs::write(&bogus, b"not gzip at all").unwrap();
-        assert!(decompress_gzip(&bogus, &dir.path().join("a.tar")).is_err());
+        let staging = dir.path().join("out");
+        std::fs::create_dir_all(&staging).unwrap();
+        assert!(extract_binary(&bogus, &staging).is_err());
+    }
+
+    /// 压缩包里没有 `yi-agent` 成员时必须报错，而不是返回一个不存在的路径。
+    #[test]
+    fn a_tarball_without_the_binary_fails_loudly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("something-else"), b"x").unwrap();
+        let gz = dir.path().join("a.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &gz.display().to_string(),
+                "-C",
+                &src.display().to_string(),
+                "something-else",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let staging = dir.path().join("out");
+        std::fs::create_dir_all(&staging).unwrap();
+        assert!(extract_binary(&gz, &staging).is_err());
     }
 }
