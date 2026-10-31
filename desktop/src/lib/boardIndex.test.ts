@@ -53,6 +53,13 @@ describe("summarize", () => {
     expect(summarize(cards)).toBe("3 待合并 · 2 待处理");
   });
 
+  it("已确认合并、正在排队的卡单独算一行", () => {
+    // merge_queued 不需要用户再做任何事，但也绝不能消失成「无待办」。
+    expect(summarize([{ state: "merge_queued" }, { state: "merge_queued" }])).toBe(
+      "2 合并排队中",
+    );
+  });
+
   it("没有待办时明说，不留空", () => {
     expect(summarize([{ state: "done" }, { state: "failed" }])).toBe("无待办");
   });

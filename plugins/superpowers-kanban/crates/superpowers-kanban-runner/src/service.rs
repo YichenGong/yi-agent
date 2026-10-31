@@ -1088,6 +1088,8 @@ impl BoardService {
     pub fn list(&self) -> Value {
         let board = persist::read_board(&self.state_dir);
         let observations = crate::observation::load(&self.state_dir);
+        // 一次读出，别在逐卡闭包里反复开文件。
+        let holder = crate::merge_lock::read_holder(&self.state_dir);
         json!({
             "cards": board.visible().map(|card| json!({
                 "id": card.id.0,
@@ -1105,6 +1107,13 @@ impl BoardService {
                 "title": card.title,
                 // 观测是**派生**的：卡写着 running 但会话没了就标 stale。
                 // 它永远不写回卡片状态，只是个给人和桌面的角标。
+                // 排队时刻（FIFO 依据）。不在队列里就是 null。
+                "merge_queued_at": card.merge_queued_at.map(|at| at.to_rfc3339()),
+                // 谁在合并由 holder 说话，不靠状态：合并是一次会话回合，
+                // 回合期间卡就是 running。
+                "merging": holder
+                    .as_ref()
+                    .is_some_and(|holder| holder.card_id == card.id.0),
                 "stale": crate::observation::stale(card, &observations).is_some(),
                 "last_alive_at": card
                     .thread_id
@@ -1900,6 +1909,31 @@ mod tests {
             other => panic!("expected a merge launch, got {other:?}"),
         }
         assert_eq!(state_of(&service, &merge_id), "running");
+    }
+
+    /// `list` 要能告诉人「谁在合并」——只靠状态看不出来：合并期间卡就是 running。
+    #[test]
+    fn list_marks_the_card_that_holds_the_merge_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        service.merge_request("card-1").unwrap();
+        let card = |service: &BoardService| {
+            service.list()["cards"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|card| card["id"] == "card-1")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(card(&service)["merging"], false);
+        assert!(card(&service)["merge_queued_at"].is_string());
+        let _ = service.driver_step(&[], &[]).unwrap();
+        assert_eq!(card(&service)["merging"], true);
+        // 已经开跑，队列时间就清掉了。
+        assert!(card(&service)["merge_queued_at"].is_null());
     }
 
     #[test]

@@ -40,6 +40,7 @@ export function summarize(cards: { state: string }[]): string {
   let queued = 0;
   let active = 0;
   let awaitingMerge = 0;
+  let mergeQueued = 0;
   let needsYou = 0;
   for (const card of cards) {
     const state = card.state.toLowerCase();
@@ -47,6 +48,8 @@ export function summarize(cards: { state: string }[]): string {
     else if (state === "queued" || state === "launching") queued += 1;
     else if (state === "running" || state === "merging") active += 1;
     else if (state === "awaiting_merge") awaitingMerge += 1;
+    // 已确认要合、正在排队等名额：用户不用再做任何事，但也不该从摘要里消失。
+    else if (state === "merge_queued") mergeQueued += 1;
     else if (state === "needs_you") needsYou += 1;
   }
   const parts: string[] = [];
@@ -55,6 +58,7 @@ export function summarize(cards: { state: string }[]): string {
   if (queued > 0) parts.push(`${queued} 排队`);
   if (active > 0) parts.push(`${active} 运行中`);
   if (awaitingMerge > 0) parts.push(`${awaitingMerge} 待合并`);
+  if (mergeQueued > 0) parts.push(`${mergeQueued} 合并排队中`);
   if (needsYou > 0) parts.push(`${needsYou} 待处理`);
   return parts.length > 0 ? parts.join(" · ") : "无待办";
 }

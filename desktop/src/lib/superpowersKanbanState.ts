@@ -36,6 +36,13 @@ export interface BoardCard {
   stale?: boolean;
   /** 该会话最后一次被看到还活着的时刻（ISO 串）。只用于 stale 卡的说明。 */
   lastAliveAt?: string;
+  /** 排进合并队列的时刻（ISO 串）。插件未提供则不设。 */
+  mergeQueuedAt?: string;
+  /**
+   * 本项目此刻的合并名额在它手里。合并是一次会话回合，所以这时卡仍是
+   * `running`——光看状态分不出「在写代码」和「在合并」。
+   */
+  merging?: boolean;
 }
 
 export function boardJsonPath(stateDir: string): string {
@@ -111,6 +118,8 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     order,
     stale: record.stale === true,
     lastAliveAt: optionalString(record.last_alive_at),
+    mergeQueuedAt: optionalString(record.merge_queued_at),
+    merging: record.merging === true,
   };
 }
 

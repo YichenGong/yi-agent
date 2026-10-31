@@ -406,12 +406,13 @@ fn parse_state(value: &str) -> Result<superpowers_kanban_core::card::CardState, 
         "running" => Ok(CardState::Running),
         "needs_you" => Ok(CardState::NeedsYou),
         "awaiting_merge" => Ok(CardState::AwaitingMerge),
+        "merge_queued" => Ok(CardState::MergeQueued),
         "done" => Ok(CardState::Done),
         "failed" => Ok(CardState::Failed),
         "cancelled" => Ok(CardState::Cancelled),
         other => Err(format!(
             "unknown state: {other} (expected pre_queued|queued|running|needs_you|\
-             awaiting_merge|done|failed|cancelled)"
+             awaiting_merge|merge_queued|done|failed|cancelled)"
         )),
     }
 }
@@ -661,6 +662,43 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&service_for(&a), &service_for(&b)),
             "distinct state dirs must not share leases"
+        );
+    }
+
+    /// 退队必须能从 IPC 走通：模型只会通过 dispatch 说话。
+    #[test]
+    fn merge_cancel_is_reachable_over_ipc() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("card-1"),
+            "c.spec.md".into(),
+            "c.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&CardId::new("card-1"), CardState::AwaitingMerge)
+            .unwrap();
+        board
+            .transition(&CardId::new("card-1"), CardState::MergeQueued)
+            .unwrap();
+        crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+        dispatch_with_global(state, None, "merge_cancel", &json!({ "card_id": "card-1" })).unwrap();
+        let back = crate::persist::read_board(state);
+        assert_eq!(
+            back.get(&CardId::new("card-1")).unwrap().state,
+            CardState::AwaitingMerge
+        );
+    }
+
+    #[test]
+    fn parse_state_accepts_merge_queued() {
+        assert_eq!(
+            parse_state("merge_queued").unwrap(),
+            superpowers_kanban_core::card::CardState::MergeQueued
         );
     }
 

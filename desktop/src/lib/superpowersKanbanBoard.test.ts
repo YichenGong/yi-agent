@@ -24,6 +24,12 @@ describe("columnForState", () => {
     expect(columnForState("cancelled")).toBe("done");
   });
 
+  it("puts a card waiting for the merge slot in doing", () => {
+    // 用户已经确认要合，剩下的只是等名额；它既不该催人（needDecision），
+    // 也不该显示成完成。
+    expect(columnForState("merge_queued")).toBe("doing");
+  });
+
   it("maps pre_queued to its own column", () => {
     expect(columnForState("pre_queued")).toBe("preQueued");
   });

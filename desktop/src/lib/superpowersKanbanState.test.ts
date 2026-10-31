@@ -198,6 +198,17 @@ describe("normalizeCard", () => {
     expect(card!.terminalAt).toBe("2026-10-03T00:00:00+08:00");
   });
 
+  it("carries the merge-queue timestamp and the gate flag", () => {
+    const card = normalizeCard({
+      id: "c", state: "merge_queued",
+      merge_queued_at: "2026-10-31T10:00:00+08:00", merging: false,
+    });
+    expect(card!.mergeQueuedAt).toBe("2026-10-31T10:00:00+08:00");
+    expect(card!.merging).toBe(false);
+    const merging = normalizeCard({ id: "c", state: "running", merging: true });
+    expect(merging!.merging).toBe(true);
+  });
+
   it("returns null only when id or state is missing", () => {
     expect(normalizeCard({ state: "queued" })).toBeNull();
     expect(normalizeCard({ id: "c" })).toBeNull();
