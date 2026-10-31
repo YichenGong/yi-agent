@@ -467,7 +467,8 @@ stdio 传输有硬上限 `MAX_FRAME_BYTES = 1 MiB`
 ### 4.6 并行：多项目同时连，桥接层必须改成多进程
 
 **并行是硬需求**：用户会在两个远端项目之间来回切，甚至在两个项目里各跑一个会话。
-现状做不到，有五个结构性障碍（障碍一、二 最容易被漏——它们不是"结构"，而是几个小函数）。
+现状做不到，有六个结构性障碍（障碍一、二 最容易被漏——
+它们不是「结构」，而是几个小函数）。
 
 #### 障碍一：`kill_sidecar` / `set_relay_url` 的"全局"语义必须重新定义
 
@@ -498,14 +499,53 @@ stdio 传输有硬上限 `MAX_FRAME_BYTES = 1 MiB`
 |---|---|---|
 | `clear_child`（`bridge.rs:398-402`） | `*guard = None`，直接清空 | 任一槽位退出都会**清空整张表**，其余槽位的 RPC 立刻报 "sidecar not running"——表现为"一个远端掉线，本地也崩了" |
 | `write_line`（`bridge.rs:52-57`） | 取唯一的 `child`，无槽位参数 | `rpc`/`rpc_respond` 无法指定目标槽位，请求会写进"最后设置的那个"进程 |
-| `forward_stdout`（`bridge.rs:404`） | 把帧发到全局事件名 | 所有槽位的帧进同一个事件名（§4.6 障碍五） |
+| `forward_stdout`（`bridge.rs:404`） | 把帧发到全局事件名 | 所有槽位的帧进同一个事件名（§4.6 障碍六） |
 
 正确改法：`clear_child(app, slot)` 只删**该 slot 的键**，且删之前要核对
 "表里这个键是不是我启动的那个进程"（作业 token 式校验）——否则会误删已经重启的
 新进程的句柄。这与 `relay/src/lib.rs:112` 里
 "只摘除仍是我自己的登记"是同一类问题，可以照那个思路写。
 
-#### 障碍三：`Sidecar` 是单例
+#### 障碍三：写 pipe 会阻塞，锁必须每槽位一把
+
+`write_line`（`bridge.rs:52-58`）是**同步写**：
+
+```rust
+let mut guard = state.child.lock()?;          // 持锁
+let child = guard.as_mut()...?;
+child.write(&buf)                            // tauri-plugin-shell 内部 write_all
+```
+
+`CommandChild::write` 是 `self.stdin_writer.write_all(buf)`
+（`tauri-plugin-shell-2.3.6/src/process/mod.rs:72-75`），**同步**。而且
+`rpc`/`rpc_respond` 都是非 `async` 的 `#[tauri::command]`（`bridge.rs:61`、`:75`），
+所以阻塞会占住 Tauri 的 IPC 线程。
+
+为什么这在**远端**场景下更严重：
+
+- 本地 sidecar 是同机进程，pipe 被读得快，写阻塞极罕见
+- 远端是 **ssh 子进程**：网络抖动、远端负载高、远端 app-server 卡在一次 LLM 调用上
+  时，ssh 的 stdin 管道会积压。一旦写满（默认 64KB），`write_all` 就阻塞
+- 阻塞期间**持有那把锁**。如果多槽位共用一个全局 `Mutex`，一个远端卡住会让
+  **所有槽位**的 RPC 全部卡住，包括本地——表现是「整个 App 卡死」
+
+因此多槽位改造里，锁的粒度**必须是每槽位一把**，不能是一把全局锁：
+
+```rust
+// 正确：每个槽位独立的锁，A 阻塞不影响 B
+struct Sidecar {
+    slots: Mutex<HashMap<ProfileKey, Arc<Mutex<Option<CommandChild>>>>>,
+}
+```
+
+注意外层 `Mutex` 只保护「查表」，**不能**在写 pipe 期间持有它——否则退化成全局锁。
+取到 `Arc<Mutex<..>>` 后立刻释放外层锁，再写 pipe。
+
+**仍然存在的风险（本设计不改，但要记录）**：即便锁是每槽位的，一个卡住的远端
+仍会阻塞**它自己**槽位的后续 RPC，直到 ssh 管道疏通或超时。这是同步 IO 的固有限制。
+缓解靠 §4.3 的断线检测（重试上限 + 手动重连），不靠「不阻塞」。
+
+#### 障碍四：`Sidecar` 是单例
 
 ```rust
 // desktop/src-tauri/src/bridge.rs:38-40
@@ -518,7 +558,7 @@ pub struct Sidecar {
 取的也是这一槽位；`spawn_once` 直接 `.replace(child)`。多进程必须换成
 按 key 分槽的表。
 
-#### 障碍四：JSON-RPC `id` 空间会撞车（最隐蔽）
+#### 障碍五：JSON-RPC `id` 空间会撞车（最隐蔽）
 
 前端 `RpcClient` 的 id 是**每实例从 0 单调递增**
 （`desktop/src/lib/rpc.ts:188` 的 `this.nextId++`），而 `App.tsx:1777` 只有一个
@@ -538,12 +578,12 @@ app-server 各回一个 `id=1` 的响应，**前端无法判断哪个是哪个**
 | `desktop/src/App.tsx:164` `clientRef` | 单例 ref，**全文 50 处引用** | 改成 `Map<ProjectKey, RpcClient>` 后，这 50 处要逐条判断"该用当前活动的那个，还是该用指定槽位的"。这是前端改造工作量的真实来源，不能低估为"改个 ref" |
 | `desktop/src/App.tsx:1597-1613` `build/info` + `flags/list` | 发往**当前活动 client** | 当前活动若是远端槽位，读到的就是**远端**的构建类型与 flag。远端 release 恒关（§5.3.1）会让结果恰好也是"关"，但这是巧合不是设计。**必须钉死这两个请求只发往本地槽位**，与 §5.2 判定口径一致 |
 
-**为什么单列这张表**：§4.6 的障碍一~五 都是**桥接层/Rust 侧**的，容易被当成
+**为什么单列这张表**：§4.6 的障碍一~六 都是**桥接层/Rust 侧**的，容易被当成
 全部工作量。而前端这四处是"看起来能跑、实际只在单项目下正确"的隐性问题——单项目
 测试全绿，一开第二个远端项目才暴露。实现顺序里必须把"遍历所有槽位重连"和
 "事件名参数化"当成独立步骤，各配一条判据。
 
-#### 障碍五：事件通道是全局的，没有 project 维度
+#### 障碍六：事件通道是全局的，没有 project 维度
 
 ```ts
 // desktop/src/tauriTransport.ts:51-54
@@ -1027,8 +1067,36 @@ per-project 的 system_prompt；跨机器复制会把本机项目的提示词带
 `~/.yi-agent/remote.json`（或 `YI_AGENT_HOME` 指向的实例根）。**不在远端存**——
 配置属于"这台电脑要怎么连"，不属于被连的那台机器。
 
-**写入方式**：读-改-写 + temp+rename 原子替换，与
-`workspace_index.rs:4` 的既有约定一致。**必须**加进程内锁（多槽位会并发写）。
+**写入方式**：读-改-写 + temp+rename 原子替换。**但这里不能只照抄
+`workspace_index.rs` 的做法**——它只有进程内 `Mutex`（`workspace_index.rs:4`），
+而 `remote.json` 会被**两个进程**碰：
+
+- **写**：Tauri 桥接层（用户改配置时）
+- **读**：app-server 进程（`remote/relayTargets`，§4.6）
+
+进程内 `Mutex` 保护不了跨进程。必须用 `device_store.rs:104-130` 已有的**双层**范式：
+
+```rust
+/// 进程内 Mutex + 跨进程 flock 一起拿，覆盖一次读-改-写。
+fn exclusive(&self) -> io::Result<(MutexGuard<'_, ()>, std::fs::File)> {
+    let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+    let file = self.lock_file()?;   // flock(LOCK_EX)
+    Ok((guard, file))
+}
+```
+
+**另一个必须照抄的细节：临时文件名要唯一。** `device_store.rs:120-128` 的注释写明：
+
+> 唯一临时名：并发写者不得共用同一个临时路径，否则一个 `rename` 会 `ENOENT`
+> 另一个的，且撕裂的读会看成「一条设备都没有」。pid+uuid 足够。
+
+若用固定的 `remote.json.tmp`，两处并发写（例如用户快速连点两次、或桥接层与
+app-server 同时写）会互相踩掉临时文件。**必须**用
+`remote.json.<pid>.<uuid>.tmp` 形式。
+
+**只读的场景不需要锁**：`remote/relayTargets` 只读，且 temp+rename 保证了
+它读到的要么是旧版本要么是新版本，不会是半截文件。**不要**为了"保险"给读路径
+也加 flock——那会让 UI 查询被写操作阻塞。
 
 **不存的东西**（有意为之）：
 - 不存密码、私钥路径、passphrase —— 完全交给 `~/.ssh`（§4.7）
@@ -1496,7 +1564,13 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
     （如 `/home/dev` 之外的 `/data/dev`）时，`YI_AGENT_HOME` 落在
     `/data/dev/.yi-agent-projects/<id>/.yi-agent`，而不是项目目录下、也不是本机猜的值；
     另测 `HOME` 为空时连接**失败并说明**（§4.1）
-48. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+48. **`remote.json` 并发写不丢更新**：桥接层连续写 50 次（模拟连点、含多线程）
+    后文件仍能解析、`profiles` 数量正确、无 `remote.json.tmp` 残留
+    （验证 flock + 唯一临时名，§4.9）
+49. **一个槽位卡住不拖垮其他（必测）**：让远端 A 的 ssh 阻塞（指向黑洞地址，
+    或对远端 app-server `kill -STOP`），本地与远端 B 的对话**仍正常**；
+    确认锁是每槽位一把，不是外层那把（§4.6）
+50. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1522,6 +1596,7 @@ bug 分不清"的泥潭。
    - **`kill_sidecar` 加槽位参数**，另起 `kill_all_slots`（§4.6 障碍一）
    - **`set_relay_url` 收窄为只重启本地槽位**（§4.6 障碍一）
    - **`clear_child` 加槽位 + 作业 token 校验**（§4.6 障碍二）
+   - **锁改成每槽位一把**（外层只保护查表，写 pipe 时不持外层锁，§4.6 障碍三）
    - **验收：此时只有 `Local` 一个 slot，全部既有测试通过、行为不变。
      特别跑一遍"改 relay URL"与"重启 sidecar"两条既有路径，确认语义未变**
 5. **把"起远端命令"收敛成一个纯函数**（`fn remote_argv(profile) -> Vec<String>`，
@@ -1549,7 +1624,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **48 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **50 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
