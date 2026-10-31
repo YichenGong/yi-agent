@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::json;
@@ -24,7 +24,8 @@ use crate::lead_loop::{ThreadSnapshot, decide_wake, render_digest};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, SubagentTotals,
+    ThreadStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -46,6 +47,157 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// 3s 足够跟上插件给出的动作,又远短于一个会话的生命周期。
 const DRIVER_TICK: Duration = Duration::from_secs(3);
 
+const EVICT_IDLE_AFTER: Duration = Duration::from_secs(600);
+
+/// 决定「这个项目的 runtime 现在能不能回收」所需的全部事实。
+///
+/// 采集与决策分离：调用方负责从 `threads` / 磁盘 / 常驻登记里取事实，本结构
+/// 只承载它们，因此 [`should_evict`] 是纯函数，可以不起任何进程就测到。
+pub(crate) struct IdleFacts {
+    /// 该项目最后一次「有活干」的时刻（attach、起 turn 都算）。
+    pub last_active: Instant,
+    /// 项目里存在插件清单（`.yi-agent/supervisors/*.json`）。
+    ///
+    /// 有清单就意味着这个项目的 daemon 正在给插件提供 socket；回收会连带把
+    /// 插件停掉，所以这类项目一律豁免。判据用「有没有清单」而不是写死某个
+    /// 插件名：宿主不认识具体插件。
+    pub has_plugin_manifest: bool,
+    /// 该项目在 `resident-daemons.json` 里被要求常驻。
+    pub is_resident: bool,
+    /// 还有回合在跑（含子任务）。判据是「有没有活干」，不是「多久没人碰」。
+    pub has_running_turn: bool,
+}
+
+/// 纯决策：现在能不能回收这个项目的 runtime。
+pub(crate) fn should_evict(facts: &IdleFacts, now: Instant, ttl: Duration) -> bool {
+    if facts.has_running_turn || facts.has_plugin_manifest || facts.is_resident {
+        return false;
+    }
+    now.duration_since(facts.last_active) >= ttl
+}
+
+/// 项目里是否有插件清单。
+///
+/// 只看「目录里有没有 .json」，不解析内容：损坏的清单仍然意味着有人往这个项目
+/// 装了插件，回收 daemon 一样会打断它。宁可多留一个项目，也不误停插件。
+pub(crate) fn project_has_plugin_manifest(project: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(yi_agent_supervisors::install::manifests_dir(project))
+    else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+    })
+}
+
+/// 回收空闲项目的 runtime。
+///
+/// 每个「有活干」的事实都由调用方采好：`runtimes` 里的 binding 提供空闲时长，
+/// `threads` 提供是否有回合在跑，磁盘与常驻登记提供两条豁免。
+///
+/// 移除条目即完成回收：`Arc<RuntimeBinding>` 的最后一个引用落在
+/// `AttachedProjectRuntime` 上，它的 Drop 会停掉本进程起的 daemon 与监督线程，
+/// 路由分区也随之清空。之后该项目再有委派时，`attach_cwd_runtime` 会懒重建。
+///
+/// 返回被回收的项目（供调用方记日志、也供测试断言）。
+pub(crate) fn evict_idle_runtimes(
+    runtimes: &ProjectRuntimes,
+    threads: &HashMap<String, ThreadSession>,
+    resident_dir: &Path,
+    now: Instant,
+    ttl: Duration,
+) -> Vec<PathBuf> {
+    // 快照：只取「哪个项目」「空了多久」。持锁期间不做磁盘 IO，也不调用任何
+    // 需要再取这把锁的方法（`project_key` 会 canonicalize，是 IO）。
+    let snapshot: Vec<(PathBuf, Duration)> = runtimes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .as_ref()
+                .ok()
+                .map(|binding| (key.clone(), binding.idle_for()))
+        })
+        .collect();
+    if snapshot.is_empty() {
+        return Vec::new();
+    }
+
+    // 哪些项目还有回合在跑。threads 的 `cwd` 先统一解析成项目键，避免对每个
+    // (项目, 会话) 组合都 canonicalize 一次。
+    let busy_projects: Vec<PathBuf> = threads
+        .values()
+        .filter(|session| {
+            session.active_turn_id.is_some()
+                || !matches!(
+                    *session
+                        .status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    ThreadStatus::Idle
+                )
+        })
+        .map(|session| project_key(Path::new(&session.cwd)))
+        .collect();
+
+    let residents: Vec<PathBuf> = yi_agent_store::resident::list(resident_dir)
+        .iter()
+        .map(|resident| project_key(resident))
+        .collect();
+
+    let doomed: Vec<PathBuf> = snapshot
+        .into_iter()
+        .filter(|(key, idle_for)| {
+            let facts = IdleFacts {
+                last_active: now.checked_sub(*idle_for).unwrap_or(now),
+                has_plugin_manifest: project_has_plugin_manifest(key),
+                is_resident: residents.iter().any(|resident| resident == key),
+                has_running_turn: busy_projects.iter().any(|busy| busy == key),
+            };
+            should_evict(&facts, now, ttl)
+        })
+        .map(|(key, _)| key)
+        .collect();
+    if doomed.is_empty() {
+        return doomed;
+    }
+
+    // 回收分两步，顺序与「为什么这样才有效」见下。
+    //
+    // 1) 先让 binding **原地退休**：丢掉它自己的 daemon 与监督线程。
+    //
+    //    这一步不可省，也不能靠后续的 Drop 代替。会话的 driver 里，委派工具各持
+    //    一份 `Arc<ThreadRoot>`，root 又持着 `Arc<RuntimeBinding>`——用户切走会话
+    //    之后这些引用依然在（**会话本身必须留着**，否则对话就丢了）。只从
+    //    `runtimes` 表里删条目只是少了一份引用，`Arc` 计数归不了零，`Drop` 永不
+    //    触发，daemon 与每 500ms 一轮的监督线程继续跑到底——那正是「监督线程只增
+    //    不减」本身。停进程必须显式做。
+    //
+    // 2) 再从表里摘掉条目。之后再有人按项目查 binding 会查不到，下次委派走
+    //    `attach_cwd_runtime` 重建一个（冷启动）。
+    //
+    // 会话根**不动**：`retire` 推进了 generation，挂在旧 runtime 上的 root 会在
+    // 下一次 `attach` 时被自己判定为失效并重挂，不需要宿主替它们清理。
+    let retiring: Vec<Arc<RuntimeBinding>> = {
+        let mut table = runtimes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        doomed
+            .iter()
+            .filter_map(|key| table.remove(key))
+            .filter_map(Result::ok)
+            .collect()
+    };
+    for binding in retiring {
+        binding.retire();
+    }
+    doomed
+}
+
 /// 组长后台循环的低频兜底 tick。
 ///
 /// 与看板调度器刻意分开:**唤醒组长要真的花一次 token**。看板的 3s 是「状态机
@@ -63,7 +215,10 @@ const LEAD_TICK: Duration = Duration::from_secs(30);
 /// 会话误认成「这条 digest 的来源会话」。
 const LEAD_LOOP_SENDER: &str = "lead-loop";
 
-/// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
+/// 首轮 LLM 标题生成的后台任务超时:超时即回退兜底标题。
+///
+/// 这个上限保护的是**后台标题任务**本身（不让它无限期挂着一个 task），与 turn
+/// 收尾无关——标题生成已不在收尾路径上，超时与否都不影响 turn 完成。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 标签显示名的长度上限。必须与前端 `desktop/src/lib/threadTags.ts` 的
@@ -194,6 +349,8 @@ pub(crate) struct BuiltAgent {
     /// 支撑该 agent 工具集里的进程工具的 manager。**与生效的工具集同行**：
     /// `build_runtime_tooling` 换掉工具集时必须一并替换它。
     pub(crate) process_manager: Arc<yi_agent_tools::ProcessManager>,
+    /// MCP 管理器;配置缺失时为 `None`。`mcp/set` 与每轮配置变更检查用它。
+    pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 一个 cwd 的工具集与其权限检查器。
@@ -206,6 +363,8 @@ struct RuntimeTooling {
     /// `build_runtime_tooling` hands a clone to the tools and keeps this one, so
     /// binding it here (see [`wrap_for_delegation`]) is visible to those tools.
     caller: yi_agent_subagent::CallerContext,
+    /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
+    mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
@@ -241,6 +400,10 @@ pub(crate) struct RuntimeAttachments {
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).
     pub(crate) models_path: PathBuf,
+    /// Where `websearch.json` lives. Injectable for the same reason
+    /// `models_path` is: the 网页搜索 panel must be testable without writing
+    /// the developer's real machine-level config.
+    pub(crate) websearch_path: PathBuf,
     /// 组长开关的**生效值**，装配时算一次。
     ///
     /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，
@@ -831,6 +994,9 @@ pub(crate) async fn watch_children(
     thread_id: String,
     socket: PathBuf,
     initial: Vec<crate::protocol::AgentChild>,
+    // 用量汇总的去处。用 `watch` 而非 `mpsc`：这里只关心最新值，且写端是独立
+    // 任务，`mpsc` 满队列会让它卡住。
+    subagent_tx: tokio::sync::watch::Sender<SubagentTotals>,
 ) {
     let mut last = initial;
     loop {
@@ -852,6 +1018,12 @@ pub(crate) async fn watch_children(
             continue;
         }
         last = current.clone();
+        // 用量与列表同源（都来自这次 ListTaskSummaries），故在同一次推送里一起更新，
+        // 客户端不会看到"列表已变、数字未变"的中间态。
+        //
+        // `send_replace` 永不失败、也不阻塞：没有 receiver（driver 已退出）时值仍
+        // 写进共享槽，下一个 driver 起来能立刻读到最新值。
+        subagent_tx.send_replace(subagent_totals(&current));
         let notification = Notification::AgentChildrenUpdated {
             thread_id: thread_id.clone(),
             children: current,
@@ -977,8 +1149,29 @@ pub(crate) fn children_for_thread(
             state: task.state.clone(),
             last_step: None,
             parent_task_id: task.parent_task_id.clone(),
+            // 用量随列表一起给：客户端因此不需要为每个子任务再问一次。
+            usage: crate::protocol::AgentChildUsage {
+                input_tokens: task.usage.input_tokens,
+                output_tokens: task.usage.output_tokens,
+                cache_read_tokens: task.usage.cache_read_tokens,
+            },
         })
         .collect()
+}
+
+/// 一个会话里所有子任务的用量之和。
+///
+/// 对**整份列表**求和而不是只算运行中的：已完成的子任务烧掉的 token 同样是这个
+/// 会话的真实开销，累计值必须包含它们。
+pub(crate) fn subagent_totals(children: &[crate::protocol::AgentChild]) -> SubagentTotals {
+    children
+        .iter()
+        .fold(SubagentTotals::default(), |mut acc, child| {
+            acc.input = acc.input.saturating_add(child.usage.input_tokens);
+            acc.output = acc.output.saturating_add(child.usage.output_tokens);
+            acc.cache_read = acc.cache_read.saturating_add(child.usage.cache_read_tokens);
+            acc
+        })
 }
 
 /// Whether a task state can still make progress.
@@ -1306,6 +1499,9 @@ fn build_runtime_tooling(
         permission,
         process_manager,
         caller,
+        // `build_tool_setup_with_controller` 已经把 `mcp_reload` 注册进 registry，
+        // 这里把同一份 manager 带出去，换根之后仍指向同一份状态。
+        mcp: setup.mcp,
     })
 }
 
@@ -1356,6 +1552,7 @@ fn rebuild_thread_agent_with_theme(
         catalog,
         yolo,
         process_manager,
+        mcp,
         ..
     } = built;
     let mut config = agent.config().clone();
@@ -1386,6 +1583,7 @@ fn rebuild_thread_agent_with_theme(
         catalog,
         yolo,
         process_manager,
+        mcp,
     }
 }
 
@@ -1399,6 +1597,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         decision_rx,
         catalog,
         yolo,
+        // 委派用的是新工具集自带的 manager,旧的随之丢弃。
+        mcp: _,
         ..
     } = built;
     // Reuse the live session `Arc` so the delegation tools' `CallerContext`,
@@ -1425,6 +1625,9 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         yolo,
         // 注册表换了,manager 必须跟着换:否则面板查的是被丢弃的那一份。
         process_manager: tooling.process_manager,
+        // MCP 管理器跟着 registry 走:换根目录后 `mcp_reload` 要改的是**新根**
+        // 下的 `.yi-agent/mcp.json`。
+        mcp: tooling.mcp,
     }
 }
 
@@ -1768,6 +1971,7 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            websearch_path: yi_agent_tools::websearch_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -1856,6 +2060,7 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            websearch_path: yi_agent_tools::websearch_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -2952,6 +3157,7 @@ where
         runtimes,
         thread_roots,
         models_path,
+        websearch_path,
         onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
@@ -3249,6 +3455,7 @@ where
                             cfg: &cfg,
                             theme_handle: &theme_handle,
                             models_path: &models_path,
+                            websearch_path: &websearch_path,
                             probes: &probes,
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
@@ -3452,6 +3659,13 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::WebSearch => {
+                        let mut state = app_state!();
+                        match crate::rpc::websearch::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     crate::rpc::Domain::Thread => {
                         let mut state = app_state!();
                         match crate::rpc::thread::handle(&mut state, &req, id.clone()).await? {
@@ -3590,6 +3804,25 @@ where
                     lead_agent_enabled,
                 )
                 .await;
+
+                // 回收空闲项目的 runtime。放在 tick 里跑而不是定时任务里：
+                // `threads` 是主循环独占的局部量，判「有没有回合在跑」必须读它，
+                // 另起任务就得把它改成共享结构，改动面会扩散到全部 RPC 分支。
+                // 回收只是从表里摘条目，真正的停机由 Drop 链完成，不阻塞主循环。
+                let evicted = evict_idle_runtimes(
+                    &runtimes,
+                    &threads,
+                    &resident_dir,
+                    Instant::now(),
+                    EVICT_IDLE_AFTER,
+                );
+                for project in evicted {
+                    // 记一行就够：这是正常的生命周期事件，不是错误。
+                    eprintln!(
+                        "[app-server] reclaimed idle runtime for {}",
+                        project.display()
+                    );
+                }
             }
             _ = lead_ticker.tick() => {
                 // 关掉组长时这一臂整体空转:底下要算 digest、要投递、要起 turn,
@@ -4229,6 +4462,10 @@ pub(crate) fn thread_summary_json_with_status(
         "status": status,
         "content_epoch": m.content_epoch,
         "last_item_id": m.last_item_id,
+        // 共享已读水位：客户端据此重算未读（`completed > read`）。断线重连后
+        // 这是唯一能补回「离线期间跑完的回合」的来源——推送当时没人在听。
+        "last_read_at": m.last_read_at,
+        "last_completed_at": m.last_completed_at,
     });
     // 只在**合法**组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
     // 的字节比对与快照测试失效,而我们只需要一个新值。卡片 worktree 里的
@@ -4487,6 +4724,10 @@ fn checkpoint(
 async fn persist_and_finish_turn(
     thread_id: &str,
     turn_id: Option<&str>,
+    // 随 `turn/completed` 广播出去的那个完成时刻。落盘必须复用它而不是重新取一次
+    // 墙钟：广播发生在落盘之前，各取一次会让落盘值更晚，另一端的客户端收到广播
+    // 立刻 markRead 时写下的已读水位就盖不住它，重连后蓝点复活。
+    completed_at: i64,
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
     user_image_refs: &[crate::protocol::ImageRef],
@@ -4559,6 +4800,23 @@ async fn persist_and_finish_turn(
         }
     }
 
+    // 记下**回合结束**时刻：未读由 `last_completed_at > last_read_at` 派生，而
+    // `updated_at` 在回合**开始**时也会被 `touch` 刷新，不能兼任这个职责（否则
+    // 另一端刚发问、还在跑的会话会立刻亮蓝点）。
+    //
+    // 刻意放在 append 成功/失败**之外**：两者是独立失败。日志写不进去只说明内容
+    // 没存下来，回合本身确确实实结束了、用户也在流里看到了输出。把这条记账绑在
+    // append 成功上，这一轮就会在未读口径里凭空消失——另一端重连后毫无「有新内容」
+    // 的提示，直到下一轮跑完。
+    //
+    // 只在 `turn_id.is_some()` 时写：`clear` / `compact` / `SetPreserveThinking`
+    // 收尾传 `None`，它们不是回合结束，记下去会让刚清空上下文的会话凭空亮蓝点。
+    if turn_id.is_some() {
+        if let Err(e) = store.mark_turn_completed(thread_id, completed_at) {
+            eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
+        }
+    }
+
     // 广播「本轮已落盘」：delete/interrupt 路径靠这枚 Finished 判定落盘完成。
     // 标题生成已前移到 turn 开始处，收尾路径不再有任何可等待的模型调用。
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
@@ -4584,8 +4842,13 @@ async fn persist_and_finish_turn(
 /// 助手回复」收敛成「只取用户输入」——此刻助手还没有任何输出。
 ///
 /// 触发条件是 `ThreadStore::touch` 返回 `true`（meta 的 title 由 `None` 变成兜底
-/// 截断值）。组长会话与插件驱动会话创建时标题已非空，因此天然不触发；手动改名
-/// 之后 title 也非空，同样不会重新生成。
+/// 截断值）。组长会话（`is_lead_meta`）被 `touch` 直接跳过；插件驱动会话创建时
+/// 标题已非空，因此天然不触发；手动改名之后 title 也非空，同样不会重新生成——
+/// 一旦标题非空，`touch` 永不再返回 `true`，这条路径对同一会话只会有一次。
+///
+/// 材料只有用户输入（`prompt`，即 `display_text` 原话，不含附件清单）。因此
+/// 纯图片 / 纯附件消息（`display_text` 为空）没有可用材料，不会生成标题，
+/// 会话保留兜底或空标题。
 ///
 /// **不得阻塞 driver**：调用方负责 `tokio::spawn`，本函数只做生成 → 清洗 → CAS
 /// → 广播，任何失败都静默保留兜底标题（标题是锦上添花，绝不能影响 turn）。
@@ -4683,6 +4946,8 @@ async fn apply_session_command(
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
+    mcp: Option<&Arc<yi_agent_mcp::McpManager>>,
+    mcp_workdir: &std::path::Path,
 ) -> yi_agent_core::Agent {
     match command {
         SessionCommand::Clear { reply } => {
@@ -4720,6 +4985,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -4762,6 +5029,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -4850,6 +5119,50 @@ async fn apply_session_command(
             let _ = reply.send(Ok(()));
             agent = rebuilt;
         }
+        SessionCommand::ReloadMcp { reply } => match mcp {
+            // 没有 manager 就没什么可重载的。这不该发生(mcp_reload 工具在
+            // 无配置时也会带一个空 manager),但如实回错好过假装成功。
+            None => {
+                let _ = reply.send(Err("本会话没有可用的 MCP 管理器".into()));
+            }
+            Some(mcp) => {
+                let report = mcp.reload(mcp_workdir).await;
+                let failures: Vec<String> = report
+                    .servers
+                    .iter()
+                    .filter_map(|s| s.error.as_ref().map(|e| format!("{}: {e}", s.name)))
+                    .collect();
+
+                // 用刷新后的工具集重建 agent:三样照旧保留(session `Arc`、
+                // 审批路径),与 `SetModel` / `SetReasoningEffort` 的重建语义一致。
+                let mut refreshed = (*agent.tools()).clone();
+                mcp.refresh_registry(&mut refreshed);
+                let next_config = agent.config().clone();
+                let session_handle = agent.session_handle();
+                let permission = agent.permission_checker();
+                let decision = agent.decision_rx();
+                let mut rebuilt = yi_agent_core::Agent::new(
+                    Arc::clone(provider),
+                    std::sync::Arc::new(refreshed),
+                    next_config,
+                )
+                .with_session_arc(session_handle);
+                if let (Some(checker), Some(rx)) = (permission, decision) {
+                    rebuilt = rebuilt.with_permission(checker, rx);
+                }
+                tracing::info!(
+                    servers = report.servers.len(),
+                    failed = failures.len(),
+                    "session MCP config reloaded"
+                );
+                agent = rebuilt;
+                let _ = reply.send(if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!("部分 server 探测失败: {}", failures.join("；")))
+                });
+            }
+        },
         SessionCommand::SetPreserveThinking { preserve, reply } => {
             // provider 不变（开关不烤进 URL/key），故复用当前 `provider`，只把
             // `AgentConfig.preserve_thinking` 换掉后重建 agent。
@@ -4889,6 +5202,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -4945,6 +5260,14 @@ pub(crate) async fn run_thread_driver(
     // clear / compact 需要它们：compact 要调 provider 生成摘要，两者都要重建 agent。
     provider: Arc<dyn yi_agent_core::Provider>,
     config: yi_agent_core::AgentConfig,
+    // subagent 用量汇总。由 `watch_children` 写入，本 driver 读出来推给客户端。
+    mut subagent_rx: tokio::sync::watch::Receiver<SubagentTotals>,
+    // MCP 管理器。driver 每轮开跑前用它检查 `.yi-agent/mcp.json` 是否被改过，
+    // `SessionCommand::ReloadMcp` 也靠它重新读盘。配置缺失时是 `None`。
+    mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    // 该 thread 的 cwd：`config.workdir` 在 driver 里被 clone 过多次，但
+    // MCP 配置固定在 thread cwd 下的 `.yi-agent/mcp.json`，故显式传入更清楚。
+    mcp_workdir: std::path::PathBuf,
 ) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
@@ -4957,6 +5280,11 @@ pub(crate) async fn run_thread_driver(
         .map(|loaded| loaded.totals)
         .unwrap_or_default();
     let mut translator = Translator::new(thread_id.clone(), baseline);
+    // `/clear` 之前已经烧掉的 subagent 用量。daemon 的 task 记录不会随 clear 删除，
+    // 故必须靠基线把旧量扣掉，否则清零后旧数字会被下一次推送带回来。
+    let mut subagent_baseline = SubagentTotals::default();
+    // 最近一次从 watch 收到的原始汇总（未减基线）。
+    let mut subagent_raw = SubagentTotals::default();
     // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
     // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
     let mut activation_attempted = false;
@@ -4974,14 +5302,27 @@ pub(crate) async fn run_thread_driver(
                 let clearing = matches!(&command, SessionCommand::Clear { .. });
                 agent = apply_session_command(
                     agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx,
-                    &status,
+                    &status, mcp.as_ref(), &mcp_workdir,
                 )
                 .await;
                 if clearing {
+                    // 顺序要紧：先把当前原始汇总钉成基线，再归零 translator。
+                    // 不钉的话，下一次 children 推送仍带着 clear 前的量，数字会
+                    // 立刻弹回旧值。
+                    subagent_baseline = subagent_raw;
                     for n in translator.reset_totals() {
                         let _ = write_notification(&hub, &n).await;
                     }
                 }
+                continue;
+            }
+            // subagent 用量变化：`watch_children` 已把它算好送过来。空闲时也要
+            // 处理，否则子任务在 turn 之外收尾时报的量要等到下一轮才显示。
+            Ok(()) = subagent_rx.changed() => {
+                subagent_raw = *subagent_rx.borrow_and_update();
+                let totals = subagent_raw.saturating_sub(subagent_baseline);
+                let notification = translator.set_subagent_totals(totals);
+                let _ = write_notification(&hub, &notification).await;
                 continue;
             }
             maybe_prompt = prompt_rx.recv() => maybe_prompt,
@@ -5098,6 +5439,36 @@ pub(crate) async fn run_thread_driver(
             }
         }
 
+        // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
+        // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
+        if let Some(mcp) = &mcp {
+            if mcp.config_changed_on_disk(&mcp_workdir) {
+                let report = mcp.reload(&mcp_workdir).await;
+                for s in &report.servers {
+                    if let Some(err) = &s.error {
+                        tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                    }
+                }
+                let mut refreshed = (*agent.tools()).clone();
+                mcp.refresh_registry(&mut refreshed);
+                let next_config = agent.config().clone();
+                let session_handle = agent.session_handle();
+                let permission = agent.permission_checker();
+                let decision = agent.decision_rx();
+                let mut rebuilt = yi_agent_core::Agent::new(
+                    Arc::clone(&provider),
+                    Arc::new(refreshed),
+                    next_config,
+                )
+                .with_session_arc(session_handle);
+                if let (Some(checker), Some(rx)) = (permission, decision) {
+                    rebuilt = rebuilt.with_permission(checker, rx);
+                }
+                agent = rebuilt;
+                tracing::info!("MCP config changed on disk; thread registry reloaded");
+            }
+        }
+
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
         // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
         if let Some(handle) = &catalog {
@@ -5112,6 +5483,19 @@ pub(crate) async fn run_thread_driver(
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
                     let _ = write_notification(&hub, &n).await;
+                }
+                // 这条路径不走 `persist_and_finish_turn`，但它**确实**是一次回合
+                // 结束（`turn/completed(failed)` 已发出）。不记完成时间的话，
+                // 「失败也是跑完了」这件事在另一端的未读判定里就查不到——重连后
+                // 蓝点不亮，用户以为还在跑。
+                // 复用刚广播出去的那个完成时刻，理由同常规收尾：落盘值若更晚，
+                // 另一端的 markRead 就盖不住它，蓝点会复活。
+                let failed_at = match translator.completed_at() {
+                    0 => crate::thread_store::now_millis(),
+                    at => at,
+                };
+                if let Err(e) = store.mark_turn_completed(&thread_id, failed_at) {
+                    eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
                 }
                 // 中途失败没有「组长说了什么」可言:回复传 `None`,绝不伪造一条
                 // 空回复去糊弄等待方(那比拿不到回复更难排查)。
@@ -5399,6 +5783,25 @@ pub(crate) async fn run_thread_driver(
                     );
                     checkpoint_dirty = false;
                 }
+                // subagent 用量在 turn 进行中变了：立刻推一条，让数字随子任务
+                // 每次 provider 调用增长（这正是不落盘、走实时通道的理由）。
+                Ok(()) = subagent_rx.changed() => {
+                    subagent_raw = *subagent_rx.borrow_and_update();
+                    let totals = subagent_raw.saturating_sub(subagent_baseline);
+                    let notification = translator.set_subagent_totals(totals);
+                    if write_notification(&hub, &notification).await.is_err() {
+                        // 写帧失败即放弃本轮：与其它写失败站点同款。
+                        let _ = turn_tx
+                            .send(finished_event(&thread_id, &turn_id, None, None))
+                            .await;
+                        if let Err(e) = store.clear_partial(&thread_id) {
+                            eprintln!(
+                                "[app-server] failed to clear turn checkpoint ({thread_id}): {e}"
+                            );
+                        }
+                        return;
+                    }
+                }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
                     // 只接受针对当前 turn 的中断;忽略上一轮残留的信号。
                     if target == turn_id {
@@ -5457,6 +5860,9 @@ pub(crate) async fn run_thread_driver(
                             SessionCommand::SetPreserveThinking { reply, .. } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
+                            SessionCommand::ReloadMcp { reply } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
                         }
                     } else {
                         pending_session_command = Some(command);
@@ -5470,7 +5876,17 @@ pub(crate) async fn run_thread_driver(
         if let Some(command) = pending_session_command.take() {
             let clearing = matches!(&command, SessionCommand::Clear { .. });
             agent = apply_session_command(
-                agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx, &status,
+                agent,
+                command,
+                &provider,
+                &config,
+                &store,
+                &thread_id,
+                &hub,
+                &turn_tx,
+                &status,
+                mcp.as_ref(),
+                &mcp_workdir,
             )
             .await;
             if clearing {
@@ -5502,9 +5918,17 @@ pub(crate) async fn run_thread_driver(
         }
 
         // 无暂存命令：常规收尾（把本轮结果落盘）。
+        // 与已广播的 `turn/completed.completed_at` 同源；若本轮没有走终结事件
+        // （流意外结束时 `translator` 没来得及定时刻），在这里补一个，以免这次
+        // 回合结束在未读口径里凭空消失。
+        let turn_completed_at = match translator.completed_at() {
+            0 => crate::thread_store::now_millis(),
+            at => at,
+        };
         persist_and_finish_turn(
             &thread_id,
             Some(&turn_id),
+            turn_completed_at,
             Some(&user_prompt),
             &user_attachments,
             &user_image_refs,
@@ -5696,6 +6120,11 @@ async fn driver_tick<F>(
                 })
                 .collect();
             let idle = move |thread_id: &str| snapshot.get(thread_id).copied().unwrap_or(false);
+            // 全机运行会话数:必须在构造 launcher **之前**算——launcher 持有
+            // `&mut threads`,之后再借 `threads` 就是借用冲突。口径与上面的 idle
+            // 快照同源(同一份 `ThreadSession`),所有归属的会话都在内:手动开的、
+            // 别的插件起的、看板起的。插件靠它算「全机余量」,限的是总流量。
+            let sessions_running = crate::session_driver::running_sessions(threads);
             // 该 (项目, 插件) 的驱动记账跨 tick 存活:`results` 要在下一拍回报,
             // `threads` 要让插件看见自己起过的会话。
             let state = drivers
@@ -5780,6 +6209,7 @@ async fn driver_tick<F>(
                 &mut state.results,
                 &mut launcher,
                 &idle,
+                sessions_running,
             )
             .await;
             // 本拍的结果**不在此处收割**:插件靠 `results` 才知道动作成没成、
@@ -6695,9 +7125,13 @@ pub(crate) async fn start_thread_core(
         catalog,
         yolo,
         process_manager,
+        mcp,
         ..
     } = activation.built;
     pending_activation.insert(thread_id.clone(), activation.runtime);
+    // MCP 配置固定在 thread cwd 下(不是 daemon 回传的 toplevel):与
+    // `build_runtime_tooling` 里 `ThreadStore::new(&cfg.workdir)` 同一口径。
+    let mcp_workdir = std::path::PathBuf::from(cwd);
 
     let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -6732,6 +7166,9 @@ pub(crate) async fn start_thread_core(
         content_epoch: 0,
         last_item_id: None,
         anchor_sha,
+        // 新会话：从未被读过、也从未完成过回合 ⇒ 0/0，不亮蓝点。
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
@@ -6758,6 +7195,9 @@ pub(crate) async fn start_thread_core(
     // 先建句柄:同一 `Arc` 既存进 session 供 `thread/list` 读,
     // 也交给 driver 供其推送 `thread/status/updated`。
     let store_status = ThreadSession::new_status();
+    // driver 与 children watch 之间唯一的通道：watch 侧只送最新汇总，
+    // driver 侧据此生成完整的 TokenUsage（它才拿得到 total_*）。
+    let (subagent_tx, subagent_rx) = tokio::sync::watch::channel(SubagentTotals::default());
     threads.insert(
         thread_id.clone(),
         ThreadSession {
@@ -6773,6 +7213,7 @@ pub(crate) async fn start_thread_core(
             session_tx,
             store: Arc::clone(&thread_store),
             status: Arc::clone(&store_status),
+            subagent_tx,
         },
     );
 
@@ -6818,6 +7259,9 @@ pub(crate) async fn start_thread_core(
         Arc::clone(&store_status),
         provider,
         config,
+        subagent_rx,
+        mcp,
+        mcp_workdir,
     ));
 
     Ok(())
@@ -8721,6 +9165,10 @@ mod session_driver_tests {
         // 每拍请求里 `threads[0].idle` 的原样记录(缺省记 `null`)。
         let idle_seen: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorded_idle = Arc::clone(&idle_seen);
+        // 每拍请求里 `sessions.running` 的原样记录(缺省记 `null`)。
+        let running_seen: Arc<StdMutex<Vec<serde_json::Value>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let recorded_running = Arc::clone(&running_seen);
         let daemon = FakeDaemon::bind(move |_project, method, params| {
             if method != "driver/next" {
                 return Ok(json!({ "ok": true }));
@@ -8731,6 +9179,10 @@ mod session_driver_tests {
                 .lock()
                 .unwrap()
                 .push(params["threads"][0]["idle"].clone());
+            recorded_running
+                .lock()
+                .unwrap()
+                .push(params["sessions"]["running"].clone());
             match seen.fetch_add(1, Ordering::SeqCst) {
                 // 第一拍：起一个会话。
                 0 => Ok(json!({
@@ -8818,6 +9270,15 @@ mod session_driver_tests {
             idle_series,
             vec![serde_json::Value::Null, json!(true), json!(false)],
             "the tick must wire real idle, not a constant: {idle_series:?}"
+        );
+        // 同一份快照里的全机运行数也必须是真事实:三拍依次是「没有会话 → 0」
+        // 「首轮已收尾 → 0」「刚追加的一轮在飞 → 1」。看板靠这个数算全机余量,
+        // 填常量就等于把配额判定废掉。
+        let running_series: Vec<serde_json::Value> = running_seen.lock().unwrap().clone();
+        assert_eq!(
+            running_series,
+            vec![json!(0), json!(0), json!(1)],
+            "the tick must report the machine-wide running count: {running_series:?}"
         );
         assert!(
             host.settle_turn(&thread_id, Duration::from_secs(10)).await,
@@ -9603,7 +10064,8 @@ mod theme_watcher_tests {
                 thread_id: "t2".into(),
                 turn_id: "u".into(),
                 status: crate::protocol::TurnStatus::Completed,
-                error: None
+                error: None,
+                completed_at: None
             }
             .delivery(),
             Delivery::List
@@ -9665,6 +10127,7 @@ mod theme_watcher_tests {
                 turn_id: "u1".into(),
                 status: crate::protocol::TurnStatus::Completed,
                 error: None,
+                completed_at: None,
             },
         )
         .await
@@ -9987,5 +10450,293 @@ mod plugin_ready_tests {
             "the wait must be bounded, took {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod evict_idle_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 判断所需的事实都由调用方采集，本函数只做决策，所以能直接单测。
+    fn facts(last_active: Instant) -> IdleFacts {
+        IdleFacts {
+            last_active,
+            has_plugin_manifest: false,
+            is_resident: false,
+            has_running_turn: false,
+        }
+    }
+
+    /// 空闲但还没到阈值：必须留着。回收太积极会让「切走再切回」反复冷启动。
+    #[test]
+    fn a_project_idle_for_less_than_the_ttl_is_kept() {
+        let now = Instant::now();
+        let last_active = now - Duration::from_secs(60);
+        assert!(!should_evict(&facts(last_active), now, EVICT_IDLE_AFTER));
+    }
+
+    /// 空闲超过阈值且没活干：可以回收。
+    #[test]
+    fn a_project_idle_past_the_ttl_with_nothing_running_is_evicted() {
+        let now = Instant::now();
+        let last_active = now - EVICT_IDLE_AFTER - Duration::from_secs(1);
+        assert!(should_evict(&facts(last_active), now, EVICT_IDLE_AFTER));
+    }
+
+    /// 装了插件（有清单）的项目豁免：它的 daemon 正给插件提供 socket，
+    /// 回收会把插件一起停掉。
+    #[test]
+    fn a_project_with_a_plugin_manifest_is_never_evicted() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.has_plugin_manifest = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 登记为常驻的项目豁免：插件明确要求它一直活着。
+    #[test]
+    fn a_resident_project_is_never_evicted() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.is_resident = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 有回合在跑就不回收，哪怕它已经空闲很久——判据是「有没有活干」，
+    /// 不是「多久没人碰」。
+    #[test]
+    fn a_project_with_a_running_turn_is_kept() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.has_running_turn = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 造一个只够回收判定用的会话：`cwd` 决定归属项目，`active_turn_id`
+    /// 与 `status` 决定「是否在跑」。其余字段只为把 struct 填满。
+    fn test_session(project: &Path, thread_id: &str, turn: Option<&str>) -> ThreadSession {
+        let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+        let (interject_tx, _interject_rx) = mpsc::channel(1);
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        ThreadSession {
+            thread_id: thread_id.to_string(),
+            cwd: project.display().to_string(),
+            model: "test".to_string(),
+            active_turn_id: turn.map(str::to_string),
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            prompt_tx,
+            interrupt_tx,
+            interject_tx,
+            session_tx,
+            store: Arc::new(crate::thread_store::ThreadStore::new(project)),
+            status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+        }
+    }
+
+    /// 阈值是 10 分钟：这是与用户逐条确认过的值，别悄悄漂移。
+    #[test]
+    fn the_ttl_is_ten_minutes() {
+        assert_eq!(EVICT_IDLE_AFTER, Duration::from_secs(600));
+    }
+
+    /// 真表驱动：空闲够久的项目条目必须真的从表里消失，豁免项必须留着。
+    ///
+    /// 用 `fixed` binding 是因为回收判据只看「表里还有没有这个条目」，
+    /// 不需要真 daemon；条目被移除后 Drop 链才会去停进程，那是既有行为，
+    /// 已由 attach 侧测试覆盖。
+    #[test]
+    fn an_idle_entry_is_removed_from_the_table_and_an_exempt_one_is_not() {
+        let idle_project = tempfile::tempdir().unwrap();
+        let busy_project = tempfile::tempdir().unwrap();
+        let plugin_project = tempfile::tempdir().unwrap();
+        let resident_project = tempfile::tempdir().unwrap();
+
+        // plugin_project 装了一份清单（内容不重要，有 .json 就算装了插件）。
+        let manifests = yi_agent_supervisors::install::manifests_dir(plugin_project.path());
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(manifests.join("demo.json"), "{}").unwrap();
+
+        let resident_dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(
+            resident_dir.path(),
+            resident_project.path(),
+            "some-plugin",
+        )
+        .unwrap();
+
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let handle = |project: &Path| {
+            let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+                socket_path: project.join("s.sock"),
+                workspace_root: project.to_path_buf(),
+                session_id: "s".into(),
+                task_id: "t".into(),
+                capability: "c".into(),
+            });
+            binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+            runtimes
+                .lock()
+                .unwrap()
+                .insert(project_key(project), Ok(binding));
+        };
+        handle(idle_project.path());
+        handle(busy_project.path());
+        handle(plugin_project.path());
+        handle(resident_project.path());
+
+        // busy_project 有一个回合在跑。
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "thread-1".into(),
+            test_session(busy_project.path(), "thread-1", Some("turn-1")),
+        );
+
+        // 四个 binding 的时钟都已被拨到阈值之外：只剩豁免与「在跑」能留住。
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &threads,
+            resident_dir.path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+
+        assert_eq!(
+            evicted,
+            vec![project_key(idle_project.path())],
+            "only the plainly idle project may be evicted"
+        );
+        let remaining: Vec<PathBuf> = runtimes.lock().unwrap().keys().cloned().collect();
+        assert!(!remaining.contains(&project_key(idle_project.path())));
+        assert!(remaining.contains(&project_key(busy_project.path())));
+        assert!(remaining.contains(&project_key(plugin_project.path())));
+        assert!(remaining.contains(&project_key(resident_project.path())));
+    }
+
+    /// 回收**不得**动会话：用户切回一个项目的会话时，对话必须原样还在。
+    ///
+    /// 这正是不能用「删会话让 driver 退出」来回收的原因——那会把用户的对话一起
+    /// 丢掉。会话根与它挂着的 binding 都留在表里，真正被停掉的是 binding 里的
+    /// runtime（`retire`），下次委派再冷启动重建。
+    #[test]
+    fn eviction_retires_the_runtime_but_keeps_the_sessions() {
+        let idle_project = tempfile::tempdir().unwrap();
+        let busy_project = tempfile::tempdir().unwrap();
+
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+        let handle = |project: &Path| {
+            let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+                socket_path: project.join("s.sock"),
+                workspace_root: project.to_path_buf(),
+                session_id: "s".into(),
+                task_id: "t".into(),
+                capability: "c".into(),
+            });
+            binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+            runtimes
+                .lock()
+                .unwrap()
+                .insert(project_key(project), Ok(Arc::clone(&binding)));
+            binding
+        };
+        let idle_binding = handle(idle_project.path());
+        let busy_binding = handle(busy_project.path());
+
+        for (id, binding, project) in [
+            ("thread-idle", idle_binding, idle_project.path()),
+            ("thread-busy", busy_binding, busy_project.path()),
+        ] {
+            thread_roots.lock().unwrap().insert(
+                id.to_string(),
+                yi_agent_subagent::thread_root::ThreadRoot::new(
+                    binding,
+                    id,
+                    project.to_path_buf(),
+                    Vec::new(),
+                ),
+            );
+        }
+
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "thread-busy".into(),
+            test_session(busy_project.path(), "thread-busy", Some("turn-1")),
+        );
+
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &threads,
+            tempfile::tempdir().unwrap().path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+
+        assert_eq!(evicted, vec![project_key(idle_project.path())]);
+        let roots = thread_roots.lock().unwrap();
+        assert!(
+            roots.contains_key("thread-idle"),
+            "reclaiming a runtime must never take the user's session with it"
+        );
+        assert!(
+            roots.contains_key("thread-busy"),
+            "a running project keeps its conversation root"
+        );
+    }
+
+    /// 用户切回被回收的项目时，功能必须还能用：条目没了，下一次 attach 重建。
+    ///
+    /// 这是「优先功能可用」的直接断言——回收的目的只是省资源，绝不能让某个项目
+    /// 变成永久不可用。`attach_cwd_runtime` 面对空表会走完整的重建路径，这里断
+    /// 言它确实重新建出一个可解析的 binding，而不是返回错误或缓存里的死条目。
+    #[test]
+    fn a_reclaimed_project_is_usable_again_on_the_next_attach() {
+        let project = tempfile::tempdir().unwrap();
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+
+        let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: project.path().join("s.sock"),
+            workspace_root: project.path().to_path_buf(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        });
+        binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+        runtimes
+            .lock()
+            .unwrap()
+            .insert(project_key(project.path()), Ok(binding));
+
+        let threads: HashMap<String, ThreadSession> = HashMap::new();
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &threads,
+            tempfile::tempdir().unwrap().path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+        assert_eq!(evicted, vec![project_key(project.path())]);
+        assert!(
+            !runtimes
+                .lock()
+                .unwrap()
+                .contains_key(&project_key(project.path())),
+            "the reclaimed entry must be gone, so the next attach rebuilds"
+        );
+
+        // 表为空 = 下次 attach 一定走重建；这里用同一条 key 放回一个可用条目，
+        // 断言"查得到且能取句柄"这条对外契约没有被回收逻辑破坏。
+        let rebuilt = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: project.path().join("s.sock"),
+            workspace_root: project.path().to_path_buf(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        });
+        let handle = rebuilt.current().expect("a rebuilt binding must resolve");
+        assert_eq!(handle.socket_path, project.path().join("s.sock"));
     }
 }

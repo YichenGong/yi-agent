@@ -493,15 +493,42 @@ html[data-mobile="true"] {
   text-align: center;
 }
 
-/* 小数点：与数字同高、不占滚动窗口，宽度按字符自然宽度。 */
+/*
+ * 小数点。
+ *
+ * **不能收窄宽度**：等宽字体里 `.` 的前进宽度是 `1ch`，字形在其前进盒内居中、
+ * 两侧各留约 0.4ch 的空隙。把它塞进 `0.5ch` 的盒子里（早期实现如此）会让字形
+ * 左移 0.25ch，前进盒同时压到左右两位数字的盒子上——于是小数点与相邻数字粘成
+ * 一团墨迹，正是不缩放的普通文本里不会出现的重叠。
+ *
+ * 这里干脆不声明宽度：单字符的 inline-block 自然就是 `1ch`，与普通文本逐字
+ * 排版完全一致，空隙由字体自己的 sidebearing 决定。
+ */
 .rolling-point {
   display: inline-block;
-  width: 0.5ch;
-  text-align: center;
 }
 
 /* 单位（k/M/G）：跟在数字后，左侧留一点空隙，避免与末位贴死。 */
 .rolling-unit {
   display: inline-block;
   margin-left: 0.1em;
+}
+
+/*
+ * 会话内搜索命中。`mark` 自带浏览器默认底色（黄），在深色主题上刺眼且与
+ * 代码高亮的 token 色打架，所以两种状态都由我们接管：
+ * - `.search-hit`：全部命中，半透明琥珀，正文颜色继承原样；
+ * - `.search-hit[data-search-active="true"]`：当前命中，更实的底色 + 描边，
+ *   保证在代码块这类彩色背景上也一眼可辨。
+ */
+mark.search-hit {
+  background-color: rgb(245 158 11 / 0.35);
+  color: inherit;
+  border-radius: 2px;
+}
+
+mark.search-hit[data-search-active="true"] {
+  background-color: rgb(245 158 11 / 0.85);
+  color: #1c1917;
+  outline: 1px solid rgb(251 191 36);
 }

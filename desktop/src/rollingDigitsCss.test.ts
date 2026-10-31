@@ -48,3 +48,25 @@ describe("rolling digit geometry", () => {
     expect(rule).not.toMatch(/line-height:\s*1em/);
   });
 });
+
+/**
+ * 小数点与单位的几何。
+ *
+ * 两者都是 `.rolling-number`（`inline-flex`）的直接子项，所以任何"按视觉宽度
+ * 收窄"的尺寸都会直接改变字形的位置——百分比 width 在这里尤其危险。
+ */
+describe("rolling point and unit geometry", () => {
+  it("leaves the point at its natural advance width", () => {
+    const rule = declarations(".rolling-point");
+    // 回归：`.rolling-point` 曾写成 `width: 0.5ch`。等宽字体里 `.` 的前进宽度是
+    // `1ch`，把字形塞进半个宽度的盒子里会让它左移 0.25ch，前进盒同时压到左右
+    // 两位数字上——小数点与相邻数字粘成一团，而普通文本里不会出现这种重叠。
+    expect(rule).not.toMatch(/width\s*:/);
+    expect(rule).toMatch(/display:\s*inline-block/);
+  });
+
+  it("keeps the unit's spacing from shrinking to nothing", () => {
+    const rule = declarations(".rolling-unit");
+    expect(rule).toMatch(/margin-left:\s*0\.1em/);
+  });
+});

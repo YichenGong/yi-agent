@@ -406,7 +406,7 @@ fn run_loop<B: Backend, E: EventSource>(
     // up. It must be a popup, not only a history line: the failure can land
     // many turns into a long session, where a separator appended to the
     // transcript appears off-screen and is never seen.
-    let mut runtime_notice_popup: Option<&'static str> = None;
+    let mut runtime_notice_popup: Option<String> = None;
     let mut runtime_intent = runtime_intent;
     // `DisabledNotice` prints exactly one line, on the first frame, once the
     // history width is known.
@@ -497,7 +497,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     cause = %cause,
                     "subagent runtime unavailable for this session"
                 );
-                runtime_notice_popup = Some(crate::tui::subagents::RUNTIME_RESTART_NOTICE);
+                runtime_notice_popup = Some(crate::tui::subagents::runtime_restart_notice_text());
             }
             route_event(
                 &mut task_registry,
@@ -637,7 +637,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 );
             }
 
-            if let Some(text) = runtime_notice_popup {
+            if let Some(text) = &runtime_notice_popup {
                 render_runtime_notice_popup(f, text, chunks[0]);
             }
 
@@ -977,7 +977,21 @@ fn render_runtime_notice_popup(
     text: &str,
     area: ratatui::layout::Rect,
 ) {
-    let box_w = 58u16.min(area.width.saturating_sub(4));
+    // Width follows the text so the notice stays on one line. The fixed 58 was
+    // sized for the bare remedy; with the running version appended the text
+    // needs ~63 columns, so 58 wrapped it onto a second line and split the
+    // version away from what it qualifies ("restart" is useless advice for a
+    // stale binary). Wrapping is not truncation, so nothing was lost -- but the
+    // one piece of diagnostic information ended up on a line of its own.
+    // Still capped so a long line cannot cover the screen.
+    // +2 for the block's left/right borders. Display width, not char count:
+    // the notice is Chinese, and a CJK glyph occupies two terminal cells.
+    let text_width: u16 = text
+        .chars()
+        .map(|c| if c.is_ascii() { 1u16 } else { 2u16 })
+        .sum();
+    let needed = text_width + 2;
+    let box_w = needed.max(58).min(area.width.saturating_sub(4));
     let box_h = 5u16.min(area.height.max(1));
     let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
     let box_y = area.y + (area.height.saturating_sub(box_h)) / 3;
@@ -2778,6 +2792,17 @@ fn execute_slash_command(
                     let text = render_mcp_status(mcp.master(), &mcp.status());
                     history.push(HistoryCell::Markdown { text }, width);
                 }
+                Ok(McpAction::Reload) => {
+                    // 真正的重读 + 探测由 driver 侧完成(那里才有 ToolRegistry
+                    // 与 tokio runtime);这里只发出请求并给一句即时反馈。
+                    let _ = control_tx.blocking_send(crate::DriverControl::McpReload);
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some("正在重新读取 MCP 配置…".into()),
+                        },
+                        width,
+                    );
+                }
                 Ok(McpAction::Master(on)) => {
                     mcp.set_master(on);
                     let _ = control_tx.blocking_send(crate::DriverControl::McpRefresh);
@@ -4059,6 +4084,7 @@ mod tests {
                     is_root: true,
                     parent_task_id: None,
                     thread_id: None,
+                    usage: Default::default(),
                 },
                 yi_agent_store::ipc::IpcTaskSummary {
                     task_id: "child".into(),
@@ -4066,6 +4092,7 @@ mod tests {
                     is_root: false,
                     parent_task_id: Some("root".into()),
                     thread_id: None,
+                    usage: Default::default(),
                 },
             ],
             Some("root"),
@@ -4087,6 +4114,7 @@ mod tests {
                 is_root: true,
                 parent_task_id: None,
                 thread_id: None,
+                usage: Default::default(),
             }],
             None,
             "暂无任务",
@@ -10847,6 +10875,60 @@ mod runtime_restart_notice_tests {
         assert!(
             screen.contains("重启yi-agent后即可用"),
             "the restart remedy is not on screen: {screen}"
+        );
+    }
+
+    /// The version must sit on the same line as the remedy it qualifies.
+    ///
+    /// A stale binary and a broken one print the same remedy, so the version is
+    /// the only thing that tells them apart. A fixed width sized for the bare
+    /// remedy wraps the notice, which moves the version onto its own line --
+    /// separated from the "restart" advice it is supposed to qualify. Asserting
+    /// only "the version is somewhere on screen" passes either way, so this
+    /// asserts row equality instead.
+    #[test]
+    fn the_failure_alert_keeps_the_version_on_the_remedys_line() {
+        use ratatui::backend::TestBackend;
+
+        let text = crate::tui::subagents::runtime_restart_notice_text();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_runtime_notice_popup(f, &text, ratatui::layout::Rect::new(0, 0, 120, 30));
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let screen: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            screen.contains(crate::build_info::VERSION),
+            "the version is missing from the popup: {screen}"
+        );
+
+        // Compare rows cell-by-cell instead of by string offset: the notice is
+        // CJK, so one glyph spans two buffer cells and a char-indexed offset
+        // would land on the wrong row.
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let row_of = |needle: &str| -> Option<usize> {
+            let first = needle.chars().next()?;
+            buffer
+                .content
+                .iter()
+                .position(|cell| cell.symbol().starts_with(first))
+                .map(|index| index / width)
+        };
+        let remedy_row = row_of("重启").expect("the remedy must be rendered");
+        let version_row = row_of(crate::build_info::VERSION).expect("the version must be rendered");
+        assert_eq!(
+            remedy_row, version_row,
+            "the version wrapped onto its own line, away from the remedy it qualifies"
         );
     }
 

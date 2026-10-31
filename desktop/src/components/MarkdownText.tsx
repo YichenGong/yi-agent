@@ -1,4 +1,5 @@
-import { memo, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { memo, useMemo, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import type { PluggableList } from "unified";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -6,6 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { isRemoteClient, openExternalLink } from "../lib/platform";
 import "highlight.js/styles/github-dark.css";
 import "../lib/highlight-light.css";
+import { rehypeSearchMark } from "../lib/rehypeSearchMark";
 
 /**
  * 外链在系统浏览器打开,避免 webview 被导航走。
@@ -64,12 +66,25 @@ const TableBlock = ({
 );
 
 export const MarkdownText = memo(
-  function MarkdownText({ text }: { text: string }) {
+  function MarkdownText({ text, query = "" }: { text: string; query?: string }) {
+    // 插件数组按 query 记忆：rehype 插件是有状态的闭包，每次渲染都换新对象会让
+    // react-markdown 认为管线变了而整体重建。
+    //
+    // 类型必须写成 `PluggableList`（来自 unified）。三点实测：`as const` 会因
+    // readonly 元组不可赋值给可变元组而失败；`react-markdown` **不导出**
+    // `Pluggable`；`unified` 的 `PluggableList` 才是对的。
+    //
+    // 顺序要紧：`rehypeHighlight` 必须在前，它会把代码块切成多个 span，
+    // 本插件随后才能在这些 span 的文本节点里找命中。
+    const rehypePlugins = useMemo(
+      (): PluggableList => [rehypeHighlight, [rehypeSearchMark, { query }]],
+      [query],
+    );
     return (
       <div className="prose prose-invert max-w-none break-words prose-img:max-w-full prose-pre:bg-panel">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeHighlight]}
+          rehypePlugins={rehypePlugins}
           components={{ a: ExternalLink, table: TableBlock }}
         >
           {text}
@@ -77,7 +92,7 @@ export const MarkdownText = memo(
       </div>
     );
   },
-  (prev, next) => prev.text === next.text,
+  (prev, next) => prev.text === next.text && prev.query === next.query,
 );
 
 /**
@@ -87,12 +102,12 @@ export const MarkdownText = memo(
  * 白占主线程、饿死侧栏 spinner 的动画帧。按 `text` 判定即可：文本变了才需要重解析。
  */
 export const AgentMessage = memo(
-  function AgentMessage({ text }: { text: string }) {
+  function AgentMessage({ text, query = "" }: { text: string; query?: string }) {
     return (
       <div className="my-1 max-w-[90%] self-start">
-        <MarkdownText text={text} />
+        <MarkdownText text={text} query={query} />
       </div>
     );
   },
-  (prev, next) => prev.text === next.text,
+  (prev, next) => prev.text === next.text && prev.query === next.query,
 );

@@ -573,6 +573,8 @@ fn only_the_lead_sees_the_memory_tools() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -705,6 +707,8 @@ fn only_the_lead_sees_the_view_tools() {
             tag: None,
             extra_roots: Vec::new(),
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         })
         .expect("a plain meta must persist");
     // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
@@ -1050,11 +1054,11 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
     )
     .expect("an in-place root must activate");
 
-    // Delegating is where a plain directory stops: the daemon refuses the
-    // worker because it cannot name a Git worktree lease to recover into.
-    // Pin it here so the boundary is a documented fact rather than a
-    // surprise in a chat window -- the desktop app's default cwd is $HOME.
-    let spawned = yi_agent_store::ipc::send_request(
+    // Read-only delegation works in a plain directory: it writes nothing, so
+    // there is no worktree to recover into and no delivery to validate. The
+    // desktop app's default cwd is $HOME, so this is the ordinary case, not an
+    // edge one.
+    let read_only = yi_agent_store::ipc::send_request(
         &attached.socket_path,
         yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
             session_id: attached.attached_root.session_id.clone(),
@@ -1069,14 +1073,43 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
             fork_token: None,
         },
     )
-    .expect("the runtime socket answers even when it refuses");
+    .expect("the runtime socket answers");
     assert!(
-        !matches!(
-            spawned,
+        matches!(
+            read_only,
             yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
         ),
-        "delegation needs a checkpoint to recover into, so a plain directory \
-         must be refused rather than half-admitted; got {spawned:?}"
+        "a plain directory must still admit a read-only child, got {read_only:?}"
+    );
+
+    // Coding is where it stops: a commit is the recovery boundary a coding
+    // child cannot work without. The refusal must be recognizable rather than a
+    // bare internal error, so the model can explain it and offer to initialize.
+    let coding = yi_agent_store::ipc::send_request(
+        &attached.socket_path,
+        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+            session_id: attached.attached_root.session_id.clone(),
+            parent_task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+            objective: "change the plain directory".into(),
+            mode: Some("coding".into()),
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .expect("the runtime socket answers even when it refuses");
+    let yi_agent_store::ipc::IpcResponse::Error { code, message } = coding else {
+        panic!("a plain directory must refuse a coding child, got {coding:?}");
+    };
+    assert_eq!(code, yi_agent_store::ipc::IpcErrorCode::Validation);
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|text| text.contains("coding_requires_git")),
+        "the refusal must be actionable, got {message:?}"
     );
 }
 
@@ -1785,6 +1818,7 @@ pub(crate) fn build_test_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1817,6 +1851,7 @@ fn build_test_agent_with_provider(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1851,6 +1886,7 @@ pub(crate) fn build_slow_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1876,6 +1912,7 @@ fn build_delayed_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1903,6 +1940,7 @@ fn build_checkpoint_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -2050,6 +2088,51 @@ impl Harness {
             PERMISSION_TIMEOUT,
             Scope::Admin,
             enabled,
+        )
+    }
+
+    /// 自定义 config + 组长开关：`with_config_lead_and_scope` 的 config 版。
+    fn with_config_and_flags<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        lead_agent_enabled: bool,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            lead_agent_enabled,
         )
     }
 
@@ -2292,6 +2375,7 @@ impl Harness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: models_dir.path().join("models.json"),
+                websearch_path: models_dir.path().join("websearch.json"),
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
@@ -2701,6 +2785,7 @@ fn summary(
         is_root: false,
         parent_task_id: Some("root".into()),
         thread_id: thread_id.map(str::to_string),
+        usage: yi_agent_store::ipc::IpcTaskUsage::default(),
     }
 }
 
@@ -2732,6 +2817,95 @@ fn children_are_scoped_by_the_conversation_marker() {
         children_for_thread(&tasks, "thread-c").is_empty(),
         "a conversation with no children lists none"
     );
+}
+
+/// 子任务列表项携带它自己的累计用量。
+#[test]
+fn children_for_thread_carries_task_usage() {
+    let mut task = summary("child-1", "running", Some("thread-a"));
+    task.usage = yi_agent_store::ipc::IpcTaskUsage {
+        input_tokens: 1_200,
+        output_tokens: 34,
+        cache_read_tokens: 56_000,
+    };
+    let children = children_for_thread(&[task], "thread-a");
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        children[0].usage,
+        crate::protocol::AgentChildUsage {
+            input_tokens: 1_200,
+            output_tokens: 34,
+            cache_read_tokens: 56_000,
+        }
+    );
+}
+
+/// 汇总对整份列表求和：已完成的子任务烧掉的 token 同样是这个会话的开销。
+#[test]
+fn subagent_totals_sums_every_child() {
+    let child = |input, output, cache_read| crate::protocol::AgentChild {
+        task_id: "x".into(),
+        objective: None,
+        state: "completed".into(),
+        last_step: None,
+        parent_task_id: Some("root".into()),
+        usage: crate::protocol::AgentChildUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+        },
+    };
+    let children = vec![child(10, 1, 100), child(20, 2, 200)];
+    assert_eq!(
+        subagent_totals(&children),
+        SubagentTotals {
+            input: 30,
+            output: 3,
+            cache_read: 300,
+        }
+    );
+    // 空列表是零，不是错误。
+    assert_eq!(subagent_totals(&[]), SubagentTotals::default());
+}
+
+/// `/clear` 之后要把 clear 之前的量扣掉：daemon 的 task 记录不会随 clear 删除，
+/// 不扣的话旧数字会被下一次 children 推送带回来。
+#[test]
+fn subagent_baseline_subtracts_cleared_usage() {
+    let raw = SubagentTotals {
+        input: 900,
+        output: 90,
+        cache_read: 8000,
+    };
+    let baseline = SubagentTotals {
+        input: 400,
+        output: 40,
+        cache_read: 3000,
+    };
+    assert_eq!(
+        raw.saturating_sub(baseline),
+        SubagentTotals {
+            input: 500,
+            output: 50,
+            cache_read: 5000,
+        }
+    );
+}
+
+/// daemon 重启 / 任务被清理都可能让当前值短暂小于基线：报 0，不许回绕。
+#[test]
+fn subagent_baseline_never_underflows() {
+    let raw = SubagentTotals {
+        input: 10,
+        output: 1,
+        cache_read: 5,
+    };
+    let baseline = SubagentTotals {
+        input: 900,
+        output: 90,
+        cache_read: 8000,
+    };
+    assert_eq!(raw.saturating_sub(baseline), SubagentTotals::default());
 }
 
 /// A root task is never a child, even when it carries the marker.
@@ -2774,6 +2948,11 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
             state: "running".into(),
             last_step: Some("running tests".into()),
             parent_task_id: Some("root".into()),
+            usage: crate::protocol::AgentChildUsage {
+                input_tokens: 1_200,
+                output_tokens: 34,
+                cache_read_tokens: 56_000,
+            },
         }],
     };
     let json = serde_json::to_value(&children).unwrap();
@@ -2781,6 +2960,13 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
     assert_eq!(json["params"]["threadId"], "thread-1");
     assert_eq!(json["params"]["children"][0]["taskId"], "task-1");
     assert_eq!(json["params"]["children"][0]["lastStep"], "running tests");
+    // 用量走 camelCase，与列表里其它字段一致。
+    assert_eq!(json["params"]["children"][0]["usage"]["inputTokens"], 1_200);
+    assert_eq!(json["params"]["children"][0]["usage"]["outputTokens"], 34);
+    assert_eq!(
+        json["params"]["children"][0]["usage"]["cacheReadTokens"],
+        56_000
+    );
 
     let event = Notification::AgentTraceEvent {
         thread_id: "thread-1".into(),
@@ -3521,6 +3707,7 @@ async fn unknown_method_returns_method_not_found() {
         ("thread/lead", Domain::Thread),
         ("thread/list", Domain::Thread),
         ("thread/listAll", Domain::Thread),
+        ("thread/markRead", Domain::Thread),
         ("thread/readItems", Domain::Thread),
         ("thread/rename", Domain::Thread),
         ("thread/reorderPinned", Domain::Thread),
@@ -3923,6 +4110,7 @@ async fn eof_exits_gracefully() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -4007,6 +4195,7 @@ async fn agent_factory_failure_returns_internal_error() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -4093,6 +4282,7 @@ async fn oversized_frame_returns_err() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -4293,6 +4483,7 @@ async fn turn_start_prompt_reaching_the_model_contains_the_attachment_manifest()
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -4767,6 +4958,7 @@ async fn an_uploaded_image_reaches_the_model_as_a_content_block() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -4901,6 +5093,7 @@ async fn turn_start_drops_an_unknown_upload_id_and_still_runs_the_turn() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -5452,6 +5645,7 @@ async fn an_image_reaches_the_model_as_a_content_block() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -5994,6 +6188,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             session_tx,
             store: Arc::new(crate::thread_store::ThreadStore::new(warm.path())),
             status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
         },
     );
 
@@ -6018,6 +6213,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6810,6 +7007,9 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -6938,6 +7138,9 @@ async fn driver_reports_finished_when_writer_fails() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -7013,6 +7216,9 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。
@@ -7107,6 +7313,8 @@ async fn set_model_command_rebuilds_with_the_new_model() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7212,6 +7420,8 @@ async fn set_reasoning_effort_command_rebuilds_without_a_new_provider() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7327,6 +7537,8 @@ async fn set_preserve_thinking_false_strips_the_shared_session() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7434,6 +7646,8 @@ async fn set_preserve_thinking_true_leaves_the_shared_session_untouched() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer.await.unwrap().unwrap();
@@ -7535,6 +7749,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7574,6 +7790,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer.await.unwrap().unwrap();
@@ -7646,6 +7864,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7671,6 +7891,7 @@ async fn a_turn_while_off_persists_without_credentials() {
     persist_and_finish_turn(
         tid,
         None,
+        0,
         None,
         &[],
         &[],
@@ -7745,6 +7966,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7770,6 +7993,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
     persist_and_finish_turn(
         tid,
         None,
+        0,
         None,
         &[],
         &[],
@@ -7839,6 +8063,8 @@ async fn set_model_command_keeps_the_agent_when_the_provider_fails() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     let error = answer
@@ -7910,6 +8136,9 @@ async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     let mut effective = crate::test_support::test_config();
@@ -7979,6 +8208,9 @@ async fn driver_uses_unique_item_ids_across_turns() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -8167,6 +8399,7 @@ fn build_slow_call_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -8238,6 +8471,7 @@ fn build_long_tool_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(true),
         process_manager: Arc::clone(&registry.process_manager),
+        mcp: None,
     })
 }
 
@@ -8273,6 +8507,7 @@ fn build_permission_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -8517,6 +8752,9 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -9140,6 +9378,8 @@ fn write_meta(
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9170,6 +9410,8 @@ fn write_lead_meta(dir: &Path, id: &str) {
         extra_roots: Vec::new(),
         role: Some(crate::thread_store::LEAD_ROLE.to_string()),
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -10010,6 +10252,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         session_tx,
         store: Arc::new(crate::thread_store::ThreadStore::new(project)),
         status: Arc::new(StdMutex::new(status)),
+        subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
     }
 }
 
@@ -11062,6 +11305,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -11176,6 +11421,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -11366,6 +11613,9 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -11437,6 +11687,7 @@ async fn thread_resume_replays_history_and_restores_context() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -11948,6 +12199,7 @@ fn compactable_factory(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -12070,6 +12322,7 @@ async fn thread_compact_reports_failure_without_breaking_the_connection() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -12788,15 +13041,20 @@ async fn failed_title_generation_broadcasts_no_title_change() {
 
 /// 标题必须在**用户输入落地时**生成，而不是等本轮结束。
 ///
-/// 用的 provider 让对话轮刻意慢 400ms、标题轮秒回：若实现仍把标题生成挂在
-/// `persist_and_finish_turn`（本轮收尾），`thread/titleChanged` 必然晚于
-/// `turn/completed`。断言它先到，就是在钉「不等 session 结束」这条要求本身。
+/// 顺序不靠 sleep 赌：对话轮的 provider 会卡在 `title_written` 上，测试只有读到
+/// `thread/titleChanged` 才放行它。于是「标题先到」是被构造出来的因果——
+/// 只要实现把标题挂在 turn 收尾之后，两边互等就会超时失败。
 #[tokio::test(flavor = "multi_thread")]
 async fn first_turn_broadcasts_llm_title_change() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
     cfg.workdir = dir.path().to_path_buf();
-    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowConversationTitleProvider);
+    let title_seen = Arc::new(tokio::sync::Notify::new());
+    let title_written = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(GatedByTitleProvider {
+        title_seen: Arc::clone(&title_seen),
+        title_written: Arc::clone(&title_written),
+    });
     let mut h = Harness::with_config(
         cfg,
         move |session, cwd, mode| {
@@ -12813,9 +13071,13 @@ async fn first_turn_broadcasts_llm_title_change() {
     ))
     .await;
 
-    // 标题生成发生在 turn **开始**时（用户输入一落地就发起），与 turn 并行，因此
-    // `thread/titleChanged` 必须先于 `turn/completed` 到达：这正是本次改动的
-    // 目的——用户不必等整轮跑完才在侧栏看到有意义的标题。
+    // 先握手：标题请求确实到达过，证明这条路径被走到（而不是压根没生成）。
+    tokio::time::timeout(EVENT_WAIT, title_seen.notified())
+        .await
+        .expect("a title request must reach the provider");
+
+    // 标题生成发生在 turn **开始**时（用户输入一落地就发起），与 turn 并行，
+    // 因此 `thread/titleChanged` 必须先于 `turn/completed` 到达。
     let mut saw_title_change = None;
     for _ in 0..40 {
         let v = h.read_value().await;
@@ -12830,6 +13092,8 @@ async fn first_turn_broadcasts_llm_title_change() {
             _ => {}
         }
     }
+    // 放行对话轮，避免后台任务长期悬挂。
+    title_written.notify_one();
     let ev = saw_title_change.expect("expected a thread/titleChanged notification");
     assert_eq!(ev["params"]["thread_id"], tid);
     assert_eq!(
@@ -12839,14 +13103,25 @@ async fn first_turn_broadcasts_llm_title_change() {
     h.shutdown().await;
 }
 
-/// 对话轮慢 400ms、标题轮立即返回的 provider。
+/// 「对话轮等标题落盘」的 provider：用信号量取代 sleep，让顺序断言确定。
 ///
-/// 用来证明标题生成本身不依赖 turn 收尾：只要实现仍把标题挂在收尾处，
-/// `thread/titleChanged` 就会排在 `turn/completed` 之后而被本用例抓住。
-struct SlowConversationTitleProvider;
+/// 旧的写法让对话轮 `sleep(400ms)` 来赌标题任务先跑完，宿主机负载高时
+/// spawn 出的标题任务可能被推迟，测试就会偶发失败。这里改为显式握手：
+/// 标题请求到达后置 `title_seen`；对话请求在返回前 `await` `title_written`
+/// （由测试在读到 `thread/titleChanged` 后放行）。
+///
+/// 这样「`titleChanged` 先于 `turn/completed`」不再是时序赌博，而是被构造出来的
+/// 因果：对话轮不返回，turn 就不可能收尾。若实现仍把标题挂在收尾之后，
+/// 两边互等会直接超时失败，同样能抓住回归。
+struct GatedByTitleProvider {
+    /// 标题请求已到达（测试据此判断手已经握上）。
+    title_seen: Arc<tokio::sync::Notify>,
+    /// 允许对话轮返回。
+    title_written: Arc<tokio::sync::Notify>,
+}
 
 #[async_trait]
-impl yi_agent_core::Provider for SlowConversationTitleProvider {
+impl yi_agent_core::Provider for GatedByTitleProvider {
     async fn call_stream(
         &self,
         req: yi_agent_core::provider::ProviderRequest,
@@ -12855,6 +13130,7 @@ impl yi_agent_core::Provider for SlowConversationTitleProvider {
         yi_agent_core::provider::ProviderError,
     > {
         if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            self.title_seen.notify_one();
             return Ok(Box::pin(futures::stream::iter(vec![
                 yi_agent_core::provider::ProviderEvent::TextDelta("修复登录报错".into()),
                 yi_agent_core::provider::ProviderEvent::Stop {
@@ -12862,7 +13138,8 @@ impl yi_agent_core::Provider for SlowConversationTitleProvider {
                 },
             ])));
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // 等到测试确认 `thread/titleChanged` 已到达才结束本轮。
+        self.title_written.notified().await;
         Ok(Box::pin(futures::stream::iter(vec![
             yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
             yi_agent_core::provider::ProviderEvent::Stop {
@@ -12992,12 +13269,19 @@ async fn second_turn_does_not_regenerate_the_title() {
     {
         // 第二次 turn/start 可能撞上上一轮尚未释放的 `active_turn_id`（`turn/completed`
         // 先于收尾发出），这不是产品缺陷：按 `-32012` 重试即可。
+        //
+        // **必须读到自己那条响应（id == {id}）为止**，不能只读一帧就下结论：流里
+        // 还夹着 `thread/titleChanged` / `thread/status/updated` 等通知，把通知当成
+        // 响应会漏掉真正的 `-32012`，于是第二轮从未启动、后面等 `turn/completed`
+        // 直接超时。标题生成前移到 turn 开始后，这类通知出现得更早，更要守住这条。
         loop {
             h.send(&format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
             ))
             .await;
-            let v = h.read_value().await;
+            let v = h
+                .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(id)))
+                .await;
             match v.get("error") {
                 None => break,
                 Some(_) if idx == 0 => panic!("first turn must start: {v}"),
@@ -13015,6 +13299,330 @@ async fn second_turn_does_not_regenerate_the_title() {
         title_calls.load(Ordering::SeqCst),
         1,
         "title must be generated exactly once"
+    );
+    h.shutdown().await;
+}
+
+/// 插件驱动会话（标题创建时已写入、且非组长）**不得**调用标题模型。
+///
+/// 这条钉的是 `ThreadStore::touch` 里的 `meta.title.is_none()` 判据：若该条件被
+/// 放宽，已命名的会话会在每轮首输入时被重新命名，覆盖用户自己起的名字。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_that_already_has_a_title_never_calls_the_title_model() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let tid = "thread-with-title";
+    // 非组长、标题已存在：插件驱动会话的真实形态。
+    write_meta(
+        dir.path(),
+        tid,
+        "my-app 组长",
+        Some("my-app"),
+        Some("refs/heads/main"),
+    );
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let resumed = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert!(
+        resumed.get("error").is_none(),
+        "resume must succeed: {resumed}"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "a thread that already has a title must not be renamed"
+    );
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(tid)
+        .ok()
+        .flatten()
+        .expect("meta must survive");
+    assert_eq!(loaded.meta.title.as_deref(), Some("my-app 组长"));
+    h.shutdown().await;
+}
+
+/// 组长会话即便标题为空也不生成标题（`is_lead_meta` 这条分支本身的判据）。
+///
+/// 真机出现过 9 例「幽灵组长」（`ask_lead` 懒创建、未命名）。若只用「标题已存在」
+/// 来挡，这类会话会被误当成首轮而改名；这条用例把 `role:"lead"` 单独钉住。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let tid = "thread-ghost-lead";
+    {
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().into(),
+                model: "m".into(),
+                created_at: 0,
+                updated_at: 0,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+                driver_project: None,
+                driver_ref: None,
+                model_ref: None,
+                reasoning_effort: None,
+                tag: None,
+                preserve_thinking: true,
+                content_epoch: 0,
+                last_item_id: None,
+                anchor_sha: None,
+                last_read_at: 0,
+                last_completed_at: 0,
+                extra_roots: Vec::new(),
+                role: Some(crate::thread_store::LEAD_ROLE.into()),
+            })
+            .unwrap();
+    }
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let resumed = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert!(
+        resumed.get("error").is_none(),
+        "resume must succeed: {resumed}"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "lead threads must never be auto-renamed"
+    );
+    // `touch` 对组长直接跳过，连兜底标题都不写。
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(tid)
+        .ok()
+        .flatten()
+        .expect("meta must survive");
+    assert_eq!(loaded.meta.title, None, "lead meta must stay untitled");
+    h.shutdown().await;
+}
+
+/// 标题生成期间用户手动改名：CAS 必须让手写标题胜出。
+///
+/// 时间窗是真实构造的：标题 provider 停在 `release_title` 上，测试在窗口内发
+/// `thread/rename`。若 `generate_title_for_first_input` 把 CAS 退回无条件
+/// `rename`，手写标题会被覆盖成「自动标题」，本用例即失败。
+///
+/// 注意：不要在等 rename 响应时用 `read_matching`——它会丢弃通知帧，把随后
+/// 要等的 `turn/completed` 一起吞掉。这里用单循环同时处理两种帧。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_rename_during_generation_wins_over_the_generated_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let title_seen = Arc::new(tokio::sync::Notify::new());
+    let release_title = Arc::new(tokio::sync::Notify::new());
+    let title_returned = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(TitleBlockingProvider {
+        title_seen: Arc::clone(&title_seen),
+        release_title: Arc::clone(&release_title),
+        title_returned: Arc::clone(&title_returned),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+
+    // 标题生成已经发起并卡住：此刻是用户手写改名的真实窗口。
+    tokio::time::timeout(EVENT_WAIT, title_seen.notified())
+        .await
+        .expect("title generation must start before the rename window");
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/rename","params":{{"threadId":"{tid}","title":"我的登录排查"}}}}"#
+    ))
+    .await;
+
+    // 单循环同时收两条关键帧：rename 响应（id=4）与 turn 收尾。
+    // 注意 `read_matching` 会丢弃通知帧，用它等 rename 会把 `turn/completed`
+    // 一起吞掉，故这里不用它。
+    let mut rename_ok = false;
+    let mut turn_done = false;
+    for _ in 0..60 {
+        if rename_ok && turn_done {
+            break;
+        }
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            assert!(v.get("error").is_none(), "rename must succeed: {v}");
+            rename_ok = true;
+            // 手写标题已落盘，放行自动标题：CAS 应让它放弃覆盖。
+            release_title.notify_one();
+        } else if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            turn_done = true;
+        }
+    }
+    assert!(rename_ok, "rename response never arrived");
+
+    // 等标题任务真的返回。CAS 紧跟在生成之后，用一个有界的轮询给它落地时间
+    // （不断言中间态，只断言最终值；若被覆盖，最终值就是「自动标题」）。
+    tokio::time::timeout(EVENT_WAIT, title_returned.notified())
+        .await
+        .expect("title generation must finish once released");
+    let mut loaded = None;
+    for _ in 0..100 {
+        let meta = crate::thread_store::ThreadStore::new(dir.path())
+            .read_meta(&tid)
+            .ok()
+            .flatten();
+        let title = meta.as_ref().and_then(|m| m.title.clone());
+        loaded = meta;
+        // 只在「被覆盖」时提前退出：手写标题本来就已是当前值，看到它不代表
+        // CAS 已经跑完，提前 break 会让断言在 CAS 之前下结论。
+        if title.as_deref() == Some("自动标题") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let loaded = loaded.expect("meta must exist");
+    assert_eq!(loaded.title.as_deref(), Some("我的登录排查"));
+    h.shutdown().await;
+}
+
+/// 标题请求会卡在 `release_title` 上、对话轮立刻返回的 provider。
+struct TitleBlockingProvider {
+    title_seen: Arc<tokio::sync::Notify>,
+    release_title: Arc<tokio::sync::Notify>,
+    /// 标题文本即将返回（CAS 紧随其后）。
+    title_returned: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for TitleBlockingProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::ProviderEvent as E;
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            self.title_seen.notify_one();
+            self.release_title.notified().await;
+            self.title_returned.notify_one();
+            return Ok(Box::pin(futures::stream::iter(vec![
+                E::TextDelta("自动标题".into()),
+                E::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            E::TextDelta("ok".into()),
+            E::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+/// 纯图片输入（`display_text` 为空）不生成标题：没有可喂给标题模型的文本。
+///
+/// 这是刻意的边界，spec §4 的错误处理表已列明。用 `assert_eq!(.., 0)` 而不是
+/// 「标题为空」——后者在兜底标题恰好也没写入时会误通过。
+#[tokio::test(flavor = "multi_thread")]
+async fn image_only_input_does_not_generate_a_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let png = dir.path().join("shot.png");
+    image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([7, 7, 7]))
+        .save_with_format(&png, image::ImageFormat::Png)
+        .unwrap();
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}}]}}}}"#,
+        png.display()
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "an image-only message has no text to title from"
     );
     h.shutdown().await;
 }
@@ -13943,6 +14551,39 @@ async fn an_observe_client_cannot_delete_a_thread() {
     h.shutdown().await;
 }
 
+/// `mcp/set` 改用户的持久配置,必须 Control;只读客户端只能看不能改。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observe_client_may_not_write_mcp_config() {
+    let mut h = (Harness::with_scope(Scope::Observe)).await;
+    initialize(&mut h).await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":9,"method":"mcp/set","params":{"scope":"master","enabled":false}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 9).await;
+    assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
+    h.shutdown().await;
+}
+
+/// 反例:Control 客户端(手机)能改——门禁只挡最低档,不是挡所有人。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_client_may_write_mcp_config() {
+    let mut h = Harness::with_scope(Scope::Control).await;
+    initialize(&mut h).await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":9,"method":"mcp/set","params":{"scope":"master","enabled":false}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 9).await;
+    // 该 harness 的 workdir 下没有 mcp.json,故这里是业务错误而非权限错误:
+    // 关键是它**没有**被判 -32014。
+    assert_ne!(
+        v["error"]["code"], -32014,
+        "Control 客户端不该被判权限不足: {v}"
+    );
+    h.shutdown().await;
+}
+
 /// 手机（Control）必须能切换会话权限模式：设计 §2 的「引导去桌面端授权」
 /// 入口在代码里并不存在，admin-only 会让手机端的 YOLO 切换永远是死路。
 /// 与 `thread/setModel` 同档（Control）。
@@ -14327,6 +14968,38 @@ async fn an_observe_client_may_list_but_not_write_models() {
     assert_eq!(
         v["error"]["code"], -32014,
         "writes require Control, Observe must be refused: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// `websearch/get` 只读盘且只回掩码,`Observe` 即可;`set` / `test` 触及密钥,
+/// 必须 `Control` —— 与 `model/*` 同一档位划分。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observe_client_may_read_websearch_but_not_write_it() {
+    let mut h = (Harness::with_scope(Scope::Observe)).await;
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"websearch/get","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 20).await;
+    assert!(
+        v["result"]["engines"]["bocha"].is_object(),
+        "Observe may read the masked config: {v}"
+    );
+
+    h.send(r#"{"jsonrpc":"2.0","id":21,"method":"websearch/set","params":{"enabled":false}}"#)
+        .await;
+    let v = read_response(&mut h, 21).await;
+    assert_eq!(
+        v["error"]["code"], -32014,
+        "writes require Control, Observe must be refused: {v}"
+    );
+
+    h.send(r#"{"jsonrpc":"2.0","id":22,"method":"websearch/test","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 22).await;
+    assert_eq!(
+        v["error"]["code"], -32014,
+        "connection tests touch the key, so they require Control: {v}"
     );
     h.shutdown().await;
 }
@@ -16800,6 +17473,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     };
     let rebuilt = wrap_for_delegation(built, tooling);
     assert!(
@@ -16977,6 +17651,8 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &hub,
                 &turn_tx,
                 &status,
+                None,
+                &std::env::temp_dir(),
             )
             .await;
             answer
@@ -16995,6 +17671,8 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &hub,
                 &turn_tx,
                 &status,
+                None,
+                &std::env::temp_dir(),
             )
             .await;
             assert_eq!(
@@ -17084,6 +17762,7 @@ impl MergedHarness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: PathBuf::new(),
+                websearch_path: PathBuf::new(),
                 lead_agent_enabled: false,
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
@@ -17953,6 +18632,62 @@ async fn workspace_list_reports_linked_to() {
     );
     h.shutdown().await;
 }
+/// 看板卡片会话落进索引后，`workspace/list` 不得把它带进「New thread」菜单。
+///
+/// 卡片会话的 cwd 是 `<项目>/.worktrees/kanban/<slug>`，`thread/start` 会把它
+/// 当普通目录写进索引（`thread/listAll` 靠这条发现冷会话）。但那个目录不是用户
+/// 挑的文件夹：菜单里堆十几条 `2026-10-31-xxx-design-...` 只会让用户分不清
+/// 哪个才是自己的项目。
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_list_hides_card_worktrees() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+    // 卡片会话的落盘形态：cwd 在 worktree，归属靠 `driver_project`。
+    write_meta(
+        &wt,
+        "t-card",
+        "看板 · card-1",
+        Some(&project.to_string_lossy()),
+        Some("card-1"),
+    );
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    add_workspace(&mut h, 11, &project.to_string_lossy()).await;
+    add_workspace(&mut h, 12, &wt.to_string_lossy()).await;
+
+    let v = rpc(&mut h, 13, "workspace/list", serde_json::json!({})).await;
+    let paths: Vec<&str> = v["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["path"].as_str())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.contains("/.worktrees/kanban")),
+        "the card worktree must stay out of the New-thread menu: {v}"
+    );
+    assert!(
+        paths.contains(&project.to_string_lossy().as_ref()),
+        "the real project must still be offered: {v}"
+    );
+
+    // 索引本身保留该目录：`thread/listAll` 仍要靠它发现卡片会话，并折进项目组。
+    let all = list_all(&mut h).await;
+    let card_listed = all["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+        .any(|t| t["thread_id"] == serde_json::json!("t-card"));
+    assert!(
+        card_listed,
+        "hiding the worktree from the picker must not hide the card session: {all}"
+    );
+    h.shutdown().await;
+}
+
 /// `role` 必须在列表条目上暴露;普通会话不得带该 key(旧客户端字节兼容)。
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_exposes_the_lead_role_only_for_the_lead() {
@@ -18428,6 +19163,8 @@ fn the_lead_does_not_get_ask_lead() {
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();
@@ -19062,7 +19799,7 @@ async fn an_interrupt_without_an_active_turn_is_an_error() {
 async fn list_all_carries_groups_and_hides_stale_members() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19129,13 +19866,49 @@ async fn list_all_always_includes_an_empty_groups_array() {
     h.shutdown().await;
 }
 
+/// 分组已是常开能力：建组照常成功，列表照常下发组表。
+///
+/// （2026-10-29 转正：`session_groups` 开关连同服务端闸门一起删除，所以这里不再
+/// 有"关掉时看不见、改不动"的另一半——那条断言随闸门一起去掉了。）
+#[tokio::test(flavor = "multi_thread")]
+async fn groups_are_listed_and_writable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_cfg(cfg).await;
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let ws = dir.path().canonicalize().unwrap().display().to_string();
+
+    let create = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/group/create",
+        "params":{"workspace": ws, "name": "登录模块", "description": "", "threadIds":[tid]}});
+    h.send(&create.to_string()).await;
+    let v = read_response(&mut h, 3).await;
+    assert!(v.get("error").is_none(), "create must succeed: {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 4).await;
+    let ws_group = v["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["workspace"] == ws.as_str())
+        .expect("the workspace must be listed")
+        .clone();
+    assert_eq!(ws_group["groups"][0]["name"], "登录模块");
+    h.shutdown().await;
+}
+
 /// 建组：成功后应答带回新组，`thread/listAll` 能读到；跨目录成员、未索引目录、
 /// 空组名一律 `-32602`。
 #[tokio::test(flavor = "multi_thread")]
 async fn group_create_persists_and_validates_workspace() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19190,7 +19963,7 @@ async fn group_create_persists_and_validates_workspace() {
 async fn group_update_set_members_and_delete() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19294,7 +20067,7 @@ async fn deleting_a_thread_prunes_it_from_groups() {
 async fn group_mutations_broadcast_groups_changed() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19463,5 +20236,737 @@ async fn plugin_uninstall_rejects_an_unusable_plugin_name() {
         "a traversing name must be refused: {response}"
     );
 
+    h.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 跨端未读状态同步（设计见 docs/superpowers/specs/2026-10-25-unread-read-state-sync-design.md）
+// ---------------------------------------------------------------------------
+
+/// 从 `thread/listAll` 的条目里取某个水位（缺省 → 0）。
+fn watermark_of(list: &serde_json::Value, thread_id: &str, field: &str) -> u64 {
+    find_listed(list, thread_id)[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{field} must be present on {thread_id}: {list}"))
+}
+
+/// 已读水位必须经 `thread/listAll` 下发——这是断线重连后重建未读的唯一来源。
+///
+/// 若只把水位写在 meta 里而下不到线上，手机重连后永远算不出「离线期间跑完的
+/// 回合」，正是用户报的那个不一致。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_reports_the_read_watermarks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        0,
+        "a fresh thread has never been read: {listed}"
+    );
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_completed_at"),
+        0,
+        "a fresh thread has never completed a turn: {listed}"
+    );
+
+    // 跑完一轮：完成时间推进，已读水位不动 ⇒ 该会话未读。
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+    let listed = list_all(&mut h).await;
+    let completed = watermark_of(&listed, &tid, "last_completed_at");
+    assert!(
+        completed > 0,
+        "a finished turn must stamp completion: {listed}"
+    );
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        0,
+        "running a turn is not reading it: {listed}"
+    );
+
+    // 标记已读：水位追上完成时间，该会话不再未读。
+    let resp = rpc(
+        &mut h,
+        902,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "markRead must succeed: {resp}");
+    let read = resp["result"]["last_read_at"]
+        .as_u64()
+        .expect("markRead must report the new watermark");
+    assert!(
+        read >= completed,
+        "reading must reach the completion: {resp}"
+    );
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        read,
+        "the read watermark must survive the round trip: {listed}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 标记已读必须落盘并且单调：重复调用不倒退、不报错。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_persists_and_is_idempotent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let first = rpc(
+        &mut h,
+        910,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(first.get("error").is_none(), "first markRead: {first}");
+    let a = first["result"]["last_read_at"].as_u64().expect("watermark");
+
+    let second = rpc(
+        &mut h,
+        911,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(second.get("error").is_none(), "second markRead: {second}");
+    let b = second["result"]["last_read_at"]
+        .as_u64()
+        .expect("watermark");
+    assert!(b >= a, "the watermark must never go backwards: {a} -> {b}");
+
+    // 直接读盘：水位必须真的写进 meta，而不只是活在响应里。
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["last_read_at"].as_u64(),
+        Some(b),
+        "the watermark must be persisted: {on_disk}"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_rejects_an_unknown_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        912,
+        "thread/markRead",
+        serde_json::json!({ "threadId": "thread-nope" }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"], -32011,
+        "an unknown thread must be reported, not silently accepted: {resp}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_requires_control_scope() {
+    // Observe 是掩码级只读视图：它不得推进共享水位（那会让只读客户端
+    // 悄悄改变另一端的未读显示）。
+    let mut h = Harness::with_scope(Scope::Observe).await;
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        913,
+        "thread/markRead",
+        serde_json::json!({ "threadId": "thread-any" }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"], -32014,
+        "markRead must require Control: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 跨端清除蓝点的通道：`markRead` 成功后广播，且属列表层（恒推）。
+///
+/// 若被归为内容层，远程客户端只为窗口内会话订阅 → 窗口外会话的「已读」
+/// 同步不过去，另一端会一直亮着蓝点。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_broadcasts_a_list_level_read_state_update() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    rpc(
+        &mut h,
+        920,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "thread/readStateChanged", EVENT_WAIT)
+        .await
+        .expect("markRead must broadcast the new read state");
+    assert_eq!(frame["params"]["thread_id"], serde_json::json!(tid));
+    assert!(
+        frame["params"]["last_read_at"].as_u64().unwrap_or(0) > 0,
+        "the broadcast must carry the watermark: {frame}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 未订阅该会话的客户端也必须收到已读更新（钉住「恒推」这一层）。
+///
+/// 这是本设计的核心断言之一：远程客户端只为少数会话订阅内容。若把已读更新当
+/// 内容层过滤，订阅窗口**外**会话的「已读」就同步不到另一端——那正是用户报的
+/// 「手机读过、电脑仍亮」。故这里不只看 `delivery()` 的标签，而是真的经
+/// `write_notification` 往一个**只订阅了别的会话**的客户端投一帧。
+#[tokio::test(flavor = "multi_thread")]
+async fn read_state_reaches_an_unsubscribed_client() {
+    use crate::protocol::{Delivery, Notification};
+
+    let notification = Notification::ReadStateChanged {
+        thread_id: "t2".into(),
+        last_read_at: 5,
+        last_completed_at: 1,
+    };
+    assert_eq!(
+        notification.delivery(),
+        Delivery::List,
+        "read state is a list-level fact: filtering it by subscription would \
+         leave the other end's dot on forever"
+    );
+
+    let hub = crate::broadcast::Broadcaster::new();
+    let sub = crate::broadcast::ClientId::ws(uuid::Uuid::from_u128(7));
+    let mut rx = hub.register(sub.clone());
+    // 只订阅 t1：t2 的已读更新必须照样到达。
+    hub.subscribe(&sub, vec!["t1".to_string()]);
+
+    write_notification(&hub, &notification).await.unwrap();
+    let frame = rx
+        .try_recv()
+        .expect("an unsubscribed thread's read state must arrive");
+    assert_eq!(frame["method"], "thread/readStateChanged");
+    assert_eq!(frame["params"]["thread_id"], "t2");
+    assert_eq!(frame["params"]["last_completed_at"], 1);
+}
+
+/// 回合结束记 `last_completed_at`，且不动 `updated_at` 的既有语义。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_turn_records_its_completion_time() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert!(
+        meta["last_completed_at"].as_u64().unwrap_or(0) > 0,
+        "a finished turn must stamp last_completed_at: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `clear` / `compact` 不是回合结束：不得记完成时间。
+///
+/// 若记了，刚清空上下文的会话会凭空亮起蓝点——另一端看到「有东西没读」，
+/// 点进去却什么都没有。
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_does_not_record_a_completion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["last_completed_at"].as_u64(),
+        Some(0),
+        "clearing is not a completion: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `turn/completed` 必须自带完成时间。
+///
+/// 广播发生在落盘之前，客户端收到后立刻重拉列表会读到旧的 `last_completed_at`。
+/// 通知自带时间戳让客户端按 max 合并，那次竞态自然消失。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_completed_carries_its_completion_time() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 930, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn must report completion");
+    assert!(
+        frame["params"]["completed_at"].as_u64().unwrap_or(0) > 0,
+        "turn/completed must carry completed_at so the client can merge it \
+         without racing the persist: {frame}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 广播的完成时刻必须与落盘的是**同一个值**（而不是「广播一个、随后落盘另一个」）。
+///
+/// 这是一条容易漏掉、且只会在跨端场景暴露的顺序约束：`turn/completed` 在流循环
+/// 里就广播出去了，落盘发生在循环**之后**。若两处各取一次 `now_millis()`，落盘的
+/// 那个必然更晚。于是另一端收到通知立刻发 `thread/markRead` 时，写下的已读水位
+/// 会**低于**稍后才落盘的完成水位 ⇒ 服务端判为「读完之后又跑完了一轮」⇒ 重连
+/// 后蓝点复活。用户看到的现象就是「我明明在手机上读过了，电脑上又亮了」。
+///
+/// 断言取 `<=` 而非 `==`：要紧的是落盘值**不晚于**广播值（已读才能盖住它）。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persisted_completion_is_not_later_than_the_broadcast_one() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 933, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn must report completion");
+    let broadcast_at = frame["params"]["completed_at"]
+        .as_u64()
+        .expect("turn/completed must carry completed_at");
+
+    // 等到落盘真的发生（meta 里的完成水位出现），再比这一刻的两个值。
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut persisted_at = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        let path = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.meta.json"));
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                persisted_at = meta["last_completed_at"].as_u64().unwrap_or(0);
+                if persisted_at > 0 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(persisted_at > 0, "the turn's completion must reach disk");
+
+    assert!(
+        persisted_at <= broadcast_at,
+        "the persisted completion ({persisted_at}) must not be later than the \
+         broadcast one ({broadcast_at}): a client that marks the thread read on \
+         receiving turn/completed would otherwise write a read watermark that the \
+         server then considers older than the completion, and the dot comes back \
+         after reconnect"
+    );
+
+    h.shutdown().await;
+}
+
+/// 落盘失败（append 写不进去）**不得**连带丢掉「这一轮跑完了」这件事。
+///
+/// 两条失败是独立的：日志写失败只代表内容没存下来，回合本身确确实实结束了，用户
+/// 也在流里看到了输出。若把完成时刻的记账绑在 append 成功分支上，这一轮在未读
+/// 口径里就凭空消失——另一端重连后看不到任何「有新内容」的提示，直到下一轮跑完。
+///
+/// 失败注入：把 `<thread>.jsonl` 换成一个**目录**，`OpenOptions::append` 必然失败。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_append_still_records_the_completion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let log = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.jsonl"));
+    std::fs::create_dir_all(&log).expect("sabotage: the log path becomes a directory");
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 934, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn itself must still complete");
+    let broadcast_at = frame["params"]["completed_at"].as_u64().unwrap_or(0);
+    assert!(broadcast_at > 0);
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["last_completed_at"].as_u64().unwrap_or(0),
+        broadcast_at,
+        "a failed append must not swallow the completion stamp: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 新 RPC 必须归到 thread 域，否则会被静默映射成 `method_not_found`。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_routes_to_the_thread_domain() {
+    assert_eq!(domain_for("thread/markRead"), Domain::Thread);
+}
+
+/// `thread/delete` 必须把该会话的视图帧一并收走。
+///
+/// 帧表以 `thread_id` 为键、进程生命周期内常驻，且全仓库只有插没有删。
+/// `thread/view/read` 有 `require_known_thread` 前挡，故残留不影响正确性,
+/// 但每删一个看过 diff 的会话就永久留一份(单条上限 256 KiB)。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_delete_drops_the_view_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        // 直接注入一帧，等价于 `pump_git_diff_notifications` 写帧。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: Some("git log --oneline".to_string()),
+                as_kind: "text".to_string(),
+                exit_code: Some(0),
+                stdout: "x".repeat(1024),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+    assert!(
+        h.view_frames.lock().await.contains_key(&tid),
+        "precondition: the frame must be present before delete"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":30,"method":"thread/delete","params":{{"threadId":"{tid}","force":true}}}}"#
+    ))
+    .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(30)))
+        .await;
+
+    assert!(
+        !h.view_frames.lock().await.contains_key(&tid),
+        "thread/delete must drop the view frame for {tid}"
+    );
+    h.shutdown().await;
+}
+
+/// `image/read` 只应触碰被请求的那一段，而不是把整个文件读进内存再切片。
+///
+/// 判据用**相对比较**：同一个 20 MiB 文件，取最后一页 1 字节的耗时不应显著
+/// 高于取首页 1 字节。全量读实现下两者都是「读满 20 MiB」，比值接近 1 但
+/// **绝对开销与文件大小成正比**;区间读实现下两者都只碰 16 字节头 + 1 字节。
+/// 故这里改用更锐利的判据：页内字节数相同,比较 20 MiB 与 1 KiB 两个文件。
+#[tokio::test(flavor = "multi_thread")]
+async fn image_read_does_not_scale_with_file_size() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 两张「png」：魔数正确即可通过 guess_format，其余填充随机性无关。
+    let png_magic: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let big_path = dir.path().join("big.png");
+    let mut big = png_magic.to_vec();
+    big.resize(20 * 1024 * 1024, 0x41);
+    std::fs::write(&big_path, &big).unwrap();
+
+    let small_path = dir.path().join("small.png");
+    let mut small = png_magic.to_vec();
+    small.resize(1024, 0x41);
+    std::fs::write(&small_path, &small).unwrap();
+
+    // 取各自**最后一页**的第一字节：两者读取量都是 1 字节。
+    let big_offset = big.len() as u64 - 1;
+    let small_offset = small.len() as u64 - 1;
+
+    // 自由函数而不是闭包：闭包捕获 &mut h 后无法在循环里连续 await 两次。
+    async fn time_one_read(
+        h: &mut Harness,
+        tid: &str,
+        path: &str,
+        offset: u64,
+        id: u64,
+    ) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"image/read","params":{{"threadId":"{tid}","path":"{path}","offset":{offset},"maxBytes":1}}}}"#
+        ))
+        .await;
+        let v = h
+            .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(id)))
+            .await;
+        assert_eq!(v["result"]["nextOffset"], serde_json::Value::Null, "{v}");
+        started.elapsed()
+    }
+
+    // 各跑三次取最小值，压掉文件系统缓存冷启动的抖动。串行 await，
+    // 不能用 join!/select!——那会交错两次读取，测不出单次开销。
+    let mut big_best = std::time::Duration::MAX;
+    let mut small_best = std::time::Duration::MAX;
+    let mut id = 80u64;
+    for _ in 0..3 {
+        big_best = big_best.min(time_one_read(&mut h, &tid, "big.png", big_offset, id).await);
+        id += 1;
+        small_best =
+            small_best.min(time_one_read(&mut h, &tid, "small.png", small_offset, id).await);
+        id += 1;
+    }
+    assert!(
+        big_best < small_best * 4,
+        "one 1-byte read must not scale with file size: \
+         20MiB={big_best:?} 1KiB={small_best:?}"
+    );
+    h.shutdown().await;
+}
+
+/// `thread/diff/read` 不得把主循环占住。
+///
+/// 该臂在 async handler 里同步跑 git(5+ 次子进程)并全量读所有未跟踪文件。
+/// 判据:一条需要扫大量未跟踪文件的 diff 读取之后,紧随其后的 `thread/list`
+/// 必须很快应答——它证明主循环已经回到 `select!`。
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_read_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 一个没写进 .gitignore 的产物目录：60 个 8 MiB 未跟踪文件。
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+
+    // 先量基线：空载下一条 thread/list 的往返。
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":70,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(70)))
+        .await;
+    let baseline = t0.elapsed();
+
+    // 发一条 diff 读取，紧接着发 list：后者必须不被前者挡住。
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":71,"method":"thread/diff/read","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":72,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(72)))
+        .await;
+    let blocked = t1.elapsed();
+
+    // 相对判据：同一进程同一磁盘上，被挡住时是 1000 倍量级（实测 1101x）。
+    // 用 50 倍留足 CI 抖动余量，同时远小于阻塞量级。
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a diff read must not block the main loop: \
+         baseline={baseline:?} list_behind_diff={blocked:?}"
+    );
+    // 两条响应都得回来，确认 diff 本身也没被弄坏。
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(71)))
+        .await;
+    assert!(v["result"].is_object(), "diff/read must still answer: {v}");
+    h.shutdown().await;
+}
+
+/// `thread/diff/read` 的 panic 兜底必须按**调用方期望的形状**返回。
+///
+/// 整线程请求（只带 `threadId`，`useDiffState` 的 `loadThreadDiff` 发的就是
+/// 这个）期望 `ThreadDiffResult`；带 `commit` / `path` 的单文件请求期望
+/// `DiffTextResult`。两者字段不同，而前端 `setThreadDiff` 不做形状检查、
+/// `GitDiffView` 直接解引用 `files.length`——整线程请求若收到单文件形状，
+/// 面板必然崩。故钉死这两条兜底形状。
+#[test]
+fn diff_read_panic_fallback_matches_the_callers_shape() {
+    // 单文件请求：原样保留 DiffTextResult 形状。
+    let text = crate::rpc::thread::diff_read_fallback(true, Some("origin/main"));
+    assert_eq!(
+        text,
+        serde_json::json!({ "unifiedDiff": "", "truncated": false }),
+        "commit/path requests expect DiffTextResult and nothing else"
+    );
+
+    // 整线程请求：必须是字段齐全的空 ThreadDiffResult。
+    let whole = crate::rpc::thread::diff_read_fallback(false, Some("origin/main"));
+    assert_eq!(
+        whole,
+        serde_json::json!({
+            "base": "origin/main",
+            "baseKind": "none",
+            "mergeBase": serde_json::Value::Null,
+            "commits": [],
+            "files": [],
+            "unifiedDiff": "",
+            "truncated": false,
+        }),
+        "whole-thread requests expect a well-formed ThreadDiffResult"
+    );
+
+    // 无 `base` 时必须显式给 `null`，而不是把这个字段整个省掉。
+    let whole_no_base = crate::rpc::thread::diff_read_fallback(false, None);
+    assert_eq!(whole_no_base["base"], serde_json::Value::Null);
+}
+
+/// `thread/view/read?refresh=true` 同样不得占住主循环。
+///
+/// 它的 `structured_frame` 分支同步跑 thread_diff(5+ 次 git);命令帧分支虽然
+/// 是 async,但 `command_frame` 开头同步构造 SandboxPolicy,后者调
+/// `Path::canonicalize`(在已卸载的挂载点上会卡住),也不经过任何 await。
+#[tokio::test(flavor = "multi_thread")]
+async fn view_read_refresh_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+    {
+        // 结构化帧(无 command)：refresh 会走 structured_frame -> thread_diff。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: None,
+                as_kind: "diff".to_string(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":90,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(90)))
+        .await;
+    let baseline = t0.elapsed();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":91,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":92,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(92)))
+        .await;
+    let blocked = t1.elapsed();
+
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a view refresh must not block the main loop: \
+         baseline={baseline:?} list_behind_refresh={blocked:?}"
+    );
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(91)))
+        .await;
+    assert!(v["result"].is_object(), "view/read must still answer: {v}");
     h.shutdown().await;
 }

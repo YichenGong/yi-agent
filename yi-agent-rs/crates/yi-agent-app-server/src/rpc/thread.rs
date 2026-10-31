@@ -547,11 +547,14 @@ pub(crate) async fn handle(
                 catalog,
                 yolo,
                 process_manager,
+                mcp,
                 ..
             } = activation.built;
             state
                 .pending_activation
                 .insert(thread_id.clone(), activation.runtime);
+            // MCP 配置固定在 thread cwd 下,与 `build_runtime_tooling` 同源。
+            let mcp_workdir = std::path::PathBuf::from(cwd.as_str());
 
             let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
             let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -560,6 +563,10 @@ pub(crate) async fn handle(
             // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
             // driver 拿一份用于推送 `thread/status/updated`。
             let store_status = ThreadSession::new_status();
+            // 与 driver 同处创建：resume 会重建 driver，跨 resume 复用 sender
+            // 会让新 driver 永远收不到（旧 sender 的接收端已随旧 driver 退出）。
+            let (subagent_tx, subagent_rx) =
+                tokio::sync::watch::channel(crate::protocol::SubagentTotals::default());
             state.threads.insert(
                 thread_id.clone(),
                 ThreadSession {
@@ -575,6 +582,7 @@ pub(crate) async fn handle(
                     session_tx,
                     store: Arc::clone(&thread_store),
                     status: Arc::clone(&store_status),
+                    subagent_tx,
                 },
             );
 
@@ -618,6 +626,9 @@ pub(crate) async fn handle(
                 Arc::clone(&store_status),
                 provider,
                 config,
+                subagent_rx,
+                mcp,
+                mcp_workdir,
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。
@@ -665,6 +676,12 @@ pub(crate) async fn handle(
                         total_output_tokens: totals.output_tokens,
                         total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
                         total_cache_read_input_tokens: totals.cache_read_input_tokens,
+                        // 回放不带 subagent 汇总：它由 children watch 在会话恢复后
+                        // 推送（Task 5）。这里给 0 而不是省略字段，客户端因此不必
+                        // 处理「缺失」这一种额外状态。
+                        subagent_input_tokens: 0,
+                        subagent_output_tokens: 0,
+                        subagent_cache_read_tokens: 0,
                     },
                 )
                 .await?;
@@ -688,6 +705,9 @@ pub(crate) async fn handle(
                         turn_id: "crashed".to_string(),
                         status: TurnStatus::Interrupted,
                         error: None,
+                        // 崩溃那轮从未走到收尾，meta 里没有它的完成时间；
+                        // 回放这一刻即客户端「得知它结束」的时刻。
+                        completed_at: Some(crate::thread_store::now_millis()),
                     },
                 )
                 .await?;
@@ -1374,6 +1394,68 @@ pub(crate) async fn handle(
                 }
             }
         }
+        // 推进某会话的**共享已读水位**（任一端读过 → 所有端的蓝点消失）。
+        //
+        // 与 `thread/setTag` 同档（Control 起）：`Observe` 是掩码级只读视图，
+        // 它不得推进共享水位——那会让一个只读客户端悄悄改变另一端的未读显示。
+        "thread/markRead" => {
+            if state.client_scope < Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            let store = store_lookup(state.threads, state.workspaces, state.cfg, &thread_id);
+            match store.mark_read(&thread_id) {
+                Ok(Some((last_read_at, last_completed_at))) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        ok_response(id, json!({ "last_read_at": last_read_at })),
+                    )
+                    .await?;
+                    // 广播给所有客户端（含本端）：列表层恒推。这正是「手机点开、
+                    // 桌面蓝点同时消失」的通道——若归内容层，未订阅该会话的远程
+                    // 客户端就收不到，另一端会一直亮着。
+                    //
+                    // 即便水位没推进（重复点开同一会话）也照发：它是一次廉价的
+                    // 收敛信号，能让刚重连、还停在旧水位的另一端就地补齐。
+                    let _ = write_notification(
+                        state.hub,
+                        &Notification::ReadStateChanged {
+                            thread_id: thread_id.clone(),
+                            last_read_at,
+                            last_completed_at,
+                        },
+                    )
+                    .await;
+                }
+                Ok(None) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::unknown_thread(&thread_id)),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?;
+                }
+            }
+        }
         // 会话分组的四个写操作。与 `thread/setTag` 同档（Control 起），参数校验
         // 一律先于存在性：非法输入只可能是客户端 bug，越早拒绝越不会留下半状态。
         // 四个臂共用同一段实现与同一条收尾：写成功后广播 `thread/groupsChanged`。
@@ -1534,15 +1616,21 @@ pub(crate) async fn handle(
                 .unwrap_or(false);
             // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
             // 顺手把 driver_project 拷到局部变量：会话文件随后即被删除，
-            // 到执行删除时再 load 只会失败，故必须在此刻留下。
+            // 到执行删除时再读只会失败，故必须在此刻留下。
+            //
+            // 用 `read_meta` 而不是 `load`：这里只要 meta 的三个字段，
+            // 而 `load` 会把整份对话 jsonl 解析一遍（主循环上的无谓阻塞 IO，
+            // 与 `thread/diff/read` 同类）。计数语义不变：`load` 在 meta 缺失
+            // 时走 `rebuild_meta`，其对 `driver_ref` / `driver_project` 都填
+            // `None`，与 `read_meta` 返回 `None` 落到同一分支。
             let mut driver_project: Option<String> = None;
-            let reclaim = match thread_store.load(&thread_id) {
-                Ok(Some(loaded)) => {
-                    driver_project = loaded.meta.driver_project.clone();
+            let reclaim = match thread_store.read_meta(&thread_id) {
+                Ok(Some(meta)) => {
+                    driver_project = meta.driver_project.clone();
                     crate::worktree_reclaim::decide(
-                        loaded.meta.driver_ref.as_deref(),
-                        loaded.meta.driver_project.as_deref(),
-                        Path::new(&loaded.meta.cwd),
+                        meta.driver_ref.as_deref(),
+                        meta.driver_project.as_deref(),
+                        Path::new(&meta.cwd),
                     )
                 }
                 _ => crate::worktree_reclaim::WorktreeReclaim::None,
@@ -1630,6 +1718,10 @@ pub(crate) async fn handle(
             if let Some(watch) = state.process_watches.remove(&thread_id) {
                 watch.stop().await;
             }
+            // 视图帧与 thread 同生命周期:帧表按 thread_id 索引,不清理就永久驻留。
+            // `thread/view/read` 有 `require_known_thread` 前置检查,故此处不影响
+            // 正确性,只是不让已删会话的帧继续占内存。
+            state.view_frames.lock().await.remove(&thread_id);
             let live_cwds = state
                 .threads
                 .values()
@@ -1833,22 +1925,94 @@ pub(crate) async fn handle(
                 .map(|t| t.cwd.clone())
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| state.cfg.workdir.display().to_string());
-            let repo = Path::new(&cwd);
-            let base = req.params.get("base").and_then(|v| v.as_str());
-            let result = if let Some(commit) = req.params.get("commit").and_then(|v| v.as_str()) {
-                let (unified_diff, truncated) = crate::git_diff::commit_diff(repo, commit);
-                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
-            } else if let Some(path) = req.params.get("path").and_then(|v| v.as_str()) {
-                // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
-                let d = crate::git_diff::thread_diff(repo, base, None);
-                let (unified_diff, truncated) =
-                    crate::git_diff::file_diff(repo, d.merge_base.as_deref(), path);
-                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
-            } else {
-                serde_json::to_value(crate::git_diff::thread_diff(repo, base, None))
-                    .unwrap_or(json!(null))
-            };
-            write_response(state.hub, state.client, ok_response(id, result)).await?;
+            // 计算搬到**独立 task** 里做,而不是在本臂内联等待。理由与
+            // `thread/listAll` 逐字相同:这一臂要跑 5+ 次 git 子进程,并读每个
+            // 未跟踪文件(判二进制 / 合成 unified diff;每个文件只读一趟、超过
+            // `MAX_UNTRACKED_FILE_BYTES` 就不读正文)。盘慢、目录多时这段同步
+            // IO 会把主循环整个占住,期间收到的 `turn/interrupt` 只能干等,
+            // 用户看到的是「点了 Stop 没反应」。
+            //
+            // 主 runtime 是多线程的(`crates/yi-agent/src/main.rs` 里用
+            // `tokio::runtime::Runtime::new()` 建的就是多线程 runtime;本 crate
+            // 没有 `#[tokio::main]` 属性)。把计算挪到别的 worker 后,主循环
+            // 立刻回到 `select!`。
+            //
+            // 代价是计算期间不能借 `AppState`:故先把参数快照成纯值。
+            let repo = std::path::PathBuf::from(&cwd);
+            let base = req
+                .params
+                .get("base")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let commit = req
+                .params
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let path = req
+                .params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // 兜底应答的形状取决于请求种类(`commit` / `path` = 单文件,其余 =
+            // 整线程)。必须在参数被移进阻塞闭包之前定下来,否则 panic 分支只剩
+            // 一个通用形状可选,而两个调用方的契约并不相同。
+            let wants_text = commit.is_some() || path.is_some();
+            let fallback_base = base.clone();
+            let hub = Arc::clone(state.hub);
+            let client = state.client.clone();
+            tokio::spawn(async move {
+                let computed = tokio::task::spawn_blocking(move || {
+                    // 这一位描述的是**本线程这一次**计算：先清，算完再取走。
+                    crate::git_diff::reset_git_timeout();
+                    let body = if let Some(commit) = commit {
+                        let (unified_diff, truncated) =
+                            crate::git_diff::commit_diff(&repo, &commit);
+                        json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                    } else if let Some(path) = path {
+                        // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
+                        let d = crate::git_diff::thread_diff(&repo, base.as_deref(), None);
+                        let (unified_diff, truncated) =
+                            crate::git_diff::file_diff(&repo, d.merge_base.as_deref(), &path);
+                        json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                    } else {
+                        serde_json::to_value(crate::git_diff::thread_diff(
+                            &repo,
+                            base.as_deref(),
+                            None,
+                        ))
+                        .unwrap_or(json!(null))
+                    };
+                    let timed_out = crate::git_diff::take_git_timeout();
+                    (body, timed_out)
+                })
+                .await;
+                match computed {
+                    // 超时分支没有可信的 body 可用，故不绑定它。
+                    Ok((_body, true)) => {
+                        // git 超时时 `git_ok` 的 `None` 无法与「真没有改动」区分,
+                        // 若照常回 body 就会把挂住的仓库渲染成「没有改动」。
+                        // 按 spec §4.3:这种情形应当失败,而不是沉默地报空。
+                        let _ = write_response(
+                            &hub,
+                            &client,
+                            err_response(id, RpcError::internal("git timed out")),
+                        )
+                        .await;
+                    }
+                    Ok((body, false)) => {
+                        let _ = write_response(&hub, &client, ok_response(id, body)).await;
+                    }
+                    Err(error) => {
+                        // 只在 panic 时到这里。回一个合法形状的空结果,而不是
+                        // 静默丢响应——后者会让客户端一直等。
+                        eprintln!("[app-server] thread/diff/read task failed: {error}");
+                        let body = diff_read_fallback(wants_text, fallback_base.as_deref());
+                        let _ = write_response(&hub, &client, ok_response(id, body)).await;
+                    }
+                }
+            });
+            return Ok(Flow::Continue);
         }
         "thread/view/read" => {
             // 读回**帧**（模型给命令 / 结构化默认），与 `thread/diff/read` 的
@@ -1878,25 +2042,30 @@ pub(crate) async fn handle(
                 // 重算这一帧：**分叉**在「这一帧原本是命令帧还是结构化默认」上。
                 // 命令帧重跑同一条命令（模型可重复观察同一视角）；结构化默认则
                 // 重算锚点 diff（工作区在这期间变了，重读必须反映新内容）。
+                //
+                // 与 `thread/diff/read` 同一理由搬进独立 task：结构化分支同步跑
+                // thread_diff(5+ 次 git),命令分支虽 async 但开头同步
+                // `Path::canonicalize`(挂载点失效时会卡住),都不该压在主循环上。
                 let cwd = state
                     .threads
                     .get(&thread_id)
                     .map(|t| t.cwd.clone())
                     .filter(|c| !c.is_empty())
                     .unwrap_or_else(|| state.cfg.workdir.display().to_string());
-                let repo = Path::new(&cwd);
+                let repo = std::path::PathBuf::from(&cwd);
+                // 只要 meta 的 `anchor_sha`：`load` 会把整份对话 jsonl 解析一遍,
+                // 那是本任务要消除的主循环阻塞类 IO。同 `rpc/mod.rs:70` 的
+                // `store.read_meta(thread_id)` 取法。
                 let anchor = state
                     .threads
                     .get(&thread_id)
-                    .and_then(|t| t.store.load(&thread_id).ok().flatten())
-                    .and_then(|l| l.meta.anchor_sha);
-                // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
-                // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个
-                // future 非 `Send`，直接编译不过。
+                    .and_then(|t| t.store.read_meta(&thread_id).ok().flatten())
+                    .and_then(|m| m.anchor_sha);
+                // 分两次短暂持锁，**不**把 guard 跨过 await：`serve()` 跑在
+                // `tokio::spawn` 里，guard 过 await 会让整个 future 非 `Send`。
                 // 快照连**基准来历**一起取：结构化帧可能是「模型指定的基准」
                 // (`base_kind == "explicit"`)，重算时必须原样再用那个 base——
-                // 只传 `explicit=None` 会让它退化成会话锚点，帧与回执就从
-                // 「跟 origin/main 比」变成「本次会话以来」，正是 D3 的误导。
+                // 只传 `explicit=None` 会让它退化成会话锚点。
                 let snapshot = state
                     .view_frames
                     .lock()
@@ -1907,33 +2076,82 @@ pub(crate) async fn handle(
                 let explicit = snapshot.as_ref().and_then(|(_, base, kind)| {
                     (kind == "explicit").then(|| base.clone()).flatten()
                 });
-                let next = match command.as_deref() {
-                    Some(command) => {
-                        crate::git_diff::command_frame(repo, command, None, None).await
+                let hub = Arc::clone(state.hub);
+                let client = state.client.clone();
+                let view_frames = Arc::clone(state.view_frames);
+                let tid_for_task = thread_id.clone();
+                tokio::spawn(async move {
+                    let next = match command.as_deref() {
+                        // 命令帧：`command_frame` 是 async(tokio::process + 超时)，
+                        // 放进本 task 即已脱离主循环。
+                        Some(command) => {
+                            crate::git_diff::command_frame(&repo, command, None, None).await
+                        }
+                        // 结构化帧：全同步(5+ 次 git_ok)，必须进 blocking 池。
+                        None => {
+                            let repo = repo.clone();
+                            let explicit = explicit.clone();
+                            let anchor = anchor.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                crate::git_diff::structured_frame(
+                                    &repo,
+                                    explicit.as_deref(),
+                                    anchor.as_deref(),
+                                )
+                            })
+                            .await
+                            {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    eprintln!("[app-server] view refresh task failed: {error}");
+                                    // 算不出来就回读已有帧（CAS 阶段会读到它），
+                                    // 不写坏帧、不丢响应。
+                                    let existing = view_frames.lock().await;
+                                    match existing.get(&tid_for_task) {
+                                        Some(f) => f.clone(),
+                                        None => {
+                                            // 没有既有帧可回读时**也必须应答**：直接
+                                            // return 会把这个响应的 promise 永远吊着，
+                                            // 桌面 RPC 客户端没有单请求超时。空值与
+                                            // 非 refresh 路径「无帧」的应答同形。
+                                            eprintln!(
+                                                "[app-server] view refresh has no frame to fall back on"
+                                            );
+                                            drop(existing);
+                                            let _ = write_response(
+                                                &hub,
+                                                &client,
+                                                ok_response(id, json!(null)),
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间
+                    // 隔了一次 await（最多 VIEW_TIMEOUT）。期间别的写入者（另一次
+                    // refresh、或 Task 4 的 watcher）可能已经写了更新的帧；若无条件
+                    // 覆盖，面板就会显示与「刚刚请求的命令」不符的内容。
+                    // 判定：槽里的命令仍等于我们读到的快照才写。
+                    // 边界：判据只有 `command`，故它只对**命令帧**有区分力——两条
+                    // 都是结构化帧时区分不出先后，后果仅是多算一遍，不产生错标。
+                    let mut frames = view_frames.lock().await;
+                    let unchanged = frames.get(&tid_for_task).and_then(|f| f.command.as_deref())
+                        == command.as_deref();
+                    if unchanged {
+                        frames.insert(tid_for_task.clone(), next);
                     }
-                    None => crate::git_diff::structured_frame(
-                        repo,
-                        explicit.as_deref(),
-                        anchor.as_deref(),
-                    ),
-                };
-                // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间隔了
-                // 一次 await（最多 `VIEW_TIMEOUT`）。期间别的写入者（另一次 refresh、
-                // 或 Task 4 的 watcher）可能已经写了更新的帧；若无条件覆盖，面板就会
-                // 显示与「刚刚请求的命令」不符的内容——正是 D3 要杜绝的误导。
-                // 判定：槽里的命令仍等于我们读到的快照才写。
-                // 边界（如实记下）：判据只有 `command`，故它只对**命令帧**有区分力
-                // ——命令一旦不同必让位给更晚的写入者（下面的 result 会读到它）。
-                // 两条都是结构化帧（`command == None`）时这里区分不出先后，更晚的
-                // 结构化写入者仍可能被本次覆盖；那种情况下两边都是刚算出的自洽帧，
-                // 后果仅是多算一遍，不产生错标。
-                let mut frames = state.view_frames.lock().await;
-                let unchanged =
-                    frames.get(&thread_id).and_then(|f| f.command.as_deref()) == command.as_deref();
-                if unchanged {
-                    frames.insert(thread_id.clone(), next);
-                }
-                drop(frames);
+                    let result = frames
+                        .get(&tid_for_task)
+                        .map(|f| serde_json::to_value(f).unwrap_or(json!(null)))
+                        .unwrap_or(json!(null));
+                    drop(frames);
+                    let _ = write_response(&hub, &client, ok_response(id, result)).await;
+                });
+                return Ok(Flow::Continue);
             }
             let result = state
                 .view_frames
@@ -2122,6 +2340,34 @@ pub(crate) fn scan_workspace_metas_for_test(
     seed_lead: bool,
 ) -> Vec<(String, Option<Vec<crate::thread_store::ThreadMeta>>)> {
     scan_workspace_metas(dirs, seed_lead)
+}
+
+/// `thread/diff/read` 在阻塞计算 panic 时的兜底应答体。
+///
+/// 两个调用方的契约不同,不能共用一种形状:
+/// - 带 `commit` / `path` 的**单文件**请求 → `DiffTextResult`
+///   (`{unifiedDiff, truncated}`,`desktop/src/lib/protocol.ts`)。
+/// - 只带 `threadId` 的**整线程**请求(前端 `loadThreadDiff` 发的就是这个)
+///   → `ThreadDiffResult`。前端不做形状检查,直接 `setThreadDiff(r)` 后由
+///   `GitDiffView` 解引用 `diff.files.length`;少给字段不是「显示无改动」而是
+///   渲染期抛错。
+///
+/// 只在 `spawn_blocking` panic 时走到,属降级路径,故 `baseKind` 取 `"none"`。
+pub(crate) fn diff_read_fallback(wants_text: bool, base: Option<&str>) -> serde_json::Value {
+    if wants_text {
+        return json!({ "unifiedDiff": "", "truncated": false });
+    }
+    // 字段必须是**齐的**:`ThreadDiff` 带 `#[serde(rename_all = "camelCase")]`,
+    // 故这里是 camelCase 而非 snake_case。
+    json!({
+        "base": base,
+        "baseKind": "none",
+        "mergeBase": serde_json::Value::Null,
+        "commits": [],
+        "files": [],
+        "unifiedDiff": "",
+        "truncated": false,
+    })
 }
 
 /// 构造 `thread/listAll` 的应答体（纯函数，可离开主循环执行）。

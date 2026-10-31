@@ -52,10 +52,7 @@ pub(crate) fn run_onboarding_prompt(models_path: &Path, prefs_path: &Path) -> Re
     println!("欢迎使用 yi-agent。先配置一个模型就能开始对话。\n");
 
     let provider = loop {
-        let raw = read_line_or(
-            "API 格式 [anthropic/openai]（默认 anthropic）: ",
-            "anthropic",
-        )?;
+        let raw = read_line_or("API 格式 [openai/anthropic]（默认 openai）: ", "openai")?;
         if yi_agent_runtime::models::ModelProvider::parse(&raw).is_some() {
             break raw.to_ascii_lowercase();
         }

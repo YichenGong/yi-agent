@@ -177,7 +177,7 @@ fn sidecar_args(relay: Option<&str>) -> Vec<String> {
 /// without touching the process env or the filesystem. Unset or blank in both
 /// places → `None`, which reproduces the original stdio-only spawn exactly.
 fn configured_relay() -> Option<String> {
-    let home = home_dir();
+    let home = instance_home();
     configured_relay_in(home.as_deref())
 }
 
@@ -206,6 +206,52 @@ fn resolve_relay(env: Option<&str>, stored: Option<&str>) -> Option<String> {
 /// The home directory, or `None` when the platform cannot report one.
 fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
+}
+
+/// 实例状态根：`YI_AGENT_HOME` 优先，否则 `<home>/.yi-agent`。
+///
+/// 与 `yi_agent_store::paths::instance_home_from` 同一套归一化：覆盖值若不以
+/// `.yi-agent` 结尾会自动补上，这样所有消费者都能安全地拼 `.yi-agent/...`，
+/// 不会出现 `<dir>/.yi-agent/.yi-agent/...` 的双重嵌套。桌面壳刻意不依赖
+/// app-server crate，故此处镜像同一规则（sidecar 侧读的是同一个环境变量，
+/// 两侧因此解析到同一个目录）。
+fn instance_home_from(
+    override_value: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(dir) = override_value.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        // 纯空白不算有效覆盖：`YI_AGENT_HOME="   "` 多半是启动脚本写错了。
+        if dir.as_os_str().to_string_lossy().trim().is_empty() {
+            // fall through to the default
+        } else if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+            return Some(dir);
+        } else {
+            return Some(dir.join(".yi-agent"));
+        }
+    }
+    home.map(|home| home.join(".yi-agent"))
+}
+
+/// 进程级的实例状态根：`YI_AGENT_HOME` 环境变量 + `dirs::home_dir()`。
+fn instance_home() -> Option<PathBuf> {
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty());
+    instance_home_from(override_value.as_deref(), home_dir().as_deref())
+}
+
+/// sidecar 进程的工作目录：实例 home 的**父目录**（sidecar 自己拼 `.yi-agent`）。
+///
+/// 打包 app 从 Finder 启动时继承 `/`，会让 agent 的 workdir（及其 runtime 目录）
+/// 变成文件系统根，故必须显式锚定到一个真实目录。
+fn sidecar_cwd_from(
+    override_value: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    instance_home_from(override_value, home).map(|dir| {
+        dir.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.clone())
+    })
 }
 
 /// `<home>/.yi-agent/preferences.json` — the file the sidecar reads/writes when
@@ -278,7 +324,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// and the setting would not take effect until the next exit.
 #[tauri::command]
 pub fn set_relay_url(app: AppHandle, url: Option<String>) -> Result<(), String> {
-    let home = home_dir().ok_or_else(|| "home directory is unavailable".to_string())?;
+    let home = instance_home().ok_or_else(|| "home directory is unavailable".to_string())?;
     save_relay_url(&home, url.as_deref()).map_err(|error| error.to_string())?;
     // 不把 URL 打进日志(设计 §5.5):只说是否已配置。
     let configured = url
@@ -326,11 +372,13 @@ fn spawn_once(app: &AppHandle) -> Result<tauri::async_runtime::Receiver<CommandE
 
     // A bundled app launched from Finder inherits `/` as its cwd, which would
     // make the agent's workdir (and its runtime directory) the filesystem root.
-    // Anchor the sidecar to the user's home directory so packaged and dev
-    // launches behave predictably.
-    match app.path().home_dir() {
-        Ok(home) => cmd = cmd.current_dir(home),
-        Err(e) => eprintln!("[sidecar] home_dir unavailable, using inherited cwd: {e}"),
+    // Anchor the sidecar to the instance home so packaged and dev launches
+    // behave predictably, and so a second app (`YI_AGENT_HOME`) gets its own
+    // runtime/threads instead of sharing the first app's.
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty());
+    match sidecar_cwd_from(override_value.as_deref(), home_dir().as_deref()) {
+        Some(dir) => cmd = cmd.current_dir(dir),
+        None => eprintln!("[sidecar] home_dir unavailable, using inherited cwd"),
     }
 
     let (rx, child) = cmd
@@ -655,5 +703,81 @@ mod tests {
         assert_eq!(next_restart_delay(5), Duration::from_millis(5_000));
         assert_eq!(next_restart_delay(50), Duration::from_millis(5_000));
         assert_eq!(next_restart_delay(u32::MAX), Duration::from_millis(5_000));
+    }
+
+    /// `YI_AGENT_HOME` 非空时赢，且不以 `.yi-agent` 结尾会自动补上。
+    #[test]
+    fn instance_home_prefers_a_non_blank_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let value = dir.path().as_os_str().to_owned();
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            instance_home_from(Some(&value), Some(home)),
+            Some(dir.path().join(".yi-agent"))
+        );
+    }
+
+    /// 覆盖值已经叫 `.yi-agent` 时不再嵌套。
+    #[test]
+    fn instance_home_does_not_double_nest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let value = dir.path().join(".yi-agent");
+        assert_eq!(
+            instance_home_from(Some(value.as_os_str()), None),
+            Some(value)
+        );
+    }
+
+    /// 空白覆盖视同未设置，退化为 `<home>/.yi-agent`。
+    #[test]
+    fn instance_home_ignores_a_blank_override() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            instance_home_from(Some(std::ffi::OsStr::new("")), Some(home)),
+            Some(home.join(".yi-agent"))
+        );
+        assert_eq!(
+            instance_home_from(Some(std::ffi::OsStr::new("   ")), Some(home)),
+            Some(home.join(".yi-agent"))
+        );
+    }
+
+    /// 两侧都缺 → None。
+    #[test]
+    fn instance_home_is_none_without_any_home() {
+        assert_eq!(instance_home_from(None, None), None);
+    }
+
+    /// relay 偏好落在实例 home，而不是真实 `~`。
+    #[test]
+    fn configured_relay_reads_the_instance_home_preferences() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path();
+        save_relay_url(home, Some("wss://instance/connect?session=i")).unwrap();
+        assert_eq!(
+            load_relay_url(home).as_deref(),
+            Some("wss://instance/connect?session=i")
+        );
+        // 落点确认：写在 `<instance home>/.yi-agent/preferences.json`。
+        assert!(home.join(".yi-agent").join("preferences.json").is_file());
+    }
+
+    /// sidecar 的 cwd 用实例 home 的父目录，而不是真实 `~`。
+    #[test]
+    fn sidecar_cwd_prefers_the_instance_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let value = dir.path().as_os_str().to_owned();
+        assert_eq!(
+            sidecar_cwd_from(Some(&value), None),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    /// 没有覆盖值时 cwd 退化为 `<home>`（sidecar 自己拼 `.yi-agent`）。
+    #[test]
+    fn sidecar_cwd_falls_back_to_the_platform_home() {
+        let home = Path::new("/Users/example");
+        assert_eq!(sidecar_cwd_from(None, Some(home)), Some(home.to_path_buf()));
+        assert_eq!(sidecar_cwd_from(None, None), None);
     }
 }

@@ -8,7 +8,9 @@ import { SettingsPluginsTab } from "./SettingsPluginsTab";
 import { SettingsModelsTab } from "./SettingsModelsTab";
 import { SettingsSkillsTab } from "./SettingsSkillsTab";
 import { SettingsMcpTab } from "./SettingsMcpTab";
+import { SettingsWebSearchTab } from "./SettingsWebSearchTab";
 import type { McpCall } from "../lib/mcp";
+import type { WebSearchCall } from "../lib/websearch";
 import type { SkillsCall } from "../lib/skills";
 import { SettingsTagsTab } from "./SettingsTagsTab";
 import { SettingsFlagsTab, type FlagsCall } from "./SettingsFlagsTab";
@@ -22,6 +24,7 @@ const TABS = [
   { id: "models", label: "模型" },
   { id: "skills", label: "技能" },
   { id: "mcp", label: "MCP" },
+  { id: "websearch", label: "网页搜索" },
   { id: "tags", label: "标签" },
   // 只有 dev 构建可见；过滤在渲染期做（见 `visibleTabs`），常量表保持完整。
   { id: "flags", label: "实验功能" },
@@ -49,6 +52,7 @@ export function SettingsDialog({
   skillsProjects,
   skillsDefaultProject,
   mcpCall,
+  websearchCall,
   mcpProjects,
   mcpDefaultProject,
   pluginProjects,
@@ -99,6 +103,8 @@ export function SettingsDialog({
   pluginDefaultProject?: string;
   /** 「MCP」Tab 的宿主 RPC 接缝（mcp/list）。 */
   mcpCall?: McpCall;
+  /** 「网页搜索」Tab 的宿主 RPC 接缝（websearch/get|set|test）。 */
+  websearchCall?: WebSearchCall;
   /** 「MCP」Tab 可选的配置项目（绝对路径）。 */
   mcpProjects?: string[];
   /** 「MCP」Tab 首选项目（当前对话的工作目录）。 */
@@ -349,6 +355,8 @@ export function SettingsDialog({
                 projects={mcpProjects ?? []}
                 defaultProject={mcpDefaultProject}
               />
+            ) : active === "websearch" && websearchCall ? (
+              <SettingsWebSearchTab call={websearchCall} />
             ) : active === "tags" ? (
               <SettingsTagsTab
                 tagNames={tagNames ?? DEFAULT_TAG_NAMES}

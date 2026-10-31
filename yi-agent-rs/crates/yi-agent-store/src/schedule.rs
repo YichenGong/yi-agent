@@ -174,6 +174,33 @@ pub struct WatchdogUsage {
     pub provider_retries: u16,
     pub tool_retries: u16,
     pub rework_cycles: u16,
+    /// 分项：provider 调用的 input tokens 之和。
+    ///
+    /// `tokens` 仍是 input+output（watchdog 的预算判断依赖它），分项是**额外**记录，
+    /// 供会话级展示按项拆开。`serde(default)` 让本次改造前落盘的 `usage_json`
+    /// （没有这些键）照样能读，读出来是 0——`usage_json` 是自由格式 JSON 文本列，
+    /// 加字段不需要 schema 迁移。
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// 分项：provider 调用的 output tokens 之和。
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 分项：provider 调用的 cache read tokens 之和。
+    ///
+    /// 只记 cache read：用户口径明确只关注缓存**读取**量，cache write 不统计。
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+/// 一次 watchdog 进度上报里携带的 token 分项增量。
+///
+/// 与 `record_watchdog_progress` 的 `token_delta` 分开：后者维持既有
+/// `WatchdogUsage::tokens` 语义（input+output，供预算判断），本类型只负责分项记账。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WatchdogTokenDelta {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 /// Inputs originate in durable attempt facts. In particular,

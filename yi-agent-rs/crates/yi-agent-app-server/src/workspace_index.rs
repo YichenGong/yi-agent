@@ -50,8 +50,32 @@ impl WorkspaceIndex {
     }
 
     /// 当前目录列表,最近的在前。
+    ///
+    /// **这是目录发现的权威全集**:`thread/listAll` 靠它找冷会话、`store_lookup`
+    /// 靠它定位 thread、`collect_pinned` 靠它跨目录收置顶项。插件划出的 worktree
+    /// 也必须在里面——卡片会话的 cwd 就是那儿,摘掉它会话会从侧栏消失。
+    /// 只在展示层过滤的见 [`WorkspaceIndex::picker_list`]。
     pub fn list(&self) -> Vec<String> {
         self.read().dirs
+    }
+
+    /// 「New thread」下拉用的目录列表。
+    ///
+    /// 与 [`WorkspaceIndex::list`] 的唯一差别:**滤掉插件 worktree**
+    /// (`.worktrees/<namespace>/<slug>`,如看板卡片与合并轮)。
+    ///
+    /// 那些目录是插件在建卡片会话时由 `thread/start` 顺带写进索引的,不是用户挑的
+    /// 文件夹。真机上它们能占满整份索引(十几个 `2026-10-31-xxx-design-...`),
+    /// 菜单里混着它们,用户就没法一眼找到自己的项目。
+    ///
+    /// 过滤放在**读**路径而不是**写**路径:写路径不能省(见 [`Self::list`] 的说明),
+    /// 而历史索引里已经积下的那些条目也只能在这里挡住。
+    pub fn picker_list(&self) -> Vec<String> {
+        self.read()
+            .dirs
+            .into_iter()
+            .filter(|dir| !crate::plugin_worktree::is_plugin_worktree(Path::new(dir)))
+            .collect()
     }
 
     /// 加入并置顶(去重)。path 应为已 canonicalize 的绝对路径。
@@ -429,6 +453,27 @@ mod tests {
         idx.link(Path::new("/tmp/wsidx-u"), Path::new("/tmp/wsidx-u2"))
             .unwrap_err(); // u2 不存在
         idx.unlink(Path::new("/tmp/wsidx-u2")).unwrap();
+    }
+
+    /// 「New thread」菜单只看**用户亲手加过**的目录：插件划出的 worktree
+    /// （`.worktrees/kanban/<slug>`）由卡片会话顺带写进索引，必须不进这一份视图。
+    #[test]
+    fn picker_list_hides_plugin_worktrees() {
+        let (_d, idx) = index();
+        idx.add(Path::new("/tmp/project")).unwrap();
+        idx.add(Path::new("/tmp/project/.worktrees/kanban/card-1"))
+            .unwrap();
+        idx.add(Path::new("/tmp/other")).unwrap();
+        idx.add(Path::new("/tmp/project/.worktrees/kanban-merge/main"))
+            .unwrap();
+
+        assert_eq!(
+            idx.picker_list(),
+            vec!["/tmp/other".to_string(), "/tmp/project".to_string()],
+            "card / merge worktrees are not user-chosen folders"
+        );
+        // 索引本身不动：`thread/listAll` 仍靠它发现卡片会话。
+        assert_eq!(idx.list().len(), 4);
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
 pub(crate) mod ui;
+pub(crate) mod websearch;
 pub(crate) mod workspace;
 
 use std::collections::HashMap;
@@ -265,6 +266,9 @@ pub(crate) enum Domain {
     Skill,
     /// `mcp/*`(设置页 MCP 面板:项目级 mcp.json + 工具 schema 缓存的只读视图)。
     Mcp,
+    /// `websearch/*`(设置页「网页搜索」面板:机器级 websearch.json 的读写与
+    /// 连通性测试)。
+    WebSearch,
     /// `flags/*` 与 `build/*`（功能开关面板 + 构建类型查询）。
     Flags,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
@@ -296,6 +300,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("turn") => Domain::Turn,
         Some("skill") => Domain::Skill,
         Some("mcp") => Domain::Mcp,
+        Some("websearch") => Domain::WebSearch,
         Some("flags") | Some("build") => Domain::Flags,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
@@ -342,6 +347,9 @@ pub(crate) struct AppState<'a> {
     /// 机器级模型清单路径(`~/.yi-agent/models.json`)。搬移前臂里的
     /// `models_path`。
     pub(crate) models_path: &'a Path,
+    /// 网页搜索配置文件路径（`~/.yi-agent/websearch.json`）。可注入，让测试
+    /// 不必改 `HOME` 这类进程全局量。搬移前臂里的 `websearch_path`。
+    pub(crate) websearch_path: &'a Path,
     /// 进程内「正在探测」的模型名登记表：`model/probe` 与 `model/upsert` 的
     /// 后台探测共用同一张表，保证同名条目的探测不会并发跑两轮。它只是内存态，
     /// 每个 app-server 进程一份（见 `serve()` 里的构造）。

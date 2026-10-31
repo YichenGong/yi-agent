@@ -659,7 +659,18 @@ fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
 
 fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
     let ScheduleAction::Add { request, confirm } = action;
-    let config = config::load(cli)?;
+    // 与 TUI / `run` 同一条解析链：宽松加载，再让清单的默认条目补上
+    // provider/model/key。以前这里用严格加载器，于是「模型只在 models.json」
+    // 的机器上 `schedule add` 直接报 `API key required`——那是加载器的错，
+    // 不是用户的配置错。
+    let config = config::load_lenient(cli)?;
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
+    // 宽松加载器不再因缺 key 报错，所以「未配置」必须在这里显式说清楚。
+    // 不能省：省掉的话空 key 会一路传到 provider，变成一句更难懂的 401。
+    if let Some(line) = unconfigured_guidance(yi_agent_runtime::models::is_usable(&config)) {
+        anyhow::bail!("{line}");
+    }
     let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let preview = runtime.block_on(
@@ -760,11 +771,23 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     }
 }
 
+/// Builds the worker factory that the daemon uses to spawn subagents.
+///
+/// Resolves its config exactly like the TUI's own turn does: leniently, then
+/// through the model catalog. The strict loader knows only about CLI overrides
+/// and real process environment variables, so on a catalog-only machine (the
+/// normal state after model keys were migrated out of `.env` into
+/// `models.json`) it bails with `API key required` -- and since this factory is
+/// built before the daemon starts, that aborted the whole runtime attach on
+/// launch. `worker_factory` then picks the subagent entry (or the catalog
+/// default) from the config it is handed.
 fn build_daemon_worker_factory(
     cli: &Cli,
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
-    let config = config::load(cli)?;
+    let config = config::load_lenient(cli)?;
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
     yi_agent_subagent::attach::worker_factory(
         &config,
         runtime_socket,
@@ -949,8 +972,20 @@ fn build_tui_root_tools(
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
+    mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
+    // `base_registry` 只有 skills,`mcp_reload` 是在主注册表上登记的;切根目录
+    // 重建时必须补回来,否则用户换根之后就再也改不了 MCP 配置了。
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn = std::sync::Arc::new(|cmd: &str| {
+        yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string)
+    });
+    yi_agent_mcp::register_mcp_reload_tool(
+        &mut registry,
+        std::sync::Arc::clone(mcp),
+        &attached_root.workspace.path,
+        Some(blocklist_fn),
+    );
     // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
@@ -1005,6 +1040,15 @@ impl TuiRuntimeSession {
 /// visible, because the symptom the user sees is merely a missing tool, which
 /// is impossible to diagnose from the outside.
 fn runtime_unavailable_reason(error: &yi_agent_store::ipc::IpcError) -> String {
+    format!("subagent delegation unavailable: {error}")
+}
+
+/// The same actionable line for failures raised before the daemon exists.
+///
+/// Building the worker factory happens first (its config feeds the daemon), so
+/// its errors are plain `anyhow` ones rather than IPC codes. They still mean
+/// "delegation is unavailable", never "a turn failed".
+fn worker_factory_unavailable_reason(error: &anyhow::Error) -> String {
     format!("subagent delegation unavailable: {error}")
 }
 
@@ -1099,10 +1143,39 @@ fn startup_intent_for(
     })
 }
 
-fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
+/// Brings up the subagent runtime for this TUI session.
+///
+/// **This function cannot fail**, and that is deliberate. Its return type used to
+/// be `Result<Option<TuiRuntimeSession>>`, which promised two outcomes it never
+/// produced: no path ever returned `Ok(None)`, and the one `?`
+/// (`socket_path_for`) let a bring-up problem escape as `Err`. The caller's `Err`
+/// arm then wrapped it in `AgentError::ProviderTurnAdmission`, so a launch-time
+/// configuration problem surfaced as
+/// `Error: provider turn admission failed: API key required: ...` before the user
+/// had typed anything.
+///
+/// Every failure here means the same thing to the user: *this session runs
+/// without delegation, and here is why*. That is a notice, not a failed turn, so
+/// the type says so: one infallible return value, and `Unavailable` carries the
+/// reason. A startup error has no route to the turn-failure channel because no
+/// such route exists in the signature.
+///
+/// `cli` is kept because the daemon worker factory resolves the user's model
+/// configuration from the same overrides the TUI itself uses.
+fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> TuiRuntimeSession {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
-    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
+    // A socket path that cannot be derived is a configuration problem, not a
+    // crashed process: the session still runs, just without delegation. Same
+    // shape as every other bring-up failure below, and the reason stays actionable.
+    let socket_path = match yi_agent_store::ipc::socket_path_for(&runtime_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            let reason = runtime_unavailable_reason(&error);
+            tracing::warn!(error = %error, "{reason}");
+            return TuiRuntimeSession::unavailable(reason);
+        }
+    };
     // Record the project-local state before the daemon creates it, otherwise
     // root worktree provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&config.workdir);
@@ -1110,19 +1183,29 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     // in the project directory, so it would outlive any restart. Retire it so
     // the `start_with_factory` below replaces it with a working one.
     replace_wedged_daemon(&socket_path);
-    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
-        &runtime_dir,
-        &database,
-        build_daemon_worker_factory(cli, socket_path.clone())?,
-    ) {
-        Ok(daemon) => Some(daemon),
-        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+    // Build the factory before starting the daemon, but never let its failure
+    // escape: a bring-up failure is a delegation notice, not a failed turn. The
+    // strict loader used to bail here with `API key required`, and the escaping
+    // `?` turned that into `Error: provider turn admission failed: ...` on a
+    // launch where no turn had been attempted.
+    let factory = match build_daemon_worker_factory(cli, socket_path.clone()) {
+        Ok(factory) => factory,
         Err(error) => {
-            let reason = runtime_unavailable_reason(&error);
+            let reason = worker_factory_unavailable_reason(&error);
             tracing::warn!(error = %error, "{reason}");
-            return Ok(Some(TuiRuntimeSession::unavailable(reason)));
+            return TuiRuntimeSession::unavailable(reason);
         }
     };
+    let embedded_daemon =
+        match yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory) {
+            Ok(daemon) => Some(daemon),
+            Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+            Err(error) => {
+                let reason = runtime_unavailable_reason(&error);
+                tracing::warn!(error = %error, "{reason}");
+                return TuiRuntimeSession::unavailable(reason);
+            }
+        };
     // 只有"我起的 daemon"才该由我监督：借用了别人的 daemon 还去监督，
     // 两边会互相拉/停同一批插件进程。
     let owns_daemon = embedded_daemon.is_some();
@@ -1140,7 +1223,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         Err(error) => {
             let reason = format!("could not reach the runtime socket: {error}");
             tracing::warn!(error = %error, "{reason}");
-            return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
+            return TuiRuntimeSession::unavailable(reason);
         }
     };
     let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
@@ -1152,25 +1235,23 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     else {
         let reason = runtime_attached_root_rejection(&response);
         tracing::warn!(response = ?response, "{reason}");
-        return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
+        return TuiRuntimeSession::unavailable(reason);
     };
-    Ok(Some(TuiRuntimeSession::Attached(Box::new(
-        AttachedTuiRuntime {
-            socket_path,
-            attached_root: crate::tui::subagents::AttachedRoot {
-                session_id,
-                task_id: root_task_id,
-                capability: message_capability,
-                workspace,
-            },
-            embedded_daemon,
-            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
-                &config.workdir,
-                &runtime_dir,
-                owns_daemon,
-            ),
+    TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
         },
-    ))))
+        embedded_daemon,
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &config.workdir,
+            &runtime_dir,
+            owns_daemon,
+        ),
+    }))
 }
 
 fn activate_tui_runtime_root(
@@ -1300,6 +1381,18 @@ fn run_agent(cli: Cli) -> Result<()> {
             yi_agent_mcp::McpManager::empty()
         }
     };
+
+    // `mcp_reload` 必须**始终**存在,包括还没有 mcp.json 的时候——那正是用户
+    // 想说"帮我加一个 MCP"的场景。与上面的 `mcp` 共享同一个 manager,否则
+    // 它改完配置后本轮的工具集不会跟着变。
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string));
+    yi_agent_mcp::register_mcp_reload_tool(
+        &mut registry,
+        Arc::clone(&mcp),
+        &config.workdir,
+        Some(blocklist_fn),
+    );
 
     let tools = Arc::new(registry);
 
@@ -1973,6 +2066,7 @@ fn run_tui_agent(
             runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
         };
 
+        let driver_workdir = snapshot_workdir.clone();
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1983,7 +2077,7 @@ fn run_tui_agent(
                 config_clone,
             )
             .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx));
-            let _ = workdir; // workdir already passed to tools registration
+
 
             loop {
                 // Wait for user input, runtime startup choice, or a control command.
@@ -2071,6 +2165,45 @@ fn run_tui_agent(
                                         .await;
                                 }
                             }
+                        }
+                        DriverControl::McpReload => {
+                            // 重新读盘:用户可能自己改过 mcp.json,所以要按磁盘
+                            // 现状重建,而不是信任内存里的开关。只探测变化的 server。
+                            let report = mcp_for_driver.reload(&driver_workdir).await;
+                            for s in &report.servers {
+                                if let Some(err) = &s.error {
+                                    tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                                }
+                            }
+                            let label = if report.all_ok() {
+                                let probed = report.servers.iter().filter(|s| s.probed).count();
+                                format!("MCP 配置已重载（{} 个 server，重探 {probed} 个）", report.servers.len())
+                            } else {
+                                let failed: Vec<&str> = report
+                                    .servers
+                                    .iter()
+                                    .filter(|s| s.error.is_some())
+                                    .map(|s| s.name.as_str())
+                                    .collect();
+                                format!("MCP 配置已重载，但探测失败: {}", failed.join(", "))
+                            };
+                            let mut refreshed = (*current_tools).clone();
+                            mcp_for_driver.refresh_registry(&mut refreshed);
+                            current_tools = Arc::new(refreshed);
+                            let handle = agent.session_handle();
+                            agent = live.rebuild(
+                                Arc::clone(&current_tools),
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                                handle,
+                            );
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Notice {
+                                    level: yi_agent_core::NoticeLevel::Info,
+                                    text: label,
+                                })
+                                .await;
+                            tracing::info!("MCP config reloaded from disk");
                         }
                         DriverControl::McpRefresh => {
                             let mut refreshed = (*current_tools).clone();
@@ -2189,7 +2322,7 @@ fn run_tui_agent(
                     match choice {
                         Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
                             match attach_tui_runtime(&cli, &config) {
-                                Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+                                TuiRuntimeSession::Unavailable { reason } => {
                                     tracing::warn!(
                                         cause = %reason,
                                         "subagent runtime unavailable; continuing without delegation"
@@ -2198,7 +2331,7 @@ fn run_tui_agent(
                                         .send(runtime_unavailable_event("runtime attach", reason))
                                         .await;
                                 }
-                                Ok(Some(TuiRuntimeSession::Attached(attached))) => {
+                                TuiRuntimeSession::Attached(attached) => {
                                     let AttachedTuiRuntime {
                                         socket_path,
                                         attached_root,
@@ -2243,6 +2376,7 @@ fn run_tui_agent(
                                         socket_path.clone(),
                                         &attached_root,
                                         caller_for_attach.clone(),
+                                        &mcp_for_driver,
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
@@ -2295,18 +2429,6 @@ fn run_tui_agent(
                                         }
                                     }
                                 }
-                                Ok(None) => {
-                                    tracing::warn!("subagent runtime unavailable; continuing without delegation");
-                                }
-                                Err(error) => {
-                                    let _ = agent_tx
-                                        .send(yi_agent_core::AgentEvent::Error(
-                                            yi_agent_core::AgentError::ProviderTurnAdmission(
-                                                error.to_string(),
-                                            ),
-                                        ))
-                                        .await;
-                                }
                             }
                         }
                         Some(crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation) => {
@@ -2346,6 +2468,28 @@ fn run_tui_agent(
                         }
                     }
                     root_activated = true;
+                }
+
+                // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
+                // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
+                if mcp_for_driver.config_changed_on_disk(&driver_workdir) {
+                    let report = mcp_for_driver.reload(&driver_workdir).await;
+                    for s in &report.servers {
+                        if let Some(err) = &s.error {
+                            tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                        }
+                    }
+                    let mut refreshed = (*current_tools).clone();
+                    mcp_for_driver.refresh_registry(&mut refreshed);
+                    current_tools = Arc::new(refreshed);
+                    let handle = agent.session_handle();
+                    agent = live.rebuild(
+                        Arc::clone(&current_tools),
+                        Arc::clone(&current_checker),
+                        Arc::clone(&rebuild_decision_rx),
+                        handle,
+                    );
+                    tracing::info!("MCP config changed on disk; registry reloaded");
                 }
 
                 // Run agent
@@ -2531,6 +2675,10 @@ pub(crate) enum DriverControl {
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
+    /// Re-read `.yi-agent/mcp.json` from disk (re-probing only what changed),
+    /// then rebuild the agent. Backs `/mcp reload`: the user may have edited the
+    /// file themselves, so this cannot rely on `mcp/set` having been called.
+    McpReload,
 }
 
 /// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
@@ -2633,6 +2781,141 @@ mod tests {
         );
     }
 
+    /// The subagent worker factory feeds the daemon that the TUI attaches to on
+    /// launch. It must resolve its config the same way the TUI's own turn does:
+    /// leniently, then through the model catalog.
+    ///
+    /// A catalog-only machine (settings UI configured, `models.json` holds the
+    /// key, no model env vars -- the normal state after model keys were migrated
+    /// out of `.env`) has no key for the strict loader, so the strict loader
+    /// bails with `API key required`. That error reached the driver's fallback
+    /// arm and rendered as `Error: provider turn admission failed: ...` before
+    /// the user typed anything.
+    ///
+    /// The guard is a source assertion because the regression is literally a
+    /// one-word loader swap in one function, and because driving the real path
+    /// needs a live daemon. `build_daemon_worker_factory` is isolated by slicing
+    /// to the next column-0 `\nfn ` so a longer function further down cannot
+    /// satisfy the needles.
+    #[test]
+    fn the_daemon_worker_factory_resolves_its_config_through_the_catalog() {
+        // Needles built from fragments so this test's own source cannot match.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn build_daemon_worker_factory(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("build_daemon_worker_factory must exist");
+        let strict = ["config::load(", "cli)"].concat();
+        let lenient = ["config::load_lenient", "(cli)"].concat();
+        let catalog = ["models::load_catalog", "()"].concat();
+        let resolve = ["models::resolve_effective", "(&config, &catalog"].concat();
+        assert!(
+            !body.contains(&strict),
+            "the worker factory must not use the strict loader: a catalog-only machine has no \
+             key until the catalog resolves, so the daemon would report `API key required`"
+        );
+        assert!(
+            body.contains(&lenient),
+            "the worker factory must load leniently, like run_agent and run_headless"
+        );
+        assert!(
+            body.contains(&catalog) && body.contains(&resolve),
+            "the worker factory must resolve the config through the model catalog"
+        );
+    }
+
+    /// A startup failure must never be representable as a failed turn.
+    ///
+    /// The signature is the guard, not this test: `attach_tui_runtime` returns a
+    /// bare `TuiRuntimeSession`, so there is no `Err` and no `Ok(None)` for a
+    /// bring-up problem to travel through. Before it was infallible, an escaped
+    /// factory error reached the driver's `Err` arm, which emitted
+    /// `AgentError::ProviderTurnAdmission`; users saw
+    /// `Error: provider turn admission failed: API key required: ...` on a launch
+    /// where no turn had been attempted.
+    ///
+    /// This asserts the signature itself, so re-introducing a fallible return --
+    /// the one edit that would silently restore the old channel -- fails here.
+    #[test]
+    fn attach_tui_runtime_reports_a_factory_failure_as_unavailable() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn attach_tui_runtime(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("attach_tui_runtime must exist");
+        let escaping = [
+            "build_daemon_worker_factory(cli, socket_path.clone())",
+            "?,",
+        ]
+        .concat();
+        assert!(
+            !body.contains(&escaping),
+            "a worker-factory failure must become a TuiRuntimeSession::Unavailable notice, \
+             not an escaping error that the driver renders as a failed turn"
+        );
+        let unavailable = ["TuiRuntimeSession::unavailable(", "reason)"].concat();
+        assert!(
+            body.contains(&unavailable),
+            "attach_tui_runtime must funnel bring-up failures through the Unavailable notice"
+        );
+    }
+
+    /// The startup path must have exactly one way to fail, and it must not be a
+    /// `Result`.
+    ///
+    /// `attach_tui_runtime` is infallible by design: a bring-up problem is a
+    /// delegation notice, never a failed turn. `Result` in its signature is the
+    /// one edit that would restore the old `Error: provider turn admission
+    /// failed: ...` channel, so it is asserted against directly.
+    ///
+    /// Needles are built from fragments so this test's own source cannot satisfy
+    /// them.
+    #[test]
+    fn attach_tui_runtime_is_infallible() {
+        let source = include_str!("main.rs");
+        let header = source
+            .split("fn attach_tui_runtime(")
+            .nth(1)
+            .and_then(|rest| rest.split('{').next())
+            .expect("attach_tui_runtime must exist");
+        let result = ["-> ", "Result<"].concat();
+        let option = ["-> ", "Option<"].concat();
+        assert!(
+            !header.contains(&result),
+            "attach_tui_runtime must not return Result: a startup error with a return type to \
+             escape through is how it reached the turn-failure channel. Got header: {header}"
+        );
+        assert!(
+            !header.contains(&option),
+            "attach_tui_runtime must not return Option: no path ever produced a `None` session, \
+             and the dead arm only invited the bug. Got header: {header}"
+        );
+        assert!(
+            header.contains("TuiRuntimeSession"),
+            "attach_tui_runtime must return the session type directly, got: {header}"
+        );
+    }
+
+    /// One loader, not two.
+    ///
+    /// The strict loader answered "this machine is configured" differently from
+    /// the lenient one, and whichever startup path picked the wrong answer turned
+    /// a catalog-only machine into a launch failure. With one loader there is no
+    /// wrong pick; `models::is_usable` is the only judge of usability.
+    #[test]
+    fn only_the_lenient_loader_exists() {
+        let source = include_str!("main.rs");
+        let strict_needle = ["config::load(", "cli)"].concat();
+        let strict_with_ref = ["config::load(", "&cli)"].concat();
+        assert!(
+            !source.contains(&strict_needle) && !source.contains(&strict_with_ref),
+            "the strict loader must not be called: it and the lenient one disagree about \
+             whether a catalog-only machine is configured"
+        );
+    }
+
     #[test]
     fn guidance_is_returned_when_the_env_has_no_model() {
         let line = unconfigured_guidance(false).expect("must report an unconfigured machine");
@@ -2676,10 +2959,18 @@ mod tests {
             if why.contains("must not invert") {
                 assert!(!source.contains(&needle), "{why}");
             } else {
-                assert_eq!(
-                    source.matches(&needle).count(),
-                    2,
-                    "both `run` and the TUI entry must check usability ({why})"
+                // Every entry that can reach a provider must check usability
+                // after resolving the catalog: `run`, the TUI, and `schedule`
+                // (the latter stopped relying on the loader's bail once the
+                // strict loader was removed). A floor, not an exact count --
+                // pinning the number made adding a fourth entry a test failure
+                // for no reason.
+                let count = source.matches(&needle).count();
+                assert!(
+                    count >= 3,
+                    "every entry that can call a provider must check usability after \
+                     resolving the catalog; found {count} call sites, expected at least 3 \
+                     (`run`, the TUI, `schedule`) ({why})"
                 );
             }
         }
@@ -3597,6 +3888,14 @@ mod tests {
             prompt.contains("git merge --no-ff"),
             "default prompt must still tell parents to integrate the delivered commit"
         );
+        assert!(
+            prompt.contains("coding_requires_git"),
+            "the system prompt must tell the model to ask the user when a coding child is refused"
+        );
+        assert!(
+            prompt.contains("read_only"),
+            "the fallback after a refusal is a read-only child, which must be discoverable here"
+        );
     }
 
     // --- drain_stream_human tests ---
@@ -3715,19 +4014,19 @@ mod tests {
         // fails regardless of the machine's `$TMPDIR` or permissions.
         config.workdir = std::path::PathBuf::from(format!("/{}", "a".repeat(200)));
 
+        // No `Err` / `Ok(None)` arms exist because the signature cannot produce
+        // them. That is the whole point of the infallible return type: the old
+        // test had to panic on an escaped error, which is a runtime guard where
+        // the type should have been the guard.
         match attach_tui_runtime(&cli, &config) {
-            Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+            TuiRuntimeSession::Unavailable { reason } => {
                 assert!(
                     !reason.trim().is_empty(),
                     "an unavailable runtime must explain itself"
                 );
             }
-            Ok(Some(TuiRuntimeSession::Attached(_))) => {
+            TuiRuntimeSession::Attached(_) => {
                 panic!("bring-up was expected to fail for an uncreatable workdir")
-            }
-            Ok(None) => panic!("the TUI must always get a session, attached or not"),
-            Err(error) => {
-                panic!("a failed bring-up escaped as `Error: ...` instead of a notice: {error}")
             }
         }
     }
@@ -3757,12 +4056,14 @@ mod tests {
     fn build_tui_root_tools_registers_subagent_tools_for_attached_runtime() {
         let config = test_config();
         let root = attached_root_for_main_tests();
+        let mcp = yi_agent_mcp::McpManager::empty();
         let registry = build_tui_root_tools(
             &yi_agent_core::ToolRegistry::new(),
             &config,
             "/tmp/runtime.sock".into(),
             &root,
             crate::tui::subagents::CallerContext::unbound(),
+            &mcp,
         );
         let names = registry
             .schemas()
@@ -3774,6 +4075,12 @@ mod tests {
         assert!(names.contains(&"send_message".to_string()));
         assert!(names.contains(&"wait_agent".to_string()));
         assert!(names.contains(&"bash".to_string()));
+        // 换根之后仍然要能改 MCP 配置:否则用户一旦 attach,就失去了
+        // "帮我加一个 MCP" 的入口。
+        assert!(
+            names.contains(&"mcp_reload".to_string()),
+            "mcp_reload must survive a root switch; got {names:?}"
+        );
     }
 
     /// A provider that is never called: the rebuild tests only exercise the

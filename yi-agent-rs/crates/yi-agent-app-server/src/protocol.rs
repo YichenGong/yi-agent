@@ -307,6 +307,26 @@ pub enum Notification {
         #[ts(type = "\"normal\" | \"yolo\"")]
         mode: crate::thread_store::ThreadMode,
     },
+    /// 某会话的**共享已读水位**已推进（任一端读过它）。
+    ///
+    /// 这是「手机点开、桌面蓝点同时消失」的唯一通道：未读由
+    /// `last_completed_at > last_read_at` 派生，一端标记已读后必须让其余端
+    /// 立刻合入新水位。与 `thread/modelChanged` / `thread/permissionModeChanged`
+    /// 同族——都是会话元数据，只带时间戳、不带正文。
+    ///
+    /// 两个值一起发：客户端只需按 `max` 合入，就能在没有额外请求的情况下重算
+    /// 「还该不该亮蓝点」，不必再拉一次 `thread/listAll`。
+    #[serde(rename = "thread/readStateChanged")]
+    ReadStateChanged {
+        thread_id: String,
+        // 线上是 JSON 数字（epoch 毫秒）。与 `RequestId::Num` / `RpcError::code`
+        // 同一口径：`i64` 在本项目一律显式标注为 `number`，否则 ts-rs 会生成
+        // `bigint`，而 wire 上来的、以及与 `Date.now()` 比较的都是普通 number。
+        #[ts(type = "number")]
+        last_read_at: i64,
+        #[ts(type = "number")]
+        last_completed_at: i64,
+    },
     /// 该会话的 reasoning effort 覆盖已切换（或清除）。
     ///
     /// 与 `thread/modelChanged` / `thread/permissionModeChanged` 并列：effort 是
@@ -424,6 +444,19 @@ pub enum Notification {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         error: Option<String>,
+        /// 本轮完成时刻（epoch 毫秒），与落盘的 `last_completed_at` **同源**。
+        ///
+        /// 客户端收到本帧会立刻重拉 `thread/listAll`，而那一次落盘**排在广播
+        /// 之后**（广播在 driver 的流消费处，落盘在 `persist_and_finish_turn`），
+        /// 于是列表里的 `last_completed_at` 可能仍是旧值。自带权威时间戳让客户端
+        /// 按 `max` 合入即可收敛，无需再造一套「哪个来源更权威」的机制。
+        ///
+        /// 可选：旧服务端不发这个字段，客户端退回自己的墙钟（只会多亮一次蓝点，
+        /// 不会漏），故不必为一个「更好一点」的时间戳把线协议变成破坏性变更。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        #[ts(type = "number | null")]
+        completed_at: Option<i64>,
     },
     /// Mid-turn user messages the server could not consume, handed back so the
     /// client can restore them to the input box. Carries the `tag` ids, because
@@ -467,6 +500,16 @@ pub enum Notification {
         total_cache_creation_input_tokens: u64,
         #[ts(type = "number")]
         total_cache_read_input_tokens: u64,
+        /// 本会话所有 subagent 的累计，**不并入** `total_*`。
+        ///
+        /// 与主会话是两组独立的数：`/usage` 与展开面板要分开呈现，合并会让
+        /// 「主 Agent 自己花了多少」无从得知。恒为具体数字，没有 subagent 时是 0。
+        #[ts(type = "number")]
+        subagent_input_tokens: u64,
+        #[ts(type = "number")]
+        subagent_output_tokens: u64,
+        #[ts(type = "number")]
+        subagent_cache_read_tokens: u64,
     },
     /// 一条子 agent 轨迹行,推给订阅了该 thread 那个任务的客户端。
     #[serde(rename = "agent/trace/event", rename_all = "camelCase")]
@@ -553,6 +596,7 @@ impl Notification {
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
+            | Notification::ReadStateChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::TitleChanged { thread_id, .. }
@@ -611,6 +655,7 @@ impl Notification {
             | Notification::TitleChanged { .. }
             | Notification::TagChanged { .. }
             | Notification::GroupsChanged { .. }
+            | Notification::ReadStateChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
@@ -618,6 +663,48 @@ impl Notification {
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
             _ => Delivery::Content,
+        }
+    }
+}
+
+/// 一个子任务的累计用量。
+///
+/// 只带展示要用的三项：input / output / cache read。cache write 不在用户口径内，
+/// 故既不记账也不传输。恒为具体数字（不是 Optional）：没有用量的子任务就是三个 0，
+/// 客户端用 `> 0` 判断是否值得展示。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase")]
+pub struct AgentChildUsage {
+    #[ts(type = "number")]
+    pub input_tokens: u64,
+    #[ts(type = "number")]
+    pub output_tokens: u64,
+    #[ts(type = "number")]
+    pub cache_read_tokens: u64,
+}
+
+/// 一个会话里所有子任务的用量之和。
+///
+/// 与 [`AgentChildUsage`] 同形状但用途不同：后者是「一个子任务」的量，本类型是
+/// 「整个会话」的合计。不直接复用前者，是因为合计值还要参与 `/clear` 基线相减。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SubagentTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+}
+
+impl SubagentTotals {
+    /// 逐项饱和相减，供 `/clear` 基线扣减用。
+    ///
+    /// 用饱和而非直接减：基线来自同一条数据流，理论上不会超过当前值，但 daemon
+    /// 重启 / 任务被清理都可能让它短暂倒挂——此时报 0 好过 panic 或回绕成天文数字。
+    pub(crate) fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
         }
     }
 }
@@ -638,6 +725,9 @@ pub struct AgentChild {
     /// lists exactly the task's own children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// 该子任务的累计用量。`serde(default)` 让老 daemon 不回该字段时读出全零。
+    #[serde(default)]
+    pub usage: AgentChildUsage,
 }
 
 /// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
@@ -1015,6 +1105,7 @@ mod tests {
             turn_id: "u1".into(),
             status: TurnStatus::Completed,
             error: None,
+            completed_at: None,
         };
         let v: Value = serde_json::to_value(&n).unwrap();
         assert_eq!(v["params"]["status"], "completed");
@@ -1034,6 +1125,9 @@ mod tests {
             total_output_tokens: 300,
             total_cache_creation_input_tokens: 500,
             total_cache_read_input_tokens: 700,
+            subagent_input_tokens: 11,
+            subagent_output_tokens: 22,
+            subagent_cache_read_tokens: 33,
         };
         let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
         assert_eq!(v["method"], "thread/tokenUsage/updated");
@@ -1043,6 +1137,10 @@ mod tests {
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
         assert_eq!(v["params"]["total_input_tokens"], 1_000);
         assert_eq!(v["params"]["total_output_tokens"], 300);
+        // subagent 三个值走 snake_case（与其它用量字段同款），且不并入 total_*。
+        assert_eq!(v["params"]["subagent_input_tokens"], 11);
+        assert_eq!(v["params"]["subagent_output_tokens"], 22);
+        assert_eq!(v["params"]["subagent_cache_read_tokens"], 33);
         assert_eq!(v["params"]["total_cache_creation_input_tokens"], 500);
         assert_eq!(v["params"]["total_cache_read_input_tokens"], 700);
     }

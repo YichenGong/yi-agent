@@ -190,6 +190,9 @@ impl Tool for ShowGitDiffTool {
             .base
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
+        // 工具调用同步跑在线程上，该线程可能刚服务过别的请求：先清掉可能残留的
+        // 超时标记，否则本调用会被上一次的挂住误报成超时。
+        crate::git_diff::reset_git_timeout();
         if let Some(ref rev) = explicit {
             if !crate::git_diff::valid_rev(&self.repo, rev) {
                 return ToolResult::error(format!("`{rev}` is not a usable git revision"));
@@ -200,6 +203,14 @@ impl Tool for ShowGitDiffTool {
             explicit.as_deref(),
             self.anchor.as_deref(),
         );
+        // 挂住的仓库会让 `git_ok` 超时返回 `None`，而空 diff 与「真的没有改动」
+        // 无法区分。对模型必须明说失败，否则等于告诉它「没有改动」。
+        if crate::git_diff::take_git_timeout() {
+            return ToolResult::error(
+                "git timed out while computing the diff; the repository may be locked \
+                 (e.g. a stale index.lock). Try again once it is free.",
+            );
+        }
         // `valid_rev` 接受范围表达式（`A..B` 两侧各自可解），但 `resolve_base` 只用
         // 单个 `ref_exists` 复核显式基准——范围在那里解不开，会静默落到候选链。
         // 若不说，模型要的是 `A..B`，拿到的是分支 diff，就违反了「校验失败明确报错」。

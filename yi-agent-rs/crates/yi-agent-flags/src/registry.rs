@@ -148,6 +148,17 @@ mod tests {
     }
 
     #[test]
+    fn session_search_is_not_a_flag() {
+        // 会话内搜索已转为常开功能，前端无条件注册 Cmd+F。这里守住"别再给它
+        // 加闸门"：若有人重新登记，前端不会读它，注册表反而会误导用户在实验
+        // 页拨一个无效开关。
+        assert!(
+            find("session_search").is_none(),
+            "session search is always on; do not register it as a flag"
+        );
+    }
+
+    #[test]
     fn the_superpowers_kanban_flag_is_registered() {
         let def = find("superpowers_kanban").expect("superpowers_kanban must be in the registry");
         assert!(!def.default, "the kanban must default to off");

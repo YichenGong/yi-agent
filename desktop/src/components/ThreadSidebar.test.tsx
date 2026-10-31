@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, fireEvent, cleanup, screen, act, waitFor } from "@testing-library/react";
+import { render, fireEvent, createEvent, cleanup, screen, act, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
@@ -919,12 +919,13 @@ describe("ThreadSidebar pinned section", () => {
       onReorderPinned,
     });
     const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
-    // 把第一行拖到第二行位置。
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
+    // 把第一行拖到第二行位置（指针拖拽，见 `dragOrigin` 的注释）。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
     // 悬停期间要有可见的落点指示线，否则用户看不到会落到哪儿。
     expect(container.querySelector("[data-pin-drop-indicator]")).not.toBeNull();
-    fireEvent.drop(rows[1]);
+    fireEvent.pointerUp(window, { pointerId: 1 });
     expect(onReorderPinned).toHaveBeenCalledWith(["8", "9"]);
   });
 
@@ -952,21 +953,38 @@ describe("ThreadSidebar pinned section", () => {
     expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(1);
   });
 
-  it("renders neither a pin button nor draggable on the row being renamed", () => {
+  it("renders neither a pin button nor a drag start on the row being renamed", () => {
     const { container } = renderSidebar({ pinned: [pinnedThread("9", "nine")] });
     fireEvent.doubleClick(screen.getByText("nine"));
     const row = container.querySelector<HTMLElement>("[data-pinned-row]")!;
     expect(row.querySelector("[aria-label=\"Unpin thread\"]")).toBeNull();
     expect(row.querySelector("[aria-label=\"Pin thread\"]")).toBeNull();
-    expect(row.getAttribute("draggable")).not.toBe("true");
+    // 重命名中的行不起手拖拽：按下后移动不会高亮任何落点。
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    expect(document.querySelector("[data-pin-drop-indicator]")).toBeNull();
   });
 
-  it("does not make unpinned group rows draggable", () => {
-    const { container } = renderSidebar();
-    const notDraggable = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]")).every(
-      (r) => r.getAttribute("draggable") !== "true",
-    );
-    expect(notDraggable).toBe(true);
+  it("lets group rows start a drag but never reorders them on drop", () => {
+    // 非置顶行可起手拖拽——但只为「拖进/拖出组」，不参与置顶区排序。
+    // 因此这里锁两件事：能起手，且落到另一行上不会调用 onReorderPinned。
+    const onReorderPinned = vi.fn();
+    const dragGroups: WorkspaceGroup[] = [
+      {
+        workspace: "/w",
+        exists: true,
+        threads: [thread("1", "a", "/w"), thread("2", "b", "/w")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: dragGroups, onReorderPinned });
+    const rows = container.querySelectorAll<HTMLElement>("[data-group-row]");
+    expect(rows.length).toBeGreaterThan(1);
+    // 整行可起手（进/出组的手势），但落到另一行上不会触发置顶重排。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(onReorderPinned).not.toHaveBeenCalled();
   });
 
   it("offers a settings button in the footer", () => {
@@ -1635,6 +1653,187 @@ describe("会话分组框", () => {
     );
   });
 
+  it("Cmd 连点三条会话后，按钮显示 3 且三条都进组", async () => {
+    // 现场回归：用户按住 Cmd 依次点三条，按钮却显示「新建组（2）」。
+    // 三次真实点击的 `detail` 依次是 1、2、3（浏览器按连击计数，修饰键不参与
+    // 判定），所以必须按真实序列驱动，而不是清一色 detail=1。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: boxThreads }],
+      onCreateGroup,
+    });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("新建组（3）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+    expect(onCreateGroup.mock.calls[0][3]).toEqual(["a", "b", "c"]);
+  });
+
+  it("Cmd 选中三条会话时，组长行也算一条（不再被点成跳转）", async () => {
+    // 现场回归：三条里有一条是组长行时，按钮只显示「新建组（2）」。
+    // 组长行的 onClick 没接修饰键分支，Cmd+点击直接走 onSelect——那一行既没进
+    // 选择集，还把用户的注意力跳走了。
+    const lead = { ...thread("lead", "组长", "/work/projA"), role: "lead" };
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [lead, thread("b", "B", "/work/projA"), thread("c", "C", "/work/projA")],
+      },
+    ];
+    const onSelect = vi.fn();
+    const { container } = renderSidebar({ groups: g, onSelect });
+    fireEvent.click(container.querySelector("[data-lead-row]")!, { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+  });
+
+  it("无修饰键时普通会话行整行可拖", () => {
+    const grouped: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
+      },
+    ];
+    const { container } = renderSidebar({ groups: grouped });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    // 按下并越过阈值后进入拖拽态：悬停到框外的会话行上会亮出落点。
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(container.querySelector('[data-thread-row="b"]')!, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    // 手柄已经删掉：整行可拖之后它是多余的第二入口。
+    expect(container.querySelector("[data-drag-handle]")).toBeNull();
+  });
+
+  it("按着 Cmd 时按下不起手拖拽（点击多选不能被抢走）", () => {
+    // 多选靠点击攒起来。按着修饰键时行不该成为拖拽源，否则「按下 + 轻微移动」
+    // 会被当成拖拽起点，click 就没了——「点了三条只记到两条」正是这条路。
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const other = container.querySelector<HTMLElement>('[data-thread-row="b"]')!;
+
+    fireEvent.keyDown(document, { key: "Meta" });
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(other, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+
+    // 松开修饰键后同一手势就能拖了。
+    fireEvent.keyUp(document, { key: "Meta" });
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(other, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+  });
+
+  it("按着 Cmd 时点击三条仍然只选三条、不触发拖拽", () => {
+    const onSelect = vi.fn();
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g, onSelect });
+    fireEvent.keyDown(document, { key: "Meta" });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    expect(container.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（3）");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("先打开一条会话，再 Cmd 点另外两条，三條都算进选择集", async () => {
+    // 现场回归：会话 A 在前台（currentId），按住 Cmd 点 B、C，按钮却只显示
+    // 「新建组（2）」——A 虽是用户眼里的「当前这条」，却从没进过选择集。
+    // 期望是「前面那条 + Cmd 点到的两条」= 3。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+        ],
+      },
+    ];
+    renderSidebar({ groups: g, currentId: "a", onCreateGroup });
+
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 2 });
+
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("新建组（3）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+    expect(onCreateGroup.mock.calls[0][3]).toEqual(["a", "b", "c"]);
+  });
+
+  it("前台会话自己也带上选中样式", async () => {
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g, currentId: "a" });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    // 前端会话必须显得"被选中"，否则用户无从知道它会进组。
+    expect(container.querySelector('[data-thread-row="a"]')!.className).toContain("ring-inset");
+  });
+
+  it("再点一次前台会话自身把它移出选择集", async () => {
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      },
+    ];
+    renderSidebar({ groups: g, currentId: "a" });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    expect(screen.getByText("新建组（2）")).toBeTruthy();
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 2 });
+    expect(screen.getByText("新建组（1）")).toBeTruthy();
+  });
+
   it("点击组名就地编辑，Enter 保存", async () => {
     const onUpdateGroup = vi.fn().mockResolvedValue(true);
     renderSidebar({ groups: boxGroups, onUpdateGroup });
@@ -1657,6 +1856,49 @@ describe("会话分组框", () => {
     fireEvent.blur(area);
     await waitFor(() =>
       expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { description: "两条线" }),
+    );
+  });
+
+  it("点描述进入编辑后，点击其它会话行即保存", async () => {
+    // 用户要的正是这个：点别处 = 保存。浏览器在点击他处时会先把焦点移走并触发
+    // blur，所以这条链本该自然成立——但会话行的 `pointerdown` 为了挡住 WebKit
+    // 的原生文本拖拽而调了 `preventDefault`，那恰好抑制了焦点转移，blur 不再来，
+    // 描述就一直停在编辑态。故这条用**会话行按下**（真正坏掉的那条路）来钉。
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: boxGroups, onUpdateGroup });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("三条线"));
+    const area = container.querySelector<HTMLTextAreaElement>("[data-group-description-input]")!;
+    fireEvent.change(area, { target: { value: "两条线" } });
+    fireEvent.pointerDown(container.querySelector<HTMLElement>('[data-thread-row="b"]')!);
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { description: "两条线" }),
+    );
+  });
+
+  it("点组名进入编辑后，点击其它区域也保存", async () => {
+    // 同一条路：组名输入框一样会被「按下不转移焦点」卡住。
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    const two = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: boxThreads,
+        groups: [
+          { id: "grp-1", name: "登录模块", description: "", threadIds: ["b"] },
+          { id: "grp-2", name: "支付模块", description: "", threadIds: ["c"] },
+        ],
+      },
+    ] as WorkspaceGroup[];
+    const { container } = renderSidebar({ groups: two, onUpdateGroup });
+    // 展开后才有成员行可点——而成员行正是那条会 preventDefault 的路径。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("登录模块"));
+    const input = container.querySelector<HTMLInputElement>("[data-group-name-input]")!;
+    fireEvent.change(input, { target: { value: "扫码登录" } });
+    fireEvent.pointerDown(container.querySelector<HTMLElement>('[data-thread-row="b"]')!);
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { name: "扫码登录" }),
     );
   });
 
@@ -1773,3 +2015,380 @@ describe("多选操作条的视觉一致性", () => {
     }
   });
 });
+
+describe("多选：连击不能吞掉第二次 Cmd 点击", () => {
+  // macOS 上在同一行附近连点两次，第二次 click 的 `detail` 是 2（浏览器按连击
+  // 计数）。原先的双击保护写在修饰键分支**之前**，于是 Cmd+点 A、Cmd+点 B 时
+  // 第二次点击被当成双击返回，选择集只剩 A——用户看到「选了两条，只进去一条」。
+  const twoThreads: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+    },
+  ];
+
+  it("第二次 Cmd 点击带 detail=2 时仍然加选", () => {
+    renderSidebar({ groups: twoThreads });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    expect(document.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（2）");
+  });
+
+  it("无修饰键的双击仍然只打开一次会话", () => {
+    const onSelect = vi.fn();
+    renderSidebar({ groups: twoThreads, onSelect });
+    fireEvent.click(screen.getByText("A"), { detail: 1 });
+    fireEvent.click(screen.getByText("A"), { detail: 2 });
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("Shift 连选也不被 detail 拦截", () => {
+    renderSidebar({ groups: twoThreads });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { shiftKey: true, detail: 2 });
+    expect(document.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（2）");
+  });
+});
+
+describe("组框：加入会话只走拖拽", () => {
+  const base: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [
+        thread("a", "A", "/work/projA"),
+        thread("b", "B", "/work/projA"),
+        thread("c", "C", "/work/projA"),
+      ],
+      groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a", "b"] }],
+    },
+  ];
+
+  it("组框头不再有「+」按钮与候选列表", () => {
+    // 「+」把「把会话放进组」表达成一次菜单选择，实测不直观；拖拽才是用户
+    // 脑子里的那个动作。同一件事只留一个入口。
+    const { container } = renderSidebar({ groups: base });
+    expect(container.querySelector("[data-group-add]")).toBeNull();
+    expect(container.querySelector("[data-group-add-picker]")).toBeNull();
+    expect(container.querySelector("[data-add-candidate]")).toBeNull();
+  });
+
+  it("组框头显示成员数", () => {
+    renderSidebar({ groups: base });
+    expect(document.querySelector("[data-group-count]")?.textContent).toBe("2");
+  });
+
+  it("新建组成功后自动展开新框", async () => {
+    // 服务端返回新组 id，前端据此展开；否则框停在折叠态，看不出成员进去了。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    const { container, rerender } = renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: base[0].threads }],
+      onCreateGroup,
+    });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("新建组（2）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+
+    rerender(
+      <ThreadSidebar
+        {...sidebarProps({
+          groups: [
+            {
+              workspace: "/work/projA",
+              exists: true,
+              threads: base[0].threads,
+              groups: [{ id: "g-new", name: "登录模块", description: "", threadIds: ["a", "b"] }],
+            },
+          ],
+          onCreateGroup,
+        })}
+      />,
+    );
+    // 展开后两条成员都渲染在框内（explicit：不是只靠总数，顺带确认折叠被打开）。
+    expect(container.querySelector('[data-thread-row="a"]')).toBeTruthy();
+    expect(container.querySelector('[data-thread-row="b"]')).toBeTruthy();
+  });
+});
+
+describe("拖动会话进组", () => {
+  const dragBase: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [
+        thread("a", "A", "/work/projA"),
+        thread("b", "B", "/work/projA"),
+        thread("c", "C", "/work/projA"),
+      ],
+      groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
+    },
+  ];
+
+  /**
+   * 起手：按下并在同一行内移动一小段。
+   *
+   * 阈值是 4px——纯点击（含手抖一两像素）不该变成拖拽，那是「整行可拖会吞点击」
+   * 的老问题的现代版：拖拽不该抢走点击。
+   */
+  const startDrag = (row: Element, x = 10, y = 10) => {
+    fireEvent.pointerDown(row, { clientX: x, clientY: y, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: x + 12, clientY: y, pointerId: 1 });
+  };
+
+  const hover = (el: Element) => fireEvent.pointerEnter(el, { pointerId: 1 });
+  const release = () => fireEvent.pointerUp(window, { pointerId: 1 });
+
+  it("当前会话行（正在查看的那条）同样能拖进组", async () => {
+    // 用户报：被点中的当前会话拖不动，非当前会话进出组都正常。差别只在
+    // `active` —— 这条钉住「当前会话行也是拖拽源」，否则它会成为唯一拖不动的行。
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers, currentId: "c" });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    startDrag(row);
+    hover(box);
+    release();
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
+    );
+  });
+
+  it("当前会话行也能被别的会话拖拽移出组", async () => {
+    // 另一侧：当前会话行作为「移出」落点也必须有效。
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers, currentId: "b" });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const inGroup = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const currentRow = container.querySelector<HTMLElement>('[data-thread-row="b"]')!;
+    startDrag(inGroup);
+    hover(currentRow);
+    release();
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []),
+    );
+  });
+
+  it("拖动一条未选中的行到组框只加这一条", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    startDrag(row);
+    hover(box);
+    release();
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
+    );
+  });
+
+  it("选中三条后拖其中一条进组，整批三条一起加，已在组内的跳过", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+    // `dragBase` 里 a 已在 g1 内，折叠态下该行不渲染，先展开。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    startDrag(row);
+    hover(box);
+    release();
+    // a 已在组里 → 跳过；b、c 追加，顺序 = 组内既有 + 新追加。
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "b", "c"]),
+    );
+  });
+
+  it("三条都在组内时拖其中一条到框外会话行，三条一起移出", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const three: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+          thread("d", "D", "/work/projA"),
+        ],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a", "b", "c"] }],
+      },
+    ];
+    const { container } = renderSidebar({ groups: three, onSetGroupMembers });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="d"]')!;
+    startDrag(row);
+    hover(outside);
+    release();
+    await waitFor(() => expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []));
+  });
+
+  it("多选跨两个组时，从 A 组拖出只解散 A 组那批", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const two: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+          thread("d", "D", "/work/projA"),
+          thread("e", "E", "/work/projA"),
+        ],
+        groups: [
+          { id: "g1", name: "登录模块", description: "", threadIds: ["a", "b"] },
+          { id: "g2", name: "支付模块", description: "", threadIds: ["c", "d"] },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: two, onSetGroupMembers });
+    // 两个组的成员都折在框里，先展开才能点到那两行。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByLabelText("展开分组 支付模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 2 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="e"]')!;
+    startDrag(row);
+    hover(outside);
+    release();
+    // 只有 g1 被写；g2 一动不动。
+    await waitFor(() => expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b"]));
+    expect(onSetGroupMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("拖到目录标题上不触发移出（目录标题不是落点）", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const header = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
+    startDrag(row);
+    hover(header);
+    release();
+    expect(onSetGroupMembers).not.toHaveBeenCalled();
+  });
+
+  it("拖到框外会话行上时该行高亮", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    startDrag(row);
+    hover(outside);
+    expect(container.querySelector('[data-group-drop-target="c"]')).toBeTruthy();
+  });
+
+  it("松开后高亮熄灭", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    startDrag(row);
+    hover(outside);
+    release();
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
+  });
+
+  it("拖到组框上时高亮该框", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    startDrag(row);
+    hover(box);
+    expect(container.querySelector("[data-group-drop-active]")).toBeTruthy();
+  });
+
+  it("按下会阻止原生文本拖拽（否则 WKWebView 会吞掉后续指针事件）", () => {
+    // 真实 WKWebView 实测：在可选中文本上按下并拖动，WebKit 会启动原生
+    // NSDragging 会话（伴随 `selectstart`），而 Tauri 装了原生拖放处理器，
+    // 于是后续 pointermove/pointerup 一个都不再派发——拖拽永远走不到阈值。
+    // jsdom 复现不了这条平台行为，所以这里钉住的是**我们必须做的那件事**：
+    // 按下时 preventDefault，别让 WebKit 把这次手势认成文本选择。
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const ev = createEvent.pointerDown(row, { bubbles: true, cancelable: true, button: 0, pointerId: 1 });
+    fireEvent(row, ev);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("手抖一两像素仍是点击：不进入拖拽态", () => {
+    // 4px 阈值。这是「整行可拖会吞点击」那类问题的指针版：按下时的微小位移
+    // 不该把一次点击变成拖拽。断言的是**拖拽没被激活**，而不是"没调用 RPC"
+    // ——后者在没有落点时本来就恒真，钉不住阈值。
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 13, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(outside, { pointerId: 1 });
+    // 未越过阈值 → 落点不该亮。
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+  });
+
+  it("越过阈值后才进入拖拽态", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 15, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(outside, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+  });
+
+  it("置顶分区内的排序拖拽不受影响", () => {
+    const onReorderPinned = vi.fn();
+    const pinned = [pinnedThread("p1", "one"), pinnedThread("p2", "two")];
+    const { container } = renderSidebar({ groups: dragBase, pinned, onReorderPinned });
+    const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
+    startDrag(rows[0]);
+    hover(rows[1]);
+    release();
+    expect(onReorderPinned).toHaveBeenCalled();
+  });
+});
+
+describe("分组功能（常开）", () => {
+  const grouped: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      groups: [{ id: "g1", name: "登录模块", description: "三条线", threadIds: ["a", "b"] }],
+    },
+  ];
+
+  // 2026-10-29 转正：`session_groups` 开关删除后，原先三个「开关关闭时…」的
+  // 用例失去了被测对象（再没有"关闭"这个状态）。留下这条，钉住"分组是天生的
+  // 默认行为"：组框在、成员收在框内不重复。
+  it("分组框与成员收进框内，不需要任何开关", () => {
+    const { container } = renderSidebar({ groups: grouped });
+    expect(container.querySelector('[data-group-box="g1"]')).toBeTruthy();
+    // 成员收在框里，不再重复出现在框外（框默认折叠，先展开）。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    expect(container.querySelectorAll('[data-thread-row="a"]').length).toBe(1);
+  });
+});
+

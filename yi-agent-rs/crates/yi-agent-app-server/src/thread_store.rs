@@ -113,6 +113,32 @@ pub struct ThreadMeta {
     /// 第二处写入点 `promote_partial` 不维护它（偏旧只导致多补一段，不漏内容）。
     #[serde(default)]
     pub last_item_id: Option<String>,
+    /// 共享已读水位（epoch 毫秒）：**所有客户端共用的**「我读到哪了」。
+    ///
+    /// 任一端打开会话就推进它，服务端广播给其余端，于是「手机读过 ⇒ 桌面蓝点也
+    /// 消失」。**不是**每设备独立位：那会让「一端读过、另一端仍亮」变成设计意图。
+    /// 单调（只取 max），因此乱序、重试、时钟回拨都不会把已读打回未读。
+    /// 旧 meta 缺字段必须读成 0（零迁移：那时它还没被读过，也不该凭空冒出蓝点）。
+    #[serde(default)]
+    pub last_read_at: i64,
+    /// 最近一次**回合结束**的时间（epoch 毫秒）。
+    ///
+    /// 未读的判定式是 `last_completed_at > last_read_at`，故必须与 `updated_at`
+    /// 分开记：`updated_at` 在**回合开始**时也会被 `touch` 刷新，拿它当完成时间
+    /// 会让「另一端刚发问、还在跑」的会话立刻亮蓝点。`clear` / `compact` 不是
+    /// 回合结束，不写本字段。
+    #[serde(default)]
+    pub last_completed_at: i64,
+}
+
+impl ThreadMeta {
+    /// 该会话是否有未读的回合结束：完成时间晚于已读水位。
+    ///
+    /// 这是**全系统唯一**的未读判定，服务端与客户端同一条口径。`0/0`（旧 meta、
+    /// 新建会话）恒为 `false`——不能因为缺字段就让人凭空看到蓝点。
+    pub fn is_unread(&self) -> bool {
+        self.last_completed_at > self.last_read_at
+    }
 }
 
 /// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
@@ -508,6 +534,22 @@ impl ThreadStore {
         id: &str,
         f: F,
     ) -> io::Result<Option<ThreadMeta>> {
+        self.update_meta_with(id, |meta| {
+            f(meta);
+            true
+        })
+    }
+
+    /// 与 [`ThreadStore::update_meta`] 相同，但由闭包决定**是否落盘**。
+    ///
+    /// 返回 `false` 表示「本次无事可做」：此时完全不写文件（`rename` 会推进
+    /// mtime，让盯着 meta 的 watcher 白重读一次），但仍返回读到的 meta，调用方
+    /// 据此拿到当前值。用于幂等操作——重复标记已读、重复记同一个完成时间。
+    fn update_meta_with<F: FnOnce(&mut ThreadMeta) -> bool>(
+        &self,
+        id: &str,
+        f: F,
+    ) -> io::Result<Option<ThreadMeta>> {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
@@ -531,7 +573,9 @@ impl ThreadStore {
                 return Ok(None);
             }
         };
-        f(&mut meta);
+        if !f(&mut meta) {
+            return Ok(Some(meta));
+        }
         let bytes = serde_json::to_vec_pretty(&meta).map_err(io_err)?;
         write_atomic(&path, &bytes)?;
         Ok(Some(meta))
@@ -648,6 +692,64 @@ impl ThreadStore {
         Ok(self
             .update_meta(id, |meta| meta.tag = tag.map(str::to_string))?
             .is_some())
+    }
+
+    /// 推进共享已读水位到「此刻」，返回 `(last_read_at, last_completed_at)`。
+    ///
+    /// 单调：取 `max(旧值, now)`，故重复调用、乱序调用、系统时钟回拨都不会让
+    /// 已读倒退（倒退会让已经消掉的蓝点重新亮起）。
+    ///
+    /// 两个值在**同一次**读-改-写里返回：调用方要用它们算
+    /// `completed > read`，分两次读会让它在写入与读取之间看到一个自相矛盾的
+    /// 组合（例如刚好在两步之间完成了一轮）。
+    ///
+    /// 有意**不**刷新 `updated_at`：读一个会话不是会话活动，不该把它顶到列表
+    /// 最前面（否则「点开看一眼」就会重排侧栏）。
+    ///
+    /// 返回 `None` 表示 thread 不存在或 meta 不可读。
+    pub fn mark_read(&self, id: &str) -> io::Result<Option<(i64, i64)>> {
+        let mut watermarks = (0, 0);
+        let updated = self.update_meta_with(id, |meta| {
+            let next = meta.last_read_at.max(now_millis());
+            // 水位没推进（重复点开同一个会话、或时钟没动）⇒ 不落盘。写一次只会
+            // 推进 mtime，让盯着 meta 的地方白重读；原子文件本身也没变化。
+            let advanced = next != meta.last_read_at;
+            meta.last_read_at = next;
+            watermarks = (meta.last_read_at, meta.last_completed_at);
+            advanced
+        })?;
+        Ok(updated.map(|_| watermarks))
+    }
+
+    /// 记录一次**回合结束**，返回新的完成时间。
+    ///
+    /// 与 [`mark_read`] 一样不刷新 `updated_at`（`touch` 已经在回合结束时做过
+    /// 这件事，这里再写一次只会是无谓的第二次落盘）。`clear` / `compact` 不是
+    /// 回合结束，调用方不得走到这里。返回 `None` 表示 thread 不存在。
+    ///
+    /// `at` 由调用方给，且必须是**随 `turn/completed` 广播出去的那个值**：广播
+    /// 发生在落盘之前，若这里另取一次 `now_millis()`，落盘值必然更晚。另一端的
+    /// 客户端收到广播就发 `thread/markRead`，写下的已读水位于是低于完成水位，
+    /// 服务端判为「读完又跑完一轮」——重连后蓝点复活。两处同源才能闭合这条缝。
+    pub fn mark_turn_completed(&self, id: &str, at: i64) -> io::Result<Option<i64>> {
+        let mut new_value = 0;
+        let updated = self.update_meta_with(id, |meta| {
+            // 取 max：`at` 由**广播那一刻**决定，可能比先前记录的值小（时钟回拨，
+            // 或同一回合的两条收尾路径都走了一遍）。完成是单调事实，只前进。
+            let next = meta.last_completed_at.max(at);
+            let advanced = next != meta.last_completed_at;
+            meta.last_completed_at = next;
+            new_value = meta.last_completed_at;
+            advanced
+        })?;
+        Ok(updated.map(|_| new_value))
+    }
+
+    /// 直接把已读水位写成给定值。**仅供测试**模拟「时钟回拨后再标记」。
+    #[cfg(test)]
+    pub fn set_last_read_at_for_test(&self, id: &str, at: i64) -> io::Result<()> {
+        self.update_meta(id, |meta| meta.last_read_at = at)?;
+        Ok(())
     }
 
     /// 更新该 thread 的模型覆盖选择（清单里的显示名），保留其余 meta 字段。
@@ -1028,6 +1130,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     }
 }
 
@@ -1063,6 +1167,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         }
     }
 
@@ -1973,6 +2079,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         }
     }
 
@@ -2365,6 +2473,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -2415,6 +2525,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
@@ -2490,6 +2602,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -2615,6 +2729,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         };
         store.create(&lead).unwrap();
         store
@@ -2694,6 +2810,8 @@ mod tests {
                     content_epoch: 0,
                     last_item_id: None,
                     anchor_sha: None,
+                    last_read_at: 0,
+                    last_completed_at: 0,
                 })
                 .unwrap();
             store
@@ -2788,6 +2906,169 @@ mod tests {
             "missing last_item_id must read as None"
         );
         assert_eq!(legacy.thread_id, "t", "other fields must survive");
+    }
+
+    /// 未读由两个时间戳派生：`last_completed_at > last_read_at`。
+    ///
+    /// 这条测试钉住判定式本身：新建的会话两个水位都是 0 ⇒ 不未读（旧数据零迁移
+    /// 的结果）；只写完成时间 ⇒ 未读；已读推进到完成之后 ⇒ 不再未读。
+    #[test]
+    fn unread_is_derived_from_the_two_watermarks() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        let fresh = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(fresh.last_read_at, 0, "a new thread has never been read");
+        assert_eq!(fresh.last_completed_at, 0);
+        assert!(
+            !fresh.is_unread(),
+            "0/0 must read as read: old metas predate the field and must not sprout dots"
+        );
+
+        let completed = s
+            .mark_turn_completed("thread-a", now_millis())
+            .unwrap()
+            .expect("thread exists");
+        assert!(completed > 0);
+        let done = s.load("thread-a").unwrap().unwrap().meta;
+        assert!(done.last_completed_at > 0);
+        assert!(
+            done.is_unread(),
+            "a completion after the read mark is unread"
+        );
+
+        let (read_at, completed_at) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert_eq!(
+            completed_at, done.last_completed_at,
+            "both watermarks come back together"
+        );
+        let after = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(after.last_read_at, read_at);
+        assert!(!after.is_unread(), "reading clears the dot");
+    }
+
+    /// 已读水位单调：重复标记不倒退，也不刷新 `updated_at`。
+    #[test]
+    fn mark_read_is_monotonic_and_does_not_touch_updated_at() {
+        let (_d, s) = store();
+        let mut m = meta("thread-a");
+        m.updated_at = 7;
+        s.create(&m).unwrap();
+
+        let (first, _) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert!(first > 0);
+        // 打已读是用户视图标记而非会话活动：不得把该行顶到列表最上方。
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.updated_at,
+            7,
+            "marking read must not refresh updated_at"
+        );
+
+        // 第二次标记：`now` 可能相等或更大，但绝不能更小。
+        let (second, _) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert!(
+            second >= first,
+            "the read watermark must never go backwards"
+        );
+
+        // 时钟被拨回时也取 max：直接写一个更小的值验证同一个不变量。
+        s.set_last_read_at_for_test("thread-a", 1).unwrap();
+        let (back, _) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert!(
+            back >= second,
+            "a clock rollback must not rewind the watermark"
+        );
+    }
+
+    /// 水位没推进时**不写盘**：重复点开同一个会话不该白改一次 meta 的 mtime。
+    ///
+    /// 判据用 mtime 而不是内容：内容在两种写法下都一样，区别只在于有没有真的
+    /// 走一次「序列化 + 原子 rename」。盯着 meta 的 watcher 正是靠 mtime 判断
+    /// 「要不要重读」，所以无谓的写会变成无谓的重读。
+    #[test]
+    fn marking_read_without_advancing_writes_nothing() {
+        let (d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        let path = d.path().join(".yi-agent/threads/thread-a.meta.json");
+
+        let (first, _) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert!(first > 0);
+        let after_first = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // 把水位钉到「很远的将来」，再标记一次：`max(旧值, now)` 仍是旧值。
+        s.set_last_read_at_for_test("thread-a", first + 10_000_000)
+            .unwrap();
+        let pinned = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(pinned >= after_first);
+
+        let (again, _) = s.mark_read("thread-a").unwrap().expect("thread exists");
+        assert_eq!(again, first + 10_000_000, "the watermark must not move");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            pinned,
+            "a no-op read mark must not rewrite the meta file"
+        );
+    }
+
+    /// 同一个完成时刻记两次只写一次盘（失败路径与常规收尾可能都走到这里）。
+    #[test]
+    fn recording_the_same_completion_twice_writes_once() {
+        let (d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        let path = d.path().join(".yi-agent/threads/thread-a.meta.json");
+
+        let at = now_millis();
+        let first = s
+            .mark_turn_completed("thread-a", at)
+            .unwrap()
+            .expect("thread exists");
+        assert_eq!(first, at);
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let second = s
+            .mark_turn_completed("thread-a", at)
+            .unwrap()
+            .expect("thread exists");
+        assert_eq!(second, at, "the completion time must not move");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written,
+            "recording the same completion twice must not rewrite the meta file"
+        );
+
+        // 更早的时间同样不推进（时钟回拨 / 乱序收尾）。
+        let third = s
+            .mark_turn_completed("thread-a", at - 1000)
+            .unwrap()
+            .expect("thread exists");
+        assert_eq!(third, at, "the completion watermark only moves forward");
+    }
+
+    #[test]
+    fn mark_read_unknown_id_is_none() {
+        let (_d, s) = store();
+        assert!(s.mark_read("nope").unwrap().is_none());
+    }
+
+    /// 旧 meta 缺两个新字段：读成 0，且不得凭空造出未读。
+    #[test]
+    fn legacy_meta_without_read_watermarks_reads_as_zero() {
+        // 严格解析（绕过 `load()` 的 `rebuild_meta` 兜底），理由同
+        // `legacy_meta_without_tag_deserializes_to_none`。
+        let legacy_json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(legacy_json)
+            .expect("old metas must deserialize into the current ThreadMeta");
+        assert_eq!(
+            legacy.last_read_at, 0,
+            "missing last_read_at must read as 0"
+        );
+        assert_eq!(
+            legacy.last_completed_at, 0,
+            "missing last_completed_at must read as 0"
+        );
+        assert!(
+            !legacy.is_unread(),
+            "a legacy thread must not sprout an unread dot"
+        );
     }
 
     #[test]

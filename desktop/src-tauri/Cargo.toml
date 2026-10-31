@@ -36,6 +36,8 @@ dirs = "6"
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.
 tempfile = "3"
+# MockRuntime for window/run-event tests.
+tauri = { version = "2", features = ["test"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

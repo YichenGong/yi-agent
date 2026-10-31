@@ -23,6 +23,7 @@ use yi_agent_core::subagent::scheduler::{
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, CompletedChildReport, SpawnError, WaitMode, WaitOutcome, WorkerStartError,
 };
+use yi_agent_core::subagent::supervisor::{TerminalKind, classify_terminal};
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
     MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
@@ -39,7 +40,7 @@ use crate::repository::{
     RepositoryError, RuntimeEvent, RuntimeRepository, ScheduleOccurrenceResult, WatchdogEvidence,
     WatchdogTerminal,
 };
-use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
+use crate::schedule::{MissedRunPolicy, WatchdogOutcome, WatchdogTokenDelta, evaluate_watchdog};
 use crate::terminal::text_completion_report;
 
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
@@ -85,6 +86,8 @@ pub enum RuntimeCoordinatorError {
     AuthorityDenied(String),
     #[error(transparent)]
     Spawn(#[from] SpawnError),
+    #[error("a settled parent task (state: {state}) cannot spawn descendants")]
+    ParentSettled { state: String },
     #[error("global resident subagent capacity is exhausted")]
     ResidentCapacityExhausted,
     #[error("global queued subagent capacity is exhausted")]
@@ -95,6 +98,46 @@ pub enum RuntimeCoordinatorError {
     ForkTooLarge { total: u64, max: u64 },
     #[error("fork upload rejected: {0}")]
     ForkUpload(String),
+    #[error(
+        "{prefix}{reason} at {workdir}",
+        prefix = CODING_REQUIRES_GIT_PREFIX,
+        reason = reason.as_str(),
+        workdir = workdir.display()
+    )]
+    CodingRequiresGit {
+        workdir: PathBuf,
+        reason: CodingRequiresGitReason,
+    },
+}
+
+/// Stable wire prefix for "a coding child needs a git worktree with a HEAD".
+///
+/// The daemon cannot hand the model a JSON object through `IpcResponse::Error`
+/// without changing the protocol, so the rejection carries this prefix and the
+/// tool layer rebuilds the structured payload from it. One definition, one test.
+pub const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+/// Which git precondition a coding spawn failed.
+///
+/// Kept apart so the remedy can omit `git init` for a repository that exists but
+/// has no commit: telling a user to re-initialize would be both wrong and
+/// destructive-sounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingRequiresGitReason {
+    /// The directory is not inside any git repository.
+    NotARepository,
+    /// The repository exists but has no commit, so `rev-parse HEAD` fails and
+    /// there is no base the runtime could recover into.
+    NoInitialCommit,
+}
+
+impl CodingRequiresGitReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotARepository => "not_a_repository",
+            Self::NoInitialCommit => "no_initial_commit",
+        }
+    }
 }
 
 /// The `kind` column for a trace fact.
@@ -1510,11 +1553,69 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
         }
         let supervisor = self.supervisor(session)?;
+        // Refuse a settled parent here, before `take_fork_messages` consumes the
+        // upload: the supervisor enforces the same rule, but by then the token is
+        // already gone and the caller's retry would fail with an unhelpful
+        // "unknown token" instead of the real reason.
+        //
+        // An unparseable state falls through to the supervisor's authoritative
+        // check rather than refusing: the pre-check is a guard, not the verdict,
+        // and wrongly refusing a live parent is worse than one wasted upload.
+        // An unknown parent must keep reporting `ParentNotFound` (not a bare SQL
+        // "no rows" surfacing as `internal`), so a missing row simply falls
+        // through to the supervisor, which owns that verdict.
+        let parent_state = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_state(parent);
+        if let Ok(parent_state) = parent_state
+            && let Some(state) = TaskState::from_state_label(&parent_state)
+            && classify_terminal(&state) == TerminalKind::Settled
+        {
+            return Err(RuntimeCoordinatorError::ParentSettled {
+                state: parent_state,
+            });
+        }
         // A parent names the directory from its own position, so a relative
         // workdir resolves against the parent's workdir, not the daemon's cwd
         // (which is unrelated to any task). Resolving before the spawn means the
         // supervisor stores the absolute path worker start will look up.
         let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
+        // A coding child needs a recoverable git position. Checked before the
+        // task row is written: a refusal must not leave a queued ghost task the
+        // caller can neither see nor clean up.
+        //
+        // Only directories that exist are judged. Without an explicit workdir the
+        // child inherits the parent's remembered position, which is the directory
+        // a coding child would actually write into; a position the factory
+        // synthesizes at start time is not knowable here. A missing directory is
+        // the parent's earlier mistake and keeps its own, more precise error from
+        // `observe_workdir` rather than being reported as a git problem.
+        let inherited_position = workdir.is_none().then(|| {
+            self.remembered_task_position(parent)
+                .map(|position| position.path)
+        });
+        let target = match (workdir.as_deref(), inherited_position) {
+            (Some(workdir), _) => Some(workdir.to_path_buf()),
+            (None, Some(position)) => position,
+            (None, None) => None,
+        };
+        if workspace_mode == ChildWriteMode::Coding
+            && let Some(target) = target.as_deref().filter(|target| target.is_dir())
+        {
+            coding_git_precondition(target).map_err(|reason| {
+                // Canonicalized so the message names one path, not two spellings
+                // of the same directory (`/var` vs `/private/var` on macOS): the
+                // model quotes this back to the user and runs the remedy there.
+                RuntimeCoordinatorError::CodingRequiresGit {
+                    workdir: target
+                        .canonicalize()
+                        .unwrap_or_else(|_| target.to_path_buf()),
+                    reason,
+                }
+            })?;
+        }
         // Resolve the marker before the child row is written so the inherited
         // value lands in the same INSERT as the row: there is no intermediate
         // state in which the task exists but its marker does not.
@@ -1624,7 +1725,14 @@ impl RuntimeCoordinator {
         // add`) and hands over its path; the daemon only records that position.
         // A bad path fails the spawn rather than deferring to worker start, so
         // the parent learns immediately that its workdir was not usable.
-        if let Some(workdir) = workdir.as_deref() {
+        //
+        // Read-only children are exempt: `prepare_task_workspace` ignores a
+        // read-only task's `workdir` entirely and inherits the nearest
+        // ancestor's position, so validating a directory that will never be used
+        // only manufactures a failure unrelated to what the task does.
+        if workspace_mode == ChildWriteMode::Coding
+            && let Some(workdir) = workdir.as_deref()
+        {
             let registry = self.factory.worker_workspace_registry().ok_or_else(|| {
                 RuntimeCoordinatorError::Supervisor(
                     "coding child requires a prepared-workspace registry".into(),
@@ -2952,16 +3060,43 @@ impl RuntimeCoordinator {
                 .lock()
                 .expect("runtime repository mutex poisoned");
             let attempt = repository.active_attempt_id(&task_id)?;
-            let (turn_delta, token_delta, provider_retry_delta, tool_retry_delta, meaningful) =
-                match update {
-                    WorkerWatchdogEvent::ProviderUsage {
+            let (
+                turn_delta,
+                token_delta,
+                provider_retry_delta,
+                tool_retry_delta,
+                meaningful,
+                usage_delta,
+            ) = match update {
+                WorkerWatchdogEvent::ProviderUsage {
+                    input_tokens,
+                    output_tokens,
+                    // cache write 本次不统计（用户口径只关注 input/output/cache read）。
+                    // 保留在事件里是为了将来记账不需要再动上报链路。
+                    cache_creation_tokens: _,
+                    cache_read_tokens,
+                } => (
+                    1,
+                    input_tokens.saturating_add(output_tokens),
+                    0,
+                    0,
+                    false,
+                    WatchdogTokenDelta {
                         input_tokens,
                         output_tokens,
-                    } => (1, input_tokens.saturating_add(output_tokens), 0, 0, false),
-                    WorkerWatchdogEvent::ProviderRetry => (0, 0, 1, 0, false),
-                    WorkerWatchdogEvent::ToolRetry => (0, 0, 0, 1, false),
-                    WorkerWatchdogEvent::MeaningfulProgress => (0, 0, 0, 0, true),
-                };
+                        cache_read_tokens,
+                    },
+                ),
+                WorkerWatchdogEvent::ProviderRetry => {
+                    (0, 0, 1, 0, false, WatchdogTokenDelta::default())
+                }
+                WorkerWatchdogEvent::ToolRetry => {
+                    (0, 0, 0, 1, false, WatchdogTokenDelta::default())
+                }
+                WorkerWatchdogEvent::MeaningfulProgress => {
+                    (0, 0, 0, 0, true, WatchdogTokenDelta::default())
+                }
+            };
             repository.record_watchdog_progress(
                 &task_id,
                 &attempt,
@@ -2971,6 +3106,7 @@ impl RuntimeCoordinator {
                 tool_retry_delta,
                 meaningful,
                 Utc::now(),
+                usage_delta,
             )?;
         }
         for (task_id, message_id) in &consumed_overrides {
@@ -4226,6 +4362,31 @@ impl RecoveryContext {
             tool_state_json: self.tool_state_json.clone(),
         }
     }
+}
+
+/// Whether `workdir` can host a coding child: it must be inside a git worktree
+/// *and* that worktree must already have a commit.
+///
+/// The second half is not redundant. `git init` alone makes `--show-toplevel`
+/// succeed while `rev-parse HEAD` still fails, so a check on the toplevel only
+/// would admit the child, let it run its whole task, and then fail it at
+/// delivery with an opaque `Git workspace error`. Checking HEAD here turns that
+/// into an immediate, actionable refusal.
+fn coding_git_precondition(workdir: &std::path::Path) -> Result<(), CodingRequiresGitReason> {
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !run(&["rev-parse", "--show-toplevel"]) {
+        return Err(CodingRequiresGitReason::NotARepository);
+    }
+    if !run(&["rev-parse", "HEAD"]) {
+        return Err(CodingRequiresGitReason::NoInitialCommit);
+    }
+    Ok(())
 }
 
 /// Runs git and returns its stdout on success. `None` on any failure keeps the

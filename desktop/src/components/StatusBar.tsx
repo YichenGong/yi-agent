@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { compact } from "../lib/compactNumber";
-import type { Usage, UsageTotals } from "../lib/protocol";
+import type { SubagentTotals, Usage, UsageTotals } from "../lib/protocol";
 import { RollingNumber } from "./RollingNumber";
 import { UsagePanel } from "./UsagePanel";
 
@@ -37,6 +37,8 @@ export function StatusBar({
   cwd,
   status,
   totals,
+  subagentTotals,
+  subagentCount,
   fallbackUsage,
   usageId,
   actions,
@@ -48,6 +50,15 @@ export function StatusBar({
    * 会话累计用量（本会话所有 provider 调用之和）。这是折叠态与面板的主体。
    */
   totals: UsageTotals | null;
+  /**
+   * 本会话所有 subagent 的累计用量。折叠态把它**加进**主会话数字里显示合计，
+   * 展开面板则分开显示两组。
+   */
+  subagentTotals: SubagentTotals;
+  /**
+   * 本会话的子任务数量，只用于读屏句子（"including subagents, N subagents"）。
+   */
+  subagentCount: number;
   /**
    * 最后一次调用的快照。仅在 `totals === null`（老服务端）时用来兜底显示，
    * 它代表的是「一轮」而非整个会话，不能冒充累计值。
@@ -86,6 +97,20 @@ export function StatusBar({
         }
       : null);
   const model = fallbackUsage?.model ?? null;
+  // 「有没有 subagent」看用量而不是看数量：一个跑完但没烧 token 的子任务不该让
+  // 折叠态改口径。数量只影响读屏句子里那句 "N subagents"。
+  const hasSubagents =
+    subagentTotals.input + subagentTotals.output + subagentTotals.cacheRead > 0;
+  // 折叠态展示的是合计：主会话 + 本会话所有 subagent。cacheWrite 不参与——
+  // subagent 的 cache write 不在用户口径内，主会话的自己那份保持原值。
+  const combined: UsageTotals | null = shown
+    ? {
+        input: shown.input + subagentTotals.input,
+        output: shown.output + subagentTotals.output,
+        cacheRead: shown.cacheRead + subagentTotals.cacheRead,
+        cacheWrite: shown.cacheWrite,
+      }
+    : null;
   return (
     <div className="app-statusbar relative flex items-center gap-3 border-b border-line bg-panel px-4 py-2 text-xs text-fg-muted">
       <span
@@ -109,16 +134,24 @@ export function StatusBar({
              * 并另给一句完整文本：读屏拿到的仍是精确数字。
              */}
             <span className="sr-only">
-              {totals
-                ? `${thousands(totals.input)} cumulative input / ${thousands(totals.cacheRead)} cumulative cache read / ${thousands(totals.output)} cumulative output`
-                : `${thousands(shown.input)} in / ${thousands(shown.output)} out`}
+              {/*
+               * 读屏句子必须与可见数字表达**同一件事**（都是合计），否则读屏用户
+               * 与视觉用户看到的是两个数。没有 subagent 时逐字保持原句。
+               */}
+              {combined === null
+                ? ""
+                : !totals
+                  ? `${thousands(combined.input)} in / ${thousands(combined.output)} out`
+                  : hasSubagents
+                    ? `${thousands(combined.input)} cumulative input / ${thousands(combined.cacheRead)} cumulative cache read / ${thousands(combined.output)} cumulative output, including subagents, ${subagentCount} subagents`
+                    : `${thousands(combined.input)} cumulative input / ${thousands(combined.cacheRead)} cumulative cache read / ${thousands(combined.output)} cumulative output`}
             </span>
             <span aria-hidden="true" className="inline-flex items-center gap-1">
-              <RollingToken value={shown.input} label="in" usageKey={usageId} />
+              <RollingToken value={combined!.input} label="in" usageKey={usageId} />
               <span className="text-fg-muted/60">/</span>
-              <RollingToken value={shown.cacheRead} label="cache" usageKey={usageId} />
+              <RollingToken value={combined!.cacheRead} label="cache" usageKey={usageId} />
               <span className="text-fg-muted/60">/</span>
-              <RollingToken value={shown.output} label="out" usageKey={usageId} />
+              <RollingToken value={combined!.output} label="out" usageKey={usageId} />
             </span>
           </button>
         )}
@@ -133,8 +166,14 @@ export function StatusBar({
         )}
         {actions}
       </div>
-      {shown && showUsage && (
-        <UsagePanel totals={shown} isFallback={totals === null} model={model} />
+      {shown && combined && showUsage && (
+        <UsagePanel
+          totals={shown}
+          subagentTotals={subagentTotals}
+          hasSubagents={hasSubagents}
+          isFallback={totals === null}
+          model={model}
+        />
       )}
     </div>
   );

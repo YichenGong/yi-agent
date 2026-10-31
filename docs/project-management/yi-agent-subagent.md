@@ -54,11 +54,11 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   `cargo test -p yi-agent-subagent --test attach_delegation`
 - [x] 运行时归属与自愈原语 — `src/attach.rs` 的 `probe_runtime` / `ensure_owned_runtime` /
   `retire_if_wedged`，与 `src/binding.rs` 的 `RuntimeBinding`（`managed` / `fixed`）：
-  委派工具持 `Arc<RuntimeBinding>`，每次调用经 `current_or_repair` 解析当届 socket 与
-  root，`send` 遇 liveness 失败时先 `repair`（单飞，避免并发起两个 daemon）再重试一次；
-  `activate` 走同一条通道。判据：启动该 runtime 的进程退出后，下一次委派调用仍能自愈。
-  `fixed` 绑定（TUI 整个会话自己持有 daemon）行为与过去完全一致。验证：
-  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-app-server --lib a_dead_runtime_is_repaired`
+  委派工具持 `Arc<ThreadRoot>`，每次调用经 `ThreadRoot::send_as_root` 解析当届 socket
+  与 root；`send` 遇 liveness 失败时先 `repair`（单飞，避免并发起两个 daemon）再重试
+  一次；`activate` 走同一条通道。判据：启动该 runtime 的进程退出后，下一次委派调用仍能
+  自愈。`fixed` 绑定（TUI 整个会话自己持有 daemon）行为与过去完全一致。验证：
+  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-app-server --lib a_dead_runtime_is_repaired_on_the_next_tool_call`
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
@@ -95,14 +95,52 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
 - [x] worker 工厂按 `subagent_model` 解析 provider/model — `worker_factory`（`src/attach.rs:88`）从**调用方注入的**机器级清单路径（新增 `models_path: &Path` 形参，经 `load_catalog_from` 读取；不再自取 `$HOME`）取 `subagent_entry`（缺省回退全局默认、再无则回退进程 cfg），经 `resolve_effective`（`src/attach.rs:113`）得到该条目的 provider/api_url/api_key/model 去 `build_provider`；改完 `subagent_model` 下次项目 daemon 重启生效。该路径经 `attach_project_runtime` / `ensure_owned_runtime` / `RuntimeBinding::managed` 从 app-server 的 `RuntimeAttachments.models_path` 与 CLI 的 `yi_agent_runtime::models::models_path()` 一路传入，使委派链路可被隔离测试（见 `docs/bug-list.md`「委派 worker 工厂重读 $HOME」条）。验证 `cargo test -p yi-agent-subagent --lib the_worker_uses_the_subagent_model_entry`、`cargo test -p yi-agent-subagent --lib the_worker_falls_back_to_the_global_default`、`cargo test -p yi-agent-subagent --lib the_public_worker_factory_reads_the_injected_catalog the_public_worker_factory_never_falls_back_to_home`
 
 **边界（两端口一致，故记在这里）：** attach 与工具注册**不看**项目是不是 git 仓库（非
-git 目录原地成 root，`workspace_root == project_root`），真正需要仓库的是后续 `spawn_agent`
-——daemon 的 worker 准入要求可恢复的 `worktree:` lease。因此非 git 项目下「工具在、调用被拒」。
+git 目录原地成 root，`workspace_root == project_root`）。`spawn_agent` 之后按 mode 分流：
+
+- `mode: "read_only"`（默认）— 不写任何文件，因而**不需要** git：非 git 目录下可正常启动、
+  原地运行并在文本结果收口时进入终态。仓库层的准入凭据是 `checkpoint_json.kind ==
+  "read_only_checkpoint"`（`worktree_lease` 缺失是允许的，但**只**对该 kind 允许，不让
+  「丢了 lease 的 coding worker」蒙混过关）。
+- `mode: "coding"` — 必须落在**带 HEAD 的 git worktree**里。判据是两道：`git rev-parse
+  --show-toplevel` 成功 **且** `git rev-parse HEAD` 成功。只做 `git init` 不做提交会被拒
+  （实测：空仓库 `--show-toplevel` 成功、`rev-parse HEAD` 失败），因此提示词里的修复动作是
+  `git init` + `git add -A` + `git commit -m "initial commit"`。
+- 拒绝发生在**写任务行之前**（`RuntimeCoordinator::spawn_child_with_objective`），不留下
+  queued 僵尸行；错误为 `CodingRequiresGit { workdir, reason }`，IPC 上是 `Validation` 且
+  消息带 `coding_requires_git:` 前缀，`reason` 为 `not_a_repository` 或 `no_initial_commit`
+  （两者的 `remedy.commands` 不同：后者**不含** `git init`，避免提示去重建已有仓库）。
+- 工具层（`coding_requires_git_payload`）把该消息翻成结构化 JSON：`code`、`workdir`、
+  `reason`、`remedy.commands`、`remedy.requires_initial_commit`、`ask_user`。父 LLM 据此
+  征询用户；用户同意后自行用 `bash` 执行命令再重试一次，拒绝后本会话不再起 coding child
+  （纯提示词约束，无 daemon 侧状态）。
+
 app-server 侧的钉法是 `cargo test -p yi-agent-app-server
-a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
+a_non_git_cwd_attaches_in_place_with_the_delegation_tools`（同时断言 read-only 被接受、
+coding 被拒且带前缀），store 侧为 `cargo test -p yi-agent-store --test runtime_coordinator
+non_git_read_only_child` / `non_git_coding_child_is_refused_without_a_queued_row`。
 
 - [x] daemon 工厂按指纹跟随模型清单（运行期热重载）— `DaemonAgentWorkerFactory::with_catalog_watcher(cfg, watcher)`（`src/lib.rs:231`）装一个 `WorkerRefresh`（`:121`）；worker start 时先用 `EffectiveKey::of`（`:98`，`resolve_effective` 覆盖的 6 字段）比对缓存，命中则复用，未命中则 `WorkerParts::rebuild`（`:55`）按当前清单重建 provider/tools/config/sandbox（装配口径与 `attach::build_worker_factory` 一致：skills-only 注册表 + 同一组 `bootstrap` 构造函数）；重建失败保留上一次可用派生件。**`new()` 签名逐字节不变**，未装刷新器的 22 处既有构造点行为不变（零回归）；`worker_config_model` 仅在无刷新器时生效，有刷新器时模型名来自当前清单条目。生产装配在 `attach.rs:156`（`build_worker_factory` 新增 `models_path` 形参后 `.with_catalog_watcher(cfg.clone(), CatalogWatcher::new(models_path))`）。验证：`cargo test -p yi-agent-subagent`（65 lib + 5 e2e，含 `a_watcher_backed_factory_follows_a_changed_subagent_model`、`a_factory_without_a_watcher_keeps_its_static_config`、`the_attached_worker_factory_follows_a_changed_catalog`、`the_attached_worker_factory_survives_a_corrupt_catalog`）；真机三步判据见 `yi-agent/tests/model_catalog_live_reload_e2e.rs` — [设计](../superpowers/specs/2026-10-17-model-catalog-live-reload-design.md)
 
 - [x] worker 工具注册的根集参数 + 「FS 根集 ≠ 沙箱可写根」 — `DaemonAgentWorkerFactory::worker_tool_registry`（`src/lib.rs:306`）/ `worker_tool_registry_with_base`（`src/lib.rs:328`）新增第 4 个参数 `inherited_roots: Vec<PathBuf>`（父会话下发的关联根，主根除外；空集即今天的单根 worker），把它并进 **FS 根集** `fs_roots = [worktree] + inherited_roots`（`src/lib.rs:339`）。**两个根集刻意分开**：`fs_roots` 进 FS 工具（`read`/`write`/`edit`/`glob`/`grep` 的多根校验），而 `git_writable_roots_for_worktree`（`src/lib.rs:1239`）产出的 git 内部目录**只**并入 shell 沙箱的额外可写根 `writable_roots`（`src/lib.rs:345`），**绝不**进 FS 根集——否则 `write` 能直写 `.git`（该约束写在 `src/lib.rs:355` 的注释里）。接线：`WorkerStart.extra_roots`（`yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs:97`）在 `start_with_provider_turn_gate` 里被取出并下传给注册函数（`src/lib.rs:766`）。ReadOnly 子任务只扩读、不注册写工具。验证：`cargo test -p yi-agent-subagent --lib coding_worker_gets_fs_tools_over_the_inherited_roots`、`--lib read_only_worker_inherits_roots_without_write_tools`、`--lib coding_worker_shell_sandbox_covers_the_inherited_roots`、`--lib fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs`、`--lib worker_start_hands_the_inherited_roots_to_its_fs_tools`（分别钉住 FS 工具覆盖关联根、只读不扩写、沙箱覆盖关联根、两集不混、`WorkerStart` 真到达 FS 工具）— [设计](../superpowers/specs/2026-10-17-linked-workspace-roots-design.md)
+
+- [x] 陈旧 conversation root 的三分类自愈入口 `ThreadRoot::send_as_root` — 六个委派工具（七个 `send_as_root`
+  调用点：application 与 worker 两套各有 spawn/send_message）不再各自
+  `handle()` + 裸 `send_request`（那条路径**没人**处理失效），统一走
+  `ThreadRoot::send_as_root`（`src/thread_root.rs:243`），按失败层分类：传输层
+  （`is_liveness_error`，`src/binding.rs:332`，即 socket 没了）先 `binding.repair()`
+  （`src/binding.rs:226`，单飞 + 推进 generation）再重读 `handle()` 重发一次；身份层
+  （`is_stale_root_response`，`src/binding.rs:360`，即 socket 健在但 `session_id` /
+  `root_task_id` / `capability` 在替换后的 daemon 里查不到，稳定返回 `NotFound` /
+  `AuthorityDenied`）先丢缓存 root、再 `repair()`，然后 `Idempotent` 重发一次、
+  `SingleShot` 返回 `stale_root_hint()`（`src/thread_root.rs:16`）让模型自己重试；
+  业务拒绝原样返回、绝不重试。传输层分支**不能**直接 `handle()`：缓存 root 仍属当届
+  generation，`attach()` 会短路返回 `Ok`，重发又打向同一个死 socket——这才是原来的 bug。
+  `detach()`（`src/thread_root.rs:320`）与 repair 脱钩：缓存里没有属于当届 generation 的
+  root 就直接返回，故「回收」不会把已退休的 daemon 冷启动回来。验证：
+  `cargo test -p yi-agent-subagent`（87 lib + 14 e2e，含
+  `detaching_a_retired_root_does_not_start_a_daemon`、`a_replaced_daemon_invalidates_the_cached_root`、
+  `a_non_idempotent_call_reports_the_stale_root_instead_of_replaying`）—
+  [设计](../superpowers/specs/2026-10-29-delegation-stale-root-self-heal-design.md)
 
 **验证命令：** `cargo test -p yi-agent-subagent`（含 `binding::` 单测与
 `application_tools_share_one_binding`；依赖真 socket 的 `probe_reports_healthy_on_status`

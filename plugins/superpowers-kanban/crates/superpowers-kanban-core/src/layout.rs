@@ -39,6 +39,27 @@ pub fn global_preferences_path() -> Option<PathBuf> {
     })
 }
 
+pub fn global_settings_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    global_settings_path_in(&PathBuf::from(home))
+}
+
+/// 插件自己的全局配置目录：`$HOME/.yi-agent/plugins/superpowers-kanban/`。
+///
+/// 与 `$HOME/.yi-agent/superpowers-kanban/`（看板状态 + `leases/`）刻意分开：
+/// 那个是**运行时状态**，这个是**用户配置**。混在一起时，清理状态目录会连带
+/// 抹掉用户的并发配额。
+pub fn global_plugin_dir(home: &Path) -> PathBuf {
+    home.join(".yi-agent")
+        .join("plugins")
+        .join("superpowers-kanban")
+}
+
+/// [`global_plugin_dir`] 下的配置文件路径。
+pub fn global_settings_path_in(home: &Path) -> Option<PathBuf> {
+    Some(global_plugin_dir(home).join("superpowers-kanban.toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

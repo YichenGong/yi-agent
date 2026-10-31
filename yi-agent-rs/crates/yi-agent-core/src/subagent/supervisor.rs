@@ -37,6 +37,8 @@ pub enum SpawnError {
     MaximumDepthReached,
     #[error("an agent may have at most {limit} direct children")]
     DirectChildLimitReached { limit: usize },
+    #[error("a settled parent task (state: {state}) cannot spawn descendants")]
+    ParentSettled { state: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1279,6 +1281,19 @@ impl AgentSupervisor {
             .tasks
             .get(&parent_id)
             .ok_or(SpawnError::ParentNotFound)?;
+        // A settled parent is finished: any child spawned now falls outside the
+        // terminal cascade (which only fires on the transition itself) and its
+        // result has nowhere to go, because deliver_message refuses a terminal
+        // recipient. Refuse the spawn instead of building a dead subtree.
+        //
+        // classify_terminal, not is_terminal: recovery_required is terminal for
+        // bookkeeping but parked and resumable, and a resumed parent keeps
+        // spawning.
+        if let TerminalKind::Settled = classify_terminal(parent.state()) {
+            return Err(SpawnError::ParentSettled {
+                state: task_state_label(parent.state()),
+            });
+        }
         let child_depth = parent
             .depth
             .can_spawn_child()
@@ -1957,13 +1972,13 @@ impl AgentSupervisor {
 /// bookkeeping but is a *parked, resumable* state, so cascading on it would
 /// kill children the parent could still need after a resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalKind {
+pub enum TerminalKind {
     NonTerminal,
     Settled,
     RecoveryRequired,
 }
 
-fn classify_terminal(state: &TaskState) -> TerminalKind {
+pub fn classify_terminal(state: &TaskState) -> TerminalKind {
     match state {
         TaskState::Completed
         | TaskState::CompletedNoChanges
@@ -2106,6 +2121,47 @@ mod provider_turn_priority_tests {
         handle.report_delivery(delivery.clone());
         supervisor.reconcile_worker_events().unwrap();
         (supervisor, parent, child, delivery)
+    }
+}
+
+#[cfg(test)]
+mod state_label_inverse_tests {
+    use super::*;
+    use crate::subagent::task::WaitSelector;
+
+    /// `task_state_label` 与 `TaskState::from_state_label` 必须互为逆运算：
+    /// 否则 runtime 的预检会用一个库能存的标签喂给一个不认识它的解析器。
+    #[test]
+    fn supervisor_labels_round_trip_through_from_state_label() {
+        let states = vec![
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::WaitingForChildren(WaitSelector::AnyChild),
+            TaskState::Paused(PauseReason("p".into())),
+            TaskState::Completed,
+            TaskState::CompletedNoChanges,
+            TaskState::Blocked(BlockReason("b".into())),
+            TaskState::TimedOut(TimeoutKind::WallClock),
+            TaskState::BudgetExhausted(BudgetKind::Turns),
+            TaskState::Failed(TaskFailure::new("f")),
+            TaskState::Cancelled(CancelReason("c".into())),
+            TaskState::RecoveryRequired(RecoveryEvidence("r".into())),
+        ];
+        for state in states {
+            let label = task_state_label(&state);
+            let parsed = TaskState::from_state_label(label)
+                .unwrap_or_else(|| panic!("{label} must parse back"));
+            assert_eq!(
+                task_state_label(&parsed),
+                label,
+                "round trip changed the label for {label}"
+            );
+            assert_eq!(
+                classify_terminal(&parsed),
+                classify_terminal(&state),
+                "round trip changed the terminal kind for {label}"
+            );
+        }
     }
 }
 

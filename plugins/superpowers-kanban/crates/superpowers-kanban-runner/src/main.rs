@@ -49,7 +49,7 @@ fn effective_interval(cli: Option<Duration>, state_dir: &std::path::Path) -> Dur
     if let Some(cli) = cli {
         return cli;
     }
-    let secs = ConcurrencyCalendar::load_preferring_new(state_dir).interval_secs;
+    let secs = ConcurrencyCalendar::load_merged(state_dir).interval_secs;
     Duration::from_secs(secs)
 }
 
@@ -798,6 +798,25 @@ fn command_merge_request(state_dir: &std::path::Path, card_id: &str) -> Result<S
                 .unwrap_or_else(|| "another merge is running in this project".to_string());
             Ok(format!("busy: {holder}\nwait for it to finish"))
         }
+        // 入队成功（含重复调用的幂等返回）：队列由 daemon 每拍推进，所以这里
+        // 只报排位，不报「合并已开始」。`position` 是前面还有几张，0 = 队首。
+        Some("queued") => {
+            let position = value
+                .get("position")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if position == 0 {
+                Ok(format!(
+                    "queued: {card_id} is at the head of the merge queue; \
+                     the daemon starts it on the next tick"
+                ))
+            } else {
+                Ok(format!(
+                    "queued: {card_id} has {position} merge(s) ahead of it; \
+                     the daemon starts it when it reaches the head"
+                ))
+            }
+        }
         Some("denied") => Err(format!(
             "denied: {}",
             value
@@ -1134,7 +1153,7 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
 /// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
-    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
+    let calendar = ConcurrencyCalendar::load_merged(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
     // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
     // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。
@@ -1646,6 +1665,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = command_merge_request(dir.path(), "nope").unwrap_err();
         assert!(err.contains("denied"), "{err}");
+    }
+
+    /// `merge-request` 现在只**入队**，CLI 必须把「排上了」如实打出来。
+    ///
+    /// 回归锁：早期实现只认 `granted`，入队成功会走进 `unexpected ...` 分支并以
+    /// 非零退出——用户以为申请失败，其实卡已经在队里了。
+    #[test]
+    fn merge_request_prints_the_queue_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        let id = superpowers_kanban_core::card::CardId::new("card-1");
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&id, superpowers_kanban_core::card::CardState::AwaitingMerge)
+            .unwrap();
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+
+        let out = command_merge_request(state_dir, "card-1").expect("enqueue succeeds");
+        assert!(out.starts_with("queued"), "{out}");
+        assert!(out.contains("card-1"), "{out}");
+        assert!(
+            out.contains("head"),
+            "first in the queue is the head: {out}"
+        );
+        // 重复调用是幂等的：仍在队里，不打错误、不重复入队。
+        let again = command_merge_request(state_dir, "card-1").expect("idempotent");
+        assert!(again.starts_with("queued"), "{again}");
+        let saved = superpowers_kanban_runner::persist::read_board(state_dir);
+        let card = saved.get(&id).expect("card survives");
+        assert_eq!(
+            card.state,
+            superpowers_kanban_core::card::CardState::MergeQueued
+        );
     }
 
     #[test]

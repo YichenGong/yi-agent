@@ -111,7 +111,8 @@ CAS 的 `expected` 仍是 `title_from(prompt)`，与 `touch` 写入的字节完�
 |---|---|
 | `touch` 返回 `false`（已有标题 / 组长 / 驱动会话） | 不生成 |
 | `touch` 返回 `Err` | 记 stderr；不生成（标题是展示层，不影响 turn） |
-| `user_prompt` 全空白（图片-only 消息） | 不生成（没有可用的标题材料） |
+| `user_prompt` 全空白（图片-only / 附件-only 消息） | 不生成，保留空标题或原兜底值（`display_text` 是用户原话，不含附件清单；无文本即无标题材料）。这是刻意的边界，不是缺陷 |
+| 手动改名之后 | 不再生成。标题非空后 `touch` 永不返回 `true`，同一会话的自动命名只发生一次 |
 | provider 报错 / 超时 / 清洗为空 | 保留兜底标题，记 `tracing::info!` |
 | CAS 返回 `Ok(false)`（被手动改名抢占） | 静默跳过，不广播 |
 | 广播失败 | 记 stderr |

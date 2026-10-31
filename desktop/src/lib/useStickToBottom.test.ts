@@ -35,7 +35,11 @@ const flushRaf = () => {
   cbs.forEach((cb) => cb(0));
 };
 
-let api: { scrollToBottom: () => void; followIfAtBottom: () => void } | null = null;
+let api: {
+  scrollToBottom: () => void;
+  followIfAtBottom: () => void;
+  releaseFollow: () => void;
+} | null = null;
 
 beforeEach(() => {
   observers = [];
@@ -61,8 +65,12 @@ afterEach(() => {
 function Harness() {
   const stick = useStickToBottom();
   useEffect(() => {
-    api = { scrollToBottom: stick.scrollToBottom, followIfAtBottom: stick.followIfAtBottom };
-  }, [stick.scrollToBottom, stick.followIfAtBottom]);
+    api = {
+      scrollToBottom: stick.scrollToBottom,
+      followIfAtBottom: stick.followIfAtBottom,
+      releaseFollow: stick.releaseFollow,
+    };
+  }, [stick.scrollToBottom, stick.followIfAtBottom, stick.releaseFollow]);
   return createElement("div", { ref: stick.ref, "data-testid": "scroller" }, "x");
 }
 
@@ -83,6 +91,36 @@ function installMetrics(
     get: () => state.scrollTop,
     set: (v: number) => {
       state.scrollTop = v;
+    },
+  });
+  return state;
+}
+
+/**
+ * 与 `installMetrics` 相同，但**按真实布局语义夹取 `scrollTop`**。
+ *
+ * 真实浏览器里 `scrollTop` 永远落在 `[0, scrollHeight - clientHeight]`：写
+ * `scrollTop = scrollHeight` 实际只会得到当时的最大值。这就是「贴底」之后再
+ * 长高内容时 `gap` 会变成增量，而不是 0 的原因——用不夹取的替身会把这个缺陷
+ * 掩盖掉（测试恒绿，线上恒错）。
+ */
+function installClampedMetrics(
+  el: HTMLElement,
+  init: { scrollHeight: number; clientHeight: number; scrollTop?: number },
+) {
+  const state = {
+    scrollHeight: init.scrollHeight,
+    clientHeight: init.clientHeight,
+    scrollTop: init.scrollTop ?? 0,
+  };
+  const maxTop = () => Math.max(0, state.scrollHeight - state.clientHeight);
+  Object.defineProperty(el, "scrollHeight", { configurable: true, get: () => state.scrollHeight });
+  Object.defineProperty(el, "clientHeight", { configurable: true, get: () => state.clientHeight });
+  Object.defineProperty(el, "scrollTop", {
+    configurable: true,
+    get: () => state.scrollTop,
+    set: (v: number) => {
+      state.scrollTop = Math.min(Math.max(0, v), maxTop());
     },
   });
   return state;
@@ -158,6 +196,110 @@ describe("useStickToBottom", () => {
     state.scrollHeight = 1200;
     act(() => api!.followIfAtBottom());
     expect(state.scrollTop).toBe(1200);
+  });
+
+  /**
+   * 真实浏览器实测（Chrome，真实布局）：`scrollTop = scrollHeight` 写入后，浏览器
+   * 在**后续的 scroll steps** 才派发 `scroll` 事件；若这之前内容又长高了（流式
+   * throttle 窗口内新增的文本），事件送达时 `gap` 已经是新增的高度（实测 126px）。
+   * 用当下的绝对 gap 重算意图会把「我们自己刚贴的底」判成「用户上翻」，跟随就此
+   * 永久关闭——正是「生成到某处停住、后面内容继续长但视口不贴底」的现场。
+   */
+  it("keeps following when the scroll event lands after the content already grew", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installClampedMetrics(el, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    fireEvent.scroll(el); // 用户贴底
+    act(() => api!.scrollToBottom()); // 我们写 scrollTop = scrollHeight -> 夹到 600
+    expect(state.scrollTop).toBe(600);
+    // 内容在事件送达之前增长：scrollHeight 1000 -> 1726，scrollTop 仍停在 600。
+    state.scrollHeight = 1726;
+    fireEvent.scroll(el); // 浏览器派发的 scroll 事件，此刻 gap = 726
+    // 意图必须仍是「贴底」：这次增长来自我们自己贴底之后的内容，不是用户上翻。
+    state.scrollHeight = 2000;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(1600);
+  });
+
+  it("still stops following when the user actually scrolls up", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installClampedMetrics(el, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    fireEvent.scroll(el); // 贴底
+    // 用户真的往上滑了：scrollTop 变小、内容高度没变。
+    state.scrollTop = 100;
+    fireEvent.scroll(el);
+    state.scrollHeight = 1200;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(100);
+  });
+
+  it("accumulates sub-pixel upward steps so a slow scroll-up still releases follow", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installClampedMetrics(el, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    fireEvent.scroll(el); // 贴底
+    // 触控板慢速上滑：每个 scroll 事件只移动 0.4px，低于噪声下限。
+    // 累计 8px 后必须越过 4px 容差、真的放弃跟随；若把基线每次重置到当前值，
+    // 每步的 0.4px 都低于下限，就永远触发不了上翻。
+    for (let i = 1; i <= 20; i += 1) {
+      state.scrollTop = 600 - i * 0.4;
+      fireEvent.scroll(el);
+    }
+    state.scrollHeight = 1400;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBeCloseTo(592, 1);
+  });
+
+  it("does not release follow on a small upward jitter that is still inside the threshold", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installClampedMetrics(el, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    fireEvent.scroll(el); // 贴底
+    // 行高取整 / 图片解码 / 上方内容重排都可能让 scrollTop 突然少 3px——
+    // 这仍在 4px 容差内，用户没有表达任何上翻意图。
+    state.scrollTop = 597;
+    fireEvent.scroll(el);
+    state.scrollHeight = 1400;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(1000); // 必须继续跟随
+  });
+
+  it("ignores sub-pixel jitter while still at the bottom", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installClampedMetrics(el, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    fireEvent.scroll(el); // 贴底
+    // 设备像素比带来的浮点抖动：0.5px 级别、来回跳。
+    state.scrollTop = 599.5;
+    fireEvent.scroll(el);
+    state.scrollTop = 600;
+    fireEvent.scroll(el);
+    state.scrollTop = 599.6;
+    fireEvent.scroll(el);
+    state.scrollHeight = 1400;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(1000); // 仍在跟随，贴到新的底部
   });
 
   it("forces the bottom even when the user scrolled up (explicit intent)", () => {
@@ -239,6 +381,19 @@ describe("useStickToBottom", () => {
     fireResize(400); // same height again: not a change
     expect(rafCallbacks.size).toBe(0);
     expect(state.scrollTop).toBe(600);
+  });
+
+  it("releases follow without moving the viewport", () => {
+    // 恢复阅读位置后必须放弃跟随，否则下一个 delta 会把人拽回底部；
+    // 但它不能自己动视口——位置由调用方刚设好。
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installMetrics(el, { scrollHeight: 1000, clientHeight: 400, scrollTop: 500 });
+    fireEvent.scroll(el);
+    act(() => api!.releaseFollow());
+    state.scrollHeight = 2000;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(500);
   });
 
   it("degrades gracefully when ResizeObserver is unavailable", () => {

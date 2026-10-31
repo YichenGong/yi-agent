@@ -136,6 +136,16 @@ export interface ThreadSummary {
   content_epoch?: number | null;
   /** 服务端最后一条 item 的 id；`null` = 该会话从未有过 item。 */
   last_item_id?: string | null;
+  /**
+   * 共享已读水位（epoch 毫秒）：**所有客户端共用**的「读到哪了」。
+   *
+   * 未读由 `last_completed_at > last_read_at` 派生，故断线重连后靠这两个值就能
+   * 补回「离线期间跑完的回合」——推送当时没人在听。旧服务端不发送 ⇒ 按 0 处理
+   * （那时等于「没读过也没完成过」，不得凭空亮蓝点）。
+   */
+  last_read_at?: number | null;
+  /** 最近一次**回合结束**的时间（epoch 毫秒）。`0` = 从未完成过回合。 */
+  last_completed_at?: number | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
@@ -167,6 +177,28 @@ export interface UsageTotals {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+}
+
+/**
+ * 本会话所有 subagent 的累计用量（客户端形状）。
+ *
+ * 与 {@link UsageTotals} 刻意分开：不含 `cacheWrite`（用户口径只看 cache read），
+ * 也**不**并入 `UsageTotals`——`/usage` 与展开面板要把主会话与子 agent 分开显示。
+ * 恒为具体数字，没有 subagent 时是三个 0（用 `> 0` 判断是否展示）。
+ */
+export interface SubagentTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+}
+
+/** 没有 subagent 时的零值。常量而非每次新建，便于 `===` 之外的浅比较稳定。 */
+export const NO_SUBAGENTS: SubagentTotals = { input: 0, output: 0, cacheRead: 0 };
+
+/** 三项之和是否为正——即「这个会话到底有没有 subagent 用量」。 */
+export function hasSubagentUsage(t: SubagentTotals | null | undefined): boolean {
+  if (!t) return false;
+  return t.input + t.output + t.cacheRead > 0;
 }
 
 /** `thread/readItems` 回包里的累计用量（线形状）。 */

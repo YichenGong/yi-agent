@@ -264,3 +264,40 @@ describe("MarkdownText light-theme transcript readability", () => {
     expect(contrastRatio(color!, surface)).toBeGreaterThan(3);
   });
 });
+
+describe("MarkdownText search highlighting", () => {
+  it("marks every occurrence of the query", () => {
+    const { container } = render(<MarkdownText text={"alpha beta alpha"} query="alpha" />);
+    const hits = container.querySelectorAll("mark.search-hit");
+    expect(hits.length).toBe(2);
+    expect(hits[0].textContent).toBe("alpha");
+  });
+
+  it("marks text inside fenced code", () => {
+    const { container } = render(
+      <MarkdownText text={"```\nconst needle = 1;\n```"} query="needle" />,
+    );
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(1);
+  });
+
+  it("renders no mark when the query is only whitespace", () => {
+    const { container } = render(<MarkdownText text={"alpha"} query="   " />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(0);
+  });
+
+  it("re-parses when the query changes but keeps the text", () => {
+    const { container, rerender } = render(<MarkdownText text={"alpha beta"} query="alpha" />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(1);
+    rerender(<MarkdownText text={"alpha beta"} query="beta" />);
+    const hits = container.querySelectorAll("mark.search-hit");
+    expect(hits.length).toBe(1);
+    expect(hits[0].textContent).toBe("beta");
+  });
+
+  it("drops all marks when the query is cleared", () => {
+    const { container, rerender } = render(<MarkdownText text={"alpha"} query="alpha" />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(1);
+    rerender(<MarkdownText text={"alpha"} query="" />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(0);
+  });
+});

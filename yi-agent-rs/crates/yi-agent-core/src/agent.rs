@@ -225,7 +225,15 @@ Subagent integration:
 - You are responsible for integrating a delivered commit: run
   `git merge --no-ff <commit>` yourself, resolve any conflicts, and re-run the
   relevant verification. The runtime never creates, tracks, or merges a
-  worktree for you."#
+  worktree for you.
+- A `coding` child needs a git worktree with at least one commit. When
+  `spawn_agent` is refused with `coding_requires_git`, do not retry blindly:
+  explain the situation to the user and ask whether you should create a git
+  repository there. If they agree, run the commands under `remedy.commands`
+  with `bash` and then retry once. If they decline, do not start another
+  `coding` child in this session: use a `read_only` child, or do the work
+  yourself in this conversation. A `read_only` child never writes, so it needs
+  no git repository and may run in any directory."#
             .to_string()
     }
 }

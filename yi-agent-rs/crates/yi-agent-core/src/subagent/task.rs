@@ -218,6 +218,46 @@ impl TaskState {
         }
     }
 
+    /// Parses the bare label stored in `tasks.state_json` back into a state.
+    ///
+    /// The store keeps bare labels (`completed`), while `TaskState`'s serde shape
+    /// is PascalCase (`"Completed"`), so serde cannot read a persisted row. This
+    /// is the inverse of the supervisor's `task_state_label`, and exists so callers
+    /// outside the state machine (the runtime coordinator) can classify a
+    /// persisted parent without keeping a second copy of the terminal vocabulary.
+    ///
+    /// Payload-bearing variants get a stand-in payload: only the variant identity
+    /// matters to callers, and inventing a reason string here would be a lie the
+    /// caller could accidentally persist.
+    pub fn from_state_label(label: &str) -> Option<Self> {
+        match label {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "waiting_for_resource" => Some(Self::WaitingForResource(ResourceWait(String::new()))),
+            "waiting_for_permission" => {
+                // A uuid newtype, not a string tuple: `String::new()` does not exist.
+                Some(Self::WaitingForPermission(PermissionRequestId::new()))
+            }
+            "waiting_for_children" => Some(Self::WaitingForChildren(WaitSelector::AnyChild)),
+            "paused" => Some(Self::Paused(PauseReason(String::new()))),
+            "completed" => Some(Self::Completed),
+            "completed_no_changes" => Some(Self::CompletedNoChanges),
+            "blocked" => Some(Self::Blocked(BlockReason(String::new()))),
+            "stalled" => Some(Self::Stalled(WatchdogEvidence {
+                last_meaningful_event_id: None,
+                last_meaningful_at: Utc::now(),
+                elapsed_secs: 0,
+                current_wait: None,
+            })),
+            "timed_out" => Some(Self::TimedOut(TimeoutKind::WallClock)),
+            "budget_exhausted" => Some(Self::BudgetExhausted(BudgetKind::WallTime)),
+            "failed" => Some(Self::Failed(TaskFailure(String::new()))),
+            "cancelled" => Some(Self::Cancelled(CancelReason(String::new()))),
+            "recovery_required" => Some(Self::RecoveryRequired(RecoveryEvidence(String::new()))),
+            _ => None,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -1433,5 +1473,65 @@ mod inherited_sandbox_tests {
         assert_eq!(InheritedSandbox::parse("read_only"), None);
         assert_eq!(InheritedSandbox::parse("nope"), None);
         assert_eq!(InheritedSandbox::parse(""), None);
+    }
+}
+
+#[cfg(test)]
+mod state_label_tests {
+    use super::*;
+
+    #[test]
+    fn every_label_the_supervisor_emits_parses_back() {
+        // 这 8 个是「已定终态」，闸门必须认出来。
+        for label in [
+            "completed",
+            "completed_no_changes",
+            "blocked",
+            "stalled",
+            "timed_out",
+            "budget_exhausted",
+            "failed",
+            "cancelled",
+        ] {
+            let state = TaskState::from_state_label(label)
+                .unwrap_or_else(|| panic!("settled label {label} must parse"));
+            assert!(
+                !matches!(state, TaskState::RecoveryRequired(_)),
+                "{label} must not parse as RecoveryRequired"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_required_parses_as_recovery_not_settled() {
+        let state =
+            TaskState::from_state_label("recovery_required").expect("recovery_required must parse");
+        assert!(
+            matches!(state, TaskState::RecoveryRequired(_)),
+            "recovery_required must stay recovery: a resumed parent still spawns"
+        );
+    }
+
+    #[test]
+    fn non_terminal_labels_parse_to_non_terminal_states() {
+        for label in [
+            "queued",
+            "running",
+            "waiting_for_resource",
+            "waiting_for_permission",
+            "waiting_for_children",
+            "paused",
+        ] {
+            let state = TaskState::from_state_label(label)
+                .unwrap_or_else(|| panic!("non-terminal label {label} must parse"));
+            assert!(!state.is_terminal(), "{label} must not parse as terminal");
+        }
+    }
+
+    #[test]
+    fn unknown_labels_are_none_not_a_panic() {
+        assert!(TaskState::from_state_label("").is_none());
+        assert!(TaskState::from_state_label("not_a_state").is_none());
+        assert!(TaskState::from_state_label("Completed").is_none());
     }
 }

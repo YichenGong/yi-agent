@@ -43,6 +43,10 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     rejectCode: {} as Record<string, number>,
     // Status reported by `thread/listAll` for every seeded thread.
     listStatus: "idle" as "idle" | "running" | "awaiting_approval",
+    // 共享已读水位（`last_read_at` / `last_completed_at`），按 thread_id。
+    // 未读由 `last_completed_at > last_read_at` 派生，故列表要报这两个值才能
+    // 模拟「另一台设备读过 / 离线期间跑完一轮」这两种跨端状态。
+    watermarks: {} as Record<string, { read: number; completed: number }>,
     // 顶层 pinned 列表（thread_id 顺序即渲染顺序）。服务端把已置顶的会话
     // 同时留在它自己的分组内（带 pinned:true）并在这个顶层数组里重复一份。
     pinnedIds: [] as string[],
@@ -220,6 +224,8 @@ vi.mock("./lib/rpc", () => ({
                       pinned: state.pinnedIds.includes(t.thread_id),
                       driver_project: t.driver_project,
                       driver_ref: t.driver_ref,
+                      last_read_at: state.watermarks[t.thread_id]?.read ?? 0,
+                      last_completed_at: state.watermarks[t.thread_id]?.completed ?? 0,
                     })),
                     ...leadEntries(workspace),
                   ]
@@ -245,6 +251,8 @@ vi.mock("./lib/rpc", () => ({
             title: (seeds.find((s) => s.thread_id === id)?.title ?? null),
             permission_mode: seeds.find((s) => s.thread_id === id)?.permission_mode,
             pinned: true,
+            last_read_at: state.watermarks[id]?.read ?? 0,
+            last_completed_at: state.watermarks[id]?.completed ?? 0,
           })),
         };
       }
@@ -398,6 +406,7 @@ beforeEach(() => {
   state.statusHandlers.length = 0;
   state.rejectCode = {};
   state.listStatus = "idle";
+  state.watermarks = {};
   state.pinnedIds = [];
   state.picks = [];
   state.boards = [];
@@ -696,6 +705,217 @@ describe("App approval overlay scope", () => {
         params: { threadId: "t1" },
       }),
     );
+  });
+});
+
+/**
+ * 跨端未读同步（用户报的问题：「手机上的未读和电脑 App 不一致」）。
+ *
+ * 未读由**服务端**两个水位派生（`last_completed_at > last_read_at`），不再是每个
+ * 客户端进程内存里的布尔位。于是「一端读过」必须同时做到三件事：
+ *   1. 向服务端推进共享水位（`thread/markRead`）——否则重连/刷新后会被旧水位
+ *      重新算成未读；
+ *   2. 服务端向**所有**客户端广播 `thread/readStateChanged`；
+ *   3. 收到广播的端就地清掉蓝点，不依赖自己有没有订阅该会话的内容。
+ * 这三条缺任何一条，用户看到的就是「手机读过了、电脑还亮着」。
+ */
+describe("App cross-device unread sync", () => {
+  const unreadDot = () => document.querySelector('[aria-label="Unread"]');
+  const markReadCallsFor = (id: string) =>
+    clients[0].requests.filter(
+      (r) => r.method === "thread/markRead" && (r.params as { threadId: string }).threadId === id,
+    ).length;
+
+  it("reports the thread as read when the user opens it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(screen.getByText("two"));
+
+    // 只清本地蓝点是不够的：服务端水位不动，重连后蓝点会「复活」。
+    await waitFor(() => expect(markReadCallsFor("t2")).toBe(1));
+  });
+
+  it("clears a background thread's dot when another device reads it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    // t2 在**这台设备**没看着时跑完了一轮：服务端记下完成水位，未读派生为真。
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+
+    // 另一端（手机）点开了 t2：服务端推进已读水位并广播到这台设备。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "thread/readStateChanged",
+          params: { thread_id: "t2", last_read_at: 200, last_completed_at: 200 },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).toBeNull());
+  });
+
+  it("keeps a dot that appeared after the other device's read", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 200, completed: 200 } };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(unreadDot()).toBeNull();
+
+    // 手机读过之后，t2 又跑完一轮：这是**新**的未读，必须再亮。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "thread/readStateChanged",
+          params: { thread_id: "t2", last_read_at: 200, last_completed_at: 300 },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+  });
+
+  it("shows the dot for a turn that finished while this device was offline", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    // 断线期间跑完的回合：推送当时没人在听，只有落盘的完成水位记得它跑完了。
+    // 这是「重连后补回未读」的唯一来源。
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+  });
+
+  it("marks the thread read when a turn completes in the thread being viewed", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 用户正看着 t1，t1 里跑完一轮：他就在看，本地不亮蓝点；但服务端水位仍停在
+    // 这一轮之前，不上报的话重连后蓝点会「复活」。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "turn/completed",
+          params: {
+            thread_id: "t1",
+            turn_id: "u1",
+            status: "completed",
+            completed_at: 500,
+          },
+        });
+    });
+
+    // 必须**真的**再来一次（而不只是切过去时那一次），否则服务端水位停在
+    // 这一轮之前，重连后蓝点复活。
+    await waitFor(() => expect(markReadCallsFor("t1")).toBeGreaterThanOrEqual(2));
+    expect(unreadDot()).toBeNull();
+  });
+
+  it("leaves a background thread's dot alone when its turn completes", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "turn/completed",
+          params: {
+            thread_id: "t2",
+            turn_id: "u2",
+            status: "completed",
+            completed_at: 500,
+          },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+    // 后台会话跑完**不该**被自动标已读：那样用户永远看不到「有新内容」。
+    expect(
+      clients[0].requests.some(
+        (r) => r.method === "thread/markRead" && (r.params as { threadId: string }).threadId === "t2",
+      ),
+    ).toBe(false);
+  });
+});
+
+/**
+ * 离线时不画未读点（spec §3.2）。
+ *
+ * 手机离线时列表来自本地缓存，两个水位都是上次同步的快照。缓存里的「未读」可能
+ * 早被另一台设备读掉了——照画就是在误导用户，也正是「手机与电脑不一致」的一部分。
+ * 门控限定 `isMobile && offline`：桌面端不受影响。
+ */
+describe("App offline unread suppression", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+  const unreadDot = () => document.querySelector('[aria-label="Unread"]');
+
+  it("hides the unread dot on the phone while disconnected", async () => {
+    asRemote();
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() => expect(state.statusHandlers.length).toBeGreaterThan(0));
+
+    // 连上时照常显示：这是服务端权威值，可信。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "connected" });
+    });
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+
+    // 断线 → 列表变回缓存快照，未读不再可信。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+    await waitFor(() => expect(unreadDot()).toBeNull());
+  });
+
+  it("still shows the dot on the desktop while disconnected", async () => {
+    // 桌面端恒为「在线」语义（不显示缓存相关 UI），故不受这条门控影响。
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() => expect(state.statusHandlers.length).toBeGreaterThan(0));
+
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
   });
 });
 
@@ -1143,9 +1363,13 @@ describe("App slash commands", () => {
     fireEvent.change(textarea, { target: { value: "/usage" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await screen.findByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/);
-    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
-    expect(screen.getByText(/input: 12,345 output: 678/)).toBeTruthy();
+    // /usage 的输出是卡片，不是一段灰字：notice 容器没有 pre-wrap，
+    // 多行文本会被折叠成一行。
+    await screen.findByTestId("usage-card");
+    expect(screen.getByText("本轮用量")).toBeTruthy();
+    expect(screen.getByText("12,345 / 160,000 (7.7%)")).toBeTruthy();
+    expect(screen.getByText("12,345")).toBeTruthy();
+    expect(screen.getByText("678")).toBeTruthy();
     // 读的是当前会话的阈值,不是进程级快照。
     expect(clients[0].requests.find((r) => r.method === "config/read")?.params).toEqual({
       threadId: "t1",
@@ -1238,11 +1462,14 @@ describe("App slash commands", () => {
     fireEvent.change(textarea, { target: { value: "/usage" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
-    await screen.findByText(/累计 input: 1,000,000 output: 5,000/);
-    expect(screen.getByText(/累计 cache read: 800,000/)).toBeTruthy();
+    await screen.findByTestId("usage-card");
+    // 有累计值时标题是 Token 用量（不是「本轮用量」）。
+    expect(screen.getByText("Token 用量")).toBeTruthy();
+    expect(screen.getByText("1,000,000")).toBeTruthy();
+    expect(screen.getByText("800,000")).toBeTruthy();
+    expect(screen.getByText("5,000")).toBeTruthy();
     // 上下文仍是最后一次调用的 12,345，不是累计的 100 万。
-    expect(screen.getByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/)).toBeTruthy();
+    expect(screen.getByText("12,345 / 160,000 (7.7%)")).toBeTruthy();
   });
 
   it("renders /config as a card without touching the agent", async () => {
@@ -1936,10 +2163,12 @@ describe("App session pinning", () => {
 
     const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
     expect(rows).toHaveLength(2);
-    // 把第一行拖到第二行位置。
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
-    fireEvent.drop(rows[1]);
+    // 把第一行拖到第二行位置（指针拖拽：HTML5 拖放在 Tauri 的 WKWebView 里
+    // 收不到 dragover/drop，见 `ThreadSidebar` 的 `dragOrigin` 注释）。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
 
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
@@ -3436,6 +3665,25 @@ describe("relay handshake recovery wiring", () => {
 //  - 子 agent 的卡片列表与轨迹详情都收在该栏的「子 agent」Tab 内（点卡片下钻、
 //    「返回子 agent 列表」退回），不再有单独的「收起子 agent」按钮。
 describe("App 会话详情栏的开合", () => {
+  it("keeps the detail panel open when the same thread is selected again", async () => {
+    // 重连与「点已选中的那一行」都会走 selectThread；会话没变就不该把右侧
+    // 面板、diff、进程详情当成"上一个会话的残留"清掉。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const toggle = await screen.findByLabelText("会话详情面板");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"));
+    // 再点一次同一会话：默认夹具里它叫 "one"（见 App.test.tsx 的 listAll 桩）。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(1),
+    );
+    // 面板没有被当成"上一个会话的残留"收起。
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("状态栏图标开合详情栏，栏页眉可关闭", async () => {
     render(<App />);
     await screen.findByLabelText("会话详情面板");
@@ -5195,7 +5443,7 @@ describe("App mobile reopen keeps the selection", () => {
     ).toBe(true);
   });
 
-  it("still selects the first thread on the desktop reconnect (unchanged)", async () => {
+  it("keeps the current thread across a foreground reconnect on the desktop too", async () => {
     state.threads = threads();
     render(<App />);
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
@@ -5207,9 +5455,78 @@ describe("App mobile reopen keeps the selection", () => {
     await waitFor(() =>
       expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
-    // 桌面端重放保留历史行为：每次都回到第一条会话。
+    // 桌面端同样保持：切到别的 app 再回来，看到的还是离开时那条会话。
+    const last = clients[clients.length - 1];
+    await waitFor(() => expect(resumedOn(last)).toContain("t2"));
+    expect(resumedOn(last)).not.toContain("t1");
+  });
+
+  it("still falls back to the first thread when the current one is gone", async () => {
+    state.threads = threads();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumedOn(clients[0])).toContain("t2"));
+    // 服务端列表里已经没有 t2：必须回落第一条，而不是抱着一个不存在的会话。
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    clients[0].requests.length = 0;
+    foregroundAfterDeadSocket();
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    await waitFor(() => expect(resumedOn(clients[clients.length - 1])).toContain("t1"));
+  });
+});
+
+describe("App cold start restores the last selected thread", () => {
+  beforeEach(() => {
+    localStorage.setItem("yi-agent.selectedThread", "t2");
+  });
+  afterEach(() => {
+    localStorage.removeItem("yi-agent.selectedThread");
+  });
+
+  it("resumes the thread that was selected before the app quit", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
     await waitFor(() =>
-      expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
+      expect(
+        clients[0].requests
+          .filter((r) => r.method === "thread/resume")
+          .map((r) => (r.params as { threadId: string }).threadId),
+      ).toContain("t2"),
+    );
+    const resumed = clients[0].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).not.toContain("t1");
+  });
+
+  it("falls back to the first thread when the remembered one is gone", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/resume" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("records the selection so the next cold start can use it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("two")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(localStorage.getItem("yi-agent.selectedThread")).toBe("t2"),
     );
   });
 });
@@ -5483,5 +5800,89 @@ describe("拖入路径", () => {
       dragDrop.fn?.({ payload: { type: "drop", paths: ["/a"], position: { x: 900, y: 900 } } });
     });
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+});
+
+describe("session search (Cmd+F)", () => {
+  /** 推进到 initialize 之后（App 挂载即发 initialize）。 */
+  async function settle() {
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // 会话列表就绪（默认线程标题是 "one"），主区域才有转录可搜。
+    await screen.findByText("one");
+  }
+
+  function pressCmdF() {
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(event);
+    return event;
+  }
+
+  /**
+   * 查找条。**不能**用 `getByRole("searchbox")`：侧栏本来就有一个
+   * `aria-label="搜索会话"` 的搜索框，两者角色相同会撞车。这里按查找条自己的
+   * 无障碍名收窄。
+   */
+  const findBar = () => screen.queryByRole("searchbox", { name: "查找文本" });
+
+  // 搜索是常开功能，不再由 flag 门控：不 mock 任何 flag 也必须能打开。
+  it("opens the search bar on Cmd+F", async () => {
+    render(<App />);
+    await settle();
+    pressCmdF();
+    expect(await screen.findByRole("searchbox", { name: "查找文本" })).toBeTruthy();
+  });
+
+  it("swallows the keypress so the webview does not run its own find", async () => {
+    render(<App />);
+    await settle();
+    const event = pressCmdF();
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("closes the search bar on Escape", async () => {
+    render(<App />);
+    await settle();
+    pressCmdF();
+    await screen.findByRole("searchbox", { name: "查找文本" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(findBar()).toBeNull());
+  });
+
+  it("does not open the search bar while a modal is up", async () => {
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("tab", { name: "实验功能" });
+    pressCmdF();
+    expect(findBar()).toBeNull();
+  });
+
+  it("never asks the server whether search is allowed", async () => {
+    // 搜索是常开功能：`flags/list` 里不该再出现 session_search，前端也不该为它
+    // 多发一次请求。若有人把 flag 加回来，这条会失败。
+    render(<App />);
+    await settle();
+    pressCmdF();
+    await screen.findByRole("searchbox", { name: "查找文本" });
+    const flagRows = clients[0].requests.filter((r) => r.method === "flags/list");
+    expect(flagRows.length).toBeGreaterThan(0);
+    expect(clients[0].requests.some((r) => r.method === "flags/set")).toBe(false);
+  });
+
+  it("does not open the search bar before a session is selected", async () => {
+    state.threads = [];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    pressCmdF();
+    expect(findBar()).toBeNull();
   });
 });

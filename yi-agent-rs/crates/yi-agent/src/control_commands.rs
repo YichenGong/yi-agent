@@ -110,7 +110,7 @@ impl ControlCommand {
             Self::Mcp => spec(
                 self,
                 "mcp",
-                "[on|off|enable <server>|disable <server>|status]",
+                "[on|off|reload|enable <server>|disable <server>|status]",
                 "管理 MCP server 开关",
                 false,
             ),

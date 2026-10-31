@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
+import { SearchBar } from "./components/SearchBar";
+import { useTranscriptSearch, SEARCH_DEBOUNCE_MS } from "./hooks/useTranscriptSearch";
+import { useEscapeKey } from "./ui/useEscapeKey";
 import { useDiffState } from "./hooks/useDiffState";
 import { useProcessState } from "./hooks/useProcessState";
 import { useBoardState } from "./hooks/useBoardState";
@@ -31,7 +34,7 @@ import type {
   WireUsage,
   WorkspaceGroup,
 } from "./lib/protocol";
-import { wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
+import { NO_SUBAGENTS, wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
@@ -48,6 +51,7 @@ import {
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { readSelectedThread, writeSelectedThread } from "./lib/selectedThread";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
@@ -70,7 +74,7 @@ import {
   type ThreadMode,
 } from "./lib/threadPermissionMode";
 import { configReadParams } from "./lib/configRequest";
-import { formatUsage } from "./lib/usageCommand";
+import { buildUsageReport } from "./lib/usageCommand";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
@@ -313,6 +317,21 @@ export default function App() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  /**
+   * 把「这个会话已读到最新」上报给服务端（共享已读水位）。
+   *
+   * 未读由服务端两个水位派生（`last_completed_at > last_read_at`），所以「清本地
+   * 蓝点」和「让别的端也不再亮」是两件事：前者是 `store.select()`，后者必须走这个
+   * RPC。服务端推进水位后会向**所有**客户端广播 `thread/readStateChanged`，桌面与
+   * 手机的蓝点因此同时消失。
+   *
+   * 刻意 fire-and-forget：已读是幂等的收敛动作，失败最坏让蓝点多留一会儿，不该
+   * 阻塞切会话或让 UI 报错。
+   */
+  const markThreadRead = (id: string) => {
+    void clientRef.current?.request("thread/markRead", { threadId: id }).catch(() => {});
+  };
+
   /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
   const CONTENT_PERSIST_DEBOUNCE_MS = 800;
   const schedulePersist = (id: string) => {
@@ -437,6 +456,20 @@ export default function App() {
   );
 
   /**
+   * 「网页搜索」Tab 的宿主接缝。理由同 `modelCall`：只闭合 `clientRef`，空依赖
+   * 即稳定；若每次渲染换新身份，面板的读取 effect 会跟着重跑，把用户没保存的
+   * 编辑冲掉。
+   */
+  const websearchCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 「实验功能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖
    * 即稳定；换新身份会让面板的读取 effect 重跑。
    *
@@ -484,6 +517,83 @@ export default function App() {
   );
 
   const current = sess.currentId ? store.view(sess.currentId) : null;
+
+  /**
+   * 会话内搜索（Cmd+F）的三份状态。
+   *
+   * `searchInput` 是输入框原文，`searchQuery` 是**防抖后**真正喂给 `ChatView` 的
+   * 值——每次敲字都会让可见消息重解析 markdown，不防抖长会话会卡。
+   */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchInput, setSearchInput] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  /**
+   * 转录**真正的滚动容器**句柄，由 `ChatView` 的 `scrollerRef` 回填。
+   *
+   * 不能用 App 自己那层 `relative` 容器：它不滚动，`scrollTop` 恒为 0，
+   * `initialActiveIndex` 的"视口"会退化成"内容最顶端"，每次打开都跳第一个命中。
+   */
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const captureTranscriptRef = useRef<(() => void) | null>(null);
+
+  const search = useTranscriptSearch({
+    containerRef: transcriptRef,
+    open: searchOpen,
+    query: searchQuery,
+  });
+
+  // 输入防抖：只有停手 120ms 才让 ChatView 重新解析 markdown。
+  useEffect(() => {
+    if (!searchOpen) return;
+    const id = setTimeout(() => setSearchQuery(searchInput), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [searchInput, searchOpen]);
+
+  // mark 落地后按视口选当前命中。用 rAF 等一帧，确保 rehype 的输出已在 DOM。
+  useEffect(() => {
+    if (!searchOpen || searchQuery.trim() === "") return;
+    const id = requestAnimationFrame(() => search.reselect());
+    return () => cancelAnimationFrame(id);
+  }, [searchOpen, searchQuery, search.reselect]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchInput("");
+    setSearchQuery("");
+  }, []);
+
+  // 切换会话即关闭：旧 DOM 的命中序号没有意义。
+  useEffect(() => {
+    closeSearch();
+  }, [sess.currentId, closeSearch]);
+
+  /**
+   * Cmd/Ctrl+F 的进入条件，收敛进 ref。
+   *
+   * 监听器只装一次；直接闭包读 state 会读到**首次渲染**时的值（那时会话还
+   * 没选上），于是进了会话 Cmd+F 仍然没反应。
+   */
+  const canSearchRef = useRef(false);
+  canSearchRef.current =
+    sess.currentId !== null &&
+    board.selectedBoard === null &&
+    !prefs.settingsOpen &&
+    current?.approval == null;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "f") return;
+      if (!canSearchRef.current) return;
+      // 拦掉 webview 自带的查找：我们要的是会话内查找条，不是整页查找。
+      e.preventDefault();
+      setSearchOpen(true);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Esc 关闭并清空。
+  useEscapeKey(searchOpen, closeSearch);
 
   // 首屏：把缓存里的会话播种进 store（标题/cwd/model/状态徽标），并预填选中会话
   // 的内容。预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
@@ -542,8 +652,20 @@ export default function App() {
     opts?: { leaveBoard?: boolean; forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
+    if (prevId !== id) captureTranscriptRef.current?.();
+    // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
+    // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
+    const changed = prevId !== null && prevId !== id;
     store.select(id);
+    // 把「已读」上报给服务端：`store.select` 只清了本地蓝点，服务端水位不知道。
+    // 不上报的话，下一次 `thread/listAll`（或重连后的 `seed`）会按旧水位把蓝点
+    // 重新算回来；另一端也永远收不到 `thread/readStateChanged`，会一直亮着——
+    // 那正是用户报的「手机读过、电脑仍亮」。不 await、失败即忽略：已读是一次
+    // 幂等收敛，掉一次只会让蓝点多留一会儿，不该阻塞切会话。
+    markThreadRead(id);
     sess.setCurrentId(id);
+    // 记到最后看的那条：下次冷启动据此复位（服务端列表仍是否存在的裁决者）。
+    writeSelectedThread(localStorage, id);
     // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
     // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
     // 这里不会因为命中缓存而跳过 resume。这里刻意放在下方的早退分支（running
@@ -559,16 +681,20 @@ export default function App() {
     if (opts?.leaveBoard !== false) board.setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
-    sess.setPanelOpen(false);
-    diff.resetThreadDiff();
+    if (changed) {
+      sess.setPanelOpen(false);
+      diff.resetThreadDiff();
+    }
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void sess.refreshSubagents(id);
     // 该对话的后台进程:重进对话时重新拉取。
     void proc.refreshProcesses(id);
-    // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
-    proc.setOpenProcessId(null);
-    proc.setProcessOutput(null);
+    if (changed) {
+      // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
+      proc.setOpenProcessId(null);
+      proc.setProcessOutput(null);
+    }
     // 服务端对本次会话的裁决（spec §4.2）。注意 plan 以 threadId 为键直接查：
     // 被删除的会话不会出现在 listAll 里，靠 summary 反查必然查不到它的 `drop`。
     // `noneNeedsCatchUp`：裁决为 none 的缓存会话仍**可能落后于服务端尾部**——
@@ -824,8 +950,10 @@ export default function App() {
         typeof t.reasoning_effort === "string" ? t.reasoning_effort : null;
       // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
+      captureTranscriptRef.current?.();
       store.select(t.thread_id);
       sess.setCurrentId(t.thread_id);
+      writeSelectedThread(localStorage, t.thread_id);
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -897,6 +1025,7 @@ export default function App() {
   const onOpenBoard = (path: string) => {
     // 已经在该看板页：纯 no-op，不重读、不清屏。
     if (path === board.selectedBoard) return;
+    captureTranscriptRef.current?.();
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     board.setBoardError(null);
     board.setBoardCards([]);
@@ -1079,6 +1208,7 @@ export default function App() {
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
+    sess.forgetView(id);
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
     // 服务端已经没有的会话画回侧栏里。
     deleteCachedContent(id);
@@ -1086,6 +1216,8 @@ export default function App() {
     cachedAt.current.delete(id);
     if (id === sess.currentId) {
       sess.setCurrentId(null);
+      // 记住值也一并清掉：否则下次冷启动会去找一个已经不存在的会话。
+      writeSelectedThread(localStorage, null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -1368,10 +1500,25 @@ export default function App() {
         // 触发下面的列表刷新，所以单独保证重渲染。
         const changed = store.applyNotification(n);
         if (changed || n.method === "turn/completed") force((v) => v + 1);
+        if (n.method === "turn/completed") {
+          // 用户正看着的这个会话里跑完了一轮：内容他就读在眼前，本地不会亮蓝点，
+          // 但**服务端水位还停在这一轮之前**。不上报的话，重连/刷新后
+          // `thread/listAll` 会按旧水位把蓝点算出来——即「读过的东西又变成未读」。
+          // 只对当前会话这么做：后台会话跑完理应保持未读，等信息被看到再清。
+          if (n.params.thread_id === sess.currentIdRef.current) {
+            markThreadRead(n.params.thread_id);
+          }
+        }
         // `Notification` 是判别联合：只有带 `thread_id` 的通知才有会话内容可落盘
         // （`error` 无归属、由 store 归到当前会话，在此跳过）。其余 `agent/*`、
         // `ui/*` 通知已在上方分支提前返回。
-        if ("thread_id" in n.params) schedulePersist(n.params.thread_id);
+        //
+        // `thread/readStateChanged` 是唯一能走到这里的纯元数据通知（标题/标签
+        // 都在上方提前返回）：它只带两个时间戳，没有会话内容可落。给它排一次
+        // 内容落盘纯属白写一次 IndexedDB。
+        if ("thread_id" in n.params && n.method !== "thread/readStateChanged") {
+          schedulePersist(n.params.thread_id);
+        }
         if (n.method === "turn/completed") void sess.refreshThreads();
       });
       client.onApproval((r) => {
@@ -1445,7 +1592,7 @@ export default function App() {
         // 局部量而不是直接读 state：`setLeadAgentEnabled` 要下一次渲染才生效，
         // 而本函数后面的补建循环就在**这一轮**里跑，读 state 拿到的还是 `null`。
         let leadOn = false;
-        // 同一份 `flags/list` 里就有看板开关，不再多发一次请求。
+        // 同一份 `flags/list` 里就有看板开关，不再多发请求。
         let kanbanOn = false;
         try {
           const flags = await client.request<{
@@ -1548,16 +1695,16 @@ export default function App() {
           }
         }
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
-        // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
-        // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
-        // 的东西。并且重连后新进程记忆为空（warm 与订阅窗口在 exited 时已清），
-        // 必须对它再走一次 selectThread：冷则补 resume、running 则补 readItems
-        // （不打断在途回合）、warm 则补 subscribe，否则视图留着而该会话的实时更新
-        // 会静默停摆。仅当当前会话不在服务端新列表里（被删）或根本没有已选会话时，
-        // 才回落第一条。桌面端保留原行为（每次选第一条）。
-        // （副作用：selectThread 会 resetThreadDiff()，故重连时 diff 面板若开着会
-        // 收起——会话未变，属既有行为，且窄屏下 diff 面板本就不渲染。）
-        const keptId = isRemoteClient() ? sess.currentIdRef.current : null;
+        // 握手（含重连/切回前台）**不是**「用户换了页面」：当前会话——冷启从缓存
+        // 恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看的
+        // 东西，桌面端与手机端一致。并且重连后新进程记忆为空（warm 与订阅窗口在
+        // exited 时已清），必须对它再走一次 selectThread：冷则补 resume、running
+        // 则补 readItems（不打断在途回合）、warm 则补 subscribe，否则视图留着而
+        // 该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里（被删）或
+        // 根本没有已选会话时，才回落第一条。
+        // 回落顺序：当前会话 → 上次选中的（冷启动没有当前会话）→ 列表第一条。
+        // 记住值同样要过服务端列表这一关：会话可能已被别的端删掉。
+        const keptId = sess.currentIdRef.current ?? readSelectedThread();
         const kept =
           keptId !== null &&
           list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
@@ -1668,8 +1815,14 @@ export default function App() {
         } catch {
           // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
         }
-        // 累计值是 `/usage` 的主体；没有（老服务端）时函数内部退回快照。
-        session.notice(formatUsage(u, session.usageTotals, { compactThreshold: threshold }));
+        // 累计值是 `/usage` 的主体；没有（老服务端）时报告内部退回快照并改标题。
+        // subagent 用量单独成组：它与主会话是两笔账，混在一起看不出谁花得多。
+        session.noticeBody({
+          kind: "usage",
+          report: buildUsageReport(u, session.usageTotals, session.subagentTotals, {
+            compactThreshold: threshold,
+          }),
+        });
         break;
       }
       case "config":
@@ -2096,12 +2249,16 @@ export default function App() {
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
   const unread = new Map<string, TurnStatus>();
+  // 离线时不画未读点（spec §3.2）：此时列表来自本地缓存，两个水位都是上次同步
+  // 的快照。缓存里「未读」可能早就被另一台设备读掉了，画出来是在误导用户；而
+  // 手机离线时的蓝点尤其容易与桌面矛盾——那正是要修的现象。宁可少画一个点。
+  const hideUnread = isMobile && offline;
   for (const g of sess.groups)
     for (const t of g.threads) {
       const v = store.peek(t.thread_id);
       if (!v) continue;
       statuses.set(t.thread_id, v.status);
-      if (v.unread && t.thread_id !== sess.currentId)
+      if (!hideUnread && v.unread && t.thread_id !== sess.currentId)
         unread.set(t.thread_id, v.session.lastStatus ?? "completed");
     }
 
@@ -2357,7 +2514,28 @@ export default function App() {
                   // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                   call={imageCall}
                   structuralVersion={current?.session.structuralVersion ?? 0}
+                  query={searchQuery}
+                  anchor={sess.currentId ? sess.anchorFor(sess.currentId) : undefined}
+                  // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
+                  // "还没到"（继续等）与"真的没了"（回退到底部）。
+                  syncing={sess.currentId ? store.peek(sess.currentId)?.syncState === "syncing" : false}
+                  // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                  // 注释），所以直接透传，不在闭包里另读 currentId。
+                  onRememberView={sess.rememberView}
+                  scrollerRef={transcriptRef}
+                  captureViewRef={captureTranscriptRef}
                 />
+                {searchOpen && (
+                  <SearchBar
+                    value={searchInput}
+                    total={search.total}
+                    active={search.active}
+                    onChange={setSearchInput}
+                    onNext={search.next}
+                    onPrev={search.prev}
+                    onClose={closeSearch}
+                  />
+                )}
                 {approval && (
                   <ApprovalDialog
                     key={approval.id}
@@ -2441,6 +2619,9 @@ export default function App() {
             }
             // 累计值是主体；`usage` 快照只作老服务端的兜底。
             totals={current?.session.usageTotals ?? null}
+            // subagent 累计：折叠态把它加进合计，展开面板分开显示。
+            subagentTotals={current?.session.subagentTotals ?? NO_SUBAGENTS}
+            subagentCount={sess.railRows.length}
             fallbackUsage={current?.session.usage ?? null}
             // 切换会话时数字直接跳终值，不从上一个会话滚过来。
             usageId={sess.currentId}
@@ -2623,6 +2804,7 @@ export default function App() {
         // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
         // 用户在三个面板里看到不同的项目列表。
         mcpCall={mcpCall}
+        websearchCall={websearchCall}
         mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页

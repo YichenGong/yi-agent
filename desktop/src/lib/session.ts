@@ -1,12 +1,15 @@
-import type {
-  Attachment,
-  Item,
-  Notification,
-  RetryCause,
-  TurnStatus,
-  Usage,
-  UsageTotals,
+import {
+  NO_SUBAGENTS,
+  type Attachment,
+  type Item,
+  type Notification,
+  type RetryCause,
+  type SubagentTotals,
+  type TurnStatus,
+  type Usage,
+  type UsageTotals,
 } from "./protocol";
+import type { UsageReport } from "./usageCommand";
 
 /**
  * `Notification` 的 `turn/retry` 载荷里 `cause` 的类型是 `string`——那就是线形状
@@ -62,10 +65,12 @@ export interface NoticeItem {
  *
  * - `config`：`/config` 的 `config/read` 原始结果（或读取错误）。
  * - `help`：`/help` 的目录/详情；`error` 非空时先显示错误行（未知目标、未知命令）。
+ * - `usage`：`/usage` 的用量报告。数据由 `buildUsageReport` 算好，卡片只摆版。
  */
 export type NoticeBody =
   | { kind: "config"; data: Record<string, unknown> | null; error: string | null }
-  | { kind: "help"; target: string | null; error: string | null };
+  | { kind: "help"; target: string | null; error: string | null }
+  | { kind: "usage"; report: UsageReport };
 
 /**
  * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端在实时期间
@@ -112,6 +117,14 @@ export class Session {
    * 老服务端不回传时为 `null`，界面回退到快照。
    */
   usageTotals: UsageTotals | null = null;
+
+  /**
+   * 本会话所有 subagent 的累计用量，与 `usageTotals` 分开存。
+   *
+   * 初值是全零而不是 `null`：服务端恒发具体数字（没有 subagent 就是 0），
+   * 所以客户端不需要「缺失」这一种额外状态。`> 0` 才是「有没有 subagent」的判据。
+   */
+  subagentTotals: SubagentTotals = NO_SUBAGENTS;
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
 
   /**
@@ -262,6 +275,8 @@ export class Session {
     this.lastError = null;
     this.usage = null;
     this.usageTotals = null;
+    // `/clear` 后子 agent 也归零：历史都没了，留着旧数字会让人以为清空没生效。
+    this.subagentTotals = NO_SUBAGENTS;
     this.returnedInterjections = [];
     this.lastServerItemId = null;
     this.openReasoning = null;
@@ -692,6 +707,16 @@ export class Session {
             output: notification.params.total_output_tokens,
             cacheRead: notification.params.total_cache_read_input_tokens,
             cacheWrite: notification.params.total_cache_creation_input_tokens,
+          };
+        }
+        // subagent 累计与服务端同步。老服务端不发这三个字段：此时保持当前值
+        // （初始为全零），而不是把它写成 `undefined`——那会让后续拼接得到 NaN。
+        const subagentInput = notification.params.subagent_input_tokens;
+        if (typeof subagentInput === "number") {
+          this.subagentTotals = {
+            input: subagentInput,
+            output: notification.params.subagent_output_tokens ?? 0,
+            cacheRead: notification.params.subagent_cache_read_tokens ?? 0,
           };
         }
         visible = true;

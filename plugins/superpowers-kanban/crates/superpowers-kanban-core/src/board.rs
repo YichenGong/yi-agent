@@ -284,6 +284,12 @@ impl Board {
         Ok(())
     }
 
+    /// 认领下一张排队卡：`budget` 是**调用方已算好的可用额度**。
+    ///
+    /// `budget` 的含义是「全机还能再起几个会话」（全局峰值 − 全机运行数），
+    /// 由 `BoardService::next_launch` 从宿主上报的计数算出。这里**不得**再减一次
+    /// 看板内的 `running_count()`：那批会话已经算在全机运行数里了。
+    ///
     /// 只认领实现卡的会话通路：合并卡走的是合并轮（`driver_step` 的候选集，
     /// 见 `superpowers_kanban_runner`），绝不能经这里启动。
     pub fn claim_next_launch(&mut self) -> Option<CardId> {

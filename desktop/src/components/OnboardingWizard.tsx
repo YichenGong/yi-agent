@@ -41,7 +41,7 @@ export function OnboardingWizard({
   onDone: (result?: OnboardingOutcome) => void;
 }) {
   const [step, setStep] = useState<Step>("welcome");
-  const [provider, setProvider] = useState<"anthropic" | "openai">("anthropic");
+  const [provider, setProvider] = useState<"anthropic" | "openai">("openai");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
   const [apiUrl, setApiUrl] = useState("");

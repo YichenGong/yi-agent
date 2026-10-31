@@ -202,6 +202,8 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     store.create(&meta)?;
     // 复读:并发下这里可能读到别人先落的、`created_at` 更早的那一个。
@@ -520,6 +522,8 @@ mod tests {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         };
         store.create(&existing).unwrap();
 

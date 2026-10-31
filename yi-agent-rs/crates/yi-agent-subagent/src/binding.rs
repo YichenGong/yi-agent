@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_store::ipc::{IpcError, IpcRequest, IpcResponse, send_request};
@@ -60,6 +61,12 @@ pub struct RuntimeBinding {
     /// Serialises repair so one thread starts the daemon while the others wait
     /// and then adopt its result instead of racing into a second start.
     flight: Mutex<()>,
+    /// 本项目最近一次「有活干」的时刻。
+    ///
+    /// 由宿主在取句柄时刷新（`current` / `send` 都经过
+    /// 这里），因此它记录的是真实的委派使用，而不是「进程还记着这个项目」。
+    /// 回收判定据此区分「这个项目还在被用」与「只是表里留了个条目」。
+    last_active: Mutex<Instant>,
 }
 
 impl RuntimeBinding {
@@ -81,6 +88,7 @@ impl RuntimeBinding {
                 models_path,
             }),
             flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
         })
     }
 
@@ -93,6 +101,7 @@ impl RuntimeBinding {
             }),
             repair: None,
             flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
         })
     }
 
@@ -114,7 +123,38 @@ impl RuntimeBinding {
 
     /// The current handle, without any repair attempt.
     pub fn current(&self) -> Result<RuntimeHandle, String> {
+        self.touch();
         Ok(self.lock_state().handle.clone())
+    }
+
+    /// 记一次「这个项目刚被用到」。
+    fn touch(&self) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    /// 仅用于测试：把空闲时钟拨到 `idle` 之前。
+    ///
+    /// 回收阈值是十分钟，测试不可能真等；这个缝隙让「一个项目已经空闲很久」
+    /// 成为可构造的状态，而不是把阈值本身调小（那会让测试断言不到真实取值）。
+    #[doc(hidden)]
+    pub fn backdate_idle_clock(&self, idle: Duration) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now()
+            .checked_sub(idle)
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// 距上次活动过了多久。回收判定的输入之一。
+    pub fn idle_for(&self) -> Duration {
+        self.last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
     }
 
     /// The current handle and the generation that produced it, read from one
@@ -124,6 +164,10 @@ impl RuntimeBinding {
     /// keyed on the generation must be sure the handle it pairs it with came from
     /// that very generation.
     pub(crate) fn current_with_generation(&self) -> (RuntimeHandle, u64) {
+        // `send` / `send_with_generation` 走的是这条路径而不是 `current()`：
+        // 委派请求本身也算「这个项目在被用」，不刷新时钟会让一个一直在干活的
+        // 项目被误判为空闲而回收。
+        self.touch();
         let state = self.lock_state();
         (state.handle.clone(), state.generation)
     }
@@ -150,6 +194,35 @@ impl RuntimeBinding {
     }
 
     /// Brings the runtime back up (single-flight) and adopts the result.
+    /// 原地退休本 binding 持有的 runtime：停 daemon、停监督线程，会话与 binding
+    /// 本身都留着。
+    ///
+    /// 为什么不能只靠 Drop：宿主的 `runtimes` / `thread_roots` 两张表只是
+    /// **一部分**持有者。会话的 driver 里，委派工具各持一份 `Arc<ThreadRoot>`，
+    /// root 又持着 `Arc<RuntimeBinding>`——只要会话还活着，binding 的 Drop 就永远
+    /// 等不到，daemon 与监督线程会继续跑到底。这样「回收」只清空了表，进程一个
+    /// 都没少。停进程必须在这里显式做。
+    ///
+    /// 会话不删：用户切回来应当看到原样的对话。代价是下一次委派要重建 runtime
+    /// （冷启动），这与「宁可冷启动延迟，不要常驻资源」的取舍一致。
+    ///
+    /// 幂等：已经退休过的 binding 不再推进 generation，重复调用无副作用。
+    pub fn retire(&self) {
+        let mut state = self.lock_state();
+        let Some(runtime) = state.runtime.take() else {
+            return;
+        };
+        // 推进 generation 再释放 runtime：所有缓存了 root 的调用方（`ThreadRoot`
+        // 的 `cached`）会在下一次 `attach` 时发现 root 属于一个已经不存在的
+        // runtime，从而重新挂载，而不是拿着死 root 发请求。
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        // `runtime` 在这里离开作用域：`AttachedProjectRuntime` 的字段随之 drop，
+        // `embedded_daemon` 的 `Drop` 停监听与服务，`supervisor` 的 `Drop` 停监督
+        // 线程。刻意显式写出来，表明这是有意停机而不是顺手释放。
+        drop(runtime);
+    }
+
     pub fn repair(&self) -> Result<RuntimeHandle, String> {
         self.repair_with_generation()
             .map(|(handle, _generation)| handle)
@@ -183,14 +256,6 @@ impl RuntimeBinding {
         // boundary so callers that cached a root can notice it is stale.
         state.generation = state.generation.wrapping_add(1);
         Ok((handle, state.generation))
-    }
-
-    /// Current if usable, else repair.
-    pub fn current_or_repair(&self) -> Result<RuntimeHandle, String> {
-        match self.current() {
-            Ok(handle) => Ok(handle),
-            Err(_) => self.repair(),
-        }
     }
 
     /// Sends one request, repairing and retrying once if the runtime turns out
@@ -282,6 +347,27 @@ pub fn is_liveness_error(error: &IpcError) -> bool {
     }
 }
 
+/// 这个应答是否在说「你手里的 root 我不认识」。
+///
+/// 与 [`is_liveness_error`] 互补：那个判传输层（socket 没了），这个判身份层
+/// （socket 很好，但这个 session / root 不是我的）。替换后的 daemon 会为新
+/// root 重建 session 与 capability，旧 root 的三元组在它的
+/// `application_root_attachments` 里查不到，于是稳定返回 `NotFound`；权限
+/// 摘要不匹配则是 `AuthorityDenied`。两者对客户端是同一件事：手里的 root 过期了。
+///
+/// 业务拒绝（`Validation`、`RateLimited`、`InvalidState`、`Conflict`、`Internal`）
+/// **不**属于这一类：那些错误重发一次不会好，触发 repair 只是浪费一次 daemon 启动。
+pub fn is_stale_root_response(response: &IpcResponse) -> bool {
+    matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound
+                | yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +411,121 @@ mod tests {
     #[test]
     fn a_frame_too_large_is_not_a_liveness_error() {
         assert!(!is_liveness_error(&IpcError::FrameTooLarge));
+    }
+
+    /// 陈旧 root 的判据：daemon 明确说「这个 session / root 我不认识」。
+    /// 实测替换后的 daemon 对 send_message / spawn_agent / wait_agent / detach
+    /// 四条路径稳定返回 NotFound（见 spec §1.3）。
+    #[test]
+    fn a_not_found_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    #[test]
+    fn an_authority_denied_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    /// 业务拒绝绝不能被当成「root 过期」，否则一次参数错误就会触发 repair。
+    #[test]
+    fn a_business_rejection_is_not_a_stale_root() {
+        for code in [
+            yi_agent_store::ipc::IpcErrorCode::Validation,
+            yi_agent_store::ipc::IpcErrorCode::RateLimited,
+            yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            yi_agent_store::ipc::IpcErrorCode::Conflict,
+            yi_agent_store::ipc::IpcErrorCode::Internal,
+        ] {
+            let response = IpcResponse::Error {
+                code,
+                message: Some("business".into()),
+            };
+            assert!(
+                !is_stale_root_response(&response),
+                "{code} is business-layer"
+            );
+        }
+        assert!(!is_stale_root_response(&IpcResponse::Stopping));
+    }
+}
+
+#[cfg(test)]
+mod idle_clock_tests {
+    use super::*;
+
+    fn fixed_binding() -> Arc<RuntimeBinding> {
+        RuntimeBinding::fixed(RuntimeHandle {
+            socket_path: "/tmp/frozen.sock".into(),
+            workspace_root: "/tmp/ws".into(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        })
+    }
+
+    /// 取句柄就是「用了一次」：空闲计时必须被刷新，否则一个一直在被委派的
+    /// 项目会被误判为空闲而回收。
+    #[test]
+    fn reading_the_handle_resets_the_idle_clock() {
+        let binding = fixed_binding();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            binding.idle_for() >= Duration::from_millis(100),
+            "the clock must advance while the binding is unused"
+        );
+
+        let _ = binding.current().expect("fixed bindings always resolve");
+        assert!(
+            binding.idle_for() < Duration::from_millis(100),
+            "reading the handle must reset the clock"
+        );
+    }
+
+    /// 委派请求走的不是 `current()`，而是 `current_with_generation()` 那条路。
+    /// 它同样必须刷新时钟，否则一个不停接活的项目会被判成空闲。
+    #[test]
+    fn sending_through_the_generation_path_resets_the_idle_clock() {
+        let binding = fixed_binding();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(binding.idle_for() >= Duration::from_millis(100));
+
+        let _ = binding.send(|_handle| IpcRequest::Status);
+        assert!(
+            binding.idle_for() < Duration::from_millis(100),
+            "a delegation attempt counts as activity"
+        );
+    }
+
+    /// 回收必须能在**会话还活着**的前提下真正停掉进程。
+    ///
+    /// 只从宿主的两张表里摘条目不够：driver 里的委派工具各持一份
+    /// `Arc<ThreadRoot>`，root 又持着 `Arc<RuntimeBinding>`，于是 binding 的
+    /// Drop 永远等不到，daemon 与监督线程继续跑——「回收」只骗过了表。
+    ///
+    /// 所以回收要能**原地退休**：丢掉 binding 里的 runtime（Drop 即停进程与监督
+    /// 线程），并推进 generation。会话不必删；下次真要委派时 `send` 会照既有
+    /// 路径重建 runtime。
+    ///
+    /// 用 fixed binding 表达这条语义：它没有自己的 runtime，"退休" 的可见效果
+    /// 就是 generation 不动（不能去停别人的 daemon），这也是一条要钉住的行为。
+    #[test]
+    fn retiring_a_binding_that_owns_no_runtime_changes_nothing() {
+        let binding = fixed_binding();
+        let before = binding.generation();
+        binding.retire();
+        assert_eq!(
+            binding.generation(),
+            before,
+            "a binding that adopted someone else's daemon must not pretend to drop it"
+        );
+        assert!(binding.current().is_ok());
     }
 }

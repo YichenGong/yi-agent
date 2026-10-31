@@ -216,23 +216,28 @@ impl RuntimeConfig {
         ApiStyle::Auto
     }
 
-    /// 从覆盖项 + 环境变量加载配置。
+    /// 从覆盖项 + 环境变量加载配置；**允许 API key 缺失**（回空串）。
     ///
     /// 优先级:覆盖项 > 真实进程环境变量 > 全局 `.env`（仅非模型键） > 默认值。
     /// `.env` 只有一处:`$HOME/.yi-agent/.env`,不主动创建目录。
-    pub fn load(overrides: &ConfigOverrides) -> Result<Self> {
-        Self::load_inner(overrides, false)
-    }
-
-    /// 与 [`load`] 相同，但**允许 API key 缺失**（回空串）。
     ///
-    /// 桌面侧车在新机器上必须能起来才能提供引导 RPC；缺 key 时按空 key 加载，
-    /// 由调用方先跑引导再真正发起对话。
+    /// 这是**唯一**的加载入口。曾经还有一个严格版 `load`（缺 key 即 bail），
+    /// 它和本函数对「这台机器配好了没有」给出相反答案：模型只在 `models.json`
+    /// 里的机器，严格版读不到 key 就报错，宽松版照常返回。两个入口并存时，
+    /// 启动路径选错一个就把「没有 key」变成启动失败——2026-10-29 的
+    /// `Error: provider turn admission failed: API key required` 正是这样来的。
+    ///
+    /// 因此「能不能发起对话」不再由加载器回答，只由 [`crate::models::is_usable`]
+    /// 回答，且必须作用在 `resolve_effective` **之后**（否则清单里的 key 还没
+    /// 合入配置，只会误判）。加载器只负责把能读到的值读全。
+    ///
+    /// 缺 key 时返回空串而不是报错，理由不变：桌面侧车在新机器上必须能起来才能
+    /// 提供引导 RPC，CLI 要靠 `unconfigured_guidance` 给出中文指引。
     pub fn load_lenient(overrides: &ConfigOverrides) -> Result<Self> {
-        Self::load_inner(overrides, true)
+        Self::load_inner(overrides)
     }
 
-    fn load_inner(overrides: &ConfigOverrides, allow_missing_key: bool) -> Result<Self> {
+    fn load_inner(overrides: &ConfigOverrides) -> Result<Self> {
         // 快照必须早于任何 .env 加载（见 `ModelEnvSnapshot` 的文档）。
         let model_env = ModelEnvSnapshot::take();
         // 唯一的 `.env` 是全局 `~/.yi-agent/.env`；没有 HOME 时退回到 workdir 内的
@@ -275,7 +280,7 @@ impl RuntimeConfig {
             );
         }
 
-        let provider = injected_provider.unwrap_or_else(|| "anthropic".to_string());
+        let provider = injected_provider.unwrap_or_else(|| "openai".to_string());
         let default_api_url = match provider.as_str() {
             "openai" => "https://api.openai.com/v1",
             _ => "https://api.anthropic.com",
@@ -285,11 +290,11 @@ impl RuntimeConfig {
         // 传播到子 agent(`subagent_model` -> `default_model` -> `cfg`)。空串是
         // "未配置"的唯一诚实表示,由 RPC 入口与 CLI 给出可操作的指引。
         let model = injected_model.unwrap_or_default();
-        let api_key = match injected_key {
-            Some(key) => key,
-            _ if allow_missing_key => String::new(),
-            _ => bail!("API key required: set MODEL_API_KEY or use --api-key"),
-        };
+        // 缺 key 回空串，不在此处报错：「能不能发起对话」只由
+        // `models::is_usable` 在 `resolve_effective` 之后回答（见
+        // [`RuntimeConfig::load_lenient`] 的文档）。加载器报错的旧行为会让
+        // 「模型只在 models.json」的机器在启动路径上直接失败。
+        let api_key = injected_key.unwrap_or_default();
 
         let max_turns = overrides
             .max_turns
@@ -722,43 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn load_requires_api_key() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let overrides = ConfigOverrides {
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            // An explicit empty workdir prevents fallback loading of a local
-            // or global .yi-agent/.env file.
-            workdir: Some(temp.path().to_path_buf()),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-        };
-        let result = RuntimeConfig::load(&overrides);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("API key"),
-            "error should mention API key, got: {msg}"
-        );
-    }
-
-    #[test]
     fn load_lenient_allows_a_missing_api_key() {
         let _lock = ENV_TEST_MUTEX
             .lock()
@@ -771,20 +739,6 @@ mod tests {
         };
         let config = RuntimeConfig::load_lenient(&overrides).expect("lenient load must succeed");
         assert_eq!(config.api_key, "");
-    }
-
-    #[test]
-    fn load_still_requires_a_key() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let overrides = ConfigOverrides {
-            workdir: Some(temp.path().to_path_buf()),
-            ..ConfigOverrides::default()
-        };
-        assert!(RuntimeConfig::load(&overrides).is_err());
     }
 
     #[test]
@@ -811,7 +765,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.api_url, "https://example.com");
         assert_eq!(config.api_key, "test-key");
         assert_eq!(config.model, "test-model");
@@ -844,7 +798,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
         // 地址有客观默认值,模型名没有:没有显式注入就必须是空串,由调用方
         // 自己判断"未配置"并报可识别的错误,而不是凭空猜一个名字发出去。
@@ -882,7 +836,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
         assert_eq!(config.compact_user_budget_tokens, 20_000);
         assert_eq!(config.compact_tool_budget_tokens, 12_000);
@@ -912,7 +866,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.compact_threshold, 50_000); // 100000 * 50 / 100
     }
 
@@ -941,7 +895,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.compact_threshold, 160_000); // 200000 * 80 / 100
     }
 
@@ -969,20 +923,25 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let result = RuntimeConfig::load(&overrides);
+        let result = RuntimeConfig::load_lenient(&overrides);
         assert!(result.is_err());
     }
 
+    /// 真正覆盖「未注入 provider 时的回退」。
+    ///
+    /// 旧版本这个位置的测试名叫 `load_defaults_provider_to_anthropic`，却传了
+    /// `provider: Some("anthropic")` —— 断言的是显式配置，回退路径其实从未被测。
+    /// 这里全部覆盖项留空，走真正的默认分支。
     #[test]
-    fn load_defaults_provider_to_anthropic() {
+    fn defaults_provider_to_openai_when_nothing_is_configured() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: Some("anthropic".into()),
+            provider: None,
             api_url: None,
-            api_key: Some("test-key".into()),
+            api_key: None,
             model: None,
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
@@ -998,8 +957,10 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
-        assert_eq!(config.provider, "anthropic");
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_url, "https://api.openai.com/v1");
+        assert_eq!(config.model, "", "no default model name may be invented");
     }
 
     #[test]
@@ -1027,7 +988,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(config.provider, "openai");
         assert_eq!(config.api_url, "https://api.openai.com/v1");
         assert_eq!(config.model, "", "no default model name may be invented");
@@ -1181,7 +1142,8 @@ mod tests {
             ..Default::default()
         };
 
-        let cfg = RuntimeConfig::load(&overrides).expect("an explicit empty key is a full package");
+        let cfg = RuntimeConfig::load_lenient(&overrides)
+            .expect("an explicit empty key is a full package");
         assert_eq!(cfg.api_key, "");
         assert!(cfg.model_injected);
     }
@@ -1275,7 +1237,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let result = RuntimeConfig::load(&overrides);
+        let result = RuntimeConfig::load_lenient(&overrides);
         assert!(result.is_ok(), "load should succeed: {:?}", result.err());
 
         assert!(
@@ -1312,7 +1274,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(
             config.workdir.is_absolute(),
             "workdir should be a valid absolute path (current_dir fallback), got: {}",
@@ -1355,7 +1317,7 @@ mod tests {
         env.remove("YI_AGENT_SANDBOX");
         let mut overrides = test_overrides();
         overrides.yolo = true;
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(config.yolo);
         assert_eq!(
             config.sandbox,
@@ -1372,7 +1334,7 @@ mod tests {
         overrides.yolo = true;
         overrides.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
         assert_eq!(
-            RuntimeConfig::load(&overrides).unwrap().sandbox,
+            RuntimeConfig::load_lenient(&overrides).unwrap().sandbox,
             yi_agent_tools::SandboxMode::ReadOnly
         );
     }
@@ -1387,7 +1349,7 @@ mod tests {
         let mut overrides = test_overrides();
         overrides.yolo = true;
         assert_eq!(
-            RuntimeConfig::load(&overrides).unwrap().sandbox,
+            RuntimeConfig::load_lenient(&overrides).unwrap().sandbox,
             yi_agent_tools::SandboxMode::ReadOnly
         );
     }
@@ -1400,7 +1362,7 @@ mod tests {
         let mut overrides = test_overrides();
         overrides.yolo = true;
         overrides.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
-        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        let cfg = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(!cfg.sandbox_promotable);
         assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::ReadOnly);
     }
@@ -1414,7 +1376,7 @@ mod tests {
         env.set("YI_AGENT_SANDBOX", "read-only");
         let mut overrides = test_overrides();
         overrides.yolo = true;
-        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        let cfg = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(!cfg.sandbox_promotable);
         assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::ReadOnly);
     }
@@ -1427,7 +1389,7 @@ mod tests {
         let _env = isolated_config_env();
         let mut overrides = test_overrides();
         overrides.skip_permissions = true;
-        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        let cfg = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
         assert!(!cfg.sandbox_promotable);
     }
@@ -1440,7 +1402,7 @@ mod tests {
         let _env = isolated_config_env();
         let mut overrides = test_overrides();
         overrides.yolo = true;
-        let cfg = RuntimeConfig::load(&overrides).unwrap();
+        let cfg = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::DangerFullAccess);
         assert!(!cfg.sandbox_promotable);
     }
@@ -1451,7 +1413,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
-        let cfg = RuntimeConfig::load(&test_overrides()).unwrap();
+        let cfg = RuntimeConfig::load_lenient(&test_overrides()).unwrap();
         assert!(cfg.sandbox_promotable);
     }
 
@@ -1464,7 +1426,7 @@ mod tests {
         env.remove("YI_AGENT_SANDBOX");
         let mut overrides = test_overrides();
         overrides.skip_permissions = true;
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(config.yolo);
         assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
     }
@@ -1477,7 +1439,7 @@ mod tests {
         let mut env = EnvVarGuard::new(["YI_AGENT_YOLO", "YI_AGENT_SANDBOX"]);
         env.set("YI_AGENT_YOLO", "true");
         env.remove("YI_AGENT_SANDBOX");
-        let config = RuntimeConfig::load(&test_overrides()).unwrap();
+        let config = RuntimeConfig::load_lenient(&test_overrides()).unwrap();
         assert!(config.yolo);
         assert_eq!(config.sandbox, yi_agent_tools::SandboxMode::WorkspaceWrite);
     }
@@ -1506,7 +1468,7 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
         assert!(!config.yolo);
     }
 
@@ -1539,7 +1501,7 @@ mod tests {
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()
         };
-        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        let config = RuntimeConfig::load_lenient(&overrides).expect("config loads");
         assert_eq!(config.max_resident_subagents, 64);
     }
 
@@ -1557,7 +1519,7 @@ mod tests {
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()
         };
-        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        let config = RuntimeConfig::load_lenient(&overrides).expect("config loads");
         assert_eq!(config.max_resident_subagents, 8);
     }
 
@@ -1574,12 +1536,12 @@ mod tests {
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()
         };
-        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        let config = RuntimeConfig::load_lenient(&overrides).expect("config loads");
         assert_eq!(config.max_direct_children, DIRECT_CHILDREN_DEFAULT);
         assert_eq!(DIRECT_CHILDREN_DEFAULT, 8);
 
         env.set("YI_AGENT_MAX_DIRECT_CHILDREN", "3");
-        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        let config = RuntimeConfig::load_lenient(&overrides).expect("config loads");
         assert_eq!(config.max_direct_children, 3);
     }
 

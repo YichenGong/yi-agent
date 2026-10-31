@@ -16,11 +16,30 @@ export type NotificationEnvelope = { jsonrpc: string, } & ({ "method": "thread/s
  * 该会话选中的清单条目显示名(`None`＝跟随全局默认)。`model` 是解析后的
  * 生效串,`model_ref` 是用户在清单里选中的那一条,客户端据此回显。
  */
-model_ref?: string | null, } } | { "method": "turn/started", "params": { thread_id: string, turn_id: string, } } | { "method": "thread/status/updated", "params": { thread_id: string, status: ThreadStatus, } } | { "method": "thread/modelChanged", "params": { thread_id: string, model: string, } } | { "method": "thread/permissionModeChanged", "params": { thread_id: string, mode: "normal" | "yolo", } } | { "method": "thread/reasoningEffortChanged", "params": { thread_id: string, effort?: string | null, } } | { "method": "thread/preserveThinkingChanged", "params": { thread_id: string, preserve: boolean, } } | { "method": "model/capabilitiesChanged", "params": { name: string, reasoning_capabilities?: unknown, } } | { "method": "thread/titleChanged", "params": { thread_id: string, title: string, } } | { "method": "thread/tagChanged", "params": { thread_id: string, tag: string | null, } } | { "method": "thread/groupsChanged", "params": { workspace: string, } } | { "method": "thread/notice", "params": { thread_id: string, level: "Info" | "Warn", text: string, } } | { "method": "thread/reasoningDelta", "params": { thread_id: string, text: string, kind: "Content" | "Summary", } } | { "method": "item/started", "params": { thread_id: string, item: Item, } } | { "method": "item/delta", "params": { thread_id: string, item_id: string, delta: string, } } | { "method": "item/completed", "params": { thread_id: string, item: Item, } } | { "method": "items/completed", "params": { thread_id: string, items: Array<Item>, } } | { "method": "turn/completed", "params": { thread_id: string, turn_id: string, status: TurnStatus, error?: string, } } | { "method": "turn/interjectionsReturned", "params": { thread_id: string, turn_id: string, items: Array<string>, } } | { "method": "turn/retry", "params": { thread_id: string, turn_id: string, attempt: number, max: number, 
+model_ref?: string | null, } } | { "method": "turn/started", "params": { thread_id: string, turn_id: string, } } | { "method": "thread/status/updated", "params": { thread_id: string, status: ThreadStatus, } } | { "method": "thread/modelChanged", "params": { thread_id: string, model: string, } } | { "method": "thread/permissionModeChanged", "params": { thread_id: string, mode: "normal" | "yolo", } } | { "method": "thread/readStateChanged", "params": { thread_id: string, last_read_at: number, last_completed_at: number, } } | { "method": "thread/reasoningEffortChanged", "params": { thread_id: string, effort?: string | null, } } | { "method": "thread/preserveThinkingChanged", "params": { thread_id: string, preserve: boolean, } } | { "method": "model/capabilitiesChanged", "params": { name: string, reasoning_capabilities?: unknown, } } | { "method": "thread/titleChanged", "params": { thread_id: string, title: string, } } | { "method": "thread/tagChanged", "params": { thread_id: string, tag: string | null, } } | { "method": "thread/groupsChanged", "params": { workspace: string, } } | { "method": "thread/notice", "params": { thread_id: string, level: "Info" | "Warn", text: string, } } | { "method": "thread/reasoningDelta", "params": { thread_id: string, text: string, kind: "Content" | "Summary", } } | { "method": "item/started", "params": { thread_id: string, item: Item, } } | { "method": "item/delta", "params": { thread_id: string, item_id: string, delta: string, } } | { "method": "item/completed", "params": { thread_id: string, item: Item, } } | { "method": "items/completed", "params": { thread_id: string, items: Array<Item>, } } | { "method": "turn/completed", "params": { thread_id: string, turn_id: string, status: TurnStatus, error?: string, 
+/**
+ * 本轮完成时刻（epoch 毫秒），与落盘的 `last_completed_at` **同源**。
+ *
+ * 客户端收到本帧会立刻重拉 `thread/listAll`，而那一次落盘**排在广播
+ * 之后**（广播在 driver 的流消费处，落盘在 `persist_and_finish_turn`），
+ * 于是列表里的 `last_completed_at` 可能仍是旧值。自带权威时间戳让客户端
+ * 按 `max` 合入即可收敛，无需再造一套「哪个来源更权威」的机制。
+ *
+ * 可选：旧服务端不发这个字段，客户端退回自己的墙钟（只会多亮一次蓝点，
+ * 不会漏），故不必为一个「更好一点」的时间戳把线协议变成破坏性变更。
+ */
+completed_at?: number | null, } } | { "method": "turn/interjectionsReturned", "params": { thread_id: string, turn_id: string, items: Array<string>, } } | { "method": "turn/retry", "params": { thread_id: string, turn_id: string, attempt: number, max: number, 
 /**
  * Why the turn is being retried: `"idle_stall"` or `"request_timeout"`.
  */
-cause: string, } } | { "method": "thread/tokenUsage/updated", "params": { thread_id: string, model: string, input_tokens: number, output_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, total_input_tokens: number, total_output_tokens: number, total_cache_creation_input_tokens: number, total_cache_read_input_tokens: number, } } | { "method": "agent/trace/event", "params": { threadId: string, taskId: string, row: AgentTraceRow, } } | { "method": "agent/children/updated", "params": { threadId: string, children: Array<AgentChild>, } } | { "method": "process/updated", "params": { thread_id: string, process_id: string, 
+cause: string, } } | { "method": "thread/tokenUsage/updated", "params": { thread_id: string, model: string, input_tokens: number, output_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, total_input_tokens: number, total_output_tokens: number, total_cache_creation_input_tokens: number, total_cache_read_input_tokens: number, 
+/**
+ * 本会话所有 subagent 的累计，**不并入** `total_*`。
+ *
+ * 与主会话是两组独立的数：`/usage` 与展开面板要分开呈现，合并会让
+ * 「主 Agent 自己花了多少」无从得知。恒为具体数字，没有 subagent 时是 0。
+ */
+subagent_input_tokens: number, subagent_output_tokens: number, subagent_cache_read_tokens: number, } } | { "method": "agent/trace/event", "params": { threadId: string, taskId: string, row: AgentTraceRow, } } | { "method": "agent/children/updated", "params": { threadId: string, children: Array<AgentChild>, } } | { "method": "process/updated", "params": { thread_id: string, process_id: string, 
 /**
  * `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
  * killed / failed_to_start。
