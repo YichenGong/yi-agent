@@ -120,6 +120,29 @@ app-server、各自的工作目录、各自的会话状态、各自的重连退�
    **解压在远端做**是刻意的：Linux 一定有 `tar`，本机因此不需要引入任何
    xz/gzip 解压依赖，Rust 侧只负责「下载」和「scp」两个动作。
 
+   **但"有 `tar`"不等于"能解 `.tar.gz`"**，这条必须实测而不是假设
+   （BSD tar 与 GNU tar 行为不同，已在本机验证）：
+
+   - **macOS 的 bsdtar 内置 zlib**，`tar -xzf` 不需要外部 `gzip`
+     （实测 `bsdtar 3.5.3 - libarchive ... zlib/1.2.12`，解 `.tgz` 成功）
+   - **Linux 的 GNU tar 不内置解压器**，`-z` 会去 fork 一个 `gzip` 进程。
+     极简镜像（alpine 的 busybox tar、distroless、某些 CI 容器）里可能
+     **没有 `gzip` 二进制**，此时 `tar -xzf` 直接失败
+
+   所以安装前要**先探测再决定**，探测结果缓存进 `profile`，避免每次重复：
+
+   ```bash
+   ssh <host> 'command -v tar && tar --help 2>&1 | grep -qi gzip && echo gz || echo plain'
+   ```
+
+   - 有 `tar` + 支持 gzip（绝大多数情况）→ 主路径，`.tar.gz`
+   - 有 `tar` 但不支持 gzip → 本机先解成**未压缩 tar**再 scp（体积回到 37MB，
+     但仍能装上；比直接失败好），远端 `tar -xf`
+   - 连 `tar` 都没有 → 回落到路径 2（远端直下 + `sh` 自解压脚本），
+     再失败就提示用户用路径 3（`--from`）
+
+   **不要**为了省事把 `.tar.xz` 当默认：`xz` 在极简镜像里更少见。
+
 2. **远端直下**（远端有外网时）
    `ssh host 'curl|wget <url>'` 直接拉，省本机带宽。仅当远端确实能连通时启用，
    失败立刻回落到路径 1。
@@ -1710,7 +1733,10 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
     不能是文件里的旧值（§4.6）
 53. **替换而非追加 session 参数**：`relay_url` 已含 `?session=old` 时，
     派生结果是 `session=<新值>` 且只出现**一次**（§4.6）
-54. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+54. **无 gzip 的远端能装上（降级路径）**：在一个**没有 `gzip`** 的环境里
+    （可用容器或临时移除 PATH 里的 gzip 模拟）验证安装成功走 plain-tar 路径，
+    而不是报 `tar: gzip: not found` 就中止（§2.4.2）
+55. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1764,7 +1790,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **54 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **55 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
