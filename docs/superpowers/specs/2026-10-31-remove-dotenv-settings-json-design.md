@@ -154,6 +154,23 @@ CLI flag / GUI 覆盖  >  真实进程环境变量  >  settings.json  >  Rust �
 与现状的唯一区别是第三层从 `.env` 换成 `settings.json`。真实环境变量这一层必须保留：
 CI、`just test-*`、部署脚本都在用它做临时覆盖。
 
+**`skills_catalog_budget_explicit` 的语义要跟着改。** 它现在（`config.rs:396-400`）的
+含义是「用户显式给了预算」，判定源是 `overrides` 或 `YI_AGENT_SKILLS_CATALOG_BUDGET`
+环境变量。它决定 `resolve_catalog_budget_policy`（`bootstrap.rs:608`）在技能目录超出
+预算时，是直接截断还是**交互式弹「Include all skills?」**。
+
+`settings.json` 里的值算不算 explicit？判定标准：**explicit 只表示「本次启动被显式指定」，
+配置文件里的值是「长期偏好」，不算 explicit。**
+
+- 理由：`settings.json` 的定位与前一层 `.env` 完全相同（都是用户事先写好的持久配置）。
+  如果把它算作 explicit，那么任何在 UI 里设过一次预算的用户，从此永久失去
+  「目录变大时被提示要不要全量加载」这个行为，且无法察觉。
+- 实现：`skills_catalog_budget_explicit` 的表达式**原样保留**，不追加
+  `settings.skills_catalog_budget.is_some()`。这个字段的 doc comment 要同步写明
+  「不含 `settings.json`」。
+- 新增一条测试：`settings.json` 设了 budget、无 env、无 override、总数超预算时，
+  `skills_catalog_budget_explicit == false`。
+
 ### 迁移
 
 **启动序是本节唯一必须做对的事。** 两条迁移（既有的 `migrate_model_keys` 与新的
@@ -236,6 +253,60 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 
 新的 `.env` 读取器必须剥 `export ` 前缀、截断未转义的行内 `#`、剥配对引号。放在
 `settings.rs` 里作为一个纯函数，与迁移逻辑分开测试。
+
+### onboarding 的兜底层必须一起改
+
+这是删掉 `.env` 时最容易漏的一条链：引导流程至今把 `.env` 当作**仅次于 `models.json` 的
+兜底配置来源**。`.env` 改名后这些代码不会报错，只会安静地拿到空值。
+
+现有的权威链（`onboarding.rs:44` `assess`）：
+
+```
+1. models.json 的默认条目可用           → Ready{Catalog}
+2. 否则读 .env 的四个模型键，全齐且合法 → Ready{Env}
+3. 否则                                  → Needed{缺哪几项}
+```
+
+读取点（非测试代码，全部实测确认）：
+
+| 位置 | 用途 |
+|---|---|
+| `onboarding.rs:169` `read_env_fields` | 本体：解析 `.env` 的四个模型键 |
+| `onboarding_rpc.rs:21` | `onboarding/status` 的判定输入 |
+| `rpc/thread.rs:55` | `missing_model_error` 的 `reasons` 列表 |
+| `onboarding_prompt.rs:15` `should_offer` | CLI 首启是否弹引导，第一个形参就是 `env_path` |
+| `server.rs:417` 起共 6 处 | `AppState.onboarding_env_path` 的定义与装配 |
+| `rpc/mod.rs:359`、`ws.rs:151` | 参数传递 |
+
+（`main.rs:1298` 的 `prefs_path = env_path.with_file_name("preferences.json")` **不是**问题：
+那只是路径拼接，不读文件内容，`.env` 改名后依然正确。）
+
+后果（`.env` 已改名成 `.env.migrated` 后）：`read_env_fields` 永远返回全空，于是
+`onboarding/status` 恒报 `needed`、`should_offer` 一直弹引导、`missing_model_error`
+恒返回四项全缺。
+
+**处置：删掉 `ReadySource::Env` 这一层。**
+
+- `assess(env, catalog)` 简化为 `assess(catalog)`：只保留「清单默认条目可用 → Ready，
+  否则 Needed」。`EnvModelFields`、`read_env_fields`、`ReadySource::Env` 一并删除
+  （`EnvModelFields` 在 `onboarding.rs` 内出现 8 次、无跨文件引用，删起来是局部的）。
+  `ReadySource` 若只剩一个分支，就直接改成 `Result<(), Vec<Missing>>` 或 bool。
+- `should_offer(preferences_path)`：丢掉第一个形参。
+- `AppState.onboarding_env_path` 整体删除。`onboarding/apply` 早已**只写
+  `models.json`**（`onboarding_rpc.rs:76` 的形参就叫 `_env_path`，测试
+  `apply_writes_the_catalog_and_never_the_env` 钉着这点），所以这个 path 在删掉
+  读取后没有任何用途；`handle_onboarding_request_at` 的第一个形参随之去掉。
+  同时清掉 `server.rs` 的 6 处装配、`rpc/mod.rs:359`、`ws.rs:151` 的传递，
+  以及 `rpc_tests.rs` 里 4 处 `onboarding_env_path: PathBuf::new()`。
+- **不需要迁移**：模型键早就在 `migrate_model_keys` 里进了 `models.json`，
+  所以「模型配置只在 `models.json`」在本 spec 之前就已成立。删掉 Env 层只是删掉
+  一个已经不再被写入的读取路径，不丢任何用户数据。
+- 顺带修一个既有体验缺陷：`missing_model_error` 在「清单有默认条目但 key 为空」时
+  会报「四项全缺」，实际只缺 `api_key`。简化成单一来源后，原因列表必须与 `assess`
+  的判据同源，避免两处给出不同的缺失描述。
+
+`onboarding.rs` 现有 20 个 `#[test]`，凡是以 `EnvModelFields` 为输入的都要改成 catalog
+输入；`should_offer` 的两条测试同步改签名。
 
 ### RPC 面
 
@@ -363,6 +434,15 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 - `.env` 读取口径：`KEY=v #c` → `v`；`export KEY=v` → `v`；`KEY="v"` → `v`。
 - **BOCHA 回退已删**：`resolved_api_key()` 在 `websearch.json` 无 key 且
   `BOCHA_API_KEY` 环境变量有值时返回 `None`（钉住「不再读 env」）。
+- **onboarding 只剩一条权威链**：`assess` 只吃 catalog；清单默认条目可用 → `Ready`，
+  不可用 → `Needed`。`.env` 里写着完整的四个模型键也**不影响**判定（这是钉住
+  「兜底层已删」的那条测试，否则将来有人会把 Env 分支加回去）。
+- **`should_offer` 不因 `.env.migrated` 存在而误判**：目录里有 `.env.migrated`
+  且清单无可用条目时，仍返回 `true`（要弹引导），但判定依据是 catalog 而非那个文件。
+- **`skills_catalog_budget_explicit` 不认 `settings.json`**：`settings.json` 设了 budget、
+  无 env、无 override、总数超预算时该字段为 `false`。
+- **零写入的拒绝**：`settings/write` 传 `max_turns: 0` 或 `sandbox: "bogus"` 时返回
+  `invalid_setting`，且文件的 mtime 与内容都不变。
 - `YI_AGENT_WORKDIR` 不再影响 `resolve_workdir`（设为任意值后断言仍用当前目录）。
 - `domain_for` 表补 `settings/read|write|test`。
 - web：`put_config` 不再产生空值行；未知键存活；`source` 基于 `null` 判定；`real-llm` 路由返回 404。
@@ -394,7 +474,8 @@ cd desktop && npx tsc --noEmit && npx vitest run --maxWorkers=1
   「`~/.yi-agent/.env` 是唯一的 `.env`」那段（届时已无 `.env`）。
 - `.env.example`：删除。已核实没有任何 Rust 代码读它（`grep -rn "env.example" yi-agent-rs/crates`
   只命中测试里的假 URL `https://env.example`），留着只会误导用户去项目根建 `.env`。
-- `docs/bug-list.md`：记录本次修复的一号缺陷（web 保存删键）。
+- `docs/bug-list.md`：一号缺陷（web 保存删键）与 `bug-list.md:171` 的 `.env` 解析口径问题
+  一并标为已修，附本次的回归测试名。
 
 ## 阶段二：`yi-agent web` 复用桌面前端（C 方案）
 
@@ -441,6 +522,19 @@ cd desktop && npx tsc --noEmit && npx vitest run --maxWorkers=1
 **5. `yolo` 不该持久化。** 它会破坏 `sandbox_promotable` 的不变量（启动时非 yolo 才允许
 运行期提权），且把「一次开过 yolo」变成「永久 yolo」。已从 `settings.json` 移除，
 并在测试一节加了钉住该不变量的用例。
+
+**6.（第二轮）漏了 onboarding 的 `.env` 兜底层。** 这是第二轮自审最重要的发现，初稿完全
+没提。引导流程（`onboarding.rs:44` 的 `assess`）把 `.env` 当作仅次于 `models.json` 的
+配置来源，`onboarding/status`、`should_offer`、`missing_model_error` 三处都在读它。
+`.env` 改名后这些代码不报错，只会静默拿到空值，表现为「每次启动都弹引导」「错误信息
+恒报四项全缺」。已新增「onboarding 的兜底层必须一起改」一节，要求删掉
+`ReadySource::Env` 与 `AppState.onboarding_env_path`。幸运的是 `onboarding/apply`
+早就只写 `models.json`，所以这一步不丢用户数据。
+
+**7.（第二轮）`skills_catalog_budget_explicit` 没定义新语义。** 它决定技能目录超预算时
+是直接截断还是交互式询问。`settings.json` 的值算不算 「显式指定」是个必须选边的叉路，
+初稿没写，实施时会随手二选一。已定：**不算**，因为配置文件是长期偏好而非本次启动的
+显式指令；判定表达式原样保留。
 
 此外补了两处初稿含糊的地方：**空字符串等于未设置**（覆盖字符串/数值/枚举三类，且必须在
 写入侧实现，否则会重演 `env_file::write` 写空占位导致 `source` 失真的老问题）；
