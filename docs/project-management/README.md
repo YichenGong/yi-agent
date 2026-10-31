@@ -29,6 +29,7 @@
 | subagent-runtime | 44 / 52 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 10 / 10 | [详情](./superpowers-kanban.md) |
 | desktop | 89 / 103 | [详情](./desktop.md) |
+| magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 
 ## 已知问题
 
