@@ -404,6 +404,10 @@ pub(crate) struct RuntimeAttachments {
     /// `models_path` is: the 网页搜索 panel must be testable without writing
     /// the developer's real machine-level config.
     pub(crate) websearch_path: PathBuf,
+    /// Where `settings.json` lives. Injectable for the same reason
+    /// `models_path` is: the runtime settings panel must be testable without
+    /// writing the developer's real machine-level config.
+    pub(crate) settings_path: PathBuf,
     /// 组长开关的**生效值**，装配时算一次。
     ///
     /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，
@@ -1968,6 +1972,7 @@ where
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
+            settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -2055,6 +2060,7 @@ where
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
+            settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -3199,6 +3205,7 @@ where
         thread_roots,
         models_path,
         websearch_path,
+        settings_path,
         onboarding_preferences_path,
         resident_dir,
         skills_home,
@@ -3496,6 +3503,7 @@ where
                             theme_handle: &theme_handle,
                             models_path: &models_path,
                             websearch_path: &websearch_path,
+                            settings_path: &settings_path,
                             probes: &probes,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,

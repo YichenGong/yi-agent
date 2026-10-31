@@ -287,7 +287,7 @@ pub(crate) enum Domain {
 /// [`Domain::Unknown`],`serve()` 照旧处理。
 pub(crate) fn domain_for(method: &str) -> Domain {
     match method.split_once('/').map(|(head, _)| head) {
-        Some("ui") | Some("config") => Domain::Ui,
+        Some("ui") | Some("config") | Some("settings") => Domain::Ui,
         Some("model") => Domain::Model,
         Some("onboarding") => Domain::Onboarding,
         Some("resident") => Domain::Resident,
@@ -350,6 +350,8 @@ pub(crate) struct AppState<'a> {
     /// 网页搜索配置文件路径（`~/.yi-agent/websearch.json`）。可注入，让测试
     /// 不必改 `HOME` 这类进程全局量。搬移前臂里的 `websearch_path`。
     pub(crate) websearch_path: &'a Path,
+    /// `settings.json` 路径。可注入，让测试不必改 `HOME`。
+    pub(crate) settings_path: &'a Path,
     /// 进程内「正在探测」的模型名登记表：`model/probe` 与 `model/upsert` 的
     /// 后台探测共用同一张表，保证同名条目的探测不会并发跑两轮。它只是内存态，
     /// 每个 app-server 进程一份（见 `serve()` 里的构造）。
