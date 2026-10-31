@@ -28,15 +28,31 @@ yi-agent 现在的工具层全部是**本地执行**：
 `ssh <host> <remote-yi-agent> app-server --listen stdio://`，把这条 ssh 子进程的
 stdin/stdout 当作 JSON-RPC 通道。
 
-依据（调研 codex 源码 `codex-rs/exec-server/src/environment_toml.rs:428-437`）：
-codex 采用完全相同的形态，其配置即
+依据（调研 codex 源码）：codex 采用完全相同的形态。其 environment 配置结构
+（`codex-rs/exec-server/src/environment_toml.rs:41-57` 的 `EnvironmentToml`）包含：
 
-```toml
-[[environments]]
-id = "ssh-dev"
-program = "ssh"
-args = ["dev", "codex exec-server --listen stdio"]
+```rust
+program: Option<String>,        // 可执行程序，如 "ssh"
+args: Option<Vec<String>>,      // ["dev", "codex exec-server --listen stdio"]
+env: Option<HashMap<String, String>>,
+cwd: Option<PathBuf>,           // 绝对路径，spawn 时直接作为子进程 cwd
+connect_timeout_sec: Option<Duration>,
+initialize_timeout_sec: Option<Duration>,
 ```
+
+四件值得直接借鉴的事：
+
+1. **`cwd` 是 spawn 参数**，不是拼进 args 的 `cd`（`environment_toml.rs:190-196`
+   把 `cwd` 传给 spawn，`:215-231` 的 `normalize_stdio_cwd` 强制它必须是绝对路径）。
+   这比 shell 拼接更安全——无需引号、天然免疫注入。本设计采用这个思路，
+   而不是 `cd xxx &&` 的写法（见 §4.4 的修订）。
+2. **`env` 可注入环境变量**。本设计用它传 `YI_AGENT_HOME` 做状态隔离（§4.6）。
+3. **每个 environment 有独立的连接与初始化超时**（§4.1 的超时表参照此项）。
+4. codex 还有一个明确的区分：**recovery（瞬断后恢复同一会话）vs refresh
+   （执行器被替换后建新会话）**，分别实现在 `client_recovery.rs` 与
+   `client_refresh.rs`。本设计不做会话恢复（§4.3、§7），因此只需要
+   recovery 的"重启进程"语义，不需要 refresh。这个区分记在这里是为了避免
+   实现时误抄 refresh 的复杂度。
 
 好处：协议零改动、工具语义天然一致（read/grep/glob 都在远端跑，不存在"远程版行为
 对不齐"的问题）、不引入 SSH 依赖、不需要维护两套工具实现。
@@ -162,7 +178,7 @@ app-server、各自的工作目录、各自的会话状态、各自的重连退�
 
 | 组件 | 职责 | 位置 | 依赖 |
 |---|---|---|---|
-| `remote/profile.rs`（新增） | 远端配置读写与校验：host、远端项目路径、二进制版本。存 `$YI_AGENT_HOME/remote.json` | `desktop/src-tauri/src/` | 无（纯逻辑，好测） |
+| `remote/profile.rs`（新增） | 远端配置读写与校验。存 `<本机 instance_home>/remote.json`（schema 见 §4.9） | `desktop/src-tauri/src/` | 无（纯逻辑，好测） |
 | `remote/install.rs`（新增） | 探测远端架构、下载与缓存 tar.gz、scp、触发远端解压、校验版本 | 同上 | `ssh`、发布渠道、本机缓存 |
 | `remote/rpc.rs`（新增） | `remote/*` 的 Tauri 命令：由前端直接 `invoke`，不经 sidecar | 同上 | 上述两者 |
 | `bridge.rs`（改） | **单例改为按 slot 分键的进程表**；按 slot 起本地 sidecar 或 ssh 子进程；事件按 slot 命名 | 同上 | 上述两者 |
@@ -197,14 +213,40 @@ webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 
 1. 用户在设置里填 host（如 `dev@10.0.0.5`）与远端项目路径
 2. 点「连接」，前端发 `remote/connect`
 3. Rust：`ssh <host> 'uname -sm'` 探测架构
-4. 查 `~/.yi-agent/bin/<version>/` 是否已存在且 `--version` 匹配
-5. 不存在则安装（§2.4 的三级优先），进度以 `remote/install/progress` 事件回推
-6. 安装完起 `ssh <host> '<path> app-server --listen stdio://'`，接管 stdio
-7. 前端拿到 `remote/status` 的 `connected`，正常开始对话
+4. **校验远端项目路径存在**：`ssh <host> 'test -d <远端项目路径>'`。
+   不存在就**立即失败并说明**，不要等到起 app-server 时由
+   `resolve_workdir` 报 `working directory does not exist`（§4.4 已说明这是必做步骤，
+   因为 app-server 启动即会校验 `is_dir()`）
+5. 查 `~/.yi-agent/bin/<version>/` 是否已存在且 `--version` 匹配
+6. 不存在则安装（§2.4 的三级优先），进度以 `remote/install/progress` 事件回推
+7. 安装完起 ssh 会话（`cwd` = 远端项目路径，`YI_AGENT_HOME` 隔离，见 §4.6），
+   接管 stdio
+8. 前端拿到 `remote/status` 的 `connected`，正常开始对话
+
+**每一步都要有超时，不能无限等**。参考 codex 的做法
+（`exec-server/src/environment_toml.rs:53-56` 的 `connect_timeout_sec` /
+`initialize_timeout_sec` 是每个 environment 的可配置项）：
+
+| 阶段 | 超时建议 | 超时后的行为 |
+|---|---|---|
+| ssh 建连（第 3 步） | 20s | 报「无法连接 <host>」，附 ssh stderr |
+| 路径校验（第 4 步） | 10s | 报「远端路径不可用」 |
+| 安装（第 6 步） | 不设总超时，但**每阶段有进度** | 用户可取消 |
+| app-server 握手（第 8 步） | 30s | 杀掉子进程，报「远端 app-server 未就绪」 |
+
+没有超时的后果是 UI 永远停在"连接中"，用户既不知道在等什么，也没法重试——
+这是这类功能最常见的坏体验。
+
+**并发安装必须互斥**：用户在两台窗口里同时连同一个 `(host, version)` 时，两个流程会
+同时下载、同时 scp、同时解压到同一个远端目录，产生半截文件。做法：本机按
+`(host, version)` 加一把进程内锁（`OnceCell<Mutex<..>>` 的 map 即可，不需要跨进程）；
+远端解压用"先解到临时目录再 rename"的原子替换（与 `workspace_index.rs` 的
+temp+rename 同法），避免读到半截二进制。
 
 ### 4.2 日常连接
 
-直接跳第 4 步之后。**不重复探测架构**——profile 里缓存上次探测结果，架构不会变。
+从第 5 步开始。**不重复探测架构**——profile 里缓存上次探测结果，架构不会变。
+路径校验（第 4 步）仍然**每次都做**：目录可能被删除或改名，这是廉价的一次 `test -d`。
 
 ### 4.3 断线
 
@@ -258,20 +300,14 @@ app-server 在远端跑，而前端手上的 cwd 是**本机路径**（如
 
 **决策：引入显式的路径映射，不做隐式猜测。**
 
-`remote.json` 里除了 `host`，还要存一对路径：
+`remote.json` 需要存"本机项目 → 远端项目"的映射。**完整 schema 定义在
+§4.9，这里只讲它与路径语义的关系**：
 
-```json
-{
-  "host": "dev@10.0.0.5",
-  "projects": {
-    "/Users/yichen/proj/foo": "/home/dev/proj/foo"
-  },
-  "binary_version": "0.1.10"
-}
-```
+- key：本机项目路径（绝对、canonical）
+- value：远端路径（绝对）**以及该项目的实例隔离根**（§4.6）
 
-- **key**：本机项目路径（绝对、canonical）
-- **value**：该项目在远端的对应路径（绝对）
+即每个远端项目是一个独立 profile，而不是"一个 host 下挂多个项目目录"。理由同
+§4.6：每个项目要独立进程、独立状态目录，把它建成 profile 正好一一对应。
 
 前端目前 `thread/start` 会传本机路径。**远端模式下必须停止这样做**——本机路径
 送到远端 `canonicalize` 必然失败。两种处理方式，**选 B**：
@@ -280,11 +316,28 @@ app-server 在远端跑，而前端手上的 cwd 是**本机路径**（如
   缺点：桥接层要解析并改写 JSON-RPC 参数，破坏"桥接层只转发不解析"的现有性质
   （见 `bridge.rs:29-46` 的 `classify`，它只看有没有 `method`/`id`，不看 content），
   而且每新增一个带路径的 RPC 都要记得改，漏一个就回到本节的 bug。
-- **B. 远端 cwd 由 ssh 命令的 `cd` + app-server 的 `--workdir` 决定**：
-  ssh 命令为 `ssh host 'cd <远端项目路径> && exec <bin> app-server --listen stdio://'`，
-  且前端在远端模式下**不传 `cwd`**。此时 `resolve_thread_cwd` 走
-  `None => cfg.workdir` 分支，直接用进程的 workdir。
-  优点：桥接层保持纯转发；路径映射只影响"起进程时 cd 到哪"这一处。
+- **B. 远端 cwd 由 ssh 会话的工作目录决定**：前端在远端模式下**不传 `cwd`**，
+  此时 `resolve_thread_cwd` 走 `None => cfg.workdir` 分支，直接用进程的 workdir。
+  优点：桥接层保持纯转发；路径映射只影响"起进程时工作目录在哪"这一处。
+
+  **为什么只能用 `cd`（重要，别去抄 codex 的 `cwd`）**：
+  codex 的 `cwd` 是**本机侧 spawn 参数**（`environment_toml.rs:190-196`），管的是
+  **本机 ssh 子进程**的工作目录，管不到远端。而 ssh 协议**没有**"指定远端工作目录"
+  的参数，`ssh -t` 需要终端也不适用。所以"让远端 app-server 的 cwd = 项目目录"
+  只能靠远端 shell 的 `cd`。这是协议限制，不是设计选择。
+
+  因此形态固定为：
+
+  ```bash
+  ssh <host> "cd '<远端项目路径>' && exec '<bin>' app-server --listen stdio://"
+  ```
+
+  - `<bin>` 是安装产生的固定路径（`~/.yi-agent/bin/<version>/yi-agent`），
+    **不由用户输入**，无需转义
+  - `<远端项目路径>` 来自 `remote.json`，**必须经 §6.3 校验**（绝对路径、不含
+    shell 元字符），并用单引号包裹、内部单引号按 `'\''` 转义
+  - 这正是 §6.2/§6.3 要做输入校验的原因：这是全设计里**唯一**把字符串拼进
+    shell 的地方，是命令注入的唯一边界
 
 **B 的代价**：远端模式下「一个会话一个项目」被固化为「一个 app-server 进程一个项目」。
 这正好与 §2.3「一项目一个远端进程」一致，不构成额外限制。
@@ -413,6 +466,75 @@ A 项目的帧隔离在 A 的连接里，前端不需要在回调里再过滤一
 `App.tsx:1777` 的单例改为 `Map<ProjectKey, RpcClient>`。当前活动项目决定用哪个
 client 发请求；每个 client 只订阅自己 slot 的事件名。
 
+#### 与「同一主机多进程」的冲突：共享状态目录（并行引入的真实 bug）
+
+这是并行带来的**第二个**结构性问题，比 `--relay` 更隐蔽，因为它只在"同一个用户在同一台
+远端主机上开两个项目"时触发——而这恰恰是最常见的用法（谁会在两台不同服务器上各开一个
+项目来回切？绝大多数是同一台开发机上开两个仓库）。
+
+**问题**：远端 app-server 的所有持久状态都在 `<远端 home>/.yi-agent/` 下，且**没有
+跨进程互斥**。已核实的共享状态与各自的风险：
+
+| 路径 | 写入方式 | 多进程风险 |
+|---|---|---|
+| `workspaces.json` | 进程内 `Mutex<()>` + temp+rename（`workspace_index.rs:4` 注释明确写"进程内"） | **丢失更新**：A 读→B 读→A 写→B 写，A 的新增被 B 覆盖 |
+| `resident-daemons.json` | temp+rename（`resident.rs:51`） | 同上；且**每个 app-server 都跑一份 watch loop**（`server.rs:1913-1921` 每 30s 一次），两个 loop 会重复拉起/杀掉同一批 daemon |
+| `threads/*.jsonl` | 按 thread id 分文件 | 安全（文件名不冲突） |
+| `runtime.sqlite` | WAL（`repository.rs:443`） | 安全（WAL 支持多进程并发） |
+| `devices.json` / `pairing.json` | 读-改-写 | 配对状态可能互相覆盖 |
+
+**决策：远端 app-server 用独立的 `YI_AGENT_HOME` 隔离，不做共享。**
+
+ssh 命令改为（`YI_AGENT_HOME` 的写法见下方"路径坑"）：
+
+```
+ssh host "cd '<远端项目路径>' && exec env YI_AGENT_HOME='<实例根>' '<bin>' app-server --listen stdio://"
+```
+
+其中 `<slug>` 由**本机**的 profile 名派生（稳定、可预测），例如 `proj-foo`。
+这样每个远端项目有自己完整的 `threads/`、`workspaces.json`、
+`resident-daemons.json`、`runtime.sqlite`，**互不干扰**。
+
+**`YI_AGENT_HOME` 的路径写法有个坑（已按 `paths.rs` 逻辑实测确认）**：
+`instance_home_from`（`yi-agent-store/src/paths.rs:30-46`）的归一化规则是
+"若传入路径的 basename 不是 `.yi-agent`，就再补一层 `.yi-agent`"。实测结果：
+
+| 传入 `YI_AGENT_HOME` | 实际 `instance_home` |
+|---|---|
+| `/home/dev/.yi-agent-projects/proj-foo` | `/home/dev/.yi-agent-projects/proj-foo/.yi-agent` |
+| `/home/dev/.yi-agent-projects/proj-foo/.yi-agent` | `/home/dev/.yi-agent-projects/proj-foo/.yi-agent` |
+
+即 `instance_home` 的 basename **必然是 `.yi-agent`**。所以要么显式传
+`<home>/.yi-agent-projects/<slug>/.yi-agent`，要么接受归一化补出来的那一层——但
+**必须让 spec、验收命令、实际路径三者一致**，否则排障时会对着路径怀疑人生。
+推荐显式写全，并加一条单测钉住（断言 `instance_home_from` 的返回值等于预期）。
+
+**不要**把实例目录放在 `<home>/.yi-agent/` **内部**（如
+`<home>/.yi-agent/projects/<slug>/...`）：虽然也能工作，但与全局实例共享上层目录，
+语义上不够干净。用**平级**的 `<home>/.yi-agent-projects/` 更清楚。
+
+**代价与取舍**：
+- 每个远端项目独占一份状态 → 磁盘占用随项目数线性增长。但每份也就几 MB
+  （threads 是 jsonl，runtime.sqlite 很小），可接受。
+- **同机两个项目看不到彼此的会话历史**。这是隔离的必然结果，也是正确的：项目 A 的
+  会话列表本来就不该出现在项目 B 里。
+- `models.json` 在 `<instance_home>/models.json`，隔离后每个项目要单独配一次模型。
+  **这是本决策最明显的体验代价**，缓解办法见下。
+
+**缓解 `models.json` 重复配置**：安装时如果检测到同名 `models.json` 不存在，从
+`<home>/.yi-agent/models.json`（用户可能已有的全局配置）**复制**一份过去。这是
+"复制用户自己的配置到同一台机器的另一个目录"，不涉及跨机器传输密钥，与 §6.1
+"不做凭据转发"不冲突。
+
+**不做跨机共享的理由**：另一种设计是让同一台主机的所有远端项目共用一个 app-server
+状态目录（即现在的行为）。那样 `threads/` 会混在一起，且必须给 `workspaces.json`
+和 `resident-daemons.json` 加跨进程文件锁（`flock`，参照
+`yi-agent-store/src/ipc.rs:1211` 的 `InstanceLock`）。**这需要改远端 app-server，
+违背 §3.2「app-server 一行不改」的前提**，因此不采用。
+
+**验收上必须有一条**：同一台远端主机上开两个不同项目，各自的会话列表只包含自己的
+会话；`ls <远端 home>/.yi-agent-projects/` 下有两个目录。
+
 #### 与 `--relay` 的冲突（并行带来的真实约束，必须处理）
 
 `--relay` 的语义是**一个 session 对应一个电脑侧 agent 连接**：
@@ -513,6 +635,59 @@ C 的具体行为：
 3. 明确写出「不会自动复制本机密钥」，让用户知道这是有意的安全选择
 
 这样既不偷偷搬密钥，也不让用户在一句 `no model configured` 面前无从下手。
+
+### 4.9 `remote.json` 的完整 schema（唯一定义处）
+
+前面几节零散提到过字段，这里集中定死，实现时以此为准。
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "proj-foo",
+      "label": "foo (devbox)",
+      "host": "dev@10.0.0.5",
+      "local_path": "/Users/yichen/proj/foo",
+      "remote_path": "/home/dev/proj/foo",
+      "instance_root": "/home/dev/.yi-agent-projects/proj-foo",
+      "binary_version": "0.1.10",
+      "remote_arch": "x86_64-unknown-linux-gnu",
+      "relay_session": null
+    }
+  ]
+}
+```
+
+字段说明与约束：
+
+| 字段 | 约束 | 说明 |
+|---|---|---|
+| `version` | 整数，当前唯一合法值 `1` | 未来迁移用。读到更高版本**拒绝加载**并提示升级 App，不要猜 |
+| `profiles[].id` | `^[a-z0-9][a-z0-9-]{0,31}$`，全文件唯一 | 用作 `ProfileKey`、`instance_root` 末段、事件名后缀。**必须**满足这个字符集，否则事件名与目录名都会被污染 |
+| `host` | `^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$`（§6.2） | 拼进 ssh 命令行，故严格白名单 |
+| `local_path` | 绝对路径，且必须是已存在的目录 | 本机侧的键。UI 上按它显示 |
+| `remote_path` | 绝对路径，不含 shell 元字符（§6.3） | 拼进远端 `cd` |
+| `instance_root` | 绝对路径 | 由 App 自动派生为 `<远端 home>/.yi-agent-projects/<id>`，**不由用户输入**；运行时传给 `YI_AGENT_HOME`（末尾 `.yi-agent` 的处理见 §4.6） |
+| `binary_version` | semver 字符串 | 与 App 版本解耦：远端可以跑旧版 |
+| `remote_arch` | `uname -sm` 的归一化结果 | 缓存探测结果，避免每次重连都探测（§4.2） |
+| `relay_session` | 可为 `null` | 默认 `null`（§4.6：远端 slot 不带中继）。留字段是为了将来做"远端项目手机端可见"时不用改 schema |
+
+**存哪里**：本机 `<本机 instance_home>/remote.json`，即
+`~/.yi-agent/remote.json`（或 `YI_AGENT_HOME` 指向的实例根）。**不在远端存**——
+配置属于"这台电脑要怎么连"，不属于被连的那台机器。
+
+**写入方式**：读-改-写 + temp+rename 原子替换，与
+`workspace_index.rs:4` 的既有约定一致。**必须**加进程内锁（多槽位会并发写）。
+
+**不存的东西**（有意为之）：
+- 不存密码、私钥路径、passphrase —— 完全交给 `~/.ssh`（§4.7）
+- 不存 API key（§6.1）
+- 不存远端 `models.json` 内容（§4.8）
+
+**读坏文件的行为**：JSON 语法错误、字段缺失、`version` 不认识 —— **全部**当作
+"没有配置"，记一条 warning，让用户重新配置。绝不允许坏的 `remote.json` 导致
+desktop 起不来或设置页白屏。
 
 ## 5. 实验开关
 
@@ -650,6 +825,35 @@ flag 是闸门，不是数据清除。重新打开即恢复。
 它失败得早、信息量少，很容易被误判成"ssh 连不上"，从而被错误地"修复"成放宽
 `StrictHostKeyChecking`。实施时**不允许**把它修成 `accept-new` 或 `no`。
 
+### 8.5 状态目录隔离若做错，是"静默丢数据"
+
+`workspaces.json` 和 `resident-daemons.json` 只有**进程内**锁（`workspace_index.rs:4`
+明确写了这一点）。如果 §4.6 的 `YI_AGENT_HOME` 隔离漏做、或某个 slot 忘了传这个
+环境变量，两个远端项目就会并发写同一个文件，后果是**丢失更新且不报错**：
+用户的"最近目录"偶尔少一个，或者某个常驻 daemon 被另一个进程的 watch loop 杀掉。
+
+这类 bug 不会崩、不会报错，只会表现为"有时候怪怪的"。因此：
+- §4.6 的隔离**不是可选优化，是并行正确性的前提**
+- 实施时必须有一条测试：构造两个 `YI_AGENT_HOME` 不同的实例，断言它们的
+  `workspace_index::default_path()` 不同
+- code review 时重点看"是不是每个起远端进程的地方都传了这个变量"
+
+### 8.6 ssh 会话的 cwd 是唯一且脆弱的通道
+
+远端 app-server 的项目目录**只能**来自进程 cwd（`resolve_workdir` 用
+`env::current_dir()`；`--workdir` 参数不存在，`YI_AGENT_WORKDIR` 已下线）。
+这意味着：
+
+- 一旦有人为了"方便"把 ssh 命令改成 `ssh host '<bin> ...'`（去掉 `cd`），
+  所有远端项目会静默地跑在**用户 home** 下——工具仍然能读写，只是写错了地方，
+  而且不会有任何报错
+- `cd` 目标目录被删/改名后，重连会在 `resolve_workdir` 的 `is_dir()` 上失败
+  （`config.rs:198-200`），报 `working directory does not exist`
+
+缓解：把"起远端命令"收敛到**一个纯函数**（输入 profile，输出 args + cwd），
+单测断言输出里包含 `cd '<remote_path>'`，且 `remote_path` 与 profile 一致。
+不要在多处拼这条命令。
+
 ## 9. 验收判据
 
 每条都可用命令验证，不写主观描述。
@@ -700,7 +904,18 @@ flag 是闸门，不是数据清除。重新打开即恢复。
     （§4.3 第 4 条）
 21. **host key 不静默接受**：连一台 known_hosts 里没有的机器，连接必须**失败**
     并进入信任流程；`~/.ssh/known_hosts` 在用户确认前不新增条目（§6.5）
-22. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+22. **同主机的两个项目状态隔离（必测）**：同一台远端主机上开项目 A 与 B，
+    各自的会话列表只含自己的会话；远端
+    `ls <home>/.yi-agent-projects/` 下有两个目录，且各自的
+    `workspaces.json` 不含对方的项目路径（§4.6）
+23. **远端路径不存在时快速失败**：填一个不存在的远端路径，连接在
+    `test -d` 阶段就报「远端路径不可用」，不是等到 app-server 启动后报
+    `working directory does not exist`（§4.1 第 4 步、§4.4）
+24. **每阶段有超时**：把 ssh 指向一个黑洞地址（如 `10.255.255.1`），
+    20s 内必须报「无法连接」并给出重试，UI 不能永远停在"连接中"（§4.1）
+25. **并发安装不产生半截文件**：同时触发两个 `(host, version)` 相同的安装，
+    只有一个真正执行；远端 `<bin>` 可执行且 `--version` 正确（§4.1）
+26. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -720,13 +935,18 @@ bug 分不清"的泥潭。
    - 事件名改 `app-server://{kind}/{slot}`
    - `RpcClient` 注入 id 偏移
    - **验收：此时只有 `Local` 一个 slot，全部既有测试通过、行为不变**
-5. **`bridge.rs` 接入远端 slot** — 按 profile 起 ssh 子进程；每 slot 独立监督循环
-6. **路径语义** — 落实 §4.4 方案 B：ssh `cd` 到远端项目路径，前端不传 `cwd`
-7. **前端多 client 改造** — `Map<ProjectKey, RpcClient>`，按活动项目取用
-8. **前端设置页 + 进度事件 + 断线状态** — 含 §4.3 的手动重连按钮
-9. **关开关时杀进程**（必须杀**全部**远端 slot）
-10. **端到端真机验证** — 走完 §9 的 20 条判据，其中 15/16/17/18 必须双项目并行测
-11. 补齐路径 2（远端直下）与路径 3（`--from`）
+5. **把"起远端命令"收敛成一个纯函数**（`fn remote_argv(profile) -> Vec<String>`，
+   无 IO，可直接单测）——包含 `cd '<remote_path>'` 与 `YI_AGENT_HOME` 两段。
+   先写这个函数和它的测试，再接到 bridge 上（§8.6：这是唯一拼 shell 的地方）
+6. **`bridge.rs` 接入远端 slot** — 用上一步的纯函数起 ssh 子进程；每 slot 独立监督
+   循环；**每个 slot 必须传独立的 `instance_root`**（§4.6、§8.5）
+7. **路径语义** — 落实 §4.4 方案 B：远端模式下前端不传 `cwd`
+8. **前端多 client 改造** — `Map<ProjectKey, RpcClient>`，按活动项目取用
+9. **前端设置页 + 进度事件 + 断线状态** — 含 §4.3 的手动重连按钮
+10. **关开关时杀进程**（必须杀**全部**远端 slot）
+11. **端到端真机验证** — 走完 §9 的 **26 条**判据。并行相关的
+    15–18、22 必须**双项目同时开**才测得出来；24 需要指向不可达地址
+12. 补齐路径 2（远端直下）与路径 3（`--from`）
 
 第 3 步先只做一条安装路径是刻意的：解析压缩包、探测架构、版本校验这些逻辑在
 "路径 1"里已经全部覆盖，路径 2/3 只是换个字节来源。先打通一条，避免三路并行时
