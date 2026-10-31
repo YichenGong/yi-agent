@@ -75,6 +75,12 @@ impl Board {
     }
 
     /// 排入一张合并卡。载荷是 `source`/`base` 两个分支名；`origin` 仅自动派生时非空。
+    ///
+    /// **直接进 `MergeQueued`**，不进 `Queued`。独立合并卡没有「先干活」的阶段：
+    /// 投递它的人已经确认要合了，所以它一出生就排在合并队列里，由 daemon 的队列
+    /// 推进开跑。留在 `Queued` 反而会走 `next_launch` 那条实现卡通路——那轮会话
+    /// 手里没有名额，唯一能拿名额的 `merge-request` 又只收 `awaiting_merge`，
+    /// 于是一张永远合不进来的卡。
     pub fn enqueue_merge(
         &mut self,
         id: CardId,
@@ -90,7 +96,7 @@ impl Board {
             id,
             spec_path: PathBuf::new(),
             plan_path: PathBuf::new(),
-            state: CardState::Queued,
+            state: CardState::MergeQueued,
             enqueued_at: now,
             order,
             workdir: None,
@@ -105,7 +111,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: None,
-            merge_queued_at: None,
+            merge_queued_at: Some(now),
         });
         &self.cards[index]
     }
@@ -667,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_path_claims_a_merge_card_as_well() {
+    fn a_delivered_merge_card_is_born_queued_for_merge() {
         let mut board = Board::new();
         board.enqueue_merge(
             CardId::new("m1"),
@@ -682,10 +688,11 @@ mod tests {
             "a.plan.md".into(),
             at(1, 1),
         );
-        // 合并卡也走会话通路：它 order 更小，就先起它的会话，由会话自己去
-        // `merge-request` 取名额（项目级锁保证同一时刻只有一个进程在合并）。
-        // 队列里「先排的先跑」这条秩序不因卡片种类破例。
-        assert_eq!(board.claim_next_launch(), Some(CardId::new("m1")));
+        let merge = board.get(&CardId::new("m1")).unwrap();
+        // 投递它的人已经确认要合了，所以它不经过「先开一轮会话干活」那段。
+        assert_eq!(merge.state, CardState::MergeQueued);
+        assert_eq!(merge.merge_queued_at, Some(at(1, 0)));
+        // 起点就比实现卡靠前，也不会抢走实现卡的会话通路。
         assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
         assert_eq!(board.claim_next_launch(), None);
     }

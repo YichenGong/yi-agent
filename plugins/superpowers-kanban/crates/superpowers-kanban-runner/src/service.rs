@@ -1859,6 +1859,49 @@ mod tests {
         assert_eq!(holder.card_id, "card-1");
     }
 
+    /// 独立的合并卡（`add-merge`）出生即入合并队列，所以它必须由队列推进开跑，
+    /// 而不是走实现卡的会话通路——那条路上的会话拿不到名额，卡会永远合不进去。
+    #[test]
+    fn a_delivered_merge_card_is_started_by_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        git_run(&project, &["branch", "feat/manual"]);
+        crate::dispatch::dispatch_with_service(
+            &service,
+            &service.state_dir,
+            None,
+            "enqueue_merge",
+            &serde_json::json!({ "source": "feat/manual" }),
+        )
+        .unwrap();
+        // 投递只是往 inbox 写文件；排进看板要等 daemon 消费那一拍。
+        service.consume_inbox(chrono::Local::now());
+        let board = persist::read_board(&service.state_dir);
+        let merge_card = board
+            .cards()
+            .iter()
+            .find(|card| card.kind == CardKind::Merge)
+            .expect("the merge card was delivered")
+            .clone();
+        assert_eq!(merge_card.state, CardState::MergeQueued);
+        let merge_id = merge_card.id.0.clone();
+        let action = service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("a merge turn");
+        match action {
+            DriverAction::Launch {
+                card_id, objective, ..
+            } => {
+                assert_eq!(card_id, merge_id);
+                assert!(objective.contains("feat/manual"), "{objective}");
+            }
+            other => panic!("expected a merge launch, got {other:?}"),
+        }
+        assert_eq!(state_of(&service, &merge_id), "running");
+    }
+
     #[test]
     fn only_one_merge_starts_per_tick() {
         let dir = tempfile::tempdir().unwrap();
