@@ -1168,8 +1168,13 @@ flag 是闸门，不是数据清除。重新打开即恢复。
 
 ## 7. 不做什么（非目标）
 
-- **不做远端常驻 daemon**（§2.3 已论证）：注意这与"并行"不冲突——并行是
-  **多进程**，daemon 是**一个进程服务多客户端**。本设计明确选前者
+- **不做"多项目共享一个远端常驻服务"**（§2.3 已论证）：注意这与"并行"不冲突——
+  并行是**多进程**，daemon 是**一个进程服务多客户端**。本设计明确选前者。
+  **这条不是"远端不跑任何 daemon"**：每个远端 app-server 启动时都会自己
+  `spawn_resident_watch_loop`（`server.rs:1913-1921`，每 30s 扫一次
+  `resident_dir` 并 `ensure_daemons`），这是**既有行为**，本设计不改它。
+  每个项目的 `instance_root` 隔离，所以各自的 `resident-daemons.json` 独立
+  （见下面那条风险）
 - **不做本地多实例**：`ProfileKey::Local` 恒为单例，并行只针对远端项目
 - **不做合并列表**：手机端按项目分组展示多个连接，不把本地与远端的会话混成
   一个列表（§4.6）。需要时再加视图，只动 UI
@@ -1317,6 +1322,48 @@ app-server 是另一台机器、有独立的设备表，它凭什么信任这条
 安全边界已经在"谁知道 session"上。但要在 §7 非目标里明确写"不做 per-device
 audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 
+### 8.10 远端会留下"故意不死"的 daemon（既有机制与新场景的冲突）
+
+这是本轮核对中发现的、本设计必须**明确认下**的一个行为，不是 bug，但用户在远端会
+观察到它。
+
+事实链（已核实）：
+
+1. 每个 app-server 启动时 `spawn_resident_watch_loop`（`server.rs:1913-1921`），
+   每 30s 扫 `resident_dir`，对登记的项目调 `ensure_daemons`
+2. `ensure_running`（`supervisors/src/daemon.rs:61`）发现没有 daemon 就
+   `spawn_detached`
+3. `spawn_detached` 用 **`setsid`** 让子进程脱离会话，注释写明
+   "the child deliberately outlives the caller: the desktop app must be able to
+   quit without its projects' daemons going down"
+4. 这个 daemon 的存在是为了"关掉 app 后看板/常驻任务继续跑"
+
+在**本地**这是正确设计。套到**远端**会产生两个后果：
+
+- **远端进程残留**：ssh 断开、远端 app-server 退出后，它拉起的 daemon **不会**
+  跟着退出（`setsid` 就是要它别退）。用户 `ssh` 上去 `ps` 会看到
+  `yi-agent daemon serve` 在跑
+- **多项目 = 多个 daemon 并存**：每个项目一个 `instance_root`（§4.6），各自有
+  自己的 `resident-daemons.json`，所以是 N 个 daemon 各守一个项目目录。这是
+  内存占用随项目数线性增长的来源
+
+**本设计的取态：不改这个行为**，理由：
+
+- 改它等于改本地已验证的语义（"关 app 后看板继续跑"是明确的产品行为）
+- 远端残留的 daemon 是**用户自己的机器、自己的项目**，不是共享资源泄漏
+- 强行在 ssh 断线时杀 daemon，会破坏"远端常驻任务继续跑"这个本来可能有用的能力
+
+但必须做到两点，否则用户会以为功能有 bug：
+
+1. **在设置页/文档里说明**："远端项目会在远端留下 `yi-agent daemon serve`
+   进程；这是为了让常驻任务继续跑，与本地行为一致"
+2. **提供清理路径**：文档给出 `ssh <host> pkill -f 'yi-agent daemon serve'`
+   （或未来的 `remote/cleanup` 命令，本期**不做**）
+
+**验收时要确认的是"没有失控"而不是"没有残留"**：连 3 个远端项目后，
+每台机器上的 `daemon serve` 数量应等于项目数，**不应**出现同一项目多个 daemon
+（`ensure_running` 的 `is_running` 判据应保证幂等，这条要验）。
+
 ## 9. 验收判据
 
 每条都可用命令验证，不写主观描述。
@@ -1431,7 +1478,10 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 45. **远端不带未派生的 URL**：远端槽位的 argv 里 `session=` 的值**不等于**本地
     的 configured session（必须含 profile.id 后缀）；单测断言两个调用点用的是
     不同函数（§4.6 障碍一）
-46. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+46. **远端 daemon 不失控**：连 3 个远端项目后，每台远端机器上
+    `pgrep -fc 'yi-agent daemon serve'` 等于该项目数（不是 0，也不是 2 倍以上）；
+    同一项目重复重连 3 次后数量**不增长**（`ensure_running` 幂等，§8.10）
+47. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1484,7 +1534,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **46 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **47 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
