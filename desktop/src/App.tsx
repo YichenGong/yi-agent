@@ -21,6 +21,7 @@ import { useSessionState } from "./hooks/useSessionState";
 import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
+import { ownsThreadView } from "./lib/slotRouting";
 import { ThreadStore } from "./lib/threadStore";
 import { ClientRegistry } from "./lib/clientRegistry";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
@@ -1627,8 +1628,20 @@ export default function App() {
 
     // 注册每个客户端的通知/审批/状态回调。sidecar 重启后会换一个新客户端,
     // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
-    const wireClient = (client: RpcClient) => {
+    const wireClient = (client: RpcClient, slot: Slot = LOCAL_SLOT) => {
       client.onNotification((n) => {
+        // 非活动槽位（别的远端项目、或本地而用户正看远端）的通知**不写**本视图。
+        //
+        // spec §4.6 判据 17：A 项目跑一个多步任务时，B 项目的会话视图里不得
+        // 出现 A 的 `turn/*`。所有槽位共用同一个 `ThreadStore`，而 thread id 在
+        // 各 app-server 之间没有任何全局唯一性保证——两个项目里都叫 `t-1` 完全
+        // 可能。放进来不是「多一行」，而是把两条对话的内容拼进同一份视图。
+        //
+        // 只丢弃**视图写入**这一层：连接本身仍要收帧，重连/握手/状态记账照常，
+        // 否则切到该槽位时会发现它的连接已经半死。
+        if (!ownsThreadView(slot, activeSlotRef.current, n.method)) {
+          return;
+        }
         // A driven session is created outside the desktop's thread/start RPC, so
         // it may not exist in the cached groups when its first Running status
         // arrives. Pull the authoritative list once for an unknown thread; waiting
@@ -2073,7 +2086,7 @@ export default function App() {
         recoveryRef.current!(raw),
       );
       registryRef.current.put(slot, client);
-      wireClient(client);
+      wireClient(client, slot);
       return client;
     };
 
@@ -2111,7 +2124,7 @@ export default function App() {
             recoveryRef.current!(r),
           );
           registryRef.current.put(target.profileId, next);
-          wireClient(next);
+          wireClient(next, target.profileId);
           // 与主连接同样握手：不做 `initialize` 的话该连接上任何 `thread/*` 都
           // 会得到 `-32010 not initialized`。
           await next.request("initialize", {});
