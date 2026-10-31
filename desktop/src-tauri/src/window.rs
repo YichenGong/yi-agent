@@ -94,6 +94,48 @@ pub fn fit_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The label of the one window that hides instead of closing.
+pub const MAIN_WINDOW: &str = "main";
+
+/// Whether a `CloseRequested` on `label` should hide the window.
+///
+/// Split out from [`hide_on_close`] so the rule is testable without a runtime:
+/// `CloseRequestApi` cannot be constructed outside the framework.
+pub fn hide_on_close_is_our_window(label: &str) -> bool {
+    label == MAIN_WINDOW
+}
+
+/// Hide the window instead of closing it, so the app keeps running in the Dock.
+///
+/// The window object survives — nothing is destroyed — which is why the
+/// webview keeps its React state (scroll position, streamed transcript, the
+/// draft in the composer) across the hide/show cycle.
+///
+/// Only `main` is handled; any other window keeps the framework default. A
+/// failed `hide` is logged rather than propagated: the close was already
+/// prevented, and a window that stays visible is better than a crash.
+#[cfg(target_os = "macos")]
+pub fn hide_on_close<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    api: &tauri::CloseRequestApi,
+) {
+    use tauri::Manager;
+
+    if !hide_on_close_is_our_window(label) {
+        return;
+    }
+    api.prevent_close();
+    match app.get_webview_window(label) {
+        Some(window) => {
+            if let Err(err) = window.hide() {
+                eprintln!("[window] hide failed: {err}");
+            }
+        }
+        None => eprintln!("[window] close requested for a missing window: {label}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +192,25 @@ mod tests {
             let fit = fit_to_work_area(DESIRED, MIN, (1280.0, 720.0), scale);
             assert_fit(fit, 1280.0, 820.0, 900.0, 600.0);
         }
+    }
+
+    /// Only the main window hides on close. A second window keeps the
+    /// framework default (close really closes), so adding one later cannot
+    /// silently produce an un-closable window.
+    #[test]
+    fn hide_on_close_only_applies_to_the_main_window() {
+        let app = tauri::test::mock_app();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let other = tauri::WebviewWindowBuilder::new(&app, "other", Default::default())
+            .build()
+            .unwrap();
+
+        assert!(hide_on_close_is_our_window("main"));
+        assert!(!hide_on_close_is_our_window("other"));
+        // Keep the windows alive for the duration of the test.
+        let _ = (&main, &other);
     }
 
     /// Guards the one thing two sources of truth can silently disagree on: the
