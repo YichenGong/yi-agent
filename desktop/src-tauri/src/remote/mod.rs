@@ -1,0 +1,5 @@
+//! 远程 SSH 执行：配置、命令行拼装、安装。
+//!
+//! 依据 `docs/superpowers/specs/2026-10-31-remote-ssh-execution-design.md`。
+
+pub mod profile;

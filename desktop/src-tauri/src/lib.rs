@@ -1,5 +1,6 @@
 #[cfg(desktop)]
 mod bridge;
+mod remote;
 #[cfg(desktop)]
 pub mod window;
 
