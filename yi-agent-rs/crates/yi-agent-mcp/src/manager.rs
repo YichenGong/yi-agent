@@ -2184,6 +2184,80 @@ mod tests {
             "未探测时不得写 failed_at"
         );
     }
+
+    /// 10 条存量条目迁移后,连续两轮 needs_reload 都为 false。
+    ///
+    /// 防「升级即卡 9 分钟」:若不迁移,10 条全部 Stale,第二轮仍会触发重探。
+    #[tokio::test]
+    async fn migration_of_many_servers_probes_none_of_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // 手写一份**没有 probed_at / failed_at** 的旧格式缓存(10 个 server)
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        let mut servers = serde_json::Map::new();
+        for i in 0..10 {
+            let sc = cfg("npx");
+            servers.insert(
+                format!("s{i}"),
+                serde_json::json!({
+                    "fingerprint": McpCache::fingerprint_for_test(&sc),
+                    "tools": [{
+                        "name": format!("tool{i}"),
+                        "description": null,
+                        "input_schema": {"type": "object"},
+                        "read_only": true
+                    }]
+                }),
+            );
+        }
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp-cache.json"),
+            serde_json::to_string(&serde_json::json!({"servers": servers})).unwrap(),
+        )
+        .unwrap();
+
+        // 配置里也有这 10 个 server
+        let mut cfg_servers = serde_json::Map::new();
+        for i in 0..10 {
+            cfg_servers.insert(format!("s{i}"), serde_json::json!({"command": "npx"}));
+        }
+        write_mcp(
+            dir.path(),
+            &serde_json::to_string(&serde_json::json!({"mcpServers": cfg_servers})).unwrap(),
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let mgr = manager_in_sync(dir.path()).await;
+
+        // 关键断言一:只做过 `load_and_probe`(还没 reload)时,迁移就必须已经落盘
+        // 且 `needs_reload` 为 false。否则升级后第一轮会因「10 条全 Stale」而集体
+        // 重探——正是 load_and_probe 那处 backfill 的作用,reload 那处兜不住。
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "load_and_probe 不应探测存量条目"
+        );
+        assert!(
+            !mgr.needs_reload(dir.path(), now_unix()),
+            "load_and_probe 迁移后 needs_reload 必须为 false(否则升级即卡 30s+)"
+        );
+
+        // 关键断言二:再 reload 一轮也不探测(此时看的是 reload 那处 backfill)。
+        let _ = mgr.reload(dir.path(), now_unix()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "reload 一轮后仍不应有任何探测"
+        );
+        assert!(
+            !mgr.needs_reload(dir.path(), now_unix()),
+            "连续两轮后 needs_reload 必须为 false"
+        );
+    }
 }
 
 #[cfg(test)]
