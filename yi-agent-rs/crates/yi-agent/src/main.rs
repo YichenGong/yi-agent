@@ -2486,7 +2486,7 @@ fn run_tui_agent(
 
                 // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
                 // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
-                if mcp_for_driver.config_changed_on_disk(&driver_workdir) {
+                if mcp_for_driver.needs_reload(&driver_workdir, yi_agent_mcp::now_unix()) {
                     let report = mcp_for_driver.reload(&driver_workdir).await;
                     for s in &report.servers {
                         if let Some(err) = &s.error {

@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use yi_agent_core::{Tool, ToolRegistry, ToolResult};
 
-use crate::cache::{CachedTool, McpCache};
+use crate::cache::{CacheLookup, CachedTool, McpCache, RETRY_AFTER_SECS, TTL_SECS};
 use crate::config::{McpConfig, ServerConfig, Transport};
 use crate::tool::McpTool;
 
@@ -161,6 +161,10 @@ impl McpManager {
                     }
                     Err(e) => {
                         warn!(server = %name, error = %e, "MCP probe failed; server unavailable");
+                        // 记下失败时刻:否则「只启动、不 reload」的 headless 场景下
+                        // 退避永远不会开始计时,每轮都要重探一遍(最坏 55s)。
+                        cache.note_failure(name, sc, now);
+                        cache_dirty = true;
                         Vec::new()
                     }
                 },
@@ -245,7 +249,12 @@ impl McpManager {
                             cache.put(name, sc, probed_tools.clone(), now_unix());
                             (probed_tools, true, None)
                         }
-                        Err(e) => (Vec::new(), true, Some(e.to_string())),
+                        Err(e) => {
+                            // 记下失败时刻,让下一轮 reload 在退避窗口内跳过探测。
+                            // 不写 probed_at:失败不能把「已过期」固化成「新鲜」。
+                            cache.note_failure(name, sc, now_unix());
+                            (Vec::new(), true, Some(e.to_string()))
+                        }
                     },
                 },
             };
@@ -314,11 +323,20 @@ impl McpManager {
         ReloadReport { servers: out }
     }
 
-    /// 当前磁盘配置的指纹;文件缺失或坏 JSON 时返回 `None`(调用方据此决定是否 reload)。
-    pub fn config_fingerprint(&self, workdir: &Path) -> Option<String> {
+    /// 读一次 `mcp.json`,同时拿到指纹与解析后的配置。
+    ///
+    /// 拆出来是为了让 [`needs_reload`](Self::needs_reload) 不必读两遍盘:
+    /// 指纹比较与逐 server 判定用的是同一份解析结果。
+    pub fn fingerprint_and_config(&self, workdir: &Path) -> Option<(String, McpConfig)> {
         let text = std::fs::read_to_string(crate::config::config_path(workdir)).ok()?;
         let cfg: McpConfig = serde_json::from_str(&text).ok()?;
-        Some(crate::cache::fingerprint_for_manager(&cfg))
+        let fp = crate::cache::fingerprint_for_manager(&cfg);
+        Some((fp, cfg))
+    }
+
+    /// 当前磁盘配置的指纹;文件缺失或坏 JSON 时返回 `None`(调用方据此决定是否 reload)。
+    pub fn config_fingerprint(&self, workdir: &Path) -> Option<String> {
+        self.fingerprint_and_config(workdir).map(|(fp, _)| fp)
     }
 
     /// 上一次 reload / 启动探测时读到的配置指纹。
@@ -329,21 +347,59 @@ impl McpManager {
             .clone()
     }
 
-    /// 磁盘上的配置是否与上次见到的不一样。
+    /// 磁盘上的配置是否与上次见到的不一样(只比指纹)。
     ///
-    /// 用在"每轮开始前"的检查:用户可能在别的窗口改了 `mcp.json`,也可能
-    /// 刚刚通过 `mcp_reload` 写过盘——后者会在 `reload` 里更新 `last_seen`,
-    /// 所以不会误判成"外部改动"而白跑一次。
+    /// `needs_reload` 走的是「读一次、复用解析结果」的路径,不使用本方法;
+    /// 它保留给只需要布尔判断的调用方(既有测试与将来的一次性检查)。
     ///
     /// 文件缺失且从未见过配置时返回 `false`(没什么可重载的);文件从有到无
     /// 返回 `true`(server 全删了,得把它清出 registry)。
-    pub fn config_changed_on_disk(&self, workdir: &Path) -> bool {
+    #[allow(dead_code)]
+    fn fingerprint_changed(&self, workdir: &Path) -> bool {
         let current = self.config_fingerprint(workdir);
         let last = self.last_seen_fingerprint();
         match (current, last) {
             (None, None) => false,
             (a, b) => a != b,
         }
+    }
+
+    /// 每轮开跑前:是否需要重新 `reload`。
+    ///
+    /// 判据必须与 [`reload`](Self::reload) 的短路逐条对齐——`reload` 不会做任何事
+    /// 的 server,就不能成为触发条件,否则每轮空转(还可能每轮重建一次 agent)。
+    pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
+        // 整个函数只读一次 mcp.json:解析结果同时用于指纹比较与逐 server 判定。
+        let current = self.fingerprint_and_config(workdir);
+
+        // 1. 指纹变了 ⇒ 一定重载(含「文件从有到无 / 从无到有」)
+        let last = self.last_seen_fingerprint();
+        let changed = match (&current, &last) {
+            (None, None) => false,
+            (Some((fp, _)), Some(prev)) => fp != prev,
+            _ => true,
+        };
+        if changed {
+            return true;
+        }
+
+        // 2. 配置没变,但某个 server 的条目已过期且允许重试 ⇒ 也要重载
+        let Some((_, cfg)) = current else {
+            return false;
+        };
+        // 总开关关闭 ⇒ reload 整段不探测,不能成为触发条件
+        if !cfg.enabled {
+            return false;
+        }
+        let cache = McpCache::load(workdir);
+        cfg.mcp_servers.iter().any(|(name, sc)| {
+            // 停用的 server 由 reload 短路、永不探测 ⇒ 不能触发 reload
+            sc.enabled
+                && matches!(
+                    cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                    CacheLookup::Stale
+                )
+        })
     }
 
     pub fn set_master(&self, on: bool) {
@@ -1073,7 +1129,7 @@ mod tests {
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
 
         assert!(
-            !mgr.config_changed_on_disk(dir.path()),
+            !mgr.needs_reload(dir.path(), now_unix()),
             "load_and_probe must record what it saw"
         );
     }
@@ -1098,7 +1154,7 @@ mod tests {
         .unwrap();
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
 
         std::fs::write(
             dir.path().join(".yi-agent/mcp.json"),
@@ -1106,13 +1162,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            mgr.config_changed_on_disk(dir.path()),
+            mgr.needs_reload(dir.path(), now_unix()),
             "edit must be noticed"
         );
 
         // reload 之后同一次改动不该反复触发。
         mgr.reload(dir.path()).await;
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
     }
 
     /// 配置从有到无:server 全被删掉,必须触发一次收尾 reload。
@@ -1133,10 +1189,10 @@ mod tests {
         std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
 
         std::fs::remove_file(&path).unwrap();
-        assert!(mgr.config_changed_on_disk(dir.path()));
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
     }
 
     #[test]
@@ -1504,6 +1560,134 @@ mod tests {
         assert!(mgr.enabled_tools().is_empty());
 
         mgr.shutdown().await;
+    }
+
+    // ---- needs_reload ----
+
+    fn write_mcp(dir: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(dir.join(".yi-agent")).unwrap();
+        std::fs::write(dir.join(".yi-agent/mcp.json"), body).unwrap();
+    }
+
+    /// 建一个 manager,并把 `last_seen` 对齐到磁盘现状(模拟「刚 reload 过」)。
+    async fn manager_in_sync(dir: &std::path::Path) -> Arc<McpManager> {
+        let cfg = McpConfig::load(dir).unwrap().unwrap();
+        McpManager::load_and_probe(cfg, dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn needs_reload_is_false_when_nothing_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    #[tokio::test]
+    async fn needs_reload_is_true_when_the_file_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"uvx"}}}"#);
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 配置没变、但缓存过期 ⇒ 触发重载(本 bug 的自愈入口)。
+    #[tokio::test]
+    async fn needs_reload_is_true_when_a_cache_entry_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now_unix() - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 配置没变、缓存新鲜 ⇒ 不重载(防每轮重探)。
+    #[tokio::test]
+    async fn needs_reload_is_false_when_the_cache_is_fresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now_unix() - 23 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 过期 + 刚失败 ⇒ 不重载(否则每轮白跑一遍 reload + 重建 agent)。
+    #[tokio::test]
+    async fn needs_reload_is_false_while_a_stale_entry_is_backed_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        let sc = cfg("npx");
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.note_failure("fs", &sc, now - 60);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
+    }
+
+    /// 停用的 server 过期后不能触发 reload(否则永久空转)。
+    #[tokio::test]
+    async fn needs_reload_is_false_for_a_disabled_expired_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        let mut sc = cfg("npx");
+        sc.enabled = false;
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
+    }
+
+    /// 总开关关闭时,任何过期条目都不能触发 reload。
+    #[tokio::test]
+    async fn master_off_suppresses_needs_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"enabled":false,"mcpServers":{"fs":{"command":"npx"}}}"#,
+        );
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
     }
 }
 

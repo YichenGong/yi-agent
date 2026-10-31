@@ -5497,7 +5497,7 @@ pub(crate) async fn run_thread_driver(
         // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
         // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
         if let Some(mcp) = &mcp {
-            if mcp.config_changed_on_disk(&mcp_workdir) {
+            if mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix()) {
                 let report = mcp.reload(&mcp_workdir).await;
                 for s in &report.servers {
                     if let Some(err) = &s.error {

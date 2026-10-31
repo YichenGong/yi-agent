@@ -20,7 +20,7 @@ use yi_agent_core::ToolRegistry;
 
 pub use cache::CachedTool;
 pub use config::{McpConfig, ServerConfig, ServerKind, Transport, config_path};
-pub use manager::McpManager;
+pub use manager::{McpManager, now_unix};
 pub use reload_tool::{McpReloadTool, TOOL_NAME as MCP_RELOAD_TOOL_NAME};
 pub use tool::McpTool;
 
