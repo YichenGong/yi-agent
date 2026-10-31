@@ -17,7 +17,10 @@
 - **`settings.json` 里不含 `workdir`，也不含 `yolo`。** 工作目录只由 `--workdir` / 启动目录 / 桌面端选项目决定；`yolo` 必须每次启动显式给出。
 - **写入必须读-改-写，保留文件里的未知顶层键。** 参照 `models.rs:650` 的 `save_catalog_to`：临时文件 + `rename` + `0600` + 同目录锁。绝不使用 `env_file.rs:80` 那种裸写。
 - **空字符串等于未设置。** 加载侧与写入侧都要实现：`""` 与 `"   "` 按 `None` 处理；写入侧收到 `""` 必须删键而不是写空串或 `0`。
-- **坏文件绝不阻断启动。** `settings.json` 缺失 / 不可读 / JSON 非法 → 全 `None` + 默认值，`tracing::warn!` 后继续。
+- **坏文件绝不阻断启动，但坏字段只降级自己。** 两级容错，不要混为一谈：
+  - 整份读不出来（缺失 / 不可读 / JSON 非法 / 顶层不是对象）→ 全 `None` + 默认值，`tracing::warn!` 后继续。
+  - 单个字段坏掉（类型不符 / 数值越界 / 枚举不在白名单）→ **只把那个字段置 `None`**，其余字段照常生效。
+  第二级必须显式实现：`#[serde(default)]` 只补**缺失**字段，不救**坏值**——没有 `deserialize_with` 时，用户手改出 `"max_turns": "abc"` 会让整份文件回默认，连带正确的 `compact.ratio` 一起丢掉。
 - **提交前必须 `cargo fmt --all`**（在 `yi-agent-rs/` 下），commit message 用 conventional commits，首行 ≤ 72 字符，不写 `Co-Authored-By`。
 - **在 `main` 之外的分支上做**：`.worktrees/feat-settings-json`，分支 `feat/settings-json`。
 - **`cargo` 不在默认 PATH**：`export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`。
