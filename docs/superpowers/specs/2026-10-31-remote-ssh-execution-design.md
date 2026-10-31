@@ -249,7 +249,10 @@ webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 
 
 1. 用户在设置里填 host（如 `dev@10.0.0.5`）与远端项目路径
 2. 点「连接」，前端发 `remote/connect`
-3. Rust：`ssh <host> 'uname -sm'` 探测架构
+3. Rust：`ssh <host> 'uname -sm'` 探测架构，**并立刻对照支持矩阵**（§2.4.5）。
+   只有 `x86_64-unknown-linux-gnu`、`aarch64-apple-darwin`、
+   `x86_64-apple-darwin` 三类可继续；其余（尤其 `aarch64-unknown-linux-gnu`）
+   在此**停下并给出可读原因**，不要进入下载。这一步与路径校验同为"失败要趁早"
 4. **校验远端项目路径存在**：`ssh <host> 'test -d <远端项目路径>'`。
    不存在就**立即失败并说明**，不要等到起 app-server 时由
    `resolve_workdir` 报 `working directory does not exist`（§4.4 已说明这是必做步骤，
