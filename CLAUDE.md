@@ -141,6 +141,45 @@ codesign -v "$APP"   # 应 exit 0
   通过 `just fmt-check`。`git commit` 前的 hook 不自动跑 fmt,所以需要手动
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
 
+## 磁盘占用:`target/` 会无限膨胀
+
+Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉几十 G。开发阶段
+收尾时(一个 feature 合完、`just ci` 通过、确认不再需要增量编译)按下表清理。
+
+- **判断"开发阶段结束"**:当前这轮改动的测试/lint/构建都跑完了、且短时间内
+  不会再改这块代码;或者只是读代码、写文档、不开编译。**有改动在进行中时
+  不要清理**,下一次编译会从零重来。
+- **先看再删**,不要盲目 `cargo clean`:
+
+  ```bash
+  cargo clean --dry-run                       # 列出会删哪些目录,不实际删除
+  du -sh target                               # 主仓库
+  du -sh .worktrees/*/yi-agent-rs/target      # 各 worktree
+  df -h .                                     # 剩余空间
+  ```
+
+- **粒度选择**(在 `yi-agent-rs/` 下执行):
+
+  ```bash
+  cargo clean --profile dev --dry-run   # 只想回收 debug 产物时先预演
+  cargo clean --profile dev             # 删 target/debug(最常涨的部分)
+  cargo clean -p <crate>                # 只删某个 crate 的产物
+  cargo clean                           # 整个 target/
+  ```
+
+- **必须连 `.worktrees/` 一起清**:每个 worktree 有独立 `target/`,而且常常被
+  遗忘。已合并/废弃的 worktree 直接连壳删掉(`git worktree remove <path>`)
+  最省空间;仍在开发中的 worktree 只清 `target`,不要删目录。
+- **删之前确认没有进程在用**:
+
+  ```bash
+  ps aux | grep -v grep | grep -E "cargo|rustc|yi_agent"
+  ```
+
+  有残留编译进程时删 `target/` 会得到诡异的构建错误,先 `kill` 再清。
+- **`cargo clean` 后必然全量重编**(workspace 全量约十几分钟),所以要清理就
+  一次清干净,别反复清。
+
 ## cargo test 执行
 
 - 在 worktree 里跑测试用 `cd <worktree>/yi-agent-rs && cargo test ...`,或在
