@@ -66,6 +66,19 @@ export class ClientRegistry<T extends Disposable> {
     client.dispose();
   }
 
+  /**
+   * 摘掉并销毁除本地之外的所有槽位。
+   *
+   * 关掉远端开关时用（spec §5.4）：留着这些客户端的话，它们的 transport 仍在
+   * 监听事件，而对应的进程已经被杀——用户看到的是「关了开关，远端项目的流还在
+   * 动一下」。活动槽位若正好是远端，调用方需要自行回退（见 `App`）。
+   */
+  removeRemotes(): void {
+    for (const slot of [...this.slots.keys()]) {
+      if (slot !== LOCAL_SLOT) this.remove(slot);
+    }
+  }
+
   /** 已登记的全部槽位，用于「遍历所有连接」的操作（如切回前台重连）。 */
   keys(): Slot[] {
     return [...this.slots.keys()];

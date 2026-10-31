@@ -79,6 +79,18 @@ describe("ClientRegistry", () => {
     expect(registry.current()?.name).toBe("remote");
   });
 
+  // 关掉远端开关时：留着远端客户端等于让已死的连接继续派发事件。
+  it("removes every remote slot but keeps local", () => {
+    const local = registry.put(LOCAL_SLOT, new FakeClient("local"));
+    const a = registry.put("proj-a", new FakeClient("a"));
+    const b = registry.put("proj-b", new FakeClient("b"));
+    registry.removeRemotes();
+    expect(a.disposed).toBe(true);
+    expect(b.disposed).toBe(true);
+    expect(local.disposed).toBe(false);
+    expect(registry.keys()).toEqual([LOCAL_SLOT]);
+  });
+
   it("has no global-read client before the local slot connects", () => {
     registry.put("proj-foo", new FakeClient("remote"));
     expect(registry.forGlobalReads()).toBeUndefined();

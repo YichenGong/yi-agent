@@ -519,9 +519,14 @@ pub fn kill_all_slots(app: &AppHandle) {
 /// 这个只杀远端——本地 sidecar 跟 flag 无关，必须一直活着。
 #[tauri::command]
 pub fn kill_remote_slots(app: AppHandle) {
-    for key in app.state::<Sidecar>().keys() {
+    let state = app.state::<Sidecar>();
+    for key in state.keys() {
         if matches!(key, ProfileKey::Remote(_)) {
+            // 先撤销意图再杀：监督循环每轮都读 desired，漏掉这一步就会在
+            // 关掉开关后立刻把 ssh 重新拉起来（"开关关了，远端还在跑"）。
+            state.unmark_desired(&key);
             kill_sidecar(&app, &key);
+            state.remove_slot(&key);
         }
     }
 }
@@ -1044,6 +1049,50 @@ mod tests {
             state.is_desired(&b),
             "another project must keep reconnecting"
         );
+    }
+
+    // ---- 关开关后的清理（计划 01 · Task 9）----
+
+    /// 关掉开关必须同时撤销「希望连着」与槽位登记。
+    ///
+    /// 只杀进程不撤销意图 = 监督循环在 200ms 后重新拉起 ssh，用户看到的正是
+    /// 「开关关了但远端还在跑」。只撤销意图不摘槽位 = `remote_status` 继续报
+    /// 一个早已死掉的槽位。
+    #[test]
+    fn revoking_a_remote_slot_clears_both_intent_and_registration() {
+        let state = Sidecar::new();
+        let key = ProfileKey::Remote("proj-foo".into());
+        state.set_slot(key.clone(), Arc::new(Mutex::new(None)));
+        state.mark_desired(&key);
+
+        // `kill_remote_slots` 的三步，按同一顺序。
+        assert!(state.unmark_desired(&key));
+        state.remove_slot(&key);
+
+        assert!(!state.is_desired(&key), "a revoked slot must not respawn");
+        assert_eq!(state.status_of(&key), "disconnected");
+        assert!(state.keys().is_empty());
+    }
+
+    /// 本地槽位不受远端清理影响：它跟 flag 无关，必须一直活着。
+    #[test]
+    fn clearing_remote_slots_keeps_the_local_one() {
+        let state = Sidecar::new();
+        state.set_slot(ProfileKey::Local, Arc::new(Mutex::new(None)));
+        state.set_slot(ProfileKey::Remote("a".into()), Arc::new(Mutex::new(None)));
+        state.set_slot(ProfileKey::Remote("b".into()), Arc::new(Mutex::new(None)));
+
+        let remotes: Vec<ProfileKey> = state
+            .keys()
+            .into_iter()
+            .filter(|key| matches!(key, ProfileKey::Remote(_)))
+            .collect();
+        assert_eq!(remotes.len(), 2, "both remote slots must be found");
+        for key in remotes {
+            state.remove_slot(&key);
+        }
+
+        assert_eq!(state.keys(), vec![ProfileKey::Local]);
     }
 
     // `configured_relay` reads a process-global env var. Cargo runs tests in

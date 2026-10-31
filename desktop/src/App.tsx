@@ -513,6 +513,7 @@ export default function App() {
       if (!c) return Promise.reject(new Error("not connected"));
       const pending = c.request(method, params ?? {});
       if (method !== "flags/set") return pending;
+      const written = (params ?? {}) as { name?: unknown; enabled?: unknown };
       return pending.then(async (result) => {
         const fresh = await c.request<{
           flags?: Array<{ name?: unknown; enabled?: unknown }>;
@@ -522,6 +523,22 @@ export default function App() {
           rows.find((row) => row.name === name)?.enabled === true;
         setLeadAgentEnabled(read("lead_agent"));
         setKanbanEnabled(read("superpowers_kanban"));
+        // 关掉远端开关时立刻清掉所有远端连接与进程（spec §5.4）。只改
+        // `flags.json` 的话，已经连上的 ssh 会一直跑，用户看到的是「开关关了，
+        // 远端还在」。写后处理放在前端而不是 Rust 侧：`flags/set` 在宿主里是
+        // 通用的，只有前端知道「哪个开关关掉意味着要收拾本地资源」。
+        if (written.name === "remote_ssh" && written.enabled === false) {
+          registryRef.current.removeRemotes();
+          clientRef.current = registryRef.current.current() ?? null;
+          void (async () => {
+            try {
+              const { invoke } = await import("@tauri-apps/api/core");
+              await invoke("kill_remote_slots");
+            } catch {
+              // 清理失败不该让开关操作整体报错：开关本身已经生效了。
+            }
+          })();
+        }
         return result;
       });
     },
