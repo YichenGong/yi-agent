@@ -152,21 +152,71 @@ pub async fn command_frame(
     }
 }
 
+/// `git_ok` 的单次时间上限。
+///
+/// 与 `VIEW_TIMEOUT` 分开:那个约束「模型给的展示命令」(走沙箱、允许较慢),
+/// 这个约束「我们自己发的只读内省命令」(`rev-parse` / `diff` / `log`,
+/// 正常都是毫秒级)。给 5s 是因为大仓库首次 `git diff` 可能真慢;但
+/// 「`index.lock` 残留」或「仓库在网络挂载点上」应当失败而不是无限等待。
+pub const GIT_OK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `git_ok` 轮询子进程状态的间隔。git 正常返回是毫秒级,10 ms 只多等一轮。
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 跑一个子进程,在 `timeout` 内返回它的 stdout(成功时),否则 `None`。
+///
+/// stdout 走**临时文件**而不是管道:管道模式下子进程写满内核缓冲区
+/// (macOS 64 KiB)就会阻塞在 write 上,而我们正在轮询 `try_wait`、没有任何人
+/// 读管道——这是死锁(子进程等我们读,我们等子进程退出)。`git diff` 的输出
+/// 远超 64 KiB 是常态,故管道方案对本项目不可用。
+fn run_git_bounded(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    let out_file = tempfile::NamedTempFile::new().ok()?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::from(out_file.reopen().ok()?))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                return std::fs::read_to_string(out_file.path()).ok();
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // 必须 wait:否则留下僵尸进程。
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(GIT_POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// 跑 git 并返回成功时的 stdout 文本。
 ///
 /// 只认 success：`rev-parse --verify` / `merge-base` / `log` 这类命令失败时
 /// 本就该当作「没有」，而 diff 类命令的退出码差异由 HTML 生成后的内容决定，
 /// 故所有调用点都只需「有内容」或「没有」两态。
+///
+/// 有界等待见 [`GIT_OK_TIMEOUT`]：无上界时,一个挂住的 git 会把调用方
+/// 永久占住(修复前是主循环)。
 fn git_ok(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run_git_bounded("git", &owned, directory, GIT_OK_TIMEOUT)
 }
 
 /// 该 ref 能否在本仓库解析。
@@ -644,6 +694,40 @@ mod tests {
                 .success()
         );
         dir
+    }
+
+    /// `run_git_bounded` 必须在上界内放弃,并回收子进程。
+    ///
+    /// 用 `/bin/sh -c 'sleep 600'` 冒充挂住的 git:它确实是「一个不会自己退出
+    /// 的子进程」,这正是残留 `index.lock` 或网络挂载点上的 git 的表现。
+    /// 不走 PATH 注入,故不会污染并行测试。
+    #[test]
+    fn run_git_bounded_gives_up_after_the_timeout() {
+        let started = std::time::Instant::now();
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 600".to_string()],
+            std::path::Path::new("/tmp"),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        assert!(out.is_none(), "a hung child must yield None");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must give up near the bound, took {elapsed:?}"
+        );
+    }
+
+    /// 正常返回的子进程要照常给出 stdout,且不受上界影响。
+    #[test]
+    fn run_git_bounded_returns_stdout_on_success() {
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "printf 'hi\\n'".to_string()],
+            std::path::Path::new("/tmp"),
+            Duration::from_secs(5),
+        );
+        assert_eq!(out.as_deref(), Some("hi\n"));
     }
 
     #[test]
