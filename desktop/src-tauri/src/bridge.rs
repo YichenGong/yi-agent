@@ -171,7 +171,8 @@ fn sidecar_args(relay: Option<&str>) -> Vec<String> {
 ///
 /// Two sources, in priority order: the `YI_AGENT_RELAY` environment variable
 /// (explicit override for dev/launch scripts) and the `relay_url` key in
-/// `<home>/.yi-agent/preferences.json` (what the desktop Settings page writes).
+/// `<实例 home>/preferences.json` (what the desktop Settings page writes, and
+/// the same file the sidecar reads once `spawn_once` anchors its cwd).
 ///
 /// The pure part is [`resolve_relay`], so the priority rules are unit-tested
 /// without touching the process env or the filesystem. Unset or blank in both
@@ -254,20 +255,25 @@ fn sidecar_cwd_from(
     })
 }
 
-/// `<home>/.yi-agent/preferences.json` — the file the sidecar reads/writes when
-/// its workdir is the user home (`spawn_once` anchors the sidecar there).
+/// `<instance home>/preferences.json` — the file the sidecar reads/writes.
 ///
-/// Mirror of `yi_agent_app_server::settings_store::preferences_path`; the
-/// desktop shell intentionally does not depend on the app-server crate.
-fn preferences_path(home: &Path) -> PathBuf {
-    home.join(".yi-agent").join("preferences.json")
+/// 参数是**实例 home**（`~/.yi-agent`，或 `YI_AGENT_HOME` 归一到 `…/.yi-agent`），
+/// 不是用户 `~`：`spawn_once` 把 sidecar 的 cwd 锚在实例 home 的**父目录**，sidecar
+/// 自己再拼 `.yi-agent`，落点正是这里。以前这里把实例 home 当用户 home 又拼了一次
+/// `.yi-agent`，读到的 `~/.yi-agent/.yi-agent/preferences.json` 永远不存在，于是
+/// sidecar 不带 `--relay` 启动、手机配对只看得到「no computer connected」。
+///
+/// 与 `yi_agent_app_server::settings_store::preferences_path(workdir)` 对齐：
+/// 那边的 `workdir` 是实例 home 的父目录，拼完 `.yi-agent` 后仍是同一个文件。
+fn preferences_path(instance_home: &Path) -> PathBuf {
+    instance_home.join("preferences.json")
 }
 
-/// Read `relay_url` from the home preferences file. Missing/broken file, a
+/// Read `relay_url` from the preferences file. Missing/broken file, a
 /// missing key, a non-string or a blank value all read as `None` — a bad
 /// preference must never keep the sidecar from starting.
-fn load_relay_url(home: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(preferences_path(home)).ok()?;
+fn load_relay_url(instance_home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(preferences_path(instance_home)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value
         .get(RELAY_URL_KEY)
@@ -277,12 +283,12 @@ fn load_relay_url(home: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Write (or, for `None`/blank, remove) `relay_url` in the home preferences
+/// Write (or, for `None`/blank, remove) `relay_url` in the preferences
 /// file: read-modify-write so `theme` / `board_watchman_enabled` /
 /// `subagent_runtime` survive, temp-file + rename so the replace is atomic.
-fn save_relay_url(home: &Path, url: Option<&str>) -> std::io::Result<()> {
-    let dir = home.join(".yi-agent");
-    std::fs::create_dir_all(&dir)?;
+fn save_relay_url(instance_home: &Path, url: Option<&str>) -> std::io::Result<()> {
+    let dir = instance_home;
+    std::fs::create_dir_all(dir)?;
     let path = dir.join("preferences.json");
     let mut object = std::fs::read_to_string(&path)
         .ok()
@@ -522,16 +528,12 @@ mod tests {
         restore_relay_env(previous);
     }
 
-    /// 落盘往返:save 后 load 读回同一个值,写入的是 `<home>/.yi-agent/preferences.json`。
+    /// 落盘往返:save 后 load 读回同一个值,写入的是 `<实例 home>/preferences.json`。
     #[test]
     fn saving_the_relay_url_round_trips_through_the_preferences_file() {
         let dir = tempfile::TempDir::new().unwrap();
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
-        assert!(dir
-            .path()
-            .join(".yi-agent")
-            .join("preferences.json")
-            .is_file());
+        assert!(dir.path().join("preferences.json").is_file());
         assert_eq!(
             load_relay_url(dir.path()).as_deref(),
             Some("wss://r/connect?session=x")
@@ -546,9 +548,7 @@ mod tests {
             save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
             save_relay_url(dir.path(), clear).unwrap();
             assert_eq!(load_relay_url(dir.path()), None, "clear: {clear:?}");
-            let text =
-                std::fs::read_to_string(dir.path().join(".yi-agent").join("preferences.json"))
-                    .unwrap();
+            let text = std::fs::read_to_string(dir.path().join("preferences.json")).unwrap();
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert!(
                 value.get("relay_url").is_none(),
@@ -561,16 +561,14 @@ mod tests {
     #[test]
     fn saving_the_relay_url_preserves_unrelated_keys() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
-            dir.path().join(".yi-agent").join("preferences.json"),
+            dir.path().join("preferences.json"),
             r#"{"theme":"light","board_watchman_enabled":false,"subagent_runtime":"never"}"#,
         )
         .unwrap();
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
 
-        let text =
-            std::fs::read_to_string(dir.path().join(".yi-agent").join("preferences.json")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("preferences.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["relay_url"], "wss://r/connect?session=x");
         assert_eq!(value["theme"], "light");
@@ -582,12 +580,7 @@ mod tests {
     #[test]
     fn a_broken_preferences_file_reads_as_no_relay() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
-        std::fs::write(
-            dir.path().join(".yi-agent").join("preferences.json"),
-            "not json",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("preferences.json"), "not json").unwrap();
         assert_eq!(load_relay_url(dir.path()), None);
 
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
@@ -602,7 +595,7 @@ mod tests {
     fn saving_the_relay_url_leaves_no_temp_file_behind() {
         let dir = tempfile::TempDir::new().unwrap();
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
-        let stray: Vec<String> = std::fs::read_dir(dir.path().join(".yi-agent"))
+        let stray: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "preferences.json")
@@ -748,18 +741,43 @@ mod tests {
         assert_eq!(instance_home_from(None, None), None);
     }
 
+    /// 桌面壳读的中继偏好必须与侧车实际读的那份是**同一个文件**。
+    ///
+    /// 侧车以 `workdir = <实例 home 的父目录>` 启动，它自己拼 `.yi-agent` 后读的是
+    /// `<workdir>/.yi-agent/preferences.json`，也就是 `<实例 home>/preferences.json`。
+    /// 桌面壳若在已经是实例 home 的路径上再多拼一次 `.yi-agent`，就会读到 `None`，
+    /// sidecar 便不带 `--relay` 启动；手机连同一个 relay session 只会拿到
+    /// `no computer connected for this session`，配对页显示「无法连接服务器」。
+    #[test]
+    fn the_relay_preference_is_the_file_the_sidecar_reads() {
+        let user_home = Path::new("/Users/example");
+        let instance = instance_home_from(None, Some(user_home)).unwrap();
+        let workdir = sidecar_cwd_from(None, Some(user_home)).unwrap();
+
+        assert_eq!(
+            workdir.join(".yi-agent"),
+            instance,
+            "sidecar cwd must be the instance home's parent"
+        );
+        assert_eq!(
+            preferences_path(&instance),
+            workdir.join(".yi-agent").join("preferences.json"),
+            "the desktop shell must read exactly the file the sidecar reads"
+        );
+    }
+
     /// relay 偏好落在实例 home，而不是真实 `~`。
     #[test]
     fn configured_relay_reads_the_instance_home_preferences() {
         let dir = tempfile::TempDir::new().unwrap();
-        let home = dir.path();
+        let home = dir.path(); // 实例 home（`…/.yi-agent`），不是用户 `~`
         save_relay_url(home, Some("wss://instance/connect?session=i")).unwrap();
         assert_eq!(
             load_relay_url(home).as_deref(),
             Some("wss://instance/connect?session=i")
         );
-        // 落点确认：写在 `<instance home>/.yi-agent/preferences.json`。
-        assert!(home.join(".yi-agent").join("preferences.json").is_file());
+        // 落点确认：写在 `<实例 home>/preferences.json`（sidecar 读的就是这份）。
+        assert!(home.join("preferences.json").is_file());
     }
 
     /// sidecar 的 cwd 用实例 home 的父目录，而不是真实 `~`。
