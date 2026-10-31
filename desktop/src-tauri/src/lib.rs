@@ -1,5 +1,6 @@
 #[cfg(desktop)]
 mod bridge;
+#[cfg(desktop)]
 mod remote;
 #[cfg(desktop)]
 pub mod window;
@@ -21,10 +22,11 @@ pub fn run() {
             bridge::rpc,
             bridge::rpc_respond,
             bridge::set_relay_url,
-            bridge::restart_sidecar
+            bridge::restart_sidecar,
+            bridge::kill_remote_slots
         ])
         .setup(|app| {
-            bridge::spawn(app.handle())?;
+            bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;
             // Sizing is cosmetic: log and continue rather than fail launch.
             if let Err(err) = window::fit_main_window(app.handle()) {
                 eprintln!("[window] fit failed: {err}");

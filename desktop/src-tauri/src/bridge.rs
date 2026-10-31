@@ -1,10 +1,13 @@
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+
+use crate::remote::profile::ProfileKey;
 
 /// `preferences.json` key the sidecar reads its relay URL from. Mirrors
 /// `yi_agent_app_server::settings_store::RELAY_URL_KEY`.
@@ -34,26 +37,84 @@ pub fn classify(value: &Value) -> Frame {
     }
 }
 
-/// Owns the spawned `yi-agent app-server` child process.
+/// Owns every spawned `app-server` child process, one per slot.
+///
+/// **锁的粒度是刻意的**：外层锁只保护"查表"，每个槽位有自己的内层锁。写 pipe
+/// 是同步 IO（`CommandChild::write` → `write_all`），远端链路一旦积压就会阻塞；
+/// 若共用一把锁，一个卡住的远端会让所有槽位（含本地）的 RPC 全部卡死，表现为
+/// 「整个 App 卡死」（spec §4.6 障碍三）。
 pub struct Sidecar {
-    child: Mutex<Option<CommandChild>>,
+    slots: Mutex<HashMap<ProfileKey, Arc<Mutex<Option<CommandChild>>>>>,
 }
 
 impl Sidecar {
     pub fn new() -> Self {
         Self {
-            child: Mutex::new(None),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 取某槽位的锁，不创建。外层锁在这里**立刻释放**。
+    fn slot(&self, key: &ProfileKey) -> Option<Arc<Mutex<Option<CommandChild>>>> {
+        self.slots
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(key).cloned())
+    }
+
+    /// 登记一个槽位（覆盖旧句柄）。
+    fn set_slot(&self, key: ProfileKey, child: Arc<Mutex<Option<CommandChild>>>) {
+        if let Ok(mut guard) = self.slots.lock() {
+            guard.insert(key, child);
+        }
+    }
+
+    /// 所有已登记的槽位键。
+    fn keys(&self) -> Vec<ProfileKey> {
+        match self.slots.lock() {
+            Ok(guard) => guard.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 某槽位的粗粒度状态。只用于 UI 展示与 `remote/relayTargets` 的 `available`。
+    fn status_of(&self, key: &ProfileKey) -> &'static str {
+        match self.slot(key) {
+            None => "disconnected",
+            Some(cell) => match cell.lock() {
+                Ok(guard) if guard.is_some() => "connected",
+                Ok(_) => "connecting",
+                Err(_) => "disconnected",
+            },
         }
     }
 }
 
-fn write_line(state: &Sidecar, value: &serde_json::Value) -> Result<(), String> {
+/// 事件名格式的唯一来源：`app-server://{kind}/{slot}`。
+fn event_name(kind: &str, slot: &ProfileKey) -> String {
+    format!("app-server://{kind}/{}", slot.as_str())
+}
+
+/// 前端的槽位标识 → `ProfileKey`。`"local"` 是保留字。
+fn slot_key(raw: &str) -> ProfileKey {
+    if raw == "local" {
+        ProfileKey::Local
+    } else {
+        ProfileKey::Remote(raw.to_string())
+    }
+}
+
+fn write_line(state: &Sidecar, slot: &ProfileKey, value: &serde_json::Value) -> Result<(), String> {
     let mut buf = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    let mut guard = state.child.lock().map_err(|e| e.to_string())?;
+    // 外层锁已在这一行内释放；下面只持本槽位的锁。
+    let cell = state
+        .slot(slot)
+        .ok_or_else(|| format!("sidecar not running for slot `{}`", slot.as_str()))?;
+    let mut guard = cell.lock().map_err(|e| e.to_string())?;
     let child = guard
         .as_mut()
-        .ok_or_else(|| "sidecar not running".to_string())?;
+        .ok_or_else(|| format!("sidecar not running for slot `{}`", slot.as_str()))?;
     child.write(&buf).map_err(|e| e.to_string())
 }
 
@@ -61,12 +122,14 @@ fn write_line(state: &Sidecar, value: &serde_json::Value) -> Result<(), String> 
 #[tauri::command]
 pub fn rpc(
     state: State<'_, Sidecar>,
+    slot: String,
     id: u64,
     method: String,
     params: serde_json::Value,
 ) -> Result<(), String> {
     write_line(
         &state,
+        &slot_key(&slot),
         &serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
     )
 }
@@ -75,11 +138,13 @@ pub fn rpc(
 #[tauri::command]
 pub fn rpc_respond(
     state: State<'_, Sidecar>,
+    slot: String,
     id: String,
     result: serde_json::Value,
 ) -> Result<(), String> {
     write_line(
         &state,
+        &slot_key(&slot),
         &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
     )
 }
@@ -94,10 +159,22 @@ pub fn rpc_respond(
 /// temporary disk issue) resolves on its own and a permanent one should surface
 /// as a visible, retried error rather than a dead app.
 fn next_restart_delay(consecutive_restarts: u32) -> Duration {
+    next_restart_delay_for(&ProfileKey::Local, consecutive_restarts)
+}
+
+/// 按槽位区分的退避。
+///
+/// 本地保持原样（200ms → 5s）：同机进程崩溃多半瞬时。
+/// 远端上限抬到 60s（spec §4.3）：失败原因通常是网络断/服务器关机/VPN 掉线，
+/// 会持续数分钟到数小时，5s 一次的 ssh 只是给服务器制造无意义的认证请求。
+fn next_restart_delay_for(slot: &ProfileKey, consecutive_restarts: u32) -> Duration {
     const BASE_MS: u64 = 200;
-    const CAP_MS: u64 = 5_000;
-    let shift = consecutive_restarts.min(5); // 200ms * 2^5 = 6.4s, then cap
-    let ms = (BASE_MS << shift).min(CAP_MS);
+    let cap_ms: u64 = match slot {
+        ProfileKey::Local => 5_000,
+        ProfileKey::Remote(_) => 60_000,
+    };
+    let shift = consecutive_restarts.min(16);
+    let ms = (BASE_MS << shift).min(cap_ms);
     Duration::from_millis(ms)
 }
 
@@ -109,25 +186,25 @@ fn next_restart_delay(consecutive_restarts: u32) -> Duration {
 /// when writing to the dead process's stdin). So the sidecar is supervised here
 /// rather than spawned once — an unexpected exit is restarted with backoff and
 /// announced on `app-server://status` so the UI can reconnect.
-pub fn spawn(app: &AppHandle) -> Result<(), String> {
+pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut consecutive_restarts: u32 = 0;
         loop {
-            match spawn_once(&app) {
+            match spawn_once(&app, &key) {
                 Ok(mut rx) => {
                     // A successful launch resets the backoff: the previous exit
                     // was a one-off, not a start-up loop.
                     consecutive_restarts = 0;
                     while let Some(event) = rx.recv().await {
                         match event {
-                            CommandEvent::Stdout(bytes) => forward_stdout(&app, &bytes),
+                            CommandEvent::Stdout(bytes) => forward_stdout(&app, &key, &bytes),
                             CommandEvent::Stderr(bytes) => {
-                                eprintln!("[sidecar] {}", String::from_utf8_lossy(&bytes));
+                                eprintln!("[{}] {}", key.as_str(), String::from_utf8_lossy(&bytes));
                             }
                             CommandEvent::Terminated(payload) => {
                                 let _ = app.emit(
-                                    "app-server://status",
+                                    &event_name("status", &key),
                                     serde_json::json!({"state":"exited","code":payload.code}),
                                 );
                             }
@@ -137,19 +214,43 @@ pub fn spawn(app: &AppHandle) -> Result<(), String> {
                     // The event stream closed: the process is gone. Drop the
                     // stale handle so `rpc` reports "sidecar not running" rather
                     // than writing into a dead pipe while we restart.
-                    clear_child(&app);
-                    eprintln!("[sidecar] exited; restarting");
+                    clear_child(&app, &key);
+                    eprintln!("[{}] exited; restarting", key.as_str());
                 }
                 Err(e) => {
-                    eprintln!("[sidecar] spawn failed: {e}");
+                    eprintln!("[{}] spawn failed: {e}", key.as_str());
                 }
             }
-            let delay = next_restart_delay(consecutive_restarts);
+            if !should_retry(&key, consecutive_restarts) {
+                let _ = app.emit(
+                    &event_name("status", &key),
+                    serde_json::json!({
+                        "state": "disconnected",
+                        "reason": format!("gave up after {REMOTE_MAX_RETRIES} attempts")
+                    }),
+                );
+                eprintln!(
+                    "[{}] giving up after {REMOTE_MAX_RETRIES} attempts",
+                    key.as_str()
+                );
+                return;
+            }
+            let delay = next_restart_delay_for(&key, consecutive_restarts);
             consecutive_restarts = consecutive_restarts.saturating_add(1);
             tokio::time::sleep(delay).await;
         }
     });
     Ok(())
+}
+
+/// 远端连续失败这么多次后停止自动重试，转「断线」让人手动重连（spec §4.3）。
+const REMOTE_MAX_RETRIES: u32 = 5;
+
+fn should_retry(slot: &ProfileKey, consecutive_failures: u32) -> bool {
+    match slot {
+        ProfileKey::Local => true,
+        ProfileKey::Remote(_) => consecutive_failures < REMOTE_MAX_RETRIES,
+    }
 }
 
 /// The sidecar argv. Pure: no I/O, so it is directly unit-testable.
@@ -332,7 +433,7 @@ pub fn set_relay_url(app: AppHandle, url: Option<String>) -> Result<(), String> 
         .map(str::trim)
         .is_some_and(|url| !url.is_empty());
     eprintln!("[sidecar] relay setting saved (configured: {configured}); restarting");
-    kill_sidecar(&app);
+    kill_sidecar(&app, &ProfileKey::Local);
     Ok(())
 }
 
@@ -343,27 +444,60 @@ pub fn set_relay_url(app: AppHandle, url: Option<String>) -> Result<(), String> 
 /// `exited → 重新握手` 路径刷回主界面。
 #[tauri::command]
 pub fn restart_sidecar(app: AppHandle) -> Result<(), String> {
-    kill_sidecar(&app);
+    kill_sidecar(&app, &ProfileKey::Local);
     Ok(())
 }
 
 /// Kill the current sidecar child so the supervisor loop respawns it with the
 /// freshly persisted settings. An already-dead child is fine (its kill error is
 /// ignored): the supervisor is about to restart it either way.
-fn kill_sidecar(app: &AppHandle) {
+fn kill_sidecar(app: &AppHandle, slot: &ProfileKey) {
     let taken = app
         .state::<Sidecar>()
-        .child
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
+        .slot(slot)
+        .and_then(|cell| cell.lock().ok().and_then(|mut guard| guard.take()));
     if let Some(child) = taken {
         let _ = child.kill();
     }
 }
 
+/// 杀全部槽位。**只给 App 退出用**，不要变成默认可调用的
+/// （spec §4.6 障碍一：改个中继配置就把所有远端项目一起断开是用户可见事故）。
+pub fn kill_all_slots(app: &AppHandle) {
+    for key in app.state::<Sidecar>().keys() {
+        kill_sidecar(app, &key);
+    }
+}
+
+/// 关 `remote_ssh` 时调用：杀掉**全部**远端槽位，不留孤儿。
+///
+/// **与 `kill_all_slots` 的区别**：那个连本地槽位一起杀（只在 App 退出时用），
+/// 这个只杀远端——本地 sidecar 跟 flag 无关，必须一直活着。
+#[tauri::command]
+pub fn kill_remote_slots(app: AppHandle) {
+    for key in app.state::<Sidecar>().keys() {
+        if matches!(key, ProfileKey::Remote(_)) {
+            kill_sidecar(&app, &key);
+        }
+    }
+}
+
 /// Launch one `yi-agent app-server` and return its event stream.
-fn spawn_once(app: &AppHandle) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
+fn spawn_once(
+    app: &AppHandle,
+    key: &ProfileKey,
+) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
+    match key {
+        ProfileKey::Local => spawn_local_once(app, key),
+        // 远端槽位在计划 1 的 Task 7 接入；此处先明确报错而不是静默起本地进程。
+        ProfileKey::Remote(id) => Err(format!("remote profile `{id}` is not wired up yet")),
+    }
+}
+
+fn spawn_local_once(
+    app: &AppHandle,
+    key: &ProfileKey,
+) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
     let mut cmd = app
         .shell()
         .sidecar("yi-agent")
@@ -386,22 +520,25 @@ fn spawn_once(app: &AppHandle) -> Result<tauri::async_runtime::Receiver<CommandE
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 
     app.state::<Sidecar>()
-        .child
-        .lock()
-        .map_err(|e| e.to_string())?
-        .replace(child);
+        .set_slot(key.clone(), Arc::new(Mutex::new(Some(child))));
 
     Ok(rx)
 }
 
-/// Forget the current child handle (called once its event stream ended).
-fn clear_child(app: &AppHandle) {
-    if let Ok(mut guard) = app.state::<Sidecar>().child.lock() {
-        *guard = None;
+/// 只清空**该槽位**的句柄内容（保留槽位登记，监督循环会重新填）。
+///
+/// 若某个槽位从未登记过，这里什么也不做——不能因为一个未知 key 就动整张表
+/// （spec §4.6 障碍二：任一槽位退出清空整张表，会让其余槽位的 RPC 立刻报
+/// "sidecar not running"）。
+fn clear_child(app: &AppHandle, key: &ProfileKey) {
+    if let Some(cell) = app.state::<Sidecar>().slot(key) {
+        if let Ok(mut guard) = cell.lock() {
+            *guard = None;
+        }
     }
 }
 
-fn forward_stdout(app: &AppHandle, bytes: &[u8]) {
+fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
     if line.is_empty() {
@@ -413,12 +550,12 @@ fn forward_stdout(app: &AppHandle, bytes: &[u8]) {
     };
     match classify(&value) {
         Frame::ReverseRequest => {
-            let _ = app.emit("app-server://request", &value);
+            let _ = app.emit(&event_name("request", slot), &value);
         }
         Frame::Notification | Frame::Response => {
-            let _ = app.emit("app-server://message", &value);
+            let _ = app.emit(&event_name("message", slot), &value);
         }
-        Frame::Garbage => eprintln!("[sidecar] dropping non-protocol frame: {value}"),
+        Frame::Garbage => eprintln!("[{}] dropping non-protocol frame: {value}", slot.as_str()),
     }
 }
 
@@ -610,6 +747,66 @@ mod tests {
         assert!(
             stray.is_empty(),
             "no temp file may survive a save: {stray:?}"
+        );
+    }
+
+    // ---- 多槽位事件名与路由（计划 01 · Task 5）----
+
+    /// 不同槽位的事件名必须互相隔离：远端的一条 message 绝不能落到本地槽位
+    /// 的监听器上，否则本地 UI 会显示另一个项目的对话（spec §4.6 障碍四）。
+    #[test]
+    fn event_names_are_per_slot() {
+        let local = event_name("message", &ProfileKey::Local);
+        let remote = event_name("message", &ProfileKey::Remote("alpha".into()));
+        assert_eq!(local, "app-server://message/local");
+        assert_eq!(remote, "app-server://message/alpha");
+        assert_ne!(local, remote);
+    }
+
+    /// 本地槽位必须保持历史事件名 `app-server://message`（无后缀）。
+    ///
+    /// 但设计要求统一为 `/local`；这里锁定**新的**约定，并显式记录与旧名的
+    /// 差异，防止有人为了让旧前端继续工作而把本地槽位改回无后缀、从而让
+    /// 「本地」在前后端有第二套命名。
+    #[test]
+    fn local_slot_keeps_the_historical_event_prefix() {
+        for kind in ["message", "request", "status"] {
+            let name = event_name(kind, &ProfileKey::Local);
+            assert!(
+                name.starts_with(&format!("app-server://{kind}")),
+                "{name} must keep the app-server://{kind} prefix"
+            );
+            assert_eq!(name, format!("app-server://{kind}/local"));
+        }
+    }
+
+    /// 往未登记的槽位写 RPC 必须**报错**，不能静默写入别的槽位。
+    ///
+    /// 静默误投会导致「发给远端项目 A 的请求被执行在本地项目上」这类数据损坏。
+    #[test]
+    fn writing_to_an_unknown_slot_is_an_error_not_a_silent_misdelivery() {
+        let state = Sidecar::new();
+        let result = write_line(
+            &state,
+            &ProfileKey::Remote("nobody-home".into()),
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}),
+        );
+        let err = result.expect_err("unknown slot must fail");
+        assert!(
+            err.contains("nobody-home"),
+            "error must name the slot so the UI can tell which project broke: {err}"
+        );
+    }
+
+    /// 槽位表的 status 只反映该槽位，不会因别的槽位有空句柄而误报。
+    #[test]
+    fn status_is_per_slot() {
+        let state = Sidecar::new();
+        state.set_slot(ProfileKey::Local, Arc::new(Mutex::new(None)));
+        assert_eq!(state.status_of(&ProfileKey::Local), "connecting");
+        assert_eq!(
+            state.status_of(&ProfileKey::Remote("alpha".into())),
+            "disconnected"
         );
     }
 

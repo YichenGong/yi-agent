@@ -36,10 +36,9 @@ pub enum ProfileError {
 impl fmt::Display for ProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProfileError::BadId(v) => write!(
-                f,
-                "profile id `{v}` must match ^[a-z0-9][a-z0-9-]{{0,31}}$"
-            ),
+            ProfileError::BadId(v) => {
+                write!(f, "profile id `{v}` must match ^[a-z0-9][a-z0-9-]{{0,31}}$")
+            }
             ProfileError::BadHost(v) => write!(
                 f,
                 "host `{v}` must look like `user@host` with no shell metacharacters"
@@ -110,7 +109,10 @@ mod tests {
     #[test]
     fn profile_id_rejects_uppercase_and_underscore_and_empty() {
         for bad in ["", "Proj", "proj_foo", "-proj", "proj foo", "proj.foo"] {
-            assert!(validate_profile_id(bad).is_err(), "`{bad}` should be rejected");
+            assert!(
+                validate_profile_id(bad).is_err(),
+                "`{bad}` should be rejected"
+            );
         }
     }
 

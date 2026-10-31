@@ -126,7 +126,10 @@ mod tests {
             cmd.contains("YI_AGENT_HOME='/home/dev/.yi-agent-projects/proj-foo/.yi-agent'"),
             "state dir via env, NOT via cwd: {cmd}"
         );
-        assert!(cmd.contains("exec "), "exec so signals reach app-server: {cmd}");
+        assert!(
+            cmd.contains("exec "),
+            "exec so signals reach app-server: {cmd}"
+        );
     }
 
     #[test]
@@ -166,7 +169,10 @@ mod tests {
         let argv = remote_argv(&p, "/b/yi-agent", None).unwrap();
         let cmd = argv.last().unwrap();
         assert!(cmd.contains(r"'/home/dev/it'\''s here'"), "escaped: {cmd}");
-        assert!(!cmd.contains("it's here'"), "must not leak a bare quote: {cmd}");
+        assert!(
+            !cmd.contains("it's here'"),
+            "must not leak a bare quote: {cmd}"
+        );
     }
 
     /// spec §9 判据 4 按这个名字找测试，别改名。
