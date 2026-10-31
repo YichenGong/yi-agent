@@ -175,6 +175,67 @@ mod tests {
     /// The configured command does not exist, so any probe attempt would fail
     /// and register nothing; a passing assertion therefore proves the cache was
     /// consulted. Regression guard for the cache-probe wiring.
+    /// 启动时注册的工具必须被 manager 记账,否则之后停用该 server 时
+    /// `refresh_registry` 没有名字可摘,工具会永远留在工具表里(调用虽被
+    /// `call_tool` 拒绝,模型却仍看得见、仍会去调)。
+    #[tokio::test]
+    async fn disabling_a_server_after_startup_removes_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".yi-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let sc = ServerConfig {
+            kind: ServerKind::Stdio,
+            command: Some("/nonexistent/definitely-not-here".into()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
+        };
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "read_file".into(),
+                description: Some("reads a file".into()),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+        );
+        cache.save(dir.path()).unwrap();
+
+        let cfg_path = agent_dir.join("mcp.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here"}}}"#,
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let mgr = register_mcp_tools(&mut registry, dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(registry.get("mcp__fs__read_file").is_some());
+
+        // 与设置页 `mcp/set` / `mcp_reload disable` 一致:只改磁盘。
+        std::fs::write(
+            &cfg_path,
+            r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here","enabled":false}}}"#,
+        )
+        .unwrap();
+        mgr.reload(dir.path()).await;
+        let mut refreshed = registry.clone();
+        mgr.refresh_registry(&mut refreshed);
+
+        assert!(
+            refreshed.get("mcp__fs__read_file").is_none(),
+            "a server disabled after startup must have its tools unregistered; got {:?}",
+            refreshed.names()
+        );
+    }
+
     #[test]
     fn cache_hit_registers_tools_without_probing() {
         let dir = tempfile::tempdir().unwrap();
