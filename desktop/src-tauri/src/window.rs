@@ -136,6 +136,28 @@ pub fn hide_on_close<R: tauri::Runtime>(
     }
 }
 
+/// Bring the main window back after the user clicks the Dock icon.
+///
+/// Called only when macOS reports no visible windows, so this never fights a
+/// window the user already has in front. `show` and `set_focus` failures are
+/// logged, not propagated: `App::run`'s callback has no way to surface them and
+/// a window that is visible but unfocused is still usable.
+#[cfg(target_os = "macos")]
+pub fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager;
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        eprintln!("[window] reopen: no {MAIN_WINDOW} window to show");
+        return;
+    };
+    if let Err(err) = window.show() {
+        eprintln!("[window] show failed: {err}");
+    }
+    if let Err(err) = window.set_focus() {
+        eprintln!("[window] focus failed: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
