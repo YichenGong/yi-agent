@@ -27,7 +27,12 @@ pub(crate) async fn handle(
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "workspace/list" => {
-            let dirs = state.workspaces.list();
+            // `picker_list` 而不是 `list()`:这条应答只喂「New thread」下拉(桌面
+            // 侧栏的 Browse 菜单 / 手机端同一入口)。插件划出的 worktree
+            // (`.worktrees/kanban/<slug>`)是卡片会话顺带写进索引的,不是用户挑的
+            // 文件夹,混进菜单只会让十几个 `2026-10-31-xxx-design-...` 盖住项目名。
+            // 索引本身仍保留它们:`thread/listAll` 靠它发现卡片会话。
+            let dirs = state.workspaces.picker_list();
             let list: Vec<serde_json::Value> = dirs
                 .iter()
                 .map(|p| {

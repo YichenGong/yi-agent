@@ -18546,6 +18546,62 @@ async fn workspace_list_reports_linked_to() {
     );
     h.shutdown().await;
 }
+/// 看板卡片会话落进索引后，`workspace/list` 不得把它带进「New thread」菜单。
+///
+/// 卡片会话的 cwd 是 `<项目>/.worktrees/kanban/<slug>`，`thread/start` 会把它
+/// 当普通目录写进索引（`thread/listAll` 靠这条发现冷会话）。但那个目录不是用户
+/// 挑的文件夹：菜单里堆十几条 `2026-10-31-xxx-design-...` 只会让用户分不清
+/// 哪个才是自己的项目。
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_list_hides_card_worktrees() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+    // 卡片会话的落盘形态：cwd 在 worktree，归属靠 `driver_project`。
+    write_meta(
+        &wt,
+        "t-card",
+        "看板 · card-1",
+        Some(&project.to_string_lossy()),
+        Some("card-1"),
+    );
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    add_workspace(&mut h, 11, &project.to_string_lossy()).await;
+    add_workspace(&mut h, 12, &wt.to_string_lossy()).await;
+
+    let v = rpc(&mut h, 13, "workspace/list", serde_json::json!({})).await;
+    let paths: Vec<&str> = v["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["path"].as_str())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.contains("/.worktrees/kanban")),
+        "the card worktree must stay out of the New-thread menu: {v}"
+    );
+    assert!(
+        paths.contains(&project.to_string_lossy().as_ref()),
+        "the real project must still be offered: {v}"
+    );
+
+    // 索引本身保留该目录：`thread/listAll` 仍要靠它发现卡片会话，并折进项目组。
+    let all = list_all(&mut h).await;
+    let card_listed = all["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+        .any(|t| t["thread_id"] == serde_json::json!("t-card"));
+    assert!(
+        card_listed,
+        "hiding the worktree from the picker must not hide the card session: {all}"
+    );
+    h.shutdown().await;
+}
+
 /// `role` 必须在列表条目上暴露;普通会话不得带该 key(旧客户端字节兼容)。
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_exposes_the_lead_role_only_for_the_lead() {
