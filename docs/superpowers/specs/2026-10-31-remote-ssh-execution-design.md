@@ -944,8 +944,30 @@ B 的具体形态：
 
 - 新增 RPC `remote/relayTargets`（**在本机 app-server 侧**，不是 Tauri 命令——
   手机只能经中继访问 app-server，访问不到 Tauri 桥接层）
-- 返回：`[{ profileId, label, session, available }]`，其中 `available` 表示该远端
-  当前是否真的连着（中继可能连不上，见上一节）
+- 返回：`[{ profileId, label, session, available }]`
+
+  **`available` 的真相：本机 app-server 根本不知道远端连没连。** 远端 slot 的
+  生命周期由 Tauri 桥接层管（`HashMap<ProfileKey, CommandChild>`，§4.6），
+  app-server 里没有任何远端概念。所以这个字段**不能**由 app-server 自己算。
+
+  三种填法，选 (b)：
+
+  - **(a) 不返回 `available`**：最简单，但手机无法区分"项目不存在"和
+    "项目存在但当前连不上"，会把两种情况都当成失败重试
+  - **(b) 由桥接层写一个状态旁路文件（采用）**：桥接层在每次 slot 状态变化时
+    写 `<本机 instance_home>/remote-status.json`（`{profileId: "connected"|
+    "connecting"|"disconnected"}`），app-server 读它填 `available`。
+    这是**只读旁路**，不引入新的 RPC 方向，也不需要 app-server 理解 ssh
+  - **(c) 让 app-server 反向查桥接层**：需要 app-server → Tauri 的逆向通道，
+    当前架构没有，不引入
+
+  (b) 的代价：多一个文件、需要与 `remote.json` 同样的写盘纪律（flock +
+  唯一临时名，§4.9）。好处是 `available` 的信息来源明确，且**桥接层是唯一
+  知道真相的地方**这一点被诚实地表达出来。
+
+  **`available` 允许短暂失真**：手机两秒前拿到的 `connected` 可能已经断了。
+  手机端必须仍然准备好接收 `-32000`（§8.8），不能把 `available=true` 当作
+  连接成功的保证。
 - 该 RPC 的 scope：**`Control` 及以上才能拿到 `session` 字段**。
   `Observe` 只能拿到 `{profileId, label, available}`，**`session` 必须置空**
   （`protocol.rs:18-22` 定义了 `Observe < Control < Admin` 三档）
@@ -1171,6 +1193,28 @@ app-server 同时写）会互相踩掉临时文件。**必须**用
 **读坏文件的行为**：JSON 语法错误、字段缺失、`version` 不认识 —— **全部**当作
 "没有配置"，记一条 warning，让用户重新配置。绝不允许坏的 `remote.json` 导致
 desktop 起不来或设置页白屏。
+
+**同目录下还有第二个文件：`remote-status.json`（运行时状态，非用户配置）**
+
+由桥接层写、app-server 读（§4.6 的 `available` 字段来源）。与 `remote.json` 的
+关键区别：
+
+| | `remote.json` | `remote-status.json` |
+|---|---|---|
+| 谁写 | Tauri 桥接层（用户操作时） | Tauri 桥接层（slot 状态变化时） |
+| 谁读 | 桥接层 + app-server | **只有 app-server** |
+| 内容 | 用户配置，需严格校验 | 易失状态，读坏就当全 `disconnected` |
+| 写盘纪律 | flock + 唯一临时名（同上） | 同上，但**允许丢**：写失败只记日志 |
+
+```json
+{ "statuses": { "proj-foo": "connected", "proj-bar": "disconnected" } }
+```
+
+取值只有三个：`connected` / `connecting` / `disconnected`。未知字符串按
+`disconnected` 处理（fail-closed：宁可让手机多试一次，也不要报假的"可用"）。
+
+**不要把这两个文件合并**：一个是用户配置、需要原子性与校验，一个是易失状态、
+高频更新且可丢。合在一起会让"状态频繁写"污染"配置的原子性"。
 
 ## 5. 实验开关
 
@@ -1639,7 +1683,10 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
     `env YI_AGENT_HOME=...` 去掉，连两个远端项目，确认它们**确实**共用
     `$HOME/.yi-agent`（证明这条 env 是隔离的唯一来源，而非 cwd）；恢复后
     两者分开（§4.6、§4.1 第 8 步）
-51. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+51. **`available` 反映真实状态**：远端 A 正常连着时 `available=true`；
+    杀掉 A 的 ssh 后**刷一次** `remote/relayTargets` 得到 `false`
+    （验证状态旁路文件被桥接层更新，§4.6）
+52. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1693,7 +1740,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **51 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **52 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
