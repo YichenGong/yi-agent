@@ -240,3 +240,44 @@ async fn put_config_treats_a_missing_value_as_null() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(value.get("agent").is_none(), "空壳分组应被清掉: {value}");
 }
+
+/// `groups` 必须覆盖 FIELDS 里出现的每个 group，且不重复、不遗漏。
+/// 前端改为从这份数据派生侧栏，任何一侧漏组都会让整组字段消失。
+#[tokio::test]
+async fn get_config_groups_match_every_group_in_fields() {
+    use std::collections::BTreeSet;
+    use yi_agent_runtime::settings;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    let response = app(path)
+        .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let value = body_json(response).await;
+
+    let returned: Vec<&str> = value["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+
+    let expected: BTreeSet<&str> = settings::FIELDS.iter().map(|f| f.group).collect();
+
+    assert_eq!(
+        returned.len(),
+        expected.len(),
+        "分组数不符；返回 {returned:?}，期望 {expected:?}"
+    );
+    assert_eq!(
+        returned.iter().copied().collect::<BTreeSet<_>>(),
+        expected,
+        "分组集合不符"
+    );
+    assert!(
+        !returned.contains(&"Tools"),
+        "Tools 分组已不存在，出现它说明硬编码残留"
+    );
+}
