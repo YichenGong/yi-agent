@@ -957,6 +957,34 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A yi-agent-rs && git comm
         ), "失败必须写 failed_at");
     }
 
+    /// 探测失败**不能**刷新 probed_at（否则「已过期」被固化成「新鲜」，24h 内不再重探）。
+    #[tokio::test]
+    async fn a_failed_probe_does_not_make_the_entry_fresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        install_failing_connector();
+        let _seam = SeamGuard;
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = stdio_cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+        let before = McpCache::load(dir.path())
+            .lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS)
+            .is_settled();
+
+        let _ = mgr.reload(dir.path(), now).await;
+
+        let after = McpCache::load(dir.path());
+        assert!(
+            matches!(after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS), CacheLookup::BackedOff),
+            "失败后必须处于退避状态（probed_at 未被刷新）"
+        );
+        assert!(!before, "前置条件：探测前必须不是 settled 状态");
+    }
+
     /// 无缓存 + 探测失败 ⇒ 工具为空。
     #[tokio::test]
     async fn a_failed_probe_with_no_cache_yields_no_tools() {
@@ -1058,6 +1086,46 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A yi-agent-rs && git comm
         assert_eq!(report.servers[0].tool_count, 1);
         let tools = mgr.enabled_tools();
         assert_eq!(tools[0].name(), "mcp__fs__disk_tool");
+    }
+
+    /// 本 bug 的直接回归测试：过期后探测拿到新工具名。
+    #[tokio::test]
+    async fn reload_refreshes_a_renamed_tool_after_the_ttl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_echo_connector(Arc::clone(&calls));
+        let _seam = SeamGuard;
+        let mgr = manager_in_sync(dir.path()).await;
+
+        // 把缓存改成一个**过期的、工具名是旧的**条目
+        let now = now_unix();
+        let sc = stdio_cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![crate::cache::CachedTool {
+                name: "old_name".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(report.servers[0].probed, "过期后必须重探");
+        let names: Vec<String> = mgr
+            .enabled_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with("old_name")),
+            "旧工具名必须被替换, 实际: {names:?}"
+        );
     }
 
     /// 冷缓存探测成功后必须写入 probed_at，否则 TTL 永不开始计时。
@@ -1353,6 +1421,42 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A yi-agent-rs && git comm
         assert!(!report.servers[0].probed, "停用 server 不应探测");
         assert_eq!(report.servers[0].tool_count, 1, "旧清单必须保留");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
+    /// 启动路径刻意**不**校验 TTL：25h 前的缓存照样直接复用，不探测。
+    #[tokio::test]
+    async fn load_and_probe_does_not_probe_an_expired_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        // 预置 25h 前的缓存（带工具），指纹与配置一致
+        let now = now_unix();
+        let sc = stdio_cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![crate::cache::CachedTool {
+                name: "old".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_echo_connector(Arc::clone(&calls));
+        let _seam = SeamGuard;
+
+        let mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不应因 TTL 过期而探测"
+        );
+        assert_eq!(mgr.enabled_tools().len(), 1, "旧清单必须沿用");
     }
 
     /// 启动路径同样不探测停用的 server（与 reload 保持一致）。
