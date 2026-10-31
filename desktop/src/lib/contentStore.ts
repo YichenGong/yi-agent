@@ -102,15 +102,28 @@ export interface AsyncContentStore {
 /** In-memory implementation: the test double and the no-IndexedDB fallback. */
 export class MemoryContentStore implements AsyncContentStore {
   private entries = new Map<string, ContentEntry>();
+  /**
+   * 调用次数。**仅供测试观测**，不参与任何存储语义，也绝不写进 `ContentEntry`
+   * （那是被 `toEqual` 逐字段比对的对象，加字段会让既有断言全挂）。
+   *
+   * 注意 `deletes` 会混入 `evict` 的淘汰删除——`persistContent` 写完就
+   * `await evict(store)`，后者也调 `delete`。要区分「业务删除」请改用
+   * `keys()` 断言。
+   */
+  writes = 0;
+  deletes = 0;
+
   async read(threadId: string): Promise<ContentEntry | null> {
     return this.entries.get(threadId) ?? null;
   }
   async write(entry: ContentEntry): Promise<void> {
+    this.writes += 1;
     // Deep-copy so a caller mutating its arrays afterwards cannot alter what was
     // "stored" — the real store serializes, so this mirrors that boundary.
     this.entries.set(entry.threadId, JSON.parse(JSON.stringify(entry)) as ContentEntry);
   }
   async delete(threadId: string): Promise<void> {
+    this.deletes += 1;
     this.entries.delete(threadId);
   }
   async keys(): Promise<string[]> {

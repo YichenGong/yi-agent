@@ -130,6 +130,24 @@ describe("MemoryContentStore", () => {
   it("reads a missing key as null", async () => {
     expect(await new MemoryContentStore().read("nope")).toBeNull();
   });
+
+  it("counts writes and deletes without changing the stored shape", async () => {
+    const store = new MemoryContentStore();
+    expect(store.writes).toBe(0);
+    expect(store.deletes).toBe(0);
+    await store.write({
+      threadId: "t1", savedAt: 1, lastServerItemId: null,
+      items: [], trimmed: false, bytes: 0,
+    });
+    expect(store.writes).toBe(1);
+    // 计数不写进条目本身：读回来逐字段比对仍与写入值一致。
+    expect(await store.read("t1")).toEqual({
+      threadId: "t1", savedAt: 1, lastServerItemId: null,
+      items: [], trimmed: false, bytes: 0,
+    });
+    await store.delete("t1");
+    expect(store.deletes).toBe(1);
+  });
 });
 
 describe("evict", () => {
