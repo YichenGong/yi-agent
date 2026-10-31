@@ -163,7 +163,7 @@ fn env_usize(name: &str) -> Option<usize> {
 ///
 /// 语义等价于 clap 的 `ValueEnum::from_str(value, true)`(kebab-case 变体名、
 /// 大小写不敏感);runtime crate 不依赖 clap,故在此手工映射。
-fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxMode> {
+pub(crate) fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxMode> {
     if value.eq_ignore_ascii_case("read-only") {
         Some(yi_agent_tools::SandboxMode::ReadOnly)
     } else if value.eq_ignore_ascii_case("workspace-write") {

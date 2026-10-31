@@ -297,6 +297,356 @@ pub fn find_spec(key: &str) -> Option<&'static FieldSpec> {
     FIELDS.iter().find(|field| field.key == key)
 }
 
+use std::path::{Path, PathBuf};
+
+/// `<instance_home>/settings.json`；实例目录不可解析时回退 `.yi-agent/settings.json`，
+/// 与 `models_path` / `websearch_path` 同口径。
+pub fn settings_path() -> PathBuf {
+    yi_agent_store::paths::home_join("settings.json")
+        .unwrap_or_else(|| PathBuf::from(".yi-agent").join("settings.json"))
+}
+
+/// 读 `settings.json`。缺失 / 不可读 / JSON 非法一律回全 `None`（用默认值）——
+/// 坏文件绝不阻断启动，与 `models.json` / `preferences.json` 同一约定。
+///
+/// **单个字段非法只清掉那一个**：先按 `Option<T>` 宽松反序列化（类型不符的字段
+/// 会因 `deserialize` 失败而拖垮整份，故这里用 `Value` 中转），再逐字段按
+/// `FIELDS` 校验，越界或枚举非法的值置 `None` 并 `warn`。用户手改 `sandbox`
+/// 拼错时不该连 `max_turns` 一起回默认。
+pub fn load_from(path: &Path) -> Settings {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
+        Err(error) => {
+            tracing::warn!(error = %error, path = %path.display(), "could not read settings.json; using defaults");
+            return Settings::default();
+        }
+    };
+    // 先确认顶层是对象。`serde_json::from_str::<Settings>` 对数组/标量会失败，
+    // 那样整份回默认；这条路径单独提出只是为了让 warn 措辞准确。
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, path = %path.display(), "invalid settings.json; using defaults");
+            return Settings::default();
+        }
+    };
+    if !value.is_object() {
+        tracing::warn!(path = %path.display(), "settings.json is not a JSON object; using defaults");
+        return Settings::default();
+    }
+    let settings = match serde_json::from_value::<Settings>(value) {
+        Ok(settings) => settings,
+        Err(error) => {
+            // 到这一步只剩结构性的坏（比如 `"agent": 5`）。字段级的类型不符
+            // 已被 `de_optional_*` 吸收成 `None`，不会走到这里。
+            tracing::warn!(error = %error, path = %path.display(), "invalid settings.json; using defaults");
+            return Settings::default();
+        }
+    };
+    settings.normalized()
+}
+
+/// 读实例目录下的 `settings.json`。
+pub fn load() -> Settings {
+    load_from(&settings_path())
+}
+
+impl Settings {
+    /// 施加两条加载期约束，让加载侧与写入侧对「有效值」只有一个判据：
+    ///
+    /// 1. **空串等于未设置**：字符串字段的空白串归一为 `None`。
+    /// 2. **单字段非法只清掉那一个**：按 [`FIELDS`] 校验数值边界与枚举白名单，
+    ///    不合法就置 `None` 并 `warn`。整份文件丢掉会让用户「改错一个字段、
+    ///    全盘回默认」——spec 的错误处理一节明确要求逐字段降级。
+    fn normalized(mut self) -> Settings {
+        self.agent.system_prompt = self
+            .agent
+            .system_prompt
+            .filter(|value| !value.trim().is_empty());
+        self.startup.sandbox = self
+            .startup
+            .sandbox
+            .filter(|value| !value.trim().is_empty());
+
+        // 数值上下界。逐字段写出而不做泛型分派：`Option<u32>` / `Option<u16>` /
+        // `Option<usize>` 的宽度不同，泛型反而要引入 trait。
+        macro_rules! clamp {
+            ($key:literal, $field:expr) => {{
+                if let Some(value) = $field {
+                    if !within($key, value as u64) {
+                        tracing::warn!(
+                            key = $key,
+                            value,
+                            "settings.json value is out of range; falling back to the default"
+                        );
+                        $field = None;
+                    }
+                }
+            }};
+        }
+        clamp!("agent.max_turns", self.agent.max_turns);
+        clamp!("agent.max_direct_children", self.agent.max_direct_children);
+        clamp!(
+            "agent.max_resident_subagents",
+            self.agent.max_resident_subagents
+        );
+        clamp!(
+            "agent.skills_catalog_budget",
+            self.agent.skills_catalog_budget
+        );
+        clamp!("compact.ratio", self.compact.ratio);
+        clamp!(
+            "compact.user_budget_tokens",
+            self.compact.user_budget_tokens
+        );
+        clamp!(
+            "compact.tool_budget_tokens",
+            self.compact.tool_budget_tokens
+        );
+
+        // 枚举白名单：只认 `parse_sandbox_mode` 那份映射，不另写一遍。
+        // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
+        // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
+        // 同 crate，`pub(crate)` 足够）。
+        if let Some(sandbox) = self.startup.sandbox.as_deref() {
+            if crate::config::parse_sandbox_mode(sandbox).is_none() {
+                tracing::warn!(
+                    value = sandbox,
+                    "settings.json has an unknown startup.sandbox; falling back to the default"
+                );
+                self.startup.sandbox = None;
+            }
+        }
+        self
+    }
+}
+
+/// `key` 的 `min`/`max` 约束是否满足。`FIELDS` 之外的键一律放行。
+fn within(key: &str, value: u64) -> bool {
+    let Some(spec) = find_spec(key) else {
+        return true;
+    };
+    spec.min.is_none_or(|min| value >= min) && spec.max.is_none_or(|max| value <= max)
+}
+
+/// 写入失败的原因。`InvalidSetting` 与 `Corrupt` 是**零写入**的拒绝：
+/// 文件的 mtime 与内容都不会变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsError {
+    /// 键不认识、类型不对、数值越界、枚举值非法。
+    InvalidSetting {
+        key: String,
+        reason: String,
+    },
+    /// 文件存在，但读不出来 / 不是 JSON 对象。拒绝覆盖。
+    Corrupt(String),
+    Io(String),
+}
+
+impl std::fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SettingsError::InvalidSetting { key, reason } => {
+                write!(f, "invalid setting {key}: {reason}")
+            }
+            SettingsError::Corrupt(reason) => write!(f, "settings.json is not writable: {reason}"),
+            SettingsError::Io(reason) => write!(f, "settings.json io error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SettingsError {}
+
+/// 写实例目录下的 `settings.json`。
+pub fn write(patch: &serde_json::Value) -> Result<(), SettingsError> {
+    write_to(&settings_path(), patch)
+}
+
+/// 部分更新：`patch` 的键是点路径（`agent.max_turns`），值为 `null` 或 `""`
+/// 表示删除该键、回退默认。
+///
+/// **读-改-写，不是重建**：文件里的未知顶层键原样保留。这是 `env_file::write`
+/// 一号缺陷（保存时删掉不认识的键）的直接修复。
+pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsError> {
+    let patch = patch
+        .as_object()
+        .ok_or_else(|| SettingsError::InvalidSetting {
+            key: "<root>".to_string(),
+            reason: "patch must be a JSON object".to_string(),
+        })?;
+
+    // 全部校验先做完：任何一项失败都零写入。
+    let mut ops: Vec<(&'static FieldSpec, Option<serde_json::Value>)> = Vec::new();
+    for (key, value) in patch {
+        let spec = find_spec(key).ok_or_else(|| SettingsError::InvalidSetting {
+            key: key.clone(),
+            reason: "unknown setting".to_string(),
+        })?;
+        ops.push((spec, validate_value(spec, value)?));
+    }
+
+    // 读底：文件存在却读不出来 → 拒绝覆盖（与 `save_catalog_to` 同一守卫）。
+    let mut object = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| {
+                SettingsError::Corrupt(format!(
+                    "{} exists but is not a readable JSON object",
+                    path.display()
+                ))
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(SettingsError::Io(error.to_string())),
+    };
+
+    for (spec, value) in ops {
+        apply_op(&mut object, spec.key, value);
+    }
+
+    // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
+    for group in ["agent", "compact", "startup"] {
+        if object
+            .get(group)
+            .and_then(|value| value.as_object())
+            .is_some_and(|inner| inner.is_empty())
+        {
+            object.remove(group);
+        }
+    }
+
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(|error| SettingsError::Io(error.to_string()))?;
+    write_atomically(path, &text).map_err(|error| SettingsError::Io(error.to_string()))
+}
+
+/// 校验单个值；`Ok(None)` 表示「删键」。
+fn validate_value(
+    spec: &'static FieldSpec,
+    value: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, SettingsError> {
+    let reject = |reason: String| SettingsError::InvalidSetting {
+        key: spec.key.to_string(),
+        reason,
+    };
+
+    // `null` 与空串都表示删键。
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(text) = value.as_str() {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+    }
+
+    match spec.field_type {
+        FieldType::Number => {
+            let number = match value {
+                serde_json::Value::Number(n) => n.as_u64(),
+                // 表单发上来的是字符串，这里统一收口，避免两套解析。
+                serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| reject("expected a non-negative integer".to_string()))?;
+            if let Some(min) = spec.min {
+                if number < min {
+                    return Err(reject(format!("must be at least {min}")));
+                }
+            }
+            if let Some(max) = spec.max {
+                if number > max {
+                    return Err(reject(format!("must be at most {max}")));
+                }
+            }
+            Ok(Some(serde_json::Value::from(number)))
+        }
+        FieldType::Text => Ok(Some(serde_json::Value::String(
+            value
+                .as_str()
+                .ok_or_else(|| reject("expected a string".to_string()))?
+                .to_string(),
+        ))),
+        FieldType::Select => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| reject("expected a string".to_string()))?;
+            if !spec.options.contains(&text) {
+                return Err(reject(format!(
+                    "expected one of {:?}, got {text:?}",
+                    spec.options
+                )));
+            }
+            Ok(Some(serde_json::Value::String(text.to_string())))
+        }
+    }
+}
+
+/// 把一个点路径键套进顶层对象。`None` 表示删键。
+fn apply_op(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<serde_json::Value>,
+) {
+    let (group, field) = match key.split_once('.') {
+        Some(pair) => pair,
+        // FIELDS 里每一项都是 `group.field`，走不到这里。
+        None => return,
+    };
+    match value {
+        Some(value) => {
+            let entry = object
+                .entry(group.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(inner) = entry.as_object_mut() {
+                inner.insert(field.to_string(), value);
+            }
+        }
+        None => {
+            if let Some(inner) = object.get_mut(group).and_then(|v| v.as_object_mut()) {
+                inner.remove(field);
+            }
+        }
+    }
+}
+
+/// 临时文件 + `rename` + `0600`，与 `models.rs` 的 `save_catalog_to` 同一套。
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!("settings.json.{}.{}.tmp", std::process::id(), seq));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, text)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +869,301 @@ malformed line
         ] {
             assert!(spec.options.contains(&mode.as_str()));
         }
+    }
+
+    use std::path::Path;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn missing_file_loads_as_all_none() {
+        let dir = temp_dir();
+        let settings = load_from(&dir.path().join("settings.json"));
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn corrupt_json_loads_as_all_none_without_panicking() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(load_from(&path), Settings::default());
+    }
+
+    #[test]
+    fn loads_typed_values() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"max_turns":500},"compact":{"ratio":75},"startup":{"sandbox":"read-only"}}"#,
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.max_turns, Some(500));
+        assert_eq!(settings.compact.ratio, Some(75));
+        assert_eq!(settings.startup.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(settings.agent.system_prompt, None);
+    }
+
+    #[test]
+    fn write_then_load_round_trips() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(
+            &path,
+            &serde_json::json!({
+                "agent.max_turns": 500,
+                "compact.ratio": 75,
+                "startup.sandbox": "read-only",
+            }),
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.max_turns, Some(500));
+        assert_eq!(settings.compact.ratio, Some(75));
+        assert_eq!(settings.startup.sandbox.as_deref(), Some("read-only"));
+    }
+
+    /// 一号缺陷的回归网：写入绝不能把文件里用户手写的未知顶层键删掉。
+    /// 旧 `env_file::write` 的循环源是元数据表而不是文件内容，所以会删。
+    #[test]
+    fn write_preserves_unknown_top_level_keys() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"my_note":"keep me","agent":{"max_turns":100}}"#).unwrap();
+
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["my_note"], "keep me");
+        assert_eq!(value["agent"]["max_turns"], 500);
+    }
+
+    /// 未设置的字段不得被写成空值或 null 占位——那会让「未设置」与「设成空」失配。
+    #[test]
+    fn write_does_not_emit_keys_for_unset_fields() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let agent = value["agent"].as_object().unwrap();
+        assert_eq!(
+            agent.len(),
+            1,
+            "only max_turns should be present: {agent:?}"
+        );
+        assert!(
+            value.get("compact").is_none(),
+            "compact must not be materialized"
+        );
+        assert!(
+            value.get("startup").is_none(),
+            "startup must not be materialized"
+        );
+    }
+
+    /// 空串等于未设置：写入侧必须删键，而不是写空串或 0。
+    #[test]
+    fn empty_string_removes_the_key() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+
+        write_to(&path, &serde_json::json!({"agent.max_turns": ""})).unwrap();
+
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.max_turns, None);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            value
+                .get("agent")
+                .and_then(|a| a.get("max_turns"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn null_removes_the_key() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+        write_to(&path, &serde_json::json!({"agent.max_turns": null})).unwrap();
+        assert_eq!(load_from(&path).agent.max_turns, None);
+    }
+
+    #[test]
+    fn rejects_unknown_keys_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = write_to(&path, &serde_json::json!({"agent.not_a_field": 1})).unwrap_err();
+        assert!(matches!(error, SettingsError::InvalidSetting { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected write must not touch the file"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_numbers_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+
+        for (key, value) in [
+            ("agent.max_turns", serde_json::json!(0)),
+            ("agent.max_direct_children", serde_json::json!(0)),
+            ("compact.ratio", serde_json::json!(0)),
+            ("compact.ratio", serde_json::json!(101)),
+            ("compact.user_budget_tokens", serde_json::json!(0)),
+            // 上限：`agent.max_turns` 落盘后要能反序列化回 `Option<u32>`。
+            // 不设上限的话，写 u32::MAX+1 会让下次 `load_from` 整份失败回默认，
+            // 用户只会看到「我改的设置全没了」。
+            ("agent.max_turns", serde_json::json!(u32::MAX as u64 + 1)),
+            (
+                "agent.max_direct_children",
+                serde_json::json!(u16::MAX as u64 + 1),
+            ),
+            (
+                "agent.max_resident_subagents",
+                serde_json::json!(u16::MAX as u64 + 1),
+            ),
+            (
+                "agent.skills_catalog_budget",
+                serde_json::json!(u32::MAX as u64 + 1),
+            ),
+        ] {
+            let error = write_to(&path, &serde_json::json!({ key: value })).unwrap_err();
+            assert!(
+                matches!(error, SettingsError::InvalidSetting { .. }),
+                "{key}={value} should be rejected, got {error:?}"
+            );
+        }
+        assert!(!path.exists(), "no rejected write may create the file");
+    }
+
+    #[test]
+    fn rejects_unknown_select_option_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        let error = write_to(&path, &serde_json::json!({"startup.sandbox": "bogus"})).unwrap_err();
+        assert!(matches!(error, SettingsError::InvalidSetting { .. }));
+        assert!(!path.exists());
+    }
+
+    /// 文件存在但读不出来 → 拒绝覆盖。那是用户的配置坏了，不是「没有配置」；
+    /// 静默重建会把 `my_note` 之类手写内容整份扔掉。
+    #[test]
+    fn refuses_to_overwrite_a_corrupt_file() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ broken").unwrap();
+
+        let error = write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap_err();
+        assert!(matches!(error, SettingsError::Corrupt(_)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ broken",
+            "the corrupt file must be left exactly as it was"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "settings.json must be 0600");
+    }
+
+    #[test]
+    fn write_creates_the_parent_directory() {
+        let dir = temp_dir();
+        let path = dir.path().join("nested/deeper/settings.json");
+        write_to(&path, &serde_json::json!({"agent.max_turns": 500})).unwrap();
+        assert!(path.exists());
+    }
+
+    /// 字符串字段的空白等同未设置。
+    #[test]
+    fn whitespace_only_string_is_treated_as_unset() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        write_to(&path, &serde_json::json!({"agent.system_prompt": "   "})).unwrap();
+        assert_eq!(load_from(&path).agent.system_prompt, None);
+    }
+
+    /// spec 的「错误处理」一节：单个字段非法**只清掉那一个**，不把整份文件丢掉。
+    /// 用户手改了 `sandbox` 拼错，不该连 `max_turns` 一起回默认。
+    #[test]
+    fn an_invalid_field_is_dropped_but_the_rest_survives() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"max_turns":500},"compact":{"ratio":0},"startup":{"sandbox":"bogus"}}"#,
+        )
+        .unwrap();
+
+        let settings = load_from(&path);
+
+        assert_eq!(
+            settings.agent.max_turns,
+            Some(500),
+            "a valid neighbour survives"
+        );
+        assert_eq!(
+            settings.compact.ratio, None,
+            "an out-of-range value falls back to the default"
+        );
+        assert_eq!(
+            settings.startup.sandbox, None,
+            "an unknown enum value falls back to the default"
+        );
+    }
+
+    /// 顶层不是对象（比如被写成了数组）→ 整份回默认，而不是 panic。
+    #[test]
+    fn a_non_object_settings_file_falls_back_to_defaults() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "[1,2,3]").unwrap();
+        assert_eq!(load_from(&path), Settings::default());
+    }
+
+    /// 单个字段类型不对（`"abc"`、`-1`、数组）只让它自己变未设置。
+    #[test]
+    fn a_wrong_typed_field_is_dropped_but_the_rest_survives() {
+        let dir = temp_dir();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"max_turns":"abc","max_direct_children":-1,"system_prompt":42},
+                "compact":{"ratio":75}}"#,
+        )
+        .unwrap();
+
+        let settings = load_from(&path);
+
+        assert_eq!(settings.agent.max_turns, None);
+        assert_eq!(settings.agent.max_direct_children, None);
+        assert_eq!(settings.agent.system_prompt, None);
+        assert_eq!(
+            settings.compact.ratio,
+            Some(75),
+            "a well-typed neighbour must survive"
+        );
     }
 }
