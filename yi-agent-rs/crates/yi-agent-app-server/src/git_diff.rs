@@ -1576,10 +1576,45 @@ mod tests {
         );
     }
 
-    /// 非普通文件一律拒绝：目录 / FIFO / 设备 的 `len` 不可信（常为 0），
-    /// 读 FIFO 在无写端时会一直阻塞。这里用目录触发 `!is_file()` 这一支。
+    /// 非普通文件一律拒绝：设备 / FIFO 的 `len` 不可信（常为 0），读 FIFO 在
+    /// 无写端时会一直阻塞。
+    ///
+    /// 承重的是 `/dev/null`，不是目录：目录的 `metadata().len()` 虽也非 0（本机实测
+    /// 64），但真正拦下它的是随后的 `read`——macOS 上 `File::open(dir)` 成功而
+    /// `read_to_end` 返回 `EISDIR`，`.ok()?` 一样给出 `None`。所以拿目录当样本，
+    /// 删掉 `!meta.is_file()` 这道闸测试仍然绿，没有回归价值。
+    ///
+    /// `/dev/null` 没有这个退路：`size=0`（过尺寸闸）、`crw-rw-rw-`
+    /// （`is_file() == false`）、且 `open` 后 `read` 成功返回 0 字节。于是
+    /// 旧代码（丢掉 `is_file()` 检查）对它会走 `metadata` → 尺寸闸通过 →
+    /// `fs::read` 返回 `Ok(vec![])` → `Some(vec![])`，新代码返回 `None`。
+    /// 这才是真 RED——实测：删掉 `is_file()` 后本测试失败，且探到的旧返回值
+    /// 就是 `Some([])`；同样的删除下「只测目录」的临时用例仍然绿。
     #[test]
     fn read_untracked_capped_refuses_a_non_regular_file() {
+        let dev_null = Path::new("/dev/null");
+        let meta = std::fs::metadata(dev_null).expect("/dev/null must exist");
+        assert_eq!(
+            meta.len(),
+            0,
+            "premise: a device reports len 0, so it slips past the byte cap"
+        );
+        assert!(
+            !meta.is_file(),
+            "premise: a char device must not look like a regular file"
+        );
+        assert_eq!(
+            std::fs::read(dev_null).expect("reading /dev/null must succeed"),
+            Vec::<u8>::new(),
+            "premise: the old code's unbounded read returns Ok(empty) here, \
+             so only the !is_file() guard can reject it"
+        );
+        assert!(
+            read_untracked_capped(dev_null).is_none(),
+            "/dev/null must never be read as file content"
+        );
+
+        // 目录也拒绝，但它单独不能证明这道闸（见上面的理由）。
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("subdir");
         std::fs::create_dir(&sub).unwrap();

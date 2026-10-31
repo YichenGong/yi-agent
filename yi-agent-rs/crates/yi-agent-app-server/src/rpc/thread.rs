@@ -2040,7 +2040,8 @@ pub(crate) async fn handle(
                     .unwrap_or_else(|| state.cfg.workdir.display().to_string());
                 let repo = std::path::PathBuf::from(&cwd);
                 // 只要 meta 的 `anchor_sha`：`load` 会把整份对话 jsonl 解析一遍,
-                // 那是本任务要消除的主循环阻塞类 IO。同 `rpc/mod.rs` 的取法。
+                // 那是本任务要消除的主循环阻塞类 IO。同 `rpc/mod.rs:70` 的
+                // `store.read_meta(thread_id)` 取法。
                 let anchor = state
                     .threads
                     .get(&thread_id)
