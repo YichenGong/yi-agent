@@ -318,6 +318,16 @@ pub fn dispatch_with_service(
             };
             Ok(json!({ "status": status }))
         }
+        // 退出合并队列。只在 `merge_queued` 上成立：已经开跑的那张不退，
+        // 否则会与一轮在跑的合并会话打架（spec §4.2）。
+        "merge_cancel" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "merge_cancel needs a card_id".to_string())?;
+            service.merge_cancel(card_id)?;
+            Ok(json!({ "status": "cancelled" }))
+        }
         // 模型声明一张卡现在处于什么状态。这是 daemon 之外**唯一**写状态的
         // 入口——判断归模型，插件只落账。
         "card.state" => {

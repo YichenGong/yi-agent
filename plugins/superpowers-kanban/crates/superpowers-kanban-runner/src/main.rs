@@ -119,6 +119,11 @@ enum Subcommand {
         state_dir: PathBuf,
         card_id: String,
     },
+    /// 退出合并队列。只在 `merge_queued` 上成立——已经开跑的合并不能退。
+    MergeCancel {
+        state_dir: PathBuf,
+        card_id: String,
+    },
     Archive {
         state_dir: PathBuf,
         card_id: Option<String>,
@@ -137,7 +142,7 @@ enum Subcommand {
 }
 
 const USAGE: &str =
-    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|state|archive|purge|list|on|off|workdir|manifest> [...]
+    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|merge-cancel|done|state|archive|purge|list|on|off|workdir|manifest> [...]
   run            --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
   add            <spec> <plan> [--state-dir <d>]
   add-prequeued  <title> [--state-dir <d>]
@@ -145,6 +150,7 @@ const USAGE: &str =
   add-merge      <source> [--base <ref>] [--state-dir <d>]
   merge-request <card-id> [--state-dir <d>]
   merge-finish  <card-id> [--state-dir <d>]
+  merge-cancel  <card-id> [--state-dir <d>]
   done          <card-id> [--state-dir <d>]
   state         <card-id> <state> [--detail <t>] | --self <state> [--detail <t>] [--state-dir <d>]
   archive       <card-id>|--all-terminal [--state-dir <d>]
@@ -317,7 +323,7 @@ where
                 detail,
             })
         }
-        Some(verb @ ("merge-request" | "merge-finish")) => {
+        Some(verb @ ("merge-request" | "merge-finish" | "merge-cancel")) => {
             let (state_dir, rest) = parse_state_dir(args)?;
             let mut rest = rest.into_iter();
             let card_id = rest
@@ -326,10 +332,10 @@ where
             if let Some(extra) = rest.next() {
                 return Err(format!("{verb} takes one card id, got an extra: {extra}"));
             }
-            Ok(if verb == "merge-request" {
-                Subcommand::MergeRequest { state_dir, card_id }
-            } else {
-                Subcommand::MergeFinish { state_dir, card_id }
+            Ok(match verb {
+                "merge-request" => Subcommand::MergeRequest { state_dir, card_id },
+                "merge-finish" => Subcommand::MergeFinish { state_dir, card_id },
+                _ => Subcommand::MergeCancel { state_dir, card_id },
             })
         }
         Some("archive") => {
@@ -814,6 +820,25 @@ fn command_merge_finish(state_dir: &std::path::Path, card_id: &str) -> Result<St
     }
 }
 
+/// `merge-cancel`：退出合并队列。
+///
+/// 只对 `merge_queued` 成立。已经排到队、开跑的那张不退——它已经是一轮在跑的
+/// 会话，改回去会和那次合并打架。
+fn command_merge_cancel(state_dir: &std::path::Path, card_id: &str) -> Result<String, String> {
+    let value = superpowers_kanban_runner::dispatch::dispatch(
+        state_dir,
+        "merge_cancel",
+        &serde_json::json!({ "card_id": card_id }),
+    )
+    .map_err(|error| error.to_string())?;
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("cancelled") => Ok(format!(
+            "cancelled\n{card_id} is back to awaiting_merge and out of the merge queue"
+        )),
+        other => Err(format!("unexpected merge_cancel result: {other:?}")),
+    }
+}
+
 /// `done`：把一张 `awaiting_merge` 的卡结算为 `done`。分支核对结果如实打印，
 /// 但**不**据此阻断——合并权归人，这里只登记「已合并」这一事实。
 fn command_done(
@@ -978,6 +1003,9 @@ fn main() {
         }
         Subcommand::MergeFinish { state_dir, card_id } => {
             command_merge_finish(&state_dir, &card_id)
+        }
+        Subcommand::MergeCancel { state_dir, card_id } => {
+            command_merge_cancel(&state_dir, &card_id)
         }
         Subcommand::Archive {
             state_dir,
@@ -1595,6 +1623,11 @@ mod tests {
         assert!(parse(&["merge-request"]).is_err(), "缺 card id");
         assert!(parse(&["merge-finish"]).is_err(), "缺 card id");
         assert!(parse(&["merge-request", "a", "b"]).is_err(), "多参数");
+        assert!(matches!(
+            parse(&["merge-cancel", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::MergeCancel { .. })
+        ));
+        assert!(parse(&["merge-cancel"]).is_err(), "缺 card id");
     }
 
     #[test]
