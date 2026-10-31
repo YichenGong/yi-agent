@@ -46,6 +46,9 @@ pub struct TuiTheme {
     /// Nothing reads them yet: the cursor is drawn with REVERSED, which needs no
     /// colors. They exist so a future solid-block cursor has theme-controlled
     /// values instead of a fresh hardcoded white/black pair.
+    //
+    // Not redundant in this crate: `yi-agent` is a binary, so a `pub`
+    // field is still unreachable from outside and `dead_code` warns.
     #[allow(dead_code)]
     pub cursor_fg: Color,
     #[allow(dead_code)]
@@ -118,24 +121,37 @@ pub(crate) fn relative_luminance(color: Color) -> f32 {
     0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
 }
 
+/// The normalized `light`/`dark` override, if `value` is one.
+///
+/// Single source of truth for "is this a valid override": `detect_theme_kind`
+/// uses it for its decision table and `detect_theme_from_terminal` uses it to
+/// decide whether the 200ms probe can be skipped. Duplicating the check would
+/// let a third accepted value be added in one place only, silently re-arming a
+/// pointless probe wait.
+fn override_kind(value: &str) -> Option<TuiThemeKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(TuiThemeKind::Light),
+        "dark" => Some(TuiThemeKind::Dark),
+        _ => None,
+    }
+}
+
 /// Resolve the theme from an explicit override and/or a raw OSC 11 reply.
 ///
 /// Pure so the decision table is testable without a terminal. Precedence:
 /// valid env override, then the reply's luminance, then `Dark`.
 pub fn detect_theme_kind(env_override: Option<&str>, reply: Option<&str>) -> TuiThemeKind {
-    match env_override
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("light") => return TuiThemeKind::Light,
-        Some("dark") => return TuiThemeKind::Dark,
-        Some(other) if !other.is_empty() => {
-            tracing::warn!(
-                value = %other,
-                "ignoring unknown YI_AGENT_THEME; falling back to background detection"
-            );
-        }
-        _ => {}
+    let normalized = env_override.map(str::trim).map(str::to_ascii_lowercase);
+    let normalized = normalized.as_deref();
+    if let Some(kind) = normalized.and_then(override_kind) {
+        return kind;
+    }
+    // An empty override is not a typo worth warning about.
+    if let Some(value) = normalized.filter(|value| !value.is_empty()) {
+        tracing::warn!(
+            value = %value,
+            "ignoring unknown YI_AGENT_THEME; falling back to background detection"
+        );
     }
 
     let Some(parsed) = reply.and_then(|r| parse_osc11_reply(r.as_bytes())) else {
@@ -188,17 +204,11 @@ pub fn parse_osc11_reply(bytes: &[u8]) -> Option<(u8, u8, u8)> {
 ///
 /// Never writes to stdout/stderr on a failure path: a stray byte during TUI
 /// startup corrupts the frame.
-// Task 3 wires this into `run_tui` (after raw mode, before the alternate
-// screen); until then nothing calls it and dead-code lint would fail `just lint`.
-#[allow(dead_code)]
 pub fn detect_theme_from_terminal() -> TuiThemeKind {
     let env_override = std::env::var("YI_AGENT_THEME").ok();
-    if let Some(value) = env_override.as_deref() {
-        let lowered = value.trim().to_ascii_lowercase();
-        if lowered == "light" || lowered == "dark" {
-            // A valid override needs no probe: skip the 200ms wait entirely.
-            return detect_theme_kind(Some(value), None);
-        }
+    if let Some(kind) = env_override.as_deref().and_then(override_kind) {
+        // A valid override needs no probe: skip the 200ms wait entirely.
+        return kind;
     }
     let reply = query_osc11();
     detect_theme_kind(env_override.as_deref(), reply.as_deref())
@@ -305,7 +315,9 @@ fn query_osc11() -> Option<String> {
     }
 
     {
-        let stdout = std::io::stdout();
+        // The one legal stdout write in this module; exempted from the
+        // scan in `probe_failure_writes_nothing`.
+        let stdout = std::io::stdout(); // theme-guard: allow: OSC 11 query
         let mut out = stdout.lock();
         if out.write_all(b"\x1b]11;?\x1b\\").is_err() || out.flush().is_err() {
             tracing::warn!("OSC 11 probe could not write the query");
@@ -519,6 +531,82 @@ mod tests {
     fn probe_timeout_falls_back_to_dark() {
         // No reply at all: startup must not hang or panic.
         assert_eq!(detect_theme_kind(None, None), TuiThemeKind::Dark);
+    }
+
+    /// The failure paths must leave stdout untouched (spec §4.2, §3.7).
+    ///
+    /// The invariant is about *stdout*, not about the returned `Option`: a
+    /// library that bare-writes a line lands inside the frame being drawn and
+    /// smears the input stripe (`docs/bug-list.md:101`).
+    ///
+    /// A real fd 1 capture is not reachable from a test without an unsafe
+    /// process-global swap of the stdout handle, and it would not work anyway:
+    /// libtest installs its own fd 1 redirect, so a raw `poll` on fd 1 sees
+    /// nothing even when code writes to stdout (verified with a manual
+    /// `write_all(b"leaked")` mutation). So the claim is pinned from two sides,
+    /// neither of which pretends to be a capture:
+    ///
+    /// 1. Runtime: exercise the failure paths a test process can reach — stdin
+    ///    is not a tty under `cargo test`, so `query_osc11` bails before the
+    ///    query — and assert the deterministic no-reply outcome. This proves
+    ///    the path is entered and returns cleanly; it does *not* prove fd 1
+    ///    stayed quiet, which is exactly why prong 2 exists.
+    /// 2. Static: production `theme.rs` names no write channel to fd 1/2 —
+    ///    no `print!`/`println!`/`eprint!`/`eprintln!`/`dbg!`, no
+    ///    `stdout()`/`stderr()`, no `STDOUT_FILENO`/`STDERR_FILENO`. The one
+    ///    legal stdout write, the 6-byte OSC 11 query, is a greppable
+    ///    `theme-guard: allow` (the same escape hatch `tui_theme_guard.rs`
+    ///    uses). `tracing::warn!` is the only reporting channel on failure
+    ///    paths; it goes to the file layer (`tracing_init.rs:38`), not to a
+    ///    terminal.
+    #[test]
+    #[cfg(unix)]
+    fn probe_failure_writes_nothing() {
+        use std::io::IsTerminal;
+
+        // Prong 1: the reachable failure path runs and is deterministic.
+        assert!(
+            !std::io::stdin().is_terminal(),
+            "this test relies on a non-tty stdin; under a tty the probe \
+             legitimately writes the OSC 11 query first"
+        );
+        assert_eq!(query_osc11(), None, "non-tty stdin must yield no reply");
+        let env = std::env::var("YI_AGENT_THEME").ok();
+        assert_eq!(
+            detect_theme_from_terminal(),
+            // A reply is impossible without a tty, so the pure decision table
+            // predicts the full result; comparing against it keeps the
+            // assertion valid when the environment carries an override.
+            detect_theme_kind(env.as_deref(), None)
+        );
+
+        // Prong 2: static, over production code only — the test module is cut
+        // up front, so this test cannot match its own literals.
+        let production = include_str!("theme.rs")
+            .split("mod tests {")
+            .next()
+            .expect("theme.rs opens a test module");
+        let banned: Vec<String> = ["print", "eprint", "println", "eprintln", "dbg"]
+            .into_iter()
+            .map(|stem| format!("{stem}!"))
+            .chain(
+                ["stdout()", "stderr()", "STDOUT_FILENO", "STDERR_FILENO"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .collect();
+        let allowed = "theme-guard: allow";
+        let found: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.contains(allowed))
+            .filter(|(_, line)| banned.iter().any(|needle| line.contains(needle.as_str())))
+            .map(|(number, line)| (number + 1, line.trim()))
+            .collect();
+        assert!(
+            found.is_empty(),
+            "theme.rs must not write straight to fd 1/2; use tracing::warn!:{found:#?}"
+        );
     }
 
     #[test]
