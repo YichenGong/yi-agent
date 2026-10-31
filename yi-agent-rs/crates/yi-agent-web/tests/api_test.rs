@@ -281,3 +281,43 @@ async fn get_config_groups_match_every_group_in_fields() {
         "Tools 分组已不存在，出现它说明硬编码残留"
     );
 }
+
+/// HTML 契约：挡住「又加一行硬编码分组」这类回归。
+///
+/// 注意这是**弱保证**——纯文本断言，不执行 JS，无法证明渲染正确。
+/// 真正的渲染正确性靠人工浏览器验收（见 plan 的人工验收清单）。
+#[tokio::test]
+async fn index_html_derives_groups_instead_of_hardcoding_them() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let response = app(dir.path().join("settings.json"))
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        !html.contains("const tabs = ["),
+        "禁止再把分组写死；应从 data.groups 派生"
+    );
+    assert!(html.contains("data.groups"), "分组必须来自 API 数据");
+    assert!(
+        html.contains("GROUP_LABELS"),
+        "显示名需要映射表，否则侧栏显示英文名"
+    );
+    assert!(
+        html.contains("v.min") && html.contains("v.max"),
+        "数字输入必须带上后端给的上下限"
+    );
+    assert!(html.contains("reset-btn"), "必须有「恢复默认」按钮");
+    assert!(
+        html.contains("currentValues[v.key] = null"),
+        "恢复默认的核心是把当前值置 null（save 靠差分检测收进 updates）"
+    );
+}
+
+/// 把响应体当纯文本读出来（HTML 不走 JSON）。
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
