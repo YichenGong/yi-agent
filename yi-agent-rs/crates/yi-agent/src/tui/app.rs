@@ -130,12 +130,16 @@ pub fn run_tui(
     catalog: yi_agent_runtime::models::ModelCatalog,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
+    // Detect the terminal background BEFORE the alternate screen takes over:
+    // the query needs raw mode, and any stray output must land in the normal
+    // scrollback rather than inside a frame being drawn.
+    let theme = TuiTheme::of(crate::tui::theme::detect_theme_from_terminal());
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut history = HistoryState::new();
+    let mut history = HistoryState::with_theme(theme);
     let mut input = InputLine::new();
 
     let channels = TuiChannels {
@@ -162,6 +166,7 @@ pub fn run_tui(
         mcp,
         &config,
         &catalog,
+        theme,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -276,11 +281,16 @@ pub fn run_tui_with_backend<B: Backend>(
         yi_agent_mcp::McpManager::empty(),
         &snapshot_for_tests(),
         &catalog_for_tests(),
+        TuiTheme::DARK,
     )
     .map(|_dropped| ())
 }
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
+///
+/// Forwards [`TuiTheme::DARK`]: the ~31 existing callers assert the historical
+/// look and must not silently change palette. Tests that need a specific theme
+/// call [`run_tui_with_backend_and_events_themed`].
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
@@ -296,7 +306,41 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
 ) -> std::io::Result<()> {
-    let mut history = HistoryState::new();
+    run_tui_with_backend_and_events_themed(
+        terminal,
+        agent_rx,
+        input_tx,
+        interrupt_tx,
+        kill_tx,
+        control_tx,
+        decision_tx,
+        is_running,
+        events,
+        config,
+        catalog,
+        TuiTheme::DARK,
+    )
+}
+
+/// [`run_tui_with_backend_and_events`] with an explicit palette, so a whole
+/// frame can be rendered for a light terminal and inspected cell by cell.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
+    terminal: &mut Terminal<B>,
+    agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    input_tx: &tokio::sync::mpsc::Sender<String>,
+    interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
+    control_tx: &tokio::sync::mpsc::Sender<crate::DriverControl>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: &E,
+    config: &TuiConfigSnapshot,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+    theme: TuiTheme,
+) -> std::io::Result<()> {
+    let mut history = HistoryState::with_theme(theme);
     let mut input = InputLine::new();
     let channels = TuiChannels {
         input: input_tx.clone(),
@@ -321,6 +365,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         yi_agent_mcp::McpManager::empty(),
         config,
         catalog,
+        theme,
     )
     .map(|_dropped| ())
 }
@@ -380,6 +425,7 @@ fn run_loop<B: Backend, E: EventSource>(
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
+    theme: TuiTheme,
 ) -> std::io::Result<usize> {
     let mut current_model: String = model.to_string();
     // 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
@@ -427,10 +473,8 @@ fn run_loop<B: Backend, E: EventSource>(
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        // Task 7 threads the detected theme into `run_loop`; until then the
-        // loop renders with the historical dark palette.
         let initial_queued_lines =
-            crate::tui::queued::render_queued_preview_with(queued.items(), width, TuiTheme::DARK);
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
         let initial_layout = compute_layout(
             area,
             input,
@@ -468,11 +512,10 @@ fn run_loop<B: Backend, E: EventSource>(
             })
             .count()
             .min(queued.len());
-        // Task 7 threads the detected theme here too.
         let final_queued_lines = crate::tui::queued::render_queued_preview_with(
             &queued.items()[promotion_count..],
             width,
-            TuiTheme::DARK,
+            theme,
         );
         let final_layout = compute_layout(
             area,
@@ -544,9 +587,8 @@ fn run_loop<B: Backend, E: EventSource>(
             .capture_viewport_anchor(final_text_width, final_history_area.height)
             .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
-        // Task 7 threads the detected theme here too.
         let queued_lines =
-            crate::tui::queued::render_queued_preview_with(queued.items(), width, TuiTheme::DARK);
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
@@ -593,9 +635,7 @@ fn run_loop<B: Backend, E: EventSource>(
             let history_view = HistoryView {
                 state: history,
                 width: chunks[0].width,
-                // Task 7 threads the detected theme into `run_loop`; until then
-                // the transcript keeps the historical dark look.
-                theme: TuiTheme::DARK,
+                theme,
             };
             f.render_widget(history_view, chunks[0]);
 
@@ -603,17 +643,11 @@ fn run_loop<B: Backend, E: EventSource>(
             if let Some(p) = &popup {
                 let popup_area = chunks[1];
                 if popup_area.height > 0 {
-                    // Task 7 threads the detected theme into `run_loop`; until
-                    // then the popup keeps the historical dark look.
-                    f.render_widget(
-                        build_popup_with(p, popup_area.height, TuiTheme::DARK),
-                        popup_area,
-                    );
+                    f.render_widget(build_popup_with(p, popup_area.height, theme), popup_area);
                 }
             }
 
-            // Status bar. Task 7 threads the detected theme into `run_loop`;
-            // until then this is explicitly the historical dark theme.
+            // Status bar.
             let statusbar_line = render_statusbar_with(
                 &statusbar_state,
                 &task_registry,
@@ -621,7 +655,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 trimmed_history,
                 &current_model,
                 chunks[2].width,
-                TuiTheme::DARK,
+                theme,
             );
             f.render_widget(statusbar_line, chunks[2]);
 
@@ -630,7 +664,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line = build_input_line(input, pending_quit, chunks[5].width);
+            let input_line = build_input_line_with(input, pending_quit, chunks[5].width, theme);
             f.render_widget(input_line, chunks[5]);
 
             if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
@@ -668,6 +702,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &process_snapshots,
                 &process_outputs,
                 chunks[0],
+                theme,
             );
         })?;
         sync_trace_streams(
@@ -1041,22 +1076,23 @@ fn render_runtime_popup(
     process_snapshots: &[yi_agent_tools::ManagedProcessSnapshot],
     process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     area: ratatui::layout::Rect,
+    theme: TuiTheme,
 ) {
     match runtime_popup {
         RuntimePopup::None => {}
         RuntimePopup::Bash(bash_popup) => {
-            render_existing_bash_popup(f, bash_popup, task_registry, area);
+            render_existing_bash_popup(f, bash_popup, task_registry, area, theme);
         }
         RuntimePopup::Processes(ProcessPopup::List(p)) => {
             f.render_widget(Clear, area);
-            // Task 7 threads the detected theme; `Clear` above stays so the
-            // raised surface fills a cleared cell instead of ghosting.
+            // `Clear` above stays so the raised surface fills a cleared cell
+            // instead of ghosting.
             f.render_widget(
                 super::process_popup::render_process_list_popup_with(
                     p,
                     process_snapshots,
                     area,
-                    TuiTheme::DARK,
+                    theme,
                 ),
                 area,
             );
@@ -1067,14 +1103,13 @@ fn render_runtime_popup(
                 .find(|p2| p2.process_id == p.process_id)
             {
                 f.render_widget(Clear, area);
-                // Task 7 threads the detected theme.
                 f.render_widget(
                     super::process_popup::render_process_detail_popup_with(
                         p,
                         process,
                         process_outputs.get(&p.process_id),
                         area,
-                        TuiTheme::DARK,
+                        theme,
                     ),
                     area,
                 );
@@ -1084,14 +1119,8 @@ fn render_runtime_popup(
             f.render_widget(Clear, area);
             match &agents.detail {
                 None => {
-                    // Task 7 threads the detected theme.
                     f.render_widget(
-                        render_subagent_list_with(
-                            &agents.list,
-                            &agents.children,
-                            area,
-                            TuiTheme::DARK,
-                        ),
+                        render_subagent_list_with(&agents.list, &agents.children, area, theme),
                         area,
                     );
                 }
@@ -1101,14 +1130,13 @@ fn render_runtime_popup(
                         awaiting_cancel: agents.awaiting_cancel.is_some(),
                         status: agents.status.as_deref(),
                     };
-                    // Task 7 threads the detected theme.
                     super::trace::render_subagent_detail_with(
                         f,
                         detail,
                         &agents.children,
                         &prompt,
                         area,
-                        TuiTheme::DARK,
+                        theme,
                     );
                 }
             }
@@ -1120,14 +1148,13 @@ fn render_runtime_popup(
             {
                 f.render_widget(Clear, area);
                 let detail = ProcessDetailPopup::new(ck.process_id.clone());
-                // Task 7 threads the detected theme.
                 f.render_widget(
                     super::process_popup::render_process_detail_popup_with(
                         &detail,
                         process,
                         process_outputs.get(&ck.process_id),
                         area,
-                        TuiTheme::DARK,
+                        theme,
                     ),
                     area,
                 );
@@ -1143,6 +1170,7 @@ fn render_existing_bash_popup(
     bash_popup: &BashPopup,
     task_registry: &RunningTaskRegistry,
     area: ratatui::layout::Rect,
+    theme: TuiTheme,
 ) {
     match bash_popup {
         BashPopup::List(p) => {
@@ -1156,23 +1184,16 @@ fn render_existing_bash_popup(
                     .min((p.task_ids.len() as u16 + 2).max(6)),
             };
             f.render_widget(Clear, list_area);
-            // Task 7 threads the detected theme.
             f.render_widget(
-                super::bash_popup::render_list_popup_with(
-                    p,
-                    task_registry,
-                    list_area,
-                    TuiTheme::DARK,
-                ),
+                super::bash_popup::render_list_popup_with(p, task_registry, list_area, theme),
                 list_area,
             );
         }
         BashPopup::Detail(p) => {
             if let Some(task) = task_registry.get(&p.task_id) {
                 f.render_widget(Clear, area);
-                // Task 7 threads the detected theme.
                 f.render_widget(
-                    super::bash_popup::render_detail_popup_with(p, task, area, TuiTheme::DARK),
+                    super::bash_popup::render_detail_popup_with(p, task, area, theme),
                     area,
                 );
             }
@@ -1181,14 +1202,8 @@ fn render_existing_bash_popup(
             if let Some(task) = task_registry.get(&ck.task_id) {
                 f.render_widget(Clear, area);
                 let detail = DetailPopup::new(ck.task_id.clone());
-                // Task 7 threads the detected theme.
                 f.render_widget(
-                    super::bash_popup::render_detail_popup_with(
-                        &detail,
-                        task,
-                        area,
-                        TuiTheme::DARK,
-                    ),
+                    super::bash_popup::render_detail_popup_with(&detail, task, area, theme),
                     area,
                 );
             }
@@ -3560,14 +3575,13 @@ fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("命令"))
 }
 
-fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> Paragraph<'static> {
-    build_input_line_with(input, pending_quit, area_width, TuiTheme::DARK)
-}
-
-/// Theme-aware [`build_input_line`].
+/// The input stripe, painted for `theme`.
 ///
 /// The stripe used a hardcoded `Indexed(240)`, which is a dark gray band on a
-/// light terminal; it now asks the theme for its raised surface instead.
+/// light terminal; it now asks the theme for its raised surface instead. The
+/// foreground is explicit too: `bg_raised` is light in the light theme, so
+/// leaving text at the terminal default would paint dark-terminal light text
+/// onto `#ededed` when a dark terminal is forced to `YI_AGENT_THEME=light`.
 fn build_input_line_with(
     input: &InputLine,
     pending_quit: bool,
@@ -3583,10 +3597,10 @@ fn build_input_line_with(
             prefix,
             Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
         ]))
-        .style(Style::new().bg(theme.bg_raised));
+        .style(Style::new().bg(theme.bg_raised).fg(theme.fg));
     }
     let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
-    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised))
+    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised).fg(theme.fg))
 }
 
 /// Number of terminal lines the input will occupy when rendered.
@@ -5234,6 +5248,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5320,6 +5335,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5383,6 +5399,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5457,6 +5474,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5573,6 +5591,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5646,6 +5665,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5699,6 +5719,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5759,6 +5780,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6154,6 +6176,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6212,6 +6235,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6384,6 +6408,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6745,6 +6770,11 @@ mod tests {
         assert_eq!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
         assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
         assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+        // A raised surface needs an explicit foreground: `bg_raised` is light in
+        // the light theme, so text left at the terminal default would vanish
+        // when a dark terminal is forced to `YI_AGENT_THEME=light`.
+        assert_eq!(dark_buf[(39, 0)].fg, TuiTheme::DARK.fg);
+        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
     }
 
     /// The `Ctrl+C` quit prompt rides the same raised stripe: it used to
@@ -6759,6 +6789,93 @@ mod tests {
         ratatui::widgets::Widget::render(light, area, &mut light_buf);
         assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
         assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+        // Padded cells inherit the paragraph style, so this is the stripe
+        // foreground, not the `再按 Ctrl+C 退出` span's own `warn`.
+        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+    }
+
+    /// Whole-frame acceptance: with the light theme, no cell may be painted with
+    /// a value that was unreadable on a white terminal.
+    ///
+    /// Per-renderer tests can each pass while one call site still bakes in a raw
+    /// color, so this renders the entire frame through the real `run_loop` and
+    /// inspects every cell. `Color::White` is banned as a foreground: `sel_fg`
+    /// is `Rgb(255,255,255)`, a distinct variant, so a legitimate selection is
+    /// not a false positive.
+    #[test]
+    fn light_theme_frame_has_no_unreadable_cells() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Queue real history before the first draw. An empty transcript would
+        // leave the cell renderers (assistant markdown, tool call, tool result)
+        // unexercised, which is where most of the palette lives.
+        agent_tx
+            .try_send(AgentEvent::AssistantText(
+                "**bold** and `code` on a light terminal".into(),
+            ))
+            .unwrap();
+        agent_tx
+            .try_send(AgentEvent::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            })
+            .unwrap();
+        agent_tx
+            .try_send(AgentEvent::ToolResult {
+                id: "call-1".into(),
+                result: yi_agent_core::tool::ToolResult::text("file-a\nfile-b"),
+            })
+            .unwrap();
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events_themed(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::LIGHT,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut bad: Vec<(u16, u16, Color)> = Vec::new();
+        for y in 0..30u16 {
+            for x in 0..100u16 {
+                let cell = &buffer[(x, y)];
+                let offender = matches!(cell.fg, Color::Gray | Color::DarkGray | Color::White)
+                    || cell.bg == Color::Indexed(240);
+                if offender {
+                    bad.push((x, y, cell.fg));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "light theme left {} unreadable cells out of {}; first 5 (x, y, fg): {:?}",
+            bad.len(),
+            30 * 100,
+            &bad[..bad.len().min(5)]
+        );
     }
 
     /// Test that agent events appear in the rendered history area.
@@ -7993,6 +8110,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 

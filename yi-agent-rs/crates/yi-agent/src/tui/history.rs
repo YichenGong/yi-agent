@@ -182,9 +182,9 @@ pub(in crate::tui) struct HistoryCache {
     /// Which palette the cached lines were rendered with.
     ///
     /// Cached lines carry colors baked in at render time, so a theme change has
-    /// to drop them the same way a resize does. Today the theme is fixed for the
-    /// process lifetime; keying the cache keeps a future `/theme` from painting
-    /// stale colors.
+    /// to drop them the same way a resize does. The theme is fixed for the
+    /// process lifetime (detected once at startup), but keying the cache keeps a
+    /// future `/theme` from painting stale colors.
     theme_kind: TuiThemeKind,
     entries: Vec<CachedCell>,
     /// Cell indexes known to need a re-render.
@@ -278,11 +278,24 @@ pub struct HistoryState {
 
 impl HistoryState {
     pub fn new() -> Self {
+        Self::with_theme(TuiTheme::DARK)
+    }
+
+    /// Build an empty state whose render cache already claims `theme`.
+    ///
+    /// The theme is only a cache key, so seeding it costs nothing and buys the
+    /// first frame: without it the cache starts as `Dark`, an idle
+    /// `reconcile_scroll_offset` warms every cell in `DARK`, and the first draw
+    /// on a light terminal immediately throws all of that away to re-render the
+    /// transcript in `LIGHT`.
+    pub fn with_theme(theme: TuiTheme) -> Self {
+        let mut cache = HistoryCache::new(0);
+        cache.theme_kind = theme.kind;
         Self {
             cells: Vec::new(),
             selected: None,
             scroll_offset: 0,
-            cache: RefCell::new(HistoryCache::new(0)),
+            cache: RefCell::new(cache),
             content_generation: Cell::new(0),
             dropped_cells: 0,
         }
