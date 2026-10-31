@@ -2381,7 +2381,6 @@ impl Harness {
                 lead_agent_enabled,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
-                onboarding_env_path: index_dir.path().join(".env"),
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
@@ -4112,7 +4111,6 @@ async fn eof_exits_gracefully() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -4197,7 +4195,6 @@ async fn agent_factory_failure_returns_internal_error() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -4284,7 +4281,6 @@ async fn oversized_frame_returns_err() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -17764,7 +17760,6 @@ impl MergedHarness {
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 lead_agent_enabled: false,
-                onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。

@@ -411,13 +411,9 @@ pub(crate) struct RuntimeAttachments {
     /// 生产的构造点统一调 [`crate::lead_gate::from_process_environment`]，
     /// 测试直接给 `true` / `false`。
     pub(crate) lead_agent_enabled: bool,
-    /// Where the global `.env` lives, for `onboarding/apply`. Injectable for the
-    /// same reason `models_path` is: onboarding must never write the developer's
-    /// real `~/.yi-agent/.env`.
-    pub(crate) onboarding_env_path: PathBuf,
     /// Where `preferences.json` lives, for the `onboarding_dismissed` marker.
-    /// Injectable for the same reason `onboarding_env_path` is: dismissing the
-    /// first-run guide must never touch the developer's real preferences file.
+    /// Injectable for the same reason `models_path` is: dismissing the first-run
+    /// guide must never touch the developer's real preferences file.
     pub(crate) onboarding_preferences_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
     /// Injectable: `resident/*` must be testable without writing the
@@ -1976,8 +1972,6 @@ where
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
-            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
-                .unwrap_or_default(),
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
@@ -2065,8 +2059,6 @@ where
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
-            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
-                .unwrap_or_default(),
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
@@ -3207,7 +3199,6 @@ where
         thread_roots,
         models_path,
         websearch_path,
-        onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
         skills_home,
@@ -3494,9 +3485,9 @@ where
                 macro_rules! app_state {
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
-                        // `onboarding_env_path` / `onboarding_preferences_path` /
-                        // `watchman_home` 四个相邻字段同为 `&Path`,位置一旦
-                        // 写错照样编译通过、却会静默把机器级路径接错。
+                        // `onboarding_preferences_path` / `watchman_home` 三个相邻
+                        // 字段同为 `&Path`,位置一旦写错照样编译通过、却会静默把
+                        // 机器级路径接错。
                         crate::rpc::AppState {
                             hub: &hub,
                             client: &client,
@@ -3506,7 +3497,6 @@ where
                             models_path: &models_path,
                             websearch_path: &websearch_path,
                             probes: &probes,
-                            onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
                             resident_dir: &resident_dir,

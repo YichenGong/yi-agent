@@ -7,15 +7,14 @@ use anyhow::Result;
 /// 是否应自动弹引导：未就绪且用户尚未结束过引导。
 ///
 /// 就绪判定要看**清单**（模型设置的唯一真相源）：清单里已有可用默认条目就不再弹。
-pub(crate) fn should_offer(env_path: &Path, preferences_path: &Path) -> bool {
-    use yi_agent_runtime::onboarding::{Assessment, assess, load_dismissed, read_env_fields};
+pub(crate) fn should_offer(preferences_path: &Path) -> bool {
+    use yi_agent_runtime::onboarding::{Assessment, assess, load_dismissed};
     if load_dismissed(preferences_path) {
         return false;
     }
-    let env = read_env_fields(env_path).unwrap_or_default();
     let catalog =
         yi_agent_runtime::models::load_catalog_from(&yi_agent_runtime::models::models_path());
-    matches!(assess(&env, Some(&catalog)), Assessment::Needed { .. })
+    matches!(assess(Some(&catalog)), Assessment::Needed { .. })
 }
 
 /// provider 的默认 (api_url, model)，与 `config.rs` 的默认值同源。
@@ -168,9 +167,8 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let _home = HomeGuard::set(home.path());
         let dir = tempfile::TempDir::new().unwrap();
-        let env = dir.path().join(".env");
         let prefs = dir.path().join("preferences.json");
-        assert!(should_offer(&env, &prefs));
+        assert!(should_offer(&prefs));
     }
 
     #[test]
@@ -182,18 +180,37 @@ mod tests {
         let _home = HomeGuard::set(home.path());
         write_catalog(home.path());
         let dir = tempfile::TempDir::new().unwrap();
-        let env = dir.path().join(".env");
         let prefs = dir.path().join("preferences.json");
-        assert!(!should_offer(&env, &prefs));
+        assert!(!should_offer(&prefs));
+    }
+
+    /// `.env.migrated` 的存在不影响判定：判定依据是 catalog。
+    #[test]
+    fn a_migrated_env_file_does_not_suppress_the_prompt() {
+        let _lock = HOME_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let dir = home.path().join(".yi-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 一个写满模型键的旧文件，以及迁移留下的 .env.migrated。
+        std::fs::write(dir.join(".env.migrated"), "MODEL_API_KEY=sk-x\n").unwrap();
+        let prefs = home.path().join("preferences.json");
+
+        // 清单为空 → 仍应弹引导。
+        assert!(
+            should_offer(&prefs),
+            "an empty catalog must still offer onboarding"
+        );
     }
 
     #[test]
     fn does_not_offer_after_dismissal() {
         let dir = tempfile::TempDir::new().unwrap();
-        let env = dir.path().join(".env");
         let prefs = dir.path().join("preferences.json");
         yi_agent_runtime::onboarding::save_dismissed(&prefs, true).unwrap();
-        assert!(!should_offer(&env, &prefs));
+        assert!(!should_offer(&prefs));
     }
 
     #[test]

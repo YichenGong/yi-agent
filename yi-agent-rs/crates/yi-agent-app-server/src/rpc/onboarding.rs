@@ -25,7 +25,6 @@ pub(crate) async fn handle(
         // (Observe);apply/dismiss/test 都触及密钥或落盘,需 `Control`。
         "onboarding/status" => {
             match crate::onboarding_rpc::handle_onboarding_request_at(
-                state.onboarding_env_path,
                 state.onboarding_preferences_path,
                 state.models_path,
                 req.method.as_str(),
@@ -78,7 +77,6 @@ pub(crate) async fn handle(
             }
             // 探测已通过,这里只剩校验 + 写盘:同步入口不再发第二次网络请求。
             match crate::onboarding_rpc::handle_onboarding_request_at(
-                state.onboarding_env_path,
                 state.onboarding_preferences_path,
                 state.models_path,
                 "onboarding/apply",
@@ -104,7 +102,6 @@ pub(crate) async fn handle(
                 return Ok(Flow::Continue);
             }
             match crate::onboarding_rpc::handle_onboarding_request_at(
-                state.onboarding_env_path,
                 state.onboarding_preferences_path,
                 state.models_path,
                 "onboarding/dismiss",

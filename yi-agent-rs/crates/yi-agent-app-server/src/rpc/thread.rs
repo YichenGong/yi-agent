@@ -52,14 +52,12 @@ fn missing_model_error(state: &AppState<'_>, session_model_ref: Option<&str>) ->
         return None;
     }
     // 原因列表留给 UI 展示"还差哪几项"，与 `onboarding/status` 同源。
-    let env = yi_agent_runtime::onboarding::read_env_fields(state.onboarding_env_path)
-        .unwrap_or_default();
-    let reasons = match yi_agent_runtime::onboarding::assess(&env, Some(&catalog)) {
+    let reasons = match yi_agent_runtime::onboarding::assess(Some(&catalog)) {
         yi_agent_runtime::onboarding::Assessment::Needed { reasons } => reasons
             .into_iter()
             .map(|m| crate::onboarding_rpc::missing_name(m).to_string())
             .collect(),
-        yi_agent_runtime::onboarding::Assessment::Ready { .. } => Vec::new(),
+        yi_agent_runtime::onboarding::Assessment::Ready => Vec::new(),
     };
     Some(RpcError::model_not_configured(&reasons))
 }

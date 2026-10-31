@@ -1320,7 +1320,7 @@ fn run_agent(cli: Cli) -> Result<()> {
     // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
     // 让 should_offer / prompt 与运行期读点一致。
     let models_path = yi_agent_runtime::models::models_path();
-    if onboarding_prompt::should_offer(&env_path, &prefs_path) {
+    if onboarding_prompt::should_offer(&prefs_path) {
         if let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path) {
             eprintln!("引导未完成：{error}");
         }
@@ -2735,7 +2735,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("run_agent must exist");
-        let offer = ["onboarding_prompt::should_offer(", "&env_path"].concat();
+        let offer = ["onboarding_prompt::should_offer(", "&prefs_path"].concat();
         let global = ["config::resolve_global", "_env_path()"].concat();
         // 宽松加载器：清单里已经有模型（无任何注入）的机器，严格加载器会因为
         // 「没有 key」直接 bail，用户永远起不来。与 `run_headless` 同形——缺 key

@@ -354,9 +354,6 @@ pub(crate) struct AppState<'a> {
     /// 后台探测共用同一张表，保证同名条目的探测不会并发跑两轮。它只是内存态，
     /// 每个 app-server 进程一份（见 `serve()` 里的构造）。
     pub(crate) probes: &'a crate::model_rpc::ProbeRegistry,
-    /// 全局 `.env` 路径,供 `onboarding/apply` 落盘。搬移前臂里的
-    /// `onboarding_env_path`。
-    pub(crate) onboarding_env_path: &'a Path,
     /// 引导是否已关闭的标记文件路径。搬移前臂里的
     /// `onboarding_preferences_path`。
     pub(crate) onboarding_preferences_path: &'a Path,
