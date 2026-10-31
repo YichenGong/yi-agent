@@ -1008,10 +1008,29 @@ B 的具体形态：
    中继自建在内网，而远端在另一张网络上，这条连接建不起来。此时远端仍可正常用
    （stdio 就行），只是手机看不到它。**必须在 UI 上区分"本地可用"与"手机可见"，
    不要让整个连接因为中继失败而失败。**
-2. **中继 URL 要传到远端**。本机从 `preferences.json` 读 `relay_url`
-   （`settings_store.rs:135` 的 `RELAY_URL_KEY`），然后拼进远端命令行：
-   `--relay '<relay_url>?session=<派生 session>'`。这个 URL 是**用户自己的服务地址，
-   不是凭据**，但仍要按 §6 第 3 条校验后再拼进 shell。
+2. **中继 URL 要传到远端**，且**取值来源有两层，env 优先**（易错）：
+
+   ```rust
+   // bridge.rs:186-204
+   fn configured_relay_in(home: Option<&Path>) -> Option<String> {
+       let stored = home.and_then(load_relay_url);      // preferences.json 的 relay_url
+       resolve_relay(std::env::var("YI_AGENT_RELAY").ok().as_deref(), stored.as_deref())
+   }
+   // resolve_relay：非空 env 赢，否则用文件值；两者都 trim，空白视为未设置
+   ```
+
+   所以派生 session 的输入**必须**是这个合并后的值，而不是直接读
+   `preferences.json`。若只读文件，用户在开发时用 `YI_AGENT_RELAY` 覆盖的场景下
+   会出现"桌面连的是环境变量给的中继，远端连的是文件里配置的中继"——
+   手机在 A 中继找远端，远端正连着 B 中继，表现为"项目显示可用但手机连不上"。
+
+   派生后拼进远端命令行：`--relay '<relay_url>?session=<派生 session>'`。
+   这个 URL 是**用户自己的服务地址，不是凭据**，但仍要按 §6 第 3 条校验后再拼进 shell。
+
+   **注意 `relay_url` 里可能已经带 `session`**（`docs/relay-deploy.md` 的示例就是
+   `wss://relay.example.com/connect?session=<id>`）。派生时要**替换**已有的
+   `session` 参数，不是追加——否则会出现 `?session=a&session=b`，中继取哪个
+   取决于实现细节。用 URL API 设 `searchParams.set("session", ...)`。
 3. **远端不参与配对**。配对码由本地铸（`PairingState` 的 `codes_path` 允许同机
    跨进程兑换，但**跨机器不行**）。所以手机配对的永远是"本机"，不是远端——
    这正是"手机多连接"设计成立的基础：手机连的是本机给它的 session 清单。
@@ -1686,7 +1705,12 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 51. **`available` 反映真实状态**：远端 A 正常连着时 `available=true`；
     杀掉 A 的 ssh 后**刷一次** `remote/relayTargets` 得到 `false`
     （验证状态旁路文件被桥接层更新，§4.6）
-52. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+52. **派生用合并后的 relay 值**：设 `YI_AGENT_RELAY` 覆盖
+    `preferences.json`，远端槽位的 `--relay` 必须等于 env 的值（派生后），
+    不能是文件里的旧值（§4.6）
+53. **替换而非追加 session 参数**：`relay_url` 已含 `?session=old` 时，
+    派生结果是 `session=<新值>` 且只出现**一次**（§4.6）
+54. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1740,7 +1764,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **52 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **54 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
