@@ -740,9 +740,11 @@ mod tests {
     /// gray↔white, where the brightest phase was 1.00:1 on white.
     #[test]
     fn spinner_pulses_between_theme_colors() {
-        let mut state = StatusBarState::default();
         // Phase 0 and 180 are the two ends of the sine wave.
-        state.spinner_phase = 270; // sin = -1 → dimmest
+        let mut state = StatusBarState {
+            spinner_phase: 270, // sin = -1 → dimmest
+            ..Default::default()
+        };
         let dim = state.spinner_color_for(TuiTheme::LIGHT);
         state.spinner_phase = 90; // sin = +1 → brightest
         let bright = state.spinner_color_for(TuiTheme::LIGHT);
