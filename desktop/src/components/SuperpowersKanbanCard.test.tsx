@@ -27,6 +27,18 @@ describe("SuperpowersKanbanCard", () => {
     expect(screen.queryByText("/work/tree")).toBeNull();
   });
 
+  it("正在合并的卡有独立角标", () => {
+    // 合并是一次会话回合，卡此时仍是 running；没有角标就与"在写代码"没差别。
+    render(<SuperpowersKanbanCard card={card({ state: "running", merging: true })} />);
+    expect(screen.getByLabelText("正在合并")).toBeTruthy();
+  });
+
+  it("没拿到名额的卡不显示合并角标", () => {
+    render(<SuperpowersKanbanCard card={card({ state: "merge_queued", merging: false })} />);
+    expect(screen.queryByLabelText("正在合并")).toBeNull();
+    expect(screen.getByText("merge_queued")).toBeTruthy();
+  });
+
   it("stale 卡显示角标与最后活动时间", () => {
     // 会话没了但卡还写着 running：看板不改状态，只给人和模型一个可判读的信号。
     render(

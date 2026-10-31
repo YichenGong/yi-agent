@@ -32,6 +32,15 @@ export function SuperpowersKanbanCard({
             !
           </span>
         )}
+        {card.merging && (
+          <span
+            aria-label="正在合并"
+            className="shrink-0 text-sky-400"
+            title="这张卡持有本项目的合并名额，正在合并"
+          >
+            ⇄
+          </span>
+        )}
         {card.stale && (
           <span
             aria-label="会话已不在"
