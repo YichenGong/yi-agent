@@ -215,24 +215,24 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 
 ## 配置放在哪
 
-按优先级从低到高：
+| 层 | 位置 | 用途 |
+|---|---|---|
+| 默认值 | Rust 常量（`yi-agent-runtime/src/config.rs`） | 不需要文件 |
+| 模型 | `~/.yi-agent/models.json` | 设置 → 模型 UI 或 `model/*` RPC |
+| 运行参数 | `~/.yi-agent/settings.json` | 设置 → 运行参数 UI 或 `settings/*` RPC |
+| 临时覆盖 | CLI 参数、真实环境变量 | CI、脚本、一次性试验 |
 
-1. 默认值
-2. 全局配置 `~/.yi-agent/.env`（非模型设置：轮次、压缩、沙箱等）
-3. 模型配置 `~/.yi-agent/models.json`（**模型设置的唯一真相源**）
-4. 命令行参数 / 真实环境变量（临时整包覆盖：`--provider` + `--api-key`）
-
-`~/.yi-agent/.env` 是唯一的 `.env`，没有项目级 `.env`；`--workdir` 只决定工具干活
-的目录，不影响配置来源。配置文件不会写进项目根目录，不会污染你的仓库。
+`YI_AGENT_HOME` 可以把 `~/.yi-agent` 整体换到别处（打包独立实例时用它隔离）。
+`.env` 已不再被读取：存量配置在首次启动时自动迁入 `settings.json`，原文件改名为
+`.env.migrated` 保留取回。`YI_AGENT_WORKDIR` 已下线——工作目录只由 `--workdir`、
+启动目录或桌面端选项目决定。
 
 **一行说明**：`--model` 给的是模型**字符串**；要覆盖它必须同时给出 `--provider`
 与 `--api-key`（`--api-url` 可选）——这是「整包注入」，缺项会直接报错。
 
-**懒人做法**：桌面端「设置 → 模型」图形化配置模型（写 `~/.yi-agent/models.json`）；
-`yi-agent web`（默认 <http://127.0.0.1:7292>）只管理非模型设置。
-
-> 破坏性变更：模型键不再从 `.env` 读取。升级后首次启动会把存量 `.env` 里的活跃
-> 模型键收边进 `models.json`，并把那几行注释掉（`# MIGRATED: ...`）。
+**图形化入口**：桌面端「设置 → 模型」配置模型（写 `~/.yi-agent/models.json`），
+「设置 → 运行参数」配置轮次、压缩、沙箱等（写 `~/.yi-agent/settings.json`）；
+`yi-agent web`（默认 <http://127.0.0.1:7292>）改的是同一份 `settings.json`。
 
 ## 接入 MCP server
 
@@ -286,7 +286,6 @@ MCP（Model Context Protocol）让你把外部工具接进来：GitHub、数据�
 | 换服务商 | `YI_AGENT_PROVIDER`（`anthropic` / `openai`） | `--provider` |
 | 换模型标识 | —— （用设置 UI / `models.json`） | `--model`（须配 `--provider` + `--api-key`） |
 | 自定义 API 地址 | `MODEL_API_URL` | `--api-url` |
-| 指定工作目录 | `YI_AGENT_WORKDIR` | `--workdir` |
 | 单轮最大步数 | `YI_AGENT_MAX_TURNS`（默认 200） | `--max-turns` |
 | 每个 agent 的直接子任务上限 | `YI_AGENT_MAX_DIRECT_CHILDREN`（默认 8） | —— |
 | 子 agent 常驻总容量 | `YI_AGENT_MAX_RESIDENT_SUBAGENTS`（默认 64） | —— |

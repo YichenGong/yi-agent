@@ -233,29 +233,27 @@ rationale: [mobile remote access design](docs/superpowers/specs/2026-10-02-mobil
 
 ## Where configuration lives
 
-Priority, lowest to highest:
+| Layer | Location | Managed by |
+|---|---|---|
+| Defaults | Rust constants (`yi-agent-runtime/src/config.rs`) | no file needed |
+| Models | `~/.yi-agent/models.json` | Settings → Models UI, or `model/*` RPCs |
+| Runtime settings | `~/.yi-agent/settings.json` | Settings → Runtime UI, or `settings/*` RPCs |
+| Temporary overrides | CLI flags, real environment variables | CI, scripts, one-off runs |
 
-1. Built-in defaults
-2. Global config `~/.yi-agent/.env` (non-model settings: turns, compaction, sandbox)
-3. Model config `~/.yi-agent/models.json` (**the single source of truth for models**)
-4. CLI flags / real environment variables (temporary whole-package override:
-   `--provider` + `--api-key`)
-
-`~/.yi-agent/.env` is the only `.env` — there is no project-level one. `--workdir`
-only picks where tools operate; it does not change where config comes from. Config
-never lands in your project root, so your repo stays clean.
+`YI_AGENT_HOME` relocates the whole `~/.yi-agent` directory (used to isolate
+standalone instances). `.env` is no longer read: existing settings are migrated
+into `settings.json` on first start and the old file is renamed to `.env.migrated`
+so nothing is lost. `YI_AGENT_WORKDIR` is gone — the working directory comes only
+from `--workdir`, the launch directory, or the project picked in the desktop app.
 
 **One-liner**: `--model` is a model **string**; overriding it requires the whole
 package (`--provider` + `--api-key`, `--api-url` optional) — a partial injection
 is rejected outright.
 
-**Easy path**: configure models in the desktop app (Settings → Models, writing
-`~/.yi-agent/models.json`); `yi-agent web` (<http://127.0.0.1:7292> by default)
-manages only non-model settings.
-
-> Breaking change: model keys are no longer read from `.env`. On first start after
-> upgrading, the active model keys in `.env` are migrated into `models.json` and
-> those lines are commented out (`# MIGRATED: ...`).
+**GUI entry points**: the desktop app configures models under Settings → Models
+(writing `~/.yi-agent/models.json`) and turns/compaction/sandbox under
+Settings → Runtime (writing `~/.yi-agent/settings.json`); `yi-agent web`
+(<http://127.0.0.1:7292> by default) edits that same `settings.json`.
 
 ## Common settings
 
@@ -266,7 +264,6 @@ manages only non-model settings.
 | Switch provider | `YI_AGENT_PROVIDER` (`anthropic` / `openai`) | `--provider` |
 | Model identifier | — (use the settings UI / `models.json`) | `--model` (needs `--provider` + `--api-key`) |
 | Custom API endpoint | `MODEL_API_URL` | `--api-url` |
-| Set the working directory | `YI_AGENT_WORKDIR` | `--workdir` |
 | Max steps per turn | `YI_AGENT_MAX_TURNS` (default 200) | `--max-turns` |
 | Auto-compact threshold | `YI_AGENT_COMPACT_RATIO` (default 80, percent of context) | `--compact-ratio` |
 | Web search | `BOCHA_API_KEY` | — |
