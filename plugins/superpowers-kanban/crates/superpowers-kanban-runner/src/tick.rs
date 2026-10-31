@@ -38,6 +38,18 @@ pub fn engagement_objective_for_paths(plan_path: &str, spec_path: &str) -> Strin
     )
 }
 
+/// 队列推进开出的合并回合：名额**已经**由 daemon 拿到，所以不再让模型去
+/// `merge-request`（那会撞上自己进程持有的锁，只会拿到 Busy）。
+///
+/// 与 [`merge_objective`] 的差别只有「谁拿的名额」，其余边界（冲突就地解决、
+/// 不 push、不删源分支、成败自己写进卡片状态）完全一致。
+pub fn queued_merge_objective(source: &str, base: &str, workdir: &Path) -> String {
+    format!(
+        "This card was queued for merge by the user and its turn has come. Merge the          branch {source} into {base} in {workdir}. The project merge slot is already          held for you, so do not call `superpowers-kanban merge-request`. Do not push          and do not delete the source branch. Resolve conflicts in place and commit          the merge. When you are done, release the slot with          `superpowers-kanban merge-finish <card-id>` and record the outcome with          `superpowers-kanban state --self <state>`: `done` when          `git merge-base --is-ancestor {source} {base}` succeeds, otherwise          `needs_you` with the reason.",
+        workdir = workdir.display(),
+    )
+}
+
 /// 独立合并卡的 objective：**另一段**文案。
 ///
 /// 与实现轮分开是刻意的（spec §4.6）：同一条「Never merge yourself」若也用在
@@ -170,6 +182,25 @@ mod tests {
                 || objective.contains("do not delete the source branch"),
             "{objective}"
         );
+    }
+
+    /// 队列推进的合并回合不能说「去 merge-request」：名额已由 daemon 持有。
+    #[test]
+    fn the_queued_merge_objective_does_not_ask_for_a_second_grant() {
+        let objective = queued_merge_objective("kanban/card-1", "main", Path::new("/w/merge"));
+        // `format!` 的续行会留下成串空格，比对前先归一。
+        let flat = objective.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("kanban/card-1"), "{objective}");
+        assert!(flat.contains("/w/merge"), "{objective}");
+        assert!(flat.contains("merge slot is already held"), "{objective}");
+        assert!(
+            flat.contains("do not call `superpowers-kanban merge-request`"),
+            "必须明说不要再申请一次：{objective}"
+        );
+        // 收尾动作必须仍在，否则名额永远不还、状态也没人写。
+        assert!(objective.contains("merge-finish"), "{objective}");
+        assert!(objective.contains("state --self"), "{objective}");
+        assert!(objective.contains("Do not push"), "{objective}");
     }
 
     /// 两段文案必须真的不同——否则「拆开」只是改名。

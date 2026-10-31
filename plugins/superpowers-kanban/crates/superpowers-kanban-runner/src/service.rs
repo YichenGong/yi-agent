@@ -532,7 +532,8 @@ impl BoardService {
                     kind: PendingKind::LaunchForMerge,
                 },
             );
-            let objective = crate::tick::merge_objective(
+            // daemon 已代持名额，所以用「不必再申请」的那版文案。
+            let objective = crate::tick::queued_merge_objective(
                 card.source_ref.as_deref().unwrap_or_default(),
                 &base,
                 &workdir,
@@ -1845,6 +1846,14 @@ mod tests {
         } = action;
         assert_eq!(card_id, "card-1");
         assert!(objective.contains("merge"), "{objective}");
+        assert!(
+            objective
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("already held"),
+            "the daemon already holds the gate: {objective}"
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
         let holder = crate::merge_lock::read_holder(&service.state_dir).expect("holder");
         assert_eq!(holder.card_id, "card-1");
