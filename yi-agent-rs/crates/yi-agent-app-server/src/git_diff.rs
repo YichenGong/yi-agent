@@ -4,10 +4,20 @@
 //! PR 的算法，也是「这个会话从分叉点以来改了什么」最贴切的语义。默认分支判定
 //! 见 [`resolve_base`]；全不可用时退化为「仅工作区改动」。
 
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 pub const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+/// 未跟踪文件参与 diff 合成的单文件上限。
+///
+/// 超过它的文件在清单里标 `binary: true`、正文给一行说明,**不读内容**。
+/// 为什么是 1 MiB:`MAX_DIFF_BYTES` 是 256 KiB,一个超过 1 MiB 的未跟踪文件
+/// 无论如何都不可能完整出现在最终 diff 里(前面还有 `truncate`);继续读它
+/// 只是白白占用时间与内存。前端对 `binary: true` 已有占位渲染
+/// (`desktop/src/components/GitDiffView.tsx:187`)。
+pub const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
 
 /// 视图命令的超时。与 bash 的「预期运行时长」无关：这里是展示用命令，
 /// 只读且应当很快；挂住比失败更糟（面板会一直转）。
@@ -152,21 +162,98 @@ pub async fn command_frame(
     }
 }
 
+/// `git_ok` 的单次时间上限。
+///
+/// 与 `VIEW_TIMEOUT` 分开:那个约束「模型给的展示命令」(走沙箱、允许较慢),
+/// 这个约束「我们自己发的只读内省命令」(`rev-parse` / `diff` / `log`,
+/// 正常都是毫秒级)。给 5s 是因为大仓库首次 `git diff` 可能真慢;但
+/// 「`index.lock` 残留」或「仓库在网络挂载点上」应当失败而不是无限等待。
+pub const GIT_OK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `git_ok` 轮询子进程状态的间隔。git 正常返回是毫秒级,10 ms 只多等一轮。
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+thread_local! {
+    /// 本线程最近一次 diff 计算里，是否有 `git_ok` 因超时被放弃。
+    ///
+    /// 用 thread-local 而不是给 `git_ok` 加参数：它有十余个调用点，散布在
+    /// `resolve_base` / `files` / `commits` / `untracked_paths` / `file_diff` /
+    /// `commit_diff` 里，逐个加 `&mut bool` 只会把噪声传到每一层。
+    /// 一次 diff 计算在单个 blocking 线程里同步跑完，故这一位不会跨请求串。
+    static GIT_TIMED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 清掉「本线程有 git 超时」标记。计算入口在开始前调它。
+pub fn reset_git_timeout() {
+    GIT_TIMED_OUT.with(|c| c.set(false));
+}
+
+/// 取走「本线程有 git 超时」标记（读过即清）。
+///
+/// 为什么必须区分这一位：`git_ok` 的 `None` 同时表示「git 说没有」与
+/// 「git 没在 [`GIT_OK_TIMEOUT`] 内返回」。前者是合法的空 diff，后者是失败
+/// （典型成因是残留的 `index.lock`）。不区分就会把挂住渲染成「没有改动」。
+pub fn take_git_timeout() -> bool {
+    GIT_TIMED_OUT.with(|c| c.replace(false))
+}
+
+/// 跑一个子进程,在 `timeout` 内返回它的 stdout(成功时),否则 `None`。
+///
+/// stdout 走**临时文件**而不是管道:管道模式下子进程写满内核缓冲区
+/// (macOS 64 KiB)就会阻塞在 write 上,而我们正在轮询 `try_wait`、没有任何人
+/// 读管道——这是死锁(子进程等我们读,我们等子进程退出)。`git diff` 的输出
+/// 远超 64 KiB 是常态,故管道方案对本项目不可用。
+fn run_git_bounded(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    let out_file = tempfile::NamedTempFile::new().ok()?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::from(out_file.reopen().ok()?))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                return std::fs::read_to_string(out_file.path()).ok();
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // 必须 wait:否则留下僵尸进程。
+                    let _ = child.wait();
+                    // 只有这一支是「超时」：非零退出码与 spawn 失败都是 git
+                    // 给出的真实结论，仍保留「没有」的语义。
+                    GIT_TIMED_OUT.with(|c| c.set(true));
+                    return None;
+                }
+                std::thread::sleep(GIT_POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// 跑 git 并返回成功时的 stdout 文本。
 ///
 /// 只认 success：`rev-parse --verify` / `merge-base` / `log` 这类命令失败时
 /// 本就该当作「没有」，而 diff 类命令的退出码差异由 HTML 生成后的内容决定，
 /// 故所有调用点都只需「有内容」或「没有」两态。
+///
+/// 有界等待见 [`GIT_OK_TIMEOUT`]：无上界时,一个挂住的 git 会把调用方
+/// 永久占住(修复前是主循环)。
 fn git_ok(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run_git_bounded("git", &owned, directory, GIT_OK_TIMEOUT)
 }
 
 /// 该 ref 能否在本仓库解析。
@@ -308,10 +395,17 @@ fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
     }
     for path in untracked_paths(repo) {
         let full = root.join(&path);
-        let additions = std::fs::read(&full)
-            .map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64)
-            .unwrap_or(0);
-        let binary = is_binary(&full);
+        // 一次读取服务两件事：数换行、判二进制。原实现为此各做一次
+        // 全量 `std::fs::read`，纯粹是重复 IO。
+        let bytes = read_untracked_capped(&full);
+        let (additions, binary) = match bytes.as_deref() {
+            Some(b) => (
+                b.iter().filter(|&&c| c == b'\n').count() as u64,
+                looks_binary(b),
+            ),
+            // 超上限 / 非普通文件 / 读不到：视为二进制，(0 行新增)。
+            None => (0, true),
+        };
         out.push(FileStat {
             path,
             status: "A".into(),
@@ -369,11 +463,35 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|&b| b == 0)
 }
 
-fn is_binary(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    looks_binary(&bytes)
+/// 读未跟踪文件；超过 [`MAX_UNTRACKED_FILE_BYTES`] 或读失败返回 `None`。
+///
+/// `None` 的语义 = 「不参与内容合成」：调用方据此标 binary / 跳过正文。
+///
+/// 两道闸，各管一个失效模式：
+/// - 读之前按 `metadata` 挡下超限与非普通文件；
+/// - 读的时候再按上限截断（`.take`），故超大文件最多只被读进 1 MiB + 1 字节。
+///
+/// 只有闸不行：`metadata` 看到的是**那一刻**的长度，文件在 stat 与 read 之间
+/// 长大（或本就是个增长中的日志）时 `read` 仍会按新长度全量分配。只有 `.take`
+/// 也不行：非普通文件的 `len` 不可信，见下一条。
+///
+/// 非普通文件（FIFO / 设备 / socket）的 `len` 常为 0，能骗过尺寸闸；而读
+/// FIFO 在无写端时会一直阻塞，故与 `rpc/image.rs` 同一条判据直接拒绝。
+fn read_untracked_capped(full: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(full).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(full)
+        .ok()?
+        .take(MAX_UNTRACKED_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_UNTRACKED_FILE_BYTES {
+        return None;
+    }
+    Some(buf)
 }
 
 /// 未跟踪文件合成一份「整文件新增」的 unified diff（避免触碰用户索引）。
@@ -383,7 +501,15 @@ fn is_binary(path: &Path) -> bool {
 fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
-        let Ok(bytes) = std::fs::read(root.join(path)) else {
+        let Some(bytes) = read_untracked_capped(&root.join(path)) else {
+            // 超上限 / 非普通文件 / 读不到：给一行明确说明，而不是留下一个
+            // 空白条目 (D1 的另一半：清单里有、点开却是空的)。措辞不写
+            // 「too large」——拒绝的原因也可能是 FIFO/设备，见 `read_untracked_capped`。
+            out.push_str(&format!(
+                "diff --git a/{path} b/{path}\nnew file mode 100644\n\
+                 Binary files /dev/null and b/{path} differ (not shown: too large \
+                 or not a regular file)\n"
+            ));
             continue;
         };
         out.push_str(&format!(
@@ -391,8 +517,8 @@ fn untracked_diff(root: &Path, paths: &[String]) -> String {
         ));
         // 二进制按 git 自己的约定给一行说明。此前这里是 `read_to_string` 失败就
         // `continue`，结果是面板把该文件列为 `A`、点开却是空白——D1 的另一半。
-        // 判据与 `is_binary` 共用 `looks_binary`，否则会出现「清单标 binary、
-        // 正文却当文本渲染」这类自相矛盾。
+        // 判据与 `files` 里的清单标志共用 `looks_binary`，否则会出现「清单标
+        // binary、正文却当文本渲染」这类自相矛盾。
         if looks_binary(&bytes) {
             out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
             continue;
@@ -644,6 +770,40 @@ mod tests {
                 .success()
         );
         dir
+    }
+
+    /// `run_git_bounded` 必须在上界内放弃,并回收子进程。
+    ///
+    /// 用 `/bin/sh -c 'sleep 600'` 冒充挂住的 git:它确实是「一个不会自己退出
+    /// 的子进程」,这正是残留 `index.lock` 或网络挂载点上的 git 的表现。
+    /// 不走 PATH 注入,故不会污染并行测试。
+    #[test]
+    fn run_git_bounded_gives_up_after_the_timeout() {
+        let started = std::time::Instant::now();
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 600".to_string()],
+            std::path::Path::new("/tmp"),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        assert!(out.is_none(), "a hung child must yield None");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must give up near the bound, took {elapsed:?}"
+        );
+    }
+
+    /// 正常返回的子进程要照常给出 stdout,且不受上界影响。
+    #[test]
+    fn run_git_bounded_returns_stdout_on_success() {
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "printf 'hi\\n'".to_string()],
+            std::path::Path::new("/tmp"),
+            Duration::from_secs(5),
+        );
+        assert_eq!(out.as_deref(), Some("hi\n"));
     }
 
     #[test]
@@ -1276,7 +1436,7 @@ mod tests {
 
     /// 「清单说它是二进制」与「点开后的正文」必须一致，且都不能是空白。
     ///
-    /// 判据若两处不同（`is_binary` 只看 NUL，正文却把非法 UTF-8 也当二进制），
+    /// 判据若两处不同（清单只看 NUL，正文却把非法 UTF-8 也当二进制），
     /// 就会出现清单标 text、正文说 binary 这类自相矛盾。这里同时钉住两种输入的
     /// 归属：含 NUL 的走二进制说明；非法 UTF-8 但无 NUL 的按文本有损渲染。
     #[test]
@@ -1305,5 +1465,180 @@ mod tests {
                 "body agrees with the list flag for {path}: {diff:?}"
             );
         }
+    }
+
+    /// 超过上限的未跟踪文件不读内容:清单标 binary,正文给一行说明。
+    ///
+    /// 原实现对每个未跟踪文件做三次全量 `std::fs::read`(数换行 / 判二进制 /
+    /// 合成 unified diff),没有大小上限。截断只在最后做,故 `MAX_DIFF_BYTES`
+    /// 只约束输出、不约束输入——一个 512 MiB 的未跟踪文件会被完整读进内存。
+    #[test]
+    fn untracked_file_over_the_cap_is_not_read_into_the_diff() {
+        let dir = repo();
+        let big = dir.path().join("huge.log");
+        // 2 MiB,超过 MAX_UNTRACKED_FILE_BYTES(1 MiB)。
+        let chunk = "x".repeat(1024 * 1024);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big).unwrap();
+            f.write_all(chunk.as_bytes()).unwrap();
+            f.write_all(chunk.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let d = thread_diff(dir.path(), Some("trunk"), None);
+        let stat = d
+            .files
+            .iter()
+            .find(|f| f.path == "huge.log")
+            .expect("the oversized untracked file must still be listed");
+        assert!(
+            stat.binary,
+            "an oversized untracked file must be reported as binary, not read as text"
+        );
+        assert!(
+            d.unified_diff
+                .contains("not shown: too large or not a regular file"),
+            "the body must say why it is not rendered: {}",
+            &d.unified_diff[..d.unified_diff.len().min(400)]
+        );
+        // 正文里绝不能出现那 2 MiB 的内容。
+        assert!(
+            !d.unified_diff.contains(&"x".repeat(4096)),
+            "the file content must not be read"
+        );
+    }
+
+    /// 超时必须被记下来，且读取即清（否则会污染同线程的下一次计算）。
+    ///
+    /// 这一条只证明**标记机制**本身：真的让 `git` 挂住需要构造仓库级故障
+    /// （如占住 `index.lock`），故 `git_ok` 的端到端超时上报仍无自动化覆盖。
+    #[test]
+    fn run_git_bounded_records_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        reset_git_timeout();
+        assert!(!take_git_timeout(), "a fresh thread must start clean");
+
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            dir.path(),
+            Duration::from_millis(100),
+        );
+        assert!(out.is_none(), "a timed-out command yields no stdout");
+        assert!(take_git_timeout(), "the timeout branch must raise the flag");
+        assert!(!take_git_timeout(), "taking the flag must clear it");
+
+        // 正常退出不能置位：只有超时才算失败。
+        GIT_TIMED_OUT.with(|c| c.set(true));
+        reset_git_timeout();
+        assert!(!take_git_timeout(), "reset must clear a stale flag");
+        assert!(
+            run_git_bounded(
+                "/bin/sh",
+                &["-c".to_string(), "exit 0".to_string()],
+                dir.path(),
+                Duration::from_secs(5)
+            )
+            .is_some()
+        );
+        assert!(
+            !take_git_timeout(),
+            "a successful run must not raise the flag"
+        );
+        assert!(
+            run_git_bounded(
+                "/bin/sh",
+                &["-c".to_string(), "exit 3".to_string()],
+                dir.path(),
+                Duration::from_secs(5)
+            )
+            .is_none()
+        );
+        assert!(
+            !take_git_timeout(),
+            "a non-zero exit is a real failure, not a timeout"
+        );
+    }
+
+    /// 上限边界：正好 `MAX_UNTRACKED_FILE_BYTES` 字节仍接受，多 1 字节即拒绝。
+    ///
+    /// 关键是把 `>` 与 `>=` 的区别钉住：上限语义是「可以等于」。
+    #[test]
+    fn read_untracked_capped_stops_reading_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("exact.txt");
+        std::fs::write(&exact, vec![b'x'; MAX_UNTRACKED_FILE_BYTES as usize]).unwrap();
+        let got = read_untracked_capped(&exact).expect("exactly at the cap must be accepted");
+        assert_eq!(got.len() as u64, MAX_UNTRACKED_FILE_BYTES);
+
+        let over = dir.path().join("over.txt");
+        std::fs::write(&over, vec![b'x'; MAX_UNTRACKED_FILE_BYTES as usize + 1]).unwrap();
+        assert!(
+            read_untracked_capped(&over).is_none(),
+            "one byte over the cap must be rejected"
+        );
+    }
+
+    /// 非普通文件一律拒绝：设备 / FIFO 的 `len` 不可信（常为 0），读 FIFO 在
+    /// 无写端时会一直阻塞。
+    ///
+    /// 承重的是 `/dev/null`，不是目录：目录的 `metadata().len()` 虽也非 0（本机实测
+    /// 64），但真正拦下它的是随后的 `read`——macOS 上 `File::open(dir)` 成功而
+    /// `read_to_end` 返回 `EISDIR`，`.ok()?` 一样给出 `None`。所以拿目录当样本，
+    /// 删掉 `!meta.is_file()` 这道闸测试仍然绿，没有回归价值。
+    ///
+    /// `/dev/null` 没有这个退路：`size=0`（过尺寸闸）、`crw-rw-rw-`
+    /// （`is_file() == false`）、且 `open` 后 `read` 成功返回 0 字节。于是
+    /// 旧代码（丢掉 `is_file()` 检查）对它会走 `metadata` → 尺寸闸通过 →
+    /// `fs::read` 返回 `Ok(vec![])` → `Some(vec![])`，新代码返回 `None`。
+    /// 这才是真 RED——实测：删掉 `is_file()` 后本测试失败，且探到的旧返回值
+    /// 就是 `Some([])`；同样的删除下「只测目录」的临时用例仍然绿。
+    #[test]
+    fn read_untracked_capped_refuses_a_non_regular_file() {
+        let dev_null = Path::new("/dev/null");
+        let meta = std::fs::metadata(dev_null).expect("/dev/null must exist");
+        assert_eq!(
+            meta.len(),
+            0,
+            "premise: a device reports len 0, so it slips past the byte cap"
+        );
+        assert!(
+            !meta.is_file(),
+            "premise: a char device must not look like a regular file"
+        );
+        assert_eq!(
+            std::fs::read(dev_null).expect("reading /dev/null must succeed"),
+            Vec::<u8>::new(),
+            "premise: the old code's unbounded read returns Ok(empty) here, \
+             so only the !is_file() guard can reject it"
+        );
+        assert!(
+            read_untracked_capped(dev_null).is_none(),
+            "/dev/null must never be read as file content"
+        );
+
+        // 目录也拒绝，但它单独不能证明这道闸（见上面的理由）。
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(
+            read_untracked_capped(&sub).is_none(),
+            "a directory must never be read as file content"
+        );
+    }
+
+    /// 正常大小的未跟踪文件仍按文本合成 diff（不能被上限误伤）。
+    #[test]
+    fn untracked_file_under_the_cap_is_still_rendered_as_text() {
+        let dir = repo();
+        std::fs::write(dir.path().join("note.txt"), "hello\nworld\n").unwrap();
+        let d = thread_diff(dir.path(), Some("trunk"), None);
+        let stat = d.files.iter().find(|f| f.path == "note.txt").unwrap();
+        assert!(!stat.binary, "a small text file must not be marked binary");
+        assert!(
+            d.unified_diff.contains("+hello"),
+            "small untracked text must still be rendered: {}",
+            d.unified_diff
+        );
     }
 }

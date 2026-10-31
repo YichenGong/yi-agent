@@ -54,9 +54,12 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+# `git_ok` 把 git 的 stdout 写进临时文件而不是管道:管道会在输出超过内核
+# 缓冲区(64 KiB)时死锁——我们在轮询 try_wait、没人读管道,`git diff` 的输出
+# 又常态超过 64 KiB。
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # Endpoint stubbing for the `onboarding/*` connection probe tests.
 wiremock = "0.6"
 tokio-tungstenite = "0.29"

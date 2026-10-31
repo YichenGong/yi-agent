@@ -20534,3 +20534,293 @@ async fn a_failed_append_still_records_the_completion() {
 async fn mark_read_routes_to_the_thread_domain() {
     assert_eq!(domain_for("thread/markRead"), Domain::Thread);
 }
+
+/// `thread/delete` 必须把该会话的视图帧一并收走。
+///
+/// 帧表以 `thread_id` 为键、进程生命周期内常驻，且全仓库只有插没有删。
+/// `thread/view/read` 有 `require_known_thread` 前挡，故残留不影响正确性,
+/// 但每删一个看过 diff 的会话就永久留一份(单条上限 256 KiB)。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_delete_drops_the_view_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        // 直接注入一帧，等价于 `pump_git_diff_notifications` 写帧。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: Some("git log --oneline".to_string()),
+                as_kind: "text".to_string(),
+                exit_code: Some(0),
+                stdout: "x".repeat(1024),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+    assert!(
+        h.view_frames.lock().await.contains_key(&tid),
+        "precondition: the frame must be present before delete"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":30,"method":"thread/delete","params":{{"threadId":"{tid}","force":true}}}}"#
+    ))
+    .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(30)))
+        .await;
+
+    assert!(
+        !h.view_frames.lock().await.contains_key(&tid),
+        "thread/delete must drop the view frame for {tid}"
+    );
+    h.shutdown().await;
+}
+
+/// `image/read` 只应触碰被请求的那一段，而不是把整个文件读进内存再切片。
+///
+/// 判据用**相对比较**：同一个 20 MiB 文件，取最后一页 1 字节的耗时不应显著
+/// 高于取首页 1 字节。全量读实现下两者都是「读满 20 MiB」，比值接近 1 但
+/// **绝对开销与文件大小成正比**;区间读实现下两者都只碰 16 字节头 + 1 字节。
+/// 故这里改用更锐利的判据：页内字节数相同,比较 20 MiB 与 1 KiB 两个文件。
+#[tokio::test(flavor = "multi_thread")]
+async fn image_read_does_not_scale_with_file_size() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 两张「png」：魔数正确即可通过 guess_format，其余填充随机性无关。
+    let png_magic: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let big_path = dir.path().join("big.png");
+    let mut big = png_magic.to_vec();
+    big.resize(20 * 1024 * 1024, 0x41);
+    std::fs::write(&big_path, &big).unwrap();
+
+    let small_path = dir.path().join("small.png");
+    let mut small = png_magic.to_vec();
+    small.resize(1024, 0x41);
+    std::fs::write(&small_path, &small).unwrap();
+
+    // 取各自**最后一页**的第一字节：两者读取量都是 1 字节。
+    let big_offset = big.len() as u64 - 1;
+    let small_offset = small.len() as u64 - 1;
+
+    // 自由函数而不是闭包：闭包捕获 &mut h 后无法在循环里连续 await 两次。
+    async fn time_one_read(
+        h: &mut Harness,
+        tid: &str,
+        path: &str,
+        offset: u64,
+        id: u64,
+    ) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"image/read","params":{{"threadId":"{tid}","path":"{path}","offset":{offset},"maxBytes":1}}}}"#
+        ))
+        .await;
+        let v = h
+            .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(id)))
+            .await;
+        assert_eq!(v["result"]["nextOffset"], serde_json::Value::Null, "{v}");
+        started.elapsed()
+    }
+
+    // 各跑三次取最小值，压掉文件系统缓存冷启动的抖动。串行 await，
+    // 不能用 join!/select!——那会交错两次读取，测不出单次开销。
+    let mut big_best = std::time::Duration::MAX;
+    let mut small_best = std::time::Duration::MAX;
+    let mut id = 80u64;
+    for _ in 0..3 {
+        big_best = big_best.min(time_one_read(&mut h, &tid, "big.png", big_offset, id).await);
+        id += 1;
+        small_best =
+            small_best.min(time_one_read(&mut h, &tid, "small.png", small_offset, id).await);
+        id += 1;
+    }
+    assert!(
+        big_best < small_best * 4,
+        "one 1-byte read must not scale with file size: \
+         20MiB={big_best:?} 1KiB={small_best:?}"
+    );
+    h.shutdown().await;
+}
+
+/// `thread/diff/read` 不得把主循环占住。
+///
+/// 该臂在 async handler 里同步跑 git(5+ 次子进程)并全量读所有未跟踪文件。
+/// 判据:一条需要扫大量未跟踪文件的 diff 读取之后,紧随其后的 `thread/list`
+/// 必须很快应答——它证明主循环已经回到 `select!`。
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_read_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 一个没写进 .gitignore 的产物目录：60 个 8 MiB 未跟踪文件。
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+
+    // 先量基线：空载下一条 thread/list 的往返。
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":70,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(70)))
+        .await;
+    let baseline = t0.elapsed();
+
+    // 发一条 diff 读取，紧接着发 list：后者必须不被前者挡住。
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":71,"method":"thread/diff/read","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":72,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(72)))
+        .await;
+    let blocked = t1.elapsed();
+
+    // 相对判据：同一进程同一磁盘上，被挡住时是 1000 倍量级（实测 1101x）。
+    // 用 50 倍留足 CI 抖动余量，同时远小于阻塞量级。
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a diff read must not block the main loop: \
+         baseline={baseline:?} list_behind_diff={blocked:?}"
+    );
+    // 两条响应都得回来，确认 diff 本身也没被弄坏。
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(71)))
+        .await;
+    assert!(v["result"].is_object(), "diff/read must still answer: {v}");
+    h.shutdown().await;
+}
+
+/// `thread/diff/read` 的 panic 兜底必须按**调用方期望的形状**返回。
+///
+/// 整线程请求（只带 `threadId`，`useDiffState` 的 `loadThreadDiff` 发的就是
+/// 这个）期望 `ThreadDiffResult`；带 `commit` / `path` 的单文件请求期望
+/// `DiffTextResult`。两者字段不同，而前端 `setThreadDiff` 不做形状检查、
+/// `GitDiffView` 直接解引用 `files.length`——整线程请求若收到单文件形状，
+/// 面板必然崩。故钉死这两条兜底形状。
+#[test]
+fn diff_read_panic_fallback_matches_the_callers_shape() {
+    // 单文件请求：原样保留 DiffTextResult 形状。
+    let text = crate::rpc::thread::diff_read_fallback(true, Some("origin/main"));
+    assert_eq!(
+        text,
+        serde_json::json!({ "unifiedDiff": "", "truncated": false }),
+        "commit/path requests expect DiffTextResult and nothing else"
+    );
+
+    // 整线程请求：必须是字段齐全的空 ThreadDiffResult。
+    let whole = crate::rpc::thread::diff_read_fallback(false, Some("origin/main"));
+    assert_eq!(
+        whole,
+        serde_json::json!({
+            "base": "origin/main",
+            "baseKind": "none",
+            "mergeBase": serde_json::Value::Null,
+            "commits": [],
+            "files": [],
+            "unifiedDiff": "",
+            "truncated": false,
+        }),
+        "whole-thread requests expect a well-formed ThreadDiffResult"
+    );
+
+    // 无 `base` 时必须显式给 `null`，而不是把这个字段整个省掉。
+    let whole_no_base = crate::rpc::thread::diff_read_fallback(false, None);
+    assert_eq!(whole_no_base["base"], serde_json::Value::Null);
+}
+
+/// `thread/view/read?refresh=true` 同样不得占住主循环。
+///
+/// 它的 `structured_frame` 分支同步跑 thread_diff(5+ 次 git);命令帧分支虽然
+/// 是 async,但 `command_frame` 开头同步构造 SandboxPolicy,后者调
+/// `Path::canonicalize`(在已卸载的挂载点上会卡住),也不经过任何 await。
+#[tokio::test(flavor = "multi_thread")]
+async fn view_read_refresh_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+    {
+        // 结构化帧(无 command)：refresh 会走 structured_frame -> thread_diff。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: None,
+                as_kind: "diff".to_string(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":90,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(90)))
+        .await;
+    let baseline = t0.elapsed();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":91,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":92,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(92)))
+        .await;
+    let blocked = t1.elapsed();
+
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a view refresh must not block the main loop: \
+         baseline={baseline:?} list_behind_refresh={blocked:?}"
+    );
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(91)))
+        .await;
+    assert!(v["result"].is_object(), "view/read must still answer: {v}");
+    h.shutdown().await;
+}
