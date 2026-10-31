@@ -1,3 +1,4 @@
+use crate::tui::theme::TuiTheme;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
@@ -117,19 +118,34 @@ fn status_word(status: &ProcessStatus) -> &'static str {
     }
 }
 
-fn status_color(status: &ProcessStatus) -> Color {
+/// Status is an attention signal: in flight is `warn`, ready is `success`,
+/// exited is `fg_faint`, killed or failed is `danger`.
+fn status_color_with(status: &ProcessStatus, theme: TuiTheme) -> Color {
     match status {
-        ProcessStatus::Starting | ProcessStatus::Running => Color::Yellow,
-        ProcessStatus::Ready => Color::Green,
-        ProcessStatus::Exited { .. } => Color::DarkGray,
-        ProcessStatus::Killed | ProcessStatus::FailedToStart { .. } => Color::Red,
+        ProcessStatus::Starting | ProcessStatus::Running => theme.warn,
+        ProcessStatus::Ready => theme.success,
+        ProcessStatus::Exited { .. } => theme.fg_faint,
+        ProcessStatus::Killed | ProcessStatus::FailedToStart { .. } => theme.danger,
     }
 }
 
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_process_list_popup_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_process_list_popup<'a>(
     popup: &'a ProcessListPopup,
     processes: &'a [ManagedProcessSnapshot],
+    area: Rect,
+) -> Paragraph<'a> {
+    render_process_list_popup_with(popup, processes, area, TuiTheme::DARK)
+}
+
+/// Theme-aware [`render_process_list_popup`]. Also paints the raised surface.
+pub fn render_process_list_popup_with<'a>(
+    popup: &'a ProcessListPopup,
+    processes: &'a [ManagedProcessSnapshot],
     _area: Rect,
+    theme: TuiTheme,
 ) -> Paragraph<'a> {
     let lines: Vec<Line> = processes
         .iter()
@@ -141,9 +157,9 @@ pub fn render_process_list_popup<'a>(
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into());
             let style = if i == popup.selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.sel_bg).fg(theme.sel_fg)
             } else {
-                Style::new().fg(status_color(&process.status))
+                Style::new().fg(status_color_with(&process.status, theme))
             };
             Line::styled(
                 format!(
@@ -159,23 +175,43 @@ pub fn render_process_list_popup<'a>(
         })
         .collect();
 
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("processes (Up/Down select, Enter open, Tab switch, q close)"),
-    )
+    Paragraph::new(lines)
+        .style(Style::new().bg(theme.bg_raised))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("processes (Up/Down select, Enter open, Tab switch, q close)"),
+        )
 }
 
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_process_detail_popup_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_process_detail_popup(
     popup: &ProcessDetailPopup,
     process: &ManagedProcessSnapshot,
     output: Option<&ProcessReadResult>,
     area: Rect,
 ) -> Paragraph<'static> {
+    render_process_detail_popup_with(popup, process, output, area, TuiTheme::DARK)
+}
+
+/// Theme-aware [`render_process_detail_popup`]. The raised surface is painted
+/// under the text so `Clear` leaves a card rather than a hole.
+pub fn render_process_detail_popup_with(
+    popup: &ProcessDetailPopup,
+    process: &ManagedProcessSnapshot,
+    output: Option<&ProcessReadResult>,
+    area: Rect,
+    theme: TuiTheme,
+) -> Paragraph<'static> {
     let scroll = process_detail_scroll(popup, process, output, area);
-    Paragraph::new(process_detail_lines(process, output, area.width))
-        .alignment(Alignment::Left)
-        .scroll((scroll as u16, 0))
+    Paragraph::new(process_detail_lines_with(
+        process, output, area.width, theme,
+    ))
+    .style(Style::new().bg(theme.bg_raised))
+    .alignment(Alignment::Left)
+    .scroll((scroll as u16, 0))
 }
 
 pub fn process_detail_line_count(
@@ -183,6 +219,8 @@ pub fn process_detail_line_count(
     output: Option<&ProcessReadResult>,
     width: u16,
 ) -> usize {
+    // Folding depends on the width only, so the count is theme-independent and
+    // this can stay on the `DARK` default.
     process_detail_lines(process, output, width).len()
 }
 
@@ -199,10 +237,20 @@ pub fn process_detail_scroll(
     }
 }
 
-pub fn process_detail_lines(
+/// Detail lines with the colors of [`TuiTheme::DARK`].
+fn process_detail_lines(
     process: &ManagedProcessSnapshot,
     output: Option<&ProcessReadResult>,
     width: u16,
+) -> Vec<Line<'static>> {
+    process_detail_lines_with(process, output, width, TuiTheme::DARK)
+}
+
+fn process_detail_lines_with(
+    process: &ManagedProcessSnapshot,
+    output: Option<&ProcessReadResult>,
+    width: u16,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
     let mut lines = Vec::new();
@@ -225,7 +273,7 @@ pub fn process_detail_lines(
             process.elapsed_sec,
             process.exit_code
         ),
-        Style::new().fg(status_color(&process.status)),
+        Style::new().fg(status_color_with(&process.status, theme)),
         &mut lines,
     );
     fold(format!(" cwd: {}", process.cwd), Style::new(), &mut lines);
@@ -240,29 +288,29 @@ pub fn process_detail_lines(
         &mut lines,
     );
     lines.push(Line::raw(""));
-    lines.push(Line::styled("stdout:", Style::new().fg(Color::DarkGray)));
+    lines.push(Line::styled("stdout:", Style::new().fg(theme.fg_faint)));
     match output.map(|o| o.stdout.as_str()).filter(|s| !s.is_empty()) {
         Some(stdout) => {
             for line in stdout.lines() {
                 fold(line.to_string(), Style::new(), &mut lines);
             }
         }
-        None => lines.push(Line::styled("(empty)", Style::new().fg(Color::DarkGray))),
+        None => lines.push(Line::styled("(empty)", Style::new().fg(theme.fg_faint))),
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("stderr:", Style::new().fg(Color::DarkGray)));
+    lines.push(Line::styled("stderr:", Style::new().fg(theme.fg_faint)));
     match output.map(|o| o.stderr.as_str()).filter(|s| !s.is_empty()) {
         Some(stderr) => {
             for line in stderr.lines() {
                 fold(line.to_string(), Style::new(), &mut lines);
             }
         }
-        None => lines.push(Line::styled("(empty)", Style::new().fg(Color::DarkGray))),
+        None => lines.push(Line::styled("(empty)", Style::new().fg(theme.fg_faint))),
     }
     lines.push(Line::raw(""));
     fold(
         " [q] back  [k] kill  [Up/Down] scroll  [f] follow  [Tab] switch".to_string(),
-        Style::new().fg(Color::DarkGray),
+        Style::new().fg(theme.fg_faint),
         &mut lines,
     );
     lines
@@ -313,6 +361,85 @@ mod tests {
         assert!(text.contains("dev"));
         assert!(text.contains("ready"));
         assert!(text.contains("1234"));
+    }
+
+    #[test]
+    fn process_popups_paint_the_theme_raised_surface_on_light() {
+        use crate::tui::theme::TuiTheme;
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+
+        let processes = vec![snapshot("proc_1", Some("dev"), ProcessStatus::Running)];
+        let output = ProcessReadResult {
+            process_id: "proc_1".into(),
+            name: Some("dev".into()),
+            stdout: "listening\n".into(),
+            stderr: String::new(),
+            next_cursor: 10,
+            truncated: false,
+            status: ProcessStatus::Running,
+            ready: true,
+        };
+
+        // List view: the card must have an edge on a light terminal.
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            render_process_list_popup_with(
+                &ProcessListPopup::new(),
+                &processes,
+                area,
+                TuiTheme::LIGHT,
+            ),
+            area,
+            &mut buf,
+        );
+        assert_eq!(buf[(59, 7)].bg, TuiTheme::LIGHT.bg_raised);
+        assert_ne!(buf[(59, 7)].bg, Color::Reset);
+
+        // Detail view: same guarantee.
+        let detail_area = Rect::new(0, 0, 60, 10);
+        let mut detail_buf = Buffer::empty(detail_area);
+        Widget::render(
+            render_process_detail_popup_with(
+                &ProcessDetailPopup::new("proc_1".into()),
+                &processes[0],
+                Some(&output),
+                detail_area,
+                TuiTheme::LIGHT,
+            ),
+            detail_area,
+            &mut detail_buf,
+        );
+        assert_eq!(detail_buf[(59, 9)].bg, TuiTheme::LIGHT.bg_raised);
+    }
+
+    /// The selected row used a hardcoded ANSI `Blue` background.
+    #[test]
+    fn process_list_selected_row_uses_the_theme_selection() {
+        use crate::tui::theme::TuiTheme;
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+
+        let processes = vec![
+            snapshot("proc_1", Some("dev"), ProcessStatus::Running),
+            snapshot("proc_2", Some("web"), ProcessStatus::Ready),
+        ];
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            render_process_list_popup_with(
+                &ProcessListPopup::new(),
+                &processes,
+                area,
+                TuiTheme::LIGHT,
+            ),
+            area,
+            &mut buf,
+        );
+        assert_eq!(buf[(1, 1)].bg, TuiTheme::LIGHT.sel_bg);
+        assert_ne!(buf[(1, 1)].bg, Color::Blue);
+        assert_eq!(buf[(1, 2)].bg, TuiTheme::LIGHT.bg_raised);
     }
 
     fn assert_lines_fit(lines: &[Line<'static>], width: u16, what: &str) {

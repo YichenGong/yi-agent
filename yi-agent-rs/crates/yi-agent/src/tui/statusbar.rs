@@ -2,14 +2,16 @@
 //!
 //! The status bar state ticks at 30hz (driven by the TUI poll loop) and
 //! linearly interpolates the displayed token counts toward the latest
-//! target reported by `ProviderEvent::Usage`. The running-task dot uses
-//! a gray-to-white breathing pulse to make activity visible at a glance.
+//! target reported by `ProviderEvent::Usage`. The running-task dot breathes
+//! between two theme colors so the pulse stays visible on light and dark
+//! terminals alike.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::state::{RunningTaskRegistry, TaskStatus};
+use crate::tui::theme::TuiTheme;
 
 /// State for the status bar. Tick at ~30hz for smooth interpolation + spinner.
 #[derive(Debug, Clone, Default)]
@@ -113,13 +115,24 @@ impl StatusBarState {
     pub fn spinner_hue(&self) -> u32 {
         self.spinner_phase
     }
+    /// Breathing dot for the default (dark) theme.
+    ///
+    /// Kept for callers that predate theming; new call sites should pass the
+    /// active theme to [`StatusBarState::spinner_color_for`]. `render_statusbar_with`
+    /// uses the theme-aware form, so this only has test callers today.
+    #[allow(dead_code)]
     pub fn spinner_color(&self) -> Color {
-        // Gray-to-white breathing: brightness oscillates in [100, 255].
-        // spinner_phase is 0..360; map to a sine wave for a soft pulse.
+        self.spinner_color_for(TuiTheme::DARK)
+    }
+
+    /// Breathing dot between the theme's faint and body foreground.
+    ///
+    /// The old gray↔white ramp peaked at `Rgb(255,255,255)`, which is 1.00:1 on
+    /// a white background — the dot vanished once per pulse on light terminals.
+    pub fn spinner_color_for(&self, theme: TuiTheme) -> Color {
         let phase = self.spinner_phase as f32 * std::f32::consts::PI / 180.0;
-        let v = 100.0 + 77.5 * (phase.sin() + 1.0); // (sin+1)/2 * 155 + 100 → [100, 255]
-        let v = v.round() as u8;
-        Color::Rgb(v, v, v)
+        let t = (phase.sin() + 1.0) / 2.0; // 0.0 dim ..= 1.0 bright
+        lerp_color(theme.fg_faint, theme.fg, t)
     }
 }
 
@@ -150,6 +163,16 @@ fn estimate_tokens(text: &str) -> u64 {
     (ascii as f32 / 4.0 + non_ascii as f32 / 1.5) as u64
 }
 
+/// Linear RGB interpolation. Used for the spinner ramp so both endpoints are
+/// theme-controlled.
+fn lerp_color(from: Color, to: Color, t: f32) -> Color {
+    let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (from, to) else {
+        return to;
+    };
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(mix(fr, tr), mix(fg, tg), mix(fb, tb))
+}
+
 /// Format an integer with thousands separators (e.g., 12345 → "12,345").
 pub fn format_thousands(n: u64) -> String {
     let s = n.to_string();
@@ -171,6 +194,11 @@ pub fn format_thousands(n: u64) -> String {
 ///   `已略去 N 条更早的历史`  (only when history cells were dropped at the cap)
 ///   `prefill <n>  decode <m>`
 ///   `<model>`
+///
+/// Dark-theme forwarder. The TUI draws with [`render_statusbar_with`] so it can
+/// pass the detected theme; this keeps the pre-theming signature available
+/// (tests call it) and only has test callers today.
+#[allow(dead_code)]
 pub fn render_statusbar<'a>(
     state: &'a StatusBarState,
     tasks: &'a RunningTaskRegistry,
@@ -178,6 +206,29 @@ pub fn render_statusbar<'a>(
     trimmed_history: usize,
     model: &'a str,
     width: u16,
+) -> Line<'a> {
+    render_statusbar_with(
+        state,
+        tasks,
+        active_process_count,
+        trimmed_history,
+        model,
+        width,
+        TuiTheme::DARK,
+    )
+}
+
+/// Theme-aware [`render_statusbar`]. Every color comes from a semantic slot so
+/// the row stays readable on a light terminal instead of relying on ANSI slots
+/// (`Gray`/`DarkGray`) whose contrast depends on the user's palette.
+pub fn render_statusbar_with<'a>(
+    state: &'a StatusBarState,
+    tasks: &'a RunningTaskRegistry,
+    active_process_count: usize,
+    trimmed_history: usize,
+    model: &'a str,
+    width: u16,
+    theme: TuiTheme,
 ) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
     // The status row is exactly one terminal row tall, so the assembled line
@@ -200,7 +251,7 @@ pub fn render_statusbar<'a>(
         .filter(|t| t.status == TaskStatus::Running)
         .collect();
     if !running.is_empty() {
-        let dot = Span::styled("●", Style::new().fg(state.spinner_color()));
+        let dot = Span::styled("●", Style::new().fg(state.spinner_color_for(theme)));
         let count = running.len();
         let oldest = running
             .iter()
@@ -234,7 +285,7 @@ pub fn render_statusbar<'a>(
             &mut spans,
             Span::styled(
                 format!("已略去 {trimmed_history} 条更早的历史  "),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme.fg_faint),
             ),
             &mut used,
         );
@@ -245,7 +296,7 @@ pub fn render_statusbar<'a>(
         &mut spans,
         Span::styled(
             format_thousands(state.display_input_tokens()),
-            Style::new().fg(Color::Gray),
+            Style::new().fg(theme.fg_muted),
         ),
         &mut used,
     );
@@ -254,7 +305,7 @@ pub fn render_statusbar<'a>(
         &mut spans,
         Span::styled(
             format_thousands(state.display_output_tokens()),
-            Style::new().fg(Color::Gray),
+            Style::new().fg(theme.fg_muted),
         ),
         &mut used,
     );
@@ -265,7 +316,7 @@ pub fn render_statusbar<'a>(
         &mut spans,
         Span::styled(
             crate::tui::wrap::truncate_to_width(model, budget.saturating_sub(used)),
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme.fg_faint),
         ),
         &mut used,
     );
@@ -661,6 +712,69 @@ mod tests {
         assert_eq!(
             s.target_output, 0,
             "decode target should reset when tool execution begins"
+        );
+    }
+
+    /// The prefill/decode counters used `Color::Gray`, which is 1.90:1 on a
+    /// white background — effectively invisible.
+    #[test]
+    fn token_counters_use_theme_muted_not_raw_gray() {
+        let mut state = StatusBarState::default();
+        state.set_token_target(1200, 340);
+        // `Line` borrows the registry, so it needs a named local.
+        let tasks = RunningTaskRegistry::default();
+        let line = render_statusbar_with(&state, &tasks, 0, 0, "m", 80, TuiTheme::LIGHT);
+        let flat: Vec<_> = line.spans.iter().collect();
+        assert!(
+            flat.iter()
+                .any(|s| s.style.fg == Some(TuiTheme::LIGHT.fg_muted)),
+            "expected a span painted with the light theme's muted foreground"
+        );
+        assert!(
+            !flat.iter().any(|s| s.style.fg == Some(Color::Gray)),
+            "raw Color::Gray must not reach the light theme"
+        );
+    }
+
+    /// The breathing dot interpolates between two theme colors instead of
+    /// gray↔white, where the brightest phase was 1.00:1 on white.
+    #[test]
+    fn spinner_pulses_between_theme_colors() {
+        // Phase 0 and 180 are the two ends of the sine wave.
+        let mut state = StatusBarState {
+            spinner_phase: 270, // sin = -1 → dimmest
+            ..Default::default()
+        };
+        let dim = state.spinner_color_for(TuiTheme::LIGHT);
+        state.spinner_phase = 90; // sin = +1 → brightest
+        let bright = state.spinner_color_for(TuiTheme::LIGHT);
+        assert_eq!(dim, TuiTheme::LIGHT.fg_faint);
+        assert_eq!(bright, TuiTheme::LIGHT.fg);
+    }
+
+    /// The trimmed-history notice and the model name were `Color::DarkGray`,
+    /// which is near-invisible on a white background.
+    #[test]
+    fn faint_segments_use_theme_faint_not_raw_dark_gray() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::default();
+        let line = render_statusbar_with(&state, &tasks, 0, 3, "model", 80, TuiTheme::LIGHT);
+        assert!(
+            !line
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::DarkGray)),
+            "raw Color::DarkGray must not reach the light theme"
+        );
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(TuiTheme::LIGHT.fg_faint),
+            "the trimmed-history notice must be faint"
+        );
+        assert_eq!(
+            line.spans.last().map(|s| s.style.fg),
+            Some(Some(TuiTheme::LIGHT.fg_faint)),
+            "the model name must be faint"
         );
     }
 }

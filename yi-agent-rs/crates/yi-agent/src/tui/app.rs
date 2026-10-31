@@ -12,7 +12,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -32,9 +32,10 @@ use super::slash::{
     render_mcp_status,
 };
 use super::state::RunningTaskRegistry;
-use super::statusbar::{StatusBarState, render_statusbar};
+use super::statusbar::{StatusBarState, render_statusbar_with};
+use super::theme::TuiTheme;
 use super::trace::{
-    SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list,
+    SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list_with,
 };
 
 const HISTORY_WHEEL_LINES: usize = 3;
@@ -129,12 +130,16 @@ pub fn run_tui(
     catalog: yi_agent_runtime::models::ModelCatalog,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
+    // Detect the terminal background BEFORE the alternate screen takes over:
+    // the query needs raw mode, and any stray output must land in the normal
+    // scrollback rather than inside a frame being drawn.
+    let theme = TuiTheme::of(crate::tui::theme::detect_theme_from_terminal());
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut history = HistoryState::new();
+    let mut history = HistoryState::with_theme(theme);
     let mut input = InputLine::new();
 
     let channels = TuiChannels {
@@ -161,6 +166,7 @@ pub fn run_tui(
         mcp,
         &config,
         &catalog,
+        theme,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -275,11 +281,16 @@ pub fn run_tui_with_backend<B: Backend>(
         yi_agent_mcp::McpManager::empty(),
         &snapshot_for_tests(),
         &catalog_for_tests(),
+        TuiTheme::DARK,
     )
     .map(|_dropped| ())
 }
 
 /// Testable variant: accepts a custom EventSource for injecting fake key events.
+///
+/// Forwards [`TuiTheme::DARK`]: the ~31 existing callers assert the historical
+/// look and must not silently change palette. Tests that need a specific theme
+/// call [`run_tui_with_backend_and_events_themed`].
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
@@ -295,7 +306,41 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
 ) -> std::io::Result<()> {
-    let mut history = HistoryState::new();
+    run_tui_with_backend_and_events_themed(
+        terminal,
+        agent_rx,
+        input_tx,
+        interrupt_tx,
+        kill_tx,
+        control_tx,
+        decision_tx,
+        is_running,
+        events,
+        config,
+        catalog,
+        TuiTheme::DARK,
+    )
+}
+
+/// [`run_tui_with_backend_and_events`] with an explicit palette, so a whole
+/// frame can be rendered for a light terminal and inspected cell by cell.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
+    terminal: &mut Terminal<B>,
+    agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    input_tx: &tokio::sync::mpsc::Sender<String>,
+    interrupt_tx: &tokio::sync::mpsc::Sender<()>,
+    kill_tx: &tokio::sync::mpsc::Sender<String>,
+    control_tx: &tokio::sync::mpsc::Sender<crate::DriverControl>,
+    decision_tx: &tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: &E,
+    config: &TuiConfigSnapshot,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+    theme: TuiTheme,
+) -> std::io::Result<()> {
+    let mut history = HistoryState::with_theme(theme);
     let mut input = InputLine::new();
     let channels = TuiChannels {
         input: input_tx.clone(),
@@ -320,6 +365,7 @@ pub fn run_tui_with_backend_and_events<B: Backend, E: EventSource>(
         yi_agent_mcp::McpManager::empty(),
         config,
         catalog,
+        theme,
     )
     .map(|_dropped| ())
 }
@@ -379,6 +425,7 @@ fn run_loop<B: Backend, E: EventSource>(
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
+    theme: TuiTheme,
 ) -> std::io::Result<usize> {
     let mut current_model: String = model.to_string();
     // 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
@@ -426,7 +473,8 @@ fn run_loop<B: Backend, E: EventSource>(
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let initial_queued_lines = crate::tui::queued::render_queued_preview(queued.items(), width);
+        let initial_queued_lines =
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
         let initial_layout = compute_layout(
             area,
             input,
@@ -464,8 +512,11 @@ fn run_loop<B: Backend, E: EventSource>(
             })
             .count()
             .min(queued.len());
-        let final_queued_lines =
-            crate::tui::queued::render_queued_preview(&queued.items()[promotion_count..], width);
+        let final_queued_lines = crate::tui::queued::render_queued_preview_with(
+            &queued.items()[promotion_count..],
+            width,
+            theme,
+        );
         let final_layout = compute_layout(
             area,
             input,
@@ -536,7 +587,8 @@ fn run_loop<B: Backend, E: EventSource>(
             .capture_viewport_anchor(final_text_width, final_history_area.height)
             .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
-        let queued_lines = crate::tui::queued::render_queued_preview(queued.items(), width);
+        let queued_lines =
+            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
         statusbar_state.tick();
@@ -583,6 +635,7 @@ fn run_loop<B: Backend, E: EventSource>(
             let history_view = HistoryView {
                 state: history,
                 width: chunks[0].width,
+                theme,
             };
             f.render_widget(history_view, chunks[0]);
 
@@ -590,18 +643,19 @@ fn run_loop<B: Backend, E: EventSource>(
             if let Some(p) = &popup {
                 let popup_area = chunks[1];
                 if popup_area.height > 0 {
-                    f.render_widget(build_popup(p, popup_area.height), popup_area);
+                    f.render_widget(build_popup_with(p, popup_area.height, theme), popup_area);
                 }
             }
 
-            // Status bar
-            let statusbar_line = render_statusbar(
+            // Status bar.
+            let statusbar_line = render_statusbar_with(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
                 trimmed_history,
                 &current_model,
                 chunks[2].width,
+                theme,
             );
             f.render_widget(statusbar_line, chunks[2]);
 
@@ -610,7 +664,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line = build_input_line(input, pending_quit, chunks[5].width);
+            let input_line = build_input_line_with(input, pending_quit, chunks[5].width, theme);
             f.render_widget(input_line, chunks[5]);
 
             if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
@@ -648,6 +702,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &process_snapshots,
                 &process_outputs,
                 chunks[0],
+                theme,
             );
         })?;
         sync_trace_streams(
@@ -1021,16 +1076,24 @@ fn render_runtime_popup(
     process_snapshots: &[yi_agent_tools::ManagedProcessSnapshot],
     process_outputs: &std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
     area: ratatui::layout::Rect,
+    theme: TuiTheme,
 ) {
     match runtime_popup {
         RuntimePopup::None => {}
         RuntimePopup::Bash(bash_popup) => {
-            render_existing_bash_popup(f, bash_popup, task_registry, area);
+            render_existing_bash_popup(f, bash_popup, task_registry, area, theme);
         }
         RuntimePopup::Processes(ProcessPopup::List(p)) => {
             f.render_widget(Clear, area);
+            // `Clear` above stays so the raised surface fills a cleared cell
+            // instead of ghosting.
             f.render_widget(
-                super::process_popup::render_process_list_popup(p, process_snapshots, area),
+                super::process_popup::render_process_list_popup_with(
+                    p,
+                    process_snapshots,
+                    area,
+                    theme,
+                ),
                 area,
             );
         }
@@ -1041,11 +1104,12 @@ fn render_runtime_popup(
             {
                 f.render_widget(Clear, area);
                 f.render_widget(
-                    super::process_popup::render_process_detail_popup(
+                    super::process_popup::render_process_detail_popup_with(
                         p,
                         process,
                         process_outputs.get(&p.process_id),
                         area,
+                        theme,
                     ),
                     area,
                 );
@@ -1056,7 +1120,7 @@ fn render_runtime_popup(
             match &agents.detail {
                 None => {
                     f.render_widget(
-                        render_subagent_list(&agents.list, &agents.children, area),
+                        render_subagent_list_with(&agents.list, &agents.children, area, theme),
                         area,
                     );
                 }
@@ -1066,12 +1130,13 @@ fn render_runtime_popup(
                         awaiting_cancel: agents.awaiting_cancel.is_some(),
                         status: agents.status.as_deref(),
                     };
-                    super::trace::render_subagent_detail(
+                    super::trace::render_subagent_detail_with(
                         f,
                         detail,
                         &agents.children,
                         &prompt,
                         area,
+                        theme,
                     );
                 }
             }
@@ -1084,11 +1149,12 @@ fn render_runtime_popup(
                 f.render_widget(Clear, area);
                 let detail = ProcessDetailPopup::new(ck.process_id.clone());
                 f.render_widget(
-                    super::process_popup::render_process_detail_popup(
+                    super::process_popup::render_process_detail_popup_with(
                         &detail,
                         process,
                         process_outputs.get(&ck.process_id),
                         area,
+                        theme,
                     ),
                     area,
                 );
@@ -1104,6 +1170,7 @@ fn render_existing_bash_popup(
     bash_popup: &BashPopup,
     task_registry: &RunningTaskRegistry,
     area: ratatui::layout::Rect,
+    theme: TuiTheme,
 ) {
     match bash_popup {
         BashPopup::List(p) => {
@@ -1118,14 +1185,17 @@ fn render_existing_bash_popup(
             };
             f.render_widget(Clear, list_area);
             f.render_widget(
-                super::bash_popup::render_list_popup(p, task_registry, list_area),
+                super::bash_popup::render_list_popup_with(p, task_registry, list_area, theme),
                 list_area,
             );
         }
         BashPopup::Detail(p) => {
             if let Some(task) = task_registry.get(&p.task_id) {
                 f.render_widget(Clear, area);
-                f.render_widget(super::bash_popup::render_detail_popup(p, task, area), area);
+                f.render_widget(
+                    super::bash_popup::render_detail_popup_with(p, task, area, theme),
+                    area,
+                );
             }
         }
         BashPopup::ConfirmKill(ck) => {
@@ -1133,7 +1203,7 @@ fn render_existing_bash_popup(
                 f.render_widget(Clear, area);
                 let detail = DetailPopup::new(ck.task_id.clone());
                 f.render_widget(
-                    super::bash_popup::render_detail_popup(&detail, task, area),
+                    super::bash_popup::render_detail_popup_with(&detail, task, area, theme),
                     area,
                 );
             }
@@ -3476,7 +3546,7 @@ fn format_agents_summary(
 /// asked for. Only the windowed commands are drawn; the renderer clips the
 /// rest, so rendering the whole list would hide the highlighted row once the
 /// selection scrolls past the visible rows.
-fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
+fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -> Paragraph<'a> {
     let content_height = height.saturating_sub(2) as usize;
     let window = popup.visible(content_height);
     let window_start = popup.window_start(content_height);
@@ -3494,7 +3564,7 @@ fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
             let desc = cmd.description();
             let is_selected = window_start + i == popup.selected_index();
             let style = if is_selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.sel_bg).fg(theme.sel_fg)
             } else {
                 Style::new()
             };
@@ -3505,7 +3575,19 @@ fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("命令"))
 }
 
-fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> Paragraph<'static> {
+/// The input stripe, painted for `theme`.
+///
+/// The stripe used a hardcoded `Indexed(240)`, which is a dark gray band on a
+/// light terminal; it now asks the theme for its raised surface instead. The
+/// foreground is explicit too: `bg_raised` is light in the light theme, so
+/// leaving text at the terminal default would paint dark-terminal light text
+/// onto `#ededed` when a dark terminal is forced to `YI_AGENT_THEME=light`.
+fn build_input_line_with(
+    input: &InputLine,
+    pending_quit: bool,
+    area_width: u16,
+    theme: TuiTheme,
+) -> Paragraph<'static> {
     let prefix = Span::styled(
         "> ",
         Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
@@ -3513,12 +3595,12 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled("再按 Ctrl+C 退出", Style::new().fg(Color::Yellow)),
+            Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
         ]))
-        .style(Style::new().bg(Color::Indexed(240)));
+        .style(Style::new().bg(theme.bg_raised).fg(theme.fg));
     }
     let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
-    Paragraph::new(Text::from(lines)).style(Style::new().bg(Color::Indexed(240)))
+    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised).fg(theme.fg))
 }
 
 /// Number of terminal lines the input will occupy when rendered.
@@ -3581,8 +3663,8 @@ fn compute_layout(
 /// with `"  "` so the cursor column is visually aligned. Wrapping is
 /// character-based using unicode display width (so CJK / wide chars work).
 ///
-/// The character at `cursor` (byte offset) is rendered with reverse video
-/// (white background, black foreground) so the user can see the cursor.
+/// The character at `cursor` (byte offset) is rendered with reverse video so
+/// the user can see the cursor.
 fn wrap_input_buffer(
     buffer: &str,
     cursor: usize,
@@ -3591,7 +3673,11 @@ fn wrap_input_buffer(
 ) -> Vec<Line<'static>> {
     const PREFIX_LEN: usize = 2; // "> " or "  "
     let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
-    let cursor_style = Style::new().fg(Color::Black).bg(Color::White);
+    // Reverse video instead of a hardcoded white block: REVERSED is resolved by
+    // the terminal against its own background, so the cursor stays visible on
+    // both light and dark themes. A fixed `bg(White)` is 1.00:1 on a white
+    // terminal — literally invisible.
+    let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
 
     // Helper to build spans for a chunk of text, applying cursor_style to the
     // character at the cursor byte offset if it falls within this chunk.
@@ -3704,6 +3790,7 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+    use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -5161,6 +5248,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5247,6 +5335,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5310,6 +5399,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5384,6 +5474,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5500,6 +5591,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5573,6 +5665,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5626,6 +5719,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -5686,6 +5780,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6081,6 +6176,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6139,6 +6235,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6311,6 +6408,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 
@@ -6652,6 +6750,131 @@ mod tests {
             compute_input_height(&inp, false, 20),
             2,
             "10 cjk = 20 cells wraps"
+        );
+    }
+
+    /// The input stripe must follow the theme: on a light terminal the old
+    /// hardcoded `Indexed(240)` painted a dark gray band across a white screen.
+    #[test]
+    fn input_stripe_uses_theme_raised() {
+        let input = InputLine::new();
+        let dark = build_input_line_with(&input, false, 40, TuiTheme::DARK);
+        let light = build_input_line_with(&input, false, 40, TuiTheme::LIGHT);
+        // Paragraph style is not directly readable, so render one row into a
+        // scratch buffer and inspect the background of the padded cells.
+        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        let mut dark_buf = ratatui::buffer::Buffer::empty(area);
+        let mut light_buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(dark, area, &mut dark_buf);
+        ratatui::widgets::Widget::render(light, area, &mut light_buf);
+        assert_eq!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
+        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+        // A raised surface needs an explicit foreground: `bg_raised` is light in
+        // the light theme, so text left at the terminal default would vanish
+        // when a dark terminal is forced to `YI_AGENT_THEME=light`.
+        assert_eq!(dark_buf[(39, 0)].fg, TuiTheme::DARK.fg);
+        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+    }
+
+    /// The `Ctrl+C` quit prompt rides the same raised stripe: it used to
+    /// paint its own `Indexed(240)` band, so on a light terminal the hint
+    /// flashed as a dark strip over a white screen.
+    #[test]
+    fn pending_quit_stripe_uses_theme_raised() {
+        let input = InputLine::new();
+        let light = build_input_line_with(&input, true, 40, TuiTheme::LIGHT);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        let mut light_buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(light, area, &mut light_buf);
+        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+        // Padded cells inherit the paragraph style, so this is the stripe
+        // foreground, not the `再按 Ctrl+C 退出` span's own `warn`.
+        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+    }
+
+    /// Whole-frame acceptance: with the light theme, no cell may be painted with
+    /// a value that was unreadable on a white terminal.
+    ///
+    /// Per-renderer tests can each pass while one call site still bakes in a raw
+    /// color, so this renders the entire frame through the real `run_loop` and
+    /// inspects every cell. `Color::White` is banned as a foreground: `sel_fg`
+    /// is `Rgb(255,255,255)`, a distinct variant, so a legitimate selection is
+    /// not a false positive.
+    #[test]
+    fn light_theme_frame_has_no_unreadable_cells() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Queue real history before the first draw. An empty transcript would
+        // leave the cell renderers (assistant markdown, tool call, tool result)
+        // unexercised, which is where most of the palette lives.
+        agent_tx
+            .try_send(AgentEvent::AssistantText(
+                "**bold** and `code` on a light terminal".into(),
+            ))
+            .unwrap();
+        agent_tx
+            .try_send(AgentEvent::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            })
+            .unwrap();
+        agent_tx
+            .try_send(AgentEvent::ToolResult {
+                id: "call-1".into(),
+                result: yi_agent_core::tool::ToolResult::text("file-a\nfile-b"),
+            })
+            .unwrap();
+        let events = Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))]));
+        let source = ScriptedEvents { events };
+
+        run_tui_with_backend_and_events_themed(
+            &mut terminal,
+            &mut agent_rx,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+            &is_running,
+            &source,
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::LIGHT,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut bad: Vec<(u16, u16, Color)> = Vec::new();
+        for y in 0..30u16 {
+            for x in 0..100u16 {
+                let cell = &buffer[(x, y)];
+                let offender = matches!(cell.fg, Color::Gray | Color::DarkGray | Color::White)
+                    || cell.bg == Color::Indexed(240);
+                if offender {
+                    bad.push((x, y, cell.fg));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "light theme left {} unreadable cells out of {}; first 5 (x, y, fg): {:?}",
+            bad.len(),
+            30 * 100,
+            &bad[..bad.len().min(5)]
         );
     }
 
@@ -7399,8 +7622,8 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let highlight_row = (0..24u16)
-            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let highlight_row =
+            (0..24u16).find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == TuiTheme::DARK.sel_bg));
         let row = highlight_row.expect("the highlighted command row must be visible");
         let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
         assert!(
@@ -7463,8 +7686,8 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let highlight_row = (0..14u16)
-            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let highlight_row =
+            (0..14u16).find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == TuiTheme::DARK.sel_bg));
         let row = highlight_row.expect("the highlighted command row must be visible");
         let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
         assert!(
@@ -7592,8 +7815,8 @@ mod tests {
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc" — cursor should be at position 3 (after 'c').
-        // With reverse video, at least one cell in the input row should have
-        // a white background.
+        // With reverse video, at least one cell in the input row should be
+        // rendered with the REVERSED modifier.
         let events = Rc::new(RefCell::new(vec![
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
@@ -7617,22 +7840,19 @@ mod tests {
         )
         .unwrap();
 
-        // Check the input row for a cell with white background (reverse video cursor)
+        // The cursor is reverse video, not a hardcoded white block: a white
+        // block is invisible on a white terminal (contrast 1.00:1).
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
-            // Look for a cell with white background (Color::White)
-            if cell.bg == ratatui::style::Color::White {
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
                 found_cursor = true;
                 break;
             }
         }
-        assert!(
-            found_cursor,
-            "expected a cursor cell with white background in input row"
-        );
+        assert!(found_cursor, "expected a REVERSED cursor cell in input row");
     }
 
     /// When the buffer is empty, the cursor should still be visible (at position 0).
@@ -7676,7 +7896,7 @@ mod tests {
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
-            if cell.bg == ratatui::style::Color::White {
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
                 found_cursor = true;
                 break;
             }
@@ -7730,23 +7950,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
         let cursor_cell = &buffer[(4, input_row)];
-        assert_eq!(
-            cursor_cell.fg,
-            ratatui::style::Color::Black,
-            "cursor character 'c' should have black foreground"
-        );
-        assert_eq!(
-            cursor_cell.bg,
-            ratatui::style::Color::White,
-            "cursor character 'c' should have white background"
+        assert!(
+            cursor_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "cursor character 'c' should be rendered reversed"
         );
 
         // The 'a' character (not at cursor) should NOT have reverse video
         let non_cursor_cell = &buffer[(2, input_row)];
-        assert_ne!(
-            non_cursor_cell.bg,
-            ratatui::style::Color::White,
-            "non-cursor character 'a' should not have white background"
+        assert!(
+            !non_cursor_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "non-cursor character 'a' should not be reversed"
         );
     }
 
@@ -7861,6 +8078,7 @@ mod tests {
         let _ = HistoryView {
             state: &history,
             width: 80,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(warm_width);
 
@@ -7892,6 +8110,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
+            TuiTheme::DARK,
         )
         .unwrap();
 

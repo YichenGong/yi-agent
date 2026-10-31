@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::cell::{CallState, HistoryCell};
 use super::history::{HistoryState, HistoryView};
+use super::theme::TuiTheme;
 use yi_agent_core::subagent::trace::TraceFact;
 
 /// The persisted row kinds the daemon can report, and what a subscription asks
@@ -358,19 +359,44 @@ impl SubagentListState {
     }
 }
 
+/// State marker color, with the colors of [`TuiTheme::DARK`].
+///
+/// Kept as the pre-theming helper and used as the documented dark default;
+/// render paths that know the terminal background call [`state_color_with`].
+#[allow(dead_code)]
 fn state_color(state: &str) -> Color {
+    state_color_with(state, TuiTheme::DARK)
+}
+
+/// Completion is `success`, failure and cancellation are `danger`, in-flight
+/// states are `warn`. An unknown state must not be a raw ANSI slot: it was
+/// `DarkGray` (2.34:1 on dark), so it falls back to the faint slot.
+fn state_color_with(state: &str, theme: TuiTheme) -> Color {
     match state {
-        "completed" | "completed_no_changes" => Color::Green,
-        "failed" | "cancelled" => Color::Red,
-        "running" | "waiting_for_children" => Color::Yellow,
-        _ => Color::DarkGray,
+        "completed" | "completed_no_changes" => theme.success,
+        "failed" | "cancelled" => theme.danger,
+        "running" | "waiting_for_children" => theme.warn,
+        _ => theme.fg_faint,
     }
 }
 
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_subagent_list_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_subagent_list(
     popup: &TraceListPopup,
     children: &SubagentListState,
+    area: Rect,
+) -> Paragraph<'static> {
+    render_subagent_list_with(popup, children, area, TuiTheme::DARK)
+}
+
+/// Theme-aware [`render_subagent_list`]. Also paints the raised surface.
+pub fn render_subagent_list_with(
+    popup: &TraceListPopup,
+    children: &SubagentListState,
     _area: Rect,
+    theme: TuiTheme,
 ) -> Paragraph<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if children.is_empty() {
@@ -390,21 +416,23 @@ pub fn render_subagent_list(
             Span::raw(marker),
             Span::styled(
                 format!("[{}] ", item.state),
-                Style::default().fg(state_color(&item.state)),
+                Style::default().fg(state_color_with(&item.state, theme)),
             ),
             Span::raw(label),
-            Span::styled(step, Style::default().fg(Color::DarkGray)),
+            Span::styled(step, Style::default().fg(theme.fg_faint)),
         ]));
         lines.push(Line::styled(
             format!("    {}", item.task_id),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_faint),
         ));
     }
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("子 agent (Enter 查看, Esc 关闭)"),
-    )
+    Paragraph::new(lines)
+        .style(Style::new().bg(theme.bg_raised))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("子 agent (Enter 查看, Esc 关闭)"),
+        )
 }
 
 /// The children of `task_id`, in daemon order. The root's children are the
@@ -433,6 +461,10 @@ pub fn drill_targets<'a>(
 ///
 /// The trace body is rendered by [`HistoryView`], the same widget the main
 /// transcript uses, so folding and scrolling behave identically in both places.
+///
+/// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+/// background must use [`render_subagent_detail_with`].
+#[allow(dead_code)] // Kept as the pre-theming signature; `app.rs` uses `_with`.
 pub fn render_subagent_detail(
     f: &mut Frame,
     detail: &TraceDetailPopup,
@@ -440,9 +472,31 @@ pub fn render_subagent_detail(
     prompt: &DetailPrompt<'_>,
     area: Rect,
 ) {
+    render_subagent_detail_with(f, detail, children, prompt, area, TuiTheme::DARK);
+}
+
+/// Theme-aware [`render_subagent_detail`]. The theme reaches the embedded
+/// [`HistoryView`] too: a light popup around a dark-palette transcript would be
+/// half-themed.
+pub fn render_subagent_detail_with(
+    f: &mut Frame,
+    detail: &TraceDetailPopup,
+    children: &SubagentListState,
+    prompt: &DetailPrompt<'_>,
+    area: Rect,
+    theme: TuiTheme,
+) {
     if area.width < 4 || area.height < 4 {
         return;
     }
+    // Paint the whole popup as a raised card before any section renders. The
+    // three `rows` below span `area` exactly (3 + Min(1) + 4), so one background
+    // pass is enough; per-Paragraph styling would miss the block borders, and
+    // `HistoryView` paints only foregrounds, so its cells keep this background.
+    f.render_widget(
+        Block::default().style(Style::new().bg(theme.bg_raised)),
+        area,
+    );
     let task_id = detail.task_id().to_string();
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -464,7 +518,7 @@ pub fn render_subagent_detail(
         Some(item) => Line::from(vec![
             Span::styled(
                 format!("[{}] ", item.state),
-                Style::default().fg(state_color(&item.state)),
+                Style::default().fg(state_color_with(&item.state, theme)),
             ),
             Span::raw(
                 item.objective
@@ -480,7 +534,7 @@ pub fn render_subagent_detail(
             detail.feed().row_count(),
             detail.feed().high_water_id()
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.fg_faint),
     ));
     f.render_widget(Paragraph::new(header).block(titled(&title)), rows[0]);
 
@@ -489,7 +543,7 @@ pub fn render_subagent_detail(
         f.render_widget(
             Paragraph::new(Line::styled(
                 "该任务暂无轨迹（可能尚未开始或已被清理）",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_faint),
             ))
             .block(titled("轨迹")),
             rows[1],
@@ -502,6 +556,9 @@ pub fn render_subagent_detail(
             HistoryView {
                 state: detail.feed().history(),
                 width: inner.width,
+                // The transcript must follow the popup's palette, not a literal
+                // DARK: otherwise a light terminal gets dark text in here.
+                theme,
             },
             inner,
         );
@@ -509,7 +566,7 @@ pub fn render_subagent_detail(
 
     // Children to drill into, then the two actions and the current action state.
     f.render_widget(
-        Paragraph::new(footer_lines(detail, children, &task_id, prompt)).block(titled("")),
+        Paragraph::new(footer_lines(detail, children, &task_id, prompt, theme)).block(titled("")),
         rows[2],
     );
 }
@@ -537,29 +594,30 @@ fn footer_lines(
     children: &SubagentListState,
     task_id: &str,
     prompt: &DetailPrompt<'_>,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(status) = prompt.status {
         lines.push(Line::styled(
             status.to_string(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warn),
         ));
     }
     if prompt.awaiting_cancel {
         lines.push(Line::styled(
             "确认取消？y 确认 / 其他键放弃",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.danger),
         ));
     }
     if prompt.composing {
         lines.push(Line::from(vec![
-            Span::styled("发消息> ", Style::default().fg(Color::Cyan)),
+            Span::styled("发消息> ", Style::default().fg(theme.accent)),
             Span::raw(detail.input().to_string()),
-            Span::styled("_", Style::default().fg(Color::Cyan)),
+            Span::styled("_", Style::default().fg(theme.accent)),
         ]));
         lines.push(Line::styled(
             "Enter 发送 · Esc 取消",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_faint),
         ));
         return lines;
     }
@@ -567,29 +625,29 @@ fn footer_lines(
     if targets.is_empty() {
         lines.push(Line::styled(
             "无直接子任务",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_faint),
         ));
     } else {
         let mut spans = vec![Span::styled(
             "子任务: ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_faint),
         )];
         for (index, item) in targets.iter().enumerate() {
             spans.push(Span::styled(
                 format!("[{}] {}", index + 1, item.task_id),
-                Style::default().fg(state_color(&item.state)),
+                Style::default().fg(state_color_with(&item.state, theme)),
             ));
             spans.push(Span::raw(" "));
         }
         lines.push(Line::from(spans));
         lines.push(Line::styled(
             "Enter 进入子任务",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.fg_faint),
         ));
     }
     lines.push(Line::styled(
         "m 发消息 · k 取消该任务",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.fg_faint),
     ));
     lines
 }
@@ -1143,6 +1201,220 @@ mod tests {
         assert_eq!(popup.selected_id(&items), Some("b"));
         let empty: Vec<SubagentListItem> = Vec::new();
         assert_eq!(popup.selected_id(&empty), None);
+    }
+
+    /// `state_color` fell back to `Color::DarkGray` (2.34:1 on dark).
+    #[test]
+    fn unknown_state_uses_theme_faint() {
+        assert_eq!(
+            state_color_with("no_such_state", TuiTheme::DARK),
+            TuiTheme::DARK.fg_faint
+        );
+        assert_eq!(
+            state_color_with("no_such_state", TuiTheme::LIGHT),
+            TuiTheme::LIGHT.fg_faint
+        );
+        assert_eq!(
+            state_color_with("completed", TuiTheme::LIGHT),
+            TuiTheme::LIGHT.success
+        );
+        assert_eq!(
+            state_color_with("failed", TuiTheme::LIGHT),
+            TuiTheme::LIGHT.danger
+        );
+        assert_eq!(
+            state_color_with("running", TuiTheme::LIGHT),
+            TuiTheme::LIGHT.warn
+        );
+    }
+
+    /// Draw the detail at `theme` and hand back the buffer, so color
+    /// assertions can read the cells the frame actually painted.
+    fn drawn_detail(
+        detail: &TraceDetailPopup,
+        state: &SubagentListState,
+        prompt: &DetailPrompt<'_>,
+        theme: TuiTheme,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_subagent_detail_with(f, detail, state, prompt, area, theme);
+            })
+            .expect("draw the detail");
+        terminal.backend().buffer().clone()
+    }
+
+    fn any_cell_has_fg(buffer: &ratatui::buffer::Buffer, color: Color) -> bool {
+        (0..buffer.area.height).any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == color))
+    }
+
+    /// Whether `color` appears in the rows from `first_row` down.
+    ///
+    /// `any_cell_has_fg` scans the whole frame, and the header already paints
+    /// `warn` and `fg_faint`, so a whole-buffer assertion on either slot is
+    /// satisfied by the header alone and cannot fail when the footer regresses.
+    /// The footer is `Constraint::Length(4)`, so passing `height - 4` scopes an
+    /// assertion to the footer region and nothing else.
+    fn any_cell_has_fg_in_rows(
+        buffer: &ratatui::buffer::Buffer,
+        color: Color,
+        first_row: u16,
+    ) -> bool {
+        (first_row..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == color))
+    }
+
+    /// The detail used raw ANSI slots (`Yellow` / `Red` / `Cyan` / `DarkGray`),
+    /// so a light terminal got a footer that ranged from muddy to invisible.
+    ///
+    /// The footer is `Constraint::Length(4)`, i.e. two text rows after the
+    /// border, so each prompt state is drawn on its own: a render with every
+    /// flag set would clip the composing line out of the frame.
+    #[test]
+    fn the_detail_header_and_footer_use_the_passed_theme() {
+        let state = SubagentListState::new(vec![item("task-1", "running", true)]);
+        let detail = TraceDetailPopup::new("task-1".into());
+
+        // Composing: the prompt and caret are accent, the hint under it and the
+        // empty-trace notice are faint.
+        let composing = DetailPrompt {
+            composing: true,
+            awaiting_cancel: false,
+            status: None,
+        };
+        let light = drawn_detail(&detail, &state, &composing, TuiTheme::LIGHT, 80, 20);
+        // Row 16 is the first of the footer's 4 rows; the header's colors must
+        // not be able to satisfy these two assertions.
+        let footer = 20 - 4;
+        assert!(
+            any_cell_has_fg(&light, TuiTheme::LIGHT.accent),
+            "the 发消息> prompt and caret must use the light accent slot"
+        );
+        assert!(
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.fg_faint, footer),
+            "the muted hint must use the light faint slot in the footer"
+        );
+        for raw in [Color::Yellow, Color::Red, Color::Cyan, Color::DarkGray] {
+            assert!(
+                !any_cell_has_fg(&light, raw),
+                "{raw:?} is a raw ANSI slot and must not survive theming"
+            );
+        }
+
+        // A pending cancel and the last action's status are the two rows the
+        // footer shows when nothing is being typed.
+        let confirming = DetailPrompt {
+            composing: false,
+            awaiting_cancel: true,
+            status: Some("已取消该次操作"),
+        };
+        let light = drawn_detail(&detail, &state, &confirming, TuiTheme::LIGHT, 80, 20);
+        assert!(
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.warn, footer),
+            "the advisory status line must use the light warn slot in the footer"
+        );
+        assert!(
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.danger, footer),
+            "the pending-cancel line must use the light danger slot in the footer"
+        );
+        for raw in [Color::Yellow, Color::Red, Color::Cyan, Color::DarkGray] {
+            assert!(
+                !any_cell_has_fg(&light, raw),
+                "{raw:?} is a raw ANSI slot and must not survive theming"
+            );
+        }
+
+        // Dark keeps the historical look: same slots, dark values.
+        let dark = drawn_detail(&detail, &state, &composing, TuiTheme::DARK, 80, 20);
+        assert!(any_cell_has_fg(&dark, TuiTheme::DARK.accent));
+        assert!(!any_cell_has_fg(&dark, TuiTheme::LIGHT.accent));
+    }
+
+    /// `app.rs` clears the popup area with `Clear`, which resets every cell to
+    /// the terminal default. Nothing but the list view repainted a surface, so
+    /// on a light terminal the detail's card was invisible: it sat on the same
+    /// white as the transcript behind it.
+    ///
+    /// The sample cells are text-free on purpose (`symbol()` is asserted to be
+    /// a space first), so this is an assertion about the background rather than
+    /// about a glyph. It is not an exhaustive scan: `Buffer::set_stringn` calls
+    /// `Cell::reset()` on the trailing half of a two-cell CJK glyph, so those
+    /// cells report `bg = Reset` in every themed popup in this crate.
+    #[test]
+    fn the_detail_paints_the_theme_raised_surface_behind_every_section() {
+        let state = SubagentListState::new(vec![item("task-1", "running", true)]);
+        let mut detail = TraceDetailPopup::new("task-1".into());
+        let payload = serde_json::to_string(&TraceFact::AssistantText {
+            text: "short".into(),
+        })
+        .unwrap();
+        detail
+            .feed_mut()
+            .push_row(1, "assistant_text", &payload, 70);
+        assert!(!detail.feed().is_empty(), "the feed must render a body");
+        let prompt = DetailPrompt::default();
+
+        // (x, y) at 80x20: the header's identity row, the trace body (filled by
+        // `HistoryView`, which paints foregrounds only), and the footer.
+        let buffer = drawn_detail(&detail, &state, &prompt, TuiTheme::LIGHT, 80, 20);
+        for (x, y) in [(78, 1), (78, 4), (78, 18)] {
+            assert_eq!(buffer[(x, y)].symbol(), " ", "({x}, {y}) must be blank");
+            assert_eq!(
+                buffer[(x, y)].bg,
+                TuiTheme::LIGHT.bg_raised,
+                "({x}, {y}) must be painted as the raised card"
+            );
+        }
+
+        let dark = drawn_detail(&detail, &state, &prompt, TuiTheme::DARK, 80, 20);
+        assert_eq!(dark[(78, 1)].bg, TuiTheme::DARK.bg_raised);
+        assert_ne!(
+            dark[(78, 1)].bg,
+            TuiTheme::LIGHT.bg_raised,
+            "the card surface must follow the passed theme"
+        );
+    }
+
+    /// The embedded `HistoryView` was constructed with a literal
+    /// `TuiTheme::DARK`, so a light terminal got dark-palette transcript text
+    /// inside a light popup. Inline code carries the accent slot, which makes
+    /// the transcript's palette observable through the frame.
+    #[test]
+    fn the_detail_trace_body_uses_the_passed_theme() {
+        let state = SubagentListState::new(vec![item("task-1", "running", true)]);
+        let mut detail = TraceDetailPopup::new("task-1".into());
+        let payload = serde_json::to_string(&TraceFact::AssistantText {
+            text: "run `cargo test` first".into(),
+        })
+        .unwrap();
+        detail
+            .feed_mut()
+            .push_row(1, "assistant_text", &payload, 70);
+        assert!(!detail.feed().is_empty(), "the feed must render a body");
+
+        let prompt = DetailPrompt::default();
+        let light = drawn_detail(&detail, &state, &prompt, TuiTheme::LIGHT, 80, 20);
+        assert!(
+            any_cell_has_fg(&light, TuiTheme::LIGHT.accent),
+            "inline code in the transcript must use the light accent"
+        );
+        assert!(
+            !any_cell_has_fg(&light, TuiTheme::DARK.accent),
+            "the transcript must not keep the dark palette inside a light popup"
+        );
+
+        let dark = drawn_detail(&detail, &state, &prompt, TuiTheme::DARK, 80, 20);
+        assert!(
+            any_cell_has_fg(&dark, TuiTheme::DARK.accent),
+            "the dark theme still resolves the transcript through DARK"
+        );
     }
 
     #[test]

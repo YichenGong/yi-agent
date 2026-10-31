@@ -1,8 +1,9 @@
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use super::theme::TuiTheme;
 use super::wrap::wrap_by_display_width;
 
 #[cfg(test)]
@@ -14,11 +15,25 @@ thread_local! {
 }
 
 /// Render a markdown string into ratatui Lines, wrapped at `width`.
+///
+/// Colors come from [`TuiTheme::DARK`]. Callers that know the terminal
+/// background must use [`render_markdown_with`] instead: several spans (inline
+/// code, math, links) used raw ANSI slots that are unreadable on a light
+/// background.
+///
+/// Kept as the pre-theming signature (tests call it, and it documents the dark
+/// default); the production path goes through [`render_markdown_with`].
+#[allow(dead_code)]
 pub fn render_markdown(src: &str, width: u16) -> Vec<Line<'static>> {
+    render_markdown_with(src, width, TuiTheme::DARK)
+}
+
+/// Render a markdown string into ratatui Lines with the given theme.
+pub fn render_markdown_with(src: &str, width: u16, theme: TuiTheme) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let normalized = normalize_math_delimiters(src);
     let parser = Parser::new_ext(&normalized, opts);
-    let mut builder = LineBuilder::new(width);
+    let mut builder = LineBuilder::new(width, theme);
     for event in parser {
         builder.handle_event(event);
     }
@@ -391,6 +406,9 @@ fn closing_backticks(src: &str, mut index: usize, ticks: usize) -> Option<usize>
 
 struct LineBuilder {
     width: u16,
+    /// Color source. Every colored span asks a semantic slot instead of naming
+    /// a raw ANSI color, so the same markdown reads on a light terminal too.
+    theme: TuiTheme,
     lines: Vec<Line<'static>>,
     current_spans: Vec<PendingSpan>,
     current_style: Style,
@@ -415,9 +433,10 @@ struct PendingSpan {
 }
 
 impl LineBuilder {
-    fn new(width: u16) -> Self {
+    fn new(width: u16, theme: TuiTheme) -> Self {
         Self {
             width,
+            theme,
             lines: Vec::new(),
             current_spans: Vec::new(),
             current_style: Style::new(),
@@ -454,7 +473,8 @@ impl LineBuilder {
                 if self.in_table {
                     self.current_cell.push_str(code.as_ref());
                 } else {
-                    self.push_span(Span::styled(code.to_string(), Style::new().fg(Color::Cyan)));
+                    let style = Style::new().fg(self.theme.accent);
+                    self.push_span(Span::styled(code.to_string(), style));
                 }
             }
             Event::InlineMath(formula) => {
@@ -463,7 +483,8 @@ impl LineBuilder {
                 if self.in_table {
                     self.current_cell.push_str(&formula);
                 } else {
-                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
+                    let style = Style::new().fg(self.theme.accent);
+                    self.push_math_span(Span::styled(formula, style));
                 }
             }
             Event::DisplayMath(formula) => {
@@ -474,7 +495,8 @@ impl LineBuilder {
                     if !self.current_spans.is_empty() {
                         self.flush_line();
                     }
-                    self.push_math_span(Span::styled(formula, Style::new().fg(Color::Cyan)));
+                    let style = Style::new().fg(self.theme.accent);
+                    self.push_math_span(Span::styled(formula, style));
                     self.flush_line();
                     self.display_math_just_flushed = true;
                 }
@@ -520,13 +542,13 @@ impl LineBuilder {
                 self.current_style = self.current_style.add_modifier(Modifier::CROSSED_OUT);
             }
             Tag::BlockQuote(_) => {
-                self.current_style = self.current_style.fg(Color::Green);
+                self.current_style = self.current_style.fg(self.theme.success);
             }
             Tag::Link { dest_url, .. } => {
                 self.push_span(Span::styled(
                     dest_url.to_string(),
                     Style::new()
-                        .fg(Color::Cyan)
+                        .fg(self.theme.accent)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
             }
@@ -736,8 +758,12 @@ impl LineBuilder {
         }
     }
 
+    /// A fenced block body is verbatim source, not a warning and not an
+    /// emphasis: `warn` would read as an alert and `accent` (documented as
+    /// inline code / math / slash menu) would paint whole code blocks like
+    /// links. `fg_muted` is readable secondary text on both palettes.
     fn flush_code_block(&mut self) {
-        let style = Style::new().fg(Color::Yellow);
+        let style = Style::new().fg(self.theme.fg_muted);
         let buffer = std::mem::take(&mut self.code_block_buffer);
         for code_line in buffer.lines() {
             self.push_wrapped(code_line, style, "  ");
@@ -1280,6 +1306,9 @@ fn map_script_character(ch: char, superscript: bool) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still name a raw color: the production path asks the
+    // theme for a slot.
+    use ratatui::style::Color;
 
     fn spans_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.to_string()).collect()
@@ -1324,8 +1353,25 @@ mod tests {
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
+    /// Inline code used raw `Color::Cyan` (2.93:1 on white). It must follow the
+    /// theme's accent slot instead.
     #[test]
-    fn inline_code_is_cyan() {
+    fn inline_code_uses_theme_accent() {
+        let lines = render_markdown_with("`code`", 40, TuiTheme::LIGHT);
+        let span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("code"))
+            .expect("inline code span");
+        assert_eq!(span.style.fg, Some(TuiTheme::LIGHT.accent));
+        assert_ne!(span.style.fg, Some(Color::Cyan));
+    }
+
+    /// The default entry point renders with `TuiTheme::DARK`, so inline code is
+    /// that palette's accent instead of the raw ANSI cyan that was unreadable on
+    /// a light background.
+    #[test]
+    fn inline_code_uses_the_dark_accent_by_default() {
         let lines = render_markdown("use `foo` here", 80);
         assert_eq!(lines.len(), 1);
         let code_span = lines[0]
@@ -1333,7 +1379,7 @@ mod tests {
             .iter()
             .find(|s| s.content == "foo")
             .expect("should find code span");
-        assert_eq!(code_span.style.fg, Some(Color::Cyan));
+        assert_eq!(code_span.style.fg, Some(TuiTheme::DARK.accent));
     }
 
     #[test]
@@ -1381,21 +1427,21 @@ mod tests {
         let code_words: Vec<_> = lines[0]
             .spans
             .iter()
-            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .filter(|span| span.style.fg == Some(TuiTheme::DARK.accent))
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(code_words, ["two", "words"]);
     }
 
     #[test]
-    fn inline_dollar_math_omits_delimiters_and_is_cyan() {
+    fn inline_dollar_math_omits_delimiters_and_uses_accent() {
         let lines = render_markdown("area is $\\pi r^2$.", 80);
         let formula = lines[0]
             .spans
             .iter()
             .find(|span| span.content == "π r²")
             .expect("formula span");
-        assert_eq!(formula.style.fg, Some(Color::Cyan));
+        assert_eq!(formula.style.fg, Some(TuiTheme::DARK.accent));
         assert_eq!(spans_text(&lines[0]), "area is π r².");
     }
 
@@ -1563,7 +1609,7 @@ mod tests {
         assert_eq!(spans_text(&lines[0]), "word");
         assert_eq!(spans_text(&lines[1]), "a b");
         assert_eq!(lines[1].spans.len(), 1);
-        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(lines[1].spans[0].style.fg, Some(TuiTheme::DARK.accent));
     }
 
     #[test]

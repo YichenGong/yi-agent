@@ -2,6 +2,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::theme::TuiTheme;
 use super::wrap::wrap_by_display_width;
 
 /// 提交结果：调用方必须处理三态，避免"拒收"被静默忽略。
@@ -131,10 +132,27 @@ impl Default for DeliveredInterjections {
 
 /// 渲染排队预览区。返回若干行,空队列返回空 Vec。
 ///
+/// 颜色来自 [`TuiTheme::DARK`];知道终端背景的渲染路径应改用
+/// [`render_queued_preview_with`]。
+#[allow(dead_code)] // 保留改造前的签名;`app.rs` 走 `_with`。
+pub fn render_queued_preview(items: &[String], width: u16) -> Vec<Line<'static>> {
+    render_queued_preview_with(items, width, TuiTheme::DARK)
+}
+
+/// 主题感知的 [`render_queued_preview`]。
+///
 /// - 标题行:`⌛ 已送达，待生效 (N)`,dim,N = 总数
 /// - 每条消息:`  ↳ ` 前缀,dim + italic
 /// - 最多显示 3 行,超出显示 `… 还有 X 条` 计数行
-pub fn render_queued_preview(items: &[String], width: u16) -> Vec<Line<'static>> {
+///
+/// 预览区本来就没有颜色:只用 `Modifier::DIM`,由终端自己按背景色暗化,
+/// 在深色和浅色背景上都成立。所以 `theme` 目前没有用处,等这里真的需要颜色
+/// 时再消费它。
+pub fn render_queued_preview_with(
+    items: &[String],
+    width: u16,
+    _theme: TuiTheme,
+) -> Vec<Line<'static>> {
     if items.is_empty() {
         return Vec::new();
     }
