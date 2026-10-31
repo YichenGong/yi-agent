@@ -1200,7 +1200,7 @@ TTL（§4.2），删掉缓存文件后重启，`get_for` 查不到条目 ⇒ 走
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-mcp              # 期望：全绿，新增 29 例
+cargo test -p yi-agent-mcp              # 期望：全绿，lib 测试 94 → 121（新增 27 条用例）
 cargo test -p yi-agent-mcp --test http_transport -- --ignored   # 真实端点
 cargo test -p yi-agent-app-server --lib # 下游未受影响（1068+）
 cargo test -p yi-agent-runtime --lib
@@ -1247,3 +1247,50 @@ cargo fmt --all -- --check
    本设计只是让 24h 后自动恢复。若后续摩擦明显，加 `mcp_reload refresh`（方案 B）。
 3. **stdio server 的清单变化**同样受 24h TTL 约束，但 stdio server 通常是本机安装，
    无「上游改名」场景，优先级低。
+
+## 8. 实现记录（2026-10-31）
+
+实现完成于分支 `feat/mcp-cache-ttl`，9 个 Task 逐条落地，`cargo test -p yi-agent-mcp --lib`
+由 94 条增至 121 条，全绿。与本文档的偏差如下（均为实测发现，已修正）：
+
+1. **`CacheLookup` 不能派生 `PartialEq`/`Eq`**：`CachedTool` 含 `serde_json::Value`
+   （`input_schema`），`Value` 未实现 `Eq`，派生会编译失败。改为只派生 `Debug, Clone, Copy`，
+   测试用 `matches!`。
+2. **`reload` 的 `Fresh` 分支不能要求「内存里有条目」**：初版写成
+   `(Some(_), CacheLookup::Fresh(disk))`，导致内存为空（如 `mcp_reload add` 后首次 reload）
+   时明明磁盘缓存新鲜却仍去探测。改为只看 `lookup` 结果。此错误被
+   `reload_tool::tests::add_on_a_fresh_project_creates_the_config_file` 抓到。
+3. **`load_and_probe` / `reload` 的失败路径都必须写 `failed_at`**：只在 `reload` 写不够——
+   headless 场景（只启动不 reload）退避永不开始计时。两处都写。
+4. **`tool_count` 类断言不能数 `tools/call`**：探测走 `list_tools`，
+   `install_echo_connector` 的计数器在断言「有没有探测」时永远是 0。新增
+   `install_counting_failing_connector` 数**连接尝试**，否则变异验证打不掉。
+5. **测试的锁语义**：`SeamGuard`（`Drop` 时清 `TEST_CONNECTOR`）与
+   `seam_guard()`（串行锁）是两件事。既有测试成对使用 `_serial = seam_guard()` +
+   `_seam = SeamGuard`；新增测试若只写 `_seam = seam_guard()` 会与同测试内其他
+   `seam_guard()` 自死锁（`std::sync::Mutex` 非重入）。
+
+### 变异验证实测结果（全部生效）
+
+| 变异 | 抓到它的测试 |
+|---|---|
+| 去掉 `load_and_probe` 的停用短路 | `load_and_probe_does_not_probe_a_disabled_server`（left 1, right 0） |
+| `Fresh` 分支要求 `reusable.is_some()` | `reload_tool::tests::add_on_a_fresh_project_creates_the_config_file` |
+| `lookup` 里退避判定挪到指纹判定之前 | `a_fingerprint_change_ignores_the_backoff_window`、`backfill_does_not_touch_the_fingerprint` |
+| 去掉全部 `backfill_probed_at` | `migration_of_many_servers_probes_none_of_them`（left 10, right 0） |
+| 只去掉 `load_and_probe` 的 `backfill` | 同上（`needs_reload` 断言先红） |
+| 去掉 `needs_reload` 的 TTL 判据 | `needs_reload_is_true_when_a_cache_entry_expired` |
+| 去掉 `reload` 失败分支的 `note_failure` | `a_permanently_dead_server_is_probed_once_per_backoff_window`（实际 10 次） |
+| 去掉 `needs_reload` 的 `sc.enabled &&` | `needs_reload_is_false_for_a_disabled_expired_server` |
+| 去掉 `probe_allowed` 的 `cfg.enabled` | `master_off_probes_nothing_even_when_stale` |
+
+### 未实现（与本 spec 一致，非遗漏）
+
+- §4.3.1.1(b) 的错峰抖动 / 每轮探测限额：spec 列为可选压住手段，未实现。真机验收第 2 条
+  （3 个 server 同时过期）若超 20s，需补一个 Task 10。
+
+### 发版说明必须写一句
+
+`backfill_probed_at` 把存量条目填成 `now`，是刻意的取舍（避免升级首轮集体重探 30~40s），
+代价是**升级后要等满 24h 才会触发第一次自愈重探**。用户若急需刷新，手动
+`/mcp reload` 在退避窗口外可用。

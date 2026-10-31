@@ -77,13 +77,31 @@ fn error_frame(message: &str) -> Vec<u8> {
 }
 
 /// 处理一条已接受的连接：读一行、回一行。
+///
+/// # 为什么 `set_read_timeout` 失败不算错
+///
+/// 宿主每 500ms 探活一次，探活就是「connect 后立刻 close」，不发任何字节。
+/// 内核把 FIN 送达之后，这条连接处于「fd 有效但对端已走」的状态，而 macOS 对
+/// 这种 socket 调用 `set_read_timeout` 会返回 `EINVAL`（Linux 不报）。旧实现用
+/// `?` 把它当致命错误，于是每次探活都往 stderr 打一条
+/// `query connection failed: Invalid argument (os error 22)`——实测单日 1.9 万条，
+/// 把真正的问题彻底埋掉。
+///
+/// 读超时的作用是防止一个连上来却不说话的对端占住线程；对端既然已经走了，
+/// 就没有可防的对象。真正的判断依据是下面的 `read`：它会干净地返回 `Ok(0)`。
+/// 因此这里只忽略**这一类**失败，其余 I/O 错误照旧上报。
 fn serve_connection<D: Dispatch>(dispatch: &D, stream: UnixStream) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
+    if let Err(error) = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)) {
+        // EINVAL：对端已关闭（见上）。除了这一种，别的错误仍要冒泡。
+        if error.raw_os_error() != Some(libc::EINVAL) {
+            return Err(error);
+        }
+    }
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = Vec::new();
     let read = reader.read_until(b'\n', &mut line)?;
     if read == 0 {
-        // 连上就断开：没有请求可答。
+        // 连上就断开：没有请求可答。探活走的就是这条路。
         return Ok(());
     }
     let mut stream = stream;
@@ -326,6 +344,84 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    /// 回归：宿主的探活是「connect 后立刻 close」，不发任何字节。
+    ///
+    /// 旧实现把 `set_read_timeout` 当成不可失败的前置条件，而 macOS 上对一条
+    /// **对端已关闭**的 AF_UNIX socket 调用它返回 `EINVAL`。宿主每 500ms 探活一次，
+    /// 于是日志被 `query connection failed: Invalid argument (os error 22)` 淹没
+    /// （实测单日 1.9 万条），真正的问题被埋掉。探活是正常现象，不该报错。
+    #[test]
+    fn a_bare_liveness_probe_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_path(dir.path()).expect("temp dir fits");
+        let dispatch = fake();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let path = socket.clone();
+
+        // `serve_with` 把每条连接的失败打到 stderr，这里用 error 计数代替抓日志：
+        // 它返回的是 accept 循环的结局，而单条连接的失败被吞在循环里。
+        let handle = std::thread::spawn(move || {
+            serve_with(&path, dispatch, || {
+                !flag.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap()
+        });
+
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 完全复刻宿主的探活：连上、不等、直接关掉。
+        for _ in 0..5 {
+            // connect 后立刻 drop：与宿主探活逐字一致。
+            drop(UnixStream::connect(&socket).expect("probe must connect"));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 探活之后，正常查询仍必须得到应答。
+        let mut stream = UnixStream::connect(&socket).expect("query must connect");
+        stream
+            .write_all(br#"{"type":"plugin.query","method":"list","params":{}}"#)
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["type"], "plugin.result", "{reply}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+
+    /// 核心不变量：探活连接（对端已关闭）必须被当作「没有请求可答」，而不是
+    /// 一条 I/O 错误。这条直接锁住 `serve_connection` 的契约。
+    #[test]
+    fn serving_a_probe_that_already_left_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_path(dir.path()).expect("temp dir fits");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let dispatch = fake();
+
+        // 必须**先连再彻底关闭、且等内核把 FIN 送达**，`accept` 才会拿到一条
+        // 「fd 有效但对端已走」的连接——这正是宿主探活留下的状态。只 `shutdown`
+        // 不 drop 时 macOS 仍会让 `set_read_timeout` 成功，测不出问题。
+        let peer = UnixStream::connect(&socket).expect("connect");
+        drop(peer);
+        std::thread::sleep(Duration::from_millis(50));
+        let (stream, _) = listener.accept().unwrap();
+
+        let outcome = serve_connection(dispatch.as_ref(), stream);
+        assert!(
+            outcome.is_ok(),
+            "a peer that left before sending anything is normal, got {outcome:?}"
+        );
     }
 
     /// 回归：accept 不再盲睡 200ms。三个**连续**查询的总耗时必须远小于

@@ -5208,7 +5208,7 @@ async fn apply_session_command(
                 let _ = reply.send(Err("本会话没有可用的 MCP 管理器".into()));
             }
             Some(mcp) => {
-                let report = mcp.reload(mcp_workdir).await;
+                let report = mcp.reload(mcp_workdir, yi_agent_mcp::now_unix()).await;
                 let failures: Vec<String> = report
                     .servers
                     .iter()
@@ -5524,8 +5524,8 @@ pub(crate) async fn run_thread_driver(
         // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
         // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
         if let Some(mcp) = &mcp {
-            if mcp.config_changed_on_disk(&mcp_workdir) {
-                let report = mcp.reload(&mcp_workdir).await;
+            if mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix()) {
+                let report = mcp.reload(&mcp_workdir, yi_agent_mcp::now_unix()).await;
                 for s in &report.servers {
                     if let Some(err) = &s.error {
                         tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
