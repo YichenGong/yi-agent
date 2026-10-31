@@ -88,6 +88,21 @@ pub struct ReloadReport {
 }
 
 impl ReloadReport {
+    /// 本轮因失败退避窗口而跳过探测的 server 名。
+    ///
+    /// 手动 `reload` 时用来说明「为什么没刷新」:否则用户分不清「真没问题」
+    /// 与「被退避挡住」。按名字排序,便于稳定展示。
+    pub fn skipped_backoff_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .servers
+            .iter()
+            .filter(|s| s.skipped_backoff)
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     /// 全部 server 都没有探测错误。写盘成功与探测成功是两件事,由调用方分别呈现。
     pub fn all_ok(&self) -> bool {
         self.servers.iter().all(|s| s.error.is_none())

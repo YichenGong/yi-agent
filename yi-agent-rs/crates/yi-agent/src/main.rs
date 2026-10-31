@@ -2191,7 +2191,21 @@ fn run_tui_agent(
                             }
                             let label = if report.all_ok() {
                                 let probed = report.servers.iter().filter(|s| s.probed).count();
-                                format!("MCP 配置已重载（{} 个 server，重探 {probed} 个）", report.servers.len())
+                                let mut l = format!(
+                                    "MCP 配置已重载（{} 个 server，重探 {probed} 个）",
+                                    report.servers.len()
+                                );
+                                // 退避跳过的要如实说明:否则用户敲 reload 却什么都没探,
+                                // 分不清「真没问题」与「被上一次失败的退避挡住」。
+                                let skipped = report.skipped_backoff_names();
+                                if !skipped.is_empty() {
+                                    l.push_str(&format!(
+                                        "，{} 个因退避窗口跳过（{}）",
+                                        skipped.len(),
+                                        skipped.join(", ")
+                                    ));
+                                }
+                                l
                             } else {
                                 let failed: Vec<&str> = report
                                     .servers
