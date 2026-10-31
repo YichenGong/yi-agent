@@ -203,6 +203,12 @@ impl Board {
         Ok(())
     }
 
+    /// 可变借用一张卡。仅给「就地改一个字段」的场景（入队时刻、workdir），
+    /// 状态迁移仍然必须走 `transition`，否则 `cards` 的不变式就没人看着了。
+    pub fn get_mut(&mut self, id: &CardId) -> Option<&mut Card> {
+        self.cards.iter_mut().find(|card| &card.id == id)
+    }
+
     pub fn get(&self, id: &CardId) -> Option<&Card> {
         self.cards.iter().find(|card| &card.id == id)
     }

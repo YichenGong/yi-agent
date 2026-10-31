@@ -295,20 +295,13 @@ pub fn dispatch_with_service(
                 .get("card_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "merge_request needs a card_id".to_string())?;
+            // 入队不拿锁，所以这里只有「排上了」和「不让排」两种结局。真正开跑
+            // 是 daemon 下一拍的事，`status: queued` 就是那条边界的说明。
             match service.merge_request(card_id)? {
-                crate::service::MergeRequest::Granted {
-                    workdir,
-                    source,
-                    base,
-                } => Ok(json!({
-                    "status": "granted",
-                    "workdir": workdir.to_string_lossy(),
-                    "source": source,
-                    "base": base,
+                crate::service::MergeRequest::Queued { position } => Ok(json!({
+                    "status": "queued",
+                    "position": position,
                 })),
-                crate::service::MergeRequest::Busy { card_id } => {
-                    Ok(json!({ "status": "busy", "card_id": card_id }))
-                }
                 crate::service::MergeRequest::Denied(reason) => {
                     Ok(json!({ "status": "denied", "reason": reason }))
                 }

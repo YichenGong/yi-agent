@@ -53,15 +53,9 @@ pub struct ThreadFacts {
 /// 去执行 `git merge --no-ff`，完成后必须回 `merge_finish` 让插件复核。
 #[derive(Debug, PartialEq, Eq)]
 pub enum MergeRequest {
-    Granted {
-        /// 执行合并的 base worktree（base 已被检出的那个，通常是主检出）。
-        workdir: PathBuf,
-        source: String,
-        base: String,
-    },
-    /// 本项目已有合并在跑：卡不动，排队。带上持有者的卡号，好让人知道在等谁。
-    Busy { card_id: String },
-    /// 卡不在可合并状态（或 refs 不全）。
+    /// 已排进合并队列。`position` 是前面还有几张（0 = 队首）。
+    Queued { position: usize },
+    /// 卡不在可合并状态（还没 `awaiting_merge`，或卡不存在）。
     Denied(String),
 }
 
@@ -841,51 +835,48 @@ impl BoardService {
     /// pid 也查无此人：视为残留，直接接管。
     ///
     /// 不做 git 校验：分支存不存在、能不能合，是模型的判断，不是插件的。
+    /// 把卡放进本项目的合并队列。**只改状态，不拿 `merge.lock`**——抢锁是 daemon
+    /// 在开跑那一拍的事（`promote_merge_queue`）。申请与执行分开，「排队」才有
+    /// 地方存在：名额忙时卡就一直在队列里，且能被人看见排在第几。
     pub fn merge_request(&self, card_id: &str) -> Result<MergeRequest, String> {
         let id = CardId::new(card_id);
-        let board = persist::read_board(&self.state_dir);
-        let Some(card) = board.get(&id) else {
-            return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
-        };
-        // 准入只挡「还没开始」的卡：排队中的**实现卡**必须走会话通路，不能借
-        // 合并名额一步落地。其余状态（含终态）由模型自己负责——它显式来要名额，
-        // 说明它认为自己该合并了。
-        if card.state == CardState::Queued && card.kind == CardKind::Implementation {
-            return Ok(MergeRequest::Denied(format!(
-                "card {card_id} is still queued; it must run in a session before merging"
-            )));
-        }
-        let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
-            (Some(source), Some(base)) => (source, base),
-            _ => {
-                if card.kind != CardKind::Implementation {
-                    return Ok(MergeRequest::Denied(format!(
-                        "card {card_id} has no source/base to merge"
-                    )));
-                }
-                (
-                    format!("kanban/{}", crate::worktree::slugify(&card.id)),
-                    crate::merge::default_branch(&self.project_root),
-                )
+        persist::with_board(&self.state_dir, |board| {
+            let Some(card) = board.get(&id).cloned() else {
+                return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
+            };
+            // 已在队列里：幂等，报告当前名次。绝不能重写时间戳——那等于让重复
+            // 申请把自己排到队尾。
+            if card.state == CardState::MergeQueued {
+                let position = board
+                    .cards()
+                    .iter()
+                    .filter(|other| other.state == CardState::MergeQueued)
+                    .filter(|other| other.merge_queued_at < card.merge_queued_at)
+                    .count();
+                return Ok(MergeRequest::Queued { position });
             }
-        };
-        let workdir = match merge::prepare(&self.project_root, &base) {
-            Ok(worktree) => worktree.path,
-            Err(error) => return Ok(MergeRequest::Denied(error)),
-        };
-        let gate = match crate::merge_lock::acquire_with_holder(&self.state_dir, card_id) {
-            crate::merge_lock::MergeAttempt::Granted(lock)
-            | crate::merge_lock::MergeAttempt::Reclaimed(lock) => lock,
-            crate::merge_lock::MergeAttempt::Busy { card_id, .. } => {
-                return Ok(MergeRequest::Busy { card_id });
+            // 授权的唯一入口：用户发话 → 模型跑这个动词。所以卡必须已经
+            // 「活儿干完了」(`awaiting_merge`)。别的状态说明调用方走错了路，
+            // 报清当前状态让它自己纠正——尤其是排队中的实现卡，它必须先在
+            // 会话里干活。
+            if card.state != CardState::AwaitingMerge {
+                return Ok(MergeRequest::Denied(format!(
+                    "card {card_id} is {:?}, not awaiting_merge",
+                    card.state
+                )));
             }
-        };
-        // 同一进程重复申请：旧 fd 直接 drop，名额仍在本进程手上。
-        self.lock().merge_gate = Some(gate);
-        Ok(MergeRequest::Granted {
-            workdir,
-            source,
-            base,
+            let position = board
+                .cards()
+                .iter()
+                .filter(|other| other.state == CardState::MergeQueued)
+                .count();
+            board
+                .transition(&id, CardState::MergeQueued)
+                .map_err(|error| error.to_string())?;
+            if let Some(card) = board.get_mut(&id) {
+                card.mark_merge_queued(chrono::Local::now());
+            }
+            Ok(MergeRequest::Queued { position })
         })
     }
 
@@ -1546,48 +1537,82 @@ mod tests {
         let service = service_with_card(&project);
         match service.merge_request("card-1").unwrap() {
             MergeRequest::Denied(reason) => {
-                assert!(reason.contains("still queued"), "{reason}")
+                assert!(reason.contains("not awaiting_merge"), "{reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// 入队不拿锁：两张卡可以同时排着队。这是「排队」存在的全部前提。
+    #[test]
+    fn merge_request_only_queues_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        assert_eq!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Queued { position: 0 }
+        );
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        service.enqueue_card_for_test("card-2");
+        service
+            .set_state("card-2", CardState::AwaitingMerge, None)
+            .unwrap();
+        assert_eq!(
+            service.merge_request("card-2").unwrap(),
+            MergeRequest::Queued { position: 1 },
+            "a second card must be able to queue: queueing takes no lock"
+        );
+    }
+
+    #[test]
+    fn merge_request_refuses_a_card_that_is_not_awaiting_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service
+            .set_state("card-1", CardState::Running, None)
+            .unwrap();
+        assert_eq!(state_of(&service, "card-1"), "running");
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Denied(reason) => {
+                assert!(
+                    reason.contains("not awaiting_merge"),
+                    "must name why: {reason}"
+                )
             }
             other => panic!("expected Denied, got {other:?}"),
         }
     }
 
     #[test]
-    fn merge_request_is_busy_while_the_gate_is_held() {
+    fn merge_request_is_idempotent_and_keeps_the_queue_position() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let (service, source) = service_with_awaiting_card(&project);
         git_run(&project, &["branch", &source]);
-        // 模拟「另一处正持着 merge.lock」，并留下它的 holder 记录。
-        let held = crate::merge_lock::acquire(&service.state_dir).expect("hold the gate");
-        std::fs::write(
-            service.state_dir.join("merge.lock.holder"),
-            format!(
-                r#"{{"card_id":"other-card","pid":{},"since":"2026-10-01T00:00:00+08:00"}}"#,
-                std::process::id()
-            ),
-        )
-        .unwrap();
-        match service.merge_request("card-1").unwrap() {
-            MergeRequest::Busy { card_id } => assert_eq!(card_id, "other-card"),
-            other => panic!("expected Busy, got {other:?}"),
-        }
-        drop(held);
+        service.merge_request("card-1").unwrap();
+        assert_eq!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Queued { position: 0 },
+            "asking twice must not move the card to the back of the queue"
+        );
     }
 
-    /// 名额不绑卡片状态：一张已经 `done` 的卡仍可申请（模型自己负责语义），
-    /// 申请本身**不改**卡片状态——状态只由模型写。
+    /// 入队只写「排队」这一个状态：它不会顺手把卡推到执行态，也不碰 `merge.lock`。
     #[test]
-    fn merge_request_never_touches_the_card_state() {
+    fn merge_request_never_starts_the_merge_itself() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let (service, source) = service_with_awaiting_card(&project);
         git_run(&project, &["branch", &source]);
-        assert!(matches!(
-            service.merge_request("card-1").unwrap(),
-            MergeRequest::Granted { .. }
-        ));
-        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+        service.merge_request("card-1").unwrap();
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_none(),
+            "queueing must not take the gate"
+        );
     }
 
     /// 释放名额：只放锁，状态一动不动，且放掉之后别人能拿到。
@@ -1597,20 +1622,23 @@ mod tests {
         let project = project_with_worktree(dir.path());
         let (service, source) = service_with_awaiting_card(&project);
         git_run(&project, &["branch", &source]);
-        assert!(matches!(
-            service.merge_request("card-1").unwrap(),
-            MergeRequest::Granted { .. }
-        ));
+        // 名额由 daemon 在开跑那一拍拿到（这里模拟那一拍）。
+        match crate::merge_lock::acquire_with_holder(&service.state_dir, "card-1") {
+            crate::merge_lock::MergeAttempt::Granted(lock) => {
+                service.lock().merge_gate = Some(lock)
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
         assert_eq!(
             service.merge_finish("card-1").unwrap(),
             MergeFinish::Released
         );
         // 状态一动不动：合没合上由模型自己判断并 `state ... done`。
         assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
-        // 名额已放掉，第二个申请者能拿到。
+        // 名额已放掉，别人能拿到。
         assert!(matches!(
-            service.merge_request("card-1").unwrap(),
-            MergeRequest::Granted { .. }
+            crate::merge_lock::acquire_with_holder(&service.state_dir, "other"),
+            crate::merge_lock::MergeAttempt::Granted(_)
         ));
     }
 
@@ -1931,15 +1959,25 @@ mod tests {
         service
             .set_state(&card_id, CardState::AwaitingMerge, None)
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             service.merge_request(&card_id).unwrap(),
-            MergeRequest::Granted { .. }
-        ));
+            MergeRequest::Queued { position: 0 }
+        );
+        assert_eq!(state_of(&service, &card_id), "merge_queued");
+        // 下一拍：名额空 → daemon 把卡推进到 running 并追一回合（见 promote_merge_queue）。
+        match crate::merge_lock::acquire_with_holder(&service.state_dir, &card_id) {
+            crate::merge_lock::MergeAttempt::Granted(lock) => {
+                service.lock().merge_gate = Some(lock)
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        service
+            .set_state(&card_id, CardState::Running, None)
+            .unwrap();
         assert_eq!(
             service.merge_finish(&card_id).unwrap(),
             MergeFinish::Released
         );
-        assert_eq!(state_of(&service, &card_id), "awaiting_merge");
         service.set_state(&card_id, CardState::Done, None).unwrap();
         assert_eq!(state_of(&service, &card_id), "done");
     }
