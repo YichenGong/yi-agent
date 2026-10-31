@@ -41,8 +41,9 @@ yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MC
   - 纯逻辑：`yi-agent-rs/crates/yi-agent-mcp/src/reload.rs`（名字规则、`${VAR}` 必须已定义、header 名校验、add 重名需 `overwrite`；失败不改配置）
   - 热重载：`yi-agent-rs/crates/yi-agent-mcp/src/manager.rs` 的 `McpManager::reload`（只探测新增/指纹变化的 server；单个失败原文进 `ServerOutcome::error`，不吞）、`config_changed_on_disk`（每轮变更检测）
   - 原子写盘：`McpConfig::save`（临时文件 + rename，见 `config.rs`）
-  - 孤儿清理：`refresh_registry` 按 `last_registered` drain，删除 server 后其工具不再残留
+  - 孤儿清理：`refresh_registry` 按 `last_registered` drain，删除 server 后其工具不再残留；`enabled_tools` 同时记账（启动期注册走的是它，漏记会让「启动后停用」的工具永久留在 registry）
+  - 开关优先级：`reload` 里 server 的 `enabled` **以磁盘为准**，仅当磁盘值未变时沿用内存里的运行时开关（TUI 的 `/mcp disable` 只动内存）；`mcp_reload` 的 enable/disable 会同步内存开关
   - 注册：`register_mcp_reload_tool` **无条件注册**（无 `mcp.json` 时也有入口），接在 `yi-agent-runtime/src/bootstrap.rs` 与 `yi-agent/src/main.rs` 两处
   - 权限：`mcp_reload` 始终 `NeedConfirm`，**不受 yolo 豁免**（`yi-agent-rs/crates/yi-agent-core/src/permission.rs`）
   - 生效时机：下一轮生效（不改 `ToolRegistry` 为 `RwLock`）；返回文案固定写「新工具从下一条消息起可用」
-  - 验证：`cargo test -p yi-agent-mcp`（72 个 lib 测试，含 `reload_does_not_reprobe_an_unchanged_server`、`reload_reprobes_a_changed_server_and_reports_the_error`、`reload_removes_a_deleted_server`、`config_changed_on_disk_*`、`reload_tool::tests::*`）
+  - 验证：`cargo test -p yi-agent-mcp`（80 个 lib 测试，含 `reload_does_not_reprobe_an_unchanged_server`、`reload_reprobes_a_changed_server_and_reports_the_error`、`reload_removes_a_deleted_server`、`reload_honors_a_server_disabled_on_disk`、`reload_keeps_an_in_memory_switch_when_disk_did_not_change`、`disabling_a_server_after_startup_removes_its_tools`、`enable_after_a_runtime_only_disable_takes_effect`、`config_changed_on_disk_*`、`reload_tool::tests::*`）

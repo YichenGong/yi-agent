@@ -88,6 +88,15 @@ impl McpReloadTool {
             return ToolResult::error(format!("写入配置失败: {e:#}"));
         }
 
+        // enable/disable 同时改内存开关:磁盘值可能与内存里的旧值相同
+        // (TUI 的 `/mcp disable` 只动内存),只靠"磁盘变了"检测不到这次
+        // 显式意图,`reload` 会继续沿用旧开关,工具仍然不可用。
+        if matches!(req.action, ReloadAction::Enable | ReloadAction::Disable) {
+            let _ = self
+                .manager
+                .set_server(&req.name, req.action == ReloadAction::Enable);
+        }
+
         // disable / remove 不需要联网:配置里删掉的工具本轮就不该再出现。
         if matches!(req.action, ReloadAction::Disable | ReloadAction::Remove) {
             return ToolResult::text(render_local(&req, &cfg));
@@ -357,6 +366,41 @@ mod tests {
         assert!(
             text.contains("下一条消息"),
             "must state when it takes effect: {text}"
+        );
+    }
+
+    /// TUI 的 `/mcp disable` 只动内存(磁盘仍 `enabled: true`),之后
+    /// `mcp_reload enable` 写盘的值与磁盘旧值相同——`reload` 的"磁盘变了"
+    /// 检测不到这次显式意图,必须由本工具同步内存开关。
+    #[tokio::test]
+    async fn enable_after_a_runtime_only_disable_takes_effect() {
+        let dir = TempDir::new().unwrap();
+        write_cfg(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let spec = crate::config::ServerConfig {
+            kind: crate::config::ServerKind::Stdio,
+            command: Some("npx".into()),
+            ..dummy_spec()
+        };
+        // 预置缓存,避免 reload 真的 spawn。
+        let mut cache = crate::test_support::cache_with(dir.path());
+        cache.put(
+            "fs",
+            &spec,
+            vec![crate::test_support::cached_tool("read", true)],
+        );
+        cache.save(dir.path()).unwrap();
+
+        let manager = McpManager::empty();
+        manager.reload(dir.path()).await;
+        manager.set_server("fs", false).unwrap();
+        assert!(!manager.is_effective("fs"), "runtime disable must apply");
+
+        let tool = McpReloadTool::new(Arc::clone(&manager), dir.path());
+        let res = tool.call(json!({"action": "enable", "name": "fs"})).await;
+        assert!(!res.is_error, "got {}", text_of(&res));
+        assert!(
+            manager.is_effective("fs"),
+            "enable must take effect even though the on-disk value did not change"
         );
     }
 

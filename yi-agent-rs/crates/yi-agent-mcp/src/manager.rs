@@ -240,9 +240,24 @@ impl McpManager {
                     },
                 },
             };
-            let enabled = previous
-                .map(|e| e.enabled.load(Ordering::Relaxed))
-                .unwrap_or(sc.enabled);
+            // 开关以**磁盘**为准,但保留本轮内尚未落盘的运行时开关(TUI 的
+            // `/mcp disable` 只动内存)。两者用「磁盘值是否变了」区分:
+            // - 磁盘值没变 ⇒ 没有新的显式意图,沿用内存里的运行时开关;
+            // - 磁盘值变了 ⇒ 有人显式改过(设置页 `mcp/set`、`mcp_reload`
+            //   disable/enable、手改文件),磁盘必须胜出。
+            // 只取内存值(旧实现)会让上述"只写盘"的路径全部失效:用户看到
+            // 「已停用」,工具却照旧可用,直到进程重启。
+            let enabled = match previous {
+                None => sc.enabled,
+                Some(e) => {
+                    let runtime = e.enabled.load(Ordering::Relaxed);
+                    if e.config.enabled == sc.enabled {
+                        runtime
+                    } else {
+                        sc.enabled
+                    }
+                }
+            };
             let read_only_count = tools.iter().filter(|t| t.read_only).count();
             out.push(ServerOutcome {
                 name: name.clone(),
@@ -375,22 +390,39 @@ impl McpManager {
     }
 
     /// Adapters for every tool on currently-effective servers.
+    ///
+    /// 顺带把返回的名字记进 `last_registered`:启动期注册走的是这条路径
+    /// (而不是 `refresh_registry`),漏记的话之后停用/删除该 server 时
+    /// `refresh_registry` 无名字可摘,工具会一直留在工具表里。
     pub fn enabled_tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         let snapshot = self.snapshot();
         for (name, entry) in snapshot.iter() {
             if !self.is_effective(name) {
                 continue;
             }
             for t in &entry.tools {
-                out.push(Arc::new(McpTool::new(
+                let tool = McpTool::new(
                     name.clone(),
                     t.name.clone(),
                     t.description.clone().unwrap_or_default(),
                     t.input_schema.clone(),
                     t.read_only,
                     Arc::clone(self),
-                )));
+                );
+                names.push(tool.name().to_string());
+                out.push(Arc::new(tool));
+            }
+        }
+        // 只增不删:`refresh_registry` 负责 drain,这里补记它没见过的那批。
+        {
+            let mut registered = self
+                .last_registered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for n in names {
+                registered.insert(n);
             }
         }
         out
@@ -402,6 +434,9 @@ impl McpManager {
     /// Idempotent. Call after changing the master/per-server switches so the next
     /// `Agent` rebuild exposes the new tool set.
     pub fn refresh_registry(self: &Arc<Self>, registry: &mut ToolRegistry) {
+        // 先取工具再拿锁:`enabled_tools` 自己也会写 `last_registered`,
+        // 持锁调用会自死锁(std::sync::Mutex 不可重入)。
+        let tools = self.enabled_tools();
         // 按**上次注册过的名字**清理,而不是按当前快照推导:server 被删掉后
         // 它的名字已不在快照里,反向推导会把这些工具永久留在 registry。
         let mut registered = self
@@ -411,7 +446,7 @@ impl McpManager {
         for name in registered.drain() {
             registry.remove(&name);
         }
-        for tool in self.enabled_tools() {
+        for tool in tools {
             registered.insert(tool.name().to_string());
             registry.register(tool);
         }
@@ -1062,6 +1097,108 @@ mod tests {
         assert!(
             registry.get("mcp__fs__read").is_some(),
             "effective tool must be registered; got {:?}",
+            registry.names()
+        );
+    }
+
+    /// 反向约束:TUI 的 `/mcp disable` 只改内存,磁盘上的 `enabled` 没变;
+    /// 之后因为**别的**原因触发一次 reload,那个运行时开关不能被冲掉。
+    #[tokio::test]
+    async fn reload_keeps_an_in_memory_switch_when_disk_did_not_change() {
+        // 整进程共享的连接接缝:冷缓存探测会读它,必须与其它 seam 测试串行。
+        let _serial = seam_guard();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        let cfg_path = dir.path().join(".yi-agent/mcp.json");
+        std::fs::write(&cfg_path, r#"{"mcpServers":{"fs":{"command":"npx"}}}"#).unwrap();
+
+        let sc = cfg("npx");
+        let mut cache = McpCache::default();
+        cache.put("fs", &sc, vec![]);
+        cache.save(dir.path()).unwrap();
+
+        let loaded = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(loaded, dir.path())
+            .await
+            .unwrap();
+
+        // 等价于 TUI 的 `/mcp disable`:只动内存。
+        mgr.set_server("fs", false).unwrap();
+        assert!(!mgr.is_effective("fs"));
+
+        // 磁盘加一个无关的新 server,触发 reload(fs 自己的 enabled 没变)。
+        // 新 server 也预置缓存,免得 reload 真的 spawn 一个 `uvx`。
+        let other = ServerConfig {
+            kind: crate::config::ServerKind::Stdio,
+            command: Some("uvx".into()),
+            ..cfg("uvx")
+        };
+        let mut cache = McpCache::load(dir.path());
+        cache.put("other", &other, vec![]);
+        cache.save(dir.path()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"mcpServers":{"fs":{"command":"npx"},"other":{"command":"uvx"}}}"#,
+        )
+        .unwrap();
+        mgr.reload(dir.path()).await;
+
+        assert!(
+            !mgr.is_effective("fs"),
+            "an unrelated disk edit must not re-enable a server disabled at runtime"
+        );
+    }
+
+    /// 磁盘上停用某个 server 后 reload,它必须真的不再生效。
+    ///
+    /// 回归:`reload` 曾用内存里的旧 `enabled` 覆盖磁盘值,于是设置页的
+    /// `mcp/set`(只写盘)与 `mcp_reload disable`(只写盘)的效果会在下一次
+    /// reload 时被悄悄撤销——用户看到"已停用",工具却照旧可用。
+    #[tokio::test]
+    async fn reload_honors_a_server_disabled_on_disk() {
+        // 整进程共享的连接接缝:冷缓存探测会读它,必须与其它 seam 测试串行。
+        let _serial = seam_guard();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        let cfg_path = dir.path().join(".yi-agent/mcp.json");
+        std::fs::write(&cfg_path, r#"{"mcpServers":{"fs":{"command":"npx"}}}"#).unwrap();
+
+        // 预置缓存,避免 reload 真的去 spawn `npx`。
+        let sc = cfg("npx");
+        let mut cache = McpCache::default();
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "read".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+        );
+        cache.save(dir.path()).unwrap();
+
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        assert!(mgr.is_effective("fs"), "server starts out enabled");
+
+        // 与 `mcp/set` / `mcp_reload disable` 一致:只改磁盘,不动内存。
+        std::fs::write(
+            &cfg_path,
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        )
+        .unwrap();
+        mgr.reload(dir.path()).await;
+
+        assert!(
+            !mgr.is_effective("fs"),
+            "reload must honor enabled=false from disk, not the stale in-memory flag"
+        );
+        let mut registry = ToolRegistry::new();
+        mgr.refresh_registry(&mut registry);
+        assert!(
+            registry.get("mcp__fs__read").is_none(),
+            "a server disabled on disk must not keep its tools registered; got {:?}",
             registry.names()
         );
     }

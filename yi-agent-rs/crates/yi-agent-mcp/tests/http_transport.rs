@@ -158,15 +158,23 @@ async fn real_horizon_websearch_smoke() {
         .iter()
         .map(|t| t.name().to_string())
         .collect();
-    assert!(
-        names.contains(&"mcp__horizon-websearch__SearchPro".to_string()),
-        "expected real endpoint to expose SearchPro; got {names:?}"
-    );
+
+    // 网关会把上游 server 名带进工具名(当前是 `tencent-websearch__SearchPro`)。
+    // 断言"有一个以 SearchPro 结尾的搜索工具",而不是写死上游前缀:那个前缀
+    // 换供应商就会变,写死会让冒烟测试在网关升级后无意义地红。
+    let qualified = names
+        .iter()
+        .find(|n| n.ends_with("__SearchPro"))
+        .unwrap_or_else(|| panic!("expected a SearchPro tool; got {names:?}"))
+        .clone();
+    let remote = qualified
+        .strip_prefix("mcp__horizon-websearch__")
+        .expect("tool must live on the horizon-websearch server");
 
     let res = mgr
         .call_tool(
             "horizon-websearch",
-            "SearchPro",
+            remote,
             json!({ "Query": "今天北京天气", "Cnt": "10" }),
         )
         .await;
