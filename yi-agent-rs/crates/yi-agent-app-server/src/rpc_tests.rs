@@ -20752,3 +20752,75 @@ fn diff_read_panic_fallback_matches_the_callers_shape() {
     let whole_no_base = crate::rpc::thread::diff_read_fallback(false, None);
     assert_eq!(whole_no_base["base"], serde_json::Value::Null);
 }
+
+/// `thread/view/read?refresh=true` 同样不得占住主循环。
+///
+/// 它的 `structured_frame` 分支同步跑 thread_diff(5+ 次 git);命令帧分支虽然
+/// 是 async,但 `command_frame` 开头同步构造 SandboxPolicy,后者调
+/// `Path::canonicalize`(在已卸载的挂载点上会卡住),也不经过任何 await。
+#[tokio::test(flavor = "multi_thread")]
+async fn view_read_refresh_does_not_block_the_main_loop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    let junk = dir.path().join("dist");
+    std::fs::create_dir_all(&junk).unwrap();
+    let chunk = "y".repeat(1024 * 1024);
+    for n in 0..60 {
+        std::fs::write(junk.join(format!("chunk{n}.log")), &chunk).unwrap();
+    }
+    {
+        // 结构化帧(无 command)：refresh 会走 structured_frame -> thread_diff。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: None,
+                as_kind: "diff".to_string(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":90,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(90)))
+        .await;
+    let baseline = t0.elapsed();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":91,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let t1 = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":92,"method":"thread/list","params":{}}"#)
+        .await;
+    let _ = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(92)))
+        .await;
+    let blocked = t1.elapsed();
+
+    assert!(
+        blocked < baseline * 50 + std::time::Duration::from_millis(100),
+        "a view refresh must not block the main loop: \
+         baseline={baseline:?} list_behind_refresh={blocked:?}"
+    );
+    let v = h
+        .read_matching(256, |v| v.get("id") == Some(&serde_json::json!(91)))
+        .await;
+    assert!(v["result"].is_object(), "view/read must still answer: {v}");
+    h.shutdown().await;
+}
