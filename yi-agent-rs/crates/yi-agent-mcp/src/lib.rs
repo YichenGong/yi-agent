@@ -229,7 +229,7 @@ mod tests {
             r#"{"mcpServers":{"fs":{"command":"/nonexistent/definitely-not-here","enabled":false}}}"#,
         )
         .unwrap();
-        mgr.reload(dir.path()).await;
+        mgr.reload(dir.path(), now_unix()).await;
         let mut refreshed = registry.clone();
         mgr.refresh_registry(&mut refreshed);
 

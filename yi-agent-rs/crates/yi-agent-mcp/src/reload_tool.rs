@@ -12,7 +12,7 @@ use yi_agent_core::permission::BlocklistFn;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 use crate::config::{McpConfig, ServerConfig, ServerKind};
-use crate::manager::McpManager;
+use crate::manager::{McpManager, now_unix};
 use crate::reload::{ReloadAction, ReloadRequest, apply};
 
 pub const TOOL_NAME: &str = "mcp_reload";
@@ -102,7 +102,7 @@ impl McpReloadTool {
             return ToolResult::text(render_local(&req, &cfg));
         }
 
-        let report = self.manager.reload(&self.workdir).await;
+        let report = self.manager.reload(&self.workdir, now_unix()).await;
         ToolResult::text(render_with_report(&req, &report))
     }
 }
@@ -393,7 +393,7 @@ mod tests {
         cache.save(dir.path()).unwrap();
 
         let manager = McpManager::empty();
-        manager.reload(dir.path()).await;
+        manager.reload(dir.path(), now_unix()).await;
         manager.set_server("fs", false).unwrap();
         assert!(!manager.is_effective("fs"), "runtime disable must apply");
 
@@ -490,6 +490,7 @@ mod tests {
                 added: true,
                 removed: false,
                 probed: true,
+                skipped_backoff: false,
                 tool_count: 0,
                 read_only_count: 0,
                 error: Some("npx 下载超时".into()),
@@ -526,6 +527,7 @@ mod tests {
                 added: true,
                 removed: false,
                 probed: false,
+                skipped_backoff: false,
                 tool_count: 3,
                 read_only_count: 1,
                 error: None,

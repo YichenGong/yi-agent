@@ -2183,7 +2183,7 @@ fn run_tui_agent(
                         DriverControl::McpReload => {
                             // 重新读盘:用户可能自己改过 mcp.json,所以要按磁盘
                             // 现状重建,而不是信任内存里的开关。只探测变化的 server。
-                            let report = mcp_for_driver.reload(&driver_workdir).await;
+                            let report = mcp_for_driver.reload(&driver_workdir, yi_agent_mcp::now_unix()).await;
                             for s in &report.servers {
                                 if let Some(err) = &s.error {
                                     tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
@@ -2487,7 +2487,7 @@ fn run_tui_agent(
                 // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
                 // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
                 if mcp_for_driver.needs_reload(&driver_workdir, yi_agent_mcp::now_unix()) {
-                    let report = mcp_for_driver.reload(&driver_workdir).await;
+                    let report = mcp_for_driver.reload(&driver_workdir, yi_agent_mcp::now_unix()).await;
                     for s in &report.servers {
                         if let Some(err) = &s.error {
                             tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
