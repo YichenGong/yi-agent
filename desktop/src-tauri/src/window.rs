@@ -94,6 +94,93 @@ pub fn fit_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The label of the one window that hides instead of closing.
+pub const MAIN_WINDOW: &str = "main";
+
+/// Whether a `CloseRequested` on `label` should hide the window.
+///
+/// Split out from [`hide_on_close`] so the rule is testable without a runtime:
+/// `CloseRequestApi` cannot be constructed outside the framework.
+pub fn hide_on_close_is_our_window(label: &str) -> bool {
+    label == MAIN_WINDOW
+}
+
+/// Hide the window instead of closing it, so the app keeps running in the Dock.
+///
+/// The window object survives — nothing is destroyed — which is why the
+/// webview keeps its React state (scroll position, streamed transcript, the
+/// draft in the composer) across the hide/show cycle.
+///
+/// Only `main` is handled; any other window keeps the framework default. A
+/// failed `hide` is logged rather than propagated: the close was already
+/// prevented, and a window that stays visible is better than a crash.
+#[cfg(target_os = "macos")]
+pub fn hide_on_close<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    api: &tauri::CloseRequestApi,
+) {
+    use tauri::Manager;
+
+    if !hide_on_close_is_our_window(label) {
+        return;
+    }
+    api.prevent_close();
+    match app.get_webview_window(label) {
+        Some(window) => {
+            if let Err(err) = window.hide() {
+                eprintln!("[window] hide failed: {err}");
+            }
+        }
+        None => eprintln!("[window] close requested for a missing window: {label}"),
+    }
+}
+
+/// Bring the main window back after the user clicks the Dock icon.
+///
+/// Called only when macOS reports no visible windows, so this never fights a
+/// window the user already has in front. `show` and `set_focus` failures are
+/// logged, not propagated: `App::run`'s callback has no way to surface them and
+/// a window that is visible but unfocused is still usable.
+#[cfg(target_os = "macos")]
+pub fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager;
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        eprintln!("[window] reopen: no {MAIN_WINDOW} window to show");
+        return;
+    };
+    if let Err(err) = window.show() {
+        eprintln!("[window] show failed: {err}");
+    }
+    if let Err(err) = window.set_focus() {
+        eprintln!("[window] focus failed: {err}");
+    }
+}
+
+/// The window-visibility policy, wired to the app's event loop.
+///
+/// Kept as a named function so a test can drive the real policy instead of
+/// re-writing the match. `lib.rs` does nothing but forward to it.
+#[cfg(target_os = "macos")]
+pub fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &tauri::RunEvent) {
+    match event {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } => hide_on_close(app, label, api),
+        // `has_visible_windows == true` means the app is merely behind
+        // another one: macOS already brings it forward, and calling `show()`
+        // there would steal focus the user is in the middle of moving.
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => reveal_main_window(app),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +237,16 @@ mod tests {
             let fit = fit_to_work_area(DESIRED, MIN, (1280.0, 720.0), scale);
             assert_fit(fit, 1280.0, 820.0, 900.0, 600.0);
         }
+    }
+
+    /// The hide-on-close rule matches exactly the main window label and no
+    /// other. This covers the label predicate only; the actual hide/show path
+    /// is exercised by the `close_hides_window` integration test and by manual
+    /// acceptance.
+    #[test]
+    fn hide_on_close_only_applies_to_the_main_window() {
+        assert!(hide_on_close_is_our_window("main"));
+        assert!(!hide_on_close_is_our_window("other"));
     }
 
     /// Guards the one thing two sources of truth can silently disagree on: the

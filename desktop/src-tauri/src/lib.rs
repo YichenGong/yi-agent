@@ -1,7 +1,7 @@
 #[cfg(desktop)]
 mod bridge;
 #[cfg(desktop)]
-mod window;
+pub mod window;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -31,7 +31,15 @@ pub fn run() {
             Ok(())
         });
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // Closing the main window hides it instead of quitting, so the app keeps
+    // running in the Dock like every other Mac app. `Reopen` (the Dock click)
+    // only exists on macOS; elsewhere the framework default is correct.
+    #[cfg(target_os = "macos")]
+    app.run(|app, event| window::handle_run_event(app, &event));
+    #[cfg(not(target_os = "macos"))]
+    app.run(|_app, _event| {});
 }
