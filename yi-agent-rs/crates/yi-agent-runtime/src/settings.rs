@@ -65,6 +65,238 @@ pub fn parse_env_text(text: &str) -> BTreeMap<String, String> {
     out
 }
 
+use serde::{Deserialize, Serialize};
+
+/// `settings.json` 的顶层结构。
+///
+/// 每个字段都是 `Option<T>`：`None` 表示「未设置，用默认值」。这让「恢复默认」
+/// 等于删掉该键，而不是把当前默认值写回去——将来默认值改了，用户跟着变。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub agent: AgentSettings,
+    pub compact: CompactSettings,
+    pub startup: StartupSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    #[serde(default, deserialize_with = "de_optional_u32")]
+    pub max_turns: Option<u32>,
+    #[serde(default, deserialize_with = "de_optional_u16")]
+    pub max_direct_children: Option<u16>,
+    #[serde(default, deserialize_with = "de_optional_u16")]
+    pub max_resident_subagents: Option<u16>,
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub system_prompt: Option<String>,
+    #[serde(default, deserialize_with = "de_optional_usize")]
+    pub skills_catalog_budget: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactSettings {
+    #[serde(default, deserialize_with = "de_optional_u32")]
+    pub ratio: Option<u32>,
+    #[serde(default, deserialize_with = "de_optional_usize")]
+    pub user_budget_tokens: Option<usize>,
+    #[serde(default, deserialize_with = "de_optional_usize")]
+    pub tool_budget_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartupSettings {
+    /// `read-only` / `workspace-write` / `danger-full-access`；`None` = 未设置。
+    /// 存字符串而非枚举：非法值要能被加载侧识别并 warn 回退，而不是让整份
+    /// JSON 反序列化失败（那会把用户其它字段一起丢掉）。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub sandbox: Option<String>,
+}
+
+/// 表单控件类型。`Number` 与 `Text` 在 JSON 里都是标量，区别只在渲染与校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldType {
+    Number,
+    Text,
+    Select,
+}
+
+/// 一个可持久化字段的元数据。web 与桌面端都渲染这张表，故描述与默认值文案
+/// 只在这里写一次。
+#[derive(Debug, Clone, Copy)]
+pub struct FieldSpec {
+    /// 点路径键，同时是 RPC 的 `key` 与写入定位。
+    pub key: &'static str,
+    pub group: &'static str,
+    pub label: &'static str,
+    pub field_type: FieldType,
+    /// 默认值的展示文案。必须是 `config.rs` 常量的字符串形式（Task 3 会加
+    /// 常量并在测试里比对）。
+    pub default_display: &'static str,
+    pub description: &'static str,
+    pub options: &'static [&'static str],
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+}
+
+/// 可持久化的全部字段。`workdir` 与 `yolo` 不在其中，见 spec「存储」一节。
+pub static FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        key: "agent.max_turns",
+        group: "agent",
+        label: "最大轮次",
+        field_type: FieldType::Number,
+        default_display: "200",
+        description: "一次对话里 agent 最多执行的轮数",
+        options: &[],
+        min: Some(1),
+        // 上限必须给：`Settings.agent.max_turns` 是 `Option<u32>`，写入
+        // 大于 u32::MAX 的值会让下次 `load_from` 反序列化失败，整份文件
+        // 静默回默认——用户看到的只是「我改的设置全没了」。
+        max: Some(u32::MAX as u64),
+    },
+    FieldSpec {
+        key: "agent.max_direct_children",
+        group: "agent",
+        label: "直接子 agent 上限",
+        field_type: FieldType::Number,
+        default_display: "8",
+        description: "一个 agent 可同时拥有的未终止直接子 agent 数",
+        options: &[],
+        min: Some(1),
+        max: Some(u16::MAX as u64),
+    },
+    FieldSpec {
+        key: "agent.max_resident_subagents",
+        group: "agent",
+        label: "常驻子 agent 容量",
+        field_type: FieldType::Number,
+        default_display: "64",
+        description: "本 daemon 可常驻的子 agent 数；根 agent 不占额度",
+        options: &[],
+        min: Some(1),
+        max: Some(u16::MAX as u64),
+    },
+    FieldSpec {
+        key: "agent.system_prompt",
+        group: "agent",
+        label: "系统提示词",
+        field_type: FieldType::Text,
+        default_display: "",
+        description: "覆盖默认系统提示词；留空表示用默认",
+        options: &[],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "agent.skills_catalog_budget",
+        group: "agent",
+        label: "技能目录预算（字节）",
+        field_type: FieldType::Number,
+        default_display: "8192",
+        description: "注入系统提示词的技能目录上限；超出时按策略截断或询问",
+        options: &[],
+        min: Some(1),
+        max: Some(u32::MAX as u64),
+    },
+    FieldSpec {
+        key: "compact.ratio",
+        group: "compact",
+        label: "压缩触发占比（%）",
+        field_type: FieldType::Number,
+        default_display: "80",
+        description: "上下文占用达到这个百分比时触发自动压缩",
+        options: &[],
+        min: Some(1),
+        max: Some(100),
+    },
+    FieldSpec {
+        key: "compact.user_budget_tokens",
+        group: "compact",
+        label: "压缩保留用户 token",
+        field_type: FieldType::Number,
+        default_display: "20000",
+        description: "压缩时保留的真实用户输入 token 数",
+        options: &[],
+        min: Some(1),
+        max: Some(u32::MAX as u64),
+    },
+    FieldSpec {
+        key: "compact.tool_budget_tokens",
+        group: "compact",
+        label: "压缩保留工具 token",
+        field_type: FieldType::Number,
+        default_display: "12000",
+        description: "压缩时保留的完整工具交互 token 数",
+        options: &[],
+        min: Some(1),
+        max: Some(u32::MAX as u64),
+    },
+    FieldSpec {
+        key: "startup.sandbox",
+        group: "startup",
+        label: "默认沙箱档位",
+        field_type: FieldType::Select,
+        default_display: "workspace-write",
+        description: "启动时的文件写入沙箱；空表示用默认档位",
+        options: &["read-only", "workspace-write", "danger-full-access"],
+        min: None,
+        max: None,
+    },
+];
+
+/// `Option<T>` 的宽容反序列化：类型不符（如 `"abc"`、`-1`、`1.5`、数组）按
+/// **未设置**处理，而不是让整份 `settings.json` 反序列化失败。
+///
+/// 为什么需要：`#[serde(default)]` 只补缺失字段，**不救坏值**。没有这几个
+/// 函数时，用户手改出 `"max_turns": "abc"` 会让 `load_from` 整份回默认，
+/// 连正确的 `compact.ratio` 一起丢掉——spec 的错误处理一节要求逐字段降级。
+///
+/// 与 `models.rs` 的 `de_optional_string` / `de_optional_capabilities` 同一策略。
+fn de_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_u64()))
+}
+
+fn de_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(de_optional_u64(deserializer)?.and_then(|v| u32::try_from(v).ok()))
+}
+
+fn de_optional_u16<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(de_optional_u64(deserializer)?.and_then(|v| u16::try_from(v).ok()))
+}
+
+fn de_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(de_optional_u64(deserializer)?.and_then(|v| usize::try_from(v).ok()))
+}
+
+fn de_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_str().map(str::to_string)))
+}
+
+/// 按点路径键查元数据。
+pub fn find_spec(key: &str) -> Option<&'static FieldSpec> {
+    FIELDS.iter().find(|field| field.key == key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +417,108 @@ malformed line
             parse_env_line("A=中文值 # 注释"),
             Some(("A".to_string(), "中文值".to_string()))
         );
+    }
+    #[test]
+    fn field_keys_are_unique() {
+        let mut keys: Vec<&str> = FIELDS.iter().map(|f| f.key).collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "duplicate field keys in FIELDS");
+    }
+
+    #[test]
+    fn every_select_field_has_options_and_every_other_field_has_none() {
+        for field in FIELDS {
+            match field.field_type {
+                FieldType::Select => {
+                    assert!(
+                        !field.options.is_empty(),
+                        "{} is Select but has no options",
+                        field.key
+                    );
+                }
+                _ => {
+                    assert!(
+                        field.options.is_empty(),
+                        "{} is not Select but has options",
+                        field.key
+                    );
+                }
+            }
+        }
+    }
+
+    /// 默认值文案必须与 `config.rs` 的常量一致。这条测试是「默认值只有一处」的
+    /// 回归网：改了常量却忘了改文案，这里会红。
+    #[test]
+    fn default_display_matches_the_runtime_constants() {
+        use crate::config::{DIRECT_CHILDREN_DEFAULT, RESIDENT_SUBAGENTS_DEFAULT};
+        assert_eq!(
+            find_spec("agent.max_resident_subagents")
+                .unwrap()
+                .default_display,
+            RESIDENT_SUBAGENTS_DEFAULT.to_string()
+        );
+        assert_eq!(
+            find_spec("agent.max_direct_children")
+                .unwrap()
+                .default_display,
+            DIRECT_CHILDREN_DEFAULT.to_string()
+        );
+        // 这三个在 config.rs 里是行内字面量，Task 3 会把它们提成常量后再回来改这里。
+        assert_eq!(find_spec("agent.max_turns").unwrap().default_display, "200");
+        assert_eq!(find_spec("compact.ratio").unwrap().default_display, "80");
+        assert_eq!(
+            find_spec("compact.user_budget_tokens")
+                .unwrap()
+                .default_display,
+            "20000"
+        );
+        assert_eq!(
+            find_spec("compact.tool_budget_tokens")
+                .unwrap()
+                .default_display,
+            "12000"
+        );
+        assert_eq!(
+            find_spec("agent.skills_catalog_budget")
+                .unwrap()
+                .default_display,
+            "8192"
+        );
+        assert_eq!(
+            find_spec("startup.sandbox").unwrap().default_display,
+            "workspace-write"
+        );
+    }
+
+    /// `workdir` 与 `yolo` 刻意不在表里。workdir 只由启动方式决定，yolo 必须每次
+    /// 启动显式给出——持久化它会让 `sandbox_promotable` 恒为 false。
+    #[test]
+    fn workdir_and_yolo_are_not_persistable() {
+        for forbidden in ["workdir", "agent.workdir", "yolo", "startup.yolo"] {
+            assert!(
+                find_spec(forbidden).is_none(),
+                "{forbidden} must not be persistable"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_options_match_the_sandbox_mode_variants() {
+        let spec = find_spec("startup.sandbox").unwrap();
+        assert_eq!(
+            spec.options,
+            &["read-only", "workspace-write", "danger-full-access"]
+        );
+        // 与 SandboxMode::as_str 同源，不是另抄一份。
+        for mode in [
+            yi_agent_tools::SandboxMode::ReadOnly,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            yi_agent_tools::SandboxMode::DangerFullAccess,
+        ] {
+            assert!(spec.options.contains(&mode.as_str()));
+        }
     }
 }
