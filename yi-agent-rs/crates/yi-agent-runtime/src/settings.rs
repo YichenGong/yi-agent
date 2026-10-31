@@ -871,8 +871,6 @@ malformed line
         }
     }
 
-    use std::path::Path;
-
     fn temp_dir() -> tempfile::TempDir {
         tempfile::TempDir::new().unwrap()
     }

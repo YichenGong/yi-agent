@@ -52,6 +52,8 @@ impl ModelEnvSnapshot {
 /// 把「因 `.env` 而出现」的模型键从进程环境剔除，避免泄漏给子进程。
 ///
 /// 判据：快照里没有、现在却有 → 它必然来自 `.env`。真实进程环境里的键不动。
+// TODO(Task 14): 随 `.env` 支持一并删除。
+#[allow(dead_code)]
 fn prune_dotenv_model_keys(snapshot: &ModelEnvSnapshot) {
     for key in MODEL_ENV_KEYS {
         let from_real_env = snapshot.values.get(key).is_some_and(Option::is_some);
@@ -153,6 +155,12 @@ pub struct ConfigOverrides {
     pub skills_catalog_budget: Option<usize>,
 }
 
+fn env_u16(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name)
         .ok()
@@ -179,6 +187,8 @@ pub(crate) fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxM
 ///
 /// 「全局」是唯一的 `.env`：模型设置已迁到 `models.json`，其余键（轮次、压缩、
 /// 沙箱等）只从 `~/.yi-agent/.env` 读，不再叠加项目级 `.env`。
+// TODO(Task 14): 迁移窗口结束后连同 `prune_dotenv_model_keys` 一起删除。
+#[allow(dead_code)]
 pub(crate) fn load_env_files(path: &Path) {
     load_one_env(path);
 }
@@ -203,18 +213,15 @@ pub fn resolve_global_env_path() -> Option<PathBuf> {
 
 /// Resolve the effective workdir without loading provider configuration.
 ///
-/// Priority is the explicit workdir override, non-empty `YI_AGENT_WORKDIR`,
-/// then the current directory.
+/// Priority is the explicit workdir override, then the current directory.
+/// `YI_AGENT_WORKDIR` is intentionally gone: the working directory is a
+/// session/project property, decided by `--workdir`, the launch directory, or
+/// the project the desktop app selected. A global env var fighting the
+/// "last opened project" was the exact conflict this removal fixes.
 pub fn resolve_workdir(overrides: &ConfigOverrides) -> Result<PathBuf> {
     let workdir = overrides
         .workdir
         .clone()
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     if !workdir.is_dir() {
@@ -233,8 +240,8 @@ impl RuntimeConfig {
 
     /// 从覆盖项 + 环境变量加载配置；**允许 API key 缺失**（回空串）。
     ///
-    /// 优先级:覆盖项 > 真实进程环境变量 > 全局 `.env`（仅非模型键） > 默认值。
-    /// `.env` 只有一处:`$HOME/.yi-agent/.env`,不主动创建目录。
+    /// 优先级:覆盖项 > 真实进程环境变量 > `settings.json` > 默认值。
+    /// `settings.json` 只有一处:`<instance_home>/settings.json`,不主动创建目录。
     ///
     /// 这是**唯一**的加载入口。曾经还有一个严格版 `load`（缺 key 即 bail），
     /// 它和本函数对「这台机器配好了没有」给出相反答案：模型只在 `models.json`
@@ -253,14 +260,11 @@ impl RuntimeConfig {
     }
 
     fn load_inner(overrides: &ConfigOverrides) -> Result<Self> {
-        // 快照必须早于任何 .env 加载（见 `ModelEnvSnapshot` 的文档）。
+        // 快照必须早于任何环境注入（见 `ModelEnvSnapshot` 的文档）。
         let model_env = ModelEnvSnapshot::take();
-        // 唯一的 `.env` 是全局 `~/.yi-agent/.env`；没有 HOME 时退回到 workdir 内的
-        // 本地路径（与 `models_path` 同口径），不再有项目级 `.env` 概念。
-        let env_path =
-            resolve_global_env_path().unwrap_or_else(|| PathBuf::from(".yi-agent").join(".env"));
-        load_env_files(&env_path);
-        prune_dotenv_model_keys(&model_env);
+        // `settings.json` 是第三层（覆盖 > 真实 env > settings.json > 默认）。
+        // 坏文件已在 `load_from` 里降级成全 `None`，故这里不必再处理错误。
+        let settings = crate::settings::load();
 
         let injected_provider = overrides
             .provider
@@ -318,16 +322,15 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
+            .or(settings.agent.max_turns)
             .unwrap_or(MAX_TURNS_DEFAULT);
 
-        let max_resident_subagents = std::env::var("YI_AGENT_MAX_RESIDENT_SUBAGENTS")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let max_resident_subagents = env_u16("YI_AGENT_MAX_RESIDENT_SUBAGENTS")
+            .or(settings.agent.max_resident_subagents)
             .unwrap_or(RESIDENT_SUBAGENTS_DEFAULT);
 
-        let max_direct_children = std::env::var("YI_AGENT_MAX_DIRECT_CHILDREN")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let max_direct_children = env_u16("YI_AGENT_MAX_DIRECT_CHILDREN")
+            .or(settings.agent.max_direct_children)
             .unwrap_or(DIRECT_CHILDREN_DEFAULT);
 
         let workdir = resolve_workdir(overrides)?;
@@ -336,6 +339,7 @@ impl RuntimeConfig {
             .system_prompt
             .clone()
             .or_else(|| std::env::var("YI_AGENT_SYSTEM_PROMPT").ok())
+            .or_else(|| settings.agent.system_prompt.clone())
             .filter(|s| !s.is_empty());
 
         let model_context_length = overrides.model_context_length.or_else(|| {
@@ -351,6 +355,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
+            .or(settings.compact.ratio)
             .unwrap_or(COMPACT_RATIO_DEFAULT);
 
         let effective_context_length = model_context_length.unwrap_or(200_000);
@@ -369,6 +374,7 @@ impl RuntimeConfig {
         let compact_user_budget_tokens = overrides
             .compact_user_budget_tokens
             .or_else(|| env_usize("YI_AGENT_COMPACT_USER_BUDGET_TOKENS"))
+            .or(settings.compact.user_budget_tokens)
             .unwrap_or(COMPACT_USER_BUDGET_DEFAULT);
         if compact_user_budget_tokens == 0 {
             bail!("compact user budget tokens must be greater than zero");
@@ -376,6 +382,7 @@ impl RuntimeConfig {
         let compact_tool_budget_tokens = overrides
             .compact_tool_budget_tokens
             .or_else(|| env_usize("YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS"))
+            .or(settings.compact.tool_budget_tokens)
             .unwrap_or(COMPACT_TOOL_BUDGET_DEFAULT);
 
         let yolo = overrides.yolo
@@ -385,6 +392,14 @@ impl RuntimeConfig {
                 .unwrap_or(false);
 
         let env_sandbox = std::env::var("YI_AGENT_SANDBOX").ok();
+        // settings.json 的沙箱与 env 的沙箱都不算「显式指定启动姿态」，故与过去
+        // 来自 `.env` 的档位同口径：不阻断运行期提权。只有 CLI flag 与真实 env
+        // 才把它钉死为不可提权。
+        let settings_sandbox = settings
+            .startup
+            .sandbox
+            .as_deref()
+            .and_then(parse_sandbox_mode);
         // 显式 / env 指定的沙箱永不被提权。同时 `promotable` 只在「启动时非 yolo」时
         // 才有意义(桌面端运行期切换场景):若启动时 yolo 已打开(CLI `--yolo`、
         // `--dangerously-skip-permissions` 或 `YI_AGENT_YOLO`),`sandbox` 已经反映了
@@ -402,7 +417,7 @@ impl RuntimeConfig {
                     false,
                 ),
                 None if overrides.yolo => (yi_agent_tools::SandboxMode::DangerFullAccess, !yolo),
-                None => (yi_agent_tools::SandboxMode::default(), !yolo),
+                None => (settings_sandbox.unwrap_or_default(), !yolo),
             },
         };
 
@@ -420,6 +435,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
+            .or(settings.agent.skills_catalog_budget)
             .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
 
         Ok(RuntimeConfig {
@@ -595,6 +611,7 @@ mod tests {
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
             "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
             "YI_AGENT_MAX_DIRECT_CHILDREN",
+            "YI_AGENT_HOME",
         ]);
         // 唯一 `.env` 是 `$HOME/.yi-agent/.env`。测试必须把 HOME 指到一个不存在
         // 的位置，否则会读到开发者机器上的真实 `.env`（其非模型键会污染默认值断言）。
@@ -622,6 +639,7 @@ mod tests {
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
             "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
             "YI_AGENT_MAX_DIRECT_CHILDREN",
+            "YI_AGENT_HOME",
         ] {
             env.remove(key);
         }
@@ -702,6 +720,199 @@ mod tests {
         }
     }
 
+    /// 设置一个白名单环境变量，并让它指向隔离的实例目录。
+    struct IsolatedInstance {
+        _env: EnvVarGuard,
+        dir: tempfile::TempDir,
+    }
+
+    impl IsolatedInstance {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut env = isolated_config_env();
+            env.set("YI_AGENT_HOME", dir.path().join(".yi-agent"));
+            Self { _env: env, dir }
+        }
+
+        fn write_settings(&self, json: &str) {
+            let home = self.dir.path().join(".yi-agent");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("settings.json"), json).unwrap();
+        }
+    }
+
+    #[test]
+    fn settings_json_supplies_values_when_nothing_else_does() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(
+            r#"{"agent":{"max_turns":321},"compact":{"ratio":55},"startup":{"sandbox":"read-only"}}"#,
+        );
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.max_turns, 321);
+        assert_eq!(cfg.compact_ratio, 55);
+        assert_eq!(cfg.sandbox, yi_agent_tools::SandboxMode::ReadOnly);
+        // 配置出来的沙箱不是「显式指定」，故仍可运行期提权。
+        assert!(
+            cfg.sandbox_promotable,
+            "a sandbox from settings.json must stay promotable"
+        );
+    }
+
+    /// 真实进程环境变量压过 settings.json——这是 spec 定的第二/第三层。
+    #[test]
+    fn real_env_beats_settings_json() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"max_turns":321}}"#);
+
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_HOME", instance.dir.path().join(".yi-agent"));
+        env.set("YI_AGENT_MAX_TURNS", "654");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.max_turns, 654);
+    }
+
+    /// CLI 覆盖压过两者。
+    #[test]
+    fn override_beats_env_and_settings() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"max_turns":321}}"#);
+
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_HOME", instance.dir.path().join(".yi-agent"));
+        env.set("YI_AGENT_MAX_TURNS", "654");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            max_turns: Some(999),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.max_turns, 999);
+    }
+
+    #[test]
+    fn missing_settings_json_falls_back_to_defaults() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.max_turns, MAX_TURNS_DEFAULT);
+        assert_eq!(cfg.compact_ratio, COMPACT_RATIO_DEFAULT);
+        assert_eq!(cfg.skills_catalog_budget, SKILLS_CATALOG_BUDGET_DEFAULT);
+    }
+
+    #[test]
+    fn corrupt_settings_json_does_not_block_startup() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings("{ not json");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .expect("a corrupt settings.json must not block startup");
+
+        assert_eq!(cfg.max_turns, MAX_TURNS_DEFAULT);
+    }
+
+    /// 空白串等同于未设置，不能让 `system_prompt` 变成空串而不是 None。
+    #[test]
+    fn blank_settings_string_is_unset() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"system_prompt":"   "}}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.system_prompt, None);
+    }
+
+    /// `YI_AGENT_WORKDIR` 已下线：设了也不影响工作目录。
+    #[test]
+    fn workdir_env_var_no_longer_overrides() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let here = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_WORKDIR", elsewhere.path());
+
+        let resolved = resolve_workdir(&ConfigOverrides {
+            workdir: Some(here.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(resolved, here.path());
+        assert_ne!(resolved, elsewhere.path());
+    }
+
+    /// settings.json 里的 budget 不算「显式指定」：技能目录超预算时仍应询问
+    /// （交互终端下），而不是静默截断。
+    #[test]
+    fn settings_budget_is_not_explicit() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"agent":{"skills_catalog_budget":4096}}"#);
+
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_HOME", instance.dir.path().join(".yi-agent"));
+        env.remove("YI_AGENT_SKILLS_CATALOG_BUDGET");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(cfg.skills_catalog_budget, 4096);
+        assert!(
+            !cfg.skills_catalog_budget_explicit,
+            "settings.json is a long-lived preference, not an explicit per-launch choice"
+        );
+    }
+
     #[test]
     fn parse_sandbox_mode_covers_all_variants() {
         use clap::ValueEnum;
@@ -771,21 +982,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_workdir_uses_nonempty_environment_value() {
+    fn resolve_workdir_ignores_the_environment_value() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::TempDir::new().expect("tempdir");
+        let here = tempfile::TempDir::new().expect("tempdir");
+        let elsewhere = tempfile::TempDir::new().expect("tempdir");
         let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
         env.set(
             "YI_AGENT_WORKDIR",
-            temp.path().to_str().expect("UTF-8 temporary path"),
+            elsewhere.path().to_str().expect("UTF-8 temporary path"),
         );
-        let overrides = ConfigOverrides::default();
+        let _cwd = CurrentDirGuard::change_to(here.path());
 
+        // `YI_AGENT_WORKDIR` 已下线：没有 workdir 覆盖时只能落回启动目录。
+        // macOS 的 `/var` 是 `/private/var` 的符号链接，两边都规范化后再比。
         assert_eq!(
-            resolve_workdir(&overrides).expect("resolve environment workdir"),
-            temp.path()
+            resolve_workdir(&ConfigOverrides::default())
+                .expect("resolve workdir")
+                .canonicalize()
+                .unwrap(),
+            here.path().canonicalize().unwrap()
         );
     }
 
@@ -1057,26 +1274,23 @@ mod tests {
         assert_eq!(config.model, "", "no default model name may be invented");
     }
 
-    /// `.env` 仍会被加载（非模型键需要它），但它**不再是模型 key 的来源**。
+    /// 非模型键改由 `settings.json` 提供，`.env` 不再是任何键的来源。
     ///
-    /// 这是 Task 2 的语义翻转：同一个 `MODEL_API_KEY=...` 写进 `$HOME/.yi-agent/.env`，
-    /// 但整包注入只认「真实进程环境 + CLI 覆盖」，故它既不进 config，也不残留在进程
-    /// 环境里（`prune_dotenv_model_keys` 已剔除），更不会泄漏给子进程。
+    /// 语义翻转：同一个 `MODEL_API_KEY=...` 写进 `.env` 后既不进 config，也不残留
+    /// 在进程环境里，更不会泄漏给子进程；`max_turns` 则来自 `settings.json`。
     #[test]
-    fn load_reads_dotenv_file() {
+    fn settings_file_supplies_non_model_keys() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut env = isolated_config_env();
-        // 唯一 `.env` 在 `$HOME/.yi-agent/.env`：把 HOME 指向本次测试的临时家。
         let home = tempfile::TempDir::new().unwrap();
         env.set("HOME", home.path());
         let yi_agent_dir = home.path().join(".yi-agent");
         std::fs::create_dir_all(&yi_agent_dir).unwrap();
-        let env_path = yi_agent_dir.join(".env");
         std::fs::write(
-            &env_path,
-            "MODEL_API_KEY=from-dotenv-file\nYI_AGENT_MAX_TURNS=123\n",
+            yi_agent_dir.join("settings.json"),
+            r#"{"agent":{"max_turns":123}}"#,
         )
         .unwrap();
 
@@ -1100,16 +1314,14 @@ mod tests {
             skills_catalog_budget: None,
         };
         let config = RuntimeConfig::load_lenient(&overrides).unwrap();
-        assert_eq!(config.api_key, "", "dotenv must not supply the model key");
+        assert_eq!(
+            config.api_key, "",
+            "the model key must not come from a file"
+        );
         assert!(!config.model_injected);
         assert_eq!(
             config.max_turns, 123,
-            "non-model keys still come from the .env"
-        );
-        assert_eq!(
-            std::env::var("MODEL_API_KEY").ok(),
-            None,
-            "the key dotenvy injected must be pruned from the process env"
+            "non-model keys come from settings.json"
         );
     }
 
