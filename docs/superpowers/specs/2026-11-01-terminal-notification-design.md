@@ -7,10 +7,10 @@
 
 TUI 里跑一个长回合时，用户会切到别的窗口。回合结束时没有任何信号，只能不断切回来确认。当 agent 卡在权限确认弹窗等待时，这个成本更高——它真的停在那里等，而用户不知道。
 
-终端本身提供了三条件内通知机制，实现成本极低：
+终端本身提供了三种标准的通知机制，实现成本极低：
 
 - **BEL**（`0x07`）：最古老，几乎全部终端支持。
-- **OSC 9**（`ESC ] 9 ; <text> ST`）：iTerm2 起源（2070 年前），Ghostty、kitty、WezTerm、Warp 跟进。
+- **OSC 9**（`ESC ] 9 ; <text> ST`）：iTerm2 起源（2010 年前），Ghostty、kitty、WezTerm、Warp 跟进。
 - **OSC 777**（`ESC ] 777 ; notify ; <title> ; <body> ST`）：urxvt 扩展，WezTerm 支持。
 
 当前 yi-agent 的 CLI 与 TUI **完全没有这部分实现**。全仓核查结果：
@@ -25,7 +25,7 @@ TUI 里跑一个长回合时，用户会切到别的窗口。回合结束时没�
 
 ## 2. 参照实现
 
-本设计以本地 Codex 源码（`OpenSource/codex`，HEAD `67f0994b53`）为基准，逐项对齐其架构与行为，并修正其中三处已知缺陷。
+本设计以本地 Codex 源码（`OpenSource/codex`，HEAD `67f0994b53`）为基准，逐项对齐其架构与行为。相对它共有六处差异：**三处是缺陷修正**（Windows 焦点、正文消毒、zellij 透传），**三处是范围减法**（不做 OSC 777、不做按类型白名单、不做热更新）。汇总见 §8。
 
 Codex 的实现分布：
 
@@ -38,7 +38,7 @@ Codex 的实现分布：
 | `tui/src/tui.rs:1056-1080` | `Tui::notify`：焦点条件 + 失败自禁 |
 | `tui/src/tui.rs:123-128` | `should_emit_notification` |
 | `tui/src/tui.rs:268-270` | `EnableFocusChange` / `DisableFocusChange` |
-| `tui/src/event_stream.rs:306-313` | `FocusGained/Lost` → `AtomicBool` |
+| `tui/src/tui/event_stream.rs:306-313` | `FocusGained/Lost` → `AtomicBool` |
 | `tui/src/chatwidget/notifications.rs` | `Notification` 枚举、优先级、去抖、文案 |
 | `tui/src/app.rs:1184` | `maybe_post_pending_notification`（绘制间隙 flush） |
 
@@ -57,7 +57,7 @@ Codex 的实现分布：
 
 - **OSC 777**。唯一优势是能带标题，但支持者只有 urxvt 与 WezTerm，而 WezTerm 同样支持 OSC 9。为一个几乎不存在的终端组合增加一个后端、一组分号转义规则和一批测试，属于 YAGNI。将来若要做，只作为显式 `method` 值，**不进入 `auto` 的自动选择**（否则 `auto` 需要回答一个永远没有正确答案的问题）。
 - **按类型白名单**。Codex 的 `Notifications` 是 `bool | Vec<String>` 的 untagged enum，我们本次只有两类事件，白名单不产生价值。只实现 `bool`。将来加数组形态是向后兼容的扩展。
-- **失败 / 中断通知**。`Done { reason: MaxTurns }`、`AgentEvent::Error`、`AgentEvent::Cancelled` 一律不发。失败时 TUI 已有醒目的红色错误行；`Ctrl+C` 说明用户人就在键盘前。这两种情况的通知价值远低于「你切走了但结果出来了」，且一旦默认开启会在 CI 与无人值守场景刷屏。
+- **失败 / 中断通知**。`DoneReason` 有三个变体（`yi-agent-core/src/agent.rs:436-440`）：`EndTurn`、`MaxTurns`、`Interrupted { reason }`。只有 `EndTurn` 发通知；`MaxTurns`（撞上轮次上限，不是正常结束）与 `Interrupted`（含用户 `Ctrl+C`）都不发。`AgentEvent::Error` 与 `AgentEvent::Cancelled` 同样不发。失败时 TUI 已有醒目的红色错误行；`Ctrl+C` 说明用户人就在键盘前。这两种情况的通知价值远低于「你切走了但结果出来了」，且一旦默认开启会在 CI 与无人值守场景刷屏。
 - **配置热更新**。Codex 有 `set_notification_settings` 供设置面板调用，但我们的 TUI 没有设置面板（`/config` 只渲染只读快照，`tui/slash.rs::TuiConfigSnapshot::render`），没有触发源。配置改动**下次启动生效**。
 - **headless（`yi-agent run`）通知**。`run --json` 的 stdout 是逐行 JSONL，是端到端测试的契约（见 `docs/project-management/yi-agent-run.md`），注入控制字符会直接破坏它。headless 完全不动。
 
@@ -118,18 +118,52 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 
 ### 5.2 auto 选择
 
-严格对齐 Codex `notifications/mod.rs:57-66` 的五家白名单：
+严格对齐 Codex `notifications/mod.rs:53-63` 的**五家白名单**：
 
-| 终端 | 判据 | 结果 |
+```rust
+matches!(name,
+    Ghostty | Iterm2 | Kitty | WarpTerminal | WezTerm)
+```
+
+不扩表。这张表是「实测能弹出系统通知」的集合，不是「协议支持」的集合；扩表必须先实测，本次没有实测预算。显式 `method = osc9` 可让任何终端走 OSC 9。
+
+#### 5.2.1 终端识别判据
+
+**必须可注入环境。** Codex 的识别函数签名是 `fn detect_terminal_identity_from_env(env: &dyn Environment)`（`lib.rs:289`），`Environment` 是一个只含 `var` / `var_non_empty` / `has` / `has_non_empty` 的私有 trait（`lib.rs:214`），真实进程环境经 `ProcessEnvironment` 传入，测试传入一个 `HashMap` 即可。
+
+我们照这个形状做，不直接读 `std::env`：
+
+```rust
+#[cfg_attr(test, derive(Default))]
+pub struct TerminalEnv(BTreeMap<String, String>);
+impl TerminalEnv { pub fn from_process() -> Self { /* std::env::vars */ } }
+```
+
+理由很实际：用 `std::env::set_var` 写测试会污染其它并行测试（而且 `set_var` 在 Rust 2024 已是 `unsafe`）。注入式环境让「五位白名单 + 五种兜底 + 两个多路复用器」全部可以在无终端环境下断言。
+
+Codex 把识别做成独立的 `terminal-detection` crate（`codex-rs/terminal-detection/src/lib.rs`）。我们**不移植整个 crate**，只实现本功能需要的五种识别，顺序照抄 `detect_terminal_identity_from_env`（`lib.rs:289-337`）：
+
+| 顺序 | 判据 | 结论 |
 |---|---|---|
-| Ghostty | `TERM_PROGRAM=ghostty` | OSC 9 |
-| iTerm2 | `TERM_PROGRAM=iTerm.app` | OSC 9 |
-| kitty | `TERM=xterm-kitty` | OSC 9 |
-| Warp | `TERM_PROGRAM=WarpTerminal` | OSC 9 |
-| WezTerm | `TERM_PROGRAM=WezTerm` | OSC 9 |
-| 其余（Apple Terminal、Alacritty、GNOME、Konsole、VS Code、Windows Terminal、Unknown） | — | BEL |
+| 1 | `TERM_PROGRAM` 非空且不是 `tmux` | 归一化后匹配：`iterm`/`iterm2`/`itermapp` → iTerm2；`ghostty` → Ghostty；`kitty` → Kitty；`warp`/`warpterminal` → Warp；`wezterm` → WezTerm；其余 → Unknown |
+| 2 | `GHOSTTY_RESOURCES_DIR` 存在 | Ghostty |
+| 3 | `WEZTERM_VERSION` 存在 | WezTerm |
+| 4 | `ITERM_SESSION_ID` / `ITERM_PROFILE` / `ITERM_PROFILE_NAME` 存在 | iTerm2 |
+| 5 | `KITTY_WINDOW_ID` 存在，或 `TERM` 含 `kitty` | Kitty |
+| — | 都不匹配 | Unknown → BEL |
 
-**不扩表。** 这张表是「实测能弹出系统通知」的集合，不是「协议支持」的集合。扩表必须先实测，本次没有实测预算。显式指定 `method = osc9` 可以让任何终端走 OSC 9。
+归一化规则照 `lib.rs:415-417`：剔除空格、`-`、`_`、`.`，转小写。因此 `WarpTerminal` 与 `warp` 等价。
+
+**注意**：`TERM=xterm-kitty` 不是主判据，`KITTY_WINDOW_ID` 优先；`TERM` 匹配只是兜底。早期版本的 Codex 曾用 `TERM=xterm-ghostty`（`lib.rs:142`），现在 `GHOSTTY_RESOURCES_DIR` 更可靠。
+
+多路复用器单独判定，与终端名正交（`detect_multiplexer`，`lib.rs:368`）：
+
+| 判据 | 结论 |
+|---|---|
+| `TERM_PROGRAM=tmux` 或 `TMUX` 存在 | tmux |
+| `ZELLIJ` 存在 | zellij（第 3 处修正） |
+
+`TERM_PROGRAM=tmux` 时第 1 条识别被跳过（`is_tmux_term_program`），否则会把 tmux 本身当成终端名——此时真实终端信息要靠 `TERM` 兜底（第 5 条仍可能命中 kitty）。
 
 ## 6. 触发与投递
 
@@ -143,9 +177,48 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 |---|---|---|---|
 | `Done { reason: EndTurn }` | `TurnComplete` | 0 | 正文首行摘要（截 60 字素） |
 | `PermissionRequest { tool_name, tool_input, .. }` | `ApprovalRequested` | 1 | `等待批准: <命令或工具名，截 30 字素>` |
-| `Done { reason: MaxTurns }` / `Error` / `Cancelled` | — | — | 不发 |
+| `Done { reason: MaxTurns }` / `Done { reason: Interrupted { .. } }` / `Error` / `Cancelled` | — | — | 不发 |
 
-`PermissionRequest` 的文案取值：按顺序取第一个非空值——`tool_input.command`（bash 类工具）→ `tool_name` → 固定文案 `等待批准`。截 30 字素，同样经过 §7 的 `summarize` + `sanitize`。
+`PermissionRequest` 的文案**复用既有 `permission_summary`**（`tui/history.rs:119-141`），不另写摘要逻辑。
+
+该函数已经处理好了三类工具的差异，且有三条既有测试钉住行为（`history.rs:3951`、`:3980`、`:4007`）：
+
+| 工具 | 摘要形态 |
+|---|---|
+| `bash` / `process_start` | 直接取 `command`，丢掉 `expected_timeout_sec` 等 JSON 噪音 |
+| `write` / `edit` | `path: <路径>, content: N bytes`，**绝不内联正文块** |
+| 其它 | `input.to_string()` |
+
+复用的理由不是省代码，而是**一致性**：同一个权限请求在转录里和在通知里必须说同一件事。若通知另写一套，`write` 场景就会把 500 字节的正文塞进通知（`history.rs:3980` 的测试正是防这个）。
+
+通知文案 = `format!("等待批准: {}", permission_summary(tool_name, tool_input))`，再经 §7 的 `summarize`（会剥掉 `path:` 这类前缀中的标记并截断）与 `sanitize`。截断取 60 字素，与其他通知统一，不单独设 30。
+
+需要把 `permission_summary` 从 `tui/history.rs` 的私有函数提升为 `pub(crate)`，或移到 `tui/cell.rs` 旁的公共位置——实现时择一，以不破坏 `history.rs` 现有测试为准。
+
+### 6.1.1 回合完成的正文来源
+
+`AgentEvent::Done { reason }` **不携带回复正文**（`yi-agent-core/src/agent.rs:343-345`），`history.push_event` 收到它只压一条 `Separator`（`tui/history.rs:1101-1104`）。正文在流式阶段已逐段写进最后一条 `HistoryCell::AssistantMessage { markdown }`。
+
+因此摘要来源是**转录的最后一条 assistant cell**，取值时机必须在处理 `Done` **之前**（`push_event` 会把 `Separator` 压到末尾，之后 `cells.last()` 就不再是 assistant）。
+
+实现位置在 `tui/app.rs` 的事件循环里，`history.push_event(event, ...)` 之前（现为 `app.rs:568`）：
+
+```rust
+if let AgentEvent::Done { reason: DoneReason::EndTurn } = &event {
+    pending_notification = coalesce(
+        pending_notification,
+        PendingNotification::TurnComplete(history.last_assistant_text()),
+    );
+}
+```
+
+需要给 `HistoryState` 新增 `last_assistant_text(&self) -> Option<&str>`：从尾部反向找第一个 `HistoryCell::AssistantMessage { markdown }`（`tui/cell.rs:18`），返回 `markdown` 原文。注意 `Reasoning { text }` 是思维链、显示专用，**不可**当作回复正文取用。
+
+三个必须处理的边界：
+
+- **该回合没有任何 assistant 文本**（例如只调了工具就结束）。返回 `None`，通知文案退回固定句 `yi-agent 回合完成`，不发空通知。
+- **流式中途被压缩**（`AutoCompacting`）。压缩会改写转录，摘要取到的是压缩后的内容——这是可接受的，因为用户看到的也是压缩后的版本。
+- **只取本轮**。不跨回合拼接：`last_assistant_text` 只返回最后一条，不做多段合并。
 
 ### 6.2 去抖
 
@@ -178,9 +251,23 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 
 ### 6.6 可观测性
 
-`/config` 的只读快照追加三行：开关状态、`method` 配置值、**解析后的实际后端**。
+`/config`（`tui/slash.rs` 的 `TuiConfigSnapshot::render`，`slash.rs:299-305`）的只读输出追加一行：
 
-最后一项是 Codex 没有的：只显示 `auto` 时，用户排查「为什么我的 kitty 不弹」没有任何线索。
+```
+  terminal notify: on（method=auto → osc9, condition=unfocused）
+```
+
+三个信息必须同时出现：开关键、**解析后的实际后端**、条件。解析结果是 Codex 没有的——只显示 `auto` 时，用户排查「为什么我的 kitty 不弹」没有任何线索。
+
+Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注：
+
+```
+  terminal notify: on（method=auto → bel, condition=unfocused→always 降级：本终端不支持焦点事件）
+```
+
+降级必须可见。用户在配置里写的是 `unfocused`、实际行为是 `always`，若不显示，这个差异永远无法自查。
+
+`TuiConfigSnapshot` 新增五个字段：`notifications: bool`、`method: String`（配置值）、`effective_backend: String`（解析结果）、`condition: String`（生效条件）、`focus_degraded: bool`。由 `run_tui` 组装处填充；`app.rs:220` 的 `snapshot_for_tests()` 需同步补齐，否则测试构造点会编译失败——这正好保证新字段不会漏填。
 
 ## 7. 正文摘要与消毒
 
@@ -195,25 +282,31 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 3. 去掉行首 markdown 标记：`#`、`>`、`-`、`*`、`1.`
 4. 去掉行内标记：`**`、`*`、`` ` ``、`[text](url)` → `text`
 5. 空白折叠为单空格
-6. 按**字素**截 60（不是字节、不是 char——中文与 emoji 不会被切半）
+6. 按**字素簇**截 60（不是字节、不是 `char`——中文与 emoji 不会被切半）
 7. 空结果 → 回退固定文案 `yi-agent 回合完成`
+
+**字素簇的实现**：`unicode-segmentation` 已在 `Cargo.lock`（v1.13.3，经 `unicode-truncate` 传递引入），但**不在** `yi-agent` 的直接依赖里。本项目现有截断（`tui/bash_popup.rs:296`、`tui/cell.rs:525`、`tui/wrap.rs:94`）全部用 `chars()`，按 `char` 而非字素。
+
+本模块**新增直接依赖** `unicode-segmentation = "1"`（workspace 已有该 crate 的锁定版本，不引入新的下载）。理由：`chars().take(60)` 会把 `👨‍👩‍👧` 这类 ZWJ 序列切断，产生半个 emoji 显示为乱码方块——通知里出现方块比少显示几个字更糟。依赖面很小，且该 crate 已在构建图内。
 
 ### 7.2 sanitize
 
 剥掉全部 C0（`U+0000`–`U+001F`）、`U+007F`（DEL）、C1（`U+0080`–`U+009F`）。
 
-**第 2 处修正**：必须在**两种后端的所有路径**上执行，包括非 tmux 的 OSC 9。Codex 只在 tmux 分支里翻倍 ESC（`osc9.rs:44-46`），非 tmux 路径直接 `format!("\x1b]9;{}\x07", message)`（`osc9.rs:41`）。而消息来自模型输出与命令文本，正文里一个 `\x1b` 就能截断序列、注入终端指令。
+**第 2 处修正**：必须在**两种后端的所有路径**上执行，包括非 tmux 的 OSC 9。Codex 只在 tmux 分支里翻倍 ESC（`notifications/osc9.rs:48-50`），非 tmux 路径直接 `write!(f, "\x1b]9;{}\x07", self.message)`（`notifications/osc9.rs:52`）。而消息来自模型输出与命令文本，正文里一个 `\x1b` 就能截断序列、注入终端指令。
 
 顺序是 `summarize` → `sanitize`，不可颠倒。先截断再消毒，避免截断点落在被剥掉的字符上导致长度抖动。
 
-## 8. 与 Codex 的四处差异
+## 8. 与 Codex 的六处差异
 
 | # | 差异 | 理由 |
 |---|---|---|
 | 1 | Windows 上尝试 `EnableFocusChange`，失败则 `unfocused` 退化为 `always` | Codex 在 Windows 上 `focused` 恒真，`unfocused` 永不成立，功能实际失效 |
-| 2 | OSC 9 非 tmux 路径也执行控制字符消毒 | Codex 该路径直接拼接消息，含是真实注入面 |
+| 2 | OSC 9 非 tmux 路径也执行控制字符消毒 | Codex 该路径直接拼接消息，消息含模型输出与命令文本，是真实注入面 |
 | 3 | zellij 复用 tmux 的 DCS 包裹 | Codex 只认 tmux，zellij 里 OSC 9 静默丢失 |
-| 4 | 不做 OSC 777；不做按类型白名单；不做热更新 | 分别见 §3 的 YAGNI 判断 |
+| 4 | 不做 OSC 777 | 目标终端只有 urxvt 与 WezTerm 支持，而 WezTerm 也支持 OSC 9；收益仅剩 urxvt 一家 |
+| 5 | 不做按类型白名单（`Notifications` 只到 `bool`） | 本次只有两类事件，白名单不产生价值；将来加数组形态向后兼容 |
+| 6 | 不做配置热更新 | 我们没有设置面板，`/config` 是只读快照，没有触发源 |
 
 其余（配置键名与取值、两张协议字节、五家白名单、优先级与去抖、绘制间隙 flush、失败自禁）与 Codex 一致。
 
@@ -249,7 +342,7 @@ zellij 复用 tmux 的包裹形式（zellij 明确兼容 `ESC Ptmux;` 透传）�
 
 - `Done{EndTurn}` 后 `pending_notification` 被置位，下一次绘制后清空
 - `PermissionRequest` 优先级压过同帧的 `TurnComplete`
-- `Cancelled` / `Error` / `Done{MaxTurns}` 不置位
+- `Cancelled` / `Error` / `Done{MaxTurns}` / `Done{Interrupted}` 不置位
 - `notifications=false` 时任何事件都不置位
 - `focused=true` + `unfocused` 不发；`FocusLost` 后发
 - 非 TTY 时 `notify()` 短路
