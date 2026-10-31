@@ -102,6 +102,8 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 - 不新增 `mcp_reload refresh` 动作或设置页「重新探测」按钮（方案 B 的内容）。
 - 不修正 `-32603` 被误分类为传输错误的问题（见 §8，独立缺陷）。
 - 不解决 stdio server 的工具清单变化实时感知。
+- 不让 headless（`yi-agent run`）在进程内自愈：它没有每轮检查，且启动路径刻意不校验
+  TTL（§3 决策 1、§4.2）。
 
 ## 3. 设计决策
 
@@ -117,6 +119,10 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 在每轮开跑前都已调用 `config_changed_on_disk` → `reload` → `refresh_registry` →
 重建 agent。扩展这个判据即可复用整条链路，无需新机制。
 
+**这个机制在 headless（`yi-agent run`）下不存在**：`run_headless` 没有每轮检查，只在
+启动时装配一次。因此 headless 进程内不会自愈——启动路径刻意不校验 TTL（见 §4.2），
+否则就等于把否决掉的「启动时校验」加回去，而 headless 是唯一只有启动路径的场景。
+
 注意这个触发条件的代价：`needs_reload` 为真时，`reload` 会对**所有** server 逐个
 判断新鲜度。未过期的仍然零成本复用，只有过期的那个付 2~3s——所以"一天一次"的开销
 不会随 server 数量线性放大。
@@ -126,8 +132,9 @@ tools/list:   2.07s / 2.09s / 3.16s      (HTTP 端点，三次连续测量)
 判据取值 **24 小时**，时间戳存进缓存文件：
 
 - 桌面端 sidecar 常驻，进程内标记在「一直不重启」时等于没修——而这正是本 bug 的现场形态。
-- 旧缓存文件缺该字段时 `#[serde(default)]` 读成 `None`，视为「从未校验」，下一轮重探一次。
-  这就是存量用户的自动迁移路径，不需要写迁移代码。
+- 旧缓存文件缺该字段时 `#[serde(default)]` 读成 `None`。**但迁移时不能让它触发
+  「所有存量条目在同一轮集体重探」**——那是用户可感知的数分钟卡顿，处理方式见
+  §4.3.1.1.1（迁移时填成「现在」，而非留 `None`）。
 
 24h 的依据：搜索类 MCP 的工具改名不是分钟级事件；一天一次的 2~3s 可接受，且能
 挡住「同一分钟内反复重探」。
@@ -304,11 +311,20 @@ const RETRY_AFTER_SECS: i64 = 5 * 60;
 保留 `put` 这个名字而不用 `put_probed`：两者语义相同（记录一次成功的清单），多一个
 名字只会让人以为行为有差别。
 
+**若采纳 §4.3.1.1(b) 的错峰抖动，抖动必须发生在调用方、不能藏进 `put`。**
+`put` 是唯一写入 `probed_at` 的地方，测试要靠它把时间戳精确摆到 `now - 25h` 这类
+位置；若 `put` 内部悄悄加抖动，`a_legacy_entry_without_probed_at_is_stale` 这类断言
+就会变得依赖运气。正确做法是 `reload` / `load_and_probe` 在调用 `put` 前算好
+`put_at = now ± jitter(name)` 再传进去——时钟注入的意义正是「时间由调用方决定」。
+
 **`get_for` 不能直接删掉，它在设置页有一条语义不同的读路径。** 决策改为：
 
-- 重命名 `get_for` → `cached_tools_ignoring_freshness`（`lib.rs` 的 `cached_tools_for`
-  与 `reload` 的失败回退都用它），名字里写明「不看新鲜度」，杜绝被误当成命中判据。
-- 注册/探测路径（`load_and_probe`、`reload`）只用 `lookup`（其判定细节不外露）。
+- 重命名 `get_for` → `cached_tools_ignoring_freshness`（`lib.rs` 的 `cached_tools_for`、
+  `load_and_probe` 的启动判据、`reload` 的失败回退都用它），名字里写明「不看新鲜度」，
+  杜绝被误当成每轮的自愈判据。
+- `reload`（每轮 / 手动）只用 `lookup`（其判定细节不外露）。
+- `load_and_probe`（启动）**继续用** `cached_tools_ignoring_freshness`，不看 TTL
+  ——决策 1 要求不惩罚启动路径，理由见 §4.2。
 
 原因是设置页 `mcp_rpc::list` 用它回答的是**另一个问题**：「这块缓存是否仍然对应
 当前配置」。`None` ⇒ 面板显示 `tools: null`（「尚未探测」）。若改成 TTL 判据，一份
@@ -348,8 +364,9 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
     // 1. 配置指纹变了 ⇒ 一定重载（既有逻辑，先于缓存判断）
     if self.fingerprint_changed(workdir) { return true; }
 
-    // 2. 配置没变，但某个 server 的缓存条目已过期且允许重试 ⇒ 也要重载
-    let Ok(Some(cfg)) = McpConfig::load(workdir) else { return false };
+    // 2. 配置没变，但某个 server 的缓存条目已过期且允许重试 ⇒ 也要重载。
+    //    复用第 1 步已解析出的配置，不重复读盘（见下）。
+    let Some((_, cfg)) = self.fingerprint_and_config(workdir) else { return false };
     let cache = McpCache::load(workdir);
     cfg.mcp_servers.iter().any(|(name, sc)| {
         matches!(cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS), CacheLookup::Stale)
@@ -357,15 +374,22 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
 }
 ```
 
+**实现要点：把现有的 `config_fingerprint` 拆成「读一次盘、同时拿到指纹和配置」**
+（`fingerprint_and_config`），`needs_reload` 内部只读一次。既有的
+`config_fingerprint` 每轮已经 `read_to_string` + `serde_json::from_str` 一次，
+若按最直观的写法再调一次 `McpConfig::load`，每轮就要多读多解析一遍 `mcp.json`。
+把解析结果传下去，比多读一次省事得多——这是纯重构，行为不变。
+
 两条注意：
 
 - **配置读不出来时返回 `false`**：`McpConfig::load` 失败（文件损坏）时既有路径会让
   `reload` 报错并展示，不该在这里短路成「配置变了」——指纹逻辑已经覆盖了「文件被删 /
   被删空」这些情况，重复判断只会掩盖真正的配置错误。
-- `needs_reload` 每轮多一次 `mcp-cache.json` 读取（小文件，与既有的 `mcp.json` 读取
-  同级）。`reload` 进来后会再 load 一次，两次之间别人可能刚好写了新时间戳——这只会让
-  本轮少探一次（下次再来）或多探一次（本来就允许），不会产出错误的工具清单。为省这
-  一次读取而把签名改成「传一份快照」，反而会让两个入口各自持有一份可能更旧的状态。
+- `needs_reload` 每轮多一次 `mcp-cache.json` 读取（小文件，本机实测 2 KB，与既有的
+  `mcp.json` 读取同级；`mcp.json` 的读盘一次都不增加，见上）。`reload` 进来后会再
+  load 一次，两次之间别人可能刚好写了新时间戳——这只会让本轮少探一次（下次再来）或
+  多探一次（本来就允许），不会产出错误的工具清单。为省这一次读取而把签名改成「传一份
+  快照」，反而会让两个入口各自持有一份可能更旧的状态。
 
 `reload` 按 `lookup` 结果分四条路径（`load_and_probe` 用同样的 `lookup` 三态，仅
 `Fresh` 的处置不同，见本节末尾）：
@@ -387,13 +411,31 @@ pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
 旧名仍可能被调用并继续报错——但那比工具凭空消失更容易理解，且错误已带可操作提示
 （§4.4）。
 
-`load_and_probe`（启动路径）与 `reload` 用同一套 `lookup` 三态判断，**唯一的区别在
-`Fresh` 的处置**：启动时内存里还没有客户端，即使工具清单是新鲜的也必须建连（只跳过
-`tools/list`）；而 `reload` 在 `Fresh` 时连快照一起复用，不建连。`BackedOff` 与
-`Stale` 在两条路径上行为一致（`BackedOff` 用旧清单、`Stale` 探测）。
+**`load_and_probe` 保持原有语义：只看指纹，不看 TTL。**
 
-这个差别在当前代码里就已存在（启动路径 `get_for` 命中后仍会 new client），本设计
-不改变它，只是把判据换成 `lookup`。
+这是决策 1 的直接结论，也是初稿写错的地方。决策 1 明确否决了「启动时校验」，理由是
+冷启动会稳定多 2~3s。但若让 `load_and_probe` 也走 `lookup`，过期条目在**启动时**就会
+被探测——等于把被否决的选项改了名字加回来。
+
+而且这不仅是理论问题：`yi-agent run`（headless）**没有每轮检查**（`run_headless`
+里没有 `config_changed_on_disk` 调用，只在启动时 `register_mcp_tools` 一次）。对
+headless 而言，「启动时校验」是唯一会发生的校验，也就是它必然付出这笔开销：一次
+`yi-agent run` 本来只跑一个 prompt，却要先卡 2~3s（最坏 55s）去探测工具清单。
+
+所以分工是：
+
+| 路径 | 判据 | 理由 |
+|---|---|---|
+| `load_and_probe`（启动） | `cached_tools_ignoring_freshness`（只比指纹） | 决策 1：不惩罚启动；headless 只有这一条路径 |
+| `reload`（每轮 / 手动） | `lookup`（指纹 + TTL + 退避） | 自愈发生在这里 |
+
+`load_and_probe` 仍需写 `probed_at`（探测成功时）与 `failed_at`（探测失败时），否则
+TTL 计时与退避在「只启动、不 reload」的 headless 场景下永远不会开始记。
+
+**headless 因此不自愈**：一次 `yi-agent run` 的进程中缓存若已过期，它仍会用旧工具名
+跑完这次 prompt，直到某次 TUI / app-server 会话触发 `reload` 把清单刷新。这是可接受
+的——headless 是短命进程，缓存过期只影响少量调用，而代价（每次启动 +2~3s）会落在
+所有调用上。这一点必须写进文档，避免后续被当成缺陷重新「修复」。
 
 `load_and_probe` 现在用 `cache_dirty` 标记「需要写盘」。必须让 `note_failure` 也置位，
 否则启动时探测失败写下的 `failed_at` 不落盘，进程重启后立刻重试——正是 §4.3.1 说
@@ -465,10 +507,111 @@ reload。所以这是**新增**的回归，不是既有缺陷。方向必须反�
 | 完全无缓存（新装）、探测失败 | 记 `failed_at`，之后 5 分钟内不再试，工具为空 |
 
 `RETRY_AFTER_SECS = 5min` 的依据：自愈延迟从 24h 变成「24h + 最多 5 分钟」，用户不可感知；
-而最坏情况开销从「每轮 55s」降到「每 5 分钟 55s」。两者相差约 3 个数量级。
+而最坏情况开销从「每轮 55s」降到「每 5 分钟 55s」。
+
+### 4.3.1.1 三个尚未被覆盖的放大路径
+
+上面那句「每 5 分钟一次」只在「单个坏 server、每轮间隔大于 0」时成立。以下三种情形会
+放大它，实现时必须处理，否则这个防回归措施本身会变成新的回归。
+
+**（a）`reload` 不检查 `enabled`，停用的坏 server 照样占满探测预算。**
+
+`reload` 的循环体（`manager.rs:226`）只按配置指纹和缓存判据决定是否探测，
+**完全不看 `sc.enabled`**——`enabled` 只影响工具是否注册进 registry（`refresh_registry`
+里过滤）。现状下这没造成问题，因为停用的 server 一旦进过缓存就不再重探。
+
+本设计改变了这一点：停用的坏 server 也会因为 24h 过期而被重新探测。用户特意停用一个
+端点，24h 后却仍要为它每 5 分钟付一次 55s。修法是在 `lookup` 之前加一条：`sc.enabled ==
+false` 且缓存里有条目时，直接沿用条目、不探测（工具反正不注册）。这既省掉无谓探测，
+也符合「停用就是别碰它」的直觉。
+
+**（b）探测是串行的，代价是 `N × 55s` 而不是 55s。**
+
+`probe_tools` 在 `for` 循环里逐个 `await`（`manager.rs:133` 的文档注释自己写着
+`N * (CONNECT_TIMEOUT + PROBE_TIMEOUT + REAP_TIMEOUT)`）。本设计让所有过期条目在
+**同一轮**里集体触发探测：一个装了 5 个 HTTP server、且它们同时到期的会话，那一轮开头
+会卡 `5 × 55s ≈ 4.6 分钟`。这是**用户可感知的卡顿**，不是理论上的开销。
+
+缓解方式（按性价比排序，实现时至少取第一条）：
+1. 把过期时刻**错开**：`put` 写入 `probed_at` 时加一个基于 server 名的确定性抖动
+   （0~2 小时），避免所有 server 在同一轮集体到期。
+2. 限制每轮最多探测 `MAX_PROBES_PER_RELOAD = 1` 个 server，其余顺延到后续轮次。
+   自愈延迟从「TTL」变成「TTL + N 轮」，仍远小于「永不恢复」，而单轮卡顿有上界。
+
+**（c）47 小时的往返不可避免，但 55s 的上界需要重新核对。**
+
+`now - t < ttl` 无法表达方向：一份 47 小时前写入、此后未再探测的缓存，与一份 23 小时前
+的缓存，在 `now - t` 上都可能落到「刚好差一点」。用户开机（间隔 47h）→ 探测成功 →
+关机 3h → 开机，此时距 `probed_at` 已 50h，会**立刻再探一次**。这是正确行为，不是缺陷，
+但意味着「一天一次」实际上是「每次跨越 24h 边界都探一次」。
+
+同时 `55s` 是**上界而非典型值**：实测连接被拒 2ms、DNS 失败 21ms。只有「连接握手挂住
+直到超时」才接近 55s。所以（b）的串行放大在常见故障下（端点直接拒绝连接）代价很小，
+但在「防火墙黑洞 / 上游不响应」时才是真问题——而后者恰恰是最常见的 MCP 故障形态。
 
 为什么失败也要写盘（`note_failure`）：`failed_at` 若不落盘，进程重启后又会立刻重试一次
 ——重启频繁时同样会放大代价。落盘后重启不会重置退避。
+
+### 4.3.1.1.1 首次迁移是最坏情况，必须单独处理
+
+§4.3.1.1(b) 的串行放大在**升级后的第一次**最严重，因为存量缓存的条目**全都缺
+`probed_at`**（本机实测：`{"servers":{"horizon-websearch":{"fingerprint":...,"tools":[...]}}}`
+——确实没有该字段），`#[serde(default)]` 读成 `None` ⇒ 全部 `Stale` ⇒ 在**同一轮**里
+集体探测。
+
+| server 数 | 单轮卡顿上界（串行 × 55s） |
+|---|---|
+| 1 | 55s |
+| 3 | 165s |
+| 5 | 275s |
+| 10 | 550s（9 分钟） |
+
+10 个 MCP server 不是极端配置。用户升级后第一次发消息，界面卡 9 分钟且没有任何进度
+反馈，会被判定为「升级把软件搞坏了」。这是本设计**引入**的最严重的一次性退化。
+
+必须处理，且不能只依赖 §4.3.1.1(b) 的「每轮最多探 1 个」——那会让首次迁移后要连续
+`N` 轮才全部探完，期间每轮卡 55s，用户同样难受。推荐组合：
+
+1. **迁移时把 `probed_at` 填成「现在」而不是 `None`。** 存量条目本来就有工具清单且
+   一直在用，把它们一律视为「刚探测过」不会让行为变差；真正的自愈仍会在 24h 后发生。
+   这一步把「升级即触发全量探测」变成「升级 24h 后才逐个探测」，配合错峰抖动即可
+   完全消失。
+   - 代价：一次升级后要等满 24h 才享受到自愈。但用户此前已被这个 bug 困了很久
+     （spec 的立身之本就是「永久失效」），多等一天可接受；且真急着要，删缓存重启
+     即可（§4.4 文案）。
+2. 若坚持「存量条目视为过期」，则必须配合错峰抖动 + 每轮限额，并且**在启动时就把
+   `probed_at` 错开写入**（而不是在探测时），否则仍然是同一轮集体到期。
+
+方案 1 与 §3 决策 2 里「缺字段时 `#[serde(default)]` 读成 `None`，视为从未校验，
+下一轮重探一次」直接冲突。**以本节为准**：那段描述的是「单个新装 server」的正常路径，
+不适用于「所有存量条目同时缺字段」的批量迁移。实现时按方案 1 走，并补一条测试
+`a_legacy_entry_without_probed_at_is_migrated_to_now`（区别于
+`a_legacy_entry_without_probed_at_is_stale`：前者钉迁移后的行为，后者钉 `lookup` 对
+`None` 的原始判定）。
+
+### 4.3.1.2 手动 reload 的用户预期被退避挡住
+
+`reload` 有三个调用方：两个每轮自动检查，外加**手动的 `/mcp reload`（TUI）与
+`mcp_reload` 工具（`reload_tool.rs:105`）**。三者共用同一个 `reload()`，因此也会共用
+同一个退避窗口。
+
+这会产生一个别扭的用户体验：用户刚看到工具报错，敲 `/mcp reload` 想强制刷新，得到的是
+「没有探测」——因为 2 分钟前自动检查刚失败过。他无法区分「真的没问题」与「被退避挡住
+了」。
+
+处理方式是在**报告里如实说明**，而不是给手动路径开后门：
+
+- `ReloadReport` 增一个 `skipped_backoff: Vec<String>`（或复用 `ServerOutcome` 加一个
+  `skipped: bool` 字段），记录「本轮因退避而没有探测」的 server。
+- 手动入口（`/mcp reload`、`mcp_reload` 工具）在输出里明确写出
+  「`X` 上次探测失败于 …，跳过重试，最早 … 后再试」。
+- 不建议为手动调用传 `force: true` 绕过退避：§1 已经论证「重探风暴」是真实风险
+  （网关不区分工具不存在与上游故障），让一次手动点击就能触发全量重探，等于把这个
+  风险重新引入。用户若确实要立即重试，删缓存文件并重启仍是最直接的逃生口（§4.4 的
+  文案已经这么写）。
+
+这样做的代价是手动入口的行为需要新增一个参数或字段，比纯改缓存判据多一处改动；
+但它把「静默什么都不做」变成「明确告诉你为什么没做」，是必要的一步。
 
 ### 4.3.2 恢复耗时
 
@@ -481,6 +624,49 @@ T0+24h   下一轮开头 needs_reload 为真 → 探测 → 拿到 Y，自愈
 
 若 T0+24h 那次探测碰上上游抖动，`failed_at` 记录之，5 分钟后重试；端点恢复后最多
 再等 5 分钟即自愈。所以恢复耗时的上限是 **TTL + `RETRY_AFTER_SECS`**，而不是无限重试。
+
+若采纳 §4.3.1.1(b) 的「每轮最多探测 1 个」限额，且同一轮有 `N` 个 server 排队，则
+恢复耗时上界变为 **TTL + N 轮 + `RETRY_AFTER_SECS`**。`N` 是同时过期的 server 数，
+通常等于配置里的 server 总数（首次迁移时所有条目都没有 `probed_at`，会同时过期）。
+
+### 4.3.3 一个会误导排查的窗口：`Fresh` 但 `headers` 轮换
+
+指纹刻意排除了 `headers` 里 `${ENV_VAR}` 的展开值（`cache.rs` 注释写明「轮换 token
+不失效缓存」）。这意味着 token 轮换后缓存仍判 `Fresh`，而实际调用会因鉴权失败而报错。
+TTL 到期后探测才会发现。
+
+这是**既有行为**，本设计不改变它，但要注意它会让用户误判：报错看起来像「工具改名」
+（因为 §4.4 的文案会提示「远端工具清单可能已变化」），实际原因是凭据过期。§4.4 的
+文案因此不能断言原因，只能写「可能」。当前写法（`may have changed`）已经足够谨慎，
+实现时不要把它改成断言式的 `has changed`。
+
+### 4.3.4 缓存写入不再是「可选的副作用」
+
+这是本设计带来的一个容易被忽略的语义变化。
+
+今天 `cache::save` 只在一个 server **首次探测成功**时被调用（`reload` 里
+`cache_dirty` / `load_and_probe` 里同样的标记），失败路径从不写盘。本设计让它成为
+**每轮自动检查的产物**：`note_failure` 必须落盘，否则退避在重启后失效（§4.3.1）。
+
+问题在于 `cache::save` **不是原子写**：
+
+```rust
+let text = serde_json::to_string_pretty(self)?;
+std::fs::write(&path, text)?;          // 截断后直接写，没有 tmp + rename
+```
+
+对比 `McpConfig::save`（`config.rs:191`）——它老老实实用了 `tmp + rename`。缓存文件按
+`workdir` 定位（`cache.rs:43`），而同一个项目被 TUI、desktop sidecar、app-server
+同时打开是完全正常的用法。两个进程都在 `reload` 里写同一份 `mcp-cache.json` 时，
+`std::fs::write` 的截断 + 写入不是原子的，可能被读到半截 JSON。
+
+现在这没有后果：`McpCache::load` 解析失败就 `unwrap_or_default()` 静默返回空缓存，
+下一次探测重新填上。但本设计让退避依赖这份文件——**文件被写坏 ⇒ 退避信息丢失 ⇒
+坏 server 立刻重试**。虽然只是一次额外探测，但这恰好是要防的性能回归路径。
+
+修法很小：把 `cache::save` 改成与 `McpConfig::save` 一致的 `tmp + rename`（顺带
+`remove_file` 清理失败残留）。这不是本 spec 的核心改动，但**不做的话 `failed_at` 的
+可靠性没有保证**，所以列为实现必做项。
 
 ### 4.4 报错文案
 
@@ -505,13 +691,17 @@ and restart yi-agent; the list is re-probed on startup.
 | 情况 | 行为 |
 |---|---|
 | 缓存文件损坏/缺失 | 既有行为：空缓存 → 全部重探 |
-| `probed_at` 缺失（存量缓存） | 视为过期，重探一次并写入时间戳 |
+| `probed_at` 缺失（存量缓存，单个新装 server） | 视为过期，重探一次并写入时间戳 |
+| `probed_at` 缺失（**批量迁移**，全部条目都缺） | 迁移时填成「现在」，不集体重探（§4.3.1.1.1） |
 | `probed_at` 在未来（时钟回拨） | 视为过期，重探并覆盖 |
 | `failed_at` 在未来（时钟回拨） | 视为**不**在退避窗口内，允许重试一次并覆盖 |
 | 探测超时/失败 | 保留旧清单，写 `failed_at`，`error` 进 `ServerOutcome`，退避 5 分钟后重试 |
-| 端点长期不可用 | 每 `RETRY_AFTER_SECS` 付一次 55s，而不是每轮 |
+| 端点长期不可用 | 每 `RETRY_AFTER_SECS` 付一次 55s（上界；连接被拒时实测 2ms），而不是每轮 |
+| 端点长期不可用**且已停用** | 不探测（`enabled=false` 时直接沿用缓存条目，见 §4.3.1.1(a)） |
+| 多个 server 同时过期 | 串行探测，单轮最坏 `N × 55s`；用错峰或每轮限额压住（§4.3.1.1(b)） |
 | 系统时钟不可用（`now` 取不到） | `now` 退化为 `0`，此时 `t <= now` 对任何真实时间戳都不成立 ⇒ `is_fresh` 与 `is_backed_off` 同为 `false` ⇒ 所有条目 `Stale`。为避免「每轮付 55s」，`needs_reload` 在取不到时钟时只做指纹判断、跳过 TTL 触发；不 panic |
-| 只读文件系统导致 `save` 失败 | 既有行为：warn，不影响本次内存快照 |
+| 只读文件系统导致 `save` 失败 | 既有行为：warn，不影响本次内存快照；但退避信息会丢，表现为「每次重启重试一次」——可接受，不要为此 panic |
+| `cache.save` 与另一进程并发写 | 改为 `tmp + rename` 后无损坏（§4.3.3）；改动前可能产生半截 JSON，`load` 静默退回空缓存 |
 
 ## 6. 测试策略
 
@@ -521,7 +711,9 @@ and restart yi-agent; the list is re-probed on startup.
 |---|---|
 | `an_entry_older_than_the_ttl_is_not_fresh` | `probed_at = now - 25h` → `lookup` 返回 `Stale` |
 | `an_entry_within_the_ttl_is_fresh` | `probed_at = now - 23h` → `lookup` 返回 `Fresh` |
-| `a_legacy_entry_without_probed_at_is_stale` | 手写无 `probed_at` 的 JSON → `Stale` |
+| `a_legacy_entry_without_probed_at_is_stale` | 手写无 `probed_at` 的 JSON → `lookup` 返回 `Stale` |
+| `a_legacy_entry_without_probed_at_is_migrated_to_now` | 载入存量缓存后 `probed_at` 被填成 `now`，`lookup` 返回 `Fresh`（钉住 §4.3.1.1.1 的迁移策略） |
+| `migration_of_many_servers_probes_none_of_them` | 10 条存量条目迁移后连续 `needs_reload` 为 `false`（防「升级即卡 9 分钟」） |
 | `a_future_probed_at_is_treated_as_stale` | `probed_at = now + 1h` → `Stale` |
 | `a_failed_probe_does_not_make_the_entry_fresh` | 探测失败后 `probed_at` 不变（不能假装新鲜） |
 | `retry_is_skipped_within_the_backoff_window` | `failed_at = now - 1min` → 不探测、旧清单照旧 |
@@ -540,6 +732,8 @@ and restart yi-agent; the list is re-probed on startup.
 
 | 测试 | 断言 |
 |---|---|
+| `load_and_probe_does_not_probe_an_expired_entry` | 预置 25h 前的缓存 → 启动路径不探测、沿用旧清单（钉住决策 1：启动不校验 TTL） |
+| `load_and_probe_records_probed_at_on_success` | 冷缓存探测成功后 `probed_at` 被写入（否则 TTL 永不开始计时） |
 | `reload_reprobes_when_the_in_memory_snapshot_has_expired` | 同一进程内先 `load_and_probe` 建立快照，把缓存时间戳改到 25h 前，再 `reload` → 必须重新探测且工具名更新（删掉 `Some(e) if lookup(...).is_settled()` 那个 guard 即变红） |
 
 `reload_refreshes_a_renamed_tool_after_the_ttl` 与上一条都是本 bug 的直接回归测试。
@@ -549,11 +743,50 @@ and restart yi-agent; the list is re-probed on startup.
 同时修正真实端点冒烟测试（`tests/http_transport.rs`）——它已在 `a89b23f6` 中改为按
 `__SearchPro` 后缀匹配，本轮只需确认它仍绿。
 
+## 6.5 风险清单（按严重程度排序）
+
+本设计不是「改一个判据」那么小。以下是全部已知风险，**实现必须逐条对照**，任何一条
+未处理都会让这次修复引入比原 bug 更糟的问题（原 bug 是「永久失效，但零额外开销」）。
+
+### 高：会让用户可感知卡顿
+
+| # | 风险 | 触发条件 | 处置 |
+|---|---|---|---|
+| R1 | 存量缓存全部缺 `probed_at`，升级后**同一轮**集体探测 | 任何从旧版本升级的用户 | 迁移时把 `probed_at` 填成「现在」（§4.3.1.1.1） |
+| R2 | 串行探测，单轮最坏 `N × 55s` | N 个 server 同时过期（常见：升级、长期关机后） | 错峰抖动 + 每轮限额（§4.3.1.1(b)） |
+| R3 | 停用的坏 server 仍被 TTL 唤醒 | 用户停用了不可用端点 | `enabled=false` 时跳过探测（§4.3.1.1(a)） |
+| R4 | 端点黑洞时每 5 分钟一次 55s | 防火墙丢包 / 上游不响应 | 退避本身（§4.3.1）；连接被拒场景实测 2ms，不构成问题 |
+
+### 中：会让人误判或行为不符预期
+
+| # | 风险 | 触发条件 | 处置 |
+|---|---|---|---|
+| R5 | 手动 `/mcp reload` 被退避挡住，静默无事发生 | 用户看到报错后想强制刷新 | 报告里明确写出「因退避跳过」（§4.3.1.2） |
+| R6 | headless 不自愈 | `yi-agent run` 单次执行 | 接受，写进非目标；启动路径不校验 TTL（§4.2） |
+| R7 | token 轮换后缓存仍 `Fresh`，报错像「工具改名」 | `${ENV_VAR}` 凭据过期 | 既有行为；文案保持 `may have changed` 不断言（§4.3.4） |
+| R8 | 24h 边界导致的「立刻再探」 | 跨 24h 的关机/长间隔 | 正确行为，不算缺陷（§4.3.1.1(c)） |
+
+### 低：实现细节，但会让退避不可靠
+
+| # | 风险 | 触发条件 | 处置 |
+|---|---|---|---|
+| R9 | `cache::save` 非原子，并发写产生半截 JSON | 同项目多进程（TUI + sidecar） | 改 `tmp + rename`（§4.3.3） |
+| R10 | `note_failure` 不置 `cache_dirty`，退避不落盘 | 只读盘不写盘的路径 | 与 `put` 同样置位（§4.2） |
+| R11 | 抖动塞进 `put` 会让测试不可控 | 采纳 R2 的错峰 | 抖动在调用方计算（§4.1） |
+| R12 | `needs_reload` 重复读解析 `mcp.json` | 每轮 | 复用已解析的配置（§4.2） |
+
+### 为什么这份清单比设计本身更重要
+
+原 bug 的性质是「工具永远用旧名，但没有任何额外开销」。上面任何一条风险失控，都会把
+它换成「工具偶尔能自愈，但每轮/每次升级要卡几十秒到几分钟」——用户对前者的容忍度
+远高于后者（前者像是「远端改了名」，后者像是「软件坏了」）。所以实现阶段的验收标准
+不是「bug 修好了」，而是「bug 修好了，且 §7 的变异验证里关于性能的两条都是绿的」。
+
 ## 7. 验证判据
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-mcp              # 期望：全绿，新增 16 例
+cargo test -p yi-agent-mcp              # 期望：全绿，新增 20 例
 cargo test -p yi-agent-mcp --test http_transport -- --ignored   # 真实端点
 cargo test -p yi-agent-app-server --lib # 下游未受影响（1068+）
 cargo test -p yi-agent-runtime --lib
@@ -571,8 +804,14 @@ cargo fmt --all -- --check
   `needs_reload_is_false_while_a_stale_entry_is_backed_off` 变红
   （这条专门守护性能回归，是 §4.3.1 的直接防线）。
 
-真机验收：删掉 `.yi-agent/mcp-cache.json` 之外的路径——把一个 server 的 `probed_at`
-手工改到 25 小时前，启动会话并发一条消息，观察日志出现一次探测、工具名更新为远端现值。
+真机验收（两条都要做）：
+
+1. **自愈**：把一个 server 的 `probed_at` 手工改到 25 小时前，启动会话并发一条消息，
+   观察日志出现**一次**探测、工具名更新为远端现值。
+2. **不卡顿**：准备 3 个 server 的缓存，把它们的 `probed_at` 同时改到 25 小时前，再发
+   一条消息，**计时**这一轮的耗时。若超过 10s，说明 R2 未处理（应看到错峰或限额生效）。
+3. **升级路径**：用一份不含 `probed_at` 的旧缓存启动，确认**没有任何探测**发生
+   （R1 已处理），且 `mcp-cache.json` 里被补上了 `probed_at`。
 
 ## 8. 范围外的已知缺陷（记录，不在本 spec 处理）
 
