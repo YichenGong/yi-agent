@@ -1949,7 +1949,9 @@ pub(crate) async fn handle(
             let client = state.client.clone();
             tokio::spawn(async move {
                 let computed = tokio::task::spawn_blocking(move || {
-                    if let Some(commit) = commit {
+                    // 这一位描述的是**本线程这一次**计算：先清，算完再取走。
+                    crate::git_diff::reset_git_timeout();
+                    let body = if let Some(commit) = commit {
                         let (unified_diff, truncated) =
                             crate::git_diff::commit_diff(&repo, &commit);
                         json!({ "unifiedDiff": unified_diff, "truncated": truncated })
@@ -1966,19 +1968,35 @@ pub(crate) async fn handle(
                             None,
                         ))
                         .unwrap_or(json!(null))
-                    }
+                    };
+                    let timed_out = crate::git_diff::take_git_timeout();
+                    (body, timed_out)
                 })
                 .await;
-                let body = match computed {
-                    Ok(body) => body,
+                match computed {
+                    // 超时分支没有可信的 body 可用，故不绑定它。
+                    Ok((_body, true)) => {
+                        // git 超时时 `git_ok` 的 `None` 无法与「真没有改动」区分,
+                        // 若照常回 body 就会把挂住的仓库渲染成「没有改动」。
+                        // 按 spec §4.3:这种情形应当失败,而不是沉默地报空。
+                        let _ = write_response(
+                            &hub,
+                            &client,
+                            err_response(id, RpcError::internal("git timed out")),
+                        )
+                        .await;
+                    }
+                    Ok((body, false)) => {
+                        let _ = write_response(&hub, &client, ok_response(id, body)).await;
+                    }
                     Err(error) => {
                         // 只在 panic 时到这里。回一个合法形状的空结果,而不是
                         // 静默丢响应——后者会让客户端一直等。
                         eprintln!("[app-server] thread/diff/read task failed: {error}");
-                        diff_read_fallback(wants_text, fallback_base.as_deref())
+                        let body = diff_read_fallback(wants_text, fallback_base.as_deref());
+                        let _ = write_response(&hub, &client, ok_response(id, body)).await;
                     }
-                };
-                let _ = write_response(&hub, &client, ok_response(id, body)).await;
+                }
             });
             return Ok(Flow::Continue);
         }
@@ -2021,11 +2039,13 @@ pub(crate) async fn handle(
                     .filter(|c| !c.is_empty())
                     .unwrap_or_else(|| state.cfg.workdir.display().to_string());
                 let repo = std::path::PathBuf::from(&cwd);
+                // 只要 meta 的 `anchor_sha`：`load` 会把整份对话 jsonl 解析一遍,
+                // 那是本任务要消除的主循环阻塞类 IO。同 `rpc/mod.rs` 的取法。
                 let anchor = state
                     .threads
                     .get(&thread_id)
-                    .and_then(|t| t.store.load(&thread_id).ok().flatten())
-                    .and_then(|l| l.meta.anchor_sha);
+                    .and_then(|t| t.store.read_meta(&thread_id).ok().flatten())
+                    .and_then(|m| m.anchor_sha);
                 // 分两次短暂持锁，**不**把 guard 跨过 await：`serve()` 跑在
                 // `tokio::spawn` 里，guard 过 await 会让整个 future 非 `Send`。
                 // 快照连**基准来历**一起取：结构化帧可能是「模型指定的基准」

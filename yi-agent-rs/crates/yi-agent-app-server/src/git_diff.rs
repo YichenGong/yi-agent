@@ -4,6 +4,7 @@
 //! PR 的算法，也是「这个会话从分叉点以来改了什么」最贴切的语义。默认分支判定
 //! 见 [`resolve_base`]；全不可用时退化为「仅工作区改动」。
 
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -172,6 +173,30 @@ pub const GIT_OK_TIMEOUT: Duration = Duration::from_secs(5);
 /// `git_ok` 轮询子进程状态的间隔。git 正常返回是毫秒级,10 ms 只多等一轮。
 const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+thread_local! {
+    /// 本线程最近一次 diff 计算里，是否有 `git_ok` 因超时被放弃。
+    ///
+    /// 用 thread-local 而不是给 `git_ok` 加参数：它有十余个调用点，散布在
+    /// `resolve_base` / `files` / `commits` / `untracked_paths` / `file_diff` /
+    /// `commit_diff` 里，逐个加 `&mut bool` 只会把噪声传到每一层。
+    /// 一次 diff 计算在单个 blocking 线程里同步跑完，故这一位不会跨请求串。
+    static GIT_TIMED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 清掉「本线程有 git 超时」标记。计算入口在开始前调它。
+pub fn reset_git_timeout() {
+    GIT_TIMED_OUT.with(|c| c.set(false));
+}
+
+/// 取走「本线程有 git 超时」标记（读过即清）。
+///
+/// 为什么必须区分这一位：`git_ok` 的 `None` 同时表示「git 说没有」与
+/// 「git 没在 [`GIT_OK_TIMEOUT`] 内返回」。前者是合法的空 diff，后者是失败
+/// （典型成因是残留的 `index.lock`）。不区分就会把挂住渲染成「没有改动」。
+pub fn take_git_timeout() -> bool {
+    GIT_TIMED_OUT.with(|c| c.replace(false))
+}
+
 /// 跑一个子进程,在 `timeout` 内返回它的 stdout(成功时),否则 `None`。
 ///
 /// stdout 走**临时文件**而不是管道:管道模式下子进程写满内核缓冲区
@@ -206,6 +231,9 @@ fn run_git_bounded(
                     let _ = child.kill();
                     // 必须 wait:否则留下僵尸进程。
                     let _ = child.wait();
+                    // 只有这一支是「超时」：非零退出码与 spawn 失败都是 git
+                    // 给出的真实结论，仍保留「没有」的语义。
+                    GIT_TIMED_OUT.with(|c| c.set(true));
                     return None;
                 }
                 std::thread::sleep(GIT_POLL_INTERVAL);
@@ -438,13 +466,32 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// 读未跟踪文件；超过 [`MAX_UNTRACKED_FILE_BYTES`] 或读失败返回 `None`。
 ///
 /// `None` 的语义 = 「不参与内容合成」：调用方据此标 binary / 跳过正文。
-/// 先看 `metadata` 再读，故超大文件不会被读进内存。
+///
+/// 两道闸，各管一个失效模式：
+/// - 读之前按 `metadata` 挡下超限与非普通文件；
+/// - 读的时候再按上限截断（`.take`），故超大文件最多只被读进 1 MiB + 1 字节。
+///
+/// 只有闸不行：`metadata` 看到的是**那一刻**的长度，文件在 stat 与 read 之间
+/// 长大（或本就是个增长中的日志）时 `read` 仍会按新长度全量分配。只有 `.take`
+/// 也不行：非普通文件的 `len` 不可信，见下一条。
+///
+/// 非普通文件（FIFO / 设备 / socket）的 `len` 常为 0，能骗过尺寸闸；而读
+/// FIFO 在无写端时会一直阻塞，故与 `rpc/image.rs` 同一条判据直接拒绝。
 fn read_untracked_capped(full: &Path) -> Option<Vec<u8>> {
-    let len = std::fs::metadata(full).ok()?.len();
-    if len > MAX_UNTRACKED_FILE_BYTES {
+    let meta = std::fs::metadata(full).ok()?;
+    if !meta.is_file() {
         return None;
     }
-    std::fs::read(full).ok()
+    let mut buf = Vec::new();
+    std::fs::File::open(full)
+        .ok()?
+        .take(MAX_UNTRACKED_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_UNTRACKED_FILE_BYTES {
+        return None;
+    }
+    Some(buf)
 }
 
 /// 未跟踪文件合成一份「整文件新增」的 unified diff（避免触碰用户索引）。
@@ -1455,6 +1502,90 @@ mod tests {
         assert!(
             !d.unified_diff.contains(&"x".repeat(4096)),
             "the file content must not be read"
+        );
+    }
+
+    /// 超时必须被记下来，且读取即清（否则会污染同线程的下一次计算）。
+    ///
+    /// 这一条只证明**标记机制**本身：真的让 `git` 挂住需要构造仓库级故障
+    /// （如占住 `index.lock`），故 `git_ok` 的端到端超时上报仍无自动化覆盖。
+    #[test]
+    fn run_git_bounded_records_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        reset_git_timeout();
+        assert!(!take_git_timeout(), "a fresh thread must start clean");
+
+        let out = run_git_bounded(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            dir.path(),
+            Duration::from_millis(100),
+        );
+        assert!(out.is_none(), "a timed-out command yields no stdout");
+        assert!(take_git_timeout(), "the timeout branch must raise the flag");
+        assert!(!take_git_timeout(), "taking the flag must clear it");
+
+        // 正常退出不能置位：只有超时才算失败。
+        GIT_TIMED_OUT.with(|c| c.set(true));
+        reset_git_timeout();
+        assert!(!take_git_timeout(), "reset must clear a stale flag");
+        assert!(
+            run_git_bounded(
+                "/bin/sh",
+                &["-c".to_string(), "exit 0".to_string()],
+                dir.path(),
+                Duration::from_secs(5)
+            )
+            .is_some()
+        );
+        assert!(
+            !take_git_timeout(),
+            "a successful run must not raise the flag"
+        );
+        assert!(
+            run_git_bounded(
+                "/bin/sh",
+                &["-c".to_string(), "exit 3".to_string()],
+                dir.path(),
+                Duration::from_secs(5)
+            )
+            .is_none()
+        );
+        assert!(
+            !take_git_timeout(),
+            "a non-zero exit is a real failure, not a timeout"
+        );
+    }
+
+    /// 上限边界：正好 `MAX_UNTRACKED_FILE_BYTES` 字节仍接受，多 1 字节即拒绝。
+    ///
+    /// 关键是把 `>` 与 `>=` 的区别钉住：上限语义是「可以等于」。
+    #[test]
+    fn read_untracked_capped_stops_reading_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("exact.txt");
+        std::fs::write(&exact, vec![b'x'; MAX_UNTRACKED_FILE_BYTES as usize]).unwrap();
+        let got = read_untracked_capped(&exact).expect("exactly at the cap must be accepted");
+        assert_eq!(got.len() as u64, MAX_UNTRACKED_FILE_BYTES);
+
+        let over = dir.path().join("over.txt");
+        std::fs::write(&over, vec![b'x'; MAX_UNTRACKED_FILE_BYTES as usize + 1]).unwrap();
+        assert!(
+            read_untracked_capped(&over).is_none(),
+            "one byte over the cap must be rejected"
+        );
+    }
+
+    /// 非普通文件一律拒绝：目录 / FIFO / 设备 的 `len` 不可信（常为 0），
+    /// 读 FIFO 在无写端时会一直阻塞。这里用目录触发 `!is_file()` 这一支。
+    #[test]
+    fn read_untracked_capped_refuses_a_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(
+            read_untracked_capped(&sub).is_none(),
+            "a directory must never be read as file content"
         );
     }
 
