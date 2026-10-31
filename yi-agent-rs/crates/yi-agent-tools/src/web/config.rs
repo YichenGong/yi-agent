@@ -1,8 +1,8 @@
 //! 网页搜索的机器级配置：`~/.yi-agent/websearch.json`。
 //!
-//! 选择 JSON 文件而不是 `.env`：`.env` 只在进程启动时读一次
-//! (`runtime/src/config.rs` 的 `load_env_files`)，改完必须重启；本文件每次搜索
-//! 前热读，保存即生效。命名与 `models.json` 一致，故字段一律 snake_case。
+//! 选择 JSON 文件而不是环境变量：本文件每次搜索前热读，保存即生效；环境变量
+//! 只在进程启动时读一次，改完必须重启。命名与 `models.json` 一致，故字段一律
+//! snake_case。
 //!
 //! `engines` 刻意做成 map：加新引擎只是加一个键 + 一个 provider 实现，
 //! `active_engine` 已经有位置放。
@@ -89,15 +89,18 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// 生效的 key：文件里的值优先；为空时回退 `BOCHA_API_KEY` 环境变量，
-    /// 保证老用户不改配置也能继续用。
+    /// 生效的 key：只认文件里的值。
+    ///
+    /// 过去这里还有一层 `std::env::var("BOCHA_API_KEY")` 回退，目的是「老用户
+    /// 不改配置也能继续用」。`.env` 下线后那个 env 值在下次启动时必然为 `None`，
+    /// 回退只会造出「当前进程能用、重启后静默失效」的难查故障。迁移已把旧 key
+    /// 写进 `websearch.json`，故文件是唯一来源。
     pub fn resolved_api_key(&self) -> Option<String> {
-        if !self.api_key.is_empty() {
-            return Some(self.api_key.clone());
+        if self.api_key.is_empty() {
+            None
+        } else {
+            Some(self.api_key.clone())
         }
-        std::env::var("BOCHA_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())
     }
 
     /// 钳制到 1–50。越界不报错：用户输错数字不该让整页保存失败。
@@ -311,14 +314,34 @@ mod tests {
         assert_eq!(c.active_engine, "bocha");
     }
 
+    /// 涉及 `BOCHA_API_KEY` 的测试必须串行：进程环境是全局量。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn a_file_key_wins_over_the_env_var() {
+    fn resolved_api_key_reads_the_file_value() {
         let (_dir, path) = cfg_text(r#"{"engines":{"bocha":{"api_key":"from-file"}}}"#);
         let e = load_websearch_config_from(&path)
             .engine("bocha")
             .unwrap()
             .clone();
         assert_eq!(e.resolved_api_key().as_deref(), Some("from-file"));
+    }
+
+    /// `BOCHA_API_KEY` 不再是回退层：文件里没有 key 就是没配，哪怕进程环境里有。
+    /// 这一条钉住「不再读 env」——`.env` 下线后那个 env 值在重启时必然消失，
+    /// 留着回退会造出「当前能用、重启失效」的故障。
+    #[test]
+    fn resolved_api_key_does_not_fall_back_to_the_environment() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut engine = EngineConfig::default();
+        engine.api_key = String::new();
+        // env 里有值也不能被采用。
+        unsafe { std::env::set_var("BOCHA_API_KEY", "from-env") };
+        let resolved = engine.resolved_api_key();
+        unsafe { std::env::remove_var("BOCHA_API_KEY") };
+        assert_eq!(resolved, None, "the env fallback must be gone");
     }
 
     #[test]
