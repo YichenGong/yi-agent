@@ -1,5 +1,6 @@
 import type { Item } from "./protocol";
 import { DB_NAME, DB_VERSION, STORE_NAME } from "./cacheDb";
+import { ensureCacheScopeClean } from "./cacheScope";
 
 /** Per-entry cap: how large a single thread's cached transcript may get. */
 export const MAX_ENTRY_BYTES = 1024 * 1024;
@@ -152,7 +153,13 @@ export function createIndexedDbStore(): AsyncContentStore {
       req.onerror = () => reject(req.error);
     });
 
-  const db = (): Promise<IDBDatabase> => (dbPromise ??= open());
+  // 打开库之前先等「失配清理」完成：所有读写都经 run() → db()，故这是唯一
+  // 收口点。用 `??=` 一次写完，避免「清理完成」与「开始建库」之间的空档被
+  // 另一个调用插进来，各自建一个库句柄。
+  //
+  // 不能写成 `const d = await ensureCacheScopeClean(); dbPromise ??= open()`：
+  // 那样两个并发调用都会走到 open()。
+  const db = (): Promise<IDBDatabase> => (dbPromise ??= ensureCacheScopeClean().then(open));
 
   const run = async <T>(
     mode: IDBTransactionMode,
