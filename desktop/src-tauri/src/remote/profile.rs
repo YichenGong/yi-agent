@@ -96,8 +96,15 @@ pub fn validate_profile_id(id: &str) -> Result<(), ProfileError> {
 /// 重连都会在手机上多出一个 session。
 pub fn derive_relay(configured: Option<&str>, profile_id: &str) -> Option<String> {
     let base = configured?;
-    let session = format!("{}-{profile_id}", session_seed(base));
-    Some(set_query_param(base, "session", &session))
+    // **幂等**：已经带着本项目后缀的 session 原样返回。与 app-server 的
+    // `remote_session::derive_session` 逐字同构（见该文件顶部的说明与两处
+    // `SHARED_CASES`）。稳定是为了不每次重连在手机上多出一个 session。
+    let seed = session_seed(base);
+    let suffix = format!("-{profile_id}");
+    if seed.ends_with(&suffix) {
+        return Some(base.to_string());
+    }
+    Some(set_query_param(base, "session", &format!("{seed}{suffix}")))
 }
 
 fn session_seed(url: &str) -> String {
@@ -215,6 +222,60 @@ mod tests {
     #[test]
     fn derive_relay_is_none_without_a_configured_url() {
         assert_eq!(derive_relay(None, "p"), None);
+    }
+
+    /// 与 app-server 的 `remote_session::SHARED_CASES` **逐字相同**的用例表。
+    ///
+    /// app-server 不能依赖本 crate，故 `derive_relay` 与
+    /// `remote_session::derive_session` 是两份实现。两边派生出不同的 session
+    /// 时，手机拿到的地址没有一个进程在监听——而两端各自的日志都正常。这条
+    /// 测试是唯一能钉住这个跨 crate 约定的手段。
+    const SHARED_CASES: &[(&str, &str, &str)] = &[
+        ("wss://r/?session=base", "proj-foo", "wss://r/?session=base-proj-foo"),
+        ("wss://r/connect", "p", "wss://r/connect?session=remote-p"),
+        ("wss://r/?token=t&session=s", "p", "wss://r/?token=t&session=s-p"),
+        ("wss://r/?session=old", "proj-foo", "wss://r/?session=old-proj-foo"),
+        ("wss://r/?token=t", "p", "wss://r/?token=t&session=remote-p"),
+        ("ws://127.0.0.1:8080/ws", "a", "ws://127.0.0.1:8080/ws?session=remote-a"),
+        // 幂等：远端 app-server 对自己已派生过的 session 再派生一次必须是 no-op。
+        (
+            "wss://r/?session=base-proj-foo",
+            "proj-foo",
+            "wss://r/?session=base-proj-foo",
+        ),
+    ];
+
+    #[test]
+    fn derive_relay_matches_the_shared_table_verbatim() {
+        for (url, id, expected) in SHARED_CASES {
+            assert_eq!(
+                derive_relay(Some(url), id).as_deref(),
+                Some(*expected),
+                "case {url} / {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn deriving_twice_for_the_same_profile_is_a_noop() {
+        let once = derive_relay(Some("wss://r/?session=base"), "proj-foo").unwrap();
+        assert_eq!(derive_relay(Some(&once), "proj-foo").as_deref(), Some(&*once));
+    }
+
+    #[test]
+    fn derivation_still_differs_for_another_profile() {
+        let once = derive_relay(Some("wss://r/?session=base"), "proj-foo").unwrap();
+        let other = derive_relay(Some(&once), "proj-bar").unwrap();
+        assert_ne!(other, once);
+        assert!(other.ends_with("session=base-proj-foo-proj-bar"), "{other}");
+    }
+
+    #[test]
+    fn an_empty_session_falls_back_to_the_default_seed() {
+        assert_eq!(
+            derive_relay(Some("wss://r/?session="), "p").as_deref(),
+            Some("wss://r/?session=remote-p")
+        );
     }
 
     #[test]

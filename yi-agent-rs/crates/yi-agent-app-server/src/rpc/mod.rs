@@ -22,6 +22,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
+pub(crate) mod remote;
 pub(crate) mod resident;
 pub(crate) mod skill;
 pub(crate) mod thread;
@@ -275,6 +276,8 @@ pub(crate) enum Domain {
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
     Agent,
+    /// `remote/*`(手机端「本项目清单 + 每项目的 relay session」)。
+    Remote,
     /// 未搬移者:只剩 `initialize` 与未识别前缀(全部域都已搬走)。
     Unknown,
 }
@@ -304,6 +307,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("flags") | Some("build") => Domain::Flags,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
+        Some("remote") => Domain::Remote,
         _ => Domain::Unknown,
     }
 }
@@ -468,4 +472,20 @@ pub(crate) struct AppState<'a> {
     /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
     /// 读一次的判定输入。
     pub(crate) lead_agent_enabled: bool,
+
+    // ---- 远端 SSH 执行(实验开关 `remote_ssh`) ----
+    /// 实例状态根,`remote/relayTargets` 从它下面读 `remote.json` 与
+    /// `remote-status.json`。可注入的理由同 [`AppState::resident_dir`]:手机端
+    /// 清单必须能在测试里读隔离 tempdir,而不是开发者真实的 `~/.yi-agent`。
+    /// 与 `skills_home` 的区别:那个是「像 HOME 的目录」(skill 自己再拼
+    /// `.yi-agent`),这个**就是**实例状态根。
+    pub(crate) remote_dir: &'a Path,
+    /// 本进程自己收到的中继地址**原始串**(含本机的 `?session=`),原样来自启动
+    /// 参数 `--relay`。`remote/relayTargets` 用它为每个项目派生 session。
+    ///
+    /// 必须是原始串而非剥掉 `session` 的 base:桌面侧 `derive_relay` 以「原有
+    /// session」为种子,两边输入不同形就会派生出不同的 session,手机便连到一个
+    /// 没人监听的 channel——两个进程各自的日志都正常,只有手机连不上。
+    /// `None` = 本机没配中继,此时手机根本连不到本机,派生不出 session 是正解。
+    pub(crate) relay_url: Option<&'a str>,
 }

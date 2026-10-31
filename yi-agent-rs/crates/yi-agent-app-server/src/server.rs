@@ -427,6 +427,9 @@ pub(crate) struct RuntimeAttachments {
     /// `resident_dir` is: `skill/list` / `skill/read` must be testable without
     /// reading the developer's real `~/.yi-agent/skills`.
     pub(crate) skills_home: PathBuf,
+    /// 实例状态根（`remote.json` / `remote-status.json` 所在目录）。可注入的
+    /// 理由同 `resident_dir`：手机端项目清单必须能在测试里读隔离 tempdir。
+    pub(crate) remote_dir: PathBuf,
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,
@@ -1979,6 +1982,7 @@ where
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
+            remote_dir: instance_home_dir(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2067,6 +2071,7 @@ where
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
+            remote_dir: instance_home_dir(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2973,6 +2978,12 @@ where
     // 后 channel 永不关闭,主循环的 `recv()` 拿不到 `None`,优雅退出被拖住。
     drop(inbound_tx);
 
+    // `remote/relayTargets` 需要**原始** relay 串（含本机的 `?session=`）：桌面侧
+    // `derive_relay` 的种子就是「原有 session」，两边输入不同形就派生出不同的
+    // session，手机便会连到一个没人监听的 channel。此处仍持有 `relay_url` 的所有权
+    // （上面只借用了 `as_deref`），故可直接搬过来。
+    let relay_url_for_targets = relay_url;
+
     let result = serve(
         inbound_rx,
         Arc::clone(&hub),
@@ -2985,6 +2996,7 @@ where
         client_scopes,
         client_initialized,
         stdio_eof_rx.take(),
+        relay_url_for_targets,
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
@@ -3188,6 +3200,11 @@ pub(crate) async fn serve<F>(
     // 合并模式下 stdio 读端关闭的信号(见 `serve_scoped_core` 里 `read_lines` 的
     // oneshot);纯 stdio / 纯 ws 传 `None`,该 `select!` 分支 `pending`。
     mut stdio_eof: Option<std::pin::Pin<Box<tokio::sync::oneshot::Receiver<()>>>>,
+    // 本进程自己的中继地址（含 `?session=`），原样传自 `--relay`。只有
+    // `remote/relayTargets` 用它为每个项目派生 session；`None` = 本机没配中继。
+    // 传**原始串**而不是剥掉 session 的 base：桌面侧 `derive_relay` 的种子是
+    // 「原有 session」，两边输入必须同形才能派生出同一个 session。
+    relay_url: Option<String>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -3208,6 +3225,7 @@ where
         onboarding_preferences_path,
         resident_dir,
         skills_home,
+        remote_dir,
         theme,
         git_diff,
         view_frames,
@@ -3534,6 +3552,8 @@ where
                             lead_control_replies: &lead_control_replies,
                             lead_agent_enabled,
                             pending_lead_replies: &mut pending_lead_replies,
+                            remote_dir: &remote_dir,
+                            relay_url: relay_url.as_deref(),
                         }
                     };
                 }
@@ -3691,6 +3711,13 @@ where
                     crate::rpc::Domain::Flags => {
                         let mut state = app_state!();
                         match crate::rpc::flags::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Remote => {
+                        let mut state = app_state!();
+                        match crate::rpc::remote::handle(&mut state, &req, id.clone()).await? {
                             crate::rpc::Flow::Continue => continue,
                             crate::rpc::Flow::Unknown => {}
                         }

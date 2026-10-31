@@ -26,6 +26,7 @@ pub mod pairing;
 pub mod plugin_gate;
 pub(crate) mod plugin_worktree;
 pub mod protocol;
+pub mod remote_session;
 pub(crate) mod rpc;
 pub mod server;
 pub mod session;
