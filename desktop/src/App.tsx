@@ -81,7 +81,16 @@ import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
-import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
+import {
+  contentFingerprintOf,
+  createContentStore,
+  normalizeForCache,
+  persistContent,
+  type AsyncContentStore,
+  type ContentEntry,
+  type PersistOptions,
+  type PersistOutcome,
+} from "./lib/contentStore";
 import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
@@ -249,6 +258,14 @@ export default function App() {
   const cachedAt = useRef(new Map<string, number>());
   /** 每个会话的缓存元数据（epoch / 游标 / 是否被裁剪），用于组装 hints 与裁决。 */
   const cacheMetaRef = useRef(new Map<string, ContentEntry>());
+  /**
+   * 「盘上是什么」的内存镜像：threadId → 内容指纹。
+   *
+   * 与 `cacheMetaRef`（盘上条目的元数据，供 hints 用）职责不同，不要合并。
+   * **只能在写成功之后更新**：先记指纹再写，一次 IndexedDB 失败就会把该会话
+   * 永久标记为「已落盘」，此后 flushAll 都判「没变」而不再重试——静默永久丢缓存。
+   */
+  const persistedFp = useRef(new Map<string, string>());
   /** 本连接的 syncPlan（`initialize` 的响应），按 threadId 索引。 */
   const syncPlanRef = useRef(new Map<string, { action: SyncAction; epoch: number }>());
 
@@ -309,7 +326,17 @@ export default function App() {
       try {
         for (const id of await cs.keys()) {
           const entry = await cs.read(id);
-          if (entry) cacheMetaRef.current.set(entry.threadId, entry);
+          if (entry) {
+            cacheMetaRef.current.set(entry.threadId, entry);
+            // 用盘上条目反算指纹，而不是留空。留空的话冷启后第一次 flushAll
+            // 会把每个有缓存的会话都重写一遍、savedAt 全部抬到当下，又一次
+            // 抹平 LRU。entry.items 已是归一化后的写入结果，与写入时记下的
+            // 指纹天然同源。
+            persistedFp.current.set(
+              entry.threadId,
+              contentFingerprintOf(entry.items, entry.lastServerItemId, entry.contentEpoch),
+            );
+          }
         }
       } catch {
         /* hints 是优化：读失败就按"没有缓存"声明 */
@@ -345,18 +372,43 @@ export default function App() {
     }, CONTENT_PERSIST_DEBOUNCE_MS);
     timers.set(id, timer);
   };
-  /** 立即落盘某会话（切走 / 页面隐藏 / 卸载时用）。 */
-  const flushContent = (id: string) => {
-    if (!isRemoteClient()) return Promise.resolve();
+  /**
+   * 落盘一条会话，并维护 `persistedFp`。
+   *
+   * 返回「动了盘上什么」，而不是 boolean：`written` 与 `deleted` 都算「没失败」，
+   * 但 `persistedFp` 要做相反的操作（set / delete）。`skipped` 表示盘上没动过。
+   * 抛错或前置条件不满足 → 返回 null，表示什么都没记，下次自然重试。
+   */
+  const flushContent = async (
+    id: string,
+    options?: PersistOptions,
+  ): Promise<PersistOutcome | null> => {
+    if (!isRemoteClient()) return null;       // 桌面端：本就没有缓存
     const v = store.peek(id);
-    if (!v) return Promise.resolve();
-    return persistContent(getContentStore(), id, v.session).catch(() => {
-      // 缓存写失败不影响任何用户可见行为。
-    });
+    if (!v) return null;                      // 会话已不存在（如刚被 drop）
+    try {
+      const outcome = await persistContent(getContentStore(), id, v.session, options);
+      // 只有 persistContent 成功返回才更新「盘上是什么」；顺序不可颠倒。
+      if (outcome.action === "deleted") {
+        persistedFp.current.delete(id);
+      } else if (outcome.action === "written") {
+        persistedFp.current.set(id, outcome.fingerprint);
+        // LRU 被淘汰的会话已从盘上消失，指纹必须跟着删。留着的话，`flushAll`
+        // 会判「它与盘上一致、没变过」而跳过，它再也写不回来。
+        for (const gone of outcome.evicted) persistedFp.current.delete(gone);
+      }
+      // skipped：盘上没动过，persistedFp 保持原值。
+      return outcome;
+    } catch {
+      return null;                            // 写失败：不抛给调用方，也不记指纹
+    }
   };
   /** 删除某会话的内容缓存（仅手机端）。桌面端不构造内容缓存，故此处也必须门控。 */
   const deleteCachedContent = (id: string) => {
     if (!isRemoteClient()) return;
+    cacheMetaRef.current.delete(id);
+    cachedAt.current.delete(id);
+    persistedFp.current.delete(id);      // 新增：否则指纹会永久偏旧
     void getContentStore().delete(id).catch(() => {});
   };
 
@@ -638,7 +690,24 @@ export default function App() {
       for (const id of persistTimers.current.keys()) {
         window.clearTimeout(persistTimers.current.get(id));
       }
-      const ids = new Set([...persistTimers.current.keys(), ...store.ids()]);
+      // 候选 = 脏集 ∪ 指纹变化的会话。
+      //
+      // 不能只刷脏集：内容进入会话有三条路径，只有 schedulePersist 会注册防抖。
+      // thread/readItems 的两个分支直接 upsertItems，prefillFromCache 同理——
+      // 只看 persistTimers 会让这些会话丢掉首次落盘机会。
+      //
+      // 也不能用「有没有内容」当判据：它不区分「内容变了」与「内容一直在」，
+      // 每次切后台都会把所有有内容的会话重写一遍、savedAt 一起抬到当下，
+      // 写序被抹平成迭代顺序，LRU 仍然失效。
+      const dirty = persistTimers.current.keys();
+      const changed = store.ids().filter((id) => {
+        const sess0 = store.peek(id)?.session;
+        if (!sess0) return false;
+        const { items } = normalizeForCache(sess0);
+        const fp = contentFingerprintOf(items, sess0.lastServerItemId, sess0.contentEpoch);
+        return fp !== persistedFp.current.get(id);
+      });
+      const ids = new Set([...dirty, ...changed]);
       persistTimers.current.clear();
       for (const id of ids) void flushContent(id);
     };
@@ -747,6 +816,8 @@ export default function App() {
           cacheMetaRef.current.delete(id);
           void getContentStore().delete(id);
           cachedAt.current.delete(id);
+          persistedFp.current.delete(id);   // store.peek 已为 undefined，
+                                            // flushContent 会提前返回，不会自己清
           if (sess.currentIdRef.current === id) {
             const first = sess.pinned[0] ?? sess.groups.flatMap((g) => g.threads)[0];
             if (first) void selectThread(first.thread_id, { leaveBoard: false });
@@ -901,7 +972,11 @@ export default function App() {
       // 而后者的代价是把刚预填的缓存整段抹掉——spec §5 的三段式第一步（先显示
       // 缓存）就此消失。生产 ws 路径上全量回放必然携带帧(thread/started +
       // items/completed),所以这一守卫只在「无帧可对账」时跳过,不影响幽灵项清理。
-      if (replayed !== null && replayed.size > 0) replaySession.dropStale(replayed);
+      // 只有在真的收到过回放帧并做过 dropStale 时才「权威」：replayed 为空意味着
+      // 这趟 resume 压根没投递帧，此时 items 仍可能是刚预填的缓存内容，
+      // 不能据此判定「服务端确认无内容」而删盘上条目。
+      const authoritative = replayed !== null && replayed.size > 0;
+      if (authoritative) replaySession.dropStale(replayed);
       // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
       // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
       const view = store.peek(id);
@@ -910,7 +985,9 @@ export default function App() {
       // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
       view.syncState = "synced";
       cachedAt.current.delete(id);
-      void flushContent(id);
+      // 不要挪进 `if (authoritative)`：false 时仍然要落盘（那是预填内容），
+      // 只是不授权删除。
+      void flushContent(id, { authoritative });
       // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
       const fromResponse = permissionModeFromResponse(resumed);
