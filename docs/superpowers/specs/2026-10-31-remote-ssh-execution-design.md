@@ -103,7 +103,7 @@ Linux 服务器是 `x86_64-unknown-linux-gnu`（ELF），跨架构直接不可�
 ### 3.1 组件划分
 
 全部改动集中在 **desktop 的 Tauri 桥接层**（`desktop/src-tauri/`），
-`yi-agent-app-server` 一行不改。理由见 §3.3。
+`yi-agent-app-server` 一行不改。理由见 §3.2。
 
 | 组件 | 职责 | 位置 | 依赖 |
 |---|---|---|---|
@@ -114,7 +114,7 @@ Linux 服务器是 `x86_64-unknown-linux-gnu`（ELF），跨架构直接不可�
 | `yi-agent-flags`（改） | 注册 `remote_ssh` | `yi-agent-rs/crates/yi-agent-flags/` | — |
 | 前端（改） | 「远程」设置页、进度展示、开关联动 | `desktop/src/` | 只走 Tauri `invoke` |
 
-### 3.3 为什么 `remote/*` 不能放进 app-server（关键）
+### 3.2 为什么 `remote/*` 不能放进 app-server（关键）
 
 app-server 是**被 ssh 隧道运送的那一端**。把「怎么连远端」放进 app-server，等于让
 远端进程自己决定怎么连自己——职责颠倒。而且开关关闭时远端在跑旧二进制，可能根本
@@ -130,7 +130,7 @@ JSON-RPC 给 agent。
   的结果一并传下来
 - **app-server 侧**：本设计没有新增需求，`flags/*` 维持现状
 
-### 3.2 为什么安装逻辑放 Rust 侧而不是前端
+### 3.3 为什么安装逻辑放 Rust 侧而不是前端
 
 安装涉及 `ssh` 子进程、文件传输、进度反馈，全部是桥接层的活。放前端等于让
 webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 请求、收进度事件。
@@ -187,7 +187,7 @@ FlagDef {
 第 3 条容易被漏掉：如果只在 UI 隐藏、不杀进程，用户会处于"看不见但远端还在跑、
 还在烧 token"的状态。
 
-### 5.1.1 谁能判定 flag 值（易错点）
+### 5.2 谁能判定 flag 值（易错点）
 
 `remote_ssh` 是**本机**的开关，管的是"本机要不要去连远端"。因此**不能**靠
 `flags/list` RPC 判定——那个 RPC 经 sidecar 转发，一旦已经连上远端，它读到的
@@ -204,12 +204,12 @@ FlagDef {
 
 两条路都必须保证前端**永远不**从 sidecar 的 `flags/list` 里读 `remote_ssh`。
 
-### 5.2 stable 构建的语义
+### 5.3 stable 构建的语义
 
 `store.rs:75` 的 `status_at` 第一行 `if build_kind != "dev" { return (false, Source::BuildKind) }`
 已经保证 stable 恒关。**不需要额外代码**，但需要一条测试钉住它。
 
-### 5.3 关掉开关后的数据处理
+### 5.4 关掉开关后的数据处理
 
 不删已保存的 `remote.json`，也不删远端已安装的二进制。理由与看板 flag 一致：
 flag 是闸门，不是数据清除。重新打开即恢复。
