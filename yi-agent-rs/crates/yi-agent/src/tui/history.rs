@@ -467,17 +467,6 @@ impl HistoryState {
             && cache.entries.len() == self.cells.len()
     }
 
-    /// Whether the cache already reflects `cells` at `width` for the default
-    /// theme.
-    ///
-    /// Kept as a thin forwarder so the historical measurement-only test
-    /// assertions keep working; production paths ask `is_current_for` directly
-    /// with the palette they are about to render.
-    #[allow(dead_code)]
-    fn cache_is_current(&self, width: u16) -> bool {
-        self.is_current_for(width, TuiThemeKind::Dark)
-    }
-
     /// The palette the cache currently holds, without touching it.
     ///
     /// Measurement paths have no theme of their own and must not invent one:
@@ -764,7 +753,7 @@ impl HistoryState {
     /// is folded away.
     ///
     /// This deliberately does **not** bump the generation: `ensure_cache` is
-    /// gated by `cache_is_current`, which early-returns while the generation is
+    /// gated by `is_current_for`, which early-returns while the generation is
     /// unchanged, so a caller that registered dirty without bumping would leave
     /// the entry unprocessed and the cell stale. Every caller must therefore end
     /// with a `note_content_change()`.
@@ -4285,38 +4274,72 @@ mod tests {
     /// streamed token; if that forced `DARK` into `ensure_cache`, a light
     /// terminal would re-render the whole transcript in `DARK` per token and
     /// again in `LIGHT` on the next frame — O(transcript) work per token.
+    ///
+    /// The theme assertion alone cannot catch that: an implementation that did
+    /// `ensure_cache(width, DARK)` and then `ensure_cache(width, LIGHT)` would
+    /// end on `Light` while paying two full re-renders. So the render counter is
+    /// the load-bearing part of this test.
+    ///
+    /// Note the two phases: a measurement over an *up-to-date* cache must render
+    /// nothing at all, while a measurement after a content change must render
+    /// only the changed tail (a new cell has no cached line count, so zero is
+    /// not reachable there). Both bounds are O(1) in transcript length; a
+    /// render-in-DARK-then-restore blows through them by rendering everything
+    /// twice.
     #[test]
     fn push_does_not_evict_the_render_theme() {
         let mut state = HistoryState::new();
-        state.push(
-            HistoryCell::AssistantMessage {
-                markdown: "first".into(),
-            },
-            40,
-        );
+        for turn in 0..12 {
+            state.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("turn {turn}"),
+                },
+                40,
+            );
+        }
         state.ensure_cache(40, TuiTheme::LIGHT);
         assert_eq!(state.cache.borrow().theme_kind, TuiThemeKind::Light);
 
-        // The hot path: a streaming delta measures the line count, then pushes.
-        state.push(
-            HistoryCell::Markdown {
-                text: "second".into(),
-            },
-            40,
-        );
+        // (a) Pure measurement: the cache is current, so measuring renders zero.
+        crate::tui::cell::reset_lines_call_count();
+        let _ = state.flattened_line_count(40);
         let _ = state.flattened_line_count(40);
         assert_eq!(
             state.cache.borrow().theme_kind,
             TuiThemeKind::Light,
             "measuring line counts must not replace the render theme"
         );
+        assert_eq!(
+            crate::tui::cell::lines_call_count(),
+            0,
+            "a measurement over a current cache must render nothing: a \
+             render-in-DARK-then-restore would keep the theme but pay two full \
+             re-renders"
+        );
 
+        // (b) The streaming hot path: a delta arrives, then gets measured.
+        crate::tui::cell::reset_lines_call_count();
+        state.push(
+            HistoryCell::AssistantMessage {
+                markdown: "streaming".into(),
+            },
+            40,
+        );
+        let _ = state.flattened_line_count(40);
         state.extend_last_assistant_text(" more", 40);
         let _ = state.flattened_line_count(40);
         assert_eq!(
             state.cache.borrow().theme_kind,
             TuiThemeKind::Light,
             "streaming deltas must not replace the render theme"
+        );
+        let renders = crate::tui::cell::lines_call_count();
+        assert!(
+            renders <= 4,
+            "a streaming delta must re-render only its tail, got {renders} renders \
+             for {} cells; a render-in-DARK-then-restore would be at least twice \
+             the transcript",
+            state.cells.len()
         );
     }
 }

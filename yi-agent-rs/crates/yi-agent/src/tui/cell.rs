@@ -260,14 +260,19 @@ fn render_tool_result(
     // assistant's answer (and green was a raw ANSI slot that went unreadable on
     // a light background). A failure still names `danger` so the error line
     // stays scannable in the transcript.
-    let summary_color = if is_error {
-        theme.danger
-    } else {
-        theme.fg_muted
-    };
+    //
+    // Only the muted branch is dimmed. `fg_muted` has 7.86:1 (dark) / 8.86:1
+    // (light) of headroom, so a 50% fade stays well clear of the floor, but
+    // `danger` is already the tightest color in the palette (light `#a01818` is
+    // 7.96:1 on white); dimming it toward the background drops it under the 3:1
+    // large-text floor and far under the 4.5:1 body floor the spec enforces.
     let w = width.max(1) as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let summary_style = Style::new().fg(summary_color).add_modifier(Modifier::DIM);
+    let summary_style = if is_error {
+        Style::new().fg(theme.danger)
+    } else {
+        Style::new().fg(theme.fg_muted).add_modifier(Modifier::DIM)
+    };
     // Only the first physical line is previewed when folded; the full text is
     // available via Ctrl+O. Fold it by display width so a multi-byte preview is
     // neither over-wide nor silently cut.
@@ -1199,5 +1204,29 @@ mod tests {
         let summary = lines.first().expect("a summary line");
         assert_eq!(summary.spans[0].style.fg, Some(TuiTheme::DARK.fg_muted));
         assert_ne!(summary.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    /// The error summary keeps `danger` and is deliberately *not* dimmed: the
+    /// pairing is what makes a failure scannable, and `danger` is already the
+    /// tightest color in the palette. Dimming it pushed the light variant
+    /// (`#a01818`, 7.96:1 on white) under the 3:1 large-text floor.
+    ///
+    /// Without this test a cleanup that unified both branches onto `fg_muted`
+    /// (or that restored the shared `DIM`) would keep the suite green.
+    #[test]
+    fn tool_result_error_summary_uses_theme_danger() {
+        let cell = HistoryCell::ToolResult {
+            id: "t1".into(),
+            result_text: "first line\nsecond line".into(),
+            is_error: true,
+            expanded: false,
+        };
+        let lines = cell.lines_with(60, TuiTheme::DARK);
+        let summary = lines.first().expect("a summary line");
+        assert_eq!(summary.spans[0].style.fg, Some(TuiTheme::DARK.danger));
+        assert!(
+            !summary.spans[0].style.add_modifier.contains(Modifier::DIM),
+            "an error summary must not be dimmed: `danger` has no contrast headroom"
+        );
     }
 }
