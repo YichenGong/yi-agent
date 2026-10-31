@@ -4937,7 +4937,16 @@ async fn generate_title_for_first_input(
             }
         }
         // 模型产出无法作为标题：保留兜底标题。
-        Ok(Ok(None)) => {}
+        //
+        // 这条路径过去完全静默，导致「LLM 标题不常见」查了很久：推理模型把
+        // `max_tokens` 烧在思考上、正文留空，就落在这里。留一条 info，
+        // 下次同类症状能直接从日志看出来。
+        Ok(Ok(None)) => {
+            tracing::info!(
+                %thread_id,
+                "title generation produced no usable title; keeping fallback"
+            );
+        }
         Ok(Err(e)) => {
             tracing::info!(%e, %thread_id, "title generation failed; keeping fallback");
         }

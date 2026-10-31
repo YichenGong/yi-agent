@@ -373,6 +373,28 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "user");
     }
 
+    /// `disable_thinking` 必须让 responses 通道不发 `reasoning` 块。
+    #[test]
+    fn request_omits_reasoning_block_when_thinking_disabled() {
+        use yi_agent_core::{GenParams, Message};
+        let req = yi_agent_core::ProviderRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams {
+                max_tokens: Some(512),
+                disable_thinking: Some(true),
+                ..Default::default()
+            },
+        };
+        let body = serde_json::to_value(responses_request_from(req)).unwrap();
+        assert!(
+            body.get("reasoning").is_none(),
+            "disable_thinking must omit reasoning: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn request_omits_reasoning_block_when_effort_unset() {
         let req = ProviderRequest {

@@ -342,7 +342,13 @@ impl From<ProviderRequest> for OpenaiRequest {
                 max_tokens: req.params.max_tokens,
                 top_p: req.params.top_p,
                 stop_sequences: req.params.stop_sequences,
-                reasoning_effort: req.params.reasoning_effort.clone(),
+                // 关思考在 OpenAI 兼容通道上就是 `effort: "none"`（没有布尔字段）。
+                // 显式设置时以它为准，盖掉调用方可能带来的档位。
+                reasoning_effort: if req.params.disable_thinking == Some(true) {
+                    Some("none".to_string())
+                } else {
+                    req.params.reasoning_effort.clone()
+                },
             },
         }
     }
@@ -563,6 +569,44 @@ mod tests {
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["function"]["name"], "read");
         assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    /// `disable_thinking` 必须在 chat 通道翻译成 `reasoning_effort: "none"`。
+    ///
+    /// OpenAI 兼容网关里没有「不思考」的布尔字段，`"none"` 是既有的关闭档位
+    /// （实测 DeepSeek 系模型传它后 `reasoning_tokens` 归零）。
+    #[test]
+    fn disable_thinking_serializes_effort_none() {
+        let req = ProviderRequest {
+            model: "HORIZON-DeepSeek".to_string(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams {
+                max_tokens: Some(512),
+                disable_thinking: Some(true),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_value(&OpenaiRequest::from(req)).unwrap();
+        assert_eq!(
+            json["reasoning_effort"], "none",
+            "chat 通道用 effort=none 表达「不思考」: {json}"
+        );
+    }
+
+    /// 缺省（`None`）不得凭空多出 `reasoning_effort`。零回归。
+    #[test]
+    fn absent_disable_thinking_sends_no_effort() {
+        let req = ProviderRequest {
+            model: "gpt-4o".to_string(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(&OpenaiRequest::from(req)).unwrap();
+        assert!(json.get("reasoning_effort").is_none(), "{json}");
     }
 
     #[test]
