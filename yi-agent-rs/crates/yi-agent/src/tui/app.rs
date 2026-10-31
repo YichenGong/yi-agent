@@ -12,7 +12,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -32,7 +32,8 @@ use super::slash::{
     render_mcp_status,
 };
 use super::state::RunningTaskRegistry;
-use super::statusbar::{StatusBarState, render_statusbar};
+use super::statusbar::{StatusBarState, render_statusbar_with};
+use super::theme::TuiTheme;
 use super::trace::{
     SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list,
 };
@@ -590,18 +591,25 @@ fn run_loop<B: Backend, E: EventSource>(
             if let Some(p) = &popup {
                 let popup_area = chunks[1];
                 if popup_area.height > 0 {
-                    f.render_widget(build_popup(p, popup_area.height), popup_area);
+                    // Task 7 threads the detected theme into `run_loop`; until
+                    // then the popup keeps the historical dark look.
+                    f.render_widget(
+                        build_popup_with(p, popup_area.height, TuiTheme::DARK),
+                        popup_area,
+                    );
                 }
             }
 
-            // Status bar
-            let statusbar_line = render_statusbar(
+            // Status bar. Task 7 threads the detected theme into `run_loop`;
+            // until then this is explicitly the historical dark theme.
+            let statusbar_line = render_statusbar_with(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
                 trimmed_history,
                 &current_model,
                 chunks[2].width,
+                TuiTheme::DARK,
             );
             f.render_widget(statusbar_line, chunks[2]);
 
@@ -3476,7 +3484,7 @@ fn format_agents_summary(
 /// asked for. Only the windowed commands are drawn; the renderer clips the
 /// rest, so rendering the whole list would hide the highlighted row once the
 /// selection scrolls past the visible rows.
-fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
+fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -> Paragraph<'a> {
     let content_height = height.saturating_sub(2) as usize;
     let window = popup.visible(content_height);
     let window_start = popup.window_start(content_height);
@@ -3494,7 +3502,7 @@ fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
             let desc = cmd.description();
             let is_selected = window_start + i == popup.selected_index();
             let style = if is_selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.sel_bg).fg(theme.sel_fg)
             } else {
                 Style::new()
             };
@@ -3506,6 +3514,19 @@ fn build_popup<'a>(popup: &'a CommandPopup, height: u16) -> Paragraph<'a> {
 }
 
 fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> Paragraph<'static> {
+    build_input_line_with(input, pending_quit, area_width, TuiTheme::DARK)
+}
+
+/// Theme-aware [`build_input_line`].
+///
+/// The stripe used a hardcoded `Indexed(240)`, which is a dark gray band on a
+/// light terminal; it now asks the theme for its raised surface instead.
+fn build_input_line_with(
+    input: &InputLine,
+    pending_quit: bool,
+    area_width: u16,
+    theme: TuiTheme,
+) -> Paragraph<'static> {
     let prefix = Span::styled(
         "> ",
         Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
@@ -3513,12 +3534,12 @@ fn build_input_line(input: &InputLine, pending_quit: bool, area_width: u16) -> P
     if pending_quit {
         return Paragraph::new(Line::from(vec![
             prefix,
-            Span::styled("再按 Ctrl+C 退出", Style::new().fg(Color::Yellow)),
+            Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
         ]))
-        .style(Style::new().bg(Color::Indexed(240)));
+        .style(Style::new().bg(theme.bg_raised));
     }
     let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
-    Paragraph::new(Text::from(lines)).style(Style::new().bg(Color::Indexed(240)))
+    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised))
 }
 
 /// Number of terminal lines the input will occupy when rendered.
@@ -3708,6 +3729,7 @@ fn wrap_input_buffer(
 mod tests {
     use super::*;
     use crate::tui::state::TaskStatus;
+    use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -6659,6 +6681,39 @@ mod tests {
         );
     }
 
+    /// The input stripe must follow the theme: on a light terminal the old
+    /// hardcoded `Indexed(240)` painted a dark gray band across a white screen.
+    #[test]
+    fn input_stripe_uses_theme_raised() {
+        let input = InputLine::new();
+        let dark = build_input_line_with(&input, false, 40, TuiTheme::DARK);
+        let light = build_input_line_with(&input, false, 40, TuiTheme::LIGHT);
+        // Paragraph style is not directly readable, so render one row into a
+        // scratch buffer and inspect the background of the padded cells.
+        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        let mut dark_buf = ratatui::buffer::Buffer::empty(area);
+        let mut light_buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(dark, area, &mut dark_buf);
+        ratatui::widgets::Widget::render(light, area, &mut light_buf);
+        assert_eq!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
+        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+    }
+
+    /// The `Ctrl+C` quit prompt rides the same raised stripe: it used to
+    /// paint its own `Indexed(240)` band, so on a light terminal the hint
+    /// flashed as a dark strip over a white screen.
+    #[test]
+    fn pending_quit_stripe_uses_theme_raised() {
+        let input = InputLine::new();
+        let light = build_input_line_with(&input, true, 40, TuiTheme::LIGHT);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        let mut light_buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(light, area, &mut light_buf);
+        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
+    }
+
     /// Test that agent events appear in the rendered history area.
     #[test]
     fn agent_events_render_to_history_area() {
@@ -7403,8 +7458,8 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let highlight_row = (0..24u16)
-            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let highlight_row =
+            (0..24u16).find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == TuiTheme::DARK.sel_bg));
         let row = highlight_row.expect("the highlighted command row must be visible");
         let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
         assert!(
@@ -7467,8 +7522,8 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let highlight_row = (0..14u16)
-            .find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue));
+        let highlight_row =
+            (0..14u16).find(|&y| (0..80u16).any(|x| buffer[(x, y)].bg == TuiTheme::DARK.sel_bg));
         let row = highlight_row.expect("the highlighted command row must be visible");
         let row_text: String = (0..80u16).map(|x| buffer[(x, row)].symbol()).collect();
         assert!(
