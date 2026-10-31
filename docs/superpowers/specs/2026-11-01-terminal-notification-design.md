@@ -329,18 +329,29 @@ Windows 上若 `EnableFocusChange` 失败降级（§6.4），该行追加标注�
 - tmux：`\x1bPtmux;\x1b\x1b]9;hello\x07\x1b\\`
 - 消息含 `\x1b` 时输出不得出现裸 ESC（Codex 无此用例）
 
-`notify/mod.rs`：
+`notify/mod.rs` + 终端识别（注入 `TerminalEnv`，不读写真实环境）：
 
 - `auto` 对五家白名单逐个选 OSC 9
 - `auto` 对 Apple Terminal / Alacritty / VS Code / Windows Terminal / Unknown 选 BEL
 - 显式 `osc9` / `bel` 覆盖自动判定
 - `ZELLIJ` 存在时走 tmux 包裹
+- `TERM_PROGRAM=WarpTerminal` 与 `warp` 归一化后等价（`lib.rs:415` 的规则）
+- `TERM_PROGRAM=tmux` 时第 1 条识别被跳过，改由 `KITTY_WINDOW_ID` / `TERM` 兜底
+- `GHOSTTY_RESOURCES_DIR` / `WEZTERM_VERSION` / `ITERM_SESSION_ID` / `KITTY_WINDOW_ID` 四条兜底各一例（`TERM_PROGRAM` 缺席时命中）
+
+`tui/history.rs`：
+
+- `last_assistant_text` 只返回最后一条 assistant cell
+- 末条是 `Separator` 时仍能反向找到之前的 assistant cell（`push_event` 会压分隔线）
+- 空转录返回 `None`
+- 末条是 `Reasoning` 时不返回思维链
 
 ### 9.2 集成测试（`tui/app.rs` 测试模块）
 
 沿用现有假 `EventSource` 模式（`app.rs:4999` 有先例）：
 
-- `Done{EndTurn}` 后 `pending_notification` 被置位，下一次绘制后清空
+- `Done{EndTurn}` 后 `pending_notification` 被置位（摘要取自 `last_assistant_text`），下一次绘制后清空
+- 该回合无 assistant 文本时，摘要退回固定句 `yi-agent 回合完成`
 - `PermissionRequest` 优先级压过同帧的 `TurnComplete`
 - `Cancelled` / `Error` / `Done{MaxTurns}` / `Done{Interrupted}` 不置位
 - `notifications=false` 时任何事件都不置位
