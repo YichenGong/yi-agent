@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use yi_agent_core::{Tool, ToolRegistry, ToolResult};
 
-use crate::cache::{CachedTool, McpCache};
+use crate::cache::{CacheLookup, CachedTool, McpCache, RETRY_AFTER_SECS, TTL_SECS};
 use crate::config::{McpConfig, ServerConfig, Transport};
 use crate::tool::McpTool;
 
@@ -31,6 +31,14 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Upper bound on spawning a server and completing the MCP `initialize`
 /// handshake. Bounds a server that starts but never finishes handshaking.
+/// 当前 Unix 秒。整个 crate 只有这一处取真实时钟,其余全部接受 `now` 参数。
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the `tools/list` half of a cold cache probe.
@@ -65,6 +73,8 @@ pub struct ServerOutcome {
     pub removed: bool,
     /// 本次是否真的连上去探测过。
     pub probed: bool,
+    /// 本轮因失败退避窗口而**没有**探测(区别于「配置未变,复用旧清单」)。
+    pub skipped_backoff: bool,
     pub tool_count: usize,
     pub read_only_count: usize,
     /// 探测失败原因原文;`None` 表示成功(或未探测)。
@@ -78,6 +88,21 @@ pub struct ReloadReport {
 }
 
 impl ReloadReport {
+    /// 本轮因失败退避窗口而跳过探测的 server 名。
+    ///
+    /// 手动 `reload` 时用来说明「为什么没刷新」:否则用户分不清「真没问题」
+    /// 与「被退避挡住」。按名字排序,便于稳定展示。
+    pub fn skipped_backoff_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .servers
+            .iter()
+            .filter(|s| s.skipped_backoff)
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     /// 全部 server 都没有探测错误。写盘成功与探测成功是两件事,由调用方分别呈现。
     pub fn all_ok(&self) -> bool {
         self.servers.iter().all(|s| s.error.is_none())
@@ -142,16 +167,30 @@ impl McpManager {
         let mut cache_dirty = false;
 
         for (name, sc) in &cfg.mcp_servers {
-            let tools = match cache.get_for(name, sc) {
+            let now = now_unix();
+            // 存量条目(无 probed_at)一次性迁移到 now:否则升级后第一条
+            // needs_reload 会把它们全判成 Stale,同一轮集体重探(10 个 server
+            // 串行就是 30~40 秒),看起来像「升级把软件搞坏了」。
+            if cache.backfill_probed_at(name, now) {
+                cache_dirty = true;
+            }
+            // 启动路径刻意**不**校验 TTL:过期条目照样直接用(决策 1)。
+            // 但停用的 server 不该探——它根本不会注册成工具,探满 55s 纯浪费。
+            let tools = match cache.cached_tools_ignoring_freshness(name, sc) {
                 Some(t) => t.to_vec(),
+                None if !cfg.enabled || !sc.enabled => Vec::new(),
                 None => match probe_tools(sc).await {
                     Ok(probed) => {
-                        cache.put(name, sc, probed.clone());
+                        cache.put(name, sc, probed.clone(), now);
                         cache_dirty = true;
                         probed
                     }
                     Err(e) => {
                         warn!(server = %name, error = %e, "MCP probe failed; server unavailable");
+                        // 记下失败时刻:否则「只启动、不 reload」的 headless 场景下
+                        // 退避永远不会开始计时,每轮都要重探一遍(最坏 55s)。
+                        cache.note_failure(name, sc, now);
+                        cache_dirty = true;
                         Vec::new()
                     }
                 },
@@ -199,7 +238,7 @@ impl McpManager {
     ///
     /// 单个 server 的探测失败**不会**被吞掉:原因原文写进 `ServerOutcome::error`,
     /// 由调用方回传给模型。写盘(cache)失败只 warn,不影响本次内存快照。
-    pub async fn reload(&self, workdir: &Path) -> ReloadReport {
+    pub async fn reload(&self, workdir: &Path, now: i64) -> ReloadReport {
         let cfg = match McpConfig::load(workdir) {
             Ok(Some(c)) => c,
             Ok(None) => McpConfig::default(),
@@ -210,6 +249,7 @@ impl McpManager {
                         added: false,
                         removed: false,
                         probed: false,
+                        skipped_backoff: false,
                         tool_count: 0,
                         read_only_count: 0,
                         error: Some(format!("{e:#}")),
@@ -220,33 +260,98 @@ impl McpManager {
 
         let old = self.snapshot();
         let mut cache = McpCache::load(workdir);
+        let mut cache_dirty = false;
         let mut next: HashMap<String, Arc<ServerEntry>> = HashMap::new();
         let mut out = Vec::new();
 
         for (name, sc) in &cfg.mcp_servers {
+            // 存量条目迁移:缺 probed_at 的填成 now(一次性,不探测)。
+            if cache.backfill_probed_at(name, now) {
+                cache_dirty = true;
+            }
+
             let previous = old.get(name);
-            // 旧快照里有同名条目且配置完全一致 ⇒ 沿用工具清单,不重探。
             let reusable = previous.filter(|e| e.config == *sc);
-            let (tools, probed, error) = match reusable {
-                Some(e) => (e.tools.clone(), false, None),
-                None => match cache.get_for(name, sc) {
-                    Some(cached) => (cached.to_vec(), false, None),
-                    None => match probe_tools(sc).await {
+            let probe_allowed = cfg.enabled && sc.enabled;
+
+            // 开关关闭:不探测、不写 failed_at,工具按「内存快照 → 磁盘缓存 → 空」回落。
+            let (tools, probed, error, skipped_backoff) = if !probe_allowed {
+                let t = match reusable {
+                    Some(e) if !e.tools.is_empty() => e.tools.clone(),
+                    _ => cache
+                        .cached_tools_ignoring_freshness(name, sc)
+                        .map(<[CachedTool]>::to_vec)
+                        .unwrap_or_default(),
+                };
+                (t, false, None, false)
+            } else {
+                // 先把判定结果拷成 owned 值,再动 cache(否则 `Fresh` 借来的切片
+                // 会与后面的 `cache.put` / `note_failure` 冲突)。
+                let lookup = cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS);
+                // `Fresh` 用**磁盘**清单(跨进程同步:进程 A 写的新清单,进程 B 必须
+                // 读到)。这里不能要求 `reusable` 存在——内存里没有条目时同样该用磁盘。
+                let fresh = match lookup {
+                    CacheLookup::Fresh(disk) => Some(disk.to_vec()),
+                    _ => None,
+                };
+                let backed_off = matches!(lookup, CacheLookup::BackedOff);
+
+                if let Some(disk) = fresh {
+                    (disk, false, None, false)
+                } else if backed_off {
+                    // `BackedOff`:刚失败过,不探测。数据源是**内存快照**(磁盘可能
+                    // 因 save 失败而缺失或更旧),没有内存快照才退到磁盘旧清单。
+                    let t = match &reusable {
+                        Some(e) if !e.tools.is_empty() => e.tools.clone(),
+                        _ => cache
+                            .cached_tools_ignoring_freshness(name, sc)
+                            .map(<[CachedTool]>::to_vec)
+                            .unwrap_or_default(),
+                    };
+                    (t, false, None, true)
+                } else {
+                    match probe_tools(sc).await {
                         Ok(probed_tools) => {
-                            cache.put(name, sc, probed_tools.clone());
-                            (probed_tools, true, None)
+                            cache.put(name, sc, probed_tools.clone(), now);
+                            cache_dirty = true;
+                            (probed_tools, true, None, false)
                         }
-                        Err(e) => (Vec::new(), true, Some(e.to_string())),
-                    },
-                },
+                        Err(e) => {
+                            // 保留旧清单:内存快照优先(它才是 agent 当前在用的那批),
+                            // 其次磁盘缓存。若反过来,磁盘缓存缺失时会把可用工具清成 0 个。
+                            let fallback = match &reusable {
+                                Some(entry) if !entry.tools.is_empty() => Some(entry.tools.clone()),
+                                _ => cache
+                                    .cached_tools_ignoring_freshness(name, sc)
+                                    .map(<[CachedTool]>::to_vec),
+                            };
+                            // 记下失败时刻,让下一轮 reload 在退避窗口内跳过探测。
+                            // 不写 probed_at:失败不能把「已过期」固化成「新鲜」。
+                            cache.note_failure(name, sc, now);
+                            cache_dirty = true;
+                            (
+                                fallback.unwrap_or_default(),
+                                true,
+                                Some(e.to_string()),
+                                false,
+                            )
+                        }
+                    }
+                }
             };
-            // 开关以**磁盘**为准,但保留本轮内尚未落盘的运行时开关(TUI 的
-            // `/mcp disable` 只动内存)。两者用「磁盘值是否变了」区分:
-            // - 磁盘值没变 ⇒ 没有新的显式意图,沿用内存里的运行时开关;
-            // - 磁盘值变了 ⇒ 有人显式改过(设置页 `mcp/set`、`mcp_reload`
-            //   disable/enable、手改文件),磁盘必须胜出。
-            // 只取内存值(旧实现)会让上述"只写盘"的路径全部失效:用户看到
-            // 「已停用」,工具却照旧可用,直到进程重启。
+
+            let read_only_count = tools.iter().filter(|t| t.read_only).count();
+            out.push(ServerOutcome {
+                name: name.clone(),
+                added: previous.is_none(),
+                removed: false,
+                probed,
+                skipped_backoff,
+                tool_count: tools.len(),
+                read_only_count,
+                error,
+            });
+
             let enabled = match previous {
                 None => sc.enabled,
                 Some(e) => {
@@ -258,16 +363,6 @@ impl McpManager {
                     }
                 }
             };
-            let read_only_count = tools.iter().filter(|t| t.read_only).count();
-            out.push(ServerOutcome {
-                name: name.clone(),
-                added: previous.is_none(),
-                removed: false,
-                probed,
-                tool_count: tools.len(),
-                read_only_count,
-                error,
-            });
             next.insert(
                 name.clone(),
                 Arc::new(ServerEntry {
@@ -279,6 +374,7 @@ impl McpManager {
             );
         }
 
+        // 被删掉的 server:只报 removed,不写缓存(它已经不在配置里)。
         for name in old.keys() {
             if !cfg.mcp_servers.contains_key(name) {
                 out.push(ServerOutcome {
@@ -286,6 +382,7 @@ impl McpManager {
                     added: false,
                     removed: true,
                     probed: false,
+                    skipped_backoff: false,
                     tool_count: 0,
                     read_only_count: 0,
                     error: None,
@@ -293,8 +390,10 @@ impl McpManager {
             }
         }
 
-        if let Err(e) = cache.save(workdir) {
-            warn!(error = %e, "failed to persist MCP cache after reload");
+        if cache_dirty {
+            if let Err(e) = cache.save(workdir) {
+                warn!(error = %e, "failed to persist MCP cache after reload");
+            }
         }
         self.master_enabled.store(cfg.enabled, Ordering::Relaxed);
         *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
@@ -305,11 +404,20 @@ impl McpManager {
         ReloadReport { servers: out }
     }
 
-    /// 当前磁盘配置的指纹;文件缺失或坏 JSON 时返回 `None`(调用方据此决定是否 reload)。
-    pub fn config_fingerprint(&self, workdir: &Path) -> Option<String> {
+    /// 读一次 `mcp.json`,同时拿到指纹与解析后的配置。
+    ///
+    /// 拆出来是为了让 [`needs_reload`](Self::needs_reload) 不必读两遍盘:
+    /// 指纹比较与逐 server 判定用的是同一份解析结果。
+    pub fn fingerprint_and_config(&self, workdir: &Path) -> Option<(String, McpConfig)> {
         let text = std::fs::read_to_string(crate::config::config_path(workdir)).ok()?;
         let cfg: McpConfig = serde_json::from_str(&text).ok()?;
-        Some(crate::cache::fingerprint_for_manager(&cfg))
+        let fp = crate::cache::fingerprint_for_manager(&cfg);
+        Some((fp, cfg))
+    }
+
+    /// 当前磁盘配置的指纹;文件缺失或坏 JSON 时返回 `None`(调用方据此决定是否 reload)。
+    pub fn config_fingerprint(&self, workdir: &Path) -> Option<String> {
+        self.fingerprint_and_config(workdir).map(|(fp, _)| fp)
     }
 
     /// 上一次 reload / 启动探测时读到的配置指纹。
@@ -320,21 +428,59 @@ impl McpManager {
             .clone()
     }
 
-    /// 磁盘上的配置是否与上次见到的不一样。
+    /// 磁盘上的配置是否与上次见到的不一样(只比指纹)。
     ///
-    /// 用在"每轮开始前"的检查:用户可能在别的窗口改了 `mcp.json`,也可能
-    /// 刚刚通过 `mcp_reload` 写过盘——后者会在 `reload` 里更新 `last_seen`,
-    /// 所以不会误判成"外部改动"而白跑一次。
+    /// `needs_reload` 走的是「读一次、复用解析结果」的路径,不使用本方法;
+    /// 它保留给只需要布尔判断的调用方(既有测试与将来的一次性检查)。
     ///
     /// 文件缺失且从未见过配置时返回 `false`(没什么可重载的);文件从有到无
     /// 返回 `true`(server 全删了,得把它清出 registry)。
-    pub fn config_changed_on_disk(&self, workdir: &Path) -> bool {
+    #[allow(dead_code)]
+    fn fingerprint_changed(&self, workdir: &Path) -> bool {
         let current = self.config_fingerprint(workdir);
         let last = self.last_seen_fingerprint();
         match (current, last) {
             (None, None) => false,
             (a, b) => a != b,
         }
+    }
+
+    /// 每轮开跑前:是否需要重新 `reload`。
+    ///
+    /// 判据必须与 [`reload`](Self::reload) 的短路逐条对齐——`reload` 不会做任何事
+    /// 的 server,就不能成为触发条件,否则每轮空转(还可能每轮重建一次 agent)。
+    pub fn needs_reload(&self, workdir: &Path, now: i64) -> bool {
+        // 整个函数只读一次 mcp.json:解析结果同时用于指纹比较与逐 server 判定。
+        let current = self.fingerprint_and_config(workdir);
+
+        // 1. 指纹变了 ⇒ 一定重载(含「文件从有到无 / 从无到有」)
+        let last = self.last_seen_fingerprint();
+        let changed = match (&current, &last) {
+            (None, None) => false,
+            (Some((fp, _)), Some(prev)) => fp != prev,
+            _ => true,
+        };
+        if changed {
+            return true;
+        }
+
+        // 2. 配置没变,但某个 server 的条目已过期且允许重试 ⇒ 也要重载
+        let Some((_, cfg)) = current else {
+            return false;
+        };
+        // 总开关关闭 ⇒ reload 整段不探测,不能成为触发条件
+        if !cfg.enabled {
+            return false;
+        }
+        let cache = McpCache::load(workdir);
+        cfg.mcp_servers.iter().any(|(name, sc)| {
+            // 停用的 server 由 reload 短路、永不探测 ⇒ 不能触发 reload
+            sc.enabled
+                && matches!(
+                    cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                    CacheLookup::Stale
+                )
+        })
     }
 
     pub fn set_master(&self, on: bool) {
@@ -908,6 +1054,7 @@ mod tests {
 
     /// 配置没变时 `reload` 不得重新探测——探测会 spawn 子进程并可能耗时 55s。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
@@ -935,7 +1082,7 @@ mod tests {
         let after_load = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_load, 1, "startup must probe once (cache is cold)");
 
-        let report = mgr.reload(dir.path()).await;
+        let report = mgr.reload(dir.path(), now_unix()).await;
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             after_load,
@@ -949,6 +1096,7 @@ mod tests {
 
     /// 改了配置就必须重新探测,并把失败原文带上(不静默)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
@@ -981,7 +1129,7 @@ mod tests {
             r#"{"mcpServers":{"fs":{"command":"npx","args":["--new"]}}}"#,
         )
         .unwrap();
-        let report = mgr.reload(dir.path()).await;
+        let report = mgr.reload(dir.path(), now_unix()).await;
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -994,6 +1142,7 @@ mod tests {
 
     /// 删除一个 server 后,它的工具名必须从 registry 消失。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
@@ -1018,7 +1167,7 @@ mod tests {
             headers: Default::default(),
             enabled: true,
         };
-        cache.put("fs", &sc, vec![]);
+        cache.put("fs", &sc, vec![], now_unix());
         cache.save(dir.path()).unwrap();
 
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
@@ -1031,7 +1180,7 @@ mod tests {
             r#"{"mcpServers":{}}"#,
         )
         .unwrap();
-        let report = mgr.reload(dir.path()).await;
+        let report = mgr.reload(dir.path(), now_unix()).await;
         assert!(report.servers.iter().any(|s| s.name == "fs" && s.removed));
         mgr.refresh_registry(&mut registry);
         assert!(
@@ -1043,6 +1192,7 @@ mod tests {
 
     /// 每轮检查:磁盘没变就不该说"变了",否则每轮都会白跑一次 reload。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
@@ -1064,12 +1214,13 @@ mod tests {
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
 
         assert!(
-            !mgr.config_changed_on_disk(dir.path()),
+            !mgr.needs_reload(dir.path(), now_unix()),
             "load_and_probe must record what it saw"
         );
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
@@ -1089,7 +1240,7 @@ mod tests {
         .unwrap();
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
 
         std::fs::write(
             dir.path().join(".yi-agent/mcp.json"),
@@ -1097,17 +1248,18 @@ mod tests {
         )
         .unwrap();
         assert!(
-            mgr.config_changed_on_disk(dir.path()),
+            mgr.needs_reload(dir.path(), now_unix()),
             "edit must be noticed"
         );
 
         // reload 之后同一次改动不该反复触发。
-        mgr.reload(dir.path()).await;
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        mgr.reload(dir.path(), now_unix()).await;
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
     }
 
     /// 配置从有到无:server 全被删掉,必须触发一次收尾 reload。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // 这些用例会走 `load_and_probe` → `connect`，而 `connect` 读进程级
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
@@ -1124,10 +1276,10 @@ mod tests {
         std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
         let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
         let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
-        assert!(!mgr.config_changed_on_disk(dir.path()));
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
 
         std::fs::remove_file(&path).unwrap();
-        assert!(mgr.config_changed_on_disk(dir.path()));
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
     }
 
     #[test]
@@ -1159,7 +1311,7 @@ mod tests {
 
         let sc = cfg("npx");
         let mut cache = McpCache::default();
-        cache.put("fs", &sc, vec![]);
+        cache.put("fs", &sc, vec![], now_unix());
         cache.save(dir.path()).unwrap();
 
         let loaded = McpConfig::load(dir.path()).unwrap().unwrap();
@@ -1179,14 +1331,14 @@ mod tests {
             ..cfg("uvx")
         };
         let mut cache = McpCache::load(dir.path());
-        cache.put("other", &other, vec![]);
+        cache.put("other", &other, vec![], now_unix());
         cache.save(dir.path()).unwrap();
         std::fs::write(
             &cfg_path,
             r#"{"mcpServers":{"fs":{"command":"npx"},"other":{"command":"uvx"}}}"#,
         )
         .unwrap();
-        mgr.reload(dir.path()).await;
+        mgr.reload(dir.path(), now_unix()).await;
 
         assert!(
             !mgr.is_effective("fs"),
@@ -1224,6 +1376,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 read_only: true,
             }],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -1237,7 +1390,7 @@ mod tests {
             r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
         )
         .unwrap();
-        mgr.reload(dir.path()).await;
+        mgr.reload(dir.path(), now_unix()).await;
 
         assert!(
             !mgr.is_effective("fs"),
@@ -1411,6 +1564,22 @@ mod tests {
         *TEST_CONNECTOR.lock().unwrap() = Some(factory);
     }
 
+    /// 装一个「计数型」失败 connector：每次**连接尝试**都 +1 再失败。
+    ///
+    /// 与 `install_echo_connector` 的区别:那个只在 `tools/call` 时计数,而
+    /// **探测**走的是 `list_tools`。要断言「有没有去探测」必须数连接次数,
+    /// 数 `call_tool` 永远是 0(踩过这个坑:变异测试打不掉)。
+    fn install_counting_failing_connector(calls: Arc<AtomicUsize>) {
+        let factory: TestConnector = Arc::new(move || {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow!("counting connector: no real server"))
+            })
+        });
+        *TEST_CONNECTOR.lock().unwrap() = Some(factory);
+    }
+
     /// `TEST_CONNECTOR` 是进程级全局量,并行测试会互相清空/覆盖。
     /// 所有用到这个缝的测试都先拿这把锁,保证同一时刻只有一个在跑。
     static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1433,6 +1602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
@@ -1469,7 +1639,9 @@ mod tests {
             "probe must not call any tool"
         );
         let cached = McpCache::load(dir.path());
-        let hit = cached.get_for("s", &sc).expect("cache hit after probe");
+        let hit = cached
+            .cached_tools_ignoring_freshness("s", &sc)
+            .expect("cache hit after probe");
         assert_eq!(hit.len(), 1, "probe should list exactly one tool");
         assert_eq!(hit[0].name, "echo");
         assert_eq!(mgr.enabled_tools().len(), 1);
@@ -1492,6 +1664,695 @@ mod tests {
         assert!(mgr.enabled_tools().is_empty());
 
         mgr.shutdown().await;
+    }
+
+    // ---- needs_reload ----
+
+    fn write_mcp(dir: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(dir.join(".yi-agent")).unwrap();
+        std::fs::write(dir.join(".yi-agent/mcp.json"), body).unwrap();
+    }
+
+    /// 建一个 manager,并把 `last_seen` 对齐到磁盘现状(模拟「刚 reload 过」)。
+    async fn manager_in_sync(dir: &std::path::Path) -> Arc<McpManager> {
+        let cfg = McpConfig::load(dir).unwrap().unwrap();
+        McpManager::load_and_probe(cfg, dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn needs_reload_is_false_when_nothing_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    #[tokio::test]
+    async fn needs_reload_is_true_when_the_file_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"uvx"}}}"#);
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 配置没变、但缓存过期 ⇒ 触发重载(本 bug 的自愈入口)。
+    #[tokio::test]
+    async fn needs_reload_is_true_when_a_cache_entry_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now_unix() - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 配置没变、缓存新鲜 ⇒ 不重载(防每轮重探)。
+    #[tokio::test]
+    async fn needs_reload_is_false_when_the_cache_is_fresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now_unix() - 23 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now_unix()));
+    }
+
+    /// 过期 + 刚失败 ⇒ 不重载(否则每轮白跑一遍 reload + 重建 agent)。
+    #[tokio::test]
+    async fn needs_reload_is_false_while_a_stale_entry_is_backed_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        let sc = cfg("npx");
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.note_failure("fs", &sc, now - 60);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
+    }
+
+    /// 停用的 server 过期后不能触发 reload(否则永久空转)。
+    #[tokio::test]
+    async fn needs_reload_is_false_for_a_disabled_expired_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        let mut sc = cfg("npx");
+        sc.enabled = false;
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
+    }
+
+    /// 总开关关闭时,任何过期条目都不能触发 reload。
+    #[tokio::test]
+    async fn master_off_suppresses_needs_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"enabled":false,"mcpServers":{"fs":{"command":"npx"}}}"#,
+        );
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &cfg("npx"), vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        assert!(!mgr.needs_reload(dir.path(), now));
+    }
+
+    // ---- reload 分派 ----
+
+    /// 过期 + 探测失败 ⇒ 工具沿用、error 非空、failed_at 被写。
+    #[tokio::test]
+    async fn a_failed_probe_falls_back_to_the_old_tool_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "old_tool".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        let s = &report.servers[0];
+        assert_eq!(s.tool_count, 1, "旧工具必须保留");
+        assert!(s.error.is_some());
+        assert!(s.probed);
+
+        let after = McpCache::load(dir.path());
+        assert!(
+            matches!(
+                after.lookup("fs", &sc, now + 1, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "失败必须写 failed_at"
+        );
+    }
+
+    /// 探测失败**不能**刷新 probed_at(否则「已过期」被固化成「新鲜」,24h 内不再重探)。
+    #[tokio::test]
+    async fn a_failed_probe_does_not_make_the_entry_fresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+        let before = McpCache::load(dir.path())
+            .lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS)
+            .is_settled();
+
+        let _ = mgr.reload(dir.path(), now).await;
+
+        let after = McpCache::load(dir.path());
+        assert!(
+            matches!(
+                after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "失败后必须处于退避状态(probed_at 未被刷新)"
+        );
+        assert!(!before, "前置条件:探测前必须不是 settled 状态");
+    }
+
+    /// 无缓存 + 探测失败 ⇒ 工具为空。
+    ///
+    /// 用空 manager:若先走 `manager_in_sync` 的启动探测,失败会被记成
+    /// `failed_at`(启动路径也会写),紧接着的 reload 就命中退避而不探测了,
+    /// 测不到「无缓存 + 探测失败」这条路径。
+    #[tokio::test]
+    async fn a_failed_probe_with_no_cache_yields_no_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = Arc::new(McpManager::new_for_test(true));
+
+        let now = now_unix();
+        let report = mgr.reload(dir.path(), now).await;
+        assert_eq!(report.servers[0].tool_count, 0);
+        assert!(report.servers[0].error.is_some());
+    }
+
+    /// 内存有工具、磁盘缓存无条目、探测失败 ⇒ 工具数不变。
+    ///
+    /// 钉住「回退源是内存快照」:若改成只回退磁盘缓存,会变成 0 个。
+    #[tokio::test]
+    async fn a_failed_probe_keeps_the_in_memory_tools_when_the_cache_file_is_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_echo_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+        let before = mgr.enabled_tools().len();
+        assert!(before > 0, "先要有内存工具");
+
+        std::fs::remove_file(dir.path().join(".yi-agent/mcp-cache.json")).unwrap();
+        install_failing_connector();
+
+        let now = now_unix();
+        let report = mgr.reload(dir.path(), now).await;
+        assert_eq!(
+            report.servers[0].tool_count, before,
+            "内存快照必须保留 {before} 个工具,实际 {}",
+            report.servers[0].tool_count
+        );
+    }
+
+    /// 退避窗口内 reload 不探测。
+    #[tokio::test]
+    async fn reload_skips_a_probe_within_the_backoff_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.note_failure("fs", &sc, now - 60);
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed, "退避窗口内不应探测");
+        assert!(report.servers[0].skipped_backoff, "应标记为因退避跳过");
+    }
+
+    /// 新鲜缓存用**磁盘清单**,不是内存快照(跨进程同步)。
+    #[tokio::test]
+    async fn reload_uses_the_disk_list_not_the_memory_snapshot_when_fresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "disk_tool".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed, "新鲜不应探测");
+        assert_eq!(report.servers[0].tool_count, 1);
+        let tools = mgr.enabled_tools();
+        assert_eq!(tools[0].name(), "mcp__fs__disk_tool");
+    }
+
+    /// 本 bug 的直接回归测试:过期后探测拿到新工具名。
+    #[tokio::test]
+    async fn reload_refreshes_a_renamed_tool_after_the_ttl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_echo_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "old_name".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(report.servers[0].probed, "过期后必须重探");
+        let names: Vec<String> = mgr
+            .enabled_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with("old_name")),
+            "旧工具名必须被替换, 实际: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("echo")),
+            "必须换成新探测到的工具, 实际: {names:?}"
+        );
+    }
+
+    /// 冷缓存探测成功后必须写入 probed_at,否则 TTL 永不开始计时。
+    #[tokio::test]
+    async fn load_and_probe_records_probed_at_on_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_echo_connector(Arc::clone(&calls));
+
+        let _mgr = manager_in_sync(dir.path()).await;
+        let cache = McpCache::load(dir.path());
+        assert!(
+            matches!(
+                cache.lookup("fs", &cfg("npx"), now_unix(), TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::Fresh(_)
+            ),
+            "成功后 probed_at 必须被写入"
+        );
+    }
+
+    // ---- 停用 server 的两条路径 ----
+
+    /// 停用的 server 即使缓存过期也不探测,工具沿用旧清单。
+    #[tokio::test]
+    async fn a_disabled_server_is_never_probed_even_after_the_ttl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut sc = cfg("npx");
+        sc.enabled = false;
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "kept".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed, "停用 server 不应探测");
+        assert_eq!(report.servers[0].tool_count, 1, "旧清单必须保留");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+
+        // failed_at 不该被写:没探测就没有失败
+        let after = McpCache::load(dir.path());
+        assert!(
+            !matches!(
+                after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "未探测时不得写 failed_at"
+        );
+    }
+
+    /// 启动路径刻意**不**校验 TTL:25h 前的缓存照样直接复用,不探测。
+    #[tokio::test]
+    async fn load_and_probe_does_not_probe_an_expired_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "old".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不应因 TTL 过期而探测"
+        );
+        assert_eq!(mgr.enabled_tools().len(), 1, "旧清单必须沿用");
+    }
+
+    /// 启动路径同样不探测停用的 server(与 reload 保持一致)。
+    #[tokio::test]
+    async fn load_and_probe_does_not_probe_a_disabled_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let _mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不应为停用 server 探测"
+        );
+    }
+
+    /// 总开关关闭时,即使配置里有过期条目也不探测,且 failed_at 不被写。
+    #[tokio::test]
+    async fn master_off_probes_nothing_even_when_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"enabled":false,"mcpServers":{"fs":{"command":"npx"}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "kept".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed);
+        assert_eq!(report.servers[0].tool_count, 1, "旧清单必须保留");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+
+        let after = McpCache::load(dir.path());
+        assert!(
+            !matches!(
+                after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "未探测时不得写 failed_at"
+        );
+    }
+
+    /// 10 条存量条目迁移后,连续两轮 needs_reload 都为 false。
+    ///
+    /// 防「升级即卡 9 分钟」:若不迁移,10 条全部 Stale,第二轮仍会触发重探。
+    #[tokio::test]
+    async fn migration_of_many_servers_probes_none_of_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // 手写一份**没有 probed_at / failed_at** 的旧格式缓存(10 个 server)
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        let mut servers = serde_json::Map::new();
+        for i in 0..10 {
+            let sc = cfg("npx");
+            servers.insert(
+                format!("s{i}"),
+                serde_json::json!({
+                    "fingerprint": McpCache::fingerprint_for_test(&sc),
+                    "tools": [{
+                        "name": format!("tool{i}"),
+                        "description": null,
+                        "input_schema": {"type": "object"},
+                        "read_only": true
+                    }]
+                }),
+            );
+        }
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp-cache.json"),
+            serde_json::to_string(&serde_json::json!({"servers": servers})).unwrap(),
+        )
+        .unwrap();
+
+        // 配置里也有这 10 个 server
+        let mut cfg_servers = serde_json::Map::new();
+        for i in 0..10 {
+            cfg_servers.insert(format!("s{i}"), serde_json::json!({"command": "npx"}));
+        }
+        write_mcp(
+            dir.path(),
+            &serde_json::to_string(&serde_json::json!({"mcpServers": cfg_servers})).unwrap(),
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let mgr = manager_in_sync(dir.path()).await;
+
+        // 关键断言一:只做过 `load_and_probe`(还没 reload)时,迁移就必须已经落盘
+        // 且 `needs_reload` 为 false。否则升级后第一轮会因「10 条全 Stale」而集体
+        // 重探——正是 load_and_probe 那处 backfill 的作用,reload 那处兜不住。
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "load_and_probe 不应探测存量条目"
+        );
+        assert!(
+            !mgr.needs_reload(dir.path(), now_unix()),
+            "load_and_probe 迁移后 needs_reload 必须为 false(否则升级即卡 30s+)"
+        );
+
+        // 关键断言二:再 reload 一轮也不探测(此时看的是 reload 那处 backfill)。
+        let _ = mgr.reload(dir.path(), now_unix()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "reload 一轮后仍不应有任何探测"
+        );
+        assert!(
+            !mgr.needs_reload(dir.path(), now_unix()),
+            "连续两轮后 needs_reload 必须为 false"
+        );
+    }
+
+    // ---- 放大路径防线 ----
+
+    /// 连续 10 轮 needs_reload + reload,坏 server 的探测次数必须是 1~2 次。
+    #[tokio::test]
+    async fn a_permanently_dead_server_is_probed_once_per_backoff_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        // 先把过期缓存写好,**再**建 manager:否则启动探测失败会在
+        // load_and_probe 里写下 failed_at,掩盖「reload 有没有记失败」这件事。
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不该探测(缓存只看指纹)"
+        );
+        // 清掉 failed_at,把起点固定成「已过期、未退避」
+        let mut cache = McpCache::load(dir.path());
+        cache.put("fs", &sc, vec![], now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let mut probes = 0usize;
+        for round in 0..10 {
+            let t = now + round; // 10 秒内跑完 10 轮
+            if mgr.needs_reload(dir.path(), t) {
+                let report = mgr.reload(dir.path(), t).await;
+                probes += report.servers.iter().filter(|s| s.probed).count();
+            }
+        }
+        assert!(
+            (1..=2).contains(&probes),
+            "10 轮内应只探 1~2 次,实际 {probes} 次(退避失效会变成 10 次,每轮 55s)"
+        );
+        assert!(
+            (1..=2).contains(&calls.load(std::sync::atomic::Ordering::SeqCst)),
+            "连接尝试次数应与探测次数一致"
+        );
+    }
+
+    /// 同一进程内先建立快照,把缓存时间戳改旧,再 reload ⇒ 必须重探。
+    #[tokio::test]
+    async fn reload_reprobes_when_the_in_memory_snapshot_has_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_echo_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+        let built = mgr.enabled_tools().len();
+        assert!(built > 0);
+
+        // 把磁盘缓存时间戳改到 25h 前(配置指纹不变)
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        let tools = cache
+            .cached_tools_ignoring_freshness("fs", &sc)
+            .expect("cache hit")
+            .to_vec();
+        cache.put("fs", &sc, tools, now - 25 * 3600);
+        cache.save(dir.path()).unwrap();
+
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(
+            report.servers[0].probed,
+            "内存快照过期后必须重探(否则永远拿不到新工具名)"
+        );
     }
 }
 

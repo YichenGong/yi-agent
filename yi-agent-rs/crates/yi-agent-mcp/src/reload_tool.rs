@@ -12,7 +12,7 @@ use yi_agent_core::permission::BlocklistFn;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 use crate::config::{McpConfig, ServerConfig, ServerKind};
-use crate::manager::McpManager;
+use crate::manager::{McpManager, now_unix};
 use crate::reload::{ReloadAction, ReloadRequest, apply};
 
 pub const TOOL_NAME: &str = "mcp_reload";
@@ -102,7 +102,7 @@ impl McpReloadTool {
             return ToolResult::text(render_local(&req, &cfg));
         }
 
-        let report = self.manager.reload(&self.workdir).await;
+        let report = self.manager.reload(&self.workdir, now_unix()).await;
         ToolResult::text(render_with_report(&req, &report))
     }
 }
@@ -287,6 +287,16 @@ fn render_with_report(req: &ReloadRequest, report: &crate::manager::ReloadReport
                 "- `{}` ✓ {} 个工具（{} 只读）\n",
                 s.name, s.tool_count, s.read_only_count
             ));
+        } else if s.skipped_backoff {
+            // 用户敲 reload 想强制刷新,却被上一次失败的退避窗口挡住。必须说明,
+            // 否则他分不清「真没问题」与「被退避挡住」。
+            out.push_str(&format!(
+                "- `{}` 跳过探测（上次失败后的退避窗口内，最早可重试约 {} 分钟后），沿用 {} 个工具（{} 只读）\n",
+                s.name,
+                crate::cache::RETRY_AFTER_SECS / 60,
+                s.tool_count,
+                s.read_only_count
+            ));
         } else {
             out.push_str(&format!(
                 "- `{}` ✓ {} 个工具（{} 只读，配置未变，未重新探测）\n",
@@ -306,6 +316,7 @@ fn render_with_report(req: &ReloadRequest, report: &crate::manager::ReloadReport
 mod tests {
     use super::*;
     use crate::config::ServerKind;
+    use crate::manager::now_unix;
     use crate::reload::{ReloadAction, ReloadRequest};
     use tempfile::TempDir;
 
@@ -387,11 +398,12 @@ mod tests {
             "fs",
             &spec,
             vec![crate::test_support::cached_tool("read", true)],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
         let manager = McpManager::empty();
-        manager.reload(dir.path()).await;
+        manager.reload(dir.path(), now_unix()).await;
         manager.set_server("fs", false).unwrap();
         assert!(!manager.is_effective("fs"), "runtime disable must apply");
 
@@ -440,6 +452,7 @@ mod tests {
             "fs",
             &spec,
             vec![crate::test_support::cached_tool("read", true)],
+            now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -487,6 +500,7 @@ mod tests {
                 added: true,
                 removed: false,
                 probed: true,
+                skipped_backoff: false,
                 tool_count: 0,
                 read_only_count: 0,
                 error: Some("npx 下载超时".into()),
@@ -523,6 +537,7 @@ mod tests {
                 added: true,
                 removed: false,
                 probed: false,
+                skipped_backoff: false,
                 tool_count: 3,
                 read_only_count: 1,
                 error: None,
@@ -588,5 +603,62 @@ mod tests {
         assert!(!md.read_only);
         assert_eq!(md.source, ToolSource::Builtin);
         assert_eq!(tool.name(), "mcp_reload");
+    }
+
+    /// 因退避跳过时,报告必须写明原因,不能与「配置未变」混为一谈。
+    #[test]
+    fn backoff_skip_is_explained_in_the_report() {
+        let req = ReloadRequest {
+            action: ReloadAction::Enable,
+            name: "fs".into(),
+            spec: None,
+            overwrite: false,
+        };
+        let report = crate::manager::ReloadReport {
+            servers: vec![crate::manager::ServerOutcome {
+                name: "fs".into(),
+                added: false,
+                removed: false,
+                probed: false,
+                skipped_backoff: true,
+                tool_count: 2,
+                read_only_count: 1,
+                error: None,
+            }],
+        };
+        let text = render_with_report(&req, &report);
+        assert!(
+            text.contains("跳过") || text.contains("退避"),
+            "必须说明为什么没探测, 实际: {text}"
+        );
+        assert!(
+            text.contains("2 个工具"),
+            "必须说明沿用了多少个工具, 实际: {text}"
+        );
+        assert!(
+            !text.contains("配置未变"),
+            "退避与「配置未变」必须可区分, 实际: {text}"
+        );
+    }
+
+    /// 汇总方法要能列出因退避跳过的 server,且按名字稳定排序。
+    #[test]
+    fn skipped_backoff_names_lists_only_backed_off_servers() {
+        let mk = |name: &str, skipped: bool| crate::manager::ServerOutcome {
+            name: name.into(),
+            added: false,
+            removed: false,
+            probed: false,
+            skipped_backoff: skipped,
+            tool_count: 0,
+            read_only_count: 0,
+            error: None,
+        };
+        let report = crate::manager::ReloadReport {
+            servers: vec![mk("zeta", true), mk("alpha", true), mk("mid", false)],
+        };
+        assert_eq!(report.skipped_backoff_names(), vec!["alpha", "zeta"]);
+        let empty = crate::manager::ReloadReport { servers: vec![] };
+        assert!(empty.skipped_backoff_names().is_empty());
     }
 }

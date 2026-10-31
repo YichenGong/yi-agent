@@ -409,6 +409,7 @@ mod tests {
                 yi_agent_mcp::test_support::cached_tool("read_file", true),
                 yi_agent_mcp::test_support::cached_tool("write_file", false),
             ],
+            yi_agent_mcp::now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
@@ -439,6 +440,7 @@ mod tests {
             "fs",
             &other,
             vec![yi_agent_mcp::test_support::cached_tool("x", true)],
+            yi_agent_mcp::now_unix(),
         );
         cache.save(dir.path()).unwrap();
 
