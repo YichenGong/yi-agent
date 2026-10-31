@@ -13,6 +13,8 @@ import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
+import { ClientRegistry } from "./lib/clientRegistry";
+import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
 import { CacheNotice } from "./components/CacheNotice";
@@ -161,7 +163,18 @@ export default function App() {
   const storeRef = useRef(new ThreadStore());
   const store = storeRef.current;
   const [, force] = useState(0);
+  /**
+   * 按槽位持有连接（本地 + 每个已连接的远端项目）。
+   *
+   * `clientRef` 仍然存在，但语义收窄成「**当前活动槽位**的客户端」：全文几十处
+   * 读取点都是「当前项目」语义，让它们继续读同一个名字，比逐个改成
+   * `registry.current()` 安全得多——那批改动里混入一处误改就是跨项目写错数据。
+   * 连接管理（建连/重连/dispose/全局只读）一律走注册表。
+   */
+  const registryRef = useRef(new ClientRegistry<RpcClient>());
   const clientRef = useRef<RpcClient | null>(null);
+  /** 当前活动槽位：本地项目是 `local`，选中远端项目时换成它的 profile id。 */
+  const activeSlotRef = useRef<Slot>(LOCAL_SLOT);
   // Set once the effect wires up; `RpcClient` calls it to re-handshake the current
   // client after the relay bridge restarts (see `RpcClient.request`). A ref, not
   // a closure over `clientRef`, so the client created inside the effect captures
@@ -1335,6 +1348,29 @@ export default function App() {
     // 握手成功即清零,所以偶尔一次闪断不会让下一次重连背负更大的延迟。
     let attempt = 0;
 
+    /**
+     * 重建**某个**槽位的连接并握手。
+     *
+     * 与 `reconnectNow` 的区别：那个只服务「当前活动槽位 + 单一退避定时器」，
+     * 这条要给「切回前台时把所有槽位一起唤醒」用——远端槽位被系统掐断后不会
+     * 自己恢复，逐个重建才不会有项目静默半死。
+     *
+     * **只握手、不排队**：这里的调用点是前台唤醒，延迟没有价值；失败了由
+     * 该槽位自己的握手失败路径（`scheduleReconnect`）接管。
+     */
+    const reconnectSlot = (slot: Slot) => {
+      if (disposed) return;
+      let next: RpcClient;
+      try {
+        next = connectSlot(slot);
+      } catch (e) {
+        setStatus(`error: ${formatError(e)}`);
+        return;
+      }
+      syncActiveClient();
+      void handshake(next);
+    };
+
     // 断开后的重连入口：清掉可能已在途的定时器,立刻建客户端重试。前台唤醒
     // 用它做即时重连,exited 处理则用 scheduleReconnect 排队。
     const reconnectNow = () => {
@@ -1375,7 +1411,14 @@ export default function App() {
     const onVisibilityChange = () => {
       if (document.visibilityState !== "visible" || disposed) return;
       attempt = 0;
-      reconnectNow();
+      // 遍历**所有**槽位：被后台掐断的远端连接不会自己恢复。只重连当前槽位会让
+      // 用户切回其它项目时的前几个请求全部失败（spec §4.6）。
+      const slots = registryRef.current.keys();
+      if (slots.length <= 1) {
+        reconnectNow();
+        return;
+      }
+      for (const slot of slots) reconnectSlot(slot);
     };
 
     // 注册每个客户端的通知/审批/状态回调。sidecar 重启后会换一个新客户端,
@@ -1593,8 +1636,12 @@ export default function App() {
         syncPlanRef.current = parseSyncPlan(initialized);
         // 构建类型只在 dev 上开放「实验功能」；读失败按 release 处理（fail-closed，
         // 与 Rust 侧的硬闸同一口径），不让面板因为一次网络抖动冒出来。
+        // 全局只读一律问**本地**槽位（spec §5.2）：远端跑的是它自己的二进制，
+        // 它报的 build kind 与 flag 值描述的是那台机器。拿远端的答案渲染本机的
+        // 「实验功能」面板，会得到一个恰好看起来合理、来源却完全错误的值。
+        const globalReader = registryRef.current.forGlobalReads() ?? client;
         try {
-          const info = await client.request<{ build_kind?: unknown }>("build/info", {});
+          const info = await globalReader.request<{ build_kind?: unknown }>("build/info", {});
           const kind = info.build_kind;
           setBuildKind(kind === "dev" || kind === "nogit" ? kind : "release");
         } catch {
@@ -1608,7 +1655,7 @@ export default function App() {
         // 同一份 `flags/list` 里就有看板开关，不再多发请求。
         let kanbanOn = false;
         try {
-          const flags = await client.request<{
+          const flags = await globalReader.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
           }>("flags/list", {});
           const lead = (flags.flags ?? []).find((f) => f.name === "lead_agent");
@@ -1765,18 +1812,32 @@ export default function App() {
       if (win.length > 0) await raw("thread/subscribe", { threadIds: win });
     };
 
-    const connect = (): RpcClient => {
-      // Tear down the previous client before building the new one. A Tauri (or
-      // ws) transport keeps delivering frames until it is explicitly disposed,
-      // so leaving the old client subscribed would apply every notification
-      // twice: an append-only `item/delta` duplicates the streamed text, and it
-      // only "converges" because `item/completed` replaces the whole item by id.
-      clientRef.current?.dispose();
+    /**
+     * 建某槽位的连接。**只替换该槽位**，绝不动别的槽位。
+     *
+     * 销毁旧实例的职责收在 `ClientRegistry.put`：Tauri 事件监听不会随连接关闭
+     * 自动停，未 dispose 的旧 transport 会与新的一起消费每条帧，append-only 的
+     * `item/delta` 于是被应用两遍（流式文本重复，直到 `item/completed` 按 id
+     * 整条覆盖才「收敛」）。
+     */
+    const connectSlot = (slot: Slot = LOCAL_SLOT): RpcClient => {
       // 新连接 = 新的对账周期：为「none 缓存会话」的静默补齐重新开账（见 `toppedUp`）。
       toppedUp.current.clear();
-      const client = new RpcClient(transportFactory(), (raw) => recoveryRef.current!(raw));
-      clientRef.current = client;
+      const client = new RpcClient(transportFactory({ slot }), (raw) => recoveryRef.current!(raw));
+      registryRef.current.put(slot, client);
       wireClient(client);
+      return client;
+    };
+
+    /** 让 `clientRef` 指向当前活动槽位的客户端。切槽位/重连后都要调一次。 */
+    const syncActiveClient = () => {
+      registryRef.current.setActive(activeSlotRef.current);
+      clientRef.current = registryRef.current.current() ?? null;
+    };
+
+    const connect = (): RpcClient => {
+      const client = connectSlot(activeSlotRef.current);
+      syncActiveClient();
       return client;
     };
 

@@ -1,5 +1,6 @@
 import type { Transport } from "./lib/rpc";
 import { type RemoteConfig, type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
+import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import { tauriTransport } from "./tauriTransport";
 import { wsTransport } from "./wsTransport";
 
@@ -27,13 +28,18 @@ export interface TransportFactoryOptions {
   storage?: StorageLike;
   /** Explicit config wins over storage (used by tests, and by a future paired-URL deep link). */
   config?: RemoteConfig | null;
+  /**
+   * 桌面端要连的槽位（`local` 或远端 profile id）。只有落到 Tauri 桥接时才
+   * 有意义：ws 客户端连的是中继上的一个 session，没有「槽位」概念。
+   */
+  slot?: Slot;
 }
 
 export function transportFactory(opts: TransportFactoryOptions = {}): Transport {
   const config =
     opts.config ??
     storedRemoteConfig(opts.storage ?? (globalThis.localStorage as StorageLike | undefined) ?? emptyStorage);
-  return config ? wsTransport(config.url, config.token) : tauriTransport();
+  return config ? wsTransport(config.url, config.token) : tauriTransport(opts.slot ?? LOCAL_SLOT);
 }
 
 const emptyStorage: StorageLike = { getItem: () => null, setItem: () => {}, removeItem: () => {} };

@@ -50,6 +50,22 @@ describe("transportFactory", () => {
     });
   });
 
+  // 槽位只在桌面桥接上有意义：ws 客户端连的是中继上的一个 session。
+  it("passes the slot through to tauriTransport", () => {
+    transportFactory({ storage: storages(), slot: "proj-foo" });
+    expect(tauriTransport).toHaveBeenCalledWith("proj-foo");
+  });
+
+  it("defaults the slot to local on the desktop path", () => {
+    transportFactory({ storage: storages() });
+    expect(tauriTransport).toHaveBeenCalledWith("local");
+  });
+
+  it("does not pass a slot to the ws transport", () => {
+    transportFactory({ storage: storages(remote("wss://relay.test/ws", "t")), slot: "proj-foo" });
+    expect(wsTransport).toHaveBeenLastCalledWith("wss://relay.test/ws", "t");
+  });
+
   it("falls back to tauriTransport when storage access throws", () => {
     const denied: StorageLike = {
       getItem: () => {
