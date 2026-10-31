@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::cell::{CallState, HistoryCell};
 use super::history::{HistoryState, HistoryView};
+use super::theme::TuiTheme;
 use yi_agent_core::subagent::trace::TraceFact;
 
 /// The persisted row kinds the daemon can report, and what a subscription asks
@@ -502,6 +503,9 @@ pub fn render_subagent_detail(
             HistoryView {
                 state: detail.feed().history(),
                 width: inner.width,
+                // Task 7 threads the detected theme into the whole UI; until
+                // then the trace popup keeps the historical dark look.
+                theme: TuiTheme::DARK,
             },
             inner,
         );

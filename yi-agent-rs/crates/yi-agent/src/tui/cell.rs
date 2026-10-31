@@ -1,7 +1,8 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
+use super::theme::TuiTheme;
 use super::wrap::{MAX_COLLAPSED_LINES, wrap_by_display_width};
 use unicode_width::UnicodeWidthStr;
 
@@ -76,14 +77,22 @@ impl HistoryCell {
     }
 
     /// Render this cell into ratatui Lines for display at the given width.
+    ///
+    /// Colors come from [`TuiTheme::DARK`]. Render paths that know the terminal
+    /// background must use [`Self::lines_with`].
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines_with(width, TuiTheme::DARK)
+    }
+
+    /// Render this cell into ratatui Lines with the given theme.
+    pub fn lines_with(&self, width: u16, theme: TuiTheme) -> Vec<Line<'static>> {
         #[cfg(test)]
         note_line_render();
         match self {
             Self::UserMessage { text } => render_user_message(text, width),
-            Self::Markdown { text } => super::markdown::render_markdown(text, width),
+            Self::Markdown { text } => super::markdown::render_markdown_with(text, width, theme),
             Self::AssistantMessage { markdown } => {
-                super::markdown::render_markdown(markdown, width)
+                super::markdown::render_markdown_with(markdown, width, theme)
             }
             Self::ToolCall {
                 name,
@@ -91,15 +100,15 @@ impl HistoryCell {
                 state,
                 expanded,
                 ..
-            } => render_tool_call(name, input, *state, *expanded, width),
+            } => render_tool_call(name, input, *state, *expanded, width, theme),
             Self::ToolResult {
                 id: _,
                 result_text,
                 is_error,
                 expanded,
-            } => render_tool_result(result_text, *is_error, *expanded, width),
+            } => render_tool_result(result_text, *is_error, *expanded, width, theme),
             Self::Separator { label } => render_separator(label.as_deref(), width),
-            Self::Reasoning { text, expanded } => render_reasoning(text, *expanded, width),
+            Self::Reasoning { text, expanded } => render_reasoning(text, *expanded, width, theme),
             Self::PermissionRequest {
                 tool_name,
                 summary,
@@ -118,8 +127,9 @@ impl HistoryCell {
                 *resolved,
                 *expanded,
                 width,
+                theme,
             ),
-            Self::PermissionResolved { decision } => render_permission_resolved(decision),
+            Self::PermissionResolved { decision } => render_permission_resolved(decision, theme),
         }
     }
 
@@ -197,11 +207,12 @@ fn render_tool_call(
     state: CallState,
     expanded: bool,
     width: u16,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
     let (bullet, bullet_color) = match state {
-        CallState::Running => ("●", Color::Yellow),
-        CallState::Success => ("●", Color::Green),
-        CallState::Failed => ("●", Color::Red),
+        CallState::Running => ("●", theme.warn),
+        CallState::Success => ("●", theme.success),
+        CallState::Failed => ("●", theme.danger),
     };
     let w = width.max(1) as usize;
     let bullet_style = Style::new().fg(bullet_color).add_modifier(Modifier::BOLD);
@@ -220,7 +231,7 @@ fn render_tool_call(
                         Span::raw(chunk.strip_prefix('●').unwrap_or(&chunk).to_string()),
                     ])
                 } else {
-                    Line::styled(chunk, Style::new().fg(Color::DarkGray))
+                    Line::styled(chunk, Style::new().fg(theme.fg_muted))
                 }
             })
             .collect();
@@ -230,7 +241,7 @@ fn render_tool_call(
             lines.extend(
                 wrap_by_display_width(line, w, "  └ ", "    ")
                     .into_iter()
-                    .map(|chunk| Line::styled(chunk, Style::new().fg(Color::DarkGray))),
+                    .map(|chunk| Line::styled(chunk, Style::new().fg(theme.fg_muted))),
             );
         }
     }
@@ -242,11 +253,21 @@ fn render_tool_result(
     is_error: bool,
     expanded: bool,
     width: u16,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
-    let arrow_color = if is_error { Color::Red } else { Color::Green };
+    // A successful result is secondary text: the paired tool-call bullet already
+    // carries the state, so painting the summary green only competed with the
+    // assistant's answer (and green was a raw ANSI slot that went unreadable on
+    // a light background). A failure still names `danger` so the error line
+    // stays scannable in the transcript.
+    let summary_color = if is_error {
+        theme.danger
+    } else {
+        theme.fg_muted
+    };
     let w = width.max(1) as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let summary_style = Style::new().fg(arrow_color).add_modifier(Modifier::DIM);
+    let summary_style = Style::new().fg(summary_color).add_modifier(Modifier::DIM);
     // Only the first physical line is previewed when folded; the full text is
     // available via Ctrl+O. Fold it by display width so a multi-byte preview is
     // neither over-wide nor silently cut.
@@ -256,7 +277,10 @@ fn render_tool_result(
         .enumerate()
         .map(|(i, chunk)| {
             if i == 0 {
-                Line::styled(chunk, summary_style)
+                // Style the span, not the line: the summary's color is part of
+                // the span contract (callers assert on `span.style.fg`), and a
+                // line-level style would make the color invisible to them.
+                Line::from(Span::styled(chunk, summary_style))
             } else {
                 Line::styled(chunk, dim)
             }
@@ -306,11 +330,11 @@ fn render_separator(label: Option<&str>, width: u16) -> Vec<Line<'static>> {
 /// reasoning models can emit paragraphs before the answer and the transcript
 /// must still be scannable. Every line is folded by display width and styled dim
 /// so the block never competes with the assistant's answer.
-fn render_reasoning(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
+fn render_reasoning(text: &str, expanded: bool, width: u16, theme: TuiTheme) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let header_style = Style::new()
-        .fg(Color::DarkGray)
+        .fg(theme.fg_muted)
         .add_modifier(Modifier::DIM | Modifier::ITALIC);
     let mut lines: Vec<Line<'static>> = wrap_by_display_width("思考", w, "✻ ", "  ")
         .into_iter()
@@ -362,10 +386,11 @@ fn render_permission_request(
     resolved: bool,
     expanded: bool,
     width: u16,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
-    let warn_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let warn_style = Style::new().fg(theme.warn).add_modifier(Modifier::BOLD);
     let dim_style = Style::new().add_modifier(Modifier::DIM);
-    let menu_style = Style::new().fg(Color::Cyan);
+    let menu_style = Style::new().fg(theme.accent);
     let w = width.max(1) as usize;
 
     if resolved {
@@ -420,7 +445,7 @@ fn render_permission_request(
         yi_agent_core::permission::PermissionKind::Blacklisted(_)
     );
     if blacklisted {
-        let style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+        let style = Style::new().fg(theme.danger).add_modifier(Modifier::BOLD);
         for chunk in wrap_by_display_width("  [!] Blacklisted command", w, "", "  ") {
             lines.push(Line::from(Span::styled(chunk, style)));
         }
@@ -459,14 +484,15 @@ fn render_permission_request(
 
 fn render_permission_resolved(
     decision: &yi_agent_core::permission::Decision,
+    theme: TuiTheme,
 ) -> Vec<Line<'static>> {
     let (label, color) = match decision {
-        yi_agent_core::permission::Decision::AllowOnce => ("allowed (once)", Color::Green),
-        yi_agent_core::permission::Decision::AlwaysAllowTool => ("allowed (always)", Color::Green),
+        yi_agent_core::permission::Decision::AllowOnce => ("allowed (once)", theme.success),
+        yi_agent_core::permission::Decision::AlwaysAllowTool => ("allowed (always)", theme.success),
         yi_agent_core::permission::Decision::AlwaysAllowPrefix(_) => {
-            ("allowed (prefix)", Color::Green)
+            ("allowed (prefix)", theme.success)
         }
-        yi_agent_core::permission::Decision::Deny => ("denied", Color::Red),
+        yi_agent_core::permission::Decision::Deny => ("denied", theme.danger),
     };
     vec![Line::from(vec![
         Span::styled("  -> ", Style::new().add_modifier(Modifier::DIM)),
@@ -591,6 +617,9 @@ fn wrap_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still name a raw color, to assert the production path no
+    // longer emits it.
+    use ratatui::style::Color;
 
     #[test]
     fn user_message_renders_with_prefix() {
@@ -1153,5 +1182,22 @@ mod tests {
             widths.iter().all(|w| *w <= 40),
             "resolved line too wide: {widths:?}"
         );
+    }
+
+    /// Folded tool-result summaries used `Color::DarkGray`, which is 2.34:1 on a
+    /// dark background. Field names match `HistoryCell::ToolResult` at
+    /// `cell.rs:27` (`id` / `result_text` / `is_error` / `expanded`).
+    #[test]
+    fn tool_result_summary_uses_theme_muted() {
+        let cell = HistoryCell::ToolResult {
+            id: "t1".into(),
+            result_text: "first line\nsecond line".into(),
+            is_error: false,
+            expanded: false,
+        };
+        let lines = cell.lines_with(60, TuiTheme::DARK);
+        let summary = lines.first().expect("a summary line");
+        assert_eq!(summary.spans[0].style.fg, Some(TuiTheme::DARK.fg_muted));
+        assert_ne!(summary.spans[0].style.fg, Some(Color::DarkGray));
     }
 }

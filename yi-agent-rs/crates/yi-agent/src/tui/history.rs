@@ -8,6 +8,7 @@ use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, Stateful
 use yi_agent_core::{AgentEvent, DoneReason, RetryCause};
 
 use super::cell::HistoryCell;
+use super::theme::{TuiTheme, TuiThemeKind};
 
 /// Render a runtime notice for the status line.
 ///
@@ -178,6 +179,13 @@ pub const MAX_HISTORY_CELLS: usize = 2000;
 /// cache turns that into one rebuild per content or width change.
 pub(in crate::tui) struct HistoryCache {
     width: u16,
+    /// Which palette the cached lines were rendered with.
+    ///
+    /// Cached lines carry colors baked in at render time, so a theme change has
+    /// to drop them the same way a resize does. Today the theme is fixed for the
+    /// process lifetime; keying the cache keeps a future `/theme` from painting
+    /// stale colors.
+    theme_kind: TuiThemeKind,
     entries: Vec<CachedCell>,
     /// Cell indexes known to need a re-render.
     ///
@@ -205,13 +213,18 @@ pub(in crate::tui) struct HistoryCache {
     /// re-wrap every cell at the wider width, and the next frame would probe
     /// back at the narrower one. Remembering the verdict keeps a settled frame
     /// from re-wrapping the whole scrollback even when nothing is overflowing.
-    decision: Option<(u16, u16, u16, u64)>,
+    ///
+    /// The theme kind is part of the key: a verdict derived at one palette must
+    /// not be reused after the theme changed, or the draw would settle on a
+    /// width whose cached lines belong to the other theme.
+    decision: Option<(u16, u16, u16, u64, TuiThemeKind)>,
 }
 
 impl HistoryCache {
     fn new(width: u16) -> Self {
         Self {
             width,
+            theme_kind: TuiThemeKind::Dark,
             entries: Vec::new(),
             dirty: std::collections::BTreeSet::new(),
             cumulative: vec![0],
@@ -351,12 +364,12 @@ impl HistoryState {
     /// rendered cell, because the wrap is width-specific. Otherwise the entries
     /// that are still up to date are kept and only the differing ones are
     /// re-rendered, which during a turn is just the streaming tail.
-    fn ensure_cache(&self, width: u16) {
+    fn ensure_cache(&self, width: u16, theme: TuiTheme) {
         // Two phases on purpose. Rendering a cell takes `&self`, and holding a
         // `RefCell` borrow across it would panic the moment a renderer touched
         // the cache, so jobs are collected first and rendered with the guard
         // dropped.
-        if self.cache_is_current(width) {
+        if self.is_current_for(width, theme.kind) {
             return;
         }
 
@@ -365,13 +378,15 @@ impl HistoryState {
             // The tables have to be rebuilt only when the entries themselves
             // change; a read of unchanged history must not touch them.
             let mut rebuild_tables = false;
-            if cache.width != width {
-                // A wrap is width-specific, so a resize invalidates everything.
+            // Both the wrap and the baked-in colors are inputs to the cached
+            // lines, so either changing invalidates everything.
+            if cache.width != width || cache.theme_kind != theme.kind {
                 cache.entries.clear();
                 cache.dirty.clear();
                 cache.cumulative.truncate(1);
                 cache.part_offsets.clear();
                 cache.width = width;
+                cache.theme_kind = theme.kind;
                 rebuild_tables = true;
             }
 
@@ -413,7 +428,7 @@ impl HistoryState {
         if !changed.is_empty() {
             let rendered: Vec<Option<Vec<ratatui::text::Line<'static>>>> = changed
                 .iter()
-                .map(|(index, _)| Some(self.cells[*index].lines(width)))
+                .map(|(index, _)| Some(self.cells[*index].lines_with(width, theme)))
                 .collect();
 
             let mut cache = self.cache.borrow_mut();
@@ -439,12 +454,38 @@ impl HistoryState {
         self.cache.borrow_mut().reflected_generation = self.content_generation.get();
     }
 
-    /// Whether the cache already reflects `cells` at `width`.
-    fn cache_is_current(&self, width: u16) -> bool {
+    /// Whether the cache already reflects `cells` at `width`, rendered for
+    /// `theme_kind`.
+    ///
+    /// Kept on the state rather than on `HistoryCache`: the generation and the
+    /// cell count it compares live here, not on the cache.
+    fn is_current_for(&self, width: u16, theme_kind: TuiThemeKind) -> bool {
         let cache = self.cache.borrow();
         cache.width == width
+            && cache.theme_kind == theme_kind
             && cache.reflected_generation == self.content_generation.get()
             && cache.entries.len() == self.cells.len()
+    }
+
+    /// Whether the cache already reflects `cells` at `width` for the default
+    /// theme.
+    ///
+    /// Kept as a thin forwarder so the historical measurement-only test
+    /// assertions keep working; production paths ask `is_current_for` directly
+    /// with the palette they are about to render.
+    #[allow(dead_code)]
+    fn cache_is_current(&self, width: u16) -> bool {
+        self.is_current_for(width, TuiThemeKind::Dark)
+    }
+
+    /// The palette the cache currently holds, without touching it.
+    ///
+    /// Measurement paths have no theme of their own and must not invent one:
+    /// a color never changes a line count, so re-rendering the transcript in
+    /// `DARK` just to count its lines would evict the real theme and make every
+    /// streamed token re-render the whole scrollback twice.
+    fn cached_theme(&self) -> TuiTheme {
+        TuiTheme::of(self.cache.borrow().theme_kind)
     }
 
     fn recompute_cache_accelerators(&self) {
@@ -480,7 +521,7 @@ impl HistoryState {
     /// Counts cell content only, without the semantic blank spacers.
     #[allow(dead_code)]
     pub fn total_lines(&self, width: u16) -> usize {
-        self.ensure_cache(width);
+        self.ensure_cache(width, self.cached_theme());
         self.cache
             .borrow()
             .entries
@@ -492,13 +533,25 @@ impl HistoryState {
     /// Number of display lines including semantic blank spacers. This matches
     /// the line count used by `HistoryView::flattened_lines` / `render`.
     pub fn flattened_line_count(&self, width: u16) -> usize {
-        self.ensure_cache(width);
+        // Reuse the theme the cache already holds: this is the per-token hot
+        // path (`push`, `extend_last_assistant_text`), and a color never changes
+        // a line count, so measuring must never evict the render theme.
+        self.ensure_cache(width, self.cached_theme());
         self.cache.borrow().total()
     }
 
     /// Width available to history text after reserving a scrollbar column
     /// when the content overflows the viewport.
+    ///
+    /// Uses the palette the cache already holds, so a measurement never forces
+    /// a theme of its own. Render paths that know the theme should prefer
+    /// [`Self::text_width_with`].
     pub fn text_width(&self, area_width: u16, viewport_height: u16) -> u16 {
+        self.text_width_with(area_width, viewport_height, self.cached_theme())
+    }
+
+    /// Width available to history text, rendering any probe at `theme`.
+    pub fn text_width_with(&self, area_width: u16, viewport_height: u16, theme: TuiTheme) -> u16 {
         let candidate_width = area_width.saturating_sub(1);
         if candidate_width == 0 {
             return area_width;
@@ -511,19 +564,23 @@ impl HistoryState {
         let generation = self.content_generation.get();
         {
             let cache = self.cache.borrow();
-            if let Some((area, height, width, decided_at)) = cache.decision {
-                if area == area_width && height == viewport_height && decided_at == generation {
+            if let Some((area, height, width, decided_at, decided_theme)) = cache.decision {
+                if area == area_width
+                    && height == viewport_height
+                    && decided_at == generation
+                    && decided_theme == theme.kind
+                {
                     // `width` shadows the narrowing, so bind it out before the
                     // borrow is released and the cache is re-aligned.
                     let decided = width;
                     drop(cache);
-                    self.ensure_cache(decided);
+                    self.ensure_cache(decided, theme);
                     return decided;
                 }
             }
         }
 
-        self.ensure_cache(candidate_width);
+        self.ensure_cache(candidate_width, theme);
         let text_width = {
             let cache = self.cache.borrow();
             if cache.total() > viewport_height as usize {
@@ -532,13 +589,18 @@ impl HistoryState {
                 area_width
             }
         };
-        self.cache.borrow_mut().decision =
-            Some((area_width, viewport_height, text_width, generation));
+        self.cache.borrow_mut().decision = Some((
+            area_width,
+            viewport_height,
+            text_width,
+            generation,
+            theme.kind,
+        ));
         // Leave the cache at the width the caller is about to render at: the
         // probe above ran at `candidate_width`, and without this the draw would
         // re-wrap every cell at `area_width` and the next probe would flip it
         // back, so a settled history would re-render once per frame.
-        self.ensure_cache(text_width);
+        self.ensure_cache(text_width, theme);
         text_width
     }
 
@@ -566,7 +628,7 @@ impl HistoryState {
         text_width: u16,
         viewport_height: u16,
     ) -> Option<ViewportAnchor> {
-        self.ensure_cache(text_width);
+        self.ensure_cache(text_width, self.cached_theme());
         let cache = self.cache.borrow();
         let total = cache.total();
         let effective_offset = self
@@ -618,7 +680,7 @@ impl HistoryState {
             return;
         };
 
-        self.ensure_cache(text_width);
+        self.ensure_cache(text_width, self.cached_theme());
         let cache = self.cache.borrow();
         let cell_lines = |index: usize| -> usize {
             cache.entries[index]
@@ -1204,6 +1266,9 @@ pub struct HistoryView<'a> {
     pub state: &'a HistoryState,
     #[allow(dead_code)]
     pub width: u16,
+    /// Palette the transcript is rendered with, chosen from the detected
+    /// terminal background in `app.rs`.
+    pub theme: TuiTheme,
 }
 
 impl<'a> HistoryView<'a> {
@@ -1220,7 +1285,7 @@ impl<'a> HistoryView<'a> {
         &self,
         text_width: u16,
     ) -> Vec<(usize, ratatui::text::Line<'static>)> {
-        self.state.ensure_cache(text_width);
+        self.state.ensure_cache(text_width, self.theme);
         let cache = self.state.cache.borrow();
         let mut all_lines: Vec<(usize, ratatui::text::Line<'static>)> =
             Vec::with_capacity(cache.total());
@@ -1274,9 +1339,11 @@ impl LineRef<'_> {
 
 impl<'a> Widget for HistoryView<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let text_width = self.state.text_width(area.width, area.height);
+        let text_width = self
+            .state
+            .text_width_with(area.width, area.height, self.theme);
         let show_scrollbar = text_width < area.width;
-        self.state.ensure_cache(text_width);
+        self.state.ensure_cache(text_width, self.theme);
         let cache = self.state.cache.borrow();
 
         let visible_height = area.height as usize;
@@ -1507,6 +1574,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(warm_text_width);
 
@@ -1520,6 +1588,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(text_width);
 
@@ -1598,6 +1667,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(warm_text_width);
 
@@ -1607,6 +1677,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(text_width);
             crate::tui::cell::lines_call_count()
@@ -1629,11 +1700,15 @@ mod tests {
     #[test]
     fn appended_assistant_text_is_visible_after_the_full_scan_is_gone() {
         fn rendered_text(state: &HistoryState, width: u16) -> String {
-            HistoryView { state, width: 80 }
-                .flattened_lines(width)
-                .into_iter()
-                .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
-                .collect()
+            HistoryView {
+                state,
+                width: 80,
+                theme: TuiTheme::DARK,
+            }
+            .flattened_lines(width)
+            .into_iter()
+            .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
+            .collect()
         }
 
         let mut state = HistoryState::new();
@@ -1680,6 +1755,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(width);
             assert_eq!(
@@ -1698,6 +1774,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: 80,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(width);
             (crate::tui::cell::lines_call_count(), fingerprint_count())
@@ -1767,6 +1844,7 @@ mod tests {
         let cached = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
 
@@ -1774,6 +1852,7 @@ mod tests {
         let cached_again = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
         assert_eq!(
@@ -1826,11 +1905,13 @@ mod tests {
         let narrow = HistoryView {
             state: &state,
             width: 40,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(40);
         let wide = HistoryView {
             state: &state,
             width: 120,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(120);
 
@@ -1845,6 +1926,7 @@ mod tests {
         let wide_again = HistoryView {
             state: &state,
             width: 120,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(120);
         assert_eq!(
@@ -1871,6 +1953,7 @@ mod tests {
         let before = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
 
@@ -1879,6 +1962,7 @@ mod tests {
         let after = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
 
@@ -1916,6 +2000,7 @@ mod tests {
         let folded = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
         state.selected = Some(0);
@@ -1923,6 +2008,7 @@ mod tests {
         let expanded = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
 
@@ -1954,12 +2040,14 @@ mod tests {
         let collapsed = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
         assert!(state.toggle_pending_permission_expanded());
         let expanded = HistoryView {
             state: &state,
             width,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(width);
 
@@ -2016,6 +2104,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: AREA_WIDTH,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(TEXT_WIDTH);
             let _ = state.capture_viewport_anchor(TEXT_WIDTH, VIEWPORT_HEIGHT);
@@ -2029,6 +2118,7 @@ mod tests {
             let _ = HistoryView {
                 state: &state,
                 width: AREA_WIDTH,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(width);
             crate::tui::cell::lines_call_count()
@@ -2066,7 +2156,12 @@ mod tests {
         }
 
         fn compare(state: &HistoryState, width: u16, step: usize) {
-            let cached = HistoryView { state, width }.flattened_lines(width);
+            let cached = HistoryView {
+                state,
+                width,
+                theme: TuiTheme::DARK,
+            }
+            .flattened_lines(width);
             let expected = naive(state, width);
             assert_eq!(
                 cached.len(),
@@ -2285,6 +2380,7 @@ mod tests {
                     HistoryView {
                         state: &state,
                         width: area.width,
+                        theme: TuiTheme::DARK,
                     },
                     area,
                 );
@@ -2970,6 +3066,7 @@ mod tests {
         let view = HistoryView {
             state: &s,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let lines = view.flattened_lines(80);
 
@@ -3004,6 +3101,7 @@ mod tests {
         let view = HistoryView {
             state: &state,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let lines = view.flattened_lines(80);
         let result_index = state
@@ -3053,6 +3151,7 @@ mod tests {
         let view = HistoryView {
             state: &state,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let spacer_count = view
             .flattened_lines(80)
@@ -3089,6 +3188,7 @@ mod tests {
         let view = HistoryView {
             state: &state,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let spacer_count = view
             .flattened_lines(80)
@@ -3119,6 +3219,7 @@ mod tests {
         let view = HistoryView {
             state: &state,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let lines = view.flattened_lines(80);
         let result_index = state
@@ -3148,6 +3249,7 @@ mod tests {
         let view = HistoryView {
             state: &s,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let lines = view.flattened_lines(80);
 
@@ -3171,6 +3273,7 @@ mod tests {
         let view = HistoryView {
             state: &s,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let lines = view.flattened_lines(80);
 
@@ -3208,6 +3311,7 @@ mod tests {
         let view = HistoryView {
             state: &s,
             width: 80,
+            theme: TuiTheme::DARK,
         };
         let area = Rect::new(0, 0, 80, 3);
         let mut buf = Buffer::empty(area);
@@ -3251,6 +3355,7 @@ mod tests {
                     HistoryView {
                         state: &state,
                         width: area.width,
+                        theme: TuiTheme::DARK,
                     },
                     area,
                 );
@@ -3297,6 +3402,7 @@ mod tests {
                     HistoryView {
                         state: &state,
                         width: area.width,
+                        theme: TuiTheme::DARK,
                     },
                     area,
                 );
@@ -3356,6 +3462,7 @@ mod tests {
                         HistoryView {
                             state,
                             width: area.width,
+                            theme: TuiTheme::DARK,
                         },
                         area,
                     );
@@ -3466,6 +3573,7 @@ mod tests {
             HistoryView {
                 state: &state,
                 width: area.width,
+                theme: TuiTheme::DARK,
             }
             .render(area, &mut buffer);
         }
@@ -3705,11 +3813,15 @@ mod tests {
     #[test]
     fn replaced_compaction_label_is_visible_in_the_next_frame() {
         fn rendered_text(state: &HistoryState, width: u16) -> String {
-            HistoryView { state, width: 80 }
-                .flattened_lines(width)
-                .into_iter()
-                .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
-                .collect()
+            HistoryView {
+                state,
+                width: 80,
+                theme: TuiTheme::DARK,
+            }
+            .flattened_lines(width)
+            .into_iter()
+            .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
+            .collect()
         }
 
         // The driver emits this label when `/compact` starts (`app.rs` pushes the
@@ -4029,6 +4141,7 @@ mod tests {
         let _ = HistoryView {
             state: &state,
             width: WIDTH,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(WIDTH);
 
@@ -4043,6 +4156,7 @@ mod tests {
         let rendered = HistoryView {
             state: &state,
             width: WIDTH,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(WIDTH);
         let re_rendered = crate::tui::cell::lines_call_count();
@@ -4093,6 +4207,7 @@ mod tests {
             let lines = HistoryView {
                 state,
                 width: HEIGHT,
+                theme: TuiTheme::DARK,
             }
             .flattened_lines(width);
             let total = lines.len();
@@ -4142,6 +4257,66 @@ mod tests {
             top_visible_line(&state, WIDTH, HEIGHT),
             before,
             "a head drop must leave a scrolled-up reader on the same content"
+        );
+    }
+
+    /// A theme change must invalidate the render cache: cached lines carry
+    /// colors baked in at render time. Today the theme is fixed for the process
+    /// lifetime, but keying the cache prevents a future `/theme` from painting
+    /// stale colors.
+    ///
+    /// Mirrors the historical `cache_is_current` conditions (width, reflected
+    /// generation, entry count) plus the new theme comparison. The probe lives on
+    /// `HistoryState`, not on `HistoryCache`: the generation and the cell count it
+    /// compares live on the state.
+    #[test]
+    fn changing_the_theme_invalidates_the_render_cache() {
+        let mut state = HistoryState::new();
+        state.push(HistoryCell::Markdown { text: "`x`".into() }, 40);
+        state.ensure_cache(40, TuiTheme::DARK);
+        assert!(state.is_current_for(40, TuiThemeKind::Dark));
+        assert!(!state.is_current_for(40, TuiThemeKind::Light));
+    }
+
+    /// A line count never depends on a color, so measuring must not sweep the
+    /// render theme.
+    ///
+    /// `push` / `extend_last_assistant_text` call `flattened_line_count` on every
+    /// streamed token; if that forced `DARK` into `ensure_cache`, a light
+    /// terminal would re-render the whole transcript in `DARK` per token and
+    /// again in `LIGHT` on the next frame — O(transcript) work per token.
+    #[test]
+    fn push_does_not_evict_the_render_theme() {
+        let mut state = HistoryState::new();
+        state.push(
+            HistoryCell::AssistantMessage {
+                markdown: "first".into(),
+            },
+            40,
+        );
+        state.ensure_cache(40, TuiTheme::LIGHT);
+        assert_eq!(state.cache.borrow().theme_kind, TuiThemeKind::Light);
+
+        // The hot path: a streaming delta measures the line count, then pushes.
+        state.push(
+            HistoryCell::Markdown {
+                text: "second".into(),
+            },
+            40,
+        );
+        let _ = state.flattened_line_count(40);
+        assert_eq!(
+            state.cache.borrow().theme_kind,
+            TuiThemeKind::Light,
+            "measuring line counts must not replace the render theme"
+        );
+
+        state.extend_last_assistant_text(" more", 40);
+        let _ = state.flattened_line_count(40);
+        assert_eq!(
+            state.cache.borrow().theme_kind,
+            TuiThemeKind::Light,
+            "streaming deltas must not replace the render theme"
         );
     }
 }

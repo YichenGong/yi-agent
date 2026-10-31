@@ -584,6 +584,9 @@ fn run_loop<B: Backend, E: EventSource>(
             let history_view = HistoryView {
                 state: history,
                 width: chunks[0].width,
+                // Task 7 threads the detected theme into `run_loop`; until then
+                // the transcript keeps the historical dark look.
+                theme: TuiTheme::DARK,
             };
             f.render_widget(history_view, chunks[0]);
 
@@ -7914,6 +7917,7 @@ mod tests {
         let _ = HistoryView {
             state: &history,
             width: 80,
+            theme: TuiTheme::DARK,
         }
         .flattened_lines(warm_width);
 
