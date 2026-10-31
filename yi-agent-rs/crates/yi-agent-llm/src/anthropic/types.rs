@@ -193,6 +193,9 @@ impl From<AnthropicGenParams> for yi_agent_core::GenParams {
             top_p: p.top_p,
             stop_sequences: p.stop_sequences,
             reasoning_effort: None,
+            // Anthropic 请求体没有对应的布尔字段：`thinking` 缺席无法从已解析的
+            // 参数里反推（这是从响应参数回填方向的转换，不承载该意图）。
+            disable_thinking: None,
         }
     }
 }
@@ -281,16 +284,24 @@ impl From<ProviderRequest> for AnthropicRequest {
             Some(system_parts.join("\n\n"))
         };
 
-        let thinking = Some(ThinkingConfig {
-            r#type: "adaptive".into(),
-            display: "summarized".into(),
-        });
+        // 思考默认常开（spec §5.1）；调用方显式关掉时整个字段缺席。
+        // Anthropic 没有 "none" 档位，只能靠省略 `thinking` 来表达不思考。
+        let thinking = match req.params.disable_thinking {
+            Some(true) => None,
+            _ => Some(ThinkingConfig {
+                r#type: "adaptive".into(),
+                display: "summarized".into(),
+            }),
+        };
         // `reasoning_effort` 只被读取（clone），故 `req.params.into()` 可在其后移动。
-        let output_config = req
-            .params
-            .reasoning_effort
-            .clone()
-            .map(|effort| OutputConfig { effort });
+        let output_config = if req.params.disable_thinking == Some(true) {
+            None
+        } else {
+            req.params
+                .reasoning_effort
+                .clone()
+                .map(|effort| OutputConfig { effort })
+        };
 
         Self {
             model: req.model,
@@ -548,6 +559,51 @@ mod tests {
             assert_eq!(blocks.len(), 1, "non-Anthropic token must be dropped");
             assert_eq!(blocks[0]["type"], "text");
         }
+    }
+
+    /// `disable_thinking` 必须让 Anthropic 请求省略 `thinking` 字段。
+    ///
+    /// 这是三条通道里唯一做不到「靠 effort 档位关闭」的一条：`thinking` 原本是
+    /// 无条件 `Some(adaptive)`。标题调用（20 字的分类任务）不需要推理，且推理
+    /// token 与正文共用 `max_tokens`，不关就会把额度烧光、返回空标题。
+    #[test]
+    fn disable_thinking_omits_the_thinking_field() {
+        use yi_agent_core::GenParams;
+        let req = ProviderRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: Some("title".into()),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams {
+                max_tokens: Some(512),
+                disable_thinking: Some(true),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        assert!(
+            json.get("thinking").is_none(),
+            "disable_thinking must drop the thinking field entirely: {json}"
+        );
+        assert!(
+            json.get("output_config").is_none(),
+            "no effort configured, so no output_config"
+        );
+    }
+
+    /// 缺省（`None`）保持旧行为：`thinking` 照发。零回归。
+    #[test]
+    fn thinking_stays_on_by_default() {
+        use yi_agent_core::GenParams;
+        let req = ProviderRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        assert_eq!(json["thinking"]["type"], "adaptive");
     }
 
     #[test]

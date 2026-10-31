@@ -146,10 +146,14 @@ pub fn responses_request_from(req: ProviderRequest) -> ResponsesRequest {
             })
         })
         .collect();
-    let reasoning = req.params.reasoning_effort.map(|effort| Reasoning {
-        effort,
-        summary: "auto".into(),
-    });
+    // 关思考 = 整个 `reasoning` 块缺席（responses 通道没有 "none" 档位）。
+    let reasoning = match req.params.disable_thinking {
+        Some(true) => None,
+        _ => req.params.reasoning_effort.map(|effort| Reasoning {
+            effort,
+            summary: "auto".into(),
+        }),
+    };
     ResponsesRequest {
         model: req.model,
         instructions: req.system,

@@ -29,6 +29,15 @@ pub struct GenParams {
     pub stop_sequences: Option<Vec<String>>,
     /// `reasoning_effort` 档位；`None` = 不发该字段（零回归默认）。
     pub reasoning_effort: Option<String>,
+    /// 显式关闭思考；`None` = 不动（零回归默认），`Some(true)` = 本次调用不思考。
+    ///
+    /// 单独一个布尔位而非复用 `reasoning_effort`，是因为三条通道表达「不思考」
+    /// 的方式互不相同：chat 用 `effort: "none"`，responses 靠不发 `reasoning`
+    /// 块，Anthropic 要把 `thinking` 整个字段省掉——后者根本无法用 effort 表达
+    /// （它原本是无条件自适应思考）。调用方只声明意图，翻译交给各通道。
+    ///
+    /// 设置它即代表「本调用不需要推理」：`reasoning_effort` 在此时应一并忽略。
+    pub disable_thinking: Option<bool>,
 }
 
 /// Token usage from a provider response.

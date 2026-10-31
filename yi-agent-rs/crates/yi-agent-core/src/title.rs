@@ -17,6 +17,17 @@ pub const TITLE_MAX_CHARS: usize = 30;
 /// 材料每一侧（提问 / 回复）截断后的最大字符数。
 pub const TITLE_MATERIAL_SIDE_CHARS: usize = 2000;
 
+/// 标题调用的输出上限。
+///
+/// 标题本身只要 20 字左右，原本这里写的是 `64`。但那点额度对**推理模型**不够：
+/// 推理 token 与正文共用 `max_tokens`，`64` 会被思考吃光、正文返回空串，
+/// 表现为「LLM 标题不常见」（实测 `reasoning_tokens: 64` / `content: ""`）。
+///
+/// 现在标题调用已显式关掉思考（[`disable_thinking`](GenParams::disable_thinking)），
+/// 正常路径下几十个 token 就够。保留 512 是给关不掉思考的网关留的余量：
+/// 宁可多留额度，也不要静默退回兜底标题。
+pub const TITLE_MAX_TOKENS: u32 = 512;
+
 /// 把首轮的两侧文本拼成标题模型的输入材料。
 ///
 /// `assistant_text` 为 `None`（首轮无文本回复，例如纯工具调用）时省略该段。
@@ -84,7 +95,13 @@ pub async fn generate_title(
 ) -> Result<Option<String>, AgentError> {
     let mut params = config.gen_params.clone();
     // 标题极短：限死输出上限，避免个别模型长篇大论。
-    params.max_tokens = Some(64);
+    params.max_tokens = Some(TITLE_MAX_TOKENS);
+    // 标题是「读一句话、起个名字」的分类任务，不需要推理。必须显式关掉：
+    // 推理 token 与正文共用 `max_tokens`，不关就会把额度烧在思考上、正文留空
+    // （推理模型上的实际症状，见 `TITLE_MAX_TOKENS` 的说明）。
+    // 关思考时同时清掉 effort 档位：两个信号并存会互相矛盾。
+    params.disable_thinking = Some(true);
+    params.reasoning_effort = None;
     let response = provider
         .call(ProviderRequest {
             model: config.model.clone(),
@@ -235,7 +252,17 @@ mod tests {
             .unwrap()
             .take()
             .expect("provider must be called");
-        assert_eq!(req.params.max_tokens, Some(64), "标题调用必须限死输出上限");
+        assert_eq!(
+            req.params.max_tokens,
+            Some(TITLE_MAX_TOKENS),
+            "标题调用必须限死输出上限（但要能容纳未被禁用思考时的推理）"
+        );
+        assert_eq!(
+            req.params.disable_thinking,
+            Some(true),
+            "标题调用必须显式关掉思考：推理 token 与正文共用 max_tokens，\
+             推理模型会把额度烧光而返回空标题"
+        );
         assert_eq!(
             req.system.as_deref(),
             Some(TITLE_INSTRUCTIONS),
@@ -247,6 +274,61 @@ mod tests {
             req.params.temperature,
             Some(0.3),
             "config.gen_params 的非默认字段必须被保留"
+        );
+    }
+
+    /// 标题调用必须显式关掉思考。
+    ///
+    /// 真机症状：`HORIZON-DeepSeek` 这类推理模型先产 `reasoning_content`，
+    /// 推理 token 计入 `max_tokens`。`max_tokens=64` 时 64 个 token 全被思考
+    /// 吃光，正文 `content` 为空串 → `sanitize_title` 判空 → 静默保留兜底标题，
+    /// 表现为「LLM 标题不常见」。实测传 `reasoning_effort: "none"` 后
+    /// `reasoning_tokens` 归零、标题立刻正常。
+    #[tokio::test]
+    async fn generate_title_disables_thinking() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(CapturingProvider {
+            seen: seen.clone(),
+            reply: "登录页报错".into(),
+        });
+        generate_title(&provider, &core_config(), "登录页报错了", None)
+            .await
+            .unwrap();
+        let req = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider must be called");
+        assert_eq!(
+            req.params.disable_thinking,
+            Some(true),
+            "不关思考，推理模型会把 max_tokens 全烧在 reasoning 上"
+        );
+    }
+
+    /// `disable_thinking` 覆盖会话可能配了的 `reasoning_effort`：标题是分类任务，
+    /// 不该跟随用户为长任务选的推理档位。
+    #[tokio::test]
+    async fn generate_title_overrides_a_configured_effort() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(CapturingProvider {
+            seen: seen.clone(),
+            reply: "标题".into(),
+        });
+        let mut config = core_config();
+        config.gen_params.reasoning_effort = Some("high".into());
+        generate_title(&provider, &config, "hi", None)
+            .await
+            .unwrap();
+        let req = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider must be called");
+        assert_eq!(req.params.disable_thinking, Some(true));
+        assert_eq!(
+            req.params.reasoning_effort, None,
+            "关掉思考时不得再发 effort 档位，否则两个信号互相矛盾"
         );
     }
 
