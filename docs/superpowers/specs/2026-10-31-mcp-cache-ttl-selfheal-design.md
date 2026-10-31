@@ -154,7 +154,8 @@ let reusable = previous.filter(|e| e.config == *sc);
 match reusable {
     // 新增「且缓存未过期」：否则 24h 后仍会复用旧快照
     Some(e) if cache.has_fresh(name, sc, now, TTL) => (e.tools.clone(), false, None),
-    Some(e) => /* 快照在但已过期：走探测，失败则回落到 e.tools */,
+    Some(e) if cache.is_backed_off(name, sc, now, RETRY_AFTER) => (e.tools.clone(), false, None),
+    Some(e) => /* 快照在但已过期且可重试：走探测，失败则回落到 e.tools */,
     None => ...
 }
 ```
@@ -173,9 +174,14 @@ struct CachedServer {
     /// 上次成功探测远端工具清单的时间（Unix 秒）。旧缓存缺该字段 ⇒ `None`。
     #[serde(default)]
     probed_at: Option<i64>,
+    /// 上次探测**失败**的时间（Unix 秒）。用于失败退避。
+    #[serde(default)]
+    failed_at: Option<i64>,
     tools: Vec<CachedTool>,
 }
 ```
+
+`failed_at` 不是可选项，它是防性能回归的关键，见 §4.3.1。
 
 **判定必须用明确的枚举，不能用 `Option`。** 这是本设计最容易写错的一处：
 
@@ -191,15 +197,20 @@ struct CachedServer {
 命中）；若回 `None`，则与「从未探测」不可区分，探测失败会顺带清空已有工具清单。
 
 ```rust
-/// 一次缓存查找的结果。两个变体足够：「旧值是否保留」是 reload 的策略，
-/// 不属于查找语义，故不塞进枚举。
+/// 一次缓存查找的结果。「旧值是否保留」是 reload 的策略，不属于查找语义，
+/// 故不塞进枚举。
 pub enum CacheLookup<'a> {
     /// 指纹匹配且未过期：直接用。
     Fresh(&'a [CachedTool]),
-    /// 指纹不匹配、从未探测，或已过期：需要重新探测。
+    /// 已过期但仍在失败退避窗口内：本轮不探测。
+    BackedOff,
+    /// 指纹不匹配、从未探测，或已过期且允许重试：需要重新探测。
     Stale,
 }
 ```
+
+`BackedOff` 与 `Stale` 必须分开，理由见 §4.3.1：合并成一个变体的话，`reload` 无法
+区分「该探」与「该等」，只能二选一——探则每轮 55s，等则永远不恢复。
 
 本 bug 的现场（指纹匹配、已过期、上次调用失败）落在 `Stale`，与「需要重探」一致；
 至于「过期后探测失败、旧清单是否暂时保留」，由 `reload` 决定：**保留旧清单**并在
@@ -210,19 +221,40 @@ pub enum CacheLookup<'a> {
 
 ```rust
 impl McpCache {
-    /// 指纹匹配且 `probed_at` 在 TTL 内才返回 `Fresh`；其余一律 `Stale`。
-    pub fn lookup<'a>(&'a self, name: &str, cfg: &ServerConfig, now: i64, ttl: Duration)
-        -> CacheLookup<'a>;
+    /// `Fresh` 条件：指纹匹配且 `probed_at` 在 TTL 内。
+    /// `BackedOff` 条件：不新鲜，但 `failed_at` 在退避窗口内。
+    /// 其余（指纹不匹配 / 从未探测 / 过期且可重试）⇒ `Stale`。
+    pub fn lookup<'a>(
+        &'a self,
+        name: &str,
+        cfg: &ServerConfig,
+        now: i64,
+        ttl: Duration,
+        retry_after: Duration,
+    ) -> CacheLookup<'a>;
 
-    /// 记录一次成功探测，写入当前时间。
-    pub fn put_probed(&mut self, name: &str, cfg: &ServerConfig, tools: Vec<CachedTool>, now: i64);
+    /// 记录一次成功探测（工具清单 + 时间戳）。
+    pub fn put(&mut self, name: &str, cfg: &ServerConfig, tools: Vec<CachedTool>, now: i64);
+
+    /// 记录一次**失败**的探测尝试，只更新时间戳，不动工具清单。
+    pub fn note_failure(&mut self, name: &str, cfg: &ServerConfig, now: i64);
 
     /// TTL 内是否已有某 server 的新鲜条目（供 `needs_reload` 判定）。
     pub fn has_fresh(&self, name: &str, cfg: &ServerConfig, now: i64, ttl: Duration) -> bool;
+
+    /// 是否处于失败退避窗口内（不与 `has_fresh` 合并：两者是独立的两个时钟）。
+    pub fn is_backed_off(&self, name: &str, cfg: &ServerConfig, now: i64, retry_after: Duration)
+        -> bool;
 }
 ```
 
-`put` 保留原语义（供既有测试与既有调用点使用），内部转调 `put_probed` 并打上 `now`。
+`put` **必须跟着改签名**为 `put(&mut self, name, cfg, tools, now)`：它现在的签名里
+没有时间参数，若不改就只能内部调 `SystemTime::now()`，这与下面「时钟注入」的原则
+直接矛盾（测试无法把 `probed_at` 摆到任意位置）。既有调用点共 8 处（`lib.rs` 2、
+`manager.rs` 测试 5、`reload_tool.rs` 2、`mcp_rpc.rs` 2），逐处补 `now` 即可。
+
+保留 `put` 这个名字而不用 `put_probed`：两者语义相同（记录一次成功的清单），多一个
+名字只会让人以为行为有差别。
 
 **`get_for` 不能直接删掉，它在设置页有一条语义不同的读路径。** 决策改为：
 
@@ -258,12 +290,15 @@ impl McpCache {
 | `lookup` 结果 | 行为 |
 |---|---|
 | `Fresh(tools)` | 沿用，`probed = false` |
-| `Stale` 且 `probe_tools` 成功 | `put_probed` 打新时间戳，`probed = true` |
-| `Stale` 且 `probe_tools` 失败 | **保留旧清单**（若缓存里有），`error = 原因`，**不**更新时间戳 |
+| `Stale` 且 `probe_tools` 成功 | `put` 写新清单与时间戳，`probed = true` |
+| `BackedOff` | 不探测，沿用旧清单，`probed = false` |
+| `Stale` 且 `probe_tools` 失败 | **保留旧清单**（若缓存里有），`error = 原因`，`note_failure` 写 `failed_at` |
 
-「失败时不更新时间戳」是刻意选择：若失败也刷新时间戳，端点挂一天就会把「清单不可用」
-状态固化 24h；不刷新则下一轮继续尝试，失败成本由 `CONNECT_TIMEOUT`（30s）与
-`PROBE_TIMEOUT`（20s）界定，且只在真的过期之后才发生。
+「失败不改 `probed_at`」是刻意选择：若成功时间戳被失败刷新，端点挂一天就会把
+「清单已过期」状态固化成「新鲜」，`is_fresh` 会误判为命中，此后 24h 内再也不会重探。
+
+「失败要写 `failed_at`」是另一半：它只影响**要不要再试**，不影响**清单是否新鲜**。
+两个时钟职责分离，才不会重现 §4.3.1 描述的每轮 55s 回归。
 
 「失败时保留旧清单」也是刻意选择：一次网络抖动不应让模型瞬间失去一批工具。代价是
 旧名仍可能被调用并继续报错——但那比工具凭空消失更容易理解，且错误已带可操作提示
@@ -283,39 +318,74 @@ impl McpCache {
        └─ 是 → reload()
                 └─ 每个 server:
                      ├─ 内存快照可复用(配置一致) 且 缓存未过期 → 沿用,probed=false
+                     ├─ lookup()==BackedOff → 沿用旧清单,不探测
                      ├─ lookup()==Stale → probe_tools()
-                     │    ├─ 成功 → put_probed()+时间戳,probed=true
-                     │    └─ 失败 → 回退旧清单(若有),error=原因,时间戳不变
+                     │    ├─ 成功 → put()+probed_at,probed=true
+                     │    └─ 失败 → 回退旧清单(若有),note_failure()+failed_at
                      └─ refresh_registry() → 重建 agent,新工具名进入工具表
 ```
 
-### 4.3.1 恢复耗时上限是 24h + 一次探测，且失败会立即重试
+### 4.3.1 失败必须退避，否则每轮都付 55 秒
 
-TTL 是「距离上次成功探测」计的，而探测失败不刷新时间戳：
+这是本设计唯一可能造成**严重性能回归**的地方，初稿写错过。
+
+如果「探测失败不刷新任何时间戳」，那么一个**长期不可用**的 server（离线、端点下线、
+凭据过期）会让 `needs_reload` 每一轮都为真，`reload` 每一轮都去探它。单次探测的成本是：
+
+```
+CONNECT_TIMEOUT 30s + PROBE_TIMEOUT 20s + REAP_TIMEOUT 5s = 55s     （每轮，每个坏 server）
+```
+
+当前 main 上不会有这个问题：`config_changed_on_disk` 只比指纹，坏 server 不触发
+reload。所以这是**新增**的回归，不是既有缺陷。方向必须反过来。
+
+引入第二个时间戳，两个时钟各管一件事：
+
+| 字段 | 含义 | 谁写 |
+|---|---|---|
+| `probed_at` | 上次**成功**探测 | 探测成功时 |
+| `failed_at` | 上次**失败**尝试 | 探测失败时 |
+
+判据拆成两条，互不干扰：
+
+```rust
+/// 工具清单是否还新鲜（决定能否复用旧工具名）。
+fn is_fresh(probed_at, now) -> bool { now - probed_at < TTL }          // 24h
+
+/// 现在是否允许再试一次（决定要不要发起探测）。
+fn may_retry(failed_at, now) -> bool {
+    failed_at.is_none_or(|t| now - t >= RETRY_AFTER)                   // 5min
+}
+```
+
+`Stale` 只有在 `!is_fresh && may_retry` 时才会真正触发探测；否则沿用旧清单、
+不探测。于是：
+
+| 场景 | 行为 |
+|---|---|
+| 缓存新鲜 | 零成本复用 |
+| 缓存过期、从未失败过 | 探测一次（+2~3s） |
+| 缓存过期、上次失败在 5 分钟内 | 跳过，本轮零成本；旧清单继续可用 |
+| 缓存过期、上次失败超 5 分钟 | 再试一次 |
+| 完全无缓存（新装）、探测失败 | 记 `failed_at`，之后 5 分钟内不再试，工具为空 |
+
+`RETRY_AFTER = 5min` 的依据：自愈延迟从 24h 变成「24h + 最多 5 分钟」，用户不可感知；
+而最坏情况开销从「每轮 55s」降到「每 5 分钟 55s」。两者相差约 3 个数量级。
+
+为什么失败也要写盘（`note_failure`）：`failed_at` 若不落盘，进程重启后又会立刻重试一次
+——重启频繁时同样会放大代价。落盘后重启不会重置退避。
+
+### 4.3.2 恢复耗时
 
 ```
 T0       成功探测，工具名 X 正确
 T0+1min  上游把 X 改名成 Y
-T0+1min → T0+24h   旧名调用一直失败（缓存未过期，不会重探）
+T0+1min → T0+24h   旧名调用失败（缓存未过期，不重探）
 T0+24h   下一轮开头 needs_reload 为真 → 探测 → 拿到 Y，自愈
 ```
 
-如果 T0+24h 那次探测恰好碰上上游抖动/限流，探测失败 → 时间戳不变 → **下一轮立刻
-再试**（判据是「已过期」，不是「距上次尝试超过 N」）。所以失败不会把恢复再推迟一个
-TTL，这是刻意的：换来的是端点持续不可用期间，每轮对话开头都要付一次探测超时代价。
-
-需要明确这是一个**权衡**而不是缺陷：
-
-| 选择 | 端点长期挂掉时的行为 |
-|---|---|
-| 失败不刷新时间戳（本设计） | 每轮都试，每轮 +2~3s；端点一恢复立刻自愈 |
-| 失败也刷新时间戳 | 每 24h 只试一次，代价小；但端点恢复后最长还要等 24h |
-
-本设计选前者，因为「每轮 +2~3s」只在缓存已过期**且**端点不可用时发生，是局部而非
-全局降级；而「恢复后还等 24h」是用户可感知的功能性延迟。
-
-自愈的用户可见效果：TTL 到期后的下一次对话开头，工具名更新为远端现值。在那之前，
-旧名调用仍会失败——这是「不做人工入口」这个范围选择必然接受的延迟。
+若 T0+24h 那次探测碰上上游抖动，`failed_at` 记录之，5 分钟后重试；端点恢复后最多
+再等 5 分钟即自愈。所以恢复耗时的上限是 **TTL + RETRY_AFTER**，而不是无限重试。
 
 ### 4.4 报错文案
 
@@ -342,7 +412,8 @@ and restart yi-agent; the list is re-probed on startup.
 | 缓存文件损坏/缺失 | 既有行为：空缓存 → 全部重探 |
 | `probed_at` 缺失（存量缓存） | 视为过期，重探一次并写入时间戳 |
 | `probed_at` 在未来（时钟回拨） | 视为过期，重探并覆盖 |
-| 探测超时/失败 | 保留过期状态，`error` 进 `ServerOutcome`，下一轮再试 |
+| 探测超时/失败 | 保留旧清单，写 `failed_at`，`error` 进 `ServerOutcome`，退避 5 分钟后重试 |
+| 端点长期不可用 | 每 `RETRY_AFTER` 付一次 55s，而不是每轮 |
 | 系统时钟不可用 | `now` 取不到时退化为 `0`，等价于「总是过期」；不 panic |
 | 只读文件系统导致 `save` 失败 | 既有行为：warn，不影响本次内存快照 |
 
@@ -356,7 +427,11 @@ and restart yi-agent; the list is re-probed on startup.
 | `an_entry_within_the_ttl_is_fresh` | `probed_at = now - 23h` → `lookup` 返回 `Fresh` |
 | `a_legacy_entry_without_probed_at_is_stale` | 手写无 `probed_at` 的 JSON → `Stale` |
 | `a_future_probed_at_is_treated_as_stale` | `probed_at = now + 1h` → `Stale` |
-| `a_failed_probe_keeps_the_entry_stale` | 探测失败后 `probed_at` 不变，下一轮仍会重探 |
+| `a_failed_probe_does_not_make_the_entry_fresh` | 探测失败后 `probed_at` 不变（不能假装新鲜） |
+| `retry_is_skipped_within_the_backoff_window` | `failed_at = now - 1min` → 不探测、旧清单照旧 |
+| `retry_happens_after_the_backoff_window` | `failed_at = now - 6min` → 再试一次 |
+| `a_failure_persists_the_backoff_across_restarts` | 失败后重新 `McpCache::load`，`failed_at` 仍在 |
+| `a_permanently_dead_server_is_probed_once_per_backoff_window` | 连续 10 轮 `needs_reload`，探测次数为 1~2，不是 10 |
 | `a_failed_probe_falls_back_to_the_old_tool_list` | 过期 + 探测失败 → 旧工具仍在、`error` 非空 |
 | `a_failed_probe_with_no_cache_yields_no_tools` | 无缓存 + 探测失败 → 工具为空、`error` 非空 |
 | `needs_reload_is_true_when_a_cache_entry_expired` | 配置未变 + 缓存过期 → `true` |
@@ -381,16 +456,20 @@ and restart yi-agent; the list is re-probed on startup.
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-mcp              # 期望：全绿，新增 10 例
+cargo test -p yi-agent-mcp              # 期望：全绿，新增 15 例
 cargo test -p yi-agent-mcp --test http_transport -- --ignored   # 真实端点
 cargo test -p yi-agent-app-server --lib # 下游未受影响（1068+）
 cargo test -p yi-agent-runtime --lib
 cargo fmt --all -- --check
 ```
 
-变异验证（逐条实测，回退即红）：删掉 TTL 判据 → `needs_reload_is_true_when_a_cache_entry_expired`
-与 `reload_refreshes_a_renamed_tool_after_the_ttl` 变红；把 `probed_at` 的
-`#[serde(default)]` 去掉 → `a_legacy_entry_without_probed_at_is_stale` 变红。
+变异验证（逐条实测，回退即红）：
+
+- 删掉 TTL 判据 → `needs_reload_is_true_when_a_cache_entry_expired`、
+  `reload_refreshes_a_renamed_tool_after_the_ttl` 变红。
+- 去掉 `probed_at` 的 `#[serde(default)]` → `a_legacy_entry_without_probed_at_is_stale` 变红。
+- 把 `may_retry` 改成恒 `true` → `a_permanently_dead_server_is_probed_once_per_backoff_window` 变红
+  （这条专门守护性能回归，是 §4.3.1 的直接防线）。
 
 真机验收：删掉 `.yi-agent/mcp-cache.json` 之外的路径——把一个 server 的 `probed_at`
 手工改到 25 小时前，启动会话并发一条消息，观察日志出现一次探测、工具名更新为远端现值。
