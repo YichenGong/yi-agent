@@ -196,15 +196,24 @@ match reusable {
 
 ```rust
 let reusable = previous.filter(|e| e.config == *sc);
-match reusable {
-    // 新增「且缓存未过期」：否则 24h 后仍会复用旧快照
-    // `Fresh` 与 `BackedOff` 都是「本轮沿用旧快照」，只有 `Stale` 才往下探
-    Some(e) if cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS).is_settled()
-        => (e.tools.clone(), false, None),
-    Some(e) => /* 快照在但已 Stale：走探测，失败则回落到 e.tools */,
-    None => ...
-}
+let (tools, probed) = match (reusable, cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS)) {
+    // 新鲜 ⇒ 用磁盘清单（跨进程同步，见 §4.2），不往下探。
+    (Some(_), CacheLookup::Fresh(disk)) => (disk.to_vec(), false),
+    // 刚失败过 ⇒ 不探，用内存快照（它才是 agent 正在用的那批）。
+    (Some(e), CacheLookup::BackedOff) => (e.tools.clone(), false),
+    (Some(e), CacheLookup::Stale) => /* 走探测，失败则回落到 e.tools */,
+    (None, _) => ...
+};
 ```
+
+**`is_settled()` 只能回答「要不要探」，不能用来选数据源。** `Fresh` 与 `BackedOff`
+都不探，但载体相反（磁盘 / 内存）。若用 `is_settled()` 把两者并成一个分支，就必须
+二选一，两种选法都会错：
+
+- 选 `e.tools` ⇒ 跨进程场景永远拿不到别进程探测到的新清单（本 bug 的形态）。
+- 选 `disk` ⇒ 刚探测失败、`cache.save` 又没写进去时，工具会从非空变成空。
+
+所以枚举变体各自带载荷（`Fresh(&[CachedTool])`），实现时必须逐个变体匹配。
 
 这是本设计最容易漏的一处，也是「只改 cache.rs」这种最小改动必然失败的原因。
 
@@ -284,8 +293,11 @@ pub enum CacheLookup<'a> {
 }
 
 impl CacheLookup<'_> {
-    /// 「本轮无事可做」：`Fresh` 与 `BackedOff` 都为真。
-    /// `reload` 与 `needs_reload` 都用它，才不会有第二处枚举匹配漂移。
+    /// 「本轮是否不需要探测」：`Fresh` 与 `BackedOff` 都为真。
+    ///
+    /// **只用于跳过探测的判断**（`needs_reload` 的触发条件、reload 的短路与否），
+    /// **不能用来选数据源**——`Fresh` 要磁盘清单、`BackedOff` 要内存快照，两者
+    /// 相反（见 §4.2）。`reload` 里需要清单时必须逐变体匹配，不能调这个谓词。
     pub fn is_settled(&self) -> bool {
         !matches!(self, CacheLookup::Stale)
     }
@@ -623,13 +635,16 @@ Some(e) => {
 即「内存快照非空就用它；只有内存里也没有（server 刚加进来、从未成功探测过）时，
 才回落到磁盘缓存」。
 
-**`Fresh` / `BackedOff` 也必须走同一个「内存快照优先」规则，不要写成「`Fresh` 时用
-磁盘清单」。** 二者都有 `probed_at`/`failed_at` 记录，说明磁盘上有条目，但磁盘清单
-可能落后于内存——`cache.save` 失败只 `warn` 不中断（`manager.rs:171`、`manager.rs:296`
-都是 `if let Err(e) = cache.save(..) { warn!(..) }`），磁盘满或只读文件系统下内存
-已经更新、磁盘仍是旧的；用户手工删掉 `mcp-cache.json` 也会造成同样分叉。agent 手上
-跑的是内存那批，按磁盘清单回填会让工具集在两轮之间抖动。数据流图与 §4.2 的 `match`
-分支现在写的是同一条规则。
+**`Fresh` 与 `BackedOff` 的数据源刻意不同，不是笔误。**
+
+- `Fresh` 用**磁盘清单**：判据（`probed_at`）就是从磁盘读的，载体也必须是磁盘那份，
+  否则「判据说新鲜、用的却是另一份数据」。跨进程场景下这是唯一的同步手段——
+  进程 A 探测成功写入 `[Y]`，进程 B 若用自己的旧快照 `[X]` 就会一直错下去。
+- `BackedOff` 用**内存快照优先**：此时刚探测失败，磁盘清单可能是旧的或缺失
+  （`cache.save` 失败只 `warn`，`manager.rs:171`、`manager.rs:296`），而内存里那批
+  正是 agent 当前在用的，换掉反而让工具凭空消失。
+
+两者取舍相反，但各自的理由都是「选那份不会让工具集与真实状态分叉的」。
 
 ### 4.3 数据流
 
@@ -642,9 +657,9 @@ Some(e) => {
                 │    ├─ !cfg.enabled || !sc.enabled
                 │    │                       → 不探测;工具=内存快照→磁盘缓存→空
                 │    │                          （§4.3.1.1(a)(d)）
-                │    ├─ lookup().is_settled() (Fresh / BackedOff)
-                │    │                        → 不探测;工具=内存快照→磁盘缓存→空
-                │    │                          （与 §4.2 的 match 分支逐字一致；probed=false）
+                │    ├─ lookup()==Fresh      → 用磁盘清单 tools.to_vec(),probed=false
+                │    │                          （刻意不用内存快照,见下「跨进程」）
+                │    ├─ lookup()==BackedOff  → 不探测;工具=内存快照→磁盘缓存→空
                 │    └─ lookup()==Stale      → probe_tools()
                 │         ├─ 成功 → put(tools, now)  → probed=true
                 │         └─ 失败 → 回退:内存快照(非空)→磁盘缓存(否则)
@@ -807,21 +822,41 @@ probed_at` 已远超 24h，于是**开机第一轮就探一次**。这是预期�
 
 ```rust
 for (name, sc) in &cfg.mcp_servers {
-    // 总开关或单 server 开关关闭 ⇒ 一律不探测（§4.3.1.1(a)(d)）
-    let probe_allowed = cfg.enabled && sc.enabled;
+    let probe_allowed = cfg.enabled && sc.enabled;          // (a)(d) 两个开关
     let reusable = old.get(name).filter(|e| e.config == *sc);
-    let (tools, probed, error) = match reusable {
-        Some(e) if !probe_allowed || cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS).is_settled() => {
-            // 沿用：内存快照 → 磁盘缓存 → 空
-            let t = if e.tools.is_empty() {
+
+    // 开关关闭：不探测，也不写 failed_at。工具按「内存快照 → 磁盘缓存 → 空」回落。
+    if !probe_allowed {
+        let t = match reusable {
+            Some(e) if !e.tools.is_empty() => e.tools.clone(),
+            _ => cache
+                .cached_tools_ignoring_freshness(name, sc)
+                .map(<[CachedTool]>::to_vec)
+                .unwrap_or_default(),
+        };
+        /* push ServerOutcome { tools: t, probed: false, .. } */
+        continue;
+    }
+
+    // 每个变体单独匹配：Fresh 要磁盘清单，BackedOff 要内存快照（见 §4.2）。
+    let (tools, probed, error) = match (reusable, cache.lookup(name, sc, now, TTL_SECS, RETRY_AFTER_SECS)) {
+        (Some(_), CacheLookup::Fresh(disk)) => (disk.to_vec(), false, None),
+        (Some(e), CacheLookup::BackedOff) => (e.tools.clone(), false, None),
+        (other, _) => {
+            // Stale（或没有内存快照）⇒ 探测；失败回落到内存快照。
+            let fallback = other.map(|e| e.tools.clone()).unwrap_or_default();
+            let note = if fallback.is_empty() {
                 cache.cached_tools_ignoring_freshness(name, sc).map(<[CachedTool]>::to_vec)
-            } else { Some(e.tools.clone()) };
-            (t.unwrap_or_default(), false, None)
+            } else { Some(fallback) };
+            cache.note_failure(name, sc, now);
+            (note.unwrap_or_default(), true, Some(/* err */ String::new()))
         }
-        // …其余与 §4.2 相同…
     };
 }
 ```
+
+这段已用最小可编译模型验证过三种路径：开关关闭保留内存快照且不探测；`Fresh` 拿到
+磁盘的 3 个工具而非内存的 2 个（跨进程同步）；磁盘空 + 探测失败回落到内存的 2 个。
 
 `needs_reload` 也必须同步短路：`cfg.enabled == false` 时直接返回 `false`，否则
 「某 server 过期 ⇒ 每轮 reload」的空转仍在。这与 (a) 那条总原则完全一致——**`reload`
@@ -1111,11 +1146,11 @@ TTL（§4.2），删掉缓存文件后重启，`get_for` 查不到条目 ⇒ 走
 |---|---|
 | `load_and_probe_does_not_probe_an_expired_entry` | 预置 25h 前的缓存 → 启动路径不探测、沿用旧清单（钉住决策 1：启动不校验 TTL） |
 | `load_and_probe_records_probed_at_on_success` | 冷缓存探测成功后 `probed_at` 被写入（否则 TTL 永不开始计时） |
-| `reload_reprobes_when_the_in_memory_snapshot_has_expired` | 同一进程内先 `load_and_probe` 建立快照，把缓存时间戳改到 25h 前，再 `reload` → 必须重新探测且工具名更新（删掉 `Some(e) if lookup(...).is_settled()` 那个 guard 即变红） |
+| `reload_reprobes_when_the_in_memory_snapshot_has_expired` | 同一进程内先 `load_and_probe` 建立快照，把缓存时间戳改到 25h 前，再 `reload` → 必须重新探测且工具名更新（把 `Some(e) if !is_stale` 那个 guard 删掉即变红） |
 
 `reload_refreshes_a_renamed_tool_after_the_ttl` 与上一条都是本 bug 的直接回归测试。
 变异验证对象：把 `needs_reload` 里的 TTL 判据删掉 → 第一条变红；把 `reusable` 分支
-的 `is_settled()` guard 删掉 → 上表这条变红。两条守护的是不同路径，缺一不可。
+的「非 `Stale` 才沿用快照」guard 删掉 → 上表这条变红。两条守护的是不同路径，缺一不可。
 
 同时修正真实端点冒烟测试（`tests/http_transport.rs`）——它已在 `a89b23f6` 中改为按
 `__SearchPro` 后缀匹配，本轮只需确认它仍绿。
