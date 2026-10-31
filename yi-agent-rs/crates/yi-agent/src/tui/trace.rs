@@ -489,6 +489,14 @@ pub fn render_subagent_detail_with(
     if area.width < 4 || area.height < 4 {
         return;
     }
+    // Paint the whole popup as a raised card before any section renders. The
+    // three `rows` below span `area` exactly (3 + Min(1) + 4), so one background
+    // pass is enough; per-Paragraph styling would miss the block borders, and
+    // `HistoryView` paints only foregrounds, so its cells keep this background.
+    f.render_widget(
+        Block::default().style(Style::new().bg(theme.bg_raised)),
+        area,
+    );
     let task_id = detail.task_id().to_string();
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1247,6 +1255,22 @@ mod tests {
         (0..buffer.area.height).any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == color))
     }
 
+    /// Whether `color` appears in the rows from `first_row` down.
+    ///
+    /// `any_cell_has_fg` scans the whole frame, and the header already paints
+    /// `warn` and `fg_faint`, so a whole-buffer assertion on either slot is
+    /// satisfied by the header alone and cannot fail when the footer regresses.
+    /// The footer is `Constraint::Length(4)`, so passing `height - 4` scopes an
+    /// assertion to the footer region and nothing else.
+    fn any_cell_has_fg_in_rows(
+        buffer: &ratatui::buffer::Buffer,
+        color: Color,
+        first_row: u16,
+    ) -> bool {
+        (first_row..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == color))
+    }
+
     /// The detail used raw ANSI slots (`Yellow` / `Red` / `Cyan` / `DarkGray`),
     /// so a light terminal got a footer that ranged from muddy to invisible.
     ///
@@ -1266,13 +1290,16 @@ mod tests {
             status: None,
         };
         let light = drawn_detail(&detail, &state, &composing, TuiTheme::LIGHT, 80, 20);
+        // Row 16 is the first of the footer's 4 rows; the header's colors must
+        // not be able to satisfy these two assertions.
+        let footer = 20 - 4;
         assert!(
             any_cell_has_fg(&light, TuiTheme::LIGHT.accent),
             "the 发消息> prompt and caret must use the light accent slot"
         );
         assert!(
-            any_cell_has_fg(&light, TuiTheme::LIGHT.fg_faint),
-            "the muted hint must use the light faint slot"
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.fg_faint, footer),
+            "the muted hint must use the light faint slot in the footer"
         );
         for raw in [Color::Yellow, Color::Red, Color::Cyan, Color::DarkGray] {
             assert!(
@@ -1290,12 +1317,12 @@ mod tests {
         };
         let light = drawn_detail(&detail, &state, &confirming, TuiTheme::LIGHT, 80, 20);
         assert!(
-            any_cell_has_fg(&light, TuiTheme::LIGHT.warn),
-            "the advisory status line must use the light warn slot"
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.warn, footer),
+            "the advisory status line must use the light warn slot in the footer"
         );
         assert!(
-            any_cell_has_fg(&light, TuiTheme::LIGHT.danger),
-            "the pending-cancel line must use the light danger slot"
+            any_cell_has_fg_in_rows(&light, TuiTheme::LIGHT.danger, footer),
+            "the pending-cancel line must use the light danger slot in the footer"
         );
         for raw in [Color::Yellow, Color::Red, Color::Cyan, Color::DarkGray] {
             assert!(
@@ -1308,6 +1335,51 @@ mod tests {
         let dark = drawn_detail(&detail, &state, &composing, TuiTheme::DARK, 80, 20);
         assert!(any_cell_has_fg(&dark, TuiTheme::DARK.accent));
         assert!(!any_cell_has_fg(&dark, TuiTheme::LIGHT.accent));
+    }
+
+    /// `app.rs` clears the popup area with `Clear`, which resets every cell to
+    /// the terminal default. Nothing but the list view repainted a surface, so
+    /// on a light terminal the detail's card was invisible: it sat on the same
+    /// white as the transcript behind it.
+    ///
+    /// The sample cells are text-free on purpose (`symbol()` is asserted to be
+    /// a space first), so this is an assertion about the background rather than
+    /// about a glyph. It is not an exhaustive scan: `Buffer::set_stringn` calls
+    /// `Cell::reset()` on the trailing half of a two-cell CJK glyph, so those
+    /// cells report `bg = Reset` in every themed popup in this crate.
+    #[test]
+    fn the_detail_paints_the_theme_raised_surface_behind_every_section() {
+        let state = SubagentListState::new(vec![item("task-1", "running", true)]);
+        let mut detail = TraceDetailPopup::new("task-1".into());
+        let payload = serde_json::to_string(&TraceFact::AssistantText {
+            text: "short".into(),
+        })
+        .unwrap();
+        detail
+            .feed_mut()
+            .push_row(1, "assistant_text", &payload, 70);
+        assert!(!detail.feed().is_empty(), "the feed must render a body");
+        let prompt = DetailPrompt::default();
+
+        // (x, y) at 80x20: the header's identity row, the trace body (filled by
+        // `HistoryView`, which paints foregrounds only), and the footer.
+        let buffer = drawn_detail(&detail, &state, &prompt, TuiTheme::LIGHT, 80, 20);
+        for (x, y) in [(78, 1), (78, 4), (78, 18)] {
+            assert_eq!(buffer[(x, y)].symbol(), " ", "({x}, {y}) must be blank");
+            assert_eq!(
+                buffer[(x, y)].bg,
+                TuiTheme::LIGHT.bg_raised,
+                "({x}, {y}) must be painted as the raised card"
+            );
+        }
+
+        let dark = drawn_detail(&detail, &state, &prompt, TuiTheme::DARK, 80, 20);
+        assert_eq!(dark[(78, 1)].bg, TuiTheme::DARK.bg_raised);
+        assert_ne!(
+            dark[(78, 1)].bg,
+            TuiTheme::LIGHT.bg_raised,
+            "the card surface must follow the passed theme"
+        );
     }
 
     /// The embedded `HistoryView` was constructed with a literal
