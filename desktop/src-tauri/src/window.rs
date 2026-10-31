@@ -194,23 +194,14 @@ mod tests {
         }
     }
 
-    /// Only the main window hides on close. A second window keeps the
-    /// framework default (close really closes), so adding one later cannot
-    /// silently produce an un-closable window.
+    /// The hide-on-close rule matches exactly the main window label and no
+    /// other. This covers the label predicate only; the actual hide/show path
+    /// is exercised by the `close_hides_window` integration test and by manual
+    /// acceptance.
     #[test]
     fn hide_on_close_only_applies_to_the_main_window() {
-        let app = tauri::test::mock_app();
-        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
-            .build()
-            .unwrap();
-        let other = tauri::WebviewWindowBuilder::new(&app, "other", Default::default())
-            .build()
-            .unwrap();
-
         assert!(hide_on_close_is_our_window("main"));
         assert!(!hide_on_close_is_our_window("other"));
-        // Keep the windows alive for the duration of the test.
-        let _ = (&main, &other);
     }
 
     /// Guards the one thing two sources of truth can silently disagree on: the
