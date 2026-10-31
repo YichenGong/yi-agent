@@ -782,10 +782,29 @@ impl BoardService {
             .iter()
             .filter(
                 |card| match card.thread_id.as_deref().filter(|id| !id.is_empty()) {
-                    Some(thread) => observations
-                        .threads
-                        .get(thread)
-                        .is_none_or(|observation| observation.alive),
+                    Some(thread) => match observations.threads.get(thread) {
+                        Some(observation) => observation.alive,
+                        // **没观测到**：对已交付的卡按「不活」算，其余按「活」算。
+                        //
+                        // 保守地把「缺证据」当「还活着」是为了不超发并发位——
+                        // 一张刚认领、宿主还没上报的卡，若凭缺失就放名额，
+                        // 同一拍里会凭空多出一个位子。但这个保守只对**可能还在
+                        // 起跑线上**的卡成立。
+                        //
+                        // `done` / `cancelled` 的卡没有在飞的动作，它身上的
+                        // thread_id 只是历史记录。线上出过事故：三张 `done` 卡带着
+                        // 旧 thread_id，`observations.json` 恰是空的（daemon 刚重启、
+                        // 宿主还没上报），于是它们被永久判为「活」，全局名额被占满，
+                        // 后面 `queued` 的卡一张都起不来，日志只说
+                        // 「no slot could be re-adopted」——看起来像没有名额，
+                        // 实际是名额被早就跑完的卡占着。
+                        //
+                        // 这里**不**用 `is_terminal()`：`failed` 虽也是终态，却常是
+                        // 「会话还活着但报了失败」（见 `release` 的契约与用例
+                        // `a_released_card_keeps_its_slot_while_its_session_is_alive`），
+                        // 那种情况名额必须继续算它头上。
+                        None => !matches!(card.state, CardState::Done | CardState::Cancelled),
+                    },
                     None => card.state == CardState::Running && awaiting_thread.contains(&card.id),
                 },
             )
@@ -1734,6 +1753,62 @@ mod tests {
             service.list()["cards"][1]["state"],
             "queued",
             "card-2 must not be claimed while the slot is taken"
+        );
+    }
+
+    /// 回归：**终态卡不得占用名额**。
+    ///
+    /// 线上症状：三张 `done` 的卡各自带着历史 `thread_id`，而 `observations.json`
+    /// 是空的（daemon 刚重启、宿主还没上报）。`live` 判定把「没观测到」当成
+    /// 「还活着」（`is_none_or`），于是这三张早就跑完的卡**永久**占住了全局名额，
+    /// 后面 `queued` 的卡一张都起不来。日志里只有两行
+    /// `has a live session but no slot could be re-adopted`，看起来像「没槽位」，
+    /// 实际是「槽位被已完成的卡占着」。
+    ///
+    /// 判据本该看「会话是否还在」，但终态卡已经交付完毕，它上面的 thread_id 只是
+    /// 历史记录。会话确实还在跑也好、已经不在了也好，都不该再挡住后面的卡：
+    /// `is_terminal()` 优先于观测缺失。
+    #[test]
+    fn a_finished_card_never_holds_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 复刻线上 board：一张 done 且留着 thread_id，一张 queued。
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("card-done"),
+            PathBuf::from("a.spec.md"),
+            PathBuf::from("a.plan.md"),
+            at(),
+        );
+        board
+            .transition(&CardId::new("card-done"), CardState::Running)
+            .unwrap();
+        board
+            .set_thread_id(&CardId::new("card-done"), "thread-gone".to_string())
+            .unwrap();
+        board
+            .transition(&CardId::new("card-done"), CardState::Done)
+            .unwrap();
+        board.enqueue(
+            CardId::new("card-next"),
+            PathBuf::from("b.spec.md"),
+            PathBuf::from("b.plan.md"),
+            at(),
+        );
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+        // 观测文件留空，与线上一致：没有任何 thread 的记录。
+
+        let service = BoardService::new(state_dir, project, Some(dir.path().join("home")));
+        one_slot_only(&service);
+        service.adopt_running_leases(1);
+
+        // 唯一的名额必须还在池子里：那张 done 的卡不许占着它。
+        assert!(
+            service.next_launch(1, at()).unwrap().is_some(),
+            "a finished card must not keep a queued card from starting"
         );
     }
 
