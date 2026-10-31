@@ -145,6 +145,12 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
 其余目标照常停。这样从 App 对话里发起重建不会自毁，代价只是那一个进程留旧，
 且告警明确指出。
 
+**但 `desktop` / `all` 必须例外地提前失败。** 这两个子命令最后要替换
+`/Applications/yi-agent.app`，而祖先正占用着它——无论先编多久，最后都装不进去。
+所以 `stop_dependents` 在检测到「有祖先进程命中」且 `cmd` 是 `desktop`/`all` 时
+直接 `die`，并给出「请到终端里运行」的完整命令。`cli` / `plugin` 不受影响：
+它们不碰 bundle，祖先进程留旧不影响本次产物落地。
+
 ### 2.5 调用点：新增 `stop` 子命令，四个构建子命令都先停
 
 新增 `./scripts/rebuild.sh stop`：只停进程、不编译。用途有两个——用户随时手动
@@ -178,6 +184,7 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
 | `launchctl bootout` 失败（未加载） | 不计为错误，打印一行说明后继续 |
 | SIGTERM 后 5s 仍有存活 | SIGKILL，再等 2s；仍存活则 `die`，不继续构建 |
 | 目标 pid 是祖先进程 | 跳过 + 告警，其余照常 |
+| 祖先进程命中且子命令是 `desktop`/`all` | `die` 并提示到终端里重跑（bundle 无法替换） |
 | `ps` 解析不到某行 | 跳过该行，不中断 |
 
 ## 4. 验收
@@ -200,3 +207,45 @@ WARN: pid 69432 (app-server) 是本次重建的祖先进程，跳过。
 - 唯一的行为变化：重建会主动结束正在运行的 App 与会话。发起重建等于放弃
   当前正在进行的会话——这正是用户明确接受的取舍（「我不会需要保护 app 的时候
   运行这个更新脚本」）
+
+## 6. 实现与验证记录（2026-11-01）
+
+实现落在 `scripts/rebuild.sh`：新增 `WATCHMAN_LABEL` /
+`LEGACY_WATCHMAN_LABEL`、`is_target_command`、`target_pids`、
+`ancestor_pids`、`wait_gone`、`stop_dependents`，新增 `stop` 子命令，
+四个构建子命令在 `preflight` 之后调用 `stop_dependents`。
+
+`scripts/` 整个目录在 `.git/info/exclude`，故脚本改动本身不入库（与该文件头部
+声明一致）；本文档照常入库。
+
+### 验证
+
+**匹配器单测（18/18）**：命中 `desktop`、`daemon serve`、`resident watch`、
+`app-server`、`superpowers-kanban run`、`yi-agent-dev`、`~/.cargo/bin/yi-agent`、
+终端 `yi-agent tui`；不命中 `vi yi-agent/docs/foo.md`、`grep -r yi-agent .`、
+`tail -f …/resident-daemon-watchman.log`、`sh -c echo yi-agent`、
+`vim …/superpowers-kanban/SKILL.md`、`cargo build --manifest-path …/yi-agent-rs/…`、
+`mdfind superpowers-kanban`、`ls /Applications/yi-agent.app`、
+`open -a /Applications/yi-agent.app`、`/sbin/launchd`。
+
+**`stop_dependents` 流程测试（16/16）**：把 `ps` / `launchctl` / `kill` /
+`sleep` / `date` 换成假实现（不碰真实进程），覆盖——
+
+- 四个目标全部停掉（`daemon serve` / `resident watch` /
+  `superpowers-kanban` / 终端 `yi-agent`）
+- 祖先进程（`desktop` / `app-server`）被跳过且有告警
+- 无关进程（`vim`）不被误杀
+- 先 `bootout` 值守，且旧标签 `ai.yi-agent.board-watchman` 一并清掉
+- 幂等：无目标时打印「没有需要停止的进程」并退出 0
+- `desktop` 从 App 内发起时提前失败（不白等编译），原因明确
+- 超时未退出时走 SIGKILL 兜底
+- 确实杀不掉时中止（退出码非 0），不会进入替换 `/Applications` 的分支
+
+**真实进程表上的只读演练**：对当时真实运行的 5 个进程执行
+`target_pids "$(ancestor_pids)"`，结果为「停 3 个（`daemon serve`、
+`resident watch`、`superpowers-kanban`）、跳过 2 个祖先（`desktop`、
+`app-server`）」，与预期一致。
+
+**未执行**：真实调用 `./scripts/rebuild.sh stop` 会杀掉承载当次会话的
+`app-server`，使验证报告无法交付，故留在用户实际重建时执行。用
+`./scripts/rebuild.sh stop` 即可复现 §4 的验收 1-4。
