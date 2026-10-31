@@ -269,9 +269,24 @@ webview 直接调 shell，既危险也不好测。前端只发 `remote/install` 
    因为 app-server 启动即会校验 `is_dir()`）
 6. 查 `~/.yi-agent/bin/<version>/` 是否已存在且 `--version` 匹配
 7. 不存在则安装（§2.4 的三级优先），进度以 `remote/install/progress` 事件回推
-8. 安装完起 ssh 会话：命令里 `cd '<远端项目路径>'` 让**远端进程**的 cwd 落在
-   项目目录（ssh 没有指定远端 cwd 的参数，见 §4.4），并用 `YI_AGENT_HOME` 做状态
-   隔离（见 §4.6），接管 stdio
+8. 安装完起 ssh 会话，完整命令形如：
+
+   ```bash
+   ssh <host> "cd '<远端项目路径>' && exec env YI_AGENT_HOME='<instance_root>' \
+     '<bin>' app-server --listen stdio://"
+   ```
+
+   两件事分开看，**不要混为一谈**：
+
+   - `cd '<远端项目路径>'` → 决定 app-server 的 **cwd**，即项目目录
+     （ssh 没有"指定远端 cwd"的参数，只能靠 `cd`，见 §4.4）
+   - `env YI_AGENT_HOME=...` → 决定 **状态目录**。这是**必须显式给**的：
+     `instance_home()` 只认 `YI_AGENT_HOME` 与 `$HOME`，**不看 cwd**
+     （§4.6 已核实）。只 `cd` 不设 env，所有远端项目会共用
+     `$HOME/.yi-agent`，静默互相覆盖状态
+
+   用 `exec` 让 app-server 替换 shell 进程：ssh 断线时信号直达 app-server，
+   不留一层 `sh` 挡在中间
 9. 前端拿到 `remote/status` 的 `connected`，正常开始对话
 
 **每一步都要有超时，不能无限等**。参考 codex 的做法
@@ -710,6 +725,29 @@ ssh host "cd '<远端项目路径>' && exec env YI_AGENT_HOME='<实例根>' '<bi
 其中 `<slug>` 由**本机**的 profile 名派生（稳定、可预测），例如 `proj-foo`。
 这样每个远端项目有自己完整的 `threads/`、`workspaces.json`、
 `resident-daemons.json`、`runtime.sqlite`，**互不干扰**。
+
+**先纠正一个容易搞错的事实：cwd 不影响 `instance_home`。**
+
+本地侧车的做法是"把 cwd 锚到 instance_home"（`bridge.rs:376-383` 的
+`sidecar_cwd_from`），容易让人以为这样就把状态目录定住了。但
+`instance_home()`（`store/src/paths.rs:20-23`）只看两样东西：
+
+```rust
+pub fn instance_home() -> Option<PathBuf> {
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|v| !v.is_empty());
+    instance_home_from(override_value.as_deref(), os_home().as_deref())
+}
+// os_home() 同样只看 env：std::env::var_os("HOME")
+```
+
+**`cwd` 完全不参与**。所以：
+
+- 本地侧车能够隔离，是因为 `YI_AGENT_HOME` 由**桌面进程的环境**继承下来
+  （`spawn_once` 用 `cmd.args(...)` 起子进程，默认继承环境），**不是**因为 cwd
+- 远端槽位**必须显式在远端 shell 里设 `YI_AGENT_HOME`**（这就是 §4.1 里
+  `cd '<remote_path>' && YI_AGENT_HOME='<实例根>' ...` 的由来）。只 `cd` 不设 env，
+  远端会落到 `$HOME/.yi-agent` —— 所有远端项目**共用同一个状态目录**，正是
+  §8.5 警告的静默丢数据
 
 **`YI_AGENT_HOME` 的路径写法有个坑（已按 `paths.rs` 逻辑实测确认）**：
 `instance_home_from`（`yi-agent-store/src/paths.rs:25-40`）的归一化规则是
@@ -1597,7 +1635,11 @@ audit / 不做 scope 透传到远端"，避免后续误以为它已经存在。
 49. **一个槽位卡住不拖垮其他（必测）**：让远端 A 的 ssh 阻塞（指向黑洞地址，
     或对远端 app-server `kill -STOP`），本地与远端 B 的对话**仍正常**；
     确认锁是每槽位一把，不是外层那把（§4.6）
-50. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+50. **只 cd 不设 env 会共用状态（负向测试）**：手动把 `remote_argv()` 里的
+    `env YI_AGENT_HOME=...` 去掉，连两个远端项目，确认它们**确实**共用
+    `$HOME/.yi-agent`（证明这条 env 是隔离的唯一来源，而非 cwd）；恢复后
+    两者分开（§4.6、§4.1 第 8 步）
+51. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1651,7 +1693,7 @@ bug 分不清"的泥潭。
     `transportFactory` 签名从"返回单个 Transport"改为可按项目取；
     列表按项目分组；消费 `remote/relayTargets` 拿清单。
     **必须单独验证桌面路径未被破坏**（`tauriTransport()` 分支）
-13. **端到端真机验证** — 走完 §9 的 **50 条**判据。并行相关的
+13. **端到端真机验证** — 走完 §9 的 **51 条**判据。并行相关的
     15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
