@@ -1,4 +1,5 @@
 import type { Item } from "./protocol";
+import { DB_NAME, DB_VERSION, STORE_NAME } from "./cacheDb";
 
 /** Per-entry cap: how large a single thread's cached transcript may get. */
 export const MAX_ENTRY_BYTES = 1024 * 1024;
@@ -117,9 +118,9 @@ export class MemoryContentStore implements AsyncContentStore {
   }
 }
 
-const DB_NAME = "yi-agent-cache";
-const DB_VERSION = 1;
-const STORE_NAME = "threadContent";
+// 常量已抽到 cacheDb.ts（打断与 cacheScope.ts 的循环依赖）。这里重导出，
+// 保持既有 import 路径可用。
+export { DB_NAME, DB_VERSION, STORE_NAME };
 
 /** IndexedDB-backed store. Opens lazily on first use. */
 export function createIndexedDbStore(): AsyncContentStore {
