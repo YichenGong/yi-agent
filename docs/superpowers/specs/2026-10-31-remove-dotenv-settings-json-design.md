@@ -310,13 +310,13 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 
 ### RPC 面
 
-新增三个方法，归 `Domain::Ui`（与 `ui/settings/read|write` 同域、同权限档）：
+新增两个方法，归 `Domain::Ui`（与 `ui/settings/read|write` 同域、同权限档）：
 
 | 方法 | 语义 |
 |---|---|
 | `settings/read` | 返回每个字段的 `{key, group, label, type, value, default, description, options}`；`value: null` 表示未设置 |
 | `settings/write` | 部分更新；`null` 或空串表示删除该键（回退默认）；返回被拒绝的字段与原因 |
-| `settings/test` | 可选：只校验不落盘，供 UI 在输入时即时反馈 |
+| ~~`settings/test`~~ | **不做。** 校验规则只存在于 `settings/write` 一处；`read` 已把取值范围与 `options` 交给前端做提示，新增一个「只校验」的方法会让同一套规则存在于两处、迟早漂移。若日后确实需要「输入即校验」，给 `write` 加 `dry_run: true` 参数，而不是新增方法。 |
 
 `settings/write` 的拒绝规则（返回 `invalid_setting`，零写入）：
 
@@ -395,7 +395,20 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 `YI_AGENT_REAL_LLM_*` 专用键保留，仍用于「测一个与日常不同的模型」。
 
 导出逻辑写成一个脚本（`yi-agent-rs/scripts/export-model-env.sh`），四个 recipe 共用，
-避免四份重复的 `jq` 表达式。
+避免四份重复的表达式。
+
+脚本的三条硬要求：
+
+- **首选 `python3`，回退 `jq`。** `python3` 在本仓库的开发前提（Rust 工具链 + CLT）下必然
+  存在，`jq` 则常需 `brew install`。用 `python3` 还能一次读出整个 JSON 再统一处理
+  `null`/缺字段，不必为四个变量写四份表达式。
+- **两者都缺时打一行提示并 `exit 0`，不 `exit 1`。** 与「无 key 时 real-test 自动跳过、
+  exit 0 不算失败」的既有约定一致。缺工具是环境问题，不该伪装成测试失败。
+- **只导出非空值。** `models.json` 里某字段为空时不导出空串——否则会把本来能用的真实
+  环境变量覆盖成空。这一点由 `unset`/跳过实现，而不是 `export KEY=`。
+
+脚本输出 `export KEY='...'` 形式供 `source`；值里的单引号按 `'\''` 转义（`models.json`
+的 key 理论上不含引号，但这是最容易写出未闭合引号的坑）。
 
 ## 错误处理
 
@@ -444,7 +457,7 @@ export MODEL_API_KEY=sk-x →  []                                   ← 既不�
 - **零写入的拒绝**：`settings/write` 传 `max_turns: 0` 或 `sandbox: "bogus"` 时返回
   `invalid_setting`，且文件的 mtime 与内容都不变。
 - `YI_AGENT_WORKDIR` 不再影响 `resolve_workdir`（设为任意值后断言仍用当前目录）。
-- `domain_for` 表补 `settings/read|write|test`。
+- `domain_for` 表补 `settings/read|write`；**不出现** `settings/test`（钉住它没被顺手加回来）。
 - web：`put_config` 不再产生空值行；未知键存活；`source` 基于 `null` 判定；`real-llm` 路由返回 404。
 - 桌面端：`SettingsRuntimeTab` 渲染三组、恢复默认发 `null`、未设置显示默认值、
   **`value: null` 时「恢复默认」按钮禁用**。
@@ -491,10 +504,73 @@ cd desktop && npx tsc --noEmit && npx vitest run --maxWorkers=1
 
 因此阶段二需要三件事：给 `transportFactory` 加「本地 WS 模式」；给浏览器一条拿到 token 的
 路径（`yi-agent web` 启动时打印一次性配对码）；解决 `desktop/dist` 如何进入 `yi-agent-web`
-二进制（构建期嵌入，或在构建脚本里先 `npm run build` 再 `cargo build`）。
+二进制（已定：构建期嵌入，缺失则在 `yi-agent web` 启动时硬失败，见下）。
 
-阶段一交付 `settings/*` RPC 面正是这三件事的前置条件 —— 所以本次改动不会被阶段二的待定决策
-绑死。
+阶段一交付 `settings/*` RPC 面正是这三件事的前置条件 —— 所以本次改动不会被阶段二绑死。
+
+### 前端资源的嵌入：缺失即报错，但报错的位置要分层
+
+`desktop/dist` 是 1.0M、6 个文件、文件名带内容哈希（`assets/index-Dl3f9nH0.js`）。
+所以嵌入的不是一个 HTML 字符串，而是一张「路径 → 字节」的表。现状 `api.rs:38` 只有一个
+`index_html` 返回 `&'static str`，阶段二需扩成静态资源路由。
+
+**不做降级。** 降级会让「为什么这个功能不见了」变成一个无法回答的问题：用户看到的是
+一个能正常打开、但能力不完整的界面，既没有报错也没有提示，只会以为功能坏了。
+宁可硬失败，让「没构建前端」这个原因在第一时间暴露。
+
+但「报错」必须报在正确的层，否则会误伤与前端无关的所有人：
+
+| 层 | 行为 | 理由 |
+|---|---|---|
+| `build.rs` | **永不失败**。`dist` 存在则嵌入，不存在则生成空表 + `HAS_BUNDLE = false` | `justfile:23` 是 `cargo test --all-features --workspace`、`justfile:27` 是 `cargo build --workspace`，`just ci` 依赖两者，而 CI 不构建前端。`build.rs` 一旦 panic，整个 workspace 的编译与测试全部瘫痪 |
+| `yi-agent web` 启动 | **硬失败**：打印「前端未构建，请先 `cd desktop && npm ci && npm run build`」并 `exit 1` | 只有真正要跑 web UI 的人受影响。不启动服务、不监听端口、不给出半成品页面 |
+| `just package-all` / release | **硬失败**：shell 层先断言 `desktop/dist/index.html` 存在 | 发布产物必须自带完整 UI，否则所有用户的 `yi-agent web` 都是坏的 |
+
+**这样做的净效果**：`cargo build` / `cargo test` / CI 零 Node 前置；开发者忘了构建前端时，
+`yi-agent web` 立刻给出可执行的修复指令；发布流程不可能漏掉前端。
+
+`build.rs` 的实现要点：
+
+```rust
+// 扫描 ../desktop/dist（相对 crate 根），生成 assets_generated.rs
+pub static BUNDLE: &[(&str, &[u8], &str)] = &[
+    ("/index.html", include_bytes!("..."), "text/html"),
+    ("/assets/index-Dl3f9nH0.js", include_bytes!("..."), "text/javascript"),
+    // ...
+];
+pub const HAS_BUNDLE: bool = true;   // dist 缺失时为 false、表为空
+```
+
+- `println!("cargo:rerun-if-changed=../desktop/dist")` 不能漏，否则前端重新 `npm run build`
+  后 Rust 不重编，用户看到的是旧界面。
+- `content-type` 按扩展名映射（`.js` / `.css` / `.svg` / `.html` / `.woff2` / `.png`），
+  未识别的按 `application/octet-stream`。
+
+`yi-agent web` 的检查点在 `serve()` 的最开头，早于 `TcpListener::bind`：
+
+```rust
+if !HAS_BUNDLE { bail!("前端未构建……") }
+```
+
+**`assets/index.html`（手写的那份）在阶段二删除**，与「不做降级」一致：留着它就会诱导
+后来的人把它当兜底接回去。
+
+**测试**：
+
+- 缺 `dist` 时 `cargo build --workspace` 与 `cargo test --workspace` 必须通过
+  （这是 CI 的硬约束，也是本设计唯一不可让步的一条）。
+- 缺 `dist` 时 `yi-agent web --port 0` 以非零码退出，stderr 含「前端未构建」。
+- 有 `dist` 时 `/` 返回 200 且含 `<div id="root">`；`/assets/<表中某文件>` 返回 200
+  且 `content-type` 正确；`/assets/不存在.js` 返回 404（**不回落成 index.html**——
+  单页应用「未知路径一律 index.html」的惯例会掩盖真实问题，这里明确不采用）。
+
+**为什么不改成「运行期读 `desktop/dist` 目录」**：那样没有构建期耦合，改前端不用重编，
+但发布出去的二进制会依赖一个外部目录，单文件分发就没了；且换台机器跑会直接失败，
+而失败原因（目录不在）与「配置坏了」难以区分。构建期嵌入让产物自包含。
+
+**为什么不 `build.rs` 直接失败**：见上表第一行——它会连带 `cargo test` 与 CI 一起红，
+把「没装 Node」的成本转嫁给完全不碰前端的 Rust 任务。报错该报给用 web UI 的人，
+而不是报给所有编译这个仓库的人。
 
 ## 附：本 spec 的自审记录
 
@@ -536,17 +612,26 @@ cd desktop && npx tsc --noEmit && npx vitest run --maxWorkers=1
 初稿没写，实施时会随手二选一。已定：**不算**，因为配置文件是长期偏好而非本次启动的
 显式指令；判定表达式原样保留。
 
+**8.（第二轮）前端资源降级方案被推翻。** 初稿写的是「缺 `dist` 就用占位页降级」，
+目的是让纯 Rust 开发不受 Node 阻塞。用户否决了这个方向并给出理由：降级会让「为什么功能
+不见了」无法回答，用户看到的是能打开但能力不全的界面，只会以为功能坏了。改判为**硬失败**，
+但把失败点从 `build.rs` 移到 `yi-agent web` 启动处——因为 `justfile:23/27` 的
+`cargo test --workspace` 与 `cargo build --workspace` 是 CI 入口，CI 不构建前端，
+`build.rs` 一旦 panic 就会把「没装 Node」的成本转嫁给所有 Rust 任务。
+
 此外补了两处初稿含糊的地方：**空字符串等于未设置**（覆盖字符串/数值/枚举三类，且必须在
 写入侧实现，否则会重演 `env_file::write` 写空占位导致 `source` 失真的老问题）；
 **`value: null` 的三态渲染**（未设置 / 已设置 / 恢复默认按钮是否可用），避免前端又退化成
 两态。
 
-### 仍未解决、需要在实施时决定
+### 三个待定项的裁决（2026-10-31 已定）
 
-- `settings/test` 是否真的需要。UI 可以在前端校验，多一个 RPC 就多一处要维护的
-  校验逻辑。若前端校验足够，这一条可以砍掉。
-- `justfile` 的 `export-model-env.sh` 依赖 `jq` 或 `python3`。前者可能未装，
-  后者 macOS 自带但 `python3` 在某些精简环境缺失。实施时选定一种并加存在性检查。
-- 阶段二的「构建期嵌入 `desktop/dist`」会引入跨 crate 的构建依赖：
-  `yi-agent-web` 的 `build.rs` 若不产出 `dist` 就要报错，这会让「只改 Rust 不碰前端」
-  的开发者被迫装 Node。需要在阶段二单独权衡。
+- **`settings/test` 砍掉。** 校验只存在于 `settings/write` 一处，`read` 已把取值范围与
+  `options` 交给前端做提示。若日后需要「输入即校验」，给 `write` 加 `dry_run` 参数，
+  不新增方法。
+- **`export-model-env.sh` 首选 `python3`、回退 `jq`，两者都缺则提示并 `exit 0`。**
+  缺工具是环境问题，不该伪装成测试失败（与「无 key 时 real-test 自动跳过」同一约定）。
+- **前端资源缺失即报错，不降级；但报错位置分层**（`build.rs` 永不失败、
+  `yi-agent web` 硬失败、发布流程硬失败），见「前端资源的嵌入」一节。
+
+三项都已写入正文，不再是开放问题。
