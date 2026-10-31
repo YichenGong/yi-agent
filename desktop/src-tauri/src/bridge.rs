@@ -738,7 +738,35 @@ pub fn remote_list() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub fn remote_upsert(profile: serde_json::Value) -> Result<serde_json::Value, String> {
     remote_gate()?;
-    let validated = crate::remote::rpc::validate_profile_payload(&profile)?;
+    let mut validated = crate::remote::rpc::validate_profile_payload(&profile)?;
+    // `instance_root` 由 App 派生，不由用户填（spec §4.9）：探测远端 `$HOME`，
+    // 拼成 `<home>/.yi-agent-projects/<id>/.yi-agent`。放在保存时做而不是连接时：
+    // 连接要重试很多次，而这个值一旦定下就该是确定的，每次连接重探只会让
+    // 「同一 profile 在不同时刻指向不同状态目录」成为可能。
+    if crate::remote::rpc::needs_instance_root(&validated) {
+        let home = run_remote(
+            &validated.host,
+            crate::remote::probe::expand_home_probe_command(),
+        )?
+        .trim()
+        .to_string();
+        validated.instance_root =
+            crate::remote::profile::derive_instance_root(&home, &validated.id)?;
+    }
+    // 判据 24：远端项目路径必须**现在**就验，而不是等 app-server 起来由
+    // `resolve_workdir` 报 `working directory does not exist`——那时用户已经
+    // 等了安装与握手，而真正的原因（路径写错）早就可查。
+    let check = format!(
+        "test -d {} && echo YI_PATH_OK",
+        crate::remote::sh_quote(&validated.remote_path)
+    );
+    let answer = run_remote(&validated.host, &check)?;
+    if !answer.contains("YI_PATH_OK") {
+        return Err(format!(
+            "remote path `{}` is not a directory on `{}`",
+            validated.remote_path, validated.host
+        ));
+    }
     let path = remote_config_path();
     let mut config = crate::remote::config::load(&path);
     match config

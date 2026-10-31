@@ -57,8 +57,14 @@ pub fn validate_profile_payload(raw: &Value) -> Result<RemoteProfile, String> {
     // 值——那是最危险的一类输入。
     check_host(&host)?;
 
+    // `instance_root` **不由用户输入**（spec §4.9）：它按远端 home 派生。
+    // 这里允许缺失，缺失时留空串，由 `remote_upsert` 探测 home 后补上。
+    // 若前端（或旧配置）确实给了值，仍按远端路径的同一套规则校验——它是
+    // 直接进 `YI_AGENT_HOME=` 的字符串。
     let instance_root = get("instance_root");
-    check_remote_path("instance_root", &instance_root)?;
+    if !instance_root.is_empty() {
+        check_remote_path("instance_root", &instance_root)?;
+    }
     let remote_path = get("remote_path");
     check_remote_path("remote_path", &remote_path)?;
 
@@ -92,6 +98,15 @@ pub fn validate_profile_payload(raw: &Value) -> Result<RemoteProfile, String> {
         binary_version,
         remote_arch: arch,
     })
+}
+
+/// 这个 profile 是否还需要去探远端 home 才能落盘。
+///
+/// 判据是「`instance_root` 为空」，而不是「前端传了没有」：前端**从来**不传它
+/// （spec §4.9），所以这两种说法等价，但前者对旧配置与测试更宽容——已经存了
+/// 值的 profile 编辑时不该被强制重探一次。
+pub fn needs_instance_root(profile: &RemoteProfile) -> bool {
+    profile.instance_root.is_empty()
 }
 
 /// `host` 会被拼进 ssh 命令行，必须与 `remote_argv` 用**同一个**判据。
@@ -153,6 +168,45 @@ mod tests {
             "binary_version": "0.1.10",
             "remote_arch": "x86_64-unknown-linux-gnu"
         })
+    }
+
+    /// 前端从不传 `instance_root`（spec §4.9）：缺它**不是**错误，只是需要后续
+    /// 探测远端 home 补齐。
+    #[test]
+    fn a_payload_without_instance_root_is_accepted_and_flagged() {
+        let mut raw = payload();
+        raw.as_object_mut().unwrap().remove("instance_root");
+        let profile = validate_profile_payload(&raw).unwrap();
+        assert!(
+            needs_instance_root(&profile),
+            "a missing instance_root must ask for a probe, not fail validation"
+        );
+    }
+
+    /// 已经派生过的值不该被反复重探：编辑一个已存的 profile 时远端可能正好
+    /// 连不上，此时保存失败会让人以为配置坏了。
+    #[test]
+    fn a_payload_with_instance_root_needs_no_probe() {
+        let profile = validate_profile_payload(&payload()).unwrap();
+        assert!(!needs_instance_root(&profile));
+    }
+
+    /// 但一旦给了，就必须过与远端路径同一套校验——它直接进 `YI_AGENT_HOME=`。
+    #[test]
+    fn a_supplied_instance_root_is_still_validated() {
+        for bad in ["relative/.yi-agent", "/home/dev/$(id)/.yi-agent", ""] {
+            let mut raw = payload();
+            raw["instance_root"] = json!(bad);
+            if bad.is_empty() {
+                // 空串等价于「没给」，交给探测。
+                assert!(validate_profile_payload(&raw).is_ok());
+            } else {
+                assert!(
+                    validate_profile_payload(&raw).is_err(),
+                    "instance_root `{bad}` must be rejected"
+                );
+            }
+        }
     }
 
     /// 三条闸门乘积：flag 关、非 dev、nogit 都必须关。

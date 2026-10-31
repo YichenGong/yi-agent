@@ -5,6 +5,7 @@
 //! 机器；执行部分是 ssh/scp 编排，靠手工端到端验证。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::remote::probe::RemoteCaps;
 
@@ -157,7 +158,7 @@ pub fn install(
             }
             if needs_local_extract(caps) {
                 // 远端解不了 gzip：只把二进制解出来传过去，远端不必有 tar。
-                let staging = tempfile::TempDir::new().map_err(|e| e.to_string())?;
+                let staging = Staging::create()?;
                 let local_bin = extract_binary(&cached, staging.path())?;
                 let remote_tmp = "/tmp/yi-agent-upload";
                 scp_to_remote(&local_bin, host, remote_tmp)?;
@@ -208,6 +209,38 @@ pub fn install(
     Ok(binary)
 }
 
+/// 解压用的临时目录，离开作用域即删。
+///
+/// 不引 `tempfile`：它当前只是 dev-dependency，为一次解压把它提成生产依赖会
+/// 为三个函数多带一棵依赖树。这里要的语义很窄——建一个唯一目录、退出时删掉。
+struct Staging {
+    path: PathBuf,
+}
+
+impl Staging {
+    fn create() -> Result<Self, String> {
+        // 进程 id + 纳秒时间戳：同一进程连装两次也不会撞。
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("yi-agent-extract-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// 从 `.tar.gz` 里解出 `yi-agent` 这一个成员，放在 `staging` 下。
 ///
 /// 用**系统 `tar`** 而不是 Rust 解压库：判据 10 要求本机依赖树里不出现
@@ -247,25 +280,85 @@ fn extract_binary(archive: &Path, staging: &Path) -> Result<PathBuf, String> {
 /// `BatchMode=yes` 与 `ConnectTimeout=20` 与 `remote/argv.rs` 同口径：非交互、
 /// 不可达时不要挂住。
 pub fn run_remote(host: &str, command: &str) -> Result<String, String> {
-    let out = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=20",
-            host,
-            command,
-        ])
-        .output()
-        .map_err(|e| format!("ssh failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "remote command failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    run_remote_within(host, command, PROBE_TIMEOUT)
+}
+
+/// 探测类命令的超时（spec §4.1 的表：10~20s）。
+///
+/// `ConnectTimeout` 只盖住**建连**：host 可达但远端卡住（磁盘满、NFS 挂死、
+/// `test -d` 撞上一个失效挂载点）时，ssh 会一直等下去，UI 就永远停在「连接中」。
+/// 那是这类功能最常见的坏体验，所以命令本身另有一道 watchdog。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 带 watchdog 的 `run_remote`。
+///
+/// 实现方式：子进程 + 等待线程 + `timeout` 上的 `recv_timeout`。做不到「先
+/// kill 再等」的话，超时后就把它留成孤儿——所以超时分支显式 `kill`。
+pub fn run_remote_within(host: &str, command: &str, timeout: Duration) -> Result<String, String> {
+    let mut command_builder = std::process::Command::new("ssh");
+    command_builder.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=20",
+        host,
+        command,
+    ]);
+    let label = format!("ssh `{host}`");
+    run_guarded(command_builder, &label, timeout)
+}
+
+/// 同一套 watchdog，命令由调用方给。测试用它跑本地 `/bin/sh`。
+#[cfg(test)]
+fn run_local_within(command: &str, timeout: Duration) -> Result<String, String> {
+    let mut builder = std::process::Command::new("/bin/sh");
+    builder.args(["-c", command]);
+    run_guarded(builder, "`/bin/sh -c`", timeout)
+}
+
+/// 起子进程、等 stdout/stderr 收尾线程、按 `timeout` 决断。
+///
+/// **必须真的 kill**：超时后留着的 ssh 会在 ssh 层堆积，下一次重连又多一个
+/// 同样卡住的进程，越积越多。
+fn run_guarded(
+    mut builder: std::process::Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = builder
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start {label}: {e}"))?;
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = String::new();
+        let mut err = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = stderr.read_to_string(&mut err);
+        // 收尾失败意味着主线程已放弃（超时），忽略即可。
+        let _ = tx.send((out, err));
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok((out, err)) => {
+            let status = child.wait().map_err(|e| format!("{label} failed: {e}"))?;
+            // 非零退出必须带上 stderr：只说「失败」，用户无从下手。
+            if !status.success() {
+                return Err(format!("{label} failed ({status}): {}", err.trim()));
+            }
+            Ok(out)
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("{label} timed out after {}s", timeout.as_secs()))
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn scp_to_remote(local: &Path, host: &str, remote: &str) -> Result<(), String> {
@@ -386,6 +479,40 @@ mod tests {
     fn single_quotes_in_paths_are_escaped() {
         let command = unpack_command(&caps(true, true), "/tmp/a.tar.gz", "/home/it's/bin");
         assert!(command.contains(r"/home/it'\''s/bin"), "{command}");
+    }
+
+    /// 判据 25：卡住的远端命令必须超时，而不是让 UI 永远停在「连接中」。
+    ///
+    /// 只测 watchdog 本身：`sleep` 作为「远端命令」交给本地 `/bin/sh`，不经过
+    /// ssh。这样无论本机有没有 sshd、网络是否可达，测的都是同一条路径——超时
+    /// 分支。经 ssh 测会让这条断言在一台没有 sshd 的机器上变成「ssh 立刻失败」，
+    /// 根本没走到被测代码。
+    #[test]
+    fn a_stuck_command_times_out_and_is_killed() {
+        let started = std::time::Instant::now();
+        let result = run_local_within("sleep 30", Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the watchdog did not fire; elapsed {elapsed:?}"
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("0s") || error.contains("300"), "{error}");
+    }
+
+    /// 正常退出的命令要把 stdout 原样交回，且不因为 watchdog 而被误杀。
+    #[test]
+    fn a_fast_command_returns_its_stdout() {
+        let out = run_local_within("printf YI_OK", Duration::from_secs(10)).unwrap();
+        assert_eq!(out, "YI_OK");
+    }
+
+    /// 非零退出必须失败，并把 stderr 带出来——否则用户只看到「失败」两个字。
+    #[test]
+    fn a_failing_command_surfaces_stderr() {
+        let error = run_local_within("echo boom >&2; exit 3", Duration::from_secs(10)).unwrap_err();
+        assert!(error.contains("boom"), "{error}");
     }
 
     /// 真实 gzip 往返：`needs_local_extract` 的降级必须真的解出可执行文件。

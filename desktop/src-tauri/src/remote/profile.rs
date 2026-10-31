@@ -68,6 +68,87 @@ pub struct RemoteProfile {
 ///
 /// 不用正则库：这是全项目唯一一处需要匹配的字符集，手写一遍比引入依赖便宜，
 /// 且失败信息能直接指出是哪个字符不合法。
+/// 由（远端 home, profile id）派生 `instance_root`（spec §4.9）。
+///
+/// `<远端 home>/.yi-agent-projects/<id>/.yi-agent`。
+///
+/// **为什么不问用户**：这个值决定远端项目的状态目录，写错一个字符就是「两个
+/// 项目静默共用状态」——而两边 UI 都正常，只有对话内容会串。派生它只需要一个
+/// 输入（远端 `$HOME`），把它变成用户填空题只会增加出错面。
+///
+/// **为什么不能从 `remote_path` 反推**：项目可能放在 `/srv/...`，与 home 毫无
+/// 关系；反推会得到一个看似合理、实则无人使用的路径。
+///
+/// 远端 home 为空时**必须失败**：退化成相对路径会落到 ssh 会话的 cwd 下，
+/// 状态目录于是随项目目录漂移。
+pub fn derive_instance_root(remote_home: &str, profile_id: &str) -> Result<String, String> {
+    let home = remote_home.trim();
+    if home.is_empty() {
+        return Err(
+            "could not determine the remote home; refusing to derive a relative instance root"
+                .to_string(),
+        );
+    }
+    if !home.starts_with('/') {
+        return Err(format!(
+            "the remote home `{home}` is not absolute; refusing to derive an instance root from it"
+        ));
+    }
+    validate_profile_id(profile_id).map_err(|error| error.to_string())?;
+    let home = home.trim_end_matches('/');
+    Ok(format!("{home}/.yi-agent-projects/{profile_id}/.yi-agent"))
+}
+
+#[cfg(test)]
+mod instance_root_tests {
+    use super::derive_instance_root;
+
+    #[test]
+    fn derives_the_documented_shape() {
+        assert_eq!(
+            derive_instance_root("/home/dev", "proj-foo").unwrap(),
+            "/home/dev/.yi-agent-projects/proj-foo/.yi-agent"
+        );
+    }
+
+    /// 每个项目落在自己的目录下：共用一个会让两边状态互相覆盖。
+    #[test]
+    fn each_profile_gets_its_own_root() {
+        let a = derive_instance_root("/home/dev", "proj-a").unwrap();
+        let b = derive_instance_root("/home/dev", "proj-b").unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// 尾斜杠不得产生 `//`——排障时按字符串比对路径会因此对不上。
+    #[test]
+    fn a_trailing_slash_is_not_doubled() {
+        assert_eq!(
+            derive_instance_root("/home/dev/", "p").unwrap(),
+            "/home/dev/.yi-agent-projects/p/.yi-agent"
+        );
+    }
+
+    /// home 探测失败时必须失败，不能退化成相对路径。
+    #[test]
+    fn an_empty_home_is_refused() {
+        let error = derive_instance_root("  ", "p").unwrap_err();
+        assert!(error.contains("home"), "{error}");
+    }
+
+    #[test]
+    fn a_relative_home_is_refused() {
+        let error = derive_instance_root("home/dev", "p").unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
+    }
+
+    /// id 会被拼进目录名，必须走与 `ProfileKey` 同一套校验。
+    #[test]
+    fn an_invalid_id_is_refused() {
+        assert!(derive_instance_root("/home/dev", "Bad/Id").is_err());
+        assert!(derive_instance_root("/home/dev", "../escape").is_err());
+    }
+}
+
 pub fn validate_profile_id(id: &str) -> Result<(), ProfileError> {
     if id.is_empty() || id.len() > 32 {
         return Err(ProfileError::BadId(id.to_string()));
