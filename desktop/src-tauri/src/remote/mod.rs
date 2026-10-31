@@ -7,4 +7,5 @@ pub mod argv;
 pub mod cache;
 pub mod config;
 pub mod fetch;
+pub mod probe;
 pub mod profile;
