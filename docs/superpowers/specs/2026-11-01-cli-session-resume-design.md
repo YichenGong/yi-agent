@@ -254,9 +254,24 @@ driver 收到本轮 `Done` 后构造 `TurnLine::Turn { items, usage, usage_total
 | --- | --- | --- |
 | `UserMessage { text, .. }` | `UserMessage { text }` | 忽略 `attachments`/`images`：TUI 当前无附件渲染 |
 | `AgentMessage { text, .. }` | `AssistantMessage { markdown }` | 走既有 markdown 渲染 |
-| `ToolCall { name, input, status, result, .. }` | `ToolCall { .. }` + 紧随一个 `ToolResult { .. }` | `status == Failed` ⇒ `ToolResult.is_error = true`；`Running`（崩溃残留）⇒ 结果文本写「中断」 |
+| `ToolCall { .. }` | `ToolCall { .. }` + 紧随一个 `ToolResult { .. }` | 见下方状态映射 |
 | `UserInterjection { text, .. }` | `UserMessage { text }` | TUI 无独立气泡样式，与桌面区分是纯展示差异 |
-| `Thinking { .. }` | `Reasoning { text, expanded: false }` | **默认折叠**，与实时流行为一致（`cell.rs:43`） |
+| `Thinking { text, redacted, .. }` | `Reasoning { text, expanded: false }` | **默认折叠**（`cell.rs:43`）；`redacted == true` 时 `text` 为空串，**跳过不生成 cell**，否则会渲染出一条空白折叠块 |
+
+**两处枚举不同名，映射必须显式写出来**（这是最容易实现错的细节）：
+
+- `Item::ToolCall.status` 是 `ToolStatus { Running, Completed, Failed }`（`protocol.rs:876`）
+- `HistoryCell::ToolCall.state` 是 `CallState { Running, Success, Failed }`（`cell.rs:66`）
+
+对应关系：`Completed → Success`，其余同名直传。若直接 `as` 转换或想当然地写 `Completed → Completed`，编译不过；若写成 `Completed → Failed`，所有历史工具调用都会显示成红色失败。
+
+**`result: Option<String>` 的三种取值**：
+
+| 状态 | `result` | `ToolResult` 生成 |
+| --- | --- | --- |
+| `Completed` | `Some(s)` | `is_error = false`，`result_text = s` |
+| `Failed` | `Some(s)` / `None` | `is_error = true`，`None` 时写「(无输出)」 |
+| `Running` | 通常 `None` | `is_error = false`，`result_text = "中断"` —— 崩溃残留的 tool call 永远停在 `Running`，不给个说明会像卡死 |
 
 三条约束：
 
