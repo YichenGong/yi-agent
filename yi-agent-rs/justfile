@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -57,6 +57,11 @@ secret-check:
 # 且 platforms/ 目录与依赖表逐一对应。依赖表脱节会让用户装到旧版平台包。
 npm-version-check:
     bash scripts/test_sync_npm_versions.sh
+
+# iOS 版本号必须跟随 workspace 版本：硬编码的 0.1.0 会让手机 APP 与主线分叉，
+# 而装到手机上的包自报的版本正是用户判断该不该升级的唯一依据。
+ios-version-check:
+    bash ../desktop/scripts/test_ios_version_sync.sh
 
 # 发布 workflow 的环境假设（$HOME 推导 target 目录、rustup update、
 # 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。

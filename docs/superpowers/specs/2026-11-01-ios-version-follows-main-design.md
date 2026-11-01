@@ -26,9 +26,13 @@ harness 实测：本地既有的构建产物
 
 **为什么桌面端没这个问题**：macOS 的 `.app` 走的是构建时注入——
 `desktop/scripts/package-npm-app.sh:53` 用 `jq` 把 Cargo 版本写进
-`tauri.conf.json`，个人用的 `scripts/rebuild.sh:306` 用 `--config` 注入（该脚本未纳入 git，
-故不作为可依赖的链路），`.github/workflows/release.yml:160` 还会校验产物
+`tauri.conf.json`，`scripts/rebuild.sh` 用 `--config` 注入，
+`.github/workflows/release.yml:160` 还会校验产物
 `CFBundleShortVersionString == workspace version`。
+
+`scripts/rebuild.sh` 此前被 `.git/info/exclude` 的 `/scripts/` 规则挡在仓库外，
+只存在于本机；本次已把它纳入版本控制（`chore(scripts)` 提交），因此它现在是一条
+可依赖的链路，dev 桌面构建也跟 workspace 版本走。
 
 **为什么 iOS 漏了**：这条链两头都空。
 
@@ -122,13 +126,17 @@ desktop/scripts/sync-ios-version.sh --check      # 只比对；一致 exit 0，�
 
 - `SCRIPT_DIR` 按自身路径解析（`cd "$(dirname "$0")" && pwd`），再上溯两级定位仓库根；
   从任何 cwd 调用都成立。
-- `project.yml` 的正则容错带引号/不带引号两种形态（`CFBundleShortVersionString: "0.1.0"` 与
-  `CFBundleShortVersionString: 0.1.0`），统一产出不带引号形态（与现有文件一致）。
-- `Info.plist` 用 `PlistBuddy -c "Set :CFBundleShortVersionString <v>"` 而非文本替换：
-  它是 XML，正则替换容易在多行 `<key>`/`<string>` 之间打滑；PlistBuddy 还顺带保证产物仍是
-  合法 plist。`CFBundleVersion` 用 `Set` 会在键缺失时失败，因此脚本先 `Print` 探测，
-  缺失则 `Add :CFBundleVersion string <v>`。
-- 全程只改目标键，其余字节不动（幂等：连跑两次，`git diff` 第二次为空）。
+- `project.yml` 的正则**保留原有引号风格**而不是统一成一种：本文件里
+  `CFBundleShortVersionString` 不带引号、`CFBundleVersion` 带引号，把两者统一会多出
+  一行与版本无关的 diff（实测过一次，被只改版本行的约束挡回来）。
+- `Info.plist` **不能用 `PlistBuddy Set`**：实测它重写整个文件——键顺序变了
+  （`CFBundleDisplayName`、`NSCameraUsageDescription` 被挪位）、文件末尾多出换行。
+  值虽然对，但 diff 从 2 行涨到 14 行，review 时看不出真正改了什么。改用 awk 维护
+  「上一行是哪把 key」的状态，只替换目标 `<key>` 之后第一个 `<string>`；写后再用
+  `plutil -lint` 确认产物仍是合法 plist。
+- 末尾换行特征要原样保留：这份 `Info.plist` 本来没有末尾换行，awk 会补一个，
+  于是凭空多一条 `\ No newline at end of file`。
+- 全程只改目标键，其余字节不动（幂等：连跑两次，`git diff` 第二次为空——已实测）。
 
 ### 3.3 构建链接入
 
@@ -191,17 +199,21 @@ ios-version-check:
 
 | 层 | 命令 | 期望 |
 | --- | --- | --- |
-| 注入脚本自测 + 快照 | `bash desktop/scripts/test_ios_version_sync.sh` | 全绿（A 组 8 例 + B 组 1 例） |
+| 注入脚本自测 + 快照 | `bash desktop/scripts/test_ios_version_sync.sh` | 全绿（25 项：A 组注入行为 + B 组仓库快照） |
 | CI 入口 | `cd yi-agent-rs && just ci` | 12 → 13 道门禁全绿 |
-| 前端未受影响 | `cd desktop && npx vitest run src/iosDisplayName.test.ts && npx tsc --noEmit` | 绿 |
+| 前端静态门禁 | `cd desktop && npx vitest run src/iosDisplayName.test.ts && npx tsc --noEmit` | 6 例绿（2 例显示名 + 4 例版本跟随） |
+| 前端整体未受影响 | `cd desktop && npx vitest run` | 1828 例全绿（原 1824 + 新增 4） |
 | 真实产物（可离线复核） | 构建后 `bash desktop/scripts/sync-ios-version.sh --check` | 仍 exit 0（证明 `tauri ios build` 没有回写版本） |
 
-**变异验证**（每条都必须让它变红，否则门禁是假的）：
+**变异验证**（已逐条实跑，每条都确实变红，否则门禁是假的）：
 
-1. 把 `sync-ios-version.sh --check` 的漂移分支改成 `exit 0` → 仓库快照断言红；
-2. 把 `project.yml` 的写入删掉 → fixture 第 1 例红；
-3. 把 `CFBundleVersion` 的 `Add` 分支删掉 → fixture 第 4 例红；
-4. 把版本格式校验改成放行 → fixture 第 7 例红。
+| 变异 | 结果 |
+| --- | --- |
+| `--check` 的漂移分支改成 `exit 0` | 自测例 5 红 |
+| 删掉 `project.yml` 写入 | 自测例 1b/1c 红（回读校验另把它压成 exit 2） |
+| 删掉 `Info.plist` 写入 | 自测例 1d/1e 红（同上 exit 2） |
+| 放行非法版本（去掉 `X.Y.Z` 校验） | 自测例 6 红 ×3 |
+| 把 `Info.plist` 里的版本改回 `0.1.0` | 前端门禁 `iosDisplayName.test.ts` 的版本断言红 |
 
 **真机构建无法本次验收**：`xcrun devicectl list devices` 当前回
 `Yichen iPhone ... unavailable`，装包与「设置里显示的版本号」需要设备在线。
@@ -215,9 +227,17 @@ ios-version-check:
 - **仓库快照断言的取舍**：B 组门禁要求「提交进去的值 == 主线版本」，因此 `just bump` 必须同步
   iOS 三处。这是刻意的：代价是三行手改（或跑一次脚本），换来的是「看 git 就知道手机 APP
   是哪个版本」。若将来嫌麻烦，可把同步塞进 bump 的收尾脚本，门禁不必动。
-- **`tauri ios init` 会重生成工程**：脚本写 `project.yml` 就是为了让 init 后仍是正确值；
-  但若有人手改 `desktop.xcodeproj/project.pbxproj` 里的版本内联值，init 会把它抹回
-  `project.yml` 的值——这正是我们要的行为。
+- **`tauri ios init` 不读 `--config` 的版本，且会抹掉 `Info.plist` 的手工合并**
+  （本次实测，两条都要记）：在主仓库上跑
+  `tauri ios init -c '{"version":"9.9.9"}'`，`project.yml` 一行未变——即 `-c` 的版本
+  对 init 无效，版本只能靠「先写 `project.yml`，再 init」。同一次 init 还把
+  `Info.plist` 里两条手工合并的键抹掉了：`CFBundleDisplayName`（`Yi-Agent`）被挪位
+  （值还在，因它本就在 `project.yml` 里），而 **`NSCameraUsageDescription` 整条消失**
+  ——它只由 `src-tauri/Info.ios.plist` 在构建期合并进来，init 重生成 `Info.plist`
+  时并不看那个文件。结论：**跑完 `tauri ios init` 必须重跑一次本脚本**（版本回 0.1.0
+  会被 `--check` 抓住），相机权限则在 `tauri ios build` 时由 Tauri 重新合并。
+  实测后已把主仓库这两处改动还原，未提交。
+  为降低踩坑成本，`ios:build` 里先跑本脚本再调 `tauri ios build`，顺序天然正确。
 - **`CFBundleVersion` 与 `CFBundleShortVersionString` 取同一值**：App Store 要求
   `CFBundleVersion` 单调递增，若将来同版本要多次上传，需要引入 build number
   （`tauri ios build --build-number`）。当前走 development 签名侧载，不受此约束，故不预先设计。
