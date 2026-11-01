@@ -199,6 +199,18 @@ impl TuiSessionStore {
         Ok((seed, last_input))
     }
 
+    /// 回放用：返回落盘的 items 与是否有崩溃残留的轮次。
+    ///
+    /// 与 `load_seed` 分开：种子要的是可发给 provider 的转录，回放要的是
+    /// 用户可见的条目，两者不是同一份数据。
+    pub fn load_for_replay(
+        &self,
+    ) -> std::io::Result<yi_agent_app_server::thread_store::LoadedThread> {
+        self.store
+            .load(&self.thread_id)?
+            .ok_or_else(|| std::io::Error::other("thread disappeared"))
+    }
+
     /// 把崩溃残留的 checkpoint 升格进主日志。
     ///
     /// resume 必须做：采纳的 partial 是那一轮唯一的持久副本，不 append 就返回，
@@ -470,6 +482,31 @@ mod tests {
             seed.len()
         );
         assert_eq!(seed[2].role, Role::User);
+    }
+
+    #[test]
+    fn load_for_replay_returns_items_and_pending_flag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        store
+            .append_turn(
+                &[Item::UserMessage {
+                    id: "u1".into(),
+                    text: "回放我".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let loaded = store.load_for_replay().unwrap();
+        assert_eq!(loaded.items.len(), 1, "回放要的是 items，不是 messages");
+        assert!(!loaded.pending_turn);
+        // 与 load_seed 互不干扰：种子侧照样能读到同一份 messages。
+        assert!(store.load_seed().is_ok());
     }
 
     #[test]

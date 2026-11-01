@@ -2337,15 +2337,38 @@ fn run_tui_agent(
         // 会话存储：resume/fork 用调用方已打开的那份（它已持锁），
         // 否则现建一个新会话。建失败不阻断 TUI——只是这次会话不落盘，
         // 用户仍能对话。
-        let (initial_messages, initial_last_input, startup_prompt, seeded_store) = match seed {
-            Some(seed) => (
-                seed.messages,
-                seed.last_input_tokens,
-                seed.prompt,
-                Some(Arc::new(seed.store)),
-            ),
-            None => (Vec::new(), None, None, None),
-        };
+        let (initial_messages, initial_last_input, startup_prompt, seeded_store, replay_cells) =
+            match seed {
+                Some(seed) => {
+                    // 回放要用落盘的 items，不是种进 session 的 messages：
+                    // 前者是用户可见的条目，后者是发给 provider 的转录。
+                    let cells = seed
+                        .store
+                        .load_for_replay()
+                        .map(|loaded| {
+                            let mut cells = crate::tui::replay::items_to_cells(&loaded.items);
+                            if loaded.pending_turn {
+                                cells.push(crate::tui::cell::HistoryCell::Separator {
+                                    label: Some("上一轮已中断".into()),
+                                });
+                            }
+                            cells
+                        })
+                        .unwrap_or_else(|e| {
+                            // 回放失败不阻断：上下文仍是对的，只是屏幕空着。
+                            eprintln!("[yi-agent] 历史回放失败（对话可继续）: {e}");
+                            Vec::new()
+                        });
+                    (
+                        seed.messages,
+                        seed.last_input_tokens,
+                        seed.prompt,
+                        Some(Arc::new(seed.store)),
+                        cells,
+                    )
+                }
+                None => (Vec::new(), None, None, None, Vec::new()),
+            };
         let session_store: Option<Arc<crate::session_store::TuiSessionStore>> =
             match seeded_store {
                 Some(store) => Some(store),
@@ -3016,6 +3039,7 @@ fn run_tui_agent(
                 // 读一次模型清单供 TUI 的 `/model` 显示（机器级全局文件）；
                 // 无文件即空清单，行为与今天一致。
                 yi_agent_runtime::models::load_catalog(),
+                replay_cells,
             )
         });
 
