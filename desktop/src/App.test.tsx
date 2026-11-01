@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
 
 type Mode = "normal" | "yolo";
 type ThreadSeed = {
@@ -140,6 +141,8 @@ vi.mock("./lib/rpc", () => ({
     // Callbacks this instance registered, so `dispose` can remove exactly them —
     // mirroring the real client tearing down its transport subscription.
     private registered: Array<{ list: unknown[]; cb: unknown }> = [];
+    /** 在途请求的 reject，`dispose` 时统一失败（对齐真实客户端的契约）。 */
+    private pending: Array<(e: unknown) => void> = [];
     constructor(
       _transport?: unknown,
       recover?: (raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>,
@@ -170,6 +173,12 @@ vi.mock("./lib/rpc", () => ({
         if (i >= 0) list.splice(i, 1);
       }
       this.registered.length = 0;
+      // 与真实 `RpcClient.dispose` 同一契约：在途请求全部失败，调用方不会
+      // 永远等一个已经被换掉的连接。抛的是结构化连接错误（`formatError`
+      // 会把它翻成人话），这正是「手机端不该看到 rpc client disposed」的现场。
+      for (const reject of this.pending.splice(0)) {
+        reject(new ConnectionError("disconnected", "rpc client disposed"));
+      }
     }
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
@@ -177,8 +186,20 @@ vi.mock("./lib/rpc", () => ({
       if (forced !== undefined) throw { code: forced, message: `forced ${forced}` };
       // Per-test override hook — see `state.dataSources`. Its return value is
       // awaited by callers, so returning a pending promise defers the response.
+      // 若它永不 resolve，这条请求就算「在途」，`dispose` 时必须把它拒掉
+      // （与真实客户端一致），否则调用方会永远挂在一个已废弃的连接上。
       const dataSource = state.dataSources[method];
-      if (dataSource) return dataSource(params);
+      if (dataSource) {
+        const result = dataSource(params);
+        if (result instanceof Promise) {
+          // 登记 reject，好让 `dispose` 能像真实客户端那样把它拒掉。
+          return new Promise((resolve, reject) => {
+            this.pending.push(reject);
+            result.then(resolve, reject);
+          });
+        }
+        return result;
+      }
       if (method === "thread/listAll") {
         this.listCalls += 1;
         if (state.failList) throw { code: -1, message: "list failed" };
@@ -601,8 +622,9 @@ describe("App YOLO wiring", () => {
     state.failList = true;
     render(<App />);
 
-    // The mount path throws and surfaces an error status.
-    await waitFor(() => expect(screen.getByText(/error:/i)).toBeTruthy());
+    // The mount path throws and surfaces a failure status. 底栏显示的是中文说法
+    // （原始 `error: …` 只在 `title` 里），所以这里断言那一句。
+    await waitFor(() => expect(screen.getByText("连接失败，正在重试…")).toBeTruthy());
 
     const chip = modeTrigger() as HTMLButtonElement;
     expect(chip.disabled).toBe(true);
@@ -2059,13 +2081,15 @@ describe("App Superpowers 看板 enqueue", () => {
   });
 
   it("surfaces a rejected enqueue instead of crashing", async () => {
-    state.rpcError["enqueue"] = { code: -32000, message: "forced -32000" };
+    // 用一个中性的服务端错误码：-32000 是中继「没有电脑」的专用码，会被翻成
+    // 那句可操作的提示，本用例要验的是「任意失败都露出来」而非那条分支。
+    state.rpcError["enqueue"] = { code: -32603, message: "forced -32603" };
     await openBoard();
 
     state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
     clickEnqueue();
 
-    await waitFor(() => expect(screen.getByText(/forced -32000/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/forced -32603/)).toBeTruthy());
     // Still usable after the failure: 菜单没关，菜单项也没被禁用。
     expect(
       (screen.getByRole("menuitem", { name: "加入看板" }) as HTMLButtonElement).disabled,
@@ -2770,7 +2794,7 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(2);
     await flush();
     expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true);
-    expect(screen.getByText("connected")).toBeTruthy();
+    expect(screen.getByText("已连接")).toBeTruthy();
 
     // 成功之后的这一次断开,必须从 base(而不是被抬高过的档位)重新起算。
     exit();
@@ -2782,6 +2806,57 @@ describe("App reconnect resilience", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(clients.length).toBe(3);
+  });
+
+  it("shows a disconnect in plain Chinese and drops it once reconnected", async () => {
+    // 用户在这一场景里什么都不用做：退避重连是自动的。所以红条既要说清「发生了
+    // 什么」，也不能在已经连回来之后还挂着——那会让人以为问题还在。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 发一条消息，但服务端不回：这条请求正挂在线上时连接被换掉（dispose）。
+    state.dataSources["turn/start"] = () => new Promise(() => {});
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await flush();
+
+    exit();
+    await flush();
+    // 在途请求被旧客户端拒绝：这句是 `rpc client disposed` 的翻译。
+    // 假定时器下 `waitFor` 不推进时间，故 flush 后直接断言。
+    expect(screen.getByText(CONNECTION_DISCONNECTED_TEXT)).toBeTruthy();
+    // 原始英文一个都不该露面。
+    expect(screen.queryByText(/rpc client disposed/)).toBeNull();
+
+    // 重连并握手成功后，这条提示自动收起。
+    state.dataSources = {};
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(screen.queryByText(CONNECTION_DISCONNECTED_TEXT)).toBeNull();
+  });
+
+  it("keeps a business error when the connection comes back", async () => {
+    // 服务端的拒绝与连接无关：网通了也不该顺手把它抹掉。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    state.rejectCode["turn/start"] = -32602;
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await flush();
+    expect(screen.getByText(/forced -32602/)).toBeTruthy();
+
+    exit();
+    state.rejectCode = {};
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    // 握手成功（底栏回到「已连接」），但那条业务错误仍在。
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(screen.getByText(/forced -32602/)).toBeTruthy();
   });
 
   it("re-resumes a thread after a crash even though its status was live-running", async () => {
@@ -2843,7 +2918,7 @@ describe("App reconnect resilience", () => {
     await waitMounted();
     // 首连接握手成功:`connected` 已是 true(状态栏也这么说)。
     expect(clients.length).toBe(1);
-    expect(screen.getByText("connected")).toBeTruthy();
+    expect(screen.getByText("已连接")).toBeTruthy();
 
     // iOS 场景:切后台期间 socket 被系统静默掐断,却没有 close/exited 事件,
     // 于是 `connected` 一直停在 true。回到前台时不能信这个陈旧标志,必须重建

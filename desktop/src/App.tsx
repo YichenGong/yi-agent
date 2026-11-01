@@ -39,6 +39,7 @@ import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
+import { ConnectionError, clearConnectionErrorFrom } from "./lib/connectionError";
 import { formatError } from "./lib/errorMessage";
 import {
   ATTACHMENT_EXTENSIONS,
@@ -473,7 +474,7 @@ export default function App() {
   const pluginCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -487,7 +488,7 @@ export default function App() {
   const modelCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -501,7 +502,7 @@ export default function App() {
   const skillsCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -515,7 +516,7 @@ export default function App() {
   const mcpCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -529,7 +530,7 @@ export default function App() {
   const websearchCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -542,7 +543,7 @@ export default function App() {
   const runtimeSettingsCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -563,7 +564,7 @@ export default function App() {
   const flagsCall = useCallback(
     (method: string, params?: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       const pending = c.request(method, params ?? {});
       if (method !== "flags/set") return pending;
       return pending.then(async (result) => {
@@ -589,7 +590,7 @@ export default function App() {
   const imageCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -1822,6 +1823,14 @@ export default function App() {
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
         setStatus("connected");
+        // 上一条「连接已断开」现在过期了：自动重连常常几秒就成功，留着那条红条
+        // 会让人以为问题还在、还在等。只收连接类文案——服务端拒绝、参数错误那类
+        // 与连接无关，仍要让人看见。
+        let cleared = false;
+        for (const id of store.ids()) {
+          if (clearConnectionErrorFrom(store.view(id).session)) cleared = true;
+        }
+        if (cleared) force((v) => v + 1);
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
         prefs.repairDismissedRef.current = false;

@@ -1,3 +1,4 @@
+import { ConnectionError } from "./lib/connectionError";
 import type { ApprovalRequest } from "./lib/protocol";
 import type { Transport } from "./lib/rpc";
 
@@ -61,7 +62,9 @@ export function wsTransport(
 
   const ready = (): Promise<void> => {
     if (closed) {
-      return Promise.reject(new Error(`websocket closed (${closeCode ?? "unknown"})`));
+      return Promise.reject(
+        new ConnectionError("disconnected", `websocket closed (${closeCode ?? "unknown"})`),
+      );
     }
     if (opened) return Promise.resolve();
     return new Promise<void>((resolve, reject) => waiters.push({ resolve, reject }));
@@ -96,7 +99,9 @@ export function wsTransport(
   socket.onclose = (e) => {
     closed = true;
     closeCode = e.code ?? null;
-    settle((w) => w.reject(new Error(`websocket closed (${closeCode ?? "unknown"})`)));
+    settle((w) =>
+      w.reject(new ConnectionError("disconnected", `websocket closed (${closeCode ?? "unknown"})`)),
+    );
     // A close we initiated (dispose on reconnect) is not a server-side exit.
     if (disposed) return;
     for (const h of statusHandlers) h({ state: "exited", code: closeCode });
