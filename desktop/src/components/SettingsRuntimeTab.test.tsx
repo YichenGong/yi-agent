@@ -75,6 +75,21 @@ describe("SettingsRuntimeTab", () => {
   });
 });
 
+  it("renders an RpcError object as its message, not [object Object]", async () => {
+    // RPC 失败时 reject 的是 `{code, message, data?}` 对象（lib/rpc.ts 的
+    // `pending.reject(msg.error)`）。`String(obj)` 得 "[object Object]"。
+    const call = vi.fn(async (method: string) => {
+      if (method === "settings/read") return { fields: [field({ value: 500 })] };
+      throw { code: -32602, message: "invalid setting agent.max_turns: must be at least 1" };
+    });
+    render(<SettingsRuntimeTab call={call} />);
+    const input = await screen.findByLabelText("最大轮次");
+    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    expect(await screen.findByText(/must be at least 1/)).toBeTruthy();
+    expect(screen.queryByText(/\[object Object\]/)).toBeNull();
+  });
+
 describe("runtime settings labels", () => {
   it("names every backend group in Chinese", () => {
     // 与 yi-agent-runtime/src/settings.rs 的 FIELDS 分组一一对应。漏一个就会在页面上

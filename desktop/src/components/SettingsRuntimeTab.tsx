@@ -5,6 +5,7 @@ import {
   type RuntimeField,
   type RuntimeSettingsCall,
 } from "../lib/runtimeSettings";
+import { formatError } from "../lib/errorMessage";
 
 export const GROUP_LABELS: Record<string, string> = {
   agent: "Agent",
@@ -78,7 +79,7 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
       }
       setDrafts(next);
     } catch (error) {
-      setNotice({ ok: false, text: String(error) });
+      setNotice({ ok: false, text: formatError(error) });
     } finally {
       setLoading(false);
     }
@@ -109,7 +110,9 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
       setNotice({ ok: true, text: "已保存" });
     } catch (error) {
       // 服务端把 `invalid_setting` 的原因放在 message 里，直接内联显示。
-      setNotice({ ok: false, text: String(error) });
+      // 必须先过 formatError：RPC 失败给的是 `{code, message}` 对象，
+      // 直接 String() 会渲染成 "[object Object]"。
+      setNotice({ ok: false, text: formatError(error) });
     } finally {
       setSaving(false);
     }
