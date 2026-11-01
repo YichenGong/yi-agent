@@ -1,0 +1,13 @@
+# cargo-mutants 把源码树复制到 target/mutants/<name>/ 时不带仓库根的 .git，
+# 因此任何依赖 git 仓库的测试在复制树里必定失败。
+#
+# 具体症状（实测）：sandbox_readonly.rs 的 read_only_sandbox_can_run_git
+# 在 crate 目录里跑 `git log`，复制树里没有 .git →
+#   fatal: not a git repository ... exit=Some(128)
+# 基线失败会让整轮变异测试中止（exit 4），必须在测试层排除。
+#
+# 注意这里的 "--" 不能省：cargo-mutants 把 additional_cargo_test_args 直接
+# 拼进 `cargo test ... <args>`，而 `--skip` 是 **测试二进制**的参数，
+# 必须排在 cargo 的 `--` 之后。写成 ["--skip", "..."]（Plan 原稿的写法）
+# 会让 cargo 报 `unexpected argument '--skip' found`，基线同样失败（实测）。
+additional_cargo_test_args = ["--", "--skip", "read_only_sandbox_can_run_git"]

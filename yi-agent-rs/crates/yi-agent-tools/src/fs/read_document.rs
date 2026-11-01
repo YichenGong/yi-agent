@@ -471,10 +471,31 @@ mod tests {
         ReadDocumentTool::new(Arc::new(ToolsContext::new(tmp.path().to_path_buf())))
     }
 
+    /// fixture 目录：优先用 `YI_FIXTURE_DIR` 覆盖，否则回退到仓库内的默认位置。
+    ///
+    /// 环境变量是为 `cargo-mutants` 准备的：它只把 crate 树复制到
+    /// `target/mutants/<name>/` 再编译，而默认路径里的 `../../../docs` 会穿出
+    /// crate 目录，在复制树里必定 NotFound。变异测试时注入绝对路径即可。
+    /// 文档样例目录。
+    ///
+    /// 默认是仓库内路径。`cargo-mutants` 会把源码树复制到
+    /// `target/mutants/<name>/` 且不带仓库根的 `docs/`，那里默认路径不存在，
+    /// 因此允许 `YI_FIXTURE_DIR` 覆盖（`just mutants` 传入绝对路径）。
+    ///
+    /// 覆盖值指向不存在的目录时**回退到默认路径**而不是直接用它：
+    /// 复制树里某个测试设置了但在别的 crate 目录下解析出的相对路径可能失效，
+    /// 静默变成「7 个测试因找不到样例而失败」比回退更难排查（实测过）。
+    fn fixture_dir() -> std::path::PathBuf {
+        let default = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docs/research/fixtures/2026-10-07-document-samples");
+        match std::env::var_os("YI_FIXTURE_DIR") {
+            Some(dir) if std::path::Path::new(&dir).is_dir() => std::path::PathBuf::from(dir),
+            _ => default,
+        }
+    }
+
     fn fixture(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../docs/research/fixtures/2026-10-07-document-samples")
-            .join(name)
+        fixture_dir().join(name)
     }
 
     #[test]

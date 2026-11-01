@@ -1,1 +1,1 @@
-TIMEOUT  crates/yi-agent-core/src/permission.rs:133:22: replace == with != in PermissionChecker::check in 67s build + 60s test
+TIMEOUT  crates/yi-agent-core/src/permission.rs:133:22: replace == with != in PermissionChecker::check

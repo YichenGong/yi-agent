@@ -1,0 +1,3 @@
+MISSED   crates/yi-agent-tools/src/fs/path_util.rs:47:43: replace match guard !parent.as_os_str().is_empty() with true in lexical_contained_in_any
+MISSED   crates/yi-agent-tools/src/fs/path_util.rs:79:25: replace match guard !parent.as_os_str().is_empty() with true in resolve_and_check_roots
+MISSED   crates/yi-agent-tools/src/fs/path_util.rs:163:12: delete ! in resolve_for_write_roots

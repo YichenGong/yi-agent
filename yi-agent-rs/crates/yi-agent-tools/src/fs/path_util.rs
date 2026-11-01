@@ -456,4 +456,37 @@ mod tests {
         let result = resolve_for_write_roots(&[], "file.txt");
         assert!(result.is_err());
     }
+    // ---- 新增：根路径与非常规父路径的边界 ----
+    #[test]
+    fn resolve_rejects_the_filesystem_root() {
+        let tmp = TempDir::new().unwrap();
+        // `Path::new("/").parent()` 是 None，走的是「根路径绕行」分支；
+        // 该分支必须仍然断言包含关系，否则 `/` 会被当成合法结果返回。
+        let result = resolve_and_check(tmp.path(), "/");
+        assert!(
+            matches!(result, Err(ToolsError::PathEscapesRoot(_))),
+            "根路径必须被拒，实际：{result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_propagates_permission_denied_instead_of_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(a.join("b")).unwrap();
+        // canonicalize 会因 EACCES 失败，但这不是「路径不存在」——
+        // 若把任何错误都当成 NotFound，会把权限问题伪装成「文件没找到」，
+        // 用户的排障方向就完全错了。
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = resolve_and_check(tmp.path(), "a/b/child.txt");
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        match result {
+            Err(ToolsError::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            }
+            other => panic!("期望 Io(PermissionDenied)，实际：{other:?}"),
+        }
+    }
 }
