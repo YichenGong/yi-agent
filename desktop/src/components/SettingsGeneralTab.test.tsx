@@ -68,3 +68,58 @@ describe("SettingsGeneralTab", () => {
     expect(screen.getByRole("alert").textContent).toBe("未能在登录项中安装值守");
   });
 });
+
+/**
+ * 字号档位：与主题同构的一组按钮，但**受平台影响**——配对手机默认小一档。
+ *
+ * 组件本身不探测平台（`<html data-mobile>` 只能有一个设置者），只渲染宿主给的
+ * 当前档并把选择报回去。哪个默认、写到哪个键，全在 `useSettingsState`。
+ */
+describe("SettingsGeneralTab font size", () => {
+  const base = {
+    theme: "dark" as const,
+    onThemeChange: () => {},
+  };
+
+  it("renders the three tiers and marks the current one", () => {
+    render(
+      <SettingsGeneralTab {...base} fontScale="small" onFontScaleChange={() => {}} />,
+    );
+    const small = screen.getByRole("button", { name: "小" });
+    expect(small.getAttribute("aria-pressed")).toBe("true");
+    expect(
+      screen.getByRole("button", { name: "标准" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(
+      screen.getByRole("button", { name: "大" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
+  it("reports the chosen tier", () => {
+    const onFontScaleChange = vi.fn();
+    render(
+      <SettingsGeneralTab
+        {...base}
+        fontScale="standard"
+        onFontScaleChange={onFontScaleChange}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "大" }));
+    expect(onFontScaleChange).toHaveBeenCalledWith("large");
+  });
+
+  it("says the choice only affects this device", () => {
+    // 档位按平台各存一份，用户在桌面上选了「大」不会改变手机上的观感。
+    // 不写清楚会让用户以为这是全局设置。
+    render(
+      <SettingsGeneralTab {...base} fontScale="standard" onFontScaleChange={() => {}} />,
+    );
+    expect(screen.getByText(/只影响这台设备/)).toBeTruthy();
+  });
+
+  it("hides the font section when the host does not offer it", () => {
+    // 只读 / 老宿主没有这个接缝：不渲染一个拨不动的控件，与值守同一判据。
+    render(<SettingsGeneralTab {...base} />);
+    expect(screen.queryByRole("button", { name: "大" })).toBeNull();
+  });
+});

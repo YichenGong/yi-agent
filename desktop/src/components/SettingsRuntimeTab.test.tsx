@@ -216,3 +216,56 @@ describe("runtime settings labels", () => {
     expect(labelFor("power.prevent_idle_sleep", "false")).toBe("关");
   });
 });
+
+/**
+ * 按平台收窄：手机端不显示「终端通知」组。
+ *
+ * 这一组的键（`tui.notifications` / `tui.notification_method` /
+ * `tui.terminal_title` / `tui.notification_condition`）整的是**桌面主机的命令行
+ * 界面**：配对手机改它，改的是另一台机器上 TUI 的行为，而手机自己永远看不到
+ * 那些提示。这正是「页面只显示它需要的参数」。
+ */
+describe("SettingsRuntimeTab platform scoping", () => {
+  const tuiFields = [
+    field({ key: "agent.max_turns" }),
+    field({
+      key: "tui.notifications",
+      group: "tui",
+      label: "通知方式",
+      type: "select",
+      options: ["true", "false"],
+    }),
+  ];
+
+  it("hides the desktop-only tui group on the phone", async () => {
+    render(<SettingsRuntimeTab call={callWith(tuiFields)} isMobile />);
+    expect(await screen.findByText("最大轮次")).toBeTruthy();
+    // 组名与字段名都叫「终端通知」，故用组标题的 role 定位，避免歧义。
+    expect(screen.queryByRole("heading", { name: "终端通知" })).toBeNull();
+    expect(screen.queryByText("通知方式")).toBeNull();
+  });
+
+  it("keeps the tui group on the desktop", async () => {
+    render(<SettingsRuntimeTab call={callWith(tuiFields)} />);
+    expect(
+      await screen.findByRole("heading", { name: "终端通知" }),
+    ).toBeTruthy();
+  });
+
+  it("still round-trips every field in the draft, including hidden ones", async () => {
+    // 隐藏只是不渲染：`buildPatch` 与草稿仍按**全量**字段建，否则手机端保存
+    // 一次就会把桌面端的 tui 值当成「未改动」而从 patch 里漏掉——那不会写坏
+    // 数据（patch 只含有改动项），但会让下方「改了 N 项」的计数与撤销失真。
+    const call = callWith(tuiFields);
+    render(<SettingsRuntimeTab call={call} isMobile />);
+    // 输入框的值来自草稿（未设置时为空串），故按 `<label for>` 定位。
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith("settings/write", {
+        patch: { "agent.max_turns": "100" },
+      }),
+    );
+  });
+});

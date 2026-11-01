@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { isRemoteClient } from "../lib/platform";
 import { applyTheme, readCachedTheme, type Theme } from "../lib/theme";
+import {
+  applyFontScale,
+  defaultFontScale,
+  readCachedFontScale,
+  type FontScale,
+} from "../lib/fontScale";
 import { formatError } from "../lib/errorMessage";
 import type { RpcClient } from "../lib/rpc";
 
@@ -35,6 +41,7 @@ export function useSettingsState({
   rpc,
   force,
   setCurrentError,
+  isMobile,
 }: {
   /** 取当前的 RPC 客户端；未连接即 null（`changeTheme` 据此把写入整段跳过）。 */
   rpc: () => RpcClient | null;
@@ -42,6 +49,12 @@ export function useSettingsState({
   force: (updater: (v: number) => number) => void;
   /** 往当前会话的 session 上写一条错误（主题写失败的那条红字）。 */
   setCurrentError: (msg: string) => void;
+  /**
+   * 是否手机端（配对后的 iPhone 客户端）。**唯一用途**是决定字号偏好的归属：
+   * 两个平台各占 `preferences.json` 里的一个键，默认档也不同（手机 small、
+   * 桌面 standard）。由 App 传下已有的 `useIsMobile()` 结论，本 hook 不重复探测。
+   */
+  isMobile?: boolean;
 }) {
   // 首启引导：`needed && !dismissed` 时用向导盖住主界面。读失败一律按「不需要」
   // 处理，绝不因为一个读失败挡住主界面（见 handshake）。
@@ -90,6 +103,29 @@ export function useSettingsState({
   // 陈旧闭包值——否则并发写会退回到中间态（见 changeTheme）。
   const confirmedThemeRef = useRef<Theme>(readCachedTheme() ?? "dark");
 
+  // 字号档位：与主题同构（乐观更新 + 写失败回退），但**按平台分键**。
+  // 初值先看首屏缓存，没有才用本平台默认——这样手机首帧就是小档，不会先按
+  // 桌面的标准档渲染一帧再跳变。
+  const [fontScale, setFontScale] = useState<FontScale>(
+    () => readCachedFontScale() ?? defaultFontScale(isMobile ?? false),
+  );
+  // 用户是否已改过档位。首屏 `ui/settings/read` 在途期间若已被触碰，迟到的旧值
+  // 不得覆盖它（与 `themeTouchedRef` 同一理由与同一做法）。
+  const fontScaleTouchedRef = useRef(false);
+  // 服务端已确认的档位，即「写入失败可以回退到」的基线。用 ref 而非 state：
+  // 失败回调读到的是最新基线，而不是某次调用时刻的陈旧闭包值。
+  const confirmedFontScaleRef = useRef<FontScale>(
+    readCachedFontScale() ?? defaultFontScale(isMobile ?? false),
+  );
+
+  /**
+   * 按平台取 `preferences.json` 里的键名。
+   *
+   * 两个键共处一个文件（配对手机经 ws 写的是桌面主机那份），写错键就会一端
+   * 改字号、另一端观感跟着变。
+   */
+  const fontScaleKey = isMobile ? "font_scale_ios" : "font_scale_desktop";
+
   /**
    * 保存侧车的中继地址（设置页「远程访问」的保存按钮调用）。
    *
@@ -102,6 +138,47 @@ export function useSettingsState({
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("set_relay_url", { url: value });
     setRelayUrl(value ?? "");
+  };
+
+  /**
+   * 改字号：立即生效并落盘，失败回退到最近一次已确认的档位。
+   *
+   * 与 `changeTheme` 逐字同构——包括「失败必须回退」这条：乐观更新后静默放弃
+   * 会让界面停在一个服务端并不认可的档位上，下次启动又"自己变回去"。
+   */
+  const changeFontScale = (next: FontScale) => {
+    fontScaleTouchedRef.current = true;
+    setFontScale(next);
+    const client = rpc();
+    // 未连接时没有可写的通道：保持乐观值（它是用户此刻的选择），不报错——
+    // 与主题在无客户端时不发请求的语义一致。
+    if (!client) {
+      confirmedFontScaleRef.current = next;
+      return;
+    }
+    client.request("ui/settings/write", { [fontScaleKey]: next }).then(
+      () => {
+        confirmedFontScaleRef.current = next;
+      },
+      (e) => {
+        setFontScale(confirmedFontScaleRef.current);
+        setCurrentError(formatError(e));
+        force((v) => v + 1);
+      },
+    );
+  };
+
+  /**
+   * 采纳服务端读到的档位（首屏 `ui/settings/read`）。
+   *
+   * `null` 表示磁盘上没设（本平台首次运行）：保持当前值，不要用 `undefined`
+   * 之类把它抹成默认——那会让用户刚改的档位在握手后被悄悄重置。
+   */
+  const setFontScaleFromServer = (stored: FontScale | null) => {
+    if (stored === null) return;
+    if (fontScaleTouchedRef.current) return;
+    confirmedFontScaleRef.current = stored;
+    setFontScale(stored);
   };
 
   const changeTheme = (next: Theme) => {
@@ -127,6 +204,10 @@ export function useSettingsState({
     applyTheme(theme);
   }, [theme]);
 
+  useEffect(() => {
+    applyFontScale(fontScale);
+  }, [fontScale]);
+
   return {
     // state：设置/配对 JSX 与生命周期 effect 直接消费。
     onboarding,
@@ -136,6 +217,7 @@ export function useSettingsState({
     settingsOpen,
     relayUrl,
     theme,
+    fontScale,
     // setters：JSX 与生命周期 effect 直接写（跟随推送主题、采纳首屏权威值、
     // 进/出重配、开合设置页、回填中继地址）。
     setOnboarding,
@@ -151,8 +233,12 @@ export function useSettingsState({
     repairDismissedRef,
     themeTouchedRef,
     confirmedThemeRef,
+    fontScaleTouchedRef,
+    confirmedFontScaleRef,
     // actions：JSX 直接消费（设置页的主题切换与中继地址保存）。
     saveRelayUrl,
     changeTheme,
+    changeFontScale,
+    setFontScaleFromServer,
   };
 }

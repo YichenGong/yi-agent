@@ -1416,6 +1416,71 @@ async fn ui_settings_read_and_write_round_trip() {
     h.shutdown().await;
 }
 
+/// 字号：两个平台各一个键，读回时互不干扰。
+///
+/// 这条用例穿过真实的 `ui/settings/read|write`（而不是直接调
+/// `settings_store`）：接线错误——比如写路径只认了桌面键、读路径漏回手机键
+/// ——只在 RPC 层能暴露出来，而它恰恰是「在手机上改字号顺手改掉桌面观感」
+/// 这个 bug 的成因。
+#[tokio::test(flavor = "multi_thread")]
+async fn ui_settings_font_scale_is_scoped_per_platform() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    initialize(&mut h).await;
+
+    // 未设置时两个键都是 null：客户端据此回落到自己平台的默认档
+    // （桌面 standard / 手机 small），而不是拿到一个恰好看着合理的值。
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 2).await;
+    assert!(v["result"]["font_scale_desktop"].is_null(), "got {v}");
+    assert!(v["result"]["font_scale_ios"].is_null(), "got {v}");
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"font_scale_ios":"large"}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 3).await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 4).await;
+    assert_eq!(v["result"]["font_scale_ios"], "large", "got {v}");
+    assert!(
+        v["result"]["font_scale_desktop"].is_null(),
+        "writing the phone key must not touch the desktop one: {v}"
+    );
+}
+
+/// 非法字号必须被拒绝，且不落盘——与 theme 同一口径：先校验再写，别把坏值
+/// 静默折成一个档位，否则「我的设置没生效」在日志里无从诊断。
+#[tokio::test(flavor = "multi_thread")]
+async fn ui_settings_write_rejects_an_unknown_font_scale() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    initialize(&mut h).await;
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"font_scale_desktop":"tiny"}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["error"]["code"], -32602, "got {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    assert!(
+        v["result"]["font_scale_desktop"].is_null(),
+        "a rejected value must not be persisted: {v}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ui_settings_read_reports_the_stored_relay_url() {
     let dir = tempfile::TempDir::new().unwrap();
