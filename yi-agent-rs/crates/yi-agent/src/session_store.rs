@@ -211,6 +211,17 @@ impl TuiSessionStore {
             .ok_or_else(|| std::io::Error::other("thread disappeared"))
     }
 
+    /// 这份会话是否已有值得 resume 的内容。
+    ///
+    /// 刚启动就退出的空会话不该提示「你可以 resume」——那条命令恢复出来仍是
+    /// 空的，提示它只会让用户白跑一趟。`items` 与 `messages` 都要看：`/compact`
+    /// 写的是 `items: []` + 压缩后的 `messages`，此时屏幕上没有新条目但上下文
+    /// 确实存在。
+    pub fn has_resumable_content(&self) -> std::io::Result<bool> {
+        let loaded = self.load_for_replay()?;
+        Ok(!loaded.items.is_empty() || !loaded.messages.is_empty())
+    }
+
     /// 把崩溃残留的 checkpoint 升格进主日志。
     ///
     /// resume 必须做：采纳的 partial 是那一轮唯一的持久副本，不 append 就返回，
@@ -507,6 +518,83 @@ mod tests {
         assert!(!loaded.pending_turn);
         // 与 load_seed 互不干扰：种子侧照样能读到同一份 messages。
         assert!(store.load_seed().is_ok());
+    }
+
+    #[test]
+    fn a_fresh_session_has_nothing_to_resume() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        assert!(
+            !store.has_resumable_content().unwrap(),
+            "刚建的空会话不该提示 resume"
+        );
+    }
+
+    #[test]
+    fn a_session_with_a_turn_is_resumable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        store
+            .append_turn(
+                &[Item::UserMessage {
+                    id: "u1".into(),
+                    text: "问".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                &[Message {
+                    role: Role::User,
+                    content: vec![yi_agent_core::ContentBlock::Text("问".into())],
+                }],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.has_resumable_content().unwrap());
+    }
+
+    #[test]
+    fn a_compact_only_session_is_still_resumable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        // /compact 的落盘形态：items 为空，但 messages 有压缩后的上下文。
+        store
+            .compact(&[Message {
+                role: Role::User,
+                content: vec![yi_agent_core::ContentBlock::Text("摘要".into())],
+            }])
+            .unwrap();
+        assert!(
+            store.has_resumable_content().unwrap(),
+            "屏上没有条目但上下文在，仍值得 resume"
+        );
+    }
+
+    #[test]
+    fn a_cleared_session_has_nothing_to_resume() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        store
+            .append_turn(
+                &[Item::UserMessage {
+                    id: "u1".into(),
+                    text: "问".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                &[Message {
+                    role: Role::User,
+                    content: vec![yi_agent_core::ContentBlock::Text("问".into())],
+                }],
+                None,
+                None,
+            )
+            .unwrap();
+        store.clear().unwrap();
+        assert!(
+            !store.has_resumable_content().unwrap(),
+            "/clear 之后恢复出来是空的，不该提示 resume"
+        );
     }
 
     #[test]

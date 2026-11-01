@@ -1429,6 +1429,23 @@ fn run_fork(cli: Cli, spec: String, prompt: Option<String>) -> Result<()> {
     )
 }
 
+/// 退出 TUI 后该怎么接上这场对话。
+///
+/// 返回 `None` 表示没有值得恢复的内容——刚启动就退出、或 `/clear` 之后，
+/// resume 出来仍是空的，提示只会让用户白跑一趟。
+///
+/// **必须在备用屏幕退出之后打印**：TUI 期间写的内容随备用屏幕一起消失
+/// （与 `report_dropped_pending` 同一条理由）。
+fn resume_hint(store: &crate::session_store::TuiSessionStore) -> Option<String> {
+    if !store.has_resumable_content().ok()? {
+        return None;
+    }
+    let id = store.thread_id();
+    Some(format!(
+        "会话已保存：{id}\n  yi-agent resume {id}   （或 yi-agent resume --last）\n"
+    ))
+}
+
 fn run_agent(cli: Cli) -> Result<()> {
     run_agent_with_seed(cli, None)
 }
@@ -3074,6 +3091,21 @@ fn run_tui_agent(
             Err(e) => Err(anyhow::Error::from(e)),
         };
 
+        // 退出后告诉用户怎么接上这场对话。
+        //
+        // **必须在这里打印**：TUI 用的是备用屏幕，进去写的东西随退出一起消失
+        // （与 `report_dropped_pending` 同一条理由）。此刻已恢复主屏幕。
+        //
+        // 空会话不提示：刚启动就退出时，resume 出来仍是空的，提示它等于让人
+        // 白跑一趟。写到 stderr 与既有的退出信息保持同一路，不污染 stdout。
+        if let Some(hint) = session_store
+            .as_ref()
+            .map(|s| s.as_ref())
+            .and_then(resume_hint)
+        {
+            eprint!("{hint}");
+        }
+
         if let Some((socket, root)) = runtime_detach
             .lock()
             .expect("runtime detach mutex poisoned")
@@ -3158,6 +3190,56 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_hint_names_the_real_thread_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::session_store::TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            yi_agent_app_server::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        store
+            .append_turn(
+                &[yi_agent_app_server::protocol::Item::UserMessage {
+                    id: "u1".into(),
+                    text: "问".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                &[yi_agent_core::Message {
+                    role: yi_agent_core::Role::User,
+                    content: vec![yi_agent_core::ContentBlock::Text("问".into())],
+                }],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let hint = resume_hint(&store).expect("有内容就该给提示");
+        // 必须是可直接粘贴的命令，不是占位符。
+        assert!(
+            hint.contains(&format!("yi-agent resume {}", store.thread_id())),
+            "提示里要带真实 id，实际: {hint}"
+        );
+        assert!(hint.contains("yi-agent resume --last"), "也要给省事的写法");
+    }
+
+    #[test]
+    fn resume_hint_is_silent_for_a_fresh_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::session_store::TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            yi_agent_app_server::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        assert!(
+            resume_hint(&store).is_none(),
+            "空会话 resume 出来还是空的，不该提示"
+        );
+    }
 
     #[test]
     fn parse_listen_accepts_stdio() {
