@@ -26,8 +26,15 @@ use crate::protocol::ThreadStatus;
 use crate::server::ProjectRuntimes;
 use crate::session::ThreadSession;
 
-/// 远端交互的有效窗口。
-pub(crate) const REMOTE_TOUCH_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// 远端交互窗口的历史默认值，仅测试与文档引用。
+///
+/// **生产代码不再读它**：窗口由设置下发（`power.remote_touch_minutes` × 60），
+/// 装配点见 `server.rs` 的 `PowerGuard::spawn` 与 `power_ticker` 分支。
+/// 保留常量是为了让「默认语义没被悄悄改掉」有一条可断言的锚点——
+/// 它与 `yi_agent_runtime::settings::POWER_REMOTE_TOUCH_MINUTES_DEFAULT`
+/// 必须一致，由 `remote_touch_expires_after_five_minutes` 钉住。
+#[cfg(test)]
+const REMOTE_TOUCH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// 查 daemon 的回复截止时间。**必须**远小于 10s tick。
 pub(crate) const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -71,11 +78,18 @@ pub(crate) fn local_busy(threads: &HashMap<String, ThreadSession>) -> bool {
 /// (c) 远端近期交互。
 ///
 /// 时间戳必须走 `clock` 的睡眠感知时钟：睡 8 小时后 `since()` 就是 8 小时，
-/// 远超 5 分钟，`remote_touch` 自动失效。**不能**用 `Instant::now()`——那只前进
-/// 几分钟，会让一条早已失效的交互记录继续算作「刚刚有过交互」，使 `ok` 恒为真、
-/// 15 分钟窗口形同虚设。
-pub(crate) fn remote_touch_busy(last_remote_touch: Option<Stamp>, clock: &dyn Clock) -> bool {
-    last_remote_touch.is_some_and(|stamp| clock.since(stamp) < REMOTE_TOUCH_WINDOW)
+/// 远超窗口，`remote_touch` 自动失效。**不能**用 `Instant::now()`——那只前进
+/// 几分钟，会让一条早已失效的交互记录继续算作「刚刚有过交互」，使保活窗口
+/// 形同虚设。
+///
+/// `window` 由设置下发（`power.remote_touch_minutes` × 60），生产路径上
+/// 没有任何硬编码窗口；`REMOTE_TOUCH_WINDOW` 只剩测试引用。
+pub(crate) fn remote_touch_busy(
+    last_remote_touch: Option<Stamp>,
+    clock: &dyn Clock,
+    window: Duration,
+) -> bool {
+    last_remote_touch.is_some_and(|stamp| clock.since(stamp) < window)
 }
 
 /// (b) 项目 daemon 里是否有在推进的任务。
@@ -226,6 +240,13 @@ mod tests {
     #[test]
     fn remote_touch_expires_after_five_minutes() {
         assert_eq!(REMOTE_TOUCH_WINDOW, Duration::from_secs(300));
+        // 与 runtime 侧的默认值同源：两处各自定义（crate 之间无依赖），
+        // 这条断言防止它们各自漂移。
+        assert_eq!(
+            REMOTE_TOUCH_WINDOW.as_secs(),
+            yi_agent_runtime::settings::POWER_REMOTE_TOUCH_MINUTES_DEFAULT * 60,
+            "the power_busy fallback and the settings default must agree"
+        );
     }
 
     /// 探测超时必须远小于 10s tick。
@@ -390,11 +411,13 @@ mod tests {
         // 边界取 `<`：恰好 5 分钟已过期。
         assert!(remote_touch_busy(
             Some(stamp),
-            &FixedClock(Duration::from_secs(299))
+            &FixedClock(Duration::from_secs(299)),
+            REMOTE_TOUCH_WINDOW
         ));
         assert!(!remote_touch_busy(
             Some(stamp),
-            &FixedClock(REMOTE_TOUCH_WINDOW)
+            &FixedClock(REMOTE_TOUCH_WINDOW),
+            REMOTE_TOUCH_WINDOW
         ));
     }
 
@@ -402,7 +425,11 @@ mod tests {
     /// 若写成 `is_none_or`，一台纯桌面使用的机器会恒为 busy、电池下永不释放。
     #[test]
     fn no_remote_touch_ever_is_not_busy() {
-        assert!(!remote_touch_busy(None, &FixedClock(Duration::ZERO)));
+        assert!(!remote_touch_busy(
+            None,
+            &FixedClock(Duration::ZERO),
+            REMOTE_TOUCH_WINDOW
+        ));
     }
 
     /// 回归哨兵（spec 明确点名）：**stdio 的本地桌面客户端不得刷新远端时间戳。**
@@ -421,9 +448,32 @@ mod tests {
         // 过了任意长时间仍然是 false。
         for secs in [0u64, 60, 3600, 8 * 3600] {
             assert!(
-                !remote_touch_busy(never_touched, &FixedClock(Duration::from_secs(secs))),
+                !remote_touch_busy(
+                    never_touched,
+                    &FixedClock(Duration::from_secs(secs)),
+                    REMOTE_TOUCH_WINDOW
+                ),
                 "a local-only session must never look like remote activity (t={secs}s)"
             );
         }
+    }
+
+    /// 窗口真的被参数化了，而不是还在读 `REMOTE_TOUCH_WINDOW`。
+    #[test]
+    fn a_custom_remote_window_expires_at_its_own_boundary() {
+        let stamp = Stamp::from_duration(Duration::ZERO);
+        let window = Duration::from_secs(120);
+        // 第 119 秒仍在窗口内。
+        assert!(remote_touch_busy(
+            Some(stamp),
+            &FixedClock(Duration::from_secs(119)),
+            window
+        ));
+        // 第 120 秒边界到期（判定取 `<`）。
+        assert!(!remote_touch_busy(
+            Some(stamp),
+            &FixedClock(Duration::from_secs(120)),
+            window
+        ));
     }
 }

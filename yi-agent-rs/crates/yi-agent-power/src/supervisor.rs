@@ -1,5 +1,6 @@
 //! 10s tick：把 clock/policy/probe/assertion 串起来。
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::assertion::Assertion;
 use crate::clock::Clock;
@@ -33,6 +34,14 @@ impl Supervisor {
             assertion,
             policy,
         }
+    }
+
+    /// 运行时换窗口。由 `PowerGuard` 的线程每拍下发，值与设置保持一致。
+    ///
+    /// 只改 `Policy` 的字段，不触发任何 I/O；断言是否释放仍由下一拍的
+    /// `tick` 决定——所以「缩短宽限立即生效」不需要在这里补逻辑。
+    pub fn set_windows(&mut self, grace: Duration, watchdog_slack: Duration) {
+        self.policy.set_windows(grace, watchdog_slack);
     }
 
     pub fn tick(&mut self, busy: bool, enabled: bool) {
@@ -290,5 +299,37 @@ mod tests {
         sup.tick(false, true);
         assert!(!sup.is_holding(), "满 15 分钟释放");
         assert_eq!(assertion.releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// 下发更宽的窗口后，原本该释放的时刻不再释放——证明
+    /// `set_windows` 真的转到了 `Policy` 上，而不是被吞掉。
+    #[test]
+    fn set_windows_reaches_the_policy() {
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(Arc::clone(&clock), false, true, Arc::clone(&assertion));
+        // 电池 + 有活 → 持有。
+        sup.tick(true, true);
+        assert!(sup.is_holding());
+
+        // 活干完，推进到默认 15 分钟宽限的边界之后。
+        clock.advance(Duration::from_secs(901));
+        sup.tick(false, true);
+        assert!(
+            !sup.is_holding(),
+            "default 15-minute grace must release at 901s"
+        );
+
+        // 换 60 分钟窗口，重新有活，再空跑 20 分钟：仍应持有。
+        sup.set_windows(Duration::from_secs(3600), Duration::from_secs(1200));
+        clock.advance(Duration::from_secs(10));
+        sup.tick(true, true);
+        assert!(sup.is_holding());
+        clock.advance(Duration::from_secs(1200));
+        sup.tick(false, true);
+        assert!(
+            sup.is_holding(),
+            "with a 60-minute grace, 20 minutes of idle must still hold"
+        );
     }
 }

@@ -28,14 +28,34 @@
 - [x] `supervisor` 10s 拍状态机，只在迁移边沿调 FFI（`Hold` 边沿才
       `acquire`，`Idle` 与 `Drop` 都 `release`）。验证：
       `cargo test -p yi-agent-power supervisor`
-- [x] `agent.prevent_idle_sleep` 开关，四处读取点同步（`FIELDS` /
-      `AgentSettings` / `settings_rpc::current_value` / `web::api::field_value`）。
-      默认开，`false`（大小写不敏感）关，未知值与坏文件回落默认开。验证：
-      `cargo test -p yi-agent-runtime prevent_idle_sleep`
+- [x] `power.prevent_idle_sleep` 开关，四处读取点同步（`FIELDS` /
+      `PowerSettings` / `settings_rpc::current_value` / `web::api::field_value`）。
+      默认开，`false`（大小写不敏感）关，未知值与坏文件回落默认开。旧键
+      `agent.prevent_idle_sleep` 在 `serde_json::Value` 阶段迁到新组。
+      验证：`cargo test -p yi-agent-runtime prevent_idle_sleep`
 - [x] app-server 主循环接线：10s `power_ticker`、三路 busy 并集（本地会话 /
-      项目 daemon / 远端 5 分钟内交互）、非 local 客户端刷新远端时间戳；
+      项目 daemon / 远端近期交互）、非 local 客户端刷新远端时间戳；
       整条 power tick 在 `power_guard` 独立线程里跑。验证：
       `cargo test -p yi-agent-app-server power_busy`
+- [x] 休眠参数进设置界面：`power` 分组开放「条件消失后再保活多久」
+      （1–120 分钟）与「远端交互有效窗口」（1–60 分钟），开关迁到
+      `power.prevent_idle_sleep`
+  - 字段定义：`yi-agent-rs/crates/yi-agent-runtime/src/settings.rs` 的 `FIELDS`
+    （`power.idle_grace_minutes` / `power.remote_touch_minutes`）
+  - 窗口参数化：`yi-agent-rs/crates/yi-agent-power/src/policy.rs` 的
+    `Policy::with_windows` / `set_windows`，`decide` 每拍现读字段，故缩窗下一拍
+    即生效；返回 `Idle` 时同时清 `last_ok`，避免调长窗口让已释放的 hold 复活。
+    判据 `cargo test -p yi-agent-power policy`
+  - 看门狗余量随宽限缩放：
+    `yi-agent-rs/crates/yi-agent-app-server/src/power_guard.rs` 的
+    `slack_for(grace) = max(5min, grace/3)`。判据
+    `cargo test -p yi-agent-app-server power_guard`
+  - 迁移：同文件 `migrate_legacy_keys`；判据 `cargo test -p yi-agent-runtime migrate`
+  - 跨字段拒绝：同文件 `write_to`（远端窗口 > 宽限时返回 `InvalidSetting`，
+    零写入）；只在本次 patch 触碰这两个键时拒绝，否则既有倒挂会把用户锁在
+    文件外面。判据 `cargo test -p yi-agent-runtime power_windows`
+  - 前端分组：`desktop/src/components/SettingsRuntimeTab.tsx`；判据
+    `npx vitest run src/components/SettingsRuntimeTab.test.tsx`
 
 ## 非目标
 

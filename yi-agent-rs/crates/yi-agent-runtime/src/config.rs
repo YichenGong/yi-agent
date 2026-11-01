@@ -684,6 +684,9 @@ mod tests {
     #[test]
     fn settings_metadata_defaults_track_these_constants() {
         use crate::settings::find_spec;
+        use crate::settings::{
+            POWER_IDLE_GRACE_MINUTES_DEFAULT, POWER_REMOTE_TOUCH_MINUTES_DEFAULT,
+        };
         let cases: &[(&str, String)] = &[
             ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
             (
@@ -706,6 +709,14 @@ mod tests {
             (
                 "compact.tool_budget_tokens",
                 COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "power.idle_grace_minutes",
+                POWER_IDLE_GRACE_MINUTES_DEFAULT.to_string(),
+            ),
+            (
+                "power.remote_touch_minutes",
+                POWER_REMOTE_TOUCH_MINUTES_DEFAULT.to_string(),
             ),
         ];
         for (key, expected) in cases {

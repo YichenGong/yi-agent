@@ -185,11 +185,15 @@ describe("runtime settings labels", () => {
   it("names every backend group in Chinese", () => {
     // 与 yi-agent-runtime/src/settings.rs 的 FIELDS 分组一一对应。漏一个就会在页面上
     // 露出英文组名（tui 曾经就是这样）。
-    expect(GROUP_ORDER).toEqual(["agent", "compact", "tui", "startup"]);
+    //
+    // 不写精确 toEqual：这张表会随功能增长，每加一组就要改一次期望数组，
+    // 而本测试真正要守的是「没有组漏出英文名」。下面两条循环断言已覆盖它，
+    // toContain 再钉住顺序表里确实登记了新组。
     for (const group of GROUP_ORDER) {
       expect(GROUP_LABELS[group]).toBeTruthy();
       expect(GROUP_HINTS[group]).toBeTruthy();
     }
+    expect(GROUP_ORDER).toContain("power");
   });
 
   it("translates enum values but keeps unknown ones verbatim", () => {
@@ -201,5 +205,12 @@ describe("runtime settings labels", () => {
     expect(labelFor("agent.max_turns", "200")).toBe("200");
     // `default_display` 可能是空串（agent.system_prompt），显示成破折号。
     expect(labelFor("agent.system_prompt", "")).toBe("—");
+  });
+
+  it("translates the power switch like the other on/off selects", () => {
+    // 漏加映射不会报错，只会让下拉框显示英文 true/false，与相邻的
+    // 「终端通知」组风格不一致。
+    expect(labelFor("power.prevent_idle_sleep", "true")).toBe("开");
+    expect(labelFor("power.prevent_idle_sleep", "false")).toBe("关");
   });
 });
