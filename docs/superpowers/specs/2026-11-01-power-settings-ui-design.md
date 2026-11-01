@@ -430,11 +430,56 @@ grace = 最近一次 keeps_awake 为真之后，还能再扛多久
 **具体接法**（`write_to` 现有形状：解析 patch → 逐项 `validate_value` → 读原文件成 object → 逐个 `apply_op` → 删空壳组 → 序列化写回）：
 跨字段检查必须插在 `apply_op` 之后、`write_atomically` 之前，因为「新值与旧值比较」只有在合并后的完整对象上才成立。此时把合并后的 object 反序列化成 `Settings`，读两个字段的**生效值**，比较后决定是否 `return Err`。**放在这里的好处：那一刻还没有写盘，天然满足零写入。**
 
-必须注意的三点：
+必须注意的四点：
 
 1. **必须用「合并后的完整对象」判断**，不能只比较 patch 内部。用户可能只 patch 一个键（例如只把宽限从 60 改成 5），此时远端窗口的生效值来自**文件里的旧值**。
-2. **必须对合并结果跑一遍 `normalized()` 再取生效值**（`settings.normalized()` 是消费式返回，写 `let merged = merged.normalized();`；随后用 `power_windows_minutes(&merged)` 取两个生效值，见 §4.4.1）。`validate_value` 只校验 patch 里的新值；文件里的旧值可能是手改的越界值（例如 `0`），`from_value` 不会自动钳制。不归一化就会拿 `Some(0)` 参与比较，得出无意义的结论。`normalized()` 是同模块的私有方法（`fn normalized(mut self) -> Settings`，消费式返回），`write_to` 直接调用即可。
-3. **`from_value` 失败要转成 `Corrupt`**。合并后的对象可能是 `{"agent": 5}` 这种结构性坏（`write_to` 现在只校验「顶层是对象」，不校验内层），此时应 `SettingsError::Corrupt` 拒绝写入，而不是 `unwrap` 或静默跳过校验。这与现有「文件存在却读不出来 → 拒绝覆盖」的守卫同向。
+2. **绝对不能对合并结果跑 `normalized()` 再取值。** 这是本节最容易写错的一步，实测会得到一个「永远不拒绝」的死逻辑：
+   `normalized()` 里本身就带倒挂回落（§5.3 要求倒挂时两个都清成 `None`）。若先归一化再比较，倒挂值已被清成 `None`，`power_windows_minutes` 取出默认的 `(15, 5)`，`5 > 15` 恒假——**任何倒挂写入都不会被拒绝**，跨字段校验形同虚设。
+   顺带说明为什么「先归一化」看起来很必要：`validate_value` 只校验 patch 里的新值，文件里的旧值可能是手改的越界值（例如 `0`）。但那类坏值应当走**单字段**的兜底，不能借道会触发倒挂回落的 `normalized()`。
+   正确做法见下方「实现模型」。
+3. **`from_value` 失败要转成 `Corrupt`**。合并后的对象可能是 `{"agent": 5}` 这种结构性坏（`write_to` 现在只校验「顶层是对象」，不校验内层），此时应 `SettingsError::Corrupt` 拒绝写入，而不是 `unwrap` 或静默跳过校验。这与「文件存在却读不出来 → 拒绝覆盖」的守卫同向。
+4. **只拒绝「本次 patch 引入的倒挂」**，不因为文件里既有的倒挂而拒绝无关写入。否则用户手改坏了一对值之后，连改 `agent.max_turns` 都会失败——那是把人锁在文件外面。文件里的既有倒挂由加载侧 `normalized()` 静默回落并 warn（§5.3），不影响写入。
+
+#### 实现模型
+
+不调用 `normalized()`，而是对合并后的两个字段各自做一次**单字段钳制**（复用 `within(key, value)`，它按 `FieldSpec.min/max` 判界，越界返回 `None` 即「按默认」），再取生效值比较：
+
+```rust
+// 只钳制、不做倒挂回落——否则本次要检查的倒挂会先被清掉。
+// （不能复用 `power_windows_minutes`：它要一个完整的 `&Settings`，
+//  而这里手上只有两个 Option。直接算等价，且不给它造临时结构体。）
+let grace = merged
+    .power
+    .idle_grace_minutes
+    .filter(|&value| within("power.idle_grace_minutes", value))
+    .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
+let remote = merged
+    .power
+    .remote_touch_minutes
+    .filter(|&value| within("power.remote_touch_minutes", value))
+    .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+```
+
+越界值在这里由 `filter` 变成 `None` 并回落到默认，与 `normalized()` 对**单字段**的处理一致，但不触发倒挂回落。这与 `power_windows_minutes`（§4.4.1）的语义相同，只是不经过那个函数——因为它只接受完整的 `&Settings`。
+
+然后加一条**只在 patch 触碰过这两个键之一时才拒绝**的守卫：
+
+```rust
+let touches_power_windows = ops.iter().any(|(spec, _)| {
+    matches!(
+        spec.key,
+        "power.idle_grace_minutes" | "power.remote_touch_minutes"
+    )
+});
+if touches_power_windows && remote > grace {
+    return Err(SettingsError::InvalidSetting { .. });
+}
+```
+
+这样：
+- 用户把宽限从 5 改到 2（远端 5）→ 触碰了 power 窗口 → 倒挂 → 拒绝 ✓
+- 文件里有手改的倒挂、用户去改 `agent.max_turns` → 没触碰 power 窗口 → 放行 ✓
+- 文件里宽限是手改的 `0`（越界）、用户改远端到 10 → `0` 被 `filter` 掉回落默认 15 → `10 > 15` 为假 → 放行 ✓
 
 **`None` 的语义**：两个字段任一为 `None` 时视为默认值（宽限 15、远端 5），比较 `5 > 15` 为假，放行。所以「只设宽限 5、远端用默认 5」这种组合是合法的（相等，见下）。
 
@@ -725,11 +770,22 @@ settings.normalized()                    // 真实代码就是这样收尾的（
 
 ```bash
 cd yi-agent-rs
-grep -c '=> opt(' crates/yi-agent-web/src/api.rs
-grep -c '=> option_to_json(' crates/yi-agent-app-server/src/settings_rpc.rs
+# 不能写 `grep -c '=> opt('` / `grep -c '=> option_to_json('`：
+# 三个分支（agent.max_resident_subagents、PREVENT_IDLE_SLEEP_KEY、
+# tui.notification_condition）的 `=> {` 与函数调用分处两行，单行 grep
+# 会漏掉它们，实测只有 10 / 11，而 FIELDS 是 13——用错的命令会得出
+# 「不一致」的假警报，或反过来在真漏一个时仍然凑巧相等。
+_ARMS='^[[:space:]]+("[a-z]+\.[a-z_]+"|settings::PREVENT_IDLE_SLEEP_KEY) =>'
+grep -cE "$_ARMS" crates/yi-agent-web/src/api.rs                    # 期望 15
+grep -cE "$_ARMS" crates/yi-agent-app-server/src/settings_rpc.rs    # 期望 15
+awk '/pub static FIELDS/,/^];/' crates/yi-agent-runtime/src/settings.rs | grep -c 'key:'   # 期望 15
 ```
 
-两个数字必须相等（都等于 `FIELDS.len()`）。这是本设计里唯一「测试兜不住」的点，值得单独写进验收清单。
+三个数字必须相等（都等于 `FIELDS.len()`：**改动前 13，本设计加两个数值字段后 15**）。跑之前先确认 `FIELDS` 那一行输出是 15——它同时是分母，分母错了后面两条比较就没意义。
+
+`[[:space:]]` 而非 `\s`：BSD grep 两者都认，但 `[[:space:]]` 可移植性更好，不依赖 GNU 扩展。
+
+这是本设计里唯一「测试兜不住」的点，值得单独写进验收清单。
 
 **建议顺手补一条 web 侧测试**（不在本设计范围内，但成本极低）：对 `FIELDS` 里每个 `Number` 字段，构造一个非 `None` 的 `Settings`，断言 `field_value` 返回的不是 `Value::Null`。缺少这条，`field_value` 就会一直是「漏改不报错」的区域。
 
