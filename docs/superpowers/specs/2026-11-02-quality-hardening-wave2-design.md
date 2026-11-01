@@ -28,6 +28,8 @@ cargo mutants --file permission.rs  →  123.7s，50 变异体：32 caught / 12 
 
 代码照样编译，36 个 permission 测试照样全绿。因为该 arm 删除后落入 `_ => false`，而现有测试用的都是默认配置（`tool_level.write` 默认 `false`），两者结果相同。真实后果是：用户在配置里写 `tool_level.write = true`（期望"写文件不必再确认"），该设置**静默失效**，每次仍弹确认框。
 
+**读写两侧的不对称性已实测确认**，这是根因的直接证据：写侧 `apply_decision` 的 `"write"` 分支（`permission.rs:298`）**被杀死**，因为 `:839` 有 `apply_decision("write", &Decision::AlwaysAllowTool, ...)` 测试；而读侧 `tool_level_allows` 的 `"write"` 分支（`:194`）**存活**，该行没有任何测试引用。同一个配置项，写入路径被测过、读取路径没测过——配置存得进去、读出来不生效。
+
 这就是本文要解决的核心问题：**当前测试能证明"代码被执行过"，不能证明"代码行为正确"。**
 
 ## 目标
@@ -525,8 +527,10 @@ RUN 3: 3953 passed, 1 failed  (a_process_that_owns_the_daemon_supervises_its_plu
 | 5 | JUnit 上传步骤 | 第一波已产出 `target/nextest/ci/junit.xml`，但无上传 |
 | 6 | MSRV 门禁 | `Cargo.toml` 声明 `rust-version = "1.85"`，CI 无 job 用 1.85 编译 |
 | 7 | 补真 doctest | 当前全仓 0 个，文档里的代码块从未被编译验证 |
-| 8 | `CLAUDE.md` 门禁数量 | 写「12 道」，实际 `ci` 依赖列表为 14 项（本轮若加 `audit` 则为 15） |
+| 8 | `CLAUDE.md` 门禁数量 | **已过期，需复核**：`CLAUDE.md:145` 现写「14 道」，`justfile` 的 `ci:` 依赖实测为 14 项，二者当前一致；但本波若把 `cargo audit` 加入 `ci`，需同步改成 15 |
 | 9 | CI 分片 | 需先有实测数据判断是否必要 |
+| 10 | `sandbox_readonly` 等集成测试的环境耦合 | `read_only_sandbox_can_run_git` 依赖仓库根 `.git`，在复制树/打包环境里不可用。本波只用 `mutants.toml` 跳过（治标）；根治应改为在测试内 `git init` 临时仓库 |
+| 11 | fixture 路径依赖仓库布局 | C2 障碍 1 引入 `YI_FIXTURE_DIR` 是权宜之计；长期应把 `docs/research/fixtures/` 移进 crate 内，消除对仓库布局的隐式依赖 |
 
 ## 核查记录
 
