@@ -14,21 +14,26 @@ describe("CacheNotice", () => {
 
   /**
    * 用户报的「20xxxd」：`savedAt` 未知时旧代码 `savedAt ?? 0` 把 0 当 1970 年
-   * 的时间戳，格式化出 20758d。手机冷启动握手尚未完成（`offline` 为真）而
-   * `thread/resume` 已在途时就会走到这条路径——那个会话可能**根本没有**内容
-   * 缓存，`cachedAt` 里没有它，于是这里收到 null。
+   * 的时间戳，格式化出 20758d。
+   *
+   * 但换成「更新时间未知」只修了一半：这句话仍然在**声称屏幕上是离线内容**。
+   * `savedAt` 为 null 的真实成因恰恰相反——`cachedAt` 只在读到缓存条目时才
+   * 有值，所以 null 等价于「这个会话没有内容缓存」。此时正文区是空的，提示条
+   * 却在介绍一份不存在的缓存，同样是在说一件用户看不到的事。
    */
-  it("says the age is unknown instead of rendering thousands of days", () => {
+  it("does not claim offline content when nothing is cached", () => {
     render(<CacheNotice savedAt={null} />);
     const text = screen.getByRole("status").textContent ?? "";
-    expect(text).toContain("离线内容");
+    expect(text).not.toContain("离线内容");
     expect(text).not.toMatch(/\d{3,}d/);
-    expect(text).toContain("未知");
+    expect(text).not.toContain("20758");
   });
 
-  it("treats a zero timestamp as unknown too", () => {
+  it("treats a zero timestamp as not-cached instead of inventing an age", () => {
     render(<CacheNotice savedAt={0} />);
-    expect(screen.getByRole("status").textContent ?? "").not.toMatch(/\d{3,}d/);
+    const text = screen.getByRole("status").textContent ?? "";
+    expect(text).not.toMatch(/\d{3,}d/);
+    expect(text).not.toContain("离线内容");
   });
 });
 
