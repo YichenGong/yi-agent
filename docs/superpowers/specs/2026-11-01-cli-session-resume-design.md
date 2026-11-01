@@ -113,7 +113,29 @@ fn acquire_thread_lock(root: &Path, thread_id: &str) -> Result<Arc<ThreadWriterL
 
 **粒度：会话级持有**。进入 `resume` / `fork` 时取锁，进程退出随 `File` drop 释放；进程崩溃内核同样释放，不留死锁（`device_store.rs:76` 注释所述）。持有者是**该会话的 `Arc`**，所以 driver 要把它存进自有状态，避免「取完就 drop」导致锁形同虚设。
 
-**这把锁必须两端都采用**。只加在 TUI 侧而 app-server 不拿锁，锁就是摆设。因此 `thread/resume` 与 driver 启动路径也要取同一把锁。这是本设计改动面积最大的一点。
+**那把锁不能简单套到 app-server 上——这里有一个必须解决的架构冲突。**
+
+我前一轮写「两端都采用」，是错的。查证后的事实：
+
+1. **app-server 的 thread 是常驻内存的**。`state.threads` 表只在会话真正结束（驱动终态）时才 `remove`（`server.rs:9545` 的测试注释：「模拟会话结束：主循环把它从 `threads` 表里摘掉」）。空闲驱逐只针对 **runtime**（`evict_idle_runtimes`，`server.rs:106`），不动 thread 本身。桌面端打开一个会话后，可以挂好几个小时。
+2. **桌面本来就允许多客户端同时订阅同一会话**（`MAX_SUBSCRIPTIONS = 16`，`broadcast.rs:17`），手机与桌面可以同时看同一个 thread。
+
+如果按「会话级阻塞写锁」两端一起用，那么：桌面开着一个会话 → sidecar 持锁数小时 → 终端 `resume` 永远失败。反过来终端开着 → 桌面无法启动 driver。这会把桌面最常用的一条路直接堵死。
+
+**结论：锁分两种，不能混用。**
+
+| 场景 | 锁 | 语义 |
+| --- | --- | --- |
+| **两个 writer**（TUI ↔ TUI、TUI ↔ app-server driver） | 会话级排他锁，冲突即拒 | 防止交错追加同一 `.jsonl` |
+| **app-server 内部多客户端**（桌面 + 手机） | 不加锁，维持既有内存态 | 它们本来就共享同一 driver（`threads` 表里的唯一实例），不存在双写 |
+
+所以正确的表述是：
+
+- **TUI 侧**：进 `resume` / `fork` 即取会话级排他锁，持有到进程退出。
+- **app-server 侧**：只在**启动 driver**（即它要成为该 thread 的 writer）时取锁，且在 thread 从 `threads` 表移除时释放。它自己的多客户端订阅不走这条路，行为零变化。
+- **冲突是真实存在的正常结果**：桌面正在跑某会话时，终端 `resume` 该会话就该被拒绝，并提示「用 fork 新建会话」。这不是 bug，是设计意图。
+
+这条约束必须写进 §12 第 1 步的验收：**桌面开着会话时，终端 resume 同一会话被拒；终端开着时，桌面打不开同一会话的 driver。** 若实现成「app-server 全局持锁」，这两个用例会反过来失败。
 
 **锁文件会污染 `list()` 与 `find_first_user_text`，必须显式过滤。** `list()`（`thread_store.rs:439`）只认 `.meta.json` 后缀，`<id>.lock` 天然被跳过，无需改。但任何「扫目录找最新会话」的新代码必须同样只认 `.meta.json`，不能按 `mtime` 取最近的任意文件——否则锁文件（每次 resume 都会创建）会被误判成最新会话。
 
@@ -351,6 +373,8 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 
 - `fork_thread` 复制完整性：items 数量、messages 内容、`forked_from`、meta 各字段取舍（含 `role` 清空、`extra_roots` 过滤）
 - 锁：同一 `Arc` 二次获取幂等；跨进程持有失败（子进程验证）；锁文件在持有者退出后仍存在
+- **锁的释放时机（关键反例）**：app-server 启动 driver 后取锁，thread 从 `threads` 表移除后必须释放。若写成全进程持锁，桌面开着会话时终端永远 resume 不了
+- **app-server 多客户端不互斥**：两个客户端同时 `thread/subscribe` 同一 thread 仍正常（`MAX_SUBSCRIPTIONS`），证明锁没有误伤既有桌面行为
 - **锁的进程内去重**：同进程 `acquire_thread_lock` 两次拿到同一个 `Arc`（若退化成各自加锁，这条会红）
 - **`truncate` 后 `load` 为空**：`/clear` 走 `truncate`，断言 `.jsonl` 已删、`.meta.json` 仍在、`content_epoch` 递增
 - **`truncate` 同时清 partial**：清空后残留 checkpoint 不会把上下文拼回来
@@ -371,7 +395,7 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 1. 建会话 → 一轮对话 → 进程退出
 2. `run --resume <id>` → 断言历史被载入、能继续、新内容落盘
 3. 再次 `run --resume <id>` → 断言第二轮内容也在
-4. `/clear` 后退出 → `run --resume <id>` → 断言旧内容不可见（验证 §6.4 的边界语义）
+4. `/clear` 后退出 → `run --resume <id>` → 断言旧内容不可见（验证 §6.4 的 `truncate` 语义）
 
 ## 11. 日志格式
 
@@ -383,7 +407,7 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 
 按依赖倒序，每步可独立验证：
 
-1. **锁**（`thread_store` 新增 `ThreadWriterLock` + 进程级去重表 + app-server 侧采用）—— 独立、可单测、无 UI
+1. **锁**（`thread_store` 新增 `ThreadWriterLock` + 进程级去重表 + app-server **仅在启动 driver 时**采用、thread 移除时释放）—— 独立、可单测、无 UI。务必先写「桌面开会话时终端 resume 被拒」这条用例，防止实现成全局持锁
 2. **TUI 落盘**（session Arc 重构 + 新会话建 meta + 每轮 `append_turn` + `updated_at`，`/clear` 接 `truncate`、`/compact` 走空 items 行）—— resume 的前提
 3. **回放映射**（`items_to_cells`）—— 让历史真的看得见
 4. **resume**（load → 注入 → 启动）—— 主干
