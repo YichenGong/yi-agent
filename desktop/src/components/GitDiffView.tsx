@@ -9,6 +9,7 @@
  * 无帧时完全走既有的结构化 diff 路径（向后兼容）。
  */
 import { memo, useState } from "react";
+import { formatRelativeTime, RELATIVE_TIME_UNKNOWN } from "../lib/relativeTime";
 import type { CommitInfo, FileStat, ThreadDiffResult } from "../lib/protocol";
 import { parseUnifiedDiff, type FileDiff } from "../lib/gitDiff";
 import { parseLog, resolveKind, type LogEntry, type ViewFrame } from "../lib/viewFrame";
@@ -29,12 +30,21 @@ function statusBadge(status: string): string {
   }
 }
 
-function relativeTime(ts: number): string {
-  const secs = Math.max(0, Math.floor(Date.now() / 1000) - ts);
-  if (secs < 60) return "刚刚";
-  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)} 小时前`;
-  return `${Math.floor(secs / 86400)} 天前`;
+/**
+ * 提交时间。
+ *
+ * 复用 `lib/relativeTime` 而不是在组件里自算一套：那份实现已经处理了
+ * 「时间戳缺失/不是数字」与「秒当毫秒」的边界。此前这里自带一份秒级算法，
+ * `timestamp` 为 0 时会渲染「20758 天前」（用户报的「20xxxd」同形），
+ * `NaN` 则直接显示「NaN 天前」。
+ *
+ * 协议里 `CommitInfo.timestamp` 是**秒**，而共享实现按毫秒算，故先换算。
+ * 算不出来时留空：提交条已经在左侧给了短 sha，补一个假时间只会误导。
+ */
+function commitAge(ts: number): string {
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const label = formatRelativeTime(ts * 1000);
+  return label === RELATIVE_TIME_UNKNOWN ? "" : label;
 }
 
 /** 汇总行统计：从 `files[]` 求和，不额外调 git（spec §5.8 D4）。 */
@@ -354,7 +364,7 @@ export function GitDiffView({
                     >
                       <span className="font-mono text-xs text-fg-faint">{c.short}</span>
                       <span className="min-w-0 flex-1 truncate text-sm text-fg">{c.subject}</span>
-                      <span className="text-xs text-fg-faint">{relativeTime(c.timestamp)}</span>
+                      <span className="text-xs text-fg-faint">{commitAge(c.timestamp)}</span>
                     </button>
                   </li>
                 ))}
