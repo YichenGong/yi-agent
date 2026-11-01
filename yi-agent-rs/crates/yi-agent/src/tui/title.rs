@@ -52,10 +52,37 @@ pub fn compose(project: &str, running: bool) -> String {
     crate::tui::wrap::truncate_to_width(&cleaned, MAX_COLUMNS)
 }
 
+/// 写 OSC 2 设置终端标题。
+///
+/// 自己实现 `Command` 而不用 crossterm 自带的 `terminal::SetTitle`：本仓已
+/// 确立「自定义 `Command` + 可断言 `write_ansi`」的范式（`notify/osc9.rs`、
+/// `notify/bel.rs`），且单测需要逐字节断言——依赖 crossterm 的类型做不到。
+///
+/// 终止符用 BEL 而非 ST：BEL 是 OSC 的传统终止符，兼容面最广；ST 更规范但
+/// 少部分老终端不认。
+pub struct SetTitle(pub String);
+
+impl crossterm::Command for SetTitle {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(f, "\u{1b}]2;{}\u{7}", self.0)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "tried to execute SetTitle using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -162,5 +189,34 @@ mod tests {
     #[test]
     fn project_label_falls_back_for_empty_name() {
         assert_eq!(project_label(Path::new("")), FALLBACK_PROJECT);
+    }
+    #[test]
+    fn set_title_writes_exactly_one_osc2() {
+        use crossterm::Command;
+        let mut out = String::new();
+        SetTitle("myproject".to_string())
+            .write_ansi(&mut out)
+            .unwrap();
+        assert_eq!(out, "\u{1b}]2;myproject\u{7}");
+        assert_eq!(out.as_bytes(), b"\x1b]2;myproject\x07");
+    }
+
+    #[test]
+    fn set_title_with_empty_string_still_terminates() {
+        use crossterm::Command;
+        let mut out = String::new();
+        SetTitle(String::new()).write_ansi(&mut out).unwrap();
+        assert_eq!(out, "\u{1b}]2;\u{7}");
+    }
+
+    #[test]
+    fn set_title_does_not_emit_st() {
+        use crossterm::Command;
+        let mut out = String::new();
+        SetTitle("x".to_string()).write_ansi(&mut out).unwrap();
+        assert!(
+            !out.contains("\u{1b}\\"),
+            "BEL and ST must not both appear: {out:?}"
+        );
     }
 }
