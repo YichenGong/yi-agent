@@ -1171,6 +1171,33 @@ impl std::fmt::Display for ThreadBusy {
 
 impl std::error::Error for ThreadBusy {}
 
+/// 取锁失败的两种原因。**必须分开**：磁盘不可写报成「会话被占用」会让用户
+/// 永远查不出原因，而「被占用」正是要提示用户去 `fork` 的那种。
+#[derive(Debug)]
+pub enum ThreadLockError {
+    /// 另一个 writer 正持有该会话。
+    Busy(ThreadBusy),
+    /// 建目录 / 打开锁文件失败。这不是「被占用」，调用方应照常继续。
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ThreadLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(e) => e.fmt(f),
+            Self::Io(e) => write!(f, "无法创建会话锁文件: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ThreadLockError {}
+
+impl From<ThreadBusy> for ThreadLockError {
+    fn from(e: ThreadBusy) -> Self {
+        Self::Busy(e)
+    }
+}
+
 /// 持有的会话写锁。`Drop` 时关闭 `File`，内核随之释放 `flock`。
 ///
 /// **锁文件永不删除。** 删掉会让「已打开同一 inode 的竞争者」锁在 unlinked 文件
@@ -1212,7 +1239,7 @@ fn process_locks() -> &'static LockTable {
 pub fn acquire_thread_lock(
     root: &Path,
     thread_id: &str,
-) -> Result<Arc<ThreadWriterLock>, ThreadBusy> {
+) -> Result<Arc<ThreadWriterLock>, ThreadLockError> {
     let path = thread_lock_path(root, thread_id);
 
     // 先查表：本进程已持有则直接返回同一个 Arc。
@@ -1223,18 +1250,14 @@ pub fn acquire_thread_lock(
         }
     }
 
-    std::fs::create_dir_all(root).map_err(|_| ThreadBusy {
-        thread_id: thread_id.to_string(),
-    })?;
+    std::fs::create_dir_all(root).map_err(|e| ThreadLockError::Io(e))?;
 
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&path)
-        .map_err(|_| ThreadBusy {
-            thread_id: thread_id.to_string(),
-        })?;
+        .map_err(ThreadLockError::Io)?;
 
     let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if outcome != 0 {
@@ -1243,9 +1266,9 @@ pub fn acquire_thread_lock(
             error.raw_os_error(),
             Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN
         ) {
-            return Err(ThreadBusy {
+            return Err(ThreadLockError::Busy(ThreadBusy {
                 thread_id: thread_id.to_string(),
-            });
+            }));
         }
         // 真故障（坏描述符 / 不支持的 fs）不能被误报成「会话被占用」，
         // 否则用户永远查不出原因。这里退化为放行并记账，由调用方的 IO 错误暴露。
@@ -3377,6 +3400,22 @@ mod tests {
             Some("user-turn-e"),
             "the opening prompt must be recoverable"
         );
+    }
+
+    #[test]
+    fn thread_lock_reports_io_failure_not_busy() {
+        // `.yi-agent` 被一个普通文件占住时，锁文件建不出来。这**不是**
+        // 「会话被占用」——若报成 Busy，用户会去找一个并不存在的另一个实例。
+        let dir = TempDir::new().unwrap();
+        let workdir = dir.path();
+        std::fs::write(workdir.join(".yi-agent"), b"not a directory").unwrap();
+        let root = workdir.join(".yi-agent").join("threads");
+
+        match acquire_thread_lock(&root, "thread-io-fail") {
+            Err(ThreadLockError::Io(_)) => {}
+            Err(other) => panic!("IO 故障必须报 Io，实际: {other:?}"),
+            Ok(_) => panic!("建不出锁文件时必须失败，而不是静默放行"),
+        }
     }
 
     #[test]

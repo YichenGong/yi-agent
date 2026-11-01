@@ -7254,6 +7254,21 @@ pub(crate) async fn start_thread_core(
     // driver 与 children watch 之间唯一的通道：watch 侧只送最新汇总，
     // driver 侧据此生成完整的 TokenUsage（它才拿得到 total_*）。
     let (subagent_tx, subagent_rx) = tokio::sync::watch::channel(SubagentTotals::default());
+    // 新会话同样要成为 writer，同样要取锁。`thread/start` 刚生成的 id 理论上
+    // 不会与别人撞，但锁的意义是「同一路径只有一个 writer」，不是「防撞 id」：
+    // 落盘后用同一 id 另开一个进程 resume 时，这把锁就是唯一屏障。
+    // 只有 `Busy` 才拒绝；`Io`（锁文件建不出来）退化为无锁，与加锁前行为一致。
+    let writer_lock =
+        match crate::thread_store::acquire_thread_lock(thread_store.root(), &thread_id) {
+            Ok(lock) => Some(lock),
+            Err(crate::thread_store::ThreadLockError::Busy(busy)) => {
+                return Err(anyhow::anyhow!(busy.to_string()));
+            }
+            Err(e @ crate::thread_store::ThreadLockError::Io(_)) => {
+                tracing::warn!(%e, thread_id = %thread_id, "会话写锁不可用，退化为无锁");
+                None
+            }
+        };
     threads.insert(
         thread_id.clone(),
         ThreadSession {
@@ -7270,6 +7285,7 @@ pub(crate) async fn start_thread_core(
             store: Arc::clone(&thread_store),
             status: Arc::clone(&store_status),
             subagent_tx,
+            writer_lock,
         },
     );
 
@@ -10590,6 +10606,7 @@ mod evict_idle_tests {
             store: Arc::new(crate::thread_store::ThreadStore::new(project)),
             status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
             subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+            writer_lock: None,
         }
     }
 
