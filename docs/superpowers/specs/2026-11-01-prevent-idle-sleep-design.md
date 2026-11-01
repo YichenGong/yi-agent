@@ -180,12 +180,30 @@ Held ──进程退出──> (系统自动回收)
 ### 策略：一条公式 + 一个窗口
 
 ```
-GRACE = 15min                            // 单向宽限窗口
+GRACE          = 15min                   // 单向宽限窗口
+WATCHDOG_SLACK = 5min                    // 看门狗宽限
 
 ok   = online && (on_ac || busy)         // 本次 tick 是否满足保活条件
-if ok { last_ok = Some(now) }             // 只在 ok 时写入;初值 None
-hold = last_ok.map_or(false, |t| clock.since(t) < GRACE)   // 单向时间窗
+if ok { last_ok = Some(now.mono) }        // 只在 ok 时写入;初值 None
+
+hold = last_ok.is_some_and(|t| now.mono.saturating_sub(t) < GRACE)   // 单向时间窗
 ```
+
+> **实现修正（已实测，以此为准）。** 本节最初写的是 `clock.since(t) < GRACE` 一个
+> 读数。实现时发现这会让「时钟冻结看门狗」永远不可达——看门狗要检测的恰恰是
+> 「单调钟不前进」，若用同一条钟来度量「扛了多久」，冻结时读数永远为 0，兜底就
+> 形同虚设。
+>
+> 所以 `decide` 的入参改成**双时钟** `Sample { mono, wall }`，两条钟各管一件事：
+>
+> | 用途 | 用哪条钟 | 理由 |
+> |---|---|---|
+> | 宽限窗口「距上次 ok 多久」 | `mono` | 含睡眠，睡 8 小时就是 8 小时；这是 `CLOCK_MONOTONIC_RAW` / `CLOCK_BOOTTIME` 的全部意义 |
+> | 看门狗「已经扛了多久」 | `wall` | 单调钟冻结时，墙钟是唯一还在前进的来源 |
+> | 看门狗「时钟有没有前进」 | `mono` | 判据是**有增长**（`> 0`），不是「增长得够快」——后者在高负载 tick 迟到时会误判 |
+>
+> 代码：`crates/yi-agent-power/src/policy.rs` 的 `Policy::decide(&Snapshot, Sample)`、
+> `crates/yi-agent-power/src/clock.rs` 的 `Clock::sample()`。
 
 `busy` 与 `on_ac` 是两个独立输入，公式把它们合成一个布尔，所以不需要写
 `if on_ac { ... } else { ... }` 这样的分支表：
@@ -611,8 +629,38 @@ IOPMAssertionCreateWithName(CFSTR("PreventUserIdleSystemSleep"),
 
 **1. `yi-agent-app-server/src/server.rs` 主循环**
 
-已有的 `driver_ticker`（`server.rs:3276`，3s，分支在 `3822`）旁边再加一个 10s ticker。
-`busy` 由**三个来源**并起来，缺一个就会漏掉一整类活：
+已有 `driver_ticker`（`server.rs:3276`，3s，分支在 `3822`）旁边加一个 10s ticker
+（`POWER_TICK`）。`busy` 由**三个来源**并起来，缺一个就会漏掉一整类活：
+
+> **实现修正（已实测，以此为准）：整条 power tick 不在主循环里跑，而在独立线程。**
+>
+> 下面这段伪代码把探测写在主循环是**错的**，实测耗时为：
+>
+> | 步骤 | 最坏耗时 |
+> |---|---|
+> | `getifaddrs` 遍历接口 | 亚毫秒 |
+> | `route -n get default`（**spawn 一个子进程**） | 10~50 ms，系统繁忙时可到几百 ms |
+> | `TcpStream::connect_timeout(gateway:80, 2s)` | **2 s**（网关丢包时真的等满） |
+> | `IOPMAssertionCreateWithName`（IOKit FFI） | 亚毫秒 |
+>
+> 网关刚好不通的那一拍，主循环会卡住 2 秒，这 2 秒里所有 `inbound.recv()` 的 RPC
+> 都在排队——而 `DRIVER_TICK` 只有 3 秒。本功能的目标是让机器持续干活，让它自己
+> 成为卡顿源是自相矛盾的。
+>
+> 所以实际实现是：
+>
+> - `crates/yi-agent-app-server/src/power_guard.rs`：独立 OS 线程，**唯一持有 IOKit
+>   断言**，线程内每 10s 跑完整 tick（含电源/网络探测与 FFI）。
+> - 主循环每拍只做四件事：读一次 `settings.json`、遍历内存 `threads` 表、
+>   读两个 `AtomicBool`、两次 `store`。新增开销降到两次原子写。
+> - `PowerGuard::drop` 置 `stop` 并 `join`；等待用 50ms 分段轮询
+>   （`sleep_until_stop`），实测退出延迟约 39ms，不是 10 秒。
+> - daemon 侧的阻塞 IPC 另由 `power_busy::BusySampler` 在 `spawn_blocking` 里采，
+>   主循环读 `latest()`（上一拍结果，非阻塞）。
+>
+> 下面这段伪代码的**语义**（三个来源、各自判据）仍然正确，只是执行位置变了：
+> `local` 与 `remote` 留在主循环算（纯内存），`daemon` 移到 `BusySampler`，
+> 电源/网络探测与断言移到 `PowerGuard` 线程。
 
 ```rust
 // (a) 本进程的会话:与 server.rs:6165-6173 的 idle 快照同一口径,只取反
@@ -630,7 +678,9 @@ let local = threads.values().any(|s| {
 let remote_busy = runtimes
     .lock().unwrap_or_else(|p| p.into_inner())
     .values()
-    .filter_map(|entry| entry.as_ref().ok()?.current().ok())
+    // 注意：必须是 current_handle_no_touch()。current() 会 touch()，
+    // 每 10s 探一次等于让 evict_idle_runtimes 永不触发（见下方「偏差 1」）。
+    .filter_map(|entry| entry.as_ref().ok()?.current_handle_no_touch().ok())
     .any(|handle| {
         yi_agent_store::ipc::send_request_with_version_timeout(
             &handle.socket_path,
@@ -731,6 +781,27 @@ runtime daemon 执行（`server.rs:1267` 的 `attach::ensure_owned_runtime`）�
 结论：**不做全局 daemon 扫描**。判据只覆盖本 app-server 已知的项目，这在
 "辅助功能不得拖慢主循环"和"覆盖率"之间是刻意的取舍。
 
+**偏差 1（实现时才发现，必须记住）：`RuntimeBinding::current()` 有 `touch()` 副作用。**
+
+`current()` 的实现是 `self.touch(); Ok(handle.clone())`，`touch()` 会把
+`last_active` 刷成 `Instant::now()`。对「委派请求」这是对的（请求本身算使用），
+但对**探测**是错的：保活探测每 10s 问一次句柄，若顺手刷新空闲时钟，
+`evict_idle_runtimes` 的 `idle_for()` 就永远停在「刚刚」，`EVICT_IDLE_AFTER`
+（600s，`server.rs:50`）永不触发，项目 daemon 永不回收。
+
+所以新增了 `RuntimeBinding::current_handle_no_touch()`
+（`crates/yi-agent-subagent/src/binding.rs`），它只读不 touch。`daemon_busy`
+**只能**用它。守卫测试：
+`current_handle_no_touch_does_not_reset_the_idle_clock`（subagent）、
+`probing_busy_does_not_prevent_runtime_eviction`（app-server）。
+
+**偏差 2：`daemon_busy` 是同步阻塞 IPC，不能进主循环。**
+
+`send_request_with_version_timeout(..., 500ms)` 最坏等满 500ms。虽然远小于 10s
+tick，但放进主循环仍是「每 10s 卡半秒」。实现放在 `power_busy::BusySampler`
+的 `spawn_blocking` 里，主循环只读 `latest()`。守卫测试：
+`a_silent_daemon_costs_at_most_the_probe_timeout`。
+
 但它的「活跃」口径比我们想要的宽，必须写清楚：`active_only=true` 的 SQL 是
 `state_json NOT IN ('completed','completed_no_changes','failed','cancelled')`
 （`repository.rs:3433-3437`）——**只排除了 4 个**，而 `TaskState`
@@ -820,6 +891,17 @@ runtime daemon 执行（`server.rs:1267` 的 `attach::ensure_owned_runtime`）�
      遍历 `FIELDS` 断言每个键都能读回，加了 (1) 不加 (3) 会直接红；
   4. `apply_op`（`settings.rs:675-680`）用 `split_once('.')` 分 `group`/`field`，
      所以键名必须恰好是 `agent.prevent_idle_sleep`，不能多一层点。
+  5. **`crates/yi-agent-web/src/api.rs:77` 的 `field_value`** —— 这一处是本设计
+     最初漏掉的（原文只列了前四项）。它是 web 版设置页的值来源，与
+     `settings_rpc::current_value` 是同构的第二份 match；漏了它会让
+     `tests/api_test.rs` 的 `vars.len() == FIELDS.len()` 变红。**已实测**：
+     少这一处必然红，补上后 `cargo test -p yi-agent-web get_config` 三条全绿。
+
+  实测验证命令（三处各自的守卫）：
+  `cargo test -p yi-agent-app-server settings_rpc`（4 passed）、
+  `cargo test -p yi-agent-web get_config`（3 passed）、
+  `cargo test -p yi-agent-runtime prevent_idle_sleep`（5 passed + 1 条
+  `a_corrupt_settings_file_still_enables_prevention`）。
 - 默认 `"true"`；缺文件 / 空串 / 未知值按默认开处理（与 `tui.notifications`
   的兜底一致）。
 - **改动要立即生效，不能只读启动时那一次**。`read_value` 是每次 RPC 现读磁盘，
@@ -934,6 +1016,20 @@ pmset -g assertions | grep -A2 "yi-agent"
 pmset -g log | grep -E "Entering Sleep|Wake from" | tail -4
 # 若醒来后断言仍在且条件已不成立 → 时钟基准错了(见「时间源的选择」)
 ```
+
+**验收已完成的部分（2026-11-01，实测）**：
+
+- 断言类型正确：`pmset -g assertions` 实测输出
+  `PreventUserIdleSystemSleep named: "yi-agent: keeping the machine awake for work"`，
+  **没有** `PreventSystemSleep` / `PreventUserIdleDisplaySleep`。
+- 线程 + 断言 + 开关的整条链：`cargo test -p yi-agent-app-server --lib power_guard
+  -- --ignored` 通过（`disabling_the_guard_releases_the_real_assertion`，40s）。
+  它验证「线程起来后断言可见 → `set_enabled(false)` 后断言消失」。
+- 退出延迟：`drop` 实测远小于 2 秒（`dropping_the_guard_does_not_wait_a_whole_tick`），
+  没有被 10s tick 拖住。
+
+**仍需人工完成的部分**：上面第 2/3/4 条（断网 15 分钟、拔电 15 分钟、睡醒后不
+白扛）需要真人改网络/电源状态并等待，属于发布前的人工验收，自动化测试覆盖不到。
 
 **验收前必须知道的一个本机事实**：本机 `pmset -g custom` 是
 `Battery Power: sleep 1`（电池下空闲 1 分钟就睡）、`AC Power: sleep 0`（插电

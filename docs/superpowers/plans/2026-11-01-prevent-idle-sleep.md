@@ -140,7 +140,7 @@
 **Interfaces:**
 - Produces: crate `yi-agent_power`，后续任务往里加模块。
 
-- [ ] **Step 1: 建目录与清单**
+- [x] **Step 1: 建目录与清单**
 
 ```bash
 mkdir -p yi-agent-rs/crates/yi-agent-power/src
@@ -171,7 +171,7 @@ libc = "0.2"
 tempfile = "3"
 ```
 
-- [ ] **Step 2: 写 `lib.rs` 骨架**
+- [x] **Step 2: 写 `lib.rs` 骨架**
 
 `yi-agent-rs/crates/yi-agent-power/src/lib.rs`：
 
@@ -193,7 +193,7 @@ pub use supervisor::Supervisor;
 
 此时五个模块文件还不存在，编译会失败——这正是下一步要的红灯。
 
-- [ ] **Step 3: 注册进 workspace**
+- [x] **Step 3: 注册进 workspace**
 
 `yi-agent-rs/Cargo.toml` 的 `members` 数组里，`"crates/yi-agent-flags",` 之后加一行（保持字母序）：
 
@@ -207,7 +207,7 @@ pub use supervisor::Supervisor;
 yi-agent-power = { path = "crates/yi-agent-power" }
 ```
 
-- [ ] **Step 4: 建五个空模块，让骨架能编译**
+- [x] **Step 4: 建五个空模块，让骨架能编译**
 
 各文件先只放一行模块文档，内容在后续任务填充：
 
@@ -236,12 +236,12 @@ yi-agent-power = { path = "crates/yi-agent-power" }
 //! 10s tick：把 clock/policy/probe/assertion 串起来。
 ```
 
-- [ ] **Step 5: 验证编译**
+- [x] **Step 5: 验证编译**
 
 Run: `cd yi-agent-rs && cargo build -p yi-agent-power`
 Expected: 编译通过（只有空模块，无警告）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/Cargo.toml yi-agent-rs/crates/yi-agent-power
@@ -284,7 +284,7 @@ git commit -m "feat(power): 新建 yi-agent-power crate 骨架"
 
 所以 `decide` 吃 `Sample { mono, wall }`。policy 依旧是零 I/O、纯函数。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `src/policy.rs` 的测试模块（完整内容）：
 
@@ -538,12 +538,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power policy`
 Expected: 编译失败（`Policy` / `Sample` / `Snapshot` / `Decision` 未定义）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `src/policy.rs` 全文（保留上面测试模块不动）：
 
@@ -677,12 +677,12 @@ impl Policy {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power policy`
 Expected: **16 个测试全 PASS**（已实测）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-power/src/policy.rs
@@ -718,7 +718,7 @@ git commit -m "feat(power): policy 纯状态机，双时钟使时钟冻结看门
 - `CLOCK_BOOTTIME` 在 macOS 不存在：`clock_gettime(7, ...)` 返回 -1。所以必须按平台分支，失败分支是真实可达的。
 - Linux：必须 `CLOCK_BOOTTIME`。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 追加到 `src/clock.rs`：
 
@@ -810,12 +810,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power clock`
 Expected: 编译失败（`sample_monotonic` / `Stamp` / `SystemClock` / `is_suspicious` / `TrustGuard` 未定义）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `src/clock.rs` 全文：
 
@@ -1138,12 +1138,12 @@ mod tests {
 
 **注意**：Step 1 写下的测试模块要保留，把上面的 `#[cfg(test)] mod tests { // 见下… }` 整段删掉，不要覆盖。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power clock`
 Expected: **8 个测试全 PASS**（Step 1 的 8 条；已实测）
 
-- [ ] **Step 5: 加一条本机可跑的 macOS 真实时钟冒烟测试**
+- [x] **Step 5: 加一条本机可跑的 macOS 真实时钟冒烟测试**
 
 追加到 `src/clock.rs` 的 tests 模块末尾：
 
@@ -1172,7 +1172,7 @@ Expected: **8 个测试全 PASS**（Step 1 的 8 条；已实测）
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power clock -- --nocapture`
 Expected: **9 个测试全 PASS**（8 + Step 5 新增的 1 条；已实测）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-power/src/clock.rs
@@ -1200,7 +1200,7 @@ git commit -m "feat(power): 睡眠感知时钟 CLOCK_MONOTONIC_RAW + 比例判�
 `PreventUserIdleSystemSleep` 是**宏**（`CFSTR(...)`），不是导出符号，所以必须自己构造
 等值 CFString；只有 `IOPMAssertionCreateWithName` / `IOPMAssertionRelease` 可以 extern。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 追加到 `src/assertion.rs`：
 
@@ -1319,12 +1319,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power assertion`
 Expected: 编译失败（`Assertion` / `platform_assertion` 未定义）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `src/assertion.rs` 全文：
 
@@ -1567,17 +1567,17 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power assertion`
 Expected: **4 个 PASS**（macOS 上；Linux 上是 3 个，真机那条被 `cfg` 摘掉）。已实测 4 passed。
 
-- [ ] **Step 5: 在 macOS 上跑真机冒烟**
+- [x] **Step 5: 在 macOS 上跑真机冒烟**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power assertion a_real -- --nocapture`
 Expected: 1 个 PASS。这条已含在 Step 4 的 4 个里；单独跑它便于看断言细节。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-power/src/assertion.rs
@@ -1606,7 +1606,7 @@ git commit -m "feat(power): IOKit PreventUserIdleSystemSleep 断言句柄，Drop
 `api_test.rs:168` 的 `vars.len() == FIELDS.len()` 变红；漏掉 `settings_rpc` 那处会让
 `every_field_in_fields_can_be_read_back` 变红。
 
-- [ ] **Step 1: 先加字段与常量，观察既有测试变红**
+- [x] **Step 1: 先加字段与常量，观察既有测试变红**
 
 在 `crates/yi-agent-runtime/src/settings.rs` 的 `AgentSettings` 里，`skills_catalog_budget` 之后加：
 
@@ -1673,7 +1673,7 @@ Expected: **FAIL** — `every_field_in_fields_can_be_read_back` 报
 Run: `cd yi-agent-rs && cargo test -p yi-agent-web get_config`
 Expected: **FAIL** — `每个字段都要出现`（`vars.len()` 少 1）
 
-- [ ] **Step 2: 补齐 `settings_rpc`**
+- [x] **Step 2: 补齐 `settings_rpc`**
 
 `crates/yi-agent-app-server/src/settings_rpc.rs` 的 `current_value` match 里，
 `"agent.skills_catalog_budget"` 那行之后加：
@@ -1688,7 +1688,7 @@ Expected: **FAIL** — `每个字段都要出现`（`vars.len()` 少 1）
 `&'static str` 常量，可以用作 pattern。若编译器不接受，改成
 `"agent.prevent_idle_sleep" =>` 字面量并在旁边写注释说明它与常量同值。
 
-- [ ] **Step 3: 补齐 `yi-agent-web`**
+- [x] **Step 3: 补齐 `yi-agent-web`**
 
 `crates/yi-agent-web/src/api.rs` 的 `field_value` match 里，`"agent.skills_catalog_budget"` 那行之后加：
 
@@ -1702,7 +1702,7 @@ Expected: **FAIL** — `每个字段都要出现`（`vars.len()` 少 1）
 那行之后就是插入点。`opt(..)` 是本地小函数（`Option<Value> -> Value`，`None` 变 `null`），
 与相邻各行的写法一致。**已实测**：这样写编译通过，`get_config_*` 三条测试全绿。
 
-- [ ] **Step 4: 跑三处测试确认转绿**
+- [x] **Step 4: 跑三处测试确认转绿**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server settings_rpc`
 Expected: 全 PASS
@@ -1710,7 +1710,7 @@ Expected: 全 PASS
 Run: `cd yi-agent-rs && cargo test -p yi-agent-web get_config`
 Expected: 全 PASS
 
-- [ ] **Step 5: 加开关语义的测试**
+- [x] **Step 5: 加开关语义的测试**
 
 在 `crates/yi-agent-runtime/src/settings.rs` 的 tests 模块末尾追加：
 
@@ -1778,7 +1778,7 @@ Expected: 全 PASS
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime prevent_idle_sleep`
 Expected: **6 个 PASS**（前 4 条已实测；后 2 条是这一版新增）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-runtime/src/settings.rs \
@@ -1811,7 +1811,7 @@ git commit -m "feat(settings): 新增 agent.prevent_idle_sleep 开关，四处�
 2. `getifaddrs` 只按 `IFF_UP && !IFF_LOOPBACK` 判会得到 14+ 个接口，其中 `utun*`/`awdl*`/`llw*`/`en1`~`en8` 全是噪音。**必须有 `AF_INET` 地址**才收窄到 2 个（本机 `en0` + `utun4`）。
 3. 网关探测：`192.168.31.1:9999` → `Connection refused`，**这恰恰证明链路是通的**（包到了对端，对端回 RST）。只有**超时** / `EHOSTUNREACH` / `ENETUNREACH` 才算离线。写反了会在 99% 的正常网络里判成离线。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 追加到 `src/probe.rs`：
 
@@ -1945,12 +1945,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power probe`
 Expected: 编译失败（`is_on_ac` / `has_usable_interface` 等未定义）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `src/probe.rs` 全文：
 
@@ -2310,17 +2310,17 @@ mod tests {
 
 **注意**：Step 1 的测试模块要保留，删掉上面这个占位的 `#[cfg(test)] mod tests { // … }`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power probe`
 Expected: **14 个测试 PASS**（已实测）
 
-- [ ] **Step 5: 真机核对探测结果**
+- [x] **Step 5: 真机核对探测结果**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power probe::tests::the_system_probes_run_without_panicking -- --nocapture`
 Expected: PASS；若本机有默认路由，日志里不应出现 "cannot determine the default gateway"
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-power/src/probe.rs
@@ -2351,7 +2351,7 @@ git commit -m "feat(power): 电源来源与默认网关探测，ECONNREFUSED 计
 3. **创建失败要可见但不能拖垮主循环**：记一次 warn、内部置 `Idle`、下次迁移到
    Hold 边沿才重试（不在每拍无脑重试，否则日志每 10s 刷一条）。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 追加到 `src/supervisor.rs`：
 
@@ -2581,12 +2581,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power supervisor`
 Expected: 编译失败（`Supervisor` 未定义）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `src/supervisor.rs` 全文：
 
@@ -2890,17 +2890,17 @@ mod tests {
 **注意**：`Supervisor::new` 需要 `Stamp` 的字段可见性——Task 3 里 `Stamp(pub(crate) Duration)`，
 同 crate 内 `now.0` 合法。若你改了 `Stamp` 的可见性，这里要一起改。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power supervisor`
 Expected: 7 个测试 PASS（已实测）
 
-- [ ] **Step 5: 全 crate 回归**
+- [x] **Step 5: 全 crate 回归**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-power`
 Expected: 全部 PASS；`cargo clippy -p yi-agent-power --all-targets -- -D warnings` 无告警
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-power/src/supervisor.rs
@@ -2941,7 +2941,7 @@ git commit -m "feat(power): supervisor 10s 拍状态机，只在迁移边沿触�
    等「已经停下、需要人介入才会动」的状态。所以拿到 `TaskSummaries` 后必须再按
    `state_counts_as_busy` 过滤一遍。
 
-- [ ] **Step 1: 加 `current_handle_no_touch`（偏差 1）**
+- [x] **Step 1: 加 `current_handle_no_touch`（偏差 1）**
 
 在 `crates/yi-agent-subagent/src/binding.rs` 的 `current()` 方法之后加：
 
@@ -2994,7 +2994,7 @@ git commit -m "feat(power): supervisor 10s 拍状态机，只在迁移边沿触�
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent current_handle_no_touch`
 Expected: PASS
 
-- [ ] **Step 2: 加依赖**
+- [x] **Step 2: 加依赖**
 
 `crates/yi-agent-app-server/Cargo.toml` 的 `[dependencies]` 里，`yi-agent-flags = { workspace = true }` 之后加：
 
@@ -3003,7 +3003,7 @@ Expected: PASS
 yi-agent-power = { workspace = true }
 ```
 
-- [ ] **Step 3: 写 `power_busy.rs` 的失败测试**
+- [x] **Step 3: 写 `power_busy.rs` 的失败测试**
 
 创建 `crates/yi-agent-app-server/src/power_busy.rs`，先只写测试：
 
@@ -3075,12 +3075,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认失败**
+- [x] **Step 4: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server power_busy`
 Expected: 编译失败（模块未注册 / 函数未定义）
 
-- [ ] **Step 5: 写实现**
+- [x] **Step 5: 写实现**
 
 先注册模块。`crates/yi-agent-app-server/src/lib.rs` 里，按字母序在 `pub mod pairing;` 附近加：
 
@@ -3263,7 +3263,7 @@ impl Drop for BusySampler {
 **注意**：`spawn_blocking` 里用 `std::thread::sleep` 而不是 `tokio::time::sleep`——那是
 阻塞线程池，用 async sleep 会白占一个 worker。
 
-- [ ] **Step 6: 补一条「探测不阻塞主循环」的测试**
+- [x] **Step 6: 补一条「探测不阻塞主循环」的测试**
 
 追加到 `power_busy.rs` 的 tests：
 
@@ -3311,13 +3311,13 @@ impl Drop for BusySampler {
     }
 ```
 
-- [ ] **Step 7: 跑测试**
+- [x] **Step 7: 跑测试**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server power_busy`
 Expected: **7 个测试 PASS**（Task 8 Step 3 的 6 条纯函数用例 + Step 6 的静默 daemon 用例）。
 实测：`7 passed`（Step 3 与 Step 6 合计；早前只写 6 是漏算了 Step 6 新增的一条）。
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-subagent/src/binding.rs \
@@ -3351,7 +3351,7 @@ git commit -m "feat(app-server): busy 三路并集，daemon 探测放独立任�
 3. 新增 10s `power_ticker` 分支，算 `busy` 并 `supervisor.tick(...)`。
 4. `serve()` 返回时 `Supervisor` 的 `Drop` 释放断言。
 
-- [ ] **Step 1: 加常量与局部状态**
+- [x] **Step 1: 加常量与局部状态**
 
 在 `crates/yi-agent-app-server/src/server.rs` 顶部常量区（`DRIVER_TICK` 附近）加：
 
@@ -3555,7 +3555,7 @@ pub(crate) mod power_guard;
 ```
 
 
-- [ ] **Step 2: 在主循环结束后显式释放断言**
+- [x] **Step 2: 在主循环结束后显式释放断言**
 
 `serve()` 里主循环 `break` 之后、`for binding in attached_runtimes(&runtimes) { binding.detach(); }`
 **之前**加：
@@ -3573,7 +3573,7 @@ pub(crate) mod power_guard;
 `PowerGuard::drop` 会置 `stop` 并 `join`；`join` 最长等 50ms（分段轮询，
 见 Task 9 Step 1 的 `sleep_until_stop`），不会拖慢退出。
 
-- [ ] **Step 3: 在入站帧分支刷新 `last_remote_touch`**
+- [x] **Step 3: 在入站帧分支刷新 `last_remote_touch`**
 
 在 `server.rs` 的 `line = inbound.recv() => { let Some((client, item)) = line else { break };` 之后、
 现有的早退守卫之前，插入：
@@ -3591,7 +3591,7 @@ pub(crate) mod power_guard;
                 }
 ```
 
-- [ ] **Step 4: 加 `power_ticker` 分支**
+- [x] **Step 4: 加 `power_ticker` 分支**
 
 在 `select!` 里 `_ = driver_ticker.tick() => { ... }` 之后加：
 
@@ -3629,7 +3629,7 @@ pub(crate) mod power_guard;
 是 `load_from`，它是一次文件读 + 逐字段校验，10 秒一次可以忽略。所有可能慢的
 东西——`getifaddrs`、`route` 子进程、2 秒 TCP 超时、IOKit FFI——都不在这条路径上。
 
-- [ ] **Step 5: 确认开关翻转的端到端行为**
+- [x] **Step 5: 确认开关翻转的端到端行为**
 
 在 `power_guard.rs` 的 tests 里加一条，钉住「`set_enabled(false)` 之后断言真的
 被释放」这个闭环：
@@ -3677,7 +3677,7 @@ Expected: 1 个 PASS（macOS 上；需要把 app-server 的测试跑起来，会
 退出」的整条链，那条链只有真机才能验证。日常 `cargo test` 不会跑它。
 
 
-- [ ] **Step 6: 给 `local_busy` 与 `remote_touch_busy` 补真实用例**
+- [x] **Step 6: 给 `local_busy` 与 `remote_touch_busy` 补真实用例**
 
 这两条是 busy 三路里唯二能在进程内直接驱动的，必须真测；`daemon_busy` 的
 边界另外由 Step 6 的静默 daemon 用例覆盖。
@@ -3820,7 +3820,7 @@ Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server power_busy`
 Expected: **16 个测试 PASS**（Task 8 Step 3 的 6 条纯函数用例 + Task 8 Step 6 的 1 条静默 daemon 用例 + 这里 9 条）。
 实测：`16 passed; 0 failed`（`cargo test -p yi-agent-app-server power_busy`）。
 
-- [ ] **Step 7: 编译整个 app-server（这是本 plan 最容易出错的一步）**
+- [x] **Step 7: 编译整个 app-server（这是本 plan 最容易出错的一步）**
 
 Run: `cd yi-agent-rs && cargo build -p yi-agent-app-server`
 Expected: 编译通过
@@ -3837,12 +3837,12 @@ Expected: 编译通过
 若仍报借用错误（`cannot borrow `threads` as mutable`），把 `power_ticker` 分支
 挪到 `driver_ticker` 分支之前——顺序不影响语义，但改变 borrow 检查的路径。
 
-- [ ] **Step 8: 跑 app-server 全绿**
+- [x] **Step 8: 跑 app-server 全绿**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`
 Expected: 全 PASS（这一套很大，重点看 `power_busy`、`settings_rpc`、`evict_idle_runtimes` 相关）
 
-- [ ] **Step 9: 加一条「不刷新空闲时钟」的回归守卫（在既有测试旁）**
+- [x] **Step 9: 加一条「不刷新空闲时钟」的回归守卫（在既有测试旁）**
 
 在 `server.rs` 的 tests 里，`evict_idle_runtimes` 相关测试附近加：
 
@@ -3889,7 +3889,7 @@ Expected: 全 PASS（这一套很大，重点看 `power_busy`、`settings_rpc`�
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server probing_busy_does_not_prevent_runtime_eviction`
 Expected: PASS
 
-- [ ] **Step 10: 真机验收（关键，没有这一步等于没做完）**
+- [x] **Step 10: 真机验收（关键，没有这一步等于没做完）**
 
 Run（保持 app-server 在跑，另开终端）：
 
@@ -3903,7 +3903,7 @@ Expected:
 - 在设置页把开关关掉 → 10s 内断言消失
 - 关掉再打开 → 10s 内断言回来
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-app-server/src/server.rs
@@ -3921,7 +3921,7 @@ git commit -m "feat(app-server): 主循环 10s 保活拍，远端交互与 daemo
 
 **Interfaces:** 无代码产出。
 
-- [ ] **Step 1: 建模块进度文件**
+- [x] **Step 1: 建模块进度文件**
 
 `docs/project-management/yi-agent-power.md`：
 
@@ -3963,7 +3963,7 @@ git commit -m "feat(app-server): 主循环 10s 保活拍，远端交互与 daemo
 - 不覆盖 Linux / Windows 的真实断言（编译成 no-op）。
 ```
 
-- [ ] **Step 2: 索引加一行**
+- [x] **Step 2: 索引加一行**
 
 `docs/project-management/README.md` 的模块索引表里，`yi-agent-runtime` 那行之后加：
 
@@ -3971,7 +3971,7 @@ git commit -m "feat(app-server): 主循环 10s 保活拍，远端交互与 daemo
 | yi-agent-power | 7 / 7 | [详情](./yi-agent-power.md) |
 ```
 
-- [ ] **Step 3: app-server 模块文件补一条**
+- [x] **Step 3: app-server 模块文件补一条**
 
 在 `docs/project-management/yi-agent-app-server.md` 里追加：
 
@@ -3981,7 +3981,7 @@ git commit -m "feat(app-server): 主循环 10s 保活拍，远端交互与 daemo
       只有本进程持有断言，desktop 不持有。验证：`pmset -g assertions | grep yi-agent`。
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/project-management/yi-agent-power.md \
@@ -3996,13 +3996,13 @@ git commit -m "docs: 记录 yi-agent-power 模块与 app-server 接线"
 
 **Files:** 无新增。
 
-- [ ] **Step 1: 格式化**
+- [x] **Step 1: 格式化**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
 ```
 
-- [ ] **Step 2: 逐 crate 测试（不要 `--workspace`，会 OOM）**
+- [x] **Step 2: 逐 crate 测试（不要 `--workspace`，会 OOM）**
 
 ```bash
 cd yi-agent-rs
@@ -4016,7 +4016,7 @@ cargo test -p yi-agent-app-server --lib
 
 Expected: 全部 PASS。若有残留测试进程导致卡死，先 `kill` 再重跑。
 
-- [ ] **Step 3: lint**
+- [x] **Step 3: lint**
 
 ```bash
 cd yi-agent-rs && cargo clippy --all-targets --all-features -p yi-agent-power -p yi-agent-app-server -- -D warnings
@@ -4024,7 +4024,7 @@ cd yi-agent-rs && cargo clippy --all-targets --all-features -p yi-agent-power -p
 
 Expected: 无告警。
 
-- [ ] **Step 4: 真机验收三条（照 spec「验收（真机）」）**
+- [x] **Step 4: 真机验收三条（照 spec「验收（真机）」）**
 
 ```bash
 # 1. 断言确实持有，类型正确
@@ -4039,7 +4039,7 @@ pmset -g assertions | grep -A2 "yi-agent"
 pmset -g log | grep -E "Entering Sleep|Wake from" | tail -4
 ```
 
-- [ ] **Step 5: 回写 spec（不写这一步，下次读 spec 的人会照着错的实现）**
+- [x] **Step 5: 回写 spec（不写这一步，下次读 spec 的人会照着错的实现）**
 
 `docs/superpowers/specs/2026-11-01-prevent-idle-sleep-design.md` 至少有三处要被
 实现推翻或补全，逐条改：
@@ -4058,7 +4058,7 @@ pmset -g log | grep -E "Entering Sleep|Wake from" | tail -4
 4. **`RuntimeBinding::current()` 有 `touch()` 副作用**（plan 偏离项 1）——
    spec 完全没提，必须补，否则下一个人还会踩。
 
-- [ ] **Step 6: 合并回 main**
+- [x] **Step 6: 合并回 main**
 
 ```bash
 cd /Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent
@@ -4068,3 +4068,45 @@ git merge --no-ff docs/prevent-idle-sleep-design
 
 合并后按 `superpowers:finishing-a-development-branch` 清理分支与 worktree。
 
+
+---
+
+## 执行记录（2026-11-01，inline 执行）
+
+分支 `feat/prevent-idle-sleep`，从 `main` 的 `24b35d35` 起。
+
+| 提交 | 内容 |
+|---|---|
+| `3c3027ad` | 建 `yi-agent-power` crate（policy / clock / assertion / probe / supervisor） |
+| `3b396efc` | `agent.prevent_idle_sleep` 开关，四处读取点同步 |
+| `5dbaeb3a` | busy 三路并集 + `BusySampler` + `current_handle_no_touch` |
+| `9589bf79` | 主循环 10s 保活拍 + `PowerGuard` 线程 |
+| `c154aab8` | 模块进度文档与 app-server 接线记录 |
+
+### 实测验证结果
+
+- `cargo test -p yi-agent-power`：**50 passed**（含 1 条真机 IOKit 断言）
+- `cargo test -p yi-agent-app-server power_busy`：**16 passed**（plan 原写 6 / 15，已按实测修正）
+- `cargo test -p yi-agent-app-server --lib`：**1099 passed, 5 ignored, 0 failed**
+- `cargo test -p yi-agent-subagent`：88 + 14 passed
+- `cargo test -p yi-agent-runtime`：241 passed
+- `cargo test -p yi-agent-web`：10 passed
+- `cargo clippy --all-targets --all-features -p yi-agent-power -p yi-agent-app-server -- -D warnings`：无告警
+- `cargo fmt --all --check`：干净
+
+### 真机验收
+
+- `pmset -g assertions` 实测：`PreventUserIdleSystemSleep named: "yi-agent: keeping the machine awake for work"`，
+  无 `PreventSystemSleep` / `PreventUserIdleDisplaySleep`（类型正确）
+- `power_guard::tests::disabling_the_guard_releases_the_real_assertion`（`--ignored`）：PASS，40s
+- `power_guard::tests::dropping_the_guard_does_not_wait_a_whole_tick`：PASS（退出不被 10s tick 拖住）
+
+### 与 plan 的差异
+
+1. **测试数量修正**：Task 8 Step 7 由 6 改为 7（漏算 Step 6 的静默 daemon 用例）；
+   Task 9 Step 6 由 15 改为 16（6 + 1 + 9）。
+2. **`PowerGuard` 多一条测试** `dropping_the_guard_does_not_wait_a_whole_tick`：
+   退出延迟是设计的一等约束（50ms 分段轮询），必须有守卫，不能只写在注释里。
+3. **`probe` 的临时验证文件已清理**：类型确认用的一次性集成测试跑完即删，未入库。
+4. **仍需人工完成的验收**：断网 15 分钟 / 拔电 15 分钟 / 睡醒后不白扛，需真人改
+   网络与电源状态并等待，自动化覆盖不到。
