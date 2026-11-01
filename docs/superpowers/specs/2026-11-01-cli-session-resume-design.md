@@ -225,7 +225,7 @@ let agent = Agent::new(provider, tools, config).with_session_arc(Arc::new(Mutex:
 
 ### 6.1 driver 改造
 
-当前 driver 以 `Agent::new(provider, tools, config).with_permission(...)` 构造（`main.rs:2088`），**没有 session**；靠 `live.rebuild`（`main.rs:1855`）在控制命令时才换成 `with_session_arc`。
+当前 driver 以 `Agent::new(provider, tools, config).with_permission(...)` 构造（`main.rs:2113`），**没有 session**；靠 `rebuild_driver_agent`（`main.rs:1845`，其内 `Agent::new` 在 `:1855`）在控制命令时才换成 `with_session_arc`。
 
 注入历史必须在首次构造时完成，因此 driver 改为启动即持 `Arc<Mutex<Session>>`：新会话种空 `Vec<Message>`，resume 种已载入的历史。
 
@@ -277,11 +277,11 @@ driver 收到本轮 `Done` 后构造 `TurnLine::Turn { items, usage, usage_total
 
 1. **必须复用 `HistoryState` 的既有上限**（`MAX_HISTORY_CELLS = 2000`，`history.rs:172`）。回放几千条 item 会撑爆内存，且 `enforce_history_cap` 已实现「外科式从头部 drop」并上报 `dropped_cells()`。直接批量 push 后由既有机制裁剪，不新写裁剪逻辑。
 2. **回放不产生「新」的视觉分隔**：`Separator` 只在 turn 边界插入，与实时渲染同规则，否则重开一次会话就多出一堆横线。
-3. **`pending_turn` 的 interrupted 提示**用 `Separator { label: Some("上一轮已中断") }`，与既有 `HistoryCell::Separator` 用法一致（`app.rs:2628` 的「对话已清空」即是此形）。
+3. **`pending_turn` 的 interrupted 提示**用 `Separator { label: Some("上一轮已中断") }`，与既有 `HistoryCell::Separator` 用法一致（`app.rs:2791` 附近的「对话已清空」即是此形）。
 
 ### 6.4 `/clear` 与 `/compact` 的持久化语义（原设计遗漏）
 
-TUI 这两个命令目前只作用于内存（`app.rs:2626` / `:2677`，driver 侧 `main.rs:2108` / `:2124`）。会话一旦持久化，它们直接与磁盘冲突，必须各自定义语义，否则会出现「屏幕上清空了、resume 回来旧内容全在」这种最糟糕的错位。
+TUI 这两个命令目前只作用于内存（`app.rs:2790` / `:2846`，driver 侧 `main.rs:2133` / `:2149`）。会话一旦持久化，它们直接与磁盘冲突，必须各自定义语义，否则会出现「屏幕上清空了、resume 回来旧内容全在」这种最糟糕的错位。
 
 **`/clear`：直接复用 `ThreadStore::truncate`，不要新造方案。**
 
