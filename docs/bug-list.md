@@ -1,5 +1,12 @@
 # Bug 列表
 
+- [x] 承上：离线段在「**根本没有缓存**」时仍声称「离线内容」，说的是用户看不到的东西。
+  **发现方式**：修完 `20xxxd` 后复查同一渲染条件（`desktop/src/App.tsx:2630-2634`）。提示条的显示条件是 `(offline && cachedAt.has(id)) || syncState === "syncing"`，而 `savedAt` 取 `cachedAt.get(id) ?? null`——两个分支并不等价：走 `syncing` 那条时 `cachedAt` **可以没有**这个 id，于是 `savedAt` 为 null。上一版把 null 翻成「离线内容 · 更新时间未知」，数字是诚实了，但那句话仍然断言「屏幕上是离线内容」。
+  **实测（探针，非推理）**：在 `App.test.tsx` 的同类场景（手机端 + 列表缓存 + `thread/resume` 挂起、无内容缓存）里打印 `document.body.textContent`，得到 `离线内容 · 更新时间未知`，而正文区**没有任何消息文本**（`PROBE_HAS_MSG_TEXT: false`）——提示条在介绍一份不存在的缓存。
+  **根因**：把「没有缓存条目」（null）与「有缓存但时间未知」（`formatRelativeTime` 判未知）混成了同一句话。前者是**没有内容**，后者是**有内容但不知多旧**，用户要采取的动作不同。
+  **修复**：`CacheNotice` 的 `offlineLabel` 先分 null——直接说「内容未缓存 · 连接断开」，不编时间也不声称有内容；只有真正拿到 `savedAt` 且算得出年龄时才说「离线内容 · 更新于 3h」。
+  **验证**：`cd desktop && npx tsc --noEmit && npx vitest run`（1856 全绿，140 文件）。**回退即红（实测）**：把 `CacheNotice.tsx` 还原成上一版后，`does not claim offline content when nothing is cached`、`treats a zero timestamp as not-cached instead of inventing an age`、`never renders a bogus day count in the offline notice` 三条全红；恢复即 230 全绿。
+
 - [x] 手机端离线状态下「更新时间」显示成 `20xxxd`，用户不可读（用户报「手机端离线状态下 更新时间显示20xxxd 用户不友好」）。
   **根因（一个字段两种语义被混为一谈）**：离线提示条把「没有缓存时间」当成「缓存时间是 0」。`CacheNotice`（`desktop/src/components/CacheNotice.tsx:27`）写的是 `formatRelativeTime(savedAt ?? 0)`，而 `savedAt` 来自 `cachedAt.get(id) ?? null`（`desktop/src/App.tsx:2624`）——该会话**没有内容缓存条目**时它就是 null。`formatRelativeTime` 对 0 忠实按毫秒算：`(now - 0) / 86_400_000` = **20758 天**，于是屏幕上是「离线内容 · 更新于 20758d」。0 在本仓库所有生产者里都不是合法时间戳（`contentStore.ts:309` 与 `sessionCache.ts:104` 都写 `Date.now()`），它只可能表示「不知道」。
   **触发条件是冷启的正常形状，不需要任何异常**：握手顺序为 `initialize → thread/listAll → selectThread(thread/resume) → setStatus("connected")`（`App.tsx:1679-1822`），resume 在连接状态置为 `connected` **之前**就已发出，故这段时间 `offline = isRemoteClient() && status !== "connected"` 恒为真；同时 `selectThread` 已把该会话 `syncState` 置为 `"syncing"`（`App.tsx:970`）。两个条件同时成立 ⇒ 提示条的渲染条件（`App.tsx:2621-2622` 的 `offline && cachedAt.has(id)` 或 `syncState === "syncing"`）走通，而 `cachedAt` 里可能根本没有这个会话（首屏快照只存列表、内容已被 LRU 淘汰、或从未打开过）。

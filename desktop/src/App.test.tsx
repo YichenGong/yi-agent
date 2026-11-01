@@ -5702,10 +5702,12 @@ describe("App mobile offline UX", () => {
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
-    const notice = await screen.findByText(/离线内容|正在同步/);
+    const notice = await screen.findByText(/离线内容|正在同步|内容未缓存/);
     expect(notice.textContent ?? "").not.toMatch(/\d{3,}d/);
-    // 时间真的算不出来（该会话没有内容缓存）时，如实说未知，不要编一个天数。
+    // 时间真的算不出来（该会话没有内容缓存）时，不要编一个天数。
     expect(notice.textContent ?? "").not.toContain("20758");
+    // 而且不能声称是「离线内容」：这个会话根本没有缓存条目，正文区是空的。
+    expect(notice.textContent ?? "").not.toContain("离线内容");
   });
 });
 
