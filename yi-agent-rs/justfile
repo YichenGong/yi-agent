@@ -48,6 +48,18 @@ ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-
 magpie-agent-check:
     bash ../scripts/test-magpie-agent.sh
 
+# 桌面端类型检查 + 单元测试。需要 Node，故**不进** `ci` 依赖列表：
+# MR 路径的 `ci-mr` 用的是 `rust:latest` 镜像，没有 Node；塞进去会把整条
+# 流水线拖垮。与 `magpie-agent-check` 同类，由独立 job 跑。
+#
+# 用 `tsc --noEmit` 而不是 `npm run build`：门禁要的是类型正确，产出 `dist/`
+# 是发布步骤。用 `npx vitest run` 而不是 `npm test`：避免以后 test 脚本被改成
+# watch 模式后门禁挂死。用 `npm ci` 而不是 `npm install`：严格按 lock 安装且不改它。
+desktop-check:
+    cd ../desktop && npm ci
+    cd ../desktop && npx tsc --noEmit
+    cd ../desktop && npx vitest run
+
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:

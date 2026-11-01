@@ -31,3 +31,26 @@ jobs:
       # yi-agent-rs/justfile 的 `ci` recipe 依赖列表（不再内联，避免漏列而漂移，
       # 例如新挂的 secret-check）。GitHub PR / GitLab push / GitLab MR 三条路径
       # 统一走 `just ci`，故此处不再单列一步，否则同一条门禁在 GitHub 路径上会跑两遍。
+
+  desktop:
+    # 独立 job：`rust:latest` 系镜像没有 Node，桌面测试不能塞进 just ci。
+    #
+    # Node 22：vite 8 的 engines 是 `^20.19.0 || >=22.12.0`
+    # （实测 node_modules/vite/package.json），Node 20 其实也在允许范围内
+    # （`"20"` 取 20.x 最新，当日为 v20.20.2）。选 22 的理由是维护活跃度：
+    # v20 自 2026-03-24 起未再发版，v22 最新为 v22.23.4（2026-10-20，LTS Jod）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Desktop type check + unit tests
+        working-directory: yi-agent-rs
+        run: just desktop-check
