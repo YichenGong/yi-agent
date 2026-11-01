@@ -303,6 +303,8 @@ mod tests {
             store: Arc::new(crate::thread_store::ThreadStore::new(&std::env::temp_dir())),
             status: Arc::new(std::sync::Mutex::new(status)),
             subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+            // busy 判定不碰会话写锁；这里只是补字段。
+            writer_lock: None,
         }
     }
 
