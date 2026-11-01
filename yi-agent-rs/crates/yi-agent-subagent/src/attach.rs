@@ -5,6 +5,7 @@
 //! both go through here rather than each inventing their own bring-up.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use yi_agent_core::subagent::worker::AgentWorkerFactory;
 use yi_agent_runtime::config::RuntimeConfig;
@@ -12,22 +13,53 @@ use yi_agent_store::ipc::{Daemon, IpcError, IpcResponse, send_request};
 
 use crate::AttachedRoot;
 
-/// Why a runtime could not be brought up. Both fields are diagnostics for the
-/// trace: delegation is optional, so neither reaches the user as an error.
+/// Why a runtime could not be brought up. Every field is diagnostics for the
+/// trace: delegation is optional, so none of them reaches the user as an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachFailure {
     /// The bring-up step that failed: `runtime directory`, `worker factory`,
     /// `daemon start`, or `attach`.
     pub stage: &'static str,
     pub cause: String,
+    /// Whether the same call could plausibly succeed later.
+    ///
+    /// Callers cache failures so a doomed bring-up is not re-run on every
+    /// thread, but a *transient* failure must never be cached: on 2026-11-01 the
+    /// desktop's first attach raced the daemon's bind, got ENOENT, and the
+    /// cached `Err` left every later thread in that process without
+    /// `spawn_agent` until the app was restarted. Only failures that no retry
+    /// can fix -- a missing catalogue, an unusable runtime directory, a rejected
+    /// attachment -- are permanent.
+    pub retryable: bool,
 }
 
 impl AttachFailure {
+    /// A failure that another attempt cannot fix (a bad directory, an
+    /// unreadable catalogue, a rejection by the daemon).
     pub fn new(stage: &'static str, cause: impl std::fmt::Display) -> Self {
         Self {
             stage,
             cause: cause.to_string(),
+            retryable: false,
         }
+    }
+
+    /// A failure that is only about *when* the call happened: the peer's socket
+    /// was not there yet, or the daemon was still coming up. The caller should
+    /// wait and try again, and must not cache the miss.
+    pub fn transient(stage: &'static str, cause: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            cause: cause.to_string(),
+            retryable: true,
+        }
+    }
+}
+
+impl std::fmt::Display for AttachFailure {
+    /// `stage: cause` -- the shape the desktop's trace line has always used.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.cause)
     }
 }
 
@@ -250,7 +282,13 @@ pub fn attach_project_runtime_with_environment(
             extra_roots: Vec::new(),
         },
     )
-    .map_err(|error| AttachFailure::new("attach", error))?;
+    .map_err(|error| match &error {
+        // A peer that holds the instance lock but has not bound its socket yet
+        // is *starting*, not broken: report it as transient so the caller waits
+        // instead of caching a miss.
+        IpcError::Io(io) if is_startup_io(io) => AttachFailure::transient("attach", error),
+        _ => AttachFailure::new("attach", error),
+    })?;
     let IpcResponse::ApplicationRootAttached {
         session_id,
         root_task_id,
@@ -395,6 +433,49 @@ fn is_dead_io(error: &std::io::Error) -> bool {
     )
 }
 
+/// How long a caller waits for a peer daemon that holds the instance lock but
+/// has not bound its socket yet.
+///
+/// `Daemon::start` proves liveness with an exclusive `flock`, then deletes the
+/// stale socket node and binds a fresh one. A caller that loses the lock race
+/// sees `AlreadyRunning` *and* a socket path that may not exist yet: connecting
+/// then fails with ENOENT even though a daemon is starting. Waiting is the only
+/// correct answer -- treating it as "dead" is what stranded the desktop's
+/// delegation tools on 2026-11-01.
+const PEER_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the wait above re-probes the socket.
+const PEER_START_POLL: Duration = Duration::from_millis(25);
+
+/// Whether a failed `attach` request can only be about the peer's startup window
+/// (the socket was not bound yet, or the daemon was still initialising).
+fn is_startup_io(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+    )
+}
+
+/// Waits until `deadline` for the peer's socket to stop answering `Dead`.
+///
+/// Returns as soon as the probe is no longer `Dead`: a `Healthy` daemon can be
+/// attached, and `Unknown`/`Wedged` are real answers the caller must see rather
+/// than keep waiting on. Returns `false` only when the budget ran out with the
+/// socket still missing, which is when the failure is genuine.
+fn wait_for_peer_socket(socket_path: &Path, deadline: Instant) -> bool {
+    loop {
+        if probe_runtime(socket_path) != RuntimeProbe::Dead {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(PEER_START_POLL.min(deadline - now));
+    }
+}
+
 /// Starts, joins, or replaces the project daemon so *this* process ends up
 /// owning a usable runtime.
 ///
@@ -437,7 +518,31 @@ pub fn ensure_owned_runtime(
     // `attach_project_runtime` already implements the three outcomes this
     // classification implies: a fresh start, a join on `AlreadyRunning`, or a
     // start over the socket node a dead daemon left behind.
-    attach_project_runtime(cfg, runtime_dir, models_path)
+    //
+    // The one race it cannot handle on its own is a peer that already holds the
+    // instance lock: we take the `AlreadyRunning` branch while that peer is
+    // still between "lock acquired" and "socket bound", so the attach that
+    // follows fails with ENOENT/ECONNREFUSED. Retry within a bounded budget --
+    // the peer will either finish binding or never show up, and only then is
+    // the failure real.
+    let deadline = Instant::now() + PEER_START_TIMEOUT;
+    loop {
+        match attach_project_runtime(cfg, runtime_dir.clone(), models_path) {
+            Ok(attached) => return Ok(attached),
+            Err(failure) if failure.retryable => {
+                // Do not spin: wait for the peer's socket to answer, then retry
+                // the whole bring-up (which re-takes the lock and re-attaches).
+                if !wait_for_peer_socket(&socket_path, deadline) {
+                    return Err(failure);
+                }
+                // The socket can be up while the daemon is still refusing
+                // requests; a retry loop tighter than the poll interval would
+                // burn the whole budget in microseconds.
+                std::thread::sleep(PEER_START_POLL);
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
 }
 
 /// Retires a *wedged* daemon (listening, but every request answers `internal`)

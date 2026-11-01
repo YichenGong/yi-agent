@@ -32,7 +32,7 @@ pub(crate) mod websearch;
 pub(crate) mod workspace;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -109,7 +109,6 @@ pub(crate) fn thread_config_view(
     effective.redacted_view_for_session(cwd, &model, yolo)
 }
 
-use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 值守安装句柄。与 `server.rs` 里的 `pub(crate) type WatchmanInstall` 是**同一个**
@@ -122,8 +121,7 @@ pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Se
 /// `type ProjectRuntimes` 是**同一个**类型(同一个 `Arc<StdMutex<HashMap<..>>>`),
 /// 在对齐处互换无碍——与 [`WatchmanInstall`] 同一手法。`agent/*` 与 `thread/*`
 /// 的臂把它转发给 daemon 查询 helper(`socket_for_thread` 等)。
-pub(crate) type ProjectRuntimes =
-    Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
+pub(crate) type ProjectRuntimes = crate::server::ProjectRuntimes;
 
 /// 每会话自身的 root 表(建在项目共享 binding 之上)。同 [`ProjectRuntimes`],
 /// 与 `server.rs` 的同名私有别名是同一个类型。

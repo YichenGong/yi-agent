@@ -1217,3 +1217,126 @@ async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
         "the spawn must NOT have been replayed: no child may exist under the new root"
     );
 }
+
+/// 启动瞬间的竞态: 别人正在起 daemon(socket 还没 bind)时, attach 必须等。
+///
+/// 真实形状(2026-11-01 desktop 冷启动): `daemon serve` 先拿到了实例锁,
+/// 而 `app-server` 在同一毫秒 probe 得 `Dead`(socket 文件还没建), 走
+/// `AlreadyRunning` 分支后立刻 `connect`, 撞上 ENOENT; 这条失败被永久缓存,
+/// 于是**整个 app-server 进程**后续所有会话都没有 `spawn_agent`。
+///
+/// 这里用 flock 精确复现那个窗口: 测试先像"刚启动的 daemon"一样占住实例锁,
+/// 200ms 后才真正 bind。修复前 `ensure_owned_runtime` 直接以
+/// `attach: No such file or directory` 失败; 修复后必须等它出现并 join。
+fn hold_instance_lock(path: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .expect("the instance lock file must open");
+    let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        outcome,
+        0,
+        "the test must be able to take the instance lock: {}",
+        std::io::Error::last_os_error()
+    );
+    file
+}
+
+#[test]
+fn a_socket_that_appears_just_after_the_probe_is_waited_for() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+    let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+
+    // 尚未 bind, 但实例锁已被占: 这正是 `daemon serve` 启动中的样子。
+    let lock = hold_instance_lock(&runtime.path().join("runtime.lock"));
+    assert!(
+        !socket.exists(),
+        "precondition: the peer has not bound its socket yet"
+    );
+
+    let late = {
+        let socket = socket.clone();
+        let database = runtime.path().join("runtime.sqlite");
+        let factory =
+            yi_agent_subagent::attach::worker_factory(&cfg, socket, &models).expect("factory");
+        let runtime_dir = runtime.path().to_path_buf();
+        std::thread::spawn(move || {
+            // 让调用方先进入 `AlreadyRunning` + ENOENT 的那条路径。
+            std::thread::sleep(Duration::from_millis(200));
+            // 交棒: 释放锁后由真正的 daemon 重新持有并 bind。
+            drop(lock);
+            yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
+                .expect("the late daemon must start")
+        })
+    };
+
+    let attached = yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a socket that appears during the start window must be joined, not failed");
+
+    assert!(
+        attached.embedded_daemon.is_none(),
+        "the peer owns the runtime; this process must join it, not steal it"
+    );
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "the joined runtime must actually answer"
+    );
+
+    drop(attached);
+    drop(late.join().expect("the late daemon thread must not panic"));
+}
+
+/// 重试必须有界: 对端拿了锁却永远不 bind 时, `ensure_owned_runtime` 必须
+/// 在预算耗尽后**失败**, 而不是挂住桌面进程或无限重试。
+///
+/// 上限取 `PEER_START_TIMEOUT`(10s)加一点余量: 断言的是「它确实会停下来」,
+/// 不是「它停得多快」——后者由实现细节决定,钉住只会让用例变脆。
+#[test]
+fn a_peer_that_never_binds_fails_instead_of_retrying_forever() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    // 拿住实例锁再也不放: 对面永远停在「正在启动」。
+    let _lock = hold_instance_lock(&runtime.path().join("runtime.lock"));
+
+    let started = std::time::Instant::now();
+    let failure = match yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    ) {
+        Ok(_) => panic!("a peer that never binds must not be attached"),
+        Err(failure) => failure,
+    };
+    let waited = started.elapsed();
+
+    assert_eq!(failure.stage, "attach");
+    assert!(
+        failure.retryable,
+        "the failure is still about timing, so callers must not cache it: {failure}"
+    );
+    assert!(
+        waited >= Duration::from_secs(10),
+        "the retry budget must be spent before giving up, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "giving up must be bounded, waited {waited:?}"
+    );
+}

@@ -770,6 +770,87 @@ fn a_vanished_project_directory_is_refused_and_not_recreated() {
     .expect("a restored project directory must attach on the next call");
 }
 
+/// A transient attach failure must not be cached as a permanent one.
+///
+/// The incident (2026-11-01 desktop cold start): the first `thread/start` raced
+/// the `daemon serve` that was binding the socket, `attach` failed with ENOENT,
+/// and because the cache stores `Err` values the whole app-server process kept
+/// answering "delegation unavailable" -- every later thread silently lost
+/// `spawn_agent` until the desktop was restarted.
+///
+/// Inserting the failure by hand is the point: `attach_cwd_runtime` stores
+/// whatever `ensure_owned_runtime` returns, so a test that can only fail it
+/// through a real race would be flaky rather than a regression guard.
+#[test]
+fn a_transient_attach_failure_is_not_cached_as_a_permanent_one() {
+    let repo = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let runtime = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let key = project_key(&cfg.workdir);
+    runtimes.lock().unwrap().insert(
+        key,
+        Err(yi_agent_subagent::attach::AttachFailure::transient(
+            "attach",
+            "No such file or directory (os error 2)",
+        )),
+    );
+
+    let binding = attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    )
+    .expect("a transient attach failure must be retried, not replayed from the cache");
+
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&binding.current().unwrap().socket_path),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "the retry must land on a live runtime"
+    );
+}
+
+/// A *non*-transient failure stays cached: retrying it on every thread would
+/// re-run a doomed bring-up forever, which is what the cache exists to prevent.
+#[test]
+fn a_non_transient_failure_is_still_cached() {
+    let repo = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let runtime = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let key = project_key(&cfg.workdir);
+    let stored = yi_agent_subagent::attach::AttachFailure::new(
+        "worker factory",
+        "the catalog cannot be read",
+    );
+    runtimes
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Err(stored.clone()));
+
+    let error = match attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    ) {
+        Ok(_) => panic!("a cached non-transient failure must be replayed"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        stored.to_string(),
+        "the cached cause must be replayed verbatim"
+    );
+}
+
 /// The incident, end to end.
 #[test]
 fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
