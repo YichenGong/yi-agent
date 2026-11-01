@@ -18,9 +18,15 @@ fmt-check:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
-# 跑全部测试
+# 跑全部测试（nextest：每个测试独立进程，一个 panic 不带走同批其他测试，
+# 也不会因为共享进程内的静态量互相干扰）。
+#
+# `--profile ci` 不能省：JUnit 只在被选中的 profile 下生成。
+# nextest 不跑 doctest，但本仓库 doctest 数为 0（2026-11-01 实测 14 个 crate 全 0），
+# 故无需补 `cargo test --doc`。若将来引入可执行 doctest，必须加回。
 test:
-    cargo test --all-features --workspace
+    cargo nextest --version
+    cargo nextest run --all-features --workspace --profile ci
 
 # 构建（debug）
 build:
@@ -45,7 +51,7 @@ magpie-agent-check:
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:
-    cargo test --all-features -p yi-agent-app-server export_bindings
+    cargo nextest run --all-features -p yi-agent-app-server export_bindings
     git diff --exit-code -- ../desktop/src/lib/generated
 
 # 凭据卫生：挡住真实部署凭据进入跟踪文件。
