@@ -3059,7 +3059,18 @@ async fn an_observe_client_cannot_set_preserve_thinking() {
 /// 契约：某 item 的 `item/completed` 之后，不得再出现该 item 的 `item/delta`。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_completed_item_never_trails_its_own_buffered_delta() {
-    let mut h = Harness::new();
+    // 用独立临时目录，**不要**退回 `Harness::new()` 的共享 `/tmp/yi-agent-app-server-test`。
+    //
+    // `thread/start` 会经 `attach_delegation` → `attach_cwd_runtime` →
+    // `ensure_owned_runtime` 同步拉起/复用该 cwd 的 subagent daemon。共享 cwd 意味着
+    // 全量并发时上百个测试抢同一个 socket 与同一个 daemon：抢到健康 daemon 的只要
+    // 几十毫秒，需要重新拉起或排队握手的高达 12~27s，超过 `EVENT_WAIT`(30s) 就
+    // panic 成 `timed out waiting for a message`。隔离 cwd 后本测试恒定 ~150ms，
+    // 与并发无关。
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
     let tid = start_thread(&mut h).await;
     // 制造「存在已订阅客户端」：这会让驱动走合并路径（生产里由手机订阅触发）。
     h.hub()
