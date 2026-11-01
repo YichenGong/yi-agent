@@ -929,6 +929,24 @@ async fn flush_unconsumed(tx: &EventTx, inbox: &Option<InboxHandle>) {
     let _ = tx.send(AgentEvent::InterjectionsReturned { items }).await;
 }
 
+/// The single stop path for every cancellation point that has an assistant
+/// message in flight: roll the session back to its last consistent boundary,
+/// drain queued interjections so they are not silently lost, tell the
+/// consumer, and let the caller `return`.
+///
+/// The six call sites differ only in their `tracing` text — and two of them
+/// share a spelling on purpose while belonging to different retry families
+/// (provider rejection vs. stream stall) — so each call site keeps its own
+/// `info!` immediately above this call rather than passing a reason in. The
+/// rollback length comes from [`safe_cancel_truncate_len`], which already
+/// encodes "keep the run's user prompt and every completed round-trip".
+async fn abort_run(tx: &EventTx, inbox: &Option<InboxHandle>, session: &Arc<Mutex<Session>>) {
+    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+    session.lock().unwrap().truncate(keep);
+    flush_unconsumed(tx, inbox).await;
+    let _ = tx.send(AgentEvent::Cancelled).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
@@ -968,10 +986,7 @@ async fn run_loop(
             // run's user prompt and completed round-trips (same policy as a
             // cancel during the provider call).
             info!(turn, "agent loop cancelled during auto-compact");
-            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-            session.lock().unwrap().truncate(keep);
-            flush_unconsumed(&tx, &inbox).await;
-            let _ = tx.send(AgentEvent::Cancelled).await;
+            abort_run(&tx, &inbox, &session).await;
             return;
         }
         if let AutoCompact::Compacted(new_messages) = compacted {
@@ -1131,10 +1146,7 @@ async fn run_loop(
                                     _ = tokio::time::sleep(delay) => {}
                                     _ = cancel_token.cancelled() => {
                                         info!(turn, "agent loop cancelled during retry backoff");
-                                        let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                                        session.lock().unwrap().truncate(keep);
-                                        flush_unconsumed(&tx, &inbox).await;
-                                        let _ = tx.send(AgentEvent::Cancelled).await;
+                                        abort_run(&tx, &inbox, &session).await;
                                         return;
                                     }
                                 }
@@ -1160,10 +1172,7 @@ async fn run_loop(
                     // so keep the run's user prompt and completed round-trips —
                     // same policy as a cancel during THINK.
                     info!(turn, "agent loop cancelled during provider call");
-                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                    session.lock().unwrap().truncate(keep);
-                    flush_unconsumed(&tx, &inbox).await;
-                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    abort_run(&tx, &inbox, &session).await;
                     return;
                 }
             };
@@ -1187,10 +1196,7 @@ async fn run_loop(
                     info!(turn, "agent loop cancelled during think");
                     // Cancel during THINK: no assistant reply exists yet, so this
                     // keeps the run's user prompt and every completed round-trip.
-                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                    session.lock().unwrap().truncate(keep);
-                    flush_unconsumed(&tx, &inbox).await;
-                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    abort_run(&tx, &inbox, &session).await;
                     return;
                 }
             };
@@ -1245,10 +1251,7 @@ async fn run_loop(
                             info!(turn, "agent loop cancelled during retry backoff");
                             // Same policy as the other cancel points: keep the
                             // run's user prompt and completed round-trips.
-                            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                            session.lock().unwrap().truncate(keep);
-                            flush_unconsumed(&tx, &inbox).await;
-                            let _ = tx.send(AgentEvent::Cancelled).await;
+                            abort_run(&tx, &inbox, &session).await;
                             return;
                         }
                     }
@@ -1612,10 +1615,7 @@ async fn run_loop(
                 // whose results were never observed. Dropping that last message
                 // keeps the transcript valid (no unpaired tool_use) while
                 // preserving the completed work.
-                let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                session.lock().unwrap().truncate(keep);
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx.send(AgentEvent::Cancelled).await;
+                abort_run(&tx, &inbox, &session).await;
                 return;
             }
         };
