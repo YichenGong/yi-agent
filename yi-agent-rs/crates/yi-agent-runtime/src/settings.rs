@@ -302,6 +302,28 @@ pub static FIELDS: &[FieldSpec] = &[
         max: None,
     },
     FieldSpec {
+        key: "power.idle_grace_minutes",
+        group: "power",
+        label: "条件消失后再保活多久（分钟）",
+        field_type: FieldType::Number,
+        default_display: "15",
+        description: "有网且（插电 或 有活在跑）的条件消失后，继续阻止休眠这么久；范围 1–120",
+        options: &[],
+        min: Some(1),
+        max: Some(120),
+    },
+    FieldSpec {
+        key: "power.remote_touch_minutes",
+        group: "power",
+        label: "远端交互有效窗口（分钟）",
+        field_type: FieldType::Number,
+        default_display: "5",
+        description: "手机等远端客户端最近一次请求在这么久之内，仍算作有活在跑；不得大于上面的保活窗口。范围 1–60",
+        options: &[],
+        min: Some(1),
+        max: Some(60),
+    },
+    FieldSpec {
         key: "compact.ratio",
         group: "compact",
         label: "压缩触发占比（%）",
@@ -768,8 +790,60 @@ pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsEr
         apply_op(&mut object, spec.key, value);
     }
 
+    // 跨字段：远端窗口不得长于宽限窗口。`validate_value` 是逐字段无状态的，
+    // 做不了这个判断，只能在这里做。
+    //
+    // 必须基于**合并后的完整对象**：用户可能只 patch 一个键（例如只把宽限改小），
+    // 此时远端窗口的生效值来自文件里的旧值。
+    //
+    // 但**不能**在这里调 `normalized()`：它自带的倒挂回落会把倒挂值清成 None，
+    // 于是下面的比较永远为假、任何倒挂都不会被拒绝。改为对两个字段各自做
+    // 单字段钳制（`within` 按 FieldSpec.min/max 判界），越界即当默认。
+    let merged_value = serde_json::Value::Object(object.clone());
+    let merged = match serde_json::from_value::<Settings>(merged_value) {
+        Ok(settings) => settings,
+        Err(error) => {
+            // `write_to` 只校验过「顶层是对象」，内层可能是结构性的坏
+            // （比如 `"agent": 5`）。这与「文件存在却读不出来 → 拒绝覆盖」
+            // 的守卫同向：宁可不写，也不把坏文件当默认值覆盖掉。
+            return Err(SettingsError::Corrupt(format!(
+                "the merged settings would not deserialize: {error}"
+            )));
+        }
+    };
+
+    // 只钳制、不做倒挂回落——否则本次要检查的倒挂会先被清掉。
+    // 不复用 `power_windows_minutes`：它要一个完整的 `&Settings`，
+    // 而这里手上只有两个 Option。直接算等价。
+    let grace_minutes = merged
+        .power
+        .idle_grace_minutes
+        .filter(|&value| within("power.idle_grace_minutes", value))
+        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
+    let remote_minutes = merged
+        .power
+        .remote_touch_minutes
+        .filter(|&value| within("power.remote_touch_minutes", value))
+        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+
+    // 只在本次 patch 触碰了这两个键时才拒绝。否则文件里既有的倒挂会让用户
+    // 连改 `agent.max_turns` 都失败——那是把人锁在文件外面。文件里的既有
+    // 倒挂由加载侧的 `normalized()` 静默回落并 warn，不影响写入。
+    let touches_power_windows = patch.contains_key("power.idle_grace_minutes")
+        || patch.contains_key("power.remote_touch_minutes");
+    if touches_power_windows && remote_minutes > grace_minutes {
+        return Err(SettingsError::InvalidSetting {
+            key: "power.remote_touch_minutes".to_string(),
+            reason: format!(
+                "must not exceed power.idle_grace_minutes \
+                 (the remote window {remote_minutes} is longer than the grace \
+                 {grace_minutes}, which would make the grace ineffective on battery)"
+            ),
+        });
+    }
+
     // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
-    for group in ["agent", "compact", "startup", "tui"] {
+    for group in ["agent", "compact", "startup", "tui", "power"] {
         if object
             .get(group)
             .and_then(|value| value.as_object())
@@ -1071,6 +1145,9 @@ malformed line
             DIRECT_CHILDREN_DEFAULT, MAX_TURNS_DEFAULT, RESIDENT_SUBAGENTS_DEFAULT,
             SKILLS_CATALOG_BUDGET_DEFAULT,
         };
+        use crate::settings::{
+            POWER_IDLE_GRACE_MINUTES_DEFAULT, POWER_REMOTE_TOUCH_MINUTES_DEFAULT,
+        };
         let cases: &[(&str, String)] = &[
             ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
             (
@@ -1093,6 +1170,14 @@ malformed line
             (
                 "compact.tool_budget_tokens",
                 COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "power.idle_grace_minutes",
+                POWER_IDLE_GRACE_MINUTES_DEFAULT.to_string(),
+            ),
+            (
+                "power.remote_touch_minutes",
+                POWER_REMOTE_TOUCH_MINUTES_DEFAULT.to_string(),
             ),
         ];
         for (key, expected) in cases {
@@ -1685,5 +1770,170 @@ malformed line
         let once = value.clone();
         migrate_legacy_keys(&mut value);
         assert_eq!(value, once, "migration must be idempotent");
+    }
+
+    fn write_json(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// 造真实旧格式文件，走完整的「读 → 解析 → 迁移 → 反序列化 → normalized」。
+    #[test]
+    fn migrate_the_old_agent_key_into_the_power_group() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep.as_deref(), Some("false"));
+        assert!(!prevent_idle_sleep_enabled(&settings));
+    }
+
+    #[test]
+    fn migrate_twice_on_disk_is_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let first = load_from(&path);
+        let second = load_from(&path);
+        assert_eq!(first, second);
+        assert_eq!(first.power.prevent_idle_sleep.as_deref(), Some("false"));
+    }
+
+    /// 两个键都在且冲突时，`power` 的值生效。
+    #[test]
+    fn migrate_keeps_an_explicit_power_key_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"agent":{"prevent_idle_sleep":"false"},"power":{"prevent_idle_sleep":"true"}}"#,
+        );
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep.as_deref(), Some("true"));
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 写入被拒时文件必须**逐字节不变**。
+    /// 不断言 mtime：同一秒内两次写入的 mtime 可能一样，APFS 的粗粒度
+    /// 时间戳会让这条断言假通过。字节比对才是「零写入」的真正判据。
+    #[test]
+    fn power_windows_reject_a_remote_window_longer_than_the_grace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":5}}"#,
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        // 只 patch 宽限（5 → 60 会合法；这里相反：把宽限压到 2，远端 5 就倒挂了）。
+        let patch = serde_json::json!({"power.idle_grace_minutes": 2});
+        let error = write_to(&path, &patch).unwrap_err();
+        match error {
+            SettingsError::InvalidSetting { key, reason } => {
+                assert_eq!(key, "power.remote_touch_minutes");
+                assert!(
+                    reason.contains("must not exceed"),
+                    "reason should explain the cross-field rule, got {reason}"
+                );
+            }
+            other => panic!("expected InvalidSetting, got {other:?}"),
+        }
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after, before, "a rejected write must not touch the file");
+    }
+
+    /// 旧键不会因为「保存了别的字段」而消失——这是预期行为，不是 bug。
+    /// `write_to` 只对 patch 里出现的键调 `apply_op`，其余原样保留。
+    #[test]
+    fn migrate_legacy_key_stays_on_disk_after_other_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 30})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("agent"),
+            "the legacy key must survive an unrelated write, got {text}"
+        );
+        assert!(text.contains("prevent_idle_sleep"), "got {text}");
+        // 而新值确实写进去了。
+        assert!(text.contains("idle_grace_minutes"), "got {text}");
+    }
+
+    /// 迁移结果可重放：把迁好的 Settings 整份写回，再读一次必须相等。
+    /// 若迁移只在内存搬、而值本身落不进新键，第二次读会退回默认（开）。
+    #[test]
+    fn migrate_value_survives_a_fresh_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let first = load_from(&path);
+        assert_eq!(first.power.prevent_idle_sleep.as_deref(), Some("false"));
+
+        std::fs::write(&path, serde_json::to_string(&first).unwrap()).unwrap();
+        let second = load_from(&path);
+        assert_eq!(first, second, "a migrated value must survive a rewrite");
+        assert_eq!(second.power.prevent_idle_sleep.as_deref(), Some("false"));
+    }
+
+    /// `clamp!` 是逐字段列举的，新增字段漏了它不会报错、越界值会一路进
+    /// 策略层。这条测试是那两个 `clamp!` 的唯一问责令。
+    ///
+    /// 它必须放在本 Task 而不是 Task 3：`within` 靠 `find_spec` 取 min/max，
+    /// `FIELDS` 里没有 `power.*` 时 `within` 返回 true、`clamp!` 清不掉任何值。
+    #[test]
+    fn power_windows_out_of_range_fall_back_to_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // 下限：0 被清成 None。
+        std::fs::write(&path, r#"{"power":{"idle_grace_minutes":0}}"#).unwrap();
+        let (grace, _) = power_windows_minutes(&load_from(&path));
+        assert_eq!(
+            grace, POWER_IDLE_GRACE_MINUTES_DEFAULT,
+            "0 must be clamped away, not passed through"
+        );
+
+        // 上限：121 > 120 被清成 None。
+        std::fs::write(&path, r#"{"power":{"idle_grace_minutes":121}}"#).unwrap();
+        let (grace, _) = power_windows_minutes(&load_from(&path));
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+
+        // 远端窗口上限 60。
+        std::fs::write(&path, r#"{"power":{"remote_touch_minutes":61}}"#).unwrap();
+        let (_, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    }
+
+    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，改**无关**字段
+    /// 仍须成功。否则用户手改坏了一对值之后就再也存不进任何设置——
+    /// 那是把人锁在文件外面。倒挂本身由加载侧 `normalized()` 回落。
+    #[test]
+    fn an_unrelated_write_succeeds_despite_an_inverted_pair_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        );
+        write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("123"),
+            "the unrelated write must land, got {text}"
+        );
+    }
+
+    /// 但触碰这对窗口就被拒——哪怕只是其中一个键。
+    #[test]
+    fn touching_an_inverted_pair_is_still_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        );
+        let error =
+            write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 2})).unwrap_err();
+        assert!(
+            matches!(error, SettingsError::InvalidSetting { .. }),
+            "touching the inverted pair must be rejected, got {error:?}"
+        );
     }
 }
