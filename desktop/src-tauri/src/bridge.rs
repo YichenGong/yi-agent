@@ -603,7 +603,13 @@ fn remote_gate() -> Result<(), String> {
 
 /// 开始连一个远端项目。启动后由监督循环维持（断线自动重连、退避到 60s）。
 #[tauri::command]
-pub async fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), String> {
+pub async fn remote_connect(
+    app: AppHandle,
+    profile_id: String,
+    // 路径 3（spec §2.4.2）：用户自己给一份同架构二进制。只在前两条路径都失败
+    // 时才用得上——气隙环境、或发布渠道里没有这台机器的产物。
+    from: Option<String>,
+) -> Result<(), String> {
     remote_gate()?;
     crate::remote::profile::validate_profile_id(&profile_id).map_err(|e| e.to_string())?;
     let key = ProfileKey::Remote(profile_id.clone());
@@ -617,9 +623,13 @@ pub async fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), St
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| format!("unknown remote profile `{profile_id}`"))?;
     let home = instance_home().ok_or_else(|| "home directory is unavailable".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || ensure_installed(&home, &profile))
-        .await
-        .map_err(|error| format!("install task failed: {error}"))??;
+    let handle = app.clone();
+    let from_path = from.map(std::path::PathBuf::from);
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_installed(&handle, &home, &profile, from_path.as_deref())
+    })
+    .await
+    .map_err(|error| format!("install task failed: {error}"))??;
 
     app.state::<Sidecar>().mark_desired(&key);
     spawn(&app, key)
@@ -630,19 +640,25 @@ pub async fn remote_connect(app: AppHandle, profile_id: String) -> Result<(), St
 /// 「先查后装」而不是「每次连接都装」：`--version` 一次 ssh 往返，比再传一次
 /// 十几 MB 便宜一个数量级，而且重连是常态（断线重连、切回前台）。
 fn ensure_installed(
+    app: &AppHandle,
     home: &std::path::Path,
     profile: &crate::remote::profile::RemoteProfile,
+    from: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let binary =
         crate::remote::cache::remote_binary_path(&profile.instance_root, &profile.binary_version);
-    let probe = format!(
-        "if [ -x {binary} ]; then {binary} --version; fi",
-        binary = sh_quote(&binary)
-    );
-    if let Ok(output) = run_remote(&profile.host, &probe) {
-        let reported = output.trim();
-        if !reported.is_empty() && reported.contains(&profile.binary_version) {
-            return Ok(());
+    // 用户显式给了文件就是显式动作：不能被「远端已经有一份」短路掉。他之所以
+    // 走路径 3，往往正是因为远端的旧二进制跑不起来，保留它等于把问题留在原地。
+    if from.is_none() {
+        let probe = format!(
+            "if [ -x {binary} ]; then {binary} --version; fi",
+            binary = sh_quote(&binary)
+        );
+        if let Ok(output) = run_remote(&profile.host, &probe) {
+            let reported = output.trim();
+            if !reported.is_empty() && reported.contains(&profile.binary_version) {
+                return Ok(());
+            }
         }
     }
 
@@ -657,6 +673,15 @@ fn ensure_installed(
     }
 
     let fetcher = crate::remote::fetch::HttpFetcher;
+    // 进度按**项目**回推（spec §4.1 第 7 步）：两个项目同时首次连接时，用户要能
+    // 分清是哪个在下载。事件名带 slot，与收帧的事件名同一套命名。
+    let slot = ProfileKey::Remote(profile.id.clone());
+    let progress = |stage: crate::remote::install::InstallStage| {
+        let _ = app.emit(
+            &event_name("install/progress", &slot),
+            serde_json::json!({ "stage": stage.as_str() }),
+        );
+    };
     crate::remote::install::install(
         &fetcher,
         home,
@@ -665,7 +690,8 @@ fn ensure_installed(
         &profile.binary_version,
         &caps,
         &profile.host,
-        None,
+        from,
+        Some(&progress),
     )?;
     // 装完立刻清旧版本缓存，避免每次升级多留十几 MB。
     let _ = crate::remote::cache::prune(home, &profile.binary_version);

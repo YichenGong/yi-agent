@@ -54,6 +54,8 @@ dev 构建里验证充分。
 - [x] `RemoteConfig` 扩展为多项目绑定 — `desktop/src/lib/remoteConfig.ts`
 - [x] 手机每项目一条连接 — `desktop/src/lib/relayTargets.ts` + `App.tsx`
 - [x] 非活动槽位的通知不写当前视图 — `desktop/src/lib/slotRouting.ts`（5 测试）
+- [x] 安装进度按项目回推，UI 显示阶段文案 — `bridge.rs:ensure_installed` → `app-server://install/progress/<id>`；`RemoteSettings.tsx:stageLabel`（4 测试）
+- [x] 路径 3（本地二进制）可从设置页触发，且不被「远端已装」短路 — `remote_connect(from)`、`RemoteSettings.tsx`（2 测试）
 
 ### 计划 04：端到端验收
 

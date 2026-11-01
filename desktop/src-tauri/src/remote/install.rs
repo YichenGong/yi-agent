@@ -111,6 +111,39 @@ pub fn plan(
     }
 }
 
+// ---- 进度回推 ----
+
+/// 安装阶段。UI 据此显示「正在做什么」，而不是一个静止的「连接中」。
+///
+/// spec §8.2：慢网下这一步要等十几秒，没有反馈就是最容易被投诉的体验。
+/// 阶段划分按**用户能理解的动作**切，不按函数边界切：用户在意的不是
+/// 「正在解压」，而是「在下 16MB」还是「在传到机器上」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallStage {
+    /// 正在从发布渠道下 `.tar.gz`（含 sha256 校验）。
+    Downloading,
+    /// 正在 scp 到远端。
+    Uploading,
+    /// 正在远端解压 / 落位。
+    Unpacking,
+    /// 装完了。
+    Done,
+}
+
+impl InstallStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstallStage::Downloading => "downloading",
+            InstallStage::Uploading => "uploading",
+            InstallStage::Unpacking => "unpacking",
+            InstallStage::Done => "done",
+        }
+    }
+}
+
+/// 进度回调。`None` 表示调用方不关心（单测与 CLI 路径）。
+pub type Progress<'a> = &'a dyn Fn(InstallStage);
+
 // ---- 执行部分：ssh / scp 编排 ----
 
 /// 执行安装，返回装好的远端二进制路径。
@@ -126,7 +159,13 @@ pub fn install(
     caps: &RemoteCaps,
     host: &str,
     from: Option<&Path>,
+    progress: Option<Progress<'_>>,
 ) -> Result<String, String> {
+    let report = |stage: InstallStage| {
+        if let Some(callback) = progress {
+            callback(stage);
+        }
+    };
     let dest = crate::remote::cache::remote_install_dir(instance_root, version);
     let binary = crate::remote::cache::remote_binary_path(instance_root, version);
 
@@ -134,7 +173,9 @@ pub fn install(
         InstallRoute::FromFile => {
             let source = from.expect("route implies a source");
             let remote_tmp = "/tmp/yi-agent-from";
+            report(InstallStage::Uploading);
             scp_to_remote(source, host, remote_tmp)?;
+            report(InstallStage::Unpacking);
             run_remote(
                 host,
                 &format!(
@@ -148,6 +189,7 @@ pub fn install(
         InstallRoute::LocalDownload => {
             let cached = crate::remote::cache::cache_path(home, version, target);
             if !cached.exists() {
+                report(InstallStage::Downloading);
                 crate::remote::fetch::download_verified(
                     fetcher,
                     crate::remote::fetch::RELEASE_BASE,
@@ -161,7 +203,9 @@ pub fn install(
                 let staging = Staging::create()?;
                 let local_bin = extract_binary(&cached, staging.path())?;
                 let remote_tmp = "/tmp/yi-agent-upload";
+                report(InstallStage::Uploading);
                 scp_to_remote(&local_bin, host, remote_tmp)?;
+                report(InstallStage::Unpacking);
                 run_remote(
                     host,
                     &format!(
@@ -173,7 +217,9 @@ pub fn install(
                 )?;
             } else {
                 let remote_tmp = format!("/tmp/{}", upload_name(target, version, caps));
+                report(InstallStage::Uploading);
                 scp_to_remote(&cached, host, &remote_tmp)?;
+                report(InstallStage::Unpacking);
                 run_remote(host, &unpack_command(caps, &remote_tmp, &dest))?;
                 run_remote(
                     host,
@@ -191,6 +237,7 @@ pub fn install(
                 crate::remote::fetch::RELEASE_BASE
             );
             let url = sh_quote(&url);
+            report(InstallStage::Downloading);
             // curl 缺席时退 wget；两者都没有则明确报错，而不是留一个空目录。
             run_remote(
                 host,
@@ -206,6 +253,7 @@ pub fn install(
             )?;
         }
     }
+    report(InstallStage::Done);
     Ok(binary)
 }
 
@@ -479,6 +527,81 @@ mod tests {
     fn single_quotes_in_paths_are_escaped() {
         let command = unpack_command(&caps(true, true), "/tmp/a.tar.gz", "/home/it's/bin");
         assert!(command.contains(r"/home/it'\''s/bin"), "{command}");
+    }
+
+    /// 阶段名是**外部契约**（前端按字符串匹配）：改名会让 UI 静默失去进度。
+    #[test]
+    fn stage_names_are_stable_strings() {
+        assert_eq!(InstallStage::Downloading.as_str(), "downloading");
+        assert_eq!(InstallStage::Uploading.as_str(), "uploading");
+        assert_eq!(InstallStage::Unpacking.as_str(), "unpacking");
+        assert_eq!(InstallStage::Done.as_str(), "done");
+    }
+
+    /// 无缓存时必须先报「下载」再报「上传」：顺序反了会让 UI 显示
+    /// 「正在上传」十几秒而实际在下载。
+    #[test]
+    fn a_cold_install_reports_download_before_upload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let record = |stage: InstallStage| seen.lock().unwrap().push(stage);
+
+        // 用一个必然失败的 host：我们只关心失败前报过的阶段。
+        struct EmptyFetch;
+        impl crate::remote::fetch::Fetcher for EmptyFetch {
+            fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+                Err(format!("test fetcher refuses {url}"))
+            }
+        }
+        let _ = install(
+            &EmptyFetch,
+            dir.path(),
+            "/home/dev/.yi-agent",
+            "x86_64-unknown-linux-gnu",
+            "0.1.10",
+            &caps(true, true),
+            "127.0.0.1",
+            None,
+            Some(&record),
+        );
+
+        let stages = seen.lock().unwrap().clone();
+        let first = stages.first().copied();
+        assert_eq!(
+            first,
+            Some(InstallStage::Downloading),
+            "a cold install must announce the download first: {stages:?}"
+        );
+    }
+
+    /// 走路径 3 时不该出现「下载」阶段：用户给的文件是本地的，报下载会
+    /// 让人以为系统还在联网取东西（对气隙环境尤其误导）。
+    #[test]
+    fn a_from_file_install_never_reports_downloading() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("yi-agent");
+        std::fs::write(&source, b"#!/bin/sh\n").unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let record = |stage: InstallStage| seen.lock().unwrap().push(stage);
+
+        let _ = install(
+            &crate::remote::fetch::HttpFetcher,
+            dir.path(),
+            "/home/dev/.yi-agent",
+            "x86_64-unknown-linux-gnu",
+            "0.1.10",
+            &caps(true, true),
+            "127.0.0.1",
+            Some(&source),
+            Some(&record),
+        );
+
+        let stages = seen.lock().unwrap().clone();
+        assert!(
+            !stages.contains(&InstallStage::Downloading),
+            "path 3 must not claim to download: {stages:?}"
+        );
+        assert_eq!(stages.first().copied(), Some(InstallStage::Uploading));
     }
 
     /// 判据 25：卡住的远端命令必须超时，而不是让 UI 永远停在「连接中」。

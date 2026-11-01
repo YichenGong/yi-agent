@@ -49,6 +49,25 @@ export const defaultHostInvoke: RemoteInvoke = async <T,>(
   return invoke<T>(command, args);
 };
 
+/**
+ * 选一个本地可执行文件交给后端上传（路径 3）。
+ *
+ * 用 Tauri 的对话框插件而不是让用户手打路径：远端项目多半在另一台机器上折腾，
+ * 打错一个字符得到的是「scp 失败」而不是「路径不存在」。
+ *
+ * 返回 null 表示用户取消。插件不可用（浏览器里跑测试）时也返回 null——
+ * 这个入口是兜底，不该因为它而让整个设置页崩掉。
+ */
+async function pickLocalBinary(): Promise<string | null> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({ multiple: false, directory: false });
+    return typeof picked === "string" ? picked : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 三个受支持的 target（spec §2.4.5），顺序即下拉框顺序。 */
 const ARCHES = [
   { value: "aarch64-apple-darwin", label: "macOS (Apple Silicon)" },
@@ -75,6 +94,12 @@ export function RemoteSettings({ invoke }: { invoke: RemoteInvoke }) {
   const [draft, setDraft] = useState<RemoteProfileDraft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // 路径 3 的本地文件：按 profile id 记。只在安装失败后由用户点选填进来，
+  // 所以正常情况下这个表是空的——它是兜底，不是配置项。
+  const [fromPaths, setFromPaths] = useState<Record<string, string>>({});
+  // 安装阶段，按 profile id。装完（"done"）就清掉，避免长期显示"下载中"。
+  const [stages, setStages] = useState<Record<string, string>>({});
+  const fromPathFor = (id: string): string | null => fromPaths[id] ?? null;
 
   const refresh = useCallback(async () => {
     const on = await invoke<boolean>("remote_enabled");
@@ -99,6 +124,37 @@ export function RemoteSettings({ invoke }: { invoke: RemoteInvoke }) {
   useEffect(() => {
     void refresh().catch((e) => setError(String(e)));
   }, [refresh]);
+
+  // 安装进度（spec §4.1 第 7 步）。事件名带 slot，且 Tauri 的 listen 不支持
+  // 通配符，所以按 profile 逐个注册——注册表随 profiles 变化重建。
+  useEffect(() => {
+    if (enabled !== true || profiles.length === 0) return;
+    let disposed = false;
+    const offs: Array<() => void> = [];
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        for (const profile of profiles) {
+          const off = await listen<{ stage: string }>(
+            `app-server://install/progress/${profile.id}`,
+            (event) => {
+              setStages((prev) => ({ ...prev, [profile.id]: event.payload.stage }));
+            },
+          );
+          // 卸载发生在 await 之间：此刻必须立刻退订，否则每轮 refresh 都会
+          // 多留一个监听器（spec §4.6 记录的泄漏形态）。
+          if (disposed) off();
+          else offs.push(off);
+        }
+      } catch {
+        // 非 Tauri 环境（测试）没有事件总线；进度只是附加信息。
+      }
+    })();
+    return () => {
+      disposed = true;
+      for (const off of offs) off();
+    };
+  }, [enabled, profiles]);
 
   // 闸门未知（首帧）与关闭都返回 null：多渲染一帧表单再撤掉会造成闪烁。
   if (enabled !== true) return null;
@@ -155,6 +211,18 @@ export function RemoteSettings({ invoke }: { invoke: RemoteInvoke }) {
               profile={profile}
               slot={slots[profile.id]}
               busy={busy}
+              stage={stages[profile.id] ?? null}
+              fromPath={fromPaths[profile.id] ?? null}
+              onPickFrom={(path) =>
+                setFromPaths((prev) => {
+                  // 取消 = 移除该键，而不是存一个 null：`fromPathFor` 用
+                  // 「有没有键」判断是否为路径 3，存 null 会让它误判为已选。
+                  const next = { ...prev };
+                  if (path === null) delete next[profile.id];
+                  else next[profile.id] = path;
+                  return next;
+                })
+              }
               onEdit={() => setDraft({ ...profile })}
               onRemove={() =>
                 act("删除", async () => {
@@ -163,7 +231,12 @@ export function RemoteSettings({ invoke }: { invoke: RemoteInvoke }) {
               }
               onConnect={() =>
                 act("连接", async () => {
-                  await invoke("remote_connect", { profileId: profile.id });
+                  // from 只在自动安装失败后才有值：路径 3 是兜底，
+                  // 不是常规路径（spec §2.4）。
+                  await invoke("remote_connect", {
+                    profileId: profile.id,
+                    from: fromPathFor(profile.id),
+                  });
                 })
               }
               onDisconnect={() =>
@@ -189,10 +262,27 @@ export function RemoteSettings({ invoke }: { invoke: RemoteInvoke }) {
   );
 }
 
+/** 安装阶段 → 用户能读懂的一句话。未知阶段回落到原文，便于排查新加的阶段。 */
+function stageLabel(stage: string): string {
+  switch (stage) {
+    case "downloading":
+      return "正在下载远端组件…";
+    case "uploading":
+      return "正在上传到远端…";
+    case "unpacking":
+      return "正在远端安装…";
+    default:
+      return stage;
+  }
+}
+
 function RemoteRow({
   profile,
   slot,
   busy,
+  stage,
+  fromPath,
+  onPickFrom,
   onEdit,
   onRemove,
   onConnect,
@@ -201,6 +291,9 @@ function RemoteRow({
   profile: RemoteProfileView;
   slot: SlotState | undefined;
   busy: boolean;
+  stage: string | null;
+  fromPath: string | null;
+  onPickFrom: (path: string | null) => void;
   onEdit: () => void;
   onRemove: () => void;
   onConnect: () => void;
@@ -223,6 +316,45 @@ function RemoteRow({
       {/* 断线时必须给出原因：只说「已断开」用户唯一能做的只有等待。 */}
       {status !== "connected" && reason !== null ? (
         <p className="mt-2 break-words text-xs text-danger">{reason}</p>
+      ) : null}
+
+      {/* 路径 3（spec §2.4.2）的入口。只在已经失败过时出现：能自动装成的
+          情况下给一个「手动选文件」按钮，只会让用户以为必须自己准备二进制。 */}
+      {status !== "connected" && reason !== null ? (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="rounded border border-border px-2 py-1 text-xs"
+            disabled={busy}
+            onClick={async () => {
+              const picked = await pickLocalBinary();
+              if (picked !== null) onPickFrom(picked);
+            }}
+          >
+            改用本地二进制
+          </button>
+          {fromPath !== null ? (
+            <>
+              <span className="truncate text-xs text-fg-subtle">
+                将上传 {fromPath}
+              </span>
+              <button
+                type="button"
+                className="rounded border border-border px-2 py-1 text-xs"
+                disabled={busy}
+                onClick={() => onPickFrom(null)}
+              >
+                取消
+              </button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* 首次连接要下载十几 MB（spec §8.2）：没有这句话，用户看到的是一个
+          静止的「连接中」，会以为卡死。 */}
+      {status !== "connected" && stage !== null && stage !== "done" ? (
+        <p className="mt-2 text-xs text-fg-subtle">{stageLabel(stage)}</p>
       ) : null}
 
       <div className="mt-2 flex flex-wrap gap-2">

@@ -150,11 +150,68 @@ describe("RemoteSettings", () => {
         true,
       ),
     );
+    // `from` 常态为 null：路径 3 是兜底，不该在未失败时带上任何东西。
     expect(
       calls.find((call) => call.command === "remote_connect")?.args,
     ).toEqual({
       profileId: "proj-foo",
+      from: null,
     });
+  });
+
+  /**
+   * 路径 3 的入口只在失败后出现。能自动装成时给一个「改用本地二进制」按钮，
+   * 会让人以为必须自己准备二进制——这类提示会把常规路径变成看起来像例外。
+   */
+  it("only offers the local-binary fallback after a failure", async () => {
+    const { invoke } = fakeInvoke({
+      remote_enabled: true,
+      remote_list: {
+        enabled: true,
+        profiles: [
+          {
+            id: "proj-foo",
+            label: "foo",
+            host: "dev@host",
+            local_path: "/Users/y/foo",
+            remote_path: "/home/dev/foo",
+            remote_arch: "x86_64-unknown-linux-gnu",
+            binary_version: "0.1.10",
+          },
+        ],
+      },
+      remote_status: { slots: { "proj-foo": { status: "connected", lastError: null } } },
+    });
+    render(<RemoteSettings invoke={invoke} />);
+    await screen.findByText(/dev@host/);
+    expect(screen.queryByRole("button", { name: "改用本地二进制" })).toBeNull();
+  });
+
+  it("offers the local-binary fallback once there is an error to explain", async () => {
+    const { invoke } = fakeInvoke({
+      remote_enabled: true,
+      remote_list: {
+        enabled: true,
+        profiles: [
+          {
+            id: "proj-foo",
+            label: "foo",
+            host: "dev@host",
+            local_path: "/Users/y/foo",
+            remote_path: "/home/dev/foo",
+            remote_arch: "x86_64-unknown-linux-gnu",
+            binary_version: "0.1.10",
+          },
+        ],
+      },
+      remote_status: {
+        slots: { "proj-foo": { status: "disconnected", lastError: "下载失败" } },
+      },
+    });
+    render(<RemoteSettings invoke={invoke} />);
+    expect(
+      await screen.findByRole("button", { name: "改用本地二进制" }),
+    ).toBeTruthy();
   });
 
   /**
