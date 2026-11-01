@@ -15,7 +15,7 @@
 | 载入历史并恢复上下文 | `rpc/thread.rs:373` `thread/resume` | 有 |
 | 只读补齐 items | `rpc/thread.rs:2208` `thread/readItems` | 有 |
 | 截断尾部悬空 `tool_use` | `core/agent.rs:793` `fork_prefix_len` | 有 |
-| CLI resume / fork 参数 | `config.rs:26` `Cli` | **无** |
+| CLI resume / fork 参数 | `config.rs:17` `Cli` | **无** |
 | TUI 使用 `ThreadStore` | 全仓库 `crates/yi-agent/src` 零命中 | **无** |
 | 跨进程写者互斥 | `ThreadStore.meta_lock` 仅进程内 `Mutex`（`thread_store.rs:261`） | **无** |
 
@@ -41,6 +41,12 @@
 - 跨目录 `--all`（`ThreadStore` 按 cwd 组织，跨目录需 `listAll` 索引，另议）
 - 会话归档 / 重命名 / 搜索 / 删除（app-server 已有，CLI 不重复实现）
 - 会话级 fork 的 worktree 隔离（与子 agent 的 `worktree` 是两件事）
+- **`/clear` 的物理回收**：本设计的 `/clear` 是追加边界（§6.4），不删数据。长期使用会让 `.jsonl` 只增不减。这是刻意取舍——物理回收需要 tarball/compaction 那套机制（app-server 的归档走的是另一条路），且删数据必须可撤销。若磁盘成为问题，后续单独做，不在本轮。
+
+### 已知取舍
+
+- fork 物理复制让长会话磁盘翻倍（§3.2 已说明）
+- `/clear` 与 fork 都只追加不回收，`.jsonl` 会持续增长
 
 ## 3. 关键设计决策
 
@@ -70,25 +76,46 @@ let safe = forkable_messages(&session);
 - **引用前缀**（新会话只记 `{forked_from, prefix_len}`）：零复制，但 `load` 要回溯拼接，源会话被删会悬空，一致性规则复杂。
 - **只复制 messages 不复制 items**：磁盘最省，但 resume 打开 fork 时屏幕空白，用户会以为历史丢了。
 
-### 3.3 锁：特点会话，`flock`，永不删锁文件
+### 3.3 锁：按会话、`flock`、永不删锁文件
 
 app-server（桌面）与 TUI 会写同一个 `<cwd>/.yi-agent/threads/`。没有跨进程锁，两端的 `append_turn` 会交错进同一个 `.jsonl`，`meta.json` 的读-改-写会互相覆盖。
 
-**照抄项目已有的 `flock` 模式**（`device_store.rs:81`）：
+**照抄项目已有的 `flock` 模式**（`device_store.rs:81` / `ipc.rs:1226`）：
 
 - 锁文件：`<cwd>/.yi-agent/threads/<thread-id>.lock`
 - **永不删除**。`device_store.rs:78` 的注释已记录原因：删除会让「已打开同一 inode 的竞争者」锁在 unlinked 文件上，第三个进程新建同名文件后两个进程都以为持锁。Codex 敢删是因为它另有 `.coordination.lock` 兜底（`rollout/src/writer_lock.rs:49`），本项目不引入协调锁，就绝不能删。
 - **`LOCK_NB` 非阻塞**。`device_store` 用阻塞是因为临界区只有一次「读 + rename」，极短；这里要持有整个会话，阻塞会让用户干等。
 
+**实现必须用 `libc::flock`，不能用 `std::fs::File::try_lock`。** 后者要到 Rust 1.89 才稳定，而本项目 MSRV 是 `1.85`（`yi-agent-rs/Cargo.toml:23`）。`ipc.rs:1226` 已把正确写法做出来，直接照抄：
+
 ```rust
-fn acquire_thread_lock(root: &Path, thread_id: &str) -> io::Result<File>
+let file = OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
+let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+if outcome != 0 {
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN) {
+        return Err(ThreadBusy { thread_id });   // 冲突
+    }
+    return Err(error);                          // 坏描述符 / 不支持的 fs，不得误报为冲突
+}
+Ok(ThreadWriterLock { _file: file })            // 仅持 File，无 Drop 实现
 ```
 
-进程内 `Mutex` + 跨进程 `flock` 一起拿，与 `device_store.rs:104` `exclusive()` 同形。
+`EWOULDBLOCK` 与 `EAGAIN` 必须单独判，其余错误一律上抛——把真实故障误报成「会话被占用」会让用户永远找不到原因。
 
-**粒度：会话级持有**。进入 `resume` / `fork` 时取锁，进程退出随 `File` drop 释放；进程崩溃内核同样释放，不留死锁（`device_store.rs:76` 注释所述）。
+**必须做进程内去重表**。`ThreadStore` 有 127 处 `ThreadStore::new` 调用点，同一路径可能被构造出多个实例；而 `flock` 按**打开文件描述**加锁、不按路径，同一进程内两个描述符各拿一次不会互相阻塞，于是「本进程已持有」会被自己判成空闲。锁因此挂在**进程级静态表**上（`OnceLock<Mutex<HashMap<PathBuf, Arc<ThreadWriterLock>>>>`），与 `group_store.rs:120` 的进程级 `static LOCK` 同思路：
+
+```rust
+fn acquire_thread_lock(root: &Path, thread_id: &str) -> Result<Arc<ThreadWriterLock>, ThreadBusy>
+```
+
+语义：先查静态表，已持有则返回**同一个 `Arc`**（幂等，调用方可重复取）；表里没有才去动内核 `flock`。所有 `Arc` drop 后移除条目，内核锁随之释放。
+
+**粒度：会话级持有**。进入 `resume` / `fork` 时取锁，进程退出随 `File` drop 释放；进程崩溃内核同样释放，不留死锁（`device_store.rs:76` 注释所述）。持有者是**该会话的 `Arc`**，所以 driver 要把它存进自有状态，避免「取完就 drop」导致锁形同虚设。
 
 **这把锁必须两端都采用**。只加在 TUI 侧而 app-server 不拿锁，锁就是摆设。因此 `thread/resume` 与 driver 启动路径也要取同一把锁。这是本设计改动面积最大的一点。
+
+**锁文件会污染 `list()` 与 `find_first_user_text`，必须显式过滤。** `list()`（`thread_store.rs:439`）只认 `.meta.json` 后缀，`<id>.lock` 天然被跳过，无需改。但任何「扫目录找最新会话」的新代码必须同样只认 `.meta.json`，不能按 `mtime` 取最近的任意文件——否则锁文件（每次 resume 都会创建）会被误判成最新会话。
 
 ### 3.4 `meta_lock` 不改，改为立不变量
 
@@ -167,10 +194,10 @@ let agent = Agent::new(provider, tools, config).with_session_arc(Arc::new(Mutex:
 
 四点必须与 app-server 现行行为严格对齐，否则同一会话在 TUI 与桌面打开后状态不同：
 
-1. **`set_last_input_tokens`**（`rpc/thread.rs:456`）：不设则 auto-compact 在 resume 首轮不触发，长会话可能直接超上下文。
+1. **`set_last_input_tokens`**（`rpc/thread.rs:451`）：不设则 auto-compact 在 resume 首轮不触发，长会话可能直接超上下文。
 2. **`pending_turn` 必须先 `promote_partial`**（`rpc/thread.rs:687-696`）：这是**容易漏掉且会丢数据**的一步。采纳的 partial 是那一轮唯一的持久副本；不 append 就返回，用户下一条消息的 turn-start checkpoint 会原子覆盖同一文件，该轮 items 永久丢失，而 session 上下文仍「记得」它们，造成 item 与上下文不一致。成功后再补一条 interrupted 提示，否则用户会困惑「最后一句为什么没有回复」。
 3. **`forkable_messages` 接收 `&Session` 而非 `Vec<Message>`**（`core/agent.rs:804`）：所以要先 `Session::from_messages` 再截断，再重建一次 `Session`。多这一次构造是刻意的轻薄代价，换的是与 fork 路径共用同一实现。
-4. **cwd 已删校验**（`rpc/thread.rs:385`）：`meta.cwd` 不是目录时明确报错，**不得**回退到当前 workdir。回退会让历史里的相对路径全部指向错误位置。
+4. **cwd 已删校验**（`rpc/thread.rs:392`）：`meta.cwd` 不是目录时明确报错，**不得**回退到当前 workdir。回退会让历史里的相对路径全部指向错误位置。
 
 ## 6. TUI 落盘
 
@@ -188,12 +215,50 @@ driver 收到本轮 `Done` 后构造 `TurnLine::Turn { items, usage, usage_total
 
 | 规则 | 依据 | 漏掉的后果 |
 | --- | --- | --- |
-| 补 `UserMessage` item | `server.rs:4790` 明确注释 | resume 后用户提问消失，只剩回答 |
-| `preserve_thinking == false` 时剥离落盘副本的思考块 | `server.rs:4805` | 磁盘上的会话「复活」已放弃保留的凭证 |
+| 补 `UserMessage` item | `server.rs:4795` 明确注释 | resume 后用户提问消失，只剩回答 |
+| `preserve_thinking == false` 时剥离落盘副本的思考块 | `server.rs:4807` | 磁盘上的会话「复活」已放弃保留的凭证 |
 | 成功后更新 `meta.updated_at` | 本设计新增要求 | `--last` 永远选中最旧会话 |
 | 落盘失败不阻断对话 | 与 app-server 的 `eprintln!` 一致 | 磁盘问题导致对话中断 |
 
 落盘只剥**副本**，不动 session 本体——session 是展示与请求的权威。
+
+### 6.3 回放：`Item → HistoryCell` 映射（原设计遗漏，必须补）
+
+**没有这一块，resume 等于白做**：上下文是对的，屏幕却是空的，用户会以为历史丢了。TUI 侧目前**完全没有** `Item` 渲染代码（`crates/yi-agent/src/tui/` 零命中 `Item::UserMessage`），而 `Item` 只定义在 `app-server/src/protocol.rs:825`，desktop 直接消费它、TUI 不能。
+
+必须新增纯函数 `replay.rs::items_to_cells(items, width) -> Vec<HistoryCell>`，按 `Item` 五个变体逐一映射：
+
+| `Item` 变体 | → `HistoryCell` | 备注 |
+| --- | --- | --- |
+| `UserMessage { text, .. }` | `UserMessage { text }` | 忽略 `attachments`/`images`：TUI 当前无附件渲染 |
+| `AgentMessage { text, .. }` | `AssistantMessage { markdown }` | 走既有 markdown 渲染 |
+| `ToolCall { name, input, status, result, .. }` | `ToolCall { .. }` + 紧随一个 `ToolResult { .. }` | `status == Failed` ⇒ `ToolResult.is_error = true`；`Running`（崩溃残留）⇒ 结果文本写「中断」 |
+| `UserInterjection { text, .. }` | `UserMessage { text }` | TUI 无独立气泡样式，与桌面区分是纯展示差异 |
+| `Thinking { .. }` | `Reasoning { text, expanded: false }` | **默认折叠**，与实时流行为一致（`cell.rs:43`） |
+
+三条约束：
+
+1. **必须复用 `HistoryState` 的既有上限**（`MAX_HISTORY_CELLS = 2000`，`history.rs:172`）。回放几千条 item 会撑爆内存，且 `enforce_history_cap` 已实现「外科式从头部 drop」并上报 `dropped_cells()`。直接批量 push 后由既有机制裁剪，不新写裁剪逻辑。
+2. **回放不产生「新」的视觉分隔**：`Separator` 只在 turn 边界插入，与实时渲染同规则，否则重开一次会话就多出一堆横线。
+3. **`pending_turn` 的 interrupted 提示**用 `Separator { label: Some("上一轮已中断") }`，与既有 `HistoryCell::Separator` 用法一致（`app.rs:2628` 的「对话已清空」即是此形）。
+
+### 6.4 `/clear` 与 `/compact` 的持久化语义（原设计遗漏）
+
+TUI 这两个命令目前只作用于内存（`app.rs:2626` / `:2677`，driver 侧 `main.rs:2108` / `:2124`）。会话一旦持久化，它们直接与磁盘冲突，必须各自定义语义，否则会出现「屏幕上清空了、resume 回来旧内容全在」这种最糟糕的错位。
+
+**`/clear`：只清会话，不删数据。** 三件事一起做：
+
+1. 内存里 `replace_messages(Vec::new())` + `set_last_input_tokens(None)`（沿用 `main.rs:2121` 现状）
+2. 向 `.jsonl` 追加一条**空 turns 的边界记录**，让 resume 时按「最后一条边界之后」读取；**不截断、不删文件**
+3. `content_epoch += 1`（与 app-server `thread/clear` 的语义一致，`thread_store.rs` 注释：这是 `content_epoch` 的唯一递增点）
+
+第 2 点需要一个新变体：`TurnLine` 增加 `Clear { at: i64 }`，`read_log` 遇到它就把已累积的 items/messages/usage/totals 全部清空。这样 `/clear` 是**纯追加**，不会与并发的读者打架，也天然可回滚（想恢复就删文件）。**不能**用 `truncate` 就地改写——那会与 `flock` 之外的读者产生窗口期，且破坏「`.jsonl` 只追加」这条既有不变量。
+
+实现上要注意：`read_log`（`thread_store.rs:314`）现在是 `match serde_json::from_str::<TurnLine>(line) { Ok(TurnLine::Turn {..}) => .., Err(e) => .. }` 的**穷尽匹配**，加变体后**编译会失败**，必须补 `Ok(TurnLine::Clear { .. }) => { items.clear(); messages.clear(); usage = None; totals = UsageTotals::default(); }` 分支。这不是「加个枚举值」那么轻——漏了它连编译都过不去（这反而是好事，编译器会强制实现者处理）。
+
+**`/compact`：只换上下文，不写 items。** app-server 的 `thread/compact` 落盘时 items 为空、`content_epoch` 不递增（`thread_store.rs` 注释明确：「它落盘时 items 为空、历史 item 分毫未动」）。TUI 照此办理：把压缩后的 `messages` 作为一条 `items: []` 的 `TurnLine` 追加。回放时这条记录不产生任何 cell，但 `read_log` 会用它的 `messages` 覆盖上下文——正好是压缩该有的效果。
+
+漏掉这两条的后果分别是：`/clear` 后 resume 旧内容复活；`/compact` 后 resume 拿到未压缩的超长上下文，可能直接超出模型窗口。
 
 ## 7. fork 语义
 
@@ -227,7 +292,20 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 两项必须处理，否则列表形同废纸：
 
 1. **id 前缀匹配**：完整 id 没人愿意手抄。`resume` 接受唯一前缀（类 git short hash），歧义时列出候选并拒绝。
-2. **标题兜底**：TUI 建的会话没有标题生成逻辑（那是 app-server 的 `set_title_if_unchanged`），`meta.title` 为 `None` 时取首条 `UserMessage` 的首行截断显示。
+2. **标题兜底不用新写**：`first_user_text`（`thread_store.rs:1087`）已经实现「取第一条 user 文本」，`rebuild_meta` 正是用它填 `title`（`thread_store.rs:1118`）；截断长度也有 `title_from`（`thread_store.rs:1081`，30 字符）。TUI 落盘时直接调 `title_from(&first_user_text(&messages))` 即可，不引入第二套标题规则。
+
+## 8.1 新会话的 meta 创建时机（原设计遗漏）
+
+`resume --last` 依赖 `meta.updated_at`，但 TUI 新建会话时**根本还没有 meta**——`ThreadStore::create` 从未被 TUI 调用过。若不在启动时建 meta，`--last` 永远看不到终端里建的会话。
+
+因此 TUI 启动（新会话路径）时必须做两步：
+
+1. `thread_id = thread-<uuid>`，`store.create(&meta)` 写入初始 meta（`cwd`/`model`/`permission_mode`/`created_at`/`updated_at` 取当前值，其余字段用与 `rebuild_meta` 一致的默认）
+2. 立刻取该 thread 的 writer lock 并持有到退出
+
+这两步与 §6.1 的 session 重构是同一处改动，必须一起做——只建 meta 不持锁，等于给别的进程开了后门；只持锁不建 meta，`--last` 就找不到它。
+
+**已存在的历史会话（本设计之前建的）没有 meta 也没关系**：`load` 在 meta 缺失时会走 `rebuild_meta` 从日志重建（`thread_store.rs:390`），但重建出的 `cwd` 是空串——所以 CLI 侧的 cwd 校验（§5 第 4 点）必须容忍空 `cwd`（视为「与当前 workdir 相同」），否则所有老会话都打不开。这条容易漏，测试要专门覆盖。
 
 ## 9. 错误处理
 
@@ -236,10 +314,14 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 | thread 不存在 | `找不到会话 <id>`，提示 `yi-agent threads` |
 | 前缀有歧义 | 列出候选 id，拒绝执行 |
 | cwd 已删 | 明确报错，不回退（§5） |
+| cwd 为空串（老会话重建的 meta） | 视为「当前 workdir」，放行（§8.1） |
 | 锁被占 | `会话 <id> 正被另一个 yi-agent 实例使用`，提示关窗口或 `fork` |
+| 锁文件 open 失败（权限/只读盘） | 报真实原因，**不得**报成「会话被占用」 |
 | `.jsonl` 尾部损坏 | 沿用 `load_tolerates_truncated_final_line` 既有容错 |
 | `meta.json` 损坏 | 沿用既有重建逻辑 |
+| 日志含未知 `type` 行 | 跳过该行，其余照常（§11） |
 | 落盘失败 | 日志 + 继续，不阻断对话 |
+| `fork` 源会话不可 `load` | 报错退出，**不**建半个新会话（先 `load` 成功才写 meta） |
 
 ## 10. 测试策略
 
@@ -247,11 +329,18 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 
 - `forkable_messages` 在 resume 路径上的四种边界：空会话 / 仅用户消息 / 完整轮次 / 尾部悬空 `tool_use`
 - resume 与 fork 子 agent 的截断结果一致（防止规则漂移）
+- `items_to_cells` 五个变体各一例，含 `ToolCall.status == Running`（崩溃残留）与 `Failed`
+- 回放超过 `MAX_HISTORY_CELLS` 时，裁剪由既有 `enforce_history_cap` 生效且 `dropped_cells()` 上报非零
 
 ### 存储（app-server）
 
 - `fork_thread` 复制完整性：items 数量、messages 内容、`forked_from`、meta 各字段取舍（含 `role` 清空、`extra_roots` 过滤）
-- 锁：同进程二次持有失败；跨进程持有失败（子进程验证）；锁文件在持有者退出后仍存在
+- 锁：同一 `Arc` 二次获取幂等；跨进程持有失败（子进程验证）；锁文件在持有者退出后仍存在
+- **锁的进程内去重**：同进程 `acquire_thread_lock` 两次拿到同一个 `Arc`（若退化成各自加锁，这条会红）
+- **`Clear` 边界**：`read_log` 遇到 `Clear` 后只返回其后的 items/messages
+- **未知 `type` 行不影响其余行**：混合日志里插入一条 `{"type":"future_thing"}`，其余照常解析
+- **`/compact` 落盘**：`items: []` 的 TurnLine 不产生 cell，但覆盖 `messages`
+- **meta 缺失的老会话**：`rebuild_meta` 的 `cwd` 为空串，CLI cwd 校验须放行（§8.1）
 
 ### CLI 解析
 
@@ -267,16 +356,27 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 1. 建会话 → 一轮对话 → 进程退出
 2. `run --resume <id>` → 断言历史被载入、能继续、新内容落盘
 3. 再次 `run --resume <id>` → 断言第二轮内容也在
+4. `/clear` 后退出 → `run --resume <id>` → 断言旧内容不可见（验证 §6.4 的边界语义）
 
-## 11. 落地顺序
+## 11. 日志格式向后兼容
+
+`TurnLine` 是 `#[serde(tag = "type", rename_all = "snake_case")]` 的带标签枚举（`thread_store.rs:211`），新增变体对**旧日志**是安全的：旧日志只有 `turn`，反序列化不会碰到未知变体。
+
+但**新日志对旧版本不兼容**：新版本写入的 `clear` 行，旧版 `read_log` 反序列化会失败。`read_log` 现有的容错是「跳过损坏行」（`load_skips_corrupt_log_lines`），所以旧版本打开新日志不会崩，只是会**忽略 `/clear` 边界**，表现为「清空后的内容仍然可见」。
+
+这是可接受的降级（单机 CLI，读写两端版本一致），但必须在实现时确认 `read_log` 对未知 `type` 的跳过路径确实生效，并写一条测试：**含未知变体的日志行不影响其余行解析**。
+
+## 12. 落地顺序
 
 按依赖倒序，每步可独立验证：
 
-1. **锁**（`thread_store` 新增 + app-server 侧采用）—— 独立、可单测、无 UI
-2. **TUI 落盘**（session Arc 重构 + 每轮 `append_turn` + `updated_at`）—— resume 的前提
-3. **resume**（load → 注入 → 启动）—— 主干
-4. **headless `run --resume`** —— 端到端测试载体
-5. **fork**（物理复制 + meta 规则）—— 依赖 1、3
-6. **`threads` 列表 + 前缀匹配** —— 纯展示
+1. **锁**（`thread_store` 新增 `ThreadWriterLock` + 进程级去重表 + app-server 侧采用）—— 独立、可单测、无 UI
+2. **`TurnLine::Clear` 变体 + `read_log` 边界处理** —— 为 `/clear` 铺路，纯存储层
+3. **TUI 落盘**（session Arc 重构 + 新会话建 meta + 每轮 `append_turn` + `updated_at` + `/clear` `/compact` 语义）—— resume 的前提
+4. **回放映射**（`items_to_cells`）—— 让历史真的看得见
+5. **resume**（load → 注入 → 启动）—— 主干
+6. **headless `run --resume`** —— 端到端测试载体
+7. **fork**（物理复制 + meta 规则）—— 依赖 1、5
+8. **`threads` 列表 + 前缀匹配** —— 纯展示
 
-第 1、2 步不做，3-5 做出来是空转。
+第 1-3 步不做，4-7 做出来是空转；第 4 步不做，resume 起来是空屏幕。
