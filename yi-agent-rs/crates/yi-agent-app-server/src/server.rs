@@ -4708,7 +4708,7 @@ pub(crate) async fn interrupt_and_wait_for_persist(
 ///
 /// 单个 turn 的累加值几乎不可能超过 `u32::MAX`（4.29e9），但溢出的后果是数字
 /// 突然变小，比封顶更难解释，所以封顶而不是截断。
-fn saturate_u32(value: u64) -> u32 {
+pub fn saturate_u32(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
 }
 
