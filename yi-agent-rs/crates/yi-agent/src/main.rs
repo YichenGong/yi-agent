@@ -2373,6 +2373,15 @@ fn run_tui_agent(
                 .effective_backend()
                 .to_string()
             },
+            terminal_title: config.terminal_title,
+            title_status: {
+                let multiplexed = crate::tui::notify::is_multiplexed(
+                    &crate::tui::notify::TerminalEnv::from_process(),
+                );
+                crate::tui::title::TitleWriter::new(config.terminal_title, multiplexed)
+                    .status()
+                    .to_string()
+            },
             focus_degraded: false,
         };
 

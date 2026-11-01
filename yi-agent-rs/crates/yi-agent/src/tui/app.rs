@@ -362,6 +362,8 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
         notification_method: "auto".into(),
         notification_condition: "unfocused".into(),
         effective_backend: "bel".into(),
+        terminal_title: true,
+        title_status: "on".into(),
         focus_degraded: false,
     }
 }
