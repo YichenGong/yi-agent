@@ -34,6 +34,7 @@ use crate::session_driver::{DriverAction, DriverActionKind, DriverState, Session
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
+use yi_agent_subagent::attach::AttachFailure;
 use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
@@ -380,10 +381,15 @@ struct RuntimeTooling {
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
 /// 划分的,因此 attach 以 canonical cwd 为键、懒初始化。
 ///
-/// 失败也缓存(存 `Err(原因)`):否则纯目录下每开一个 thread 都会重跑一遍注定失败的
+/// 失败也缓存(存 `Err`):否则纯目录下每开一个 thread 都会重跑一遍注定失败的
 /// bring-up(git 检查 + daemon 起停尝试)。
+///
+/// 缓存项存的是结构化的 [`yi_agent_subagent::attach::AttachFailure`] 而不是字符串,
+/// 因为「能不能重试」必须和失败原因一起记住: **瞬时**失败(对端 daemon 还在启动
+/// 窗口、socket 尚未 bind)一旦被当成终态, 整个进程的后续会话都会永久失去
+/// `spawn_agent`。2026-11-01 的 desktop 冷启动就是这样丢的委派能力。
 pub(crate) type ProjectRuntimes =
-    Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
+    Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, AttachFailure>>>>;
 
 /// 每会话自己的 root,建在项目共享 binding 之上。
 ///
@@ -854,7 +860,8 @@ pub(crate) fn cancel_thread_children(
         let guard = runtimes.lock().unwrap_or_else(|p| p.into_inner());
         guard.get(&key).cloned()
     }
-    .ok_or_else(|| "no attached runtime for this project".to_string())??;
+    .ok_or_else(|| "no attached runtime for this project".to_string())?
+    .map_err(|failure| failure.to_string())?;
     let response = binding.send(
         |handle| yi_agent_store::ipc::IpcRequest::CancelThreadTasks {
             session_id: handle.session_id.clone(),
@@ -1225,7 +1232,15 @@ fn attach_cwd_runtime(
         ));
     }
     if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        return existing.clone();
+        match existing {
+            Ok(binding) => return Ok(Arc::clone(binding)),
+            // A failure that another attempt could fix must not be replayed: it
+            // is only in the cache because the bring-up happened to run during
+            // the daemon's startup window. Re-run it and let the outcome replace
+            // this entry.
+            Err(failure) if failure.retryable => {}
+            Err(failure) => return Err(failure.to_string()),
+        }
     }
     // Own a *usable* runtime: adopt a healthy daemon, replace a dead or wedged
     // one. The binding it returns heals itself on later calls, so a daemon that
@@ -1243,13 +1258,21 @@ fn attach_cwd_runtime(
             models_path.to_path_buf(),
             Arc::new(attached),
         )
-    })
-    .map_err(|failure| format!("{}: {}", failure.stage, failure.cause));
-    runtimes
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key, outcome.clone());
-    outcome
+    });
+    let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
+    match &outcome {
+        // Only durable conclusions are worth remembering. A transient failure is
+        // not one, and storing it is exactly the bug that lost `spawn_agent`
+        // process-wide; leave the key absent so the next thread simply retries.
+        Err(failure) if failure.retryable => {
+            cache.remove(&key);
+        }
+        _ => {
+            cache.insert(key, outcome.clone());
+        }
+    }
+    drop(cache);
+    outcome.map_err(|failure| failure.to_string())
 }
 
 /// 断开已 attach、但已无 thread 使用的项目 root。
