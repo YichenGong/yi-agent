@@ -19,7 +19,7 @@
 | yi-agent-web | 11 / 11 | [详情](./yi-agent-web.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
 | ci-cd | 21 / 23 | [详情](./ci-cd.md) |
-| tooling | 9 / 9 | [详情](./tooling.md) |
+| tooling | 11 / 11 | [详情](./tooling.md) |
 | yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
