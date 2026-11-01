@@ -11,6 +11,7 @@ mod schedule_intent;
 mod session_store;
 mod tracing_init;
 mod tui;
+mod turn_log;
 
 #[cfg(test)]
 mod control_commands_tests;
@@ -82,9 +83,11 @@ fn main() -> Result<()> {
             stdin,
             naked,
             subagents,
+            ref resume,
         }) => {
             let prompt = prompt.clone();
-            run_headless(cli, prompt, json, stdin, naked, subagents)
+            let resume = resume.clone();
+            run_headless(cli, prompt, json, stdin, naked, subagents, resume)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
         Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
@@ -1595,6 +1598,7 @@ async fn drain_with_signals<W: std::io::Write, E: std::io::Write>(
     err: &mut E,
     json: bool,
     agent: &yi_agent_core::Agent,
+    turn_log: &mut crate::turn_log::TurnLog,
 ) -> i32 {
     use futures::StreamExt;
 
@@ -1618,6 +1622,8 @@ async fn drain_with_signals<W: std::io::Write, E: std::io::Write>(
             }
             event = stream.next() => {
                 let Some(event) = event else { break };
+                // 落盘口径与 TUI 完全一致：同一个 `TurnLog`，不存在第二套映射。
+                turn_log.feed(event.clone());
                 if json {
                     let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
                     let _ = writeln!(out, "{line}");
@@ -1841,6 +1847,7 @@ fn run_headless(
     from_stdin: bool,
     naked: bool,
     subagents: bool,
+    resume: Option<String>,
 ) -> Result<()> {
     let config = config::load_lenient(&cli)?;
     // 与 TUI 同一条解析链：先让 `models.json` 的默认条目补上 provider/model/key，
@@ -1924,17 +1931,76 @@ fn run_headless(
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
     let mcp = setup.mcp;
 
+    // 会话存储：resume 用既有的那份，否则新开一条。与 TUI 同一套 store，
+    // 所以 `run` 跑过的会话之后能被 `resume` / TUI 接上。
+    //
+    // 建失败不阻断：headless 的首要职责是把这一问跑完并输出，落盘是附加价值。
+    let session_store = match resume.as_deref() {
+        Some(spec) => {
+            let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
+            let id = resume::resolve_thread_id(&store, spec)?;
+            Some(
+                crate::session_store::TuiSessionStore::open(&workdir, &id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        }
+        None => {
+            let model = config.model.clone();
+            match crate::session_store::TuiSessionStore::create_new(
+                &workdir,
+                &model,
+                yi_agent_app_server::thread_store::ThreadMode::Normal,
+            ) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    eprintln!("[yi-agent] 本次会话不落盘: {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    // resume 的种子：先升格崩溃残留的轮次，再读转录。顺序固定——反过来会
+    // 读到未合流的旧状态。升格失败只记日志：`load` 自己也会合流 partial，
+    // 消息不会丢，升格的意义是让磁盘也收尾。
+    let mut seed_messages = Vec::new();
+    let mut seed_last_input = None;
+    if let Some(store) = &session_store {
+        if resume.is_some() {
+            if let Err(e) = store.promote_pending() {
+                eprintln!("[yi-agent] 未能升格未收尾的轮次: {e}");
+            }
+            let (messages, last_input) = store.load_seed()?;
+            seed_messages = messages;
+            seed_last_input = last_input;
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async move {
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let mut session = yi_agent_core::Session::from_messages(seed_messages);
+        session.set_last_input_tokens(seed_last_input);
+        let session_handle = Arc::new(std::sync::Mutex::new(session));
+
         let mut agent = yi_agent_core::Agent::new(provider, tools, agent_config)
-            .with_permission(checker, decision_rx);
+            .with_permission(checker, decision_rx)
+            .with_session_arc(Arc::clone(&session_handle));
         // The delegation tools were assembled with `runtime_caller`; binding it to
         // this agent's live session makes a `fork:true` spawn read the caller's
         // transcript at call time.
         if let Some(caller) = &runtime_caller {
             caller.bind(agent.session_handle());
         }
+
+        // 必须在 `agent.run` 之前取：run 内部会 push 本轮 user message。
+        let base_len = agent
+            .session_handle()
+            .lock()
+            .map(|s| s.messages().len())
+            .unwrap_or(0);
+        let prompt_for_log = prompt_text.clone();
 
         let stream = match agent.run(prompt_text).await {
             Ok(s) => s,
@@ -1944,11 +2010,40 @@ fn run_headless(
             }
         };
 
+        let mut turn_log = crate::turn_log::TurnLog::new(session_store.as_ref().map(|s| {
+            yi_agent_app_server::translate::Translator::new(
+                s.thread_id().to_string(),
+                s.baseline_totals(),
+            )
+        }));
+        turn_log.begin_turn();
+
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let mut out = stdout.lock();
         let mut err = stderr.lock();
-        drain_with_signals(stream, &mut out, &mut err, json, &agent).await
+        let code =
+            drain_with_signals(stream, &mut out, &mut err, json, &agent, &mut turn_log).await;
+
+        // 落盘。与 TUI 一样挂在 stream 结束上而不是 `Done`：取消路径不发 Done。
+        if let Some(store) = session_store.as_ref() {
+            let messages = agent
+                .session_handle()
+                .lock()
+                .map(|s| s.messages().to_vec())
+                .unwrap_or_default();
+            if let Some((items, usage, usage_total)) =
+                turn_log.finish(&prompt_for_log, &messages, base_len, true)
+            {
+                if let Err(e) = store.append_turn(&items, &messages, usage, usage_total) {
+                    eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                }
+                if let Err(e) = store.touch(&prompt_for_log) {
+                    eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                }
+            }
+        }
+        code
     });
 
     // Close MCP server connections on a running reactor so the child processes
@@ -2287,13 +2382,15 @@ fn run_tui_agent(
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
-            let mut translator = session_store_for_driver.as_ref().map(|s| {
-                yi_agent_app_server::translate::Translator::new(
-                    s.thread_id().to_string(),
-                    s.baseline_totals(),
-                )
-            });
-            let mut turn_items: Vec<yi_agent_app_server::protocol::Item> = Vec::new();
+            // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
+            let mut turn_log = crate::turn_log::TurnLog::new(session_store_for_driver.as_ref().map(
+                |s| {
+                    yi_agent_app_server::translate::Translator::new(
+                        s.thread_id().to_string(),
+                        s.baseline_totals(),
+                    )
+                },
+            ));
             let catalog = catalog;
             // session 必须在首次构造时就存在，且要跨 rebuild 存活——子 agent
             // 的 CallerContext 绑在它上面。resume 时用种子填进去；新会话等价于
@@ -2345,9 +2442,7 @@ fn run_tui_agent(
                             // 用量累计归零：否则清空对话后状态栏仍显示旧总数，
                             // 用户会以为清空没生效。app-server 在同一位置调
                             // `translator.reset_totals()`（server.rs:5368）。
-                            if let Some(t) = translator.as_mut() {
-                                let _ = t.reset_totals();
-                            }
+                            turn_log.reset_totals();
                             tracing::info!("agent session cleared via /clear");
                         }
                         DriverControl::Compact => {
@@ -2768,18 +2863,10 @@ fn run_tui_agent(
                     }
                 }
 
-                // 每轮重置累积器。`set_turn` 必须在 `on_event` 之前调：
-                // `alloc_item_id` 依赖 turn_id，空串会让 id 跨轮重复，而
-                // `partial_is_committed` 正靠首个 item id 判断「这轮是否已落盘」。
-                // **不要**在这里重建 Translator：那会清掉 committed 累计。
-                if let Some(t) = translator.as_mut() {
-                    t.set_turn(format!("turn-{}", uuid::Uuid::new_v4()));
-                }
-                turn_items.clear();
-                // 每轮独立，声明在这里而不是循环外：循环外的初值从来没人读，
-                // 只会让 clippy 认为赋值失效。
-                let mut last_usage: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
-                let mut usage_total: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
+                // 每轮重置累积器。`begin_turn` 内的 `set_turn` 必须先于
+                // `on_event`：`alloc_item_id` 依赖 turn_id。
+                // **不要**在这里重建 TurnLog 里的 Translator：那会清掉 committed 累计。
+                turn_log.begin_turn();
                 // 必须在 `agent.run` 之前取：run 内部会 push 本轮 user message，
                 // 取晚了基线含它，net 恒少 1。
                 let base_len = agent
@@ -2803,42 +2890,9 @@ fn run_tui_agent(
                                     match event {
                                         Some(ev) => {
                                             // 翻译用 `ev.clone()`：AgentEvent 已派生 Clone。
-                                            // 落盘口径与 app-server 完全一致，不存在第二套映射。
-                                            if let Some(t) = translator.as_mut() {
-                                                for n in t.on_event(ev.clone()) {
-                                                    match n {
-                                                        yi_agent_app_server::protocol::Notification::ItemCompleted { item, .. } => {
-                                                            turn_items.push(item);
-                                                        }
-                                                        yi_agent_app_server::protocol::Notification::TokenUsage {
-                                                            model,
-                                                            input_tokens,
-                                                            output_tokens,
-                                                            cache_creation_input_tokens,
-                                                            cache_read_input_tokens,
-                                                            ..
-                                                        } => {
-                                                            last_usage = Some(yi_agent_app_server::thread_store::TurnUsage {
-                                                                model: model.clone(),
-                                                                input_tokens,
-                                                                output_tokens,
-                                                                cache_creation_input_tokens,
-                                                                cache_read_input_tokens,
-                                                            });
-                                                            // 同一条通知里带着 translator 算好的累计量。
-                                                            let totals = t.turn_totals();
-                                                            usage_total = Some(yi_agent_app_server::thread_store::TurnUsage {
-                                                                model,
-                                                                input_tokens: yi_agent_app_server::server::saturate_u32(totals.input_tokens),
-                                                                output_tokens: yi_agent_app_server::server::saturate_u32(totals.output_tokens),
-                                                                cache_creation_input_tokens: yi_agent_app_server::server::saturate_u32(totals.cache_creation_input_tokens),
-                                                                cache_read_input_tokens: yi_agent_app_server::server::saturate_u32(totals.cache_read_input_tokens),
-                                                            });
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                            }
+                                            // 落盘口径与 app-server 完全一致，不存在第二套映射
+                                            // （映射与裁剪都在 `TurnLog`，headless 共用同一份）。
+                                            turn_log.feed(ev.clone());
                                             if agent_tx.send(ev).await.is_err() {
                                                 break;
                                             }
@@ -2864,13 +2918,7 @@ fn run_tui_agent(
                                     // **必须同样翻译**：取消轮也要落盘（只是会被下面的
                                     // 裁剪截短），否则 Ctrl+C 那轮永久丢失。
                                     while let Some(ev) = stream.next().await {
-                                        if let Some(t) = translator.as_mut() {
-                                            for n in t.on_event(ev.clone()) {
-                                                if let yi_agent_app_server::protocol::Notification::ItemCompleted { item, .. } = n {
-                                                    turn_items.push(item);
-                                                }
-                                            }
-                                        }
+                                        turn_log.feed(ev.clone());
                                         if agent_tx.send(ev).await.is_err() { break; }
                                     }
                                     break;
@@ -2922,39 +2970,15 @@ fn run_tui_agent(
                         .map(|s| s.messages().to_vec())
                         .unwrap_or_default();
 
-                    // 本轮 net 增长的 message 数。取消时 session 被 truncate 回滚，
-                    // net 会变小甚至为 0。
-                    let net = messages.len().saturating_sub(base_len);
-
-                    // 必须自己补 UserMessage：Translator 只翻译 agent 侧事件，从不
-                    // 产出它（server.rs:4794 同款注释）。漏了这一步，resume 出来的
-                    // 会话只有回答没有问题。
-                    let mut items: Vec<yi_agent_app_server::protocol::Item> =
-                        Vec::with_capacity(turn_items.len() + 1);
-                    items.push(yi_agent_app_server::protocol::Item::UserMessage {
-                        id: format!("user-{}", uuid::Uuid::new_v4()),
-                        text: prompt_for_log.clone(),
-                        attachments: Vec::new(),
-                        images: Vec::new(),
-                    });
-
-                    // 按 session 实际长度裁剪：宁可少写不可多写。多写的内容在
-                    // session 里不存在，resume 后会显示模型没说过的话。
-                    // `net == 0` 表示连 user prompt 都被回滚了，此时只留那 1 条
-                    // user item——它确实是用户问过的，不算伪造。
-                    let keep = net.max(1).min(turn_items.len() + 1);
-                    items.extend(turn_items.iter().take(keep - 1).cloned());
-
-                    if let Err(e) = store.append_turn(
-                        &items,
-                        &messages,
-                        last_usage.clone(),
-                        usage_total.clone(),
-                    ) {
-                        eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
-                    }
-                    if let Err(e) = store.touch(&prompt_for_log) {
-                        eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                    if let Some((items, usage, usage_total)) =
+                        turn_log.finish(&prompt_for_log, &messages, base_len, true)
+                    {
+                        if let Err(e) = store.append_turn(&items, &messages, usage, usage_total) {
+                            eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                        }
+                        if let Err(e) = store.touch(&prompt_for_log) {
+                            eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                        }
                     }
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4805,7 +4829,15 @@ mod tests {
             .build()
             .expect("build runtime");
         let agent = test_agent();
-        rt.block_on(drain_with_signals(stream, out, err, false, &agent))
+        let mut turn_log = crate::turn_log::TurnLog::new(None);
+        rt.block_on(drain_with_signals(
+            stream,
+            out,
+            err,
+            false,
+            &agent,
+            &mut turn_log,
+        ))
     }
 
     fn drain_stream_json_sync<W: std::io::Write>(
@@ -4818,7 +4850,15 @@ mod tests {
             .expect("build runtime");
         let agent = test_agent();
         let mut err = Vec::new();
-        rt.block_on(drain_with_signals(stream, out, &mut err, true, &agent))
+        let mut turn_log = crate::turn_log::TurnLog::new(None);
+        rt.block_on(drain_with_signals(
+            stream,
+            out,
+            &mut err,
+            true,
+            &agent,
+            &mut turn_log,
+        ))
     }
 
     /// A real `Agent` over a provider that is never called. `drain_with_signals`

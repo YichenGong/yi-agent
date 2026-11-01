@@ -199,6 +199,17 @@ impl TuiSessionStore {
         Ok((seed, last_input))
     }
 
+    /// 把崩溃残留的 checkpoint 升格进主日志。
+    ///
+    /// resume 必须做：采纳的 partial 是那一轮唯一的持久副本，不 append 就返回，
+    /// 用户下一条消息的 turn-start checkpoint 会原子覆盖同一文件，该轮 items
+    /// 永久丢失，而 session 上下文仍「记得」它们，造成 item 与上下文不一致。
+    ///
+    /// 返回 `true` 表示确实升格了。
+    pub fn promote_pending(&self) -> std::io::Result<bool> {
+        self.store.promote_partial(&self.thread_id)
+    }
+
     #[cfg(test)]
     fn load_for_test(&self) -> std::io::Result<yi_agent_app_server::thread_store::LoadedThread> {
         Ok(self

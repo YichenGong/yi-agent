@@ -115,6 +115,13 @@ pub enum Command {
         /// Enable local subagent delegation for this headless run.
         #[arg(long)]
         subagents: bool,
+
+        /// 恢复一个既有会话再跑。跑完的内容会追加进同一份日志。
+        ///
+        /// 支持完整 id 或唯一前缀。这是 resume 链路在 TUI 之外唯一的
+        /// 可自动化载体（TUI 是全屏应用，测不了）。
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Start web config UI
     Web {
@@ -715,6 +722,7 @@ mod tests {
                 stdin: _,
                 naked,
                 subagents: _,
+                resume: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(naked, "naked flag should be true");
@@ -734,6 +742,7 @@ mod tests {
                 stdin: _,
                 naked,
                 subagents: _,
+                resume: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(!naked, "naked flag should default to false");
