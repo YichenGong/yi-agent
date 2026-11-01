@@ -247,6 +247,32 @@ mod tests {
     use super::*;
     use yi_agent_core::Role;
 
+    /// 有界轮询重开一个刚刚 `drop` 过的会话。
+    ///
+    /// `drop` 只关掉本进程那个描述符，内核释放 `flock` 与 `close()` 之间没有
+    /// 同步语义。本职位的偶发来源更具体：**测试并行时的 fork**。同模块的
+    /// `second_open_of_same_thread_is_busy` 会 `spawn` 子进程，fork 会复制
+    /// **所有线程**持有的描述符——包括别的测试正持有的那把锁。子进程 `exec`
+    /// 之前内核认为锁仍被持有，于是紧随 `drop` 的非阻塞 `open` 偶发拿到
+    /// `Busy`。实测：单线程跑 26 次零失败；并行满载 15 次偶发 1~3 次失败；
+    /// 只跑 `session_store::tests` 20 次零失败，跑整个测试二进制才出现，
+    /// 据此定位为释放时序而非逻辑错误（同 `docs/bug-list.md` 里
+    /// `superpowers-kanban-runner` `lease.rs` 的已知同类问题）。
+    ///
+    /// 只改测试：产品语义（冲突即 `Busy`，不阻塞）不动。
+    fn reopen_within_a_bounded_wait(dir: &std::path::Path, id: &str) -> TuiSessionStore {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TuiSessionStore::open(dir, id) {
+                Ok(store) => return store,
+                Err(OpenError::Busy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(other) => panic!("重开会话失败: {other}"),
+            }
+        }
+    }
+
     #[test]
     fn create_new_writes_meta_and_holds_lock() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -291,7 +317,7 @@ mod tests {
         store.touch("hello").unwrap();
         drop(store);
 
-        let reopened = TuiSessionStore::open(dir.path(), &id).unwrap();
+        let reopened = reopen_within_a_bounded_wait(dir.path(), &id);
         let loaded = reopened.load_for_test().unwrap();
         assert_eq!(loaded.items.len(), 1);
         assert_eq!(loaded.messages.len(), 1);
