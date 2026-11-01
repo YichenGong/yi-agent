@@ -7548,10 +7548,8 @@ mod plugins_tests;
 mod session_driver_tests;
 
 #[cfg(test)]
-// 这里的模块名必须与文件名不同:`#[path]` 只换文件来源,模块路径由 `mod tests`
-// 决定,故仍是 `crate::server::tests`,该路径下 227 个测试名一字未变(若命名成
-// `mod rpc_tests;` 则路径会变成 `server::rpc_tests`,测试名全变)。
-#[path = "rpc_tests.rs"]
+// 目录模块：`src/server/tests/mod.rs`。模块路径仍是 `crate::server::tests`，
+// 故被 `--exact` 硬编码的 `server::tests::child_holds_thread_lock` 不受影响。
 pub(crate) mod tests;
 #[cfg(test)]
 mod theme_watcher_tests;
