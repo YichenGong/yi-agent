@@ -7,8 +7,25 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use yi_agent_subagent::thread_root::ThreadRoot;
+
+/// Budget for "wait until the spawned child has done something observable".
+///
+/// A wide safety net, not a guess about scheduling speed. Every other wait in
+/// this file already uses 10s; this one used a fixed 5s, which encoded the
+/// assumption that a shell child starts and writes its marker within 5s. Under
+/// `nextest --workspace` the machine is saturated by every other test binary at
+/// once and that assumption is false — measured on an 18-core host, the
+/// supervisor test in this file failed 3 of 9 full-workspace runs with the
+/// marker simply absent (the child had been spawned; it had not yet run).
+///
+/// 20s matches `CHILD_START_BUDGET` in `yi-agent-supervisors/tests/supervisor.rs`
+/// so the two files no longer disagree about what "slow" means. The wait is a
+/// condition poll, so a genuine bug (a child that never starts) still trips the
+/// deadline instead of being masked.
+const CHILD_START_BUDGET: Duration = Duration::from_secs(20);
 
 fn init_git_repo(dir: &Path) {
     for args in [
@@ -544,7 +561,7 @@ fn arm_plugin(repo: &Path, marker: &Path) -> std::path::PathBuf {
 /// 且 daemon 的转发表里出现它的路由。
 #[test]
 fn a_process_that_owns_the_daemon_supervises_its_plugins() {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let repo = tempfile::TempDir::new().unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
     init_git_repo(repo.path());
@@ -568,8 +585,9 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
         "this test needs the process to own the daemon"
     );
 
-    // 子进程被拉起（监督循环 500ms 一轮，给足余量）。
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 子进程被拉起（监督循环 500ms 一轮）。预算见 CHILD_START_BUDGET：
+    // 这里是条件轮询，宽预算只吸收调度延迟，不会掩盖「永远起不来」的真实缺陷。
+    let deadline = Instant::now() + CHILD_START_BUDGET;
     let mut started = false;
     while Instant::now() < deadline {
         if marker.exists() {
@@ -584,7 +602,7 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
     );
 
     // 且它可被路由：转发表里出现 demo（清单声明了 query_socket）。
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + CHILD_START_BUDGET;
     let mut routable = false;
     while Instant::now() < deadline {
         if yi_agent_store::ipc::plugin_socket_for(runtime_dir.path(), "demo").is_some() {
