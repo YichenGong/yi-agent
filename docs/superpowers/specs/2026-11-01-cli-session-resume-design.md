@@ -334,7 +334,7 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 | 锁文件 open 失败（权限/只读盘） | 报真实原因，**不得**报成「会话被占用」 |
 | `.jsonl` 尾部损坏 | 沿用 `load_tolerates_truncated_final_line` 既有容错 |
 | `meta.json` 损坏 | 沿用既有重建逻辑 |
-| 日志含未知 `type` 行 | 跳过该行，其余照常（§11） |
+| 日志含未知 `type` 行 | 沿用 `read_log` 既有的跳过行为（`thread_store.rs:347`） |
 | 落盘失败 | 日志 + 继续，不阻断对话 |
 | `fork` 源会话不可 `load` | 报错退出，**不**建半个新会话（先 `load` 成功才写 meta） |
 
