@@ -58,7 +58,7 @@
   - `pub fn truncate_graphemes(text: &str, max: usize) -> String` — 超长时留 `max-3` 字素再补 `...`
   - `pub fn summarize(text: &str) -> String` — 去围栏、去 markdown、折叠空白、截 200；空则 `"yi-agent 回合完成"`
 
-- [ ] **Step 1: 加依赖**
+- [x] **Step 1: 加依赖**
 
 在 `yi-agent-rs/Cargo.toml` 的 `[workspace.dependencies]` 里，`unicode-width` 那行附近加：
 
@@ -74,7 +74,7 @@ unicode-segmentation = { workspace = true }
 
 理由：`unicode-segmentation` v1.13.3 已在 `Cargo.lock`（经 `unicode-truncate` 传递引入），这里只是把它提为直接依赖，不引入新的下载。
 
-- [ ] **Step 2: 注册模块**
+- [x] **Step 2: 注册模块**
 
 在 `yi-agent-rs/crates/yi-agent/src/tui/mod.rs` 的 `pub mod markdown;` 之后按字母序插入：
 
@@ -82,7 +82,7 @@ unicode-segmentation = { workspace = true }
 pub mod notify;
 ```
 
-- [ ] **Step 3: 写失败的测试**
+- [x] **Step 3: 写失败的测试**
 
 创建 `yi-agent-rs/crates/yi-agent/src/tui/notify/mod.rs`，本步只写最小骨架让模块能编译：
 
@@ -183,7 +183,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认失败**
+- [x] **Step 4: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
@@ -191,7 +191,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
 
 Expected: 编译失败，报 `cannot find function `sanitize` in this scope`。
 
-- [ ] **Step 5: 写实现**
+- [x] **Step 5: 写实现**
 
 把 `text.rs` 的测试模块之前补上实现：
 
@@ -305,7 +305,7 @@ fn strip_ordered_list(line: &str) -> Option<&str> {
 }
 ```
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
@@ -313,7 +313,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
 
 Expected: PASS（11 个测试）。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): 通知正文摘要与消毒纯函数"
@@ -336,7 +336,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `osc9::Osc9Backend::new(dcs_passthrough: bool)` / `notify(&mut self, message: &str) -> io::Result<()>`
   - `bel::BelBackend::new()` / `notify(&mut self, _message: &str) -> io::Result<()>`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `yi-agent-rs/crates/yi-agent/src/tui/notify/osc9.rs`，只写测试：
 
@@ -402,7 +402,7 @@ pub mod bel;
 pub mod osc9;
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
@@ -410,7 +410,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
 
 Expected: 编译失败，报 `cannot find function `encode`` 与 `cannot find value `BEL_SEQUENCE``。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `osc9.rs` 在测试模块之前补：
 
@@ -528,7 +528,7 @@ impl BelBackend {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
@@ -536,7 +536,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
 
 Expected: PASS（5 个测试）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): BEL 与 OSC 9 协议字节编码"
@@ -559,7 +559,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `pub fn is_multiplexed(env: &TerminalEnv) -> bool`
   - `pub struct Notifier { backend: Option<Backend>, condition: Condition }` + `Notifier::new(method, condition, env)` / `notify(&mut self, message: &str)` / `is_disabled(&self) -> bool`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `mod.rs` 末尾追加测试模块（此时实现还不存在，先看红）：
 
@@ -669,7 +669,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::tests
@@ -677,7 +677,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::tests
 
 Expected: 编译失败，报 `cannot find type TerminalEnv`。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 把 `mod.rs` 现有内容整体替换为：
 
@@ -917,7 +917,7 @@ impl Notifier {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
@@ -925,7 +925,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
 
 Expected: PASS（全部 notify 测试）。若 `uses_osc9` 在非 test 构建下报 dead_code，说明它被错误地加上了 `#[cfg(test)]`——保留该属性即可，它只在测试里用。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): 终端识别与通知后端选择"
@@ -944,7 +944,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `HistoryState::last_assistant_text(&self) -> Option<&str>`
   - `pub(crate) fn permission_summary(tool_name: &str, input: &serde_json::Value) -> String`（仅改可见性，行为不变）
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `history.rs` 的测试模块里追加：
 
@@ -991,7 +991,7 @@ fn last_assistant_text_ignores_reasoning_blocks() {
 
 **注意事件名**：`AgentEvent` 里没有 `AssistantMessage`。流式正文事件是 `AgentEvent::AssistantText(String)`（`yi-agent-core/src/agent.rs:269`），而 `history.rs` 在 `push_event` 内部把它累积进 `HistoryCell::AssistantMessage { markdown }`。`ReasoningKind` 有两个变体：`Content` / `Summary`（`provider.rs:92-97`），上面用 `Summary`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::history::tests::last_assistant_text
@@ -999,7 +999,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::history::tests::last_assista
 
 Expected: 编译失败，报 `no method named `last_assistant_text``。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `impl HistoryState` 块内加（放在 `push_event` 附近）：
 
@@ -1021,7 +1021,7 @@ Expected: 编译失败，报 `no method named `last_assistant_text``。
 
 把 `permission_summary` 的 `fn` 改为 `pub(crate) fn`（`history.rs:119`）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::history
@@ -1029,7 +1029,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::history
 
 Expected: PASS，且原有 `permission_summary_*` 三条测试仍绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): last_assistant_text 供回合通知取摘要"
@@ -1049,7 +1049,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `Settings.tui: TuiSettings`
   - `FIELDS` 新增 `tui.notifications` / `tui.notification_method` / `tui.notification_condition`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `settings.rs` 测试模块追加：
 
@@ -1121,7 +1121,7 @@ fn valid_notification_values_survive() {
 
 `tempfile` 已是 `yi-agent-runtime` 的 dev-dependency（`Cargo.toml:26`），无需新增。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-runtime --lib settings::tests::tui
@@ -1129,7 +1129,7 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime --lib settings::tests::tui
 
 Expected: 编译失败，报 `no field `tui` on type `Settings``。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `Settings` 结构体里加字段：
 
@@ -1248,7 +1248,7 @@ pub struct TuiSettings {
         }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-runtime --lib settings
@@ -1256,7 +1256,7 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime --lib settings
 
 Expected: PASS，包括既有的 `FIELDS` 唯一性与默认值护栏测试。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(settings): 新增 tui 通知三项配置"
@@ -1276,7 +1276,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 - Consumes: `Settings.tui`（Task 5）
 - Produces: 三个键在 settings RPC 与 web API 上可读可写
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `rpc_tests.rs` 里，紧邻既有的 `startup.sandbox` 断言（约 `:16265`）加一条：
 
@@ -1311,7 +1311,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 
 上方 `call_settings_write` / `call_settings_list` 用该文件里既有的同类辅助函数替换（`rpc_tests.rs` 已有调用 `settings/write` 与 `settings/list` 的现成写法，照它改）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-app-server --lib every_tui_notification_field
@@ -1319,7 +1319,7 @@ cd yi-agent-rs && cargo test -p yi-agent-app-server --lib every_tui_notification
 
 Expected: FAIL，`tui.notifications must be listed` 或读回 `null`。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 `yi-agent-app-server/src/settings_rpc.rs` 的 `current_value`，在 `"startup.sandbox"` 分支后加：
 
@@ -1349,7 +1349,7 @@ Expected: FAIL，`tui.notifications must be listed` 或读回 `null`。
         "tui.notification_condition" => settings.tui.notification_condition.is_some(),
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-app-server --lib settings && cargo test -p yi-agent-web --lib
@@ -1357,7 +1357,7 @@ cd yi-agent-rs && cargo test -p yi-agent-app-server --lib settings && cargo test
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(settings): 通知三项接入 web 与 RPC 通路"
@@ -1379,7 +1379,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `RuntimeConfig.notifications: bool`、`.notification_method: String`、`.notification_condition: String`
   - `TuiConfigSnapshot.notifications: bool`、`.notification_method: String`、`.notification_condition: String`、`.effective_backend: String`（**四个**字段；焦点降级不进快照，见 Task 8）
 
-- [ ] **Step 1: 加 `RuntimeConfig` 字段**
+- [x] **Step 1: 加 `RuntimeConfig` 字段**
 
 在 `RuntimeConfig` 里 `model_injected` 之后加：
 
@@ -1417,7 +1417,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 
 **注意**：`RuntimeConfig` 若有 `Default` 实现或其它构造点（`grep -rn "RuntimeConfig {" crates/`），必须逐个补齐，否则编译失败。这是好事——编译器会指出所有构造点。
 
-- [ ] **Step 2: 加 snapshot 字段**
+- [x] **Step 2: 加 snapshot 字段**
 
 `TuiConfigSnapshot` 加：
 
@@ -1456,7 +1456,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 
 **`focus_degraded` 走另一条路**：它取决于 `execute!(stdout, EnableFocusChange)` 的返回值，那发生在 `run_tui` 里、`main.rs` 之后。因此它作为**值参**传给 `run_loop`（Task 8），在 `/config` 渲染后追加一行提示。`TuiConfigSnapshot.render` 保持纯函数。
 
-- [ ] **Step 3: 在 `/config` 里展示**
+- [x] **Step 3: 在 `/config` 里展示**
 
 `slash.rs` 的 `TuiConfigSnapshot::render` 里，照 `startup.sandbox` 那行的样式加一行：
 
@@ -1475,7 +1475,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 
 具体 `lines.push` 形式与既有代码保持一致；若有宽度对齐辅助函数，用之。
 
-- [ ] **Step 4: 编译并跑快照测试**
+- [x] **Step 4: 编译并跑快照测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::slash
@@ -1483,7 +1483,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::slash
 
 Expected: PASS。若 `/config` 已有整屏快照测试，会因新增一行而失败——此时更新该快照的期望值，**不要**删掉通知行。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(config): 通知配置贯通到 RuntimeConfig 与 TUI 快照"
@@ -1503,7 +1503,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
   - `run_loop` 内 `let focused = Arc::new(AtomicBool::new(true));`
   - `run_loop` 新签名参数 `focus_degraded: bool`（`app.rs:410`），供 `/config` 展示降级提示
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `app.rs` 测试模块加（用既有假 `EventSource` 模式）：
 
@@ -1535,7 +1535,7 @@ fn should_notify_respects_condition() {
 
 `FakeEventSource` 若不存在，用 `app.rs` 里现有的假事件源类型替换（grep `impl EventSource for`）。本步的两个测试其实只依赖 `apply_focus_event` 与 `should_notify` 两个纯函数，`FakeEventSource` 那句可以删掉。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify
@@ -1543,7 +1543,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify
 
 Expected: 编译失败，`cannot find function `should_notify``。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `app.rs` 里加两个自由函数：
 
@@ -1625,7 +1625,7 @@ fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> boo
             }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify && cargo check -p yi-agent
@@ -1633,7 +1633,7 @@ cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify &&
 
 Expected: PASS + 编译无错。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): 焦点跟踪与通知条件判定"
@@ -1652,7 +1652,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 - Consumes: `Notifier`、`HistoryState::last_assistant_text`、`permission_summary`、`should_notify`、`apply_focus_event`
 - Produces: 无新公开接口（内部状态机）
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `app.rs` 测试模块加：
 
@@ -1779,15 +1779,15 @@ fn flush_clears_pending() {
 - `ReasoningKind` 只有 `Content` 与 `Summary` 两变体（`provider.rs:92-97`），上面用 `Summary`。
 - `AgentEvent` 没有 `AssistantMessage` 变体，流式正文是 `AssistantText(String)`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::turn_complete
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::app::notification_tests::turn_complete
 ```
 
 Expected: 编译失败，`cannot find type `NotificationState``。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `app.rs` 里新增状态机（放在 `should_notify` 旁边）：
 
@@ -1921,15 +1921,17 @@ impl NotificationState {
             }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::app
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::app
 ```
 
-Expected: PASS（9 个新测试 + 既有测试）。
+Expected: PASS（10 个新测试 + 既有测试）。
 
-- [ ] **Step 5: 提交**
+> 注：`yi-agent` crate 没有 lib target，实际用 `--bin yi-agent`。
+
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(tui): 事件循环发出终端通知"
@@ -1948,7 +1950,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 - Consumes: 前九个任务的全部产物
 - Produces: 可交付的完整功能
 
-- [ ] **Step 1: 确认 `snapshot_for_tests` 与 `main.rs` 的字段齐全**
+- [x] **Step 1: 确认 `snapshot_for_tests` 与 `main.rs` 的字段齐全**
 
 ```bash
 cd yi-agent-rs && cargo check -p yi-agent
@@ -1956,15 +1958,15 @@ cd yi-agent-rs && cargo check -p yi-agent
 
 Expected: 无错。若有 `missing field` 报错，按 Task 7 Step 2 的取值逐项补齐。
 
-- [ ] **Step 2: 跑全 crate 测试**
+- [x] **Step 2: 跑全 crate 测试**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui
 ```
 
 Expected: PASS。
 
-- [ ] **Step 3: 跑相邻 crate 测试**
+- [x] **Step 3: 跑相邻 crate 测试**
 
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-runtime && cargo test -p yi-agent-app-server --lib settings && cargo test -p yi-agent-web --lib
@@ -1972,7 +1974,7 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime && cargo test -p yi-agent-app-s
 
 Expected: PASS。
 
-- [ ] **Step 4: 检查格式与 clippy**
+- [x] **Step 4: 检查格式与 clippy**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all --check && cargo clippy -p yi-agent -p yi-agent-runtime -p yi-agent-web -p yi-agent-app-server --all-targets -- -D warnings
@@ -1980,7 +1982,7 @@ cd yi-agent-rs && cargo fmt --all --check && cargo clippy -p yi-agent -p yi-agen
 
 Expected: 无输出（fmt 通过）+ clippy 无 warning。
 
-- [ ] **Step 5: 手工验收（本机 macOS）**
+- [x] **Step 5: 手工验收（本机 macOS）**
 
 在真实终端里跑：
 
@@ -2002,7 +2004,7 @@ cat "$HOME/.yi-agent/settings.json"   # 或 $YI_AGENT_HOME 下的同名文件
 
 把 `"notification_condition": "always"` 写进去，重跑第 2 步 → 这次应弹通知。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "test(tui): 通知功能收尾与全量验证"

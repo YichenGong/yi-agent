@@ -739,6 +739,49 @@ mod tests {
     }
 
     #[test]
+    fn tui_notification_settings_reach_runtime_config() {
+        // 端到端钉子：写进 settings.json 的三个值必须真的出现在 RuntimeConfig
+        // 上。缺了这条，字段名写错（比如 `tui.notification`）在编译期毫无反应，
+        // 用户改了配置却永远拿默认值。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(
+            r#"{"tui":{"notifications":"false","notification_method":"bel","notification_condition":"always"}}"#,
+        );
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!cfg.notifications);
+        assert_eq!(cfg.notification_method, "bel");
+        assert_eq!(cfg.notification_condition, "always");
+    }
+
+    #[test]
+    fn tui_notification_defaults_apply_when_absent() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(cfg.notifications, "通知默认开启");
+        assert_eq!(cfg.notification_method, "auto");
+        assert_eq!(cfg.notification_condition, "unfocused");
+    }
+
+    #[test]
     fn settings_json_supplies_values_when_nothing_else_does() {
         let _lock = ENV_TEST_MUTEX
             .lock()
