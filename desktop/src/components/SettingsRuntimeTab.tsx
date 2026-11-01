@@ -12,6 +12,7 @@ export const GROUP_LABELS: Record<string, string> = {
   compact: "上下文压缩",
   startup: "启动",
   tui: "终端通知",
+  power: "电源与休眠",
 };
 
 /** 每组一句话说明在管什么。后端新增分组时查不到就不渲染，不造空话。 */
@@ -20,10 +21,14 @@ export const GROUP_HINTS: Record<string, string> = {
   compact: "上下文接近上限时的自动压缩策略",
   tui: "命令行界面在回合结束时的提示方式",
   startup: "启动时生效的默认档位",
+  power: "有网且（插电 或 有活在跑）时阻止系统空闲休眠",
 };
 
-/** 按「影响面从大到小」排：agent 是主循环，compact 是它的兜底，tui 是另一个前端。 */
-export const GROUP_ORDER = ["agent", "compact", "tui", "startup"];
+/**
+ * 按「影响面从大到小」排：agent 是主循环，compact 是它的兜底，tui 是另一个前端。
+ * `power` 影响整机、改动频率最低，放末尾。
+ */
+export const GROUP_ORDER = ["agent", "compact", "tui", "startup", "power"];
 
 /**
  * 枚举值的显示文案。**只影响显示**：提交给 `settings/write` 的永远是原始字符串。
@@ -38,6 +43,7 @@ const VALUE_LABELS: Record<string, Record<string, string>> = {
     "danger-full-access": "完全访问",
   },
   "tui.notifications": { true: "开", false: "关" },
+  "power.prevent_idle_sleep": { true: "开", false: "关" },
   "tui.notification_method": { auto: "自动", osc9: "OSC 9（带正文）", bel: "响铃" },
   "tui.notification_condition": { unfocused: "仅窗口失焦时", always: "总是" },
 };
