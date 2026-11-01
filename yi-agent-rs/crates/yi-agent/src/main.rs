@@ -1338,6 +1338,7 @@ pub(crate) struct ResumeSeed {
 }
 
 fn run_resume(cli: Cli, spec: Option<String>, last: bool, prompt: Option<String>) -> Result<()> {
+    prepare_environment();
     let config = config::load_lenient(&cli)?;
     let workdir = config.workdir.clone();
     let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
@@ -1381,6 +1382,7 @@ fn run_resume(cli: Cli, spec: Option<String>, last: bool, prompt: Option<String>
 }
 
 fn run_threads(cli: &Cli) -> Result<()> {
+    prepare_environment();
     let config = config::load_lenient(cli)?;
     let store = yi_agent_app_server::thread_store::ThreadStore::new(&config.workdir);
     let mut all = store.list()?;
@@ -1403,6 +1405,7 @@ fn run_threads(cli: &Cli) -> Result<()> {
 }
 
 fn run_fork(cli: Cli, spec: String, prompt: Option<String>) -> Result<()> {
+    prepare_environment();
     let config = config::load_lenient(&cli)?;
     let workdir = config.workdir.clone();
     let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
@@ -1430,8 +1433,20 @@ fn run_agent(cli: Cli) -> Result<()> {
     run_agent_with_seed(cli, None)
 }
 
-fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
-    // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
+/// 配置加载**之前**必须完成的迁移：`.env` → `settings.json` / `models.json`。
+///
+/// 所有需要 `config` 的入口（新会话、resume、fork、threads、headless）都必须
+/// 先过这里。少调一次的后果不是「迁移没做」而是**解析到错误的 workdir**：老
+/// 格式 `.env` 里的设置迁移前在 `.env`、迁移后在 `settings.json`，两条读取路径
+/// 给出的 `workdir` 一旦不同，`resume` 就会去另一个目录的 threads 里找会话。
+///
+/// **只做非交互的事**：本函数会被 `threads`、headless 这类可能要跑在管道里的
+/// 入口调用，弹引导会让它们挂死在 stdin 上。首启引导由交互入口自己调。
+///
+/// 幂等：两个迁移各自检查状态。
+///
+/// 返回 `preferences.json` 的路径，供调用方判断要不要弹引导。
+fn prepare_environment() -> std::path::PathBuf {
     // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
     // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
     let env_path = config::resolve_global_env_path()
@@ -1452,6 +1467,13 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
         &yi_agent_tools::websearch_path(),
     );
     yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
+    prefs_path
+}
+
+fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
+    // 迁移与首启引导必须发生在 `config::load` 之前：此时还没有配置，
+    // 加载器会直接报错；而迁移会移动 `workdir` 的读取来源。
+    let prefs_path = prepare_environment();
     // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
     // 让 should_offer / prompt 与运行期读点一致。
     let models_path = yi_agent_runtime::models::models_path();
@@ -1849,6 +1871,9 @@ fn run_headless(
     subagents: bool,
     resume: Option<String>,
 ) -> Result<()> {
+    // 迁移必须在 `config::load` 之前：它决定了 `workdir` 从哪读。
+    // 不弹引导——headless 可能跑在管道里，弹了会挂死在 stdin 上。
+    let _ = prepare_environment();
     let config = config::load_lenient(&cli)?;
     // 与 TUI 同一条解析链：先让 `models.json` 的默认条目补上 provider/model/key，
     // 再判断是否可发起对话。只拿裸配置判定会把「模型只在清单里」的机器误判成
@@ -3149,6 +3174,14 @@ mod tests {
         // 同名调用（`run_headless` 也调用 `load_lenient`）满足，断言就成了空转。
         // 注意切片目标是 `run_agent_with_seed`：`run_agent` 只是转调它的薄包装，
         // resume 复用的是同一个函数体，断言必须盯住真正执行逻辑的那个。
+        // 环境前置被抽成 `prepare_environment`，引导语句仍在入口本体里。
+        // 两段一起看：否则抽函数会让这条断言悄悄失效（它断的是「顺序」，
+        // 而顺序跨了函数边界）。
+        let helper = source
+            .split("fn prepare_environment(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("prepare_environment must exist");
         let body = source
             .split("fn run_agent_with_seed(")
             .nth(1)
@@ -3195,9 +3228,14 @@ mod tests {
             "a machine with neither a key nor a catalog entry must get the guidance line, \
              and the check must require a non-empty model as well as a key"
         );
+        // 全局 `.env` 路径在辅助函数里算，`prefs_path` 由它返回。
         assert!(
-            body.contains(&global),
+            helper.contains(&global),
             "onboarding must target the global env path"
+        );
+        assert!(
+            body.contains("prepare_environment()"),
+            "就绪步骤必须先跑一次，否则 workdir 会从旧路径解析"
         );
     }
 
@@ -3343,22 +3381,30 @@ mod tests {
     #[test]
     fn the_env_migration_runs_before_config_loading() {
         let source = include_str!("main.rs");
-        // 切 `run_agent_with_seed`：`run_agent` 只是转调它的薄包装，迁移与加载
-        // 都在真正执行逻辑的那个函数体里。
-        let run_agent_at = source
-            .find("fn run_agent_with_seed(")
-            .expect("run_agent_with_seed must exist");
-        let body = &source[run_agent_at..];
-        let body = body.split("\nfn ").next().expect("body terminates");
-
-        let migration_at = body
+        // 迁移被抽进 `prepare_environment`，入口只负责先调它。这里断两件事：
+        // 迁移确实在辅助函数里、且辅助函数先于 `config::load_lenient` 被调。
+        let helper = source
+            .split("fn prepare_environment(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("prepare_environment must exist");
+        helper
             .find("migrate::migrate_env_settings(")
-            .expect("run_agent must migrate .env before loading config");
-        let load_at = body
+            .expect("prepare_environment must migrate .env");
+
+        let entry = source
+            .split("fn run_agent_with_seed(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("run_agent_with_seed must exist");
+        let prepare_at = entry
+            .find("prepare_environment()")
+            .expect("the entry must run the migration helper");
+        let load_at = entry
             .find("config::load_lenient(")
             .expect("run_agent must load config");
         assert!(
-            migration_at < load_at,
+            prepare_at < load_at,
             "the .env migration must run before the config is loaded, otherwise values get \
              injected into the process env and then lost on the next start"
         );
