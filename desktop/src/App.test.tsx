@@ -2938,6 +2938,37 @@ describe("App reconnect resilience", () => {
   });
 });
 
+describe("App multi-slot wiring", () => {
+  /**
+   * 全局只读（`build/info` / `flags/list`）必须落在**本地**槽位。
+   *
+   * 这里直接对注册表断言而不是经 `App`：测试里的 fake transport 不区分槽位，
+   * 经 App 断言只能证明「问了一次」，证明不了「问的是哪一条连接」——而后者
+   * 正是本用例要钉住的东西（spec §5.2：问远端会得到那台机器的答案）。
+   */
+  it("reads build kind and flags from the local slot, never a remote one", async () => {
+    const { ClientRegistry } = await import("./lib/clientRegistry");
+    const registry = new ClientRegistry<{ dispose: () => void; name: string }>();
+    const local = { name: "local", dispose: () => {} };
+    const remote = { name: "remote", dispose: () => {} };
+    registry.put("local", local);
+    registry.put("proj-foo", remote);
+    // 用户正看着远端项目：活动槽位是远端，但全局只读仍须走本地。
+    registry.setActive("proj-foo");
+    expect(registry.current()).toBe(remote);
+    expect(registry.forGlobalReads()).toBe(local);
+  });
+
+  it("reconnects every connected slot on foreground, not just the active one", async () => {
+    const { ClientRegistry } = await import("./lib/clientRegistry");
+    const registry = new ClientRegistry<{ dispose: () => void }>();
+    registry.put("local", { dispose: () => {} });
+    registry.put("proj-foo", { dispose: () => {} });
+    // 前台唤醒的遍历依据就是这个列表：漏掉哪个槽位，哪个项目就永久半死。
+    expect(registry.keys().sort()).toEqual(["local", "proj-foo"]);
+  });
+});
+
 describe("App iOS first-launch pairing", () => {
   const IPHONE_UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";

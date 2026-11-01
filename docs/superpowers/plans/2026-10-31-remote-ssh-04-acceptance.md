@@ -865,3 +865,106 @@ yi-agent remote install --from /path/to/yi-agent-linux
 **3. 数量核对**：A 批 12 小节、B 批 18 小节、C 批 23 小节、D 批 7 小节 = 60 个执行小节，覆盖 55 条判据（其中判据 3、29、34、40、44 拆成单测部分与真机部分两处执行，故小节数多于判据数）。
 
 **4. 依赖顺序**：A 批可完全并行；B 批需一个远端就绪；C 批需两个远端 + 中继；D 批需 release 构建与真机。
+
+---
+
+## 实际执行记录（2026-11-01）
+
+环境：macOS aarch64 开发机；远端为 `gpu-jump`（x86_64 Linux，
+`/usr/bin/tar` + `/usr/bin/gzip` + `/usr/bin/curl` 齐全）；中继为
+`relay.yi-agent.top` 真实部署。
+
+### A 批：全部 PASS
+
+| # | 命令 | 实际结果 |
+|---|---|---|
+| A1 | `cargo test -p yi-agent-flags --lib the_remote_ssh_flag_is_registered` | `1 passed` |
+| A2 | `cargo test --lib remote::rpc::tests::remote_commands_are_absent` | `1 passed` |
+| A3 | `cargo test --lib remote::argv` | `11 passed`（含新增 `listen_is_always_stdio`） |
+| A4 | `git diff --stat main -- yi-agent-rs/crates/yi-agent-tools` | **空输出** |
+| A5 | `du -sh /Applications/yi-agent.app` / `find ... -name '*linux*'` | `51M`；`find` 无输出 |
+| A6 | `cargo tree -p desktop \| grep -E 'xz2\|flate2'` | **见下方「A6 说明」** |
+| A7 | `remote::profile` / `remote_session` | `21 passed` / `8 passed` |
+| A8 | `cargo test -p yi-agent-app-server --lib rpc::remote` | `15 passed`（含 `observe_never_sees_the_session`） |
+| A9 | `cargo test --lib remote::argv::tests::listen_is_always_stdio` | `passed`（断言拒绝 `ws://`/`tcp://`/`relay://`） |
+| A10 | `cargo test --lib bridge` | `46 passed` |
+| A11 | `cargo test --lib remote::config` | `6 passed`，含 `concurrent_saves_do_not_corrupt_the_file` 与 `.tmp` 无残留断言 |
+| A12 | 三栈全量 | app-server `1107 passed` / desktop `159 passed` / vitest `1864 passed` / `tsc` 干净 |
+
+#### A6 说明（判据 10 字面与实测的偏差，已按实质含义满足）
+
+`cargo tree -p desktop | grep flate2` **非空**，但这不是本功能引入的：
+
+- `main` 的 `Cargo.lock` 里本来就固定着 `flate2 1.1.10`，来源是
+  `tauri → tauri-macros → tauri-codegen → ico → png → flate2`（打包图标用）。
+- 本分支**没有**新增任何解压 crate：`git diff main -- desktop/src-tauri/Cargo.lock`
+  里没有 `flate2` / `xz2` / `miniz_oxide` 的新增行。
+- 实现过程中曾为「远端无 gzip」降级直接声明过 `flate2`，已移除：改为用
+  **系统 `tar`** 只解出 `yi-agent` 一个成员再 scp（见 `remote/install.rs` 的
+  `needs_local_extract` / `extract_binary`）。这样远端不再需要 `tar`，
+  本机依赖树也不因本功能增加任何解压库。
+
+判据 10 的**实质**（本机不因远端安装而引入解压依赖）成立；字面上的
+`grep` 命令在任何含 `tauri` 的仓库里都必然命中，建议后续把判据改成
+「`git diff main -- Cargo.lock` 无新增解压 crate」这类可真正判定的形式。
+
+### B 批：部分 PASS（受环境限制）
+
+| # | 判据 | 结果 | 证据 |
+|---|---|---|---|
+| B1 | 配置落盘、`instance_root` 以 `.yi-agent` 结尾 | PASS | 交叉编译产物装到 `~/.yi-agent-projects/proj-b/bin/0.1.12/` |
+| B2 | 端到端执行远端命令 | **BLOCKED** | 远端无模型配置，`thread/start` 返回 `-32027 model_not_configured` |
+| B3 | 远端 `cwd` 正确 | **BLOCKED** | 同上 |
+| B4 | 本机路径不泄漏 | PASS | 远端 `$HOME/.yi-agent` 未被创建；实例目录隔离在 `.yi-agent-projects/` 下 |
+| B5 | 远端路径不存在时快速失败 | PASS | 改为保存时 `test -d` 预检，报 `remote path ... is not a directory on ...` |
+| B6 | 每阶段有超时 | PASS | `run_remote_within` watchdog，`a_stuck_command_times_out_and_is_killed` |
+| B7 | 中继失败不拖垮主通道 | PASS | 见 C 批：`remote/relayTargets` 与 stdio 主通道互相独立 |
+| B8 | `app_server_mode` 是 `StdioWithRelay` | PASS | 远端 `ps` 显示 `--listen stdio:// --relay ...`，无 `ws://` |
+| B9 | 不支持架构快速失败 | PASS | `remote::probe` 在探测阶段拒绝，未进入下载 |
+
+B2/B3 未通过的唯一原因是**远端机器没有模型 key**，不是实现问题；
+加上 `ANTHROPIC_API_KEY` 后可复验。
+
+**远端 relay 桥接无法在 `gpu-jump` 上验证**：该机无外网出口
+（`curl https://relay.yi-agent.top` 返回 `000`，`github.com` 亦然）。
+因此 B 批的中继部分改在本机用等价拓扑验证（见 C 批）。
+
+### C 批：核心判据 PASS（本机等价拓扑）
+
+拓扑：一个「桌面」实例（`YI_AGENT_HOME=/tmp/rb1`，带真实 `--relay`）
+装有两个 profile；另起两个进程分别占用派生出的两条 session，模拟两个远端项目。
+
+| # | 判据 | 结果 | 证据 |
+|---|---|---|---|
+| C1 | 并行连两个远端项目 | PASS | 两个进程同时注册在两个 session 上，`pgrep` 见到两条 `app-server` |
+| C2 | 响应归属正确 | PASS | 两个项目**同时**发 `initialize`，**故意用相同的 `id: 7`**，各自收到自己的响应 |
+| C3 | 事件不串台 | PASS（单测） | `ownsThreadView` 5 条测试；`wireClient` 按槽位门控视图写入 |
+| C5 | 每项目一条 relay session | PASS | `remote/relayTargets` 返回两条不同 session：`...-proj-a` / `...-proj-b` |
+| C6 | 不落 `default` session | PASS | 派生串显式带 `?session=<base>-<id>`，无 `session=default` |
+| C7 | 跨槽位故障隔离 | PASS | 杀掉 A 的进程后：A 得 `no computer connected for this session`，B 仍 `initialize` 成功 |
+
+**本轮查出并修复的 3 个真实缺陷**（都是真机/真实中继跑出来的，单测当时全绿）：
+
+1. **`relayTargets` 把电脑侧端点给了手机**。原实现返回
+   `derive_session(...)` = `wss://relay/connect?session=x-y`。手机连 `/connect`
+   能握手（`OPEN`）但 20s 收不到任何帧——那是电脑侧注册端点。已加
+   `remote_session::client_endpoint`，只改路径不动 session 值。修后同一 URL
+   收到 `initialize` 响应。
+2. **`instance_root` 无法从 UI 保存**。设置页按 spec §4.9 不提供该输入框，
+   而 `remote_upsert` 要求它必填 —— 前端保存的任何 profile 都必然被拒。
+   已改为保存时探测远端 `$HOME` 并派生。顺带补上判据 24 的 `test -d` 预检。
+3. **所有槽位共写一个 `ThreadStore`**。thread id 在各自 app-server 内唯一、
+   跨 app-server 无保证，两个项目都可能有 `t-1`。原实现会把 A 的
+   `turn/*` 写进 B 的视图（判据 17 的对象）。已加槽位门控，只拦视图写入、
+   不拦收帧。
+
+### D 批：待发布前执行
+
+需要 release 构建、安装包与真机，本环境不具备。D 批 7 个小节全部标记为
+**待执行**，不填 PASS。
+
+### 结论
+
+A 批 12/12 PASS；C 批核心并行与隔离判据 PASS；B 批除「需要远端模型配置」
+的两条外 PASS；D 批待发布前执行。**未达到「55 条全 PASS」**，因此按计划
+第 842 行的约定，尚不进入正式版评审。

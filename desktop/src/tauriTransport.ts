@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ApprovalRequest } from "./lib/protocol";
 import type { Transport } from "./lib/rpc";
+import { LOCAL_SLOT, type Slot, eventName } from "./lib/slots";
 
 /**
  * Subscribes to a bridge event and returns an unsubscribe function that is safe
@@ -28,7 +29,7 @@ function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
  * `Transport` backed by the Tauri bridge. Each hook subscribes to a bridge
  * event; `send`/`respond` invoke the two commands the Rust side exposes.
  */
-export function tauriTransport(): Transport {
+export function tauriTransport(slot: Slot = LOCAL_SLOT): Transport {
   // Every subscription must be unlistened on `dispose`. A Tauri event listener
   // (unlike a closed WebSocket) keeps firing forever if it is never removed, so
   // a client replaced on reconnect would otherwise keep applying every frame
@@ -43,15 +44,15 @@ export function tauriTransport(): Transport {
   };
   return {
     send: async (message) => {
-      await invoke("rpc", message);
+      await invoke("rpc", { ...(message as object), slot });
     },
     respond: async (id, result) => {
-      await invoke("rpc_respond", { id, result });
+      await invoke("rpc_respond", { id, result, slot });
     },
-    onMessage: (cb) => track(subscribe<unknown>("app-server://message", cb)),
-    onRequest: (cb) => track(subscribe<ApprovalRequest>("app-server://request", cb)),
+    onMessage: (cb) => track(subscribe<unknown>(eventName("message", slot), cb)),
+    onRequest: (cb) => track(subscribe<ApprovalRequest>(eventName("request", slot), cb)),
     onStatus: (cb) =>
-      track(subscribe<{ state: string; code?: number | null }>("app-server://status", cb)),
+      track(subscribe<{ state: string; code?: number | null }>(eventName("status", slot), cb)),
     dispose: () => {
       for (const off of [...unsubscribers]) off();
       unsubscribers.clear();

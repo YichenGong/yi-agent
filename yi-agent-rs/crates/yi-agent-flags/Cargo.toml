@@ -8,8 +8,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-yi-agent-store = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# 只为「路径解析与 store 逐字一致」的对照测试；不参与运行期依赖，
+# 否则桌面壳引入本 crate 时会连带链进 rusqlite（bundled），白涨体积。
+yi-agent-store = { workspace = true }
 tempfile = "3"

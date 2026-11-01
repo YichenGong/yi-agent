@@ -1,10 +1,32 @@
 #[cfg(desktop)]
 mod bridge;
 #[cfg(desktop)]
+mod remote;
+#[cfg(desktop)]
 pub mod window;
+
+/// 本壳的构建标识（由 `build.rs` 注入）。
+///
+/// 缺失时退回 `"release"`：宁可开关全部失效，也不让未验证的功能漏给用户
+/// （与 `yi-agent-flags::build_kind` 的兜底一致）。
+#[cfg(desktop)]
+const BUILD_KIND: &str = match option_env!("YI_AGENT_BUILD_KIND") {
+    Some(kind) => kind,
+    None => "release",
+};
+
+#[cfg(desktop)]
+const WRAPPER_VERSION: &str = match option_env!("YI_AGENT_WRAPPER_VERSION") {
+    Some(version) => version,
+    None => "0.0.0",
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 必须在任何开关判定之前。OnceLock：重复调用无副作用。
+    #[cfg(desktop)]
+    yi_agent_flags::set_build_info(BUILD_KIND, WRAPPER_VERSION);
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
@@ -20,10 +42,18 @@ pub fn run() {
             bridge::rpc,
             bridge::rpc_respond,
             bridge::set_relay_url,
-            bridge::restart_sidecar
+            bridge::restart_sidecar,
+            bridge::kill_remote_slots,
+            bridge::remote_connect,
+            bridge::remote_disconnect,
+            bridge::remote_status,
+            bridge::remote_enabled,
+            bridge::remote_list,
+            bridge::remote_upsert,
+            bridge::remote_remove
         ])
         .setup(|app| {
-            bridge::spawn(app.handle())?;
+            bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;
             // Sizing is cosmetic: log and continue rather than fail launch.
             if let Err(err) = window::fit_main_window(app.handle()) {
                 eprintln!("[window] fit failed: {err}");

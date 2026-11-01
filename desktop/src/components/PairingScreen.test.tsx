@@ -1,7 +1,17 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { CONNECT_FAILED_TEXT, INVALID_CODE_TEXT, PairingScreen } from "./PairingScreen";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import {
+  CONNECT_FAILED_TEXT,
+  INVALID_CODE_TEXT,
+  PairingScreen,
+} from "./PairingScreen";
 import {
   REMOTE_STORAGE_KEY,
   type StorageLike,
@@ -31,7 +41,10 @@ function fields() {
   };
 }
 
-function fill(f: ReturnType<typeof fields>, { code = "ABCD-EFGH", name = "我的 iPhone" } = {}) {
+function fill(
+  f: ReturnType<typeof fields>,
+  { code = "ABCD-EFGH", name = "我的 iPhone" } = {},
+) {
   fireEvent.change(f.url, { target: { value: URL } });
   fireEvent.change(f.code, { target: { value: code } });
   fireEvent.change(f.name, { target: { value: name } });
@@ -57,7 +70,9 @@ describe("PairingScreen validation", () => {
   });
 
   it("prefills the address from `initialUrl`", () => {
-    render(<PairingScreen redeem={vi.fn()} storage={storages()} initialUrl={URL} />);
+    render(
+      <PairingScreen redeem={vi.fn()} storage={storages()} initialUrl={URL} />,
+    );
     expect(fields().url.value).toBe(URL);
   });
 
@@ -74,7 +89,9 @@ describe("PairingScreen submit", () => {
     const storage = storages();
     const redeem = vi.fn().mockResolvedValue(PAIRED);
     const onPaired = vi.fn();
-    render(<PairingScreen redeem={redeem} storage={storage} onPaired={onPaired} />);
+    render(
+      <PairingScreen redeem={redeem} storage={storage} onPaired={onPaired} />,
+    );
 
     fill(fields());
     fireEvent.click(fields().submit);
@@ -83,7 +100,11 @@ describe("PairingScreen submit", () => {
     expect(redeem).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone");
     // The persisted binding is what `transportFactory` reads on the next boot,
     // so it must carry the relay url under the key `storedRemoteConfig` reads.
-    expect(storedRemoteConfig(storage)).toEqual({ url: URL, token: "yia_tok" });
+    expect(storedRemoteConfig(storage)).toEqual({
+      url: URL,
+      token: "yia_tok",
+      projects: [],
+    });
     expect(JSON.parse(storage.getItem(REMOTE_STORAGE_KEY)!).url).toBe(URL);
   });
 
@@ -100,7 +121,11 @@ describe("PairingScreen submit", () => {
 
     await waitFor(() => expect(redeem).toHaveBeenCalledTimes(1));
     expect(redeem).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone");
-    expect(storedRemoteConfig(storage)).toEqual({ url: URL, token: "yia_tok" });
+    expect(storedRemoteConfig(storage)).toEqual({
+      url: URL,
+      token: "yia_tok",
+      projects: [],
+    });
   });
 
   it("keeps the persisted config untouched when the redeem fails", async () => {
@@ -117,21 +142,26 @@ describe("PairingScreen submit", () => {
 
   it("disables submit and shows a pending label while the redeem is in flight", async () => {
     let resolve!: (d: typeof PAIRED) => void;
-    const redeem = vi.fn(() => new Promise<typeof PAIRED>((r) => (resolve = r)));
+    const redeem = vi.fn(
+      () => new Promise<typeof PAIRED>((r) => (resolve = r)),
+    );
     render(<PairingScreen redeem={redeem} storage={storages()} />);
 
     fill(fields());
     fireEvent.click(fields().submit);
 
     await waitFor(() =>
-      expect((screen.getByRole("button", { name: "配对中…" }) as HTMLButtonElement).disabled).toBe(
-        true,
-      ),
+      expect(
+        (screen.getByRole("button", { name: "配对中…" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
     );
     expect(redeem).toHaveBeenCalledTimes(1);
 
     resolve(PAIRED);
-    await waitFor(() => expect(screen.getByRole("button", { name: "配对" })).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "配对" })).toBeTruthy(),
+    );
   });
 });
 
@@ -139,23 +169,31 @@ describe("PairingScreen error mapping", () => {
   it("renders the invalid-code message for a 4401 close", async () => {
     const redeem = vi
       .fn()
-      .mockRejectedValue(new Error("pairing rejected: invalid or used code (4401)"));
+      .mockRejectedValue(
+        new Error("pairing rejected: invalid or used code (4401)"),
+      );
     render(<PairingScreen redeem={redeem} storage={storages()} />);
 
     fill(fields());
     fireEvent.click(fields().submit);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT),
+    );
   });
 
   it("also recognises a structured 4401 rejection", async () => {
-    const redeem = vi.fn().mockRejectedValue({ code: 4401, message: "no token" });
+    const redeem = vi
+      .fn()
+      .mockRejectedValue({ code: 4401, message: "no token" });
     render(<PairingScreen redeem={redeem} storage={storages()} />);
 
     fill(fields());
     fireEvent.click(fields().submit);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT),
+    );
   });
 
   // 中继路径（`?session=…`）不走 4401 关帧：`pair/redeem` 作为 JSON-RPC 调用失败，
@@ -171,17 +209,23 @@ describe("PairingScreen error mapping", () => {
     fill(fields());
     fireEvent.click(fields().submit);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT),
+    );
   });
 
   it("maps every other failure to the connect message", async () => {
-    const redeem = vi.fn().mockRejectedValue(new Error("pairing socket closed (1006)"));
+    const redeem = vi
+      .fn()
+      .mockRejectedValue(new Error("pairing socket closed (1006)"));
     render(<PairingScreen redeem={redeem} storage={storages()} />);
 
     fill(fields());
     fireEvent.click(fields().submit);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(CONNECT_FAILED_TEXT));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(CONNECT_FAILED_TEXT),
+    );
   });
 });
 
@@ -189,12 +233,20 @@ describe("PairingScreen host seam", () => {
   it("delegates the whole submit to `onSubmit` when the host injects one", async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const redeem = vi.fn();
-    render(<PairingScreen redeem={redeem} onSubmit={onSubmit} storage={storages()} />);
+    render(
+      <PairingScreen
+        redeem={redeem}
+        onSubmit={onSubmit}
+        storage={storages()}
+      />,
+    );
 
     fill(fields());
     fireEvent.click(fields().submit);
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone"));
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone"),
+    );
     expect(redeem).not.toHaveBeenCalled();
   });
 });
@@ -207,12 +259,25 @@ describe("PairingScreen QR scan", () => {
       onText("yiagent://pair?v=1&relay=wss%3A%2F%2Fr%2Fws&code=ABCD-EFGH");
       return () => {};
     };
-    render(<PairingScreen enableScan redeem={redeem} storage={storage} scan={scan} />);
+    render(
+      <PairingScreen
+        enableScan
+        redeem={redeem}
+        storage={storage}
+        scan={scan}
+      />,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
-    await waitFor(() => expect(redeem).toHaveBeenCalledWith("wss://r/ws", "ABCD-EFGH", "iPhone"));
-    expect(storedRemoteConfig(storage)).toEqual({ url: "wss://r/ws", token: "yia_tok" });
+    await waitFor(() =>
+      expect(redeem).toHaveBeenCalledWith("wss://r/ws", "ABCD-EFGH", "iPhone"),
+    );
+    expect(storedRemoteConfig(storage)).toEqual({
+      url: "wss://r/ws",
+      token: "yia_tok",
+      projects: [],
+    });
   });
 
   it("shows a message and does not redeem when the payload is not a pairing QR", async () => {
@@ -221,18 +286,30 @@ describe("PairingScreen QR scan", () => {
       onText("https://example.com/not-a-pairing-code");
       return () => {};
     };
-    render(<PairingScreen enableScan redeem={redeem} scan={scan} storage={storages()} />);
+    render(
+      <PairingScreen
+        enableScan
+        redeem={redeem}
+        scan={scan}
+        storage={storages()}
+      />,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
     await waitFor(() =>
-      expect(screen.getByRole("alert").textContent).toBe("不是有效的配对二维码"),
+      expect(screen.getByRole("alert").textContent).toBe(
+        "不是有效的配对二维码",
+      ),
     );
     expect(redeem).not.toHaveBeenCalled();
   });
 
   it("falls back to manual entry when the camera is unavailable", async () => {
-    const scan = (_onText: (t: string) => void, onError: (e: unknown) => void) => {
+    const scan = (
+      _onText: (t: string) => void,
+      onError: (e: unknown) => void,
+    ) => {
       onError(new Error("no camera"));
       return () => {};
     };
@@ -241,26 +318,43 @@ describe("PairingScreen QR scan", () => {
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
     await waitFor(() =>
-      expect(screen.getByRole("alert").textContent).toBe("无法访问相机，可手输配对码"),
+      expect(screen.getByRole("alert").textContent).toBe(
+        "无法访问相机，可手输配对码",
+      ),
     );
     expect(screen.getByLabelText("配对码")).toBeTruthy(); // 表单仍可用
   });
 
   it("hides the scan button when scanning is not enabled", () => {
-    render(<PairingScreen enableScan={false} redeem={vi.fn()} storage={storages()} />);
+    render(
+      <PairingScreen
+        enableScan={false}
+        redeem={vi.fn()}
+        storage={storages()}
+      />,
+    );
     expect(screen.queryByRole("button", { name: "扫码" })).toBeNull();
   });
 
   it("lets the user cancel the scanner and return to the form", async () => {
     const scan = () => () => {};
-    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+    render(
+      <PairingScreen
+        enableScan
+        scan={scan}
+        redeem={vi.fn()}
+        storage={storages()}
+      />,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
     expect(screen.getByRole("button", { name: "返回" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "返回" }));
 
-    await waitFor(() => expect(screen.queryByRole("button", { name: "返回" })).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "返回" })).toBeNull(),
+    );
     expect(screen.getByLabelText("配对码")).toBeTruthy(); // 回到可编辑表单
   });
 
@@ -269,13 +363,22 @@ describe("PairingScreen QR scan", () => {
     // 反复记过这条）。头部若不自己补 `env(safe-area-inset-top)`，唯一的出口就会
     // 落在刘海/灵动岛底下——用户报的「扫码过程中没有返回按钮」。
     const scan = () => () => {};
-    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+    render(
+      <PairingScreen
+        enableScan
+        scan={scan}
+        redeem={vi.fn()}
+        storage={storages()}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
     const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
     const bar = dialog.querySelector(".scan-overlay-bar");
     expect(bar).toBeTruthy(); // CSS 在 [data-mobile] 下给它补 padding-top: max(env(safe-area-inset-top…))
-    expect(bar?.contains(screen.getByRole("button", { name: "返回" }))).toBe(true);
+    expect(bar?.contains(screen.getByRole("button", { name: "返回" }))).toBe(
+      true,
+    );
   });
 
   it("returns to the form instead of blanking the app when the scanner throws", async () => {
@@ -287,12 +390,21 @@ describe("PairingScreen QR scan", () => {
       const scan = () => {
         throw new Error("camera exploded");
       };
-      render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+      render(
+        <PairingScreen
+          enableScan
+          scan={scan}
+          redeem={vi.fn()}
+          storage={storages()}
+        />,
+      );
 
       fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
       await waitFor(() =>
-        expect(screen.getByRole("alert").textContent).toBe("无法访问相机，可手输配对码"),
+        expect(screen.getByRole("alert").textContent).toBe(
+          "无法访问相机，可手输配对码",
+        ),
       );
       expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
       expect(screen.getByLabelText("配对码")).toBeTruthy();
@@ -306,13 +418,22 @@ describe("PairingScreen QR scan", () => {
       onText("https://example.com/nope");
       return () => {};
     };
-    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+    render(
+      <PairingScreen
+        enableScan
+        scan={scan}
+        redeem={vi.fn()}
+        storage={storages()}
+      />,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
 
     // 错误必须渲染在扫描器覆盖层**内部**，否则会被 z-50 的黑色层盖住、用户看不到。
     await waitFor(() =>
-      expect(screen.getByRole("alert").textContent).toBe("不是有效的配对二维码"),
+      expect(screen.getByRole("alert").textContent).toBe(
+        "不是有效的配对二维码",
+      ),
     );
     const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
     expect(dialog.contains(screen.getByRole("alert"))).toBe(true);
@@ -329,7 +450,13 @@ describe("PairingScreen optional cancel", () => {
 
   it("renders a working cancel button when the host passes one", () => {
     const onCancel = vi.fn();
-    render(<PairingScreen redeem={vi.fn()} storage={storages()} onCancel={onCancel} />);
+    render(
+      <PairingScreen
+        redeem={vi.fn()}
+        storage={storages()}
+        onCancel={onCancel}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: "返回" }));
     expect(onCancel).toHaveBeenCalledTimes(1);
   });

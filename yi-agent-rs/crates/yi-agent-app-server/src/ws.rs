@@ -153,6 +153,7 @@ where
                     .join("preferences.json"),
                 resident_dir: resident_dir.clone(),
                 skills_home: crate::server::skills_home_dir(),
+                remote_dir: crate::server::instance_home_dir(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -170,6 +171,9 @@ where
             serve_scopes,
             serve_initialized,
             // 纯 ws 路径无 stdio 读端,故无 EOF 观察者。
+            None,
+            // 纯 ws 入口没有 `--relay`:它是「别人连进来」的入口,不是中继客户
+            // 端。手机端清单里的 session 一律为 null,与事实相符。
             None,
         )
         .await

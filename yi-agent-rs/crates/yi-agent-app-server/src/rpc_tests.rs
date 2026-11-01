@@ -2342,6 +2342,7 @@ impl Harness {
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
+                remote_dir: index_dir.path().to_path_buf(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
@@ -4076,6 +4077,7 @@ async fn eof_exits_gracefully() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            remote_dir: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4161,6 +4163,7 @@ async fn agent_factory_failure_returns_internal_error() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            remote_dir: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4248,6 +4251,7 @@ async fn oversized_frame_returns_err() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            remote_dir: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -17852,6 +17856,7 @@ impl MergedHarness {
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
+                remote_dir: PathBuf::new(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

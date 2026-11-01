@@ -28,6 +28,7 @@ pub(crate) mod plugin_worktree;
 pub(crate) mod power_busy;
 pub(crate) mod power_guard;
 pub mod protocol;
+pub mod remote_session;
 pub(crate) mod rpc;
 pub mod server;
 pub mod session;

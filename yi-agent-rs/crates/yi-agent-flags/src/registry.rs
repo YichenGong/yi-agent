@@ -25,6 +25,9 @@ pub const LEAD_AGENT_FLAG: &str = "lead_agent";
 /// `yi-agent-supervisors::supervisor::Supervisor::desired_on` 的注释。
 pub const SUPERPOWERS_KANBAN_FLAG: &str = "superpowers_kanban";
 
+/// 远程 SSH 执行的总开关。dev-only：stable 构建下恒关（spec §5.3.1）。
+pub const REMOTE_SSH_FLAG: &str = "remote_ssh";
+
 pub const REGISTRY: &[FlagDef] = &[
     FlagDef {
         name: LEAD_AGENT_FLAG,
@@ -38,6 +41,13 @@ pub const REGISTRY: &[FlagDef] = &[
         summary: "Superpowers 看板：项目级看板、卡片会话与后台值守",
         owner: "yichen",
         expires_on: "2027-03-31",
+        default: false,
+    },
+    FlagDef {
+        name: REMOTE_SSH_FLAG,
+        summary: "远程执行：经 ssh 在远端项目里跑常驻 app-server，手机可见",
+        owner: "yichen",
+        expires_on: "2027-06-30",
         default: false,
     },
 ];
@@ -80,6 +90,17 @@ mod tests {
             !def.owner.is_empty(),
             "an expired flag needs someone to ask"
         );
+    }
+
+    #[test]
+    fn the_remote_ssh_flag_is_registered() {
+        let def = find(crate::registry::REMOTE_SSH_FLAG).expect("remote_ssh must be registered");
+        assert!(
+            !def.default,
+            "remote ssh must default to off: it is dev-only"
+        );
+        assert!(!def.summary.is_empty());
+        assert!(!def.owner.is_empty());
     }
 
     #[test]

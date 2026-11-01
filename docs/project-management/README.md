@@ -31,6 +31,7 @@
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 106 / 117 | [详情](./desktop.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
+| remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 
 ## 已知问题
 
