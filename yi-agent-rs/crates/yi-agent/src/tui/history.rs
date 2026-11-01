@@ -4393,7 +4393,7 @@ mod tests {
 
     #[test]
     fn last_assistant_text_is_none_when_no_message() {
-        let mut s = HistoryState::new();
+        let s = HistoryState::new();
         assert_eq!(s.last_assistant_text(), None);
 
         let mut only_tools = HistoryState::new();

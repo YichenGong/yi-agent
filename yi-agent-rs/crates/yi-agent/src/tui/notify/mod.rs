@@ -78,6 +78,7 @@ impl TerminalEnv {
         Self(std::env::vars().collect())
     }
 
+    #[cfg(test)]
     pub fn from_pairs(pairs: impl IntoIterator<Item = (&'static str, &'static str)>) -> Self {
         Self(
             pairs
@@ -205,11 +206,13 @@ impl Notifier {
         }
     }
 
+    #[cfg(test)]
     pub fn is_disabled(&self) -> bool {
         self.backend.is_none()
     }
 
     /// 是否选了 OSC 9 后端。测试与 `/config` 之外的内部断言用。
+    #[cfg(test)]
     pub fn uses_osc9(&self) -> bool {
         matches!(self.backend, Some(Backend::Osc9(_)))
     }
