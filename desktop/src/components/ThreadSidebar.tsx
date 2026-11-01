@@ -151,6 +151,7 @@ export function ThreadSidebar({
   onSelect,
   onRename,
   onDelete,
+  onFork,
   onTogglePin,
   onReorderPinned,
   onSetTag,
@@ -189,6 +190,7 @@ export function ThreadSidebar({
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
+  onFork: (id: string) => void;
   onTogglePin: (id: string, pinned: boolean) => void;
   /** 置顶分区拖拽落点：新的从顶到底顺序。 */
   onReorderPinned: (orderedIds: string[]) => void;
@@ -1301,6 +1303,18 @@ export function ThreadSidebar({
                 ))}
               </div>
             )}
+            <button
+              type="button"
+              role="menuitem"
+              data-fork-thread=""
+              onClick={() => {
+                closeMenus();
+                onFork(t.thread_id);
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              创建副本
+            </button>
             <button
               type="button"
               role="menuitem"

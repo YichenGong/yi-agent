@@ -928,6 +928,12 @@ Expected: FAIL —— 命令列表对不上，且 `fork` 为 `undefined`。
 
 - [ ] **Step 3: 加命令与分组**
 
+> **`SlashPopup.test.tsx` 也会被这件事带红**（计划初稿漏掉了它）：那两条用例用
+> **下标**选中选项（`selected={4}` 指 `/help`、`selected={2}` 指 `/config`），
+> 目录插入 `fork` 后整体后移一位。把它们改成按名字求下标
+> （`SLASH_COMMANDS.findIndex((c) => c.name === "help")`），否则以后每加一条命令
+> 都要回来改这两个数字。
+
 `slash.ts` 的 `SLASH_COMMANDS` 里，在 `compact` 之后插入（Popup 顺序即此顺序，`f` 开头排在 `c` 与 `u` 之间读起来顺）：
 
 ```ts

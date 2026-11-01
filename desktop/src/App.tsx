@@ -1252,6 +1252,25 @@ export default function App() {
     await sess.refreshThreads();
   };
 
+  /**
+   * 复制一份会话，源会话不动。
+   *
+   * **刻意不切会话**：从侧栏复制一个会话，用户的注意力不该被抢走。新条目靠
+   * `(fork)` 标题 + 更新时间出现在列表顶部，这本身就是反馈（桌面端没有 toast）。
+   */
+  const forkThread = async (id: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/fork", { threadId: id });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return;
+    }
+    await sess.refreshThreads();
+  };
+
   const deleteThread = async (id: string) => {
     const c = clientRef.current;
     if (!c) return;
@@ -2500,6 +2519,7 @@ export default function App() {
           onSelect={selectThread}
           onRename={renameThread}
           onDelete={deleteThread}
+          onFork={(id) => void forkThread(id)}
           onTogglePin={onTogglePin}
           onSetTag={onSetTag}
           onCreateGroup={sess.createGroup}

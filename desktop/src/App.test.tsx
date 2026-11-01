@@ -1593,6 +1593,38 @@ describe("App slash commands", () => {
     // 默认 mock 返回 {},没有 status 字段 → 视为 unknown,提示"未知结果"。
     await screen.findByText(/压缩/);
   });
+
+  it("creates a copy from the sidebar without switching threads", async () => {
+    // fork 之后 App 会 `refreshThreads()`：桩的 `thread/listAll` 只回 `state.threads`，
+    // 新会话不在里面就会被当成「已不存在」。故 fork 时要把它推进 seed。
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-copy", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-copy", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumeCountBefore = clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+    // 右键当前会话行，点「创建副本」。选择器要排除组长行（`data-lead-row`）：
+    // 它同样带 `data-thread-row`，但没有会话菜单。
+    const row = document.querySelector<HTMLElement>("[data-thread-row]:not([data-lead-row])");
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/fork")).toBe(true),
+    );
+    // 侧栏入口刻意不切会话：不该多出一次 resume。
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/resume").length,
+    ).toBe(resumeCountBefore);
+  });
 });
 
 /**
