@@ -18,10 +18,16 @@
 #   ./scripts/rebuild.sh plugin      # 只编 C
 #   ./scripts/rebuild.sh cli --profile stable
 #                                    # 编稳定版，覆盖 ~/.cargo/bin/yi-agent
-#                                    # 与 /opt/homebrew/bin/yi-agent（要显式要）
 #   ./scripts/rebuild.sh cli --force # 跳过"无并发 cargo"检查（自担风险）
 #   ./scripts/rebuild.sh stop        # 只停进程不编译（App / daemon / 值守 / 看板）
 #   ./scripts/rebuild.sh --help
+#
+# A 编完会把 /opt/homebrew/bin/yi-agent 这个软链指到本次装好的二进制，因为
+# 登录 shell 的 PATH 里 /opt/homebrew/bin 排在 ~/.local/bin 与 ~/.cargo/bin
+# 之前：不接管它，「装好了」和「终端里敲 yi-agent 用的是它」就是两件事。
+# 两个 profile 的区别只在二进制落点——dev 写 ~/.local/bin/yi-agent-dev（不
+# 覆盖稳定版二进制），stable 写 ~/.cargo/bin/yi-agent；软链若已是真实文件
+# 则拒绝覆盖（见 docs/superpowers/specs/2026-11-01-rebuild-install-global-design.md）。
 #
 # 任何构建子命令都会**先停掉所有依附进程**再动手：App、app-server、
 # daemon serve、launchd 值守、被托管的 superpowers-kanban，外加终端里的
@@ -47,6 +53,21 @@ PLUGIN_DIR="$ROOT/plugins/superpowers-kanban"
 APP_DEST="/Applications/yi-agent.app"
 PLUGIN_BIN_DEST="/opt/homebrew/bin/superpowers-kanban"
 SKILL_DEST="$HOME/.yi-agent/skills/superpowers-kanban/SKILL.md"
+
+# 三个安装落点。默认值就是生产位置；测试用环境变量把它们指到临时目录，
+# 免得为了验安装逻辑真编一次 Rust，也免得测试碰到 /opt/homebrew/bin。
+LOCAL_BIN_DIR="${REBUILD_LOCAL_BIN_DIR:-$HOME/.local/bin}"
+CARGO_BIN_DIR="${REBUILD_CARGO_BIN_DIR:-$HOME/.cargo/bin}"
+GLOBAL_BIN="${REBUILD_GLOBAL_BIN:-/opt/homebrew/bin/yi-agent}"
+
+# 入口段（原样保留的开关）也在这里初始化：安装函数要读 PROFILE，
+# 而 PROFILE 在 source 场景下不会被入口段赋默认值。
+FORCE=0
+# 默认装开发版：`~/.local/bin/yi-agent-dev`，不覆盖稳定版二进制。
+# 稳定版只应来自发布渠道（npm / Homebrew）；本机覆盖它必须显式
+# --profile stable，否则一次随手重编就会把「稳定版」定义污染成某个下午的 main。
+PROFILE="${PROFILE:-dev}"
+CMD="all"
 
 # 版本对齐 yi-agent-rs 的 workspace 版本（App bundle 与 CLI 都用它）
 VERSION="$(grep '^version' "$RS_DIR/Cargo.toml" | head -1 | awk -F'"' '{print $2}')"
@@ -265,31 +286,84 @@ app_is_running() {
 }
 
 # --- A. CLI ---------------------------------------------------------------
-build_cli() {
-  log "A. 编译 yi-agent CLI (release)"
-  ( cd "$RS_DIR" && cargo build --release -p yi-agent )
-  local bin="$RS_DIR/target/release/yi-agent"
-  [ -x "$bin" ] || die "未产出 $bin"
 
-  if [ "$PROFILE" = dev ]; then
-    # 开发构建只进独立路径：稳定版的二进制、软链、launchd 注册一律不碰。
-    mkdir -p "$HOME/.local/bin"
-    cp "$bin" "$HOME/.local/bin/yi-agent-dev"
-    echo "CLI  -> $bin"
-    echo "     -> $HOME/.local/bin/yi-agent-dev (开发版，不覆盖稳定版)"
-    echo "版本确认: $("$HOME/.local/bin/yi-agent-dev" --version 2>&1 || echo '(执行失败)')"
+# 把全局路径接到本次装好的二进制上。
+#
+# 为什么必须做：登录 shell 的 PATH 里 /opt/homebrew/bin 排在 ~/.local/bin 与
+# ~/.cargo/bin 之前（实测 `which -a yi-agent` 首选它），所以「装到
+# ~/.local/bin」改变不了终端里跑哪个。不接管这个软链，rebuild 跑完敲
+# `yi-agent` 命中的仍是上一次装的东西。
+#
+# $1 目标二进制（绝对路径）。
+link_global() {
+  local target="$1"
+  local dir
+  dir="$(dirname "$GLOBAL_BIN")"
+
+  if [ -d "$GLOBAL_BIN" ] && [ ! -L "$GLOBAL_BIN" ]; then
+    die "$GLOBAL_BIN 是个目录，不接管"
+  fi
+
+  # 真实文件（Homebrew 装的 / 手工 cp 的）不覆盖：删掉会让 brew 的账本与
+  # 磁盘不一致，后续 upgrade/uninstall 行为不可预期。也不能只 warn 后
+  # 成功退出——「全局路径指向刚编的产物」正是本改动的全部意义。
+  if [ -e "$GLOBAL_BIN" ] && [ ! -L "$GLOBAL_BIN" ]; then
+    die "$GLOBAL_BIN 是真实文件，不是软链；不覆盖。
+     路径：$(ls -l "$GLOBAL_BIN" 2>/dev/null | sed 's/  */ /g')
+     先把它移走再重跑（若是 Homebrew 装的：brew uninstall yi-agent），
+     或设 REBUILD_GLOBAL_BIN 指到别处。"
+  fi
+
+  # 父目录不存在：不造也不拦。该目录归 Homebrew 管，在没有 brew 的机器上
+  # 凭空建 /opt/homebrew/bin 只会让人误以为 brew 装好了；而这里也没有本该
+  # 被接管的对象，谈不上分叉。warn 后继续，让 CLI / App / 插件照常编完。
+  if [ ! -d "$dir" ]; then
+    warn "全局路径的父目录不存在：$dir（不代为创建），跳过全局软链。
+     没有 Homebrew 时请设 REBUILD_GLOBAL_BIN 指到 PATH 上的别处。"
     return 0
   fi
 
-  # 装到 ~/.cargo/bin（对齐 .bashrc 的 installYiAgent 约定），再软链到
-  # /opt/homebrew/bin 让终端可直接调用（该目录在登录 shell 的 PATH 上）。
-  mkdir -p "$HOME/.cargo/bin"
-  cp "$bin" "$HOME/.cargo/bin/yi-agent"
-  ln -sf "$HOME/.cargo/bin/yi-agent" /opt/homebrew/bin/yi-agent
+  # 目录在、但写不进去（/opt/homebrew 属 admin:admin 775）：此时路径是真实
+  # 存在的，用户会以为它已被更新——必须失败。
+  if [ ! -w "$dir" ]; then
+    die "全局路径的父目录不可写：$dir（需要 sudo 或调整属主）。"
+  fi
+
+  ln -sfn "$target" "$GLOBAL_BIN"
+  echo "     -> $GLOBAL_BIN (软链 -> $target)"
+}
+
+# 安装 + 接软链。与编译分开，测试可以直接喂一个假二进制进来。
+# $1 已编好的二进制（绝对路径）。
+install_cli_bin() {
+  local bin="$1"
+  [ -x "$bin" ] || die "未产出 $bin"
+
+  if [ "$PROFILE" = dev ]; then
+    # 开发构建只写独立文件名：稳定版二进制（~/.cargo/bin/yi-agent）一律不碰。
+    mkdir -p "$LOCAL_BIN_DIR"
+    install -m 0755 "$bin" "$LOCAL_BIN_DIR/yi-agent-dev"
+    echo "CLI  -> $bin"
+    echo "     -> $LOCAL_BIN_DIR/yi-agent-dev (开发版，不覆盖稳定版)"
+    link_global "$LOCAL_BIN_DIR/yi-agent-dev"
+    echo "版本确认: $("$GLOBAL_BIN" --version 2>&1 || echo '(执行失败)')"
+    return 0
+  fi
+
+  # 装到 ~/.cargo/bin（对齐 .bashrc 的 installYiAgent 约定），全局软链再
+  # 指过来让终端可直接调用。
+  mkdir -p "$CARGO_BIN_DIR"
+  install -m 0755 "$bin" "$CARGO_BIN_DIR/yi-agent"
   echo "CLI  -> $bin"
-  echo "     -> $HOME/.cargo/bin/yi-agent (已同步)"
-  echo "     -> /opt/homebrew/bin/yi-agent (软链)"
-  echo "版本确认: $(/opt/homebrew/bin/yi-agent --version 2>&1 || echo '(执行失败)')"
+  echo "     -> $CARGO_BIN_DIR/yi-agent (已同步)"
+  link_global "$CARGO_BIN_DIR/yi-agent"
+  echo "版本确认: $("$GLOBAL_BIN" --version 2>&1 || echo '(执行失败)')"
+}
+
+build_cli() {
+  log "A. 编译 yi-agent CLI (release)"
+  ( cd "$RS_DIR" && cargo build --release -p yi-agent )
+  install_cli_bin "$RS_DIR/target/release/yi-agent"
 }
 
 # --- B. 桌面 App ----------------------------------------------------------
@@ -368,37 +442,41 @@ EOF
 }
 
 # --- 入口：解析子命令与开关 -----------------------------------------------
-FORCE=0
-# 默认装开发版：`~/.local/bin/yi-agent-dev`，不碰稳定版。
-# 稳定版只应来自发布渠道（npm / Homebrew）；本机覆盖它必须显式 --profile stable，
-# 否则一次随手重编就会把「稳定版」定义污染成某个下午的 main。
-PROFILE="dev"
-CMD="all"
-while [ $# -gt 0 ]; do
-  arg="$1"; shift
-  case "$arg" in
-    -h|--help) usage; exit 0 ;;
-    -f|--force) FORCE=1 ;;
-    dev|--profile=dev) PROFILE=dev ;;
-    --profile)
-      [ $# -ge 1 ] || die "--profile 需要一个值（stable|dev）"
-      case "$1" in
-        stable|dev) PROFILE="$1" ;;
-        *) die "--profile 只接受 stable 或 dev，收到 '$1'" ;;
-      esac
-      shift ;;
-    all|cli|desktop|plugin|stop) CMD="$arg" ;;
-    *) die "未知参数 '$arg'（可用: all|cli|desktop|plugin|stop|dev|--profile stable|dev|--force|--help）" ;;
-  esac
-done
+# FORCE / PROFILE / CMD 的默认值在常量段初始化（安装函数要读 PROFILE，
+# 且 source 场景不经过这里）。
+main() {
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      -h|--help) usage; exit 0 ;;
+      -f|--force) FORCE=1 ;;
+      dev|--profile=dev) PROFILE=dev ;;
+      --profile)
+        [ $# -ge 1 ] || die "--profile 需要一个值（stable|dev）"
+        case "$1" in
+          stable|dev) PROFILE="$1" ;;
+          *) die "--profile 只接受 stable 或 dev，收到 '$1'" ;;
+        esac
+        shift ;;
+      all|cli|desktop|plugin|stop) CMD="$arg" ;;
+      *) die "未知参数 '$arg'（可用: all|cli|desktop|plugin|stop|dev|--profile stable|dev|--force|--help）" ;;
+    esac
+  done
 
-# 四个构建子命令都先停依附进程：plugin 单独重建也要让新二进制真正生效，
-# 而旧的 superpowers-kanban 正被旧 daemon 托管着（spec §2.5）。
-# `stop` 只停不编：用于随时手动清理，也是本改动最省时的验收入口。
-case "$CMD" in
-  stop)      preflight; stop_dependents stop; summary ;;
-  cli)       preflight; stop_dependents cli; build_cli; summary ;;
-  desktop)   preflight; stop_dependents desktop; build_desktop; summary ;;
-  plugin)    preflight; stop_dependents plugin; build_plugin; summary ;;
-  all)       preflight; stop_dependents all; build_cli; build_desktop; build_plugin; summary ;;
-esac
+  # 四个构建子命令都先停依附进程：plugin 单独重建也要让新二进制真正生效，
+  # 而旧的 superpowers-kanban 正被旧 daemon 托管着（spec §2.5）。
+  # `stop` 只停不编：用于随时手动清理，也是本改动最省时的验收入口。
+  case "$CMD" in
+    stop)      preflight; stop_dependents stop; summary ;;
+    cli)       preflight; stop_dependents cli; build_cli; summary ;;
+    desktop)   preflight; stop_dependents desktop; build_desktop; summary ;;
+    plugin)    preflight; stop_dependents plugin; build_plugin; summary ;;
+    all)       preflight; stop_dependents all; build_cli; build_desktop; build_plugin; summary ;;
+  esac
+}
+
+# 被 source 时只加载函数、不跑构建——scripts/test_rebuild_global_link.sh 靠
+# 这一点在临时目录里验安装逻辑，不必真编一次 Rust。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
