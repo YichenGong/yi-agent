@@ -7,6 +7,7 @@ pub mod cost;
 pub mod history;
 pub mod input;
 pub mod markdown;
+pub mod notify;
 pub mod plugins;
 pub mod process_popup;
 pub mod queued;

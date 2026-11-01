@@ -21040,3 +21040,40 @@ async fn view_read_refresh_does_not_block_the_main_loop() {
     assert!(v["result"].is_object(), "view/read must still answer: {v}");
     h.shutdown().await;
 }
+
+/// 三个 tui 通知键必须能写入并读回非 null。`FIELDS` 驱动 UI，
+/// `current_value` 决定读出的值——漏一个就会静默返回 null，
+/// 设置页显示空白，用户改完像没生效。
+#[tokio::test(flavor = "multi_thread")]
+async fn every_tui_notification_field_is_writable_and_readable() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"settings/write","params":{"patch":{"tui.notifications":"false","tui.notification_method":"bel","tui.notification_condition":"always"}}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["result"]["ok"], true, "write failed: {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let fields = v["result"]["fields"].as_array().expect("fields array");
+
+    for (key, expected) in [
+        ("tui.notifications", "false"),
+        ("tui.notification_method", "bel"),
+        ("tui.notification_condition", "always"),
+    ] {
+        let field = fields
+            .iter()
+            .find(|f| f["key"] == key)
+            .unwrap_or_else(|| panic!("{key} must be listed"));
+        assert_eq!(field["type"], "select", "{key} must be a select: {field}");
+        assert_eq!(
+            field["value"], expected,
+            "{key} must read back what was written: {field}"
+        );
+    }
+}

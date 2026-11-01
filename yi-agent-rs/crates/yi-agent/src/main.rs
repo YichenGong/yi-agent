@@ -2078,6 +2078,31 @@ fn run_tui_agent(
             mcp_master: mcp.master(),
             runtime_preference: runtime_preference.to_string(),
             runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
+            notifications: config.notifications,
+            // 归一化：配置里的非法值（手改 settings.json）按默认处理，同时
+            // 保证 `/config` 显示的是规范串而不是用户写错的原文。
+            notification_method: crate::tui::notify::Method::parse(&config.notification_method)
+                .unwrap_or(crate::tui::notify::Method::Auto)
+                .as_str()
+                .to_string(),
+            notification_condition: crate::tui::notify::Condition::parse(
+                &config.notification_condition,
+            )
+            .unwrap_or(crate::tui::notify::Condition::Unfocused)
+            .as_str()
+            .to_string(),
+            effective_backend: {
+                let method = crate::tui::notify::Method::parse(&config.notification_method)
+                    .unwrap_or(crate::tui::notify::Method::Auto);
+                crate::tui::notify::Notifier::new(
+                    method,
+                    crate::tui::notify::Condition::Unfocused,
+                    &crate::tui::notify::TerminalEnv::from_process(),
+                )
+                .effective_backend()
+                .to_string()
+            },
+            focus_degraded: false,
         };
 
         let driver_workdir = snapshot_workdir.clone();
@@ -4014,6 +4039,9 @@ mod tests {
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
             model_injected: false,
+            notifications: true,
+            notification_method: "auto".into(),
+            notification_condition: "unfocused".into(),
         }
     }
 
