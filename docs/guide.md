@@ -117,8 +117,9 @@ echo "解释一下 Makefile 里的 deploy 目标" | yi-agent run
 
 `YI_AGENT_HOME` 可以把 `~/.yi-agent` 整体换到别处（打包独立实例时用它隔离）。
 `.env` 已不再被读取：存量配置在首次启动时自动迁入 `settings.json`，原文件改名为
-`.env.migrated` 保留取回。`YI_AGENT_WORKDIR` 已下线——工作目录只由 `--workdir`、
-启动目录或桌面端选项目决定。
+`.env.migrated` 保留取回。**这个自动迁移会在 2027-01-01 之后移除**——到那时
+程序不再认得 `.env`，升级前请先运行一次当前版本把配置搬过来。
+`YI_AGENT_WORKDIR` 已下线——工作目录只由 `--workdir`、启动目录或桌面端选项目决定。
 
 **一行说明**：`--model` 给的是模型**字符串**；要覆盖它必须同时给出 `--provider`
 与 `--api-key`（`--api-url` 可选）——这是「整包注入」，缺项会直接报错。

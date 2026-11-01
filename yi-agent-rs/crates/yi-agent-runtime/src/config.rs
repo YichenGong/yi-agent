@@ -10,6 +10,9 @@
 //! 与 `.env` 无关，是第二层的实现。
 //! 运行参数现在读 `settings.json`（见 [`crate::settings`]），且它是**第三层**：
 //! 覆盖 > 真实环境变量 > settings.json > 默认值。
+//!
+//! 唯一还认得 `.env` 的是 [`crate::migrate`] 的存量迁移层，它计划在
+//! **`2027-01-01`** 整体退役；删除清单见那个模块的文档。
 
 use std::path::PathBuf;
 
@@ -187,6 +190,9 @@ pub(crate) fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxM
 /// 注意：产品已不再读取 `.env`。保留这个路径解析是因为启动迁移
 /// （[`crate::migrate`]）仍要找到旧的 `.env` 把它改名作废——迁移必须先能
 /// 定位它，才谈得上「不再被读取」。
+///
+/// **退役计划 `2027-01-01`**：只服务于上述迁移，随迁移层整体删除。
+/// 完整删除清单见 [`crate::migrate`] 的模块文档。
 pub fn resolve_global_env_path() -> Option<PathBuf> {
     yi_agent_store::paths::home_join(".env")
 }

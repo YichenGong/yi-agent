@@ -1,4 +1,41 @@
 //! 一次性迁移：把存量 `.env` 里的活跃模型键收边进清单，并注释掉它们。
+//!
+//! # 退役计划：`2027-01-01`
+//!
+//! 本模块已在 2026 年被收缩为**纯粹的读取侧兼容层**——产品的配置读取路径早已
+//! 完全不碰 `.env`（见 [`crate::config`] 的模块文档），这里只负责把「从旧版本
+//! 升级上来的用户」的存量配置搬进 `models.json` / `settings.json` / `websearch.json`，
+//! 然后把 `.env` 改名成 `.env.migrated`。全新安装的机器上它每次启动只是
+//! `read_to_string` 拿到 `NotFound` 就返回（`migrate_env_settings` 的
+//! `EnvMigrationOutcome::NothingToDo`），不产生任何行为。
+//!
+//! **保留的代价**：约 1200 行代码 + [`crate::settings::parse_env_text`]，以及
+//! 「迁移必须排在 `config::load` 之前」「先落清单、后改名」这两条只能在测试里
+//! 守住的不变量。
+//!
+//! **到期（`2027-01-01` 之后）整块删除**，理由是这个日期足够长，任何还在跑旧
+//! 版本的用户有充分机会安装过一个带迁移的版本。届时按下面这份清单逐条删，
+//! 删完本模块即可整体移除：
+//!
+//! 1. 本文件：`migrate_model_keys`、`migrate_env_settings`、`log_outcome`、
+//!    `log_env_settings_outcome`，以及本文件的 30 个测试。
+//! 2. [`crate::settings::parse_env_text`]：本模块（`migrate_env_settings`）是它
+//!    唯一的生产消费者。
+//! 3. [`crate::config::resolve_global_env_path`]：只为定位那个待迁移的文件而存在。
+//! 4. 四个生产入口的接线：`yi-agent-rs/crates/yi-agent/src/main.rs` 的
+//!    `Command::Web` 分支与 `prepare_environment`，
+//!    `yi-agent-rs/crates/yi-agent-app-server/src/server.rs` 的
+//!    `migrate_legacy_model_keys_on_startup`（`run` / `serve_stdio_with_relay` 各调一次）。
+//! 5. **三个钉住接线的测试**必须同批处理，否则会红：
+//!    `server.rs` 的 `the_startup_migration_runs_both_model_and_settings_migrations`
+//!    与 `the_ws_entry_runs_the_startup_migration`（都用 `include_str!` + 字符串
+//!    匹配断言「迁移挂在启动路径上」），以及
+//!    `yi-agent-rs/crates/yi-agent/tests/settings_migration.rs` 的两条端到端用例。
+//!
+//! 删除时的唯一风险：**如果还有用户从未安装过带迁移的版本**，他们的 `.env` 里
+//! 的 key 就再也读不出来（表现为「模型未配置」）。因此删之前应先确认最低支持
+//! 版本已经高于本次迁移发布的那一版。跟踪项见
+//! `docs/project-management/yi-agent-runtime.md` 的「待删」条目。
 
 use std::path::Path;
 

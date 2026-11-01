@@ -55,6 +55,11 @@ fn parse_env_value(raw: &str) -> String {
 }
 
 /// 解析整份 `.env` 文本；同一键出现多次时后者覆盖前者（与 `dotenvy` 一致）。
+///
+/// **退役计划 `2027-01-01`**：本函数只服务于存量 `.env` 的一次性迁移
+/// （[`crate::migrate::migrate_env_settings`] 是它唯一的生产消费者）。配置读取
+/// 路径早已不碰 `.env`，故迁移层到期整体删除时，本函数与 [`parse_env_line`]
+/// 一并移除。完整删除清单见 [`crate::migrate`] 的模块文档。
 pub fn parse_env_text(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in text.lines() {

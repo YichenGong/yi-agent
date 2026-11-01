@@ -64,4 +64,8 @@
 - [x] `YI_AGENT_WORKDIR` 下线，工作目录只由 `--workdir` / 启动目录 / 桌面端选项目决定 — `resolve_workdir`（`src/config.rs`）：显式 override，否则 `current_dir()`
   - 判据：`cargo test -p yi-agent-runtime --lib config::tests::workdir_env_var_no_longer_overrides`
 
+- [ ] **待删（2027-01-01 退役）存量 `.env` 迁移层** — 配置读取路径已完全不碰 `.env`，只剩一个「搬家工」：把旧版本的 `.env` 搬进 `models.json` / `settings.json` / `websearch.json` 后改名 `.env.migrated`。全新机器上它每次启动只是读到 `NotFound` 就返回，零行为。保留到 `2027-01-01` 是为了让还在跑旧版本的用户有机会安装一个带迁移的版本；到期后整块删除（理由与风险见 `src/migrate.rs` 的模块文档「退役计划」一节）。**删除清单**：(1) `src/migrate.rs` 的 `migrate_model_keys`（`:84`）、`migrate_env_settings`（`:315`）、`log_outcome`（`:226`）、`log_env_settings_outcome`（`:547`）与全部 30 个测试；(2) `src/settings.rs` 的 `parse_env_text`（`:58`）与 `parse_env_line`——前者唯一的生产消费者是 `migrate_env_settings`；(3) `src/config.rs` 的 `resolve_global_env_path`（`:190`）；(4) 四个生产入口的接线：`crates/yi-agent/src/main.rs` 的 `Command::Web` 分支与 `prepare_environment`、`crates/yi-agent-app-server/src/server.rs` 的 `migrate_legacy_model_keys_on_startup`（`run` / `serve_stdio_with_relay` 各调一次）；(5) **必须同批处理否则会红**的三个钉住接线的测试：`server.rs` 的 `the_startup_migration_runs_both_model_and_settings_migrations` 与 `the_ws_entry_runs_the_startup_migration`（`include_str!` + 字符串匹配断言迁移挂在启动路径上）、`crates/yi-agent/tests/settings_migration.rs` 的两条端到端用例。**删前须确认**：最低支持版本已高于发布该迁移的版本，否则从未升级过的用户的 `.env` key 会彻底读不出来（表现为「模型未配置」）
+  - 判据：`grep -rn "migrate_model_keys\|migrate_env_settings\|parse_env_text\|resolve_global_env_path" yi-agent-rs/crates` 应无输出（`settings.rs` 的函数定义除外，届时已删）
+  - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
+
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
