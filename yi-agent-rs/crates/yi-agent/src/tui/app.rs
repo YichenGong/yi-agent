@@ -824,8 +824,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line = build_input_line_with(input, pending_quit, chunks[5].width, theme);
-            f.render_widget(input_line, chunks[5]);
+            let input_line =
+                build_input_line_with(input, pending_quit, chunks[INPUT_CHUNK].width, theme);
+            f.render_widget(input_line, chunks[INPUT_CHUNK]);
 
             if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                 let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
@@ -3752,13 +3753,16 @@ fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("命令"))
 }
 
-/// The input stripe, painted for `theme`.
+/// The input card, painted for `theme`.
 ///
-/// The stripe used a hardcoded `Indexed(240)`, which is a dark gray band on a
-/// light terminal; it now asks the theme for its raised surface instead. The
-/// foreground is explicit too: `bg_raised` is light in the light theme, so
-/// leaving text at the terminal default would paint dark-terminal light text
-/// onto `#ededed` when a dark terminal is forced to `YI_AGENT_THEME=light`.
+/// The card is a contiguous band of `input_bg` three or more rows tall: one
+/// blank padding row, the input itself (one or more rows), and one blank
+/// padding row. The padding rows carry no characters, so selecting only the
+/// middle row with the terminal's native selection copies clean text.
+///
+/// The foreground is explicit because `input_bg` is a fixed gray in both
+/// themes: leaving text at the terminal default would be unreadable when a
+/// dark terminal is forced to `YI_AGENT_THEME=light` and vice versa.
 fn build_input_line_with(
     input: &InputLine,
     pending_quit: bool,
@@ -3770,27 +3774,39 @@ fn build_input_line_with(
         Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
     );
     if pending_quit {
-        return Paragraph::new(Line::from(vec![
-            prefix,
-            Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
+        // Ride the same three-row card: collapsing to one row would make the
+        // whole frame jump on Ctrl+C.
+        return Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(vec![
+                prefix,
+                Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
+            ]),
+            Line::from(""),
         ]))
-        .style(Style::new().bg(theme.bg_raised).fg(theme.fg));
+        .style(Style::new().bg(theme.input_bg).fg(theme.fg));
     }
     let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
-    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised).fg(theme.fg))
+    let mut padded = Vec::with_capacity(lines.len() + 2);
+    padded.push(Line::from(""));
+    padded.extend(lines);
+    padded.push(Line::from(""));
+    Paragraph::new(Text::from(padded)).style(Style::new().bg(theme.input_bg).fg(theme.fg))
 }
 
-/// Number of terminal lines the input will occupy when rendered.
+/// Number of terminal lines the input card occupies, including its two padding
+/// rows.
 fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) -> u16 {
     if pending_quit {
-        return 1;
+        return INPUT_CARD_PADDING * 2 + 1;
     }
-    // Derive the height from the exact same wrapping the renderer uses. The
-    // previous `div_ceil(width)` estimate was wrong for explicit newlines and
-    // for per-character wrapping, and a too-small height silently hides the
+    // Derive the height from the exact same wrapping the renderer uses. A
+    // `div_ceil(width)` estimate was wrong for explicit newlines and for
+    // per-character wrapping, and a too-small height silently hides the
     // overflow rows (the terminal only reserves `height` rows for the input).
     let prefix = Span::raw("> ");
-    wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width).len() as u16
+    let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width).len() as u16;
+    lines + INPUT_CARD_PADDING * 2
 }
 
 /// Pre-computed screen layout, shared between the draw closure and the mouse
@@ -3798,9 +3814,15 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
 #[derive(Clone, Debug)]
 struct LayoutInfo {
     /// Vertical chunks: [0]=history, [1]=popup, [2]=status, [3]=queued,
-    /// [4]=gap, [5]=input.
+    /// [4]=input card.
+    ///
+    /// The input card carries its own padding rows, so there is no separate
+    /// blank gap above it any more.
     chunks: Vec<ratatui::layout::Rect>,
 }
+
+/// Index of the input card chunk in [`LayoutInfo::chunks`].
+const INPUT_CHUNK: usize = 4;
 
 /// Compute the screen layout from the current terminal size and widget state.
 fn compute_layout(
@@ -3811,7 +3833,10 @@ fn compute_layout(
     queued_height: u16,
 ) -> LayoutInfo {
     let input_width = area.width;
-    let input_height = compute_input_height(input, pending_quit, input_width).min(6);
+    // Cap the text rows, not the card: the two padding rows are always present
+    // so the card keeps its shape once the input starts wrapping a lot.
+    let max_height = INPUT_MAX_TEXT_LINES + INPUT_CARD_PADDING * 2;
+    let input_height = compute_input_height(input, pending_quit, input_width).min(max_height);
     let popup_height = popup
         .as_ref()
         .map(|p| p.height(area.height) as u16)
@@ -3824,8 +3849,7 @@ fn compute_layout(
             Constraint::Length(popup_height),  // popup (0 when none)
             Constraint::Length(1),             // status bar
             Constraint::Length(queued_height), // queued preview
-            Constraint::Length(1),             // blank gap
-            Constraint::Length(input_height),  // input (wraps up to 6 lines)
+            Constraint::Length(input_height),  // input card (padding included)
         ])
         .split(area);
 
@@ -3834,11 +3858,30 @@ fn compute_layout(
     }
 }
 
+/// Blank padding rows above and below the input text inside the input card.
+///
+/// The card is deliberately more than one row tall so it reads as a card rather
+/// than a stripe. The padding carries no characters, so terminal-native
+/// selection over just the middle row copies clean text.
+const INPUT_CARD_PADDING: u16 = 1;
+
+/// Maximum number of text rows the input card shows before it stops growing.
+const INPUT_MAX_TEXT_LINES: u16 = 6;
+
+/// Width of the `"> "` prefix on the first input row.
+const INPUT_PREFIX_WIDTH: usize = 2;
+
 /// Wrap the input buffer into multiple `Line`s so all typed text is visible.
 ///
-/// The first line begins with the `"> "` prefix; continuation lines begin
-/// with `"  "` so the cursor column is visually aligned. Wrapping is
-/// character-based using unicode display width (so CJK / wide chars work).
+/// Only the first line carries the `"> "` prefix. Continuation lines start at
+/// column 0 with **no** indent: the two-space indent used to align the cursor
+/// column, but it leaked into every copied line as leading whitespace, and
+/// terminals do not trim leading spaces on copy. The ragged left edge is the
+/// price of clean copy.
+///
+/// Wrapping is character-based using unicode display width (so CJK / wide chars
+/// work). Because the first line is narrower by the prefix, the two row kinds
+/// have different capacities.
 ///
 /// The character at `cursor` (byte offset) is rendered with reverse video so
 /// the user can see the cursor.
@@ -3848,8 +3891,10 @@ fn wrap_input_buffer(
     prefix: &Span<'static>,
     area_width: u16,
 ) -> Vec<Line<'static>> {
-    const PREFIX_LEN: usize = 2; // "> " or "  "
-    let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
+    let first_avail = (area_width as usize)
+        .saturating_sub(INPUT_PREFIX_WIDTH)
+        .max(1);
+    let cont_avail = (area_width as usize).max(1);
     // Reverse video instead of a hardcoded white block: REVERSED is resolved by
     // the terminal against its own background, so the cursor stays visible on
     // both light and dark themes. A fixed `bg(White)` is 1.00:1 on a white
@@ -3908,7 +3953,6 @@ fn wrap_input_buffer(
             Span::styled(" ", cursor_style),
         ])];
     }
-
     // Split by explicit newlines first: a pasted multi-line block used to be
     // one span holding raw '\n's, which renders as a single over-wide (and
     // mis-shaped) line whose tail ratatui drops. Byte offsets are tracked so
@@ -3928,13 +3972,20 @@ fn wrap_input_buffer(
 
         for ch in segment.chars() {
             let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            // The first row is narrower by the prefix; continuation rows use the
+            // full width because they carry no indent.
+            let avail = if lines.is_empty() {
+                first_avail
+            } else {
+                cont_avail
+            };
             if current_width + ch_width > avail && !current.is_empty() {
                 let chunk = std::mem::take(&mut current);
                 let spans = build_spans(&chunk, chunk_start);
                 let mut all_spans = if lines.is_empty() {
                     vec![prefix.clone()]
                 } else {
-                    vec![Span::raw("  ")]
+                    Vec::new()
                 };
                 all_spans.extend(spans);
                 lines.push(Line::from(all_spans));
@@ -3950,7 +4001,7 @@ fn wrap_input_buffer(
         let mut all_spans = if lines.is_empty() {
             vec![prefix.clone()]
         } else {
-            vec![Span::raw("  ")]
+            Vec::new()
         };
         all_spans.extend(spans);
         lines.push(Line::from(all_spans));
@@ -3991,8 +4042,8 @@ mod tests {
         }
         assert_eq!(
             compute_input_height(&inp, false, width) as usize,
-            lines.len(),
-            "height must equal the wrapped line count"
+            lines.len() + INPUT_CARD_PADDING as usize * 2,
+            "height must equal the wrapped line count plus the card padding"
         );
     }
 
@@ -4042,7 +4093,7 @@ mod tests {
                 let expected = wrap_input_buffer(&inp.buffer, inp.cursor, &prefix, width).len();
                 assert_eq!(
                     compute_input_height(&inp, false, width) as usize,
-                    expected,
+                    expected + INPUT_CARD_PADDING as usize * 2,
                     "width {width} text {text:?}"
                 );
             }
@@ -6553,7 +6604,9 @@ mod tests {
 
         // After Ctrl+C, the input row should show the confirm message
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains("Ctrl") || row_text.contains("退出"),
@@ -6750,7 +6803,9 @@ mod tests {
             result
         );
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains('x'),
@@ -6846,7 +6901,9 @@ mod tests {
 
         // The terminal buffer should contain "hi" in the input row (last row)
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains("hi"),
@@ -6978,23 +7035,28 @@ mod tests {
     /// Unit test for `compute_input_height` with ASCII.
     #[test]
     fn compute_input_height_ascii() {
+        // The card always adds one padding row above and below the text, so
+        // the height is `text_rows + 2`. Width 20 leaves 18 for the first row
+        // (after `"> "`); continuation rows carry no indent and get all 20.
+        let pad = INPUT_CARD_PADDING * 2;
         let mut inp = InputLine::new();
-        // width=20, prefix=2, avail=18. 30 chars -> ceil(30/18) = 2 lines.
-        assert_eq!(compute_input_height(&inp, false, 20), 1);
+        assert_eq!(compute_input_height(&inp, false, 20), 1 + pad);
         inp.buffer = "a".repeat(18);
-        assert_eq!(compute_input_height(&inp, false, 20), 1, "18 fits in 18");
+        assert_eq!(compute_input_height(&inp, false, 20), 1 + pad, "18 fits");
         inp.buffer = "a".repeat(19);
-        assert_eq!(compute_input_height(&inp, false, 20), 2, "19 wraps to 2");
-        inp.buffer = "a".repeat(36);
+        assert_eq!(compute_input_height(&inp, false, 20), 2 + pad, "19 wraps");
+        // 18 (first row) + 20 (full continuation row) = 38 fits in 2 rows.
+        inp.buffer = "a".repeat(38);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            2,
-            "36 = 2 lines of 18"
+            2 + pad,
+            "38 = 18 + 20 fits two rows"
         );
-        inp.buffer = "a".repeat(37);
-        assert_eq!(compute_input_height(&inp, false, 20), 3, "37 wraps to 3");
-        // pending_quit overrides to 1
-        assert_eq!(compute_input_height(&inp, true, 20), 1);
+        inp.buffer = "a".repeat(39);
+        assert_eq!(compute_input_height(&inp, false, 20), 3 + pad, "39 wraps");
+        // pending_quit keeps the card at three rows: collapsing it would make
+        // the frame jump on Ctrl+C.
+        assert_eq!(compute_input_height(&inp, true, 20), 1 + pad);
     }
 
     /// Unit test for `compute_input_height` with CJK (double-width).
@@ -7003,16 +7065,17 @@ mod tests {
         let mut inp = InputLine::new();
         // width=20, prefix=2, avail=18. Each '你' is 2 cells. 9 chars = 18
         // cells fit on line 1; 10 chars = 20 cells -> 2 lines.
+        let pad = INPUT_CARD_PADDING * 2;
         inp.buffer = "你".repeat(9);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            1,
+            1 + pad,
             "9 cjk = 18 cells fits"
         );
         inp.buffer = "你".repeat(10);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            2,
+            2 + pad,
             "10 cjk = 20 cells wraps"
         );
     }
@@ -7020,42 +7083,108 @@ mod tests {
     /// The input stripe must follow the theme: on a light terminal the old
     /// hardcoded `Indexed(240)` painted a dark gray band across a white screen.
     #[test]
-    fn input_stripe_uses_theme_raised() {
+    fn input_card_uses_input_bg() {
         let input = InputLine::new();
         let dark = build_input_line_with(&input, false, 40, TuiTheme::DARK);
         let light = build_input_line_with(&input, false, 40, TuiTheme::LIGHT);
-        // Paragraph style is not directly readable, so render one row into a
-        // scratch buffer and inspect the background of the padded cells.
-        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        // The card is three rows: padding / text / padding. Render the whole
+        // card so the padding rows are inspected too, not just the text row.
+        let area = ratatui::layout::Rect::new(0, 0, 40, 3);
         let mut dark_buf = ratatui::buffer::Buffer::empty(area);
         let mut light_buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(dark, area, &mut dark_buf);
         ratatui::widgets::Widget::render(light, area, &mut light_buf);
-        assert_eq!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
-        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
-        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
-        // A raised surface needs an explicit foreground: `bg_raised` is light in
-        // the light theme, so text left at the terminal default would vanish
-        // when a dark terminal is forced to `YI_AGENT_THEME=light`.
-        assert_eq!(dark_buf[(39, 0)].fg, TuiTheme::DARK.fg);
-        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+
+        for (buf, theme) in [(&dark_buf, TuiTheme::DARK), (&light_buf, TuiTheme::LIGHT)] {
+            for y in 0..3u16 {
+                assert_eq!(buf[(39, y)].bg, theme.input_bg, "row {y} background");
+            }
+        }
+        assert_ne!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        // The card needs an explicit foreground: `input_bg` is a fixed gray in
+        // both themes, so text left at the terminal default would vanish when a
+        // dark terminal is forced to `YI_AGENT_THEME=light`.
+        assert_eq!(dark_buf[(39, 1)].fg, TuiTheme::DARK.fg);
+        assert_eq!(light_buf[(39, 1)].fg, TuiTheme::LIGHT.fg);
     }
 
-    /// The `Ctrl+C` quit prompt rides the same raised stripe: it used to
-    /// paint its own `Indexed(240)` band, so on a light terminal the hint
-    /// flashed as a dark strip over a white screen.
+    /// The card is a contiguous band: both padding rows carry no characters and
+    /// the same background as the text row. Terminal-native selection over the
+    /// middle row alone therefore copies clean text.
     #[test]
-    fn pending_quit_stripe_uses_theme_raised() {
+    fn input_card_pads_one_blank_row_each_side() {
+        let mut input = InputLine::new();
+        input.insert_str("hello");
+        let paragraph = build_input_line_with(&input, false, 20, TuiTheme::DARK);
+        let area = ratatui::layout::Rect::new(0, 0, 20, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(paragraph, area, &mut buf);
+
+        for y in [0u16, 2] {
+            let row: String = (0..20u16).map(|x| buf[(x, y)].symbol()).collect();
+            assert_eq!(row.trim(), "", "padding row {y} must be blank: {row:?}");
+            assert_eq!(buf[(0, y)].bg, TuiTheme::DARK.input_bg);
+        }
+        let text_row: String = (0..20u16).map(|x| buf[(x, 1)].symbol()).collect();
+        assert_eq!(text_row.trim_end(), "> hello");
+    }
+
+    /// Only the first row carries `"> "`; continuation rows start at column 0.
+    /// The old two-space indent leaked into every copied line as leading
+    /// whitespace, and terminals do not trim leading spaces on copy.
+    #[test]
+    fn wrapped_input_keeps_only_the_first_prefix() {
+        let mut input = InputLine::new();
+        // Width 12 leaves 10 for the first row; 25 chars wrap to 3 rows.
+        input.insert_str(&"x".repeat(25));
+        let lines = wrap_input_buffer(&input.buffer, input.cursor, &Span::raw("> "), 12);
+        assert!(lines.len() >= 2, "expected wrapping, got {}", lines.len());
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(rendered[0].starts_with("> "), "{:?}", rendered[0]);
+        for (i, line) in rendered.iter().enumerate().skip(1) {
+            assert!(
+                !line.starts_with(' ') && !line.starts_with('>'),
+                "continuation row {i} must start at column 0: {line:?}"
+            );
+        }
+        // Nothing but the prefix itself (plus the trailing cursor cell, which
+        // Ghostty trims on copy) may survive concatenation.
+        let joined: String = rendered.concat();
+        assert_eq!(joined.trim_end(), format!("> {}", "x".repeat(25)));
+    }
+
+    /// The `Ctrl+C` prompt rides the same three-row card. It used to be one
+    /// row, so pressing `Ctrl+C` shrank the card and made the whole frame jump.
+    #[test]
+    fn pending_quit_keeps_the_three_row_card() {
         let input = InputLine::new();
         let light = build_input_line_with(&input, true, 40, TuiTheme::LIGHT);
-        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
-        let mut light_buf = ratatui::buffer::Buffer::empty(area);
-        ratatui::widgets::Widget::render(light, area, &mut light_buf);
-        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
-        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
-        // Padded cells inherit the paragraph style, so this is the stripe
-        // foreground, not the `再按 Ctrl+C 退出` span's own `warn`.
-        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(light, area, &mut buf);
+
+        for y in 0..3u16 {
+            assert_eq!(buf[(39, y)].bg, TuiTheme::LIGHT.input_bg, "row {y}");
+        }
+        for y in [0u16, 2] {
+            let row: String = (0..40u16).map(|x| buf[(x, y)].symbol()).collect();
+            assert_eq!(row.trim(), "", "padding row {y} must be blank");
+        }
+        // Wide (CJK) glyphs occupy two cells and ratatui writes a space into
+        // the second one; drop all whitespace before matching.
+        let hint: String = (0..40u16)
+            .map(|x| buf[(x, 1)].symbol())
+            .filter(|s| !s.trim().is_empty())
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        assert!(hint.contains("再按Ctrl+C退出"), "{hint:?}");
+        // Padding cells inherit the paragraph foreground, not the hint's `warn`.
+        assert_eq!(buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
     }
 
     /// Whole-frame acceptance: with the light theme, no cell may be painted with
@@ -7664,7 +7793,9 @@ mod tests {
 
         // The input row should contain "/clear" (completed by Tab)
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -7821,7 +7952,9 @@ mod tests {
 
         // After Down + Tab, the 2nd command (clear) should be completed into input
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -8107,7 +8240,9 @@ mod tests {
         // The cursor is reverse video, not a hardcoded white block: a white
         // block is invisible on a white terminal (contrast 1.00:1).
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
@@ -8156,7 +8291,9 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
@@ -8212,7 +8349,9 @@ mod tests {
         // Input starts at x=2 (after "> " prefix). 'a' at x=2, 'b' at x=3, 'c' at x=4.
         // Cursor at byte offset 2 means 'c' is the cursor character, at x=4.
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let cursor_cell = &buffer[(4, input_row)];
         assert!(
             cursor_cell
@@ -8804,7 +8943,9 @@ mod tests {
 
         // The input row should not contain 'a' — it was ignored while permission was pending.
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -11049,7 +11190,7 @@ mod tests {
     #[test]
     fn mouse_scroll_in_input_region_ignores_history() {
         let (layout, _history_area) = layout_80x24();
-        let input_area = layout.chunks[5];
+        let input_area = layout.chunks[INPUT_CHUNK];
         let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {

@@ -35,8 +35,21 @@ pub struct TuiTheme {
     pub danger: Color,
     /// Success / completion.
     pub success: Color,
-    /// Raised surface background (input stripe, popup cards).
+    /// Raised surface background (popup cards, trace panels).
+    ///
+    /// Deliberately only a hair above the page: it is meant to give popups an
+    /// edge, not to read as a distinct band. Do **not** use it for the input
+    /// card — see [`Self::input_bg`].
     pub bg_raised: Color,
+    /// Input card background. Must read as a clearly distinct band against the
+    /// page, unlike `bg_raised`.
+    ///
+    /// The dark value is the pre-2026-10-31 `Indexed(240)`, restored at the
+    /// user's request ("same strength as the old one"). The light value is the
+    /// visually equivalent gray: the old `#585858` on a white page left body
+    /// text at 2.32:1, which is exactly the defect
+    /// `2026-10-31-tui-light-terminal-theme-design.md` removed.
+    pub input_bg: Color,
     /// Selected row foreground / background.
     pub sel_fg: Color,
     pub sel_bg: Color,
@@ -68,6 +81,7 @@ impl TuiTheme {
         danger: Color::Rgb(0xff, 0x7b, 0x72),   //  6.61:1
         success: Color::Rgb(0x7e, 0xe7, 0x87),  // 10.85:1
         bg_raised: Color::Rgb(0x2a, 0x2a, 0x2a), // 1.16 vs #1e1e1e
+        input_bg: Color::Rgb(0x58, 0x58, 0x58), // 2.34 vs #1e1e1e; fg 5.60:1
         sel_fg: Color::Rgb(0xff, 0xff, 0xff),   //  5.06:1 on sel_bg
         sel_bg: Color::Rgb(0x2f, 0x6f, 0xbf),
         cursor_fg: Color::Rgb(0x1e, 0x1e, 0x1e),
@@ -86,6 +100,7 @@ impl TuiTheme {
         danger: Color::Rgb(0xa0, 0x18, 0x18),   //  7.96:1
         success: Color::Rgb(0x14, 0x69, 0x1f),  //  6.84:1
         bg_raised: Color::Rgb(0xed, 0xed, 0xed), // 1.17 vs #ffffff
+        input_bg: Color::Rgb(0xb9, 0xb9, 0xb9), // 1.96 vs #ffffff; fg 8.40:1
         sel_fg: Color::Rgb(0xff, 0xff, 0xff),   //  6.44:1 on sel_bg
         sel_bg: Color::Rgb(0x1f, 0x5f, 0xa8),
         cursor_fg: Color::Rgb(0xff, 0xff, 0xff),
@@ -417,9 +432,33 @@ mod tests {
 
     #[test]
     fn raised_surface_is_distinguishable() {
-        // The input stripe must read as a distinct band, not invisible.
+        // Popup cards only need a hair of separation; they are borders, not
+        // bands. The input card has its own, much stronger, slot below.
         assert!(contrast_ratio(TuiTheme::DARK.bg_raised, Color::Rgb(0x1e, 0x1e, 0x1e)) >= 1.15);
         assert!(contrast_ratio(TuiTheme::LIGHT.bg_raised, Color::Rgb(0xff, 0xff, 0xff)) >= 1.15);
+    }
+
+    /// The input card must read as an obvious band. `bg_raised` at 1.16 looked
+    /// invisible on a real terminal whose page was `#282c34` rather than the
+    /// assumed `#1e1e1e` (only 1.025 there), which is the bug this slot fixes.
+    #[test]
+    fn input_card_is_clearly_distinguishable() {
+        let dark = contrast_ratio(TuiTheme::DARK.input_bg, Color::Rgb(0x1e, 0x1e, 0x1e));
+        let light = contrast_ratio(TuiTheme::LIGHT.input_bg, Color::Rgb(0xff, 0xff, 0xff));
+        assert!(dark >= 1.9, "dark input card is only {dark:.2}:1");
+        assert!(light >= 1.9, "light input card is only {light:.2}:1");
+    }
+
+    /// The dark card restores the pre-2026-10-31 `Indexed(240)` look at the
+    /// user's request ("same strength as the old one").
+    #[test]
+    fn dark_input_card_restores_the_old_band_strength() {
+        let old = contrast_ratio(Color::Rgb(0x58, 0x58, 0x58), Color::Rgb(0x1e, 0x1e, 0x1e));
+        let now = contrast_ratio(TuiTheme::DARK.input_bg, Color::Rgb(0x1e, 0x1e, 0x1e));
+        assert!(
+            (now - old).abs() < 0.05,
+            "dark card is {now:.2}:1, old band was {old:.2}:1"
+        );
     }
 
     #[test]
@@ -437,6 +476,18 @@ mod tests {
             assert!(
                 ratio >= 4.5,
                 "{:?} body-on-raised is {ratio:.2}:1",
+                theme.kind
+            );
+        }
+    }
+
+    #[test]
+    fn body_text_on_input_card_is_readable() {
+        for theme in [TuiTheme::DARK, TuiTheme::LIGHT] {
+            let ratio = contrast_ratio(theme.fg, theme.input_bg);
+            assert!(
+                ratio >= 4.5,
+                "{:?} body-on-input-card is {ratio:.2}:1",
                 theme.kind
             );
         }
