@@ -393,11 +393,11 @@ fn        observe_phase(...)                   // 回填顺序 + push 到 sessio
 
 | 步 | 动作 | 验收 |
 |---|---|---|
-| D1a | 提取 `abort_run`，替换 7 处 | `cargo test -p yi-agent-core` 309 全绿 |
+| D1a | 提取 `abort_run`，替换 **6** 处 | `cargo test -p yi-agent-core` 309 全绿 |
 | D1b | 抽 `think_phase` | 同上 |
 | D1c | 抽 `act_phase` + `observe_phase` | 同上 |
 
-### 4.3 完成判据（已验算）
+### 4.4 完成判据（已验算）
 
 ⚠️ **纠正初稿一个方向性错误**：初稿要求「`agent.rs` 生产代码从 1,876 降到 ≤ 1,600 行」。
 **这在数学上做不到，也不该是这块的目标。**
