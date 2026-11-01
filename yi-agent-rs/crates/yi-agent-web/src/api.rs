@@ -88,6 +88,11 @@ fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Valu
         "compact.user_budget_tokens" => opt(current.compact.user_budget_tokens.map(Value::from)),
         "compact.tool_budget_tokens" => opt(current.compact.tool_budget_tokens.map(Value::from)),
         "startup.sandbox" => opt(current.startup.sandbox.clone().map(Value::from)),
+        "tui.notifications" => opt(current.tui.notifications.clone().map(Value::from)),
+        "tui.notification_method" => opt(current.tui.notification_method.clone().map(Value::from)),
+        "tui.notification_condition" => {
+            opt(current.tui.notification_condition.clone().map(Value::from))
+        }
         _ => Value::Null,
     }
 }
