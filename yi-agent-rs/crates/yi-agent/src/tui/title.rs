@@ -4,12 +4,6 @@
 //! 无所谓），标题是持续状态（有当前值、需 diff、退出必须还原）。两者没有
 //! 共享状态，只复用 `sanitize` 与 `is_multiplexed` 两个纯工具。
 
-// 本模块的 API 要到接线任务（`run_loop` 每帧 sync、退出 clear）才有生产
-// 调用者；在那之前只有测试在用。分阶段提交时不该因此让 `clippy -D warnings`
-// 变红，故按仓内既有做法（`tui/queued.rs:105`、`tui/slash.rs:153`）在
-// 非测试构建下放开 `dead_code`。接线完成后删掉这行。
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::Path;
 
 /// 标题的显示列宽上限。
@@ -162,12 +156,14 @@ impl TitleSink for StdoutSink {
 ///
 /// `Box<dyn TitleSink>` 交出去就拿不回来了，所以记录必须共享：调用方先
 /// `clone()` 一份探针，再把原 sink 装箱喂进去。
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct RecordingSink {
     calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(test)]
 impl RecordingSink {
     /// 至今收到的所有写入值，按调用顺序。
     pub fn calls(&self) -> Vec<String> {
@@ -181,6 +177,7 @@ impl RecordingSink {
     }
 }
 
+#[cfg(test)]
 impl TitleSink for RecordingSink {
     fn write_title(&mut self, text: &str) -> io::Result<()> {
         self.calls.lock().unwrap().push(text.to_string());
@@ -322,10 +319,15 @@ pub struct TitleHandle {
 impl TitleHandle {
     /// 生产构造：从工作目录取项目名。
     pub fn new(enabled: bool, multiplexed: bool, workdir: &Path) -> Self {
-        Self::with_sink(enabled, multiplexed, workdir, Box::new(StdoutSink))
+        Self {
+            writer: TitleWriter::new(enabled, multiplexed),
+            state: TitleState::default(),
+            project: project_label(workdir),
+        }
     }
 
     /// 可注入 sink 的构造（测试用）。
+    #[cfg(test)]
     pub fn with_sink(
         enabled: bool,
         multiplexed: bool,
@@ -340,6 +342,7 @@ impl TitleHandle {
     }
 
     /// 永不写入。给那些只关心渲染、不关心标题的既有测试用。
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             writer: TitleWriter::with_sink(false, false, Box::new(StdoutSink)),
@@ -348,6 +351,9 @@ impl TitleHandle {
         }
     }
 
+    /// 当前状态。生产路径由 `main.rs` 在构造快照时直接问 `TitleWriter`，
+    /// 这里只为测试保留。
+    #[cfg(test)]
     pub fn status(&self) -> TitleStatus {
         self.writer.status()
     }

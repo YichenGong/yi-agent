@@ -175,6 +175,13 @@ pub fn run_tui(
         decision: decision_tx,
     };
 
+    // 标题：必须在 `workdir` 被 move 进 `run_loop` 之前取项目名。
+    let mut title = crate::tui::title::TitleHandle::new(
+        config.terminal_title,
+        crate::tui::notify::is_multiplexed(&crate::tui::notify::TerminalEnv::from_process()),
+        &workdir,
+    );
+
     let result = run_loop(
         &mut terminal,
         &mut agent_rx,
@@ -192,6 +199,7 @@ pub fn run_tui(
         &config,
         &catalog,
         theme,
+        &mut title,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -208,6 +216,11 @@ pub fn run_tui(
     if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
         cleanup_error.get_or_insert(error);
     }
+
+    // 标题还原：独立路径，失败只记日志、不影响退出码。必须在
+    // `LeaveAlternateScreen` 之后——alternate screen 关闭时多数终端会重置
+    // 标题，先写空串等于白写。
+    title.clear();
 
     // Report the dropped count only after the alternate screen is gone;
     // printing earlier would be erased along with it.
@@ -401,6 +414,7 @@ pub fn run_tui_with_backend<B: Backend>(
         control: control_tx.clone(),
         decision: decision_tx.clone(),
     };
+    let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
         terminal,
         agent_rx,
@@ -418,6 +432,7 @@ pub fn run_tui_with_backend<B: Backend>(
         &snapshot_for_tests(),
         &catalog_for_tests(),
         TuiTheme::DARK,
+        &mut title,
     )
     .map(|_dropped| ())
 }
@@ -485,6 +500,7 @@ pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
         control: control_tx.clone(),
         decision: decision_tx.clone(),
     };
+    let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
         terminal,
         agent_rx,
@@ -502,6 +518,7 @@ pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
         config,
         catalog,
         theme,
+        &mut title,
     )
     .map(|_dropped| ())
 }
@@ -562,6 +579,7 @@ fn run_loop<B: Backend, E: EventSource>(
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
     theme: TuiTheme,
+    title: &mut crate::tui::title::TitleHandle,
 ) -> std::io::Result<usize> {
     let mut current_model: String = model.to_string();
     // 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
@@ -876,6 +894,10 @@ fn run_loop<B: Backend, E: EventSource>(
                 let _ = notifier.notify(&pending.text);
             }
         }
+
+        // 标题跟随运行态。值没变就不写（`TitleHandle` 内部 diff），所以每帧
+        // 调用是安全的：一次会话只在状态翻转点真正写字节。
+        title.sync(is_running.load(std::sync::atomic::Ordering::SeqCst));
 
         sync_trace_streams(
             &mut trace_streams,
@@ -5456,6 +5478,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5479,6 +5502,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5543,6 +5567,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5566,6 +5591,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5607,6 +5633,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5630,6 +5657,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5682,6 +5710,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5705,6 +5734,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5799,6 +5829,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5822,6 +5853,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5873,6 +5905,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5896,6 +5929,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5927,6 +5961,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5950,6 +5985,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5988,6 +6024,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6011,6 +6048,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6467,6 +6505,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let mut history = HistoryState::new();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6494,6 +6533,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6530,6 +6570,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let mut history = HistoryState::new();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6553,6 +6594,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6705,6 +6747,7 @@ mod tests {
             events: Rc::new(RefCell::new(delivery)),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         let dropped = run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6728,6 +6771,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -8493,6 +8537,7 @@ mod tests {
         };
 
         crate::tui::cell::reset_lines_call_count();
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -8516,6 +8561,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
