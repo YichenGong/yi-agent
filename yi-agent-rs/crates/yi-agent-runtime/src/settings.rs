@@ -439,6 +439,67 @@ pub fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".yi-agent").join("settings.json"))
 }
 
+/// 把旧键 `agent.prevent_idle_sleep` 搬到 `power.prevent_idle_sleep`。
+///
+/// **必须做在 `serde_json::Value` 上，不能等反序列化之后。**
+/// `Settings` 上没有 `deny_unknown_fields`，`AgentSettings` 里删掉该字段后，
+/// serde 会静默忽略文件里的旧键——反序列化之后旧值**已经不存在**，无处可搬。
+///
+/// 三条约束：
+/// 1. 只在新键缺失时迁移，否则用户显式设的 `power` 值每次启动都被旧值覆盖；
+/// 2. 不落盘（只在内存里搬），避免擅自改用户文件；
+/// 3. 幂等——旧键被删掉，同一份 `Value` 上再跑是空操作。
+///
+/// 旧键字符串是**字面量**，不得引用 `PREVENT_IDLE_SLEEP_KEY`：那个常量
+/// 已经指向新键，将来再改值会让迁移跟着漂移、静默失效。
+fn migrate_legacy_keys(value: &mut serde_json::Value) {
+    const LEGACY_GROUP: &str = "agent";
+    const LEGACY_FIELD: &str = "prevent_idle_sleep";
+    const NEW_GROUP: &str = "power";
+
+    let existing = value
+        .get(LEGACY_GROUP)
+        .and_then(|group| group.get(LEGACY_FIELD))
+        .cloned();
+    let Some(legacy) = existing else {
+        return;
+    };
+
+    // 新键已存在就不动：用户显式设的值优先。
+    let already_set = value
+        .get(NEW_GROUP)
+        .and_then(|group| group.get(LEGACY_FIELD))
+        .is_some();
+    if already_set {
+        return;
+    }
+
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object
+        .entry(NEW_GROUP.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .expect("just inserted an object")
+        .insert(LEGACY_FIELD.to_string(), legacy);
+
+    // 删旧键；agent 变空壳则整组删掉，与 `write_to` 的空组清理同口径。
+    let agent_now_empty = match object
+        .get_mut(LEGACY_GROUP)
+        .and_then(|group| group.as_object_mut())
+    {
+        Some(group) => {
+            group.remove(LEGACY_FIELD);
+            group.is_empty()
+        }
+        None => false,
+    };
+    if agent_now_empty {
+        object.remove(LEGACY_GROUP);
+    }
+}
+
 /// 读 `settings.json`。缺失 / 不可读 / JSON 非法一律回全 `None`（用默认值）——
 /// 坏文件绝不阻断启动，与 `models.json` / `preferences.json` 同一约定。
 ///
@@ -457,7 +518,7 @@ pub fn load_from(path: &Path) -> Settings {
     };
     // 先确认顶层是对象。`serde_json::from_str::<Settings>` 对数组/标量会失败，
     // 那样整份回默认；这条路径单独提出只是为了让 warn 措辞准确。
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+    let mut value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(error = %error, path = %path.display(), "invalid settings.json; using defaults");
@@ -468,6 +529,10 @@ pub fn load_from(path: &Path) -> Settings {
         tracing::warn!(path = %path.display(), "settings.json is not a JSON object; using defaults");
         return Settings::default();
     }
+
+    // 旧键在反序列化之后就不存在了，必须在这里搬。
+    migrate_legacy_keys(&mut value);
+
     let settings = match serde_json::from_value::<Settings>(value) {
         Ok(settings) => settings,
         Err(error) => {
@@ -1583,5 +1648,42 @@ malformed line
         .unwrap();
         let (grace, remote) = power_windows_minutes(&load_from(&path));
         assert_eq!((grace, remote), (45, 20));
+    }
+
+    #[test]
+    fn migrate_moves_the_legacy_key_into_power() {
+        let mut value = serde_json::json!({"agent":{"prevent_idle_sleep":"false"}});
+        migrate_legacy_keys(&mut value);
+        assert_eq!(value["power"]["prevent_idle_sleep"], "false");
+        // 旧键必须被删掉，否则幂等性靠的是「新键已存在」这个间接条件。
+        assert!(
+            value["agent"].get("prevent_idle_sleep").is_none(),
+            "the legacy key must be removed, got {value}"
+        );
+        // agent 变空壳则整组删掉，不留 {"agent":{}} 噪音。
+        assert!(
+            value.get("agent").is_none(),
+            "an emptied agent group must be pruned, got {value}"
+        );
+    }
+
+    #[test]
+    fn migrate_keeps_an_explicit_power_key() {
+        let mut value = serde_json::json!({
+            "agent": {"prevent_idle_sleep": "false"},
+            "power": {"prevent_idle_sleep": "true"}
+        });
+        migrate_legacy_keys(&mut value);
+        // 新键优先：不能被旧的 false 覆盖。
+        assert_eq!(value["power"]["prevent_idle_sleep"], "true");
+    }
+
+    #[test]
+    fn migrate_twice_is_a_no_op() {
+        let mut value = serde_json::json!({"agent":{"prevent_idle_sleep":"false"}});
+        migrate_legacy_keys(&mut value);
+        let once = value.clone();
+        migrate_legacy_keys(&mut value);
+        assert_eq!(value, once, "migration must be idempotent");
     }
 }
