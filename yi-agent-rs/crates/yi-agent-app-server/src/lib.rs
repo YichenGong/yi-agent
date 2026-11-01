@@ -22,9 +22,11 @@ pub mod model_rpc;
 pub mod onboarding_rpc;
 pub mod pair_uri;
 pub mod pairing;
-/// 插件被自己的 flag 关掉的判定。与 `lead_gate` 同一手法：构造点算一次。
 pub mod plugin_gate;
 pub(crate) mod plugin_worktree;
+/// 插件被自己的 flag 关掉的判定。与 `lead_gate` 同一手法：构造点算一次。
+pub(crate) mod power_busy;
+pub(crate) mod power_guard;
 pub mod protocol;
 pub(crate) mod rpc;
 pub mod server;

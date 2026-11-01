@@ -4992,6 +4992,7 @@ dependencies = [
  "yi-agent-core",
  "yi-agent-flags",
  "yi-agent-mcp",
+ "yi-agent-power",
  "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-skills",
