@@ -1192,7 +1192,7 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
 
 并把 `session_handle` 传给 `rebuild_driver_agent`（Task 6 处理 resume 时也复用它）。
 
-- [ ] **Step 3: 每轮累积 items 并在 Done 后落盘**
+- [ ] **Step 3: 每轮累积 items，在终止事件后落盘**
 
 在闭包顶部（`let mut live = LiveRebuild::new(...)` 旁边）建**跨轮存活**的 `translator`，在 loop 内维护每轮清空的累积器：
 
@@ -1208,6 +1208,8 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
             let mut turn_items: Vec<yi_agent_app_server::protocol::Item> = Vec::new();
             let mut last_usage: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
             let mut usage_total: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
+            // 每轮的 session 基线长度，落盘时用来判断有没有被取消回滚。
+            let mut base_len = 0usize;
 ```
 
 在事件转发处（`agent_tx.send(ev).await` 之前）追加。**两个用量字段都从 `Notification::TokenUsage` 里取**，与 app-server 的做法逐字一致（`server.rs:5715-5735`）——那条通知携带的就是本轮完整快照，不需要给 `Translator` 加任何新 API：
@@ -1289,11 +1291,37 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
                 turn_items.clear();
                 last_usage = None;
                 usage_total = None;
+                // 必须在 `agent.run(text)` 之前取：run 内部会 push 本轮 user
+                // message（agent.rs:739），取晚了基线就含它，net 恒少 1。
+                base_len = session_handle
+                    .lock()
+                    .map(|s| s.messages().len())
+                    .unwrap_or(0);
 ```
 
 **item id 必须全局唯一。** `Translator` 的 `alloc_item_id` 生成的是 `item-{turn_id}-{n}`，而 `next_item` 只在 `Translator::new` 时置 1、`set_turn` **不重置**它。所以只要 `turn_id` 每轮唯一，id 就不会撞。**坏掉的情形**是不调 `set_turn` 直接 `on_event`：`turn_id` 为空串，所有行生成 `item--1`、`item--2`，跨轮重复；而 `partial_is_committed`（`thread_store.rs`）正是靠**首个 item id** 判断「这轮是否已落盘」，id 重复会让崩溃恢复误判，把已落盘的轮次当成未收尾再追加一遍。
 
 `AgentEvent` 已派生 `Clone`（`agent.rs:265` 的 `#[derive(Debug, Clone, Serialize)]`），`ev.clone()` 可直接用。
+
+**落盘不能只挂在 `Done` 上——`Cancelled` 同样是终止事件。** `is_terminal`（`main.rs:1626`）把 `Done`、`Cancelled`、`Error` 三者都当终止。而 agent 的取消路径（`agent.rs:1134`、`1163`、`1190`、`1248`）都是 `truncate(keep)` 之后发 `Cancelled` 再 `return`，**压根不发 `Done`**。只挂 `Done` 的话，用户每按一次 Ctrl+C 那一轮就静默丢失，resume 回来完全没有痕迹。
+
+所以落盘点是「见到终止事件就收尾」，`match` 形状照 `main.rs:1626` 的 `is_terminal` 写：
+
+```rust
+                            // `Done` / `Cancelled` / `Error` 都是终止事件。
+                            // 取消路径不发 Done（agent.rs:1134 等），漏掉
+                            // Cancelled 会让每次 Ctrl+C 的那一轮永久丢失。
+                            let terminal = matches!(
+                                ev,
+                                yi_agent_core::AgentEvent::Done { .. }
+                                    | yi_agent_core::AgentEvent::Cancelled
+                                    | yi_agent_core::AgentEvent::Error(_)
+                            );
+```
+
+**并且必须按 session 的实际长度裁剪 `turn_items`。** 取消路径会 `truncate(keep)` 回滚 session（`safe_cancel_truncate_len`），但 `turn_items` 是纯累积的，里面的 item 对应的是**回滚前**的事件流。不裁剪就会把被撤销的回答写进磁盘，而 `messages` 快照里没有它——item 与上下文对不上，resume 后 UI 显示一段 model 并没有说过的话。
+
+裁剪规则：记下每轮开始时的 baseline 长度，落盘前按 `messages.len() - baseline` 折算保留多少 item。
 
 **先留一份提问副本。** `agent.run(text)` 的签名是 `run(&mut self, user_prompt: String)`（`agent.rs:702`），会消费掉 `text`；而落盘要用它补 `Item::UserMessage`、`touch` 要用它做标题兜底。所以在 `match agent.run(text).await` **之前**加一行：
 
@@ -1302,31 +1330,46 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
                 let prompt_for_log = text.clone();
 ```
 
-`AgentEvent::Done` 到达后、`is_running` 置 false 之前落盘：
+**完整落盘块**（终止事件到达后、`is_running` 置 false 之前）：
 
 ```rust
-                            if let Some(store) = session_store.as_ref() {
-                                let messages = session_handle
-                                    .lock()
-                                    .map(|s| s.messages().to_vec())
-                                    .unwrap_or_default();
-                                // 必须自己补 UserMessage：Translator 只翻译 agent 侧
-                                // 事件，从不产出它（server.rs:4794 同款注释）。
-                                // 漏了这一步，resume 出来的会话只有回答没有问题。
-                                let mut items = Vec::with_capacity(turn_items.len() + 1);
-                                items.push(yi_agent_app_server::protocol::Item::UserMessage {
-                                    id: format!("user-{}", uuid::Uuid::new_v4()),
-                                    text: prompt_for_log.clone(),
-                                    attachments: Vec::new(),
-                                    images: Vec::new(),
-                                });
-                                items.extend(turn_items.iter().cloned());
+                            if terminal {
+                                if let Some(store) = session_store.as_ref() {
+                                    let messages = session_handle
+                                        .lock()
+                                        .map(|s| s.messages().to_vec())
+                                        .unwrap_or_default();
 
-                                if let Err(e) = store.append_turn(&items, &messages, last_usage.clone(), usage_total.clone()) {
-                                    eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
-                                }
-                                if let Err(e) = store.touch(&prompt_for_log) {
-                                    eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                                    // 本轮 net 增长的 message 数。取消时 session
+                                    // 被 truncate 回滚，net 会变小甚至为 0。
+                                    let net = messages.len().saturating_sub(base_len);
+
+                                    // 必须自己补 UserMessage：Translator 只翻译
+                                    // agent 侧事件，从不产出它（server.rs:4794
+                                    // 同款注释）。漏了这一步，resume 出来的会话
+                                    // 只有回答没有问题。
+                                    let mut items = Vec::with_capacity(turn_items.len() + 1);
+                                    items.push(yi_agent_app_server::protocol::Item::UserMessage {
+                                        id: format!("user-{}", uuid::Uuid::new_v4()),
+                                        text: prompt_for_log.clone(),
+                                        attachments: Vec::new(),
+                                        images: Vec::new(),
+                                    });
+
+                                    // 按 session 实际长度裁剪：宁可少写不可多写。
+                                    // 多写的内容在 session 里不存在，resume 后会
+                                    // 显示模型没说过的话。`net == 0` 表示连 user
+                                    // prompt 都被回滚了，此时只留那 1 条 user item
+                                    // ——它确实是用户问过的，不算伪造。
+                                    let keep = net.max(1).min(turn_items.len() + 1);
+                                    items.extend(turn_items.iter().take(keep - 1).cloned());
+
+                                    if let Err(e) = store.append_turn(&items, &messages, last_usage.clone(), usage_total.clone()) {
+                                        eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                                    }
+                                    if let Err(e) = store.touch(&prompt_for_log) {
+                                        eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                                    }
                                 }
                             }
 ```
