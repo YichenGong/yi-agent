@@ -1,4 +1,4 @@
-# @yi-agent/magpie-agent
+# @yi-agent/magpie-agent-yi-agent
 
 A [Magpie](https://usemagpie.ai) agent plugin that connects
 [Yi Agent](https://github.com/YichenGong/yi-agent) to Magpie's gateway.
@@ -6,7 +6,7 @@ A [Magpie](https://usemagpie.ai) agent plugin that connects
 Install it with:
 
 ```bash
-magpie plugin add @yi-agent/magpie-agent
+magpie plugin add @yi-agent/magpie-agent-yi-agent
 ```
 
 Then find **Yi Agent** on Magpie's Agents page, pick one of Magpie's models in
@@ -71,7 +71,7 @@ talks to every Magpie model through one OpenAI-compatible endpoint.
 ## Development
 
 ```bash
-cd integrations/magpie
+cd integrations/magpie-agent-yi-agent
 npm test            # node --test tests/agent.test.mjs
 ```
 
@@ -88,17 +88,17 @@ with/without a prior value, and unusable model metadata.
 This package is versioned independently of Yi Agent. To publish a new version:
 
 ```bash
-cd integrations/magpie
+cd integrations/magpie-agent-yi-agent
 npm version patch   # or minor / major
 git push            # CI publishes the new version when it lands on main
 ```
 
-CI (`.github/workflows/magpie-agent.yml`) publishes only when the version
+CI (`.github/workflows/magpie-agent-yi-agent.yml`) publishes only when the version
 actually changed — an already-published version is skipped, so re-merging
 without bumping doesn't republish. You can also publish by hand:
 
 ```bash
-cd integrations/magpie
+cd integrations/magpie-agent-yi-agent
 npm publish --access public
 ```
 

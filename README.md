@@ -338,7 +338,7 @@ yi-agent --provider openai --api-key sk-... --model gpt-4o
 | yi-agent-app-server | 55 / 55 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 44 / 52 | [详情](docs/project-management/subagent-runtime.md) |
 | desktop | 103 / 114 | [详情](docs/project-management/desktop.md) |
-| magpie-agent | 5 / 5 | [详情](docs/project-management/magpie-agent.md) |
+| magpie-agent-yi-agent | 5 / 5 | [详情](docs/project-management/magpie-agent-yi-agent.md) |
 
 </details>
 
