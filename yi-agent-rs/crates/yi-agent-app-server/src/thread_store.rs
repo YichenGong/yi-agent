@@ -305,6 +305,113 @@ impl ThreadStore {
         write_atomic(&self.meta_path(&meta.thread_id), &bytes)
     }
 
+    /// 从 `from` 物理复制出一个新会话。
+    ///
+    /// **必须实现在本模块内**：标题截断要用 `title_from`（`pub(crate)`），
+    /// 写在 CLI 侧只能要么扩大 API、要么复制一份截断规则。
+    ///
+    /// 只读源会话——`load` 已在内存里合并了崩溃残留的 partial，不需要也不应该
+    /// 对源调 `promote_partial`。
+    pub fn fork_thread(&self, from: &str, new_id: &str) -> io::Result<String> {
+        if !valid_id(new_id) {
+            return Err(invalid_id(new_id));
+        }
+
+        // 先取源锁：防止复制到「半轮」内容。拿不到直接失败，不建半个新会话。
+        let _src_lock = acquire_thread_lock(&self.root, from).map_err(|e| match e {
+            ThreadLockError::Busy(busy) => {
+                io::Error::new(io::ErrorKind::WouldBlock, busy.to_string())
+            }
+            ThreadLockError::Io(err) => err,
+        })?;
+
+        let loaded = self
+            .load(from)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("thread {from}")))?;
+
+        let now = now_millis();
+        let title = loaded
+            .meta
+            .title
+            .as_ref()
+            .map(|t| title_from(&format!("{t} (fork)")));
+
+        let meta = ThreadMeta {
+            thread_id: new_id.to_string(),
+            cwd: loaded.meta.cwd.clone(),
+            model: loaded.meta.model.clone(),
+            created_at: now,
+            updated_at: now,
+            title,
+            permission_mode: loaded.meta.permission_mode,
+            // 新会话不继承用户的整理意图
+            pin_seq: None,
+            driver_project: None,
+            driver_ref: None,
+            model_ref: loaded.meta.model_ref.clone(),
+            reasoning_effort: loaded.meta.reasoning_effort.clone(),
+            tag: None,
+            preserve_thinking: loaded.meta.preserve_thinking,
+            // 历史提到的文件可能在这些根里，不继承则 fork 后工具访问不到。
+            // 已消失的目录要滤掉，否则 fork 出来的会话一启动就报错。
+            extra_roots: loaded
+                .meta
+                .extra_roots
+                .iter()
+                .filter(|p| Path::new(p).is_dir())
+                .cloned()
+                .collect(),
+            // 唯一组长不变量：一个项目只能有一个 lead
+            role: None,
+            forked_from: Some(from.to_string()),
+            content_epoch: 0,
+            // 锚点/已读/完成时刻都不能继承：继承 last_item_id 会让桌面端的
+            // 锚点校验拒绝 fork 会话的首轮；新会话必须未读、从未完成。
+            last_item_id: None,
+            anchor_sha: loaded.meta.anchor_sha.clone(),
+            last_read_at: 0,
+            last_completed_at: 0,
+        };
+        self.create(&meta)?;
+
+        // 新会话从诞生起就归本进程
+        let _new_lock = acquire_thread_lock(&self.root, new_id).map_err(|e| match e {
+            ThreadLockError::Busy(busy) => {
+                io::Error::new(io::ErrorKind::WouldBlock, busy.to_string())
+            }
+            ThreadLockError::Io(err) => err,
+        })?;
+
+        // `usage` 与 `usage_total` 都必须给：`rpc/thread.rs:662` 的
+        // `if let Some(u) = loaded.usage` 会挡掉 None 时的整个用量通知，
+        // 只给 usage_total 的话客户端仍显示 0。
+        let totals = loaded.totals;
+        let usage_total = TurnUsage {
+            model: loaded
+                .usage
+                .as_ref()
+                .map(|u| u.model.clone())
+                .unwrap_or_else(|| loaded.meta.model.clone()),
+            input_tokens: crate::server::saturate_u32(totals.input_tokens),
+            output_tokens: crate::server::saturate_u32(totals.output_tokens),
+            cache_creation_input_tokens: crate::server::saturate_u32(
+                totals.cache_creation_input_tokens,
+            ),
+            cache_read_input_tokens: crate::server::saturate_u32(totals.cache_read_input_tokens),
+        };
+        self.append_turn(
+            new_id,
+            &TurnLine::Turn {
+                items: loaded.items,
+                usage: loaded.usage,
+                usage_total: Some(usage_total),
+                messages: loaded.messages,
+            },
+        )?;
+
+        Ok(new_id.to_string())
+    }
+
     pub fn append_turn(&self, id: &str, turn: &TurnLine) -> io::Result<()> {
         if !valid_id(id) {
             return Err(invalid_id(id));
@@ -1265,7 +1372,7 @@ pub fn acquire_thread_lock(
         table.remove(&path);
     }
 
-    std::fs::create_dir_all(root).map_err(|e| ThreadLockError::Io(e))?;
+    std::fs::create_dir_all(root).map_err(ThreadLockError::Io)?;
 
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -2223,6 +2330,169 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b, "以当前顺序再算一次应稳定");
+    }
+
+    #[test]
+    fn fork_copies_items_and_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-src");
+        meta.title = Some("原始标题".into());
+        store.create(&meta).unwrap();
+
+        let messages = vec![yi_agent_core::Message {
+            role: yi_agent_core::Role::User,
+            content: vec![yi_agent_core::ContentBlock::Text("hi".into())],
+        }];
+        store
+            .append_turn(
+                "thread-src",
+                &TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "u1".into(),
+                        text: "hi".into(),
+                        attachments: Vec::new(),
+                        images: Vec::new(),
+                    }],
+                    usage: None,
+                    usage_total: None,
+                    messages: messages.clone(),
+                },
+            )
+            .unwrap();
+
+        let new_id = store.fork_thread("thread-src", "thread-forked").unwrap();
+        assert_eq!(new_id, "thread-forked");
+
+        let loaded = store.load("thread-forked").unwrap().unwrap();
+        assert_eq!(loaded.items.len(), 1, "items 必须复制过去");
+        assert_eq!(loaded.messages.len(), 1, "messages 必须复制过去");
+        assert_eq!(loaded.meta.forked_from.as_deref(), Some("thread-src"));
+        assert_eq!(
+            loaded.meta.title.as_deref(),
+            Some("原始标题 (fork)"),
+            "标题要标出 fork 来源，否则列表里两条一模一样"
+        );
+    }
+
+    #[test]
+    fn fork_clears_fields_that_would_break_the_desktop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-src2");
+        meta.last_item_id = Some("stale-item".into());
+        meta.last_read_at = 1_700_000_000_000;
+        meta.last_completed_at = 1_700_000_000_000;
+        meta.role = Some(LEAD_ROLE.to_string());
+        meta.content_epoch = 7;
+        store.create(&meta).unwrap();
+        store
+            .append_turn(
+                "thread-src2",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store.fork_thread("thread-src2", "thread-forked2").unwrap();
+        let loaded = store.load("thread-forked2").unwrap().unwrap();
+
+        assert_eq!(
+            loaded.meta.last_item_id, None,
+            "继承 last_item_id 会让桌面端锚点校验直接拒绝 fork 会话的首轮"
+        );
+        assert_eq!(loaded.meta.last_read_at, 0, "新会话必须是未读");
+        assert_eq!(loaded.meta.last_completed_at, 0, "新会话从未完成过");
+        assert_eq!(
+            loaded.meta.role, None,
+            "不能继承 lead，否则一个项目两个组长"
+        );
+        assert_eq!(loaded.meta.content_epoch, 0, "新会话的内容世代从头算");
+    }
+
+    #[test]
+    fn fork_does_not_touch_the_source_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-src3")).unwrap();
+        store
+            .append_turn(
+                "thread-src3",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let log = dir
+            .path()
+            .join(".yi-agent")
+            .join("threads")
+            .join("thread-src3.jsonl");
+        let before = std::fs::metadata(&log).unwrap().modified().unwrap();
+        let before_len = std::fs::metadata(&log).unwrap().len();
+
+        store.fork_thread("thread-src3", "thread-forked3").unwrap();
+
+        let after = std::fs::metadata(&log).unwrap();
+        assert_eq!(after.len(), before_len, "fork 是只读操作，不能改源日志");
+        assert_eq!(after.modified().unwrap(), before, "源日志 mtime 不能变");
+    }
+
+    #[test]
+    fn fork_carries_usage_totals() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-src4")).unwrap();
+        store
+            .append_turn(
+                "thread-src4",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: Some(TurnUsage {
+                        model: "m".into(),
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    usage_total: Some(TurnUsage {
+                        model: "m".into(),
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store.fork_thread("thread-src4", "thread-forked4").unwrap();
+        let loaded = store.load("thread-forked4").unwrap().unwrap();
+        assert_eq!(
+            loaded.totals.input_tokens, 100,
+            "累计用量必须跟着过去，否则面板归零"
+        );
+        assert!(
+            loaded.usage.is_some(),
+            "usage 必须是 Some——rpc/thread.rs:662 的 if let Some(u) 会挡掉 None 的整个通知"
+        );
+    }
+
+    #[test]
+    fn fork_rejects_an_unknown_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let err = store.fork_thread("thread-nope", "thread-new").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     fn sample_meta(id: &str) -> ThreadMeta {

@@ -179,6 +179,26 @@ impl TuiSessionStore {
         )
     }
 
+    /// 载入可种进新 `Session` 的转录。
+    ///
+    /// 用 `forkable_messages` 截断，而不是整份 messages：会话末尾若停在
+    /// 「assistant 发了 tool_use 但 tool_result 还没回来」的半轮，整份种子
+    /// 会让下一轮请求带上一个没有配对结果的 tool_use——API 直接 400。
+    /// 同一函数 fork 也在用，两处共享一条截断规则。
+    ///
+    /// 返回的 `last_input_tokens` 让 auto-compact 在 resume 后的首轮即生效，
+    /// 不必等到第一次真实测量。
+    pub fn load_seed(&self) -> std::io::Result<(Vec<Message>, Option<u32>)> {
+        let loaded = self
+            .store
+            .load(&self.thread_id)?
+            .ok_or_else(|| std::io::Error::other("thread disappeared"))?;
+        let session = yi_agent_core::Session::from_messages(loaded.messages);
+        let seed = yi_agent_core::forkable_messages(&session);
+        let last_input = loaded.usage.as_ref().map(|u| u.input_tokens);
+        Ok((seed, last_input))
+    }
+
     #[cfg(test)]
     fn load_for_test(&self) -> std::io::Result<yi_agent_app_server::thread_store::LoadedThread> {
         Ok(self
@@ -395,6 +415,50 @@ mod tests {
             &loaded.messages[0].content[0],
             yi_agent_core::ContentBlock::Text(t) if t == "摘要"
         ));
+    }
+
+    #[test]
+    fn load_seed_drops_a_trailing_unpaired_tool_use() {
+        use yi_agent_core::ContentBlock;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+
+        // 一轮正常的问答 + 一条「assistant 发了 tool_use 但没结果」的半轮。
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text("hi".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text("hello".into())],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text("run it".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"cmd": "ls"}),
+                }],
+            },
+        ];
+        store.append_turn(&[], &messages, None, None).unwrap();
+
+        let (seed, _) = store.load_seed().unwrap();
+        // 末尾那条孤立 tool_use 必须被丢掉：带着它发下一轮请求，API 会 400
+        // （tool_use 没有配对的 tool_result）。
+        assert_eq!(
+            seed.len(),
+            3,
+            "末尾未配对的 tool_use 必须被裁掉，实际 {} 条",
+            seed.len()
+        );
+        assert_eq!(seed[2].role, Role::User);
     }
 
     #[test]

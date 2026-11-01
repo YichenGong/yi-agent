@@ -164,6 +164,8 @@ pub struct ThreadSession {
     /// **只在启动 driver 时取**，不覆盖多客户端订阅：同一个 app-server 里桌面
     /// 和手机共享同一 driver，本来就不存在双写。thread 从 `threads` 表移除时
     /// 随 `Arc` drop 自然释放，不额外写清理代码。
+    // 字段只为 RAII 持有：值一旦 drop，flock 就释放。没有读取方是设计如此。
+    #[allow(dead_code)]
     pub(crate) writer_lock: Option<Arc<crate::thread_store::ThreadWriterLock>>,
 }
 
