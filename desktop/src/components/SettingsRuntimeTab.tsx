@@ -6,13 +6,49 @@ import {
   type RuntimeSettingsCall,
 } from "../lib/runtimeSettings";
 
-const GROUP_LABELS: Record<string, string> = {
+export const GROUP_LABELS: Record<string, string> = {
   agent: "Agent",
-  compact: "压缩",
+  compact: "上下文压缩",
   startup: "启动",
+  tui: "终端通知",
 };
 
-const GROUP_ORDER = ["agent", "compact", "startup"];
+/** 每组一句话说明在管什么。后端新增分组时查不到就不渲染，不造空话。 */
+export const GROUP_HINTS: Record<string, string> = {
+  agent: "单次对话的执行上限与提示词覆盖",
+  compact: "上下文接近上限时的自动压缩策略",
+  tui: "命令行界面在回合结束时的提示方式",
+  startup: "启动时生效的默认档位",
+};
+
+/** 按「影响面从大到小」排：agent 是主循环，compact 是它的兜底，tui 是另一个前端。 */
+export const GROUP_ORDER = ["agent", "compact", "tui", "startup"];
+
+/**
+ * 枚举值的显示文案。**只影响显示**：提交给 `settings/write` 的永远是原始字符串。
+ *
+ * 不在此表里的字段（数字、自由文本）原样返回——这张表是「补充说明」而不是白名单，
+ * 后端将来加选项时前端不至于留空。
+ */
+const VALUE_LABELS: Record<string, Record<string, string>> = {
+  "startup.sandbox": {
+    "read-only": "只读",
+    "workspace-write": "工作区可写",
+    "danger-full-access": "完全访问",
+  },
+  "tui.notifications": { true: "开", false: "关" },
+  "tui.notification_method": { auto: "自动", osc9: "OSC 9（带正文）", bel: "响铃" },
+  "tui.notification_condition": { unfocused: "仅窗口失焦时", always: "总是" },
+};
+
+/**
+ * 字段值的中文显示。空串显示成破折号——它出现两处：`agent.system_prompt` 的
+ * `default_display`（默认就是「不覆盖」），以及用户清空输入框后的草稿值。
+ */
+export function labelFor(key: string, raw: string): string {
+  if (raw === "") return "—";
+  return VALUE_LABELS[key]?.[raw] ?? raw;
+}
 
 /**
  * 「运行参数」页。

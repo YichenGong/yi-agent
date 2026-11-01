@@ -1,7 +1,13 @@
 /** @vitest-environment jsdom */
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SettingsRuntimeTab } from "./SettingsRuntimeTab";
+import {
+  GROUP_HINTS,
+  GROUP_LABELS,
+  GROUP_ORDER,
+  SettingsRuntimeTab,
+  labelFor,
+} from "./SettingsRuntimeTab";
 
 afterEach(cleanup);
 
@@ -66,5 +72,28 @@ describe("SettingsRuntimeTab", () => {
     fireEvent.change(input, { target: { value: "0" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     expect(await screen.findByText(/must be at least 1/)).toBeTruthy();
+  });
+});
+
+describe("runtime settings labels", () => {
+  it("names every backend group in Chinese", () => {
+    // 与 yi-agent-runtime/src/settings.rs 的 FIELDS 分组一一对应。漏一个就会在页面上
+    // 露出英文组名（tui 曾经就是这样）。
+    expect(GROUP_ORDER).toEqual(["agent", "compact", "tui", "startup"]);
+    for (const group of GROUP_ORDER) {
+      expect(GROUP_LABELS[group]).toBeTruthy();
+      expect(GROUP_HINTS[group]).toBeTruthy();
+    }
+  });
+
+  it("translates enum values but keeps unknown ones verbatim", () => {
+    expect(labelFor("startup.sandbox", "workspace-write")).toBe("工作区可写");
+    expect(labelFor("tui.notification_method", "bel")).toBe("响铃");
+    // 后端将来加选项时，前端不该留空或抛错。
+    expect(labelFor("startup.sandbox", "some-future-mode")).toBe("some-future-mode");
+    // 没有映射表的字段（数字）原样返回。
+    expect(labelFor("agent.max_turns", "200")).toBe("200");
+    // `default_display` 可能是空串（agent.system_prompt），显示成破折号。
+    expect(labelFor("agent.system_prompt", "")).toBe("—");
   });
 });
