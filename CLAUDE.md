@@ -142,8 +142,9 @@ codesign -v "$APP"   # 应 exit 0
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
 - **提交前必须自检 `just ci` 全绿**(在 `yi-agent-rs/` 下),合并到 `main` 后再
   在合并结果上跑一次。它是 CI 的唯一入口(GitHub PR / GitLab MR 都只跑它),
-  涵盖 12 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
-  `test`、`build`、`bindings-check`、`secret-check` 等。少跑一次就可能让
+  涵盖 14 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
+  `test`、`build`、`bindings-check`、`secret-check` 等。实际清单以
+  `yi-agent-rs/justfile` 的 `ci:` 行为准(共 14 项依赖)。少跑一次就可能让
   `main` 直接变红;本地几分钟,比事后回滚便宜。
 
 ## 磁盘占用:`target/` 会无限膨胀
