@@ -64,7 +64,10 @@ impl Sidecar {
     pub fn new() -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
-            desired: Mutex::new(std::collections::HashSet::new()),
+            // 本地槽位从构造那一刻起就是 desired：它是内建的、常驻的，
+            // 没有任何「用户点了连接」的动作会去标记它。留空会让 `setup`
+            // 里的监督循环第一轮就退出，侧车永远起不来。
+            desired: Mutex::new(std::collections::HashSet::from([ProfileKey::Local])),
             last_errors: Mutex::new(HashMap::new()),
         }
     }
@@ -1355,6 +1358,21 @@ mod tests {
         assert_eq!(state.last_error(&b), None);
         state.clear_error(&b);
         assert_eq!(state.last_error(&a).as_deref(), Some("boom"));
+    }
+
+    /// 本地槽位**天生**就是 desired：App 一起来就要有 sidecar。
+    ///
+    /// 回归 `05234ef9`：`desired` 是空集，而只有 `remote_connect` 会写它，
+    /// 于是 `setup` 里 `spawn(Local)` 的监督循环第一轮就问出「不需要」，
+    /// 打印 `[local] no longer desired; supervisor stops` 后直接退出——
+    /// 侧车从未 spawn，界面永远停在「连接失败，正在重试」。
+    #[test]
+    fn the_local_slot_is_desired_from_construction() {
+        let state = Sidecar::new();
+        assert!(
+            state.is_desired(&ProfileKey::Local),
+            "本地槽位不需要任何人标记：App 启动就该有 sidecar"
+        );
     }
 
     /// 用户主动断开后，监督循环必须能看出「这次不该重连」。
