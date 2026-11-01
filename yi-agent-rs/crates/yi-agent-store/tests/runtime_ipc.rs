@@ -3380,6 +3380,12 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
     };
     factory.handles.lock().unwrap()[0].report_completed("partial result");
 
+    // 10ms 会把「超时必须发生」和「已完成报告必须已被编入本次返回值」混为一谈：
+    // `pending_id` 永不完成，超时是必然的，10ms 只是把它压到最短；但全量并发时
+    // daemon 调度抖动足以让它在 `report_completed` 落库可见之前就返回，于是
+    // `children`/`reports` 对不上（合并门禁实测 `expected bounded wait response`）。
+    // 200ms 与同文件 `daemon_wait_completed_report_wakes_before_timeout` 同量级：
+    // 对「等到报告」绰绰有余，对「必然超时」仍远小于任何断言级等待。
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::WaitAgent {
@@ -3387,7 +3393,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
-            timeout_ms: Some(10),
+            timeout_ms: Some(200),
         },
     )
     .unwrap();
