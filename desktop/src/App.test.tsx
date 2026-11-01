@@ -2179,6 +2179,49 @@ describe("App Superpowers 看板 enqueue", () => {
     ).toHaveLength(1);
   });
 
+  /**
+   * 顶栏「＋」→「预排队」是**容器级**动作：它发生在看板页，而看板页不属于任何
+   * 会话的讨论上下文（打开看板只改 `selectedBoard`，不动 `currentId`）。因此这里
+   * 投出去的卡不能带 `origin_thread_id`——`currentId` 是「上次打开的那条会话」，
+   * 与这张卡无关，甚至可能属于另一个项目。
+   *
+   * 会话内的溯源走另一条路径：会话里 `superpowers-kanban add-prequeued` 由宿主经
+   * `YI_AGENT_THREAD_ID` 注入，那里拿到的会话必然是这条讨论本身。
+   */
+  it("does not pin a discussion session on a card added from the board panel", async () => {
+    // 先开一条会话：`currentId` 非空，正是最容易串上脏值的态势。
+    state.threads = [{ thread_id: "t1", title: "discussion", permission_mode: "normal" }];
+    await openBoard();
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
+    fireEvent.change(screen.getByLabelText("预排队标题"), {
+      target: { value: "还没写 spec 的想法" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "预排队" }));
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter(
+          (r) =>
+            r.method === "plugin/query" &&
+            (r.params as { method?: string })?.method === "enqueue_prequeued",
+        ),
+      ).toHaveLength(1),
+    );
+    const [call] = clients[0].requests.filter(
+      (r) =>
+        r.method === "plugin/query" &&
+        (r.params as { method?: string })?.method === "enqueue_prequeued",
+    );
+    // 只有标题，没有来源会话。
+    expect((call.params as { params: Record<string, unknown> }).params).toEqual({
+      title: "还没写 spec 的想法",
+    });
+  });
+
   it("sends nothing when the picker is cancelled", async () => {
     await openBoard();
 
