@@ -127,6 +127,9 @@ pub struct RuntimeConfig {
     pub notification_method: String,
     /// `unfocused` / `always`（`tui.notification_condition`，默认 `unfocused`）。
     pub notification_condition: String,
+    /// 是否把项目名与运行状态写进终端标签页标题
+    /// （`tui.terminal_title`，默认 true）。
+    pub terminal_title: bool,
 }
 
 /// 来自 CLI flag 或 GUI 请求的纯数据覆盖项。不依赖 clap。
@@ -427,6 +430,11 @@ impl RuntimeConfig {
             .notification_condition
             .clone()
             .unwrap_or_else(|| "unfocused".to_string());
+        // 与 `notifications` 同理：存储侧是字符串，这里解析成 bool。
+        // 用 `!matches!(.., Some("false"))` 而不是 `== Some("true")`：
+        // 后者会让「键缺失」（最常见情况）得到 false，把默认的 true 变成
+        // false。
+        let terminal_title = !matches!(settings.tui.terminal_title.as_deref(), Some("false"));
 
         Ok(RuntimeConfig {
             provider,
@@ -455,6 +463,7 @@ impl RuntimeConfig {
             notifications,
             notification_method,
             notification_condition,
+            terminal_title,
         })
     }
 
@@ -530,6 +539,7 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         notifications: true,
         notification_method: "auto".to_string(),
         notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }
 
@@ -790,6 +800,45 @@ mod tests {
         assert!(cfg.notifications, "通知默认开启");
         assert_eq!(cfg.notification_method, "auto");
         assert_eq!(cfg.notification_condition, "unfocused");
+    }
+
+    #[test]
+    fn tui_terminal_title_reaches_runtime_config() {
+        // 端到端钉子：写进 settings.json 的值必须真的出现在 RuntimeConfig
+        // 上。缺了这条，字段名写错（比如 `tui.terminaltitle`）在编译期毫无
+        // 反应，用户改了配置却永远拿默认值。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"tui":{"terminal_title":"false"}}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!cfg.terminal_title, "explicit false must reach the config");
+    }
+
+    #[test]
+    fn tui_terminal_title_defaults_apply_when_absent() {
+        // 钉住 `!matches!(.., Some("false"))` 那行：键缺失时必须是 true。
+        // 若有人写成 `== Some("true")`，这条会红。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(cfg.terminal_title, "标题默认开启");
     }
 
     #[test]
