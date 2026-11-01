@@ -1306,6 +1306,7 @@ fn map_script_character(ch: char, superscript: bool) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     // Only the tests still name a raw color: the production path asks the
     // theme for a slot.
     use ratatui::style::Color;
@@ -2229,6 +2230,32 @@ mod tests {
                     "width {width}: line is {w} cols: {line:?}"
                 );
             }
+        }
+    }
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            ..ProptestConfig::default()
+        })]
+
+        /// 任意 markdown 输入都不 panic，且 width == 0 也不崩。
+        ///
+        /// 不用「不产生零宽行」这类性质：空输入渲染出的就是 1 个空行（宽度 0），
+        /// 那是合理行为，写成必须非零会对正确实现报假失败。
+        ///
+        /// case 数取 64（而非 256）：`just test` 用 `--all-features` 会打开
+        /// `syntax-highlight`（syntect），markdown 渲染在此路径下明显变慢。
+        #[test]
+        fn prop_never_panics(src in "\\PC{0,400}", width in 0u16..120) {
+            let lines = render_markdown(&src, width);
+            prop_assert!(
+                lines.len() <= src.chars().count() + 64,
+                "输出行数 {} 与输入长度 {} 不成比例，疑似死循环或爆炸",
+                lines.len(), src.chars().count()
+            );
         }
     }
 }

@@ -113,6 +113,7 @@ pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn preserves_runs_of_spaces_exactly() {
@@ -219,5 +220,82 @@ mod tests {
     fn empty_input_yields_one_empty_line() {
         let out = wrap_by_display_width("", 10, "", "");
         assert_eq!(out, vec![""]);
+    }
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        })]
+
+        /// 字符守恒：剥掉 prefix 后逐行拼接，必须与输入（去掉显式换行）逐字符相同。
+        ///
+        /// 这是本模块文档承诺的核心不变量：
+        /// "Wrapping here never alters a character."
+        /// 它也是「权限确认框里显示的命令必须与真正执行的完全一致」的底层保证。
+        #[test]
+        fn prop_preserves_every_character(
+            text in "\\PC{0,120}",
+            width in 1usize..60,
+            first_prefix in "[ ]{0,4}",
+            cont_prefix in "[ ]{0,4}",
+        ) {
+            let out = wrap_by_display_width(&text, width, &first_prefix, &cont_prefix);
+            let mut rebuilt = String::new();
+            for (i, line) in out.iter().enumerate() {
+                let p = if i == 0 { &first_prefix } else { &cont_prefix };
+                let body = line.strip_prefix(p.as_str())
+                    .unwrap_or_else(|| panic!("line {i} 缺少预期 prefix {p:?}: {line:?}"));
+                rebuilt.push_str(body);
+            }
+            let expected: String = text.chars().filter(|c| *c != '\n').collect();
+            prop_assert_eq!(rebuilt, expected, "字符被改动或丢失");
+        }
+
+        /// 不 panic：任意输入（含控制字符、超长 CJK、空串）都不得崩。
+        #[test]
+        fn prop_never_panics(
+            text in "\\PC{0,200}",
+            width in 0usize..120,
+            first_prefix in "\\PC{0,8}",
+            cont_prefix in "\\PC{0,8}",
+        ) {
+            let _ = wrap_by_display_width(&text, width, &first_prefix, &cont_prefix);
+        }
+
+        /// 宽度约束**仅在「可用宽度装得下一个最宽字符」时**成立。
+        ///
+        /// 两个前置条件都来自实测反例，缺任一条都会对正确实现报假失败：
+        ///
+        /// 1. `wrap_by_display_width("hello world", 5, ">>>>> ", ">>>>>> ")`
+        ///    产出 11 行、11 行全部超宽——prefix 比 width 宽时，
+        ///    `width.saturating_sub(prefix_width).max(1)` 把可用宽度兜到 1。
+        /// 2. `wrap_by_display_width("🤀﹔", 4, "  ", "   ")`——可用宽度
+        ///    `4-3=1`，而 CJK / emoji 字符本身占 2 列，单字符就必然超宽。
+        ///
+        /// 两者都是同一处 `.max(1)` 的有意降级：宁可超宽也要每行有内容，
+        /// 且绝不能丢字符（字符守恒由另一条性质守着）。故前置条件取
+        /// 「可用宽度 >= 2」即一个字符的最大显示宽度。
+        #[test]
+        fn prop_respects_width_when_prefix_fits(
+            text in "\\PC{0,120}",
+            width in 4usize..80,
+            first_prefix in "[ ]{0,3}",
+            cont_prefix in "[ ]{0,3}",
+        ) {
+            // 每个字符最宽占 2 列（CJK / emoji），可用宽度必须容得下它。
+            prop_assume!(UnicodeWidthStr::width(first_prefix.as_str()) + 2 <= width);
+            prop_assume!(UnicodeWidthStr::width(cont_prefix.as_str()) + 2 <= width);
+            let out = wrap_by_display_width(&text, width, &first_prefix, &cont_prefix);
+            for line in &out {
+                prop_assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= width,
+                    "行宽 {} 超过上限 {}：{:?}",
+                    UnicodeWidthStr::width(line.as_str()), width, line
+                );
+            }
+        }
     }
 }
