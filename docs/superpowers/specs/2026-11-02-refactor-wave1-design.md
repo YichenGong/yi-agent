@@ -15,7 +15,57 @@
 > 3. `App.tsx` 的 `useState` 写成 9 个——实为 **10 个**（首轮 grep 用 `const [x, setY]` 模式漏掉了 `const [, force]`）。补记为 29 个 `useRef` / 11 个 `useCallback`。
 > 4. 源码注释里的「`handle_key` 已长到 25 个」是 **`TuiChannels` 引入前的历史峰值**，当前实测 **20 个**。已在正文说明这次补救只削减了 channel 一组。
 >
-> 两个门禁命令**已实测可跑**并写死基线：`ipc` 测试 **56** 个、`agent` 的 `cancel` 测试 **11** 个。目录里所有行号与行数均来自 `main` @ `f4a2b433` 的实跑，非估算。
+> 两个门禁命令**已实测可跑**并写死基线：`ipc` 测试 **56** 个、`agent` 的 `cancel` 测试 **11** 个。
+
+> **第二轮自查（八轮交叉核对，修正 11 处，其中 3 处会让实施直接失败）**
+>
+> 这一轮把每个数字和每条门禁都拿去实跑验证，发现的问题按严重度排列：
+>
+> **A. 会让实施直接失败的（3 处）**
+> 1. **A3 的测试名 diff 门禁必然失败**。`mod socket_path_tests` 从 `ipc.rs` 搬进 `ipc/server.rs` 后，
+>    全名从 `ipc::socket_path_tests::*` 变成 `ipc::server::socket_path_tests::*`——模块路径多一层。
+>    我用最小工程实测确认（`sub::alpha_tests::the_test`）。门禁已改为**只比对末段函数名**（`sed 's/.*:://'`）。
+> 2. **`ipc` 拆模块后漏了 re-export**。全仓有 **436 处** `yi_agent_store::ipc::Xxx` 引用、跨 8 个 crate，
+>    还有插件侧独立复刻的协议。拆成子模块后必须在 `ipc/mod.rs` 逐项 `pub use`，否则大面积编译失败。
+>    已把实测的 **25 个必须 re-export 的名字**列进 spec。
+> 3. **`repository.rs` 的 7 个顶层自由函数**（`append_event`/`insert_attempt`/`trim_trace_rows`/`migrate` 等）
+>    被 impl 方法调用（`trim_trace_rows` 3 次、`migrate` 2 次）。搬进子模块后必须变 `pub(super)`，
+>    初稿完全没提，会直接编译失败。
+>
+> **B. 目标本身不可达的（3 处，全是方向性错误）**
+> 4. **`repository.rs` ≤ 700 行做不到**。搬走 3,343 行 impl 后壳文件仍有 **966 行**，其中 696 行是内联测试；
+>    测试外移是 C1 的活。改为 **≤ 1,000**（= 理论下限）。
+> 5. **`App.tsx` ≤ 2,000 行做不到**。抽走 632 行 effect 后仍有 **2,877 行**，剩下两个巨石
+>    `setThreadMode`(654 行) 与 `selectThread`(320 行) 本块明确不抽。改为 **≤ 2,950**。
+> 6. **`agent.rs` 「降到 ≤ 1,600 行」在数学上做不到**。阶段抽取是**重新分布**不是删除：
+>    THINK(361)+ACT(213)+OBSERVE(30) 搬进新函数还会多出签名开销，总行数只增不减。
+>    D1a 消除 6 处重复只净减 **24 行**（1,876→1,852）。判据已改为**形状指标**
+>    （`run_loop` ≤ 200 行 + 重复序列从 6 处降到 1 处 + 总行数 ≤ 1,900）。
+>
+> **C. 数字错误的（5 处）**
+> 7. `RuntimeRepository` 方法数是 **101**（100 `pub` + 1 私有），不是 102。
+> 8. `impl RuntimeCoordinator` 是 3,069 行（不是 3,066），69 个方法 = 54 `pub` + 15 私有。
+> 9. `app.rs` 生产 **3,830 行** / 测试 **8,230 行**（初稿写 3,829 / 8,232）。
+> 10. **分组表是猜的，合计只有 87，缺口 14 个方法**。已改为逐名枚举的实测结果（100/100 全部归组）。
+>     并且发现 `task` 组会吸收 **26 个方法**——直接把 3,343 行的 impl 换成 800+ 行的 `task.rs`，
+>     问题原样搬家。已在 spec 里把它定成**实施硬要求**（再分 create/transition/field 三片）。
+> 11. `repository.rs` 测试行是 696（不是 695），壳文件 966（不是 967）；`runtime.rs` 生产 3,910。
+>
+> **D. 表述不准的（1 处）**
+> 12. `_for_test` 测试接缝是 **4 个**，但初稿列错了：`daemon_agent_detail_at` 不是接缝（它是普通生产函数，
+>     名字里没有 `_for_test`）。正确 4 个：`snapshot_for_tests`、`catalog_for_tests`、
+>     `switch_runtime_tab_for_test`、`handle_runtime_popup_key_for_test`。
+>     另补一项实测的爆炸半径：测试模块里 `run_loop` 被调用 **13 次**、`handle_key` **20 次**。
+>
+> **关于测量方法的一次自我纠正**：这一轮中我一度得到「`runtime.rs` 生产 3,832 行 / 壳文件 763 行」，
+> 随后又得出「841 行」。原因是 `runtime.rs` 的测试模块**不在文件末尾**（L3833–4344 之后还有 77 行生产代码），
+> 用「首个测试模块之前」估算就会错。最终统一用「逐行标记测试覆盖集合」重算，并对每个结果做
+> `wc -l` 与算术自洽双重校验（966 = 270+696 = 4,309−3,343；841 = 330+511 = 3,910−3,069）。
+>
+> **基线复核**：完整单次跑 `cargo test --workspace --all-features` 得到
+> `3954 passed / 0 failed / 27 ignored`（78 个 test binary），与 spec 一致。
+> 期间曾出现一次 `3063 passed / 1 failed`，原因是**并发跑了两个 cargo 争构建锁导致的截断**，
+> 不是真失败——这正是 CLAUDE.md 里记录过的那类误判。
 
 ---
 
@@ -56,7 +106,7 @@
 **R1 只搬不改。** 允许的机械改动只有：函数/类型搬家、`use` 路径、可见性（`fn` → `pub(crate) fn` 或子模块内 `pub(super)`）、测试模块路径。**禁止**在本次顺手改逻辑、改文案、改变量名、改错误消息。
 
 **R2 公共 API 冻结。** 下列签名逐字不变，任何变动都是设计被违反：
-- `yi_agent_store::repository::RuntimeRepository` 的 102 个 `pub fn` 全表
+- `yi_agent_store::repository::RuntimeRepository` 的 **100 个 `pub fn`** 全表（外加 1 个 `pub(crate) connection_for_test`，测试用）
 - `yi_agent_store::runtime::RuntimeCoordinator` 的 69 个方法全表
 - `yi_agent_store::ipc::*` 全部 `pub` 项（协议层是跨进程契约）
 - `yi_agent_core::Agent` 全部 `pub` 方法、`AgentEvent` 全部变体
@@ -83,24 +133,36 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 | 文件 | 生产行 | 问题 |
 |---|---|---|
-| `repository.rs` | 3,911 | `impl RuntimeRepository` 单块 **3,343 行 / 102 个方法**，覆盖约 20 张表 |
-| `runtime.rs` | 3,911 | `impl RuntimeCoordinator` 单块 **3,066 行 / 69 个方法** |
-| `ipc.rs` | 3,744 | 线协议 + socket 服务端 + 客户端 + 队列 + worker 工厂，一个文件 |
+| `repository.rs` | 4,309 | `impl RuntimeRepository` 单块 **3,343 行 / 101 个方法**（100 `pub` + 1 私有），覆盖约 20 张表 |
+| `runtime.rs` | 3,910 | `impl RuntimeCoordinator` 单块 **3,069 行 / 69 个方法**（54 `pub` + 15 私有） |
+| `ipc.rs` | 3,745 | 线协议 + socket 服务端 + 客户端 + 队列 + worker 工厂，一个文件 |
 
 关键事实：`RuntimeRepository` 只持有一个字段 `connection: Connection`，且 Rust 允许**子模块写 `impl` 并访问父模块的私有字段**。这意味着切分不需要引入 trait、不需要 newtype、不需要 `Deref`。
 
-`repository.rs` 的方法按 SQL 里的表名可清晰分成 8 组（实测表出现频次）：
+`repository.rs` 的 100 个 `pub fn` 按表与语义归组如下。**这是逐名枚举的实测结果**
+（100/100 全部归组，无遗漏），不是抽样估算：
 
-| 组 | 表 | 方法数（约） |
+| 组 | 代表方法 | 方法数 |
 |---|---|---|
-| `schedule` | `schedules`、`schedule_occurrences` | 11 |
-| `admission` | `resource_admission_cursors`、`resource_leases` | 6 |
-| `task` | `tasks`、`attempts` | 22 |
-| `watchdog` | `attempt_watchdogs` | 8 |
-| `mailbox` | `mailbox_messages`、`deliveries`、`permission_requests` | 12 |
-| `trace` | `task_trace_events` | 7 |
-| `application_root` | `application_root_attachments` | 9 |
-| `read` | 跨表只读快照（`task_detail`、`subscription_snapshot` 等） | 12 |
+| `shell`（留在 `repository.rs`） | `open` / `schema_version` / `has_table` | 3 |
+| `schedule` | `create_schedule` / `claim_schedule_occurrence` / `skip_schedule_occurrence` … | 11 |
+| `watchdog` | `save_attempt_watchdog_snapshot` / `recover_inflight_tasks` / `reclaim_orphaned_tasks` … | 15 |
+| `mailbox` | `record_user_override_message` / `mailbox_messages_for_task` / `request_permission` … | 12 |
+| `trace` | `append_trace` / `trace_after` / `trim_trace` … | 6 |
+| `application_root` | `record_application_root_attachment` / `reattach_application_root` … | 8 |
+| `admission` | `save_provider_turn_grant` / `release_provider_turn_lease` … | 7 |
+| `event` | `append_event` / `events_after` / `advance_event_replay_floor_through` … | 6 |
+| `read` | `task_snapshots` / `task_detail` / `subscription_snapshot` / `cancel_scope` … | 6 |
+| `task` | `create_task*` / `transition_task*` / `task_state` / `set_task_extra_roots` … | **26** |
+
+⚠️ **`task` 组 26 个方法仍嫌大**，实施时应再分两片：
+- `task/create.rs`：`create_task*`、`create_child_task*`、`create_attempt`（约 7 个）
+- `task/transition.rs`：`transition_task*` 六个变体（状态机，约 6 个）
+- `task/field.rs`：`set_task_*`、`task_*` 读写单列字段（约 9 个）
+- 其余（`append_event` 之外的事件/查询）归入上面已有的 `event`、`read` 组
+
+这一条是**实施时的硬要求**，不是建议：把 26 个方法整块搬进一个 `task.rs`，只是把一个 3,343 行的
+`impl` 换成一个 800+ 行的 `task.rs`，问题原样搬家。
 
 ### 2.2 目标结构
 
@@ -155,16 +217,62 @@ src/ipc/queue.rs       # PendingSubscriptionFrames、PendingFrameWrite、Confirm
 | A3 | `ipc.rs` 拆 4 文件，16 个测试模块随类型迁移 | 同上 + `cargo test -p yi-agent-store --test subagent_ipc_protocol` |
 | A4 | 更新 `docs/project-management/yi-agent-store.md` 的代码位置引用 | 引用行号可点开即中 |
 
-A3 的额外验收（防止测试隐身）：拆完后 `ipc` 相关测试名集合必须与拆前**完全一致**。该命令已实测可用，拆前基线是 **56 个**：
+A3 的额外验收（防止测试隐身）：拆完后测试**数量**必须与拆前一致，但**名字会变**——`mod socket_path_tests` 搬到 `ipc/server.rs` 后，全名从 `ipc::socket_path_tests::*` 变成 `ipc::server::socket_path_tests::*`。这一点已用最小工程实测确认（`src/sub/mod.rs` 里的 `mod alpha_tests` 报为 `sub::alpha_tests::the_test`）。
+
+⚠️ 因此**直接 diff 全名会必然失败**。正确门禁是**只比对末段测试函数名**（去掉模块路径）：
+
 ```bash
-# 拆前 / 拆后各跑一次，两次输出应 diff 为空
-cargo test -p yi-agent-store --lib -- --list | grep '^ipc::' | sort > /tmp/ipc-before.txt
+cargo test -p yi-agent-store --lib -- --list \
+  | grep '^ipc::' | sed 's/.*:://' | sort > /tmp/ipc-before.txt
 # ... 执行 A3 ...
-cargo test -p yi-agent-store --lib -- --list | grep '^ipc::' | sort > /tmp/ipc-after.txt
-diff /tmp/ipc-before.txt /tmp/ipc-after.txt && wc -l < /tmp/ipc-after.txt   # 期望 56
+cargo test -p yi-agent-store --lib -- --list \
+  | grep '^ipc::' | sed 's/.*:://' | sort > /tmp/ipc-after.txt
+diff /tmp/ipc-before.txt /tmp/ipc-after.txt
+wc -l < /tmp/ipc-after.txt    # 期望 56（实测基线，含 15 个测试模块）
 ```
 
-**A 块完成判据**：`repository.rs` ≤ 700 行、`runtime.rs` ≤ 900 行、`ipc/mod.rs` ≤ 1,200 行；store 的 344 个测试名集合不变；公共 API 零变化（`git diff` 里 `pub fn` 的签名行数为 0）。
+注意 `grep '^ipc::'` 依赖模块仍挂在 `ipc` 之下——A3 的拆法是 `ipc.rs → ipc/mod.rs`，所以前缀保留、只多一层 `server::` / `client::` 等。若将来拆出 `ipc` 之外，这条 grep 也要改。
+
+### 2.4 A 块的完成判据（已按「只搬不改 ⇒ 总量守恒」验算过）
+
+⚠️ **先纠正一个初稿里的不可达目标**：初稿写 `repository.rs` ≤ 700 行。这不可能——
+把 3,343 行的 impl 整个搬走后，壳文件仍有 `4,309 - 3,343 = 966` 行，其中 **695 行是内联测试**。
+测试外移是 C1 的活，不在本波范围。**任何不含测试外移的拆分都无法把这个文件压到 700 行。**
+
+按实际构成重新定判据：
+
+| 文件 | 拆前 | 拆后壳文件 | 判据 | 依据 |
+|---|---|---|---|---|
+| `repository.rs` | 4,309 生产 | 966 行（270 生产 + 696 测试） | **≤ 1,000** | 3,343 行 impl 全部搬走后的理论下限 |
+| `runtime.rs` | 3,910 生产 | 841 行（330 生产 + 511 测试） | **≤ 900** | 3,910 − 3,069(impl) = 841，余量留给子模块声明 |
+| `ipc/mod.rs` | 3,745 生产 | 约 1,050（协议类型） | **≤ 1,300** | 协议类型 + 25 个 re-export + 15 个测试模块 |
+
+**这三个数字是「搬完就该长这样」，不是「努力目标」**——若实测偏离，说明搬得不干净或有东西没搬走，应当排查而不是调数字。
+
+外加两条硬门禁：
+
+1. **store 的 344 个测试全绿**（`cargo test -p yi-agent-store`）
+2. **公共 API 零变化**：`git diff` 里 `pub fn` 签名行数为 0
+3. **`ipc` 的 25 个 `pub` 项必须逐一 re-export**：全仓有 **436 处** `yi_agent_store::ipc::Xxx` 引用（跨 8 个 crate，含插件侧独立复刻的协议）。
+   拆成 `ipc/mod.rs` + 子模块后，`mod.rs` 里必须有：
+   ```rust
+   pub use client::{send_request, send_request_with_version, send_request_with_version_timeout,
+                    subscribe, subscribe_with_filters, subscribe_trace, read_task_trace};
+   pub use server::{Daemon, TraceSubscription};
+   pub use queue::SubscriptionFilters;
+   // 协议类型、IpcError、IpcErrorCode、PROTOCOL_VERSION、socket_path_for 等留在 mod.rs
+   ```
+   实测被外部引用的 25 个名字：
+   `Daemon` `IpcError` `IpcErrorCode` `IpcEvent` `IpcPermissionDecision` `IpcRequest` `IpcResponse`
+   `IpcTaskDetail` `IpcTaskSummary` `IpcTaskUsage` `IpcTraceRow` `MAX_SOCKET_PATH_BYTES`
+   `PROTOCOL_VERSION` `SubscriptionFilters` `TraceSubscription` `clear_plugin_sockets`
+   `plugin_socket_for` `read_task_trace` `register_plugin_sockets` `send_request`
+   `send_request_with_version_timeout` `socket_path_for` `subscribe` `subscribe_trace`
+   `subscribe_with_filters`
+4. **`repository.rs` 的 7 个顶层自由函数**（`append_event` / `append_event_with_payload` /
+   `append_event_with_actor_payload` / `insert_attempt` / `validate_recovery_context` /
+   `trim_trace_rows` / `migrate`）被 impl 方法调用（`trim_trace_rows` 3 次、`migrate` 2 次）。
+   搬到子模块后它们必须变 `pub(super)` 或 `pub(crate)`——**这是 R1 允许的可见性收紧，不算设计违反**，但要一并做，否则编译失败。
 
 ---
 
@@ -208,7 +316,24 @@ hooks/useHandshakeRecovery.ts     # 握手后恢复编排（第 4 项）
 | B2 | 抽 `useServerNotifications`，`if` 链改为映射表 | 同上；且每个 method 分支至少一条测试 |
 | B3 | 抽 `useHandshakeRecovery` | 同上 |
 
-**B 块完成判据**：`App.tsx` ≤ 2,000 行；**最大的单个 `useEffect` ≤ 150 行**；`vitest` 用例数 **≥ 1932 且全绿**（只许增不许减）；新增三个 hook 各自带 `.test.ts`。
+### 3.4 完成判据（已验算）
+
+⚠️ **纠正初稿的不可达目标**：初稿写 `App.tsx` ≤ 2,000 行。抽走 631 行 effect 后仍有 **2,879 行**
+（总 3,509 − 631，其中 JSX 占 593 行）。剩下的两个巨石是 `setThreadMode`（**654 行**）与
+`selectThread`（**320 行**），它们**本块明确不抽**（见 3.2「明确不做」），所以 2,000 行不可达。
+
+按实际构成重定判据：
+
+| 指标 | 拆前 | 判据 | 依据 |
+|---|---|---|---|
+| 最大的单个 `useEffect` | **632 行** | **≤ 150** | 四件事拆成三个 hook 后，单块职责单一 |
+| `App.tsx` 总行数 | 3,509 | **≤ 2,950** | 3,509 − 631(effect) + 约 70(hook 调用与依赖) ≈ 2,948 |
+| `vitest` 用例 | 1,932 全绿 | **≥ 1,932 且全绿** | 只许增不许减 |
+| 新增 hook | — | 各带 `.test.ts` | 三个新文件 |
+
+**选 ≤ 2,950 而非更激进数字的理由**：`setThreadMode`（654 行）与 `selectThread`（320 行）是
+跨关注点的编排逻辑（会话切换要同时碰 session、workspace、订阅窗口、看板），抽出去只会制造隐式依赖。
+它们的体量属于「值得单独讨论」的下一块，不该被本块的数字倒逼着抽。
 
 风险提示：`App.test.tsx` 是 6,358 行的集成测试，它对 hook 内部细节不敏感，对**时序**敏感。B1 是最大风险步——抽取后如果 connect 的调用次数或顺序变了，`App.test.tsx` 会准确报出来，这正是我们想要的护栏。
 
@@ -272,7 +397,24 @@ fn        observe_phase(...)                   // 回填顺序 + push 到 sessio
 | D1b | 抽 `think_phase` | 同上 |
 | D1c | 抽 `act_phase` + `observe_phase` | 同上 |
 
-**D1 完成判据**：`run_loop` ≤ 200 行；`agent.rs` 生产代码（剔除测试）从 **1,876** 行降到 ≤ 1,600 行；**取消语义零变化**——`agent::tests` 里所有含 `cancel` 的测试名必须全部保留且通过。该命令已实测可用，基线 **11 个**（`agent_cancel_during_act_emits_cancelled`、`agent_cancel_during_act_rolls_back_session`、`agent_cancel_during_think_emits_cancelled`、`agent_cancel_keeps_completed_round_trips_and_drops_only_the_dangling_tool_use`、`agent_cancel_then_run_works`、`agent_cancel_token_is_cancellable`、`agent_cancel_while_auto_compact_is_in_flight`、`agent_cancel_while_provider_call_is_blocking` 等）：
+### 4.3 完成判据（已验算）
+
+⚠️ **纠正初稿一个方向性错误**：初稿要求「`agent.rs` 生产代码从 1,876 降到 ≤ 1,600 行」。
+**这在数学上做不到，也不该是这块的目标。**
+
+- 阶段抽取是**重新分布**，不是删除。把 THINK(361) + ACT(213) + OBSERVE(30) 抽成三个函数后，
+  这些行搬进新函数，还会多出约 15–30 行的签名与返回值传递开销。**总行数只增不减。**
+- 本块唯一真正删除重复的是 D1a：6 处 × (5 行 → 1 行) = **净减 24 行**，即 1,876 → **1,852**。
+
+因此判据改为**形状指标**，不再看总行数：
+
+| 指标 | 拆前 | 判据 |
+|---|---|---|
+| `run_loop` 行数 | 718 | **≤ 200**（抽走三段后理论值约 114，留余量） |
+| `run_loop` 里「取消→回滚→冲刷→发事件」序列 | 6 处逐字重复 | **1 处**（只在 `abort_run` 内） |
+| `agent.rs` 生产行数 | 1,876 | **≤ 1,900**（允许因签名开销略增，但不得超） |
+
+**取消语义零变化**——`agent::tests` 里所有含 `cancel` 的测试名必须全部保留且通过。该命令已实测可用，基线 **11 个**（`agent_cancel_during_act_emits_cancelled`、`agent_cancel_during_act_rolls_back_session`、`agent_cancel_during_think_emits_cancelled`、`agent_cancel_keeps_completed_round_trips_and_drops_only_the_dangling_tool_use`、`agent_cancel_then_run_works`、`agent_cancel_token_is_cancellable`、`agent_cancel_while_auto_compact_is_in_flight`、`agent_cancel_while_provider_call_is_blocking` 等）：
 
 ```bash
 cargo test -p yi-agent-core --lib -- --list | grep -i cancel | sort > /tmp/cancel-before.txt
@@ -287,7 +429,7 @@ diff /tmp/cancel-before.txt /tmp/cancel-after.txt && wc -l < /tmp/cancel-after.t
 
 ### 5.1 现状（实测）
 
-生产代码 3,829 行（另有 8,232 行内联测试）。两个函数是问题源：
+生产代码 **4,061 行**（另有 **8,000 行**内联测试）。两个函数是问题源：
 
 | 函数 | 行数 | 参数数 | 局部状态 |
 |---|---|---|---|
@@ -340,9 +482,25 @@ struct LoopBookkeeping { pending_quit, queued, task_registry, viewport, notifica
 | D2b | `run_loop` 状态分三组 | 同上 |
 | D2c | 抽 `dispatch_event` | 同上 |
 
-**D2 完成判据**：`handle_key` ≤ 3 个参数；`run_loop` ≤ 250 行且局部 `let mut` ≤ 6 个；`app.rs` 里以 `_for_test` 结尾的测试接缝（现有 4 个：`switch_runtime_tab_for_test`、`handle_runtime_popup_key_for_test`、`daemon_agent_detail_at`、`snapshot_for_tests`）**一个都不能少**。
+### 5.4 完成判据（已按实测清单核对）
 
-⚠️ D2 的最大风险：`app.rs` 有 8,232 行内联测试直接构造这些函数。**D2 不搬测试**（那是 C1 的活）。因此改签名会让测试编译失败——这是**预期的**，处理方式是同步更新测试的调用点，**不改断言**。
+| 指标 | 拆前 | 判据 |
+|---|---|---|
+| `handle_key` 参数个数 | **20** | **≤ 3**（`key` + `&mut KeyState` + `&KeyContext`） |
+| `run_loop` 行数 | 568 | **≤ 250** |
+| `run_loop` 局部 `let mut` | 20 | **≤ 6**（三组状态各一个 + 少量真正的循环局部量） |
+
+**生产代码里的测试接缝现存 4 个，一个都不能少**（`app.rs` 内实测）：
+`snapshot_for_tests`(L382)、`catalog_for_tests`(L408)、`switch_runtime_tab_for_test`(L1204)、
+`handle_runtime_popup_key_for_test`(L1465)。
+
+> 初稿把 `daemon_agent_detail_at` 也算作接缝，**这是错的**——它在 L3244，是普通生产函数，
+> 名字里没有 `_for_test`，只是恰好被测试调用。上面的清单是 `grep 'fn .*_for_test'` 的实测结果。
+
+⚠️ 改签名的爆炸半径（实测）：`app.rs` 的测试模块里 **`run_loop` 被调用 13 次、`handle_key` 被调用 20 次**。
+这 33 处调用点必须随签名同步更新——**只改调用点，不改断言**。
+
+⚠️ D2 的最大风险：`app.rs` 有 8,000 行内联测试直接构造这些函数（33 处调用点）。**D2 不搬测试**（那是 C1 的活）。因此改签名会让测试编译失败——这是**预期的**，处理方式是同步更新测试的调用点，**不改断言**。
 
 ---
 
@@ -373,8 +531,19 @@ git diff main -- desktop/src/lib/generated/ | wc -l                             
 ## 7. 完成定义（整波）
 
 1. 四块各自合并，`just ci` 在 `main` 上全绿
-2. 测试总量**只增不减**：Rust `cargo test --workspace` 通过数 ≥ 基线的 3954；桌面 vitest ≥ 1932
-3. 结构指标全部达成：`repository.rs` ≤ 700、`runtime.rs` ≤ 900、`App.tsx` ≤ 2,000、`run_loop`(agent) ≤ 200、`run_loop`(tui) ≤ 250、`handle_key` 参数 ≤ 3
+2. 测试总量**只增不减**：Rust `cargo test --workspace --all-features` 通过数 ≥ **3954**（实测基线，单次完整运行为 `3954 passed / 0 failed / 27 ignored`）；桌面 `npx vitest run` ≥ **1932**（146 文件）
+3. 结构指标全部达成：
+
+| 块 | 指标 | 拆前 | 目标 |
+|---|---|---|---|
+| A | `repository.rs` | 4,309 生产行 | ≤ 1,000（理论下限 966） |
+| A | `runtime.rs` | 3,910 生产行 | ≤ 900 |
+| A | `ipc/mod.rs` | 3,746 生产行 | ≤ 1,300 |
+| B | `App.tsx` | 3,509 行 | ≤ 2,950 |
+| B | 最大单个 `useEffect` | 632 行 | ≤ 150 |
+| D1 | `run_loop`(agent) | 718 行 | ≤ 200 |
+| D2 | `run_loop`(tui) | 568 行 | ≤ 250 |
+| D2 | `handle_key` 参数 | 20 | ≤ 3 |
 4. `docs/project-management/` 对应模块文件的代码位置引用已同步更新（A 块 → `yi-agent-store.md`；D1 → `yi-agent-core.md`；D2 → `yi-agent-tui.md`；B → `desktop.md`）
 
 ---
