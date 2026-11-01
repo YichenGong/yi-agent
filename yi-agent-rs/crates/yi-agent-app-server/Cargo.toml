@@ -19,6 +19,8 @@ ts-rs = { version = "11", features = ["serde-compat"] }
 yi-agent-core = { workspace = true }
 yi-agent-runtime = { workspace = true }
 yi-agent-flags = { workspace = true }
+# 保活策略与平台断言。app-server 是唯一持有断言的进程（见 spec「为什么是单一持有者」）。
+yi-agent-power = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-subagent = { workspace = true }
 # `skill/list` / `skill/read` 枚举与读取三层 skill 根。

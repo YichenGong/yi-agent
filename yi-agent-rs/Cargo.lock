@@ -4992,6 +4992,7 @@ dependencies = [
  "yi-agent-core",
  "yi-agent-flags",
  "yi-agent-mcp",
+ "yi-agent-power",
  "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-skills",
@@ -5063,6 +5064,14 @@ dependencies = [
  "tracing",
  "wiremock",
  "yi-agent-core",
+]
+
+[[package]]
+name = "yi-agent-power"
+version = "0.1.12"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

@@ -93,6 +93,13 @@ pub struct AgentSettings {
     pub system_prompt: Option<String>,
     #[serde(default, deserialize_with = "de_optional_usize")]
     pub skills_catalog_budget: Option<usize>,
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// 存字符串而不是 `Option<bool>`：`FIELDS` 的 `Text`/`Select` 只接受 JSON
+    /// 字符串（`validate_value`），用 `Option<bool>` 会让设置页写进 `"true"`
+    /// 后反序列化读不回来。与 `tui.notifications` 完全同构。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub prevent_idle_sleep: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +170,18 @@ pub struct FieldSpec {
     pub max: Option<u64>,
 }
 
+/// 开关的点路径键。多处引用同一常量，避免字符串抄错。
+pub const PREVENT_IDLE_SLEEP_KEY: &str = "agent.prevent_idle_sleep";
+
+/// 开关是否打开。缺文件 / 空串 / 未知值一律按默认（开）处理，与
+/// `tui.notifications` 的兜底一致。
+pub fn prevent_idle_sleep_enabled(settings: &Settings) -> bool {
+    match settings.agent.prevent_idle_sleep.as_deref() {
+        Some(value) => !value.eq_ignore_ascii_case("false"),
+        None => true,
+    }
+}
+
 /// 可持久化的全部字段。`workdir` 与 `yolo` 不在其中，见 spec「存储」一节。
 pub static FIELDS: &[FieldSpec] = &[
     FieldSpec {
@@ -222,6 +241,17 @@ pub static FIELDS: &[FieldSpec] = &[
         options: &[],
         min: Some(1),
         max: Some(u32::MAX as u64),
+    },
+    FieldSpec {
+        key: PREVENT_IDLE_SLEEP_KEY,
+        group: "agent",
+        label: "干活期间防止休眠",
+        field_type: FieldType::Select,
+        default_display: "true",
+        description: "有网且（插电 或 有活在跑）时阻止系统空闲休眠；条件消失 15 分钟后恢复",
+        options: &["true", "false"],
+        min: None,
+        max: None,
     },
     FieldSpec {
         key: "compact.ratio",
@@ -495,6 +525,15 @@ impl Settings {
                     "settings.json has an unknown tui.notification_condition; falling back to the default"
                 );
                 self.tui.notification_condition = None;
+            }
+        }
+        if let Some(enabled) = self.agent.prevent_idle_sleep.as_deref() {
+            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
+                tracing::warn!(
+                    value = enabled,
+                    "settings.json has an unknown agent.prevent_idle_sleep; falling back to the default"
+                );
+                self.agent.prevent_idle_sleep = None;
             }
         }
         if let Some(sandbox) = self.startup.sandbox.as_deref() {
@@ -1360,5 +1399,64 @@ malformed line
             value.get("tui").is_none(),
             "empty tui group must be pruned, got {text}"
         );
+    }
+
+    #[test]
+    fn prevent_idle_sleep_defaults_to_enabled() {
+        let settings = Settings::default();
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    #[test]
+    fn prevent_idle_sleep_honours_false() {
+        let mut settings = Settings::default();
+        settings.agent.prevent_idle_sleep = Some("false".to_string());
+        assert!(!prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 未知值在 `normalized` 里被清成 `None`，于是读取端按默认（开）处理。
+    #[test]
+    fn an_unknown_prevent_idle_sleep_falls_back_to_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":"yes"}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.prevent_idle_sleep, None);
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 空串等于未设置。
+    #[test]
+    fn an_empty_prevent_idle_sleep_is_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":""}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.agent.prevent_idle_sleep, None);
+    }
+
+    /// 整份 JSON 坏掉时 `load_from` 返回默认值，即开关回到「开」。
+    ///
+    /// 方向是刻意的：坏文件下**不能**让保活失效（那正是「夜里跑着跑着睡了」
+    /// 的原始故障），所以兜底偏向「继续保活」。用户在设置页重新保存一次即可
+    /// 修正文件。
+    #[test]
+    fn a_corrupt_settings_file_still_enables_prevention() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let settings = load_from(&path);
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// `"FALSE"` / `"False"` 也算关闭——大小写不敏感。
+    /// 设置页写的是小写，但用户手改文件时不该因为大小写就悄悄打开。
+    #[test]
+    fn prevent_idle_sleep_is_case_insensitive() {
+        for raw in ["false", "FALSE", "False"] {
+            let mut settings = Settings::default();
+            settings.agent.prevent_idle_sleep = Some(raw.to_string());
+            assert!(!prevent_idle_sleep_enabled(&settings), "{raw} must disable");
+        }
     }
 }

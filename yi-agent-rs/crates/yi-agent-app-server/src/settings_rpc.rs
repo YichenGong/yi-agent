@@ -50,6 +50,9 @@ fn current_value(current: &settings::Settings, spec: &FieldSpec) -> Value {
         "agent.max_resident_subagents" => option_to_json(current.agent.max_resident_subagents),
         "agent.system_prompt" => option_to_json(current.agent.system_prompt.as_deref()),
         "agent.skills_catalog_budget" => option_to_json(current.agent.skills_catalog_budget),
+        settings::PREVENT_IDLE_SLEEP_KEY => {
+            option_to_json(current.agent.prevent_idle_sleep.as_deref())
+        }
         "compact.ratio" => option_to_json(current.compact.ratio),
         "compact.user_budget_tokens" => option_to_json(current.compact.user_budget_tokens),
         "compact.tool_budget_tokens" => option_to_json(current.compact.tool_budget_tokens),
