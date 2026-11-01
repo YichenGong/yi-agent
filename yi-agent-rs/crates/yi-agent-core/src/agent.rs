@@ -4237,9 +4237,14 @@ mod tests {
         let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
 
         let stream = agent.run("hang".into()).await.unwrap();
+        // 不在此处断言 `!cancel_tool_call("t1")`：`run()` 在返回 stream 之前就已
+        // `tokio::spawn` 了 run_loop,所以"批次尚未开始"这个时间点在外部根本不可
+        // 观测——后台可能已经跑到注册 token 那一行,断言会随机失败(满载下更明显)。
+        // 想覆盖"未注册的 id 返回 false"这层语义,用一个本 run 永远不会出现的 id
+        // 来问,它不依赖任何时序。
         assert!(
-            !agent.cancel_tool_call("t1"),
-            "no call is registered before the batch starts"
+            !agent.cancel_tool_call("no-such-call"),
+            "an id that was never registered must report false"
         );
 
         // Kill the call once it is actually in flight: wait for the run loop to

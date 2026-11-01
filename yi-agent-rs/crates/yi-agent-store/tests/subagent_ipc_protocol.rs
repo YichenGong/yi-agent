@@ -11,9 +11,16 @@ use yi_agent_store::ipc::{
 };
 use yi_agent_store::repository::{RuntimeEvent, RuntimeRepository};
 
+/// 读一帧响应。
+///
+/// 超时是**失败判据**而不是节流器：这里要区分"daemon 真没回"与"daemon 只是
+/// 排队慢"。原先 500ms 在满载（全量并发跑测试）下会把后者判成前者——
+/// `fragmented_status_frames_preserve_request_correlation` 单跑要发 75 轮、
+/// 2850 次写，任一往返稍慢就撞线，表现为偶发 flaky。放宽到 30s 后仍能抓住
+/// 真正挂死的 daemon（那时读完就是超时），但不再因调度抖动误杀。
 fn read_response(stream: UnixStream) -> Option<Value> {
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let mut line = String::new();
     let read = BufReader::new(stream).read_line(&mut line).unwrap();
