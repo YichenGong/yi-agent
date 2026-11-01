@@ -16,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use yi_agent_core::AgentEvent;
+use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
@@ -230,6 +230,89 @@ fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> boo
     match condition {
         crate::tui::notify::Condition::Always => true,
         crate::tui::notify::Condition::Unfocused => !focused,
+    }
+}
+
+/// 待发通知。优先级数字小的压过数字大的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NotificationPriority {
+    TurnComplete = 0,
+    ApprovalRequested = 1,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNotification {
+    priority: NotificationPriority,
+    text: String,
+}
+
+/// 把 `AgentEvent` 收敛成「至多一条待发通知」。
+///
+/// 不直接写字节：通知必须等这一帧画完再发，否则会插进 ANSI 序列中间，
+/// 把一帧切开造成渲染残影。
+#[derive(Debug, Default)]
+struct NotificationState {
+    pending: Option<PendingNotification>,
+}
+
+impl NotificationState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 观察一个事件，可能更新候选通知。
+    ///
+    /// `enabled` 为假时什么都不做；`history` 用于取回合正文（`Done` 不带
+    /// 正文），必须在 `push_event` **之前**调用——`push_event` 会在末尾压
+    /// 一条 `Separator`，`last_assistant_text` 也就还能跳过它找到正文。
+    fn observe(&mut self, event: &AgentEvent, history: &HistoryState, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        let candidate = match event {
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            } => Some(PendingNotification {
+                priority: NotificationPriority::TurnComplete,
+                text: history
+                    .last_assistant_text()
+                    .map(crate::tui::notify::text::summarize)
+                    .unwrap_or_else(|| crate::tui::notify::text::EMPTY_FALLBACK.to_string()),
+            }),
+            AgentEvent::PermissionRequest {
+                tool_name,
+                tool_input,
+                ..
+            } => Some(PendingNotification {
+                priority: NotificationPriority::ApprovalRequested,
+                text: format!(
+                    "等待批准: {}",
+                    crate::tui::notify::text::truncate_graphemes(
+                        &crate::tui::history::permission_summary(tool_name, tool_input),
+                        crate::tui::notify::text::MAX_GRAPHEMES,
+                    )
+                ),
+            }),
+            _ => None,
+        };
+
+        let Some(candidate) = candidate else { return };
+        match &self.pending {
+            // 同优先级或更高优先级的已有候选不被覆盖：一轮里先到的权限
+            // 请求不该被随后的回合完成盖掉。
+            Some(existing) if existing.priority >= candidate.priority => {}
+            _ => self.pending = Some(candidate),
+        }
+    }
+
+    /// 取出并清空。绘制完成后调用。
+    fn take(&mut self) -> Option<PendingNotification> {
+        self.pending.take()
+    }
+
+    #[cfg(test)]
+    fn pending_text(&self) -> Option<&str> {
+        self.pending.as_ref().map(|p| p.text.as_str())
     }
 }
 
@@ -512,6 +595,29 @@ fn run_loop<B: Backend, E: EventSource>(
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
 
+    // 终端通知：候选在这里攒着，等这一帧画完再 flush（见下面 `notifications.take()`）。
+    let mut notifications = NotificationState::new();
+    let notifications_enabled = config.notifications;
+    let focused = std::sync::atomic::AtomicBool::new(true);
+    let mut notifier = {
+        let method = crate::tui::notify::Method::parse(&config.notification_method)
+            .unwrap_or(crate::tui::notify::Method::Auto);
+        let condition = crate::tui::notify::Condition::parse(&config.notification_condition)
+            .unwrap_or(crate::tui::notify::Condition::Unfocused);
+        // 终端拒绝了焦点事件时 `unfocused` 无从判定，按 always 处理：
+        // 宁可多弹一次，也不要静默到用户以为功能坏了。
+        let condition = if config.focus_degraded {
+            crate::tui::notify::Condition::Always
+        } else {
+            condition
+        };
+        crate::tui::notify::Notifier::new(
+            method,
+            condition,
+            &crate::tui::notify::TerminalEnv::from_process(),
+        )
+    };
+
     loop {
         let size = terminal.size()?;
         let width = size.width;
@@ -608,6 +714,9 @@ fn run_loop<B: Backend, E: EventSource>(
             if let AgentEvent::ModelChanged { model: new_model } = &event {
                 current_model = new_model.clone();
             }
+            // 必须在 `push_event` 之前：`Done` 不带正文，只能从 history 反查，
+            // 而 `push_event` 会立刻压一条 `Separator`。
+            notifications.observe(&event, history, notifications_enabled);
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
@@ -748,6 +857,15 @@ fn run_loop<B: Backend, E: EventSource>(
                 theme,
             );
         })?;
+
+        // 通知只在两帧之间发：插在帧中间会把 ANSI 序列切断，留下渲染残影。
+        if let Some(pending) = notifications.take() {
+            let is_focused = focused.load(std::sync::atomic::Ordering::Relaxed);
+            if should_notify(notifier.condition(), is_focused) {
+                let _ = notifier.notify(&pending.text);
+            }
+        }
+
         sync_trace_streams(
             &mut trace_streams,
             &mut runtime_popup,
@@ -757,6 +875,9 @@ fn run_loop<B: Backend, E: EventSource>(
 
         // Poll for events with timeout (33ms → ~30hz refresh)
         match events.poll(Duration::from_millis(33))? {
+            Some(event @ (Event::FocusGained | Event::FocusLost)) => {
+                apply_focus_event(&event, &focused);
+            }
             Some(Event::Key(key)) => {
                 // Ctrl+P opens the runtime popup (bash tasks tab) when no popup
                 // is active. Tab then switches to the managed-processes tab.
@@ -11307,6 +11428,154 @@ mod runtime_restart_notice_tests {
             text.contains("重启"),
             "the dialog never mentions a restart: {text}"
         );
+    }
+}
+
+/// 终端通知的纯逻辑：事件 → 候选通知、焦点 → 是否发送。
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use crate::tui::history::HistoryState;
+
+    #[test]
+    fn turn_complete_uses_last_assistant_text() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let mut history = HistoryState::new();
+        history.push_event(AgentEvent::AssistantText("已完成重构".into()), 80);
+
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("已完成重构"));
+    }
+
+    #[test]
+    fn turn_complete_without_text_falls_back() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("yi-agent 回合完成"));
+    }
+
+    #[test]
+    fn permission_request_outranks_turn_complete() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        state.observe(
+            &AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "cargo test" }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("等待批准: cargo test"));
+    }
+
+    #[test]
+    fn lower_priority_candidate_does_not_replace_higher() {
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+
+        state.observe(
+            &AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "rm -rf /" }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            &history,
+            true,
+        );
+        state.observe(
+            &AgentEvent::Done {
+                reason: yi_agent_core::DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("等待批准: rm -rf /"));
+    }
+
+    #[test]
+    fn non_notifying_events_are_ignored() {
+        use yi_agent_core::DoneReason;
+        let history = HistoryState::new();
+        for event in [
+            AgentEvent::Done {
+                reason: DoneReason::MaxTurns,
+            },
+            AgentEvent::Done {
+                reason: DoneReason::Interrupted {
+                    reason: "user".into(),
+                },
+            },
+            AgentEvent::Cancelled,
+            AgentEvent::Error(yi_agent_core::AgentError::ProviderTurnAdmission(
+                "boom".into(),
+            )),
+        ] {
+            let mut state = NotificationState::new();
+            state.observe(&event, &history, true);
+            assert_eq!(state.pending_text(), None, "{event:?} must not notify");
+        }
+    }
+
+    #[test]
+    fn disabled_notifications_produce_nothing() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            false,
+        );
+        assert_eq!(state.pending_text(), None);
+    }
+
+    #[test]
+    fn flush_clears_pending() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        let taken = state.take();
+        assert!(taken.is_some());
+        assert_eq!(state.pending_text(), None);
     }
 
     #[test]
