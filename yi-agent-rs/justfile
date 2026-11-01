@@ -36,6 +36,44 @@ build:
 build-release:
     cargo build --workspace --release
 
+# === 质量度量（不进 ci，见 docs/superpowers/specs/2026-11-02-quality-hardening-wave2-design.md） ===
+
+# 只卡「本次新增行」的覆盖率，不设全仓总阈值。
+#
+# 为什么不设总阈值：全仓行覆盖已 90.11%，设总阈值只会被存量拉平、失去信号。
+# 为什么是手动 recipe 而非 pre-push hook：必须用独立 CARGO_TARGET_DIR 全量重编
+# （占用 7.2 GB、165s 起），塞进每次 push 必被 --no-verify 绕过，等于没有。
+#
+# 前置条件：全量测试必须全绿。任何测试失败都会让 cargo llvm-cov 以 exit 101
+# 中止且不产出 lcov 文件（实测确认 --no-fail-fast 也不行）。
+#
+# 必须在 git 根比对：diff-cover 用 `git diff` 的仓库相对路径（yi-agent-rs/...）
+# 匹配 lcov 的绝对路径，在 yi-agent-rs/ 下运行会一条都匹配不上并输出
+# "No lines with coverage information in this diff." 后 exit 0 —— 门禁静默失效。
+ci-patch base="main" min="60":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DC="$HOME/.local/share/yi-agent-tools/venv/bin/diff-cover"
+    if [ ! -x "$DC" ]; then DC="$(command -v diff-cover)"; fi
+    if [ ! -x "$DC" ]; then
+        echo "找不到 diff-cover。安装：python3 -m venv ~/.local/share/yi-agent-tools/venv && ~/.local/share/yi-agent-tools/venv/bin/pip install diff-cover" >&2
+        exit 1
+    fi
+    LCOV_ABS="$PWD/target/llvm-cov-target"
+    mkdir -p "$LCOV_ABS"
+    CARGO_TARGET_DIR="$LCOV_ABS" cargo llvm-cov --workspace --lcov \
+        --output-path "$LCOV_ABS/lcov.info"
+    # diff-cover 必须从 git 根运行：它拿 `git diff` 的仓库相对路径
+    # （yi-agent-rs/crates/...）去比对 lcov 里的绝对路径。在 yi-agent-rs/ 下运行
+    # 时一条都匹配不上，于是输出 "No lines with coverage information in this
+    # diff." 并 exit 0 —— 门禁静默失效（2026-11-02 实测）。cd 到 git 根后报告才正确。
+    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    echo "提示：$LCOV_ABS 占约 7.2 GB，回收用 rm -rf $LCOV_ABS"
+    cd "$GIT_ROOT"
+    "$DC" "$LCOV_ABS/lcov.info" \
+        --compare-branch="{{base}}" \
+        --fail-under="{{min}}"
+
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
