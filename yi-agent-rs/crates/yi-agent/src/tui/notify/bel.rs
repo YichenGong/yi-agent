@@ -51,4 +51,16 @@ mod tests {
     fn bel_is_a_single_byte() {
         assert_eq!(BEL_SEQUENCE, "\u{7}");
     }
+
+    /// 断言 `Command` 真正写出的字节，而不只是常量。`notify` 走的是
+    /// `crossterm::execute!` → `write_ansi` 这条链，只测常量的话把
+    /// `write_ansi` 改成空实现仍然全绿，用户却收不到任何通知。
+    #[test]
+    fn the_command_writes_exactly_one_bel() {
+        use crossterm::Command;
+        let mut out = String::new();
+        PostNotification.write_ansi(&mut out).unwrap();
+        assert_eq!(out, "\u{7}");
+        assert_eq!(out.as_bytes(), b"\x07");
+    }
 }

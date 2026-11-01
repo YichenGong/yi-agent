@@ -390,4 +390,38 @@ mod tests {
         assert!(!notifier.uses_osc9());
         assert_eq!(notifier.effective_backend(), "bel");
     }
+
+    /// `cargo test` 的 stdout 不是 TTY，所以这条恰好覆盖了 `notify` 的第一道
+    /// 短路：必须返回 `Ok` 而不是报错，且不能把后端标记为失效——否则在
+    /// 管道/重定向环境里跑一次就会永久静音本会话。
+    #[test]
+    fn notify_is_a_no_op_when_stdout_is_not_a_tty() {
+        if std::io::stdout().is_terminal() {
+            // 有人在真终端里跑测试时这条不成立，跳过而不是给出假结论。
+            eprintln!("skip: stdout is a tty");
+            return;
+        }
+        let mut notifier = Notifier::new(Method::Bel, Condition::Always, &env(&[]));
+        let result = notifier.notify("hello");
+        assert!(
+            result.is_ok(),
+            "non-tty must not surface an error: {result:?}"
+        );
+        assert!(
+            !notifier.is_disabled(),
+            "a non-tty run must not disable the notifier for the rest of the session"
+        );
+        assert_eq!(notifier.effective_backend(), "bel");
+    }
+
+    #[test]
+    fn a_disabled_notifier_stays_quiet_and_ok() {
+        // 直接构造「已失效」状态：写失败后 `notify` 必须继续返回 `Ok`，
+        // 否则事件循环里的 `let _ =` 之外还会有人把它当错误处理。
+        let mut notifier = Notifier::new(Method::Bel, Condition::Always, &env(&[]));
+        notifier.backend = None;
+        assert!(notifier.is_disabled());
+        assert_eq!(notifier.effective_backend(), "disabled");
+        assert!(notifier.notify("hello").is_ok());
+    }
 }

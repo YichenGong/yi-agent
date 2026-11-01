@@ -186,7 +186,7 @@ mod tests {
 - [x] **Step 4: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify::text
 ```
 
 Expected: 编译失败，报 `cannot find function `sanitize` in this scope`。
@@ -308,7 +308,7 @@ fn strip_ordered_list(line: &str) -> Option<&str> {
 - [x] **Step 6: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::text
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify::text
 ```
 
 Expected: PASS（11 个测试）。
@@ -405,7 +405,7 @@ pub mod osc9;
 - [x] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify
 ```
 
 Expected: 编译失败，报 `cannot find function `encode`` 与 `cannot find value `BEL_SEQUENCE``。
@@ -531,7 +531,7 @@ impl BelBackend {
 - [x] **Step 4: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify
 ```
 
 Expected: PASS（5 个测试）。
@@ -672,7 +672,7 @@ mod tests {
 - [x] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify::tests
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify::tests
 ```
 
 Expected: 编译失败，报 `cannot find type TerminalEnv`。
@@ -920,7 +920,7 @@ impl Notifier {
 - [x] **Step 4: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::notify
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::notify
 ```
 
 Expected: PASS（全部 notify 测试）。若 `uses_osc9` 在非 test 构建下报 dead_code，说明它被错误地加上了 `#[cfg(test)]`——保留该属性即可，它只在测试里用。
@@ -994,7 +994,7 @@ fn last_assistant_text_ignores_reasoning_blocks() {
 - [x] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::history::tests::last_assistant_text
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::history::tests::last_assistant_text
 ```
 
 Expected: 编译失败，报 `no method named `last_assistant_text``。
@@ -1024,7 +1024,7 @@ Expected: 编译失败，报 `no method named `last_assistant_text``。
 - [x] **Step 4: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::history
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::history
 ```
 
 Expected: PASS，且原有 `permission_summary_*` 三条测试仍绿。
@@ -1478,7 +1478,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "feat(
 - [x] **Step 4: 编译并跑快照测试**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::slash
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::slash
 ```
 
 Expected: PASS。若 `/config` 已有整屏快照测试，会因新增一行而失败——此时更新该快照的期望值，**不要**删掉通知行。
@@ -1538,7 +1538,7 @@ fn should_notify_respects_condition() {
 - [x] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::app::tests::should_notify
 ```
 
 Expected: 编译失败，`cannot find function `should_notify``。
@@ -1628,7 +1628,7 @@ fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> boo
 - [x] **Step 4: 跑测试确认通过**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent --lib tui::app::tests::should_notify && cargo check -p yi-agent
+cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::app::tests::should_notify && cargo check -p yi-agent
 ```
 
 Expected: PASS + 编译无错。
@@ -1982,7 +1982,25 @@ cd yi-agent-rs && cargo fmt --all --check && cargo clippy -p yi-agent -p yi-agen
 
 Expected: 无输出（fmt 通过）+ clippy 无 warning。
 
-- [x] **Step 5: 手工验收（本机 macOS）**
+- [x] **Step 4b: 跑 `just ci` 全量门禁**
+
+```bash
+cd yi-agent-rs && just ci
+```
+
+Expected: 末尾输出 `CI passed`，`EXIT=0`。它是 CI 的唯一入口（12 道门禁），
+覆盖 `fmt-check` / `lint`（`clippy --all-targets`，含**全 workspace** 与测试代码）/
+`test` / `build` / `bindings-check` / `secret-check` 等。
+
+**这一步不能省略**：`cargo test -p <单个 crate>` 只验证你想到的那几个 crate，
+本功能新增了 `RuntimeConfig` 的必填字段，`yi-agent-subagent` 的 8 处测试夹具
+就因为「只跑了 4 个 crate」被漏掉，直到 `just ci` 的 `lint` 门禁才暴露。
+
+- [ ] **Step 5: 手工验收（本机 macOS，需要真人 + 真实终端）**
+
+> **状态：未执行。** 实现与自动化验证已完成，但这一步需要人眼确认
+> 「系统通知真的弹出来了」——通知是终端/系统层面的行为，无法由 `cargo test`
+> 断言。合入前请由人按下面步骤走一遍。
 
 在真实终端里跑：
 
@@ -2018,11 +2036,11 @@ cd yi-agent-rs && cargo fmt --all && cd .. && git add -A && git commit -m "test(
 
 | # | 判据 | 命令 / 操作 |
 |---|---|---|
-| 1 | 摘要与消毒纯函数正确 | `cargo test -p yi-agent --lib tui::notify::text` |
-| 2 | 协议字节正确（含 tmux 包裹） | `cargo test -p yi-agent --lib tui::notify` |
+| 1 | 摘要与消毒纯函数正确 | `cargo test -p yi-agent --bin yi-agent tui::notify::text` |
+| 2 | 协议字节正确（含 tmux 包裹） | `cargo test -p yi-agent --bin yi-agent tui::notify` |
 | 3 | 五家白名单 / 其余 BEL | 同上（`whitelist_terminals_support_osc9` 等） |
-| 4 | 焦点条件生效 | `cargo test -p yi-agent --lib tui::app::tests::should_notify` |
-| 5 | 优先级与去抖 | `cargo test -p yi-agent --lib tui::app::tests::permission_request_outranks_turn_complete` |
+| 4 | 焦点条件生效 | `cargo test -p yi-agent --bin yi-agent tui::app::tests::should_notify` |
+| 5 | 优先级与去抖 | `cargo test -p yi-agent --bin yi-agent tui::app::tests::permission_request_outranks_turn_complete` |
 | 6 | 配置非法值只清单字段 | `cargo test -p yi-agent-runtime --lib settings::tests::invalid_notification_method_is_dropped_not_fatal` |
 | 7 | 设置页能读写三项 | `cargo test -p yi-agent-app-server --lib every_tui_notification_field` |
 | 8 | 通知出现在两帧之间 | 手工验收第 1-3 步（无残影） |

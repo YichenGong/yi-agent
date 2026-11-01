@@ -69,6 +69,22 @@ impl Osc9Backend {
 mod tests {
     use super::*;
 
+    /// `write_ansi` 是 `notify` 真正走的路径，必须与 `encode` 逐字节一致。
+    #[test]
+    fn the_command_writes_the_encoded_bytes() {
+        use crossterm::Command;
+        for (message, dcs) in [("hi", false), ("hi", true), ("a\u{1b}b", false)] {
+            let mut out = String::new();
+            PostNotification {
+                message: message.to_string(),
+                dcs_passthrough: dcs,
+            }
+            .write_ansi(&mut out)
+            .unwrap();
+            assert_eq!(out, encode(message, dcs), "dcs={dcs} message={message:?}");
+        }
+    }
+
     #[test]
     fn plain_encodes_osc9() {
         assert_eq!(encode("hello", false), "\u{1b}]9;hello\u{7}");
