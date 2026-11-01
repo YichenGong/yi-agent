@@ -1343,4 +1343,161 @@ bash = true
             "关联根不该被写入本会话的 .yi-agent"
         );
     }
+    /// 每个工具层开关单独打开时都必须真的放行。
+    ///
+    /// 缺了这条，`tool_level_allows` 里对应的 match arm 被删掉也不会红：
+    /// 删除后落入 `_ => false`，而默认配置全是 false，两者结果相同。
+    /// cargo-mutants 的 `:192/:193/:194/:195` 四个「delete match arm」
+    /// 变异体正是靠这类用例才被杀死。
+    #[test]
+    fn check_tool_level_each_tool_allows_when_enabled() {
+        let cases: [(&str, fn(&mut ToolLevelConfig)); 4] = [
+            ("process_start", |c| c.process_start = true),
+            ("process_kill", |c| c.process_kill = true),
+            ("write", |c| c.write = true),
+            ("edit", |c| c.edit = true),
+        ];
+        for (tool, enable) in cases {
+            let mut tool_level = ToolLevelConfig::default();
+            enable(&mut tool_level);
+            let config = PermissionsConfig {
+                tool_level,
+                ..Default::default()
+            };
+            let checker = checker_with(config, false);
+            let input = match tool {
+                "write" | "edit" => serde_json::json!({"path": "/tmp/probe.txt"}),
+                _ => serde_json::json!({"command": "probe"}),
+            };
+            assert!(
+                matches!(checker.check(tool, &input), CheckResult::Allow),
+                "{tool} 工具层开关为 true 时必须 Allow"
+            );
+        }
+    }
+
+    /// `apply_decision` 的 `AlwaysAllowTool` 分支里，每种工具都要真的写进配置。
+    /// 缺了这条，`:296/:297/:299` 三个「delete match arm」变异体存活——
+    /// 删除后落入 `_ => {}`，配置不变，但没有测试会红。
+    #[tokio::test]
+    async fn apply_always_allow_tool_covers_every_arm() {
+        let cases: [(&str, fn(&ToolLevelConfig) -> bool); 3] = [
+            ("process_start", |c| c.process_start),
+            ("process_kill", |c| c.process_kill),
+            ("edit", |c| c.edit),
+        ];
+        for (tool, read) in cases {
+            let tmpdir = tempfile::tempdir().unwrap();
+            let workdir = tmpdir.path().to_path_buf();
+            let blocklist: BlocklistFn = Arc::new(|_| None);
+            let checker = PermissionChecker::new(
+                PermissionsConfig::default(),
+                crate::autonomy::YoloSwitch::new(false),
+                workdir.clone(),
+                blocklist,
+            );
+
+            checker
+                .apply_decision(tool, &Decision::AlwaysAllowTool, &PermissionKind::Normal)
+                .await
+                .unwrap();
+
+            let loaded = PermissionChecker::load(&workdir).await.unwrap();
+            assert!(
+                read(&loaded.tool_level),
+                "{tool} 的 AlwaysAllowTool 必须落盘到 tool_level"
+            );
+        }
+    }
+
+    /// `write` / `edit` 的 `AlwaysAllowPrefix` 重复添加必须去重。
+    ///
+    /// 缺了这条，`:312/:315` 的「match guard 恒为 true」变异体存活：
+    /// 守卫失效后同一路径被反复 push，配置文件无限膨胀。
+    /// 现有 `apply_always_allow_prefix_bash_no_duplicate` 只覆盖 bash。
+    #[tokio::test]
+    async fn apply_always_allow_prefix_write_and_edit_dedupe() {
+        let cases: [(&str, fn(&mut PermissionsConfig, Vec<String>)); 2] = [
+            ("write", |c, v| c.prefix_level.write.paths = v),
+            ("edit", |c, v| c.prefix_level.edit.paths = v),
+        ];
+        for (tool, seed) in cases {
+            let tmpdir = tempfile::tempdir().unwrap();
+            let workdir = tmpdir.path().to_path_buf();
+            let mut config = PermissionsConfig::default();
+            seed(&mut config, vec!["src/**".to_string()]);
+
+            let blocklist: BlocklistFn = Arc::new(|_| None);
+            let checker = PermissionChecker::new(
+                config,
+                crate::autonomy::YoloSwitch::new(false),
+                workdir.clone(),
+                blocklist,
+            );
+
+            checker
+                .apply_decision(
+                    tool,
+                    &Decision::AlwaysAllowPrefix("src/**".to_string()),
+                    &PermissionKind::Normal,
+                )
+                .await
+                .unwrap();
+
+            let loaded = PermissionChecker::load(&workdir).await.unwrap();
+            let paths = match tool {
+                "write" => &loaded.prefix_level.write.paths,
+                _ => &loaded.prefix_level.edit.paths,
+            };
+            assert_eq!(paths.len(), 1, "{tool} 不得重复添加已有前缀");
+        }
+    }
+
+    /// 配置文件存在但读不出来时必须报错，不得静默降级为默认配置。
+    ///
+    /// 这是安全相关的：静默降级意味着损坏的 `permissions.toml` 被忽略，
+    /// 权限全部回落到默认（更宽松）配置，而用户完全不知情。
+    /// 覆盖变异体 `:350:23` 的 `"with true"`——它把兜底 `Err(e) => Err(...)`
+    /// 改成了 `Ok(default)`，只有非 NotFound 的读取失败才能杀死它。
+    ///
+    /// 实测确认有效载荷：无效 UTF-8 字节 → `ErrorKind::InvalidData`（非 NotFound）。
+    /// 不用「把目录当文件读」是因为那返回 `IsADirectory`，跨平台行为不一致。
+    #[tokio::test]
+    async fn load_unreadable_config_returns_error_not_default() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir = tmpdir.path().join(".yi-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("permissions.toml"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let result = PermissionChecker::load(tmpdir.path()).await;
+        assert!(
+            result.is_err(),
+            "损坏的配置文件必须报错，实际得到 {result:?}"
+        );
+    }
+
+    /// `is_yolo` 是两个方向都要测的：改成恒 true 或恒 false 都必须被抓到。
+    /// 在此之前 `permission.rs` 内零直接断言，仅靠 `runtime/src/bootstrap.rs`
+    /// 的跨 crate 间接覆盖，故 `:127` 的 `with true` / `with false` 双双存活。
+    #[test]
+    fn is_yolo_reflects_the_switch() {
+        let config = PermissionsConfig::default();
+        let blocklist: BlocklistFn = Arc::new(|_| None);
+
+        let on = PermissionChecker::new(
+            config.clone(),
+            crate::autonomy::YoloSwitch::new(true),
+            std::path::PathBuf::from("/tmp"),
+            blocklist.clone(),
+        );
+        assert!(on.is_yolo(), "YoloSwitch(true) 时 is_yolo 必须为 true");
+
+        let off = PermissionChecker::new(
+            config,
+            crate::autonomy::YoloSwitch::new(false),
+            std::path::PathBuf::from("/tmp"),
+            blocklist,
+        );
+        assert!(!off.is_yolo(), "YoloSwitch(false) 时 is_yolo 必须为 false");
+    }
 }
