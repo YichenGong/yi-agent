@@ -43,6 +43,7 @@ const VALUE_LABELS: Record<string, Record<string, string>> = {
     "danger-full-access": "完全访问",
   },
   "tui.notifications": { true: "开", false: "关" },
+  "tui.terminal_title": { true: "开", false: "关" },
   "power.prevent_idle_sleep": { true: "开", false: "关" },
   "tui.notification_method": { auto: "自动", osc9: "OSC 9（带正文）", bel: "响铃" },
   "tui.notification_condition": { unfocused: "仅窗口失焦时", always: "总是" },

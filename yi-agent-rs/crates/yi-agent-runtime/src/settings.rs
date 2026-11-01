@@ -136,6 +136,13 @@ pub struct TuiSettings {
     /// `unfocused` / `always`；`None` = `unfocused`。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub notification_condition: Option<String>,
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// 与同组三个通知键同构：必须是字符串而不是 `Option<bool>`，因为
+    /// `FIELDS` 的 `Select` / `Text` 只接受 JSON 字符串，用 `Option<bool>`
+    /// 会导致设置页写进 `"true"` 后反序列化读不回来。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub terminal_title: Option<String>,
 }
 
 /// 电源与休眠设置。
@@ -374,6 +381,17 @@ pub static FIELDS: &[FieldSpec] = &[
         field_type: FieldType::Select,
         default_display: "true",
         description: "回合完成或等待批准时发送终端通知；空表示用默认（开）",
+        options: &["true", "false"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.terminal_title",
+        group: "tui",
+        label: "终端标题",
+        field_type: FieldType::Select,
+        default_display: "true",
+        description: "在终端标签页标题里显示项目名与运行状态；空表示用默认（开）",
         options: &["true", "false"],
         min: None,
         max: None,
@@ -641,6 +659,15 @@ impl Settings {
                     "settings.json has an unknown tui.notifications; falling back to the default"
                 );
                 self.tui.notifications = None;
+            }
+        }
+        if let Some(enabled) = self.tui.terminal_title.as_deref() {
+            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
+                tracing::warn!(
+                    value = enabled,
+                    "settings.json has an unknown tui.terminal_title; falling back to the default"
+                );
+                self.tui.terminal_title = None;
             }
         }
         if let Some(method) = self.tui.notification_method.as_deref() {
@@ -1519,6 +1546,7 @@ malformed line
         assert!(settings.tui.notifications.is_none());
         assert!(settings.tui.notification_method.is_none());
         assert!(settings.tui.notification_condition.is_none());
+        assert!(settings.tui.terminal_title.is_none());
     }
 
     #[test]
@@ -1527,6 +1555,7 @@ malformed line
             "tui.notifications",
             "tui.notification_method",
             "tui.notification_condition",
+            "tui.terminal_title",
         ] {
             assert!(
                 find_spec(key).is_some(),
@@ -1586,6 +1615,27 @@ malformed line
             settings.tui.notification_condition.as_deref(),
             Some("always")
         );
+    }
+
+    #[test]
+    fn invalid_terminal_title_flag_is_dropped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"terminal_title":"maybe"}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(
+            settings.tui.terminal_title, None,
+            "an unknown value must fall back to the default, not abort"
+        );
+    }
+
+    #[test]
+    fn valid_terminal_title_values_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"terminal_title":"false"}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.tui.terminal_title.as_deref(), Some("false"));
     }
 
     #[test]

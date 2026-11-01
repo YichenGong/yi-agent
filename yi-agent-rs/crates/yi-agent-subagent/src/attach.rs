@@ -497,6 +497,7 @@ mod tests {
             notifications: true,
             notification_method: "auto".to_string(),
             notification_condition: "unfocused".to_string(),
+            terminal_title: true,
         }
     }
 
@@ -681,6 +682,7 @@ mod tests {
             notifications: true,
             notification_method: "auto".to_string(),
             notification_condition: "unfocused".to_string(),
+            terminal_title: true,
         };
         let socket = directory.path().join("runtime.sock");
 
@@ -731,6 +733,7 @@ mod tests {
             notifications: true,
             notification_method: "auto".to_string(),
             notification_condition: "unfocused".to_string(),
+            terminal_title: true,
         };
         let socket = directory.path().join("runtime.sock");
 

@@ -54,6 +54,7 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         notifications: true,
         notification_method: "auto".to_string(),
         notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }
 

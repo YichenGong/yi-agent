@@ -302,6 +302,12 @@ pub struct TuiConfigSnapshot {
     pub notification_condition: String,
     /// `auto` 解析后的实际后端。
     pub effective_backend: String,
+    /// 是否写终端标签标题（`tui.terminal_title`，默认 true）。
+    pub terminal_title: bool,
+    /// 标题状态：`on` / `off` / `disabled (multiplexer)`。
+    ///
+    /// `disabled (write failed)` 属运行期状态，而这是启动快照，看不到它。
+    pub title_status: String,
     /// 终端拒绝启用焦点事件时为真；此时 `unfocused` 实际退化为 `always`。
     pub focus_degraded: bool,
 }
@@ -332,7 +338,7 @@ impl TuiConfigSnapshot {
                 self.effective_backend.as_str()
             },
             self.notification_condition,
-        )
+        ) + &format!("\n  terminal title: {}", self.title_status)
     }
 }
 
@@ -1242,6 +1248,8 @@ mod tests {
             notification_method: "auto".into(),
             notification_condition: "unfocused".into(),
             effective_backend: "osc9".into(),
+            terminal_title: true,
+            title_status: "on".into(),
             focus_degraded: false,
         };
         let text = snap.render("claude-sonnet-4-5");
@@ -1263,6 +1271,10 @@ mod tests {
         assert!(
             text.contains("condition=unfocused"),
             "config must show the condition: {text}"
+        );
+        assert!(
+            text.contains("terminal title: on"),
+            "title status must be visible in /config: {text}"
         );
         assert!(!text.to_lowercase().contains("api_key"));
         assert!(!text.to_lowercase().contains("api-key"));

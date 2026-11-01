@@ -64,6 +64,7 @@ fn current_value(current: &settings::Settings, spec: &FieldSpec) -> Value {
         "tui.notification_condition" => {
             option_to_json(current.tui.notification_condition.as_deref())
         }
+        "tui.terminal_title" => option_to_json(current.tui.terminal_title.as_deref()),
         // `FIELDS` 与这里的 match 必须同步。漏一个就会静默返回 null，
         // 故有一条测试遍历 FIELDS 断言每个键都能取到值。
         _ => Value::Null,

@@ -1532,6 +1532,7 @@ mod resolve_tests {
             notifications: true,
             notification_method: "auto".to_string(),
             notification_condition: "unfocused".to_string(),
+            terminal_title: true,
         }
     }
 

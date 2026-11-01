@@ -199,6 +199,8 @@ describe("runtime settings labels", () => {
   it("translates enum values but keeps unknown ones verbatim", () => {
     expect(labelFor("startup.sandbox", "workspace-write")).toBe("工作区可写");
     expect(labelFor("tui.notification_method", "bel")).toBe("响铃");
+    expect(labelFor("tui.terminal_title", "false")).toBe("关");
+    expect(labelFor("tui.terminal_title", "true")).toBe("开");
     // 后端将来加选项时，前端不该留空或抛错。
     expect(labelFor("startup.sandbox", "some-future-mode")).toBe("some-future-mode");
     // 没有映射表的字段（数字）原样返回。
