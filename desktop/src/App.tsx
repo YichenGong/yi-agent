@@ -1427,6 +1427,25 @@ export default function App() {
     await sess.refreshThreads();
   };
 
+  /**
+   * 复制一份会话，源会话不动。
+   *
+   * **刻意不切会话**：从侧栏复制一个会话，用户的注意力不该被抢走。新条目靠
+   * `(fork)` 标题 + 更新时间出现在列表顶部，这本身就是反馈（桌面端没有 toast）。
+   */
+  const forkThread = async (id: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/fork", { threadId: id });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return;
+    }
+    await sess.refreshThreads();
+  };
+
   const deleteThread = async (id: string) => {
     const c = clientRef.current;
     if (!c) return;
@@ -2311,6 +2330,34 @@ export default function App() {
           });
         }
         break;
+      case "fork": {
+        // `runSlash` 调本函数后**不 await**，紧接着同步执行 `onDraftChange("")`
+        // 清空当前会话的草稿。故 seed 必须在第一次 await 之前取到。
+        const seed = args;
+        let newId: string;
+        try {
+          const r = await c.request<{ thread_id: string; title?: string | null }>(
+            "thread/fork",
+            { threadId: id },
+          );
+          newId = r.thread_id;
+        } catch (e) {
+          session.notice(
+            (e as { code?: number })?.code === -32012
+              ? "这个会话正在运行，跑完再 fork"
+              : `分叉失败: ${formatError(e)}`,
+          );
+          break;
+        }
+        // `thread/fork` 不发通知，侧栏行只能来自 listAll。先刷新再切，否则
+        // 用户会短暂看到一个「列表里不存在」的会话。
+        await sess.refreshThreads();
+        // 预先写进**新会话**的草稿：输入框 value 直接读 view(id).draft，先写好
+        // 才能在新会话首帧就显示。此刻 currentId 仍指向源会话，不能用 changeDraft。
+        if (seed) store.setDraft(newId, seed);
+        await selectThread(newId);
+        break;
+      }
       case "clear":
         try {
           await c.request("thread/clear", { threadId: id });
@@ -2917,6 +2964,7 @@ export default function App() {
               onSelect={selectThread}
               onRename={renameThread}
               onDelete={deleteThread}
+              onFork={(id) => void forkThread(id)}
               onTogglePin={onTogglePin}
               onSetTag={onSetTag}
               onCreateGroup={sess.createGroup}

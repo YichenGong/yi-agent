@@ -1593,6 +1593,121 @@ describe("App slash commands", () => {
     // 默认 mock 返回 {},没有 status 字段 → 视为 unknown,提示"未知结果"。
     await screen.findByText(/压缩/);
   });
+
+  it("creates a copy from the sidebar without switching threads", async () => {
+    // fork 之后 App 会 `refreshThreads()`：桩的 `thread/listAll` 只回 `state.threads`，
+    // 新会话不在里面就会被当成「已不存在」。故 fork 时要把它推进 seed。
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-copy", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-copy", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumeCountBefore = clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+    // 右键当前会话行，点「创建副本」。选择器要排除组长行（`data-lead-row`）：
+    // 它同样带 `data-thread-row`，但没有会话菜单。
+    const row = document.querySelector<HTMLElement>("[data-thread-row]:not([data-lead-row])");
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/fork")).toBe(true),
+    );
+    // 侧栏入口刻意不切会话：不该多出一次 resume。
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/resume").length,
+    ).toBe(resumeCountBefore);
+  });
+
+  it("forks on /fork and carries the message into the new thread's draft", async () => {
+    // 与侧栏用例同理：`refreshThreads` 之后新会话必须能从 listAll 里读到，
+    // 否则 `selectThread` 的对账会把它判成「服务端已删除」。
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-forked", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-forked", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork 换个思路试试" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/fork")).toBe(true),
+    );
+    // 切到新会话：之后必须为它发一次 resume。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/resume" && (r.params as any)?.threadId === "thread-forked",
+        ),
+      ).toBe(true),
+    );
+    // /fork 后面的文字成为新会话的草稿，不自动发送。
+    await waitFor(() =>
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("换个思路试试"),
+    );
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("leaves the new thread's draft empty when /fork has no message", async () => {
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-forked", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-forked", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/resume" && (r.params as any)?.threadId === "thread-forked",
+        ),
+      ).toBe(true),
+    );
+    // 命令文本不能被当成草稿搬到新会话。
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("explains a refused /fork instead of switching threads", async () => {
+    state.rejectCode = { "thread/fork": -32012 };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumeCountBefore = clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/正在运行，跑完再 fork/);
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/resume").length,
+    ).toBe(resumeCountBefore);
+  });
 });
 
 /**

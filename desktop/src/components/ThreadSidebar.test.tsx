@@ -53,6 +53,7 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onSelect: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
+    onFork: vi.fn(),
     onTogglePin: vi.fn(),
     onReorderPinned: vi.fn(),
     onNew: vi.fn(),
@@ -313,6 +314,22 @@ describe("ThreadSidebar", () => {
     fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "无标签" }));
     expect(onSetTag).toHaveBeenCalledWith("1", null);
+  });
+
+  it("offers 创建副本 in the thread menu and reports the id", () => {
+    const onFork = vi.fn();
+    const { container } = renderSidebar({ onFork });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+    expect(onFork).toHaveBeenCalledWith("1");
+  });
+
+  it("closes the thread menu after 创建副本", () => {
+    const { container } = renderSidebar({ onFork: vi.fn() });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
   });
 
   it("marks the current tag as checked", () => {

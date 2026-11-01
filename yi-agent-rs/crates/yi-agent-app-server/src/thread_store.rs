@@ -271,6 +271,87 @@ pub struct ThreadStore {
     meta_lock: std::sync::Mutex<()>,
 }
 
+/// 把 `src` 下的普通文件复制到 `dst`，跳过分片上传的 `.tmp` 暂存区。
+///
+/// 只遍历一层：附件目录的形状恒为 `<tid>/<hash>-<name>`（见
+/// [`crate::attachments::stored_relative_path`]），内嵌递归没有必要。非普通文件
+/// 同样跳过——与 `image/read` 拒绝 FIFO 同一条理由：一个怪异条目不该把主循环挂住。
+fn copy_attachment_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        if from.file_name().and_then(|n| n.to_str()) == Some(".tmp") {
+            continue;
+        }
+        if !from.is_file() {
+            continue;
+        }
+        if let Some(name) = from.file_name() {
+            std::fs::copy(&from, dst.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// 把历史里指向源会话附件目录的路径改写成新会话的。
+///
+/// `Item` 与 `Message` 是两套不同的形状，都要走；`ToolResult` 里的内容块可能
+/// 再嵌套 `Image`，故 `ContentBlock` 侧必须递归。
+fn rewrite_attachment_paths(loaded: &mut LoadedThread, from: &str, to: &str) {
+    let src_prefix = format!(".yi-agent/attachments/{from}/");
+    let dst_prefix = format!(".yi-agent/attachments/{to}/");
+    let remap = |p: &mut String| {
+        // `strip_prefix` 而不是 `starts_with` + 拼接：`thread-a` 是 `thread-ab`
+        // 的前缀，后者不该被改写。
+        if let Some(rest) = p.strip_prefix(src_prefix.as_str()) {
+            *p = format!("{dst_prefix}{rest}");
+        }
+    };
+
+    for item in &mut loaded.items {
+        match item {
+            Item::UserMessage {
+                attachments,
+                images,
+                ..
+            }
+            | Item::UserInterjection {
+                attachments,
+                images,
+                ..
+            } => {
+                for a in attachments {
+                    remap(&mut a.path);
+                }
+                for i in images {
+                    remap(&mut i.path);
+                }
+            }
+            Item::ToolCall { images, .. } => {
+                for i in images {
+                    remap(&mut i.path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remap_blocks(blocks: &mut [ContentBlock], remap: &impl Fn(&mut String)) {
+        for block in blocks {
+            match block {
+                ContentBlock::Image { path: Some(p), .. } => remap(p),
+                ContentBlock::ToolResult { content, .. } => remap_blocks(content, remap),
+                _ => {}
+            }
+        }
+    }
+
+    for message in &mut loaded.messages {
+        remap_blocks(&mut message.content, &remap);
+    }
+}
+
 impl ThreadStore {
     pub fn new(workdir: &Path) -> Self {
         Self {
@@ -325,16 +406,30 @@ impl ThreadStore {
             ThreadLockError::Io(err) => err,
         })?;
 
-        let loaded = self
+        let mut loaded = self
             .load(from)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("thread {from}")))?;
 
         let now = now_millis();
+        // `title_from` 会把整串再截到 30 字。源标题通常已经是 30 字，直接拼
+        // ` (fork)` 会被截掉后缀，副本与原件在侧栏里一模一样。故先给后缀留位置。
+        const FORK_SUFFIX: &str = " (fork)";
+        const TITLE_LIMIT: usize = 30;
         let title = loaded
             .meta
             .title
-            .as_ref()
-            .map(|t| title_from(&format!("{t} (fork)")));
+            .clone()
+            // 老会话可能没有标题：从首条用户消息派生，否则副本会和原件一起显示
+            // `(untitled)`，同样分不出谁是谁。
+            .or_else(|| first_user_text(&loaded.messages))
+            .map(|t| {
+                let normalized = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                let head: String = normalized
+                    .chars()
+                    .take(TITLE_LIMIT - FORK_SUFFIX.chars().count())
+                    .collect();
+                format!("{head}{FORK_SUFFIX}")
+            });
 
         let meta = ThreadMeta {
             thread_id: new_id.to_string(),
@@ -372,7 +467,26 @@ impl ThreadStore {
             last_read_at: 0,
             last_completed_at: 0,
         };
+        // 路径重写与目录复制必须一起做：只复制不改引用，工具按旧路径读不到文件。
+        rewrite_attachment_paths(&mut loaded, from, new_id);
+
         self.create(&meta)?;
+
+        // 附件跟会话走同一条生命周期：`thread/delete` 会删掉
+        // `.yi-agent/attachments/<tid>/`。不搬过来的话，用户「试完分支、删掉
+        // 旧那条」之后，副本里的图片会静默变成空白。
+        //
+        // cwd 从 store 的 root（`<cwd>/.yi-agent/threads`）上溯两级推出，与
+        // `thread/delete` 同一写法：`meta.cwd` 在 meta 缺失/损坏时会被
+        // `rebuild_meta` 填成空串，不能用来拼路径。
+        if let Some(cwd) = self.root().parent().and_then(|p| p.parent()) {
+            let attachments_root = cwd.join(".yi-agent").join("attachments");
+            let src_dir = attachments_root.join(from);
+            if src_dir.is_dir() {
+                let dst_dir = attachments_root.join(new_id);
+                copy_attachment_tree(&src_dir, &dst_dir)?;
+            }
+        }
 
         // 新会话从诞生起就归本进程
         let _new_lock = acquire_thread_lock(&self.root, new_id).map_err(|e| match e {
@@ -2375,6 +2489,85 @@ mod tests {
         );
     }
 
+    /// 源标题本身已是 30 字上限时，直接拼 ` (fork)` 会被 `title_from` 再截一次，
+    /// 后缀整个丢掉——副本和原会话在侧栏里一模一样。
+    #[test]
+    fn fork_keeps_the_marker_when_the_source_title_is_at_the_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-long-title");
+        meta.title = Some("一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十".into());
+        store.create(&meta).unwrap();
+        store
+            .append_turn(
+                "thread-long-title",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store
+            .fork_thread("thread-long-title", "thread-long-forked")
+            .unwrap();
+        let title = store
+            .load("thread-long-forked")
+            .unwrap()
+            .unwrap()
+            .meta
+            .title
+            .unwrap();
+
+        assert!(
+            title.ends_with(" (fork)"),
+            "fork 标记必须保留，否则侧栏里两条一模一样: {title}"
+        );
+        assert!(
+            title.chars().count() <= 30,
+            "标题仍要遵守 30 字上限: {title}"
+        );
+    }
+
+    /// 老会话可能根本没有标题（meta 里 `title` 是 None）。此时不能直接报 None，
+    /// 否则副本和原件都显示 `(untitled)`，同样分不出谁是谁。
+    #[test]
+    fn fork_falls_back_to_the_first_user_message_for_an_untitled_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let store_meta = sample_meta("thread-untitled");
+        store.create(&store_meta).unwrap();
+        store
+            .append_turn(
+                "thread-untitled",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    usage_total: None,
+                    messages: vec![yi_agent_core::Message {
+                        role: yi_agent_core::Role::User,
+                        content: vec![yi_agent_core::ContentBlock::Text("帮我改仓库".into())],
+                    }],
+                },
+            )
+            .unwrap();
+
+        store
+            .fork_thread("thread-untitled", "thread-untitled-forked")
+            .unwrap();
+        let title = store
+            .load("thread-untitled-forked")
+            .unwrap()
+            .unwrap()
+            .meta
+            .title
+            .expect("无标题时也要从首条用户消息派生一个");
+
+        assert_eq!(title, "帮我改仓库 (fork)");
+    }
+
     #[test]
     fn fork_clears_fields_that_would_break_the_desktop() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2484,6 +2677,253 @@ mod tests {
         assert!(
             loaded.usage.is_some(),
             "usage 必须是 Some——rpc/thread.rs:662 的 if let Some(u) 会挡掉 None 的整个通知"
+        );
+    }
+
+    /// `thread/delete` 会把 `.yi-agent/attachments/<tid>/` 整个删掉。fork 若不
+    /// 把附件搬过去，用户「试完分支、删掉旧那条」之后副本里的图片全变空白。
+    #[test]
+    fn fork_copies_the_attachment_directory_and_rewrites_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-with-files");
+        meta.cwd = dir.path().display().to_string();
+        store.create(&meta).unwrap();
+
+        let src_dir = dir.path().join(".yi-agent/attachments/thread-with-files");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("deadbeef-a.png"), b"png-bytes").unwrap();
+        // 分片上传的暂存区：未 commit 的半成品，不该跟着副本走。
+        std::fs::create_dir_all(src_dir.join(".tmp")).unwrap();
+        std::fs::write(src_dir.join(".tmp/upload-1"), b"partial").unwrap();
+
+        let doc = crate::protocol::Attachment {
+            name: "a.png".into(),
+            path: ".yi-agent/attachments/thread-with-files/deadbeef-a.png".into(),
+            mime: Some("image/png".into()),
+            size: 9,
+        };
+        let image = crate::protocol::ImageRef {
+            path: ".yi-agent/attachments/thread-with-files/deadbeef-a.png".into(),
+            media_type: "image/png".into(),
+            size: 9,
+            detail: None,
+        };
+        store
+            .append_turn(
+                "thread-with-files",
+                &TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "u1".into(),
+                        text: "看这张图".into(),
+                        attachments: vec![doc],
+                        images: vec![image],
+                    }],
+                    usage: None,
+                    usage_total: None,
+                    messages: vec![yi_agent_core::Message {
+                        role: yi_agent_core::Role::User,
+                        content: vec![yi_agent_core::ContentBlock::Image {
+                            source: yi_agent_core::ImageSource::Url("x".into()),
+                            detail: Default::default(),
+                            path: Some(
+                                ".yi-agent/attachments/thread-with-files/deadbeef-a.png".into(),
+                            ),
+                        }],
+                    }],
+                },
+            )
+            .unwrap();
+
+        store
+            .fork_thread("thread-with-files", "thread-files-forked")
+            .unwrap();
+
+        let dst_dir = dir.path().join(".yi-agent/attachments/thread-files-forked");
+        assert!(
+            dst_dir.join("deadbeef-a.png").is_file(),
+            "附件本体必须复制过去"
+        );
+        assert!(
+            !dst_dir.join(".tmp").exists(),
+            "分片上传的暂存区不该跟着副本走"
+        );
+        assert!(
+            src_dir.join("deadbeef-a.png").is_file(),
+            "源附件必须原样保留"
+        );
+
+        let loaded = store.load("thread-files-forked").unwrap().unwrap();
+        let want = ".yi-agent/attachments/thread-files-forked/deadbeef-a.png";
+        match &loaded.items[0] {
+            crate::protocol::Item::UserMessage {
+                attachments,
+                images,
+                ..
+            } => {
+                assert_eq!(attachments[0].path, want, "文档路径要指到新目录");
+                assert_eq!(images[0].path, want, "图片引用同样要改");
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+        match &loaded.messages[0].content[0] {
+            yi_agent_core::ContentBlock::Image { path, .. } => {
+                assert_eq!(path.as_deref(), Some(want), "转录里的图片路径也要改");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    /// 前缀比较必须按**整段目录名**，不能用 starts_with 直接拼：`thread-a` 是
+    /// `thread-ab` 的前缀，误伤会把另一个会话的引用改到自己头上。
+    #[test]
+    fn fork_does_not_rewrite_paths_that_merely_share_the_id_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-a");
+        meta.cwd = dir.path().display().to_string();
+        store.create(&meta).unwrap();
+
+        let foreign = ".yi-agent/attachments/thread-ab/beef-b.png".to_string();
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "u1".into(),
+                        text: "x".into(),
+                        attachments: vec![crate::protocol::Attachment {
+                            name: "b.png".into(),
+                            path: foreign.clone(),
+                            mime: None,
+                            size: 1,
+                        }],
+                        images: Vec::new(),
+                    }],
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store.fork_thread("thread-a", "thread-a-forked").unwrap();
+        let loaded = store.load("thread-a-forked").unwrap().unwrap();
+        match &loaded.items[0] {
+            crate::protocol::Item::UserMessage { attachments, .. } => {
+                assert_eq!(
+                    attachments[0].path, foreign,
+                    "只共享前缀的别的会话路径不能被改写"
+                );
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    /// 源没有附件目录时不该凭空建一个空目录。
+    /// `ToolCall.images` 与 `UserInterjection` 也要走重写：漏掉任一条，
+    /// 副本里那些图片就会指回源会话的目录，源会话被删后变成空白。
+    #[test]
+    fn fork_rewrites_tool_call_and_interjection_image_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-mixed");
+        meta.cwd = dir.path().display().to_string();
+        store.create(&meta).unwrap();
+
+        let old = ".yi-agent/attachments/thread-mixed/x.png".to_string();
+        let want = ".yi-agent/attachments/thread-mixed-forked/x.png".to_string();
+        let img = || crate::protocol::ImageRef {
+            path: old.clone(),
+            media_type: "image/png".into(),
+            size: 1,
+            detail: None,
+        };
+        store
+            .append_turn(
+                "thread-mixed",
+                &TurnLine::Turn {
+                    items: vec![
+                        crate::protocol::Item::ToolCall {
+                            id: "c1".into(),
+                            call_id: "c1".into(),
+                            name: "read_image".into(),
+                            input: serde_json::json!({}),
+                            status: crate::protocol::ToolStatus::Completed,
+                            result: None,
+                            images: vec![img()],
+                        },
+                        crate::protocol::Item::UserInterjection {
+                            id: "u2".into(),
+                            text: "再看这张".into(),
+                            attachments: vec![crate::protocol::Attachment {
+                                name: "x.png".into(),
+                                path: old.clone(),
+                                mime: None,
+                                size: 1,
+                            }],
+                            images: vec![img()],
+                        },
+                    ],
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store
+            .fork_thread("thread-mixed", "thread-mixed-forked")
+            .unwrap();
+        let loaded = store.load("thread-mixed-forked").unwrap().unwrap();
+
+        match &loaded.items[0] {
+            crate::protocol::Item::ToolCall { images, .. } => {
+                assert_eq!(images[0].path, want, "ToolCall.images 必须重写");
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+        match &loaded.items[1] {
+            crate::protocol::Item::UserInterjection {
+                attachments,
+                images,
+                ..
+            } => {
+                assert_eq!(attachments[0].path, want, "插话的附件也要重写");
+                assert_eq!(images[0].path, want, "插话的图片也要重写");
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_creates_no_attachment_dir_when_the_source_has_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let mut meta = sample_meta("thread-no-files");
+        meta.cwd = dir.path().display().to_string();
+        store.create(&meta).unwrap();
+        store
+            .append_turn(
+                "thread-no-files",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    usage_total: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        store
+            .fork_thread("thread-no-files", "thread-no-files-forked")
+            .unwrap();
+
+        assert!(
+            !dir.path()
+                .join(".yi-agent/attachments/thread-no-files-forked")
+                .exists(),
+            "没有附件就不该建空目录"
         );
     }
 

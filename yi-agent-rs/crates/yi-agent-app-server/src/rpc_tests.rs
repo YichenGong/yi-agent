@@ -3664,6 +3664,7 @@ async fn unknown_method_returns_method_not_found() {
         ("thread/compact", Domain::Thread),
         ("thread/delete", Domain::Thread),
         ("thread/diff/read", Domain::Thread),
+        ("thread/fork", Domain::Thread),
         ("thread/lead", Domain::Thread),
         ("thread/list", Domain::Thread),
         ("thread/listAll", Domain::Thread),
@@ -21274,4 +21275,160 @@ fn child_holds_thread_lock() {
     std::io::stdout().flush().unwrap();
     // 持锁直到被父进程 kill。
     std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+/// `thread/fork` 的最小闭环：返回新 id、落盘能看到、源会话字节不变。
+#[tokio::test]
+async fn thread_fork_copies_a_settled_thread() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    write_meta(&cwd, "t-fork-src", "源会话", None, None);
+
+    // workdir 必须与 `write_meta` 的目录一致，否则 `store_lookup` 找不到它。
+    let mut cfg = test_config();
+    cfg.workdir = cwd.clone();
+    let mut h = Harness::with_cfg(cfg).await;
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"thread/fork","params":{"threadId":"t-fork-src"}}"#)
+        .await;
+    let v = read_response(&mut h, 7).await;
+    assert!(v.get("error").is_none(), "fork 应当成功: {v}");
+    let new_id = v["result"]["thread_id"].as_str().unwrap().to_string();
+    assert_ne!(new_id, "t-fork-src");
+    assert_eq!(
+        v["result"]["title"].as_str(),
+        Some("源会话 (fork)"),
+        "回包要带上落盘的标题，前端才能立刻显示"
+    );
+
+    let store = crate::thread_store::ThreadStore::new(&cwd);
+    let loaded = store.load(&new_id).unwrap().expect("新会话必须落盘");
+    assert_eq!(loaded.meta.forked_from.as_deref(), Some("t-fork-src"));
+    assert!(
+        store.load("t-fork-src").unwrap().is_some(),
+        "源会话必须还在"
+    );
+    h.shutdown().await;
+}
+
+/// 未知 id 要说是「不认识」，不能悄悄建一个空会话出来。
+#[tokio::test]
+async fn thread_fork_rejects_an_unknown_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":8,"method":"thread/fork","params":{"threadId":"t-nope"}}"#)
+        .await;
+    let v = read_response(&mut h, 8).await;
+    assert_eq!(v["error"]["code"], serde_json::json!(-32011), "{v}");
+    h.shutdown().await;
+}
+
+/// 运行中的会话一律拒绝：复制到半轮会产生一个「开头有提问、结尾是断掉的
+/// tool_use」的坏副本。拒绝必须发生在**任何磁盘写入之前**。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_fork_refuses_a_running_thread_and_writes_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_checkpoint_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    // 起一轮不会立刻结束的 turn。`CheckpointProvider` 第一次调用给 tool_use、
+    // 第二次起 `pending()` 永不收尾，故这一轮不会自己结束。
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"do work"}}]}}}}"#
+    ))
+    .await;
+    let _ = read_response(&mut h, 10).await;
+
+    // 只数 `.meta.json`：运行中的 turn 会往同目录写 `<tid>.partial.json`
+    // （turn 开始写一次、之后每 500ms 去抖刷新），数全部条目会与其竞态而偶发红。
+    let count_metas = || {
+        std::fs::read_dir(dir.path().join(".yi-agent/threads"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let before = count_metas();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":11,"method":"thread/fork","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 11).await;
+    assert_eq!(
+        v["error"]["code"],
+        serde_json::json!(-32012),
+        "运行中的会话必须被拒绝: {v}"
+    );
+
+    assert_eq!(count_metas(), before, "被拒绝的 fork 不该建出任何新会话");
+    h.shutdown().await;
+}
+
+/// 源目录被删掉后不该 fork 出一个打不开的会话。
+///
+/// 会话必须先在内存里（`thread/start` 时给了 cwd），`thread_cwd` 才会返回那条
+/// 路径并走到 `!cwd.is_dir()` 分支。若走冷会话路径，`store_lookup` 定位不到
+/// 目录就回落到 `cfg.workdir`，最终报的是 `-32011`（未知会话）——那测的就不是
+/// 这条分支了。
+#[tokio::test]
+async fn thread_fork_refuses_when_the_working_directory_is_gone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let gone = dir.path().join("vanished");
+    std::fs::create_dir_all(&gone).unwrap();
+    let gone_str = gone.to_string_lossy().to_string();
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 9, "method": "thread/start",
+            "params": { "cwd": gone_str }
+        })
+        .to_string(),
+    )
+    .await;
+    let started = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(9)))
+        .await;
+    let tid = started["result"]["thread_id"].as_str().unwrap().to_string();
+
+    // 起会话之后目录才消失——这正是「项目目录被删/改名」的真机情形。
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":12,"method":"thread/fork","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 12).await;
+    assert_eq!(
+        v["error"]["code"],
+        serde_json::json!(-32602),
+        "目录已消失必须明确报错，而不是落盘一个打不开的会话: {v}"
+    );
+    // 关键判据：**没有多出任何会话**。若 cwd 检查缺失，`fork_thread` 的
+    // `create` 会 `create_dir_all(&self.root)` 把整棵 `<gone>/.yi-agent/threads`
+    // 复活并写进一个新会话。
+    //
+    // 不断言 `!gone.exists()`：`thread/start` 的标题生成是异步的，可能在删除之后
+    // 才回写 meta，把目录重新建出来——那是无关写入，不该让这条测试偶发变红。
+    // `ThreadStore::new` 接受的是**工作区根**（它自己拼 `.yi-agent/threads`）。
+    let store = crate::thread_store::ThreadStore::new(&gone);
+    let ids: Vec<String> = store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.thread_id)
+        .collect();
+    assert!(
+        ids.is_empty(),
+        "被拒绝的 fork 不该在已删除的目录里留下会话: {ids:?}"
+    );
+    h.shutdown().await;
 }

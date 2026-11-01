@@ -26,10 +26,10 @@
 | yi-agent-runtime | 24 / 24 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 75 / 75 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 78 / 78 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
-| desktop | 106 / 117 | [详情](./desktop.md) |
+| desktop | 109 / 120 | [详情](./desktop.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 

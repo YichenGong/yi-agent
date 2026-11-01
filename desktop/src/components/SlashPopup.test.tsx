@@ -19,22 +19,24 @@ describe("SlashPopup", () => {
 
   it("renders every command with its usage and description", () => {
     // The brief passes `selected={0}` here while asserting below that the marked
-    // option is `/help` (index 4), and the next test pins the semantics as
-    // index-based (`selected={2}` -> `/config`). Those cannot both hold, so the
-    // brief's `0` is a typo; `4` selects the very item the assertions name.
-    render(<SlashPopup commands={SLASH_COMMANDS} selected={4} />);
+    // option is `/help`, and the next test pins the semantics as index-based
+    // (`selected={2}` -> `/config`). Those cannot both hold, so the brief's `0`
+    // is a typo; the index below selects the very item the assertions name.
+    // 目录加入 `/fork` 后整体后移一位：/help 由 4 变 5，/config 由 2 变 3。
+    const helpIndex = SLASH_COMMANDS.findIndex((c) => c.name === "help");
+    render(<SlashPopup commands={SLASH_COMMANDS} selected={helpIndex} />);
     expect(screen.getAllByTestId("slash-option")).toHaveLength(SLASH_COMMANDS.length);
     const selected = screen
       .getAllByTestId("slash-option")
       .filter((el) => el.getAttribute("data-selected") === "true");
     expect(selected).toHaveLength(1);
-    // /help 是目录里的第 5 条（index 4）。
     expect(selected[0].textContent).toContain("/help [command]");
     expect(selected[0].textContent).toContain("显示帮助信息");
   });
 
   it("marks exactly the selected option", () => {
-    render(<SlashPopup commands={SLASH_COMMANDS} selected={2} />);
+    const configIndex = SLASH_COMMANDS.findIndex((c) => c.name === "config");
+    render(<SlashPopup commands={SLASH_COMMANDS} selected={configIndex} />);
     const selected = screen
       .getAllByTestId("slash-option")
       .filter((el) => el.getAttribute("data-selected") === "true");

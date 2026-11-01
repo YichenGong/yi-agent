@@ -18,6 +18,7 @@ export interface SlashCommandSpec {
 export const SLASH_COMMANDS: SlashCommandSpec[] = [
   { name: "clear", description: "清空对话上下文", usage: null, needsArg: false },
   { name: "compact", description: "压缩对话历史", usage: null, needsArg: false },
+  { name: "fork", description: "从当前会话分叉出一个新副本（需会话空闲）", usage: "[message]", needsArg: false },
   { name: "config", description: "显示当前配置", usage: null, needsArg: false },
   { name: "usage", description: "查看 token 用量与上下文占用", usage: null, needsArg: false },
   { name: "help", description: "显示帮助信息", usage: "[command]", needsArg: false },
@@ -31,7 +32,7 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
  * 却忘了分组时，`slash.test.ts` 直接红。
  */
 export const HELP_GROUPS: { title: string; commands: string[] }[] = [
-  { title: "会话", commands: ["clear", "compact"] },
+  { title: "会话", commands: ["clear", "compact", "fork"] },
   { title: "状态", commands: ["config", "usage"] },
   { title: "帮助", commands: ["help"] },
 ];
