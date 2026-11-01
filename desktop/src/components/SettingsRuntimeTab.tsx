@@ -42,6 +42,15 @@ const VALUE_LABELS: Record<string, Record<string, string>> = {
   "tui.notification_condition": { unfocused: "仅窗口失焦时", always: "总是" },
 };
 
+/** 草稿的起点：每个字段取「当前值」，未设置取空串。 */
+function draftsOf(fields: RuntimeField[]): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const field of fields) {
+    next[field.key] = field.value === null ? "" : String(field.value);
+  }
+  return next;
+}
+
 /**
  * 字段值的中文显示。空串显示成破折号——它出现两处：`agent.system_prompt` 的
  * `default_display`（默认就是「不覆盖」），以及用户清空输入框后的草稿值。
@@ -62,6 +71,7 @@ export function labelFor(key: string, raw: string): string {
  */
 export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
   const [fields, setFields] = useState<RuntimeField[]>([]);
+  const [path, setPath] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -72,12 +82,11 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
     try {
       const view = parseRuntimeSettings(await call("settings/read", {}));
       setFields(view.fields);
+      // `path` 只在读成功时更新：它是页脚的上下文，读失败时保留上一次的值，
+      // 免得底栏闪一下空白。
+      setPath(view.path);
       // 草稿从「当前值」起步，让 buildPatch 能算出用户改了哪一项。
-      const next: Record<string, string> = {};
-      for (const field of view.fields) {
-        next[field.key] = field.value === null ? "" : String(field.value);
-      }
-      setDrafts(next);
+      setDrafts(draftsOf(view.fields));
     } catch (error) {
       setNotice({ ok: false, text: formatError(error) });
     } finally {
@@ -118,76 +127,122 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
     }
   };
 
-  if (loading) return <p className="settings-hint">读取中…</p>;
+  /** 「撤销改动」：草稿回到各字段的当前值，`buildPatch` 随之变空、保存按钮重新禁用。 */
+  const resetDrafts = () => {
+    setDrafts(draftsOf(fields));
+    setNotice(null);
+  };
+
+  if (loading) return <p className="p-5 text-sm text-fg-subtle">读取中…</p>;
+
+  const patch = buildPatch(fields, drafts);
+  const dirty = Object.keys(patch).length > 0;
+
+  if (fields.length === 0) {
+    return <p className="p-5 text-sm text-fg-subtle">没有可配置的运行参数</p>;
+  }
 
   return (
-    <div className="settings-runtime">
-      {notice ? (
-        <p className={notice.ok ? "settings-hint" : "settings-error"} role="status">
-          {notice.text}
-        </p>
-      ) : null}
+    <div className="flex min-h-full flex-col">
+      <div className="flex-1 space-y-6 p-5">
+        {notice ? (
+          <p
+            role={notice.ok ? "status" : "alert"}
+            className={`rounded-md border px-3 py-2 text-xs ${
+              notice.ok
+                ? "border-line bg-raised/50 text-fg-muted"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-500"
+            }`}
+          >
+            {notice.text}
+          </p>
+        ) : null}
 
-      {grouped.map(({ group, fields: rows }) => (
-        <section key={group} className="settings-group">
-          <h3>{GROUP_LABELS[group] ?? group}</h3>
-          {rows.map((field) => {
-            const isUnset = field.value === null;
-            return (
-              <div key={field.key} className="settings-row">
-                <label htmlFor={`runtime-${field.key}`}>{field.label}</label>
-                {field.type === "select" ? (
-                  <select
-                    id={`runtime-${field.key}`}
-                    value={drafts[field.key] ?? ""}
-                    onChange={(event) =>
-                      setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
-                    }
+        {grouped.map(({ group, fields: rows }) => (
+          <section key={group}>
+            <h3 className="text-sm font-medium text-fg">{GROUP_LABELS[group] ?? group}</h3>
+            {GROUP_HINTS[group] ? (
+              <p className="mt-1 text-xs text-fg-subtle">{GROUP_HINTS[group]}</p>
+            ) : null}
+            <div className="@container mt-3 divide-y divide-line rounded-md border border-line">
+              {rows.map((field) => {
+                const isUnset = field.value === null;
+                return (
+                  <div
+                    key={field.key}
+                    className="flex flex-col gap-2 px-3 py-2.5 @lg:flex-row @lg:items-start @lg:justify-between @lg:gap-6"
                   >
-                    <option value="">未设置（默认 {field.default || "—"}）</option>
-                    {field.options.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    id={`runtime-${field.key}`}
-                    type={field.type === "number" ? "number" : "text"}
-                    min={field.min ?? undefined}
-                    max={field.max ?? undefined}
-                    value={drafts[field.key] ?? ""}
-                    placeholder={`未设置 · 默认 ${field.default || "—"}`}
-                    onChange={(event) =>
-                      setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
-                    }
-                  />
-                )}
-                <p className="settings-hint">
-                  {isUnset ? `未设置 · 默认 ${field.default || "—"}` : `已设为 ${field.value}`}
-                </p>
-                <p className="settings-hint">{field.description}</p>
-                <button
-                  type="button"
-                  disabled={saving || isUnset}
-                  onClick={() => void save({ [field.key]: null })}
-                >
-                  恢复默认
-                </button>
-              </div>
-            );
-          })}
-        </section>
-      ))}
+                    <div className="min-w-0 @lg:flex-1">
+                      <label htmlFor={`runtime-${field.key}`} className="block text-sm text-fg">
+                        {field.label}
+                      </label>
+                      <p className="mt-0.5 text-xs leading-relaxed text-fg-subtle">
+                        {field.description}
+                      </p>
+                    </div>
+                    <div className="shrink-0 @lg:w-56">
+                      {/* 先统一渲染 <input>：本步的脏状态测试需要真实控件存在，
+                          否则 Task 4 无法独立跑绿。select / textarea 在 Task 5 升级。 */}
+                      <input
+                        id={`runtime-${field.key}`}
+                        type={field.type === "number" ? "number" : "text"}
+                        min={field.min ?? undefined}
+                        max={field.max ?? undefined}
+                        value={drafts[field.key] ?? ""}
+                        onChange={(event) =>
+                          setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
+                        }
+                        className="w-full rounded border border-line-strong bg-raised px-2.5 py-1.5 text-sm text-fg outline-none focus:border-fg-subtle disabled:opacity-50"
+                      />
+                      <div className="mt-1 flex items-center justify-between gap-2 text-xs">
+                        <span className={isUnset ? "text-fg-subtle" : "text-fg-muted"}>
+                          {isUnset
+                            ? `默认 ${labelFor(field.key, field.default)}`
+                            : `已设为 ${labelFor(field.key, String(field.value))}`}
+                        </span>
+                        {isUnset ? null : (
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => void save({ [field.key]: null })}
+                            className="rounded text-fg-subtle hover:text-fg disabled:opacity-50"
+                          >
+                            恢复默认
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+      </div>
 
-      <button
-        type="button"
-        disabled={saving}
-        onClick={() => void save(buildPatch(fields, drafts))}
-      >
-        保存
-      </button>
+      <div className="sticky bottom-0 flex flex-wrap items-center justify-between gap-3 border-t border-line bg-panel px-5 py-3">
+        <span className="min-w-0 truncate text-xs text-fg-subtle" title={path}>
+          settings.json · {path}
+        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            disabled={saving || !dirty}
+            onClick={() => resetDrafts()}
+            className="rounded border border-line-strong px-3 py-1.5 text-sm text-fg-muted disabled:opacity-50"
+          >
+            撤销改动
+          </button>
+          <button
+            type="button"
+            disabled={saving || !dirty}
+            onClick={() => void save(patch)}
+            className="rounded bg-fg px-3 py-1.5 text-sm text-surface disabled:opacity-50"
+          >
+            {saving ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

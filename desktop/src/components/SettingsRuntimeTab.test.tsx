@@ -33,21 +33,21 @@ function callWith(fields: unknown[]) {
 }
 
 describe("SettingsRuntimeTab", () => {
-  it("shows the default and disables restore when the value is unset", async () => {
+  it("shows the default and offers no restore button when the value is unset", async () => {
     render(<SettingsRuntimeTab call={callWith([field()])} />);
-    expect(await screen.findByText(/未设置/)).toBeTruthy();
-    expect(screen.getByText(/默认 200/)).toBeTruthy();
-    const restore = screen.getByRole("button", { name: /恢复默认/ }) as HTMLButtonElement;
-    // 用原生 DOM property 断言。本仓库没有装 `@testing-library/jest-dom`
-    // （desktop/package.json 只有 @testing-library/react），所以 `toBeDisabled()`
-    // 与 `toHaveProperty()` 这类匹配器都不可用——前者没注册，后者不是 vitest 内建。
-    expect(restore.disabled).toBe(true);
+    // 未设置：只显示「默认 200」，不出现「已设为」。
+    expect(await screen.findByText("默认 200")).toBeTruthy();
+    expect(screen.queryByText(/已设为/)).toBeNull();
+    // 「恢复默认」在无需恢复时**不渲染**——12 颗禁用按钮正是原来最难看的噪声。
+    expect(screen.queryByRole("button", { name: /恢复默认/ })).toBeNull();
   });
 
-  it("enables restore and shows the set value when a value exists", async () => {
+  it("marks a customised value and offers restore when a value exists", async () => {
     render(<SettingsRuntimeTab call={callWith([field({ value: 500 })])} />);
-    expect(await screen.findByText(/已设为 500/)).toBeTruthy();
+    expect(await screen.findByText("已设为 500")).toBeTruthy();
+    expect(screen.queryByText("默认 200")).toBeNull();
     const restore = screen.getByRole("button", { name: /恢复默认/ }) as HTMLButtonElement;
+    // 本仓库没有 @testing-library/jest-dom，故用原生 DOM property。
     expect(restore.disabled).toBe(false);
   });
 
@@ -88,6 +88,47 @@ describe("SettingsRuntimeTab", () => {
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     expect(await screen.findByText(/must be at least 1/)).toBeTruthy();
     expect(screen.queryByText(/\[object Object\]/)).toBeNull();
+  });
+
+  it("disables save until something changes, and undo restores the baseline", async () => {
+    render(<SettingsRuntimeTab call={callWith([field({ value: 500 })])} />);
+    const input = (await screen.findByLabelText("最大轮次")) as HTMLInputElement;
+    const saveBtn = screen.getByRole("button", { name: /保存/ }) as HTMLButtonElement;
+    const undoBtn = screen.getByRole("button", { name: /撤销改动/ }) as HTMLButtonElement;
+    // 刚加载时没有改动，两颗按钮都点不动。
+    expect(saveBtn.disabled).toBe(true);
+    expect(undoBtn.disabled).toBe(true);
+
+    fireEvent.change(input, { target: { value: "800" } });
+    expect(saveBtn.disabled).toBe(false);
+    expect(undoBtn.disabled).toBe(false);
+
+    fireEvent.click(undoBtn);
+    expect(input.value).toBe("500");
+    expect(saveBtn.disabled).toBe(true);
+    expect(undoBtn.disabled).toBe(true);
+  });
+
+  it("shows the settings.json path from the server", async () => {
+    render(<SettingsRuntimeTab call={callWith([field()])} />);
+    expect(await screen.findByText(/\/x\/settings\.json/)).toBeTruthy();
+  });
+
+  it("renders the tui group under a Chinese heading", async () => {
+    const tuiField = field({
+      key: "tui.notification_method",
+      group: "tui",
+      label: "通知协议",
+      type: "select",
+      options: ["auto", "osc9", "bel"],
+      default: "auto",
+      description: "auto 按终端自动选择；osc9 带正文，bel 只响铃",
+      min: null,
+    });
+    render(<SettingsRuntimeTab call={callWith([tuiField])} />);
+    expect(await screen.findByText("终端通知")).toBeTruthy();
+    // 绝不能漏出英文组名——那是 `GROUP_LABELS[group] ?? group` 的老问题。
+    expect(screen.queryByText("tui")).toBeNull();
   });
 
 describe("runtime settings labels", () => {
