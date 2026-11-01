@@ -929,6 +929,646 @@ async fn flush_unconsumed(tx: &EventTx, inbox: &Option<InboxHandle>) {
     let _ = tx.send(AgentEvent::InterjectionsReturned { items }).await;
 }
 
+/// The single stop path for every cancellation point with a message in flight:
+/// roll the session back to its last consistent boundary, drain queued
+/// interjections, tell the consumer, and let the caller `return`.
+///
+/// Call sites keep their own `info!` above the call: two of them share a
+/// spelling on purpose while belonging to different retry families.
+async fn abort_run(tx: &EventTx, inbox: &Option<InboxHandle>, session: &Arc<Mutex<Session>>) {
+    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+    session.lock().unwrap().truncate(keep);
+    flush_unconsumed(tx, inbox).await;
+    let _ = tx.send(AgentEvent::Cancelled).await;
+}
+
+/// How one THINK attempt hands control back to `run_loop`: fall through to the
+/// termination check, leave the run, or restart the turn. The last exists for
+/// `MaxTokens`, where the truncation prompt was already pushed into the session.
+enum ThinkOutcome {
+    /// The assistant reply is complete; run the termination check on it.
+    Content(Vec<ContentBlock>),
+    /// A stop path already emitted its terminal event (and any rollback).
+    Stopped,
+    /// `MaxTokens`: the truncation prompt is in place; THINK again.
+    RestartTurn,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn think_phase(
+    tx: &EventTx,
+    inbox: &Option<InboxHandle>,
+    session: &Arc<Mutex<Session>>,
+    provider: &Arc<dyn Provider>,
+    tools: &Arc<ToolRegistry>,
+    config: &AgentConfig,
+    cancel_token: &CancellationToken,
+    provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
+    messages: &mut Vec<Message>,
+    turn: u32,
+) -> ThinkOutcome {
+    // 1. THINK
+    //
+    // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
+    // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
+    // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
+    // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
+    // 请求体逐字不变（零回归）。
+    let request_messages = if config.preserve_thinking {
+        messages.clone()
+    } else {
+        crate::thinking::strip_thinking_except_last_assistant(messages)
+    };
+    let req = ProviderRequest {
+        model: config.model.clone(),
+        system: config.system_prompt.clone(),
+        messages: request_messages,
+        tools: tools.schemas(),
+        params: config.gen_params.clone(),
+    };
+    // Emit a heuristic prefill estimate so the status bar shows activity
+    // before the provider returns real usage (OpenAI-compatible APIs only
+    // send usage at stream end).
+    let prefill_estimate = estimate_prefill_tokens(&req);
+    let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+
+    // Retry loop for a transiently failed THINK attempt. Two families are
+    // retried: an idle stall / request deadline that ended the *stream*, and
+    // an outright provider rejection (429 / 5xx / network) that produced *no*
+    // stream at all. Both consume the same `stall_retries` budget, so the
+    // worst case inside one turn stays bounded by a single limit rather than
+    // two. Each attempt is a fresh provider turn (own lease); a failed
+    // attempt's partial content is never committed to the session.
+    let mut stall_retries: u16 = 0;
+    let (content, end, last_usage) = loop {
+        let provider_turn_lease = match provider_turn_gate {
+            Some(gate) => match tokio::select! {
+                lease = gate.acquire() => lease,
+                _ = cancel_token.cancelled() => {
+                    flush_unconsumed(tx, inbox).await;
+                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    return ThinkOutcome::Stopped;
+                }
+            } {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = tx
+                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                        .await;
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            None => None,
+        };
+
+        let stream = tokio::select! {
+            result = provider.call_stream(req.clone()) => match result {
+                Ok(s) => {
+                    tracing::info!(
+                        turn,
+                        "provider call_stream returned Ok, entering accumulate"
+                    );
+                    s
+                }
+                Err(e) => {
+                    warn!(turn, error = %e, "provider call failed");
+                    // A retryable outright rejection (429/5xx/network) is
+                    // retried with backoff instead of killing the turn: these
+                    // are capacity/transport conditions, so resending the same
+                    // request is the standard remedy. Deterministic failures
+                    // (InvalidRequest, Auth) get no such treatment.
+                    if let Some(cause) = retryable_provider_error_cause(&e) {
+                        if stall_retries < config.provider_error_retry_limit {
+                            stall_retries += 1;
+                            let delay =
+                                stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                            tracing::warn!(
+                                turn,
+                                attempt = stall_retries,
+                                max = config.provider_error_retry_limit,
+                                delay_ms = delay.as_millis() as u64,
+                                ?cause,
+                                "provider rejected the request transiently; retrying after backoff"
+                            );
+                            // Surface it: a silent backoff looks like a hang.
+                            if tx
+                                .send(AgentEvent::ProviderRetry {
+                                    attempt: stall_retries,
+                                    max: config.provider_error_retry_limit,
+                                    idle_secs: 0,
+                                    cause,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                            }
+                            // Release the turn lease before sleeping: a retry
+                            // backoff must not hold provider capacity.
+                            drop(provider_turn_lease);
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancel_token.cancelled() => {
+                                    info!(turn, "agent loop cancelled during retry backoff");
+                                    abort_run(tx, inbox, session).await;
+                                    return ThinkOutcome::Stopped;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if tx
+                        .send(AgentEvent::Error(AgentError::Provider(e)))
+                        .await
+                        .is_err()
+                    {
+                        return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                    }
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            _ = cancel_token.cancelled() => {
+                // Cancel while the provider request is still in flight (the
+                // HTTP response headers have not arrived yet). Real providers
+                // await the network here for up to `DEFAULT_TIMEOUT_SECS`
+                // (300s), so without this arm a Stop would be swallowed
+                // until the call returned. No assistant reply exists yet,
+                // so keep the run's user prompt and completed round-trips —
+                // same policy as a cancel during THINK.
+                info!(turn, "agent loop cancelled during provider call");
+                abort_run(tx, inbox, session).await;
+                return ThinkOutcome::Stopped;
+            }
+        };
+
+        // Check 2: THINK 中 — select! between accumulate and cancel
+        let attempt = tokio::select! {
+            result = accumulate_provider_stream(stream, tx, &config.model, config.think_idle_timeout) => match result {
+                Ok(v) => {
+                    tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
+                    v
+                }
+                Err(e) => {
+                    warn!(turn, error = %e, "provider stream error");
+                    if tx.send(AgentEvent::Error(e)).await.is_err() {
+                        return ThinkOutcome::Stopped;
+                    }
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            _ = cancel_token.cancelled() => {
+                info!(turn, "agent loop cancelled during think");
+                // Cancel during THINK: no assistant reply exists yet, so this
+                // keeps the run's user prompt and every completed round-trip.
+                abort_run(tx, inbox, session).await;
+                return ThinkOutcome::Stopped;
+            }
+        };
+
+        // Release the turn lease before sleeping: a retry backoff must not
+        // hold provider capacity.
+        drop(provider_turn_lease);
+
+        // Two transient modes are retryable: an idle stall and a request
+        // deadline. Everything else (malformed SSE payloads, connection
+        // resets, auth failures) is terminal.
+        //
+        // `Failed(Network)` is a load-bearing shorthand for "the request
+        // deadline elapsed": the providers only classify a *timeout* as
+        // `Network` here, and keep every other transport break as `Stream`.
+        // Widening that classification would silently start retrying
+        // connection resets, which the design explicitly excludes.
+        let retry_cause = match &attempt.1 {
+            StreamEnd::Stopped(StopReason::Stalled) => Some(RetryCause::IdleStall),
+            StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
+            _ => None,
+        };
+        if let Some(cause) = retry_cause {
+            if stall_retries < config.think_stall_retry_limit {
+                stall_retries += 1;
+                let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
+                tracing::warn!(
+                    turn,
+                    attempt = stall_retries,
+                    max = config.think_stall_retry_limit,
+                    delay_ms = delay.as_millis() as u64,
+                    ?cause,
+                    "think phase failed transiently; retrying after backoff"
+                );
+                // Surface the retry: a silent backoff looks like a hang.
+                if tx
+                    .send(AgentEvent::ProviderRetry {
+                        attempt: stall_retries,
+                        max: config.think_stall_retry_limit,
+                        idle_secs,
+                        cause,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel_token.cancelled() => {
+                        info!(turn, "agent loop cancelled during retry backoff");
+                        // Same policy as the other cancel points: keep the
+                        // run's user prompt and completed round-trips.
+                        abort_run(tx, inbox, session).await;
+                        return ThinkOutcome::Stopped;
+                    }
+                }
+                continue;
+            }
+        }
+        break attempt;
+    };
+
+    if let Some(usage) = last_usage {
+        session
+            .lock()
+            .unwrap()
+            .set_last_input_tokens(Some(usage.input_tokens));
+    }
+
+    // Log the full accumulated response content at debug level (never repeats across turns).
+    debug!(turn, content = ?content, "think: response");
+
+    // A non-retryable transport failure (malformed SSE payload, connection
+    // reset, ...) is terminal. Retryable timeouts never reach here: they
+    // either succeeded on a later attempt or exhausted the retry budget,
+    // in which case the terminal reason below explains it.
+    if let StreamEnd::Failed(error) = &end {
+        if !matches!(error, ProviderError::Network(_)) {
+            let _ = tx
+                .send(AgentEvent::Error(AgentError::Provider(error.clone())))
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+    }
+
+    // An exhausted transient failure is terminal and its partial must NOT
+    // enter the session: a stream can end mid-tool-call, leaving an
+    // unpaired `tool_use` that would make the next provider request
+    // invalid. The same applies to a failed attempt (no valid stop).
+    let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
+    let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
+    if !exhausted_stall && !exhausted_timeout {
+        messages.push(Message::assistant(content.clone()));
+        session
+            .lock()
+            .unwrap()
+            .push(Message::assistant(content.clone()));
+    }
+
+    let stop_reason = match end {
+        StreamEnd::Stopped(reason) => reason,
+        StreamEnd::Failed(ProviderError::Network(_)) => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: format!("request timeout after {stall_retries} retries"),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        // Any other failure was already reported as a terminal Error above.
+        StreamEnd::Failed(_) => return ThinkOutcome::Stopped,
+    };
+
+    match stop_reason {
+        StopReason::Stalled => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: format!("idle timeout after {stall_retries} retries"),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        StopReason::EndTurn => {}
+        StopReason::MaxTokens => {
+            messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
+            session
+                .lock()
+                .unwrap()
+                .push(Message::user(CONTINUE_AFTER_TRUNCATION));
+            return ThinkOutcome::RestartTurn;
+        }
+        StopReason::StopSequence => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: "stop sequence".into(),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        StopReason::Other(reason) => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted { reason },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+    }
+    ThinkOutcome::Content(content)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// What one ACT pass produced. `results` keeps `join_all`'s `Option` on
+/// purpose: `None` means the event channel was gone, so that tool's outcome is
+/// unknown and must not enter the transcript — flattening it here would make
+/// "channel closed" indistinguishable from "tool failed".
+struct ActOutcome {
+    results: Vec<(String, Option<ToolResult>)>,
+    denied: Vec<(String, ToolResult)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn act_phase(
+    tx: &EventTx,
+    inbox: &Option<InboxHandle>,
+    session: &Arc<Mutex<Session>>,
+    tools: &Arc<ToolRegistry>,
+    tool_call_tokens: &ToolCallTokens,
+    permission_checker: &Option<Arc<crate::permission::PermissionChecker>>,
+    decision_rx: &Option<DecisionRx>,
+    cancel_token: &CancellationToken,
+    tool_uses: Vec<(String, String, Value)>,
+    turn: u32,
+) -> Option<ActOutcome> {
+    // 3. ACT - permission check + parallel execution
+    info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
+
+    // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
+    let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
+    let mut denied_results: Vec<(String, ToolResult)> = Vec::new();
+    for (id, name, input) in tool_uses {
+        if let Some(checker) = &permission_checker {
+            let check_result = checker.check(&name, &input);
+            match check_result {
+                crate::permission::CheckResult::Allow => {
+                    checked_uses.push((id, name, input));
+                }
+                crate::permission::CheckResult::Deny => {
+                    let _ = tx
+                        .send(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            result: ToolResult::error("permission denied"),
+                        })
+                        .await;
+                    denied_results.push((id.clone(), ToolResult::error("permission denied")));
+                }
+                crate::permission::CheckResult::NeedConfirm(req) => {
+                    if let Some(decision_rx) = &decision_rx {
+                        let id_clone = id.clone();
+                        match handle_confirmation(
+                            tx,
+                            checker,
+                            decision_rx,
+                            cancel_token,
+                            id,
+                            name,
+                            input,
+                            req,
+                            "user denied",
+                        )
+                        .await
+                        {
+                            Some((id, name, input)) => checked_uses.push((id, name, input)),
+                            None => {
+                                denied_results.push((id_clone, ToolResult::error("user denied")))
+                            }
+                        }
+                    } else {
+                        // No decision channel - deny by default
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: ToolResult::error(
+                                    "permission required but no decision channel",
+                                ),
+                            })
+                            .await;
+                        denied_results.push((
+                            id.clone(),
+                            ToolResult::error("permission required but no decision channel"),
+                        ));
+                    }
+                }
+                crate::permission::CheckResult::Blacklisted(req) => {
+                    // 黑名单是硬红线:不可通过 Allow once / Always allow 绕过,
+                    // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
+                    // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
+                    let reason = match &req.kind {
+                        crate::permission::PermissionKind::Blacklisted(reason) => reason.clone(),
+                        _ => "blacklisted command".to_string(),
+                    };
+                    let message = format!("blocked by safety filter: {reason}");
+                    let _ = tx
+                        .send(AgentEvent::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            result: ToolResult::error(message.clone()),
+                        })
+                        .await;
+                    denied_results.push((id.clone(), ToolResult::error(message)));
+                }
+            }
+        } else {
+            // No permission checker - allow all (backward compatible)
+            checked_uses.push((id, name, input));
+        }
+    }
+
+    // Publish a kill token per call of this batch before racing them, and
+    // drop ids left over from the previous round. Done here (not after
+    // `Checker 3`) so the registration and the execution are adjacent: a
+    // kill can never land on a call the run loop has stopped waiting for —
+    // that would orphan the token and leave the command running.
+    {
+        let mut tokens = tool_call_tokens.lock().unwrap();
+        tokens.clear();
+        for (id, _, _) in &checked_uses {
+            tokens.insert(id.clone(), CancellationToken::new());
+        }
+    }
+    let futures: Vec<_> = checked_uses
+        .iter()
+        .map(|(id, name, input)| {
+            let tools = tools.clone();
+            let tx = tx.clone();
+            let tool_calls = tool_call_tokens.clone();
+            async move {
+                let tool_span = info_span!("tool_call", tool = %name, id = %id);
+                let _enter = tool_span.enter();
+                info!(input = %input, "tool call start");
+
+                if tx
+                    .send(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (id.clone(), None);
+                }
+
+                let tool = match tools.get(name) {
+                    Some(t) => t,
+                    None => {
+                        let result = ToolResult::error(format!("tool not found: {}", name));
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: result.clone(),
+                            })
+                            .await;
+                        return (id.clone(), Some(result));
+                    }
+                };
+
+                // Set up streaming channel + forwarder
+                let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
+                let fwd_tx = tx.clone();
+                let fwd_id = id.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = event_rx.recv().await {
+                        let agent_ev = match ev {
+                            ToolEvent::OutputDelta { stream, text } => {
+                                AgentEvent::ToolOutputDelta {
+                                    id: fwd_id.clone(),
+                                    stream,
+                                    text,
+                                }
+                            }
+                            ToolEvent::Exit { code } => AgentEvent::ToolExit {
+                                id: fwd_id.clone(),
+                                code,
+                            },
+                            ToolEvent::Timeout => AgentEvent::ToolTimeout { id: fwd_id.clone() },
+                            ToolEvent::Truncated { .. } => continue,
+                        };
+                        let _ = fwd_tx.send(agent_ev).await;
+                    }
+                });
+
+                // Race the call against its own kill token. Dropping the
+                // `call_stream` future is what reaps a spawned process
+                // group, so this is a real kill, not just a stopped wait.
+                let call_token = tool_calls
+                    .lock()
+                    .unwrap()
+                    .get(id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let result = tokio::select! {
+                    r = tool.call_stream(input.clone(), event_tx) => r,
+                    _ = call_token.cancelled() => {
+                        info!(tool = %name, "tool call killed by the user");
+                        let _ = tx
+                            .send(AgentEvent::ToolExit { id: id.clone(), code: None })
+                            .await;
+                        ToolResult::error(
+                            "killed by the user before it finished; its output is incomplete",
+                        )
+                    }
+                };
+
+                info!(is_error = result.is_error, "tool call done");
+
+                // Retire the token: a kill request arriving after this point
+                // must be reported as "nothing to kill", not silently
+                // accepted against a finished call.
+                tool_calls.lock().unwrap().remove(id.as_str());
+
+                if tx
+                    .send(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        result: result.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (id.clone(), None);
+                }
+
+                (id.clone(), Some(result))
+            }
+            .instrument(info_span!("tool", name = %name, id = %id))
+        })
+        .collect();
+
+    // Check 3: ACT 中 — select! between join_all and cancel
+    let results = tokio::select! {
+        r = futures::future::join_all(futures) => r,
+        _ = cancel_token.cancelled() => {
+            info!(turn, "agent loop cancelled during act");
+            // Cancel during ACT: the session holds this run's user prompt,
+            // every completed round-trip, and a trailing assistant(tool_use)
+            // whose results were never observed. Dropping that last message
+            // keeps the transcript valid (no unpaired tool_use) while
+            // preserving the completed work.
+            abort_run(tx, inbox, session).await;
+            return None;
+        }
+    };
+    Some(ActOutcome {
+        results,
+        denied: denied_results,
+    })
+}
+
+/// Feed tool results back into the transcript in tool_use order.
+#[allow(clippy::needless_pass_by_value)]
+fn observe_phase(
+    messages: &mut Vec<Message>,
+    session: &Arc<Mutex<Session>>,
+    results: Vec<(String, Option<ToolResult>)>,
+    denied: Vec<(String, ToolResult)>,
+) {
+    // 4. OBSERVE - feed results back in tool_use_id order
+    let mut tool_results: Vec<ContentBlock> = results
+        .into_iter()
+        .filter_map(|(id, result)| {
+            result.map(|r| ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: r.content,
+                is_error: r.is_error,
+            })
+        })
+        .collect();
+    // Add denied tool results so LLM sees them
+    for (id, result) in denied {
+        tool_results.push(ContentBlock::ToolResult {
+            tool_use_id: id,
+            content: result.content,
+            is_error: result.is_error,
+        });
+    }
+    let tool_results_msg = Message::tool_results(tool_results);
+    messages.push(tool_results_msg.clone());
+    session.lock().unwrap().push(tool_results_msg);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
@@ -968,10 +1608,7 @@ async fn run_loop(
             // run's user prompt and completed round-trips (same policy as a
             // cancel during the provider call).
             info!(turn, "agent loop cancelled during auto-compact");
-            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-            session.lock().unwrap().truncate(keep);
-            flush_unconsumed(&tx, &inbox).await;
-            let _ = tx.send(AgentEvent::Cancelled).await;
+            abort_run(&tx, &inbox, &session).await;
             return;
         }
         if let AutoCompact::Compacted(new_messages) = compacted {
@@ -1029,332 +1666,24 @@ async fn run_loop(
         last_logged = messages.len();
 
         // 1. THINK
-        //
-        // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
-        // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
-        // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
-        // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
-        // 请求体逐字不变（零回归）。
-        let request_messages = if config.preserve_thinking {
-            messages.clone()
-        } else {
-            crate::thinking::strip_thinking_except_last_assistant(&messages)
+        let content = match think_phase(
+            &tx,
+            &inbox,
+            &session,
+            &provider,
+            &tools,
+            &config,
+            &cancel_token,
+            &provider_turn_gate,
+            &mut messages,
+            turn,
+        )
+        .await
+        {
+            ThinkOutcome::Content(content) => content,
+            ThinkOutcome::Stopped => return,
+            ThinkOutcome::RestartTurn => continue,
         };
-        let req = ProviderRequest {
-            model: config.model.clone(),
-            system: config.system_prompt.clone(),
-            messages: request_messages,
-            tools: tools.schemas(),
-            params: config.gen_params.clone(),
-        };
-        // Emit a heuristic prefill estimate so the status bar shows activity
-        // before the provider returns real usage (OpenAI-compatible APIs only
-        // send usage at stream end).
-        let prefill_estimate = estimate_prefill_tokens(&req);
-        let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
-
-        // Retry loop for a transiently failed THINK attempt. Two families are
-        // retried: an idle stall / request deadline that ended the *stream*, and
-        // an outright provider rejection (429 / 5xx / network) that produced *no*
-        // stream at all. Both consume the same `stall_retries` budget, so the
-        // worst case inside one turn stays bounded by a single limit rather than
-        // two. Each attempt is a fresh provider turn (own lease); a failed
-        // attempt's partial content is never committed to the session.
-        let mut stall_retries: u16 = 0;
-        let (content, end, last_usage) = loop {
-            let provider_turn_lease = match &provider_turn_gate {
-                Some(gate) => match tokio::select! {
-                    lease = gate.acquire() => lease,
-                    _ = cancel_token.cancelled() => {
-                        flush_unconsumed(&tx, &inbox).await;
-                        let _ = tx.send(AgentEvent::Cancelled).await;
-                        return;
-                    }
-                } {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        let _ = tx
-                            .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
-                            .await;
-                        return;
-                    }
-                },
-                None => None,
-            };
-
-            let stream = tokio::select! {
-                result = provider.call_stream(req.clone()) => match result {
-                    Ok(s) => {
-                        tracing::info!(
-                            turn,
-                            "provider call_stream returned Ok, entering accumulate"
-                        );
-                        s
-                    }
-                    Err(e) => {
-                        warn!(turn, error = %e, "provider call failed");
-                        // A retryable outright rejection (429/5xx/network) is
-                        // retried with backoff instead of killing the turn: these
-                        // are capacity/transport conditions, so resending the same
-                        // request is the standard remedy. Deterministic failures
-                        // (InvalidRequest, Auth) get no such treatment.
-                        if let Some(cause) = retryable_provider_error_cause(&e) {
-                            if stall_retries < config.provider_error_retry_limit {
-                                stall_retries += 1;
-                                let delay =
-                                    stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                                tracing::warn!(
-                                    turn,
-                                    attempt = stall_retries,
-                                    max = config.provider_error_retry_limit,
-                                    delay_ms = delay.as_millis() as u64,
-                                    ?cause,
-                                    "provider rejected the request transiently; retrying after backoff"
-                                );
-                                // Surface it: a silent backoff looks like a hang.
-                                if tx
-                                    .send(AgentEvent::ProviderRetry {
-                                        attempt: stall_retries,
-                                        max: config.provider_error_retry_limit,
-                                        idle_secs: 0,
-                                        cause,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return; // Receiver dropped, stop the loop
-                                }
-                                // Release the turn lease before sleeping: a retry
-                                // backoff must not hold provider capacity.
-                                drop(provider_turn_lease);
-                                tokio::select! {
-                                    _ = tokio::time::sleep(delay) => {}
-                                    _ = cancel_token.cancelled() => {
-                                        info!(turn, "agent loop cancelled during retry backoff");
-                                        let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                                        session.lock().unwrap().truncate(keep);
-                                        flush_unconsumed(&tx, &inbox).await;
-                                        let _ = tx.send(AgentEvent::Cancelled).await;
-                                        return;
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        if tx
-                            .send(AgentEvent::Error(AgentError::Provider(e)))
-                            .await
-                            .is_err()
-                        {
-                            return; // Receiver dropped, stop the loop
-                        }
-                        return;
-                    }
-                },
-                _ = cancel_token.cancelled() => {
-                    // Cancel while the provider request is still in flight (the
-                    // HTTP response headers have not arrived yet). Real providers
-                    // await the network here for up to `DEFAULT_TIMEOUT_SECS`
-                    // (300s), so without this arm a Stop would be swallowed
-                    // until the call returned. No assistant reply exists yet,
-                    // so keep the run's user prompt and completed round-trips —
-                    // same policy as a cancel during THINK.
-                    info!(turn, "agent loop cancelled during provider call");
-                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                    session.lock().unwrap().truncate(keep);
-                    flush_unconsumed(&tx, &inbox).await;
-                    let _ = tx.send(AgentEvent::Cancelled).await;
-                    return;
-                }
-            };
-
-            // Check 2: THINK 中 — select! between accumulate and cancel
-            let attempt = tokio::select! {
-                result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
-                    Ok(v) => {
-                        tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
-                        v
-                    }
-                    Err(e) => {
-                        warn!(turn, error = %e, "provider stream error");
-                        if tx.send(AgentEvent::Error(e)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                },
-                _ = cancel_token.cancelled() => {
-                    info!(turn, "agent loop cancelled during think");
-                    // Cancel during THINK: no assistant reply exists yet, so this
-                    // keeps the run's user prompt and every completed round-trip.
-                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                    session.lock().unwrap().truncate(keep);
-                    flush_unconsumed(&tx, &inbox).await;
-                    let _ = tx.send(AgentEvent::Cancelled).await;
-                    return;
-                }
-            };
-
-            // Release the turn lease before sleeping: a retry backoff must not
-            // hold provider capacity.
-            drop(provider_turn_lease);
-
-            // Two transient modes are retryable: an idle stall and a request
-            // deadline. Everything else (malformed SSE payloads, connection
-            // resets, auth failures) is terminal.
-            //
-            // `Failed(Network)` is a load-bearing shorthand for "the request
-            // deadline elapsed": the providers only classify a *timeout* as
-            // `Network` here, and keep every other transport break as `Stream`.
-            // Widening that classification would silently start retrying
-            // connection resets, which the design explicitly excludes.
-            let retry_cause = match &attempt.1 {
-                StreamEnd::Stopped(StopReason::Stalled) => Some(RetryCause::IdleStall),
-                StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
-                _ => None,
-            };
-            if let Some(cause) = retry_cause {
-                if stall_retries < config.think_stall_retry_limit {
-                    stall_retries += 1;
-                    let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                    let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
-                    tracing::warn!(
-                        turn,
-                        attempt = stall_retries,
-                        max = config.think_stall_retry_limit,
-                        delay_ms = delay.as_millis() as u64,
-                        ?cause,
-                        "think phase failed transiently; retrying after backoff"
-                    );
-                    // Surface the retry: a silent backoff looks like a hang.
-                    if tx
-                        .send(AgentEvent::ProviderRetry {
-                            attempt: stall_retries,
-                            max: config.think_stall_retry_limit,
-                            idle_secs,
-                            cause,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return; // Receiver dropped, stop the loop
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = cancel_token.cancelled() => {
-                            info!(turn, "agent loop cancelled during retry backoff");
-                            // Same policy as the other cancel points: keep the
-                            // run's user prompt and completed round-trips.
-                            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                            session.lock().unwrap().truncate(keep);
-                            flush_unconsumed(&tx, &inbox).await;
-                            let _ = tx.send(AgentEvent::Cancelled).await;
-                            return;
-                        }
-                    }
-                    continue;
-                }
-            }
-            break attempt;
-        };
-
-        if let Some(usage) = last_usage {
-            session
-                .lock()
-                .unwrap()
-                .set_last_input_tokens(Some(usage.input_tokens));
-        }
-
-        // Log the full accumulated response content at debug level (never repeats across turns).
-        debug!(turn, content = ?content, "think: response");
-
-        // A non-retryable transport failure (malformed SSE payload, connection
-        // reset, ...) is terminal. Retryable timeouts never reach here: they
-        // either succeeded on a later attempt or exhausted the retry budget,
-        // in which case the terminal reason below explains it.
-        if let StreamEnd::Failed(error) = &end {
-            if !matches!(error, ProviderError::Network(_)) {
-                let _ = tx
-                    .send(AgentEvent::Error(AgentError::Provider(error.clone())))
-                    .await;
-                return;
-            }
-        }
-
-        // An exhausted transient failure is terminal and its partial must NOT
-        // enter the session: a stream can end mid-tool-call, leaving an
-        // unpaired `tool_use` that would make the next provider request
-        // invalid. The same applies to a failed attempt (no valid stop).
-        let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
-        let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
-        if !exhausted_stall && !exhausted_timeout {
-            messages.push(Message::assistant(content.clone()));
-            session
-                .lock()
-                .unwrap()
-                .push(Message::assistant(content.clone()));
-        }
-
-        let stop_reason = match end {
-            StreamEnd::Stopped(reason) => reason,
-            StreamEnd::Failed(ProviderError::Network(_)) => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: format!("request timeout after {stall_retries} retries"),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            // Any other failure was already reported as a terminal Error above.
-            StreamEnd::Failed(_) => return,
-        };
-
-        match stop_reason {
-            StopReason::Stalled => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: format!("idle timeout after {stall_retries} retries"),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            StopReason::EndTurn => {}
-            StopReason::MaxTokens => {
-                messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
-                session
-                    .lock()
-                    .unwrap()
-                    .push(Message::user(CONTINUE_AFTER_TRUNCATION));
-                continue;
-            }
-            StopReason::StopSequence => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: "stop sequence".into(),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            StopReason::Other(reason) => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted { reason },
-                    })
-                    .await;
-                return;
-            }
-        }
-
         // 2. Termination check
         let tool_uses: Vec<(String, String, Value)> = content
             .iter()
@@ -1390,258 +1719,25 @@ async fn run_loop(
         }
 
         // 3. ACT - permission check + parallel execution
-        info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
-
-        // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
-        let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
-        let mut denied_results: Vec<(String, ToolResult)> = Vec::new();
-        for (id, name, input) in tool_uses {
-            if let Some(checker) = &permission_checker {
-                let check_result = checker.check(&name, &input);
-                match check_result {
-                    crate::permission::CheckResult::Allow => {
-                        checked_uses.push((id, name, input));
-                    }
-                    crate::permission::CheckResult::Deny => {
-                        let _ = tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                result: ToolResult::error("permission denied"),
-                            })
-                            .await;
-                        denied_results.push((id.clone(), ToolResult::error("permission denied")));
-                    }
-                    crate::permission::CheckResult::NeedConfirm(req) => {
-                        if let Some(decision_rx) = &decision_rx {
-                            let id_clone = id.clone();
-                            match handle_confirmation(
-                                &tx,
-                                checker,
-                                decision_rx,
-                                &cancel_token,
-                                id,
-                                name,
-                                input,
-                                req,
-                                "user denied",
-                            )
-                            .await
-                            {
-                                Some((id, name, input)) => checked_uses.push((id, name, input)),
-                                None => denied_results
-                                    .push((id_clone, ToolResult::error("user denied"))),
-                            }
-                        } else {
-                            // No decision channel - deny by default
-                            let _ = tx
-                                .send(AgentEvent::ToolResult {
-                                    id: id.clone(),
-                                    result: ToolResult::error(
-                                        "permission required but no decision channel",
-                                    ),
-                                })
-                                .await;
-                            denied_results.push((
-                                id.clone(),
-                                ToolResult::error("permission required but no decision channel"),
-                            ));
-                        }
-                    }
-                    crate::permission::CheckResult::Blacklisted(req) => {
-                        // 黑名单是硬红线:不可通过 Allow once / Always allow 绕过,
-                        // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
-                        // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
-                        let reason = match &req.kind {
-                            crate::permission::PermissionKind::Blacklisted(reason) => {
-                                reason.clone()
-                            }
-                            _ => "blacklisted command".to_string(),
-                        };
-                        let message = format!("blocked by safety filter: {reason}");
-                        let _ = tx
-                            .send(AgentEvent::ToolCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            })
-                            .await;
-                        let _ = tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                result: ToolResult::error(message.clone()),
-                            })
-                            .await;
-                        denied_results.push((id.clone(), ToolResult::error(message)));
-                    }
-                }
-            } else {
-                // No permission checker - allow all (backward compatible)
-                checked_uses.push((id, name, input));
-            }
-        }
-
-        // Publish a kill token per call of this batch before racing them, and
-        // drop ids left over from the previous round. Done here (not after
-        // `Checker 3`) so the registration and the execution are adjacent: a
-        // kill can never land on a call the run loop has stopped waiting for —
-        // that would orphan the token and leave the command running.
-        {
-            let mut tokens = tool_call_tokens.lock().unwrap();
-            tokens.clear();
-            for (id, _, _) in &checked_uses {
-                tokens.insert(id.clone(), CancellationToken::new());
-            }
-        }
-        let futures: Vec<_> = checked_uses
-            .iter()
-            .map(|(id, name, input)| {
-                let tools = tools.clone();
-                let tx = tx.clone();
-                let tool_calls = tool_call_tokens.clone();
-                async move {
-                    let tool_span = info_span!("tool_call", tool = %name, id = %id);
-                    let _enter = tool_span.enter();
-                    info!(input = %input, "tool call start");
-
-                    if tx
-                        .send(AgentEvent::ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return (id.clone(), None);
-                    }
-
-                    let tool = match tools.get(name) {
-                        Some(t) => t,
-                        None => {
-                            let result = ToolResult::error(format!("tool not found: {}", name));
-                            let _ = tx
-                                .send(AgentEvent::ToolResult {
-                                    id: id.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-                            return (id.clone(), Some(result));
-                        }
-                    };
-
-                    // Set up streaming channel + forwarder
-                    let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
-                    let fwd_tx = tx.clone();
-                    let fwd_id = id.clone();
-                    tokio::spawn(async move {
-                        while let Some(ev) = event_rx.recv().await {
-                            let agent_ev = match ev {
-                                ToolEvent::OutputDelta { stream, text } => {
-                                    AgentEvent::ToolOutputDelta {
-                                        id: fwd_id.clone(),
-                                        stream,
-                                        text,
-                                    }
-                                }
-                                ToolEvent::Exit { code } => AgentEvent::ToolExit {
-                                    id: fwd_id.clone(),
-                                    code,
-                                },
-                                ToolEvent::Timeout => {
-                                    AgentEvent::ToolTimeout { id: fwd_id.clone() }
-                                }
-                                ToolEvent::Truncated { .. } => continue,
-                            };
-                            let _ = fwd_tx.send(agent_ev).await;
-                        }
-                    });
-
-                    // Race the call against its own kill token. Dropping the
-                    // `call_stream` future is what reaps a spawned process
-                    // group, so this is a real kill, not just a stopped wait.
-                    let call_token = tool_calls
-                        .lock()
-                        .unwrap()
-                        .get(id.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-                    let result = tokio::select! {
-                        r = tool.call_stream(input.clone(), event_tx) => r,
-                        _ = call_token.cancelled() => {
-                            info!(tool = %name, "tool call killed by the user");
-                            let _ = tx
-                                .send(AgentEvent::ToolExit { id: id.clone(), code: None })
-                                .await;
-                            ToolResult::error(
-                                "killed by the user before it finished; its output is incomplete",
-                            )
-                        }
-                    };
-
-                    info!(is_error = result.is_error, "tool call done");
-
-                    // Retire the token: a kill request arriving after this point
-                    // must be reported as "nothing to kill", not silently
-                    // accepted against a finished call.
-                    tool_calls.lock().unwrap().remove(id.as_str());
-
-                    if tx
-                        .send(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            result: result.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return (id.clone(), None);
-                    }
-
-                    (id.clone(), Some(result))
-                }
-                .instrument(info_span!("tool", name = %name, id = %id))
-            })
-            .collect();
-
-        // Check 3: ACT 中 — select! between join_all and cancel
-        let results = tokio::select! {
-            r = futures::future::join_all(futures) => r,
-            _ = cancel_token.cancelled() => {
-                info!(turn, "agent loop cancelled during act");
-                // Cancel during ACT: the session holds this run's user prompt,
-                // every completed round-trip, and a trailing assistant(tool_use)
-                // whose results were never observed. Dropping that last message
-                // keeps the transcript valid (no unpaired tool_use) while
-                // preserving the completed work.
-                let keep = safe_cancel_truncate_len(&session.lock().unwrap());
-                session.lock().unwrap().truncate(keep);
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx.send(AgentEvent::Cancelled).await;
-                return;
-            }
+        let Some(outcome) = act_phase(
+            &tx,
+            &inbox,
+            &session,
+            &tools,
+            &tool_call_tokens,
+            &permission_checker,
+            &decision_rx,
+            &cancel_token,
+            tool_uses,
+            turn,
+        )
+        .await
+        else {
+            return;
         };
 
         // 4. OBSERVE - feed results back in tool_use_id order
-        let mut tool_results: Vec<ContentBlock> = results
-            .into_iter()
-            .filter_map(|(id, result)| {
-                result.map(|r| ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: r.content,
-                    is_error: r.is_error,
-                })
-            })
-            .collect();
-        // Add denied tool results so LLM sees them
-        for (id, result) in denied_results {
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: result.content,
-                is_error: result.is_error,
-            });
-        }
-        let tool_results_msg = Message::tool_results(tool_results);
-        messages.push(tool_results_msg.clone());
-        session.lock().unwrap().push(tool_results_msg);
+        observe_phase(&mut messages, &session, outcome.results, outcome.denied);
     }
 }
 
