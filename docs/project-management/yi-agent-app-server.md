@@ -160,3 +160,32 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
       `PreventUserIdleSystemSleep named: "yi-agent: keeping the machine awake for work"`）、
       `cargo test -p yi-agent-app-server power_busy`、
       `cargo test -p yi-agent-app-server probing_busy_does_not_prevent_runtime_eviction`。
+- [x] 测试代码按域下沉（C1 测试搬移，`server.rs` 10,972 → 7,567 行）——把长期塞在
+      `server.rs` 里的 11 个内联 `#[cfg(test)] mod` 平移到 `src/server/`，再把
+      21,434 行的 `src/rpc_tests.rs` 拆成 `src/server/tests/` 目录模块：`mod.rs`
+      （2,800 行，纯夹具 117 项 + 1 个测试）加 11 个域文件。域划分依据是**调用传递
+      闭包**（测试 → 辅助函数 → RPC 方法串），不是测试名关键词启发式；每个文件
+      测试数实测 `thread_index` 73 / `turn` 62 / `model_settings` 60 /
+      `thread_lifecycle` 40 / `image` 29 / `lead` 29 / `process` 24 /
+      `transport` 24 / `assembly` 20 / `plugin_theme` 16 / `title` 10，合计 388。
+
+      **三条必须守住的约束**：① 目录模块化后子模块名 `image` 会遮蔽同名 crate，
+      `image::RgbImage` / `ImageFormat` / `Rgb` 一律改 `::image::`（域文件与
+      `mod.rs` 共 12 处，替换正则须 `(?<![:\w])image::` 否则会把 `::image::` 二次
+      替换成 `::::image::`）；② 模块级文档注释必须转 `//!`，`///` 留在
+      `#[cfg(test)]` 之前会挂到第一条 `use` 上并触发
+      `clippy::empty_lines_after_doc_comment`（`-D warnings` 下是硬错误），删函数
+      时也必须连 `///` 一起删；③ `server::tests::child_holds_thread_lock` **留在
+      `mod.rs` 父层**——它被 `thread_index` 里的
+      `writer_lock_refuses_a_second_writer_on_the_same_thread` 以
+      `--exact "server::tests::child_holds_thread_lock" --ignored` 拉起，下沉后会
+      变成 `server::tests::thread_index::...` 而静默失败（`--exact` 不匹配时 libtest
+      返回 `0 passed` 且 **exit 0**，只有看到测试名出现在输出里才算真的验过）。
+
+      验收口径：`cargo test --lib -- --list` 的测试名集合与基线**完全相等**
+      （1,158 条，仅模块前缀变化）；`cargo test -p yi-agent-app-server --lib
+      --all-features` 为 1,151 passed / 0 failed / 7 ignored，与重构前一致；
+      `just ci` 全绿（nextest 3,957 passed / 27 skipped）。代码：
+      `src/server.rs`、`src/server/`（12 个 `.rs`）、`src/server/tests/`（12 个
+      `.rs`）。— [设计](../../superpowers/specs/2026-11-01-test-extraction-c1-design.md)、
+      [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)
