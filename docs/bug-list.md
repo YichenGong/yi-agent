@@ -1,5 +1,11 @@
 # Bug 列表
 
+- [x] 承上（第三处同形实现）：`GitDiffView` 自带一份秒级相对时间，提交时间戳缺失时渲染成「20758 天前」。
+  **发现方式**：修完提示条后全仓库检索相对时间的实现，发现共有三份独立实现——`lib/relativeTime.ts`（已加固）、`CacheNotice`（已加固）、以及 `GitDiffView.tsx:32` 那份额外的秒级 `relativeTime`。
+  **实测（探针）**：`timestamp: 0` → `20758 天前`（与用户报的「20xxxd」完全同形），`timestamp: NaN` → `NaN 天前`，`Infinity` → `刚刚`。三个值都不是合法时间戳，却各自渲染出一个「看起来像时间」的字符串。生产侧 `git_diff.rs:333` 用 `.ok()?` 丢弃解析失败的记录，所以线上尚未触发——但这是**靠调用方自律**，函数本身零测试覆盖（`GitDiffView.test.tsx` 里没有任何时间断言）。
+  **修复**：删掉本地实现，改经 `commitAge()` 复用 `lib/relativeTime` 的 `formatRelativeTime`（协议里 `CommitInfo.timestamp` 是**秒**，先 `* 1000` 换算到毫秒）。非有限值/≤0 一律返回空串——提交条左侧已有短 sha，补一个假时间只会误导。显示格式随公共实现统一为 `3m` / `2h` / `5d`，与侧栏一致（原先这里是「3 分钟前」，两处不一致本身也是个小毛病）。
+  **验证**：`cd desktop && npx tsc --noEmit && npx vitest run`（1858 全绿，140 文件）。**回退即红（实测）**：还原 `GitDiffView.tsx` 后 `does not invent a day count when a commit timestamp is missing` 与 `does not render NaN for a non-numeric commit timestamp` 两条全红；恢复即 14 全绿。
+
 - [x] 承上：离线段在「**根本没有缓存**」时仍声称「离线内容」，说的是用户看不到的东西。
   **发现方式**：修完 `20xxxd` 后复查同一渲染条件（`desktop/src/App.tsx:2630-2634`）。提示条的显示条件是 `(offline && cachedAt.has(id)) || syncState === "syncing"`，而 `savedAt` 取 `cachedAt.get(id) ?? null`——两个分支并不等价：走 `syncing` 那条时 `cachedAt` **可以没有**这个 id，于是 `savedAt` 为 null。上一版把 null 翻成「离线内容 · 更新时间未知」，数字是诚实了，但那句话仍然断言「屏幕上是离线内容」。
   **实测（探针，非推理）**：在 `App.test.tsx` 的同类场景（手机端 + 列表缓存 + `thread/resume` 挂起、无内容缓存）里打印 `document.body.textContent`，得到 `离线内容 · 更新时间未知`，而正文区**没有任何消息文本**（`PROBE_HAS_MSG_TEXT: false`）——提示条在介绍一份不存在的缓存。
