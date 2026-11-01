@@ -262,10 +262,11 @@ Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉�
   容易成为黑洞(进去就出不来)。
 - 每条 feature 必须带**可验证的完成判据**:代码位置(`file.rs:line`)或
   可执行命令,不要写"已实现权限管理"这种主观描述。
-- 更新模块文件后,同步更新 `README.md` 模块索引表的"完成 / 总计"计数。
+- 更新模块文件后,同步更新 `docs/project-management/README.md` 模块索引表的
+  "完成 / 总计"计数(根 `README.md` 是面向用户的精简版,不再放模块索引)。
 - **新增 crate 时**,同一 PR 内必须:
   1. 在 `docs/project-management/` 下创建对应模块文件
-  2. 在 `README.md` 模块索引表登记一行
+  2. 在 `docs/project-management/README.md` 模块索引表登记一行
 - `bug-list.md` 同理:只有 `[x]` 已修复 / `[ ]` 未修复两态,不用 `[~]`。
 - 维护规则详见 `docs/project-management/README.md` 末尾"维护规则"小节。
 
