@@ -929,17 +929,12 @@ async fn flush_unconsumed(tx: &EventTx, inbox: &Option<InboxHandle>) {
     let _ = tx.send(AgentEvent::InterjectionsReturned { items }).await;
 }
 
-/// The single stop path for every cancellation point that has an assistant
-/// message in flight: roll the session back to its last consistent boundary,
-/// drain queued interjections so they are not silently lost, tell the
-/// consumer, and let the caller `return`.
+/// The single stop path for every cancellation point with a message in flight:
+/// roll the session back to its last consistent boundary, drain queued
+/// interjections, tell the consumer, and let the caller `return`.
 ///
-/// The six call sites differ only in their `tracing` text — and two of them
-/// share a spelling on purpose while belonging to different retry families
-/// (provider rejection vs. stream stall) — so each call site keeps its own
-/// `info!` immediately above this call rather than passing a reason in. The
-/// rollback length comes from [`safe_cancel_truncate_len`], which already
-/// encodes "keep the run's user prompt and every completed round-trip".
+/// Call sites keep their own `info!` above the call: two of them share a
+/// spelling on purpose while belonging to different retry families.
 async fn abort_run(tx: &EventTx, inbox: &Option<InboxHandle>, session: &Arc<Mutex<Session>>) {
     let keep = safe_cancel_truncate_len(&session.lock().unwrap());
     session.lock().unwrap().truncate(keep);
@@ -947,21 +942,15 @@ async fn abort_run(tx: &EventTx, inbox: &Option<InboxHandle>, session: &Arc<Mute
     let _ = tx.send(AgentEvent::Cancelled).await;
 }
 
-/// How one THINK attempt handed control back to `run_loop`.
-///
-/// Three states, because THINK can end in three ways that the caller must
-/// handle differently: fall through to the termination check, leave the run
-/// entirely, or start the turn over. The last one exists for `MaxTokens`,
-/// where the truncation prompt was already pushed into the session and the
-/// only correct next step is another THINK.
+/// How one THINK attempt hands control back to `run_loop`: fall through to the
+/// termination check, leave the run, or restart the turn. The last exists for
+/// `MaxTokens`, where the truncation prompt was already pushed into the session.
 enum ThinkOutcome {
     /// The assistant reply is complete; run the termination check on it.
     Content(Vec<ContentBlock>),
-    /// A stop path already emitted its terminal event (and, when it was a
-    /// cancel, rolled the session back). `run_loop` returns immediately.
+    /// A stop path already emitted its terminal event (and any rollback).
     Stopped,
-    /// `MaxTokens`: the continue-after-truncation prompt was pushed to both
-    /// `messages` and the session, so the turn must restart from THINK.
+    /// `MaxTokens`: the truncation prompt is in place; THINK again.
     RestartTurn,
 }
 
@@ -1296,6 +1285,291 @@ async fn think_phase(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// What one ACT pass produced. `results` keeps `join_all`'s `Option` on
+/// purpose: `None` means the event channel was gone, so that tool's outcome is
+/// unknown and must not enter the transcript — flattening it here would make
+/// "channel closed" indistinguishable from "tool failed".
+struct ActOutcome {
+    results: Vec<(String, Option<ToolResult>)>,
+    denied: Vec<(String, ToolResult)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn act_phase(
+    tx: &EventTx,
+    inbox: &Option<InboxHandle>,
+    session: &Arc<Mutex<Session>>,
+    tools: &Arc<ToolRegistry>,
+    tool_call_tokens: &ToolCallTokens,
+    permission_checker: &Option<Arc<crate::permission::PermissionChecker>>,
+    decision_rx: &Option<DecisionRx>,
+    cancel_token: &CancellationToken,
+    tool_uses: Vec<(String, String, Value)>,
+    turn: u32,
+) -> Option<ActOutcome> {
+    // 3. ACT - permission check + parallel execution
+    info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
+
+    // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
+    let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
+    let mut denied_results: Vec<(String, ToolResult)> = Vec::new();
+    for (id, name, input) in tool_uses {
+        if let Some(checker) = &permission_checker {
+            let check_result = checker.check(&name, &input);
+            match check_result {
+                crate::permission::CheckResult::Allow => {
+                    checked_uses.push((id, name, input));
+                }
+                crate::permission::CheckResult::Deny => {
+                    let _ = tx
+                        .send(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            result: ToolResult::error("permission denied"),
+                        })
+                        .await;
+                    denied_results.push((id.clone(), ToolResult::error("permission denied")));
+                }
+                crate::permission::CheckResult::NeedConfirm(req) => {
+                    if let Some(decision_rx) = &decision_rx {
+                        let id_clone = id.clone();
+                        match handle_confirmation(
+                            tx,
+                            checker,
+                            decision_rx,
+                            cancel_token,
+                            id,
+                            name,
+                            input,
+                            req,
+                            "user denied",
+                        )
+                        .await
+                        {
+                            Some((id, name, input)) => checked_uses.push((id, name, input)),
+                            None => {
+                                denied_results.push((id_clone, ToolResult::error("user denied")))
+                            }
+                        }
+                    } else {
+                        // No decision channel - deny by default
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: ToolResult::error(
+                                    "permission required but no decision channel",
+                                ),
+                            })
+                            .await;
+                        denied_results.push((
+                            id.clone(),
+                            ToolResult::error("permission required but no decision channel"),
+                        ));
+                    }
+                }
+                crate::permission::CheckResult::Blacklisted(req) => {
+                    // 黑名单是硬红线:不可通过 Allow once / Always allow 绕过,
+                    // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
+                    // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
+                    let reason = match &req.kind {
+                        crate::permission::PermissionKind::Blacklisted(reason) => reason.clone(),
+                        _ => "blacklisted command".to_string(),
+                    };
+                    let message = format!("blocked by safety filter: {reason}");
+                    let _ = tx
+                        .send(AgentEvent::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(AgentEvent::ToolResult {
+                            id: id.clone(),
+                            result: ToolResult::error(message.clone()),
+                        })
+                        .await;
+                    denied_results.push((id.clone(), ToolResult::error(message)));
+                }
+            }
+        } else {
+            // No permission checker - allow all (backward compatible)
+            checked_uses.push((id, name, input));
+        }
+    }
+
+    // Publish a kill token per call of this batch before racing them, and
+    // drop ids left over from the previous round. Done here (not after
+    // `Checker 3`) so the registration and the execution are adjacent: a
+    // kill can never land on a call the run loop has stopped waiting for —
+    // that would orphan the token and leave the command running.
+    {
+        let mut tokens = tool_call_tokens.lock().unwrap();
+        tokens.clear();
+        for (id, _, _) in &checked_uses {
+            tokens.insert(id.clone(), CancellationToken::new());
+        }
+    }
+    let futures: Vec<_> = checked_uses
+        .iter()
+        .map(|(id, name, input)| {
+            let tools = tools.clone();
+            let tx = tx.clone();
+            let tool_calls = tool_call_tokens.clone();
+            async move {
+                let tool_span = info_span!("tool_call", tool = %name, id = %id);
+                let _enter = tool_span.enter();
+                info!(input = %input, "tool call start");
+
+                if tx
+                    .send(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (id.clone(), None);
+                }
+
+                let tool = match tools.get(name) {
+                    Some(t) => t,
+                    None => {
+                        let result = ToolResult::error(format!("tool not found: {}", name));
+                        let _ = tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                result: result.clone(),
+                            })
+                            .await;
+                        return (id.clone(), Some(result));
+                    }
+                };
+
+                // Set up streaming channel + forwarder
+                let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
+                let fwd_tx = tx.clone();
+                let fwd_id = id.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = event_rx.recv().await {
+                        let agent_ev = match ev {
+                            ToolEvent::OutputDelta { stream, text } => {
+                                AgentEvent::ToolOutputDelta {
+                                    id: fwd_id.clone(),
+                                    stream,
+                                    text,
+                                }
+                            }
+                            ToolEvent::Exit { code } => AgentEvent::ToolExit {
+                                id: fwd_id.clone(),
+                                code,
+                            },
+                            ToolEvent::Timeout => AgentEvent::ToolTimeout { id: fwd_id.clone() },
+                            ToolEvent::Truncated { .. } => continue,
+                        };
+                        let _ = fwd_tx.send(agent_ev).await;
+                    }
+                });
+
+                // Race the call against its own kill token. Dropping the
+                // `call_stream` future is what reaps a spawned process
+                // group, so this is a real kill, not just a stopped wait.
+                let call_token = tool_calls
+                    .lock()
+                    .unwrap()
+                    .get(id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let result = tokio::select! {
+                    r = tool.call_stream(input.clone(), event_tx) => r,
+                    _ = call_token.cancelled() => {
+                        info!(tool = %name, "tool call killed by the user");
+                        let _ = tx
+                            .send(AgentEvent::ToolExit { id: id.clone(), code: None })
+                            .await;
+                        ToolResult::error(
+                            "killed by the user before it finished; its output is incomplete",
+                        )
+                    }
+                };
+
+                info!(is_error = result.is_error, "tool call done");
+
+                // Retire the token: a kill request arriving after this point
+                // must be reported as "nothing to kill", not silently
+                // accepted against a finished call.
+                tool_calls.lock().unwrap().remove(id.as_str());
+
+                if tx
+                    .send(AgentEvent::ToolResult {
+                        id: id.clone(),
+                        result: result.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (id.clone(), None);
+                }
+
+                (id.clone(), Some(result))
+            }
+            .instrument(info_span!("tool", name = %name, id = %id))
+        })
+        .collect();
+
+    // Check 3: ACT 中 — select! between join_all and cancel
+    let results = tokio::select! {
+        r = futures::future::join_all(futures) => r,
+        _ = cancel_token.cancelled() => {
+            info!(turn, "agent loop cancelled during act");
+            // Cancel during ACT: the session holds this run's user prompt,
+            // every completed round-trip, and a trailing assistant(tool_use)
+            // whose results were never observed. Dropping that last message
+            // keeps the transcript valid (no unpaired tool_use) while
+            // preserving the completed work.
+            abort_run(tx, inbox, session).await;
+            return None;
+        }
+    };
+    Some(ActOutcome {
+        results,
+        denied: denied_results,
+    })
+}
+
+/// Feed tool results back into the transcript in tool_use order.
+#[allow(clippy::needless_pass_by_value)]
+fn observe_phase(
+    messages: &mut Vec<Message>,
+    session: &Arc<Mutex<Session>>,
+    results: Vec<(String, Option<ToolResult>)>,
+    denied: Vec<(String, ToolResult)>,
+) {
+    // 4. OBSERVE - feed results back in tool_use_id order
+    let mut tool_results: Vec<ContentBlock> = results
+        .into_iter()
+        .filter_map(|(id, result)| {
+            result.map(|r| ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: r.content,
+                is_error: r.is_error,
+            })
+        })
+        .collect();
+    // Add denied tool results so LLM sees them
+    for (id, result) in denied {
+        tool_results.push(ContentBlock::ToolResult {
+            tool_use_id: id,
+            content: result.content,
+            is_error: result.is_error,
+        });
+    }
+    let tool_results_msg = Message::tool_results(tool_results);
+    messages.push(tool_results_msg.clone());
+    session.lock().unwrap().push(tool_results_msg);
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
     provider: Arc<dyn Provider>,
@@ -1445,255 +1719,25 @@ async fn run_loop(
         }
 
         // 3. ACT - permission check + parallel execution
-        info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
-
-        // 权限检查阶段: 在并行执行前逐个检查,过滤被拒绝的工具
-        let mut checked_uses: Vec<(String, String, Value)> = Vec::new();
-        let mut denied_results: Vec<(String, ToolResult)> = Vec::new();
-        for (id, name, input) in tool_uses {
-            if let Some(checker) = &permission_checker {
-                let check_result = checker.check(&name, &input);
-                match check_result {
-                    crate::permission::CheckResult::Allow => {
-                        checked_uses.push((id, name, input));
-                    }
-                    crate::permission::CheckResult::Deny => {
-                        let _ = tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                result: ToolResult::error("permission denied"),
-                            })
-                            .await;
-                        denied_results.push((id.clone(), ToolResult::error("permission denied")));
-                    }
-                    crate::permission::CheckResult::NeedConfirm(req) => {
-                        if let Some(decision_rx) = &decision_rx {
-                            let id_clone = id.clone();
-                            match handle_confirmation(
-                                &tx,
-                                checker,
-                                decision_rx,
-                                &cancel_token,
-                                id,
-                                name,
-                                input,
-                                req,
-                                "user denied",
-                            )
-                            .await
-                            {
-                                Some((id, name, input)) => checked_uses.push((id, name, input)),
-                                None => denied_results
-                                    .push((id_clone, ToolResult::error("user denied"))),
-                            }
-                        } else {
-                            // No decision channel - deny by default
-                            let _ = tx
-                                .send(AgentEvent::ToolResult {
-                                    id: id.clone(),
-                                    result: ToolResult::error(
-                                        "permission required but no decision channel",
-                                    ),
-                                })
-                                .await;
-                            denied_results.push((
-                                id.clone(),
-                                ToolResult::error("permission required but no decision channel"),
-                            ));
-                        }
-                    }
-                    crate::permission::CheckResult::Blacklisted(req) => {
-                        // 黑名单是硬红线:不可通过 Allow once / Always allow 绕过,
-                        // 因此不走确认流程。这里仍先发 ToolCall,让 TUI 能渲染出
-                        // 这次被拒的调用;否则拒绝会变成静默,用户会误以为命令已执行。
-                        let reason = match &req.kind {
-                            crate::permission::PermissionKind::Blacklisted(reason) => {
-                                reason.clone()
-                            }
-                            _ => "blacklisted command".to_string(),
-                        };
-                        let message = format!("blocked by safety filter: {reason}");
-                        let _ = tx
-                            .send(AgentEvent::ToolCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            })
-                            .await;
-                        let _ = tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                result: ToolResult::error(message.clone()),
-                            })
-                            .await;
-                        denied_results.push((id.clone(), ToolResult::error(message)));
-                    }
-                }
-            } else {
-                // No permission checker - allow all (backward compatible)
-                checked_uses.push((id, name, input));
-            }
-        }
-
-        // Publish a kill token per call of this batch before racing them, and
-        // drop ids left over from the previous round. Done here (not after
-        // `Checker 3`) so the registration and the execution are adjacent: a
-        // kill can never land on a call the run loop has stopped waiting for —
-        // that would orphan the token and leave the command running.
-        {
-            let mut tokens = tool_call_tokens.lock().unwrap();
-            tokens.clear();
-            for (id, _, _) in &checked_uses {
-                tokens.insert(id.clone(), CancellationToken::new());
-            }
-        }
-        let futures: Vec<_> = checked_uses
-            .iter()
-            .map(|(id, name, input)| {
-                let tools = tools.clone();
-                let tx = tx.clone();
-                let tool_calls = tool_call_tokens.clone();
-                async move {
-                    let tool_span = info_span!("tool_call", tool = %name, id = %id);
-                    let _enter = tool_span.enter();
-                    info!(input = %input, "tool call start");
-
-                    if tx
-                        .send(AgentEvent::ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return (id.clone(), None);
-                    }
-
-                    let tool = match tools.get(name) {
-                        Some(t) => t,
-                        None => {
-                            let result = ToolResult::error(format!("tool not found: {}", name));
-                            let _ = tx
-                                .send(AgentEvent::ToolResult {
-                                    id: id.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-                            return (id.clone(), Some(result));
-                        }
-                    };
-
-                    // Set up streaming channel + forwarder
-                    let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
-                    let fwd_tx = tx.clone();
-                    let fwd_id = id.clone();
-                    tokio::spawn(async move {
-                        while let Some(ev) = event_rx.recv().await {
-                            let agent_ev = match ev {
-                                ToolEvent::OutputDelta { stream, text } => {
-                                    AgentEvent::ToolOutputDelta {
-                                        id: fwd_id.clone(),
-                                        stream,
-                                        text,
-                                    }
-                                }
-                                ToolEvent::Exit { code } => AgentEvent::ToolExit {
-                                    id: fwd_id.clone(),
-                                    code,
-                                },
-                                ToolEvent::Timeout => {
-                                    AgentEvent::ToolTimeout { id: fwd_id.clone() }
-                                }
-                                ToolEvent::Truncated { .. } => continue,
-                            };
-                            let _ = fwd_tx.send(agent_ev).await;
-                        }
-                    });
-
-                    // Race the call against its own kill token. Dropping the
-                    // `call_stream` future is what reaps a spawned process
-                    // group, so this is a real kill, not just a stopped wait.
-                    let call_token = tool_calls
-                        .lock()
-                        .unwrap()
-                        .get(id.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-                    let result = tokio::select! {
-                        r = tool.call_stream(input.clone(), event_tx) => r,
-                        _ = call_token.cancelled() => {
-                            info!(tool = %name, "tool call killed by the user");
-                            let _ = tx
-                                .send(AgentEvent::ToolExit { id: id.clone(), code: None })
-                                .await;
-                            ToolResult::error(
-                                "killed by the user before it finished; its output is incomplete",
-                            )
-                        }
-                    };
-
-                    info!(is_error = result.is_error, "tool call done");
-
-                    // Retire the token: a kill request arriving after this point
-                    // must be reported as "nothing to kill", not silently
-                    // accepted against a finished call.
-                    tool_calls.lock().unwrap().remove(id.as_str());
-
-                    if tx
-                        .send(AgentEvent::ToolResult {
-                            id: id.clone(),
-                            result: result.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return (id.clone(), None);
-                    }
-
-                    (id.clone(), Some(result))
-                }
-                .instrument(info_span!("tool", name = %name, id = %id))
-            })
-            .collect();
-
-        // Check 3: ACT 中 — select! between join_all and cancel
-        let results = tokio::select! {
-            r = futures::future::join_all(futures) => r,
-            _ = cancel_token.cancelled() => {
-                info!(turn, "agent loop cancelled during act");
-                // Cancel during ACT: the session holds this run's user prompt,
-                // every completed round-trip, and a trailing assistant(tool_use)
-                // whose results were never observed. Dropping that last message
-                // keeps the transcript valid (no unpaired tool_use) while
-                // preserving the completed work.
-                abort_run(&tx, &inbox, &session).await;
-                return;
-            }
+        let Some(outcome) = act_phase(
+            &tx,
+            &inbox,
+            &session,
+            &tools,
+            &tool_call_tokens,
+            &permission_checker,
+            &decision_rx,
+            &cancel_token,
+            tool_uses,
+            turn,
+        )
+        .await
+        else {
+            return;
         };
 
         // 4. OBSERVE - feed results back in tool_use_id order
-        let mut tool_results: Vec<ContentBlock> = results
-            .into_iter()
-            .filter_map(|(id, result)| {
-                result.map(|r| ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: r.content,
-                    is_error: r.is_error,
-                })
-            })
-            .collect();
-        // Add denied tool results so LLM sees them
-        for (id, result) in denied_results {
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: result.content,
-                is_error: result.is_error,
-            });
-        }
-        let tool_results_msg = Message::tool_results(tool_results);
-        messages.push(tool_results_msg.clone());
-        session.lock().unwrap().push(tool_results_msg);
+        observe_phase(&mut messages, &session, outcome.results, outcome.denied);
     }
 }
 
