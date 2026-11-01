@@ -239,7 +239,7 @@ driver 收到本轮 `Done` 后构造 `TurnLine::Turn { items, usage, usage_total
 | --- | --- | --- |
 | 补 `UserMessage` item | `server.rs:4795` 明确注释 | resume 后用户提问消失，只剩回答 |
 | `preserve_thinking == false` 时剥离落盘副本的思考块 | `server.rs:4807` | 磁盘上的会话「复活」已放弃保留的凭证 |
-| 成功后更新 `meta.updated_at` | 本设计新增要求 | `--last` 永远选中最旧会话 |
+| 成功后更新 `meta.updated_at` | 用 `ThreadStore::touch`（§8 第 2 点） | `--last` 永远选中最旧会话 |
 | 落盘失败不阻断对话 | 与 app-server 的 `eprintln!` 一致 | 磁盘问题导致对话中断 |
 
 落盘只剥**副本**，不动 session 本体——session 是展示与请求的权威。
@@ -311,10 +311,12 @@ TUI 这两个命令目前只作用于内存（`app.rs:2790` / `:2846`，driver �
 | `cwd` `model` `model_ref` `reasoning_effort` `permission_mode` `preserve_thinking` `anchor_sha` | 继承 | 定义「这段对话是什么」，历史内容依赖它们 |
 | `extra_roots` | 继承，过滤已删目录 | 历史提到的文件可能在这些根里；不继承则 fork 后工具访问不到 |
 | `created_at` `updated_at` | 取当前时间 | 否则 `--last` 排序错乱 |
+| `title` | 源为 `Some(t)` ⇒ `title_from("{t} (fork)")`；源为 `None` ⇒ `None` | 否则列表里两个同标题会话无法分辨。**必须经 `title_from` 截断**（30 字符）——直接拼会溢出列宽；`None` 时保持 `None`，由 `threads` 列表兜底显示 `(untitled)` |
 | `content_epoch` | 重置 `0` | 新会话的可见内容集合世代 |
 | `pin_seq` `tag` | 清空 | 新会话不继承用户的整理意图 |
 | `driver_project` `driver_ref` | 清空 | fork 是用户动作，不自动并入看板卡片 |
 | `role` | **强制清空** | 见 §3.5 |
+| `last_item_id` `last_read_at` `last_completed_at` | 清空 / `0` | 见 §7.2 |
 
 5. `forked_from = Some(源 id)`，**仅用于展示**，不参与任何读取路径
 
@@ -331,6 +333,70 @@ TUI 这两个命令目前只作用于内存（`app.rs:2790` / `:2846`，driver �
 
 锁的获取顺序固定（先源后新），且都是同一张全局表，不存在交叉死锁。若源会话正被另一进程写，步骤 1 即失败并报「会话被占用」，**不建半个新会话**。
 
+### 7.2 三个时间戳字段不能继承（原设计遗漏）
+
+`ThreadMeta` 共 22 个字段，上表原先只覆盖 18 个。剩下三个若照抄源会话，会直接损坏桌面端行为：
+
+**`last_item_id` 必须清空。** 它是上下文锚点校验的载体（`server.rs:3742` / `:4422`）：客户端带 `contextAnchor.lastItemId` 请求时，服务端比对不上就判定「客户端持有的是服务端不存在的内容」而拒绝该轮。fork 后的新会话若继承源会话的 `last_item_id`，桌面端一打开就锚点不匹配，**首轮直接失败**。
+
+**`last_read_at` 必须置 `0`**（未读）。继承源会话的已读时间会让新会话一出现就是「已读」，用户看不到 fork 出来的会话。
+
+**`last_completed_at` 必须置 `0`**。它标记「本会话最后一次成功收尾」，继承过来会让一个从未跑过的新会话显示为已完成过。
+
+### 7.3 fork 首条 TurnLine 的 `usage` / `usage_total` 不能为空（原设计遗漏）
+
+§7 第 3 步只说「写入源会话全部 items + 一份 messages 快照」。但 `TurnLine::Turn` 还有两个用量字段，`read_log` 会用它累加 `totals`（`thread_store.rs` 的 `add_turn_usage`）。
+
+**`usage` 必须跟着 `usage_total` 一起写，两个都不能留 `None`。** 这不是审美问题，`thread/resume` 的回放代码是这样写的（`rpc/thread.rs:662`）：
+
+```rust
+if let Some(u) = loaded.usage {
+    let totals = loaded.totals;
+    write_notification(state.hub, &Notification::TokenUsage { .. total_input_tokens: totals.input_tokens, .. });
+}
+```
+
+整个 `TokenUsage` 通知**被 `if let Some(u)` 包着**。所以只要 `usage` 是 `None`，`totals` 再准也发不出去——客户端 resume 后状态栏累计从 0 重来。注释里那句话（「后者若不带，客户端 resume 后累计会从 0 重来」）正是这个场景。
+
+| 写法 | 后果 |
+| --- | --- |
+| `usage: None, usage_total: Some(..)` | `totals` 被 `if let` 挡掉，客户端仍显示 0 |
+| `usage: Some(..), usage_total: None` | `read_log` 退回用 `usage` 近似累加（`else if let Some(last) = &turn_usage`），累计值偏小 |
+| 两个都 `Some` | 正确 |
+
+取值来源：`usage` 用 `loaded.usage`（源会话最后一轮的快照），`usage_total` 用 `loaded.totals` 转成 `TurnUsage`。
+
+**类型要降位**：`usage_total` 字段是 `TurnUsage`（`u32`），而 `loaded.totals` 是 `UsageTotals`（`u64`）。长会话 input 累计可超 `u32::MAX`，`try_into().unwrap()` 会 panic。用 `u32::try_from(x).unwrap_or(u32::MAX)` 裁剪。
+
+**不要重算 `totals`。** `load` 的返回已带 `totals: UsageTotals`（所有轮次累加），直接搬用；在 fork 里再遍历 items 重算是第二套规则，且会漏掉 partial 的贡献。
+
+### 7.4 崩溃残留：fork 需要 `promote_partial`，且**只对自己**写
+
+这里有个和 resume 不同、容易写错的分叉：
+
+- **resume 必须先 `promote_partial(源)`**（§5 第 2 点）：它要把崩溃残留的 partial 升格进主日志，因为 resume 之后主日志就是这份会话的归属，不升格会在下一轮被 checkpoint 原子覆盖。
+- **fork **不需要** `promote_partial(源)`**：`load()` 已在内存里合并了 partial（`load` 中 `read_partial` 分支把 `partial.items` 推入 `items`、`partial.messages` 覆盖 `messages`、用量并入 `totals`）。fork 只要把 `load` 的结果写进新文件即可，**不必也不应该**修改源会话——fork 是只读操作，写源会话会让「fork 一个正在进行的会话」意外改变源会话的落盘状态。
+
+实现上就是**拷 `load()` 的输出，不要碰源文件**。这一条写错会让 fork 变成隐式写操作，在源会话被别的进程持锁时会莫名失败。
+
+### 7.5 `fork_thread` 必须实现在 `thread_store.rs` 内
+
+不是风格问题，是编译约束：fork 要用 `title_from`（`pub(crate)`）做标题截断（§7 表格），而 `yi-agent` crate 调不到它。若把 fork 逻辑写在 CLI 侧，就会卡在「要么把 `title_from` 提升为 `pub`（无谓扩大 API），要么复制一份 30 字符截断（第二套规则，迟早漂移）」。
+
+因此签名定为：
+
+```rust
+impl ThreadStore {
+    /// 从 `from` 物理复制出一个新会话，返回新 id。
+    /// 内部完成：取源/新锁（§7.1）、load、写 meta 与 jsonl、标题截断。
+    pub fn fork_thread(&self, from: &str, new_id: &str) -> io::Result<String>
+}
+```
+
+CLI 只负责生成 `thread-<uuid>` 并调它。这样 `title_from`、`is_lead_meta`、`now_millis`、`valid_id` 这些 crate 内部 fn 全都能直接用，不必外露。
+
+`valid_id`（`thread_store.rs:995`）会校验 id 只含 ASCII 字母数字/`-`/`_`、长度 ≤128，`thread-<uuid>` 天然合规——但别用带 `/` 的自定义 id。
+
 ## 8. `yi-agent threads` 列表
 
 纯文本输出（对齐 `yi-agent agents` 的既有风格），同目录会话按 `updated_at` 降序：
@@ -344,7 +410,11 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 两项必须处理，否则列表形同废纸：
 
 1. **id 前缀匹配**：完整 id 没人愿意手抄。`resume` 接受唯一前缀（类 git short hash），歧义时列出候选并拒绝。
-2. **标题兜底不用新写**：`first_user_text`（`thread_store.rs:1087`）已经实现「取第一条 user 文本」，`rebuild_meta` 正是用它填 `title`（`thread_store.rs:1118`）；截断长度也有 `title_from`（`thread_store.rs:1081`，30 字符）。TUI 落盘时直接调 `title_from(&first_user_text(&messages))` 即可，不引入第二套标题规则。
+2. **标题兜底与 `updated_at` 用现成的 `touch`，不要自己拼**：`ThreadStore::touch(id, title_hint)`（`thread_store.rs:827`）一步做完两件事——写 `meta.updated_at = now`，并在 `title` 仍为 `None` 时用 `title_from(hint)` 填充。TUI 每轮落盘后调 `store.touch(id, Some(&prompt))` 即可，与 app-server 的 driver 行为完全一致。
+
+   **不要调 `title_from` / `first_user_text` 自己拼标题**（这曾是我上一版 spec 的写法，是错的）：`title_from` 是 `pub(crate)`、`first_user_text` 是私有 fn，`yi-agent` crate 根本调不到，会直接编译失败。改成 `pub` 属于无谓的 API 扩大，而 `touch` 恰好就是为此设计的公开入口——它还顺带处理了「`is_lead_meta` 时不写标题」这条规则，自己拼会漏掉。
+
+   注意 `touch` 的返回值（`true` = 本次真的写了标题）在 CLI 侧**不需要**消费：它存在的意义是让调用方决定要不要再发一次 LLM 标题生成，而 TUI 没有这个流程。忽略返回值即可（`let _ = store.touch(...)`）。
 
 ## 8.1 新会话的 meta 创建时机（原设计遗漏）
 
@@ -387,6 +457,11 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 ### 存储（app-server）
 
 - `fork_thread` 复制完整性：items 数量、messages 内容、`forked_from`、meta 各字段取舍（含 `role` 清空、`extra_roots` 过滤）
+- **fork 的 22 个 meta 字段全覆盖**：写一条断言 `last_item_id == None`、`last_read_at == 0`、`last_completed_at == 0` 的用例。继承这三个会让桌面端锚点校验直接拒绝首轮（§7.2）
+- **fork 首条 TurnLine 的 `usage` 与 `usage_total` 都为 `Some`**：`load` 回来的 `totals` 与源会话一致（§7.3）。只写 `usage_total` 会被 `rpc/thread.rs:662` 的 `if let Some(u)` 挡掉，客户端仍显示 0
+- **`totals` 降位不 panic**：构造一个 `input_tokens > u32::MAX` 的 fake `UsageTotals`，断言 fork 后为 `u32::MAX` 而非 panic
+- **fork 不写源会话**：fork 前记源 `.jsonl` 与 `.meta.json` 的 mtime/字节数，fork 后断言未变（§7.4）。若实现里调了 `promote_partial(源)`，这条会红
+- **fork 一个含崩溃残留的会话**：源有 `.partial.json` 时，fork 出的新会话 items 应包含 partial 的内容（因为 `load` 已合流），且源会话的 `.partial.json` 仍存在
 - 锁：同一 `Arc` 二次获取幂等；跨进程持有失败（子进程验证）；锁文件在持有者退出后仍存在
 - **锁的释放时机（关键反例）**：app-server 启动 driver 后取锁，thread 从 `threads` 表移除后必须释放。若写成全进程持锁，桌面开着会话时终端永远 resume 不了
 - **app-server 多客户端不互斥**：两个客户端同时 `thread/subscribe` 同一 thread 仍正常（`MAX_SUBSCRIPTIONS`），证明锁没有误伤既有桌面行为
