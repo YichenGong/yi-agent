@@ -302,6 +302,8 @@ pub struct TuiConfigSnapshot {
     pub notification_condition: String,
     /// `auto` 解析后的实际后端。
     pub effective_backend: String,
+    /// 终端拒绝启用焦点事件时为真；此时 `unfocused` 实际退化为 `always`。
+    pub focus_degraded: bool,
 }
 
 impl TuiConfigSnapshot {
@@ -1240,6 +1242,7 @@ mod tests {
             notification_method: "auto".into(),
             notification_condition: "unfocused".into(),
             effective_backend: "osc9".into(),
+            focus_degraded: false,
         };
         let text = snap.render("claude-sonnet-4-5");
         assert!(text.contains("anthropic"));

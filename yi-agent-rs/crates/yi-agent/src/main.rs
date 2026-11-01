@@ -2092,6 +2092,7 @@ fn run_tui_agent(
                 .effective_backend()
                 .to_string()
             },
+            focus_degraded: false,
         };
 
         let driver_workdir = snapshot_workdir.clone();

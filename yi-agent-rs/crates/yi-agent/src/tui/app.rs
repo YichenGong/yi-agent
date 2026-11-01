@@ -2,8 +2,8 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -126,7 +126,7 @@ pub fn run_tui(
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
-    config: TuiConfigSnapshot,
+    mut config: TuiConfigSnapshot,
     catalog: yi_agent_runtime::models::ModelCatalog,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
@@ -136,6 +136,23 @@ pub fn run_tui(
     let theme = TuiTheme::of(crate::tui::theme::detect_theme_from_terminal());
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+
+    // 焦点事件让 `unfocused` 条件才有意义。老 conhost 不支持这个序列，
+    // 失败不致命：Windows 上退化成 always（宁可多响，不静默），其它平台
+    // 只在日志里留痕。
+    let focus_degraded = match execute!(stdout, EnableFocusChange) {
+        Ok(()) => false,
+        Err(error) => {
+            if cfg!(windows) {
+                tracing::info!(error = %error, "focus tracking unavailable; notifications will always fire");
+                true
+            } else {
+                tracing::debug!(error = %error, "focus tracking unavailable");
+                false
+            }
+        }
+    };
+    config.focus_degraded = focus_degraded;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -174,6 +191,9 @@ pub fn run_tui(
     if let Err(error) = execute!(terminal.backend_mut(), DisableBracketedPaste) {
         cleanup_error.get_or_insert(error);
     }
+    if let Err(error) = execute!(terminal.backend_mut(), DisableFocusChange) {
+        cleanup_error.get_or_insert(error);
+    }
     if let Err(error) = disable_raw_mode() {
         cleanup_error.get_or_insert(error);
     }
@@ -195,6 +215,24 @@ pub fn run_tui(
 }
 
 /// Event source trait so the loop can be tested with fake events.
+/// 焦点事件 → 原子标志。
+fn apply_focus_event(event: &Event, focused: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    match event {
+        Event::FocusGained => focused.store(true, Ordering::Relaxed),
+        Event::FocusLost => focused.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+/// 当前是否应当发送通知。`focused` 为真表示窗口在前台。
+fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> bool {
+    match condition {
+        crate::tui::notify::Condition::Always => true,
+        crate::tui::notify::Condition::Unfocused => !focused,
+    }
+}
+
 pub trait EventSource {
     /// Poll for an event, waiting up to `timeout`. Returns `Ok(None)` on timeout.
     fn poll(&self, timeout: Duration) -> std::io::Result<Option<Event>>;
@@ -233,6 +271,7 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
         notification_method: "auto".into(),
         notification_condition: "unfocused".into(),
         effective_backend: "bel".into(),
+        focus_degraded: false,
     }
 }
 
@@ -2673,7 +2712,12 @@ fn execute_slash_command(
                     width,
                 );
             } else {
-                let text = config.render(current_model);
+                let mut text = config.render(current_model);
+                if config.focus_degraded && config.notification_condition == "unfocused" {
+                    text.push_str(
+                        "\n  注意: 本终端不支持焦点事件，notify condition 已从 unfocused 退化为 always",
+                    );
+                }
                 history.push(HistoryCell::Markdown { text }, width);
             }
             KeyOutcome::None
@@ -5874,6 +5918,93 @@ mod tests {
         assert!(
             labels.iter().any(|l| l.contains("未创建")),
             "status 走进生命周期、如实报告没有看板：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn config_warns_when_focus_events_are_unavailable() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+        let mut config = snapshot_for_tests();
+        config.focus_degraded = true;
+        config.notification_condition = "unfocused".into();
+
+        execute_slash_command(
+            SlashCommand::Config,
+            None,
+            None,
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &config,
+            "test-model",
+            None,
+            &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
+        );
+
+        let rendered: String = history
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::Markdown { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rendered.contains("退化为 always"),
+            "焦点事件不可用时必须提示条件已退化：{rendered}"
+        );
+    }
+
+    #[test]
+    fn config_stays_quiet_when_focus_events_work() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        execute_slash_command(
+            SlashCommand::Config,
+            None,
+            None,
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+            None,
+            &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
+        );
+
+        let rendered: String = history
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::Markdown { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !rendered.contains("退化为 always"),
+            "焦点事件正常时不该出现降级提示：{rendered}"
         );
     }
 
@@ -11176,5 +11307,31 @@ mod runtime_restart_notice_tests {
             text.contains("重启"),
             "the dialog never mentions a restart: {text}"
         );
+    }
+
+    #[test]
+    fn should_notify_respects_condition() {
+        use crate::tui::notify::Condition;
+        assert!(should_notify(Condition::Always, false));
+        assert!(should_notify(Condition::Always, true));
+        assert!(should_notify(Condition::Unfocused, false));
+        assert!(!should_notify(Condition::Unfocused, true));
+    }
+
+    #[test]
+    fn focus_events_flip_the_flag() {
+        let focused = std::sync::atomic::AtomicBool::new(true);
+        apply_focus_event(&Event::FocusLost, &focused);
+        assert!(!focused.load(std::sync::atomic::Ordering::Relaxed));
+
+        apply_focus_event(&Event::FocusGained, &focused);
+        assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unrelated_events_do_not_touch_the_focus_flag() {
+        let focused = std::sync::atomic::AtomicBool::new(true);
+        apply_focus_event(&Event::Resize(80, 24), &focused);
+        assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
