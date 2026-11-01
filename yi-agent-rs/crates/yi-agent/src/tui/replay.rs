@@ -11,7 +11,6 @@ use crate::tui::cell::{CallState, HistoryCell};
 /// 一个 `ToolCall` 会产出两个 cell（调用 + 结果），与实时渲染的形态一致。
 /// 不插 `Separator`：分隔线只在 turn 边界由实时路径插入，这里再插会让重开
 /// 一次会话就多出一堆横线。
-#[allow(dead_code)] // Task 9 把它接进 TUI 启动回放
 pub fn items_to_cells(items: &[Item]) -> Vec<HistoryCell> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
