@@ -116,7 +116,7 @@ fn cell_fingerprint(cell: &HistoryCell) -> u64 {
 /// Bash-like tools show only the command, since that is what the user is
 /// judging. File tools show the target path plus the size of each payload
 /// field rather than inlining the payload, which can be thousands of bytes.
-fn permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
+pub(crate) fn permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
     match tool_name {
         "bash" | "process_start" => input
             .get("command")
@@ -1013,6 +1013,20 @@ impl HistoryState {
     }
 
     /// Process an AgentEvent and update the cell list accordingly.
+    /// 最后一条助手正文的原文。
+    ///
+    /// 回合结束通知需要它：`AgentEvent::Done` 只带 `reason`、不带正文，
+    /// 正文在流式阶段已写进 `AssistantMessage` cell。从尾部反向找，是因为
+    /// `push_event` 收到 `Done` 会在末尾压一条 `Separator`。
+    ///
+    /// 跳过 `Reasoning`：思维链是显示专用的，不是回复内容，不能出现在通知里。
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.cells.iter().rev().find_map(|cell| match cell {
+            HistoryCell::AssistantMessage { markdown } => Some(markdown.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn push_event(&mut self, event: AgentEvent, width: u16) {
         let was_scrolled = self.scroll_offset != 0;
         let lines_before = self.flattened_line_count(width);
@@ -4354,5 +4368,54 @@ mod tests {
              the transcript",
             state.cells.len()
         );
+    }
+
+    #[test]
+    fn last_assistant_text_returns_trailing_message() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("第一段".into()), 80);
+        assert_eq!(s.last_assistant_text(), Some("第一段"));
+    }
+
+    #[test]
+    fn last_assistant_text_skips_trailing_separator() {
+        let mut s = HistoryState::new();
+        s.push_event(AgentEvent::AssistantText("结论".into()), 80);
+        s.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            80,
+        );
+        // push_event 会把 Separator 压到末尾，仍要能找到 assistant 正文。
+        assert_eq!(s.last_assistant_text(), Some("结论"));
+    }
+
+    #[test]
+    fn last_assistant_text_is_none_when_no_message() {
+        let mut s = HistoryState::new();
+        assert_eq!(s.last_assistant_text(), None);
+
+        let mut only_tools = HistoryState::new();
+        only_tools.push_event(
+            AgentEvent::Done {
+                reason: DoneReason::MaxTurns,
+            },
+            80,
+        );
+        assert_eq!(only_tools.last_assistant_text(), None);
+    }
+
+    #[test]
+    fn last_assistant_text_ignores_reasoning_blocks() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "思考".into(),
+                kind: yi_agent_core::ReasoningKind::Summary,
+            },
+            80,
+        );
+        assert_eq!(s.last_assistant_text(), None);
     }
 }
