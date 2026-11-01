@@ -3268,10 +3268,16 @@ where
     //
     // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：它含子进程与
     // 2 秒级 TCP 超时，放主循环会把 RPC 卡住。
-    let initial_enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(
-        &yi_agent_runtime::settings::load_from(&settings_path),
+    // 只读一次盘：三个初值来自同一份 `Settings`，不会互相错位。
+    let initial_settings = yi_agent_runtime::settings::load_from(&settings_path);
+    let initial_enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(&initial_settings);
+    let (initial_grace_min, initial_remote_min) =
+        yi_agent_runtime::settings::power_windows_minutes(&initial_settings);
+    let power_guard = crate::power_guard::PowerGuard::spawn(
+        initial_enabled,
+        initial_grace_min * 60,
+        initial_remote_min * 60,
     );
-    let power_guard = crate::power_guard::PowerGuard::spawn(initial_enabled);
     // daemon 侧的 busy 另由 `BusySampler` 采（同样是阻塞 IPC，同样不能进主循环）。
     let busy_sampler = crate::power_busy::BusySampler::spawn(Arc::clone(&runtimes));
     // 远端最后一次发来请求的时刻。**只**由非 local 客户端刷新：桌面壳用 stdio
@@ -3866,11 +3872,17 @@ where
             }
             Some(error) = fatal_rx.recv() => return Err(error),
             _ = power_ticker.tick() => {
-                // 开关每拍现读磁盘，所以设置页保存后下一拍就生效，不必重启进程。
-                // `load_from` 是「读一次文件 + 逐字段校验」，10s 一次开销可忽略。
-                let enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(
-                    &yi_agent_runtime::settings::load_from(&settings_path),
-                );
+                // 开关与两个窗口每拍现读磁盘，所以设置页保存后下一拍就生效，
+                // 不必重启进程。`load_from` 是「读一次文件 + 逐字段校验」，
+                // 10s 一次开销可忽略。
+                //
+                // **同一拍内只读一次盘**：`settings` 这一个变量同时喂给开关、
+                // 两个窗口与远端判定，四处不会读到不同版本。
+                let settings = yi_agent_runtime::settings::load_from(&settings_path);
+                let enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(&settings);
+                let (grace_min, remote_min) =
+                    yi_agent_runtime::settings::power_windows_minutes(&settings);
+                let (grace_secs, remote_secs) = (grace_min * 60, remote_min * 60);
 
                 // 本进程侧：本地会话 ∪ 远端近期交互。两项都是纯内存判断，
                 // 放主循环里是安全的（不碰 I/O，也不起子进程）。
@@ -3878,13 +3890,15 @@ where
                 let remote = crate::power_busy::remote_touch_busy(
                     last_remote_touch,
                     &power_clock,
+                    Duration::from_secs(remote_secs),
                 );
                 // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
                 let daemon = busy_sampler.latest();
 
-                // 只写两个原子。探测与 IOKit 都在供电线程里，这里绝不阻塞。
+                // 只写原子。探测与 IOKit 都在供电线程里，这里绝不阻塞。
                 power_guard.set_activity(local || remote || daemon);
                 power_guard.set_enabled(enabled);
+                power_guard.set_windows(grace_secs, remote_secs);
             }
             _ = driver_ticker.tick() => {
                 // 通用会话驱动器内联跑一轮:问每个驱动插件「下一步起/续哪个
