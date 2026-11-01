@@ -4554,6 +4554,7 @@ mod tests {
             notifications: true,
             notification_method: "auto".into(),
             notification_condition: "unfocused".into(),
+            terminal_title: true,
         }
     }
 

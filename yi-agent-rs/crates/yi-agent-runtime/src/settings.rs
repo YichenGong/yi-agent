@@ -1546,6 +1546,7 @@ malformed line
         assert!(settings.tui.notifications.is_none());
         assert!(settings.tui.notification_method.is_none());
         assert!(settings.tui.notification_condition.is_none());
+        assert!(settings.tui.terminal_title.is_none());
     }
 
     #[test]
@@ -1554,6 +1555,7 @@ malformed line
             "tui.notifications",
             "tui.notification_method",
             "tui.notification_condition",
+            "tui.terminal_title",
         ] {
             assert!(
                 find_spec(key).is_some(),

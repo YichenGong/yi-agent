@@ -110,5 +110,6 @@ pub(crate) fn test_config() -> RuntimeConfig {
         notifications: true,
         notification_method: "auto".to_string(),
         notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }
