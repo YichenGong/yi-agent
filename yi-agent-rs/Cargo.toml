@@ -57,6 +57,7 @@ url = "2"
 
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }
+unicode-segmentation = "1"
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 

@@ -42,6 +42,7 @@ dirs = "5"
 
 ratatui = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 pulldown-cmark = { workspace = true }
 syntect = { workspace = true, optional = true }
 
