@@ -300,6 +300,15 @@ mod tests {
         )
     }
 
+    /// 观测「子进程已就绪」这类异步事实的预算。**宽预算，不是期望值。**
+    ///
+    /// 这里的四个用例原先各自写死 3s。实测（2026-11-01，nextest 全量并发）它们
+    /// 全部恰好在 3.03s 处失败：`nextest` 每测试一个进程，同一 crate 的 261 个
+    /// 单元测试并发跑，被测的 daemon 线程几秒内根本拿不到调度。断言写的是
+    /// 「子进程会被拉起」，固定 3s 却把「机器有多空」写了进去。20s 是 backstop：
+    /// 正常情况毫秒级返回，只有真的永不成立才会走满。
+    const SETTLE_BUDGET: Duration = Duration::from_secs(20);
+
     fn wait_for(path: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -332,7 +341,7 @@ mod tests {
         let handle = serve_armed(dir.path(), &flags);
         assert!(handle.is_supervising());
         assert!(
-            wait_for(&marker, Duration::from_secs(3)),
+            wait_for(&marker, SETTLE_BUDGET),
             "a switched-on manifest must have its child started"
         );
         handle.stop();
@@ -347,11 +356,11 @@ mod tests {
         let (_child, flags) = armed_project(dir.path(), &marker);
 
         let handle = serve_armed(dir.path(), &flags);
-        assert!(wait_for(&marker, Duration::from_secs(3)));
+        assert!(wait_for(&marker, SETTLE_BUDGET));
         // 运行中：清单声明了 query_socket 且进程在跑，路由必须出现。
         // （先证明"表里本来有东西"，否则"停后被清空"是句空话。）
         let registered = {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + SETTLE_BUDGET;
             while Instant::now() < deadline {
                 if yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_some() {
                     break;
@@ -407,7 +416,7 @@ mod tests {
         let owned = serve_armed(owned_dir.path(), &owned_flags);
         assert!(owned.is_supervising());
         assert!(
-            wait_for(&owned_marker, Duration::from_secs(3)),
+            wait_for(&owned_marker, SETTLE_BUDGET),
             "the process that owns the daemon must supervise"
         );
         owned.stop();
@@ -440,10 +449,10 @@ mod tests {
 
         {
             let handle = serve_armed(dir.path(), &flags);
-            assert!(wait_for(&marker, Duration::from_secs(3)));
+            assert!(wait_for(&marker, SETTLE_BUDGET));
             // 路由在每轮对账末尾登记，与子进程写 marker 有竞态，所以轮询等它出现，
             // 而不是假定"子进程一起来路由就到"。
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + SETTLE_BUDGET;
             while Instant::now() < deadline
                 && yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none()
             {
@@ -503,7 +512,7 @@ mod tests {
 
         // 等到路由出现，然后跨过好几个对账周期持续观察：只要有任意一拍被
         // 抹掉，就说明空表仍然在越权清别人的分区。
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + SETTLE_BUDGET;
         while Instant::now() < deadline
             && yi_agent_store::ipc::plugin_socket_for(&plugin_scope, "demo").is_none()
         {

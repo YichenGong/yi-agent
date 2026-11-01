@@ -557,6 +557,9 @@ mod tests {
     use std::path::Path;
 
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
+    ///
+    /// `cargo nextest` 下每个测试独立进程，环境变量天然不共享，这把锁退化为
+    /// 无害的空操作；`cargo test` 下它仍是必需的。两种运行器都必须保留。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvVarGuard {

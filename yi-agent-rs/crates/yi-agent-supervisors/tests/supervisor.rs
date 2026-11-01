@@ -15,6 +15,13 @@ use yi_agent_supervisors::supervisor::{Layout, Supervisor};
 /// delay near half a second. The wide budget in [`wait_until`] is the backstop
 /// for load this lock cannot see (other test binaries running under
 /// `cargo test --workspace`, CI neighbours).
+///
+/// **两种运行器下的语义不同：**
+/// - `cargo test`：同进程内并行，这把锁真的在防「多测试同时 fork 子进程」。
+/// - `cargo nextest`：每个测试独立进程，锁跨不过进程边界，等于没有。
+///   所以真正托底的是各测试自己的条件轮询 + 宽预算，不是锁。
+///   实测（2026-11-01）：`binary(supervisor)` 全组跑在 nextest 下仍有测试
+///   超时，锁帮不上忙——别再往这里加锁来「修」并发问题。
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Hold this for the whole test body; it releases on drop.
@@ -36,7 +43,10 @@ fn spawn_serial_guard() -> MutexGuard<'static, ()> {
 const CHILD_START_BUDGET: Duration = Duration::from_secs(20);
 
 /// Poll `condition` every 10ms until it holds or the budget runs out.
-fn wait_until(condition: impl Fn() -> bool, what: &str) -> bool {
+///
+/// `FnMut` 而非 `Fn`：有的调用方要在闭包里驱动状态机（例如反复调用
+/// `supervisor.reconcile()` 再读日志），那需要可变借用。
+fn wait_until(mut condition: impl FnMut() -> bool, what: &str) -> bool {
     let deadline = Instant::now() + CHILD_START_BUDGET;
     loop {
         if condition() {
@@ -782,13 +792,32 @@ fn a_childs_exit_is_recorded_once_not_once_per_tick() {
     enable(workdir, "superpowers_kanban");
 
     let mut supervisor = supervisor_for(workdir, "dev");
-    // 20 拍 x 50ms 约 1s，全程 < 60s 退避：同一退出事实被观察约 20 次。
+    let log = layout.logs_dir().join("demo.log");
+    // 先轮询到「reconcile 真的观察到了退出事实」，再进入计数阶段。
+    // 原写法直接固定 20 拍，隐含「1s 内子进程一定退完」这个负载假设；全量并发下
+    // 该假设不成立（实测：单跑 1.1s 通过，全量 1.09s 失败，日志里只有 started），
+    // 断言于是拿到 0 次而不是 1 次。轮询消除这个时间假设。
+    assert!(
+        wait_until(
+            || {
+                supervisor.reconcile();
+                std::fs::read_to_string(&log)
+                    .map(|text| text.contains("exited demo"))
+                    .unwrap_or(false)
+            },
+            "the child's exit to be recorded at least once"
+        ),
+        "the supervisor never recorded the child's exit"
+    );
+
+    // 退出已被记录；再拍 20 次，验证它不会被重复写进日志。
+    // 这一段保留固定拍数是刻意的：退避是 60s，远大于 20 x 50ms 的墙钟，
+    // 所以这里测的是「拍多少次都不会重复记录」，与调度快慢无关。
     for _ in 0..20 {
         supervisor.reconcile();
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let log = layout.logs_dir().join("demo.log");
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let count = text.matches("exited demo").count();
     assert_eq!(
