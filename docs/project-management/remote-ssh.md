@@ -44,7 +44,9 @@ dev 构建里验证充分。
 - [x] 远端模式不传 `cwd` — `desktop/src/lib/threadStart.ts`（6 测试）
 - [x] 重试策略：本地 5s 封顶、远端 60s、5 次后停 — `bridge.rs`（4 测试）
 - [x] `remote-status.json` 旁路，供手机读可用性 — `remote/status.rs`
-- [x] `remote/*` Tauri 命令带闸门 — `remote/rpc.rs`
+- [x] `remote/*` Tauri 命令带闸门 — `remote/rpc.rs`；**静态审计**确保没有漏网的
+  命令，只有收尾动作豁免（`remote_disconnect` / `kill_remote_slots` /
+  `remote_enabled`）— `bridge.rs:every_remote_command_is_gated_or_is_cleanup`
 - [x] `instance_root` 由远端 home 派生，不由用户输入 — `remote/profile.rs:derive_instance_root`
 - [x] 保存时预检远端项目路径存在 — `bridge.rs:remote_upsert`
 - [x] 每条远端命令有 watchdog，超时即 kill — `remote/install.rs:run_remote_within`

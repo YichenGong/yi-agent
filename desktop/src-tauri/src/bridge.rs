@@ -701,6 +701,10 @@ fn ensure_installed(
 /// 用户主动断开：撤销「希望连着」再杀进程。
 ///
 /// **顺序很重要**：先撤销意图，监督循环才不会在下一轮立刻把进程拉回来。
+///
+/// **刻意不过闸**：这是收尾动作。开关刚被关掉时前端可能正在收尾，此时再要求
+/// 「开关开着才能断开」会让远端进程留在那里没有入口可以杀——`kill_remote_slots`
+/// 同理。`every_remote_command_is_gated_or_is_cleanup` 把这条例外钉在测试里。
 #[tauri::command]
 pub fn remote_disconnect(app: AppHandle, profile_id: String) -> Result<(), String> {
     let key = ProfileKey::Remote(profile_id);
@@ -1003,6 +1007,68 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 开关是本功能的唯一入口（spec §5.3）：只要有一个 `remote_*` 命令没被闸住，
+    /// 关掉开关后它仍然可以从 webview 里调，等于开关没关。
+    ///
+    /// 用 `include_str!` 读源码做静态审计，因为「有没有调用闸门」是结构事实，
+    /// 运行时测不到——闸门关着时每个命令都返回同一个错误，测不出谁漏了。
+    /// 例外只有两类，且都是**关开关时必须还能用**的收尾动作：
+    /// - `remote_disconnect` / `kill_remote_slots`：关开关要能杀进程、清状态
+    /// - `remote_enabled`：它就是回答「开关开了吗」，自己不能先闸
+    #[test]
+    fn every_remote_command_is_gated_or_is_cleanup() {
+        let source = include_str!("bridge.rs");
+        let body_start = source.find("mod tests").expect("tests module");
+
+        let mut ungated = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(found) = source[cursor..].find("#[tauri::command]") {
+            let marker = cursor + found;
+            cursor = marker + 1;
+            if marker > body_start {
+                break;
+            }
+            let rest = &source[marker..];
+            let Some(fn_at) = rest.find("pub ") else {
+                continue;
+            };
+            let signature = &rest[fn_at..];
+            let Some(paren) = signature.find('(') else {
+                continue;
+            };
+            let name = signature["pub ".len()..paren]
+                .trim()
+                .trim_start_matches("async ")
+                .trim_start_matches("fn ")
+                .to_string();
+            if !name.starts_with("remote_") && name != "kill_remote_slots" {
+                continue;
+            }
+            // 函数体到下一个命令属性为止，足够覆盖本文件的写法。
+            // 起点必须越过属性行本身：`rest` 是从 `#[tauri::command]` 开始的，
+            // 直接 find 会立刻命中它自己（返回 0），把函数体截成空串——那样
+            // 每个命令都会被误判成「没闸」。这个断言必须自己先是对的。
+            let next = rest[1..]
+                .find("#[tauri::command]")
+                .map(|offset| offset + 1)
+                .unwrap_or(rest.len());
+            let body = &rest[..next];
+            let gated = body.contains("remote_gate()") || body.contains("remote_enabled_now()");
+            let cleanup = matches!(
+                name.as_str(),
+                "remote_disconnect" | "kill_remote_slots" | "remote_enabled"
+            );
+            if !gated && !cleanup {
+                ungated.push(name);
+            }
+        }
+
+        assert!(
+            ungated.is_empty(),
+            "these commands bypass the remote_ssh gate: {ungated:?}"
+        );
+    }
 
     #[test]
     fn notification_has_method_without_id() {
