@@ -11,6 +11,7 @@
     "test:browser:session-view": "node scripts/browser/session-view-check.mjs",
     "sidecar": "bash scripts/build-sidecar.sh",
     "sidecar:release": "bash scripts/build-sidecar.sh release",
+    "ios:build": "bash scripts/sync-ios-version.sh && tauri ios build",
     "tauri": "tauri"
   },
   "dependencies": {
