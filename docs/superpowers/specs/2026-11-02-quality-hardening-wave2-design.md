@@ -1,7 +1,8 @@
 # 质量加固第二波：变异测试、patch coverage、属性测试、golden-set eval、nightly
 
-> 状态：设计待评审
+> 状态：设计已批准（2026-11-02）
 > 日期：2026-11-02
+> 实施计划：[2026-11-02-quality-hardening-wave2-impl.md](../plans/2026-11-02-quality-hardening-wave2-impl.md)
 > 前置：[2026-11-01-test-ci-hardening-design.md](./2026-11-01-test-ci-hardening-design.md)（已合入 main，见 `e2f87fad`）
 > 本文承接前一份 Spec 的「附录 C：本设计未覆盖、需要后续处理的事项」，只处理其中第 1–5 项。
 
@@ -95,12 +96,32 @@ cargo mutants --file permission.rs  →  123.7s，50 变异体：32 caught / 12 
 
 ### D5：12 个存活变异体 —— 列为必修
 
-不采用「只记录 72.7% 基线」的方案。理由：设一个「不许低于 72.7%」的门禁，等于承认 27% 的 bug 抓不到是正常的；而这 27% 是已知的、可修的、成本约 40 行测试。修复内容包括：
+不采用「只记录 72.7% 基线」的方案。理由：设一个「不许低于 72.7%」的门禁，等于承认 27% 的 bug 抓不到是正常的；而这 27% 是已知的、可修的、成本约 40 行测试。
 
-1. 为 `tool_level_allows` 缺测的四个 arm（`process_start` / `process_kill` / `write` / `edit`）各补一条「工具层为 true 时应 Allow」的用例——现有只有 `check_tool_level_bash_allow` 覆盖了 `bash`
-2. 为 `apply_decision` 的 `process_start` / `process_kill` / `edit` arm 补对应用例（现有仅覆盖 `bash` 与 `write`）
-3. 为 `load` 的 `ErrorKind::NotFound` 分支补用例（变异体 `:350` 存活）
-4. 为 `check` 的 `is_yolo` 返回值变异补用例（`:127` 两个方向都存活，说明 `is_yolo()` 本身无直接断言——现有测试在 `runtime/src/bootstrap.rs:1420` 才断言，属跨 crate 的间接覆盖）
+**权威清单（2026-11-02 重跑确认，50 变异体 / 12 missed / 32 caught / 5 unviable / 1 timeout，EXIT=3）**
+
+| # | 位置 | 变异内容 | 修复方式 |
+|---|---|---|---|
+| 1 | `:127:9` | `is_yolo -> bool` 改为 `true` | 补 `is_yolo()` 直接断言（读侧） |
+| 2 | `:127:9` | `is_yolo -> bool` 改为 `false` | 同上（必须两个方向都测） |
+| 3 | `:192:13` | 删除 `tool_level_allows` 的 `"process_start"` arm | 补「process_start 工具层为 true → Allow」 |
+| 4 | `:193:13` | 删除 `"process_kill"` arm | 补对应用例 |
+| 5 | `:194:13` | 删除 `"write"` arm | 补对应用例 |
+| 6 | `:195:13` | 删除 `"edit"` arm | 补对应用例 |
+| 7 | `:296:21` | 删除 `apply_decision` 的 `"process_start"` arm | 补「AlwaysAllowTool(process_start) 后 config 落盘」 |
+| 8 | `:297:21` | 删除 `"process_kill"` arm | 同上 |
+| 9 | `:299:21` | 删除 `"edit"` arm | 同上 |
+| 10 | `:312:32` | `apply_decision` 写侧去重守卫 `!contains` 恒为 `true` | 补 write 的 `AlwaysAllowPrefix` 重复添加用例 |
+| 11 | `:315:31` | `apply_decision` 编辑侧去重守卫恒为 `true` | 补 edit 的重复添加用例 |
+| 12 | `:350:23` | `load` 的 `e.kind() == NotFound` 恒为 `true` | 补「文件存在但读取失败 → 返回 Err」用例 |
+
+**原稿清单有三处偏差，已按实测修正**：
+
+1. **漏了 `:312` 和 `:315`**。原稿只列 10 条，实际是 12 条。这两处是 `AlwaysAllowPrefix` 的**去重守卫**：删掉后同一前缀会被重复 push 进白名单配置。现有只有 `apply_always_allow_prefix_bash_no_duplicate`（`:1002`）覆盖 bash，write/edit 两条完全没测。后果是配置文件无限膨胀（每次确认多一行）。
+2. **`:350` 的归因错了**。原稿写「为 `ErrorKind::NotFound` 分支补用例」，但 `load_nonexistent_returns_default`（`:995`）**已经存在**且能杀死 `"with false"` 那个变异体。真正存活的是 `"with true"`——它把 `Err(e) => Err(...)` 兜底分支变成了 `Ok(default)`。实测确认 `read_to_string` 对无效 UTF-8 返回 `InvalidData`、对目录返回 `IsADirectory`，两者都不是 `NotFound`。所以缺的是**「文件存在但读取失败必须报错，不得静默降级为默认配置」**的用例。这个缺陷比原稿描述的更严重：它会让损坏的配置文件被静默忽略、权限全部回落到默认（更宽松）。
+3. **`is_yolo` 确实零直接断言**。实测 `grep -n "is_yolo" permission.rs` 只有 `:126` 的定义本身，无任何测试调用；仅 `runtime/src/bootstrap.rs:1406/1420/1428` 跨 crate 间接断言。这解释了为什么 `true`/`false` 两个方向都存活。
+
+**修复成本**：12 个用例约 130 行（每个用例需构造 `PermissionsConfig` + 断言 config 变化），比原稿估的「约 40 行」多。原因是要覆盖 write/edit 的去重与落盘断言，不能只写 `matches!(..., Allow)` 一行断言。
 
 ## 总体设计
 
@@ -112,7 +133,7 @@ cargo mutants --file permission.rs  →  123.7s，50 变异体：32 caught / 12 
 |---|---|---|---|
 | C1 patch coverage | `just ci-patch` recipe | 手动，合并收尾时 | `cargo-llvm-cov`、`diff-cover` |
 | C2 变异测试 | `just mutants` recipe + 三处落点配置 | 手动 / nightly | `cargo-mutants` |
-| C3 属性测试 | 各 crate 的 `tests/proptest_*.rs` | 随 `just test` | `proptest` |
+| C3 属性测试 | 各源文件的 `mod tests`（**不是** `tests/proptest_*.rs`：`yi-agent` 是纯 binary crate，`tui` 是私有 `mod`，集成测试访问不到） | 随 `just test` | `proptest` |
 | C4 golden-set eval | `tests/eval/` + `just eval` recipe | 手动 / nightly | 真实 API key |
 | C5 nightly | `.github/workflows/nightly.yml` + `.gitlab-ci.yml` schedule | 定时 | C1–C4 的 recipe |
 
@@ -307,17 +328,30 @@ additional_cargo_test_args = ["--skip", "read_only_sandbox_can_run_git"]
 
 **三个被测函数与性质**
 
+> **2026-11-02 复核修正**：原稿写的三条性质里有两条经实测**不成立**，已按下表改写。这不是措辞调整，是原性质会把正确的实现判成 bug。
+
 | 目标 | 入口 | 性质（property） |
 |---|---|---|
-| markdown 渲染 | `crates/yi-agent/src/tui/markdown.rs:27` `render_markdown(src: &str, width: u16)` | 1) 任意输入不 panic；2) 返回的 `Vec<Line>` 在有限步内产出（无死循环）；3) 任意 `width > 0` 时不产生宽度为 0 的行 |
-| 折行 | `crates/yi-agent/src/tui/wrap.rs:42` `wrap_by_display_width(text: &str, width: usize, first_prefix: &str, cont_prefix: &str) -> Vec<String>` | 1) 任意输入不 panic；2) 拼接还原后语义不丢字（除空白归一）；3) 输出每行显示宽度 ≤ `width`（前缀计入） |
-| slash 命令解析 | `crates/yi-agent/src/tui/slash.rs:223` `SlashCommand::from_name(name: &str)` | 1) 任意输入不 panic；2) 返回值恒为 `Option`，不存在「匹配到但内容越界」；3) 对 `all()` 里每个命令名，`from_name(name).name() == name`（往返一致） |
+| markdown 渲染 | `crates/yi-agent/src/tui/markdown.rs:27` `render_markdown(src: &str, width: u16) -> Vec<Line<'static>>` | 1) 任意 `&str` 输入不 panic；2) 输出行数有限（对输入长度设上限，防死循环）；3) `width == 0` 时也不 panic（`u16` 可为 0，实现需自行兜底） |
+| 折行 | `crates/yi-agent/src/tui/wrap.rs:42` `wrap_by_display_width(text: &str, width: usize, first_prefix: &str, cont_prefix: &str) -> Vec<String>` | 1) 任意输入不 panic；2) **字符守恒**：把所有输出行的 prefix 剥掉后拼接（`\n` 视为分段），与输入去掉 `\n` 后逐字符相同——这是该函数文档承诺的核心不变量（"Wrapping here never alters a character"）；3) **仅在 prefix 宽度 < width 时**，每行显示宽度 ≤ `width` |
+| slash 命令解析 | `crates/yi-agent/src/tui/slash.rs:223` `SlashCommand::from_name(name: &str) -> Option<SlashCommand>` | 1) 任意输入不 panic；2) **规范名往返**：对 `all()` 里每个 `cmd`，`from_name(cmd.name()) == Some(cmd)`；3) **别名不破坏往返**：`from_name` 的返回值 `r` 满足 `from_name(r.name()) == Some(r)`（对 `"kanban"` 这类别名成立，因为 `Kanban.name()` 是 `"superpowers-kanban"`） |
 
-**为什么是这三处**：全部是解析外部/用户输入、且无 IO 依赖的纯函数。属性测试的价值在探索输入空间边界（畸形嵌套、超长 CJK、控制字符），而非补覆盖率——这三处测试密度本已不低（markdown 2234 行 / 58 测试，slash 1282 行 / 52 测试，wrap 223 行 / 11 测试）。
+**两条原性质为何被推翻（实测证据）**
+
+1. **wrap 的「每行 ≤ width」不成立**。实测：
+   ```
+   wrap_by_display_width("hello world", 5, ">>>>> ", ">>>>>> ")
+   → 11 行，11 行全部超宽：[">>>>> h", ">>>>>> e", ...]
+   ```
+   根因在 `wrap.rs:52`：`width.saturating_sub(prefix_width).max(1)`。当 prefix 比 width 还宽时，可用宽度被 `max(1)` 兜到 1，每行必然超过 width。这是**有意的降级行为**（宁可超宽也要每行有内容），不是 bug。所以性质必须加前置条件「prefix 宽度 < width」，否则属性测试会对正确实现报假失败。
+2. **slash 的「`from_name(name).name() == name` 对所有 `all()` 元素成立」是恒真的废话**（`all()` 里存的就是规范名，`find(|c| c.name() == name)` 直接命中），测不出东西。真正有意义的是两种：规范名往返（性质 2）和别名收敛（性质 3：`from_name("kanban") → Kanban`，且 `Kanban.name() == "superpowers-kanban"`）。
+3. **markdown 的「不产生宽度为 0 的行」不成立**。空输入 `render_markdown("", 80)` 返回 1 个空行（宽度 0），这是合理行为。已改为「`width == 0` 不 panic」。
+
+**为什么是这三处**：全部是解析外部/用户输入、且无 IO 依赖的纯函数。属性测试的价值在探索输入空间边界（畸形嵌套、超长 CJK、控制字符），而非补覆盖率——这三处测试密度本已不低（markdown 1290 行 / 58 测试，slash 1282 行 / 52 测试，wrap 195 行 / 11 测试）。
 
 **规模约束**：每个性质设 `PROPTEST_CASES` 默认 256，CI 上不提高。发现问题后以最小的 failing case 转成常规单元测试固化，属性测试本身保留回归。
 
-**已知风险**：`render_markdown` 依赖 `syntect`（语法高亮），可能对某些输入极慢。若实测单 case 超 1s，应把该性质排除 syntect 路径（用 `render_markdown_with` 指定 `TuiTheme` 的纯色主题）。
+**syntect 风险已排除**：`crates/yi-agent/Cargo.toml:67` 的 `default = []`，`syntax-highlight = ["dep:syntect"]` 是**默认关闭的可选 feature**。`render_markdown` 走的是 `pulldown_cmark`，默认构建根本不编译 syntect。原稿把此列为风险是错的——除非显式 `--all-features` 跑测试，否则无此慢路径。而 `just test` 用的正是 `--all-features`，**因此该风险在 CI 里真实存在**，需在实施时实测单 case 耗时；若超 1s，用 `PROPTEST_CASES` 降级而非改实现。
 
 ### C4：golden-set eval
 
