@@ -78,6 +78,7 @@ pub struct Settings {
     pub compact: CompactSettings,
     pub startup: StartupSettings,
     pub tui: TuiSettings,
+    pub power: PowerSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,13 +94,6 @@ pub struct AgentSettings {
     pub system_prompt: Option<String>,
     #[serde(default, deserialize_with = "de_optional_usize")]
     pub skills_catalog_budget: Option<usize>,
-    /// `true` / `false`；`None` = 默认 `true`。
-    ///
-    /// 存字符串而不是 `Option<bool>`：`FIELDS` 的 `Text`/`Select` 只接受 JSON
-    /// 字符串（`validate_value`），用 `Option<bool>` 会让设置页写进 `"true"`
-    /// 后反序列化读不回来。与 `tui.notifications` 完全同构。
-    #[serde(default, deserialize_with = "de_optional_string")]
-    pub prevent_idle_sleep: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +138,25 @@ pub struct TuiSettings {
     pub notification_condition: Option<String>,
 }
 
+/// 电源与休眠设置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerSettings {
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// 存字符串而不是 `Option<bool>`：`FIELDS` 的 `Select` 只接受 JSON
+    /// 字符串（`validate_value`），用 `Option<bool>` 会让设置页写进
+    /// `"true"` 后反序列化读不回来。与 `tui.notifications` 完全同构。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub prevent_idle_sleep: Option<String>,
+    /// 条件消失后再保活多久（分钟）。范围 1–120。
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub idle_grace_minutes: Option<u64>,
+    /// 最近一次远端交互在多长时间内仍算「有活」（分钟）。范围 1–60。
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub remote_touch_minutes: Option<u64>,
+}
+
 /// 表单控件类型。`Number` 与 `Text` 在 JSON 里都是标量，区别只在渲染与校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldType {
@@ -170,16 +183,51 @@ pub struct FieldSpec {
     pub max: Option<u64>,
 }
 
+/// 「条件消失后再保活多久」的默认值，单位分钟。
+///
+/// 与字段语义同单位（分钟），秒数换算只在取用窗口时做一次。
+/// 单位真实值 15 分钟 = `yi_agent_power::policy::DEFAULT_GRACE`，
+/// 但本 crate 不依赖 `yi-agent-power`（二者互不依赖），故此处独立定义，
+/// 由 `power_windows_minutes` 的测试与 `Policy` 的测试各自钉住。
+pub const POWER_IDLE_GRACE_MINUTES_DEFAULT: u64 = 15;
+
+/// 「远端交互有效窗口」的默认值，单位分钟。对应 300 秒。
+pub const POWER_REMOTE_TOUCH_MINUTES_DEFAULT: u64 = 5;
+
 /// 开关的点路径键。多处引用同一常量，避免字符串抄错。
-pub const PREVENT_IDLE_SLEEP_KEY: &str = "agent.prevent_idle_sleep";
+///
+/// **它从此只表示新键。** 迁移函数里的旧键必须写成字面量
+/// `"agent.prevent_idle_sleep"`，不能引用本常量——否则将来再改常量，
+/// 迁移就会跟着漂移、静默失效。
+pub const PREVENT_IDLE_SLEEP_KEY: &str = "power.prevent_idle_sleep";
 
 /// 开关是否打开。缺文件 / 空串 / 未知值一律按默认（开）处理，与
 /// `tui.notifications` 的兜底一致。
 pub fn prevent_idle_sleep_enabled(settings: &Settings) -> bool {
-    match settings.agent.prevent_idle_sleep.as_deref() {
+    match settings.power.prevent_idle_sleep.as_deref() {
         Some(value) => !value.eq_ignore_ascii_case("false"),
         None => true,
     }
+}
+
+/// 两个窗口的实际生效值（分钟），返回 `(grace, remote)`。
+///
+/// **只兜 `None`，不兜越界**——越界值由 `normalized()` 的 `clamp!` 先行清空，
+/// 调用方必须先取得经过 `normalized()` 的 `Settings`。`load_from` 的返回值
+/// 已经过；`write_to` 里要自己先调 `.normalized()`。
+///
+/// 不做 slack 推导，也不做单位换算：slack 是策略层概念，放在
+/// `power_guard::slack_for`；分钟到秒的换算由调用点乘 60。
+pub fn power_windows_minutes(settings: &Settings) -> (u64, u64) {
+    let grace = settings
+        .power
+        .idle_grace_minutes
+        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
+    let remote = settings
+        .power
+        .remote_touch_minutes
+        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    (grace, remote)
 }
 
 /// 可持久化的全部字段。`workdir` 与 `yolo` 不在其中，见 spec「存储」一节。
@@ -244,11 +292,11 @@ pub static FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         key: PREVENT_IDLE_SLEEP_KEY,
-        group: "agent",
+        group: "power",
         label: "干活期间防止休眠",
         field_type: FieldType::Select,
         default_display: "true",
-        description: "有网且（插电 或 有活在跑）时阻止系统空闲休眠；条件消失 15 分钟后恢复",
+        description: "有网且（插电 或 有活在跑）时阻止系统空闲休眠；条件消失后按「保活窗口」再等一段时间",
         options: &["true", "false"],
         min: None,
         max: None,
@@ -489,6 +537,11 @@ impl Settings {
             "compact.tool_budget_tokens",
             self.compact.tool_budget_tokens
         );
+        clamp!("power.idle_grace_minutes", self.power.idle_grace_minutes);
+        clamp!(
+            "power.remote_touch_minutes",
+            self.power.remote_touch_minutes
+        );
 
         // 枚举白名单：只认 `parse_sandbox_mode` 那份映射，不另写一遍。
         // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
@@ -527,13 +580,13 @@ impl Settings {
                 self.tui.notification_condition = None;
             }
         }
-        if let Some(enabled) = self.agent.prevent_idle_sleep.as_deref() {
+        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref() {
             if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
                 tracing::warn!(
                     value = enabled,
-                    "settings.json has an unknown agent.prevent_idle_sleep; falling back to the default"
+                    "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
                 );
-                self.agent.prevent_idle_sleep = None;
+                self.power.prevent_idle_sleep = None;
             }
         }
         if let Some(sandbox) = self.startup.sandbox.as_deref() {
@@ -543,6 +596,24 @@ impl Settings {
                     "settings.json has an unknown startup.sandbox; falling back to the default"
                 );
                 self.startup.sandbox = None;
+            }
+        }
+
+        // 跨字段：远端窗口长于宽限会让「宽限」在电池场景下失去意义——
+        // 用户以为「没活 15 分钟就放睡」，实际因为远端窗口 30 分钟一直在扛。
+        // `clamp!` 管不到这个：两个值各自都在范围内，倒挂仍然成立。
+        if let (Some(remote), Some(grace)) = (
+            self.power.remote_touch_minutes,
+            self.power.idle_grace_minutes,
+        ) {
+            if remote > grace {
+                tracing::warn!(
+                    remote,
+                    grace,
+                    "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
+                );
+                self.power.remote_touch_minutes = None;
+                self.power.idle_grace_minutes = None;
             }
         }
         self
@@ -1410,7 +1481,7 @@ malformed line
     #[test]
     fn prevent_idle_sleep_honours_false() {
         let mut settings = Settings::default();
-        settings.agent.prevent_idle_sleep = Some("false".to_string());
+        settings.power.prevent_idle_sleep = Some("false".to_string());
         assert!(!prevent_idle_sleep_enabled(&settings));
     }
 
@@ -1421,7 +1492,7 @@ malformed line
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":"yes"}}"#).unwrap();
         let settings = load_from(&path);
-        assert_eq!(settings.agent.prevent_idle_sleep, None);
+        assert_eq!(settings.power.prevent_idle_sleep, None);
         assert!(prevent_idle_sleep_enabled(&settings));
     }
 
@@ -1432,7 +1503,7 @@ malformed line
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":""}}"#).unwrap();
         let settings = load_from(&path);
-        assert_eq!(settings.agent.prevent_idle_sleep, None);
+        assert_eq!(settings.power.prevent_idle_sleep, None);
     }
 
     /// 整份 JSON 坏掉时 `load_from` 返回默认值，即开关回到「开」。
@@ -1455,8 +1526,62 @@ malformed line
     fn prevent_idle_sleep_is_case_insensitive() {
         for raw in ["false", "FALSE", "False"] {
             let mut settings = Settings::default();
-            settings.agent.prevent_idle_sleep = Some(raw.to_string());
+            settings.power.prevent_idle_sleep = Some(raw.to_string());
             assert!(!prevent_idle_sleep_enabled(&settings), "{raw} must disable");
         }
+    }
+
+    #[test]
+    fn power_windows_default_to_fifteen_and_five() {
+        let (grace, remote) = power_windows_minutes(&Settings::default());
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+        assert_eq!((grace, remote), (15, 5));
+    }
+
+    /// 两个值各自合法但倒挂（宽限 5、远端 30）→ 两个都回默认。
+    ///
+    /// 只清远端会留下「宽限 5 单独生效」，用户看到的仍是自己设的 5 分钟，
+    /// 而文件里那对矛盾值会一直在，每次启动 warn 一次。两个一起回默认，
+    /// 行为单调且可解释。
+    #[test]
+    fn power_windows_inverted_pair_falls_back_to_both_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    }
+
+    /// 相等是合法的：远端窗口在宽限到期的同一刻失效，语义自洽。
+    #[test]
+    fn power_windows_allow_equal_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":10,"remote_touch_minutes":10}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!((grace, remote), (10, 10));
+    }
+
+    #[test]
+    fn power_windows_read_through_from_a_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":45,"remote_touch_minutes":20}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!((grace, remote), (45, 20));
     }
 }
