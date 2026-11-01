@@ -77,6 +77,7 @@ pub struct Settings {
     pub agent: AgentSettings,
     pub compact: CompactSettings,
     pub startup: StartupSettings,
+    pub tui: TuiSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +114,27 @@ pub struct StartupSettings {
     /// JSON 反序列化失败（那会把用户其它字段一起丢掉）。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub sandbox: Option<String>,
+}
+
+/// 终端 TUI 的行为设置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiSettings {
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// **为什么是字符串而不是 `Option<bool>`**：`FIELDS` 的三种控件
+    /// （`Number`/`Text`/`Select`）里，`Text` 与 `Select` 都只接受 JSON
+    /// 字符串（`validate_value`）。用 `Option<bool>` 会导致设置页写进
+    /// `"true"` 后反序列化读不回来。存字符串与 `startup.sandbox` 完全同构，
+    /// 也让非法值能按字段 warn 回退。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notifications: Option<String>,
+    /// `auto` / `osc9` / `bel`；`None` = `auto`。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notification_method: Option<String>,
+    /// `unfocused` / `always`；`None` = `unfocused`。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notification_condition: Option<String>,
 }
 
 /// 表单控件类型。`Number` 与 `Text` 在 JSON 里都是标量，区别只在渲染与校验。
@@ -242,6 +264,39 @@ pub static FIELDS: &[FieldSpec] = &[
         default_display: "workspace-write",
         description: "启动时的文件写入沙箱；空表示用默认档位",
         options: &["read-only", "workspace-write", "danger-full-access"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notifications",
+        group: "tui",
+        label: "终端通知",
+        field_type: FieldType::Select,
+        default_display: "true",
+        description: "回合完成或等待批准时发送终端通知；空表示用默认（开）",
+        options: &["true", "false"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notification_method",
+        group: "tui",
+        label: "通知协议",
+        field_type: FieldType::Select,
+        default_display: "auto",
+        description: "auto 按终端自动选择；osc9 带正文，bel 只响铃",
+        options: &["auto", "osc9", "bel"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notification_condition",
+        group: "tui",
+        label: "通知触发条件",
+        field_type: FieldType::Select,
+        default_display: "unfocused",
+        description: "unfocused 只在窗口失焦时发；always 总是发",
+        options: &["unfocused", "always"],
         min: None,
         max: None,
     },
@@ -409,6 +464,39 @@ impl Settings {
         // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
         // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
         // 同 crate，`pub(crate)` 足够）。
+        if let Some(enabled) = self.tui.notifications.as_deref() {
+            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
+                tracing::warn!(
+                    value = enabled,
+                    "settings.json has an unknown tui.notifications; falling back to the default"
+                );
+                self.tui.notifications = None;
+            }
+        }
+        if let Some(method) = self.tui.notification_method.as_deref() {
+            if !matches!(
+                method.to_ascii_lowercase().as_str(),
+                "auto" | "osc9" | "bel"
+            ) {
+                tracing::warn!(
+                    value = method,
+                    "settings.json has an unknown tui.notification_method; falling back to the default"
+                );
+                self.tui.notification_method = None;
+            }
+        }
+        if let Some(condition) = self.tui.notification_condition.as_deref() {
+            if !matches!(
+                condition.to_ascii_lowercase().as_str(),
+                "unfocused" | "always"
+            ) {
+                tracing::warn!(
+                    value = condition,
+                    "settings.json has an unknown tui.notification_condition; falling back to the default"
+                );
+                self.tui.notification_condition = None;
+            }
+        }
         if let Some(sandbox) = self.startup.sandbox.as_deref() {
             if crate::config::parse_sandbox_mode(sandbox).is_none() {
                 tracing::warn!(
@@ -506,7 +594,7 @@ pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsEr
     }
 
     // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
-    for group in ["agent", "compact", "startup"] {
+    for group in ["agent", "compact", "startup", "tui"] {
         if object
             .get(group)
             .and_then(|value| value.as_object())
@@ -1162,6 +1250,115 @@ malformed line
             settings.compact.ratio,
             Some(75),
             "a well-typed neighbour must survive"
+        );
+    }
+
+    #[test]
+    fn tui_defaults_are_all_none() {
+        let settings = Settings::default();
+        assert!(settings.tui.notifications.is_none());
+        assert!(settings.tui.notification_method.is_none());
+        assert!(settings.tui.notification_condition.is_none());
+    }
+
+    #[test]
+    fn tui_fields_are_registered() {
+        for key in [
+            "tui.notifications",
+            "tui.notification_method",
+            "tui.notification_condition",
+        ] {
+            assert!(
+                find_spec(key).is_some(),
+                "{key} must be in FIELDS or the settings UI will not show it"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_notification_method_is_dropped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tui":{"notification_method":"carrier-pigeon","notifications":"false"},
+                "agent":{"max_turns":42}}"#,
+        )
+        .unwrap();
+
+        let settings = load_from(&path);
+        // 非法值被清成 None（回退默认），而不是让整份文件失败。
+        assert_eq!(settings.tui.notification_method, None);
+        // 同一份文件里的其它字段必须还在。
+        assert_eq!(settings.tui.notifications.as_deref(), Some("false"));
+        assert_eq!(settings.agent.max_turns, Some(42));
+    }
+
+    #[test]
+    fn invalid_notification_condition_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"notification_condition":"sometimes"}}"#).unwrap();
+        assert_eq!(load_from(&path).tui.notification_condition, None);
+    }
+
+    #[test]
+    fn invalid_notifications_flag_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"notifications":"maybe"}}"#).unwrap();
+        assert_eq!(load_from(&path).tui.notifications, None);
+    }
+
+    #[test]
+    fn valid_notification_values_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tui":{"notifications":"true","notification_method":"osc9","notification_condition":"always"}}"#,
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.tui.notifications.as_deref(), Some("true"));
+        assert_eq!(settings.tui.notification_method.as_deref(), Some("osc9"));
+        assert_eq!(
+            settings.tui.notification_condition.as_deref(),
+            Some("always")
+        );
+    }
+
+    #[test]
+    fn deleting_all_tui_keys_removes_the_empty_group() {
+        // 写三个键再全部删掉，文件里不该留下 {"tui":{}} 这种空壳。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_to(
+            &path,
+            &serde_json::json!({
+                "tui.notifications": "true",
+                "tui.notification_method": "bel",
+            }),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"tui\""), "group must exist: {text}");
+
+        write_to(
+            &path,
+            &serde_json::json!({
+                "tui.notifications": null,
+                "tui.notification_method": null,
+            }),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("tui").is_none(),
+            "empty tui group must be pruned, got {text}"
         );
     }
 }
