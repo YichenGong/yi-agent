@@ -3048,7 +3048,16 @@ export default function App() {
                           board.boardRpc,
                           board.selectedBoard!,
                           title,
-                          sess.currentId,
+                          // 这里的「＋」是看板页的容器级动作，不在任何会话的讨论
+                          // 上下文里：`sess.currentId` 是「上次打开的那条会话」
+                          // （打开看板只改 `selectedBoard`，不动 `currentId`），
+                          // 未必和这张卡有关，甚至可能属于另一个项目。绑上去会让
+                          // 卡片链接跳进一个不相干的对话，故一律不绑。
+                          //
+                          // 会话内的溯源走另一条路径：会话里
+                          // `superpowers-kanban add-prequeued`，宿主经
+                          // `YI_AGENT_THREAD_ID` 注入当前会话，那里必然正确。
+                          null,
                         )
                       }
                     />
