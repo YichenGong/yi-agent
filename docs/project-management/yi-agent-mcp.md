@@ -58,3 +58,4 @@ yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MC
   - 手动 reload 说明：`ReloadReport::skipped_backoff_names()` + `reload_tool.rs` 渲染「跳过探测（退避窗口内），沿用 N 个工具」；TUI label 列出被跳过的 server
   - 原子写：`McpCache::save` 改为同目录 `tmp + rename`，失败清临时文件
   - 验证：`cargo test -p yi-agent-mcp --lib`（121 个，全绿）；关键回归测试 `reload_refreshes_a_renamed_tool_after_the_ttl`（本 bug）、`a_permanently_dead_server_is_probed_once_per_backoff_window`（10 轮只探 1~2 次）
+  - 手工验收：`scripts/verify/mcp-cache-ttl.sh {status|expire|backoff|restore}` + 发一条消息；流程与实测数据见 spec「手工验收流程」。**注意自愈在下一轮对话前触发，启动时不会**（`manager.rs` 的 `load_and_probe` 刻意不校验 TTL）；headless `yi-agent run` 不走这段，只能用 TUI/桌面端验收

@@ -1289,6 +1289,47 @@ cargo fmt --all -- --check
 - §4.3.1.1(b) 的错峰抖动 / 每轮探测限额：spec 列为可选压住手段，未实现。真机验收第 2 条
   （3 个 server 同时过期）若超 20s，需补一个 Task 10。
 
+### 手工验收流程（已实测通过，2026-11-01）
+
+自愈发生在**下一轮对话开始前**（`main.rs:2903` 的 `needs_reload`），**不是**进程启动时：
+`load_and_probe` 刻意不校验 TTL（`manager.rs:173`），过期条目照样直接用。所以验收必须
+「发一条消息」，光启动不够。headless 的 `yi-agent run` 也**不**走这段——它没有每轮检查，
+只能用 TUI 或桌面端验收。
+
+辅助脚本：`scripts/verify/mcp-cache-ttl.sh {status|expire|backoff|restore <备份>}`。
+
+**验收 1：过期 ⇒ 重探（对应本 bug）**
+
+```bash
+cp .yi-agent/mcp-cache.json /tmp/mcp-cache.bak
+scripts/verify/mcp-cache-ttl.sh expire     # probed_at 改成 25h 前
+scripts/verify/mcp-cache-ttl.sh status     # 应显示「已过期」
+yi-agent                                   # 发任意一条消息
+scripts/verify/mcp-cache-ttl.sh status     # probed_at 应变成「刚刚」
+```
+
+实测：`probed_at` 由 25.01h 前变为 0.01h 前；`~/.yi-agent/trace/session-*.jsonl` 中出现
+`MCP config changed on disk; registry reloaded`。
+
+**验收 2：退避窗口内 ⇒ 不重探（对照组）**
+
+```bash
+scripts/verify/mcp-cache-ttl.sh backoff    # 过期 + failed_at 1 分钟前
+yi-agent                                   # 发消息
+scripts/verify/mcp-cache-ttl.sh status     # probed_at 必须**不变**
+```
+
+实测：`probed_at` 前后一致（1793444126 → 1793444126）。
+
+**验收 3：`/mcp reload` 要如实说明被退避挡住**
+
+在验收 2 的状态下敲 `/mcp reload`，应出现「，1 个因退避窗口跳过（<server>）」。
+
+**验收 4：旧格式缓存零探测**
+
+删掉缓存条目里的 `probed_at` 字段后启动，应**不产生探测**且文件被补上 `probed_at`
+（单测 `migration_of_many_servers_probes_none_of_them` 覆盖同一逻辑）。
+
 ### 发版说明必须写一句
 
 `backfill_probed_at` 把存量条目填成 `now`，是刻意的取舍（避免升级首轮集体重探 30~40s），
