@@ -2392,3 +2392,29 @@ describe("分组功能（常开）", () => {
   });
 });
 
+
+describe("ThreadSidebar relative time", () => {
+  /**
+   * 用户报的「20xxxd」：`formatRelativeTime(0)` 曾被算成 1970 年 ⇒ 20758d。
+   * 侧栏与离线提示条共用这个函数，故两处都必须钉住。
+   */
+  it("does not render a day count for a zero updated_at", () => {
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: [thread("1", "zero-time", "/work/projA")] }],
+    });
+    expect(container.textContent).not.toMatch(/\d{3,}d/);
+  });
+
+  it("still renders a normal age", () => {
+    const { container } = renderSidebar({
+      groups: [
+        {
+          workspace: "/work/projA",
+          exists: true,
+          threads: [{ ...thread("1", "fresh", "/work/projA"), updated_at: Date.now() - 5 * 24 * 3600_000 }],
+        },
+      ],
+    });
+    expect(container.textContent).toContain("5d");
+  });
+});
