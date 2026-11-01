@@ -1,0 +1,111 @@
+name: Nightly
+
+# 定时任务：覆盖「代码没改但外部世界变了」的失效模式。
+#
+# 与 ci.yml 的分工：ci.yml 管「这次提交有没有问题」，这里管「时间带来的问题」——
+# 新披露的 CVE、真实 LLM 供应商行为漂移、变异测试的渐进退化。
+#
+# 为什么挂 GitHub 而不挂在 GitLab：GitLab runner 是局域网里的 Mac mini，
+# 夜间跑真 LLM 测试会占用开发机。GitHub 是云端 runner，不占本机。
+on:
+  schedule:
+    # UTC 18:00 = 北京时间 02:00，避开白天开发时段
+    - cron: "0 18 * * *"
+  workflow_dispatch:  # 手动触发，用于验证 workflow 本身
+
+# 三个 job 互不依赖，任一失败不影响其它两个跑完——夜间任务的价值在于
+# 「一次看到所有坏消息」，而不是第一个红就中止（那是 PR 门禁的取舍）。
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        working-directory: yi-agent-rs
+        run: cargo audit
+
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yi-agent-rs
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Install just
+        uses: extractions/setup-just@v2
+      - name: Mutants
+        working-directory: yi-agent-rs
+        # 不需要额外 scrub 会话变量：`just mutants` 里已 `unset YI_AGENT_THREAD_ID
+        # YI_AGENT_SESSION_ID`。这一步不能省——`yi-agent-tools` 的
+        # `bash_without_a_session_env_leaves_the_variable_unset` 断言这些变量
+        # 不存在，被污染时基线失败，cargo-mutants 直接 exit 4（实测踩过）。
+        run: just mutants
+
+  real-llm:
+    # 真实 API 调用。跑在 GitHub 云端 runner，不占局域网 Mac mini。
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yi-agent-rs
+      - name: Install just
+        uses: extractions/setup-just@v2
+      # 配置源是 models.json，不是环境变量。见下方「为什么不能直接注入 API key」。
+      - name: Write models.json from secrets
+        working-directory: yi-agent-rs
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_API_URL: ${{ secrets.MODEL_API_URL }}
+          MODEL: ${{ secrets.MODEL }}
+          PROVIDER: ${{ secrets.PROVIDER }}
+        run: |
+          mkdir -p "$HOME/.yi-agent"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          # 缺任何一个 secret 就直接失败，而不是写出一个空条目让测试静默 SKIPPED。
+          # 「配错了还以为在跑」比「红了要人看一眼」贵得多。
+          missing = [k for k in ("PROVIDER", "MODEL", "MODEL_API_URL", "MODEL_API_KEY")
+                     if not os.environ.get(k)]
+          if missing:
+              sys.exit(f"missing secrets: {', '.join(missing)}")
+          entry = {
+              "name": "nightly",
+              "provider": os.environ["PROVIDER"],
+              "model": os.environ["MODEL"],
+              "api_url": os.environ["MODEL_API_URL"],
+              "api_key": os.environ["MODEL_API_KEY"],
+          }
+          doc = {"default_model": "nightly", "models": [entry]}
+          path = os.path.expanduser("~/.yi-agent/models.json")
+          with open(path, "w") as fh:
+              json.dump(doc, fh)
+          print(f"wrote {path} (model={entry['model']}, provider={entry['provider']})")
+          PYEOF
+      - name: Real LLM tests
+        working-directory: yi-agent-rs
+        # real-llm 系 recipe 第一步会 unset 所有 key 再从 models.json 重新导出，
+        # 所以这一层不需要也不该注入环境变量。
+        run: just test-real-all
+      - name: Golden-set eval
+        working-directory: yi-agent-rs
+        run: |
+          eval "$(bash scripts/export-model-env.sh)"
+          if [ -z "${MODEL_API_KEY:-}" ]; then
+            echo "SKIPPED: models.json 没有可用条目"; exit 0
+          fi
+          cargo test -p yi-agent --test eval_baseline -- --ignored --nocapture

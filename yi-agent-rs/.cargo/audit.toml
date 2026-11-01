@@ -1,0 +1,79 @@
+# cargo audit 豁免清单。
+#
+# 只录「当下确实修不了」的条目，每条必须写明理由与复查条件。
+# 分类依据见 docs/superpowers/specs/2026-11-02-quality-hardening-wave2-design.md 的 D1。
+#
+# 三类的处置差异（重要，不要混为一谈）：
+#   A. 纯 lock 更新即可修 —— 本波**不修**，因为 cargo update 会改动约 134 个包，
+#      必须等所有并行卡片合入 main 后单独做（D1 约束）。这里临时豁免，
+#      复查条件统一是「cargo update 那一波之后全部移除」。
+#   B. 需改 Cargo.toml 约束（跨大版本）—— 单独开卡，本波不做。
+#   C. 无法修 / 非 CVE —— 长期豁免，复查条件是上游发版或我们换依赖。
+#
+# 不要图省事写 ignore = ["*"]，也不要为了「让门禁变绿」把 A 类当 C 类长期豁免。
+
+[advisories]
+ignore = [
+    # ===== A 类：等 cargo update 修（本波不动 lock）=====
+    # 复查条件：cargo update 那一波执行后逐条删除，删完仍红说明 update 未覆盖到。
+    "RUSTSEC-2026-0258",  # h2 0.4.15：unbounded empty DATA frames → 0.4.20
+    "RUSTSEC-2026-0338",  # quinn-proto 0.11.16：zero-length STREAM frame panic → 0.11.19
+    "RUSTSEC-2026-0339",  # quinn-proto 0.11.16：connection ID retirement 无界增长 → 0.11.19
+    "RUSTSEC-2026-0340",  # quinn-proto 0.11.16：最小 ACK delay 触发 panic → 0.11.19
+    "RUSTSEC-2026-0341",  # quinn-proto 0.11.16：stream reassembly 内存耗尽 → 0.11.19
+    "RUSTSEC-2026-0342",  # quinn-proto 0.11.16：零长 DATAGRAM 绕过接收缓冲上限 → 0.11.19
+    "RUSTSEC-2026-0285",  # rustls 0.23.42：TLS1.3 握手消息跨加密层级被接受 → 0.23.46
+    "RUSTSEC-2026-0346",  # rustls 0.23.42：Debug 实现泄漏会话密钥 → 0.23.46
+    "RUSTSEC-2026-0348",  # rustls 0.23.42：brotli 证书解压可先吃 1 GiB → 0.23.46
+    "RUSTSEC-2026-0349",  # rustls 0.23.42：未认证 ServerHello 可降级后续连接 → 0.23.46
+    "RUSTSEC-2026-0382",  # rustls-webpki 0.103.13：可能接受不受信中间证书 → 随 rustls
+    "RUSTSEC-2026-0381",  # webpki-roots 1.0.9：内置根证书含 emSign 不受信链
+    "RUSTSEC-2026-0383",  # webpki-root-certs 1.0.9：同上（reqwest 0.13 → rmcp 的验证器）
+    "RUSTSEC-2026-0386",  # tokio 1.53.0：AsyncFd 违反 I/O safety → 1.53.3+
+    # chacha20 0.10.1 被 yanked，无 advisory id，故不在本表；
+    # 它是 proptest → rand 的传递依赖，cargo update 时一并解决。
+    # 复查条件：cargo update 后 `cargo audit` 不再报 chacha20 yanked。
+
+    # ===== 不在本表但会出现在输出里的条目 =====
+    # chacha20 0.10.1 被 yanked（无 advisory id，cargo audit 无法按 id 忽略）。
+    # 来源：proptest → rand 0.10.2 的 dev 依赖，不进程制品。
+    # `cargo audit` 默认把 yanked 算 warning、不影响退出码，故 `just audit` 仍绿；
+    # `cargo update -p chacha20` 可升到 0.10.2（只动 1 个包），但按 D1 约束
+    # 本波不动 lock，留到 cargo update 那一波一并处理。
+    # 复查条件：cargo update 后 `cargo audit` 不再打印 chacha20。
+
+    # ===== B 类：跨大版本，单独开卡 =====
+    # 复查条件：quick-xml 升到 0.40 / zip 升到 9.0 的卡片完成时删除。
+    "RUSTSEC-2026-0194",  # quick-xml 0.38.4：重复属性检查平方复杂度
+    "RUSTSEC-2026-0195",  # quick-xml 0.38.4：NsReader 命名空间声明无界分配
+    "RUSTSEC-2026-0367",  # zip 8.6.0：解压时保留 SUID/SGID 位
+    "RUSTSEC-2026-0368",  # zip 8.6.0：解压创建符号链接可越界
+    "RUSTSEC-2026-0369",  # zip 8.6.0：extract 应用 UNIX 权限位
+
+    # ===== C 类：无法在本仓库修 =====
+    # 复查条件：html2md 发布新版本把 regex 提到 1.x 时整组删除。
+    #   regex 0.2.11 是 html2md 0.1.1 的传递依赖，上游多年未更新；
+    #   thread_local 0.3.6 只被 regex 0.2.11 拉入，无独立修复路径。
+    "RUSTSEC-2022-0013",  # regex 0.2.11：大重复对空子表达式导致指数回溯
+    "RUSTSEC-2022-0006",  # thread_local 0.3.6：Iter/IterMut 数据竞争
+    # 复查条件：ratatui 升到用 lru >= 0.18.2 的版本时删除。
+    #   lru 0.12.5 由 ratatui 0.29 锁定；我们在 TUI 里只用 LruCache 做缓存，
+    #   不调用 pop()（UAF 触发点），也不暴露 IterMut。风险面是「未触发」而非「不存在」。
+    "RUSTSEC-2026-0253",  # lru 0.12.5：pop() 非 panic-safe 导致 UAF
+    "RUSTSEC-2026-0002",  # lru 0.12.5：IterMut 违反 Stacked Borrows
+    # 复查条件：html2md 升级或移除时删除（ascii 来自 jni → combine，只在 html2md 链上）。
+    "RUSTSEC-2023-0015",  # ascii 0.7.1：安全代码内越界索引
+    # 以下是 unmaintained（非 CVE）。cargo audit 默认把它们算 warning、不影响退出码，
+    # 但 `--deny warnings` 会。逐条给复查条件：
+    #   复查条件：serde_yaml 被替换为 serde-saphyr / 移除时删除。
+    "RUSTSEC-2024-0449",  # unsafe-libyaml 0.2.11：serde_yaml 的 C 翻译实现
+    "RUSTSEC-2024-0320",  # yaml-rust 0.4.5：无维护者，建议 yaml-rust2
+    #   复查条件：ratatui 去掉 paste 时删除。
+    "RUSTSEC-2024-0436",  # paste 1.0.15：作者归档仓库
+    #   复查条件：pdf-extract / lopdf 换字体解析库时删除。
+    "RUSTSEC-2026-0192",  # ttf-parser 0.25.1：作者声明不再维护
+    #   复查条件：确认 bincode 只出现在 dev/构建链上即可降级为 warning；彻底消除需上游换代。
+    "RUSTSEC-2025-0141",  # bincode 1.3.3：团队解散停止开发
+    #   复查条件：phf/markup5ever 链升级到 rand >= 0.7 时删除。
+    "RUSTSEC-2025-0124",  # rand_os 0.1.3：已并入 rand_core
+]
