@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -79,6 +79,11 @@ desktop-target-dir-check:
 model-setup-docs-check:
     bash scripts/test_model_setup_docs.sh
     bash scripts/check-model-setup-docs.sh
+
+# rebuild.sh 安装段自测：dev/stable 各装到哪、全局软链指向谁、拒绝覆盖真实文件。
+# 该失败却静默成功时，用户会以为全局 `yi-agent` 已是新版而实际全在用旧的。
+rebuild-install-check:
+    bash ../scripts/test_rebuild_global_link.sh
 
 # 发布门禁自测：tag 必须落在 main 可达的提交上。release.yml 只由 tag 触发、
 # 只打包不跑测试，所以打在未合并功能分支上的 tag 会被直接发出去。
