@@ -103,6 +103,35 @@ impl TuiChannels {
     }
 }
 
+/// 终端清理段。
+///
+/// 抽出来是为了让「标题还原发生在最后一步之后」可被测试断言。`step` 是
+/// 可注入的执行器：生产传入真实 crossterm 调用，测试传入记录器。
+///
+/// 标题还原刻意**不**参与 `cleanup_error`：`TitleHandle::clear` 返回 `()`，
+/// 签名层面就进不来。否则上百种不支持 OSC 2 的终端会在每次正常退出时
+/// 返回非零，被 `set -e` / CI 脚本当成崩溃。
+fn run_cleanup_with<F>(mut step: F, title: &mut crate::tui::title::TitleHandle) -> Option<io::Error>
+where
+    F: FnMut(&str) -> io::Result<()>,
+{
+    let mut cleanup_error: Option<io::Error> = None;
+    for name in [
+        "DisableBracketedPaste",
+        "DisableFocusChange",
+        "disable_raw_mode",
+        "LeaveAlternateScreen",
+    ] {
+        if let Err(error) = step(name) {
+            cleanup_error.get_or_insert(error);
+        }
+    }
+    // 必须在 `LeaveAlternateScreen` 之后：alternate screen 关闭时多数终端
+    // 会重置标题，先写空串等于白写。
+    title.clear();
+    cleanup_error
+}
+
 /// Run the ratatui TUI main loop with the real terminal.
 ///
 /// - `agent_rx`: receives agent events to display in history
@@ -203,24 +232,15 @@ pub fn run_tui(
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
-    let mut cleanup_error: Option<io::Error> = None;
-    if let Err(error) = execute!(terminal.backend_mut(), DisableBracketedPaste) {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = execute!(terminal.backend_mut(), DisableFocusChange) {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = disable_raw_mode() {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
-        cleanup_error.get_or_insert(error);
-    }
-
-    // 标题还原：独立路径，失败只记日志、不影响退出码。必须在
-    // `LeaveAlternateScreen` 之后——alternate screen 关闭时多数终端会重置
-    // 标题，先写空串等于白写。
-    title.clear();
+    let cleanup_error = run_cleanup_with(
+        |name| match name {
+            "DisableBracketedPaste" => execute!(terminal.backend_mut(), DisableBracketedPaste),
+            "DisableFocusChange" => execute!(terminal.backend_mut(), DisableFocusChange),
+            "disable_raw_mode" => disable_raw_mode(),
+            _ => execute!(terminal.backend_mut(), LeaveAlternateScreen),
+        },
+        &mut title,
+    );
 
     // Report the dropped count only after the alternate screen is gone;
     // printing earlier would be erased along with it.
@@ -11510,6 +11530,243 @@ mod tests {
         assert_eq!(
             history.scroll_offset, 1,
             "Up should scroll history while a permission is pending"
+        );
+    }
+
+    /// 按脚本逐帧设置 `is_running`，脚本走完后按 Ctrl+Q 退出。
+    struct TitleScriptEvents {
+        script: Vec<bool>,
+        is_running: Arc<AtomicBool>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for TitleScriptEvents {
+        // `run_loop` 每帧的顺序是：draw → title.sync(is_running) → events.poll()。
+        // 也就是说第 N 帧的 sync 看到的是「第 N-1 次 poll 写入的值」。所以
+        // `is_running` 必须用脚本首帧的值初始化（首帧 sync 才能看到正确状态），
+        // 而 poll 里要写入的是**下一帧**该看到的值，即 `script[index + 1]`。
+        // 若在 poll 里就地写 `script[index]`，首帧 sync 会先看到初始的 false，
+        // 白写一次 "p"，断言序列变成 ["p", "● p", "p"]。
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let index = self.poll_count.get();
+            if index >= self.script.len() {
+                return Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                ))));
+            }
+            if let Some(next) = self.script.get(index + 1) {
+                self.is_running
+                    .store(*next, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.poll_count.set(index + 1);
+            Ok(None)
+        }
+    }
+
+    /// 跑 `run_loop` 直到事件源说停，返回记录到的标题写入序列。
+    ///
+    /// 用 `RecordingSink` 而非真 stdout：`cargo test` 的 stdout 不是 tty，
+    /// `StdoutSink` 会短路，写入次数根本看不见。
+    fn run_loop_for_title(workdir: &std::path::Path, script: Vec<bool>) -> Vec<String> {
+        let backend = Rc::new(RefCell::new(TestBackend::new(80, 24)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        // 首帧 sync 发生在第一次 poll 之前，故初值必须取脚本首帧。
+        let first = script.first().copied().unwrap_or(false);
+        let is_running = Arc::new(AtomicBool::new(first));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let source = TitleScriptEvents {
+            script,
+            is_running: Arc::clone(&is_running),
+            poll_count: Cell::new(0),
+        };
+
+        let sink = crate::tui::title::RecordingSink::default();
+        let probe = sink.clone();
+        let mut title =
+            crate::tui::title::TitleHandle::with_sink(true, false, workdir, Box::new(sink));
+        let config = snapshot_for_tests();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &source,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            workdir.to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &config,
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+        )
+        .unwrap();
+
+        probe.calls()
+    }
+
+    #[test]
+    fn title_follows_the_running_flag() {
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true, false]);
+        assert_eq!(calls, vec!["● p".to_string(), "p".to_string()]);
+    }
+
+    #[test]
+    fn title_is_written_once_while_running_stays_true() {
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true; 60]);
+        assert_eq!(
+            calls,
+            vec!["● p".to_string()],
+            "60 identical frames must not rewrite the title (would flicker)"
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_returns_title_to_idle() {
+        // 与通知功能相反：`Done{Interrupted}` 不发通知，但标题必须回空闲。
+        // 这里用「置 false」等价于 `main.rs` 收尾处的 `store(false)`。
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true, false]);
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("p"),
+            "an interrupted turn must not leave the running dot on the tab"
+        );
+    }
+
+    /// 把清理步骤和标题写入放进**同一条**时间线。
+    ///
+    /// 为什么不用两个独立序列比较末尾：那样只能证明「标题还原是标题序列的
+    /// 最后一项」+「LeaveAlternateScreen 是步骤序列的最后一项」，证明不了
+    /// 两者的**相对顺序**。共享一条 log 才能断言 clear 严格落在最后一步之后。
+    #[derive(Debug, Clone, Default)]
+    struct TimelineSink {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TimelineSink {
+        fn entries(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// 只让**下一次**标题写入返回 `Err`（只生效一次）。
+        fn fail_next(&self) {
+            self.fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::tui::title::TitleSink for TimelineSink {
+        fn write_title(&mut self, text: &str) -> std::io::Result<()> {
+            self.log.lock().unwrap().push(format!("title:{text:?}"));
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn title_restore_failure_does_not_change_exit_code() {
+        let sink = TimelineSink::default();
+        let log = std::sync::Arc::clone(&sink.log);
+        let probe = sink.clone();
+        let mut title = crate::tui::title::TitleHandle::with_sink(
+            true,
+            false,
+            std::path::Path::new("/work/p"),
+            Box::new(sink),
+        );
+
+        // 先让一次写入**成功**：否则 writer 立刻进入 disabled，`clear` 短路，
+        // 失败根本落不到 clear 上，断言会恒真。
+        title.sync(true);
+        assert_eq!(probe.entries(), vec![r#"title:"● p""#.to_string()]);
+
+        // 只注入一次失败 —— 正好是接下来的 `clear`。
+        probe.fail_next();
+
+        let cleanup_error = run_cleanup_with(
+            |name| {
+                log.lock().unwrap().push(format!("step:{name}"));
+                Ok(())
+            },
+            &mut title,
+        );
+
+        assert!(
+            cleanup_error.is_none(),
+            "title restore must never contribute a cleanup error"
+        );
+
+        let entries = probe.entries();
+        assert_eq!(entries.len(), 6, "1 sync + 4 cleanup steps + 1 clear");
+        assert_eq!(entries[0], r#"title:"● p""#);
+        assert_eq!(entries[1], "step:DisableBracketedPaste");
+        assert_eq!(
+            entries[5], r#"title:"""#,
+            "clear must still be attempted even though it fails"
+        );
+    }
+
+    #[test]
+    fn clear_happens_after_leave_alternate_screen() {
+        let sink = TimelineSink::default();
+        let log = std::sync::Arc::clone(&sink.log);
+        let probe = sink.clone();
+        let mut title = crate::tui::title::TitleHandle::with_sink(
+            true,
+            false,
+            std::path::Path::new("/work/p"),
+            Box::new(sink),
+        );
+        title.sync(true);
+
+        let _ = run_cleanup_with(
+            |name| {
+                log.lock().unwrap().push(format!("step:{name}"));
+                Ok(())
+            },
+            &mut title,
+        );
+
+        assert_eq!(
+            probe.entries(),
+            vec![
+                r#"title:"● p""#.to_string(),
+                "step:DisableBracketedPaste".to_string(),
+                "step:DisableFocusChange".to_string(),
+                "step:disable_raw_mode".to_string(),
+                "step:LeaveAlternateScreen".to_string(),
+                r#"title:"""#.to_string(),
+            ],
+            "the empty title must be written strictly after the last cleanup step"
         );
     }
 }
