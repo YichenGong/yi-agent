@@ -54,3 +54,36 @@ jobs:
       - name: Desktop type check + unit tests
         working-directory: yi-agent-rs
         run: just desktop-check
+
+  macos:
+    # macOS 专属代码在 PR 阶段就该有信号：21 处 cfg(target_os = "macos")
+    # （power 8 / tools 6 / app-server 7）在 ubuntu runner 上根本不会被编译。
+    #
+    # 镜像选择（2026-11-01 核对 actions/runner-images README）：
+    #   - macos-14 已于 2026-11-02 退役（官方 changelog 2026-10-01，issue #13518），不用
+    #   - macos-latest 现在指向 macOS 26，会随 GitHub 调整漂移，门禁要用固定标签
+    #   - macos-15 是当前可用的 arm64 固定标签，可用
+    # 只跑三个 crate：目标是覆盖 macOS 特有路径，不是重复 Linux 已跑过的验证。
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yi-agent-rs
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.150
+
+      - name: Run macOS-gated tests
+        working-directory: yi-agent-rs
+        run: |
+          cargo nextest run --all-features \
+            -p yi-agent-power -p yi-agent-tools -p yi-agent-app-server \
+            --profile ci
