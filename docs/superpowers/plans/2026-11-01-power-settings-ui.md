@@ -296,6 +296,8 @@ impl Policy {
     }
 ```
 
+**上面的代码块是不完整的，这是有意的**：它只覆盖从 `#[derive(Debug, Default)] pub struct Policy {` 到 `pub fn new()` / `with_windows` / `set_windows` 这一段的原有范围。`impl Policy` 里紧跟其后的 `on_disabled`、`re_enable`、`decide`、`keeps_awake` **保持原样不动**（`decide` 在下一步改，其余两条完全不动）。不要因为代码块看起来「少一个 `}`」就去补——那样会把 `on_disabled` 等方法挤出 `impl`，直接编译失败。
+
 - [ ] **Step 4: 改 `decide` 的两处常量引用与 `Idle` 分支**
 
 `decide` 内改写两处判定，并把尾部 `match` 的 `Idle` 分支补上清 `last_ok`：
@@ -1238,6 +1240,8 @@ cargo test -p yi-agent-runtime --lib power_windows
 ```
 
 - [ ] **Step 4: 把 `power` 加进 `write_to` 的空组清理列表**
+
+只改 `for group in [...]` 这一行的数组，循环体与注释不动（片段只显示到 `{`）：
 
 ```rust
     // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
