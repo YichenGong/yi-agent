@@ -291,6 +291,64 @@ flock + 进程级去重表。flock 按打开文件描述加锁，同一进程两
 
 ---
 
+## Task 1b: 给 `ThreadMeta` 加 `forked_from`
+
+**Files:**
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/thread_store.rs`
+
+**Interfaces:**
+- Produces: `ThreadMeta.forked_from: Option<String>`
+
+**为什么单独一步、且必须在 Task 3 之前：** Task 3 的 `TuiSessionStore::create_new` 会构造 `ThreadMeta` 完整字面量，Task 7 的 `fork_thread` 也要读它。若等到 Task 7 才加字段，Task 3 编译不过（`missing field forked_from`）。加字段本身是纯机械改动，单独成步便于评审。
+
+- [ ] **Step 1: 加字段**
+
+```rust
+    /// 从哪个 thread fork 而来。**仅用于展示**，任何读取路径都不看它。
+    ///
+    /// `#[serde(default)]` 是必须的：既有 meta 文件都没有这个字段，缺默认值会让
+    /// 反序列化失败，`load` 走 `rebuild_meta` 兜底并把 `cwd` 冲成空串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+```
+
+- [ ] **Step 2: 让编译器找出所有待补的字面量**
+
+```bash
+cd yi-agent-rs && cargo build -p yi-agent-app-server 2>&1 | grep -c "missing field"
+```
+
+Expected: 一个大于 0 的数字。逐个补 `forked_from: None`。
+
+- [ ] **Step 3: 确认全 crate 编译通过**
+
+```bash
+cd yi-agent-rs && cargo build -p yi-agent-app-server
+```
+
+Expected: 编译成功。
+
+- [ ] **Step 4: 有一段既有 meta 必须仍能反序列化**
+
+```bash
+cd yi-agent-rs && cargo test -p yi-agent-app-server --lib thread_store
+```
+
+Expected: 全 green。若 `load_*` 测试变红，说明 `#[serde(default)]` 漏了。
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd yi-agent-rs && cargo fmt --all && cd .. && \
+git add yi-agent-rs/crates/yi-agent-app-server/src/thread_store.rs && \
+git commit -m "feat(thread_store): ThreadMeta 增加 forked_from 展示字段
+
+必须 serde(default)：既有 meta 文件没有这个字段，缺默认值会让反序列化
+失败并走 rebuild_meta 兜底，把 cwd 冲成空串。"
+```
+
+---
+
 ## Task 2: app-server 在启动 driver 时持锁
 
 **Files:**
@@ -1136,21 +1194,20 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
 
 - [ ] **Step 3: 每轮累积 items 并在 Done 后落盘**
 
-在 driver 的 prompt 分支（`match agent.run(text).await` 那一处）之前建累积器：
+在闭包顶部（`let mut live = LiveRebuild::new(...)` 旁边）建**跨轮存活**的 `translator`，在 loop 内维护每轮清空的累积器：
 
 ```rust
-                // 每轮开始时重置：Translator 负责把 AgentEvent 翻译成 Item，
-                // 与 app-server 落盘走完全相同的实现，不存在第二套口径。
-                let mut translator = session_store.as_ref().map(|_| {
-                    yi_agent_app_server::translate::Translator::new(
-                        session_store.as_ref().unwrap().thread_id().to_string(),
-                        session_store
-                            .as_ref()
-                            .map(|s| s.baseline_totals())
-                            .unwrap_or_default(),
-                    )
-                });
-                let mut turn_items: Vec<yi_agent_app_server::protocol::Item> = Vec::new();
+            // Translator 负责把 AgentEvent 翻译成 Item，与 app-server 落盘走完全
+            // 相同的实现，不存在第二套口径。跨轮存活：committed 累计要连续。
+            let mut translator = session_store.as_ref().map(|s| {
+                yi_agent_app_server::translate::Translator::new(
+                    s.thread_id().to_string(),
+                    s.baseline_totals(),
+                )
+            });
+            let mut turn_items: Vec<yi_agent_app_server::protocol::Item> = Vec::new();
+            let mut last_usage: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
+            let mut usage_total: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
 ```
 
 在事件转发处（`agent_tx.send(ev).await` 之前）追加。**两个用量字段都从 `Notification::TokenUsage` 里取**，与 app-server 的做法逐字一致（`server.rs:5715-5735`）——那条通知携带的就是本轮完整快照，不需要给 `Translator` 加任何新 API：
@@ -1193,14 +1250,57 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
                                         }
 ```
 
-在 `turn_items` 旁边声明这两个变量：
+**但 `turn_items` 里没有用户提问——必须自己补。** 这是最容易漏、且漏了后果最重的一步：`Translator::on_event` 只翻译 agent 侧事件（`AssistantText` / `ToolCall` / `Thinking` / `UserInterjection`），**从不产出 `Item::UserMessage`**。`server.rs:4794` 的注释把原因写死了：
+
+> 基线 server 不 emit userMessage，必须在落盘时补齐，否则 resume 会丢用户提问。
+
+不补的话，resume 出来的会话只有回答、没有问题——用户会以为自己的话没被记住。所以落盘前先把本轮的 `Item::UserMessage` 插到最前面：
 
 ```rust
-                let mut last_usage: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
-                let mut usage_total: Option<yi_agent_app_server::thread_store::TurnUsage> = None;
+                            if let Some(store) = session_store.as_ref() {
+                                // 与 server.rs:4794 同款补齐：Translator 不产出
+                                // UserMessage，缺了它 resume 会丢提问。
+                                let mut items = Vec::with_capacity(turn_items.len() + 1);
+                                items.push(yi_agent_app_server::protocol::Item::UserMessage {
+                                    id: format!("user-{}", uuid::Uuid::new_v4()),
+                                    text: text.clone(),
+                                    attachments: Vec::new(),
+                                    images: Vec::new(),
+                                });
+                                items.extend(turn_items.iter().cloned());
+
+                                if let Err(e) = store.append_turn(&items, &messages, last_usage.clone(), usage_total.clone()) {
+                                    eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                                }
+                                if let Err(e) = store.touch(&prompt_for_log) {
+                                    eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                                }
+                            }
 ```
 
+**要点：`translator` 跨轮存活，每轮只 `set_turn`，不要重建。** 重建会把 `committed` 累计清零，用量就断在每轮边界上。每轮开始时：
+
+```rust
+                // set_turn 必须在 on_event 之前调：alloc_item_id 依赖 turn_id。
+                // 不要在这里重建 Translator：那会清掉 committed 累计。
+                if let Some(t) = translator.as_mut() {
+                    t.set_turn(format!("turn-{}", uuid::Uuid::new_v4()));
+                }
+                turn_items.clear();
+                last_usage = None;
+                usage_total = None;
+```
+
+**item id 必须全局唯一。** `Translator` 的 `alloc_item_id` 生成的是 `item-{turn_id}-{n}`，而 `next_item` 只在 `Translator::new` 时置 1、`set_turn` **不重置**它。所以只要 `turn_id` 每轮唯一，id 就不会撞。**坏掉的情形**是不调 `set_turn` 直接 `on_event`：`turn_id` 为空串，所有行生成 `item--1`、`item--2`，跨轮重复；而 `partial_is_committed`（`thread_store.rs`）正是靠**首个 item id** 判断「这轮是否已落盘」，id 重复会让崩溃恢复误判，把已落盘的轮次当成未收尾再追加一遍。
+
 `AgentEvent` 已派生 `Clone`（`agent.rs:265` 的 `#[derive(Debug, Clone, Serialize)]`），`ev.clone()` 可直接用。
+
+**先留一份提问副本。** `agent.run(text)` 的签名是 `run(&mut self, user_prompt: String)`（`agent.rs:702`），会消费掉 `text`；而落盘要用它补 `Item::UserMessage`、`touch` 要用它做标题兜底。所以在 `match agent.run(text).await` **之前**加一行：
+
+```rust
+                // `agent.run(text)` 会 move 掉 text；落盘与 touch 都需要它。
+                let prompt_for_log = text.clone();
+```
 
 `AgentEvent::Done` 到达后、`is_running` 置 false 之前落盘：
 
@@ -1210,10 +1310,22 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
                                     .lock()
                                     .map(|s| s.messages().to_vec())
                                     .unwrap_or_default();
-                                if let Err(e) = store.append_turn(&turn_items, &messages, last_usage.clone(), usage_total.clone()) {
+                                // 必须自己补 UserMessage：Translator 只翻译 agent 侧
+                                // 事件，从不产出它（server.rs:4794 同款注释）。
+                                // 漏了这一步，resume 出来的会话只有回答没有问题。
+                                let mut items = Vec::with_capacity(turn_items.len() + 1);
+                                items.push(yi_agent_app_server::protocol::Item::UserMessage {
+                                    id: format!("user-{}", uuid::Uuid::new_v4()),
+                                    text: prompt_for_log.clone(),
+                                    attachments: Vec::new(),
+                                    images: Vec::new(),
+                                });
+                                items.extend(turn_items.iter().cloned());
+
+                                if let Err(e) = store.append_turn(&items, &messages, last_usage.clone(), usage_total.clone()) {
                                     eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
                                 }
-                                if let Err(e) = store.touch(&text) {
+                                if let Err(e) = store.touch(&prompt_for_log) {
                                     eprintln!("[yi-agent] 更新 meta 失败: {e}");
                                 }
                             }
@@ -1230,6 +1342,12 @@ redacted 的 Thinking text 为空，跳过不生成 cell。"
                                 if let Err(e) = store.clear() {
                                     eprintln!("[yi-agent] /clear 落盘失败: {e}");
                                 }
+                            }
+                            // 用量累计也要归零：否则清空对话后状态栏仍显示旧总数，
+                            // 用户会以为清空没生效。app-server 在同一位置调
+                            // `translator.reset_totals()`（server.rs:5368）。
+                            if let Some(t) = translator.as_mut() {
+                                let _ = t.reset_totals();
                             }
 ```
 
@@ -1503,7 +1621,8 @@ fn run_agent(cli: Cli) -> Result<()> {
 }
 
 fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
-    // ...（函数体与现 `run_agent` 逐字相同，只是末尾把 seed 传下去）...
+    // 这里就是现有 `run_agent`（main.rs:1298）的完整函数体，逐字搬过来。
+    // 唯一的改动是末尾 `run_tui_agent(...)` 多传一个 `seed`。
     run_tui_agent(
         provider,
         tools,
@@ -1693,7 +1812,7 @@ driver 闭包里种 session：
             let session_handle = Arc::new(std::sync::Mutex::new(initial));
 ```
 
-（Task 5 Step 2 里原本的 `Session::new()` 就换成这段。）
+**这三行替换 Task 5 Step 2 里那行 `Session::new()`**，不是新增。替换后新会话路径（`initial_messages` 为空）等价于原来的空 session，行为零变化。
 
 - [ ] **Step 9: 跑测试**
 
@@ -1914,18 +2033,15 @@ cd yi-agent-rs && cargo test -p yi-agent-app-server --lib fork_
 
 Expected: 编译失败，`fork_thread` 与 `forked_from` 不存在。
 
-- [ ] **Step 3: 给 `ThreadMeta` 加 `forked_from`**
+- [ ] **Step 3: 确认 `forked_from` 已存在**
 
-```rust
-    /// 从哪个 thread fork 而来。**仅用于展示**，任何读取路径都不看它。
-    ///
-    /// `#[serde(default)]` 是必须的：既有 meta 文件都没有这个字段，缺默认值会让
-    /// 反序列化失败，`load` 走 `rebuild_meta` 兜底并把 `cwd` 冲成空串。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forked_from: Option<String>,
+该字段在 Task 1b 已加好。这里只需确认：
+
+```bash
+cd yi-agent-rs && grep -n "pub forked_from" crates/yi-agent-app-server/src/thread_store.rs
 ```
 
-**注意**：`rebuild_meta` 与所有 `ThreadMeta { .. }` 字面量都要补 `forked_from: None`。用编译器找你——它会逐个报出来。
+Expected: 一行命中。若没有，回到 Task 1b。
 
 - [ ] **Step 4: 实现 `fork_thread`**
 
@@ -2226,7 +2342,39 @@ dispatch 里 `Some(Command::Run { .. })` 的解构要补 `resume`，并传给 `r
     let agent = agent.with_session_arc(Arc::new(std::sync::Mutex::new(session)));
 ```
 
-`pending_turn` 的处理：在 `load_seed` 之前调 `store.promote_partial()`（resume 需要，fork 不需要）。
+**`pending_turn` 必须先升格。** 给 `TuiSessionStore` 加：
+
+```rust
+    /// 把崩溃残留的 checkpoint 升格进主日志。
+    ///
+    /// resume 必须做：采纳的 partial 是那一轮唯一的持久副本，不 append 就返回，
+    /// 用户下一条消息的 turn-start checkpoint 会原子覆盖同一文件，该轮 items
+    /// 永久丢失，而 session 上下文仍「记得」它们，造成 item 与上下文不一致。
+    ///
+    /// 返回 `true` 表示确实升格了（调用方据此决定是否补一条「上一轮已中断」提示）。
+    pub fn promote_pending(&self) -> std::io::Result<bool> {
+        self.store.promote_partial(&self.thread_id)
+    }
+```
+
+调用顺序固定为「先 `promote_pending`，再 `load_seed`」——反过来会读到未合流的旧状态：
+
+```rust
+    let mut session = yi_agent_core::Session::new();
+    if let Some(store) = &resume_session {
+        match store.promote_pending() {
+            Ok(_) => {}
+            // 失败只记日志，不阻断：partial 不是唯一数据源，主日志仍在。
+            Err(e) => eprintln!("[yi-agent] 未能升格未收尾的轮次: {e}"),
+        }
+        let (messages, last_input) = store.load_seed()?;
+        session = yi_agent_core::Session::from_messages(messages);
+        session.set_last_input_tokens(last_input);
+    }
+    let agent = agent.with_session_arc(Arc::new(std::sync::Mutex::new(session)));
+```
+
+`load_seed` 内部已经调了 `load`，而 `load` 会自己合流 partial（`thread_store.rs` 的 `read_partial` 分支）。所以即使 `promote_pending` 失败，消息不会丢——升格的意义是让**磁盘**也收尾，避免下一轮 checkpoint 覆盖。
 
 - [ ] **Step 5: 跑测试确认通过**
 
