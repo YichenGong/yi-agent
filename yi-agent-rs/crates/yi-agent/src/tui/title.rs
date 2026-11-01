@@ -80,6 +80,289 @@ impl crossterm::Command for SetTitle {
     }
 }
 
+use std::io::{self, stdout};
+
+/// 跳过原因。`None` = 正常可用。
+///
+/// 三种原因共用一个字段：`sync` / `clear` 只需一次 `is_some()` 判断，不必
+/// 分别检查「配置关」「多路复用器」「写失败」三个来源，也就不存在两处状态
+/// 不一致的可能。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisabledReason {
+    /// 配置关闭（`tui.terminal_title = "false"`）。
+    Off,
+    /// tmux / zellij 内：不写任何字节（不做 DCS 透传）。
+    Multiplexer,
+    /// 写过一次失败，本会话自禁。
+    WriteFailed,
+}
+
+/// `/config` 的展示值。
+///
+/// 四个变体里 `WriteFailed` 是运行期状态，而 `/config` 渲染的是启动时的
+/// 快照，所以界面上只会看到前三者。保留第四态是为了将来接热更新时不必改
+/// 渲染层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleStatus {
+    On,
+    Off,
+    Multiplexer,
+    WriteFailed,
+}
+
+impl DisabledReason {
+    fn to_status(self) -> TitleStatus {
+        match self {
+            Self::Off => TitleStatus::Off,
+            Self::Multiplexer => TitleStatus::Multiplexer,
+            Self::WriteFailed => TitleStatus::WriteFailed,
+        }
+    }
+}
+
+impl std::fmt::Display for TitleStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Multiplexer => "disabled (multiplexer)",
+            Self::WriteFailed => "disabled (write failed)",
+        })
+    }
+}
+
+/// 往哪里写标题。
+///
+/// 抽成 trait 的唯一理由是「写入次数」必须可观测：`cargo test` 的 stdout
+/// 不是 tty，`StdoutSink` 会短路，于是「逐帧重写导致闪烁」这个最需要钉住的
+/// 属性在集成测试里完全看不见。生产实现只有 [`StdoutSink`]，每次会话几十次
+/// 调用，动态分发的开销可忽略。
+pub trait TitleSink: Send {
+    fn write_title(&mut self, text: &str) -> io::Result<()>;
+}
+
+/// 写 stdout 的生产实现。
+///
+/// stdout 非 tty 时返回 `Ok(())` 而不写、也**不**置自禁：那不是「终端不支持
+/// OSC 2」，只是「这次没有终端」。会话中途被重定向同样走这条路径。
+#[derive(Debug, Default, Clone)]
+pub struct StdoutSink;
+
+impl TitleSink for StdoutSink {
+    fn write_title(&mut self, text: &str) -> io::Result<()> {
+        use std::io::IsTerminal;
+        if !stdout().is_terminal() {
+            return Ok(());
+        }
+        crossterm::execute!(stdout(), SetTitle(text.to_string()))
+    }
+}
+
+/// 测试用：把写入记进外部持有的容器，调用方在 writer 被移动后仍可读。
+///
+/// `Box<dyn TitleSink>` 交出去就拿不回来了，所以记录必须共享：调用方先
+/// `clone()` 一份探针，再把原 sink 装箱喂进去。
+#[derive(Debug, Clone, Default)]
+pub struct RecordingSink {
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordingSink {
+    /// 至今收到的所有写入值，按调用顺序。
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// 让下一次写入返回 `Err`（只生效一次）。
+    pub fn fail_next(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl TitleSink for RecordingSink {
+    fn write_title(&mut self, text: &str) -> io::Result<()> {
+        self.calls.lock().unwrap().push(text.to_string());
+        if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected failure"));
+        }
+        Ok(())
+    }
+}
+
+/// 上一次的写入状态，用于避免每帧重写。
+#[derive(Debug, Default)]
+pub struct TitleState {
+    /// 上一次**成功**写出的值。
+    written: Option<String>,
+    /// 上一次观察到的运行态。`None` = 还没观察过。
+    observed_running: Option<bool>,
+}
+
+/// 标题的写入策略。
+pub struct TitleWriter {
+    /// 三种跳过原因的唯一来源。`None` = 正常可用。
+    disabled_reason: Option<DisabledReason>,
+    sink: Box<dyn TitleSink>,
+}
+
+impl std::fmt::Debug for TitleWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TitleWriter")
+            .field("disabled_reason", &self.disabled_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TitleWriter {
+    /// 生产构造：写 stdout。
+    pub fn new(enabled: bool, multiplexed: bool) -> Self {
+        Self::with_sink(enabled, multiplexed, Box::new(StdoutSink))
+    }
+
+    /// 可注入 sink 的构造（测试用）。
+    ///
+    /// 判定顺序固定为 `enabled` → `multiplexed`：配置关且身处 tmux 时报告
+    /// `Off`——用户明确关掉的东西，没必要再报告环境限制。
+    pub fn with_sink(enabled: bool, multiplexed: bool, sink: Box<dyn TitleSink>) -> Self {
+        let disabled_reason = if !enabled {
+            Some(DisabledReason::Off)
+        } else if multiplexed {
+            Some(DisabledReason::Multiplexer)
+        } else {
+            None
+        };
+        Self {
+            disabled_reason,
+            sink,
+        }
+    }
+
+    /// 当前状态，供 `/config` 渲染。
+    pub fn status(&self) -> TitleStatus {
+        self.disabled_reason
+            .map_or(TitleStatus::On, DisabledReason::to_status)
+    }
+
+    /// 按运行态同步标题。值没变就不写。
+    ///
+    /// 判定顺序（每一步都有理由）：
+    /// 1. 已失效 → 直接返回，且**不**更新 `observed_running`：自禁是终态，
+    ///    状态应冻结在「失效那一刻」，而不是看起来还在跟进。
+    /// 2. 运行态未变 → 不重组字符串、不碰 stdout：挡的是「每帧调用」。
+    /// 3. 目标值与自己写过的相同 → 跳过：挡的是「运行态翻转但截断后目标串
+    ///    恰好一样」。
+    /// 4. 写。失败则自禁并吞掉错误——调用方不该因标题失败而中断。
+    pub fn sync(&mut self, state: &mut TitleState, project: &str, running: bool) -> io::Result<()> {
+        if self.disabled_reason.is_some() {
+            return Ok(());
+        }
+        if state.observed_running == Some(running) {
+            return Ok(());
+        }
+        state.observed_running = Some(running);
+
+        let target = compose(project, running);
+        if state.written.as_deref() == Some(target.as_str()) {
+            return Ok(());
+        }
+
+        match self.sink.write_title(&target) {
+            Ok(()) => {
+                state.written = Some(target);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "terminal title write failed; disabling for this session"
+                );
+                self.disabled_reason = Some(DisabledReason::WriteFailed);
+                Ok(())
+            }
+        }
+    }
+
+    /// 退出还原：写空串。
+    ///
+    /// 返回 `()` 而非 `Result` 是刻意的——签名层面杜绝「有人把它的错误并进
+    /// `run_tui` 的 `cleanup_error`」。那会让上百种不支持 OSC 2 的终端在每次
+    /// 正常退出时都返回非零，被 shell 的 `set -e`、CI 脚本当成崩溃。
+    ///
+    /// 第一行为同样是失效短路：配置关闭或身处 tmux 时我们从没写过，也就
+    /// 不该在退出时写空串去覆盖用户终端。
+    pub fn clear(&mut self, state: &mut TitleState) {
+        if self.disabled_reason.is_some() {
+            return;
+        }
+        if state.written.as_deref() == Some("") {
+            return;
+        }
+        if self.sink.write_title("").is_ok() {
+            state.written = Some(String::new());
+        }
+    }
+}
+
+/// 把 writer、state 与项目名绑在一起，让 `run_loop` 只多一个参数。
+///
+/// `run_loop` 已经有 16 个参数（靠 `#[allow(clippy::too_many_arguments)]`
+/// 压着），不该为标题再涨两个。这个聚合器是纯转发，不含新逻辑。
+#[derive(Debug)]
+pub struct TitleHandle {
+    writer: TitleWriter,
+    state: TitleState,
+    project: String,
+}
+
+impl TitleHandle {
+    /// 生产构造：从工作目录取项目名。
+    pub fn new(enabled: bool, multiplexed: bool, workdir: &Path) -> Self {
+        Self::with_sink(enabled, multiplexed, workdir, Box::new(StdoutSink))
+    }
+
+    /// 可注入 sink 的构造（测试用）。
+    pub fn with_sink(
+        enabled: bool,
+        multiplexed: bool,
+        workdir: &Path,
+        sink: Box<dyn TitleSink>,
+    ) -> Self {
+        Self {
+            writer: TitleWriter::with_sink(enabled, multiplexed, sink),
+            state: TitleState::default(),
+            project: project_label(workdir),
+        }
+    }
+
+    /// 永不写入。给那些只关心渲染、不关心标题的既有测试用。
+    pub fn disabled() -> Self {
+        Self {
+            writer: TitleWriter::with_sink(false, false, Box::new(StdoutSink)),
+            state: TitleState::default(),
+            project: FALLBACK_PROJECT.to_string(),
+        }
+    }
+
+    pub fn status(&self) -> TitleStatus {
+        self.writer.status()
+    }
+
+    /// 同步标题。错误在 writer 内部已吞掉，这里也不返回。
+    pub fn sync(&mut self, running: bool) {
+        let _ = self.writer.sync(&mut self.state, &self.project, running);
+    }
+
+    /// 退出还原。
+    pub fn clear(&mut self) {
+        self.writer.clear(&mut self.state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +501,208 @@ mod tests {
             !out.contains("\u{1b}\\"),
             "BEL and ST must not both appear: {out:?}"
         );
+    }
+    /// 构造一个能观测写入的 writer，并留下探针。
+    fn writer_with_probe(
+        enabled: bool,
+        multiplexed: bool,
+    ) -> (TitleWriter, RecordingSink, TitleState) {
+        let sink = RecordingSink::default();
+        let probe = sink.clone();
+        let writer = TitleWriter::with_sink(enabled, multiplexed, Box::new(sink));
+        (writer, probe, TitleState::default())
+    }
+
+    #[test]
+    fn disabled_writer_writes_nothing() {
+        let (mut writer, probe, mut state) = writer_with_probe(false, false);
+        writer.sync(&mut state, "p", true).unwrap();
+        writer.sync(&mut state, "p", false).unwrap();
+        assert_eq!(probe.calls(), Vec::<String>::new());
+        assert_eq!(writer.status(), TitleStatus::Off);
+    }
+
+    #[test]
+    fn multiplexed_writer_writes_nothing() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, true);
+        writer.sync(&mut state, "p", true).unwrap();
+        assert_eq!(probe.calls(), Vec::<String>::new());
+        assert_eq!(writer.status(), TitleStatus::Multiplexer);
+    }
+
+    #[test]
+    fn off_wins_over_multiplexer() {
+        assert_eq!(TitleWriter::new(false, true).status(), TitleStatus::Off);
+    }
+
+    #[test]
+    fn status_maps_each_disabled_reason() {
+        assert_eq!(TitleWriter::new(true, false).status(), TitleStatus::On);
+        assert_eq!(TitleWriter::new(false, false).status(), TitleStatus::Off);
+        assert_eq!(
+            TitleWriter::new(true, true).status(),
+            TitleStatus::Multiplexer
+        );
+        assert_eq!(TitleStatus::On.to_string(), "on");
+        assert_eq!(TitleStatus::Off.to_string(), "off");
+        assert_eq!(
+            TitleStatus::Multiplexer.to_string(),
+            "disabled (multiplexer)"
+        );
+        assert_eq!(
+            TitleStatus::WriteFailed.to_string(),
+            "disabled (write failed)"
+        );
+    }
+
+    #[test]
+    fn sync_is_a_no_op_when_running_is_unchanged() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        for _ in 0..5 {
+            writer.sync(&mut state, "p", true).unwrap();
+        }
+        assert_eq!(probe.calls(), vec!["● p".to_string()]);
+    }
+
+    #[test]
+    fn sync_rewrites_when_running_flips() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.sync(&mut state, "p", true).unwrap();
+        writer.sync(&mut state, "p", false).unwrap();
+        assert_eq!(probe.calls(), vec!["● p".to_string(), "p".to_string()]);
+    }
+
+    #[test]
+    fn sync_rewrites_when_project_changes() {
+        // 运行态未变（true → true），但项目名变了：第 2 步会挡住这次 sync。
+        // 现实中项目名在会话内不变，所以这里直接把 `observed_running` 置回
+        // `None` 模拟「下一次观察」，验证第 3 步的 diff 用的是最新目标串。
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.sync(&mut state, "p", true).unwrap();
+        writer.sync(&mut state, "p", true).unwrap();
+        assert_eq!(probe.calls().len(), 1, "unchanged running must not rewrite");
+
+        state.observed_running = None;
+        writer.sync(&mut state, "q", true).unwrap();
+        assert_eq!(probe.calls(), vec!["● p".to_string(), "● q".to_string()]);
+    }
+
+    #[test]
+    fn sync_skips_when_target_equals_written() {
+        // 运行态翻转，但截断后的目标串与上次写过的完全相同 → 不写。
+        let long = "a".repeat(40);
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        let already = compose(&long, true);
+        state.written = Some(already);
+        state.observed_running = Some(false);
+        writer.sync(&mut state, &long, true).unwrap();
+        assert_eq!(probe.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn clear_empties_the_title() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.sync(&mut state, "p", true).unwrap();
+        writer.clear(&mut state);
+        assert_eq!(probe.calls(), vec!["● p".to_string(), String::new()]);
+        assert_eq!(state.written, Some(String::new()));
+    }
+
+    #[test]
+    fn clear_is_a_no_op_when_already_empty() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        writer.clear(&mut state);
+        writer.clear(&mut state);
+        assert_eq!(probe.calls(), vec![String::new()]);
+    }
+
+    #[test]
+    fn clear_is_a_no_op_when_never_wrote() {
+        // 配置关闭时从没写过，退出也不该写空串去覆盖用户的标题。
+        let (mut writer, probe, mut state) = writer_with_probe(false, false);
+        writer.clear(&mut state);
+        assert_eq!(probe.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_failed_write_disables_the_writer() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        probe.fail_next();
+        writer.sync(&mut state, "p", true).unwrap();
+        assert_eq!(writer.status(), TitleStatus::WriteFailed);
+        assert_eq!(probe.calls().len(), 1);
+
+        // 自禁后不再碰 sink。
+        writer.sync(&mut state, "p", false).unwrap();
+        assert_eq!(probe.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_disabled_writer_stays_quiet_and_ok() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        probe.fail_next();
+        writer.sync(&mut state, "p", true).unwrap();
+        assert!(
+            writer.sync(&mut state, "p", false).is_ok(),
+            "a disabled writer must keep returning Ok"
+        );
+        assert_eq!(writer.status(), TitleStatus::WriteFailed);
+    }
+
+    #[test]
+    fn clear_swallows_errors_without_disabling() {
+        let (mut writer, probe, mut state) = writer_with_probe(true, false);
+        probe.fail_next();
+        writer.clear(&mut state); // 返回 ()，不 panic
+        assert_eq!(
+            writer.status(),
+            TitleStatus::On,
+            "clear must not self-disable"
+        );
+    }
+
+    #[test]
+    fn title_handle_exposes_project_and_status() {
+        let handle = TitleHandle::new(false, false, Path::new("/work/my-app"));
+        assert_eq!(handle.status(), TitleStatus::Off);
+    }
+
+    #[test]
+    fn disabled_handle_never_writes() {
+        let mut handle = TitleHandle::disabled();
+        handle.sync(true);
+        handle.sync(false);
+        handle.clear();
+        assert_eq!(handle.status(), TitleStatus::Off);
+    }
+
+    #[test]
+    fn title_handle_writes_through_its_sink() {
+        let sink = RecordingSink::default();
+        let probe = sink.clone();
+        let mut handle =
+            TitleHandle::with_sink(true, false, Path::new("/work/my-app"), Box::new(sink));
+        handle.sync(true);
+        handle.sync(true);
+        handle.sync(false);
+        assert_eq!(
+            probe.calls(),
+            vec!["● my-app".to_string(), "my-app".to_string()]
+        );
+        handle.clear();
+        assert_eq!(probe.calls().last().map(String::as_str), Some(""));
+    }
+
+    /// `cargo test` 的 stdout 不是 TTY，这条恰好覆盖 `StdoutSink` 的第一道
+    /// 短路：必须返回 `Ok` 而不是报错。
+    #[test]
+    fn stdout_sink_is_a_no_op_when_not_a_tty() {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            eprintln!("skip: stdout is a tty");
+            return;
+        }
+        let mut sink = StdoutSink;
+        assert!(sink.write_title("hello").is_ok());
     }
 }
