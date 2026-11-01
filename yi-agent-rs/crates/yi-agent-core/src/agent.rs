@@ -947,6 +947,354 @@ async fn abort_run(tx: &EventTx, inbox: &Option<InboxHandle>, session: &Arc<Mute
     let _ = tx.send(AgentEvent::Cancelled).await;
 }
 
+/// How one THINK attempt handed control back to `run_loop`.
+///
+/// Three states, because THINK can end in three ways that the caller must
+/// handle differently: fall through to the termination check, leave the run
+/// entirely, or start the turn over. The last one exists for `MaxTokens`,
+/// where the truncation prompt was already pushed into the session and the
+/// only correct next step is another THINK.
+enum ThinkOutcome {
+    /// The assistant reply is complete; run the termination check on it.
+    Content(Vec<ContentBlock>),
+    /// A stop path already emitted its terminal event (and, when it was a
+    /// cancel, rolled the session back). `run_loop` returns immediately.
+    Stopped,
+    /// `MaxTokens`: the continue-after-truncation prompt was pushed to both
+    /// `messages` and the session, so the turn must restart from THINK.
+    RestartTurn,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn think_phase(
+    tx: &EventTx,
+    inbox: &Option<InboxHandle>,
+    session: &Arc<Mutex<Session>>,
+    provider: &Arc<dyn Provider>,
+    tools: &Arc<ToolRegistry>,
+    config: &AgentConfig,
+    cancel_token: &CancellationToken,
+    provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
+    messages: &mut Vec<Message>,
+    turn: u32,
+) -> ThinkOutcome {
+    // 1. THINK
+    //
+    // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
+    // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
+    // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
+    // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
+    // 请求体逐字不变（零回归）。
+    let request_messages = if config.preserve_thinking {
+        messages.clone()
+    } else {
+        crate::thinking::strip_thinking_except_last_assistant(messages)
+    };
+    let req = ProviderRequest {
+        model: config.model.clone(),
+        system: config.system_prompt.clone(),
+        messages: request_messages,
+        tools: tools.schemas(),
+        params: config.gen_params.clone(),
+    };
+    // Emit a heuristic prefill estimate so the status bar shows activity
+    // before the provider returns real usage (OpenAI-compatible APIs only
+    // send usage at stream end).
+    let prefill_estimate = estimate_prefill_tokens(&req);
+    let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
+
+    // Retry loop for a transiently failed THINK attempt. Two families are
+    // retried: an idle stall / request deadline that ended the *stream*, and
+    // an outright provider rejection (429 / 5xx / network) that produced *no*
+    // stream at all. Both consume the same `stall_retries` budget, so the
+    // worst case inside one turn stays bounded by a single limit rather than
+    // two. Each attempt is a fresh provider turn (own lease); a failed
+    // attempt's partial content is never committed to the session.
+    let mut stall_retries: u16 = 0;
+    let (content, end, last_usage) = loop {
+        let provider_turn_lease = match provider_turn_gate {
+            Some(gate) => match tokio::select! {
+                lease = gate.acquire() => lease,
+                _ = cancel_token.cancelled() => {
+                    flush_unconsumed(tx, inbox).await;
+                    let _ = tx.send(AgentEvent::Cancelled).await;
+                    return ThinkOutcome::Stopped;
+                }
+            } {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = tx
+                        .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
+                        .await;
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            None => None,
+        };
+
+        let stream = tokio::select! {
+            result = provider.call_stream(req.clone()) => match result {
+                Ok(s) => {
+                    tracing::info!(
+                        turn,
+                        "provider call_stream returned Ok, entering accumulate"
+                    );
+                    s
+                }
+                Err(e) => {
+                    warn!(turn, error = %e, "provider call failed");
+                    // A retryable outright rejection (429/5xx/network) is
+                    // retried with backoff instead of killing the turn: these
+                    // are capacity/transport conditions, so resending the same
+                    // request is the standard remedy. Deterministic failures
+                    // (InvalidRequest, Auth) get no such treatment.
+                    if let Some(cause) = retryable_provider_error_cause(&e) {
+                        if stall_retries < config.provider_error_retry_limit {
+                            stall_retries += 1;
+                            let delay =
+                                stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                            tracing::warn!(
+                                turn,
+                                attempt = stall_retries,
+                                max = config.provider_error_retry_limit,
+                                delay_ms = delay.as_millis() as u64,
+                                ?cause,
+                                "provider rejected the request transiently; retrying after backoff"
+                            );
+                            // Surface it: a silent backoff looks like a hang.
+                            if tx
+                                .send(AgentEvent::ProviderRetry {
+                                    attempt: stall_retries,
+                                    max: config.provider_error_retry_limit,
+                                    idle_secs: 0,
+                                    cause,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                            }
+                            // Release the turn lease before sleeping: a retry
+                            // backoff must not hold provider capacity.
+                            drop(provider_turn_lease);
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancel_token.cancelled() => {
+                                    info!(turn, "agent loop cancelled during retry backoff");
+                                    abort_run(tx, inbox, session).await;
+                                    return ThinkOutcome::Stopped;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if tx
+                        .send(AgentEvent::Error(AgentError::Provider(e)))
+                        .await
+                        .is_err()
+                    {
+                        return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                    }
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            _ = cancel_token.cancelled() => {
+                // Cancel while the provider request is still in flight (the
+                // HTTP response headers have not arrived yet). Real providers
+                // await the network here for up to `DEFAULT_TIMEOUT_SECS`
+                // (300s), so without this arm a Stop would be swallowed
+                // until the call returned. No assistant reply exists yet,
+                // so keep the run's user prompt and completed round-trips —
+                // same policy as a cancel during THINK.
+                info!(turn, "agent loop cancelled during provider call");
+                abort_run(tx, inbox, session).await;
+                return ThinkOutcome::Stopped;
+            }
+        };
+
+        // Check 2: THINK 中 — select! between accumulate and cancel
+        let attempt = tokio::select! {
+            result = accumulate_provider_stream(stream, tx, &config.model, config.think_idle_timeout) => match result {
+                Ok(v) => {
+                    tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
+                    v
+                }
+                Err(e) => {
+                    warn!(turn, error = %e, "provider stream error");
+                    if tx.send(AgentEvent::Error(e)).await.is_err() {
+                        return ThinkOutcome::Stopped;
+                    }
+                    return ThinkOutcome::Stopped;
+                }
+            },
+            _ = cancel_token.cancelled() => {
+                info!(turn, "agent loop cancelled during think");
+                // Cancel during THINK: no assistant reply exists yet, so this
+                // keeps the run's user prompt and every completed round-trip.
+                abort_run(tx, inbox, session).await;
+                return ThinkOutcome::Stopped;
+            }
+        };
+
+        // Release the turn lease before sleeping: a retry backoff must not
+        // hold provider capacity.
+        drop(provider_turn_lease);
+
+        // Two transient modes are retryable: an idle stall and a request
+        // deadline. Everything else (malformed SSE payloads, connection
+        // resets, auth failures) is terminal.
+        //
+        // `Failed(Network)` is a load-bearing shorthand for "the request
+        // deadline elapsed": the providers only classify a *timeout* as
+        // `Network` here, and keep every other transport break as `Stream`.
+        // Widening that classification would silently start retrying
+        // connection resets, which the design explicitly excludes.
+        let retry_cause = match &attempt.1 {
+            StreamEnd::Stopped(StopReason::Stalled) => Some(RetryCause::IdleStall),
+            StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
+            _ => None,
+        };
+        if let Some(cause) = retry_cause {
+            if stall_retries < config.think_stall_retry_limit {
+                stall_retries += 1;
+                let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
+                tracing::warn!(
+                    turn,
+                    attempt = stall_retries,
+                    max = config.think_stall_retry_limit,
+                    delay_ms = delay.as_millis() as u64,
+                    ?cause,
+                    "think phase failed transiently; retrying after backoff"
+                );
+                // Surface the retry: a silent backoff looks like a hang.
+                if tx
+                    .send(AgentEvent::ProviderRetry {
+                        attempt: stall_retries,
+                        max: config.think_stall_retry_limit,
+                        idle_secs,
+                        cause,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel_token.cancelled() => {
+                        info!(turn, "agent loop cancelled during retry backoff");
+                        // Same policy as the other cancel points: keep the
+                        // run's user prompt and completed round-trips.
+                        abort_run(tx, inbox, session).await;
+                        return ThinkOutcome::Stopped;
+                    }
+                }
+                continue;
+            }
+        }
+        break attempt;
+    };
+
+    if let Some(usage) = last_usage {
+        session
+            .lock()
+            .unwrap()
+            .set_last_input_tokens(Some(usage.input_tokens));
+    }
+
+    // Log the full accumulated response content at debug level (never repeats across turns).
+    debug!(turn, content = ?content, "think: response");
+
+    // A non-retryable transport failure (malformed SSE payload, connection
+    // reset, ...) is terminal. Retryable timeouts never reach here: they
+    // either succeeded on a later attempt or exhausted the retry budget,
+    // in which case the terminal reason below explains it.
+    if let StreamEnd::Failed(error) = &end {
+        if !matches!(error, ProviderError::Network(_)) {
+            let _ = tx
+                .send(AgentEvent::Error(AgentError::Provider(error.clone())))
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+    }
+
+    // An exhausted transient failure is terminal and its partial must NOT
+    // enter the session: a stream can end mid-tool-call, leaving an
+    // unpaired `tool_use` that would make the next provider request
+    // invalid. The same applies to a failed attempt (no valid stop).
+    let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
+    let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
+    if !exhausted_stall && !exhausted_timeout {
+        messages.push(Message::assistant(content.clone()));
+        session
+            .lock()
+            .unwrap()
+            .push(Message::assistant(content.clone()));
+    }
+
+    let stop_reason = match end {
+        StreamEnd::Stopped(reason) => reason,
+        StreamEnd::Failed(ProviderError::Network(_)) => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: format!("request timeout after {stall_retries} retries"),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        // Any other failure was already reported as a terminal Error above.
+        StreamEnd::Failed(_) => return ThinkOutcome::Stopped,
+    };
+
+    match stop_reason {
+        StopReason::Stalled => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: format!("idle timeout after {stall_retries} retries"),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        StopReason::EndTurn => {}
+        StopReason::MaxTokens => {
+            messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
+            session
+                .lock()
+                .unwrap()
+                .push(Message::user(CONTINUE_AFTER_TRUNCATION));
+            return ThinkOutcome::RestartTurn;
+        }
+        StopReason::StopSequence => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted {
+                        reason: "stop sequence".into(),
+                    },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+        StopReason::Other(reason) => {
+            flush_unconsumed(tx, inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Interrupted { reason },
+                })
+                .await;
+            return ThinkOutcome::Stopped;
+        }
+    }
+    ThinkOutcome::Content(content)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     tx: EventTx,
@@ -1044,320 +1392,24 @@ async fn run_loop(
         last_logged = messages.len();
 
         // 1. THINK
-        //
-        // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
-        // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
-        // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
-        // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
-        // 请求体逐字不变（零回归）。
-        let request_messages = if config.preserve_thinking {
-            messages.clone()
-        } else {
-            crate::thinking::strip_thinking_except_last_assistant(&messages)
+        let content = match think_phase(
+            &tx,
+            &inbox,
+            &session,
+            &provider,
+            &tools,
+            &config,
+            &cancel_token,
+            &provider_turn_gate,
+            &mut messages,
+            turn,
+        )
+        .await
+        {
+            ThinkOutcome::Content(content) => content,
+            ThinkOutcome::Stopped => return,
+            ThinkOutcome::RestartTurn => continue,
         };
-        let req = ProviderRequest {
-            model: config.model.clone(),
-            system: config.system_prompt.clone(),
-            messages: request_messages,
-            tools: tools.schemas(),
-            params: config.gen_params.clone(),
-        };
-        // Emit a heuristic prefill estimate so the status bar shows activity
-        // before the provider returns real usage (OpenAI-compatible APIs only
-        // send usage at stream end).
-        let prefill_estimate = estimate_prefill_tokens(&req);
-        let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
-
-        // Retry loop for a transiently failed THINK attempt. Two families are
-        // retried: an idle stall / request deadline that ended the *stream*, and
-        // an outright provider rejection (429 / 5xx / network) that produced *no*
-        // stream at all. Both consume the same `stall_retries` budget, so the
-        // worst case inside one turn stays bounded by a single limit rather than
-        // two. Each attempt is a fresh provider turn (own lease); a failed
-        // attempt's partial content is never committed to the session.
-        let mut stall_retries: u16 = 0;
-        let (content, end, last_usage) = loop {
-            let provider_turn_lease = match &provider_turn_gate {
-                Some(gate) => match tokio::select! {
-                    lease = gate.acquire() => lease,
-                    _ = cancel_token.cancelled() => {
-                        flush_unconsumed(&tx, &inbox).await;
-                        let _ = tx.send(AgentEvent::Cancelled).await;
-                        return;
-                    }
-                } {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        let _ = tx
-                            .send(AgentEvent::Error(AgentError::ProviderTurnAdmission(error)))
-                            .await;
-                        return;
-                    }
-                },
-                None => None,
-            };
-
-            let stream = tokio::select! {
-                result = provider.call_stream(req.clone()) => match result {
-                    Ok(s) => {
-                        tracing::info!(
-                            turn,
-                            "provider call_stream returned Ok, entering accumulate"
-                        );
-                        s
-                    }
-                    Err(e) => {
-                        warn!(turn, error = %e, "provider call failed");
-                        // A retryable outright rejection (429/5xx/network) is
-                        // retried with backoff instead of killing the turn: these
-                        // are capacity/transport conditions, so resending the same
-                        // request is the standard remedy. Deterministic failures
-                        // (InvalidRequest, Auth) get no such treatment.
-                        if let Some(cause) = retryable_provider_error_cause(&e) {
-                            if stall_retries < config.provider_error_retry_limit {
-                                stall_retries += 1;
-                                let delay =
-                                    stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                                tracing::warn!(
-                                    turn,
-                                    attempt = stall_retries,
-                                    max = config.provider_error_retry_limit,
-                                    delay_ms = delay.as_millis() as u64,
-                                    ?cause,
-                                    "provider rejected the request transiently; retrying after backoff"
-                                );
-                                // Surface it: a silent backoff looks like a hang.
-                                if tx
-                                    .send(AgentEvent::ProviderRetry {
-                                        attempt: stall_retries,
-                                        max: config.provider_error_retry_limit,
-                                        idle_secs: 0,
-                                        cause,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return; // Receiver dropped, stop the loop
-                                }
-                                // Release the turn lease before sleeping: a retry
-                                // backoff must not hold provider capacity.
-                                drop(provider_turn_lease);
-                                tokio::select! {
-                                    _ = tokio::time::sleep(delay) => {}
-                                    _ = cancel_token.cancelled() => {
-                                        info!(turn, "agent loop cancelled during retry backoff");
-                                        abort_run(&tx, &inbox, &session).await;
-                                        return;
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        if tx
-                            .send(AgentEvent::Error(AgentError::Provider(e)))
-                            .await
-                            .is_err()
-                        {
-                            return; // Receiver dropped, stop the loop
-                        }
-                        return;
-                    }
-                },
-                _ = cancel_token.cancelled() => {
-                    // Cancel while the provider request is still in flight (the
-                    // HTTP response headers have not arrived yet). Real providers
-                    // await the network here for up to `DEFAULT_TIMEOUT_SECS`
-                    // (300s), so without this arm a Stop would be swallowed
-                    // until the call returned. No assistant reply exists yet,
-                    // so keep the run's user prompt and completed round-trips —
-                    // same policy as a cancel during THINK.
-                    info!(turn, "agent loop cancelled during provider call");
-                    abort_run(&tx, &inbox, &session).await;
-                    return;
-                }
-            };
-
-            // Check 2: THINK 中 — select! between accumulate and cancel
-            let attempt = tokio::select! {
-                result = accumulate_provider_stream(stream, &tx, &model, config.think_idle_timeout) => match result {
-                    Ok(v) => {
-                        tracing::info!(turn, stop_reason = ?v.1, content_blocks = v.0.len(), "accumulate returned Ok");
-                        v
-                    }
-                    Err(e) => {
-                        warn!(turn, error = %e, "provider stream error");
-                        if tx.send(AgentEvent::Error(e)).await.is_err() {
-                            return;
-                        }
-                        return;
-                    }
-                },
-                _ = cancel_token.cancelled() => {
-                    info!(turn, "agent loop cancelled during think");
-                    // Cancel during THINK: no assistant reply exists yet, so this
-                    // keeps the run's user prompt and every completed round-trip.
-                    abort_run(&tx, &inbox, &session).await;
-                    return;
-                }
-            };
-
-            // Release the turn lease before sleeping: a retry backoff must not
-            // hold provider capacity.
-            drop(provider_turn_lease);
-
-            // Two transient modes are retryable: an idle stall and a request
-            // deadline. Everything else (malformed SSE payloads, connection
-            // resets, auth failures) is terminal.
-            //
-            // `Failed(Network)` is a load-bearing shorthand for "the request
-            // deadline elapsed": the providers only classify a *timeout* as
-            // `Network` here, and keep every other transport break as `Stream`.
-            // Widening that classification would silently start retrying
-            // connection resets, which the design explicitly excludes.
-            let retry_cause = match &attempt.1 {
-                StreamEnd::Stopped(StopReason::Stalled) => Some(RetryCause::IdleStall),
-                StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
-                _ => None,
-            };
-            if let Some(cause) = retry_cause {
-                if stall_retries < config.think_stall_retry_limit {
-                    stall_retries += 1;
-                    let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                    let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
-                    tracing::warn!(
-                        turn,
-                        attempt = stall_retries,
-                        max = config.think_stall_retry_limit,
-                        delay_ms = delay.as_millis() as u64,
-                        ?cause,
-                        "think phase failed transiently; retrying after backoff"
-                    );
-                    // Surface the retry: a silent backoff looks like a hang.
-                    if tx
-                        .send(AgentEvent::ProviderRetry {
-                            attempt: stall_retries,
-                            max: config.think_stall_retry_limit,
-                            idle_secs,
-                            cause,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return; // Receiver dropped, stop the loop
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = cancel_token.cancelled() => {
-                            info!(turn, "agent loop cancelled during retry backoff");
-                            // Same policy as the other cancel points: keep the
-                            // run's user prompt and completed round-trips.
-                            abort_run(&tx, &inbox, &session).await;
-                            return;
-                        }
-                    }
-                    continue;
-                }
-            }
-            break attempt;
-        };
-
-        if let Some(usage) = last_usage {
-            session
-                .lock()
-                .unwrap()
-                .set_last_input_tokens(Some(usage.input_tokens));
-        }
-
-        // Log the full accumulated response content at debug level (never repeats across turns).
-        debug!(turn, content = ?content, "think: response");
-
-        // A non-retryable transport failure (malformed SSE payload, connection
-        // reset, ...) is terminal. Retryable timeouts never reach here: they
-        // either succeeded on a later attempt or exhausted the retry budget,
-        // in which case the terminal reason below explains it.
-        if let StreamEnd::Failed(error) = &end {
-            if !matches!(error, ProviderError::Network(_)) {
-                let _ = tx
-                    .send(AgentEvent::Error(AgentError::Provider(error.clone())))
-                    .await;
-                return;
-            }
-        }
-
-        // An exhausted transient failure is terminal and its partial must NOT
-        // enter the session: a stream can end mid-tool-call, leaving an
-        // unpaired `tool_use` that would make the next provider request
-        // invalid. The same applies to a failed attempt (no valid stop).
-        let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
-        let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
-        if !exhausted_stall && !exhausted_timeout {
-            messages.push(Message::assistant(content.clone()));
-            session
-                .lock()
-                .unwrap()
-                .push(Message::assistant(content.clone()));
-        }
-
-        let stop_reason = match end {
-            StreamEnd::Stopped(reason) => reason,
-            StreamEnd::Failed(ProviderError::Network(_)) => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: format!("request timeout after {stall_retries} retries"),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            // Any other failure was already reported as a terminal Error above.
-            StreamEnd::Failed(_) => return,
-        };
-
-        match stop_reason {
-            StopReason::Stalled => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: format!("idle timeout after {stall_retries} retries"),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            StopReason::EndTurn => {}
-            StopReason::MaxTokens => {
-                messages.push(Message::user(CONTINUE_AFTER_TRUNCATION));
-                session
-                    .lock()
-                    .unwrap()
-                    .push(Message::user(CONTINUE_AFTER_TRUNCATION));
-                continue;
-            }
-            StopReason::StopSequence => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted {
-                            reason: "stop sequence".into(),
-                        },
-                    })
-                    .await;
-                return;
-            }
-            StopReason::Other(reason) => {
-                flush_unconsumed(&tx, &inbox).await;
-                let _ = tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::Interrupted { reason },
-                    })
-                    .await;
-                return;
-            }
-        }
-
         // 2. Termination check
         let tool_uses: Vec<(String, String, Value)> = content
             .iter()
