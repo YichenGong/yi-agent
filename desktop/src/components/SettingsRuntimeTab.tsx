@@ -42,6 +42,16 @@ const VALUE_LABELS: Record<string, Record<string, string>> = {
   "tui.notification_condition": { unfocused: "仅窗口失焦时", always: "总是" },
 };
 
+/**
+ * 控件的外观。三个控件共用一份，避免 select / textarea / input 之间漂移。
+ *
+ * `bg-raised` + `border-line-strong` 而非 `bg-surface` + `border-line`：本页卡片底色
+ * 是 `panel`，#0a0a0a 的 `surface` 落在 #171717 上是一块更黑的「洞」，边框也几乎
+ * 看不见；`raised` 比 `panel` 亮一档，控件才读作「凸起的可编辑区」。
+ */
+const CONTROL_CLASS =
+  "w-full rounded border border-line-strong bg-raised px-2.5 py-1.5 text-sm text-fg outline-none focus:border-fg-subtle disabled:opacity-50";
+
 /** 草稿的起点：每个字段取「当前值」，未设置取空串。 */
 function draftsOf(fields: RuntimeField[]): Record<string, string> {
   const next: Record<string, string> = {};
@@ -181,19 +191,47 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
                       </p>
                     </div>
                     <div className="shrink-0 @lg:w-56">
-                      {/* 先统一渲染 <input>：本步的脏状态测试需要真实控件存在，
-                          否则 Task 4 无法独立跑绿。select / textarea 在 Task 5 升级。 */}
-                      <input
-                        id={`runtime-${field.key}`}
-                        type={field.type === "number" ? "number" : "text"}
-                        min={field.min ?? undefined}
-                        max={field.max ?? undefined}
-                        value={drafts[field.key] ?? ""}
-                        onChange={(event) =>
-                          setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
-                        }
-                        className="w-full rounded border border-line-strong bg-raised px-2.5 py-1.5 text-sm text-fg outline-none focus:border-fg-subtle disabled:opacity-50"
-                      />
+                      {field.type === "select" ? (
+                        <select
+                          id={`runtime-${field.key}`}
+                          value={drafts[field.key] ?? ""}
+                          onChange={(event) =>
+                            setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
+                          }
+                          className={CONTROL_CLASS}
+                        >
+                          <option value="">
+                            未设置（默认 {labelFor(field.key, field.default)}）
+                          </option>
+                          {field.options.map((option) => (
+                            <option key={option} value={option}>
+                              {labelFor(field.key, option)}
+                            </option>
+                          ))}
+                        </select>
+                      ) : field.key === "agent.system_prompt" ? (
+                        <textarea
+                          id={`runtime-${field.key}`}
+                          rows={3}
+                          value={drafts[field.key] ?? ""}
+                          onChange={(event) =>
+                            setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
+                          }
+                          className={`${CONTROL_CLASS} resize-y`}
+                        />
+                      ) : (
+                        <input
+                          id={`runtime-${field.key}`}
+                          type={field.type === "number" ? "number" : "text"}
+                          min={field.min ?? undefined}
+                          max={field.max ?? undefined}
+                          value={drafts[field.key] ?? ""}
+                          onChange={(event) =>
+                            setDrafts((prev) => ({ ...prev, [field.key]: event.target.value }))
+                          }
+                          className={CONTROL_CLASS}
+                        />
+                      )}
                       <div className="mt-1 flex items-center justify-between gap-2 text-xs">
                         <span className={isUnset ? "text-fg-subtle" : "text-fg-muted"}>
                           {isUnset

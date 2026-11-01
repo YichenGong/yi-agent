@@ -131,6 +131,56 @@ describe("SettingsRuntimeTab", () => {
     expect(screen.queryByText("tui")).toBeNull();
   });
 
+  it("shows enum options in Chinese but submits the raw value", async () => {
+    const sandbox = field({
+      key: "startup.sandbox",
+      group: "startup",
+      label: "默认沙箱档位",
+      type: "select",
+      options: ["read-only", "workspace-write", "danger-full-access"],
+      default: "workspace-write",
+      description: "启动时的文件写入沙箱；空表示用默认档位",
+      min: null,
+    });
+    const call = callWith([sandbox]);
+    render(<SettingsRuntimeTab call={call} />);
+
+    // 默认值本身也要中文化，否则下拉里是中文、旁边写着英文。
+    expect(await screen.findByText("默认 工作区可写")).toBeTruthy();
+
+    const select = (await screen.findByLabelText("默认沙箱档位")) as HTMLSelectElement;
+    const labels = Array.from(select.options).map((o) => o.textContent);
+    expect(labels).toContain("只读");
+    expect(labels).toContain("完全访问");
+    // 未设置项显示默认值的中文。
+    expect(labels[0]).toBe("未设置（默认 工作区可写）");
+
+    // 选中文项，提交的仍是原始字符串。
+    fireEvent.change(select, { target: { value: "danger-full-access" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => {
+      expect(call).toHaveBeenCalledWith("settings/write", {
+        patch: { "startup.sandbox": "danger-full-access" },
+      });
+    });
+  });
+
+  it("uses a multi-line textarea for the free-text system prompt", async () => {
+    const prompt = field({
+      key: "agent.system_prompt",
+      label: "系统提示词",
+      type: "text",
+      default: "",
+      description: "覆盖默认系统提示词；留空表示用默认",
+      min: null,
+    });
+    render(<SettingsRuntimeTab call={callWith([prompt])} />);
+    const box = (await screen.findByLabelText("系统提示词")) as HTMLElement;
+    expect(box.tagName).toBe("TEXTAREA");
+    // 空默认值显示成破折号，不是空白。
+    expect(screen.getByText("默认 —")).toBeTruthy();
+  });
+
 describe("runtime settings labels", () => {
   it("names every backend group in Chinese", () => {
     // 与 yi-agent-runtime/src/settings.rs 的 FIELDS 分组一一对应。漏一个就会在页面上
