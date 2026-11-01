@@ -49,6 +49,16 @@ const DRIVER_TICK: Duration = Duration::from_secs(3);
 
 const EVICT_IDLE_AFTER: Duration = Duration::from_secs(600);
 
+/// 保活策略的采样间隔。
+///
+/// 与 `DRIVER_TICK`（3s）刻意不同：电源/网络判定不需要 3s 的精度，而每拍都要
+/// 走一次 `getifaddrs`（可能还有 `route` 子进程），3s 太密。10s 仍远小于 15 分钟
+/// 的宽限窗口，迟到一拍不改变结论。
+const POWER_TICK: Duration = Duration::from_secs(10);
+
+/// `SystemClock::now` / `since` 来自 `Clock` trait，这里只借用方法，不带名字。
+use yi_agent_power::clock::Clock as _;
+
 /// 决定「这个项目的 runtime 现在能不能回收」所需的全部事实。
 ///
 /// 采集与决策分离：调用方负责从 `threads` / 磁盘 / 常驻登记里取事实，本结构
@@ -3253,6 +3263,28 @@ where
     // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
     let initialized = client_initialized;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+
+    // 保活。**唯一持有断言的进程**就是这里（spec「为什么是单一持有者」）。
+    //
+    // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：它含子进程与
+    // 2 秒级 TCP 超时，放主循环会把 RPC 卡住。
+    let initial_enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(
+        &yi_agent_runtime::settings::load_from(&settings_path),
+    );
+    let power_guard = crate::power_guard::PowerGuard::spawn(initial_enabled);
+    // daemon 侧的 busy 另由 `BusySampler` 采（同样是阻塞 IPC，同样不能进主循环）。
+    let busy_sampler = crate::power_busy::BusySampler::spawn(Arc::clone(&runtimes));
+    // 远端最后一次发来请求的时刻。**只**由非 local 客户端刷新：桌面壳用 stdio
+    // 连的，若不排除，「本地桌面每发一条消息」都会把它刷成真，于是 busy 恒真、
+    // 电池下永不释放。
+    //
+    // 时钟与 `power_guard` 线程里那条**是同一种读数**（睡眠感知单调钟）。它是
+    // 系统级读数，不随实例变化，所以两边各建一个 `SystemClock` 得到的是同一口径。
+    // 反之若这里改用 `Instant::now()`，睡 8 小时后它会说「刚交互过、还在 5 分钟内」，
+    // 而 policy 说「超过 15 分钟」——两个判据打架，`ok` 恒为真。
+    let power_clock = yi_agent_power::clock::SystemClock::new();
+    let mut last_remote_touch: Option<yi_agent_power::clock::Stamp> = None;
+
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
     let mut pending_activation: HashMap<String, Option<Arc<ThreadRoot>>> = HashMap::new();
@@ -3280,6 +3312,10 @@ where
     // 组长 I/O 之后。低频是刻意的:唤醒组长要真花钱(见 `LEAD_TICK`)。
     let mut lead_ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + LEAD_TICK, LEAD_TICK);
+    // 主循环侧的保活拍：只做「读设置 + 算 activity + 写两个原子」。
+    // 真正的探测与断言在线程里（`power_guard`），这里不碰任何 I/O，
+    // 所以用 `interval` 而不是 `interval_at`——立刻跑一次也无害。
+    let mut power_ticker = tokio::time::interval(POWER_TICK);
     // 上次**已投递**的 digest 文本(键 = project_key)。审批期的重复 tick 会给出
     // 一模一样的文本,靠它压掉(见 `take_changed_digests`)。纯内存、不落盘:
     // 重启后重投一次是可接受的代价,比多一个索引文件简单得多。
@@ -3339,6 +3375,16 @@ where
             } => break,
             line = inbound.recv() => {
                 let Some((client, item)) = line else { break }; // EOF → graceful exit
+                // 远端交互时间戳：**只**记非 local 客户端。
+                // `ClientId::ws(..)` 是唯一一种「远端」，而 relay 不是独立入口
+                // （`--relay` 的环回桥走同一个 `serve_ws_body`），所以这一个判据
+                // 同时覆盖手机直连与经 relay 连接，不需要按传输方式分支。
+                // 注意：畸形帧也刷新——它同样证明「有人正在指挥我」。
+                if client != crate::broadcast::ClientId::local() {
+                    if let Some(stamp) = power_clock.now() {
+                        last_remote_touch = Some(stamp);
+                    }
+                }
                 // 早退守卫:某客户端(如被 `device/revoke` 踢掉、或被广播背压
                 // 摘除)在断连后仍可能有一帧已在 channel 里排队。它已经不在 hub
                 // 上,任何按它寻址的响应都写不出去;在主循环里处理它只会走到
@@ -3819,6 +3865,27 @@ where
                 }
             }
             Some(error) = fatal_rx.recv() => return Err(error),
+            _ = power_ticker.tick() => {
+                // 开关每拍现读磁盘，所以设置页保存后下一拍就生效，不必重启进程。
+                // `load_from` 是「读一次文件 + 逐字段校验」，10s 一次开销可忽略。
+                let enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(
+                    &yi_agent_runtime::settings::load_from(&settings_path),
+                );
+
+                // 本进程侧：本地会话 ∪ 远端近期交互。两项都是纯内存判断，
+                // 放主循环里是安全的（不碰 I/O，也不起子进程）。
+                let local = crate::power_busy::local_busy(&threads);
+                let remote = crate::power_busy::remote_touch_busy(
+                    last_remote_touch,
+                    &power_clock,
+                );
+                // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
+                let daemon = busy_sampler.latest();
+
+                // 只写两个原子。探测与 IOKit 都在供电线程里，这里绝不阻塞。
+                power_guard.set_activity(local || remote || daemon);
+                power_guard.set_enabled(enabled);
+            }
             _ = driver_ticker.tick() => {
                 // 通用会话驱动器内联跑一轮:问每个驱动插件「下一步起/续哪个
                 // 会话」并按它的回答执行。所有局部量按顺序借用,不与 RPC 分支
@@ -4034,6 +4101,17 @@ where
             }
         }
     }
+
+    // 显式释放断言，再拆项目 root。
+    //
+    // 顺序有讲究：`detach()` 会停掉本进程起的 daemon，那是「本进程还在干活」的
+    // 最后证据。若断言在 detach 之后才由 `Drop` 释放，中间这段时间系统可能已经
+    // 开始休眠流程。显式先 drop 让断言立刻消失。
+    //
+    // `PowerGuard::drop` 会置 `stop` 并 `join`；`join` 最长等 50ms（分段轮询，
+    // 见 `power_guard::sleep_until_stop`），不会拖慢退出。
+    drop(power_guard);
+    drop(busy_sampler);
 
     // 进程退出前断开所有项目 root。同步调用:已经不在热路径上,而进程即将结束。
     for binding in attached_runtimes(&runtimes) {
@@ -10669,6 +10747,44 @@ mod evict_idle_tests {
         assert!(remaining.contains(&project_key(busy_project.path())));
         assert!(remaining.contains(&project_key(plugin_project.path())));
         assert!(remaining.contains(&project_key(resident_project.path())));
+    }
+
+    /// 回归守卫：`daemon_busy` 不得刷新 binding 的空闲时钟。
+    ///
+    /// 之前若用 `current()` 做探测，每 10s 一次会把 `idle_for()` 压回零，
+    /// `EVICT_IDLE_AFTER` 永不触发，项目 daemon 永不回收。
+    #[test]
+    fn probing_busy_does_not_prevent_runtime_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        // 一个不存在的 socket：探测会立刻失败（快），且不碰空闲时钟。
+        let socket = dir.path().join("absent.sock");
+        let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: socket,
+            workspace_root: dir.path().to_path_buf(),
+            session_id: String::new(),
+            task_id: String::new(),
+            capability: String::new(),
+        });
+        binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        runtimes
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_path_buf(), Ok(Arc::clone(&binding)));
+
+        // 探测若干次。
+        for _ in 0..5 {
+            let _ = crate::power_busy::daemon_busy(&runtimes);
+        }
+
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &HashMap::new(),
+            &dir.path().join("residents"),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+        assert_eq!(evicted, vec![dir.path().to_path_buf()], "探测不得阻止回收");
     }
 
     /// 回收**不得**动会话：用户切回一个项目的会话时，对话必须原样还在。
