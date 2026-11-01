@@ -204,6 +204,7 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     store.create(&meta)?;
     // 复读:并发下这里可能读到别人先落的、`created_at` 更早的那一个。
@@ -524,6 +525,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         };
         store.create(&existing).unwrap();
 

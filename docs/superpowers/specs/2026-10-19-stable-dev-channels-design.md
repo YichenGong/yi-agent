@@ -210,8 +210,13 @@ plist 路径）与 `skills_home`（实例技能目录）。前者必须是真实
 - 实例目录：`~/.yi-agent-instances/<worktree>-<branch>-<path-hash-6>/`，位于仓库外，
   删除目录即销毁。
 - `scripts/rebuild.sh` 增加 `--profile dev`：只产出并安装 `yi-agent-dev`，**不再**写
-  `~/.cargo/bin/yi-agent` 与 `/opt/homebrew/bin/yi-agent`。这是修正稳定版定义被污染
-  的根源。该文件在 `.git/info/exclude:15` 里（`/scripts/`），属本地工具、不入库。
+  `~/.cargo/bin/yi-agent`。这是修正稳定版定义被污染的根源。该文件在 `.git/info/exclude:15`
+  里（`/scripts/`），属本地工具、不入库。
+  - **2026-11-01 变更**：上面这条对 `/opt/homebrew/bin/yi-agent` 的限制已取消。
+    登录 shell 的 PATH 里 `/opt/homebrew/bin` 排在 `~/.local/bin` 之前，不接管
+    该软链就等于「装好了但终端里用的还是旧的」。现在两个 profile 都接管软链，
+    但 dev 仍不写稳定版二进制本身。见
+    [2026-11-01-rebuild-install-global-design.md](2026-11-01-rebuild-install-global-design.md)。
 - 新增的实例管理脚本必须**入库**，因此放在 `yi-agent-rs/scripts/`（该目录已被跟踪，
   现有 `sync-npm-versions.sh` 等），而不是仓库根的 `scripts/`。
 - 桌面端保持只装稳定版。`desktop/src-tauri/src/bridge.rs:211-217` 读取 preferences 的

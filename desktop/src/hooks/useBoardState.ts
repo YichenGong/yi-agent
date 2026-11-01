@@ -9,6 +9,7 @@ import {
   pluginIsUnavailable,
   readBoardSwitch,
 } from "../lib/superpowersKanbanSwitch";
+import { ConnectionError } from "../lib/connectionError";
 import type { RpcClient } from "../lib/rpc";
 
 /**
@@ -23,7 +24,7 @@ import type { RpcClient } from "../lib/rpc";
  * 故不随切项目重置。
  *
  * `clientRef` 是 App 的 RPC 客户端槽，`boardRpc` 由它在本 hook 内构出并对外返回。
- * 这条接缝**未连接时直接失败**（`Promise.reject(new Error("not connected"))`），
+ * 这条接缝**未连接时直接失败**（抛 `ConnectionError("disconnected")`），
  * 语义逐字保留自搬移前：看板是主区域的平级页面，写入失败必须报出来（`boardError`
  * 与 `onCreateBoard` 那几处），不能像附属视图那样静默——故不学 `useDiffState` 的
  * `() => RpcClient | null` 接缝。空依赖即可稳定：它只闭合一个 ref。`App.tsx` 的
@@ -96,7 +97,7 @@ export function useBoardState({
   const boardRpc = useCallback(
     <T = unknown,>(method: string, params: unknown): Promise<T> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request<T>(method, params);
     },
     [],

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Item } from "./protocol";
 import {
   applyTrim,
+  contentFingerprintOf,
   estimateItemsBytes,
   evict,
   MAX_ENTRY_BYTES,
@@ -129,6 +130,24 @@ describe("MemoryContentStore", () => {
   it("reads a missing key as null", async () => {
     expect(await new MemoryContentStore().read("nope")).toBeNull();
   });
+
+  it("counts writes and deletes without changing the stored shape", async () => {
+    const store = new MemoryContentStore();
+    expect(store.writes).toBe(0);
+    expect(store.deletes).toBe(0);
+    await store.write({
+      threadId: "t1", savedAt: 1, lastServerItemId: null,
+      items: [], trimmed: false, bytes: 0,
+    });
+    expect(store.writes).toBe(1);
+    // 计数不写进条目本身：读回来逐字段比对仍与写入值一致。
+    expect(await store.read("t1")).toEqual({
+      threadId: "t1", savedAt: 1, lastServerItemId: null,
+      items: [], trimmed: false, bytes: 0,
+    });
+    await store.delete("t1");
+    expect(store.deletes).toBe(1);
+  });
 });
 
 describe("evict", () => {
@@ -156,5 +175,89 @@ describe("persistContent", () => {
     const entry = await store.read("t1");
     expect(entry?.items.map((i) => i.id)).toEqual(["s1"]);
     expect(entry?.lastServerItemId).toBe("s1");
+  });
+
+  it("writes nothing when there is no server content and it is not authoritative", async () => {
+    const store = new MemoryContentStore();
+    const session = new Session();
+    // 只有本地回显与 notice：服务端尚未回帧。
+    session.notice("command output");
+    session.addUserMessage("hi");
+    const outcome = await persistContent(store, "t1", session);
+    expect(outcome).toEqual({ action: "skipped" });
+    expect(await store.keys()).toEqual([]);
+  });
+
+  it("deletes the entry on an authoritative empty result", async () => {
+    const store = new MemoryContentStore();
+    await store.write({
+      threadId: "t1", savedAt: 1, lastServerItemId: "old",
+      items: [{ type: "agentMessage", id: "old", text: "stale" }],
+      trimmed: false, bytes: 10,
+    });
+    const session = new Session();          // 全量 resume 后确认为空
+    const outcome = await persistContent(store, "t1", session, { authoritative: true });
+    expect(outcome).toEqual({ action: "deleted" });
+    expect(await store.keys()).toEqual([]);
+  });
+
+  it("does not delete when authoritative but only local echoes exist", async () => {
+    const store = new MemoryContentStore();
+    await store.write({
+      threadId: "t1", savedAt: 1, lastServerItemId: "done",
+      items: [{ type: "agentMessage", id: "done", text: "keep" }],
+      trimmed: false, bytes: 10,
+    });
+    const session = new Session();
+    session.addUserMessage("just sent, server has not echoed yet");
+    const outcome = await persistContent(store, "t1", session, { authoritative: true });
+    expect(outcome).toEqual({ action: "skipped" });
+    expect(await store.keys()).toEqual(["t1"]);   // 好缓存必须留着
+  });
+
+  it("returns a fingerprint computed from the trimmed entry, not raw items", async () => {
+    const store = new MemoryContentStore();
+    const session = new Session();
+    // 一条 notice + 三条服务端项：归一化前 4 条，归一化后 3 条。
+    session.notice("notice");
+    for (const id of ["a", "b", "c"]) {
+      session.apply({ method: "item/completed", params: { item: msg(id, `text-${id}`) } } as never);
+    }
+    const outcome = await persistContent(store, "t1", session);
+    expect(outcome.action).toBe("written");
+    if (outcome.action !== "written") throw new Error("unreachable");
+    const entry = await store.read("t1");
+    expect(entry).not.toBeNull();
+    // 关键：指纹必须与「从盘上条目反算」逐字相等，否则冷启后永远判「变了」。
+    expect(outcome.fingerprint).toBe(
+      contentFingerprintOf(entry!.items, entry!.lastServerItemId, entry!.contentEpoch),
+    );
+    // 且不能等于用原始 items 算出来的那个（那会把 notice 也数进去）。
+    expect(outcome.fingerprint).not.toBe(
+      contentFingerprintOf(session.items as never, session.lastServerItemId, session.contentEpoch),
+    );
+  });
+
+  it("reports which threads the write evicted from the LRU", async () => {
+    const store = new MemoryContentStore();
+    // 先放满上限（CONTENT_LIMITS.maxCount = 10），再写第 11 条。
+    // `savedAt` 递增：old0 最旧，必是第一个被淘汰的。
+    for (let i = 0; i < 10; i++) {
+      await store.write({
+        threadId: `old${i}`, savedAt: i + 1, lastServerItemId: null,
+        items: [msg(`i${i}`, "x")], trimmed: false, bytes: 1,
+      });
+    }
+    const session = new Session();
+    session.apply({ method: "item/completed", params: { item: msg("fresh", "y") } } as never);
+    const outcome = await persistContent(store, "fresh", session);
+    expect(outcome.action).toBe("written");
+    if (outcome.action !== "written") throw new Error("unreachable");
+    // 写第 11 条后共 11 条 > 10，必须淘汰 1 条：`old0`（savedAt 最小）。
+    // 它要在返回值里报出来——调用方靠它清 persistedFp，否则该会话既已不在
+    // 盘上、又会被 `flushAll` 判「没变」而永不重写。
+    expect(outcome.evicted).toEqual(["old0"]);
+    expect(await store.keys()).not.toContain("old0");
+    expect(await store.keys()).toContain("fresh");
   });
 });

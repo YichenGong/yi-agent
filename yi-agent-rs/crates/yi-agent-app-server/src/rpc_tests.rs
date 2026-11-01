@@ -575,6 +575,7 @@ fn only_the_lead_sees_the_memory_tools() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -709,6 +710,7 @@ fn only_the_lead_sees_the_view_tools() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         })
         .expect("a plain meta must persist");
     // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
@@ -6150,6 +6152,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             store: Arc::new(crate::thread_store::ThreadStore::new(warm.path())),
             status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
             subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+            writer_lock: None,
         },
     );
 
@@ -6176,6 +6179,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7712,6 +7716,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7827,6 +7832,7 @@ async fn a_turn_while_off_persists_without_credentials() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7929,6 +7935,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9341,6 +9348,7 @@ fn write_meta(
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9373,6 +9381,7 @@ fn write_lead_meta(dir: &Path, id: &str) {
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -10214,6 +10223,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         store: Arc::new(crate::thread_store::ThreadStore::new(project)),
         status: Arc::new(StdMutex::new(status)),
         subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+        writer_lock: None,
     }
 }
 
@@ -11268,6 +11278,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -11384,6 +11395,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -13361,6 +13373,7 @@ async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
                 anchor_sha: None,
                 last_read_at: 0,
                 last_completed_at: 0,
+                forked_from: None,
                 extra_roots: Vec::new(),
                 role: Some(crate::thread_store::LEAD_ROLE.into()),
             })
@@ -19240,6 +19253,7 @@ fn the_lead_does_not_get_ask_lead() {
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();
@@ -21044,4 +21058,220 @@ async fn view_read_refresh_does_not_block_the_main_loop() {
         .await;
     assert!(v["result"].is_object(), "view/read must still answer: {v}");
     h.shutdown().await;
+}
+
+/// 三个 tui 通知键必须能写入并读回非 null。`FIELDS` 驱动 UI，
+/// `current_value` 决定读出的值——漏一个就会静默返回 null，
+/// 设置页显示空白，用户改完像没生效。
+#[tokio::test(flavor = "multi_thread")]
+async fn every_tui_notification_field_is_writable_and_readable() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"settings/write","params":{"patch":{"tui.notifications":"false","tui.notification_method":"bel","tui.notification_condition":"always"}}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["result"]["ok"], true, "write failed: {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let fields = v["result"]["fields"].as_array().expect("fields array");
+
+    for (key, expected) in [
+        ("tui.notifications", "false"),
+        ("tui.notification_method", "bel"),
+        ("tui.notification_condition", "always"),
+    ] {
+        let field = fields
+            .iter()
+            .find(|f| f["key"] == key)
+            .unwrap_or_else(|| panic!("{key} must be listed"));
+        assert_eq!(field["type"], "select", "{key} must be a select: {field}");
+        assert_eq!(
+            field["value"], expected,
+            "{key} must read back what was written: {field}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: 跨进程会话写锁（app-server 侧）
+// ---------------------------------------------------------------------------
+
+/// 桌面（app-server）与终端（另一个 writer）不能同时成为同一 thread 的 writer。
+///
+/// 关键反例：若把锁实现成「app-server 一旦打开 thread 就长期持锁」，
+/// 桌面挂着某会话时终端永远 resume 不了。锁必须只在启动 driver 时取。
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_lock_refuses_a_second_writer_on_the_same_thread() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg.clone(), build_checkpoint_agent, PERMISSION_TIMEOUT);
+    initialize(&mut h).await;
+
+    // 直接在盘上造一个会话，**不**经 `thread/start`。
+    //
+    // 走 `thread/start` 的话 app-server 自己会先持锁，后续子进程根本抢不到，
+    // 测不出「跨进程拒绝」这件事。这里模拟的是真实场景：终端先跑了这个会话
+    // 并落盘，桌面随后才打开它。
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+    let tid = "thread-lock-conflict".to_string();
+    store
+        .create(&crate::thread_store::ThreadMeta {
+            thread_id: tid.clone(),
+            cwd: cfg.workdir.display().to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            title: None,
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            driver_project: None,
+            driver_ref: None,
+            model_ref: None,
+            reasoning_effort: None,
+            tag: None,
+            preserve_thinking: true,
+            extra_roots: Vec::new(),
+            role: None,
+            content_epoch: 0,
+            last_item_id: None,
+            anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
+            forked_from: None,
+        })
+        .unwrap();
+
+    // 模拟另一个 writer（终端）已持有该 thread 的锁。
+    //
+    // **必须是真子进程**：`flock` 按「打开文件描述」加锁，同一进程内对同一
+    // 路径再 open 一次拿到的描述符会与已持有的锁冲突——但本进程的去重表会先
+    // 命中，根本走不到 flock。所以这里起一个子进程，让内核的跨进程语义生效。
+    let lock_path =
+        crate::thread_store::thread_lock_path(&cfg.workdir.join(".yi-agent/threads"), &tid);
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+    let exe = std::env::current_exe().unwrap();
+    let mut holder = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "server::tests::child_holds_thread_lock",
+            "--nocapture",
+            "--ignored",
+        ])
+        .env("YI_LOCK_PATH", &lock_path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // 等子进程报告已持锁，避免与下面的 resume 竞速。
+    //
+    // 用逐行读到 `LOCK_HELD` 为止：libtest 会先打 `running 1 test`，
+    // 单次 read 很可能只拿到那行。
+    {
+        use std::io::{BufRead, BufReader};
+        let stdout = holder.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut seen = String::new();
+        let mut got = false;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            seen.push_str(&line);
+            if line.contains("LOCK_HELD") {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "子进程必须先成功持锁，实际: {seen}");
+    }
+
+    // 桌面尝试 resume（= 启动该 thread 的 driver）：必须被拒
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 3).await;
+    assert!(
+        v.get("error").is_some(),
+        "第二个 writer 必须被拒绝，实际: {v}"
+    );
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("正被另一个") || message.contains("busy"),
+        "错误信息要能指导用户，实际: {message}"
+    );
+
+    // 释放占位锁后必须能正常 resume（否则就是锁没释放的死锁 bug）
+    holder.kill().ok();
+    holder.wait().ok();
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let ok = read_response(&mut h, 4).await;
+    assert!(
+        ok.get("result").is_some(),
+        "锁释放后必须能 resume，实际: {ok}"
+    );
+    h.shutdown().await;
+}
+
+/// 同一 app-server 内的多客户端订阅不受 writer lock 影响（桌面 + 手机）。
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_lock_does_not_block_subscriptions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_checkpoint_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    // 订阅不该被 writer lock 挡住
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "thread/subscribe",
+            "params": { "threadIds": [tid] }
+        })
+        .to_string(),
+    )
+    .await;
+    let v = read_response(&mut h, 3).await;
+    assert!(
+        v.get("error").is_none(),
+        "订阅不该受 writer lock 影响，实际: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 由 `writer_lock_refuses_a_second_writer_on_the_same_thread` 以子进程方式调用：
+/// 独占持有指定锁文件，报告 `LOCK_HELD` 后休眠直到被杀。
+#[test]
+#[ignore]
+fn child_holds_thread_lock() {
+    use std::io::Write;
+    let path = std::path::PathBuf::from(std::env::var("YI_LOCK_PATH").unwrap());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    let rc = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    assert_eq!(rc, 0, "子进程必须能拿到锁");
+    println!("LOCK_HELD");
+    std::io::stdout().flush().unwrap();
+    // 持锁直到被父进程 kill。
+    std::thread::sleep(std::time::Duration::from_secs(30));
 }

@@ -51,6 +51,9 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: true,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
     }
 }
 

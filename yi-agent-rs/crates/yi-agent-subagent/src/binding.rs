@@ -127,6 +127,18 @@ impl RuntimeBinding {
         Ok(self.lock_state().handle.clone())
     }
 
+    /// The current handle **without** refreshing the idle clock.
+    ///
+    /// `current()` 会 `touch()`——那对「委派请求」是对的（请求本身算使用），
+    /// 但对**探测**是错的：保活探测每 10s 问一次句柄，若顺手刷新空闲时钟，
+    /// `evict_idle_runtimes` 的 `idle_for()` 就永远停在「刚刚」，
+    /// `EVICT_IDLE_AFTER`（600s）永不触发，项目 daemon 永不回收。
+    ///
+    /// 这个函数只做读取。调用方只能是「问一句就走」的旁观者。
+    pub fn current_handle_no_touch(&self) -> Result<RuntimeHandle, String> {
+        Ok(self.lock_state().handle.clone())
+    }
+
     /// 记一次「这个项目刚被用到」。
     fn touch(&self) {
         *self
@@ -486,6 +498,34 @@ mod idle_clock_tests {
         assert!(
             binding.idle_for() < Duration::from_millis(100),
             "reading the handle must reset the clock"
+        );
+    }
+
+    /// 探测不得刷新空闲时钟：调 `current_handle_no_touch` 之后 `idle_for` 必须
+    /// 继续按真实时间增长，而 `current()` 会把它压回零。
+    #[test]
+    fn current_handle_no_touch_does_not_reset_the_idle_clock() {
+        let binding = RuntimeBinding::fixed(RuntimeHandle {
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: String::new(),
+            task_id: String::new(),
+            capability: String::new(),
+        });
+        binding.backdate_idle_clock(Duration::from_secs(500));
+        let before = binding.idle_for();
+        let _ = binding.current_handle_no_touch().unwrap();
+        let after = binding.idle_for();
+        assert!(
+            after >= before,
+            "probing must not rewind the idle clock: before={before:?} after={after:?}"
+        );
+
+        binding.backdate_idle_clock(Duration::from_secs(500));
+        let _ = binding.current().unwrap();
+        assert!(
+            binding.idle_for() < Duration::from_secs(60),
+            "current() is documented to touch; this pins the difference"
         );
     }
 

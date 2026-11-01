@@ -140,6 +140,11 @@ codesign -v "$APP"   # 应 exit 0
 - **提交前必须跑 `cargo fmt --all`**(在 `yi-agent-rs/` 下),保证代码格式
   通过 `just fmt-check`。`git commit` 前的 hook 不自动跑 fmt,所以需要手动
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
+- **提交前必须自检 `just ci` 全绿**(在 `yi-agent-rs/` 下),合并到 `main` 后再
+  在合并结果上跑一次。它是 CI 的唯一入口(GitHub PR / GitLab MR 都只跑它),
+  涵盖 12 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
+  `test`、`build`、`bindings-check`、`secret-check` 等。少跑一次就可能让
+  `main` 直接变红;本地几分钟,比事后回滚便宜。
 
 ## 磁盘占用:`target/` 会无限膨胀
 
@@ -257,10 +262,11 @@ Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉�
   容易成为黑洞(进去就出不来)。
 - 每条 feature 必须带**可验证的完成判据**:代码位置(`file.rs:line`)或
   可执行命令,不要写"已实现权限管理"这种主观描述。
-- 更新模块文件后,同步更新 `README.md` 模块索引表的"完成 / 总计"计数。
+- 更新模块文件后,同步更新 `docs/project-management/README.md` 模块索引表的
+  "完成 / 总计"计数(根 `README.md` 是面向用户的精简版,不再放模块索引)。
 - **新增 crate 时**,同一 PR 内必须:
   1. 在 `docs/project-management/` 下创建对应模块文件
-  2. 在 `README.md` 模块索引表登记一行
+  2. 在 `docs/project-management/README.md` 模块索引表登记一行
 - `bug-list.md` 同理:只有 `[x]` 已修复 / `[ ]` 未修复两态,不用 `[~]`。
 - 维护规则详见 `docs/project-management/README.md` 末尾"维护规则"小节。
 

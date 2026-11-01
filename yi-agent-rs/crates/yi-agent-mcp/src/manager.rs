@@ -10,7 +10,7 @@
 //! one server are not serialized; if a call fails at the transport layer the
 //! connection is dropped and the call is retried once on a fresh connection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use yi_agent_core::{Tool, ToolRegistry, ToolResult};
+use yi_agent_core::{Tool, ToolRegistry, ToolResult, ToolSource};
 
 use crate::cache::{CacheLookup, CachedTool, McpCache, RETRY_AFTER_SECS, TTL_SECS};
 use crate::config::{McpConfig, ServerConfig, Transport};
@@ -115,9 +115,6 @@ pub struct McpManager {
     /// (否则 future 不是 `Send`,`call_tool` 编不过)。
     servers: std::sync::RwLock<Arc<HashMap<String, Arc<ServerEntry>>>>,
     master_enabled: AtomicBool,
-    /// 上一次 `refresh_registry` 注册过的工具名。用于在 server 被删除后把孤儿
-    /// 工具摘掉——新快照里已经查不到这些名字,不能反过来推导。
-    last_registered: std::sync::Mutex<HashSet<String>>,
     /// 上一次 reload / 启动探测时读到的配置指纹;用于每轮开跑前的廉价变更检测。
     last_seen: std::sync::Mutex<Option<String>>,
 }
@@ -132,7 +129,6 @@ impl McpManager {
         Arc::new(Self {
             servers: std::sync::RwLock::new(Arc::new(servers)),
             master_enabled: AtomicBool::new(master),
-            last_registered: std::sync::Mutex::new(HashSet::new()),
             last_seen: std::sync::Mutex::new(None),
         })
     }
@@ -536,13 +532,8 @@ impl McpManager {
     }
 
     /// Adapters for every tool on currently-effective servers.
-    ///
-    /// 顺带把返回的名字记进 `last_registered`:启动期注册走的是这条路径
-    /// (而不是 `refresh_registry`),漏记的话之后停用/删除该 server 时
-    /// `refresh_registry` 无名字可摘,工具会一直留在工具表里。
     pub fn enabled_tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
         let snapshot = self.snapshot();
         for (name, entry) in snapshot.iter() {
             if !self.is_effective(name) {
@@ -557,43 +548,39 @@ impl McpManager {
                     t.read_only,
                     Arc::clone(self),
                 );
-                names.push(tool.name().to_string());
                 out.push(Arc::new(tool));
-            }
-        }
-        // 只增不删:`refresh_registry` 负责 drain,这里补记它没见过的那批。
-        {
-            let mut registered = self
-                .last_registered
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for n in names {
-                registered.insert(n);
             }
         }
         out
     }
 
-    /// Sync `registry` with the effective MCP tools: unregister every tool this
-    /// manager could register, then register the currently-effective ones.
+    /// Sync `registry` with the effective MCP tools: unregister every MCP tool
+    /// present in *this* registry, then register the currently-effective ones.
     ///
     /// Idempotent. Call after changing the master/per-server switches so the next
     /// `Agent` rebuild exposes the new tool set.
+    ///
+    /// 要摘哪些名字**按 registry 自身的实际内容推导**（`ToolSource::Mcp`），
+    /// 不能用 manager 上的全局记账集合：app-server 里每个 thread 各持一份
+    /// registry、共用同一个 `McpManager`。全局集合一旦被先刷新的 thread
+    /// drain 空，后刷新的 thread 就摘不掉自己那份旧工具——远端工具改名后它会
+    /// 一直拿旧名调上游，收到 `-32603 upstream failed`。按 registry 内容推导
+    /// 天然是 per-registry 的，多 thread 各自正确。
     pub fn refresh_registry(self: &Arc<Self>, registry: &mut ToolRegistry) {
-        // 先取工具再拿锁:`enabled_tools` 自己也会写 `last_registered`,
-        // 持锁调用会自死锁(std::sync::Mutex 不可重入)。
-        let tools = self.enabled_tools();
-        // 按**上次注册过的名字**清理,而不是按当前快照推导:server 被删掉后
-        // 它的名字已不在快照里,反向推导会把这些工具永久留在 registry。
-        let mut registered = self
-            .last_registered
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for name in registered.drain() {
+        // 先摘、再装：`enabled_tools` 里若出现与旧名相同的工具，先装后摘会把它删掉。
+        let stale: Vec<String> = registry
+            .names()
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|t| matches!(t.metadata().source, ToolSource::Mcp { .. }))
+            })
+            .collect();
+        for name in stale {
             registry.remove(&name);
         }
-        for tool in tools {
-            registered.insert(tool.name().to_string());
+        for tool in self.enabled_tools() {
             registry.register(tool);
         }
     }
@@ -692,7 +679,6 @@ impl McpManager {
         Self {
             servers: std::sync::RwLock::new(Arc::new(HashMap::new())),
             master_enabled: AtomicBool::new(master),
-            last_registered: std::sync::Mutex::new(HashSet::new()),
             last_seen: std::sync::Mutex::new(None),
         }
     }
@@ -742,6 +728,24 @@ impl McpManager {
     #[cfg(test)]
     pub(crate) fn clear_servers_for_test(&self) {
         *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(HashMap::new());
+    }
+
+    /// 替换某个 server 的工具清单(测试用),模拟远端工具改名后的 reload 结果。
+    #[cfg(test)]
+    pub(crate) fn replace_server_tools_for_test(&self, name: &str, tools: Vec<CachedTool>) {
+        let mut map = (**self.servers.read().unwrap_or_else(|e| e.into_inner())).clone();
+        if let Some(entry) = map.get(name) {
+            map.insert(
+                name.to_string(),
+                Arc::new(ServerEntry {
+                    config: entry.config.clone(),
+                    enabled: AtomicBool::new(entry.enabled.load(Ordering::Relaxed)),
+                    tools,
+                    client: Mutex::new(None),
+                }),
+            );
+        }
+        *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(map);
     }
 }
 
@@ -1058,7 +1062,6 @@ mod tests {
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn reload_does_not_reprobe_an_unchanged_server() {
         let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
@@ -1100,7 +1103,6 @@ mod tests {
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn reload_reprobes_a_changed_server_and_reports_the_error() {
         let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
@@ -1147,7 +1149,6 @@ mod tests {
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
     // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn reload_removes_a_deleted_server() {
         let _serial = seam_guard();
         let dir = tempfile::TempDir::new().unwrap();
@@ -1197,7 +1198,6 @@ mod tests {
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
     // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_is_false_when_nothing_changed() {
         let _serial = seam_guard();
         // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
@@ -1225,7 +1225,6 @@ mod tests {
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
     // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_detects_an_external_edit() {
         let _serial = seam_guard();
         // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
@@ -1264,7 +1263,6 @@ mod tests {
     // `TEST_CONNECTOR`：不拿锁就会抢用别的 seam 测试装好的假 connector，把它的
     // 计数器加一（`after_load == 1` 断言失败），或反过来被清空后真去 spawn `npx`。
     // 锁要保住整个 await 区间；current_thread 单线程运行时不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn config_changed_on_disk_is_true_when_the_file_disappears() {
         let _serial = seam_guard();
         // 只测配置指纹，不关心工具探测：装一个立即失败的 connector，
@@ -1420,6 +1418,69 @@ mod tests {
             registry.get("mcp__fs__read").is_none(),
             "tool of a removed server must be unregistered; got {:?}",
             registry.names()
+        );
+    }
+
+    /// 每个 thread 各持一份 registry，但共用一个 manager（app-server 的
+    /// 真实形态：`mcp` 是 `Arc`，`agent.tools()` 每 thread 一份）。远端工具
+    /// 改名后，只有**先**刷新的那个 thread 摘掉了旧名；后刷新的 thread 因为
+    /// `last_registered` 已被前一个 drain 空，旧名永远留在自己的 registry 里，
+    /// 于是它继续用旧名调上游，拿到 `-32603`。
+    #[test]
+    fn refresh_registry_clears_stale_names_in_a_second_thread() {
+        let mut m = McpManager::new_for_test(true);
+        m.insert_server_with_tools_for_test(
+            "gw",
+            cfg("npx"),
+            true,
+            vec![CachedTool {
+                name: "SearchPro".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+        );
+        let m = Arc::new(m);
+
+        // 两个 thread 各自持有自己的 registry，都从旧名开始。
+        let mut thread_a = ToolRegistry::new();
+        let mut thread_b = ToolRegistry::new();
+        m.refresh_registry(&mut thread_a);
+        m.refresh_registry(&mut thread_b);
+        assert!(thread_a.get("mcp__gw__SearchPro").is_some());
+        assert!(thread_b.get("mcp__gw__SearchPro").is_some());
+
+        // 远端把工具改名成 `tencent-websearch__SearchPro`，reload 后快照更新。
+        m.replace_server_tools_for_test(
+            "gw",
+            vec![CachedTool {
+                name: "tencent-websearch__SearchPro".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+        );
+
+        // thread A 先刷新：它摘掉旧名并装上新的。
+        m.refresh_registry(&mut thread_a);
+        assert!(thread_a.get("mcp__gw__SearchPro").is_none());
+        assert!(
+            thread_a
+                .get("mcp__gw__tencent-websearch__SearchPro")
+                .is_some()
+        );
+
+        // thread B 后刷新：也必须摘掉旧名，否则它会一直用旧名调上游。
+        m.refresh_registry(&mut thread_b);
+        assert!(
+            thread_b.get("mcp__gw__SearchPro").is_none(),
+            "a second thread must not keep the renamed tool's old name; got {:?}",
+            thread_b.names()
+        );
+        assert!(
+            thread_b
+                .get("mcp__gw__tencent-websearch__SearchPro")
+                .is_some()
         );
     }
 
@@ -1606,7 +1667,6 @@ mod tests {
     // `seam_guard()` 要持到 await 之后：这把锁保护的是进程级 `TEST_CONNECTOR`，
     // 中途放手别的 seam 测试会插进来换掉它。`#[tokio::test]` 是 current_thread
     // 单线程运行时（实测 `num_workers == 1`），没有第二个任务能竞争，故不会死锁。
-    #[allow(clippy::await_holding_lock)]
     async fn probe_then_call_over_duplex() {
         let _serial = seam_guard();
         let _seam = SeamGuard;
@@ -1680,6 +1740,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_false_when_nothing_changed() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1691,6 +1752,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_true_when_the_file_changed() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1705,6 +1767,7 @@ mod tests {
 
     /// 配置没变、但缓存过期 ⇒ 触发重载(本 bug 的自愈入口)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_true_when_a_cache_entry_expired() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1722,6 +1785,7 @@ mod tests {
 
     /// 配置没变、缓存新鲜 ⇒ 不重载(防每轮重探)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_false_when_the_cache_is_fresh() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1739,6 +1803,7 @@ mod tests {
 
     /// 过期 + 刚失败 ⇒ 不重载(否则每轮白跑一遍 reload + 重建 agent)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_false_while_a_stale_entry_is_backed_off() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1759,6 +1824,7 @@ mod tests {
 
     /// 停用的 server 过期后不能触发 reload(否则永久空转)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn needs_reload_is_false_for_a_disabled_expired_server() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(
@@ -1782,6 +1848,7 @@ mod tests {
 
     /// 总开关关闭时,任何过期条目都不能触发 reload。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn master_off_suppresses_needs_reload() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(
@@ -1805,6 +1872,7 @@ mod tests {
 
     /// 过期 + 探测失败 ⇒ 工具沿用、error 非空、failed_at 被写。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_failed_probe_falls_back_to_the_old_tool_list() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1847,6 +1915,7 @@ mod tests {
 
     /// 探测失败**不能**刷新 probed_at(否则「已过期」被固化成「新鲜」,24h 内不再重探)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_failed_probe_does_not_make_the_entry_fresh() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1883,6 +1952,7 @@ mod tests {
     /// `failed_at`(启动路径也会写),紧接着的 reload 就命中退避而不探测了,
     /// 测不到「无缓存 + 探测失败」这条路径。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_failed_probe_with_no_cache_yields_no_tools() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1901,6 +1971,7 @@ mod tests {
     ///
     /// 钉住「回退源是内存快照」:若改成只回退磁盘缓存,会变成 0 个。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_failed_probe_keeps_the_in_memory_tools_when_the_cache_file_is_gone() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1927,6 +1998,7 @@ mod tests {
 
     /// 退避窗口内 reload 不探测。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn reload_skips_a_probe_within_the_backoff_window() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1951,6 +2023,7 @@ mod tests {
 
     /// 新鲜缓存用**磁盘清单**,不是内存快照(跨进程同步)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn reload_uses_the_disk_list_not_the_memory_snapshot_when_fresh() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -1984,6 +2057,7 @@ mod tests {
 
     /// 本 bug 的直接回归测试:过期后探测拿到新工具名。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn reload_refreshes_a_renamed_tool_after_the_ttl() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -2028,6 +2102,7 @@ mod tests {
 
     /// 冷缓存探测成功后必须写入 probed_at,否则 TTL 永不开始计时。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn load_and_probe_records_probed_at_on_success() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -2051,6 +2126,7 @@ mod tests {
 
     /// 停用的 server 即使缓存过期也不探测,工具沿用旧清单。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_disabled_server_is_never_probed_even_after_the_ttl() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(
@@ -2099,6 +2175,7 @@ mod tests {
 
     /// 启动路径刻意**不**校验 TTL:25h 前的缓存照样直接复用,不探测。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn load_and_probe_does_not_probe_an_expired_entry() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -2135,6 +2212,7 @@ mod tests {
 
     /// 启动路径同样不探测停用的 server(与 reload 保持一致)。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn load_and_probe_does_not_probe_a_disabled_server() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(
@@ -2156,6 +2234,7 @@ mod tests {
 
     /// 总开关关闭时,即使配置里有过期条目也不探测,且 failed_at 不被写。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn master_off_probes_nothing_even_when_stale() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(
@@ -2204,6 +2283,7 @@ mod tests {
     ///
     /// 防「升级即卡 9 分钟」:若不迁移,10 条全部 Stale,第二轮仍会触发重探。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn migration_of_many_servers_probes_none_of_them() {
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -2278,6 +2358,7 @@ mod tests {
 
     /// 连续 10 轮 needs_reload + reload,坏 server 的探测次数必须是 1~2 次。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_permanently_dead_server_is_probed_once_per_backoff_window() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
@@ -2326,6 +2407,7 @@ mod tests {
 
     /// 同一进程内先建立快照,把缓存时间戳改旧,再 reload ⇒ 必须重探。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn reload_reprobes_when_the_in_memory_snapshot_has_expired() {
         let dir = tempfile::TempDir::new().unwrap();
         write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);

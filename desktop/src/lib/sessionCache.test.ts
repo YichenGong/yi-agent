@@ -101,4 +101,85 @@ describe("sessionCache", () => {
     };
     expect(() => writeListCache(s, [], [], null)).not.toThrow();
   });
+
+  it("caps non-pinned threads at 1000 and marks the payload truncated", () => {
+    const s = memStorage();
+    const threads = Array.from({ length: 1001 }, (_, i) => ({
+      ...thread(`t${i}`),
+      updated_at: i,          // 越靠后越新
+    }));
+    writeListCache(s, [{ workspace: "/w", exists: true, threads }], [], null);
+    const raw = JSON.parse(s.map.get(THREAD_LIST_CACHE_KEY)!);
+    const kept = raw.groups.flatMap((g: WorkspaceGroup) => g.threads);
+    expect(kept).toHaveLength(1000);
+    expect(kept.map((t: ThreadSummary) => t.thread_id)).not.toContain("t0"); // 最旧的被砍
+    expect(raw.truncated).toBe(true);
+  });
+
+  it("omits the truncated flag when under the cap", () => {
+    const s = memStorage();
+    writeListCache(s, [{ workspace: "/w", exists: true, threads: [thread("t1")] }], [], null);
+    const raw = JSON.parse(s.map.get(THREAD_LIST_CACHE_KEY)!);
+    expect(raw.truncated).toBeUndefined();
+  });
+
+  it("keeps every pinned thread and does not count them against the cap", () => {
+    const s = memStorage();
+    // 置顶项留在各自分组里（带 pinned:true），同时出现在顶层 pinned 数组。
+    const pinnedThreads = Array.from({ length: 5 }, (_, i) => ({
+      ...thread(`p${i}`), pinned: true, updated_at: -i,
+    }));
+    const normalThreads = Array.from({ length: 1000 }, (_, i) => ({
+      ...thread(`n${i}`), updated_at: i,
+    }));
+    writeListCache(
+      s,
+      [{ workspace: "/w", exists: true, threads: [...pinnedThreads, ...normalThreads] }],
+      pinnedThreads,
+      null,
+    );
+    const raw = JSON.parse(s.map.get(THREAD_LIST_CACHE_KEY)!);
+    const ids = raw.groups.flatMap((g: WorkspaceGroup) => g.threads).map((t: ThreadSummary) => t.thread_id);
+    // 1000 条非置顶全部保住（限额只数非置顶）+ 5 条置顶
+    expect(ids).toHaveLength(1005);
+    for (const p of pinnedThreads) expect(ids).toContain(p.thread_id);
+  });
+
+  it("drops groups whose members were all truncated away", () => {
+    const s = memStorage();
+    // A 组全是新的，B 组全是老的：B 组整组被截空，应被丢弃而不是留个空表头。
+    const A = Array.from({ length: 1000 }, (_, i) => ({ ...thread(`a${i}`), updated_at: 10000 + i }));
+    const B = [{ ...thread("b0"), updated_at: 1 }];
+    writeListCache(
+      s,
+      [
+        { workspace: "/a", exists: true, threads: A },
+        { workspace: "/b", exists: true, threads: B },
+      ],
+      [],
+      null,
+    );
+    const raw = JSON.parse(s.map.get(THREAD_LIST_CACHE_KEY)!);
+    expect(raw.groups.map((g: WorkspaceGroup) => g.workspace)).toEqual(["/a"]);
+  });
+
+  it("keeps the newest threads across groups, not the first group's", () => {
+    const s = memStorage();
+    const A = Array.from({ length: 600 }, (_, i) => ({ ...thread(`a${i}`), updated_at: 20000 + i }));
+    const B = Array.from({ length: 600 }, (_, i) => ({ ...thread(`b${i}`), updated_at: 10000 + i }));
+    writeListCache(
+      s,
+      [
+        { workspace: "/a", exists: true, threads: A },
+        { workspace: "/b", exists: true, threads: B },
+      ],
+      [],
+      null,
+    );
+    const raw = JSON.parse(s.map.get(THREAD_LIST_CACHE_KEY)!);
+    const byWs = (ws: string) =>
+      (raw.groups.find((g: WorkspaceGroup) => g.workspace === ws)?.threads ?? []).length;
+    expect(byWs("/a")).toBe(600);   // 新的全留
+    expect(byWs("/b")).toBe(400);   // 老的只留 400
+  });
 });

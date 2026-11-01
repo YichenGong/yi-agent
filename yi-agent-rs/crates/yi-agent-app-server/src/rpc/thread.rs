@@ -565,6 +565,33 @@ pub(crate) async fn handle(
             // 会让新 driver 永远收不到（旧 sender 的接收端已随旧 driver 退出）。
             let (subagent_tx, subagent_rx) =
                 tokio::sync::watch::channel(crate::protocol::SubagentTotals::default());
+            // 成为该 thread 的 writer 前必须拿到跨进程锁。拿不到就直接报错，
+            // 不建半个 session——半建状态会让后续 resume 看到不一致的运行时。
+            //
+            // 取锁点放在这里（即将 insert 进 threads 表）而不是更早：在此之前的
+            // 所有步骤（load、build_agent、attach_delegation）都只是**读**，
+            // 不构成双写。放在这里也保证失败时没有留下任何注册项。
+            // 只有 `Busy` 才拒绝：另一个 writer 真的在写它。
+            // `Io`（锁文件建不出来）不阻断——锁是防双写的附加保护，不是会话
+            // 能否打开的充要条件；此时退化为「无锁」并记一行，与加锁前行为一致。
+            let writer_lock =
+                match crate::thread_store::acquire_thread_lock(thread_store.root(), &thread_id) {
+                    Ok(lock) => Some(lock),
+                    Err(crate::thread_store::ThreadLockError::Busy(busy)) => {
+                        write_response(
+                            state.hub,
+                            state.client,
+                            err_response(id, RpcError::internal(busy.to_string())),
+                        )
+                        .await?;
+                        return Ok(Flow::Continue);
+                    }
+                    Err(e @ crate::thread_store::ThreadLockError::Io(_)) => {
+                        tracing::warn!(%e, thread_id = %thread_id, "会话写锁不可用，退化为无锁");
+                        None
+                    }
+                };
+
             state.threads.insert(
                 thread_id.clone(),
                 ThreadSession {
@@ -581,6 +608,7 @@ pub(crate) async fn handle(
                     store: Arc::clone(&thread_store),
                     status: Arc::clone(&store_status),
                     subagent_tx,
+                    writer_lock,
                 },
             );
 

@@ -148,6 +148,25 @@
   .field input.modified, .field select.modified {
     border-color: var(--warning);
   }
+  .field .reset-btn {
+    margin-top: 0.4rem;
+    padding: 0.25rem 0.7rem;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .field .reset-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .field .reset-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
   .actions {
     position: sticky;
     bottom: 0;
@@ -250,7 +269,15 @@
   let allVars = [];
   let originalValues = {};
   let currentValues = {};
-  let activeTab = 'Agent';
+  // null 表示「还没加载到数据」。绝不能写死一个分组名——那正是本次故障的根因
+  // （写死的 'Agent' 与后端的小写 'agent' 永远不相等，页面渲染出 0 个字段）。
+  let activeTab = null;
+  // 分组顺序跟随后端 FIELDS 的出现顺序，不在前端另排。
+  let groupNames = [];
+  // 显示名映射。缺映射时回退成原始 name（见 groupLabel），
+  // 这样后端新增分组不会被前端吞掉。
+  const GROUP_LABELS = { agent: 'Agent', compact: '压缩', startup: '启动' };
+  const groupLabel = (name) => GROUP_LABELS[name] ?? name;
 
   function sourceLabel(source) {
     if (source === 'local') return '<span class="source-label source-local">本地</span>';
@@ -273,6 +300,13 @@
       }
     }
 
+    // 分组顺序由后端决定。activeTab 只在「当前选中的组已不存在」时才重置，
+    // 避免每次保存后跳回第一个 tab。
+    groupNames = data.groups.map((g) => g.name);
+    if (!groupNames.includes(activeTab)) {
+      activeTab = groupNames[0] ?? null;
+    }
+
     renderSidebar();
     renderMain();
     updateSaveButton();
@@ -281,11 +315,12 @@
   function renderSidebar() {
     const sidebar = document.getElementById('sidebar');
     sidebar.innerHTML = '';
-    const tabs = ['Agent', 'Tools'];
-    for (const tab of tabs) {
+    for (const tab of groupNames) {
       const btn = document.createElement('button');
       btn.className = 'tab' + (tab === activeTab ? ' active' : '');
-      btn.textContent = tab;
+      // 显示中文名，但 activeTab 里存的必须是原始 name（agent），
+      // 否则下面的 v.group === tabName 匹配不上。
+      btn.textContent = groupLabel(tab);
       btn.addEventListener('click', () => {
         activeTab = tab;
         renderSidebar();
@@ -299,13 +334,21 @@
     const main = document.getElementById('main');
     main.innerHTML = '';
 
+    if (activeTab === null) {
+      const empty = document.createElement('p');
+      empty.className = 'desc';
+      empty.textContent = '没有可配置项。';
+      main.appendChild(empty);
+      return;
+    }
+
     renderFlatTab(main, activeTab);
   }
 
   function renderFlatTab(main, tabName) {
     const groupEl = document.createElement('div');
     groupEl.className = 'group';
-    groupEl.innerHTML = `<h2>${tabName}</h2>`;
+    groupEl.innerHTML = `<h2>${groupLabel(tabName)}</h2>`;
 
     for (const v of allVars) {
       if (v.group === tabName) {
@@ -321,24 +364,45 @@
     field.className = 'field';
 
     const label = document.createElement('label');
-    label.innerHTML = `${v.key} <span class="desc">${v.description}</span> ${sourceLabel(v.source)}`;
+    const labelText = document.createElement('span');
+    labelText.textContent = v.label || v.key;
+    labelText.title = v.key; // 悬停可看到机器键名，便于对照文档
+    const desc = document.createElement('span');
+    desc.className = 'desc';
+    desc.textContent = v.description;
+    label.append(labelText, desc);
+    label.insertAdjacentHTML('beforeend', sourceLabel(v.source));
 
     let inputEl;
     const currentValue = currentValues[v.key] !== undefined ? currentValues[v.key] : v.value;
     if (v.type === 'select') {
       inputEl = document.createElement('select');
+      // 显式空选项：未设置时浏览器否则会自动选第一项（read-only），
+      // 而运行时默认其实是 workspace-write，用户会以为默认是只读。
+      const blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = `未设置（默认 ${v.default || '—'}）`;
+      // 显式指定，不依赖浏览器「没有 selected 就选第一个」的隐式行为
+      blank.selected = currentValue === null || currentValue === undefined;
+      inputEl.appendChild(blank);
       for (const opt of v.options) {
         const o = document.createElement('option');
         o.value = opt;
         o.textContent = opt;
-        if (opt === currentValue) o.selected = true;
+        if (opt === (currentValue ?? '')) o.selected = true;
         inputEl.appendChild(o);
       }
     } else {
       inputEl = document.createElement('input');
       inputEl.type = v.type === 'number' ? 'number' : 'text';
-      inputEl.value = currentValue;
+      inputEl.value = currentValue === null ? '' : currentValue;
       inputEl.placeholder = v.default || '(none)';
+      // 后端给了 min/max 就套上去。JSON null 在 JS 里是 null，
+      // 用 != null 同时排除 null 与 undefined（否则会写成属性 "null"）。
+      if (v.type === 'number') {
+        if (v.min != null) inputEl.min = v.min;
+        if (v.max != null) inputEl.max = v.max;
+      }
     }
 
     inputEl.dataset.key = v.key;
@@ -346,6 +410,26 @@
     inputEl.addEventListener('input', onFieldChange);
     inputEl.addEventListener('change', onFieldChange);
     field.appendChild(inputEl);
+
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.className = 'reset-btn';
+    reset.textContent = '恢复默认';
+    // 已经是「未设置」时没有可恢复的东西。
+    reset.disabled = currentValues[v.key] === null;
+    reset.addEventListener('click', () => {
+      // 置 null 即可：save() 用 currentValues !== originalValues 做差异检测，
+      // null 与任何字符串都不等，会自动收进 updates 并发成 JSON null。
+      // 不需要额外的「待删除集合」。
+      currentValues[v.key] = null;
+      inputEl.value = '';
+      reset.disabled = true;
+      updateSaveButton();
+    });
+    inputEl.addEventListener('change', () => {
+      reset.disabled = currentValues[v.key] === null;
+    });
+    field.appendChild(reset);
 
     field.insertBefore(label, field.firstChild);
     container.appendChild(field);

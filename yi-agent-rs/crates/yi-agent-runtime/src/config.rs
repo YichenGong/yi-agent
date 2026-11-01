@@ -121,6 +121,12 @@ pub struct RuntimeConfig {
     /// 本次配置是否来自「整包注入」（CLI flag 或真实进程环境变量）。
     /// 为真时它压过清单的 `default_model`（会话覆盖仍在其上）。
     pub model_injected: bool,
+    /// 是否发送终端通知（`tui.notifications`，默认 true）。
+    pub notifications: bool,
+    /// `auto` / `osc9` / `bel`（`tui.notification_method`，默认 `auto`）。
+    pub notification_method: String,
+    /// `unfocused` / `always`（`tui.notification_condition`，默认 `unfocused`）。
+    pub notification_condition: String,
 }
 
 /// 来自 CLI flag 或 GUI 请求的纯数据覆盖项。不依赖 clap。
@@ -408,6 +414,20 @@ impl RuntimeConfig {
             .or(settings.agent.skills_catalog_budget)
             .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
 
+        // 存储侧是字符串（见 settings.rs 的 TuiSettings 说明），这里解析成
+        // bool；空串与非法值已在 `normalized` 里清成 None，故只需处理默认。
+        let notifications = !matches!(settings.tui.notifications.as_deref(), Some("false"));
+        let notification_method = settings
+            .tui
+            .notification_method
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        let notification_condition = settings
+            .tui
+            .notification_condition
+            .clone()
+            .unwrap_or_else(|| "unfocused".to_string());
+
         Ok(RuntimeConfig {
             provider,
             api_url,
@@ -432,6 +452,9 @@ impl RuntimeConfig {
             skills_catalog_budget,
             skills_catalog_budget_explicit,
             model_injected,
+            notifications,
+            notification_method,
+            notification_condition,
         })
     }
 
@@ -504,6 +527,9 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: false,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
     }
 }
 
@@ -658,6 +684,9 @@ mod tests {
     #[test]
     fn settings_metadata_defaults_track_these_constants() {
         use crate::settings::find_spec;
+        use crate::settings::{
+            POWER_IDLE_GRACE_MINUTES_DEFAULT, POWER_REMOTE_TOUCH_MINUTES_DEFAULT,
+        };
         let cases: &[(&str, String)] = &[
             ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
             (
@@ -680,6 +709,14 @@ mod tests {
             (
                 "compact.tool_budget_tokens",
                 COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "power.idle_grace_minutes",
+                POWER_IDLE_GRACE_MINUTES_DEFAULT.to_string(),
+            ),
+            (
+                "power.remote_touch_minutes",
+                POWER_REMOTE_TOUCH_MINUTES_DEFAULT.to_string(),
             ),
         ];
         for (key, expected) in cases {
@@ -710,6 +747,49 @@ mod tests {
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("settings.json"), json).unwrap();
         }
+    }
+
+    #[test]
+    fn tui_notification_settings_reach_runtime_config() {
+        // 端到端钉子：写进 settings.json 的三个值必须真的出现在 RuntimeConfig
+        // 上。缺了这条，字段名写错（比如 `tui.notification`）在编译期毫无反应，
+        // 用户改了配置却永远拿默认值。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(
+            r#"{"tui":{"notifications":"false","notification_method":"bel","notification_condition":"always"}}"#,
+        );
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!cfg.notifications);
+        assert_eq!(cfg.notification_method, "bel");
+        assert_eq!(cfg.notification_condition, "always");
+    }
+
+    #[test]
+    fn tui_notification_defaults_apply_when_absent() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(cfg.notifications, "通知默认开启");
+        assert_eq!(cfg.notification_method, "auto");
+        assert_eq!(cfg.notification_condition, "unfocused");
     }
 
     #[test]

@@ -149,3 +149,13 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
   **顺带修掉的主循环解析**：`thread/diff/read` 取锚点原用 `store.load()`（解析整份对话 jsonl），改 `read_meta`；`thread/delete` 只取 meta 三个字段却也走 `load()`，同样改 `read_meta`（meta 缺失时 `rebuild_meta` 对 `driver_ref` / `driver_project` 都填 `None`，与 `read_meta` 返回 `None` 落到同一分支，语义不变）。
 
   代码：`yi-agent-rs/crates/yi-agent-app-server/src/git_diff.rs`（`GIT_OK_TIMEOUT` / `GIT_POLL_INTERVAL` / `GIT_TIMED_OUT` / `run_git_bounded` / `MAX_UNTRACKED_FILE_BYTES` / `read_untracked_capped`）、`src/rpc/thread.rs`（`thread/diff/read` 与 `thread/view/read` 的 spawn 化、`read_meta` 取锚点）、`src/rpc/image.rs`（按区间读）、`src/git_diff_tool.rs`（超时回报模型）、`Cargo.toml`（`tempfile` 由 dev 依赖升为普通依赖，`Cargo.lock` 无变化）。验证：`cargo test -p yi-agent-app-server --lib`（1066 passed / 4 ignored，较修复前 1054 增 12 例）、`cargo test -p yi-agent-app-server --lib diff_read_does_not_block_the_main_loop`、`cargo test -p yi-agent-app-server --lib view_read_refresh_does_not_block_the_main_loop`、`cargo test -p yi-agent-app-server --lib read_untracked_capped_refuses_a_non_regular_file`（该用例用 `/dev/null` 承重：删掉 `!is_file()` 闸即变红，用目录则仍绿——目录是靠随后的 `read` 以 `EISDIR` 失败的，没有回归价值）、`cargo test -p yi-agent-app-server --lib image_read`、`cd desktop && npm test`（135 文件 / 1778 例，桌面端零改动）。已知遗留：`thread/view/read` 的 CAS 回写可能把刷新期间被删的帧写回（与 diff 泵的无条件插入同源，用每 thread 的墓碑 / 世代号可一并关掉）；一次 `thread_diff` 串行发 5~6 次 `git_ok`，各自 5s 预算，挂住的仓库最坏要等约 30s 才报错。 — [设计](../superpowers/specs/2026-10-29-app-server-diff-blocking-and-leaks-design.md)、[计划](../superpowers/plans/2026-10-29-app-server-diff-blocking-and-leaks.md)
+- [x] 干活期间防止空闲休眠：主循环每 10s 采 `busy`（本进程会话 / 项目 daemon /
+      远端 5 分钟内交互）与电源、网络，喂给 `yi-agent-power` 的 supervisor。
+      只有本进程持有断言，desktop 不持有。接线点：`server.rs` 的
+      `POWER_TICK` / `power_ticker` 分支 / 入站帧刷新 `last_remote_touch` /
+      `serve()` 末尾 `drop(power_guard)`；整条探测在 `power_guard.rs` 的独立
+      线程里（含 `route` 子进程与 2s TCP 超时，不能进主循环）。验证：
+      `pmset -g assertions | grep -A2 yi-agent`（应只见
+      `PreventUserIdleSystemSleep named: "yi-agent: keeping the machine awake for work"`）、
+      `cargo test -p yi-agent-app-server power_busy`、
+      `cargo test -p yi-agent-app-server probing_busy_does_not_prevent_runtime_eviction`。

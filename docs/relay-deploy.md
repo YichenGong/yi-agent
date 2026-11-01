@@ -374,7 +374,7 @@ npx tauri ios init      # 生成/刷新 iOS 工程。注意：按 project.yml �
 ```bash
 cd desktop
 export PATH="/opt/homebrew/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-npx tauri ios build --ci --export-method debugging
+npm run ios:build -- --ci --export-method debugging
 # 产物：
 #   desktop/src-tauri/gen/apple/build/arm64/yi-agent.ipa                （可分发的 ipa）
 #   desktop/src-tauri/gen/apple/build/desktop_iOS.xcarchive/Products/
@@ -383,6 +383,19 @@ npx tauri ios build --ci --export-method debugging
 
 `--export-method debugging` 产出 development 签名、可装到已注册真机
 （`app-store-connect` / `release-testing` 分别对应 App Store / TestFlight）；`--ci` 免交互。
+
+> **必须走 `npm run ios:build`，不要直接调 `npx tauri ios build`。**
+> 前者会先跑 `desktop/scripts/sync-ios-version.sh`，把 `yi-agent-rs/Cargo.toml`
+> 的 workspace 版本写进 `tauri.conf.json`、`project.yml` 与 `Info.plist`。
+> 漏掉这一步，装到手机上的包自报的是模板默认值 `0.1.0`，与主线版本无关——
+> 手机「设置 → 通用 → 关于本机」里看到的版本号就是这个值，用户无从判断该不该升级。
+> `--` 之后的参数会原样透传给 `tauri ios build`。
+>
+> 版本对不对，构建前后都可以单独核对：
+>
+> ```bash
+> bash desktop/scripts/sync-ios-version.sh --check   # 一致 exit 0，漂移 exit 1 并逐处列出
+> ```
 
 **安装**
 
@@ -430,6 +443,16 @@ xcrun devicectl device install app \
    system/com.apple.CoreDevice.remotepairingd` 重启即可；② 手机**息屏会停掉 Wi-Fi
    常连接**（`ping` 全丢包、mDNS 仍能解析出旧 IP），安装窗口只有亮屏那几十秒，
    建议保持解锁亮屏再执行。
+7. **跑完 `tauri ios init` 必须重跑版本同步**（2026-11-01 实测）—— init 会按
+   `project.yml` 重生成 `desktop.xcodeproj` 与 `desktop_iOS/Info.plist`，期间：
+   ① `project.yml` 里写着的版本会被原样带回去，若此前没跑过
+   `desktop/scripts/sync-ios-version.sh`，版本就退回模板默认的 `0.1.0`；
+   ② `Info.plist` 里由 `src-tauri/Info.ios.plist` 在**构建期**合并进来的
+   `NSCameraUsageDescription` 会消失（init 不看那个文件）。前者由
+   `bash desktop/scripts/sync-ios-version.sh --check` 当场抓住，重跑一次同步即可；
+   后者在 `tauri ios build` 时会由 Tauri 重新合并，不影响产物。
+   顺带一条：`tauri ios init -c '{"version":"..."}'` 的 `-c` **不会**改 iOS 版本
+   （实测 `project.yml` 一行未变），别指望用 config 绕开同步脚本。
 
 ### 4.3 App 如何选择远端传输
 

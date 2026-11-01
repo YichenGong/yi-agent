@@ -65,6 +65,7 @@ import {
   type TagId,
 } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
+import { ConnectionError, clearConnectionErrorFrom } from "./lib/connectionError";
 import { formatError } from "./lib/errorMessage";
 import {
   ATTACHMENT_EXTENSIONS,
@@ -107,17 +108,18 @@ import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
+import { resetCacheScope } from "./lib/cacheScope";
 import {
+  contentFingerprintOf,
   createContentStore,
+  normalizeForCache,
   persistContent,
   type AsyncContentStore,
   type ContentEntry,
+  type PersistOptions,
+  type PersistOutcome,
 } from "./lib/contentStore";
-import {
-  parseSyncPlan,
-  resolveSyncPlan,
-  type SyncAction,
-} from "./lib/syncPlan";
+import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { notifyModelCapabilitiesChanged } from "./lib/modelCapabilitiesBus";
@@ -316,6 +318,14 @@ export default function App() {
   const cachedAt = useRef(new Map<string, number>());
   /** 每个会话的缓存元数据（epoch / 游标 / 是否被裁剪），用于组装 hints 与裁决。 */
   const cacheMetaRef = useRef(new Map<string, ContentEntry>());
+  /**
+   * 「盘上是什么」的内存镜像：threadId → 内容指纹。
+   *
+   * 与 `cacheMetaRef`（盘上条目的元数据，供 hints 用）职责不同，不要合并。
+   * **只能在写成功之后更新**：先记指纹再写，一次 IndexedDB 失败就会把该会话
+   * 永久标记为「已落盘」，此后 flushAll 都判「没变」而不再重试——静默永久丢缓存。
+   */
+  const persistedFp = useRef(new Map<string, string>());
   /** 本连接的 syncPlan（`initialize` 的响应），按 threadId 索引。 */
   const syncPlanRef = useRef(
     new Map<string, { action: SyncAction; epoch: number }>(),
@@ -379,7 +389,17 @@ export default function App() {
       try {
         for (const id of await cs.keys()) {
           const entry = await cs.read(id);
-          if (entry) cacheMetaRef.current.set(entry.threadId, entry);
+          if (entry) {
+            cacheMetaRef.current.set(entry.threadId, entry);
+            // 用盘上条目反算指纹，而不是留空。留空的话冷启后第一次 flushAll
+            // 会把每个有缓存的会话都重写一遍、savedAt 全部抬到当下，又一次
+            // 抹平 LRU。entry.items 已是归一化后的写入结果，与写入时记下的
+            // 指纹天然同源。
+            persistedFp.current.set(
+              entry.threadId,
+              contentFingerprintOf(entry.items, entry.lastServerItemId, entry.contentEpoch),
+            );
+          }
         }
       } catch {
         /* hints 是优化：读失败就按"没有缓存"声明 */
@@ -417,21 +437,44 @@ export default function App() {
     }, CONTENT_PERSIST_DEBOUNCE_MS);
     timers.set(id, timer);
   };
-  /** 立即落盘某会话（切走 / 页面隐藏 / 卸载时用）。 */
-  const flushContent = (id: string) => {
-    if (!isRemoteClient()) return Promise.resolve();
+  /**
+   * 落盘一条会话，并维护 `persistedFp`。
+   *
+   * 返回「动了盘上什么」，而不是 boolean：`written` 与 `deleted` 都算「没失败」，
+   * 但 `persistedFp` 要做相反的操作（set / delete）。`skipped` 表示盘上没动过。
+   * 抛错或前置条件不满足 → 返回 null，表示什么都没记，下次自然重试。
+   */
+  const flushContent = async (
+    id: string,
+    options?: PersistOptions,
+  ): Promise<PersistOutcome | null> => {
+    if (!isRemoteClient()) return null;       // 桌面端：本就没有缓存
     const v = store.peek(id);
-    if (!v) return Promise.resolve();
-    return persistContent(getContentStore(), id, v.session).catch(() => {
-      // 缓存写失败不影响任何用户可见行为。
-    });
+    if (!v) return null;                      // 会话已不存在（如刚被 drop）
+    try {
+      const outcome = await persistContent(getContentStore(), id, v.session, options);
+      // 只有 persistContent 成功返回才更新「盘上是什么」；顺序不可颠倒。
+      if (outcome.action === "deleted") {
+        persistedFp.current.delete(id);
+      } else if (outcome.action === "written") {
+        persistedFp.current.set(id, outcome.fingerprint);
+        // LRU 被淘汰的会话已从盘上消失，指纹必须跟着删。留着的话，`flushAll`
+        // 会判「它与盘上一致、没变过」而跳过，它再也写不回来。
+        for (const gone of outcome.evicted) persistedFp.current.delete(gone);
+      }
+      // skipped：盘上没动过，persistedFp 保持原值。
+      return outcome;
+    } catch {
+      return null;                            // 写失败：不抛给调用方，也不记指纹
+    }
   };
   /** 删除某会话的内容缓存（仅手机端）。桌面端不构造内容缓存，故此处也必须门控。 */
   const deleteCachedContent = (id: string) => {
     if (!isRemoteClient()) return;
-    void getContentStore()
-      .delete(id)
-      .catch(() => {});
+    cacheMetaRef.current.delete(id);
+    cachedAt.current.delete(id);
+    persistedFp.current.delete(id);      // 新增：否则指纹会永久偏旧
+    void getContentStore().delete(id).catch(() => {});
   };
 
   /** Write an error onto the current thread's session (if any). */
@@ -439,6 +482,20 @@ export default function App() {
     const s = store.current()?.session;
     if (s) s.lastError = msg;
   };
+
+  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
+  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
+  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
+  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
+  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
+  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
+  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
+  //
+  // **必须排在 `sess` 之前**：`useSessionState` 要拿 `prefs.pairingVersion` 判断
+  // 「服务端换了没有」，写在后面会踩 TDZ。反过来 `useSettingsState` 只依赖
+  // `rpc`/`force`/`setCurrentError`，三者此刻都已可用，不依赖 `sess`/`proc`/
+  // `diff`/`board`——两者没有循环，只是原先的书写顺序恰好相反。
+  const prefs = useSettingsState({ rpc, force, setCurrentError });
 
   // 会话关注点（当前会话 id/会话列表与置顶/最近目录/侧栏抽屉/详情栈与右侧
   // 详情栏开合，连同它们的 ref 影子与读取器）整体搬进 hook，见
@@ -454,6 +511,7 @@ export default function App() {
     setCurrentError,
     railStore,
     initialListCache,
+    pairingVersion: prefs.pairingVersion,
   });
   // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
   // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
@@ -479,15 +537,6 @@ export default function App() {
     kanbanEnabled: kanbanEnabled === true,
   });
 
-  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
-  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
-  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
-  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
-  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
-  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
-  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
-  const prefs = useSettingsState({ rpc, force, setCurrentError });
-
   /**
    * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
    * 空依赖即可。若每次渲染都换新函数身份，插件面板的加载 effect 会跟着重跑，
@@ -496,7 +545,7 @@ export default function App() {
   const pluginCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -510,7 +559,7 @@ export default function App() {
   const modelCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -524,7 +573,7 @@ export default function App() {
   const skillsCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -538,7 +587,7 @@ export default function App() {
   const mcpCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -552,7 +601,7 @@ export default function App() {
   const websearchCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -565,7 +614,7 @@ export default function App() {
   const runtimeSettingsCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -586,7 +635,7 @@ export default function App() {
   const flagsCall = useCallback(
     (method: string, params?: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       const pending = c.request(method, params ?? {});
       if (method !== "flags/set") return pending;
       const written = (params ?? {}) as { name?: unknown; enabled?: unknown };
@@ -629,7 +678,7 @@ export default function App() {
   const imageCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
+      if (!c) return Promise.reject(new ConnectionError("disconnected", "not connected"));
       return c.request(method, params);
     },
     [],
@@ -750,7 +799,24 @@ export default function App() {
       for (const id of persistTimers.current.keys()) {
         window.clearTimeout(persistTimers.current.get(id));
       }
-      const ids = new Set([...persistTimers.current.keys(), ...store.ids()]);
+      // 候选 = 脏集 ∪ 指纹变化的会话。
+      //
+      // 不能只刷脏集：内容进入会话有三条路径，只有 schedulePersist 会注册防抖。
+      // thread/readItems 的两个分支直接 upsertItems，prefillFromCache 同理——
+      // 只看 persistTimers 会让这些会话丢掉首次落盘机会。
+      //
+      // 也不能用「有没有内容」当判据：它不区分「内容变了」与「内容一直在」，
+      // 每次切后台都会把所有有内容的会话重写一遍、savedAt 一起抬到当下，
+      // 写序被抹平成迭代顺序，LRU 仍然失效。
+      const dirty = persistTimers.current.keys();
+      const changed = store.ids().filter((id) => {
+        const sess0 = store.peek(id)?.session;
+        if (!sess0) return false;
+        const { items } = normalizeForCache(sess0);
+        const fp = contentFingerprintOf(items, sess0.lastServerItemId, sess0.contentEpoch);
+        return fp !== persistedFp.current.get(id);
+      });
+      const ids = new Set([...dirty, ...changed]);
       persistTimers.current.clear();
       for (const id of ids) void flushContent(id);
     };
@@ -866,6 +932,8 @@ export default function App() {
           cacheMetaRef.current.delete(id);
           void getContentStore().delete(id);
           cachedAt.current.delete(id);
+          persistedFp.current.delete(id);   // store.peek 已为 undefined，
+                                            // flushContent 会提前返回，不会自己清
           if (sess.currentIdRef.current === id) {
             const first =
               sess.pinned[0] ?? sess.groups.flatMap((g) => g.threads)[0];
@@ -1034,8 +1102,11 @@ export default function App() {
       // 而后者的代价是把刚预填的缓存整段抹掉——spec §5 的三段式第一步（先显示
       // 缓存）就此消失。生产 ws 路径上全量回放必然携带帧(thread/started +
       // items/completed),所以这一守卫只在「无帧可对账」时跳过,不影响幽灵项清理。
-      if (replayed !== null && replayed.size > 0)
-        replaySession.dropStale(replayed);
+      // 只有在真的收到过回放帧并做过 dropStale 时才「权威」：replayed 为空意味着
+      // 这趟 resume 压根没投递帧，此时 items 仍可能是刚预填的缓存内容，
+      // 不能据此判定「服务端确认无内容」而删盘上条目。
+      const authoritative = replayed !== null && replayed.size > 0;
+      if (authoritative) replaySession.dropStale(replayed);
       // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
       // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
       const view = store.peek(id);
@@ -1044,7 +1115,9 @@ export default function App() {
       // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
       view.syncState = "synced";
       cachedAt.current.delete(id);
-      void flushContent(id);
+      // 不要挪进 `if (authoritative)`：false 时仍然要落盘（那是预填内容），
+      // 只是不授权删除。
+      void flushContent(id, { authoritative });
       // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
       const fromResponse = permissionModeFromResponse(resumed);
@@ -2037,6 +2110,14 @@ export default function App() {
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
         setStatus("connected");
+        // 上一条「连接已断开」现在过期了：自动重连常常几秒就成功，留着那条红条
+        // 会让人以为问题还在、还在等。只收连接类文案——服务端拒绝、参数错误那类
+        // 与连接无关，仍要让人看见。
+        let cleared = false;
+        for (const id of store.ids()) {
+          if (clearConnectionErrorFrom(store.view(id).session)) cleared = true;
+        }
+        if (cleared) force((v) => v + 1);
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
         prefs.repairDismissedRef.current = false;
@@ -2724,7 +2805,13 @@ export default function App() {
         // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
         // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
         // transportFactory 选中的是 ws。
-        onPaired={() => prefs.setPairingVersion((v) => v + 1)}
+        onPaired={() => {
+          void resetCacheScope().catch(() => {
+            /* 清理失败：scope 键保持旧值，下次启动会重试。
+               不能让配对本身失败——否则用户卡在配对界面连不上。 */
+          });
+          prefs.setPairingVersion((v) => v + 1);
+        }}
         redeem={defaultRedeem}
       />
     );
@@ -2753,6 +2840,24 @@ export default function App() {
           // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
           // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
           inited.current = false;
+          // 内存层的串数据必须一起清：resetCacheScope 只清存储，不清 store/warm。
+          //
+          // 不能写 `storeRef.current = new ThreadStore()`：`store` 是
+          // `storeRef.current` 的一次性快照，已经作为参数传给了 useSessionState /
+          // useProcessState，换 ref 不会让它们换实例——旧会话仍在 `sess`/`proc`
+          // 手里。必须就地清空同一个实例。
+          store.reset();
+          warm.current.clear();
+          inFlightResume.current.clear();
+          cacheMetaRef.current.clear();
+          cachedAt.current.clear();
+          syncPlanRef.current.clear();
+          persistTimers.current.clear();
+          toppedUp.current.clear();
+          persistedFp.current.clear();
+          // SubscriptionWindow 没有 clear()，整体换新（与该重连路径保持一致）。
+          subWindow.current = new SubscriptionWindow();
+          void resetCacheScope().catch(() => {});
           prefs.setRepairing(false);
           prefs.setRepairNotice(null);
           prefs.setPairingVersion((v) => v + 1);

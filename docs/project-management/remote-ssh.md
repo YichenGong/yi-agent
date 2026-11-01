@@ -67,7 +67,7 @@ dev 构建里验证充分。
 
 ## 已知限制
 
-- 远端那台机器必须能访问 `relay.yi-agent.top`（若启用手机侧）。
+- 远端那台机器必须能访问中继域名（见 `deploy/relay/.relay-local.md`）（若启用手机侧）。
 - 远端需自行配置模型 key；未配置时 `thread/start` 返回
   `-32027 model_not_configured`，属预期而非缺陷。
 - 不做会话恢复：远端断线即重启进程，状态不保留。

@@ -506,6 +506,9 @@ fn field_is_set(settings: &crate::settings::Settings, key: &str) -> bool {
         "compact.user_budget_tokens" => settings.compact.user_budget_tokens.is_some(),
         "compact.tool_budget_tokens" => settings.compact.tool_budget_tokens.is_some(),
         "startup.sandbox" => settings.startup.sandbox.is_some(),
+        "tui.notifications" => settings.tui.notifications.is_some(),
+        "tui.notification_method" => settings.tui.notification_method.is_some(),
+        "tui.notification_condition" => settings.tui.notification_condition.is_some(),
         _ => false,
     }
 }

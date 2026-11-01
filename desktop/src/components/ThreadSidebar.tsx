@@ -18,7 +18,7 @@ import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/si
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
-import { formatRelativeTime } from "../lib/relativeTime";
+import { formatRelativeTime, RELATIVE_TIME_UNKNOWN } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
 import { Popover } from "../ui/Popover";
 import { findLeadThread } from "../lib/leadThread";
@@ -33,6 +33,19 @@ function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
   if (status === "interrupted") return "bg-fg-muted";
   return "bg-blue-400";
+}
+
+/**
+ * 侧栏行下方那行紧凑时间。
+ *
+ * 时间未知时留空而不是写出「未知」：这一列只有几个字符宽，右侧紧贴未读点，
+ * 一行字会把标题挤窄；而会话本身仍然可用，缺一个时间戳不需要额外解释。
+ * 关键是不能编造数字——0 会被 `formatRelativeTime` 判为未知，旧实现则算出
+ * 20758d（用户报的「20xxxd」）。
+ */
+function sidebarAge(updatedAt: number): string {
+  const label = formatRelativeTime(updatedAt);
+  return label === RELATIVE_TIME_UNKNOWN ? "" : label;
 }
 
 /**
@@ -1144,7 +1157,7 @@ export function ThreadSidebar({
                   {t.title ?? "(untitled)"}
                 </div>
               </div>
-              <div className="text-xs text-fg-faint">{formatRelativeTime(t.updated_at)}</div>
+              <div className="text-xs text-fg-faint">{sidebarAge(t.updated_at)}</div>
             </div>
             {un && !active && (
               <span
@@ -1437,7 +1450,7 @@ export function ThreadSidebar({
               {t.title ?? "(untitled)"}
             </div>
           </div>
-          <div className="text-xs text-fg-faint">{formatRelativeTime(t.updated_at)}</div>
+          <div className="text-xs text-fg-faint">{sidebarAge(t.updated_at)}</div>
         </div>
         {un && !active && (
           <span

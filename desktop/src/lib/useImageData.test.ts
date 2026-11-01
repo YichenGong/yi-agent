@@ -135,8 +135,10 @@ describe("useImageData", () => {
   });
 
   it("surfaces a read failure as an error", async () => {
+    // 用中性业务码：-32000 是中继「电脑未连接」的专用码，会被翻成那句连接提示
+    // （见 `connectionError.ts`），不适合当「随便一个失败」的夹具。
     const call = vi.fn(async () => {
-      throw { code: -32000, message: "no such image" };
+      throw { code: -32603, message: "no such image" };
     });
     const { result } = renderHook(() =>
       mod.useImageData(PATH, { threadId: "t1", call }),

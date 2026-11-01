@@ -77,6 +77,8 @@ pub struct Settings {
     pub agent: AgentSettings,
     pub compact: CompactSettings,
     pub startup: StartupSettings,
+    pub tui: TuiSettings,
+    pub power: PowerSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +117,46 @@ pub struct StartupSettings {
     pub sandbox: Option<String>,
 }
 
+/// 终端 TUI 的行为设置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiSettings {
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// **为什么是字符串而不是 `Option<bool>`**：`FIELDS` 的三种控件
+    /// （`Number`/`Text`/`Select`）里，`Text` 与 `Select` 都只接受 JSON
+    /// 字符串（`validate_value`）。用 `Option<bool>` 会导致设置页写进
+    /// `"true"` 后反序列化读不回来。存字符串与 `startup.sandbox` 完全同构，
+    /// 也让非法值能按字段 warn 回退。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notifications: Option<String>,
+    /// `auto` / `osc9` / `bel`；`None` = `auto`。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notification_method: Option<String>,
+    /// `unfocused` / `always`；`None` = `unfocused`。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub notification_condition: Option<String>,
+}
+
+/// 电源与休眠设置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerSettings {
+    /// `true` / `false`；`None` = 默认 `true`。
+    ///
+    /// 存字符串而不是 `Option<bool>`：`FIELDS` 的 `Select` 只接受 JSON
+    /// 字符串（`validate_value`），用 `Option<bool>` 会让设置页写进
+    /// `"true"` 后反序列化读不回来。与 `tui.notifications` 完全同构。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub prevent_idle_sleep: Option<String>,
+    /// 条件消失后再保活多久（分钟）。范围 1–120。
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub idle_grace_minutes: Option<u64>,
+    /// 最近一次远端交互在多长时间内仍算「有活」（分钟）。范围 1–60。
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub remote_touch_minutes: Option<u64>,
+}
+
 /// 表单控件类型。`Number` 与 `Text` 在 JSON 里都是标量，区别只在渲染与校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldType {
@@ -139,6 +181,53 @@ pub struct FieldSpec {
     pub options: &'static [&'static str],
     pub min: Option<u64>,
     pub max: Option<u64>,
+}
+
+/// 「条件消失后再保活多久」的默认值，单位分钟。
+///
+/// 与字段语义同单位（分钟），秒数换算只在取用窗口时做一次。
+/// 单位真实值 15 分钟 = `yi_agent_power::policy::DEFAULT_GRACE`，
+/// 但本 crate 不依赖 `yi-agent-power`（二者互不依赖），故此处独立定义，
+/// 由 `power_windows_minutes` 的测试与 `Policy` 的测试各自钉住。
+pub const POWER_IDLE_GRACE_MINUTES_DEFAULT: u64 = 15;
+
+/// 「远端交互有效窗口」的默认值，单位分钟。对应 300 秒。
+pub const POWER_REMOTE_TOUCH_MINUTES_DEFAULT: u64 = 5;
+
+/// 开关的点路径键。多处引用同一常量，避免字符串抄错。
+///
+/// **它从此只表示新键。** 迁移函数里的旧键必须写成字面量
+/// `"agent.prevent_idle_sleep"`，不能引用本常量——否则将来再改常量，
+/// 迁移就会跟着漂移、静默失效。
+pub const PREVENT_IDLE_SLEEP_KEY: &str = "power.prevent_idle_sleep";
+
+/// 开关是否打开。缺文件 / 空串 / 未知值一律按默认（开）处理，与
+/// `tui.notifications` 的兜底一致。
+pub fn prevent_idle_sleep_enabled(settings: &Settings) -> bool {
+    match settings.power.prevent_idle_sleep.as_deref() {
+        Some(value) => !value.eq_ignore_ascii_case("false"),
+        None => true,
+    }
+}
+
+/// 两个窗口的实际生效值（分钟），返回 `(grace, remote)`。
+///
+/// **只兜 `None`，不兜越界**——越界值由 `normalized()` 的 `clamp!` 先行清空，
+/// 调用方必须先取得经过 `normalized()` 的 `Settings`。`load_from` 的返回值
+/// 已经过；`write_to` 里要自己先调 `.normalized()`。
+///
+/// 不做 slack 推导，也不做单位换算：slack 是策略层概念，放在
+/// `power_guard::slack_for`；分钟到秒的换算由调用点乘 60。
+pub fn power_windows_minutes(settings: &Settings) -> (u64, u64) {
+    let grace = settings
+        .power
+        .idle_grace_minutes
+        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
+    let remote = settings
+        .power
+        .remote_touch_minutes
+        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    (grace, remote)
 }
 
 /// 可持久化的全部字段。`workdir` 与 `yolo` 不在其中，见 spec「存储」一节。
@@ -202,6 +291,39 @@ pub static FIELDS: &[FieldSpec] = &[
         max: Some(u32::MAX as u64),
     },
     FieldSpec {
+        key: PREVENT_IDLE_SLEEP_KEY,
+        group: "power",
+        label: "干活期间防止休眠",
+        field_type: FieldType::Select,
+        default_display: "true",
+        description: "有网且（插电 或 有活在跑）时阻止系统空闲休眠；条件消失后按「保活窗口」再等一段时间",
+        options: &["true", "false"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "power.idle_grace_minutes",
+        group: "power",
+        label: "条件消失后再保活多久（分钟）",
+        field_type: FieldType::Number,
+        default_display: "15",
+        description: "有网且（插电 或 有活在跑）的条件消失后，继续阻止休眠这么久；范围 1–120",
+        options: &[],
+        min: Some(1),
+        max: Some(120),
+    },
+    FieldSpec {
+        key: "power.remote_touch_minutes",
+        group: "power",
+        label: "远端交互有效窗口（分钟）",
+        field_type: FieldType::Number,
+        default_display: "5",
+        description: "手机等远端客户端最近一次请求在这么久之内，仍算作有活在跑；不得大于上面的保活窗口。范围 1–60",
+        options: &[],
+        min: Some(1),
+        max: Some(60),
+    },
+    FieldSpec {
         key: "compact.ratio",
         group: "compact",
         label: "压缩触发占比（%）",
@@ -242,6 +364,39 @@ pub static FIELDS: &[FieldSpec] = &[
         default_display: "workspace-write",
         description: "启动时的文件写入沙箱；空表示用默认档位",
         options: &["read-only", "workspace-write", "danger-full-access"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notifications",
+        group: "tui",
+        label: "终端通知",
+        field_type: FieldType::Select,
+        default_display: "true",
+        description: "回合完成或等待批准时发送终端通知；空表示用默认（开）",
+        options: &["true", "false"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notification_method",
+        group: "tui",
+        label: "通知协议",
+        field_type: FieldType::Select,
+        default_display: "auto",
+        description: "auto 按终端自动选择；osc9 带正文，bel 只响铃",
+        options: &["auto", "osc9", "bel"],
+        min: None,
+        max: None,
+    },
+    FieldSpec {
+        key: "tui.notification_condition",
+        group: "tui",
+        label: "通知触发条件",
+        field_type: FieldType::Select,
+        default_display: "unfocused",
+        description: "unfocused 只在窗口失焦时发；always 总是发",
+        options: &["unfocused", "always"],
         min: None,
         max: None,
     },
@@ -306,6 +461,67 @@ pub fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".yi-agent").join("settings.json"))
 }
 
+/// 把旧键 `agent.prevent_idle_sleep` 搬到 `power.prevent_idle_sleep`。
+///
+/// **必须做在 `serde_json::Value` 上，不能等反序列化之后。**
+/// `Settings` 上没有 `deny_unknown_fields`，`AgentSettings` 里删掉该字段后，
+/// serde 会静默忽略文件里的旧键——反序列化之后旧值**已经不存在**，无处可搬。
+///
+/// 三条约束：
+/// 1. 只在新键缺失时迁移，否则用户显式设的 `power` 值每次启动都被旧值覆盖；
+/// 2. 不落盘（只在内存里搬），避免擅自改用户文件；
+/// 3. 幂等——旧键被删掉，同一份 `Value` 上再跑是空操作。
+///
+/// 旧键字符串是**字面量**，不得引用 `PREVENT_IDLE_SLEEP_KEY`：那个常量
+/// 已经指向新键，将来再改值会让迁移跟着漂移、静默失效。
+fn migrate_legacy_keys(value: &mut serde_json::Value) {
+    const LEGACY_GROUP: &str = "agent";
+    const LEGACY_FIELD: &str = "prevent_idle_sleep";
+    const NEW_GROUP: &str = "power";
+
+    let existing = value
+        .get(LEGACY_GROUP)
+        .and_then(|group| group.get(LEGACY_FIELD))
+        .cloned();
+    let Some(legacy) = existing else {
+        return;
+    };
+
+    // 新键已存在就不动：用户显式设的值优先。
+    let already_set = value
+        .get(NEW_GROUP)
+        .and_then(|group| group.get(LEGACY_FIELD))
+        .is_some();
+    if already_set {
+        return;
+    }
+
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object
+        .entry(NEW_GROUP.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .expect("just inserted an object")
+        .insert(LEGACY_FIELD.to_string(), legacy);
+
+    // 删旧键；agent 变空壳则整组删掉，与 `write_to` 的空组清理同口径。
+    let agent_now_empty = match object
+        .get_mut(LEGACY_GROUP)
+        .and_then(|group| group.as_object_mut())
+    {
+        Some(group) => {
+            group.remove(LEGACY_FIELD);
+            group.is_empty()
+        }
+        None => false,
+    };
+    if agent_now_empty {
+        object.remove(LEGACY_GROUP);
+    }
+}
+
 /// 读 `settings.json`。缺失 / 不可读 / JSON 非法一律回全 `None`（用默认值）——
 /// 坏文件绝不阻断启动，与 `models.json` / `preferences.json` 同一约定。
 ///
@@ -324,7 +540,7 @@ pub fn load_from(path: &Path) -> Settings {
     };
     // 先确认顶层是对象。`serde_json::from_str::<Settings>` 对数组/标量会失败，
     // 那样整份回默认；这条路径单独提出只是为了让 warn 措辞准确。
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+    let mut value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(error = %error, path = %path.display(), "invalid settings.json; using defaults");
@@ -335,6 +551,10 @@ pub fn load_from(path: &Path) -> Settings {
         tracing::warn!(path = %path.display(), "settings.json is not a JSON object; using defaults");
         return Settings::default();
     }
+
+    // 旧键在反序列化之后就不存在了，必须在这里搬。
+    migrate_legacy_keys(&mut value);
+
     let settings = match serde_json::from_value::<Settings>(value) {
         Ok(settings) => settings,
         Err(error) => {
@@ -404,11 +624,58 @@ impl Settings {
             "compact.tool_budget_tokens",
             self.compact.tool_budget_tokens
         );
+        clamp!("power.idle_grace_minutes", self.power.idle_grace_minutes);
+        clamp!(
+            "power.remote_touch_minutes",
+            self.power.remote_touch_minutes
+        );
 
         // 枚举白名单：只认 `parse_sandbox_mode` 那份映射，不另写一遍。
         // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
         // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
         // 同 crate，`pub(crate)` 足够）。
+        if let Some(enabled) = self.tui.notifications.as_deref() {
+            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
+                tracing::warn!(
+                    value = enabled,
+                    "settings.json has an unknown tui.notifications; falling back to the default"
+                );
+                self.tui.notifications = None;
+            }
+        }
+        if let Some(method) = self.tui.notification_method.as_deref() {
+            if !matches!(
+                method.to_ascii_lowercase().as_str(),
+                "auto" | "osc9" | "bel"
+            ) {
+                tracing::warn!(
+                    value = method,
+                    "settings.json has an unknown tui.notification_method; falling back to the default"
+                );
+                self.tui.notification_method = None;
+            }
+        }
+        if let Some(condition) = self.tui.notification_condition.as_deref() {
+            if !matches!(
+                condition.to_ascii_lowercase().as_str(),
+                "unfocused" | "always"
+            ) {
+                tracing::warn!(
+                    value = condition,
+                    "settings.json has an unknown tui.notification_condition; falling back to the default"
+                );
+                self.tui.notification_condition = None;
+            }
+        }
+        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref() {
+            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
+                tracing::warn!(
+                    value = enabled,
+                    "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
+                );
+                self.power.prevent_idle_sleep = None;
+            }
+        }
         if let Some(sandbox) = self.startup.sandbox.as_deref() {
             if crate::config::parse_sandbox_mode(sandbox).is_none() {
                 tracing::warn!(
@@ -416,6 +683,24 @@ impl Settings {
                     "settings.json has an unknown startup.sandbox; falling back to the default"
                 );
                 self.startup.sandbox = None;
+            }
+        }
+
+        // 跨字段：远端窗口长于宽限会让「宽限」在电池场景下失去意义——
+        // 用户以为「没活 15 分钟就放睡」，实际因为远端窗口 30 分钟一直在扛。
+        // `clamp!` 管不到这个：两个值各自都在范围内，倒挂仍然成立。
+        if let (Some(remote), Some(grace)) = (
+            self.power.remote_touch_minutes,
+            self.power.idle_grace_minutes,
+        ) {
+            if remote > grace {
+                tracing::warn!(
+                    remote,
+                    grace,
+                    "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
+                );
+                self.power.remote_touch_minutes = None;
+                self.power.idle_grace_minutes = None;
             }
         }
         self
@@ -505,8 +790,60 @@ pub fn write_to(path: &Path, patch: &serde_json::Value) -> Result<(), SettingsEr
         apply_op(&mut object, spec.key, value);
     }
 
+    // 跨字段：远端窗口不得长于宽限窗口。`validate_value` 是逐字段无状态的，
+    // 做不了这个判断，只能在这里做。
+    //
+    // 必须基于**合并后的完整对象**：用户可能只 patch 一个键（例如只把宽限改小），
+    // 此时远端窗口的生效值来自文件里的旧值。
+    //
+    // 但**不能**在这里调 `normalized()`：它自带的倒挂回落会把倒挂值清成 None，
+    // 于是下面的比较永远为假、任何倒挂都不会被拒绝。改为对两个字段各自做
+    // 单字段钳制（`within` 按 FieldSpec.min/max 判界），越界即当默认。
+    let merged_value = serde_json::Value::Object(object.clone());
+    let merged = match serde_json::from_value::<Settings>(merged_value) {
+        Ok(settings) => settings,
+        Err(error) => {
+            // `write_to` 只校验过「顶层是对象」，内层可能是结构性的坏
+            // （比如 `"agent": 5`）。这与「文件存在却读不出来 → 拒绝覆盖」
+            // 的守卫同向：宁可不写，也不把坏文件当默认值覆盖掉。
+            return Err(SettingsError::Corrupt(format!(
+                "the merged settings would not deserialize: {error}"
+            )));
+        }
+    };
+
+    // 只钳制、不做倒挂回落——否则本次要检查的倒挂会先被清掉。
+    // 不复用 `power_windows_minutes`：它要一个完整的 `&Settings`，
+    // 而这里手上只有两个 Option。直接算等价。
+    let grace_minutes = merged
+        .power
+        .idle_grace_minutes
+        .filter(|&value| within("power.idle_grace_minutes", value))
+        .unwrap_or(POWER_IDLE_GRACE_MINUTES_DEFAULT);
+    let remote_minutes = merged
+        .power
+        .remote_touch_minutes
+        .filter(|&value| within("power.remote_touch_minutes", value))
+        .unwrap_or(POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+
+    // 只在本次 patch 触碰了这两个键时才拒绝。否则文件里既有的倒挂会让用户
+    // 连改 `agent.max_turns` 都失败——那是把人锁在文件外面。文件里的既有
+    // 倒挂由加载侧的 `normalized()` 静默回落并 warn，不影响写入。
+    let touches_power_windows = patch.contains_key("power.idle_grace_minutes")
+        || patch.contains_key("power.remote_touch_minutes");
+    if touches_power_windows && remote_minutes > grace_minutes {
+        return Err(SettingsError::InvalidSetting {
+            key: "power.remote_touch_minutes".to_string(),
+            reason: format!(
+                "must not exceed power.idle_grace_minutes \
+                 (the remote window {remote_minutes} is longer than the grace \
+                 {grace_minutes}, which would make the grace ineffective on battery)"
+            ),
+        });
+    }
+
     // 删掉只剩空壳的分组对象，避免留下 {"agent":{}} 这种噪音。
-    for group in ["agent", "compact", "startup"] {
+    for group in ["agent", "compact", "startup", "tui", "power"] {
         if object
             .get(group)
             .and_then(|value| value.as_object())
@@ -808,6 +1145,9 @@ malformed line
             DIRECT_CHILDREN_DEFAULT, MAX_TURNS_DEFAULT, RESIDENT_SUBAGENTS_DEFAULT,
             SKILLS_CATALOG_BUDGET_DEFAULT,
         };
+        use crate::settings::{
+            POWER_IDLE_GRACE_MINUTES_DEFAULT, POWER_REMOTE_TOUCH_MINUTES_DEFAULT,
+        };
         let cases: &[(&str, String)] = &[
             ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
             (
@@ -830,6 +1170,14 @@ malformed line
             (
                 "compact.tool_budget_tokens",
                 COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "power.idle_grace_minutes",
+                POWER_IDLE_GRACE_MINUTES_DEFAULT.to_string(),
+            ),
+            (
+                "power.remote_touch_minutes",
+                POWER_REMOTE_TOUCH_MINUTES_DEFAULT.to_string(),
             ),
         ];
         for (key, expected) in cases {
@@ -1162,6 +1510,430 @@ malformed line
             settings.compact.ratio,
             Some(75),
             "a well-typed neighbour must survive"
+        );
+    }
+
+    #[test]
+    fn tui_defaults_are_all_none() {
+        let settings = Settings::default();
+        assert!(settings.tui.notifications.is_none());
+        assert!(settings.tui.notification_method.is_none());
+        assert!(settings.tui.notification_condition.is_none());
+    }
+
+    #[test]
+    fn tui_fields_are_registered() {
+        for key in [
+            "tui.notifications",
+            "tui.notification_method",
+            "tui.notification_condition",
+        ] {
+            assert!(
+                find_spec(key).is_some(),
+                "{key} must be in FIELDS or the settings UI will not show it"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_notification_method_is_dropped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tui":{"notification_method":"carrier-pigeon","notifications":"false"},
+                "agent":{"max_turns":42}}"#,
+        )
+        .unwrap();
+
+        let settings = load_from(&path);
+        // 非法值被清成 None（回退默认），而不是让整份文件失败。
+        assert_eq!(settings.tui.notification_method, None);
+        // 同一份文件里的其它字段必须还在。
+        assert_eq!(settings.tui.notifications.as_deref(), Some("false"));
+        assert_eq!(settings.agent.max_turns, Some(42));
+    }
+
+    #[test]
+    fn invalid_notification_condition_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"notification_condition":"sometimes"}}"#).unwrap();
+        assert_eq!(load_from(&path).tui.notification_condition, None);
+    }
+
+    #[test]
+    fn invalid_notifications_flag_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tui":{"notifications":"maybe"}}"#).unwrap();
+        assert_eq!(load_from(&path).tui.notifications, None);
+    }
+
+    #[test]
+    fn valid_notification_values_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tui":{"notifications":"true","notification_method":"osc9","notification_condition":"always"}}"#,
+        )
+        .unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.tui.notifications.as_deref(), Some("true"));
+        assert_eq!(settings.tui.notification_method.as_deref(), Some("osc9"));
+        assert_eq!(
+            settings.tui.notification_condition.as_deref(),
+            Some("always")
+        );
+    }
+
+    #[test]
+    fn deleting_all_tui_keys_removes_the_empty_group() {
+        // 写三个键再全部删掉，文件里不该留下 {"tui":{}} 这种空壳。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_to(
+            &path,
+            &serde_json::json!({
+                "tui.notifications": "true",
+                "tui.notification_method": "bel",
+            }),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"tui\""), "group must exist: {text}");
+
+        write_to(
+            &path,
+            &serde_json::json!({
+                "tui.notifications": null,
+                "tui.notification_method": null,
+            }),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("tui").is_none(),
+            "empty tui group must be pruned, got {text}"
+        );
+    }
+
+    #[test]
+    fn prevent_idle_sleep_defaults_to_enabled() {
+        let settings = Settings::default();
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    #[test]
+    fn prevent_idle_sleep_honours_false() {
+        let mut settings = Settings::default();
+        settings.power.prevent_idle_sleep = Some("false".to_string());
+        assert!(!prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 未知值在 `normalized` 里被清成 `None`，于是读取端按默认（开）处理。
+    #[test]
+    fn an_unknown_prevent_idle_sleep_falls_back_to_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":"yes"}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep, None);
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 空串等于未设置。
+    #[test]
+    fn an_empty_prevent_idle_sleep_is_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"agent":{"prevent_idle_sleep":""}}"#).unwrap();
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep, None);
+    }
+
+    /// 整份 JSON 坏掉时 `load_from` 返回默认值，即开关回到「开」。
+    ///
+    /// 方向是刻意的：坏文件下**不能**让保活失效（那正是「夜里跑着跑着睡了」
+    /// 的原始故障），所以兜底偏向「继续保活」。用户在设置页重新保存一次即可
+    /// 修正文件。
+    #[test]
+    fn a_corrupt_settings_file_still_enables_prevention() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let settings = load_from(&path);
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// `"FALSE"` / `"False"` 也算关闭——大小写不敏感。
+    /// 设置页写的是小写，但用户手改文件时不该因为大小写就悄悄打开。
+    #[test]
+    fn prevent_idle_sleep_is_case_insensitive() {
+        for raw in ["false", "FALSE", "False"] {
+            let mut settings = Settings::default();
+            settings.power.prevent_idle_sleep = Some(raw.to_string());
+            assert!(!prevent_idle_sleep_enabled(&settings), "{raw} must disable");
+        }
+    }
+
+    #[test]
+    fn power_windows_default_to_fifteen_and_five() {
+        let (grace, remote) = power_windows_minutes(&Settings::default());
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+        assert_eq!((grace, remote), (15, 5));
+    }
+
+    /// 两个值各自合法但倒挂（宽限 5、远端 30）→ 两个都回默认。
+    ///
+    /// 只清远端会留下「宽限 5 单独生效」，用户看到的仍是自己设的 5 分钟，
+    /// 而文件里那对矛盾值会一直在，每次启动 warn 一次。两个一起回默认，
+    /// 行为单调且可解释。
+    #[test]
+    fn power_windows_inverted_pair_falls_back_to_both_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    }
+
+    /// 相等是合法的：远端窗口在宽限到期的同一刻失效，语义自洽。
+    #[test]
+    fn power_windows_allow_equal_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":10,"remote_touch_minutes":10}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!((grace, remote), (10, 10));
+    }
+
+    #[test]
+    fn power_windows_read_through_from_a_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"power":{"idle_grace_minutes":45,"remote_touch_minutes":20}}"#,
+        )
+        .unwrap();
+        let (grace, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!((grace, remote), (45, 20));
+    }
+
+    #[test]
+    fn migrate_moves_the_legacy_key_into_power() {
+        let mut value = serde_json::json!({"agent":{"prevent_idle_sleep":"false"}});
+        migrate_legacy_keys(&mut value);
+        assert_eq!(value["power"]["prevent_idle_sleep"], "false");
+        // 旧键必须被删掉，否则幂等性靠的是「新键已存在」这个间接条件。
+        assert!(
+            value["agent"].get("prevent_idle_sleep").is_none(),
+            "the legacy key must be removed, got {value}"
+        );
+        // agent 变空壳则整组删掉，不留 {"agent":{}} 噪音。
+        assert!(
+            value.get("agent").is_none(),
+            "an emptied agent group must be pruned, got {value}"
+        );
+    }
+
+    #[test]
+    fn migrate_keeps_an_explicit_power_key() {
+        let mut value = serde_json::json!({
+            "agent": {"prevent_idle_sleep": "false"},
+            "power": {"prevent_idle_sleep": "true"}
+        });
+        migrate_legacy_keys(&mut value);
+        // 新键优先：不能被旧的 false 覆盖。
+        assert_eq!(value["power"]["prevent_idle_sleep"], "true");
+    }
+
+    #[test]
+    fn migrate_twice_is_a_no_op() {
+        let mut value = serde_json::json!({"agent":{"prevent_idle_sleep":"false"}});
+        migrate_legacy_keys(&mut value);
+        let once = value.clone();
+        migrate_legacy_keys(&mut value);
+        assert_eq!(value, once, "migration must be idempotent");
+    }
+
+    fn write_json(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// 造真实旧格式文件，走完整的「读 → 解析 → 迁移 → 反序列化 → normalized」。
+    #[test]
+    fn migrate_the_old_agent_key_into_the_power_group() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep.as_deref(), Some("false"));
+        assert!(!prevent_idle_sleep_enabled(&settings));
+    }
+
+    #[test]
+    fn migrate_twice_on_disk_is_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let first = load_from(&path);
+        let second = load_from(&path);
+        assert_eq!(first, second);
+        assert_eq!(first.power.prevent_idle_sleep.as_deref(), Some("false"));
+    }
+
+    /// 两个键都在且冲突时，`power` 的值生效。
+    #[test]
+    fn migrate_keeps_an_explicit_power_key_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"agent":{"prevent_idle_sleep":"false"},"power":{"prevent_idle_sleep":"true"}}"#,
+        );
+        let settings = load_from(&path);
+        assert_eq!(settings.power.prevent_idle_sleep.as_deref(), Some("true"));
+        assert!(prevent_idle_sleep_enabled(&settings));
+    }
+
+    /// 写入被拒时文件必须**逐字节不变**。
+    /// 不断言 mtime：同一秒内两次写入的 mtime 可能一样，APFS 的粗粒度
+    /// 时间戳会让这条断言假通过。字节比对才是「零写入」的真正判据。
+    #[test]
+    fn power_windows_reject_a_remote_window_longer_than_the_grace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":5}}"#,
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        // 只 patch 宽限（5 → 60 会合法；这里相反：把宽限压到 2，远端 5 就倒挂了）。
+        let patch = serde_json::json!({"power.idle_grace_minutes": 2});
+        let error = write_to(&path, &patch).unwrap_err();
+        match error {
+            SettingsError::InvalidSetting { key, reason } => {
+                assert_eq!(key, "power.remote_touch_minutes");
+                assert!(
+                    reason.contains("must not exceed"),
+                    "reason should explain the cross-field rule, got {reason}"
+                );
+            }
+            other => panic!("expected InvalidSetting, got {other:?}"),
+        }
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after, before, "a rejected write must not touch the file");
+    }
+
+    /// 旧键不会因为「保存了别的字段」而消失——这是预期行为，不是 bug。
+    /// `write_to` 只对 patch 里出现的键调 `apply_op`，其余原样保留。
+    #[test]
+    fn migrate_legacy_key_stays_on_disk_after_other_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 30})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("agent"),
+            "the legacy key must survive an unrelated write, got {text}"
+        );
+        assert!(text.contains("prevent_idle_sleep"), "got {text}");
+        // 而新值确实写进去了。
+        assert!(text.contains("idle_grace_minutes"), "got {text}");
+    }
+
+    /// 迁移结果可重放：把迁好的 Settings 整份写回，再读一次必须相等。
+    /// 若迁移只在内存搬、而值本身落不进新键，第二次读会退回默认（开）。
+    #[test]
+    fn migrate_value_survives_a_fresh_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(&dir, r#"{"agent":{"prevent_idle_sleep":"false"}}"#);
+        let first = load_from(&path);
+        assert_eq!(first.power.prevent_idle_sleep.as_deref(), Some("false"));
+
+        std::fs::write(&path, serde_json::to_string(&first).unwrap()).unwrap();
+        let second = load_from(&path);
+        assert_eq!(first, second, "a migrated value must survive a rewrite");
+        assert_eq!(second.power.prevent_idle_sleep.as_deref(), Some("false"));
+    }
+
+    /// `clamp!` 是逐字段列举的，新增字段漏了它不会报错、越界值会一路进
+    /// 策略层。这条测试是那两个 `clamp!` 的唯一问责令。
+    ///
+    /// 它必须放在本 Task 而不是 Task 3：`within` 靠 `find_spec` 取 min/max，
+    /// `FIELDS` 里没有 `power.*` 时 `within` 返回 true、`clamp!` 清不掉任何值。
+    #[test]
+    fn power_windows_out_of_range_fall_back_to_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // 下限：0 被清成 None。
+        std::fs::write(&path, r#"{"power":{"idle_grace_minutes":0}}"#).unwrap();
+        let (grace, _) = power_windows_minutes(&load_from(&path));
+        assert_eq!(
+            grace, POWER_IDLE_GRACE_MINUTES_DEFAULT,
+            "0 must be clamped away, not passed through"
+        );
+
+        // 上限：121 > 120 被清成 None。
+        std::fs::write(&path, r#"{"power":{"idle_grace_minutes":121}}"#).unwrap();
+        let (grace, _) = power_windows_minutes(&load_from(&path));
+        assert_eq!(grace, POWER_IDLE_GRACE_MINUTES_DEFAULT);
+
+        // 远端窗口上限 60。
+        std::fs::write(&path, r#"{"power":{"remote_touch_minutes":61}}"#).unwrap();
+        let (_, remote) = power_windows_minutes(&load_from(&path));
+        assert_eq!(remote, POWER_REMOTE_TOUCH_MINUTES_DEFAULT);
+    }
+
+    /// 文件里已有一对倒挂的手改值（宽限 5、远端 30）时，改**无关**字段
+    /// 仍须成功。否则用户手改坏了一对值之后就再也存不进任何设置——
+    /// 那是把人锁在文件外面。倒挂本身由加载侧 `normalized()` 回落。
+    #[test]
+    fn an_unrelated_write_succeeds_despite_an_inverted_pair_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        );
+        write_to(&path, &serde_json::json!({"agent.max_turns": 123})).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("123"),
+            "the unrelated write must land, got {text}"
+        );
+    }
+
+    /// 但触碰这对窗口就被拒——哪怕只是其中一个键。
+    #[test]
+    fn touching_an_inverted_pair_is_still_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            r#"{"power":{"idle_grace_minutes":5,"remote_touch_minutes":30}}"#,
+        );
+        let error =
+            write_to(&path, &serde_json::json!({"power.idle_grace_minutes": 2})).unwrap_err();
+        assert!(
+            matches!(error, SettingsError::InvalidSetting { .. }),
+            "touching the inverted pair must be rejected, got {error:?}"
         );
     }
 }

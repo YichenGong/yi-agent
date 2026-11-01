@@ -159,6 +159,14 @@ pub struct ThreadSession {
     /// 用 `watch` 而非 `mpsc`：只关心最新值，且写端在独立 task 里，
     /// `send_replace` 既不阻塞也不积压。
     pub(crate) subagent_tx: tokio::sync::watch::Sender<crate::protocol::SubagentTotals>,
+    /// 本进程作为该 thread writer 的凭据。`Some` 即表示「我在写它」。
+    ///
+    /// **只在启动 driver 时取**，不覆盖多客户端订阅：同一个 app-server 里桌面
+    /// 和手机共享同一 driver，本来就不存在双写。thread 从 `threads` 表移除时
+    /// 随 `Arc` drop 自然释放，不额外写清理代码。
+    // 字段只为 RAII 持有：值一旦 drop，flock 就释放。没有读取方是设计如此。
+    #[allow(dead_code)]
+    pub(crate) writer_lock: Option<Arc<crate::thread_store::ThreadWriterLock>>,
 }
 
 impl ThreadSession {

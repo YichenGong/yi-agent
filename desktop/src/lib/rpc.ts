@@ -1,3 +1,4 @@
+import { ConnectionError } from "./connectionError";
 import type { ApprovalRequest, Decision, Notification, RequestId, RpcError } from "./protocol";
 
 /** JSON-RPC error the server returns for a request that arrives before
@@ -121,8 +122,11 @@ export class RpcClient {
     this.unsubscribeTransportStatus = null;
     this.notificationHandlers.clear();
     this.statusHandlers.clear();
+    // 抛结构化错误而不是裸字符串：这个 message 会一路冒到对话红条上，用户既
+    // 看不懂也不知道该做什么。`formatError` 据类型翻成一句可操作的中文
+    // （见 `connectionError.ts`）。message 保持英文，日志与单测照旧可读。
     for (const [, pending] of this.pending) {
-      pending.reject(new Error("rpc client disposed"));
+      pending.reject(new ConnectionError("disconnected", "rpc client disposed"));
     }
     this.pending.clear();
     this.buffered.clear();

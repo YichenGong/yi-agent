@@ -41,6 +41,7 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
                 let value = field_value(&current, spec);
                 json!({
                     "key": spec.key,
+                    "label": spec.label,
                     "value": value,
                     "default": spec.default_display,
                     "type": match spec.field_type {
@@ -83,10 +84,20 @@ fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Valu
         }
         "agent.system_prompt" => opt(current.agent.system_prompt.clone().map(Value::from)),
         "agent.skills_catalog_budget" => opt(current.agent.skills_catalog_budget.map(Value::from)),
+        settings::PREVENT_IDLE_SLEEP_KEY => {
+            opt(current.power.prevent_idle_sleep.clone().map(Value::from))
+        }
+        "power.idle_grace_minutes" => opt(current.power.idle_grace_minutes.map(Value::from)),
+        "power.remote_touch_minutes" => opt(current.power.remote_touch_minutes.map(Value::from)),
         "compact.ratio" => opt(current.compact.ratio.map(Value::from)),
         "compact.user_budget_tokens" => opt(current.compact.user_budget_tokens.map(Value::from)),
         "compact.tool_budget_tokens" => opt(current.compact.tool_budget_tokens.map(Value::from)),
         "startup.sandbox" => opt(current.startup.sandbox.clone().map(Value::from)),
+        "tui.notifications" => opt(current.tui.notifications.clone().map(Value::from)),
+        "tui.notification_method" => opt(current.tui.notification_method.clone().map(Value::from)),
+        "tui.notification_condition" => {
+            opt(current.tui.notification_condition.clone().map(Value::from))
+        }
         _ => Value::Null,
     }
 }
@@ -94,7 +105,15 @@ fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Valu
 #[derive(Deserialize)]
 pub struct UpdateItem {
     pub key: String,
-    pub value: String,
+    /// `None` 与 `Some("")` 都表示删键（由 `settings::write_to` 统一判定）。
+    ///
+    /// 用 `Option` 而非 `String` 是为了让前端能显式表达「恢复默认」：直接发
+    /// JSON `null`，不必借用「空串恰好被当成删键」这个巧合。
+    ///
+    /// 注意 serde 对 `Option<T>` 在字段缺失时也解析成 `None`，因此**省略
+    /// `value` 等价于发 `null`**。这是有意接受的行为，有测试固定
+    /// （`put_config_treats_a_missing_value_as_null`）。
+    pub value: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +131,11 @@ pub async fn put_config(
 ) -> impl IntoResponse {
     let mut patch = serde_json::Map::new();
     for item in request.updates {
-        patch.insert(item.key, Value::from(item.value));
+        let value = match item.value {
+            Some(text) => Value::from(text),
+            None => Value::Null,
+        };
+        patch.insert(item.key, value);
     }
 
     match settings::write_to(&state.settings_path, &Value::Object(patch)) {
