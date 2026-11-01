@@ -5676,6 +5676,37 @@ describe("App mobile offline UX", () => {
     await waitFor(() => expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false));
     expect((box as HTMLTextAreaElement).value).toBe("hello offline");
   });
+
+  /**
+   * 用户报的「更新时间显示 20xxxd」。
+   *
+   * 现场条件（全部是冷启动的正常形状，不需要任何异常）：
+   * ① 手机端首帧 `status` 还不是 `connected` ⇒ `offline` 为真；
+   * ② 从列表缓存恢复的会话正在 `thread/resume`（`syncState === "syncing"`）；
+   * ③ 该会话**没有**内容缓存条目（首屏缓存里只有列表、或内容已被 LRU 淘汰）
+   *    ⇒ `cachedAt` 里没有它。
+   *
+   * 旧代码把 ② 当成「离线内容」，`savedAt` 取 `cachedAt.get(id) ?? null` 再被
+   * `?? 0` 兜成 0，`formatRelativeTime(0)` = 1970 年 ⇒ 渲染「更新于 20758d」。
+   * 提示条本该只在「确实正显示缓存内容」时出现，时间未知时也不该编造天数。
+   */
+  it("never renders a bogus day count in the offline notice", async () => {
+    asRemote();
+    seed("idle", "t1");
+    contentStore.current = new MemoryContentStore();
+    // 握手顺序是 initialize → listAll → selectThread(resume) → setStatus("connected")，
+    // 故让 resume 挂起就足以同时满足 ①②：status 仍停在 connecting（offline 为真），
+    // 而该会话的 syncState 已被置为 syncing。
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const notice = await screen.findByText(/离线内容|正在同步/);
+    expect(notice.textContent ?? "").not.toMatch(/\d{3,}d/);
+    // 时间真的算不出来（该会话没有内容缓存）时，如实说未知，不要编一个天数。
+    expect(notice.textContent ?? "").not.toContain("20758");
+  });
 });
 
 describe("App mobile reopen keeps the selection", () => {

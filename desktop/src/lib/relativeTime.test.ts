@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatRelativeTime } from "./relativeTime";
+import { formatRelativeTime, RELATIVE_TIME_UNKNOWN } from "./relativeTime";
 
 const T = 1_000_000_000_000; // fixed "now"
 
@@ -23,5 +23,20 @@ describe("formatRelativeTime", () => {
   });
   it("clamps a future timestamp to 'now'", () => {
     expect(formatRelativeTime(T + 10_000, T)).toBe("now");
+  });
+
+  /**
+   * 0 / 负数 / NaN / Infinity / 缺值都不是时间戳，只能表示「不知道」。
+   *
+   * 修复前 0 会一路算到 `Math.floor(diff / 86_400_000)` 得 20758 —— 手机上离线
+   * 提示条因此显示「更新于 20758d」，即用户报的「20xxxd 用户不友好」。
+   */
+  it("reports an unknown timestamp instead of a huge day count", () => {
+    expect(formatRelativeTime(0, T)).toBe(RELATIVE_TIME_UNKNOWN);
+    expect(formatRelativeTime(-1, T)).toBe(RELATIVE_TIME_UNKNOWN);
+    expect(formatRelativeTime(Number.NaN, T)).toBe(RELATIVE_TIME_UNKNOWN);
+    expect(formatRelativeTime(Number.POSITIVE_INFINITY, T)).toBe(RELATIVE_TIME_UNKNOWN);
+    expect(formatRelativeTime(undefined as unknown as number, T)).toBe(RELATIVE_TIME_UNKNOWN);
+    expect(formatRelativeTime(null as unknown as number, T)).toBe(RELATIVE_TIME_UNKNOWN);
   });
 });
