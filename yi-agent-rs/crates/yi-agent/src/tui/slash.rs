@@ -294,6 +294,14 @@ pub struct TuiConfigSnapshot {
     pub mcp_master: bool,
     pub runtime_preference: String,
     pub runtime_preference_path: std::path::PathBuf,
+    /// 是否发送终端通知。
+    pub notifications: bool,
+    /// 配置里的协议值（`auto` / `osc9` / `bel`）。
+    pub notification_method: String,
+    /// 配置里的触发条件（`unfocused` / `always`）。
+    pub notification_condition: String,
+    /// `auto` 解析后的实际后端。
+    pub effective_backend: String,
 }
 
 impl TuiConfigSnapshot {
@@ -312,6 +320,16 @@ impl TuiConfigSnapshot {
             if self.mcp_master { "on" } else { "off" },
             self.runtime_preference,
             self.runtime_preference_path.display(),
+        ) + &format!(
+            "\n\n  terminal notify: {}（method={} → {}, condition={}）",
+            if self.notifications { "on" } else { "off" },
+            self.notification_method,
+            if self.effective_backend.is_empty() {
+                self.notification_method.as_str()
+            } else {
+                self.effective_backend.as_str()
+            },
+            self.notification_condition,
         )
     }
 }
@@ -1218,6 +1236,10 @@ mod tests {
             runtime_preference_path: std::path::PathBuf::from(
                 "/tmp/proj/.yi-agent/preferences.json",
             ),
+            notifications: true,
+            notification_method: "auto".into(),
+            notification_condition: "unfocused".into(),
+            effective_backend: "osc9".into(),
         };
         let text = snap.render("claude-sonnet-4-5");
         assert!(text.contains("anthropic"));
@@ -1225,6 +1247,20 @@ mod tests {
         assert!(text.contains("/tmp/proj"));
         assert!(text.contains("workspace-write"));
         assert!(text.contains("160000") || text.contains("160_000"));
+        // 通知行必须同时给出开关、解析后的实际后端与条件——只显示 `auto`
+        // 时用户排查「为什么我的 kitty 不弹」没有任何线索。
+        assert!(
+            text.contains("terminal notify: on"),
+            "config must show the notification switch: {text}"
+        );
+        assert!(
+            text.contains("method=auto → osc9"),
+            "config must show the resolved backend, not the raw setting: {text}"
+        );
+        assert!(
+            text.contains("condition=unfocused"),
+            "config must show the condition: {text}"
+        );
         assert!(!text.to_lowercase().contains("api_key"));
         assert!(!text.to_lowercase().contains("api-key"));
     }

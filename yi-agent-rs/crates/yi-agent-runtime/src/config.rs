@@ -121,6 +121,12 @@ pub struct RuntimeConfig {
     /// 本次配置是否来自「整包注入」（CLI flag 或真实进程环境变量）。
     /// 为真时它压过清单的 `default_model`（会话覆盖仍在其上）。
     pub model_injected: bool,
+    /// 是否发送终端通知（`tui.notifications`，默认 true）。
+    pub notifications: bool,
+    /// `auto` / `osc9` / `bel`（`tui.notification_method`，默认 `auto`）。
+    pub notification_method: String,
+    /// `unfocused` / `always`（`tui.notification_condition`，默认 `unfocused`）。
+    pub notification_condition: String,
 }
 
 /// 来自 CLI flag 或 GUI 请求的纯数据覆盖项。不依赖 clap。
@@ -408,6 +414,20 @@ impl RuntimeConfig {
             .or(settings.agent.skills_catalog_budget)
             .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
 
+        // 存储侧是字符串（见 settings.rs 的 TuiSettings 说明），这里解析成
+        // bool；空串与非法值已在 `normalized` 里清成 None，故只需处理默认。
+        let notifications = !matches!(settings.tui.notifications.as_deref(), Some("false"));
+        let notification_method = settings
+            .tui
+            .notification_method
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        let notification_condition = settings
+            .tui
+            .notification_condition
+            .clone()
+            .unwrap_or_else(|| "unfocused".to_string());
+
         Ok(RuntimeConfig {
             provider,
             api_url,
@@ -432,6 +452,9 @@ impl RuntimeConfig {
             skills_catalog_budget,
             skills_catalog_budget_explicit,
             model_injected,
+            notifications,
+            notification_method,
+            notification_condition,
         })
     }
 
@@ -504,6 +527,9 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: false,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
     }
 }
 

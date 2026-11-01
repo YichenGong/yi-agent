@@ -229,6 +229,10 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
         mcp_master: true,
         runtime_preference: "ask".into(),
         runtime_preference_path: std::path::PathBuf::from("/tmp/proj/.yi-agent/preferences.json"),
+        notifications: true,
+        notification_method: "auto".into(),
+        notification_condition: "unfocused".into(),
+        effective_backend: "bel".into(),
     }
 }
 

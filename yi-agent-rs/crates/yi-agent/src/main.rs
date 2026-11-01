@@ -2078,6 +2078,20 @@ fn run_tui_agent(
             mcp_master: mcp.master(),
             runtime_preference: runtime_preference.to_string(),
             runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
+            notifications: config.notifications,
+            notification_method: config.notification_method.clone(),
+            notification_condition: config.notification_condition.clone(),
+            effective_backend: {
+                let method = crate::tui::notify::Method::parse(&config.notification_method)
+                    .unwrap_or(crate::tui::notify::Method::Auto);
+                crate::tui::notify::Notifier::new(
+                    method,
+                    crate::tui::notify::Condition::Unfocused,
+                    &crate::tui::notify::TerminalEnv::from_process(),
+                )
+                .effective_backend()
+                .to_string()
+            },
         };
 
         let driver_workdir = snapshot_workdir.clone();
@@ -4014,6 +4028,9 @@ mod tests {
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
             model_injected: false,
+            notifications: true,
+            notification_method: "auto".into(),
+            notification_condition: "unfocused".into(),
         }
     }
 
