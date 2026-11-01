@@ -27,7 +27,9 @@ function bar(
 describe("StatusBar", () => {
   it("renders the connection status and cwd", () => {
     render(bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }));
-    expect(screen.getByText("connected")).toBeTruthy();
+    // 底栏用中文说法，原始状态留在 `title` 里供排查。
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(screen.getByText("已连接").getAttribute("title")).toBe("connected");
     expect(screen.getByText("/w")).toBeTruthy();
   });
 
