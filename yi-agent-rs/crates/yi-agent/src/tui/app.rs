@@ -128,6 +128,8 @@ pub fn run_tui(
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
     mut config: TuiConfigSnapshot,
     catalog: yi_agent_runtime::models::ModelCatalog,
+    // resume 时的历史回放。空 vec 等价于全新会话。
+    replay_cells: Vec<crate::tui::cell::HistoryCell>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     // Detect the terminal background BEFORE the alternate screen takes over:
@@ -157,6 +159,12 @@ pub fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut history = HistoryState::with_theme(theme);
+    // resume 时把历史摊平成 cells。不注入的话上下文是对的但屏幕是空的，
+    // 用户会以为历史丢了。裁剪交给既有 `push` 里的 `enforce_history_cap`，
+    // 不新写裁剪逻辑。
+    for cell in replay_cells {
+        history.push(cell, terminal.size()?.width);
+    }
     let mut input = InputLine::new();
 
     let channels = TuiChannels {

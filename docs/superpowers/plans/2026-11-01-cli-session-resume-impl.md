@@ -2597,3 +2597,70 @@ cargo run -p yi-agent -- fork --help     # 参数齐全
 1. **锁只防两个 writer**。若在 app-server 里无条件长期持锁，桌面开着会话时终端永远 resume 不了（Task 2 Step 5 的反例测试会红）。
 2. **`fork` 不写源会话**。调了 `promote_partial(源)` 就会让 fork 变成隐式写操作（Task 7 的 `fork_does_not_touch_the_source_thread` 会红）。
 3. **`/clear` 不新增日志变体**。复用 `truncate`；自造 `Clear` 边界记录会与既有语义重复并引入向后兼容负担。
+
+---
+
+## 执行记录：与计划的偏差（2026-11-01 实施时发现）
+
+计划在执行中被验证出若干错误，逐条记录，避免后来者照着重犯。
+
+### 1. 锁永不释放（严重，已修）
+原设计让进程级去重表存 `Arc<ThreadWriterLock>`，而锁本身又持有表项的键。两者互相
+持有构成自引用循环，`Drop` 永不触发 → `flock` 永不释放 + fd 泄漏。**改为存 `Weak`**，
+并在查表时用 `Weak::upgrade` 顺带清掉失效项。
+
+### 2. `serde(default)` 对 `Option<T>` 不是必需的
+计划称「`forked_from` 缺 `default` 会让反序列化失败、`cwd` 被冲成空串」。实测：serde
+对 `Option<T>` 缺字段自动填 `None`，去掉 `default` 仍通过。测试保留（它钉的是行为），
+注释改成准确说法。
+
+### 3. 子进程测试名必须带完整模块路径
+`--exact tests::child_xxx` 匹配不到，必须写 `session_store::tests::child_holds_lock`
+（或对应模块的完整路径）。
+
+### 4. 同进程内 flock 无法模拟「另一个 writer」
+flock 按打开文件描述加锁，同进程再 open 一次会先命中进程级去重表，根本走不到内核。
+必须起真子进程。
+
+### 5. `thread/start` 也必须加锁（计划只提了 `thread/resume`）
+`ThreadSession` 有两处生产构造点（`server.rs` 的 `thread/start` 分支、
+`rpc/thread.rs` 的 `thread/resume` 分支），只加一处等于留后门。
+
+### 6. IO 失败不能报成 Busy
+`thread/start` 里 `create_dir_all` 失败即报错会打断既有测试
+`agent_message_without_a_runtime_is_an_error`（它故意用文件占住 `.yi-agent`）。改为
+`ThreadLockError::{Busy, Io}`：`Busy` 拒绝，`Io` 退化为无锁并记 warn。
+
+### 7. `ThreadStore::root()` 已存在
+计划里的 `root_for_test()` 不需要新增。
+
+### 8. `run_agent` 拆成两层后，两个源码结构断言测试要改
+`run_agent_offers_onboarding_before_loading_config` 与
+`the_env_migration_runs_before_config_loading` 都按 `fn run_agent(` 切片。`run_agent`
+变成转调 `run_agent_with_seed` 的薄包装后，切片落在空壳上，断言空转失败。改为切
+`run_agent_with_seed`（以及抽取后的 `prepare_environment`）。
+
+### 9. headless `run` 此前完全不落盘（计划假设它已落盘）
+Task 8 的 e2e 断言「两轮都落盘」，但 `run_headless` 原来没有任何存储代码，`resume`
+也就无从谈起。补上落盘时顺手把「事件 → items → 按 session 净增长裁剪」抽成
+`TurnLog`（`crates/yi-agent/src/turn_log.rs`），TUI driver 与 headless 共用同一份。
+不抽的话这条链要复制三处易错逻辑（用户消息补齐、取消轮不发 Done、按净增长裁剪）。
+
+### 10. 所有需要 config 的入口都必须先跑迁移
+冒烟发现 `resume` 拿到的 `workdir` 可能来自旧读取路径：老格式 `.env` 里的设置在迁移
+前读 `.env`、迁移后读 `settings.json`，两边不同就会去另一个目录找会话。抽出
+`prepare_environment`（只做非交互的迁移，**不弹引导**——`threads` / headless 可能跑在
+管道里，弹引导会挂死在 stdin），`resume` / `fork` / `threads` / headless / 新会话都先调它。
+headless 此前完全没做迁移，是顺带补上的既有缺口。
+
+### 11. e2e 不需要 wiremock
+`yi-agent` 的 dev-dependencies 里没有 wiremock，而这条链路只需「回一句固定的话」。
+用标准库 `TcpListener` 手写一个只会返回固定 Anthropic SSE 的服务器，几十行，不加依赖。
+
+### 12. 新增的 `TurnLog` / 回放相关 clippy 处理
+- `items_to_cells` 在 Task 9 前无人调用 → `#[allow(dead_code)]`（Task 9 接上后即可移除，
+  当前保留以标注接入点）。
+- `ThreadSession.writer_lock` 是纯 RAII 字段，永远没有读取方 → `#[allow(dead_code)]`
+  并注明「值一旦 drop，flock 就释放。没有读取方是设计如此」。
+- 循环外的三个轮次累加器（`last_usage` / `usage_total` / `base_len`）初值从未被读 →
+  搬进循环体。

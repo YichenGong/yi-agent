@@ -4786,7 +4786,7 @@ pub(crate) async fn interrupt_and_wait_for_persist(
 ///
 /// 单个 turn 的累加值几乎不可能超过 `u32::MAX`（4.29e9），但溢出的后果是数字
 /// 突然变小，比封顶更难解释，所以封顶而不是截断。
-fn saturate_u32(value: u64) -> u32 {
+pub fn saturate_u32(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
 }
 
@@ -7302,6 +7302,7 @@ pub(crate) async fn start_thread_core(
         // 新会话：从未被读过、也从未完成过回合 ⇒ 0/0，不亮蓝点。
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
@@ -7331,6 +7332,21 @@ pub(crate) async fn start_thread_core(
     // driver 与 children watch 之间唯一的通道：watch 侧只送最新汇总，
     // driver 侧据此生成完整的 TokenUsage（它才拿得到 total_*）。
     let (subagent_tx, subagent_rx) = tokio::sync::watch::channel(SubagentTotals::default());
+    // 新会话同样要成为 writer，同样要取锁。`thread/start` 刚生成的 id 理论上
+    // 不会与别人撞，但锁的意义是「同一路径只有一个 writer」，不是「防撞 id」：
+    // 落盘后用同一 id 另开一个进程 resume 时，这把锁就是唯一屏障。
+    // 只有 `Busy` 才拒绝；`Io`（锁文件建不出来）退化为无锁，与加锁前行为一致。
+    let writer_lock =
+        match crate::thread_store::acquire_thread_lock(thread_store.root(), &thread_id) {
+            Ok(lock) => Some(lock),
+            Err(crate::thread_store::ThreadLockError::Busy(busy)) => {
+                return Err(anyhow::anyhow!(busy.to_string()));
+            }
+            Err(e @ crate::thread_store::ThreadLockError::Io(_)) => {
+                tracing::warn!(%e, thread_id = %thread_id, "会话写锁不可用，退化为无锁");
+                None
+            }
+        };
     threads.insert(
         thread_id.clone(),
         ThreadSession {
@@ -7347,6 +7363,7 @@ pub(crate) async fn start_thread_core(
             store: Arc::clone(&thread_store),
             status: Arc::clone(&store_status),
             subagent_tx,
+            writer_lock,
         },
     );
 
@@ -10667,6 +10684,7 @@ mod evict_idle_tests {
             store: Arc::new(crate::thread_store::ThreadStore::new(project)),
             status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
             subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+            writer_lock: None,
         }
     }
 
