@@ -41,12 +41,12 @@
 - 跨目录 `--all`（`ThreadStore` 按 cwd 组织，跨目录需 `listAll` 索引，另议）
 - 会话归档 / 重命名 / 搜索 / 删除（app-server 已有，CLI 不重复实现）
 - 会话级 fork 的 worktree 隔离（与子 agent 的 `worktree` 是两件事）
-- **`/clear` 的物理回收**：本设计的 `/clear` 是追加边界（§6.4），不删数据。长期使用会让 `.jsonl` 只增不减。这是刻意取舍——物理回收需要 tarball/compaction 那套机制（app-server 的归档走的是另一条路），且删数据必须可撤销。若磁盘成为问题，后续单独做，不在本轮。
+- **`/clear` 的历史回收**：`/clear` 走 `truncate`（§6.4），直接删 `.jsonl`，旧对话不可恢复。这是 app-server 既有语义，本轮沿用；不做「清空但保留可回滚副本」。
 
 ### 已知取舍
 
 - fork 物理复制让长会话磁盘翻倍（§3.2 已说明）
-- `/clear` 与 fork 都只追加不回收，`.jsonl` 会持续增长
+- `/clear` 删除即不可恢复（与 app-server 一致）
 
 ## 3. 关键设计决策
 
@@ -246,19 +246,21 @@ driver 收到本轮 `Done` 后构造 `TurnLine::Turn { items, usage, usage_total
 
 TUI 这两个命令目前只作用于内存（`app.rs:2626` / `:2677`，driver 侧 `main.rs:2108` / `:2124`）。会话一旦持久化，它们直接与磁盘冲突，必须各自定义语义，否则会出现「屏幕上清空了、resume 回来旧内容全在」这种最糟糕的错位。
 
-**`/clear`：只清会话，不删数据。** 三件事一起做：
+**`/clear`：直接复用 `ThreadStore::truncate`，不要新造方案。**
 
-1. 内存里 `replace_messages(Vec::new())` + `set_last_input_tokens(None)`（沿用 `main.rs:2121` 现状）
-2. 向 `.jsonl` 追加一条**空 turns 的边界记录**，让 resume 时按「最后一条边界之后」读取；**不截断、不删文件**
-3. `content_epoch += 1`（与 app-server `thread/clear` 的语义一致，`thread_store.rs` 注释：这是 `content_epoch` 的唯一递增点）
+`truncate`（`thread_store.rs:959`）的注释本身就是这个需求的答案：
 
-第 2 点需要一个新变体：`TurnLine` 增加 `Clear { at: i64 }`，`read_log` 遇到它就把已累积的 items/messages/usage/totals 全部清空。这样 `/clear` 是**纯追加**，不会与并发的读者打架，也天然可回滚（想恢复就删文件）。**不能**用 `truncate` 就地改写——那会与 `flock` 之外的读者产生窗口期，且破坏「`.jsonl` 只追加」这条既有不变量。
+> 只删 `.jsonl`，保留 `.meta.json`：thread 仍在 `list()` 里、仍能 `resume`（回放为空），标题 / cwd / 权限模式不变。这是 `/clear` 的持久化语义——若只清内存而不删日志，`resume` 会把旧消息回放回来，用户以为清空了实则没有。
 
-实现上要注意：`read_log`（`thread_store.rs:314`）现在是 `match serde_json::from_str::<TurnLine>(line) { Ok(TurnLine::Turn {..}) => .., Err(e) => .. }` 的**穷尽匹配**，加变体后**编译会失败**，必须补 `Ok(TurnLine::Clear { .. }) => { items.clear(); messages.clear(); usage = None; totals = UsageTotals::default(); }` 分支。这不是「加个枚举值」那么轻——漏了它连编译都过不去（这反而是好事，编译器会强制实现者处理）。
+它同时做了三件必须一起做的事：删 `.jsonl`、`clear_partial`（否则重启后未收尾 checkpoint 会把已清空的上下文拼回来）、持 `meta_lock` 与并发 `update_meta` 串行。TUI 只需在 `DriverControl::Clear` 分支里调一次 `store.truncate(id)`，再加 `meta.content_epoch += 1`（`bump_content_epoch`，与 app-server `thread/clear` 一致：这是 `content_epoch` 的唯一递增点）。
 
-**`/compact`：只换上下文，不写 items。** app-server 的 `thread/compact` 落盘时 items 为空、`content_epoch` 不递增（`thread_store.rs` 注释明确：「它落盘时 items 为空、历史 item 分毫未动」）。TUI 照此办理：把压缩后的 `messages` 作为一条 `items: []` 的 `TurnLine` 追加。回放时这条记录不产生任何 cell，但 `read_log` 会用它的 `messages` 覆盖上下文——正好是压缩该有的效果。
+**因此不需要给 `TurnLine` 加新变体**，也不需要改 `read_log`。我最初设想的「追加 `Clear` 边界记录」方案是错的：它与既有 `truncate` 语义重复、引入了新的日志格式与向后兼容问题，并且和 spec §3.1「不新增第二套实现」的原则自相矛盾。
+
+**`/compact`：只换上下文，不写 items。** app-server 的 `thread/compact` 落盘时 items 为空、`content_epoch` 不递增（`thread_store.rs` 注释：「它落盘时 items 为空、历史 item 分毫未动」）。TUI 照此办理：把压缩后的 `messages` 作为一条 `items: []` 的 `TurnLine` 追加。回放时这条记录不产生任何 cell，但 `read_log` 会用它的 `messages` 覆盖上下文——正好是压缩该有的效果。
 
 漏掉这两条的后果分别是：`/clear` 后 resume 旧内容复活；`/compact` 后 resume 拿到未压缩的超长上下文，可能直接超出模型窗口。
+
+**并发注意**：`truncate` 删文件与 `append_turn` 追加写若并发，追加会「复活」刚被删的日志（`create(true)` 语义）。这也是为什么 §3.3 的会话级锁必须覆盖 driver 全程——锁在，这种交错就不可能发生。
 
 ## 7. fork 语义
 
@@ -278,6 +280,19 @@ TUI 这两个命令目前只作用于内存（`app.rs:2626` / `:2677`，driver �
 | `role` | **强制清空** | 见 §3.5 |
 
 5. `forked_from = Some(源 id)`，**仅用于展示**，不参与任何读取路径
+
+### 7.1 两处必须写明的实现约束
+
+**`forked_from` 必须带 `#[serde(default)]`。** `ThreadMeta` 现有 116 个真实 meta 文件都不会有该字段，缺默认值会导致反序列化失败，`load` 走 `rebuild_meta` 兜底——看起来「能用」，实则把 `cwd` 冲成空串、`role` 清空，属于静默数据损坏。这与 `extra_roots`/`tag` 等既有 `#[serde(default)]` 字段同口径。
+
+**fork 必须持源会话的读锁、新会话的写锁。** 具体顺序：
+
+1. `acquire_thread_lock(源 id)` —— 防止 fork 过程中源会话被并发追加，导致复制到半轮内容
+2. `load(源)` → 复制 items/messages
+3. `acquire_thread_lock(新 id)` —— 新会话从诞生起就归本进程
+4. 写新 meta 与 `.jsonl`
+
+锁的获取顺序固定（先源后新），且都是同一张全局表，不存在交叉死锁。若源会话正被另一进程写，步骤 1 即失败并报「会话被占用」，**不建半个新会话**。
 
 ## 8. `yi-agent threads` 列表
 
@@ -337,8 +352,8 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 - `fork_thread` 复制完整性：items 数量、messages 内容、`forked_from`、meta 各字段取舍（含 `role` 清空、`extra_roots` 过滤）
 - 锁：同一 `Arc` 二次获取幂等；跨进程持有失败（子进程验证）；锁文件在持有者退出后仍存在
 - **锁的进程内去重**：同进程 `acquire_thread_lock` 两次拿到同一个 `Arc`（若退化成各自加锁，这条会红）
-- **`Clear` 边界**：`read_log` 遇到 `Clear` 后只返回其后的 items/messages
-- **未知 `type` 行不影响其余行**：混合日志里插入一条 `{"type":"future_thing"}`，其余照常解析
+- **`truncate` 后 `load` 为空**：`/clear` 走 `truncate`，断言 `.jsonl` 已删、`.meta.json` 仍在、`content_epoch` 递增
+- **`truncate` 同时清 partial**：清空后残留 checkpoint 不会把上下文拼回来
 - **`/compact` 落盘**：`items: []` 的 TurnLine 不产生 cell，但覆盖 `messages`
 - **meta 缺失的老会话**：`rebuild_meta` 的 `cwd` 为空串，CLI cwd 校验须放行（§8.1）
 
@@ -358,25 +373,22 @@ thread-0ed0af09-a570-4bb5-aa60-ae3…   (untitled)                2026-10-31 09:
 3. 再次 `run --resume <id>` → 断言第二轮内容也在
 4. `/clear` 后退出 → `run --resume <id>` → 断言旧内容不可见（验证 §6.4 的边界语义）
 
-## 11. 日志格式向后兼容
+## 11. 日志格式
 
-`TurnLine` 是 `#[serde(tag = "type", rename_all = "snake_case")]` 的带标签枚举（`thread_store.rs:211`），新增变体对**旧日志**是安全的：旧日志只有 `turn`，反序列化不会碰到未知变体。
+**本设计不新增 `TurnLine` 变体**，日志格式保持不变（`/clear` 走 `truncate`，`/compact` 复用既有的空 items `Turn` 行）。这是复用既有实现的直接收益：无向后兼容负担，`read_log` 的穷尽匹配也不用动。
 
-但**新日志对旧版本不兼容**：新版本写入的 `clear` 行，旧版 `read_log` 反序列化会失败。`read_log` 现有的容错是「跳过损坏行」（`load_skips_corrupt_log_lines`），所以旧版本打开新日志不会崩，只是会**忽略 `/clear` 边界**，表现为「清空后的内容仍然可见」。
-
-这是可接受的降级（单机 CLI，读写两端版本一致），但必须在实现时确认 `read_log` 对未知 `type` 的跳过路径确实生效，并写一条测试：**含未知变体的日志行不影响其余行解析**。
+`TurnLine` 的 serde 配置（`#[serde(tag = "type")]`，`thread_store.rs:211`）保留扩展点，日后若真有需要再加。
 
 ## 12. 落地顺序
 
 按依赖倒序，每步可独立验证：
 
 1. **锁**（`thread_store` 新增 `ThreadWriterLock` + 进程级去重表 + app-server 侧采用）—— 独立、可单测、无 UI
-2. **`TurnLine::Clear` 变体 + `read_log` 边界处理** —— 为 `/clear` 铺路，纯存储层
-3. **TUI 落盘**（session Arc 重构 + 新会话建 meta + 每轮 `append_turn` + `updated_at` + `/clear` `/compact` 语义）—— resume 的前提
-4. **回放映射**（`items_to_cells`）—— 让历史真的看得见
-5. **resume**（load → 注入 → 启动）—— 主干
-6. **headless `run --resume`** —— 端到端测试载体
-7. **fork**（物理复制 + meta 规则）—— 依赖 1、5
-8. **`threads` 列表 + 前缀匹配** —— 纯展示
+2. **TUI 落盘**（session Arc 重构 + 新会话建 meta + 每轮 `append_turn` + `updated_at`，`/clear` 接 `truncate`、`/compact` 走空 items 行）—— resume 的前提
+3. **回放映射**（`items_to_cells`）—— 让历史真的看得见
+4. **resume**（load → 注入 → 启动）—— 主干
+5. **headless `run --resume`** —— 端到端测试载体
+6. **fork**（物理复制 + meta 规则）—— 依赖 1、4
+7. **`threads` 列表 + 前缀匹配** —— 纯展示
 
-第 1-3 步不做，4-7 做出来是空转；第 4 步不做，resume 起来是空屏幕。
+第 1-2 步不做，3-6 做出来是空转；第 3 步不做，resume 起来是空屏幕。
