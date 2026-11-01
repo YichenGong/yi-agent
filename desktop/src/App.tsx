@@ -103,6 +103,7 @@ import {
 import { configReadParams } from "./lib/configRequest";
 import { buildUsageReport } from "./lib/usageCommand";
 import { parseTheme } from "./lib/theme";
+import { parseFontScale } from "./lib/fontScale";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
@@ -495,7 +496,10 @@ export default function App() {
   // 「服务端换了没有」，写在后面会踩 TDZ。反过来 `useSettingsState` 只依赖
   // `rpc`/`force`/`setCurrentError`，三者此刻都已可用，不依赖 `sess`/`proc`/
   // `diff`/`board`——两者没有循环，只是原先的书写顺序恰好相反。
-  const prefs = useSettingsState({ rpc, force, setCurrentError });
+  // `isMobile` 决定字号偏好的归属：两个平台各占 preferences.json 里的一个键，
+  // 默认档也不同（手机 small、桌面 standard）。`isMobile` 在本函数开头就已求值
+  // （`useIsMobile()`），故这里不踩 TDZ。
+  const prefs = useSettingsState({ rpc, force, setCurrentError, isMobile });
 
   // 会话关注点（当前会话 id/会话列表与置顶/最近目录/侧栏抽屉/详情栈与右侧
   // 详情栏开合，连同它们的 ref 影子与读取器）整体搬进 hook，见
@@ -1996,6 +2000,9 @@ export default function App() {
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
           tag_names?: unknown;
+          /** 字号档位：两个平台各一个键，客户端只认自己那个。 */
+          font_scale_desktop?: unknown;
+          font_scale_ios?: unknown;
         }>("ui/settings/read", {});
         // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
         // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
@@ -2009,6 +2016,14 @@ export default function App() {
           prefs.confirmedThemeRef.current = authoritative;
           prefs.setTheme(authoritative);
         }
+        // 字号：只认本平台那个键。`parseFontScale` 对未设置/非法值返回 `null`，
+        // 此时**保持当前值**（首屏缓存或平台默认），不要把它抹成默认——
+        // 那会让手机端刚改的档位在握手后被悄悄重置。
+        prefs.setFontScaleFromServer(
+          parseFontScale(
+            isMobile ? settings.font_scale_ios : settings.font_scale_desktop,
+          ),
+        );
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
         // `ui/settings/read`。读序（新名优先、旧名兜底）与缺省口径都在
         // `watchmanFromSettings` 里，与 readBoardWatchman 共用同一份实现。
@@ -3459,10 +3474,15 @@ export default function App() {
         isMobile={isMobile}
         theme={prefs.theme}
         onThemeChange={prefs.changeTheme}
+        fontScale={prefs.fontScale}
+        onFontScaleChange={prefs.changeFontScale}
         // 值守从看板面板迁来：它装的是通用登录项，服务所有已登记的项目。
-        watchmanEnabled={board.watchmanEnabled}
-        onToggleWatchman={(next) => void onToggleWatchman(next)}
-        watchmanWarning={board.watchmanWarning}
+        // **手机端整节不传**：它装的是桌面主机的登录项，手机拨不到，也不该让
+        // 一个手机端去改另一台机器的开机项。与 `saveRelayUrl` 的守卫同一先例
+        // （宿主传 `undefined`，组件自身的 `showWatchman` 判据负责不渲染）。
+        watchmanEnabled={isMobile ? undefined : board.watchmanEnabled}
+        onToggleWatchman={isMobile ? undefined : (next) => void onToggleWatchman(next)}
+        watchmanWarning={isMobile ? undefined : board.watchmanWarning}
         onClose={() => prefs.setSettingsOpen(false)}
         // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
         // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。

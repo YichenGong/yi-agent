@@ -1,4 +1,5 @@
 import type { Theme } from "../lib/theme";
+import { FONT_SCALES, type FontScale } from "../lib/fontScale";
 
 const CHOICES: Array<{ value: Theme; label: string }> = [
   { value: "dark", label: "深色" },
@@ -15,12 +16,20 @@ const CHOICES: Array<{ value: Theme; label: string }> = [
 export function SettingsGeneralTab({
   theme,
   onThemeChange,
+  fontScale,
+  onFontScaleChange,
   watchmanEnabled,
   onToggleWatchman,
   watchmanWarning,
 }: {
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
+  /**
+   * 当前字号档位。缺省 `undefined` 表示宿主没提供该能力——此时不渲染这一节，
+   * 与值守同一判据（拨不动的控件比不显示更糟）。
+   */
+  fontScale?: FontScale;
+  onFontScaleChange?: (scale: FontScale) => void;
   /**
    * 宿主级值守开关的当前值。缺省 `undefined` 表示这个宿主没提供该能力
    * （例如只读客户端），此时不渲染这一节，而不是显示一个拨不动的开关。
@@ -31,6 +40,7 @@ export function SettingsGeneralTab({
   watchmanWarning?: string | null;
 }) {
   const showWatchman = watchmanEnabled !== undefined && onToggleWatchman !== undefined;
+  const showFontScale = fontScale !== undefined && onFontScaleChange !== undefined;
   return (
     <section className="p-5">
       <h2 className="text-sm font-medium text-fg">主题</h2>
@@ -55,6 +65,32 @@ export function SettingsGeneralTab({
       <p className="mt-4 text-xs text-fg-subtle">
         也可以直接对话让 Yi-Agent 切换主题，例如「帮我切成浅色」。
       </p>
+      {showFontScale && (
+        <div className="mt-8 border-t border-line pt-6">
+          <h2 className="text-sm font-medium text-fg">字体大小</h2>
+          <div className="mt-3 inline-flex rounded-md border border-line overflow-hidden">
+            {FONT_SCALES.map((c) => {
+              const active = c.value === fontScale;
+              return (
+                <button
+                  key={c.value}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => onFontScaleChange(c.value)}
+                  className={`px-4 py-1.5 text-sm ${
+                    active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
+                  }`}
+                >
+                  {c.label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-4 text-xs text-fg-subtle">
+            只影响这台设备的显示；桌面端与手机端各记各的档位。
+          </p>
+        </div>
+      )}
       {showWatchman && (
         <div className="mt-8 border-t border-line pt-6">
           <label className="flex items-center gap-3 text-sm">

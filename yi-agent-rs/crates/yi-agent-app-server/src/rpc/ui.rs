@@ -72,6 +72,17 @@ pub(crate) async fn handle(
             // 标签显示名：与 theme/值守/中继同处一个 preferences.json，
             // 故同样从 workdir 读。只回**用户覆盖项**，默认名由前端持有。
             let tag_names = crate::settings_store::load_tag_names(workdir);
+            // 字号档位：两个平台**各一个键**，同时回给客户端，由它按自己的平台
+            // 取值。未设置即 `null`——客户端据此回落到平台默认（桌面 standard、
+            // 配对手机 small），而不是拿一个恰好看着合理的值。
+            let font_scale_desktop = crate::settings_store::load_font_scale(
+                workdir,
+                crate::settings_store::FontScalePlatform::Desktop,
+            );
+            let font_scale_ios = crate::settings_store::load_font_scale(
+                workdir,
+                crate::settings_store::FontScalePlatform::Ios,
+            );
             write_response(
                 state.hub,
                 state.client,
@@ -85,6 +96,10 @@ pub(crate) async fn handle(
                         crate::settings_store::WATCHMAN_KEY: watchman_enabled,
                         "relay_url": relay_url,
                         "tag_names": tag_names,
+                        crate::settings_store::FONT_SCALE_DESKTOP_KEY: font_scale_desktop
+                            .map(crate::settings_store::FontScale::as_str),
+                        crate::settings_store::FONT_SCALE_IOS_KEY: font_scale_ios
+                            .map(crate::settings_store::FontScale::as_str),
                     }),
                 ),
             )
@@ -170,6 +185,61 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
+            // 字号档位：两个平台的键各自独立，客户端只写自己那一半。先全部校验，
+            // 全部合法才落盘——与 theme/tag_names 同一口径：非法值不该把同一请求
+            // 里其它有效的键写了一半。未知档位直接失败（`FontScale::parse` 返回
+            // `None`），不静默折成某个档：折错会让「我的设置没生效」无从诊断。
+            let mut font_scales: Vec<(
+                crate::settings_store::FontScalePlatform,
+                crate::settings_store::FontScale,
+            )> = Vec::new();
+            for platform in [
+                crate::settings_store::FontScalePlatform::Desktop,
+                crate::settings_store::FontScalePlatform::Ios,
+            ] {
+                let Some(value) = req.params.get(platform.key()) else {
+                    continue;
+                };
+                let parsed = value
+                    .as_str()
+                    .and_then(crate::settings_store::FontScale::parse);
+                match parsed {
+                    Some(scale) => font_scales.push((platform, scale)),
+                    None => {
+                        write_response(
+                            state.hub,
+                            state.client,
+                            err_response(
+                                id,
+                                RpcError::invalid_params(format!(
+                                    "unsupported {} '{}': expected 'small', 'standard' or 'large'",
+                                    platform.key(),
+                                    value.as_str().unwrap_or("<non-string>")
+                                )),
+                            ),
+                        )
+                        .await?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+            }
+            if !font_scales.is_empty() {
+                let workdir = state.theme_handle.workdir();
+                for (platform, scale) in &font_scales {
+                    if let Err(error) =
+                        crate::settings_store::save_font_scale(workdir, *platform, Some(*scale))
+                    {
+                        write_response(
+                            state.hub,
+                            state.client,
+                            err_response(id, RpcError::internal(error.to_string())),
+                        )
+                        .await?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+            }
+
             // theme 只在请求里显式带上时才校验/应用：只写 relay_url
             // 的请求不该因为「没有 theme」而被拒绝。先校验再落盘，
             // 免得非法 theme 把一个有效的 relay_url 写了一半。

@@ -31,6 +31,15 @@ export const GROUP_HINTS: Record<string, string> = {
 export const GROUP_ORDER = ["agent", "compact", "tui", "startup", "power"];
 
 /**
+ * 只在桌面有意义的组。
+ *
+ * `tui` 整的是**桌面主机的命令行界面**（回合结束提示、终端标题、通知方式）：
+ * 配对手机改它，改的是另一台机器上 TUI 的行为，而手机自己永远看不到那些提示。
+ * 隐藏只发生在渲染层——字段仍进草稿与 `buildPatch`，保存时不会因此漏项。
+ */
+export const DESKTOP_ONLY_GROUPS: ReadonlySet<string> = new Set(["tui"]);
+
+/**
  * 枚举值的显示文案。**只影响显示**：提交给 `settings/write` 的永远是原始字符串。
  *
  * 不在此表里的字段（数字、自由文本）原样返回——这张表是「补充说明」而不是白名单，
@@ -86,7 +95,19 @@ export function labelFor(key: string, raw: string): string {
  *
  * 保存只发用户改过的字段（`buildPatch`），故不会把其余项的当前值整体回写。
  */
-export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
+export function SettingsRuntimeTab({
+  call,
+  isMobile = false,
+}: {
+  call: RuntimeSettingsCall;
+  /**
+   * 是否手机端。只影响「显示哪些组」：桌面专属组在手机端不渲染（见
+   * {@link DESKTOP_ONLY_GROUPS}）。字段数据本身不受影响，草稿与 patch 仍是全量。
+   *
+   * 缺省 `false`（桌面），与 `SettingsModelsTab` 同一约定。
+   */
+  isMobile?: boolean;
+}) {
   const [fields, setFields] = useState<RuntimeField[]>([]);
   const [path, setPath] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -116,15 +137,20 @@ export function SettingsRuntimeTab({ call }: { call: RuntimeSettingsCall }) {
   }, [load]);
 
   const grouped = useMemo(() => {
-    const order = GROUP_ORDER.filter((group) => fields.some((f) => f.group === group));
-    const extra = [...new Set(fields.map((f) => f.group))].filter(
+    // 手机端先摘掉桌面专属组，再排其余：`extra` 是把不在 `GROUP_ORDER` 里的
+    // 组补到末尾，故过滤必须发生在它之前，否则被隐藏的组会经 `extra` 漏回来。
+    const visible = isMobile
+      ? fields.filter((f) => !DESKTOP_ONLY_GROUPS.has(f.group))
+      : fields;
+    const order = GROUP_ORDER.filter((group) => visible.some((f) => f.group === group));
+    const extra = [...new Set(visible.map((f) => f.group))].filter(
       (group) => !order.includes(group),
     );
     return [...order, ...extra].map((group) => ({
       group,
-      fields: fields.filter((f) => f.group === group),
+      fields: visible.filter((f) => f.group === group),
     }));
-  }, [fields]);
+  }, [fields, isMobile]);
 
   const save = async (patch: Record<string, string | null>) => {
     if (Object.keys(patch).length === 0) return;
