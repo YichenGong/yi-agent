@@ -7,6 +7,7 @@ mod flags_cmd;
 mod llm_prefix;
 mod onboarding_prompt;
 mod schedule_intent;
+mod session_store;
 mod tracing_init;
 mod tui;
 

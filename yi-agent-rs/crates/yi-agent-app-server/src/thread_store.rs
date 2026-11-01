@@ -1214,13 +1214,25 @@ impl Drop for ThreadWriterLock {
         if let Some(table) = PROCESS_LOCKS.get()
             && let Ok(mut table) = table.lock()
         {
-            table.remove(&self.path);
+            // 只有当表里那份**已经失效**时才删：若此时表项还升级得出来，
+            // 说明是「表里那份 `Weak` 刚被我们 drop 触发」，删掉它是安全的；
+            // 反过来若同路径已被别的 Arc 重新插入，则不能误删。
+            let stale = table
+                .get(&self.path)
+                .map(|w| w.strong_count() == 0)
+                .unwrap_or(true);
+            if stale {
+                table.remove(&self.path);
+            }
         }
         // `_file` 在此之后 drop，内核锁随之释放。
     }
 }
 
-type LockTable = std::sync::Mutex<HashMap<PathBuf, Arc<ThreadWriterLock>>>;
+/// 表里存 `Weak`：存 `Arc` 会让表与锁互相持有，`ThreadWriterLock::drop`
+/// 永远不触发——于是 `flock` 永不释放，同一进程内「关掉会话再打开」会
+/// 一直被自己挡住（表现为 `WouldBlock`），且每条会话都泄漏一个描述符。
+type LockTable = std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<ThreadWriterLock>>>;
 
 /// 进程级去重表：`flock` 按**打开文件描述**加锁，不按路径。
 ///
@@ -1243,11 +1255,14 @@ pub fn acquire_thread_lock(
     let path = thread_lock_path(root, thread_id);
 
     // 先查表：本进程已持有则直接返回同一个 Arc。
+    // 用 `Weak::upgrade` 而非直接 clone：表项可能已随上一次 drop 失效。
     {
-        let table = process_locks().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = table.get(&path) {
-            return Ok(Arc::clone(existing));
+        let mut table = process_locks().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = table.get(&path).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
         }
+        // 失效项顺手清掉，避免表无限增长。
+        table.remove(&path);
     }
 
     std::fs::create_dir_all(root).map_err(|e| ThreadLockError::Io(e))?;
@@ -1282,7 +1297,7 @@ pub fn acquire_thread_lock(
     process_locks()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(path, Arc::clone(&lock));
+        .insert(path, Arc::downgrade(&lock));
     Ok(lock)
 }
 
@@ -3400,6 +3415,19 @@ mod tests {
             Some("user-turn-e"),
             "the opening prompt must be recoverable"
         );
+    }
+
+    #[test]
+    fn thread_lock_is_reacquirable_after_drop() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        {
+            let _g = acquire_thread_lock(root, "thread-reacq").unwrap();
+        }
+        // drop 之后必须能重新拿到：进程内表要清干净，否则同一进程内
+        // 「关掉再打开同一会话」会永远返回同一个旧 Arc（且内核锁状态不明）。
+        let again = acquire_thread_lock(root, "thread-reacq").unwrap();
+        assert!(Arc::strong_count(&again) >= 1);
     }
 
     #[test]
