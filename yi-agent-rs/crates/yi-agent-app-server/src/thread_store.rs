@@ -131,6 +131,14 @@ pub struct ThreadMeta {
     /// 回合结束，不写本字段。
     #[serde(default)]
     pub last_completed_at: i64,
+    /// 从哪个 thread fork 而来。**仅用于展示**，任何读取路径都不看它。
+    ///
+    /// 既有 meta 文件都没有这个字段。`Option<T>` 在 serde 里缺失即 `None`，
+    /// 所以零迁移读得进来（`old_meta_without_forked_from_reads_as_none` 钉住
+    /// 这一点）。`skip_serializing_if` 保证未 fork 的会话不写这个键，避免给
+    /// 所有既有 meta 平白加一个 `null`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 impl ThreadMeta {
@@ -1134,6 +1142,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     }
 }
 
@@ -1288,6 +1297,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         }
     }
 
@@ -2200,6 +2210,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         }
     }
 
@@ -2594,6 +2605,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -2646,6 +2658,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
@@ -2723,6 +2736,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -2850,6 +2864,7 @@ mod tests {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         };
         store.create(&lead).unwrap();
         store
@@ -2931,6 +2946,7 @@ mod tests {
                     anchor_sha: None,
                     last_read_at: 0,
                     last_completed_at: 0,
+                    forked_from: None,
                 })
                 .unwrap();
             store
@@ -3360,6 +3376,26 @@ mod tests {
             crate::server::item_id(&loaded.items[0]),
             Some("user-turn-e"),
             "the opening prompt must be recoverable"
+        );
+    }
+
+    #[test]
+    fn old_meta_without_forked_from_reads_as_none() {
+        let (_dir, s) = store();
+        // 既有 meta 文件全都没有 forked_from。缺 #[serde(default)] 时反序列化
+        // 会失败，load 走 rebuild_meta 兜底并把 cwd 冲成空串——这里同时断言 cwd。
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-nofork"),
+            r#"{"thread_id":"thread-nofork","cwd":"/tmp/keep-me","model":"m","created_at":1,
+                "updated_at":1,"title":null,"permission_mode":"normal"}"#,
+        )
+        .unwrap();
+        let loaded = s.load("thread-nofork").unwrap().expect("meta must parse");
+        assert_eq!(loaded.meta.forked_from, None);
+        assert_eq!(
+            loaded.meta.cwd, "/tmp/keep-me",
+            "cwd 被冲成空串说明反序列化失败了，走了 rebuild_meta 兜底"
         );
     }
 

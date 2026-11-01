@@ -575,6 +575,7 @@ fn only_the_lead_sees_the_memory_tools() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -709,6 +710,7 @@ fn only_the_lead_sees_the_view_tools() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
         })
         .expect("a plain meta must persist");
     // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
@@ -6172,6 +6174,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7708,6 +7711,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7823,6 +7827,7 @@ async fn a_turn_while_off_persists_without_credentials() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7925,6 +7930,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9337,6 +9343,7 @@ fn write_meta(
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9369,6 +9376,7 @@ fn write_lead_meta(dir: &Path, id: &str) {
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -11264,6 +11272,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -11380,6 +11389,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             anchor_sha: None,
             last_read_at: 0,
             last_completed_at: 0,
+            forked_from: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -13357,6 +13367,7 @@ async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
                 anchor_sha: None,
                 last_read_at: 0,
                 last_completed_at: 0,
+                forked_from: None,
                 extra_roots: Vec::new(),
                 role: Some(crate::thread_store::LEAD_ROLE.into()),
             })
@@ -19235,6 +19246,7 @@ fn the_lead_does_not_get_ask_lead() {
         anchor_sha: None,
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();

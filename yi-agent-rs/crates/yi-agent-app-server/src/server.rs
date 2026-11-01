@@ -7224,6 +7224,7 @@ pub(crate) async fn start_thread_core(
         // 新会话：从未被读过、也从未完成过回合 ⇒ 0/0，不亮蓝点。
         last_read_at: 0,
         last_completed_at: 0,
+        forked_from: None,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
