@@ -31,3 +31,59 @@ jobs:
       # yi-agent-rs/justfile 的 `ci` recipe 依赖列表（不再内联，避免漏列而漂移，
       # 例如新挂的 secret-check）。GitHub PR / GitLab push / GitLab MR 三条路径
       # 统一走 `just ci`，故此处不再单列一步，否则同一条门禁在 GitHub 路径上会跑两遍。
+
+  desktop:
+    # 独立 job：`rust:latest` 系镜像没有 Node，桌面测试不能塞进 just ci。
+    #
+    # Node 22：vite 8 的 engines 是 `^20.19.0 || >=22.12.0`
+    # （实测 node_modules/vite/package.json），Node 20 其实也在允许范围内
+    # （`"20"` 取 20.x 最新，当日为 v20.20.2）。选 22 的理由是维护活跃度：
+    # v20 自 2026-03-24 起未再发版，v22 最新为 v22.23.4（2026-10-20，LTS Jod）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Desktop type check + unit tests
+        working-directory: yi-agent-rs
+        run: just desktop-check
+
+  macos:
+    # macOS 专属代码在 PR 阶段就该有信号：21 处 cfg(target_os = "macos")
+    # （power 8 / tools 6 / app-server 7）在 ubuntu runner 上根本不会被编译。
+    #
+    # 镜像选择（2026-11-01 核对 actions/runner-images README）：
+    #   - macos-14 已于 2026-11-02 退役（官方 changelog 2026-10-01，issue #13518），不用
+    #   - macos-latest 现在指向 macOS 26，会随 GitHub 调整漂移，门禁要用固定标签
+    #   - macos-15 是当前可用的 arm64 固定标签，可用
+    # 只跑三个 crate：目标是覆盖 macOS 特有路径，不是重复 Linux 已跑过的验证。
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: yi-agent-rs
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.150
+
+      - name: Run macOS-gated tests
+        working-directory: yi-agent-rs
+        run: |
+          cargo nextest run --all-features \
+            -p yi-agent-power -p yi-agent-tools -p yi-agent-app-server \
+            --profile ci

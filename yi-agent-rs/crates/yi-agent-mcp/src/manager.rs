@@ -759,6 +759,9 @@ pub(crate) type TestConnector = std::sync::Arc<
         + Sync,
 >;
 
+/// 进程级 seam。**只在 `cargo test` 下有意义**：nextest 每测试一个进程，
+/// 进程级静态天然隔离，不必也争不到锁。保留它是为了让人仍能
+/// `cargo test -p yi-agent-mcp --lib` 单跑。
 #[cfg(test)]
 pub(crate) static TEST_CONNECTOR: std::sync::Mutex<Option<TestConnector>> =
     std::sync::Mutex::new(None);

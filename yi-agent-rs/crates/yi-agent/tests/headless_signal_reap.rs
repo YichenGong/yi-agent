@@ -25,8 +25,13 @@ fn yi_agent_bin() -> PathBuf {
 /// Serve one OpenAI-compatible SSE completion per request: the first emits a
 /// `bash` tool call, every later one (a tool result is in the transcript)
 /// finishes the turn.
-fn spawn_mock_gateway(port: u16, probe_cmd: &str) -> std::thread::JoinHandle<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock gateway");
+///
+/// 接收**已绑定**的 listener，不自己 bind。
+///
+/// 端口由内核分配（调用方传 `127.0.0.1:0` 再读 `local_addr()`），因此不存在
+/// 「先算一个端口再抢」的假设：多个测试并行、或同一台机器上跑两份测试，都不会
+/// 撞。
+fn spawn_mock_gateway(listener: TcpListener, probe_cmd: &str) -> std::thread::JoinHandle<()> {
     let cmd = probe_cmd.to_string();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -160,11 +165,19 @@ fn start_run_with_live_tool(port: u16, pid_file: &str) -> (ChildGuard, i32) {
 }
 
 fn signal_and_expect_group_reaped(signal: i32) {
-    let port = 9000 + (signal as u16 % 500);
-    // One pid file per signal so the two tests can run in parallel.
-    let pid_file = format!("/tmp/yi-headless-signal-tool-{signal}.pid");
+    // 端口交给内核分配。原来用「9000 加上 signal % 500」推导端口，靠「两个信号号
+    // 恰好不同」避让，那是巧合不是设计：换信号号或并发跑两份测试就会撞。
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock gateway");
+    let port = listener.local_addr().expect("local addr").port();
+    // pid 文件放进进程专属临时目录，不再写死 /tmp（全局共享，同名会互相覆盖）。
+    let pid_dir = tempfile::tempdir().expect("tempdir for pid file");
+    let pid_file = pid_dir
+        .path()
+        .join(format!("headless-signal-tool-{signal}.pid"))
+        .to_string_lossy()
+        .into_owned();
     let cmd = format!("echo $$ > {pid_file}; sleep 60");
-    let _gateway = spawn_mock_gateway(port, &cmd);
+    let _gateway = spawn_mock_gateway(listener, &cmd);
 
     let (mut child, pgid) = start_run_with_live_tool(port, &pid_file);
     assert!(

@@ -1,10 +1,25 @@
+# 仓库级 nextest 配置。必须与 workspace 的 Cargo.toml 同级（即 yi-agent-rs/）。
+#
+# `terminate-after` 的单位是「周期数」，不是秒：period = 60s 且 terminate-after = 3
+# 表示第 3 个 60s 周期结束（累计 180s）才终止；第 1、2 个周期只标 SLOW。
+# 写成 terminate-after = "180s" 是不行的——它只接受整数。
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
+# 显式覆盖内建默认值 true：合并门禁需要知道一次 PR 里到底坏了几个地方，
+# 首个失败就停会让修一个推一次、来回排队。本地想要快速失败用 `--fail-fast`。
 fail-fast = false
 
 [profile.ci]
+# 键名是 inherits（带 s）。已实测：写成 inherit 不报错退出，只在 stderr 打一行
+#   warning: ... ignoring unknown configuration key: profile.ci.inherit
+# 后果是 slow-timeout 等 default 段配置**静默不继承**（JUnit 仍会生成，因为
+# profile.ci.junit 是同级键，不依赖继承）。所以一定要按 Step 2 卡住这个警告。
 inherits = "default"
+# 刻意不重试：先加重试会训练团队忽略红灯。需要重试的是被显式隔离的测试，
+# 那是后续议题。
 retries = 0
 
 [profile.ci.junit]
+# 相对路径解析到 target/nextest/<profile>/ 下，即 target/nextest/ci/junit.xml。
 path = "junit.xml"

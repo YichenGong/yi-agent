@@ -216,24 +216,38 @@ mod tests {
 
         // 等 stub 写出自己的身份。文件是重定向时先建、内容后写，只判 exists 会
         // 读到空文件、在下面 get 的 unwrap 上随机 panic，故按内容轮询。
-        let text = {
-            let mut text = String::new();
-            for _ in 0..100 {
-                text = std::fs::read_to_string(&marker).unwrap_or_default();
-                if ["pid=", "cwd=", "pgid="]
-                    .iter()
-                    .all(|key| text.contains(key))
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+        //
+        // 宽预算：100 x 20ms 的 2s 上限把机器负载写进了断言（实测并发下会超）。
+        // 20s 是 backstop，不是期望值。
+        let budget = std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + budget;
+        let mut text;
+        loop {
+            text = std::fs::read_to_string(&marker).unwrap_or_default();
+            if ["pid=", "cwd=", "pgid="]
+                .iter()
+                .all(|key| text.contains(key))
+            {
+                break;
             }
-            text
-        };
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 超时后不要在各字段的 `unwrap()` 上 panic——那会把「子进程没起来」报
+        // 成「Option::unwrap on None」，丢掉真正的原因。先给出可读诊断。
+        assert!(
+            ["pid=", "cwd=", "pgid="]
+                .iter()
+                .all(|key| text.contains(key)),
+            "the detached child never reported its identity within {budget:?}; \
+             marker file held: {text:?}"
+        );
         let get = |key: &str| {
             text.lines()
                 .find_map(|l| l.strip_prefix(&format!("{key}=")))
-                .unwrap()
+                .expect("the diagnostic assert above guarantees every key is present")
                 .to_string()
         };
 

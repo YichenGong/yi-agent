@@ -4263,7 +4263,10 @@ mod tests {
             Some(flags),
             Some("dev"),
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 宽预算：本测试断言的是「监督器会拉起子进程」，不是「它 3 秒内拉起」。
+        // 实测全量并发下这一拍要 3.03s（单跑 0.52s），固定 3s 只是把机器负载
+        // 写进了断言。30s 是 backstop，不是期望值——正常情况下 1s 内就返回。
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut started = false;
         while Instant::now() < deadline {
             if marker.exists() {
