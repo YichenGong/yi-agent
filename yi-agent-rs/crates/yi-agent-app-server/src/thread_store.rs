@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use yi_agent_core::{ContentBlock, Message, Role};
@@ -1133,6 +1135,123 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         last_read_at: 0,
         last_completed_at: 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 跨进程会话写锁
+// ---------------------------------------------------------------------------
+
+/// 某个 thread 的写者锁路径：`<root>/<thread-id>.lock`。
+///
+/// 与 `.jsonl` / `.meta.json` 平级。`list()` 只认 `.meta.json` 后缀，天然跳过它。
+pub fn thread_lock_path(root: &Path, thread_id: &str) -> std::path::PathBuf {
+    root.join(format!("{thread_id}.lock"))
+}
+
+/// 会话已被另一个 writer 持有。
+#[derive(Debug)]
+pub struct ThreadBusy {
+    pub thread_id: String,
+}
+
+impl std::fmt::Display for ThreadBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "会话 {} 正被另一个 yi-agent 实例使用", self.thread_id)
+    }
+}
+
+impl std::error::Error for ThreadBusy {}
+
+/// 持有的会话写锁。`Drop` 时关闭 `File`，内核随之释放 `flock`。
+///
+/// **锁文件永不删除。** 删掉会让「已打开同一 inode 的竞争者」锁在 unlinked 文件
+/// 上，第三个进程新建同名文件后两者都以为持锁（见 `device_store.rs:78` 的同类说明）。
+pub struct ThreadWriterLock {
+    /// 只为持有 `flock` 而存在。字段名带下划线是因为从不读取。
+    _file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl Drop for ThreadWriterLock {
+    fn drop(&mut self) {
+        // 从进程级去重表移除自己，下一次 acquire 才会重新走内核 flock。
+        if let Some(table) = PROCESS_LOCKS.get()
+            && let Ok(mut table) = table.lock()
+        {
+            table.remove(&self.path);
+        }
+        // `_file` 在此之后 drop，内核锁随之释放。
+    }
+}
+
+type LockTable = std::sync::Mutex<HashMap<PathBuf, Arc<ThreadWriterLock>>>;
+
+/// 进程级去重表：`flock` 按**打开文件描述**加锁，不按路径。
+///
+/// 同一进程内两次 `open` 同一路径会得到两个描述符，各拿一次锁互不阻塞——于是
+/// 「本进程已持有」会被自己判成空闲。表挂在进程级静态量上，与
+/// `group_store.rs:120` 的 `static LOCK` 同思路。
+static PROCESS_LOCKS: std::sync::OnceLock<LockTable> = std::sync::OnceLock::new();
+
+fn process_locks() -> &'static LockTable {
+    PROCESS_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 取某个 thread 的写锁。进程内幂等（同一路径返回同一个 `Arc`）。
+///
+/// 非阻塞：冲突立即返回 [`ThreadBusy`]，调用方决定是报错还是提示 `fork`。
+pub fn acquire_thread_lock(
+    root: &Path,
+    thread_id: &str,
+) -> Result<Arc<ThreadWriterLock>, ThreadBusy> {
+    let path = thread_lock_path(root, thread_id);
+
+    // 先查表：本进程已持有则直接返回同一个 Arc。
+    {
+        let table = process_locks().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = table.get(&path) {
+            return Ok(Arc::clone(existing));
+        }
+    }
+
+    std::fs::create_dir_all(root).map_err(|_| ThreadBusy {
+        thread_id: thread_id.to_string(),
+    })?;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| ThreadBusy {
+            thread_id: thread_id.to_string(),
+        })?;
+
+    let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if outcome != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN
+        ) {
+            return Err(ThreadBusy {
+                thread_id: thread_id.to_string(),
+            });
+        }
+        // 真故障（坏描述符 / 不支持的 fs）不能被误报成「会话被占用」，
+        // 否则用户永远查不出原因。这里退化为放行并记账，由调用方的 IO 错误暴露。
+        eprintln!("[thread_store] flock failed on {}: {error}", path.display());
+    }
+
+    let lock = Arc::new(ThreadWriterLock {
+        _file: file,
+        path: path.clone(),
+    });
+    process_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path, Arc::clone(&lock));
+    Ok(lock)
 }
 
 #[cfg(test)]
@@ -3261,5 +3380,68 @@ mod tests {
         .unwrap();
         let loaded = s.load("thread-old").unwrap().expect("meta must parse");
         assert_eq!(loaded.meta.anchor_sha, None);
+    }
+
+    // --- 跨进程会话写锁（Task 1）---
+
+    #[test]
+    fn thread_lock_is_idempotent_within_a_process() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let a = acquire_thread_lock(root, "thread-lock-idem").unwrap();
+        let b = acquire_thread_lock(root, "thread-lock-idem").unwrap();
+        // 同一进程内必须拿到同一个 Arc，否则 flock 按描述符加锁会自欺欺人
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn thread_lock_file_survives_release() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        {
+            let _g = acquire_thread_lock(root, "thread-lock-keep").unwrap();
+        }
+        assert!(
+            thread_lock_path(root, "thread-lock-keep").exists(),
+            "锁文件不能被删除：删了会让已持有旧 inode 的进程与新建同名文件的进程都以为持锁"
+        );
+    }
+
+    #[test]
+    fn thread_lock_rejects_a_second_process() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let _held = acquire_thread_lock(root, "thread-lock-proc").unwrap();
+
+        // 子进程尝试拿同一把锁：必须失败
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "thread_store::tests::child_tries_thread_lock",
+                "--nocapture",
+                "--ignored",
+            ])
+            .env("YI_LOCK_ROOT", root)
+            .env("YI_LOCK_THREAD", "thread-lock-proc")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("LOCK_BUSY"),
+            "子进程应报告 LOCK_BUSY，实际: {stderr}"
+        );
+    }
+
+    /// 由 `thread_lock_rejects_a_second_process` 以子进程方式调用。
+    #[test]
+    #[ignore]
+    fn child_tries_thread_lock() {
+        let root = std::path::PathBuf::from(std::env::var("YI_LOCK_ROOT").unwrap());
+        let id = std::env::var("YI_LOCK_THREAD").unwrap();
+        match acquire_thread_lock(&root, &id) {
+            Ok(_) => eprintln!("LOCK_ACQUIRED_UNEXPECTEDLY"),
+            Err(e) => eprintln!("LOCK_BUSY {e}"),
+        }
     }
 }
