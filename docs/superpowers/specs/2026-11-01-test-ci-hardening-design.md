@@ -20,13 +20,19 @@
 > **关于测量基准的一次自我纠正**：复核中段我曾以主仓库工作区为基准测量，得出「桌面测试 146 文件」「`rpc_tests.rs` 21277 行」等结论——那是错的。主仓库 `main` 上当时并行存在 thread-fork 的未提交改动（`git status` 有 `M`/`UU`），同一文件两次测得 21272 / 21434。**已全部回退，并在本 worktree 的 `df3cf1f2` 干净基线上重测**：140 文件 / 1851 声明 + `it.each`×8 ≈ 1859 用例、21272 行、10945 行。文末 #20 记录了这次教训。
 >
 > **第三轮（写 implementation plan 时逐条实跑）**：以「计划里每条命令都要能真跑」为标准复核，又修正 3 处，并**撤回了我自己在第三轮开头做出的 2 处误判**：
-> 1. 阶段 3a-补 的失败清单从「3 个」改为「**5 个**」——连跑四轮，失败数在 1/4/2 之间浮动、失败集合每次不同，新增 `the_supervisor_loop_starts_a_manifest_when_its_switch_is_on`（`main.rs:4257` 固定 3s）与 `a_detached_child_leads_its_own_session_and_runs_in_the_project`（`daemon.rs:221` 固定 2s + 超时后 `unwrap` panic）。阶段 3 的完成判据因此改为**连跑四轮全绿**。
+> 1. 阶段 3a-补 的失败清单从「3 个」改为「**5 个**」——连跑四轮，失败数在 1/4/2 之间浮动、失败集合每次不同，新增 `the_supervisor_loop_starts_a_manifest_when_its_switch_is_on`（`main.rs:4266` 固定 3s）与 `a_detached_child_leads_its_own_session_and_runs_in_the_project`（`daemon.rs:221` 固定 2s + 超时后 `unwrap` panic）。阶段 3 的完成判据因此改为**连跑四轮全绿**。
 > 2. `refreshing_a_stale_manifest_...` 的 5s 超时不是测试侧问题，而是**生产常量** `DESCRIBE_TIMEOUT`（`refresh.rs:34`），必须单列一次「改生产代码」的提交并附代价分析。
 > 3. `wait_until(impl Fn)` 包不住 `supervisor.reconcile()`（需要 `&mut`），签名须先改 `impl FnMut() -> bool`。
 >
 > 两处**误判的撤回**（原文已改回，教训记在 #21 / #24）：
 > - 我曾因 `runner-images` README 只有 deprecated 徽章而断定「macOS 14 无退役日期」——回查附录 A 的 changelog 原文，`"will be retired on November 2, 2026"` 白纸黑字。**README 没写日期不等于没有出处。**
 > - 我曾称「`node-version: "20"` 会让 vite 8 拒绝启动」——vite 的 engines 是 `^20.19.0 || >=22.12.0`，20 在允许范围内，`"20"` 取 20.x 最新（当日 v20.20.2）。选 Node 22 的真实理由是 v20 自 2026-03-24 起停止发版，而非「20 会挂」。
+>
+> **第四轮（合入 main 前重测，main `03149e99`）**：本分支基点 `32ec0db0` 之后 main 前进 62 个提交，把基线刷新后重测，**结论全部维持**，但所有绝对数字变化：
+> - nextest 收集数 **3875 → 3954**；单轮实跑 `3953 passed, 1 failed`（失败的仍是 `a_childs_exit_is_recorded_once_not_once_per_tick`），5 个 flaky 测试**全部仍存在**，固定预算也一个没被改（`main.rs:4266` 的 3s、`supervisor.rs:785` 的 20 拍、`daemon.rs:221` 的 100×20ms、`refresh.rs:34` 的 5s）。
+> - 桌面 **140 文件/1856 用例 → 146 文件/1932 用例**（main 新增了测试）。
+> - `yi-agent` crate **829 → 865**；`yi-agent-supervisors` 仍 **87**；`export_bindings` 仍 **18**；power+tools+app-server 实测 **1520 passed / 7 skipped**。
+> - 行号随之偏移，已逐条回源修正（`main.rs:4257→4266`、`supervisor.rs:780-790→784-789`、`supervisor.rs:35→36`、`daemon.rs:218-240→219-238`、`config.rs:544→554`、`ws.rs:605→609`、`supervisor.rs:37-44→36-39`）。
 >
 > 全部核查过程与依据见文末「核查记录」。
 
@@ -38,7 +44,7 @@
 
 ### 缺口 1：桌面端测试不在任何 CI 里
 
-`desktop/src` 下有 140 个 `*.test.ts*`，运行时 **1856 条用例**（`npx vitest run` 实测，11.66s），`desktop/package.json:10` 有 `"test": "vitest run"`。但：
+`desktop/src` 下有 146 个 `*.test.ts*`，运行时 **1932 条用例**（`npx vitest run` 实测，12.47s；main `03149e99` 基线），`desktop/package.json:10` 有 `"test": "vitest run"`。但：
 
 - `yi-agent-rs/justfile:36` 的 `ci:` 依赖列表里没有它；
 - `.github/workflows/ci.yml`、`.gitlab-ci.yml` 只调 `just ci`；
@@ -53,7 +59,7 @@
 | 静态 | 位置 | 保护方式 |
 |---|---|---|
 | `TEST_CONNECTOR` | `yi-agent-mcp/src/manager.rs:763` | `seam_guard()` 手动持锁到 await 之后 |
-| `ENV_TEST_MUTEX` | `yi-agent-runtime/src/config.rs:544` | 42 处 `lock()` 调用 |
+| `ENV_TEST_MUTEX` | `yi-agent-runtime/src/config.rs:554` | 42 处 `lock()` 调用 |
 | `SPAWN_LOCK` | `yi-agent-supervisors/tests/supervisor.rs:18` | 起子进程的测试串行 |
 
 这些锁是有效补丁，但**约束只存在于代码里**，没有变成仓库规则；且 `cargo test` 下一个测试 panic 会带走同进程的其他测试。
@@ -161,11 +167,11 @@ desktop-check:
 ```
 $ npx tsc --noEmit      -> exit 0（无输出）
 $ npx vitest run        -> Test Files 140 passed (140)
-                           Tests 1856 passed (1856)
+                           Tests 1932 passed (1932)
                            Duration 11.66s
 ```
 
-**结论：桌面测试当前全绿，阶段 1 没有前置修复任务。** 用例数以运行时 1856 为准（静态数 `it()` 是一个近似值，`it.each` 与参数化会改变实际条数）。
+**结论：桌面测试当前全绿，阶段 1 没有前置修复任务。** 用例数以运行时 1932 为准（静态数 `it()` 是一个近似值，`it.each` 与参数化会改变实际条数）。
 
 若将来因新增改动变红：修复测试是阶段 1 的前置任务。**不能通过放宽门禁（skip 用例、降级断言）来让它变绿**，否则这次改造就变成了给已知问题盖盖子。
 
@@ -259,7 +265,7 @@ CI 里安装 nextest 用 `taiki-e/install-action@v2`（`tool: nextest`），比 
 
 | 资源 | 实际状况 | 是否需要 test-groups |
 |---|---|---|
-| TCP 端口 | 15 处已绑定 `127.0.0.1:0`（`relay/tests/bridge.rs:70`、`llm/tests/integration.rs:638`、`app-server/src/ws.rs:605` 等） | 否 |
+| TCP 端口 | 15 处已绑定 `127.0.0.1:0`（`relay/tests/bridge.rs:70`、`llm/tests/integration.rs:638`、`app-server/src/ws.rs:609` 等） | 否 |
 | daemon socket | 每个测试一个 `TempDir`（`runtime_ipc.rs` 99 处、`runtime_coordinator.rs` 96 处） | 否 |
 | sqlite | 每 daemon 一条连接 + `Mutex`，文件名由 `TempDir` 决定 | 否 |
 | **`headless_signal_reap` 的端口 + /tmp pid 文件** | **固定值，靠信号不同这份巧合避让** | **是** |
@@ -304,7 +310,7 @@ let _gateway = spawn_mock_gateway(listener, &cmd);
 
 ### 3a-补：实测发现的真实阻塞（2026-11-01，nextest 0.9.150）
 
-首次全量 `cargo nextest run --all-features --workspace --profile ci` 结果：
+首次全量 `cargo nextest run --all-features --workspace --profile ci` 结果（**历史记录**，基线 `df3cf1f2`；合入前在 main `03149e99` 上重测为 3954 个测试、单轮 1 failed，见修订记录第四轮）：
 
 ```
 Summary [46.968s] 3875 tests run: 3872 passed, 3 failed, 27 skipped
@@ -330,7 +336,7 @@ FAIL yi-agent-supervisors::supervisor refreshing_a_stale_manifest_makes_switch_o
 2. **`SPAWN_LOCK` 在 nextest 下双重失效。** 它是进程级静态，nextest 进程隔离后本就无法跨测试生效；而原本它保护的正是「多测试同时 fork 子进程导致调度延迟」。所以这不是锁写错了，而是**该锁的语义在 nextest 下不存在**——`cargo test` 靠它变稳，nextest 下无人接替。
 3. **失败测试是时间预算型，不是逻辑错误。** 它写死「20 拍 × 50ms ≈ 1s」的观测窗口，断言日志里 `exited demo` 命中 1 次；高负载下子进程尚未退出，断言得到 0。单独跑 1.08s 稳定通过，全量跑 1.09s 就失败——差在负载，不在逻辑。
 
-**因此阶段 3 的首要工作从「修端口」改为「修这个测试的时间预算」**：把固定 `20 × 50ms` 观测窗口改为 `wait_until` 轮询（该文件已有现成的 `wait_until` + 20s 预算约定，见 `supervisor.rs:37-44`）。这样它在任何运行器、任何并发度下都稳定，而不是靠 test-groups 掩盖。
+**因此阶段 3 的首要工作从「修端口」改为「修这个测试的时间预算」**：把固定 `20 × 50ms` 观测窗口改为 `wait_until` 轮询（该文件已有现成的 `wait_until` + 20s 预算约定，见 `supervisor.rs:36-39`）。这样它在任何运行器、任何并发度下都稳定，而不是靠 test-groups 掩盖。
 
 **待办真伪确认：** 另两个失败（`stopping_clears_the_forwarding_table`、`refreshing_a_stale_manifest_makes_switch_off_actually_stop_the_child`）只出现一次、复跑即过，属于同类时间预算问题，一并纳入同一修法排查。
 

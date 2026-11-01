@@ -29,16 +29,19 @@
 
 写这份计划时全部实跑过，执行者可直接对照，**不必重新试探**：
 
-| 项目 | 实测值 |
+| 项目 | 实测值（main `03149e99` 基线） |
 |---|---|
-| nextest 收集到的测试总数 | `3875`（`cargo nextest list --all-features --workspace \| grep -c "::"`） |
-| 全量 nextest 跑（含 27 skipped） | 40~51s，**失败数随负载在 1~4 之间浮动**，非固定值 |
+| nextest 收集到的测试总数 | `3954`（`cargo nextest list --all-features --workspace \| grep -c "::"`） |
+| 全量 nextest 跑（含 27 skipped） | 44s，**失败数随负载浮动**（单轮实测 1 个），非固定值 |
 | doctest 总数 | **0**（14 个 crate 全 0，`cargo test --doc` 实测） |
 | `cargo test -p yi-agent-supervisors --test supervisor` | `23 passed` |
-| `cargo nextest run -p yi-agent-app-server export_bindings` | `18 tests run: 18 passed`，exit 0 |
+| `cargo nextest run -p yi-agent-app-server export_bindings` | `18 tests run: 18 passed`，0.163s |
+| `yi-agent-supervisors` 全 crate | `87` 个测试 |
+| `yi-agent` 全 crate | `865` 个测试 |
+| power + tools + app-server 三个 crate | `1520 passed, 7 skipped`，36.6s |
 | 桌面 `npx tsc --noEmit` | exit 0，无输出 |
-| 桌面 `npx vitest run` | `140 files / 1856 tests passed`，12.57s |
-| JUnit 产物 | `yi-agent-rs/target/nextest/ci/junit.xml`，688KB |
+| 桌面 `npx vitest run` | `146 files / 1932 tests passed`，12.47s |
+| JUnit 产物 | `yi-agent-rs/target/nextest/ci/junit.xml` |
 
 ### 已实测确认的 5 个脆弱测试（这是 Task 3 的完整输入）
 
@@ -46,8 +49,8 @@
 
 | # | 测试 | 位置 | 根因（实测栈） |
 |---|---|---|---|
-| 1 | `yi-agent::bin/yi-agent tests::the_supervisor_loop_starts_a_manifest_when_its_switch_is_on` | `crates/yi-agent/src/main.rs:4257` | `let deadline = Instant::now() + Duration::from_secs(3)` 固定 3s；单跑 0.52s 过，全量 3.03s 超时 |
-| 2 | `yi-agent-supervisors::supervisor a_childs_exit_is_recorded_once_not_once_per_tick` | `crates/yi-agent-supervisors/tests/supervisor.rs:780-790` | `for _ in 0..20 { reconcile(); sleep(50ms) }` 固定 1s 观测窗；断言拿到 `exited` 计数 0（应为 1） |
+| 1 | `yi-agent::bin/yi-agent tests::the_supervisor_loop_starts_a_manifest_when_its_switch_is_on` | `crates/yi-agent/src/main.rs:4266` | `let deadline = Instant::now() + Duration::from_secs(3)` 固定 3s；单跑 0.52s 过，全量 3.03s 超时 |
+| 2 | `yi-agent-supervisors::supervisor a_childs_exit_is_recorded_once_not_once_per_tick` | `crates/yi-agent-supervisors/tests/supervisor.rs:784-789` | `for _ in 0..20 { reconcile(); sleep(50ms) }` 固定 1s 观测窗；断言拿到 `exited` 计数 0（应为 1） |
 | 3 | `yi-agent-supervisors daemon::tests::a_detached_child_leads_its_own_session_and_runs_in_the_project` | `crates/yi-agent-supervisors/src/daemon.rs:221` | `for _ in 0..100 { ...; sleep(20ms) }` 固定 2s；超时后 `text` 为空，`get()` 里 `unwrap()` 在 `None` 上 panic（`daemon.rs:236`） |
 | 4 | `yi-agent-supervisors::supervisor refreshing_a_stale_manifest_makes_switch_off_actually_stop_the_child` | 生产常量 `crates/yi-agent-supervisors/src/refresh.rs:34` | `DESCRIBE_TIMEOUT = 5s`；实测报 `` `describer.sh manifest` did not answer within 5s `` → `RefreshOutcome::Skipped` |
 | 5 | `yi-agent-runtime supervise::tests::stopping_clears_the_forwarding_table` | `crates/yi-agent-runtime/src/supervise.rs:350` | `wait_for(&marker, Duration::from_secs(3))` 固定 3s。**写计划时未复现**，按同一类隐患一并处理 |
@@ -91,7 +94,7 @@ Task 8  文档与进度收尾 ── 依赖全部
 
 ### Task 1: 复核桌面测试基线（不绿则先修）
 
-写计划时已实测全绿（140 files / 1856 tests / 12.57s）。这个任务只做确认，**任何修复都不许通过 skip 或降级断言完成**。
+写计划时已实测全绿（146 files / 1932 tests / 12.47s）。这个任务只做确认，**任何修复都不许通过 skip 或降级断言完成**。
 
 **Files:**
 - 无代码改动（除非失败）
@@ -123,7 +126,7 @@ Expected: `exit=0`，无输出。
 cd desktop && export PATH="/opt/homebrew/bin:$PATH" && npx vitest run 2>&1 | tail -6
 ```
 
-Expected: `Test Files 140 passed (140)`、`Tests 1856 passed (1856)`。
+Expected: `Test Files 146 passed (146)`、`Tests 1932 passed (1932)`。
 
 - [ ] **Step 4: 若失败，按根因修**
 
@@ -216,7 +219,7 @@ cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-a
   && cargo nextest run --all-features --workspace --profile ci --no-fail-fast 2>&1 | grep -E "^     Summary|^        FAIL" | sort -u
 ```
 
-Expected：`3875 tests run`，失败数 **1~4 个，且组合每次不同**。写计划时的四轮实测：
+Expected：`3954 tests run`，失败数 **1~4 个，且组合每次不同**。写计划时的四轮实测：
 
 | 轮次 | 失败数 | 失败集合（编号见「5 个脆弱测试」表） |
 |---|---|---|
@@ -261,14 +264,14 @@ cd yi-agent-rs && git add .config/nextest.toml && git commit -m "test: 新增 ne
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-supervisors/tests/supervisor.rs:39`（`wait_until` 签名）
-- Modify: `yi-agent-rs/crates/yi-agent-supervisors/tests/supervisor.rs:780-790`（#2）
-- Modify: `yi-agent-rs/crates/yi-agent/src/main.rs:4257`（#1）
-- Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/daemon.rs:218-240`（#3）
+- Modify: `yi-agent-rs/crates/yi-agent-supervisors/tests/supervisor.rs:784-789`（#2）
+- Modify: `yi-agent-rs/crates/yi-agent/src/main.rs:4266`（#1）
+- Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/daemon.rs:219-238`（#3）
 - Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/refresh.rs:34`（#4）
 - Modify: `yi-agent-rs/crates/yi-agent-runtime/src/supervise.rs:303-315, 350`（#5）
 
 **Interfaces:**
-- Consumes: `wait_until`（`supervisor.rs:39`）、`CHILD_START_BUDGET`（`supervisor.rs:35`，20s）、`wait_for`（`daemon.rs` / `supervise.rs` 各自私有）
+- Consumes: `wait_until`（`supervisor.rs:39`）、`CHILD_START_BUDGET`（`supervisor.rs:36`，20s）、`wait_for`（`daemon.rs` / `supervise.rs` 各自私有）
 - Produces: 5 个测试在任何并发度下稳定。Task 5 依赖这一点。
 
 #### 3a. 先改 `wait_until` 签名（一次编译验证）
@@ -309,7 +312,7 @@ Expected: 单跑 `1 passed`；全 crate 里这条 FAIL，报 `left: 0, right: 1`
 
 - [ ] **Step 4: 改测试**
 
-`crates/yi-agent-supervisors/tests/supervisor.rs:780-790` 当前形态：
+`crates/yi-agent-supervisors/tests/supervisor.rs:784-789` 当前形态：
 
 ```rust
     let mut supervisor = supervisor_for(workdir, "dev");
@@ -372,7 +375,7 @@ Expected: 三次都是 `23 tests run: 23 passed`。**必须跑 `binary(superviso
 
 - [ ] **Step 6: 改固定 3s 预算**
 
-`crates/yi-agent/src/main.rs:4257` 附近当前形态：
+`crates/yi-agent/src/main.rs:4266` 附近当前形态：
 
 ```rust
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -413,13 +416,13 @@ Expected: 三次都是 `23 tests run: 23 passed`。**必须跑 `binary(superviso
 cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin" && for i in 1 2 3; do cargo nextest run -p yi-agent --profile ci 2>&1 | grep -E "^     Summary"; done
 ```
 
-Expected: 三次都是 `829 tests run: 829 passed`（13 skipped）。
+Expected: 三次都是 `865 tests run: 865 passed`（13 skipped）。
 
 #### 3d. 修 #3：`a_detached_child_leads_its_own_session_and_runs_in_the_project`
 
 - [ ] **Step 8: 改轮询预算，并去掉超时后的 `unwrap` panic**
 
-`crates/yi-agent-supervisors/src/daemon.rs:218-240` 当前形态（注意两个缺陷：固定 2s、超时后 `get()` 在空串上 `unwrap()`）：
+`crates/yi-agent-supervisors/src/daemon.rs:219-238` 当前形态（注意两个缺陷：固定 2s、超时后 `get()` 在空串上 `unwrap()`）：
 
 ```rust
         let text = {
@@ -518,7 +521,7 @@ cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-dar
 
 - [ ] **Step 10b: `ENV_TEST_MUTEX` 两处**
 
-`crates/yi-agent-runtime/src/config.rs:544` 与 `crates/yi-agent/src/config.rs:468`，把
+`crates/yi-agent-runtime/src/config.rs:554` 与 `crates/yi-agent/src/config.rs:468`，把
 
 ```rust
 /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
@@ -623,7 +626,7 @@ cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-a
 cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin" && for i in 1 2 3 4; do cargo nextest run --all-features --workspace --profile ci --no-fail-fast 2>&1 | grep -E "^     Summary|^        FAIL" | sort -u; echo "--- run $i end ---"; done
 ```
 
-Expected: **四轮全绿**（`3875 tests run: 3875 passed, 27 skipped`）。四轮而不是一轮，是因为原问题的表现就是「每次失败组合不同」；一轮绿说明不了什么。
+Expected: **四轮全绿**（`3954 tests run: 3954 passed, 27 skipped`）。四轮而不是一轮，是因为原问题的表现就是「每次失败组合不同」；一轮绿说明不了什么。
 
 - [ ] **Step 17: 确认 `cargo test` 路径也没坏**
 
@@ -763,8 +766,8 @@ cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-dar
 **前置条件：Task 3 已完成且四轮全绿。** 否则这一步之后 `just test` 就是红的。
 
 **Files:**
-- Modify: `yi-agent-rs/justfile:21-23`（`test`）
-- Modify: `yi-agent-rs/justfile:45-49`（`bindings-check`）
+- Modify: `yi-agent-rs/justfile:22-23`（`test`）
+- Modify: `yi-agent-rs/justfile:47-49`（`bindings-check`）
 
 **Interfaces:**
 - Consumes: `.config/nextest.toml` 的 `ci` profile（Task 2）
@@ -780,7 +783,7 @@ Expected: `cargo-nextest 0.9.150`。
 
 - [ ] **Step 2: 改 `test` recipe**
 
-`justfile:21-23` 当前：
+`justfile:22-23` 当前：
 
 ```make
 # 跑全部测试
@@ -804,7 +807,7 @@ test:
 
 - [ ] **Step 3: 改 `bindings-check` recipe**
 
-`justfile:45-49` 当前：
+`justfile:47-49` 当前：
 
 ```make
 bindings-check:
@@ -838,7 +841,7 @@ Expected: `18 tests run: 18 passed`（写计划时实测 18、0.147s）。
 cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin" && just test 2>&1 | tail -6
 ```
 
-Expected: 先打印 `cargo-nextest 0.9.150`，然后 `Summary [..] 3875 tests run: 3875 passed, 27 skipped`。
+Expected: 先打印 `cargo-nextest 0.9.150`，然后 `Summary [..] 3954 tests run: 3954 passed, 27 skipped`。
 
 - [ ] **Step 6: 验证 JUnit 产物是这次生成的**
 
@@ -901,7 +904,7 @@ desktop-check:
 cd yi-agent-rs && export PATH="/opt/homebrew/bin:$PATH" && just desktop-check 2>&1 | tail -8
 ```
 
-Expected: tsc 无输出；vitest 末尾 `Test Files 140 passed (140)`、`Tests 1856 passed (1856)`。
+Expected: tsc 无输出；vitest 末尾 `Test Files 146 passed (146)`、`Tests 1932 passed (1932)`。
 
 - [ ] **Step 3: 加 GitHub job**
 
@@ -1105,9 +1108,9 @@ cd /Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent
 在 `## Features` 下追加（每条带可验证判据，这是仓库规范）。**数字必须用你自己跑出来的，不要照抄这里**：
 
 ```markdown
-- [x] 桌面端类型检查与单元测试进流水线 — `just desktop-check`（`tsc --noEmit` + `vitest run`）；GitHub `desktop` job、GitLab `ci-desktop` job（node:22）各自独立，不进 `just ci`（`rust:latest` 无 Node）。判据：`cd desktop && npx vitest run` 输出 `Tests 1856 passed`；故意改坏一条断言后 push，对应 job 必须红
-- [x] Rust 测试迁移到 nextest — `yi-agent-rs/.config/nextest.toml`（profile `ci`，`inherits = "default"`，JUnit 到 `target/nextest/ci/junit.xml`）；`justfile` 的 `test` / `bindings-check` 改调 `cargo nextest`。判据：`just test` 打印 `cargo-nextest 0.9.150` 且 `3875 tests run: 3875 passed`；`ls target/nextest/ci/junit.xml` 存在且 mtime 为本次
-- [x] 时间预算型脆弱测试消除 — 4 处固定观测窗口改为条件轮询 / 宽 backstop：`supervisor.rs`（`wait_until` 改 `FnMut`）、`main.rs:4257`、`daemon.rs:221`、`supervise.rs`；另有 `refresh.rs` 的 `DESCRIBE_TIMEOUT` 5s→15s。判据：`cargo nextest run --all-features --workspace --profile ci` **连跑四轮全绿**
+- [x] 桌面端类型检查与单元测试进流水线 — `just desktop-check`（`tsc --noEmit` + `vitest run`）；GitHub `desktop` job、GitLab `ci-desktop` job（node:22）各自独立，不进 `just ci`（`rust:latest` 无 Node）。判据：`cd desktop && npx vitest run` 输出 `Tests 1932 passed`；故意改坏一条断言后 push，对应 job 必须红
+- [x] Rust 测试迁移到 nextest — `yi-agent-rs/.config/nextest.toml`（profile `ci`，`inherits = "default"`，JUnit 到 `target/nextest/ci/junit.xml`）；`justfile` 的 `test` / `bindings-check` 改调 `cargo nextest`。判据：`just test` 打印 `cargo-nextest 0.9.150` 且 `3954 tests run: 3954 passed`；`ls target/nextest/ci/junit.xml` 存在且 mtime 为本次
+- [x] 时间预算型脆弱测试消除 — 4 处固定观测窗口改为条件轮询 / 宽 backstop：`supervisor.rs`（`wait_until` 改 `FnMut`）、`main.rs:4266`、`daemon.rs:221`、`supervise.rs`；另有 `refresh.rs` 的 `DESCRIBE_TIMEOUT` 5s→15s。判据：`cargo nextest run --all-features --workspace --profile ci` **连跑四轮全绿**
 - [x] headless 测试端口与临时文件加固 — `headless_signal_reap.rs` 的 `spawn_mock_gateway` 改为接收已绑定 listener（`127.0.0.1:0` 内核分配）；pid 文件挪进 `tempfile::tempdir()`。判据：`grep -n "9000 +" crates/yi-agent/tests/headless_signal_reap.rs` 无输出；`cargo nextest run -p yi-agent --test headless_signal_reap --profile ci` 连跑三次通过
 - [x] 进程级静态的语义说明 — `SPAWN_LOCK`、`ENV_TEST_MUTEX`（两处）、`TEST_CONNECTOR` 的注释注明「`cargo test` 下有效、nextest 下跨不过进程边界」。判据：`git diff -U0 crates/ | grep -E "^[+-]" | grep -vE "^[+-]{3}" | grep -vE "^[+-]\s*(//|///)"` 无输出（即只动了注释）
 - [x] macOS 门禁 — `.github/workflows/ci.yml` 的 `macos` job，`runs-on: macos-15`，只跑 power/tools/app-server。判据：临时删掉一处 power 的 macOS 断言后该 job 必须红；`macos-14` 已 deprecated（runner-images #13518），不可回退
@@ -1141,7 +1144,7 @@ cd /Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent
 cd yi-agent-rs && export PATH="/tmp/nx:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin" && just ci 2>&1 | tail -5 && just desktop-check 2>&1 | tail -4
 ```
 
-Expected: `CI passed` + `Tests 1856 passed`。
+Expected: `CI passed` + `Tests 1932 passed`。
 
 - [ ] **Step 6: 提交**
 
