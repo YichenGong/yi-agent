@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::rpc::{Domain, domain_for};
+use crate::server::test_support::{is_terminal_state, serve_scoped_with_loopback};
 use crate::test_support::{EVENT_WAIT, isolated_models_path};
 
 /// detach 的前提：这两个域的状态必须是 `Send + Sync + 'static`，否则
