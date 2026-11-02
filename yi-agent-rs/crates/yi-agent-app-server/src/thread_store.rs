@@ -1443,12 +1443,21 @@ fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// canonical 比较用：路径不存在或不可 canonical 时退回原样，好让比较仍然确定。
-fn canonical_or_self(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// 该串是否可能是一个 thread id。
+///
+/// 驱动侧在校验 `resume_append` 的绑定时要用它:一个明显不是 id 的串该报
+/// `ThreadNotFound`(插件的绑定坏了),而不是等到严格读才以 I/O 错误出现,
+/// 那样插件只能按「不确定」处理。
+pub(crate) fn is_valid_thread_id(id: &str) -> bool {
+    valid_id(id)
 }
 
 /// Generated ids look like `thread-<uuid>`; allow only a conservative charset so

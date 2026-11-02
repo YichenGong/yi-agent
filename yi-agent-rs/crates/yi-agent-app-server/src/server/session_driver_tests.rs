@@ -1326,3 +1326,1084 @@ async fn a_launch_action_records_the_driver_origin_and_still_starts_a_turn() {
         "the driver must consume the delivered objective"
     );
 }
+
+/// 任务 3 的核心行为:被授权的合并轮必须回到**原会话**。
+///
+/// 这里钉住的是 precondition——热会话存在时,`resume_append` 必须复用同一个
+/// thread id,不新铸 uuid、不新写 meta,并且这一轮真的跑完。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_keeps_the_live_thread_identity() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    let tid = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir,
+            "original",
+            "first turn",
+            (None, None),
+        )
+        .await
+        .expect("a healthy factory must start the session")
+    };
+    assert!(host.settle_turn(&tid, Duration::from_secs(10)).await);
+
+    let action = DriverAction {
+        action_id: "act-resume".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.clone(),
+            workdir: workdir.clone(),
+            objective: "authorized merge".into(),
+            env: Vec::new(),
+        },
+    };
+    let returned = SessionLauncher::launch(&mut host.launcher(&build_test_agent), &action)
+        .await
+        .expect("resuming a live thread must be wired");
+    assert_eq!(
+        returned, tid,
+        "the merge must go back to the original thread"
+    );
+    assert_eq!(host.threads.len(), 1, "no replacement session may appear");
+    assert_eq!(
+        crate::thread_store::ThreadStore::new(Path::new(&workdir))
+            .list()
+            .unwrap()
+            .len(),
+        1,
+        "no second meta may be written"
+    );
+    assert!(host.settle_turn(&tid, Duration::from_secs(10)).await);
+}
+
+/// 冷路径的工厂:记录它**实际收到**的 session,供逐字段断言。
+///
+/// 记录的是 `Option<Session>` 的克隆——`build_agent` 的约定是「给了 session 就
+/// 把它装进建出的 agent」,故这份记录就是「恢复出来的历史真的走到了 agent」的
+/// 证据,而不是「我们以为传了」。
+#[derive(Clone, Default)]
+struct RecordingFactory {
+    seen: Arc<StdMutex<Vec<Option<yi_agent_core::Session>>>>,
+}
+
+impl RecordingFactory {
+    fn take(&self) -> Vec<Option<yi_agent_core::Session>> {
+        std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+
+    fn builder(
+        &self,
+    ) -> impl Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let seen = Arc::clone(&self.seen);
+        move |session, cwd, mode| {
+            seen.lock().unwrap().push(session.clone());
+            build_test_agent(session, cwd, mode)
+        }
+    }
+}
+
+/// 一条带可恢复上下文的持久化轮次,直接写盘。
+///
+/// 用它而不是「先真跑一轮再杀 driver」:本测试要断言的是**装配**行为(历史、
+/// 用量、meta 的逐字段保留),真跑一轮要等 mock 模型与落盘时序,断言会跟着
+/// 噪声漂。真跑的那条端到端路径由 `resume_append_after_a_real_first_turn_...`
+/// 覆盖。
+fn persist_turn(
+    workdir: &Path,
+    thread_id: &str,
+    meta: &crate::thread_store::ThreadMeta,
+    items: Vec<crate::protocol::Item>,
+    messages: Vec<yi_agent_core::Message>,
+    usage: crate::thread_store::TurnUsage,
+) {
+    let store = crate::thread_store::ThreadStore::new(workdir);
+    store.create(meta).unwrap();
+    store
+        .append_turn(
+            thread_id,
+            &crate::thread_store::TurnLine::Turn {
+                items,
+                usage: Some(usage),
+                usage_total: None,
+                messages,
+            },
+        )
+        .unwrap();
+}
+
+fn resume_meta(
+    workdir: &Path,
+    thread_id: &str,
+    model_ref: Option<&str>,
+) -> crate::thread_store::ThreadMeta {
+    let mut meta = crate::thread_store::ThreadMeta {
+        thread_id: thread_id.to_string(),
+        cwd: workdir.to_string_lossy().to_string(),
+        model: crate::test_support::TEST_MODEL.to_string(),
+        created_at: 1,
+        updated_at: 2,
+        title: Some("看板 · card-1".into()),
+        permission_mode: crate::thread_store::ThreadMode::Yolo,
+        pin_seq: None,
+        driver_project: Some("/proj".into()),
+        driver_ref: Some("card-1".into()),
+        model_ref: model_ref.map(str::to_string),
+        reasoning_effort: Some("high".into()),
+        tag: None,
+        preserve_thinking: false,
+        extra_roots: Vec::new(),
+        role: None,
+        content_epoch: 0,
+        last_item_id: None,
+        anchor_sha: Some("deadbeef".into()),
+        last_read_at: 0,
+        last_completed_at: 0,
+        forked_from: None,
+    };
+    meta.extra_roots = Vec::new();
+    meta
+}
+
+/// 冷路径的核心断言:**同一 workdir、同一 thread id**,历史完整接上。
+///
+/// 换一个 `Host` 即「宿主进程重启」:旧的 `threads` 表没了、driver 没了、锁随
+/// 旧会话的 `Arc` 释放。workdir 的 `TempDir` 必须仍然存活,否则会话的盘上
+/// 归属目录就消失了(那是 `WorkdirMissing`,不是本测试的意图)。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_cold_restores_the_same_thread_and_history() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let tid = "thread-cold-restore-1";
+
+    let first_items = vec![
+        crate::protocol::Item::UserMessage {
+            id: "user-turn-a".into(),
+            text: "do the first thing".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        },
+        crate::protocol::Item::AgentMessage {
+            id: "agent-turn-a".into(),
+            text: "done".into(),
+        },
+    ];
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        first_items,
+        vec![
+            yi_agent_core::Message::user("do the first thing"),
+            yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                "done".into(),
+            )]),
+        ],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 42,
+            output_tokens: 7,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    let factory = RecordingFactory::default();
+    let action = DriverAction {
+        action_id: "act-cold".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.to_string(),
+            workdir: workdir_str.clone(),
+            objective: "authorized merge".into(),
+            env: Vec::new(),
+        },
+    };
+    let returned = SessionLauncher::launch(&mut host.launcher(&factory.builder()), &action)
+        .await
+        .expect("a cold thread with good history must be restorable");
+    assert_eq!(returned, tid, "the merge must land on the original id");
+
+    // 工厂实际收到的那份 session 就是证据:两条消息都在,用量也接上了。
+    let seen = factory.take();
+    let restored = seen
+        .iter()
+        .find_map(|session| session.as_ref())
+        .expect("the cold path must hand the restored history to the factory");
+    assert_eq!(
+        restored.messages().len(),
+        2,
+        "both turns of the stored transcript must come back: {:?}",
+        restored.messages()
+    );
+    assert_eq!(
+        restored.last_input_tokens(),
+        Some(42),
+        "the last input tokens must be restored so auto-compact works on turn one"
+    );
+
+    // 内存与盘上都没有新会话:一个 thread、一份 meta、id 未变。
+    assert_eq!(host.threads.len(), 1);
+    assert!(host.threads.contains_key(tid));
+    let metas = crate::thread_store::ThreadStore::new(&workdir)
+        .list()
+        .unwrap();
+    assert_eq!(metas.len(), 1, "restoring must not create a second meta");
+    assert_eq!(metas[0].thread_id, tid);
+    assert_eq!(metas[0].title.as_deref(), Some("看板 · card-1"));
+    assert_eq!(metas[0].driver_ref.as_deref(), Some("card-1"));
+    assert_eq!(metas[0].anchor_sha.as_deref(), Some("deadbeef"));
+    assert_eq!(metas[0].reasoning_effort.as_deref(), Some("high"));
+    assert!(!metas[0].preserve_thinking);
+
+    // 这一轮真的跑起来了,并且跑在恢复出的 agent 上。
+    assert!(
+        host.threads
+            .get(tid)
+            .is_some_and(|session| session.active_turn_id.is_some()),
+        "the merge turn must be occupying the restored thread"
+    );
+    assert!(host.settle_turn(tid, Duration::from_secs(10)).await);
+}
+
+/// 冷恢复必须把「上次用量」交给**实际建出的** agent,而不只是工厂参数。
+///
+/// 与上一条分开,是因为它钉住的是 `apply_session` 的那一步(重建 agent 时
+/// `last_input_tokens` 不能在 live 句柄上归零 —— 否则 auto-compact 在恢复后
+/// 首轮不生效)。agent 由 `BuiltAgent` 交回,故直接读它。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_cold_applies_the_restored_usage_to_the_built_agent() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let tid = "thread-cold-usage-1";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![crate::protocol::Item::UserMessage {
+            id: "user-turn-u".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }],
+        vec![yi_agent_core::Message::user("hi")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 12_345,
+            output_tokens: 6,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    let seen_tokens: Arc<StdMutex<Vec<Option<u32>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen_tokens);
+    let builder = move |session: Option<yi_agent_core::Session>,
+                        cwd: &Path,
+                        mode: crate::thread_store::ThreadMode| {
+        let built = build_test_agent(session, cwd, mode)?;
+        // 记录「实际建出的 agent 的 live session 句柄」。`build_test_agent` 已经把
+        // 历史装进这个句柄,故读到什么就是 agent 真正会用的上下文。
+        recorded.lock().unwrap().push(
+            built
+                .agent
+                .session_handle()
+                .lock()
+                .unwrap()
+                .last_input_tokens(),
+        );
+        Ok(built)
+    };
+    let action = DriverAction {
+        action_id: "act-cold-usage".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.to_string(),
+            workdir: workdir_str,
+            objective: "authorized merge".into(),
+            env: Vec::new(),
+        },
+    };
+    SessionLauncher::launch(&mut host.launcher(&builder), &action)
+        .await
+        .expect("restore must succeed");
+    assert_eq!(
+        seen_tokens.lock().unwrap().as_slice(),
+        &[Some(12_345)],
+        "the restored usage must reach the live session handle"
+    );
+}
+
+/// 分类必须真的落到 `anyhow` 的源链上:插件只信 `error_code`,不信错误文本。
+fn failure_code(error: &anyhow::Error) -> Option<crate::session_driver::DriverErrorCode> {
+    error
+        .downcast_ref::<crate::session_driver::DriverActionFailure>()
+        .map(|failure| failure.code)
+}
+
+fn resume_action(thread_id: &str, workdir: &str, objective: &str) -> DriverAction {
+    DriverAction {
+        action_id: "act-resume".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: thread_id.to_string(),
+            workdir: workdir.to_string(),
+            objective: objective.to_string(),
+            env: Vec::new(),
+        },
+    }
+}
+
+/// 热会话**不该**因为动作带了 env 而被拒。
+///
+/// env 只对冷装配有意义(热会话不重建工具),而插件无从知道宿主这边是热是冷,
+/// 故它对热会话也会照常带上。拒收会让「原会话还活着」这个最好的情形反而失败。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_accepts_env_on_a_live_thread() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    let tid = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir,
+            "original",
+            "first turn",
+            (None, None),
+        )
+        .await
+        .expect("the session must start")
+    };
+    assert!(host.settle_turn(&tid, Duration::from_secs(10)).await);
+
+    let action = DriverAction {
+        action_id: "act-hot-env".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.clone(),
+            workdir: workdir.clone(),
+            objective: "authorized merge".into(),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".into(), "card-1".into())],
+        },
+    };
+    let returned = SessionLauncher::launch(&mut host.launcher(&build_test_agent), &action)
+        .await
+        .expect("a live thread must not be rejected just because the action carries env");
+    assert_eq!(returned, tid);
+    assert!(host.settle_turn(&tid, Duration::from_secs(10)).await);
+}
+
+/// 忙碌的原会话必须**零副作用**地被拒:`busy` 分类、旧 turn 的 id 与 cancel
+/// 信号都不许被动过。插件据 `busy` 把卡退回队列,任何对活 turn 的扰动都会让
+/// 开发会话被合并动作打断。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_refuses_a_busy_thread_without_touching_its_turn() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    // 慢模型:首轮会一直挂着,留下一个真实的活跃 turn。
+    let tid = {
+        let mut launcher = host.launcher(&build_slow_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir,
+            "original",
+            "slow first turn",
+            (None, None),
+        )
+        .await
+        .expect("the slow session must still start")
+    };
+    let before_turn = host
+        .threads
+        .get(&tid)
+        .and_then(|session| session.active_turn_id.clone())
+        .expect("the slow turn must be occupying the thread");
+    let before_interrupt = host.threads.get(&tid).unwrap().interrupt_tx.clone();
+
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(&tid, &workdir, "authorized merge"),
+    )
+    .await
+    .expect_err("a busy thread must be refused");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::Busy)
+    );
+
+    assert_eq!(
+        host.threads
+            .get(&tid)
+            .and_then(|session| session.active_turn_id.clone()),
+        Some(before_turn),
+        "the live turn id must be untouched"
+    );
+    assert!(
+        !before_interrupt.is_closed(),
+        "the busy thread's control channel must stay open"
+    );
+    assert_eq!(host.threads.len(), 1, "no second session may appear");
+}
+
+/// 动作里的 workdir 与会话实际所属目录不一致时不能投递。
+///
+/// 这是「用错的目录去合并」的唯一拦截点:同一个 thread id 在另一个树里可能
+/// 指向完全不同的仓库,投进去比不合并危险得多。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_refuses_a_thread_from_another_workdir() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    let tid = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir,
+            "original",
+            "first turn",
+            (None, None),
+        )
+        .await
+        .expect("the session must start")
+    };
+    assert!(host.settle_turn(&tid, Duration::from_secs(10)).await);
+
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(
+            &tid,
+            &elsewhere.path().to_string_lossy(),
+            "authorized merge",
+        ),
+    )
+    .await
+    .expect_err("a mismatched workdir must be refused");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed),
+        "the action names a tree the conversation does not live in"
+    );
+    assert!(
+        host.threads
+            .get(&tid)
+            .is_some_and(|session| session.active_turn_id.is_none()),
+        "a refused resume must not occupy the thread"
+    );
+}
+
+/// 原目录已被删除(开发 worktree 被清掉)⇒ `workdir_missing`,不去别处找。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_reports_a_missing_workdir() {
+    let mut host = Host::new();
+    let gone = host.workdir.join("already-deleted");
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(
+            "thread-missing-dir",
+            &gone.to_string_lossy(),
+            "authorized merge",
+        ),
+    )
+    .await
+    .expect_err("a missing directory must be refused");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::WorkdirMissing)
+    );
+    assert!(host.threads.is_empty(), "nothing may be registered");
+}
+
+/// 明显不是 thread id 的串 ⇒ `thread_not_found`(插件的绑定坏了),而不是等到
+/// 严格读才以一个笼统的 I/O 错误出现。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_reports_an_invalid_thread_id() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action("../../etc/passwd", &workdir, "authorized merge"),
+    )
+    .await
+    .expect_err("an id that could name a path must be refused");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::ThreadNotFound)
+    );
+    assert!(host.threads.is_empty());
+}
+
+/// 冷会话在本目录没有任何持久化历史 ⇒ `thread_not_found`,绝不新建一个空会话
+/// 顶着它的 id 继续合并(那就是失忆合并)。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_reports_a_thread_without_history() {
+    let mut host = Host::new();
+    let workdir = host.workdir.to_string_lossy().to_string();
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action("thread-never-persisted", &workdir, "authorized merge"),
+    )
+    .await
+    .expect_err("a thread with no history is not restorable");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::ThreadNotFound)
+    );
+    assert!(host.threads.is_empty(), "no session may be registered");
+    assert!(
+        crate::thread_store::ThreadStore::new(Path::new(&workdir))
+            .list()
+            .unwrap()
+            .is_empty(),
+        "no meta may be created for a thread that never existed"
+    );
+}
+
+/// 坏历史(meta 在、日志是垃圾)⇒ `restore_failed`,且不改写盘上文件。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_reports_corrupt_history_without_rewriting_it() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let tid = "thread-corrupt-history";
+    let store = crate::thread_store::ThreadStore::new(&workdir);
+    store.create(&resume_meta(&workdir, tid, None)).unwrap();
+    std::fs::write(store.root().join(format!("{tid}.jsonl")), b"{not json\n").unwrap();
+    let before = std::fs::read(store.root().join(format!("{tid}.jsonl"))).unwrap();
+
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir.to_string_lossy(), "authorized merge"),
+    )
+    .await
+    .expect_err("corrupt history must not be silently repaired");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed)
+    );
+    assert_eq!(
+        std::fs::read(store.root().join(format!("{tid}.jsonl"))).unwrap(),
+        before,
+        "a failed restore must leave the history byte-identical"
+    );
+    assert!(host.threads.is_empty());
+}
+
+/// 只有 meta、没有可恢复历史的冷会话(`/clear` 之后的样子)必须拒绝。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_refuses_a_meta_only_cold_thread() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let tid = "thread-meta-only";
+    crate::thread_store::ThreadStore::new(&workdir)
+        .create(&resume_meta(&workdir, tid, None))
+        .unwrap();
+
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir.to_string_lossy(), "authorized merge"),
+    )
+    .await
+    .expect_err("a meta-only session has no context to merge with");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed)
+    );
+    assert!(host.threads.is_empty());
+}
+
+/// 另一个 writer 进程持有该会话的写锁 ⇒ `busy`,且**不读盘、不登记**。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_reports_a_busy_writer_lock() {
+    use std::os::unix::io::AsRawFd;
+
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let tid = "thread-locked-elsewhere";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![crate::protocol::Item::UserMessage {
+            id: "user-turn-l".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }],
+        vec![yi_agent_core::Message::user("hi")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    // 另一个「进程」:同一路径上另开一个 fd 拿排他锁(flock 是按 fd 的,本进程
+    // 内的 `process_locks` 表不会被这一步骗过)。
+    let lock_path = crate::thread_store::thread_lock_path(
+        crate::thread_store::ThreadStore::new(&workdir).root(),
+        tid,
+    );
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test must be able to hold the lock");
+
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir.to_string_lossy(), "authorized merge"),
+    )
+    .await
+    .expect_err("a thread written elsewhere must be refused");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::Busy)
+    );
+    assert!(
+        host.threads.is_empty(),
+        "a busy writer must leave no registration behind"
+    );
+}
+
+/// 锁文件本身建不出来(这里让 `.yi-agent/threads` 是个普通文件)⇒
+/// `restore_failed`,不无锁继续。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_refuses_to_restore_without_a_lock() {
+    let workdir = tempfile::TempDir::new().unwrap();
+    let store_dir = crate::thread_store::ThreadStore::new(workdir.path())
+        .root()
+        .to_path_buf();
+    // 把整个 thread 存储根替换成一个普通文件:锁文件与历史都建不出来。
+    std::fs::create_dir_all(store_dir.parent().unwrap()).unwrap();
+    std::fs::write(&store_dir, b"not a directory").unwrap();
+
+    let mut host = Host::new();
+    let error = SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(
+            "thread-no-lock",
+            &workdir.path().to_string_lossy(),
+            "authorized merge",
+        ),
+    )
+    .await
+    .expect_err("an unavailable writer lock must not be ignored");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed),
+        "cold restore must not proceed lock-free"
+    );
+    assert!(host.threads.is_empty());
+}
+
+/// 冷恢复完成的会话,其 driver 已经不起作用(`prompt_rx` 的接收端随旧 driver
+/// 退出而关闭)时,投递必须**只回滚本次占位**,并回报 `delivery_failed`。
+///
+/// 这是 spec §7 那条边界的落点:「prepare/send 失败只回滚本次拥有的 turn 占位;
+/// 不能清掉已有 busy turn」。这里先让占位是本次新建的,再确认回滚后 thread 回到
+/// 空闲;同一宿主里另一条会话的活 turn 不受影响。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_rolls_back_only_its_own_placeholder() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+
+    // ① 一条**活的**会话,带着一个正在跑的 turn(它代表「别人的活"turn」)。
+    let live = {
+        let mut launcher = host.launcher(&build_slow_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir_str,
+            "live",
+            "slow turn",
+            (None, None),
+        )
+        .await
+        .expect("the slow session must start")
+    };
+    let live_turn = host
+        .threads
+        .get(&live)
+        .and_then(|session| session.active_turn_id.clone())
+        .expect("the slow turn must be running");
+
+    // ② 一个冷会话:先真起一轮让它落盘,然后把它从内存里摘掉、并让它的 driver
+    //    退出(丢接收端)——这正是「进程重启后 driver 不在」的形态,又不依赖
+    //    伪造的磁盘夹具。
+    let cold = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launch_via_driver(
+            &mut launcher,
+            &workdir_str,
+            "cold",
+            "first turn",
+            (None, None),
+        )
+        .await
+        .expect("the cold session must start")
+    };
+    assert!(host.settle_turn(&cold, Duration::from_secs(10)).await);
+    // 摘掉登记 ⇒ 释放 writer lock,使紧接的冷装配能拿到它(仍在新 Host 之外的
+    // 同一 workdir 上,等价于「另一个宿主进程」)。
+    host.threads.remove(&cold);
+    host.pending_activation.remove(&cold);
+    if let Some(watch) = host.process_watches.remove(&cold) {
+        watch.stop().await;
+    }
+
+    // ③ 冷装配成功,但紧接着把 driver 杀掉:投递时 `prompt_tx` 已无接收端。
+    {
+        let mut launcher = host.launcher(&build_test_agent);
+        launcher
+            .restore_driver_thread(&cold, &workdir_str, Vec::new())
+            .await
+            .expect("restoring a genuine persisted thread must succeed");
+    }
+    // 让 restored driver 退出:它的 `prompt_rx` 由 driver task 持有,测试里无法
+    // 直接丢弃;用「替换成一个已关闭通道」的等价手段——把会话的 prompt_tx 换掉,
+    // 这正是 driver 退出后 send 会看到的形态。
+    let (dead_tx, dead_rx) = mpsc::channel::<TurnPrompt>(1);
+    drop(dead_rx);
+    host.threads
+        .get_mut(&cold)
+        .expect("the restored session must be registered")
+        .prompt_tx = dead_tx;
+
+    let mut launcher = host.launcher(&build_test_agent);
+
+    let error = launcher
+        .prepare_and_deliver(&cold, "authorized merge")
+        .await
+        .expect_err("a closed prompt channel must fail the delivery");
+    assert!(
+        error.to_string().contains("gone"),
+        "unexpected error: {error}"
+    );
+
+    // 本次占位被回滚 ⇒ 会话回到空闲;别人的活 turn 一动不动。
+    assert!(
+        host.threads
+            .get(&cold)
+            .is_some_and(|session| session.active_turn_id.is_none()),
+        "the failed delivery must roll back only its own placeholder"
+    );
+    assert_eq!(
+        host.threads
+            .get(&live)
+            .and_then(|session| session.active_turn_id.clone()),
+        Some(live_turn),
+        "another live turn must not be cleared by a failed resume"
+    );
+}
+
+/// 观测量:恢复动作只发 **thread-keyed** 通知,不发任何 RPC 响应帧,也不重放全量
+/// 历史。桌面侧栏靠 `turn/started` + 开启项这两条内容通知看到这一轮。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_emits_thread_scoped_notifications_only() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let tid = "thread-cold-notifications";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![crate::protocol::Item::UserMessage {
+            id: "user-turn-n".into(),
+            text: "earlier".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }],
+        vec![yi_agent_core::Message::user("earlier")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 3,
+            output_tokens: 2,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    let mut frames = host
+        .hub
+        .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
+    // 响应帧是定向投递给 `ClientId::local()` 的,未登记会被静默丢弃;登记它,
+    // 「没有响应帧」才是一条有判别力的断言。
+    let mut local_frames = host
+        .hub
+        .register_reliable(crate::broadcast::ClientId::local());
+
+    SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir_str, "authorized merge"),
+    )
+    .await
+    .expect("restoring must succeed");
+
+    let mut seen = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        assert!(
+            frame.get("method").is_some(),
+            "notifications only, never a response frame: {frame}"
+        );
+        seen.push(frame);
+    }
+    assert!(
+        seen.iter().any(|frame| frame["method"] == "turn/started"),
+        "the restored turn must announce itself: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|frame| frame["method"] == "item/started"
+            && frame["params"]["item"]["text"] == "authorized merge"),
+        "the merge objective must open the turn: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| frame["method"] == "items/completed"),
+        "a resume must not replay the whole transcript: {seen:?}"
+    );
+    // 每一条内容通知都属于**这一条** thread。
+    for frame in &seen {
+        if let Some(thread_id) = frame["params"]["threadId"].as_str() {
+            assert_eq!(
+                thread_id, tid,
+                "a resume must not emit frames for another thread: {frame}"
+            );
+        }
+    }
+
+    let local: Vec<serde_json::Value> =
+        std::iter::from_fn(|| local_frames.try_recv().ok()).collect();
+    assert!(
+        local.iter().all(|frame| frame.get("id").is_none()),
+        "the launcher must answer no RPC client: {local:?}"
+    );
+
+    assert!(host.settle_turn(tid, Duration::from_secs(10)).await);
+}
+
+/// 同一条 thread 的「已登记」只算一次:重复的 resume 不得在观测表里造出第二份。
+///
+/// 与 `session_driver` 的单测互补:那条测的是插件侧的登记去重,这条测的是宿主
+/// 真的只留一个 `ThreadSession` 与一份 meta。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_registers_the_thread_exactly_once() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let tid = "thread-cold-dedupe";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![crate::protocol::Item::UserMessage {
+            id: "user-turn-d".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }],
+        vec![yi_agent_core::Message::user("hi")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir_str, "authorized merge"),
+    )
+    .await
+    .expect("the first resume must succeed");
+    assert!(host.settle_turn(tid, Duration::from_secs(10)).await);
+
+    // 第二次:此时已是热会话,同一条路径(热追加)也要落在同一个登记上。
+    SessionLauncher::launch(
+        &mut host.launcher(&build_test_agent),
+        &resume_action(tid, &workdir_str, "merge again"),
+    )
+    .await
+    .expect("a follow-up resume of a live thread must succeed");
+    assert_eq!(host.threads.len(), 1);
+    assert_eq!(
+        crate::thread_store::ThreadStore::new(&workdir)
+            .list()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(host.settle_turn(tid, Duration::from_secs(10)).await);
+}
+
+/// 端到端:真跑完首轮 → 宿主「重启」(新 Host,同一 workdir) → 合并轮落在原会话,
+/// 并且模型侧真的看到了首轮的内容。
+///
+/// 与上面用夹具写盘的那几条互补:它们断言装配细节,这条证明**真实落盘的
+/// transcript** 也能被冷恢复读成上下文。旧 `TempDir` 必须继续存活——它是会话
+/// 的目录归属,删了就是 `WorkdirMissing`。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_after_a_real_first_turn_keeps_the_transcript() {
+    let workdir_dir = tempfile::TempDir::new().unwrap();
+    let workdir = workdir_dir.path().to_path_buf();
+    let workdir_str = workdir.to_string_lossy().to_string();
+
+    // ① 第一个宿主:真起一轮并等它落盘。
+    let tid = {
+        let mut host = Host::new();
+        let usage_agent = build_usage_agent_for_resume();
+        let tid = {
+            let mut launcher = host.launcher(&usage_agent);
+            launch_via_driver(
+                &mut launcher,
+                &workdir_str,
+                "看板 · card-e2e",
+                "first turn",
+                (None, None),
+            )
+            .await
+            .expect("the session must start")
+        };
+        assert!(host.settle_turn(&tid, Duration::from_secs(20)).await);
+        // 离开作用域即「进程退出」:driver 被丢下,writer lock 随会话 drop 释放。
+        tid
+    };
+
+    // 首轮真的写进了盘:meta + 至少一条带 messages 的 turn。用 store 自己的
+    // 定位方式(`list`/`restore`),不另外拼路径。
+    let store = crate::thread_store::ThreadStore::new(&workdir);
+    assert!(
+        store
+            .restore_for_driver(&tid, &workdir)
+            .expect("the persisted thread must be strictly readable")
+            .is_some(),
+        "the first turn must have persisted meta and a log"
+    );
+
+    // ② 第二个宿主:同一 workdir,冷恢复。
+    let mut host = Host::new();
+    let restored = Arc::new(StdMutex::new(Vec::new()));
+    let recorder = Arc::clone(&restored);
+    let builder = move |session: Option<yi_agent_core::Session>,
+                        cwd: &Path,
+                        mode: crate::thread_store::ThreadMode| {
+        recorder
+            .lock()
+            .unwrap()
+            .push(session.as_ref().map(|s| s.messages().len()));
+        build_test_agent(session, cwd, mode)
+    };
+    let returned = SessionLauncher::launch(
+        &mut host.launcher(&builder),
+        &resume_action(&tid, &workdir_str, "authorized merge"),
+    )
+    .await
+    .expect("the persisted thread must be restorable");
+    assert_eq!(returned, tid);
+    assert_eq!(
+        restored.lock().unwrap().as_slice(),
+        &[Some(2)],
+        "the model must receive both the prompt and the answer of the first turn"
+    );
+    assert!(host.settle_turn(&tid, Duration::from_secs(20)).await);
+
+    // 合并轮也落进同一份日志:没有第二个会话。
+    assert_eq!(
+        store.list().unwrap().len(),
+        1,
+        "the merge turn must not add a second session"
+    );
+}
+
+/// `build_usage_agent` 在 `server::tests` 里是私有的;这里就地包一个同型工厂,
+/// 让首轮带上真实用量(这样冷恢复的 `last_input_tokens` 断言才有内容)。
+fn build_usage_agent_for_resume() -> impl Fn(
+    Option<yi_agent_core::Session>,
+    &Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    |session, cwd, mode| crate::server::tests::build_usage_agent_for_tests(session, cwd, mode)
+}
+
+/// spec §5.1:冷装配**必须**在实际构造 bash 工具时应用 env;装配失败不得降级成
+/// 「遗漏 env 的 BuiltAgent」再宣称成功。
+///
+/// 本夹具里没有真 daemon,故 `attach_delegation` 会走降级分支(`tooling_error`
+/// 有值)。这正是要拦的情形:调用方带了 env,合并命令会落在一个拿不到卡片句柄的
+/// shell 里。必须报 `restore_failed`,并且**不留下**一个被登记成可用的会话。
+///
+/// 真实 runtime 装配下 env 的端到端验证在 Task 7 的插件串联夹具里做(计划明确
+/// 允许这一分工:不能靠 FakeDaemon 的失败降级来证明 env 生效)。
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_append_refuses_to_drop_an_injected_environment() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let tid = "thread-cold-env";
+    persist_turn(
+        &workdir,
+        tid,
+        &resume_meta(&workdir, tid, None),
+        vec![crate::protocol::Item::UserMessage {
+            id: "user-turn-e".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }],
+        vec![yi_agent_core::Message::user("hi")],
+        crate::thread_store::TurnUsage {
+            model: crate::test_support::TEST_MODEL.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    );
+
+    // 让委派装配**确定失败**并不可重试:项目 runtime 缓存里预置一条永久失败,
+    // `attach_cwd_runtime` 会直接返回它,不再尝试 ensure-owned-runtime。这样
+    // `tooling_error` 必有值,正是「工具没能带上 env」的那一支。
+    host.runtimes.lock().unwrap().insert(
+        super::project_key(&workdir),
+        Err(yi_agent_subagent::attach::AttachFailure::new(
+            "test",
+            "the test forces the degraded assembly",
+        )),
+    );
+
+    let action = DriverAction {
+        action_id: "act-env".into(),
+        kind: DriverActionKind::ResumeAppend {
+            thread_id: tid.to_string(),
+            workdir: workdir.to_string_lossy().to_string(),
+            objective: "authorized merge".into(),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".into(), "card-1".into())],
+        },
+    };
+    let error = SessionLauncher::launch(&mut host.launcher(&build_test_agent), &action)
+        .await
+        .expect_err("dropping an injected card handle must not be reported as success");
+    assert_eq!(
+        failure_code(&error),
+        Some(crate::session_driver::DriverErrorCode::RestoreFailed),
+        "unexpected error: {error}"
+    );
+    assert!(
+        host.threads.is_empty(),
+        "a thread that cannot carry its environment must not be registered as usable"
+    );
+    // 装配阶段为本次 thread 建出的 root 也必须清掉,否则 `thread_roots` 里留下
+    // 一条没人持有的记录(项目共享的 runtime binding 则不受影响)。
+    assert!(
+        !host.thread_roots.lock().unwrap().contains_key(tid),
+        "a refused assembly must not leave a per-thread root behind"
+    );
+}

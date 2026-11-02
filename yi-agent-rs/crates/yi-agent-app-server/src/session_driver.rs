@@ -80,10 +80,8 @@ pub(crate) enum DriverActionKind {
 ///
 /// 拼写与 spec §5.2 及两端契约逐字对齐（`driver-protocol.json`）。
 ///
-/// TODO(Task 3)：`ResumeAppend` 的恢复/投递落地后，各分类会在这里被真正构造。
-/// 在那之前只有测试与契约用到它们，故先允许未构造——契约本身（错误码拼写）
-/// 必须在 Task 1 就钉住，否则插件无从按契约分流。
-#[allow(dead_code)]
+/// 契约本身（错误码拼写）在 Task 1 就钉住；驱动侧的内核
+/// (`server/driver_resume.rs`) 现在按这些分类构造失败，插件据此分流。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverErrorCode {
     /// 会话正忙（有 turn 在跑）。零副作用：没有取消、没有抢占、没有投递。
