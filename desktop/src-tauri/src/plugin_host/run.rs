@@ -227,6 +227,17 @@ pub fn handle_request(
     }
 }
 
+/// 关闭之后是否要重建容器。
+///
+/// 只取决于**关闭是否成功**，与页面是否配合无关。这个门控原先写成
+/// `blocked_confirmed && closed`：页面不主动宣告阻塞（静态页面连 JS 都不跑，
+/// 真实攻击者同样不会宣告）时，原生侧只关不建，等于「重建失控容器」这条
+/// 能力从未被验证过。spec §4.7 把页面当作潜在失控客户端，宿主的重建能力
+/// 不能建立在对方先举手之上。
+pub fn should_rebuild_after_close(closed: bool) -> bool {
+    closed
+}
+
 /// 原生侧对恢复用例的裁定。只有三个条件同时成立才算通过：
 /// 1. 页面确实进入了阻塞（阻塞前上报过），且之后**没有**再报“恢复”；
 /// 2. 原生侧关闭并重建过容器（代数 ≥ 2）；
@@ -567,7 +578,7 @@ fn drive_probe(
     state.note(format!("close of the blocked container reported: {closed}"));
 
     let mut rebuilt = false;
-    if blocked_confirmed && closed {
+    if should_rebuild_after_close(closed) {
         let thread_handle = handle.clone();
         let state_clone = Arc::clone(state);
         let main_config = main.cloned();

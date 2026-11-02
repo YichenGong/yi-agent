@@ -26,10 +26,10 @@
 | 构建 | 本 worktree 的 release bundle，`--features plugin-probe` |
 | 产物 | `desktop/src-tauri/target/release/bundle/macos/yi-agent.app` |
 | 可执行文件 | `Contents/MacOS/desktop`（不是 `productName`，见 §7） |
-| 应用摘要 | `29c184d719cf29702a084a7baf7483c13d76762e2383540f7d21b665d0b56bf0`（bundle 全量哈希；随构建变化，复现时以报告里的 `appSha256` 为准） |
+| 应用摘要 | `d40eb89fc862f80ddfaa9cdf26c7f4552774ca5bc7e274aea90f9c2574101edd`（`app_digest()` 对 `Contents/MacOS/desktop` 取的文件摘要，不是整个 bundle；随构建变化，复现时以报告里的 `appSha256` 为准） |
 | 容器配置摘要 | `95a6a842b55fde346833d08161794773997073f04d163f8f2b7da3862c341b5` |
 | 实例根 | 一次性临时目录（`YI_AGENT_HOME` 指向它），不触碰真实 `~/.yi-agent` |
-| 结论 | 12 / 12 用例通过（`startedAt` 18:18:01.070Z → `finishedAt` 18:18:01.932Z，时长约 0.86s） |
+| 结论 | 12 / 12 用例通过（`startedAt` 18:25:40.269Z → `finishedAt` 18:25:41.141Z，时长约 0.87s） |
 
 复现命令：
 
@@ -151,7 +151,7 @@ node desktop/scripts/plugins/probe.mjs --suite isolation \
   --fixture-root /tmp/probe-negative --output .artifacts/plugins/negative.json
 ```
 
-结果：**12/12 失败**，每条证据为 `native deadline expired`，恢复用例为四项事实全否，进程正常退出、报告正常落盘、runner 退 1。
+结果：**12/12 失败**。11 条证据为 `native deadline expired`；恢复用例不是四项全否，而是「页面从未确认阻塞」与「重建后无交互回报」成立为 FAIL，而「原生侧已重建到 generation 2」「宿主持久化 marker 仍在」两条事实为真——这正是修复 §7.6 之后应有的样子：宿主的重建能力被实打实走通，但整个用例依然失败，因为页面确实什么都没做。进程正常退出、报告正常落盘、runner 退 1。
 
 这个负例第一次跑时**没有产出任何报告**——进程在「没有窗口了」时退出了事件循环，把还在等截止时间的编排线程一起带走。那会让失败表现为「探针没跑过」而不是「探针跑失败了」，是最糟的一种沉默。修复方式是：只有在编排线程明确置位 `finished` 之后才允许 `ExitRequested` 生效。顺序必须「先置位、再 exit」，反过来会永远退不出去。
 
@@ -169,11 +169,13 @@ node desktop/scripts/plugins/probe.mjs --suite isolation \
 |---|---|---|
 | fixture | `plugins/fixtures/example-counter/probe`（含 `attacks.js`） | `/tmp/probe-negative`（只有一段静态 HTML） |
 | 页面行为 | 主动攻击并上报 | 什么都不做 |
-| 结果 | 12/12 通过 | 12/12 失败，全部 `native deadline expired` |
+| 结果 | 12/12 通过 | 12/12 失败：11 条 `native deadline expired`，`blocked_script_recovery` 为「页面从未确认阻塞 + 原生侧确实重建到 generation 2 + 重建后无交互回报」 |
 | 报告 | 正常落盘 | 正常落盘 |
 | 退出码 | 0 | 1 |
 
 配置没有为负例做任何放宽，负例也不是靠「换个配置」才失败的——这正是要证明的：失败来自页面行为与原生裁定，不是来自配置开关。
+
+注意两次报告的 `containerConfigSha256` **不同**（`95a6a842…` 对 `939dd5ea…`），这不代表策略变了。该摘要刻意把「容器配置 + 它服务的资源清单规模」一起哈希，正是为了防止「配置没变但白名单换了一套」仍显示同一个摘要；负例 fixture 只有 1 个文件、正例有 3 个，所以摘要必然不同。策略本体（CSP、scheme、`allow_remote_network=false`、`max_frames=4`、截止时间、恢复策略）两侧完全一致。
 
 ## 6. 支持平台矩阵
 
@@ -195,7 +197,8 @@ runner 对未支持平台的做法是**明确失败**而不是「跳过该平台
 3. **报告时间戳在构造时打点**，导致 `startedAt == finishedAt`、时长永远为 0，无法判断是否撞上截止时间。现由编排起点回推。
 4. **bundle 里的可执行文件不是 `productName`。** bundle 叫 `yi-agent.app`，但 `CFBundleExecutable` 是 `desktop`，兄弟位置还有一个 `yi-agent`（sidecar）。按 `productName` 猜会去 exec sidecar，得到 `unexpected argument '--plugin-probe-run'`。
 5. **负例静默无报告**（见 §4.7 末段）。
-6. **报告里的应用摘要会随重建变化。** 本文件初稿记的是更早一次 bundle 的哈希；写完文档后又重建过 bundle，两者对不上。现在改为以报告自身的 `appSha256` 为准，并注明它随构建变化。容器配置摘要（`containerConfigSha256`）不随重建变化——它描述的是策略而非产物，这也是它能作为 G0 依据的原因。
+6. **“原生侧能重建容器”曾被页面是否配合所阻塞。** 重建门控原先写成 `blocked_confirmed && closed`：只有页面先宣告“我要阻塞了”才重建。静态页面连 JS 都不跑，真实攻击者更不会宣告——于是负例里只关不建，证明的是“能关”，不是设计 §4.7 要的“能关**并能重建**”。门控已改为只看关闭是否成功（`should_rebuild_after_close`），并加了回归测试钉住。修复后负例的证据变成「`the native side closed and rebuilt the container (generation 2)`」加「页面从未确认阻塞」——能力被验证，但整体仍判失败，这才是正确语义。
+7. **报告里的应用摘要会随重建变化。** 本文件初稿记的是更早一次 bundle 的哈希；写完文档后又重建过 bundle，两者对不上。现在改为以报告自身的 `appSha256` 为准，并注明它随构建变化。容器配置摘要（`containerConfigSha256`）不随重建变化，但它**随资源清单规模变化**（见 §5），所以跨 fixture 比较时不能拿它当“策略相同”的证明；策略是否相同要看摘要的构成项。
 
 ## 8. 需要审阅者决定的事
 

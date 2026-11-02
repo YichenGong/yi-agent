@@ -16,8 +16,8 @@ use desktop_lib::plugin_host::probe::{
     CASE_DEADLINE, EXPECTED_CASES,
 };
 use desktop_lib::plugin_host::run::{
-    handle_request, judge_blocked_recovery, write_resume_marker, ProbeOptions, ProbeState,
-    ISOLATION_SUITE, MAX_MESSAGE_BYTES,
+    handle_request, judge_blocked_recovery, should_rebuild_after_close, write_resume_marker,
+    ProbeOptions, ProbeState, ISOLATION_SUITE, MAX_MESSAGE_BYTES,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -531,4 +531,16 @@ fn a_blocking_announcement_is_observed_by_the_native_side() {
     );
     assert_eq!(status, 200);
     assert!(*state.blocking_seen.lock().unwrap());
+}
+
+#[test]
+fn rebuilding_the_container_never_depends_on_the_page_cooperating() {
+    // spec §4.7：页面是“潜在失控客户端”，宿主必须能关闭并重建失控容器。
+    // 之前的实现把重建写成 `blocked_confirmed && closed`，于是页面只要不主动
+    // 宣告阻塞（真实攻击者不会宣告，静态页面连 JS 都不跑），原生侧就只关不建，
+    // “能重建”这条能力根本没被走通。负例跑出来的证据正是
+    // `FAIL: the native side never rebuilt the container`。
+    assert!(should_rebuild_after_close(true));
+    // 关闭本身失败时没有可重建的对象，但这条分支不允许被读成“等页面配合”。
+    assert!(!should_rebuild_after_close(false));
 }
