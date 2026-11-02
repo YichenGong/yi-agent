@@ -1,0 +1,12 @@
+id = "001-read-and-edit"
+prompt = "Read src/lib.rs, then change the body of the `add` function so it adds instead of subtracts. Use the edit tool."
+
+[fixture]
+files = { "src/lib.rs" = "pub fn add(a: i32, b: i32) -> i32 { a - b }\n" }
+
+[expect.result]
+files = { "src/lib.rs" = "a \\+ b" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 7
+max_input_tokens = 36500

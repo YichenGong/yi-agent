@@ -1,0 +1,14 @@
+id = "005-rename-symbol"
+prompt = "In src/main.rs rename the function `calc` to `compute` everywhere it appears, including its call site."
+
+[fixture]
+files = { "src/main.rs" = "fn calc(x: i32) -> i32 { x * 2 }\n\nfn main() { println!(\"{}\", calc(21)); }\n" }
+
+[expect.result]
+files = { "src/main.rs" = "fn compute[\\s\\S]*compute\\(21\\)" }
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 13
+max_input_tokens = 68500

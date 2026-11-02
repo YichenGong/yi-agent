@@ -142,7 +142,16 @@ mutants:
 eval filter="":
     #!/usr/bin/env bash
     set -euo pipefail
-    set -a; source ../.env 2>/dev/null || true; set +a
+    # 配置源必须是 models.json，不能 source ../.env：本仓库没有 .env
+    # （.gitignore 里也没有），source 失败被 `|| true` 吞掉后
+    # skip_if_no_key 直接 return —— 输出「跑了 0 条 case」且退出码 0，
+    # 看起来是绿的其实一条都没跑。
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
+    eval "$(bash scripts/export-model-env.sh)"
+    if [ -z "${MODEL_API_KEY:-}" ]; then
+        echo "SKIPPED: no headless configuration (models.json has no usable default entry)"
+        exit 0
+    fi
     EVAL_FILTER="{{filter}}" cargo test -p yi-agent --test eval_baseline \
         -- --ignored --nocapture
 

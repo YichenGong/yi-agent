@@ -1,0 +1,12 @@
+id = "013-fix-wrong-operator"
+prompt = "src/compare.rs uses the wrong comparison so `is_adult` returns true for 17. Fix it and verify with bash."
+
+[fixture]
+files = { "src/compare.rs" = "pub fn is_adult(age: u32) -> bool { age > 18 }\n" }
+
+[expect.result]
+files = { "src/compare.rs" = "age >= 18" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 13
+max_input_tokens = 72500

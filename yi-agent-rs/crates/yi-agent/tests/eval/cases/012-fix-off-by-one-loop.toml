@@ -1,0 +1,12 @@
+id = "012-fix-off-by-one-loop"
+prompt = "The function `count_to` in src/lib.rs produces one element too many. Fix the bug. You may run tests with bash."
+
+[fixture]
+files = { "src/lib.rs" = "pub fn count_to(n: u32) -> Vec<u32> { (0..=n).collect() }\n\n#[cfg(test)]\nmod t { #[test] fn exclusive() { assert_eq!(super::count_to(3), vec![0,1,2]); } }\n" }
+
+[expect.result]
+files = { "src/lib.rs" = "\\(0\\.\\.n\\)" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 11
+max_input_tokens = 69500

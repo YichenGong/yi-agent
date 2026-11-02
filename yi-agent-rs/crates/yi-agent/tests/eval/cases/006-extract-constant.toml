@@ -1,0 +1,14 @@
+id = "006-extract-constant"
+prompt = "src/a.rs and src/b.rs both hardcode 86400. Introduce a public constant SECONDS_PER_DAY in src/a.rs and use it in both files."
+
+[fixture]
+files = { "src/a.rs" = "pub fn a() -> u64 { 86400 }\n", "src/b.rs" = "pub fn b() -> u64 { 86400 }\n" }
+
+[expect.result]
+files = { "src/a.rs" = "SECONDS_PER_DAY", "src/b.rs" = "SECONDS_PER_DAY" }
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 14
+max_input_tokens = 96500
