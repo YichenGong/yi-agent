@@ -1834,15 +1834,6 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn restore_restore_user_item(id: &str, text: &str) -> Item {
-        Item::UserMessage {
-            id: id.into(),
-            text: text.into(),
-            attachments: Vec::new(),
-            images: Vec::new(),
-        }
-    }
-
     fn dir_meta(id: &str, cwd: &Path) -> ThreadMeta {
         let mut meta = meta(id);
         meta.cwd = cwd.to_string_lossy().into_owned();
