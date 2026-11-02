@@ -1,0 +1,19 @@
+{
+  "id": "014-fix-panic-on-empty",
+  "tool_calls": 7,
+  "input_tokens": 43383,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/first.rs": "Option<i32>|None"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "grep",
+    "read",
+    "write"
+  ],
+  "secs": 39,
+  "samples": 3
+}

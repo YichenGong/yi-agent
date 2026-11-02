@@ -1,0 +1,14 @@
+{
+  "id": "017-list-files",
+  "tool_calls": 1,
+  "input_tokens": 9985,
+  "ended_normally": true,
+  "modified_files": false,
+  "result_patterns": {},
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash"
+  ],
+  "secs": 8,
+  "samples": 3
+}

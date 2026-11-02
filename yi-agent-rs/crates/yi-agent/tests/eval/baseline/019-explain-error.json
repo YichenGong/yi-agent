@@ -1,0 +1,16 @@
+{
+  "id": "019-explain-error",
+  "tool_calls": 2,
+  "input_tokens": 14761,
+  "ended_normally": true,
+  "modified_files": false,
+  "result_patterns": {},
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "glob",
+    "read"
+  ],
+  "secs": 9,
+  "samples": 3
+}

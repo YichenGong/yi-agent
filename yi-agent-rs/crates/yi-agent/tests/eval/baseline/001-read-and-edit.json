@@ -1,0 +1,18 @@
+{
+  "id": "001-read-and-edit",
+  "tool_calls": 4,
+  "input_tokens": 25370,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/lib.rs": "a \\+ b"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "read"
+  ],
+  "secs": 29,
+  "samples": 3
+}

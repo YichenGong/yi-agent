@@ -1,0 +1,18 @@
+{
+  "id": "015-fix-string-case",
+  "tool_calls": 7,
+  "input_tokens": 45047,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/name.rs": "to_uppercase"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "glob"
+  ],
+  "secs": 40,
+  "samples": 3
+}

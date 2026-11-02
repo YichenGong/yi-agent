@@ -137,9 +137,20 @@ mutants:
 #
 # 不进 `ci`：真实 API 调用（真钱）+ 分钟级耗时。
 # 用法：
-#   just eval                 跑全部
+#   just eval                 跑全部，并与 tests/eval/baseline/ 比对（抓轨迹回归）
 #   just eval 007             只跑 id 含 007 的
-eval filter="":
+#   just eval bless=1         把本次结果写成新基线（**只在确认改动是改进时用**）
+#   just eval 007 bless=1     只重写 007 的基线
+#
+# baseline 的三层判定见 crates/yi-agent/tests/eval/baseline.rs 的模块注释。
+# 关键一点：**不比对工具调用序列**——这个 agent 写同一文件会在
+# write/edit/cat>/printf>/sed -i 之间随机选择，严格比对序列会大量假红，
+# 而假红会训练人无脑 bless，机制直接失效。
+#
+# bless 绝不能进 CI：CI 里 bless = 每次重写基线，基线永远等于最新代码，
+# 检测能力归零。比对逻辑本身的单测（不需要 key）在 `eval-baseline-check`，
+# 那个进 ci。
+eval filter="" bless="":
     #!/usr/bin/env bash
     set -euo pipefail
     # 配置源必须是 models.json，不能 source ../.env：本仓库没有 .env
@@ -152,8 +163,16 @@ eval filter="":
         echo "SKIPPED: no headless configuration (models.json has no usable default entry)"
         exit 0
     fi
-    EVAL_FILTER="{{filter}}" cargo test -p yi-agent --test eval_baseline \
+    # EVAL_BLESS 走环境变量而不是 cargo 的 `--` 后参数：cargo test 自己解析
+    # `--` 之后的内容，塞自定义 flag 会报 "Unrecognized option"。
+    EVAL_FILTER="{{filter}}" EVAL_BLESS="{{bless}}" cargo test -p yi-agent --test eval_baseline \
         -- --ignored --nocapture
+
+# eval baseline 比对逻辑的自检：不需要 API key、毫秒级，故进 `ci`。
+# 它钉住的是「什么算回归」这些判据本身——判错会静默放过真退化
+# （例如把内容比对写坏、把容忍度调成 1000%），靠人读代码保证不了。
+eval-baseline-check:
+    cargo test -p yi-agent --test eval_baseline -- --skip golden_set_eval
 
 # === CI 入口 ===
 
@@ -188,7 +207,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check nightly-workflow-check audit-deps-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check eval-baseline-check nightly-workflow-check audit-deps-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`

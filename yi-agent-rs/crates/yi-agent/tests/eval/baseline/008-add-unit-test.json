@@ -1,0 +1,19 @@
+{
+  "id": "008-add-unit-test",
+  "tool_calls": 6,
+  "input_tokens": 39268,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/math.rs": "#\\[cfg\\(test\\)\\][\\s\\S]*assert"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "read",
+    "write"
+  ],
+  "secs": 35,
+  "samples": 3
+}

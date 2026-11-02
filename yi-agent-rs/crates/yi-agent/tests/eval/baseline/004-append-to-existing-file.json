@@ -1,0 +1,18 @@
+{
+  "id": "004-append-to-existing-file",
+  "tool_calls": 3,
+  "input_tokens": 19967,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "todo.txt": "buy bread[\\s\\S]*buy milk"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "read"
+  ],
+  "secs": 25,
+  "samples": 3
+}
