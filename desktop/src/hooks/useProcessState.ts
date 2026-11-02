@@ -49,13 +49,15 @@ export function useProcessState({
     truncated: boolean;
   } | null>(null);
 
-  // 进程详情打开期间，以 500ms 增量拉取 stdout/stderr；关闭或终态即停。
-  // 光标是本次订阅的局部量，进程/会话一变就随 effect 重建。
+  // 进程详情打开期间，以 500ms 拉取 stdout/stderr 快照；关闭或终态即停。
+  //
+  // 每次回包整体替换面板文本，所以回包必须是「至今为止的输出」而非增量切片：
+  // 带 cursor 的增量读只返回新增部分，替换式渲染会把这些历史一帧帧丢掉（面板
+  // 只剩最近 500ms）。快照语义由 `truncated` 告知更早的输出是否已滚出缓冲。
   useEffect(() => {
     if (!currentId || !openProcessId) return;
     const c = rpc();
     if (!c) return;
-    let cursor = 0;
     let cancelled = false;
     let timer: number | undefined;
 
@@ -64,10 +66,8 @@ export function useProcessState({
         const r = await c.request<ProcessReadResult>("process/read", {
           thread_id: currentId,
           process_id: openProcessId,
-          cursor,
         });
         if (cancelled) return;
-        cursor = r.next_cursor;
         setProcessOutput({
           stdout: r.stdout,
           stderr: r.stderr,
