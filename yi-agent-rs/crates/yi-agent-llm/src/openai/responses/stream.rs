@@ -155,17 +155,24 @@ where
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty())
                         {
+                            // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
+                            // 供下一轮回放——回放时该字段必须显式在场。
+                            let summary: Vec<Value> = item
+                                .get("summary")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            // 展示用明文：同一份数组按序拼出各段 `text`。
+                            // 只读不改——`summary` 本体必须保持上游原文。
+                            let text: String = summary
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                                .collect();
                             events.push(ProviderEvent::ThinkingBlock {
-                                text: String::new(),
+                                text,
                                 token: yi_agent_core::ThinkingToken::Encrypted {
                                     encrypted_content: enc.to_string(),
-                                    // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
-                                    // 供下一轮回放——回放时该字段必须显式在场。
-                                    summary: item
-                                        .get("summary")
-                                        .and_then(Value::as_array)
-                                        .cloned()
-                                        .unwrap_or_default(),
+                                    summary,
                                 },
                             });
                         }
@@ -586,6 +593,68 @@ mod tests {
             )
         });
         assert!(found, "empty summary must be captured as an empty vec");
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_summary_text_is_carried_into_the_thinking_block() {
+        // 上游 reasoning item 的 summary[] 是展示用明文。此前的实现把
+        // `ThinkingBlock.text` 写死成空串，导致前端接管后「思考」块空白。
+        // 这里钉住：text = 各段 text 的拼接；而 token.summary 仍是原始结构。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thought A\"},{\"type\":\"summary_text\",\"text\":\" B\"}]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let (text, token) = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::ThinkingBlock { text, token } => Some((text.clone(), token.clone())),
+                _ => None,
+            })
+            .expect("a thinking block must be emitted");
+
+        assert_eq!(text, "thought A B", "summary 各段文本须按序拼成展示文本");
+        assert_eq!(
+            token,
+            yi_agent_core::ThinkingToken::Encrypted {
+                encrypted_content: "enc-blob".into(),
+                // 原始结构逐字保留：两段、带 type 字段，未被拼平或改造。
+                summary: vec![
+                    serde_json::json!({"type": "summary_text", "text": "thought A"}),
+                    serde_json::json!({"type": "summary_text", "text": " B"}),
+                ],
+            },
+            "凭证里的 summary 必须保持上游原文"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_summary_yields_an_empty_thinking_block_text() {
+        // 上游返回 summary: [] 时（实测 Sol 在部分轮次如此），展示文本为空，
+        // 由渲染层降级为「已推理（无明文）」。凭证仍必须带上空数组以支持回放。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let text = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::ThinkingBlock { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a thinking block must be emitted");
+        assert_eq!(text, "", "空 summary must degrade to an empty display text");
     }
 
     // ---- 以下为超出 brief 的防御性用例 ----
