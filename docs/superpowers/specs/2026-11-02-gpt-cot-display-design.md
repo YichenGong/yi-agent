@@ -67,7 +67,8 @@ events.push(ProviderEvent::ThinkingBlock {
 `item/started` + `item/completed`。
 
 前端 `desktop/src/lib/session.ts:537-560` 的「就地接管」逻辑会把这个条目**整体
-替换**掉正在流式累积的本地推理块：
+替换**掉正在流式累积的本地推理块（`this.items[held] = item`，第 552 行）。由于
+`item.text` 是空串，已经流式收到的摘要被清空：
 
 ```ts
 const held = this.items.findIndex((i) => i.id === this.openReasoning!.id);
@@ -79,12 +80,28 @@ if (held >= 0) {
 
 这就是**形态 A**：卡片存在、点开空白。
 
+**并且配对帧会再清一次**：紧随其后的 `item/completed` 携带同一个空 `text`
+条目，走下面的「按 id 就地替换」分支（第 568 行附近）再做一次 `this.items[index]
+= item`。所以只修接管那一处不够——实测确认（2026-11-02，用临时 vitest 用例驱动
+真实 `Session`）：`item/started` 清空流式摘要；即使人为把文本补回，
+`item/completed` 仍会再次清空。
+
 ### 2.3 对照：DeepSeek 通道没有此问题
 
 `yi-agent-rs/crates/yi-agent-llm/src/openai/stream.rs:156-161` 在流结束时把
 累积的 `reasoning_content` 放进 `ThinkingBlock.text`，接管后仍是明文。
 
-### 2.4 其它已被覆盖的路径
+### 2.4 DeepSeek 走 responses 通道时没有卡片（附带的既有行为）
+
+实测 `HORIZON-DeepSeek` 在 `/v1/responses` 上返回 `summary`（374 字符）但
+**`encrypted_content` 为空**，而 `stream.rs:153-157` 要求凭证非空才产出
+`ThinkingBlock`（`.filter(|s| !s.is_empty())`），故该路径不产生 thinking 条目。
+实时显示仍由 `ReasoningDelta` 正常呈现，只是历史回放没有卡片。
+
+这与本缺陷无关，本期**不改**（空凭证不该回传，
+`reasoning_item_without_encrypted_content_emits_no_block` 已钉住）。
+
+### 2.5 其它已被覆盖的路径
 
 - TUI 回放 `yi-agent-rs/crates/yi-agent/src/tui/replay.rs:64-73` 已跳过
   `redacted || text.is_empty()` 的条目，**不会**出现空白块；桌面端没有对应判断。
@@ -108,48 +125,99 @@ if (held >= 0) {
 - 不改变凭证回传逻辑（`encrypted_content` / `summary` 的逐字保真契约不动）。
 - 不隐藏 GPT 的思考块（用户明确否决「纯隐藏」）。
 - 不实现「reasoning tokens 占位」所需的跨层字段传递——本期降级文案用静态
-  「已推理（无明文）」，见 §5.3 的取舍说明。
+  「已推理（无明文）」，见 §5.2 的取舍说明。
 
 ## 4. 方案
 
 ### 4.1 后端：让块级条目携带本次推理的明文
 
-**改动点：`openai/responses/stream.rs`**
+**改动点：`openai/responses/stream.rs` 的 `response.output_item.done` 分支**
 
-Responses 流解析器累积本轮的摘要文本，并在 `response.output_item.done` 生成
-`ThinkingBlock` 时填入 `text`：
+该分支已持有上游 reasoning item 的完整 `summary` 数组。**实测确认**
+（2026-11-02，`HORIZON-OG-Sol` + `effort:high` + `summary:auto`）：
 
-- 新增字段 `reasoning_buffer: String`，在
-  `response.reasoning_summary_text.delta`（以及已有分支的
-  `response.reasoning_text.delta`）处 `push_str`。
-- 在构造 `ThinkingBlock` 的**同一处** `std::mem::take(&mut self.reasoning_buffer)`
-  作为 `text`，与 `openai/stream.rs:156-161` 的 DeepSeek 处理保持同构。
-- 缓冲为空的场景（上游返回 `summary: []`）→ `text` 仍为空串，语义与今天一致，
-  由渲染层降级。
+- `response.reasoning_summary_text.done` 的 `text` == 所有 delta 的拼接（341 字符）；
+- `output_item.done` 的 `item.summary[].text` 拼接 == 同上，**逐字相等**。
 
-**为什么放在流解析器而不是 translate 层**：`ReasoningDelta` 与 `ThinkingBlock`
-是同一次上游事件流的两个投影，只有解析器能保证「这一轮的摘要」与「这一轮的
-reasoning item」严格对应；放 translate 层需要额外的跨轮归属状态，且 TUI 直接
-消费 `ThinkingBlock`，放在解析器三端自动一致。
+因此**不需要新增增量缓冲区**：直接把 `summary` 数组里的文本拼出来即可。现有代码
+已在 `token` 里逐字带走 `summary`，改动最小形态是给同一个数组派生一个展示文本
+（下图为示意，`summary` 的取法沿用现有 `item.get("summary")`）：
 
-**必须保持的不变式**：凭证（`encrypted_content`、`summary` 原文）逐字不变；
-`ReasoningDelta` 的实时下发行为不变（前端仍能流式看到思考过程，不等块结束）。
+```rust
+// 现状：summary 已由 item.get("summary") 逐字带进 token
+let summary: Vec<Value> = item
+    .get("summary")
+    .and_then(Value::as_array)
+    .cloned()
+    .unwrap_or_default();
+// 新增：同一份数组派生出展示文本（不修改 summary 本身）
+let text: String = summary
+    .iter()
+    .filter_map(|p| p.get("text").and_then(Value::as_str))
+    .collect();
+
+events.push(ProviderEvent::ThinkingBlock {
+    text,
+    token: yi_agent_core::ThinkingToken::Encrypted {
+        encrypted_content: enc.to_string(),
+        summary,          // 原文逐字，不受 text 影响
+    },
+});
+```
+
+要点：
+
+- `token.summary` 仍是**上游原文逐字**（保留 `type` 字段与分段结构），供回放
+  使用；`text` 是给展示用的拼合结果，二者互不影响。实现时**不得**把
+  `text` 结构化后写回 `summary`。
+- `summary` 为空数组 → `text` 为空串，行为与今天一致，由渲染层降级（§4.3）。
+- **不要**把 `response.reasoning_text.delta`（`content`）也并入 `text`：实测
+  DeepSeek / Sol 在 responses 通道的 `content` 均为空数组，该事件计数为 0；
+  若将来遇到只发 `content` 的模型，`summary` 与 `content` 是两份不同内容，
+  拼在一起会串味。那种模型的实时显示仍由 `ReasoningDelta` 负责，
+  块级 `text` 为空则回放期显示「已推理（无明文）」——可接受，且不在本期范围。
+
+**为什么放在解析器而不是 translate 层**：`item.summary` 只在该帧可见；
+translate 层只拿到 `ThinkingBlock`，放那里需要额外的跨轮归属状态。放解析器后，
+TUI / 桌面 / 未来客户端自动一致。
+
+**必须保持的不变式**：凭证（`encrypted_content` 与 `summary` 原文）逐字不变；
+`ReasoningDelta` 的实时下发行为不变（前端仍能边流边看，不等到块结束）。
 
 ### 4.2 前端：接管时不丢已有明文
 
-**改动点：`desktop/src/lib/session.ts` 的 `item/started` 分支**
+**改动点：`desktop/src/lib/session.ts`，三处按 id 替换点**
 
-当前无条件 `this.items[held] = item`。改为：
+`item/started` 与 `item/completed` 走**同一个 case 分支**，且配对帧会再次用
+同一个空 `text` 的 item 就地替换。所以只在「接管」分支改是不够的——必须在
+**所有按 id 替换**的地方统一守卫：
 
-- 若 `item.text` 非空 → 照旧整体替换（服务端为权威）。
-- 若 `item.text` 为空且本地块 `this.openReasoning.text` 非空 → **保留本地文本**，
-  但仍把该条目的 `id` 记为服务端 id（使配对的 `item/completed` 按 id 就地替换，
-  而不是误吞后续本地块）。实现上替换为
-  `{ ...item, text: <held text> }`，保持 `type/id/redacted` 来自服务端。
-- 若两者都为空 → 照旧替换（交给渲染层降级）。
+1. `apply` 的接管分支（`this.items[held] = item`，第 552 行）；
+2. `apply` 的按 id 替换（`this.items[index] = item`，第 563 行）——配对的
+   `item/completed` 走这里；
+3. `upsertItems` 的按 id 替换（`this.items[index] = normalized`，第 462 行）
+   ——回放补帧走这里。
 
-理由：空 `text` 不携带任何信息，用它覆盖非空文本是纯损失；而 id 绑定是「不重复
-渲染同一服务端条目」的必要条件，必须保留。
+统一规则（抽成一个私有方法 `mergeThinkingText(existing, incoming)`）：
+
+- `incoming.type !== "thinking"` → 直接用 `incoming`。
+- **`incoming.redacted === true` → 直接用 `incoming`，不保留任何文本。**
+  这是安全边界：若后到帧把块标记为 redacted，沿用旧明文等于把凭证/明文泄漏到
+  本应无明文的占位上。
+- `incoming.text` 非空 → 用 `incoming`（服务端有内容时是权威）。
+- `incoming.text` 为空 → 返回 `{ ...incoming, text: existingText }`；其中
+  `existingText` 取**同 id 条目的现有文本**，该 id 尚不存在时（接管场景）取
+  `this.openReasoning?.text ?? ""`。注意必须在调用 `breakReasoningRun()` **之前**
+  读取 `openReasoning`，否则拿到的是 `null`。
+
+这样 `started` 空文本不会清掉本地流式摘要，且随后的 `completed`（同样是空
+文本）也不会把它再清一次。
+
+**注意**：text 被补回后仍必须让比较器看见变化（`structuralVersion += 1` 或
+`lastText` 相关路径），否则 UI 不会重绘——实现时沿用各分支现有的失效方式。
+
+理由：空 `text` 不携带任何信息，用它覆盖非空文本是纯损失；而 id 绑定是
+「不重复渲染同一服务端条目」的必要条件，必须保留。
 
 ### 4.3 前端：空明文/redacted 的降级渲染
 
@@ -172,9 +240,24 @@ reasoning item」严格对应；放 translate 层需要额外的跨轮归属状�
 
 ### 4.4 TUI：无需改动
 
-`replay.rs` 已跳过空/redacted 条目，实时路径的 `ReasoningDelta` 直接累积明文。
-本次后端改动只会让 `ThinkingBlock.text` 从「恒空」变成「有值」，TUI 本身不消费
-该字段用于展示（`history.rs:1265` 为空分支），故无行为变化。
+`replay.rs:64-73` 已跳过 `redacted || text.is_empty()` 的条目，实时路径的
+`ReasoningDelta` 直接累积明文。后端改动只会让 `ThinkingBlock.text` 从「恒空」
+变成「有值」；`history.rs:1265` 对 `ThinkingBlock` 是空分支，故 TUI 无行为变化。
+
+**但 TUI 因此与桌面端不一致**：同样是「模型推理过、本次无明文」，TUI 什么都不
+显示，桌面端显示「已推理（无明文）」。这是有意的取舍（§5.4），不是遗漏。
+
+### 4.5 落盘与回放：空文本条目会被持久化
+
+`Item::Thinking` 经 `server.rs` 的 `completed_items` 进
+`ThreadStore::append_turn` 落盘（`thread_store.rs:3003` 的
+`thinking_item_round_trips_and_stays_credential_free` 钉住了这一点），冷启动
+回放时原样读回。因此：
+
+- 本轮修复**不改变落盘形状**（仍是 `id/text/redacted`，无凭证）。
+- 已产生的历史轮次里若存在 `text: ""` 的 thinking 条目，修复后会被渲染成
+  「已推理（无明文）」而不是空白卡片——这正是期望行为，**不需要**迁移脚本。
+- 新增的摘要文本会随新轮次一起落盘；旧文件不需要回填。
 
 ## 5. 边界与取舍
 
@@ -184,6 +267,11 @@ reasoning item」严格对应；放 translate 层需要额外的跨轮归属状�
 dim 的「已推理（无明文）」，而不是空白卡片。这诚实表达了「模型思考过，但本次
 没有可展示的明文」，与 TUI 的取舍（干脆不显示）不同——桌面端保留占位是用户的
 选择（方案 A）。
+
+**实测支撑「推理过就一定会有块」**：不带 `reasoning` 字段时，上游仍返回
+reasoning item（`summary: []` + `encrypted_content` 5010 字节，无任何摘要增量）。
+若某轮模型完全没推理，则上游不返回 reasoning item，也就没有卡片——不会出现
+「每轮都冒出一个占位」的噪音。
 
 ### 5.2 为什么不显示 reasoning tokens 数值
 
@@ -202,14 +290,32 @@ dim 的「已推理（无明文）」，而不是空白卡片。这诚实表达�
 `bootstrap.rs` 的 `unset_reasoning_effort_stays_none`。用户在模型设置里给 GPT
 条目选 effort 后才有摘要；不选则稳定显示占位。
 
+### 5.4 桌面端与 TUI 的表现不一致（有意）
+
+| 场景 | TUI | 桌面 App |
+|---|---|---|
+| 有明文摘要 | 折叠块，有内容 | 折叠块，有内容 |
+| 推理过但无明文 | **不显示** | 「已推理（无明文）」 |
+| `redacted`（Anthropic） | 不显示 | 「已加密的思考」 |
+
+TUI 的取舍是「没有可读内容就不占屏幕」；桌面端按用户选择保留占位。两者的差异
+在 spec 里显式记录，避免以后被当作 bug 修掉。
+
+### 5.5 DeepSeek 走 responses 通道时的额外观察
+
+见 §2.4：该模型在 responses 通道返回 `summary` 但无 `encrypted_content`，因凭证
+过滤而不产出 thinking 条目（实时 `ReasoningDelta` 仍正常）。本期不改，属既有行为。
+
 ## 6. 影响面
 
 | 位置 | 改动 |
 |---|---|
-| `yi-agent-rs/crates/yi-agent-llm/src/openai/responses/stream.rs` | 累积摘要并填入 `ThinkingBlock.text` |
+| `yi-agent-rs/crates/yi-agent-llm/src/openai/responses/stream.rs` | 从 `item.summary[]` 拼出文本填入 `ThinkingBlock.text` |
 | `yi-agent-rs/crates/yi-agent-llm/src/openai/responses/types.rs` | 不改（选项 1） |
 | `yi-agent-rs/crates/yi-agent-app-server/src/translate.rs` | 不改（已透传 `text`） |
-| `desktop/src/lib/session.ts` | 接管时保留非空本地文本 |
+| `yi-agent-rs/crates/yi-agent-app-server/src/protocol.rs` | 不改（`Item::Thinking` 形状不变） |
+| `yi-agent-rs/crates/yi-agent/src/tui/replay.rs` | 不改（已跳过空文本） |
+| `desktop/src/lib/session.ts` | 三处按 id 替换统一走「空文本不覆盖非空」守卫 |
 | `desktop/src/components/ChatView.tsx` | 空明文降级为「已推理（无明文）」 |
 | `desktop/src/lib/generated/Item.ts` | 不改（形状不变） |
 
@@ -217,25 +323,41 @@ dim 的「已推理（无明文）」，而不是空白卡片。这诚实表达�
 
 **Rust（`cargo test -p yi-agent-llm`）**
 
-1. `reasoning_summary_deltas_are_carried_into_the_thinking_block`：喂入
-   `response.reasoning_summary_text.delta` × N 与带 `encrypted_content` 的
-   `output_item.done`，断言 `ThinkingBlock.text` 等于拼接后的摘要，且
-   `token` 的 `encrypted_content` / `summary` 逐字不变。
+1. `reasoning_item_summary_text_is_carried_into_the_thinking_block`：喂入带
+   `summary: [{type:"summary_text",text:"thought A"},{type:"summary_text",text:" B"}]`
+   与 `encrypted_content` 的 `output_item.done`，断言 `ThinkingBlock.text ==
+   "thought A B"`，且 `token` 里的 `encrypted_content` 与 `summary` 数组**逐字
+   不变**（`summary` 仍是带 `type` 的原始结构与两段，未被拼平）。
 2. `empty_summary_yields_an_empty_thinking_block_text`：只喂
-   `output_item.done`（`summary: []`），断言 `text == ""`（保住降级路径）。
-3. 既有用例 `reasoning_delta_becomes_a_reasoning_notification`、
+   `output_item.done`（`summary: []`）且 `encrypted_content` 非空，断言
+   `text == ""`（保住降级路径）。
+3. 既有用例必须继续全绿：
+   `reasoning_item_done_emits_thinking_block_with_encrypted_content`、
    `reasoning_item_done_captures_summary_verbatim`、
-   `replayed_reasoning_item_always_carries_a_summary_field` 必须继续全绿。
+   `reasoning_item_done_captures_an_empty_summary_as_an_empty_vec`、
+   `reasoning_item_without_encrypted_content_emits_no_block`。
+
+**Rust（`cargo test -p yi-agent-app-server`）**
+
+4. 既有 `thinking_block_becomes_a_credential_free_thinking_item` 与
+   `thinking_item_round_trips_and_stays_credential_free` 继续全绿（translate 未改）。
 
 **前端（`npx vitest run`）**
 
-4. `session.test.ts`：本地块已有 `"T1aT1b"` 时收到 `text: ""` 的
-   `item/started`，断言条目仍保留 `"T1aT1b"`，且 `id` 已换成服务端 id；随后的
-   `item/completed` 按 id 就地替换、不产生重复。
-5. `session.test.ts`：服务端 `text` 非空时仍以服务端为准（覆盖「不丢权威更新」）。
-6. `ChatView.test.tsx`：`{ type: "thinking", text: "", redacted: false }` 展开后
-   可见「已推理（无明文）」，且不出现空字符串文本节点。
-7. 既有「已加密的思考」「折叠可展开」「回放卡片」用例继续全绿。
+5. `session.test.ts`：本地块已有 `"T1aT1b"` 时收到 `text: ""` 的
+   `item/started`，断言条目仍保留 `"T1aT1b"`，且 `id` 已换成服务端 id。
+6. `session.test.ts`：紧接着的配对 `item/completed`（同样 `text: ""`）不得再次
+   清空——断言文本仍是 `"T1aT1b"`（这条覆盖 §4.2 的第 2 个替换点，是本 spec
+   前一版遗漏的缺陷）。
+7. `session.test.ts`：服务端 `text` 非空时以服务端为准（覆盖「不丢权威更新」）。
+8. `session.test.ts`：`upsertItems` 收到空文本的同 id thinking 条目时不清空
+   已有文本（覆盖回放补帧）。
+9. `ChatView.test.tsx`：`{ type: "thinking", text: "", redacted: false }` 展开后
+   可见「已推理（无明文）」。
+10. `session.test.ts`：已有明文 `"SUMMARY"` 的条目收到 `redacted: true` 的空文本
+    帧时，**不得**保留旧明文（断言 `text === ""` 且 `redacted === true`）——覆盖
+    §4.2 的安全边界。
+11. 既有「已加密的思考」「折叠可展开」「回放卡片」「两轮 CoT 位置」用例继续全绿。
 
 **端到端（人工，非 CI）**：在 App 里用 `HORIZON-OG-Sol` + effort `high` 跑一轮
 需要推理的提问，确认「思考」块展开后有摘要；再用不配 effort 的条目跑一轮，确认
@@ -244,7 +366,8 @@ dim 的「已推理（无明文）」，而不是空白卡片。这诚实表达�
 ## 8. 验收判据
 
 - `cd yi-agent-rs && cargo test -p yi-agent-llm`：全绿，含 §7 的新增两条。
-- `cd desktop && npx vitest run src/lib/session.test.ts src/components/ChatView.test.tsx`：全绿，含 §7 的新增三条。
+- `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`：全绿。
+- `cd desktop && npx vitest run`：全绿，含 §7 的新增五条。
 - `cd desktop && npx tsc --noEmit`：无错误。
 - `cd yi-agent-rs && just ci`：全绿。
 - 人工验收：两种配置下分别看到「有摘要」与「已推理（无明文）」，**都不再出现空白
