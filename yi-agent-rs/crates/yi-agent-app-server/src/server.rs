@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,9 +22,8 @@ use yi_agent_runtime::config::RuntimeConfig;
 use crate::lead_loop::{ThreadSnapshot, decide_wake, render_digest};
 use crate::pairing::PairingState;
 use crate::protocol::{
-    ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, SubagentTotals,
-    ThreadStatus,
+    ClientResponse, JSONRPC_VERSION, Notification, PROTOCOL_VERSION, RequestEnvelope, RequestId,
+    ReverseRequest, RpcError, Scope, SubagentTotals, ThreadStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -44,6 +42,31 @@ pub(crate) use runtime_binding::{
     current_session_preserve_thinking, extract_prompt, home_dir, instance_home_dir,
     production_factory, project_key, skills_home_dir, with_session_preserve_thinking,
 };
+
+pub(crate) mod rpc_io;
+pub(crate) mod task_bridge;
+pub(crate) mod watchers;
+
+pub(crate) use rpc_io::{
+    IMAGE_READ_CHUNK_BYTES, IMAGE_READ_MAX_BYTES, err_response, forget_ws_device,
+    install_device_registry, ok_response, write_notification, write_notification_await,
+    write_response, ws_client_for_device,
+};
+pub(crate) use task_bridge::{
+    cancel_thread_children, forward_to_daemon, list_task_summaries, read_task_trace,
+};
+// 只看 lib target 的 `unused_imports` 抓不到 `server/tests/`（它 `use super::*`，
+// 且只编进 test target）。这两个名字目前只有 `server/tests/*` 用，故显式放行，
+// 同时避免 `cargo fix` 把它们裁掉。
+// `ResponseEnvelope` 原先经由 `ok_response`/`err_response` 的函数体在 lib target
+// 里"被用到"；这两个函数搬走后 lib 不再需要它，但 `server/tests/*` 的
+// `use super::*` 仍要它。显式 re-export 并放行，兼防 `cargo fix` 裁掉。
+#[allow(unused_imports)]
+pub(crate) use crate::protocol::ResponseEnvelope;
+#[allow(unused_imports)]
+pub(crate) use watchers::{subagent_totals, trace_rows};
+// 其余 watchers 项在 lib target 有真实调用。
+pub(crate) use watchers::{children_for_thread, stream_trace, watch_children, watch_processes};
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -314,14 +337,6 @@ pub(crate) fn wait_for_plugin_query_socket_within(
         std::thread::sleep(PLUGIN_READY_POLL);
     }
 }
-
-/// `image/read` 每次回传的原始字节上限。传输帧上限 1 MiB,base64 膨胀 4/3 后
-/// 512 KiB 的原始块约 683 KiB,连同其它字段仍在单帧之内。
-pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
-
-/// `image/read` 允许服务的最大文件字节数。分片只是传输形态,不代表可以无上限地
-/// 服务任意大文件;与 `image_prep::MAX_IMAGE_BYTES` 同值(20 MiB)。
-pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// driver task → 主循环的完成事件。
 pub(crate) enum TurnEvent {
@@ -785,90 +800,6 @@ pub(crate) enum ThreadCancelOutcome {
     NeedsConfirmation(usize),
 }
 
-/// Cancels every live child a conversation owns, before its files go away.
-///
-/// The children live in the shared project runtime, where the conversation's
-/// files are not the authority, so deleting them alone would leave the agents
-/// running where nobody can see them. The cancellation is scoped by the
-/// conversation marker rather than the root: several conversations share one
-/// attached root, and a root-scoped cancel would stop a sibling's work too.
-///
-/// Unless `force` is set, live children stop the deletion so the caller can ask
-/// the user first: losing running work to one click on a sidebar × is not a
-/// decision the backend should make silently.
-pub(crate) fn cancel_thread_children(
-    runtimes: &ProjectRuntimes,
-    threads: &HashMap<String, ThreadSession>,
-    thread_id: &str,
-    force: bool,
-) -> Result<ThreadCancelOutcome, String> {
-    let cwd = threads
-        .get(thread_id)
-        .map(|session| session.cwd.clone())
-        .ok_or_else(|| "the thread is not held in memory".to_string())?;
-    let key = project_key(Path::new(&cwd));
-    let binding = {
-        let guard = runtimes.lock().unwrap_or_else(|p| p.into_inner());
-        guard.get(&key).cloned()
-    }
-    .ok_or_else(|| "no attached runtime for this project".to_string())?
-    .map_err(|failure| failure.to_string())?;
-    let response = binding.send(
-        |handle| yi_agent_store::ipc::IpcRequest::CancelThreadTasks {
-            session_id: handle.session_id.clone(),
-            thread_id: thread_id.to_owned(),
-            force,
-        },
-    )?;
-    match response {
-        yi_agent_store::ipc::IpcResponse::ThreadTasksCancelled { task_ids } => {
-            Ok(ThreadCancelOutcome::Cancelled(task_ids.len()))
-        }
-        yi_agent_store::ipc::IpcResponse::ThreadHasActiveChildren { count } => {
-            Ok(ThreadCancelOutcome::NeedsConfirmation(count))
-        }
-        other => Err(format!(
-            "daemon returned a non-cancellation response: {other:?}"
-        )),
-    }
-}
-
-/// The task summaries the daemon holds for a conversation's directory.
-pub(crate) fn list_task_summaries(
-    runtimes: &ProjectRuntimes,
-    threads: &HashMap<String, ThreadSession>,
-    thread_id: &str,
-) -> Result<Vec<yi_agent_store::ipc::IpcTaskSummary>, String> {
-    let socket = socket_for_thread(runtimes, threads, thread_id)
-        .ok_or_else(|| "no attached runtime for this thread".to_string())?;
-    let response = yi_agent_store::ipc::send_request(
-        &socket,
-        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
-            session_id: None,
-            active_only: false,
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    match response {
-        yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } => Ok(tasks),
-        other => Err(format!("daemon returned a non-summary response: {other:?}")),
-    }
-}
-
-/// Read a task's persisted trace, plus the high-water mark to resume from.
-pub(crate) fn read_task_trace(
-    runtimes: &ProjectRuntimes,
-    threads: &HashMap<String, ThreadSession>,
-    thread_id: &str,
-    task_id: &str,
-) -> Result<(Vec<crate::protocol::AgentTraceRow>, i64), RpcError> {
-    let socket = socket_for_thread(runtimes, threads, thread_id)
-        .ok_or_else(|| RpcError::unknown_thread(thread_id))?;
-    let snapshot = yi_agent_store::ipc::read_task_trace(&socket, task_id)
-        .map_err(|error| RpcError::internal(error.to_string()))?;
-    Ok((trace_rows(snapshot.rows), snapshot.high_water_id))
-}
-
 /// The watch's opening frame carries the backlog the client would otherwise miss.
 pub(crate) fn snapshot_for_watch(
     runtimes: &ProjectRuntimes,
@@ -879,10 +810,6 @@ pub(crate) fn snapshot_for_watch(
     read_task_trace(runtimes, threads, thread_id, task_id)
 }
 
-fn trace_rows(rows: Vec<yi_agent_store::ipc::IpcTraceRow>) -> Vec<crate::protocol::AgentTraceRow> {
-    rows.into_iter().map(agent_trace_row).collect()
-}
-
 fn agent_trace_row(row: yi_agent_store::ipc::IpcTraceRow) -> crate::protocol::AgentTraceRow {
     crate::protocol::AgentTraceRow {
         event_id: row.event_id,
@@ -890,222 +817,6 @@ fn agent_trace_row(row: yi_agent_store::ipc::IpcTraceRow) -> crate::protocol::Ag
         kind: row.kind,
         payload_json: row.payload_json,
     }
-}
-
-/// Send one request to the daemon the conversation is attached to.
-///
-/// A request the daemon rejects is an error the caller must see, so the daemon's
-/// own error frame is turned into the RPC error rather than swallowed. A
-/// conversation with no attached runtime is an unknown-thread error, since there
-/// is nothing to send to.
-pub(crate) fn forward_to_daemon(
-    runtimes: &ProjectRuntimes,
-    threads: &HashMap<String, ThreadSession>,
-    thread_id: &str,
-    request: yi_agent_store::ipc::IpcRequest,
-) -> Result<yi_agent_store::ipc::IpcResponse, RpcError> {
-    let socket = socket_for_thread(runtimes, threads, thread_id)
-        .ok_or_else(|| RpcError::unknown_thread(thread_id))?;
-    let response = yi_agent_store::ipc::send_request(&socket, request)
-        .map_err(|error| RpcError::internal(format!("daemon is unavailable: {error}")))?;
-    if let yi_agent_store::ipc::IpcResponse::Error { code, message } = &response {
-        return Err(RpcError::internal(format!(
-            "daemon rejected the request: {code:?} {}",
-            message.clone().unwrap_or_default()
-        )));
-    }
-    Ok(response)
-}
-
-/// Push the conversation's child list whenever it changes.
-///
-/// The first frame is skipped: the caller has just answered the same question
-/// synchronously, so pushing it again would be a duplicate. Every later
-/// difference is pushed whole, because the list is small and a client that
-/// applies it wholesale cannot drift out of order.
-pub(crate) async fn watch_children(
-    hub: Arc<crate::broadcast::Broadcaster>,
-    thread_id: String,
-    socket: PathBuf,
-    initial: Vec<crate::protocol::AgentChild>,
-    // 用量汇总的去处。用 `watch` 而非 `mpsc`：这里只关心最新值，且写端是独立
-    // 任务，`mpsc` 满队列会让它卡住。
-    subagent_tx: tokio::sync::watch::Sender<SubagentTotals>,
-) {
-    let mut last = initial;
-    loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let tasks = match yi_agent_store::ipc::send_request(
-            &socket,
-            yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
-                session_id: None,
-                active_only: false,
-            },
-        ) {
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks }) => tasks,
-            // A daemon that is briefly unavailable is not a change; the next
-            // poll will pick the list back up.
-            _ => continue,
-        };
-        let current = children_for_thread(&tasks, &thread_id);
-        if current == last {
-            continue;
-        }
-        last = current.clone();
-        // 用量与列表同源（都来自这次 ListTaskSummaries），故在同一次推送里一起更新，
-        // 客户端不会看到"列表已变、数字未变"的中间态。
-        //
-        // `send_replace` 永不失败、也不阻塞：没有 receiver（driver 已退出）时值仍
-        // 写进共享槽，下一个 driver 起来能立刻读到最新值。
-        subagent_tx.send_replace(subagent_totals(&current));
-        let notification = Notification::AgentChildrenUpdated {
-            thread_id: thread_id.clone(),
-            children: current,
-        };
-        if write_notification(&hub, &notification).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// 把 manager 的状态广播转成 `process/updated` 通知。
-///
-/// 只在状态变化时推送(`Output` 丢弃):高频输出走 `process/read` 按需拉取。
-/// 关闭 thread 时由调用方 abort。
-pub(crate) async fn watch_processes(
-    hub: Arc<crate::broadcast::Broadcaster>,
-    thread_id: String,
-    manager: Arc<yi_agent_tools::ProcessManager>,
-    mut rx: tokio::sync::broadcast::Receiver<yi_agent_tools::ProcessEvent>,
-) {
-    use yi_agent_tools::ProcessEvent;
-    loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let (process_id, state) = match event {
-                    ProcessEvent::Started { process_id } => (process_id, "starting"),
-                    ProcessEvent::Ready { process_id } => (process_id, "ready"),
-                    ProcessEvent::Exited { process_id, .. } => (process_id, "exited"),
-                    ProcessEvent::Killed { process_id } => (process_id, "killed"),
-                    // 输出是高频流:不转发,详情页自己按需增量拉。
-                    ProcessEvent::Output { .. } => continue,
-                };
-                let _ = manager.list(); // 保证条目仍在(仅作存在性自检,结果丢弃)
-                let _ = write_notification(
-                    &hub,
-                    &Notification::ProcessUpdated {
-                        thread_id: thread_id.clone(),
-                        process_id,
-                        state: state.to_string(),
-                    },
-                )
-                .await;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
-    }
-}
-
-/// Forward a watched task's rows until the stream ends or the task is aborted.
-///
-/// The subscription is non-blocking so the task yields between polls; it ends on
-/// its own when the daemon closes the stream, and is aborted when the client
-/// unwatches, watches another task, or closes the thread.
-pub(crate) async fn stream_trace(
-    hub: Arc<crate::broadcast::Broadcaster>,
-    thread_id: String,
-    task_id: String,
-    socket: PathBuf,
-    after_id: i64,
-) {
-    let subscription = match yi_agent_store::ipc::subscribe_trace(
-        &socket,
-        after_id,
-        std::slice::from_ref(&task_id),
-        &[],
-    ) {
-        Ok(subscription) => subscription,
-        Err(error) => {
-            tracing::warn!(%error, %thread_id, %task_id, "trace watch could not subscribe");
-            return;
-        }
-    };
-    if let Err(error) = subscription.set_nonblocking(true) {
-        tracing::warn!(%error, %thread_id, %task_id, "trace watch could not poll");
-        return;
-    }
-    let mut subscription = subscription;
-    loop {
-        match subscription.try_row() {
-            Ok(Some(row)) => {
-                let notification = Notification::AgentTraceEvent {
-                    thread_id: thread_id.clone(),
-                    task_id: task_id.clone(),
-                    row: agent_trace_row(row),
-                };
-                if write_notification(&hub, &notification).await.is_err() {
-                    return;
-                }
-            }
-            // Nothing yet, or the stream ended: either way, yield and retry.
-            // The stream ending is indistinguishable from a quiet moment by
-            // design, so the loop is bounded by the abort that the caller does.
-            Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(error) => {
-                tracing::warn!(%error, %thread_id, %task_id, "trace watch stream failed");
-                return;
-            }
-        }
-    }
-}
-
-/// The children of one conversation, derived from a task-summary snapshot.
-///
-/// A conversation is scoped by the `thread_id` the spawner bound into its tools,
-/// not by the directory: several conversations can share one directory and one
-/// attached root, so the marker is the only thing that separates their children.
-/// Root tasks are never children, and the `thread_id` filter is exact, so an
-/// untagged task belongs to no conversation rather than to all of them.
-pub(crate) fn children_for_thread(
-    tasks: &[yi_agent_store::ipc::IpcTaskSummary],
-    thread_id: &str,
-) -> Vec<crate::protocol::AgentChild> {
-    tasks
-        .iter()
-        .filter(|task| !task.is_root)
-        .filter(|task| task.thread_id.as_deref() == Some(thread_id))
-        .map(|task| crate::protocol::AgentChild {
-            task_id: task.task_id.clone(),
-            // `ListTaskSummaries` carries no objective; a later source can fill
-            // it without changing this shape.
-            objective: None,
-            state: task.state.clone(),
-            last_step: None,
-            parent_task_id: task.parent_task_id.clone(),
-            // 用量随列表一起给：客户端因此不需要为每个子任务再问一次。
-            usage: crate::protocol::AgentChildUsage {
-                input_tokens: task.usage.input_tokens,
-                output_tokens: task.usage.output_tokens,
-                cache_read_tokens: task.usage.cache_read_tokens,
-            },
-        })
-        .collect()
-}
-
-/// 一个会话里所有子任务的用量之和。
-///
-/// 对**整份列表**求和而不是只算运行中的：已完成的子任务烧掉的 token 同样是这个
-/// 会话的真实开销，累计值必须包含它们。
-pub(crate) fn subagent_totals(children: &[crate::protocol::AgentChild]) -> SubagentTotals {
-    children
-        .iter()
-        .fold(SubagentTotals::default(), |mut acc, child| {
-            acc.input = acc.input.saturating_add(child.usage.input_tokens);
-            acc.output = acc.output.saturating_add(child.usage.output_tokens);
-            acc.cache_read = acc.cache_read.saturating_add(child.usage.cache_read_tokens);
-            acc
-        })
 }
 
 /// One conversation's child-list watcher.
@@ -3646,131 +3357,7 @@ fn apply_session(agent: &mut yi_agent_core::Agent, session: Option<yi_agent_core
     }
 }
 
-/// 把一个设备 id 映射到它当前的 ws `ClientId`——设备被撤销时据此摘除连接。
-///
-/// 这张表在 **ws 传输内部**维护(`ws.rs`):每个已认证的连接把自己
-/// `device_id → ClientId` 登记进去,断连即摘除。主循环(本文件)不能直接持有
-/// 它——`ws.rs` 依赖 `server.rs`,反向依赖会成环——故 ws 层在启动时把
-/// `Arc<Mutex<HashMap<String, ClientId>>>` 交给本函数要读的进程级句柄
-/// ([`install_device_registry`])。表为空(纯 stdio、无 ws,或尚未起 ws)时
-/// 安全返回 `None`。
-pub(crate) fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
-    let registry = device_registry().get()?;
-    let guard = registry.lock().unwrap_or_else(|p| p.into_inner());
-    guard.get(device_id).cloned()
-}
-
-/// 取出并移除某设备 id 的连接映射(撤销时用)。
-///
-/// 与 [`ws_client_for_device`] 同一张表,但顺带摘掉条目:设备已撤销,它的
-/// `device_id → ClientId` 映射不该留在全局表里等下一个同名设备(或迟到的清理)
-/// 撞上。真正的连接关闭由调用方 `hub.unregister` + ws 读循环的 disconnected
-/// tick 完成;这里只负责让主循环侧不再记得它。
-pub(crate) fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
-    let registry = device_registry().get()?;
-    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
-    guard.remove(device_id)
-}
-
-/// 进程级「设备 id → ws `ClientId`」句柄。
-///
-/// 用 `OnceLock` 而非 `RuntimeAttachments` 字段:它天然是**每进程一张表**
-/// (一个 app-server 进程只有一套 ws 连接),且只在 ws 传输启动时被设置一次。
-/// ws 起不来时它保持未设置,`device/revoke` 于是退化为「只改设备表、不摘连接」,
-/// 在纯 stdio 场景下本就没有 ws 连接可摘。
-static DEVICE_REGISTRY: OnceLock<WsDeviceRegistry> = OnceLock::new();
-
 pub(crate) type WsDeviceRegistry = Arc<StdMutex<HashMap<String, crate::broadcast::ClientId>>>;
-
-fn device_registry() -> &'static OnceLock<WsDeviceRegistry> {
-    &DEVICE_REGISTRY
-}
-
-/// 由 ws 传输在启动时登记它的「设备 id → `ClientId`」表(幂等;重复调用保留
-/// 第一张)。返回该表,便于 ws 侧直接持有同一份 `Arc`。
-pub(crate) fn install_device_registry(registry: WsDeviceRegistry) -> WsDeviceRegistry {
-    device_registry().set(Arc::clone(&registry)).ok();
-    device_registry().get().cloned().unwrap_or(registry)
-}
-
-pub(crate) fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
-    ResponseEnvelope {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-pub(crate) fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
-    ResponseEnvelope {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        id,
-        result: None,
-        error: Some(error),
-    }
-}
-
-pub(crate) async fn write_response(
-    hub: &crate::broadcast::Broadcaster,
-    client: &crate::broadcast::ClientId,
-    resp: ResponseEnvelope,
-) -> anyhow::Result<()> {
-    let frame = serde_json::to_value(&resp)
-        .map_err(|e| anyhow::anyhow!("failed to serialize response: {e}"))?;
-    // 定向回复:`reply` 会 await 到入队成功,保留 stdio 改造前
-    // 「写阻塞直到对端读」的语义。
-    match hub.reply(client, frame).await {
-        Ok(()) => Ok(()),
-        // 写失败到**非本地**客户端(ws 手机)不得掀翻共享主循环:那是**多客户端
-        // 共享**的一台服务器,一个被 `device/revoke` 踢掉、或被广播背压摘除
-        // (慢消费者)的连接,不能让所有其它客户端(以及后续连接)一起陪葬。
-        // 摘掉它、让本轮请求就此了结即可(它的读循环靠 `is_connected` 票 tick
-        // 自行收尾)。
-        Err(_) if *client != crate::broadcast::ClientId::local() => {
-            tracing::warn!(
-                client = client.as_str(),
-                "app-server response write failed; dropping the ws client"
-            );
-            hub.unregister(client);
-            Ok(())
-        }
-        // stdio 的 `local` 仍保留改造前的语义:出口泵已死,再写就是错,把错误
-        // 抛出以结束会话(`driver_reports_finished_when_writer_fails` 钉死这条)。
-        Err(_) => Err(anyhow::anyhow!("client {} disconnected", client.as_str())),
-    }
-}
-
-pub(crate) async fn write_notification(
-    hub: &crate::broadcast::Broadcaster,
-    n: &Notification,
-) -> anyhow::Result<()> {
-    let frame = serde_json::to_value(NotificationEnvelope::new(n))
-        .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
-    // S2：列表层/全局帧恒推（无键）；内容层按 thread 过滤。无订阅者时等价于全广播。
-    let delivery = n.delivery();
-    let key = match delivery {
-        crate::protocol::Delivery::Content => n.thread_key(),
-        crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
-    };
-    if is_load_bearing(delivery) {
-        // 状态机帧**绝不丢**：`turn/completed` 是前端 `turnActive` 唯一的清除来源，
-        // 丢了就永久停在 Stop（服务端 `active_turn_id` 已清，之后每次点 Stop 都是
-        // 空转，只能重启 App）。逐字流（内容层）恰恰会把出站队列灌满——bash 每
-        // 4 KiB 输出一帧、桌面端又不订阅（见 `has_subscribed_clients`），所以这条
-        // 路径上的 `try_send` 在真实使用中一定会失败。改为背压投递：队列满时等
-        // 出口泵抽干，而不是丢掉这一帧。列表/全局层每个 turn 只有寥寥数帧，等待
-        // 成本可以忽略；内容层仍走非阻塞路径，否则 bash 大量输出会把 driver 堵死。
-        //
-        // `Err(Closed)` 表示可靠客户端的出口泵已真死（`pump_stdout` 写失败并注销）。
-        // 这不是本帧的问题：主循环随后的 `reply` 会拿到 `Closed` 并按既有致命语义
-        // 收尾，故此处忽略即可。
-        let _ = hub.broadcast_await(key, frame).await;
-    } else {
-        hub.broadcast_for(key, frame);
-    }
-    Ok(())
-}
 
 /// 该投递层是否属于「丢了就修不回来」的状态机帧。
 ///
@@ -3782,25 +3369,6 @@ fn is_load_bearing(delivery: crate::protocol::Delivery) -> bool {
         delivery,
         crate::protocol::Delivery::List | crate::protocol::Delivery::Global
     )
-}
-
-/// 与 [`write_notification`] 同款序列化与投递键，但走**带背压**的
-/// [`crate::broadcast::Broadcaster::broadcast_await`]：本地 reliable 客户端队列
-/// 满时等待而非丢帧。用于历史回放这类「必须完整送达」的批量下发。
-pub(crate) async fn write_notification_await(
-    hub: &crate::broadcast::Broadcaster,
-    n: &Notification,
-) -> anyhow::Result<()> {
-    let frame = serde_json::to_value(NotificationEnvelope::new(n))
-        .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
-    let key = match n.delivery() {
-        crate::protocol::Delivery::Content => n.thread_key(),
-        crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
-    };
-    hub.broadcast_await(key, frame)
-        .await
-        .map_err(|_| anyhow::anyhow!("replay client closed"))?;
-    Ok(())
 }
 
 /// 回放分块的字节软预算（256 KiB）。单帧序列化后须**远小于**
