@@ -16,6 +16,8 @@
 
 ## 范围边界
 
+- [ ] iOS「正在同步…」旋转指示器 — 设计与计划已准备；实现范围为 `desktop/src/components/CacheNotice.tsx` 的 12px 圆环及 `motion-safe:animate-spin`，保持文案、失败优先、桌面显示条件及同步逻辑不变。完成判据：`cd desktop && npx vitest run src/components/CacheNotice.test.tsx && npx tsc --noEmit && npm test && npm run build`，并完成减少动态效果与提示条高度的浏览器验收；未验真机时明确标注。见 [设计](../superpowers/specs/2026-11-03-ios-sync-indicator-design.md)、[计划](../superpowers/plans/2026-11-03-ios-sync-indicator.md)。
+
 **做什么：**
 - 原生窗口（Tauri 2 webview，无浏览器 chrome）
 - sidecar 生命周期管理 + stdio JSON-RPC 帧桥接
