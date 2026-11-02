@@ -1129,25 +1129,33 @@ fn run_loop<B: Backend, E: EventSource>(
                 );
                 match handle_key(
                     key,
-                    input,
-                    history,
-                    max_offset,
-                    history_text_width,
-                    history_area.height,
-                    &session_ui.cost_tracker,
-                    &channels,
-                    is_running,
-                    &mut loop_bk.queued,
-                    &mut loop_bk.pending_quit,
-                    &mut popup_stack.popup,
-                    &workdir,
-                    &mcp,
-                    config,
-                    &session_ui.current_model,
-                    session_ui.current_model_ref.as_deref(),
-                    catalog,
-                    current_effort.as_deref(),
-                    effort_source,
+                    &mut KeyContext {
+                        view: ViewContext {
+                            input,
+                            history,
+                            popup: &mut popup_stack.popup,
+                            max_scroll_offset: max_offset,
+                            history_width: history_text_width,
+                            history_height: history_area.height,
+                            cost_tracker: &session_ui.cost_tracker,
+                        },
+                        runtime: RuntimeContext {
+                            channels: &channels,
+                            is_running,
+                            queued: &mut loop_bk.queued,
+                            pending_quit: &mut loop_bk.pending_quit,
+                            workdir: &workdir,
+                            mcp: &mcp,
+                            config,
+                        },
+                        model: ModelContext {
+                            model: &session_ui.current_model,
+                            current_model_ref: session_ui.current_model_ref.as_deref(),
+                            catalog,
+                            current_effort: current_effort.as_deref(),
+                            effort_source,
+                        },
+                    },
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -2253,34 +2261,50 @@ fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
         .is_some_and(|token| token.starts_with('/') && token.matches('/').count() >= 2)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_key(
-    key: KeyEvent,
-    input: &mut InputLine,
-    history: &mut HistoryState,
+/// 一次按键处理需要的全部「环境」。
+///
+/// 分组依据是实测的使用频次：高频且互相纠缠的（history/input/popup/尺寸）
+/// 放 `View`；只读的运行时依赖放 `Runtime`；模型选择放 `Model`。
+struct KeyContext<'a> {
+    view: ViewContext<'a>,
+    runtime: RuntimeContext<'a>,
+    model: ModelContext<'a>,
+}
+
+struct ViewContext<'a> {
+    input: &'a mut InputLine,
+    history: &'a mut HistoryState,
+    popup: &'a mut Option<CommandPopup>,
     max_scroll_offset: usize,
     history_width: u16,
     history_height: u16,
-    cost_tracker: &CostTracker,
-    channels: &TuiChannels,
-    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    queued: &mut crate::tui::queued::DeliveredInterjections,
-    pending_quit: &mut bool,
-    popup: &mut Option<CommandPopup>,
-    workdir: &std::path::Path,
-    mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
-    config: &TuiConfigSnapshot,
-    model: &str,
-    // 用户选中的清单显示名（`None` = 跟随清单 default_model）。
-    current_model_ref: Option<&str>,
-    catalog: &yi_agent_runtime::models::ModelCatalog,
-    // 当前生效 effort 与来源（run_loop 维护；见 `EffortSource`）。
-    current_effort: Option<&str>,
+    cost_tracker: &'a CostTracker,
+}
+
+struct RuntimeContext<'a> {
+    channels: &'a TuiChannels,
+    is_running: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+    queued: &'a mut crate::tui::queued::DeliveredInterjections,
+    pending_quit: &'a mut bool,
+    workdir: &'a std::path::Path,
+    mcp: &'a std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: &'a TuiConfigSnapshot,
+}
+
+struct ModelContext<'a> {
+    model: &'a str,
+    /// 用户选中的清单显示名（`None` = 跟随清单 default_model）。
+    current_model_ref: Option<&'a str>,
+    catalog: &'a yi_agent_runtime::models::ModelCatalog,
+    /// 当前生效 effort 与来源（run_loop 维护；见 `EffortSource`）。
+    current_effort: Option<&'a str>,
     effort_source: EffortSource,
-) -> KeyOutcome {
+}
+
+fn handle_key(key: KeyEvent, ctx: &mut KeyContext<'_>) -> KeyOutcome {
     // Check if there's a pending permission request. Clone the small fields
     // we need so the immutable borrow ends before we mutate history.
-    let pending_permission = history.pending_permission_info().map(
+    let pending_permission = ctx.view.history.pending_permission_info().map(
         |(request_id, tool_name, prefix_suggestion, kind)| {
             (
                 request_id,
@@ -2304,7 +2328,7 @@ fn handle_key(
             // Fall through to global key handling below
         } else {
             if key.code == KeyCode::Char('e') && key.modifiers.is_empty() {
-                history.toggle_pending_permission_expanded();
+                ctx.view.history.toggle_pending_permission_expanded();
                 return KeyOutcome::None;
             }
             let decision = match key.code {
@@ -2326,7 +2350,7 @@ fn handle_key(
                 _ => None,
             };
             if let Some(d) = decision {
-                let _ = channels.decision.blocking_send((request_id, d));
+                let _ = ctx.runtime.channels.decision.blocking_send((request_id, d));
                 return KeyOutcome::None;
             }
             // For other keys while permission pending, ignore (don't let user type input)
@@ -2338,23 +2362,31 @@ fn handle_key(
     match key.code {
         KeyCode::Esc => {
             // Popup dismissal takes precedence over cancelling an agent turn.
-            if popup.is_some() {
-                *popup = None;
+            if ctx.view.popup.is_some() {
+                *ctx.view.popup = None;
                 return KeyOutcome::None;
             }
-            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
+            if ctx
+                .runtime
+                .is_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 // Cancellation is idempotent; coalesce repeated Esc presses.
-                let _ = channels.interrupt.try_send(());
+                let _ = ctx.runtime.channels.interrupt.try_send(());
             }
             return KeyOutcome::None;
         }
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-            if *pending_quit {
+            if *ctx.runtime.pending_quit {
                 return KeyOutcome::Quit;
             }
-            *pending_quit = true;
-            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = channels.interrupt.blocking_send(());
+            *ctx.runtime.pending_quit = true;
+            if ctx
+                .runtime
+                .is_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = ctx.runtime.channels.interrupt.blocking_send(());
             }
             return KeyOutcome::None;
         }
@@ -2362,68 +2394,68 @@ fn handle_key(
             return KeyOutcome::Quit;
         }
         KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
-            *pending_quit = false;
-            history.toggle_fold_selected();
+            *ctx.runtime.pending_quit = false;
+            ctx.view.history.toggle_fold_selected();
             return KeyOutcome::None;
         }
         KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
-            *pending_quit = false;
-            history.select_up();
+            *ctx.runtime.pending_quit = false;
+            ctx.view.history.select_up();
             return KeyOutcome::None;
         }
         KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
-            *pending_quit = false;
-            history.select_down();
+            *ctx.runtime.pending_quit = false;
+            ctx.view.history.select_down();
             return KeyOutcome::None;
         }
         KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-            *pending_quit = false;
-            history.scroll_up(10, max_scroll_offset);
+            *ctx.runtime.pending_quit = false;
+            ctx.view.history.scroll_up(10, ctx.view.max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-            *pending_quit = false;
-            history.scroll_down(10);
+            *ctx.runtime.pending_quit = false;
+            ctx.view.history.scroll_down(10);
             return KeyOutcome::None;
         }
         _ => {}
     }
 
     // Any other key cancels pending quit
-    *pending_quit = false;
+    *ctx.runtime.pending_quit = false;
 
     // Popup-specific key handling (when popup is active)
-    if popup.is_some() {
+    if ctx.view.popup.is_some() {
         match key.code {
             KeyCode::Up => {
-                if let Some(p) = popup.as_mut() {
+                if let Some(p) = ctx.view.popup.as_mut() {
                     p.move_up();
                 }
                 return KeyOutcome::None;
             }
             KeyCode::Down => {
-                if let Some(p) = popup.as_mut() {
+                if let Some(p) = ctx.view.popup.as_mut() {
                     p.move_down();
                 }
                 return KeyOutcome::None;
             }
             KeyCode::Tab => {
                 // Complete the selected command name into the input buffer
-                if let Some(p) = popup.as_ref() {
+                if let Some(p) = ctx.view.popup.as_ref() {
                     if let Some(cmd) = p.selected() {
-                        input.buffer = format!("/{}", cmd.name());
-                        input.cursor = input.buffer.len();
+                        ctx.view.input.buffer = format!("/{}", cmd.name());
+                        ctx.view.input.cursor = ctx.view.input.buffer.len();
                     }
                 }
-                *popup = None;
+                *ctx.view.popup = None;
                 return KeyOutcome::None;
             }
             KeyCode::Enter => {
                 // Execute the selected command
-                if let Some(p) = popup.as_ref() {
+                if let Some(p) = ctx.view.popup.as_ref() {
                     if let Some(cmd) = p.selected() {
                         // Check if buffer has args (text after command name)
-                        let buffer = &input.buffer;
+                        let buffer = &ctx.view.input.buffer;
                         let cmd_full = format!("/{}", cmd.name());
                         let args = if buffer.len() > cmd_full.len() {
                             Some(&buffer[cmd_full.len()..])
@@ -2431,41 +2463,41 @@ fn handle_key(
                             None
                         };
                         let args_str = args.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                        *popup = None;
-                        input.clear();
+                        *ctx.view.popup = None;
+                        ctx.view.input.clear();
                         return execute_slash_command(
                             cmd,
                             None,
                             args_str,
-                            history,
-                            history_width,
-                            cost_tracker,
-                            &channels.input,
-                            &channels.interrupt,
-                            &channels.kill,
-                            &channels.control,
-                            workdir,
-                            queued,
-                            mcp,
-                            config,
-                            model,
-                            current_model_ref,
-                            catalog,
-                            current_effort,
-                            effort_source,
+                            ctx.view.history,
+                            ctx.view.history_width,
+                            ctx.view.cost_tracker,
+                            &ctx.runtime.channels.input,
+                            &ctx.runtime.channels.interrupt,
+                            &ctx.runtime.channels.kill,
+                            &ctx.runtime.channels.control,
+                            ctx.runtime.workdir,
+                            ctx.runtime.queued,
+                            ctx.runtime.mcp,
+                            ctx.runtime.config,
+                            ctx.model.model,
+                            ctx.model.current_model_ref,
+                            ctx.model.catalog,
+                            ctx.model.current_effort,
+                            ctx.model.effort_source,
                         );
                     } else {
                         // No command selected (empty filter) — show error
                         // Not routed through `DeliveredInterjections`: this text never
                         // reaches the agent, so queuing it would make it look
                         // like a pending prompt.
-                        let text = input.take_submitted();
-                        *popup = None;
-                        history.push(
+                        let text = ctx.view.input.take_submitted();
+                        *ctx.view.popup = None;
+                        ctx.view.history.push(
                             HistoryCell::Separator {
                                 label: Some(format!("未知命令: {}", text)),
                             },
-                            history_width,
+                            ctx.view.history_width,
                         );
                         return KeyOutcome::None;
                     }
@@ -2477,36 +2509,40 @@ fn handle_key(
 
     match key.code {
         KeyCode::Up if key.modifiers.is_empty() => {
-            history.scroll_up(1, max_scroll_offset);
+            ctx.view.history.scroll_up(1, ctx.view.max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::Down if key.modifiers.is_empty() => {
-            history.scroll_down(1);
+            ctx.view.history.scroll_down(1);
             return KeyOutcome::None;
         }
         KeyCode::PageUp if key.modifiers.is_empty() => {
-            history.scroll_page_up(history_height, max_scroll_offset);
+            ctx.view
+                .history
+                .scroll_page_up(ctx.view.history_height, ctx.view.max_scroll_offset);
             return KeyOutcome::None;
         }
         KeyCode::PageDown if key.modifiers.is_empty() => {
-            history.scroll_page_down(history_height);
+            ctx.view.history.scroll_page_down(ctx.view.history_height);
             return KeyOutcome::None;
         }
         KeyCode::Home if key.modifiers.is_empty() => {
-            history.scroll_to_top(history_width, history_height);
+            ctx.view
+                .history
+                .scroll_to_top(ctx.view.history_width, ctx.view.history_height);
             return KeyOutcome::None;
         }
         KeyCode::End if key.modifiers.is_empty() => {
-            history.scroll_to_bottom();
+            ctx.view.history.scroll_to_bottom();
             return KeyOutcome::None;
         }
         _ => {}
     }
 
     // Input handling
-    match input.handle_key(key) {
+    match ctx.view.input.handle_key(key) {
         InputAction::Submit => {
-            let text = input.take_submitted();
+            let text = ctx.view.input.take_submitted();
             // Check if this is a slash command
             if text.starts_with('/') && !starts_with_multi_segment_absolute_path(&text) {
                 let name = text
@@ -2520,82 +2556,82 @@ fn handle_key(
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
                 if let Some(cmd) = SlashCommand::from_name(name) {
-                    *popup = None;
+                    *ctx.view.popup = None;
                     return execute_slash_command(
                         cmd,
                         Some(name.to_string()),
                         args,
-                        history,
-                        history_width,
-                        cost_tracker,
-                        &channels.input,
-                        &channels.interrupt,
-                        &channels.kill,
-                        &channels.control,
-                        workdir,
-                        queued,
-                        mcp,
-                        config,
-                        model,
-                        current_model_ref,
-                        catalog,
-                        current_effort,
-                        effort_source,
+                        ctx.view.history,
+                        ctx.view.history_width,
+                        ctx.view.cost_tracker,
+                        &ctx.runtime.channels.input,
+                        &ctx.runtime.channels.interrupt,
+                        &ctx.runtime.channels.kill,
+                        &ctx.runtime.channels.control,
+                        ctx.runtime.workdir,
+                        ctx.runtime.queued,
+                        ctx.runtime.mcp,
+                        ctx.runtime.config,
+                        ctx.model.model,
+                        ctx.model.current_model_ref,
+                        ctx.model.catalog,
+                        ctx.model.current_effort,
+                        ctx.model.effort_source,
                     );
                 } else {
                     // Unknown slash command
                     // Not routed through `DeliveredInterjections`: a slash command is a
                     // local action, not a prompt for the agent.
-                    *popup = None;
-                    history.push(
+                    *ctx.view.popup = None;
+                    ctx.view.history.push(
                         HistoryCell::Separator {
                             label: Some(format!("未知命令: {}", text)),
                         },
-                        history_width,
+                        ctx.view.history_width,
                     );
                     return KeyOutcome::None;
                 }
             }
-            *popup = None;
+            *ctx.view.popup = None;
             use crate::tui::queued::SubmitOutcome;
-            match queued.submit(text.clone()) {
+            match ctx.runtime.queued.submit(text.clone()) {
                 SubmitOutcome::Sent => {
-                    history.push(
+                    ctx.view.history.push(
                         HistoryCell::UserMessage { text: text.clone() },
-                        history_width,
+                        ctx.view.history_width,
                     );
-                    let _ = channels.input.try_send(text.clone());
+                    let _ = ctx.runtime.channels.input.try_send(text.clone());
                 }
                 SubmitOutcome::Queued => {
                     // 已投递给 driver，由它在本轮下一次 provider 请求前折进上下文。
                     // 在收到 core 回执前，它一直留在预览区（"已送达，待生效"）。
-                    if channels.input.try_send(text.clone()).is_err() {
+                    if ctx.runtime.channels.input.try_send(text.clone()).is_err() {
                         // 通道满或已关闭：把文本放回输入框，不做静默丢弃。
                         // 此处 `text` 是 String（非对 input 的借用），故可变借 input 合法。
-                        input.insert_str(&text);
-                        history.push(
+                        ctx.view.input.insert_str(&text);
+                        ctx.view.history.push(
                             HistoryCell::Separator {
                                 label: Some(format!(
                                     "追加未送达（通道已满 {}），已退回输入框",
                                     crate::tui::queued::DeliveredInterjections::CAPACITY
                                 )),
                             },
-                            history_width,
+                            ctx.view.history_width,
                         );
                     }
                 }
                 SubmitOutcome::Rejected => {
                     // 文本已被 take_submitted 取走,必须退回,否则静默丢失。
                     // 此处 `text` 是 String(非对 input 的借用),故可变借 input 合法。
-                    input.insert_str(&text);
-                    history.push(
+                    ctx.view.input.insert_str(&text);
+                    ctx.view.history.push(
                         HistoryCell::Separator {
                             label: Some(format!(
                                 "待生效追加已达上限 ({})，本条未投递，已退回输入框",
                                 crate::tui::queued::DeliveredInterjections::CAPACITY
                             )),
                         },
-                        history_width,
+                        ctx.view.history_width,
                     );
                 }
             }
@@ -9152,31 +9188,39 @@ mod tests {
         ] {
             let outcome = handle_key(
                 make_key(key, KeyModifiers::NONE),
-                &mut input,
-                &mut history,
-                100,
-                80,
-                20,
-                &CostTracker::default(),
-                &TuiChannels::from_senders(
-                    &input_tx,
-                    &interrupt_tx,
-                    &kill_tx,
-                    &control_tx,
-                    &decision_tx,
-                ),
-                &is_running,
-                &mut queued,
-                &mut pending_quit,
-                &mut popup,
-                &std::env::temp_dir(),
-                &yi_agent_mcp::McpManager::empty(),
-                &snapshot_for_tests(),
-                "test-model",
-                None,
-                &catalog_for_tests(),
-                None,
-                EffortSource::Unset,
+                &mut KeyContext {
+                    view: ViewContext {
+                        input: &mut input,
+                        history: &mut history,
+                        popup: &mut popup,
+                        max_scroll_offset: 100,
+                        history_width: 80,
+                        history_height: 20,
+                        cost_tracker: &CostTracker::default(),
+                    },
+                    runtime: RuntimeContext {
+                        channels: &TuiChannels::from_senders(
+                            &input_tx,
+                            &interrupt_tx,
+                            &kill_tx,
+                            &control_tx,
+                            &decision_tx,
+                        ),
+                        is_running: &is_running,
+                        queued: &mut queued,
+                        pending_quit: &mut pending_quit,
+                        workdir: &std::env::temp_dir(),
+                        mcp: &yi_agent_mcp::McpManager::empty(),
+                        config: &snapshot_for_tests(),
+                    },
+                    model: ModelContext {
+                        model: "test-model",
+                        current_model_ref: None,
+                        catalog: &catalog_for_tests(),
+                        current_effort: None,
+                        effort_source: EffortSource::Unset,
+                    },
+                },
             );
             assert_eq!(outcome, KeyOutcome::None);
             assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
@@ -9185,31 +9229,39 @@ mod tests {
         history.selected = Some(5);
         let _ = handle_key(
             make_key(KeyCode::Up, KeyModifiers::SHIFT),
-            &mut input,
-            &mut history,
-            100,
-            80,
-            20,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 100,
+                    history_width: 80,
+                    history_height: 20,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(history.selected, Some(4));
         assert_eq!(
@@ -9235,31 +9287,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "Esc must not arm process exit");
@@ -9286,31 +9346,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "idle Esc must not arm process exit");
@@ -9337,31 +9405,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(pending_quit);
@@ -9385,59 +9461,75 @@ mod tests {
 
         let _ = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(result, KeyOutcome::None);
     }
@@ -9465,31 +9557,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
 
         assert_eq!(result, KeyOutcome::Submit(path.to_string()));
@@ -9520,31 +9620,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
 
         assert_eq!(result, KeyOutcome::None);
@@ -9578,31 +9686,39 @@ mod tests {
         input.cursor = input.buffer.len();
         let _ = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight msg");
         let history_len_before = history.cells.len();
@@ -9612,31 +9728,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -9689,31 +9813,39 @@ mod tests {
 
         let _ = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
 
         assert_eq!(
@@ -9864,31 +9996,39 @@ mod tests {
 
         let result = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -9924,31 +10064,39 @@ mod tests {
         input.cursor = input.buffer.len();
         let _ = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight");
 
@@ -9958,31 +10106,39 @@ mod tests {
             input.cursor = input.buffer.len();
             let _ = handle_key(
                 make_key(KeyCode::Enter, KeyModifiers::NONE),
-                &mut input,
-                &mut history,
-                1000,
-                80,
-                24,
-                &CostTracker::default(),
-                &TuiChannels::from_senders(
-                    &input_tx,
-                    &interrupt_tx,
-                    &kill_tx,
-                    &control_tx,
-                    &decision_tx,
-                ),
-                &is_running,
-                &mut queued,
-                &mut pending_quit,
-                &mut popup,
-                &std::env::temp_dir(),
-                &yi_agent_mcp::McpManager::empty(),
-                &snapshot_for_tests(),
-                "test-model",
-                None,
-                &catalog_for_tests(),
-                None,
-                EffortSource::Unset,
+                &mut KeyContext {
+                    view: ViewContext {
+                        input: &mut input,
+                        history: &mut history,
+                        popup: &mut popup,
+                        max_scroll_offset: 1000,
+                        history_width: 80,
+                        history_height: 24,
+                        cost_tracker: &CostTracker::default(),
+                    },
+                    runtime: RuntimeContext {
+                        channels: &TuiChannels::from_senders(
+                            &input_tx,
+                            &interrupt_tx,
+                            &kill_tx,
+                            &control_tx,
+                            &decision_tx,
+                        ),
+                        is_running: &is_running,
+                        queued: &mut queued,
+                        pending_quit: &mut pending_quit,
+                        workdir: &std::env::temp_dir(),
+                        mcp: &yi_agent_mcp::McpManager::empty(),
+                        config: &snapshot_for_tests(),
+                    },
+                    model: ModelContext {
+                        model: "test-model",
+                        current_model_ref: None,
+                        catalog: &catalog_for_tests(),
+                        current_effort: None,
+                        effort_source: EffortSource::Unset,
+                    },
+                },
             );
         }
         assert_eq!(
@@ -10006,31 +10162,39 @@ mod tests {
         input.cursor = input.buffer.len();
         let _ = handle_key(
             make_key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            1000,
-            80,
-            24,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 1000,
+                    history_width: 80,
+                    history_height: 24,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
 
         assert_eq!(
@@ -10072,33 +10236,41 @@ mod tests {
             input.cursor = input.buffer.len();
             let _ = handle_key(
                 make_key(KeyCode::Enter, KeyModifiers::NONE),
-                &mut input,
-                &mut history,
-                1000,
-                80,
-                24,
-                &CostTracker::default(),
-                &TuiChannels::from_senders(
-                    &input_tx,
-                    &interrupt_tx,
-                    &kill_tx,
-                    &control_tx,
-                    &decision_tx,
-                ),
-                // The driver has NOT yet cleared this flag: this mirrors the
-                // real ordering, where Done is emitted before is_running=false.
-                &Arc::new(AtomicBool::new(true)),
-                &mut queued,
-                &mut pending_quit,
-                &mut popup,
-                &std::env::temp_dir(),
-                &yi_agent_mcp::McpManager::empty(),
-                &snapshot_for_tests(),
-                "test-model",
-                None,
-                &catalog_for_tests(),
-                None,
-                EffortSource::Unset,
+                &mut KeyContext {
+                    view: ViewContext {
+                        input: &mut input,
+                        history: &mut history,
+                        popup: &mut popup,
+                        max_scroll_offset: 1000,
+                        history_width: 80,
+                        history_height: 24,
+                        cost_tracker: &CostTracker::default(),
+                    },
+                    runtime: RuntimeContext {
+                        channels: &TuiChannels::from_senders(
+                            &input_tx,
+                            &interrupt_tx,
+                            &kill_tx,
+                            &control_tx,
+                            &decision_tx,
+                        ),
+                        // The driver has NOT yet cleared this flag: this mirrors the
+                        // real ordering, where Done is emitted before is_running=false.
+                        is_running: &Arc::new(AtomicBool::new(true)),
+                        queued: &mut queued,
+                        pending_quit: &mut pending_quit,
+                        workdir: &std::env::temp_dir(),
+                        mcp: &yi_agent_mcp::McpManager::empty(),
+                        config: &snapshot_for_tests(),
+                    },
+                    model: ModelContext {
+                        model: "test-model",
+                        current_model_ref: None,
+                        catalog: &catalog_for_tests(),
+                        current_effort: None,
+                        effort_source: EffortSource::Unset,
+                    },
+                },
             );
         }
         // Both reached the driver already: the first opened the turn, the second
@@ -11531,31 +11703,39 @@ mod tests {
 
         let outcome = handle_key(
             make_key(KeyCode::Char('e'), KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            0,
-            80,
-            20,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 0,
+                    history_width: 80,
+                    history_height: 20,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert!(
@@ -11593,31 +11773,39 @@ mod tests {
 
         let outcome = handle_key(
             make_key(KeyCode::Up, KeyModifiers::NONE),
-            &mut input,
-            &mut history,
-            100,
-            80,
-            20,
-            &CostTracker::default(),
-            &TuiChannels::from_senders(
-                &input_tx,
-                &interrupt_tx,
-                &kill_tx,
-                &control_tx,
-                &decision_tx,
-            ),
-            &is_running,
-            &mut queued,
-            &mut pending_quit,
-            &mut popup,
-            &std::env::temp_dir(),
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
+            &mut KeyContext {
+                view: ViewContext {
+                    input: &mut input,
+                    history: &mut history,
+                    popup: &mut popup,
+                    max_scroll_offset: 100,
+                    history_width: 80,
+                    history_height: 20,
+                    cost_tracker: &CostTracker::default(),
+                },
+                runtime: RuntimeContext {
+                    channels: &TuiChannels::from_senders(
+                        &input_tx,
+                        &interrupt_tx,
+                        &kill_tx,
+                        &control_tx,
+                        &decision_tx,
+                    ),
+                    is_running: &is_running,
+                    queued: &mut queued,
+                    pending_quit: &mut pending_quit,
+                    workdir: &std::env::temp_dir(),
+                    mcp: &yi_agent_mcp::McpManager::empty(),
+                    config: &snapshot_for_tests(),
+                },
+                model: ModelContext {
+                    model: "test-model",
+                    current_model_ref: None,
+                    catalog: &catalog_for_tests(),
+                    current_effort: None,
+                    effort_source: EffortSource::Unset,
+                },
+            },
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert_eq!(
