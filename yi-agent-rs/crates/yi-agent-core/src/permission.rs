@@ -1349,9 +1349,17 @@ bash = true
     /// 删除后落入 `_ => false`，而默认配置全是 false，两者结果相同。
     /// cargo-mutants 的 `:192/:193/:194/:195` 四个「delete match arm」
     /// 变异体正是靠这类用例才被杀死。
+    /// 测试用的「工具名 + 开关操作」对。抽成别名是因为 clippy 的
+    /// `type_complexity` 会拒绝数组里的函数指针字面量类型（`-D warnings` 下报错）。
+    type ToolToggle = (&'static str, fn(&mut ToolLevelConfig));
+    /// 「工具名 + 开关只读访问器」对。
+    type ToolReader = (&'static str, fn(&ToolLevelConfig) -> bool);
+    /// 「工具名 + 写入前缀路径列表」对。
+    type PrefixSeeder = (&'static str, fn(&mut PermissionsConfig, Vec<String>));
+
     #[test]
     fn check_tool_level_each_tool_allows_when_enabled() {
-        let cases: [(&str, fn(&mut ToolLevelConfig)); 4] = [
+        let cases: [ToolToggle; 4] = [
             ("process_start", |c| c.process_start = true),
             ("process_kill", |c| c.process_kill = true),
             ("write", |c| c.write = true),
@@ -1381,7 +1389,7 @@ bash = true
     /// 删除后落入 `_ => {}`，配置不变，但没有测试会红。
     #[tokio::test]
     async fn apply_always_allow_tool_covers_every_arm() {
-        let cases: [(&str, fn(&ToolLevelConfig) -> bool); 3] = [
+        let cases: [ToolReader; 3] = [
             ("process_start", |c| c.process_start),
             ("process_kill", |c| c.process_kill),
             ("edit", |c| c.edit),
@@ -1417,7 +1425,7 @@ bash = true
     /// 现有 `apply_always_allow_prefix_bash_no_duplicate` 只覆盖 bash。
     #[tokio::test]
     async fn apply_always_allow_prefix_write_and_edit_dedupe() {
-        let cases: [(&str, fn(&mut PermissionsConfig, Vec<String>)); 2] = [
+        let cases: [PrefixSeeder; 2] = [
             ("write", |c, v| c.prefix_level.write.paths = v),
             ("edit", |c, v| c.prefix_level.edit.paths = v),
         ];

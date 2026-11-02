@@ -543,6 +543,11 @@ pub(crate) struct Harness {
     pairing: Arc<PairingState>,
     hub: Arc<crate::broadcast::Broadcaster>,
     pub(crate) watchman_calls: WatchmanCalls,
+    /// 调用方没指定 workdir 时由 Harness 生成的隔离目录。
+    ///
+    /// 必须持有所有权：`cfg` 只存 `PathBuf`，临时目录一旦在构造函数返回时
+    /// 被删除，后续 `thread/start` 就写不进去。`None` 表示调用方自带 workdir。
+    pub(crate) _fallback_workdir: Option<tempfile::TempDir>,
     pub(crate) _watchman_home: tempfile::TempDir,
     pub(crate) skills_home_dir: tempfile::TempDir,
     pub(crate) lead_inbox: crate::lead::LeadInbox,
@@ -772,6 +777,27 @@ impl Harness {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let index_dir = tempfile::TempDir::new().unwrap();
+        // workdir 必须逐个用例隔离。共享的 `/tmp/yi-agent-app-server-test`
+        // 会让 `thread/start` 经 attach_delegation 同步拉起/复用**同一个**
+        // cwd 的 subagent daemon；全量并发下上百个用例抢同一 socket，实测
+        // attach 双峰分布 12~27s vs 70~190ms，前者超过 `EVENT_WAIT`(30s)
+        // 即 panic `timed out waiting for a message`。改隔离后同一用例
+        // 从 24s 降到 0.6s。
+        //
+        // 只在调用方**没有**显式指定 workdir 时才替换：很多用例自己建
+        // `TempDir` 赋给 `cfg.workdir` 再断言该目录下的落盘文件
+        // （如 `title.rs` 读 `.yi-agent/threads/<tid>.meta.json`），
+        // 无条件覆盖会让它们一起失败（实测 80 个）。
+        let fallback_workdir =
+            if cfg.workdir == std::path::Path::new(crate::test_support::DEFAULT_TEST_WORKDIR) {
+                Some(tempfile::TempDir::new().unwrap())
+            } else {
+                None
+            };
+        let mut cfg = cfg;
+        if let Some(dir) = &fallback_workdir {
+            cfg.workdir = dir.path().to_path_buf();
+        }
         // 常驻登记落在隔离目录里:`plugin/query` 与驱动器测试不得写真的
         // `~/.yi-agent`。
         let resident_dir = tempfile::TempDir::new().unwrap();
@@ -881,6 +907,7 @@ impl Harness {
             pending: std::collections::VecDeque::new(),
             handle,
             _index_dir: index_dir,
+            _fallback_workdir: fallback_workdir,
             _models_dir: models_dir,
             resident_dir,
             pairing,
@@ -2444,6 +2471,9 @@ struct MergedHarness {
     hub: Arc<crate::broadcast::Broadcaster>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     _index_dir: tempfile::TempDir,
+    /// 隔离的 workdir（理由同 `Harness::_fallback_workdir`）。
+    #[allow(dead_code)]
+    _fallback_workdir: Option<tempfile::TempDir>,
 }
 
 impl MergedHarness {
@@ -2457,6 +2487,17 @@ impl MergedHarness {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let index_dir = tempfile::TempDir::new().unwrap();
+        // 与主构造器同样隔离 workdir（理由见 `with_config_and_scope`）。
+        let fallback_workdir =
+            if cfg.workdir == std::path::Path::new(crate::test_support::DEFAULT_TEST_WORKDIR) {
+                Some(tempfile::TempDir::new().unwrap())
+            } else {
+                None
+            };
+        let mut cfg = cfg;
+        if let Some(dir) = &fallback_workdir {
+            cfg.workdir = dir.path().to_path_buf();
+        }
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
@@ -2518,6 +2559,7 @@ impl MergedHarness {
             hub,
             handle,
             _index_dir: index_dir,
+            _fallback_workdir: fallback_workdir,
         }
     }
 

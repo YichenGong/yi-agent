@@ -82,6 +82,13 @@ pub(crate) async fn rpc_over_stdio(
 }
 
 /// 一份无凭据、无网络的测试配置；provider 只是占位字符串。
+/// `test_config()` 里 workdir 的占位值。
+///
+/// 调用方显式设置了别的 workdir 时，Harness 必须尊重它（很多用例要在那个
+/// 目录里断言落盘文件）；只有仍是这个占位值的才视为「没指定」，由 Harness
+/// 换成一个隔离的临时目录。见 `Harness::with_config_and_scope`。
+pub(crate) const DEFAULT_TEST_WORKDIR: &str = "/tmp/yi-agent-app-server-test-unused";
+
 pub(crate) fn test_config() -> RuntimeConfig {
     RuntimeConfig {
         provider: "anthropic".to_string(),
@@ -93,7 +100,16 @@ pub(crate) fn test_config() -> RuntimeConfig {
         max_turns: 20,
         max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
         max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
-        workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+        // 这里刻意给一个占位路径：`RuntimeConfig` 是值类型，没法在这里挂一个
+        // `TempDir` 的所有权（函数返回时目录就被删了）。真正生效的隔离在
+        // `Harness::with_config_and_scope` / `new_with_relay` 里——它们各建
+        // 一个 `TempDir` 并覆写 `cfg.workdir`，目录生命周期绑定到 Harness。
+        //
+        // 曾经这里写死共享的 `/tmp/yi-agent-app-server-test`，导致 93 处
+        // `Harness::new()` 让 `thread/start` 抢同一个 subagent daemon socket，
+        // 全量并发下 attach 达 12~27s，超过 `EVENT_WAIT`(30s) 即 panic。
+        // 保留这个占位值只为了让「忘了经 Harness 构造」的调用点仍能跑起来。
+        workdir: std::path::PathBuf::from(DEFAULT_TEST_WORKDIR),
         system_prompt: None,
         compact_threshold: 160_000,
         compact_ratio: 80,
