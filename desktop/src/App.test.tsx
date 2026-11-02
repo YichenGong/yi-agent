@@ -6196,6 +6196,26 @@ describe("App 后台进程接线", () => {
     expect(readCount()).toBe(settled);
   });
 
+  it("polls process/read as a snapshot so the pane shows history, not only the last tick", async () => {
+    state.processes = [runningProcess];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("tab", { name: /后台进程/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /查看进程 dev/ }));
+
+    await waitFor(() => expect(readCount()).toBeGreaterThan(0));
+    // 面板每次都用回包整体替换文本,因此回包必须是"至今为止的输出"。
+    // 带 cursor 的增量读只返回新增切片,会把这些历史一帧帧丢弃。
+    const reads = clients[0].requests.filter((r) => r.method === "process/read");
+    for (const read of reads) {
+      expect(read.params).not.toHaveProperty("cursor");
+    }
+  });
+
   it("kills via process/kill and refetches the list", async () => {
     state.processes = [runningProcess];
     render(<App />);

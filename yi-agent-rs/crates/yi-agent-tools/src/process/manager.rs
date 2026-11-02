@@ -63,10 +63,20 @@ pub struct ProcessReadResult {
 }
 
 #[derive(Debug, Clone)]
+struct StreamPage {
+    text: String,
+    /// Earlier bytes exist that this call cannot return.
+    data_lost: bool,
+}
+
+#[derive(Debug, Clone)]
 struct StreamRingBuffer {
     cap: usize,
     chunks: Vec<(u64, Vec<u8>)>,
     next_cursor: u64,
+    /// Offset of the first byte ever written to this stream. Positions below it
+    /// belong to the *other* stream, so "cursor < origin" is not data loss.
+    origin: Option<u64>,
 }
 
 impl StreamRingBuffer {
@@ -75,7 +85,13 @@ impl StreamRingBuffer {
             cap,
             chunks: Vec::new(),
             next_cursor: 0,
+            origin: None,
         }
+    }
+
+    /// First offset this stream ever wrote at (its own start), if any.
+    fn origin(&self) -> u64 {
+        self.origin.unwrap_or(self.next_cursor)
     }
 
     #[cfg(test)]
@@ -91,16 +107,12 @@ impl StreamRingBuffer {
         if bytes.is_empty() {
             return;
         }
+        self.origin.get_or_insert(start);
         self.next_cursor = self
             .next_cursor
             .max(start.saturating_add(bytes.len() as u64));
         self.chunks.push((start, bytes.to_vec()));
         self.trim_to_cap();
-    }
-
-    #[cfg(test)]
-    fn next_cursor(&self) -> u64 {
-        self.next_cursor
     }
 
     fn earliest_cursor(&self) -> u64 {
@@ -110,34 +122,80 @@ impl StreamRingBuffer {
             .unwrap_or(self.next_cursor)
     }
 
-    fn read(&self, cursor: Option<u64>, max_bytes: usize) -> (String, u64, bool) {
-        let earliest = self.earliest_cursor();
-        let requested = cursor.unwrap_or(earliest);
-        let truncated = requested < earliest;
-        let effective_cursor = requested.max(earliest);
+    /// Lowest cursor this stream can serve *without losing its own bytes*.
+    ///
+    /// A stream that has never been trimmed can serve from offset 0 — it simply
+    /// has nothing in the early part of the shared timeline, because those bytes
+    /// belong to the other stream. Only a trimmed stream pushes the floor up.
+    fn loss_floor(&self) -> u64 {
+        if self.origin() < self.earliest_cursor() {
+            self.earliest_cursor()
+        } else {
+            0
+        }
+    }
 
+    /// Bytes in `[from, to)` concatenated.
+    fn slice_range(&self, from: u64, to: u64) -> Vec<u8> {
         let mut out = Vec::new();
         for (start, bytes) in &self.chunks {
             let end = start.saturating_add(bytes.len() as u64);
-            if end <= effective_cursor {
+            let lo = (*start).max(from);
+            let hi = end.min(to);
+            if lo >= hi {
                 continue;
             }
-            let offset = effective_cursor.saturating_sub(*start) as usize;
-            if offset < bytes.len() {
-                out.extend_from_slice(&bytes[offset..]);
+            out.extend_from_slice(&bytes[(lo - start) as usize..(hi - start) as usize]);
+        }
+        out
+    }
+
+    /// True when bytes this stream wrote at or after `offset` were already
+    /// discarded by the cap. Offsets before `origin` belong to the *other*
+    /// stream on the shared timeline, so they are not loss for us.
+    fn lost_before(&self, offset: u64) -> bool {
+        self.origin() < self.earliest_cursor() && offset < self.earliest_cursor()
+    }
+
+    /// Page over the shared window `[from, to)`.
+    fn read_window(&self, from: u64, to: u64, data_lost: bool) -> StreamPage {
+        StreamPage {
+            text: String::from_utf8_lossy(&self.slice_range(from, to)).into_owned(),
+            data_lost,
+        }
+    }
+
+    /// Recent bytes of this stream, for snapshot (cursor-less) reads.
+    fn read_tail(&self, max_bytes: usize) -> StreamPage {
+        let all = self.slice_range(self.earliest_cursor(), self.next_cursor);
+        let dropped = all.len() > max_bytes;
+        let text = if dropped {
+            let start = tail_start_at_boundary(&all, max_bytes);
+            String::from_utf8_lossy(&all[start..]).into_owned()
+        } else {
+            String::from_utf8_lossy(&all).into_owned()
+        };
+        StreamPage {
+            text,
+            data_lost: dropped || self.origin() < self.earliest_cursor(),
+        }
+    }
+
+    /// Shrink `to` so this stream's bytes in `[from, to)` end on a character
+    /// boundary. Returns `None` when the stream has no bytes in the window.
+    fn boundary_end(&self, from: u64, to: u64) -> Option<u64> {
+        let bytes = self.slice_range(from, to);
+        if bytes.is_empty() {
+            return None;
+        }
+        match std::str::from_utf8(&bytes) {
+            // Incomplete character at the very end: cut it off and let the next
+            // page carry it whole.
+            Err(err) if err.error_len().is_none() => {
+                Some(from.saturating_add(err.valid_up_to() as u64))
             }
+            _ => None,
         }
-
-        if out.len() > max_bytes {
-            let keep_from = out.len() - max_bytes;
-            out.drain(..keep_from);
-        }
-
-        (
-            String::from_utf8_lossy(&out).into_owned(),
-            self.next_cursor,
-            truncated,
-        )
     }
 
     fn trim_to_cap(&mut self) {
@@ -300,6 +358,10 @@ impl ProcessManager {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return Err("process manager is shutting down".into());
             }
+            // Terminal processes never produce more output or change state, so
+            // they must not hold a slot forever: a long session that runs many
+            // short commands would otherwise permanently hit the cap.
+            processes.retain(|_, process| !is_terminal(&process.status));
             if processes.len() >= 16 {
                 return Err("maximum managed process count reached".into());
             }
@@ -419,18 +481,82 @@ impl ProcessManager {
         let process = processes
             .get(&process_id)
             .ok_or_else(|| format!("process not found: {process_id}"))?;
-        let (stdout, _, stdout_truncated) = process.stdout.read(cursor, max_bytes);
-        let (stderr, _, stderr_truncated) = process.stderr.read(cursor, max_bytes);
-        Ok(ProcessReadResult {
-            process_id: process.process_id.clone(),
-            name: process.name.clone(),
-            stdout,
-            stderr,
-            next_cursor: process.output_cursor,
-            truncated: stdout_truncated || stderr_truncated,
-            status: process.status.clone(),
-            ready: process.ready,
-        })
+        match cursor {
+            None => {
+                // Snapshot: newest `max_bytes` of each stream, for a detail view.
+                let stdout_page = process.stdout.read_tail(max_bytes);
+                let stderr_page = process.stderr.read_tail(max_bytes);
+                Ok(ProcessReadResult {
+                    process_id: process.process_id.clone(),
+                    name: process.name.clone(),
+                    stdout: stdout_page.text,
+                    stderr: stderr_page.text,
+                    next_cursor: process.output_cursor,
+                    truncated: stdout_page.data_lost || stderr_page.data_lost,
+                    status: process.status.clone(),
+                    ready: process.ready,
+                })
+            }
+            Some(requested) => {
+                // Incremental: one window over the shared timeline. Both streams
+                // are served from the same `[start, end)` window, so a caller
+                // looping on `next_cursor` sees every byte exactly once.
+                let floor = process.stdout.loss_floor().max(process.stderr.loss_floor());
+                let start = requested.max(floor);
+                let data_lost =
+                    process.stdout.lost_before(start) || process.stderr.lost_before(start);
+
+                let available = process.output_cursor.saturating_sub(start) as usize;
+                let window = max_bytes.min(available);
+                let mut end = start.saturating_add(window as u64);
+
+                // Cap the page at `max_bytes` of *rendered* bytes and keep both
+                // streams on character boundaries: an incomplete trailing
+                // character moves to the next page instead of becoming U+FFFD.
+                while end > start {
+                    let stdout_bytes = process.stdout.slice_range(start, end);
+                    let stderr_bytes = process.stderr.slice_range(start, end);
+                    if stdout_bytes.len() + stderr_bytes.len() <= max_bytes {
+                        break;
+                    }
+                    end -= 1;
+                }
+                for stream in [&process.stdout, &process.stderr] {
+                    if let Some(boundary) = stream.boundary_end(start, end) {
+                        end = end.min(boundary);
+                    }
+                }
+                // A single character wider than `max_bytes` would collapse the
+                // window to empty and stall the cursor forever. Return that one
+                // character whole (slightly over budget) so paging stays alive.
+                if end == start && window > 0 {
+                    let mut widened = start.saturating_add(1);
+                    while widened < process.output_cursor
+                        && process
+                            .stdout
+                            .boundary_end(start, widened)
+                            .or_else(|| process.stderr.boundary_end(start, widened))
+                            .is_some()
+                    {
+                        widened += 1;
+                    }
+                    end = widened.min(process.output_cursor);
+                }
+
+                let stdout_page = process.stdout.read_window(start, end, data_lost);
+                let stderr_page = process.stderr.read_window(start, end, data_lost);
+                Ok(ProcessReadResult {
+                    process_id: process.process_id.clone(),
+                    name: process.name.clone(),
+                    stdout: stdout_page.text,
+                    stderr: stderr_page.text,
+                    next_cursor: end,
+                    truncated: data_lost,
+                    status: process.status.clone(),
+                    ready: process.ready,
+                })
+            }
+        }
     }
 
     pub async fn kill(&self, selector: ProcessSelector) -> Result<(), String> {
@@ -713,9 +839,9 @@ impl ProcessManager {
     fn output_contains(&self, process_id: &str, pattern: &str) -> bool {
         let processes = self.lock_processes();
         processes.get(process_id).is_some_and(|process| {
-            let (stdout, _, _) = process.stdout.read(None, DEFAULT_STREAM_CAP_BYTES);
-            let (stderr, _, _) = process.stderr.read(None, DEFAULT_STREAM_CAP_BYTES);
-            stdout.contains(pattern) || stderr.contains(pattern)
+            let stdout = process.stdout.read_tail(DEFAULT_STREAM_CAP_BYTES);
+            let stderr = process.stderr.read_tail(DEFAULT_STREAM_CAP_BYTES);
+            stdout.text.contains(pattern) || stderr.text.contains(pattern)
         })
     }
 
@@ -769,6 +895,16 @@ impl ProcessManager {
 enum StreamKind {
     Stdout,
     Stderr,
+}
+
+/// Start offset of the last `max_bytes` of `bytes`, pushed forward to a UTF-8
+/// character boundary so a tail snapshot never begins with half a character.
+fn tail_start_at_boundary(bytes: &[u8], max_bytes: usize) -> usize {
+    let mut start = bytes.len().saturating_sub(max_bytes);
+    while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    start
 }
 
 fn is_terminal(status: &ProcessStatus) -> bool {
@@ -1013,61 +1149,271 @@ mod tests {
         buf.push(b"hello ");
         buf.push(b"world");
 
-        let (text, next_cursor, truncated) = buf.read(None, 64);
+        let page = buf.read_tail(64);
 
-        assert_eq!(text, "hello world");
-        assert_eq!(next_cursor, 11);
-        assert!(!truncated);
+        assert_eq!(page.text, "hello world");
+        assert!(!page.data_lost);
     }
 
     #[test]
-    fn stream_ring_buffer_cursor_returns_only_new_output() {
-        let mut buf = StreamRingBuffer::new(64);
-        buf.push(b"first\n");
-        let cursor = buf.next_cursor();
-        buf.push(b"second\n");
-
-        let (text, next_cursor, truncated) = buf.read(Some(cursor), 64);
-
-        assert_eq!(text, "second\n");
-        assert_eq!(next_cursor, 13);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn stream_ring_buffer_old_cursor_reports_truncation() {
-        let mut buf = StreamRingBuffer::new(6);
-        buf.push(b"abcdef");
-        buf.push(b"ghij");
-
-        let (text, next_cursor, truncated) = buf.read(Some(0), 64);
-
-        assert_eq!(text, "efghij");
-        assert_eq!(next_cursor, 10);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn stream_ring_buffer_retains_tail_when_single_chunk_exceeds_cap() {
-        let mut buf = StreamRingBuffer::new(6);
-        buf.push(b"abcdefghij");
-
-        let (text, next_cursor, truncated) = buf.read(Some(0), 64);
-
-        assert_eq!(text, "efghij");
-        assert_eq!(next_cursor, 10);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn stream_ring_buffer_respects_max_bytes() {
+    fn stream_ring_buffer_snapshot_returns_tail_and_reports_dropped_prefix() {
         let mut buf = StreamRingBuffer::new(64);
         buf.push(b"abcdefghij");
 
-        let (text, next_cursor, truncated) = buf.read(None, 4);
+        let page = buf.read_tail(4);
 
-        assert_eq!(text, "ghij");
-        assert_eq!(next_cursor, 10);
-        assert!(!truncated);
+        // Snapshot 取最近 4 字节,前面的 6 字节确实读不回来了,必须如实报告。
+        assert_eq!(page.text, "ghij");
+        assert!(page.data_lost);
+    }
+
+    #[test]
+    fn stream_ring_buffer_window_does_not_skip_or_repeat() {
+        let mut buf = StreamRingBuffer::new(1024);
+        buf.push_at(0, b"0123");
+        buf.push_at(4, b"4567");
+        buf.push_at(8, b"89");
+
+        assert_eq!(buf.read_window(0, 4, false).text, "0123");
+        assert_eq!(buf.read_window(4, 8, false).text, "4567");
+        assert_eq!(buf.read_window(8, 10, false).text, "89");
+    }
+
+    #[test]
+    fn stream_ring_buffer_reports_loss_only_when_cursor_left_trimmed_bytes() {
+        let mut buf = StreamRingBuffer::new(6);
+        buf.push_at(0, b"abcdef");
+        buf.push_at(6, b"ghij");
+
+        // "ab" 已被 cap 丢掉,从 0 读会真的漏数据。
+        assert!(buf.lost_before(0));
+        // 从现存最早位置读,没有丢失。
+        assert!(!buf.lost_before(buf.loss_floor()));
+    }
+
+    #[test]
+    fn stream_ring_buffer_window_ends_on_a_char_boundary() {
+        let mut buf = StreamRingBuffer::new(1024);
+        buf.push_at(0, "中文字".as_bytes()); // 每个字 3 字节,共 9 字节
+
+        // 窗口末落在"中"的字中间:回退到 3,让下一个窗口从"文"整字开始。
+        assert_eq!(buf.boundary_end(0, 4), Some(3));
+        // 正好落在字符边界上:无需调整。
+        assert_eq!(buf.boundary_end(0, 3), None);
+
+        assert_eq!(buf.read_window(0, 3, false).text, "中");
+        assert_eq!(buf.read_window(3, 6, false).text, "文");
+        assert_eq!(buf.read_window(6, 9, false).text, "字");
+    }
+
+    #[test]
+    fn stream_ring_buffer_tail_does_not_split_a_multibyte_char() {
+        let mut buf = StreamRingBuffer::new(1024);
+        buf.push_at(0, "中文字".as_bytes());
+
+        // 只保留 4 字节会切在"文"中间,必须往前退到"字"。
+        let page = buf.read_tail(4);
+        assert_eq!(page.text, "字");
+    }
+
+    #[tokio::test]
+    async fn manager_read_pages_incrementally_without_gaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        manager
+            .start(start_options("printf '0123456789'", "paged"))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            manager
+                .list()
+                .iter()
+                .any(|p| p.status == ProcessStatus::Exited { code: Some(0) })
+        })
+        .await;
+
+        let mut collected = String::new();
+        let mut cursor = Some(0u64);
+        for _ in 0..8 {
+            let out = manager
+                .read(ProcessSelector::Name("paged".into()), cursor, 4)
+                .await
+                .unwrap();
+            if out.stdout.is_empty() {
+                break;
+            }
+            collected.push_str(&out.stdout);
+            cursor = Some(out.next_cursor);
+        }
+
+        assert_eq!(collected, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn manager_read_always_advances_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // 非法 UTF-8 字节渲染成 3 字节的 U+FFFD,max_bytes=1 时按渲染长度收窗口
+        // 会把它整段裁掉。游标必须仍然前进,否则轮询方会永远停在同一位置。
+        manager
+            .start(start_options(r#"printf '\xff\xfe'"#, "binary"))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(5), || {
+            manager
+                .list()
+                .iter()
+                .any(|p| matches!(p.status, ProcessStatus::Exited { .. }))
+        })
+        .await;
+
+        let mut cursor = 0u64;
+        for _ in 0..4 {
+            let out = manager
+                .read(ProcessSelector::Name("binary".into()), Some(cursor), 1)
+                .await
+                .unwrap();
+            if out.next_cursor == cursor {
+                assert_eq!(
+                    out.next_cursor, 2,
+                    "游标停住了: {} (text={:?})",
+                    out.next_cursor, out.stdout
+                );
+                break;
+            }
+            cursor = out.next_cursor;
+        }
+        assert_eq!(cursor, 2, "两个非法字节必须被分页读完");
+    }
+
+    #[tokio::test]
+    async fn manager_read_advances_past_a_char_wider_than_max_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // 单个汉字 3 字节。max_bytes=1 时窗口装不下它:无论如何都要让游标前进,
+        // 否则轮询方永远读同一位置(死循环),而整字返回只是稍微超一点上限。
+        manager
+            .start(start_options("printf '中'", "wide-char"))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(5), || {
+            manager
+                .list()
+                .iter()
+                .any(|p| matches!(p.status, ProcessStatus::Exited { .. }))
+        })
+        .await;
+
+        let out = manager
+            .read(ProcessSelector::Name("wide-char".into()), Some(0), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, "中", "整字返回,不得切成 U+FFFD");
+        assert_eq!(out.next_cursor, 3, "游标必须越过这个字");
+    }
+
+    #[tokio::test]
+    async fn manager_read_does_not_mark_truncated_for_fresh_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // stdout 在前、stderr 在后:两条流都完整保留,游标 0 一定能读到全部。
+        manager
+            .start(start_options(
+                "printf 'O1\n'; sleep 0.2; printf 'E1\n' >&2",
+                "interleaved",
+            ))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(5), || {
+            manager
+                .list()
+                .iter()
+                .any(|p| matches!(p.status, ProcessStatus::Exited { .. }))
+        })
+        .await;
+
+        let out = manager
+            .read(ProcessSelector::Name("interleaved".into()), Some(0), 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, "O1\n");
+        assert_eq!(out.stderr, "E1\n");
+        assert!(
+            !out.truncated,
+            "两条流都完整返回,不应误报 truncated: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_read_keeps_stderr_after_stdout_exceeds_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // stdout 远超单流 256 KiB 上限,stderr 写在最后。共享游标若跳过头,
+        // 这条错误信息会被永久跳过。
+        manager
+            .start(start_options(
+                r#"sh -c 'head -c 300000 /dev/zero | tr "\0" "o"; printf "ERRMARK" >&2'"#,
+                "overflow",
+            ))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(10), || {
+            manager
+                .list()
+                .iter()
+                .any(|p| matches!(p.status, ProcessStatus::Exited { .. }))
+        })
+        .await;
+
+        let mut stderr = String::new();
+        let mut cursor = Some(0u64);
+        for _ in 0..12 {
+            let out = manager
+                .read(ProcessSelector::Name("overflow".into()), cursor, 64 * 1024)
+                .await
+                .unwrap();
+            stderr.push_str(&out.stderr);
+            if out.next_cursor <= cursor.unwrap_or(0) && out.stdout.is_empty() {
+                break;
+            }
+            cursor = Some(out.next_cursor);
+        }
+
+        assert!(
+            stderr.contains("ERRMARK"),
+            "stdout 溢出后 stderr 仍必须可读,实际: {stderr:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_start_reclaims_slots_from_exited_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+
+        for i in 0..16 {
+            manager
+                .start(start_options("printf done", &format!("short-{i}")))
+                .await
+                .unwrap();
+        }
+        wait_until(Duration::from_secs(10), || {
+            manager
+                .list()
+                .iter()
+                .filter(|p| matches!(p.status, ProcessStatus::Exited { .. }))
+                .count()
+                == 16
+        })
+        .await;
+
+        // 已退出的进程占着槽位却永远不再产生输出,必须能被回收。
+        manager
+            .start(start_options("sleep 30", "after-eviction"))
+            .await
+            .expect("terminal processes must not exhaust the slot budget");
+
+        manager.shutdown().await.unwrap();
     }
 }

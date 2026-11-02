@@ -89,12 +89,12 @@ desktop，右侧区域升级成 tabbed（子 agent | 后台进程）。
 ProcessManager (per-thread)
    ├─ list()       ──→ RPC process/list     ──→ 列表快照（进 tab / 收到通知后重拉）
    ├─ subscribe()  ──→ 通知 process/updated ──→ 列表刷新（仅状态变化时）
-   └─ read(cursor) ──→ RPC process/read     ──→ 详情增量追尾（仅详情打开时轮询）
+   └─ read(None) ───→ RPC process/read     ──→ 详情快照追尾（仅详情打开时轮询）
 ```
 
 - **列表**：订阅 `ProcessEvent`，只把 `Started / Ready / Exited / Killed` 转成
   `process/updated` 通知；`Output` 事件**不转发**。前端收到通知即重拉 `process/list`。
-- **详情输出**：仅当详情面板打开时，前端用上一轮的 `next_cursor` 轮询 `process/read`；
+- **详情输出**：仅当详情面板打开时，前端按快照轮询 `process/read`（不带 `cursor`）；
   关闭、切 tab、切对话即停。
 - **作用域**：所有方法带 `thread_id`，后端解析到该 thread 生效的 manager（§4.2）。
 
@@ -198,7 +198,10 @@ RightRailCollapsedStrip (w-8, 收起态)
 - stdout / stderr **分栏两块**，默认追尾最新输出。
 - 用户向上滚即**暂停追尾**，滚回底部自动恢复——对标 TUI 的 `scroll_locked`
   （`process_popup.rs:96-118`）。
-- 数据用 `process/read` 的 `next_cursor` **增量轮询**（约 500ms），**仅在详情打开时**轮询；
+- 数据用 `process/read` 的**快照**（约 500ms，不带 `cursor`），**仅在详情打开时**轮询。
+  面板每次用回包整体替换文本，所以回包必须是「至今为止的输出」；带 `cursor` 的
+  增量读只返回新增切片，替换式渲染会把历史一帧帧丢掉。更早的输出是否已滚出缓冲
+  由 `truncated` 表达；
   关闭、切 tab、切对话即停。
 - 进程进入终态后：保留最终输出供查看、停止轮询，并显示退出码。
 
@@ -249,7 +252,9 @@ RightRailCollapsedStrip (w-8, 收起态)
 - git 项目 + 委派成功时，`process/list` 反映的是**生效工具集**起的进程（而非那个被丢弃的
   manager 的空列表）——抓住 §4.2 的陷阱。
 - 非 git cwd（委派降级）时同样可 list / read / kill。
-- `process/read` 的 `cursor` 增量语义：两次读**不重不漏**。
+- `process/read` 的 `cursor` 增量语义：两次读**不重不漏**（游标是共享时间轴的窗口
+  起点，两条流按同一窗口切分）；`cursor=None` 时返回各流最新 `max_bytes` 字节，
+  丢弃了更早内容必须报 `truncated=true`。
 - 未知 thread 返回空列表而非错误。
 
 **前端（`cd desktop && npx vitest run`）：**
