@@ -50,3 +50,6 @@ dist/
 # cargo-mutants 的输出目录（每次跑 `just mutants` 会重建，不进版本库）
 /yi-agent-rs/mutants.out/
 /yi-agent-rs/mutants.out.old/
+
+# 探针运行产物（报告、运行元数据、stderr 副本）
+/.artifacts/

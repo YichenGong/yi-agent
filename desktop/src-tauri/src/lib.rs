@@ -1,5 +1,7 @@
 #[cfg(desktop)]
 mod bridge;
+#[cfg(all(desktop, feature = "plugin-probe"))]
+pub mod plugin_host;
 #[cfg(desktop)]
 mod remote;
 #[cfg(desktop)]
@@ -23,6 +25,24 @@ const WRAPPER_VERSION: &str = match option_env!("YI_AGENT_WRAPPER_VERSION") {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 全进程只展开一次 `generate_context!()`：探针与正式启动共用同一份
+    // context，否则两份 `_EMBED_INFO_PLIST` 静态符号会在链接期撞车。
+    let context = tauri::generate_context!();
+
+    // 探针构建在创建任何窗口之前接管整个进程：它需要清空窗口配置、走自己的
+    // 资源协议，且绝不能顺手拉起正式 sidecar（那会污染开发者的真实实例）。
+    #[cfg(all(desktop, feature = "plugin-probe"))]
+    if let Some(parsed) = plugin_host::run::ProbeOptions::from_args(std::env::args()) {
+        let code = match parsed {
+            Ok(options) => plugin_host::run::run_probe(context, options),
+            Err(error) => {
+                eprintln!("[plugin-probe] {error}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+
     // 必须在任何开关判定之前。OnceLock：重复调用无副作用。
     #[cfg(desktop)]
     yi_agent_flags::set_build_info(BUILD_KIND, WRAPPER_VERSION);
@@ -62,7 +82,7 @@ pub fn run() {
         });
 
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
 
     // Closing the main window hides it instead of quitting, so the app keeps
