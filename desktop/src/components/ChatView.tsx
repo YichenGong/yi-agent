@@ -13,6 +13,7 @@ import { HelpCard } from "./HelpCard";
 import { UsageCard } from "./UsageCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { HighlightText } from "./HighlightText";
+import { TranscriptPlaceholder } from "./TranscriptPlaceholder";
 
 /**
  * 一张图片引用（path → 分片读取 → 对象 URL）。`refs` 由服务端下发、长度固定，
@@ -399,6 +400,9 @@ export function ChatView({
   anchor,
   onRememberView,
   syncing = false,
+  syncError = null,
+  onRetrySync,
+  isRemote = false,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -444,6 +448,20 @@ export function ChatView({
    * 前者要继续等，后者才回退到底部。只靠 DOM 猜不出来。
    */
   syncing?: boolean;
+  /**
+   * 对账失败的原因（`ThreadView.syncError`）。仅 `syncState === "failed"` 时非空。
+   */
+  syncError?: string | null;
+  /**
+   * 失败态的「重试」回调。宿主应传 `() => selectThread(id, { forceResume: true })`：
+   * `forceResume` 会跳过 `selectThread` 的全部早退，是唯一可靠的强制重同步路径。
+   */
+  onRetrySync?: () => void;
+  /**
+   * 是否远端（手机）客户端。**只有远端才渲染骨架屏**——桌面端没有本地缓存、
+   * 内容恒来自服务端，加骨架会改变既有观感（设计 §4.3 判定顺序第二条）。
+   */
+  isRemote?: boolean;
 }) {
   const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow, isFollowing } =
     useStickToBottom();
@@ -757,6 +775,15 @@ export function ChatView({
           card — on every item event, and re-issues the
           prefix bubbles' image reads. The prop re-renders in place instead, and
           each `ChatItem` still memoizes, so unchanged messages stay untouched. */}
+      {/* 转录为空时才谈得上「占位」。有内容一律原样，绝不遮挡用户正在读的东西。
+          桌面端（`!isRemote`）永不渲染：不加任何新视觉元素（设计 §6.1）。 */}
+      {items.length === 0 && isRemote && (syncing || syncError !== null) ? (
+        syncError !== null ? (
+          <TranscriptPlaceholder kind="failed" reason={syncError} onRetry={onRetrySync} />
+        ) : (
+          <TranscriptPlaceholder kind="loading" />
+        )
+      ) : null}
       <HistoryPrefix
         items={items}
         count={items.length - 1}

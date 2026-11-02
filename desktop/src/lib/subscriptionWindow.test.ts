@@ -32,3 +32,39 @@ describe("SubscriptionWindow", () => {
     expect(w.has("x")).toBe(false); // 返回的是副本，外部改动不影响内部
   });
 });
+
+describe("SubscriptionWindow.forget", () => {
+  it("removes the id so the early-return guard no longer matches", () => {
+    const w = new SubscriptionWindow(3);
+    w.touch("t1");
+    expect(w.has("t1")).toBe(true);
+    w.forget("t1");
+    expect(w.has("t1")).toBe(false);
+  });
+
+  it("keeps the other ids in most-recent-first order", () => {
+    const w = new SubscriptionWindow(3);
+    w.touch("a");
+    w.touch("b");
+    w.touch("c");
+    w.forget("b");
+    expect(w.current()).toEqual(["c", "a"]);
+  });
+
+  it("is a no-op for an unknown id", () => {
+    const w = new SubscriptionWindow(3);
+    w.touch("a");
+    expect(() => w.forget("zzz")).not.toThrow();
+    expect(w.current()).toEqual(["a"]);
+  });
+
+  it("does not break the LRU cap afterwards", () => {
+    const w = new SubscriptionWindow(2);
+    w.touch("a");
+    w.touch("b");
+    w.forget("a");
+    w.touch("c");
+    w.touch("d");
+    expect(w.current()).toEqual(["d", "c"]);
+  });
+});

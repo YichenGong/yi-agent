@@ -388,4 +388,18 @@ describe("threadStore reasoning effort", () => {
     const s = new ThreadStore();
     expect(s.view("t1").syncState).toBe("synced");
   });
+
+  it("carries a failure reason alongside the failed state", () => {
+    const s = new ThreadStore();
+    const v = s.view("t1");
+    v.syncState = "failed";
+    v.syncError = "unknown thread";
+    expect(s.peek("t1")?.syncState).toBe("failed");
+    expect(s.peek("t1")?.syncError).toBe("unknown thread");
+  });
+
+  it("leaves syncError absent on a healthy view", () => {
+    const s = new ThreadStore();
+    expect(s.view("t1").syncError).toBeUndefined();
+  });
 });

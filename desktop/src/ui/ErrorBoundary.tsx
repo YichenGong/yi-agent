@@ -19,17 +19,41 @@ export interface ErrorBoundaryProps {
   onError?: (error: unknown) => void;
   /** 出错时渲染的内容；缺省什么都不渲染。 */
   fallback?: ReactNode;
+  /**
+   * 该值变化时清掉 `hasError`，让子树在原位置恢复渲染。
+   *
+   * 为什么不用 React 的 `key`：`key` 变化会**卸载并重挂**整棵子树。转录区
+   * 的 boundary 若用 `key={currentId}`，每次切会话都会重挂 `ChatView`，把
+   * 滚动位置与展开的 reasoning 块全部丢掉——那正是本卡要修的场景。
+   * `resetKey` 只重置错误位，子树原地保留。
+   *
+   * 不传时行为与历史版本逐字节一致（配对页那处调用就不传）。
+   */
+  resetKey?: unknown;
 }
 
 interface ErrorBoundaryState {
   hasError: boolean;
+  /** 上一次生效的 `resetKey`，用来判断它是否真的变了。 */
+  seenKey: unknown;
 }
 
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState = { hasError: false };
+  state: ErrorBoundaryState = { hasError: false, seenKey: this.props.resetKey };
 
-  static getDerivedStateFromError(): ErrorBoundaryState {
+  static getDerivedStateFromError(): Partial<ErrorBoundaryState> {
     return { hasError: true };
+  }
+
+  static getDerivedStateFromProps(
+    props: ErrorBoundaryProps,
+    state: ErrorBoundaryState,
+  ): Partial<ErrorBoundaryState> | null {
+    if (props.resetKey !== state.seenKey) {
+      return { hasError: false, seenKey: props.resetKey };
+    }
+    // 必须返回 null（而不是 `{}`）：返回对象会触发一次多余的重渲染。
+    return null;
   }
 
   componentDidCatch(error: unknown, _info: ErrorInfo): void {

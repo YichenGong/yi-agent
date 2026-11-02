@@ -1,53 +1,93 @@
 /** @vitest-environment jsdom */
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, cleanup, act } from "@testing-library/react";
+import { useState, type ReactElement } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 
 afterEach(cleanup);
 
-function Boom({ silent }: { silent?: boolean }): never {
-  if (!silent) throw new Error("boom");
+function Boom(): ReactElement {
   throw new Error("boom");
 }
 
 describe("ErrorBoundary", () => {
-  it("renders its children when nothing throws", () => {
+  it("keeps the pre-resetKey behaviour when resetKey is omitted", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     render(
-      <ErrorBoundary>
-        <span>ok</span>
+      <ErrorBoundary fallback={<div data-testid="fb">failed</div>}>
+        <Boom />
       </ErrorBoundary>,
     );
-    expect(screen.getByText("ok")).toBeTruthy();
+    expect(screen.getByTestId("fb")).toBeTruthy();
+    spy.mockRestore();
   });
 
-  it("renders the fallback and reports the error when a child throws", () => {
+  it("calls onError exactly once", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     const onError = vi.fn();
-    // React 会把 boundary 捕获到的错误也打到 console.error，这里静音以免刷屏。
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      render(
-        <ErrorBoundary onError={onError} fallback={<span>fallback</span>}>
-          <Boom />
-        </ErrorBoundary>,
-      );
-      expect(screen.getByText("fallback")).toBeTruthy();
-      expect(onError).toHaveBeenCalledTimes(1);
-    } finally {
-      spy.mockRestore();
-    }
+    render(
+      <ErrorBoundary onError={onError} fallback={<div data-testid="fb">failed</div>}>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    expect(onError).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
   });
 
-  it("renders nothing extra when no fallback is given", () => {
+  it("renders children untouched when nothing throws", () => {
+    render(
+      <ErrorBoundary resetKey="a">
+        <div data-testid="ok">ok</div>
+      </ErrorBoundary>,
+    );
+    expect(screen.getByTestId("ok")).toBeTruthy();
+  });
+
+  function Recovering() {
+    const [resetKey, setResetKey] = useState("a");
+    const [broken, setBroken] = useState(true);
+    return (
+      <>
+        <button
+          onClick={() => {
+            setBroken(false);
+            setResetKey("b");
+          }}
+        >
+          fix
+        </button>
+        <ErrorBoundary resetKey={resetKey} fallback={<div data-testid="fb">failed</div>}>
+          {broken ? <Boom /> : <div data-testid="recovered">recovered</div>}
+        </ErrorBoundary>
+      </>
+    );
+  }
+
+  it("clears hasError when resetKey changes", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const { container } = render(
-        <ErrorBoundary>
-          <Boom />
-        </ErrorBoundary>,
-      );
-      expect(container.textContent).toBe("");
-    } finally {
-      spy.mockRestore();
-    }
+    render(<Recovering />);
+    expect(screen.getByTestId("fb")).toBeTruthy();
+    // React 19 下必须包 act，否则状态更新不会同步刷新断言。
+    act(() => {
+      screen.getByText("fix").click();
+    });
+    expect(screen.getByTestId("recovered")).toBeTruthy();
+    spy.mockRestore();
+  });
+
+  it("does NOT clear hasError while resetKey stays the same", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { rerender } = render(
+      <ErrorBoundary resetKey="same" fallback={<div data-testid="fb">failed</div>}>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    rerender(
+      <ErrorBoundary resetKey="same" fallback={<div data-testid="fb">failed</div>}>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByTestId("fb")).toBeTruthy();
+    spy.mockRestore();
   });
 });

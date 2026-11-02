@@ -42,6 +42,18 @@ export class SubscriptionWindow {
     return this.ids.includes(id);
   }
 
+  /**
+   * 忘掉某条 thread。
+   *
+   * 唯一的调用点是「对账失败」：`App.selectThread` 进入时无条件 `touch(id)`
+   * 把它记进窗口，而 `:1040` 的早退判据是 `inWindow || running`。不把它摘掉，
+   * 用户再点多少次都会被那个早退挡回去，永远没有重试机会（实测连点三次，
+   * `thread/resume` 总数固定为 2）。
+   */
+  forget(id: string): void {
+    this.ids = this.ids.filter((x) => x !== id);
+  }
+
   /** A snapshot copy of the current window, most-recent first. */
   current(): string[] {
     return [...this.ids];

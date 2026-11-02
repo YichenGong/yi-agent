@@ -44,8 +44,28 @@ export interface ThreadView {
    * this connection. `syncing` means the catch-up (resume / readItems) is in
    * flight: the content on screen may be the cached one, so the UI must say so
    * and must not let the user send against it (spec §5).
+   *
+   * `failed` 是本次新增：对账**失败**（服务端拒绝、或者连续一段时间收不到
+   * 任何帧被判停滞）。它与 `syncing` 的区别是「已经不用等了」，必须给用户
+   * 一个显式重试入口，且同样不许发送——屏上的内容可能与服务端不一致。
+   *
+   * 注意：`failed` 不只在手机端出现。`thread/resume` 的收尾是两种客户端
+   * 共享的代码，桌面端失败时也会置成 `failed`（见设计文档 §6.1）。
    */
-  syncState: "syncing" | "synced";
+  syncState: "syncing" | "synced" | "failed";
+  /**
+   * 上次对账失败的原因（已格式化，可直接上屏）。
+   *
+   * 门控契约：**只在 `syncState === "failed"` 时被读取**（`App.tsx` 传给
+   * `ChatView` 的 `syncError` 与 `ChatView` 内部的占位判定都先看 `failed`）。
+   * 因此其余状态下本字段的值**不保证被清空**——失败后重试会把它带进
+   * `syncing` 态，而那时它已不代表当前状态。
+   *
+   * 之所以用门控而不是「每次离开 failed 都清空」：清零点在六处状态转移上，
+   * 任何一处漏掉都会让「只读本字段」的新调用点显示过期文案，而门控只有一个
+   * 判据、不会漏。新增消费者请照同样的门控写，不要直接拿它描述当前状态。
+   */
+  syncError?: string | null;
 }
 
 /**

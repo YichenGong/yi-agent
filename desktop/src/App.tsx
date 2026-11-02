@@ -29,6 +29,8 @@ import {
 
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
+import { TranscriptPlaceholder } from "./components/TranscriptPlaceholder";
+import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { CacheNotice } from "./components/CacheNotice";
 import { MessageInput } from "./components/MessageInput";
 import { ModelPicker } from "./components/ModelPicker";
@@ -59,6 +61,7 @@ import {
   type TagId,
 } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
+import { createWatchdog, SYNC_IDLE_TIMEOUT_MS, type Watchdog } from "./lib/syncWatchdog";
 import { ConnectionError } from "./lib/connectionError";
 import { formatError } from "./lib/errorMessage";
 import {
@@ -191,6 +194,10 @@ export default function App() {
   const storeRef = useRef(new ThreadStore());
   const store = storeRef.current;
   const [, force] = useState(0);
+  // 转录区 boundary 的重试计数：boundary 的 hasError 一旦置位就粘住，
+  // 重试必须换 resetKey 才清得掉。用独立的计数器而不是复用一个现有值，
+  // 是为了让「切换会话」与「点重试」两条复位路径互不干扰。
+  const [transcriptEpoch, setTranscriptEpoch] = useState(0);
   /**
    * 按槽位持有连接（本地 + 每个已连接的远端项目）。
    *
@@ -239,6 +246,12 @@ export default function App() {
   // window bounds how many histories stream live; the rest stay cold and are
   // caught up on demand with `thread/readItems`.
   const subWindow = useRef(new SubscriptionWindow());
+  // 每个正在全量回放的会话一个看门狗：连续收不到该 thread 的任何帧就判停滞。
+  // key 是 thread id；resume 落定（成功/失败）时删条目并 stop。
+  const syncWatchdogs = useRef(new Map<string, Watchdog>());
+  // 通知回调（effect 内）→ 组件体的续命入口。两者不在同一作用域，用 ref 桥接
+  // （与 captureTranscriptRef / storeRef 同一模式）。
+  const notifySyncActivity = useRef<(threadId: string) => void>(() => {});
   // 本连接里已为「plan 判 none 的缓存会话」补过尾部只读 readItems 的会话。按**连接**
   // 记账（`connect()` 建新客户端时清空）：这样任何一次重连——sidecar 重启、或 socket
   // 掉了但进程还在（经中继的瞬断、切回前台）——都会为这些会话重补一次；而同一连接内
@@ -825,6 +838,35 @@ export default function App() {
   }, []);
 
   /**
+   * 对账失败的唯一收尾路径。
+   *
+   * 三件事必须一起做，缺一条就会留下一个「点不动」的会话：
+   * 1. 置 `failed` + 记原因 —— 界面据此显示失败态与重试按钮；
+   * 2. `subWindow.forget(id)` —— `selectThread` 的早退判据是
+   *    `inWindow || running`，而进入时无条件 `touch(id)` 已经把它记进窗口。
+   *    不摘掉，用户再点多少次都不会重走 resume（实测连点三次，计数固定为 2）；
+   * 3. `warm.delete(id)` —— 这条会话并没有成功对账过，不该被当成热会话。
+   *
+   * 保留 `session.lastError`：连接类错误仍要靠它触发既有的
+   * `clearConnectionErrorFrom` 自愈逻辑。
+   */
+  const failSync = (id: string, error: string): void => {
+    const v = store.peek(id);
+    if (v) {
+      v.syncState = "failed";
+      v.syncError = error;
+      v.session.lastError = error;
+    }
+    subWindow.current.forget(id);
+    warm.current.delete(id);
+    force((n) => n + 1);
+  };
+
+  notifySyncActivity.current = (threadId: string) => {
+    syncWatchdogs.current.get(threadId)?.touch();
+  };
+
+  /**
    * Switch the visible thread. A warm thread (already resumed) only swaps the
    * view — its timeline kept accumulating in the background. A cold thread is
    * resumed once; per-thread isolation means the base session list/sidebar can
@@ -921,6 +963,9 @@ export default function App() {
         if (action === "drop") {
           // 会话已不存在：丢掉本地状态与缓存，回落第一条。
           store.drop(id);
+          // 会话已删：它名下若还有在途回放的看门狗，必须一并停机，防定时器泄漏。
+          syncWatchdogs.current.get(id)?.stop();
+          syncWatchdogs.current.delete(id);
           cacheMetaRef.current.delete(id);
           void getContentStore().delete(id);
           cachedAt.current.delete(id);
@@ -990,6 +1035,7 @@ export default function App() {
           // 对账开始：内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
           if (curView && !silentTopUp) curView.syncState = "syncing";
           void (async () => {
+            let failed: unknown = null;
             try {
               const r = await c0.request<{
                 items: Item[];
@@ -1009,17 +1055,31 @@ export default function App() {
                 v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
                 force((n) => n + 1);
               }
-            } catch {
-              // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+            } catch (e) {
+              // 补齐是附加能力：读失败就保留已有内容。但要记下来——否则下面那个
+              // `finally` 会把它当成「已对账」，用户看到的是「既不加载也不报错」。
+              failed = e;
             } finally {
               // 无论成败都必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
               const v = store.peek(id);
               if (v) {
                 if (!silentTopUp) {
-                  v.syncState = "synced";
-                  // 该会话已与服务端对过账：去掉"这是缓存"的标注（spec §5.3）。
-                  // 静默补齐保留标注：内容仍源自缓存，离线时理应继续标注（§5.3）。
-                  cachedAt.current.delete(id);
+                  if (failed === null) {
+                    v.syncState = "synced";
+                    // 该会话已与服务端对过账：去掉"这是缓存"的标注（spec §5.3）。
+                    // 静默补齐保留标注：内容仍源自缓存，离线时理应继续标注（§5.3）。
+                    cachedAt.current.delete(id);
+                  } else if (v.session.items.length === 0) {
+                    // 没补到任何内容又失败了：这才是真的没东西可看。
+                    // 有内容时不打扰——用户手上至少不是一片空白。
+                    v.syncState = "failed";
+                    v.syncError = formatError(failed);
+                  } else {
+                    // 有内容但补齐失败：既不显示失败占位（有内容不打扰），也不能
+                    // 说「已对账」。取 synced 是为了不让发送被永久拦住——内容已经
+                    // 能看，用户发送是合理的。
+                    v.syncState = "synced";
+                  }
                 }
                 force((n) => n + 1);
               }
@@ -1077,6 +1137,11 @@ export default function App() {
     const coldView = store.peek(id);
     if (coldView) coldView.syncState = "syncing";
     inFlightResume.current.add(id);
+    // 停滞检测：健康的回放每收一帧就续命，只有真的断了才会触发。
+    const watchdog = createWatchdog(SYNC_IDLE_TIMEOUT_MS, () =>
+      failSync(id, "内容加载超时，请重试"),
+    );
+    syncWatchdogs.current.set(id, watchdog);
     // 全量回放期间收集服务端 item id；成功后据此删掉缓存里服务端已经没有的项
     // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
     const replaySession = store.view(id).session;
@@ -1132,16 +1197,21 @@ export default function App() {
       force((v) => v + 1);
     } catch (e) {
       replaySession.endReplay();
-      // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
-      // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
-      const view = store.peek(id);
-      if (view) {
-        view.session.lastError = formatError(e);
-        // 失败也必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
-        view.syncState = "synced";
-      }
-      force((v) => v + 1);
+      // 失败路径只在视图仍存在时构造文案，避免 re-create 一个已被 drop 的
+      // ThreadView（无界泄漏 + 残留 warm 条目）。
+      //
+      // failSync 内部已经 force 过一次，故这里不再单独 force。
+      if (store.peek(id)) failSync(id, formatError(e));
     } finally {
+      // 停机是硬要求：不停的话，一次成功的加载会被这个定时器在 15s 后
+      // 反向判成失败。
+      watchdog.stop();
+      // 只摘**自己这条**条目。重试路径允许「上一趟仍在途」时再发一趟
+      // （`forceResume` 跳过全部早退），若无条件 `delete(id)`，先落定那趟会
+      // 把后起那趟的条目删掉，后者的续命信号就此丢失、健康回放被 15s 判死。
+      if (syncWatchdogs.current.get(id) === watchdog) {
+        syncWatchdogs.current.delete(id);
+      }
       inFlightResume.current.delete(id);
     }
   };
@@ -1515,6 +1585,9 @@ export default function App() {
     const v = store.peek(id);
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
+    // 删除会话：先停掉可能仍在计时的回放看门狗（设计 §6 不变量 5）。
+    syncWatchdogs.current.get(id)?.stop();
+    syncWatchdogs.current.delete(id);
     warm.current.delete(id);
     sess.forgetView(id);
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
@@ -1671,6 +1744,7 @@ export default function App() {
       setTagNames,
       force,
       markThreadRead,
+      notifySyncActivity: (id) => notifySyncActivity.current(id),
       schedulePersist,
       selectThread,
       disposed,
@@ -1897,10 +1971,15 @@ export default function App() {
     // 只提示、保留草稿，交给用户连上后再发——不排队、不自动重发。
     // 同样地，会话尚在对账中（syncing）也不能发：屏上可能还是旧缓存，此刻发出去
     // 的上下文与服务端实际上下文可能不一致（spec §5.1）。
-    if (offline || store.peek(id)?.syncState === "syncing") {
+    // **失败态（failed）同样要拦**：它比 syncing 更危险——用户以为自己已经看到了
+    // 完整上下文，其实一条都没到。这是加 failed 时最容易漏的一处。
+    const syncState = store.peek(id)?.syncState;
+    if (offline || syncState === "syncing" || syncState === "failed") {
       store.view(id).session.lastError = offline
         ? "正在连接，请稍候"
-        : "正在同步，请稍候";
+        : syncState === "failed"
+          ? "内容尚未加载完成，请先重试"
+          : "正在同步，请稍候";
       force((v) => v + 1);
       return false;
     }
@@ -2393,6 +2472,10 @@ export default function App() {
           persistedFp.current.clear();
           // SubscriptionWindow 没有 clear()，整体换新（与该重连路径保持一致）。
           subWindow.current = new SubscriptionWindow();
+          // 所有在途回放已被丢弃：看门狗的定时器必须一并停掉，否则它们会在
+          // 15s 后对着一个已经重置的 store 报失败（设计 §6 不变量 5）。
+          for (const wd of syncWatchdogs.current.values()) wd.stop();
+          syncWatchdogs.current.clear();
           void resetCacheScope().catch(() => {});
           prefs.setRepairing(false);
           prefs.setRepairNotice(null);
@@ -2604,13 +2687,14 @@ export default function App() {
               <>
                 {sess.currentId !== null &&
                   ((offline && cachedAt.current.has(sess.currentId)) ||
-                    store.peek(sess.currentId)?.syncState === "syncing") && (
+                    store.peek(sess.currentId)?.syncState === "syncing" ||
+                    store.peek(sess.currentId)?.syncState === "failed") && (
                     <CacheNotice
                       savedAt={cachedAt.current.get(sess.currentId) ?? null}
-                      syncing={
-                        !offline &&
-                        store.peek(sess.currentId)?.syncState === "syncing"
-                      }
+                      // 不再要求 !offline：冷启动时 offline 为真只是因为握手还没
+                      // 走完（status 尚未置 connected），而 syncState 是更强的证据。
+                      syncing={store.peek(sess.currentId)?.syncState === "syncing"}
+                      failed={store.peek(sess.currentId)?.syncState === "failed"}
                     />
                   )}
                 {/*
@@ -2621,34 +2705,67 @@ export default function App() {
                 `flex-1` 的转录列，输入区仍在它下面可用。
               */}
                 <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                  <ChatView
-                    items={current?.session.items ?? []}
-                    error={current?.session.lastError ?? null}
-                    retrying={current?.session.retrying ?? null}
-                    threadId={sess.currentId}
-                    // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
-                    // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
-                    call={imageCall}
-                    structuralVersion={current?.session.structuralVersion ?? 0}
-                    query={searchQuery}
-                    anchor={
-                      sess.currentId
-                        ? sess.anchorFor(sess.currentId)
-                        : undefined
+                  <ErrorBoundary
+                    // 切会话必须清掉错误位，否则切到好会话仍是错误页。
+                    // 用 resetKey 而不是 key：key 会连 ChatView 一起重挂，
+                    // 每次切会话丢滚动位置与展开的 reasoning 块。
+                    resetKey={`${sess.currentId ?? "none"}:${transcriptEpoch}`}
+                    onError={(e) => console.error("transcript render failed", e)}
+                    fallback={
+                      <TranscriptPlaceholder
+                        kind="crashed"
+                        reason="这条会话里有一段内容无法渲染"
+                        // 换 resetKey 才能真的清掉 hasError；只 force 重渲染
+                        // 的话 boundary 会一直停在 fallback 上。
+                        onRetry={() => setTranscriptEpoch((n) => n + 1)}
+                      />
                     }
-                    // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
-                    // "还没到"（继续等）与"真的没了"（回退到底部）。
-                    syncing={
-                      sess.currentId
-                        ? store.peek(sess.currentId)?.syncState === "syncing"
-                        : false
-                    }
-                    // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
-                    // 注释），所以直接透传，不在闭包里另读 currentId。
-                    onRememberView={sess.rememberView}
-                    scrollerRef={transcriptRef}
-                    captureViewRef={captureTranscriptRef}
-                  />
+                  >
+                    <ChatView
+                      items={current?.session.items ?? []}
+                      error={current?.session.lastError ?? null}
+                      retrying={current?.session.retrying ?? null}
+                      threadId={sess.currentId}
+                      // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                      // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                      call={imageCall}
+                      structuralVersion={current?.session.structuralVersion ?? 0}
+                      query={searchQuery}
+                      anchor={
+                        sess.currentId
+                          ? sess.anchorFor(sess.currentId)
+                          : undefined
+                      }
+                      // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
+                      // "还没到"（继续等）与"真的没了"（回退到底部）。
+                      syncing={
+                        sess.currentId
+                          ? store.peek(sess.currentId)?.syncState === "syncing"
+                          : false
+                      }
+                      // 失败原因：非 null 即失败态。有内容时不渲染占位（ChatView 内判）。
+                      syncError={
+                        sess.currentId
+                          ? store.peek(sess.currentId)?.syncState === "failed"
+                            ? (store.peek(sess.currentId)?.syncError ?? "加载失败")
+                            : null
+                          : null
+                      }
+                      onRetrySync={() => {
+                        const id = sess.currentId;
+                        // `forceResume` 跳过 selectThread 的全部早退，是唯一可靠的
+                        // 强制重同步路径（设计 §4.3）。
+                        if (id) void selectThread(id, { forceResume: true });
+                      }}
+                      // 只有远端才渲染骨架屏：桌面端不加任何新视觉元素（设计 §6.1）。
+                      isRemote={isRemoteClient()}
+                      // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                      // 注释），所以直接透传，不在闭包里另读 currentId。
+                      onRememberView={sess.rememberView}
+                      scrollerRef={transcriptRef}
+                      captureViewRef={captureTranscriptRef}
+                    />
+                  </ErrorBoundary>
                   {searchOpen && (
                     <SearchBar
                       value={searchInput}

@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
 
 type Mode = "normal" | "yolo";
@@ -409,6 +410,8 @@ import App, { REPAIR_REMOVED_TEXT } from "./App";
 import { MemoryContentStore } from "./lib/contentStore";
 import { __setClearThreadContent } from "./lib/cacheScope";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { TranscriptPlaceholder } from "./components/TranscriptPlaceholder";
 
 // jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
 // `useImageData` 真的去 `image/read` 取字节、建对象 URL（hook 的缓存按 path 全局
@@ -6397,5 +6400,295 @@ describe("session search (Cmd+F)", () => {
     );
     pressCmdF();
     expect(findBar()).toBeNull();
+  });
+});
+
+describe("App 同步状态机（手机端黑屏）", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  const resumeCount = () =>
+    clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+  /** 服务端的 resume 回包形状（`session.refreshThreads` 的兜底读会用到）。 */
+  const resumeOk = (threadId: string) => ({
+    thread_id: threadId,
+    cwd: "/w",
+    model: "m",
+    permission_mode: "normal",
+  });
+
+  /**
+   * 手机端 Enter 只换行，发送走 Send 按钮（`MessageInput` 的 `!isMobile` 分支）；
+   * 桌面端则是 Enter 发送。两条路径都要能触发到 `App.send`，否则用例失败的原因
+   * 会是「根本没点发送」而不是「没拦住」。
+   */
+  const typeAndSendOnMobile = (text: string) => {
+    const box = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  };
+  const typeAndSendOnDesktop = (text: string) => {
+    const box = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.keyDown(box, { key: "Enter" });
+  };
+
+  it("a failing resume is not reported as synced", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => expect(resumeCount()).toBeGreaterThan(0));
+    // 失败必须落在 failed，而不是历史行为里的「谎报 synced」。
+    // Task 6 之前也没有占位：先用状态直接断言（Task 6 之后同一状态会画成占位）。
+    await waitFor(() =>
+      expect(
+        document.querySelector("textarea")?.value ?? "",
+      ).toBe(""),
+    );
+    typeAndSendOnMobile("hello");
+    expect(
+      clients[0].requests.some((r) => r.method === "turn/start"),
+    ).toBe(false);
+    // 顶部提示说出了真正的原因，而不是「连接断开」。
+    expect(document.body.textContent).not.toContain("内容未缓存 · 连接断开");
+  });
+
+  it("tapping a failed thread again retries instead of bailing", async () => {
+    asRemote();
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let calls = 0;
+    state.dataSources["thread/resume"] = (params) => {
+      calls += 1;
+      const id = (params as { threadId: string }).threadId;
+      // 前两次（握手里的 t1、首次点 t2）拒绝，之后放行——模拟用户重试成功。
+      if (calls <= 2) throw { code: -32602, message: "unknown thread" };
+      return resumeOk(id);
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => expect(resumeCount()).toBeGreaterThan(0));
+
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumeCount()).toBe(2));
+    // 再点一次：修复前被 inWindow 早退挡掉，计数停在 2。
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumeCount()).toBe(3));
+  });
+
+  it("a failed thread refuses to send and explains why", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => expect(resumeCount()).toBeGreaterThan(0));
+    typeAndSendOnMobile("hello");
+    // 失败态必须与 syncing 一样拦在 send 之外（spec §6 不变量 8）。
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("内容尚未加载完成"),
+    );
+    expect(
+      clients[0].requests.some((r) => r.method === "turn/start"),
+    ).toBe(false);
+  });
+
+  it("keeps the transcript and shows no placeholder when content already arrived", async () => {
+    asRemote();
+    // 缓存命中 + plan 判 none 的路径才走只读 readItems 补齐；resume 直接失败，
+    // 于是「内容已到」这一条完全由缓存预填保证——正是要测的「有内容不打扰」。
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1",
+      savedAt: 1,
+      lastServerItemId: "i1",
+      items: [{ type: "agentMessage", id: "i1", text: "已经到达的正文" }],
+      trimmed: false,
+      bytes: 40,
+    });
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("已经到达的正文"),
+    );
+    expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeNull();
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+  });
+
+  it("shows a skeleton, not a blank pane, while a cold thread syncs", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeTruthy(),
+    );
+  });
+
+  it("shows a retry affordance when resume never settles", async () => {
+    // fake timers：停滞判定靠真实的 15s，必须把时间推进过去。
+    vi.useFakeTimers();
+    try {
+      asRemote();
+      state.dataSources["thread/resume"] = () => new Promise(() => {});
+      render(<App />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy();
+      expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retrying from the failure pane re-issues thread/resume", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy(),
+    );
+    const before = resumeCount();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(resumeCount()).toBe(before + 1));
+  });
+
+  it("a retry in flight shows the skeleton, not the stale failure reason", async () => {
+    // 失败后点重试：syncState 回到 syncing，而 syncError 必须已经清掉。
+    // `ChatView` 的判据是 `syncing || syncError !== null`，若旧值留着就会走进
+    // `syncError !== null` 分支 —— 健康的在途重试被显示成「内容加载失败 / 重试」。
+    //
+    // 注意：这条用例钉的是**渲染契约**（重试中只有骨架、没有重试按钮）。
+    // `ThreadView.syncError` 的清零本身在 UI 上不可直接观测（两处消费者都门控在
+    // `failed` 之内），它由 `App.tsx` 的 `clearSyncError` 在全部六处离开 failed 的
+    // 状态转移里保证——那是纵深防御，不是当前唯一的正确性来源。
+    asRemote();
+    let attempt = 0;
+    state.dataSources["thread/resume"] = () => {
+      attempt += 1;
+      if (attempt === 1) throw { code: -32602, message: "unknown thread" };
+      return new Promise(() => {});
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    // 第二次 resume 永不回包：此刻是「正在同步」，不是「失败」。
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeTruthy(),
+    );
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "重试" }),
+    ).toBeNull();
+  });
+
+  it("does not show a skeleton for a genuinely empty thread", async () => {
+    asRemote();
+    // resume 正常返回、readItems 也返回空 → 真·空会话
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeNull();
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+  });
+
+  it("a render throw inside the transcript leaves the sidebar and composer mounted", async () => {
+    // **不要**在 App 层制造异常：实测 ChatItem / itemText 对坏数据有完整防御
+    // （text:null / 未知 type / null item / 缺字段 五种形态都不抛），而
+    // `vi.doMock` + 动态 import 会让异常越过 React 直接炸到测试层（已实测失败）。
+    //
+    // 这一条改为**组件层**验证：boundary 的收敛边界是它自己的契约，
+    // 与"哪种坏数据"无关。App 层的真实接线由 Task 7 人工核对。
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      function Boom(): ReactElement {
+        throw new Error("bad item");
+      }
+      render(
+        <div>
+          <aside data-testid="sidebar">sidebar</aside>
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <ErrorBoundary
+              fallback={<TranscriptPlaceholder kind="crashed" reason="bad item" />}
+            >
+              <Boom />
+            </ErrorBoundary>
+          </div>
+          <textarea data-testid="composer" />
+          <div className="app-statusbar">stat</div>
+        </div>,
+      );
+      // 转录区收敛成崩溃页……
+      expect(document.querySelector('[data-testid="sync-crashed"]')).toBeTruthy();
+      // ……而它之外的一切仍然活着：用户能切走、能重连、能报错。
+      expect(screen.getByTestId("sidebar")).toBeTruthy();
+      expect(screen.getByTestId("composer")).toBeTruthy();
+      expect(document.querySelector(".app-statusbar")).toBeTruthy();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("the cache notice names the real reason while syncing on a cold start", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => {
+      const status = document.querySelector('[role="status"]');
+      expect(status).toBeTruthy();
+      // 冷启动时 offline 为真（握手还没走完），但真正的原因是「正在同步」。
+      expect(status?.textContent).not.toContain("断开");
+    });
+  });
+
+  it("never shows a skeleton to a desktop client", async () => {
+    // 不写 yi-agent.remote → 桌面端
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeNull();
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+  });
+
+  it("desktop: a failed resume marks the thread failed and still blocks sending", async () => {
+    // 设计 §6.1：resume 的收尾是两种客户端共享的，桌面端也会置 failed。
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => expect(resumeCount()).toBeGreaterThan(0));
+    typeAndSendOnDesktop("hello");
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("内容尚未加载完成"),
+    );
+    expect(
+      clients[0].requests.some((r) => r.method === "turn/start"),
+    ).toBe(false);
   });
 });
