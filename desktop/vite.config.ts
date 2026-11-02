@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import { configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
@@ -28,5 +29,14 @@ export default defineConfig(() => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+  },
+
+  test: {
+    // `scripts/plugins/probe-report.test.mjs` uses `node:test`, not vitest, so
+    // the probe stays runnable with plain
+    // `node --test desktop/scripts/plugins/probe-report.test.mjs` (the path the
+    // plan specifies) while `npm test` stays green. Vitest's default include
+    // would otherwise collect it and fail with "No test suite found".
+    exclude: [...configDefaults.exclude, "scripts/plugins/**"],
   },
 }));
