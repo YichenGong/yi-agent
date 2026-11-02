@@ -1,0 +1,17 @@
+{
+  "id": "002-create-file",
+  "tool_calls": 3,
+  "input_tokens": 19941,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "notes.md": "^hello\\s*$"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "write"
+  ],
+  "secs": 15,
+  "samples": 3
+}

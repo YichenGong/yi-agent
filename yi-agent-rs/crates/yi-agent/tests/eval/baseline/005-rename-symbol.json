@@ -1,0 +1,18 @@
+{
+  "id": "005-rename-symbol",
+  "tool_calls": 5,
+  "input_tokens": 31512,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/main.rs": "fn compute[\\s\\S]*compute\\(21\\)"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "read",
+    "write"
+  ],
+  "secs": 33,
+  "samples": 3
+}

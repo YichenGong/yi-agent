@@ -1,0 +1,18 @@
+{
+  "id": "011-fix-failing-assert",
+  "tool_calls": 9,
+  "input_tokens": 53634,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/lib.rs": "x \\+ 1"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "write"
+  ],
+  "secs": 33,
+  "samples": 3
+}

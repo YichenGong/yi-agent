@@ -1,0 +1,17 @@
+{
+  "id": "020-summarize-config",
+  "tool_calls": 3,
+  "input_tokens": 15153,
+  "ended_normally": true,
+  "modified_files": false,
+  "result_patterns": {},
+  "result_hashes": {},
+  "tool_kinds": [
+    "Skill",
+    "bash",
+    "glob",
+    "read"
+  ],
+  "secs": 14,
+  "samples": 3
+}
