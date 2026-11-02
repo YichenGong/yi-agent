@@ -31,6 +31,8 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 
 ## Features
 
+- [ ] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`，补齐设计 §11 的恢复、忙碌、环境与契约用例，提交前通过 `just ci`。
+
 - [x] crate 骨架 + workspace 注册 — `yi-agent-rs/crates/yi-agent-app-server/`；`yi-agent-rs/Cargo.toml` members 含 `crates/yi-agent-app-server`
 - [x] JSON-RPC 2.0 信封：`RequestEnvelope` / `ResponseEnvelope`（均 `Serialize` + `Deserialize`）/ `RequestId`（num/str 兼容）/ `RpcError`（标准错误码 + `-32010`~`-32012` 业务错误码）— `src/protocol.rs:18` / `src/protocol.rs:28` / `src/protocol.rs:12` / `src/protocol.rs:62`
 - [x] 服务端 → 客户端通知 `Notification`（`thread/started`、`turn/started`、`thread/status/updated`、`item/*`、`turn/completed`、`thread/tokenUsage/updated`、`error`）、`NotificationEnvelope`（补齐 `jsonrpc:"2.0"` 字段）与 `TurnStatus` — `src/protocol.rs:107` / `src/protocol.rs:150` / `src/protocol.rs:167`
