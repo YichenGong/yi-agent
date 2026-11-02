@@ -127,7 +127,7 @@
 
 **P1 剩余：**
 
-- [ ] reasoning / thinking 展示 — core `ProviderEvent`（`yi-agent-rs/crates/yi-agent-core/src/provider.rs:43`）与 `AgentEvent`（`yi-agent-rs/crates/yi-agent-core/src/agent.rs:198`）当前无 thinking 变体，provider 未解析 thinking block；需 core + provider + protocol + translate + 前端逐层加支持；判据：发一条触发 extended thinking 的 prompt，GUI 显示 reasoning 内容
+- [x] reasoning / thinking 展示 — 三层已贯通：core `ProviderEvent::ThinkingBlock` / `AgentEvent::ThinkingBlock`（`yi-agent-rs/crates/yi-agent-core/src/provider.rs`、`agent.rs`）→ `translate.rs` 产出**不携带凭证**的 `Item::Thinking`（`yi-agent-rs/crates/yi-agent-app-server/src/translate.rs:463`）→ 前端 `Session` 把 `thread/reasoningDelta` 合并成块、再由服务端块级条目就地接管（`desktop/src/lib/session.ts` 的 `mergeThinkingText`）→ `ChatView` 的 `ReasoningBlock` 三态渲染（`desktop/src/components/ChatView.tsx:61`）。Responses 通道的展示明文由 `openai/responses/stream.rs` 从上游 `item.summary[].text` 拼出填入 `ThinkingBlock.text`（修复前恒为空串）。判据：`cd yi-agent-rs && cargo test -p yi-agent-llm`（含 `reasoning_item_summary_text_is_carried_into_the_thinking_block`、`empty_summary_yields_an_empty_thinking_block_text`）+ `cd desktop && npx vitest run src/lib/session.test.ts src/components/ChatView.test.tsx` — [设计](../superpowers/specs/2026-11-02-gpt-cot-display-design.md)
 
 **P2 路线图：**
 
