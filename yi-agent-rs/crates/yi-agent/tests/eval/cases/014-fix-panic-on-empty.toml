@@ -1,0 +1,12 @@
+id = "014-fix-panic-on-empty"
+prompt = "src/first.rs panics on an empty slice. Make it return None instead of panicking, then run bash to check it compiles."
+
+[fixture]
+files = { "src/first.rs" = "pub fn first(v: &[i32]) -> i32 { v[0] }\n" }
+
+[expect.result]
+files = { "src/first.rs" = "Option<i32>|None" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 13
+max_input_tokens = 79500

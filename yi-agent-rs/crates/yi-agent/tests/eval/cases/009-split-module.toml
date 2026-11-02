@@ -1,0 +1,14 @@
+id = "009-split-module"
+prompt = "Move the `second` function out of src/all.rs into a new src/second.rs, wire it with `pub mod second;` plus a re-export in src/all.rs, and delete it from src/all.rs."
+
+[fixture]
+files = { "src/all.rs" = "pub fn first() -> &'static str { \"a\" }\n\npub fn second() -> &'static str { \"b\" }\n" }
+
+[expect.result]
+files = { "src/second.rs" = "pub fn second" }
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 15
+max_input_tokens = 125000

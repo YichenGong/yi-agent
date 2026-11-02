@@ -36,10 +36,141 @@ build:
 build-release:
     cargo build --workspace --release
 
+# === 质量度量（不进 ci，见 docs/superpowers/specs/2026-11-02-quality-hardening-wave2-design.md） ===
+
+# 只卡「本次新增行」的覆盖率，不设全仓总阈值。
+#
+# 为什么不设总阈值：全仓行覆盖已 90.11%，设总阈值只会被存量拉平、失去信号。
+# 为什么是手动 recipe 而非 pre-push hook：必须用独立 CARGO_TARGET_DIR 全量重编
+# （占用 7.2 GB、165s 起），塞进每次 push 必被 --no-verify 绕过，等于没有。
+#
+# 前置条件：全量测试必须全绿。任何测试失败都会让 cargo llvm-cov 以 exit 101
+# 中止且不产出 lcov 文件（实测确认 --no-fail-fast 也不行）。
+#
+# 必须在 git 根比对：diff-cover 用 `git diff` 的仓库相对路径（yi-agent-rs/...）
+# 匹配 lcov 的绝对路径，在 yi-agent-rs/ 下运行会一条都匹配不上并输出
+# "No lines with coverage information in this diff." 后 exit 0 —— 门禁静默失效。
+ci-patch base="main" min="60":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DC="$HOME/.local/share/yi-agent-tools/venv/bin/diff-cover"
+    if [ ! -x "$DC" ]; then DC="$(command -v diff-cover)"; fi
+    if [ ! -x "$DC" ]; then
+        echo "找不到 diff-cover。安装：python3 -m venv ~/.local/share/yi-agent-tools/venv && ~/.local/share/yi-agent-tools/venv/bin/pip install diff-cover" >&2
+        exit 1
+    fi
+    LCOV_ABS="$PWD/target/llvm-cov-target"
+    mkdir -p "$LCOV_ABS"
+    CARGO_TARGET_DIR="$LCOV_ABS" cargo llvm-cov --workspace --lcov \
+        --output-path "$LCOV_ABS/lcov.info"
+    # diff-cover 必须从 git 根运行：它拿 `git diff` 的仓库相对路径
+    # （yi-agent-rs/crates/...）去比对 lcov 里的绝对路径。在 yi-agent-rs/ 下运行
+    # 时一条都匹配不上，于是输出 "No lines with coverage information in this
+    # diff." 并 exit 0 —— 门禁静默失效（2026-11-02 实测）。cd 到 git 根后报告才正确。
+    GIT_ROOT="$(git rev-parse --show-toplevel)"
+    echo "提示：$LCOV_ABS 占约 7.2 GB，回收用 rm -rf $LCOV_ABS"
+    cd "$GIT_ROOT"
+    "$DC" "$LCOV_ABS/lcov.info" \
+        --compare-branch="{{base}}" \
+        --fail-under="{{min}}"
+
+# 变异测试：只打三处安全关键模块（工具权限 / 文件路径边界 / 外部数据解析）。
+#
+# 三处实测合计约 8-10 分钟（permission 2m + sse 3m + path_util 视情况），
+# 刻意不进 `ci`。nightly 跑全量，本地调试可用 --in-diff。
+#
+# 判据不是退出码——cargo-mutants 的退出码 2（有存活体）与 3（有超时）
+# 是不同问题却会互相覆盖（本次实测 permission 有 12 missed + 1 timeout，
+# 只报 3）。真正的判定必须比对 mutants-baseline/*.txt。
+mutants:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # 宿主 shell 里的会话变量会污染测试（bash 的
+    # bash_without_a_session_env_leaves_the_variable_unset 断言它们不存在），
+    # 而 cargo-mutants 会把它当作基线失败直接 exit 4。
+    unset YI_AGENT_THREAD_ID YI_AGENT_SESSION_ID
+    status=0
+    run_one() {
+        local name="$1"; shift
+        echo "=== mutants: $name ==="
+        "$@" 2>&1 | tee "/tmp/mut-$name.txt" | tail -3
+        local rc=${PIPESTATUS[0]}
+        local now
+        now="$(mktemp)"
+        # 只比到 " in " 之前（即状态 + 位置 + 变异描述），去掉耗时段。
+        # 耗时会随机器负载浮动，把 "67s build + 180s test" 写进基线等于
+        # 每次重跑都 diff 失败。
+        grep -E "^MISSED|^TIMEOUT" "/tmp/mut-$name.txt" \
+            | sed -E 's/ in [0-9]+s build.*$//' > "$now" || true
+        local base="mutants-baseline/$name.txt"
+        if [ ! -f "$base" ]; then
+            echo "缺少基线 $base，先跑一次并把 /tmp/mut-$name.txt 的 MISSED 行存进去" >&2
+            status=1; rm -f "$now"; return
+        fi
+        if ! diff -u "$base" "$now" > /tmp/mut-diff-$name.txt; then
+            echo "!! $name 的存活体与基线不一致（新增或消失），见 /tmp/mut-diff-$name.txt" >&2
+            status=1
+        fi
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && [ "$rc" -ne 3 ]; then
+            echo "!! $name 变异测试异常退出 rc=$rc（4=基线失败，70=内部错误）" >&2
+            status=1
+        fi
+        rm -f "$now"
+    }
+    # --timeout 180 而不是 60：实测 60s 会把 path_util 的 11 个守卫变异体
+    # 判成 timeout，其中 2 个其实是**真存活体**（补测试后即被杀死），
+    # 3 个是等价变异体。用 60s 得到的是「超时」噪音，不是可信结论。
+    # permission 提到 180s 后结论与 60s 完全一致（0 missed，1 timeout），
+    # 那条 timeout 是 mcp_reload 变异导致 agent 测试卡住，不是时间不够。
+    run_one permission cargo mutants --file crates/yi-agent-core/src/permission.rs --timeout 180 -j 8
+    run_one sse cargo mutants --file crates/yi-agent-llm/src/sse.rs --timeout 180 -j 8
+    run_one path_util env "YI_FIXTURE_DIR=$PWD/../docs/research/fixtures/2026-10-07-document-samples" \
+        cargo mutants --config .cargo/mutants.toml \
+        --file crates/yi-agent-tools/src/fs/path_util.rs --timeout 180 -j 6
+    exit $status
+
+# Agent golden-set eval：评结果 + 评轨迹。
+#
+# 为什么评轨迹：只评结果的话，「工具选错但碰巧把文件写出来」测不出来。
+# 轨迹断言（must_call / must_not_call / max_tool_calls / max_input_tokens）
+# 才能抓到过程错误。
+#
+# 不进 `ci`：真实 API 调用（真钱）+ 分钟级耗时。
+# 用法：
+#   just eval                 跑全部
+#   just eval 007             只跑 id 含 007 的
+eval filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 配置源必须是 models.json，不能 source ../.env：本仓库没有 .env
+    # （.gitignore 里也没有），source 失败被 `|| true` 吞掉后
+    # skip_if_no_key 直接 return —— 输出「跑了 0 条 case」且退出码 0，
+    # 看起来是绿的其实一条都没跑。
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY MODEL_API_KEY MODEL_API_URL YI_AGENT_PROVIDER YI_AGENT_MODEL
+    eval "$(bash scripts/export-model-env.sh)"
+    if [ -z "${MODEL_API_KEY:-}" ]; then
+        echo "SKIPPED: no headless configuration (models.json has no usable default entry)"
+        exit 0
+    fi
+    EVAL_FILTER="{{filter}}" cargo test -p yi-agent --test eval_baseline \
+        -- --ignored --nocapture
+
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check
+# 依赖漏洞审计。实测约 67s（含 git fetch advisory-db），不需要编译，所以进 `ci`。
+#
+# 为什么不只放 nightly：新披露的 CVE 针对的是**没改动过的依赖**，
+# 等开发者触碰相关代码才暴露是不可接受的。nightly 里再跑一次，
+# 用于捕获「依赖没变但新 CVE 被披露」（那一跑不进 lockfile 变更）。
+#
+# 豁免清单在 .cargo/audit.toml，每条都带复查条件。这里**不**加
+# `--deny warnings`：unmaintained 类告警是不可修的，加 deny 会让门禁
+# 因必然失败的条目永久变红，反而训练人忽略它。
+audit:
+    cargo audit
+
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`

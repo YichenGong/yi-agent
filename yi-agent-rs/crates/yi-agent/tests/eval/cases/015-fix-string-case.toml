@@ -1,0 +1,12 @@
+id = "015-fix-string-case"
+prompt = "The test in src/name.rs expects an uppercase name but `normalize` returns lowercase. Fix normalize so the test passes; use bash to run it."
+
+[fixture]
+files = { "src/name.rs" = "pub fn normalize(s: &str) -> String { s.to_lowercase() }\n\n#[cfg(test)]\nmod t { #[test] fn upper() { assert_eq!(super::normalize(\"bo\"), \"BO\"); } }\n" }
+
+[expect.result]
+files = { "src/name.rs" = "to_uppercase" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 10
+max_input_tokens = 67500

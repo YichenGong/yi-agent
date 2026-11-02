@@ -1923,7 +1923,17 @@ async fn turn_start_reports_a_structured_code_for_a_non_image_file() {
 /// 读不到的附件路径必须就地拒绝（错误提到 attachment），且一个 turn 都不起。
 #[tokio::test(flavor = "multi_thread")]
 async fn turn_start_rejects_an_unreadable_attachment() {
-    let mut h = Harness::new();
+    // 自带 workdir：`Harness::new()` 用的是**共享** `/tmp/yi-agent-app-server-test`，
+    // 而 `thread/start` 会经 attach_delegation 同步拉起/复用该 cwd 的 subagent
+    // daemon。全量并发下上百个用例抢同一个 socket，实测 attach 可达 12~27s，
+    // 超过 `EVENT_WAIT`(30s) 就 panic `timed out waiting for a message`
+    // （本用例在 `just ci` 全量下一稳定复现，单跑该 crate 1151 tests 全绿）。
+    // 这是 docs/project-management/ci-cd.md 里已登记的同一根因，此处先按官方
+    // 建议的隔离法修本用例。
+    let workdir = tempfile::TempDir::new().unwrap();
+    let mut cfg = default_config();
+    cfg.workdir = workdir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
     let tid = start_thread(&mut h).await;
     h.send(&format!(
         r#"{{"jsonrpc":"2.0","id":10,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"/definitely/not/here.pdf"}},{{"type":"text","text":"hi"}}]}}}}"#

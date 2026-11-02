@@ -1,0 +1,11 @@
+id = "002-create-file"
+prompt = "Create a file named notes.md containing exactly the single line: hello. Use the write tool."
+
+[expect.result]
+files = { "notes.md" = "^hello\\s*$" }
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 7
+max_input_tokens = 36000

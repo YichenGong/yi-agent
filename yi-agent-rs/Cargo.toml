@@ -72,3 +72,6 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 croner = "3"
 uuid = { version = "1", features = ["v4"] }
+
+# 测试工具
+proptest = "1"

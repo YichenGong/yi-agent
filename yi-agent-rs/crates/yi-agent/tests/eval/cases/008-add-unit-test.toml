@@ -1,0 +1,14 @@
+id = "008-add-unit-test"
+prompt = "Add a #[cfg(test)] test module to src/math.rs covering the `sub` function with at least one assertion, keeping the existing code intact."
+
+[fixture]
+files = { "src/math.rs" = "pub fn sub(a: i32, b: i32) -> i32 { a - b }\n" }
+
+[expect.result]
+files = { "src/math.rs" = "#\\[cfg\\(test\\)\\][\\s\\S]*assert" }
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 13
+max_input_tokens = 103000

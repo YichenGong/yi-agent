@@ -647,6 +647,7 @@ impl Default for CommandPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn filter_empty_shows_all() {
@@ -1278,5 +1279,42 @@ mod tests {
         );
         assert!(!text.to_lowercase().contains("api_key"));
         assert!(!text.to_lowercase().contains("api-key"));
+    }
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        })]
+
+        /// 任意输入都不 panic，且返回值的规范名能再次解析回它自己。
+        ///
+        /// 这是 `from_name` 真正有意义的不变量。原稿写的
+        /// 「`from_name(name).name() == name` 对所有 `all()` 元素成立」是恒真废话
+        /// ——`all()` 里存的就是规范名，`find(|c| c.name() == name)` 直接命中，
+        /// 永远为真、测不出任何东西。
+        #[test]
+        fn prop_from_name_converges_on_canonical_name(name in "\\PC{0,40}") {
+            if let Some(cmd) = SlashCommand::from_name(&name) {
+                let canonical = cmd.name();
+                prop_assert_eq!(
+                    SlashCommand::from_name(canonical).map(|c| c.name()),
+                    Some(canonical),
+                    "规范名必须能往返解析"
+                );
+            }
+        }
+
+        /// 别名也要收敛：`from_name("kanban")` 得到 `Kanban`，
+        /// 而 `Kanban.name()` 是 "superpowers-kanban"（`:89` 的 `name()` 实现）。
+        /// 这条保证「用户输入别名」与「用规范名再解析」指向同一命令。
+        #[test]
+        fn prop_aliases_converge(name in "\\PC{0,60}") {
+            let Some(first) = SlashCommand::from_name(&name) else { return Ok(()) };
+            let second = SlashCommand::from_name(first.name());
+            prop_assert_eq!(second, Some(first));
+        }
     }
 }

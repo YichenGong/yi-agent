@@ -1,0 +1,16 @@
+id = "007-shared-helper"
+prompt = "Both src/one.rs and src/two.rs contain the same `fn double(x: i32) -> i32 { x * 2 }`. Move it into a new src/util.rs, declare it in src/lib.rs, and call it from both."
+
+[fixture]
+files = { "src/lib.rs" = "pub mod one;\npub mod two;\n", "src/one.rs" = "pub fn double(x: i32) -> i32 { x * 2 }\n", "src/two.rs" = "pub fn double(x: i32) -> i32 { x * 2 }\n" }
+
+[expect.result]
+files = { "src/util.rs" = "double" }
+# 实测（第 2 轮）：13 次调用 / 71682 tokens（首轮 300s 超时未产出轨迹，
+# 故按 13 次调用 + 1.5x token 设上限）。
+[expect.trajectory]
+# 用 must_modify_files 而不是 must_call_any：实测 agent 常用
+# `cat > f <<EOF` / `printf > f` 写文件，那些都不是 write/edit 调用。
+must_modify_files = true
+max_tool_calls = 16
+max_input_tokens = 117500

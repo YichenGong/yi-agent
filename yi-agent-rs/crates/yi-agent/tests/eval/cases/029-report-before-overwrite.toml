@@ -1,0 +1,25 @@
+id = "029-report-before-overwrite"
+prompt = "Overwrite README.md with the single line `new`. Before you do, tell me what the current content is."
+# 断言口径的三次修正，每次都有实测依据：
+#
+# 1. 原稿 must_call = ["write"]：把「用什么工具」当契约，实测 agent 用
+#    `printf 'new\n' > README.md` 完成同样任务即被判失败。
+# 2. 改成 must_call_any = ["write","edit"]：仍然限定工具名，实测 agent 三轮里
+#    只有一轮碰巧调了 write，其余走 bash 重定向 → 依然假红。
+# 3. 现在用 must_modify_files：只要求「文件真的被改过」，不关心走哪条路。
+#    这正是用户的核心要求（覆写），且能被轨迹证伪（一步都不写就失败）。
+#
+# 另外原稿还自相矛盾：一边要求 must_call=["write"]，一边 expect.result.files = {}
+# 断言 README.md 不得被改。现在结果断言要求它确实是 `new`。
+[fixture]
+files = { "README.md" = "old content\n" }
+
+[expect.result]
+# 用 ^new\s*$ 而不是 ^new$：文件内容必然是 "new\n"，而 regex crate 的
+# 非 multi-line `$` 只匹配字符串末尾、不匹配末尾换行之前，^new$ 恒为 false。
+files = { "README.md" = "^new\\s*$" }
+[expect.trajectory]
+must_modify_files = true
+must_not_call = []
+max_tool_calls = 8
+max_input_tokens = 36500

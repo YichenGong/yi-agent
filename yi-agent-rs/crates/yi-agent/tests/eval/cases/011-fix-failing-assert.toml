@@ -1,0 +1,12 @@
+id = "011-fix-failing-assert"
+prompt = "Run the tests with `cargo test`, find the failure in src/lib.rs, and fix the code so the test passes."
+
+[fixture]
+files = { "src/lib.rs" = "pub fn inc(x: i32) -> i32 { x + 2 }\n\n#[cfg(test)]\nmod t { #[test] fn inc_by_one() { assert_eq!(super::inc(1), 2); } }\n" }
+
+[expect.result]
+files = { "src/lib.rs" = "x \\+ 1" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 15
+max_input_tokens = 97500

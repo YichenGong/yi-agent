@@ -1,0 +1,12 @@
+id = "010-fix-doc-and-code"
+prompt = "src/greet.rs has a doc comment saying it returns \"hi\" but the code returns \"hello\". Fix whichever is wrong so the doc and the code agree on a single greeting."
+
+[fixture]
+files = { "src/greet.rs" = "/// Returns \"hi\".\npub fn greet() -> &'static str { \"hello\" }\n" }
+
+[expect.result]
+files = { "src/greet.rs" = "greet" }
+[expect.trajectory]
+must_call = []
+max_tool_calls = 10
+max_input_tokens = 68000

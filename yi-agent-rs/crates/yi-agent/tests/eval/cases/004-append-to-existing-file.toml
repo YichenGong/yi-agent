@@ -1,0 +1,12 @@
+id = "004-append-to-existing-file"
+prompt = "Read todo.txt, then append a new line saying `buy milk` at the end (keep the existing lines). Use the edit or write tool."
+
+[fixture]
+files = { "todo.txt" = "buy bread\n" }
+
+[expect.result]
+files = { "todo.txt" = "buy bread[\\s\\S]*buy milk" }
+[expect.trajectory]
+must_modify_files = true
+max_tool_calls = 7
+max_input_tokens = 36000

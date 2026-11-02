@@ -62,6 +62,9 @@ libc = "0.2"
 tempfile = "3"
 serde_json = { workspace = true }
 libc = "0.2"
+proptest = { workspace = true }
+toml = "0.8"
+regex = "1"
 
 [features]
 default = []
