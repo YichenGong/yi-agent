@@ -224,7 +224,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 输入为隔离实例根、probe suite、输出报告路径；输出真实 WebView 运行报告。探针与后续产品共用容器创建和资源策略，不能在测试模式关闭安全配置。测试身份只在探针构建中注入，不改变正式信任根。`probe-lib.mjs` 导出纯函数 `checkProbeReport(report)`，导入不构建、不启动进程；`probe.mjs` 仅作 CLI 编排。原生 `probe.rs` 通过仅探针 feature 可用的宿主控制通道接收 case 回报，并独立核对 frame、case、nonce 与超时；插件不能自行报告“已恢复”。恢复 case 的成功需由原生侧关闭/重建后，用正常宿主交互及持久化会话校验确认。
 
-- [ ] Step 1：用 Node 内置测试写报告验收，先确认空 case 会失败：
+- [x] Step 1：用 Node 内置测试写报告验收，先确认空 case 会失败：
   ```js
   import test from 'node:test';
   import assert from 'node:assert/strict';
@@ -233,15 +233,15 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
     assert.throws(() => checkProbeReport({cases: []}), /missing/);
   });
   ```
-- [ ] Step 2：运行 `node --test desktop/scripts/plugins/probe-report.test.mjs`，确认缺少实现/校验时红；新增错误报告 fixture，确认不是只因 import 错误红。
-- [ ] Step 3：实现 probe 构建入口、独立临时 `YI_AGENT_HOME`、本机假后端、资源加载与消息记录；攻击用例包括 DOM/storage、invoke、跨包资源、导航/弹窗/图片外送、frame 冒领、重放初始化、持续阻塞和有界大量分配。原生侧设截止时间、关闭/重建容器；外部 runner 另设整组兜底超时，超时终止整个测试进程组并记 FAIL，不能把“杀掉应用”算恢复成功。禁止无界耗尽机器内存。
-- [ ] Step 4：从仓库根执行下列构建，再运行 `node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json`；runner 用 `cargo metadata --manifest-path desktop/src-tauri/Cargo.toml --no-deps --format-version 1` 解析 target_directory，核对 bundle/二进制存在及摘要，不猜主 workspace target。不用 `open -a`，macOS 直接运行 bundle 的 `Contents/MacOS/desktop`（当前 package 名为 desktop）；其他目标平台必须有对应启动适配器，否则不列入支持矩阵。
+- [x] Step 2：运行 `node --test desktop/scripts/plugins/probe-report.test.mjs`，确认缺少实现/校验时红；新增错误报告 fixture，确认不是只因 import 错误红。
+- [x] Step 3：实现 probe 构建入口、独立临时 `YI_AGENT_HOME`、本机假后端、资源加载与消息记录；攻击用例包括 DOM/storage、invoke、跨包资源、导航/弹窗/图片外送、frame 冒领、重放初始化、持续阻塞和有界大量分配。原生侧设截止时间、关闭/重建容器；外部 runner 另设整组兜底超时，超时终止整个测试进程组并记 FAIL，不能把“杀掉应用”算恢复成功。禁止无界耗尽机器内存。
+- [x] Step 4：从仓库根执行下列构建，再运行 `node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json`；runner 用 `cargo metadata --manifest-path desktop/src-tauri/Cargo.toml --no-deps --format-version 1` 解析 target_directory，核对 bundle/二进制存在及摘要，不猜主 workspace target。不用 `open -a`，macOS 直接运行 bundle 的 `Contents/MacOS/desktop`（当前 package 名为 desktop）；其他目标平台必须有对应启动适配器，否则不列入支持矩阵。
   ```bash
   (cd desktop && npm ci && npm run sidecar:release && npm run build && npm run tauri -- build --bundles app --features plugin-probe)
   node --test desktop/scripts/plugins/probe-report.test.mjs
   ```
   sidecar 必须由当前 worktree 构建且使用隔离实例；报告原生写入测试临时根，runner 等待原子报告及明确正常退出，收集 stderr 与摘要，finally 先停止桌面父进程再清理其后代。不借正在使用的正式 sidecar。
-- [ ] Step 5：按 C 验证并提交 `test: add isolated plugin webview probe`。管理文档记录探针命令、正式配置摘要与支持平台，不标插件已完成。
+- [x] Step 5：按 C 验证并提交 `test: add isolated plugin webview probe`。管理文档记录探针命令、正式配置摘要与支持平台，不标插件已完成。
 
 ### Task T02：审阅技术结果并解除 G0
 
@@ -251,11 +251,11 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 消费真实报告；输出逐条对应 spec §4 的 PASS/FAIL 证据、选定资源机制、sandbox/CSP/原生权限配置及恢复策略。
 
-- [ ] Step 1：报告验证脚本增加断言：case 必须包含 `blocked_script_recovery`、`native_invoke_denied` 和 `cross_frame_replay_denied`，删除任一 case 后测试必须红。
-- [ ] Step 2：用同一 release 容器配置重跑正反例，记录配置差异；无主页面 JS 响应时验证原生侧仍能恢复容器与核心交互，并校验会话持久化不受损。正常用例逐项验证中文 IME、键盘/焦点、滚动、主题和尺寸，报告不得只覆盖攻击用例。
-- [ ] Step 3：若 iframe 在所支持 WebView 上无法恢复，停止后续实现；提交容器替代设计，用户批准后重跑 G0。不能把测试改成“跳过该平台”。
+- [x] Step 1：报告验证脚本增加断言：case 必须包含 `blocked_script_recovery`、`native_invoke_denied` 和 `cross_frame_replay_denied`，删除任一 case 后测试必须红。
+- [x] Step 2：用同一 release 容器配置重跑正反例，记录配置差异；无主页面 JS 响应时验证原生侧仍能恢复容器与核心交互，并校验会话持久化不受损。正常用例逐项验证中文 IME、键盘/焦点、滚动、主题和尺寸，报告不得只覆盖攻击用例。
+- [x] Step 3：若 iframe 在所支持 WebView 上无法恢复，停止后续实现；提交容器替代设计，用户批准后重跑 G0。不能把测试改成“跳过该平台”。
 - [ ] Step 4：审阅完整报告和目标平台矩阵，显式取得 G0 认可。没有报告或许可不进入 T03 之后的产品实现。
-- [ ] Step 5：按 C 提交 `docs: record plugin container feasibility gate`。文档提交也不得绕过现有仓库提交门禁。
+- [x] Step 5：按 C 提交 `docs: record plugin container feasibility gate`。文档提交也不得绕过现有仓库提交门禁。
 
 ## Phase 1：先冻结跨模块协议
 
