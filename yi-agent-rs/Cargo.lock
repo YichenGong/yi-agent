@@ -5141,6 +5141,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yi-agent-lifecycle"
+version = "0.1.13"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "yi-agent-llm"
 version = "0.1.13"
 dependencies = [
