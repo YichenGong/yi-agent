@@ -44,8 +44,20 @@ export interface ThreadView {
    * this connection. `syncing` means the catch-up (resume / readItems) is in
    * flight: the content on screen may be the cached one, so the UI must say so
    * and must not let the user send against it (spec §5).
+   *
+   * `failed` 是本次新增：对账**失败**（服务端拒绝、或者连续一段时间收不到
+   * 任何帧被判停滞）。它与 `syncing` 的区别是「已经不用等了」，必须给用户
+   * 一个显式重试入口，且同样不许发送——屏上的内容可能与服务端不一致。
+   *
+   * 注意：`failed` 不只在手机端出现。`thread/resume` 的收尾是两种客户端
+   * 共享的代码，桌面端失败时也会置成 `failed`（见设计文档 §6.1）。
    */
-  syncState: "syncing" | "synced";
+  syncState: "syncing" | "synced" | "failed";
+  /**
+   * 上次对账失败的原因（已格式化，可直接上屏）。仅 `syncState === "failed"`
+   * 时有意义；其余状态下应为 `undefined`。
+   */
+  syncError?: string | null;
 }
 
 /**
