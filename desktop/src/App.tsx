@@ -1206,7 +1206,12 @@ export default function App() {
       // 停机是硬要求：不停的话，一次成功的加载会被这个定时器在 15s 后
       // 反向判成失败。
       watchdog.stop();
-      syncWatchdogs.current.delete(id);
+      // 只摘**自己这条**条目。重试路径允许「上一趟仍在途」时再发一趟
+      // （`forceResume` 跳过全部早退），若无条件 `delete(id)`，先落定那趟会
+      // 把后起那趟的条目删掉，后者的续命信号就此丢失、健康回放被 15s 判死。
+      if (syncWatchdogs.current.get(id) === watchdog) {
+        syncWatchdogs.current.delete(id);
+      }
       inFlightResume.current.delete(id);
     }
   };
