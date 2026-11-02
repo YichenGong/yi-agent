@@ -13,15 +13,17 @@ export interface SlashCommandSpec {
   description: string;
   usage: string | null;
   needsArg: boolean;
+  /** Explicit allowlist: new commands are not safe during a turn by default. */
+  availableDuringTurn: boolean;
 }
 
 export const SLASH_COMMANDS: SlashCommandSpec[] = [
-  { name: "clear", description: "清空对话上下文", usage: null, needsArg: false },
-  { name: "compact", description: "压缩对话历史", usage: null, needsArg: false },
-  { name: "fork", description: "从当前会话分叉出一个新副本（需会话空闲）", usage: "[message]", needsArg: false },
-  { name: "config", description: "显示当前配置", usage: null, needsArg: false },
-  { name: "usage", description: "查看 token 用量与上下文占用", usage: null, needsArg: false },
-  { name: "help", description: "显示帮助信息", usage: "[command]", needsArg: false },
+  { name: "clear", description: "清空对话上下文", usage: null, needsArg: false, availableDuringTurn: false },
+  { name: "compact", description: "压缩对话历史", usage: null, needsArg: false, availableDuringTurn: false },
+  { name: "fork", description: "从当前会话分叉出一个新副本（需会话空闲）", usage: "[message]", needsArg: false, availableDuringTurn: false },
+  { name: "config", description: "显示当前配置", usage: null, needsArg: false, availableDuringTurn: true },
+  { name: "usage", description: "查看 token 用量与上下文占用", usage: null, needsArg: false, availableDuringTurn: true },
+  { name: "help", description: "显示帮助信息", usage: "[command]", needsArg: false, availableDuringTurn: true },
 ];
 
 /**
@@ -68,4 +70,9 @@ export function parseSlashInput(text: string): ParsedSlashInput {
   if (name === "") return { kind: "none" };
   const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace).trim();
   return { kind: "command", name, args: rest === "" ? null : rest };
+}
+
+/** Unknown commands are never implicitly allowed to mutate an active turn. */
+export function canRunSlashDuringTurn(name: string): boolean {
+  return SLASH_COMMANDS.some(c => c.name === name && c.availableDuringTurn);
 }

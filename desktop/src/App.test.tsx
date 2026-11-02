@@ -1194,9 +1194,8 @@ describe("App send recovery from a status disagreement", () => {
   const sendFromInput = async (text: string) => {
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: text } });
-    // While a turn is active the button reads "Stop"; this harness clicks it
-    // either way, since Enter would take the same branch.
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    // Send stays independent from Stop while desktop turns are active.
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
   };
 
   /**
@@ -2978,7 +2977,7 @@ describe("App reconnect resilience", () => {
     // 发一条消息，但服务端不回：这条请求正挂在线上时连接被换掉（dispose）。
     state.dataSources["turn/start"] = () => new Promise(() => {});
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await flush();
 
     exit();
@@ -3005,7 +3004,7 @@ describe("App reconnect resilience", () => {
     await flush();
     state.rejectCode["turn/start"] = -32602;
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await flush();
     expect(screen.getByText(/forced -32602/)).toBeTruthy();
 
@@ -4759,39 +4758,19 @@ describe("App 附件接线", () => {
     expect(screen.getByText("报告.pdf")).toBeTruthy();
   });
 
-  it("never routes an attachment send through turn/interject", async () => {
+  it.each(["/tmp/报告.pdf", "/tmp/截图.png"])("rejects a mid-turn attachment %s without losing it", async (path) => {
     render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
-    );
-    // 服务端说这一轮在跑：纯文本本来会走 turn/interject。
-    state.notifHandlers[0]({
-      method: "thread/status/updated",
-      params: { thread_id: "t1", status: "running" },
+    await waitFor(() => expect(clients[0].requests.some(r => r.method === "thread/resume")).toBe(true));
+    await pickAttachments([path]);
+    act(() => {
+      state.notifHandlers[0]({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
     });
-
-    await pickAttachments(["/tmp/报告.pdf"]);
-    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
-
-    await act(async () => {
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
-      fireEvent.click(sendButton());
-    });
-
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
-    );
-    // turn/interject 的入参只认文本，附件会被静默丢掉；带附件必须改走 turn/start。
-    expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
-    expect(
-      clients[0].requests.find((r) => r.method === "turn/start")?.params,
-    ).toEqual({
-      threadId: "t1",
-      input: [
-        { type: "attachment", path: "/tmp/报告.pdf" },
-        { type: "text", text: "总结一下" },
-      ],
-    });
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
+    fireEvent.click(sendButton());
+    await screen.findByText("当前任务进行中，附件需等待结束或先停止后发送");
+    expect(clients[0].requests.filter(r => r.method.startsWith("turn/"))).toHaveLength(0);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("总结一下");
+    expect(screen.getByTestId("attachment-chips").textContent).toContain(path.split("/").pop());
   });
 
   it("clears the pending attachments only after a successful send", async () => {
@@ -5562,7 +5541,7 @@ describe("App mobile local cache", () => {
     await waitFor(() => expect(screen.getByText(/正在同步…/)).toBeTruthy());
     const before = clients[0].requests.filter((r) => r.method === "turn/start").length;
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     expect(clients[0].requests.filter((r) => r.method === "turn/start").length).toBe(before);
 
     // 补完 ⇒ 解禁，提示条退场，且此时真的发得出去。
@@ -5574,7 +5553,7 @@ describe("App mobile local cache", () => {
     const turnsBefore = clients[0].requests.filter(
       (r) => r.method === "turn/start" || r.method === "turn/interject",
     ).length;
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await waitFor(() =>
       expect(
         clients[0].requests.filter(
@@ -5620,7 +5599,7 @@ describe("App mobile local cache", () => {
     // 也绝不能让用户永久无法发送（设计 §11 风险 3）。
     await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hi" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
     );
@@ -5640,7 +5619,7 @@ describe("App mobile local cache", () => {
     );
 
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
 
     await waitFor(() => {
       const turns = clients[0].requests.filter((r) => r.method === "turn/start");
@@ -5671,7 +5650,7 @@ describe("App mobile local cache", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
     );
@@ -6691,4 +6670,131 @@ describe("App 同步状态机（手机端黑屏）", () => {
       clients[0].requests.some((r) => r.method === "turn/start"),
     ).toBe(false);
   });
+});
+
+// 只屏蔽按钮而不修正 Enter、命令分派或草稿归属时，这组集成回归会失败。
+describe("App desktop mid-turn submissions", () => {
+  async function ready() {
+    render(<App />);
+    await waitFor(() => expect(clients[0].requests.some(r => r.method === "thread/resume")).toBe(true));
+    act(() => {
+      state.notifHandlers[0]({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
+    });
+  }
+  function submit(text: string, entry: string) {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    if (entry === "enter") fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    else fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+  }
+  it.each(["enter", "button"])("interjects text via %s without stopping", async entry => {
+    await ready();
+    submit("补充细节", entry);
+    await waitFor(() => expect(clients[0].requests).toContainEqual({
+      method: "turn/interject", params: { threadId: "t1", input: [{ type: "text", text: "补充细节" }] },
+    }));
+    expect(clients[0].requests.some(r => r.method === "turn/start" || r.method === "turn/interrupt")).toBe(false);
+    await waitFor(() => expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""));
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeTruthy();
+  });
+  it.each([
+    ["clear", "enter"], ["compact", "enter"], ["fork", "enter"],
+    ["clear", "button"], ["compact", "button"], ["fork", "button"],
+  ])("refuses /%s mid-turn via %s with draft intact", async (name, entry) => {
+    await ready();
+    submit(`/${name}`, entry);
+    await screen.findByText(`/${name} 需等待当前任务结束或先 Stop`);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(`/${name}`);
+    expect(clients[0].requests.some(r => r.method === `thread/${name}` || r.method.startsWith("turn/"))).toBe(false);
+  });
+  it.each([
+    ["help", "enter"], ["usage", "enter"], ["config", "enter"],
+    ["help", "button"], ["usage", "button"], ["config", "button"],
+  ])("runs safe /%s mid-turn via %s", async (name, entry) => {
+    await ready();
+    submit(`/${name}`, entry);
+    if (name === "help") await screen.findByTestId("help-card");
+    else if (name === "config") await screen.findByTestId("config-card");
+    else await screen.findByText("本会话还没有用量记录");
+    await waitFor(() => expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""));
+    expect(clients[0].requests.some(r => r.method.startsWith("turn/"))).toBe(false);
+  });
+  it("reports an unknown command mid-turn and preserves its draft", async () => {
+    await ready();
+    submit("/nope", "enter");
+    await screen.findByText("未知命令: /nope");
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("/nope");
+    expect(clients[0].requests.some(r => r.method.startsWith("turn/"))).toBe(false);
+  });
+  it("keeps a rejected interjection in the composer", async () => {
+    await ready();
+    state.rejectCode["turn/interject"] = -32603;
+    submit("retry me", "enter");
+    await screen.findByText("forced -32603");
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("retry me");
+  });
+  it("does not clear another thread's draft when an interjection completes", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    await ready();
+    // Prepare the destination draft before the source request goes in flight.
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: { threadId: "t2" } }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "other draft" } });
+    fireEvent.click(screen.getByText("one"));
+    let accept!: (value: object) => void;
+    state.dataSources["turn/interject"] = () => new Promise(resolve => { accept = resolve; });
+    submit("source message", "enter");
+    await waitFor(() => expect(accept).toBeTypeOf("function"));
+    fireEvent.click(screen.getByText("two"));
+    await act(async () => { accept({}); });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("other draft");
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""));
+    fireEvent.click(screen.getByText("two"));
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("other draft");
+  });
+  it("refuses a destructive completion without clearing the typed prefix", async () => {
+    await ready();
+    submit("/com", "enter");
+    await screen.findByText("/compact 需等待当前任务结束或先 Stop");
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("/com");
+    expect(clients[0].requests.some(r => r.method === "thread/compact" || r.method.startsWith("turn/"))).toBe(false);
+  });
+  it("interjects while approval is pending instead of starting another turn", async () => {
+    await ready();
+    act(() => state.notifHandlers[0]({ method: "thread/status/updated", params: { thread_id: "t1", status: "awaiting_approval" } }));
+    submit("补充审批依据", "enter");
+    await waitFor(() => expect(clients[0].requests.some(r => r.method === "turn/interject")).toBe(true));
+    expect(clients[0].requests.some(r => r.method === "turn/start" || r.method === "turn/interrupt")).toBe(false);
+  });
+  it("keeps a failed config command available for retry", async () => {
+    await ready();
+    state.rejectCode["config/read"] = -32603;
+    submit("/config", "enter");
+    await screen.findByText(/forced -32603/);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("/config");
+  });
+  it("keeps the destination draft when a readonly command finishes after a switch", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    await ready();
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(clients[0].requests).toContainEqual({ method: "thread/resume", params: { threadId: "t2" } }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "destination draft" } });
+    fireEvent.click(screen.getByText("one"));
+    let accept!: (value: object) => void;
+    state.dataSources["config/read"] = () => new Promise(resolve => { accept = resolve; });
+    submit("/config", "enter");
+    await waitFor(() => expect(accept).toBeTypeOf("function"));
+    fireEvent.click(screen.getByText("two"));
+    await act(async () => { accept({ model: "test" }); });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("destination draft");
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""));
+  });
+
 });
