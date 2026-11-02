@@ -4,6 +4,7 @@ import {
   filterCommands,
   parseSlashInput,
   HELP_GROUPS,
+  canRunSlashDuringTurn,
 } from "./slash";
 
 describe("slash command catalog", () => {
@@ -87,5 +88,15 @@ describe("help groups", () => {
 
   it("names the three groups", () => {
     expect(HELP_GROUPS.map((g) => g.title)).toEqual(["会话", "状态", "帮助"]);
+  });
+});
+
+// 去掉安全白名单或把未知命令默认放行时，这组测试必须失败。
+describe("mid-turn slash policy", () => {
+  it.each([
+    ["help", true], ["usage", true], ["config", true],
+    ["clear", false], ["compact", false], ["fork", false], ["nope", false],
+  ])("classifies %s as available=%s", (name, available) => {
+    expect(canRunSlashDuringTurn(name)).toBe(available);
   });
 });

@@ -19,6 +19,7 @@ import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
+import { canRunSlashDuringTurn, SLASH_COMMANDS } from "./lib/slash";
 import { ClientRegistry } from "./lib/clientRegistry";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
@@ -1832,12 +1833,22 @@ export default function App() {
    * Run a slash command. Commands never reach the agent: their output is a
    * `notice` on the current session, mirroring the TUI's Separator cells.
    */
-  const onSlashCommand = async (name: string, args: string | null) => {
+  const onSlashCommand = async (name: string, args: string | null): Promise<boolean> => {
     const id = store.currentId;
     const c = clientRef.current;
-    if (!id || !c) return;
+    if (!id || !c) return false;
     const view = store.view(id);
     const session = view.session;
+    const submittedDraft = view.draft;
+    const known = SLASH_COMMANDS.some(command => command.name === name);
+    if (known && !isMobile &&
+        (session.turnActive || view.status === "running" || view.status === "awaiting_approval") &&
+        !canRunSlashDuringTurn(name)) {
+      session.notice(`/${name} 需等待当前任务结束或先 Stop`);
+      force(v => v + 1);
+      return false;
+    }
+    let accepted = true;
     switch (name) {
       case "help":
         // 目录/详情由 `HelpCard` 呈现；`text` 留空，卡片就是输出。
@@ -1886,6 +1897,7 @@ export default function App() {
           );
           session.noticeBody({ kind: "config", data: cfg, error: null });
         } catch (e) {
+          accepted = false;
           session.noticeBody({
             kind: "config",
             data: null,
@@ -1894,8 +1906,8 @@ export default function App() {
         }
         break;
       case "fork": {
-        // `runSlash` 调本函数后**不 await**，紧接着同步执行 `onDraftChange("")`
-        // 清空当前会话的草稿。故 seed 必须在第一次 await 之前取到。
+        // Capture the optional seed before the first await. Accepted-command
+        // cleanup below is tied to the source id, not the fork's new thread.
         const seed = args;
         let newId: string;
         try {
@@ -1905,6 +1917,7 @@ export default function App() {
           );
           newId = r.thread_id;
         } catch (e) {
+          accepted = false;
           session.notice(
             (e as { code?: number })?.code === -32012
               ? "这个会话正在运行，跑完再 fork"
@@ -1931,6 +1944,7 @@ export default function App() {
           cachedAt.current.delete(id);
           session.notice("对话已清空");
         } catch (e) {
+          accepted = false;
           // 失败绝不清界面:否则会出现"看着清了、服务端还记得"的假象。
           session.notice(`清空失败: ${formatError(e)}`);
         }
@@ -1946,12 +1960,17 @@ export default function App() {
           if (r.status === "compacted") session.notice("对话已压缩");
           else if (r.status === "not_reduced")
             session.notice("无需压缩：历史太短");
-          else session.notice(`压缩失败: ${r.error ?? "未知结果"}`);
+          else {
+            accepted = false;
+            session.notice(`压缩失败: ${r.error ?? "未知结果"}`);
+          }
         } catch (e) {
+          accepted = false;
           session.notice(`压缩失败: ${formatError(e)}`);
         }
         break;
       default:
+        accepted = false;
         // 与 `/help <unknown>` 同一张卡：错误行 + 完整目录。
         session.noticeBody({
           kind: "help",
@@ -1960,7 +1979,11 @@ export default function App() {
         });
         break;
     }
+    // Clearing by captured thread prevents a late command response (including
+    // fork, which switches threads) from erasing another thread's draft.
+    if (accepted && store.peek(id)?.draft === submittedDraft) store.setDraft(id, "");
     force((v) => v + 1);
+    return accepted;
   };
 
   const send = async (text: string): Promise<boolean> => {
@@ -1991,7 +2014,14 @@ export default function App() {
     // 附件本身即消息：纯附件(文本框为空)也允许发送。
     if (!text.trim() && files.length === 0) return false;
 
-    const session = store.view(id).session;
+    const view = store.view(id);
+    const session = view.session;
+    if (files.length > 0 &&
+        (session.turnActive || view.status === "running" || view.status === "awaiting_approval")) {
+      session.lastError = "当前任务进行中，附件需等待结束或先停止后发送";
+      force(v => v + 1);
+      return false;
+    }
     // 乐观回显只带**文档**：图片由服务端在回显的 item 上带 `images` 引用
     // （元数据来自摄取后的落盘），本地此刻并不知道 media_type/size。
     session.addUserMessage(
@@ -2029,7 +2059,7 @@ export default function App() {
     // 只能走 `turn/start`，纯文本才沿用上面那次方法自愈。
     const hasFiles = files.length > 0;
     let method: "turn/interject" | "turn/start" =
-      !hasFiles && store.peek(id)?.status === "running"
+      !hasFiles && (session.turnActive || view.status === "running" || view.status === "awaiting_approval")
         ? "turn/interject"
         : "turn/start";
     // 上下文锚点（spec §7.1）：客户端声明它以为的会话世代与游标。只在 `turn/start`
@@ -2051,6 +2081,8 @@ export default function App() {
         await c.request(method, withAnchor(method));
         // 成功才清空该会话的待发附件（本地路径），服务端已把它们落库。
         setPending((prev) => ({ ...prev, [id]: [] }));
+        if (store.peek(id)?.draft === text) store.setDraft(id, "");
+        force(v => v + 1);
         return true;
       } catch (e) {
         // 锚点已失效（会话在别处被清空）：绝不自动重发——用户的意图不该落到一个
@@ -2286,8 +2318,7 @@ export default function App() {
    *
    * 没有当前会话时无处可放，直接忽略（此时输入框由 `disabled` 置灰）。
    */
-  const changeDraft = (text: string) => {
-    const id = store.currentId;
+  const changeDraft = (text: string, id: string | null = store.currentId) => {
     if (!id) return;
     store.setDraft(id, text);
     force((v) => v + 1);
@@ -2806,9 +2837,7 @@ export default function App() {
                   onInterrupt={interrupt}
                   mode={current?.mode ?? null}
                   onModeChange={setThreadMode}
-                  onSlashCommand={(name, args) =>
-                    void onSlashCommand(name, args)
-                  }
+                  onSlashCommand={onSlashCommand}
                   value={current?.draft ?? ""}
                   onDraftChange={changeDraft}
                   cardRef={composerCardRef}
