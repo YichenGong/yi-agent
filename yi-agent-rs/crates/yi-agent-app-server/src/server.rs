@@ -6155,6 +6155,22 @@ where
                         eprintln!("[app-server] could not append a turn to {thread_id}: {error}");
                     })
             }
+            DriverActionKind::ResumeAppend { thread_id, .. } => {
+                // 恢复原会话需要严格的持久化读取与冷装配，还没接上（Task 3）。
+                // 这里**明确失败**并带上分类，绝不允许退化成本函数的 `Launch`
+                // 分支——那会用新会话顶替原会话，静默切断上下文，正是本次要修
+                // 的行为。分类是 `RestoreFailed`：宿主确实没能把该会话恢复出来。
+                eprintln!(
+                    "[app-server] resume_append is not wired yet for thread {thread_id}; \
+                     refusing instead of launching a replacement session"
+                );
+                Err(anyhow::Error::new(
+                    crate::session_driver::DriverActionFailure {
+                        code: crate::session_driver::DriverErrorCode::RestoreFailed,
+                        message: format!("thread history is not restorable yet: {thread_id}"),
+                    },
+                ))
+            }
         }
     }
 }

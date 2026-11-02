@@ -96,6 +96,38 @@ pub enum DriverAction {
         /// 「这张卡是哪张」是插件自己的概念（`state --self` 靠它免去手写 id）。
         env: Vec<(String, String)>,
     },
+    /// 恢复**原开发会话**（同一 thread id）后追加一轮。
+    ///
+    /// 与 `Launch` 的区别是「回到原来那个会话」：`thread_id`/`workdir` 是原会话
+    /// 的精确定位（**不是**合并目标树），宿主必须用它恢复同一会话再投递。带上
+    /// `card_id` 是因为插件要记账「这张卡的动作属于哪张卡」，它**不进 JSON**。
+    ResumeAppend {
+        action_id: String,
+        card_id: String,
+        thread_id: String,
+        /// 原会话的精确定位目录（**不是** merge 目标树）。
+        workdir: PathBuf,
+        objective: String,
+        /// 冷装配时注入工具进程的环境变量；热会话不重建工具，故不生效。
+        env: Vec<(String, String)>,
+    },
+}
+
+/// 宿主在 `driver/next` 请求里声明的能力（spec §5.2）。
+///
+/// `Default` 是**一个都不支持**——旧宿主不发这块时，插件必须保留排队并说明
+/// 原因，绝不能猜「大概支持吧」然后交出一个宿主执行不了的动作，更不能退化成
+/// `Launch`（那会切断上下文，正是这次要修的行为）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriverCapabilities {
+    pub actions: Vec<String>,
+}
+
+impl DriverCapabilities {
+    /// 精确匹配：能力名是跨进程契约的一部分，不做前缀/大小写归一。
+    pub fn supports(&self, action: &str) -> bool {
+        self.actions.iter().any(|known| known == action)
+    }
 }
 
 impl DriverAction {
@@ -103,6 +135,22 @@ impl DriverAction {
     /// 用 `action_id` 作键而不是直接序列化枚举——枚举的形状是实现细节，不能外泄。
     pub fn to_json(&self) -> Value {
         match self {
+            DriverAction::ResumeAppend {
+                action_id,
+                thread_id,
+                workdir,
+                objective,
+                env,
+                // `card_id` 是插件内部记账键，**不进 JSON**：宿主不认识看板。
+                ..
+            } => json!({
+                "action_id": action_id,
+                "kind": "resume_append",
+                "thread_id": thread_id,
+                "workdir": workdir.to_string_lossy(),
+                "objective": objective,
+                "env": env.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            }),
             DriverAction::Launch {
                 action_id,
                 workdir,
@@ -149,6 +197,12 @@ pub struct DriverResult {
     /// 由 `list` 暴露给人和桌面（spec §4.6「失败 → 卡 `failed`（原因取 `error`）」）。
     #[serde(default)]
     pub error: Option<String>,
+    /// 宿主**显式分类**过的失败码（spec §5.2）。
+    ///
+    /// `None`（或旧宿主根本没这个字段）表示「宿主没归类」——插件必须按不确定
+    /// 处理，不能拿 `error` 文本猜「大概是 busy 吧」然后安全退队。
+    #[serde(default)]
+    pub error_code: Option<String>,
 }
 
 struct Inner {
@@ -264,6 +318,9 @@ impl BoardService {
         threads: &[ThreadFacts],
         results: &[DriverResult],
         sessions_running: Option<u32>,
+        // 宿主声明的能力。缺省（旧宿主）=> 一个都不支持：保留排队并说明原因，
+        // 绝不猜、也绝不退化成本地能执行的动作。
+        _capabilities: &DriverCapabilities,
     ) -> Result<Option<DriverAction>, String> {
         // 前置检查必须**早于**消费回报：拿不到全局租约目录时 `next_launch` 只会
         // 整拍报错，而错误会让宿主把这批回报当作「没送到」重发；可回报已经消费
@@ -1410,6 +1467,18 @@ mod tests {
         }
     }
 
+    /// 宿主一个动作都不会（旧宿主、或契约里没声明能力）。
+    fn no_caps() -> DriverCapabilities {
+        DriverCapabilities::default()
+    }
+
+    /// 宿主声明支持这些动作。
+    fn caps(actions: &[&str]) -> DriverCapabilities {
+        DriverCapabilities {
+            actions: actions.iter().map(|action| action.to_string()).collect(),
+        }
+    }
+
     /// 宿主说这些会话都还忙着。
     fn busy(ids: &[&str]) -> Vec<crate::service::ThreadFacts> {
         ids.iter().map(|id| facts(id, false, true)).collect()
@@ -1418,7 +1487,7 @@ mod tests {
     /// 一拍 `driver_step`，断言它交出了一个 launch 并把它交出来。
     fn launched(service: &BoardService) -> DriverAction {
         service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a launch action")
     }
@@ -2066,12 +2135,15 @@ mod tests {
         git_run(&project, &["branch", &source]);
         service.merge_request("card-1").unwrap();
         let action = service
-            .driver_step(&[facts("thread-1", true, true)], &[], None)
+            .driver_step(&[facts("thread-1", true, true)], &[], None, &no_caps())
             .unwrap()
             .expect("a merge turn");
         let DriverAction::Launch {
             card_id, objective, ..
-        } = action;
+        } = action
+        else {
+            panic!("expected a launch, got {action:?}");
+        };
         assert_eq!(card_id, "card-1");
         assert!(objective.contains("merge"), "{objective}");
         assert!(
@@ -2099,7 +2171,7 @@ mod tests {
         service.enqueue_card_for_test("card-2");
         peak_of(&service, 4);
 
-        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        let action = service.driver_step(&[], &[], Some(4), &no_caps()).unwrap();
         assert!(
             action.is_none(),
             "全机 4 个在跑、峰值 4：看板再起就是超发，实际得到 {action:?}"
@@ -2116,7 +2188,7 @@ mod tests {
         service.enqueue_card_for_test("card-2");
         peak_of(&service, 5);
 
-        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        let action = service.driver_step(&[], &[], Some(4), &no_caps()).unwrap();
         assert!(
             matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
             "余量 1 → 队首那张走"
@@ -2139,7 +2211,7 @@ mod tests {
         assert_eq!(service.board_running_count(), 1);
 
         let action = service
-            .driver_step(&busy(&["thread-1"]), &[], Some(4))
+            .driver_step(&busy(&["thread-1"]), &[], Some(4), &no_caps())
             .unwrap();
         assert!(
             action.is_none(),
@@ -2158,7 +2230,7 @@ mod tests {
         let service = service_with_card(&project);
         peak_of(&service, 4);
 
-        let action = service.driver_step(&[], &[], None).unwrap();
+        let action = service.driver_step(&[], &[], None, &no_caps()).unwrap();
         assert!(
             matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
             "缺字段不能拒绝调度，否则旧宿主上的看板彻底停摆"
@@ -2172,7 +2244,7 @@ mod tests {
         let service = service_with_card(&project);
         peak_of(&service, 2);
 
-        let action = service.driver_step(&[], &[], Some(7)).unwrap();
+        let action = service.driver_step(&[], &[], Some(7), &no_caps()).unwrap();
         assert!(action.is_none(), "saturating_sub：多于峰值也只会是 0");
         assert_eq!(state_of(&service, "card-1"), "queued");
     }
@@ -2194,7 +2266,7 @@ mod tests {
         // 全机 4 个会话在跑 → 余量 0：本拍不动队。
         assert!(
             service
-                .driver_step(&[facts("thread-1", true, true)], &[], Some(4))
+                .driver_step(&[facts("thread-1", true, true)], &[], Some(4), &no_caps())
                 .unwrap()
                 .is_none(),
             "no room on the whole machine means no merge turn"
@@ -2211,7 +2283,7 @@ mod tests {
 
         // 余量回来（全机 3 个在跑）→ 队首照常开局。
         let action = service
-            .driver_step(&[facts("thread-1", true, true)], &[], Some(3))
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(3), &no_caps())
             .unwrap()
             .expect("room is back: the queue head starts");
         assert!(
@@ -2249,12 +2321,15 @@ mod tests {
         assert_eq!(merge_card.state, CardState::MergeQueued);
         let merge_id = merge_card.id.0.clone();
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a merge turn");
         let DriverAction::Launch {
             card_id, objective, ..
-        } = action;
+        } = action
+        else {
+            panic!("expected a launch, got {action:?}");
+        };
         assert_eq!(card_id, merge_id);
         assert!(objective.contains("feat/manual"), "{objective}");
         assert_eq!(state_of(&service, &merge_id), "running");
@@ -2279,7 +2354,7 @@ mod tests {
         };
         assert_eq!(card(&service)["merging"], false);
         assert!(card(&service)["merge_queued_at"].is_string());
-        let _ = service.driver_step(&[], &[], None).unwrap();
+        let _ = service.driver_step(&[], &[], None, &no_caps()).unwrap();
         assert_eq!(card(&service)["merging"], true);
         // 已经开跑，队列时间就清掉了。
         assert!(card(&service)["merge_queued_at"].is_null());
@@ -2296,13 +2371,13 @@ mod tests {
         git_run(&project, &["branch", &source]);
         service.merge_request("card-1").unwrap();
         service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a merge turn");
         assert!(crate::merge_lock::read_holder(&service.state_dir).is_some());
 
         // 回合还没收尾（卡仍是 running）→ 名额继续握着。
-        service.driver_step(&[], &[], None).unwrap();
+        service.driver_step(&[], &[], None, &no_caps()).unwrap();
         assert!(
             crate::merge_lock::read_holder(&service.state_dir).is_some(),
             "a merge still in flight must keep the gate"
@@ -2310,7 +2385,7 @@ mod tests {
 
         // 模型判定合并成功并落 `done` → 下一拍名额归还。
         service.set_state("card-1", CardState::Done, None).unwrap();
-        service.driver_step(&[], &[], None).unwrap();
+        service.driver_step(&[], &[], None, &no_caps()).unwrap();
         assert!(
             wait_until(|| crate::merge_lock::read_holder(&service.state_dir).is_none()),
             "the settled merge must hand the gate back"
@@ -2342,7 +2417,7 @@ mod tests {
             MergeRequest::Queued { position: 1 }
         );
         let _ = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("first merge");
         assert_eq!(state_of(&service, "card-2"), "merge_queued");
@@ -2358,7 +2433,12 @@ mod tests {
         service.merge_request("card-1").unwrap();
         let gate = crate::merge_lock::acquire_with_holder(&service.state_dir, "someone-else");
         assert!(matches!(gate, crate::merge_lock::MergeAttempt::Granted(_)));
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "merge_queued");
         drop(gate);
     }
@@ -2373,10 +2453,12 @@ mod tests {
         git_run(&project, &["branch", &source]);
         service.merge_request("card-1").unwrap();
         let action = service
-            .driver_step(&[facts("thread-1", false, true)], &[], None)
+            .driver_step(&[facts("thread-1", false, true)], &[], None, &no_caps())
             .unwrap()
             .expect("a merge turn");
-        let DriverAction::Launch { card_id, .. } = action;
+        let DriverAction::Launch { card_id, .. } = action else {
+            panic!("expected a launch, got {action:?}");
+        };
         assert_eq!(card_id, "card-1");
         assert_eq!(state_of(&service, "card-1"), "running");
     }
@@ -2481,9 +2563,12 @@ mod tests {
             objective,
             ..
         } = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
-            .expect("a launch");
+            .expect("a launch")
+        else {
+            panic!("expected a launch");
+        };
         assert_eq!(card_id, "card-1", "队首（order 最小）先走");
         assert!(workdir.join(".git").exists(), "worktree 由插件建好");
         // objective 由插件给出，措辞是契约（宿主不再复刻）。
@@ -2510,7 +2595,7 @@ mod tests {
         let service = service_with_card(&project);
 
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a launch");
         let value = action.to_json();
@@ -2536,13 +2621,16 @@ mod tests {
         one_slot_only(&service);
 
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("the head launches");
         assert!(matches!(action, DriverAction::Launch { ref card_id, .. } if card_id == "card-1"));
         // 第一张还持着名额（`Launching` 也占租约）→ 第二张不出。
         assert!(
-            service.driver_step(&[], &[], None).unwrap().is_none(),
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none(),
             "no slot -> no launch"
         );
         assert_eq!(state_of(&service, "card-2"), "queued");
@@ -2560,14 +2648,19 @@ mod tests {
 
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[], None)
+                .driver_step(&busy(&["thread-1"]), &[], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
         assert_eq!(state_of(&service, "card-1"), "running", "还忙就不动它");
         // 宿主**完全没报**这台会话（重启后它不记得任何 thread）：状态照旧不动，
         // 只在观测里标 stale——这是展示，不是迁移。
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
         assert_eq!(service.list()["cards"][0]["stale"], true);
     }
@@ -2582,7 +2675,12 @@ mod tests {
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
         let threads = vec![facts("thread-1", true, true)];
-        assert!(service.driver_step(&threads, &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&threads, &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
     }
 
@@ -2594,7 +2692,12 @@ mod tests {
         let service = service_with_card(&project);
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
     }
 
@@ -2612,12 +2715,17 @@ mod tests {
         service.set_state("card-1", CardState::Done, None).unwrap();
         // 会话仍活着 → 名额继续占着，第二张起不来。
         let threads = vec![facts("thread-1", false, true)];
-        assert!(service.driver_step(&threads, &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&threads, &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         // 会话死了 → 名额归还，第二张起得来。
         let threads = vec![facts("thread-1", false, false)];
         assert!(
             wait_until(|| service
-                .driver_step(&threads, &[], None)
+                .driver_step(&threads, &[], None, &no_caps())
                 .unwrap()
                 .is_some_and(|action| matches!(
                     action,
@@ -2680,11 +2788,11 @@ mod tests {
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
         service
-            .driver_step(&[facts("thread-1", false, true)], &[], None)
+            .driver_step(&[facts("thread-1", false, true)], &[], None, &no_caps())
             .unwrap();
         assert_eq!(service.list()["cards"][0]["stale"], false);
         service
-            .driver_step(&[facts("thread-1", false, false)], &[], None)
+            .driver_step(&[facts("thread-1", false, false)], &[], None, &no_caps())
             .unwrap();
         let card = &service.list()["cards"][0];
         assert_eq!(card["stale"], true);
@@ -2707,9 +2815,12 @@ mod tests {
         let DriverAction::Launch {
             card_id, action_id, ..
         } = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
-            .expect("launch");
+            .expect("launch")
+        else {
+            panic!("expected a launch");
+        };
         // 回报带回 thread id（launch 已把卡置成 running）。
         service
             .driver_step(
@@ -2719,8 +2830,10 @@ mod tests {
                     ok: true,
                     thread_id: Some("thread-1".into()),
                     error: None,
+                    error_code: None,
                 }],
                 None,
+                &no_caps(),
             )
             .unwrap();
         assert_eq!(state_of(&service, &card_id), "running");
@@ -2728,7 +2841,7 @@ mod tests {
         // 会话空闲、模型什么都没写 → 状态不动。
         assert!(
             service
-                .driver_step(&[facts("thread-1", true, true)], &[], None)
+                .driver_step(&[facts("thread-1", true, true)], &[], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
@@ -2775,7 +2888,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
         assert_eq!(state_of(&service, "card-1"), "running");
 
         let result = DriverResult {
@@ -2783,10 +2898,11 @@ mod tests {
             ok: true,
             thread_id: Some("thread-1".to_string()),
             error: None,
+            error_code: None,
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[result], None)
+                .driver_step(&busy(&["thread-1"]), &[result], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
@@ -2806,17 +2922,20 @@ mod tests {
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
         service.enqueue_card_for_test("card-2");
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: false,
             thread_id: None,
             error: Some("worktree not found".to_string()),
+            error_code: None,
         };
         // 同一拍就把名额让出来给队里下一张：失败的启动不是死胡同。
         let next = service
-            .driver_step(&[], &[result], None)
+            .driver_step(&[], &[result], None, &no_caps())
             .unwrap()
             .expect("the freed slot goes to the next card");
         assert!(
@@ -2847,15 +2966,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: false,
             thread_id: None,
             error: None,
+            error_code: None,
         };
-        service.driver_step(&[], &[result], None).unwrap();
+        service
+            .driver_step(&[], &[result], None, &no_caps())
+            .unwrap();
 
         assert_eq!(state_of(&service, "card-1"), "failed");
         assert_eq!(
@@ -2912,17 +3036,25 @@ mod tests {
         let service = service_with_card(&project);
         service.enqueue_card_for_test("card-2");
         one_slot_only(&service);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: true,
             thread_id: Some("thread-1".to_string()),
             error: None,
+            error_code: None,
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
+                .driver_step(
+                    &busy(&["thread-1"]),
+                    std::slice::from_ref(&result),
+                    None,
+                    &no_caps()
+                )
                 .unwrap()
                 .is_none()
         );
@@ -2930,7 +3062,12 @@ mod tests {
         // 重复投递：不报错、不改状态、不多占一个名额。
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
+                .driver_step(
+                    &busy(&["thread-1"]),
+                    std::slice::from_ref(&result),
+                    None,
+                    &no_caps()
+                )
                 .unwrap()
                 .is_none()
         );
@@ -3049,6 +3186,117 @@ mod tests {
 
         // 「无事可做」的契约形状：`{"action": null}`。
         assert_eq!(answers["nothing"], serde_json::json!({ "action": null }));
+    }
+
+    /// `resume_append` 的线上形状同样是契约：宿主 `parse_action` 认的就是这几个
+    /// 键（`thread_id` / `workdir` / `objective` / `env`）。尤其 `card_id` 是插件
+    /// 内部记账键，**绝不能**出现在 JSON 里——宿主不认识看板。
+    #[test]
+    fn the_driver_contract_resume_append_matches_what_the_plugin_emits() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let expected = &contract["answers"]["resume_append"];
+
+        let action = DriverAction::ResumeAppend {
+            action_id: "act-resume".to_string(),
+            card_id: "card-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            workdir: PathBuf::from("/w/card"),
+            objective: "merge authorized".to_string(),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+        };
+        assert_eq!(
+            action.to_json(),
+            *expected,
+            "resume_append 的线上形状必须与契约逐字段一致"
+        );
+        assert!(
+            action.to_json().get("card_id").is_none(),
+            "card_id 是插件内部记账键，不能外泄给宿主：{}",
+            action.to_json()
+        );
+
+        // 两端同一份 JSON：宿主的 `resume_append_is_a_distinct_action` 断言的是
+        // 同一组字段值（thread_id/workdir/objective/env）。
+        assert_eq!(expected["thread_id"], "thread-1");
+        assert_eq!(expected["workdir"], "/w/card");
+        assert_eq!(expected["objective"], "merge authorized");
+    }
+
+    /// 契约里声明的能力列表就是插件认的那几个动作名：宿主少报/多报都会让调度
+    /// 做出错误决定（永远排队，或派一个执行不了的动作）。
+    #[test]
+    fn the_driver_contract_declares_the_actions_the_plugin_understands() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let actions = contract["request"]["capabilities"]["actions"]
+            .as_array()
+            .expect("契约必须钉住 capabilities.actions");
+        let names: Vec<&str> = actions
+            .iter()
+            .map(|action| action.as_str().expect("能力名必须是字符串"))
+            .collect();
+        assert_eq!(names, vec!["launch", "append", "resume_append"]);
+
+        let capabilities = caps(&names);
+        assert!(capabilities.supports("resume_append"));
+        assert!(capabilities.supports("launch"));
+        assert!(!capabilities.supports("rebase"));
+    }
+
+    /// **缺能力就当不支持**：旧宿主不发表格时，默认值必须是空集。默认成「全都
+    /// 支持」会让插件派出宿主执行不了的动作，最后卡在不确定状态。
+    #[test]
+    fn a_host_that_declares_no_capabilities_supports_nothing() {
+        let capabilities = DriverCapabilities::default();
+        assert!(capabilities.actions.is_empty());
+        assert!(!capabilities.supports("launch"));
+        assert!(!capabilities.supports("append"));
+        assert!(!capabilities.supports("resume_append"));
+    }
+
+    /// 能力名是精确匹配：大小写或前缀不同的名字不能被当成同一个动作。
+    #[test]
+    fn capabilities_are_matched_exactly() {
+        let capabilities = &caps(&["resume_append"]);
+        assert!(capabilities.supports("resume_append"));
+        assert!(!capabilities.supports("Resume_Append"));
+        assert!(!capabilities.supports("resume"));
+        assert!(!capabilities.supports("resume_append "));
+    }
+
+    /// 旧宿主回报的 `results[]` 没有 `error_code`：必须默认为 `None`（= 未归类），
+    /// 而不是反序列化失败——回报丢了比回报形状旧要贵得多。
+    #[test]
+    fn an_old_result_without_error_code_defaults_to_none() {
+        let old = serde_json::json!({
+            "action_id": "act-1",
+            "ok": false,
+            "thread_id": null,
+            "error": "boom"
+        });
+        let result: DriverResult = serde_json::from_value(old).expect("旧形状必须仍可解析");
+        assert_eq!(result.error_code, None);
+
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let failure: DriverResult =
+            serde_json::from_value(contract["results"]["failure"].clone()).expect("契约失败样例");
+        assert_eq!(failure.error_code.as_deref(), Some("busy"));
+    }
+
+    /// `capabilities` 真的从 `driver/next` 的参数进了调度：解析出的集合与参数
+    /// 一致，缺字段时为空集（不是「全都支持」）。
+    #[test]
+    fn driver_next_reads_capabilities_from_the_request() {
+        let params = serde_json::json!({
+            "threads": [], "results": [], "sessions": { "running": 0 },
+            "capabilities": { "actions": ["launch", "resume_append"] }
+        });
+        let capabilities = crate::dispatch::parse_capabilities(&params);
+        assert_eq!(capabilities.actions, vec!["launch", "resume_append"]);
+        assert!(capabilities.supports("resume_append"));
+
+        let old = serde_json::json!({ "threads": [], "results": [] });
+        let capabilities = crate::dispatch::parse_capabilities(&old);
+        assert!(capabilities.actions.is_empty(), "缺字段必须按不支持处理");
     }
 }
 
