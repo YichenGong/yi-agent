@@ -191,6 +191,137 @@ pub fn clear_if_matches(state_dir: &Path, card_id: &str, action_id: &str) -> Res
     }
 }
 
+/// 离线人工恢复：**唯一**能清掉一条未经自动结算的安全记录的入口。
+///
+/// 为什么必须离线、并且必须显式确认：一条 journal 的含义是「有一个合并可能已经
+/// 交给宿主了，但我们不知道它跑完没有」。程序无从证明相关模型/工具/`git` 进程
+/// 都停了——`flock` 被内核释放只说明进程退出，不说明它写下的目标树已经一致。
+/// 所以恢复的每一步都要人能负责：
+///
+/// 1. 先拿 `plugin.lock`：拿不到说明 daemon 还活着，**拒绝**在它眼皮底下改账。
+/// 2. 再拿 `merge.lock`：拿不到说明还有别的合并进程，同样拒绝。
+/// 3. 再进 `board.lock`，在锁内重验 card/action 精确匹配、卡不处于 `Running`。
+/// 4. 卡不存在时允许清理（人已经核对过），但 attempt 必须仍然匹配。
+///
+/// 不提供"忽略坏 journal"的开关：坏读只能从备份恢复，不能当成"没有记录"。
+pub fn recover_offline(
+    state_dir: &Path,
+    card_id: &str,
+    action_id: &str,
+    ack_stopped: bool,
+) -> Result<String, String> {
+    if !ack_stopped {
+        return Err(
+            "refusing to recover without --ack-stopped: first stop the plugin (and its daemon), \
+             confirm the card's model/tool/git processes have all exited, and check the git and \
+             card state by hand"
+                .to_string(),
+        );
+    }
+    // 1) daemon 必须已经退出。这把锁由 daemon 生命周期持有。
+    let Some(_plugin_lock) =
+        crate::single_instance::acquire_within(state_dir, std::time::Duration::ZERO)
+    else {
+        return Err(
+            "the plugin (or its daemon) is still running; stop it before recovering a merge \
+             attempt"
+                .to_string(),
+        );
+    };
+    // 2) 不能踩在另一次合并上。
+    let Some(_merge_lock) = crate::merge_lock::acquire(state_dir) else {
+        return Err(
+            "another process still holds the project merge gate; confirm it has exited before \
+             recovering"
+                .to_string(),
+        );
+    };
+    // 3) 锁内重验并清理。
+    crate::persist::with_board(state_dir, |board| {
+        let current = read(state_dir)?;
+        let Some(current) = current else {
+            return Err("there is no merge attempt record to recover".to_string());
+        };
+        if current.card_id != card_id {
+            return Err(format!(
+                "the merge attempt on record belongs to {}, not {card_id}",
+                current.card_id
+            ));
+        }
+        if current.action_id != action_id {
+            return Err(format!(
+                "the merge attempt on record is {}, not {action_id}; pass the exact action id \
+                 (see `superpowers-kanban list`)",
+                current.action_id
+            ));
+        }
+        // 卡还在 Running:结论没定,先让人判定 done/needs_you,不能替他决定。
+        if board
+            .get(&superpowers_kanban_core::card::CardId::new(card_id))
+            .is_some_and(|card| card.state == superpowers_kanban_core::card::CardState::Running)
+        {
+            return Err(format!(
+                "{card_id} is still running; decide its outcome first (for example \
+                 `superpowers-kanban state {card_id} done` or `... needs_you`), then recover"
+            ));
+        }
+        std::fs::remove_file(state_dir.join(ATTEMPT_FILE))
+            .map_err(|error| format!("could not remove the merge attempt record: {error}"))?;
+        Ok(())
+    })?;
+    // 4) 记录清了，holder 才能清（它只是显示/旧版恢复凭据）。
+    crate::merge_lock::clear_holder(state_dir);
+    Ok(format!(
+        "recovered\nremoved the merge attempt record for {card_id} ({action_id}).\n\
+         This only records that you checked; it does not prove any process had stopped."
+    ))
+}
+
+/// daemon 启动时的安全检查（spec §8.3）。
+///
+/// 必须在取得 `plugin.lock`、开始回答 `driver/next` **之前**调用：此时还没有任何
+/// 新合并可能被派出去。发现残留记录就把它标成 `uncertain` 并阻塞本项目所有合并；
+/// 旧版留下的、没有记录却仍有 holder 的情况同样阻塞。
+///
+/// 绝不因为"旧 pid 已经死了"就清掉它：pid 死亡 ≠ 那次合并没在写目标树。
+pub fn block_on_startup(state_dir: &Path) -> Result<Option<String>, String> {
+    let mut reason = None;
+    match read(state_dir)? {
+        Some(record) if record.phase != MergePhase::Uncertain => {
+            let uncertain = MergeAttemptRecord {
+                phase: MergePhase::Uncertain,
+                ..record
+            };
+            save(state_dir, &uncertain)?;
+            reason = Some(format!(
+                "a merge attempt for {} was still in flight when the plugin restarted \
+                 (action {}); merges are blocked until it is confirmed by hand",
+                uncertain.card_id, uncertain.action_id
+            ));
+        }
+        Some(record) => {
+            reason = Some(format!(
+                "a merge attempt for {} is uncertain (action {}); merges are blocked until it is \
+                 confirmed by hand",
+                record.card_id, record.action_id
+            ));
+        }
+        None => {}
+    }
+    // 旧版残留:有 holder、没有 journal。不得假定 flock 空闲等于旧工具已退出。
+    match crate::merge_lock::read_holder_strict(state_dir)? {
+        Some(holder) if reason.is_none() => {
+            reason = Some(format!(
+                "a merge holder record for {} was left behind without a merge attempt record; \
+                 confirm by hand that its tools have stopped",
+                holder.card_id
+            ));
+        }
+        _ => {}
+    }
+    Ok(reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -118,6 +118,9 @@ enum Subcommand {
     MergeFinish {
         state_dir: PathBuf,
         card_id: String,
+        /// 离线人工恢复一条未结算的合并记录。必须与 `--attempt`、`--ack-stopped`
+        /// 一起用；普通调用绝不走这条路。
+        recover: Option<(String, bool)>,
     },
     /// 退出合并队列。只在 `merge_queued` 上成立——已经开跑的合并不能退。
     MergeCancel {
@@ -150,6 +153,7 @@ const USAGE: &str =
   add-merge      <source> [--base <ref>] [--state-dir <d>]
   merge-request <card-id> [--state-dir <d>]
   merge-finish  <card-id> [--state-dir <d>]
+  merge-finish  <card-id> --recover --attempt <action-id> --ack-stopped --state-dir <d>
   merge-cancel  <card-id> [--state-dir <d>]
   done          <card-id> [--state-dir <d>]
   state         <card-id> <state> [--detail <t>] | --self <state> [--detail <t>] [--state-dir <d>]
@@ -324,7 +328,30 @@ where
             })
         }
         Some(verb @ ("merge-request" | "merge-finish" | "merge-cancel")) => {
-            let (state_dir, rest) = parse_state_dir(args)?;
+            let (state_dir, mut rest) = parse_state_dir(args)?;
+            // 恢复用的三个开关只对 `merge-finish` 有意义。先摘出来，剩下的
+            // 必须仍是一个卡号——这样"混进普通命令"会在解析期就被拒绝。
+            let mut recover = false;
+            let mut attempt = None;
+            let mut ack_stopped = false;
+            if verb == "merge-finish" {
+                let mut kept = Vec::new();
+                let mut tokens = rest.into_iter();
+                while let Some(token) = tokens.next() {
+                    match token.as_str() {
+                        "--recover" => recover = true,
+                        "--ack-stopped" => ack_stopped = true,
+                        "--attempt" => {
+                            let value = tokens
+                                .next()
+                                .ok_or_else(|| "--attempt needs an action id".to_string())?;
+                            attempt = Some(value);
+                        }
+                        _ => kept.push(token),
+                    }
+                }
+                rest = kept;
+            }
             let mut rest = rest.into_iter();
             let card_id = rest
                 .next()
@@ -332,9 +359,27 @@ where
             if let Some(extra) = rest.next() {
                 return Err(format!("{verb} takes one card id, got an extra: {extra}"));
             }
+            if !recover && (attempt.is_some() || ack_stopped) {
+                return Err(
+                    "--attempt and --ack-stopped are only meaningful with --recover".to_string(),
+                );
+            }
+            let recover = if recover {
+                let action_id = attempt.ok_or_else(|| {
+                    "merge-finish --recover needs --attempt <action-id>".to_string()
+                })?;
+                // `--ack-stopped` 缺省为 false，由恢复函数再拒一次（双保险）。
+                Some((action_id, ack_stopped))
+            } else {
+                None
+            };
             Ok(match verb {
                 "merge-request" => Subcommand::MergeRequest { state_dir, card_id },
-                "merge-finish" => Subcommand::MergeFinish { state_dir, card_id },
+                "merge-finish" => Subcommand::MergeFinish {
+                    state_dir,
+                    card_id,
+                    recover,
+                },
                 _ => Subcommand::MergeCancel { state_dir, card_id },
             })
         }
@@ -846,6 +891,13 @@ fn command_merge_finish(state_dir: &std::path::Path, card_id: &str) -> Result<St
              `superpowers-kanban state {card_id} done`"
         )),
         Some("cleared") => Ok("cleared\nthe gate was not held by this process".to_string()),
+        Some("waiting") => Ok(format!(
+            "waiting\na merge attempt for {card_id} has not been settled yet; the daemon \
+             releases the gate once the matching result has arrived and that session is next \
+             observed idle. If it is stuck, confirm by hand that everything stopped and run: \
+             superpowers-kanban merge-finish {card_id} --recover --attempt <action-id> \
+             --ack-stopped --state-dir <absolute state dir>"
+        )),
         other => Err(format!("unexpected merge_finish result: {other:?}")),
     }
 }
@@ -1031,9 +1083,21 @@ fn main() {
         Subcommand::MergeRequest { state_dir, card_id } => {
             command_merge_request(&state_dir, &card_id)
         }
-        Subcommand::MergeFinish { state_dir, card_id } => {
-            command_merge_finish(&state_dir, &card_id)
-        }
+        Subcommand::MergeFinish {
+            state_dir,
+            card_id,
+            recover,
+        } => match recover {
+            Some((action_id, ack_stopped)) => {
+                superpowers_kanban_runner::merge_attempt::recover_offline(
+                    &state_dir,
+                    &card_id,
+                    &action_id,
+                    ack_stopped,
+                )
+            }
+            None => command_merge_finish(&state_dir, &card_id),
+        },
         Subcommand::MergeCancel { state_dir, card_id } => {
             command_merge_cancel(&state_dir, &card_id)
         }
@@ -1184,6 +1248,14 @@ fn run_daemon(args: Args) {
         args.project_root.clone(),
         None,
     ));
+
+    // 合并安全检查必须在开始回答任何请求**之前**：此时还没有新合并可能被派出去。
+    // 发现残留就标 uncertain 并阻塞本项目的合并，等人工确认（spec §8.3）。
+    match service.recover_merge_attempt_on_startup() {
+        Ok(Some(reason)) => eprintln!("superpowers-kanban: {reason}"),
+        Ok(None) => {}
+        Err(error) => eprintln!("superpowers-kanban: {error}"),
+    }
 
     // 启动迁移：只把「写着 running 但根本没有 thread id」的历史卡片收成
     // `needs_you`（那不是「会话死了」，是旧数据从来没有会话）。有 thread id 的
@@ -1658,6 +1730,61 @@ mod tests {
             Ok(Subcommand::MergeCancel { .. })
         ));
         assert!(parse(&["merge-cancel"]).is_err(), "缺 card id");
+    }
+
+    #[test]
+    fn merge_finish_recover_flags_parse_only_with_recover() {
+        assert!(matches!(
+            parse(&[
+                "merge-finish",
+                "card-1",
+                "--recover",
+                "--attempt",
+                "act-1",
+                "--ack-stopped",
+                "--state-dir",
+                "/s",
+            ]),
+            Ok(Subcommand::MergeFinish {
+                recover: Some((ref action_id, true)),
+                ..
+            }) if action_id == "act-1"
+        ));
+        // 普通 finish 不能被顺手带上恢复语义。
+        assert!(matches!(
+            parse(&["merge-finish", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::MergeFinish { recover: None, .. })
+        ));
+        assert!(
+            parse(&["merge-finish", "card-1", "--recover", "--state-dir", "/s"]).is_err(),
+            "--recover without --attempt must be refused"
+        );
+        assert!(
+            parse(&[
+                "merge-finish",
+                "card-1",
+                "--ack-stopped",
+                "--state-dir",
+                "/s"
+            ])
+            .is_err(),
+            "--ack-stopped is only meaningful with --recover"
+        );
+        assert!(
+            parse(&[
+                "merge-finish",
+                "card-1",
+                "--attempt",
+                "act-1",
+                "--state-dir",
+                "/s"
+            ])
+            .is_err(),
+            "--attempt is only meaningful with --recover"
+        );
+        // 别的动词不吃这些开关。
+        assert!(parse(&["merge-request", "card-1", "--recover"]).is_err());
+        assert!(parse(&["merge-cancel", "card-1", "--ack-stopped"]).is_err());
     }
 
     #[test]

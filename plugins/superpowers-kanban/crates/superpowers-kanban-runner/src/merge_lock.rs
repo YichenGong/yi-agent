@@ -96,6 +96,21 @@ fn write_holder(state_dir: &Path, holder: &Holder) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
+/// 只有当记录**确实是这张卡、且 pid 是本进程**时才删。
+///
+/// 为什么需要 pid:同一张卡可能先后被两个进程登记。只按卡号比较,后一个进程
+/// 就会把前一个仍在持有的记录删掉,留下一把"没人认领的锁"——显示上看不出谁在
+/// 合并,旧版恢复逻辑也无从判断。带上 pid,删除就只可能是"我自己的记录"。
+pub fn clear_holder_if_matches(state_dir: &Path, card_id: &str, pid: u32) -> bool {
+    match read_holder(state_dir) {
+        Some(holder) if holder.card_id == card_id && holder.pid == pid => {
+            clear_holder(state_dir);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 删掉 holder 记录。文件本就不在也算成功。
 pub fn clear_holder(state_dir: &Path) {
     let _ = std::fs::remove_file(holder_path(state_dir));

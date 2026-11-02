@@ -382,6 +382,8 @@ fn dispatch_in(
             let status = match service.merge_finish(card_id)? {
                 crate::service::MergeFinish::Released => "released",
                 crate::service::MergeFinish::Cleared => "cleared",
+                // 有安全记录:名额由 daemon 按 journal + 观测放,这里只报告。
+                crate::service::MergeFinish::Waiting => "waiting",
             };
             Ok(json!({ "status": status }))
         }
