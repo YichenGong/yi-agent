@@ -206,9 +206,13 @@ TUI / 桌面 / 未来客户端自动一致。
   本应无明文的占位上。
 - `incoming.text` 非空 → 用 `incoming`（服务端有内容时是权威）。
 - `incoming.text` 为空 → 返回 `{ ...incoming, text: existingText }`；其中
-  `existingText` 取**同 id 条目的现有文本**，该 id 尚不存在时（接管场景）取
-  `this.openReasoning?.text ?? ""`。注意必须在调用 `breakReasoningRun()` **之前**
-  读取 `openReasoning`，否则拿到的是 `null`。
+  `existingText` 取**同 id 条目的现有文本**。该条目有两种形态，都要读：
+  接管那一刻是本地 `ReasoningItem`（`type: "reasoning"`，与 `this.openReasoning`
+  是同一对象引用，流式摘要就在它的 `text` 里）；配对 `completed` 与 `upsertItems`
+  时是已接管的 `thinking` 条目。只认 `type === "thinking"` 会让接管那一步取到
+  空串，等于没修。读 `existing.text` 必须在 `breakReasoningRun()` **之前**完成
+  （该调用会把 `openReasoning` 置 `null`，但 `items` 里的引用仍在——所以实现上
+  直接从 `items` 取，不依赖 `openReasoning`）。
 
 这样 `started` 空文本不会清掉本地流式摘要，且随后的 `completed`（同样是空
 文本）也不会把它再清一次。
@@ -354,10 +358,12 @@ TUI 的取舍是「没有可读内容就不占屏幕」；桌面端按用户选�
    已有文本（覆盖回放补帧）。
 9. `ChatView.test.tsx`：`{ type: "thinking", text: "", redacted: false }` 展开后
    可见「已推理（无明文）」。
-10. `session.test.ts`：已有明文 `"SUMMARY"` 的条目收到 `redacted: true` 的空文本
+10. `ChatView.test.tsx`：`text` 非空时仍渲染原文，且**不出现**「已推理（无明文）」
+    ——护栏，防止占位文案顶掉真实摘要。
+11. `session.test.ts`：已有明文 `"SUMMARY"` 的条目收到 `redacted: true` 的空文本
     帧时，**不得**保留旧明文（断言 `text === ""` 且 `redacted === true`）——覆盖
     §4.2 的安全边界。
-11. 既有「已加密的思考」「折叠可展开」「回放卡片」「两轮 CoT 位置」用例继续全绿。
+12. 既有「已加密的思考」「折叠可展开」「回放卡片」「两轮 CoT 位置」用例继续全绿。
 
 **端到端（人工，非 CI）**：在 App 里用 `HORIZON-OG-Sol` + effort `high` 跑一轮
 需要推理的提问，确认「思考」块展开后有摘要；再用不配 effort 的条目跑一轮，确认
@@ -367,7 +373,8 @@ TUI 的取舍是「没有可读内容就不占屏幕」；桌面端按用户选�
 
 - `cd yi-agent-rs && cargo test -p yi-agent-llm`：全绿，含 §7 的新增两条。
 - `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`：全绿。
-- `cd desktop && npx vitest run`：全绿，含 §7 的新增五条。
+- `cd desktop && npx vitest run`：全绿，含 §7 的新增七条（`session.test.ts` 五条 +
+  `ChatView.test.tsx` 两条）。
 - `cd desktop && npx tsc --noEmit`：无错误。
 - `cd yi-agent-rs && just ci`：全绿。
 - 人工验收：两种配置下分别看到「有摘要」与「已推理（无明文）」，**都不再出现空白
