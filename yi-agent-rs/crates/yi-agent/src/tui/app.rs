@@ -579,6 +579,110 @@ fn persist_runtime_choice(
     }
 }
 
+/// 会话级 UI 状态：用户选的模型与 effort、状态栏、成本累计。
+///
+/// 这些值「活到下一帧」——任何时刻都可读可写，没有「必须在此之前释放」
+/// 的时序约束。把散落的 `let mut` 收在这里，`run_loop` 的其余部分才看得清
+/// 主流程。
+struct SessionUi {
+    current_model: String,
+    /// 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
+    /// 与 `current_model`（driver 回报的 model 串）分开：清单里两条条目可能共用
+    /// 同一个 model 串，且 model 串未必等于显示名，故「当前选中」只能按显示名判定。
+    /// 启动时为 `None`：TUI 跟随清单 `default_model`。
+    current_model_ref: Option<String>,
+    /// 本会话的 effort 覆盖（`/effort <tier>` 写入，`/effort default` 清空）。
+    /// 生效值不缓存：每次现算（`resolve_effort_state`），因为清单与覆盖都会在
+    /// 会话中变化。启动时无覆盖，与 TUI 没有持久化的 thread meta 一致。
+    effort_override: Option<String>,
+    statusbar_state: StatusBarState,
+    cost_tracker: CostTracker,
+}
+
+impl SessionUi {
+    fn new(model: &str) -> Self {
+        Self {
+            current_model: model.to_string(),
+            current_model_ref: None,
+            effort_override: None,
+            statusbar_state: StatusBarState::default(),
+            cost_tracker: CostTracker::default(),
+        }
+    }
+}
+
+/// 当前浮在最上层的东西：命令补全弹窗、运行时选择弹窗、子 agent 列表、
+/// trace 流、运行时提示。同一时刻通常只有一个非空，但它们各自独立开关。
+struct PopupStack {
+    popup: Option<CommandPopup>,
+    runtime_popup: RuntimePopup,
+    subagent_children: SubagentListState,
+    /// The live trace streams, one at most, for whichever task the subagent tab
+    /// is showing. Created lazily so a session that never opens the tab never
+    /// pays for a socket.
+    trace_streams: Option<super::trace::TraceStreams>,
+    /// A one-shot alert shown when the runtime the user asked for fails to come
+    /// up. It must be a popup, not only a history line: the failure can land
+    /// many turns into a long session, where a separator appended to the
+    /// transcript appears off-screen and is never seen.
+    runtime_notice_popup: Option<String>,
+}
+
+impl PopupStack {
+    fn new() -> Self {
+        Self {
+            popup: None,
+            runtime_popup: RuntimePopup::None,
+            subagent_children: SubagentListState::default(),
+            trace_streams: None,
+            runtime_notice_popup: None,
+        }
+    }
+}
+
+/// 循环本身的记账：退出标志、待发消息、在跑的任务、进程快照、视口锚点、
+/// 通知状态。
+struct LoopBookkeeping {
+    pending_quit: bool,
+    queued: crate::tui::queued::DeliveredInterjections,
+    task_registry: RunningTaskRegistry,
+    runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
+    /// `DisabledNotice` prints exactly one line, on the first frame, once the
+    /// history width is known.
+    runtime_notice_pending: bool,
+    process_events: tokio::sync::broadcast::Receiver<yi_agent_tools::ProcessEvent>,
+    process_snapshots: Vec<yi_agent_tools::ManagedProcessSnapshot>,
+    process_outputs: std::collections::HashMap<String, yi_agent_tools::ProcessReadResult>,
+    /// Keep the rendered viewport location so geometry that changes between
+    /// frames (such as a resize or newly queued preview) has an old-width anchor.
+    previous_viewport: Option<(ViewportAnchor, u16, u16)>,
+    /// 终端通知：候选在这里攒着，等这一帧画完再 flush（见下面 `notifications.take()`）。
+    notifications: NotificationState,
+}
+
+impl LoopBookkeeping {
+    fn new(
+        runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
+        process_manager: &yi_agent_tools::ProcessManager,
+    ) -> Self {
+        Self {
+            pending_quit: false,
+            queued: crate::tui::queued::DeliveredInterjections::new(),
+            task_registry: RunningTaskRegistry::new(),
+            runtime_notice_pending: matches!(
+                runtime_intent,
+                Some(crate::tui::subagents::RuntimeStartupIntent::DisabledNotice { .. })
+            ),
+            runtime_intent,
+            process_events: process_manager.subscribe(),
+            process_snapshots: process_manager.list(),
+            process_outputs: std::collections::HashMap::new(),
+            previous_viewport: None,
+            notifications: NotificationState::new(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_loop<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
@@ -601,50 +705,12 @@ fn run_loop<B: Backend, E: EventSource>(
     theme: TuiTheme,
     title: &mut crate::tui::title::TitleHandle,
 ) -> std::io::Result<usize> {
-    let mut current_model: String = model.to_string();
-    // 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
-    // 与 `current_model`（driver 回报的 model 串）分开：清单里两条条目可能共用
-    // 同一个 model 串，且 model 串未必等于显示名，故「当前选中」只能按显示名判定。
-    // 启动时为 `None`：TUI 跟随清单 `default_model`。
-    let mut current_model_ref: Option<String> = None;
-    // 本会话的 effort 覆盖（`/effort <tier>` 写入，`/effort default` 清空）。
-    // 生效值不缓存：每次现算（`resolve_effort_state`），因为清单与覆盖都会在
-    // 会话中变化。启动时无覆盖，与 TUI 没有持久化的 thread meta 一致。
-    let mut effort_override: Option<String> = None;
-    let mut pending_quit = false;
-    let mut popup: Option<CommandPopup> = None;
-    let mut queued = crate::tui::queued::DeliveredInterjections::new();
-    let mut statusbar_state = StatusBarState::default();
-    let mut task_registry = RunningTaskRegistry::new();
-    let mut cost_tracker = CostTracker::default();
-    let mut runtime_popup: RuntimePopup = RuntimePopup::None;
-    let mut subagent_children = SubagentListState::default();
-    // The live trace streams, one at most, for whichever task the subagent tab
-    // is showing. Created lazily so a session that never opens the tab never
-    // pays for a socket.
-    let mut trace_streams: Option<super::trace::TraceStreams> = None;
-    // A one-shot alert shown when the runtime the user asked for fails to come
-    // up. It must be a popup, not only a history line: the failure can land
-    // many turns into a long session, where a separator appended to the
-    // transcript appears off-screen and is never seen.
-    let mut runtime_notice_popup: Option<String> = None;
-    let mut runtime_intent = runtime_intent;
-    // `DisabledNotice` prints exactly one line, on the first frame, once the
-    // history width is known.
-    let mut runtime_notice_pending = matches!(
-        runtime_intent,
-        Some(crate::tui::subagents::RuntimeStartupIntent::DisabledNotice { .. })
-    );
-    let mut process_events = process_manager.subscribe();
-    let mut process_snapshots = process_manager.list();
-    let mut process_outputs: std::collections::HashMap<String, yi_agent_tools::ProcessReadResult> =
-        std::collections::HashMap::new();
-    // Keep the rendered viewport location so geometry that changes between
-    // frames (such as a resize or newly queued preview) has an old-width anchor.
-    let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
-
-    // 终端通知：候选在这里攒着，等这一帧画完再 flush（见下面 `notifications.take()`）。
-    let mut notifications = NotificationState::new();
+    // 三组状态各自打包：会话/模型选择、浮层、循环记账。它们的共同点是
+    // 「活到下一帧、任何时刻可读可写」，没有 D1 那种「必须在此之前释放」
+    // 的时序约束，散在那里只是让 538 行的循环更难读。
+    let mut session_ui = SessionUi::new(model);
+    let mut popup_stack = PopupStack::new();
+    let mut loop_bk = LoopBookkeeping::new(runtime_intent, &process_manager);
     let notifications_enabled = config.notifications;
     let focused = std::sync::atomic::AtomicBool::new(true);
     let mut notifier = {
@@ -671,19 +737,19 @@ fn run_loop<B: Backend, E: EventSource>(
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let initial_queued_lines =
-            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
+            crate::tui::queued::render_queued_preview_with(loop_bk.queued.items(), width, theme);
         let initial_layout = compute_layout(
             area,
             input,
-            pending_quit,
-            &popup,
+            loop_bk.pending_quit,
+            &popup_stack.popup,
             initial_queued_lines.len() as u16,
         );
         let initial_history_area = initial_layout.chunks[0];
         let initial_text_width =
             history.text_width(initial_history_area.width, initial_history_area.height);
         history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
-        let viewport_anchor = match previous_viewport.take() {
+        let viewport_anchor = match loop_bk.previous_viewport.take() {
             Some((anchor, previous_width, previous_height))
                 if previous_width != initial_text_width
                     || previous_height != initial_history_area.height =>
@@ -708,17 +774,17 @@ fn run_loop<B: Backend, E: EventSource>(
                 )
             })
             .count()
-            .min(queued.len());
+            .min(loop_bk.queued.len());
         let final_queued_lines = crate::tui::queued::render_queued_preview_with(
-            &queued.items()[promotion_count..],
+            &loop_bk.queued.items()[promotion_count..],
             width,
             theme,
         );
         let final_layout = compute_layout(
             area,
             input,
-            pending_quit,
-            &popup,
+            loop_bk.pending_quit,
+            &popup_stack.popup,
             final_queued_lines.len() as u16,
         );
         let final_history_area = final_layout.chunks[0];
@@ -745,12 +811,13 @@ fn run_loop<B: Backend, E: EventSource>(
                     cause = %cause,
                     "subagent runtime unavailable for this session"
                 );
-                runtime_notice_popup = Some(crate::tui::subagents::runtime_restart_notice_text());
+                popup_stack.runtime_notice_popup =
+                    Some(crate::tui::subagents::runtime_restart_notice_text());
             }
             route_event(
-                &mut task_registry,
-                &mut statusbar_state,
-                &mut cost_tracker,
+                &mut loop_bk.task_registry,
+                &mut session_ui.statusbar_state,
+                &mut session_ui.cost_tracker,
                 &event,
             );
             // 先应用收据/回推，再处理回合结束。核心保证 `InterjectionsReturned`
@@ -758,18 +825,20 @@ fn run_loop<B: Backend, E: EventSource>(
             // （二者是相邻的两帧），但那样就依赖事件循环的批处理边界，一旦将来
             // 把一帧内的多个事件合并处理，退回的文本就会被回合结束分支抢先消费。
             // 顺序固定下来后，两种情形都安全。
-            apply_interjection_event(&event, &mut queued, input, history, draw_text_width);
+            apply_interjection_event(&event, &mut loop_bk.queued, input, history, draw_text_width);
             if let AgentEvent::ModelChanged { model: new_model } = &event {
-                current_model = new_model.clone();
+                session_ui.current_model = new_model.clone();
             }
             // 必须在 `push_event` 之前：`Done` 不带正文，只能从 history 反查，
             // 而 `push_event` 会立刻压一条 `Separator`。
-            notifications.observe(&event, history, notifications_enabled);
+            loop_bk
+                .notifications
+                .observe(&event, history, notifications_enabled);
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
             if is_turn_end {
-                if let Some(text) = queued.on_turn_end() {
+                if let Some(text) = loop_bk.queued.on_turn_end() {
                     let _ = channels.input.try_send(text.clone());
                     history.push(HistoryCell::UserMessage { text }, draw_text_width);
                 }
@@ -783,34 +852,40 @@ fn run_loop<B: Backend, E: EventSource>(
         } else {
             history.reconcile_scroll_offset(final_text_width, final_history_area.height);
         }
-        previous_viewport = history
+        loop_bk.previous_viewport = history
             .capture_viewport_anchor(final_text_width, final_history_area.height)
             .map(|anchor| (anchor, final_text_width, final_history_area.height));
 
         let queued_lines =
-            crate::tui::queued::render_queued_preview_with(queued.items(), width, theme);
+            crate::tui::queued::render_queued_preview_with(loop_bk.queued.items(), width, theme);
         let queued_height = queued_lines.len() as u16;
         // Advance status bar interpolation + spinner (~30hz).
-        statusbar_state.tick();
-        if process_events.try_recv().is_ok() {
+        session_ui.statusbar_state.tick();
+        if loop_bk.process_events.try_recv().is_ok() {
             refresh_process_snapshots(
                 &process_manager,
-                &mut process_snapshots,
-                &mut process_outputs,
+                &mut loop_bk.process_snapshots,
+                &mut loop_bk.process_outputs,
             );
-            while process_events.try_recv().is_ok() {}
+            while loop_bk.process_events.try_recv().is_ok() {}
         }
 
         // Pre-compute layout so mouse hit-testing uses the same chunk rects
         // as the draw closure below.
         let size = terminal.size()?;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let layout = compute_layout(area, input, pending_quit, &popup, queued_height);
+        let layout = compute_layout(
+            area,
+            input,
+            loop_bk.pending_quit,
+            &popup_stack.popup,
+            queued_height,
+        );
 
-        if runtime_notice_pending {
-            runtime_notice_pending = false;
+        if loop_bk.runtime_notice_pending {
+            loop_bk.runtime_notice_pending = false;
             if let Some(crate::tui::subagents::RuntimeStartupIntent::DisabledNotice { reason }) =
-                &runtime_intent
+                &loop_bk.runtime_intent
             {
                 history.push(
                     HistoryCell::Separator {
@@ -821,7 +896,8 @@ fn run_loop<B: Backend, E: EventSource>(
             }
         }
 
-        let active_process_count = process_snapshots
+        let active_process_count = loop_bk
+            .process_snapshots
             .iter()
             .filter(|snapshot| is_active_managed_process(&snapshot.status))
             .count();
@@ -840,7 +916,7 @@ fn run_loop<B: Backend, E: EventSource>(
             f.render_widget(history_view, chunks[0]);
 
             // Render popup if active
-            if let Some(p) = &popup {
+            if let Some(p) = &popup_stack.popup {
                 let popup_area = chunks[1];
                 if popup_area.height > 0 {
                     f.render_widget(build_popup_with(p, popup_area.height, theme), popup_area);
@@ -849,11 +925,11 @@ fn run_loop<B: Backend, E: EventSource>(
 
             // Status bar.
             let statusbar_line = render_statusbar_with(
-                &statusbar_state,
-                &task_registry,
+                &session_ui.statusbar_state,
+                &loop_bk.task_registry,
                 active_process_count,
                 trimmed_history,
-                &current_model,
+                &session_ui.current_model,
                 chunks[2].width,
                 theme,
             );
@@ -864,11 +940,17 @@ fn run_loop<B: Backend, E: EventSource>(
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line =
-                build_input_line_with(input, pending_quit, chunks[INPUT_CHUNK].width, theme);
+            let input_line = build_input_line_with(
+                input,
+                loop_bk.pending_quit,
+                chunks[INPUT_CHUNK].width,
+                theme,
+            );
             f.render_widget(input_line, chunks[INPUT_CHUNK]);
 
-            if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
+            if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) =
+                &loop_bk.runtime_intent
+            {
                 let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
                 let box_h = 10u16.min(chunks[0].height.max(1));
                 let box_x = chunks[0].x + (chunks[0].width.saturating_sub(box_w)) / 2;
@@ -892,23 +974,23 @@ fn run_loop<B: Backend, E: EventSource>(
                 );
             }
 
-            if let Some(text) = &runtime_notice_popup {
+            if let Some(text) = &popup_stack.runtime_notice_popup {
                 render_runtime_notice_popup(f, text, chunks[0]);
             }
 
             render_runtime_popup(
                 f,
-                &runtime_popup,
-                &task_registry,
-                &process_snapshots,
-                &process_outputs,
+                &popup_stack.runtime_popup,
+                &loop_bk.task_registry,
+                &loop_bk.process_snapshots,
+                &loop_bk.process_outputs,
                 chunks[0],
                 theme,
             );
         })?;
 
         // 通知只在两帧之间发：插在帧中间会把 ANSI 序列切断，留下渲染残影。
-        if let Some(pending) = notifications.take() {
+        if let Some(pending) = loop_bk.notifications.take() {
             let is_focused = focused.load(std::sync::atomic::Ordering::Relaxed);
             if should_notify(notifier.condition(), is_focused) {
                 let _ = notifier.notify(&pending.text);
@@ -920,8 +1002,8 @@ fn run_loop<B: Backend, E: EventSource>(
         title.sync(is_running.load(std::sync::atomic::Ordering::SeqCst));
 
         sync_trace_streams(
-            &mut trace_streams,
-            &mut runtime_popup,
+            &mut popup_stack.trace_streams,
+            &mut popup_stack.runtime_popup,
             &workdir,
             layout.chunks[0].width,
         );
@@ -936,31 +1018,36 @@ fn run_loop<B: Backend, E: EventSource>(
                 // is active. Tab then switches to the managed-processes tab.
                 if key.code == KeyCode::Char('p')
                     && key.modifiers == KeyModifiers::CONTROL
-                    && runtime_popup.is_none()
+                    && popup_stack.runtime_popup.is_none()
                 {
                     refresh_process_snapshots(
                         &process_manager,
-                        &mut process_snapshots,
-                        &mut process_outputs,
+                        &mut loop_bk.process_snapshots,
+                        &mut loop_bk.process_outputs,
                     );
-                    let ids: Vec<String> =
-                        task_registry.list().iter().map(|t| t.id.clone()).collect();
+                    let ids: Vec<String> = loop_bk
+                        .task_registry
+                        .list()
+                        .iter()
+                        .map(|t| t.id.clone())
+                        .collect();
                     if let Ok(socket) = crate::runtime_socket_for(&workdir) {
-                        subagent_children = subagent_children_at(&socket);
+                        popup_stack.subagent_children = subagent_children_at(&socket);
                     }
-                    runtime_popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
+                    popup_stack.runtime_popup =
+                        RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
                     continue;
                 }
                 // Route keys to the runtime popup when active.
-                if !runtime_popup.is_none() {
+                if !popup_stack.runtime_popup.is_none() {
                     let process_to_kill = handle_runtime_popup_key(
                         key,
-                        &mut runtime_popup,
-                        &task_registry,
+                        &mut popup_stack.runtime_popup,
+                        &loop_bk.task_registry,
                         &channels.kill,
-                        &process_snapshots,
-                        &process_outputs,
-                        &subagent_children,
+                        &loop_bk.process_snapshots,
+                        &loop_bk.process_outputs,
+                        &popup_stack.subagent_children,
                         layout.chunks[0].width,
                         layout.chunks[0].height,
                     );
@@ -970,8 +1057,8 @@ fn run_loop<B: Backend, E: EventSource>(
                         );
                         refresh_process_snapshots(
                             &process_manager,
-                            &mut process_snapshots,
-                            &mut process_outputs,
+                            &mut loop_bk.process_snapshots,
+                            &mut loop_bk.process_outputs,
                         );
                     }
                     continue;
@@ -981,8 +1068,10 @@ fn run_loop<B: Backend, E: EventSource>(
                 // would silently corrupt what the user was writing, far worse
                 // than the nuisance it reports, so the key clears the alert and
                 // still reaches the input handling below.
-                runtime_notice_popup = None;
-                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
+                popup_stack.runtime_notice_popup = None;
+                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) =
+                    &loop_bk.runtime_intent
+                {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             persist_runtime_choice(
@@ -996,7 +1085,7 @@ fn run_loop<B: Backend, E: EventSource>(
                                     crate::tui::subagents::RuntimeStartupChoice::Start,
                                 );
                             }
-                            runtime_intent = None;
+                            loop_bk.runtime_intent = None;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             persist_runtime_choice(
@@ -1010,7 +1099,7 @@ fn run_loop<B: Backend, E: EventSource>(
                                     crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
                                 );
                             }
-                            runtime_intent = None;
+                            loop_bk.runtime_intent = None;
                         }
                         // Esc means "skip this time"; it must NOT overwrite the
                         // stored preference, so the next launch asks again.
@@ -1020,7 +1109,7 @@ fn run_loop<B: Backend, E: EventSource>(
                                     crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
                                 );
                             }
-                            runtime_intent = None;
+                            loop_bk.runtime_intent = None;
                         }
                         _ => {}
                     }
@@ -1033,9 +1122,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 // 每次按键现算:覆盖刚被 `/effort` 改过,清单也可能被 `/model`
                 // 选中新条目——两者都不该缓存住。
                 let (current_effort, effort_source) = resolve_effort_state(
-                    effort_override.as_deref(),
+                    session_ui.effort_override.as_deref(),
                     catalog,
-                    current_model_ref.as_deref(),
+                    session_ui.current_model_ref.as_deref(),
                     config.model_injected,
                 );
                 match handle_key(
@@ -1045,68 +1134,72 @@ fn run_loop<B: Backend, E: EventSource>(
                     max_offset,
                     history_text_width,
                     history_area.height,
-                    &cost_tracker,
+                    &session_ui.cost_tracker,
                     &channels,
                     is_running,
-                    &mut queued,
-                    &mut pending_quit,
-                    &mut popup,
+                    &mut loop_bk.queued,
+                    &mut loop_bk.pending_quit,
+                    &mut popup_stack.popup,
                     &workdir,
                     &mcp,
                     config,
-                    &current_model,
-                    current_model_ref.as_deref(),
+                    &session_ui.current_model,
+                    session_ui.current_model_ref.as_deref(),
                     catalog,
                     current_effort.as_deref(),
                     effort_source,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
-                        pending_quit = false;
+                        loop_bk.pending_quit = false;
                     }
                     KeyOutcome::ModelSelected(selection) => {
                         // `/model <name>` 已下发:记下用户选中的显示名,供清单
                         // 「← 当前」标记使用;`/model default` 清空(跟随
                         // default_model)。只有命令真的进了 channel 才更新。
-                        current_model_ref = selection;
+                        session_ui.current_model_ref = selection;
                     }
                     KeyOutcome::EffortChanged(effort) => {
                         // `/effort <tier>` 已下发:记下本会话覆盖。driver 收到的
                         // 就是这个值,故 TUI 侧不需要回读;下发失败的档位会被
                         // driver 以 `Notice` 告知(渲染在状态行)。
-                        effort_override = effort;
+                        session_ui.effort_override = effort;
                     }
                     KeyOutcome::OpenAgentDetail(task_id) => {
                         if let Ok(socket) = crate::runtime_socket_for(&workdir) {
-                            subagent_children = subagent_children_at(&socket);
+                            popup_stack.subagent_children = subagent_children_at(&socket);
                         }
-                        open_agent_detail(&mut runtime_popup, &subagent_children, task_id);
+                        open_agent_detail(
+                            &mut popup_stack.runtime_popup,
+                            &popup_stack.subagent_children,
+                            task_id,
+                        );
                     }
                     KeyOutcome::None => {}
                 }
                 // After any key, sync popup state with the (possibly modified) buffer
-                sync_popup(&mut popup, &input.buffer);
+                sync_popup(&mut popup_stack.popup, &input.buffer);
             }
             Some(Event::Paste(text)) => {
                 handle_paste(
                     text,
                     input,
                     history,
-                    &runtime_popup,
-                    &mut pending_quit,
-                    &mut popup,
+                    &popup_stack.runtime_popup,
+                    &mut loop_bk.pending_quit,
+                    &mut popup_stack.popup,
                 );
             }
             Some(Event::Mouse(mouse)) => {
                 handle_mouse(
                     mouse,
                     &layout,
-                    &mut runtime_popup,
+                    &mut popup_stack.runtime_popup,
                     history,
-                    &task_registry,
-                    &process_snapshots,
-                    &process_outputs,
-                    &mut pending_quit,
+                    &loop_bk.task_registry,
+                    &loop_bk.process_snapshots,
+                    &loop_bk.process_outputs,
+                    &mut loop_bk.pending_quit,
                 );
             }
             _ => {}
@@ -1116,7 +1209,7 @@ fn run_loop<B: Backend, E: EventSource>(
     // Messages submitted during the last turn never got their chance to run.
     // Return the count so the caller can report the loss after the terminal is
     // restored (anything printed while the alternate screen is up is erased).
-    Ok(queued.len())
+    Ok(loop_bk.queued.len())
 }
 
 /// Top-level runtime popup: a Bash-tasks tab and a managed-processes tab,
