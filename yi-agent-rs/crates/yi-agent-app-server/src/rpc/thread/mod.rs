@@ -38,6 +38,11 @@ use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
 use crate::workspace_index::WorkspaceIndex;
+
+pub(crate) mod content;
+pub(crate) mod groups;
+pub(crate) mod lifecycle;
+pub(crate) mod settings;
 /// 模型未配置时返回可分支的错误；配置可用时返回 `None`。
 ///
 /// 判据只看「解析后的生效 model 是否为空」，不看清单是否为空：整包注入
@@ -2806,4 +2811,36 @@ fn require_group_id(params: &serde_json::Value) -> Result<String, RpcError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| RpcError::invalid_params("missing groupId"))
+}
+
+#[cfg(test)]
+mod owns_coverage {
+    use super::{content, groups, lifecycle, settings};
+
+    /// 基线清单由 Task 0 从拆分前的 `thread.rs` 枚举，提交入库。
+    /// 它必须是**机器枚举**而非手写：手写清单抓不到「原有 method 被漏掉」。
+    #[test]
+    fn every_thread_method_is_owned_by_exactly_one_group() {
+        let all: Vec<&str> = include_str!("../thread_methods_baseline.txt")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(all.len(), 26, "基线文件必须恰好 26 行");
+        let mut bad = vec![];
+        for m in &all {
+            let n = [
+                lifecycle::owns(m),
+                settings::owns(m),
+                content::owns(m),
+                groups::owns(m),
+            ]
+            .iter()
+            .filter(|x| **x)
+            .count();
+            if n != 1 {
+                bad.push(format!("{m} 被 {n} 组认领"));
+            }
+        }
+        assert!(bad.is_empty(), "未归属或重复归属: {bad:#?}");
+    }
 }
