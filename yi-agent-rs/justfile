@@ -182,7 +182,13 @@ audit:
 audit-deps-check:
     bash ../scripts/test_audit_deps.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check audit-deps-check audit
+# nightly workflow 的静态守卫：核对它引用的 recipe / script / models.json
+# 字段名与真实定义一致。nightly 不在 PR 上跑，坏了几周都可能没人发现——
+# 「改了个 recipe 名，workflow 还在调旧名」这类静默失效靠静读发现不了。
+nightly-workflow-check:
+    bash ../scripts/test_nightly_workflow.sh
+
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check nightly-workflow-check audit-deps-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
