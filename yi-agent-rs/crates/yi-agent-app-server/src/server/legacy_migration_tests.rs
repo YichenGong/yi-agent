@@ -228,7 +228,7 @@ fn the_ws_test_seam_does_no_startup_work() {
 /// 入口（典型是 ws）静默不迁移。
 #[test]
 fn the_startup_migration_runs_both_model_and_settings_migrations() {
-    let source = include_str!("../server.rs");
+    let source = include_str!("../server/migration.rs");
     let start = source
         .find("pub(crate) fn migrate_legacy_model_keys_on_startup()")
         .expect("the startup migration function must exist");
