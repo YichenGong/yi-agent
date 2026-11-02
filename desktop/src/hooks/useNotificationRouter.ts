@@ -53,6 +53,12 @@ export interface NotificationRouterDeps {
   markThreadRead: (id: string) => void;
   schedulePersist: (id: string) => void;
   selectThread: (id: string, opts?: { leaveBoard?: boolean }) => Promise<void>;
+  /**
+   * 该 thread 收到了活动（任意帧），用来给 resume 的停滞检测续命。
+   * 只在 `ownsThreadView` 判定之后调用——非活动槽位的帧不写本视图，用它们
+   * 续命会掩盖「当前会话真的卡住」的事实（设计 §4.2）。
+   */
+  notifySyncActivity: (threadId: string) => void;
   disposed: boolean;
   scheduleReconnect: () => void;
 }
@@ -73,6 +79,7 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
     setTagNames,
     force,
     markThreadRead,
+    notifySyncActivity,
     schedulePersist,
     disposed,
     scheduleReconnect,
@@ -91,6 +98,14 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
         // 否则切到该槽位时会发现它的连接已经半死。
         if (!ownsThreadView(slot, activeSlotRef.current, n.method)) {
           return;
+        }
+        // 回放帧就是「活动」：续一次命。放在 ownsThreadView 之后是刻意的——
+        // 非活动槽位的帧不会写本视图，用它们续命会掩盖「当前会话真的卡住」。
+        {
+          const params = n.params as { thread_id?: unknown } | null | undefined;
+          if (typeof params?.thread_id === "string") {
+            notifySyncActivity(params.thread_id);
+          }
         }
         // A driven session is created outside the desktop's thread/start RPC, so
         // it may not exist in the cached groups when its first Running status
