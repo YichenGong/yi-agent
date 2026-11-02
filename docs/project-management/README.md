@@ -21,13 +21,13 @@
 | ci-cd | 32 / 34 | [详情](./ci-cd.md) |
 | tooling | 11 / 11 | [详情](./tooling.md) |
 | yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
-| yi-agent-store | 10 / 11 | [详情](./yi-agent-store.md) |
+| yi-agent-store | 11 / 12 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
 | yi-agent-runtime | 24 / 24 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 79 / 79 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
+| subagent-runtime | 47 / 55 | [详情](./subagent-runtime.md) |
 | yi-agent-lifecycle | 10 / 13 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 125 | [详情](./desktop.md) |
