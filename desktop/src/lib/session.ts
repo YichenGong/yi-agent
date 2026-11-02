@@ -330,6 +330,40 @@ export class Session {
    * notices are still not anchors — the server transcript is the authority.
    */
   /**
+   * Fold a server `thinking` item over the text we already hold.
+   *
+   * 块级 `thinking` 条目不携带明文（摘要走 `thread/reasoningDelta` 旁路），
+   * 所以它的 `text` 通常是空串。无条件用它整体替换本地块，会把已经流式收到
+   * 的摘要清空——这就是「思考」块点开空白的成因。规则：
+   *
+   * - 非 thinking 项：原样返回。
+   * - `redacted`：原样返回，**不保留任何旧文本**。否则后到帧把块标成加密时，
+   *   旧明文会留在本应无明文的占位上。
+   * - 服务端带明文：用服务端的（它是权威）。
+   * - 服务端空明文：沿用 `existing` 的文本。**`existing` 可能是本地
+   *   `ReasoningItem`（接管那一刻就是它，与 `this.openReasoning` 同一对象），
+   *   也可能是已接管的 `thinking` 条目，两者都要取 `text`；其它类型不取。
+   *
+   * `existing` 取 `items` 的声明类型（`Item | NoticeItem | ReasoningItem`）：
+   * 接管那一刻它就是本地 `ReasoningItem`，只写 `Item` 会编译失败。
+   */
+  private static mergeThinkingText(
+    existing: Item | NoticeItem | ReasoningItem | undefined,
+    incoming: Item,
+  ): Item {
+    if (incoming.type !== "thinking" || incoming.redacted) return incoming;
+    if (incoming.text !== "") return incoming;
+    // 接管时 existing 是本地 `reasoning` 块（流式摘要就在它的 text 里）；
+    // 配对 completed / upsert 时 existing 是已接管的 `thinking` 条目。
+    // 两者都要读，否则接管那一步等于没修。
+    const held =
+      existing && (existing.type === "thinking" || existing.type === "reasoning")
+        ? existing.text
+        : "";
+    return { ...incoming, text: held };
+  }
+
+  /**
    * Resolve the index of `id`, biased to the tail.
    *
    * During a turn the mutating target is always near the end — the trailing
@@ -459,7 +493,7 @@ export class Session {
           : item;
       const index = this.items.findIndex((i) => i.id === normalized.id);
       if (index >= 0) {
-        this.items[index] = normalized;
+        this.items[index] = Session.mergeThinkingText(this.items[index], normalized);
         this.structuralVersion += 1;
       } else if (normalized.type === "userMessage") {
         // 回放里还没有这条用户气泡:先把本地乐观回声就地换成服务端项,再去重。
@@ -549,7 +583,7 @@ export class Session {
         ) {
           const held = this.items.findIndex((i) => i.id === this.openReasoning!.id);
           if (held >= 0) {
-            this.items[held] = item;
+            this.items[held] = Session.mergeThinkingText(this.items[held], item);
             this.structuralVersion += 1;
             this.lastServerItemId = item.id;
             this.breakReasoningRun();
@@ -560,7 +594,7 @@ export class Session {
         this.breakReasoningRun();
         const index = this.items.findIndex((i) => i.id === item.id);
         if (index >= 0) {
-          this.items[index] = item;
+          this.items[index] = Session.mergeThinkingText(this.items[index], item);
           this.structuralVersion += 1;
         } else if (
           item.type === "userMessage" &&

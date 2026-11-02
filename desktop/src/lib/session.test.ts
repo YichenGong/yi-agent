@@ -759,6 +759,94 @@ describe("Session", () => {
       expect((s.items[1] as { text: string }).text).toBe("T2");
     });
 
+    it("keeps the streamed summary when the server thinking item arrives empty", () => {
+      // 服务端块级条目不携带明文（摘要走 reasoningDelta 旁路）。用它整体替换
+      // 本地块会把已收到的摘要清空——这正是「思考块点开空白」的成因。
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "SUMMARY", kind: "Summary" },
+      });
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "thinking", id: "item-1", text: "", redacted: false },
+        },
+      });
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0]).toMatchObject({ type: "thinking", id: "item-1", text: "SUMMARY" });
+    });
+
+    it("does not clear the summary again on the paired item/completed", () => {
+      // 配对帧携带同一个空 text，走「按 id 就地替换」那条分支。只守卫接管处
+      // 不足以修好：这里复现第二次清空。
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "SUMMARY", kind: "Summary" },
+      });
+      const item = { type: "thinking", id: "item-1", text: "", redacted: false } as const;
+      s.apply({ method: "item/started", params: { thread_id: "t", item: { ...item } } });
+      s.apply({ method: "item/completed", params: { thread_id: "t", item: { ...item } } });
+      expect(s.items).toHaveLength(1);
+      expect((s.items[0] as { text: string }).text).toBe("SUMMARY");
+    });
+
+    it("prefers the server's text when it carries one", () => {
+      // 服务端有明文时是权威（GPT 修复后走这条），本地旧文本必须让位。
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "LOCAL", kind: "Content" },
+      });
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "thinking", id: "item-1", text: "SERVER", redacted: false },
+        },
+      });
+      expect((s.items[0] as { text: string }).text).toBe("SERVER");
+    });
+
+    it("never keeps plaintext once a block is marked redacted", () => {
+      // 安全边界：后到帧把块标记为 redacted 时，沿用旧明文等于把本应无明文的
+      // 占位变成明文泄漏。
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "SECRET", kind: "Content" },
+      });
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "thinking", id: "item-1", text: "", redacted: true },
+        },
+      });
+      expect(s.items[0]).toMatchObject({ type: "thinking", redacted: true, text: "" });
+    });
+
+    it("does not clear existing text when upserting an empty thinking item", () => {
+      // `upsertItems` 是回放/补齐的入口，按 id 就地替换。它同样不得用空文本
+      // 覆盖已有内容。
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "SUMMARY", kind: "Summary" },
+      });
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "thinking", id: "item-1", text: "", redacted: false },
+        },
+      });
+      s.upsertItems([{ type: "thinking", id: "item-1", text: "", redacted: false }]);
+      expect((s.items[0] as { text: string }).text).toBe("SUMMARY");
+    });
+
     it("replaces the taken-over item on the paired item/completed without duplicating", () => {
       const s = new Session();
       s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "cot", kind: "Content" } });
