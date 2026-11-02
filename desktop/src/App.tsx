@@ -29,6 +29,8 @@ import {
 
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
+import { TranscriptPlaceholder } from "./components/TranscriptPlaceholder";
+import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { CacheNotice } from "./components/CacheNotice";
 import { MessageInput } from "./components/MessageInput";
 import { ModelPicker } from "./components/ModelPicker";
@@ -192,6 +194,10 @@ export default function App() {
   const storeRef = useRef(new ThreadStore());
   const store = storeRef.current;
   const [, force] = useState(0);
+  // 转录区 boundary 的重试计数：boundary 的 hasError 一旦置位就粘住，
+  // 重试必须换 resetKey 才清得掉。用独立的计数器而不是复用一个现有值，
+  // 是为了让「切换会话」与「点重试」两条复位路径互不干扰。
+  const [transcriptEpoch, setTranscriptEpoch] = useState(0);
   /**
    * 按槽位持有连接（本地 + 每个已连接的远端项目）。
    *
@@ -2676,13 +2682,14 @@ export default function App() {
               <>
                 {sess.currentId !== null &&
                   ((offline && cachedAt.current.has(sess.currentId)) ||
-                    store.peek(sess.currentId)?.syncState === "syncing") && (
+                    store.peek(sess.currentId)?.syncState === "syncing" ||
+                    store.peek(sess.currentId)?.syncState === "failed") && (
                     <CacheNotice
                       savedAt={cachedAt.current.get(sess.currentId) ?? null}
-                      syncing={
-                        !offline &&
-                        store.peek(sess.currentId)?.syncState === "syncing"
-                      }
+                      // 不再要求 !offline：冷启动时 offline 为真只是因为握手还没
+                      // 走完（status 尚未置 connected），而 syncState 是更强的证据。
+                      syncing={store.peek(sess.currentId)?.syncState === "syncing"}
+                      failed={store.peek(sess.currentId)?.syncState === "failed"}
                     />
                   )}
                 {/*
@@ -2693,34 +2700,67 @@ export default function App() {
                 `flex-1` 的转录列，输入区仍在它下面可用。
               */}
                 <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                  <ChatView
-                    items={current?.session.items ?? []}
-                    error={current?.session.lastError ?? null}
-                    retrying={current?.session.retrying ?? null}
-                    threadId={sess.currentId}
-                    // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
-                    // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
-                    call={imageCall}
-                    structuralVersion={current?.session.structuralVersion ?? 0}
-                    query={searchQuery}
-                    anchor={
-                      sess.currentId
-                        ? sess.anchorFor(sess.currentId)
-                        : undefined
+                  <ErrorBoundary
+                    // 切会话必须清掉错误位，否则切到好会话仍是错误页。
+                    // 用 resetKey 而不是 key：key 会连 ChatView 一起重挂，
+                    // 每次切会话丢滚动位置与展开的 reasoning 块。
+                    resetKey={`${sess.currentId ?? "none"}:${transcriptEpoch}`}
+                    onError={(e) => console.error("transcript render failed", e)}
+                    fallback={
+                      <TranscriptPlaceholder
+                        kind="crashed"
+                        reason="这条会话里有一段内容无法渲染"
+                        // 换 resetKey 才能真的清掉 hasError；只 force 重渲染
+                        // 的话 boundary 会一直停在 fallback 上。
+                        onRetry={() => setTranscriptEpoch((n) => n + 1)}
+                      />
                     }
-                    // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
-                    // "还没到"（继续等）与"真的没了"（回退到底部）。
-                    syncing={
-                      sess.currentId
-                        ? store.peek(sess.currentId)?.syncState === "syncing"
-                        : false
-                    }
-                    // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
-                    // 注释），所以直接透传，不在闭包里另读 currentId。
-                    onRememberView={sess.rememberView}
-                    scrollerRef={transcriptRef}
-                    captureViewRef={captureTranscriptRef}
-                  />
+                  >
+                    <ChatView
+                      items={current?.session.items ?? []}
+                      error={current?.session.lastError ?? null}
+                      retrying={current?.session.retrying ?? null}
+                      threadId={sess.currentId}
+                      // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                      // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                      call={imageCall}
+                      structuralVersion={current?.session.structuralVersion ?? 0}
+                      query={searchQuery}
+                      anchor={
+                        sess.currentId
+                          ? sess.anchorFor(sess.currentId)
+                          : undefined
+                      }
+                      // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
+                      // "还没到"（继续等）与"真的没了"（回退到底部）。
+                      syncing={
+                        sess.currentId
+                          ? store.peek(sess.currentId)?.syncState === "syncing"
+                          : false
+                      }
+                      // 失败原因：非 null 即失败态。有内容时不渲染占位（ChatView 内判）。
+                      syncError={
+                        sess.currentId
+                          ? store.peek(sess.currentId)?.syncState === "failed"
+                            ? (store.peek(sess.currentId)?.syncError ?? "加载失败")
+                            : null
+                          : null
+                      }
+                      onRetrySync={() => {
+                        const id = sess.currentId;
+                        // `forceResume` 跳过 selectThread 的全部早退，是唯一可靠的
+                        // 强制重同步路径（设计 §4.3）。
+                        if (id) void selectThread(id, { forceResume: true });
+                      }}
+                      // 只有远端才渲染骨架屏：桌面端不加任何新视觉元素（设计 §6.1）。
+                      isRemote={isRemoteClient()}
+                      // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                      // 注释），所以直接透传，不在闭包里另读 currentId。
+                      onRememberView={sess.rememberView}
+                      scrollerRef={transcriptRef}
+                      captureViewRef={captureTranscriptRef}
+                    />
+                  </ErrorBoundary>
                   {searchOpen && (
                     <SearchBar
                       value={searchInput}

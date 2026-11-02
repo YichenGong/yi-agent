@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
 
 type Mode = "normal" | "yolo";
@@ -409,6 +410,8 @@ import App, { REPAIR_REMOVED_TEXT } from "./App";
 import { MemoryContentStore } from "./lib/contentStore";
 import { __setClearThreadContent } from "./lib/cacheScope";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { TranscriptPlaceholder } from "./components/TranscriptPlaceholder";
 
 // jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
 // `useImageData` 真的去 `image/read` 取字节、建对象 URL（hook 的缓存按 path 全局
@@ -6523,6 +6526,112 @@ describe("App 同步状态机（手机端黑屏）", () => {
     );
     expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeNull();
     expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+  });
+
+  it("shows a skeleton, not a blank pane, while a cold thread syncs", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeTruthy(),
+    );
+  });
+
+  it("shows a retry affordance when resume never settles", async () => {
+    // fake timers：停滞判定靠真实的 15s，必须把时间推进过去。
+    vi.useFakeTimers();
+    try {
+      asRemote();
+      state.dataSources["thread/resume"] = () => new Promise(() => {});
+      render(<App />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy();
+      expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retrying from the failure pane re-issues thread/resume", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => {
+      throw { code: -32602, message: "unknown thread" };
+    };
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy(),
+    );
+    const before = resumeCount();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(resumeCount()).toBe(before + 1));
+  });
+
+  it("does not show a skeleton for a genuinely empty thread", async () => {
+    asRemote();
+    // resume 正常返回、readItems 也返回空 → 真·空会话
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeNull();
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+  });
+
+  it("a render throw inside the transcript leaves the sidebar and composer mounted", async () => {
+    // **不要**在 App 层制造异常：实测 ChatItem / itemText 对坏数据有完整防御
+    // （text:null / 未知 type / null item / 缺字段 五种形态都不抛），而
+    // `vi.doMock` + 动态 import 会让异常越过 React 直接炸到测试层（已实测失败）。
+    //
+    // 这一条改为**组件层**验证：boundary 的收敛边界是它自己的契约，
+    // 与"哪种坏数据"无关。App 层的真实接线由 Task 7 人工核对。
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      function Boom(): ReactElement {
+        throw new Error("bad item");
+      }
+      render(
+        <div>
+          <aside data-testid="sidebar">sidebar</aside>
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <ErrorBoundary
+              fallback={<TranscriptPlaceholder kind="crashed" reason="bad item" />}
+            >
+              <Boom />
+            </ErrorBoundary>
+          </div>
+          <textarea data-testid="composer" />
+          <div className="app-statusbar">stat</div>
+        </div>,
+      );
+      // 转录区收敛成崩溃页……
+      expect(document.querySelector('[data-testid="sync-crashed"]')).toBeTruthy();
+      // ……而它之外的一切仍然活着：用户能切走、能重连、能报错。
+      expect(screen.getByTestId("sidebar")).toBeTruthy();
+      expect(screen.getByTestId("composer")).toBeTruthy();
+      expect(document.querySelector(".app-statusbar")).toBeTruthy();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("the cache notice names the real reason while syncing on a cold start", async () => {
+    asRemote();
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(clients.length).toBeGreaterThan(0));
+    await waitFor(() => {
+      const status = document.querySelector('[role="status"]');
+      expect(status).toBeTruthy();
+      // 冷启动时 offline 为真（握手还没走完），但真正的原因是「正在同步」。
+      expect(status?.textContent).not.toContain("断开");
+    });
   });
 
   it("never shows a skeleton to a desktop client", async () => {

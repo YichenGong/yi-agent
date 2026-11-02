@@ -6,6 +6,9 @@ import { formatRelativeTime, RELATIVE_TIME_UNKNOWN } from "../lib/relativeTime";
  *
  * - `syncing`: the catch-up is in flight on a live connection — the cached
  *   transcript is on screen and may be stale, so sending is blocked meanwhile.
+ * - `failed`: the reconciliation failed (server rejection, or a stalled
+ *   replay). Saying "connection down" here would be a lie — the connection is
+ *   often perfectly healthy — so it must name the real reason.
  * - otherwise (offline): the connection is down; `savedAt` says how old the
  *   cached content is. A missing `savedAt` means there is **no** cached
  *   content at all, so the strip must not claim to be showing one.
@@ -16,16 +19,22 @@ import { formatRelativeTime, RELATIVE_TIME_UNKNOWN } from "../lib/relativeTime";
 export function CacheNotice({
   savedAt,
   syncing,
+  failed,
 }: {
   savedAt?: number | null;
   syncing?: boolean;
+  /** 对账失败：此时说「连接断开」是错的（连接可能好着），要说出真正的原因。 */
+  failed?: boolean;
 }) {
   return (
     <div
       role="status"
       className="border-b border-line bg-raised px-4 py-1 text-xs text-fg-muted"
     >
-      {syncing ? "正在同步…" : offlineLabel(savedAt)}
+      {/* 顺序是刻意的：`failed` 压过 `syncing`。两者同为真是状态机自身的问题
+          （置 failed 时必然已离开 syncing），真撞上时优先说出"失败了、可以重试"
+          ——那是用户唯一能行动的结论。 */}
+      {failed ? "内容加载失败 · 可重试" : syncing ? "正在同步…" : offlineLabel(savedAt)}
     </div>
   );
 }
