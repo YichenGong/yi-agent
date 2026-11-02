@@ -10,4 +10,5 @@ pub mod repository;
 pub mod resident;
 pub mod runtime;
 pub mod schedule;
+pub mod schema_compat;
 pub mod terminal;

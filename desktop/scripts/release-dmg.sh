@@ -65,9 +65,9 @@ log "环境与版本检查完成"
 # Cargo.toml——否则 App 的 CFBundleShortVersionString 会一直停在写死的
 # 0.1.0（产物文件名被本脚本重命名过，看不出这个不一致）。
 # 仅改工作区文件，不提交。
-log "收窄 bundle.targets 为 app,dmg，并注入版本 $VERSION"
+log "收窄 bundle.targets 为 app，并注入版本 $VERSION"
 CONF="$HERE/src-tauri/tauri.conf.json"
-jq --arg v "$VERSION" '.bundle.targets = ["app","dmg"] | .version = $v' "$CONF" > "$CONF.tmp"
+jq --arg v "$VERSION" '.bundle.targets = ["app"] | .version = $v' "$CONF" > "$CONF.tmp"
 mv "$CONF.tmp" "$CONF"
 sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" "$HERE/src-tauri/Cargo.toml"
 rm -f "$HERE/src-tauri/Cargo.toml.bak"
@@ -85,9 +85,6 @@ log "tauri build"
 log "归档 dmg 与独立 CLI 二进制"
 mkdir -p "$ROOT/dist"
 
-# 4a. 桌面 App 的 dmg。版本已注入 tauri 配置，故 tauri 产出的文件名恰好
-#     等于 ART；按精确文件名取，避免持久 runner 的 build 目录里残留的旧
-#     版本 dmg 被误发（旧的 `ls | head` 会按字典序选中它）。
 ART="yi-agent_${VERSION}_aarch64.dmg"
 export ART
 # tauri 的产物目录跟着 CARGO_TARGET_DIR 走。GitLab 侧目前没设它，所以
@@ -98,9 +95,30 @@ DMG_TARGET_DIR="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" \
   --format-version 1 --no-deps 2>/dev/null \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 [ -n "$DMG_TARGET_DIR" ] || DMG_TARGET_DIR="$HERE/src-tauri/target"
+
+# 4a-0. finalize：**必须在生成 dmg 之前**。清单记录 sidecar 签名后的 digest，
+#       而打包器会把 .app 快照进 dmg；先打 dmg 再 finalize 等于发布一个
+#       清单缺失或 digest 对不上的产物。finalize 内部按 sidecar → 写清单 →
+#       外层 app → verify 的顺序签，且禁止 --deep（它会重签 sidecar，把刚
+#       写下的 digest 作废）。
+APP_BUNDLE="$DMG_TARGET_DIR/release/bundle/macos/yi-agent.app"
+if [ ! -d "$APP_BUNDLE" ]; then
+  echo "ERROR: 未找到 tauri 产出的 .app（$APP_BUNDLE）" >&2
+  ls -l "$DMG_TARGET_DIR/release/bundle/macos/" >&2 || true
+  exit 1
+fi
+log "finalize 运行时清单并重签"
+bash "$HERE/scripts/finalize-runtime-bundle.sh" "$APP_BUNDLE"
+
+log "从 finalize 后的 .app 生成 dmg"
+rm -f "$DMG_TARGET_DIR/release/bundle/dmg/$ART"
+mkdir -p "$DMG_TARGET_DIR/release/bundle/dmg"
+hdiutil create -volname "yi-agent" -srcfolder "$APP_BUNDLE" \
+  -ov -format UDZO "$DMG_TARGET_DIR/release/bundle/dmg/$ART" >/dev/null
+
 DMG_SRC="$DMG_TARGET_DIR/release/bundle/dmg/$ART"
 if [ ! -f "$DMG_SRC" ]; then
-  echo "ERROR: 未找到 tauri 产出的 ${ART}（目录内容如下）" >&2
+  echo "ERROR: 未找到生成的 ${ART}（目录内容如下）" >&2
   ls -l "$DMG_TARGET_DIR/release/bundle/dmg/" >&2 || true
   exit 1
 fi

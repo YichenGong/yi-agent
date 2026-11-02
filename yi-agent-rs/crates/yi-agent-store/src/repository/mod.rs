@@ -39,7 +39,14 @@ mod task;
 mod trace;
 mod watchdog;
 
-const LATEST_SCHEMA_VERSION: i64 = 15;
+/// The newest schema this build can migrate to and read.
+///
+/// Public (via [`crate::schema_compat::SUPPORTED_SCHEMA_MAX`]) because a client
+/// must refuse to open a database written by a *newer* build before it performs
+/// any migration, task recovery, or orphan reclamation. The old check
+/// (`current_version >= LATEST` means success) silently accepted a future schema
+/// and then ran statements against columns that may not mean what it assumes.
+pub const LATEST_SCHEMA_VERSION: i64 = 15;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -146,6 +153,11 @@ pub enum RepositoryError {
     InvalidAdmissionCursor { key: String, reason: String },
     #[error("watchdog snapshot is invalid for {attempt}: {reason}")]
     InvalidWatchdogSnapshot { attempt: String, reason: String },
+    /// The on-disk schema is outside the range this build can read and migrate.
+    /// Distinct from `Sql` so a caller can tell "incompatible database" (report
+    /// it, keep the file) from "the database is corrupt".
+    #[error("schema incompatible: {reason}")]
+    SchemaIncompatible { reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -550,7 +562,10 @@ mod tests {
             )
             .unwrap();
         assert!(has_thread_id);
-        assert_eq!(LATEST_SCHEMA_VERSION, 15);
+        assert_eq!(
+            LATEST_SCHEMA_VERSION as u32,
+            crate::schema_compat::SUPPORTED_SCHEMA_MAX
+        );
     }
 
     #[test]
@@ -1142,7 +1157,10 @@ mod extra_roots_tests {
 
     #[test]
     fn schema_version_is_fifteen() {
-        assert_eq!(LATEST_SCHEMA_VERSION, 15);
+        assert_eq!(
+            LATEST_SCHEMA_VERSION as u32,
+            crate::schema_compat::SUPPORTED_SCHEMA_MAX
+        );
     }
 
     /// The fresh-open tests never exercise the upgrade an existing install

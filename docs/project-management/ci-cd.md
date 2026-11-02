@@ -64,3 +64,5 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] macOS 门禁 — `.github/workflows/ci.yml` 的 `macos` job，`runs-on: macos-15`（`macos-14` 已于 2026-11-02 退役，`macos-latest` 会漂移，故用固定标签），只跑 `yi-agent-power` / `yi-agent-tools` / `yi-agent-app-server`（覆盖 21 处 `cfg(target_os = "macos")`：8/6/7）。判据：本地同三 crate 实测 `1520 tests run: 1520 passed, 7 skipped`；临时删掉一处 power 的 macOS 断言后该 job 必须红（待首次 CI 跑验证）。**残余风险**：托管 runner 不是用户真机（Mac mini），电源断言这类行为只能拿到信号，不能替代真机验证
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做
+
+- [x] 发布门禁核对运行时清单与 sidecar digest — `.github/workflows/release.yml` 的 "Verify the desktop app is in the npm package" 步骤。原来只有 `codesign --verify --deep --strict`：`--deep` 与发布时的实际签名顺序（sidecar 先签、外层后签、全程不 `--deep`）语义不一致，且**完全没检查 daemon 身份**——一个 `runtime-sidecar.json` 缺失或 digest 与包里 sidecar 不符的 App 也能发出去，而桌面壳启动时会拒绝它。现在改为 `codesign --verify --strict`，并新增：清单必须存在、`sha256` 必须等于 `sha256(yi-agent.app/Contents/MacOS/yi-agent)`、打印 build id。判据：`grep -c "runtime-sidecar.json" .github/workflows/release.yml` ≥ 1；本地等价断言由 `bash desktop/scripts/test_runtime_build_identity.sh` 覆盖（20 passed）

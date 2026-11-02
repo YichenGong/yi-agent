@@ -197,6 +197,14 @@ pub enum Command {
         #[command(subcommand)]
         action: FlagsAction,
     },
+    /// Internal runtime roles. Hidden: these are spawned by the guardian and the
+    /// desktop shell with an inherited private bootstrap FD, never typed by a
+    /// user. Without that FD each role refuses to run.
+    #[command(hide = true, name = "internal-runtime")]
+    InternalRuntime {
+        #[command(subcommand)]
+        action: InternalRuntimeAction,
+    },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
     ///
     /// 通用子命令：它只读通用常驻登记，不认识任何插件。
@@ -229,6 +237,21 @@ pub enum Command {
     },
     /// 列出当前目录的会话。
     Threads,
+}
+
+/// Hidden runtime roles plus the one statically-reportable command.
+#[derive(clap::Subcommand, Debug)]
+pub enum InternalRuntimeAction {
+    /// Print this executable's static artifact identity and exit.
+    ///
+    /// Deliberately does NOT connect to a runtime, read the database, or start
+    /// anything: the build pipeline and the bundle manifest generator call it on a
+    /// machine where no runtime exists.
+    Identity {
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

@@ -66,6 +66,14 @@
   `TimedOut`）
 - [x] `Unsupported` 不被当成成功 — `ControlResponse::Unsupported` 是独立变体。判据：
   `control_client.rs` 的 `a_rejected_response_is_not_a_success`
+- [x] 可移植的 bundle 清单类型 — `types.rs` 的 `BundledArtifactManifest`：build id、
+  display version、**相对 bundle** 的 executable 路径、sha256、schema 与
+  handover／business 协议能力。判据：`cargo test -p yi-agent-lifecycle
+  --test bundled_manifest`（3 passed，含
+  `every_wire_field_survives_the_round_trip`——少一个字段桌面壳会在运行期
+  拒绝清单，而不是在编译期报错）；字段与
+  `desktop/src-tauri/src/runtime_manifest.rs` 的同名结构逐字段一致（桌面壳是独立
+  workspace，靠契约测试而不是共享代码保持同步）
 - [ ] 租约状态机（`leases.rs`） — 见 Task 4
 - [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
 - [ ] 受管进程 spawn 客户端 — 见 Task 8

@@ -17,6 +17,7 @@ yi-agent-core = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
+yi-agent-lifecycle = { workspace = true }
 yi-agent-flags = { workspace = true }
 yi-agent-web = { workspace = true }
 yi-agent-runtime = { workspace = true }
@@ -58,11 +59,17 @@ async-trait = "0.1"
 # would consume the reply byte before a plain `Read` could see it.
 libc = "0.2"
 
+# The build script hashes build inputs into the artifact id, so it needs the same
+# digest crate the test uses.
+[build-dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
 libc = "0.2"
 proptest = { workspace = true }
+sha2 = "0.10"
 toml = "0.8"
 regex = "1"
 

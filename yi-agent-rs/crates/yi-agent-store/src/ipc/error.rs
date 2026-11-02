@@ -204,6 +204,10 @@ pub(crate) fn repository_error_code(error: &crate::repository::RepositoryError) 
         | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. } => {
             IpcErrorCode::InvalidState
         }
+        // A schema outside this build's range is a configuration/version problem
+        // the caller must report, not an internal defect: mapping it to `Internal`
+        // would send it down the "daemon is broken, restart it" path.
+        crate::repository::RepositoryError::SchemaIncompatible { .. } => IpcErrorCode::InvalidState,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }

@@ -162,7 +162,21 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         [],
         |row| row.get(0),
     )?;
-    if current_version >= LATEST_SCHEMA_VERSION {
+    // `>=` used to be the whole gate, which silently treated a *newer* database
+    // as up to date: written by a build we do not understand, and then written to
+    // by us. A future schema must be an explicit refusal; equality is the only
+    // success. `SchemaIncompatible` maps to `InvalidState`, so callers surface it
+    // as a user-visible "upgrade (or stop) the other build" rather than an
+    // internal error.
+    if current_version > LATEST_SCHEMA_VERSION {
+        return Err(RepositoryError::SchemaIncompatible {
+            reason: format!(
+                "database schema v{current_version} was written by a newer build \
+                 (this build supports up to v{LATEST_SCHEMA_VERSION})"
+            ),
+        });
+    }
+    if current_version == LATEST_SCHEMA_VERSION {
         return Ok(());
     }
     if current_version < 1 {

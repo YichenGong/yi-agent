@@ -378,13 +378,26 @@ build_desktop() {
   # --config 注入版本与收窄 bundle.targets，不改任何仓库文件
   # （tauri.conf.json 里版本写死 0.1.0，targets 默认 "all" 会多产 updater 物）。
   # beforeBuildCommand = "npm run build"，前端构建由 tauri 自动触发。
+  #
+  # 只出 app：dmg 必须在 finalize 之后从成品 .app 生成，否则打进去的是
+  # 清单缺失或 digest 对不上的旧快照。
   ( cd "$DESKTOP_DIR" && npm run tauri -- build \
-      --config "{\"version\":\"$VERSION\",\"bundle\":{\"targets\":[\"app\",\"dmg\"]}}" )
+      --config "{\"version\":\"$VERSION\",\"bundle\":{\"targets\":[\"app\"]}}" )
 
   local app_src="$DESKTOP_DIR/src-tauri/target/release/bundle/macos/yi-agent.app"
   [ -d "$app_src" ] || die "未产出 $app_src"
+
+  # finalize：先签 sidecar → 写 runtime-sidecar.json（含最终 digest）→ 签外层
+  # app → verify 并复核 digest。桌面壳靠这份清单证明「要跑的 daemon 就是我
+  # 发的那个」，顺序错了清单就是废纸。
+  bash "$DESKTOP_DIR/scripts/finalize-runtime-bundle.sh" "$app_src"
+
+  local dmg_src="$DESKTOP_DIR/src-tauri/target/release/bundle/dmg"
+  mkdir -p "$dmg_src"
+  hdiutil create -volname "yi-agent" -srcfolder "$app_src" \
+    -ov -format UDZO "$dmg_src/yi-agent_${VERSION}_aarch64.dmg" >/dev/null
   echo "App  -> $app_src"
-  ls -1 "$DESKTOP_DIR/src-tauri/target/release/bundle/dmg/" 2>/dev/null | sed 's/^/dmg  -> /' || true
+  ls -1 "$dmg_src" 2>/dev/null | sed 's/^/dmg  -> /' || true
 
   # 替换 /Applications。
   #

@@ -2,6 +2,7 @@
 mod bridge;
 #[cfg(desktop)]
 mod remote;
+mod runtime_manifest;
 #[cfg(desktop)]
 pub mod window;
 

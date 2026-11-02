@@ -28,8 +28,8 @@ use yi_agent_core::Provider;
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{
-    AgentAction, Cli, Command, DaemonAction, FlagsAction, PairAction, ResidentAction,
-    ScheduleAction,
+    AgentAction, Cli, Command, DaemonAction, FlagsAction, InternalRuntimeAction, PairAction,
+    ResidentAction, ScheduleAction,
 };
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
@@ -97,6 +97,9 @@ fn main() -> Result<()> {
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
         Some(Command::Flags { ref action }) => run_flags(action),
+        Some(Command::InternalRuntime { ref action }) => match action {
+            InternalRuntimeAction::Identity { json } => run_internal_identity(*json),
+        },
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {
@@ -297,6 +300,35 @@ fn run_flags(action: &FlagsAction) -> Result<()> {
     };
     if code != 0 {
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Report this executable's static artifact identity.
+///
+/// Reads no configuration, opens no database, and starts nothing: it is what the
+/// packaging pipeline and the bundle-manifest generator ask on a machine where no
+/// runtime exists. `--json` is the machine form; the human form is for debugging
+/// a version mismatch by hand.
+fn run_internal_identity(json: bool) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let identity = build_info::artifact_identity(&executable);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&identity)?);
+    } else {
+        println!("build id          {}", identity.build_id);
+        println!("display version   {}", identity.display_version);
+        println!("executable        {}", identity.executable.display());
+        println!(
+            "schema range      {}..{}",
+            identity.schema_min, identity.schema_max
+        );
+        println!(
+            "business protocol {}..{}",
+            identity.business_protocol_min, identity.business_protocol_max
+        );
+        println!("handover version  {}", identity.handover_version);
+        println!("capabilities      {}", identity.capabilities.join(", "));
     }
     Ok(())
 }
