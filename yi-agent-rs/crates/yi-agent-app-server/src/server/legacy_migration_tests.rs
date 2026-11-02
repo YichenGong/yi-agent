@@ -140,11 +140,18 @@ fn the_lead_tick_arm_is_gated_by_the_flag() {
 /// ② 迁移函数的**文档注释**里提到了那个即将被删的 crate 名(说明为何用字面量
 /// 而不是引用它),那是 prose 而非依赖,不该被当成命中。
 fn production_source() -> String {
-    let source = include_str!("../server.rs");
-    let production = source
+    // 搬移（wave2 C2 batch 8）后 `run` / `serve_stdio_with_relay` 在
+    // `server/transport/scoped.rs`，迁移调用点跟着走了。两段都要读：本文件的断言
+    // 问的是「生产入口有没有调」，与代码落在哪个文件无关。
+    //
+    // 逐文件截断再拼接：`#[cfg(test)]` 标记只在 `server.rs` 里，若先拼接再
+    // split，`scoped.rs` 会被并进"测试之后"的那一半而整段丢失。
+    let own = include_str!("../server.rs")
         .split("#[cfg(test)]\nmod legacy_migration_tests")
         .next()
         .expect("this module must exist");
+    let entries = include_str!("../server/transport/scoped.rs");
+    let production = format!("{own}\n{entries}");
     production
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
