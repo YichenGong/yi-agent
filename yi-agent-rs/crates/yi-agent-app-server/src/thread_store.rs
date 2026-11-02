@@ -749,7 +749,7 @@ impl ThreadStore {
                     }
                     pending_turn = true;
                 }
-                self.promote_partial_strict(id)?;
+                self.promote_partial_strict(id, committed)?;
             }
         }
 
@@ -782,17 +782,19 @@ impl ThreadStore {
 
     /// partial 的严格升格：append 成功才清；append 失败保留 partial 并报错。
     ///
-    /// 与 [`Self::promote_partial`] 共用 [`Self::partial_is_committed`] 判据，故重复
-    /// 调用幂等；区别只在错误不吞。
-    fn promote_partial_strict(&self, id: &str) -> io::Result<()> {
+    /// `committed` 由调用方用**严格读出的**主日志 items 经
+    /// [`Self::partial_is_committed`] 算好传入。刻意不在本函数里重读：宽松的
+    /// [`Self::read_log`] 会吞掉坏行，用它判断「这轮是否已 append」正是严格入口
+    /// 不该做的推断（spec §7「严格读取必须返回真实错误，不 validate 后再调宽松
+    /// load」）。判据本身仍与宽松入口共用，故两边语义不会漂移。
+    ///
+    /// 幂等：`committed == true`（该轮已进主日志，只是上次清 partial 失败）时只
+    /// 再清一次，绝不重复 append。
+    fn promote_partial_strict(&self, id: &str, committed: bool) -> io::Result<()> {
         let Some(partial) = self.read_partial_strict(id)? else {
             return Ok(());
         };
-        if partial.items.is_empty() {
-            return self.clear_partial(id);
-        }
-        let (log_items, _, _, _) = self.read_log(id);
-        if Self::partial_is_committed(&partial, &log_items) {
+        if partial.items.is_empty() || committed {
             return self.clear_partial(id);
         }
         self.append_turn(
@@ -2065,6 +2067,111 @@ mod tests {
         let partial = store.partial_path("thread-1");
         std::fs::create_dir_all(&partial).unwrap();
         assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_does_not_duplicate_the_append_when_only_the_clear_failed() {
+        // 计划要求的那条精确路径：**append 成功、clear 失败**。用 immutable 位让
+        // 删除失败（与「partial 是目录」不同，那种在 append 之前就失败了）。
+        // 关键断言是重试幂等：第二次读必须认出「这轮已进主日志」，不再 append。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        store
+            .write_partial(
+                "thread-1",
+                &PartialTurn {
+                    turn_id: "t1".into(),
+                    items: vec![restore_user_item("user-t1", "hi")],
+                    messages: vec![Message::user("hi")],
+                    usage: None,
+                    usage_total: None,
+                },
+            )
+            .unwrap();
+
+        let partial = store.partial_path("thread-1");
+        let c = std::ffi::CString::new(partial.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::chflags(c.as_ptr(), libc::UF_IMMUTABLE) },
+            0,
+            "the test needs the partial to resist deletion"
+        );
+
+        let error = store
+            .restore_for_driver("thread-1", dir.path())
+            .expect_err("a clear that cannot happen must be an error");
+        assert!(
+            partial.exists(),
+            "the checkpoint must survive a failed clear: {error}"
+        );
+        // append 确实发生了：主日志现在有整整一轮。
+        assert_eq!(
+            std::fs::read_to_string(store.log_path("thread-1"))
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "the turn must have been promoted before the clear failed"
+        );
+
+        // 放开不可变位后重试：判据命中「已收尾」⇒ 只清 partial，绝不重复 append。
+        assert_eq!(
+            unsafe { libc::chflags(c.as_ptr(), 0) },
+            0,
+            "the test must restore the partial"
+        );
+        let reloaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !partial.exists(),
+            "the retry must finally clear the checkpoint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.log_path("thread-1"))
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "a retry must never append the same turn twice"
+        );
+        // 第一次读采纳了真实内容（pending_turn 标记它曾是未收尾轮）。
+        assert!(reloaded.messages.iter().any(|m| m == &Message::user("hi")));
+    }
+
+    #[test]
+    fn driver_restore_leaves_the_partial_when_the_append_fails() {
+        // append 失败（主日志路径是个目录）时，partial 是这一轮唯一的副本，
+        // 必须原样留着：既不清、也不报成功。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        std::fs::create_dir_all(store.log_path("thread-1")).unwrap();
+        store
+            .write_partial(
+                "thread-1",
+                &PartialTurn {
+                    turn_id: "t1".into(),
+                    items: vec![restore_user_item("user-t1", "hi")],
+                    messages: vec![Message::user("hi")],
+                    usage: None,
+                    usage_total: None,
+                },
+            )
+            .unwrap();
+        let before = std::fs::read(store.partial_path("thread-1")).unwrap();
+
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(store.partial_path("thread-1")).unwrap(),
+            before,
+            "a failed append must not consume the only copy of the turn"
+        );
     }
 
     #[test]
