@@ -969,8 +969,8 @@ async fn think_phase(
                     // are capacity/transport conditions, so resending the same
                     // request is the standard remedy. Deterministic failures
                     // (InvalidRequest, Auth) get no such treatment.
-                    if let Some(cause) = retryable_provider_error_cause(&e) {
-                        if stall_retries < config.provider_error_retry_limit {
+                    if let Some(cause) = retryable_provider_error_cause(&e)
+                        && stall_retries < config.provider_error_retry_limit {
                             stall_retries += 1;
                             let delay =
                                 stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
@@ -1008,7 +1008,6 @@ async fn think_phase(
                             }
                             continue;
                         }
-                    }
                     if tx
                         .send(AgentEvent::Error(AgentError::Provider(e)))
                         .await
@@ -1075,44 +1074,44 @@ async fn think_phase(
             StreamEnd::Failed(ProviderError::Network(_)) => Some(RetryCause::RequestTimeout),
             _ => None,
         };
-        if let Some(cause) = retry_cause {
-            if stall_retries < config.think_stall_retry_limit {
-                stall_retries += 1;
-                let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
-                let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
-                tracing::warn!(
-                    turn,
-                    attempt = stall_retries,
-                    max = config.think_stall_retry_limit,
-                    delay_ms = delay.as_millis() as u64,
-                    ?cause,
-                    "think phase failed transiently; retrying after backoff"
-                );
-                // Surface the retry: a silent backoff looks like a hang.
-                if tx
-                    .send(AgentEvent::ProviderRetry {
-                        attempt: stall_retries,
-                        max: config.think_stall_retry_limit,
-                        idle_secs,
-                        cause,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = cancel_token.cancelled() => {
-                        info!(turn, "agent loop cancelled during retry backoff");
-                        // Same policy as the other cancel points: keep the
-                        // run's user prompt and completed round-trips.
-                        abort_run(tx, inbox, session).await;
-                        return ThinkOutcome::Stopped;
-                    }
-                }
-                continue;
+        if let Some(cause) = retry_cause
+            && stall_retries < config.think_stall_retry_limit
+        {
+            stall_retries += 1;
+            let delay = stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+            let idle_secs = config.think_idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
+            tracing::warn!(
+                turn,
+                attempt = stall_retries,
+                max = config.think_stall_retry_limit,
+                delay_ms = delay.as_millis() as u64,
+                ?cause,
+                "think phase failed transiently; retrying after backoff"
+            );
+            // Surface the retry: a silent backoff looks like a hang.
+            if tx
+                .send(AgentEvent::ProviderRetry {
+                    attempt: stall_retries,
+                    max: config.think_stall_retry_limit,
+                    idle_secs,
+                    cause,
+                })
+                .await
+                .is_err()
+            {
+                return ThinkOutcome::Stopped; // Receiver dropped, stop the loop
             }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel_token.cancelled() => {
+                    info!(turn, "agent loop cancelled during retry backoff");
+                    // Same policy as the other cancel points: keep the
+                    // run's user prompt and completed round-trips.
+                    abort_run(tx, inbox, session).await;
+                    return ThinkOutcome::Stopped;
+                }
+            }
+            continue;
         }
         break attempt;
     };
@@ -1131,13 +1130,13 @@ async fn think_phase(
     // reset, ...) is terminal. Retryable timeouts never reach here: they
     // either succeeded on a later attempt or exhausted the retry budget,
     // in which case the terminal reason below explains it.
-    if let StreamEnd::Failed(error) = &end {
-        if !matches!(error, ProviderError::Network(_)) {
-            let _ = tx
-                .send(AgentEvent::Error(AgentError::Provider(error.clone())))
-                .await;
-            return ThinkOutcome::Stopped;
-        }
+    if let StreamEnd::Failed(error) = &end
+        && !matches!(error, ProviderError::Network(_))
+    {
+        let _ = tx
+            .send(AgentEvent::Error(AgentError::Provider(error.clone())))
+            .await;
+        return ThinkOutcome::Stopped;
     }
 
     // An exhausted transient failure is terminal and its partial must NOT
@@ -1563,21 +1562,21 @@ async fn run_loop(
         }
 
         turn += 1;
-        if let Some(max) = config.max_turns {
-            if turn > max {
-                info!(turn, max, "agent loop reached max turns");
-                flush_unconsumed(&tx, &inbox).await;
-                if tx
-                    .send(AgentEvent::Done {
-                        reason: DoneReason::MaxTurns,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return; // Receiver dropped, stop the loop
-                }
-                return;
+        if let Some(max) = config.max_turns
+            && turn > max
+        {
+            info!(turn, max, "agent loop reached max turns");
+            flush_unconsumed(&tx, &inbox).await;
+            if tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::MaxTurns,
+                })
+                .await
+                .is_err()
+            {
+                return; // Receiver dropped, stop the loop
             }
+            return;
         }
 
         // Fold in anything the user sent while the previous request/tools ran.
@@ -2816,7 +2815,7 @@ mod tests {
                 received.push_str(&t);
                 count += 1;
                 // Model a UI that renders more slowly than the provider emits.
-                if count % 16 == 0 {
+                if count.is_multiple_of(16) {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
             }

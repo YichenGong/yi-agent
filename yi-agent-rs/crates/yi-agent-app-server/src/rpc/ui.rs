@@ -346,20 +346,18 @@ pub(crate) async fn handle(
             // 文件，故两条路径都走 settings_store 的读-改-写。
             // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
             // 类型）不改动既有配置——静默清除是破坏性的。
-            if let Some(value) = req.params.get("relay_url") {
-                if value.is_null() || value.is_string() {
-                    let workdir = state.theme_handle.workdir();
-                    if let Err(error) =
-                        crate::settings_store::save_relay_url(workdir, value.as_str())
-                    {
-                        write_response(
-                            state.hub,
-                            state.client,
-                            err_response(id, RpcError::internal(error.to_string())),
-                        )
-                        .await?;
-                        return Ok(Flow::Continue);
-                    }
+            if let Some(value) = req.params.get("relay_url")
+                && (value.is_null() || value.is_string())
+            {
+                let workdir = state.theme_handle.workdir();
+                if let Err(error) = crate::settings_store::save_relay_url(workdir, value.as_str()) {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(error.to_string())),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
                 }
             }
 

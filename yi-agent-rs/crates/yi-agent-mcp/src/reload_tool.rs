@@ -68,12 +68,11 @@ impl McpReloadTool {
             Ok(r) => r,
             Err(e) => return ToolResult::error(e),
         };
-        if req.action == ReloadAction::Add {
-            if let Some(sc) = req.spec.as_ref() {
-                if let Err(e) = self.check_command(sc) {
-                    return ToolResult::error(e);
-                }
-            }
+        if req.action == ReloadAction::Add
+            && let Some(sc) = req.spec.as_ref()
+            && let Err(e) = self.check_command(sc)
+        {
+            return ToolResult::error(e);
         }
 
         let mut cfg = match McpConfig::load(&self.workdir) {

@@ -627,31 +627,31 @@ impl ThreadStore {
         // （= 该轮未成功收尾）时采纳。首个 item 是本轮提问 `user-<turn_id>`，
         // 全局唯一，足以判断"这轮是否已 append"。
         let mut pending_turn = false;
-        if let Some(partial) = self.read_partial(id) {
-            if !Self::partial_is_committed(&partial, &items) {
-                for item in partial.items {
-                    // 防御性去重：正常不与已落盘 items 重叠。
-                    if !items
-                        .iter()
-                        .any(|it| crate::server::item_id(it) == crate::server::item_id(&item))
-                    {
-                        items.push(item);
-                    }
+        if let Some(partial) = self.read_partial(id)
+            && !Self::partial_is_committed(&partial, &items)
+        {
+            for item in partial.items {
+                // 防御性去重：正常不与已落盘 items 重叠。
+                if !items
+                    .iter()
+                    .any(|it| crate::server::item_id(it) == crate::server::item_id(&item))
+                {
+                    items.push(item);
                 }
-                if !partial.messages.is_empty() {
-                    messages = partial.messages;
-                }
-                // 未收尾的轮次同样计入累计（它已经真实发生过）。
-                if let Some(total) = &partial.usage_total {
-                    totals.add_turn_usage(total);
-                } else if let Some(last) = &partial.usage {
-                    totals.add_turn_usage(last);
-                }
-                if partial.usage.is_some() {
-                    usage = partial.usage;
-                }
-                pending_turn = true;
             }
+            if !partial.messages.is_empty() {
+                messages = partial.messages;
+            }
+            // 未收尾的轮次同样计入累计（它已经真实发生过）。
+            if let Some(total) = &partial.usage_total {
+                totals.add_turn_usage(total);
+            } else if let Some(last) = &partial.usage {
+                totals.add_turn_usage(last);
+            }
+            if partial.usage.is_some() {
+                usage = partial.usage;
+            }
+            pending_turn = true;
         }
 
         Ok(Some(LoadedThread {
@@ -1061,13 +1061,14 @@ impl ThreadStore {
         let mut wrote = false;
         self.update_meta(id, |meta| {
             meta.updated_at = now_millis();
-            if !is_lead_meta(meta) && meta.title.is_none() {
-                if let Some(hint) = title_hint {
-                    let t = title_from(hint);
-                    if !t.is_empty() {
-                        meta.title = Some(t);
-                        wrote = true;
-                    }
+            if !is_lead_meta(meta)
+                && meta.title.is_none()
+                && let Some(hint) = title_hint
+            {
+                let t = title_from(hint);
+                if !t.is_empty() {
+                    meta.title = Some(t);
+                    wrote = true;
                 }
             }
         })?;

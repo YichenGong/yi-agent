@@ -44,14 +44,14 @@ pub fn default_branch(project: &Path) -> String {
         .arg(project)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Some(name) = text.strip_prefix("origin/") {
-                if !name.is_empty() {
-                    return name.to_string();
-                }
-            }
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Some(name) = text.strip_prefix("origin/")
+            && !name.is_empty()
+        {
+            return name.to_string();
         }
     }
     "main".to_string()

@@ -66,58 +66,58 @@ where
 
         match ty {
             "response.output_text.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    if !delta.is_empty() {
-                        events.push(ProviderEvent::TextDelta(delta.to_string()));
-                    }
+                if let Some(delta) = data.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    events.push(ProviderEvent::TextDelta(delta.to_string()));
                 }
             }
             "response.reasoning_text.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    if !delta.is_empty() {
-                        events.push(ProviderEvent::ReasoningDelta {
-                            text: delta.to_string(),
-                            kind: ReasoningKind::Content,
-                        });
-                    }
+                if let Some(delta) = data.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    events.push(ProviderEvent::ReasoningDelta {
+                        text: delta.to_string(),
+                        kind: ReasoningKind::Content,
+                    });
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    if !delta.is_empty() {
-                        events.push(ProviderEvent::ReasoningDelta {
-                            text: delta.to_string(),
-                            kind: ReasoningKind::Summary,
-                        });
-                    }
+                if let Some(delta) = data.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    events.push(ProviderEvent::ReasoningDelta {
+                        text: delta.to_string(),
+                        kind: ReasoningKind::Summary,
+                    });
                 }
             }
             "response.output_item.added" => {
-                if let Some(item) = data.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-                        if !item_id.is_empty() && !call_id.is_empty() {
-                            self.call_ids
-                                .insert(item_id.to_string(), call_id.to_string());
-                        }
-                        if !call_id.is_empty() && !name.is_empty() {
-                            events.push(ProviderEvent::ToolUseStart {
-                                id: call_id.to_string(),
-                                name: name.to_string(),
-                            });
-                        } else {
-                            tracing::warn!(
-                                provider = "openai-responses",
-                                item_id,
-                                call_id,
-                                "function_call item missing call_id or name"
-                            );
-                        }
+                if let Some(item) = data.get("item")
+                    && item.get("type").and_then(Value::as_str) == Some("function_call")
+                {
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    if !item_id.is_empty() && !call_id.is_empty() {
+                        self.call_ids
+                            .insert(item_id.to_string(), call_id.to_string());
+                    }
+                    if !call_id.is_empty() && !name.is_empty() {
+                        events.push(ProviderEvent::ToolUseStart {
+                            id: call_id.to_string(),
+                            name: name.to_string(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            provider = "openai-responses",
+                            item_id,
+                            call_id,
+                            "function_call item missing call_id or name"
+                        );
                     }
                 }
             }
@@ -128,13 +128,13 @@ where
                     .unwrap_or_default();
                 match self.call_ids.get(item_id) {
                     Some(call_id) => {
-                        if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                            if !delta.is_empty() {
-                                events.push(ProviderEvent::ToolUseDelta {
-                                    id: call_id.clone(),
-                                    partial_json: delta.to_string(),
-                                });
-                            }
+                        if let Some(delta) = data.get("delta").and_then(Value::as_str)
+                            && !delta.is_empty()
+                        {
+                            events.push(ProviderEvent::ToolUseDelta {
+                                id: call_id.clone(),
+                                partial_json: delta.to_string(),
+                            });
                         }
                     }
                     None => {
@@ -149,33 +149,32 @@ where
             }
             "response.output_item.done" => {
                 if let Some(item) = data.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                        if let Some(enc) = item
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning")
+                        && let Some(enc) = item
                             .get("encrypted_content")
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty())
-                        {
-                            // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
-                            // 供下一轮回放——回放时该字段必须显式在场。
-                            let summary: Vec<Value> = item
-                                .get("summary")
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            // 展示用明文：同一份数组按序拼出各段 `text`。
-                            // 只读不改——`summary` 本体必须保持上游原文。
-                            let text: String = summary
-                                .iter()
-                                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                                .collect();
-                            events.push(ProviderEvent::ThinkingBlock {
-                                text,
-                                token: yi_agent_core::ThinkingToken::Encrypted {
-                                    encrypted_content: enc.to_string(),
-                                    summary,
-                                },
-                            });
-                        }
+                    {
+                        // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
+                        // 供下一轮回放——回放时该字段必须显式在场。
+                        let summary: Vec<Value> = item
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        // 展示用明文：同一份数组按序拼出各段 `text`。
+                        // 只读不改——`summary` 本体必须保持上游原文。
+                        let text: String = summary
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect();
+                        events.push(ProviderEvent::ThinkingBlock {
+                            text,
+                            token: yi_agent_core::ThinkingToken::Encrypted {
+                                encrypted_content: enc.to_string(),
+                                summary,
+                            },
+                        });
                     }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();

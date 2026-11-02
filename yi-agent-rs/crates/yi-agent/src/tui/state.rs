@@ -115,16 +115,16 @@ impl RunningTaskRegistry {
     /// tools may already be finalized by ToolExit or ToolTimeout, so preserve
     /// their more specific terminal status.
     pub fn on_result(&mut self, id: &str, is_error: bool) {
-        if let Some(t) = self.tasks.get_mut(id) {
-            if t.status == TaskStatus::Running {
-                t.end_time = Some(Instant::now());
-                t.exit_code = None;
-                t.status = if is_error {
-                    TaskStatus::Failed
-                } else {
-                    TaskStatus::Done
-                };
-            }
+        if let Some(t) = self.tasks.get_mut(id)
+            && t.status == TaskStatus::Running
+        {
+            t.end_time = Some(Instant::now());
+            t.exit_code = None;
+            t.status = if is_error {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Done
+            };
         }
     }
 

@@ -38,10 +38,10 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Some(pgid) = self.pgid {
-                crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
-            }
+        if self.armed
+            && let Some(pgid) = self.pgid
+        {
+            crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
         }
     }
 }
@@ -489,10 +489,10 @@ impl Tool for BashTool {
             let exit = exit_code.unwrap_or(-1);
             // Only a successful standalone cd can change our persistent cwd.
             // A cd embedded in a shell expression may not run at all.
-            if exit == 0 {
-                if let Some(new_cwd) = parse_standalone_cd_target(&args.command, &cwd) {
-                    self.ctx.set_cwd(new_cwd);
-                }
+            if exit == 0
+                && let Some(new_cwd) = parse_standalone_cd_target(&args.command, &cwd)
+            {
+                self.ctx.set_cwd(new_cwd);
             }
             ToolResult::text(format!(
                 "exit: {}\nstdout:\n{}\nstderr:\n{}",

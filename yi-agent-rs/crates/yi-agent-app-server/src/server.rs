@@ -3009,11 +3009,10 @@ where
                 // （`--relay` 的环回桥走同一个 `serve_ws_body`），所以这一个判据
                 // 同时覆盖手机直连与经 relay 连接，不需要按传输方式分支。
                 // 注意：畸形帧也刷新——它同样证明「有人正在指挥我」。
-                if client != crate::broadcast::ClientId::local() {
-                    if let Some(stamp) = power_clock.now() {
+                if client != crate::broadcast::ClientId::local()
+                    && let Some(stamp) = power_clock.now() {
                         last_remote_touch = Some(stamp);
                     }
-                }
                 // 早退守卫:某客户端(如被 `device/revoke` 踢掉、或被广播背压
                 // 摘除)在断连后仍可能有一帧已在 channel 里排队。它已经不在 hub
                 // 上,任何按它寻址的响应都写不出去;在主循环里处理它只会走到
@@ -3700,14 +3699,13 @@ where
                     // 张冠李戴(把下一次的回复回填给这一次的 request_id)。
                     // 摘的是**这一条** id(而非队尾):与收口路径同一口径,不依赖
                     // 「刚 push 的一定在末尾」这条隐含前提。
-                    if let Some(request_id) = &envelope.request_id {
-                        if let Some(ids) = pending_lead_replies.get_mut(&lead_thread_id) {
+                    if let Some(request_id) = &envelope.request_id
+                        && let Some(ids) = pending_lead_replies.get_mut(&lead_thread_id) {
                             ids.retain(|id| id != request_id);
                             if ids.is_empty() {
                                 pending_lead_replies.remove(&lead_thread_id);
                             }
                         }
-                    }
                 }
             }
             cmd = lead_control_rx.recv() => {
@@ -4003,10 +4001,10 @@ impl DeltaCoalescer {
                     .insert(thread.to_string(), (item_id.to_string(), delta.to_string()));
             }
         }
-        if self.pending.get(thread).map(|(_, t)| t.len()).unwrap_or(0) >= Self::FLUSH_BYTES {
-            if let Some(p) = self.pending.remove(thread) {
-                out.push(p);
-            }
+        if self.pending.get(thread).map(|(_, t)| t.len()).unwrap_or(0) >= Self::FLUSH_BYTES
+            && let Some(p) = self.pending.remove(thread)
+        {
+            out.push(p);
         }
         out
     }
@@ -4398,10 +4396,10 @@ pub(crate) async fn interrupt_and_wait_for_persist(
             lead_request_id,
         }) = turn_rx.recv().await
         {
-            if let Some(s) = threads.get_mut(&done_id) {
-                if s.active_turn_id.as_deref() == Some(done_turn.as_str()) {
-                    s.active_turn_id = None;
-                }
+            if let Some(s) = threads.get_mut(&done_id)
+                && s.active_turn_id.as_deref() == Some(done_turn.as_str())
+            {
+                s.active_turn_id = None;
             }
             // 这枚完成事件不会回到主循环了,它的回填机会就在此处(见函数说明)。
             // 同样只认事件自己携带的身份:别的 thread 的那一轮与这里的等待方无关。
@@ -4555,10 +4553,10 @@ async fn persist_and_finish_turn(
         // `SetPreserveThinking`）不改变可见内容集合，写 `None` 会把「有 items」
         // 误报成「从未有过 item」，从而永久削弱 `listAll` 的「是否落后」信号。
         // 真正清空内容的 `clear` 路径在它的调用点显式清游标（见下）。
-        if let Some(last) = record_last_item_id(&record) {
-            if let Err(e) = store.set_last_item_id(thread_id, Some(&last)) {
-                eprintln!("[app-server] failed to record last_item_id for {thread_id}: {e}");
-            }
+        if let Some(last) = record_last_item_id(&record)
+            && let Err(e) = store.set_last_item_id(thread_id, Some(&last))
+        {
+            eprintln!("[app-server] failed to record last_item_id for {thread_id}: {e}");
         }
         if let Some(prompt) = user_prompt {
             // 标题已在 turn 开始时（`run_thread_driver` 收到输入后）由
@@ -4581,10 +4579,10 @@ async fn persist_and_finish_turn(
     //
     // 只在 `turn_id.is_some()` 时写：`clear` / `compact` / `SetPreserveThinking`
     // 收尾传 `None`，它们不是回合结束，记下去会让刚清空上下文的会话凭空亮蓝点。
-    if turn_id.is_some() {
-        if let Err(e) = store.mark_turn_completed(thread_id, completed_at) {
-            eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
-        }
+    if turn_id.is_some()
+        && let Err(e) = store.mark_turn_completed(thread_id, completed_at)
+    {
+        eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
     }
 
     // 广播「本轮已落盘」：delete/interrupt 路径靠这枚 Finished 判定落盘完成。
@@ -5220,40 +5218,37 @@ pub(crate) async fn run_thread_driver(
 
         // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
         // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
-        if let Some(mcp) = &mcp {
-            if mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix()) {
-                let report = mcp.reload(&mcp_workdir, yi_agent_mcp::now_unix()).await;
-                for s in &report.servers {
-                    if let Some(err) = &s.error {
-                        tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
-                    }
+        if let Some(mcp) = &mcp
+            && mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix())
+        {
+            let report = mcp.reload(&mcp_workdir, yi_agent_mcp::now_unix()).await;
+            for s in &report.servers {
+                if let Some(err) = &s.error {
+                    tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
                 }
-                let mut refreshed = (*agent.tools()).clone();
-                mcp.refresh_registry(&mut refreshed);
-                let next_config = agent.config().clone();
-                let session_handle = agent.session_handle();
-                let permission = agent.permission_checker();
-                let decision = agent.decision_rx();
-                let mut rebuilt = yi_agent_core::Agent::new(
-                    Arc::clone(&provider),
-                    Arc::new(refreshed),
-                    next_config,
-                )
-                .with_session_arc(session_handle);
-                if let (Some(checker), Some(rx)) = (permission, decision) {
-                    rebuilt = rebuilt.with_permission(checker, rx);
-                }
-                agent = rebuilt;
-                tracing::info!("MCP config changed on disk; thread registry reloaded");
             }
+            let mut refreshed = (*agent.tools()).clone();
+            mcp.refresh_registry(&mut refreshed);
+            let next_config = agent.config().clone();
+            let session_handle = agent.session_handle();
+            let permission = agent.permission_checker();
+            let decision = agent.decision_rx();
+            let mut rebuilt =
+                yi_agent_core::Agent::new(Arc::clone(&provider), Arc::new(refreshed), next_config)
+                    .with_session_arc(session_handle);
+            if let (Some(checker), Some(rx)) = (permission, decision) {
+                rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            agent = rebuilt;
+            tracing::info!("MCP config changed on disk; thread registry reloaded");
         }
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
         // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
-        if let Some(handle) = &catalog {
-            if let Some(new_prompt) = handle.current_system_prompt() {
-                agent.set_system_prompt(Some(new_prompt));
-            }
+        if let Some(handle) = &catalog
+            && let Some(new_prompt) = handle.current_system_prompt()
+        {
+            agent.set_system_prompt(Some(new_prompt));
         }
 
         let mut stream = match agent.run_blocks(blocks).await {
@@ -5482,15 +5477,14 @@ pub(crate) async fn run_thread_driver(
                                         // 非 delta 通知：先刷**它自己 thread** 的待发
                                         // delta（若有），再发这条通知。无订阅者时
                                         // 缓冲恒空，这里是 no-op、字节不变。
-                                        if let Some(t) = n.thread_key() {
-                                            if let Some((pid, text)) = coalescer.take(t) {
+                                        if let Some(t) = n.thread_key()
+                                            && let Some((pid, text)) = coalescer.take(t) {
                                                 to_send.push(Notification::ItemDelta {
                                                     thread_id: t.to_string(),
                                                     item_id: pid,
                                                     delta: text,
                                                 });
                                             }
-                                        }
                                         to_send.push(n.clone());
                                     }
                                 }
@@ -6013,19 +6007,19 @@ async fn driver_tick<F>(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                if let Some(answer) = answer {
-                    if !crate::session_driver::is_explicit_no_action(&answer) {
-                        let keys = match answer.as_object() {
-                            Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
-                            None => "<not a JSON object>".to_string(),
-                        };
-                        eprintln!(
-                            "[app-server] driver tick: {log_plugin} for {} answered driver/next \
+                if let Some(answer) = answer
+                    && !crate::session_driver::is_explicit_no_action(&answer)
+                {
+                    let keys = match answer.as_object() {
+                        Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+                        None => "<not a JSON object>".to_string(),
+                    };
+                    eprintln!(
+                        "[app-server] driver tick: {log_plugin} for {} answered driver/next \
                              with a shape the host cannot parse (top-level keys: {keys}), so this \
                              tick did nothing",
-                            log_project.display()
-                        );
-                    }
+                        log_project.display()
+                    );
                 }
             }
         }
@@ -6250,12 +6244,11 @@ where
         // 侧栏显示的名片:插件给的 `看板 · <spec stem>`。不设的话,这个会话在
         // 首轮落盘前标题为空、用户只看到一串 thread id——「可见会话」就不成立了。
         // 失败只记日志:标题是展示层信息,不该让一个会话起不来。
-        if !title.is_empty() {
-            if let Some(session) = self.threads.get(&thread_id) {
-                if let Err(error) = session.store.rename(&thread_id, title) {
-                    eprintln!("[app-server] could not title driven thread {thread_id}: {error}");
-                }
-            }
+        if !title.is_empty()
+            && let Some(session) = self.threads.get(&thread_id)
+            && let Err(error) = session.store.rename(&thread_id, title)
+        {
+            eprintln!("[app-server] could not title driven thread {thread_id}: {error}");
         }
 
         self.prepare_and_deliver(&thread_id, objective).await
@@ -6306,24 +6299,23 @@ where
                 let text = format!("[组长打回] {}", cmd.reason);
                 // 有活跃轮 → 走 interjection（与用户中途打字同一路径）；
                 // 无活跃轮 → 起一轮（spec §3.1）。
-                if let Some(session) = self.threads.get(&cmd.thread_id) {
-                    if let Some(turn_id) = session.active_turn_id.clone() {
-                        let interjection_id =
-                            format!("interject-{}-{}", turn_id, uuid::Uuid::new_v4());
-                        if session
-                            .interject_tx
-                            .send(crate::session::InterjectionRequest {
-                                turn_id,
-                                interjection_id,
-                                text,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Err("目标 driver 已退出".to_string());
-                        }
-                        return Ok(format!("已把打回指令并入 {} 的当前轮", cmd.thread_id));
+                if let Some(session) = self.threads.get(&cmd.thread_id)
+                    && let Some(turn_id) = session.active_turn_id.clone()
+                {
+                    let interjection_id = format!("interject-{}-{}", turn_id, uuid::Uuid::new_v4());
+                    if session
+                        .interject_tx
+                        .send(crate::session::InterjectionRequest {
+                            turn_id,
+                            interjection_id,
+                            text,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err("目标 driver 已退出".to_string());
                     }
+                    return Ok(format!("已把打回指令并入 {} 的当前轮", cmd.thread_id));
                 }
                 // 无活跃轮（或目标刚转为 idle）：起一轮，走 prepare_and_deliver。
                 self.prepare_and_deliver(&cmd.thread_id, &text)
@@ -6955,11 +6947,9 @@ pub(crate) async fn start_thread_core(
     // 成了一个普通会话。先探测再建,代价是一次 `meta.json` 读;`thread/start`
     // 每次都用新铸的 uuid,故该路径行为不变(仍然是建)。
     let already_persisted = thread_store.load(&thread_id).ok().flatten().is_some();
-    if !already_persisted {
-        if let Err(e) = thread_store.create(&meta) {
-            // 持久化是尽力而为:写失败不阻断 thread 创建。
-            eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
-        }
+    if !already_persisted && let Err(e) = thread_store.create(&meta) {
+        // 持久化是尽力而为:写失败不阻断 thread 创建。
+        eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
     }
     // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
     // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;

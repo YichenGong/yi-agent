@@ -163,10 +163,10 @@ async fn run_client_with_a_bad_local_token_never_delivers() {
     // 窗口内不应收到回显(本地认证失败,桥未建立)。
     let got = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(Ok(msg)) = phone.next().await {
-            if let ClientMessage::Text(t) = msg {
-                if t == "should-not-arrive" {
-                    return true;
-                }
+            if let ClientMessage::Text(t) = msg
+                && t == "should-not-arrive"
+            {
+                return true;
             }
         }
         false

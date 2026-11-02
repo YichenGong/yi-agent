@@ -772,15 +772,14 @@ impl RuntimeCoordinator {
             // A root runs in place, so it keeps no workspace row: its project is
             // validated against the durable attachment record, and the in-place
             // position is synthesized from the requested project.
-            if let Some(recorded) = existing.workspace_root.as_deref() {
-                if !self
+            if let Some(recorded) = existing.workspace_root.as_deref()
+                && !self
                     .factory
                     .project_workspace_matches(requested_workspace, &recorded_workspace(recorded))
-                {
-                    return Err(RuntimeCoordinatorError::Supervisor(
-                        "application root workspace does not match its recorded repository".into(),
-                    ));
-                }
+            {
+                return Err(RuntimeCoordinatorError::Supervisor(
+                    "application root workspace does not match its recorded repository".into(),
+                ));
             }
             let workspace = service
                 .read_only_workspace(None, &existing.root_task_id)

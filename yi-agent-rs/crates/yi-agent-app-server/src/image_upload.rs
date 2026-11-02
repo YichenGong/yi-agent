@@ -237,10 +237,10 @@ impl UploadRegistry {
 
         // staging 用完即弃；失败只记不报——文件已经安全落盘，残留一个 .tmp 不该
         // 让 commit 失败。
-        if let Err(e) = std::fs::remove_file(&session.staging) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[app-server] could not remove staging file {upload_id}: {e}");
-            }
+        if let Err(e) = std::fs::remove_file(&session.staging)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("[app-server] could not remove staging file {upload_id}: {e}");
         }
         session.state = UploadState::Committed(attachment.clone());
         Ok(attachment)
@@ -285,15 +285,14 @@ impl UploadRegistry {
     /// 丢弃一条会话（删 staging 与记录）。已落盘的附件**不动**：它已是该 thread
     /// 附件的一部分，删掉会让回放里的气泡指不到文件。
     pub fn abort(&mut self, upload_id: &str) {
-        if let Some(session) = self.sessions.remove(upload_id) {
-            if let Err(e) = std::fs::remove_file(&session.staging) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "[app-server] could not remove staging file {}: {e}",
-                        session.id
-                    );
-                }
-            }
+        if let Some(session) = self.sessions.remove(upload_id)
+            && let Err(e) = std::fs::remove_file(&session.staging)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[app-server] could not remove staging file {}: {e}",
+                session.id
+            );
         }
     }
 

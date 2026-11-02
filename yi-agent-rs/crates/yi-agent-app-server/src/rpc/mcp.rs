@@ -68,24 +68,23 @@ pub(crate) async fn handle(
                         .and_then(|v| v.as_str())
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
+                        && let Some(session) = state.threads.get(thread_id)
                     {
-                        if let Some(session) = state.threads.get(thread_id) {
-                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                            let sent = session
-                                .session_tx
-                                .send(crate::session::SessionCommand::ReloadMcp { reply: reply_tx })
-                                .await
-                                .is_ok();
-                            if sent {
-                                // 探测失败不该让写盘回错——写盘已经成功了。
-                                // 把失败降级为日志，响应里如实带上。
-                                if let Ok(Err(cause)) = reply_rx.await {
-                                    tracing::warn!(
-                                        %thread_id,
-                                        %cause,
-                                        "MCP reload after mcp/set reported probe failures"
-                                    );
-                                }
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let sent = session
+                            .session_tx
+                            .send(crate::session::SessionCommand::ReloadMcp { reply: reply_tx })
+                            .await
+                            .is_ok();
+                        if sent {
+                            // 探测失败不该让写盘回错——写盘已经成功了。
+                            // 把失败降级为日志，响应里如实带上。
+                            if let Ok(Err(cause)) = reply_rx.await {
+                                tracing::warn!(
+                                    %thread_id,
+                                    %cause,
+                                    "MCP reload after mcp/set reported probe failures"
+                                );
                             }
                         }
                     }

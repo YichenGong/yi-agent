@@ -34,10 +34,10 @@ pub fn version() -> &'static str {
 ///
 /// 测试可用 `YI_FLAGS_TODAY` 固定时间，避免「跨零点时测试忽然失败」。
 pub fn today() -> String {
-    if let Ok(fixed) = std::env::var("YI_FLAGS_TODAY") {
-        if !fixed.is_empty() {
-            return fixed;
-        }
+    if let Ok(fixed) = std::env::var("YI_FLAGS_TODAY")
+        && !fixed.is_empty()
+    {
+        return fixed;
     }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -56,10 +56,10 @@ impl Tool for WriteTool {
         };
 
         // Create parent dirs if needed.
-        if let Some(parent) = resolved.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolsError::Io(e).into();
-            }
+        if let Some(parent) = resolved.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return ToolsError::Io(e).into();
         }
 
         let bytes = args.content.as_bytes();

@@ -120,11 +120,11 @@ impl Tool for WebFetchTool {
         tracing::info!(tool = "web_fetch", status = %status, content_type = %content_type, "response received");
 
         // Check body size before reading
-        if let Some(len) = resp.content_length() {
-            if len > MAX_BODY_SIZE as u64 {
-                tracing::warn!(tool = "web_fetch", size = len, "response too large");
-                return ToolsError::ResponseTooLarge(len as usize).into();
-            }
+        if let Some(len) = resp.content_length()
+            && len > MAX_BODY_SIZE as u64
+        {
+            tracing::warn!(tool = "web_fetch", size = len, "response too large");
+            return ToolsError::ResponseTooLarge(len as usize).into();
         }
 
         let body = match resp.bytes().await {

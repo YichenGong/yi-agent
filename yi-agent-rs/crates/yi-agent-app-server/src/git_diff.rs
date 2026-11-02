@@ -275,15 +275,15 @@ pub fn resolve_base(
     explicit: Option<&str>,
     anchor: Option<&str>,
 ) -> (Option<String>, &'static str) {
-    if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        if ref_exists(repo, name) {
-            return (Some(name.to_string()), "explicit");
-        }
+    if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty())
+        && ref_exists(repo, name)
+    {
+        return (Some(name.to_string()), "explicit");
     }
-    if let Some(name) = anchor.map(str::trim).filter(|s| !s.is_empty()) {
-        if ref_exists(repo, name) {
-            return (Some(name.to_string()), "session");
-        }
+    if let Some(name) = anchor.map(str::trim).filter(|s| !s.is_empty())
+        && ref_exists(repo, name)
+    {
+        return (Some(name.to_string()), "session");
     }
     // 以下为既有候选链，逐字保留。
     // `refs/remotes/origin/HEAD` 是「远端默认分支」的权威指针。

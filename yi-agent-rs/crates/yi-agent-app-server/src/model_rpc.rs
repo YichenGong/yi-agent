@@ -222,21 +222,21 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
     // 一旦给了字符串就必须是已知值——未知值宁可报错，也不静默落盘一个打错的值
     // （`ApiStyle::parse` 会把未知值吞成 `auto`，那是解析期的语义，不是写入期的）。
     let api_style = optional_string_field(params, "api_style");
-    if let Some(v) = &api_style {
-        if !matches!(v.as_str(), "auto" | "responses" | "chat") {
-            return Err(RpcError::invalid_model(
-                "api_style must be auto|responses|chat",
-            ));
-        }
+    if let Some(v) = &api_style
+        && !matches!(v.as_str(), "auto" | "responses" | "chat")
+    {
+        return Err(RpcError::invalid_model(
+            "api_style must be auto|responses|chat",
+        ));
     }
     let reasoning_effort = optional_string_field(params, "reasoning_effort");
-    if let Some(v) = &reasoning_effort {
-        if !matches!(
+    if let Some(v) = &reasoning_effort
+        && !matches!(
             v.as_str(),
             "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        ) {
-            return Err(RpcError::invalid_model("unknown reasoning_effort"));
-        }
+        )
+    {
+        return Err(RpcError::invalid_model("unknown reasoning_effort"));
     }
 
     // Key semantics: absent (or `null`) keeps the stored value; `""` clears it;

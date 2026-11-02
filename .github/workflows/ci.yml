@@ -14,6 +14,10 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # msrv-check 要用 Cargo.toml 声明的 rust-version 真编译一遍；
+          # 只装 stable 会让该门禁因「缺工具链」而红（那不是有 bug，是没装）。
+          toolchains: stable,1.89.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

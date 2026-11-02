@@ -171,17 +171,13 @@ impl PermissionChecker {
         tool_input: &serde_json::Value,
     ) -> CheckResult {
         // 黑名单对直接 shell 和后台进程启动命令都生效。
-        if matches!(tool_name, "bash" | "process_start") {
-            if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
-                if let Some(reason) = (self.blocklist_fn)(cmd) {
-                    let request = self.build_request(
-                        tool_name,
-                        tool_input,
-                        PermissionKind::Blacklisted(reason),
-                    );
-                    return CheckResult::Blacklisted(request);
-                }
-            }
+        if matches!(tool_name, "bash" | "process_start")
+            && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
+            && let Some(reason) = (self.blocklist_fn)(cmd)
+        {
+            let request =
+                self.build_request(tool_name, tool_input, PermissionKind::Blacklisted(reason));
+            return CheckResult::Blacklisted(request);
         }
         CheckResult::Allow
     }
@@ -373,10 +369,10 @@ pub fn fallback_prefix(command: &str) -> Option<String> {
     if first.is_empty() {
         return None;
     }
-    if let Some(second) = tokens.next() {
-        if !second.starts_with('-') {
-            return Some(format!("{first} {second}"));
-        }
+    if let Some(second) = tokens.next()
+        && !second.starts_with('-')
+    {
+        return Some(format!("{first} {second}"));
     }
     Some(first.to_string())
 }

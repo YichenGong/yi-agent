@@ -399,17 +399,17 @@ pub fn parse_effort_args_with_caps(
     supported: Option<&[String]>,
 ) -> Result<EffortAction, String> {
     let action = parse_effort_args(args)?;
-    if let (EffortAction::Set(tier), Some(list)) = (&action, supported) {
-        if !list.iter().any(|s| s == tier) {
-            return Err(format!(
-                "该模型不支持 {tier}（支持：{}）",
-                if list.is_empty() {
-                    "无，仅 `default`".to_string()
-                } else {
-                    list.join(" | ")
-                }
-            ));
-        }
+    if let (EffortAction::Set(tier), Some(list)) = (&action, supported)
+        && !list.iter().any(|s| s == tier)
+    {
+        return Err(format!(
+            "该模型不支持 {tier}（支持：{}）",
+            if list.is_empty() {
+                "无，仅 `default`".to_string()
+            } else {
+                list.join(" | ")
+            }
+        ));
     }
     Ok(action)
 }

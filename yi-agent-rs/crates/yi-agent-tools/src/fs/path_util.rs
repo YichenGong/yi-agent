@@ -159,17 +159,16 @@ pub fn resolve_for_write_roots(roots: &[PathBuf], path: &str) -> Result<PathBuf,
     // Path doesn't exist - try canonicalizing parent to catch symlink escapes
     // in intermediate directories (e.g., evil_dir -> /etc, then writing
     // evil_dir/passwd would escape via the symlinked parent).
-    if let Some(parent) = candidate.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(canonical_parent) = parent.canonicalize() {
-                if !contained_in_any(&canonical_parent, &roots) {
-                    return Err(ToolsError::PathEscapesRoot(candidate));
-                }
-                // Parent exists and is inside a root - safe to write here
-                let file_name = candidate.file_name().unwrap_or_default();
-                return Ok(canonical_parent.join(file_name));
-            }
+    if let Some(parent) = candidate.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        if !contained_in_any(&canonical_parent, &roots) {
+            return Err(ToolsError::PathEscapesRoot(candidate));
         }
+        // Parent exists and is inside a root - safe to write here
+        let file_name = candidate.file_name().unwrap_or_default();
+        return Ok(canonical_parent.join(file_name));
     }
 
     // Parent doesn't exist either - use lexical normalization as last resort

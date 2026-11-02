@@ -657,65 +657,65 @@ impl Settings {
         // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
         // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
         // 同 crate，`pub(crate)` 足够）。
-        if let Some(enabled) = self.tui.notifications.as_deref() {
-            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
-                tracing::warn!(
-                    value = enabled,
-                    "settings.json has an unknown tui.notifications; falling back to the default"
-                );
-                self.tui.notifications = None;
-            }
+        if let Some(enabled) = self.tui.notifications.as_deref()
+            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
+        {
+            tracing::warn!(
+                value = enabled,
+                "settings.json has an unknown tui.notifications; falling back to the default"
+            );
+            self.tui.notifications = None;
         }
-        if let Some(enabled) = self.tui.terminal_title.as_deref() {
-            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
-                tracing::warn!(
-                    value = enabled,
-                    "settings.json has an unknown tui.terminal_title; falling back to the default"
-                );
-                self.tui.terminal_title = None;
-            }
+        if let Some(enabled) = self.tui.terminal_title.as_deref()
+            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
+        {
+            tracing::warn!(
+                value = enabled,
+                "settings.json has an unknown tui.terminal_title; falling back to the default"
+            );
+            self.tui.terminal_title = None;
         }
-        if let Some(method) = self.tui.notification_method.as_deref() {
-            if !matches!(
+        if let Some(method) = self.tui.notification_method.as_deref()
+            && !matches!(
                 method.to_ascii_lowercase().as_str(),
                 "auto" | "osc9" | "bel"
-            ) {
-                tracing::warn!(
-                    value = method,
-                    "settings.json has an unknown tui.notification_method; falling back to the default"
-                );
-                self.tui.notification_method = None;
-            }
+            )
+        {
+            tracing::warn!(
+                value = method,
+                "settings.json has an unknown tui.notification_method; falling back to the default"
+            );
+            self.tui.notification_method = None;
         }
-        if let Some(condition) = self.tui.notification_condition.as_deref() {
-            if !matches!(
+        if let Some(condition) = self.tui.notification_condition.as_deref()
+            && !matches!(
                 condition.to_ascii_lowercase().as_str(),
                 "unfocused" | "always"
-            ) {
-                tracing::warn!(
-                    value = condition,
-                    "settings.json has an unknown tui.notification_condition; falling back to the default"
-                );
-                self.tui.notification_condition = None;
-            }
+            )
+        {
+            tracing::warn!(
+                value = condition,
+                "settings.json has an unknown tui.notification_condition; falling back to the default"
+            );
+            self.tui.notification_condition = None;
         }
-        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref() {
-            if !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false") {
-                tracing::warn!(
-                    value = enabled,
-                    "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
-                );
-                self.power.prevent_idle_sleep = None;
-            }
+        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref()
+            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
+        {
+            tracing::warn!(
+                value = enabled,
+                "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
+            );
+            self.power.prevent_idle_sleep = None;
         }
-        if let Some(sandbox) = self.startup.sandbox.as_deref() {
-            if crate::config::parse_sandbox_mode(sandbox).is_none() {
-                tracing::warn!(
-                    value = sandbox,
-                    "settings.json has an unknown startup.sandbox; falling back to the default"
-                );
-                self.startup.sandbox = None;
-            }
+        if let Some(sandbox) = self.startup.sandbox.as_deref()
+            && crate::config::parse_sandbox_mode(sandbox).is_none()
+        {
+            tracing::warn!(
+                value = sandbox,
+                "settings.json has an unknown startup.sandbox; falling back to the default"
+            );
+            self.startup.sandbox = None;
         }
 
         // 跨字段：远端窗口长于宽限会让「宽限」在电池场景下失去意义——
@@ -724,16 +724,15 @@ impl Settings {
         if let (Some(remote), Some(grace)) = (
             self.power.remote_touch_minutes,
             self.power.idle_grace_minutes,
-        ) {
-            if remote > grace {
-                tracing::warn!(
-                    remote,
-                    grace,
-                    "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
-                );
-                self.power.remote_touch_minutes = None;
-                self.power.idle_grace_minutes = None;
-            }
+        ) && remote > grace
+        {
+            tracing::warn!(
+                remote,
+                grace,
+                "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
+            );
+            self.power.remote_touch_minutes = None;
+            self.power.idle_grace_minutes = None;
         }
         self
     }
@@ -904,10 +903,10 @@ fn validate_value(
     if value.is_null() {
         return Ok(None);
     }
-    if let Some(text) = value.as_str() {
-        if text.trim().is_empty() {
-            return Ok(None);
-        }
+    if let Some(text) = value.as_str()
+        && text.trim().is_empty()
+    {
+        return Ok(None);
     }
 
     match spec.field_type {
@@ -919,15 +918,15 @@ fn validate_value(
                 _ => None,
             }
             .ok_or_else(|| reject("expected a non-negative integer".to_string()))?;
-            if let Some(min) = spec.min {
-                if number < min {
-                    return Err(reject(format!("must be at least {min}")));
-                }
+            if let Some(min) = spec.min
+                && number < min
+            {
+                return Err(reject(format!("must be at least {min}")));
             }
-            if let Some(max) = spec.max {
-                if number > max {
-                    return Err(reject(format!("must be at most {max}")));
-                }
+            if let Some(max) = spec.max
+                && number > max
+            {
+                return Err(reject(format!("must be at most {max}")));
             }
             Ok(Some(serde_json::Value::from(number)))
         }
