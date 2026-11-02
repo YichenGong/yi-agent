@@ -5,7 +5,7 @@
 //! 一律不采信。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -376,6 +376,9 @@ pub fn run_probe(context: tauri::Context<tauri::Wry>, options: ProbeOptions) -> 
     let setup_main_config = main_config.clone();
     let exit_code = Arc::new(AtomicUsize::new(0));
     let setup_exit = Arc::clone(&exit_code);
+    // 报告写出来之前绝不能退出事件循环。
+    let finished = Arc::new(AtomicBool::new(false));
+    let setup_finished = Arc::clone(&finished);
 
     let probe_options = options.clone();
 
@@ -393,6 +396,9 @@ pub fn run_probe(context: tauri::Context<tauri::Wry>, options: ProbeOptions) -> 
                     started,
                 );
                 setup_exit.store(code as usize, Ordering::SeqCst);
+                // 顺序要紧：先置 finished，再 exit。反过来回调会看到
+                // finished=false 而拦住这次退出，进程就永远退不出去了。
+                setup_finished.store(true, Ordering::SeqCst);
                 handle.exit(code);
             });
             Ok(())
@@ -422,7 +428,17 @@ pub fn run_probe(context: tauri::Context<tauri::Wry>, options: ProbeOptions) -> 
         }
     };
 
-    app.run(|_app, _event| {});
+    // 窗口全部关闭时 Tauri 也会请求退出，但那不等于“探针跑完了”：页面可能
+    // 一次都没回报过（正是主线程自旋、JS 看门狗失效的那类情形，见 T02 Step 2）。
+    // 在报告落盘之前拦住退出，让 drive 线程把失败如实写进报告再自己收场。
+    let run_finished = Arc::clone(&finished);
+    app.run(move |_app, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if !run_finished.load(Ordering::SeqCst) {
+                api.prevent_exit();
+            }
+        }
+    });
     exit_code.load(Ordering::SeqCst) as i32
 }
 

@@ -192,6 +192,37 @@ fn the_report_is_not_a_pass_when_any_case_is_missing() {
 }
 
 #[test]
+fn a_page_that_never_reports_still_yields_a_report() {
+    // T02 Step 2 的负例：页面不执行任何 JS 时，原生侧必须自己在截止时间后
+    // 把每个用例记成失败并落盘，而不是让进程在“没有窗口了”时静默退出、
+    // 连一份报告都不留（那会让整个探针看起来“没跑过”，而不是“跑失败了”）。
+    let channel = ProbeChannel::new();
+    channel.register("frame-a", "n-1").unwrap();
+    let timed_out: Vec<String> = EXPECTED_CASES.iter().map(|id| (*id).to_string()).collect();
+    let mut report = assemble_report(
+        &channel,
+        &timed_out,
+        iso8601_now(),
+        "a".repeat(64),
+        "b".repeat(64),
+    );
+    assert!(!report.is_pass());
+    assert!(report
+        .cases
+        .iter()
+        .all(|case| case.evidence.iter().any(|line| line.contains("deadline"))));
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("probe.json");
+    report.write_atomic(&out).unwrap();
+    let parsed: ProbeReport =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert!(parsed.atomic);
+    assert_eq!(parsed.cases.len(), EXPECTED_CASES.len());
+    assert!(!parsed.is_pass());
+}
+
+#[test]
 fn a_timeout_is_recorded_as_a_failure() {
     let channel = ProbeChannel::new();
     let report = assemble_report(

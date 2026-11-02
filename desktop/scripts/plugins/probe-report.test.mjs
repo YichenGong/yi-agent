@@ -111,3 +111,28 @@ test("the expected case list covers every spec §4 requirement", () => {
     assert.ok(PROBE_CASES.includes(id), `missing ${id}`);
   }
 });
+
+// G0 asks for evidence, not just a green check. These three cases carry the
+// load-bearing claims of spec §4: a page that never recovers, a page that can
+// reach native commands, and a page that can replay a handshake. If any of them
+// can silently vanish from the report, "12/12 passed" means nothing.
+for (const id of [
+  "blocked_script_recovery",
+  "native_invoke_denied",
+  "cross_frame_replay_denied",
+]) {
+  test(`dropping \`${id}\` turns the report red, not silent`, () => {
+    const cases = passing().filter((c) => c.id !== id);
+    assert.throws(() => checkProbeReport(report(cases)), new RegExp(id));
+  });
+}
+
+test("every load-bearing case is present in a passing report", () => {
+  for (const id of [
+    "blocked_script_recovery",
+    "native_invoke_denied",
+    "cross_frame_replay_denied",
+  ]) {
+    assert.ok(PROBE_CASES.includes(id), `PROBE_CASES is missing ${id}`);
+  }
+});
