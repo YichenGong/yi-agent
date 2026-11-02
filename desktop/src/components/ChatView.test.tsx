@@ -381,6 +381,24 @@ describe("ChatView reasoning", () => {
     fireEvent.click(screen.getByRole("button", { name: /思考/ }));
     expect(screen.getByText("已加密的思考")).toBeTruthy();
   });
+
+  it("renders an empty non-redacted thinking item as a「已推理（无明文）」placeholder", () => {
+    // 模型推理过但本次没有可展示的明文（实测 Sol 部分轮次 summary 为空）。
+    // 此前展开后是一片空白。
+    const thinking = { type: "thinking", id: "th2", text: "", redacted: false };
+    render(<ChatView items={[thinking] as unknown as (Item | NoticeItem)[]} />);
+    fireEvent.click(screen.getByRole("button", { name: /思考/ }));
+    expect(screen.getByText("已推理（无明文）")).toBeTruthy();
+  });
+
+  it("keeps rendering the real summary when one is present", () => {
+    // 有明文时不得被占位文案顶掉。
+    const thinking = { type: "thinking", id: "th3", text: "真实摘要", redacted: false };
+    render(<ChatView items={[thinking] as unknown as (Item | NoticeItem)[]} />);
+    fireEvent.click(screen.getByRole("button", { name: /思考/ }));
+    expect(screen.getByText("真实摘要")).toBeTruthy();
+    expect(screen.queryByText("已推理（无明文）")).toBeNull();
+  });
 });
 
 describe("ChatView server notices", () => {
