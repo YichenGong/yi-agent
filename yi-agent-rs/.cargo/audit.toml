@@ -43,12 +43,12 @@ ignore = [
     # 复查条件：cargo update 后 `cargo audit` 不再打印 chacha20。
 
     # ===== B 类：跨大版本，单独开卡 =====
-    # 复查条件：quick-xml 升到 0.40 / zip 升到 9.0 的卡片完成时删除。
+    # 复查条件：quick-xml 升到 0.40 的卡片完成时删除。
     "RUSTSEC-2026-0194",  # quick-xml 0.38.4：重复属性检查平方复杂度
     "RUSTSEC-2026-0195",  # quick-xml 0.38.4：NsReader 命名空间声明无界分配
-    "RUSTSEC-2026-0367",  # zip 8.6.0：解压时保留 SUID/SGID 位
-    "RUSTSEC-2026-0368",  # zip 8.6.0：解压创建符号链接可越界
-    "RUSTSEC-2026-0369",  # zip 8.6.0：extract 应用 UNIX 权限位
+    # zip 已升到 9.2.2（2026-11-03），原 0367/0368/0369 三条豁免随之删除；
+    # 同一波新报的 RUSTSEC-2026-0429（extract 对 symlink 声明尺寸无检查导致 abort）
+    # 也被这次升级覆盖，故直接升级而未新增豁免。
 
     # ===== C 类：无法在本仓库修 =====
     # 复查条件：html2md 发布新版本把 regex 提到 1.x 时整组删除。
