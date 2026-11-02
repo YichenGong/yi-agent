@@ -26,10 +26,10 @@
 | 构建 | 本 worktree 的 release bundle，`--features plugin-probe` |
 | 产物 | `desktop/src-tauri/target/release/bundle/macos/yi-agent.app` |
 | 可执行文件 | `Contents/MacOS/desktop`（不是 `productName`，见 §7） |
-| 应用摘要 | `e19806bc9b6e682138095e223e673753aa9605f97358d3f4e6a6530887dd0232` |
+| 应用摘要 | `29c184d719cf29702a084a7baf7483c13d76762e2383540f7d21b665d0b56bf0`（bundle 全量哈希；随构建变化，复现时以报告里的 `appSha256` 为准） |
 | 容器配置摘要 | `95a6a842b55fde346833d08161794773997073f04d163f8f2b7da3862c341b5` |
 | 实例根 | 一次性临时目录（`YI_AGENT_HOME` 指向它），不触碰真实 `~/.yi-agent` |
-| 结论 | 12 / 12 用例通过（`startedAt` 18:04:21.800Z → `finishedAt` 18:04:22.630Z，时长约 0.83s） |
+| 结论 | 12 / 12 用例通过（`startedAt` 18:18:01.070Z → `finishedAt` 18:18:01.932Z，时长约 0.86s） |
 
 复现命令：
 
@@ -195,6 +195,7 @@ runner 对未支持平台的做法是**明确失败**而不是「跳过该平台
 3. **报告时间戳在构造时打点**，导致 `startedAt == finishedAt`、时长永远为 0，无法判断是否撞上截止时间。现由编排起点回推。
 4. **bundle 里的可执行文件不是 `productName`。** bundle 叫 `yi-agent.app`，但 `CFBundleExecutable` 是 `desktop`，兄弟位置还有一个 `yi-agent`（sidecar）。按 `productName` 猜会去 exec sidecar，得到 `unexpected argument '--plugin-probe-run'`。
 5. **负例静默无报告**（见 §4.7 末段）。
+6. **报告里的应用摘要会随重建变化。** 本文件初稿记的是更早一次 bundle 的哈希；写完文档后又重建过 bundle，两者对不上。现在改为以报告自身的 `appSha256` 为准，并注明它随构建变化。容器配置摘要（`containerConfigSha256`）不随重建变化——它描述的是策略而非产物，这也是它能作为 G0 依据的原因。
 
 ## 8. 需要审阅者决定的事
 
