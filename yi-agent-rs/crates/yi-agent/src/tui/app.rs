@@ -1014,105 +1014,19 @@ fn run_loop<B: Backend, E: EventSource>(
                 apply_focus_event(&event, &focused);
             }
             Some(Event::Key(key)) => {
-                // Ctrl+P opens the runtime popup (bash tasks tab) when no popup
-                // is active. Tab then switches to the managed-processes tab.
-                if key.code == KeyCode::Char('p')
-                    && key.modifiers == KeyModifiers::CONTROL
-                    && popup_stack.runtime_popup.is_none()
-                {
-                    refresh_process_snapshots(
-                        &process_manager,
-                        &mut loop_bk.process_snapshots,
-                        &mut loop_bk.process_outputs,
-                    );
-                    let ids: Vec<String> = loop_bk
-                        .task_registry
-                        .list()
-                        .iter()
-                        .map(|t| t.id.clone())
-                        .collect();
-                    if let Ok(socket) = crate::runtime_socket_for(&workdir) {
-                        popup_stack.subagent_children = subagent_children_at(&socket);
-                    }
-                    popup_stack.runtime_popup =
-                        RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
-                    continue;
-                }
-                // Route keys to the runtime popup when active.
-                if !popup_stack.runtime_popup.is_none() {
-                    let process_to_kill = handle_runtime_popup_key(
-                        key,
-                        &mut popup_stack.runtime_popup,
-                        &loop_bk.task_registry,
-                        &channels.kill,
-                        &loop_bk.process_snapshots,
-                        &loop_bk.process_outputs,
-                        &popup_stack.subagent_children,
-                        layout.chunks[0].width,
-                        layout.chunks[0].height,
-                    );
-                    if let Some(process_id) = process_to_kill {
-                        let _ = tokio::runtime::Handle::current().block_on(
-                            process_manager.kill(yi_agent_tools::ProcessSelector::Id(process_id)),
-                        );
-                        refresh_process_snapshots(
-                            &process_manager,
-                            &mut loop_bk.process_snapshots,
-                            &mut loop_bk.process_outputs,
-                        );
-                    }
-                    continue;
-                }
-                // Dismiss the failure notice on any key. Deliberately no
-                // `continue`: a popup that consumed the first character typed
-                // would silently corrupt what the user was writing, far worse
-                // than the nuisance it reports, so the key clears the alert and
-                // still reaches the input handling below.
-                popup_stack.runtime_notice_popup = None;
-                if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) =
-                    &loop_bk.runtime_intent
-                {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            persist_runtime_choice(
-                                &workdir,
-                                crate::tui::runtime_prefs::RuntimePreference::Always,
-                                history,
-                                layout.chunks[0].width,
-                            );
-                            if let Some(tx) = &runtime_choice_tx {
-                                let _ = tx.blocking_send(
-                                    crate::tui::subagents::RuntimeStartupChoice::Start,
-                                );
-                            }
-                            loop_bk.runtime_intent = None;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            persist_runtime_choice(
-                                &workdir,
-                                crate::tui::runtime_prefs::RuntimePreference::Never,
-                                history,
-                                layout.chunks[0].width,
-                            );
-                            if let Some(tx) = &runtime_choice_tx {
-                                let _ = tx.blocking_send(
-                                    crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
-                                );
-                            }
-                            loop_bk.runtime_intent = None;
-                        }
-                        // Esc means "skip this time"; it must NOT overwrite the
-                        // stored preference, so the next launch asks again.
-                        KeyCode::Esc => {
-                            if let Some(tx) = &runtime_choice_tx {
-                                let _ = tx.blocking_send(
-                                    crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
-                                );
-                            }
-                            loop_bk.runtime_intent = None;
-                        }
-                        _ => {}
-                    }
+                if handle_key_intercepts(
+                    key,
+                    &mut InterceptContext {
+                        popup_stack: &mut popup_stack,
+                        loop_bk: &mut loop_bk,
+                        history,
+                        workdir: &workdir,
+                        process_manager: &process_manager,
+                        channels: &channels,
+                        runtime_choice_tx: runtime_choice_tx.as_ref(),
+                        layout: &layout,
+                    },
+                ) {
                     continue;
                 }
                 let history_area = layout.chunks[0];
@@ -2259,6 +2173,138 @@ fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
     text.split_whitespace()
         .next()
         .is_some_and(|token| token.starts_with('/') && token.matches('/').count() >= 2)
+}
+
+/// `handle_key_intercepts` 要碰的那几样东西。
+///
+/// 打包的理由和 `KeyContext` 一样：这些引用总是一起出现，散在参数表里
+/// 只会让调用点变成一长串位置参数。
+struct InterceptContext<'a> {
+    popup_stack: &'a mut PopupStack,
+    loop_bk: &'a mut LoopBookkeeping,
+    history: &'a mut HistoryState,
+    workdir: &'a std::path::Path,
+    process_manager: &'a yi_agent_tools::ProcessManager,
+    channels: &'a TuiChannels,
+    runtime_choice_tx:
+        Option<&'a tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>>,
+    layout: &'a LayoutInfo,
+}
+
+/// 按键的前置拦截：Ctrl+P、运行时弹窗路由、启动提示。
+///
+/// 返回 `true` 表示这一键已被消费，调用方应当直接进入下一轮循环。
+///
+/// 这三段之所以单独成函数：它们都是「这个键归谁处理」的判定，不碰
+/// `session_ui`/`input`，返回值就是全部副作用之外的信息。留在 `run_loop`
+/// 里会让真正的主按键处理淹没在拦截逻辑后面。
+fn handle_key_intercepts(key: KeyEvent, ctx: &mut InterceptContext<'_>) -> bool {
+    let InterceptContext {
+        popup_stack,
+        loop_bk,
+        history,
+        workdir,
+        process_manager,
+        channels,
+        runtime_choice_tx,
+        layout,
+    } = ctx;
+    // Ctrl+P opens the runtime popup (bash tasks tab) when no popup
+    // is active. Tab then switches to the managed-processes tab.
+    if key.code == KeyCode::Char('p')
+        && key.modifiers == KeyModifiers::CONTROL
+        && popup_stack.runtime_popup.is_none()
+    {
+        refresh_process_snapshots(
+            process_manager,
+            &mut loop_bk.process_snapshots,
+            &mut loop_bk.process_outputs,
+        );
+        let ids: Vec<String> = loop_bk
+            .task_registry
+            .list()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        if let Ok(socket) = crate::runtime_socket_for(workdir) {
+            popup_stack.subagent_children = subagent_children_at(&socket);
+        }
+        popup_stack.runtime_popup = RuntimePopup::Bash(BashPopup::List(ListPopup::new(ids)));
+        return true;
+    }
+    // Route keys to the runtime popup when active.
+    if !popup_stack.runtime_popup.is_none() {
+        let process_to_kill = handle_runtime_popup_key(
+            key,
+            &mut popup_stack.runtime_popup,
+            &loop_bk.task_registry,
+            &channels.kill,
+            &loop_bk.process_snapshots,
+            &loop_bk.process_outputs,
+            &popup_stack.subagent_children,
+            layout.chunks[0].width,
+            layout.chunks[0].height,
+        );
+        if let Some(process_id) = process_to_kill {
+            let _ = tokio::runtime::Handle::current()
+                .block_on(process_manager.kill(yi_agent_tools::ProcessSelector::Id(process_id)));
+            refresh_process_snapshots(
+                process_manager,
+                &mut loop_bk.process_snapshots,
+                &mut loop_bk.process_outputs,
+            );
+        }
+        return true;
+    }
+    // Dismiss the failure notice on any key. Deliberately no
+    // `continue`: a popup that consumed the first character typed
+    // would silently corrupt what the user was writing, far worse
+    // than the nuisance it reports, so the key clears the alert and
+    // still reaches the input handling below.
+    popup_stack.runtime_notice_popup = None;
+    if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &loop_bk.runtime_intent {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                persist_runtime_choice(
+                    workdir,
+                    crate::tui::runtime_prefs::RuntimePreference::Always,
+                    history,
+                    layout.chunks[0].width,
+                );
+                if let Some(tx) = &runtime_choice_tx {
+                    let _ = tx.blocking_send(crate::tui::subagents::RuntimeStartupChoice::Start);
+                }
+                loop_bk.runtime_intent = None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                persist_runtime_choice(
+                    workdir,
+                    crate::tui::runtime_prefs::RuntimePreference::Never,
+                    history,
+                    layout.chunks[0].width,
+                );
+                if let Some(tx) = &runtime_choice_tx {
+                    let _ = tx.blocking_send(
+                        crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
+                    );
+                }
+                loop_bk.runtime_intent = None;
+            }
+            // Esc means "skip this time"; it must NOT overwrite the
+            // stored preference, so the next launch asks again.
+            KeyCode::Esc => {
+                if let Some(tx) = &runtime_choice_tx {
+                    let _ = tx.blocking_send(
+                        crate::tui::subagents::RuntimeStartupChoice::ContinueWithoutDelegation,
+                    );
+                }
+                loop_bk.runtime_intent = None;
+            }
+            _ => {}
+        }
+        return true;
+    }
+    false
 }
 
 /// 一次按键处理需要的全部「环境」。
