@@ -480,44 +480,25 @@ where
                         }
                     };
                 }
+
+                // 16 个臂的差异只有域模块名，故用局部宏收敛成一行。
+                // 不能抽成函数：`app_state!` 按名捕获 serve() 的局部量、
+                // 且臂体内联 `continue`，两者都无法跨函数。
+                macro_rules! dispatch_domain {
+                    ($handler:path) => {{
+                        let mut state = app_state!();
+                        match $handler(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }};
+                }
+
                 match crate::rpc::domain_for(method.as_str()) {
-                    crate::rpc::Domain::Ui => {
-                        let mut state = app_state!();
-                        match crate::rpc::ui::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Model => {
-                        let mut state = app_state!();
-                        match crate::rpc::model::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Onboarding => {
-                        let mut state = app_state!();
-                        match crate::rpc::onboarding::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Resident => {
-                        let mut state = app_state!();
-                        match crate::rpc::resident::handle(&mut state, &req, id.clone()).await? {
-                            crate::rpc::Flow::Continue => continue,
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
+                    crate::rpc::Domain::Ui => dispatch_domain!(crate::rpc::ui::handle),
+                    crate::rpc::Domain::Model => dispatch_domain!(crate::rpc::model::handle),
+                    crate::rpc::Domain::Onboarding => dispatch_domain!(crate::rpc::onboarding::handle),
+                    crate::rpc::Domain::Resident => dispatch_domain!(crate::rpc::resident::handle),
                     crate::rpc::Domain::Plugin => {
                         // 门禁（initialize / scope）已在上面同步做完；这里只把
                         // **处理** detach 出去。主循环是单 task，内联 await 会串行
@@ -561,117 +542,18 @@ where
                         });
                         continue;
                     }
-                    crate::rpc::Domain::Image => {
-                        let mut state = app_state!();
-                        match crate::rpc::image::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Workspace => {
-                        let mut state = app_state!();
-                        match crate::rpc::workspace::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Process => {
-                        let mut state = app_state!();
-                        match crate::rpc::process::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Pair => {
-                        let mut state = app_state!();
-                        match crate::rpc::pair::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Turn => {
-                        let mut state = app_state!();
-                        match crate::rpc::turn::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Agent => {
-                        let mut state = app_state!();
-                        match crate::rpc::agent::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Skill => {
-                        let mut state = app_state!();
-                        match crate::rpc::skill::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Flags => {
-                        let mut state = app_state!();
-                        match crate::rpc::flags::handle(&mut state, &req, id.clone()).await? {
-                            crate::rpc::Flow::Continue => continue,
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Remote => {
-                        let mut state = app_state!();
-                        match crate::rpc::remote::handle(&mut state, &req, id.clone()).await? {
-                            crate::rpc::Flow::Continue => continue,
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Mcp => {
-                        let mut state = app_state!();
-                        match crate::rpc::mcp::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::WebSearch => {
-                        let mut state = app_state!();
-                        match crate::rpc::websearch::handle(&mut state, &req, id.clone()).await? {
-                            crate::rpc::Flow::Continue => continue,
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Thread => {
-                        let mut state = app_state!();
-                        match crate::rpc::thread::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
+                    crate::rpc::Domain::Image => dispatch_domain!(crate::rpc::image::handle),
+                    crate::rpc::Domain::Workspace => dispatch_domain!(crate::rpc::workspace::handle),
+                    crate::rpc::Domain::Process => dispatch_domain!(crate::rpc::process::handle),
+                    crate::rpc::Domain::Pair => dispatch_domain!(crate::rpc::pair::handle),
+                    crate::rpc::Domain::Turn => dispatch_domain!(crate::rpc::turn::handle),
+                    crate::rpc::Domain::Agent => dispatch_domain!(crate::rpc::agent::handle),
+                    crate::rpc::Domain::Skill => dispatch_domain!(crate::rpc::skill::handle),
+                    crate::rpc::Domain::Flags => dispatch_domain!(crate::rpc::flags::handle),
+                    crate::rpc::Domain::Remote => dispatch_domain!(crate::rpc::remote::handle),
+                    crate::rpc::Domain::Mcp => dispatch_domain!(crate::rpc::mcp::handle),
+                    crate::rpc::Domain::WebSearch => dispatch_domain!(crate::rpc::websearch::handle),
+                    crate::rpc::Domain::Thread => dispatch_domain!(crate::rpc::thread::handle),
                     // 所有域都已有自己的模块:只有 `Domain::Unknown`(即 `initialize`
                     // 与未识别前缀)会落到这里,再走原始 dispatch。
                     // `Domain` 已是穷尽匹配,这里必须显式写出唯一剩下的变体 —— 用
