@@ -19,7 +19,7 @@ function renderInput(
     onInterrupt: vi.fn(),
     mode: "normal",
     onModeChange: vi.fn(),
-    onSlashCommand: vi.fn(),
+    onSlashCommand: vi.fn(() => true),
     value: "",
     onDraftChange: vi.fn(),
     attachments: [],
@@ -295,7 +295,7 @@ describe("MessageInput", () => {
   });
 
   describe("typing while a turn is running", () => {
-    // 回合进行中用户必须能敲字（否则只能先 Stop 再重打），但发送仍必须先 Stop。
+    // 桌面运行中直接投递插话，Stop 必须是独立的主动操作。
     it("keeps the textarea editable while the turn is running", () => {
       const onDraftChange = vi.fn();
       renderInput({ turnActive: true, onDraftChange, value: "" });
@@ -307,14 +307,14 @@ describe("MessageInput", () => {
       expect(textarea.value).toBe("keep typing");
     });
 
-    it("still interrupts on Enter instead of sending", () => {
+    it("sends on Enter without interrupting", () => {
       const onSend = vi.fn(async () => true);
       const onInterrupt = vi.fn();
       renderInput({ turnActive: true, onSend, onInterrupt, value: "half a thought" });
 
       fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-      expect(onInterrupt).toHaveBeenCalledTimes(1);
-      expect(onSend).not.toHaveBeenCalled();
+      expect(onInterrupt).not.toHaveBeenCalled();
+      expect(onSend).toHaveBeenCalledWith("half a thought");
     });
 
     it("lets Shift+Enter insert a newline without interrupting", () => {
@@ -325,22 +325,65 @@ describe("MessageInput", () => {
       expect(onInterrupt).not.toHaveBeenCalled();
     });
 
-    it("never runs a slash command mid-turn", () => {
-      const onSlashCommand = vi.fn();
-      const onInterrupt = vi.fn();
-      renderInput({ turnActive: true, onSlashCommand, onInterrupt, value: "/clear" });
+    it("offers slash completion mid-turn", () => {
+      renderInput({ turnActive: true, value: "" });
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "/" } });
+      expect(screen.getByTestId("slash-popup")).toBeTruthy();
+    });
 
+    it("sends from a separate Send button while retaining Stop", () => {
+      const onSend = vi.fn(async () => true);
+      const onInterrupt = vi.fn();
+      renderInput({ turnActive: true, onSend, onInterrupt, value: "additional detail" });
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+      expect(onSend).toHaveBeenCalledWith("additional detail");
+      expect(onInterrupt).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: /^stop$/i })).toBeTruthy();
+    });
+
+    it("does nothing on an empty Enter and disables only Send", () => {
+      const onInterrupt = vi.fn();
+      const onSend = vi.fn(async () => true);
+      renderInput({ turnActive: true, onInterrupt, onSend });
       fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onInterrupt).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+      expect((screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole("button", { name: /^stop$/i }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("does not submit or interrupt an IME confirmation mid-turn", () => {
+      const onSend = vi.fn(async () => true);
+      const onInterrupt = vi.fn();
+      renderInput({ turnActive: true, onSend, onInterrupt, value: "补充" });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter", keyCode: 229 });
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onInterrupt).not.toHaveBeenCalled();
+    });
+
+    it("keeps mobile running turns Stop-only and Enter inert", () => {
+      const onSend = vi.fn(async () => true);
+      const onInterrupt = vi.fn();
+      renderInput({ isMobile: true, turnActive: true, onSend, onInterrupt, value: "draft" });
+      expect(screen.queryByRole("button", { name: /^send$/i })).toBeNull();
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onInterrupt).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
       expect(onInterrupt).toHaveBeenCalledTimes(1);
     });
 
-    it("does not open the slash popup mid-turn", () => {
-      renderInput({ turnActive: true, value: "" });
-
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "/" } });
-      expect(screen.queryByTestId("slash-popup")).toBeNull();
+    it.each(["enter", "button"])("keeps rejected command input via %s", async (entry) => {
+      const onSlashCommand = vi.fn(async () => false);
+      const onSend = vi.fn(async () => true);
+      renderInput({ turnActive: true, onSlashCommand, onSend, value: "/clear" });
+      if (entry === "enter") fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      else fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+      await waitFor(() => expect(onSlashCommand).toHaveBeenCalledWith("clear", null));
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("/clear");
+      expect(onSend).not.toHaveBeenCalled();
     });
+
   });
 
   describe("attachments", () => {
@@ -533,7 +576,7 @@ describe("MessageInput", () => {
 
     it("runs the selected command on Enter instead of sending the text", () => {
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
       fireEvent.change(textarea, { target: { value: "/us" } });
@@ -544,7 +587,7 @@ describe("MessageInput", () => {
     });
 
     it("passes arguments through and runs a single-match command on Enter", () => {
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSlashCommand });
       const textarea = screen.getByRole("textbox");
       // The brief expects ("help", "usage") while "/help " is still a single
@@ -568,7 +611,7 @@ describe("MessageInput", () => {
       // the popup, so by the time Enter arrives the typed text is the only
       // source of truth for the command (`/help usage` -> help with "usage").
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
       fireEvent.change(textarea, { target: { value: "/help usage" } });
@@ -593,7 +636,7 @@ describe("MessageInput", () => {
 
     it("reports an unknown command on Enter without sending", () => {
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
       fireEvent.change(textarea, { target: { value: "/nope" } });
@@ -604,7 +647,7 @@ describe("MessageInput", () => {
 
     it("sends a two-slash path to the agent instead of treating it as a command", () => {
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
       fireEvent.change(textarea, { target: { value: "/Users/me/src" } });
@@ -619,7 +662,7 @@ describe("MessageInput", () => {
       // the destructive `/clear`. A lone "/" names no command, so Enter on the
       // untouched default must do nothing; an explicit ↑/↓ choice is honoured.
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
       fireEvent.change(textarea, { target: { value: "/" } });
@@ -677,7 +720,7 @@ describe("MessageInput", () => {
 
     it("runs a slash command from the Send button (the Enter entry is gone)", () => {
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ isMobile: true, onSend, onSlashCommand });
 
       const textarea = screen.getByRole("textbox");
@@ -691,7 +734,7 @@ describe("MessageInput", () => {
     it("keeps a bare-slash Send inert, like the desktop Enter", () => {
       // 弹窗默认高亮是破坏性的 `/clear`；裸 `/` 尚未选定命令，Send 必须什么都不做。
       const onSend = vi.fn(async () => true);
-      const onSlashCommand = vi.fn();
+      const onSlashCommand = vi.fn(() => true);
       renderInput({ isMobile: true, onSend, onSlashCommand });
 
       const textarea = screen.getByRole("textbox");
@@ -763,5 +806,33 @@ describe("拖入高亮与光标", () => {
     const ref: { current: HTMLDivElement | null } = { current: null };
     renderInput({ cardRef: ref });
     expect(ref.current).toBe(screen.getByTestId("composer-card"));
+  });
+});
+
+
+describe("MessageInput asynchronous submission isolation", () => {
+  it("does not submit twice on repeated Enter before the receipt", async () => {
+    let accept!: (ok: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>(resolve => { accept = resolve; }));
+    renderInput({ turnActive: true, onSend, value: "once" });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: /^stop$/i }) as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => { accept(true); });
+  });
+  it("does not clear a draft changed while the receipt is pending", async () => {
+    let accept!: (ok: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>(resolve => { accept = resolve; }));
+    const { props, unmount } = renderInput({ turnActive: true, onSend, value: "submitted", threadId: "t1" });
+    unmount();
+    const { rerender } = render(<MessageInput {...props} />);
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    // External edits (such as drag/drop) can replace a controlled draft even
+    // though keyboard editing is disabled during the pending submission.
+    rerender(<MessageInput {...props} value="new external draft" />);
+    await act(async () => { accept(true); });
+    expect(props.onDraftChange).not.toHaveBeenCalled();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("new external draft");
   });
 });

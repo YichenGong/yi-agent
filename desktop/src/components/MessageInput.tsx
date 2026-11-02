@@ -35,7 +35,7 @@ export function MessageInput({
   onInterrupt: () => void;
   mode: ThreadMode | null;
   onModeChange: (mode: ThreadMode) => void;
-  onSlashCommand: (name: string, args: string | null) => void;
+  onSlashCommand: (name: string, args: string | null) => boolean | Promise<boolean>;
   /**
    * 文本框内容，由父级按 session 提供（不是本组件的内部状态）。
    *
@@ -43,8 +43,8 @@ export function MessageInput({
    * 换掉 value，上一处的文字留在原 session 的 `draft` 里，不会跟着跑到新会话。
    */
   value: string;
-  /** 用户每次改动文本框；父级把它写进当前 session 的 `draft`。 */
-  onDraftChange: (text: string) => void;
+  /** 编辑默认写当前会话；异步清稿显式指定提交时的 threadId。 */
+  onDraftChange: (text: string, threadId?: string | null) => void;
   /**
    * 当前会话待发送的附件，父级按 session 保管（与 `value` 同理：附件属于会话）。
    *
@@ -62,7 +62,7 @@ export function MessageInput({
   /**
    * 手机端（配对 iPhone / iOS webview）：软键盘没有 Shift 键，回车恒为
    * `shiftKey === false`。此时把回车让给「换行」，发送与命令执行收敛到 Send 按钮；
-   * 桌面端为 `false`，行为与文案逐字节不变。
+   * 运行中只显示 Stop。桌面端为 false，运行中也可通过 Enter/Send 提交。
    */
   isMobile?: boolean;
   /** 用户移除了某个 chip；参数是附件的本地路径。 */
@@ -118,6 +118,17 @@ export function MessageInput({
   // `isImeCompositionKey` for why keyCode 229 is the load-bearing check here.
   const ime = useImeGuard();
 
+  // An async receipt belongs to its original thread and draft, not whichever
+  // thread happens to be visible when the request resolves.
+  const latestDraft = useRef({ threadId, value });
+  latestDraft.current = { threadId, value };
+  const submitting = useRef(false);
+  const clearSubmittedDraft = (submittedText: string) => {
+    if (latestDraft.current.threadId === threadId && latestDraft.current.value === submittedText) {
+      onDraftChange("", threadId);
+    }
+  };
+
   const text = value;
   const parsed = parseSlashInput(text);
   // Command names contain no spaces (the catalog has no argument-bearing
@@ -146,46 +157,64 @@ export function MessageInput({
   const handleSend = async () => {
     // 附件本身就是一条消息：只要有文字**或**至少一个附件就可以发；两者都空时
     // 才拦住（空 turn 没有意义）。
-    if ((!text.trim() && attachments.length === 0) || sending) return;
+    if ((!text.trim() && attachments.length === 0) || submitting.current || disabled) return;
+    submitting.current = true;
     setSending(true);
     try {
       const ok = await onSend(text);
       // Only discard the draft once the send was actually accepted; otherwise
       // the user's text would be lost on a rejected turn/start.
-      if (ok) onDraftChange("");
+      if (ok) clearSubmittedDraft(text);
     } finally {
+      submitting.current = false;
       setSending(false);
     }
   };
 
-  /** Run the slash command the input currently names (or report it unknown). */
-  const runSlash = (name: string, args: string | null) => {
-    onSlashCommand(name, args);
-    onDraftChange("");
-    setPopupOpen(false);
+  /** Commands and text share a submission lock, including same-tick Enter. */
+  const runSlash = async (name: string, args: string | null) => {
+    if (submitting.current || disabled || (isMobile && turnActive)) return;
+    submitting.current = true;
+    setSending(true);
+    try {
+      if (await onSlashCommand(name, args)) {
+        clearSubmittedDraft(text);
+        setPopupOpen(false);
+      }
+    } finally {
+      submitting.current = false;
+      setSending(false);
+    }
   };
 
-  /**
-   * Send 按钮的点击处理。
-   *
-   * 桌面端就是 `handleSend`。手机端回车已让给换行，命令（`/usage` 等）的入口必须补
-   * 到 Send 上：草稿解析为命令就先执行它。裸 `/`（`parsed.kind === "none"` 但弹窗
-   * 开着）按桌面端回车的既有语义处理为 inert——弹窗默认高亮是破坏性的 `/clear`，
-   * 未经用户选择不得执行。
-   */
+  // Enter and Send use the same dispatch: a slash command must never leak to
+  // the agent just because the user clicked instead of pressing Enter.
   const handleSendClick = () => {
-    if (isMobile && parsed.kind === "command") {
-      runSlash(parsed.name, parsed.args);
+    if (isMobile && turnActive) return;
+    if (parsed.kind === "command") {
+      // Desktop completion applies equally to Enter and Send. Mobile retains
+      // its existing exact-command semantics because it has no Enter-to-send.
+      if (!isMobile && showPopup && options.length > 0) {
+        const picked = options[Math.min(selected, options.length - 1)];
+        void runSlash(picked.name, null);
+      } else {
+        void runSlash(parsed.name, parsed.args);
+      }
       return;
     }
-    if (isMobile && showPopup && options.length > 0) return;
+    if (text.trim() === "/") {
+      if (!isMobile && showPopup && selected > 0 && options.length > 0) {
+        void runSlash(options[Math.min(selected, options.length - 1)].name, null);
+      }
+      return;
+    }
     void handleSend();
   };
 
   // 「没什么可发」时按钮就该是灰的，而不是点了没反应：文字与附件都是空时才算空；
   // 附件已在路上时按钮要亮着，否则「只发文件」这条路径在 UI 上根本走不通。
   const sendDisabled =
-    disabled || sending || (!turnActive && !text.trim() && attachments.length === 0);
+    disabled || sending || (!text.trim() && attachments.length === 0);
   // Stop 只受「这个输入区是否可用」约束：`sending` 表示**这次发送还没回包**，
   // 与「服务端这一轮是否在跑」无关——turn/started 可能早已到达、bash 可能已经在
   // 输出，而 Promise 仍挂着。把它算进来会让 Stop 在这段时间里点不动（真机上常见
@@ -232,9 +261,9 @@ export function MessageInput({
               const next = e.target.value;
               onDraftChange(next);
               // Re-arm the popup whenever the text still looks like a command name.
-              // 回合进行中不弹：那时 Enter 的唯一语义是「中断」，弹窗里的候选
-              // 选不中，徒增误导。
-              setPopupOpen(!turnActive && /^\/[^\s/]*$/.test(next.trim()));
+              // Desktop commands remain available mid-turn; mobile keeps its
+              // Stop-only running state.
+              setPopupOpen((!turnActive || !isMobile) && /^\/[^\s/]*$/.test(next.trim()));
             }}
             onCompositionStart={ime.onCompositionStart}
             onCompositionEnd={ime.onCompositionEnd}
@@ -270,22 +299,7 @@ export function MessageInput({
                 }
                 if (e.key === "Enter" && !e.shiftKey && !isMobile) {
                   e.preventDefault();
-                  // A bare "/" names no command (`parseSlashInput("/")` is
-                  // `{ kind: "none" }`), yet the popup is offered for it and its
-                  // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
-                  // Enter on that untouched default would erase the transcript, so it
-                  // is inert until the user either types a name character (kind turns
-                  // "command", as for "/cos") or moves the highlight with ↑/↓ (an
-                  // explicit choice, which the line below honours). Tab still
-                  // completes.
-                  if (parsed.kind !== "command" && selected === 0) return;
-                  // A space closes the popup (name-mode only), so no arguments can
-                  // be pending here: accepting the highlighted row is exactly what
-                  // "complete and run" means (`/us` -> `/usage`). Fully typed
-                  // commands — arguments and unknowns included — reach the
-                  // no-popup branch below with `parsed` intact.
-                  const picked = options[Math.min(selected, options.length - 1)];
-                  runSlash(picked.name, null);
+                  handleSendClick();
                   return;
                 }
                 return; // 弹窗开启时吞掉其余按键,不作文本处理
@@ -299,28 +313,11 @@ export function MessageInput({
                 // Confirming a candidate with Enter is the IME's key, not the user's:
                 // let the composition land in the box and wait for the next Enter.
                 e.preventDefault();
-                // 回合进行中：输入框可编辑（草稿要留住、能准备下一句），但 Enter 仍然
-                // 只表示「中断」——发送必须先 Stop。这条必须在斜杠命令之前，否则
-                // `/clear` 之类会在半路把转录抹掉。
-                if (turnActive) {
-                  onInterrupt();
-                  return;
-                }
-                if (parsed.kind === "command") {
-                  // This branch is reached when the popup matched nothing: unknown
-                  // commands and matched commands alike belong to the command
-                  // layer, never to the agent (`/nope` reports, it does not send).
-                  runSlash(parsed.name, parsed.args);
-                  return;
-                }
-                if (parsed.kind === "path") {
-                  // Two-slash first token is a path (TUI parity) — falls through.
-                }
-                void handleSend();
+                handleSendClick();
               }
             }}
-            // 回合进行中**不**置灰：用户要能先打好下一句，等 Stop 之后直接发。
-            // 发送能力仍被 Enter/Stop 的语义锁住，可见状态与可编辑状态解耦。
+            // Active turns stay editable. Only an in-flight submission or the
+            // parent availability guard disables the textarea.
             disabled={disabled || sending}
             rows={3}
             placeholder={
@@ -369,18 +366,26 @@ export function MessageInput({
             <div className="flex items-center gap-2 max-md:flex-wrap max-md:min-w-0 max-md:basis-full">
               <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
               {modelPicker}
-              <button
-                type="button"
-                onClick={turnActive ? onInterrupt : handleSendClick}
-                disabled={turnActive ? stopDisabled : sendDisabled}
-                className={
-                  turnActive
-                    ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 max-md:ml-auto"
-                    : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
-                }
-              >
-                {turnActive ? "Stop" : "Send"}
-              </button>
+              {turnActive && (
+                <button
+                  type="button"
+                  onClick={onInterrupt}
+                  disabled={stopDisabled}
+                  className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 max-md:ml-auto"
+                >
+                  Stop
+                </button>
+              )}
+              {(!turnActive || !isMobile) && (
+                <button
+                  type="button"
+                  onClick={handleSendClick}
+                  disabled={sendDisabled}
+                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
+                >
+                  Send
+                </button>
+              )}
             </div>
           </div>
         </div>
