@@ -116,7 +116,15 @@ fn the_lead_tick_arm_is_gated_by_the_flag() {
     // `serve()` 里、位于本模块之后。改用完整源码，并取**最后一处**——本
     // 测试自己的 `.split("...")` 字面量也是一次命中，只有生产代码那处才在
     // 它后面还有 `if !lead_agent_enabled`。
-    let source = include_str!("../server.rs");
+    //
+    // 搬移（wave2 C2 batch 8）后 `serve()` 在 `server/transport/mod.rs`，所以
+    // 两段都要看。`server.rs` 放前面：它的 `.split` 命中的是本测试自己的字面量，
+    // 排在后面才能让 `rsplit` 取到真正的那一处。
+    let source = concat!(
+        include_str!("../server.rs"),
+        "\n",
+        include_str!("../server/transport/mod.rs"),
+    );
     let arm = source
         .rsplit("_ = lead_ticker.tick() => {")
         .next()
