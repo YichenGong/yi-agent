@@ -118,13 +118,13 @@ impl TraceSubscription {
                 "trace subscription envelope identity mismatch",
             )));
         }
-        if let IpcResponse::TraceEvent(row) = &envelope.result {
-            if envelope.event_id != Some(row.event_id) {
-                return Err(IpcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "trace subscription event envelope identity mismatch",
-                )));
-            }
+        if let IpcResponse::TraceEvent(row) = &envelope.result
+            && envelope.event_id != Some(row.event_id)
+        {
+            return Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trace subscription event envelope identity mismatch",
+            )));
         }
         if let IpcResponse::Error { code, message } = &envelope.result {
             return Err(IpcError::Remote {

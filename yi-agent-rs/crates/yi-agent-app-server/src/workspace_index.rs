@@ -156,10 +156,10 @@ impl WorkspaceIndex {
             )));
         }
         // 环：child 已有附属根时，那个附属根不能是 primary 的后代。
-        if let Some(existing) = file.links.get(&primary) {
-            if existing.iter().any(|k| k == &child) {
-                return Ok(()); // 幂等
-            }
+        if let Some(existing) = file.links.get(&primary)
+            && existing.iter().any(|k| k == &child)
+        {
+            return Ok(()); // 幂等
         }
         if child_is_primary_of(&file, &child, &primary) {
             return Err(LinkError(format!(

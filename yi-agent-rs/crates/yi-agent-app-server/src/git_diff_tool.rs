@@ -193,10 +193,10 @@ impl Tool for ShowGitDiffTool {
         // 工具调用同步跑在线程上，该线程可能刚服务过别的请求：先清掉可能残留的
         // 超时标记，否则本调用会被上一次的挂住误报成超时。
         crate::git_diff::reset_git_timeout();
-        if let Some(ref rev) = explicit {
-            if !crate::git_diff::valid_rev(&self.repo, rev) {
-                return ToolResult::error(format!("`{rev}` is not a usable git revision"));
-            }
+        if let Some(ref rev) = explicit
+            && !crate::git_diff::valid_rev(&self.repo, rev)
+        {
+            return ToolResult::error(format!("`{rev}` is not a usable git revision"));
         }
         let frame = crate::git_diff::structured_frame(
             &self.repo,

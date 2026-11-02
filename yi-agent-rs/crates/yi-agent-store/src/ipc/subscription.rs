@@ -26,15 +26,14 @@ impl Subscription {
                 "subscription response envelope identity mismatch",
             )));
         }
-        if let IpcResponse::Event(event) = &envelope.result {
-            if envelope.event_id != Some(event.event_id)
-                || envelope.event.as_ref() != Some(&IpcEventPayload::from(event))
-            {
-                return Err(IpcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "subscription event envelope identity mismatch",
-                )));
-            }
+        if let IpcResponse::Event(event) = &envelope.result
+            && (envelope.event_id != Some(event.event_id)
+                || envelope.event.as_ref() != Some(&IpcEventPayload::from(event)))
+        {
+            return Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "subscription event envelope identity mismatch",
+            )));
         }
         Ok(envelope)
     }

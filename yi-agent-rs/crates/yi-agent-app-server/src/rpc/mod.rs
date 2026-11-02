@@ -84,14 +84,14 @@ pub(crate) fn thread_config_view(
     // 「model 是 A 家的、api_url 是 B 家的」这种自相矛盾的卡片。
     let model = match live_model {
         Some(model) => {
-            if model != effective.model {
-                if let Some(entry) = catalog.models.iter().find(|entry| entry.model == model) {
-                    effective = yi_agent_runtime::models::resolve_effective(
-                        cfg,
-                        &catalog,
-                        Some(entry.name.as_str()),
-                    );
-                }
+            if model != effective.model
+                && let Some(entry) = catalog.models.iter().find(|entry| entry.model == model)
+            {
+                effective = yi_agent_runtime::models::resolve_effective(
+                    cfg,
+                    &catalog,
+                    Some(entry.name.as_str()),
+                );
             }
             model.to_string()
         }

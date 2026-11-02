@@ -139,10 +139,10 @@ impl WorkerRefresh {
         );
         let key = EffectiveKey::of(&effective);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cached_key, parts)) = cache.as_ref() {
-            if *cached_key == key {
-                return Some(Arc::clone(parts));
-            }
+        if let Some((cached_key, parts)) = cache.as_ref()
+            && *cached_key == key
+        {
+            return Some(Arc::clone(parts));
         }
         match WorkerParts::rebuild(&self.cfg, &catalog) {
             Ok(parts) => {
@@ -819,10 +819,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         if refreshed.is_none() {
             config.model = self.worker_config_model(&request.model);
         }
-        if let Some(catalog) = &self.catalog {
-            if let Some(prompt) = catalog.current_system_prompt() {
-                config.system_prompt = Some(prompt);
-            }
+        if let Some(catalog) = &self.catalog
+            && let Some(prompt) = catalog.current_system_prompt()
+        {
+            config.system_prompt = Some(prompt);
         }
         let runtime_socket = self.runtime_socket.clone();
         let cancellation = request.cancellation.clone();

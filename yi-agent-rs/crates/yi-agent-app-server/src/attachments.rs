@@ -131,10 +131,10 @@ fn mime_for(path: &Path) -> Option<String> {
 /// 删除该 thread 的全部附件；尽力而为——目录不存在不算失败，空壳目录顺手收走。
 pub fn remove_attachments(cwd: &Path, thread_id: &str) {
     let dir = thread_dir(cwd, thread_id);
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("[app-server] failed to remove attachments for {thread_id}: {e}");
-        }
+    if let Err(e) = std::fs::remove_dir_all(&dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("[app-server] failed to remove attachments for {thread_id}: {e}");
     }
     // 不留空壳：与 settings_store 清理空 `.yi-agent` 目录的做法一致。
     let _ = std::fs::remove_dir(cwd.join(".yi-agent").join("attachments"));

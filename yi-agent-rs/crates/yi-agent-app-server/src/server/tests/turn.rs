@@ -1286,10 +1286,10 @@ async fn driver_uses_unique_item_ids_across_turns() {
             assert!(n > 0, "unexpected EOF while waiting for turn/completed");
             let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
             let method = v["method"].as_str().unwrap_or("");
-            if method == "item/started" {
-                if let Some(id) = v["params"]["item"]["id"].as_str() {
-                    item_ids.push(id.to_string());
-                }
+            if method == "item/started"
+                && let Some(id) = v["params"]["item"]["id"].as_str()
+            {
+                item_ids.push(id.to_string());
             }
             if method == "turn/completed" {
                 break;
@@ -3527,12 +3527,12 @@ async fn the_persisted_completion_is_not_later_than_the_broadcast_one() {
             .path()
             .join(".yi-agent/threads")
             .join(format!("{tid}.meta.json"));
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
-                persisted_at = meta["last_completed_at"].as_u64().unwrap_or(0);
-                if persisted_at > 0 {
-                    break;
-                }
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            persisted_at = meta["last_completed_at"].as_u64().unwrap_or(0);
+            if persisted_at > 0 {
+                break;
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;

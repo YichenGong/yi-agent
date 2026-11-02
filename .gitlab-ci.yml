@@ -35,6 +35,8 @@ ci-push:
     - cd yi-agent-rs
     - rustup default stable
     - rustup update stable
+    # msrv-check 用声明的 rust-version 真编译；不装这个工具链该门禁必红。
+    - rustup toolchain install 1.89.0 --profile minimal
     - export PATH="$HOME/.local/bin:$PATH"
     - just --version 2>/dev/null || curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
     - just --version
@@ -49,6 +51,8 @@ ci-mr:
   before_script:
     - cd yi-agent-rs
     - curl -sSf https://just.systems/install.sh | sh -s -- --to /usr/local/bin
+    # rust:latest 自带 rustup；再装声明的 MSRV，供 msrv-check 使用。
+    - rustup toolchain install 1.89.0 --profile minimal
   script:
     - just ci
 

@@ -842,11 +842,9 @@ fn run_loop<B: Backend, E: EventSource>(
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
-            if is_turn_end {
-                if let Some(text) = loop_bk.queued.on_turn_end() {
-                    let _ = channels.input.try_send(text.clone());
-                    history.push(HistoryCell::UserMessage { text }, draw_text_width);
-                }
+            if is_turn_end && let Some(text) = loop_bk.queued.on_turn_end() {
+                let _ = channels.input.try_send(text.clone());
+                history.push(HistoryCell::UserMessage { text }, draw_text_width);
             }
         }
 
@@ -2492,11 +2490,11 @@ fn handle_key(key: KeyEvent, ctx: &mut KeyContext<'_>) -> KeyOutcome {
             }
             KeyCode::Tab => {
                 // Complete the selected command name into the input buffer
-                if let Some(p) = ctx.view.popup.as_ref() {
-                    if let Some(cmd) = p.selected() {
-                        ctx.view.input.buffer = format!("/{}", cmd.name());
-                        ctx.view.input.cursor = ctx.view.input.buffer.len();
-                    }
+                if let Some(p) = ctx.view.popup.as_ref()
+                    && let Some(cmd) = p.selected()
+                {
+                    ctx.view.input.buffer = format!("/{}", cmd.name());
+                    ctx.view.input.cursor = ctx.view.input.buffer.len();
                 }
                 *ctx.view.popup = None;
                 return KeyOutcome::None;

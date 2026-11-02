@@ -68,10 +68,10 @@ fn set(path: &Path, params: &Value) -> Result<Value, RpcError> {
     if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
         cfg.enabled = enabled;
     }
-    if let Some(id) = params.get("active_engine").and_then(Value::as_str) {
-        if cfg.engines.contains_key(id) {
-            cfg.active_engine = id.to_string();
-        }
+    if let Some(id) = params.get("active_engine").and_then(Value::as_str)
+        && cfg.engines.contains_key(id)
+    {
+        cfg.active_engine = id.to_string();
     }
     if let Some(engines) = params.get("engines").and_then(Value::as_object) {
         for (id, patch) in engines {

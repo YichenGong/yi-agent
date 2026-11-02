@@ -878,10 +878,10 @@ impl AgentSupervisor {
                         ),
                         false,
                     );
-                    if let Err(error) = notification {
-                        if !matches!(error, MessageDeliveryError::RecipientTerminal) {
-                            return Err(error.to_string());
-                        }
+                    if let Err(error) = notification
+                        && !matches!(error, MessageDeliveryError::RecipientTerminal)
+                    {
+                        return Err(error.to_string());
                     }
                 }
                 WorkerEvent::Completed { report } => {

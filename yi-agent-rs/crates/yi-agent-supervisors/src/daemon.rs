@@ -137,17 +137,17 @@ pub fn stop(project: &Path) -> Result<(), String> {
         )
     })?;
 
-    if is_running(project) {
-        if let Err(error) = send_request(&socket, IpcRequest::Stop) {
-            // It died between the probe and the send: still a successful stop.
-            if !is_running(project) {
-                return Ok(());
-            }
-            return Err(format!(
-                "could not tell the daemon for {} to stop: {error}",
-                project.display()
-            ));
+    if is_running(project)
+        && let Err(error) = send_request(&socket, IpcRequest::Stop)
+    {
+        // It died between the probe and the send: still a successful stop.
+        if !is_running(project) {
+            return Ok(());
         }
+        return Err(format!(
+            "could not tell the daemon for {} to stop: {error}",
+            project.display()
+        ));
     }
 
     let deadline = Instant::now() + STOP_TIMEOUT;

@@ -768,23 +768,23 @@ pub fn resolve_effective(
             out.reasoning_effort = entry.reasoning_effort.clone();
             // 能力可信且该档不在支持列表里 → 按「未发送」处理：发出去必然被拒，
             // 只会让 provider 白跑一轮「剥离字段重投」。`None`（能力未知）不受影响。
-            if let Some(effort) = out.reasoning_effort.clone() {
-                if !effort_is_allowed(entry, &effort) {
-                    tracing::info!(
-                        model = %entry.name,
-                        %effort,
-                        "configured reasoning effort is not supported; dropping it"
-                    );
-                    out.reasoning_effort = None;
-                }
+            if let Some(effort) = out.reasoning_effort.clone()
+                && !effort_is_allowed(entry, &effort)
+            {
+                tracing::info!(
+                    model = %entry.name,
+                    %effort,
+                    "configured reasoning effort is not supported; dropping it"
+                );
+                out.reasoning_effort = None;
             }
             // `context_length` 来自手写 `models.json`，是外部输入：饱和乘法挡住 `length * ratio`
             // 的溢出（debug 会 panic、release 会静默回绕）；`0` 视为"未声明"，否则
             // `compact_threshold == 0` 会让每一轮都触发压缩。静默条目保持 cfg 阈值原样。
-            if let Some(length) = entry.context_length {
-                if length > 0 {
-                    out.compact_threshold = length.saturating_mul(out.compact_ratio) / 100;
-                }
+            if let Some(length) = entry.context_length
+                && length > 0
+            {
+                out.compact_threshold = length.saturating_mul(out.compact_ratio) / 100;
             }
             out
         }

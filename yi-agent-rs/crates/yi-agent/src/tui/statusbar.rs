@@ -73,11 +73,11 @@ impl StatusBarState {
         self.spinner_phase = (self.spinner_phase + 4) % 360;
 
         // If no new usage for 1s, snap to target (call finished).
-        if let Some(t) = self.last_usage_time {
-            if t.elapsed() > std::time::Duration::from_secs(1) {
-                self.display_input = self.target_input;
-                self.display_output = self.target_output;
-            }
+        if let Some(t) = self.last_usage_time
+            && t.elapsed() > std::time::Duration::from_secs(1)
+        {
+            self.display_input = self.target_input;
+            self.display_output = self.target_output;
         }
     }
 

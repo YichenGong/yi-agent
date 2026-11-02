@@ -566,19 +566,18 @@ impl HistoryState {
         let generation = self.content_generation.get();
         {
             let cache = self.cache.borrow();
-            if let Some((area, height, width, decided_at, decided_theme)) = cache.decision {
-                if area == area_width
-                    && height == viewport_height
-                    && decided_at == generation
-                    && decided_theme == theme.kind
-                {
-                    // `width` shadows the narrowing, so bind it out before the
-                    // borrow is released and the cache is re-aligned.
-                    let decided = width;
-                    drop(cache);
-                    self.ensure_cache(decided, theme);
-                    return decided;
-                }
+            if let Some((area, height, width, decided_at, decided_theme)) = cache.decision
+                && area == area_width
+                && height == viewport_height
+                && decided_at == generation
+                && decided_theme == theme.kind
+            {
+                // `width` shadows the narrowing, so bind it out before the
+                // borrow is released and the cache is re-aligned.
+                let decided = width;
+                drop(cache);
+                self.ensure_cache(decided, theme);
+                return decided;
             }
         }
 
@@ -740,12 +739,12 @@ impl HistoryState {
 
     /// Toggle fold on selected cell.
     pub fn toggle_fold_selected(&mut self) {
-        if let Some(i) = self.selected {
-            if let Some(cell) = self.cells.get_mut(i) {
-                cell.toggle_fold();
-                self.invalidate_cell(i);
-                self.note_content_change();
-            }
+        if let Some(i) = self.selected
+            && let Some(cell) = self.cells.get_mut(i)
+        {
+            cell.toggle_fold();
+            self.invalidate_cell(i);
+            self.note_content_change();
         }
     }
 
@@ -785,19 +784,19 @@ impl HistoryState {
     fn invalidate_mutated_cells(&self, event: &AgentEvent) {
         match event {
             AgentEvent::AssistantText(text) => {
-                if !text.is_empty() {
-                    if let Some(last) = self.cells.len().checked_sub(1) {
-                        self.invalidate_cell(last);
-                    }
+                if !text.is_empty()
+                    && let Some(last) = self.cells.len().checked_sub(1)
+                {
+                    self.invalidate_cell(last);
                 }
             }
             AgentEvent::ReasoningDelta { text, .. } => {
                 // Streamed CoT mutates the trailing reasoning block in place,
                 // exactly like streamed assistant text.
-                if !text.is_empty() {
-                    if let Some(last) = self.cells.len().checked_sub(1) {
-                        self.invalidate_cell(last);
-                    }
+                if !text.is_empty()
+                    && let Some(last) = self.cells.len().checked_sub(1)
+                {
+                    self.invalidate_cell(last);
                 }
             }
             AgentEvent::ToolResult { id, .. } => {
@@ -1094,15 +1093,15 @@ impl HistoryState {
                     .collect::<Vec<_>>()
                     .join("\n");
                 for cell in self.cells.iter_mut() {
-                    if let HistoryCell::ToolCall { id: cid, state, .. } = cell {
-                        if cid == &id {
-                            *state = if is_error {
-                                super::cell::CallState::Failed
-                            } else {
-                                super::cell::CallState::Success
-                            };
-                            break;
-                        }
+                    if let HistoryCell::ToolCall { id: cid, state, .. } = cell
+                        && cid == &id
+                    {
+                        *state = if is_error {
+                            super::cell::CallState::Failed
+                        } else {
+                            super::cell::CallState::Success
+                        };
+                        break;
                     }
                 }
                 self.cells.push(HistoryCell::ToolResult {
@@ -1215,11 +1214,10 @@ impl HistoryState {
                         resolved,
                         ..
                     } = cell
+                        && *rid == request_id
                     {
-                        if *rid == request_id {
-                            *resolved = true;
-                            break;
-                        }
+                        *resolved = true;
+                        break;
                     }
                 }
                 self.cells

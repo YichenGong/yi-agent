@@ -69,34 +69,32 @@ where
     ) {
         let pending = self.pending_tool_calls.entry(index).or_default();
 
-        if let Some(id) = tc.get("id").and_then(Value::as_str) {
-            if !id.is_empty() {
-                pending.id = id.to_string();
-            }
+        if let Some(id) = tc.get("id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            pending.id = id.to_string();
         }
         if let Some(name) = tc
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
+            && !name.is_empty()
         {
-            if !name.is_empty() {
-                pending.name = name.to_string();
-            }
+            pending.name = name.to_string();
         }
         if let Some(args) = tc
             .get("function")
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
+            && !args.is_empty()
         {
-            if !args.is_empty() {
-                if pending.started {
-                    events.push(ProviderEvent::ToolUseDelta {
-                        id: pending.id.clone(),
-                        partial_json: args.to_string(),
-                    });
-                } else {
-                    pending.args.push_str(args);
-                }
+            if pending.started {
+                events.push(ProviderEvent::ToolUseDelta {
+                    id: pending.id.clone(),
+                    partial_json: args.to_string(),
+                });
+            } else {
+                pending.args.push_str(args);
             }
         }
 
@@ -168,47 +166,47 @@ where
 
         let mut events = Vec::new();
 
-        if let Some(usage) = data.get("usage") {
-            if !usage.is_null() {
-                let prompt_tokens = usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
-                let completion_tokens = usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
-                // Cache tokens: support two conventions.
-                // 1. Anthropic-style direct fields (passed through by some
-                //    OpenAI-compatible gateways): usage.cache_creation_input_tokens
-                //    and usage.cache_read_input_tokens.
-                // 2. OpenAI-style nested field: usage.prompt_tokens_details.cached_tokens
-                //    (cache READ only; OpenAI has no "cache creation" concept).
-                // Anthropic-style takes precedence when both are present, since it
-                // distinguishes creation vs read.
-                let cache_creation_input_tokens = usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                let cache_read_input_tokens = usage
-                    .get("cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32)
-                    .or_else(|| {
-                        usage
-                            .get("prompt_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(Value::as_u64)
-                            .map(|v| v as u32)
-                    });
-                events.push(ProviderEvent::Usage(TokenUsage {
-                    input_tokens: prompt_tokens,
-                    output_tokens: completion_tokens,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    reasoning_tokens: None,
-                }));
-            }
+        if let Some(usage) = data.get("usage")
+            && !usage.is_null()
+        {
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            // Cache tokens: support two conventions.
+            // 1. Anthropic-style direct fields (passed through by some
+            //    OpenAI-compatible gateways): usage.cache_creation_input_tokens
+            //    and usage.cache_read_input_tokens.
+            // 2. OpenAI-style nested field: usage.prompt_tokens_details.cached_tokens
+            //    (cache READ only; OpenAI has no "cache creation" concept).
+            // Anthropic-style takes precedence when both are present, since it
+            // distinguishes creation vs read.
+            let cache_creation_input_tokens = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            let cache_read_input_tokens = usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .or_else(|| {
+                    usage
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32)
+                });
+            events.push(ProviderEvent::Usage(TokenUsage {
+                input_tokens: prompt_tokens,
+                output_tokens: completion_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                reasoning_tokens: None,
+            }));
         }
 
         if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
@@ -219,33 +217,30 @@ where
                 // chunk; emitting Stop first would make downstream guards
                 // (which latch on Stop) discard that delta, producing an empty
                 // reply.
-                if !self.stopped {
-                    if let Some(delta) = choice.get("delta") {
-                        if let Some(reasoning) =
-                            delta.get("reasoning_content").and_then(Value::as_str)
-                        {
-                            if !reasoning.is_empty() {
-                                self.reasoning_buffer.push_str(reasoning);
-                                events.push(ProviderEvent::ReasoningDelta {
-                                    text: reasoning.to_string(),
-                                    kind: ReasoningKind::Content,
-                                });
-                            }
-                        }
+                if !self.stopped
+                    && let Some(delta) = choice.get("delta")
+                {
+                    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                        && !reasoning.is_empty()
+                    {
+                        self.reasoning_buffer.push_str(reasoning);
+                        events.push(ProviderEvent::ReasoningDelta {
+                            text: reasoning.to_string(),
+                            kind: ReasoningKind::Content,
+                        });
+                    }
 
-                        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                            if !content.is_empty() {
-                                events.push(ProviderEvent::TextDelta(content.to_string()));
-                            }
-                        }
+                    if let Some(content) = delta.get("content").and_then(Value::as_str)
+                        && !content.is_empty()
+                    {
+                        events.push(ProviderEvent::TextDelta(content.to_string()));
+                    }
 
-                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array())
-                        {
-                            for tc in tool_calls {
-                                let index =
-                                    tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                self.absorb_tool_call_delta(index, tc, &mut events);
-                            }
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            let index =
+                                tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            self.absorb_tool_call_delta(index, tc, &mut events);
                         }
                     }
                 }

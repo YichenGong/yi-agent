@@ -72,14 +72,14 @@ async fn first_turn_title_comes_from_llm() {
     let deadline = tokio::time::Instant::now() + EVENT_WAIT;
     while tokio::time::Instant::now() < deadline {
         let store = crate::thread_store::ThreadStore::new(dir.path());
-        if let Ok(Some(loaded)) = store.load(&tid) {
-            if let Some(t) = loaded.meta.title {
-                if t == "修复登录报错" {
-                    title = Some(t);
-                    break;
-                }
+        if let Ok(Some(loaded)) = store.load(&tid)
+            && let Some(t) = loaded.meta.title
+        {
+            if t == "修复登录报错" {
                 title = Some(t);
+                break;
             }
+            title = Some(t);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

@@ -563,11 +563,11 @@ async fn thread_clear_empties_the_context_and_resume_does_not_revive_it() {
     let mut persisted = false;
     let deadline = tokio::time::Instant::now() + EVENT_WAIT;
     while tokio::time::Instant::now() < deadline {
-        if let Ok(t) = std::fs::read_to_string(&log) {
-            if !t.trim().is_empty() {
-                persisted = true;
-                break;
-            }
+        if let Ok(t) = std::fs::read_to_string(&log)
+            && !t.trim().is_empty()
+        {
+            persisted = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

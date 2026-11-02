@@ -171,21 +171,20 @@ impl Mailbox {
     pub fn push(&mut self, draft: MailboxMessageDraft) -> DeliveryReceipt {
         if let (MessageKind::Progress(_), Some(correlation_id)) =
             (&draft.kind, &draft.correlation_id)
-        {
-            if let Some(existing) = self.messages.iter_mut().find(|message| {
+            && let Some(existing) = self.messages.iter_mut().find(|message| {
                 matches!(message.kind, MessageKind::Progress(_))
                     && message.sender == draft.sender
                     && message.recipient == draft.recipient
                     && message.correlation_id.as_ref() == Some(correlation_id)
-            }) {
-                existing.kind = draft.kind;
-                existing.coalesced_count += 1;
-                return DeliveryReceipt {
-                    message_id: existing.id.clone(),
-                    wakes_recipient: false,
-                    coalesced: true,
-                };
-            }
+            })
+        {
+            existing.kind = draft.kind;
+            existing.coalesced_count += 1;
+            return DeliveryReceipt {
+                message_id: existing.id.clone(),
+                wakes_recipient: false,
+                coalesced: true,
+            };
         }
         let priority = draft.kind.priority();
         let wakes_recipient = draft.kind.wakes_recipient();

@@ -154,10 +154,10 @@ fn start_run_with_live_tool(port: u16, pid_file: &str) -> (ChildGuard, i32) {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        if let Ok(raw) = std::fs::read_to_string(pid_file) {
-            if let Ok(pgid) = raw.trim().parse::<i32>() {
-                return (child, pgid);
-            }
+        if let Ok(raw) = std::fs::read_to_string(pid_file)
+            && let Ok(pgid) = raw.trim().parse::<i32>()
+        {
+            return (child, pgid);
         }
         std::thread::sleep(Duration::from_millis(50));
     }

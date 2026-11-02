@@ -39,7 +39,7 @@ bash install.sh ./yi-agent_<版本>_aarch64.dmg
 
 ### 从源码构建
 
-需要 Rust 1.85 或更高版本。
+需要 Rust 1.89 或更高版本。
 
 ```bash
 git clone https://github.com/YichenGong/yi-agent.git

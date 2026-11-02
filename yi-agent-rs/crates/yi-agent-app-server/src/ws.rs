@@ -391,10 +391,11 @@ async fn redeem_pair_code(
 fn query_param(uri: &Uri, key: &str) -> Option<String> {
     let query = uri.query()?;
     for pair in query.split('&') {
-        if let Some((k, value)) = pair.split_once('=') {
-            if k == key && !value.is_empty() {
-                return Some(percent_decode(value));
-            }
+        if let Some((k, value)) = pair.split_once('=')
+            && k == key
+            && !value.is_empty()
+        {
+            return Some(percent_decode(value));
         }
     }
     None
@@ -403,14 +404,13 @@ fn query_param(uri: &Uri, key: &str) -> Option<String> {
 /// 从握手请求里取设备 token:`Authorization: Bearer <token>` 优先,其次
 /// `?token=<token>`。空 token 视同没有。
 fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(value) = value.to_str() {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                let token = token.trim();
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
-            }
+    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION)
+        && let Ok(value) = value.to_str()
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
         }
     }
     query_param(uri, "token")

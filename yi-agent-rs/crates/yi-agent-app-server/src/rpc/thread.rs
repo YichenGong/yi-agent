@@ -381,22 +381,22 @@ pub(crate) async fn handle(
             // 后续 load 落空,退化成含混的 -32011,甚至悄悄换到别的目录)。
             // 冷 thread 的 meta 存在 workspace 目录内,删目录后本就不可读,
             // 仍走下方的 -32011,不在此覆盖。
-            if let Some(session) = state.threads.get(&thread_id) {
-                if !Path::new(&session.cwd).is_dir() {
-                    write_response(
-                        state.hub,
-                        state.client,
-                        err_response(
-                            id.clone(),
-                            RpcError::invalid_params(format!(
-                                "working directory no longer exists: {}",
-                                session.cwd
-                            )),
-                        ),
-                    )
-                    .await?;
-                    return Ok(Flow::Continue);
-                }
+            if let Some(session) = state.threads.get(&thread_id)
+                && !Path::new(&session.cwd).is_dir()
+            {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id.clone(),
+                        RpcError::invalid_params(format!(
+                            "working directory no longer exists: {}",
+                            session.cwd
+                        )),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
             }
             // 优先用内存中该 thread 的权威 store(与其 driver 共享 lock),
             // 冷 thread 才按全局索引 / cfg.workdir 定位,再从中载入历史。
@@ -947,16 +947,16 @@ pub(crate) async fn handle(
             // 读清单路径走注入的 `models_path`(与 `model/*` 同一份),
             // 故 upsert 刚落盘的条目立刻可见。
             let catalog = yi_agent_runtime::models::load_catalog_from(state.models_path);
-            if let Some(n) = &name {
-                if !catalog.models.iter().any(|m| &m.name == n) {
-                    write_response(
-                        state.hub,
-                        state.client,
-                        err_response(id, RpcError::model_not_found(n)),
-                    )
-                    .await?;
-                    return Ok(Flow::Continue);
-                }
+            if let Some(n) = &name
+                && !catalog.models.iter().any(|m| &m.name == n)
+            {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::model_not_found(n)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
             }
             // 生效串按 清单条目 → 全局默认 → cfg 解析;校验通过后再落盘。
             let effective =
@@ -1118,29 +1118,27 @@ pub(crate) async fn handle(
                     state.cfg,
                     &catalog,
                     model_ref.as_deref(),
-                ) {
-                    if let Some(allowed) = yi_agent_runtime::models::supported_efforts(entry) {
-                        if !allowed.iter().any(|s| s == effort) {
-                            let supported = if allowed.is_empty() {
-                                "(none)".to_string()
-                            } else {
-                                allowed.join(", ")
-                            };
-                            write_response(
-                                state.hub,
-                                state.client,
-                                err_response(
-                                    id,
-                                    RpcError::invalid_params(format!(
-                                        "reasoning effort '{effort}' is not supported by this \
+                ) && let Some(allowed) = yi_agent_runtime::models::supported_efforts(entry)
+                    && !allowed.iter().any(|s| s == effort)
+                {
+                    let supported = if allowed.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        allowed.join(", ")
+                    };
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(
+                            id,
+                            RpcError::invalid_params(format!(
+                                "reasoning effort '{effort}' is not supported by this \
                                          model; supported: {supported}"
-                                    )),
-                                ),
-                            )
-                            .await?;
-                            return Ok(Flow::Continue);
-                        }
-                    }
+                            )),
+                        ),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
                 }
             }
             // 先让在场 driver 用新 effort 重建 agent（复用当前 provider——
@@ -1866,10 +1864,10 @@ pub(crate) async fn handle(
             }
             // 会话已删：成员表不能留悬空 id（spec「不变量 2」）。失败只记日志——
             // 会话删除本身已经成功，不该因为一次分组清理写失败而回滚。
-            if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent()) {
-                if let Err(e) = crate::group_store::remove_thread(cwd, &thread_id) {
-                    eprintln!("[app-server] could not prune {thread_id} from groups: {e}");
-                }
+            if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent())
+                && let Err(e) = crate::group_store::remove_thread(cwd, &thread_id)
+            {
+                eprintln!("[app-server] could not prune {thread_id} from groups: {e}");
             }
             // 收走该会话的附件:与 thread 文件同一生命周期。放在 delete
             // 之后(driver 已结束落盘),避免竞态——工作区被挪走时
@@ -1899,19 +1897,15 @@ pub(crate) async fn handle(
                 | crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete { path, .. },
                 Some(project),
             ) = (&reclaim, driver_project.as_deref())
+                && let Err(error) = crate::worktree_reclaim::remove(path, Path::new(project), force)
             {
-                if let Err(error) = crate::worktree_reclaim::remove(path, Path::new(project), force)
-                {
-                    eprintln!(
-                        "[app-server] could not remove the worktree for {thread_id}: {error}"
-                    );
-                    worktree_failure = Some(json!({
-                        "action": "remove",
-                        "removed": false,
-                        "path": path.to_string_lossy(),
-                        "reason": error,
-                    }));
-                }
+                eprintln!("[app-server] could not remove the worktree for {thread_id}: {error}");
+                worktree_failure = Some(json!({
+                    "action": "remove",
+                    "removed": false,
+                    "path": path.to_string_lossy(),
+                    "reason": error,
+                }));
             }
             // 只有"被承诺会删、且确实没删成"才带字段；普通会话（reclaim=None）、
             // Keep、以及删除成功一律仍是空成功体，既有形状零变化。

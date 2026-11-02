@@ -1494,10 +1494,10 @@ fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
     // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
     // 让 should_offer / prompt 与运行期读点一致。
     let models_path = yi_agent_runtime::models::models_path();
-    if onboarding_prompt::should_offer(&prefs_path) {
-        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path) {
-            eprintln!("引导未完成：{error}");
-        }
+    if onboarding_prompt::should_offer(&prefs_path)
+        && let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path)
+    {
+        eprintln!("引导未完成：{error}");
     }
 
     let config = config::load_lenient(&cli)?;
@@ -2007,15 +2007,15 @@ fn run_headless(
     // 消息不会丢，升格的意义是让磁盘也收尾。
     let mut seed_messages = Vec::new();
     let mut seed_last_input = None;
-    if let Some(store) = &session_store {
-        if resume.is_some() {
-            if let Err(e) = store.promote_pending() {
-                eprintln!("[yi-agent] 未能升格未收尾的轮次: {e}");
-            }
-            let (messages, last_input) = store.load_seed()?;
-            seed_messages = messages;
-            seed_last_input = last_input;
+    if let Some(store) = &session_store
+        && resume.is_some()
+    {
+        if let Err(e) = store.promote_pending() {
+            eprintln!("[yi-agent] 未能升格未收尾的轮次: {e}");
         }
+        let (messages, last_input) = store.load_seed()?;
+        seed_messages = messages;
+        seed_last_input = last_input;
     }
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -2887,8 +2887,7 @@ fn run_tui_agent(
                 if !root_activated {
                     if let Some(TuiRuntimeSession::Attached(attached)) =
                         current_runtime.as_ref()
-                    {
-                        if let Err(error) = activate_tui_runtime_root(
+                        && let Err(error) = activate_tui_runtime_root(
                             &attached.socket_path,
                             &attached.attached_root,
                             &text,
@@ -2903,7 +2902,6 @@ fn run_tui_agent(
                                 .await;
                             continue;
                         }
-                    }
                     root_activated = true;
                 }
 
@@ -2931,11 +2929,10 @@ fn run_tui_agent(
 
                 // Run agent
                 is_running_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(handle) = &catalog {
-                    if let Some(prompt) = handle.current_system_prompt() {
+                if let Some(handle) = &catalog
+                    && let Some(prompt) = handle.current_system_prompt() {
                         agent.set_system_prompt(Some(prompt));
                     }
-                }
 
                 // 每轮重置累积器。`begin_turn` 内的 `set_turn` 必须先于
                 // `on_event`：`alloc_item_id` 依赖 turn_id。
@@ -3057,15 +3054,14 @@ fn run_tui_agent(
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             }
-            if current_runtime.is_some() {
-                if let Some((socket, root)) = runtime_detach_for_driver
+            if current_runtime.is_some()
+                && let Some((socket, root)) = runtime_detach_for_driver
                     .lock()
                     .expect("runtime detach mutex poisoned")
                     .take()
                 {
                     detach_tui_runtime_root(&socket, &root);
                 }
-            }
         });
 
         // Run TUI on a dedicated blocking thread (it uses sync crossterm polling)

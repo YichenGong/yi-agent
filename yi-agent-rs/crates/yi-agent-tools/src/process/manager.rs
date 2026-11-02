@@ -365,13 +365,12 @@ impl ProcessManager {
             if processes.len() >= 16 {
                 return Err("maximum managed process count reached".into());
             }
-            if let Some(name) = &name {
-                if processes
+            if let Some(name) = &name
+                && processes
                     .values()
                     .any(|process| process.name.as_ref() == Some(name))
-                {
-                    return Err("process name already exists".into());
-                }
+            {
+                return Err("process name already exists".into());
             }
             processes.insert(
                 process_id.clone(),

@@ -112,10 +112,10 @@ fn scan_transcript(
                     };
                 for item in items {
                     total_items += 1;
-                    if let crate::protocol::Item::AgentMessage { text, .. } = &item {
-                        if !text.trim().is_empty() {
-                            last_agent_text = Some(text.clone());
-                        }
+                    if let crate::protocol::Item::AgentMessage { text, .. } = &item
+                        && !text.trim().is_empty()
+                    {
+                        last_agent_text = Some(text.clone());
                     }
                     if keep_tail > 0 {
                         tail.push_back(item);

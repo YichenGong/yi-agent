@@ -202,10 +202,8 @@ impl McpManager {
             );
         }
 
-        if cache_dirty {
-            if let Err(e) = cache.save(workdir) {
-                warn!(error = %e, "failed to persist MCP cache");
-            }
+        if cache_dirty && let Err(e) = cache.save(workdir) {
+            warn!(error = %e, "failed to persist MCP cache");
         }
 
         let manager = Self::from_parts(servers, cfg.enabled);
@@ -386,10 +384,8 @@ impl McpManager {
             }
         }
 
-        if cache_dirty {
-            if let Err(e) = cache.save(workdir) {
-                warn!(error = %e, "failed to persist MCP cache after reload");
-            }
+        if cache_dirty && let Err(e) = cache.save(workdir) {
+            warn!(error = %e, "failed to persist MCP cache after reload");
         }
         self.master_enabled.store(cfg.enabled, Ordering::Relaxed);
         *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
@@ -940,10 +936,10 @@ fn map_result(result: rmcp::model::CallToolResult) -> ToolResult {
             )),
         }
     }
-    if blocks.is_empty() {
-        if let Some(sc) = &result.structured_content {
-            blocks.push(ContentBlock::Text(sc.to_string()));
-        }
+    if blocks.is_empty()
+        && let Some(sc) = &result.structured_content
+    {
+        blocks.push(ContentBlock::Text(sc.to_string()));
     }
     if blocks.is_empty() {
         blocks.push(ContentBlock::Text(String::new()));

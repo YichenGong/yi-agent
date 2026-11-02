@@ -121,20 +121,20 @@ fn normalize_term_program(value: &str) -> String {
 /// 走 BEL，包括 Alacritty 与 Windows Terminal——它们是否弹系统通知未经
 /// 实测，不猜。
 pub fn detect_osc9_supported(env: &TerminalEnv) -> bool {
-    if let Some(program) = env.non_empty("TERM_PROGRAM") {
-        if !program.eq_ignore_ascii_case("tmux") {
-            return matches!(
-                normalize_term_program(program).as_str(),
-                "iterm"
-                    | "iterm2"
-                    | "itermapp"
-                    | "ghostty"
-                    | "kitty"
-                    | "warp"
-                    | "warpterminal"
-                    | "wezterm"
-            );
-        }
+    if let Some(program) = env.non_empty("TERM_PROGRAM")
+        && !program.eq_ignore_ascii_case("tmux")
+    {
+        return matches!(
+            normalize_term_program(program).as_str(),
+            "iterm"
+                | "iterm2"
+                | "itermapp"
+                | "ghostty"
+                | "kitty"
+                | "warp"
+                | "warpterminal"
+                | "wezterm"
+        );
     }
 
     env.has_non_empty("GHOSTTY_RESOURCES_DIR")

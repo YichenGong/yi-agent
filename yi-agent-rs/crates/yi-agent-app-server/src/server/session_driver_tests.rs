@@ -260,10 +260,10 @@ impl Host {
                     reply: _,
                     lead_request_id: _,
                 })) => {
-                    if let Some(session) = self.threads.get_mut(&id) {
-                        if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
-                            session.active_turn_id = None;
-                        }
+                    if let Some(session) = self.threads.get_mut(&id)
+                        && session.active_turn_id.as_deref() == Some(turn_id.as_str())
+                    {
+                        session.active_turn_id = None;
                     }
                     if id == thread_id {
                         return true;

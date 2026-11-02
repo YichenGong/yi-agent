@@ -103,10 +103,10 @@ impl DelegatedAuthority {
         {
             return Err(AuthorityDerivationError::BudgetOverallocated);
         }
-        if let (Some(child), Some(parent)) = (proposed.deadline, self.deadline) {
-            if child > parent {
-                return Err(AuthorityDerivationError::DeadlineAfterParent);
-            }
+        if let (Some(child), Some(parent)) = (proposed.deadline, self.deadline)
+            && child > parent
+        {
+            return Err(AuthorityDerivationError::DeadlineAfterParent);
         }
         Ok(proposed.clone())
     }

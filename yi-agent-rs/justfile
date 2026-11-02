@@ -157,7 +157,6 @@ eval filter="":
 
 # === CI 入口 ===
 
-# CI 流水线入口（push 用）
 # 依赖漏洞审计。实测约 67s（含 git fetch advisory-db），不需要编译，所以进 `ci`。
 #
 # 为什么不只放 nightly：新披露的 CVE 针对的是**没改动过的依赖**，
@@ -170,7 +169,19 @@ eval filter="":
 audit:
     cargo audit
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check audit
+# MSRV 门禁。`Cargo.toml` 的 `rust-version` 只是个声明，没人编译就等于谎话：
+# 声明 1.85 期间真实下限已经是 1.89（lopdf 0.45 → aes 0.9.3），却一直没红。
+# 工具链缺失时明确报错，不静默跳过（跳过等于门禁假绿）。
+msrv-check:
+    bash scripts/check-msrv.sh .
+
+# msrv-check 自身的测试（负向断言：缺 Cargo.toml / 缺 rust-version /
+# 没装工具链都必须退出非 0）。不进 `ci` 的依赖列表；单独跑用
+# `just msrv-check-test`。
+msrv-check-test:
+    bash scripts/test_check_msrv.sh
+
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`

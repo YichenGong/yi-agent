@@ -71,10 +71,10 @@ pub fn validate_spec(sc: &ServerConfig) -> Result<(), String> {
         check_env_refs(&format!("env.{k}"), v)?;
     }
 
-    if let Transport::Http { url, .. } = transport {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err("http 需要以 http:// 或 https:// 开头的 url".into());
-        }
+    if let Transport::Http { url, .. } = transport
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Err("http 需要以 http:// 或 https:// 开头的 url".into());
     }
     Ok(())
 }

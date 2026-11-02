@@ -142,11 +142,16 @@ codesign -v "$APP"   # 应 exit 0
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
 - **提交前必须自检 `just ci` 全绿**(在 `yi-agent-rs/` 下),合并到 `main` 后再
   在合并结果上跑一次。它是 CI 的唯一入口(GitHub PR / GitLab MR 都只跑它),
-  涵盖 15 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
-  `test`、`build`、`bindings-check`、`secret-check`、`audit`(`cargo audit`,
-  豁免清单在 `yi-agent-rs/.cargo/audit.toml`) 等。实际清单以
-  `yi-agent-rs/justfile` 的 `ci:` 行为准(共 15 项依赖)。少跑一次就可能让
-  `main` 直接变红;本地几分钟,比事后回滚便宜。
+  涵盖 16 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
+  `test`、`build`、`bindings-check`、`secret-check`、`msrv-check`(用
+  `rust-version` 声明的工具链真编一遍,脚本 `yi-agent-rs/scripts/check-msrv.sh`)、
+  `audit`(`cargo audit`,豁免清单在 `yi-agent-rs/.cargo/audit.toml`)
+  等。实际清单以 `yi-agent-rs/justfile` 的 `ci:` 行为准(共 16 项依赖)。少跑
+  一次就可能让 `main` 直接变红;本地几分钟,比事后回滚便宜。
+
+  **改依赖后必须同步 `rust-version`**:它只声明、不校验,写错了没有门禁会报
+  (`msrv-check` 就是为此加的)。真实下限 = 依赖图里最高的 `rust-version`,
+  用 `cargo metadata` 查:剔除 `--all-features` 拉进来的可选依赖后取最大值。
 
 ## 磁盘占用:`target/` 会无限膨胀
 

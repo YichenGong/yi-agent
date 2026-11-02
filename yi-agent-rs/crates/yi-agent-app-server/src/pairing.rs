@@ -278,10 +278,10 @@ impl PairingState {
         let mut index = self.read_local_devices();
 
         // 已铸过:确认设备表里那台设备还在(未被 revoke),在则复用其 token。
-        if let Some(existing) = index.devices.iter().find(|d| d.name == name) {
-            if self.store.get(&existing.device_id).is_some() {
-                return existing.token.clone();
-            }
+        if let Some(existing) = index.devices.iter().find(|d| d.name == name)
+            && self.store.get(&existing.device_id).is_some()
+        {
+            return existing.token.clone();
         }
 
         // 未铸过(或设备已被 revoke 而失效):铸一台新的,并更新「名字 → 凭据」表。
