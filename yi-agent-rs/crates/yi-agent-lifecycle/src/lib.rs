@@ -13,10 +13,12 @@
 //! - [`deadline`] — one total budget per operation on an injectable monotonic
 //!   clock.
 //! - [`client`] — the blocking control-channel client.
+//! - [`leases`] — the frontend lease state machine (no I/O, injectable time).
 
 pub mod client;
 pub mod codec;
 pub mod deadline;
+pub mod leases;
 pub mod types;
 
 /// Control protocol version. Evolves independently of the business protocol.

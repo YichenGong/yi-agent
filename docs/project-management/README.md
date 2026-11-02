@@ -28,7 +28,7 @@
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 79 / 79 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 47 / 55 | [详情](./subagent-runtime.md) |
-| yi-agent-lifecycle | 10 / 13 | [详情](./yi-agent-lifecycle.md) |
+| yi-agent-lifecycle | 11 / 13 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 125 | [详情](./desktop.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |

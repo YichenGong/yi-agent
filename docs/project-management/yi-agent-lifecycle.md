@@ -74,6 +74,21 @@
   拒绝清单，而不是在编译期报错）；字段与
   `desktop/src-tauri/src/runtime_manifest.rs` 的同名结构逐字段一致（桌面壳是独立
   workspace，靠契约测试而不是共享代码保持同步）
-- [ ] 租约状态机（`leases.rs`） — 见 Task 4
+- [x] 前端租约状态机（`leases.rs`，纯内存、时间可注入） — `LeaseTable` 回答的是「谁还在保活这个
+  runtime」。不执行任何 I/O，时间是从服务启动单调时钟映射来的 `Duration`，由调用方传入——这才让几个难题
+  能在不 sleep 的情况下测：迟到的 EOF 撞上已重连的客户端、reclaim 发出之后才到的心跳、睡了一小时的笔记本。
+  三条规则承担主要重量：**① EOF 不等于离开**——断连通常就是重连，所以 EOF 既不续租也不回收，租约继续按原
+  截止时间走完（`DisconnectOutcome::AwaitReconnect`）；**② epoch 为重连设栅栏**——同一 `client_run_id`
+  一生可以有多个连接，每次 `resume` 递增 epoch 并**轮换凭据**，上一个连接的迟到事件因此可被识别为 stale
+  而不是歧义；**③ release／expire 是终态**——之后的心跳不能复活客户端（reclaim 已发出，复活等于为一个
+  已经不存在的工作保活），`register` 也不能拿同一个 id 复活；tombstone 表按 `MAX_TOMBSTONES = 1024` 有界。
+  凭据是 256-bit CSPRNG 十六进制，只存在于 guardian 内存与匿名交接 FD，`Debug` 打码。判据：
+  `cargo test -p yi-agent-lifecycle --test client_leases`（21 passed），含
+  `late_eof_does_not_remove_resumed_client`、`eof_does_not_renew_the_lease`、
+  `a_late_heartbeat_after_release_cannot_revive_the_client`、
+  `a_heartbeat_with_the_wrong_credential_is_refused_and_does_not_extend`、
+  `a_system_resume_reopens_a_full_renewal_window`、`a_released_client_is_not_revived_by_a_system_resume`、
+  `the_released_tombstone_table_stays_bounded`；**变异验证**：让 `disconnected` 不比对 epoch、让
+  `heartbeat` 不查 tombstone → 2 个用例红（实测 RED）
 - [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
 - [ ] 受管进程 spawn 客户端 — 见 Task 8
