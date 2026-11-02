@@ -618,9 +618,135 @@ Plan 原稿写 `source ../.env`，该文件不存在，且失败被 `|| true` �
 
 `CLAUDE.md` 的门禁数量已随 `cargo audit` 进 `just ci` 更新为 15 道。
 
+## 第二波收尾：三个遗留缺口（2026-11-03）
+
+第一波合入 main 后实测发现三处未闭环。三条都修，各自独立 commit。
+
+### R1：`cargo audit` 的假红 —— 不是网络问题，是退出码语义缺陷
+
+**原判断错了**。第一波把 `just ci` 里 audit 失败归因为「偶发网络抖动」。实测推翻：
+
+```bash
+# 网络失败
+$ cargo audit --url https://127.0.0.1:9/nope.git
+error: couldn't fetch advisory database: git operation failed ...
+$ echo $?   → 1
+
+# 真发现漏洞
+$ cargo audit        # 临时清空 .cargo/audit.toml 的 ignore
+error: 17 vulnerabilities found!
+$ echo $?   → 1
+```
+
+**两种截然不同的结局返回同一退出码 1**。这不只是「偶发」，而是只要 advisory-db
+首次拉取抖动一次，`just ci` 就整条变红，且无法从退出码判断是网络还是漏洞。
+
+**修法**（`scripts/audit-deps.sh`，17 项分支自测，已进 `ci`）：
+
+| 情形 | 处置 | 退出码 |
+|---|---|---|
+| 正常 | 通过 | 0 |
+| 网络失败 → 重试成功 | 通过 | 0 |
+| 网络失败 + 缓存可用 | **降级通过 + 醒目警告**（结论基于过期数据） | 0 |
+| 网络失败 + 无缓存 | **降级通过 + 明确说「本次未做任何检查」** | 0 |
+| 真漏洞 | 红 | 1 |
+| 未知错误（配置/解析） | 红（不吞） | 1 |
+
+**关键约束**：绝不允许把真漏洞降级。判据用两个特征交叉验证 ——
+输出含 `N vulnerabilities found` 一律判红（宽匹配，不锚定行首 `error:`），
+且只有确认是网络特征时才走降级路径。误判成红只是打扰人；误判成绿会带着
+已知 CVE 发版，代价不可逆。
+
+兜底在 nightly 的独立 audit job：云端 runner 网络稳定，那里失败就是真红。
+
+### R2：nightly 从未被触发 —— 改为静态守卫
+
+`gh` 未安装、仓库无 PAT，无法用 `gh workflow run` 验证。但它真正的风险不是
+「这次没跑」，而是**改了个 recipe 名、workflow 还在调旧名**，静默失效几周
+没人发现（nightly 不在 PR 上跑）。
+
+`scripts/test_nightly_workflow.sh` 把 workflow 依赖的所有名字与真实定义对账：
+
+1. YAML 可解析 + 三个 job 齐全
+2. `run: just <recipe>` 的 recipe 在 justfile 里存在
+3. `scripts/*.sh` 存在且可执行
+4. **workflow 写 models.json 的字段名 == loader 读的字段名**（不一致会让测试静默 SKIPPED）
+5. 缺 secret 时显式失败（不写空条目）
+6. eval 步骤无 key 时有判断（不静默跑 0 条）
+
+反向验证过三种破坏：recipe 改名、字段改名 `api_key`→`apiKey`、删掉缺 secret 保护，
+各自都能让守卫变红。13 项，已进 `ci`。
+
+真正跑通仍待一次 `workflow_dispatch`（需要 `gh` 或 PAT，见「未完成」）。
+
+### R3：eval 无 baseline —— 三层设计，不走「比对工具调用序列」
+
+引入 `tests/eval/baseline/` 与 `--bless`（`EVAL_BLESS=1`）。**最初的设计被实测
+连续推翻三次**，过程本身是这个机制的核心知识：
+
+**推翻一：内容 hash 做不变量 → 5/30 假红。**
+第一版把结果文件内容存 hash 逐字节比对。刚建完基线紧接着跑一次就有 5 条红。
+抓 case 006 同一 prompt 连跑两次的真实 diff：
+
+```text
+round1: pub const SECONDS_PER_DAY: u64 = 86400;\n\npub fn a() -> u64 { SECONDS_PER_DAY }\n
+round2: /// Number of seconds in one day.\npub const SECONDS_PER_DAY: u64 = 86400;\n\npub fn a() -> u64 { SECONDS_PER_DAY }
+```
+
+两次都完全正确，差异只有「写不写文档注释」「末尾有无换行」。符号级改写任务
+本来就有无数等价写法（`86400`/`86_400`、常量放头还是尾）。**改法**：L1 不再比
+hash，改为「复用 case 已声明的正则，检查它是否仍匹配」——正则才是「这条 case
+真正在意什么」的权威表达。
+
+**推翻二：token 容忍 50% → case 027 假红。**
+token 不是独立变量，随步数累积（单轮往返约 5000 token）。基线 9829 token/1 步
+的 case，多跑 1 步必然到 14923（+52%），而答案完全正确。**改法**：token 容忍
+提到 150%，步数由独立参数把关，两者交叉验证。
+
+**推翻三：单次采样做基线 → case 018/026 假红。**
+实测 018 连跑 4 次是 3/5/4/5 步，026 连跑 7 次是 3/3/3/5/4/4/7 步。单次采样
+若落在分布低端（3），后续 5~7 步全判红。**改法**：`--bless` 默认采样 3 次取
+**中位数**（不是均值，均值会被偶发 12 步拉高、让基线过松）。
+
+**推翻四：百分比容忍在低步数 case 上太紧。**
+026 中位数 3，+50% 只到上限 5，而 7 步是实际出现过的长尾（该轮 27s，其它轮
+15~21s，说明是模型慢而非任务变复杂）。**改法**：步数上限取
+`max(基线 × 1.5, 基线 + 4 步)`。低步数靠固定余量，高步数靠百分比。
+
+**最终三层判定**：
+
+| 层 | 内容 | 判定 |
+|---|---|---|
+| L0 硬契约 | `ended_normally`、`modified_files` | 必须一致 |
+| L1 语义 | case 声明的结果正则是否仍匹配 | 必须全部匹配 |
+| L2 预算 | 步数、input token | 超容忍才报（步数 +50%/+4 取大；token +150%） |
+| L3 形状 | 工具名去重集合 | **只警告**，不判失败 |
+
+L3 只警告的依据：30 条 case 里 15 条都报形状变化，因为写文件手段本身在
+`write`/`edit`/`cat >`/`printf >`/`sed -i` 之间随机。它的价值是提供
+「工具选错但碰巧写对」的线索，不足以单独判失败。
+
+**报告分两类失败**，不能混：`case 自身断言失败`（agent 没完成，与基线无关，
+是能力信号）vs `相对基线回归`（仍做对但代价变高）。
+
+**验收数字**（3 次采样建基线后的全量比对）：
+`case 自身断言失败 1 条 / 相对基线回归 0 条`。假红清零。
+
+**禁止 CI 自动 bless**：CI 里 bless = 每次重写基线，基线永远等于最新代码，
+检测能力归零。`eval-baseline-check`（32 项，不需 key）进 `ci` 钉住比对逻辑。
+
+## 遗留未完成
+
+- **nightly 真跑一次**：需 `brew install gh` + `gh auth login`，或 GitHub PAT
+  打 `POST /repos/YichenGong/yi-agent/actions/workflows/nightly.yml/dispatches`。
+  同时需确认仓库已配 4 个 secrets（`MODEL_API_KEY`/`MODEL_API_URL`/`MODEL`/`PROVIDER`）。
+- **`cargo update`**：134 个包，A 类 9 个 crate 的 CVE 靠它。须等并行卡片合入后单独做。
+- **`quick-xml` / `zip` 跨大版本**（B 类 5 条）。
+
 ## 核查记录
 
 - 2026-11-02：基于本机实测撰写初稿。所有性能数字、覆盖率、变异分数、漏洞数量均为实测值，无估算。
 - 决策 D1–D5 均经项目所有者逐项确认。
 - 三处变异落点、patch coverage 触发方式、eval 评分维度已与所有者对齐。
+- 2026-11-03 第二波收尾：三个遗留缺口闭环，见「第二波收尾」节。audit 假红根因是退出码语义（非网络偶发）；eval baseline 的四次设计推翻均有实测 diff 支撑。
 - 2026-11-02 实施完成：见「实施期修正」节，6 处判据被实测推翻（timeout 180s、3 个等价变异体、C4 的四处错误断言、eval 配置源、`test_config()` 隔离）。所有数字为实施后实测值。
