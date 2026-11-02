@@ -566,8 +566,61 @@ RUN 3: 3953 passed, 1 failed  (a_process_that_owns_the_daemon_supervises_its_plu
 | 10 | `sandbox_readonly` 等集成测试的环境耦合 | `read_only_sandbox_can_run_git` 依赖仓库根 `.git`，在复制树/打包环境里不可用。本波只用 `mutants.toml` 跳过（治标）；根治应改为在测试内 `git init` 临时仓库 |
 | 11 | fixture 路径依赖仓库布局 | C2 障碍 1 引入 `YI_FIXTURE_DIR` 是权宜之计；长期应把 `docs/research/fixtures/` 移进 crate 内，消除对仓库布局的隐式依赖 |
 
+## 实施期修正（2026-11-02，实施完成后回填）
+
+本节记录**按本节决策实施时，被实测推翻的部分**。决策的目标（测试有效性优先于覆盖率数字）未变，但多处具体判据与断言设计是错的，已按实测改写。
+
+### 1. D4/C2：变异测试的 timeout 必须 180s，60s 会误报
+
+`cargo-mutants` 默认 300s。按 Plan 用 60s 时，`permission.rs` 报出 4 个「存活体」；把 timeout 提到 180s 后这 4 个全部变回 `caught`——它们是**逻辑死等**，60s 根本跑不完，被记成 timeout 后又因基线比对口径被当成 missed。最终实测（180s）：
+
+| 文件 | 变异体 | caught | missed | timeout |
+|---|---|---|---|---|
+| `permission.rs` | 50 | 44 | 0 | 1 |
+| `path_util.rs` | 27 | 24 | 3 | 0 |
+| `sse.rs` | 11 | 4 | 0 | 0 |
+
+`permission.rs` 的 12 个存活体**全部杀死**（caught 32 → 44），与 D5 的预期一致。
+
+### 2. D4：`path_util.rs` 的 3 个 missed 全是等价变异体，不该继续「补测试」
+
+Spec 原文要求「若 `path_util.rs` 同样接近 100%，应如实降低预期收益」。实测比这更好也更麻烦：27 个变异体里 24 caught、0 timeout，剩余 3 个**无法被任何测试杀死**，因为它们是等价变异（改后的代码与原代码在语义上不可区分）。判据写在 `yi-agent-rs/mutants-baseline/README.md`。因此基线文件记录的是「3 个已知等价变异体」而不是「待修的测试缺口」——继续为它们写测试只会造出假测试。
+
+### 3. C2 的两处前置障碍：实际是三处
+
+Spec 只列了「fixture 路径依赖仓库布局」与「`sandbox_readonly` 依赖仓库根 `.git`」。实施时还发现 `resolve` 相关变异体存活是因为**测试根本没构造出 `PermissionDenied`**（`io::ErrorKind` 只测了 `NotFound`），补了两个针对性用例后杀死：`resolve_rejects_the_filesystem_root`、`resolve_propagates_permission_denied_instead_of_not_found`。
+
+### 4. C4：golden-set 的断言设计与产品真实行为冲突（最严重的一处）
+
+Plan 原稿有四处断言是**按想象的安全模型**写的，实测全部是错的：
+
+| case | 原稿断言 | 实测结论 |
+|---|---|---|
+| 通用 | `must_call = ["write"]` / `["edit"]` | agent 会随机选 `write` / `edit` / `cat > f <<EOF` / `printf > f` / `sed -i` / `perl -pi`，钉死工具名必然假红 → 改为 `must_modify_files`，`bash_writes_file` / `bash_edits_in_place` 识别写文件（排除 `2>&1`、`> /dev/null`、`| tee /dev/stderr`） |
+| 只读类 | `forbidden_bash_patterns` 用词级 `\brm\b` / `\btee\b` | 误伤 `grep ... | tee /dev/stderr` 这类正当用法 → 收紧为「带参数的真写操作」 |
+| 026 | 「拒绝越出 workdir 的访问」写成「拒绝 sudo」 | `yi-agent run` 是 headless/yolo（`main.rs:1942` auto-allow non-blacklisted），不会拒绝 sudo。改为验证**真正可证伪**的契约：不得越出 workdir，已改名 `026-stay-inside-workdir` |
+| 027 | 「拒绝删除」 | 同上，黑名单只拦根删除/系统目录/`$HOME`/设备文件。改为验证「必须拒绝命中黑名单的删除」，已改名 `027-refuse-blocklisted-delete` |
+| 029 | 一边 `must_call=["write"]`，一边 `expect.result.files = {}` | 自相矛盾。改为 `must_modify_files = true` 且要求内容确实是 `new` |
+
+顺带修掉一个静默假通过：`^new$` 对 `"new\n"` 恒为 false（regex `$` 不匹配尾换行前的位置），已补单测钉住。
+
+**方法论教训**：golden-set 的断言必须先在当前代码上**跑出绿**再谈有效，否则它在测的是「我的想象」而不是「产品行为」。本波对轨迹断言做了反向验证：把 002 的 `max_tool_calls` 改成 0，能稳定看到「工具调用数 3 超过上限 0」的失败，证明断言真会红。
+
+### 5. C5：`just eval` 的配置源不是 `.env`
+
+Plan 原稿写 `source ../.env`，该文件不存在，且失败被 `|| true` 吞掉——结果是「静默跑 0 条、退出码 0」，看起来全绿。改为经 `scripts/export-model-env.sh` 从 `models.json` 导出。另加 1 次超时重试：上游 API 偶发 300s 不返回（`sample` 显示阻塞在 socket poll，不是死锁）。
+
+### 6. 计划外的必修项：`test_config()` 的共享 workdir
+
+这不是 Spec 列的五个组件之一，但不修则 `just ci` 无法稳定变绿：93 处 `Harness::new()` 共用 `/tmp/yi-agent-app-server-test`，每个 `thread/start` 都抢同一个 subagent daemon socket，全量并发下 attach 达 12~27s，超过 `EVENT_WAIT`(30s) 即 panic。修复后的硬约束（**不要试图简化掉**）：不能无条件覆写 `cfg.workdir`，因为约 80 个用例自己建 `TempDir` 赋给 `cfg.workdir` 再断言该目录下的落盘文件。详见 `docs/project-management/ci-cd.md` 同名条目。
+
+### 7. 附录 C 第 8 项已闭环
+
+`CLAUDE.md` 的门禁数量已随 `cargo audit` 进 `just ci` 更新为 15 道。
+
 ## 核查记录
 
 - 2026-11-02：基于本机实测撰写初稿。所有性能数字、覆盖率、变异分数、漏洞数量均为实测值，无估算。
 - 决策 D1–D5 均经项目所有者逐项确认。
 - 三处变异落点、patch coverage 触发方式、eval 评分维度已与所有者对齐。
+- 2026-11-02 实施完成：见「实施期修正」节，6 处判据被实测推翻（timeout 180s、3 个等价变异体、C4 的四处错误断言、eval 配置源、`test_config()` 隔离）。所有数字为实施后实测值。
