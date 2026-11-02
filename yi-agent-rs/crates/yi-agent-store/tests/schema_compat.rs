@@ -129,8 +129,12 @@ fn a_non_database_file_is_an_error_not_an_empty_schema() {
 #[test]
 fn the_supported_range_matches_the_migration_ceiling() {
     // The range is derived from the migration constant, so a migration bump can
-    // never leave the probe behind.
-    assert_eq!(SUPPORTED_SCHEMA_MAX as i64, 15);
+    // never leave the probe behind. Asserting the derivation, not a literal: a
+    // literal here would fail on every later migration for the wrong reason.
+    assert_eq!(
+        SUPPORTED_SCHEMA_MAX as i64,
+        yi_agent_store::repository::LATEST_SCHEMA_VERSION
+    );
     assert_eq!(yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MIN, 0);
     assert!(SchemaRange::supported().contains(SUPPORTED_SCHEMA_MAX));
     assert!(!SchemaRange::supported().contains(SUPPORTED_SCHEMA_MAX + 1));

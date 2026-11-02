@@ -28,6 +28,18 @@ use yi_agent_store::schedule::{
     MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
 };
 
+/// A handle for a fake worker whose execution is already over.
+///
+/// A test factory runs the worker inline, so there is no thread to join. It must
+/// say so explicitly: the production default is "no stop evidence", precisely so
+/// that a real thread cannot be declared stopped without an observer.
+fn joined_handle(cancellation: tokio_util::sync::CancellationToken) -> WorkerHandle {
+    use yi_agent_core::subagent::worker::StopWitness;
+    let (witness, confirmation) = StopWitness::pair();
+    witness.mark_joined();
+    WorkerHandle::new(cancellation).with_confirmation(confirmation)
+}
+
 #[derive(Default)]
 struct RecordingFactory;
 
@@ -37,7 +49,7 @@ impl AgentWorkerFactory for RecordingFactory {
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+        Box::pin(async move { Ok(joined_handle(request.cancellation)) })
     }
 }
 
@@ -4733,4 +4745,169 @@ async fn a_settled_parent_cannot_spawn_and_the_gate_runs_before_the_fork_token()
         rows_after, rows_before,
         "a refused spawn must not leave a queued ghost child"
     );
+}
+
+// ---- stop confirmation ----------------------------------------------------
+
+/// A worker whose agent loop ends normally (so the task goes terminal and its
+/// delivery is recorded) while the thread that ran it is still alive.
+///
+/// This is the shape the plan calls "假报终态但执行仍存活": the terminal report is
+/// true about the loop and false about the lease. If reconciliation freed the
+/// resident slot on the report alone, a new task could start writing the same
+/// worktree while the old thread still runs.
+struct LingeringWorkerFactory {
+    release: Arc<std::sync::atomic::AtomicBool>,
+    confirmation: Arc<Mutex<Option<yi_agent_core::subagent::worker::StopConfirmation>>>,
+}
+
+impl AgentWorkerFactory for LingeringWorkerFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn max_resident_subagents(&self) -> u16 {
+        // One slot makes the leak observable: a released slot must admit the
+        // queued child, a leaked one must not.
+        1
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let release = Arc::clone(&self.release);
+        let slot = Arc::clone(&self.confirmation);
+        Box::pin(async move {
+            let (witness, confirmation) = yi_agent_core::subagent::worker::StopWitness::pair();
+            *slot.lock().unwrap() = Some(confirmation.clone());
+            let handle =
+                WorkerHandle::new(request.cancellation.clone()).with_confirmation(confirmation);
+            let reporter = handle.clone();
+            std::thread::spawn(move || {
+                // Report a completed loop immediately, then keep running until the
+                // test says otherwise. The join has therefore NOT happened when
+                // the daemon reconciles the terminal state.
+                reporter.report_completed("finished");
+                while !release.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                witness.mark_joined();
+            });
+            Ok(handle)
+        })
+    }
+}
+
+/// The resident slot is not freed by a self-reported terminal state.
+#[tokio::test]
+async fn a_terminal_report_alone_does_not_release_the_running_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let confirmation = Arc::new(Mutex::new(None));
+    let factory = LingeringWorkerFactory {
+        release: Arc::clone(&release),
+        confirmation: Arc::clone(&confirmation),
+    };
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(factory)).unwrap();
+
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    // Let the worker report completion without ending its thread, then reconcile
+    // exactly as the daemon's accept loop does.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert_eq!(
+        coordinator.task_state(&child).unwrap(),
+        "completed_no_changes",
+        "the loop's report is still recorded: it is true about the agent loop"
+    );
+    assert!(
+        !coordinator.execution_stopped(&child),
+        "no join has happened, so there is no stop evidence"
+    );
+    assert_eq!(
+        coordinator.unconfirmed_stops().len(),
+        1,
+        "the unproven stop must be visible to the operator, not silently dropped"
+    );
+
+    // The single resident slot is still held, so a second child cannot run.
+    let other_session = coordinator.create_session().unwrap();
+    let other_root = coordinator.root_task_id(&other_session).unwrap();
+    let other = coordinator
+        .spawn_child(&other_session, &other_root)
+        .await
+        .unwrap();
+    assert!(
+        coordinator
+            .start_worker(&other_session, &other)
+            .await
+            .is_err(),
+        "a lease whose execution is unproven must not be handed to another task"
+    );
+
+    // Once the thread really ends, the next pass releases it and admits the child.
+    release.store(true, std::sync::atomic::Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        coordinator.reconcile_worker_events().await.unwrap();
+        if coordinator.execution_stopped(&child) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the observer never published its join"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(coordinator.unconfirmed_stops().is_empty());
+    coordinator
+        .start_worker(&other_session, &other)
+        .await
+        .expect("a confirmed stop frees the slot");
+}
+
+/// Dropping the observer without a join must never read as stopped.
+#[tokio::test]
+async fn a_lost_observer_keeps_the_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+
+    struct OrphanFactory;
+    impl AgentWorkerFactory for OrphanFactory {
+        fn recovery_context(&self) -> WorkerRecoveryContext {
+            durable_context()
+        }
+        fn max_resident_subagents(&self) -> u16 {
+            1
+        }
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+            Box::pin(async move {
+                // No observer: the handle keeps the "never confirmed" sentinel.
+                let handle = WorkerHandle::new(request.cancellation.clone());
+                handle.report_completed("finished");
+                Ok(handle)
+            })
+        }
+    }
+
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(OrphanFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    assert!(
+        !coordinator.execution_stopped(&child),
+        "no observer means no evidence, never a guessed stop"
+    );
+    assert_eq!(coordinator.unconfirmed_stops().len(), 1);
 }

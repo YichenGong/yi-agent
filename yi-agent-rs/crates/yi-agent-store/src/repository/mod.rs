@@ -46,7 +46,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 15;
+pub const LATEST_SCHEMA_VERSION: i64 = 16;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -589,7 +589,10 @@ mod tests {
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 15);
+        // The `migrate` path always lands on the newest version, so asserting the
+        // latest here keeps this test about the upgrade method rather than about a
+        // number that every later migration would have to edit.
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let connection = repository.connection_for_test();
         assert!(
             connection
@@ -633,7 +636,10 @@ mod tests {
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 15);
+        // The `migrate` path always lands on the newest version, so asserting the
+        // latest here keeps this test about the upgrade method rather than about a
+        // number that every later migration would have to edit.
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let connection = repository.connection_for_test();
         for (probe, what) in [
             (
@@ -1156,11 +1162,67 @@ mod extra_roots_tests {
     }
 
     #[test]
-    fn schema_version_is_fifteen() {
+    fn the_schema_ceiling_matches_the_latest_migration() {
+        // Deliberately not a hardcoded number: bumping the migration must not
+        // require editing this test, and the test's job is the *agreement* between
+        // the constant and the probe anyway.
         assert_eq!(
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
+        assert_eq!(LATEST_SCHEMA_VERSION, 16);
+    }
+
+    /// v16 records who last owned a root and why it ended.
+    #[test]
+    fn a_version_fifteen_database_gains_the_root_owners_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // Roll back to the v15 shape: drop the v16 table and its version row.
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS root_owners;
+                 DELETE FROM schema_migrations WHERE version = 16;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        let version = repository.schema_version().unwrap();
+        assert_eq!(version, 16);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let has_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_owners')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_table, "v16 must create root_owners");
+    }
+
+    /// Re-running the v16 step must not fail on the objects it already created.
+    ///
+    /// SQLite cannot roll back `ALTER TABLE`/`CREATE TABLE` inside the same
+    /// transaction that a later statement aborts, so a crash between the DDL and the
+    /// version row leaves the object without the version. The step probes first for
+    /// exactly that reason.
+    #[test]
+    fn the_v16_step_is_rerunnable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // Simulate "DDL landed, version row did not".
+        connection
+            .execute_batch("DELETE FROM schema_migrations WHERE version = 16;")
+            .unwrap();
+        drop(connection);
+
+        // Reopening replays v16 over the already-created table.
+        RuntimeRepository::open(&path).unwrap();
     }
 
     /// The fresh-open tests never exercise the upgrade an existing install
@@ -1180,7 +1242,10 @@ mod extra_roots_tests {
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 15);
+        // The `migrate` path always lands on the newest version, so asserting the
+        // latest here keeps this test about the upgrade method rather than about a
+        // number that every later migration would have to edit.
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let connection = repository.connection_for_test();
         assert!(
             connection
@@ -1226,5 +1291,59 @@ mod read_only_checkpoint_tests {
             error.to_string().contains("worktree lease is missing"),
             "{error}"
         );
+    }
+}
+
+impl RuntimeRepository {
+    /// Record which client last attached `root`, and in which generation.
+    ///
+    /// `ended_reason` of `None` clears a previous terminal reason: a root that is
+    /// being rebound in a new generation is live again, and a stale "client left"
+    /// row would make the next restart refuse to reuse it.
+    pub fn record_root_owner(
+        &self,
+        root: &str,
+        owner: &str,
+        generation: &str,
+        ended_reason: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "INSERT INTO root_owners (root, owner, generation, ended_reason)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root) DO UPDATE SET
+                 owner = excluded.owner,
+                 generation = excluded.generation,
+                 ended_reason = excluded.ended_reason,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![root, owner, generation, ended_reason],
+        )?;
+        Ok(())
+    }
+
+    /// Record that `root` stopped accepting work, keeping the first reason.
+    pub fn mark_root_exited(&self, root: &str, reason: &str) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "UPDATE root_owners
+                SET ended_reason = COALESCE(ended_reason, ?2),
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE root = ?1",
+            params![root, reason],
+        )?;
+        Ok(())
+    }
+
+    /// The last recorded owner and reason for a root, if any.
+    pub fn root_owner(
+        &self,
+        root: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, RepositoryError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT owner, generation, ended_reason FROM root_owners WHERE root = ?1")?;
+        let mut rows = statement.query(params![root])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+            None => Ok(None),
+        }
     }
 }

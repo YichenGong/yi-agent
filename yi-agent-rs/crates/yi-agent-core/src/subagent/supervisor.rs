@@ -16,8 +16,8 @@ use super::task::{
 };
 use super::trace::TraceFact;
 use super::worker::{
-    AgentWorkerFactory, SpawnRequest, WorkerEvent, WorkerHandle, WorkerMessage, WorkerStart,
-    WorkerWatchdogEvent,
+    AgentWorkerFactory, SpawnRequest, StopConfirmation, WorkerEvent, WorkerHandle, WorkerMessage,
+    WorkerStart, WorkerWatchdogEvent,
 };
 use crate::agent::ProviderTurnGate;
 use crate::message::Message;
@@ -574,6 +574,17 @@ impl AgentSupervisor {
 
     pub fn worker_task_ids(&self) -> impl Iterator<Item = &TaskId> {
         self.workers.keys()
+    }
+
+    /// The stop proofs held by the current workers, keyed by task.
+    ///
+    /// Callers take these *before* reconciling, because a terminal transition
+    /// removes the handle — and the proof with it — inside `reconcile_worker_events`.
+    pub fn worker_stop_confirmations(&self) -> std::collections::HashMap<TaskId, StopConfirmation> {
+        self.workers
+            .iter()
+            .map(|(task, handle)| (task.clone(), handle.stop_confirmation()))
+            .collect()
     }
 
     pub fn worker_cancellation(

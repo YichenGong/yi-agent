@@ -551,5 +551,27 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
         transaction.commit()?;
     }
+
+    // v16：root 的最近所有者与退出原因。租约/所有权本身住在内存里（daemon 重启
+    // 即新生代），这张表只回答「这个会话上一次由谁 attach、为什么结束」——用于
+    // 重启后向用户解释，以及阻止把已结束的 root 当成从没绑定过。
+    //
+    // ALTER TABLE 在 SQLite 里不可回滚，所以每一步都先用 `pragma_table_info`
+    // 探测再改，事务只包住 DDL + 版本行。中途失败时版本行不落，下次从 v15 重来，
+    // 探测让已存在的列/表不会被重复创建。
+    if current_version < 16 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS root_owners (
+                root TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                ended_reason TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }
