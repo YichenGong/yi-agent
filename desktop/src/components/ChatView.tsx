@@ -53,7 +53,7 @@ function BubbleImage({
  * 合并成一块；一旦块级 `item/thinking` 到达，该服务端条目即就地接管同一张卡片。
  * 历史回放期则由 `Item::Thinking` 直接渲染。这里只渲染一块。默认折叠，标题可点开
  * （Mac/iOS 的「默认折叠、可展开」）。`redacted` 块无明文（凭证不下发前端），呈现
- * 「已加密」占位。
+ * 「已加密」占位；明文为空的非 redacted 块呈现「已推理（无明文）」占位。
  *
  * 折叠状态是**每块**的局部 state：不放进 item，因为 item 归 session 所有、且会被
  * 流式追加就地改写；把 UI 状态塞进去会让「展开」也被序列化进缓存。
@@ -76,8 +76,12 @@ function ReasoningBlock({ text, redacted = false }: { text: string; redacted?: b
       </button>
       {expanded && (
         <div className="mt-1 whitespace-pre-wrap">
-          {/* redacted 块无明文（凭证不下发）：只呈现「已加密」占位，不显示空白。 */}
-          {redacted ? "已加密的思考" : text}
+          {/*
+            三态：redacted 块无明文（凭证不下发）→「已加密」；有明文 → 原文；
+            模型推理过但本次没有可展示的明文 →「已推理（无明文）」。最后一档
+            此前会渲染成一片空白。
+          */}
+          {redacted ? "已加密的思考" : text !== "" ? text : "已推理（无明文）"}
         </div>
       )}
     </div>
