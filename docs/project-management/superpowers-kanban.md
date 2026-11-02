@@ -28,6 +28,8 @@
 
 ## Features
 
+- [ ] **完整插件独立发布** — 界面、执行程序与 skill 统一版本，通过通用宿主安装和加载；官方包校验、显式项目启用、安全更新及远端版本匹配均须通过。完成判据：[设计](../superpowers/specs/2026-11-02-kanban-independent-release-design.md) §13 的 A01–A20 全部验收项，尤其在同一 yi-agent 应用包下更新看板界面且主程序发布物摘要不变。[实施总计划](../superpowers/plans/2026-11-02-kanban-independent-release.md) 已列出 27 个主任务、技术验证与子协议审阅门槛，当前仅完成设计、计划与多轮文档复查，尚未实现。
+
 - [x] 全局开关 `superpowers_kanban` 决定进程起停 — 清单 `supervisors/superpowers-kanban.json` 设 `stop_when_disabled: true`，注册表默认关。关掉 = 完全停掉 daemon 含调度（不再留进程轮询）；重开走设置页 `flags/set`（app-server 直写 `flags.json`，不经过 daemon），所以不是单向门。宿主侧同时收口：`plugin/query` 返回 `plugin_disabled`(-32025) 而不是 `daemon_unavailable`，`plugins/list` 每项带 `enabled`，桌面隐藏看板入口与全部 `driver_ref` 会话。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`（164 passed）；`cargo test -p yi-agent-app-server --lib a_switched_off_plugin`（含 `..._says_disabled_instead_of_broken`、`..._is_still_listed_but_marked_disabled`）；`cd desktop && vitest run src/App.test.tsx -t 看板开关关着时`
 - [x] 插件自述清单 — `manifest` 动词把 supervisor 清单打到 stdout，宿主 `plugin/install` 直接消费；`command` 取当前可执行文件绝对路径。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner manifest_`（含"与随包 `supervisors/superpowers-kanban.json` 逐字段相等"）
 - [x] **过期清单在启动时自校准** — 清单是安装那一刻的快照，插件升级后没人刷新它，于是新逻辑读旧结论：`stop_when_disabled` 从 `false` 改成 `true` 后，用户关掉开关、进程仍在跑，且界面无任何线索。现在监督线程进入循环前跑一次 `<command> manifest`，用插件自述覆盖过期清单（同目录 temp + rename，截断的清单会被静默跳过，等于插件消失）。只认清单里的 `command`、不认插件名；跑不起来 / 输出不是清单 / 名字对不上都只 warn 并**保留原文件**。判据：`cargo test -p yi-agent-supervisors --lib refresh::`（6 passed）；`cargo test -p yi-agent-supervisors --test supervisor refreshing_a_stale`（变异验证：把刷新替换为空结果后报 "the stale manifest must be replaced by the plugin's own description"）
