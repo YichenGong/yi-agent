@@ -60,6 +60,34 @@ pub fn read_holder(state_dir: &Path) -> Option<Holder> {
     serde_json::from_str(&text).ok()
 }
 
+/// 严格读 holder 记录:只有文件**不存在**才回 `None`。
+///
+/// 决策路径(启动恢复、调度、离线恢复)必须用这个:一份写坏的 holder 代表的
+/// 可能是「有东西正在合并」,把它读成「没有」就等于放行第二个合并。宽松的
+/// [`read_holder`] 只留给**只做显示**的地方(CLI 状态输出),它吞错是因为
+/// 一行说明文字不该让命令失败。
+pub fn read_holder_strict(state_dir: &Path) -> Result<Option<Holder>, String> {
+    let path = holder_path(state_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read the merge holder record {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let holder: Holder = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "the merge holder record {} is corrupt: {error}; \
+             refusing to treat it as unheld",
+            path.display()
+        )
+    })?;
+    Ok(Some(holder))
+}
+
 fn write_holder(state_dir: &Path, holder: &Holder) -> std::io::Result<()> {
     let text = serde_json::to_string(holder).map_err(std::io::Error::other)?;
     let path = holder_path(state_dir);
@@ -94,38 +122,49 @@ pub fn holder_alive(holder: &Holder) -> bool {
 ///
 /// 拿到 `flock` 说明没有活着的进程在合并；此时若 holder 记录里的 pid 已经消失，
 /// 说明上一位持有者崩在两次写之间——记录被接管，回 `Reclaimed`。
-pub fn acquire_with_holder(state_dir: &Path, card_id: &str) -> MergeAttempt {
-    let previous = read_holder(state_dir);
+pub fn acquire_with_holder(state_dir: &Path, card_id: &str) -> Result<MergeAttempt, String> {
+    // 先读记录再取锁:锁一旦拿到,记录就只可能是上一任留下的。
+    let previous = read_holder_strict(state_dir)?;
     let lock = match acquire(state_dir) {
         Some(lock) => lock,
         None => {
+            // 有活着的持有者。记录写坏时我们已经在上一步报错了;这里记录缺失
+            // 说明对方还没写完 holder,卡片号未知就是未知,不编造。
             let holder = previous.unwrap_or(Holder {
                 card_id: String::new(),
                 pid: 0,
                 since: String::new(),
             });
-            return MergeAttempt::Busy {
+            return Ok(MergeAttempt::Busy {
                 card_id: holder.card_id,
                 pid: holder.pid,
-            };
+            });
         }
     };
     let reclaimed = previous
         .as_ref()
         .is_some_and(|holder| !pid_alive(holder.pid));
-    let _ = write_holder(
+    // 写不进 holder 就不能说「我拿到了」:调用方会据此认为门的归属已经记下,
+    // 而显示/旧版恢复全靠这条记录。fatal 一下把锁一起还回去,让上层当失败处理。
+    write_holder(
         state_dir,
         &Holder {
             card_id: card_id.to_string(),
             pid: std::process::id(),
             since: chrono::Local::now().to_rfc3339(),
         },
-    );
-    if reclaimed {
+    )
+    .map_err(|error| {
+        format!(
+            "could not record the merge holder for card {card_id}: {error}; \
+             the gate was not taken"
+        )
+    })?;
+    Ok(if reclaimed {
         MergeAttempt::Reclaimed(lock)
     } else {
         MergeAttempt::Granted(lock)
-    }
+    })
 }
 
 /// 取 `<state_dir>/merge.lock` 的独占锁；已被占用返回 `None`。
@@ -163,8 +202,7 @@ mod tests {
         )
         .unwrap();
         match acquire_with_holder(dir.path(), "new") {
-            MergeAttempt::Reclaimed(_) => {}
-            MergeAttempt::Granted(_) => {}
+            Ok(MergeAttempt::Reclaimed(_)) | Ok(MergeAttempt::Granted(_)) => {}
             other => panic!("a dead holder must not block: {other:?}"),
         }
         let holder = read_holder(dir.path()).unwrap();
@@ -175,14 +213,61 @@ mod tests {
     fn a_live_holder_reports_busy_with_its_card() {
         let dir = tempfile::tempdir().unwrap();
         let held = match acquire_with_holder(dir.path(), "card-a") {
-            MergeAttempt::Granted(lock) => lock,
+            Ok(MergeAttempt::Granted(lock)) => lock,
             other => panic!("expected the first grant, got {other:?}"),
         };
         match acquire_with_holder(dir.path(), "card-b") {
-            MergeAttempt::Busy { card_id, .. } => assert_eq!(card_id, "card-a"),
+            Ok(MergeAttempt::Busy { card_id, .. }) => assert_eq!(card_id, "card-a"),
             other => panic!("expected busy, got {other:?}"),
         }
         drop(held);
+    }
+
+    #[test]
+    fn a_corrupt_holder_record_is_not_read_as_unheld() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(holder_path(dir.path()), b"{ not json").unwrap();
+        // 显示用的宽松读法保持原样:一行状态文字不该因为坏记录就失败。
+        assert!(read_holder(dir.path()).is_none());
+        // 但决策路径必须看得见它——否则等于「没人合并」,放行第二个。
+        assert!(
+            read_holder_strict(dir.path()).is_err(),
+            "a corrupt holder must block the decision path"
+        );
+        assert!(
+            acquire_with_holder(dir.path(), "new").is_err(),
+            "taking the gate must not silently step over a corrupt record"
+        );
+    }
+
+    #[test]
+    fn a_missing_holder_record_is_the_only_unheld_case() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_holder_strict(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_holder_that_cannot_be_written_is_not_a_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        // 把 holder 的临时文件位置占成目录:写记录必然失败。
+        std::fs::create_dir(holder_path(dir.path()).with_extension("holder.tmp")).unwrap();
+        let outcome = acquire_with_holder(dir.path(), "card-a");
+        assert!(
+            outcome.is_err(),
+            "granting without a record leaves the gate unattributable: {outcome:?}"
+        );
+        // 失败必须把 flock 一起还回去,否则项目此后再也合不了。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reopened = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(lock) = acquire(dir.path()) {
+                drop(lock);
+                reopened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reopened, "a failed holder write must not keep the gate");
     }
 
     #[test]

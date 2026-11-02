@@ -550,11 +550,18 @@ impl BoardService {
             };
             // b) 合并锁。拿不到说明别的进程刚抢到：把会话名额放回，换下一张。
             let gate = match crate::merge_lock::acquire_with_holder(&self.state_dir, &card.id.0) {
-                crate::merge_lock::MergeAttempt::Granted(lock)
-                | crate::merge_lock::MergeAttempt::Reclaimed(lock) => lock,
-                crate::merge_lock::MergeAttempt::Busy { .. } => {
+                Ok(crate::merge_lock::MergeAttempt::Granted(lock))
+                | Ok(crate::merge_lock::MergeAttempt::Reclaimed(lock)) => lock,
+                Ok(crate::merge_lock::MergeAttempt::Busy { .. }) => {
                     drop(lease);
                     continue;
+                }
+                Err(error) => {
+                    // 记录读不懂 / 写不下：门的归属不可知，这一拍不能派合并。
+                    // 也只还本次名额，不动别人的记录。
+                    eprintln!("superpowers-kanban: {error}");
+                    drop(lease);
+                    return None;
                 }
             };
             let base = card
@@ -2071,7 +2078,7 @@ mod tests {
         git_run(&project, &["branch", &source]);
         // 名额由 daemon 在开跑那一拍拿到（这里模拟那一拍）。
         match crate::merge_lock::acquire_with_holder(&service.state_dir, "card-1") {
-            crate::merge_lock::MergeAttempt::Granted(lock) => {
+            Ok(crate::merge_lock::MergeAttempt::Granted(lock)) => {
                 service.lock().merge_gate = Some(lock)
             }
             other => panic!("expected Granted, got {other:?}"),
@@ -2088,7 +2095,7 @@ mod tests {
         assert!(
             wait_until(|| matches!(
                 crate::merge_lock::acquire_with_holder(&service.state_dir, "other"),
-                crate::merge_lock::MergeAttempt::Granted(_)
+                Ok(crate::merge_lock::MergeAttempt::Granted(_))
             )),
             "the gate must be free after merge_finish"
         );
@@ -2393,7 +2400,7 @@ mod tests {
         assert!(
             wait_until(|| matches!(
                 crate::merge_lock::acquire_with_holder(&service.state_dir, "next"),
-                crate::merge_lock::MergeAttempt::Granted(_)
+                Ok(crate::merge_lock::MergeAttempt::Granted(_))
             )),
             "the next project merge must be able to take the gate"
         );
@@ -2432,7 +2439,10 @@ mod tests {
         git_run(&project, &["branch", &source]);
         service.merge_request("card-1").unwrap();
         let gate = crate::merge_lock::acquire_with_holder(&service.state_dir, "someone-else");
-        assert!(matches!(gate, crate::merge_lock::MergeAttempt::Granted(_)));
+        assert!(matches!(
+            gate,
+            Ok(crate::merge_lock::MergeAttempt::Granted(_))
+        ));
         assert!(
             service
                 .driver_step(&[], &[], None, &no_caps())
@@ -2866,7 +2876,7 @@ mod tests {
         assert_eq!(state_of(&service, &card_id), "merge_queued");
         // 下一拍：名额空 → daemon 把卡推进到 running 并追一回合（见 promote_merge_queue）。
         match crate::merge_lock::acquire_with_holder(&service.state_dir, &card_id) {
-            crate::merge_lock::MergeAttempt::Granted(lock) => {
+            Ok(crate::merge_lock::MergeAttempt::Granted(lock)) => {
                 service.lock().merge_gate = Some(lock)
             }
             other => panic!("expected Granted, got {other:?}"),
