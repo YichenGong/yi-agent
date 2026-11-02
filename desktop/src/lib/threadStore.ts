@@ -54,8 +54,16 @@ export interface ThreadView {
    */
   syncState: "syncing" | "synced" | "failed";
   /**
-   * 上次对账失败的原因（已格式化，可直接上屏）。仅 `syncState === "failed"`
-   * 时有意义；其余状态下应为 `undefined`。
+   * 上次对账失败的原因（已格式化，可直接上屏）。
+   *
+   * 门控契约：**只在 `syncState === "failed"` 时被读取**（`App.tsx` 传给
+   * `ChatView` 的 `syncError` 与 `ChatView` 内部的占位判定都先看 `failed`）。
+   * 因此其余状态下本字段的值**不保证被清空**——失败后重试会把它带进
+   * `syncing` 态，而那时它已不代表当前状态。
+   *
+   * 之所以用门控而不是「每次离开 failed 都清空」：清零点在六处状态转移上，
+   * 任何一处漏掉都会让「只读本字段」的新调用点显示过期文案，而门控只有一个
+   * 判据、不会漏。新增消费者请照同样的门控写，不要直接拿它描述当前状态。
    */
   syncError?: string | null;
 }

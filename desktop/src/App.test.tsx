@@ -6573,6 +6573,37 @@ describe("App 同步状态机（手机端黑屏）", () => {
     await waitFor(() => expect(resumeCount()).toBe(before + 1));
   });
 
+  it("a retry in flight shows the skeleton, not the stale failure reason", async () => {
+    // 失败后点重试：syncState 回到 syncing，而 syncError 必须已经清掉。
+    // `ChatView` 的判据是 `syncing || syncError !== null`，若旧值留着就会走进
+    // `syncError !== null` 分支 —— 健康的在途重试被显示成「内容加载失败 / 重试」。
+    //
+    // 注意：这条用例钉的是**渲染契约**（重试中只有骨架、没有重试按钮）。
+    // `ThreadView.syncError` 的清零本身在 UI 上不可直接观测（两处消费者都门控在
+    // `failed` 之内），它由 `App.tsx` 的 `clearSyncError` 在全部六处离开 failed 的
+    // 状态转移里保证——那是纵深防御，不是当前唯一的正确性来源。
+    asRemote();
+    let attempt = 0;
+    state.dataSources["thread/resume"] = () => {
+      attempt += 1;
+      if (attempt === 1) throw { code: -32602, message: "unknown thread" };
+      return new Promise(() => {});
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    // 第二次 resume 永不回包：此刻是「正在同步」，不是「失败」。
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="sync-skeleton"]')).toBeTruthy(),
+    );
+    expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "重试" }),
+    ).toBeNull();
+  });
+
   it("does not show a skeleton for a genuinely empty thread", async () => {
     asRemote();
     // resume 正常返回、readItems 也返回空 → 真·空会话
