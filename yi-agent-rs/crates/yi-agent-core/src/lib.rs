@@ -7,6 +7,7 @@ pub mod message;
 pub mod permission;
 pub mod provider;
 pub mod subagent;
+pub(crate) mod system_prompt;
 pub mod thinking;
 pub mod title;
 pub mod tool;

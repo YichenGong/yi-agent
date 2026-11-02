@@ -1,12 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
-import {
-  connectableTargets,
-  parseRelayTargets,
-  relayUrlForTarget,
-} from "./lib/relayTargets";
-import { wsTransport } from "./wsTransport";
 import { useIsMobile } from "./lib/useIsMobile";
 import { SearchBar } from "./components/SearchBar";
 import {
@@ -17,6 +11,7 @@ import { useEscapeKey } from "./ui/useEscapeKey";
 import { useDiffState } from "./hooks/useDiffState";
 import { createNotificationRouter } from "./hooks/useNotificationRouter";
 import { createHandshakeRecovery } from "./hooks/useHandshakeRecovery";
+import { createConnectionLifecycle } from "./hooks/connectionLifecycle";
 import { useProcessState } from "./hooks/useProcessState";
 import { useBoardState } from "./hooks/useBoardState";
 import { useSessionState } from "./hooks/useSessionState";
@@ -76,7 +71,6 @@ import {
   pendingKindFromPath,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
-import { nextReconnectDelay } from "./lib/reconnect";
 import { writeSelectedThread } from "./lib/selectedThread";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
@@ -1637,94 +1631,31 @@ export default function App() {
     if (needsPairing(isIos())) return;
     if (inited.current) return; // guard against React StrictMode double-invoke
     inited.current = true;
+    // 连接生命周期（建连 / 重连 / 退避 / 前台唤醒）已搬进
+    // `hooks/connectionLifecycle.ts`。这里只保留 effect 自己的守卫与本轮 effect
+    // 的两个记账变量：
+    // - `restartTimer`：本轮 effect 的在途退避定时器；
+    // - `attempt`：连续失败次数，握手成功即清零，所以偶尔一次闪断不会让下一次
+    //   重连背负更大的延迟。
+    // 两者必须是 effect 内的对象（而不是工厂内部的局部量），才能跨多次
+    // `reconnect*` 调用保持同一份，退避语义才与搬移前一致。
     let disposed = false;
-    let restartTimer: number | null = null;
-    // 连续失败次数：第一次断开排 500ms,此后按 1s/2s/4s/8s 翻倍(封顶 10s)。
-    // 握手成功即清零,所以偶尔一次闪断不会让下一次重连背负更大的延迟。
-    let attempt = 0;
+    const restartTimer: { current: number | null } = { current: null };
+    const attempt = { current: 0 };
 
-    /**
-     * 重建**某个**槽位的连接并握手。
-     *
-     * 与 `reconnectNow` 的区别：那个只服务「当前活动槽位 + 单一退避定时器」，
-     * 这条要给「切回前台时把所有槽位一起唤醒」用——远端槽位被系统掐断后不会
-     * 自己恢复，逐个重建才不会有项目静默半死。
-     *
-     * **只握手、不排队**：这里的调用点是前台唤醒，延迟没有价值；失败了由
-     * 该槽位自己的握手失败路径（`scheduleReconnect`）接管。
-     */
-    const reconnectSlot = (slot: Slot) => {
-      if (disposed) return;
-      let next: RpcClient;
-      try {
-        next = connectSlot(slot);
-      } catch (e) {
-        setStatus(`error: ${formatError(e)}`);
-        return;
-      }
-      syncActiveClient();
-      void handshake(next);
-    };
-
-    // 断开后的重连入口：清掉可能已在途的定时器,立刻建客户端重试。前台唤醒
-    // 用它做即时重连,exited 处理则用 scheduleReconnect 排队。
-    const reconnectNow = () => {
-      if (disposed) return;
-      if (restartTimer !== null) {
-        window.clearTimeout(restartTimer);
-        restartTimer = null;
-      }
-      let next: RpcClient;
-      try {
-        next = connect();
-      } catch (e) {
-        // 建 transport 本身也可能同步抛(落盘 URL 格式坏掉时 `withToken` 里的
-        // `new URL` 就会):这同样是"连不上",必须继续退避,否则循环就此死掉。
-        setStatus(`error: ${formatError(e)}`);
-        scheduleReconnect();
-        return;
-      }
-      void handshake(next);
-    };
-
-    // 退避排队：只要组件还挂着就绝不停下重试,后端没起来也不会一直卡在 connecting。
-    const scheduleReconnect = () => {
-      if (disposed || restartTimer !== null) return;
-      restartTimer = window.setTimeout(() => {
-        restartTimer = null;
-        reconnectNow();
-      }, nextReconnectDelay(attempt));
-      attempt += 1;
-    };
-
-    // iOS 从后台切回前台时 socket 常已被系统静默掐断,状态不会自己回来。
-    // 前台唤醒一律重建客户端重连:延迟在这条路径上毫无价值。这里故意不看
-    // `connected`——被后台掐断的 socket 可能没有 close/exited 事件,于是那个
-    // 标志会陈旧地停在 true(半开连接),信它就会把恰恰要修的场景漏过去。
-    // 只在可见性事件上触发,正常会话不受影响;reconnectNow 先清在途定时器,
-    // 再替换当前客户端,因此不会并发两条连接。
-    const onVisibilityChange = () => {
-      if (document.visibilityState !== "visible" || disposed) return;
-      attempt = 0;
-      // 遍历**所有**槽位：被后台掐断的远端连接不会自己恢复。只重连当前槽位会让
-      // 用户切回其它项目时的前几个请求全部失败（spec §4.6）。
-      const slots = registryRef.current.keys();
-      if (slots.length <= 1) {
-        reconnectNow();
-        return;
-      }
-      for (const slot of slots) reconnectSlot(slot);
-    };
-
-    // 通知/审批/状态回调与整段握手逻辑已搬进两个工厂（见
-    // `hooks/useNotificationRouter.ts` / `hooks/useHandshakeRecovery.ts`）。
-    // 依赖由参数显式传入：这与原来「闭包直接抓 effect 局部量」等价，但把
-    // 「漏抓一个就静默失效」变成 tsc 编译错误。
     // `handshake` 里要用 `connectRemoteTargets`，而后者又要用 `wireClient`：
     // 两者在同一个 effect 里互相引用。用一个转发 ref 破掉声明顺序，语义与
     // 原来「函数声明在同一作用域、调用发生在之后」等价。
     let connectRemoteTargetsRef: ((c: RpcClient) => Promise<void>) | null = null;
+    // `wireClient` / `handshake` 需要 `scheduleReconnect`，而后者又属于下面才建
+    // 好的 lifecycle：同样用一个转发 ref 破掉循环，语义与原来「同一作用域的
+    // 函数声明、调用发生在之后」等价。
+    let scheduleReconnectRef: () => void = () => {};
 
+    // 通知/审批/状态回调与整段握手逻辑见
+    // `hooks/useNotificationRouter.ts` / `hooks/useHandshakeRecovery.ts`。
+    // 依赖由参数显式传入：这与原来「闭包直接抓 effect 局部量」等价，但把
+    // 「漏抓一个就静默失效」变成 tsc 编译错误。
     const wireClient = createNotificationRouter({
       activeSlotRef,
       sess,
@@ -1743,7 +1674,7 @@ export default function App() {
       schedulePersist,
       selectThread,
       disposed,
-      scheduleReconnect,
+      scheduleReconnect: () => scheduleReconnectRef(),
     });
     const handshake = createHandshakeRecovery({
       activeSlotRef,
@@ -1765,12 +1696,29 @@ export default function App() {
       force,
       selectThread,
       connectRemoteTargets: (c) => connectRemoteTargetsRef!(c),
-      scheduleReconnect,
+      scheduleReconnect: () => scheduleReconnectRef(),
       resetAttempt: () => {
-        attempt = 0;
+        attempt.current = 0;
       },
       buildResumeHints,
     });
+
+    const lifecycle = createConnectionLifecycle({
+      activeSlotRef,
+      clientRef,
+      registryRef,
+      restartTimer,
+      attempt,
+      disposed: () => disposed,
+      toppedUp,
+      setStatus,
+      transportFactory,
+      recoveryRef,
+      handshake,
+      wireClient,
+    });
+    connectRemoteTargetsRef = lifecycle.connectRemoteTargets;
+    scheduleReconnectRef = lifecycle.scheduleReconnect;
 
     // 经中继时的自愈钩子：服务端把本连接判为「未初始化」时，`RpcClient` 会调用
     // 它重新建立会话，再自动重发那条被拒的请求。
@@ -1789,88 +1737,9 @@ export default function App() {
       if (win.length > 0) await raw("thread/subscribe", { threadIds: win });
     };
 
-    /**
-     * 建某槽位的连接。**只替换该槽位**，绝不动别的槽位。
-     *
-     * 销毁旧实例的职责收在 `ClientRegistry.put`：Tauri 事件监听不会随连接关闭
-     * 自动停，未 dispose 的旧 transport 会与新的一起消费每条帧，append-only 的
-     * `item/delta` 于是被应用两遍（流式文本重复，直到 `item/completed` 按 id
-     * 整条覆盖才「收敛」）。
-     */
-    const connectSlot = (slot: Slot = LOCAL_SLOT): RpcClient => {
-      // 新连接 = 新的对账周期：为「none 缓存会话」的静默补齐重新开账（见 `toppedUp`）。
-      toppedUp.current.clear();
-      const client = new RpcClient(transportFactory({ slot }), (raw) =>
-        recoveryRef.current!(raw),
-      );
-      registryRef.current.put(slot, client);
-      wireClient(client, slot);
-      return client;
-    };
-
-    /**
-     * 手机端：把 `remote/relayTargets` 里的每个可用项目各连一条。
-     *
-     * 三条约束（spec §4.6）：
-     * - 只连 `available` 且带 `session` 的项。不可用 = 那台远端的进程还没握手；
-     *   `session` 为 null = 本设备是 `Observe` 域，凭据根本没发给它。
-     * - **单个失败不影响其它**：多连接的全部价值就在于此。某个 target 建连失败
-     *   只是它自己缺席，不抛、不回退、不删已建好的连接。
-     * - 已经在册的槽位**不重建**：握手里会跑多次（重连、切回前台），每次重建
-     *   都会掐掉一条正在用的连接，用户看到的是流式输出中断。
-     */
-    const connectRemoteTargets = async (overLocal: RpcClient) => {
-      let raw: unknown;
-      try {
-        raw = await overLocal.request("remote/relayTargets", {});
-      } catch {
-        // 旧宿主 / stable 上这个方法不存在（-32601）。手机不该因为对面版本老
-        // 就连本地会话都用不了，静默当「没有远端项目」。
-        return;
-      }
-      const targets = parseRelayTargets(raw);
-      const config = storedRemoteConfig(localStorage);
-      for (const target of connectableTargets(targets)) {
-        if (disposed) return;
-        if (registryRef.current.get(target.profileId)) continue;
-        try {
-          const url = config
-            ? relayUrlForTarget(config.url, target.session)
-            : target.session;
-          if (!config) continue;
-          const next = new RpcClient(wsTransport(url, config.token), (r) =>
-            recoveryRef.current!(r),
-          );
-          registryRef.current.put(target.profileId, next);
-          wireClient(next, target.profileId);
-          // 与主连接同样握手：不做 `initialize` 的话该连接上任何 `thread/*` 都
-          // 会得到 `-32010 not initialized`。
-          await next.request("initialize", {});
-        } catch (e) {
-          // 只记这个项目：把它从注册表摘掉，避免留一条半死连接反复报错。
-          registryRef.current.remove(target.profileId);
-          console.warn(`remote project ${target.profileId} unavailable:`, e);
-        }
-      }
-    };
-
-    connectRemoteTargetsRef = connectRemoteTargets;
-
-    /** 让 `clientRef` 指向当前活动槽位的客户端。切槽位/重连后都要调一次。 */
-    const syncActiveClient = () => {
-      registryRef.current.setActive(activeSlotRef.current);
-      clientRef.current = registryRef.current.current() ?? null;
-    };
-
-    const connect = (): RpcClient => {
-      const client = connectSlot(activeSlotRef.current);
-      syncActiveClient();
-      return client;
-    };
-
-    void handshake(connect());
+    void handshake(lifecycle.connect());
     // 手机/iPad 切回前台时 socket 多半已被系统掐断,而状态不会自己回来。
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    document.addEventListener("visibilitychange", lifecycle.onForegroundWake);
     // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
     const boardTimer = window.setInterval(
       () => board.boardTick.current(),
@@ -1878,8 +1747,8 @@ export default function App() {
     );
     return () => {
       disposed = true;
-      if (restartTimer !== null) window.clearTimeout(restartTimer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (restartTimer.current !== null) window.clearTimeout(restartTimer.current);
+      document.removeEventListener("visibilitychange", lifecycle.onForegroundWake);
       window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

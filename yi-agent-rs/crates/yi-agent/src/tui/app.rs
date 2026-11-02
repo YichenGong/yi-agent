@@ -658,12 +658,16 @@ struct LoopBookkeeping {
     previous_viewport: Option<(ViewportAnchor, u16, u16)>,
     /// 终端通知：候选在这里攒着，等这一帧画完再 flush（见下面 `notifications.take()`）。
     notifications: NotificationState,
+    /// 真正把通知送出去的终端器（方法 / 触发条件 / 终端环境）。
+    /// 与 `notifications` 同属「终端通知」这一件事，故与它同组。
+    notifier: crate::tui::notify::Notifier,
 }
 
 impl LoopBookkeeping {
     fn new(
         runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
         process_manager: &yi_agent_tools::ProcessManager,
+        notifier: crate::tui::notify::Notifier,
     ) -> Self {
         Self {
             pending_quit: false,
@@ -679,6 +683,7 @@ impl LoopBookkeeping {
             process_outputs: std::collections::HashMap::new(),
             previous_viewport: None,
             notifications: NotificationState::new(),
+            notifier,
         }
     }
 }
@@ -710,10 +715,9 @@ fn run_loop<B: Backend, E: EventSource>(
     // 的时序约束，散在那里只是让 538 行的循环更难读。
     let mut session_ui = SessionUi::new(model);
     let mut popup_stack = PopupStack::new();
-    let mut loop_bk = LoopBookkeeping::new(runtime_intent, &process_manager);
     let notifications_enabled = config.notifications;
     let focused = std::sync::atomic::AtomicBool::new(true);
-    let mut notifier = {
+    let notifier = {
         let method = crate::tui::notify::Method::parse(&config.notification_method)
             .unwrap_or(crate::tui::notify::Method::Auto);
         let condition = crate::tui::notify::Condition::parse(&config.notification_condition)
@@ -731,6 +735,7 @@ fn run_loop<B: Backend, E: EventSource>(
             &crate::tui::notify::TerminalEnv::from_process(),
         )
     };
+    let mut loop_bk = LoopBookkeeping::new(runtime_intent, &process_manager, notifier);
 
     loop {
         let size = terminal.size()?;
@@ -992,8 +997,8 @@ fn run_loop<B: Backend, E: EventSource>(
         // 通知只在两帧之间发：插在帧中间会把 ANSI 序列切断，留下渲染残影。
         if let Some(pending) = loop_bk.notifications.take() {
             let is_focused = focused.load(std::sync::atomic::Ordering::Relaxed);
-            if should_notify(notifier.condition(), is_focused) {
-                let _ = notifier.notify(&pending.text);
+            if should_notify(loop_bk.notifier.condition(), is_focused) {
+                let _ = loop_bk.notifier.notify(&pending.text);
             }
         }
 
