@@ -103,10 +103,15 @@ pub(crate) use thread_index::{
     Activation, SyncAction, SyncHint, TAG_NAME_MAX_LEN, attach_delegation, collect_pinned,
     decision_label, find_thread_dir, image_media_type, is_load_bearing, item_id,
     parse_client_decision, parse_resume_hints, plan_sync, record_last_item_id,
-    require_known_thread, require_thread_id, resolve_thread_cwd, saturate_u32, snapshot_for_watch,
+    require_known_thread, require_thread_id, resolve_thread_cwd, snapshot_for_watch,
     socket_for_thread, store_for, store_lookup, thread_cwd, thread_status, thread_summary_json,
     thread_summary_json_with_status, update_status, worktree_json,
 };
+
+// `saturate_u32` 在拆分前就是 `pub fn`：`yi-agent` crate 的 `turn_log.rs` 跨 crate
+// 直接调 `yi_agent_app_server::server::saturate_u32`，故这里必须保持 `pub`，
+// 不能并进上面的 `pub(crate) use`。
+pub use thread_index::saturate_u32;
 
 pub(crate) mod migration;
 pub(crate) mod plugin_bridge;
