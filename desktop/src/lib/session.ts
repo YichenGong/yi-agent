@@ -313,23 +313,6 @@ export class Session {
   }
 
   /**
-   * Insert a server item right after the last item that already holds a position.
-   *
-   * Appending to the array end was wrong whenever a locally-minted bubble sat
-   * there: the first server item of a turn (the opening user message) would land
-   * *after* the local echo that preceded it, or — for a thread opened while a
-   * turn was already running — after agent text that arrived first, which is
-   * exactly how the opening prompt ended up at the bottom of the transcript.
-   * Anchoring to the last positioned item keeps reload-on-open order.
-   *
-   * The anchor is a server item **or an already-placed reasoning block**: the CoT
-   * block is a local item, but it is positioned by this very logic and must stay
-   * ahead of the answer it precedes. If it did not anchor, the turn's
-   * `agentMessage` would be spliced in before it and the 「思考」block would end
-   * up trailing its own answer (design §6.1: 位于正文之前). Local echoes and
-   * notices are still not anchors — the server transcript is the authority.
-   */
-  /**
    * Fold a server `thinking` item over the text we already hold.
    *
    * 块级 `thinking` 条目不携带明文（摘要走 `thread/reasoningDelta` 旁路），
@@ -383,6 +366,23 @@ export class Session {
     return -1;
   }
 
+  /**
+   * Insert a server item right after the last item that already holds a position.
+   *
+   * Appending to the array end was wrong whenever a locally-minted bubble sat
+   * there: the first server item of a turn (the opening user message) would land
+   * *after* the local echo that preceded it, or — for a thread opened while a
+   * turn was already running — after agent text that arrived first, which is
+   * exactly how the opening prompt ended up at the bottom of the transcript.
+   * Anchoring to the last positioned item keeps reload-on-open order.
+   *
+   * The anchor is a server item **or an already-placed reasoning block**: the CoT
+   * block is a local item, but it is positioned by this very logic and must stay
+   * ahead of the answer it precedes. If it did not anchor, the turn's
+   * `agentMessage` would be spliced in before it and the 「思考」block would end
+   * up trailing its own answer (design §6.1: 位于正文之前). Local echoes and
+   * notices are still not anchors — the server transcript is the authority.
+   */
   private insertAfterLastServerItem(item: Item): void {
     // 任何服务端项一旦插到推理块之后，就该由**它**来承载这一轮的正文：推理块
     // 到此为止（下一段 CoT 另起一块）。不打断的话，`reasoning[上一轮]` 会一直
