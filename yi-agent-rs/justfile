@@ -167,10 +167,22 @@ eval filter="":
 # 豁免清单在 .cargo/audit.toml，每条都带复查条件。这里**不**加
 # `--deny warnings`：unmaintained 类告警是不可修的，加 deny 会让门禁
 # 因必然失败的条目永久变红，反而训练人忽略它。
+#
+# 走 scripts/audit-deps.sh 而不是裸 `cargo audit`：后者对「网络失败」和
+# 「真发现漏洞」返回同一个退出码 1（实测 0.22.2，详见脚本头注释），导致
+# advisory-db 一次性拉取失败就整条 CI 变红。假红会训练人忽略这道门禁。
+# 包装层做的事：区分两者；网络失败时重试 → 降级到本地缓存 → 明确告警，
+# 但**绝不**降级真漏洞。
 audit:
-    cargo audit
+    bash ../scripts/audit-deps.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check audit
+# audit-deps.sh 自身的分支自测（假 cargo 驱动，不需网络）。
+# 必须进 ci：那层包装的核心职责是「不把真漏洞降级成网络问题」，判错是静默
+# 失效——平时全绿、真有漏洞也不报。只靠人读脚本保证不了。
+audit-deps-check:
+    bash ../scripts/test_audit_deps.sh
+
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check audit-deps-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
