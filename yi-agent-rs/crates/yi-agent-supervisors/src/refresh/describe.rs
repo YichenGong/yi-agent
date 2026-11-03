@@ -108,6 +108,26 @@ impl DescribePolicy {
         Self::with_stdout_limit(timeout, 1024 * 1024)
     }
 
+    /// 测试用：宽预算，其余参数与生产一致。
+    ///
+    /// For the cases that walk the real batch path. Their question is "does
+    /// draining work", not "is this machine fast": the production 15 s budget is
+    /// calibrated to stop a plugin that is genuinely hung, and a full parallel
+    /// test run can spend more than that just starting `python3`. Only the
+    /// deadline moves -- the stdout limit and stderr capture stay at their
+    /// production values, so the backpressure under test is the real one.
+    #[cfg(test)]
+    pub(super) fn wide_budget(timeout: Duration) -> Self {
+        Self::checked(
+            timeout,
+            Duration::from_millis(5),
+            1024 * 1024,
+            64 * 1024,
+            READ_BUFFER_BYTES,
+            64 * 1024,
+        )
+    }
+
     /// 测试用：短预算 + 指定的 stdout 硬上限。
     #[cfg(test)]
     fn with_stdout_limit(timeout: Duration, stdout_limit: usize) -> Self {

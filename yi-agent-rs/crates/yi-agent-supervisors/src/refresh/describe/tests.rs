@@ -228,11 +228,9 @@ fn describe_drains_large_stdout_without_a_false_timeout() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "small", 256 * 1024, 0);
     let before = std::fs::read(&plugin.stored).unwrap();
-    let result =
-        crate::refresh::refresh_from_plugins(&fixture.workdir().join(".yi-agent/supervisors"));
     assert_eq!(
-        result,
-        vec![crate::refresh::RefreshOutcome::Refreshed("a".into())]
+        refreshed_with_a_wide_budget(&fixture),
+        vec!["a".to_string()]
     );
     let after = std::fs::read(&plugin.stored).unwrap();
     assert_ne!(after, before);
@@ -248,11 +246,9 @@ fn describe_drains_stderr_after_its_capture_limit() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "noisy", 0, 0);
     let before = std::fs::read(&plugin.stored).unwrap();
-    let result =
-        crate::refresh::refresh_from_plugins(&fixture.workdir().join(".yi-agent/supervisors"));
     assert_eq!(
-        result,
-        vec![crate::refresh::RefreshOutcome::Refreshed("a".into())]
+        refreshed_with_a_wide_budget(&fixture),
+        vec!["a".to_string()]
     );
     let after = std::fs::read(&plugin.stored).unwrap();
     assert_ne!(after, before);
@@ -720,6 +716,29 @@ fn observing_a_running_child_reports_none() {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// 走**真实批次路径**，但用一份不会因为机器忙而到期的预算。
+///
+/// These two cases are about backpressure: a 256 KiB manifest and 2 MiB of
+/// stderr must not look like a hung plugin. Grading them against the production
+/// 15 s budget made them race the machine -- the same case takes 0.8 s alone and
+/// exceeded 15 s while the rest of the suite ran, which surfaced as a
+/// `Skipped(Timeout)` failure that said nothing about draining (reproduced on
+/// 2 of 6 runs here on 2026-11-04). A wide deadline keeps every other production
+/// parameter and still fails a genuinely stuck plugin.
+fn refreshed_with_a_wide_budget(fixture: &PluginFixture) -> Vec<String> {
+    crate::refresh::refresh_records(
+        &fixture.workdir().join(".yi-agent/supervisors"),
+        DescribePolicy::wide_budget(Duration::from_secs(120)),
+        &mut |_| false,
+    )
+    .into_iter()
+    .filter_map(|record| match record.outcome {
+        crate::refresh::RefreshOutcome::Refreshed(name) => Some(name),
+        _ => None,
+    })
+    .collect()
+}
 
 /// 观测「子进程已进入目标阶段」的预算。**宽 backstop，不是期望值**：全量测试
 /// 并发跑时 python3 冷启动实测能超过 10 秒（2026-11-03 本机 nextest 并发下复现），
