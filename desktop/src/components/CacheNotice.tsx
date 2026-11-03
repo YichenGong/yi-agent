@@ -33,8 +33,24 @@ export function CacheNotice({
     >
       {/* 顺序是刻意的：`failed` 压过 `syncing`。两者同为真是状态机自身的问题
           （置 failed 时必然已离开 syncing），真撞上时优先说出"失败了、可以重试"
-          ——那是用户唯一能行动的结论。 */}
-      {failed ? "内容加载失败 · 可重试" : syncing ? "正在同步…" : offlineLabel(savedAt)}
+          ——那是用户唯一能行动的结论。圆环同理只在 `syncing && !failed` 时出现，
+          装饰元素不参与状态判断，也不向 status 文本引入任何字符。
+          圆环用 `motion-safe:animate-spin`：系统开了「减少动态效果」时它静止，
+          文字本身已经完整表达状态，不依赖动画传达信息。 */}
+      {syncing && !failed ? (
+        <span className="inline-flex items-center gap-1.5 align-top">
+          <span
+            data-testid="sync-indicator"
+            aria-hidden="true"
+            className="size-3 shrink-0 rounded-full border border-current border-r-transparent motion-safe:animate-spin"
+          />
+          <span>正在同步…</span>
+        </span>
+      ) : failed ? (
+        "内容加载失败 · 可重试"
+      ) : (
+        offlineLabel(savedAt)
+      )}
     </div>
   );
 }
