@@ -1421,8 +1421,11 @@ pub(crate) fn respond(
             };
             let (status, children, reports) = match outcome {
                 Err(_) => {
-                    let (children, reports) =
-                        coordinator.child_completion_snapshot(&session_id, &caller_task_id)?;
+                    // Same runtime as the wait itself: the snapshot needs the
+                    // supervisor guard, and the wait may have just released it.
+                    let (children, reports) = runtime.block_on(
+                        coordinator.child_completion_snapshot(&session_id, &caller_task_id),
+                    )?;
                     (
                         "timeout".into(),
                         children

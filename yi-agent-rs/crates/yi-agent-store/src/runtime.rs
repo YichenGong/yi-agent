@@ -3032,23 +3032,29 @@ impl RuntimeCoordinator {
         self.wait_for_children(session, caller, mode).await
     }
 
-    pub fn direct_children(
+    pub async fn direct_children(
         &self,
         session: &RootSessionId,
         caller: &TaskId,
     ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
-        Ok(self.child_completion_snapshot(session, caller)?.0)
+        Ok(self.child_completion_snapshot(session, caller).await?.0)
     }
 
-    pub fn child_completion_snapshot(
+    /// Reads the completion snapshot for `caller`'s direct children.
+    ///
+    /// Waits for the supervisor instead of `try_lock`: this is a pure read, and
+    /// a briefly held guard means a turn is progressing, not that the request is
+    /// invalid. Reporting contention as `invalid_state: supervisor is busy` broke
+    /// the bounded wait path -- the timeout branch takes this snapshot to report
+    /// partial completions, so a busy supervisor turned a legitimate timeout into
+    /// a protocol error the caller could not act on.
+    pub async fn child_completion_snapshot(
         &self,
         session: &RootSessionId,
         caller: &TaskId,
     ) -> Result<(Vec<TaskId>, Vec<CompletedChildReport>), RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
-        let supervisor = supervisor
-            .try_lock()
-            .map_err(|_| RuntimeCoordinatorError::Supervisor("supervisor is busy".into()))?;
+        let supervisor = supervisor.lock().await;
         Ok(supervisor.child_completion_snapshot(caller))
     }
 
@@ -4799,6 +4805,84 @@ mod provider_turn_admission_tests {
                 .has_active_lease_prefix(&task, "llm:")
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod child_snapshot_contention_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A factory is never started here; only the coordinator's bookkeeping is
+    /// exercised, so an unavailable worker is the honest answer.
+    struct IdleFactory;
+
+    impl AgentWorkerFactory for IdleFactory {
+        fn is_available(&self) -> bool {
+            false
+        }
+        fn start(
+            &self,
+            _request: yi_agent_core::subagent::worker::WorkerStart,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<WorkerHandle, yi_agent_core::subagent::worker::WorkerError>,
+        > {
+            Box::pin(async {
+                Err(yi_agent_core::subagent::worker::WorkerError::Startup(
+                    "unused".into(),
+                ))
+            })
+        }
+    }
+
+    /// Reading the snapshot while the supervisor guard is held must wait, not
+    /// report `supervisor is busy`.
+    ///
+    /// This is the contract the bounded `wait_agent` path depends on: after a
+    /// timeout it takes this snapshot to report partial completions, and it runs
+    /// right after the wait released the guard. The old `try_lock` turned that
+    /// ordinary hand-off into `invalid_state`, which the caller could neither
+    /// explain nor retry. The test holds the guard itself, so it fails
+    /// deterministically instead of only under load.
+    #[tokio::test]
+    async fn a_held_supervisor_guard_delays_the_snapshot_instead_of_failing_it() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator = RuntimeCoordinator::open(&database, Arc::new(IdleFactory)).unwrap();
+
+        let session = RootSessionId::new();
+        let supervisor = Arc::new(AsyncMutex::new(AgentSupervisor::new(session.clone())));
+        let caller = supervisor.lock().await.root_task_id().clone();
+        coordinator
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .insert(session.clone(), Arc::clone(&supervisor));
+
+        let guard = supervisor.lock().await;
+        let reader = tokio::spawn({
+            let coordinator_session = session.clone();
+            let coordinator_caller = caller.clone();
+            async move {
+                coordinator
+                    .child_completion_snapshot(&coordinator_session, &coordinator_caller)
+                    .await
+            }
+        });
+        // Give the reader a chance to run into the held guard.
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "the snapshot must wait for the guard, not return while it is held"
+        );
+
+        drop(guard);
+        let snapshot = reader
+            .await
+            .expect("the reader task must not panic")
+            .expect("a held guard must not surface as an error");
+        assert!(snapshot.0.is_empty(), "the root has no children yet");
     }
 }
 
