@@ -5379,6 +5379,7 @@ dependencies = [
  "wiremock",
  "yi-agent-core",
  "yi-agent-lifecycle",
+ "yi-agent-llm",
  "yi-agent-skills",
  "yi-agent-supervisors",
  "zip",

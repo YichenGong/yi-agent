@@ -193,7 +193,7 @@ impl Tool for ProcessReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read buffered stdout and stderr from a managed background process."
+        "Read buffered stdout and stderr from a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder."
     }
 
     fn schema(&self) -> Value {
@@ -265,7 +265,7 @@ impl Tool for ProcessKillTool {
     }
 
     fn description(&self) -> &str {
-        "Kill a managed background process by process_id or name."
+        "Kill a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder."
     }
 
     fn schema(&self) -> Value {
@@ -314,11 +314,11 @@ fn process_selector_schema(extra_properties: Value) -> Value {
     let mut properties = serde_json::json!({
         "process_id": {
             "type": "string",
-            "description": "Managed process id returned by process_start or process_list."
+            "description": "Optional managed process id returned by process_start or process_list. Provide exactly one of process_id or name; omit name when using process_id."
         },
         "name": {
             "type": "string",
-            "description": "Unique managed process name."
+            "description": "Optional unique managed process name. Provide exactly one of process_id or name; omit process_id when using name."
         }
     });
     if let (Some(base), Some(extra)) = (properties.as_object_mut(), extra_properties.as_object()) {
@@ -329,7 +329,8 @@ fn process_selector_schema(extra_properties: Value) -> Value {
 
     serde_json::json!({
         "type": "object",
-        "properties": properties
+        "properties": properties,
+        "required": []
     })
 }
 
@@ -410,6 +411,159 @@ mod tests {
 
         assert!(result.is_error);
         assert!(text(&result).contains("max_bytes must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn process_selector_argument_contract() {
+        // 四种合法 kill 输入各用独立 manager/进程，不复用已终止实例。
+        for kill_case in ["name", "id", "name-with-null", "id-with-null"] {
+            let temp = TempDir::new().unwrap();
+            let manager = ProcessManager::new(temp.path().to_path_buf());
+            let start = ProcessStartTool::new(manager.clone());
+            let read = ProcessReadTool::new(manager.clone());
+            let kill = ProcessKillTool::new(manager.clone());
+            let started = start
+                .call(serde_json::json!({
+                    "command": "printf selector-ready; sleep 30",
+                    "name": "selector-contract",
+                    "ready_pattern": "selector-ready",
+                    "ready_timeout_sec": 5
+                }))
+                .await;
+            assert!(!started.is_error, "{}", text(&started));
+            let started_json: Value = serde_json::from_str(text(&started)).unwrap();
+            assert_eq!(started_json["ready"], true);
+            let id = started_json["process_id"].as_str().unwrap().to_owned();
+
+            let valid_reads = [
+                serde_json::json!({"process_id": id}),
+                serde_json::json!({"name": "selector-contract"}),
+                serde_json::json!({"process_id": id, "name": null}),
+                serde_json::json!({"name": "selector-contract", "process_id": null}),
+            ];
+            for args in valid_reads {
+                let result = read.call(args).await;
+                assert!(!result.is_error, "{}", text(&result));
+                let output: Value = serde_json::from_str(text(&result)).unwrap();
+                assert_eq!(output["process_id"], id);
+                assert_eq!(output["stdout"], "selector-ready");
+            }
+
+            // want 是手工选择的错误类别；不从被测函数计算期望。
+            let invalid = [
+                (serde_json::json!({}), "exactly one"),
+                (
+                    serde_json::json!({"process_id": null, "name": null}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": id, "name": "selector-contract"}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": "", "name": "selector-contract"}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": id, "name": ""}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": "", "name": ""}),
+                    "exactly one",
+                ),
+                (serde_json::json!({"process_id": ""}), "process not found"),
+                (serde_json::json!({"name": ""}), "process not found"),
+            ];
+            for (args, want) in invalid {
+                let before = manager
+                    .list()
+                    .into_iter()
+                    .find(|p| p.process_id == id)
+                    .unwrap();
+                let read_result = read.call(args.clone()).await;
+                assert!(read_result.is_error, "read accepted {args}");
+                assert!(text(&read_result).contains(want), "{}", text(&read_result));
+                let kill_result = kill.call(args.clone()).await;
+                assert!(kill_result.is_error, "kill accepted {args}");
+                assert!(text(&kill_result).contains(want), "{}", text(&kill_result));
+                let after = manager
+                    .list()
+                    .into_iter()
+                    .find(|p| p.process_id == id)
+                    .unwrap();
+                assert_eq!(
+                    after.status, before.status,
+                    "invalid kill changed status: {args}"
+                );
+                assert_eq!(after.pid, before.pid);
+                assert_eq!(after.ready, before.ready);
+                let still_readable = read.call(serde_json::json!({"process_id": id})).await;
+                assert!(!still_readable.is_error, "{}", text(&still_readable));
+                let output: Value = serde_json::from_str(text(&still_readable)).unwrap();
+                assert_eq!(output["stdout"], "selector-ready");
+            }
+
+            let kill_args = match kill_case {
+                "name" => serde_json::json!({"name": "selector-contract"}),
+                "id" => serde_json::json!({"process_id": id}),
+                "name-with-null" => {
+                    serde_json::json!({"name": "selector-contract", "process_id": null})
+                }
+                "id-with-null" => serde_json::json!({"process_id": id, "name": null}),
+                _ => unreachable!(),
+            };
+            let killed = kill.call(kill_args).await;
+            assert!(!killed.is_error, "{}", text(&killed));
+            let snapshot = manager
+                .list()
+                .into_iter()
+                .find(|p| p.process_id == id)
+                .unwrap();
+            assert_eq!(
+                snapshot.status,
+                crate::process::manager::ProcessStatus::Killed
+            );
+            manager.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn process_selector_schema_contract() {
+        let temp = TempDir::new().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ProcessReadTool::new(manager.clone())),
+            Box::new(ProcessKillTool::new(manager)),
+        ];
+        for tool in tools {
+            let schema = tool.schema();
+            assert_eq!(schema["type"], "object", "{}", tool.name());
+            assert_eq!(schema["required"], serde_json::json!([]), "{}", tool.name());
+            assert!(
+                tool.description().contains("exactly one"),
+                "{}",
+                tool.name()
+            );
+            assert!(tool.description().contains("Omit"), "{}", tool.name());
+            assert!(
+                tool.description().contains("empty string"),
+                "{}",
+                tool.name()
+            );
+            for (field, other) in [("process_id", "name"), ("name", "process_id")] {
+                assert_eq!(schema["properties"][field]["type"], "string");
+                let description = schema["properties"][field]["description"]
+                    .as_str()
+                    .expect("field description");
+                assert!(description.contains("Optional"), "{}.{field}", tool.name());
+                assert!(description.contains("omit"), "{}.{field}", tool.name());
+                assert!(description.contains(other), "{}.{field}", tool.name());
+            }
+            for key in ["oneOf", "anyOf", "allOf", "not", "enum", "const"] {
+                assert!(schema.get(key).is_none(), "{}: {key}", tool.name());
+            }
+        }
     }
 
     #[test]

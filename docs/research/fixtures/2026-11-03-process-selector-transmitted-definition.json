@@ -1,0 +1,101 @@
+{
+  "_note": "Tool definitions actually transmitted by a real agent run at an OpenAI Chat Completions boundary. Only name/description/parameters (and strict when present). No headers, auth material, or message content.",
+  "branch_fixed": {
+    "required_present": true,
+    "tools": {
+      "process_kill": {
+        "description": "Kill a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder.",
+        "parameters": {
+          "properties": {
+            "name": {
+              "description": "Optional unique managed process name. Provide exactly one of process_id or name; omit process_id when using name.",
+              "type": "string"
+            },
+            "process_id": {
+              "description": "Optional managed process id returned by process_start or process_list. Provide exactly one of process_id or name; omit name when using process_id.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        }
+      },
+      "process_read": {
+        "description": "Read buffered stdout and stderr from a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder.",
+        "parameters": {
+          "properties": {
+            "cursor": {
+              "description": "Optional output cursor returned by a previous process_read call.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_bytes": {
+              "default": 65536,
+              "description": "Maximum bytes to return from each stream. Defaults to 64 KiB.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Optional unique managed process name. Provide exactly one of process_id or name; omit process_id when using name.",
+              "type": "string"
+            },
+            "process_id": {
+              "description": "Optional managed process id returned by process_start or process_list. Provide exactly one of process_id or name; omit name when using process_id.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        }
+      }
+    }
+  },
+  "deployed_build_308ccaa4_unfixed": {
+    "required_present": false,
+    "tools": {
+      "process_kill": {
+        "description": "Kill a managed background process by process_id or name.",
+        "parameters": {
+          "properties": {
+            "name": {
+              "description": "Unique managed process name.",
+              "type": "string"
+            },
+            "process_id": {
+              "description": "Managed process id returned by process_start or process_list.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "process_read": {
+        "description": "Read buffered stdout and stderr from a managed background process.",
+        "parameters": {
+          "properties": {
+            "cursor": {
+              "description": "Optional output cursor returned by a previous process_read call.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_bytes": {
+              "default": 65536,
+              "description": "Maximum bytes to return from each stream. Defaults to 64 KiB.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Unique managed process name.",
+              "type": "string"
+            },
+            "process_id": {
+              "description": "Managed process id returned by process_start or process_list.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      }
+    }
+  }
+}
