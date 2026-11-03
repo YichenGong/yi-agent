@@ -30,7 +30,7 @@
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 111 / 122 | [详情](./desktop.md) |
-| magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
+| magpie-agent-yi-agent | 5 / 5 | [详情](./magpie-agent-yi-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 
 ## 已知问题

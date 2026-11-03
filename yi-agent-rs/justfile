@@ -43,14 +43,14 @@ ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
-# 镜像没有 Node，塞进去会把整条流水线拖垮；由 `.github/workflows/magpie-agent.yml`
-# 按路径单独触发。本地可用 `just magpie-agent-check` 跑。
-magpie-agent-check:
-    bash ../scripts/test-magpie-agent.sh
+# 镜像没有 Node，塞进去会把整条流水线拖垮；由 `.github/workflows/magpie-agent-yi-agent.yml`
+# 按路径单独触发。本地可用 `just magpie-agent-yi-agent-check` 跑。
+magpie-agent-yi-agent-check:
+    bash ../scripts/test-magpie-agent-yi-agent.sh
 
 # 桌面端类型检查 + 单元测试。需要 Node，故**不进** `ci` 依赖列表：
 # MR 路径的 `ci-mr` 用的是 `rust:latest` 镜像，没有 Node；塞进去会把整条
-# 流水线拖垮。与 `magpie-agent-check` 同类，由独立 job 跑。
+# 流水线拖垮。与 `magpie-agent-yi-agent-check` 同类，由独立 job 跑。
 #
 # 用 `tsc --noEmit` 而不是 `npm run build`：门禁要的是类型正确，产出 `dist/`
 # 是发布步骤。用 `npx vitest run` 而不是 `npm test`：避免以后 test 脚本被改成

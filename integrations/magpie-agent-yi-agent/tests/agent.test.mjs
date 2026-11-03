@@ -6,7 +6,7 @@
 // restore) to cover the "connect / switch / disconnect restores the user's
 // config" behavior without requiring a running Magpie.
 //
-// Run with: node --test tests/agent.test.mjs   (from integrations/magpie/)
+// Run with: node --test tests/agent.test.mjs   (from integrations/magpie-agent-yi-agent/)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
