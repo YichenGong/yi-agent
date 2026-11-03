@@ -68,6 +68,8 @@
   - 判据：`grep -rn "migrate_model_keys\|migrate_env_settings\|parse_env_text\|resolve_global_env_path" yi-agent-rs/crates` 应无输出（`settings.rs` 的函数定义除外，届时已删）
   - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
 
+- [ ] 插件清单刷新全阶段限时与停机取消 — `yi-agent-supervisors/src/refresh.rs:110–153` 的原始函数已用合成插件复现管道背压误判超时及退出后超过 15s；runtime `src/supervise.rs:176–188` 启动刷新需传递已有 stop 信号，避免 shutdown join 被刷新拖住。待实现判据：`cargo test -p yi-agent-supervisors` 覆盖双流排空/期限/清理，`cargo test -p yi-agent-runtime --lib supervise` 覆盖 `stopping_during_manifest_refresh_joins_promptly` 与真实对账恢复（新测试待实现）；[修复 spec](../superpowers/specs/2026-11-03-supervisor-manifest-describe-bounds-design.md) §6。
+
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
 
 - [ ] 临时旁问共享只读运行器 — 有效配置快照、独立取消/事件/用量与只读工具白名单，桌面/手机宿主与 TUI 共用；验收目标 `side_registry_rejects_mutation_even_with_yolo`、`side_cancel_does_not_cancel_parent`，执行 `cargo test -p yi-agent-runtime --lib side_`（测试待实现）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6–7、§12.1。

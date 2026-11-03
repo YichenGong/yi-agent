@@ -23,7 +23,7 @@
 | yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
-| yi-agent-runtime | 24 / 25 | [详情](./yi-agent-runtime.md) |
+| yi-agent-runtime | 24 / 27 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 12 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 80 / 81 | [详情](./yi-agent-app-server.md) |
