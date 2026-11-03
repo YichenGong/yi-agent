@@ -112,6 +112,7 @@ async fn agent_factory_failure_returns_internal_error() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            instance_home: PathBuf::new(),
             remote_dir: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),

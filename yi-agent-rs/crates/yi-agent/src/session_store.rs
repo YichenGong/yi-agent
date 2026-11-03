@@ -81,6 +81,7 @@ impl TuiSessionStore {
             last_read_at: 0,
             last_completed_at: 0,
             forked_from: None,
+            plugin_bindings: Vec::new(),
         };
         store.create(&meta)?;
         let lock = acquire_thread_lock(store.root(), &thread_id)
@@ -621,6 +622,50 @@ mod tests {
             !store.has_resumable_content().unwrap(),
             "/clear 之后恢复出来是空的，不该提示 resume"
         );
+    }
+
+    /// CLI 侧 resume：插件绑定的**版本与代次**必须原样回来。
+    ///
+    /// 与 `app-server` 的 `resuming_a_plugin_session_keeps_the_exact_binding`
+    /// 是同一行为的另一条建模路径（CLI 用 `TuiSessionStore::open`，桌面用
+    /// `ThreadStore::load`）。两条都要钉：只测一边的话，另一条路径哪天改成
+    /// "顺手刷新成当前版本"，插件升级就会静默把旧会话接到新版本上。
+    #[test]
+    fn resuming_a_plugin_session_keeps_the_plugin_binding_in_the_cli_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = TuiSessionStore::create_new(dir.path(), "m", ThreadMode::Normal).unwrap();
+        let thread_id = store.thread_id().to_string();
+        let binding = yi_agent_plugins::Binding {
+            host_id: "host-cli".into(),
+            release: yi_agent_plugins::ReleaseId {
+                plugin: yi_agent_plugins::PluginId::parse("superpowers-kanban").unwrap(),
+                version: "1.4.0".into(),
+                target: "darwin-aarch64".into(),
+                sha256: "cd".repeat(32),
+            },
+            activation: 5,
+            project: yi_agent_plugins::ProjectId::parse("/tmp/project").unwrap(),
+            grant: 1,
+        };
+        let raw = ThreadStore::new(dir.path());
+        let mut meta = raw.load(&thread_id).unwrap().expect("just created").meta;
+        meta.plugin_bindings = vec![binding.clone()];
+        // `create` 是覆盖写；用同一份 meta 落回去模拟"建会话时已带绑定"。
+        raw.create(&meta).unwrap();
+        drop(store); // 释放写锁，否则 open 拿到 Busy。
+
+        let reopened = TuiSessionStore::open(dir.path(), &thread_id).expect("reopen");
+        let loaded = ThreadStore::new(dir.path())
+            .load(&thread_id)
+            .unwrap()
+            .expect("still there");
+        assert_eq!(
+            loaded.meta.plugin_bindings,
+            vec![binding],
+            "CLI resume must not drop or rewrite the binding"
+        );
+        // 句柄本身也拿到了同一个会话（不是新建了一个）。
+        assert_eq!(reopened.thread_id(), thread_id);
     }
 
     #[test]

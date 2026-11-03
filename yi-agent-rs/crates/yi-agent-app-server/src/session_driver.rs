@@ -148,10 +148,32 @@ pub(crate) struct DriverState {
     pub results: Vec<ActionResult>,
 }
 
+/// 驱动动作的准入闸门。
+///
+/// # 为什么是一个 trait 而不是直接判权限
+///
+/// 判定要读磁盘上的绑定、授权表与生命周期（见 `plugin_manager`），而
+/// `session_driver` 是纯协议层：它不该知道那些文件长什么样。更实际的理由是
+/// 测试：要证明"没有 Launch 权限时不会起会话"，必须能注入一个"现在拒绝"的
+/// 判定，而不是去构造一整套实例根、签名包与授权表——那测的是夹具，不是门禁。
+///
+/// 返回 `Err` 即拒绝，错误原样上行到动作结果。**不做重试、不转成"无事可做"**：
+/// 一次权限拒绝若被伪装成"插件没安排活"，用户会看到系统安静地停摆。
+pub(crate) trait DriverGate: Send + Sync {
+    /// 允许这个插件在这个项目里**新建**会话吗。
+    ///
+    /// 只用于 `Launch`。`Append` 续跑的是宿主已持有的会话，它的准入在建会话时
+    /// 已经判过一次；每轮再判会导致插件升级后正在跑的会话被拦腰截断。
+    fn may_launch(&self, project: &Path, plugin: &str) -> Result<(), String>;
+}
+
 /// 执行动作的副作用。真实现复用 `start_thread_core` / `prepare_turn_core` 的
 /// 无响应帧路径；测试用替身驱动纯逻辑。
 pub(crate) trait SessionLauncher {
-    async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String>;
+    /// 执行一个动作。`plugin` 是给出该动作的插件名——闸门要按它判权限，
+    /// 而它**不能**从动作内容推断：动作里没有插件名，且凭内容猜等于让插件
+    /// 自报身份。
+    async fn launch(&mut self, plugin: &str, action: &DriverAction) -> anyhow::Result<String>;
 }
 
 /// 一个会话此刻算不算「运行中」。
@@ -218,6 +240,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     threads: &mut Vec<DriverThread>,
     results: &mut Vec<ActionResult>,
     launcher: &mut L,
+    plugin: &str,
     idle: &(dyn Fn(&str) -> bool + Sync),
     sessions_running: u32,
 ) -> Option<ActionResult> {
@@ -253,7 +276,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
 
     let action = parse_action(&answer)?;
 
-    match launcher.launch(&action).await {
+    match launcher.launch(plugin, &action).await {
         Ok(thread_id) => {
             if let DriverActionKind::Launch { .. } = &action.kind {
                 threads.push(DriverThread {
@@ -433,13 +456,17 @@ mod tests {
     #[derive(Default)]
     struct FakeLauncher {
         seen: Vec<DriverAction>,
+        /// 每次 `launch` 收到的插件名。起动路径要拿它查授权表，传错就等于
+        /// 拿别人的授权去放行，故这里如实记下来供断言。
+        plugins: Vec<String>,
         thread_id: String,
         fail: Option<String>,
     }
 
     impl SessionLauncher for FakeLauncher {
-        async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
+        async fn launch(&mut self, plugin: &str, action: &DriverAction) -> anyhow::Result<String> {
             self.seen.push(action.clone());
+            self.plugins.push(plugin.to_string());
             match &self.fail {
                 Some(detail) => Err(anyhow::anyhow!(detail.clone())),
                 None => Ok(self.thread_id.clone()),
@@ -477,6 +504,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -486,6 +514,13 @@ mod tests {
         assert_eq!(outcome.action_id, "a1");
         assert!(outcome.ok);
         assert_eq!(launcher.seen.len(), 1, "the launcher runs exactly once");
+        // 插件名必须原样传下去：起动路径拿它查授权表，传错（比如传死一个常量，
+        // 或传成项目名）就会拿别人的授权放行，而调用方完全看不出来。
+        assert_eq!(
+            launcher.plugins,
+            vec!["example-plugin".to_string()],
+            "the plugin that asked must be the plugin the launcher is asked about"
+        );
     }
 
     #[tokio::test]
@@ -506,6 +541,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -528,6 +564,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -559,6 +596,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -587,6 +625,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -618,6 +657,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
         )
@@ -674,7 +714,16 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "done";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 0).await;
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            "test-plugin",
+            &idle,
+            0,
+        )
+        .await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -776,7 +825,16 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "thread-1";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 3).await;
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            "test-plugin",
+            &idle,
+            3,
+        )
+        .await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -812,6 +870,7 @@ mod tests {
             &mut driver_threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             2,
         )

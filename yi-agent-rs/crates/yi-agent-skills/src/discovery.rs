@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::loader::parse_skill_md;
-use crate::model::{SkillError, SkillMetadata, SkillScope};
+use crate::model::{SkillError, SkillMetadata, SkillScope, SkillSource};
 
 const MAX_DEPTH: usize = 4;
 const MAX_DIRS: usize = 2000;
@@ -13,6 +13,9 @@ const MAX_ENTRIES: usize = 20000;
 pub struct SkillRoot {
     pub path: PathBuf,
     pub scope: SkillScope,
+    /// 该根下所有 skill 的来源。普通根是 `Local`；插件发布根带插件与版本，
+    /// 这样同名冲突时用户看得到「这条是 1.4.0 包里的」。
+    pub source: SkillSource,
 }
 
 /// Discover all skills under the given roots.
@@ -73,16 +76,20 @@ fn discover_one(root: &SkillRoot, out: &mut Vec<SkillMetadata>) {
             continue;
         }
 
-        match load_skill_file(entry.path(), root.scope) {
+        match load_skill_file(entry.path(), root.scope, &root.source) {
             Ok(m) => out.push(m),
             Err(e) => tracing::warn!("skipping skill at {}: {}", entry.path().display(), e),
         }
     }
 }
 
-fn load_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, SkillError> {
+fn load_skill_file(
+    path: &Path,
+    scope: SkillScope,
+    source: &SkillSource,
+) -> Result<SkillMetadata, SkillError> {
     let content = std::fs::read_to_string(path)?;
-    parse_skill_md(&content, path, scope)
+    parse_skill_md(&content, path, scope, source)
 }
 
 fn is_hidden(name: &std::ffi::OsStr) -> bool {
@@ -116,6 +123,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
@@ -130,6 +138,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 2);
@@ -148,6 +157,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::Project,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
@@ -167,6 +177,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
@@ -177,6 +188,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: PathBuf::from("/nonexistent/definitely/not/here"),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
@@ -198,6 +210,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 1);
@@ -210,6 +223,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: tmp.path().to_path_buf(),
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);
@@ -224,6 +238,7 @@ mod tests {
         let roots = vec![SkillRoot {
             path: file_path,
             scope: SkillScope::User,
+            source: SkillSource::Local,
         }];
         let skills = discover_skills(&roots);
         assert_eq!(skills.len(), 0);

@@ -4199,6 +4199,65 @@ mod tests {
         );
     }
 
+    /// 旧 meta 没有 `plugin_bindings`：必须零迁移读成空表（普通会话）。
+    ///
+    /// 若缺 `#[serde(default)]`，反序列化会整份失败，`load` 走 `rebuild_meta`
+    /// 兜底——那会把 cwd 等字段一起冲掉。所以这里同时断言 cwd 还在。
+    #[test]
+    fn old_meta_without_plugin_bindings_reads_as_an_empty_list() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-plain"),
+            r#"{"thread_id":"thread-plain","cwd":"/tmp/keep-me","model":"m","created_at":1,
+                "updated_at":1,"title":null,"permission_mode":"normal"}"#,
+        )
+        .unwrap();
+        let loaded = s.load("thread-plain").unwrap().expect("meta must parse");
+        assert!(
+            loaded.meta.plugin_bindings.is_empty(),
+            "a session that never bound a plugin has no bindings"
+        );
+        assert_eq!(
+            loaded.meta.cwd, "/tmp/keep-me",
+            "cwd 被冲成空串说明反序列化失败了，走了 rebuild_meta 兜底"
+        );
+    }
+
+    /// resume 一个插件会话：绑定的**具体版本与代次**必须原样回来。
+    ///
+    /// 这是"插件升级后旧会话被判陈旧"唯一的信息来源。若 resume 时把绑定丢了
+    /// （或改写成"当前版本"），旧会话就会被静默接到新版本上——正是设计里
+    /// 明确要避免的那条路。
+    #[test]
+    fn resuming_a_plugin_session_keeps_the_exact_plugin_binding() {
+        let (_dir, s) = store();
+        let binding = yi_agent_plugins::Binding {
+            host_id: "host-abc".into(),
+            release: yi_agent_plugins::ReleaseId {
+                plugin: yi_agent_plugins::PluginId::parse("superpowers-kanban").unwrap(),
+                version: "1.4.0".into(),
+                target: "darwin-aarch64".into(),
+                sha256: "ab".repeat(32),
+            },
+            activation: 3,
+            project: yi_agent_plugins::ProjectId::parse("/tmp/project").unwrap(),
+            grant: 2,
+        };
+        let mut meta = meta("thread-plugin");
+        meta.cwd = "/tmp/project".into();
+        meta.plugin_bindings = vec![binding.clone()];
+        std::fs::create_dir_all(&s.root).unwrap();
+        s.create(&meta).unwrap();
+
+        let loaded = s.load("thread-plugin").unwrap().expect("meta must parse");
+        assert_eq!(
+            loaded.meta.plugin_bindings,
+            vec![binding],
+            "resume must not drop or rewrite the binding"
+        );
+    }
+
     #[test]
     fn old_meta_without_anchor_reads_as_none() {
         let (_dir, s) = store();

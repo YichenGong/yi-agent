@@ -280,6 +280,8 @@ pub(crate) async fn handle(
                 Some(state.lead_agent_enabled),
                 // RPC 起的会话没有驱动方句柄，不额外注入环境变量。
                 Vec::new(),
+                // 普通会话不绑插件。绑定只由驱动路径写入（那里才知道是哪个插件）。
+                Vec::new(),
             )
             .await?;
 
@@ -599,6 +601,7 @@ pub(crate) async fn handle(
                     cwd: cwd.clone(),
                     model: model.clone(),
                     active_turn_id: None,
+                    turn_permit: None,
                     yolo,
                     process_manager: Arc::clone(&process_manager),
                     prompt_tx,

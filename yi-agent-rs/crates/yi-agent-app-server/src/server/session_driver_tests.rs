@@ -165,9 +165,14 @@ struct Host {
     lead_control_replies: crate::lead_control::LeadControlReplies,
     /// 组长开关。默认关 = stable 行为；需要组长工具的用例显式置 true。
     lead_agent_enabled: bool,
+    /// 本测试实例根。驱动闸门读它的授权表，**绝不**读进程环境——
+    /// 默认构造里没有授权文件，故所有驱动动作都会被拒；需要放行的用例
+    /// 用 `authorize_driver` 显式写入。
+    instance_home: PathBuf,
     _workdir_dir: tempfile::TempDir,
     _theme_dir: tempfile::TempDir,
     _workspace_dir: tempfile::TempDir,
+    _instance_dir: tempfile::TempDir,
 }
 
 impl Host {
@@ -176,6 +181,7 @@ impl Host {
         let workdir = workdir_dir.path().to_path_buf();
         let theme_dir = tempfile::TempDir::new().unwrap();
         let workspace_dir = tempfile::TempDir::new().unwrap();
+        let instance_dir = tempfile::TempDir::new().unwrap();
         let (turn_tx, turn_rx) = mpsc::channel::<TurnEvent>(8);
         Self {
             threads: HashMap::new(),
@@ -200,9 +206,11 @@ impl Host {
             lead_control: crate::lead_control::LeadControlInbox::new(),
             lead_control_replies: crate::lead_control::LeadControlReplies::new(),
             lead_agent_enabled: false,
+            instance_home: instance_dir.path().to_path_buf(),
             _workdir_dir: workdir_dir,
             _theme_dir: theme_dir,
             _workspace_dir: workspace_dir,
+            _instance_dir: instance_dir,
         }
     }
 
@@ -221,6 +229,12 @@ impl Host {
             lead_control_replies: &self.lead_control_replies,
             lead_agent_enabled: self.lead_agent_enabled,
             lead_target: None,
+            driver_gate: None,
+            // 该 launcher 不走闸门（单测直接驱动动作），但仍要接受实例根，
+            // 好让「会话是否写下插件绑定」能在真实 launcher 上验证。
+            instance_home: Some(&self.instance_home),
+            session_binding: None,
+            admission: None,
             threads: &mut self.threads,
             pending_activation: &mut self.pending_activation,
             process_watches: &mut self.process_watches,
@@ -263,6 +277,7 @@ impl Host {
                     if let Some(session) = self.threads.get_mut(&id) {
                         if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
                             session.active_turn_id = None;
+                            session.turn_permit = None;
                         }
                     }
                     if id == thread_id {
@@ -327,6 +342,7 @@ impl Host {
             &self.lead_control,
             &self.lead_control_replies,
             self.lead_agent_enabled,
+            &self.instance_home,
         )
         .await;
     }
@@ -342,6 +358,57 @@ const DRIVER_PLUGIN: &str = "driver";
 ///
 /// 两处都只写**通用**事实：清单里的通用字段 `session_driver` 与通用常驻登记表
 /// （`resident::require`）。宿主不该认识 `name` 之外的任何插件专有内容。
+/// 装一个驱动插件**并授权它在 `workdir` 起会话**。
+///
+/// `plugin_project` 与 `workdir` 是两件事，不能合成一个参数：
+/// - `plugin_project` 是**插件自己装在哪**。发现环（常驻登记表 + 清单）只看它，
+///   所以它必须是 `FakeDaemon::bind` 造出来的那个项目。
+/// - `workdir` 是**动作声明的会话目录**，也就是闸门核的"这个项目有没有被授权
+///   起会话"。插件可以为一个跟它自己不同目录的项目起会话（看板插件正是如此：
+///   它装在宿主项目，驱动的是卡片自己的 worktree）。
+///
+/// 一开始合成一个参数，结果用例既装错了位置（发现环找不到插件）又授权错了
+/// 项目（闸门拒掉动作），两边同时静默失败。
+///
+/// 授权是分开的一步（`GrantTable` 里独立的一条），但几乎所有 tick 用例都只是
+/// 想验证"动作被执行了"，若每处都手写一遍授权，噪声会盖住它们真正要断言的
+/// 东西。**无授权时必须被拒**由 `a_driver_without_a_launch_grant_starts_nothing`
+/// 单独钉住，那条刻意不调用本函数。
+fn install_authorized_driver_plugin(
+    plugin_project: &Path,
+    workdir: &Path,
+    resident_dir: &Path,
+    name: &str,
+    instance_home: &Path,
+) {
+    install_driver_plugin(plugin_project, resident_dir, name);
+    let workdir = std::fs::canonicalize(workdir).unwrap();
+    let project_id = yi_agent_plugins::ProjectId::parse(&workdir.to_string_lossy()).unwrap();
+    let path = yi_agent_supervisors::managed::grants::path(instance_home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // 授权表可能已存在（同一实例根下多个用例共享），读出来再追加，别覆盖。
+    let mut table = if path.exists() {
+        yi_agent_supervisors::managed::grants::load(instance_home).unwrap()
+    } else {
+        yi_agent_plugins::GrantTable::new()
+    };
+    table
+        .grant(
+            name,
+            project_id,
+            &yi_agent_plugins::ReleaseId {
+                plugin: yi_agent_plugins::PluginId::parse(name).unwrap(),
+                version: "1.0.0".into(),
+                target: "darwin-aarch64".into(),
+                sha256: "00".repeat(32),
+            },
+            &yi_agent_supervisors::managed::host_id(instance_home).unwrap(),
+            &[yi_agent_plugins::Effect::Launch],
+        )
+        .unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&table).unwrap()).unwrap();
+}
+
 fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
     let supervisors = project.join(".yi-agent/supervisors");
     std::fs::create_dir_all(&supervisors).unwrap();
@@ -423,8 +490,14 @@ fn probe_a_driver_plugin_that_cannot_be_reached() {
     let project = project_dir.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     // 清单写了 `query_socket`,却没有 daemon 听在那个 socket 上。
-    install_driver_plugin(&project, resident_dir.path(), DRIVER_PLUGIN);
     let mut host = Host::new();
+    install_authorized_driver_plugin(
+        &project,
+        &project,
+        resident_dir.path(),
+        DRIVER_PLUGIN,
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -473,8 +546,14 @@ fn probe_a_driver_answer_the_host_cannot_parse() {
         Ok(json!({ "action_id": "a1", "type": "launch", "workdir": "/w" }))
     });
     let resident_dir = tempfile::TempDir::new().unwrap();
-    install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
     let mut host = Host::new();
+    install_authorized_driver_plugin(
+        &daemon.project,
+        &daemon.project,
+        resident_dir.path(),
+        DRIVER_PLUGIN,
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -489,8 +568,14 @@ fn probe_a_driver_answer_the_host_cannot_parse() {
 fn probe_a_driver_that_answers_the_contract_null() {
     let daemon = FakeDaemon::bind(|_project, _method, _params| Ok(json!({ "action": null })));
     let resident_dir = tempfile::TempDir::new().unwrap();
-    install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
     let mut host = Host::new();
+    install_authorized_driver_plugin(
+        &daemon.project,
+        &daemon.project,
+        resident_dir.path(),
+        DRIVER_PLUGIN,
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -598,7 +683,15 @@ async fn a_tick_drives_the_plugin_through_driver_next_only() {
         }
     });
     let resident_dir = tempfile::TempDir::new().unwrap();
-    install_driver_plugin(&daemon.project, resident_dir.path(), "driver");
+    // 授权必须落在**动作声明的那个 workdir** 上：闸门核的是"这个项目有没有
+    // 被授权起会话"，而插件交出的 workdir 就是将来会话的 cwd。
+    install_authorized_driver_plugin(
+        &daemon.project,
+        &host.workdir,
+        resident_dir.path(),
+        "driver",
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
 
     // 第一拍：launch。
@@ -783,7 +876,13 @@ async fn a_driven_session_is_visible_and_its_first_content_item_is_the_objective
     let workdir = host.workdir.clone();
     *work_path.lock().unwrap() = workdir.to_string_lossy().to_string();
     let resident_dir = tempfile::TempDir::new().unwrap();
-    install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+    install_authorized_driver_plugin(
+        &daemon.project,
+        &workdir,
+        resident_dir.path(),
+        DRIVER_PLUGIN,
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
 
     host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
@@ -832,6 +931,183 @@ async fn a_driven_session_is_visible_and_its_first_content_item_is_the_objective
     );
 }
 
+/// 驱动闸门的三条拒法各钉一条：未授权、维护屏障关闭、动作指向别的项目。
+///
+/// 这三条必须分开测，因为它们是**三个不同的决定**，合起来测只会验证"某个环节
+/// 拦住了"，而分不清是哪一环。实际踩过的坑正是这样：只写一条"没授权就拒"，
+/// 结果维护屏障那一路其实从没接过线，测试照样绿。
+mod driver_gate {
+    use super::*;
+
+    /// 没被授予 `Launch` 的插件起不了会话。
+    ///
+    /// **刻意不调用 `install_authorized_driver_plugin`**：只装插件、不写授权表。
+    /// 闸门的默认答案必须是"不行"——授权表缺失 == 空表 == 谁都没授权。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_driver_without_a_launch_grant_starts_nothing() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let work_path = workdir.path().to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => Ok(json!({
+                "action_id": "a1",
+                "kind": "launch",
+                "workdir": work_path,
+                "title": "driven · card-1",
+                "objective": "do the first thing",
+            })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        // 只装不授权。
+        install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert!(
+            host.threads.is_empty(),
+            "an unauthorized plugin must not be able to start a session"
+        );
+        // 拒绝必须回报给插件，而不是让它以为任务已经交给宿主了。回报走的是
+        // **下一拍** `driver/next` 的 `results`——这是协议规定的唯一通道。
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+        let calls = daemon.calls_to("driver/next");
+        assert!(calls.len() >= 2, "the host must tick again to report back");
+        let results = calls[1]["params"]["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "the refusal must be reported exactly once"
+        );
+        assert_eq!(
+            results[0]["ok"], false,
+            "the answer must be a failure, not a silent success: {:?}",
+            results[0]
+        );
+        assert_eq!(results[0]["thread_id"], serde_json::Value::Null);
+        let reason = results[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(DRIVER_PLUGIN),
+            "the refusal must name the plugin so the user knows who was denied: {reason}"
+        );
+    }
+
+    /// 维护屏障关闭时，即便已授权也起不了会话。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_driver_is_refused_while_maintenance_has_the_barrier_closed() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let work_path = workdir.path().to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => Ok(json!({
+                "action_id": "a1",
+                "kind": "launch",
+                "workdir": work_path,
+                "title": "driven · card-1",
+                "objective": "do the first thing",
+            })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_authorized_driver_plugin(
+            &daemon.project,
+            workdir.path(),
+            resident_dir.path(),
+            DRIVER_PLUGIN,
+            &host.instance_home,
+        );
+        // 让这个插件的维护事务停在"未收尾"：写一份阶段不是 admission_open 的
+        // 日志。这正是升级进行到一半时磁盘上的样子。
+        let store = yi_agent_plugins::JournalStore::at(&host.instance_home);
+        let plugin_id = yi_agent_plugins::PluginId::parse(DRIVER_PLUGIN).unwrap();
+        let release = yi_agent_plugins::ReleaseId {
+            plugin: plugin_id.clone(),
+            version: "1.0.0".into(),
+            target: "darwin-aarch64".into(),
+            sha256: "00".repeat(32),
+        };
+        // `Journal::start` 建出来的就是 `draining`——正是"升级进行到一半"。
+        let journal = yi_agent_plugins::Journal::start(
+            "tx-00000000",
+            plugin_id,
+            yi_agent_plugins::LifecycleAction::Activate,
+            yi_agent_plugins::JournalTarget {
+                release,
+                activation: 2,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        store.write(&journal).unwrap();
+
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert!(
+            host.threads.is_empty(),
+            "no new session may start while maintenance is unfinished"
+        );
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+        let calls = daemon.calls_to("driver/next");
+        let results = calls[1]["params"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ok"], false, "{:?}", results[0]);
+        let reason = results[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("not accepting new sessions"),
+            "the refusal must say the barrier closed, not blame the grant: {reason}"
+        );
+    }
+
+    /// 授权是**按项目**的：在 A 项目授权，不能拿去 B 项目起会话。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_for_one_project_does_not_launch_into_another() {
+        let other = tempfile::TempDir::new().unwrap();
+        let other_path = other.path().to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => Ok(json!({
+                "action_id": "a1",
+                "kind": "launch",
+                "workdir": other_path,
+                "title": "driven · card-1",
+                "objective": "do the first thing",
+            })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        // 授权的是本测试的 workdir，动作却指向 `other`。
+        install_authorized_driver_plugin(
+            &daemon.project,
+            &host.workdir,
+            resident_dir.path(),
+            DRIVER_PLUGIN,
+            &host.instance_home,
+        );
+
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert!(
+            host.threads.is_empty(),
+            "a grant in project A must not let the plugin launch into project B"
+        );
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+        let calls = daemon.calls_to("driver/next");
+        let results = calls[1]["params"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ok"], false, "{:?}", results[0]);
+    }
+}
+
 /// `alive` 是宿主唯一能回答的并发事实:它必须跟着 `threads` 表走。会话还在
 /// → 插件继续占名额;会话从表里消失(结束/被杀) → 下一拍报 `alive: false`,
 /// 插件才会释放名额、把卡片标 stale。
@@ -862,7 +1138,13 @@ async fn a_thread_that_left_the_host_table_is_reported_dead_on_the_next_tick() {
 
     let mut host = Host::new();
     let resident_dir = tempfile::TempDir::new().unwrap();
-    install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+    install_authorized_driver_plugin(
+        &daemon.project,
+        workdir.path(),
+        resident_dir.path(),
+        DRIVER_PLUGIN,
+        &host.instance_home,
+    );
     let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
     let key = (daemon.project.clone(), DRIVER_PLUGIN.to_string());
 
@@ -918,7 +1200,13 @@ async fn the_serve_loop_tick_launches_a_driven_session() {
     let mut h = crate::server::tests::Harness::new();
     // 发现环的两个通用来源:常驻登记表(harness 的隔离目录)与插件清单
     // (项目自己的 `.yi-agent/supervisors/`)。
-    install_driver_plugin(&daemon.project, h.resident_dir.path(), DRIVER_PLUGIN);
+    install_authorized_driver_plugin(
+        &daemon.project,
+        &workdir,
+        h.resident_dir.path(),
+        DRIVER_PLUGIN,
+        &h.instance_home(),
+    );
     crate::server::tests::initialize(&mut h).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -964,6 +1252,7 @@ where
 {
     SessionLauncher::launch(
         launcher,
+        "test-plugin",
         &DriverAction {
             action_id: "act-launch".into(),
             kind: DriverActionKind::Launch {
@@ -1035,6 +1324,7 @@ async fn an_append_action_reuses_the_existing_thread() {
         let mut launcher = host.launcher(&build_test_agent);
         SessionLauncher::launch(
             &mut launcher,
+            "test-plugin",
             &DriverAction {
                 action_id: "act-append".into(),
                 kind: DriverActionKind::Append {
@@ -1198,6 +1488,7 @@ async fn an_append_into_a_busy_thread_fails_without_touching_the_live_turn() {
         let mut launcher = host.launcher(&build_slow_agent);
         SessionLauncher::launch(
             &mut launcher,
+            "test-plugin",
             &DriverAction {
                 action_id: "act-append".into(),
                 kind: DriverActionKind::Append {
@@ -1250,6 +1541,7 @@ async fn an_append_to_an_unknown_thread_fails_without_side_effects() {
     let mut launcher = host.launcher(&build_test_agent);
     let error = SessionLauncher::launch(
         &mut launcher,
+        "test-plugin",
         &DriverAction {
             action_id: "act-append".into(),
             kind: DriverActionKind::Append {

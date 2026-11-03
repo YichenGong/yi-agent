@@ -153,6 +153,7 @@ where
                     .join("preferences.json"),
                 resident_dir: resident_dir.clone(),
                 skills_home: crate::server::skills_home_dir(),
+                instance_home: crate::server::instance_home_dir(),
                 remote_dir: crate::server::instance_home_dir(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),

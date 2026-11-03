@@ -92,11 +92,34 @@ impl Harness {
     ///
     /// 每次调用产生一个新的 `activation`（代次递增），这正是"升级"的样子。
     fn install_and_activate(&self, version: &str, serial: u64, expected: u64) -> ReleaseId {
+        self.install_and_activate_with(version, serial, expected, true)
+    }
+
+    /// 同上，但清空清单里的 `skills`：用来区分「插件不发布 skill」与「发布空集」。
+    fn install_and_activate_without_skills(
+        &self,
+        version: &str,
+        serial: u64,
+        expected: u64,
+    ) -> ReleaseId {
+        self.install_and_activate_with(version, serial, expected, false)
+    }
+
+    fn install_and_activate_with(
+        &self,
+        version: &str,
+        serial: u64,
+        expected: u64,
+        with_skills: bool,
+    ) -> ReleaseId {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fixture("manifest-v1.json")).expect("golden manifest");
         value["version"] = version.into();
         value["program"]["entry"] = "bin/counter".into();
         value["program"]["digest"] = hex(MANAGED_PROGRAM.as_bytes()).into();
+        if !with_skills {
+            value["skills"] = serde_json::json!([]);
+        }
         let manifest_bytes = serde_json::to_vec(&value).expect("serialize manifest");
         let manifest = Manifest::parse(&manifest_bytes).expect("parse manifest");
         assert_eq!(manifest.version, version);
@@ -209,10 +232,19 @@ fn canonical(path: &Path) -> String {
         .to_string()
 }
 
+const MANAGED_SKILL: &str = "---\nname: example-counter\ndescription: count things\n---\nbody";
+
 fn build_archive(manifest_bytes: &[u8]) -> Vec<u8> {
     let entries: Vec<(&str, Vec<u8>, u32)> = vec![
         ("plugin.json", manifest_bytes.to_vec(), 0o444),
         ("bin/counter", MANAGED_PROGRAM.as_bytes().to_vec(), 0o755),
+        // 清单声明了 `skills/example-counter`。归档里必须真有它，否则冲突
+        // 检测扫一个不存在的目录，测试会"通过"却什么也没验证。
+        (
+            "skills/example-counter/SKILL.md",
+            MANAGED_SKILL.as_bytes().to_vec(),
+            0o444,
+        ),
     ];
 
     let mut builder = tar::Builder::new(Vec::new());
@@ -500,4 +532,259 @@ fn a_current_binding_with_the_capability_is_allowed() {
         .check(h.home(), "example-counter", Effect::Write)
         .expect("Write was granted");
     assert_eq!(allowed, &binding);
+}
+
+// ---------------------------------------------------------------------------
+// 新会话的绑定与 skill 来源
+// ---------------------------------------------------------------------------
+
+/// 新会话绑定**已提交**的那个发布，并且它的 skill 根指向版本目录本身。
+///
+/// 这两件事必须一起做：只写绑定不给 skill 根，会话就"知道自己是插件会话"
+/// 却拿不到插件 skill；只给 skill 根不写绑定，会话就无法在插件升级后判断
+/// 自己是不是陈旧了。
+#[test]
+fn a_new_session_plugin_binding_names_the_committed_release_and_its_skill_root() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Write, Effect::Launch]);
+
+    let plan = super::plan_session(h.home(), &h.project_id(), "example-counter")
+        .expect("an installed, authorized plugin must yield a plan");
+
+    assert_eq!(plan.binding.release, release);
+    assert_eq!(
+        plan.binding.activation, 1,
+        "bound to the committed activation"
+    );
+    assert_eq!(
+        plan.binding.project,
+        h.project_id(),
+        "the binding names the project it was made for"
+    );
+
+    // skill 根必须指向本次安装的版本目录，而不是任何"当前"或"最新"目录。
+    let managed = plan
+        .managed_skill_roots
+        .expect("the plugin declares a skill");
+    assert_eq!(managed.len(), 1);
+    assert_eq!(managed[0].plugin, "example-counter");
+    assert_eq!(managed[0].version, "1.4.0");
+    assert!(
+        managed[0]
+            .path
+            .to_string_lossy()
+            .contains("example-counter/1.4.0/darwin-aarch64/"),
+        "the skill root must live inside this exact release directory, not a \
+         latest/current alias: {}",
+        managed[0].path.display()
+    );
+    assert!(
+        managed[0].path.ends_with("skills/example-counter"),
+        "the root must be the directory the manifest declared: {}",
+        managed[0].path.display()
+    );
+}
+
+/// 未授权的项目拿不到计划：不能先给 skill、后判权限。
+#[test]
+fn an_unauthorized_project_gets_no_plugin_binding_plan() {
+    let h = Harness::new();
+    let _release = h.install_and_activate("1.4.0", 7, 1);
+    // 刻意不授权。
+
+    let error = super::plan_session(h.home(), &h.project_id(), "example-counter")
+        .expect_err("no grant means no plugin session");
+    assert_eq!(error.kind(), "PermissionDenied", "got: {error}");
+}
+
+/// 没有已提交激活时给不出计划，且原因不是"权限不足"。
+#[test]
+fn a_plugin_binding_needs_a_committed_activation() {
+    let h = Harness::new();
+    // 先授权（指向一个从未安装的发布）：这样到的才是"没有已提交激活"那一步，
+    // 而不是被授权检查先拦住。两条原因的先后顺序本身也是要钉的行为。
+    let phantom = ReleaseId {
+        plugin: h.plugin.clone(),
+        version: "1.4.0".into(),
+        target: "darwin-aarch64".into(),
+        sha256: "00".repeat(32),
+    };
+    h.authorize(&phantom, &[Effect::Launch]);
+
+    let error = super::plan_session(h.home(), &h.project_id(), "example-counter")
+        .expect_err("nothing is installed");
+    assert_eq!(error.kind(), "NotFound", "got: {error}");
+}
+
+/// 升级后，**新**会话拿到新版本；旧会话的绑定原样保留（它不会被静默改写）。
+#[test]
+fn a_new_session_plugin_binding_follows_the_upgrade_while_the_old_one_stays() {
+    let h = Harness::new();
+    let old = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&old, &[Effect::Read, Effect::Write, Effect::Launch]);
+    let old_binding = h.binding(&old, 1, 1);
+
+    let new = h.install_and_activate("1.5.0", 8, 2);
+    // 重新授权到新发布（升级要重新确认能力）。
+    h.authorize(&new, &[Effect::Read, Effect::Write, Effect::Launch]);
+
+    let plan = super::plan_session(h.home(), &h.project_id(), "example-counter")
+        .expect("the new release is committed and authorized");
+    assert_eq!(
+        plan.binding.release, new,
+        "a new session gets the new release"
+    );
+    assert_eq!(plan.binding.activation, 2);
+    assert_eq!(
+        plan.managed_skill_roots.expect("skill")[0].version,
+        "1.5.0",
+        "the new session sees the new release's skills"
+    );
+
+    // 旧会话那条绑定仍原样指向 1.4.0 —— 它没有被任何"刷新"改写过。
+    assert_eq!(old_binding.release, old);
+    assert_eq!(old_binding.activation, 1);
+    assert_eq!(
+        super::binding_state(h.home(), &old_binding).expect("state"),
+        BindingState::Stale {
+            bound_activation: 1,
+            bound_version: "1.4.0".into(),
+            committed_activation: 2,
+            committed_version: "1.5.0".into(),
+        },
+        "the old session must be told it is stale, not silently upgraded"
+    );
+}
+
+/// 插件没声明 skill 时，计划里的受管根为空——不是错误。
+#[test]
+fn a_plugin_without_skills_yields_no_managed_root() {
+    let h = Harness::new();
+    let release = h.install_and_activate_without_skills("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Launch]);
+
+    let plan = super::plan_session(h.home(), &h.project_id(), "example-counter")
+        .expect("a program-only plugin is still a valid session target");
+    assert!(
+        plan.managed_skill_roots
+            .expect("empty, not None")
+            .is_empty(),
+        "a plugin that ships no skills must contribute no skill roots"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 闸门里的 skill 冲突（自动任务）
+// ---------------------------------------------------------------------------
+
+/// 项目里有同名普通 skill 时，闸门必须拒掉自动任务。
+///
+/// 这不是"插件坏了"，所以错误串必须说清是**同名冲突**、并把两份路径与来源
+/// 都列出来——用户据此才知道该删哪一个。
+#[test]
+fn the_gate_refuses_automation_while_a_skill_name_clashes() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Launch]);
+
+    // 清单声明了 skill `example-counter`（见契约 fixture）。在项目里放一份同名。
+    let clash = h.workdir.join(".yi-agent/skills/example-counter");
+    std::fs::create_dir_all(&clash).expect("project skill dir");
+    std::fs::write(
+        clash.join("SKILL.md"),
+        "---\nname: example-counter\ndescription: mine\n---\nbody",
+    )
+    .expect("write skill");
+
+    let gate = super::GrantGate::new(h.home());
+    let error = crate::session_driver::DriverGate::may_launch(&gate, &h.workdir, "example-counter")
+        .expect_err("a name clash must block automatic tasks");
+
+    assert!(
+        error.contains("more than one place"),
+        "the refusal must say it is a clash, not a permission problem: {error}"
+    );
+    assert!(
+        error.contains("example-counter"),
+        "the refusal must name the clashing skill: {error}"
+    );
+    assert!(
+        error.contains(".yi-agent/skills/example-counter"),
+        "the refusal must show where the user's copy is: {error}"
+    );
+}
+
+/// 没有冲突时闸门放行——否则上面那条会退化成"永远拒"。
+#[test]
+fn the_gate_allows_automation_when_no_skill_clashes() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Launch]);
+
+    let gate = super::GrantGate::new(h.home());
+    crate::session_driver::DriverGate::may_launch(&gate, &h.workdir, "example-counter")
+        .expect("nothing clashes, so automation may proceed");
+}
+
+// ---------------------------------------------------------------------------
+// `plugin_binding_for_session`：launch 路径上真正被调用的那个接线函数
+// ---------------------------------------------------------------------------
+
+/// 装好发布并授权后，会话计划会算出来——这就是驱动会话 meta 里那条绑定的来源。
+#[test]
+fn the_launch_path_plugin_binding_helper_returns_a_plan_for_an_authorized_release() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Launch]);
+
+    let plan = crate::server::plugin_binding_for_session(
+        h.home(),
+        &h.workdir.to_string_lossy(),
+        "example-counter",
+    )
+    .expect("an authorized release must yield a binding for the new session");
+
+    assert_eq!(plan.binding.release, release);
+    assert_eq!(plan.binding.activation, 1);
+}
+
+/// 没授权时返回 `None`：会话照建，只是**不绑**。
+///
+/// 这一点很关键：闸门已经判过"能不能起会话"，这里判"绑哪个"。判不出来时
+/// 记空比记一个猜出来的版本安全——猜错就会让会话以为自己绑了一个它没用过的
+/// 发布。
+#[test]
+fn the_launch_path_plugin_binding_helper_returns_none_without_a_grant() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read]); // 没有 Launch
+
+    assert!(
+        crate::server::plugin_binding_for_session(
+            h.home(),
+            &h.workdir.to_string_lossy(),
+            "example-counter",
+        )
+        .is_none(),
+        "a project that never granted Launch must not get a plugin binding"
+    );
+}
+
+/// 项目键按 canonical 解析：授权表用的是 canonical 路径，动作给的是原样路径。
+#[test]
+fn the_launch_path_plugin_binding_helper_canonicalizes_the_project_before_looking_up() {
+    let h = Harness::new();
+    let release = h.install_and_activate("1.4.0", 7, 1);
+    h.authorize(&release, &[Effect::Read, Effect::Launch]);
+
+    // 带一个 `./` 段：非 canonical，但指向同一个目录。
+    //
+    // 刻意不用 `sub/..`：`sub` 不存在时 `canonicalize` 会失败并回退原样路径，
+    // 那测的就不是"规范化"而是"回退"了——两种行为都要，但得分开测。
+    let non_canonical = format!("{}/.", h.workdir.to_string_lossy());
+    let plan =
+        crate::server::plugin_binding_for_session(h.home(), &non_canonical, "example-counter")
+            .expect("the lookup must canonicalize before indexing the grant table");
+    assert_eq!(plan.binding.release, release);
 }

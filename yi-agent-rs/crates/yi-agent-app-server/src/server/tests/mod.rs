@@ -877,6 +877,7 @@ impl Harness {
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
+                instance_home: skills_home.path().to_path_buf(),
                 remote_dir: index_dir.path().to_path_buf(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -930,6 +931,15 @@ impl Harness {
     }
 
     pub(crate) fn skills_home(&self) -> std::path::PathBuf {
+        self.skills_home_dir.path().to_path_buf()
+    }
+
+    /// 本 harness 的实例根。
+    ///
+    /// 与 `skills_home` 取同一个隔离目录：`serve` 装配时 `instance_home` 就是这个
+    /// 值（见 `tests/mod.rs` 里 `RuntimeAttachments` 的构造），驱动闸门读授权表
+    /// 也必须读这里，否则测试会去碰开发者真实的 `~/.yi-agent`。
+    pub(crate) fn instance_home(&self) -> std::path::PathBuf {
         self.skills_home_dir.path().to_path_buf()
     }
 
@@ -1768,6 +1778,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         cwd: project.display().to_string(),
         model: "test".to_string(),
         active_turn_id: None,
+        turn_permit: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         prompt_tx,
@@ -2530,6 +2541,7 @@ impl MergedHarness {
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
+                instance_home: PathBuf::new(),
                 remote_dir: PathBuf::new(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -2828,6 +2840,8 @@ mod image;
 mod lead;
 #[cfg(test)]
 mod model_settings;
+#[cfg(test)]
+mod plugin_admission;
 #[cfg(test)]
 mod plugin_theme;
 #[cfg(test)]

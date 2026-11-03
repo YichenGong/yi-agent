@@ -200,5 +200,258 @@ impl SessionBindings {
     }
 }
 
+/// 为一个**新**会话算出的插件计划：绑哪个发布、看哪些 skill。
+///
+/// 这两件事由同一个函数给出，而不是让调用方各算一遍：绑定与 skill 来源必须
+/// 指向**同一个**发布。分开算的典型错误是先取"最新版本"给 skill（于是新会话
+/// 看到 1.5.0 的 skill），再取"已提交激活"写绑定（仍停在 1.4.0），会话于是
+/// 用着它没绑定的那份 skill。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPlan {
+    /// 要写进 `ThreadMeta::plugin_bindings` 的那一条。
+    pub binding: Binding,
+    /// 该发布声明的 skill 目录，作为**受管来源**交给 skill 发现。
+    ///
+    /// `None` = 该插件没有已安装的发布可供解析（调用方应视为"没 skill"）。
+    pub managed_skill_roots: Option<Vec<yi_agent_skills::ManagedRoot>>,
+}
+
+/// 算出一个新会话应该绑什么。
+///
+/// 顺序是**先授权后解析**，与 [`SessionBindings::check`] 同源：
+/// 1. 项目有没有把这个插件授权给 `Launch`（没有 = 不该起插件会话）
+/// 2. 已提交的发布是什么（没有 = 没装/没激活）
+///
+/// 第 1 步先做的理由：一个未授权的项目去解析发布，只会得到"版本号"这种
+/// 与用户当前问题无关的信息；而用户真正要知道的是"我没授权这个插件"。
+pub fn plan_session(
+    instance_home: &Path,
+    project: &yi_agent_plugins::ProjectId,
+    plugin: &str,
+) -> Result<SessionPlan, PluginError> {
+    let table = yi_agent_supervisors::managed::grants::load(instance_home)?;
+    let Some(grant) = table.get(plugin, project) else {
+        return Err(PluginError::PermissionDenied(format!(
+            "plugin `{plugin}` is not authorized for project {}; enable the plugin for that project \
+             before starting a session",
+            project.as_str()
+        )));
+    };
+    if !grant.granted.contains(&Effect::Launch) {
+        return Err(PluginError::PermissionDenied(format!(
+            "plugin `{plugin}` may not start sessions in {}: it was never granted Launch",
+            project.as_str()
+        )));
+    }
+    if grant.pending.contains(&Effect::Launch) {
+        return Err(PluginError::PermissionDenied(format!(
+            "plugin `{plugin}` needs reconfirmation for Launch in {} after a capability change",
+            project.as_str()
+        )));
+    }
+
+    let plugin_id = yi_agent_plugins::PluginId::parse(plugin)?;
+    let install = managed::resolve(instance_home, &plugin_id)?;
+
+    let binding = Binding {
+        host_id: grant.host_id.clone(),
+        release: install.release.clone(),
+        activation: install.activation,
+        project: project.clone(),
+        grant: grant.generation,
+    };
+
+    // skill 目录只取清单声明的那几个，并**必须**落在本次安装目录之内——清单里
+    // 的路径已由 `Manifest::parse` 校验过不是绝对路径/无 `..`，这里再兜一次：
+    // 一个被人手工改过的安装目录不该让 skill 发现去读包外文件。
+    let mut roots = Vec::new();
+    for entry in &install.manifest.skills {
+        let path = install.directory.join(&entry.path);
+        if !path.starts_with(&install.directory) {
+            return Err(PluginError::Integrity(format!(
+                "skill `{}` resolves outside the installed release directory",
+                entry.name
+            )));
+        }
+        roots.push(yi_agent_skills::ManagedRoot {
+            path,
+            plugin: plugin.to_string(),
+            version: install.release.version.clone(),
+        });
+    }
+
+    Ok(SessionPlan {
+        binding,
+        managed_skill_roots: Some(roots),
+    })
+}
+
 #[cfg(test)]
 mod tests;
+
+/// 驱动动作的准入闸门：按项目的**授权表**判一个插件能否新建会话。
+///
+/// # 为什么只查授权表，不查这个会话的绑定
+///
+/// 驱动动作要**新建**一个会话，此时还没有任何会话绑定可查。宿主在这里能回答的
+/// 是"这个项目把这个插件的 Launch 授权给了吗"。绑定是会话级的概念，在新会话
+/// 建成之后才写进 meta——把两件事混在一步里会让"起会话"和"用会话"的判据同源，
+/// 于是任何一处放宽都会同时放宽两边。
+///
+/// # 为什么拒绝要说清缺少什么
+///
+/// 一次驱动动作被拒后，插件只会把 `{ok:false, error}` 显示给用户。如果这里只写
+/// "denied"，用户既不知道是哪个项目、也不知道该去补哪个权限。
+pub struct GrantGate {
+    instance_home: std::path::PathBuf,
+}
+
+impl GrantGate {
+    pub fn new(instance_home: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            instance_home: instance_home.into(),
+        }
+    }
+
+    /// 生产装配：按宿主实例根。取不到实例根时返回 `None`——此时驱动路径应当
+    /// **不加闸也不放行**，调用方必须决定怎么办；这里选择让调用方看到 `None`,
+    /// 而不是悄悄用一个猜出来的目录去读授权表。
+    pub fn from_process_environment() -> Option<Self> {
+        yi_agent_store::paths::instance_home().map(Self::new)
+    }
+}
+
+impl GrantGate {
+    /// 受管 skill 与该项目的普通 skill 有同名冲突时拒绝自动任务。
+    ///
+    /// 只扫**这个项目**的普通 skill 根：用户全局目录里的同名条目会在新会话
+    /// 的 catalog 里一起出现，但那不影响"这个项目该不该自动跑"——用户已经
+    /// 在这个项目里显式授权了插件，项目级冲突才是他要就地解决的东西。
+    fn check_skill_conflicts(&self, project: &Path, plugin: &str) -> Result<(), String> {
+        let plugin_id = yi_agent_plugins::PluginId::parse(plugin)
+            .map_err(|error| format!("plugin id `{plugin}` is invalid: {error}"))?;
+        // 解析不出发布时不算冲突（未安装/未激活由上面的授权与维护检查负责，
+        // 这里只回答"有了 skill 之后有没有撞名"）。
+        let Ok(install) = managed::resolve(&self.instance_home, &plugin_id) else {
+            return Ok(());
+        };
+        let managed: Vec<yi_agent_skills::ManagedRoot> = install
+            .manifest
+            .skills
+            .iter()
+            .map(|entry| yi_agent_skills::ManagedRoot {
+                path: install.directory.join(&entry.path),
+                plugin: plugin.to_string(),
+                version: install.release.version.clone(),
+            })
+            .collect();
+        if managed.is_empty() {
+            return Ok(());
+        }
+
+        let project_id = yi_agent_plugins::ProjectId::parse(&project.to_string_lossy())
+            .map_err(|error| format!("project key is invalid: {error}"))?;
+        let _ = project_id;
+
+        let roots = vec![(
+            project.join(".yi-agent/skills"),
+            yi_agent_skills::SkillScope::Project,
+        )];
+        let service = yi_agent_skills::SkillsService::with_managed(roots, managed);
+        let conflicts = service
+            .conflicts()
+            .map_err(|error| format!("could not scan skills for `{plugin}`: {error}"))?;
+        if let Some(conflict) = conflicts.first() {
+            let listed: Vec<String> = conflict
+                .entries
+                .iter()
+                .map(|entry| format!("{} ({})", entry.path.display(), entry.source.label()))
+                .collect();
+            return Err(format!(
+                "skill `{}` exists in more than one place, so plugin `{plugin}` will not start \
+                 automatic tasks until you resolve it: {}",
+                conflict.name,
+                listed.join(", ")
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl crate::session_driver::DriverGate for GrantGate {
+    fn may_launch(&self, _project: &Path, plugin: &str) -> Result<(), String> {
+        // 项目由驱动插件给出的是 workdir；授权表按 canonical 项目键索引，
+        // 故先规范化。路径不存在时不猜：那说明插件的动作指向一个不存在的
+        // 目录，放行会让会话建在一个没有项目状态的地方。
+        let project = std::fs::canonicalize(_project).map_err(|error| {
+            format!(
+                "plugin `{plugin}` asked to start a session in {}, which cannot be resolved:                  {error}",
+                _project.display()
+            )
+        })?;
+        let table = yi_agent_supervisors::managed::grants::load(&self.instance_home)
+            .map_err(|error| format!("could not read the grant table: {error}"))?;
+        let host = yi_agent_supervisors::managed::host_id(&self.instance_home)
+            .map_err(|error| format!("could not determine the host id: {error}"))?;
+        let project_id = yi_agent_plugins::ProjectId::parse(&project.to_string_lossy())
+            .map_err(|error| format!("project key is invalid: {error}"))?;
+
+        let Some(grant) = table.get(plugin, &project_id) else {
+            return Err(format!(
+                "plugin `{plugin}` is not authorized for project {}; enable the plugin for that                  project before it can start sessions",
+                project.display()
+            ));
+        };
+        if grant.host_id != host {
+            return Err(format!(
+                "the grant for plugin `{plugin}` in {} belongs to host `{}`, not `{host}`",
+                project.display(),
+                grant.host_id
+            ));
+        }
+        if !grant.granted.contains(&Effect::Launch) {
+            return Err(format!(
+                "plugin `{plugin}` may not start sessions in {}: it was never granted Launch",
+                project.display()
+            ));
+        }
+        // 待确认的能力即使出现在 `granted` 里也不放行——升级不该顺手扩权。
+        if grant.pending.contains(&Effect::Launch) {
+            return Err(format!(
+                "plugin `{plugin}` needs reconfirmation for Launch in {} after a capability change",
+                project.display()
+            ));
+        }
+        // 维护屏障在授权之后检查：先让用户看到"你没授权"，再看"这个插件正在
+        // 维护"。反过来会把一个未授权插件报告的拒绝原因说成维护中，用户会去
+        // 等一个永远不结束的维护。
+        //
+        // `Unknown`（读不到权威记录）也**不放行**：宁可少起一个会话，也不要在
+        // 一次未收尾的升级旁边再起一个后端——那正是屏障要拦的那种事故。
+        let plugin_id = yi_agent_plugins::PluginId::parse(plugin)
+            .map_err(|error| format!("plugin id `{plugin}` is invalid: {error}"))?;
+        let maintenance =
+            yi_agent_store::ipc::MaintenanceBarrier::at(&self.instance_home).state(&plugin_id);
+        if !maintenance.state.admits_launch() {
+            let detail = maintenance
+                .detail
+                .as_deref()
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "plugin `{plugin}` is not accepting new sessions in {} ({:?}{detail})",
+                project.display(),
+                maintenance.state
+            ));
+        }
+        // skill 同名冲突也必须挡住**自动任务**——这是设计 §7.2 的硬要求：
+        // 冲突时宿主不许静默挑一个副本去执行，否则用户可能在自己手写的 skill
+        // 与发布包里的同名 skill 之间被随机选一个跑。普通聊天与只读查看不受
+        // 影响（它们不经过这个闸门）。
+        //
+        // 放在最后一步：一个未授权/维护中的插件先说"技能冲突"会把用户引到
+        // 一个不相干的问题上。
+        self.check_skill_conflicts(&project, plugin)?;
+        Ok(())
+    }
+}
