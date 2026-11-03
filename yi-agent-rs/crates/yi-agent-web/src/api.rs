@@ -73,7 +73,13 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 /// 从 `Settings` 取某个字段的 JSON 值（`None` → `null`）。
 ///
 /// 与 `settings_rpc::current_value` 同一个 match 结构。两处都覆盖全部 `FIELDS`，
-/// 各有一条测试遍历断言，漏一个键会红。
+/// 各有一条测试遍历断言「每个键都能读回非 null 值」，漏一个键会红。
+///
+/// 这里说的是**读回非 null 值**，不是「label 对得上」。`label` 直接来自
+/// `spec.label`、与本 match 无关，拿它当守卫会让漏分支静默通过——
+/// `tui.terminal_title` 就是这么漏掉的。守卫分别在：
+/// `yi-agent-web/tests/api_test.rs::get_config_reports_a_value_for_every_field`
+/// 与 `settings_rpc::tests::every_field_in_fields_can_be_read_back`。
 fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Value {
     let opt = |value: Option<Value>| value.unwrap_or(Value::Null);
     match spec.key {
@@ -94,6 +100,7 @@ fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Valu
         "compact.tool_budget_tokens" => opt(current.compact.tool_budget_tokens.map(Value::from)),
         "startup.sandbox" => opt(current.startup.sandbox.clone().map(Value::from)),
         "tui.notifications" => opt(current.tui.notifications.clone().map(Value::from)),
+        "tui.terminal_title" => opt(current.tui.terminal_title.clone().map(Value::from)),
         "tui.notification_method" => opt(current.tui.notification_method.clone().map(Value::from)),
         "tui.notification_condition" => {
             opt(current.tui.notification_condition.clone().map(Value::from))
