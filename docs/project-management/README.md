@@ -9,11 +9,11 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 23 / 24 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 23 / 25 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
-| yi-agent-tools | 19 / 19 | [详情](./yi-agent-tools.md) |
+| yi-agent-tools | 19 / 20 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
-| yi-agent-tui | 44 / 45 | [详情](./yi-agent-tui.md) |
+| yi-agent-tui | 44 / 46 | [详情](./yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
 | yi-agent-cli | 7 / 7 | [详情](./yi-agent-cli.md) |
 | yi-agent-web | 11 / 11 | [详情](./yi-agent-web.md) |
@@ -23,15 +23,17 @@
 | yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
-| yi-agent-runtime | 24 / 24 | [详情](./yi-agent-runtime.md) |
+| yi-agent-runtime | 24 / 25 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 80 / 80 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 80 / 81 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 19 / 20 | [详情](./superpowers-kanban.md) |
-| desktop | 115 / 125 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
+| desktop | 115 / 126 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
+
+临时旁问（三端，功能未实现）：[设计基线](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md)。计划细分21个任务，不重复增加六个模块的需求总数。
 
 ## 已知问题
 

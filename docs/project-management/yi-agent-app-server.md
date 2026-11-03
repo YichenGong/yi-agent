@@ -225,3 +225,5 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
       `src/server.rs`、`src/server/`（12 个 `.rs`）、`src/server/tests/`（12 个
       `.rs`）。— [设计](../../superpowers/specs/2026-11-01-test-extraction-c1-design.md)、
       [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)
+
+- [ ] 临时旁问生命周期与多端协议 — `side/` RPC、单父单旁支、内存回放/父订阅路由、去重与过期清理，不走持久 `thread/fork`；验收目标 `side_open_during_running_turn_does_not_interrupt_or_persist`、`side_reconnect_replays_current_items_without_duplicate_text`，执行 `cargo test -p yi-agent-app-server --lib side_`（测试待实现）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §8、§12.2。
