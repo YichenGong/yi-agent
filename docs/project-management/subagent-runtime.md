@@ -197,3 +197,49 @@
   `a_vanished_target_is_refused_before_anything_starts`）；
   `cargo test -p yi-agent-supervisors --lib lifecycle::preview`（8 passed）；
   `cargo test -p yi-agent-lifecycle`（`preview` 15 + `leases` 9）
+
+### 版本切换与 guardian 交接（Task 15）
+
+- [x] 有界切换状态机与两段绝对窗口 — `yi-agent-supervisors/src/lifecycle/switch.rs`。
+  `SwitchMachine` 只表达合法相位序列（`idle → preparing → draining → stopping →
+  starting → verifying → ready`，另加 `stopped_no_clients` / `failed` /
+  `manual_action_required`），不合法跳转直接拒绝；`SWITCH_GRACE=10s`、
+  `SWITCH_CONFIRM=5s` 是**绝对**窗口而非按对象分摊，`SWITCH_START=30s` 覆盖交接＋启动＋握手。
+  `SwitchController::start` 立刻返回（返回码是 `WouldBlock` 表示已有一次切换在跑），
+  切换在工作线程里跑，UI 通过 `Operation` 轮询。判据：
+  `cargo test -p yi-agent-supervisors --lib switch::`（18 passed），含
+  `the_stages_run_in_the_specified_order`、`every_stage_failure_fails_closed`、
+  `an_unproven_stop_never_starts_a_second_generation`、
+  `a_runtime_with_no_clients_is_stopped_and_not_started`、
+  `a_secondary_switch_is_refused_while_one_runs`
+- [x] 真实后端：预检、冻结旧自愈、回收证明、选择记录 — `lifecycle/switch_managed.rs`。
+  `ManagedSwitchBackend` 把每个问题交给已经拥有事实的组件：`preflight` 只读检查目标可执行、
+  handover 能力与数据库 schema（`bringup::schema_is_readable_for`），任何一项不满足都返回
+  `ManualAction` 且**在停旧之前**；`freeze` 先写 `retirement` 记录，避免旧 watchman 把旧
+  daemon 拉回来；`is_stopped` 只认 `ProcessRegistry::owner_is_stopped`，`DetachedWitness`
+  一律报错（没有 registry 就无权声称已停止）；`commit_selection` 在协调锁下原子写
+  `selection.json`。判据：`cargo test -p yi-agent-supervisors --lib switch_managed`
+  （13 passed），含 `a_preflight_without_the_lock_is_refused`、
+  `a_missing_target_is_manual_action_not_a_stop`、
+  `a_detached_witness_cannot_claim_a_stop`、
+  `an_unknown_presence_does_not_claim_nobody_is_waiting`
+- [x] 受控 exec 交接状态 — `lifecycle/handover.rs`。`HandoverState` 带 scope、目标 build、
+  handover 版本、guardian revision、操作状态、已消费 token 的**身份**（非 token 本体）、
+  释放墓碑与各保留 FD 的**角色**（不是 fd 号）；`MAX_HANDOVER_BYTES = 4 MiB` 独立于 16 KiB
+  控制帧上限，超限在**停旧前**拒绝并给手动指引。租约以「剩余毫秒」携带，
+  `remaining_after_capture` 扣掉交接耗时且时钟倒退时不延长。`exec_target` 在单线程边界
+  上 `dup2` 到固定号、显式清 `FD_CLOEXEC`、只保留白名单 FD。判据：
+  `cargo test -p yi-agent-supervisors --test guardian_handover`（11 passed），含
+  `a_released_lease_is_not_resurrected`、`a_consumed_token_is_carried_as_an_identity_only`、
+  `an_oversized_state_is_refused_before_anything_stops`、
+  `descriptors_are_carried_by_role_not_by_number`
+- [x] 真进程验收：无客户端不启动、停旧是真停、失败保留数据库 — `tests/runtime_switch.rs`。
+  判据：`cargo test -p yi-agent-supervisors --test runtime_switch`（6 passed，30s），含
+  `a_switch_with_no_clients_starts_no_daemon`（断言 **没有** PID marker 出现）、
+  `a_switch_really_stops_the_previous_child`（`waitpid(WNOHANG)` 判定真实退出，僵尸不算活）、
+  `an_unreadable_database_is_refused_before_anything_stops`、
+  `a_bundle_that_vanishes_before_start_is_refused_before_the_old_one_stops`
+- [x] guardian 暴露只读 `Operation` 查询 — `guardian.rs` 的 `serve_operation`：需活租约，
+  未知 operation 返回 `Operation(None)` 而不是伪造失败；未接控制器的 build 返回
+  `Unsupported`，让客户端能区分「这个 build 不能切换」与「我没发起过」。
+- [ ] 切换的桌面壳入口与 App 侧按钮 — 见 Task 16、17

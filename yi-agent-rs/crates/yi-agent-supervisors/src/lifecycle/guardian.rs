@@ -1067,6 +1067,12 @@ pub struct Guardian {
     /// than an empty one: a guardian that cannot see the daemon must not report that
     /// the runtime is idle.
     coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+    /// Version switches this guardian is running, so a client can poll one.
+    ///
+    /// Shared rather than owned because the switch runs on its own thread and outlives
+    /// the control exchange that started it: the handler must answer "accepted"
+    /// without holding the connection open for a teardown.
+    switches: Option<std::sync::Arc<super::switch::SwitchController>>,
     /// Leases *and* reclamation.
     ///
     /// One object rather than two because "may this client admit work" and "is the
@@ -1101,6 +1107,7 @@ impl Guardian {
             demands: None,
             previews: yi_agent_lifecycle::preview::PreviewStore::new(),
             coordinator: std::sync::Arc::new(super::preview::NoCoordinator),
+            switches: None,
             reclaim,
         }
     }
@@ -1144,6 +1151,20 @@ impl Guardian {
         probe: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
     ) {
         self.coordinator = probe;
+    }
+
+    /// Points operation queries at the switch controller that runs replacements.
+    ///
+    /// Without one, an `Operation` query is reported as unsupported rather than as
+    /// "unknown": a client must be able to tell "this build cannot switch" from "I
+    /// never asked for that operation".
+    pub fn attach_switches(&mut self, switches: std::sync::Arc<super::switch::SwitchController>) {
+        self.switches = Some(switches);
+    }
+
+    /// The switch controller, when this guardian can perform a switch.
+    pub fn switches(&self) -> Option<&std::sync::Arc<super::switch::SwitchController>> {
+        self.switches.as_ref()
     }
 
     /// Whether this guardian holds the handles needed to stop what it started.
@@ -1412,6 +1433,36 @@ fn verify_target(target: &yi_agent_lifecycle::types::ArtifactIdentity) -> Result
         ));
     }
     Ok(())
+}
+
+/// Answers `ControlRequest::Operation`: the progress of a switch this runtime runs.
+///
+/// Read-only: it starts nothing, takes no barrier and grants no power. The lease check
+/// is still required, because progress reveals which build is being installed and when
+/// a runtime will go down, and that is the runtime's business, not any local process's.
+fn serve_operation(
+    guardian: &Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    operation_id: &str,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    let Some(switches) = guardian.switches() else {
+        return ControlResponse::Unsupported {
+            detail: "this guardian build cannot perform a version switch".to_string(),
+        };
+    };
+    // An operation this guardian never ran is reported as unknown, not as failed: the
+    // caller may be polling an id from an earlier generation, and inventing a failure
+    // for it would be a false report.
+    ControlResponse::Operation(switches.status(operation_id))
 }
 
 /// Answers `ControlRequest::Preview`.
@@ -1913,8 +1964,17 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             token,
             operation_id,
         } => serve_confirm(guardian, &grant, &token, &operation_id),
+        ControlRequest::Operation {
+            grant,
+            operation_id,
+        } => serve_operation(guardian, &grant, &operation_id),
         // Reclaim/operation are completed in later tasks; until then an
         // unimplemented request is reported as such, never as accepted.
+        //
+        // The arm is kept even though this build now handles every variant: a future
+        // request must land on "unsupported" rather than failing to compile into a
+        // silently accepted request.
+        #[allow(unreachable_patterns)]
         _ => ControlResponse::Unsupported {
             detail: "not implemented by this guardian build".to_string(),
         },

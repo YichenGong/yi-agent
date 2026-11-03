@@ -700,7 +700,7 @@ fn heartbeat_does_not_change_impact_revision() {
 - `HandoverState { version: u16, scope_key: String, operation: OperationStatus, consumed_tokens: Vec<String>, captured_monotonic_ns: u64, remaining_leases_ms: Vec<(ClientGrant, u64)>, remaining_start_budget_ms: u64 }`；真实实现还保存 LeaseTable 的 released tombstone／epoch，不能让交接复活已释放身份。captured_monotonic_ns 使用同机跨进程可比较的 OS 单调时钟，验证时减去交接耗时；不能把进程本地 Instant 直接序列化或重发完整预算。
 - `handover::encode_state(&HandoverState) -> io::Result<OwnedFd>`；`validate_state(fd: BorrowedFd, scope: &RuntimeScope, target: &ArtifactIdentity) -> io::Result<HandoverState>`；`exec_target(target: &ArtifactIdentity, state: OwnedFd, preserve: &[RawFd]) -> io::Result<Infallible>`。HandoverState 还显式携带 selected target、guardian revision、operation/token 绑定、释放结果查询记录、各保留 FD 的角色／epoch 与帧缓冲状态；仅保存 ClientGrant 列表不足以恢复控制服务。旧请求 handler 在有界 quiesce 后交接：不得截断已接收的 Release／Heartbeat，也不得在新程序重执行已消费 Confirm；未完整帧保留 parser 缓冲或在明示可重连的连接上关闭，不能假装仅继承 socket FD 即可无损。exec 交接状态体有独立上限 4 MiB，超过则在停旧前拒绝自动 handover并给手动指引，不套用 16 KiB 控制帧上限。
 
-- [ ] **Step 1:** fake 后端记录严格切换顺序并注入每阶段失败；纯状态约束测试作为起点：
+- [x] **Step 1:** fake 后端记录严格切换顺序并注入每阶段失败；纯状态约束测试作为起点：
 
 ```rust
 #[test]
@@ -716,12 +716,12 @@ fn no_clients_after_stop_is_not_ready() {
 
 集成测试必须验证真进程 stopped-no-clients 不启动新 daemon，而非仅验证 enum。
 
-- [ ] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test runtime_switch`、`cargo test -p yi-agent-supervisors --test guardian_handover`。
-- [ ] **Step 3:** 维护期持协调锁，冻结旧自愈与全部准入，通知客户端；10 秒并行 checkpoint、5 秒回收已核实 daemon／executor／工具组；确认全部退出和运行锁释放，再原子写目标 selection。任一失败停止，不删锁，不杀 TUI，不降级，不开始新版调度。
-- [ ] **Step 4:** 目标构建／schema／handover 能力在停旧前只读预检，磁盘不足或不支持交接即提示手动退出，不先停旧才发现无法接管。旧对象停止后，若 guardian 构建不同，用私有匿名 FD 交接控制监听、登记连接、协调锁及操作状态；其余 FD 关闭。在单线程／安全 exec 边界交接，不在多线程 Rust fork 后执行分配器逻辑。验证 FD 类型、数量、scope、owner、版本、目标 build，失败不得恢复运行旧任务。
-- [ ] **Step 5:** 剩余租约扣除交接耗时，不能重新发完整 30 秒。已消费 token 不可重用，凭据不落磁盘。30 秒内启动新 daemon，核对 guardian＋daemon build、代际、schema和两条通道 ready；timeout 回收本次受管进程。客户端重新 attach 签新业务授权，只读操作可重试，SingleShot 不重放。
-- [ ] **Step 6:** 全部客户端退出则完成停旧并保存选择，状态 StoppedNoClients；有等待者仅授权下一代。发起者消失不取消已批准停旧；guardian 消失后下一控制者只能核实并隔离残留，不能继承强杀 token。测试启动／迁移失败保留数据库与错误阶段，bundle 中途替换、旧 PID 复用均不误杀。
-- [ ] **Step 7:** 运行受影响 supervisors／store／subagent 测试和 §0.4，提交 `feat: switch managed runtime generations with safe guardian handover`。
+- [x] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test runtime_switch`、`cargo test -p yi-agent-supervisors --test guardian_handover`。
+- [x] **Step 3:** 维护期持协调锁，冻结旧自愈与全部准入，通知客户端；10 秒并行 checkpoint、5 秒回收已核实 daemon／executor／工具组；确认全部退出和运行锁释放，再原子写目标 selection。任一失败停止，不删锁，不杀 TUI，不降级，不开始新版调度。
+- [x] **Step 4:** 目标构建／schema／handover 能力在停旧前只读预检，磁盘不足或不支持交接即提示手动退出，不先停旧才发现无法接管。旧对象停止后，若 guardian 构建不同，用私有匿名 FD 交接控制监听、登记连接、协调锁及操作状态；其余 FD 关闭。在单线程／安全 exec 边界交接，不在多线程 Rust fork 后执行分配器逻辑。验证 FD 类型、数量、scope、owner、版本、目标 build，失败不得恢复运行旧任务。
+- [x] **Step 5:** 剩余租约扣除交接耗时，不能重新发完整 30 秒。已消费 token 不可重用，凭据不落磁盘。30 秒内启动新 daemon，核对 guardian＋daemon build、代际、schema和两条通道 ready；timeout 回收本次受管进程。客户端重新 attach 签新业务授权，只读操作可重试，SingleShot 不重放。
+- [x] **Step 6:** 全部客户端退出则完成停旧并保存选择，状态 StoppedNoClients；有等待者仅授权下一代。发起者消失不取消已批准停旧；guardian 消失后下一控制者只能核实并隔离残留，不能继承强杀 token。测试启动／迁移失败保留数据库与错误阶段，bundle 中途替换、旧 PID 复用均不误杀。
+- [x] **Step 7:** 运行受影响 supervisors／store／subagent 测试和 §0.4，提交 `feat: switch managed runtime generations with safe guardian handover`。
 
 ## Task 16: 只读状态、兼容矩阵与本地桌面控制命令
 

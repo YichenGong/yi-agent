@@ -22,6 +22,7 @@ pub mod bringup;
 pub mod claim;
 pub mod demands;
 pub mod guardian;
+pub mod handover;
 pub mod managed_channel;
 pub mod migration;
 pub mod preview;
@@ -31,6 +32,8 @@ pub mod retirement;
 pub mod roles;
 pub mod scope;
 pub mod selection;
+pub mod switch;
+pub mod switch_managed;
 
 use std::io;
 use std::os::unix::fs::MetadataExt;

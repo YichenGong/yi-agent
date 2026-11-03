@@ -411,6 +411,15 @@ fn claim_is_ours(guard: &CoordinationGuard, scope: &RuntimeScope) -> Result<(), 
 ///
 /// Checked before launch because the daemon migrates the moment it opens. A missing
 /// file is a first start and therefore fine.
+/// Whether `expected` can open `database`, without writing to it.
+///
+/// Public so a version switch can do the same read-only check *before* it stops the
+/// old runtime: discovering an unreadable schema after stopping would leave the user
+/// with nothing running.
+pub fn schema_is_readable_for(database: &Path, expected: &ArtifactIdentity) -> Result<(), String> {
+    schema_is_readable(database, expected)
+}
+
 fn schema_is_readable(database: &Path, expected: &ArtifactIdentity) -> Result<(), String> {
     use yi_agent_store::schema_compat::inspect_schema;
     match inspect_schema(database) {
