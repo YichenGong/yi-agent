@@ -19,6 +19,11 @@ thiserror = "2"
 # 由 `cargo audit` 通过后锁定，见 G2 §3.4。
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
+sha2 = "0.10"
+# 归档读取。tar 的条目类型是显式枚举（普通文件/链接/设备…），比 zip 更适合
+# 「逐类拒绝」——zip 的 Unix 元数据要靠额外字段，缺字段时行为取决于实现。
+tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

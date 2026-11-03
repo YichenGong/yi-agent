@@ -5,12 +5,16 @@
 //! 路径与时钟都由调用方注入，这样同一份代码可以被宿主、桌面壳和
 //! 测试各自复用，而不会把某个运行时的假设固化进来。
 
+pub mod bundle;
 pub mod error;
+pub mod limits;
 pub mod manifest;
 pub mod trust;
 pub mod types;
 
+pub use bundle::{InstalledRelease, install_verified, verify_installed};
 pub use error::PluginError;
+pub use limits::ExtractLimits;
 pub use manifest::{Manifest, MethodDecl, ViewDecl};
 pub use trust::{TrustStore, VerifiedRelease};
 pub use types::{Binding, Effect, Operation, PluginId, ProjectId, ReleaseId};

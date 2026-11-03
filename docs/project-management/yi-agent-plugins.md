@@ -43,7 +43,12 @@
 - [x] `VerifiedRelease` 不可伪造 — 无公开构造函数、不实现 `Deserialize`。判据：`a_verified_release_cannot_be_built_from_unverified_json`
 - [x] 错误不泄漏密钥/签名 — 判据：`errors_do_not_leak_key_material_or_raw_signatures`
 - [x] 正式源码不含测试种子 — 判据：`the_shipped_sources_do_not_contain_a_test_seed_or_a_private_key`
-- [ ] 有界解包 — T08
-- [ ] 实例注册表 — T09
-- [ ] 有界解包 — T08
+- [x] 有界解包上限与硬顶 — `src/limits.rs` 的 `ExtractLimits`：归档 256 MiB、总量 1 GiB、单文件 128 MiB、20 000 个文件；`exceeds_hard_ceiling()` 拒绝插件抬高上限。判据：`limits_cannot_be_raised_by_the_plugin`（用抬高后的上限安装必须 `PermissionDenied` 且不落盘）
+- [x] 解包输入是真实验证产物 — `install_verified` 接 `&VerifiedRelease` + `&Manifest`，而不是"摘要 + 字节"，调用方无法拼一个未验证的包。判据：`a_payload_that_does_not_match_the_manifest_is_caught_by_the_signed_digest`
+- [x] 八类归档攻击被拒 — 路径穿越、绝对路径、反斜杠、symlink、hardlink、设备文件、重复名、大小写碰撞。判据：`a_parent_directory_entry_is_rejected` 等八条；test fixture 手写 tar header，因为 `tar::Builder` 会替我们拒绝 `..`，用它会造不出攻击样本
+- [x] 解包分两遍且边解边计 — 第一遍只读条目头累计计数，第二遍才写；`walk_archive`（`src/bundle.rs:404`）。判据：`exceeding_the_total_size_limit_is_rejected` 等四条上限用例，每条都先证明默认上限下同一个包能装
+- [x] 失败不留残骸 — staging 与 destination 同级、失败整目录删除、摘要文件在 staging 内生成后整体 `rename`。判据：`a_rejected_archive_leaves_no_destination_directory`（同时断言 `.installed.staging` 不存在）
+- [x] 归档权限不采纳 — 普通文件 0444，只有清单 `program.entry` 设 0555；setuid 与原始 mode 丢弃。判据：`setuid_is_not_preserved`、`a_non_entry_file_is_not_executable`、`a_declared_program_entry_becomes_executable`
+- [x] 声明入口必须存在 — 清单声明了归档里没有的入口，在解包阶段就拒，而不是等宿启进程时才发现。判据：`a_declared_program_entry_missing_from_the_archive_is_rejected`
+- [x] 安装后完整性 — `.yi-agent-digests` 记录每文件摘要，`verify_installed` 启动前比对。判据：`an_unmodified_installation_passes_the_integrity_check`、`a_tampered_installed_file_fails_the_integrity_check`
 - [ ] 实例注册表 — T09

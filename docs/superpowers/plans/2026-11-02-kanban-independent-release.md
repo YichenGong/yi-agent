@@ -379,8 +379,12 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 `ExtractLimits::default`、`install_verified`、`InstalledRelease`；输入 archive 的摘要、大小和内容均须匹配 `VerifiedRelease`。
 
-- [ ] Step 1：创建 traversal、绝对路径、软/硬链接、设备文件、重复名、大小写碰撞、超大解压量夹具，确认它们不在 bundle 测试里被当作普通文件接受。
-- [ ] Step 2：增加失败测试的核心断言：
+> **2026-11-03 实现记录：** `install_verified` 取 `(&VerifiedRelease, &Manifest, archive, destination, &ExtractLimits)`。第一个参数是真实验签产物而不是「摘要 + 字节」，这样调用方拼不出未验证的包来解压——签名只覆盖 `VerifiedRelease`，若由调用方另行传入摘要，那两条校验就退化成自证。
+
+- [x] Step 1：创建 traversal、绝对路径、软/硬链接、设备文件、重复名、大小写碰撞、超大解压量夹具，确认它们不在 bundle 测试里被当作普通文件接受。
+  > 2026-11-03：`tests/common/mod.rs` 的 `build_archive` **手写 tar header**。`tar::Builder` 会替我们拒绝含 `..` 的路径，用它造不出攻击样本——测试会红在构造阶段，什么也证明不了。八类夹具各自一条测试，另有反斜杠与 NUL 各一条（NUL 无法经 tar header 表达，直接测 `validate_entry_name`）。
+- [x] Step 2：增加失败测试的核心断言：
+  > 2026-11-03：`signed_release()` 用测试种子真实签发并被 `TrustStore::verify_release` 验过，攻击样本因此不是"摘要不符"失败。判据 `a_rejected_archive_leaves_no_destination_directory` 同时断言 outside 无 `escaped.txt`、destination 不存在、`.installed.staging` 也不存在。
   ```rust
   assert!(install_verified(&verified, &hostile_archive, &destination,
       &ExtractLimits::default()).is_err());
@@ -388,9 +392,12 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
   assert!(!destination.exists());
   ```
   `verified`、`hostile_archive`、`destination`、`outside` 均在该测试中通过 fixture 签名器/TempDir 创建；不能复用正常包签名来让所有攻击仅因摘要不符失败。
-- [ ] Step 3：实现 tar.gz 流式限量读取、逐 entry 校验、相对入口校验、独立临时目录、同文件系统原子落盘；失败清理临时产物。不得先 `extract` 全包再检查。归档中的 uid/gid、setuid/setgid 和原始权限不直接采纳；仅对清单声明的原生入口由宿主设置受控执行位，其他静态文件只读。
-- [ ] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test bundle`；验证磁盘写失败、取消、超限压缩流和安装后文件被替换；每个攻击都使用有效测试签名，确保测到解包边界。
-- [ ] Step 5：按 C 提交 `feat: install verified plugin bundles safely`。
+- [x] Step 3：实现 tar.gz 流式限量读取、逐 entry 校验、相对入口校验、独立临时目录、同文件系统原子落盘；失败清理临时产物。不得先 `extract` 全包再检查。归档中的 uid/gid、setuid/setgid 和原始权限不直接采纳；仅对清单声明的原生入口由宿主设置受控执行位，其他静态文件只读。
+  > 2026-11-03：`plan_extraction` 只读头、`write_plan` 才写，`walk_archive` 用回调避免把整个归档解压到内存。staging 与 destination 同级以保证 `rename` 不跨文件系统。`.yi-agent-digests` 在 staging 内生成后再整体换名——写在 rename 之后会留下「已发布但没指纹」的目录。
+- [x] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test bundle`；验证磁盘写失败、取消、超限压缩流和安装后文件被替换；每个攻击都使用有效测试签名，确保测到解包边界。
+  > 2026-11-03：`bundle` 25/25；整个 crate 25 + 20（manifest）+ 22（trust）= 67 全绿。20 项变异逐条打红：删 `..`/绝对路径/反斜杠/NUL 检查、三类特殊文件拒绝、大小写碰撞、四项上限、摘要与大小声明、硬顶、`verify_installed` 比对、只读位、入口存在性、执行位授予。
+  > 「取消」一项未覆盖：解包是同步函数，没有可注入的取消点；取消由 T10 的宿主编排负责（在那里杀掉宿主侧安装任务并清理 staging），本任务不假装测过。
+- [x] Step 5：按 C 提交 `feat: install verified plugin bundles safely`。
 
 ### Task T09：实现实例注册表、安装幂等与跨进程互斥
 
