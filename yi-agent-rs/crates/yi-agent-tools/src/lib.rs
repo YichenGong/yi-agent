@@ -35,7 +35,7 @@ pub use shell::BashTool;
 pub use shell::blocklist;
 pub use side_read::{
     SIDE_READ_SUPPORTED, SideBlockingPool, SideFileAlias, SideReadAccess, SideRoots,
-    register_side_file_tools,
+    StaticSideRoots, register_side_file_tools,
 };
 pub use skill_tool::SkillTool;
 pub use web::config::{

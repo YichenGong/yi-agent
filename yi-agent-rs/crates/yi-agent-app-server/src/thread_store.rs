@@ -370,11 +370,22 @@ impl ThreadStore {
         &self.root
     }
 
-    fn meta_path(&self, id: &str) -> PathBuf {
+    /// 该 store 所属的工作区（`root()` 是它下面的 `.yi-agent/threads`）。
+    ///
+    /// 测试与调用方要构造一份「cwd 与 store 对得上」的 meta：直接由 store 反推，
+    /// 比再传一遍路径更不容易写错（写错的表现是冷读报「没有可继承的历史」）。
+    pub fn workdir(&self) -> &Path {
+        self.root
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&self.root)
+    }
+
+    pub(crate) fn meta_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.meta.json"))
     }
 
-    fn log_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn log_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.jsonl"))
     }
 
@@ -1321,7 +1332,7 @@ impl ThreadStore {
         Ok(existed)
     }
 
-    fn partial_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn partial_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.partial.json"))
     }
 
@@ -1434,7 +1445,7 @@ impl ThreadStore {
 ///
 /// 宽松入口（`read_partial` / `read_log`）用 `.ok()` 把读错压成「没有」；恢复
 /// 原会话不能这样——「读不了」和「不存在」在恢复语义下是相反的结论。
-fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
+pub(crate) fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1447,7 +1458,7 @@ pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn io_err(e: serde_json::Error) -> io::Error {
+pub(crate) fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
@@ -1462,7 +1473,7 @@ pub(crate) fn is_valid_thread_id(id: &str) -> bool {
 
 /// Generated ids look like `thread-<uuid>`; allow only a conservative charset so
 /// an id can never name a path outside the store root or a nested file.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id

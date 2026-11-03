@@ -56,6 +56,28 @@ pub trait SideRoots: Send + Sync {
     fn current_roots(&self) -> Vec<PathBuf>;
 }
 
+/// A root set fixed at construction.
+///
+/// For hosts that do not revoke roots at runtime (a cold parent, or a host that
+/// has no live authorisation source). A host that *can* revoke must not use this:
+/// a fixed set cannot express "the root was taken away".
+#[derive(Debug)]
+pub struct StaticSideRoots {
+    roots: Vec<PathBuf>,
+}
+
+impl StaticSideRoots {
+    pub fn new(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
+}
+
+impl SideRoots for StaticSideRoots {
+    fn current_roots(&self) -> Vec<PathBuf> {
+        self.roots.clone()
+    }
+}
+
 /// A pre-copied attachment: the authorised original and the side-private copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SideFileAlias {
