@@ -43,6 +43,22 @@ export type { Item } from "./generated/Item";
 export type { TurnStatus } from "./generated/TurnStatus";
 export type { ThreadStatus } from "./generated/ThreadStatus";
 export type { Notification } from "./generated/Notification";
+// 旁支会话(spec §8.1–8.3)。请求是 camelCase + `deny_unknown_fields`,响应是
+// snake_case——这是本协议既有的两套约定,照旧各走各的。
+export type { SideOpenParams } from "./generated/SideOpenParams";
+export type { SideListParams } from "./generated/SideListParams";
+export type { SideListResult } from "./generated/SideListResult";
+export type { SideReadItemsParams } from "./generated/SideReadItemsParams";
+export type { SideReadItemsResult } from "./generated/SideReadItemsResult";
+export type { SideTurnStartParams } from "./generated/SideTurnStartParams";
+export type { SideTurnStartResult } from "./generated/SideTurnStartResult";
+export type { SideTurnInterruptParams } from "./generated/SideTurnInterruptParams";
+export type { SideCloseParams } from "./generated/SideCloseParams";
+export type { SideStatusWire } from "./generated/SideStatusWire";
+export type { SideSummaryWire } from "./generated/SideSummaryWire";
+export type { SideUsageWire } from "./generated/SideUsageWire";
+export type { SideTokenTotalsWire } from "./generated/SideTokenTotalsWire";
+export type { SideEffectiveConfigWire } from "./generated/SideEffectiveConfigWire";
 export type { AgentChild } from "./generated/AgentChild";
 export type { AgentTraceRow } from "./generated/AgentTraceRow";
 

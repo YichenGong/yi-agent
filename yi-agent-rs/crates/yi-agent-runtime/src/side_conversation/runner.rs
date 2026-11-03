@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use yi_agent_core::managed_run::{BudgetedAgentEvent, ManagedRunControl, ManagedRunLimits};
@@ -47,7 +47,12 @@ pub const SIDE_TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const SIDE_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Lifecycle of one side conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// Not a wire type: the app-server mirrors it as `protocol::SideStatusWire` rather
+/// than making this crate depend on the desktop binding generator. The mirror is
+/// kept honest by an exhaustive `match` in the conversion, which stops compiling
+/// when a variant is added here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideStatus {
     Creating,

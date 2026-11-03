@@ -75,6 +75,50 @@ pub(crate) fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
         error: Some(error),
     }
 }
+/// 让**已经 detach 出去**的任务回一帧响应。
+///
+/// 为什么不是直接调 `write_response`:detached 任务手里不能有 `AppState<'a>`
+/// (它按请求借用主循环的局部量),所以这里只持有写出所需的两样 owned:`Arc<hub>`
+/// 与 `ClientId`。信号与主循环内联应答完全同一条路径,故连接关闭、大小校验、
+/// 慢消费者摘除等行为不变。
+///
+/// `send` 返回 `()` 是刻意的:任务已经与请求方脱钩,写失败是那条连接自己的问题,
+/// 没有人可回报。失败记一行 debug——重连后客户端会重新对账。
+#[derive(Clone)]
+pub(crate) struct SideResponseSender {
+    hub: Arc<crate::broadcast::Broadcaster>,
+    client: crate::broadcast::ClientId,
+}
+
+impl SideResponseSender {
+    pub(crate) fn new(
+        hub: Arc<crate::broadcast::Broadcaster>,
+        client: crate::broadcast::ClientId,
+    ) -> Self {
+        Self { hub, client }
+    }
+
+    pub(crate) async fn send<T: serde::Serialize>(
+        &self,
+        id: RequestId,
+        result: Result<T, yi_agent_runtime::side_conversation::SideError>,
+    ) {
+        let response = match result {
+            Ok(value) => match serde_json::to_value(&value) {
+                Ok(value) => ok_response(id, value),
+                Err(error) => err_response(
+                    id,
+                    RpcError::internal(format!("failed to serialize side response: {error}")),
+                ),
+            },
+            Err(error) => err_response(id, RpcError::side(&error)),
+        };
+        if let Err(error) = write_response(&self.hub, &self.client, response).await {
+            tracing::debug!(%error, "side response write failed");
+        }
+    }
+}
+
 pub(crate) async fn write_response(
     hub: &crate::broadcast::Broadcaster,
     client: &crate::broadcast::ClientId,

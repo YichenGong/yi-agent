@@ -613,6 +613,39 @@ impl Harness {
         Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
     }
 
+    /// 带注入旁支注册表的 harness。scope 可指定,用来验证 `side/*` 的门禁。
+    pub(crate) async fn with_scope_and_side_registry(
+        scope: Scope,
+        registry: Arc<crate::side_conversation::SideRegistry>,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(registry),
+        )
+    }
+
     pub(crate) async fn with_lead_flag(enabled: bool) -> Self {
         Self::with_config_lead_and_scope(
             test_config(),
@@ -693,6 +726,7 @@ impl Harness {
             }),
             calls,
             lead_agent_enabled,
+            None,
         )
     }
 
@@ -710,6 +744,7 @@ impl Harness {
             uninstall,
             Arc::new(StdMutex::new(Vec::new())),
             false,
+            None,
         )
     }
 
@@ -754,11 +789,12 @@ impl Harness {
             }),
             calls,
             false,
+            None,
         )
     }
 
-    // 8 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
-    // 开关。再拆一个 builder 只会让"哪些组合真的存在"更难读。
+    // 9 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
+    // 开关 + 旁支注册表。再拆一个 builder 只会让"哪些组合真的存在"更难读。
     #[allow(clippy::too_many_arguments)]
     fn with_config_and_scope_and_watchman<F>(
         cfg: RuntimeConfig,
@@ -772,6 +808,9 @@ impl Harness {
         // 且共享进程级 `YI_AGENT_HOME`，并行测试必然互相污染；本 crate 的 lib
         // 测试从不注入 build info，`build_kind()` 恒为 "release"，写文件也无效。
         lead_agent_enabled: bool,
+        // 旁支注册表:注入后 `side/*` 走替身 resolver,不读真实项目目录。
+        // `None` 时 `serve()` 按本进程实例家目录自建(生产路径)。
+        side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
     ) -> Self
     where
         F: Fn(
@@ -887,6 +926,7 @@ impl Harness {
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
                 remote_dir: index_dir.path().to_path_buf(),
+                side_registry,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
@@ -2538,6 +2578,9 @@ impl MergedHarness {
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
                 remote_dir: PathBuf::new(),
+                // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
+                // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
+                side_registry: Some(test_side_registry(index_dir.path(), None)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2827,6 +2870,58 @@ fn child_holds_thread_lock() {
     std::thread::sleep(std::time::Duration::from_secs(30));
 }
 
+/// 只认 `p1` 的替身解析:测试用它把「打开旁支」从真实项目目录里摘出来。
+///
+/// `gate` 不是装饰:它让 `resolve` 卡在屏障上,于是「主循环有没有被堵住」变成
+/// 可断言的事实,而不是靠计时猜测(见 `tests::side` 的不阻塞用例)。
+pub(crate) struct StubSideResolver {
+    pub(crate) gate: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl crate::side_conversation::SideParentResolver for StubSideResolver {
+    fn resolve<'a>(
+        &'a self,
+        parent: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        yi_agent_runtime::side_conversation::SideResult<
+            yi_agent_runtime::side_conversation::EffectiveSideSource,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
+            Err(yi_agent_runtime::side_conversation::SideError::new(
+                yi_agent_runtime::side_conversation::SideErrorReason::UnknownThread,
+                format!("stub 不解析 {parent}"),
+            ))
+        })
+    }
+}
+
+/// 测试用旁支注册表:宿主资源落在 `home` 下,调用方负责保活那个临时目录。
+///
+/// 手工装配 `RuntimeAttachments` 的用例必须用它,而**不能**留
+/// `side_registry: None` + 空 `remote_dir`:那会让 `serve()` 把
+/// `side-conversations/` 建到当前工作目录(即源码树里),实测已经发生。
+pub(crate) fn test_side_registry(
+    home: &Path,
+    gate: Option<Arc<tokio::sync::Barrier>>,
+) -> Arc<crate::side_conversation::SideRegistry> {
+    let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
+    let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+        home.to_path_buf(),
+        Arc::clone(&pool),
+    )
+    .expect("test side host resources");
+    Arc::new(crate::side_conversation::SideRegistry::new(
+        Arc::new(StubSideResolver { gate }),
+        resources,
+        pool,
+    ))
+}
+
 #[cfg(test)]
 mod assembly;
 #[cfg(test)]
@@ -2839,6 +2934,8 @@ mod model_settings;
 mod plugin_theme;
 #[cfg(test)]
 mod process;
+#[cfg(test)]
+mod side;
 #[cfg(test)]
 mod thread_index;
 #[cfg(test)]

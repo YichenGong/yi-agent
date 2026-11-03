@@ -58,6 +58,38 @@ impl SideResolverFactory {
     }
 }
 
+/// 生产端的父来源解析:按 threadId 在工作区索引里定位它的 store,再严格冷读。
+///
+/// 为什么只有冷读路径:活跃父的 source 需要 `ThreadSession` 持有
+/// `SideSourcePublisher`(Task 10 留下、本任务文件清单外),而 `serve()` 拿到的
+/// `threads` 是主循环独占的局部量。冷读是**原子的**(Task 10 的指纹重试),所以
+/// 旁支不会读到撕裂的历史;代价是可能漏掉父正在流式输出的那一轮。这不是猜测:
+/// `read_cold_parent` 先读内容、再核对读前读后的指纹,只有两次都一致才发布。
+pub struct WorkspaceResolver {
+    workspaces: Arc<crate::workspace_index::WorkspaceIndex>,
+    base: RuntimeConfig,
+}
+
+impl WorkspaceResolver {
+    pub fn new(
+        workspaces: Arc<crate::workspace_index::WorkspaceIndex>,
+        base: RuntimeConfig,
+    ) -> Self {
+        Self { workspaces, base }
+    }
+}
+
+impl SideParentResolver for WorkspaceResolver {
+    fn resolve<'a>(&'a self, parent: &'a str) -> BoxFuture<'a, SideResult<EffectiveSideSource>> {
+        Box::pin(async move {
+            let store = crate::server::store_for(&self.workspaces, &self.base, parent);
+            ThreadStoreResolver::new(store, self.base.clone())
+                .resolve(parent)
+                .await
+        })
+    }
+}
+
 /// 一份「父的持久状态 + 解析出的配置」，用来装配冷来源。
 ///
 /// 单独成一个结构体，是为了让 `assemble_cold_source` 专注于「怎么把它变成

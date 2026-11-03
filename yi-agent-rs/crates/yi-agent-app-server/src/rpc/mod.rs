@@ -24,6 +24,7 @@ pub(crate) mod plugin;
 pub(crate) mod process;
 pub(crate) mod remote;
 pub(crate) mod resident;
+pub(crate) mod side;
 pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
@@ -272,6 +273,8 @@ pub(crate) enum Domain {
     Flags,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
+    /// `side/*`(旁支会话:开/列/读/发问/停止/关闭,spec §8.1)。
+    Side,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
     Agent,
     /// `remote/*`(手机端「本项目清单 + 每项目的 relay session」)。
@@ -304,6 +307,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("websearch") => Domain::WebSearch,
         Some("flags") | Some("build") => Domain::Flags,
         Some("thread") => Domain::Thread,
+        Some("side") => Domain::Side,
         Some("agent") => Domain::Agent,
         Some("remote") => Domain::Remote,
         _ => Domain::Unknown,
@@ -470,6 +474,17 @@ pub(crate) struct AppState<'a> {
     /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
     /// 读一次的判定输入。
     pub(crate) lead_agent_enabled: bool,
+
+    // ---- 旁支会话(spec §8) ----
+    /// 旁支注册表。`Arc` 是进程级唯一实例:`open` 必须让桌面与手机拿到**同一个**
+    /// runner,按连接各建一份就会给同一个父开两条供应商流。
+    pub(crate) side_registry: &'a Arc<crate::side_conversation::SideRegistry>,
+    /// 宿主级的旁支后台任务集合。`serve()` 在返回前 `abort_all()`。
+    ///
+    /// 之所以是 `JoinSet` 而不是裸 `spawn`:旁支任务的寿命可以长于一个请求
+    /// (创建要读盘、关闭要等核心任务收敛),没有统一持有者就无法在宿主退出时
+    /// 收口,也无法在测试里确定地清空。
+    pub(crate) side_tasks: &'a mut tokio::task::JoinSet<()>,
 
     // ---- 远端 SSH 执行(实验开关 `remote_ssh`) ----
     /// 实例状态根,`remote/relayTargets` 从它下面读 `remote.json` 与

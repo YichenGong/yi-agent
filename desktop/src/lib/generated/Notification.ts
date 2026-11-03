@@ -2,6 +2,9 @@
 import type { AgentChild } from "./AgentChild";
 import type { AgentTraceRow } from "./AgentTraceRow";
 import type { Item } from "./Item";
+import type { SideStatusWire } from "./SideStatusWire";
+import type { SideSummaryWire } from "./SideSummaryWire";
+import type { SideUsageWire } from "./SideUsageWire";
 import type { ThreadStatus } from "./ThreadStatus";
 import type { TurnStatus } from "./TurnStatus";
 
@@ -13,7 +16,15 @@ export type Notification = { "method": "thread/started", "params": { thread_id: 
  * 该会话选中的清单条目显示名(`None`＝跟随全局默认)。`model` 是解析后的
  * 生效串,`model_ref` 是用户在清单里选中的那一条,客户端据此回显。
  */
-model_ref?: string | null, } } | { "method": "turn/started", "params": { thread_id: string, turn_id: string, } } | { "method": "thread/status/updated", "params": { thread_id: string, status: ThreadStatus, } } | { "method": "thread/modelChanged", "params": { thread_id: string, model: string, } } | { "method": "thread/permissionModeChanged", "params": { thread_id: string, mode: "normal" | "yolo", } } | { "method": "thread/readStateChanged", "params": { thread_id: string, last_read_at: number, last_completed_at: number, } } | { "method": "thread/reasoningEffortChanged", "params": { thread_id: string, effort?: string | null, } } | { "method": "thread/preserveThinkingChanged", "params": { thread_id: string, preserve: boolean, } } | { "method": "model/capabilitiesChanged", "params": { name: string, reasoning_capabilities?: unknown, } } | { "method": "thread/titleChanged", "params": { thread_id: string, title: string, } } | { "method": "thread/tagChanged", "params": { thread_id: string, tag: string | null, } } | { "method": "thread/groupsChanged", "params": { workspace: string, } } | { "method": "thread/notice", "params": { thread_id: string, level: "Info" | "Warn", text: string, } } | { "method": "thread/reasoningDelta", "params": { thread_id: string, text: string, kind: "Content" | "Summary", } } | { "method": "item/started", "params": { thread_id: string, item: Item, } } | { "method": "item/delta", "params": { thread_id: string, item_id: string, delta: string, } } | { "method": "item/completed", "params": { thread_id: string, item: Item, } } | { "method": "items/completed", "params": { thread_id: string, items: Array<Item>, } } | { "method": "turn/completed", "params": { thread_id: string, turn_id: string, status: TurnStatus, error?: string, 
+model_ref?: string | null, } } | { "method": "turn/started", "params": { thread_id: string, turn_id: string, } } | { "method": "thread/status/updated", "params": { thread_id: string, status: ThreadStatus, } } | { "method": "thread/modelChanged", "params": { thread_id: string, model: string, } } | { "method": "thread/permissionModeChanged", "params": { thread_id: string, mode: "normal" | "yolo", } } | { "method": "thread/readStateChanged", "params": { thread_id: string, last_read_at: number, last_completed_at: number, } } | { "method": "side/changed", "params": { parent_thread_id: string, side_id: string, generation: number, seq: number, summary: SideSummaryWire, } } | { "method": "side/itemUpdated", "params": { parent_thread_id: string, side_id: string, generation: number, seq: number, turn_id: string, item: Item, } } | { "method": "side/turnCompleted", "params": { parent_thread_id: string, side_id: string, generation: number, seq: number, turn_id: string, status: SideStatusWire, 
+/**
+ * 该轮的失败原因(稳定 reason 串),成功时为 `None`。
+ */
+reason?: string | null, error?: string | null, usage: SideUsageWire, } } | { "method": "side/closed", "params": { parent_thread_id: string, side_id: string, generation: number, seq: number, 
+/**
+ * `CloseReason::as_str()` 的稳定串。
+ */
+reason: string, } } | { "method": "thread/reasoningEffortChanged", "params": { thread_id: string, effort?: string | null, } } | { "method": "thread/preserveThinkingChanged", "params": { thread_id: string, preserve: boolean, } } | { "method": "model/capabilitiesChanged", "params": { name: string, reasoning_capabilities?: unknown, } } | { "method": "thread/titleChanged", "params": { thread_id: string, title: string, } } | { "method": "thread/tagChanged", "params": { thread_id: string, tag: string | null, } } | { "method": "thread/groupsChanged", "params": { workspace: string, } } | { "method": "thread/notice", "params": { thread_id: string, level: "Info" | "Warn", text: string, } } | { "method": "thread/reasoningDelta", "params": { thread_id: string, text: string, kind: "Content" | "Summary", } } | { "method": "item/started", "params": { thread_id: string, item: Item, } } | { "method": "item/delta", "params": { thread_id: string, item_id: string, delta: string, } } | { "method": "item/completed", "params": { thread_id: string, item: Item, } } | { "method": "items/completed", "params": { thread_id: string, items: Array<Item>, } } | { "method": "turn/completed", "params": { thread_id: string, turn_id: string, status: TurnStatus, error?: string, 
 /**
  * 本轮完成时刻（epoch 毫秒），与落盘的 `last_completed_at` **同源**。
  *

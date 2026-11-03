@@ -113,6 +113,12 @@ async fn agent_factory_failure_returns_internal_error() {
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
             remote_dir: PathBuf::new(),
+            // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
+            // 把 side-conversations/ 建到当前工作目录(源码树)。
+            side_registry: Some(crate::server::tests::test_side_registry(
+                index_dir.path(),
+                None,
+            )),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

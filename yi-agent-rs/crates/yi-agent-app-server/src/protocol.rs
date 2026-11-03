@@ -247,6 +247,44 @@ impl RpcError {
         }
     }
 
+    /// A side-conversation failure, carrying a stable `data.reason`.
+    ///
+    /// Same family shape as [`RpcError::plugin_query_error`]: the numeric code is a
+    /// coarse fallback, `data.reason` is the vocabulary the UI branches on. Codes
+    /// live in `-3203x`/`-3204x`, which the table above does not use; the test
+    /// `side_error_codes_are_unique_and_stable` pins that claim.
+    ///
+    /// Four reasons deliberately reuse an existing code rather than inventing a new
+    /// one, because they are the same failure a caller already knows:
+    /// `invalid_params` (-32602), `turn_in_progress` (-32012),
+    /// `insufficient_scope` (-32014) and `unknown_thread` (-32011).
+    pub fn side(error: &yi_agent_runtime::side_conversation::SideError) -> Self {
+        use yi_agent_runtime::side_conversation::SideErrorReason as R;
+        let code = match error.reason {
+            R::SideNotFound => -32031,
+            R::ParentNotStarted => -32032,
+            R::SideLimit => -32033,
+            R::SnapshotTooLarge => -32034,
+            R::SourceChanged => -32035,
+            R::SideClosing => -32036,
+            R::CloseConflict => -32037,
+            R::SnapshotExpired => -32038,
+            R::SideCreating => -32039,
+            R::RequestLimit => -32040,
+            R::ResourceLimit => -32041,
+            R::Cancelled => -32042,
+            R::InvalidParams => -32602,
+            R::TurnInProgress => -32012,
+            R::InsufficientScope => -32014,
+            R::UnknownThread => -32011,
+        };
+        Self {
+            code,
+            message: error.message.clone(),
+            data: Some(serde_json::json!({ "reason": error.reason_str() })),
+        }
+    }
+
     /// One `turn/start` image input could not be turned into a content block
     /// (an explicit `{type:"image", path}` that is missing, undecodable,
     /// oversized or not a regular file).
@@ -326,6 +364,74 @@ pub enum Notification {
         last_read_at: i64,
         #[ts(type = "number")]
         last_completed_at: i64,
+    },
+    /// 旁支的状态修订已发布(spec §8.2)。
+    ///
+    /// `seq` 是**这一条 side generation 内**的单调修订号,每个已发布修订恰好
+    /// 一帧。客户端据此排序与去重,不拿 token 数或 item 序号代替。
+    ///
+    /// 订阅过滤键是**父** threadId(负载里另有 sideId):桌面 Feed::All 直接收到,
+    /// 手机把当前父 pin 在既有订阅窗口里,不额外占名额。
+    #[serde(rename = "side/changed")]
+    SideChanged {
+        parent_thread_id: String,
+        side_id: String,
+        #[ts(type = "number")]
+        generation: u64,
+        #[ts(type = "number")]
+        seq: u64,
+        summary: SideSummaryWire,
+    },
+    /// 某个旁支 item 的当前完整版本(幂等 upsert,不是文本增量)。
+    ///
+    /// 客户端按 `item.id` 整体替换;重复收到同一版本是 no-op,不会追加重复文本。
+    /// 丢帧**不能**被当成增量成功——缺号要全量对账。
+    #[serde(rename = "side/itemUpdated")]
+    SideItemUpdated {
+        parent_thread_id: String,
+        side_id: String,
+        #[ts(type = "number")]
+        generation: u64,
+        #[ts(type = "number")]
+        seq: u64,
+        turn_id: String,
+        item: Item,
+    },
+    /// 一轮旁支对话真正结束,带最终状态、错误与累计用量。
+    ///
+    /// 发布顺序是契约:先 flush 该轮所有 item 更新,再发本帧,最后才允许下一轮
+    /// 受理。客户端据此把 `running` 复位并开放下一次发送。
+    #[serde(rename = "side/turnCompleted")]
+    SideTurnCompleted {
+        parent_thread_id: String,
+        side_id: String,
+        #[ts(type = "number")]
+        generation: u64,
+        #[ts(type = "number")]
+        seq: u64,
+        turn_id: String,
+        status: SideStatusWire,
+        /// 该轮的失败原因(稳定 reason 串),成功时为 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        usage: SideUsageWire,
+    },
+    /// 旁支已关闭,**终态**。
+    ///
+    /// 收到它就丢弃该 generation 的本地内容与在途分页,即使前序有缺号也不等待
+    /// 已经不存在的快照。普通更新不得复活已关闭的 generation。
+    #[serde(rename = "side/closed")]
+    SideClosed {
+        parent_thread_id: String,
+        side_id: String,
+        #[ts(type = "number")]
+        generation: u64,
+        #[ts(type = "number")]
+        seq: u64,
+        /// `CloseReason::as_str()` 的稳定串。
+        reason: String,
     },
     /// 该会话的 reasoning effort 覆盖已切换（或清除）。
     ///
@@ -614,6 +720,18 @@ impl Notification {
             | Notification::AgentTraceEvent { thread_id, .. }
             | Notification::AgentChildrenUpdated { thread_id, .. }
             | Notification::ProcessUpdated { thread_id, .. } => Some(thread_id),
+            Notification::SideChanged {
+                parent_thread_id, ..
+            }
+            | Notification::SideItemUpdated {
+                parent_thread_id, ..
+            }
+            | Notification::SideTurnCompleted {
+                parent_thread_id, ..
+            }
+            | Notification::SideClosed {
+                parent_thread_id, ..
+            } => Some(parent_thread_id),
             Notification::UiGitDiffFocus { thread_id, .. } => thread_id.as_deref(),
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
@@ -762,6 +880,268 @@ impl<'a> NotificationEnvelope<'a> {
             notification,
         }
     }
+}
+
+/// `side/open` 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideOpenParams {
+    pub parent_thread_id: String,
+}
+
+/// `side/list` 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideListParams {
+    pub parent_thread_id: String,
+}
+
+/// `side/readItems` 的参数。
+///
+/// `cursor` 必须绑定 `snapshotToken`:没有 token 的 cursor 无法判断它属于哪个
+/// 快照,拼页就会拼出两个时刻的内容。校验在 `rpc/side.rs`(参数形状合法不代表
+/// 组合合法)。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideReadItemsParams {
+    pub side_id: String,
+    /// 首读不传;续页时与 `cursor` 一起传。`#[ts(optional)]` 让 TS 侧真的是
+    /// 可选字段(而不是「必填但可 null」),否则客户端每次首读都得显式写 null。
+    #[serde(default)]
+    #[ts(optional)]
+    pub snapshot_token: Option<String>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub cursor: Option<String>,
+}
+
+/// `side/turnStart` 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideTurnStartParams {
+    pub side_id: String,
+    pub text: String,
+    /// 规范 UUID(36 ASCII 字符)。去重表用它做键,故大小写与连字符都必须规范。
+    pub client_request_id: String,
+}
+
+/// `side/turnInterrupt` 的参数。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideTurnInterruptParams {
+    pub side_id: String,
+    pub turn_id: String,
+}
+
+/// `side/close` 的参数。
+///
+/// `expected_active_turn_id` 是**必填、可为 null** 的确认字段:Idle 时传 null,
+/// Running 时传客户端确认过的 turnId。服务端据此做条件校验,状态已变则回
+/// `close_conflict`,由客户端重新读取再确认——不能自动 force 重试。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SideCloseParams {
+    pub side_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub expected_active_turn_id: Option<String>,
+}
+
+/// `side/turnStart` 的响应。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideTurnStartResult {
+    pub turn_id: String,
+}
+
+/// `side/list` 的响应。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideListResult {
+    pub sides: Vec<SideSummaryWire>,
+}
+
+/// 旁支生命周期的线上镜像。
+///
+/// runtime 的 `SideStatus` 刻意不依赖 ts-rs(桌面绑定生成器属于宿主层)。这里
+/// 镜像一份,并由 [`SideStatusWire::from_runtime`] 的**穷尽 match** 保证同步:
+/// runtime 新增一个变体,那个 match 就不再编译,不会被静默落下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum SideStatusWire {
+    Creating,
+    Idle,
+    Running,
+    Failed,
+    Closing,
+    Closed,
+}
+
+impl SideStatusWire {
+    /// 见类型文档:这个 match 是镜像与 runtime 同步的**唯一**保证。
+    pub fn from_runtime(status: yi_agent_runtime::side_conversation::SideStatus) -> Self {
+        use yi_agent_runtime::side_conversation::SideStatus as S;
+        match status {
+            S::Creating => Self::Creating,
+            S::Idle => Self::Idle,
+            S::Running => Self::Running,
+            S::Failed => Self::Failed,
+            S::Closing => Self::Closing,
+            S::Closed => Self::Closed,
+        }
+    }
+}
+
+/// `SideSummary` 的线上镜像(spec §8.1)。
+///
+/// 与 [`SideStatusWire`] 同一理由:summary 是 registry 的内部结构,不该为了导出
+/// 绑定而把 ts-rs 拖进 registry。字段逐项对应,`#[ts(type = "number")]` 让
+/// `u64`/`i64` 在 TS 里是 `number` 而不是 `bigint`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideSummaryWire {
+    pub side_id: String,
+    pub parent_thread_id: String,
+    pub status: SideStatusWire,
+    #[ts(type = "number")]
+    pub snapshot_revision: u64,
+    #[ts(type = "number")]
+    pub last_seq: u64,
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
+    /// Epoch 毫秒;`Creating`/`Running` 时为 `None`。
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub expires_at: Option<i64>,
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub stopping: bool,
+}
+
+impl SideSummaryWire {
+    pub fn from_registry(summary: &crate::side_conversation::SideSummary) -> Self {
+        Self {
+            side_id: summary.side_id.clone(),
+            parent_thread_id: summary.parent_thread_id.clone(),
+            status: SideStatusWire::from_runtime(summary.status),
+            snapshot_revision: summary.snapshot_revision,
+            last_seq: summary.last_seq,
+            active_turn_id: summary.active_turn_id.clone(),
+            expires_at: summary.expires_at,
+            generation: summary.generation,
+            stopping: summary.stopping,
+        }
+    }
+}
+
+/// 旁支累计用量(线上形状)。
+///
+/// 逐项抄 runtime 的 `SideTokenTotals`,不借 `TokenUsage`:后者是**单次回复**的
+/// `u32` 计数,拿它装旁支终身的累计量既会丢精度、也会把「这一轮」和「这一生」
+/// 混成一个数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideTokenTotalsWire {
+    #[ts(type = "number")]
+    pub input: u64,
+    #[ts(type = "number")]
+    pub output: u64,
+    #[ts(type = "number")]
+    pub cache_creation: u64,
+    #[ts(type = "number")]
+    pub cache_read: u64,
+    #[ts(type = "number")]
+    pub reasoning: u64,
+}
+
+/// 旁支用量:数字 + 「这些数字可不可信」。
+///
+/// `complete == false` 表示至少有一轮没有拿到供应商的最终用量(被取消或被中止)。
+/// 把缺数报成 0 是撒谎,所以标志位跟数字一起走。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideUsageWire {
+    pub total: SideTokenTotalsWire,
+    pub complete: bool,
+}
+
+/// 旁支创建时固定的生效配置(脱敏)。
+///
+/// 只含能给人看、且**创建那一刻**就定下来的值:没有密钥、没有 API headers、
+/// 没有完整 system prompt。客户端据此画 `/config`,而不是去读父会话的
+/// `config/read`——父的配置此后可能已经变了,旁支不会跟着变。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideEffectiveConfigWire {
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub preserve_thinking: bool,
+    /// 旁支恒为只读装配;这个字段随配置走是为了让前端能直说,而不是靠约定。
+    pub read_only: bool,
+    pub tool_names: Vec<String>,
+}
+
+/// `side/readItems` 的响应(一致分页快照的一页,spec §8.2)。
+///
+/// 每一页都携同一份不可变 metadata:后续页重复它不改变快照,却让「客户端只拿到
+/// 第二页」这种情形仍然有状态可画。空 `items` 的单页同样带 metadata。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct SideReadItemsResult {
+    pub items: Vec<Item>,
+    #[ts(type = "number")]
+    pub snapshot_seq: u64,
+    pub status: SideStatusWire,
+    pub usage: SideUsageWire,
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
+    /// `requestId -> turnId`。客户端重连后据此确认「那条消息到底受理了没有」,
+    /// 不重发、也不新生成 id。
+    pub accepted_requests: std::collections::BTreeMap<String, String>,
+    pub effective_config: SideEffectiveConfigWire,
+    pub snapshot_token: String,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// 旁支会话的线上类型(spec §8.1 / §8.2)。
+//
+// 命名约定与全仓一致:**请求**参数 camelCase(`#[serde(rename_all = "camelCase")]`
+// 且 `deny_unknown_fields`),**响应**字段 snake_case(serde 默认)。
+//
+// 数值一律 `#[ts(type = "number")]`:ts-rs 见到 `u64`/`i64` 会生成 `bigint`,
+// 而线上是普通 JSON number,前端也按 number 比较(同 `RequestId::Num` 与
+// `RpcError::code` 的口径)。
+// ---------------------------------------------------------------------------
+
+/// `initialize.capabilities.side_conversation_v1` 的当前值。
+///
+/// **在 Task 13 之前刻意保持 `false`。** 协议的形状(六个 RPC、四类通知)已在
+/// 本任务落地,但回放与广播要到 Task 13 才通;此时把能力位打开,前端会拿到一个
+/// 「能开旁支但收不到任何更新」的半成品。因此打开它是一个**单独的一行改动**,
+/// 且本文件有测试钉住当前值——不是靠记性。
+pub const SIDE_CONVERSATION_V1: bool = false;
+
+/// 缺省即错的「必填可空」字段。
+///
+/// `Option<T>` 加 serde 默认无法区分「键缺失」与「显式 null」:两者都解成
+/// `None`。而 `side/close` 的 `expectedActiveTurnId` 必须**显式给值**(Idle 传
+/// null、Running 传所确认的 turnId),否则客户端就无法表达「我确认过当前状态」。
+/// 所以这里要求键存在,再把 `null` 解成 `None`。
+pub fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -1494,6 +1874,259 @@ mod tests {
             !raw.contains("signature") && !raw.contains("encrypted_content"),
             "thinking item 的 wire 形状不得出现任何凭证字段: {raw}"
         );
+    }
+
+    /// The close confirmation is *required and nullable*: a missing key means the
+    /// client never confirmed the current state, an explicit null means it confirmed
+    /// "idle". `Option` alone cannot tell those apart, hence the helper.
+    #[test]
+    fn side_close_requires_explicit_nullable_confirmation() {
+        let missing = serde_json::json!({"sideId":"00000000-0000-4000-8000-000000000001"});
+        assert!(decode_side_close(missing).is_err());
+        let idle = serde_json::json!({"sideId":"00000000-0000-4000-8000-000000000001",
+            "expectedActiveTurnId":null});
+        assert!(decode_side_close(idle).is_ok());
+        let running = serde_json::json!({"sideId":"00000000-0000-4000-8000-000000000001",
+            "expectedActiveTurnId":"00000000-0000-4000-8000-000000000002"});
+        let parsed = decode_side_close(running).unwrap();
+        assert_eq!(
+            parsed.expected_active_turn_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000002")
+        );
+    }
+
+    fn decode_side_close(value: serde_json::Value) -> Result<SideCloseParams, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    /// A turn must not carry attachments: a side answer never accepts files, and
+    /// silently ignoring the field would let a client believe it did.
+    #[test]
+    fn side_turn_start_rejects_unknown_fields() {
+        let with_attachments = serde_json::json!({
+            "sideId": "00000000-0000-4000-8000-000000000001",
+            "text": "问题",
+            "clientRequestId": "00000000-0000-4000-8000-000000000002",
+            "attachments": [],
+        });
+        assert!(serde_json::from_value::<SideTurnStartParams>(with_attachments).is_err());
+    }
+
+    /// Requests are camelCase on the wire, responses snake_case. Getting this
+    /// backwards would make every client silently read nulls.
+    #[test]
+    fn side_request_and_response_field_casing() {
+        let params: SideReadItemsParams = serde_json::from_value(serde_json::json!({
+            "sideId": "s", "snapshotToken": "t", "cursor": "c"
+        }))
+        .unwrap();
+        assert_eq!(params.side_id, "s");
+        assert_eq!(params.snapshot_token.as_deref(), Some("t"));
+
+        let result = SideReadItemsResult {
+            items: Vec::new(),
+            snapshot_seq: 7,
+            status: SideStatusWire::Idle,
+            usage: SideUsageWire::default(),
+            active_turn_id: None,
+            accepted_requests: Default::default(),
+            effective_config: SideEffectiveConfigWire {
+                model: "m".into(),
+                reasoning_effort: None,
+                preserve_thinking: true,
+                read_only: true,
+                tool_names: vec!["read".into()],
+            },
+            snapshot_token: "tok".into(),
+            next_cursor: None,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["snapshot_seq"], serde_json::json!(7));
+        assert_eq!(value["snapshot_token"], serde_json::json!("tok"));
+        assert!(
+            value.get("snapshotSeq").is_none(),
+            "responses are snake_case"
+        );
+    }
+
+    /// The numeric fields must survive as plain JSON numbers (not strings) and the
+    /// TS side must see `number`, so the annotations are load-bearing.
+    #[test]
+    fn side_summary_serde_shape() {
+        let summary = crate::side_conversation::SideSummary {
+            side_id: "s".into(),
+            parent_thread_id: "p".into(),
+            status: yi_agent_runtime::side_conversation::SideStatus::Idle,
+            snapshot_revision: 3,
+            last_seq: 9,
+            active_turn_id: None,
+            expires_at: Some(1_700_000_000_000),
+            generation: 2,
+            stopping: false,
+        };
+        let wire = SideSummaryWire::from_registry(&summary);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["last_seq"], serde_json::json!(9));
+        assert_eq!(value["expires_at"], serde_json::json!(1_700_000_000_000i64));
+        assert_eq!(value["status"], serde_json::json!("idle"));
+        assert_eq!(value["parent_thread_id"], serde_json::json!("p"));
+    }
+
+    /// Every side notification must be filterable by its **parent** thread id, or it
+    /// would either be dropped for the parent's subscribers or broadcast globally.
+    #[test]
+    fn side_notifications_key_on_the_parent_thread() {
+        let summary = SideSummaryWire::from_registry(&crate::side_conversation::SideSummary {
+            side_id: "s".into(),
+            parent_thread_id: "p".into(),
+            status: yi_agent_runtime::side_conversation::SideStatus::Running,
+            snapshot_revision: 1,
+            last_seq: 1,
+            active_turn_id: Some("t".into()),
+            expires_at: None,
+            generation: 1,
+            stopping: false,
+        });
+        let cases: Vec<(Notification, &str)> = vec![
+            (
+                Notification::SideChanged {
+                    parent_thread_id: "p".into(),
+                    side_id: "s".into(),
+                    generation: 1,
+                    seq: 1,
+                    summary,
+                },
+                "side/changed",
+            ),
+            (
+                Notification::SideItemUpdated {
+                    parent_thread_id: "p".into(),
+                    side_id: "s".into(),
+                    generation: 1,
+                    seq: 2,
+                    turn_id: "t".into(),
+                    item: Item::AgentMessage {
+                        id: "i".into(),
+                        text: "x".into(),
+                    },
+                },
+                "side/itemUpdated",
+            ),
+            (
+                Notification::SideTurnCompleted {
+                    parent_thread_id: "p".into(),
+                    side_id: "s".into(),
+                    generation: 1,
+                    seq: 3,
+                    turn_id: "t".into(),
+                    status: SideStatusWire::Idle,
+                    reason: None,
+                    error: None,
+                    usage: SideUsageWire::default(),
+                },
+                "side/turnCompleted",
+            ),
+            (
+                Notification::SideClosed {
+                    parent_thread_id: "p".into(),
+                    side_id: "s".into(),
+                    generation: 1,
+                    seq: 4,
+                    reason: "user_closed".into(),
+                },
+                "side/closed",
+            ),
+        ];
+        for (notification, method) in cases {
+            let envelope = serde_json::to_value(NotificationEnvelope::new(&notification)).unwrap();
+            assert_eq!(envelope["method"], serde_json::json!(method));
+            assert_eq!(
+                envelope["params"]["parent_thread_id"],
+                serde_json::json!("p")
+            );
+            assert_eq!(envelope["params"]["side_id"], serde_json::json!("s"));
+            assert_eq!(
+                envelope["params"]["seq"],
+                serde_json::json!(notification_seq(&notification))
+            );
+            assert_eq!(notification.thread_key(), Some("p"));
+        }
+    }
+
+    fn notification_seq(notification: &Notification) -> u64 {
+        match notification {
+            Notification::SideChanged { seq, .. }
+            | Notification::SideItemUpdated { seq, .. }
+            | Notification::SideTurnCompleted { seq, .. }
+            | Notification::SideClosed { seq, .. } => *seq,
+            _ => panic!("not a side notification"),
+        }
+    }
+
+    /// The error table must be *allocated*, not guessed: every side reason gets a
+    /// code, no two reasons share one unless they deliberately reuse the existing
+    /// generic code, and none of the new codes collides with a pre-existing one.
+    #[test]
+    fn side_error_codes_are_unique_and_stable() {
+        use yi_agent_runtime::side_conversation::{SideError, SideErrorReason as R};
+        let reasons = [
+            (R::SideNotFound, -32031),
+            (R::ParentNotStarted, -32032),
+            (R::SideLimit, -32033),
+            (R::SnapshotTooLarge, -32034),
+            (R::SourceChanged, -32035),
+            (R::SideClosing, -32036),
+            (R::CloseConflict, -32037),
+            (R::SnapshotExpired, -32038),
+            (R::SideCreating, -32039),
+            (R::RequestLimit, -32040),
+            (R::ResourceLimit, -32041),
+            (R::Cancelled, -32042),
+            (R::InvalidParams, -32602),
+            (R::TurnInProgress, -32012),
+            (R::InsufficientScope, -32014),
+            (R::UnknownThread, -32011),
+        ];
+        let existing = [
+            -32700, -32600, -32601, -32602, -32603, -32001, -32010, -32011, -32012, -32013, -32014,
+            -32020, -32021, -32022, -32023, -32024, -32025, -32026, -32027,
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for (reason, expected) in reasons {
+            let error = RpcError::side(&SideError::new(reason, "x"));
+            assert_eq!(error.code, expected, "{reason:?} must map to {expected}");
+            assert_eq!(
+                error.data.as_ref().unwrap()["reason"],
+                serde_json::json!(reason.as_str()),
+                "data.reason must be the stable string"
+            );
+            // Reuse is allowed only where the reason *is* the existing failure.
+            let reuse = matches!(
+                reason,
+                R::InvalidParams | R::TurnInProgress | R::InsufficientScope | R::UnknownThread
+            );
+            if !reuse {
+                assert!(
+                    !existing.contains(&expected),
+                    "{reason:?} reuses the pre-existing code {expected}"
+                );
+            }
+            assert!(
+                seen.insert(expected, reason).is_none(),
+                "{reason:?} duplicates a code another reason already owns"
+            );
+        }
+    }
+
+    /// The capability is deliberately off until replay lands (Task 13). This pins the
+    /// current value so turning it on is a conscious one-line change.
+    ///
+    /// 常量断言正是本测试的全部意图:它抓的是「有人顺手把开关翻成 true」,而不是
+    /// 某个运行时条件。`assertions_on_constants` 在这里是误报。
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn side_capability_is_off_until_replay_lands() {
+        assert!(!SIDE_CONVERSATION_V1);
     }
 
     #[test]

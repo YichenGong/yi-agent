@@ -12,10 +12,10 @@ pub mod registry;
 pub mod source;
 
 pub use registry::{
-    ClosedSide, ParentChangeGuard, SIDE_TOMBSTONE_TTL, SIDE_TOMBSTONES, SideRegistry, SideSnapshot,
-    SideSummary,
+    ClosedSide, ParentChangeGuard, SIDE_TOMBSTONE_TTL, SIDE_TOMBSTONES, SideEffectiveConfig,
+    SideRegistry, SideSnapshot, SideSummary,
 };
 pub use source::{
     ColdParent, SIDE_COLD_ATTEMPTS, SideParentResolver, SideResolverFactory, ThreadStoreResolver,
-    assemble_cold_source, read_cold_parent, source_from_live_agent,
+    WorkspaceResolver, assemble_cold_source, read_cold_parent, source_from_live_agent,
 };

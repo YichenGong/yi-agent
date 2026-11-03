@@ -154,6 +154,7 @@ where
                 resident_dir: resident_dir.clone(),
                 skills_home: crate::server::skills_home_dir(),
                 remote_dir: crate::server::instance_home_dir(),
+                side_registry: None,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

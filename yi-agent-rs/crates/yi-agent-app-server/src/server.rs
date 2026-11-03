@@ -83,9 +83,9 @@ pub(crate) mod watchers;
 pub(crate) use crate::protocol::ResponseEnvelope;
 #[allow(unused_imports)]
 pub(crate) use rpc_io::{
-    DEVICE_REGISTRY, IMAGE_READ_CHUNK_BYTES, IMAGE_READ_MAX_BYTES, device_registry, err_response,
-    forget_ws_device, install_device_registry, ok_response, write_notification,
-    write_notification_await, write_response, ws_client_for_device,
+    DEVICE_REGISTRY, IMAGE_READ_CHUNK_BYTES, IMAGE_READ_MAX_BYTES, SideResponseSender,
+    device_registry, err_response, forget_ws_device, install_device_registry, ok_response,
+    write_notification, write_notification_await, write_response, ws_client_for_device,
 };
 #[allow(unused_imports)]
 pub(crate) use task_bridge::{
@@ -319,6 +319,13 @@ pub(crate) struct RuntimeAttachments {
     /// 实例状态根（`remote.json` / `remote-status.json` 所在目录）。可注入的
     /// 理由同 `resident_dir`：手机端项目清单必须能在测试里读隔离 tempdir。
     pub(crate) remote_dir: PathBuf,
+    /// 旁支注册表。`None` = 生产路径,由 `serve()` 按本进程的实例家目录自建;
+    /// 测试注入一份带替身 resolver 的实例,于是旁支 RPC 不必依赖真实项目目录。
+    ///
+    /// 为什么是 Option 而不是必填:`SideRegistry::new` 要 `SideHostResources`
+    /// (会真的在 `side-conversations/` 下建目录并取 flock),让每个装配点自己
+    /// 构造就等于每个测试都在真实实例根里留垃圾。生产只有一个构造点。
+    pub(crate) side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,

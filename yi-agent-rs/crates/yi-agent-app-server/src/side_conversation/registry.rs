@@ -45,15 +45,24 @@ pub const SIDE_TOMBSTONES: usize = 1024;
 pub const SIDE_TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The wire-facing summary of one side (spec §8.1).
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// This is a *wire* type. It intentionally does **not** derive ts-rs: the TS
+/// bindings are generated from `yi-agent-app-server`, which may depend on this
+/// crate's runtime but not the other way around, so a ts-rs derive here could
+/// never reach the exporter. `protocol::SideSummaryWire` mirrors it field for
+/// field, and the conversion is an exhaustive `match`/destructure, so adding a
+/// field or a status variant breaks compilation instead of silently drifting.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SideSummary {
     pub side_id: String,
     pub parent_thread_id: String,
     pub status: SideStatus,
     pub snapshot_revision: u64,
     pub last_seq: u64,
+    #[serde(default)]
     pub active_turn_id: Option<String>,
     /// Epoch milliseconds; `None` while `Creating` or `Running`.
+    #[serde(default)]
     pub expires_at: Option<i64>,
     pub generation: u64,
     /// `true` while an accepted turn has been asked to stop but has not yet proven
@@ -91,6 +100,8 @@ struct SideEntry {
     stopping: std::sync::atomic::AtomicBool,
     /// `true` once `close` entered `Closing`.
     closing: bool,
+    /// Captured once, when the side is created.
+    config: SideEffectiveConfig,
 }
 
 impl SideEntry {
@@ -160,6 +171,15 @@ impl SideRegistry {
             next_generation: AtomicU64::new(1),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// This host process's identity.
+    ///
+    /// Every transport in one process must answer with the same id, so clients can
+    /// tell "same host, reconnected" from "host restarted" without guessing. The id
+    /// lives on the resource layer because that is what a restart actually replaces.
+    pub fn host_instance_id(&self) -> &str {
+        self.resources.host_instance_id()
     }
 
     /// Create or return the parent's side.
@@ -270,6 +290,19 @@ impl SideRegistry {
             side_id.clone(),
             prepared.lease.clone() as Arc<dyn Send + Sync>,
         );
+        // Captured before the source is moved into the runner: afterwards the fixed
+        // values are only reachable through the runner, and the point of the snapshot
+        // is that it never changes again.
+        let config = SideEffectiveConfig {
+            model: source.config.model.clone(),
+            reasoning_effort: source.config.gen_params.reasoning_effort.clone(),
+            preserve_thinking: source.config.preserve_thinking,
+            tool_names: yi_agent_runtime::side_conversation::SideToolPolicy::default()
+                .allowed_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        };
         let runner = SideConversationRunner::new(side_id.clone(), source, prepared, tools)?;
         let now = tokio::time::Instant::now();
         let entry = Arc::new(Mutex::new(SideEntry {
@@ -283,6 +316,7 @@ impl SideRegistry {
             seq: AtomicU64::new(0),
             stopping: std::sync::atomic::AtomicBool::new(false),
             closing: false,
+            config,
         }));
         {
             let mut sides = self.sides.lock().await;
@@ -528,6 +562,7 @@ impl SideRegistry {
             items: guard.transcript.items(),
             usage: guard.runner.usage(),
             accepted: guard.ledger.accepted_requests().into_iter().collect(),
+            config: guard.config.clone(),
         })
     }
 
@@ -634,6 +669,22 @@ pub struct SideSnapshot {
     pub items: Vec<Arc<yi_agent_runtime::side_conversation::SideItem>>,
     pub usage: SideUsage,
     pub accepted: Vec<(String, String)>,
+    pub config: SideEffectiveConfig,
+}
+
+/// The side's configuration as fixed **at creation**, in redacted form.
+///
+/// Deliberately not read from the parent when a client asks: a side inherits its
+/// parent once, at open, and does not follow later edits. Re-reading `config/read`
+/// would answer a different question than "what is this side running with".
+///
+/// Holds no secret: no API key, no headers, no system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideEffectiveConfig {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub preserve_thinking: bool,
+    pub tool_names: Vec<String>,
 }
 
 /// A barrier around a destructive parent operation.
