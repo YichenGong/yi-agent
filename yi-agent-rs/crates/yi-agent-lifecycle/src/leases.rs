@@ -73,6 +73,12 @@ pub enum ReleaseOutcome {
 struct Lease {
     epoch: u64,
     credential: String,
+    /// What kind of frontend this is.
+    ///
+    /// Recorded because a status read has to tell a user *who* is keeping the
+    /// runtime alive ("this App, 2 TUI"), and the grant does not carry it: the
+    /// grant is what the client presents, not a description of the client.
+    kind: ClientKind,
     mode: LeaseMode,
     /// `clock.now()` value at which this lease expires without a heartbeat.
     expires_at: Duration,
@@ -125,10 +131,8 @@ impl LeaseTable {
         mode: LeaseMode,
         now: Duration,
     ) -> Result<ClientGrant, String> {
-        // `kind` is recorded by the caller's own bookkeeping; the table does not key
-        // on it, but rejecting a non-frontend kind here is the structural guard
-        // against a worker accidentally keeping a runtime alive.
-        let _ = kind;
+        // `kind` is recorded so a status read can say *who* is keeping this runtime
+        // alive; it is not a key and never affects admission.
         if self.leases.contains_key(&id) {
             return Err(format!(
                 "client {id} is already registered; call resume with its grant instead"
@@ -147,6 +151,7 @@ impl LeaseTable {
             Lease {
                 epoch,
                 credential: credential.clone(),
+                kind,
                 mode,
                 expires_at: now.saturating_add(LEASE_EXPIRY),
                 connected: true,
@@ -417,6 +422,25 @@ impl LeaseTable {
             .map(|(id, lease)| (id.clone(), lease.mode, lease.connected))
             .collect();
         rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    /// Every live lease as an owned summary, sorted by client run id.
+    ///
+    /// Carries no credential: a status reader needs to *recognise* a client, never
+    /// to act as it. Sorted for the same reason as [`Self::snapshot`] -- a page
+    /// cursor must not move because a `HashMap` rehashed.
+    pub fn client_summaries(&self) -> Vec<crate::types::ClientSummary> {
+        let mut rows: Vec<crate::types::ClientSummary> = self
+            .leases
+            .iter()
+            .map(|(id, lease)| crate::types::ClientSummary {
+                client_run_id: id.clone(),
+                kind: lease.kind,
+                mode: lease.mode,
+            })
+            .collect();
+        rows.sort_by(|left, right| left.client_run_id.cmp(&right.client_run_id));
         rows
     }
 

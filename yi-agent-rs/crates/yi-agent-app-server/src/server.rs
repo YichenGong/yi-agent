@@ -3205,6 +3205,16 @@ where
                     continue;
                 }
 
+                // 本次请求的壳授权（只有本地 stdio 的 `initialize` 写得进）。
+                // 每轮现取而不是缓存到循环外：同一连接上 `initialize` 与随后的
+                // `runtime/status` 到达顺序由客户端决定，缓存的副本可能是握手前的
+                // 空值，那样状态视图会无缘无故降级成 `Unknown`。
+                let request_shell_authorization = shell_authorizations
+                    .lock()
+                    .await
+                    .get(&client)
+                    .cloned();
+
                 // 域 handler 需要主循环的局部量;每个域臂按需构造一次
                 // [`crate::rpc::AppState`],借用到臂末(通常 `continue`)为止,故主循环
                 // 各局部量的所有权与借用关系与搬移前完全一致。
@@ -3218,6 +3228,8 @@ where
                             hub: &hub,
                             client: &client,
                             client_scope,
+                            is_remote: client != crate::broadcast::ClientId::local(),
+                            shell_authorization: request_shell_authorization.as_ref(),
                             cfg: &cfg,
                             theme_handle: &theme_handle,
                             models_path: &models_path,
@@ -3439,6 +3451,13 @@ where
                     crate::rpc::Domain::WebSearch => {
                         let mut state = app_state!();
                         match crate::rpc::websearch::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Runtime => {
+                        let mut state = app_state!();
+                        match crate::rpc::runtime::handle(&mut state, &req, id.clone()).await? {
                             crate::rpc::Flow::Continue => continue,
                             crate::rpc::Flow::Unknown => {}
                         }

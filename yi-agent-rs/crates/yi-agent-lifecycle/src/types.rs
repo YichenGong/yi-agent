@@ -275,6 +275,44 @@ pub struct ConfirmationContext {
     pub revision: ImpactRevision,
 }
 
+/// One connected client, as a status reader may see it.
+///
+/// Deliberately has no credential, no epoch and no message text: the App needs to
+/// tell a user *who* is keeping a runtime alive ("this App, 2 TUI"), and nothing
+/// beyond that belongs in a read that a UI polls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSummary {
+    pub client_run_id: ClientRunId,
+    pub kind: ClientKind,
+    pub mode: LeaseMode,
+}
+
+/// The guardian's own lightweight status answer.
+///
+/// This is the *shared* source both the app-server (`runtime/status`) and the
+/// desktop shell read, so the two cannot describe one runtime differently.
+///
+/// `counts` is always whole-runtime while `clients` is one page: a UI that showed
+/// only the page's length would say "1 client" to a runtime with twelve. That is
+/// why the two are separate fields rather than "the page is the answer".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStatusSnapshot {
+    pub identity: RuntimeIdentity,
+    /// What the guardian can verify about its own impact, without asking the
+    /// daemon. `complete` stays `false` here: the daemon's executor and plugin
+    /// rows can only be added by a preview, and a status read must not block on a
+    /// wedged business socket.
+    pub counts: ImpactCounts,
+    /// This page of clients.
+    pub clients: Vec<ClientSummary>,
+    /// Present when more clients exist beyond this page.
+    pub clients_next_cursor: Option<String>,
+    /// The switch this runtime is running, if any.
+    pub active_operation: Option<OperationStatus>,
+    /// Whether this build can perform a switch at all.
+    pub local_restart_available: bool,
+}
+
 /// Requests on the control channel (protocol v1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
@@ -332,6 +370,28 @@ pub enum ControlRequest {
         grant: ClientGrant,
         token: ConfirmationToken,
         operation_id: OperationId,
+    },
+    /// Read-only status: identity, whole-runtime counts, one page of clients, and
+    /// any switch in flight.
+    ///
+    /// Deliberately **grant-free**, and that is not an oversight:
+    ///
+    /// * It must not create or renew a lease. A UI polls this continuously, and if
+    ///   the poll were what kept a runtime alive, a user who walked away from a
+    ///   window would keep a daemon running forever.
+    /// * The app-server has to answer it too, and the app-server is forbidden to
+    ///   hold the App's renewable credential (see `shell_authorization`). Requiring
+    ///   a grant would leave the only legitimate local reader unable to ask.
+    /// * It carries no secret: client run ids are names, and the credential lives
+    ///   in `ClientGrant` alone. The access boundary is the socket itself (0600
+    ///   inside a 0700 directory), not this frame.
+    Status {
+        /// Opaque `client_run_id` to resume the client page after.
+        ///
+        /// A cursor rather than an offset because offsets shift under insertion:
+        /// a client registering between two page reads would make page 2 repeat or
+        /// skip a row.
+        cursor: Option<String>,
     },
 }
 
@@ -393,6 +453,13 @@ pub enum ControlResponse {
     Confirmed {
         operation_id: OperationId,
     },
+    /// The answer to [`ControlRequest::Status`].
+    ///
+    /// Boxed because a status snapshot (identity + counts + a page of clients) is
+    /// an order of magnitude larger than the smallest reply on this channel, and
+    /// every reply would otherwise be sized for the biggest one. The frame is
+    /// encoded and dropped immediately, so one indirection costs nothing.
+    Status(Box<RuntimeStatusSnapshot>),
 }
 
 /// A portable description of a bundled daemon artifact, emitted at build time and

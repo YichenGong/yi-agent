@@ -45,6 +45,35 @@ pub struct ShellAuthorization {
     /// exists to make "this key was set by the bridge" a fact the initialize
     /// handler can check instead of inferring it from client type alone.
     pub issued_by_shell: bool,
+    /// The runtime artifact this shell shipped with, when it could verify one.
+    ///
+    /// This is what makes `runtime/status` able to answer "is the running runtime
+    /// the build I expect?" without asking the WebView and without falling back to
+    /// the wrapper's version number. It is identity, not authority: it names bytes,
+    /// cannot be renewed, and grants nothing -- a session that lies about it only
+    /// gets a wrong banner about its own project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_runtime: Option<ExpectedRuntime>,
+}
+
+/// The artifact identity the shell was built against, as the sidecar needs it.
+///
+/// A local mirror of `yi_agent_lifecycle::types::ArtifactIdentity` reduced to what
+/// a comparison actually uses. The app-server could not reuse that struct directly
+/// without exporting it to TypeScript, and this one never crosses that boundary: it
+/// is read on the handshake and thrown away.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedRuntime {
+    /// The daemon artifact's build id. Never the wrapper's version.
+    pub build_id: String,
+    /// The user-facing version that goes with `build_id`.
+    pub display_version: String,
+    pub schema_min: u32,
+    pub schema_max: u32,
+    pub business_protocol_min: u32,
+    pub business_protocol_max: u32,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 impl ShellAuthorization {
@@ -55,7 +84,14 @@ impl ShellAuthorization {
             scope_key: None,
             daemon_instance_id: None,
             issued_by_shell: true,
+            expected_runtime: None,
         }
+    }
+
+    /// The same authorization, carrying the artifact this shell shipped with.
+    pub fn expecting(mut self, expected: ExpectedRuntime) -> Self {
+        self.expected_runtime = Some(expected);
+        self
     }
 
     /// The same authorization, narrowed to one project.
@@ -86,6 +122,15 @@ impl ShellAuthorization {
             .is_some_and(|key| key.trim().is_empty())
         {
             return Err("shell authorization has an empty scope key".to_string());
+        }
+        // An expectation with an empty build id would classify every runtime as a
+        // mismatch; better to have no opinion than a wrong one.
+        if self
+            .expected_runtime
+            .as_ref()
+            .is_some_and(|expected| expected.build_id.trim().is_empty())
+        {
+            return Err("shell authorization has an empty expected build id".to_string());
         }
         Ok(self)
     }
@@ -169,6 +214,7 @@ mod tests {
         assert_eq!(parsed.scope_key.as_deref(), Some("/p/.yi-agent/runtime"));
         assert_eq!(parsed.daemon_instance_id.as_deref(), Some("daemon-7"));
         assert!(parsed.issued_by_shell);
+        assert!(parsed.expected_runtime.is_none());
     }
 
     /// Before the user opens a project the App is still one identifiable client;
@@ -180,12 +226,74 @@ mod tests {
         assert!(authorization.scope_key.is_none());
     }
 
+    /// The expectation travels without a credential and survives the handshake.
+    ///
+    /// This is the value that lets the status view say "same build" instead of
+    /// `Unknown`, so it must round-trip exactly -- but it is not authority, and the
+    /// secret test below still applies to it.
+    #[test]
+    fn the_expected_artifact_round_trips() {
+        let params = serde_json::json!({
+            "shellAuthorization": {
+                "client_run_id": "app-run-1",
+                "issued_by_shell": true,
+                "expected_runtime": {
+                    "build_id": "0123456789abcdef",
+                    "display_version": "0.2.0",
+                    "schema_min": 1,
+                    "schema_max": 16,
+                    "business_protocol_min": 1,
+                    "business_protocol_max": 1,
+                    "capabilities": ["lease.v1", "control.v1"],
+                }
+            }
+        });
+        let parsed = from_initialize_params(&params).expect("a valid authorization");
+        let expected = parsed
+            .expected_runtime
+            .clone()
+            .expect("the expectation must survive");
+        assert_eq!(expected.build_id, "0123456789abcdef");
+        assert_eq!(expected.display_version, "0.2.0");
+        assert_eq!(expected.schema_max, 16);
+        assert_eq!(expected.capabilities.len(), 2);
+
+        let again = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(again["expected_runtime"]["build_id"], "0123456789abcdef");
+    }
+
+    /// An expectation the shell cannot substantiate is worse than none: it would
+    /// label every runtime a mismatch. The empty id is refused at accept time.
+    #[test]
+    fn an_empty_expected_build_id_is_refused() {
+        let mut authorization = good();
+        authorization.expected_runtime = Some(ExpectedRuntime {
+            build_id: "  ".to_string(),
+            display_version: "0.2.0".to_string(),
+            schema_min: 1,
+            schema_max: 16,
+            business_protocol_min: 1,
+            business_protocol_max: 1,
+            capabilities: Vec::new(),
+        });
+        assert!(authorization.accept(true).is_err());
+    }
+
     /// No credential may cross the pipe: what the shell sends is identity, and a
     /// credential in this struct would end up in argv-adjacent logs and in tool
     /// environments.
     #[test]
     fn nothing_secret_is_serialized() {
-        let json = serde_json::to_string(&good()).unwrap();
+        let with_expectation = good().expecting(ExpectedRuntime {
+            build_id: "0123456789abcdef".to_string(),
+            display_version: "0.2.0".to_string(),
+            schema_min: 1,
+            schema_max: 16,
+            business_protocol_min: 1,
+            business_protocol_max: 1,
+            capabilities: vec!["lease.v1".to_string()],
+        });
+        let json = serde_json::to_string(&with_expectation).unwrap();
         assert!(!json.contains("credential"));
         assert!(!json.contains("secret"));
         assert!(!json.contains("token"));

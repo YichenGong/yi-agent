@@ -739,7 +739,7 @@ fn no_clients_after_stop_is_not_ready() {
 - Tauri 命令 `runtime_status(scope_key)`、`runtime_preview(scope_key)`、`runtime_confirm(scope_key, token, operation_id)`、`runtime_operation(scope_key, operation_id)`；它们从壳状态取当前配套 ArtifactIdentity，不接受 WebView 提交任意 executable／build target。桌面壳持有待查 operation ID，即使 WebView 刷新也能从 status 找回已有操作。
 - 跨 websocket／relay 的 app-server 不新增 Confirm／Kill RPC；远端展示状态但 `local_restart_available=false`。
 
-- [ ] **Step 1:** 在 app-server 测试中遍历同构建、不同兼容、业务不兼容／控制兼容、unknown、legacy 的矩阵；已有业务 Error 响应不能被识别成 healthy。禁止 RPC 路由断言：
+- [x] **Step 1:** 在 app-server 测试中遍历同构建、不同兼容、业务不兼容／控制兼容、unknown、legacy 的矩阵；已有业务 Error 响应不能被识别成 healthy。禁止 RPC 路由断言：
 
 ```rust
 #[test]
@@ -752,10 +752,10 @@ fn destructive_restart_is_not_a_remote_rpc_method() {
 
 `is_read_only_runtime_method(&str) -> bool` 在本任务实现；另用真实 dispatcher 断言该破坏性 method 返回 MethodNotFound，不能只测字符串函数。
 
-- [ ] **Step 2:** 运行 `cargo test -p yi-agent-app-server runtime_status`，确认旧 dispatcher／类型无新能力。
-- [ ] **Step 3:** app-server 只传项目接线与状态，不持 App 续租凭据。桌面控制命令只接受本机已解析 scope，target 固定当前 sidecar；本地 legacy preview 不绕过迁移阻断，不把 LLM 未注册当作同 UID OS 沙箱。
-- [ ] **Step 4:** DTO 沿用 ts-rs 生成约定；在 app-server protocol 定义轻量 view 转换，`RuntimeRestartPreviewView`、`RuntimeOperationStatusView` 以 ts rename 分别导出 `RestartPreview`、`OperationStatus`，状态 DTO 导出 `RuntimeStatusView`。字段逐项对应 lifecycle DTO（包含 revision 双分量、完整 counts、分页 cursor 和 active operation），桌面命令返回同形序列化 view，不向 app-server dispatcher 新增破坏性 RPC。运行 `cargo test -p yi-agent-app-server export_bindings` 后只提交生成物，不手写另一套 TS 类型。lifecycle 不引入 ts-rs／app-server 依赖；新增 roundtrip 测试防止 view 丢字段。
-- [ ] **Step 5:** 测试通知去凭据、API key、消息正文；状态请求没有隐式 register／heartbeat；运行 `just bindings-check`、桌面 Rust 测试及 §0.4，提交 `feat: expose runtime compatibility status and local restart controls`。
+- [x] **Step 2:** 运行 `cargo test -p yi-agent-app-server runtime_status`，确认旧 dispatcher／类型无新能力。
+- [x] **Step 3:** app-server 只传项目接线与状态，不持 App 续租凭据。桌面控制命令只接受本机已解析 scope，target 固定当前 sidecar；本地 legacy preview 不绕过迁移阻断，不把 LLM 未注册当作同 UID OS 沙箱。
+- [x] **Step 4:** DTO 沿用 ts-rs 生成约定；在 app-server protocol 定义轻量 view 转换，`RuntimeRestartPreviewView`、`RuntimeOperationStatusView` 以 ts rename 分别导出 `RestartPreview`、`OperationStatus`，状态 DTO 导出 `RuntimeStatusView`。字段逐项对应 lifecycle DTO（包含 revision 双分量、完整 counts、分页 cursor 和 active operation），桌面命令返回同形序列化 view，不向 app-server dispatcher 新增破坏性 RPC。运行 `cargo test -p yi-agent-app-server export_bindings` 后只提交生成物，不手写另一套 TS 类型。lifecycle 不引入 ts-rs／app-server 依赖；新增 roundtrip 测试防止 view 丢字段。
+- [x] **Step 5:** 测试通知去凭据、API key、消息正文；状态请求没有隐式 register／heartbeat；运行 `just bindings-check`、桌面 Rust 测试及 §0.4，提交 `feat: expose runtime compatibility status and local restart controls`。
 
 ## Task 17: App 持续版本提示、二次确认与操作状态 UI
 

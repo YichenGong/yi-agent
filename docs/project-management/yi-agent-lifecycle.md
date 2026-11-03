@@ -133,7 +133,44 @@
   `a_disconnected_client_is_pending_not_gone`、
   `a_stale_epoch_eof_does_not_clear_the_current_connection`；
   变异验证：让 `disconnected` 递增 revision → 对应用例红
-- [ ] 预览／确认／状态**客户端方法**与本地桌面壳入口 — 见 Task 16、17
+- [x] 预览／确认／状态客户端方法与本地桌面壳入口（Task 16） — `client.rs` 的
+  `FrontendLease::{preview, confirm, operation}` 与 `types.rs` 的
+  `ControlRequest::Status`／`ControlResponse::Status(Box<RuntimeStatusSnapshot>)`。
+  `Status` **刻意不要求 grant**：状态轮询不能隐式注册或续租租约，而 app-server 不允许
+  持有 App 的可续租凭据；边界由 0700 目录 + 0600 控制 socket 提供，不由该帧携带秘密。
+  `Status` 负载装箱是因为一个快照比该通道最小的应答大一个数量级，否则每个应答都要按最大
+  的那个分配。`Lease` 记住 `kind`，`client_summaries()` 按 `client_run_id` 排序输出，
+  分页只取一页而 `counts` 始终是全量。判据：`cargo test -p yi-agent-lifecycle`
+  （33 lib + 21 `client_leases` + 3 `bundled_manifest` passed）
+- [x] 桌面壳的只读状态与本地重启控制命令（Task 16） — `desktop/src-tauri/src/runtime_lifecycle.rs`
+  的 `runtime_status`／`runtime_preview`／`runtime_confirm`／`runtime_operation`
+  （+ `runtime_active_operation` 供 WebView 刷新后恢复轮询）。三条边界都能被验证：
+  (1) **target 固定为壳自己的产物**，`preview` 只从 `DesktopRuntimeManager::artifact`
+  取，未验证的构建（`tauri dev` 无清单）直接 `Unsupported`，绝不接受 WebView 提交路径；
+  (2) **scope 只做查表**，`registered_scope` 从 `registered_projects()` 里找，凭空的 key
+  得到「not open in this app」而不是一次指向任意目录的控制请求；(3) **operation id 在
+  请求发出前就记下**，传输失败才撤销（失败的请求不是运行时接受的操作，留着会让 UI 轮询
+  一个不存在的 id），成功后保留供重载恢复。判据：
+  `cargo test --manifest-path desktop/src-tauri/Cargo.toml`
+  （205 lib passed，含 `preview_always_targets_the_shells_own_artifact`、
+  `an_unverified_shell_cannot_preview_a_restart`、
+  `a_lost_confirmation_keeps_its_operation_id_for_recovery`、
+  `a_confirmed_operation_is_remembered_for_a_reload`、
+  `status_is_read_only_and_does_not_need_a_lease`、
+  `a_matching_artifact_is_reported_as_the_same_build`、
+  `no_answer_is_an_unknown_view_with_an_explanation`、
+  `an_unregistered_scope_is_refused_rather_than_looked_up`）
+- [x] 壳把「自己配套的产物身份」经本地握手交给 app-server（Task 16） —
+  `shell_authorization.rs` 的 `ExpectedRuntime` 字段 + `DesktopRuntimeManager::artifact`。
+  这是 `runtime/status` 能回答「是不是同一个 build」的唯一来源：没有它，配套正确的一对
+  也会显示 `Unknown`。它**只是身份**——命名字节、不可续租、不授权任何东西，说谎只会得到
+  自己项目的错误横幅；空 build id 在 `accept()` 被拒（一个空期望会把每个运行时都标成
+  不匹配）。`expected_runtime` 只随本地 stdio 的 `initialize` 走一次。判据：
+  `cargo test -p yi-agent-app-server --lib shell_authorization`（11 passed，含
+  `the_expected_artifact_round_trips`、`an_empty_expected_build_id_is_refused`、
+  `nothing_secret_is_serialized`）；`cargo test --manifest-path
+  desktop/src-tauri/Cargo.toml` 的 `a_local_initialize_carries_the_shell_identity`、
+  `an_unverified_shell_sends_no_artifact_expectation`
 - [x] 受管进程 spawn 客户端（`managed/{client,fdpass}.rs`） — 工具侧通过 guardian 签发的私有
   owner-bound 连接启动进程：`ManagedSpawnClient::connect(OwnedFd)` 接管一条已有连接（没有可连的路径，
   连接只能由 guardian 交给它），`spawn` 把 stdin／stdout／stderr 三个**独立** FD 用 `SCM_RIGHTS`

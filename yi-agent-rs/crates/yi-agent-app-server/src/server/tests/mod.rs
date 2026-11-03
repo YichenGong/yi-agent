@@ -2831,6 +2831,8 @@ mod plugin_theme;
 #[cfg(test)]
 mod process;
 #[cfg(test)]
+mod runtime_status;
+#[cfg(test)]
 mod thread_index;
 #[cfg(test)]
 mod thread_lifecycle;

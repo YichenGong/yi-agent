@@ -5101,6 +5101,7 @@ dependencies = [
  "wiremock",
  "yi-agent-core",
  "yi-agent-flags",
+ "yi-agent-lifecycle",
  "yi-agent-mcp",
  "yi-agent-power",
  "yi-agent-relay",

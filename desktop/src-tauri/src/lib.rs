@@ -61,7 +61,12 @@ pub fn run() {
             runtime_lifecycle::runtime_acquire_project,
             runtime_lifecycle::runtime_release_project,
             runtime_lifecycle::runtime_registered_projects,
-            runtime_lifecycle::runtime_quit_outcome
+            runtime_lifecycle::runtime_quit_outcome,
+            runtime_lifecycle::runtime_status,
+            runtime_lifecycle::runtime_preview,
+            runtime_lifecycle::runtime_confirm,
+            runtime_lifecycle::runtime_operation,
+            runtime_lifecycle::runtime_active_operation
         ])
         .setup(|app| {
             // 先装生命周期状态：`spawn` 起的监督循环与窗口事件都可能立刻用到它。

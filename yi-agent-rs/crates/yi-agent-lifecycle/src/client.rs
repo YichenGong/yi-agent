@@ -322,6 +322,99 @@ impl FrontendLease {
         }
     }
 
+    /// Reads the impact a replacement with `target` would have.
+    ///
+    /// Read-only at the runtime: it takes no barrier and starts no drain, so a
+    /// preview the user then cancels cannot have disturbed anything.
+    pub fn preview(
+        &self,
+        target: types::ArtifactIdentity,
+        deadline: &Deadline,
+    ) -> io::Result<types::RestartPreview> {
+        self.request_control(
+            types::ControlRequest::Preview {
+                grant: self.grant.clone(),
+                target,
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::Preview(preview) => Ok(preview),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("preview", code, &reason))
+            }
+            types::ControlResponse::Unsupported { detail } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this runtime build cannot preview a switch: {detail}"),
+            )),
+            other => Err(unexpected("preview", &other)),
+        })
+    }
+
+    /// Consumes a preview token and binds the switch to `operation_id`.
+    ///
+    /// `operation_id` is chosen by the caller *before* the click so a lost response
+    /// is recovered by querying that id, never by sending a second confirmation.
+    pub fn confirm(
+        &self,
+        token: &str,
+        operation_id: &str,
+        deadline: &Deadline,
+    ) -> io::Result<types::OperationId> {
+        self.request_control(
+            types::ControlRequest::Confirm {
+                grant: self.grant.clone(),
+                token: token.to_string(),
+                operation_id: operation_id.to_string(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::Confirmed { operation_id } => Ok(operation_id),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("confirmation", code, &reason))
+            }
+            other => Err(unexpected("confirmation", &other)),
+        })
+    }
+
+    /// One read of an operation's progress. `Ok(None)` means this runtime never ran
+    /// it, which a restarted guardian answers honestly rather than inventing a
+    /// failure.
+    pub fn operation(
+        &self,
+        operation_id: &str,
+        deadline: &Deadline,
+    ) -> io::Result<Option<types::OperationStatus>> {
+        self.request_control(
+            types::ControlRequest::Operation {
+                grant: self.grant.clone(),
+                operation_id: operation_id.to_string(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::Operation(status) => Ok(status),
+            types::ControlResponse::Unsupported { detail } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this runtime build cannot report operations: {detail}"),
+            )),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("operation query", code, &reason))
+            }
+            other => Err(unexpected("operation query", &other)),
+        })
+    }
+
+    fn request_control(
+        &self,
+        request: types::ControlRequest,
+        deadline: &Deadline,
+    ) -> io::Result<types::ControlResponse> {
+        let mut client = ControlClient::connect(&self.control_path, deadline)?;
+        client.request(&request, deadline)
+    }
+
     /// Polls a release until it finishes or `budget` runs out.
     ///
     /// A timeout is `Ok(None)` rather than an error: the shell is quitting and the
@@ -415,6 +508,21 @@ fn sleep_until_due(total: Duration, stop: &std::sync::atomic::AtomicBool) -> boo
         slept += this;
     }
     !stop.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A refusal the runtime made on purpose: permission or state, never transport.
+fn refused(what: &str, code: types::ControlErrorCode, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("the runtime refused the {what}: {code:?}: {reason}"),
+    )
+}
+
+fn unexpected(what: &str, response: &types::ControlResponse) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the runtime answered a {what} with {response:?}"),
+    )
 }
 
 fn renew(path: &Path, grant: &types::ClientGrant) -> io::Result<()> {

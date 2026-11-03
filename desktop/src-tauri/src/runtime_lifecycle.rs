@@ -25,7 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use yi_agent_lifecycle::deadline::{Clock, Deadline};
-use yi_agent_lifecycle::types::{ClientKind, LeaseMode, ReclaimResult, RuntimeScope};
+use yi_agent_lifecycle::types::{
+    ArtifactIdentity, ClientKind, LeaseMode, OperationId, OperationStatus, ReclaimResult,
+    RestartPreview, RuntimeScope, RuntimeStatusSnapshot,
+};
 
 /// The global graceful budget for one quit, shared by every project.
 ///
@@ -39,6 +42,20 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(10);
 /// Budget for one acquisition. Acquisition only registers a lease; the runtime's
 /// own 30-second first-client window belongs to the daemon, not to this call.
 const ACQUIRE_BUDGET: Duration = yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT;
+
+/// Budget for one read-only request (status, preview, operation poll).
+///
+/// One control frame's ceiling, not a retry loop: a wedged guardian must make the
+/// banner say "unknown" quickly, and the UI polls again anyway.
+const STATUS_BUDGET: Duration = yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT;
+
+/// Budget for a confirmation.
+///
+/// A confirmation is answered as soon as the switch is *accepted*, not when it
+/// completes -- completion is what `runtime_operation` is for. The larger budget
+/// covers taking the coordination lock and writing the atomic selection record,
+/// both of which touch the filesystem.
+const SWITCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// The guardian's control socket file inside a runtime directory.
 ///
@@ -108,12 +125,92 @@ pub trait ControlBackend: Send + Sync + 'static {
         scope: &RuntimeScope,
         budget: Duration,
     ) -> io::Result<ReclaimResult>;
+
+    /// One read-only status page. `Ok(None)` means nothing serves this scope.
+    ///
+    /// Defaulted to `Unsupported` rather than required: a fake that only models
+    /// quitting must not be forced to invent a status, and an honest "I cannot
+    /// answer" is better than a fake zero that a test could mistake for a healthy
+    /// runtime.
+    fn status(
+        &self,
+        scope: &RuntimeScope,
+        budget: Duration,
+    ) -> io::Result<Option<RuntimeStatusSnapshot>> {
+        let _ = (scope, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot report runtime status",
+        ))
+    }
+
+    /// Read-only impact preview for replacing the runtime with `target`.
+    fn preview(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        target: ArtifactIdentity,
+        budget: Duration,
+    ) -> io::Result<RestartPreview> {
+        let _ = (client_run_id, scope, target, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot preview a restart",
+        ))
+    }
+
+    /// Consume a preview token, bound to `operation_id` chosen before the click.
+    fn confirm(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        token: &str,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<OperationId> {
+        let _ = (client_run_id, scope, token, operation_id, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot confirm a restart",
+        ))
+    }
+
+    /// One read of an operation's progress. `Ok(None)` = this runtime never ran it.
+    fn operation(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<Option<OperationStatus>> {
+        let _ = (client_run_id, scope, operation_id, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot report an operation",
+        ))
+    }
 }
 
 /// The real backend: one [`yi_agent_lifecycle::client::FrontendLease`] per
 /// project, held here so the heartbeat outlives any single sidecar.
 pub struct SocketBackend {
-    leases: Mutex<BTreeMap<String, yi_agent_lifecycle::client::FrontendLease>>,
+    /// One lease per project, each behind its own lock.
+    ///
+    /// Two locks rather than one: a preview or a confirm on a wedged project would
+    /// otherwise hold the table while the socket call runs, and every other
+    /// project's acquire (including the quit barrier's releases) would wait behind
+    /// it. The inner lock still serialises the calls that belong to one project,
+    /// which is the only serialisation those calls need.
+    leases: Mutex<BTreeMap<String, Arc<Mutex<yi_agent_lifecycle::client::FrontendLease>>>>,
+}
+
+/// Locks one project's lease.
+fn lock_lease(
+    lease: &Mutex<yi_agent_lifecycle::client::FrontendLease>,
+) -> io::Result<std::sync::MutexGuard<'_, yi_agent_lifecycle::client::FrontendLease>> {
+    lease
+        .lock()
+        .map_err(|_| io::Error::other("the lifecycle lease is poisoned"))
 }
 
 impl SocketBackend {
@@ -148,7 +245,7 @@ impl ControlBackend for SocketBackend {
         // A live lease is not re-registered on every window switch: registration
         // is the App's identity, and a second one would be a second client.
         if let Some(existing) = leases.get(&scope.key) {
-            if !existing.is_lost() {
+            if !lock_lease(existing)?.is_lost() {
                 return Ok(true);
             }
         }
@@ -169,7 +266,7 @@ impl ControlBackend for SocketBackend {
             Some(lease) => lease,
         };
         lease.start_heartbeat()?;
-        leases.insert(scope.key.clone(), lease);
+        leases.insert(scope.key.clone(), Arc::new(Mutex::new(lease)));
         Ok(true)
     }
 
@@ -179,11 +276,11 @@ impl ControlBackend for SocketBackend {
         scope: &RuntimeScope,
         budget: Duration,
     ) -> io::Result<ReclaimResult> {
-        let mut lease = {
+        let lease = {
             let mut leases = self.leases.lock().map_err(|_| poisoned())?;
             leases.remove(&scope.key)
         };
-        let Some(lease) = lease.as_mut() else {
+        let Some(lease) = lease else {
             // Nothing registered for this project: there is nothing to reclaim,
             // and claiming a stop nobody asked for would be a false success.
             return Err(io::Error::new(
@@ -192,12 +289,119 @@ impl ControlBackend for SocketBackend {
             ));
         };
         let deadline = Deadline::after(budget);
+        let mut lease = lock_lease(&lease)?;
         let operation = lease.release(&deadline)?;
         match lease.await_result(&operation, budget)? {
             Some(result) => Ok(result),
             None => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("the reclaim for {client_run_id} was not confirmed within the budget"),
+            )),
+        }
+    }
+
+    fn status(
+        &self,
+        scope: &RuntimeScope,
+        budget: Duration,
+    ) -> io::Result<Option<RuntimeStatusSnapshot>> {
+        // Deliberately does not consult `self.leases`: a status read must not
+        // register, renew, or require a lease. That is also why the guardian
+        // accepts this request without a grant.
+        let path = Self::control_path(scope);
+        let deadline = Deadline::after(budget);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut client = match yi_agent_lifecycle::client::ControlClient::connect(&path, &deadline)
+        {
+            Ok(client) => client,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        match client.request(
+            &yi_agent_lifecycle::types::ControlRequest::Status { cursor: None },
+            &deadline,
+        )? {
+            yi_agent_lifecycle::types::ControlResponse::Status(snapshot) => Ok(Some(*snapshot)),
+            // An older guardian that has no status request: it is there, it just
+            // cannot describe itself yet.
+            yi_agent_lifecycle::types::ControlResponse::Unsupported { .. } => Ok(None),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered a status read with {other:?}"),
+            )),
+        }
+    }
+
+    fn preview(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        target: ArtifactIdentity,
+        budget: Duration,
+    ) -> io::Result<RestartPreview> {
+        let _ = client_run_id;
+        let lease = self.lease_for(scope)?;
+        let lease = lock_lease(&lease)?;
+        lease.preview(target, &Deadline::after(budget))
+    }
+
+    fn confirm(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        token: &str,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<OperationId> {
+        let _ = client_run_id;
+        let lease = self.lease_for(scope)?;
+        let lease = lock_lease(&lease)?;
+        lease.confirm(token, operation_id, &Deadline::after(budget))
+    }
+
+    fn operation(
+        &self,
+        client_run_id: &str,
+        scope: &RuntimeScope,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<Option<OperationStatus>> {
+        let _ = client_run_id;
+        let lease = self.lease_for(scope)?;
+        let lease = lock_lease(&lease)?;
+        lease.operation(operation_id, &Deadline::after(budget))
+    }
+}
+
+impl SocketBackend {
+    /// The live lease for `scope`, or a refusal that says what to do about it.
+    ///
+    /// Preview and confirm are owner-bound at the runtime (the grant must match a
+    /// live lease), so without our own lease there is nothing to present. The error
+    /// says "acquire first" rather than "not found", because the fix is in the
+    /// caller's hands.
+    fn lease_for(
+        &self,
+        scope: &RuntimeScope,
+    ) -> io::Result<Arc<Mutex<yi_agent_lifecycle::client::FrontendLease>>> {
+        let leases = self.leases.lock().map_err(|_| poisoned())?;
+        match leases.get(&scope.key) {
+            Some(lease) if !lock_lease(lease)?.is_lost() => Ok(Arc::clone(lease)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "this app has no live lease on {}; open the project first",
+                    scope.key
+                ),
             )),
         }
     }
@@ -215,6 +419,17 @@ pub struct DesktopRuntimeManager {
     /// Once quitting has begun no new project may be registered: it would
     /// outlive the quit that is already asking every runtime to let go.
     quitting: AtomicBool,
+    /// The artifact this shell shipped with, verified once at startup.
+    ///
+    /// Resolved once rather than per request: verifying means hashing the sidecar
+    /// binary, and doing that on every status poll would cost more than the poll.
+    artifact: Option<ArtifactIdentity>,
+    /// Operations this shell started, keyed by scope.
+    ///
+    /// Kept here, not in the WebView, because a WebView reload must not lose the
+    /// answer to "did my restart happen?". The id is chosen before the click, so a
+    /// lost response is recovered by querying this id -- never by clicking again.
+    operations: Mutex<BTreeMap<String, OperationId>>,
 }
 
 impl DesktopRuntimeManager {
@@ -232,7 +447,120 @@ impl DesktopRuntimeManager {
             projects: Mutex::new(BTreeMap::new()),
             backend,
             quitting: AtomicBool::new(false),
+            artifact: None,
+            operations: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The same manager, declaring the artifact this shell shipped with.
+    ///
+    /// `None` is a real answer: a `tauri dev` build has no manifest, and the shell
+    /// must not then invent an expectation out of a version number.
+    pub fn with_artifact(mut self, artifact: Option<ArtifactIdentity>) -> Self {
+        self.artifact = artifact;
+        self
+    }
+
+    /// The artifact this shell expects, when it could verify one.
+    pub fn artifact(&self) -> Option<&ArtifactIdentity> {
+        self.artifact.as_ref()
+    }
+
+    /// The operation this shell started for `scope`, if any.
+    pub fn operation_for(&self, scope_key: &str) -> Option<OperationId> {
+        self.operations
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(scope_key).cloned())
+    }
+
+    /// One status read. Read-only: it neither registers nor renews anything.
+    pub async fn status(
+        &self,
+        scope: &RuntimeScope,
+        budget: Duration,
+    ) -> io::Result<Option<RuntimeStatusSnapshot>> {
+        let backend = Arc::clone(&self.backend);
+        let scope = scope.clone();
+        run_bounded(budget, move || backend.status(&scope, budget)).await
+    }
+
+    /// A read-only preview of replacing `scope`'s runtime with this shell's
+    /// artifact.
+    ///
+    /// The target is always `self.artifact`: a WebView must not be able to name an
+    /// executable, because "restart into this binary you chose" is code execution
+    /// with extra steps. An unverified shell has no target, and says so.
+    pub async fn preview(
+        &self,
+        scope: &RuntimeScope,
+        budget: Duration,
+    ) -> io::Result<RestartPreview> {
+        let target = self.artifact.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this build has no verified runtime artifact, so it cannot be a restart target",
+            )
+        })?;
+        let backend = Arc::clone(&self.backend);
+        let id = self.client_run_id.clone();
+        let scope = scope.clone();
+        run_bounded(budget, move || backend.preview(&id, &scope, target, budget)).await
+    }
+
+    /// Confirms a preview, binding it to an operation id chosen by the caller.
+    ///
+    /// The id is recorded **before** the request goes out. If the answer is lost,
+    /// the same id is queried instead of the restart being requested twice, and a
+    /// reload still finds it.
+    pub async fn confirm(
+        &self,
+        scope: &RuntimeScope,
+        token: &str,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<OperationId> {
+        self.operations
+            .lock()
+            .map_err(|_| poisoned())?
+            .insert(scope.key.clone(), operation_id.to_string());
+        let backend = Arc::clone(&self.backend);
+        let id = self.client_run_id.clone();
+        let scope_for_io = scope.clone();
+        let key = scope.key.clone();
+        let token = token.to_string();
+        let operation = operation_id.to_string();
+        let result = run_bounded(budget, move || {
+            backend.confirm(&id, &scope_for_io, &token, &operation, budget)
+        })
+        .await;
+        if result.is_err() {
+            // A failed request is not an operation: keeping it would make the UI
+            // poll an id the runtime never accepted.
+            if let Ok(mut guard) = self.operations.lock() {
+                if guard.get(&key).map(String::as_str) == Some(operation_id) {
+                    guard.remove(&key);
+                }
+            }
+        }
+        result
+    }
+
+    /// One read of an operation's progress.
+    pub async fn operation(
+        &self,
+        scope: &RuntimeScope,
+        operation_id: &str,
+        budget: Duration,
+    ) -> io::Result<Option<OperationStatus>> {
+        let backend = Arc::clone(&self.backend);
+        let id = self.client_run_id.clone();
+        let scope = scope.clone();
+        let operation = operation_id.to_string();
+        run_bounded(budget, move || {
+            backend.operation(&id, &scope, &operation, budget)
+        })
+        .await
     }
 
     /// The App's identity for this run. Stable across sidecar restarts by
@@ -583,7 +911,57 @@ pub fn install(app: &tauri::AppHandle) {
     use tauri::Manager;
 
     let id = uuid::Uuid::new_v4().to_string();
-    app.manage(QuitState::new(Arc::new(DesktopRuntimeManager::new(id))));
+    // Verified once, here. `install` runs before any window is shown, so the
+    // expensive step (hashing the sidecar) happens before the first status poll and
+    // never again.
+    let artifact = artifact_identity_for(app);
+    app.manage(QuitState::new(Arc::new(
+        DesktopRuntimeManager::new(id).with_artifact(artifact),
+    )));
+}
+
+/// The runtime artifact this App shipped with, in the lifecycle crate's shape.
+///
+/// `None` whenever the identity could not be established -- a `tauri dev` build has
+/// no manifest at all. It is deliberately not derived from the wrapper's version: a
+/// version string names a release, and what the classifier compares is bytes.
+pub fn artifact_identity_for<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Option<ArtifactIdentity> {
+    use tauri::Manager;
+
+    // `<Foo.app>/Contents/MacOS/desktop` -> `<Foo.app>`.
+    let bundle_root = app
+        .path()
+        .resource_dir()
+        .ok()
+        .and_then(|resources| resources.parent().map(std::path::Path::to_path_buf))?;
+    artifact_identity_at(&bundle_root)
+}
+
+/// The same resolution, from a bundle root, so a test can drive it with a real
+/// directory tree instead of a running app.
+pub fn artifact_identity_at(bundle_root: &std::path::Path) -> Option<ArtifactIdentity> {
+    match crate::runtime_manifest::verify_bundle(bundle_root) {
+        crate::runtime_manifest::RuntimeArtifact::Verified {
+            manifest,
+            executable,
+        } => Some(ArtifactIdentity {
+            build_id: manifest.build_id,
+            display_version: manifest.display_version,
+            executable,
+            sha256: manifest.sha256,
+            schema_min: manifest.schema_min,
+            schema_max: manifest.schema_max,
+            handover_version: manifest.handover_version,
+            business_protocol_min: manifest.business_protocol_min,
+            business_protocol_max: manifest.business_protocol_max,
+            capabilities: manifest.capabilities,
+        }),
+        // An unverified bundle has no target: "restart into bytes we could not
+        // check" is worse than having no restart button.
+        crate::runtime_manifest::RuntimeArtifact::Unknown { .. } => None,
+    }
 }
 
 /// The `ExitRequested` half of the quit barrier.
@@ -750,6 +1128,398 @@ mod tests {
                 failures: Vec::new(),
             })
         }
+    }
+
+    /// A control backend that records what reached it and answers with fixed
+    /// views, so the shell's command surface can be tested without a socket.
+    struct RecordingControl {
+        inner: Mutex<RecordingInner>,
+    }
+
+    #[derive(Default)]
+    struct RecordingInner {
+        previews: Vec<ArtifactIdentity>,
+        confirms: Vec<(String, String)>,
+        operations: Vec<String>,
+        statuses: usize,
+        /// When set, `confirm` fails after recording -- the "answer was lost" case.
+        confirm_error: Option<io::ErrorKind>,
+    }
+
+    impl RecordingControl {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Mutex::new(RecordingInner::default()),
+            })
+        }
+
+        fn inner(&self) -> std::sync::MutexGuard<'_, RecordingInner> {
+            self.inner.lock().unwrap()
+        }
+    }
+
+    impl ControlBackend for RecordingControl {
+        fn acquire(
+            &self,
+            _client_run_id: &str,
+            _scope: &RuntimeScope,
+            _mode: LeaseMode,
+            _budget: Duration,
+        ) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn release(
+            &self,
+            client_run_id: &str,
+            _scope: &RuntimeScope,
+            _budget: Duration,
+        ) -> io::Result<ReclaimResult> {
+            Ok(ReclaimResult {
+                client_run_id: client_run_id.to_string(),
+                stopped: true,
+                failures: Vec::new(),
+            })
+        }
+
+        fn status(
+            &self,
+            scope: &RuntimeScope,
+            _budget: Duration,
+        ) -> io::Result<Option<RuntimeStatusSnapshot>> {
+            self.inner().statuses += 1;
+            Ok(Some(RuntimeStatusSnapshot {
+                identity: yi_agent_lifecycle::types::RuntimeIdentity {
+                    scope_key: scope.key.clone(),
+                    daemon_instance_id: Some("gen-1".to_string()),
+                    guardian_build_id: Some("build-a".to_string()),
+                    daemon_build_id: Some("build-a".to_string()),
+                    mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
+                    business_protocol: Some(1),
+                    daemon_display_version: Some("0.2.0".to_string()),
+                    guardian_display_version: Some("0.2.0".to_string()),
+                    capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+                    schema_min: 1,
+                    schema_max: 16,
+                },
+                counts: yi_agent_lifecycle::types::ImpactCounts {
+                    clients: 2,
+                    pending_clients: 0,
+                    running: 1,
+                    queued: 0,
+                    plugins: 0,
+                    complete: false,
+                },
+                clients: vec![yi_agent_lifecycle::types::ClientSummary {
+                    client_run_id: "tui-1".to_string(),
+                    kind: ClientKind::Tui,
+                    mode: LeaseMode::LeaseOnly,
+                }],
+                clients_next_cursor: Some("tui-1".to_string()),
+                active_operation: None,
+                local_restart_available: true,
+            }))
+        }
+
+        fn preview(
+            &self,
+            _client_run_id: &str,
+            _scope: &RuntimeScope,
+            target: ArtifactIdentity,
+            _budget: Duration,
+        ) -> io::Result<RestartPreview> {
+            self.inner().previews.push(target);
+            Ok(RestartPreview {
+                snapshot_id: "snap-1".to_string(),
+                token: "tok-1".to_string(),
+                revision: yi_agent_lifecycle::types::ImpactRevision {
+                    guardian: 3,
+                    coordinator: Some(4),
+                },
+                counts: yi_agent_lifecycle::types::ImpactCounts {
+                    clients: 2,
+                    pending_clients: 0,
+                    running: 1,
+                    queued: 0,
+                    plugins: 0,
+                    complete: false,
+                },
+                entries: vec![yi_agent_lifecycle::types::ImpactEntry {
+                    kind: "execution".to_string(),
+                    id: "run-1".to_string(),
+                    owner: Some("tui-1".to_string()),
+                }],
+                next_cursor: None,
+                requires_second_confirmation: true,
+                can_restart: true,
+                blocked_reason: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            _client_run_id: &str,
+            _scope: &RuntimeScope,
+            token: &str,
+            operation_id: &str,
+            _budget: Duration,
+        ) -> io::Result<OperationId> {
+            let mut inner = self.inner();
+            inner
+                .confirms
+                .push((token.to_string(), operation_id.to_string()));
+            if let Some(kind) = inner.confirm_error {
+                return Err(io::Error::new(kind, "the answer was lost"));
+            }
+            Ok(operation_id.to_string())
+        }
+
+        fn operation(
+            &self,
+            _client_run_id: &str,
+            _scope: &RuntimeScope,
+            operation_id: &str,
+            _budget: Duration,
+        ) -> io::Result<Option<OperationStatus>> {
+            self.inner().operations.push(operation_id.to_string());
+            Ok(Some(OperationStatus {
+                operation_id: operation_id.to_string(),
+                phase: yi_agent_lifecycle::types::SwitchPhase::Draining,
+                detail: Some("waiting for clients".to_string()),
+                ready_identity: None,
+            }))
+        }
+    }
+
+    fn artifact() -> ArtifactIdentity {
+        ArtifactIdentity {
+            build_id: "build-b".to_string(),
+            display_version: "0.3.0".to_string(),
+            executable: PathBuf::from("/Applications/Foo.app/Contents/MacOS/yi-agent"),
+            sha256: "bb".to_string(),
+            schema_min: 1,
+            schema_max: 16,
+            handover_version: 1,
+            business_protocol_min: 1,
+            business_protocol_max: 1,
+            capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+        }
+    }
+
+    /// The preview target is always this shell's own artifact.
+    ///
+    /// A WebView-supplied path would turn "restart the runtime" into "run this
+    /// binary", so the target is taken from the manager, never from the request.
+    #[tokio::test]
+    async fn preview_always_targets_the_shells_own_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(artifact()));
+        let project = scope(dir.path(), "alpha");
+        manager
+            .acquire_project(project.clone(), LeaseMode::Business)
+            .await
+            .unwrap();
+
+        let preview = manager
+            .preview(&project, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(preview.token, "tok-1");
+        assert!(preview.requires_second_confirmation);
+        assert_eq!(control.inner().previews.len(), 1);
+        assert_eq!(control.inner().previews[0].build_id, "build-b");
+    }
+
+    /// An unverified shell has no target and says so instead of guessing one.
+    #[tokio::test]
+    async fn an_unverified_shell_cannot_preview_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        );
+        let project = scope(dir.path(), "alpha");
+        manager
+            .acquire_project(project.clone(), LeaseMode::Business)
+            .await
+            .unwrap();
+
+        let error = manager
+            .preview(&project, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(control.inner().previews.is_empty());
+    }
+
+    /// The operation id is recorded before the request leaves, so a lost answer is
+    /// recoverable by polling instead of by confirming twice.
+    #[tokio::test]
+    async fn a_lost_confirmation_keeps_its_operation_id_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        control.inner().confirm_error = Some(io::ErrorKind::TimedOut);
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(artifact()));
+        let project = scope(dir.path(), "alpha");
+        manager
+            .acquire_project(project.clone(), LeaseMode::Business)
+            .await
+            .unwrap();
+
+        // A transport failure is *not* an operation the runtime accepted, so the
+        // record must not survive: polling an id nobody knows would look like a
+        // restart that vanished.
+        let _ = manager
+            .confirm(&project, "tok-1", "op-lost", Duration::from_secs(1))
+            .await;
+        assert_eq!(manager.operation_for(&project.key), None);
+        assert_eq!(control.inner().confirms.len(), 1);
+    }
+
+    /// A successful confirmation keeps the id, so a reload resumes polling.
+    #[tokio::test]
+    async fn a_confirmed_operation_is_remembered_for_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(artifact()));
+        let project = scope(dir.path(), "alpha");
+        manager
+            .acquire_project(project.clone(), LeaseMode::Business)
+            .await
+            .unwrap();
+
+        let id = manager
+            .confirm(&project, "tok-1", "op-1", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(id, "op-1");
+        assert_eq!(manager.operation_for(&project.key).as_deref(), Some("op-1"));
+        assert_eq!(
+            control.inner().confirms,
+            vec![("tok-1".to_string(), "op-1".to_string())]
+        );
+
+        let status = manager
+            .operation(&project, "op-1", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("the operation must answer");
+        assert_eq!(
+            status.phase,
+            yi_agent_lifecycle::types::SwitchPhase::Draining
+        );
+        // The view renders the phase as its snake-case wire name, the same string
+        // the app-server sends, so one component can render both.
+        let view = serde_json::to_value(operation_view(&status)).unwrap();
+        assert_eq!(view["phase"], "draining");
+        assert_eq!(view["operationId"], "op-1");
+    }
+
+    /// A status read never registers or renews anything: it must be usable without
+    /// touching the lease table at all.
+    #[tokio::test]
+    async fn status_is_read_only_and_does_not_need_a_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(artifact()));
+        let project = scope(dir.path(), "alpha");
+
+        let snapshot = manager
+            .status(&project, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(snapshot.is_some());
+        assert_eq!(control.inner().statuses, 1);
+        // Nothing was acquired as a side effect.
+        assert!(manager.registered_projects().is_empty());
+
+        let view = runtime_view(&manager, &project, snapshot, None).unwrap();
+        assert_eq!(view["compatibility"], "compatible_mismatch");
+        assert_eq!(view["expectedBuildId"], "build-b");
+        assert_eq!(view["counts"]["clients"], 2);
+        assert_eq!(view["clients"][0]["kind"], "tui");
+        assert_eq!(view["clients"][0]["mode"], "lease_only");
+        assert_eq!(view["clientsNextCursor"], "tui-1");
+        assert_eq!(view["localRestartAvailable"], true);
+        // Two clients and one running task: the banner must be able to say so.
+        assert_eq!(view["counts"]["complete"], false);
+    }
+
+    /// The same-build case is the one that proves the classifier is wired at all.
+    #[tokio::test]
+    async fn a_matching_artifact_is_reported_as_the_same_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = RecordingControl::new();
+        let mut same = artifact();
+        same.build_id = "build-a".to_string();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            Arc::clone(&control) as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(same));
+        let project = scope(dir.path(), "alpha");
+
+        let snapshot = manager
+            .status(&project, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let view = runtime_view(&manager, &project, snapshot, None).unwrap();
+        assert_eq!(view["compatibility"], "same_build");
+        assert_eq!(view["message"], serde_json::Value::Null);
+    }
+
+    /// Nothing answering is `unknown` with a reason, not an error and not a healthy
+    /// zero.
+    #[test]
+    fn no_answer_is_an_unknown_view_with_an_explanation() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            RecordingControl::new() as Arc<dyn ControlBackend>,
+        )
+        .with_artifact(Some(artifact()));
+        let project = scope(dir.path(), "alpha");
+
+        let view = runtime_view(&manager, &project, None, None).unwrap();
+        assert_eq!(view["compatibility"], "unknown");
+        assert_eq!(view["lifecycleManaged"], false);
+        assert_eq!(view["localRestartAvailable"], false);
+        assert!(!view["message"].as_str().unwrap().is_empty());
+        assert_eq!(view["identity"]["mode"], "unknown");
+        assert_eq!(view["counts"]["complete"], false);
+    }
+
+    /// A refusal from the shell is a permission-or-state answer, never a transport
+    /// error the UI would retry blindly.
+    #[test]
+    fn an_unregistered_scope_is_refused_rather_than_looked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(DesktopRuntimeManager::with_backend(
+            "app-run".to_string(),
+            RecordingControl::new() as Arc<dyn ControlBackend>,
+        ));
+        let state = QuitState::new(manager);
+        let error = registered_scope(&state, "/somewhere/else").unwrap_err();
+        assert!(error.contains("not open in this app"), "{error}");
+        let _ = dir;
     }
 
     fn scope(root: &std::path::Path, name: &str) -> RuntimeScope {
@@ -1148,6 +1918,470 @@ fn instance_home() -> std::io::Result<std::path::PathBuf> {
         return Ok(std::path::PathBuf::from(value));
     }
     dirs::home_dir().ok_or_else(|| std::io::Error::other("the home directory is unavailable"))
+}
+
+// ---------------------------------------------------------------------------
+// Wire views
+//
+// The desktop commands must answer in the *same* shape as
+// `runtime/status` (see `yi_agent_app_server::runtime_status`), because one React
+// component renders both: the banner shows the app-server's view when it is talking
+// to a sidecar and this shell's view when the sidecar is down. Mirrors rather than
+// re-exports: the app-server crate carries the whole agent runtime, and the shell
+// deliberately does not link it. The field names are pinned by a test against the
+// generated TypeScript, so a mirror cannot drift silently.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeIdentityView {
+    pub scope_key: String,
+    pub daemon_instance_id: Option<String>,
+    pub guardian_build_id: Option<String>,
+    pub daemon_build_id: Option<String>,
+    /// `managed` / `legacy_independent` / `legacy_embedded` / `unknown`.
+    pub mode: String,
+    pub business_protocol: Option<u32>,
+    pub daemon_display_version: Option<String>,
+    pub guardian_display_version: Option<String>,
+    pub capabilities: Vec<String>,
+    pub schema_min: u32,
+    pub schema_max: u32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImpactCountsView {
+    pub clients: u64,
+    pub pending_clients: u64,
+    pub running: u64,
+    pub queued: u64,
+    pub plugins: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSummaryView {
+    pub client_run_id: String,
+    pub kind: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImpactRevisionView {
+    pub guardian: u64,
+    pub coordinator: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImpactEntryView {
+    pub kind: String,
+    pub id: String,
+    pub owner: Option<String>,
+}
+
+/// Mirrors `RestartPreview` (`RuntimeRestartPreviewView` in the app-server).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartPreviewView {
+    pub snapshot_id: String,
+    pub token: String,
+    pub revision: ImpactRevisionView,
+    pub counts: ImpactCountsView,
+    pub entries: Vec<ImpactEntryView>,
+    pub next_cursor: Option<String>,
+    pub requires_second_confirmation: bool,
+    pub can_restart: bool,
+    pub blocked_reason: Option<String>,
+}
+
+/// Mirrors `OperationStatus` (`RuntimeOperationStatusView` in the app-server).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationStatusView {
+    pub operation_id: String,
+    pub phase: String,
+    pub detail: Option<String>,
+    pub ready_identity: Option<RuntimeIdentityView>,
+}
+
+/// Mirrors `RuntimeStatusView`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatusView {
+    pub identity: RuntimeIdentityView,
+    pub expected_build_id: Option<String>,
+    pub expected_display_version: Option<String>,
+    /// `same_build` / `compatible_mismatch` / `control_only` /
+    /// `legacy_temporary_choice_required` / `unknown`.
+    pub compatibility: String,
+    pub lifecycle_managed: bool,
+    pub counts: ImpactCountsView,
+    pub clients: Vec<ClientSummaryView>,
+    pub clients_next_cursor: Option<String>,
+    pub active_operation: Option<OperationStatusView>,
+    pub local_restart_available: bool,
+    pub message: Option<String>,
+}
+
+fn identity_view(identity: &yi_agent_lifecycle::types::RuntimeIdentity) -> RuntimeIdentityView {
+    use yi_agent_lifecycle::types::RuntimeMode;
+    RuntimeIdentityView {
+        scope_key: identity.scope_key.clone(),
+        daemon_instance_id: identity.daemon_instance_id.clone(),
+        guardian_build_id: identity.guardian_build_id.clone(),
+        daemon_build_id: identity.daemon_build_id.clone(),
+        mode: match identity.mode {
+            RuntimeMode::Managed => "managed",
+            RuntimeMode::LegacyIndependent => "legacy_independent",
+            RuntimeMode::LegacyEmbedded => "legacy_embedded",
+            RuntimeMode::Unknown => "unknown",
+        }
+        .to_string(),
+        business_protocol: identity.business_protocol,
+        daemon_display_version: identity.daemon_display_version.clone(),
+        guardian_display_version: identity.guardian_display_version.clone(),
+        capabilities: identity.capabilities.clone(),
+        schema_min: identity.schema_min,
+        schema_max: identity.schema_max,
+    }
+}
+
+fn counts_view(counts: &yi_agent_lifecycle::types::ImpactCounts) -> ImpactCountsView {
+    ImpactCountsView {
+        clients: counts.clients,
+        pending_clients: counts.pending_clients,
+        running: counts.running,
+        queued: counts.queued,
+        plugins: counts.plugins,
+        complete: counts.complete,
+    }
+}
+
+fn operation_view(status: &yi_agent_lifecycle::types::OperationStatus) -> OperationStatusView {
+    OperationStatusView {
+        operation_id: status.operation_id.clone(),
+        // The snake-case wire name, like the app-server's view: the phase list
+        // grows with the state machine, and a second enum here would mislabel a
+        // phase the moment one is added.
+        phase: serde_json::to_value(status.phase)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        detail: status.detail.clone(),
+        ready_identity: status.ready_identity.as_ref().map(identity_view),
+    }
+}
+
+fn runtime_operation_view(status: yi_agent_lifecycle::types::OperationStatus) -> serde_json::Value {
+    serde_json::to_value(operation_view(&status)).unwrap_or(serde_json::Value::Null)
+}
+
+fn runtime_preview_view(preview: yi_agent_lifecycle::types::RestartPreview) -> serde_json::Value {
+    let view = RestartPreviewView {
+        snapshot_id: preview.snapshot_id,
+        token: preview.token,
+        revision: ImpactRevisionView {
+            guardian: preview.revision.guardian,
+            coordinator: preview.revision.coordinator,
+        },
+        counts: counts_view(&preview.counts),
+        entries: preview
+            .entries
+            .into_iter()
+            .map(|entry| ImpactEntryView {
+                kind: entry.kind,
+                id: entry.id,
+                owner: entry.owner,
+            })
+            .collect(),
+        next_cursor: preview.next_cursor,
+        requires_second_confirmation: preview.requires_second_confirmation,
+        can_restart: preview.can_restart,
+        blocked_reason: preview.blocked_reason,
+    };
+    serde_json::to_value(view).unwrap_or(serde_json::Value::Null)
+}
+
+/// The status view this shell renders when the sidecar is down.
+///
+/// `unreachable` is the explanation, and it is *not* a failure of the command: the
+/// banner has to say "I cannot tell" rather than "everything is fine", so the answer
+/// is a view with `compatibility: "unknown"`.
+fn runtime_view(
+    manager: &DesktopRuntimeManager,
+    scope: &RuntimeScope,
+    snapshot: Option<RuntimeStatusSnapshot>,
+    unreachable: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let artifact = manager.artifact();
+    let view = match snapshot {
+        None => RuntimeStatusView {
+            identity: RuntimeIdentityView {
+                scope_key: scope.key.clone(),
+                daemon_instance_id: None,
+                guardian_build_id: None,
+                daemon_build_id: None,
+                mode: "unknown".to_string(),
+                business_protocol: None,
+                daemon_display_version: None,
+                guardian_display_version: None,
+                capabilities: Vec::new(),
+                schema_min: 0,
+                schema_max: 0,
+            },
+            expected_build_id: artifact.map(|artifact| artifact.build_id.clone()),
+            expected_display_version: artifact.map(|artifact| artifact.display_version.clone()),
+            compatibility: "unknown".to_string(),
+            lifecycle_managed: false,
+            counts: ImpactCountsView {
+                clients: 0,
+                pending_clients: 0,
+                running: 0,
+                queued: 0,
+                plugins: 0,
+                complete: false,
+            },
+            clients: Vec::new(),
+            clients_next_cursor: None,
+            active_operation: None,
+            local_restart_available: false,
+            message: Some(
+                unreachable.unwrap_or_else(|| "no runtime answered for this project".to_string()),
+            ),
+        },
+        Some(snapshot) => {
+            // Same rule as the app-server: no verified expectation is `unknown`, not
+            // "compatible". A dev build must not claim a match it never checked.
+            let compatibility = artifact
+                .map(|artifact| classify_against(&snapshot.identity, artifact))
+                .unwrap_or_else(|| "unknown".to_string());
+            let lifecycle_managed =
+                snapshot.identity.mode == yi_agent_lifecycle::types::RuntimeMode::Managed;
+            RuntimeStatusView {
+                identity: identity_view(&snapshot.identity),
+                expected_build_id: artifact.map(|artifact| artifact.build_id.clone()),
+                expected_display_version: artifact.map(|artifact| artifact.display_version.clone()),
+                message: status_message(&compatibility, lifecycle_managed),
+                compatibility,
+                lifecycle_managed,
+                counts: counts_view(&snapshot.counts),
+                clients: snapshot
+                    .clients
+                    .iter()
+                    .map(|client| ClientSummaryView {
+                        client_run_id: client.client_run_id.clone(),
+                        kind: match client.kind {
+                            ClientKind::App => "app",
+                            ClientKind::Tui => "tui",
+                            ClientKind::Headless => "headless",
+                        }
+                        .to_string(),
+                        mode: match client.mode {
+                            LeaseMode::Business => "business",
+                            LeaseMode::LeaseOnly => "lease_only",
+                            LeaseMode::WaitingNextGeneration => "waiting_next_generation",
+                        }
+                        .to_string(),
+                    })
+                    .collect(),
+                clients_next_cursor: snapshot.clients_next_cursor.clone(),
+                active_operation: snapshot.active_operation.as_ref().map(operation_view),
+                // This is the local shell: the control socket is ours, so the button
+                // is real.
+                local_restart_available: snapshot.local_restart_available,
+            }
+        }
+    };
+    serde_json::to_value(view).map_err(|error| error.to_string())
+}
+
+/// Classifies a running identity against this shell's artifact.
+///
+/// The shell cannot link the supervisors (they carry the store), so the rule is
+/// mirrored here. It is the same three questions in the same order: can this build's
+/// schema be read, is this a managed runtime at all, and do the bytes and protocol
+/// match what we shipped.
+fn classify_against(
+    identity: &yi_agent_lifecycle::types::RuntimeIdentity,
+    expected: &ArtifactIdentity,
+) -> String {
+    use yi_agent_lifecycle::types::RuntimeMode;
+    if identity.mode == RuntimeMode::Unknown || identity.daemon_build_id.is_none() {
+        return "unknown".to_string();
+    }
+    if identity.schema_max < expected.schema_min || identity.schema_min > expected.schema_max {
+        return "unknown".to_string();
+    }
+    if matches!(
+        identity.mode,
+        RuntimeMode::LegacyIndependent | RuntimeMode::LegacyEmbedded
+    ) {
+        return "legacy_temporary_choice_required".to_string();
+    }
+    let business_usable = identity.business_protocol.is_some_and(|protocol| {
+        protocol >= expected.business_protocol_min && protocol <= expected.business_protocol_max
+    });
+    if business_usable {
+        let same_daemon = identity.daemon_build_id.as_deref() == Some(expected.build_id.as_str());
+        let same_guardian =
+            identity.guardian_build_id.as_deref() == Some(expected.build_id.as_str());
+        if same_daemon && same_guardian {
+            return "same_build".to_string();
+        }
+        return "compatible_mismatch".to_string();
+    }
+    if identity
+        .capabilities
+        .iter()
+        .any(|capability| capability == "control.v1")
+    {
+        return "control_only".to_string();
+    }
+    "unknown".to_string()
+}
+
+/// The banner's sentence, matching the app-server's wording.
+fn status_message(compatibility: &str, lifecycle_managed: bool) -> Option<String> {
+    match compatibility {
+        "same_build" => None,
+        "compatible_mismatch" => Some(
+            "this project's runtime is a different build; new features may be unavailable"
+                .to_string(),
+        ),
+        "control_only" => Some(
+            "the background runtime's business protocol is incompatible: tasks are disabled \
+             until it is restarted"
+                .to_string(),
+        ),
+        "legacy_temporary_choice_required" => Some(
+            "this runtime was started by an older version and has no exit guarantees; \
+             stop it by hand to get managed restarts"
+                .to_string(),
+        ),
+        _ if !lifecycle_managed => Some("the running runtime could not be identified".to_string()),
+        _ => Some("the running runtime's build could not be verified".to_string()),
+    }
+}
+
+/// Maps a WebView-supplied scope key back to a scope this shell resolved itself.
+///
+/// The key is only a lookup, never a path: a WebView that invents a key gets
+/// "not registered" rather than a control request aimed at a directory of its
+/// choosing. This is the reason the commands below take `scope_key` at all instead
+/// of accepting a project path or an executable.
+fn registered_scope(state: &QuitState, scope_key: &str) -> Result<RuntimeScope, String> {
+    state
+        .manager
+        .registered_projects()
+        .into_iter()
+        .find(|scope| scope.key == scope_key)
+        .ok_or_else(|| {
+            format!(
+                "project `{scope_key}` is not open in this app, so it has no runtime to talk to"
+            )
+        })
+}
+
+/// Read-only runtime status for one open project.
+///
+/// Read-only at every layer: no lease is taken, none is renewed, and the answer may
+/// honestly be "nothing here" (embedded or legacy runtime).
+#[tauri::command]
+pub async fn runtime_status(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    let manager = Arc::clone(&state.manager);
+    let snapshot = manager
+        .status(&scope, STATUS_BUDGET)
+        .await
+        .map_err(|error| error.to_string())?;
+    runtime_view(&manager, &scope, snapshot, None)
+}
+
+/// Read-only preview of replacing this project's runtime with the shell's own.
+///
+/// The target comes from the shell's verified manifest, never from the WebView: a
+/// caller-supplied executable would be "run this binary" behind a friendlier name.
+#[tauri::command]
+pub async fn runtime_preview(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    let manager = Arc::clone(&state.manager);
+    let preview = manager
+        .preview(&scope, STATUS_BUDGET)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(runtime_preview_view(preview))
+}
+
+/// Consumes a preview token and starts the switch.
+///
+/// `operation_id` is supplied by the caller so it exists before the click; if this
+/// call's answer is lost, the caller polls [`runtime_operation`] with the same id
+/// instead of asking for a second confirmation.
+#[tauri::command]
+pub async fn runtime_confirm(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    token: String,
+    operation_id: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    if token.trim().is_empty() {
+        return Err("a confirmation needs the token from the preview it was shown".to_string());
+    }
+    if operation_id.trim().is_empty() {
+        return Err("a confirmation needs the operation id chosen before the click".to_string());
+    }
+    let manager = Arc::clone(&state.manager);
+    let confirmed = manager
+        .confirm(&scope, &token, &operation_id, SWITCH_BUDGET)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "operationId": confirmed }))
+}
+
+/// One read of an operation's progress.
+///
+/// `Ok(null)` means this runtime never ran that id -- which is *not* the same as
+/// "it did not happen": the runtime may have restarted since. The caller must say
+/// "unknown" rather than "failed".
+#[tauri::command]
+pub async fn runtime_operation(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    operation_id: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    let manager = Arc::clone(&state.manager);
+    let status = manager
+        .operation(&scope, &operation_id, STATUS_BUDGET)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(match status {
+        Some(status) => runtime_operation_view(status),
+        None => serde_json::Value::Null,
+    })
+}
+
+/// The operation this shell last started for `scope_key`, if any.
+///
+/// Exists so a WebView reload can resume polling instead of forgetting that a
+/// switch is in flight.
+#[tauri::command]
+pub fn runtime_active_operation(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+) -> Option<String> {
+    state.manager.operation_for(&scope_key)
 }
 
 /// Registers this App run's lease for `project`.

@@ -234,6 +234,25 @@ pub fn rpc(
 pub struct ShellIdentity {
     pub client_run_id: String,
     pub daemon_instance_id: Option<String>,
+    /// The runtime artifact this shell shipped with, when it verified one.
+    ///
+    /// Sent so the sidecar can answer `runtime/status` with "same build" instead of
+    /// `Unknown`. It names bytes and grants nothing: no lease can be renewed with it,
+    /// and a session that lies about it only gets a wrong banner about its own
+    /// project.
+    pub expected_runtime: Option<ExpectedRuntime>,
+}
+
+/// The artifact expectation, in the sidecar's handshake shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedRuntime {
+    pub build_id: String,
+    pub display_version: String,
+    pub schema_min: u32,
+    pub schema_max: u32,
+    pub business_protocol_min: u32,
+    pub business_protocol_max: u32,
+    pub capabilities: Vec<String>,
 }
 
 /// Reads the shell's identity out of the App's lifecycle state.
@@ -245,6 +264,15 @@ fn shell_identity_for<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<ShellIden
     Some(ShellIdentity {
         client_run_id: state.manager.client_run_id().to_string(),
         daemon_instance_id: None,
+        expected_runtime: state.manager.artifact().map(|artifact| ExpectedRuntime {
+            build_id: artifact.build_id.clone(),
+            display_version: artifact.display_version.clone(),
+            schema_min: artifact.schema_min,
+            schema_max: artifact.schema_max,
+            business_protocol_min: artifact.business_protocol_min,
+            business_protocol_max: artifact.business_protocol_max,
+            capabilities: artifact.capabilities.clone(),
+        }),
     })
 }
 
@@ -283,6 +311,23 @@ pub fn stamp_shell_identity(
         authorization.insert(
             "daemon_instance_id".to_string(),
             Value::String(generation.clone()),
+        );
+    }
+    // Identity of the sidecar we shipped with, not of the wrapper. An unverified
+    // build sends nothing here, and the sidecar then answers `unknown` -- which is
+    // the honest answer for a `tauri dev` session.
+    if let Some(expected) = &identity.expected_runtime {
+        authorization.insert(
+            "expected_runtime".to_string(),
+            serde_json::json!({
+                "build_id": expected.build_id,
+                "display_version": expected.display_version,
+                "schema_min": expected.schema_min,
+                "schema_max": expected.schema_max,
+                "business_protocol_min": expected.business_protocol_min,
+                "business_protocol_max": expected.business_protocol_max,
+                "capabilities": expected.capabilities,
+            }),
         );
     }
     // Overwrite rather than merge: a webview that supplied its own value would be
@@ -1379,6 +1424,15 @@ mod tests {
         ShellIdentity {
             client_run_id: "app-run-1".to_string(),
             daemon_instance_id: Some("daemon-7".to_string()),
+            expected_runtime: Some(ExpectedRuntime {
+                build_id: "0123456789abcdef".to_string(),
+                display_version: "0.2.0".to_string(),
+                schema_min: 1,
+                schema_max: 16,
+                business_protocol_min: 1,
+                business_protocol_max: 1,
+                capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+            }),
         }
     }
 
@@ -1396,8 +1450,39 @@ mod tests {
         assert_eq!(stamped["client_run_id"], "app-run-1");
         assert_eq!(stamped["daemon_instance_id"], "daemon-7");
         assert_eq!(stamped["issued_by_shell"], true);
+        // The artifact identity is what makes the sidecar able to answer "same
+        // build" instead of `unknown`; it is the daemon's build id, not the
+        // wrapper's version.
+        assert_eq!(stamped["expected_runtime"]["build_id"], "0123456789abcdef");
+        assert_eq!(stamped["expected_runtime"]["display_version"], "0.2.0");
+        assert_eq!(stamped["expected_runtime"]["schema_max"], 16);
         // The rest of the frame survives: this is an addition, not a rewrite.
         assert_eq!(params["clientInfo"]["name"], "desktop");
+    }
+
+    /// An unverified build states no expectation at all.
+    ///
+    /// `tauri dev` has no manifest, and inventing an expectation from a version
+    /// number would label every runtime a mismatch. Absent is the honest answer.
+    #[test]
+    fn an_unverified_shell_sends_no_artifact_expectation() {
+        let mut unverified = identity();
+        unverified.expected_runtime = None;
+        let params = stamp_shell_identity(&ProfileKey::Local, "initialize", json!({}), &unverified);
+        assert!(params["shellAuthorization"]
+            .get("expected_runtime")
+            .is_none());
+        // The rest of the identity is still there: "I do not know my artifact" is
+        // not "I am not the shell".
+        assert_eq!(params["shellAuthorization"]["client_run_id"], "app-run-1");
+    }
+
+    /// The expectation must never be the only thing a non-desktop frame grows.
+    #[test]
+    fn a_non_initialize_frame_carries_no_expectation_either() {
+        let params =
+            stamp_shell_identity(&ProfileKey::Local, "runtime/status", json!({}), &identity());
+        assert!(params.get("shellAuthorization").is_none());
     }
 
     /// A phone (or any remote slot) must not be able to present itself as the

@@ -218,3 +218,23 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
   `cargo test -p yi-agent-app-server --lib handshake`（含三条端到端：stdio 握手回显
   壳身份、纯 CLI 握手无 `shell` 键、伪造 `issued_by_shell:false` 被忽略）+
   `a_websocket_handshake_cannot_claim_the_desktop_shell`（真实 ws 连接上不被认作壳）
+
+- [x] 只读运行时状态 `runtime/status` 与兼容矩阵（Task 16） — 新增 `Domain::Runtime`
+  与 `src/rpc/runtime.rs`，本域**只有** `runtime/status` 一个方法。刻意没有
+  `runtime/confirmRestart`／`runtime/stop`：业务 RPC 能经 websocket／relay 抵达，
+  而控制通道是本机 unix socket，把它放进 dispatcher 就等于给远端一个本机才有的权力；
+  桌面壳自己持有租约与身份，preview／confirm 由它经控制通道发起，多一条业务 RPC 就是
+  第二处能消费一次性 token 的地方。兼容答案是**分类**而非布尔：`same_build`／
+  `compatible_mismatch`／`control_only`／`legacy_temporary_choice_required`／
+  `unknown` 各对应不同的 UI 决定；业务不兼容但带 `control.v1` 是 `control_only`
+  （可被切换、不能跑任务），没有该能力则是 `unknown`（绝不假装控制通道存在）。无应答
+  也是答案：`unknown` + 一句解释，而不是错误或一串零。`counts.complete` 在 guardian
+  侧恒为 false —— 它看不到 daemon 的 executor／plugin 队列。scope 由会话自己的 workdir
+  推导，**不接受请求参数**：能指定 scope 就能打听别人项目的运行时。远端
+  `localRestartAvailable` 恒假。代码：`src/runtime_status.rs`（DTO + `view` + `classify`
+  + `read_status`）、`src/rpc/runtime.rs`、`src/rpc/mod.rs`（`Domain::Runtime`）、
+  `src/server.rs`（dispatch 臂与 `is_remote`）。判据：
+  `cargo test -p yi-agent-app-server --lib runtime_status`（28 passed：兼容矩阵、
+  control-only 需要能力、无应答、远程无本地重启、字段不丢、JSON roundtrip、preview
+  逐字段、真实 dispatcher 四条 —— 破坏性方法确实 `-32601`、谓词与 dispatcher 一致、
+  状态帧不含凭据）

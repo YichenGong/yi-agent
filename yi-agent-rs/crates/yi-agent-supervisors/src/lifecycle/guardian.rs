@@ -1465,6 +1465,126 @@ fn serve_operation(
     ControlResponse::Operation(switches.status(operation_id))
 }
 
+/// How many clients one [`ControlRequest::Status`] page carries.
+///
+/// The point is that a status frame is bounded by `MAX_CONTROL_FRAME`: an App that
+/// has been open for days may have hundreds of released-and-reconnected clients in
+/// a runtime's history, and a single unbounded array would either exceed the frame
+/// or force the whole read to be truncated. Eight keeps a page well inside the
+/// frame with room for the identity.
+pub const STATUS_CLIENT_PAGE: usize = 8;
+
+/// Answers `ControlRequest::Status`.
+///
+/// Strictly read-only: no registration, no heartbeat, no maintenance barrier, and
+/// no credential. A UI polling this every five seconds must not thereby keep a
+/// runtime alive, and the app-server -- which may not hold the App's renewable
+/// grant -- still has to be able to answer it.
+///
+/// Two asymmetries are deliberate:
+///
+/// * `counts` describes the whole runtime while `clients` is one page. A reader
+///   that used `clients.len()` as the count would tell a user "1 client" beside a
+///   list that simply ended.
+/// * `counts.complete` is always `false`. The guardian can see leases and process
+///   groups, but not the daemon's executor queue or plugin demand; marking it
+///   complete here would let a status read claim a knowledge it does not have.
+fn serve_status(
+    guardian: &Guardian,
+    cursor: Option<&str>,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::ControlResponse;
+
+    let leases = guardian.reclaimer().leases();
+    let rows = leases.client_summaries();
+    // Whole-runtime numbers, taken from the same table as the page.
+    let pending = leases.pending_count() as u64;
+    let counts = yi_agent_lifecycle::types::ImpactCounts {
+        clients: rows.len() as u64,
+        pending_clients: pending,
+        // Only a process registry can answer these, and the status read does not
+        // ask the daemon. Zero here would be a lie; the honest answer is "this
+        // read did not determine it", which `complete: false` says.
+        running: 0,
+        queued: 0,
+        plugins: 0,
+        complete: false,
+    };
+
+    // Cursor is the last id of the previous page, so an insertion before it cannot
+    // make page two repeat a row.
+    let start = match cursor {
+        None => 0,
+        Some(after) => rows
+            .iter()
+            .position(|row| row.client_run_id == after)
+            .map(|index| index + 1)
+            // A cursor naming a client that is gone is not an error: the page it
+            // described no longer exists, so the caller restarts from the top
+            // rather than receiving rows from before its own cursor.
+            .unwrap_or(rows.len()),
+    };
+    let page: Vec<_> = rows
+        .iter()
+        .skip(start)
+        .take(STATUS_CLIENT_PAGE)
+        .cloned()
+        .collect();
+    let next_cursor = if start + page.len() < rows.len() {
+        page.last().map(|row| row.client_run_id.clone())
+    } else {
+        None
+    };
+
+    // The operation, not an error: a status read is how the App finds its own
+    // switch again after a WebView reload, so "no operation" is a valid answer.
+    let active_operation = guardian
+        .switches()
+        .and_then(|switches| switches.running())
+        .and_then(|operation| {
+            guardian
+                .switches()
+                .and_then(|switches| switches.status(&operation))
+        });
+
+    ControlResponse::Status(Box::new(yi_agent_lifecycle::types::RuntimeStatusSnapshot {
+        identity: runtime_identity(guardian),
+        counts,
+        clients: page,
+        clients_next_cursor: next_cursor,
+        active_operation,
+        local_restart_available: guardian.switches().is_some(),
+    }))
+}
+
+/// The runtime's identity as every status reader must see it.
+///
+/// Extracted so [`ControlRequest::Identity`] and [`ControlRequest::Status`] cannot
+/// drift apart: a UI that showed one build id from `identity` and another from
+/// `status` would be describing two different runtimes.
+///
+/// Everything a *daemon* owns stays `None` here, and that is not an omission. The
+/// guardian knows its own generation and artifact; it does not know whether a
+/// business daemon is running, which generation that daemon is, or which protocol
+/// version it speaks. Filling those in from the guardian's own fields would report
+/// the guardian's generation as the daemon's -- exactly the conflation the two
+/// identities exist to prevent.
+fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeIdentity {
+    yi_agent_lifecycle::types::RuntimeIdentity {
+        scope_key: guardian.scope.key.clone(),
+        daemon_instance_id: None,
+        guardian_build_id: Some(guardian.artifact.build_id.clone()),
+        daemon_build_id: None,
+        mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
+        business_protocol: None,
+        daemon_display_version: None,
+        guardian_display_version: Some(guardian.artifact.display_version.clone()),
+        capabilities: guardian.artifact.capabilities.clone(),
+        schema_min: guardian.artifact.schema_min,
+        schema_max: guardian.artifact.schema_max,
+    }
+}
+
 /// Answers `ControlRequest::Preview`.
 ///
 /// Read-only by construction: it takes no maintenance barrier, starts no drain, and
@@ -1821,21 +1941,7 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
         Err(_) => return,
     };
     let response = match request {
-        ControlRequest::Identity => {
-            ControlResponse::Identity(yi_agent_lifecycle::types::RuntimeIdentity {
-                scope_key: guardian.scope.key.clone(),
-                daemon_instance_id: None,
-                guardian_build_id: Some(guardian.artifact.build_id.clone()),
-                daemon_build_id: None,
-                mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
-                business_protocol: None,
-                daemon_display_version: None,
-                guardian_display_version: Some(guardian.artifact.display_version.clone()),
-                capabilities: guardian.artifact.capabilities.clone(),
-                schema_min: guardian.artifact.schema_min,
-                schema_max: guardian.artifact.schema_max,
-            })
-        }
+        ControlRequest::Identity => ControlResponse::Identity(runtime_identity(guardian)),
         ControlRequest::Register {
             client_run_id,
             kind,
@@ -1968,6 +2074,7 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             grant,
             operation_id,
         } => serve_operation(guardian, &grant, &operation_id),
+        ControlRequest::Status { cursor } => serve_status(guardian, cursor.as_deref()),
         // Reclaim/operation are completed in later tasks; until then an
         // unimplemented request is reported as such, never as accepted.
         //

@@ -24,6 +24,7 @@ pub(crate) mod plugin;
 pub(crate) mod process;
 pub(crate) mod remote;
 pub(crate) mod resident;
+pub(crate) mod runtime;
 pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
@@ -276,6 +277,8 @@ pub(crate) enum Domain {
     Agent,
     /// `remote/*`(手机端「本项目清单 + 每项目的 relay session」)。
     Remote,
+    /// `runtime/*`(只读运行时状态:身份、兼容性、客户端页、活动操作)。
+    Runtime,
     /// 未搬移者:只剩 `initialize` 与未识别前缀(全部域都已搬走)。
     Unknown,
 }
@@ -306,6 +309,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         Some("remote") => Domain::Remote,
+        Some("runtime") => Domain::Runtime,
         _ => Domain::Unknown,
     }
 }
@@ -335,6 +339,18 @@ pub(crate) struct AppState<'a> {
     pub(crate) hub: &'a Arc<Broadcaster>,
     /// 当前请求来自哪个客户端:所有定向应答的寻址目标。搬移前臂里的 `client`。
     pub(crate) client: &'a ClientId,
+    /// 这次请求是否来自远端(ws / relay),而不是本地 stdio。
+    ///
+    /// 只有一处在读它:`runtime/status` 据此把 `localRestartAvailable` 置假。远端
+    /// 能**看到**版本不一致,但本机控制通道是 unix socket,给远端一个重启按钮就是
+    /// 承诺一个传输层做不到的动作。
+    pub(crate) is_remote: bool,
+    /// 这个客户端的壳授权(只有本地 stdio 的 `initialize` 能写入)。
+    ///
+    /// `runtime/status` 从这里取「本壳配套的产物身份」,所以同一句「我期望哪个
+    /// build」只有壳能说,WebView 既不能改也不能伪造。`None` = 没有壳(CLI、
+    /// 远端设备、测试),此时状态视图诚实地报 `Unknown`。
+    pub(crate) shell_authorization: Option<&'a crate::shell_authorization::ShellAuthorization>,
     /// 调用方已登记的权限级(`Observe < Control < Admin`)。`serve()` 在
     /// dispatch 前查好,handler 用它做臂内的门禁(如 `model/*` 的写操作)。
     /// 搬移前臂里的 `client_scope`。
