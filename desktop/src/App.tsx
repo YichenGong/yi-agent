@@ -1154,6 +1154,9 @@ export default function App() {
       }>("thread/resume", {
         threadId: id,
       });
+      // resume 回包意味着历史回放已结束；附属列表刷新不属于内容加载，
+      // 必须在等待它之前停机，否则慢 listAll 会把已加载的内容反向判失败。
+      watchdog.stop();
       const replayed = replaySession.endReplay();
       // 只有真收到过回放帧才允许删项。空集是不能下「服务端没有这些 item」结论的：
       // 它既可能是「服务端历史本来就空」，也可能是「这趟 resume 压根没投递帧」。
@@ -1190,12 +1193,17 @@ export default function App() {
         typeof resumed.reasoning_effort === "string"
           ? resumed.reasoning_effort
           : null;
-      // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
-      // 不把已确定的模式打回 null。
-      const gs = await sess.refreshThreads();
-      if (gs !== null)
-        view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
+      // listAll 只是附属兜底，不能阻塞内容同步收尾或连接握手。
+      // 重连/删除后晚到的列表也不能再修改旧视图。
       force((v) => v + 1);
+      void sess.refreshThreads().then((gs) => {
+        if (gs !== null && clientRef.current === c && store.peek(id) === view) {
+          view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
+          force((v) => v + 1);
+        }
+      }).catch(() => {
+        // 内容已成功加载；附属刷新失败不能将其标为同步失败。
+      });
     } catch (e) {
       replaySession.endReplay();
       // 失败路径只在视图仍存在时构造文案，避免 re-create 一个已被 drop 的

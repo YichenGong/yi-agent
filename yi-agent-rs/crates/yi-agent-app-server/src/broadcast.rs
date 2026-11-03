@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 /// 而不是阻塞其它客户端。
 pub const CLIENT_QUEUE: usize = 256;
 
+/// 历史/关键帧等待 WebSocket 出口腾出空位的上限；持续停滞则断开重同步。
+const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 一个客户端可订阅的 thread 上限（防止"订阅全部"退化成"全收"）。
 pub const MAX_SUBSCRIPTIONS: usize = 16;
 
@@ -200,14 +203,12 @@ impl Broadcaster {
         });
     }
 
-    /// 按 thread 键**带背压**扇出：reliable 客户端 `await` 入队（队列满即等，
-    /// 不丢帧）；非 reliable 客户端维持 `try_send`，满则从注册表移除（ws 既有语义）。
+    /// 历史/关键帧按 thread 键带背压扇出：本地 reliable 客户端等待入队，
+    /// WebSocket 客户端最多等待十秒，持续停滞才摘除并由 ws 连接循环关闭。
+    /// 实时流仍用 [`Self::broadcast_for`]，不改变其慢消费者策略。
     ///
-    /// 只用于历史回放等「必须完整送达本地客户端」的批量下发；实时流仍用
-    /// [`Self::broadcast_for`]。
-    ///
-    /// 返回 `Err(Closed)` 表示有 reliable 客户端的出站队列已关闭（对端真死）；
-    /// 已投递的帧不受影响。持锁阶段只克隆 `(id, reliable, tx)`，不跨 `.await`。
+    /// 各客户端并发入队，不持注册表锁等待；返回 `Err(Closed)` 仅表示
+    /// reliable 客户端出口已关闭，WebSocket 失败不终止其他客户端的通知。
     pub async fn broadcast_await(&self, key: Option<&str>, frame: Value) -> Result<(), Closed> {
         let targets: Vec<(ClientId, bool, mpsc::Sender<Value>)> = {
             let guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
@@ -217,21 +218,36 @@ impl Broadcaster {
                 .map(|(id, c)| (id.clone(), c.reliable, c.tx.clone()))
                 .collect()
         };
-        let mut closed = false;
-        let mut to_remove: Vec<ClientId> = Vec::new();
-        for (id, reliable, tx) in targets {
-            if reliable {
-                if tx.send(frame.clone()).await.is_err() {
-                    closed = true;
-                }
-            } else if tx.try_send(frame.clone()).is_err() {
-                to_remove.push(id);
+        let results = futures::future::join_all(targets.into_iter().map(|(id, reliable, tx)| {
+            let frame = frame.clone();
+            async move {
+                let delivered = if reliable {
+                    tx.send(frame).await.is_ok()
+                } else {
+                    matches!(
+                        tokio::time::timeout(WS_SEND_TIMEOUT, tx.send(frame)).await,
+                        Ok(Ok(()))
+                    )
+                };
+                (id, reliable, tx, delivered)
             }
-        }
-        if !to_remove.is_empty() {
-            let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
-            for id in to_remove {
+        }))
+        .await;
+        let mut closed = false;
+        let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        for (id, reliable, tx, delivered) in results {
+            if delivered {
+                continue;
+            }
+            if reliable {
+                closed = true;
+            } else if guard.get(&id).is_some_and(|c| c.tx.same_channel(&tx)) {
+                // 不能误删等待期间同 id 重新注册的连接。
                 guard.remove(&id);
+                tracing::warn!(
+                    client = id.as_str(),
+                    "critical delivery stalled or closed; disconnecting for resync"
+                );
             }
         }
         if closed { Err(Closed) } else { Ok(()) }
@@ -474,61 +490,97 @@ mod tests {
     /// 边收"去断言送达是不行的：读方一抽干就有空位，旧实现也能蒙混过关。
     #[tokio::test]
     async fn a_critical_notification_survives_a_full_outbound_queue() {
-        let hub = Arc::new(Broadcaster::new());
-        let mut rx = hub.register_reliable(ClientId::local());
-        // 灌满队列：模拟宿主读得慢时 bash 大量输出把 256 格填满。
-        for i in 0..CLIENT_QUEUE {
-            hub.broadcast(serde_json::json!({ "n": i }));
+        for reliable in [true, false] {
+            let hub = Arc::new(Broadcaster::new());
+            let mut rx = if reliable {
+                hub.register_reliable(ClientId::local())
+            } else {
+                hub.register(ClientId::ws(uuid::Uuid::new_v4()))
+            };
+            // 灌满队列：模拟宿主读得慢时 bash 大量输出把 256 格填满。
+            for i in 0..CLIENT_QUEUE {
+                hub.broadcast(serde_json::json!({ "n": i }));
+            }
+            // 此刻**故意不读**：队列是满的。关键帧必须在这里等，而不是被丢掉。
+            let h = Arc::clone(&hub);
+            let sender = tokio::spawn(async move {
+                crate::server::write_notification(
+                    &h,
+                    &crate::protocol::Notification::TurnCompleted {
+                        thread_id: "t1".to_string(),
+                        turn_id: "u1".to_string(),
+                        status: crate::protocol::TurnStatus::Completed,
+                        error: None,
+                        completed_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+            });
+            // 给它充分的机会去跑完（旧实现会瞬间跑完并丢掉这一帧）。
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !sender.is_finished(),
+                "a load-bearing frame must wait for queue space instead of being dropped"
+            );
+
+            // 让读方抽一帧出来腾出空位：写入应当随即完成，且这一帧必须真的送到。
+            let _ = rx.recv().await;
+            tokio::time::timeout(Duration::from_secs(2), sender)
+                .await
+                .expect("the blocked write must resume once the queue drains")
+                .unwrap();
+
+            let mut saw_completed = false;
+            for _ in 0..(CLIENT_QUEUE + 16) {
+                match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                    Ok(Some(v)) => {
+                        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                            saw_completed = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            assert!(
+                saw_completed,
+                "turn/completed must reach the client even when the queue is full"
+            );
         }
-        // 此刻**故意不读**：队列是满的。关键帧必须在这里等，而不是被丢掉。
+    }
+
+    #[tokio::test]
+    async fn a_stalled_ws_is_removed_after_fast_clients_receive_the_critical_frame() {
+        let hub = Arc::new(Broadcaster::new());
+        let slow = ClientId::ws(uuid::Uuid::new_v4());
+        let _slow_rx = hub.register(slow.clone());
+        for i in 0..CLIENT_QUEUE {
+            hub.broadcast(serde_json::json!({"n": i}));
+        }
+        let fast = ClientId::ws(uuid::Uuid::new_v4());
+        let mut fast_rx = hub.register(fast.clone());
         let h = Arc::clone(&hub);
         let sender = tokio::spawn(async move {
-            crate::server::write_notification(
-                &h,
-                &crate::protocol::Notification::TurnCompleted {
-                    thread_id: "t1".to_string(),
-                    turn_id: "u1".to_string(),
-                    status: crate::protocol::TurnStatus::Completed,
-                    error: None,
-                    completed_at: None,
-                },
-            )
-            .await
-            .unwrap();
+            h.broadcast_await(None, serde_json::json!({"critical": true}))
+                .await
         });
-        // 给它充分的机会去跑完（旧实现会瞬间跑完并丢掉这一帧）。
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !sender.is_finished(),
-            "a load-bearing frame must wait for queue space instead of being dropped"
-        );
-
-        // 让读方抽一帧出来腾出空位：写入应当随即完成，且这一帧必须真的送到。
-        let _ = rx.recv().await;
-        tokio::time::timeout(Duration::from_secs(2), sender)
+        let frame = tokio::time::timeout(Duration::from_secs(1), fast_rx.recv())
             .await
-            .expect("the blocked write must resume once the queue drains")
+            .expect("a stalled WS must not delay this frame to a fast client")
             .unwrap();
-
-        let mut saw_completed = false;
-        for _ in 0..(CLIENT_QUEUE + 16) {
-            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-                Ok(Some(v)) => {
-                    if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
-                        saw_completed = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            saw_completed,
-            "turn/completed must reach the client even when the queue is full"
-        );
+        assert_eq!(frame["critical"], true);
+        assert!(hub.is_connected(&slow));
+        tokio::time::timeout(WS_SEND_TIMEOUT + Duration::from_secs(2), sender)
+            .await
+            .expect("a stalled WS must have a bounded delivery deadline")
+            .unwrap()
+            .unwrap();
+        assert!(!hub.is_connected(&slow));
+        assert!(hub.is_connected(&fast));
     }
 
     /// 关键帧走背压，但**出口泵真死时不能永久挂住**。

@@ -17,6 +17,7 @@
 | yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
 | yi-agent-cli | 7 / 7 | [详情](./yi-agent-cli.md) |
 | yi-agent-web | 12 / 12 | [详情](./yi-agent-web.md) |
+| yi-agent-relay | 2 / 2 | [详情](./yi-agent-relay.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
 | ci-cd | 36 / 36 | [详情](./ci-cd.md) |
 | tooling | 11 / 11 | [详情](./tooling.md) |
@@ -26,10 +27,10 @@
 | yi-agent-runtime | 24 / 27 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 12 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 80 / 81 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 81 / 82 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 19 / 20 | [详情](./superpowers-kanban.md) |
-| desktop | 115 / 126 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
+| desktop | 116 / 127 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 
