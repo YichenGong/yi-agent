@@ -100,6 +100,79 @@ async fn side_concurrent_open_returns_one_runner() {
     assert_eq!(registry.side_count().await, 1);
 }
 
+/// 父正在跑一轮时开旁支，父的持久文件必须**字节不变**。
+///
+/// spec §8.2/§12.2：`open` 只读父的持久状态（外加写 partial 的那一份），
+/// 不 resume、不 fork、不 append。这条用字节比对来钉：任何"顺手把父的状态
+/// 规范化一下"的改动都会让父的 jsonl/meta 变化，而客户端会把它当成一轮新内容。
+#[tokio::test]
+async fn side_open_during_a_parent_turn_does_not_touch_parent_files() {
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let store = Arc::new(ThreadStore::new(project.path()));
+    seed_parent(&store, "p1");
+    // 父此刻正跑到一半：磁盘上有一个未收尾的 partial。
+    store
+        .write_partial(
+            "p1",
+            &crate::thread_store::PartialTurn {
+                turn_id: "inflight".into(),
+                items: vec![crate::protocol::Item::UserMessage {
+                    id: "user-inflight".into(),
+                    text: "父的第二个问题".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                messages: vec![
+                    yi_agent_core::Message::user("父问题"),
+                    yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                        "父回答".into(),
+                    )]),
+                    yi_agent_core::Message::user("父的第二个问题"),
+                ],
+                usage: None,
+                usage_total: None,
+            },
+        )
+        .unwrap();
+
+    let log_path = store.log_path("p1");
+    let meta_path = store.meta_path("p1");
+    let partial_path = store.partial_path("p1");
+    let before = (
+        std::fs::read(&log_path).unwrap(),
+        std::fs::read(&meta_path).unwrap(),
+        std::fs::read(&partial_path).unwrap(),
+    );
+
+    let mut cfg = crate::test_support::test_config();
+    cfg.model = "parent-model".into();
+    cfg.workdir = project.path().to_path_buf();
+    let resolver = Arc::new(ThreadStoreResolver::new(Arc::clone(&store), cfg));
+    let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
+    let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+        home.path().to_path_buf(),
+        Arc::clone(&pool),
+    )
+    .expect("host resources");
+    let registry = SideRegistry::new(resolver, resources, pool);
+
+    let summary = registry.open("p1").await.expect("父运行中必须能开旁支");
+    assert_eq!(summary.parent_thread_id, "p1");
+    assert_eq!(registry.list("p1").await.len(), 1, "只该有一个旁支");
+
+    let after = (
+        std::fs::read(&log_path).unwrap(),
+        std::fs::read(&meta_path).unwrap(),
+        std::fs::read(&partial_path).unwrap(),
+    );
+    assert_eq!(before.0, after.0, "父 jsonl 不得被改写");
+    assert_eq!(before.1, after.1, "父 meta 不得被改写");
+    assert_eq!(before.2, after.2, "父 partial 不得被改写");
+
+    registry.shutdown().await;
+}
+
 #[tokio::test]
 async fn side_open_is_create_or_get() {
     let (_project, _home, registry) = registry_fixture().await;
