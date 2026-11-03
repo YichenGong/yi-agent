@@ -205,6 +205,30 @@ impl DescribeError {
     }
 }
 
+impl DescribeError {
+    /// 这次失败是不是**停止请求**造成的。
+    ///
+    /// 递归看主因：`WithCleanup` 保留的是主因的分类。日志级别必须读这个，
+    /// 绝不能去匹配 reason 子串——插件往 stderr 写一句 `cancelled` 就能伪造级别。
+    pub(super) fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::WithCleanup { primary, .. } => primary.is_cancelled(),
+            _ => false,
+        }
+    }
+
+    /// 清理本身的诊断（如果有）。与主因**分开**报告：主因是正常取消时，清理失败
+    /// 也不能被吞掉。
+    pub(super) fn cleanup_warning(&self) -> Option<String> {
+        match self {
+            Self::WithCleanup { cleanup, .. } => Some(cleanup.clone()),
+            Self::CleanupFailed(cleanup) => Some(cleanup.clone()),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for DescribeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `render` 需要一个命令名做主语；这里没有，就不硬编一个。
