@@ -54,6 +54,17 @@ describe("SuperpowersKanbanCard", () => {
     expect(screen.getByText(/最后观测到已加载/)).toBeTruthy();
   });
 
+  it("旧插件载荷（没有 session_observation）仍按 stale 显示未加载", () => {
+    // 混装：旧 runner 只发 `stale: true`。新 UI 必须继续认这个旧信号——若把
+    // 「缺新字段」一律当成"未知"，升级 UI 反而会把已知的未加载降级成不提示。
+    render(
+      <SuperpowersKanbanCard
+        card={card({ state: "running", stale: true, sessionObservation: undefined })}
+      />,
+    );
+    expect(screen.getByLabelText("会话未加载")).toBeTruthy();
+  });
+
   it("活着的运行卡不显示加载角标", () => {
     render(
       <SuperpowersKanbanCard

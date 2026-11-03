@@ -1046,6 +1046,93 @@ mod tests {
         assert_eq!(card["thread_id"], "thread-1");
     }
 
+    /// 混装 A：**旧宿主**（没有 `loaded_threads`）配新 runner。
+    ///
+    /// 旧宿主只给 `threads[]`。插件必须读成「没有完整快照能力」——
+    /// 显式 `alive:false` 是展示证据（`not_loaded`），但结果必须是回报照常
+    /// 落账、Sessions 照常解析，绝不能崩或丢 reply。
+    #[test]
+    fn kanban_observation_legacy_host_request_still_drives_the_board() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        crate::persist::with_board(&state, |board| {
+            board
+                .transition(
+                    &superpowers_kanban_core::card::CardId::new("card-1"),
+                    superpowers_kanban_core::card::CardState::Running,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+
+        let reply = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                // 旧载荷：没有 loaded_threads，threads 带显式 alive。
+                "threads": [{"thread_id": "thread-1", "idle": true, "alive": false}],
+                "results": [],
+                "sessions": {"running": 1}
+            }),
+        )
+        .unwrap();
+        assert!(reply.get("action").is_some(), "旧宿主也必须拿到回复");
+
+        let card = &service.list()["cards"][0];
+        assert_eq!(
+            card["session_observation"], "not_loaded",
+            "legacy explicit alive=false is real evidence, not unknown"
+        );
+        assert_eq!(card["thread_id"], "thread-1", "旧宿主路径不改绑定");
+    }
+
+    /// 混装 B：**新宿主**给完整快照，但请求里夹着旧 `threads[]` 的冲突说法。
+    ///
+    /// 完整快照对这一拍是权威的：`threads[]` 说死了，快照说在，就是在。
+    #[test]
+    fn kanban_observation_new_host_snapshot_beats_a_conflicting_legacy_list() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        crate::persist::with_board(&state, |board| {
+            board
+                .transition(
+                    &superpowers_kanban_core::card::CardId::new("card-1"),
+                    superpowers_kanban_core::card::CardState::Running,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+
+        dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                "threads": [{"thread_id": "thread-1", "idle": false, "alive": false}],
+                "loaded_threads": [{"thread_id": "thread-1", "idle": true}],
+                "results": [],
+                "sessions": {"running": 1}
+            }),
+        )
+        .unwrap();
+
+        let card = &service.list()["cards"][0];
+        assert_eq!(
+            card["session_observation"], "loaded",
+            "the complete snapshot is authoritative for this tick"
+        );
+        assert_eq!(card["stale"], false);
+    }
+
     /// 坏的完整快照必须在**任何副作用之前**被拒：回报没消费、tick 没推进、
     /// 旁路没重写。
     #[test]
