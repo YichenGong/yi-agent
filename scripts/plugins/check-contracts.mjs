@@ -10,7 +10,8 @@
 // 也不能临时下载未知版本，否则「契约冻结」这句话就没有意义。
 
 import { createRequire } from "node:module";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -529,6 +530,142 @@ export function checkTrace(_contracts, trace, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// TS golden：宿主（desktop）与 SDK 各有一份线协议镜像，必须与 fixture 一致。
+//
+// 两边都**不能**从 fixture 生成类型：那会让插件包在运行时读到契约目录，
+// 而插件包是发出去的。折中是让每一侧在源码里用字面量复述一遍，再由这里
+// 比对。比对的不是"长得像"，而是逐个条目相等：多一个、少一个、拼错一个都红。
+//
+// 只做文本抽取而不是编译 TS：checker 跑在 Node 里，没有 TS 工具链，也不该
+// 为此引入一个。抽取规则窄到只认 `export const NAME = [...] as const;` 与
+// `export const NAME = "..."`，写法变了就红——这是想要的，因为一旦写法漂移，
+// 断言就会静默失效。
+// ---------------------------------------------------------------------------
+
+const TS_MIRRORS = [
+  {
+    label: "desktop host",
+    file: path.join(REPO_ROOT, "desktop", "src", "lib", "pluginHost", "types.ts"),
+  },
+  {
+    label: "plugin sdk",
+    file: path.join(REPO_ROOT, "plugins", "sdk", "src", "index.ts"),
+  },
+];
+
+function tsSourceFor(mirror, errors) {
+  try {
+    return readFileSync(mirror.file, "utf8");
+  } catch (err) {
+    errors.push(`${mirror.label}: cannot read ${path.relative(REPO_ROOT, mirror.file)} (${err.code})`);
+    return null;
+  }
+}
+
+/** 取 `export const NAME: ... = "value"` 或 `= ["a", "b"]` 的值。 */
+function extractTsConst(source, name) {
+  const declaration = new RegExp(`export const ${name}\\b[^=]*=\\s*([^;]+);`, "s");
+  const match = declaration.exec(source);
+  if (!match) return { found: false };
+  const literal = match[1].trim().replace(/\s+as const$/, "").trim();
+
+  if (literal.startsWith('"') || literal.startsWith("'")) {
+    const quoted = /^["']([^"']*)["']$/.exec(literal);
+    return quoted ? { found: true, value: quoted[1] } : { found: false };
+  }
+  if (literal.startsWith("[")) {
+    const body = literal.slice(1, -1);
+    const strings = [...body.matchAll(/["']([^"']+)["']/g)].map((m) => m[1]);
+    return { found: true, value: strings };
+  }
+  return { found: false };
+}
+
+/** 直接读 schema 里的冻结值。loadContracts 只返回编译后的校验器，取不到字面量。 */
+export function bridgeSchema() {
+  const raw = readJSON(path.join(CONTRACTS_DIR, "bridge-v1.schema.json"));
+  return {
+    prefix: raw.properties.prefix.const,
+    methods: raw.properties.methods.items.properties.name.enum.map((name) => ({
+      name,
+      effect: null,
+    })),
+    responseVariants: raw.properties.responseVariants.const,
+  };
+}
+
+/**
+ * fixture 是 checker 的输入，schema 是它的判据。两者不同步时，checker 会
+ * 用一份"合法但过期"的样本自证——这是最隐蔽的一种假绿。
+ */
+export function checkJsonMirror(_contracts, errors = []) {
+  const fixture = readJSON(path.join(CONTRACTS_DIR, "fixtures", "bridge-v1.json"));
+  const bridge = bridgeSchema();
+
+  if (fixture.prefix !== bridge.prefix) {
+    errors.push(`bridge fixture prefix "${fixture.prefix}" does not match the schema's "${bridge.prefix}"`);
+  }
+  if (stableStringify(fixture.responseVariants) !== stableStringify(bridge.responseVariants)) {
+    errors.push("bridge fixture responseVariants does not match the schema const");
+  }
+  const schemaNames = bridge.methods.map((entry) => entry.name);
+  const fixtureNames = fixture.methods.map((entry) => entry.name);
+  if (stableStringify(schemaNames) !== stableStringify(fixtureNames)) {
+    const missing = schemaNames.filter((name) => !fixtureNames.includes(name));
+    const extra = fixtureNames.filter((name) => !schemaNames.includes(name));
+    if (missing.length) errors.push(`bridge fixture is missing methods: ${missing.join(", ")}`);
+    if (extra.length) errors.push(`bridge fixture has methods the schema closes off: ${extra.join(", ")}`);
+    if (!missing.length && !extra.length) errors.push("bridge fixture lists the same methods in a different order");
+  }
+  return errors;
+}
+
+export function checkTsGolden(_contracts, errors = [], mirrors = TS_MIRRORS) {
+  const bridge = bridgeSchema();
+  const prefix = bridge.prefix;
+  const variants = bridge.responseVariants;
+
+  for (const mirror of mirrors) {
+    const source = tsSourceFor(mirror, errors);
+    if (source === null) continue;
+
+    const management = extractTsConst(source, "MANAGEMENT_PREFIX");
+    if (!management.found) {
+      errors.push(`${mirror.label}: MANAGEMENT_PREFIX is not a string literal — the golden check cannot read it`);
+    } else if (management.value !== prefix) {
+      errors.push(
+        `${mirror.label}: MANAGEMENT_PREFIX is "${management.value}" but the contract fixes "${prefix}"`,
+      );
+    }
+
+    const declared = extractTsConst(source, "RESPONSE_VARIANTS");
+    if (!declared.found) {
+      errors.push(
+        `${mirror.label}: RESPONSE_VARIANTS is not a string array literal — the golden check cannot read it`,
+      );
+      continue;
+    }
+    if (declared.value.length !== variants.length) {
+      errors.push(
+        `${mirror.label}: RESPONSE_VARIANTS has ${declared.value.length} entries, the contract has ${variants.length}`,
+      );
+    }
+    const seen = new Set(declared.value);
+    for (const variant of variants) {
+      if (!seen.has(variant)) {
+        errors.push(`${mirror.label}: RESPONSE_VARIANTS is missing "${variant}"`);
+      }
+    }
+    for (const extra of declared.value) {
+      if (!variants.includes(extra)) {
+        errors.push(`${mirror.label}: RESPONSE_VARIANTS invents "${extra}", which the contract does not allow`);
+      }
+    }
+  }
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
 // CLI：跑黄金样本 + 负例，打印实际计数。
 // ---------------------------------------------------------------------------
 
@@ -744,6 +881,61 @@ async function main() {
       failures += 1;
       console.log(`  FAIL  ${name}`);
       for (const line of verified.errors) console.log(`          ${line}`);
+    }
+  }
+
+  const jsonMirrorErrors = checkJsonMirror(contracts);
+  positive += 1;
+  if (jsonMirrorErrors.length === 0) {
+    console.log("  ok    bridge fixture mirrors the schema");
+  } else {
+    failures += 1;
+    console.log("  FAIL  bridge fixture mirrors the schema");
+    for (const line of jsonMirrorErrors) console.log(`          ${line}`);
+  }
+
+  const tsGoldenErrors = checkTsGolden(contracts);
+  positive += 1;
+  if (tsGoldenErrors.length === 0) {
+    console.log("  ok    host and sdk TS mirrors match the bridge fixture");
+  } else {
+    failures += 1;
+    console.log("  FAIL  host and sdk TS mirrors match the bridge fixture");
+    for (const line of tsGoldenErrors) console.log(`          ${line}`);
+  }
+
+  // 负例：一份"少了 unknown"的 TS 镜像必须被拒。没有这条，上面的正向断言
+  // 只能证明"现在是对的"，不能证明"错的时候会红"。
+  {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ts-golden-"));
+    const bad = path.join(dir, "types.ts");
+    writeFileSync(
+      bad,
+      'export const MANAGEMENT_PREFIX = "plugins/v1/";\n' +
+        'export const RESPONSE_VARIANTS = ["pending", "committed", "rejected"] as const;\n',
+    );
+    const goldenNegative = checkTsGolden(contracts, [], [{ label: "tampered", file: bad }]);
+    negative += 1;
+    if (goldenNegative.length === 0) {
+      failures += 1;
+      console.log("  FAIL  ts golden accepted a mirror that dropped unknown");
+    } else {
+      console.log("  ok    ts golden rejects a mirror that dropped unknown");
+    }
+
+    const drift = path.join(dir, "prefix.ts");
+    writeFileSync(
+      drift,
+      'export const MANAGEMENT_PREFIX = "plugins/v2/";\n' +
+        'export const RESPONSE_VARIANTS = ["pending", "committed", "unknown", "rejected"] as const;\n',
+    );
+    const prefixNegative = checkTsGolden(contracts, [], [{ label: "drifted", file: drift }]);
+    negative += 1;
+    if (prefixNegative.length === 0) {
+      failures += 1;
+      console.log("  FAIL  ts golden accepted a mirrored prefix the contract does not use");
+    } else {
+      console.log("  ok    ts golden rejects a mirrored prefix the contract does not use");
     }
   }
 
