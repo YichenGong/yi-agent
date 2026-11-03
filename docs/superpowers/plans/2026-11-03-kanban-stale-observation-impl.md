@@ -550,7 +550,14 @@ git diff --check
    - `not_loaded` 但 `observed_at` 为不存在的日期（`2026-02-30`）或枚举值不认识（`dead`）→ 退回 `unknown`，不编造「截至」时间。
 2. **计数器实算**：`docs/project-management/superpowers-kanban.md` 实际 `[x]` 19 条 / `[ ]` 2 条，
    故索引维持 **19 / 21**，未按计划里「预计 20/21」的预估勾任何一条。
-3. **插件独立跑不动是有意的**：脱离宿主直接 `run` 时 daemon 探测判活失败即退出
+3. **门禁的一次偶发失败（已排除）**：在 `dd59118c` 上第一次跑 `just ci` 时，
+   `yi-agent::subagent_real_e2e` 的 `local_runtime_fixture_uses_a_tempdir_socket` 与
+   `temporary_repository_allows_an_application_root_worktree` 报「isolated runtime daemon did not
+   become ready」，两处都是 10s 固定等待。本分支改动文件里没有任何 subagent/daemon/runtime 路径
+   （`git diff --name-only a44fbe5a..HEAD` 可查），单独重跑该 test binary 6 passed，随后在无并发
+   编译的机器上重跑完整 `just ci` → `CI passed`（4083 passed / 28 skipped），两条用例均为 PASS。
+   结论：与本次改动无关的负载敏感偶发，不是放宽断言带过的。
+4. **插件独立跑不动是有意的**：脱离宿主直接 `run` 时 daemon 探测判活失败即退出
    （`main.rs` 的 `liveness.observe`），所以真机验收必须在宿主里做，不能靠裸跑插件代替。
 
 未做（因此 K 行与 feature/bug 条目均保持未勾）：Step 4 的独立 bundle 打包（新 bundle id、绝对
