@@ -9,9 +9,9 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 23 / 25 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 25 / 26 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
-| yi-agent-tools | 19 / 20 | [详情](./yi-agent-tools.md) |
+| yi-agent-tools | 22 / 22 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
 | yi-agent-tui | 45 / 46 | [详情](./yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
@@ -21,13 +21,13 @@
 | ci-cd | 36 / 36 | [详情](./ci-cd.md) |
 | tooling | 11 / 11 | [详情](./tooling.md) |
 | yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
-| yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
+| yi-agent-store | 9 / 10 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
-| yi-agent-runtime | 24 / 25 | [详情](./yi-agent-runtime.md) |
+| yi-agent-runtime | 25 / 26 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 80 / 81 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
+| yi-agent-app-server | 81 / 81 | [详情](./yi-agent-app-server.md) |
+| subagent-runtime | 46 / 54 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 19 / 20 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 126 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |

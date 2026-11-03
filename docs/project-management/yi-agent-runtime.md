@@ -70,4 +70,4 @@
 
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
 
-- [ ] 临时旁问共享只读运行器 — 有效配置快照、独立取消/事件/用量与只读工具白名单，桌面/手机宿主与 TUI 共用；验收目标 `side_registry_rejects_mutation_even_with_yolo`、`side_cancel_does_not_cancel_parent`，执行 `cargo test -p yi-agent-runtime --lib side_`（测试待实现）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6–7、§12.1。
+- [x] 临时旁问共享只读运行器 — `SideConversationRunner`（`side_conversation/runner.rs:217`）持有有效配置快照、独立取消/事件/用量，工具白名单只读（yolo 也不放宽）；`SideSourcePublisher`（`side_conversation/source.rs:148`）负责父来源重发，`SideHostResources`（`side_conversation/resources.rs:66`）统一 per-parent runner 与阻塞池，桌面/手机宿主与 TUI 共用同一套。验收：`cargo test -p yi-agent-runtime --lib side_` → 88 通过（含 `side_registry_rejects_mutation_even_with_yolo`、`side_cancel_does_not_cancel_parent`）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6–7、§12.1。
