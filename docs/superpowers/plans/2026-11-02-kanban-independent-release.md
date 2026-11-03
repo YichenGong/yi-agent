@@ -649,7 +649,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 §3 `PluginHost`。SDK 只解析桥上下文/发送消息，不带宿主 RPC client 或 Tauri import。宿主绑定 frame/MessagePort、宿主身份、双代次、项目句柄；消息无法选择另一插件。
 
-- [ ] Step 1：桥测试：
+- [x] Step 1：桥测试：
   ```ts
   it('does not trust plugin-supplied identity', async () => {
     const reply = await bridge.receive(frameB, messageForFrameA);
@@ -658,10 +658,10 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
   });
   ```
   测试内使用两个实际不同的 fake frame/source 与同一协议黄金消息，不能把身份校验 mock 掉。
-- [ ] Step 2：增加重放初始化、旧项目响应、重载后写不重放、重复 request ID 改参数、超限/未知方法、事件缺修订先取快照的失败测试。
-- [ ] Step 3：实现受控 MessageChannel 初始化、限量请求表、取消等待语义、operationResult、主题/项目变更、订阅清理、频率限制与 openThread 范围检查；SDK 构建与宿主源码隔离。
-- [ ] Step 4：`(cd desktop && npx vitest run src/lib/pluginHost && npm run build) && npm ci --prefix plugins/sdk && npm test --prefix plugins/sdk && npm run build --prefix plugins/sdk`；contract golden 双端一致。
-- [ ] Step 5：按 C 提交 `feat: add scoped plugin bridge and standalone sdk`。
+- [x] Step 2：增加重放初始化、旧项目响应、重载后写不重放、重复 request ID 改参数、超限/未知方法、事件缺修订先取快照的失败测试。
+- [x] Step 3：实现受控 MessageChannel 初始化、限量请求表、取消等待语义、operationResult、主题/项目变更、订阅清理、频率限制与 openThread 范围检查；SDK 构建与宿主源码隔离。
+- [x] Step 4：`(cd desktop && npx vitest run src/lib/pluginHost && npm run build) && npm ci --prefix plugins/sdk && npm test --prefix plugins/sdk && npm run build --prefix plugins/sdk`；contract golden 双端一致。
+- [x] Step 5：按 C 提交 `feat: add scoped plugin bridge and standalone sdk`。
 
 ### Task T19：用第二插件验证发现、导航、设置与授权 UX
 
