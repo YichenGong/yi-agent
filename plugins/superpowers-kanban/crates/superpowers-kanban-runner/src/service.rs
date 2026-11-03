@@ -96,6 +96,21 @@ fn can_release_merge(
         && thread.is_some_and(|fact| fact.alive && fact.idle)
 }
 
+/// 一张卡合并时的**来源分支**。
+///
+/// 独立合并卡把 source 落在 `source_ref` 上；实现卡没有这个字段——它的分支是
+/// `next_launch` 建 worktree 时按 `kanban/<slug>` 起的。于是「空」不等于「没有
+/// 来源」,只等于「按规则推导」:把空串拼进 objective 会让模型去合一个不存在的
+/// 分支,而这正是合并回合唯一一次的输入。
+fn merge_source(card: &superpowers_kanban_core::card::Card) -> String {
+    card.source_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("kanban/{}", slugify(&card.id)))
+}
+
 /// 本拍宿主上报的会话事实里有没有这一个。
 fn thread_fact<'a>(threads: &'a [ThreadFacts], thread_id: &str) -> Option<&'a ThreadFacts> {
     threads.iter().find(|fact| fact.thread_id == thread_id)
@@ -1011,6 +1026,29 @@ impl BoardService {
         gate: crate::merge_lock::MergeLock,
         lease: Option<Lease>,
     ) -> Option<DriverAction> {
+        // 目标树要在写记录**之前**准备好:准备失败就不该留下任何安全记录。
+        // 合并在这棵树里做,而开发树只用来定位原会话。
+        let base = card
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
+        let target = match merge::prepare(&self.project_root, &base) {
+            Ok(tree) => tree.path,
+            Err(error) => {
+                eprintln!(
+                    "superpowers-kanban: cannot prepare a tree for {}: {error}",
+                    card.id.0
+                );
+                let _ = crate::merge_lock::clear_holder_if_matches(
+                    &self.state_dir,
+                    &card.id.0,
+                    std::process::id(),
+                );
+                drop(gate);
+                drop(lease);
+                return None;
+            }
+        };
         let record = crate::merge_attempt::MergeAttemptRecord {
             version: crate::merge_attempt::ATTEMPT_VERSION,
             action_id: ledger.action_id.clone(),
@@ -1106,7 +1144,7 @@ impl BoardService {
                 resume: Some(ledger.clone()),
             },
         );
-        let source = card.source_ref.clone().unwrap_or_default();
+        let source = merge_source(card);
         let base = card
             .base_ref
             .clone()
@@ -1117,9 +1155,12 @@ impl BoardService {
             thread_id: ledger.thread_id.clone(),
             workdir: ledger.expected_workdir.clone(),
             objective: crate::tick::queued_merge_objective(
+                &card.id.0,
                 &source,
                 &base,
                 &ledger.expected_workdir,
+                &target,
+                &self.state_dir,
             ),
             env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
         })
@@ -1220,13 +1261,16 @@ impl BoardService {
             driver_project: self.project_root.to_string_lossy().into_owned(),
             driver_ref: card.id.0.clone(),
             card_id: card.id.0.clone(),
-            workdir,
-            title: String::new(),
             objective: crate::tick::queued_merge_objective(
+                &card.id.0,
                 card.source_ref.as_deref().unwrap_or_default(),
                 &base,
                 &card.workdir.clone().unwrap_or_default(),
+                &workdir,
+                &self.state_dir,
             ),
+            workdir,
+            title: String::new(),
             env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
         })
     }
@@ -2886,6 +2930,34 @@ mod tests {
             service.merge_finish("card-1").unwrap(),
             MergeFinish::Cleared
         );
+    }
+
+    /// 实现卡没有 `source_ref`,它的分支是 `kanban/<slug>`。指令里若拼进空串,
+    /// 模型就会去合一个不存在的分支——而这是合并回合唯一的输入。
+    #[test]
+    fn merge_resume_names_the_derived_branch_of_an_implementation_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = service
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                None,
+                &caps(&["resume_append"]),
+            )
+            .unwrap()
+            .expect("a merge turn");
+        let DriverAction::ResumeAppend { objective, .. } = action else {
+            panic!("expected a resume");
+        };
+        assert_eq!(source, "kanban/card-1");
+        assert!(
+            objective.contains(&format!("take '{source}' into")),
+            "the derived branch must be named verbatim: {objective}"
+        );
+        assert!(!objective.contains("take '' into"), "{objective}");
     }
 
     #[test]

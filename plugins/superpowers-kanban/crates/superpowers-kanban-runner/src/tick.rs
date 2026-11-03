@@ -38,15 +38,64 @@ pub fn engagement_objective_for_paths(plan_path: &str, spec_path: &str) -> Strin
     )
 }
 
-/// 队列推进开出的合并回合：名额**已经**由 daemon 拿到，所以不再让模型去
-/// `merge-request`（那会撞上自己进程持有的锁，只会拿到 Busy）。
+/// 把一个 shell 参数安全地包起来（单引号 + 内部单引号转义）。
 ///
-/// 与 [`merge_objective`] 的差别只有「谁拿的名额」，其余边界（冲突就地解决、
-/// 不 push、不删源分支、成败自己写进卡片状态）完全一致。
-pub fn queued_merge_objective(source: &str, base: &str, workdir: &Path) -> String {
+/// 合并指令里会带上分支名、两个目录和一个绝对 state-dir——它们都来自看板数据或
+/// 用户输入，不能直接拼进命令。用 `sh -c` 的往返测试锁住这个行为。
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// 实现卡续跑回合的 objective：**自包含**的一轮合并指令（spec §9）。
+///
+/// "自包含"是这次需求的硬要求。热会话（原会话还活着）可能仍然记得开发阶段的
+/// 范围限制——"只在开发树里工作"、"Never merge yourself"。所以这段话必须：
+///
+/// - 明确说**本轮授权替代**那条旧的范围限制（但不替代任何权限/sandbox 规则）；
+/// - 给出卡片 id、源分支、base、开发树、目标树、**绝对** state-dir，
+///   不依赖 `state --self` 的环境变量（冷装配才注入 env，热会话没有）；
+/// - 说清 daemon 已经持着名额，不要再 `merge-request`；
+/// - 要求合并与验证**同步等待**结束，不留还能写目标树的后台进程；
+/// - 不 push、不删源分支、不删开发树（删了以后就无法冷恢复原会话）。
+pub fn queued_merge_objective(
+    card_id: &str,
+    source: &str,
+    base: &str,
+    development_workdir: &Path,
+    target_workdir: &Path,
+    state_dir: &Path,
+) -> String {
+    let card = shell_quote(card_id);
+    let source = shell_quote(source);
+    let base = shell_quote(base);
+    let development = shell_quote(&development_workdir.display().to_string());
+    let target = shell_quote(&target_workdir.display().to_string());
+    let state = shell_quote(&state_dir.display().to_string());
     format!(
-        "This card was queued for merge by the user and its turn has come. Merge the          branch {source} into {base} in {workdir}. The project merge slot is already          held for you, so do not call `superpowers-kanban merge-request`. Do not push          and do not delete the source branch. Resolve conflicts in place and commit          the merge. When you are done, release the slot with          `superpowers-kanban merge-finish <card-id>` and record the outcome with          `superpowers-kanban state --self <state>`: `done` when          `git merge-base --is-ancestor {source} {base}` succeeds, otherwise          `needs_you` with the reason.",
-        workdir = workdir.display(),
+        "This card ({card}) was authorized for merge by the user. This turn **replaces** the \
+         earlier scope restriction that told you to work only in the development worktree and \
+         never to merge; that restriction is now lifted for this card. It does **not** lift any \
+         permission or sandbox rule: keep using the same approval flow as before, and if the \
+         target tree cannot be authorized, stop and report needs_you instead of widening \
+         access.\n\n\
+         The merge: take {source} into {base} in the target worktree {target}. The development \
+         worktree {development} is where this conversation started; it is only used to locate \
+         this session. Do not merge there. The project merge slot is already held for you by \
+         the daemon, so do **not** call `superpowers-kanban merge-request`.\n\n\
+         Run the merge and the project's verification **synchronously**: wait for every command \
+         and every writer to finish before you declare the outcome. A background process that \
+         can still write the target tree is not a finished merge, and \"the session looks idle\" \
+         is not proof that some other process stopped. Do not push, do not delete the source \
+         branch, and do not delete the development worktree (deleting it would make this \
+         conversation impossible to restore later). Resolve conflicts in place and commit \
+         them.\n\n\
+         When you are done, record the outcome with your own card id and state directory — do \
+         not rely on `--self`, because a restored session may not have that environment:\n\
+         `superpowers-kanban state {card} done --state-dir {state}` when \
+         `git merge-base --is-ancestor {source} {base}` succeeds, otherwise \
+         `superpowers-kanban state {card} needs_you --detail '<reason>' --state-dir {state}`.\n\
+         Do not call `merge-finish`: the daemon releases the slot on its own once it sees your \
+         result and observes this session idle."
     )
 }
 
@@ -184,23 +233,97 @@ mod tests {
         );
     }
 
-    /// 队列推进的合并回合不能说「去 merge-request」：名额已由 daemon 持有。
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// 续跑指令必须自包含:明确 card id、两个目录、绝对 state-dir,且要求
+    /// 同步等待——不能留还能写目标树的后台进程（spec §9）。
     #[test]
-    fn the_queued_merge_objective_does_not_ask_for_a_second_grant() {
-        let objective = queued_merge_objective("kanban/card-1", "main", Path::new("/w/merge"));
-        // `format!` 的续行会留下成串空格，比对前先归一。
-        let flat = objective.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("kanban/card-1"), "{objective}");
-        assert!(flat.contains("/w/merge"), "{objective}");
-        assert!(flat.contains("merge slot is already held"), "{objective}");
-        assert!(
-            flat.contains("do not call `superpowers-kanban merge-request`"),
-            "必须明说不要再申请一次：{objective}"
+    fn merge_authorization_is_explicit_and_location_safe() {
+        let text = queued_merge_objective(
+            "card-1",
+            "kanban/card-1",
+            "main",
+            Path::new("/w/dev"),
+            Path::new("/w/base tree"),
+            Path::new("/p/.yi-agent/kanban"),
         );
-        // 收尾动作必须仍在，否则名额永远不还、状态也没人写。
-        assert!(objective.contains("merge-finish"), "{objective}");
-        assert!(objective.contains("state --self"), "{objective}");
-        assert!(objective.contains("Do not push"), "{objective}");
+        assert!(text.contains("card-1"));
+        assert!(text.contains("--state-dir '/p/.yi-agent/kanban'"));
+        assert!(text.contains("'/w/base tree'"));
+        assert!(text.contains("'/w/dev'"));
+        assert!(!text.contains("<card-id>"));
+        assert!(!text.contains("state --self"));
+        assert!(!text.contains("release the slot with"));
+        let flat = flat(&text);
+        assert!(flat.contains("merge slot is already held"), "{flat}");
+        assert!(
+            flat.contains("do **not** call `superpowers-kanban merge-request`"),
+            "{flat}"
+        );
+        // 同步等待是硬要求:后台进程能写目标树就等于没合完。
+        assert!(flat.contains("**synchronously**"), "{flat}");
+        // 本轮授权替代旧的范围限制,但不替代权限/sandbox。
+        assert!(
+            flat.contains("replaces the earlier scope restriction")
+                || flat.contains("**replaces** the earlier scope restriction"),
+            "{flat}"
+        );
+        assert!(
+            flat.contains("does **not** lift any permission or sandbox rule"),
+            "{flat}"
+        );
+        assert!(flat.contains("Do not push"), "{flat}");
+        assert!(
+            flat.contains("do not delete the development worktree"),
+            "{flat}"
+        );
+    }
+
+    /// 单引号、空格、`$` 都必须原样到达 shell,不能被解释或截断。
+    #[test]
+    fn shell_quoting_survives_a_real_shell_round_trip() {
+        for value in [
+            "plain",
+            "with space",
+            "quote's here",
+            "$HOME and $(id)",
+            "semi;colon and other-command",
+            "back slash",
+        ] {
+            let quoted = shell_quote(value);
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("sh runs");
+            assert!(output.status.success(), "sh failed for {value:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                value,
+                "quoting must round-trip {value:?}"
+            );
+        }
+    }
+
+    /// 一条含注入内容的参数不能真的执行里面的命令。
+    #[test]
+    fn shell_quoting_does_not_execute_injected_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let attack = format!("x; touch {}", marker.display());
+        let quoted = shell_quote(&attack);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {quoted}"))
+            .output()
+            .expect("sh runs");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), attack);
+        assert!(
+            !marker.exists(),
+            "an injected command must stay literal text"
+        );
     }
 
     /// 两段文案必须真的不同——否则「拆开」只是改名。

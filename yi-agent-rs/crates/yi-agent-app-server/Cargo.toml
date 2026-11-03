@@ -62,6 +62,11 @@ uuid.workspace = true
 tempfile = "3"
 
 [dev-dependencies]
+# 端到端串联测试要跑**真插件**服务（判定、journal、锁全是真的），只把模型换成
+# mock。只有 dev-dependency：宿主生产代码不依赖看板类型，D4 的"宿主不认识看板"
+# 不被打破。
+superpowers-kanban-runner = { path = "../../../plugins/superpowers-kanban/crates/superpowers-kanban-runner" }
+superpowers-kanban-core = { path = "../../../plugins/superpowers-kanban/crates/superpowers-kanban-core" }
 # Endpoint stubbing for the `onboarding/*` connection probe tests.
 wiremock = "0.6"
 tokio-tungstenite = "0.29"

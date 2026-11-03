@@ -26,7 +26,9 @@ struct FakeDaemon {
     calls: Arc<StdMutex<Vec<serde_json::Value>>>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
-    _dir: tempfile::TempDir,
+    /// `Some` 只在 `bind` 自建项目目录时出现：那个临时目录必须活到 daemon 结束，
+    /// 否则 socket 与项目清单会在断言前被删掉。`bind_at` 的项目目录归调用方所有。
+    _dir: Option<tempfile::TempDir>,
     project: PathBuf,
     #[allow(dead_code)]
     runtime_dir: PathBuf,
@@ -41,6 +43,23 @@ impl FakeDaemon {
         let dir = tempfile::TempDir::new().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
+        let mut daemon = Self::bind_at(&project, on_query);
+        daemon._dir = Some(dir);
+        daemon
+    }
+
+    /// 在调用方给的**项目目录**上听 socket。
+    ///
+    /// 串联夹具要的项目不是 `bind` 随手造的那个空目录,而是一个真实的 git 仓库
+    /// (看板要 `git worktree add`、合并要点出 base 分支)。项目的生命周期因此归
+    /// 调用方:daemon 只借它的路径。
+    fn bind_at(
+        project: &Path,
+        on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
+        + Send
+        + 'static,
+    ) -> Self {
+        let project = project.to_path_buf();
         let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&project);
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
@@ -106,7 +125,7 @@ impl FakeDaemon {
             calls,
             stop,
             handle: Some(handle),
-            _dir: dir,
+            _dir: None,
             project,
             runtime_dir,
         }
@@ -2405,5 +2424,799 @@ async fn resume_append_refuses_to_drop_an_injected_environment() {
     assert!(
         !host.thread_roots.lock().unwrap().contains_key(tid),
         "a refused assembly must not leave a per-thread root behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 7.3:真插件热串联——授权合并必须回到**原会话**
+// ---------------------------------------------------------------------------
+
+/// 一个装了 `superpowers-kanban` 的真实项目:真 git 仓库、真 spec/plan、真看板。
+struct KanbanProject {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    state_dir: PathBuf,
+    spec: PathBuf,
+    plan: PathBuf,
+    card_id: String,
+}
+
+impl KanbanProject {
+    /// `git init -b main` + 一个 seed commit。看板要 `git worktree add`,合并要
+    /// 点出 base 分支,两者都要求这是一棵**真有历史**的仓库。
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .output()
+                .expect("git must be available");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        // 看板状态与卡片 worktree 都落在项目根下,必须忽略,否则主检出会因我们
+        // 自己的运行时状态变「脏」。
+        std::fs::write(root.join(".gitignore"), ".yi-agent/\n.worktrees/\n").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/alpha.spec.md"), "# alpha spec\n").unwrap();
+        std::fs::write(root.join("docs/alpha.plan.md"), "# alpha plan\n").unwrap();
+        let out = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "seed"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "seed commit failed");
+
+        let spec = root.join("docs/alpha.spec.md");
+        let plan = root.join("docs/alpha.plan.md");
+        let state_dir = root.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let card_id = superpowers_kanban_core::card_id::card_id_for(
+            &spec.to_string_lossy(),
+            &plan.to_string_lossy(),
+        );
+        Self {
+            _dir: dir,
+            root,
+            state_dir,
+            spec,
+            plan,
+            card_id,
+        }
+    }
+
+    /// 真投递:经**真实 dispatch** 写 inbox,再让 runner 消费成一一张卡。
+    fn enqueue(&self, service: &superpowers_kanban_runner::service::BoardService) {
+        let params = json!({
+            "spec_path": self.spec.to_string_lossy(),
+            "plan_path": self.plan.to_string_lossy(),
+        });
+        superpowers_kanban_runner::dispatch::dispatch_with_service(
+            service,
+            &self.state_dir,
+            None,
+            "enqueue",
+            &params,
+        )
+        .expect("a valid spec/plan pair must be accepted");
+        service.consume_inbox(chrono::Local::now());
+    }
+
+    fn call(
+        &self,
+        service: &superpowers_kanban_runner::service::BoardService,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        superpowers_kanban_runner::dispatch::dispatch_with_service(
+            service,
+            &self.state_dir,
+            None,
+            method,
+            params,
+        )
+        .expect("the real dispatch must answer")
+    }
+
+    /// 看板上这张卡此刻的形状。
+    fn card(
+        &self,
+        service: &superpowers_kanban_runner::service::BoardService,
+    ) -> serde_json::Value {
+        self.call(service, "list", &json!({}))
+            .get("cards")
+            .and_then(|cards| cards.as_array())
+            .and_then(|cards| {
+                cards
+                    .iter()
+                    .find(|card| card["id"] == serde_json::Value::String(self.card_id.clone()))
+                    .cloned()
+            })
+            .unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// 预置一条**不可重试**的装配失败,让 `attach_cwd_runtime` 直接返回它。
+///
+/// 热串联钉的是「动作回到原会话」,不是委派工具;不预置的话
+/// `ensure_owned_runtime` 会在测试里真起一个 daemon(还留下子进程),与用例
+/// 想验证的事实无关。
+fn block_delegation_for(host: &Host, workdir: &Path) {
+    host.runtimes.lock().unwrap().insert(
+        super::project_key(workdir),
+        Err(yi_agent_subagent::attach::AttachFailure::new(
+            "test",
+            "the hot round trip does not need delegation",
+        )),
+    );
+}
+
+/// **本次改造的验收用例**:真插件、真看板、真 `driver_tick`、真 `ServeLauncher`。
+///
+/// 插件的 `driver/next` **不**由夹具自造动作,而是转给真实
+/// `dispatch_with_service`,所以判定、租约、安全记录、objective 文案全是真的。
+/// 唯一假的是模型(`build_test_agent` 不会真的合并)。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_original_session_hot_round_trip() {
+    let project = KanbanProject::new();
+    let home = tempfile::TempDir::new().unwrap();
+    let service = Arc::new(superpowers_kanban_runner::service::BoardService::new(
+        project.state_dir.clone(),
+        project.root.clone(),
+        Some(home.path().to_path_buf()),
+    ));
+    project.enqueue(&service);
+    assert_eq!(
+        project.card(&service)["state"],
+        "queued",
+        "the card must be on the board before the first tick"
+    );
+
+    // 假 transport,真判定:每个插件请求原样交给真实 dispatch。
+    let daemon = FakeDaemon::bind_at(&project.root, {
+        let service = Arc::clone(&service);
+        let state_dir = project.state_dir.clone();
+        move |_project, method, params| {
+            superpowers_kanban_runner::dispatch::dispatch_with_service(
+                &service, &state_dir, None, method, params,
+            )
+        }
+    });
+    let resident_dir = tempfile::TempDir::new().unwrap();
+    install_driver_plugin(&project.root, resident_dir.path(), "superpowers-kanban");
+
+    let mut host = Host::new();
+    let dev_worktree = superpowers_kanban_runner::worktree::worktree_path(
+        &project.root,
+        &superpowers_kanban_core::card::CardId::new(project.card_id.clone()),
+    );
+    block_delegation_for(&host, &dev_worktree);
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+
+    // ① 第一拍:插件交出 `launch`,宿主真起一个会话。
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    assert_eq!(host.threads.len(), 1, "the launch registers one session");
+    let tid = host.threads.keys().next().cloned().unwrap();
+    assert!(
+        host.settle_turn(&tid, Duration::from_secs(20)).await,
+        "the first turn must finish"
+    );
+
+    // ② 第二拍:回报落账(`thread_id` 写进卡片),再把卡推进到合并队列。
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    let after_launch = project.card(&service);
+    assert_eq!(after_launch["state"], "running");
+    assert_eq!(
+        after_launch["thread_id"], tid,
+        "the board must remember which session is this card's own"
+    );
+    assert_eq!(
+        after_launch["workdir"],
+        serde_json::Value::String(dev_worktree.to_string_lossy().into_owned()),
+        "the card's development workdir is the worktree the launch created"
+    );
+
+    project.call(
+        &service,
+        "card.state",
+        &json!({ "card_id": project.card_id, "state": "awaiting_merge" }),
+    );
+    project.call(
+        &service,
+        "merge_request",
+        &json!({ "card_id": project.card_id }),
+    );
+    assert_eq!(project.card(&service)["state"], "merge_queued");
+
+    // ③ 第三拍:真插件必须交出 `resume_append`,且指回原会话。
+    let mut frames = host
+        .hub
+        .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    assert_eq!(
+        host.threads.len(),
+        1,
+        "an authorized merge must never start a second session"
+    );
+    assert!(
+        host.threads
+            .get(&tid)
+            .is_some_and(|session| session.active_turn_id.is_some()),
+        "the merge turn must land on the original session"
+    );
+    let resume_calls: Vec<serde_json::Value> = daemon
+        .calls_to("driver/next")
+        .into_iter()
+        .filter(|call| {
+            call["params"]["results"]
+                .as_array()
+                .is_some_and(|results| !results.is_empty())
+        })
+        .collect();
+    assert!(
+        !resume_calls.is_empty(),
+        "the third tick must carry the launch result back to the plugin"
+    );
+
+    // 新 objective 真的落在原 thread 上(可见性通知,不是响应帧)。
+    assert!(
+        host.settle_turn(&tid, Duration::from_secs(20)).await,
+        "the merge turn must finish"
+    );
+
+    // objective 是跨进程契约:自包含、引号安全、不要求再申请名额。
+    let prompt = host
+        .threads
+        .get(&tid)
+        .and_then(|session| session.store.load(&tid).ok().flatten())
+        .map(|loaded| {
+            loaded
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::protocol::Item::UserMessage { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .next_back()
+        .expect("the merge objective must be delivered as a user turn");
+    assert!(
+        prompt.contains(&project.card_id),
+        "the objective must name the card: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("'kanban/{}'", project.card_id)),
+        "the objective must name the derived source branch: {prompt}"
+    );
+    assert!(
+        prompt.contains("already held"),
+        "the daemon already holds the slot; the model must not call merge-request: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("--state-dir '{}'", project.state_dir.display())),
+        "the state dir must be absolute and quoted: {prompt}"
+    );
+    assert!(
+        prompt.contains("Do not call `merge-finish`"),
+        "the daemon releases the slot itself: {prompt}"
+    );
+    assert!(
+        !prompt.contains("state --self"),
+        "a hot session may not have the env; the card id must be explicit: {prompt}"
+    );
+
+    let mut texts = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        if let Some(text) = frame["params"]["item"]["text"].as_str() {
+            texts.push(text.to_string());
+        }
+    }
+    assert!(
+        texts.iter().any(|text| text.contains(&project.card_id)),
+        "the merge objective must be announced on the original thread: {texts:?}"
+    );
+
+    // ④ 第四拍:受理落账。成功**不**替模型写卡片状态。
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    let attempt_path = project
+        .state_dir
+        .join(superpowers_kanban_runner::merge_attempt::ATTEMPT_FILE);
+    let attempt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&attempt_path).unwrap()).unwrap();
+    assert_eq!(attempt["phase"], "accepted");
+    assert_eq!(attempt["card_id"], project.card_id);
+    assert_eq!(attempt["thread_id"], tid);
+    assert_eq!(
+        project.card(&service)["state"],
+        "running",
+        "the plugin must not invent a card state on behalf of the model"
+    );
+
+    // ⑤ 模型声明合并完成;下一拍观测到「原会话空闲」才放掉名额。
+    project.call(
+        &service,
+        "card.state",
+        &json!({ "card_id": project.card_id, "state": "done" }),
+    );
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    assert!(
+        !attempt_path.exists(),
+        "the safety record must be cleared once the merge is over"
+    );
+    assert!(
+        superpowers_kanban_runner::merge_lock::read_holder(&project.state_dir).is_none(),
+        "the merge slot must be released for the next card"
+    );
+    assert_eq!(project.card(&service)["state"], "done");
+
+    // 全程只有原会话:开发树里一份 meta,没有第二个。
+    let store = crate::thread_store::ThreadStore::new(&dev_worktree);
+    let metas = store.list().unwrap();
+    assert_eq!(metas.len(), 1, "no replacement session may be created");
+    assert_eq!(metas[0].thread_id, tid);
+}
+
+// ---------------------------------------------------------------------------
+// Task 7.4:真插件冷串联——重启后必须恢复**同一** thread id,并带上 bash env
+// ---------------------------------------------------------------------------
+
+/// 冷恢复轮次里的脚本化模型:先让真 `bash` 把卡片句柄打出来,再收尾。
+///
+/// 断言必须打在**真跑起来的 shell**上(`printf '%s' "$SUPERPOWERS_KANBAN_CARD"`):
+/// 从 `resume_append` 到 `attach_delegation` 再到子进程有三道手,只比较
+/// 「参数传进去了」发现不了哪一道把值丢了。
+struct ColdBashProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl yi_agent_core::Provider for ColdBashProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+        // 标题调用不是对话轮,不能占掉「第 0 次」。
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                E::TextDelta("t".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])));
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events = if n == 0 {
+            vec![
+                E::ToolUseStart {
+                    id: "merge-probe".into(),
+                    name: "bash".into(),
+                },
+                E::ToolUseDelta {
+                    id: "merge-probe".into(),
+                    // 命令原样取自计划:只打印句柄,不做别的事。
+                    partial_json: r#"{"command":"printf '%s' \"$SUPERPOWERS_KANBAN_CARD\""}"#
+                        .into(),
+                },
+                E::ToolUseEnd {
+                    id: "merge-probe".into(),
+                },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        } else {
+            vec![
+                E::TextDelta("merge recorded".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// 冷恢复用的工厂:真工具集、真权限层、`yolo = true`(否则真 bash 会等审批)。
+///
+/// 与 `build_long_tool_agent` 同型:工具集在 `build_runtime_tooling` 里会被整份
+/// 换掉,这里建注册表只为让 `BuiltAgent` 自洽;`yolo` 才是真正决定 bash 能不能
+/// 直接跑的那个值(它经 `wrap_for_delegation` 传给工具权限层)。
+fn build_cold_bash_agent(
+    session: Option<yi_agent_core::Session>,
+    _cwd: &Path,
+    _mode: crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(ColdBashProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let yolo = yi_agent_core::autonomy::YoloSwitch::new(true);
+    let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+        yi_agent_core::permission::PermissionsConfig::default(),
+        yolo.clone(),
+        PathBuf::from("/tmp"),
+        Arc::new(|_cmd: &str| None),
+    ));
+    let registry =
+        yi_agent_runtime::bootstrap::build_tool_setup(&crate::test_support::test_config(), false)
+            .unwrap();
+    let config = yi_agent_core::AgentConfig::default();
+    let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+    let rx_arc = Arc::new(Mutex::new(decision_rx));
+    let mut agent = yi_agent_core::Agent::new(
+        provider.clone(),
+        Arc::clone(&registry.tools),
+        config.clone(),
+    )
+    .with_permission(checker, rx_arc.clone());
+    crate::server::apply_session(&mut agent, session);
+    Ok(BuiltAgent {
+        agent,
+        provider,
+        config,
+        decision_tx: Some(decision_tx),
+        decision_rx: Some(rx_arc),
+        catalog: None,
+        yolo,
+        process_manager: Arc::clone(&registry.process_manager),
+        mcp: None,
+    })
+}
+
+/// 一个已经跑过首轮、并把卡推进到合并队列的项目。
+///
+/// 交回时第一个宿主已经 drop(等价于进程退出):`threads` 表没了、driver 没了、
+/// writer 锁随会话释放;留下的只有 git 树、看板、thread 历史与开发 worktree。
+struct QueuedMerge {
+    project: KanbanProject,
+    service: Arc<superpowers_kanban_runner::service::BoardService>,
+    daemon: FakeDaemon,
+    resident_dir: tempfile::TempDir,
+    tid: String,
+    dev_worktree: PathBuf,
+}
+
+impl QueuedMerge {
+    async fn setup() -> Self {
+        let project = KanbanProject::new();
+        let home = tempfile::TempDir::new().unwrap();
+        let service = Arc::new(superpowers_kanban_runner::service::BoardService::new(
+            project.state_dir.clone(),
+            project.root.clone(),
+            Some(home.path().to_path_buf()),
+        ));
+        project.enqueue(&service);
+        let daemon = FakeDaemon::bind_at(&project.root, {
+            let service = Arc::clone(&service);
+            let state_dir = project.state_dir.clone();
+            move |_project, method, params| {
+                superpowers_kanban_runner::dispatch::dispatch_with_service(
+                    &service, &state_dir, None, method, params,
+                )
+            }
+        });
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_driver_plugin(&project.root, resident_dir.path(), "superpowers-kanban");
+        let dev_worktree = superpowers_kanban_runner::worktree::worktree_path(
+            &project.root,
+            &superpowers_kanban_core::card::CardId::new(project.card_id.clone()),
+        );
+
+        // 第一个宿主:首轮 + 回报。委派预置失败只为不真起 daemon——本轮不带
+        // env,失败会被当作「这个会话没有委派工具」,不影响要验的事实。
+        let tid = {
+            let mut host = Host::new();
+            block_delegation_for(&host, &dev_worktree);
+            let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+            host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+                .await;
+            let tid = host
+                .threads
+                .keys()
+                .next()
+                .cloned()
+                .expect("the first tick must launch the card's session");
+            assert!(
+                host.settle_turn(&tid, Duration::from_secs(20)).await,
+                "the first turn must finish"
+            );
+            host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+                .await;
+            tid
+        };
+
+        assert_eq!(project.card(&service)["thread_id"], tid);
+        project.call(
+            &service,
+            "card.state",
+            &json!({ "card_id": project.card_id, "state": "awaiting_merge" }),
+        );
+        project.call(
+            &service,
+            "merge_request",
+            &json!({ "card_id": project.card_id }),
+        );
+        assert_eq!(
+            project.card(&service)["state"],
+            "merge_queued",
+            "the card must be waiting in the merge queue"
+        );
+
+        Self {
+            project,
+            service,
+            daemon,
+            resident_dir,
+            tid,
+            dev_worktree,
+        }
+    }
+}
+
+/// **冷路径的验收用例**:进程重启后,授权合并必须恢复**同一个** thread id,
+/// 并在真 bash 里看得见插件给的卡片句柄。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_original_session_cold_round_trip() {
+    let queued = QueuedMerge::setup().await;
+    let QueuedMerge {
+        project,
+        service,
+        daemon,
+        resident_dir,
+        tid,
+        dev_worktree,
+    } = queued;
+
+    // 重启前历史确实在盘上(否则下面的恢复断言测的是别的东西)。
+    let store = crate::thread_store::ThreadStore::new(&dev_worktree);
+    assert!(
+        store
+            .restore_for_driver(&tid, &dev_worktree)
+            .expect("the persisted thread must be strictly readable")
+            .is_some(),
+        "the first turn must have persisted meta and a log"
+    );
+
+    // 第二个宿主:空 `threads`、空 driver 记账,只把**真实** runtime 预置进缓存,
+    // 让 `attach_delegation` 走真 daemon(而不是降级成「没有委派」)。
+    let mut host = Host::new();
+    let mut cfg = host.cfg.clone();
+    cfg.workdir = dev_worktree.clone();
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&dev_worktree);
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime_dir.clone(),
+            &host.models_path,
+        )
+        .expect("a clean development worktree must attach a real runtime"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime_dir,
+        host.models_path.clone(),
+        Arc::clone(&attached),
+    );
+    host.runtimes
+        .lock()
+        .unwrap()
+        .insert(super::project_key(&dev_worktree), Ok(binding));
+
+    // 工厂记录它拿到的旧会话:冷恢复必须把首轮历史原样交回模型。
+    let restored = Arc::new(StdMutex::new(Vec::<(usize, String)>::new()));
+    let recorder = Arc::clone(&restored);
+    let builder = move |session: Option<yi_agent_core::Session>,
+                        cwd: &Path,
+                        mode: crate::thread_store::ThreadMode| {
+        recorder.lock().unwrap().push((
+            session.as_ref().map(|s| s.messages().len()).unwrap_or(0),
+            session
+                .as_ref()
+                .and_then(|s| s.messages().first())
+                .map(|m| format!("{:?}", m.content))
+                .unwrap_or_default(),
+        ));
+        build_cold_bash_agent(session, cwd, mode)
+    };
+
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+    host.tick(resident_dir.path(), &mut drivers, &builder).await;
+
+    // 恢复的是**原** thread,不是新铸一个。
+    assert_eq!(
+        host.threads.len(),
+        1,
+        "the cold restore must register exactly one session"
+    );
+    assert_eq!(
+        host.threads.keys().next().map(String::as_str),
+        Some(tid.as_str()),
+        "the authorized merge must resume the card's own thread id"
+    );
+    let recorded = restored.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "one restore, one build");
+    assert!(
+        recorded[0].0 >= 2,
+        "the restored session must carry the first turn's messages, got {}",
+        recorded[0].0
+    );
+
+    assert!(
+        host.settle_turn(&tid, Duration::from_secs(30)).await,
+        "the restored merge turn must finish"
+    );
+
+    // env 的终点:真 bash 子进程读到的就是这张卡的 id。
+    let loaded = store
+        .load(&tid)
+        .unwrap()
+        .expect("the merge turn must be persisted on the same thread");
+    let bash_results: Vec<String> = loaded
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::protocol::Item::ToolCall { name, result, .. } if name == "bash" => {
+                result.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        bash_results
+            .iter()
+            .any(|result| result.contains(&project.card_id)),
+        "the restored shell must see the card handle; got {bash_results:?}"
+    );
+
+    // 没有第二个 meta:恢复不 `create`。
+    assert_eq!(
+        store.list().unwrap().len(),
+        1,
+        "a cold restore must not create a replacement session"
+    );
+
+    // 后续拍:插件看到的仍是**一条**该 thread 的观测,且 alive/idle。
+    host.tick(resident_dir.path(), &mut drivers, &builder).await;
+    let last_params = daemon
+        .calls_to("driver/next")
+        .last()
+        .map(|call| call["params"].clone())
+        .expect("the plugin must have been asked");
+    let facts: Vec<serde_json::Value> = last_params["threads"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|fact| fact["thread_id"] == tid)
+        .collect();
+    assert_eq!(
+        facts.len(),
+        1,
+        "the driver must register the restored thread once, not per tick: {last_params}"
+    );
+    assert_eq!(facts[0]["alive"], true);
+    assert_eq!(facts[0]["idle"], true);
+
+    // 受理后卡片离开 `Running` 才能放门:模型自己写 done 是唯一来源。
+    project.call(
+        &service,
+        "card.state",
+        &json!({ "card_id": project.card_id, "state": "done" }),
+    );
+    host.tick(resident_dir.path(), &mut drivers, &builder).await;
+    assert!(
+        !project
+            .state_dir
+            .join(superpowers_kanban_runner::merge_attempt::ATTEMPT_FILE)
+            .exists(),
+        "the safety record must be cleared once the merge is over"
+    );
+    assert_eq!(project.card(&service)["state"], "done");
+}
+
+/// 原开发目录被删:必须转人工,**绝不**另起一个会话顶替。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_original_session_cold_reports_a_deleted_worktree() {
+    let QueuedMerge {
+        project,
+        service,
+        daemon: _daemon,
+        resident_dir,
+        tid,
+        dev_worktree,
+    } = QueuedMerge::setup().await;
+
+    // 真删:用 git 自己的 `worktree remove`,与用户清理时的路径一致。
+    let out = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&dev_worktree)
+        .current_dir(&project.root)
+        .output()
+        .expect("git must be available");
+    assert!(out.status.success(), "git worktree remove failed");
+    assert!(!dev_worktree.exists());
+
+    let mut host = Host::new();
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+    // 一拍派发,一拍回报:插件只有拿到分类过的失败才会把人叫来。
+    host.tick(resident_dir.path(), &mut drivers, &build_cold_bash_agent)
+        .await;
+    assert!(
+        host.threads.is_empty(),
+        "a missing development tree must never become a fresh session"
+    );
+    host.tick(resident_dir.path(), &mut drivers, &build_cold_bash_agent)
+        .await;
+    assert!(host.threads.is_empty(), "no launch, no replacement session");
+    assert_eq!(
+        project.card(&service)["state"],
+        "needs_you",
+        "the card must be handed to a human, not silently retried"
+    );
+    // 绑定没被改写:下次人工续跑仍指回原会话。
+    assert_eq!(project.card(&service)["thread_id"], tid);
+}
+
+/// 历史日志损坏:同样转人工并保留原绑定,**绝不**用失忆会话继续合并。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_original_session_cold_refuses_corrupt_history() {
+    let QueuedMerge {
+        project,
+        service,
+        daemon: _daemon,
+        resident_dir,
+        tid,
+        dev_worktree,
+    } = QueuedMerge::setup().await;
+
+    let log = dev_worktree
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.jsonl"));
+    let before = std::fs::read(&log).expect("the first turn must have written a log");
+    let mut corrupted = before.clone();
+    corrupted.extend_from_slice(b"{not json}\n");
+    std::fs::write(&log, &corrupted).unwrap();
+
+    let mut host = Host::new();
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+    host.tick(resident_dir.path(), &mut drivers, &build_cold_bash_agent)
+        .await;
+    assert!(
+        host.threads.is_empty(),
+        "a corrupt log must never be recovered into a fresh session"
+    );
+    host.tick(resident_dir.path(), &mut drivers, &build_cold_bash_agent)
+        .await;
+    assert!(host.threads.is_empty());
+    assert_eq!(project.card(&service)["state"], "needs_you");
+    assert_eq!(project.card(&service)["thread_id"], tid);
+    // 失败路径不改写权威历史:坏行仍在,人工可以据此判断要不要从备份恢复。
+    let after = std::fs::read(&log).unwrap();
+    assert_eq!(
+        after, corrupted,
+        "a refused restore must not rewrite the history it could not read"
     );
 }

@@ -760,6 +760,26 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
             card.id.0, card.state, where_, archived, stale, merging
         ));
     }
+    // 未结算的合并安全记录。它是**顶层**证据（卡归档/清掉也还在），而且离线恢复
+    // 必须带精确的 action id——不在这里打出来，用户就只能去翻 JSON 文件。
+    match superpowers_kanban_runner::merge_attempt::read(state_dir) {
+        Ok(Some(record)) => lines.push(format!(
+            "merge attempt {} phase {} for {} (thread {}){}",
+            record.action_id,
+            match record.phase {
+                superpowers_kanban_runner::merge_attempt::MergePhase::Pending => "pending",
+                superpowers_kanban_runner::merge_attempt::MergePhase::Accepted => "accepted",
+                superpowers_kanban_runner::merge_attempt::MergePhase::Uncertain => "uncertain",
+            },
+            record.card_id,
+            record.thread_id.as_deref().unwrap_or("<none>"),
+            record.expected_workdir.display(),
+        )),
+        Ok(None) => {}
+        // 坏记录不能当没有：它正是"不确定"的来源，必须让用户看见。
+        Err(error) => lines.push(format!("merge attempt UNREADABLE: {error}")),
+    }
+
     // 待消费投递。
     let inbox = superpowers_kanban_core::inbox::inbox_dir(state_dir);
     if let Ok(entries) = std::fs::read_dir(&inbox) {
@@ -1636,6 +1656,51 @@ mod tests {
     }
 
     /// `list` 的 `[stale]` 只来自观测旁路：会话没了要显眼，但**不改**卡片状态。
+    /// 离线恢复必须带精确的 `action_id`，而文本 `list` 是用户唯一能看见它的地方。
+    ///
+    /// 回归锁：早期 `list` 只列卡片，`merge-finish` 的 waiting 文案却让用户
+    /// "see superpowers-kanban list"——照着做根本取不到这个 id。
+    #[test]
+    fn list_prints_the_unsettled_merge_attempt_and_its_action_id() {
+        use superpowers_kanban_runner::merge_attempt::{
+            MergeAttemptRecord, MergePhase, save as save_attempt,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+
+        assert!(
+            !command_list(state_dir, false)
+                .unwrap()
+                .contains("merge attempt"),
+            "没有任何 attempt 时不该编出一条"
+        );
+
+        save_attempt(
+            state_dir,
+            &MergeAttemptRecord {
+                version: 1,
+                action_id: "act-9f3a-7".to_string(),
+                card_id: "card-1".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                expected_workdir: std::path::PathBuf::from("/w/card-1"),
+                phase: MergePhase::Uncertain,
+                merge_queued_at: None,
+            },
+        )
+        .unwrap();
+
+        let listing = command_list(state_dir, false).unwrap();
+        assert!(listing.contains("act-9f3a-7"), "{listing}");
+        assert!(listing.contains("card-1"), "{listing}");
+        assert!(listing.contains("uncertain"), "{listing}");
+        assert!(listing.contains("/w/card-1"), "{listing}");
+
+        // 坏记录不能被当成"没有记录"而静默消失。
+        std::fs::write(state_dir.join("merge.attempt.json"), b"{").unwrap();
+        let listing = command_list(state_dir, false).unwrap();
+        assert!(listing.contains("UNREADABLE"), "{listing}");
+    }
+
     #[test]
     fn list_marks_a_running_card_stale_without_touching_its_state() {
         use superpowers_kanban_core::board::Board;
@@ -2350,6 +2415,28 @@ mod tests {
             assert!(
                 SKILL.contains(&call),
                 "SKILL.md never shows `{call}`: the model cannot use what it cannot read"
+            );
+        }
+    }
+
+    /// README / INSTALL 里那句动词全景必须与 `USAGE` 逐字对齐。
+    ///
+    /// 它们是人看的第一手文档：动词改名或新增后只改 USAGE，读者会照着旧清单敲
+    /// `merge-cancel` 之类的"看起来应该有"的动词，或者根本发现不了新动词。
+    const README: &str = include_str!("../../../README.md");
+    const INSTALL: &str = include_str!("../../../INSTALL.md");
+
+    #[test]
+    fn the_release_docs_list_exactly_the_cli_verbs() {
+        let inside = crate::USAGE
+            .split_once('<')
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(inside, _)| inside)
+            .expect("USAGE must list the verbs between < and >");
+        for (name, doc) in [("README.md", README), ("INSTALL.md", INSTALL)] {
+            assert!(
+                doc.contains(&format!("superpowers-kanban <{inside}>")),
+                "{name} must show the full verb list `superpowers-kanban <{inside}>`"
             );
         }
     }

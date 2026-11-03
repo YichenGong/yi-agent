@@ -57,7 +57,7 @@ superpowers-kanban
 预期：打印用法并以退出码 2 结束（没有子命令即用法错误，这是正常的）：
 
 ```
-superpowers-kanban: usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest> [...]
+superpowers-kanban: usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|merge-cancel|done|state|archive|purge|list|on|off|workdir|manifest> [...]
 ```
 
 若报 `command not found`，说明没进 `PATH`，回到上一步。
@@ -398,6 +398,169 @@ superpowers-kanban: rejected my-card (spec file does not exist: )
 > 只接了 **stderr**，stdout 仍被丢弃——长驻的 `run` 全程用 stderr 报告，
 > stdout 留给一次性命令（`add`/`list`/`on`/`off`）的结果通道。
 > 日志按 append 写，不轮转（这类日志量极小）。
+
+---
+
+## 9. 合并的执行位置：升级、降级与人工恢复
+
+实现卡的合并**不是**新开一个会话去跑，而是回到这张卡自己的开发会话：
+
+| 情况 | daemon 怎么做 | 你的会话看到什么 |
+|---|---|---|
+| 原会话还在内存里 | 追加一轮（`resume_append`） | 同一段上下文里收到合并指令 |
+| 进程重启过、会话已冷掉 | 按原 `thread_id` + 开发 worktree 的持久历史冷恢复 | 恢复出来的仍是同一会话、同一份工具结果 |
+| 开发树被删、历史损坏、锁被占 | **不派发**，卡转 `needs_you` 并附原因 | 不会换一个会话顶替，需要人工处理 |
+
+`thread_id` 与 `workdir` 从入队到结束都不会被改写。这点是硬约束：换会话意味着
+上下文丢失，模型会重新踩一遍已经踩过的坑。
+
+### 9.1 升级顺序（宿主 / 插件 / daemon / skill 要一起换）
+
+四块里**顺序错了会静默新开会话**，所以按下面来：
+
+1. **停插件并排空**：让当前没有在飞的合并。
+   ```bash
+   superpowers-kanban list
+   ```
+   预期：末尾**没有** `merge attempt …` 行。有的话先按 9.3 处理，再继续。
+2. **换插件二进制 + 重铺 skill**（第 2a、3a 节）。
+3. **升级宿主 / app-server**，然后重启 daemon，让旧 daemon 进程退出
+   （`yi-agent daemon` 只有 `start`/`status`/`stop`，**没有** `restart`）：
+   ```bash
+   yi-agent daemon stop
+   yi-agent daemon start
+   ```
+   旧 daemon 的内存里可能还留着旧插件契约，重启才算真的换掉。
+4. **重新拉起插件**并核对能力协商：
+   ```bash
+   pkill -f "superpowers-kanban run"
+   pgrep -fl "superpowers-kanban run"    # daemon 1 秒内拉起新进程
+   ```
+   再挑一张卡走一遍合并，确认它真的从 `merge_queued` 走进 `[merging]`：
+   ```bash
+   superpowers-kanban list
+   ```
+   卡一直停在 `merge_queued`（没有 `⇄ [merging]`）说明第 3 步的 daemon 没重启干净，
+   旧进程还在按旧契约干活，回去重做第 3 步。
+
+   具体原因（`the host does not declare the resume_append action`）写在卡片 `detail`
+   里。文本 `list` 只打 id/状态/workdir，**不带** detail；要看就读状态目录：
+
+   ```bash
+   grep -o '"detail":"[^"]*"' \
+     '<项目根>/.yi-agent/superpowers-kanban/board.json'
+   ```
+
+   （桌面看板把同一份 detail 显示在卡片上。）
+
+为什么要这个顺序：
+
+- **新插件 + 旧宿主**：安全。插件发现宿主没声明 `resume_append`，会一直 defer
+  合并，卡停在 `merge_queued`，不做任何有损的事。
+- **旧插件 + 新宿主**：危险。旧插件不懂"回到原会话"，仍会 `launch` 一个新会话去合并，
+  正是本版要修的行为。所以**不能**让旧插件跑在新宿主上。
+
+### 9.2 降级前必须先排空
+
+降级（装回旧版插件）前：
+
+```bash
+superpowers-kanban list        # 末尾不应有 merge attempt 行
+superpowers-kanban list | grep '\[merging\]'   # 不应有输出
+```
+
+有在飞的合并就等它跑完，或用 `merge-cancel` 把**还在队列里**的卡退出来
+（已开跑的不能取消）。确认干净后再降级。
+
+**不要直接删 `merge.attempt.json` 来"清干净"。** 那条记录是安全证据：它证明这一轮
+可能已经把指令交给了某个会话。删掉之后 daemon 会认为没有在飞的合并，可能再派一次，
+造成同一张卡并发合并。要清就走 9.3 的 `merge-finish --recover`。
+
+### 9.3 卡在 `merge attempt` 上时的人工恢复
+
+`list` 打印的那行给出了精确的 `action_id`：
+
+```
+merge attempt act-9f3a-7 phase accepted for alpha-spec-alpha-plan (thread 6f2c…) @ /…/card
+```
+
+确认**真的没有东西在跑**之后再执行：
+
+1. **真正停掉插件**——只 `pkill` 不够：监督器会在 `restart_backoff_ms` 后把它重新拉起，
+   而恢复要求 `plugin.lock` 空闲。先摘清单，再确认进程没了：
+   ```bash
+   rm -f <项目根>/.yi-agent/supervisors/superpowers-kanban.json   # 监督器 500ms 内停掉它
+   sleep 1
+   pgrep -fl "superpowers-kanban run"    # 必须没有输出
+   ```
+   恢复完再按第 5 步把清单放回去（`superpowers-kanban manifest` 打出来的那份）。
+2. 自己确认相关进程都停了（模型回合、工具子进程、`git`）、Git 状态符合你的判断
+   （`git log` / `git status`）。这一步**只能由人做**，命令不会替你验证。
+3. 如果卡还写着 `running`，先替它判定结果——恢复命令会拒绝 `running` 的卡，
+   它不替你决定合并成没成：
+   ```bash
+   superpowers-kanban state <card-id> done        # 合并确实落了
+   superpowers-kanban state <card-id> needs_you   # 没落，留给人处理
+   ```
+4. 跑离线恢复，把上面那行的 `action_id` 原样填进去：
+   ```bash
+   superpowers-kanban merge-finish <card-id> \
+     --recover --attempt <action-id> --ack-stopped \
+     --state-dir '<项目根>/.yi-agent/superpowers-kanban'
+   ```
+   - `--ack-stopped` 是**必填**的：它表示"我已经确认停下来了"。少了它命令直接拒绝。
+   - `--state-dir` 请写**绝对路径**。命令本身不校验，写相对路径就按你的当前目录解析，
+     很可能指到另一个目录的看板上去。
+   - 命令会依次拿到 `plugin.lock`、非阻塞的 `merge.lock`、`board.lock`，再核对
+     `card_id` + `action_id` 都吻合才清记录；对不上就拒绝，不会误清别的合并。
+     `plugin.lock` 被占（插件或 daemon 还在跑）或被 `merge.lock` 挡住时同样拒绝。
+   - 卡仍是 `running` 时**拒绝**——先用 `state <card-id> done` 或 `needs_you` 判定它。
+   - 成功输出 `recovered` 并删掉记录、清 holder；没有任何记录时报
+     `there is no merge attempt record to recover`。
+5. 恢复插件：把第 1 步摘掉的清单放回去，daemon 会在 500ms 内拉起它。
+   ```bash
+   pgrep -fl "superpowers-kanban run"
+   ```
+   没有输出就检查清单路径与开关（第 4、5 节）。
+
+> 这条命令**只记录你做过的确认**，它不证明任何进程真的停了。"停没停"是你的判断，
+> 不是程序的验证。别把它当成自动清障开关。
+
+### 9.4 不能自动恢复的三种情形
+
+遇到就别指望 daemon 修好，按下面处理：
+
+| 情形 | 表现 | 怎么办 |
+|---|---|---|
+| **meta-only**：卡片记着 `thread_id`，但那份会话历史已经没了 | 每拍都 deferred / `needs_you`，重复同一句原因 | 人工判断合并是否还需要做；需要就在普通会话里自己合并，再 `state <card-id> done` |
+| **旧版覆写过的 `thread_id`**：升级前那个 id 指向的是旧版新开的合并会话，不是开发会话 | 能恢复，但恢复出来的是"那轮合并"，上下文不对 | 不要把结果当开发上下文用；按 9.3 清掉安全记录后人工处理 |
+| **开发 worktree 被删** | `needs_you`，reason 提到 `workdir` 不存在 | 恢复不了原树就人工合并；`git worktree add` 重建同名树**不能**救回会话历史 |
+
+通用原则：**不要新开一张卡或新开会话"重跑一遍合并"**。那会绕过 `merge.lock` 的
+单合并约束，也可能把已经合进去的东西再合一次。
+
+### 9.5 安全记录坏了
+
+`list` 打出 `merge attempt UNREADABLE: …` 说明 `merge.attempt.json` 解析不了。
+这**不是**"没有记录"，daemon 会因此停下所有合并。处理：
+
+1. 停插件（同上）。
+2. 备份坏文件，**不要**直接删：
+   ```bash
+   cp <state-dir>/merge.attempt.json <state-dir>/merge.attempt.json.broken-$(date +%s)
+   ```
+3. 用 `git log` / `git status` 人工核对目标分支与卡片状态，判定这一轮到底做没做。
+4. 判定结果写进卡片（`state <card-id> done` 或 `needs_you`），再由你决定是否移走
+   `<state-dir>/merge.attempt.json`。
+5. 重新拉起插件。
+
+> 从备份恢复时优先用你**自己**的备份目录/Time Machine，而不是删掉重来。
+
+### 9.6 升级 skill 后，热会话仍可能记得旧做法
+
+skill 是文件副本，已开的会话不会重新读取。升级后**只对新会话生效**；一个正在
+合作的旧会话可能还按"新开合并会话"的旧说法回答。遇到这种情况先开新会话，
+不要顺着旧说法去做。
 
 ---
 
