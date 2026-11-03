@@ -267,12 +267,35 @@ impl Admission {
     }
 
     /// 仍存活的屏障前 permit 数量。屏障"等它归零"用的就是它。
+    ///
+    /// **必须以磁盘上的锁为准，不能读进程内的登记表。** 三个理由：
+    ///
+    /// 1. 屏障的读者（生命周期事务）通常持有**另一个** `Admission` 句柄，
+    ///    它看不到登记表里由别的句柄放进去的条目——那样屏障会立刻"通过"，
+    ///    而旧回合其实还在写。
+    /// 2. 跨进程的回合完全不在本进程的登记表里，读表会把它们算成零。
+    /// 3. `flock` 才是真实存活证据：进程崩溃由内核释放，`SIGSTOP` 则不释放。
+    ///
+    /// 目录里的每个 permit 都是屏障前的：排空期间 `admit_turn` 直接拒绝，
+    /// 根本不会新建文件。所以"文件存在且锁被持有"就是"屏障前的活跃回合"。
+    /// 打不开的文件按仍被持有处理——让屏障多等一轮，比在旧进程还在写时
+    /// 继续迁移安全。
     pub fn live_before_barrier_permits(&self) -> usize {
-        self.turns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|turn| turn.before_barrier && is_lock_held(&turn.lock))
+        let dir = self.home.join("plugins").join("permits");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("permit")
+            })
+            .filter(|entry| is_path_held(&entry.path()))
             .count()
     }
 
@@ -288,6 +311,25 @@ impl Admission {
             )),
         }
     }
+}
+
+/// 按路径探测：这个 permit 文件上的锁现在还有人持有吗？
+fn is_path_held(path: &Path) -> bool {
+    let Ok(probe) = std::fs::OpenOptions::new().write(true).open(path) else {
+        // 打不开就不能证明"没人持有"。
+        return true;
+    };
+    let outcome = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if outcome == 0 {
+        // 探针拿到了锁 → 真的没人持有。立即放掉。
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+        return false;
+    }
+    let error = std::io::Error::last_os_error();
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    )
 }
 
 /// 用一个**独立描述符**探测锁是否仍被持有。

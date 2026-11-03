@@ -9,9 +9,12 @@ pub mod admission;
 pub mod bundle;
 pub mod error;
 pub mod grants;
+pub mod journal;
+pub mod lifecycle;
 pub mod limits;
 pub mod locks;
 pub mod manifest;
+pub mod migration;
 pub mod operations;
 pub mod project;
 pub mod registry;
@@ -22,8 +25,17 @@ pub use admission::{Admission, Phase, TurnPermit};
 pub use bundle::{InstalledRelease, install_verified, verify_installed};
 pub use error::PluginError;
 pub use grants::{Grant, GrantTable};
+pub use journal::{
+    Blocking, Journal, JournalError, JournalErrorKind, JournalStore, JournalTarget,
+    LifecycleAction, LifecyclePhase,
+};
+pub use lifecycle::{
+    BackupSource, CommittedActivation, Lifecycle, LifecycleRequest, PendingTransaction, Progress,
+    RuntimeControl,
+};
 pub use limits::ExtractLimits;
 pub use manifest::{Manifest, MethodDecl, ViewDecl};
+pub use migration::{Backup, BackupEntry, BackupManifest};
 pub use operations::{OperationLedger, OperationOutcome};
 pub use project::{ProjectResolver, ProjectRoot};
 pub use registry::{GrantSummary, InstalledVersion, PluginRecord, Registry};

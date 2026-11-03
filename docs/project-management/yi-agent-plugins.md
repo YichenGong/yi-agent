@@ -77,4 +77,14 @@
 - [x] 结果查询按原绑定作用域 — 别的项目或别的授权代次查不到。判据：`a_result_cannot_be_read_through_another_project_binding`
 - [x] 坏台账不当空表 — 当空会重放用户已看到成功的写。判据：`a_corrupt_ledger_is_reported_rather_than_treated_as_empty`
 - [x] 台账读改写跨进程串行 — `begin`/`finish` 各取一次 `operations.lock` 短锁；`result` 只读不加锁（`rename` 保证只看到完整文件）。判据：`two_processes_beginning_different_requests_do_not_lose_an_update`（删锁即打红，已实测）
-- [ ] 候选激活、事务日志与失败恢复 — T12
+- [x] 候选版本不可作为公共激活 — `Lifecycle::check_binding` 在能力检查之前拒绝候选代次，`Maintenance` 能力例外。判据：`a_candidate_release_is_not_usable_through_a_normal_binding`
+- [x] 八阶段持久化与唯一恢复动作 — `src/journal.rs` 的 `LifecyclePhase::recovery_action`；只有 `done` 开放准入。判据：`every_persisted_phase_declares_its_recovery_action`、`the_phase_order_is_strictly_forward`
+- [x] 崩溃恢复先于准入 — 准入关闭以**磁盘日志**为准，重启不丢。判据：`admit_is_closed_for_the_duration_of_recovery`、`recovery_from_{draining,drained,backing_up,migrating,health_checking,committing}_keeps_the_old_version`、`recovery_never_starts_anything_before_it_settles`
+- [x] 备份清单与完整性 — 摘要逐项校验、`complete` 标记、残缺备份拒绝恢复。判据：`recovery_does_not_restore_from_an_incomplete_backup`、`a_backup_is_rejected_if_a_file_no_longer_matches_its_digest`、`restoring_a_backup_twice_is_idempotent`
+- [x] 备份不含瞬态资源 — 不带 `.sock`/`.pid`/`.lock`。判据：`a_backup_never_contains_sockets_pids_or_live_locks`
+- [x] 迁移失败时全部项目不恢复准入 — 任一失败即停在 `migrating` + `RecoveryRequired`，列出失败项目。判据：`a_failed_migration_does_not_restore_admission_for_any_project`、`a_failed_migration_reports_every_blocked_project`
+- [x] 健康失败停候选且不提交 — 判据：`a_failed_health_check_stops_the_candidate_without_committing`、`recovery_from_health_checking_stops_the_candidate`
+- [x] 提交后不可取消 — `projecting`/`done` 拒绝 `cancel`。判据：`cancel_is_refused_after_the_commit`、`cancel_restores_admission_and_keeps_the_plugin_open`
+- [x] 恢复不覆盖别人改过的共享配置修订 — 判据：`recovery_does_not_overwrite_a_shared_config_revision_that_moved`
+- [x] 屏障计数以磁盘锁为准（跨句柄/跨进程） — 不再读进程内登记表。判据：`the_admission_barrier_counts_permits_from_another_handle`、`a_live_turn_keeps_the_transaction_at_drained`
+- [ ] 整机配额域适配与项目维护所有权 — T13

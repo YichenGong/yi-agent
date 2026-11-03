@@ -477,11 +477,18 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 §3 Lifecycle API、G2 phase 表、RuntimeControl trait。测试提供 `RecordingRuntime`，其实现逐项记录 maintenance/start/stop/health 动作并按指定阶段返回错误，不空实现成总成功。
 
-- [ ] Step 1：状态机测试先断言候选不可被普通 binding 使用、一个项目迁移失败时全部项目不恢复新准入、cancel 只在可安全退回阶段恢复。
-- [ ] Step 2：恢复测试使用表驱动循环覆盖 G2 每个持久化 phase：注入崩溃 → 重开 registry/lifecycle → recover → 断言唯一下一步及准入状态。
-- [ ] Step 3：实现备份清单和完整性、幂等迁移/从备份重做、候选维护凭据、全部健康后原子提交、修复投影后开放准入；任何不可恢复状态保持 RecoveryRequired。
-- [ ] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test lifecycle && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test recovery`。断言恢复前没有 start/launch 发生，备份不包含 socket/PID/活锁，恢复不覆盖别人改过的共享配置修订。
-- [ ] Step 5：按 C 提交 `feat: activate plugin versions with recoverable transactions`。
+- [x] Step 1：状态机测试先断言候选不可被普通 binding 使用、一个项目迁移失败时全部项目不恢复新准入、cancel 只在可安全退回阶段恢复。
+  > 2026-11-03：`a_candidate_release_is_not_usable_through_a_normal_binding`（同时断言「候选被拒」「维护凭据可用」「提交后可用」）、`a_failed_migration_does_not_restore_admission_for_any_project`、`cancel_is_refused_after_the_commit`、`cancel_restores_admission_and_keeps_the_plugin_open`。
+- [x] Step 2：恢复测试使用表驱动循环覆盖 G2 每个持久化 phase：注入崩溃 → 重开 registry/lifecycle → recover → 断言唯一下一步及准入状态。
+  > 2026-11-03：`tests/recovery.rs` 从 `draining`/`drained`/`backing_up`/`migrating`/`health_checking`/`committing` 各建一份「进程死掉」的中间状态，重开后 `recover`。共同断言 `assert_recovered_safely`：无未完成日志、旧激活仍可用、目标代次报 `StaleBinding`、`committed.activation == 6`。另有 `every_persisted_phase_declares_its_recovery_action` 逐项检查恢复动作与准入开放。
+- [x] Step 3：实现备份清单和完整性、幂等迁移/从备份重做、候选维护凭据、全部健康后原子提交、修复投影后开放准入；任何不可恢复状态保持 RecoveryRequired。
+  > 2026-11-03：`src/journal.rs`（冻结的八阶段 + 校验）、`src/migration.rs`（清单 + 摘要 + `complete` 标记 + 幂等 `restore`）、`src/lifecycle.rs`（状态机 + `RuntimeControl`）。
+  > 备份**永不包含** `.sock`/`.pid`/`.lock`：带活锁会让恢复后出现「幽灵持有者」。清单先以 `complete: false` 落盘，全部文件复制完并校验后才置真——半份备份与完整备份的清单形状必须不同，否则恢复会把项目数据截断到某个中间状态。
+  > 迁移任一项目失败 → 全部不恢复新准入，日志停在 `migrating`、`RecoveryRequired` 上抛，等人工重试或取消。
+- [x] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test lifecycle && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test recovery`。断言恢复前没有 start/launch 发生，备份不包含 socket/PID/活锁，恢复不覆盖别人改过的共享配置修订。
+  > 2026-11-03：`lifecycle` 17/17、`recovery` 15/15。专项：`recovery_never_starts_anything_before_it_settles`、`a_backup_never_contains_sockets_pids_or_live_locks`、`recovery_does_not_overwrite_a_shared_config_revision_that_moved`、`recovery_does_not_restore_from_an_incomplete_backup`、`a_backup_is_rejected_if_a_file_no_longer_matches_its_digest`、`restoring_a_backup_twice_is_idempotent`。
+  > 变异 15 项全部打红（候选可用、准入关闭检查、迁移失败恢复准入、健康失败不停候选、提交后允许取消、备份完整性、瞬态资源、摘要校验、activation 0、目标插件不符、准入恒开、回滚恒可、屏障忽略磁盘锁、共享修订比较、候选未被记录）。
+- [x] Step 5：按 C 提交 `feat: activate plugin versions with recoverable transactions`。
 
 ### Task T13：实现整机配额域适配与项目维护所有权
 
