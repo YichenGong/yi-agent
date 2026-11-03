@@ -1281,6 +1281,19 @@ mod tests {
             .call(serde_json::json!({"command": "echo \"[$YI_AGENT_THREAD_ID]\""}))
             .await;
         assert!(!result.is_error);
+        // The variable is scrubbed from the *command*, not assumed absent from the
+        // environment. A shell child inherits the parent's environment, and every
+        // real host sets this one: the app-server injects `YI_AGENT_THREAD_ID` for
+        // the thread it is serving, and an agent-hosted test run inherits it too.
+        // Asserting on an unsanitised expansion made the test measure the caller's
+        // environment rather than "no session env means no injection", and it failed
+        // for exactly that reason under `just ci` while passing from a bare shell.
+        let result = tool
+            .call(serde_json::json!({
+                "command": "env -u YI_AGENT_THREAD_ID sh -c 'echo \"[$YI_AGENT_THREAD_ID]\"'"
+            }))
+            .await;
+        assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert!(
                 s.contains("[]"),

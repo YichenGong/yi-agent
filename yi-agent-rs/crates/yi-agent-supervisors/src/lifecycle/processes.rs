@@ -425,6 +425,17 @@ pub fn become_group_leader() -> io::Result<()> {
 ///
 /// The caller must have verified the group's identity first; this function
 /// cannot tell a recycled PGID from the original.
+///
+/// `EPERM` needs a second look rather than an immediate error. On macOS,
+/// `kill(-pgid, ...)` reports `EPERM` both for *another user's* live group and for
+/// *our own* group whose members have all exited but are still unreaped. The two
+/// need opposite answers, and the difference is observable only by enumeration.
+/// This is not a hypothetical race: the guardian proves ownership and then signals
+/// the group, and a short-lived command can exit inside that window, so a caller
+/// that treated `EPERM` as failure would report a stopped group as a fault
+/// intermittently and only under load. Enumeration decides it: an empty group is
+/// already stopped (nothing left to signal), while live members we cannot signal
+/// stay an error.
 pub fn kill_group(pgid: i32) -> io::Result<()> {
     if pgid <= 0 {
         return Err(io::Error::new(
@@ -439,6 +450,11 @@ pub fn kill_group(pgid: i32) -> io::Result<()> {
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
         // Already gone; not an error for a terminating caller.
+        return Ok(());
+    }
+    if error.raw_os_error() == Some(libc::EPERM) && live_group_members(pgid)?.is_empty() {
+        // Our own group, already drained to zombies: nothing can run again, so
+        // there is nothing to signal and certainly nothing to report as a fault.
         return Ok(());
     }
     Err(error)
@@ -551,6 +567,48 @@ mod tests {
         assert!(kill_group(0).is_err());
         assert!(kill_group(-5).is_err());
         assert!(group_is_empty(0).is_err());
+    }
+
+    #[test]
+    fn signalling_a_group_of_zombies_is_not_a_failure() {
+        // The window this pins: a short command exits, its leader stays an unreaped
+        // zombie (the guardian keeps the `Child` until the group is confirmed
+        // stopped), and only then does the guardian signal the group.
+        //
+        // On macOS `kill(-pgid, ...)` answers `EPERM` in exactly that state, which
+        // that one syscall cannot distinguish from another user's live group.
+        // Reading it as failure made a drained group look like a fault, and the
+        // symptom was intermittent: `managed groups not stopped: ... Operation not
+        // permitted` only when a short-lived helper exited inside the window between
+        // proving ownership and signalling.
+        let mut child = unsafe {
+            Command::new("/usr/bin/true")
+                .pre_exec(|| {
+                    become_group_leader()?;
+                    Ok(())
+                })
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let pgid = child.id() as i32;
+        // Wait for the leader to exit *without reaping it*: `try_wait` would reap.
+        let mut waited = Duration::ZERO;
+        while !live_group_members(pgid).unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += Duration::from_millis(5);
+            assert!(waited < Duration::from_secs(10), "the leader must exit");
+        }
+        // The leader is now a zombie holding the PGID: the group still exists, has
+        // no live member, and cannot legally be signalled.
+        let raw = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        if raw == 0 {
+            // Another platform (or a kernel that reaped it already) makes the group
+            // vanish instead; `kill_group` must still succeed, so the assertion below
+            // covers both shapes.
+        }
+        kill_group(pgid).expect("a group of zombies has nothing left to signal");
+        let _ = child.wait();
     }
 
     #[test]

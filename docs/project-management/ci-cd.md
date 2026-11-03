@@ -65,4 +65,31 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做
 
+- [x] 共享运行时生命周期的真进程门禁（Task 18） — `yi-agent-rs/justfile` 新增 `runtime-lifecycle-check`，跑 20 个会 fork guardian／daemon／executor 的集成目标外加 lifecycle 单元族：
+  `managed_runtime_lifecycle`、`managed_roles`、`frontend_runtime_lease`、`managed_bringup`、`managed_process_groups`、`managed_channel`、`client_reclamation`、
+  `execution_admission`、`guardian_control`、`guardian_status`、`guardian_handover`、`runtime_switch`、`runtime_migration`、`runtime_scope`、
+  `runtime_restart_preview`、`executor_isolation`、`executor_bridge`、`executor_gate`、`bringup_policy`、`managed_bash`。
+  **为什么单独 recipe 不进 `just ci`**：这些目标会真的 spawn 进程组，个别用例要等真实的 10 秒优雅窗口；塞进 `cargo nextest --workspace` 会把日常 `just test` 从十几秒拖到几分钟。
+  **为什么只在 macOS job 跑**：进程组语义不可移植——`kill(-pgid, 0)` 对「只剩 zombie 的自有组」在 macOS 返回 `EPERM`，而与另一个用户的活组不可区分；守护者的 `group_state` 正是在这两者之上做判断，Linux 全绿不代表本平台成立。
+  GitHub `.github/workflows/ci.yml` 的 `macos` job 扩到 lifecycle／supervisors／subagent／store／CLI 八个 crate 并新增 `just runtime-lifecycle-check` 一步（同时补 `extractions/setup-just@v2`，否则该步会以 `command not found` 失败）；
+  GitLab `.gitlab-ci.yml` 的 `ci-push`（Mac mini）在 `just ci` 之后跑同一 recipe，云端 `ci-mr` 不跑（`rust:latest` 是 Linux，且无 macOS 进程组语义）。
+  **`runtime_process_helper` 的排除**：它是固定 `#[ignore]` 的 OS fixture，只由 harness 用 `--exact --ignored` 拉起；`.config/nextest.toml` 用 `default-filter = "not test(runtime_process_helper)"` 把它从默认调度排除，
+  因为 `--run-ignored all` 恰好是排查「某用例从没跑过」时最容易输入的，而这条用例的本意是永远不被当普通用例调度。
+  判据：`just runtime-lifecycle-check` 实测 20 个目标全绿，**205 用例：191 passed / 4 ignored / 0 failed**（单目标最长 30.06s 是 `runtime_switch` 的真实优雅窗口，
+  整轮约 46s）；
+  `cargo nextest list -p yi-agent --test managed_runtime_lifecycle` 的输出里**不含** `runtime_process_helper`（排除生效）。
+  **残余限制**：真实 Cmd+Q 属本机隔离 App 手动冒烟，无头 CI 不声称覆盖；`quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 仍缺（见 subagent-runtime.md 的 executor 生产装配缺口）
+
+- [x] 首次全量门禁暴露的两个红：一个是真缺陷，一个是测试测错了对象 — 本分支第一次跑 `just ci` 报 2 failed（4495 passed）。
+  **① `managed_process_groups a_bootstrap_descriptor_does_not_collide_with_the_ready_barrier` 偶发 `Operation not permitted`（真缺陷）**：
+  `kill_group` 把 `EPERM` 一律当失败，但 macOS 上 `kill(-pgid, SIGKILL)` 对两种情况都返回 `EPERM`——**别的用户的活组**，与**自己的、成员已全部退出但尚未 reap 的组**。
+  后者是正常终态（没有可运行的东西，也没有可发的信号），却被报成故障，于是短命令在「证明归属 → 发信号」之间退出时，守护者把自己的组报成 `managed groups not stopped`。
+  只有该窗口被撞上才失败，所以表现为偶发（同 target 13 个用例并发时 3/3 红，单跑 8 次红 1 次）。修复：`EPERM` 时再枚举一次，组内无存活成员即视为已停；**仍有存活成员则保持报错**（不能把别人的组当成自己的）。
+  判据：`cargo nextest run -p yi-agent-supervisors --test managed_process_groups` 连跑 6 轮全绿；新增单测 `signalling_a_group_of_zombies_is_not_a_failure`，**变异验证**撤掉修复即红（实测 RED 后恢复）。
+  **② `yi-agent-tools shell::bash bash_without_a_session_env_leaves_the_variable_unset` 必红（测试测错了对象）**：
+  它断言 `echo "[$YI_AGENT_THREAD_ID]"` 展开为空，前提是宿主环境没有该变量；但 app-server 会为所服务的线程注入它（`server.rs` 有一处 `YI_AGENT_THREAD_ID`），
+  任何 agent 托管下的 `just ci` 都带着它，于是这条在裸 shell 过、在门禁里红。这不是产品行为错误——`bash_injects_the_session_env_into_the_child` 已经覆盖注入方向。
+  修复：命令改为 `env -u YI_AGENT_THREAD_ID sh -c ...`，把「没有 session 注入 ⇒ 空展开」测在命令层面，而不是去测调用者的环境。
+  判据：宿主持有该变量时该用例仍绿；`just ci` 从 `2 failed` 变为 `4498 tests run: 4498 passed, 32 skipped`。
+
 - [x] 发布门禁核对运行时清单与 sidecar digest — `.github/workflows/release.yml` 的 "Verify the desktop app is in the npm package" 步骤。原来只有 `codesign --verify --deep --strict`：`--deep` 与发布时的实际签名顺序（sidecar 先签、外层后签、全程不 `--deep`）语义不一致，且**完全没检查 daemon 身份**——一个 `runtime-sidecar.json` 缺失或 digest 与包里 sidecar 不符的 App 也能发出去，而桌面壳启动时会拒绝它。现在改为 `codesign --verify --strict`，并新增：清单必须存在、`sha256` 必须等于 `sha256(yi-agent.app/Contents/MacOS/yi-agent)`、打印 build id。判据：`grep -c "runtime-sidecar.json" .github/workflows/release.yml` ≥ 1；本地等价断言由 `bash desktop/scripts/test_runtime_build_identity.sh` 覆盖（20 passed）

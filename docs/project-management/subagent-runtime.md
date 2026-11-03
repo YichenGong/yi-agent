@@ -165,7 +165,39 @@
   后台回收线程用固定的 `RECLAIM_GRACE` / `RECLAIM_CONFIRM`。判据：`cargo test -p yi-agent-supervisors --test client_reclamation`
   （20 passed，含 `a_short_callers_budget_does_not_shorten_the_grace_window`——停得慢的组在 700ms 优雅期内自行退出时不得出现 terminate 调用）；
   变异验证：恢复 `deadline.clamp(self.grace)` → 该例红（实测 RED 后恢复）
-- [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
+- [x] 默认 bring-up 走显式策略接缝（Task 18） — 原来 `BringUpPolicy` 存在但**没有任何生产调用者**：两个决定项目运行时如何起来的入口
+  （`yi-agent-app-server/src/server.rs::attach_cwd_runtime` 与 `yi-agent-subagent/src/binding.rs::repair_with_generation`）都直接调 embedded 路径，
+  所以「把默认切到 managed」只能逐个改调用点并指望不漏。现在统一走
+  `yi_agent_subagent::attach::ensure_owned_runtime_with_policy(cfg, runtime_dir, models_path, instance_home, policy, expected)`：
+  `Embedded` 保持原行为，`Managed` 转 `attach_managed_project_runtime`（`BringUpIntent::Business`，预算 `MANAGED_START_BUDGET = 30s`，
+  覆盖 guardian 自己的 20s daemon 启动 + 10s fork／协调锁／业务 attach）。
+  `RuntimeBinding::RepairPlan` 现在**记住**首次采用的策略（`BringUpChoice { policy, expected, instance_home }`），因为一次 repair 若从 embedded 静默切到 managed，
+  等于在会话中途改变「谁拥有 daemon」——那不是修复。缺的 `expected` 现在**拒绝**而不是降级成 unknown：managed 路径的全部意义就是比对构建，
+  静默在未经分类的运行时上跑业务正是它要防的失败。
+  **默认仍为 `Embedded`**：executor 生产装配未接通（见下一条），把 managed 设为默认等于给每个用户一个 worker 隔离尚未接线的运行时。
+  判据：`cargo test -p yi-agent-subagent --test bringup_policy`（5 passed，新增 `a_managed_bring_up_without_an_expected_artifact_is_refused`——断言拒绝理由点名 artifact identity、不可重试、且**不创建 runtime 目录**；
+  `the_managed_budget_covers_a_cold_guardian_and_daemon_start`）；`cargo test -p yi-agent-subagent`（100 lib + 集成全绿）
+
+- [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。
+  **2026-11-03 复核：缺的不是「少写一个 connector」，而是三处结构性前提都不存在，因此判定为需要设计决策，不能在本期收口。**
+  ① **控制协议没有「发通道」这个操作**：`ManagedSpawnClient::connect` 只接受**继承来的**描述符（路径连接被刻意禁止，否则任何本地进程都能要求 guardian 代它 spawn），
+  但 `ControlRequest` 的全部变体（`Identity`／`Register`／`Resume`／`Heartbeat`／`Release`／`ReclaimStatus`／`Operation`／`Admission`／`Preview`／`PreviewPage`／`Confirm`／`Status`）
+  里没有任何一项会被 guardian 应答以一个描述符；`codec` 是裸 JSON（u32 长度 + body），没有 `SCM_RIGHTS` 通道。也就是说「guardian 如何把 owner-bound 通道交给 daemon」这一步在设计上还没落地。
+  ② **daemon 不认识客户端身份**：`yi-agent-store`（daemon 侧）里 `ClientGrant` 出现次数为 0，它只有自己的 `RuntimeClients`（root→owner 的字符串绑定）。
+  而 `GuardianAdmission::new(runtime_dir, grant)` 要求客户端 grant，`guardian` 的 `Admission` 分支按 grant 校验 owner——所以 daemon 目前**无法**通过准入检查，即便有了 connector。
+  ③ **工具侧同样停在接口层**：`ManagedSpawner::new(ChannelFactory)` 的生产注入点 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 全仓只有一处调用且传 `None`
+  （`bootstrap.rs:210`），`ManagedSpawner::new` 的调用者全部在 `crates/yi-agent-tools/tests/managed_bash.rs`。这与 executor 是同一个洞：缺通道能力，两条链都是「机制齐、接线空」。
+  因此 `quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 这一条**不能**诚实实现——它需要「释放 app 后 app 的 executor 组真的被终止，而两个 TUI 的 executor 继续推进新 marker 序号」，
+  而这正需要上述①②③。补齐它需要先决定：通道由 guardian 在 `Admission` ACK 时一并交出（控制帧需扩 `SCM_RIGHTS`），还是 daemon 从自己的 bootstrap 通道上再派生；
+  以及客户端身份如何从业务 IPC（`AttachApplicationRoot`）传到 coordinator。这两项都改变控制协议与 daemon 的会话模型，属设计决策，不在本轮擅自落地。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
+- [ ] 工具与插件 spawn 全部走 owner-bound 受管通道（Task 8 Step 3 的后半） — 机制齐全但生产装配仍为空：`ManagedSpawner` 有 `Frontend` 策略、
+  `ManagedProcessPolicy` 能拒绝 `keep`、`PluginDemandTable` 能按 owner 计数，但 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 的**唯一**生产调用点
+  （`yi-agent-runtime/src/bootstrap.rs:210`）传 `None`，而 `ManagedSpawner::new` 的两个调用者都在 `crates/yi-agent-tools/tests/managed_bash.rs`。
+  shell／bash、`process_start`、MCP `manager.rs` 的 `TokioChildProcess::new(cmd)` 因此仍直接 spawn，未登记到 guardian。
+  判据：`grep -rn "build_tool_setup_owned" --include=*.rs crates/` 的调用点传入 `Some(..)`；`grep -rn "ManagedSpawner::new" --include=*.rs crates/` 出现非测试调用者。
+  **与下方 executor 条目同根**：`ChannelFactory` 需要一条从 guardian 继承来的私有通道，而控制协议目前没有「应答一个描述符」的操作（见该条 ①②③）。
+  所以这条不能靠改调用点单独完成，须先定通道交付方式。
+
 - [x] 租约过期必须真的回收，而不是只从表里删掉（Task 12） — 原来 `LeaseTable::expire` 存在但 guardian 的 serve 循环从不调用它：前端崩溃后心跳停止，
   它的租约永远活着，而它启动的进程组既没有 owner 也没有人回收——这正是租约机制存在的理由被绕过。现在三处补齐：**①** `Reclaimer::expire_leases(now)`
   把过期的 client 逐个走 `begin_client_reclaim`（与 `release` 共用的同一段：先关准入、无 business client 时开始全局 drain、后台线程按
