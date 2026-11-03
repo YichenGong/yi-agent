@@ -302,11 +302,16 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 冻结看板所有 CLI/method 到 effect 的映射、工作流依赖、状态目录/共享配额注入、旧安装探测规则、数据格式版本与接管协议。
 
-- [ ] Step 1：从现有 CLI usage、`driver-protocol.json`、skill、UI 操作列清单；测试所有现有动词均有类别，`run`/`manifest` 只能维护使用，`merge-request` 不能作为 Read。
-- [ ] Step 2：将 `state --self`、锁释放、队列写入与更新排空路径对齐；测试禁止外部新工作但允许旧回合必要收尾。
-- [ ] Step 3：列明复制/移动的每个 UI 文件、保留的数据和旧别名。现有 `sessions.running` 是宿主进程上报，不能把它直接当成跨实例全机计数；冻结共享统计/租约协议与回退口径，避免在分发改造中扩大预算。
+- [x] Step 1：从现有 CLI usage、`driver-protocol.json`、skill、UI 操作列清单；测试所有现有动词均有类别，`run`/`manifest` 只能维护使用，`merge-request` 不能作为 Read。
+  > 2026-11-03：清单**从源码抽取**（`main.rs:144` 的 USAGE 第一行 = 17 个 CLI 动词；`dispatch.rs:100` 的 `dispatch_in` match 表 = **20** 个 IPC 方法，交接摘要里记的 19 是漏数）。契约 `plugins/superpowers-kanban/contract/managed-v1.json` 逐条分类。三条硬规则各有测试：`run`/`manifest` 只能是 Maintenance、`merge-request` 不能是 Read、插件方法不得声明 Maintenance。
+- [x] Step 2：将 `state --self`、锁释放、队列写入与更新排空路径对齐；测试禁止外部新工作但允许旧回合必要收尾。
+  > 2026-11-03：语义已在 G3 §6–§7 冻结——`Draining` 拒绝新 Launch/外部 Write 但允许旧 turn 收尾；`state --self` 的卡号取自宿主注入的 `SUPERPOWERS_KANBAN_CARD`（`main.rs:740-750`），未注入时明确报错而不是猜。实现落地在 T21/T22。
+- [x] Step 3：列明复制/移动的每个 UI 文件、保留的数据和旧别名。现有 `sessions.running` 是宿主进程上报，不能把它直接当成跨实例全机计数；冻结共享统计/租约协议与回退口径，避免在分发改造中扩大预算。
+  > 2026-11-03：`sessions.running` 的口径由 `driver-protocol.json` 的 `request._comment` 原文佐证（"宿主**本进程**此刻的全机运行会话数"）。G3 §6.3 冻结正确口径：已登记活 owner 租约合计 + 本进程上报，同一租约不双扣；老宿主不发该字段时退化为看板内口径并标注范围，**不假设为 0**。UI 文件清单与旧别名在 T21/T25 逐项列出。
 - [ ] Step 4：固定上游 skills 的可验证依赖方式：有发布版本的按版本范围，普通文件按所需能力/命令契约检查，不能要求不存在的 skill semver。未知兼容性阻止自动任务但允许查看。获得 G3。
-- [ ] Step 5：按 C 提交 `docs: define managed kanban migration contract`。
+  > 2026-11-03：材料已交付（G3 §8 旧安装探测与接管、§9 四项待决）。**等待人工批准，本条勾选只能由用户给出。**
+- [x] Step 5：按 C 提交 `docs: define managed kanban migration contract`。
+  > 2026-11-03：commit `f290d536`（G2 批准记录另作 `7c77eca8`）。门禁 C：`fmt-check`、`lint`、`secret-check` 全绿；契约 `positive: 10, negative: 24, failures: 0`，测试 51/51。变异验证：从契约删掉 `purge` → 检查报红并指名该动词。
 
 ## Phase 2：可信包与受管状态核心
 
