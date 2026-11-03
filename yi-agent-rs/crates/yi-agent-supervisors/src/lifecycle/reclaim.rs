@@ -353,6 +353,40 @@ impl Reclaimer {
             }
         };
 
+        let operation = self.begin_client_reclaim(client);
+        self.remember_query_right(&operation, &grant);
+        Ok(operation)
+    }
+
+    /// Reclaims every lease whose window has passed, returning the operations.
+    ///
+    /// An expired lease is *not* just forgotten: the client stopped renewing, which
+    /// means it is gone or wedged, and the work it owns has to be stopped and
+    /// proven stopped. Dropping the row alone would leave that work running with
+    /// no owner -- alive, unreachable, and never reclaimed -- which is exactly the
+    /// leak leases exist to prevent.
+    ///
+    /// No query right is recorded: there is nobody to poll. The operation still
+    /// exists, so an operator or a late-returning client can see the outcome
+    /// instead of a silent disappearance.
+    pub fn expire_leases(&mut self, now: Duration) -> Vec<OperationId> {
+        let expired = self.leases.expire(now);
+        let mut operations = Vec::with_capacity(expired.len());
+        for client in expired {
+            operations.push(self.begin_client_reclaim(client));
+        }
+        if !operations.is_empty() {
+            self.expire_results();
+        }
+        operations
+    }
+
+    /// Starts the teardown of one client's work and returns its operation id.
+    ///
+    /// Shared by release and expiry so the two paths cannot drift: both close
+    /// admission first, both drain the scope only when no business client is left,
+    /// and both verify the stop rather than assume it.
+    fn begin_client_reclaim(&mut self, client: ClientRunId) -> OperationId {
         // Admission closes first, and it closes for *this* client only unless it was
         // the last one. `close_client_admission` is idempotent, so a retried release
         // cannot reopen or duplicate history.
@@ -365,7 +399,6 @@ impl Reclaimer {
         }
 
         let operation = self.next_id();
-        self.remember_query_right(&operation, &grant);
         self.last_for_client
             .insert(client.clone(), operation.clone());
         self.record_running(&operation);
@@ -397,7 +430,7 @@ impl Reclaimer {
             let _ = write_result(&scope, &generation, &operation_for_thread, &result);
         });
 
-        Ok(operation)
+        operation
     }
 
     /// The result of one operation, or `None` while it is still running.

@@ -13,8 +13,8 @@
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
 | yi-agent-tools | 20 / 20 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
-| yi-agent-tui | 44 / 45 | [详情](./yi-agent-tui.md) |
-| yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
+| yi-agent-tui | 45 / 46 | [详情](./yi-agent-tui.md) |
+| yi-agent-run | 11 / 11 | [详情](./yi-agent-run.md) |
 | yi-agent-cli | 9 / 9 | [详情](./yi-agent-cli.md) |
 | yi-agent-web | 11 / 11 | [详情](./yi-agent-web.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
@@ -27,8 +27,8 @@
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 12 / 12 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 80 / 80 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 54 / 58 | [详情](./subagent-runtime.md) |
-| yi-agent-lifecycle | 12 / 13 | [详情](./yi-agent-lifecycle.md) |
+| subagent-runtime | 55 / 58 | [详情](./subagent-runtime.md) |
+| yi-agent-lifecycle | 13 / 14 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 125 | [详情](./desktop.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |

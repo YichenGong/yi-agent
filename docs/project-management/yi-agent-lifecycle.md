@@ -90,6 +90,15 @@
   `a_system_resume_reopens_a_full_renewal_window`、`a_released_client_is_not_revived_by_a_system_resume`、
   `the_released_tombstone_table_stays_bounded`；**变异验证**：让 `disconnected` 不比对 epoch、让
   `heartbeat` 不查 tombstone → 2 个用例红（实测 RED）
+- [x] 前端租约的客户端侧（`client.rs::FrontendLease`） — 把状态机接到真实 wire 上：`register` 换 grant，`start_heartbeat` 起一条**独立控制连接**
+  的线程每 `HEARTBEAT_INTERVAL = 5s` 续约（50ms 分片睡眠，停起来是毫秒级而不是 5 秒），一次续约被拒即置 `lost` 且**不重试**——重试只会
+  反复敲一个已经撤回该客户端的 guardian，而它发起的回收才是答案；`release` 先停心跳再发 `Release`；`await_result` 以 100ms 轮询
+  `ReclaimStatus`，超时／guardian 消失／未知 operation 一律 `Ok(None)`（"答案没到"不能算成功）；`register_if_served` 在 socket 不存在或
+  `ConnectionRefused` 时返回 `Ok(None)`——嵌入式模式没有 guardian，那不是错误。**`Drop` 只停心跳、不 release、不阻塞**：把离开与 panic
+  分开，正是为了让一次崩溃不被当成用户退出。判据：`cargo test -p yi-agent-lifecycle`（`client::tests` 3 例，跑在真实 unix socket 上：
+  `a_registered_lease_releases_and_reads_its_result`（注册 → 释放 → 读结果；
+  并断言 release 之后不再出现 heartbeat）、`a_refused_heartbeat_marks_the_lease_lost_without_retrying`、
+  `no_guardian_means_no_lease_rather_than_an_error`）；`cargo test -p yi-agent --test frontend_runtime_lease`（8 passed）
 - [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
 - [x] 受管进程 spawn 客户端（`managed/{client,fdpass}.rs`） — 工具侧通过 guardian 签发的私有
   owner-bound 连接启动进程：`ManagedSpawnClient::connect(OwnedFd)` 接管一条已有连接（没有可连的路径，

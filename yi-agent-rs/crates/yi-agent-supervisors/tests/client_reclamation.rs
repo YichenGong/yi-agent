@@ -127,6 +127,106 @@ fn scope(directory: &TempDir) -> RuntimeScope {
     }
 }
 
+/// A frontend that stops renewing has to have its work stopped, not just forgotten.
+///
+/// The failure this rules out is the quiet one: the guardian drops the expired row,
+/// the table looks healthy, and the processes the vanished client started keep
+/// running forever with nobody able to admit, query, or stop them.
+#[test]
+fn an_expired_lease_reclaims_the_work_its_client_left_behind() {
+    let mut fixture = ReclaimFixture::with_two_clients();
+    // Past the 30 s window, with the other client still alive and renewing.
+    let operations = fixture.reclaimer.expire_leases(Duration::from_secs(31));
+    assert_eq!(
+        operations.len(),
+        2,
+        "both leases went unrenewed, so both have to be reclaimed"
+    );
+    assert!(!fixture.reclaimer.leases().admits_execution("tui"));
+    assert!(!fixture.can_admit("tui"));
+    assert!(
+        fixture.global_drain_started(),
+        "no business client is left, so the scope must drain"
+    );
+
+    for operation in &operations {
+        let result = fixture.wait_result(operation);
+        assert!(
+            result.stopped,
+            "an expiry must prove the work stopped: {:?}",
+            result.failures
+        );
+    }
+    let stops = fixture.stop_requests();
+    assert!(stops.contains(&"app".to_string()), "{stops:?}");
+    assert!(stops.contains(&"tui".to_string()), "{stops:?}");
+}
+
+/// Expiry is not a resurrection door: a heartbeat after the window has passed must
+/// be refused, because its client's work is already on its way down.
+#[test]
+fn a_heartbeat_after_expiry_cannot_revive_the_lease() {
+    let mut fixture = ReclaimFixture::with_two_clients();
+    let grant = fixture.tui.clone();
+    fixture.reclaimer.expire_leases(Duration::from_secs(31));
+    let error = fixture
+        .reclaimer
+        .leases_mut()
+        .heartbeat(&grant, Duration::from_secs(31))
+        .expect_err("an expired lease must stay expired");
+    assert!(
+        error.contains("released") || error.contains("not registered"),
+        "{error}"
+    );
+    assert!(
+        !fixture
+            .reclaimer
+            .leases()
+            .admits(&grant, Duration::from_secs(31))
+            .is_ok(),
+        "admission must stay closed for an expired client"
+    );
+}
+
+/// A lease that is still being renewed must survive the same tick. Without this,
+/// the expiry path is indistinguishable from "expire everything on a timer".
+#[test]
+fn a_renewed_lease_survives_the_maintenance_tick() {
+    let mut fixture = ReclaimFixture::with_two_clients();
+    fixture
+        .reclaimer
+        .leases_mut()
+        .heartbeat(&fixture.tui.clone(), Duration::from_secs(20))
+        .unwrap();
+    // app expired at 30 s, tui was renewed at 20 s and so lives until 50 s.
+    let operations = fixture.reclaimer.expire_leases(Duration::from_secs(31));
+    assert_eq!(operations.len(), 1, "only the unrenewed client may expire");
+    assert!(
+        fixture.reclaimer.leases().admits_execution("tui"),
+        "a renewed lease is still live work"
+    );
+    assert!(!fixture.reclaimer.leases().admits_execution("app"));
+}
+
+/// The guardian's tick is what makes expiry happen at all. A bare `LeaseTable::expire`
+/// call proves the table works; this proves the runtime actually asks it.
+#[test]
+fn the_guardian_maintenance_tick_reclaims_expired_clients() {
+    let directory = TempDir::new().unwrap();
+    let mut guardian = Guardian::new(scope(&directory), artifact(), "gen-1".to_string());
+    let now = Duration::from_secs(0);
+    guardian
+        .reclaimer_mut()
+        .register("tui".to_string(), ClientKind::Tui, LeaseMode::Business, now)
+        .unwrap();
+    let operations = guardian.maintain(Duration::from_secs(31));
+    assert_eq!(operations.len(), 1);
+    assert!(
+        !guardian.reclaimer().leases().admits_execution("tui"),
+        "the tick has to close the client it expired"
+    );
+}
+
 /// Two registered clients, a controllable clock, and a recording backend.
 ///
 /// Windows are `Duration`s against real time, so the fixture shortens them instead

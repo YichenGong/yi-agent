@@ -166,3 +166,13 @@
   （20 passed，含 `a_short_callers_budget_does_not_shorten_the_grace_window`——停得慢的组在 700ms 优雅期内自行退出时不得出现 terminate 调用）；
   变异验证：恢复 `deadline.clamp(self.grace)` → 该例红（实测 RED 后恢复）
 - [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
+- [x] 租约过期必须真的回收，而不是只从表里删掉（Task 12） — 原来 `LeaseTable::expire` 存在但 guardian 的 serve 循环从不调用它：前端崩溃后心跳停止，
+  它的租约永远活着，而它启动的进程组既没有 owner 也没有人回收——这正是租约机制存在的理由被绕过。现在三处补齐：**①** `Reclaimer::expire_leases(now)`
+  把过期的 client 逐个走 `begin_client_reclaim`（与 `release` 共用的同一段：先关准入、无 business client 时开始全局 drain、后台线程按
+  `RECLAIM_GRACE` / `RECLAIM_CONFIRM` 停止并**核实**停止），不登记 query right——没有客户端在场可查，但 operation 与 `reclaim-*.json` 仍写盘。
+  **②** serve 循环改为 `poll` 驱动的非阻塞 accept，`LEASE_MAINTENANCE_TICK = 1s` 触发一次 `Guardian::maintain`；原先阻塞的 `accept` 会让过期检测
+  依赖流量，而"最后一个客户端崩了"恰恰是没有流量的时刻。**③** `ControlRequest::Heartbeat` / `Resume` 从 `Unsupported` 变成真实实现（`lease_now()`
+  取 wall time），否则任何超过 30 秒的租约都会静默过期。
+  判据：`cargo test -p yi-agent-supervisors --test client_reclamation`（24 passed，新增 `an_expired_lease_reclaims_the_work_its_client_left_behind`（过期后 backend 收到 stop 且 `stopped == true`）、
+  `a_heartbeat_after_expiry_cannot_revive_the_lease`、`a_renewed_lease_survives_the_maintenance_tick`、`the_guardian_maintenance_tick_reclaims_expired_clients`）；
+  `cargo test -p yi-agent --test frontend_runtime_lease`（8 passed）；`cargo test -p yi-agent --bin yi-agent`（845 passed）

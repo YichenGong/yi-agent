@@ -1122,6 +1122,24 @@ impl Guardian {
         self.reclaim.leases_mut()
     }
 
+    /// One maintenance tick: reclaim work whose owner stopped renewing.
+    ///
+    /// Expiry is not bookkeeping. A frontend that crashes mid-task stops
+    /// heartbeating; if the guardian only forgot its lease, the processes it had
+    /// started would keep running with no owner, no admission checks, and nothing
+    /// left to stop them. So an expired lease goes through the same teardown a
+    /// release does, and the outcome is a recorded operation rather than a silent
+    /// removal.
+    ///
+    /// `now` is passed in rather than read here so a test can express "31 seconds
+    /// later" without sleeping through the real window.
+    pub fn maintain(
+        &mut self,
+        now: std::time::Duration,
+    ) -> Vec<yi_agent_lifecycle::types::OperationId> {
+        self.reclaim.expire_leases(now)
+    }
+
     /// Opens the process registry, reporting what an earlier guardian left behind.
     pub fn open_registry(&self) -> io::Result<(ProcessRegistry, RecoveryReport)> {
         ProcessRegistry::open(&self.scope, self.generation.clone(), &self.artifact)
@@ -1228,21 +1246,84 @@ pub fn serve(
     // stop. Dropping the registry still stops and reaps every group it owns.
     let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
     guardian.attach_registry(std::sync::Arc::clone(&registry));
+    // Non-blocking accept, woken by a bounded wait, so the loop can also do
+    // maintenance. A plain blocking `accept` would make lease expiry depend on
+    // traffic: a runtime whose last client crashed would have no traffic at all,
+    // which is exactly when the lease has to be noticed.
+    listener.set_nonblocking(true)?;
     while !shutdown() {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                // Per-connection setup must never take the guardian down: one
-                // malformed or already-closed peer is not a reason to lose the
-                // process groups this guardian is responsible for.
-                if prepare_control_stream(&stream).is_ok() {
-                    serve_control_connection(&mut guardian, stream);
+        if wait_for_connection(&listener, LEASE_MAINTENANCE_TICK)? {
+            // Drain everything that is ready. `WouldBlock` ends the batch; it is
+            // not an error on a non-blocking listener.
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Per-connection setup must never take the guardian down:
+                        // one malformed or already-closed peer is not a reason to
+                        // lose the process groups this guardian is responsible for.
+                        if prepare_control_stream(&stream).is_ok() {
+                            serve_control_connection(&mut guardian, stream);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
         }
+        guardian.maintain(lease_now());
     }
     Ok(())
+}
+
+/// How often the guardian looks for expired leases when nothing else happens.
+///
+/// Well under [`yi_agent_lifecycle::leases::LEASE_EXPIRY`], so a crashed frontend
+/// is noticed within a second or two of its window closing rather than whenever the
+/// next client happens to connect.
+const LEASE_MAINTENANCE_TICK: Duration = Duration::from_secs(1);
+
+/// Waits until the listener has a connection or `timeout` elapses.
+///
+/// `poll` rather than a non-blocking spin: the loop wakes once per tick even on a
+/// completely idle runtime, which costs nothing, and a connection is still noticed
+/// immediately.
+fn wait_for_connection(
+    listener: &std::os::unix::net::UnixListener,
+    timeout: Duration,
+) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    loop {
+        // SAFETY: one initialized `pollfd` for a descriptor this function borrows
+        // for the whole call, and the count matches the slice length.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(ready > 0);
+    }
+}
+
+/// The lease clock: wall time, matching what the lease table stores.
+///
+/// The lease table is driven by `Clock::now()` elsewhere in tests, but over the wire
+/// both sides have to agree on one origin, and wall time is the only one a separate
+/// process can compute. Monotonicity across a wall-clock jump is handled by
+/// `after_system_resume`, not by pretending the clock never moves.
+fn lease_now() -> std::time::Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
 }
 
 /// Prepares an accepted control connection for one request/response exchange.
@@ -1306,9 +1387,7 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             kind,
             mode,
         } => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
+            let now = lease_now();
             match guardian
                 .reclaimer_mut()
                 .register(client_run_id, kind, mode, now)
@@ -1316,6 +1395,36 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                 Ok(grant) => ControlResponse::Granted(grant),
                 Err(reason) => ControlResponse::Rejected {
                     code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
+                    reason,
+                },
+            }
+        }
+        ControlRequest::Heartbeat { grant } => {
+            // Renewal is what keeps a live frontend's lease from expiring. A stale
+            // grant is answered with a refusal rather than an error string: the
+            // client has to learn that its lease is gone, because its work is about
+            // to be reclaimed.
+            let now = lease_now();
+            match guardian.reclaimer_mut().leases_mut().heartbeat(&grant, now) {
+                Ok(()) => ControlResponse::Ack,
+                Err(reason) => ControlResponse::Rejected {
+                    code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                    reason,
+                },
+            }
+        }
+        ControlRequest::Resume { grant } => {
+            // A reconnect gets a new epoch and a new credential, so a straggling
+            // message on the old connection cannot act for the client. The old
+            // credential stops working immediately; that is the point.
+            let now = lease_now();
+            match guardian.reclaimer_mut().leases_mut().resume(&grant, now) {
+                // Root bindings are keyed by client run, not by epoch, so a resume
+                // only replaces the credential the client must present next; the
+                // work it already owns stays attached to it.
+                Ok(renewed) => ControlResponse::Granted(renewed),
+                Err(reason) => ControlResponse::Rejected {
+                    code: yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated,
                     reason,
                 },
             }
