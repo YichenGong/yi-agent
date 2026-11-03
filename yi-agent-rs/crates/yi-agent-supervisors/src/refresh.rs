@@ -53,6 +53,34 @@ pub fn refresh_from_plugins(dir: &Path) -> Vec<RefreshOutcome> {
     refresh_from_plugins_until(dir, || false)
 }
 
+/// The startup description budget in production.
+///
+/// 15 s is the calibrated conclusion: 5 s was breached on CI under concurrency (a
+/// `cat`-only script took over 5 s while 87 descriptions ran in parallel), and the
+/// budget is only ever spent in full when a plugin is actually broken.
+pub const PRODUCTION_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// [`refresh_from_plugins`], with the description budget spelled out.
+///
+/// Exists for callers that already own a policy seam. The one test it serves in
+/// `yi-agent-runtime` needs a deliberately slow description to prove that one
+/// slow plugin holds up only itself, and the production 15 s budget makes that
+/// test grade how fast this machine cold-starts `python3` instead of the
+/// property under test. Production callers keep using the one-argument form.
+pub fn refresh_from_plugins_with_budget(
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Vec<RefreshOutcome> {
+    refresh_records(
+        dir,
+        describe::DescribePolicy::wide_budget(timeout),
+        &mut |_| false,
+    )
+    .into_iter()
+    .map(|record| record.outcome)
+    .collect()
+}
+
 /// 与 [`refresh_from_plugins`] 相同，但每次可能开始新工作前问一次 `should_stop`。
 ///
 /// 这是「永不取消」入口的带取消版本：停止请求会中断**当前**自述并阻止后续插件
@@ -226,6 +254,23 @@ pub fn refresh_and_log_until(dir: &Path, mut should_stop: impl FnMut() -> bool) 
     let records = refresh_records(dir, describe::DescribePolicy::production(), &mut |_| {
         should_stop()
     });
+    log_records(records)
+}
+
+/// [`refresh_and_log`], with the description budget spelled out.
+///
+/// The production budget is [`PRODUCTION_DESCRIBE_TIMEOUT`]; this form exists for
+/// callers that own a policy seam and whose test must not grade machine speed.
+pub fn refresh_and_log_with_budget(
+    dir: &Path,
+    timeout: std::time::Duration,
+    mut should_stop: impl FnMut() -> bool,
+) -> Vec<String> {
+    let records = refresh_records(
+        dir,
+        describe::DescribePolicy::wide_budget(timeout),
+        &mut |_| should_stop(),
+    );
     log_records(records)
 }
 

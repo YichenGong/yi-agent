@@ -108,7 +108,12 @@ impl DescribePolicy {
         Self::with_stdout_limit(timeout, 1024 * 1024)
     }
 
-    /// 测试用：宽预算，其余参数与生产一致。
+    /// Same production parameters, different deadline.
+    ///
+    /// Not `#[cfg(test)]`: integration tests in other crates compile this crate as
+    /// an ordinary library, where test-only items do not exist (the same rule
+    /// `serve_without_manifest_refresh` follows). Only the deadline differs, so a
+    /// caller cannot use it to change what is checked -- just how long it may take.
     ///
     /// For the cases that walk the real batch path. Their question is "does
     /// draining work", not "is this machine fast": the production 15 s budget is
@@ -116,7 +121,6 @@ impl DescribePolicy {
     /// test run can spend more than that just starting `python3`. Only the
     /// deadline moves -- the stdout limit and stderr capture stay at their
     /// production values, so the backpressure under test is the real one.
-    #[cfg(test)]
     pub(super) fn wide_budget(timeout: Duration) -> Self {
         Self::checked(
             timeout,
