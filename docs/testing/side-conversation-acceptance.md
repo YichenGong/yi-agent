@@ -36,7 +36,7 @@ unset YI_AGENT_THREAD_ID YI_AGENT_SESSION   # tools 的 bash 用例对宿主变�
 
 **完整 `just ci` 已一次跑通：`EXIT=0`，末行 `CI passed`**，其中
 `cargo nextest run --all-features --workspace --profile ci` 为
-`4372 tests run: 4372 passed, 28 skipped`，`just ci` 的其余 15 道门禁
+`4373 tests run: 4373 passed, 28 skipped`，`just ci` 的其余 15 道门禁
 （fmt-check / lint / build / bindings-check / secret-check / 版本与 release 检查 /
 msrv-check / audit 等）全部通过；`audit` 用本地缓存的 advisory-db（日志已明确
 告警「结论基于过期数据」，nightly job 会重跑）。
