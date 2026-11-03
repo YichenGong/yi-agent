@@ -100,10 +100,12 @@ describe("PairingScreen submit", () => {
     expect(redeem).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone");
     // The persisted binding is what `transportFactory` reads on the next boot,
     // so it must carry the relay url under the key `storedRemoteConfig` reads.
+    // `scope` 一并落盘：旁支要据此决定本设备能否开/发/停/关。
     expect(storedRemoteConfig(storage)).toEqual({
       url: URL,
       token: "yia_tok",
       projects: [],
+      scope: PAIRED.scope,
     });
     expect(JSON.parse(storage.getItem(REMOTE_STORAGE_KEY)!).url).toBe(URL);
   });
@@ -121,10 +123,12 @@ describe("PairingScreen submit", () => {
 
     await waitFor(() => expect(redeem).toHaveBeenCalledTimes(1));
     expect(redeem).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone");
+    // `scope` 一并落盘：旁支要据此决定本设备能否开/发/停/关。
     expect(storedRemoteConfig(storage)).toEqual({
       url: URL,
       token: "yia_tok",
       projects: [],
+      scope: PAIRED.scope,
     });
   });
 
@@ -277,6 +281,7 @@ describe("PairingScreen QR scan", () => {
       url: "wss://r/ws",
       token: "yia_tok",
       projects: [],
+      scope: PAIRED.scope,
     });
   });
 

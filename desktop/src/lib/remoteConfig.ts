@@ -12,6 +12,8 @@
  * reaches for a global and every branch stays unit-testable.
  */
 
+import type { Scope } from "./generated/Scope";
+
 /** The `localStorage` key a paired remote client persists its config under. */
 export const REMOTE_STORAGE_KEY = "yi-agent.remote";
 
@@ -42,6 +44,15 @@ export interface RemoteConfig {
    * caller to write `projects: []` invites them to get it wrong.
    */
   projects?: RemoteProjectBinding[];
+  /**
+   * 配对时服务端授予的权限层。
+   *
+   * 为什么落盘：旁支必须知道本设备是 `Observe`（只能看）还是 `Control`（能
+   * 开/发/停/关）。这个值在配对那一刻定下来，之后不再变化；只在每次 `initialize`
+   * 后靠猜（例如「远端 = Observe」）会把一台 `Control` 手机误降成只读。缺省视为
+   * `control`，与配对协议里服务端缺字段时的默认一致。
+   */
+  scope?: Scope;
 }
 
 /** The slice of `localStorage` this module needs (injectable for tests). */
@@ -66,14 +77,35 @@ export function parseRemoteConfig(raw: string | null): RemoteConfig | null {
     return null;
   }
   if (typeof parsed !== "object" || parsed === null) return null;
-  const { url, token, projects } = parsed as {
+  const { url, token, projects, scope } = parsed as {
     url?: unknown;
     token?: unknown;
     projects?: unknown;
+    scope?: unknown;
   };
   if (typeof url !== "string" || url.length === 0) return null;
   if (typeof token !== "string" || token.length === 0) return null;
-  return { url, token, projects: parseProjectBindings(projects) };
+  const parsedScope = parseScope(scope);
+  return {
+    url,
+    token,
+    projects: parseProjectBindings(projects),
+    // 缺失时不写这个键：老版本写下的配置反序列化后再序列化必须逐字不变，
+    // 否则「保存一次」就会给一份从没有过 scope 的配置伪造一个值。
+    ...(parsedScope === undefined ? {} : { scope: parsedScope }),
+  };
+}
+
+/**
+ * 权限层只认协议里的三个字面量，其余（含缺失）一律 `control`。
+ *
+ * 不要 fail-closed 成 `observe`：那只会在用户已经能发指令时把 UI 灰掉，
+ * 而服务端仍然按 token 的真实 scope 执行——界面上「允许」与「实际执行」就
+ * 分叉了。真正的权限校验在服务端，前端的值只用于显示与提前禁用。
+ */
+function parseScope(raw: unknown): Scope | undefined {
+  if (raw === "observe" || raw === "control" || raw === "admin") return raw;
+  return undefined;
 }
 
 /**

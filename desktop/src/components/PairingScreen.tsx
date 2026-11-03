@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, type FormEvent } from "react";
 import { type PairedDevice, defaultRedeem } from "../pairing";
 import { parsePairUri } from "../lib/pairUri";
+import type { Scope } from "../lib/generated/Scope";
 import { QrScanner } from "./QrScanner";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { isIos } from "../lib/platform";
@@ -100,6 +101,17 @@ function isInvalidCode(e: unknown): boolean {
   return message.includes("4401") || message.includes("invalid or expired pairing code");
 }
 
+/**
+ * 配对回包的 `scope` 落盘前的收敛。
+ *
+ * 与 `remoteConfig.parseScope` 同一条规则（只认协议里的三个字面量，其余按
+ * `control`）：这里不 import 那个私有函数，是为了让「配对写入」与「启动读取」
+ * 两条路径各自独立成立，避免为了一个三行函数把模块依赖搅在一起。
+ */
+function parsePairScope(raw: string): Scope {
+  return raw === "observe" || raw === "admin" ? raw : "control";
+}
+
 /** `localStorage` 的默认实现；不可用（隐私模式等）时退化为无操作。 */
 function defaultStorage(): StorageLike {
   try {
@@ -145,7 +157,11 @@ export function PairingScreen({
         await onSubmit(u, c, name);
       } else {
         const device = await (redeem ?? defaultRedeem)(u, c, name);
-        const config: RemoteConfig = { url: u, token: device.token };
+        const config: RemoteConfig = {
+          url: u,
+          token: device.token,
+          scope: parsePairScope(device.scope),
+        };
         saveRemoteConfig(storage ?? defaultStorage(), config);
       }
       onPaired?.();

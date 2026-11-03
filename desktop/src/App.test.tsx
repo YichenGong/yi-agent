@@ -3226,7 +3226,13 @@ describe("App iOS first-launch pairing", () => {
         expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
       );
       const persisted = JSON.parse(localStorage.getItem("yi-agent.remote")!);
-      expect(persisted).toEqual({ url: "wss://relay.test/ws?session=s1", token: "yia_new" });
+      // scope 也落盘：旁支必须知道本设备是 Observe 还是 Control，而配对那一刻
+      // 服务端已经把这个答案给了我们（这个 fixture 回的是 "control"）。
+      expect(persisted).toEqual({
+        url: "wss://relay.test/ws?session=s1",
+        token: "yia_new",
+        scope: "control",
+      });
       expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
     } finally {
       vi.unstubAllGlobals();
@@ -6817,4 +6823,116 @@ describe("App desktop mid-turn submissions", () => {
     await waitFor(() => expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""));
   });
 
+});
+
+/**
+ * 旁支帧的路由（spec §8.2、§9.1）。
+ *
+ * 这一层的失败模式都很安静：把 `side/*` 当普通会话帧处理，不会报错，只会让
+ * 父会话多亮一个未读点、多落一次盘、多发一次已读水位。用一个「父会话正在看」
+ * 的基本场景把它们钉住即可——数值上的差别（哪个计数多了 1）比任何断言文案都
+ * 更容易判断。
+ */
+describe("App 旁支通知路由", () => {
+  /** 一个父会话、已 resume 完成、输入框可用的基线。 */
+  async function ready() {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+  }
+
+  function sideChanged(seq: number) {
+    return {
+      method: "side/changed",
+      params: {
+        parent_thread_id: "t1",
+        side_id: "6f1c0e2a-0000-4000-8000-000000000001",
+        generation: 1,
+        seq,
+        summary: {
+          side_id: "6f1c0e2a-0000-4000-8000-000000000001",
+          parent_thread_id: "t1",
+          status: "running",
+          snapshot_revision: 1,
+          last_seq: seq,
+          active_turn_id: "u-side",
+          expires_at: null,
+          generation: 1,
+          stopping: false,
+        },
+      },
+    };
+  }
+
+  it("does not mark the parent read when only the side finishes", async () => {
+    await ready();
+    const before = clients[0].requests.filter((r) => r.method === "thread/markRead").length;
+    const listsBefore = clients[0].requests.filter(
+      (r) => r.method === "thread/listAll",
+    ).length;
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb(sideChanged(1));
+        cb({
+          method: "side/turnCompleted",
+          params: {
+            parent_thread_id: "t1",
+            side_id: "6f1c0e2a-0000-4000-8000-000000000001",
+            generation: 1,
+            seq: 2,
+            turn_id: "u-side",
+            status: "idle",
+            reason: null,
+            error: null,
+            usage: {
+              total: {
+                input: 1,
+                output: 1,
+                cache_creation: 0,
+                cache_read: 0,
+                reasoning: 0,
+              },
+              complete: true,
+            },
+          },
+        });
+      }
+    });
+    // 父会话一轮都没跑：旁支跑完不该替父推进已读水位，也不该让侧栏重拉。
+    expect(clients[0].requests.filter((r) => r.method === "thread/markRead").length).toBe(
+      before,
+    );
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+    ).toBe(listsBefore);
+  });
+
+  it("does not stop or interrupt the parent when a side frame arrives", async () => {
+    await ready();
+    act(() => {
+      for (const cb of state.notifHandlers) cb(sideChanged(1));
+    });
+    const methods = clients[0].requests.map((r) => r.method);
+    expect(methods).not.toContain("turn/interrupt");
+    expect(methods).not.toContain("side/turnInterrupt");
+  });
+
+  it("keeps applying ordinary parent frames after a side frame", async () => {
+    await ready();
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb(sideChanged(1));
+        cb({
+          method: "item/started",
+          params: {
+            thread_id: "t1",
+            item: { type: "agentMessage", id: "a1", text: "parent still streams" },
+          },
+        });
+      }
+    });
+    // 父视图照常累积：旁支分支必须 return，不能把后续父帧一起吞掉。
+    expect(await screen.findByText("parent still streams")).toBeTruthy();
+  });
 });

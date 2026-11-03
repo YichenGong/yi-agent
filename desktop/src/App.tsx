@@ -21,6 +21,7 @@ import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { canRunSlashDuringTurn, SLASH_COMMANDS } from "./lib/slash";
 import { ClientRegistry } from "./lib/clientRegistry";
+import { SideConversationStore } from "./lib/sideConversation";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
   remoteProfileIdForPath,
@@ -208,6 +209,14 @@ export default function App() {
    * 连接管理（建连/重连/dispose/全局只读）一律走注册表。
    */
   const registryRef = useRef(new ClientRegistry<RpcClient>());
+  /**
+   * 旁支的视图与连接绑定。
+   *
+   * 放在 ref 里而不是 state：它的更新走 `force()` 触发重渲染，和 `store`
+   * （ThreadStore）同一套机制。用意与 `ThreadStore` 相同——旁支视图的写入频率
+   * 跟着逐字流走，每次进 state 都会重建整棵树。
+   */
+  const sideStoreRef = useRef(new SideConversationStore());
   const clientRef = useRef<RpcClient | null>(null);
   /** 当前活动槽位：本地项目是 `local`，选中远端项目时换成它的 profile id。 */
   const activeSlotRef = useRef<Slot>(LOCAL_SLOT);
@@ -1750,6 +1759,7 @@ export default function App() {
       selectThread,
       disposed,
       scheduleReconnect: () => scheduleReconnectRef(),
+      sideStore: sideStoreRef.current,
     });
     const handshake = createHandshakeRecovery({
       activeSlotRef,
@@ -1776,6 +1786,7 @@ export default function App() {
         attempt.current = 0;
       },
       buildResumeHints,
+      sideStore: sideStoreRef.current,
     });
 
     const lifecycle = createConnectionLifecycle({
@@ -1791,6 +1802,7 @@ export default function App() {
       recoveryRef,
       handshake,
       wireClient,
+      sideStore: sideStoreRef.current,
     });
     connectRemoteTargetsRef = lifecycle.connectRemoteTargets;
     scheduleReconnectRef = lifecycle.scheduleReconnect;

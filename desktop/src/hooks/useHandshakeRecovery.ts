@@ -17,6 +17,11 @@ import { clearConnectionErrorFrom } from "../lib/connectionError";
 import type { useSettingsState } from "./useSettingsState";
 import type { useSessionState } from "./useSessionState";
 import type { useBoardState } from "./useBoardState";
+import {
+  parseSideHandshake,
+  type SideConversationStore,
+} from "../lib/sideConversation";
+import { storedRemoteConfig } from "../lib/remoteConfig";
 
 type SettingsState = ReturnType<typeof useSettingsState>;
 type SessionState = ReturnType<typeof useSessionState>;
@@ -54,6 +59,8 @@ export interface HandshakeRecoveryDeps {
   /** 退避计数清零（握手成功即复位）。 */
   resetAttempt: () => void;
   buildResumeHints: () => unknown;
+  /** 旁支绑定登记处。每条连接各自解析能力与宿主 id，不借 globalReader。 */
+  sideStore: SideConversationStore;
 }
 
 export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
@@ -80,6 +87,7 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
     scheduleReconnect,
     resetAttempt,
     buildResumeHints,
+    sideStore,
   } = deps;
 
   return async (client: RpcClient) => {
@@ -91,6 +99,19 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
           },
         );
         syncPlanRef.current = parseSyncPlan(initialized);
+        // 旁支能力与宿主身份必须按**这条连接**解析（spec §8.1）：本地和每个远端
+        // 项目各跑一个 app-server，它们各自的能力位与随机宿主 id 互不相干。借
+        // `globalReader`（永远本地）的答案，会让一台还没升级的远端项目看起来
+        // 「支持旁支」，点下去每一条请求都是 method not found。
+        //
+        // scope 取持久化的配对结果：远端设备的能力由 token 决定，本地 stdio
+        // 连接始终是 Admin。缺省按 control（与配对协议一致）。
+        const slot = activeSlotRef.current;
+        const scope = isRemoteClient()
+          ? (storedRemoteConfig(localStorage)?.scope ?? "control")
+          : "admin";
+        const sideBinding = parseSideHandshake(slot, client, initialized, scope);
+        if (sideBinding) sideStore.bind(sideBinding);
         // 构建类型只在 dev 上开放「实验功能」；读失败按 release 处理（fail-closed，
         // 与 Rust 侧的硬闸同一口径），不让面板因为一次网络抖动冒出来。
         // 全局只读一律问**本地**槽位（spec §5.2）：远端跑的是它自己的二进制，
