@@ -176,3 +176,24 @@
   判据：`cargo test -p yi-agent-supervisors --test client_reclamation`（24 passed，新增 `an_expired_lease_reclaims_the_work_its_client_left_behind`（过期后 backend 收到 stop 且 `stopped == true`）、
   `a_heartbeat_after_expiry_cannot_revive_the_lease`、`a_renewed_lease_survives_the_maintenance_tick`、`the_guardian_maintenance_tick_reclaims_expired_clients`）；
   `cargo test -p yi-agent --test frontend_runtime_lease`（8 passed）；`cargo test -p yi-agent --bin yi-agent`（845 passed）
+- [x] 只读影响快照、一次性确认与原子维护屏障（Task 14） — 三件互相支撑的东西。
+  **① 收集**（`yi-agent-supervisors/src/lifecycle/preview.rs::collect`）：guardian 自己
+  能证明的行（租约客户端、在跑的受管进程组、插件需求）总是收录；只有 coordinator 知道的
+  行（运行中／排队执行、daemon 侧插件）仅在它应答且带上 revision 时收录。前后各读一次
+  guardian revision，不一致就返回 `SnapshotRace` 而不是签一张混合了两个瞬间的快照。
+  **② 状态机**（`yi-agent-lifecycle/src/preview.rs::PreviewStore`）：token 绑定发起者、
+  scope、daemon 代际、目标产物与两个 revision 分量，60 秒过期，一次消费。
+  **③ 接线**（`guardian.rs::serve_preview`／`serve_preview_page`／`serve_confirm`）：
+  预览只读（不装屏障、不开 drain、改不了准入），确认先装维护屏障、在屏障内复核
+  revision，成功才消费 token，任一步失败都撤掉屏障（否则会为一次没发生的重启冻结全部
+  新任务）。目标产物在确认时重新校验（存在、常规文件、可执行），bundle 被删后失败发生在
+  停旧之前而不是中途。`CoordinatorProbe` 让 guardian 没有 daemon 时也能诚实回答 "unknown"。
+  判据：`cargo test -p yi-agent-supervisors --test runtime_restart_preview`（13 passed，
+  含 `a_client_joining_between_preview_and_confirm_makes_the_token_stale`、
+  `a_second_confirmation_cannot_start_a_second_replacement`、
+  `retrying_the_same_operation_returns_the_same_result`、
+  `a_confirmation_closes_admission_for_the_old_generation`、
+  `a_refused_confirmation_leaves_no_barrier`、`a_lease_only_client_can_preview`、
+  `a_vanished_target_is_refused_before_anything_starts`）；
+  `cargo test -p yi-agent-supervisors --lib lifecycle::preview`（8 passed）；
+  `cargo test -p yi-agent-lifecycle`（`preview` 15 + `leases` 9）

@@ -76,6 +76,13 @@ struct Lease {
     mode: LeaseMode,
     /// `clock.now()` value at which this lease expires without a heartbeat.
     expires_at: Duration,
+    /// Whether the client's current connection is still open.
+    ///
+    /// Separate from the lease itself because an EOF is *not* a departure (see the
+    /// module docs): the client keeps its lease while it reconnects. But a
+    /// replacement would interrupt it either way, so an impact preview has to show
+    /// it -- and show it as "may come back", not as "already gone".
+    connected: bool,
 }
 
 /// The lease state machine for one runtime generation.
@@ -86,6 +93,17 @@ pub struct LeaseTable {
     /// or EOF is rejected as stale instead of silently creating a new lease.
     /// Ordered oldest-first so the table can be capped: see [`MAX_TOMBSTONES`].
     released: std::collections::VecDeque<ClientRunId>,
+    /// Monotonic counter of changes that alter *who would be affected* by a
+    /// replacement.
+    ///
+    /// A confirmation is bound to this value, so it must advance on exactly the
+    /// events that change the impact answer: a client registering, being released,
+    /// expiring, or resuming (a resume is a new connection for an existing client,
+    /// which is not a new owner -- see `resume`). It must **not** advance on a
+    /// heartbeat: heartbeats are the one thing every live client does constantly,
+    /// and bumping the revision for them would invalidate every confirmation within
+    /// seconds and make the feature unusable.
+    revision: u64,
 }
 
 impl LeaseTable {
@@ -131,8 +149,10 @@ impl LeaseTable {
                 credential: credential.clone(),
                 mode,
                 expires_at: now.saturating_add(LEASE_EXPIRY),
+                connected: true,
             },
         );
+        self.revision = self.revision.saturating_add(1);
         Ok(ClientGrant {
             client_run_id: id,
             credential,
@@ -153,6 +173,7 @@ impl LeaseTable {
         lease.epoch += 1;
         lease.credential = new_credential();
         lease.expires_at = now.saturating_add(LEASE_EXPIRY);
+        lease.connected = true;
         Ok(ClientGrant {
             client_run_id: grant.client_run_id.clone(),
             credential: lease.credential.clone(),
@@ -189,9 +210,19 @@ impl LeaseTable {
     /// user quitting, and extending it on EOF would let a dead client's lease live
     /// forever.
     pub fn disconnected(&mut self, id: &str, epoch: u64) -> DisconnectOutcome {
-        match self.leases.get(id) {
-            Some(lease) if lease.epoch == epoch => DisconnectOutcome::AwaitReconnect,
+        match self.leases.get_mut(id) {
+            Some(lease) if lease.epoch == epoch => {
+                lease.connected = false;
+                // Deliberately no revision bump. A disconnect is not a departure:
+                // the client may reconnect inside its window, and the set of owners
+                // a replacement would interrupt is unchanged either way. Bumping
+                // here would let a flapping connection invalidate a confirmation
+                // that a person is still reading.
+                DisconnectOutcome::AwaitReconnect
+            }
             // Either unknown, already released/expired, or superseded by a resume.
+            // A late EOF for a superseded epoch must not mark the *current*
+            // connection as gone.
             _ => DisconnectOutcome::IgnoredStaleEpoch,
         }
     }
@@ -210,6 +241,7 @@ impl LeaseTable {
         }
         self.leases.remove(&grant.client_run_id);
         self.remember_released(&grant.client_run_id);
+        self.revision = self.revision.saturating_add(1);
         Ok(ReleaseOutcome::Reclaim(grant.client_run_id.clone()))
     }
 
@@ -227,6 +259,9 @@ impl LeaseTable {
         for id in &expired {
             self.leases.remove(id);
             self.remember_released(id);
+        }
+        if !expired.is_empty() {
+            self.revision = self.revision.saturating_add(1);
         }
         expired
     }
@@ -313,8 +348,76 @@ impl LeaseTable {
         Ok(())
     }
 
+    /// Whether `grant` names a live lease of *this* runtime, whatever its mode.
+    ///
+    /// Distinct from [`Self::admits`], which additionally refuses a non-business
+    /// lease: an observer may not start work, but it may look at a preview. The
+    /// credential and epoch are still checked, so "may look" never means "may look
+    /// as somebody else".
+    pub fn admits_or_observes(&self, grant: &ClientGrant, now: Duration) -> Result<(), String> {
+        if self.released.iter().any(|id| id == &grant.client_run_id) {
+            return Err(format!(
+                "client {} was released; its credential no longer works",
+                grant.client_run_id
+            ));
+        }
+        let lease = self
+            .leases
+            .get(&grant.client_run_id)
+            .ok_or_else(|| format!("client {} is not registered", grant.client_run_id))?;
+        if lease.credential != grant.credential || lease.epoch != grant.epoch {
+            return Err(format!(
+                "stale or forged grant for client {} (epoch {})",
+                grant.client_run_id, grant.epoch
+            ));
+        }
+        if lease.expires_at <= now {
+            return Err(format!(
+                "client {}'s lease expired; reattach before asking",
+                grant.client_run_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// The revision a preview/confirmation is bound to.
+    ///
+    /// See [`LeaseTable::revision`]'s field comment for exactly which events move
+    /// it. Callers compare it for equality, never for ordering: it is a change
+    /// token, not a timestamp.
+    pub fn impact_revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn active_count(&self) -> usize {
         self.leases.len()
+    }
+
+    /// Clients whose lease is live but whose connection is currently closed.
+    ///
+    /// These still count as affected: they are inside their reconnect window and
+    /// may come back, so a restart is not the harmless case just because they are
+    /// momentarily silent.
+    pub fn pending_count(&self) -> usize {
+        self.leases
+            .values()
+            .filter(|lease| !lease.connected)
+            .count()
+    }
+
+    /// Every live lease as `(client run id, lease mode, connected)`.
+    ///
+    /// Sorted by client run id so two previews over an unchanged runtime produce
+    /// the same entry order; an unstable order would make a page boundary move for
+    /// no reason.
+    pub fn snapshot(&self) -> Vec<(ClientRunId, LeaseMode, bool)> {
+        let mut rows: Vec<(ClientRunId, LeaseMode, bool)> = self
+            .leases
+            .iter()
+            .map(|(id, lease)| (id.clone(), lease.mode, lease.connected))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
     }
 
     /// How many live leases may actually run work.
@@ -347,6 +450,202 @@ fn new_credential() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A heartbeat renews a lease without changing who is affected.
+    ///
+    /// This is the load-bearing one: if heartbeats moved the revision, a
+    /// confirmation taken at time T would be stale by the next heartbeat (every
+    /// 5 s), and the feature would never complete.
+    #[test]
+    fn heartbeat_does_not_change_impact_revision() {
+        let mut table = LeaseTable::new();
+        let grant = table
+            .register(
+                "app".into(),
+                ClientKind::App,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let before = table.impact_revision();
+        table.heartbeat(&grant, Duration::from_secs(5)).unwrap();
+        assert_eq!(before, table.impact_revision());
+    }
+
+    /// A resume is a new connection for a client that was already counted, so the
+    /// impact answer is unchanged and a waiting confirmation must survive it.
+    #[test]
+    fn resume_in_place_does_not_change_impact_revision() {
+        let mut table = LeaseTable::new();
+        let grant = table
+            .register(
+                "app".into(),
+                ClientKind::App,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let before = table.impact_revision();
+        let resumed = table.resume(&grant, Duration::from_secs(1)).unwrap();
+        assert_eq!(before, table.impact_revision());
+
+        // ...and the resumed grant is still a valid second registration's no-op.
+        table.heartbeat(&resumed, Duration::from_secs(6)).unwrap();
+        assert_eq!(before, table.impact_revision());
+    }
+
+    /// A closed connection is not a departure, but it is still something a
+    /// replacement would interrupt: the client is inside its reconnect window.
+    #[test]
+    fn a_disconnected_client_is_pending_not_gone() {
+        let mut table = LeaseTable::new();
+        let grant = table
+            .register(
+                "app".into(),
+                ClientKind::App,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(table.active_count(), 1);
+        assert_eq!(table.pending_count(), 0);
+
+        let before = table.impact_revision();
+        assert_eq!(
+            table.disconnected("app", grant.epoch),
+            DisconnectOutcome::AwaitReconnect
+        );
+        assert_eq!(table.pending_count(), 1, "it must still be counted");
+        assert_eq!(table.active_count(), 1, "and still hold its lease");
+        assert_eq!(
+            before,
+            table.impact_revision(),
+            "a reconnectable client is not a new owner"
+        );
+
+        // A reconnect clears the pending state.
+        let resumed = table.resume(&grant, Duration::from_secs(1)).unwrap();
+        let _ = resumed;
+        assert_eq!(table.pending_count(), 0);
+    }
+
+    /// A late EOF for a superseded connection must not mark the live one as gone.
+    #[test]
+    fn a_stale_epoch_eof_does_not_clear_the_current_connection() {
+        let mut table = LeaseTable::new();
+        let grant = table
+            .register(
+                "app".into(),
+                ClientKind::App,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let resumed = table.resume(&grant, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            table.disconnected("app", grant.epoch),
+            DisconnectOutcome::IgnoredStaleEpoch
+        );
+        assert_eq!(
+            table.pending_count(),
+            0,
+            "the previous connection's EOF says nothing about the new one"
+        );
+        let _ = resumed;
+    }
+
+    /// The preview reads one consistent row per live client.
+    #[test]
+    fn the_snapshot_lists_every_live_client_sorted_and_flagged() {
+        let mut table = LeaseTable::new();
+        table
+            .register(
+                "tui".into(),
+                ClientKind::Tui,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let app = table
+            .register(
+                "app".into(),
+                ClientKind::App,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        // An observer does not run work, but it is still connected to this runtime.
+        table
+            .register(
+                "watcher".into(),
+                ClientKind::App,
+                LeaseMode::LeaseOnly,
+                Duration::ZERO,
+            )
+            .unwrap();
+        table.disconnected("app", app.epoch);
+
+        let rows = table.snapshot();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "app");
+        assert!(!rows[0].2, "app is pending");
+        assert_eq!(rows[1].0, "tui");
+        assert!(rows[1].2);
+        assert_eq!(rows[2].0, "watcher");
+        assert_eq!(rows[2].1, LeaseMode::LeaseOnly);
+    }
+
+    /// Registering, releasing and expiring all change who would be affected, so
+    /// each must invalidate a confirmation taken before it.
+    #[test]
+    fn impact_revision_moves_on_every_real_change() {
+        let mut table = LeaseTable::new();
+        let start = table.impact_revision();
+
+        let a = table
+            .register(
+                "a".into(),
+                ClientKind::Tui,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(
+            table.impact_revision() > start,
+            "a new client is new impact"
+        );
+
+        let registered = table.impact_revision();
+        table.release(&a).unwrap();
+        assert!(
+            table.impact_revision() > registered,
+            "a release is new impact"
+        );
+
+        let released = table.impact_revision();
+        table
+            .register(
+                "b".into(),
+                ClientKind::Tui,
+                LeaseMode::Business,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let before_expiry = table.impact_revision();
+        let expired = table.expire(Duration::from_secs(3600));
+        assert_eq!(expired, vec!["b".to_string()]);
+        assert!(
+            table.impact_revision() > before_expiry,
+            "expiry is new impact"
+        );
+
+        // Expiring nothing must not move it: a periodic sweep is not a change.
+        let quiet = table.impact_revision();
+        assert!(table.expire(Duration::from_secs(7200)).is_empty());
+        assert_eq!(quiet, table.impact_revision());
+        let _ = released;
+    }
 
     #[test]
     fn the_expiry_window_matches_the_spec() {

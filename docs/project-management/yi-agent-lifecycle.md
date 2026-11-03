@@ -112,7 +112,28 @@
   `/var`↔`/private/var`、`runtime_directory` 的 `YI_AGENT_RUNTIME_DIR` 覆盖、
   `control_path` 落在 runtime 目录内）；`cargo tree --manifest-path
   desktop/src-tauri/Cargo.toml | grep -c rusqlite` 为 0
-- [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
+- [x] 预览／确认 DTO 与一次性确认状态机（Task 14） — `types.rs` 的
+  `ImpactCounts`／`ImpactEntry`／`ImpactRevision`／`RestartPreview`／
+  `ConfirmationContext`，以及 `preview.rs::PreviewStore`。三条判据把「确认」这件事
+  钉死：(1) token 绑定发起者、scope、daemon 代际、**目标产物**与两个 revision 分量，
+  任一项变化即 `Stale`，陈旧同意无法被放大成新范围；(2) 一次性消费，同 operation
+  重试幂等、新 operation 返回 `AlreadyConsumed`，所以连点不会启动第二次切换；
+  (3) 分页返回条目但 token 恒为空，读取权限不能变成授权。未知影响是一等答案：
+  `coordinator: None` 使 `counts.complete=false` 并强制二次确认，绝不解释成 0。
+  分页按 `serde_json` 实际字节切分（`PAGE_BYTES = 16 KiB`），长 id 不会撑破帧上限。
+  判据：`cargo test -p yi-agent-lifecycle --lib preview`（15 passed），含
+  `a_changed_revision_in_either_authority_makes_the_token_stale`、
+  `a_different_target_artifact_makes_the_token_stale`、`a_token_is_consumed_exactly_once`、
+  `a_token_expires_after_its_window`、`paging_returns_entries_but_never_a_token`、
+  `a_page_is_bounded_by_serialized_size`、`unknown_impact_without_independent_fence_requires_manual_action`
+- [x] 租约表提供影响快照所需的观测（Task 14） — `leases.rs` 的 `impact_revision`／
+  `pending_count`／`snapshot`／`admits_or_observes`，以及 `disconnected` 只标记连接
+  断开、**不**递增 revision。判据：`cargo test -p yi-agent-lifecycle --lib leases`
+  （9 passed），含 `heartbeat_does_not_change_impact_revision`、
+  `a_disconnected_client_is_pending_not_gone`、
+  `a_stale_epoch_eof_does_not_clear_the_current_connection`；
+  变异验证：让 `disconnected` 递增 revision → 对应用例红
+- [ ] 预览／确认／状态**客户端方法**与本地桌面壳入口 — 见 Task 16、17
 - [x] 受管进程 spawn 客户端（`managed/{client,fdpass}.rs`） — 工具侧通过 guardian 签发的私有
   owner-bound 连接启动进程：`ManagedSpawnClient::connect(OwnedFd)` 接管一条已有连接（没有可连的路径，
   连接只能由 guardian 交给它），`spawn` 把 stdin／stdout／stderr 三个**独立** FD 用 `SCM_RIGHTS`

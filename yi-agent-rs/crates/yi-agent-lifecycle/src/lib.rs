@@ -24,6 +24,8 @@ pub mod codec;
 pub mod deadline;
 pub mod leases;
 pub mod managed;
+/// 只读影响快照与一次性确认。
+pub mod preview;
 pub mod scope;
 pub mod types;
 

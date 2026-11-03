@@ -1048,6 +1048,25 @@ pub struct Guardian {
     scope: RuntimeScope,
     artifact: ArtifactIdentity,
     generation: DaemonInstanceId,
+    /// The registry, kept alongside the reclaimer's backend.
+    ///
+    /// The backend is a trait object (`dyn ProcessBackend`) because reclamation only
+    /// needs to ask "is it stopped"; an impact preview has to *enumerate* what is
+    /// running, which that trait cannot express. One `Arc` shared with reclamation
+    /// rather than a second registry: two views of "what did we start" would
+    /// eventually disagree.
+    registry: Option<std::sync::Arc<std::sync::Mutex<ProcessRegistry>>>,
+    /// Plugin demand this guardian tracks. `None` for a guardian that only serves
+    /// leases (tests, and a runtime with no plugins configured).
+    demands: Option<super::demands::PluginDemandTable>,
+    /// Impact snapshots and their one-shot tokens.
+    previews: yi_agent_lifecycle::preview::PreviewStore,
+    /// How to ask the business daemon what only it knows.
+    ///
+    /// Defaults to "nobody to ask", which yields an explicitly unknown preview rather
+    /// than an empty one: a guardian that cannot see the daemon must not report that
+    /// the runtime is idle.
+    coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
     /// Leases *and* reclamation.
     ///
     /// One object rather than two because "may this client admit work" and "is the
@@ -1078,6 +1097,10 @@ impl Guardian {
             scope,
             artifact,
             generation,
+            registry: None,
+            demands: None,
+            previews: yi_agent_lifecycle::preview::PreviewStore::new(),
+            coordinator: std::sync::Arc::new(super::preview::NoCoordinator),
             reclaim,
         }
     }
@@ -1091,8 +1114,9 @@ impl Guardian {
             std::sync::Arc::new(yi_agent_lifecycle::deadline::MonotonicClock::new());
         let backend: std::sync::Arc<std::sync::Mutex<dyn super::reclaim::ProcessBackend>> =
             std::sync::Arc::new(std::sync::Mutex::new(super::reclaim::RegistryBackend::new(
-                registry,
+                std::sync::Arc::clone(&registry),
             )));
+        self.registry = Some(std::sync::Arc::clone(&registry));
         let leases = std::mem::take(self.reclaim.leases_mut());
         let clients = std::mem::take(self.reclaim.clients_mut());
         self.reclaim = super::reclaim::Reclaimer::new(
@@ -1103,6 +1127,61 @@ impl Guardian {
         );
         *self.reclaim.leases_mut() = leases;
         *self.reclaim.clients_mut() = clients;
+    }
+
+    /// Points the impact preview at the plugin demand table.
+    ///
+    /// Separate from [`Self::attach_registry`] because demand lives with the daemon
+    /// side, not with process ownership: a runtime can own groups and track no
+    /// plugins, and a lease-only guardian tracks demand but starts nothing.
+    pub fn attach_demands(&mut self, demands: super::demands::PluginDemandTable) {
+        self.demands = Some(demands);
+    }
+
+    /// Points the impact preview at a real business-daemon probe.
+    pub fn attach_coordinator(
+        &mut self,
+        probe: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+    ) {
+        self.coordinator = probe;
+    }
+
+    /// Whether this guardian holds the handles needed to stop what it started.
+    pub fn holds_registry(&self) -> bool {
+        self.registry.is_some()
+    }
+
+    /// Every running managed group, copied out of the registry.
+    ///
+    /// Copied rather than borrowed because the registry mutex must not be held while
+    /// an impact preview is assembled: assembling it can be slow (a page of entries),
+    /// and holding the lock would stall reclamation behind a UI read.
+    pub fn running_records(&self) -> Vec<ProcessRecord> {
+        let Some(registry) = &self.registry else {
+            return Vec::new();
+        };
+        let registry = match registry.lock() {
+            Ok(registry) => registry,
+            // A poisoned registry means another thread panicked holding it. The
+            // records are still what they were, and reporting "nothing running"
+            // would be the one wrong answer here, so recover the data.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.records().to_vec()
+    }
+
+    /// The impact previews and their tokens.
+    pub fn previews(&self) -> &yi_agent_lifecycle::preview::PreviewStore {
+        &self.previews
+    }
+
+    pub fn previews_mut(&mut self) -> &mut yi_agent_lifecycle::preview::PreviewStore {
+        &mut self.previews
+    }
+
+    /// The plugin demand table, when one is attached.
+    pub fn demands(&self) -> Option<&super::demands::PluginDemandTable> {
+        self.demands.as_ref()
     }
 
     pub fn reclaimer(&self) -> &super::reclaim::Reclaimer {
@@ -1230,8 +1309,29 @@ pub fn serve(
     selected: ArtifactIdentity,
     shutdown: impl Fn() -> bool,
 ) -> io::Result<()> {
+    serve_with(
+        scope,
+        selected,
+        shutdown,
+        std::sync::Arc::new(super::preview::NoCoordinator),
+    )
+}
+
+/// Same as [`serve`], with a probe for the business daemon's impact.
+///
+/// Injected rather than looked up because the guardian is a separate process: only
+/// the caller knows how to reach the daemon it is supervising, and a guardian with
+/// no daemon (a lease-only observer, or the window between daemon generations) must
+/// still run and still answer previews honestly as "unknown".
+pub fn serve_with(
+    scope: RuntimeScope,
+    selected: ArtifactIdentity,
+    shutdown: impl Fn() -> bool,
+    coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+) -> io::Result<()> {
     let generation = format!("guardian-{}", std::process::id());
     let mut guardian = Guardian::new(scope, selected, generation);
+    guardian.attach_coordinator(coordinator);
     let (registry, report) = guardian.open_registry()?;
     if !report.is_safe() {
         // Refuse to serve rather than let the next generation schedule work beside
@@ -1285,6 +1385,306 @@ pub fn serve(
 /// is noticed within a second or two of its window closing rather than whenever the
 /// next client happens to connect.
 const LEASE_MAINTENANCE_TICK: Duration = Duration::from_secs(1);
+
+/// Re-checks that the artifact a token was minted for is still usable.
+///
+/// A bundle can be replaced or removed between the preview and the click. Checking
+/// here means the failure is "the target is gone, preview again" instead of a switch
+/// that stops the old runtime and then cannot start the new one.
+fn verify_target(target: &yi_agent_lifecycle::types::ArtifactIdentity) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(&target.executable).map_err(|error| {
+        format!(
+            "the target artifact {} cannot be used: {error}",
+            target.executable.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "the target artifact {} is not a regular file",
+            target.executable.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "the target artifact {} is not executable",
+            target.executable.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Answers `ControlRequest::Preview`.
+///
+/// Read-only by construction: it takes no maintenance barrier, starts no drain, and
+/// changes no admission state. A preview that a user cancels therefore cannot have
+/// disturbed anything, which is what makes it safe to render while they decide.
+fn serve_preview(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    target: yi_agent_lifecycle::types::ArtifactIdentity,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::preview::ConfirmationContext;
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse, ImpactRevision};
+
+    // The caller must still hold a live lease. Otherwise anybody who can open the
+    // socket could mint a token for a runtime they do not belong to.
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+
+    let records = guardian.running_records();
+    let demands = match guardian.demands() {
+        Some(demands) => demands.clone(),
+        None => super::demands::PluginDemandTable::new(),
+    };
+    // Ask the daemon out of band. A probe that cannot answer yields `None` in the
+    // preview, which the store renders as unknown -- never as "nothing running".
+    let coordinator = guardian.coordinator.impact();
+    let fencable = super::preview::is_fencable(guardian.holds_registry(), &target);
+
+    let collected = match super::preview::collect(
+        guardian.reclaimer().leases(),
+        &records,
+        &demands,
+        coordinator,
+        fencable,
+        || guardian.reclaimer().leases().impact_revision(),
+        // Second daemon read, so its rows also describe one instant. Without this a
+        // worker starting mid-collection would be missing from the impact the user
+        // approves, and the restart would stop it anyway.
+        || guardian.coordinator.impact().revision,
+    ) {
+        Ok(collected) => collected,
+        // A runtime that changed while being measured has no single instant to
+        // confirm. Handing back a mixed snapshot would let a person approve one
+        // state and get another.
+        Err(race) => {
+            return ControlResponse::Rejected {
+                code: ControlErrorCode::Conflict,
+                reason: race.to_string(),
+            };
+        }
+    };
+
+    let context = ConfirmationContext {
+        scope_key: guardian.scope.key.clone(),
+        daemon_instance_id: guardian.generation.to_string(),
+        target,
+        revision: ImpactRevision {
+            guardian: collected.guardian_revision,
+            coordinator: collected.coordinator_revision,
+        },
+    };
+    let preview = guardian
+        .previews_mut()
+        .preview(grant, context, collected.input, now);
+    ControlResponse::Preview(preview)
+}
+
+/// Answers `ControlRequest::PreviewPage`: more rows, never a token.
+fn serve_preview_page(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    snapshot_id: &str,
+    cursor: &str,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse, ImpactRevision};
+
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    // The page is checked against the *live* revision, not the one recorded when the
+    // snapshot was taken: if the runtime moved, the rest of the list describes a
+    // world that no longer exists. The target comes from the snapshot itself,
+    // because a page request carries no target.
+    let stored = match guardian
+        .previews()
+        .stored_binding_for(grant, snapshot_id, now)
+    {
+        Ok(stored) => stored,
+        Err(refusal) => {
+            return ControlResponse::Rejected {
+                code: match refusal {
+                    yi_agent_lifecycle::preview::ConfirmRefusal::UnknownToken => {
+                        ControlErrorCode::InvalidRequest
+                    }
+                    yi_agent_lifecycle::preview::ConfirmRefusal::WrongOwner => {
+                        ControlErrorCode::Unauthenticated
+                    }
+                    _ => ControlErrorCode::Conflict,
+                },
+                reason: refusal.reason(),
+            };
+        }
+    };
+    let context = yi_agent_lifecycle::preview::ConfirmationContext {
+        revision: ImpactRevision {
+            guardian: guardian.reclaimer().leases().impact_revision(),
+            coordinator: stored.revision.coordinator,
+        },
+        ..stored
+    };
+    match guardian
+        .previews_mut()
+        .page(grant, snapshot_id, cursor, &context, now)
+    {
+        Ok(page) => ControlResponse::Preview(page),
+        Err(refusal) => ControlResponse::Rejected {
+            code: match refusal {
+                yi_agent_lifecycle::preview::ConfirmRefusal::UnknownToken => {
+                    ControlErrorCode::InvalidRequest
+                }
+                yi_agent_lifecycle::preview::ConfirmRefusal::WrongOwner => {
+                    ControlErrorCode::Unauthenticated
+                }
+                _ => ControlErrorCode::Conflict,
+            },
+            reason: refusal.reason(),
+        },
+    }
+}
+
+/// Answers `ControlRequest::Confirm`: consume the token and enter maintenance.
+///
+/// The order is the safety property. The token is verified and consumed *before* any
+/// barrier is installed, so a second click cannot install a second barrier, and a
+/// barrier can never exist on behalf of a consent that was not actually given.
+fn serve_confirm(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    token: &str,
+    operation_id: &str,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse, ImpactRevision};
+
+    if operation_id.is_empty() {
+        // An empty id would make "retry the same operation" indistinguishable from
+        // "confirm again", and those differ: one is safe, the other starts a second
+        // replacement.
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: "a confirmation must carry the operation id it will start".to_string(),
+        };
+    }
+
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+
+    // The target artifact is read out of the snapshot: the confirmation is "switch
+    // to what you were shown". It is then re-verified against what is actually on
+    // disk, so a bundle deleted between preview and click fails here rather than
+    // half way through a switch.
+    let stored = match guardian.previews().stored_binding(grant, token, now) {
+        Ok(stored) => stored,
+        Err(refusal) => {
+            return ControlResponse::Rejected {
+                code: match refusal {
+                    yi_agent_lifecycle::preview::ConfirmRefusal::UnknownToken => {
+                        ControlErrorCode::InvalidRequest
+                    }
+                    yi_agent_lifecycle::preview::ConfirmRefusal::WrongOwner => {
+                        ControlErrorCode::Unauthenticated
+                    }
+                    _ => ControlErrorCode::Conflict,
+                },
+                reason: refusal.reason(),
+            };
+        }
+    };
+    if let Err(reason) = verify_target(&stored.target) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason,
+        };
+    }
+    let context = yi_agent_lifecycle::preview::ConfirmationContext {
+        revision: ImpactRevision {
+            guardian: guardian.reclaimer().leases().impact_revision(),
+            // A confirmation minted from an unanswered daemon stays bound to
+            // "unknown"; re-reading it here as a number would silently upgrade an
+            // unknown-impact consent into a known-impact one.
+            coordinator: stored.revision.coordinator,
+        },
+        ..stored
+    };
+    let refused =
+        |refusal: yi_agent_lifecycle::preview::ConfirmRefusal| ControlResponse::Rejected {
+            code: match refusal {
+                yi_agent_lifecycle::preview::ConfirmRefusal::UnknownToken => {
+                    ControlErrorCode::InvalidRequest
+                }
+                yi_agent_lifecycle::preview::ConfirmRefusal::WrongOwner => {
+                    ControlErrorCode::Unauthenticated
+                }
+                _ => ControlErrorCode::Conflict,
+            },
+            reason: refusal.reason(),
+        };
+
+    // The barrier comes before consuming, so a refused confirmation leaves the token
+    // usable: a user who fixed the problem (put the bundle back, closed the extra
+    // client) can still confirm with the same click rather than seeing a new preview.
+    if let Err(reason) = guardian
+        .reclaimer_mut()
+        .clients_mut()
+        .begin_maintenance(context.revision.guardian)
+    {
+        // Another switch already holds the barrier. Answering "confirmed" here would
+        // claim this click started a replacement that is not running.
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Conflict,
+            reason,
+        };
+    }
+
+    // Re-read the revision *while* the barrier is up. Admission under this generation
+    // is now closed, so the only ways it can still move are decreases -- a client
+    // leaving, a task finishing, a lease expiring -- and each of those makes the
+    // user's consent describe a *larger* impact than will actually occur. That is not
+    // what they agreed to either, so the confirmation fails and the barrier comes
+    // down.
+    let after_barrier = guardian.reclaimer().leases().impact_revision();
+    if after_barrier != context.revision.guardian {
+        guardian.reclaimer_mut().clients_mut().end_maintenance();
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Conflict,
+            reason: format!(
+                "the runtime changed while the barrier was being installed \
+                 (revision {} -> {}); take a fresh preview",
+                context.revision.guardian, after_barrier
+            ),
+        };
+    }
+
+    match guardian
+        .previews_mut()
+        .confirm(grant, token, operation_id, &context, now)
+    {
+        Ok(operation) => ControlResponse::Confirmed {
+            operation_id: operation,
+        },
+        Err(refusal) => {
+            // Nothing was authorised, so the barrier must not stay up: it would block
+            // every new task on behalf of a replacement that is not happening.
+            guardian.reclaimer_mut().clients_mut().end_maintenance();
+            refused(refusal)
+        }
+    }
+}
 
 /// Waits until the listener has a connection or `timeout` elapses.
 ///
@@ -1502,8 +1902,19 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                 }
             }
         }
-        // Heartbeat/resume/reclaim/operation are completed in later tasks; until
-        // then an unimplemented request is reported as such, never as accepted.
+        ControlRequest::Preview { grant, target } => serve_preview(guardian, &grant, target),
+        ControlRequest::PreviewPage {
+            grant,
+            snapshot_id,
+            cursor,
+        } => serve_preview_page(guardian, &grant, &snapshot_id, &cursor),
+        ControlRequest::Confirm {
+            grant,
+            token,
+            operation_id,
+        } => serve_confirm(guardian, &grant, &token, &operation_id),
+        // Reclaim/operation are completed in later tasks; until then an
+        // unimplemented request is reported as such, never as accepted.
         _ => ControlResponse::Unsupported {
             detail: "not implemented by this guardian build".to_string(),
         },

@@ -194,6 +194,87 @@ pub enum ControlErrorCode {
     Internal,
 }
 
+/// How much a replacement would disturb, as counts only.
+///
+/// `complete` is the load-bearing field: `false` means the snapshot could not be
+/// finished (the business daemon did not answer, or the read raced a change), so
+/// every number here is a **lower bound**. A caller that treats `complete: false`
+/// as "nothing is happening" would let a restart kill unseen work, so an
+/// incomplete snapshot is always shown as unknown rather than as zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactCounts {
+    /// Frontends currently registered (the App itself included).
+    pub clients: u64,
+    /// Clients that disconnected but may still reconnect inside their window.
+    pub pending_clients: u64,
+    /// Executions running right now.
+    pub running: u64,
+    /// Executions queued but not started.
+    pub queued: u64,
+    /// Shared plugin services with at least one owner.
+    pub plugins: u64,
+    /// Whether those numbers are a complete answer.
+    pub complete: bool,
+}
+
+/// One affected thing, named so a human can judge it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactEntry {
+    /// A stable, unbounded-set-free category (`client`, `execution`, `plugin`, ...).
+    pub kind: String,
+    /// The concrete id inside that category.
+    pub id: String,
+    /// Who it belongs to, when that is known. `None` is "unattributed", which is a
+    /// reason to be more careful, not less.
+    pub owner: Option<String>,
+}
+
+/// The two independent authorities whose state a preview describes.
+///
+/// Two counters rather than one derived hash: a hash could collide, and this value
+/// decides whether a confirmation still applies. They are compared for equality,
+/// never ordered -- an older generation is not "less" than a newer one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactRevision {
+    /// The guardian's own counter: leases and process ownership.
+    pub guardian: u64,
+    /// The business daemon's counter. `None` means it did not answer: the impact
+    /// is **unknown**, which must never be read as zero.
+    pub coordinator: Option<u64>,
+}
+
+/// What a restart would disturb, plus the token that authorises consuming it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartPreview {
+    /// Identifies this snapshot for paging. Not a credential on its own: every
+    /// page request is still checked against the caller's grant and context.
+    pub snapshot_id: String,
+    /// The one-shot token a confirmation must present. Empty on a page after the
+    /// first, which is what makes "paging cannot confirm" structural.
+    pub token: ConfirmationToken,
+    pub revision: ImpactRevision,
+    pub counts: ImpactCounts,
+    pub entries: Vec<ImpactEntry>,
+    /// Set when more entries exist than fit in one frame.
+    pub next_cursor: Option<String>,
+    /// True when the action is not the harmless case: someone else, some running
+    /// work, or an unknown impact. The UI must ask a second time.
+    pub requires_second_confirmation: bool,
+    /// Whether a restart may be attempted at all. `false` with a `blocked_reason`
+    /// is an answer, not a failure: some runtimes cannot be upgraded automatically.
+    pub can_restart: bool,
+    pub blocked_reason: Option<String>,
+}
+
+/// Everything a confirmation is bound to, so a stale click cannot do new damage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationContext {
+    pub scope_key: String,
+    pub daemon_instance_id: String,
+    pub target: ArtifactIdentity,
+    pub revision: ImpactRevision,
+}
+
 /// Requests on the control channel (protocol v1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
@@ -228,6 +309,29 @@ pub enum ControlRequest {
     /// anything -- a refusal is the only power it has.
     Admission {
         asked: ExecutionAdmission,
+    },
+    /// Read-only impact preview. Never drains, never takes a maintenance lock.
+    ///
+    /// `target` is the artifact the caller wants to move to; it is part of the
+    /// token binding because "upgrade to 9.2.2" and "upgrade to 9.3.0" are
+    /// different decisions even when the current impact is identical.
+    Preview {
+        grant: ClientGrant,
+        target: ArtifactIdentity,
+    },
+    /// One more page of an existing snapshot. Cannot confirm anything.
+    PreviewPage {
+        grant: ClientGrant,
+        snapshot_id: String,
+        cursor: String,
+    },
+    /// Consume a preview token. `operation_id` is chosen by the caller *before*
+    /// the click so a lost response does not require a second confirmation: the
+    /// same id is queried instead of the action being repeated.
+    Confirm {
+        grant: ClientGrant,
+        token: ConfirmationToken,
+        operation_id: OperationId,
     },
 }
 
@@ -282,6 +386,12 @@ pub enum ControlResponse {
     /// This endpoint does not implement the request at all.
     Unsupported {
         detail: String,
+    },
+    /// The snapshot (first page, or a later page with an empty token).
+    Preview(RestartPreview),
+    /// The confirmation was accepted and bound to `operation_id`.
+    Confirmed {
+        operation_id: OperationId,
     },
 }
 

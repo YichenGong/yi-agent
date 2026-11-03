@@ -666,7 +666,7 @@ async fn multi_project_quit_releases_in_parallel_under_one_deadline() {
 - 正常确认先取得协调权、在 guardian 串行入口验证其分量并建立短时 admission reservation，再在 coordinator 同一入口比较 coordinator 的 Some 分量且关闭全部业务准入。reservation 阶段暂停可增加影响的登记／demand／spawn，**不得冻结心跳、Release、死亡监控**；这些减少影响的变化递增 revision 并使未提交确认失败。协调完成后复核 guardian 分量，成功才一次消费 token／记录 operation／开始 drain。任何跨边界失败均撤销未提交 reservation；coordinator 已关闭但尚未 drain 时仅在原实例仍健康且 scope 身份一致下撤销屏障，否则 fail-closed。每步 2 秒请求并受剩余预算约束，不能把业务锁持有到整个切换结束。屏障提交后新登记只到 WaitingNextGeneration，退出继续生效。
 - 无响应路径在 guardian 验证 unknown token 后，独立撤销旧代际全部执行准入／capability，并由 executor、工具与前台 host 的私有控制面确认屏障；不等待 coordinator 应答才封闭执行。随后按 Task 15 的 10 + 5 秒预算尽力 checkpoint／核实强停，锁或任一组未确认停止就失败，绝不启动新版。若确认前 coordinator 恢复、范围／revision 变更，返回 stale，重新完整预览而不自动改变用户已确认的范围。增加 `unresponsive_managed_daemon_can_be_confirmed_with_explicit_unknown_impact` 与 `unknown_impact_without_independent_fence_requires_manual_action` 测试。
 
-- [ ] **Step 1:** 添加重复确认、过期、代际／目标变化、分页 revision 变化测试；关键纯函数用例：
+- [x] **Step 1:** 添加重复确认、过期、代际／目标变化、分页 revision 变化测试；关键纯函数用例：
 
 ```rust
 #[test]
@@ -681,10 +681,10 @@ fn heartbeat_does_not_change_impact_revision() {
 
 本任务给 Task 4 LeaseTable 增加 `impact_revision(&self) -> u64`，只在登记／释放及实际影响变化时递增，单纯重连 socket 不新增 client。
 
-- [ ] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test runtime_restart_preview`；变更集合与 confirm 同时竞争，断言不可能“旧 token 成功但新任务逃过确认”。
-- [ ] **Step 3:** token 绑定发起者、scope、代际、目标固定副本身份、完整 revision，CSPRNG、60 秒、一次消费；预览无 drain 无维护锁，取消无副作用。确认校验与维护准入原子化；重复点击返回已消费／已有 operation，不开始第二次切换。
-- [ ] **Step 4:** 页内容按 16 KiB 实际序列化长度切分，完整分类计数不截断。其他客户端／活跃或排队任务／自动工作／unknown 都需要二次确认；只有本 App 空闲可直接消费预览 token。旧实例 token 在壳管理入口本地维护，不能要求旧 daemon实现新协议；未知不等于可强杀。
-- [ ] **Step 5:** 测试控制面兼容但业务不兼容时 lease-only 仍能预览；执行 §0.4，提交 `feat: require revision-bound confirmation for runtime replacement`。
+- [x] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test runtime_restart_preview`；变更集合与 confirm 同时竞争，断言不可能“旧 token 成功但新任务逃过确认”。
+- [x] **Step 3:** token 绑定发起者、scope、代际、目标固定副本身份、完整 revision，CSPRNG、60 秒、一次消费；预览无 drain 无维护锁，取消无副作用。确认校验与维护准入原子化；重复点击返回已消费／已有 operation，不开始第二次切换。
+- [x] **Step 4:** 页内容按 16 KiB 实际序列化长度切分，完整分类计数不截断。其他客户端／活跃或排队任务／自动工作／unknown 都需要二次确认；只有本 App 空闲可直接消费预览 token。旧实例 token 在壳管理入口本地维护，不能要求旧 daemon实现新协议；未知不等于可强杀。
+- [x] **Step 5:** 测试控制面兼容但业务不兼容时 lease-only 仍能预览；执行 §0.4，提交 `feat: require revision-bound confirmation for runtime replacement`。
 
 ## Task 15: 有界版本切换、guardian exec 交接与失败恢复
 

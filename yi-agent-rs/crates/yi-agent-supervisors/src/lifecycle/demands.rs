@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use yi_agent_lifecycle::types::ClientRunId;
 
 /// Per-plugin sets of clients that are currently waiting on it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PluginDemandTable {
     /// `BTreeMap`/`BTreeSet` so `owners` answers in a stable order; callers that
     /// pick "the" owner from the list must not see it reshuffle run to run.
