@@ -1,8 +1,30 @@
 # yi-agent-tools
 
-## 防休眠加固交叉引用（待实现）
+## 防休眠加固交叉引用（已实现）
 
-显式后台进程保活意图与读回见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) §7、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 5–6。需求 P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数；完成判据为 B1–B8、`cargo test -p yi-agent-tools --lib sleep_hardening_` 与 app-server/desktop 接线回归。本轮仅文档，未实现。
+显式后台进程保活意图与读回见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) §7、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 5–6。需求 P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数。
+
+完成判据（自动化已通过，详见 [verification](../research/2026-11-03-idle-sleep-hardening-verification.md)）：
+`cargo test -p yi-agent-tools --lib sleep_hardening` 6 项（B1–B4），加
+`cargo test -p yi-agent-tools --lib process::` 32 项无回归。
+实现位置：`crates/yi-agent-tools/src/process/tools.rs`（`ProcessStartArgs` 的
+`#[serde(default)] prevent_idle_sleep: bool` + schema `type: boolean` /
+`default: false`、不在 `required` 里；`"true"` / `null` / `1` 被 serde 拒绝）与
+`crates/yi-agent-tools/src/process/manager.rs`
+（`ProcessStartOptions` / `ManagedProcess` / snapshot / 结果 DTO 都携带意图，
+只在构造时写入、不按状态改写；`has_sleep_preventing_processes()` 只遍历内存表，
+`Starting | Running | Ready` 算活跃，`Ready` 不是终态）。
+
+desktop 侧同一意图由 `ProcessInfo` / `ProcessReadResult` 的可选字段承载，
+`desktop/src/lib/processes.ts` 的 `requestsIdleSleepPrevention` 把「缺值按 false」
+固化成唯一入口（当前无 UI 消费者）；`npx vitest run` 2051 passed。
+
+变异证据：schema 改 `type: "string"` → `sleep_hardening_schema_exposes_explicit_boolean` 红；
+谓词去掉 `Ready` → `..._predicate_covers_every_status` 与
+`..._gated_process_reports_the_intent_end_to_end` 红（"status Ready with
+prevent_idle_sleep=true must yield true"）。
+
+遗留的既有跳转（`JumpToProcess`）与 old `App` 老流程无关，不受影响。
 
 ## 模块说明
 

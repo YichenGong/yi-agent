@@ -62,16 +62,32 @@ pub(crate) fn state_counts_as_busy(state: &str) -> bool {
 /// 那一刻 turn 没结束、上下文都在，机器睡了用户回来点批准，这条 turn 已经随
 /// 睡眠死掉了。`active_turn_id.is_some()` 与它并列，覆盖「turn 已挂上但状态还
 /// 没切成 Running」的短暂窗口。
+///
+/// 第三条来源是**会话托管的后台进程**：进程显式请求了 `prevent_idle_sleep`、
+/// 且仍在 `Starting`/`Running`/`Ready` 时，即使该会话 `Idle`、没有活跃 turn，
+/// 也算有活（有限的后台工作在跑，机器不该在这时睡）。它只是本函数的内部新增
+/// 一路，调用方签名与「三路 busy」的语义都不变；主循环仍是 10 秒采样一次，
+/// 最后一路 busy 消失后的宽限从**观察到终态**那拍开始算。
+///
+/// 锁边界：状态锁在 `any` 的每个元素内即取即放，绝不跨到 `has_sleep_...`
+/// 的进程表遍历（两者是不同的锁，嵌套会引入不必要的耦合）。
 pub(crate) fn local_busy(threads: &HashMap<String, ThreadSession>) -> bool {
     threads.values().any(|session| {
-        session.active_turn_id.is_some()
-            || !matches!(
-                *session
-                    .status
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ThreadStatus::Idle
-            )
+        if session.active_turn_id.is_some() {
+            return true;
+        }
+        // 先算成 `bool` 再比较：写成 `!matches!(*status.lock()... , Idle) || ...`
+        // 时，锁 guard 作为操作数的临时值会活到**整条语句**结束，于是下面那次
+        // 进程表遍历仍持着状态锁——正是上面说的嵌套。显式作用域让 guard 在这里
+        // 结束。
+        let status_busy = {
+            let status = session
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            !matches!(*status, ThreadStatus::Idle)
+        };
+        status_busy || session.process_manager.has_sleep_preventing_processes()
     })
 }
 
@@ -300,6 +316,107 @@ mod tests {
             "probe must be bounded by its 500ms timeout, took {elapsed:?}"
         );
         let _ = server.join();
+    }
+
+    /// B5/B6：会话完全空闲，但它在托管一个显式请求防休眠的有限后台工作。
+    ///
+    /// 基线旧 `local_busy` 只读 `active_turn_id` / `status`，这里必然返回 `false`，
+    /// 于是「turn 已结束、后台还在跑」时机器会照睡。
+    ///
+    /// 判据刻意先用 `has_sleep_preventing_processes()`（manager 自己的谓词），
+    /// 只断言 `local_busy` 与它一致，避免测试自己复刻一遍状态机。
+    #[tokio::test]
+    async fn sleep_hardening_idle_session_with_background_work_is_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let gate = dir.path().join("done");
+        let session = session(ThreadStatus::Idle, None);
+        assert!(
+            session.active_turn_id.is_none()
+                && *session.status.lock().unwrap() == ThreadStatus::Idle,
+            "precondition: the session itself looks completely idle"
+        );
+
+        // 在**这个会话自己的** manager 上起门闩进程（与生产同一实例）。
+        let mut opts = yi_agent_tools::ProcessStartOptions {
+            command: "printf READY; while [ ! -e \"$DONE\" ]; do sleep 0.02; done".into(),
+            name: Some("gated".into()),
+            cwd: None,
+            env: Default::default(),
+            on_exit: Default::default(),
+            ready_pattern: Some("READY".into()),
+            ready_timeout_sec: Some(5),
+            prevent_idle_sleep: true,
+        };
+        opts.env.insert("DONE".into(), gate.display().to_string());
+        let started = session.process_manager.start(opts).await.unwrap();
+        assert!(started.ready && started.prevent_idle_sleep);
+
+        let manager = Arc::clone(&session.process_manager);
+        let thread_id = session.thread_id.clone();
+        let threads = HashMap::from([(thread_id.clone(), session)]);
+
+        assert!(
+            manager.has_sleep_preventing_processes(),
+            "precondition: the opted-in gated process is active"
+        );
+        assert!(
+            local_busy(&threads),
+            "an idle session hosting opted-in background work must still be busy"
+        );
+
+        // 放行并**有界**等待 manager 进入终态：宽限必须从观察到终态之后才起算。
+        std::fs::write(&gate, b"go").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while manager.has_sleep_preventing_processes() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gated process must reach a terminal state after the gate is written"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !local_busy(&threads),
+            "once the last opted-in process is terminal the session is idle again"
+        );
+
+        // B8：移除该会话后不再聚合它。
+        let mut threads = threads;
+        threads.remove(&thread_id);
+        assert!(
+            !local_busy(&threads),
+            "a removed session aggregates nothing"
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    /// B5 对照：没有显式意图的常驻进程不能把空闲会话变成忙。
+    #[tokio::test]
+    async fn sleep_hardening_idle_session_with_opted_out_work_is_not_busy() {
+        let session = session(ThreadStatus::Idle, None);
+        let started = session
+            .process_manager
+            .start(yi_agent_tools::ProcessStartOptions {
+                command: "sleep 30".into(),
+                name: Some("resident".into()),
+                cwd: None,
+                env: Default::default(),
+                on_exit: Default::default(),
+                ready_pattern: None,
+                ready_timeout_sec: None,
+                prevent_idle_sleep: false,
+            })
+            .await
+            .unwrap();
+        assert!(!started.prevent_idle_sleep);
+
+        let manager = Arc::clone(&session.process_manager);
+        let threads = HashMap::from([(session.thread_id.clone(), session)]);
+        assert!(
+            !local_busy(&threads),
+            "an opted-out background process must not keep the machine awake"
+        );
+        manager.shutdown().await.unwrap();
     }
 
     // ---- Task 9 Step 6：local_busy 与 remote_touch_busy 的真实用例（9 条） ----

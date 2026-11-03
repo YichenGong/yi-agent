@@ -333,6 +333,7 @@ mod tests {
             on_exit: OnExitPolicy::Kill,
             exit_code: None,
             elapsed_sec: 1.2,
+            prevent_idle_sleep: false,
         }
     }
 
@@ -379,6 +380,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Running,
             ready: true,
+            prevent_idle_sleep: false,
         };
 
         // List view: the card must have an edge on a light terminal.
@@ -471,6 +473,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Running,
             ready: true,
+            prevent_idle_sleep: false,
         };
 
         for width in [20u16, 40, 80] {
@@ -495,6 +498,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Running,
             ready: true,
+            prevent_idle_sleep: false,
         };
 
         let rendered: String = process_detail_lines(&process, Some(&output), 40)
@@ -519,6 +523,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Ready,
             ready: true,
+            prevent_idle_sleep: false,
         };
 
         let lines = process_detail_lines(&process, Some(&output), 80);
@@ -543,6 +548,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Ready,
             ready: true,
+            prevent_idle_sleep: false,
         };
 
         let popup = ProcessDetailPopup::new("proc_1".into());
@@ -563,6 +569,7 @@ mod tests {
             truncated: false,
             status: ProcessStatus::Ready,
             ready: true,
+            prevent_idle_sleep: false,
         };
         let max_scroll = process_detail_scroll(
             &ProcessDetailPopup::new("proc_1".into()),

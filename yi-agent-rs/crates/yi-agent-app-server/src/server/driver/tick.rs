@@ -151,6 +151,8 @@ pub(crate) async fn driver_tick<F>(
                 // 替所有项目写一遍 meta,并把「谁拉起组长」变成驱动器。`None`
                 // 是诚实取值:该 launcher 只负责起被驱动的会话。
                 lead_target: None,
+                #[cfg(test)]
+                before_prompt_send: None,
             };
             // 查询闭包走**通用**插件通道(`plugin_query_self`):宿主只转发
             // `method`/`params`,不解释应答,也不受任何看板登记表门控。

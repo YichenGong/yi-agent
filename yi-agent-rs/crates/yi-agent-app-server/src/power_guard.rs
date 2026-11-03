@@ -2,14 +2,17 @@
 //!
 //! 为什么是独立 OS 线程而不是 `select!` 分支或 `spawn_blocking`：
 //!
-//! - 一拍里含 `route` 子进程（10~50 ms）与 `connect_timeout(.., 2s)`，
-//!   放主循环会阻塞所有 RPC，最长 2 秒。
+//! - 一拍里含 `getifaddrs` 快照、电源来源查询与可能的 IOKit 调用；这些是**本地**
+//!   系统调用，但仍不该放主循环里和 RPC 抢时间片。
 //! - `spawn_blocking` 的线程会被 tokio 在空闲时回收，而这里需要「长期存在、
 //!   每 10 秒醒一次」的节奏；`std::thread` 语义更清楚，也不占 tokio 的阻塞配额。
 //! - 断言句柄必须活到进程结束，`Drop` 里 join 才能保证「线程停了断言一定释放」。
+//!
+//! 线程不轮询参数，而是等在一个 `Mutex<GuardInputs>` + `Condvar` 上：主循环
+//! 一次 `update` 提交**一致**的三个业务值（busy / enabled / grace），线程被
+//! 唤醒后立刻拷贝快照、放锁，再做 tick——锁绝不跨任何 probe 或 FFI。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use yi_agent_power::Supervisor;
@@ -38,181 +41,293 @@ fn slack_for(grace: Duration) -> Duration {
     (grace / 3).max(yi_agent_power::policy::DEFAULT_WATCHDOG_SLACK)
 }
 
+/// 主循环与保活线程之间唯一共享的可变状态。
+///
+/// 三个业务值必须**一起**换版：拆成三个原子时，线程可能读到「新的 busy +
+/// 旧的 enabled」，那一拍的策略输入从未真实存在过。`stop` 只由 `Drop` 写，
+/// `update` 永远不能把它恢复成 `false`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct GuardInputs {
+    pub(crate) busy: bool,
+    pub(crate) enabled: bool,
+    pub(crate) grace_secs: u64,
+    pub(crate) stop: bool,
+}
+
+type SharedInputs = Arc<(Mutex<GuardInputs>, Condvar)>;
+
 pub(crate) struct PowerGuard {
-    /// 主循环每拍写入：本进程侧是否有活（本地会话 ∪ 远端近期交互）。
-    activity: Arc<AtomicBool>,
-    /// 主循环每拍写入：设置页开关的当前值。
-    enabled: Arc<AtomicBool>,
-    /// 主循环每拍写入：条件消失后的宽限，单位秒。
-    grace_secs: Arc<AtomicU64>,
-    /// 主循环每拍写入：远端交互有效窗口，单位秒。
-    ///
-    /// 保活线程本身不读它——远端窗口由主循环消费（传给 `remote_touch_busy`）。
-    /// 存下来是为了 `set_windows` 的签名对称，以及让「主循环确实下发过」可被断言。
-    #[allow(dead_code)]
-    remote_secs: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
+    shared: SharedInputs,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PowerGuard {
-    /// 起线程。三个初值都是装配时读到的——避免线程第一拍先误持、再释放。
-    pub(crate) fn spawn(enabled: bool, grace_secs: u64, remote_secs: u64) -> Self {
-        let activity = Arc::new(AtomicBool::new(false));
-        let enabled_flag = Arc::new(AtomicBool::new(enabled));
-        let grace_flag = Arc::new(AtomicU64::new(grace_secs));
-        let remote_flag = Arc::new(AtomicU64::new(remote_secs));
-        let stop = Arc::new(AtomicBool::new(false));
-        let activity_in = Arc::clone(&activity);
-        let enabled_in = Arc::clone(&enabled_flag);
-        let grace_in = Arc::clone(&grace_flag);
-        let stop_in = Arc::clone(&stop);
-
-        let handle = std::thread::Builder::new()
-            .name("yi-agent-power".to_string())
-            .spawn(move || {
+    /// 生产装配：真实时钟 / 电源 / 网络 / IOKit 全部在**线程内**创建。
+    ///
+    /// 远程交互窗口不在这里：它由主循环自己消费（`remote_touch_busy`），
+    /// 线程不需要它，也就不必保存一份可能失同步的副本。
+    pub(crate) fn spawn(enabled: bool, grace_secs: u64) -> Self {
+        let initial = GuardInputs {
+            busy: false,
+            enabled,
+            grace_secs,
+            stop: false,
+        };
+        Self::spawn_with_factory(
+            initial,
+            move || {
                 // 时钟在线程里建：`SystemClock` 自己持有「单调钟是否可信」的状态，
                 // 每拍读一次就是它的全部用途，跨线程共享没有意义。
                 let clock = Arc::new(SystemClock::new()) as Arc<dyn Clock>;
-                let mut supervisor = Supervisor::new(
+                Supervisor::new(
                     clock,
                     Box::new(SystemPowerProbe::new()),
                     Box::new(SystemNetProbe::new()),
                     platform_assertion(ASSERTION_LABEL),
-                    enabled_in.load(Ordering::Relaxed),
-                );
-                while !stop_in.load(Ordering::Relaxed) {
-                    let busy = activity_in.load(Ordering::Relaxed);
-                    let enabled = enabled_in.load(Ordering::Relaxed);
-                    // 每拍重算并下发：成本是两次 load + 两次 store，远低于
-                    // 一次时钟采样。不做「值变了才下发」的优化——那要多保存
-                    // 一份可能失同步的状态。
-                    let grace = Duration::from_secs(grace_in.load(Ordering::Relaxed));
-                    supervisor.set_windows(grace, slack_for(grace));
-                    supervisor.tick(busy, enabled);
-                    sleep_until_stop(&stop_in);
-                }
-                // 显式 drop：确保断言在 join 返回前释放，不依赖栈清理时机。
-                drop(supervisor);
-            })
-            .expect("spawn the power guard thread");
+                    enabled,
+                )
+            },
+            || {},
+        )
+    }
 
+    /// 起线程并保存句柄。工厂与首拍后回调都在线程里执行，调用方不跨线程搬运
+    /// 任何非 `Send` 的平台句柄。
+    ///
+    /// `after_tick` 只用于测试观察「一次真实 tick 已结束」；生产传空闭包。
+    pub(crate) fn spawn_with_factory<F, A>(initial: GuardInputs, factory: F, after_tick: A) -> Self
+    where
+        F: FnOnce() -> Supervisor + Send + 'static,
+        A: FnMut() + Send + 'static,
+    {
+        let shared: SharedInputs = Arc::new((Mutex::new(initial), Condvar::new()));
+        let shared_in = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("yi-agent-power".to_string())
+            .spawn(move || run_worker(shared_in, factory, after_tick))
+            .expect("spawn the power guard thread");
         Self {
-            activity,
-            enabled: enabled_flag,
-            grace_secs: grace_flag,
-            remote_secs: remote_flag,
-            stop,
+            shared,
             handle: Some(handle),
         }
     }
 
-    /// 主循环每拍调用：写一个原子，不阻塞。
-    pub(crate) fn set_activity(&self, active: bool) {
-        self.activity.store(active, Ordering::Relaxed);
-    }
-
-    /// 主循环每拍调用：开关现读磁盘后写进来。
-    pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    /// 主循环每拍调用：把设置里的两个窗口写进来。只 `store`，不阻塞。
+    /// 主循环每拍调用一次：提交一致的三个业务值。
     ///
-    /// 与 `set_enabled` 同形状：主循环绝不在这里做 I/O，窗口的读取与
-    /// 换算都在调用方那一拍完成。
-    pub(crate) fn set_windows(&self, grace_secs: u64, remote_secs: u64) {
-        self.grace_secs.store(grace_secs, Ordering::Relaxed);
-        // 远端窗口由主循环自己消费（传给 `remote_touch_busy`），线程不需要它；
-        // 但存下来让「装配值与运行值来自同一处」这件事可被测试断言。
-        self.remote_secs.store(remote_secs, Ordering::Relaxed);
+    /// 只持锁写字段、放锁后 `notify_one`；相同值的重复提交不唤醒线程，避免
+    /// 10 秒一次的无意义 tick 或忙循环。这里绝不执行 I/O。
+    pub(crate) fn update(&self, busy: bool, enabled: bool, grace_secs: u64) {
+        let (lock, cv) = &*self.shared;
+        let changed = {
+            let mut inputs = lock.lock().unwrap_or_else(|p| p.into_inner());
+            // `stop` 只由 Drop 写；提交参数不能把已停止的线程"复活"。
+            if inputs.stop {
+                false
+            } else {
+                let next = GuardInputs {
+                    busy,
+                    enabled,
+                    grace_secs,
+                    stop: false,
+                };
+                let changed = *inputs != next;
+                if changed {
+                    *inputs = next;
+                }
+                changed
+            }
+        };
+        if changed {
+            cv.notify_one();
+        }
     }
 }
 
 impl Drop for PowerGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let (lock, cv) = &*self.shared;
+        {
+            let mut inputs = lock.lock().unwrap_or_else(|p| p.into_inner());
+            inputs.stop = true;
+        }
+        // 先放锁再 notify：被唤醒的线程要能立刻拿到锁。
+        cv.notify_one();
         if let Some(handle) = self.handle.take() {
             // join 是必要的：不 join 则进程可能在线程释放断言之前退出，
             // 断言变成内核里的孤儿（实际会被系统回收，但那依赖系统行为）。
             //
-            // 代价分析：最坏情况要等满一个 `SUPERVISOR_TICK`（10s）——线程正在
-            // sleep，只能醒来才发现 stop。让退出等 10 秒不可接受，故等待走
-            // `sleep_until_stop` 的分段轮询：`stop` 置位后最多 50ms 返回。
+            // 等待有上限：线程不是在 sleep 轮询，而是等 Condvar；stop 置位并
+            // notify 后它立即返回。若 stop 恰好落进一次正在执行的本地 tick，
+            // join 会等那次调用返回——不宣称能强行中断 OS 调用。
             let _ = handle.join();
         }
     }
 }
 
-/// 可被提前打断的等待：`stop` 置位后最多 50ms 内返回。
+/// 线程主体：取快照 → 放锁 → tick → 等下一拍或输入变化/stop。
 ///
-/// 直接用 `thread::sleep(10s)` 会让 `Drop` 的 join 等满 10 秒——那意味着关掉桌面
-/// 要卡 10 秒才能退出，用户会以为程序挂了。分段轮询的代价只是一些无意义的唤醒，
-/// 而这个线程本来就只在后台每 10 秒干一次活。
-fn sleep_until_stop(stop: &AtomicBool) {
-    let step = Duration::from_millis(50);
-    let mut waited = Duration::ZERO;
-    while waited < SUPERVISOR_TICK {
-        if stop.load(Ordering::Relaxed) {
-            return;
+/// `after_tick` 在**真实 tick 结束之后**调用，测试用它确认「首拍已结束」，
+/// 从而不会把首拍与唤醒混为一谈。
+fn run_worker<F, A>(shared: SharedInputs, make_supervisor: F, mut after_tick: A)
+where
+    F: FnOnce() -> Supervisor,
+    A: FnMut(),
+{
+    let mut supervisor = make_supervisor();
+    let (lock, cv) = &*shared;
+    loop {
+        let snapshot = *lock.lock().unwrap_or_else(|p| p.into_inner());
+        if snapshot.stop {
+            break;
         }
-        std::thread::sleep(step);
-        waited += step;
+        let grace = Duration::from_secs(snapshot.grace_secs);
+        supervisor.set_windows(grace, slack_for(grace));
+        supervisor.tick(snapshot.busy, snapshot.enabled);
+        after_tick();
+
+        let inputs = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if inputs.stop {
+            break;
+        }
+        // 谓词把「输入被换版」「stop」「伪唤醒」三件事一次处理完：条件不再成立
+        // 时立即返回，否则最多等一拍。
+        let _wait_result = cv
+            .wait_timeout_while(inputs, SUPERVISOR_TICK, |current| {
+                !current.stop && *current == snapshot
+            })
+            .unwrap_or_else(|p| p.into_inner());
     }
+    // 显式 drop：确保断言在 join 返回前释放，不依赖栈清理时机。
+    drop(supervisor);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use yi_agent_power::assertion::Assertion;
+    use yi_agent_power::clock::Stamp;
+    use yi_agent_power::probe::{NetProbe, NetworkState, PowerProbe};
 
-    /// 线程起来、收到 `false` 之后，`pmset` 里不应再看到我们的断言。
+    /// 假时钟：每次采样推进 1 秒。真实线程里的策略需要时间前进才会做决策。
+    struct SteppingClock {
+        elapsed: StdMutex<Duration>,
+    }
+
+    impl SteppingClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                elapsed: StdMutex::new(Duration::ZERO),
+            })
+        }
+    }
+
+    impl Clock for SteppingClock {
+        fn now(&self) -> Option<Stamp> {
+            let mut elapsed = self.elapsed.lock().unwrap();
+            *elapsed += Duration::from_secs(1);
+            Some(Stamp::from_duration(*elapsed))
+        }
+        fn since(&self, stamp: Stamp) -> Duration {
+            self.elapsed
+                .lock()
+                .unwrap()
+                .saturating_sub(stamp.as_duration())
+        }
+        fn wall(&self) -> Option<Stamp> {
+            Some(Stamp::from_duration(*self.elapsed.lock().unwrap()))
+        }
+        fn mono_trusted(&self) -> bool {
+            true
+        }
+    }
+
+    struct Battery;
+    impl PowerProbe for Battery {
+        fn on_ac(&self) -> bool {
+            false
+        }
+    }
+
+    struct AlwaysOnline;
+    impl NetProbe for AlwaysOnline {
+        fn state(&self) -> NetworkState {
+            NetworkState::Online
+        }
+    }
+
+    /// 计数断言：acquire 时向 channel 发信号，release 计数。
     ///
-    /// `#[ignore]`：这条要真读系统的断言表，只在 macOS 上、且只在手动跑
-    /// `--ignored` 时执行（与 `assertion` 模块的真机测试同款 gate）。
-    #[test]
-    #[ignore]
-    fn disabling_the_guard_releases_the_real_assertion() {
-        let guard = PowerGuard::spawn(true, 15 * 60, 5 * 60);
-        guard.set_activity(true);
-        // 等线程跑够两拍，确保它持有断言。
-        std::thread::sleep(Duration::from_secs(SUPERVISOR_TICK.as_secs() * 2));
-        let held = assertion_visible_in_pmset();
-        guard.set_enabled(false);
-        std::thread::sleep(Duration::from_secs(SUPERVISOR_TICK.as_secs() * 2));
-        let released = !assertion_visible_in_pmset();
-        drop(guard);
-        assert!(held, "the guard should have held an assertion while active");
-        assert!(released, "disabling the guard must release the assertion");
+    /// `Clone` 是「同一份状态的两个句柄」：计数都在 `Arc` 里，测试线程与
+    /// supervisor 线程看的是同一组原子值。不能直接给 `Arc<Self>` 实现
+    /// `Assertion`——`Assertion` 对本 crate 是外部 trait，孤儿规则不允许。
+    #[derive(Clone)]
+    struct CountingAssertion {
+        held: Arc<AtomicBool>,
+        releases: Arc<AtomicUsize>,
+        acquired: mpsc::Sender<()>,
     }
 
-    /// `pmset -g assertions` 的输出里有没有我们的断言。
-    fn assertion_visible_in_pmset() -> bool {
-        let output = std::process::Command::new("pmset")
-            .args(["-g", "assertions"])
-            .output()
-            .expect("run pmset");
-        String::from_utf8_lossy(&output.stdout).contains("yi-agent: keeping the machine awake")
+    impl CountingAssertion {
+        fn new(acquired: mpsc::Sender<()>, releases: Arc<AtomicUsize>) -> Self {
+            Self {
+                held: Arc::new(AtomicBool::new(false)),
+                releases,
+                acquired,
+            }
+        }
+        fn handle(&self) -> Box<dyn Assertion> {
+            Box::new(self.clone())
+        }
     }
 
-    /// 退出延迟必须远小于一拍：`Drop` 不该让关闭桌面卡 10 秒。
-    ///
-    /// 用真实的 `PowerGuard`（因此会真的碰 IOKit 一次）来量，是因为延迟来自
-    /// `sleep_until_stop` 与线程调度，`mock` 量不到。
-    #[test]
-    fn dropping_the_guard_does_not_wait_a_whole_tick() {
-        let guard = PowerGuard::spawn(false, 15 * 60, 5 * 60);
-        let started = std::time::Instant::now();
-        drop(guard);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "drop must be bounded by the 50ms poll step, took {elapsed:?}"
-        );
+    impl Assertion for CountingAssertion {
+        fn acquire(&mut self) -> bool {
+            self.held.store(true, Ordering::SeqCst);
+            let _ = self.acquired.send(());
+            true
+        }
+        fn release(&mut self) {
+            if self.held.swap(false, Ordering::SeqCst) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn is_held(&self) -> bool {
+            self.held.load(Ordering::SeqCst)
+        }
     }
 
-    /// `watchdog_slack = max(5min, grace/3)`。
-    /// 下限 5 分钟的理由：宽限设成 1 分钟时，20 秒的 slack 会让看门狗
-    /// 过于敏感——一次短暂的采样抖动就可能被判成时钟故障。
+    /// 可阻塞一次的探针：用于「tick 进行中 Drop」。
+    struct BlockingPower {
+        entered: Option<mpsc::Sender<()>>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl PowerProbe for BlockingPower {
+        fn on_ac(&self) -> bool {
+            if let Some(entered) = &self.entered {
+                let _ = entered.send(());
+            }
+            self.release.wait();
+            false
+        }
+    }
+
+    fn battery_online_supervisor(
+        clock: Arc<SteppingClock>,
+        assertion: &CountingAssertion,
+    ) -> Supervisor {
+        Supervisor::new(
+            clock,
+            Box::new(Battery),
+            Box::new(AlwaysOnline),
+            assertion.handle(),
+            true,
+        )
+    }
+
     #[test]
     fn slack_scales_with_the_grace_window() {
         let cases = [
@@ -229,5 +344,277 @@ mod tests {
                 "grace {grace_min}min should give slack {want_slack_min}min"
             );
         }
+    }
+
+    // ---- 真实线程循环：G1–G5 --------------------------------------------
+
+    /// G1：enabled=true 且已持有断言时 Drop——不等 10 秒，断言恰好释放一次。
+    #[test]
+    fn sleep_hardening_drop_releases_once_without_waiting_a_tick() {
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let clock = SteppingClock::new();
+        let assertion = CountingAssertion::new(acquired_tx, Arc::clone(&releases));
+        let factory_assertion = assertion.clone();
+        let factory_clock = Arc::clone(&clock);
+
+        // 首拍只建立策略基线，所以先 update 一次触发第二拍再等 acquire。
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let guard = PowerGuard::spawn_with_factory(
+            GuardInputs {
+                busy: true,
+                enabled: true,
+                grace_secs: 900,
+                stop: false,
+            },
+            move || battery_online_supervisor(factory_clock, &factory_assertion),
+            move || {
+                let _ = tick_tx.send(());
+            },
+        );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first tick must finish");
+        guard.update(true, true, 901);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("must acquire while busy on battery");
+
+        let started = std::time::Instant::now();
+        drop(guard);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drop must not wait a whole tick, took {elapsed:?}"
+        );
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "the assertion is released exactly once"
+        );
+    }
+
+    /// G2：线程等在 Condvar 上时 enabled=false，必须被唤醒并跳过宽限直接释放。
+    #[test]
+    fn sleep_hardening_disable_wakes_the_worker_and_skips_the_grace() {
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let clock = SteppingClock::new();
+        let assertion = CountingAssertion::new(acquired_tx, Arc::clone(&releases));
+        let factory_assertion = assertion.clone();
+        let factory_clock = Arc::clone(&clock);
+
+        let guard = PowerGuard::spawn_with_factory(
+            GuardInputs {
+                busy: true,
+                enabled: true,
+                grace_secs: 900,
+                stop: false,
+            },
+            move || battery_online_supervisor(factory_clock, &factory_assertion),
+            || {},
+        );
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("must acquire first");
+
+        guard.update(false, false, 900);
+        // 不等满一拍：禁用必须立刻唤醒线程并释放。
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while releases.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "disable must release immediately, not after the grace"
+        );
+        drop(guard);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// G3：一次本地 tick 卡在系统调用里时 Drop——join 等这次调用返回，
+    /// 之后不再有新的 tick，断言最终释放一次。
+    #[test]
+    fn sleep_hardening_drop_during_a_blocked_tick_waits_then_stops() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let clock = SteppingClock::new();
+        let assertion = CountingAssertion::new(mpsc::channel().0, Arc::clone(&releases));
+        let ticks = Arc::new(AtomicUsize::new(0));
+
+        let factory_barrier = Arc::clone(&barrier);
+        let factory_clock = Arc::clone(&clock);
+        let factory_assertion = assertion.clone();
+        let factory_ticks = Arc::clone(&ticks);
+        let guard = PowerGuard::spawn_with_factory(
+            GuardInputs {
+                busy: true,
+                enabled: true,
+                grace_secs: 900,
+                stop: false,
+            },
+            move || {
+                Supervisor::new(
+                    factory_clock,
+                    Box::new(BlockingPower {
+                        entered: Some(entered_tx),
+                        release: factory_barrier,
+                    }),
+                    Box::new(AlwaysOnline),
+                    factory_assertion.handle(),
+                    true,
+                )
+            },
+            move || {
+                factory_ticks.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        // 等线程真的进到那一次本地调用里，再开另一个线程 Drop。
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker must enter the blocked probe");
+        let dropper = std::thread::spawn(move || {
+            drop(guard);
+        });
+        // 给 Drop 一点时间去置 stop 并卡在 join 上，然后才放行 tick。
+        std::thread::sleep(Duration::from_millis(50));
+        barrier.wait();
+        dropper
+            .join()
+            .expect("drop must return after the call completes");
+
+        let ticks_after = ticks.load(Ordering::SeqCst);
+        assert_eq!(
+            ticks_after, 1,
+            "no tick runs after the stop observed post-call"
+        );
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "the assertion is released exactly once on the way out"
+        );
+    }
+
+    /// G4：一致输入。同一拍的 busy/enabled/grace 必须一起换版，且相同的重复
+    /// update 不引发额外 tick。
+    #[test]
+    fn sleep_hardening_repeated_identical_updates_do_not_tick() {
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let clock = SteppingClock::new();
+        let assertion = CountingAssertion::new(mpsc::channel().0, Arc::new(AtomicUsize::new(0)));
+        let factory_assertion = assertion.clone();
+        let factory_clock = Arc::clone(&clock);
+
+        let guard = PowerGuard::spawn_with_factory(
+            GuardInputs {
+                busy: false,
+                enabled: true,
+                grace_secs: 900,
+                stop: false,
+            },
+            move || battery_online_supervisor(factory_clock, &factory_assertion),
+            move || {
+                let _ = tick_tx.send(());
+            },
+        );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first tick must finish");
+
+        // 100 次完全相同的提交：值没变 → 不 notify → 不应有新的 tick。
+        for _ in 0..100 {
+            guard.update(false, true, 900);
+        }
+        assert!(
+            tick_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "identical updates must not cause extra ticks"
+        );
+
+        // 真的变了：必须唤醒并跑一拍。
+        guard.update(true, true, 900);
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a real change must wake the worker");
+        drop(guard);
+    }
+
+    /// G5：缩窗/扩窗/再启用仍走原 Supervisor 语义（这里只验证装配把
+    /// grace_secs 真的交给了每拍，而不是固定初值）。
+    #[test]
+    fn sleep_hardening_grace_changes_reach_the_policy() {
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let clock = SteppingClock::new();
+        let assertion = CountingAssertion::new(mpsc::channel().0, Arc::new(AtomicUsize::new(0)));
+        let factory_assertion = assertion.clone();
+        let factory_clock = Arc::clone(&clock);
+
+        let guard = PowerGuard::spawn_with_factory(
+            GuardInputs {
+                busy: true,
+                enabled: true,
+                grace_secs: 900,
+                stop: false,
+            },
+            move || battery_online_supervisor(factory_clock, &factory_assertion),
+            move || {
+                let _ = tick_tx.send(());
+            },
+        );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first tick must finish");
+
+        // 只改窗口（其余不变）也必须算一次变化并被下发。
+        guard.update(true, true, 3600);
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a grace change must wake the worker");
+        drop(guard);
+    }
+
+    /// 退出预算的基线检查：`spawn` 的装配本身不阻塞，Drop 有界。
+    #[test]
+    fn sleep_hardening_spawn_and_drop_are_bounded() {
+        let started = std::time::Instant::now();
+        let guard = PowerGuard::spawn(false, 900);
+        drop(guard);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "spawn+drop must stay within the 2s real-platform budget"
+        );
+    }
+
+    // ---- 真机：`#[ignore]` 手动跑 --------------------------------------
+
+    /// 线程起来、收到 `false` 之后，`pmset` 里不应再看到我们的断言。
+    ///
+    /// `#[ignore]`：这条要真读系统的断言表，只在 macOS 上、且只在手动跑
+    /// `--ignored` 时执行（与 `assertion` 模块的真机测试同款 gate）。
+    #[test]
+    #[ignore]
+    fn disabling_the_guard_releases_the_real_assertion() {
+        let guard = PowerGuard::spawn(true, 15 * 60);
+        guard.update(true, true, 15 * 60);
+        // 等线程跑够两拍，确保它持有断言。
+        std::thread::sleep(Duration::from_secs(SUPERVISOR_TICK.as_secs() * 2));
+        let held = assertion_visible_in_pmset();
+        guard.update(false, false, 15 * 60);
+        std::thread::sleep(Duration::from_secs(2));
+        let released = !assertion_visible_in_pmset();
+        drop(guard);
+        assert!(held, "the guard should have held an assertion while active");
+        assert!(released, "disabling the guard must release the assertion");
+    }
+
+    /// `pmset -g assertions` 的输出里有没有我们的断言。
+    fn assertion_visible_in_pmset() -> bool {
+        let output = std::process::Command::new("pmset")
+            .args(["-g", "assertions"])
+            .output()
+            .expect("run pmset");
+        String::from_utf8_lossy(&output.stdout).contains("yi-agent: keeping the machine awake")
     }
 }

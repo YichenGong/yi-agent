@@ -346,6 +346,10 @@ export interface ProcessInfo {
   on_exit: "kill" | "keep";
   exit_code: number | null;
   elapsed_sec: number;
+  // 后台进程显式请求的防休眠意图（`process_start.prevent_idle_sleep`）。
+  // 旧 sidecar 不返回此字段 ⇒ `undefined`，必须按 false 解读。
+  // 当前没有 UI 消费者；将来消费时必须用 `info.prevent_idle_sleep ?? false`。
+  prevent_idle_sleep?: boolean;
 }
 
 /** `process/list` 的响应。 */
@@ -363,4 +367,6 @@ export interface ProcessReadResult {
   truncated: boolean;
   status: ProcessStatus;
   ready: boolean;
+  // 同上：旧 sidecar 缺值按 false 解读。
+  prevent_idle_sleep?: boolean;
 }

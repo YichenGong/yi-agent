@@ -54,6 +54,8 @@ pub struct ManagedProcessSnapshot {
     pub on_exit: OnExitPolicy,
     pub exit_code: Option<i32>,
     pub elapsed_sec: f32,
+    /// 启动时登记的意图，终态也保留原值。
+    pub prevent_idle_sleep: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +68,8 @@ pub struct ProcessReadResult {
     pub truncated: bool,
     pub status: ProcessStatus,
     pub ready: bool,
+    /// 启动时登记的意图，终态也保留原值。
+    pub prevent_idle_sleep: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +235,12 @@ pub struct ProcessStartOptions {
     pub on_exit: OnExitPolicy,
     pub ready_pattern: Option<String>,
     pub ready_timeout_sec: Option<u64>,
+    /// 调用方显式请求「在这段有限的后台工作活着期间别让机器空闲睡眠」。
+    ///
+    /// 只记录**意图**：它不按 `on_exit` / readiness / 已运行多久被改写，终态也
+    /// 保留原值（`list`/`read` 照原样回报）。真正的电源断言只由 app-server 会话
+    /// 聚合（见 `power_busy`），其它入口只保留这个意图。
+    pub prevent_idle_sleep: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -242,6 +252,8 @@ pub struct ProcessStartResult {
     pub ready: bool,
     pub next_cursor: u64,
     pub start_warning: Option<String>,
+    /// 原样复制启动时收到的意图，不随当前状态改写。
+    pub prevent_idle_sleep: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +299,8 @@ struct ManagedProcess {
     stdout: StreamRingBuffer,
     stderr: StreamRingBuffer,
     child: Option<Child>,
+    /// 启动时登记的休眠保护意图。只在构造时写，之后不因状态变化改写。
+    prevent_idle_sleep: bool,
 }
 
 pub struct ProcessManager {
@@ -359,6 +373,7 @@ impl ProcessManager {
         let process_id = self.next_process_id();
         let name = opts.name.clone();
         let on_exit = opts.on_exit;
+        let prevent_idle_sleep = opts.prevent_idle_sleep;
         {
             let mut processes = self.lock_processes();
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -396,6 +411,7 @@ impl ProcessManager {
                     stdout: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
                     stderr: StreamRingBuffer::new(DEFAULT_STREAM_CAP_BYTES),
                     child: None,
+                    prevent_idle_sleep,
                 },
             );
         }
@@ -462,6 +478,22 @@ impl ProcessManager {
             ready: snapshot.ready,
             next_cursor: self.next_output_cursor(&process_id).unwrap_or(0),
             start_warning,
+            prevent_idle_sleep: snapshot.prevent_idle_sleep,
+        })
+    }
+
+    /// 是否存在**仍在活跃**、且显式请求了防休眠的后台进程。
+    ///
+    /// 只读内存表的轻量谓词（不 spawn、不读盘、不 fork）：主循环每 10 秒采样一次
+    /// 电源 busy，这里必须是常数级工作。`Starting` 也算活跃——它已经占了位，正
+    /// 在等 readiness；`Ready` 不是终态，`on_exit` / readiness 都不改变意图。
+    pub fn has_sleep_preventing_processes(&self) -> bool {
+        self.lock_processes().values().any(|p| {
+            p.prevent_idle_sleep
+                && matches!(
+                    p.status,
+                    ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Ready
+                )
         })
     }
 
@@ -500,6 +532,7 @@ impl ProcessManager {
                     truncated: stdout_page.data_lost || stderr_page.data_lost,
                     status: process.status.clone(),
                     ready: process.ready,
+                    prevent_idle_sleep: process.prevent_idle_sleep,
                 })
             }
             Some(requested) => {
@@ -559,6 +592,7 @@ impl ProcessManager {
                     truncated: data_lost,
                     status: process.status.clone(),
                     ready: process.ready,
+                    prevent_idle_sleep: process.prevent_idle_sleep,
                 })
             }
         }
@@ -729,6 +763,7 @@ impl ProcessManager {
             on_exit: process.on_exit,
             exit_code: process.exit_code,
             elapsed_sec: elapsed_end.duration_since(process.start_time).as_secs_f32(),
+            prevent_idle_sleep: process.prevent_idle_sleep,
         }
     }
 
@@ -1001,6 +1036,7 @@ mod tests {
             on_exit: OnExitPolicy::Kill,
             ready_pattern: None,
             ready_timeout_sec: None,
+            prevent_idle_sleep: false,
         }
     }
 
@@ -1622,6 +1658,171 @@ mod tests {
             .await
             .expect("terminal processes must not exhaust the slot budget");
 
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sleep_hardening_tests {
+    use super::*;
+    use tokio::time::{Duration, sleep};
+
+    fn options(command: &str, name: &str) -> ProcessStartOptions {
+        ProcessStartOptions {
+            command: command.into(),
+            name: Some(name.into()),
+            cwd: None,
+            env: Default::default(),
+            on_exit: OnExitPolicy::Kill,
+            ready_pattern: None,
+            ready_timeout_sec: None,
+            prevent_idle_sleep: false,
+        }
+    }
+
+    /// B2/B3：意图只按状态判定活跃，不因终态被抹掉。
+    ///
+    /// 直接改记录里的 `status` 覆盖全部 6 态：这是纯状态谓词，不需要真实进程。
+    #[tokio::test]
+    async fn sleep_hardening_predicate_covers_every_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // 先起一个真实进程拿到一条记录，再在锁内直接改它的状态与意图——
+        // 这样不依赖 `start` 之外的任何新入口。
+        manager.start(options("sleep 300", "st")).await.unwrap();
+
+        let cases = [
+            (ProcessStatus::Starting, true),
+            (ProcessStatus::Running, true),
+            (ProcessStatus::Ready, true),
+            (ProcessStatus::Exited { code: Some(0) }, false),
+            (ProcessStatus::Killed, false),
+            (
+                ProcessStatus::FailedToStart {
+                    reason: "boom".into(),
+                },
+                false,
+            ),
+        ];
+        for (status, expected) in cases {
+            {
+                let mut processes = manager.lock_processes();
+                let process = processes.values_mut().next().expect("one record");
+                process.prevent_idle_sleep = true;
+                process.status = status.clone();
+            }
+            assert_eq!(
+                manager.has_sleep_preventing_processes(),
+                expected,
+                "status {status:?} with prevent_idle_sleep=true must yield {expected}"
+            );
+            // 终态也保留原意图：这是「只记录意图、不按状态抹掉」的判据。
+            assert!(
+                manager.list()[0].prevent_idle_sleep,
+                "the intent must survive the terminal status {status:?}"
+            );
+        }
+
+        // false 的任何活跃状态都不算忙。
+        {
+            let mut processes = manager.lock_processes();
+            let process = processes.values_mut().next().expect("one record");
+            process.prevent_idle_sleep = false;
+            process.status = ProcessStatus::Running;
+        }
+        assert!(!manager.has_sleep_preventing_processes());
+
+        manager.shutdown().await.unwrap();
+    }
+
+    /// B1–B4 的真实路径：门闩进程保持活跃 ⇒ true；写完门闩到终态 ⇒ false；
+    /// 且 ready 终态前后 `list` / `read` / `start` 三处读回都等于 `true`。
+    ///
+    /// 用「读一行 stdin 再退出」会因 `stdin` 是 null 而立即结束，**不能**用它保持
+    /// 活跃；这里用临时文件门闩。
+    #[tokio::test]
+    async fn sleep_hardening_gated_process_reports_the_intent_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let gate = temp.path().join("done");
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+
+        let mut opts = options(
+            "printf READY; while [ ! -e \"$DONE\" ]; do sleep 0.02; done",
+            "gated",
+        );
+        opts.env.insert("DONE".into(), gate.display().to_string());
+        opts.ready_pattern = Some("READY".into());
+        opts.ready_timeout_sec = Some(5);
+        opts.prevent_idle_sleep = true;
+
+        let started = manager.start(opts).await.expect("the gated process starts");
+        assert!(
+            started.prevent_idle_sleep,
+            "start result must carry the intent"
+        );
+        assert!(started.ready, "the gate printed READY");
+        assert!(
+            manager.has_sleep_preventing_processes(),
+            "a ready, gated, opted-in process must count as busy"
+        );
+
+        let listed = manager.list();
+        assert!(listed[0].prevent_idle_sleep, "list must carry the intent");
+        assert!(
+            matches!(listed[0].status, ProcessStatus::Ready),
+            "readiness is not a terminal state, got {:?}",
+            listed[0].status
+        );
+
+        let read = manager
+            .read(ProcessSelector::Name("gated".into()), None, 4096)
+            .await
+            .unwrap();
+        assert!(read.prevent_idle_sleep, "read must carry the intent");
+
+        // 放行：写门闩，等它真的进入终态。
+        std::fs::write(&gate, b"go").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let terminal = manager
+                .list()
+                .first()
+                .is_some_and(|p| matches!(p.status, ProcessStatus::Exited { .. }));
+            if terminal {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gated process must exit after the gate is written"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !manager.has_sleep_preventing_processes(),
+            "a terminal process must not keep the machine awake"
+        );
+        assert!(
+            manager.list()[0].prevent_idle_sleep,
+            "the intent is retained even after exit"
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    /// B4：默认 false 的常驻进程不算忙。
+    #[tokio::test]
+    async fn sleep_hardening_default_false_process_is_not_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let started = manager
+            .start(options("sleep 30", "resident"))
+            .await
+            .unwrap();
+        assert!(!started.prevent_idle_sleep, "the default is false");
+        assert!(
+            !manager.has_sleep_preventing_processes(),
+            "an opted-out process must never count as busy"
+        );
         manager.shutdown().await.unwrap();
     }
 }

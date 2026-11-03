@@ -1,8 +1,34 @@
 # yi-agent-app-server（GUI app-server）
 
-## 防休眠加固交叉引用（待实现）
+## 防休眠加固交叉引用（已实现）
 
-启动失败收口、电源线程生命周期及后台 busy 接线见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 2–4、6。需求 P2/P3/P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数；完成判据为 T1–T7/G1–G5/B5–B8、`cargo test -p yi-agent-app-server --lib sleep_hardening_`。本轮仅文档，未实现。
+启动失败收口、电源线程生命周期及后台 busy 接线见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 2–4、6。需求 P2/P3/P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数。
+
+完成判据（自动化已通过，详见 [verification](../research/2026-11-03-idle-sleep-hardening-verification.md)）：
+`cargo test -p yi-agent-app-server --lib sleep_hardening` 22 项（T1–T7 / G1–G5 / B5–B7），
+加整包 `--lib` 1230 passed / 7 ignored 无回归。
+
+关键位置：
+- `server/turn/failure.rs`：`rollback_turn`（按 `active_turn_id` 身份回滚）与
+  `fail_announced_turn`（一次 `now_millis` 同时用于落盘水位与 `turn/completed`
+  广播；落盘/广播失败只记日志、不跳过回滚）。`server/turn/mod.rs` 的
+  `start_turn_core_inner` 在 `turn/started` 之后的任一失败（outbound 或
+  prompt 投递）都走它，且投递失败**不再**补第二个同 id 的 RPC 响应。
+- `server/driver/launcher.rs`：插件 launch 与 cold lead 首投失败复用同一组
+  共享 helper（删掉了 launcher 私有的重复实现）；cold lead 仍报原错误串
+  `"lead driver is gone before its first prompt"` 且不伪造 `turn/completed`；
+  warm 分支不 prepare、不占位，行为不变。
+- `power_guard.rs`：`spawn` / `update` 一次提交一致快照，
+  `Mutex<GuardInputs>` + `Condvar::wait_timeout_while` 同时处理输入换版 / stop /
+  伪唤醒；锁不跨 probe 或 FFI。
+- `power_busy.rs::local_busy`：`active_turn_id` 或非 Idle 状态，或
+  `process_manager.has_sleep_preventing_processes()`，任一成立即忙；遍历进程表时
+  不持状态锁。
+
+变异证据：RPC 投递失败只清占位 → T1 红（"the session must return to Idle"）；
+`rollback_turn` 去掉身份比较 → T3 红；落盘另取一个较早时间 → 水位同源断言红；
+删 cold lead 的 `rollback_turn` → T5 红；`update` 不发 `notify_one` → G4 红；
+等待谓词恒真 → G2/G4/G5 红。
 
 ## 模块说明
 

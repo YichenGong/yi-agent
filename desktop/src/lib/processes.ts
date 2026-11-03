@@ -7,7 +7,7 @@
  * 状态一律经 `status.state` 读取——线协议是 `{"state":"running"}`,不是裸字符串
  * (见 `protocol.ts` 的 `ProcessStatus`)。
  */
-import type { ProcessInfo, ProcessStatus } from "./protocol";
+import type { ProcessInfo, ProcessReadResult, ProcessStatus } from "./protocol";
 
 /** 仍在推进、值得默认显示的三个状态。 */
 const ACTIVE = ["starting", "running", "ready"];
@@ -34,6 +34,19 @@ export function partitionProcesses(processes: ProcessInfo[]): {
     (isActive(p.status) ? active : finished).push(p);
   }
   return { active, finished };
+}
+
+/**
+ * 后台进程是否显式请求了防休眠。
+ *
+ * 单一入口的理由：旧 sidecar 不返回该字段，`undefined` 在 JS 里是假值，但直接把
+ * `p.prevent_idle_sleep` 塞进条件会让「缺值」和「显式 false」在类型上无法区分；
+ * 这里把 `?? false` 固化成一个可测的函数，将来消费方不必各自记住这条规则。
+ */
+export function requestsIdleSleepPrevention(
+  info: ProcessInfo | ProcessReadResult,
+): boolean {
+  return info.prevent_idle_sleep ?? false;
 }
 
 export function processDisplayName(p: ProcessInfo): string {
