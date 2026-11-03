@@ -7,6 +7,7 @@ pub mod lease;
 pub mod managed;
 pub mod merge;
 pub mod merge_lock;
+pub mod migrate;
 pub mod observation;
 pub mod operations;
 pub mod tick;

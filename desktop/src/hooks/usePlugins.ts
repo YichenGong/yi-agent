@@ -222,3 +222,71 @@ export async function readTransaction(call: RpcCall, plugin: string): Promise<Tr
   });
   return { phase: result?.phase };
 }
+
+/** 旧安装探测报告里的一条痕迹。字段名与宿主 `Finding` 的 serde 表示一致。 */
+export interface LegacyFinding {
+  kind: string;
+  path: string;
+  project?: string;
+  detail: string;
+}
+
+export interface LegacyReport {
+  findings: LegacyFinding[];
+  rejectedInputs: string[];
+}
+
+/**
+ * 探测某个插件的旧安装。**只读**，可以随时调用。
+ *
+ * `plugin` 必填：旧布局的自述（旧二进制名、旧数据目录、旧开关键）来自那份插件
+ * 的清单，不给插件就无从知道该找什么。宿主不会用"猜一个插件"来代替这个参数。
+ *
+ * `projects` 由调用方显式给出：宿主只查"点名的项目 + 已登记项目 + 已知技能根"，
+ * 不扫盘。省略时宿主只查后两者。
+ */
+export async function inspectLegacy(
+  call: RpcCall,
+  params: { plugin: string; projects?: string[] },
+): Promise<LegacyReport> {
+  const result = await call<{ findings?: unknown; rejectedInputs?: unknown }>(
+    RPC.pluginsV1InspectLegacy,
+    params.projects ? { plugin: params.plugin, projects: params.projects } : { plugin: params.plugin },
+  );
+  const findings = Array.isArray(result?.findings)
+    ? result.findings
+        .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+        .filter((entry) => typeof entry.path === "string")
+        .map((entry) => ({
+          kind: typeof entry.kind === "string" ? entry.kind : "unknown",
+          path: entry.path as string,
+          project: typeof entry.project === "string" ? entry.project : undefined,
+          detail: typeof entry.detail === "string" ? entry.detail : "",
+        }))
+    : [];
+  const rejectedInputs = Array.isArray(result?.rejectedInputs)
+    ? result.rejectedInputs.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return { findings, rejectedInputs };
+}
+
+/**
+ * 接管一个旧安装。
+ *
+ * `capabilities` **必须**由用户显式勾选后传入：旧开关不是授权（迁移 spec §8.1），
+ * 宿主在没有这个字段时直接拒绝，而不是替他补齐。
+ */
+export async function adoptLegacy(
+  call: RpcCall,
+  params: { plugin: string; project: string; granted: string[] },
+): Promise<{ activation: number; backup?: string }> {
+  const result = await call<{ activation?: unknown; backup?: unknown }>(RPC.pluginsV1AdoptLegacy, {
+    plugin: params.plugin,
+    project: params.project,
+    capabilities: params.granted,
+  });
+  return {
+    activation: typeof result?.activation === "number" ? result.activation : 0,
+    backup: typeof result?.backup === "string" ? result.backup : undefined,
+  };
+}

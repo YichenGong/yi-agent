@@ -197,7 +197,23 @@ def main() -> int:
             "optional": ["Launch", "QuotaWrite", "Resident"],
         },
         "dependencies": {"workflows": [{"name": name} for name in WORKFLOWS]},
-        "data": {"format": 1, "migrations": []},
+        # How to recognise a pre-managed install of this plugin (design
+        # §8.1). The host probes generically: it reads these names out of the
+        # verified manifest instead of hard-coding one plugin's file layout.
+        # Listed here, not only in the committed json, because this script
+        # rebuilds the manifest from scratch and would otherwise drop it.
+        "data": {
+            "format": 1,
+            "migrations": [],
+            "legacy": {
+                "binaries": ["superpowers-kanban", "superpowers-kanban-runner"],
+                "supervisor": "superpowers-kanban.json",
+                "stateDirs": [".yi-agent/superpowers-kanban"],
+                "preferences": ".yi-agent/preferences.json",
+                "switchKey": "superpowers_kanban",
+                "skill": "superpowers-kanban",
+            },
+        },
         "compatibility": {"hostApi": "v1", "uiApi": "v1"},
     }
 

@@ -92,6 +92,50 @@ pub struct Migration {
 pub struct DataDecl {
     pub format: u32,
     pub migrations: Vec<Migration>,
+    /// 旧安装"长什么样"。缺省 = 这个插件没有旧布局可找。
+    ///
+    /// 放在清单里而不是宿主代码里：宿主探测必须对插件保持通用，否则加第二个
+    /// 插件就要去改宿主的硬编码表，而那张表迟早会与真实布局分叉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyDecl>,
+}
+
+/// 清单里的旧布局自述。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LegacyDecl {
+    /// `PATH` 上的旧可执行文件名。
+    #[serde(default)]
+    pub binaries: Vec<String>,
+    /// 旧 supervisor 清单文件名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<String>,
+    /// 旧状态目录（相对项目根）。
+    #[serde(default)]
+    pub state_dirs: Vec<String>,
+    /// 旧项目偏好文件（相对项目根）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<String>,
+    /// 旧偏好里的功能开关键名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_key: Option<String>,
+    /// 旧 skill 目录名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+}
+
+impl LegacyDecl {
+    /// 变成探测器认识的形状。
+    pub fn rules(&self) -> crate::legacy::LegacyRules {
+        crate::legacy::LegacyRules {
+            binaries: self.binaries.clone(),
+            supervisor: self.supervisor.clone(),
+            state_dirs: self.state_dirs.clone(),
+            preferences: self.preferences.clone(),
+            switch_key: self.switch_key.clone(),
+            skill: self.skill.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

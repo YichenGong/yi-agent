@@ -158,6 +158,43 @@
               "entry": { "$ref": "#/$defs/packagePath" }
             }
           }
+        },
+        "legacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "How to recognise this plugin's pre-managed install (design §8.1). Declared here so the host's probe stays generic: adding a plugin must not require teaching the host that plugin's old file names. Absent means the plugin has no legacy layout to look for.",
+          "properties": {
+            "binaries": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+              "description": "Legacy executable names to look for on PATH. The host records where they are and never runs them to identify themselves."
+            },
+            "supervisor": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.json$",
+              "description": "Legacy supervisor manifest file name under <project>/.yi-agent/supervisors/."
+            },
+            "stateDirs": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^\\.?[A-Za-z0-9._/-]+$" },
+              "description": "Legacy state directories relative to the project root. One holding board.json is adoptable."
+            },
+            "preferences": {
+              "type": "string",
+              "pattern": "^\\.?[A-Za-z0-9._/-]+$",
+              "description": "Legacy project preferences file relative to the project root."
+            },
+            "switchKey": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_]+$",
+              "description": "Key in that preferences file that used to switch the plugin on. Reported as a clue, never as a grant."
+            },
+            "skill": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "description": "Skill directory name to look for under the known skill roots."
+            }
+          }
         }
       }
     },

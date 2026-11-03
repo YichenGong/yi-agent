@@ -239,6 +239,34 @@ impl PluginService {
         ))
     }
 
+    /// 选中版本在磁盘上的那份清单。
+    ///
+    /// `None` = 插件未登记、没有选中版本，或选中的版本没装。**不**报错：调用方
+    /// 拿它来读"旧布局自述"之类的可选声明，缺失时用保守默认即可，不该因此
+    /// 让整个请求失败。
+    ///
+    /// 与 [`PluginService::selected_release`] 用同一份清单：发布身份与自述
+    /// 必须来自同一组字节，否则会出现"按 A 版的声明探测、按 B 版的身份接管"。
+    pub fn selected_manifest(&self, plugin: &PluginId) -> Option<Manifest> {
+        let record = Registry::open(&self.home)
+            .ok()?
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|record| &record.plugin == plugin)?;
+        let version = record.selected.clone()?;
+        let installed = record
+            .installed
+            .iter()
+            .find(|installed| installed.version == version)?;
+        let path = self
+            .home
+            .join(&installed.directory)
+            .join(managed::MANAGED_MANIFEST);
+        let bytes = std::fs::read(path).ok()?;
+        Manifest::parse(&bytes).ok()
+    }
+
     /// 选中版本的完整发布身份。
     ///
     /// target 取自**磁盘上的那份清单**，不猜：注册表只记版本与摘要，

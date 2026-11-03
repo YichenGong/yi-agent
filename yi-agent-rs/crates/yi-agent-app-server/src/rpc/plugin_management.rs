@@ -23,7 +23,7 @@
 use serde_json::{Value, json};
 
 use crate::plugin_manager::service::{self, PluginService};
-use yi_agent_plugins::{PluginError, PluginId};
+use yi_agent_plugins::{PluginError, PluginId, ReleaseId};
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{Flow, PluginChannelState, write_or_fatal};
@@ -155,10 +155,9 @@ fn dispatch(
         "uninstall" => uninstall(&service, params),
         "clearData" => clear_data(&service, params),
         "gc" => gc(&service),
-        // 下游任务的两种方法：如实说"还没有"，不伪装成功。
-        "inspectLegacy" | "adoptLegacy" => Err(PluginError::NotSupported(
-            "legacy inspection and adoption land with the migration task (T25)".to_string(),
-        )),
+        // 探测已经落地；接管要用户逐个项目重新授权，作为独立动作随后接入。
+        "inspectLegacy" => inspect_legacy(home, &service, params),
+        "adoptLegacy" => adopt_legacy(home, &service, params),
         "assetRelease" => {
             let _ = &service;
             asset_release_at(catalog_path, params)
@@ -177,6 +176,365 @@ fn dispatch(
 // ---------------------------------------------------------------------------
 // 各方法
 // ---------------------------------------------------------------------------
+
+/// 旧安装探测。**只读**：不执行旧程序、不删任何东西、不改任何登记。
+///
+/// 输入刻意是"用户点名的项目 + 实例已登记的常驻项目"，没有"给我扫一遍这台机器"
+/// 的分支（设计 §8.1 / G3 已批的取舍）：全盘扫描既慢又会碰用户没授权的目录。
+///
+/// 请求可以带 `projects: [路径]` 显式补上没登记的项目；一个不存在的路径会被
+/// 拒绝并原样报回，而**不**去找一个相近的存在路径顶替。
+fn inspect_legacy(
+    home: &std::path::Path,
+    service: &PluginService,
+    params: &Value,
+) -> Result<Value, PluginError> {
+    inspect_legacy_with_path(
+        home,
+        service,
+        params,
+        &std::env::var("PATH").unwrap_or_default(),
+    )
+}
+
+/// 与 [`inspect_legacy`] 相同，但 `PATH` 由调用方给。
+///
+/// 测试必须能钉住 `PATH`：读真实环境会让"探测到什么"随开发机装了什么而变，
+/// 而这条函数的核心承诺正是"只报我探到的、不猜"。
+fn inspect_legacy_with_path(
+    home: &std::path::Path,
+    service: &PluginService,
+    params: &Value,
+    path: &str,
+) -> Result<Value, PluginError> {
+    let mut projects: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(requested) = params.get("projects") {
+        let list = requested.as_array().ok_or_else(|| {
+            PluginError::Conflict("`projects` must be an array of project paths".to_string())
+        })?;
+        for entry in list {
+            let raw = entry.as_str().ok_or_else(|| {
+                PluginError::Conflict("every entry of `projects` must be a string".to_string())
+            })?;
+            // 规范化才能让"同一项目的两种写法"被认成同一个；失败就把原样交出去，
+            // 由探测把它记成 rejected input，而不是在这里猜。
+            projects
+                .push(std::fs::canonicalize(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw)));
+        }
+    }
+    // 已登记的常驻项目也是允许的探测来源。读不懂登记表就不追加，而不是报错——
+    // 那会让"我想看看旧安装"因为一份坏登记表完全用不了。
+    projects.extend(resident_project_paths(home));
+    projects.sort();
+    projects.dedup();
+
+    let rules = legacy_rules(service, params);
+    let report = yi_agent_plugins::legacy::probe(&yi_agent_plugins::legacy::Probe {
+        projects,
+        instance_dir: home,
+        path,
+        rules: &rules,
+    });
+    // 保持只读语义：`service` 只用来确认实例根打开过（与其它管理方法一致），
+    // 探测本身不经过它。
+    let _ = service;
+    serde_json::to_value(report)
+        .map_err(|error| PluginError::Io(format!("could not encode the report: {error}")))
+}
+
+/// 这个插件"旧安装长什么样"。
+///
+/// 优先读**已验证包**的清单（`data.legacy`）；读不到时回退到按插件 id 推导的
+/// 最常见布局，并明确标注这是回退。回退值只用于"给用户看看这台机器上有什么"，
+/// **不**用于接管：接管必须来自已安装、已验签的发布。
+fn legacy_rules(service: &PluginService, params: &Value) -> yi_agent_plugins::legacy::LegacyRules {
+    let fallback = || {
+        params
+            .get("plugin")
+            .and_then(Value::as_str)
+            .and_then(|raw| PluginId::parse(raw).ok())
+            .map(|plugin| yi_agent_plugins::legacy::LegacyRules::for_plugin(&plugin))
+            .unwrap_or_default()
+    };
+    let Some(plugin) = params
+        .get("plugin")
+        .and_then(Value::as_str)
+        .and_then(|raw| PluginId::parse(raw).ok())
+    else {
+        return fallback();
+    };
+    let Some(selected) = service.selected_manifest(&plugin) else {
+        return yi_agent_plugins::legacy::LegacyRules::for_plugin(&plugin);
+    };
+    match selected.data.legacy {
+        Some(legacy) => legacy.rules(),
+        None => yi_agent_plugins::legacy::LegacyRules::for_plugin(&plugin),
+    }
+}
+
+/// 常驻登记里登记过的项目路径。坏表 → 空表（只是没有可追加的来源）。
+fn resident_project_paths(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let path = home.join("resident-daemons.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("projects")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("project")?.as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 接管一个旧安装（§8.2）。
+///
+/// 这里是**唯一**的接管入口：探测（`inspectLegacy`）只报告，接管要用户显式
+/// 指定项目并重新授权。三个输入都必须显式给出，没有"帮我接管所有探到的"分支——
+/// 那等于把一次扫描变成一次批量数据变更。
+///
+/// 顺序与失败语义都在 `yi_agent_supervisors::adopt` 里：先备份、再停旧服务、
+/// 再建受管身份。这里只负责把 `params` 变成调用，并把 `PluginError` 归类。
+fn adopt_legacy(
+    home: &std::path::Path,
+    service: &PluginService,
+    params: &Value,
+) -> Result<Value, PluginError> {
+    let plugin = plugin_from_params(params)?;
+    let raw_project = params
+        .get("project")
+        .and_then(Value::as_str)
+        .filter(|project| !project.trim().is_empty())
+        .ok_or_else(|| PluginError::Conflict("adoptLegacy needs a `project` path".to_string()))?;
+    let capabilities = capabilities_from_params(params)?;
+
+    // 规范化：项目身份要能跨"用户敲的路径"与"磁盘路径"两种写法对上。
+    // 失败就原样交给下面的 `is_dir` 判断，由它报 NotFound——不在这里猜。
+    let project = std::fs::canonicalize(raw_project)
+        .unwrap_or_else(|_| std::path::PathBuf::from(raw_project));
+
+    let release = service.selected_release(&plugin)?;
+    let legacy_state_dir = project.join(".yi-agent").join(plugin.as_str());
+    let request = yi_agent_supervisors::adopt::AdoptRequest {
+        project: project.clone(),
+        legacy_state_dir,
+        capabilities,
+        backup: true,
+    };
+    let owner = HostLegacyOwner {
+        plugin: plugin.as_str(),
+    };
+    let ownership =
+        yi_agent_plugins::ownership::ProjectOwnership::new(home.join("plugins").join("owners"));
+    let adopted = yi_agent_supervisors::adopt::adopt(
+        home,
+        &plugin,
+        &release,
+        &request,
+        &owner,
+        &ownership,
+        chrono::Local::now(),
+    )?;
+    serde_json::to_value(adopted)
+        .map_err(|error| PluginError::Io(format!("could not encode the outcome: {error}")))
+}
+
+/// 支持的能力名 → `Effect`。未知名字报错，不静默丢弃。
+fn effect_from_name(name: &str) -> Result<yi_agent_plugins::Effect, PluginError> {
+    Ok(match name {
+        "Read" => yi_agent_plugins::Effect::Read,
+        "Write" => yi_agent_plugins::Effect::Write,
+        "Launch" => yi_agent_plugins::Effect::Launch,
+        "QuotaWrite" => yi_agent_plugins::Effect::QuotaWrite,
+        "Resident" => yi_agent_plugins::Effect::Resident,
+        "Maintenance" => yi_agent_plugins::Effect::Maintenance,
+        other => {
+            return Err(PluginError::Conflict(format!(
+                "unknown capability `{other}`"
+            )));
+        }
+    })
+}
+
+fn plugin_from_params(params: &Value) -> Result<PluginId, PluginError> {
+    let raw = params
+        .get("plugin")
+        .and_then(Value::as_str)
+        .filter(|plugin| !plugin.trim().is_empty())
+        .ok_or_else(|| PluginError::Conflict("adoptLegacy needs a `plugin` id".to_string()))?;
+    PluginId::parse(raw)
+}
+
+/// 解析用户勾选的能力。
+///
+/// **不**用清单里的 `capabilities.required` 兜底：那会把"用户没勾"变成
+/// "宿主替他勾了"，而接管正是要用户重新表态的时刻（§8.1）。
+pub(crate) fn capabilities_from_params(
+    params: &Value,
+) -> Result<Vec<yi_agent_plugins::Effect>, PluginError> {
+    let Some(raw) = params.get("capabilities") else {
+        return Err(PluginError::PermissionDenied(
+            "adoptLegacy needs an explicit `capabilities` list; the legacy switch is not a grant"
+                .to_string(),
+        ));
+    };
+    let list = raw.as_array().ok_or_else(|| {
+        PluginError::Conflict("`capabilities` must be an array of effect names".to_string())
+    })?;
+    let mut effects = Vec::new();
+    for entry in list {
+        let name = entry.as_str().ok_or_else(|| {
+            PluginError::Conflict("every entry of `capabilities` must be a string".to_string())
+        })?;
+        let effect = effect_from_name(name)?;
+        if !effects.contains(&effect) {
+            effects.push(effect);
+        }
+    }
+    Ok(effects)
+}
+
+/// 宿主侧的外部动作。
+///
+/// # 存活判据
+///
+/// 插件自己的 `plugin.lock`（`<state_dir>/plugin.lock`）是 `flock`：持有者退出
+/// （含 `SIGKILL`）内核就释放。**不用 PID 文件**——PID 会被回收，一个死进程
+/// 留下的 PID 会被当成活着的，接管就永远做不了。
+///
+/// # 停止只针对这一个项目
+///
+/// 找到持锁那份 `supervisors/<plugin>.json` 指向的子进程并结束它；找不到
+/// 明确的持有者就报阻塞，绝不按名字批量 `kill`——同名进程可能属于另一个实例、
+/// 另一个项目，或用户手动跑的调试进程。
+struct HostLegacyOwner<'a> {
+    plugin: &'a str,
+}
+
+impl HostLegacyOwner<'_> {
+    fn state_dir(&self, project: &std::path::Path) -> std::path::PathBuf {
+        project.join(".yi-agent").join(self.plugin)
+    }
+
+    /// 旧插件的 `plugin.lock` 是否被持有。
+    fn lock_held(&self, state_dir: &std::path::Path) -> bool {
+        let path = state_dir.join("plugin.lock");
+        if !path.exists() {
+            return false;
+        }
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            // 打不开不能证明"没人持有"，按仍持有处理。
+            return true;
+        };
+        use std::os::unix::io::AsRawFd;
+        let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if outcome == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return false;
+        }
+        true
+    }
+}
+
+impl yi_agent_supervisors::adopt::LegacyOwner for HostLegacyOwner<'_> {
+    fn legacy_is_running(&self, project: &std::path::Path) -> Result<bool, PluginError> {
+        Ok(self.lock_held(&self.state_dir(project)))
+    }
+
+    /// 停旧服务。
+    ///
+    /// **这里不发任何信号。** 三个理由，每一个都足以否掉"顺手 kill 掉"：
+    ///
+    /// 1. 我们只有"某个进程持有 `plugin.lock`"，没有它的 PID。按进程名
+    ///    `pkill` 会连另一个实例、另一个项目、甚至用户手动起的调试进程一起
+    ///    杀掉，而杀错进程是不可撤销的。
+    /// 2. 旧进程由旧 supervisor 拉起，宿主重启它才是正确的停止方式；宿主
+    ///    在这里的职责是**报告冲突**，不是替用户清理。
+    /// 3. §8.2 明确要求"冲突时报告阻塞"。
+    ///
+    /// 因此这里只在"锁已经空了"时返回成功（此时没有东西可停），否则把
+    /// 情况原样报出去，让用户自己关掉旧看板再重试。
+    fn stop_legacy(&self, project: &std::path::Path) -> Result<(), PluginError> {
+        let state_dir = self.state_dir(project);
+        if self.lock_held(&state_dir) {
+            return Err(PluginError::Busy(format!(
+                "the legacy board for {} is still running (it holds {}); close it, then retry the \
+                 adoption. The host does not kill processes it cannot identify.",
+                project.display(),
+                state_dir.join("plugin.lock").display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 接管后的健康检查。
+    ///
+    /// 只做不依赖具体插件的检查：项目目录在、数据目录可读、`board.json`
+    /// 是一个 JSON 对象（若存在）。**不**去连插件的 socket——那会让宿主
+    /// 认识某个具体插件，而这一层必须保持通用。
+    fn health_check(
+        &self,
+        project: &std::path::Path,
+        _release: &ReleaseId,
+    ) -> Result<(), PluginError> {
+        if !project.is_dir() {
+            return Err(PluginError::NotFound(format!(
+                "{} is no longer a directory",
+                project.display()
+            )));
+        }
+        let state_dir = self.state_dir(project);
+        if !state_dir.is_dir() {
+            return Err(PluginError::Io(format!(
+                "the managed state dir {} was not created",
+                state_dir.display()
+            )));
+        }
+        let board = state_dir.join("board.json");
+        if board.is_file() {
+            let bytes = std::fs::read(&board)
+                .map_err(|error| PluginError::Io(format!("{}: {error}", board.display())))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                PluginError::Io(format!("{} is not valid JSON: {error}", board.display()))
+            })?;
+            if !value.is_object() {
+                return Err(PluginError::Io(format!(
+                    "{} is not a JSON object",
+                    board.display()
+                )));
+            }
+        }
+        // 新 owner 必须拿得到项目锁；拿不到说明还有别的推进者在。
+        if self.lock_held(&state_dir) {
+            return Err(PluginError::Busy(format!(
+                "{} is still locked after adoption",
+                state_dir.join("plugin.lock").display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 把项目投影到新代次。
+    ///
+    /// 受管插件从宿主注入的环境（`YI_AGENT_PLUGIN_BINDING`）推导自己的项目，
+    /// 所以这里**不**写任何"项目 → 插件"的私有映射文件：写一份等于给宿主
+    /// 增加一个必须与插件同步的磁盘契约，而两边分开演进时它会先烂掉。
+    fn project(
+        &self,
+        _project: &std::path::Path,
+        _release: &ReleaseId,
+        _activation: u64,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
 
 /// 目录内容。**只读**：不安装、不启用、不激活。
 ///
@@ -630,11 +988,13 @@ mod tests {
 
     /// 下游任务的方法如实返回 NotSupported，而不是伪装成功。
     ///
-    /// `assetRelease` 不在表里：它在 T20 变成了真实实现，仍然"未实现"的方法
-    /// 只剩下面这两个。
+    /// `assetRelease`（T20）、`inspectLegacy` 与 `adoptLegacy`（T23）已是真实实现，
+    /// 故意不在表里：这条测试锁的是"**未实现**的要说明白"，不是"这些永远不实现"。
     #[test]
     fn downstream_methods_report_not_supported() {
-        for verb in ["inspectLegacy", "adoptLegacy", "operationResult"] {
+        // 只剩一个方法；用单项列表而不是裸调用，加下一个时不必改结构。
+        let verbs = ["operationResult"];
+        for verb in verbs {
             let error = dispatch(
                 std::path::Path::new("/nonexistent"),
                 std::path::Path::new("/nonexistent/catalog.json"),
@@ -647,6 +1007,86 @@ mod tests {
                 "{verb} must be NotSupported, got {error:?}"
             );
         }
+    }
+
+    /// `inspectLegacy` 是**只读**探测：给出可搬的旧看板，不改任何东西。
+    #[test]
+    fn inspect_legacy_reports_an_adoptable_board_without_touching_it() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".yi-agent");
+        let project = root.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        let state = project.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state).unwrap();
+        let board = r#"{"cards":[],"next_order":0}"#;
+        std::fs::write(state.join("board.json"), board).unwrap();
+
+        // 明确指出是哪个插件：旧布局的自述来自那份插件的清单。插件不是身份
+        // 判据而是查询参数——不给就无从知道该找哪些文件名。
+        let report = inspect_legacy_with_path(
+            &home,
+            &PluginService::open(&home),
+            &json!({
+                "plugin": "superpowers-kanban",
+                "projects": [project.to_string_lossy()],
+            }),
+            "",
+        )
+        .unwrap();
+
+        let findings = report["findings"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding["kind"] == "boardData"),
+            "{report}"
+        );
+        // 探测读完之后文件原样还在。
+        assert_eq!(
+            std::fs::read_to_string(state.join("board.json")).unwrap(),
+            board
+        );
+    }
+
+    /// 不存在的项目路径被原样报回，不去找一个相近的存在路径顶替。
+    #[test]
+    fn inspect_legacy_reports_a_missing_project_instead_of_guessing_one() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".yi-agent");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let report = inspect_legacy_with_path(
+            &home,
+            &PluginService::open(&home),
+            &json!({ "projects": [root.path().join("typo").to_string_lossy()] }),
+            "",
+        )
+        .unwrap();
+
+        let rejected = report["rejectedInputs"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1, "{report}");
+        assert!(rejected[0].as_str().unwrap().contains("typo"));
+        assert!(
+            report["findings"].as_array().unwrap().is_empty(),
+            "{report}"
+        );
+    }
+
+    /// `projects` 形状不对时明确报错，而不是静默当成"没有项目"。
+    #[test]
+    fn inspect_legacy_rejects_a_malformed_projects_param() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".yi-agent");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let error = inspect_legacy_with_path(
+            &home,
+            &PluginService::open(&home),
+            &json!({ "projects": "not-an-array" }),
+            "",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("projects"), "{error}");
     }
 
     /// 没有目录时 `assetRelease` 明确报 Io，而不是返回一个空身份。

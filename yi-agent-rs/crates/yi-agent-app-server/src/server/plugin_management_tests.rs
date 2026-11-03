@@ -124,16 +124,10 @@ async fn unimplemented_management_methods_report_not_supported() {
     let mut h = Harness::with_scope(Scope::Admin).await;
     initialize(&mut h).await;
 
-    // `assetRelease` 已在 T20 实现（目录查得到才返回身份），不再列在这里：
-    // 一条会随任务推进而消失的断言若留着，只会变成"测试阻止功能变好"。
-    for (index, method) in [
-        "plugins/v1/inspectLegacy",
-        "plugins/v1/adoptLegacy",
-        "plugins/v1/operationResult",
-    ]
-    .iter()
-    .enumerate()
-    {
+    // `assetRelease`（T20）、`inspectLegacy` 与 `adoptLegacy`（T23）已实现，
+    // 不再列在这里：一条会随任务推进而消失的断言若留着，只会变成
+    // "测试阻止功能变好"。
+    for (index, method) in ["plugins/v1/operationResult"].iter().enumerate() {
         let resp = call(&mut h, index as i64 + 1, method, "{}").await;
         let error = resp
             .get("error")
@@ -191,5 +185,144 @@ async fn transaction_on_an_uninstalled_plugin_is_null_not_an_error() {
     .await;
     assert!(resp.get("error").is_none(), "must not error: {resp}");
     assert!(resp["result"]["transaction"].is_null(), "{resp}");
+    h.shutdown().await;
+}
+
+/// `adoptLegacy` 一次真实接管：备份旧看板、写新授权、返回备份位置。
+#[tokio::test(flavor = "multi_thread")]
+async fn adopting_a_legacy_install_backs_up_and_grants() {
+    let mut h = Harness::with_scope(Scope::Admin).await;
+    initialize(&mut h).await;
+
+    let fixture = crate::plugin_manager::service::tests_support::Fixture::build();
+    let params = json!({
+        "bundlePath": fixture.bundle().to_string_lossy(),
+        "metadataPath": fixture.metadata().to_string_lossy(),
+    })
+    .to_string();
+    let resp = call(&mut h, 1, "plugins/v1/install", &params).await;
+    assert!(resp.get("error").is_none(), "install must succeed: {resp}");
+
+    // 项目里有一份旧看板，且旧进程已经不在（没有 plugin.lock 被持有）。
+    let project = tempfile::tempdir().expect("project");
+    let state = project.path().join(".yi-agent/example-counter");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let board = r#"{"cards":[],"next_order":0}"#;
+    std::fs::write(state.join("board.json"), board).expect("board");
+
+    let params = json!({
+        "plugin": "example-counter",
+        "project": project.path().to_string_lossy(),
+        "capabilities": ["Read", "Write"],
+    })
+    .to_string();
+    let resp = call(&mut h, 2, "plugins/v1/adoptLegacy", &params).await;
+    assert!(resp.get("error").is_none(), "adoption must succeed: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["activation"], json!(1), "{resp}");
+    let backup = result["backup"].as_str().expect("backup path");
+    assert!(
+        std::path::Path::new(backup).join("board.json").is_file(),
+        "the legacy board must be backed up: {backup}"
+    );
+    // 旧数据没被搬走——接管建立的是"谁有权推进"，不是"把卡搬个地方"。
+    assert_eq!(
+        std::fs::read_to_string(state.join("board.json")).unwrap(),
+        board
+    );
+
+    let resp = call(&mut h, 3, "plugins/v1/list", "{}").await;
+    assert_eq!(
+        resp["result"]["plugins"][0]["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "adoption must grant exactly the project it adopted: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 旧开关不是授权：不显式给 `capabilities` 就拒绝，而不是替他勾上。
+#[tokio::test(flavor = "multi_thread")]
+async fn adopting_without_explicit_capabilities_is_refused() {
+    let mut h = Harness::with_scope(Scope::Admin).await;
+    initialize(&mut h).await;
+    let fixture = crate::plugin_manager::service::tests_support::Fixture::build();
+    let params = json!({
+        "bundlePath": fixture.bundle().to_string_lossy(),
+        "metadataPath": fixture.metadata().to_string_lossy(),
+    })
+    .to_string();
+    let _ = call(&mut h, 1, "plugins/v1/install", &params).await;
+
+    let project = tempfile::tempdir().expect("project");
+    let params = json!({
+        "plugin": "example-counter",
+        "project": project.path().to_string_lossy(),
+    })
+    .to_string();
+    let resp = call(&mut h, 2, "plugins/v1/adoptLegacy", &params).await;
+    let error = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("adoption must be refused: {resp}"));
+    assert_eq!(
+        error["data"]["code"], "plugin_permission_denied",
+        "missing capabilities must be a permission error: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 旧进程还持有 `plugin.lock` 时报告阻塞，**不**杀进程。
+#[tokio::test(flavor = "multi_thread")]
+async fn adopting_while_the_legacy_process_is_alive_reports_busy() {
+    let mut h = Harness::with_scope(Scope::Admin).await;
+    initialize(&mut h).await;
+    let fixture = crate::plugin_manager::service::tests_support::Fixture::build();
+    let params = json!({
+        "bundlePath": fixture.bundle().to_string_lossy(),
+        "metadataPath": fixture.metadata().to_string_lossy(),
+    })
+    .to_string();
+    let _ = call(&mut h, 1, "plugins/v1/install", &params).await;
+
+    let project = tempfile::tempdir().expect("project");
+    let state = project.path().join(".yi-agent/example-counter");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("board.json"), r#"{"cards":[],"next_order":0}"#).expect("board");
+    // 模拟旧进程仍持有锁：用一个独立 fd 起 flock。
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(state.join("plugin.lock"))
+        .expect("lock file");
+    {
+        use std::os::unix::io::AsRawFd;
+        let outcome = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(outcome, 0, "test must be able to take the lock");
+    }
+
+    let params = json!({
+        "plugin": "example-counter",
+        "project": project.path().to_string_lossy(),
+        "capabilities": ["Read", "Write"],
+    })
+    .to_string();
+    let resp = call(&mut h, 2, "plugins/v1/adoptLegacy", &params).await;
+    let error = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("adoption must be refused: {resp}"));
+    assert_eq!(
+        error["data"]["code"], "plugin_busy",
+        "a live legacy owner must be reported as busy: {resp}"
+    );
+    // 没有授权被写进去。
+    let resp = call(&mut h, 3, "plugins/v1/list", "{}").await;
+    assert_eq!(
+        resp["result"]["plugins"][0]["projects"],
+        json!([]),
+        "{resp}"
+    );
     h.shutdown().await;
 }

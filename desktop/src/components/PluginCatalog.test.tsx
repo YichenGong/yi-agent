@@ -33,7 +33,11 @@ describe("PluginCatalog", () => {
     });
     render(<PluginCatalog call={call} declarations={declarations} />);
     await screen.findByText("没有可管理的插件");
-    expect(methods).toEqual(["plugins/v1/list"]);
+    // `inspectLegacy` 是只读探测，允许在加载时调用；写方法一个都不许有。
+    expect(methods).toContain("plugins/v1/list");
+    expect(methods.every((method) => method === "plugins/v1/list" || method === "plugins/v1/inspectLegacy")).toBe(
+      true,
+    );
   });
 
   it("shows the not-installed state with no business iframe", async () => {
@@ -55,8 +59,13 @@ describe("PluginCatalog", () => {
     });
     render(<PluginCatalog call={call} project="ph1_aaaa" declarations={declarations} />);
     await screen.findByText("未安装");
-    // 目录加载完成后，除了 list 没有任何管理写操作被隐式触发。
-    expect(calls.map(([method]) => method)).toEqual(["plugins/v1/list"]);
+    // 目录加载完成后，除了 list（与只读的 inspectLegacy）没有任何管理**写**
+    // 操作被隐式触发。这里按"写方法"判断而不是枚举调用序列：探测是只读的，
+    // 允许它出现；而 enable/grant/activate/adopt 出现一次就是真 bug。
+    const writes = calls
+      .map(([method]) => method)
+      .filter((method) => method !== "plugins/v1/list" && method !== "plugins/v1/inspectLegacy");
+    expect(writes).toEqual([]);
   });
 
   it("shows installed-but-disabled separately and offers a scoped enable", async () => {
@@ -172,5 +181,89 @@ describe("PluginCatalog", () => {
     render(<PluginCatalog call={call} declarations={declarations} />);
     expect(await screen.findByText("需要先选择一个项目才能启用。")).toBeTruthy();
     expect(screen.queryByText("为当前项目启用")).toBeNull();
+  });
+});
+
+describe("PluginCatalog legacy adoption", () => {
+  const legacyReport = {
+    findings: [
+      { kind: "boardData", path: "/p/.yi-agent/superpowers-kanban", project: "/p", detail: "can be adopted" },
+      { kind: "userSkill", path: "/h/skills/superpowers-kanban/SKILL.md", detail: "a user copy" },
+      { kind: "pathBinary", path: "/usr/local/bin/superpowers-kanban", detail: "on PATH" },
+    ],
+    rejectedInputs: [],
+  };
+
+  function legacyRpc(calls: Array<[string, unknown]>) {
+    return rpc((method, params) => {
+      calls.push([method, params]);
+      // 必须"已安装"：旧布局的规则来自那份插件的清单，没装就没有可查的自述。
+      if (method === "plugins/v1/list") return rowsPlugin([], ["1.0.0"]);
+      if (method === "plugins/v1/inspectLegacy") return legacyReport;
+      if (method === "plugins/v1/adoptLegacy") return { activation: 1, backup: "/home/plugins/backups/tx-1" };
+      return {};
+    });
+  }
+
+  it("separates what can be adopted from what is left untouched", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(
+      <PluginCatalog call={legacyRpc(calls)} project="ph1_aaaa" declarations={declarations} />,
+    );
+
+    expect(await screen.findByText("旧安装")).toBeTruthy();
+    // 用户自定义 skill 与 PATH 上的旧程序被单列，并明确写着不会删除。
+    // 文案被 `<strong>` 拆成多段，且祖先元素也包含它；用最内层的那一个。
+    const untouchedNotice = screen
+      .getAllByText((_, element) => element?.textContent?.includes("不会被删除或改动") ?? false)
+      .find((element) => element.tagName === "P");
+    expect(untouchedNotice).toBeTruthy();
+    expect(screen.getByText("/h/skills/superpowers-kanban/SKILL.md")).toBeTruthy();
+    expect(screen.getByText("/usr/local/bin/superpowers-kanban")).toBeTruthy();
+  });
+
+  it("sends the capabilities the user ticked, not the legacy switch", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(
+      <PluginCatalog call={legacyRpc(calls)} project="ph1_aaaa" declarations={declarations} />,
+    );
+    await screen.findByText("旧安装");
+
+    // 取消勾选 Write，只留 Read：请求体必须如实只带 Read。
+    fireEvent.click(screen.getByLabelText(/写入数据/));
+    fireEvent.click(screen.getByText("接管这个项目"));
+
+    await waitFor(() => {
+      const adopt = calls.find(([method]) => method === "plugins/v1/adoptLegacy");
+      expect(adopt).toBeTruthy();
+      expect(adopt?.[1]).toEqual({
+        plugin: "example-counter",
+        project: "ph1_aaaa",
+        capabilities: ["Read"],
+      });
+    });
+  });
+
+  it("does not offer adoption when no project is selected", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(<PluginCatalog call={legacyRpc(calls)} declarations={declarations} />);
+
+    await screen.findByText("旧安装");
+    expect(screen.getByText("需要先选择一个项目才能接管。")).toBeTruthy();
+    expect(screen.queryByText("接管这个项目")).toBeNull();
+  });
+
+  it("asks the host about each installed plugin by name", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(
+      <PluginCatalog call={legacyRpc(calls)} project="ph1_aaaa" declarations={declarations} />,
+    );
+    await screen.findByText("旧安装");
+
+    // 规则来自清单，所以必须带上具体插件名；不传插件等于让宿主猜该找什么。
+    const probes = calls.filter(([method]) => method === "plugins/v1/inspectLegacy");
+    expect(probes).toEqual([
+      ["plugins/v1/inspectLegacy", { plugin: "example-counter", projects: ["ph1_aaaa"] }],
+    ]);
   });
 });

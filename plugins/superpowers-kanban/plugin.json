@@ -159,7 +159,20 @@
   },
   "data": {
     "format": 1,
-    "migrations": []
+    "migrations": [],
+    "legacy": {
+      "binaries": [
+        "superpowers-kanban",
+        "superpowers-kanban-runner"
+      ],
+      "supervisor": "superpowers-kanban.json",
+      "stateDirs": [
+        ".yi-agent/superpowers-kanban"
+      ],
+      "preferences": ".yi-agent/preferences.json",
+      "switchKey": "superpowers_kanban",
+      "skill": "superpowers-kanban"
+    }
   },
   "compatibility": {
     "hostApi": "v1",

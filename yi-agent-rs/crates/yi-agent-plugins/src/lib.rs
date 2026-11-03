@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod error;
 pub mod grants;
 pub mod journal;
+pub mod legacy;
 pub mod lifecycle;
 pub mod limits;
 pub mod locks;
@@ -36,6 +37,7 @@ pub use journal::{
     Blocking, Journal, JournalError, JournalErrorKind, JournalStore, JournalTarget,
     LifecycleAction, LifecyclePhase,
 };
+pub use legacy::{Finding, FindingKind, Probe, Report};
 pub use lifecycle::{
     BackupSource, CommittedActivation, Lifecycle, LifecycleRequest, PendingTransaction, Progress,
     RuntimeControl,

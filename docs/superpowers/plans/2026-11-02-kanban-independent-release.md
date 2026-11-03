@@ -768,11 +768,15 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 通用 legacy 规则来自签名清单，仅在用户选择/已登记项目及已知 skill 根探测；显式迁移入口来自已验证包。旧可执行文件不能被运行来“认证自己”。
 
-- [ ] Step 1：为旧 supervisor+PATH+skill+卡片数据+常驻引用构造完整临时安装；接管前拒绝自动运行新程序，未知数据格式不原地猜。
-- [ ] Step 2：测试 ID、状态、队列顺序、会话关联和配置保持；用户自定义 skill/旧二进制不删除；活锁不复制；旧开关不等于已获新授权。
-- [ ] Step 3：实现备份、排空旧操作、停止旧服务、用户重批权限、原子接管与恢复。旧 guardian 与新 owner 冲突时报告阻塞，不 pkill 名称匹配的其他实例。
-- [ ] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test legacy`；`cd ../plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --test managed_migration`；逐阶段中断验证无新旧并跑。
-- [ ] Step 5：按 C 提交 `feat: adopt legacy kanban installs without losing project data`。
+- [x] Step 1：为旧 supervisor+PATH+skill+卡片数据+常驻引用构造完整临时安装；接管前拒绝自动运行新程序，未知数据格式不原地猜。
+  （`crates/yi-agent-plugins/src/legacy.rs` 的有界探测 + `tests/legacy.rs`；解析失败一律拒绝而非猜。）
+- [x] Step 2：测试 ID、状态、队列顺序、会话关联和配置保持；用户自定义 skill/旧二进制不删除；活锁不复制；旧开关不等于已获新授权。
+  （`superpowers-kanban-runner/src/migrate.rs` 的 `verify()` 逐卡比对；`adopting_leaves_the_sibling_project_preferences_alone`；`legacy_switch` 只产出线索文字。）
+- [x] Step 3：实现备份、排空旧操作、停止旧服务、用户重批权限、原子接管与恢复。旧 guardian 与新 owner 冲突时报告阻塞，不 pkill 名称匹配的其他实例。
+  （`yi-agent-supervisors/src/adopt.rs`；`HostLegacyOwner` 无法确认身份时返回 `Busy`，不按名字杀进程。）
+- [x] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test legacy`；`cd ../plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --test managed_migration`；逐阶段中断验证无新旧并跑。
+  （实测：plugins 8 + 8、supervisors 12、runner 14 + 12、app-server 24。）
+- [x] Step 5：按 C 提交 `feat: adopt legacy kanban installs without losing project data`。
 
 ### Task T24：完成停用、卸载、清理与保留数据策略
 
