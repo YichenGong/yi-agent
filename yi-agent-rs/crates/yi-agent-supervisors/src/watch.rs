@@ -31,6 +31,34 @@ pub fn ensure_daemons_with(
     started
 }
 
+/// Whether this instance may still start daemons nobody asked for.
+///
+/// The resident registration is *configuration*: it records that a project wants a
+/// daemon when a frontend is around. It is not an instruction to keep one alive
+/// with no frontend at all. Once an instance has migrated to the managed runtime,
+/// "no client" must mean "no daemon", so every unattended starter consults this.
+pub fn may_start_unattended(instance_home: &Path) -> bool {
+    !crate::lifecycle::retirement::is_retired(instance_home)
+}
+
+/// The unattended loop: read the registration and ensure each project has a daemon,
+/// **unless** this instance no longer restarts itself.
+///
+/// Returns `None` when the loop must stand down, which is deliberately distinct
+/// from `Some(0)` (nothing registered): the first means "this is not my job any
+/// more", the second means "my job found no work". Collapsing them would make a
+/// retired loop look like an idle one and keep sleeping forever.
+pub fn once_unattended(
+    instance_home: &Path,
+    resident_dir: &Path,
+    ensure: &mut dyn FnMut(&[PathBuf]),
+) -> Option<usize> {
+    if !may_start_unattended(instance_home) {
+        return None;
+    }
+    Some(once(resident_dir, ensure))
+}
+
 /// 读通用登记并交给 `ensure`；返回登记项目数。CLI 与 app-server 共用这一份，
 /// 不各自复制「读登记 → ensure」的胶水。
 pub fn once(resident_dir: &Path, ensure: &mut dyn FnMut(&[PathBuf])) -> usize {
@@ -43,6 +71,43 @@ pub fn once(resident_dir: &Path, ensure: &mut dyn FnMut(&[PathBuf])) -> usize {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// 迁移后的实例不得再被「登记表里还有项目」驱动起 daemon。
+    ///
+    /// 登记是配置，不是无人值守的授权；把两者等同起来就是 spec 反对的
+    /// 「旧自愈源继续复活 daemon」。
+    #[test]
+    fn a_retired_instance_starts_nothing_unattended() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()),
+            "{\"projects\":[]}",
+        )
+        .unwrap();
+        crate::lifecycle::retirement::retire(instance.path(), "managed runtime took over").unwrap();
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended(instance.path(), dir.path(), &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, None);
+        assert!(seen.borrow().is_empty(), "no ensure call may happen");
+    }
+
+    /// 「没有登记」与「不再是我负责」必须是两个不同答案。
+    #[test]
+    fn an_empty_registry_still_reports_that_it_ran() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let seen = RefCell::new(Vec::new());
+        let outcome = once_unattended(instance.path(), dir.path(), &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+        assert_eq!(outcome, Some(0));
+        assert_eq!(*seen.borrow(), vec![0]);
+    }
 
     #[test]
     fn every_registered_project_is_ensured() {

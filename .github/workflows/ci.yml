@@ -67,13 +67,24 @@ jobs:
     #   - macos-14 已于 2026-11-02 退役（官方 changelog 2026-10-01，issue #13518），不用
     #   - macos-latest 现在指向 macOS 26，会随 GitHub 调整漂移，门禁要用固定标签
     #   - macos-15 是当前可用的 arm64 固定标签，可用
-    # 只跑三个 crate：目标是覆盖 macOS 特有路径，不是重复 Linux 已跑过的验证。
+    # crate 范围分两类：
+    #   * power／tools／app-server —— 含 macOS 专属代码，目标是覆盖
+    #     `cfg(target_os = "macos")` 分支，不是重复 Linux 已跑过的验证。
+    #   * lifecycle／supervisors／subagent／store／CLI —— 共享运行时生命周期。
+    #     这些测试 spawn 真实进程组、用真实信号，而进程组语义在 Linux 与 macOS 上
+    #     并不等价（`kill(-pgid, 0)` 对只剩 zombie 的自有组在 macOS 返回 EPERM），
+    #     所以只在 Linux 跑等于没测到这层。
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # 下面的 `just runtime-lifecycle-check` 需要它。漏装会让那一步在 runner 上
+      # 直接 "command not found"，而这看起来像测试失败。
+      - name: Install just
+        uses: extractions/setup-just@v2
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -90,4 +101,23 @@ jobs:
         run: |
           cargo nextest run --all-features \
             -p yi-agent-power -p yi-agent-tools -p yi-agent-app-server \
+            -p yi-agent-supervisors -p yi-agent-subagent -p yi-agent-store \
+            -p yi-agent-lifecycle -p yi-agent \
             --profile ci
+
+      # 共享运行时生命周期的真进程验收。
+      #
+      # 为什么必须单独一步而不是并进上面的 nextest：这些目标会真的 fork
+      # guardian／daemon／子进程，个别用例要等真实的 10 秒优雅窗口，把它们塞进
+      # 其它 crate 的批量运行会让 macOS job 从几分钟变成十几分钟且失败时难以定位。
+      # 为什么必须用 `cargo test` 而不是 nextest：`managed_runtime_lifecycle`
+      # 用 `current_exe()` + `--exact runtime_process_helper --ignored` 拉起自己
+      # 的 OS fixture，依赖 libtest 的命令行语义；nextest 的进程模型下
+      # `--exact` 指向的是它自己的过滤参数，行为不同。
+      #
+      # 缺 Node／缺 GUI：本 job 不跑桌面 Rust 生命周期测试与 vitest，那两处分别在
+      # `desktop-rust` 与 `desktop` job。真实 Cmd+Q 的冒烟是**本机隔离 App 手动
+      # 门禁**，无头环境不声称覆盖。
+      - name: Run shared runtime lifecycle tests
+        working-directory: yi-agent-rs
+        run: just runtime-lifecycle-check

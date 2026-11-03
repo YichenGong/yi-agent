@@ -14,6 +14,7 @@ members = [
     "crates/yi-agent-app-server",
     "crates/yi-agent-subagent",
     "crates/yi-agent-supervisors",
+    "crates/yi-agent-lifecycle",
     "crates/yi-agent-relay",
     "crates/yi-agent-power",
 ]
@@ -40,6 +41,7 @@ yi-agent-runtime = { path = "crates/yi-agent-runtime" }
 yi-agent-app-server = { path = "crates/yi-agent-app-server" }
 yi-agent-subagent = { path = "crates/yi-agent-subagent" }
 yi-agent-supervisors = { path = "crates/yi-agent-supervisors" }
+yi-agent-lifecycle = { path = "crates/yi-agent-lifecycle" }
 yi-agent-relay = { path = "crates/yi-agent-relay" }
 yi-agent-power = { path = "crates/yi-agent-power" }
 

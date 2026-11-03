@@ -207,7 +207,12 @@ fn migration_v14_folds_review_state_into_completed() {
     drop(connection);
 
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 15);
+    // The migration chain always lands on the newest version; what this test
+    // pins is that opening a v13 database applies the v14 rewrite.
+    assert_eq!(
+        repository.schema_version().unwrap(),
+        yi_agent_store::repository::LATEST_SCHEMA_VERSION
+    );
     assert_eq!(repository.task_state(&child).unwrap(), "completed");
     assert_eq!(
         repository.attempt_state(&child_attempt).unwrap(),

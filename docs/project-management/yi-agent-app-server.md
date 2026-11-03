@@ -259,3 +259,51 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
       [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)
 
 - [ ] 临时旁问生命周期与多端协议 — `side/` RPC、单父单旁支、内存回放/父订阅路由、去重与过期清理，不走持久 `thread/fork`；验收目标 `side_open_during_running_turn_does_not_interrupt_or_persist`、`side_reconnect_replays_current_items_without_duplicate_text`，执行 `cargo test -p yi-agent-app-server --lib side_`（测试待实现）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §8、§12.2。
+- [x] 迁移后不再自动重装旧值守（Task 10） — `yi-agent-rs/crates/yi-agent-app-server/src/{server.rs,rpc/ui.rs}`、
+  `src/server/watchman_install_tests.rs`、`src/server/tests/plugin_theme.rs`。三处自愈入口都查实例级
+  退休标记（`yi_agent_supervisors::lifecycle::retirement`），缺一处就会「启动时卸载、装插件时又装回」：
+  `plugin/install` 的收尾（`ensure_watchman_installed_in`）、`ui/settings/write` 的开关臂
+  （已退休时只允许关，打开回 `warning` 说明登录项**故意**未重装）、会话期 `spawn_resident_watch_loop`
+  经 `watch::once_unattended`（退休后不再无人拉起 daemon）。偏好键不因迁移被改写：那是用户的配置。
+  反射源与迁移标记同属实例目录，故 `AppState` 的 `resident_dir` 同时充当实例根，测试注入的隔离
+  目录自然生效。判据：`cargo test -p yi-agent-app-server --lib`（1161 passed，含
+  `watchman_install_tests::a_retired_instance_never_reinstalls_the_watchman`、
+  `plugin_theme::re_enabling_the_watchman_on_a_retired_instance_installs_nothing`）；**变异验证**：
+  去掉任一处的退休判断 → 对应用例红（均实测 RED 后恢复）
+- [x] 本地 stdio 握手携带桌面壳的窄授权（Task 13） — 侧车不再自己猜「谁在替 App 干活」，
+  而是从**本地 stdio 的 `initialize`** 收一次壳的声明：`ShellAuthorization{client_run_id,
+  scope_key(可选), daemon_instance_id(可选), issued_by_shell}`。三条性质都是硬约束：
+  ① 只认 stdio —— `client == ClientId::local()` 才算，ws／relay 客户端发同一段 JSON
+  一律忽略（否则一台手机就能自称 App 的 owner）；② 不携带凭据 —— 过管道只有身份
+  与代际，没有 credential，所以继承进程环境的工具拿不到任何可续租的东西（单测断言
+  序列化结果不含 `credential`／`secret`／`token`）；③ `scope_key` 可选 —— 侧车启动
+  时用户还没打开任何项目，此时「没有 scope」是事实而不是无权限。畸形字段**不是**
+  握手失败（CLI 的常态就是没有这个字段），只当「没有壳」。被接受的声明以
+  `result.shell.{clientRunId,scopeKey}` 回显，让「壳被认出来」成为可观测事实而不是
+  内部写盘。代码：`src/shell_authorization.rs`、`src/server.rs` 的 `initialize` 分支
+  与 `ClientShellAuthorizations` 表、`src/ws.rs`（纯 ws 给空表）。判据：
+  `cargo test -p yi-agent-app-server --lib shell_authorization`（9 例：本地可带、
+  ws 伪造被拒、非 bridge 签发被拒、空 client/scope 被拒、无 scope 仍可识别、
+  缺字段视为无壳、畸形不破坏握手、roundtrip、不含密钥）+
+  `cargo test -p yi-agent-app-server --lib handshake`（含三条端到端：stdio 握手回显
+  壳身份、纯 CLI 握手无 `shell` 键、伪造 `issued_by_shell:false` 被忽略）+
+  `a_websocket_handshake_cannot_claim_the_desktop_shell`（真实 ws 连接上不被认作壳）
+- [x] 只读运行时状态 `runtime/status` 与兼容矩阵（Task 16） — 新增 `Domain::Runtime`
+  与 `src/rpc/runtime.rs`，本域**只有** `runtime/status` 一个方法。刻意没有
+  `runtime/confirmRestart`／`runtime/stop`：业务 RPC 能经 websocket／relay 抵达，
+  而控制通道是本机 unix socket，把它放进 dispatcher 就等于给远端一个本机才有的权力；
+  桌面壳自己持有租约与身份，preview／confirm 由它经控制通道发起，多一条业务 RPC 就是
+  第二处能消费一次性 token 的地方。兼容答案是**分类**而非布尔：`same_build`／
+  `compatible_mismatch`／`control_only`／`legacy_temporary_choice_required`／
+  `unknown` 各对应不同的 UI 决定；业务不兼容但带 `control.v1` 是 `control_only`
+  （可被切换、不能跑任务），没有该能力则是 `unknown`（绝不假装控制通道存在）。无应答
+  也是答案：`unknown` + 一句解释，而不是错误或一串零。`counts.complete` 在 guardian
+  侧恒为 false —— 它看不到 daemon 的 executor／plugin 队列。scope 由会话自己的 workdir
+  推导，**不接受请求参数**：能指定 scope 就能打听别人项目的运行时。远端
+  `localRestartAvailable` 恒假。代码：`src/runtime_status.rs`（DTO + `view` + `classify`
+  + `read_status`）、`src/rpc/runtime.rs`、`src/rpc/mod.rs`（`Domain::Runtime`）、
+  `src/server.rs`（dispatch 臂与 `is_remote`）。判据：
+  `cargo test -p yi-agent-app-server --lib runtime_status`（28 passed：兼容矩阵、
+  control-only 需要能力、无应答、远程无本地重启、字段不丢、JSON roundtrip、preview
+  逐字段、真实 dispatcher 四条 —— 破坏性方法确实 `-32601`、谓词与 dispatcher 一致、
+  状态帧不含凭据）

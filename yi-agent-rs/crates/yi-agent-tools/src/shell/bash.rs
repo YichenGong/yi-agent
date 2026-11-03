@@ -165,40 +165,94 @@ impl Tool for BashTool {
             }
         };
 
-        let mut child = match Command::new(program)
-            .args(command_args)
-            .current_dir(&cwd)
-            .envs(self.ctx.session_env().iter().cloned())
-            .process_group(0) // 自成进程组（pgid == 子进程 pid），与 yi-agent 隔离
-            // Dropping the agent's tool future must not leave the shell running.
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
-                return ToolsError::Io(e).into();
+        // Two ways to own a child, one wait loop. A managed runtime hands the
+        // process to the guardian, which is what lets it be reclaimed even if this
+        // process dies; an unmanaged one keeps the local child it always had.
+        let managed = self.ctx.managed_spawner().cloned();
+        let mut child = match managed.as_ref() {
+            Some(spawner) => {
+                // The sandbox program and the session environment are unchanged:
+                // the guardian execs exactly this wrapper, so a managed runtime
+                // gains reclamation without gaining or losing file permissions.
+                let env: Vec<(String, String)> = self.ctx.session_env().to_vec();
+                // The guardian refuses a bare program name: `sh` would be resolved
+                // against *its* cwd and environment, which is not this session's.
+                // Resolving here also means the binary is picked by the same PATH
+                // the sandbox policy was built against.
+                let executable = match crate::managed_process::resolve_program(&program) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                        return ToolsError::Io(e).into();
+                    }
+                };
+                let args = command_args.clone();
+                match spawner.spawn(&executable, &args, &env, &cwd).await {
+                    Ok(child) => RunningChild::Managed(child),
+                    Err(e) => {
+                        let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                        return ToolsError::Io(e).into();
+                    }
+                }
             }
+            None => match Command::new(program)
+                .args(command_args)
+                .current_dir(&cwd)
+                .envs(self.ctx.session_env().iter().cloned())
+                .process_group(0) // 自成进程组（pgid == 子进程 pid），与 yi-agent 隔离
+                // Dropping the agent's tool future must not leave the shell running.
+                .kill_on_drop(true)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => RunningChild::Local(c),
+                Err(e) => {
+                    let _ = tx.send(ToolEvent::Exit { code: Some(-1) }).await;
+                    return ToolsError::Io(e).into();
+                }
+            },
         };
 
         // 必须在任何 wait() 之前抓取：Child::id() 一旦子进程被 poll 完成
         // 即返回 None（tokio 1.53.0 process/mod.rs:1216-1227）。
-        // 隔离后该值同时是子进程的进程组 id。
-        let child_pgid = child.id();
+        // 隔离后该值同时是子进程的进程组 id。managed 子进程不由本进程回收，
+        // 因此这里没有 pgid 可发信号，超时走 guardian 的整组终止。
+        let child_pgid = child.pgid();
         let mut pgid_guard = ProcessGroupGuard::new(child_pgid);
 
+        // A managed child reports its exit through a watcher, not through the
+        // select loop. The loop rebuilds its branches on every pass, and a managed
+        // `wait` is a request to the guardian: rebuilding it would queue one
+        // request per pass, and dropping it mid-flight would cancel an exchange the
+        // guardian is still serving. One long-lived watcher asks once and reports.
+        // The value is `None` until the group drains, then `Some(code)`. The outer
+        // `Option` distinguishes "not yet" from "ended without a code".
+        let mut managed_exit: Option<tokio::sync::watch::Receiver<Option<Option<i32>>>> = None;
+        if let RunningChild::Managed(managed) = &child {
+            let watcher = managed.watcher();
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            managed_exit = Some(receiver);
+            tokio::spawn(async move {
+                // A generous bound: the loop's own idle and hard deadlines are what
+                // actually end a long command, and they terminate the group, which
+                // makes this wait return.
+                let exit = watcher.wait(Duration::from_secs(24 * 60 * 60)).await.ok();
+                let _ = sender.send(Some(exit.and_then(|exit| exit.code)));
+            });
+        }
+
         // Take stdout/stderr pipes.
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let stdout = child.take_stdout().expect("stdout piped");
+        let stderr = child.take_stderr().expect("stderr piped");
 
         // Spawn reader tasks that send chunks through channels.
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
         let stdout_reader = tokio::spawn(async move {
+            let mut stdout = stdout;
             let mut buf = [0u8; 4096];
             loop {
                 match stdout.read(&mut buf).await {
@@ -213,6 +267,7 @@ impl Tool for BashTool {
         });
 
         let stderr_reader = tokio::spawn(async move {
+            let mut stderr = stderr;
             let mut buf = [0u8; 4096];
             loop {
                 match stderr.read(&mut buf).await {
@@ -267,14 +322,12 @@ impl Tool for BashTool {
                 chunk = stdout_recv => {
                     match chunk {
                         Some(data) => {
-                            // Send OutputDelta event.
                             let text = String::from_utf8_lossy(&data).into_owned();
                             let _ = tx.send(ToolEvent::OutputDelta {
                                 stream: OutputStream::Stdout,
                                 text,
                             }).await;
 
-                            // Accumulate with truncation tracking.
                             let was_truncated = stdout_truncated;
                             append_with_truncation(
                                 &mut stdout_buf,
@@ -283,18 +336,15 @@ impl Tool for BashTool {
                                 &data,
                             );
                             if !was_truncated && stdout_truncated {
-                                // Just crossed the threshold — send Truncated event.
                                 let _ = tx.send(ToolEvent::Truncated {
                                     stream: OutputStream::Stdout,
                                     skipped_bytes: stdout_skipped,
                                 }).await;
                             }
 
-                            // Reset idle deadline.
                             next_idle_deadline = tokio::time::Instant::now() + idle_limit;
                         }
                         None => {
-                            // stdout reader finished; stop polling.
                             stdout_rx = None;
                         }
                     }
@@ -326,7 +376,6 @@ impl Tool for BashTool {
                             next_idle_deadline = tokio::time::Instant::now() + idle_limit;
                         }
                         None => {
-                            // stderr reader finished; stop polling.
                             stderr_rx = None;
                         }
                     }
@@ -337,10 +386,7 @@ impl Tool for BashTool {
                     // group, not just the direct child: background grandchildren
                     // (`sh -c 'while :; do :; done' &`) would otherwise be
                     // orphaned and keep burning CPU forever.
-                    if let Some(pgid) = child_pgid {
-                        crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
-                    }
-                    let _ = child.wait().await;
+                    child.stop(idle_limit).await;
                     let _ = tx.send(ToolEvent::Timeout).await;
                     timed_out = true;
                     pgid_guard.disarm();
@@ -350,25 +396,25 @@ impl Tool for BashTool {
                 _ = tokio::time::sleep_until(hard_deadline) => {
                     // Hard timeout: same whole-group reclamation as the idle
                     // watchdog above.
-                    if let Some(pgid) = child_pgid {
-                        crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
-                    }
-                    let _ = child.wait().await;
+                    child.stop(idle_limit).await;
                     let _ = tx.send(ToolEvent::Timeout).await;
                     timed_out = true;
                     pgid_guard.disarm();
                     break;
                 }
 
-                status = child.wait() => {
-                    match status {
-                        Ok(s) => {
-                            exit_code = s.code();
+                code = async {
+                    match managed_exit.as_mut() {
+                        // The watcher reports once; `changed` then resolves.
+                        Some(receiver) => {
+                            let _ = receiver.changed().await;
+                            (*receiver.borrow_and_update()).flatten()
                         }
-                        Err(_) => {
-                            exit_code = None;
-                        }
+                        // A local child is polled directly; `wait` resolves once.
+                        None => child.wait().await,
                     }
+                } => {
+                    exit_code = code;
                     break;
                 }
             }
@@ -378,11 +424,11 @@ impl Tool for BashTool {
         // in place): keep background processes alive so `nohup ... &` services
         // can outlive this call. Without this the guard would kill them on drop.
         pgid_guard.disarm();
-
-        // Reap the child if it was killed (wait already done if we hit the child.wait branch).
-        // If we broke out via timeout, the group kill above already reaped it.
-        if timed_out {
-            let _ = child.wait().await;
+        // The same promise for a managed child. Its `Drop` reclaims the group, so
+        // a finished command has to hand the channel back first; termination on
+        // drop is for the abandoned-mid-flight case, which this is not.
+        if let RunningChild::Managed(child) = &mut child {
+            child.retain_group();
         }
 
         // Wait for the reader tasks to finish so we have all stdout/stderr
@@ -410,60 +456,6 @@ impl Tool for BashTool {
                 "bash: reader tasks did not finish within idle_limit after child exited — \
                  orphaned subprocess is holding the pipe; draining available output"
             );
-        }
-
-        // Drain any chunks that arrived after the last select iteration.
-        if let Some(rx) = stdout_rx.as_mut() {
-            while let Ok(data) = rx.try_recv() {
-                let text = String::from_utf8_lossy(&data).into_owned();
-                let _ = tx
-                    .send(ToolEvent::OutputDelta {
-                        stream: OutputStream::Stdout,
-                        text,
-                    })
-                    .await;
-                let was_truncated = stdout_truncated;
-                append_with_truncation(
-                    &mut stdout_buf,
-                    &mut stdout_truncated,
-                    &mut stdout_skipped,
-                    &data,
-                );
-                if !was_truncated && stdout_truncated {
-                    let _ = tx
-                        .send(ToolEvent::Truncated {
-                            stream: OutputStream::Stdout,
-                            skipped_bytes: stdout_skipped,
-                        })
-                        .await;
-                }
-            }
-        }
-        if let Some(rx) = stderr_rx.as_mut() {
-            while let Ok(data) = rx.try_recv() {
-                let text = String::from_utf8_lossy(&data).into_owned();
-                let _ = tx
-                    .send(ToolEvent::OutputDelta {
-                        stream: OutputStream::Stderr,
-                        text,
-                    })
-                    .await;
-                let was_truncated = stderr_truncated;
-                append_with_truncation(
-                    &mut stderr_buf,
-                    &mut stderr_truncated,
-                    &mut stderr_skipped,
-                    &data,
-                );
-                if !was_truncated && stderr_truncated {
-                    let _ = tx
-                        .send(ToolEvent::Truncated {
-                            stream: OutputStream::Stderr,
-                            skipped_bytes: stderr_skipped,
-                        })
-                        .await;
-                }
-            }
         }
 
         // Emit Exit event.
@@ -507,6 +499,99 @@ impl Tool for BashTool {
             requires_confirmation: true,
             read_only: false,
             version: None,
+        }
+    }
+}
+
+/// The one child type the wait loop sees, whichever way it was started.
+///
+/// Both variants expose the same three facts the loop needs: the pipes, whether
+/// the process ended, and how to stop the whole group. Keeping one loop over both
+/// is what stops the managed path from quietly diverging from the original
+/// timeout/cancel behaviour.
+enum RunningChild {
+    Local(tokio::process::Child),
+    Managed(crate::managed_process::ManagedChild),
+}
+
+impl RunningChild {
+    /// The group to signal directly, for a child this process owns.
+    ///
+    /// `None` for a managed child: it lives in the guardian's process tree, so this
+    /// process must not signal its group -- the guardian's terminate does that, and
+    /// a second signaller would be a second opinion about who owns it.
+    fn pgid(&self) -> Option<u32> {
+        match self {
+            Self::Local(child) => child.id(),
+            Self::Managed(_) => None,
+        }
+    }
+
+    /// Boxed because the two variants produce different concrete reader types;
+    /// only `AsyncRead` matters to the reader task.
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        match self {
+            Self::Local(child) => child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            Self::Managed(child) => child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        match self {
+            Self::Local(child) => child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            Self::Managed(child) => child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        }
+    }
+
+    /// Reports the exit code once the process (or group) ended, else `None`.
+    ///
+    /// Poll-shaped on purpose: this future is rebuilt on every pass of the wait
+    /// loop, so a managed variant that *blocks* in the guardian would queue one
+    /// request per pass. A `try_wait` is one short exchange and is discarded with
+    /// the rest of the loop's work.
+    ///
+    /// A managed leader that exited is reported only once its group is empty.
+    /// A shell that exits while a foreground child still runs is not finished
+    /// work, and `exit: 0` for it would be the lie this change removes. A
+    /// deliberately backgrounded job (`nohup ... &`) makes its own session, so it
+    /// leaves this group and does not hold the report back.
+    async fn wait(&mut self) -> Option<i32> {
+        match self {
+            Self::Local(child) => child.wait().await.ok().and_then(|status| status.code()),
+            Self::Managed(child) => match child.try_wait().await {
+                Ok(Some(exit)) => exit.code,
+                Ok(None) | Err(_) => None,
+            },
+        }
+    }
+
+    /// Stops the whole group within `budget`.
+    async fn stop(&mut self, budget: Duration) {
+        match self {
+            Self::Local(child) => {
+                // `kill_on_drop(true)` plus the group signal below: the group
+                // signal reaches grandchildren, the wait reaps the leader.
+                if let Some(pgid) = child.id() {
+                    crate::process_group::signal_process_group(pgid, crate::process_group::SIGKILL);
+                }
+                let _ = child.wait().await;
+            }
+            Self::Managed(child) => {
+                // The guardian does the group kill and the proof that it drained.
+                let _ = child.terminate_group(budget).await;
+            }
         }
     }
 }
@@ -1194,6 +1279,19 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool
             .call(serde_json::json!({"command": "echo \"[$YI_AGENT_THREAD_ID]\""}))
+            .await;
+        assert!(!result.is_error);
+        // The variable is scrubbed from the *command*, not assumed absent from the
+        // environment. A shell child inherits the parent's environment, and every
+        // real host sets this one: the app-server injects `YI_AGENT_THREAD_ID` for
+        // the thread it is serving, and an agent-hosted test run inherits it too.
+        // Asserting on an unsanitised expansion made the test measure the caller's
+        // environment rather than "no session env means no injection", and it failed
+        // for exactly that reason under `just ci` while passing from a bare shell.
+        let result = tool
+            .call(serde_json::json!({
+                "command": "env -u YI_AGENT_THREAD_ID sh -c 'echo \"[$YI_AGENT_THREAD_ID]\"'"
+            }))
             .await;
         assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {

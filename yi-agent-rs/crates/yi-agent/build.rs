@@ -3,8 +3,11 @@
 //! `Cargo.toml` 的版本永远是下一个正式版的干净号；是否发布由 git 状态判定，
 //! 不写进版本字段——发布流水线要求 tag 与 Cargo 版本严格相等。
 
-use std::path::Path;
 use std::process::Command;
+
+// The same pure module the integration test compiles, so the id the binary
+// embeds and the property the test asserts cannot drift apart.
+include!("build_identity.rs");
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -96,6 +99,111 @@ fn main() {
 
     println!("cargo:rustc-env=YI_AGENT_VERSION={version}");
     println!("cargo:rustc-env=YI_AGENT_BUILD_KIND={kind}");
+
+    // ---- Daemon artifact identity -------------------------------------------
+    //
+    // The id must describe the produced *executable*, not the wrapper version and
+    // not `git SHA + dirty` (see build_identity.rs for why). It is embedded as a
+    // compile-time constant and compared at runtime against the bundled sidecar's
+    // manifest.
+    let build_id = daemon_build_id(Path::new(&manifest_dir), &repo_root);
+    println!("cargo:rustc-env=YI_AGENT_DAEMON_BUILD_ID={build_id}");
+}
+
+/// Compute this binary's artifact id from its real build inputs.
+fn daemon_build_id(manifest_dir: &Path, repo_root: &Path) -> String {
+    // Declare a rerun for every source file we digest. `build.rs` writes these
+    // before returning; a new/removed file is caught because cargo re-runs the
+    // script when any declared path changes, and the directory itself is declared
+    // for additions.
+    let mut sources = collect_sources(manifest_dir, &[]);
+    for (relative, _) in &sources {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join(relative).display()
+        );
+    }
+    for dir in ["src", "tests"] {
+        let path = manifest_dir.join(dir);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
+    let mut manifest = std::fs::read(manifest_dir.join("Cargo.toml")).unwrap_or_default();
+    // The lockfile pins every dependency's exact version, so a dependency bump at
+    // an unchanged SHA must change the id.
+    let lock = repo_root.join("Cargo.lock");
+    if let Ok(lock_bytes) = std::fs::read(&lock) {
+        println!("cargo:rerun-if-changed={}", lock.display());
+        manifest.extend_from_slice(&lock_bytes);
+    }
+    // Workspace-level build configuration.
+    for config in [
+        repo_root.join("Cargo.toml"),
+        repo_root.join(".cargo").join("config.toml"),
+    ] {
+        if let Ok(bytes) = std::fs::read(&config) {
+            println!("cargo:rerun-if-changed={}", config.display());
+            manifest.extend_from_slice(&bytes);
+        }
+    }
+
+    // Only build-relevant environment enters the identity. Secrets are never
+    // read, and unrelated variables (PATH, HOME, CI metadata) are ignored so the
+    // same source builds to the same id on a different machine.
+    let mut rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if rustflags.is_empty() {
+        rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_TRIPLE");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+
+    let target_triple = std::env::var("CARGO_CFG_TARGET_TRIPLE")
+        .or_else(|_| std::env::var("TARGET"))
+        .unwrap_or_default();
+    let rustc_version =
+        Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()))
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+
+    let features = features_from_env();
+
+    // Sort for determinism; the digest also sorts, but keeping the input tidy
+    // makes the report readable.
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+
+    build_id(
+        BuildInputs {
+            sources,
+            target_triple,
+            rustc_version,
+            profile: std::env::var("PROFILE").unwrap_or_default(),
+            features,
+            rustflags,
+            manifest,
+        }
+        .into(),
+    )
+}
+
+/// `CARGO_FEATURE_<NAME>` is set for every enabled feature.
+fn features_from_env() -> Vec<String> {
+    let mut features: Vec<String> = std::env::vars()
+        .filter_map(|(key, _)| {
+            let name = key.strip_prefix("CARGO_FEATURE_")?;
+            Some(name.to_ascii_lowercase().replace('_', "-"))
+        })
+        .collect();
+    features.sort();
+    features.dedup();
+    features
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {

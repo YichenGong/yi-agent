@@ -79,15 +79,17 @@ if [ ! -d "$APP_SRC" ]; then
   exit 1
 fi
 
-# --- 4. 修签名 -----------------------------------------------------------
-# Tauri 产出的签名是坏的：codesign --verify 报
-# "code has no resources but signature indicates they must be present"。
-# ad-hoc 重签可修复（实测 verify 通过、启动正常）。
-log "ad-hoc 重签"
-codesign --force --deep --sign - "$APP_SRC"
+# --- 4. 签名与运行时清单 -------------------------------------------------
+# 顺序固定，由 finalize-runtime-bundle.sh 保证：先签 sidecar（字节定稿）→
+# 写 runtime-sidecar.json（含最终 digest）→ 签外层 app → verify 并复核
+# digest。**不能再 --deep**：它会把已签的 sidecar 重签一遍，使刚写下的
+# digest 与实际文件不符，而清单正是桌面壳用来证明「要跑的 daemon 就是
+# 我发的那个」的依据。
+log "finalize 运行时清单并重签"
+bash "$HERE/scripts/finalize-runtime-bundle.sh" "$APP_SRC"
 
 log "校验签名"
-if ! codesign --verify --deep --strict "$APP_SRC"; then
+if ! codesign --verify --strict "$APP_SRC"; then
   echo "ERROR: 重签后签名仍无效，拒绝打包坏产物" >&2
   exit 1
 fi

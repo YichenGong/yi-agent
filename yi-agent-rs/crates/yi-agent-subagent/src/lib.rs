@@ -7,6 +7,7 @@
 
 pub mod attach;
 pub mod binding;
+pub mod executor;
 pub mod thread_root;
 
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::trace::TraceAggregator;
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
+    AgentWorkerFactory, StopWitness, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
     WorkerRecoveryContext, WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
@@ -842,7 +843,13 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             if objective.trim().is_empty() {
                 return Err(WorkerError::Startup("worker objective is required".into()));
             }
-            let handle = WorkerHandle::new(cancellation.clone());
+            // The stop proof comes from an observer that joins the real thread,
+            // never from the worker's own terminal report. A worker may report
+            // `Completed` while its thread, provider stream, and tool children are
+            // still alive; only the join returning proves the execution is over.
+            let (stop_witness, stop_confirmation) = StopWitness::pair();
+            let handle =
+                WorkerHandle::new(cancellation.clone()).with_confirmation(stop_confirmation);
             for message in initial_user_messages {
                 handle.deliver_worker_message(message);
             }
@@ -894,7 +901,7 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 worker_tools.register(tool);
             }
             let worker_tools = Arc::new(worker_tools);
-            std::thread::Builder::new()
+            let worker_thread = std::thread::Builder::new()
                 .name("yi-agent-subagent-worker".into())
                 .spawn(move || {
                     let Ok(runtime) = tokio::runtime::Runtime::new() else {
@@ -1197,6 +1204,20 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 })
                 .map_err(|error| {
                     WorkerError::Startup(format!("could not start worker thread: {error}"))
+                })?;
+            // Observer: its only job is to join. Proof is published *after* the
+            // join returns, so the handle can never claim a stop while the real
+            // thread still runs. A panic inside the worker also reaches here --
+            // `join` returns `Err` once it has unwound -- and still counts as
+            // stopped, which is true: the thread is gone.
+            std::thread::Builder::new()
+                .name("yi-agent-subagent-observer".into())
+                .spawn(move || {
+                    let _ = worker_thread.join();
+                    stop_witness.mark_joined();
+                })
+                .map_err(|error| {
+                    WorkerError::Startup(format!("could not start worker observer: {error}"))
                 })?;
             Ok(handle)
         })

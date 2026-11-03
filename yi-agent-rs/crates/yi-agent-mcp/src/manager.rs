@@ -52,6 +52,45 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// A live client connection to one MCP server.
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
+/// How a server's stdio process is started.
+///
+/// A managed runtime must not let this crate spawn a child of its own: a local
+/// child is not registered with the guardian, so quitting the frontend would leave
+/// it running. The launcher is therefore a seam -- the runtime supplies one that
+/// goes through the guardian's owner-bound channel, and the returned pipes are
+/// handed to rmcp's generic read/write transport. An unmanaged runtime keeps the
+/// direct spawn it always had.
+pub trait StdioLauncher: Send + Sync {
+    /// Starts `command` with `args`/`env` and returns the server's stdin, stdout,
+    /// and stderr as async handles.
+    ///
+    /// `stderr` is returned rather than discarded: a server that fails to start
+    /// usually says why on stderr, and a probe with no diagnostics is the hardest
+    /// kind of failure to explain.
+    fn launch<'a>(
+        &'a self,
+        command: &'a str,
+        args: &'a [String],
+        env: &'a std::collections::BTreeMap<String, String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<LaunchedStdio>> + Send + 'a>,
+    >;
+}
+
+/// The three pipes a launched server is wired to.
+pub struct LaunchedStdio {
+    pub stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    pub stderr: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// Keeps the spawned group owned while the connection lives.
+    ///
+    /// For a managed launch this is the child handle: dropping it asks the
+    /// guardian to terminate the group, which is exactly the cleanup a server's
+    /// grandchildren need. Its lifetime is tied to the stderr drain task, so it
+    /// ends when the server process does -- not when a probe merely gives up.
+    pub guard: Option<Box<dyn std::any::Any + Send>>,
+}
+
 /// One configured server: its config, switch state, advertised tools, and the
 /// lazily-established connection. The `Arc` lets a call clone the client and
 /// release the lock before awaiting the (long) network call; the lock is held
@@ -117,6 +156,8 @@ pub struct McpManager {
     master_enabled: AtomicBool,
     /// 上一次 reload / 启动探测时读到的配置指纹;用于每轮开跑前的廉价变更检测。
     last_seen: std::sync::Mutex<Option<String>>,
+    /// How stdio servers are started. `None` keeps the original direct spawn.
+    launcher: Option<Arc<dyn StdioLauncher>>,
 }
 
 impl McpManager {
@@ -126,11 +167,26 @@ impl McpManager {
     }
 
     fn from_parts(servers: HashMap<String, Arc<ServerEntry>>, master: bool) -> Arc<Self> {
+        Self::from_parts_with(servers, master, None)
+    }
+
+    fn from_parts_with(
+        servers: HashMap<String, Arc<ServerEntry>>,
+        master: bool,
+        launcher: Option<Arc<dyn StdioLauncher>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             servers: std::sync::RwLock::new(Arc::new(servers)),
             master_enabled: AtomicBool::new(master),
             last_seen: std::sync::Mutex::new(None),
+            launcher,
         })
+    }
+
+    /// How stdio servers are started, if this manager was built for a managed
+    /// runtime.
+    fn launcher(&self) -> Option<Arc<dyn StdioLauncher>> {
+        self.launcher.clone()
     }
 
     /// 当前配置快照。clone 出 `Arc` 后立刻放开锁,调用方可以安全地 `.await`。
@@ -158,6 +214,16 @@ impl McpManager {
     /// The returned `Result` only errors on runtime/setup failure, never on an
     /// individual server's probe.
     pub async fn load_and_probe(cfg: McpConfig, workdir: &Path) -> Result<Arc<Self>> {
+        Self::load_and_probe_with(cfg, workdir, None).await
+    }
+
+    /// Same as [`Self::load_and_probe`], but stdio servers are started through
+    /// `launcher` instead of spawned directly.
+    pub async fn load_and_probe_with(
+        cfg: McpConfig,
+        workdir: &Path,
+        launcher: Option<Arc<dyn StdioLauncher>>,
+    ) -> Result<Arc<Self>> {
         let mut cache = McpCache::load(workdir);
         let mut servers = HashMap::new();
         let mut cache_dirty = false;
@@ -175,7 +241,7 @@ impl McpManager {
             let tools = match cache.cached_tools_ignoring_freshness(name, sc) {
                 Some(t) => t.to_vec(),
                 None if !cfg.enabled || !sc.enabled => Vec::new(),
-                None => match probe_tools(sc).await {
+                None => match probe_tools(sc, launcher.clone()).await {
                     Ok(probed) => {
                         cache.put(name, sc, probed.clone(), now);
                         cache_dirty = true;
@@ -206,7 +272,7 @@ impl McpManager {
             warn!(error = %e, "failed to persist MCP cache");
         }
 
-        let manager = Self::from_parts(servers, cfg.enabled);
+        let manager = Self::from_parts_with(servers, cfg.enabled, launcher);
         // 记下启动时的指纹:否则第一轮热重载检测会把它误判成「配置变了」,
         // 白跑一次 reload(还可能是 55s 的探测)。
         if let Some(fp) = manager.config_fingerprint(workdir) {
@@ -304,7 +370,7 @@ impl McpManager {
                     };
                     (t, false, None, true)
                 } else {
-                    match probe_tools(sc).await {
+                    match probe_tools(sc, self.launcher()).await {
                         Ok(probed_tools) => {
                             cache.put(name, sc, probed_tools.clone(), now);
                             cache_dirty = true;
@@ -599,7 +665,7 @@ impl McpManager {
             return ToolResult::error(format!("MCP server '{server}' is disabled"));
         }
 
-        let client = match acquire_client(server, &entry).await {
+        let client = match acquire_client(server, &entry, self.launcher()).await {
             Ok(client) => client,
             Err(e) => return ToolResult::error(e.to_string()),
         };
@@ -617,7 +683,7 @@ impl McpManager {
                 // next call reconnects, then retry exactly once inline.
                 tracing::debug!(server, error = %e, "MCP call failed; reconnecting once");
                 drop_client_if_same(&entry, &client).await;
-                let retry = match acquire_client(server, &entry).await {
+                let retry = match acquire_client(server, &entry, self.launcher()).await {
                     Ok(client) => client,
                     Err(e) => return ToolResult::error(e.to_string()),
                 };
@@ -676,6 +742,7 @@ impl McpManager {
             servers: std::sync::RwLock::new(Arc::new(HashMap::new())),
             master_enabled: AtomicBool::new(master),
             last_seen: std::sync::Mutex::new(None),
+            launcher: None,
         }
     }
 
@@ -772,7 +839,7 @@ fn test_connector() -> Option<TestConnector> {
 /// 按 `cfg.transport()` 分派到 stdio 子进程或 Streamable HTTP,完成 MCP 握手。
 ///
 /// 两条路径都产出同一个 `Client`,因此懒连接/重连/超时/shutdown 逻辑无需分支。
-async fn connect(cfg: &ServerConfig) -> Result<Client> {
+async fn connect(cfg: &ServerConfig, launcher: Option<Arc<dyn StdioLauncher>>) -> Result<Client> {
     #[cfg(test)]
     {
         if let Some(factory) = test_connector() {
@@ -784,15 +851,53 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
 
     match cfg.transport()? {
         Transport::Stdio { command, args, env } => {
-            use rmcp::transport::TokioChildProcess;
+            match launcher {
+                Some(launcher) => {
+                    // The guardian-owned path: this crate does not spawn at all, it
+                    // only wires the pipes it was handed into rmcp's generic
+                    // read/write transport. Falling back to a direct spawn here
+                    // would be the leak this seam exists to prevent, so a launch
+                    // failure is a failure.
+                    let launched = launcher.launch(&command, &args, &env).await?;
+                    // Drain stderr so a chatty server cannot fill the pipe and
+                    // block, and keep its last words for diagnostics.
+                    let mut stderr = launched.stderr;
+                    // The guard travels with the drain task: it must outlive the
+                    // transport, and must not be dropped while the server may still
+                    // be running.
+                    let guard = launched.guard;
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let _guard = guard;
+                        let mut sink = Vec::new();
+                        let mut buf = [0_u8; 4096];
+                        while let Ok(n) = stderr.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if sink.len() < 8192 {
+                                sink.extend_from_slice(&buf[..n]);
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&sink);
+                        if !text.trim().is_empty() {
+                            tracing::debug!(stderr = %text, "MCP server stderr");
+                        }
+                    });
+                    Ok(().serve((launched.stdout, launched.stdin)).await?)
+                }
+                None => {
+                    use rmcp::transport::TokioChildProcess;
 
-            let mut cmd = tokio::process::Command::new(&command);
-            cmd.args(&args);
-            for (k, v) in &env {
-                cmd.env(k, v);
+                    let mut cmd = tokio::process::Command::new(&command);
+                    cmd.args(&args);
+                    for (k, v) in &env {
+                        cmd.env(k, v);
+                    }
+                    let transport = TokioChildProcess::new(cmd)?;
+                    Ok(().serve(transport).await?)
+                }
             }
-            let transport = TokioChildProcess::new(cmd)?;
-            Ok(().serve(transport).await?)
         }
         Transport::Http { url, headers } => {
             use rmcp::transport::StreamableHttpClientTransport;
@@ -825,8 +930,11 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
 /// process is reaped deterministically instead of relying on `RunningService`'s
 /// drop path (which spawns a kill task that can be cancelled when a temporary
 /// probe runtime is torn down, orphaning the child).
-async fn probe_tools(cfg: &ServerConfig) -> Result<Vec<CachedTool>> {
-    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(cfg)).await {
+async fn probe_tools(
+    cfg: &ServerConfig,
+    launcher: Option<Arc<dyn StdioLauncher>>,
+) -> Result<Vec<CachedTool>> {
+    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(cfg, launcher)).await {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => return Err(e),
         // `connect` already spawned the child (`TokioChildProcess::new`) before
@@ -868,12 +976,17 @@ async fn probe_tools(cfg: &ServerConfig) -> Result<Vec<CachedTool>> {
 /// Return a live client for `server`, connecting (bounded by `CONNECT_TIMEOUT`)
 /// if none is cached. The lock is held only across the connect and the clone,
 /// never across a tool call.
-async fn acquire_client(server: &str, entry: &ServerEntry) -> Result<Arc<Client>> {
+async fn acquire_client(
+    server: &str,
+    entry: &ServerEntry,
+    launcher: Option<Arc<dyn StdioLauncher>>,
+) -> Result<Arc<Client>> {
     let mut guard = entry.client.lock().await;
     if let Some(client) = guard.as_ref() {
         return Ok(Arc::clone(client));
     }
-    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&entry.config)).await {
+    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect(&entry.config, launcher)).await
+    {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => return Err(anyhow!("connect to '{server}' failed: {e}")),
         Err(_) => return Err(anyhow!("connect to '{server}' timed out")),

@@ -76,3 +76,202 @@
 - [ ] 已知偏差：设计文档声明的 `max_coding_agents = 6` 与 `max_host_build_jobs = 2`（`docs/superpowers/specs/2026-08-09-runtime-scheduling-design.md:64-70`）**当前未被强制**——`ResourceCoordinator` 只为 `coding:global` / `build:host` 定义了容量，却没有任何申请方（`yi-agent-rs/crates/yi-agent-core/src/subagent/scheduler.rs:118-119`；实际被申请的资源键只有 `resident:global` 与 `llm:{profile}`）。据文档推断行为会被误导。本期不修，仅记录。
 - [x] 已定终态父任务拒绝派生 — `spawn_with_objective` 此前只校验 depth 与 direct-child 上限，从不看 `parent.state()`，因此已完成的父仍能派生新子任务；这类子任务落在终态级联之外（级联只在状态转换那一刻触发），且 `deliver_message` 拒绝向终态 recipient 投递，结果是一棵注定无人消费的死子树。修复用同文件已有的 `classify_terminal`（`Settled` / `RecoveryRequired` / `NonTerminal` 三分类）作闸门，**不用** `is_terminal()`——后者把可恢复的 `RecoveryRequired` 也算终态，会误拒 resume 后仍需派生的父。runtime 层另加一层预检，排在 `take_fork_messages` 之前，避免拒绝路径白白消耗 fork 上传；未知父任务则交由超管判定，保持 `ParentNotFound` 而不退化成 `internal`。`tasks.state_json` 存的是裸标签而 `TaskState` 的 serde 形态是 PascalCase，故新增 `TaskState::from_state_label` 作为 `task_state_label` 的逆运算，并有互逆性测试锁住两者。代码：`yi-agent-rs/crates/yi-agent-core/src/subagent/{supervisor.rs,task.rs}`、`yi-agent-rs/crates/yi-agent-store/src/{runtime.rs,ipc.rs}`，验证：`cargo test -p yi-agent-core --lib state_label`、`cargo test -p yi-agent-core --test subagent_supervisor -- a_recovery_required_parent_can_still_spawn a_completed_parent_cannot_spawn`、`cargo test -p yi-agent-store --test runtime_coordinator -- a_settled_parent_cannot_spawn`、`cargo test -p yi-agent-store --lib a_settled_parent_rejection_carries_a_readable_message`
 - [x] 瞬时 attach 失败不再永久缓存、daemon 启动窗口内有界重试 — 两个缺陷叠加会让**整个 app-server 进程**丢掉 `spawn_agent`：其一，`Daemon::start` 先用 `flock` 证明无活 daemon、再删除旧 socket 节点并 bind；抢锁失败的一方走 `AlreadyRunning` 分支后立刻 `connect`，对端仍停在「已持锁、未 bind」的窗口，于是拿到 ENOENT。其二，`attach_cwd_runtime` 把任何 `Err` 都写进 `ProjectRuntimes` 当终态，一次冷启动抖动即锁死该进程后续所有会话的委派能力（2026-11-01 desktop 实测，trace 中 39 条 `stage=attach, cause="No such file or directory (os error 2)"`）。修复：`AttachFailure` 新增 `retryable`（仅对启动窗口类 I/O `NotFound`/`ConnectionRefused` 置真，`transient()` 构造），`ensure_owned_runtime` 在 10s 预算内轮询对端 socket 并重试整条 bring-up，预算耗尽才报错；`ProjectRuntimes` 改为存结构化的 `AttachFailure`，命中 `retryable` 的缓存项不重放、不写入（直接移除键，下一次调用自然重试），永久失败（目录不存在、catalog 读不出、daemon 拒绝）仍照旧缓存以保留「不重跑注定失败的 bring-up」这一保证；`rpc::ProjectRuntimes` 改为别名指向同一类型，避免两处定义漂移。代码：`yi-agent-rs/crates/yi-agent-subagent/src/attach.rs`（`AttachFailure::transient`、`PEER_START_TIMEOUT`、`is_startup_io`、`wait_for_peer_socket`、`ensure_owned_runtime`）、`yi-agent-rs/crates/yi-agent-app-server/src/server.rs`（`ProjectRuntimes`、`attach_cwd_runtime`）、`yi-agent-rs/crates/yi-agent-app-server/src/rpc/mod.rs`，验证：`cargo test -p yi-agent-subagent --test attach_delegation a_socket_that_appears_just_after_the_probe_is_waited_for`、`cargo test -p yi-agent-subagent --test attach_delegation a_peer_that_never_binds_fails_instead_of_retrying_forever`、`cargo test -p yi-agent-app-server a_transient_attach_failure_is_not_cached_as_a_permanent_one`、`cargo test -p yi-agent-app-server a_non_transient_failure_is_still_cached`、`just ci`
+
+- [x] canonical runtime 作用域与固定 inode 协调锁 — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{mod,scope,selection}.rs`。三件事各自防一种具体的错：**① canonical scope**（`scope::resolve`）把 runtime 目录、项目、实例家目录都归一化再求 key——同一目录的两种写法（软链、macOS 的 `/var` vs `/private/var`）必须得到同一个 key，否则它们各拿一把锁、各开一个 socket，却在共享同一个数据库；首次启动目录还不存在时对**最深的已存在祖先**做 canonicalize 再拼回剩余部分（`canonicalize_allowing_missing`），因为 `fs::canonicalize` 对不存在的路径直接失败。**② 固定 inode 协调锁**（`CoordinationGuard::acquire`）与 daemon 的 `runtime.lock` 是两把锁（前者串行化「探测—启动／切换」，后者代表一个**正在运行**的 daemon，混用会让协调者被误认成 daemon）：flock 后重新核对 fd 指向的 inode 与路径上的 inode 一致，不一致就重试（别人在我们 open 与 flock 之间换掉了文件，我们锁住的是一个没人会再打开的孤儿 inode）；**释放时绝不 unlink**（删除文件会与已打开同一 inode 的并发者赛跑，导致两个协调者同时成功）。等待受调用方**总预算**约束，预算耗尽立刻 `WouldBlock`，不阻塞 UI 线程。**③ 选择记录**（`selection.rs`）用「同目录临时文件 → fsync → rename → 目录 fsync」原子写、权限 0600、不含任何凭据；损坏的记录是 `InvalidData` 错误而**不是** `None`（读成「没有选择」会让全新启动把损坏记录当成首次启动，从而静默降级到手边任意一个二进制）。判据：`cargo test -p yi-agent-supervisors --test runtime_scope`（14 passed）——`two_spellings_of_one_directory_produce_one_key`、`a_symlink_alias_cannot_get_a_second_lock`、`the_lock_file_is_never_unlinked_and_keeps_its_inode`、`an_exhausted_budget_refuses_to_wait_instead_of_blocking`、`a_corrupt_selection_is_an_error_not_an_empty_selection`、`one_override_dir_claimed_by_two_projects_is_a_conflict`；**变异验证**：给 `CoordinationGuard` 加一个 `Drop` 去 `remove_file` → inode 用例红；`canonicalize_allowing_missing` 跳过 canonicalize → 软链与会话键两例红（实测 RED）
+
+- [x] worker 线程由 observer join 后给出停止证明（Task 5）— 工厂把 `std::thread` 的 `JoinHandle` 交给 `yi-agent-subagent-observer` 线程：join 返回（正常返回；panic 也会先 unwind 再返回 `Err`）之后才 `StopWitness::mark_joined`。worker 自报 `Completed` 不再被当作物理停止，store 侧据此推迟释放 resident 运行租约。验证：`cargo test -p yi-agent-store --test runtime_coordinator a_terminal_report_alone_does_not_release_the_running_lease`（线程仍活时第二个子任务拿不到唯一 resident 名额；线程真结束后下一轮 reconcile 释放并准入）、`a_lost_observer_keeps_the_lease`
+- [x] 受管进程的归属与可验证整组回收（Task 6）— `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{processes,guardian}.rs`。三层各自防一种具体的误判：**① 进程出生身份**（`processes::ProcessBirth`）用内核的进程起始时间而不是 PID 判断「是不是同一个进程」——PID 会被回收，数字相同不等于同一进程；macOS 走 `proc_pidinfo(PROC_PIDTBSDINFO)`（缺失进程报 `ESRCH` 而非 `ENOENT`，`pbi_status == 5` 的僵尸按已退出处理），Linux 走 `/proc/<pid>/stat` 的 starttime 与 state。**② 组空判定必须区分「只剩僵尸」与「别人的组」**：macOS 上 `kill(-pgid, 0)` 对这两种状态都返回 `EPERM`，而答案相反（前者=已停止，后者=错误），因此组空靠枚举存活成员（`live_group_members`）判定——枚举已排除僵尸，读不到的系统进程不属于本用户的受管组。**③ 归属证明与信号次序**（`ProcessRegistry`）：只要还持有未 reap 的 `Child`，内核就不能回收其 PID 进而不能回收其 PGID，所以此时发信号是安全的；一旦组长已被 reap 且无法用出生身份证明存活，就**拒绝发信号**并记为 `Unverifiable`，而不是对可能被复用的 PGID 赌博。`recover()` 只在组长仍以同一出生身份存活时自动回收，其余进 `manual`，且 `is_safe() == false` 时后续 `spawn` 一律 `PermissionDenied`（不让下一代与来历不明的进程并行调度）。**注册先于执行**：子进程在 `pre_exec` 里 `setsid` 成组长、把就绪管道 dup 到固定 fd，注册成功并落盘后才收到一个字节，在此之前只可能读到 EOF 而退出，因此不存在「未登记却已在跑」的窗口（`dup2` 到同一 fd 是空操作，会保留源 fd 的 CLOEXEC，必须显式清除 FD_CLOEXEC，否则该管道在 exec 时消失、屏障提前失效——实测踩到）。**spawn 时关闭全部非目标 fd**（`getdtablesize` 内除 0/1/2 与就绪 fd 外全关），不依赖 CLOEXEC，因为宿主继承来的生命周期管道正是「子孙意外保活」的来源。journal 为 0600 原子写（临时文件 + fsync + rename），只记 scope／代际／PID／PGID／出生标识／产物身份／owner／root／task／attempt，**不写 env、键名或任何凭据**（`ManagedCommand` 的 `Debug` 也只打印键名）。`terminate_execution` 按 `TaskExecutionKey` 只收本任务的工具组，`terminate_owner` 才收整个 owner；`Guardian::serve` 持有租约表与进程登记，**不打开 repository**（否则 guardian 活在 daemon 死后会把 schema 推新，旧 daemon 再也服务不了同一 runtime）。控制 socket 复用判定 fail-closed：只有 connect 被拒（`ConnectionRefused`）才认定是崩溃残留并替换，能连上却不应答一律 `AddrInUse`，绝不因为「名字一样」删掉别人的 socket；单条坏连接只影响该连接，不让 guardian 退出。判据：`cargo test -p yi-agent-supervisors --test managed_process_groups`（10 passed，含 `owner_reclamation_waits_for_the_entire_group`——组长退出但孙进程仍写 marker，只 kill 直接 child 的实现会红）、`cargo test -p yi-agent-supervisors --test guardian_control`（5 passed）、`cargo test -p yi-agent-supervisors`（130 passed）
+
+- [x] 插件 demand 的唯一 owner 派生与「双证据」停止闸门（Task 8） — 两件事都在回答「谁的服务、算谁的服务」：
+  **① 派生（`crates/yi-agent-supervisors/src/lifecycle/demands.rs`）**：`PluginDemandTable::derivation_owner(plugin, source)`
+  返回 `Owner(client)` / `NoOwner` / `Ambiguous{candidates}`。规则刻意保守——只有**一个** owner 时不要求带
+  `source`（没有歧义可解），有**多个** owner 时必须给出 `source` 且它必须是候选之一，`source` 不持有 demand
+  也算歧义。`Ambiguous` 与 `NoOwner` 的处置相同：**不执行自动派生**，因为按某个候选去起服务等于替别人做了决定，
+  而错误的选择会把服务登记到错的 owner 名下、在该 owner 离开时被连带收走。
+  **② 停止证据（`crates/yi-agent-core/src/subagent/worker.rs` 的 `StopConfirmation`）**：join 结束只证明「worker
+  的那条线程/进程退出了」，不证明「它启动的工具组也没了」——后者是组级事实，只有 guardian 能回答。`gate` 让两个
+  证据**相与**：`is_stopped()` = join 标志 **且** gate 成立，`also_requiring` 可叠加多个 gate（AND，且永不掩盖
+  更早的停止判定）。store 的 `execution_stopped` / `release_confirmed_stops` 已统一走 `is_stopped()`，所以闸门对
+  租约释放自动生效、无需改 store。判据：`cargo test -p yi-agent-supervisors --lib demands`（13 passed，含
+  `plugin_demand_reacquires_after_client_return`——服务因无人需要而停掉后，回来的客户端必须能再次把它要起来，
+  不能因为「记得停过」而永远跳过）、`cargo test -p yi-agent-core --lib stop_confirmation`（7 passed，含
+  `task_join_without_tool_group_exit_retains_execution_lease`、`gates_compose_and_never_mask_an_earlier_stop`）；
+  **变异验证**：去掉 gate 判定 → 租约保留用例红（实测 RED）
+- [x] 有界客户端回收与最后客户端 drain（Task 9） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/reclaim.rs`。
+  三个决定被刻意分开，合在一起正是这个模块要修的 bug：
+  **① 准入先关**。`release` 第一件事是 `close_client_admission`，再才去停进程——反过来做的话，
+  枚举完工作和停掉工作之间派生出来的任务会挂在已交还的客户端名下，没人会再去回收它。
+  **② 只有最后一个业务租约才 drain 整个 scope**。一个前端退出不能让仍在用的 TUI 收到
+  项目级 draining（那会拒绝它自己的任务，读起来像自伤）。`LeaseMode::LeaseOnly` 的观察者
+  不计入 `business_active_count`——否则"有人在看升级"会让它等的收尾永远不开始。
+  **③ 停止是证据而不是请求**。`ProcessBackend` 的 `request_stop` 只是请求，
+  只有 `is_stopped` 为真（或 terminate 后被它确认）才允许 `ReclaimResult.stopped == true`。
+  两个窗口是**绝对**的（10 秒优雅 + 5 秒确认，不分对象），按对象计预算会随客户端数量相乘。
+  Release 立即返回 operation id，结果用 `ReclaimStatus` 轮询——同步阻塞 15 秒会让正在退出的
+  shell 无法问"到底停没停"。租约已被消费，所以只读查询权用凭据的 SHA-256 摘要校验，
+  且只保留 60 秒、按受控访问清理（不靠定时器，不为清理保活 guardian）。结果落盘 0600 原子写、
+  不含凭据，读取时同时校验 scope 与文件名形状（防路径穿越）。guardian 通过
+  `attach_registry` 单点接入 `ProcessRegistry`；未接入时用 `DetachedBackend` 明确失败，
+  绝不假装停成功。判据：`cargo test -p yi-agent-supervisors --test client_reclamation`（19 passed）、
+  `cargo test -p yi-agent-supervisors`（91 lib + 集成全绿）、`cargo test -p yi-agent-store --lib lifecycle`
+  （10 passed）；**变异验证**：把"仅最后客户端 drain"改成无条件 drain → 3 例红；把"terminate 已发"
+  当作停止证明 → 2 例红；去掉 admission 先关 → 2 例红（均实测 RED 后恢复）
+- [x] 旧 watchman 与 unmanaged runtime 的安全迁移（Task 10） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{migration,retirement}.rs`。
+  **迁移是两阶段的，因为一次误判就是事故**：`MigrationPlan::inspect` 只读、零副作用（它跑在 UI 轮询里，
+  边显示边迁移等于给没提出请求的用户换掉运行时）；`execute` 才动手，且必须拿到**命名了本 scope 的确认串**
+  ——布尔确认是误点能产生的东西，而这个操作会停进程。`LegacyProbe` 把五种独立的失败分开问：
+  身份不可验证、影响面不完整、无法在不杀宿主的情况下退休、自愈仍活跃，各自对应一个具名
+  `MigrationBlocker`（"不 ready" 没有原因就等于 bug）。`LegacyEmbedded` 与
+  `can_retire_without_host_exit == false` 一律 `ManualActionRequired`：那种 daemon 就是 TUI 进程本身，
+  "退休" 只能等于杀用户的编辑器。**归还要双证据**：`launchctl print` 读到的 loaded job 必须
+  `program` 指向本产品（`LegacyWatchman::claims`），磁盘 plist 也必须命名该程序
+  （`plist_names_program`）——只按 plist 文本包含某路径判定会把日志路径或参数当成归属证据，
+  而只有 job 没有 plist 则无从分辨是不是别人的安装；两者不一致一律 `ManualActionRequired` 且不动手。
+  退休动作是 bootout **加删 plist**：launchd 下次登录会加载 `LaunchAgents` 里每个 plist，留下文件等于
+  重启后复活。`ai.yi-agent.board-watchman`（旧标签，跑的是已删除的子命令）先处理，失败即中止。
+  **自愈源用一份记录统一关掉**：`lifecycle::retirement` 的 `self-heal-retired.json` 存在即视为已退休
+  （存在性而非内容——半截文件被当成"未退休"会让旧 supervisor 复活，正是要防的方向），三处自愈源
+  都查它：`watchman` 的插件安装钩子（`ensure_watchman_installed_in`）、`watch::once_unattended`
+  （无人值守循环，`None` 与 `Some(0)` 刻意区分"不再归我管"与"我没活干"）、`ui/settings/write`
+  的开关臂（只许关、不许开，并回 `warning` 说明系统状态**故意**没变）。用户偏好不被改写：
+  偏好是配置，迁移是既成事实。判据：`cargo test -p yi-agent-supervisors --test runtime_migration`
+  （15 passed）、`cargo test -p yi-agent-supervisors`（98 lib + 集成全绿）、
+  `cargo test -p yi-agent-app-server --lib`（1161 passed）；**变异验证**：忽略"job 是不是我们的程序"
+  直接 bootout → 1 例红；跳过确认串校验 → 1 例红；无人值守循环忽略退休标记 → 1 例红；
+  插件安装钩子忽略退休标记 → 1 例红；`ui/settings/write` 忽略退休标记 → 1 例红（均实测 RED 后恢复）
+- [x] 唯一 managed bring-up 与私有运行角色（Task 11） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{bringup,claim,roles}.rs`、`yi-agent-rs/crates/yi-agent/src/{managed_runtime,config,main}.rs`、`yi-agent-rs/crates/yi-agent-subagent/src/attach.rs`。
+  四件事各自防一种具体的错：**① 探测三态，`Unresponsive` 永不等于 `Absent`**（`ProbeOutcome`）——超时、权限错误、wedge 的监听者在两态模型里都会读成"没人跑"，于是再起一个 daemon 落在同一个库上；
+  三态让"问了没答"只能等到预算耗尽后报 `ManualActionRequired`。**② 协调锁内先探再决**（`ensure_managed_with`）：并发 attach 排队后观察同一个 daemon，
+  锁内重探若只是"尚未 bind"的暂态则在**调用方总预算**内继续等，而不是当成 wedge 立刻放弃——guardian 刚起来时 socket 已监听但还没读完请求，
+  这个窗口真实存在，判成 wedge 会把每次成功启动变成间歇失败。**③ Inspect 从不登记、不取锁、不建目录**（`BringUpIntent::may_start`，
+  自带 2 秒上限）：探测跑在 UI 轮询里，"看一眼谁在跑"若创建了 runtime 目录，就是这一 intent 存在的理由本身被违反。**④ 一个目录一个 scope**
+  （`lifecycle/claim.rs`，`scope.json` 0600 原子写）：`YI_AGENT_RUNTIME_DIR` 能让两个项目／两个配置实例指向同一个目录，路径完全相同无法区分，
+  首个协调者在锁内写下 project_key 与 instance home，后来者只比对、只报错（消息点名两边与换目录的出路），绝不另建库或起第二个 daemon；损坏的 claim 是
+  `InvalidData` 而不是 `None`（读成"未认领"会让占用中的 runtime 被覆盖）。
+  **产物固定为校验副本**（`pin_artifact` / `verify_pinned`）：`<instance>/artifacts/<build_id>/yi-agent`，流式复制 + SHA-256，目录 0700／文件 0700，
+  复制前后 digest 不符即删临时文件报 `InvalidData`；selection 指向该缓存并带 digest，bundle 被替换或删除都不会让旧客户端改用 PATH。
+  **私有角色无授权不起**（`roles.rs`）：`internal-runtime guardian` / `daemon` 都 `hide = true`，必须持有 launcher dup 进来的 `YI_AGENT_BOOTSTRAP_FD`
+  与 `YI_AGENT_SCOPE_KEY`；std 流号（≤2）被拒，且 `from_raw_fd` 前必须 `fcntl(F_GETFD)` 探活——对已关闭的号取所有权会以 `IO Safety violation` 直接 abort
+  （实测踩到，是 abort 不是 Err）。guardian 的授权检查先于 scope 解析：错误必须是"这不是你的角色"，而不是"去设个 scope key"。
+  `attach_managed_project_runtime` 走同一套 attach 请求且 `embedded_daemon: None`——受管模式下客户端退出不得带走 runtime；
+  `BringUpPolicy::default_for_build()` 仍为 `Embedded`，默认切换留 Task 18。
+  判据：`cargo test -p yi-agent-supervisors --test managed_bringup`（22 passed）、`cargo test -p yi-agent-supervisors --lib claim`（7 passed）、
+  `cargo test -p yi-agent --test managed_roles`（5 passed）、`cargo test -p yi-agent-subagent --test bringup_policy`（3 passed）、
+  `cargo test -p yi-agent-supervisors`（110 lib + 集成全绿）、`cargo test -p yi-agent --bin yi-agent`（842 passed）；
+  **变异验证**：把 `Unresponsive` 当 `Absent` → 1 例红；`may_start()` 恒真 → 1 例红；legacy 当作同构建 → 1 例红；
+  跳过 schema 预检 → 1 例红；release 的 grace 重新 clamp 到调用方预算 → 1 例红（均实测 RED 后恢复）
+- [x] 回收窗口不被调用方预算截断（Task 9 修正） — `Reclaimer::release` 曾把 10 秒优雅窗口 clamp 到控制请求的 2 秒超时，
+  等于 spec 承诺的 10 + 5 秒从未生效，仍在干净退出的客户端工作会被提前终止。现在 `deadline` 只约束同步段（耗尽即 `WouldBlock`，尚未改动任何状态），
+  后台回收线程用固定的 `RECLAIM_GRACE` / `RECLAIM_CONFIRM`。判据：`cargo test -p yi-agent-supervisors --test client_reclamation`
+  （20 passed，含 `a_short_callers_budget_does_not_shorten_the_grace_window`——停得慢的组在 700ms 优雅期内自行退出时不得出现 terminate 调用）；
+  变异验证：恢复 `deadline.clamp(self.grace)` → 该例红（实测 RED 后恢复）
+- [x] 默认 bring-up 走显式策略接缝（Task 18） — 原来 `BringUpPolicy` 存在但**没有任何生产调用者**：两个决定项目运行时如何起来的入口
+  （`yi-agent-app-server/src/server.rs::attach_cwd_runtime` 与 `yi-agent-subagent/src/binding.rs::repair_with_generation`）都直接调 embedded 路径，
+  所以「把默认切到 managed」只能逐个改调用点并指望不漏。现在统一走
+  `yi_agent_subagent::attach::ensure_owned_runtime_with_policy(cfg, runtime_dir, models_path, instance_home, policy, expected)`：
+  `Embedded` 保持原行为，`Managed` 转 `attach_managed_project_runtime`（`BringUpIntent::Business`，预算 `MANAGED_START_BUDGET = 30s`，
+  覆盖 guardian 自己的 20s daemon 启动 + 10s fork／协调锁／业务 attach）。
+  `RuntimeBinding::RepairPlan` 现在**记住**首次采用的策略（`BringUpChoice { policy, expected, instance_home }`），因为一次 repair 若从 embedded 静默切到 managed，
+  等于在会话中途改变「谁拥有 daemon」——那不是修复。缺的 `expected` 现在**拒绝**而不是降级成 unknown：managed 路径的全部意义就是比对构建，
+  静默在未经分类的运行时上跑业务正是它要防的失败。
+  **默认仍为 `Embedded`**：executor 生产装配未接通（见下一条），把 managed 设为默认等于给每个用户一个 worker 隔离尚未接线的运行时。
+  判据：`cargo test -p yi-agent-subagent --test bringup_policy`（5 passed，新增 `a_managed_bring_up_without_an_expected_artifact_is_refused`——断言拒绝理由点名 artifact identity、不可重试、且**不创建 runtime 目录**；
+  `the_managed_budget_covers_a_cold_guardian_and_daemon_start`）；`cargo test -p yi-agent-subagent`（100 lib + 集成全绿）
+
+- [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。
+  **2026-11-03 复核：缺的不是「少写一个 connector」，而是三处结构性前提都不存在，因此判定为需要设计决策，不能在本期收口。**
+  ① **控制协议没有「发通道」这个操作**：`ManagedSpawnClient::connect` 只接受**继承来的**描述符（路径连接被刻意禁止，否则任何本地进程都能要求 guardian 代它 spawn），
+  但 `ControlRequest` 的全部变体（`Identity`／`Register`／`Resume`／`Heartbeat`／`Release`／`ReclaimStatus`／`Operation`／`Admission`／`Preview`／`PreviewPage`／`Confirm`／`Status`）
+  里没有任何一项会被 guardian 应答以一个描述符；`codec` 是裸 JSON（u32 长度 + body），没有 `SCM_RIGHTS` 通道。也就是说「guardian 如何把 owner-bound 通道交给 daemon」这一步在设计上还没落地。
+  ② **daemon 不认识客户端身份**：`yi-agent-store`（daemon 侧）里 `ClientGrant` 出现次数为 0，它只有自己的 `RuntimeClients`（root→owner 的字符串绑定）。
+  而 `GuardianAdmission::new(runtime_dir, grant)` 要求客户端 grant，`guardian` 的 `Admission` 分支按 grant 校验 owner——所以 daemon 目前**无法**通过准入检查，即便有了 connector。
+  ③ **工具侧同样停在接口层**：`ManagedSpawner::new(ChannelFactory)` 的生产注入点 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 全仓只有一处调用且传 `None`
+  （`bootstrap.rs:210`），`ManagedSpawner::new` 的调用者全部在 `crates/yi-agent-tools/tests/managed_bash.rs`。这与 executor 是同一个洞：缺通道能力，两条链都是「机制齐、接线空」。
+  因此 `quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 这一条**不能**诚实实现——它需要「释放 app 后 app 的 executor 组真的被终止，而两个 TUI 的 executor 继续推进新 marker 序号」，
+  而这正需要上述①②③。补齐它需要先决定：通道由 guardian 在 `Admission` ACK 时一并交出（控制帧需扩 `SCM_RIGHTS`），还是 daemon 从自己的 bootstrap 通道上再派生；
+  以及客户端身份如何从业务 IPC（`AttachApplicationRoot`）传到 coordinator。这两项都改变控制协议与 daemon 的会话模型，属设计决策，不在本轮擅自落地。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
+- [ ] 工具与插件 spawn 全部走 owner-bound 受管通道（Task 8 Step 3 的后半） — 机制齐全但生产装配仍为空：`ManagedSpawner` 有 `Frontend` 策略、
+  `ManagedProcessPolicy` 能拒绝 `keep`、`PluginDemandTable` 能按 owner 计数，但 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 的**唯一**生产调用点
+  （`yi-agent-runtime/src/bootstrap.rs:210`）传 `None`，而 `ManagedSpawner::new` 的两个调用者都在 `crates/yi-agent-tools/tests/managed_bash.rs`。
+  shell／bash、`process_start`、MCP `manager.rs` 的 `TokioChildProcess::new(cmd)` 因此仍直接 spawn，未登记到 guardian。
+  判据：`grep -rn "build_tool_setup_owned" --include=*.rs crates/` 的调用点传入 `Some(..)`；`grep -rn "ManagedSpawner::new" --include=*.rs crates/` 出现非测试调用者。
+  **与下方 executor 条目同根**：`ChannelFactory` 需要一条从 guardian 继承来的私有通道，而控制协议目前没有「应答一个描述符」的操作（见该条 ①②③）。
+  所以这条不能靠改调用点单独完成，须先定通道交付方式。
+
+- [x] 租约过期必须真的回收，而不是只从表里删掉（Task 12） — 原来 `LeaseTable::expire` 存在但 guardian 的 serve 循环从不调用它：前端崩溃后心跳停止，
+  它的租约永远活着，而它启动的进程组既没有 owner 也没有人回收——这正是租约机制存在的理由被绕过。现在三处补齐：**①** `Reclaimer::expire_leases(now)`
+  把过期的 client 逐个走 `begin_client_reclaim`（与 `release` 共用的同一段：先关准入、无 business client 时开始全局 drain、后台线程按
+  `RECLAIM_GRACE` / `RECLAIM_CONFIRM` 停止并**核实**停止），不登记 query right——没有客户端在场可查，但 operation 与 `reclaim-*.json` 仍写盘。
+  **②** serve 循环改为 `poll` 驱动的非阻塞 accept，`LEASE_MAINTENANCE_TICK = 1s` 触发一次 `Guardian::maintain`；原先阻塞的 `accept` 会让过期检测
+  依赖流量，而"最后一个客户端崩了"恰恰是没有流量的时刻。**③** `ControlRequest::Heartbeat` / `Resume` 从 `Unsupported` 变成真实实现（`lease_now()`
+  取 wall time），否则任何超过 30 秒的租约都会静默过期。
+  判据：`cargo test -p yi-agent-supervisors --test client_reclamation`（24 passed，新增 `an_expired_lease_reclaims_the_work_its_client_left_behind`（过期后 backend 收到 stop 且 `stopped == true`）、
+  `a_heartbeat_after_expiry_cannot_revive_the_lease`、`a_renewed_lease_survives_the_maintenance_tick`、`the_guardian_maintenance_tick_reclaims_expired_clients`）；
+  `cargo test -p yi-agent --test frontend_runtime_lease`（8 passed）；`cargo test -p yi-agent --bin yi-agent`（845 passed）
+- [x] 只读影响快照、一次性确认与原子维护屏障（Task 14） — 三件互相支撑的东西。
+  **① 收集**（`yi-agent-supervisors/src/lifecycle/preview.rs::collect`）：guardian 自己
+  能证明的行（租约客户端、在跑的受管进程组、插件需求）总是收录；只有 coordinator 知道的
+  行（运行中／排队执行、daemon 侧插件）仅在它应答且带上 revision 时收录。前后各读一次
+  guardian revision，不一致就返回 `SnapshotRace` 而不是签一张混合了两个瞬间的快照。
+  **② 状态机**（`yi-agent-lifecycle/src/preview.rs::PreviewStore`）：token 绑定发起者、
+  scope、daemon 代际、目标产物与两个 revision 分量，60 秒过期，一次消费。
+  **③ 接线**（`guardian.rs::serve_preview`／`serve_preview_page`／`serve_confirm`）：
+  预览只读（不装屏障、不开 drain、改不了准入），确认先装维护屏障、在屏障内复核
+  revision，成功才消费 token，任一步失败都撤掉屏障（否则会为一次没发生的重启冻结全部
+  新任务）。目标产物在确认时重新校验（存在、常规文件、可执行），bundle 被删后失败发生在
+  停旧之前而不是中途。`CoordinatorProbe` 让 guardian 没有 daemon 时也能诚实回答 "unknown"。
+  判据：`cargo test -p yi-agent-supervisors --test runtime_restart_preview`（13 passed，
+  含 `a_client_joining_between_preview_and_confirm_makes_the_token_stale`、
+  `a_second_confirmation_cannot_start_a_second_replacement`、
+  `retrying_the_same_operation_returns_the_same_result`、
+  `a_confirmation_closes_admission_for_the_old_generation`、
+  `a_refused_confirmation_leaves_no_barrier`、`a_lease_only_client_can_preview`、
+  `a_vanished_target_is_refused_before_anything_starts`）；
+  `cargo test -p yi-agent-supervisors --lib lifecycle::preview`（8 passed）；
+  `cargo test -p yi-agent-lifecycle`（`preview` 15 + `leases` 9）
+
+### 版本切换与 guardian 交接（Task 15）
+
+- [x] 有界切换状态机与两段绝对窗口 — `yi-agent-supervisors/src/lifecycle/switch.rs`。
+  `SwitchMachine` 只表达合法相位序列（`idle → preparing → draining → stopping →
+  starting → verifying → ready`，另加 `stopped_no_clients` / `failed` /
+  `manual_action_required`），不合法跳转直接拒绝；`SWITCH_GRACE=10s`、
+  `SWITCH_CONFIRM=5s` 是**绝对**窗口而非按对象分摊，`SWITCH_START=30s` 覆盖交接＋启动＋握手。
+  `SwitchController::start` 立刻返回（返回码是 `WouldBlock` 表示已有一次切换在跑），
+  切换在工作线程里跑，UI 通过 `Operation` 轮询。判据：
+  `cargo test -p yi-agent-supervisors --lib switch::`（18 passed），含
+  `the_stages_run_in_the_specified_order`、`every_stage_failure_fails_closed`、
+  `an_unproven_stop_never_starts_a_second_generation`、
+  `a_runtime_with_no_clients_is_stopped_and_not_started`、
+  `a_secondary_switch_is_refused_while_one_runs`
+- [x] 真实后端：预检、冻结旧自愈、回收证明、选择记录 — `lifecycle/switch_managed.rs`。
+  `ManagedSwitchBackend` 把每个问题交给已经拥有事实的组件：`preflight` 只读检查目标可执行、
+  handover 能力与数据库 schema（`bringup::schema_is_readable_for`），任何一项不满足都返回
+  `ManualAction` 且**在停旧之前**；`freeze` 先写 `retirement` 记录，避免旧 watchman 把旧
+  daemon 拉回来；`is_stopped` 只认 `ProcessRegistry::owner_is_stopped`，`DetachedWitness`
+  一律报错（没有 registry 就无权声称已停止）；`commit_selection` 在协调锁下原子写
+  `selection.json`。判据：`cargo test -p yi-agent-supervisors --lib switch_managed`
+  （13 passed），含 `a_preflight_without_the_lock_is_refused`、
+  `a_missing_target_is_manual_action_not_a_stop`、
+  `a_detached_witness_cannot_claim_a_stop`、
+  `an_unknown_presence_does_not_claim_nobody_is_waiting`
+- [x] 受控 exec 交接状态 — `lifecycle/handover.rs`。`HandoverState` 带 scope、目标 build、
+  handover 版本、guardian revision、操作状态、已消费 token 的**身份**（非 token 本体）、
+  释放墓碑与各保留 FD 的**角色**（不是 fd 号）；`MAX_HANDOVER_BYTES = 4 MiB` 独立于 16 KiB
+  控制帧上限，超限在**停旧前**拒绝并给手动指引。租约以「剩余毫秒」携带，
+  `remaining_after_capture` 扣掉交接耗时且时钟倒退时不延长。`exec_target` 在单线程边界
+  上 `dup2` 到固定号、显式清 `FD_CLOEXEC`、只保留白名单 FD。判据：
+  `cargo test -p yi-agent-supervisors --test guardian_handover`（11 passed），含
+  `a_released_lease_is_not_resurrected`、`a_consumed_token_is_carried_as_an_identity_only`、
+  `an_oversized_state_is_refused_before_anything_stops`、
+  `descriptors_are_carried_by_role_not_by_number`
+- [x] 真进程验收：无客户端不启动、停旧是真停、失败保留数据库 — `tests/runtime_switch.rs`。
+  判据：`cargo test -p yi-agent-supervisors --test runtime_switch`（6 passed，30s），含
+  `a_switch_with_no_clients_starts_no_daemon`（断言 **没有** PID marker 出现）、
+  `a_switch_really_stops_the_previous_child`（`waitpid(WNOHANG)` 判定真实退出，僵尸不算活）、
+  `an_unreadable_database_is_refused_before_anything_stops`、
+  `a_bundle_that_vanishes_before_start_is_refused_before_the_old_one_stops`
+- [x] guardian 暴露只读 `Operation` 查询 — `guardian.rs` 的 `serve_operation`：需活租约，
+  未知 operation 返回 `Operation(None)` 而不是伪造失败；未接控制器的 build 返回
+  `Unsupported`，让客户端能区分「这个 build 不能切换」与「我没发起过」。
+- [ ] 切换的桌面壳入口与 App 侧按钮 — 见 Task 16、17

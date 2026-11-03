@@ -9,28 +9,29 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 23 / 25 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 26 / 28 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
-| yi-agent-tools | 21 / 23 | [详情](./yi-agent-tools.md) |
+| yi-agent-tools | 22 / 24 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
-| yi-agent-tui | 44 / 46 | [详情](./yi-agent-tui.md) |
-| yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
-| yi-agent-cli | 7 / 7 | [详情](./yi-agent-cli.md) |
+| yi-agent-tui | 45 / 47 | [详情](./yi-agent-tui.md) |
+| yi-agent-run | 11 / 11 | [详情](./yi-agent-run.md) |
+| yi-agent-cli | 9 / 9 | [详情](./yi-agent-cli.md) |
 | yi-agent-web | 12 / 12 | [详情](./yi-agent-web.md) |
 | yi-agent-relay | 2 / 2 | [详情](./yi-agent-relay.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
-| ci-cd | 36 / 36 | [详情](./ci-cd.md) |
+| ci-cd | 40 / 42 | [详情](./ci-cd.md) |
 | tooling | 11 / 11 | [详情](./tooling.md) |
-| yi-agent-mcp | 5 / 5 | [详情](./yi-agent-mcp.md) |
-| yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
+| yi-agent-mcp | 6 / 6 | [详情](./yi-agent-mcp.md) |
+| yi-agent-store | 13 / 14 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
-| yi-agent-runtime | 25 / 27 | [详情](./yi-agent-runtime.md) · [清单刷新 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) |
+| yi-agent-runtime | 26 / 28 | [详情](./yi-agent-runtime.md) · [清单刷新 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) |
 | yi-agent-power | 12 / 12 | [详情](./yi-agent-power.md) |
-| yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 81 / 82 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
+| yi-agent-subagent | 12 / 12 | [详情](./yi-agent-subagent.md) |
+| yi-agent-app-server | 84 / 85 | [详情](./yi-agent-app-server.md) |
+| subagent-runtime | 62 / 73 | [详情](./subagent-runtime.md) |
+| yi-agent-lifecycle | 19 / 19 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 19 / 22 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |
-| desktop | 116 / 127 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
+| desktop | 128 / 140 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 

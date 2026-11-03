@@ -31,8 +31,12 @@ yi-agent-mcp = { workspace = true }
 # The embedded relay client (outbound wss) used by `serve_stdio_with_relay`: the
 # desktop and a relay-attached phone must share ONE `serve()` loop.
 yi-agent-relay = { workspace = true }
-# `plugins/list` reads the plugin manifests under `<workdir>/.yi-agent/supervisors`.
+# `plugins/list` reads the plugin manifests under `<workdir>/.yi-agent/supervisors`,
+# and `runtime/status` classifies compatibility with the same rule bring-up uses.
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
+# `runtime/status` reads the guardian's grant-free status frame. Dependency-light
+# by design (no SQLite, no provider), so this does not pull a second stack in.
+yi-agent-lifecycle = { path = "../yi-agent-lifecycle" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 # `lead::ensure_lead_meta` 给组长 meta 盖创建时间戳(epoch 毫秒)。与

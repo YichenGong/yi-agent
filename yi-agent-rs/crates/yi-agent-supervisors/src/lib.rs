@@ -5,6 +5,7 @@
 
 pub mod daemon;
 pub mod install;
+pub mod lifecycle;
 pub mod manifest;
 pub mod refresh;
 pub mod supervisor;

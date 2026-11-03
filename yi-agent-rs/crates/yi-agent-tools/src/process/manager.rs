@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::time;
 
@@ -283,6 +283,100 @@ pub enum ProcessEvent {
     },
 }
 
+/// Either a child this process owns, or one the guardian owns on its behalf.
+///
+/// The waiter and the kill path need one shape for both, because a managed runtime
+/// must not quietly change how a process is reported or stopped -- it only changes
+/// *who* can stop it.
+enum SpawnedChild {
+    Local(tokio::process::Child),
+    Managed(crate::managed_process::ManagedChild),
+}
+
+impl SpawnedChild {
+    fn local_pid(&self) -> Option<u32> {
+        match self {
+            Self::Local(child) => child.id(),
+            // The guardian owns the group; this process must not signal it.
+            Self::Managed(_) => None,
+        }
+    }
+
+    async fn try_exit(&mut self) -> Option<Option<i32>> {
+        match self {
+            Self::Local(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(status.code()),
+                Ok(None) => None,
+                // An error is terminal: the handle cannot produce an exit later.
+                Err(_) => Some(None),
+            },
+            Self::Managed(child) => match child.try_wait().await {
+                Ok(Some(exit)) => Some(exit.code),
+                Ok(None) => None,
+                Err(_) => Some(None),
+            },
+        }
+    }
+
+    /// Terminates the whole group and does not return before it is gone.
+    ///
+    /// A local child keeps the escalation this path always had: SIGTERM to the
+    /// group, a grace period, then SIGKILL for descendants that ignore it.
+    /// `start_kill()` alone would `SIGKILL` the leader before its own handler
+    /// ran -- exactly what the graceful-stop test pins down.
+    async fn terminate(mut self, pid: Option<u32>) {
+        match &mut self {
+            Self::Local(child) => {
+                let Some(pid) = pid else {
+                    // No pid means the spawn never completed; the handle is all
+                    // there is to kill.
+                    let _ = child.start_kill();
+                    return;
+                };
+                signal_process_group(pid, libc::SIGTERM);
+                if local_group_drained(child, pid, KILL_GRACE).await {
+                    return;
+                }
+                // Grace expired: take the whole group, including grandchildren
+                // that ignore SIGTERM. The extra `start_kill()` covers a leader
+                // whose group signal landed nowhere (already gone, pid reused).
+                signal_process_group(pid, libc::SIGKILL);
+                let _ = child.start_kill();
+                local_group_drained(child, pid, KILL_REAP_WAIT).await;
+            }
+            Self::Managed(child) => {
+                // Group kill plus the proof it drained: the guardian's answer is
+                // the only authority on whether this group stopped.
+                let _ = child
+                    .terminate_group(std::time::Duration::from_secs(10))
+                    .await;
+            }
+        }
+    }
+}
+
+/// Waits until the direct child has been reaped *and* the process group is empty.
+///
+/// Both conditions are needed: reaping the leader says nothing about its
+/// descendants, which is exactly the case this wait exists for.
+async fn local_group_drained(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let reaped = !matches!(child.try_wait(), Ok(None));
+        if reaped && !process_group::group_exists(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 struct ManagedProcess {
     process_id: String,
     name: Option<String>,
@@ -298,7 +392,7 @@ struct ManagedProcess {
     output_cursor: u64,
     stdout: StreamRingBuffer,
     stderr: StreamRingBuffer,
-    child: Option<Child>,
+    child: Option<SpawnedChild>,
     /// 启动时登记的休眠保护意图。只在构造时写，之后不因状态变化改写。
     prevent_idle_sleep: bool,
 }
@@ -310,6 +404,13 @@ pub struct ProcessManager {
     shutting_down: AtomicBool,
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     events: broadcast::Sender<ProcessEvent>,
+    /// Who owns processes this manager starts.
+    ///
+    /// `Unmanaged` keeps the original behaviour: a manual daemon or a test has no
+    /// guardian to register with and makes no promise that quitting stops
+    /// anything.
+    policy: crate::managed_process::ManagedProcessPolicy,
+    spawner: Option<crate::managed_process::ManagedSpawner>,
 }
 
 impl ProcessManager {
@@ -327,6 +428,8 @@ impl ProcessManager {
             shutting_down: AtomicBool::new(false),
             processes: Arc::new(Mutex::new(HashMap::new())),
             events,
+            policy: crate::managed_process::ManagedProcessPolicy::Unmanaged,
+            spawner: None,
         })
     }
 
@@ -341,6 +444,38 @@ impl ProcessManager {
     ) -> Arc<Self> {
         let sandbox = SandboxPolicy::with_controller(&root, extra_writable_roots, controller);
         Self::with_sandbox(root, sandbox)
+    }
+
+    /// The same manager, with every process it starts owned by one frontend.
+    ///
+    /// Consumption is deliberate: switching owners mid-session would leave earlier
+    /// processes under the old owner, and "which client owns this?" would stop
+    /// having an answer.
+    pub fn into_managed(
+        self: Arc<Self>,
+        policy: crate::managed_process::ManagedProcessPolicy,
+        spawner: crate::managed_process::ManagedSpawner,
+    ) -> Arc<Self> {
+        // The fields are immutable after construction, so a managed manager is a
+        // rebuilt one; there is no window where it is half-managed.
+        Arc::new(Self {
+            root: self.root.clone(),
+            sandbox: self.sandbox.clone(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::SeqCst)),
+            shutting_down: AtomicBool::new(self.shutting_down.load(Ordering::SeqCst)),
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            events: self.events.clone(),
+            policy,
+            spawner: Some(spawner),
+        })
+    }
+
+    fn managed_policy(&self) -> &crate::managed_process::ManagedProcessPolicy {
+        &self.policy
+    }
+
+    fn managed_spawner(&self) -> Option<&crate::managed_process::ManagedSpawner> {
+        self.spawner.as_ref()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ProcessEvent> {
@@ -370,6 +505,16 @@ impl ProcessManager {
             .sandbox
             .command(command, &cwd)
             .map_err(|err| err.to_string())?;
+
+        // `keep` asks for a process that outlives the work that started it. In a
+        // managed runtime that is precisely the promise the product makes and then
+        // must not break, so it is refused here rather than silently turned into
+        // `kill`.
+        let on_exit_value = match opts.on_exit {
+            OnExitPolicy::Kill => "kill",
+            OnExitPolicy::Keep => "keep",
+        };
+        crate::managed_process::validate_on_exit(self.managed_policy(), on_exit_value)?;
         let process_id = self.next_process_id();
         let name = opts.name.clone();
         let on_exit = opts.on_exit;
@@ -416,8 +561,11 @@ impl ProcessManager {
             );
         }
 
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        // The unmanaged command is still built: when the runtime is managed it is
+        // simply not spawned, and building it keeps one code path for the sandbox
+        // wrapper's arguments.
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -426,30 +574,74 @@ impl ProcessManager {
         cmd.envs(opts.env.iter());
         configure_process_group(&mut cmd);
 
-        let mut child = cmd
-            .spawn()
-            .inspect_err(|_| {
-                self.lock_processes().remove(&process_id);
-            })
-            .map_err(|err| format!("failed to start process: {err}"))?;
-        let pid = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let (child, pid, stdout, stderr) = match self.managed_spawner() {
+            Some(spawner) => {
+                // The guardian execs exactly the sandbox wrapper the unmanaged path
+                // would have run, so file permissions are unchanged; only
+                // ownership moves.
+                let executable = crate::managed_process::resolve_program(&program)
+                    .map_err(|error| error.to_string())?;
+                let env: Vec<(String, String)> = opts
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                let mut managed = spawner
+                    .spawn(&executable, &args, &env, &cwd)
+                    .await
+                    .inspect_err(|_| {
+                        self.lock_processes().remove(&process_id);
+                    })
+                    .map_err(|err| format!("failed to start process: {err}"))?;
+                let stdout = managed
+                    .stdout
+                    .take()
+                    .map(crate::managed_process::into_reader);
+                let stderr = managed
+                    .stderr
+                    .take()
+                    .map(crate::managed_process::into_reader);
+                (SpawnedChild::Managed(managed), None, stdout, stderr)
+            }
+            None => {
+                let mut child = cmd
+                    .spawn()
+                    .inspect_err(|_| {
+                        self.lock_processes().remove(&process_id);
+                    })
+                    .map_err(|err| format!("failed to start process: {err}"))?;
+                let pid = child.id();
+                let stdout = child.stdout.take().map(crate::managed_process::into_reader);
+                let stderr = child.stderr.take().map(crate::managed_process::into_reader);
+                (SpawnedChild::Local(child), pid, stdout, stderr)
+            }
+        };
 
-        {
+        // The child is moved out so both branches can own it: the rejection path
+        // has to terminate it, and the accepted path hands it to the record.
+        let mut pending = Some(child);
+        let rejected = {
             let mut processes = self.lock_processes();
             if self.shutting_down.load(Ordering::SeqCst) {
                 processes.remove(&process_id);
-                drop(processes);
-                terminate_child(child, pid);
-                return Err("process manager is shutting down".into());
+                true
+            } else {
+                let process = processes
+                    .get_mut(&process_id)
+                    .ok_or_else(|| format!("process reservation missing: {process_id}"))?;
+                process.pid = pid;
+                process.status = ProcessStatus::Running;
+                process.child = pending.take();
+                false
             }
-            let process = processes
-                .get_mut(&process_id)
-                .ok_or_else(|| format!("process reservation missing: {process_id}"))?;
-            process.pid = pid;
-            process.status = ProcessStatus::Running;
-            process.child = Some(child);
+        };
+        if rejected {
+            // Nothing was recorded, so this is only cleanup: stop whatever was just
+            // started, through whichever authority owns it.
+            if let Some(child) = pending.take() {
+                child.terminate(pid).await;
+            }
+            return Err("process manager is shutting down".into());
         }
 
         self.spawn_reader(process_id.clone(), StreamKind::Stdout, stdout);
@@ -600,7 +792,7 @@ impl ProcessManager {
 
     pub async fn kill(&self, selector: ProcessSelector) -> Result<(), String> {
         let process_id = self.selector_to_id(&selector)?;
-        let (pid, killed) = {
+        let (pid, child, child_was_running) = {
             let mut processes = self.lock_processes();
             let process = processes
                 .get_mut(&process_id)
@@ -608,72 +800,29 @@ impl ProcessManager {
             if is_terminal(&process.status) {
                 return Ok(());
             }
-            let pid = process.child.as_ref().and(process.pid);
+            let pid = process
+                .child
+                .as_ref()
+                .and_then(|child| child.local_pid())
+                .or(process.pid);
             process.status = ProcessStatus::Killed;
             process.ready = false;
             process.end_time = Some(Instant::now());
-            (pid, true)
+            // Whether there was a child at all decides the event: a process whose
+            // waiter already observed the exit is not "killed" by this call.
+            let had_child = process.child.is_some();
+            let child = process.child.take();
+            (pid, child, had_child)
         };
-        if killed {
-            self.terminate_group(pid, &process_id).await;
+        // Signalling belongs to `terminate` for both shapes. Signalling here as
+        // well would send SIGTERM twice and let the escalation run behind its back.
+        if let Some(child) = child {
+            child.terminate(pid).await;
+        }
+        if child_was_running {
             self.emit(ProcessEvent::Killed { process_id });
         }
         Ok(())
-    }
-
-    /// 整组优雅终止：先给 SIGTERM 让进程自己清理，宽限期过后整组升级到 SIGKILL。
-    ///
-    /// 「整组」不能省的正是这一步——直接子进程之外的子孙只会收到组信号。只对
-    /// 直接子进程 `start_kill()`（SIGKILL）会让忽略 SIGTERM 的子孙变成孤儿继续
-    /// 跑，而面板已经显示 killed。
-    async fn terminate_group(&self, pid: Option<u32>, process_id: &str) {
-        let Some(pid) = pid else {
-            // 没有 pid（进程尚未 spawn 完）：只能尽力杀掉已持有的 child。
-            if let Ok(mut processes) = self.processes.lock()
-                && let Some(child) = processes.get_mut(process_id).and_then(|p| p.child.as_mut())
-            {
-                let _ = child.start_kill();
-            }
-            return;
-        };
-
-        signal_process_group(pid, libc::SIGTERM);
-        if self.wait_until_gone(pid, KILL_GRACE).await {
-            return;
-        }
-        // 宽限期内没走干净：整组 SIGKILL，连忽略 SIGTERM 的子孙一并收掉。
-        // 先发组信号再补 child.start_kill()，覆盖组长已退出但 pid 已被复用等
-        // 组信号落空的边界。
-        signal_process_group(pid, libc::SIGKILL);
-        if let Ok(mut processes) = self.processes.lock()
-            && let Some(child) = processes.get_mut(process_id).and_then(|p| p.child.as_mut())
-        {
-            let _ = child.start_kill();
-        }
-        self.wait_until_gone(pid, KILL_REAP_WAIT).await;
-    }
-
-    /// 等到「直接子进程已被收割」且「整组已无存活成员」。
-    ///
-    /// 两个条件都要：组长被 reap 时子孙可能还在（正是本函数要等的情形），而整组
-    /// 清空时 `spawn_waiter` 也几乎同时把 child 置空。
-    async fn wait_until_gone(&self, pid: u32, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.child_reaped(pid) && !process_group::group_exists(pid) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            time::sleep(POLL_INTERVAL).await;
-        }
-    }
-    /// 直接子进程是否已被 `spawn_waiter` 收割（`child` 为 None 且状态已终态）。
-    fn child_reaped(&self, pid: u32) -> bool {
-        self.lock_processes().values().any(|process| {
-            process.pid == Some(pid) && process.child.is_none() && is_terminal(&process.status)
-        })
     }
 
     pub async fn shutdown(&self) -> Result<Vec<ManagedProcessSnapshot>, String> {
@@ -815,56 +964,98 @@ impl ProcessManager {
         let manager = self.clone();
         tokio::spawn(async move {
             loop {
+                // The probe happens outside the lock. A managed `try_exit` sends a
+                // request to the guardian, and holding the process mutex across
+                // that await would both block every other tool and make this task
+                // non-`Send`.
+                let outcome = {
+                    // A local child is polled under the lock (a `try_wait` does not
+                    // yield); a managed one has to await the guardian, so its
+                    // request runs outside the lock and the result is written back
+                    // afterwards.
+                    enum Step {
+                        Local(Option<Option<i32>>),
+                        Remote,
+                        Gone,
+                    }
+                    let step = {
+                        let mut processes = manager.lock_processes();
+                        match processes.get_mut(&process_id) {
+                            Some(process) => match process.child.as_mut() {
+                                Some(SpawnedChild::Local(child)) => {
+                                    Step::Local(match child.try_wait() {
+                                        Ok(Some(status)) => Some(status.code()),
+                                        Ok(None) => None,
+                                        Err(_) => Some(None),
+                                    })
+                                }
+                                Some(SpawnedChild::Managed(_)) => Step::Remote,
+                                None => Step::Gone,
+                            },
+                            None => Step::Gone,
+                        }
+                    };
+                    match step {
+                        Step::Local(value) => value,
+                        Step::Gone => return,
+                        Step::Remote => {
+                            // Poll the guardian without the lock. The managed child
+                            // is taken out, asked, and put back, so no other path
+                            // can observe a half-updated handle.
+                            let taken = {
+                                let mut processes = manager.lock_processes();
+                                processes
+                                    .get_mut(&process_id)
+                                    .and_then(|process| process.child.take())
+                            };
+                            let Some(mut child) = taken else {
+                                return;
+                            };
+                            let outcome = child.try_exit().await;
+                            let mut processes = manager.lock_processes();
+                            match processes.get_mut(&process_id) {
+                                Some(process) => {
+                                    if outcome.is_none() {
+                                        process.child = Some(child);
+                                    }
+                                    outcome
+                                }
+                                None => outcome,
+                            }
+                        }
+                    }
+                };
+
                 let event = {
                     let mut processes = manager.lock_processes();
                     let Some(process) = processes.get_mut(&process_id) else {
                         return;
                     };
-                    match process.child.as_mut() {
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(status)) => {
-                                process.child = None;
-                                process.ready = false;
-                                process.end_time.get_or_insert_with(Instant::now);
-                                if matches!(process.status, ProcessStatus::Killed) {
-                                    Some(ProcessEvent::Killed {
-                                        process_id: process_id.clone(),
-                                    })
-                                } else {
-                                    let code = status.code();
-                                    process.status = ProcessStatus::Exited { code };
-                                    process.exit_code = code;
-                                    Some(ProcessEvent::Exited {
-                                        process_id: process_id.clone(),
-                                        code,
-                                    })
-                                }
+                    match outcome {
+                        Some(code) => {
+                            process.child = None;
+                            process.ready = false;
+                            process.end_time.get_or_insert_with(Instant::now);
+                            // `Killed` was recorded by `kill`, so the exit must be
+                            // reported as a kill rather than a normal exit with the
+                            // signal-derived code.
+                            if matches!(process.status, ProcessStatus::Killed) {
+                                Some(ProcessEvent::Killed {
+                                    process_id: process_id.clone(),
+                                })
+                            } else {
+                                process.status = ProcessStatus::Exited { code };
+                                process.exit_code = code;
+                                Some(ProcessEvent::Exited {
+                                    process_id: process_id.clone(),
+                                    code,
+                                })
                             }
-                            Ok(None) => None,
-                            Err(_) => {
-                                process.child = None;
-                                process.ready = false;
-                                process.end_time.get_or_insert_with(Instant::now);
-                                if matches!(process.status, ProcessStatus::Killed) {
-                                    Some(ProcessEvent::Killed {
-                                        process_id: process_id.clone(),
-                                    })
-                                } else {
-                                    process.status = ProcessStatus::Exited { code: None };
-                                    process.exit_code = None;
-                                    Some(ProcessEvent::Exited {
-                                        process_id: process_id.clone(),
-                                        code: None,
-                                    })
-                                }
-                            }
-                        },
-                        None => {
-                            if is_terminal(&process.status) {
-                                return;
-                            }
-                            None
                         }
+                        // Still running: keep polling. Returning here would stop
+                        // the waiter on the first tick and leave the process
+                        // reported as running forever.
+                        None => None,
                     }
                 };
                 if let Some(event) = event {
@@ -1010,16 +1201,6 @@ fn process_id_sort_key(process_id: &str) -> (u64, String) {
         .and_then(|suffix| suffix.parse().ok())
         .unwrap_or(u64::MAX);
     (numeric, process_id.to_owned())
-}
-
-fn terminate_child(mut child: Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        signal_process_group(pid, libc::SIGTERM);
-        // terminate_child 用在同步上下文（start 的关闭竞态/exit 清理），无法等待；
-        // 直接对整组补 SIGKILL，确保忽略 SIGTERM 的子孙也被收掉，而不是只杀组长。
-        signal_process_group(pid, libc::SIGKILL);
-    }
-    let _ = child.start_kill();
 }
 
 #[cfg(test)]

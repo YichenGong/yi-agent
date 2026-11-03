@@ -58,6 +58,12 @@ pub struct Sidecar {
     /// 没有可操作性。成功起进程时清空——留着一条旧错误会让界面在已连上时仍
     /// 显示红字。
     last_errors: Mutex<HashMap<ProfileKey, String>>,
+    /// 正在退出。
+    ///
+    /// 与 `desired` 不同：`desired` 是「用户希望连着」，用户随时可以重新打开；
+    /// 这里一旦置位就不可撤销，因为退出流程已经在向各 runtime 请求释放租约，
+    /// 此时把 sidecar 拉起来等于让一个正在被回收的客户端重新出现。
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Sidecar {
@@ -69,6 +75,7 @@ impl Sidecar {
             // 里的监督循环第一轮就退出，侧车永远起不来。
             desired: Mutex::new(std::collections::HashSet::from([ProfileKey::Local])),
             last_errors: Mutex::new(HashMap::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -153,6 +160,11 @@ impl Sidecar {
             .unwrap_or(false)
     }
 
+    /// 是否已经开始退出。监督循环每次重试前都问一次。
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// 摘掉槽位登记（连同内层句柄一起）。
     fn remove_slot(&self, key: &ProfileKey) {
         if let Ok(mut guard) = self.slots.lock() {
@@ -192,17 +204,139 @@ fn write_line(state: &Sidecar, slot: &ProfileKey, value: &serde_json::Value) -> 
 /// Frontend → sidecar: write one JSON-RPC request line.
 #[tauri::command]
 pub fn rpc(
+    app: AppHandle,
     state: State<'_, Sidecar>,
     slot: String,
     id: u64,
     method: String,
     params: serde_json::Value,
 ) -> Result<(), String> {
+    let key = slot_key(&slot);
+    let params = match shell_identity_for(&app) {
+        Some(identity) => stamp_shell_identity(&key, &method, params, &identity),
+        None => params,
+    };
     write_line(
         &state,
-        &slot_key(&slot),
+        &key,
         &serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
     )
+}
+
+/// Who the local stdio session speaks for, as the shell can prove it.
+///
+/// The `client_run_id` is minted once per App launch, so it survives an
+/// `app-server` restart — that is exactly the identity the runtime's lease is
+/// keyed on. `daemon_instance_id` is the generation the shell is attached to,
+/// when it knows one; a missing value means "no generation observed yet", and
+/// the guardian re-checks the live lease regardless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellIdentity {
+    pub client_run_id: String,
+    pub daemon_instance_id: Option<String>,
+    /// The runtime artifact this shell shipped with, when it verified one.
+    ///
+    /// Sent so the sidecar can answer `runtime/status` with "same build" instead of
+    /// `Unknown`. It names bytes and grants nothing: no lease can be renewed with it,
+    /// and a session that lies about it only gets a wrong banner about its own
+    /// project.
+    pub expected_runtime: Option<ExpectedRuntime>,
+}
+
+/// The artifact expectation, in the sidecar's handshake shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedRuntime {
+    pub build_id: String,
+    pub display_version: String,
+    pub schema_min: u32,
+    pub schema_max: u32,
+    pub business_protocol_min: u32,
+    pub business_protocol_max: u32,
+    pub capabilities: Vec<String>,
+}
+
+/// Reads the shell's identity out of the App's lifecycle state.
+///
+/// `None` in a window-only test or before `runtime_lifecycle::install` ran:
+/// then the frame is written exactly as before, which is also the CLI's shape.
+fn shell_identity_for<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<ShellIdentity> {
+    let state = app.try_state::<crate::runtime_lifecycle::QuitState>()?;
+    Some(ShellIdentity {
+        client_run_id: state.manager.client_run_id().to_string(),
+        daemon_instance_id: None,
+        expected_runtime: state.manager.artifact().map(|artifact| ExpectedRuntime {
+            build_id: artifact.build_id.clone(),
+            display_version: artifact.display_version.clone(),
+            schema_min: artifact.schema_min,
+            schema_max: artifact.schema_max,
+            business_protocol_min: artifact.business_protocol_min,
+            business_protocol_max: artifact.business_protocol_max,
+            capabilities: artifact.capabilities.clone(),
+        }),
+    })
+}
+
+/// Adds the shell identity to a local `initialize` frame, and to nothing else.
+///
+/// Three narrowings, each closing a way the authority could leak:
+///
+/// * **Local stdio only.** A remote slot is `ssh`/relay; a phone must never be
+///   able to present itself as the App, so its frame is forwarded untouched (the
+///   server would reject the field anyway — this stops it even being sent).
+/// * **`initialize` only.** The value is a statement of ownership made once per
+///   session; repeating it on every request would make it look like a credential
+///   that could be refreshed.
+/// * **No credential.** Only run id and generation cross the pipe. Nothing here
+///   can be replayed to renew a lease, so a tool that inherits the process
+///   environment inherits nothing.
+pub fn stamp_shell_identity(
+    slot: &ProfileKey,
+    method: &str,
+    mut params: serde_json::Value,
+    identity: &ShellIdentity,
+) -> serde_json::Value {
+    if !matches!(slot, ProfileKey::Local) || method != "initialize" {
+        return params;
+    }
+    let Some(object) = params.as_object_mut() else {
+        return params;
+    };
+    let mut authorization = serde_json::Map::new();
+    authorization.insert(
+        "client_run_id".to_string(),
+        Value::String(identity.client_run_id.clone()),
+    );
+    authorization.insert("issued_by_shell".to_string(), Value::Bool(true));
+    if let Some(generation) = &identity.daemon_instance_id {
+        authorization.insert(
+            "daemon_instance_id".to_string(),
+            Value::String(generation.clone()),
+        );
+    }
+    // Identity of the sidecar we shipped with, not of the wrapper. An unverified
+    // build sends nothing here, and the sidecar then answers `unknown` -- which is
+    // the honest answer for a `tauri dev` session.
+    if let Some(expected) = &identity.expected_runtime {
+        authorization.insert(
+            "expected_runtime".to_string(),
+            serde_json::json!({
+                "build_id": expected.build_id,
+                "display_version": expected.display_version,
+                "schema_min": expected.schema_min,
+                "schema_max": expected.schema_max,
+                "business_protocol_min": expected.business_protocol_min,
+                "business_protocol_max": expected.business_protocol_max,
+                "capabilities": expected.capabilities,
+            }),
+        );
+    }
+    // Overwrite rather than merge: a webview that supplied its own value would be
+    // claiming an identity, and the shell's is the only one that is true.
+    object.insert(
+        "shellAuthorization".to_string(),
+        Value::Object(authorization),
+    );
+    params
 }
 
 /// Frontend → sidecar: reply to a reverse request (permission approval).
@@ -250,6 +384,17 @@ fn next_restart_delay_for(slot: &ProfileKey, consecutive_restarts: u32) -> Durat
     Duration::from_millis(ms)
 }
 
+/// Whether the supervisor should (re)start this slot right now.
+///
+/// Extracted from the loop so the two stop conditions are testable without a
+/// real `AppHandle`: a sidecar crash is only allowed to become a respawn while
+/// the slot is still wanted *and* the App is not quitting. Checking quitting
+/// first is what stops a crash during the quit drain from resurrecting a client
+/// whose leases are being released.
+fn should_respawn(state: &Sidecar, key: &ProfileKey) -> bool {
+    !state.is_shutting_down() && state.is_desired(key)
+}
+
 /// Spawn the sidecar, forward its stdout frames as Tauri events, and respawn it
 /// whenever it exits.
 ///
@@ -263,10 +408,12 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         let mut consecutive_restarts: u32 = 0;
         loop {
-            if !app.state::<Sidecar>().is_desired(&key) {
+            let state = app.state::<Sidecar>();
+            if !should_respawn(&state, &key) {
                 eprintln!("[{}] no longer desired; supervisor stops", key.as_str());
                 return;
             }
+            drop(state);
             match spawn_once(&app, &key) {
                 Ok(mut rx) => {
                     // A successful launch resets the backoff: the previous exit
@@ -548,6 +695,29 @@ fn kill_sidecar(app: &AppHandle, slot: &ProfileKey) {
         .and_then(|cell| cell.lock().ok().and_then(|mut guard| guard.take()));
     if let Some(child) = taken {
         let _ = child.kill();
+    }
+}
+
+/// 退出流程的第一步：禁止所有槽位重生。
+///
+/// 必须在向 runtime 请求释放租约**之前**调用。晚一步的话，正在退出的 daemon
+/// 把 sidecar 的 stdio 关掉，监督循环看见「进程没了」就立刻拉起一个新的——
+/// 那个新进程还带着本 App 的业务连接，于是已经释放掉的项目又被重新登记。
+///
+/// 只改状态、不动进程：真正的终止由退出收尾按需完成，且和租约释放并行。
+pub fn begin_shutdown<R: tauri::Runtime>(app: &AppHandle<R>) {
+    // A window-only test app never manages `Sidecar`. Quitting still has to work
+    // there, and there is no supervisor to freeze in that case.
+    let Some(state) = app.try_state::<Sidecar>() else {
+        return;
+    };
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // 撤销全部意图，让已经进入 `sleep` 等待重试的那一轮也不再继续。
+    let keys = state.keys();
+    for key in keys {
+        state.unmark_desired(&key);
     }
 }
 
@@ -1250,6 +1420,119 @@ mod tests {
 
     /// 不同槽位的事件名必须互相隔离：远端的一条 message 绝不能落到本地槽位
     /// 的监听器上，否则本地 UI 会显示另一个项目的对话（spec §4.6 障碍四）。
+    fn identity() -> ShellIdentity {
+        ShellIdentity {
+            client_run_id: "app-run-1".to_string(),
+            daemon_instance_id: Some("daemon-7".to_string()),
+            expected_runtime: Some(ExpectedRuntime {
+                build_id: "0123456789abcdef".to_string(),
+                display_version: "0.2.0".to_string(),
+                schema_min: 1,
+                schema_max: 16,
+                business_protocol_min: 1,
+                business_protocol_max: 1,
+                capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+            }),
+        }
+    }
+
+    /// The App's authority is stated once, on the local handshake, and nowhere
+    /// else: repeating it on each request would read as a refreshable credential.
+    #[test]
+    fn a_local_initialize_carries_the_shell_identity() {
+        let params = stamp_shell_identity(
+            &ProfileKey::Local,
+            "initialize",
+            json!({ "clientInfo": { "name": "desktop" } }),
+            &identity(),
+        );
+        let stamped = &params["shellAuthorization"];
+        assert_eq!(stamped["client_run_id"], "app-run-1");
+        assert_eq!(stamped["daemon_instance_id"], "daemon-7");
+        assert_eq!(stamped["issued_by_shell"], true);
+        // The artifact identity is what makes the sidecar able to answer "same
+        // build" instead of `unknown`; it is the daemon's build id, not the
+        // wrapper's version.
+        assert_eq!(stamped["expected_runtime"]["build_id"], "0123456789abcdef");
+        assert_eq!(stamped["expected_runtime"]["display_version"], "0.2.0");
+        assert_eq!(stamped["expected_runtime"]["schema_max"], 16);
+        // The rest of the frame survives: this is an addition, not a rewrite.
+        assert_eq!(params["clientInfo"]["name"], "desktop");
+    }
+
+    /// An unverified build states no expectation at all.
+    ///
+    /// `tauri dev` has no manifest, and inventing an expectation from a version
+    /// number would label every runtime a mismatch. Absent is the honest answer.
+    #[test]
+    fn an_unverified_shell_sends_no_artifact_expectation() {
+        let mut unverified = identity();
+        unverified.expected_runtime = None;
+        let params = stamp_shell_identity(&ProfileKey::Local, "initialize", json!({}), &unverified);
+        assert!(params["shellAuthorization"]
+            .get("expected_runtime")
+            .is_none());
+        // The rest of the identity is still there: "I do not know my artifact" is
+        // not "I am not the shell".
+        assert_eq!(params["shellAuthorization"]["client_run_id"], "app-run-1");
+    }
+
+    /// The expectation must never be the only thing a non-desktop frame grows.
+    #[test]
+    fn a_non_initialize_frame_carries_no_expectation_either() {
+        let params =
+            stamp_shell_identity(&ProfileKey::Local, "runtime/status", json!({}), &identity());
+        assert!(params.get("shellAuthorization").is_none());
+    }
+
+    /// A phone (or any remote slot) must not be able to present itself as the
+    /// App. The field is not merely rejected downstream — it is never sent.
+    #[test]
+    fn a_remote_initialize_is_forwarded_without_any_identity() {
+        let params = stamp_shell_identity(
+            &ProfileKey::Remote("phone".to_string()),
+            "initialize",
+            json!({}),
+            &identity(),
+        );
+        assert!(params.get("shellAuthorization").is_none());
+    }
+
+    /// Only the handshake: a business request must not carry ownership with it.
+    #[test]
+    fn other_methods_never_carry_the_shell_identity() {
+        for method in ["thread/start", "session/attach", "release"] {
+            let params = stamp_shell_identity(&ProfileKey::Local, method, json!({}), &identity());
+            assert!(
+                params.get("shellAuthorization").is_none(),
+                "{method} must not carry an identity"
+            );
+        }
+    }
+
+    /// A webview offering its own identity must not have it merged in: the
+    /// shell's value replaces it, so "who owns this work" is never self-declared.
+    #[test]
+    fn a_supplied_identity_is_replaced_not_merged() {
+        let params = stamp_shell_identity(
+            &ProfileKey::Local,
+            "initialize",
+            json!({ "shellAuthorization": { "client_run_id": "forged" } }),
+            &identity(),
+        );
+        assert_eq!(params["shellAuthorization"]["client_run_id"], "app-run-1");
+    }
+
+    /// Nothing that could renew a lease may cross the pipe.
+    #[test]
+    fn the_stamped_frame_carries_no_credential() {
+        let params = stamp_shell_identity(&ProfileKey::Local, "initialize", json!({}), &identity());
+        let text = serde_json::to_string(&params).unwrap();
+        assert!(!text.contains("credential"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("token"));
+    }
+
     #[test]
     fn event_names_are_per_slot() {
         let local = event_name("message", &ProfileKey::Local);
@@ -1373,6 +1656,65 @@ mod tests {
             state.is_desired(&ProfileKey::Local),
             "本地槽位不需要任何人标记：App 启动就该有 sidecar"
         );
+    }
+
+    /// App 退出时监督循环必须停下。
+    ///
+    /// 与 `desired` 的区别是这里不可撤销：`desired` 回答「用户还想连着吗」，
+    /// 用户随时能再打开；`shutting_down` 回答「App 是不是已经在退出」。退出
+    /// 流程正在请求各 runtime 释放租约，此时重生 sidecar 等于让一个正在被
+    /// 回收的客户端重新出现。
+    #[test]
+    fn shutting_down_stops_every_slot_from_being_desired() {
+        let state = Sidecar::new();
+        let remote = ProfileKey::Remote("proj-foo".into());
+        state.mark_desired(&remote);
+        assert!(!state.is_shutting_down());
+
+        // 直接置位（`begin_shutdown` 需要 AppHandle，这里测的是它留下的状态）。
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(state.is_shutting_down());
+        assert!(
+            state.is_desired(&ProfileKey::Local),
+            "desired 仍未撤销：监督循环靠 shutting_down 先判定"
+        );
+    }
+
+    /// 崩溃后是否重生，只看两件事：还想不想要、是不是在退出。
+    ///
+    /// `sidecar crash/respawn` 的真实进程路径需要 AppHandle，这里锁定它的判定
+    /// 依据：正常崩溃必须重生，退出流程中的崩溃必须被拦下——否则正在被回收
+    /// 的客户端会在释放途中重新出现。
+    #[test]
+    fn a_crash_respawns_only_while_the_app_is_not_quitting() {
+        let state = Sidecar::new();
+        let key = ProfileKey::Local;
+        assert!(
+            should_respawn(&state, &key),
+            "a live slot should be started"
+        );
+
+        // 模拟一次崩溃：句柄被清空、意图仍在 → 应当重生。
+        state.set_slot(key.clone(), Arc::new(Mutex::new(None)));
+        state.note_error(&key, "exited with code 1");
+        assert!(
+            should_respawn(&state, &key),
+            "a crash alone must not stop the supervisor"
+        );
+
+        // 用户断开（撤销意图）→ 不重生。
+        state.unmark_desired(&key);
+        assert!(!should_respawn(&state, &key));
+        state.mark_desired(&key);
+
+        // App 开始退出 → 即使仍「想要」也不重生。
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!should_respawn(&state, &key));
     }
 
     /// 用户主动断开后，监督循环必须能看出「这次不该重连」。

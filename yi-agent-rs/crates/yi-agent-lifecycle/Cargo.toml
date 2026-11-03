@@ -1,0 +1,21 @@
+[package]
+name = "yi-agent-lifecycle"
+description = "Shared, dependency-light lifecycle control protocol for the yi-agent runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately no tokio, no rusqlite, no yi-agent-core, no provider. The desktop
+# shell links this crate; anything heavier would pull SQLite and the model stack
+# into the Tauri binary. `cargo tree -p yi-agent-lifecycle` is the guard.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+getrandom = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

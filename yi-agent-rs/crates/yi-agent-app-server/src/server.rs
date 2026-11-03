@@ -130,9 +130,9 @@ pub(crate) use plugin_bridge::{
 };
 #[allow(unused_imports)]
 pub(crate) use watchman::{
-    PLUGIN_READY_POLL, agent_trace_row, ensure_watchman_installed, production_watchman_install,
-    production_watchman_uninstall, project_has_plugin_manifest, should_evict, skills_home_from,
-    wait_for_plugin_query_socket_within, watchman_home_from,
+    PLUGIN_READY_POLL, agent_trace_row, ensure_watchman_installed, ensure_watchman_installed_in,
+    production_watchman_install, production_watchman_uninstall, project_has_plugin_manifest,
+    should_evict, skills_home_from, wait_for_plugin_query_socket_within, watchman_home_from,
 };
 
 pub(crate) mod assembly;
@@ -469,6 +469,13 @@ pub(crate) type ClientScopes = Arc<Mutex<HashMap<crate::broadcast::ClientId, Sco
 /// 层摘除。用共享表而非主循环里的局部 `HashMap`,是为了能在断连时**回收**条目:
 /// 否则每个 ws 连接都会永久留下一个 `ClientId` 键(连接可来去,表只增不减)。
 pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId, bool>>>;
+
+/// 每个客户端被告知的「它在替谁干活」。
+///
+/// 只由本地 stdio 的 `initialize` 写入（见 `shell_authorization`）：远端设备
+/// 自报同一个字段一律忽略，否则一台手机可以把身份栽赃给别人。
+pub(crate) type ClientShellAuthorizations =
+    Arc<Mutex<HashMap<crate::broadcast::ClientId, crate::shell_authorization::ShellAuthorization>>>;
 
 pub(crate) type WsDeviceRegistry = Arc<StdMutex<HashMap<String, crate::broadcast::ClientId>>>;
 

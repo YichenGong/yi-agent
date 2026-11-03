@@ -12,6 +12,11 @@ pub enum IpcError {
     Runtime(#[from] RuntimeCoordinatorError),
     #[error("a daemon is already running for {path}")]
     AlreadyRunning { path: PathBuf },
+    /// The database was written by a build this one does not understand. A
+    /// user-visible state, not an internal fault: the fix is to upgrade (or stop)
+    /// the other build, and the daemon must not write to it in the meantime.
+    #[error("incompatible database schema: {0}")]
+    SchemaIncompatible(String),
     #[error("plugin {plugin} is not running or does not declare a query socket")]
     PluginUnavailable { plugin: String },
     #[error("plugin {plugin} did not answer within {seconds}s")]
@@ -184,6 +189,7 @@ pub(crate) fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         | IpcError::FrameWriteTimeout { .. } => IpcErrorCode::Validation,
         IpcError::PluginUnavailable { .. } => IpcErrorCode::NotFound,
         IpcError::PluginTimeout { .. } => IpcErrorCode::InvalidState,
+        IpcError::SchemaIncompatible(_) => IpcErrorCode::InvalidState,
         IpcError::PluginRefused { .. } => IpcErrorCode::Validation,
         IpcError::Remote { code, .. } => *code,
         _ => IpcErrorCode::Internal,
@@ -204,6 +210,10 @@ pub(crate) fn repository_error_code(error: &crate::repository::RepositoryError) 
         | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. } => {
             IpcErrorCode::InvalidState
         }
+        // A schema outside this build's range is a configuration/version problem
+        // the caller must report, not an internal defect: mapping it to `Internal`
+        // would send it down the "daemon is broken, restart it" path.
+        crate::repository::RepositoryError::SchemaIncompatible { .. } => IpcErrorCode::InvalidState,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }

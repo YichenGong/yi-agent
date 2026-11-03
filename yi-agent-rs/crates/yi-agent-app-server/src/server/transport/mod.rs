@@ -28,12 +28,13 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 
 // `serve()` 的签名与函数体用到的其余名字仍由 `server.rs` 提供。
 use crate::server::{
-    BuiltAgent, ChildrenWatch, ClientInitialized, ClientScopes, DRIVER_TICK, EVICT_IDLE_AFTER,
-    LEAD_LOOP_SENDER, LEAD_TICK, POWER_TICK, ProcessWatch, RuntimeAttachments, ServeLauncher,
-    SyncAction, TraceWatch, TurnEvent, attached_runtimes, decision_label, driver_tick,
-    err_response, evict_idle_runtimes, lead_tick_once, ok_response, parse_resume_hints, plan_sync,
-    resolve_lead_target, route_client_response, settle_pending_lead_replies, store_lookup,
-    take_changed_digests, write_notification, write_response,
+    BuiltAgent, ChildrenWatch, ClientInitialized, ClientScopes, ClientShellAuthorizations,
+    DRIVER_TICK, EVICT_IDLE_AFTER, LEAD_LOOP_SENDER, LEAD_TICK, POWER_TICK, ProcessWatch,
+    RuntimeAttachments, ServeLauncher, SyncAction, TraceWatch, TurnEvent, attached_runtimes,
+    decision_label, driver_tick, err_response, evict_idle_runtimes, lead_tick_once, ok_response,
+    parse_resume_hints, plan_sync, resolve_lead_target, route_client_response,
+    settle_pending_lead_replies, store_lookup, take_changed_digests, write_notification,
+    write_response,
 };
 pub(crate) mod scoped;
 pub(crate) mod stdio;
@@ -78,6 +79,9 @@ pub(crate) async fn serve<F>(
     // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
     // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
     client_initialized: ClientInitialized,
+    // 每个客户端被告知的壳授权（见 [`ClientShellAuthorizations`]）。只有本地
+    // stdio 能写入；远端设备的自报在 `initialize` 里被拒。
+    client_shell_authorizations: ClientShellAuthorizations,
     // 合并模式下 stdio 读端关闭的信号(见 `serve_scoped_core` 里 `read_lines` 的
     // oneshot);纯 stdio / 纯 ws 传 `None`,该 `select!` 分支 `pending`。
     mut stdio_eof: Option<std::pin::Pin<Box<tokio::sync::oneshot::Receiver<()>>>>,
@@ -151,6 +155,7 @@ where
     // `initialized` 由调用方传入(共享表),理由同 `client_scopes`:断连时传输层
     // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
     let initialized = client_initialized;
+    let shell_authorizations = client_shell_authorizations;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
 
     // 保活。**唯一持有断言的进程**就是这里（spec「为什么是单一持有者」）。
@@ -425,6 +430,15 @@ where
                 // 域 handler 需要主循环的局部量;每个域臂按需构造一次
                 // [`crate::rpc::AppState`],借用到臂末(通常 `continue`)为止,故主循环
                 // 各局部量的所有权与借用关系与搬移前完全一致。
+                // 本次请求的壳授权（只有本地 stdio 的 `initialize` 写得进）。
+                // 每轮现取而不是缓存到循环外：同一连接上 `initialize` 与随后的
+                // `runtime/status` 到达顺序由客户端决定，缓存的副本可能是握手前的
+                // 空值，那样状态视图会无缘无故降级成 `Unknown`。
+                let request_shell_authorization = shell_authorizations
+                    .lock()
+                    .await
+                    .get(&client)
+                    .cloned();
                 macro_rules! app_state {
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
@@ -434,6 +448,8 @@ where
                         crate::rpc::AppState {
                             hub: &hub,
                             client: &client,
+                            is_remote: client != crate::broadcast::ClientId::local(),
+                            shell_authorization: request_shell_authorization.as_ref(),
                             client_scope,
                             cfg: &cfg,
                             theme_handle: &theme_handle,
@@ -444,6 +460,8 @@ where
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
                             resident_dir: &resident_dir,
+                            // 常驻登记目录就是实例根：迁移标记与它同处一个目录。
+                            instance_home: &resident_dir,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
                             uploads: &mut uploads,
@@ -495,6 +513,7 @@ where
                     crate::rpc::Domain::Model => dispatch_domain!(crate::rpc::model::handle),
                     crate::rpc::Domain::Onboarding => dispatch_domain!(crate::rpc::onboarding::handle),
                     crate::rpc::Domain::Resident => dispatch_domain!(crate::rpc::resident::handle),
+                    crate::rpc::Domain::Runtime => dispatch_domain!(crate::rpc::runtime::handle),
                     crate::rpc::Domain::Plugin => {
                         // 门禁（initialize / scope）已在上面同步做完；这里只把
                         // **处理** detach 出去。主循环是单 task，内联 await 会串行
@@ -559,6 +578,35 @@ where
                 match method.as_str() {
                     "initialize" => {
                         initialized.lock().await.insert(client.clone(), true);
+                        // The desktop shell stamps the local stdio handshake with
+                        // who this session speaks for. Only stdio may do so: over a
+                        // websocket the same JSON is a claim by a remote device, and
+                        // believing it would let a phone declare itself the App's
+                        // owner. A malformed or absent field is simply "no shell",
+                        // never a failed handshake.
+                        let mut accepted_shell = None;
+                        if let Some(authorization) =
+                            crate::shell_authorization::from_initialize_params(&req.params)
+                        {
+                            let is_local = client == crate::broadcast::ClientId::local();
+                            match authorization.accept(is_local) {
+                                Ok(authorization) => {
+                                    shell_authorizations
+                                        .lock()
+                                        .await
+                                        .insert(client.clone(), authorization.clone());
+                                    accepted_shell = Some(authorization.clone());
+                                }
+                                Err(reason) => {
+                                    // Not fatal: the session just has no shell
+                                    // behind it, which is the CLI's normal state.
+                                    eprintln!(
+                                        "[app-server] ignoring shell authorization from {}: {reason}",
+                                        client.as_str()
+                                    );
+                                }
+                            }
+                        }
                         // 客户端在**第一帧**声明它手上有什么（spec §4.1）：这不需要
                         // 新增往返——initialize 是连上那一刻必发的帧。仅手机端会带
                         // `resumeHints`；桌面/老客户端不带 ⇒ 空 plan，零回归。
@@ -602,22 +650,26 @@ where
                                 })
                             })
                             .collect();
-                        write_response(
-                            &hub, &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "serverInfo": {
-                                        "name": "yi-agent-app-server",
-                                        "version": env!("CARGO_PKG_VERSION"),
-                                    },
-                                    "protocolVersion": PROTOCOL_VERSION,
-                                    "capabilities": {},
-                                    "syncPlan": sync_plan,
-                                }),
-                            ),
-                        )
-                        .await?;
+                        // The handshake answers with the identity it accepted, so
+                        // "the shell was recognised" is an observable fact rather
+                        // than an internal write. A rejected or absent field is
+                        // simply omitted -- the CLI's normal shape is unchanged.
+                        let mut response = json!({
+                            "serverInfo": {
+                                "name": "yi-agent-app-server",
+                                "version": env!("CARGO_PKG_VERSION"),
+                            },
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "syncPlan": sync_plan,
+                        });
+                        if let Some(shell) = accepted_shell {
+                            response["shell"] = json!({
+                                "clientRunId": shell.client_run_id,
+                                "scopeKey": shell.scope_key,
+                            });
+                        }
+                        write_response(&hub, &client, ok_response(id, response)).await?;
                     }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))

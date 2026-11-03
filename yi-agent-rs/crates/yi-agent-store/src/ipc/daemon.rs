@@ -101,6 +101,12 @@ impl Daemon {
         let socket_path = socket_path_for(runtime_dir)?;
         let lock_path = runtime_dir.join("runtime.lock");
         let instance_lock = InstanceLock::acquire(runtime_dir, &lock_path)?;
+        // Before any recovery, orphan reclamation or `RuntimeCoordinator::open`,
+        // which all write. A database written by a newer build must be refused
+        // read-only up front: `RuntimeRepository::open` would otherwise migrate
+        // (no-op) and start rewriting rows under a schema this build does not
+        // understand.
+        yi_agent_store_schema_preflight(database_path.as_ref())?;
         // Holding the exclusive lock proves no live daemon serves this directory,
         // so any socket node still on disk was left by a killed process. `bind`
         // fails with `EADDRINUSE` on an existing path, so the stale node must go
@@ -455,6 +461,19 @@ impl Drop for Daemon {
         // explicit `stop()` performs the cooperative checkpoint protocol.
         let _ = self.stop_listener();
     }
+}
+
+/// Refuse a database this build cannot safely write, before touching it.
+///
+/// Logically `schema_compat::require_compatible`, lifted into `IpcError` so the
+/// daemon's existing error surface reports it. Kept as its own function so the
+/// ordering above is visible at the call site.
+fn yi_agent_store_schema_preflight(database_path: &Path) -> Result<(), IpcError> {
+    crate::schema_compat::require_compatible(
+        database_path,
+        crate::schema_compat::SchemaRange::supported(),
+    )
+    .map_err(|error| IpcError::SchemaIncompatible(error.to_string()))
 }
 
 pub(crate) fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
@@ -2077,6 +2096,70 @@ mod watchdog_tick_tests {
         assert!(
             !recorded_watchdog_terminal(&events, &unhydrated_task),
             "no watchdog terminal event may be recorded for an unhydrated session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_preflight_tests {
+    use super::*;
+
+    /// A future-schema database must be refused by `Daemon::start` *before*
+    /// recovery, orphan reclamation or coordinator hydration write to it.
+    ///
+    /// This is the ordering that matters: `RuntimeRepository::open` happily opens
+    /// a newer database (its `migrate` gate now refuses, but only after the WAL
+    /// pragma), and `recover_inflight_tasks` would rewrite rows under a schema this
+    /// build does not understand. Asserting on the error alone would not prove
+    /// ordering, so the test also proves the file is byte-identical afterwards.
+    #[test]
+    fn a_future_schema_database_is_refused_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let database = dir.path().join("runtime.sqlite");
+
+        // A database this build can create, then pushed one version past the top.
+        {
+            let repository = RuntimeRepository::open(&database).unwrap();
+            drop(repository);
+        }
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version) VALUES (?1)",
+                    [crate::repository::LATEST_SCHEMA_VERSION + 1],
+                )
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+
+        let error = match Daemon::start(&runtime_dir, &database) {
+            Ok(_) => panic!("a newer schema must not start a daemon"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, IpcError::SchemaIncompatible(_)),
+            "{error:?}"
+        );
+        // The category is what a client sees: `InvalidState` reads as "upgrade or
+        // stop the other build", while `Internal` would send someone hunting for a
+        // crashed daemon that is running fine.
+        assert_eq!(
+            super::error::ipc_error_code(&error),
+            IpcErrorCode::InvalidState,
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "the daemon wrote to a database it cannot understand"
+        );
+        // The pre-flight also runs before the socket is bound, so a refused start
+        // leaves nothing for the next client to mistake for a live daemon.
+        assert!(
+            !socket_path_for(&runtime_dir).unwrap().exists(),
+            "a refused start must not leave a socket behind"
         );
     }
 }

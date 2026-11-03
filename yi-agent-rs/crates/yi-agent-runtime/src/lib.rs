@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod config;
+pub mod mcp_launcher;
 pub mod migrate;
 pub mod models;
 pub mod onboarding;

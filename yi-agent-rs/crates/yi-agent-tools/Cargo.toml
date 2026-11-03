@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 yi-agent-core = { workspace = true }
+yi-agent-lifecycle = { workspace = true }
 yi-agent-skills = { workspace = true }
 
 # 异步
@@ -61,3 +62,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 rstest = "0.23"
+# The managed-spawn test runs a real guardian channel server. Dev-only: the tools
+# crate must not depend on supervisors at runtime (that would make every tool
+# build pull the process-journal machinery in).
+yi-agent-supervisors = { workspace = true }

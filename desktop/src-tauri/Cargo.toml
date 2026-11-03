@@ -16,6 +16,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Reads the sidecar's `internal-runtime identity --json` output at build time.
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -25,8 +27,9 @@ tauri-plugin-shell = "2.3.6"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # The sidecar supervisor sleeps between respawn attempts; `tauri::async_runtime`
-# has no timer, so depend on tokio's time driver directly.
-tokio = { version = "1", features = ["time"] }
+# has no timer, so depend on tokio's time driver directly. `rt` is what lets the
+# quit barrier spawn one blocking release per project and join them in parallel.
+tokio = { version = "1", features = ["time", "rt"] }
 # `bridge::home_dir` must resolve the same directory as the app (whose
 # `app.path().home_dir()` drives the sidecar's cwd) without an `AppHandle`:
 # `set_relay_url` has the handle, but the pure `configured_relay_in` used by
@@ -43,12 +46,19 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # 开关判定的唯一真源。本 crate 刻意不依赖 `yi-agent-store`（它带 bundled
 # rusqlite），所以引入它不会把 SQLite 链进桌面二进制。
 yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }
+# 生命周期控制协议。与 `yi-agent-flags` 同理，它是刻意保持轻量的 crate：只带
+# serde/libc。桌面壳**直接**持有租约与心跳（App 的身份不随 sidecar 重启改变），
+# 所以它必须是桌面自己的依赖，而不是经 supervisors 间接获得（那会拖进 SQLite）。
+yi-agent-lifecycle = { path = "../../yi-agent-rs/crates/yi-agent-lifecycle" }
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.
 tempfile = "3"
 # MockRuntime for window/run-event tests.
 tauri = { version = "2", features = ["test"] }
+# The quit-barrier tests drive a paused clock, so the deadline and the Tokio
+# timers that enforce it must read the same time source.
+tokio = { version = "1", features = ["time", "rt", "macros", "test-util"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

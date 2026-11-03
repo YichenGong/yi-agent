@@ -2,6 +2,13 @@
 mod bridge;
 #[cfg(desktop)]
 mod remote;
+/// 桌面壳持有的 runtime 租约、退出屏障。
+///
+/// 必须由壳持有而不是 sidecar：App 的身份不能随 app-server 重启改变，残留的
+/// sidecar 也不能替一个已经退出的 App 续租。
+#[cfg(desktop)]
+pub mod runtime_lifecycle;
+mod runtime_manifest;
 #[cfg(desktop)]
 pub mod window;
 
@@ -50,9 +57,22 @@ pub fn run() {
             bridge::remote_enabled,
             bridge::remote_list,
             bridge::remote_upsert,
-            bridge::remote_remove
+            bridge::remote_remove,
+            runtime_lifecycle::runtime_acquire_project,
+            runtime_lifecycle::runtime_release_project,
+            runtime_lifecycle::runtime_registered_projects,
+            runtime_lifecycle::runtime_quit_outcome,
+            runtime_lifecycle::runtime_status,
+            runtime_lifecycle::runtime_preview,
+            runtime_lifecycle::runtime_confirm,
+            runtime_lifecycle::runtime_operation,
+            runtime_lifecycle::runtime_active_operation,
+            runtime_lifecycle::runtime_known_scopes,
+            runtime_lifecycle::runtime_scope_for_project
         ])
         .setup(|app| {
+            // 先装生命周期状态：`spawn` 起的监督循环与窗口事件都可能立刻用到它。
+            runtime_lifecycle::install(app.handle());
             bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;
             // Sizing is cosmetic: log and continue rather than fail launch.
             if let Err(err) = window::fit_main_window(app.handle()) {
@@ -65,11 +85,17 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // Closing the main window hides it instead of quitting, so the app keeps
-    // running in the Dock like every other Mac app. `Reopen` (the Dock click)
-    // only exists on macOS; elsewhere the framework default is correct.
-    #[cfg(target_os = "macos")]
-    app.run(|app, event| window::handle_run_event(app, &event));
-    #[cfg(not(target_os = "macos"))]
-    app.run(|_app, _event| {});
+    // Two policies run on every platform:
+    //
+    // * Closing the main window hides it instead of quitting, so the app keeps
+    //   running in the Dock like every other Mac app. `Reopen` (the Dock click)
+    //   only exists on macOS.
+    // * A real quit (`Cmd+Q`, Dock → Quit, or the framework's own exit) first
+    //   releases every project's runtime lease, in parallel, under one budget.
+    //   The drain is platform-independent: other platforms exit for real.
+    app.run(|app, event| {
+        runtime_lifecycle::handle_run_event(app, &event);
+        #[cfg(target_os = "macos")]
+        window::handle_run_event(app, &event);
+    });
 }

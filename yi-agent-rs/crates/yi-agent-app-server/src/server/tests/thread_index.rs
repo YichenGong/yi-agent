@@ -429,6 +429,8 @@ async fn unknown_method_returns_method_not_found() {
         ("agent/trace/read", Domain::Agent),
         ("agent/trace/unwatch", Domain::Agent),
         ("agent/trace/watch", Domain::Agent),
+        // ---- Runtime（只读运行时状态） ----
+        ("runtime/status", Domain::Runtime),
     ] {
         assert_eq!(
             domain_for(method),

@@ -5,9 +5,11 @@
 //! 在本 crate 内实现。
 
 pub mod ipc;
+pub mod lifecycle;
 pub mod paths;
 pub mod repository;
 pub mod resident;
 pub mod runtime;
 pub mod schedule;
+pub mod schema_compat;
 pub mod terminal;
