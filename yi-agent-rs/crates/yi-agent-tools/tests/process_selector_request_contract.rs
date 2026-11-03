@@ -102,11 +102,19 @@ async fn process_selector_request_contract() {
             let tool = tools
                 .iter()
                 .find(|tool| {
-                    let definition = if style == "chat" { &tool["function"] } else { tool };
+                    let definition = if style == "chat" {
+                        &tool["function"]
+                    } else {
+                        tool
+                    };
                     definition["name"] == name
                 })
                 .expect("both tools transmitted");
-            let definition = if style == "chat" { &tool["function"] } else { tool };
+            let definition = if style == "chat" {
+                &tool["function"]
+            } else {
+                tool
+            };
             let schema = if style == "anthropic" {
                 &definition["input_schema"]
             } else {
@@ -114,11 +122,7 @@ async fn process_selector_request_contract() {
             };
 
             assert_eq!(schema["type"], "object", "{style}/{name}");
-            assert_eq!(
-                schema["required"],
-                serde_json::json!([]),
-                "{style}/{name}"
-            );
+            assert_eq!(schema["required"], serde_json::json!([]), "{style}/{name}");
             assert_ne!(definition["strict"], true, "strict unexpectedly enabled");
 
             let description = definition["description"].as_str().unwrap();
