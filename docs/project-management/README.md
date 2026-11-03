@@ -11,7 +11,7 @@
 |---|---|---|
 | yi-agent-core | 23 / 25 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
-| yi-agent-tools | 22 / 23 | [详情](./yi-agent-tools.md) |
+| yi-agent-tools | 21 / 23 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
 | yi-agent-tui | 44 / 46 | [详情](./yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
