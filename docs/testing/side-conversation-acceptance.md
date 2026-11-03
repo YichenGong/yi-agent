@@ -32,10 +32,15 @@ unset YI_AGENT_THREAD_ID YI_AGENT_SESSION   # tools 的 bash 用例对宿主变�
 | 前端构建 | `cd desktop && npm run build` | 通过 |
 | 桌面图 | `just desktop-check` | 通过 |
 
-`just ci` 的 16 道 recipe 本地逐项跑过均 OK（fmt-check / lint / build / bindings-check /
-secret-check / mspt-check 系列 / audit 等）。一次性 `just ci` 的 `test` 步骤曾被系统
-SIGKILL（同期另一 worktree 在编译，属资源竞争而非用例失败），因此以「分 crate nextest
-+ 逐项 recipe」作为等价证据记录在此。
+**完整 `just ci` 已一次跑通：`EXIT=0`，末行 `CI passed`**，其中
+`cargo nextest run --all-features --workspace --profile ci` 为
+`4372 tests run: 4372 passed, 28 skipped`，`just ci` 的其余 15 道门禁
+（fmt-check / lint / build / bindings-check / secret-check / 版本与 release 检查 /
+msrv-check / audit 等）全部通过；`audit` 用本地缓存的 advisory-db（日志已明确
+告警「结论基于过期数据」，nightly job 会重跑）。
+
+早前一次性 `just ci` 的 `test` 步骤曾被系统 SIGKILL（同期另一 worktree 在编译，
+属资源竞争而非用例失败），本轮重跑未复现。
 
 ## 2. 自动矩阵覆盖（spec §11）
 
@@ -60,6 +65,25 @@ SIGKILL（同期另一 worktree 在编译，属资源竞争而非用例失败）
 | 无 capability 旧 server 隐藏所有入口 | `hides every side entry when the host lacks the capability` | 通过 |
 | TUI：审批命令模式 Enter 不批准 | `parent_approval_command_mode_does_not_approve_on_enter` | 通过 |
 | TUI：旁支正文不落父 TurnLog | `side_events_never_reach_main_turn_log`（真实 `TuiSessionStore`） | 通过 |
+
+### 2.1 同宿主双端 / 断线重连（计划 Task 21 自动矩阵）
+
+| 场景 | 落点 | 状态 |
+| --- | --- | --- |
+| 两个连接 open 同一父 → 同一 side id / host instance id | `side_open_from_two_connections_shares_one_host_instance_id` | 通过 |
+| 一个连接的 snapshot token 不能用于另一个连接 | `side_snapshot_token_does_not_cross_connections` | 通过 |
+| 握手通告 capability 与 host id | `side_initialize_advertises_capability_and_a_host_id` | 通过 |
+| 断线重连后按 list + 快照对账，不重复 open | `does not call open or renew the token while reconciling`、`keeps an existing view and marks it unsynced when the reconnect list fails` | 通过 |
+| 重连后序号有洞 → 重新对账而非跳过 | `re-reconciles instead of skipping a gap`、`re-reconciles when the cache itself has a hole` | 通过 |
+| 更早 generation 的迟到帧被丢弃 | `drops frames from an older generation`、`ignores an older generation reported after a newer one was seen` | 通过 |
+| closed 帧立即生效，不等缺失序号 | `applies a closed frame without waiting for missing numbers` | 通过 |
+| 未确定提交用同一 request id 重试 | `retries uncertain submission with the same request id`、`confirms an uncertain submission via accepted_requests` | 通过 |
+| 旧回包不清掉更新的编辑 | `does not overwrite newer edits when restoring a rejected question` | 通过 |
+| 后台不轮询、可见时轮询 list | `polls list while visible and stops in the background` | 通过 |
+| 不同 side id 不互相串 | `keeps distinct side ids under one host apart` | 通过 |
+
+以上都是「同宿主、双客户端/重连」的确定性用例，用显式帧与失败注入而非 sleep。
+真实 relay + 两台设备的端到端仍在第 3 节人工验收里，不能由这些替代。
 
 ## 3. 人工验收（**未执行**）
 
