@@ -343,7 +343,14 @@ JSON
     enable(workdir, "superpowers_kanban");
 
     // 启动时的校准：用插件自述覆盖旧快照。
-    let refreshed = yi_agent_supervisors::refresh::refresh_from_plugins(&layout.manifests_dir());
+    // The property is "a stale snapshot is replaced by the plugin's own
+    // description", not "this machine cold-starts `sh` within 15 s": under a full
+    // parallel run the same describe has taken longer than the production budget
+    // and come back `Skipped(Timeout)` (observed 2026-11-04).
+    let refreshed = yi_agent_supervisors::refresh::refresh_from_plugins_with_budget(
+        &layout.manifests_dir(),
+        std::time::Duration::from_secs(120),
+    );
     assert_eq!(
         refreshed,
         vec![yi_agent_supervisors::refresh::RefreshOutcome::Refreshed(

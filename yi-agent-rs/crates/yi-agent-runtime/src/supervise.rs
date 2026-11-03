@@ -139,7 +139,13 @@ pub fn serve_with_environment(
     flags_path: Option<std::path::PathBuf>,
     build_kind: Option<&str>,
 ) -> SuperviseHandle {
-    serve_inner(workdir, runtime_dir, flags_path, build_kind, true)
+    serve_inner(
+        workdir,
+        runtime_dir,
+        flags_path,
+        build_kind,
+        Some(yi_agent_supervisors::refresh::PRODUCTION_DESCRIBE_TIMEOUT),
+    )
 }
 
 /// 与 [`serve_with_environment`] 相同，但**跳过**启动时的清单校准。
@@ -155,7 +161,34 @@ pub fn serve_without_manifest_refresh(
     flags_path: Option<std::path::PathBuf>,
     build_kind: Option<&str>,
 ) -> SuperviseHandle {
-    serve_inner(workdir, runtime_dir, flags_path, build_kind, false)
+    serve_inner(workdir, runtime_dir, flags_path, build_kind, None)
+}
+
+/// [`serve_with_environment`], but with the startup description budget spelled out.
+///
+/// Same rule as [`serve_without_manifest_refresh`]: a seam for tests, not a
+/// `#[cfg(test)]` branch, because the tests that need it are integration tests of
+/// this crate compiled against the ordinary library.
+///
+/// The one caller uses it to prove that a slow plugin holds up only itself. With
+/// the production budget that test also graded how fast this machine starts a
+/// plugin: under a full parallel run the *second* plugin's description was the one
+/// that ran past 15 s, and the assertion failed on a situation the test was not
+/// about (observed 2026-11-04).
+pub fn serve_with_manifest_budget(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+    describe_timeout: std::time::Duration,
+) -> SuperviseHandle {
+    serve_inner(
+        workdir,
+        runtime_dir,
+        flags_path,
+        build_kind,
+        Some(describe_timeout),
+    )
 }
 
 fn serve_inner(
@@ -163,7 +196,8 @@ fn serve_inner(
     runtime_dir: &Path,
     flags_path: Option<std::path::PathBuf>,
     build_kind: Option<&str>,
-    refresh_manifests: bool,
+    // The startup description budget; `None` means "do not refresh at all".
+    describe_timeout: Option<std::time::Duration>,
 ) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -187,10 +221,12 @@ fn serve_inner(
             // 停止请求必须传进去：一次卡住的自述会让 handle 的 join 白等满
             // 15 秒（后代持写端时更久）。刷新在 catch 之内，所以它在展开路上
             // 留下的资源也由执行器的 guard 收口。
-            if refresh_manifests {
-                yi_agent_supervisors::refresh::refresh_and_log_until(dir, || {
-                    stop.load(Ordering::SeqCst)
-                });
+            if let Some(describe_timeout) = describe_timeout {
+                yi_agent_supervisors::refresh::refresh_and_log_with_budget(
+                    dir,
+                    describe_timeout,
+                    || stop.load(Ordering::SeqCst),
+                );
             }
         });
     });
@@ -341,6 +377,20 @@ mod tests {
     /// 「子进程会被拉起」，固定 3s 却把「机器有多空」写了进去。20s 是 backstop：
     /// 正常情况毫秒级返回，只有真的永不成立才会走满。
     const SETTLE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// 观测「被测进程已按前置条件启动」的预算，只用于**前置条件**，不用于被测性质。
+    ///
+    /// 与 [`SETTLE_BUDGET`] 同一类问题、更极端的一档：`stopping/dropping_during_
+    /// manifest_refresh_joins_promptly` 要先证明插件真的进了自述阶段，再去测
+    /// 「停止能在 2s 内 join 回来」。前置条件要拉起一个 `python3` 子进程，而全量
+    /// nextest 是每测试一进程 + 三个 crate 二进制并发，实测（2026-11-04）两个 crate
+    /// 一起跑时恰好 20.03s 走满，单跑同一条只要 0.44s。失败信息会指向
+    /// 「插件没进自述阶段」，与被测的停机语义无关。
+    ///
+    /// 不能用「宽一点」糊过去：把被测性质也放进同一个预算，就等于又按机器速度打分。
+    /// 所以这里只放宽前置条件，`recv_timeout(2s)` 保持原样——停止必须立即生效，
+    /// 那条断言本身就是被测属性。
+    const SPAWN_BUDGET: Duration = Duration::from_secs(120);
 
     fn wait_for(path: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -593,7 +643,7 @@ mod tests {
         // 先证明 child 真的进入了自述阶段，再要求停止——否则这条用例可能在
         // 「还没来得及卡住」就通过。
         assert!(
-            wait_for(&a.manifest_marker, SETTLE_BUDGET),
+            wait_for(&a.manifest_marker, SPAWN_BUDGET),
             "the plugin must reach its manifest phase before we stop"
         );
         let (tx, rx) = std::sync::mpsc::channel();
@@ -647,12 +697,24 @@ mod tests {
         let a_before = std::fs::read(&a.stored).unwrap();
         let b_before = std::fs::read(&b.stored).unwrap();
         let scope = scope_of(fixture.workdir());
-        let handle = serve_with_environment(fixture.workdir(), &scope, Some(flags), Some("dev"));
+        // A budget that outlives machine noise but still expires: the slow plugin
+        // has to run out of it before the second one starts. The production 15 s
+        // made this test also grade how fast `sh` cold-starts here -- under a full
+        // parallel run the *second* plugin's description was the one that went over,
+        // and the failure said nothing about the ordering being checked.
+        let handle = serve_with_manifest_budget(
+            fixture.workdir(),
+            &scope,
+            Some(flags),
+            Some("dev"),
+            Duration::from_secs(30),
+        );
 
-        // 外层至少 40 秒：a 要走满生产的 15 秒，再给 b 的自述 + 对账留足余量。
-        let outer = Instant::now() + Duration::from_secs(45);
+        // Outer ceiling: the slow description must run out of its 30 s, plus room
+        // for the second plugin's description and a reconcile pass.
+        let outer = Instant::now() + Duration::from_secs(90);
         assert!(
-            wait_for(&b.run_marker, Duration::from_secs(45)),
+            wait_for(&b.run_marker, Duration::from_secs(90)),
             "the later plugin must still be started after a slow description"
         );
         assert!(Instant::now() < outer);
