@@ -518,8 +518,9 @@ h.shutdown().await;
 
 **Interfaces:** Consumes 所有交付；Produces K1–K17 证据表、独立实例验收记录。只有相关 tests 与真机全部通过才把 bug/feature 勾 [x] 并将索引 19/21 更新为实际计数（本特性完成后预计 20/21；实施时按实际条目重算）。
 
-- [ ] Step 1：更新文档前核对 pending/results 故障测试记录、模块实际 feature 计数与实现位置。保存一张证据表：case、测试函数/命令、退出码、对应 commit、真机是否通过；未跑不得写通过。
-- [ ] Step 2：执行完整 mock 门禁并记录日志：
+- [x] Step 1：更新文档前核对 pending/results 故障测试记录、模块实际 feature 计数与实现位置。保存一张证据表：case、测试函数/命令、退出码、对应 commit、真机是否通过；未跑不得写通过。
+  - 结果：`.superpowers/sdd/2026-11-03-kanban-stale-observation-impl/evidence.md`，K1–K17 共 17 行，每条列测试函数与 commit；真机列如实写 `pending`（未跑），未把任何一条标为真机通过。
+- [x] Step 2：执行完整 mock 门禁并记录日志（2026-11-03）：
 
 ```sh
 (cd yi-agent-rs && cargo fmt --all && just ci) &&
@@ -528,12 +529,66 @@ h.shutdown().await;
 git diff --check
 ```
 
+  - 结果：`just ci` → `CI passed`（nextest 4082 passed / 28 skipped，含 msrv 1.89、audit 仅 1 条豁免 yanked 警告、secret-check、bindings-check）；`superpowers-kanban-runner` 267 + 48、`superpowers-kanban-ipc` 30、`tsc --noEmit` 干净、`vitest run` 2063 / 153 全绿、`git diff --check` 干净。rust-version 与 Cargo.lock 未变动，新增 DTO 未触碰 `protocol.rs` 或 ts-rs 产物。
 运行全量桌面 tests，含看板原会话链接和合并角标；CI 若缺 ignored real keys 不去调用。检查 rust-version/lock 无变动，新增 DTO 不需要改 protocol.rs 或 ts-rs generated；不得借本任务引入无关 bindings 漂移。
-- [ ] Step 3：混装 fixture 测试矩阵：新 runner 接 legacy_request、旧 list 载荷喂新 UI、含新字段请求喂未接 loaded 的旧判定替身、缺新字段 typed driver_step wrapper。验证不崩溃/不丢 result，明确旧 UI 文案不在保证中，不能为“混装全绿”删除限制造假。
-- [ ] Step 4：按项目 CLAUDE.md 的独立 App 打包流程：新 bundle identifier、绝对 YI_AGENT_HOME、worktree sidecar 资源、先 npm build 再 tauri bundle、sidecar→desktop→app 三层签名。用独立插件二进制/skill 与独立项目状态目录，必须核对进程参数没有生产 relay/session 串用；不直接覆盖 /Applications/yi-agent.app 或 /opt/homebrew/bin/superpowers-kanban。
-- [ ] Step 5：隔离实例人工验收：合法卡与历史准备后重启宿主，观察原卡未加载语义；手动打开原 thread，下一成功 tick 不再 warning；没有额外 turn/新 ID；热表移除但保留历史后只提示未加载。再用旧载荷确认新 UI 只说未观测到。记录完整日期标签、原会话按钮、当前宿主范围；过程不修改生产卡、不为清角标写 done。无真机可用时状态保持未完成并列出缺失验收，不宣称完成。
-- [ ] Step 6：证据齐全后更新 docs 和计数，执行统一门禁，提交 `docs(kanban): record loading-observation repair verification`。只在获授权后使用 finishing-a-development-branch 流程整合；若是看板卡执行，本会话仅 merge-request 等 daemon 持名额，不绕过 merge.lock 自己 merge。
-- [ ] Step 7：合并结果再 `just ci`、runner/IPC tests、桌面 tests。确认无需增量开发后按项目要求先 dry-run/看占用/确认无编译进程，再清自己的 target 和 worktree，不删除别人的开发树。
+- [x] Step 3：混装 fixture 测试矩阵（2026-11-03）：新 runner 接 legacy_request、旧 list 载荷喂新 UI、含新字段请求喂未接 loaded 的旧判定替身、缺新字段 typed driver_step wrapper。  - 结果：`kanban_observation_legacy_host_request_still_drives_the_board`、`kanban_observation_new_host_snapshot_beats_a_conflicting_legacy_list`、`kanban_observation_contract_samples_parse_both_ways`、`kanban_observation_legacy_defaults_and_explicit_alive`（含「缺新字段的 typed wrapper」）、`kanban_observation_dispatch_reports_absence_without_moving_the_card` 及桌面 `SuperpowersKanbanCard.test.tsx` 的 legacy `stale` 行全绿；限制性行为未删（旧 UI 文案不在保证中已写进 SKILL.md 升级矩阵）。
+- [ ] Step 4（未执行）：按项目 CLAUDE.md 的独立 App 打包流程：新 bundle identifier、绝对 YI_AGENT_HOME、worktree sidecar 资源、先 npm build 再 tauri bundle、sidecar→desktop→app 三层签名。用独立插件二进制/skill 与独立项目状态目录，必须核对进程参数没有生产 relay/session 串用；不直接覆盖 /Applications/yi-agent.app 或 /opt/homebrew/bin/superpowers-kanban。
+- [ ] Step 5（未执行，缺真机）：隔离实例人工验收：合法卡与历史准备后重启宿主，观察原卡未加载语义；手动打开原 thread，下一成功 tick 不再 warning；没有额外 turn/新 ID；热表移除但保留历史后只提示未加载。再用旧载荷确认新 UI 只说未观测到。记录完整日期标签、原会话按钮、当前宿主范围；过程不修改生产卡、不为清角标写 done。无真机可用时状态保持未完成并列出缺失验收，不宣称完成。
+- [ ] Step 6（部分完成）：证据齐全后更新 docs 和计数，执行统一门禁，提交 `docs(kanban): record loading-observation repair verification`。只在获授权后使用 finishing-a-development-branch 流程整合；若是看板卡执行，本会话仅 merge-request 等 daemon 持名额，不绕过 merge.lock 自己 merge。
+- [ ] Step 7（待合并后）：合并结果再 `just ci`、runner/IPC tests、桌面 tests。确认无需增量开发后按项目要求先 dry-run/看占用/确认无编译进程，再清自己的 target 和 worktree，不删除别人的开发树。
+
+### 验收记录（2026-11-03，未宣称完成）
+
+已做，且以真实产物核对，而不是只看测试名：
+
+1. **真实插件二进制 CLI 投影**（`plugins/superpowers-kanban/target/debug/superpowers-kanban list`，
+   真实 `board.json` + `observations.json` fixture，独立临时项目目录）：
+   - `session_observation=not_loaded` + 合法 `observed_at` → `[stale] 当前宿主未加载（截至 2026-11-03T17:20:00+08:00；历史可能仍存在）`；
+   - `loaded` → 无角标；
+   - 旧格式只有 `alive:false` → `[observation unknown] 当前宿主未观测到（历史可能仍存在）`，不落 `[stale]`；
+   - 无 `observations.json` → 同样 `unknown`；
+   - `not_loaded` 但 `observed_at` 为不存在的日期（`2026-02-30`）或枚举值不认识（`dead`）→ 退回 `unknown`，不编造「截至」时间。
+2. **计数器实算**：`docs/project-management/superpowers-kanban.md` 实际 `[x]` 19 条 / `[ ]` 2 条，
+   故索引维持 **19 / 21**，未按计划里「预计 20/21」的预估勾任何一条。
+3. **插件独立跑不动是有意的**：脱离宿主直接 `run` 时 daemon 探测判活失败即退出
+   （`main.rs` 的 `liveness.observe`），所以真机验收必须在宿主里做，不能靠裸跑插件代替。
+
+未做（因此 K 行与 feature/bug 条目均保持未勾）：Step 4 的独立 bundle 打包（新 bundle id、绝对
+`YI_AGENT_HOME`、三层签名）与 Step 5 的真机矩阵——真实宿主重启后原卡未加载语义、手动打开原
+thread 后下一 tick 角标消失、无额外 turn / 无新 thread ID、热表移除但保留历史只提示未加载、
+旧载荷下新 UI 只说未观测到。缺这些就不写 `docs(kanban): record loading-observation repair
+verification` 之外的完成结论。
+
+
+#### K1–K17 证据表（2026-11-03）
+
+「真机」列只有 `pass` 与 `pending` 两种：`pending` = 需要在隔离实例上人工验收（Step 5），
+**未跑**。因此任何一行都没有因为自动化测试通过就被写成真机通过。
+
+| K | Claim | Test / command | Exit | Commit | Machine |
+|---|---|---|---|---|---|
+| K1 | Empty `drivers`, hot table has the card's ID: real tick sends the complete snapshot; `list` = loaded, stale=false; ID and card fields unchanged | `cargo test -p yi-agent-app-server --lib kanban_observation_empty_driver_state_keeps_loaded_card` | 0 | `d97c7fa7` | pass |
+| K2 | Real plain `thread/resume` restores the same ID: discovered, no Launch, no extra model turn | `cargo test -p yi-agent-app-server --lib kanban_observation_plain_rpc_resume_is_discovered` | 0 | `dd34f0f8` | pass |
+| K3 | Legacy subset says dead, complete snapshot says loaded: the complete snapshot wins, `idle` from it | `cargo test -p superpowers-kanban-runner --lib`（`kanban_observation_complete_overrides_stale_subset`、`kanban_observation_complete_beats_conflicting_legacy_alive`、`kanban_observation_complete_absence_is_not_loaded_and_not_idle`） | 0 | `a7d231d2` | pass |
+| K4 | idle loaded / busy / AwaitingApproval all count as `loaded`; busy not preempted; `running` count keeps the old rule | `cargo test -p yi-agent-app-server --lib kanban_observation_snapshot_idle_counts_only_idle_without_a_turn`; `cargo test -p yi-agent-app-server --lib -- is_a_running_session` | 0 | `0ee0669f` | pass |
+| K5 | Hot table drops the ID, history remains: `not_loaded`, wording never claims the history is gone, thread link kept | `cargo test -p superpowers-kanban-runner --lib kanban_observation_forgotten_hot_thread_keeps_card_binding_and_history`; `cargo test -p superpowers-kanban-runner --lib kanban_observation_cli_not_loaded_names_the_observation_time` | 0 | `dd34f0f8`, `d6b77a47` | pass |
+| K6 | After a host restart, before any restore: only a fresh complete empty snapshot yields `not_loaded`; old `alive:false` or no report yields `unknown` | `cargo test -p superpowers-kanban-runner --lib kanban_observation_old_false_without_a_fresh_report_is_unknown`; `... kanban_observation_dropped_from_legacy_report_becomes_unknown`; `... kanban_observation_empty_complete_is_not_legacy` | 0 | `a7d231d2` | pass |
+| K7 | Multi-project / multi-plugin / plain sessions: own IDs match, unrelated IDs are not persisted, opaque `driver_ref` owner is not guessed | `cargo test -p superpowers-kanban-runner --lib kanban_observation_prunes_unrelated_and_never_mutates_previous`; `... kanban_observation_never_seen_and_unmentioned_is_not_inserted` | 0 | `a7d231d2` | pass |
+| K8 | Old host / old runner / old UI combinations do not crash or drop results; new UI on an old runner says only "not observed"; old UI's hard-coded text is out of scope | `cargo test -p superpowers-kanban-runner --lib kanban_observation_legacy_host_request_still_drives_the_board`; `... kanban_observation_new_host_snapshot_beats_a_conflicting_legacy_list`; `... kanban_observation_contract_samples_parse_both_ways`; `cd desktop && npx vitest run src/components/SuperpowersKanbanCard.test.tsx` (legacy `stale` row) | 0 | `b018424e`, `3780572e` | pass |
+| K9 | Illegal / duplicate / missing-field complete snapshots are refused without consuming results, dispatching, or overwriting a valid bypass; a corrected retry succeeds | `cargo test -p superpowers-kanban-runner --lib kanban_observation_invalid_complete_is_rejected`; `... kanban_observation_bad_snapshot_is_rejected_before_any_effect`; `... kanban_observation_bad_new_fields_preserve_other_ids` | 0 | `3780572e`, `ebbb4167` | pass |
+| K10 | Query failure, corrupt bypass, missing or illegal time: no fabricated report, death, or date; unknown / historical semantics stay explicit | `cargo test -p superpowers-kanban-runner --lib kanban_observation_unknown_state_or_bad_date_is_unknown`; `... kanban_observation_corrupt_board_is_rejected_before_saving`; `cd desktop && npx vitest run src/lib/kanbanObservation.test.ts` | 0 | `a7d231d2`, `ebbb4167`, `9ea3eebc` | pass |
+| K11 | Lease and merge regressions: an observed hot card reuses or re-adopts exactly one lease; no duplicate quota; not-loaded / unknown never releases an uncertain merge attempt | `cargo test -p superpowers-kanban-runner --lib kanban_observation_zero_budget_still_adopts_exactly_one_lease`; `... kanban_observation_merge_attempt_keeps_its_lease`; `... kanban_observation_accepted_idle_waits_one_tick` | 0 | `dd34f0f8`, `ebbb4167` | pass |
+| K12 | Timestamp refreshes every tick while the session stays idle: the UI says "last observed as loaded", never "last activity"; cross-day times show the date | `cargo test -p superpowers-kanban-runner --lib kanban_observation_repeated_loaded_refreshes_only_the_observation_time`; `... kanban_observation_presentation_time_is_the_snapshot_time`; `cd desktop && npx vitest run src/lib/kanbanObservation.test.ts` | 0 | `a7d231d2`, `9ea3eebc` | pass |
+| K13 | Repair control: deleting the production or the consumption side of the complete snapshot turns K1–K3 red; restoring turns them green | Mutation runs recorded in `task-7-report.md` (host encoding removed -> 4 FAILED; `normalize` ignoring complete -> 9 FAILED; pre-save removed -> 6 FAILED) | 0 | `dd34f0f8` | pass |
+| K14 | Bypass write failure, or unreadable board / attempt: refused before consuming; pending / results / lease / tick / gate unchanged; no dispatch; after the fault clears the same results are consumed once | `cargo test -p superpowers-kanban-runner --lib kanban_observation_save_failure_consumes_nothing`; `... kanban_observation_corrupt_attempt_is_rejected_before_any_effect`; `... kanban_observation_corrupt_board_is_rejected_before_saving` | 0 | `ebbb4167` | pass |
+| K15 | Old report missing `alive`, or a partially corrupt new display field: never fabricates loaded or a fresh last-loaded time; only that ID's display degrades, other IDs and scheduling data survive | `cargo test -p superpowers-kanban-runner --lib kanban_observation_missing_alive_does_not_fabricate_a_report`; `... kanban_observation_bad_new_fields_preserve_other_ids`; `cd desktop && npx vitest run src/lib/superpowersKanbanState.test.ts` | 0 | `a7d231d2`, `9ea3eebc` | pass |
+| K16 | Same-tick matched result, orphan / origin IDs, archive and purge: a successful result's ID is observed before the binding lands; stranger results do not spread; an archived hot card still reconciles; purge only clears without an in-flight reference | `cargo test -p superpowers-kanban-runner --lib kanban_observation_observes_a_launch_before_the_binding_lands`; `... kanban_observation_archived_card_still_holds_its_lease`; `... kanban_observation_purge_drops_only_unreferenced_observations`; `... kanban_observation_ignores_a_stranger_action_id` | 0 | `ebbb4167`, `dd34f0f8` | pass |
+| K17 | Beyond the existing IPC frame limit: an explicit transport error, the complete snapshot is neither truncated nor elided, results survive, no action, no fake `not_loaded` | `cargo test -p yi-agent-store --lib kanban_observation_oversized_snapshot_is_refused_not_truncated` | 0 | `d97c7fa7` | pass |
+
+尚未验证的部分（正是它挡住 `[x]`）：Step 5 的隔离实例矩阵——独立 bundle（新 bundle id +
+绝对 `YI_AGENT_HOME`）下真实宿主重启后原卡未加载语义、手动打开原 thread 后下一拍角标消失、
+无额外 turn / 无新 thread ID、热表移除但保留历史只提示未加载、旧载荷下新 UI 只说未观测到。
+
 
 ## Spec 覆盖与复核
 
