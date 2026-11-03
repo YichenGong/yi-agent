@@ -135,11 +135,19 @@ fn the_plugin_page_is_not_covered_by_any_capability() {
     // `main`，所以它们拿不到任何放行。这条断言是“插件窗口不被任何 capability
     // 覆盖”的机械保证——只要有人给 capability 加了通配窗口，测试就红。
     let source = capability_source();
-    assert!(
-        !source.contains("\"*\"") && !source.contains("plugin-") && !source.contains("probe-"),
-        "a capability now targets a wildcard or a plugin window; the plugin page \
-         would inherit host commands. Capabilities must stay scoped to `main`."
-    );
+    // 只看 `windows` 数组。权限名里出现 `plugin-`（例如
+    // `allow-open-plugin-view`）是正常的；关键是被覆盖的窗口标签。
+    let start = source.find("\"windows\"").expect("windows key");
+    let rest = &source[start..];
+    let end = rest.find(']').expect("unterminated windows array");
+    let windows = &rest[..end];
+    for forbidden in ["\"*\"", "plugin-", "probe-"] {
+        assert!(
+            !windows.contains(forbidden),
+            "the capability targets {forbidden}; the plugin page would inherit host \
+             commands. Capabilities must stay scoped to `main`. Got: {windows}"
+        );
+    }
 }
 
 #[test]

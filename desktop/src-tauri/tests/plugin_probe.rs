@@ -295,6 +295,31 @@ fn the_container_config_digest_changes_with_the_csp() {
     assert_eq!(strict.recovery, RecoveryPolicy::CloseAndRebuild);
 }
 
+/// 探针与生产容器必须是同一份描述。
+///
+/// 如果 `probe::ContainerConfig` 是生产 `container::ContainerConfig` 的副本，
+/// 那么"探针 12/12 通过"描述的是另一个策略；报告里的
+/// `containerConfigSha256` 也就失去意义。这条测试把两者钉成同一个类型。
+#[test]
+fn the_probe_reuses_the_production_container_policy() {
+    let from_probe = desktop_lib::plugin_host::probe::ContainerConfig::default();
+    let from_production = desktop_lib::plugin_host::container::ContainerConfig::default();
+    assert_eq!(from_probe, from_production);
+    assert_eq!(
+        desktop_lib::plugin_host::probe::ContainerConfig::strict_csp(),
+        desktop_lib::plugin_host::container::ContainerConfig::strict_csp()
+    );
+    // 与主窗口的策略不同：视图不允许任何网络，也不允许被嵌入。
+    assert_ne!(
+        desktop_lib::plugin_host::host::view_csp(),
+        String::new(),
+        "the view policy must exist"
+    );
+    let production = desktop_lib::plugin_host::container::ContainerConfig::default();
+    assert!(!production.allow_remote_network);
+    assert!(production.csp.contains("frame-src 'none'"));
+}
+
 #[test]
 fn the_bootstrap_script_quotes_the_nonce() {
     let script = bootstrap_script("a\"b", "frame-a");

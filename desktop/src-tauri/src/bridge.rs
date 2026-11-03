@@ -420,7 +420,10 @@ fn instance_home_from(
 }
 
 /// 进程级的实例状态根：`YI_AGENT_HOME` 环境变量 + `dirs::home_dir()`。
-fn instance_home() -> Option<PathBuf> {
+///
+/// `pub(crate)`：`plugin_host::host` 要用同一个根去解析插件安装目录，
+/// 两处各写一份解析规则迟早会分叉。
+pub(crate) fn instance_home() -> Option<PathBuf> {
     let override_value = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty());
     instance_home_from(override_value.as_deref(), home_dir().as_deref())
 }

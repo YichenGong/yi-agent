@@ -22,6 +22,9 @@
     "allow-restart-sidecar",
     "allow-rpc",
     "allow-rpc-respond",
-    "allow-set-relay-url"
+    "allow-set-relay-url",
+    "allow-open-plugin-view",
+    "allow-close-plugin-view",
+    "allow-plugin-committed-activation"
   ]
 }

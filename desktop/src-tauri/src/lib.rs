@@ -1,6 +1,8 @@
 #[cfg(desktop)]
 mod bridge;
-#[cfg(all(desktop, feature = "plugin-probe"))]
+// 正式容器与探针共用这一个入口：容器本身始终编译，`probe`/`run` 子模块
+// 由 `plugin-probe` feature 单独门控（见 `plugin_host/mod.rs`）。
+#[cfg(desktop)]
 pub mod plugin_host;
 #[cfg(desktop)]
 mod remote;
@@ -54,10 +56,18 @@ pub fn run() {
     // 桌面端自带 app-server 侧车（经 stdio 驱动）；iOS 是纯 WebSocket 客户端，
     // **没有侧车**（见 `desktop/src/transportFactory.ts`）。故侧车管理只在桌面注册，
     // 否则 iOS 构建会去找一个它用不上的 externalBin（并试图 spawn 它）。
+    // 宿主状态先拿到手：`manage` 之后从 Builder 上取不回来，而注册协议需要
+    // 同一个实例。
+    #[cfg(desktop)]
+    let plugin_host_state = plugin_host::host_state();
+
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .manage(bridge::Sidecar::new())
+        // 宿主状态与资源协议都要在 Builder 阶段就位：协议注册是 Builder
+        // 方法，且窗口创建后禁止再注册。
+        .manage(std::sync::Arc::clone(&plugin_host_state))
         .invoke_handler(tauri::generate_handler![
             bridge::rpc,
             bridge::rpc_respond,
@@ -70,7 +80,10 @@ pub fn run() {
             bridge::remote_enabled,
             bridge::remote_list,
             bridge::remote_upsert,
-            bridge::remote_remove
+            bridge::remote_remove,
+            plugin_host::host::open_plugin_view,
+            plugin_host::host::close_plugin_view,
+            plugin_host::host::plugin_committed_activation
         ])
         .setup(|app| {
             bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;
@@ -80,6 +93,9 @@ pub fn run() {
             }
             Ok(())
         });
+
+    #[cfg(desktop)]
+    let builder = plugin_host::host::register_protocol(builder, plugin_host_state);
 
     let app = builder
         .build(context)

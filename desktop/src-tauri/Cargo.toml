@@ -50,6 +50,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # 开关判定的唯一真源。本 crate 刻意不依赖 `yi-agent-store`（它带 bundled
 # rusqlite），所以引入它不会把 SQLite 链进桌面二进制。
 yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }
+# 插件视图的资源服务要复用验签/清单/生命周期的**值类型与校验**，不能自己
+# 再造一份。这个 crate 不依赖 SQLite，所以不会把数据库链进桌面二进制。
+yi-agent-plugins = { path = "../../yi-agent-rs/crates/yi-agent-plugins" }
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.

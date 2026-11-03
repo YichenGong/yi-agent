@@ -737,7 +737,50 @@ fn root_envelope_path() -> PathBuf {
 /// 校验源，让 curl 自己跟就会绕过那一步。
 #[derive(Default)]
 struct CurlFetcher {
-    current: Option<std::io::BufReader<std::process::ChildStdout>>,
+    /// 最近一次 `head` 的 URL。`read` 用它启动 GET。
+    pending: Option<String>,
+    /// 当前 GET 的子进程。
+    ///
+    /// `head` 只做 `-I`；GET 必须真的发出去，否则 `read` 永远读到 0 字节，
+    /// 每一次真实下载都会以"大小与签名不符"失败——看起来像服务端问题，
+    /// 实际是客户端根本没发 GET。
+    current: Option<std::process::Child>,
+}
+
+impl CurlFetcher {
+    /// 为最近一次 `head` 的 URL 启动 GET，并把 stdout 挂到 `current`。
+    fn start_get(&mut self) -> Result<(), yi_agent_plugins::FetchError> {
+        use yi_agent_plugins::FetchError;
+        let Some(url) = self.pending.as_ref() else {
+            return Err(FetchError::Transport(
+                "read() was called before head(); there is no URL to fetch".to_string(),
+            ));
+        };
+        let child = std::process::Command::new("curl")
+            .args([
+                "-sS",
+                // 跟 `head` 用同一套策略：不让 curl 自己跟跳转，源校验由
+                // `yi_agent_plugins::download` 逐跳完成。
+                "--max-redirs",
+                "0",
+                // 缓冲读：一次写出 64 KiB 再进管道，否则每读一小段就要醒一次。
+                "--no-buffer",
+                "-f",
+                "--max-time",
+                "300",
+                "--speed-limit",
+                "1",
+                "--speed-time",
+                "30",
+            ])
+            .arg(url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| FetchError::Transport(format!("could not run curl: {error}")))?;
+        self.current = Some(child);
+        Ok(())
+    }
 }
 
 impl yi_agent_plugins::Fetcher for CurlFetcher {
@@ -756,6 +799,7 @@ impl yi_agent_plugins::Fetcher for CurlFetcher {
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
+        self.pending = Some(format!("{}://{}{}", url.scheme, url.host, url.path));
         let text = String::from_utf8_lossy(&output.stdout).to_string();
         let mut lines = text.lines();
         let status_line = lines.next().unwrap_or_default();
@@ -785,17 +829,47 @@ impl yi_agent_plugins::Fetcher for CurlFetcher {
 
     fn read(&mut self, max_bytes: usize) -> Result<Option<Vec<u8>>, yi_agent_plugins::FetchError> {
         use std::io::Read;
-        let Some(reader) = self.current.as_mut() else {
+
+        // 首次 `read` 才真正发 GET：`head` 只做一次 `-I`，此时还不知道
+        // 是不是要下载（可能是重定向、4xx）。把 GET 放在这里，`download`
+        // 决定要读的时候才付网络代价。
+        if self.current.is_none() {
+            self.start_get()?;
+        }
+        let Some(child) = self.current.as_mut() else {
             return Ok(None);
         };
+        let Some(stdout) = child.stdout.as_mut() else {
+            return Err(yi_agent_plugins::FetchError::Transport(
+                "curl's stdout was already consumed".to_string(),
+            ));
+        };
         let mut buffer = vec![0u8; max_bytes];
-        match reader.read(&mut buffer) {
-            Ok(0) => Ok(None),
+        match stdout.read(&mut buffer) {
+            Ok(0) => {
+                // 流结束：等子进程退出并检查退出码。非零退出意味着传输被中断
+                // （超时、连接重置），此时"读到 0 字节"不能当成正常结束。
+                let status = child
+                    .wait()
+                    .map_err(|error| yi_agent_plugins::FetchError::Transport(error.to_string()))?;
+                self.current = None;
+                if !status.success() {
+                    return Err(yi_agent_plugins::FetchError::Transport(format!(
+                        "curl exited with {status} before the body completed"
+                    )));
+                }
+                Ok(None)
+            }
             Ok(n) => {
                 buffer.truncate(n);
                 Ok(Some(buffer))
             }
-            Err(error) => Err(yi_agent_plugins::FetchError::Transport(error.to_string())),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.current = None;
+                Err(yi_agent_plugins::FetchError::Transport(error.to_string()))
+            }
         }
     }
 }
@@ -835,3 +909,96 @@ fn not_supported(method: &str, why: &str) -> Result<i32> {
 }
 
 use yi_agent_plugins::ProjectId;
+
+#[cfg(test)]
+mod curl_fetcher_tests {
+    //! 下载器自身的成功路径。
+    //!
+    //! 这段测试存在的理由是一次真实缺陷：`CurlFetcher` 只做了 `curl -I`，
+    //! `read` 依赖一个从未被赋值的 reader，于是**每一次**下载都读到 0 字节，
+    //! 然后以"大小与签名不符"失败。错误信息指向服务端，真正的问题在客户端
+    //! 根本没发 GET。只用 mock fetcher 的测试发现不了它，因为 mock 不区分
+    //! "没发请求"和"发了但没内容"。
+
+    use super::CurlFetcher;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use yi_agent_plugins::Fetcher;
+
+    /// 起一个只服务一个请求的最小 HTTP 服务，返回端口与原始响应体。
+    ///
+    /// 不用 python3：这条测试要能在任何装了 curl 的环境里跑，而 `curl` 本身
+    /// 已经是这个实现的依赖。
+    fn serve_once(body: Vec<u8>) -> (String, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let expected = body.clone();
+        std::thread::spawn(move || {
+            // 两个请求：一个 `-I`（HEAD），一个 GET。
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let head_only = request.starts_with(b"HEAD");
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                if !head_only {
+                    let _ = stream.write_all(&body);
+                }
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/bundle.bin"), expected)
+    }
+
+    #[test]
+    fn reads_the_body_after_head() {
+        let body: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let (raw_url, expected) = serve_once(body);
+        // `Url::parse` 刻意拒绝带端口的地址（官方下载没有这种形状）。
+        // 这里要测的是**下载器**，所以直接构造 Url 值，绕过源校验那一层：
+        // 两层各测各的，混在一起会让"下载器坏了"被"源校验拒绝"掩盖。
+        let rest = raw_url.trim_start_matches("http://");
+        let (authority, path) = rest.split_once('/').expect("authority/path");
+        let url = yi_agent_plugins::Url {
+            scheme: "http".to_string(),
+            host: authority.to_string(),
+            path: format!("/{path}"),
+        };
+
+        let mut fetcher = CurlFetcher::default();
+        let head = fetcher.head(&url).expect("head");
+        assert_eq!(head.status, 200);
+        assert_eq!(head.content_length, Some(expected.len() as u64));
+
+        let mut received = Vec::new();
+        loop {
+            match fetcher.read(64 * 1024).expect("read") {
+                Some(chunk) => received.extend_from_slice(&chunk),
+                None => break,
+            }
+            assert!(received.len() <= expected.len(), "read past the body");
+        }
+        assert_eq!(
+            received, expected,
+            "the fetched bytes must match the server's"
+        );
+    }
+
+    #[test]
+    fn reading_without_a_head_is_an_error_not_an_empty_body() {
+        let mut fetcher = CurlFetcher::default();
+        let error = fetcher
+            .read(1024)
+            .expect_err("read without head must not pretend the stream ended");
+        assert!(
+            format!("{error}").contains("head"),
+            "the error must name the missing step, got: {error}"
+        );
+    }
+}

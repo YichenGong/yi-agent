@@ -10,29 +10,22 @@
 //! - 原生侧必须能关掉并重建失控的 frame，且核心交互与会话持久化不受损。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use sha2::{Digest, Sha256};
+// 资源服务与容器策略住在生产模块里；探针**再导出**它们，这样集成测试与
+// 报告字段沿用既有路径，而实现只有一份。
+pub use super::assets::{
+    content_type_for, safe_relative_path, serve_asset, sha256_hex, AssetResponse, AssetRoot,
+    ASSET_SCHEME, CASE_DEADLINE, FOREIGN_PACKAGE, MAX_FRAMES,
+};
+pub use super::container::{ContainerConfig, RecoveryPolicy};
 
 /// 探针 suite 名。报告与 CLI 都靠它区分不同测试组。
 pub const ISOLATION_SUITE: &str = "isolation";
-
-/// 资源服务的自定义协议名。页面 Origin 在 macOS/Linux 上是
-/// `plugin-asset://localhost`，Windows/Android 上是 `http://plugin-asset.localhost`。
-pub const ASSET_SCHEME: &str = "plugin-asset";
-
-/// 资源服务里“另一个包”的路径前缀，用于跨包读取攻击。
-pub const FOREIGN_PACKAGE: &str = "foreign";
-
-/// 单条用例的最长等待时间。超过即判失败，不允许无限等一个被阻塞的 frame。
-pub const CASE_DEADLINE: Duration = Duration::from_secs(20);
-
-/// 原生侧允许的 frame 数上限。页面不得靠不断创建子 frame 绕过资源限制。
-pub const MAX_FRAMES: usize = 4;
 
 /// 一次性初始化通道的字节上限：报告通道只传小 JSON。
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -241,103 +234,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
-/// 资源服务的白名单根。每个包一个根，路径必须落在包根之内。
-#[derive(Debug, Clone)]
-pub struct AssetRoot {
-    /// 包内相对路径 → 绝对文件路径。启动时一次性建好，运行期不解释路径。
-    files: BTreeMap<String, PathBuf>,
-}
-
-impl AssetRoot {
-    /// 从目录建立白名单。只接受规范化普通文件；符号链接、越界路径直接跳过，
-    /// 这样即便包内容被替换也不会把任意文件捧成资源。
-    pub fn load(package_root: &Path) -> std::io::Result<Self> {
-        let root = package_root
-            .canonicalize()
-            .unwrap_or_else(|_| package_root.to_path_buf());
-        let mut files = BTreeMap::new();
-        collect_files(&root, &root, &mut files)?;
-        Ok(Self { files })
-    }
-
-    pub fn get(&self, relative: &str) -> Option<&PathBuf> {
-        self.files.get(relative)
-    }
-
-    pub fn len(&self) -> usize {
-        self.files.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
-    }
-}
-
-fn collect_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut BTreeMap<String, PathBuf>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.is_symlink() {
-            // 链接可以指向包外；宁可漏也别把任意文件当资源。
-            continue;
-        }
-        if metadata.is_dir() {
-            collect_files(root, &path, out)?;
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let Some(key) = relative.to_str().map(|value| value.replace('\\', "/")) else {
-            continue;
-        };
-        out.insert(key, path);
-    }
-    Ok(())
-}
-
-/// 把请求路径规范化成包内相对路径；任何越界或非法输入都返回 `None`。
-pub fn safe_relative_path(root: &Path, requested: &str) -> Option<PathBuf> {
-    let trimmed = requested.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.contains('\0') {
-        return None;
-    }
-    let mut depth: i32 = 0;
-    for segment in trimmed.split('/') {
-        match segment {
-            "" | "." => continue,
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return None;
-                }
-            }
-            _ => depth += 1,
-        }
-    }
-    let candidate = root.join(trimmed);
-    // 规范化后再确认仍在根内：这一步挡住 `a/../../etc/passwd` 这类拼接。
-    let canonical = candidate.canonicalize().ok()?;
-    canonical.starts_with(root).then_some(canonical)
-}
-
 /// 探测脚本向原生侧证明“我确实在页面里”的一次性挑战。
 ///
 /// 页面拿不到 `nonce` 就无法伪造回报；nonce 由原生侧在创建窗口时生成并通过
@@ -406,146 +302,6 @@ impl ProbeChannel {
 
     pub fn frame(&self, id: &str) -> Option<FrameRecord> {
         self.frames.lock().unwrap().get(id).cloned()
-    }
-}
-
-/// 原生侧容器的创建参数。探针与后续正式容器共用同一份描述，
-/// 这样报告里的 `containerConfigSha256` 才有意义。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContainerConfig {
-    pub scheme: String,
-    /// 页面 CSP。覆盖脚本/样式/图片/帧/表单等资源类型，而不只是 connect-src。
-    pub csp: String,
-    /// 是否允许页面自定义协议之外的网络请求（探针要求 false）。
-    pub allow_remote_network: bool,
-    pub max_frames: usize,
-    pub case_deadline_secs: u64,
-    /// 原生侧恢复策略：超时后关闭并重建容器。
-    pub recovery: RecoveryPolicy,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RecoveryPolicy {
-    CloseAndRebuild,
-}
-
-impl Default for ContainerConfig {
-    fn default() -> Self {
-        Self {
-            scheme: ASSET_SCHEME.to_string(),
-            csp: Self::strict_csp(),
-            allow_remote_network: false,
-            max_frames: MAX_FRAMES,
-            case_deadline_secs: CASE_DEADLINE.as_secs(),
-            recovery: RecoveryPolicy::CloseAndRebuild,
-        }
-    }
-}
-
-impl ContainerConfig {
-    /// 严格的页面 CSP：默认全部拒绝，只放行本包资源与非内联的必要脚本样式。
-    ///
-    /// `form-action` / `frame-src` / `img-src` / `style-src` / `font-src` 都必须
-    /// 显式设为 `'none'` 或自身来源：只写 `connect-src` 挡不住图片/表单外送
-    /// （spec §4.4）。
-    pub fn strict_csp() -> String {
-        "default-src 'none'; \
-         script-src 'self' 'unsafe-inline'; \
-         style-src 'self' 'unsafe-inline'; \
-         img-src 'self'; \
-         font-src 'self'; \
-         connect-src 'self'; \
-         frame-src 'none'; \
-         child-src 'none'; \
-         worker-src 'none'; \
-         form-action 'none'; \
-         base-uri 'none'; \
-         object-src 'none'; \
-         navigate-to 'none'; \
-         manifest-src 'none'; \
-         media-src 'none'; \
-         frame-ancestors 'none'"
-            .to_string()
-    }
-
-    pub fn digest(&self) -> String {
-        sha256_hex(&serde_json::to_vec(self).unwrap_or_default())
-    }
-}
-
-/// 页面资源响应。抽成纯函数，便于在没有真实 WebView 时单测边界。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetResponse {
-    pub status: u16,
-    pub content_type: &'static str,
-    pub body: Vec<u8>,
-}
-
-impl AssetResponse {
-    fn text(status: u16, body: &str) -> Self {
-        Self {
-            status,
-            content_type: "text/plain; charset=utf-8",
-            body: body.as_bytes().to_vec(),
-        }
-    }
-}
-
-pub fn content_type_for(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
-}
-
-/// 处理一次资源请求。
-///
-/// - `active_package` 是当前视图绑定的包；请求只能落在它的白名单里。
-/// - 请求里出现别的包名、或 `/foreign/...` 前缀，一律 403 —— 这正是
-///   `cross_package_asset_denied` 用例要证明的行为。
-/// - 冒号之后的 host 部分（`plugin-asset://localhost/...`）先被剥掉。
-pub fn serve_asset(
-    assets: &AssetRoot,
-    requested_path: &str,
-    active_package: &str,
-) -> AssetResponse {
-    let mut path = requested_path;
-    if let Some((_, rest)) = path.split_once("://") {
-        // 去掉 `localhost` / `plugin-asset.localhost` 这类 authority 段。
-        path = rest.split_once('/').map(|(_, tail)| tail).unwrap_or("");
-    }
-    let path = path.trim_start_matches('/');
-
-    if path == FOREIGN_PACKAGE || path.starts_with(&format!("{FOREIGN_PACKAGE}/")) {
-        return AssetResponse::text(403, "forbidden: package boundary");
-    }
-    if let Some((first, _)) = path.split_once('/') {
-        if first != active_package && first.starts_with("pkg-") {
-            return AssetResponse::text(403, "forbidden: package boundary");
-        }
-    }
-
-    let root = Path::new("/");
-    if safe_relative_path(root, path).is_none() && path.split('/').any(|s| s == "..") {
-        return AssetResponse::text(403, "forbidden: traversal");
-    }
-
-    let Some(file) = assets.get(path) else {
-        return AssetResponse::text(404, "not found");
-    };
-    match std::fs::read(file) {
-        Ok(body) => AssetResponse {
-            status: 200,
-            content_type: content_type_for(path),
-            body,
-        },
-        Err(_) => AssetResponse::text(403, "forbidden: unreadable"),
     }
 }
 

@@ -38,6 +38,9 @@ const APP_COMMANDS: &[&str] = &[
     "remote_list",
     "remote_upsert",
     "remote_remove",
+    "open_plugin_view",
+    "close_plugin_view",
+    "plugin_committed_activation",
 ];
 
 fn main() {
