@@ -48,14 +48,35 @@ pub(crate) async fn handle(
         return Ok(Flow::Unknown);
     };
 
-    let home = state.watchman_home.clone();
+    // 受管管理方法一律要求 `Admin`。装包、授权、激活、卸载动的是**宿主**的
+    // 状态；一个只读观察者能做这些，等于把"看板"和"装东西"混成同一权限。
+    //
+    // 门禁放在这里而不是 `server.rs` 的 `ADMIN_METHODS` 常量里：那个常量按
+    // 方法名字面量硬编码，`plugins/v1/*` 是前缀域，逐个列举必然漏掉新方法，
+    // 而漏掉的门禁不会有任何编译错误——只有一条越权路径。
+    if state.client_scope < crate::protocol::Scope::Admin {
+        write_or_fatal(
+            state,
+            id.clone(),
+            err_response(
+                id,
+                RpcError::insufficient_scope(crate::protocol::Scope::Admin),
+            ),
+        )
+        .await;
+        return Ok(Flow::Continue);
+    }
+
+    let home = state.plugin_home.clone();
+    let catalog_path = state.plugin_catalog.clone();
     let params = req.params.clone();
     let verb = verb.to_string();
 
     // 管理动作是阻塞的（读盘、验签、有时下载）。放进 blocking 池，别让一次
     // 安装卡住整个 RPC 循环。`verb` 与 `params` 都先取成 owned：`req` 只在
     // 函数体内有效，搬不进 `'static` 的任务。
-    let outcome = tokio::task::spawn_blocking(move || dispatch(&home, &verb, &params)).await;
+    let outcome =
+        tokio::task::spawn_blocking(move || dispatch(&home, &catalog_path, &verb, &params)).await;
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -113,10 +134,15 @@ fn kind_code(error: &PluginError) -> &'static str {
 }
 
 /// 真正的分发。纯同步，便于在 blocking 池里跑，也便于单测。
-fn dispatch(home: &std::path::Path, verb: &str, params: &Value) -> Result<Value, PluginError> {
+fn dispatch(
+    home: &std::path::Path,
+    catalog_path: &std::path::Path,
+    verb: &str,
+    params: &Value,
+) -> Result<Value, PluginError> {
     let service = PluginService::open(home);
     match verb {
-        "catalog" => catalog(&service),
+        "catalog" => catalog_at(catalog_path),
         "list" => list(&service),
         "install" => install(&service, params),
         "enableProject" => enable_project(&service, params),
@@ -133,9 +159,10 @@ fn dispatch(home: &std::path::Path, verb: &str, params: &Value) -> Result<Value,
         "inspectLegacy" | "adoptLegacy" => Err(PluginError::NotSupported(
             "legacy inspection and adoption land with the migration task (T25)".to_string(),
         )),
-        "assetRelease" => Err(PluginError::NotSupported(
-            "serving release assets needs the desktop asset cache, which lands in T17".to_string(),
-        )),
+        "assetRelease" => {
+            let _ = &service;
+            asset_release_at(catalog_path, params)
+        }
         "operationResult" => Err(PluginError::NotSupported(
             "operation results are served by the operation ledger path, which lands with the \
              managed kanban migration (T23)"
@@ -155,14 +182,11 @@ fn dispatch(home: &std::path::Path, verb: &str, params: &Value) -> Result<Value,
 ///
 /// 目录条目不是信任凭据——它只说明"官方源上有这么个版本"。真正的授权仍来自
 /// 每个包的签名。
-fn catalog(service: &PluginService) -> Result<Value, PluginError> {
-    let _ = service;
-    // 目录的位置由宿主钉死（`YI_AGENT_PLUGIN_CATALOG` 或实例根下的默认位置），
-    // 不接受请求传入路径：一个能指定"从哪读目录"的调用方，等于能指定
-    // "哪些版本算官方"。
-    let path = catalog_path();
+fn catalog_at(path: &std::path::Path) -> Result<Value, PluginError> {
+    // 目录的位置由**宿主装配**钉死，不接受请求传入路径：一个能指定"从哪读目录"
+    // 的调用方，等于能指定"哪些版本算官方"。
     let bytes =
-        std::fs::read(&path).map_err(|e| PluginError::Io(format!("{}: {e}", path.display())))?;
+        std::fs::read(path).map_err(|e| PluginError::Io(format!("{}: {e}", path.display())))?;
     let catalog: yi_agent_plugins::Catalog = serde_json::from_slice(&bytes).map_err(|e| {
         PluginError::InvalidManifest(format!("catalog at {} is not valid: {e}", path.display()))
     })?;
@@ -454,7 +478,104 @@ fn capabilities_arg(params: &Value) -> Result<Vec<yi_agent_plugins::Effect>, Plu
     raw.into_iter().map(service::parse_capability).collect()
 }
 
-fn catalog_path() -> std::path::PathBuf {
+/// `assetRelease`：一条**已认证**发布的身份 + 受控传输句柄。
+///
+/// # 它故意不返回什么
+///
+/// 不返回下载 URL、不返回 cookie/token、不返回宿主凭据。页面的 iframe 拿不到
+/// 任何可以直接 `fetch` 的东西——否则"桥是唯一业务通道"这句话就被一个字符串
+/// 绕过了。调用方只能拿到一个句柄，由宿主自己按目录条目取字节。
+///
+/// # 身份从哪来
+///
+/// 目录条目（`Catalog::find`）只回答"官方目录说有这个版本"。所以返回的
+/// `authenticated` 只有在**目录里确实有这条**且发布未过期时才为 true：
+/// 未知发布是 `NotFound`，过期发布是 `Expired`，被撤回的由调用方在验签时挡。
+///
+/// 目录路径显式传入而不是读进程环境变量：同一进程里两个连接可以各有各的
+/// 官方源（本地与远端），并行测试也不会互相改写。
+fn asset_release_at(path: &std::path::Path, params: &Value) -> Result<Value, PluginError> {
+    let plugin = plugin_arg(params)?;
+    let version = string_arg(params, "version")?;
+    let target = string_arg(params, "target")?;
+    let sha256 = string_arg(params, "sha256")?;
+
+    let bytes =
+        std::fs::read(path).map_err(|e| PluginError::Io(format!("{}: {e}", path.display())))?;
+    let catalog: yi_agent_plugins::Catalog = serde_json::from_slice(&bytes).map_err(|e| {
+        PluginError::InvalidManifest(format!("catalog at {} is not valid: {e}", path.display()))
+    })?;
+
+    let release = yi_agent_plugins::ReleaseId {
+        plugin,
+        version,
+        target,
+        sha256,
+    };
+    let entry = catalog.find(&release).ok_or_else(|| {
+        PluginError::NotFound(format!(
+            "the catalog does not list {} {} for {}",
+            release.plugin.as_str(),
+            release.version,
+            release.target
+        ))
+    })?;
+
+    let now = service::unix_now();
+    if entry.expires_at != 0 && entry.expires_at <= now {
+        return Err(PluginError::Expired(format!(
+            "the release expired at {} (now {now})",
+            entry.expires_at
+        )));
+    }
+
+    // 句柄只是"这四元组在目录里存在"的代号，携带不了任何权限：宿主下次取字节
+    // 时还要重新查目录、重新验签。
+    let handle = format!(
+        "rel1_{}",
+        hex8(&format!(
+            "{}|{}|{}|{}|{}",
+            release.plugin.as_str(),
+            release.version,
+            release.target,
+            release.sha256,
+            entry.serial
+        ))
+    );
+
+    Ok(json!({
+        "plugin": release.plugin.as_str(),
+        "version": release.version,
+        "target": release.target,
+        "sha256": release.sha256,
+        "sizeBytes": entry.size_bytes,
+        "publishedAt": entry.published_at,
+        "expiresAt": entry.expires_at,
+        "serial": entry.serial,
+        // 目录里查得到才算"认证"；签名仍由安装路径独立验证，这里不代替它。
+        "authenticated": true,
+        "transfer": { "handle": handle, "kind": "host-mediated" },
+        // 明确写出来，防止有人日后"顺手"加上 URL。
+        "directUrl": Value::Null,
+        "credentials": Value::Null,
+    }))
+}
+
+/// 短摘要：句柄不需要可逆，只需要稳定且不泄漏长度信息。
+fn hex8(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 默认目录位置：进程环境变量优先，否则实例根下的 `plugins/catalog.json`。
+///
+/// 这个函数**只**给装配方（`server.rs` 的生产构造与测试 harness）用；
+/// 分发路径不再调用它。
+pub(crate) fn default_catalog_path() -> std::path::PathBuf {
     match std::env::var_os("YI_AGENT_PLUGIN_CATALOG") {
         Some(path) => std::path::PathBuf::from(path),
         None => yi_agent_store::paths::instance_home()
@@ -479,6 +600,7 @@ fn root_envelope() -> Result<Vec<u8>, PluginError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     /// `plugins/v1/*` 与旧的 `plugins/*` 不共用名称空间。
     #[test]
@@ -507,21 +629,105 @@ mod tests {
     }
 
     /// 下游任务的方法如实返回 NotSupported，而不是伪装成功。
+    ///
+    /// `assetRelease` 不在表里：它在 T20 变成了真实实现，仍然"未实现"的方法
+    /// 只剩下面这两个。
     #[test]
     fn downstream_methods_report_not_supported() {
-        for verb in [
-            "inspectLegacy",
-            "adoptLegacy",
-            "assetRelease",
-            "operationResult",
-        ] {
-            let error =
-                dispatch(std::path::Path::new("/nonexistent"), verb, &json!({})).expect_err(verb);
+        for verb in ["inspectLegacy", "adoptLegacy", "operationResult"] {
+            let error = dispatch(
+                std::path::Path::new("/nonexistent"),
+                std::path::Path::new("/nonexistent/catalog.json"),
+                verb,
+                &json!({}),
+            )
+            .expect_err(verb);
             assert!(
                 matches!(error, PluginError::NotSupported(_)),
                 "{verb} must be NotSupported, got {error:?}"
             );
         }
+    }
+
+    /// 没有目录时 `assetRelease` 明确报 Io，而不是返回一个空身份。
+    #[test]
+    fn asset_release_without_a_catalog_is_an_io_error() {
+        let error = asset_release_at(
+            std::path::Path::new("/nonexistent/catalog.json"),
+            &json!({
+                "plugin": "example-counter",
+                "version": "1.0.0",
+                "target": "darwin-aarch64",
+                "sha256": "00",
+            }),
+        )
+        .expect_err("no catalog");
+        assert!(matches!(error, PluginError::Io(_)), "got {error:?}");
+    }
+
+    /// 目录里没有这条发布 → NotFound。绝不能返回一个"也许存在"的句柄。
+    #[test]
+    fn asset_release_for_an_unknown_release_is_not_found() {
+        let dir = TempDir::new().expect("temp dir");
+        let catalog = dir.path().join("catalog.json");
+        std::fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({ "serial": 1, "entries": [] })).unwrap(),
+        )
+        .unwrap();
+
+        let error = asset_release_at(
+            &catalog,
+            &json!({
+                "plugin": "example-counter",
+                "version": "9.9.9",
+                "target": "darwin-aarch64",
+                "sha256": "00",
+            }),
+        )
+        .expect_err("unknown release");
+        assert!(matches!(error, PluginError::NotFound(_)), "got {error:?}");
+    }
+
+    /// 过期发布拒绝，即使目录里确实有这条。
+    #[test]
+    fn asset_release_refuses_an_expired_entry() {
+        let dir = TempDir::new().expect("temp dir");
+        let catalog = dir.path().join("catalog.json");
+        std::fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "serial": 3,
+                "entries": [{
+                    "release": {
+                        "plugin": "example-counter",
+                        "version": "1.0.0",
+                        "target": "darwin-aarch64",
+                        "sha256": "ab".repeat(32),
+                    },
+                    "sizeBytes": 10,
+                    "metadataPath": "/m.json",
+                    "bundlePath": "/b.tar",
+                    "publishedAt": 1,
+                    "expiresAt": 2,
+                    "serial": 3,
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = asset_release_at(
+            &catalog,
+            &json!({
+                "plugin": "example-counter",
+                "version": "1.0.0",
+                "target": "darwin-aarch64",
+                "sha256": "ab".repeat(32),
+            }),
+        )
+        .expect_err("expired");
+        assert!(matches!(error, PluginError::Expired(_)), "got {error:?}");
     }
 
     /// 清理数据要二次确认：没确认就什么都不做。

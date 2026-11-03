@@ -549,6 +549,8 @@ pub(crate) struct Harness {
     /// 被删除，后续 `thread/start` 就写不进去。`None` 表示调用方自带 workdir。
     pub(crate) _fallback_workdir: Option<tempfile::TempDir>,
     pub(crate) _watchman_home: tempfile::TempDir,
+    /// 本次连接的官方目录路径。测试要往它写一份目录再断言 RPC 读到的是这份。
+    pub(crate) plugin_catalog: std::path::PathBuf,
     pub(crate) skills_home_dir: tempfile::TempDir,
     pub(crate) lead_inbox: crate::lead::LeadInbox,
     pub(crate) lead_replies: crate::lead::LeadReplies,
@@ -602,6 +604,40 @@ impl Harness {
 
     pub(crate) async fn with_scope(scope: Scope) -> Self {
         Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
+    }
+
+    /// 与 [`Harness::with_scope`] 相同，但实例根由调用方钉死。
+    ///
+    /// 用来模拟"同一台宿主的第二次连接"：两条 stdio 管道、两个主循环，读写的
+    /// 却是同一份 `plugins/registry.json` 与授权表。默认构造每次都给一个新
+    /// tempdir，那只能证明"两个宿主互不可见"，证明不了重连后读到权威状态。
+    pub(crate) async fn with_scope_and_instance_home(scope: Scope, home: &Path) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(home.to_path_buf()),
+        )
     }
 
     pub(crate) async fn with_lead_flag(enabled: bool) -> Self {
@@ -774,6 +810,43 @@ impl Harness {
             + Sync
             + 'static,
     {
+        Self::with_config_and_scope_and_watchman_in(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            install,
+            uninstall,
+            calls,
+            lead_agent_enabled,
+            None,
+        )
+    }
+
+    /// 见 [`Harness::with_scope_and_instance_home`]。`instance_home_override`
+    /// 为 `Some` 时不再自造 tempdir，而是复用调用方给的根。
+    #[allow(clippy::too_many_arguments)]
+    fn with_config_and_scope_and_watchman_in<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        install: WatchmanInstall,
+        uninstall: WatchmanUninstall,
+        calls: WatchmanCalls,
+        lead_agent_enabled: bool,
+        instance_home_override: Option<PathBuf>,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let index_dir = tempfile::TempDir::new().unwrap();
@@ -818,6 +891,10 @@ impl Harness {
         // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
         // 触碰真实的 `~/Library/LaunchAgents`。
         let watchman_home = tempfile::TempDir::new().unwrap();
+        let catalog_path = watchman_home.path().join("plugins").join("catalog.json");
+        if let Some(parent) = catalog_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         // 假的插件可执行目录:注入的解析器只在它里面找名字,故既不依赖本机
         // 装了什么插件,也不必改动进程级 `PATH`(那会污染同进程的并行用例)。
         let plugins_dir = tempfile::TempDir::new().unwrap();
@@ -877,7 +954,9 @@ impl Harness {
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
-                instance_home: skills_home.path().to_path_buf(),
+                instance_home: instance_home_override
+                    .clone()
+                    .unwrap_or_else(|| skills_home.path().to_path_buf()),
                 remote_dir: index_dir.path().to_path_buf(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -887,6 +966,9 @@ impl Harness {
                 watchman_install: install,
                 watchman_uninstall: uninstall,
                 watchman_home: watchman_home.path().to_path_buf(),
+                // 官方目录也落隔离目录：`plugins/v1/catalog` 与 `assetRelease`
+                // 不得读开发者真实的 `~/.yi-agent/plugins/catalog.json`。
+                plugin_catalog: watchman_home.path().join("plugins").join("catalog.json"),
                 // 假插件目录 + 记账式 daemon 拉起:安装路径可测,且绝不真的
                 // `spawn` 一个 detached `daemon serve`。
                 resolve_plugin,
@@ -915,6 +997,7 @@ impl Harness {
             hub,
             watchman_calls: calls,
             _watchman_home: watchman_home,
+            plugin_catalog: catalog_path,
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
@@ -2550,6 +2633,7 @@ impl MergedHarness {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                plugin_catalog: PathBuf::new(),
                 // 测试注入:同上,不拉起真实 daemon。
                 resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
                 ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),

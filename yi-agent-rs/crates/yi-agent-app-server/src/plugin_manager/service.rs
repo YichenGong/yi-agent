@@ -47,15 +47,13 @@ pub fn release_directory(manifest: &Manifest) -> String {
 
 /// 宿主的平台标识（`darwin-aarch64` 这类）。
 pub fn host_target() -> String {
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "aarch64",
-        other => other,
-    };
+    // Rust 的 `ARCH`/`OS` 与发布目标的命名只差一处：macOS 叫 `macos`，而发布
+    // 目标写作 `darwin`。其余（`aarch64`、`x86_64`、`linux`）逐字相同。
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         other => other,
     };
-    format!("{os}-{arch}")
+    format!("{os}-{}", std::env::consts::ARCH)
 }
 
 /// 当前时间（Unix 秒）。注入点集中在这里，测试可以绕开它。
@@ -138,6 +136,10 @@ impl PluginService {
     ///
     /// `entry` 来自 `Catalog::find`，不是调用方拼的 URL。下载器只会去
     /// `origin` 允许的地方，跳转每次重验。
+    // 七个参数是这条路径的真实输入（目录项、目录、源、取字节的方式、上限、
+    // 时钟、信任根）。把其中几个打包成结构体只会让"这到底是哪两个"隐式化，
+    // 而这里的每一项都是独立的信任边界，不该被折叠成一个不透明的「配置」。
+    #[allow(clippy::too_many_arguments)]
     pub fn install_from_catalog(
         &self,
         entry: &CatalogEntry,

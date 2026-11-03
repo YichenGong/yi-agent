@@ -14,6 +14,7 @@ pub mod cache;
 pub mod container;
 pub mod host;
 pub mod recovery;
+pub mod remote_assets;
 
 #[cfg(feature = "plugin-probe")]
 pub mod probe;

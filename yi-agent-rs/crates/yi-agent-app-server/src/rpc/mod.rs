@@ -187,12 +187,31 @@ pub(crate) enum Flow {
 pub(crate) struct PluginChannelState {
     pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
     pub(crate) client: crate::broadcast::ClientId,
+    /// 发起这次请求的客户端权限。受管管理方法（`plugins/v1/*`）要求 `Admin`：
+    /// 装包、授权、激活动的是**宿主**的状态，一个只读观察者不该能做。
+    ///
+    /// 门禁在这里而不是在 `server.rs` 的 `ADMIN_METHODS` 常量里，因为那个常量
+    /// 按方法名字面量硬编码；`plugins/v1/*` 是前缀域，逐个列举会漏。
+    pub(crate) client_scope: crate::protocol::Scope,
     /// 通用常驻登记目录。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
     /// 值守安装所针对的 home。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_home: std::path::PathBuf,
+    /// 受管插件的**实例根**：`plugins/registry.json`、`plugins/grants.json`、
+    /// `plugins/releases/**` 都在它下面。
+    ///
+    /// 之前这里错用了 `watchman_home`（= 真实 `$HOME`），于是 `plugins/v1/install`
+    /// 会把包装进 `~/plugins/`，与实例根下的登记表对不上。`watchman_home` 是
+    /// 「往哪个 `Library/LaunchAgents` 写」，和插件存储是两件事，不能共用一个字段。
+    pub(crate) plugin_home: std::path::PathBuf,
+    /// 官方目录文件。**按连接注入**而不是读进程环境变量。
+    ///
+    /// 进程级 `YI_AGENT_PLUGIN_CATALOG` 有两个毛病：同一进程里两个 app-server
+    /// 连接无法各自持有一份目录（远端与本地必须能指向不同源），以及并行测试
+    /// 会互相改写。按连接注入把这两件事一起修掉。
+    pub(crate) plugin_catalog: std::path::PathBuf,
     /// 安装句柄。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_install: crate::server::WatchmanInstall,
     /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。见

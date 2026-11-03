@@ -973,7 +973,7 @@ fn uninstall_removes_the_program_and_keeps_the_projects_data() {
         data.join("cards.json").exists(),
         "uninstalling a program must not delete the user's data"
     );
-    let records = yi_agent_plugins::Registry::open(&fixture.instance_home())
+    let records = yi_agent_plugins::Registry::open(fixture.instance_home())
         .expect("registry")
         .list()
         .expect("list");
@@ -1137,8 +1137,7 @@ fn a_host_with_a_port_is_not_an_acceptable_official_origin() {
     let archive = std::fs::read(&fixture.bundle).expect("bundle");
     let metadata = std::fs::read(&fixture.metadata).expect("metadata");
 
-    let mut server =
-        StaticServer::start(&[("metadata.json", &metadata), ("bundle.tar.gz", &archive)]);
+    let server = StaticServer::start(&[("metadata.json", &metadata), ("bundle.tar.gz", &archive)]);
     let port = server.port;
 
     // 目录只给路径；源由宿主钉死（`YI_AGENT_PLUGIN_ORIGIN`）。
@@ -1198,7 +1197,7 @@ fn a_host_with_a_port_is_not_an_acceptable_official_origin() {
     );
 
     // 关键：什么都没装进去。
-    let records = yi_agent_plugins::Registry::open(&fixture.instance_home())
+    let records = yi_agent_plugins::Registry::open(fixture.instance_home())
         .expect("registry")
         .list()
         .expect("list");

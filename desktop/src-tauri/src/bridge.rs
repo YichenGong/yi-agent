@@ -275,6 +275,19 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
                     // 起来过就不再显示上一次的原因：设置页的红字要回答「现在
                     // 为什么没连上」，进程已经在跑时答案是「没有」。
                     app.state::<Sidecar>().clear_error(&key);
+                    // 连上即切换插件宿主身份。放在"起进程成功"之后而不是
+                    // 用户点连接时：进程没起来的切换会让视图绑定到一个不存在
+                    // 的宿主上。
+                    let revoked = bind_plugin_host_to(&app, &key);
+                    if revoked > 0 {
+                        let _ = app.emit(
+                            "plugin-host://revoked",
+                            serde_json::json!({
+                                "slot": key.as_str(),
+                                "revoked": revoked,
+                            }),
+                        );
+                    }
                     while let Some(event) = rx.recv().await {
                         match event {
                             CommandEvent::Stdout(bytes) => forward_stdout(&app, &key, &bytes),
@@ -704,6 +717,69 @@ fn ensure_installed(
     Ok(())
 }
 
+/// 把插件宿主的当前身份切到某个已连接的槽位，返回被撤销的视图数。
+///
+/// **每次切换都推进代次并撤销旧宿主的视图**。理由：桌面客户端同一时刻只看
+/// 一个宿主，用户从 A 切到 B 时，A 的窗口若还开着，页面上的读请求会打到 A、
+/// 写请求却可能落到 B 的连接上——这种"半在新半在旧"是最难排查的一类错。
+/// 撤销在这里显式做，不指望 UI 记得关窗口。
+pub fn bind_plugin_host_to(app: &AppHandle, key: &ProfileKey) -> usize {
+    use crate::plugin_host::remote_assets::HostIdentity;
+
+    let host = app.state::<std::sync::Arc<crate::plugin_host::host::PluginHost>>();
+    let previous = host.current_host();
+    let instance = match key {
+        ProfileKey::Local => crate::plugin_host::host::local_instance_id(host.home()),
+        // 远端实例 id 由 profile 决定：同一个 profile 重连仍是"那台机器"，
+        // 摘要寻址的缓存因此可以复用；但代次会推进，旧视图照样失效。
+        ProfileKey::Remote(id) => format!("remote-{id}"),
+    };
+    let kind = match key {
+        ProfileKey::Local => "local".to_string(),
+        ProfileKey::Remote(id) => format!("remote:{id}"),
+    };
+    let generation = if previous.instance_id == instance && previous.kind == kind {
+        previous.generation + 1
+    } else {
+        1
+    };
+    host.switch_host(HostIdentity {
+        kind,
+        instance_id: instance,
+        generation,
+    })
+}
+
+/// 当前插件宿主身份。前端拿它和 `pluginHostIdentity` 的视图绑定比对。
+#[tauri::command]
+pub fn plugin_host_identity(
+    host: tauri::State<'_, std::sync::Arc<crate::plugin_host::host::PluginHost>>,
+) -> crate::plugin_host::remote_assets::HostIdentity {
+    host.current_host()
+}
+
+/// 切换到某个槽位作为插件宿主，返回被撤销的视图数。
+///
+/// 与 `bind_plugin_host_to` 的区别只是入口：这是前端可调的收尾动作，
+/// 那是监督循环里的自动切换。
+#[tauri::command]
+pub fn plugin_bind_host(app: AppHandle, slot: String) -> Result<usize, String> {
+    let key = match slot.as_str() {
+        "local" => ProfileKey::Local,
+        other => {
+            // 只接受已登记的槽位：编一个 id 出来会让视图绑到不存在的宿主。
+            let key = ProfileKey::Remote(other.to_string());
+            if !app.state::<Sidecar>().is_desired(&key)
+                && !app.state::<Sidecar>().keys().contains(&key)
+            {
+                return Err(format!("no connected slot named `{other}`"));
+            }
+            key
+        }
+    };
+    Ok(bind_plugin_host_to(&app, &key))
+}
+
 /// 用户主动断开：撤销「希望连着」再杀进程。
 ///
 /// **顺序很重要**：先撤销意图，监督循环才不会在下一轮立刻把进程拉回来。
@@ -717,6 +793,9 @@ pub fn remote_disconnect(app: AppHandle, profile_id: String) -> Result<(), Strin
     app.state::<Sidecar>().unmark_desired(&key);
     kill_sidecar(&app, &key);
     app.state::<Sidecar>().remove_slot(&key);
+    // 断开必须撤销该宿主的插件视图：否则窗口还在，读的是远端遗留的缓存，
+    // 用户会以为"还连着"。
+    crate::plugin_host::host_state().revoke_host_kind(&format!("remote:{}", key.as_str()));
     // 用户主动断开不是故障：清掉原因，否则设置页会一直挂着上一次的红字。
     app.state::<Sidecar>().clear_error(&key);
     Ok(())

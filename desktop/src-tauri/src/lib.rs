@@ -83,7 +83,9 @@ pub fn run() {
             bridge::remote_remove,
             plugin_host::host::open_plugin_view,
             plugin_host::host::close_plugin_view,
-            plugin_host::host::plugin_committed_activation
+            plugin_host::host::plugin_committed_activation,
+            bridge::plugin_host_identity,
+            bridge::plugin_bind_host
         ])
         .setup(|app| {
             bridge::spawn(app.handle(), crate::remote::profile::ProfileKey::Local)?;

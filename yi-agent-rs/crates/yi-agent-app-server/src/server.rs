@@ -471,6 +471,10 @@ pub(crate) struct RuntimeAttachments {
     /// 它是「往哪个 `Library/LaunchAgents` 写」与「读哪个 plist 判已装」的
     /// 唯一来源，抽出来测试才不会误判真实 home 里的安装状态。
     pub(crate) watchman_home: PathBuf,
+    /// 官方插件目录文件。**按连接注入**：同一进程里的两个 app-server（本地与
+    /// 远端，或多账号）必须能各自指向不同的官方源，而进程级
+    /// `YI_AGENT_PLUGIN_CATALOG` 只能有一个值。并行测试也靠它隔离。
+    pub(crate) plugin_catalog: PathBuf,
     /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。可注入的理由
     /// 见 [`ResolvePlugin`]：靠改 `PATH` 来测会在并行用例间互相污染。
     pub(crate) resolve_plugin: ResolvePlugin,
@@ -1983,6 +1987,7 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            plugin_catalog: crate::rpc::plugin_management::default_catalog_path(),
             resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
             ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
@@ -2073,6 +2078,7 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            plugin_catalog: crate::rpc::plugin_management::default_catalog_path(),
             resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
             ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
@@ -2856,6 +2862,7 @@ where
         watchman_install,
         watchman_uninstall,
         watchman_home,
+        plugin_catalog,
         resolve_plugin,
         ensure_daemon,
         lead_inbox,
@@ -2867,6 +2874,9 @@ where
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
     } = attachments;
+    // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
+    // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
+    let plugin_home = instance_home.clone();
     // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
     // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
     let probes = crate::model_rpc::ProbeRegistry::default();
@@ -3271,9 +3281,12 @@ where
                         let state = std::sync::Arc::new(crate::rpc::PluginChannelState {
                             hub: std::sync::Arc::clone(&hub),
                             client: client.clone(),
+                            client_scope,
                             resident_dir: resident_dir.clone(),
                             theme_handle: theme_handle.clone(),
                             watchman_home: watchman_home.clone(),
+                            plugin_home: plugin_home.clone(),
+                            plugin_catalog: plugin_catalog.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
@@ -7766,6 +7779,9 @@ mod plugin_query_tests;
 
 #[cfg(test)]
 mod plugin_management_tests;
+
+#[cfg(test)]
+mod plugin_remote_tests;
 
 #[cfg(test)]
 mod plugins_tests;

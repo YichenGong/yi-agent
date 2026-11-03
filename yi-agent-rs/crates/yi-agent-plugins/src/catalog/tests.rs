@@ -73,18 +73,8 @@ impl Fetcher for ScriptedFetcher {
     }
 }
 
-/// 时钟：每次读都前进固定的毫秒数，用于触发总超时。
-struct SteppingClock {
-    step_ms: u64,
-    now: u64,
-}
-
-impl Clock for SteppingClock {
-    fn elapsed_ms(&self) -> u64 {
-        self.now
-    }
-}
-
+/// 时钟：恒定 0。超时相关的用例各自用一个会前进的时钟，这里只提供
+/// 「不会自己超时」的基线。
 struct FrozenClock;
 
 impl Clock for FrozenClock {

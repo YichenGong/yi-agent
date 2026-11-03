@@ -34,6 +34,7 @@ use yi_agent_plugins::{
 use crate::plugin_host::assets::{AssetResponse, ASSET_SCHEME};
 use crate::plugin_host::cache::{OpenRequest, Rejection, ViewRegistry};
 use crate::plugin_host::container::{ContainerConfig, ViewInstance};
+use crate::plugin_host::remote_assets::HostIdentity;
 
 /// 受管清单的文件名。与 `yi-agent-supervisors::managed::MANAGED_MANIFEST`
 /// 同值；桌面壳不依赖那个 crate（它会带进 supervisor 的运行时假设），
@@ -61,15 +62,62 @@ pub struct PluginHost {
     views: Mutex<ViewRegistry>,
     /// 窗口 label → 实例 id。关闭窗口时反向查找。
     labels: Mutex<BTreeMap<String, String>>,
+    /// 当前宿主身份。桌面客户端同一时刻只"看"一个宿主；切换连接时递增
+    /// 代次并撤销旧绑定，旧句柄立刻失效。
+    current_host: Mutex<HostIdentity>,
 }
 
 impl PluginHost {
     pub fn new(home: PathBuf) -> PluginHost {
+        let instance = local_instance_id(&home);
         PluginHost {
             home,
             views: Mutex::new(ViewRegistry::new()),
             labels: Mutex::new(BTreeMap::new()),
+            current_host: Mutex::new(HostIdentity::local(instance)),
         }
+    }
+
+    /// 当前宿主身份的快照。前端拿它和 `assetRelease` 的宿主比对。
+    pub fn current_host(&self) -> HostIdentity {
+        self.current_host.lock().unwrap().clone()
+    }
+
+    /// 切换当前宿主（连上/切到另一台机器）。
+    ///
+    /// 切换必须先撤销旧宿主的全部视图：否则旧窗口仍然持有指向旧宿主文件的
+    /// 句柄，用户看到的是 A 的界面，操作却落到 B 的连接上。代次递增保证
+    /// 即便有句柄漏网，`resolve` 的宿主闸门也会拒绝它。
+    pub fn switch_host(&self, host: HostIdentity) -> usize {
+        let previous = {
+            let mut current = self.current_host.lock().unwrap();
+            std::mem::replace(&mut *current, host)
+        };
+        self.revoke_host(&previous)
+    }
+
+    /// 撤销某个宿主上的全部视图。断线、旧客户端不兼容都走这里。
+    /// 按宿主类别撤销全部视图（含它的所有代次）。
+    pub fn revoke_host_kind(&self, kind: &str) -> usize {
+        let mut views = self.views.lock().unwrap();
+        let revoked = views.revoke_kind(kind);
+        if revoked > 0 {
+            let mut labels = self.labels.lock().unwrap();
+            labels.retain(|_, instance| views.host_of(instance).is_some());
+        }
+        revoked
+    }
+
+    pub fn revoke_host(&self, host: &HostIdentity) -> usize {
+        let mut views = self.views.lock().unwrap();
+        let revoked = views.revoke_host(host);
+        if revoked > 0 {
+            // 窗口 label 指向已撤销的实例就没有意义了；留着会让下一次
+            // `WindowEvent::Destroyed` 去 close 一个不存在的句柄。
+            let mut labels = self.labels.lock().unwrap();
+            labels.retain(|_, instance| views.host_of(instance).is_some());
+        }
+        revoked
     }
 
     /// 用进程实例根构造。拿不到 home 时返回错误而不是退回当前目录：
@@ -177,6 +225,7 @@ impl PluginHost {
                 .map(|program| program.entry.clone()),
         };
         let window_label = format!("{WINDOW_PREFIX}{instance_id}");
+        let host = self.current_host();
 
         let mut views = self.views.lock().unwrap();
         let opened = views.open(OpenRequest {
@@ -186,6 +235,7 @@ impl PluginHost {
             manifest: &manifest,
             activation,
             view,
+            host: &host,
         })?;
         let result = OpenedView {
             instance_id: instance_id.clone(),
@@ -228,9 +278,10 @@ impl PluginHost {
                 activation: active.activation,
             });
         let _ = bound;
+        let host = self.current_host();
 
         let views = self.views.lock().unwrap();
-        match views.resolve(&instance, &relative, committed.as_ref()) {
+        match views.resolve(&instance, &relative, committed.as_ref(), Some(&host)) {
             Ok(body) => AssetResponse {
                 status: 200,
                 content_type: crate::plugin_host::assets::content_type_for(&relative),
@@ -267,6 +318,16 @@ impl PluginHost {
     pub fn instance(&self, instance_id: &str) -> Option<ViewInstance> {
         self.views.lock().unwrap().get(instance_id).cloned()
     }
+}
+
+/// 本机宿主的实例 id。
+///
+/// 由实例根派生而不是随机生成：随机 id 会让"同一个本机"在重启后变成另一台
+/// 宿主，缓存与绑定对不上；而全用常量又会让两个不同 `YI_AGENT_HOME` 的实例
+/// 互相冒充。取根的摘要前缀，既稳定又能区分实例。
+pub fn local_instance_id(home: &std::path::Path) -> String {
+    let digest = crate::plugin_host::assets::sha256_hex(home.to_string_lossy().as_bytes());
+    format!("local-{}", &digest[..16])
 }
 
 /// 已提交激活的线协议形状。与 `yi_agent_plugins::CommittedActivation` 同义，

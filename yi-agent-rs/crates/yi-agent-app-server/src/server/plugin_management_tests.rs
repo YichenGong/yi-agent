@@ -124,10 +124,11 @@ async fn unimplemented_management_methods_report_not_supported() {
     let mut h = Harness::with_scope(Scope::Admin).await;
     initialize(&mut h).await;
 
+    // `assetRelease` 已在 T20 实现（目录查得到才返回身份），不再列在这里：
+    // 一条会随任务推进而消失的断言若留着，只会变成"测试阻止功能变好"。
     for (index, method) in [
         "plugins/v1/inspectLegacy",
         "plugins/v1/adoptLegacy",
-        "plugins/v1/assetRelease",
         "plugins/v1/operationResult",
     ]
     .iter()

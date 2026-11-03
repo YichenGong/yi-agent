@@ -62,6 +62,12 @@ pub enum ViewRejection {
     UnknownInstance,
     /// 句柄指向的代次已不是当前激活。
     StaleGeneration { bound: u64, current: Option<u64> },
+    /// 句柄所属的宿主不再是当前宿主（切到另一个连接、代次推进）。
+    ///
+    /// 与 [`ViewRejection::StaleGeneration`] 分开：代次讲的是"同一宿主上的
+    /// 激活被换掉"，这里讲的是"这个句柄都不属于当前这台宿主"。两条判据任一
+    /// 成立都必须拒绝，但给出不同的话，用户才知道该重连还是该重开视图。
+    ForeignHost { bound: String, current: String },
     /// 清单里没有这个视图。
     UnknownView,
     /// 安装本身有问题（文件被替换、入口不见了）。
@@ -86,6 +92,11 @@ impl std::fmt::Display for ViewRejection {
                      activation any more; reinstall it"
                 ),
             },
+            ViewRejection::ForeignHost { bound, current } => write!(
+                f,
+                "this view is bound to {bound}, but the active host is {current}; \
+                 reopen it against the active host"
+            ),
             ViewRejection::UnknownView => write!(f, "the release does not declare this view"),
             ViewRejection::BrokenInstall(detail) => {
                 write!(f, "the installation is not usable: {detail}")

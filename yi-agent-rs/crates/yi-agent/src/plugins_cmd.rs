@@ -977,11 +977,8 @@ mod curl_fetcher_tests {
         assert_eq!(head.content_length, Some(expected.len() as u64));
 
         let mut received = Vec::new();
-        loop {
-            match fetcher.read(64 * 1024).expect("read") {
-                Some(chunk) => received.extend_from_slice(&chunk),
-                None => break,
-            }
+        while let Some(chunk) = fetcher.read(64 * 1024).expect("read") {
+            received.extend_from_slice(&chunk);
             assert!(received.len() <= expected.len(), "read past the body");
         }
         assert_eq!(

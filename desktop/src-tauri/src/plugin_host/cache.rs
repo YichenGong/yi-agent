@@ -24,6 +24,7 @@ use yi_agent_plugins::{CommittedActivation, InstalledRelease, Manifest, PluginEr
 
 use crate::plugin_host::assets::AssetCache;
 use crate::plugin_host::container::{ViewInstance, ViewRejection};
+use crate::plugin_host::remote_assets::HostIdentity;
 
 /// 打开视图时需要的、已经过验证的输入。
 pub struct OpenRequest<'a> {
@@ -35,6 +36,9 @@ pub struct OpenRequest<'a> {
     pub manifest: &'a Manifest,
     pub activation: u64,
     pub view: &'a str,
+    /// 这次打开属于哪个宿主。桌面客户端可能同时连着本机与远端，句柄必须
+    /// 记住自己在哪一边，否则切到 B 之后 A 的句柄仍然能读 A 的文件。
+    pub host: &'a HostIdentity,
 }
 
 /// 所有已打开视图的宿主侧注册表。
@@ -46,6 +50,8 @@ pub struct ViewRegistry {
 struct OpenView {
     instance: ViewInstance,
     assets: AssetCache,
+    /// 打开时的宿主身份快照。与 `activation` 一起构成完整的绑定。
+    host: HostIdentity,
 }
 
 impl ViewRegistry {
@@ -80,28 +86,57 @@ impl ViewRegistry {
             entry: entry.to_string(),
             root: assets.root().to_path_buf(),
         };
+        let host = request.host.clone();
         let key = request.instance_id;
-        self.views
-            .insert(key.clone(), OpenView { instance, assets });
+        self.views.insert(
+            key.clone(),
+            OpenView {
+                instance,
+                assets,
+                host,
+            },
+        );
         Ok(&self.views[&key].instance)
     }
 
     /// 按句柄读一个资源。
     ///
-    /// 三道闸门，顺序固定：
+    /// 四道闸门，顺序固定：
     /// 1. 句柄存在（关闭/从未打开都拒绝）；
-    /// 2. 代次仍是当前激活（升级/回滚之后旧句柄失效）；
-    /// 3. 路径在白名单里（包外、跨包、`..` 一律拒绝）。
+    /// 2. 宿主仍是当前宿主（切到别的连接之后旧句柄失效）；
+    /// 3. 代次仍是当前激活（升级/回滚之后旧句柄失效）；
+    /// 4. 路径在白名单里（包外、跨包、`..` 一律拒绝）。
+    ///
+    /// `host` 为 `None` 表示宿主还没握手完成。此时按"当前宿主未知"处理：
+    /// 只有本地宿主能读，远端句柄一律拒绝——"不确定"绝不能退化成"放行"，
+    /// 否则连上第二个连接的那一瞬间就是一个混淆窗口。
     pub fn resolve(
         &self,
         instance_id: &str,
         relative: &str,
         committed: Option<&CommittedActivation>,
+        host: Option<&HostIdentity>,
     ) -> Result<Vec<u8>, Rejection> {
         let open = self
             .views
             .get(instance_id)
             .ok_or(Rejection::View(ViewRejection::UnknownInstance))?;
+        let current_host = match host {
+            Some(host) => host.clone(),
+            None if !open.host.is_remote() => open.host.clone(),
+            None => {
+                return Err(Rejection::View(ViewRejection::ForeignHost {
+                    bound: open.host.binding_key(&open.instance.release),
+                    current: "<no host handshake>".to_string(),
+                }))
+            }
+        };
+        if open.host != current_host {
+            return Err(Rejection::View(ViewRejection::ForeignHost {
+                bound: open.host.binding_key(&open.instance.release),
+                current: current_host.binding_key(&open.instance.release),
+            }));
+        }
         if !open.instance.is_current(committed) {
             return Err(Rejection::View(ViewRejection::StaleGeneration {
                 bound: open.instance.activation,
@@ -122,6 +157,42 @@ impl ViewRegistry {
 
     pub fn close(&mut self, instance_id: &str) -> bool {
         self.views.remove(instance_id).is_some()
+    }
+
+    /// 撤销某个宿主上的全部视图，返回撤销数量。
+    ///
+    /// 连接切换、断开、旧客户端不兼容都走这里。返回计数而不是 `()`，是为了
+    /// 让调用方能断言"确实撤掉了几个"，而不是靠"没有报错"来判断成功。
+    pub fn revoke_host(&mut self, host: &HostIdentity) -> usize {
+        let doomed: Vec<String> = self
+            .views
+            .iter()
+            .filter(|(_, open)| open.host == *host)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            self.views.remove(id);
+        }
+        doomed.len()
+    }
+
+    /// 按宿主类别撤销（断开连接时只知道 profile，不知道当时的代次）。
+    pub fn revoke_kind(&mut self, kind: &str) -> usize {
+        let doomed: Vec<String> = self
+            .views
+            .iter()
+            .filter(|(_, open)| open.host.kind == kind)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            self.views.remove(id);
+        }
+        doomed.len()
+    }
+
+    /// 这个实例当前绑定在哪个宿主上。仅供宿主内部与测试使用。
+    pub fn host_of(&self, instance_id: &str) -> Option<&HostIdentity> {
+        self.views.get(instance_id).map(|open| &open.host)
     }
 
     pub fn len(&self) -> usize {

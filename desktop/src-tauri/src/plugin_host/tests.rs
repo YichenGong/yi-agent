@@ -11,6 +11,7 @@ use yi_agent_plugins::{CommittedActivation, InstalledRelease, Manifest, ReleaseI
 use crate::plugin_host::assets::AssetCache;
 use crate::plugin_host::cache::{OpenRequest, Rejection, ViewRegistry};
 use crate::plugin_host::container::ViewRejection;
+use crate::plugin_host::remote_assets::HostIdentity;
 
 const MANIFEST: &str = r#"{
   "schemaVersion": 1,
@@ -72,15 +73,11 @@ fn committed(activation: u64, version: &str, sha: &str) -> CommittedActivation {
     }
 }
 
-fn open(
-    registry: &mut ViewRegistry,
-    dir: &Path,
-    instance: &str,
-    activation: u64,
-) -> ReleaseId {
+fn open(registry: &mut ViewRegistry, dir: &Path, instance: &str, activation: u64) -> ReleaseId {
     let installed = install_at(dir);
     let manifest = manifest();
     let release = release_id("1.4.0", "aaa");
+    let host = HostIdentity::local("test-instance");
     registry
         .open(OpenRequest {
             instance_id: instance.to_string(),
@@ -89,9 +86,15 @@ fn open(
             manifest: &manifest,
             activation,
             view: "main",
+            host: &host,
         })
         .expect("open must succeed");
     release
+}
+
+/// 打开视图所用的本机宿主身份。与 `open` 里的同一份。
+fn local_host() -> HostIdentity {
+    HostIdentity::local("test-instance")
 }
 
 #[test]
@@ -183,7 +186,7 @@ fn serves_a_view_through_a_host_issued_handle() {
     let active = committed(7, "1.4.0", &release.sha256);
 
     let body = registry
-        .resolve("view-1", "ui/app.js", Some(&active))
+        .resolve("view-1", "ui/app.js", Some(&active), Some(&local_host()))
         .expect("a handle opened for this activation can read its own files");
     assert_eq!(body, b"console.log(1)");
 
@@ -197,7 +200,7 @@ fn serves_a_view_through_a_host_issued_handle() {
 #[test]
 fn rejects_unknown_handles_instead_of_falling_back() {
     let registry = ViewRegistry::new();
-    match registry.resolve("never-opened", "ui/index.html", None) {
+    match registry.resolve("never-opened", "ui/index.html", None, Some(&local_host())) {
         Err(Rejection::View(ViewRejection::UnknownInstance)) => {}
         other => panic!("expected UnknownInstance, got {other:?}"),
     }
@@ -212,7 +215,12 @@ fn closed_handles_stop_reading_immediately() {
 
     assert!(registry.close("view-1"));
     assert!(!registry.close("view-1"));
-    match registry.resolve("view-1", "ui/index.html", Some(&active)) {
+    match registry.resolve(
+        "view-1",
+        "ui/index.html",
+        Some(&active),
+        Some(&local_host()),
+    ) {
         Err(Rejection::View(ViewRejection::UnknownInstance)) => {}
         other => panic!("a closed handle must not read, got {other:?}"),
     }
@@ -226,7 +234,7 @@ fn a_handle_from_a_superseded_activation_is_refused() {
 
     // 升级已提交：同一个发布，代次推进到 4。
     let next = committed(4, "1.4.0", &release.sha256);
-    match registry.resolve("view-1", "ui/index.html", Some(&next)) {
+    match registry.resolve("view-1", "ui/index.html", Some(&next), Some(&local_host())) {
         Err(Rejection::View(ViewRejection::StaleGeneration {
             bound: 3,
             current: Some(4),
@@ -244,7 +252,7 @@ fn a_handle_from_a_different_release_is_refused() {
 
     // 已提交的是版本 1.5.0（不同摘要）：即使代次同为 1，也不是同一个发布。
     let other = committed(1, "1.5.0", "bbb");
-    match registry.resolve("view-1", "ui/index.html", Some(&other)) {
+    match registry.resolve("view-1", "ui/index.html", Some(&other), Some(&local_host())) {
         Err(Rejection::View(ViewRejection::StaleGeneration { bound: 1, .. })) => {}
         other => panic!("a cross-version token must be refused, got {other:?}"),
     }
@@ -268,7 +276,12 @@ fn a_handle_for_a_different_plugin_cannot_read_another_package() {
     };
     assert!(
         matches!(
-            registry.resolve("view-1", "ui/index.html", Some(&foreign)),
+            registry.resolve(
+                "view-1",
+                "ui/index.html",
+                Some(&foreign),
+                Some(&local_host())
+            ),
             Err(Rejection::View(ViewRejection::StaleGeneration { .. }))
         ),
         "a handle must not be validated against another plugin's activation"
@@ -288,7 +301,7 @@ fn rejects_paths_that_are_not_in_the_release_through_a_handle() {
         "ui/missing.js",
         "ui/../ui/index.html",
     ] {
-        match registry.resolve("view-1", request, Some(&active)) {
+        match registry.resolve("view-1", request, Some(&active), Some(&local_host())) {
             Err(Rejection::Path(_)) => {}
             other => panic!("`{request}` must be a path rejection, got {other:?}"),
         }
@@ -305,7 +318,12 @@ fn works_under_a_unicode_install_root() {
     let active = committed(2, "1.4.0", &release.sha256);
 
     let body = registry
-        .resolve("view-1", "ui/index.html", Some(&active))
+        .resolve(
+            "view-1",
+            "ui/index.html",
+            Some(&active),
+            Some(&local_host()),
+        )
         .expect("non-ASCII install roots must work");
     assert_eq!(body, b"<!doctype html><p>hi</p>");
 }
@@ -327,6 +345,7 @@ fn refuses_to_open_the_same_instance_twice() {
             manifest: &manifest,
             activation: 1,
             view: "main",
+            host: &local_host(),
         })
         .expect_err("reusing an instance id must not silently replace the old handle");
     assert!(error.to_string().contains("already open"));
@@ -347,11 +366,166 @@ fn a_view_not_declared_by_the_manifest_is_refused() {
             manifest: &manifest,
             activation: 1,
             view: "settings",
+            host: &local_host(),
         })
         .expect_err("settings is not in this manifest");
     assert!(error.to_string().contains("settings"));
     assert!(
         registry.is_empty(),
         "a failed open must not leave a half-registered handle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T20：跨宿主隔离
+// ---------------------------------------------------------------------------
+
+/// 打开视图并绑定到指定宿主。`open` 用本机身份，这里要指定别的宿主。
+fn open_on(
+    registry: &mut ViewRegistry,
+    dir: &Path,
+    instance: &str,
+    activation: u64,
+    host: &HostIdentity,
+) -> ReleaseId {
+    let installed = install_at(dir);
+    let manifest = manifest();
+    let release = release_id("1.4.0", "aaa");
+    registry
+        .open(OpenRequest {
+            instance_id: instance.to_string(),
+            release: &release,
+            installation: &installed,
+            manifest: &manifest,
+            activation,
+            view: "main",
+            host,
+        })
+        .expect("open must succeed");
+    release
+}
+
+/// 宿主 A 的句柄在切到宿主 B 之后读不到任何字节。
+///
+/// 这是 T20 的核心断言：两个宿主上同一个插件、同一个版本、同一份字节，
+/// 身份仍然不同。只按"插件 + 视图"记账的实现会在这里放行。
+#[test]
+fn a_handle_bound_to_host_a_stops_serving_once_host_b_is_active() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let host_a = HostIdentity::remote("profile-a", "inst-1");
+    let host_b = HostIdentity::remote("profile-b", "inst-1");
+    let release = open_on(&mut registry, tmp.path(), "view-a", 1, &host_a);
+    let active = committed(1, "1.4.0", &release.sha256);
+
+    // A 仍活跃时能读。
+    assert!(registry
+        .resolve("view-a", "ui/index.html", Some(&active), Some(&host_a))
+        .is_ok());
+
+    // 切到 B：同一句柄、同一代次、同一份已提交激活，仍然拒绝。
+    match registry.resolve("view-a", "ui/index.html", Some(&active), Some(&host_b)) {
+        Err(Rejection::View(ViewRejection::ForeignHost { .. })) => {}
+        other => panic!("host B must not read host A's view, got {other:?}"),
+    }
+}
+
+/// 撤销宿主之后，句柄立即变成"未知实例"，而不是"存在但被拒"。
+#[test]
+fn revoking_a_host_drops_its_handles_instead_of_leaving_them_dangling() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let host = HostIdentity::remote("profile-a", "inst-1");
+    let release = open_on(&mut registry, tmp.path(), "view-a", 1, &host);
+    let active = committed(1, "1.4.0", &release.sha256);
+    assert_eq!(registry.len(), 1);
+
+    assert_eq!(registry.revoke_host(&host), 1);
+    assert_eq!(registry.revoke_host(&host), 0, "revoking twice is a no-op");
+    assert!(registry.is_empty());
+    match registry.resolve("view-a", "ui/index.html", Some(&active), Some(&host)) {
+        Err(Rejection::View(ViewRejection::UnknownInstance)) => {}
+        other => panic!("a revoked handle must be unknown, got {other:?}"),
+    }
+}
+
+/// 撤销只影响目标宿主：另一个宿主的同名视图必须留下。
+#[test]
+fn revoking_one_host_leaves_the_other_host_intact() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let host_a = HostIdentity::remote("a", "i");
+    let host_b = HostIdentity::remote("b", "i");
+    let release_a = open_on(&mut registry, tmp.path(), "view-a", 1, &host_a);
+    let release_b = open_on(&mut registry, tmp.path(), "view-b", 1, &host_b);
+    let active_a = committed(1, "1.4.0", &release_a.sha256);
+    let active_b = committed(1, "1.4.0", &release_b.sha256);
+
+    assert_eq!(registry.revoke_host(&host_a), 1);
+    assert!(matches!(
+        registry.resolve("view-a", "ui/index.html", Some(&active_a), Some(&host_a)),
+        Err(Rejection::View(ViewRejection::UnknownInstance))
+    ));
+    assert!(registry
+        .resolve("view-b", "ui/index.html", Some(&active_b), Some(&host_b))
+        .is_ok());
+}
+
+/// 同一个宿主推进代次之后，旧句柄失效，新句柄可用。
+#[test]
+fn advancing_the_host_generation_invalidates_the_previous_handles() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let mut host = HostIdentity::remote("a", "i");
+    let release = open_on(&mut registry, tmp.path(), "view-old", 1, &host);
+    let active = committed(1, "1.4.0", &release.sha256);
+
+    host.generation += 1;
+    match registry.resolve("view-old", "ui/index.html", Some(&active), Some(&host)) {
+        Err(Rejection::View(ViewRejection::ForeignHost { bound, current })) => {
+            assert_ne!(bound, current, "the rejection must name both generations");
+        }
+        other => panic!("an older generation must not be current, got {other:?}"),
+    }
+
+    let release = open_on(&mut registry, tmp.path(), "view-new", 1, &host);
+    let active = committed(1, "1.4.0", &release.sha256);
+    assert!(registry
+        .resolve("view-new", "ui/index.html", Some(&active), Some(&host))
+        .is_ok());
+}
+
+/// 宿主还没握手完成（`None`）时，远端句柄一律拒绝。
+///
+/// "不确定"绝不能退化成"放行"：连上第二个连接的那一瞬间就是最大的混淆窗口。
+#[test]
+fn an_unhandshaked_host_never_serves_a_remote_view() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let host = HostIdentity::remote("a", "i");
+    let release = open_on(&mut registry, tmp.path(), "view-a", 1, &host);
+    let active = committed(1, "1.4.0", &release.sha256);
+
+    match registry.resolve("view-a", "ui/index.html", Some(&active), None) {
+        Err(Rejection::View(ViewRejection::ForeignHost { current, .. })) => {
+            assert!(current.contains("no host handshake"), "got {current}");
+        }
+        other => panic!("an unknown host must not serve a remote view, got {other:?}"),
+    }
+}
+
+/// 本机视图在 `None` 时照旧可用：本地没有"另一个连接"可混淆。
+#[test]
+fn a_local_view_still_serves_when_the_host_argument_is_absent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut registry = ViewRegistry::new();
+    let release = open(&mut registry, tmp.path(), "view-1", 1);
+    let active = committed(1, "1.4.0", &release.sha256);
+
+    assert_eq!(
+        registry
+            .resolve("view-1", "ui/index.html", Some(&active), None)
+            .expect("local views do not need a remote handshake"),
+        b"<!doctype html><p>hi</p>"
     );
 }

@@ -18,6 +18,10 @@ pub(crate) struct Fixture {
     _temp: tempfile::TempDir,
     bundle: PathBuf,
     metadata: PathBuf,
+    /// 打出来的包摘要。T20 之前没有读者；现在离线缓存测试要拿它当键，
+    /// 故保留而不是删字段（删掉会让 `Fixture::build` 少一次摘要计算，
+    /// 而那份计算结果正是"包与该摘要绑定"的测试依据）。
+    #[allow(dead_code)]
     pub(crate) sha256: String,
 }
 

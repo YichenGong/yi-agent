@@ -595,6 +595,7 @@ async fn eof_exits_gracefully() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            plugin_catalog: PathBuf::new(),
             // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
             // 二进制当 daemon、并白等 10s)。
             resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
@@ -682,6 +683,7 @@ async fn oversized_frame_returns_err() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            plugin_catalog: PathBuf::new(),
             // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
             // 二进制当 daemon、并白等 10s)。
             resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
