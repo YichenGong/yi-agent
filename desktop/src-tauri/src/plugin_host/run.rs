@@ -360,10 +360,33 @@ pub fn run_probe(context: tauri::Context<tauri::Wry>, options: ProbeOptions) -> 
         .cloned();
     context.config_mut().app.windows.clear();
 
+    // 探针必须注册**生产的那套命令**，否则测的就不是真实边界。
+    //
+    // 这条曾经是错的：探针原先没有 `invoke_handler`，于是页面调用 `rpc` 得到
+    // `Command rpc not found`，被当成「ACL 拒绝了它」。实际只证明了「这个临时
+    // 应用没有这条命令」。换成生产命令集后立刻暴露真实情况——在声明 app
+    // manifest 之前，`set_relay_url` 是能被插件页面直接调用的。
+    //
+    // 命令名必须与 `lib.rs` 的 `invoke_handler` 和 `build.rs` 的
+    // `APP_COMMANDS` 保持一致；漏掉一个，探针就会漏测那一条命令的边界。
     let handler_state = Arc::clone(&state);
-    let builder = tauri::Builder::default().register_uri_scheme_protocol(
-        ASSET_SCHEME,
-        move |_ctx, request| {
+    let builder = tauri::Builder::default()
+        .manage(crate::bridge::Sidecar::new())
+        .invoke_handler(tauri::generate_handler![
+            crate::bridge::rpc,
+            crate::bridge::rpc_respond,
+            crate::bridge::set_relay_url,
+            crate::bridge::restart_sidecar,
+            crate::bridge::kill_remote_slots,
+            crate::bridge::remote_connect,
+            crate::bridge::remote_disconnect,
+            crate::bridge::remote_status,
+            crate::bridge::remote_enabled,
+            crate::bridge::remote_list,
+            crate::bridge::remote_upsert,
+            crate::bridge::remote_remove
+        ])
+        .register_uri_scheme_protocol(ASSET_SCHEME, move |_ctx, request| {
             let (parts, body) = request.into_parts();
             let (status, content_type, body) = handle_request(
                 &handler_state,
@@ -380,8 +403,7 @@ pub fn run_probe(context: tauri::Context<tauri::Wry>, options: ProbeOptions) -> 
                 .header("Referrer-Policy", "no-referrer")
                 .body(body)
                 .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
-        },
-    );
+        });
 
     let setup_state = Arc::clone(&state);
     let setup_main_config = main_config.clone();

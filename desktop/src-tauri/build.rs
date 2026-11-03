@@ -14,8 +14,36 @@
 
 use std::path::Path;
 
+/// 应用自定义命令的 ACL 清单。
+///
+/// **为什么必须有它。** Tauri 只在三种情况下对自定义命令做 ACL 检查：命令是
+/// `plugin:` 命令、应用声明了 app manifest、或来源不是 local。`plugin-asset://`
+/// 是已注册协议，因此插件页面被判定为 local；本仓库原先没有 `permissions/`，
+/// `has_app_acl_manifest` 恒为 false。三者全不成立，于是 `rpc`、`set_relay_url`
+/// 等命令对插件页面**完全不经过 ACL**（实测可调用 `set_relay_url`）。
+///
+/// 声明 manifest 后，自定义命令默认不被任何窗口允许，必须在 capability 里逐个
+/// 列出——这正是不想让插件窗口拿到的能力。新增 `bridge::*` 命令时必须同步加到
+/// 这里和 `capabilities/default.json`，否则主窗口会调不动它。
+const APP_COMMANDS: &[&str] = &[
+    "rpc",
+    "rpc_respond",
+    "set_relay_url",
+    "restart_sidecar",
+    "kill_remote_slots",
+    "remote_connect",
+    "remote_disconnect",
+    "remote_status",
+    "remote_enabled",
+    "remote_list",
+    "remote_upsert",
+    "remote_remove",
+];
+
 fn main() {
-    tauri_build::build();
+    let mut attributes = tauri_build::Attributes::new();
+    attributes = attributes.app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS));
+    tauri_build::try_build(attributes).expect("failed to run tauri-build");
 
     println!("cargo:rerun-if-env-changed=YI_AGENT_BUILD_KIND");
 

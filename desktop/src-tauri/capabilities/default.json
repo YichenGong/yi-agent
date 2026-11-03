@@ -1,13 +1,27 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window. The app commands are listed explicitly: declaring an app ACL manifest makes every custom command denied by default, so the main window must opt in to each one it uses.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
     "opener:allow-open-url",
     "opener:allow-default-urls",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "allow-kill-remote-slots",
+    "allow-remote-connect",
+    "allow-remote-disconnect",
+    "allow-remote-enabled",
+    "allow-remote-list",
+    "allow-remote-remove",
+    "allow-remote-status",
+    "allow-remote-upsert",
+    "allow-restart-sidecar",
+    "allow-rpc",
+    "allow-rpc-respond",
+    "allow-set-relay-url"
   ]
 }

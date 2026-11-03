@@ -112,8 +112,18 @@ async function nativeStorageDenied() {
     return [true, evidence];
   }
 
+  // 每条都带**完整合法参数**，否则一条「缺参数」错误会被误读成「被拒绝」。
+  // 之前 `rpc` 只传了 method/params，于是拿到 `missing required key slot`，
+  // 看起来像失败、实际是根本没进到权限判断。
+  //
+  // 判据是「失败原因必须是拒绝，而不是不存在或参数错」：
+  //   - `not found`        → 探针没注册这条命令，证明不了任何边界；
+  //   - `missing ... key`  → 参数不合法，同样没到权限判断；
+  //   - `not allowed`      → 这才是 ACL 拒绝，唯一有效的通过证据。
   const attempts = [
-    ["host rpc (sidecar)", "rpc", { method: "runtime.status", params: {} }],
+    ["host rpc (sidecar)", "rpc", { slot: "local", id: 1, method: "runtime.status", params: {} }],
+    ["set_relay_url", "set_relay_url", { url: "https://attacker.invalid" }],
+    ["restart_sidecar", "restart_sidecar", {}],
     ["plugin store", "plugin:store|get", { key: "session", id: 1 }],
     ["filesystem read", "plugin:fs|read_text_file", { path: "/etc/passwd" }],
     ["dialog open", "plugin:dialog|open", { options: {} }],
@@ -125,7 +135,17 @@ async function nativeStorageDenied() {
       return [false, evidence];
     } catch (error) {
       const message = String(error).replace(/\s+/g, " ").slice(0, 140);
-      evidence.push(`${label} refused: ${message}`);
+      const notFound = /not found/i.test(message);
+      const notAllowed = /not allowed/i.test(message);
+      if (notFound) {
+        evidence.push(`${label}: INCONCLUSIVE (\`${command}\` not registered in this build: ${message})`);
+        return [false, evidence];
+      }
+      if (!notAllowed) {
+        evidence.push(`${label}: INCONCLUSIVE (no ACL verdict: ${message})`);
+        return [false, evidence];
+      }
+      evidence.push(`${label} refused by ACL: ${message}`);
     }
   }
   evidence.push("every host-storage read was refused");
@@ -136,11 +156,22 @@ async function nativeStorageDenied() {
 async function nativeInvokeDenied() {
   const attempts = [];
   if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === "function") {
-    try {
-      await window.__TAURI_INTERNALS__.invoke("plugin:opener|open_url", { url: "https://example.com" });
-      attempts.push("invoke(opener) resolved");
-    } catch (error) {
-      attempts.push(`invoke threw: ${String(error).slice(0, 80)}`);
+    // 宿主自有命令也必须试：它们曾经完全绕过 ACL，只测 `plugin:` 命令会漏掉。
+    for (const [command, args] of [
+      ["set_relay_url", { url: "https://attacker.invalid" }],
+      ["plugin:opener|open_url", { url: "https://example.com" }],
+    ]) {
+      try {
+        await window.__TAURI_INTERNALS__.invoke(command, args);
+        attempts.push(`BREACH: invoke(${command}) resolved`);
+      } catch (error) {
+        const message = String(error).replace(/\s+/g, " ").slice(0, 100);
+        if (/not allowed/i.test(message)) {
+          attempts.push(`invoke(${command}) refused by ACL: ${message}`);
+        } else {
+          attempts.push(`invoke(${command}) INCONCLUSIVE: ${message}`);
+        }
+      }
     }
   }
   const probeScript = document.createElement("script");
@@ -149,7 +180,7 @@ async function nativeInvokeDenied() {
   if (window.__invokeProbe && window.__invokeProbe !== "undefined") {
     attempts.push("invoke is reachable from inline script");
   }
-  return attempts.some((line) => line === "invoke(opener) resolved")
+  return attempts.some((line) => line.startsWith("BREACH") || line.includes("INCONCLUSIVE"))
     ? [false, attempts]
     : [true, attempts.length ? attempts : ["no invoke surface exists"]];
 }
