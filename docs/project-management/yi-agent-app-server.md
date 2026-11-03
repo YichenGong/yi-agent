@@ -1,5 +1,9 @@
 # yi-agent-app-server（GUI app-server）
 
+## 防休眠加固交叉引用（待实现）
+
+启动失败收口、电源线程生命周期及后台 busy 接线见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 2–4、6。需求 P2/P3/P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数；完成判据为 T1–T7/G1–G5/B5–B8、`cargo test -p yi-agent-app-server --lib sleep_hardening_`。本轮仅文档，未实现。
+
 ## 模块说明
 
 `yi-agent-app-server` 是桌面 GUI 的后端进程：一个长驻进程，通过 **stdio 上的

@@ -57,6 +57,18 @@
   - 前端分组：`desktop/src/components/SettingsRuntimeTab.tsx`；判据
     `npx vitest run src/components/SettingsRuntimeTab.test.tsx`
 
+## 待实现加固（2026-11-03）
+
+设计：[任务运行防休眠加固 spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)；
+计划：[实施 plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md)。仅文档审查完成，以下产品需求尚未实现。
+
+- [ ] P1 被动双栈链路资格，移除 route/TCP 80 判据；完成判据：plan Task 1 的 N1–N8 用例及 `cargo test -p yi-agent-power sleep_hardening_`，真机网络边界按 Task 7 验收。
+- [ ] P2 RPC/插件/cold lead 启动失败按 turn_id 回滚并收口；完成判据：plan Tasks 3–4 的 T1–T7，`cargo test -p yi-agent-app-server --lib sleep_hardening_`，warm 排队语义不回归。
+- [ ] P3 一致输入与可通知电源线程、真实已持断言停机测试；完成判据：plan Task 2 的 G1–G5、`cargo test -p yi-agent-app-server --lib sleep_hardening_`，可控预算1秒、真机预算2秒且不冒充硬实时。
+- [ ] P4 显式后台进程意图，默认false、活跃才参与busy；完成判据：plan Tasks 5–6 的 B1–B8，tools/app-server `sleep_hardening_` 与 desktop `npx tsc --noEmit && npx vitest run`。
+
+这四项只在本模块计数，tools/app-server 交叉引用不重复增加需求数。通过 spec/plan 不表示产品修复；原已完成项记录基线行为，实施后再同步替换旧探针说明。
+
 ## 非目标
 
 - 不实现唤醒后续跑（需独立 spec）。
