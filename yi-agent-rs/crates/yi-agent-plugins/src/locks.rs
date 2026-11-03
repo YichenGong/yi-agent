@@ -16,6 +16,19 @@
 //! 因此同路径的锁在进程内去重，返回同一个 `Arc`。表里存 `Weak`，
 //! 否则表与锁互相持有，锁永不释放。
 //!
+//! # `fork` 与 `exec` 之间的窗口
+//!
+//! `std` 在 unix 上打开文件时**默认**带 `O_CLOEXEC`，所以 `exec` 之后的子进程
+//! 不会继承锁描述符——长驻子进程（sidecar 等）不会把项目永久锁死。
+//!
+//! 但 `fork` 与 `exec` 之间，子进程与父进程共享同一个打开文件描述。父进程
+//! 若在这个窗口里释放锁，`flock` 仍被那个尚未 `exec` 的子进程持有，于是
+//! 「释放后立刻探测存活」会短暂返回 true（实测毫秒级，子进程 `exec` 后消失）。
+//!
+//! 这是 flock 的固有性质，加 `O_CLOEXEC` 也消除不了，**不需要**消除：
+//! 所有调用方只依赖「最终一致」——`reclaimable` 下一轮重新判定，维护动作
+//! 重试一次即可。测试因此断言有界收敛，而不是瞬时可见。
+//!
 //! # 锁文件永不删除
 //!
 //! 删掉会让「已打开同一 inode 的竞争者」锁在 unlinked 文件上，第三个
@@ -150,6 +163,8 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<Arc<ExclusiveLock>, Plu
 ///
 /// 刻意 `doc(hidden)`：这不是 API，只是让一条本不可观测的内存属性
 /// 可被测试钉住，否则「表随路径数无限增长」只能靠读代码发现。
+#[doc(hidden)]
+/// 诊断：本进程登记了多少把锁。
 #[doc(hidden)]
 pub fn tracked_lock_count() -> usize {
     let table = process_locks().lock().unwrap_or_else(|e| e.into_inner());

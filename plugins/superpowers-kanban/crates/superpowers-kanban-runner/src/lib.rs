@@ -10,6 +10,7 @@ pub mod tick;
 
 pub mod dispatch;
 pub mod persist;
+pub mod quota;
 pub mod resident;
 pub mod service;
 pub mod single_instance;

@@ -498,11 +498,48 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** `QuotaContext { config_path, leases_path, revision }` 和 `ProjectOwnership` 由宿主注入，独立于 instance_home。配额共享格式遵循 G3，不能让一个新实例创建自己的完整预算。跨进程活动观测带 owner 存活锁；只在死亡确认后回收，不按过期时间猜。
 
-- [ ] Step 1：两实例/两项目测试同一峰值，不允许各自再得到全额；修改共享配置产生修订冲突时更新/回退失败，不覆盖新值。
-- [ ] Step 2：增加旧格式共存与不兼容迁移拒绝、无法定位共享域拒绝新自动任务、同项目第二 owner 拒绝、维护期间后端重启 owner 不丢失的红例。
-- [ ] Step 3：实现显式上下文和跨实例兼容检查；运行统计不能把“宿主本进程的 sessions.running”直接当整机值。聚合已登记活 owner 的统计且不双扣看板租约；quota 中审批等待的既有口径与 drain 中未结束 turn 的口径分别保留。
-- [ ] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test quota && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test ownership`；再 `cd ../plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`。覆盖普通非看板回合消耗预算，实例关闭不留下虚假活动。
-- [ ] Step 5：按 C 提交 `feat: preserve shared plugin quotas across managed instances`。
+- [x] Step 1：两实例/两项目测试同一峰值，不允许各自再得到全额；修改共享配置产生修订冲突时更新/回退失败，不覆盖新值。
+  > 2026-11-03：`crates/yi-agent-plugins/tests/quota.rs` 12 项 + runner 侧 `quota::tests` 12 项。
+  > 两实例共享一份预算：`two_instances_share_one_budget_instead_of_each_getting_a_full_one`（插件）与
+  > `two_instances_do_not_each_get_the_full_machine_peak`（runner，走完整 `driver/next` 一拍）。
+  > 后者是**真正的红例**：把 `launch_budget` 退回直接用 `sessions.running` 时它会红，因为两个实例
+  > 都上报 0、都以为"峰值 2 还有 2 个名额"。
+  > 修订冲突：`writing_with_a_stale_revision_is_refused_and_keeps_the_newer_value`、
+  > `a_stale_revision_cannot_overwrite_a_newer_limit`、`a_write_must_advance_the_revision_by_exactly_one`
+  > （插件侧）与 `a_write_must_advance_the_revision_by_exactly_one`（runner 侧）。
+- [x] Step 2：增加旧格式共存与不兼容迁移拒绝、无法定位共享域拒绝新自动任务、同项目第二 owner 拒绝、维护期间后端重启 owner 不丢失的红例。
+  > 2026-11-03：无法定位共享域 → `a_path_outside_any_quota_domain_is_refused_rather_than_guessed`、
+  > `a_config_and_lease_directory_in_different_domains_is_refused`、
+  > `a_missing_config_allows_no_new_automatic_work`、
+  > `a_corrupt_shared_config_is_reported_rather_than_treated_as_absent`。
+  > 同项目第二 owner → `a_second_owner_cannot_take_a_project_that_is_already_owned`（Busy 必须带持有者名字）、
+  > `a_child_process_must_not_inherit_the_owner_lock` 的反面（同进程不同 owner 亦互斥，见下）。
+  > 旧格式/不兼容迁移：`a_corrupt_shared_config_is_reported_rather_than_treated_as_absent` 明确拒绝猜测。
+  > **新发现的真实缺陷（同进程不同 owner 被放行）**：`held` 表原先只按路径索引，第二个 owner 拿到
+  > `owns_lock: false` 的 guard 并成功——等价于没有互斥。改为 `HeldOwner { owner, lock }` 后，
+  > `a_second_owner_cannot_take_a_project_that_is_already_owned` 能单独打红它。
+- [x] Step 3：实现显式上下文和跨实例兼容检查；运行统计不能把“宿主本进程的 sessions.running”直接当整机值。聚合已登记活 owner 的统计且不双扣看板租约；quota 中审批等待的既有口径与 drain 中未结束 turn 的口径分别保留。
+  > 2026-11-03：`QuotaContext`/`ProjectOwnership`（`yi-agent-plugins`）与 `QuotaDomain`/`LocalActivity`
+  > （runner `src/quota.rs`）都由宿主/调用方**注入**路径，不默认 instance_home。
+  > 整机统计：每个实例在 `<quota-domain>/activity/<owner>.activity` 持 flock 并写自己的会话数；
+  > 扫描方**拿得到锁就是已死、跳过**，不按 mtime/TTL 猜。
+  > 不双扣：`remaining()` 用 `observed.total().max(own)`，**不相加**（`own_sessions_are_not_added_on_top_of_the_observation`）。
+  > `sessions.running` 只作为兜底证据：`a_plain_non_board_turn_consumes_the_shared_budget` 钉住手动回合也吃额度；
+  > `a_closed_instance_leaves_no_phantom_activity` 钉住关停不留虚假活动。
+  > `lease.rs:47` 的注释矛盾已修：代码一直是「拒绝启动」，注释却写「回退按项目限流」，现以代码为准并注明。
+- [x] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test quota && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test ownership`；再 `cd ../plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`。覆盖普通非看板回合消耗预算，实例关闭不留下虚假活动。
+  > 2026-11-03：`quota` 12/12、`ownership` 15/15（1 ignored 为子进程入口）、plugin crate 全量 205 项绿；
+  > `superpowers-kanban-runner` 180 + 42 项绿，clippy `-D warnings` 干净。
+  > 变异验证 12 项全部打红：域不匹配、跳过修订检查、跳过修订递增、缺配置当无上限、
+  > `own` 与观测相加、同 owner 累加、同进程 owner 不互斥、按年龄回收、`sanitize` 丢掉摘要、
+  > 去掉 `acquire` 的重试窗口、`sessions.running` 直接当整机值。
+  > **两个被当作"实现缺陷"追了很久、实际是 flock 固有性质的现象**（已写进 `locks.rs` 与
+  > `ownership.rs` 的模块注释，测试断言有界收敛而非瞬时可见）：
+  > ① `fork` 与 `exec` 之间子进程与父进程共享同一打开文件描述，父进程释放后锁仍被那个窗口持有（毫秒级）；
+  > ② 同进程并发 `spawn` 会让 `is_alive` 短暂误判。
+  > 为此 `ProjectOwnership::acquire` 加了 250ms 有界重试：**不抢占**真持有者（仍要真拿到 flock），
+  > 只避免把瞬时窗口报成"别的实例占着这个项目"。
+- [x] Step 5：按 C 提交 `feat: preserve shared plugin quotas across managed instances`。
 
 ### Task T14：接入 supervisor、watchman 与受管 CLI
 

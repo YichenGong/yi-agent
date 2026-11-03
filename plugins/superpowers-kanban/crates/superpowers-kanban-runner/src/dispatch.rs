@@ -1019,6 +1019,191 @@ mod tests {
         );
     }
 
+    /// 两个实例、两个项目、同一份整机峰值：不允许各自再得到全额。
+    ///
+    /// 这条是 T13 的核心红例。只用 `sessions.running` 实现时它会绿——两个实例
+    /// 各自上报 0，各自看到"峰值 2 还有 2 个名额"，于是合计起 4 个。只有真的
+    /// 读整机活动表（别人持锁登记的会话数）才会红。
+    #[test]
+    fn two_instances_do_not_each_get_the_full_machine_peak() {
+        let workdir = tempfile::tempdir().unwrap();
+        let dir_a = workdir.path().join("a");
+        let dir_b = workdir.path().join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let project_a = project_with_worktree(&dir_a);
+        let project_b = project_with_worktree(&dir_b);
+        let state_a = state_dir(&project_a);
+        let state_b = state_dir(&project_b);
+
+        // 两份看板共用一个 home，因此共用一份配额域。
+        let home = workdir.path().join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        // 两个实例的看板里**各自**都有一张排队卡。少了这一步，实例 B 即使
+        // 拿到全额余量也无卡可起，测试会以"没有动作"通过——那是假绿。
+        let enqueue = |state: &Path| {
+            std::fs::create_dir_all(state).unwrap();
+            let mut board = superpowers_kanban_core::board::Board::new();
+            board.enqueue(
+                superpowers_kanban_core::card::CardId::new("card-1"),
+                "a.spec.md".into(),
+                "a.plan.md".into(),
+                chrono::Local::now(),
+            );
+            crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+        };
+        enqueue(&state_a);
+        enqueue(&state_b);
+
+        let service_a = crate::service::BoardService::new(
+            state_a.clone(),
+            project_a.clone(),
+            Some(home.clone()),
+        );
+        let service_b = crate::service::BoardService::new(
+            state_b.clone(),
+            project_b.clone(),
+            Some(home.clone()),
+        );
+
+        // 实例 A 已经在跑 2 个会话（宿主上报，同时它会把 2 写进活动表）。
+        dispatch_with_service(
+            &service_a,
+            &state_a,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+        )
+        .unwrap();
+
+        // 实例 B 自己也上报 0 —— 它只能看到自己。若直接拿 0 去比峰值，
+        // 它会以为还有 2 个名额。
+        let value = dispatch_with_service(
+            &service_b,
+            &state_b,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 0 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["kind"].as_str(),
+            None,
+            "整机已被实例 A 占满，实例 B 不许再起：{value}"
+        );
+        // 也必须真的**没有认领**：卡还是 queued。只看返回值会漏掉
+        // "返回了动作但字段名不对" 这一整类错误。
+        assert_eq!(
+            crate::persist::read_board(&state_b)
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued,
+            "the card must stay queued when the machine is full"
+        );
+    }
+
+    /// 普通非看板回合也消耗预算。
+    ///
+    /// 看板只起自己那几张卡，但用户的**手动**会话也在调模型。`sessions.running`
+    /// 的口径本来就包含它们；活动表也照抄这个口径，所以一个纯手动会话必须
+    /// 让看板少一个名额。
+    #[test]
+    fn a_plain_non_board_turn_consumes_the_shared_budget() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 1,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        // 峰值 1，一个与看板无关的会话正开着。
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 1 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["kind"].as_str(),
+            None,
+            "手动会话也吃同一份额度：{value}"
+        );
+        assert_eq!(
+            crate::persist::read_board(&state)
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued,
+            "a plain manual turn must leave no room for an automatic launch"
+        );
+    }
+
+    /// 实例关停后不能留下虚假活动继续扣额度。
+    #[test]
+    fn a_closed_instance_leaves_no_phantom_activity() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        {
+            let service = crate::service::BoardService::new(
+                state.clone(),
+                project.clone(),
+                Some(home.clone()),
+            );
+            dispatch_with_service(
+                &service,
+                &state,
+                None,
+                "driver/next",
+                &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+            )
+            .unwrap();
+        }
+
+        // 实例已 drop（flock 释放）。新实例必须看到整机空闲，而不是被
+        // 上一实例留下的数字继续扣着。
+        let fresh =
+            crate::service::BoardService::new(state.clone(), project.clone(), Some(home.clone()));
+        let domain = fresh.quota_domain().expect("shared domain");
+        // 有界收敛而不是一拍断言：`flock` 的释放与探测之间没有同步保证（内核
+        // 异步释放；`fork`/`exec` 之间的子进程共享描述符）。生产调用方每拍都
+        // 重算，同样只依赖最终一致。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let total = crate::quota::observe_machine(&domain).unwrap().total();
+            if total == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a closed instance must not keep burning the machine budget; still {total}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// 端到端跨进程契约：一张排队卡 → 恰好一个 `launch`，字段名逐字对齐宿主
     /// `session_driver::parse_action`（spec §4.3）。
     #[test]

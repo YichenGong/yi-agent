@@ -87,4 +87,16 @@
 - [x] 提交后不可取消 — `projecting`/`done` 拒绝 `cancel`。判据：`cancel_is_refused_after_the_commit`、`cancel_restores_admission_and_keeps_the_plugin_open`
 - [x] 恢复不覆盖别人改过的共享配置修订 — 判据：`recovery_does_not_overwrite_a_shared_config_revision_that_moved`
 - [x] 屏障计数以磁盘锁为准（跨句柄/跨进程） — 不再读进程内登记表。判据：`the_admission_barrier_counts_permits_from_another_handle`、`a_live_turn_keeps_the_transaction_at_drained`
-- [ ] 整机配额域适配与项目维护所有权 — T13
+- [x] 整机配额域适配与项目维护所有权 — `src/quota.rs`、`src/ownership.rs`。判据：`cargo test -p yi-agent-plugins --test quota --test ownership`
+- [x] 配额域必须自洽且不能被猜 — 配置与租约必须同属 `superpowers-kanban` 域；找不到域时**拒绝**而不是建独立池（建池 = 每实例一份完整预算）。判据：`a_config_and_lease_directory_in_different_domains_is_refused`、`a_path_outside_any_quota_domain_is_refused_rather_than_guessed`
+- [x] 缺配置不等于无上限、坏配置不等于空表 — 前者 `remaining()` 返回 0，后者报 `RecoveryRequired`（当成空表会让下一次写入覆盖别人刚设的限额）。判据：`a_missing_config_allows_no_new_automatic_work`、`a_corrupt_shared_config_is_reported_rather_than_treated_as_absent`
+- [x] 共享配置按修订递增，旧修订不能覆盖新值 — 判据：`writing_with_a_stale_revision_is_refused_and_keeps_the_newer_value`、`a_write_must_advance_the_revision_by_exactly_one`
+- [x] 观测不双扣 — 同一个 owner 记两次取 max 不累加；`own` 已含在观测里，用 `max` 不相加。判据：`the_same_owner_recorded_twice_is_not_double_counted`、`own_sessions_are_not_added_on_top_of_the_observation`
+- [x] 只覆盖本实例的统计不得冒充整机值 — `ObservationScope::InstanceOnly` 时 `is_machine_wide()` 为假。判据：`an_instance_only_observation_is_not_advertised_as_a_machine_total`
+- [x] 限额低于已用时饱和到 0 — 判据：`a_limit_smaller_than_usage_saturates_at_zero`
+- [x] 维护所有权互斥且不抢占 — 第二 owner 得 `Busy` 且错误含持有者名字；不同项目互不影响。判据：`a_second_owner_cannot_take_a_project_that_is_already_owned`、`a_second_owner_may_take_a_different_project`、`releasing_frees_the_project_for_the_next_owner`
+- [x] 同进程不同 owner 也必须互斥 — `held` 表原先只按路径索引，第二个 owner 会拿到 `owns_lock: false` 的 guard 并成功，等价于放行。用 `HeldOwner { owner, lock }` 修掉。判据：`a_second_owner_cannot_take_a_project_that_is_already_owned`
+- [x] 存活只问 `flock`，不问时间 — 把 owner 文件与锁的 mtime 改到 20 天前仍判活着；`SIGSTOP` 不释放锁；`SIGKILL` 由内核释放。判据：`liveness_is_never_decided_by_file_age`、`a_stopped_process_keeps_its_ownership`、`a_killed_process_releases_its_ownership`
+- [x] 回收只列死 owner — 判据：`reclaimable_lists_only_dead_owners`、`reclaimable_is_empty_when_every_owner_is_alive`
+- [x] 项目键投影防撞名 — 可读前缀 + sha256 摘要；`/p/a/b` 与 `/p/a_b`、`a-b` 与 `a_b` 不共用锁文件。判据：`two_projects_whose_keys_sanitise_to_the_same_file_still_get_different_locks`、`project_keys_that_differ_only_in_separators_do_not_collide`
+- [x] 瞬时 fork 窗口不被当成"别人占着" — `fork` 与 `exec` 之间子进程与父进程共享打开文件描述，刚释放的锁短暂仍被持有。`acquire` 做 250ms 有界重试，仍必须真拿到 flock（不抢占）。判据：`a_free_project_is_acquired_even_when_a_fork_window_temporarily_holds_the_lock`

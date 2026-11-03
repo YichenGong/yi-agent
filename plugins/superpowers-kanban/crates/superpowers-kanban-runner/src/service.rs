@@ -174,6 +174,11 @@ struct Inner {
     /// 若 id 只有序号，上一进程遗留的回报会被误认成本进程的动作。
     next_action_seq: u64,
     action_nonce: String,
+    /// 本实例在整机活动表里的登记（`<quota-domain>/activity/<owner>.activity`）。
+    ///
+    /// 惰性建立：只有真的推进过一拍才写。`None` 表示配额域不可解析（`HOME`
+    /// 缺失）或还没发布过——两者都不该让本实例"看起来在跑"。
+    activity: Option<crate::quota::LocalActivity>,
 }
 
 /// 一个已交出、等回报的动作。
@@ -236,6 +241,7 @@ impl BoardService {
                     std::process::id(),
                     chrono::Local::now().timestamp_millis()
                 ),
+                activity: None,
             }),
         }
     }
@@ -284,6 +290,9 @@ impl BoardService {
         // 也在全机计数里，再减一次就是双重扣减；反过来，一张标了 `done` 但会话还
         // 开着的卡不算「在跑」也是对的——名额由租约按活会话记，状态只描述进展。
         let limit = self.calendar().limit_at(chrono::Local::now());
+        // 先把本进程此刻的会话数**发布**到整机活动表，再算余量。顺序不能反：
+        // 反了的话本拍读到的是上一拍的自己，刚起的会话会少算一个名额。
+        self.publish_activity(sessions_running.unwrap_or(0));
         let budget = self.launch_budget(sessions_running);
         // 3) 合并队列：用户确认过的卡在这里排到队。放在启动之前——合并优先，
         //    且它一拍最多开一个、开完即返回，本拍不会再起新会话。
@@ -482,15 +491,11 @@ impl BoardService {
         candidates.sort_by(|a, b| {
             (a.merge_queued_at, a.order, &a.id).cmp(&(b.merge_queued_at, b.order, &b.id))
         });
-        let Some(leases_dir) = inner.leases_dir.clone() else {
-            return None;
-        };
+        let leases_dir = inner.leases_dir.clone()?;
         for card in candidates {
             // a) 会话名额。拿不到就整拍不推进——名额是全机共享的，换一张卡也
             //    一样拿不到，继续试只是白烧 CPU。
-            let Some(lease) = lease::acquire_in(&leases_dir, limit as usize) else {
-                return None;
-            };
+            let lease = lease::acquire_in(&leases_dir, limit as usize)?;
             // b) 合并锁。拿不到说明别的进程刚抢到：把会话名额放回，换下一张。
             let gate = match crate::merge_lock::acquire_with_holder(&self.state_dir, &card.id.0) {
                 crate::merge_lock::MergeAttempt::Granted(lock)
@@ -594,21 +599,105 @@ impl BoardService {
             .count()
     }
 
-    /// 本拍还能起几个会话：全机峰值 − 全机运行会话数。
+    /// 本拍还能起几个会话：全机峰值 − **整机**已用。
     ///
-    /// `sessions_running` 由宿主在 `driver/next` 里下发，口径是「正在调模型或
-    /// 正在执行进程的会话数」（`AwaitingApproval` 与人闲都不算）。它是**全机**
-    /// 事实，不区分会话由谁创建——手动会话也占额度。
+    /// # 为什么不能直接用 `sessions_running`
     ///
-    /// 旧宿主不带这个字段（`None`）时退回全机租约口径（`budget = 峰值`）：
-    /// 租约本来就按活会话记，跨项目共享，比看板的卡片状态更接近真相。
-    /// **绝不**退回 `running_count`——按状态数「在跑」正是要废除的误判口径。
+    /// 宿主下发的 `sessions.running` 是**它自己那个进程**看到的全机数字。两个
+    /// 实例各自拿它去比同一个总上限，两边都会看到"还有余量"，合计就超了
+    /// （G3 §6.3）。这台机器上同时可能跑着桌面壳、CLI、以及另一个实例的插件。
+    ///
+    /// 所以已用量取两处证据的**较大者**，不相加：
+    ///
+    /// 1. 整机活动表：每个活实例在 `<quota-domain>/activity/` 下持有 flock 并
+    ///    写着自己的会话数。存活由锁判定（进程退出释放、`SIGSTOP` 不释放），
+    ///    不按时间猜。
+    /// 2. 宿主上报值：旧宿主、或活动目录写不进去时，这是唯一来源。
+    ///
+    /// 不是相加的理由：本进程的会话既在自己的活动行里、又在宿主上报值里，相加
+    /// 会把它算两遍，于是"还有一个名额"变成"一个都没有"。
+    ///
+    /// 活动表读不出来（配额域不可解析、目录损坏）时**退回宿主上报值**，而不是
+    /// 当成 0：当成 0 会让每个读失败的实例都以为整机空闲，那正是超发的形态。
     fn launch_budget(&self, sessions_running: Option<u32>) -> usize {
         let limit = self.calendar().limit_at(chrono::Local::now()) as usize;
-        match sessions_running {
-            Some(running) => limit.saturating_sub(running as usize),
-            None => limit,
+        let Some(used) = self.machine_usage(sessions_running) else {
+            // 配额都不存在就不该自动起任务（G3 §6.2）。没有配置时 `limit`
+            // 来自内置默认值，此时保持原有「按日历限额」行为，但活动表读不到
+            // 就别再假装知道整机状态。
+            return match sessions_running {
+                Some(running) => limit.saturating_sub(running as usize),
+                None => limit,
+            };
+        };
+        limit.saturating_sub(used as usize)
+    }
+
+    /// 整机已用会话数：活动表与宿主上报取**较大者**，不相加。`None` 表示
+    /// 两处都没有可信证据。
+    fn machine_usage(&self, sessions_running: Option<u32>) -> Option<u32> {
+        let observed = self
+            .quota_domain()
+            .and_then(|domain| crate::quota::observe_machine(&domain).ok());
+        match (observed, sessions_running) {
+            (Some(observed), reported) => {
+                let total = observed.total();
+                // 本进程的会话已在活动行里；上报值可能更新（例如刚起了一个
+                // 还没来的及发布的会话），取较大者既不会双扣也不会漏。
+                Some(total.max(reported.unwrap_or(0)))
+            }
+            (None, Some(reported)) => Some(reported),
+            (None, None) => None,
         }
+    }
+
+    /// 本实例的配额域。`None` 表示无法定位共享域——调用方必须**阻止**新的
+    /// 自动任务，而不是自造一个池（G3 §6.2）。
+    pub fn quota_domain(&self) -> Option<crate::quota::QuotaDomain> {
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => PathBuf::from(std::env::var_os("HOME").filter(|home| !home.is_empty())?),
+        };
+        crate::quota::QuotaDomain::resolve(&home)
+    }
+
+    /// 把本实例此刻的会话数发布到整机活动表。
+    ///
+    /// 每拍调用一次。失败只打日志：活动登记是**观测**，它坏了应当让
+    /// `launch_budget` 退回宿主上报值，而不是让整拍失败——整拍失败会让宿主
+    /// 把已消费的回报当成没送到而重发。
+    fn publish_activity(&self, sessions: u32) {
+        let Some(domain) = self.quota_domain() else {
+            eprintln!(
+                "superpowers-kanban: no shared quota domain (HOME unset); \
+                 cross-instance activity cannot be published"
+            );
+            return;
+        };
+        let owner = format!("{}-{}", self.instance_owner_prefix(), std::process::id());
+        let mut inner = self.lock();
+        let activity = inner
+            .activity
+            .get_or_insert_with(|| crate::quota::LocalActivity::new(domain, owner));
+        if let Err(error) = activity.publish(sessions) {
+            eprintln!("superpowers-kanban: could not publish activity: {error}");
+        }
+    }
+
+    /// 本实例在整机活动表里的唯一名字。
+    ///
+    /// 只取项目目录末段 + pid **不够**：同一个宿主进程可以托管多个项目的看板
+    /// （`dispatch_with_service` 里的两个 `BoardService` 就是），它们的 pid 相同、
+    /// 项目名可能相同，于是两行活动会落到同一个文件——一个覆盖另一个，整机
+    /// 用量少算一半，两个实例于是各自再拿一份额度。
+    ///
+    /// 所以名字里带**状态目录的全路径摘要**：路径本身已经是每个看板唯一的。
+    /// 尾部仍留 pid，让人一眼看出是哪个进程写的。
+    fn instance_owner_prefix(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.state_dir.to_string_lossy().as_bytes());
+        let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        format!("kanban-{hex}")
     }
 
     fn locked_cards(&self) -> Vec<Card> {

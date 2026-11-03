@@ -418,9 +418,9 @@ where
     for token in rest {
         if token == all_flag {
             all = true;
-        } else if token.starts_with("--") {
-            return Err(format!("unexpected argument: {token}"));
-        } else if card_id.is_some() {
+        } else if token.starts_with("--") || card_id.is_some() {
+            // 两种情形给出同一条结论：这个位置只能有一个 card id，多出来的
+            // 位置要么是第二个 id，要么是一个没人认识的选项。
             return Err(format!("unexpected argument: {token}"));
         } else {
             card_id = Some(token);

@@ -36,9 +36,15 @@ impl Lease {
 /// The directory every project's plugin leases from:
 /// `$HOME/.yi-agent/superpowers-kanban/leases`.
 ///
-/// `None` when `HOME` is unset. A caller that cannot resolve it must fall back
-/// to per-project limiting rather than inventing a directory: two different
-/// guesses would hand out two disjoint pools and silently overrun the provider.
+/// `None` when `HOME` is unset. A caller that cannot resolve it must **refuse to
+/// start new automatic work**, not fall back to a per-project pool. That is what
+/// the callers actually do (`service.rs` returns `"no lease directory"` from
+/// `driver_step`, `next_launch` errors, `promote_merge_queue` declines). Inventing
+/// a directory would hand out two disjoint pools and silently overrun the
+/// provider — the bill grows and nothing reports an error.
+///
+/// This comment used to say "fall back to per-project limiting", which the code
+/// has never done. The comment was the bug (G3 §6.2); the code is the contract.
 pub fn global_leases_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
