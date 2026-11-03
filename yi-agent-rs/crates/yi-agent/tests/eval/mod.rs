@@ -11,6 +11,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod baseline;
+
 /// 一条 eval case 的完整定义，对应一个 TOML 文件。
 #[derive(Debug, serde::Deserialize)]
 pub struct Case {
@@ -309,8 +311,19 @@ pub fn load_cases(dir: &Path) -> Vec<(PathBuf, Case)> {
 // 执行
 // ---------------------------------------------------------------------------
 
-/// 在临时目录里铺好 fixture，跑 agent，返回 Trace 与 stdout。
-pub fn run_case(bin: &Path, case: &Case) -> Result<(Trace, String), String> {
+/// `run_case` 的三个产出。
+pub struct RunOutput {
+    pub trace: Trace,
+    /// 该 case **声明要检查的**结果文件的实际内容（`expect.result.files` 的键）。
+    ///
+    /// 只取声明过的键，不是临时目录里的全部文件：agent 会在工作目录里留下
+    /// 一堆中间产物（备份、临时脚本），把它们全量纳入基线会让基线天天变，
+    /// 而它们与「这条 case 是否正确完成」无关。
+    pub result_files: BTreeMap<String, String>,
+}
+
+/// 在临时目录里铺好 fixture，跑 agent，返回 Trace、stdout 与结果文件内容。
+pub fn run_case(bin: &Path, case: &Case) -> Result<RunOutput, String> {
     // 先清空上一轮的轨迹：超时/启动失败时 `run_case` 直接返回 `Err`，
     // 若不清空，调用方会打印出上一条 case 的轨迹，把它当成本条实测值去校准预算。
     // 实测踩过：case 007 超时，打印的 tokens/calls 与 006 完全相同。
@@ -370,7 +383,19 @@ pub fn run_case(bin: &Path, case: &Case) -> Result<(Trace, String), String> {
             failures.join("\n  ")
         ));
     }
-    Ok((trace, stdout))
+    // 收集声明过的结果文件内容。读取失败（文件没被创建）时记为缺失——不塞空串，
+    // 否则「本应创建却没创建」会被当成「内容为空」，基线比对就失去意义。
+    let mut result_files = BTreeMap::new();
+    for rel in case.expect.result.files.keys() {
+        if let Ok(content) = std::fs::read_to_string(tmp.path().join(rel)) {
+            result_files.insert(rel.clone(), content);
+        }
+    }
+
+    Ok(RunOutput {
+        trace,
+        result_files,
+    })
 }
 
 // ---------------------------------------------------------------------------

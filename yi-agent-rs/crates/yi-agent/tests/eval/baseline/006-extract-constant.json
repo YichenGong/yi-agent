@@ -1,0 +1,19 @@
+{
+  "id": "006-extract-constant",
+  "tool_calls": 7,
+  "input_tokens": 33234,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/a.rs": "SECONDS_PER_DAY",
+    "src/b.rs": "SECONDS_PER_DAY"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "grep",
+    "write"
+  ],
+  "secs": 39,
+  "samples": 3
+}

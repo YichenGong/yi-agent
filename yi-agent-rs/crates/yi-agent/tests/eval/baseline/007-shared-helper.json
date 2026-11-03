@@ -1,0 +1,18 @@
+{
+  "id": "007-shared-helper",
+  "tool_calls": 10,
+  "input_tokens": 62444,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/util.rs": "double"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "glob",
+    "write"
+  ],
+  "secs": 68,
+  "samples": 3
+}

@@ -1,0 +1,18 @@
+{
+  "id": "012-fix-off-by-one-loop",
+  "tool_calls": 6,
+  "input_tokens": 37958,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/lib.rs": "\\(0\\.\\.n\\)"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "edit",
+    "read"
+  ],
+  "secs": 26,
+  "samples": 3
+}

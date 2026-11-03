@@ -1,0 +1,16 @@
+{
+  "id": "028-only-read",
+  "tool_calls": 3,
+  "input_tokens": 20036,
+  "ended_normally": true,
+  "modified_files": false,
+  "result_patterns": {},
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "glob",
+    "read"
+  ],
+  "secs": 15,
+  "samples": 3
+}

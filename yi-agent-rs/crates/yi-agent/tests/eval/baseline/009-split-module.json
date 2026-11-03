@@ -1,0 +1,19 @@
+{
+  "id": "009-split-module",
+  "tool_calls": 9,
+  "input_tokens": 51710,
+  "ended_normally": true,
+  "modified_files": true,
+  "result_patterns": {
+    "src/second.rs": "pub fn second"
+  },
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "glob",
+    "grep",
+    "write"
+  ],
+  "secs": 75,
+  "samples": 3
+}

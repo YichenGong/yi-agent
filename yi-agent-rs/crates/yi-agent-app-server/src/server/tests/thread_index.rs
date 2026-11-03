@@ -2821,7 +2821,8 @@ async fn diff_read_does_not_block_the_main_loop() {
 #[test]
 fn diff_read_panic_fallback_matches_the_callers_shape() {
     // 单文件请求：原样保留 DiffTextResult 形状。
-    let text = crate::rpc::thread::diff_read_fallback(true, Some("origin/main"));
+    let text =
+        crate::rpc::thread::content::diff_read::diff_read_fallback(true, Some("origin/main"));
     assert_eq!(
         text,
         serde_json::json!({ "unifiedDiff": "", "truncated": false }),
@@ -2829,7 +2830,8 @@ fn diff_read_panic_fallback_matches_the_callers_shape() {
     );
 
     // 整线程请求：必须是字段齐全的空 ThreadDiffResult。
-    let whole = crate::rpc::thread::diff_read_fallback(false, Some("origin/main"));
+    let whole =
+        crate::rpc::thread::content::diff_read::diff_read_fallback(false, Some("origin/main"));
     assert_eq!(
         whole,
         serde_json::json!({
@@ -2845,7 +2847,7 @@ fn diff_read_panic_fallback_matches_the_callers_shape() {
     );
 
     // 无 `base` 时必须显式给 `null`，而不是把这个字段整个省掉。
-    let whole_no_base = crate::rpc::thread::diff_read_fallback(false, None);
+    let whole_no_base = crate::rpc::thread::content::diff_read::diff_read_fallback(false, None);
     assert_eq!(whole_no_base["base"], serde_json::Value::Null);
 }
 

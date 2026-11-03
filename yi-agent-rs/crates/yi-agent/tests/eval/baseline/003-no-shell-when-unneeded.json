@@ -1,0 +1,16 @@
+{
+  "id": "003-no-shell-when-unneeded",
+  "tool_calls": 2,
+  "input_tokens": 14759,
+  "ended_normally": true,
+  "modified_files": false,
+  "result_patterns": {},
+  "result_hashes": {},
+  "tool_kinds": [
+    "bash",
+    "glob",
+    "read"
+  ],
+  "secs": 12,
+  "samples": 3
+}
