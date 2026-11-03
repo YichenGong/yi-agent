@@ -1,5 +1,9 @@
 # yi-agent-tools
 
+## 防休眠加固交叉引用（待实现）
+
+显式后台进程保活意图与读回见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) §7、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 5–6。需求 P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数；完成判据为 B1–B8、`cargo test -p yi-agent-tools --lib sleep_hardening_` 与 app-server/desktop 接线回归。本轮仅文档，未实现。
+
 ## 模块说明
 
 yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统）、Shell、Web、Skill 核心工具能力，通过实现 `yi-agent-core` 的 `Tool` trait 接入 agent。
