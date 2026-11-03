@@ -657,6 +657,22 @@ impl WorkerHandle {
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     }
 
+    /// Requeues an event that a transport delivered.
+    ///
+    /// Used when a worker's execution lives in another process: the transport
+    /// reconstructs the event and hands it back here, so the coordinator keeps
+    /// reading one buffer regardless of where the worker ran. Deliberately the
+    /// same funnel as a locally reported event -- there must not be a second,
+    /// differently-behaving path into the queue.
+    pub fn report_transported_event(&self, event: WorkerEvent) {
+        self.report(event);
+    }
+
+    /// Records a watchdog fact that a transport delivered.
+    pub fn report_transported_watchdog(&self, event: WorkerWatchdogEvent) {
+        self.report_watchdog(event);
+    }
+
     fn report(&self, event: WorkerEvent) {
         self.events
             .lock()

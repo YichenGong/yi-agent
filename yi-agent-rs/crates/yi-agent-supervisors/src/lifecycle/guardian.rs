@@ -965,6 +965,24 @@ fn prepare_control_stream(stream: &std::os::unix::net::UnixStream) -> io::Result
     Ok(())
 }
 
+/// Serves exactly one control connection.
+///
+/// Exposed for integration tests that own their accept loop: a test must be able
+/// to run the real handler against a real socket without spawning a whole
+/// guardian, and re-implementing the handler in the test would test the copy.
+pub fn serve_one_for_test(
+    guardian: &mut Guardian,
+    stream: std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    prepare_control_stream(&stream)?;
+    serve_control_connection(
+        guardian,
+        &mut ProcessRegistry::without_journal("test", guardian.artifact.clone()),
+        stream,
+    );
+    Ok(())
+}
+
 fn serve_control_connection(
     guardian: &mut Guardian,
     registry: &mut ProcessRegistry,
@@ -1041,6 +1059,42 @@ fn serve_control_connection(
                     code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
                     reason,
                 },
+            }
+        }
+        ControlRequest::Admission { asked } => {
+            // The guardian, not the daemon, decides whether this client may still
+            // start work. That ordering is the point: a release that has already
+            // begun withdrawal must refuse the Start even though the daemon still
+            // holds an executor channel for the client.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            if asked.task.is_empty() || asked.attempt.is_empty() {
+                // An admission question about nothing would be answered "yes" by
+                // the lease table, which knows only about the owner.
+                ControlResponse::Rejected {
+                    code: yi_agent_lifecycle::types::ControlErrorCode::InvalidRequest,
+                    reason: "an admission question must name its task and attempt".into(),
+                }
+            } else {
+                match guardian.leases.admits(&asked.grant, now) {
+                    Err(reason) => ControlResponse::Rejected {
+                        code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                        reason,
+                    },
+                    // A generation mismatch is refused: the previous generation's
+                    // admission is closed once a new one is selected.
+                    Ok(()) if asked.generation != guardian.generation => {
+                        ControlResponse::Rejected {
+                            code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
+                            reason: format!(
+                                "generation {} is not current (this guardian serves {})",
+                                asked.generation, guardian.generation
+                            ),
+                        }
+                    }
+                    Ok(()) => ControlResponse::Ack,
+                }
             }
         }
         // Heartbeat/resume/reclaim/operation are completed in later tasks; until

@@ -9,7 +9,7 @@
 
 | 模块 | 完成 / 总计 | 详情 |
 |---|---|---|
-| yi-agent-core | 25 / 26 | [详情](./yi-agent-core.md) |
+| yi-agent-core | 26 / 27 | [详情](./yi-agent-core.md) |
 | yi-agent-llm | 12 / 15 | [详情](./yi-agent-llm.md) |
 | yi-agent-tools | 19 / 19 | [详情](./yi-agent-tools.md) |
 | yi-agent-skills | 9 / 9 | [详情](./yi-agent-skills.md) |
@@ -25,9 +25,9 @@
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
 | yi-agent-runtime | 24 / 24 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
-| yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
+| yi-agent-subagent | 11 / 11 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 79 / 79 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 49 / 56 | [详情](./subagent-runtime.md) |
+| subagent-runtime | 49 / 58 | [详情](./subagent-runtime.md) |
 | yi-agent-lifecycle | 11 / 13 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 125 | [详情](./desktop.md) |

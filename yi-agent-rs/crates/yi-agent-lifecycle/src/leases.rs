@@ -259,9 +259,60 @@ impl LeaseTable {
         self.released.len()
     }
 
-    /// Leases currently held. Includes `LeaseOnly` and `WaitingNextGeneration`: both
-    /// keep the runtime alive. Read-only queries never register, so they are absent
-    /// by construction.
+    /// Whether `client` may start new work right now.
+    ///
+    /// `false` is the answer for an unknown id as well as a released one: an
+    /// unknown id has no admitted lease, and treating "never registered" as
+    /// "allowed" would let a caller bypass admission by inventing an id.
+    pub fn admits_execution(&self, client: &str) -> bool {
+        if self.released.iter().any(|id| id == client) {
+            return false;
+        }
+        self.leases.contains_key(client)
+    }
+
+    /// Whether `grant` may start new work at `now`.
+    ///
+    /// The credential and epoch must match the live lease, so a caller cannot ask
+    /// on behalf of an owner it does not speak for. An expired lease is refused:
+    /// its client is about to be reclaimed, and admitting work into it would
+    /// orphan that work.
+    pub fn admits(&self, grant: &ClientGrant, now: Duration) -> Result<(), String> {
+        if self.released.iter().any(|id| id == &grant.client_run_id) {
+            return Err(format!(
+                "client {} was released; its new work is refused",
+                grant.client_run_id
+            ));
+        }
+        let lease = self
+            .leases
+            .get(&grant.client_run_id)
+            .ok_or_else(|| format!("client {} is not registered", grant.client_run_id))?;
+        if lease.credential != grant.credential || lease.epoch != grant.epoch {
+            return Err(format!(
+                "stale or forged grant for client {} (epoch {})",
+                grant.client_run_id, grant.epoch
+            ));
+        }
+        if lease.mode != LeaseMode::Business {
+            // `LeaseOnly` observes and controls upgrades; it never authorizes a
+            // task. Enforced here rather than at the call site, because a lease
+            // that *could* be talked into running work would make the mode
+            // advisory.
+            return Err(format!(
+                "client {}'s lease is {:?}, which never authorizes a task",
+                grant.client_run_id, lease.mode
+            ));
+        }
+        if lease.expires_at <= now {
+            return Err(format!(
+                "client {}'s lease expired; its new work is refused",
+                grant.client_run_id
+            ));
+        }
+        Ok(())
+    }
+
     pub fn active_count(&self) -> usize {
         self.leases.len()
     }

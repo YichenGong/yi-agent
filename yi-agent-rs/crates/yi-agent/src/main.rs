@@ -5,6 +5,7 @@ mod config;
 mod control_commands;
 mod flags_cmd;
 mod llm_prefix;
+mod managed_runtime;
 mod onboarding_prompt;
 mod resume;
 mod schedule_intent;
@@ -99,6 +100,9 @@ fn main() -> Result<()> {
         Some(Command::Flags { ref action }) => run_flags(action),
         Some(Command::InternalRuntime { ref action }) => match action {
             InternalRuntimeAction::Identity { json } => run_internal_identity(*json),
+            InternalRuntimeAction::Executor { owner, models } => {
+                run_internal_executor(owner.clone(), models.clone())
+            }
         },
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
@@ -310,6 +314,17 @@ fn run_flags(action: &FlagsAction) -> Result<()> {
 /// packaging pipeline and the bundle-manifest generator ask on a machine where no
 /// runtime exists. `--json` is the machine form; the human form is for debugging
 /// a version mismatch by hand.
+/// Runs one client's worker executor.
+///
+/// Resolves the local runtime configuration the same way every other entry point
+/// does, then hands the inherited descriptor to the executor. No public RPC is
+/// involved, so a local process cannot ask this binary to execute anything.
+fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> Result<()> {
+    let overrides = yi_agent_runtime::config::ConfigOverrides::default();
+    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
+    managed_runtime::run_executor(owner, models, config)
+}
+
 fn run_internal_identity(json: bool) -> Result<()> {
     let executable = std::env::current_exe()?;
     let identity = build_info::artifact_identity(&executable);

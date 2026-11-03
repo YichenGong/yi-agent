@@ -252,6 +252,19 @@ pub enum InternalRuntimeAction {
         #[arg(long)]
         json: bool,
     },
+    /// Run one client's worker executor.
+    ///
+    /// Started by the daemon with an inherited control descriptor; never typed by
+    /// a user. Refuses to run without that descriptor.
+    Executor {
+        /// The client this executor serves, as the daemon established it.
+        #[arg(long)]
+        owner: String,
+        /// The model catalogue to resolve providers from. Defaults to this
+        /// machine's catalogue.
+        #[arg(long)]
+        models: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

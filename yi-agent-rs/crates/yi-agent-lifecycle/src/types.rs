@@ -221,6 +221,41 @@ pub enum ControlRequest {
         grant: ClientGrant,
         operation_id: OperationId,
     },
+    /// Ask whether one execution may start.
+    ///
+    /// Owner-bound by construction: the grant must match the live lease, so this is
+    /// not a way to learn about, or act for, another client. It cannot spawn
+    /// anything -- a refusal is the only power it has.
+    Admission {
+        asked: ExecutionAdmission,
+    },
+}
+
+/// A narrow, owner-bound execution-admission question.
+///
+/// This is *not* a public control operation: it is asked over a private descriptor
+/// the guardian issued to one owner, and it can only ever answer about work that
+/// owner is about to start. It grants no ability to spawn, renew, or register --
+/// its whole purpose is to let the guardian refuse a Start after it has begun
+/// withdrawing a client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAdmission {
+    /// The owner's own grant. Proves the asker really speaks for this client:
+    /// without it a caller could ask about someone else's owner, or invent one.
+    pub grant: ClientGrant,
+    pub generation: String,
+    pub task: String,
+    pub attempt: String,
+}
+
+/// The guardian's answer to an [`ExecutionAdmission`] question.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmissionVerdict {
+    /// This exact execution may start now.
+    Admitted,
+    /// The owner's admission is closed: released, expired, or past this
+    /// generation. The caller must not start the work.
+    Refused { reason: String },
 }
 
 /// Responses on the control channel (protocol v1).

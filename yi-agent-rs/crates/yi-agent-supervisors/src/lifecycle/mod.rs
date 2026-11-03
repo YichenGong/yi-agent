@@ -17,6 +17,7 @@
 //! process created a fresh one, so two holders would both believe they own the
 //! runtime.
 
+pub mod admission;
 pub mod guardian;
 pub mod processes;
 pub mod scope;
