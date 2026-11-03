@@ -31,10 +31,21 @@ use std::time::{Duration, Instant};
 use crate::error::PluginError;
 
 /// 持有的独占锁。`Drop` 时关闭文件，内核随之释放 `flock`。
+///
+/// 手写 `Debug`：`File` 的 `Debug` 会打出描述符号，那对诊断没帮助，
+/// 而派生 `Debug` 会让持锁结构体没法被 `#[derive(Debug)]`。
 pub struct ExclusiveLock {
     /// 只为持有 `flock` 而存在；从不读取。
     _file: File,
     path: PathBuf,
+}
+
+impl std::fmt::Debug for ExclusiveLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExclusiveLock")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExclusiveLock {

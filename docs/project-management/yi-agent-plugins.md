@@ -66,4 +66,15 @@
 - [x] 升级不自动扩权 — 新能力进 `pending` 并要求重新确认，旧能力不重置；`pending` 里的能力即便在 `granted` 中也拒绝。判据：`a_capability_increase_requires_reconfirmation`、`a_pending_capability_is_refused_even_if_it_is_listed_as_granted`、`a_pure_version_bump_does_not_require_reconfirmation`、`confirming_a_reconfirmation_clears_pending_and_bumps_the_generation`
 - [x] 子目录不逃过根的撤销 — 判据：`a_revoked_grant_cannot_be_reused_through_a_subdirectory_path`
 - [x] 授权持久化后重开仍拒旧绑定 — 判据：`a_grant_table_survives_a_round_trip_and_still_rejects_stale_bindings`
-- [ ] 活动准入、排空屏障与幂等操作记录 — T11
+- [x] permit 是真实存活的 OS 锁 — `src/admission.rs` 用 `flock` 住 permit 文件；存活判定用独立描述符试锁，不看 TTL/PID/mtime。判据：`a_crashed_process_releases_its_permit`、`a_stopped_process_keeps_its_permit`（SIGSTOP 后仍不可获取）、`two_processes_cannot_both_take_the_same_turn_permit`
+- [x] 排空拒绝新工作、允许旧 turn 收尾 — 拒新 turn / Launch / 外部写，允许已登记且屏障前的旧 turn 写。判据：`a_draining_plugin_refuses_new_launches`、`a_draining_plugin_refuses_new_turns`、`a_draining_plugin_refuses_external_writes_but_allows_old_turn_writes`、`a_single_turn_can_wrap_up_several_writes_and_release_once`
+- [x] `parent_turn` 不是授权 — 要求 turn 已登记 + 锁仍被持有 + 屏障前 + project/grant 一致。判据：`a_forged_turn_id_is_rejected`、`a_finished_turn_cannot_start_another_round`、`a_turn_from_another_project_cannot_wrap_up_here`、`turn_write_only_covers_writes`
+- [x] 屏障计数只算存活的屏障前 permit — 判据：`the_barrier_wait_counts_only_live_before_barrier_permits`、`a_turn_waiting_on_approval_keeps_the_barrier_from_completing`
+- [x] 取消排空恢复旧准入 — 不关闭整个插件。判据：`cancelling_a_drain_restores_admission_without_closing_the_plugin`、`concurrent_barrier_establishment_is_idempotent`
+- [x] 写操作幂等台账 — 键为 `(requestId, method, params-digest)`；同 ID 同参数返回原结果，改参数或改 method → `Conflict`。判据：`the_same_request_with_the_same_params_replays_the_recorded_result`、`the_same_request_id_with_different_params_is_a_conflict`、`the_same_request_id_with_a_different_method_is_a_conflict`、`array_order_still_matters`
+- [x] 读操作不留日志 — 判据：`reads_do_not_leave_a_permanent_log`、`finishing_a_read_does_not_create_a_log_either`
+- [x] 已送出但无结果的写标 Unknown 且不重放 — `begin` 先记 Unknown 再执行。判据：`a_begun_but_unfinished_write_is_unknown`、`a_replay_of_an_unknown_request_returns_unknown_not_a_fresh_start`
+- [x] 结果查询按原绑定作用域 — 别的项目或别的授权代次查不到。判据：`a_result_cannot_be_read_through_another_project_binding`
+- [x] 坏台账不当空表 — 当空会重放用户已看到成功的写。判据：`a_corrupt_ledger_is_reported_rather_than_treated_as_empty`
+- [x] 台账读改写跨进程串行 — `begin`/`finish` 各取一次 `operations.lock` 短锁；`result` 只读不加锁（`rename` 保证只看到完整文件）。判据：`two_processes_beginning_different_requests_do_not_lose_an_update`（删锁即打红，已实测）
+- [ ] 候选激活、事务日志与失败恢复 — T12

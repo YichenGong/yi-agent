@@ -455,11 +455,17 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 §3 Admission API。新增 `OperationLedger::result(request_id: &str, binding: &Binding) -> Result<OperationOutcome, PluginError>`；`OperationOutcome` 与 TS result 联合一一对应。读操作不留下永久幂等日志。
 
-- [ ] Step 1：写排空期间新 Launch/外部 Write 拒绝、旧 turn 的状态写与锁释放允许、turn 结束后旧凭据不能开下一轮的失败测试。
-- [ ] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test admission && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test operations`；先验证保护缺失时确实红。
-- [ ] Step 3：实现准入与屏障的原子检查、TurnPermit/OperationPermit 存活锁、规范 request ID 与参数摘要；重复同 ID 同参数不重复提交，重复 ID 改参数返回 Conflict。已送出但缺结果的写标 Unknown，不在重连/重启时重放。`parent_turn` 字符串不是收尾授权：须核对宿主登记的会话/调用者绑定和仍存活的屏障前 permit，伪填他人 turn ID 的外部写必须拒绝。结果查询与新业务准入分离：认证管理调用可在原绑定作用域查询已提交结果，旧代次不能据此再提交操作，切换项目不能取另一个项目结果。
-- [ ] Step 4：subprocess 测进程崩溃释放、暂停进程不能按 TTL 回收、活跃审批仍阻塞 drain、单 turn 多次必要收尾以及并发建立屏障。取消 drain 恢复旧准入，不能关闭整个插件。
-- [ ] Step 5：按 C 提交 `feat: gate plugin operations and drain active turns safely`。
+- [x] Step 1：写排空期间新 Launch/外部 Write 拒绝、旧 turn 的状态写与锁释放允许、turn 结束后旧凭据不能开下一轮的失败测试。
+  > 2026-11-03：`a_draining_plugin_refuses_new_launches`、`a_draining_plugin_refuses_external_writes_but_allows_old_turn_writes`、`a_draining_plugin_refuses_new_turns`、`a_finished_turn_cannot_start_another_round`。第一条用例同时断言「拒绝外部写」与「允许旧 turn 写」——只测前者的话，一个「排空期拒绝一切写」的实现也能通过，而那会让屏障永远等不到零。
+- [x] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test admission && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test operations`；先验证保护缺失时确实红。
+  > 2026-11-03：`admission` 15/15（另 2 条 `#[ignore]` 子进程入口）、`operations` 17/17。14 项变异逐条验证，11 项打红。
+- [x] Step 3：实现准入与屏障的原子检查、TurnPermit/OperationPermit 存活锁、规范 request ID 与参数摘要；重复同 ID 同参数不重复提交，重复 ID 改参数返回 Conflict。已送出但缺结果的写标 Unknown，不在重连/重启时重放。`parent_turn` 字符串不是收尾授权：须核对宿主登记的会话/调用者绑定和仍存活的屏障前 permit，伪填他人 turn ID 的外部写必须拒绝。结果查询与新业务准入分离：认证管理调用可在原绑定作用域查询已提交结果，旧代次不能据此再提交操作，切换项目不能取另一个项目结果。
+  > 2026-11-03：`src/admission.rs` 的 permit 是 `flock` 住的真实文件；存活判定用**独立描述符**试锁（`flock` 按打开文件描述加锁，同进程第二个描述符照样冲突），不看 TTL/PID/mtime。`parent_turn` 不被采信，`admit_turn_write` 要求 turn 已登记 + 锁仍被持有 + 屏障前 + project/grant 一致。
+  > `src/operations.rs` 以 `(requestId, method, params-digest)` 为键，`begin` 先记 `Unknown` 再执行，崩溃后重启读到的是 Unknown 而不是「没有这条请求」。结果查询按 project + grant 过滤，别的项目/代次查不到。
+  > 发现并修正一处真实缺陷：`TurnPermit` 原本只释放锁、不从登记表摘除，导致「锁已释放」与「表里还有该 turn」同时成立，屏障计数永不归零（两条测试打红）。
+- [x] Step 4：subprocess 测进程崩溃释放、暂停进程不能按 TTL 回收、活跃审批仍阻塞 drain、单 turn 多次必要收尾以及并发建立屏障。取消 drain 恢复旧准入，不能关闭整个插件。
+  > 2026-11-03：`a_crashed_process_releases_its_permit`（SIGKILL 后内核释放）、`a_stopped_process_keeps_its_permit`（SIGSTOP 后仍不可获取，直接反驳 TTL 回收）、`two_processes_cannot_both_take_the_same_turn_permit`、`a_turn_waiting_on_approval_keeps_the_barrier_from_completing`（含「静默 200ms 后计数不变」）、`a_single_turn_can_wrap_up_several_writes_and_release_once`、`concurrent_barrier_establishment_is_idempotent`、`cancelling_a_drain_restores_admission_without_closing_the_plugin`。
+- [x] Step 5：按 C 提交 `feat: gate plugin operations and drain active turns safely`。
 
 ## Phase 3：生命周期与宿主运行接入
 
