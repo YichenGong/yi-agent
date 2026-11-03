@@ -245,7 +245,7 @@ pub fn normalize(
         // 从来没有记录、这一拍也没提到：不插入。缺记录不是死亡的证据，
         // 也不能凭它编出一条 false 去影响租约默认规则。
         if previous_entry.is_none()
-            && matches!(input.loaded, None)
+            && input.loaded.is_none()
             && !input.legacy.iter().any(|fact| &fact.thread_id == thread_id)
         {
             continue;

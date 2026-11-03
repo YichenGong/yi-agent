@@ -256,27 +256,11 @@ fn dispatch_in(
             // 宿主每 tick 拉一拍：给它一份会话空闲快照与上一拍的结果，回至多一个
             // 通用动作（spec §4.2/§4.3）。参数形状不对时把话说清楚——静默当成空
             // 一拍会让宿主以为「插件没事可做」而永远推不动。
-            let threads = params
-                .get("threads")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "driver/next needs a `threads` array".to_string())?;
-            let mut snapshot: Vec<crate::service::ThreadFacts> = Vec::with_capacity(threads.len());
-            for thread in threads {
-                let thread_id = thread
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "driver/next threads need a `thread_id`".to_string())?;
-                // 缺 `idle` 当作「不闲」：把忙当闲会让插件对一台正在跑的会话下结论。
-                let idle = thread.get("idle").and_then(Value::as_bool).unwrap_or(false);
-                // 缺 `alive` 当作「还活着」：保守方向相反——宁可不判 stale，
-                // 也不凭一次缺字段就报废一张卡的观测（旧宿主不发这个键）。
-                let alive = thread.get("alive").and_then(Value::as_bool).unwrap_or(true);
-                snapshot.push(crate::service::ThreadFacts {
-                    thread_id: thread_id.to_string(),
-                    idle,
-                    alive,
-                });
-            }
+            // 解析**全部**先做完，再调 service：任何一项参数不合法都必须早于
+            // 副作用（尤其是早于消费回报）。旧 `threads[]` 的保守默认值由
+            // `parse_observation_input` 负责，同时它把显式 `alive` 单独记下来，
+            // 缺字段就不会被包装成「宿主说它还活着」。
+            let input = crate::driver_observation::parse_observation_input(params)?;
             let results: Vec<crate::service::DriverResult> = params
                 .get("results")
                 .map(|value| {
@@ -298,7 +282,12 @@ fn dispatch_in(
 
             let capabilities = parse_capabilities(params);
 
-            match service.driver_step(&snapshot, &results, sessions_running, &capabilities)? {
+            match service.driver_step_with_loaded(
+                &input,
+                &results,
+                sessions_running,
+                &capabilities,
+            )? {
                 Some(action) => Ok(action.to_json()),
                 // 一拍无事可做：契约形状是 `{"action": null}`。
                 None => Ok(json!({ "action": null })),
@@ -976,6 +965,115 @@ mod tests {
         );
         crate::persist::save_board(&state.join("board.json"), &board).unwrap();
         crate::service::BoardService::new(state, project.to_path_buf(), Some(project.join("home")))
+    }
+
+    /// 真实的一拍：宿主给了完整热表快照，看板里绑定的那个会话就在里面，
+    /// 于是 `list` 必须在**同一拍**报 `loaded`，而且不 stale。
+    ///
+    /// 这条走完整 dispatch，钉住三件容易写错的事：① 新参数确实被读进来；
+    /// ② 旁路是在消费回报之前落盘的，所以同一拍 `list` 就读得到；
+    /// ③ 观测不碰卡片状态（`thread_id` 原样）。
+    #[test]
+    fn kanban_observation_dispatch_finds_a_loaded_bound_thread() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        crate::persist::with_board(&state, |board| {
+            board
+                .transition(
+                    &superpowers_kanban_core::card::CardId::new("card-1"),
+                    superpowers_kanban_core::card::CardState::Running,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+
+        let reply = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                "threads": [],
+                "loaded_threads": [{"thread_id": "thread-1", "idle": true}],
+                "results": [],
+                "sessions": {"running": 0}
+            }),
+        )
+        .unwrap();
+        assert_eq!(reply["action"], Value::Null);
+
+        let card = &service.list()["cards"][0];
+        assert_eq!(card["session_observation"], "loaded");
+        assert_eq!(card["stale"], false);
+        assert_eq!(card["thread_id"], "thread-1");
+        assert!(card["observed_at"].as_str().is_some(), "{card}");
+    }
+
+    /// 完整快照里没有它 => 明确 `not_loaded`（stale），但卡片状态一点不动。
+    #[test]
+    fn kanban_observation_dispatch_reports_absence_without_moving_the_card() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        crate::persist::with_board(&state, |board| {
+            board
+                .transition(
+                    &superpowers_kanban_core::card::CardId::new("card-1"),
+                    superpowers_kanban_core::card::CardState::Running,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+
+        dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({"threads": [], "loaded_threads": [], "results": [], "sessions": {"running": 0}}),
+        )
+        .unwrap();
+
+        let card = &service.list()["cards"][0];
+        assert_eq!(card["state"], "running", "观测永不迁移状态");
+        assert_eq!(card["session_observation"], "not_loaded");
+        assert_eq!(card["stale"], true);
+        assert_eq!(card["thread_id"], "thread-1");
+    }
+
+    /// 坏的完整快照必须在**任何副作用之前**被拒：回报没消费、tick 没推进、
+    /// 旁路没重写。
+    #[test]
+    fn kanban_observation_bad_snapshot_is_rejected_before_any_effect() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        let before = std::fs::read(state.join("board.json")).unwrap();
+
+        let error = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                "threads": [],
+                "loaded_threads": [{"thread_id": "thread-1", "idle": "yes"}],
+                "results": []
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("loaded_threads[0]"), "{error}");
+        assert!(
+            !state.join("observations.json").exists(),
+            "参数错误不得留下半份观测：{error}"
+        );
+        assert_eq!(std::fs::read(state.join("board.json")).unwrap(), before);
     }
 
     /// 一拍无事可做（空板）时，契约形状是 `{"action": null}`。
