@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 yi-agent-core = { workspace = true }
+# Cross-process foreground root DTOs (shared with guardian, host and desktop shell).
+yi-agent-lifecycle = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 uuid = { workspace = true }
@@ -28,6 +30,12 @@ libc = "0.2"
 # The daemon records why a request failed; `error_response` drops that detail to
 # keep the wire contract stable, so without a log the cause is unrecoverable.
 tracing = { workspace = true }
+
+[features]
+# Test-only construction hooks (fixtures, barriers, clock injection). It must never
+# change production semantics: enabling it does not turn on ForegroundActivation, so
+# `--all-features` in CI does not alter runtime behaviour.
+foreground-test-support = []
 
 [dev-dependencies]
 tempfile = "3"

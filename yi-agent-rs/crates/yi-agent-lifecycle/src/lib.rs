@@ -22,6 +22,8 @@
 pub mod client;
 pub mod codec;
 pub mod deadline;
+/// 前台会话根生命周期的跨进程 DTO。
+pub mod foreground;
 pub mod leases;
 pub mod managed;
 /// 只读影响快照与一次性确认。

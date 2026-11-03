@@ -22,7 +22,9 @@
 
 ## Features
 
-- [ ] 前台会话根生命周期与 watchdog 隔离 — [设计](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [实施计划](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md)。设计与计划已完成多轮交叉自审修订，功能未实施；完成判据：设计 C1–C16 全部通过，包括可信 guardian→daemon 授权闭环、原子准入、合法 owner 下跨 300/2700 秒仍可 spawn、等待 child 不被误级联取消、历史 stalled root 经停止证明与显式确认产生后继 attempt、租约退出有界回收及后台 worker watchdog 保持有效；用例统一 `foreground_root_lifecycle` 前缀并核对非零命中，执行命令见设计 §11 与计划 Task 11。
+- [ ] 前台会话根生命周期与 watchdog 隔离 — [设计](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [实施计划](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md)。进度：Task 1 已完成（契约层），Task 2–11 未开始；完成判据：设计 C1–C16 全部通过，包括可信 guardian→daemon 授权闭环、原子准入、合法 owner 下跨 300/2700 秒仍可 spawn、等待 child 不被误级联取消、历史 stalled root 经停止证明与显式确认产生后继 attempt、租约退出有界回收及后台 worker watchdog 保持有效；用例统一 `foreground_root_lifecycle` 前缀并核对非零命中，执行命令见设计 §11 与计划 Task 11。
+
+  - Task 1（契约层，已完成）：跨进程 DTO 在 `yi-agent-rs/crates/yi-agent-lifecycle/src/foreground.rs`（含 `SecretCapability` 的脱敏 `Debug`、`ForegroundErrorCode`/`ForegroundFailure`/`RecoveryOperationStatus`、`FOREGROUND_ROOT_CAPABILITY` 常量但**未广告**）；分类与活动归约规则在 `yi-agent-rs/crates/yi-agent-store/src/foreground.rs`（`RootExecutionClass`、`worker_watchdog_applies`、`reduce_activity`、`ForegroundError`）；`yi-agent-store` 新增 `yi-agent-lifecycle` 直接依赖与非默认 feature `foreground-test-support`。验证：`cargo test -p yi-agent-lifecycle --lib foreground_root_lifecycle`（7 passed）与 `cargo test -p yi-agent-store --lib foreground_root_lifecycle`（18 passed）。此任务不接数据库、不改 watchdog 行为、不启用能力。
 
 - [ ] 任务、attempt 与两层父子状态机 — 验证：`cargo test -p yi-agent-core subagent::task::tests`
 - [ ] AgentSupervisor 与结构化 mailbox — 验证：`cargo test -p yi-agent-core subagent::supervisor::tests`
