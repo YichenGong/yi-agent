@@ -2,7 +2,7 @@
 
 日期：2026-11-02
 
-状态：**等待人工审阅**。本文是 G0 的输入，不是 G0 的结论。是否继续 Phase 1 之后的产品容器实现，由用户在本报告基础上明确批准后决定。
+状态：**G0 不通过，存在阻断项 B1（见 §9）**。本文是 G0 的输入，不是 G0 的结论。早先版本的「§4.1/§4.2 PASS」已被推翻，原因见 §9。是否继续 Phase 1 之后的产品容器实现，由用户在本报告基础上明确批准后决定。
 
 对应设计与计划：[设计](2026-11-02-kanban-independent-release-design.md)、[计划](../plans/2026-11-02-kanban-independent-release.md)（T01 / T02）。
 
@@ -76,26 +76,30 @@ recovery              close_and_rebuild
 | 子项 | 结果 | 证据 |
 |---|---|---|
 | 宿主 DOM | PASS | 插件在独立 webview 中，没有宿主父文档可访问（`the frame has no host parent (separate webview)`） |
-| 宿主存储 | PASS | 见下方说明——这是本次最重要的一条修正 |
+| 宿主存储 | **FAIL（B1）** | 宿主的 `plugin:` 命令确实被 ACL 拒绝，但**宿主自定义命令不经过 ACL**，`set_relay_url` 实测可从插件页面调用。见 §9 |
 | 其他插件资源 | PASS | 请求 `foreign/secret.txt` 返回 **403**；该文件在 fixture 里**真实存在**，所以是边界拒绝而非「文件不存在」的假通过 |
 | 其他版本资源 | PASS | 请求 `../v0.0.1/index.html` 返回 **404**（不在白名单即不存在），且路径规范化会拒绝越界 |
 
 **宿主存储这条要单独说明。** 首次运行时该用例失败，页面报出 `host bridge globals are visible: __TAURI_INTERNALS__, ipc`。这不是误报：Tauri 确实会向每个 webview 注入桥对象。但「对象存在」与「能读到宿主数据」是两件事——原用例把前者当成后者，判据错了。
 
-修正后的判据是**实际发起读取**，四条都必须失败：
+修正后的判据是**实际发起读取**：
 
 ```
-host rpc (sidecar)      → Command rpc not found
+host rpc (sidecar)      → Command rpc not found      ← 这条是假证据，见下
 plugin store            → Command plugin:store|get not allowed by ACL
 filesystem read         → Command plugin:fs|read_text_file not allowed by ACL
 dialog open             → Command plugin:dialog|open not allowed by ACL
 ```
 
-同时报告如实记录：页面拥有**自己的**浏览器本地存储（这是浏览器给的，不是宿主存储，允许存在），以及桥对象确实被注入。把这三件事分开写，审阅者才能判断隔离到底靠什么——靠的是 ACL 而非「对象不存在」。若将来某人删掉了 capability 限制，这条会立刻变红，而不会因为「全局变量本来就在」而永远通过或永远失败。
+**第一条是假的，而且掩盖了阻断项。** `Command rpc not found` 的成因是探针应用的 `tauri::Builder` 里没有 `invoke_handler`，所以那个应用根本没有 `rpc` 命令——它不证明 ACL 拦住了什么。把生产命令集注册进探针后，同一条调用变成 `sidecar not running for slot local`（已通过 ACL，只是缺运行时状态），而 `set_relay_url` 直接调用成功。详见 §9 的 B1。
+
+教训值得写在这里：**「命令不存在」与「命令被拒绝」是两种完全不同的结果，后者才是安全证据**。一个只报 `not found` 的探针看起来全绿，实际什么都没验证到。
+
+同时报告如实记录：页面拥有**自己的**浏览器本地存储（这是浏览器给的，不是宿主存储，允许存在），以及桥对象确实被注入。
 
 ### §4.2 页面不能直接调用 Tauri invoke、原生 opener、文件对话框等主窗口能力
 
-PASS。`plugin:opener|open_url` 被 ACL 拒绝（`Command plugin:opener|open_url not allowed by ACL`）。同时报告记录了 `invoke is reachable from inline script`——即接口可达但调用被拒，与 §4.1 同一套判断逻辑。
+**FAIL（B1）**。`plugin:opener|open_url`、`plugin:dialog|open` 这类 **plugin 命令**确实被 ACL 拒绝；但 **应用自定义命令**（`rpc`、`set_relay_url` 等）不做 ACL 检查，实测 `set_relay_url` 从插件页面调用成功。原先把「`rpc` 报 Command not found」当作通过证据，而探针应用当时并未注册生产命令集，那条证据不成立。详见 §9。
 
 探针窗口**不挂任何 capability**，这正是要证明的：能力靠配置不在，而不是靠页面「没去调用」。
 
@@ -203,12 +207,58 @@ runner 对未支持平台的做法是**明确失败**而不是「跳过该平台
 ## 8. 需要审阅者决定的事
 
 1. **是否接受 `script-src 'unsafe-inline'`**（§3 第 1 点）。当前隔离不依赖禁用内联脚本，但这是明确的放宽项。
-2. **是否接受「桥对象注入但 ACL 拒绝」**作为 §4.1/§4.2 的通过依据。当前判据是「读取失败」而非「对象不存在」。我们倾向于接受：ACL 是实际边界，对象可见本身不构成越权；但这是安全取舍，应由审阅者确认。
+2. ~~是否接受「桥对象注入但 ACL 拒绝」作为 §4.1/§4.2 的通过依据。~~ **此问题已被 §9 的 B1 取代**：「ACL 拒绝」这个前提对宿主自定义命令根本不成立，所以不是取舍问题，而是阻断项。
 3. **macOS x86_64 是否需要进入首版矩阵。** 当前只有 arm64 证据。
 4. **恢复策略 `close_and_rebuild` 是否满足产品预期。** 探针证明它能恢复容器与核心交互、会话标记不丢；但它会丢弃页面内未持久化的状态，产品侧需确认这是可接受的行为。
 
-## 9. 结论
+## 9. 结论：G0 **不通过**（阻断项 B1）
 
-在 macOS / arm64、系统 WKWebView、正式构建与正式容器配置下，设计 §4 的七条要求**全部有真实运行证据支持**，包括最关键的「原生侧能关闭并重建失控容器」这一条。负例证明这套判据不是「怎么写都会过」。
+在 macOS / arm64、系统 WKWebView、正式构建与正式容器配置下，设计 §4 的第 3、4、6、7 条有真实运行证据支持，第 1、2 条**不成立**。
 
-按计划，**G0 不能由实现者自行认定**。本文件提交后等待用户明确批准；未获批准前不开始 T03 及之后的任何产品容器实现。
+### B1 — 宿主自定义命令对插件页面可达（§4.1/§4.2 失败）
+
+这是复验时发现的阻断项，必须如实记录，不能沿用早先的「PASS」。
+
+**原先的证据为什么不够。** 探针对 `rpc` 的判定是「`Command rpc not found`」，而**探针自己的 `tauri::Builder` 根本没有注册生产 `invoke_handler`**（`run_probe` 里只有 `register_uri_scheme_protocol`）。也就是说，那条证据证明的是「这个探针应用里没有这个命令」，不是「ACL 拒绝了它」。生产应用注册了 12 个自定义命令（`bridge::rpc`、`set_relay_url`、`restart_sidecar`、`kill_remote_slots`、`remote_*` 等）。
+
+**Tauri 的实际行为**（`tauri-2.11.6/src/webview/mod.rs:1823`）：
+
+```rust
+if (plugin_command.is_some() || has_app_acl_manifest || !is_local)
+```
+
+自定义命令只有在三种情况之一成立时才走 ACL：是 `plugin:` 命令、应用定义了 app ACL manifest、或来源非 local。本仓库：
+
+- `plugin-asset://` 是注册的自定义协议，因此被判定为 **local**（`is_local_url` 命中 `uri_scheme_protocols`）；
+- 没有 `permissions/` 目录，`acl-manifests.json` 里**没有** `__app-acl__` 键 → `has_app_acl_manifest = false`；
+- `rpc` 不是 `plugin:` 命令。
+
+三个条件全不成立 → **自定义命令不做 ACL 检查**。
+
+**实测（两次独立实验，代码已回滚，未提交）：**
+
+| 实验 | 页面调用 | 结果 |
+|---|---|---|
+| 注册一个无害 canary 自定义命令 | `__probe_canary` | **BREACH：成功返回** |
+| 注册生产命令集 | `set_relay_url`（参数完整） | **BREACH：成功调用** |
+| 注册生产命令集 | `rpc`（参数完整） | 到达命令内部，报 `sidecar not running for slot local`（说明 ACL 已放行，只是缺运行时状态） |
+| 注册生产命令集 | `rpc`（缺 `slot`） | 报缺参数，而非 ACL 拒绝 |
+
+`set_relay_url` 可达意味着插件页面能把宿主指向任意 relay 地址；`rpc` 可达意味着只要本地 sidecar 在运行，插件就能直接驱动 sidecar 的全部 JSON-RPC 方法（`bridge::rpc` 本身**没有任何调用方鉴权**，只负责把行写进管道）。这违反 §4.2「页面不能直接调用 Tauri invoke」。
+
+### 修复方向（尚未实施，需在 G0 修复后重新验证）
+
+任一即可让自定义命令进入 ACL 检查，但都需要单独评审：
+
+1. **加 app ACL manifest**（`src-tauri/permissions/` + capability 里逐个列出允许的 app 命令），使 `has_app_acl_manifest = true`，插件窗口不在允许清单里即被拒。
+2. **让插件页加载于非 local 来源**（例如独立 webview 使用不被视为 local 的 scheme），触发 `!is_local` 分支。
+3. **在 `bridge::*` 命令内部自行校验调用来源**，不依赖 ACL。
+
+方案 1 最贴合 Tauri 的模型，但会同时影响主窗口现有调用的放行清单，属跨模块协议变更，应先落子 spec 再改代码。
+
+### 其他两条结论
+
+- §4.6/§4.7（frame 绑定、重放、原生侧关闭并重建容器）：**有真实证据，成立**（重建门控已改为不依赖页面配合，见 §7.6）。
+- §4.3/§4.4（资源白名单、禁联网/跳转/弹窗/子 frame/外送）：**有真实证据，成立**。
+
+按计划，G0 不能由实现者自行认定，也**不能在被推翻的证据上认定**。本文件记录阻断项，等待修复后重新出证。未修复前不开始 T03 及之后的任何产品容器实现。
