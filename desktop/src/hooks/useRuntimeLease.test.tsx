@@ -8,6 +8,13 @@ const calls: Array<{ cmd: string; args: unknown }> = [];
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args: unknown) => {
     calls.push({ cmd, args });
+    // The shell answers `runtime_scope_for_project` with the key it resolved. A
+    // bare `undefined` would make the hook skip every release, so the double has
+    // to answer the way the real command does.
+    if (cmd === "runtime_scope_for_project") {
+      const project = (args as { project: string }).project;
+      return Promise.resolve(`${project}/.yi-agent/runtime`);
+    }
     return Promise.resolve();
   },
 }));
@@ -38,6 +45,9 @@ describe("useRuntimeLease", () => {
     await flush();
     expect(calls).toEqual([
       { cmd: "runtime_acquire_project", args: { project: "/p/a" } },
+      // The key is asked for, not computed: one canonicalisation lives in the
+      // shell, and release must speak the same one.
+      { cmd: "runtime_scope_for_project", args: { project: "/p/a" } },
     ]);
   });
 
@@ -52,7 +62,7 @@ describe("useRuntimeLease", () => {
     await flush();
 
     expect(calls).toEqual([
-      { cmd: "runtime_release_project", args: { scopeKey: "/p/a" } },
+      { cmd: "runtime_release_project", args: { scopeKey: "/p/a/.yi-agent/runtime" } },
     ]);
   });
 
@@ -74,6 +84,7 @@ describe("useRuntimeLease", () => {
 
     expect(calls).toEqual([
       { cmd: "runtime_acquire_project", args: { project: "/p/b" } },
+      { cmd: "runtime_scope_for_project", args: { project: "/p/b" } },
     ]);
   });
 

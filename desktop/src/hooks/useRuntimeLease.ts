@@ -31,6 +31,11 @@ export function useRuntimeLease(deps: LeaseDeps) {
   // What this shell believes it holds. Kept in a ref, not state: it is not
   // rendered, and making it state would re-render the whole app on every switch.
   const owned = useRef<Set<string>>(new Set());
+  // The scope key the shell resolved for each project. Release needs the key, not
+  // the path: the key is the canonical runtime directory, and the shell refuses to
+  // act on a key it never resolved. Asking the shell keeps one canonicalisation
+  // instead of two that could disagree about which directory a scope names.
+  const scopes = useRef<Map<string, string>>(new Map());
   // Serialise the calls: each run waits for the previous one.
   const chain = useRef<Promise<void>>(Promise.resolve());
   const remote = useRef(isRemoteClient());
@@ -53,6 +58,13 @@ export function useRuntimeLease(deps: LeaseDeps) {
       for (const project of decision.acquire) {
         try {
           await invoke("runtime_acquire_project", { project });
+          // Recorded only after the shell accepted it: the shell holds the resolved
+          // scope from this point on, so it can answer status reads for a runtime
+          // that refused a lease (embedded or legacy) as well.
+          const scopeKey = await invoke<string | null>("runtime_scope_for_project", {
+            project,
+          });
+          if (scopeKey) scopes.current.set(project, scopeKey);
         } catch {
           // Not fatal: the runtime simply stays unleased, which is the state the
           // app was in before this feature existed.
@@ -60,10 +72,13 @@ export function useRuntimeLease(deps: LeaseDeps) {
         }
       }
       for (const project of decision.release) {
+        const scopeKey = scopes.current.get(project);
+        // Without a resolved key the shell has nothing to release; inventing one
+        // from the path would ask it to act on a scope it never resolved.
+        if (!scopeKey) continue;
         try {
-          await invoke("runtime_release_project", {
-            scopeKey: project,
-          });
+          await invoke("runtime_release_project", { scopeKey });
+          scopes.current.delete(project);
         } catch {
           // Releasing is best-effort here; the quit drain is the authoritative
           // path and reports its own failures.

@@ -792,7 +792,7 @@ export function useRuntimeLifecycle(scopeKey: string | null, control: RuntimeCon
 
 `RuntimeVersionBanner` props 为 `{ scopeKey: string; control: RuntimeControl }`。组件使用 hook，二次确认时保留 snapshot／token 与 scope。首个不同版本提示不是阻塞弹窗。
 
-- [ ] **Step 1:** 用 fake RuntimeControl 添加 Vitest 测试，测试文件声明 jsdom 环境；关键旧请求防重复：
+- [x] **Step 1:** 用 fake RuntimeControl 添加 Vitest 测试，测试文件声明 jsdom 环境；关键旧请求防重复：
 
 ```tsx
 it("does not confirm when the user cancels the impact dialog", async () => {
@@ -806,11 +806,11 @@ it("does not confirm when the user cancels the impact dialog", async () => {
 
 `makeControl({otherClients, running})` 在同测试文件内返回完整 status／preview DTO 和 `vi.fn` 的 RuntimeControl；ready status 和 error 不允许返回空对象欺骗类型检查。
 
-- [ ] **Step 2:** 运行 `cd desktop && npx vitest run src/components/RuntimeVersionBanner.test.tsx src/lib/runtimeLifecycle.test.ts`，确认先红。
-- [ ] **Step 3:** 提示显示实际／期望版本、客户端和任务／插件数；不同构建不随意称旧版。暂不重启只折叠／保持可发现状态，不吞掉未来代际提示。legacy 明示“后台退出管理尚未生效”，unknown 不假装兼容。存在未知或其他影响时展示完整二次确认；无能力时禁按钮并给手动指引。
-- [ ] **Step 4:** 点击期间禁重复操作；token stale 重新预览并重新确认，不能自动同意。点击时先生成 operation ID 并交给壳保存，再发送一次 Confirm；网络断开只按该 ID 查询，不自动重发，不重新预览后自动授权第二次。NotFound 不代表一定未执行：查询 status／等待原请求的 2 秒边界，仍不能确认则显示结果未知、要求用户手动刷新状态，禁止自动生成新 token／新 operation。取消不调用 Stop／kill。
-- [ ] **Step 5:** 状态轮询按 scope + generation 隔离，项目切换／卸载取消异步结果与计时器，不让旧项目 token 在新项目确认；独立控制路径不走 RpcClient 自动恢复重放。按 Task 1 的 5 秒／操作期 1 秒只读轮询，心跳使用独立连接／队列，不能以轮询替代心跳。测试切项目、超时、迁移失败、StoppedNoClients、远端不可重启、状态刷新。
-- [ ] **Step 6:** 运行 `cd desktop && npx tsc --noEmit && npx vitest run`、§0.4，提交 `feat: show runtime version mismatch and confirmed restart progress`。
+- [x] **Step 2:** 运行 `cd desktop && npx vitest run src/components/RuntimeVersionBanner.test.tsx src/lib/runtimeLifecycle.test.ts`，确认先红。
+- [x] **Step 3:** 提示显示实际／期望版本、客户端和任务／插件数；不同构建不随意称旧版。暂不重启只折叠／保持可发现状态，不吞掉未来代际提示。legacy 明示“后台退出管理尚未生效”，unknown 不假装兼容。存在未知或其他影响时展示完整二次确认；无能力时禁按钮并给手动指引。
+- [x] **Step 4:** 点击期间禁重复操作；token stale 重新预览并重新确认，不能自动同意。点击时先生成 operation ID 并交给壳保存，再发送一次 Confirm；网络断开只按该 ID 查询，不自动重发，不重新预览后自动授权第二次。NotFound 不代表一定未执行：查询 status／等待原请求的 2 秒边界，仍不能确认则显示结果未知、要求用户手动刷新状态，禁止自动生成新 token／新 operation。取消不调用 Stop／kill。
+- [x] **Step 5:** 状态轮询按 scope + generation 隔离，项目切换／卸载取消异步结果与计时器，不让旧项目 token 在新项目确认；独立控制路径不走 RpcClient 自动恢复重放。按 Task 1 的 5 秒／操作期 1 秒只读轮询，心跳使用独立连接／队列，不能以轮询替代心跳。测试切项目、超时、迁移失败、StoppedNoClients、远端不可重启、状态刷新。
+- [x] **Step 6:** 运行 `cd desktop && npx tsc --noEmit && npx vitest run`、§0.4，提交 `feat: show runtime version mismatch and confirmed restart progress`。
 
 ## Task 18: 真进程验收、默认接入与文档收口
 

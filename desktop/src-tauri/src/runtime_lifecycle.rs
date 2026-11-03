@@ -424,6 +424,15 @@ pub struct DesktopRuntimeManager {
     /// Resolved once rather than per request: verifying means hashing the sidecar
     /// binary, and doing that on every status poll would cost more than the poll.
     artifact: Option<ArtifactIdentity>,
+    /// Every scope this shell has resolved for an open project, lease or not.
+    ///
+    /// Kept separately from `projects` because "the user has this project open" and
+    /// "a guardian gave us a lease" are different facts. An embedded or legacy
+    /// runtime answers no registration, yet its status must still be readable --
+    /// those are exactly the runtimes whose version banner says "unknown" or "this
+    /// old runtime has no exit guarantees". Keying the read on `projects` would make
+    /// the shell unable to describe the cases it most needs to report.
+    known: Mutex<BTreeMap<String, RuntimeScope>>,
     /// Operations this shell started, keyed by scope.
     ///
     /// Kept here, not in the WebView, because a WebView reload must not lose the
@@ -448,6 +457,7 @@ impl DesktopRuntimeManager {
             backend,
             quitting: AtomicBool::new(false),
             artifact: None,
+            known: Mutex::new(BTreeMap::new()),
             operations: Mutex::new(BTreeMap::new()),
         }
     }
@@ -575,6 +585,37 @@ impl DesktopRuntimeManager {
             .lock()
             .map(|guard| guard.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Records that `scope` belongs to a project the user has open.
+    ///
+    /// This is the readable half of opening a project, and it is recorded before the
+    /// lease is requested: whether a lease exists is the runtime's answer, not a
+    /// precondition for describing it.
+    pub fn note_open(&self, scope: &RuntimeScope) {
+        if let Ok(mut guard) = self.known.lock() {
+            guard.insert(scope.key.clone(), scope.clone());
+        }
+    }
+
+    /// Forgets a scope the user has closed.
+    pub fn forget_open(&self, scope_key: &str) {
+        if let Ok(mut guard) = self.known.lock() {
+            guard.remove(scope_key);
+        }
+    }
+
+    /// Every scope this shell can describe: open projects, plus any still leased.
+    pub fn known_scopes(&self) -> Vec<RuntimeScope> {
+        let mut all: BTreeMap<String, RuntimeScope> = self
+            .known
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for scope in self.registered_projects() {
+            all.entry(scope.key.clone()).or_insert(scope);
+        }
+        all.into_values().collect()
     }
 
     /// Registers the App's lease for one project.
@@ -1452,7 +1493,7 @@ mod tests {
         assert!(manager.registered_projects().is_empty());
 
         let view = runtime_view(&manager, &project, snapshot, None).unwrap();
-        assert_eq!(view["compatibility"], "compatible_mismatch");
+        assert_eq!(view["compatibility"], "compatibleMismatch");
         assert_eq!(view["expectedBuildId"], "build-b");
         assert_eq!(view["counts"]["clients"], 2);
         assert_eq!(view["clients"][0]["kind"], "tui");
@@ -1482,7 +1523,7 @@ mod tests {
             .await
             .unwrap();
         let view = runtime_view(&manager, &project, snapshot, None).unwrap();
-        assert_eq!(view["compatibility"], "same_build");
+        assert_eq!(view["compatibility"], "sameBuild");
         assert_eq!(view["message"], serde_json::Value::Null);
     }
 
@@ -2015,8 +2056,11 @@ pub struct RuntimeStatusView {
     pub identity: RuntimeIdentityView,
     pub expected_build_id: Option<String>,
     pub expected_display_version: Option<String>,
-    /// `same_build` / `compatible_mismatch` / `control_only` /
-    /// `legacy_temporary_choice_required` / `unknown`.
+    /// The wire names of `Compatibility` as ts-rs generates them
+    /// (`sameBuild` / `compatibleMismatch` / `controlOnly` /
+    /// `legacyTemporaryChoiceRequired` / `unknown`). They are camelCase, unlike the
+    /// mode and kind enums: one component renders both this shell's view and the
+    /// app-server's, so the two must spell the same value the same way.
     pub compatibility: String,
     pub lifecycle_managed: bool,
     pub counts: ImpactCountsView,
@@ -2220,7 +2264,7 @@ fn classify_against(
         identity.mode,
         RuntimeMode::LegacyIndependent | RuntimeMode::LegacyEmbedded
     ) {
-        return "legacy_temporary_choice_required".to_string();
+        return "legacyTemporaryChoiceRequired".to_string();
     }
     let business_usable = identity.business_protocol.is_some_and(|protocol| {
         protocol >= expected.business_protocol_min && protocol <= expected.business_protocol_max
@@ -2230,16 +2274,16 @@ fn classify_against(
         let same_guardian =
             identity.guardian_build_id.as_deref() == Some(expected.build_id.as_str());
         if same_daemon && same_guardian {
-            return "same_build".to_string();
+            return "sameBuild".to_string();
         }
-        return "compatible_mismatch".to_string();
+        return "compatibleMismatch".to_string();
     }
     if identity
         .capabilities
         .iter()
         .any(|capability| capability == "control.v1")
     {
-        return "control_only".to_string();
+        return "controlOnly".to_string();
     }
     "unknown".to_string()
 }
@@ -2247,17 +2291,17 @@ fn classify_against(
 /// The banner's sentence, matching the app-server's wording.
 fn status_message(compatibility: &str, lifecycle_managed: bool) -> Option<String> {
     match compatibility {
-        "same_build" => None,
-        "compatible_mismatch" => Some(
+        "sameBuild" => None,
+        "compatibleMismatch" => Some(
             "this project's runtime is a different build; new features may be unavailable"
                 .to_string(),
         ),
-        "control_only" => Some(
+        "controlOnly" => Some(
             "the background runtime's business protocol is incompatible: tasks are disabled \
              until it is restarted"
                 .to_string(),
         ),
-        "legacy_temporary_choice_required" => Some(
+        "legacyTemporaryChoiceRequired" => Some(
             "this runtime was started by an older version and has no exit guarantees; \
              stop it by hand to get managed restarts"
                 .to_string(),
@@ -2276,7 +2320,7 @@ fn status_message(compatibility: &str, lifecycle_managed: bool) -> Option<String
 fn registered_scope(state: &QuitState, scope_key: &str) -> Result<RuntimeScope, String> {
     state
         .manager
-        .registered_projects()
+        .known_scopes()
         .into_iter()
         .find(|scope| scope.key == scope_key)
         .ok_or_else(|| {
@@ -2400,6 +2444,9 @@ pub async fn runtime_acquire_project(
     let runtime = runtime_dir_for(&project);
     let scope = yi_agent_lifecycle::scope::resolve(&runtime, &project, &home)
         .map_err(|error| error.to_string())?;
+    // Readable before it is leased: a runtime that refuses registration (embedded,
+    // legacy) still has a version the banner must be able to report.
+    manager.note_open(&scope);
     manager
         .acquire_project(scope, yi_agent_lifecycle::types::LeaseMode::Business)
         .await
@@ -2420,6 +2467,9 @@ pub async fn runtime_release_project(
         .release_project(&scope_key, Deadline::after(ACQUIRE_BUDGET))
         .await
         .map_err(|error| error.to_string())?;
+    // No longer open, so no longer describable: a closed project must not keep
+    // answering status reads with a runtime nobody is looking at.
+    manager.forget_open(&scope_key);
     Ok(result.failures)
 }
 
@@ -2432,6 +2482,35 @@ pub fn runtime_registered_projects(state: tauri::State<'_, QuitState>) -> Vec<St
         .into_iter()
         .map(|scope| scope.key)
         .collect()
+}
+
+/// The scope keys this shell can answer for.
+///
+/// The frontend needs a scope key to poll status, but it must not compute one: the
+/// key is a canonical runtime directory, and computing it in the WebView (with a
+/// different canonicalisation) would name a scope the shell has never resolved.
+/// It asks the shell instead, and the shell answers only about projects the user
+/// actually opened.
+#[tauri::command]
+pub fn runtime_known_scopes(state: tauri::State<'_, QuitState>) -> Vec<String> {
+    state
+        .manager
+        .known_scopes()
+        .into_iter()
+        .map(|scope| scope.key)
+        .collect()
+}
+
+/// The scope key for one project path, once this shell has resolved it.
+#[tauri::command]
+pub fn runtime_scope_for_project(state: tauri::State<'_, QuitState>, project: String) -> Option<String> {
+    let project = std::path::PathBuf::from(project);
+    state
+        .manager
+        .known_scopes()
+        .into_iter()
+        .find(|scope| scope.project_key == project.to_string_lossy())
+        .map(|scope| scope.key)
 }
 
 /// The result of the last quit, for the UI and for support reports.

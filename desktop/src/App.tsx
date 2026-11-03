@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
@@ -115,6 +116,9 @@ import {
 import { resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { useRuntimeLease } from "./hooks/useRuntimeLease";
+import { localRuntimeControl } from "./lib/runtimeLifecycle";
+import { useRuntimeScopeKey } from "./hooks/useRuntimeLifecycle";
+import { RuntimeVersionBanner } from "./components/RuntimeVersionBanner";
 import { wantedProjects } from "./lib/runtimeLease";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
@@ -543,6 +547,27 @@ export default function App() {
       threads: leaseThreads,
     }).join("\n"),
   });
+
+  // 运行时版本生命周期（状态横幅 / 预览 / 确认 / 轮询）整体在 hook 与
+  // `lib/runtimeLifecycle.ts` 里，见那两处注释：控制面刻意不走 `RpcClient`，
+  // 免得确认请求被重连重放成第二次重启。
+  //
+  // 远端客户端没有本机控制通道，故不给 control。
+  const runtimeControl = useMemo(
+    () => (isRemoteClient() ? null : localRuntimeControl()),
+    [],
+  );
+  // scope key 只由壳解析（见 `useRuntimeScopeKey`）：WebView 自己拼 canonical
+  // 路径可能与壳不一致，从而指向一个壳从未打开过的 scope。
+  const runtimeScopeKey = useRuntimeScopeKey(leaseActiveProject, runtimeControl !== null);
+
+  // 操作 id 记在壳里（确认请求的发起方），所以重载页面恢复的是同一次操作，
+  // 也不会把上一次运行留下的 id 误当成本次的。
+  const readRuntimeOperationId = useCallback(
+    async (key: string) =>
+      (await invoke<string | null>("runtime_active_operation", { scopeKey: key })) ?? null,
+    [],
+  );
 
   // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
   // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
@@ -2874,6 +2899,13 @@ export default function App() {
                   }
                 />
               </>
+            )}
+            {runtimeScopeKey !== null && runtimeControl !== null && (
+              <RuntimeVersionBanner
+                scopeKey={runtimeScopeKey}
+                control={runtimeControl}
+                readOperationId={readRuntimeOperationId}
+              />
             )}
             <ApprovalBanner
               items={bannerItems}
