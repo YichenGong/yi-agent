@@ -350,7 +350,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 `TrustStore::bootstrap`、`verify_metadata`、不可伪造 `VerifiedRelease`；trust store 可持久化接受序号、时间下界、根版本和撤销记录。
 
-- [ ] Step 1：写失败测试：
+- [x] Step 1：写失败测试：
   ```rust
   #[test]
   fn changed_payload_without_new_signature_is_rejected() {
@@ -362,10 +362,14 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
       assert!(verify_metadata(&bad, &mut trust, 1_800_000_000).is_err());
   }
   ```
-- [ ] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test trust`，增加正确签名但过期/撤回/回放、未知 key、未经旧 root 授权换根、时钟回退与离线旧安装重启的独立红例。
-- [ ] Step 3：依 G2 实现逐字节签名验证和持久化 trust 更新；只在整体验证成功后推进接受序号。坏元数据不能污染 trust store，下载端不能选择公钥。`bootstrap` 仅接收宿主内置/编译时固定的根锚，首次网络返回的 root envelope 不能自签成为新锚；后续换根必须经已有根授权。测试 fixture 可用测试根调用，正式构建检查禁止嵌入测试根。
-- [ ] Step 4：验证所有负例通过；修改一个签名检查条件，确认 tamper 负例红，再恢复。输出错误不得包含密钥或原始认证信息。
-- [ ] Step 5：按 C 提交 `feat: verify official plugin release trust`。
+- [x] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test trust`，增加正确签名但过期/撤回/回放、未知 key、未经旧 root 授权换根、时钟回退与离线旧安装重启的独立红例。
+  > 2026-11-03：22 条。过期/未来/回放/未知 key 各一条；换根三条（缺授权、授权给别人、序号不递增）；时钟回退一条；撤销一条通过 `TrustStore::revoke`。
+- [x] Step 3：依 G2 实现逐字节签名验证和持久化 trust 更新；只在整体验证成功后推进接受序号。坏元数据不能污染 trust store，下载端不能选择公钥。`bootstrap` 仅接收宿主内置/编译时固定的根锚，首次网络返回的 root envelope 不能自签成为新锚；后续换根必须经已有根授权。测试 fixture 可用测试根调用，正式构建检查禁止嵌入测试根。
+  > 2026-11-03：`encode_root_payload` / `encode_release_payload` 按 G1 §8.1 逐字节实现；`PINNED_ROOT_KEY_IDS` 是编译时常量，只有一个根；`to_json`/`from_json` 持久化根、接受序号、时间下界与撤销记录（重启即可继续拒绝回放）。测试种子只在 `tests/`，并有一条测试扫 `src/*.rs` 确认无 `SigningKey`/`TEST_SEED`。
+- [x] Step 4：验证所有负例通过；修改一个签名检查条件，确认 tamper 负例红，再恢复。输出错误不得包含密钥或原始认证信息。
+  > 2026-11-03：9 项变异全部打红——验签恒真 1、去过期检查 1、去未来检查 1、去序号检查 1、去 keyId 检查 2、去换根授权检查 1、序号提前推进 1、去换根序号递增 1、去字节一致性检查 2。**过程中发现两处假绿并补了测试**：①「缺 authorizedBy」被缺字段检查拦下，证明不了「授权给别人」也会被拒，补了 `a_root_rotation_authorized_by_a_different_root_is_rejected`；②「失败不污染」原先的样本序号比合法包大，证明不了 floor 未被提前抬高，补了 `a_rejected_release_does_not_raise_the_floor_for_a_lower_serial`。补完后两条变异都会红。
+- [x] Step 5：按 C 提交 `feat: verify official plugin release trust`。
+  > 2026-11-03：门禁 C 全绿，含 `cargo audit`（558 个依赖，无新增漏洞；ed25519-dalek 2.2.0 满足 G2 的 `>= 2.0.0`）。
 
 ### Task T08：实现有界安全解包与不可变安装目录
 

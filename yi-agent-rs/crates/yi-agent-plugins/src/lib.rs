@@ -7,8 +7,10 @@
 
 pub mod error;
 pub mod manifest;
+pub mod trust;
 pub mod types;
 
 pub use error::PluginError;
 pub use manifest::{Manifest, MethodDecl, ViewDecl};
+pub use trust::{TrustStore, VerifiedRelease};
 pub use types::{Binding, Effect, Operation, PluginId, ProjectId, ReleaseId};

@@ -14,6 +14,11 @@ repository.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = "2"
+# 签名验证。约束 >= 2.0.0 是安全下界而非随手取的值：RUSTSEC-2022-0093
+# （公私钥可分离建模导致的签名预言机攻击）只影响 < 2.0。精确补丁版本
+# 由 `cargo audit` 通过后锁定，见 G2 §3.4。
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
