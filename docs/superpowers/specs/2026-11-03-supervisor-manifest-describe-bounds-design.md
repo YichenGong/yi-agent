@@ -2,7 +2,7 @@
 
 日期：2026-11-03
 基线提交：`20fc3133f04a3659038808cac694adfd1bc8f71e`
-状态：设计及实施计划已复核、待实现。实施计划见 [plan](../plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md)；本轮只修订文档，不修改生产代码。文档门禁结果见§8，不等于修复已验收。
+状态：**实现已验收**（Tasks 1–4 完成）。实施计划见 [plan](../plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md)；实现位于 `yi-agent-rs/crates/yi-agent-supervisors/src/refresh/{describe.rs,describe/}`、`refresh.rs` 与 `yi-agent-rs/crates/yi-agent-runtime/src/supervise.rs`。验收证据（macOS 14 / arm64 实跑）：`cargo test -p yi-agent-supervisors`（100 单元 + 23 集成）、`cargo test -p yi-agent-runtime --lib supervise`（12）、`cargo clippy -p yi-agent-supervisors -p yi-agent-runtime --all-targets -- -D warnings`、`just ci` exit 0；八项变异各自使对应用例转红后逐字还原。§8 的文档门禁结果保留原日期与性质，不因实现完成而重写为代码验收。
 
 ## 1. 问题与证据
 

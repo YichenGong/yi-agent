@@ -129,9 +129,9 @@ pub(super) enum DescribeError {
 
 ### Step 1：先造不会污染 run marker 的假插件与兼容旧 API 的失败测试
 
-- [ ] 新建 fixture.rs。产生 `PluginFixture::new()`、`workdir() -> &Path`、`plugin(name: &str, mode: &str, payload_bytes: usize, exit_code: i32) -> FakePlugin`、`arm_flags() -> PathBuf`。
-- [ ] `FakePlugin` 暴露测试所需的 `command/stored/body/manifest_marker/descendant_marker/run_marker/query_socket: PathBuf`，不暴露生产类型。每个项目一个 TempDir，可装 a、b 两插件；stored 清单的 `stop_when_disabled=false`，插件自述改为 true，command 一致，switch_key 为已注册 `superpowers_kanban`。root 析构时删除目录，使 hold/hang/continuous 后代在下一轮检查退出。
-- [ ] launcher 用 shell 正确引用路径，再 `exec python3 helper.py config.json "$@"`。helper/config 文件用 UTF-8；Python 子进程为 exec 后的直接 child，不留中间 sh。
+- [x] 新建 fixture.rs。产生 `PluginFixture::new()`、`workdir() -> &Path`、`plugin(name: &str, mode: &str, payload_bytes: usize, exit_code: i32) -> FakePlugin`、`arm_flags() -> PathBuf`。
+- [x] `FakePlugin` 暴露测试所需的 `command/stored/body/manifest_marker/descendant_marker/run_marker/query_socket: PathBuf`，不暴露生产类型。每个项目一个 TempDir，可装 a、b 两插件；stored 清单的 `stop_when_disabled=false`，插件自述改为 true，command 一致，switch_key 为已注册 `superpowers_kanban`。root 析构时删除目录，使 hold/hang/continuous 后代在下一轮检查退出。
+- [x] launcher 用 shell 正确引用路径，再 `exec python3 helper.py config.json "$@"`。helper/config 文件用 UTF-8；Python 子进程为 exec 后的直接 child，不留中间 sh。
 
 fixture helper 的实际内容（config 含 root、fresh、mode、exit_code 和各 marker/socket；由 serde_json::json! 写入）：
 
@@ -236,7 +236,7 @@ fn describe_drains_large_stdout_without_a_false_timeout() {
 }
 ```
 
-- [ ] 加入完整的 stderr背压行为测试：
+- [x] 加入完整的 stderr背压行为测试：
 
 ```rust
 #[test]
@@ -253,7 +253,7 @@ fn describe_drains_stderr_after_its_capture_limit() {
     assert_eq!(parsed.name, "a");
 }
 ```
-- [ ] 在 refresh.rs 用下列声明加载 fixture；describe.rs 用 `#[cfg(test)] mod tests;` 加载 describe/tests.rs。fixture 本身不引用 crate::manifest，便于 Task 3 源码级测试复用。describe tests 通过 `crate::refresh::fixture::PluginFixture` 访问，不重复定义 fixture。
+- [x] 在 refresh.rs 用下列声明加载 fixture；describe.rs 用 `#[cfg(test)] mod tests;` 加载 describe/tests.rs。fixture 本身不引用 crate::manifest，便于 Task 3 源码级测试复用。describe tests 通过 `crate::refresh::fixture::PluginFixture` 访问，不重复定义 fixture。
 
 ```rust
 #[cfg(test)]
@@ -266,13 +266,13 @@ fixture 的 Rust 构造代码见本计划附录 B，Python helper 使用本步�
 
 ### Step 2：运行旧行为，记录红
 
-- [ ] `cargo test -p yi-agent-supervisors --lib describe_drains_ -- --list` 核对上述两名。
-- [ ] `cargo test -p yi-agent-supervisors --lib describe_drains_ -- --nocapture`；旧逻辑两个场景约到 15s 返回 Skipped，Refreshed 断言红。外层 runner 至少 40s；保存输出，不先改全局超时。
+- [x] `cargo test -p yi-agent-supervisors --lib describe_drains_ -- --list` 核对上述两名。
+- [x] `cargo test -p yi-agent-supervisors --lib describe_drains_ -- --nocapture`；旧逻辑两个场景约到 15s 返回 Skipped，Refreshed 断言红。外层 runner 至少 40s；保存输出，不先改全局超时。
 
 ### Step 3：实现有界捕获、错误和纯时间判据
 
-- [ ] 按 Interfaces 写类型与 production 常量。`ObservedExit::success` 只认 `code == Some(0) && signal.is_none()`。
-- [ ] Capture 用 `Vec::with_capacity(limit)`，字段 `bytes: Vec<u8>, limit: usize, hard_limit: bool, truncated: bool`。下面 append 逻辑同时服务 stdout/stderr，不把软上限变成停止读取：
+- [x] 按 Interfaces 写类型与 production 常量。`ObservedExit::success` 只认 `code == Some(0) && signal.is_none()`。
+- [x] Capture 用 `Vec::with_capacity(limit)`，字段 `bytes: Vec<u8>, limit: usize, hard_limit: bool, truncated: bool`。下面 append 逻辑同时服务 stdout/stderr，不把软上限变成停止读取：
 
 ```rust
 fn push(&mut self, chunk: &[u8]) -> Result<(), DescribeError> {
@@ -297,13 +297,13 @@ fn check_limits(
 }
 ```
 
-- [ ] `text()` 严格 UTF-8，不用 lossy；`diagnostic()` 对 stderr 才使用 lossy，取首行 trim，按 chars 截断。常量标记 `" [truncated]"` 的字符数从 512 中扣除，capture 已截断也加标记，最终总字符数仍 ≤512。
-- [ ] render 覆盖所有枚举：命令执行阶段、15s/注入 timeout、stdout 限值、退出 code/signal、非 UTF-8、所有权丢失、清理失败；WithCleanup 保留主因后追加清理说明。不输出 stdout。
-- [ ] 写单元边界表：stdout 恰好 1,048,576、下一字节 Err；stderr 写到 2 MiB 后保存仅 65,536 且仍可 push；中文首行超长、无换行、空 stderr、非法 UTF-8；到期恰好 `now == deadline` 为 timeout，取消与到期同时成立为 Cancelled。
+- [x] `text()` 严格 UTF-8，不用 lossy；`diagnostic()` 对 stderr 才使用 lossy，取首行 trim，按 chars 截断。常量标记 `" [truncated]"` 的字符数从 512 中扣除，capture 已截断也加标记，最终总字符数仍 ≤512。
+- [x] render 覆盖所有枚举：命令执行阶段、15s/注入 timeout、stdout 限值、退出 code/signal、非 UTF-8、所有权丢失、清理失败；WithCleanup 保留主因后追加清理说明。不输出 stdout。
+- [x] 写单元边界表：stdout 恰好 1,048,576、下一字节 Err；stderr 写到 2 MiB 后保存仅 65,536 且仍可 push；中文首行超长、无换行、空 stderr、非法 UTF-8；到期恰好 `now == deadline` 为 timeout，取消与到期同时成立为 Cancelled。
 
 ### Step 4：实现不回收的退出观察和非阻塞 FD
 
-- [ ] process.rs 的 `spawn` 使用下列 Command 设置；successful spawn 后**立刻**把 child 放入 guard，然后 take 两个 pipe；对每个 FD 先 F_GETFL，再 F_SETFL `flags | O_NONBLOCK`。只有 spawn 自身失败时无 child可清理。接管/设flags失败时，显式 `finish()` 并通过 combine 保留初始化主错及清理附错，再返回；不能只依赖不返回诊断的 Drop。Drop仅兜底展开，清理失败时另行warn，且不覆盖panic或二次panic。
+- [x] process.rs 的 `spawn` 使用下列 Command 设置；successful spawn 后**立刻**把 child 放入 guard，然后 take 两个 pipe；对每个 FD 先 F_GETFL，再 F_SETFL `flags | O_NONBLOCK`。只有 spawn 自身失败时无 child可清理。接管/设flags失败时，显式 `finish()` 并通过 combine 保留初始化主错及清理附错，再返回；不能只依赖不返回诊断的 Drop。Drop仅兜底展开，清理失败时另行warn，且不覆盖panic或二次panic。
 
 ```rust
 use std::os::unix::process::CommandExt;
@@ -318,7 +318,7 @@ let child = std::process::Command::new(command)
 ```
 
 接管后为负组号转换使用 `libc::pid_t::try_from(child.id())`，不得未经检查把u32变负值。guard构造字段初始化不执行用户代码；初始化错误与正常操作共用combine规则。
-- [ ] `observe_exit(pid: libc::pid_t) -> std::io::Result<Option<ObservedExit>>` 使用以下主体：
+- [x] `observe_exit(pid: libc::pid_t) -> std::io::Result<Option<ObservedExit>>` 使用以下主体：
 
 ```rust
 let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -340,14 +340,14 @@ match info.si_code {
 }
 ```
 
-- [ ] ChildSession::observe 缓存 ObservedExit，但不调用 try_wait。Interrupted 原样交给外层限时循环重查；ECHILD 先清 owns_child/may_signal_group，take 读端，再返回 OwnershipLost；其他 Io 附上 waitid 阶段。
-- [ ] 写 `exit_observation_keeps_the_leader_waitable`：spawn `sh -c 'exit 7'` 后，宽预算轮询 observe 为 Some；第二次 observe 仍 Some(7)，finish 才回收；回收后的原生 waitid 为 ECHILD。另测 running 的观察为 None。
+- [x] ChildSession::observe 缓存 ObservedExit，但不调用 try_wait。Interrupted 原样交给外层限时循环重查；ECHILD 先清 owns_child/may_signal_group，take 读端，再返回 OwnershipLost；其他 Io 附上 waitid 阶段。
+- [x] 写 `exit_observation_keeps_the_leader_waitable`：spawn `sh -c 'exit 7'` 后，宽预算轮询 observe 为 Some；第二次 observe 仍 Some(7)，finish 才回收；回收后的原生 waitid 为 ECHILD。另测 running 的观察为 None。
 
 ### Step 5：实现一次性的组清理与非阻塞异常降级
 
-- [ ] session 每次 finish 都使用同一顺序：若 owns_child=false，仅关闭 pipe、解除能力并结束；否则在 child 未回收时向负 pgid 发 SIGKILL。保存结果后关闭 pipe；未观察退出时向正 child PID 尝试 SIGKILL。然后解除 may_signal_group，再回收。
-- [ ] 已观察退出或 child 的 kill 成功：`child.wait()` 回收，Interrupted 重试；信号失败且未确认退出：仅 `child.try_wait()` 一次，不能无条件 wait。组信号 ESRCH 本身是可接受的“组不存在”，不单独制造清理失败，但也不当作child死亡证明：仍按上述规则尝试正PID信号/一次try_wait。正PID信号 ESRCH 只有在一次try_wait确认已退出时才能消解；否则仍报告无法确认回收。其他错误收集为 CleanupFailed。finish所有出口都置finished，解除缓存组信号能力，Drop不得对旧pgid重试。
-- [ ] 为决策分支抽一个私有纯函数，不造通用 mock 进程框架：
+- [x] session 每次 finish 都使用同一顺序：若 owns_child=false，仅关闭 pipe、解除能力并结束；否则在 child 未回收时向负 pgid 发 SIGKILL。保存结果后关闭 pipe；未观察退出时向正 child PID 尝试 SIGKILL。然后解除 may_signal_group，再回收。
+- [x] 已观察退出或 child 的 kill 成功：`child.wait()` 回收，Interrupted 重试；信号失败且未确认退出：仅 `child.try_wait()` 一次，不能无条件 wait。组信号 ESRCH 本身是可接受的“组不存在”，不单独制造清理失败，但也不当作child死亡证明：仍按上述规则尝试正PID信号/一次try_wait。正PID信号 ESRCH 只有在一次try_wait确认已退出时才能消解；否则仍报告无法确认回收。其他错误收集为 CleanupFailed。finish所有出口都置finished，解除缓存组信号能力，Drop不得对旧pgid重试。
+- [x] 为决策分支抽一个私有纯函数，不造通用 mock 进程框架：
 
 ```rust
 #[derive(Debug, PartialEq, Eq)]
@@ -360,14 +360,14 @@ fn reap_mode(owns_child: bool, observed_exit: bool, child_kill_ok: bool) -> Reap
 ```
 
 生产 finish 必须真正调用该函数。表驱动断言 `(false,false,false)->None`、`(false,true,true)->None`、`(true,true,false)->Blocking`、`(true,false,true)->Blocking`、`(true,false,false)->NonBlocking`。
-- [ ] 增加 cfg(test) 的事件观察/错误注入点（仅该模块）：记录 `signal_group/close_pipes/signal_child/disarm_group/reap` 次序；模拟 ECHILD、fcntl 失败、组信号失败、直接信号失败、Interrupted。注入点不增加公开 API，不在生产路径按 env 切行为。
-- [ ] 真实 fixture 组清理覆盖：inherited（超时）、inherited+marker触发取消、inherited_closed（成功；后代先关两流但仍活着）。helper在parent退出前等待后代marker，避免还未spawn就断言“后代已死”。读取marker中的PID只用于观察，使用有界 `ps -p <pid> -o stat=` 条件轮询：不存在或Z为已终止；普通活状态为未终止。不得按marker PID盲kill，避免复用误杀；PID复用最多导致测试安全失败。每条测试在fixture目录仍存在时检查后代终止，不能先drop根目录让后代自行退出来伪造产品清理成功。失败退出才用root消失和60s helper backstop收口。
-- [ ] 用 `catch_unwind` 故意在持有 session 时 panic，检查 guard 走同一清理次序。成功 finish 后再次 Drop 不产生第二次组信号。
+- [x] 增加 cfg(test) 的事件观察/错误注入点（仅该模块）：记录 `signal_group/close_pipes/signal_child/disarm_group/reap` 次序；模拟 ECHILD、fcntl 失败、组信号失败、直接信号失败、Interrupted。注入点不增加公开 API，不在生产路径按 env 切行为。
+- [x] 真实 fixture 组清理覆盖：inherited（超时）、inherited+marker触发取消、inherited_closed（成功；后代先关两流但仍活着）。helper在parent退出前等待后代marker，避免还未spawn就断言“后代已死”。读取marker中的PID只用于观察，使用有界 `ps -p <pid> -o stat=` 条件轮询：不存在或Z为已终止；普通活状态为未终止。不得按marker PID盲kill，避免复用误杀；PID复用最多导致测试安全失败。每条测试在fixture目录仍存在时检查后代终止，不能先drop根目录让后代自行退出来伪造产品清理成功。失败退出才用root消失和60s helper backstop收口。
+- [x] 用 `catch_unwind` 故意在持有 session 时 panic，检查 guard 走同一清理次序。成功 finish 后再次 Drop 不产生第二次组信号。
 
 ### Step 6：实现双流公平轮询和全阶段限时
 
-- [ ] describe.rs 内声明 `mod process;`。定义 `DrainProgress { bytes: usize, eof: bool, interrupted: bool }`，`drain_once<R: std::io::Read>(reader: &mut R, capture: &mut Capture, policy: &DescribePolicy) -> Result<DrainProgress, DescribeError>` 使用固定8KiB buffer；每次只传 `&mut buf[..policy.read_chunk.min(buf.len()).min(remaining_budget)]` 的预计算长度片段，读至本轮policy.drain_budget_per_stream。私有policy构造保证两个值大于0且read_chunk<=8KiB；生产值仍为8/64KiB。read=0 EOF；WouldBlock返回；Interrupted返回interrupted；其他读错返回Io；每块调用Capture::push，软cap不停止读。
-- [ ] `describe` 的操作结果放入内部闭包，再无条件 finish，以便所有 ? 出口都合并清理诊断。骨架如下，里面的函数均由本 Task 定义：
+- [x] describe.rs 内声明 `mod process;`。定义 `DrainProgress { bytes: usize, eof: bool, interrupted: bool }`，`drain_once<R: std::io::Read>(reader: &mut R, capture: &mut Capture, policy: &DescribePolicy) -> Result<DrainProgress, DescribeError>` 使用固定8KiB buffer；每次只传 `&mut buf[..policy.read_chunk.min(buf.len()).min(remaining_budget)]` 的预计算长度片段，读至本轮policy.drain_budget_per_stream。私有policy构造保证两个值大于0且read_chunk<=8KiB；生产值仍为8/64KiB。read=0 EOF；WouldBlock返回；Interrupted返回interrupted；其他读错返回Io；每块调用Capture::push，软cap不停止读。
+- [x] `describe` 的操作结果放入内部闭包，再无条件 finish，以便所有 ? 出口都合并清理诊断。骨架如下，里面的函数均由本 Task 定义：
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,8 +439,8 @@ fn describe_with_clock(
 }
 ```
 
-- [ ] `combine<T>` 的四种情况写全：Ok+Ok 保留值；Err+Ok 保留主错；Ok+Err 返回清理错；Err+Err 返回 WithCleanup。它不识别 error 字符串。
-- [ ] 上述 Checkpoint 与 describe_with_clock 是唯一实现真源，所有执行预算判据调用同一个now；AfterIo携带本轮真实观察，不增加cfg(test)可变全局观察器。生产包装的完整函数如下：
+- [x] `combine<T>` 的四种情况写全：Ok+Ok 保留值；Err+Ok 保留主错；Ok+Err 返回清理错；Err+Err 返回 WithCleanup。它不识别 error 字符串。
+- [x] 上述 Checkpoint 与 describe_with_clock 是唯一实现真源，所有执行预算判据调用同一个now；AfterIo携带本轮真实观察，不增加cfg(test)可变全局观察器。生产包装的完整函数如下：
 
 ```rust
 pub(super) fn describe(
@@ -475,16 +475,16 @@ assert!(matches!(result, Err(DescribeError::Timeout(_))));
 ```
 
 continuous stderr在bytes_read>0的AfterIo推进；eof_live在两个EOF且observed_exit=false时推进；完成后到期仅在Final推进。各测试都断言目标状态布尔值，禁止仅断言最终Timeout。生产时钟从不冻结。
-- [ ] 原 refresh.rs 的 describe 替换为兼容包装：调用私有 executor、production policy、永不取消谓词，然后 error.render(command)。生产立即使用新执行器，不能只让测试使用新路径。
+- [x] 原 refresh.rs 的 describe 替换为兼容包装：调用私有 executor、production policy、永不取消谓词，然后 error.render(command)。生产立即使用新执行器，不能只让测试使用新路径。
 
 ### Step 7：验证行为绿、限时红的鉴别力与提交
 
-- [ ] 运行 Task 1 两条旧 API 行为红，必须转绿。
-- [ ] 新增 `describe_deadline_covers_inherited_pipes_after_exit`、`describe_times_out_while_output_keeps_arriving`、`describe_rejects_stdout_over_limit_without_rewriting`、`describe_cleanup_stops_its_process_group`、`describe_keeps_bounded_failure_diagnostics`。每条既验证具体 error 类型，也验证原清单未改、capture 上限或真实阶段，不只看耗时。
-- [ ] 有界 EOF 场景全部测：两 EOF 但 child 仍活着不能成功；child 已退出但一流未 EOF 不成功；晚完成在最终检查恰好到期不成功；非零 child 也受期限，不进入阻塞读。
-- [ ] 变异三项逐个还原再跑：先等退出后读→两条背压测试红；退出后不查 deadline→继承管道测试红；直接 kill child、跳过组→组清理测试红。不能把编译错误当作这些行为变异的红。
-- [ ] 删除旧阻塞 wait_with_output 实现与旧 DESCRIBE_TIMEOUT 重复真源，保留其历史注释所需的说明并指向 DescribePolicy::production。新 private module 无 unused/dead_code 警告。
-- [ ] 同步 runtime 未完成项中的执行器阶段判据，**仍为 [ ]**：批次和 runtime 取消尚未完成。`cargo fmt --all && just ci` 通过后仅 add Task 1 文件和对应文档，commit `fix: bound plugin manifest description and child cleanup`。
+- [x] 运行 Task 1 两条旧 API 行为红，必须转绿。
+- [x] 新增 `describe_deadline_covers_inherited_pipes_after_exit`、`describe_times_out_while_output_keeps_arriving`、`describe_rejects_stdout_over_limit_without_rewriting`、`describe_cleanup_stops_its_process_group`、`describe_keeps_bounded_failure_diagnostics`。每条既验证具体 error 类型，也验证原清单未改、capture 上限或真实阶段，不只看耗时。
+- [x] 有界 EOF 场景全部测：两 EOF 但 child 仍活着不能成功；child 已退出但一流未 EOF 不成功；晚完成在最终检查恰好到期不成功；非零 child 也受期限，不进入阻塞读。
+- [x] 变异三项逐个还原再跑：先等退出后读→两条背压测试红；退出后不查 deadline→继承管道测试红；直接 kill child、跳过组→组清理测试红。不能把编译错误当作这些行为变异的红。
+- [x] 删除旧阻塞 wait_with_output 实现与旧 DESCRIBE_TIMEOUT 重复真源，保留其历史注释所需的说明并指向 DescribePolicy::production。新 private module 无 unused/dead_code 警告。
+- [x] 同步 runtime 未完成项中的执行器阶段判据，**仍为 [ ]**：批次和 runtime 取消尚未完成。`cargo fmt --all && just ci` 通过后仅 add Task 1 文件和对应文档，commit `fix: bound plugin manifest description and child cleanup`。
 
 ---
 
@@ -513,7 +513,7 @@ struct RefreshRecord {
 
 ### Step 1：先写取消与不写盘测试
 
-- [ ] `cancelled_refresh_does_not_start_the_next_plugin`：a=hang、b=small，在取消谓词观察 a 的 manifest marker 后返回 true；断言只有 a 的 cancelled Skipped、a 字节未改、b marker 不存在。先前成功 c 项需另用排序更靠前的名称 `0_done`，断言已 Refreshed 的文件保留，b 未开始。
+- [x] `cancelled_refresh_does_not_start_the_next_plugin`：a=hang、b=small，在取消谓词观察 a 的 manifest marker 后返回 true；断言只有 a 的 cancelled Skipped、a 字节未改、b marker 不存在。先前成功 c 项需另用排序更靠前的名称 `0_done`，断言已 Refreshed 的文件保留，b 未开始。
 
 ```rust
 #[test]
@@ -535,7 +535,7 @@ fn cancelled_refresh_does_not_start_the_next_plugin() {
 ```
 
 测试检查 reason 只是公开结果的断言，不作为生产日志分类。内部另断言 DescribeError 的 Cancelled 类型。
-- [ ] 开始即取消→空vector、所有marker不存在。私有RefreshPhase用于稳定观察写回闸门，不新增公开API或cfg(test)全局hook。写回前取消的测试正文如下；Current由已有测试保持不写盘：
+- [x] 开始即取消→空vector、所有marker不存在。私有RefreshPhase用于稳定观察写回闸门，不新增公开API或cfg(test)全局hook。写回前取消的测试正文如下；Current由已有测试保持不写盘：
 
 ```rust
 #[test]
@@ -557,12 +557,12 @@ fn cancellation_at_the_write_gate_preserves_stored_bytes() {
     assert_eq!(std::fs::read(&a.stored).unwrap(), before);
 }
 ```
-- [ ] 原有六类刷新测试全部保留：Current 不写、同名 stale 更新、命令失败、名称错位、坏 JSON、临时文件清理；不把大 stdout 测试改成仅验证 parse 报错。
-- [ ] 先运行并记录缺 API 的编译红；API 补齐后将批次取消检查暂时移除，确认取消/marker 断言的行为红。
+- [x] 原有六类刷新测试全部保留：Current 不写、同名 stale 更新、命令失败、名称错位、坏 JSON、临时文件清理；不把大 stdout 测试改成仅验证 parse 报错。
+- [x] 先运行并记录缺 API 的编译红；API 补齐后将批次取消检查暂时移除，确认取消/marker 断言的行为红。
 
 ### Step 2：实施批次投影与写回闸门
 
-- [ ] error classification 使用递归枚举，而不是 reason：
+- [x] error classification 使用递归枚举，而不是 reason：
 
 ```rust
 pub(super) fn is_cancelled(&self) -> bool {
@@ -575,14 +575,14 @@ pub(super) fn is_cancelled(&self) -> bool {
 ```
 
 `cleanup_warning` 对 WithCleanup 返回 cleanup 的副本，对单独 CleanupFailed 返回其说明，其他返回 None。
-- [ ] refresh_one从executor的typed error构造record；向describe传 `&mut || should_stop(RefreshPhase::DescribeCheck)`。parse/名称校验/写入IO错作为非取消Skipped。比较fresh与stored前查BeforeCompare，write_atomic前查BeforeWrite；已启动项取消也产出record。
-- [ ] refresh_records首先查BeforeLoad，为true立即返回空vector，不读目录；随后按load_manifests现有稳定顺序循环，BeforeItem检查、处理后push；若record.cancelled或AfterItem检查为true则break，保留先前成功项，不伪造尚未启动项的Skipped。
-- [ ] 两个until入口使用production policy，将公开FnMut()取消谓词适配为私有 `&mut |_| should_stop()`；RefreshPhase不export。旧refresh_from_plugins(dir)等价 `refresh_from_plugins_until(dir, || false)`；旧refresh_and_log同理。移除Task1临时兼容describe包装，所有入口走同一executor。
+- [x] refresh_one从executor的typed error构造record；向describe传 `&mut || should_stop(RefreshPhase::DescribeCheck)`。parse/名称校验/写入IO错作为非取消Skipped。比较fresh与stored前查BeforeCompare，write_atomic前查BeforeWrite；已启动项取消也产出record。
+- [x] refresh_records首先查BeforeLoad，为true立即返回空vector，不读目录；随后按load_manifests现有稳定顺序循环，BeforeItem检查、处理后push；若record.cancelled或AfterItem检查为true则break，保留先前成功项，不伪造尚未启动项的Skipped。
+- [x] 两个until入口使用production policy，将公开FnMut()取消谓词适配为私有 `&mut |_| should_stop()`；RefreshPhase不export。旧refresh_from_plugins(dir)等价 `refresh_from_plugins_until(dir, || false)`；旧refresh_and_log同理。移除Task1临时兼容describe包装，所有入口走同一executor。
 
 ### Step 3：实现不会被 stderr 伪造的日志
 
-- [ ] log_records 先对 cleanup_warning 单独 warn（即使主因是正常取消也不能掩盖清理失败）；Current 不写日志；Refreshed info 并收集名称；真正 cancelled Skipped debug；其他 Skipped warn。不要从 reason 字串推断级别。
-- [ ] 不加 tracing-subscriber 依赖，使用现有 tracing::Subscriber 自定义测试接收器，记录 event metadata.level。完整所需 trait 方法如下：
+- [x] log_records 先对 cleanup_warning 单独 warn（即使主因是正常取消也不能掩盖清理失败）；Current 不写日志；Refreshed info 并收集名称；真正 cancelled Skipped debug；其他 Skipped warn。不要从 reason 字串推断级别。
+- [x] 不加 tracing-subscriber 依赖，使用现有 tracing::Subscriber 自定义测试接收器，记录 event metadata.level。完整所需 trait 方法如下：
 
 ```rust
 #[derive(Clone)]
@@ -602,13 +602,13 @@ impl tracing::Subscriber for Levels {
 }
 ```
 
-- [ ] fixture nonzero 的 stderr 第一行含 cancelled；with_default 中调用真实 refresh_and_log_until，断言 WARN 且不是仅 DEBUG。正常取消只有 debug（除非清理异常），WithCleanup(Cancelled)另有 WARN，正文超512 chars/原 stdout不进日志。该接收器只断言级别；字段/文本上限由 error/capture 单元测试断言。
+- [x] fixture nonzero 的 stderr 第一行含 cancelled；with_default 中调用真实 refresh_and_log_until，断言 WARN 且不是仅 DEBUG。正常取消只有 debug（除非清理异常），WithCleanup(Cancelled)另有 WARN，正文超512 chars/原 stdout不进日志。该接收器只断言级别；字段/文本上限由 error/capture 单元测试断言。
 
 ### Step 4：验证与提交
 
-- [ ] `cargo test -p yi-agent-supervisors --lib refresh::` 与整个 crate，核对取消前/中/写前、先前成功项保留、后续项未启动、旧结果形状均覆盖。
-- [ ] 变异：日志分类改为 `reason.contains("cancelled")`→nonzero fixture 用例红；去掉 write 前 stop 闸门→写回取消用例红；去掉批次 break→b marker 用例红。
-- [ ] 同步 docs 中批次/日志判据，仍 [ ] 等待 runtime 接线。门禁通过后 commit `fix: cancel manifest refresh batches without losing stored state`。
+- [x] `cargo test -p yi-agent-supervisors --lib refresh::` 与整个 crate，核对取消前/中/写前、先前成功项保留、后续项未启动、旧结果形状均覆盖。
+- [x] 变异：日志分类改为 `reason.contains("cancelled")`→nonzero fixture 用例红；去掉 write 前 stop 闸门→写回取消用例红；去掉批次 break→b marker 用例红。
+- [x] 同步 docs 中批次/日志判据，仍 [ ] 等待 runtime 接线。门禁通过后 commit `fix: cancel manifest refresh batches without losing stored state`。
 
 ---
 
@@ -620,7 +620,7 @@ impl tracing::Subscriber for Levels {
 
 ### Step 1：真实入口的红测试
 
-- [ ] 在 supervise.rs 模块根添加 cfg(test) 源码级 fixture 引用，不添加运行时依赖：
+- [x] 在 supervise.rs 模块根添加 cfg(test) 源码级 fixture 引用，不添加运行时依赖：
 
 ```rust
 #[cfg(test)]
@@ -630,7 +630,7 @@ mod refresh_fixture;
 ```
 
 相对于 `yi-agent-runtime/src/` 回退两层到 crates；fixture 只用 std/tempfile/serde_json，两 crate 已有这些依赖。新 runtime tests 从 `super::refresh_fixture` 取得 PluginFixture。
-- [ ] `stopping_during_manifest_refresh_joins_promptly` 从真实 `serve_with_environment` 起 a=hang，传 fixture.arm_flags()、Some("dev")、真实 scope；条件等待 manifest_marker 完整 PID（用现有 SETTLE_BUDGET），然后停止。必须先证明 child 已进入自述，不能用 serve_without_manifest_refresh。
+- [x] `stopping_during_manifest_refresh_joins_promptly` 从真实 `serve_with_environment` 起 a=hang，传 fixture.arm_flags()、Some("dev")、真实 scope；条件等待 manifest_marker 完整 PID（用现有 SETTLE_BUDGET），然后停止。必须先证明 child 已进入自述，不能用 serve_without_manifest_refresh。
 
 ```rust
 fn assert_refresh_shutdown(use_drop: bool) {
@@ -671,15 +671,15 @@ fn dropping_during_manifest_refresh_joins_promptly() { assert_refresh_shutdown(t
 ```
 
 成功后断言 a 原 bytes 不变、本项目 plugin_socket_for 为空、b run/manifest marker均未出现。失败分支不先 join；fixture 消失是测试 child 的回收 backstop，不是产品取消的替代。
-- [ ] 上述两个测试经同一辅助函数分别验证stop和Drop，均须在--list中出现，不删掉任一分支。
-- [ ] `a_slow_description_does_not_block_later_supervision` 同项目 a=hang、b=small，真实刷新等待 a 的生产 15 秒 deadline，b 自述结束并进入正常 run。用至少40s条件轮询证明 b.run_marker、b路由均出现；a.store 原bytes不变，b.store为fresh。
-- [ ] b 的路由从 `plugin_socket_for(&scope_of(workdir), "b")` 取得，UnixStream 连该路径并发送 `{"method":"ping"}\n`，读取响应解析后 `ok == true`。设 read/write timeout，不能只靠 socket 文件存在或marker伪造可查询。
-- [ ] 新测试与既有 TABLE 锁共用现有 exclusive()，但不把此锁当 nextest 跨进程同步。
-- [ ] 先跑 --list；基线 stop 测试红在2s接收，而不是整个测试无限挂起。保留这份输出。
+- [x] 上述两个测试经同一辅助函数分别验证stop和Drop，均须在--list中出现，不删掉任一分支。
+- [x] `a_slow_description_does_not_block_later_supervision` 同项目 a=hang、b=small，真实刷新等待 a 的生产 15 秒 deadline，b 自述结束并进入正常 run。用至少40s条件轮询证明 b.run_marker、b路由均出现；a.store 原bytes不变，b.store为fresh。
+- [x] b 的路由从 `plugin_socket_for(&scope_of(workdir), "b")` 取得，UnixStream 连该路径并发送 `{"method":"ping"}\n`，读取响应解析后 `ok == true`。设 read/write timeout，不能只靠 socket 文件存在或marker伪造可查询。
+- [x] 新测试与既有 TABLE 锁共用现有 exclusive()，但不把此锁当 nextest 跨进程同步。
+- [x] 先跑 --list；基线 stop 测试红在2s接收，而不是整个测试无限挂起。保留这份输出。
 
 ### Step 2：最小生产接线
 
-- [ ] 只把刷新移动到既有 catch 的开头，使用已有 flag；别在 stop 后直接 return，仍落入 cleanup：
+- [x] 只把刷新移动到既有 catch 的开头，使用已有 flag；别在 stop 后直接 return，仍落入 cleanup：
 
 ```rust
 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -705,14 +705,14 @@ if outcome.is_err() {
 ```
 
 外层 stop/join 结构不变，for_daemon_ownership、serve_without_manifest_refresh 的分流不变。
-- [ ] 抽出私有 `drive_supervision`（完整代码见附录 C），将本步 catch/循环原样放入其中；`serve_inner` 的 thread closure 调用该驱动，并传入真实刷新闭包。测试直接给同一驱动传一次 panic 闭包，检查本项目清空、其他项目保留。不得新增公开 API、可变全局 hook 或 env 行为分支。真实 stop/Drop 和 A/B 两测试仍经过 serve_with_environment，不用这个注入驱动替代真实接线。
+- [x] 抽出私有 `drive_supervision`（完整代码见附录 C），将本步 catch/循环原样放入其中；`serve_inner` 的 thread closure 调用该驱动，并传入真实刷新闭包。测试直接给同一驱动传一次 panic 闭包，检查本项目清空、其他项目保留。不得新增公开 API、可变全局 hook 或 env 行为分支。真实 stop/Drop 和 A/B 两测试仍经过 serve_with_environment，不用这个注入驱动替代真实接线。
 
 ### Step 3：验证、变异和提交
 
-- [ ] `cargo test -p yi-agent-runtime --lib supervise -- --list`，确认两个主要名称及 Drop/路由 panic 用例。
-- [ ] 运行整个 supervise 测试和 supervisors crate；去掉 until stop接线→2s停机用例红；改回刷新在catch外→刷新panic路由用例红；stop后early return→已预登记本项目路由清理用例红。
-- [ ] 不降低 a 的生产deadline，不新增 pub测试policy，不把新用例改成 serve_without_manifest_refresh。
-- [ ] 此 Task 产品接线完成后，先在文档记实际通过的 crate命令；只有 Task4的完整验收都通过才整体 [x]。门禁通过后 commit `fix: interrupt project supervision during manifest refresh`。
+- [x] `cargo test -p yi-agent-runtime --lib supervise -- --list`，确认两个主要名称及 Drop/路由 panic 用例。
+- [x] 运行整个 supervise 测试和 supervisors crate；去掉 until stop接线→2s停机用例红；改回刷新在catch外→刷新panic路由用例红；stop后early return→已预登记本项目路由清理用例红。
+- [x] 不降低 a 的生产deadline，不新增 pub测试policy，不把新用例改成 serve_without_manifest_refresh。
+- [x] 此 Task 产品接线完成后，先在文档记实际通过的 crate命令；只有 Task4的完整验收都通过才整体 [x]。门禁通过后 commit `fix: interrupt project supervision during manifest refresh`。
 
 ---
 
@@ -724,7 +724,7 @@ if outcome.is_err() {
 
 ### Step 1：逐项对照 spec 验收，不把绿灯代替覆盖
 
-- [ ] 用下表核对 --list 和实际结果，列出缺项；缺项回到对应 Task补测，不用只通过总体计数代替。
+- [x] 用下表核对 --list 和实际结果，列出缺项；缺项回到对应 Task补测，不用只通过总体计数代替。
 
 | spec §6 验收目标 | 实施责任 | 额外必须核实 |
 |---|---|---|
@@ -741,7 +741,7 @@ if outcome.is_err() {
 
 ### Step 2：运行真实实现和平台边界
 
-- [ ] macOS 本机跑下面全部命令；Linux CI跑相同Rust gate，并核实 libc访问器与waitid行为，不能凭macOS C探针冒称Linux机制已验证：
+- [x] macOS 本机跑下面全部命令；Linux CI跑相同Rust gate，并核实 libc访问器与waitid行为，不能凭macOS C探针冒称Linux机制已验证：
 
 ```sh
 cd yi-agent-rs
@@ -752,16 +752,16 @@ cargo clippy -p yi-agent-supervisors -p yi-agent-runtime --all-targets -- -D war
 just ci
 ```
 
-- [ ] 运行正常子进程退出、信号退出、运行中None、WNOWAIT重复观察、最后ECHILD五态；每个spawn都拥有一次可核验的收口。检查新unsafe块的注释和真实FD非阻塞状态。
-- [ ] 在目标检查点推进测试时钟：轮询入口、两流读后、退出观察后、成功cleanup后。确认 final check才是成功线性化点，没有清理结束后的到期漏判。
-- [ ] 单项变异通过后还原全部生产代码，再跑完整测试；diff里不留下测试注入、日志诊断打印或放宽超时。
+- [x] 运行正常子进程退出、信号退出、运行中None、WNOWAIT重复观察、最后ECHILD五态；每个spawn都拥有一次可核验的收口。检查新unsafe块的注释和真实FD非阻塞状态。
+- [x] 在目标检查点推进测试时钟：轮询入口、两流读后、退出观察后、成功cleanup后。确认 final check才是成功线性化点，没有清理结束后的到期漏判。
+- [x] 单项变异通过后还原全部生产代码，再跑完整测试；diff里不留下测试注入、日志诊断打印或放宽超时。
 
 ### Step 3：按真实结果更新状态并提交
 
-- [ ] bug-list 中本缺陷改 [x]，加准确代码位置与两crate命令、所跑平台、变异结果；所有权异常/逃逸后代仍按spec降级描述，不能写“完全没有孤儿”。
-- [ ] runtime 模块该项改 [x]，留下可执行判据；重算README的runtime完成/总数。禁止 [~]；如果门禁失败仍保留 [ ]，不把完成定义降低为“已写代码”。
-- [ ] spec头部改为实现已验收，链接交付提交；本plan复选框只在各步实际完成后打勾。历史复现、历史CI限制保留其日期和性质。
-- [ ] 文档提交前仍 cargo fmt、just ci、git diff --check；commit `docs: record bounded manifest refresh verification`。
+- [x] bug-list 中本缺陷改 [x]，加准确代码位置与两crate命令、所跑平台、变异结果；所有权异常/逃逸后代仍按spec降级描述，不能写“完全没有孤儿”。
+- [x] runtime 模块该项改 [x]，留下可执行判据；重算README的runtime完成/总数。禁止 [~]；如果门禁失败仍保留 [ ]，不把完成定义降低为“已写代码”。
+- [x] spec头部改为实现已验收，链接交付提交；本plan复选框只在各步实际完成后打勾。历史复现、历史CI限制保留其日期和性质。
+- [x] 文档提交前仍 cargo fmt、just ci、git diff --check；commit `docs: record bounded manifest refresh verification`。
 
 ### Step 4：合并与清理
 
