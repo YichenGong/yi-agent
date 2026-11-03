@@ -440,3 +440,44 @@ mod tests {
         );
     }
 }
+
+/// Whether the foreground-root lifecycle is switched on for this process.
+///
+/// Every behavioural change from Task 2 through Task 10 hangs off this flag, and its
+/// production default is [`Self::Disabled`] until Task 11 flips the real entry point.
+/// That ordering is deliberate: the persisted schema, the classification rules and the
+/// new IPC surface can all land and be tested while a running daemon still behaves
+/// exactly as it did before.
+///
+/// It is an *internal* type. There is no environment variable, file or RPC that sets
+/// it: a flag that can be flipped from outside is a feature switch nobody has to
+/// prove, and this one gates an exemption from the worker watchdog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForegroundActivation {
+    /// Legacy semantics: every root obeys the existing watchdog and recovery paths.
+    #[default]
+    Disabled,
+    /// Foreground semantics: classified roots are fenced by binding/driver epochs and
+    /// `pending`/`managed` roots leave the worker-watchdog and startup sweep alone.
+    Enabled,
+}
+
+impl ForegroundActivation {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// The activation a test may construct.
+    ///
+    /// Available to unit tests and to integration tests that opt in through the
+    /// non-default `foreground-test-support` feature. Production callers cannot reach
+    /// it, so `--all-features` cannot turn the feature on by accident.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn for_test(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}

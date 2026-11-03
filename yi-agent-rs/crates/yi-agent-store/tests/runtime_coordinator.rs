@@ -4911,3 +4911,132 @@ async fn a_lost_observer_keeps_the_lease() {
     );
     assert_eq!(coordinator.unconfirmed_stops().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Foreground root lifecycle: startup reconciliation (Task 2)
+// ---------------------------------------------------------------------------
+
+/// Opens a database with two roots inside a live session, then reopens it through the
+/// daemon's real startup path with the foreground switch on.
+///
+/// The point is the *interaction*: the generic sweep parks live work, and the
+/// foreground reconciliation has to run in the same window without either of them
+/// contradicting the other. A unit test on `recover_inflight_tasks_with_activation`
+/// alone cannot show that ordering.
+#[test]
+fn foreground_root_lifecycle_daemon_startup_keeps_a_managed_container_and_parks_execution() {
+    use yi_agent_store::foreground::{ForegroundActivation, RootExecutionClass};
+    use yi_agent_store::repository::foreground::{
+        AdmissionState, ForegroundClassification, PersistedForegroundRoot,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime_dir = directory.path().join("runtime");
+
+    let (managed, execution, session) = {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        let session = RootSessionId::new();
+        let managed = TaskId::new();
+        let managed_attempt = AttemptId::new();
+        repository
+            .create_task_with_attempt(&managed, &session, &managed_attempt, 1, "running")
+            .unwrap();
+        repository
+            .record_application_root_attachment(
+                "thread-key",
+                &session,
+                &managed,
+                "digest",
+                "secret",
+                "/tmp/workspace",
+            )
+            .unwrap();
+        repository
+            .record_foreground_root(&PersistedForegroundRoot {
+                root: managed.clone(),
+                classification: ForegroundClassification::Managed,
+                binding_epoch: 3,
+                driver_epoch: 2,
+                owner_client_id: Some("owner-a".into()),
+                admission: AdmissionState::Closed,
+                driver_bind_operation_id: Some("bind-1".into()),
+            })
+            .unwrap();
+
+        // A queued reservation whose prepare never finished.
+        let pending = TaskId::new();
+        let pending_attempt = AttemptId::new();
+        repository
+            .create_task_with_attempt(&pending, &session, &pending_attempt, 1, "running")
+            .unwrap();
+        repository
+            .record_foreground_root(&PersistedForegroundRoot {
+                root: pending.clone(),
+                classification: ForegroundClassification::Pending,
+                binding_epoch: 0,
+                driver_epoch: 0,
+                owner_client_id: None,
+                admission: AdmissionState::Closed,
+                driver_bind_operation_id: Some("abandoned".into()),
+            })
+            .unwrap();
+        // A child of the managed root: children keep the execution policy.
+        let execution = TaskId::new();
+        let execution_attempt = AttemptId::new();
+        repository
+            .create_child_task_with_attempt(
+                &execution,
+                &session,
+                &managed,
+                1,
+                &execution_attempt,
+                1,
+                "running",
+            )
+            .unwrap();
+        (managed, execution, session)
+    };
+    let _ = session;
+
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_and_activation(
+        &runtime_dir,
+        &database,
+        Arc::new(RecordingFactory),
+        ForegroundActivation::Enabled,
+    )
+    .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.foreground_class(&managed).unwrap(),
+        RootExecutionClass::ForegroundManaged,
+        "a managed container keeps its identity across a restart"
+    );
+    assert_eq!(repository.task_state(&managed).unwrap(), "running");
+    assert_eq!(
+        repository.foreground_class(&execution).unwrap(),
+        RootExecutionClass::Execution,
+        "a child is execution work even when its root is a container"
+    );
+    assert_eq!(
+        repository.task_state(&execution).unwrap(),
+        "recovery_required",
+        "a live child of a container is still parked: the watchdog does govern it"
+    );
+
+    let persisted = repository
+        .persisted_foreground_root(&managed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.admission,
+        AdmissionState::Closed,
+        "a new generation holds no authorization for a surviving root"
+    );
+    assert!(!persisted.admission.admits_business());
+    assert_eq!(persisted.binding_epoch, 3);
+    assert_eq!(persisted.driver_epoch, 2);
+
+    drop(daemon);
+}

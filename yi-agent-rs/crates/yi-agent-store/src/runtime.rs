@@ -478,6 +478,27 @@ impl RuntimeCoordinator {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, RuntimeCoordinatorError> {
+        Self::open_with_activation(
+            database_path,
+            factory,
+            crate::foreground::ForegroundActivation::Disabled,
+        )
+    }
+
+    /// Hydrates the coordinator, with the foreground switch made explicit.
+    ///
+    /// The switch matters in exactly one place today: a `managed` foreground root is
+    /// deliberately left out of the startup sweep (it is the user's live conversation,
+    /// not a parked worker), so its children are parked *without* a recovered root
+    /// under them. `Disabled` keeps the original strictness — a recovered child with no
+    /// recovered parent is a corrupt database and must fail loudly — while `Enabled`
+    /// treats that shape as the expected consequence of a container that survived, and
+    /// leaves the child parked for its owner instead of failing the whole daemon.
+    pub fn open_with_activation(
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+    ) -> Result<Self, RuntimeCoordinatorError> {
         let mut repository = RuntimeRepository::open(database_path)?;
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
@@ -530,11 +551,17 @@ impl RuntimeCoordinator {
                         ));
                     }
                 };
-                let supervisor = supervisors.get(&task.session_id).ok_or_else(|| {
-                    RuntimeCoordinatorError::Supervisor(
+                let Some(supervisor) = supervisors.get(&task.session_id) else {
+                    if activation.is_enabled() {
+                        // Only reachable when the session's root was a surviving
+                        // foreground container: the child stays parked and its session
+                        // hydrates once the root is re-authorized and bound.
+                        continue;
+                    }
+                    return Err(RuntimeCoordinatorError::Supervisor(
                         "persisted recovered child has no recovered root".into(),
-                    )
-                })?;
+                    ));
+                };
                 // Read the model and inherited sandbox before `task.task_id`
                 // is moved into the call.
                 let model = repository.task_model(&task.task_id)?;

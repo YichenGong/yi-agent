@@ -93,6 +93,26 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
+        Self::start_with_factory_and_activation(
+            runtime_dir,
+            database_path,
+            factory,
+            crate::foreground::ForegroundActivation::Disabled,
+        )
+    }
+
+    /// The real startup sequence, with the foreground switch made explicit.
+    ///
+    /// `Disabled` reproduces the historical order exactly; `Enabled` additionally
+    /// reconciles the persisted foreground facts *after* the generic sweeps and
+    /// *before* the coordinator hydrates, which is the only window where no work is
+    /// admitted yet and no in-memory authority exists to disagree with the rows.
+    pub fn start_with_factory_and_activation(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+    ) -> Result<Self, IpcError> {
         raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
         fs::create_dir_all(runtime_dir)?;
@@ -113,7 +133,31 @@ impl Daemon {
         // before we bind our own listener.
         remove_if_exists(&socket_path)?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
-        repository.recover_inflight_tasks()?;
+        if activation.is_enabled() {
+            // Before the generic sweeps, because those are exactly the paths that would
+            // otherwise park a managed container or promote a half-prepared root. Both
+            // operations are idempotent and neither needs an authorization: they only
+            // ever *close* admission or cancel a reservation nothing can resume.
+            let cancelled_pending = repository.cancel_pending_foreground_roots()?;
+            if !cancelled_pending.is_empty() {
+                eprintln!(
+                    "yi-agent: cancelled {} abandoned foreground root reservation(s)",
+                    cancelled_pending.len()
+                );
+            }
+            // A new generation holds no authorization, so every persisted root starts
+            // closed. A `managed` root keeps its identity here and nothing more.
+            repository.close_foreground_admission()?;
+            // A `ready` operation's confirmation token lived in the dead process; the
+            // freeze survives, the token does not, so the host must prepare again.
+            let expired = repository.expire_uncommitted_recovery_operations()?;
+            if expired > 0 {
+                eprintln!(
+                    "yi-agent: {expired} foreground recovery operation(s) need a fresh preview"
+                );
+            }
+        }
+        repository.recover_inflight_tasks_with_activation(activation)?;
         // The sweep above parks interrupted work in `recovery_required`, which
         // is a terminal state, so anything that cannot actually resume would sit
         // there forever and pin its session's supervisor. Reclaim those, plus
@@ -131,7 +175,11 @@ impl Daemon {
             );
         }
         drop(repository);
-        let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
+        let coordinator = Arc::new(RuntimeCoordinator::open_with_activation(
+            database_path.as_ref(),
+            factory,
+            activation,
+        )?);
         // A fresh daemon starts with no plugin routes; the supervisor republishes
         // them as soon as it reconciles. Only this project's routes are dropped:
         // another project's daemon in the same process keeps serving.

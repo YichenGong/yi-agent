@@ -475,13 +475,49 @@ impl RuntimeRepository {
     }
 
     pub fn recover_inflight_tasks(&mut self) -> Result<usize, RepositoryError> {
+        self.recover_inflight_tasks_with_activation(
+            crate::foreground::ForegroundActivation::Disabled,
+        )
+    }
+
+    /// Startup recovery, with the foreground switch applied.
+    ///
+    /// `Disabled` is byte-for-byte the historical behaviour (and the only production
+    /// path until Task 11). `Enabled` additionally leaves `pending` and `managed`
+    /// foreground roots in place: neither may be parked in `recovery_required`,
+    /// because
+    ///
+    /// * a `pending` root never ran anything, so there is nothing to recover and no
+    ///   authorization survives the restart that would let it resume — the sweep
+    ///   cancels those instead of parking them; and
+    /// * a `managed` root is the user's live conversation container: parking it would
+    ///   end the conversation, while leaving it alone is safe because its admission is
+    ///   closed at boot and only a fresh authorization reopens it.
+    ///
+    /// `legacy` roots are deliberately *not* excluded. They keep the execution budget
+    /// policy, so they must keep the execution recovery policy with it.
+    pub fn recover_inflight_tasks_with_activation(
+        &mut self,
+        activation: crate::foreground::ForegroundActivation,
+    ) -> Result<usize, RepositoryError> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The exclusion is expressed as a correlated subquery over the persisted
+        // classification rather than a precomputed id list so a row cannot slip
+        // between the two statements.
+        let exclusion = if activation.is_enabled() {
+            " AND NOT EXISTS(
+                  SELECT 1 FROM foreground_root_state f
+                  WHERE f.root_task_id = tasks.id
+                    AND f.classification IN ('pending', 'managed'))"
+        } else {
+            ""
+        };
         let task_ids = {
-            let mut statement = transaction.prepare(
-                "SELECT id FROM tasks WHERE state_json IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children')",
-            )?;
+            let mut statement = transaction.prepare(&format!(
+                "SELECT id FROM tasks WHERE state_json IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children'){exclusion}"
+            ))?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -574,9 +610,21 @@ impl RuntimeRepository {
                 [],
             )?;
         }
+        // Attempts follow their task. Without this guard an excluded managed root would
+        // keep a live task row while its attempt was parked, and every later query that
+        // joins the two would disagree with `foreground_class`.
+        let attempt_exclusion = if activation.is_enabled() {
+            " AND task_id NOT IN (
+                  SELECT f.root_task_id FROM foreground_root_state f
+                  WHERE f.classification IN ('pending', 'managed'))"
+        } else {
+            ""
+        };
         transaction.execute(
-            "UPDATE attempts SET state = 'recovery_required', ended_at = CURRENT_TIMESTAMP
-             WHERE state IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children')",
+            &format!(
+                "UPDATE attempts SET state = 'recovery_required', ended_at = CURRENT_TIMESTAMP
+                 WHERE state IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children'){attempt_exclusion}"
+            ),
             [],
         )?;
         transaction.commit()?;

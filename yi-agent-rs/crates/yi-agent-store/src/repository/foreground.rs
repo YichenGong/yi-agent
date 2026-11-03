@@ -1,0 +1,526 @@
+//! Durable foreground-root facts: classification, activity and recovery receipts.
+//!
+//! Three questions, three tables (created by the v17 migration):
+//!
+//! * **classification** — is this root a worker attempt or a foreground container,
+//!   and is it currently allowed to do business?
+//! * **activity** — what is the conversation doing, independent of `TaskState`?
+//! * **recovery** — which recovery operations already happened, so a retry replays
+//!   the receipt instead of minting a second successor attempt?
+//!
+//! The rules that decide *whether* a write is legal live in [`crate::foreground`]
+//! (pure, no database). This module only persists their verdict. That split is what
+//! keeps "a late finish must not overwrite a newer turn" testable twice: once as a
+//! reducer unit test, and once against a real row.
+
+use super::*;
+use crate::foreground::{ActivityApply, ForegroundError, RootExecutionClass, reduce_activity};
+use yi_agent_lifecycle::foreground::{
+    ActivityPhase, ActivitySnapshot, ActivityUpdate, RecoveryResult,
+};
+
+/// The migration's `classification` column, as a value rather than a string.
+///
+/// `Legacy` is the only shape an existing installation can have: an attachment
+/// written before this feature. It is still recognised as a foreground session, but
+/// it keeps the `Execution` budget policy until an authenticated prepare moves it,
+/// because silently promoting a *running* root into an unbounded container would
+/// remove the only thing that ever stops a dead delegation tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundClassification {
+    Legacy,
+    Pending,
+    Managed,
+}
+
+impl ForegroundClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Pending => "pending",
+            Self::Managed => "managed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, RepositoryError> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "pending" => Ok(Self::Pending),
+            "managed" => Ok(Self::Managed),
+            _ => Err(RepositoryError::Foreground(ForegroundError::CorruptBinding)),
+        }
+    }
+
+    /// The watchdog policy this classification asks for.
+    ///
+    /// `Legacy` deliberately maps to `Execution`: the migration only records the
+    /// foreground *role*, it does not grant the new budget policy.
+    pub fn execution_class(self) -> RootExecutionClass {
+        match self {
+            Self::Legacy => RootExecutionClass::Execution,
+            Self::Pending => RootExecutionClass::ForegroundPending,
+            Self::Managed => RootExecutionClass::ForegroundManaged,
+        }
+    }
+}
+
+/// Whether the root may accept new business, as far as persistence can know.
+///
+/// The plan's schema only allows `closed` and `frozen` here, and that is the whole
+/// point: **open is runtime-only state**. A restarted daemon has no authorization, so
+/// it always opens with every root closed; if "open" were a persisted value, a crash
+/// between two writes could leave a root admitting business on a generation that
+/// never authenticated it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionState {
+    /// Persisted default: no business until a live generation authorizes this root.
+    Closed,
+    /// A recovery freeze. Also refuses business, and additionally refuses the
+    /// delegation that recovery has not yet proven stopped.
+    Frozen,
+}
+
+impl AdmissionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Frozen => "frozen",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, RepositoryError> {
+        match value {
+            "closed" => Ok(Self::Closed),
+            "frozen" => Ok(Self::Frozen),
+            _ => Err(RepositoryError::Foreground(ForegroundError::CorruptBinding)),
+        }
+    }
+
+    /// No persisted admission state admits business. A caller that needs "may I
+    /// dispatch?" must consult the live authority table, not this row.
+    pub fn admits_business(self) -> bool {
+        false
+    }
+}
+
+/// One persisted foreground row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedForegroundRoot {
+    pub root: TaskId,
+    pub classification: ForegroundClassification,
+    pub binding_epoch: u64,
+    pub driver_epoch: u64,
+    pub owner_client_id: Option<String>,
+    pub admission: AdmissionState,
+    pub driver_bind_operation_id: Option<String>,
+}
+
+impl RuntimeRepository {
+    /// Persists the initial (or replacement) foreground identity of one root.
+    ///
+    /// This is the *only* writer of `classification`, and it is not reachable from
+    /// the wire: Task 3 authenticates a prepare, Task 7 proves the stop boundary.
+    /// A direct call here is how the migration tests build a `managed` row to check
+    /// hydration; it does not mean the root passed authentication.
+    pub fn record_foreground_root(
+        &mut self,
+        row: &PersistedForegroundRoot,
+    ) -> Result<(), RepositoryError> {
+        let binding_epoch = i64::try_from(row.binding_epoch).map_err(|_| {
+            RepositoryError::InvalidForegroundFact {
+                root: row.root.to_string(),
+                reason: "binding epoch exceeds the SQLite integer range".into(),
+            }
+        })?;
+        let driver_epoch = i64::try_from(row.driver_epoch).map_err(|_| {
+            RepositoryError::InvalidForegroundFact {
+                root: row.root.to_string(),
+                reason: "driver epoch exceeds the SQLite integer range".into(),
+            }
+        })?;
+        self.connection.execute(
+            "INSERT INTO foreground_root_state
+                (root_task_id, binding_epoch, driver_epoch, owner_client_id,
+                 admission_state, driver_bind_operation_id, activity_json, classification)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+             ON CONFLICT(root_task_id) DO UPDATE SET
+                 binding_epoch = excluded.binding_epoch,
+                 driver_epoch = excluded.driver_epoch,
+                 owner_client_id = excluded.owner_client_id,
+                 admission_state = excluded.admission_state,
+                 driver_bind_operation_id = excluded.driver_bind_operation_id,
+                 classification = excluded.classification",
+            params![
+                row.root.to_string(),
+                binding_epoch,
+                driver_epoch,
+                row.owner_client_id,
+                row.admission.as_str(),
+                row.driver_bind_operation_id,
+                row.classification.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn persisted_foreground_root(
+        &self,
+        root: &TaskId,
+    ) -> Result<Option<PersistedForegroundRoot>, RepositoryError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT root_task_id, classification, binding_epoch, driver_epoch,
+                        owner_client_id, admission_state, driver_bind_operation_id
+                 FROM foreground_root_state WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((root_task_id, classification, binding_epoch, driver_epoch, owner, admission, op)) =
+            row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PersistedForegroundRoot {
+            root: root_task_id
+                .parse()
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+            classification: ForegroundClassification::parse(&classification)?,
+            binding_epoch: u64::try_from(binding_epoch)
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+            driver_epoch: u64::try_from(driver_epoch)
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+            owner_client_id: owner,
+            admission: AdmissionState::parse(&admission)?,
+            driver_bind_operation_id: op,
+        }))
+    }
+
+    /// Classifies one root, from persistence plus the attachment it must agree with.
+    ///
+    /// The order matters: a persisted row wins (it is a decision someone
+    /// authenticated), and only a root with no row falls back to "does an
+    /// attachment exist". A persisted row whose root disappeared, or whose
+    /// attachment contradicts it, is `Corrupt` — never silently reclassified,
+    /// because guessing an exemption is how an immortal container gets created.
+    pub fn foreground_class(&self, root: &TaskId) -> Result<RootExecutionClass, RepositoryError> {
+        let Some(persisted) = self.persisted_foreground_root(root)? else {
+            // No explicit row. Every root is an execution task until an authenticated
+            // prepare says otherwise, so an attachment alone changes nothing: that is
+            // exactly the legacy policy (the plan's `application` assertion).
+            return Ok(RootExecutionClass::Execution);
+        };
+        if !self.task_exists(&persisted.root)? {
+            return Ok(RootExecutionClass::Corrupt);
+        }
+        // A `legacy` row claims a foreground role, so it must still agree with an
+        // attachment. The rows this migration can produce never do this (it writes
+        // none); a mismatch means a row was written by hand or a task was deleted
+        // from under it.
+        if persisted.classification == ForegroundClassification::Legacy
+            && !self.root_has_attachment(&persisted.root)?
+        {
+            return Ok(RootExecutionClass::Corrupt);
+        }
+        Ok(persisted.classification.execution_class())
+    }
+
+    /// Whether the worker watchdog may settle this root.
+    ///
+    /// One call site for the policy, so the candidate query and the terminal commit
+    /// cannot disagree about it (Task 5 re-checks it inside the commit transaction).
+    pub fn root_is_watchdog_governed(&self, root: &TaskId) -> Result<bool, RepositoryError> {
+        Ok(crate::foreground::worker_watchdog_applies(
+            self.foreground_class(root)?,
+        ))
+    }
+
+    fn task_exists(&self, task: &TaskId) -> Result<bool, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            params![task.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    /// Does this root (task or its session) carry an application attachment?
+    ///
+    /// An attachment on a *different* task of the same session does not count: it
+    /// names the root, and matching only the session would let a child inherit its
+    /// root's exemption.
+    fn root_has_attachment(&self, root: &TaskId) -> Result<bool, RepositoryError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM application_root_attachments a
+                 WHERE a.root_task_id = ?1
+             )",
+            params![root.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    /// The committed activity snapshot, if one exists.
+    ///
+    /// A historical `running` phase is projected to `Unknown`: after a restart the
+    /// daemon cannot know whether that turn is still alive, and claiming `idle`
+    /// would turn a possibly-live turn into permission to start another one. The
+    /// stored snapshot is left untouched because it is diagnostic evidence.
+    pub fn foreground_activity(
+        &self,
+        root: &TaskId,
+    ) -> Result<Option<ActivitySnapshot>, RepositoryError> {
+        let stored: Option<(Option<String>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT activity_json, classification FROM foreground_root_state
+                 WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((activity_json, _)) = stored else {
+            return Ok(None);
+        };
+        let Some(activity_json) = activity_json else {
+            return Ok(None);
+        };
+        let mut snapshot: ActivitySnapshot = serde_json::from_str(&activity_json)?;
+        snapshot.update.phase = project_reloaded_phase(snapshot.update.phase);
+        Ok(Some(snapshot))
+    }
+
+    /// Applies one activity report, or explains why it may not be applied.
+    ///
+    /// The reduction is the pure [`reduce_activity`]; this function only supplies the
+    /// committed row and writes the result. `Duplicate` and `Stale` write nothing, so
+    /// a replayed report cannot refresh `changed_at` and thereby extend anything.
+    pub fn apply_foreground_activity(
+        &mut self,
+        update: &ActivityUpdate,
+    ) -> Result<ActivitySnapshot, RepositoryError> {
+        let root: TaskId = update
+            .fence
+            .root
+            .root_id
+            .parse()
+            .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT activity_json FROM foreground_root_state WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let committed = current
+            .as_deref()
+            .map(serde_json::from_str::<ActivitySnapshot>)
+            .transpose()?;
+
+        let Some(committed) = committed else {
+            // The first report ever: nothing to order against, but a driver still may
+            // not open with `Unknown` (only the daemon produces it).
+            if update.phase == ActivityPhase::Unknown {
+                return Err(RepositoryError::Foreground(
+                    ForegroundError::InvalidActivity,
+                ));
+            }
+            let snapshot = ActivitySnapshot {
+                update: update.clone(),
+                changed_at: Utc::now().to_rfc3339(),
+            };
+            transaction.execute(
+                "UPDATE foreground_root_state SET activity_json = ?1 WHERE root_task_id = ?2",
+                params![serde_json::to_string(&snapshot)?, root.to_string()],
+            )?;
+            transaction.commit()?;
+            return Ok(snapshot);
+        };
+
+        // `Duplicate` and `Stale` return the committed snapshot unchanged: replaying a
+        // report must not refresh `changed_at`, or an old message could look newer
+        // than the turn that actually replaced it.
+        match reduce_activity(&committed.update, update)? {
+            ActivityApply::Applied => {}
+            ActivityApply::Duplicate | ActivityApply::Stale => {
+                transaction.commit()?;
+                return Ok(committed);
+            }
+        }
+
+        let snapshot = ActivitySnapshot {
+            update: update.clone(),
+            changed_at: Utc::now().to_rfc3339(),
+        };
+        transaction.execute(
+            "UPDATE foreground_root_state SET activity_json = ?1 WHERE root_task_id = ?2",
+            params![serde_json::to_string(&snapshot)?, root.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    /// The durable receipt of a committed recovery, if that exact operation happened.
+    ///
+    /// `None` means "no committed result"; it does **not** mean "safe to start a new
+    /// operation" — an in-flight prepare is also `None` here and is answered by
+    /// `foreground_recovery_phase`.
+    pub fn foreground_recovery_result(
+        &self,
+        root: &TaskId,
+        operation: &str,
+    ) -> Result<Option<RecoveryResult>, RepositoryError> {
+        let result: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT result_json FROM foreground_recovery_operations
+                 WHERE root_task_id = ?1 AND operation_id = ?2 AND phase = 'committed'",
+                params![root.to_string(), operation],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        match result {
+            None | Some(None) => Ok(None),
+            Some(Some(json)) => Ok(Some(serde_json::from_str(&json)?)),
+        }
+    }
+
+    /// The stored phase of one recovery operation, including the non-success ones.
+    pub fn foreground_recovery_phase(
+        &self,
+        root: &TaskId,
+        operation: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT phase FROM foreground_recovery_operations
+                 WHERE root_task_id = ?1 AND operation_id = ?2",
+                params![root.to_string(), operation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// Rewrites every uncommitted recovery operation to `needs_preview`.
+    ///
+    /// The confirmation token lives in memory, so after a restart a `ready`
+    /// operation cannot be committed; the freeze is preserved but the host must
+    /// prepare again under valid authority. Calling this is part of startup, not of
+    /// a request path.
+    pub fn expire_uncommitted_recovery_operations(&mut self) -> Result<usize, RepositoryError> {
+        Ok(self.connection.execute(
+            "UPDATE foreground_recovery_operations SET phase = 'needs_preview'
+             WHERE phase IN ('preparing', 'blocked', 'ready')",
+            [],
+        )?)
+    }
+
+    /// Cancels foreground roots that were still `pending` when the daemon died.
+    ///
+    /// A `pending` root is a reservation made by a prepare that never completed. It
+    /// holds no execution — nothing ran under it — but it also holds no surviving
+    /// authorization: the prepare, its operation id and its deadline all lived in the
+    /// dead generation. Leaving it alone would leave a root that refuses business
+    /// forever, and promoting it to `managed` would hand out an exemption nobody
+    /// proved. Cancelling is the only honest outcome.
+    ///
+    /// Only rows whose task is still live are touched, so a root that already settled
+    /// keeps its real terminal state and its real evidence.
+    pub fn cancel_pending_foreground_roots(&mut self) -> Result<Vec<TaskId>, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending = {
+            let mut statement = transaction.prepare(
+                "SELECT f.root_task_id FROM foreground_root_state f
+                 JOIN tasks t ON t.id = f.root_task_id
+                 WHERE f.classification = 'pending'
+                   AND t.state_json IN ('queued', 'running', 'waiting_for_resource',
+                                        'waiting_for_permission', 'waiting_for_children')",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut cancelled = Vec::new();
+        for value in pending {
+            let root: TaskId = value
+                .parse()
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+            let terminal_json = serde_json::to_string(&serde_json::json!({
+                "reason": "pending_foreground_root_abandoned",
+            }))?;
+            transaction.execute(
+                "UPDATE tasks SET state_json = 'cancelled', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![root.to_string()],
+            )?;
+            transaction.execute(
+                "UPDATE attempts SET state = 'cancelled', ended_at = CURRENT_TIMESTAMP,
+                     terminal_json = ?1
+                 WHERE id = (SELECT active_attempt_id FROM tasks WHERE id = ?2)",
+                params![terminal_json, root.to_string()],
+            )?;
+            transaction.execute(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE task_id = ?1 AND state = 'active'",
+                params![root.to_string()],
+            )?;
+            transaction.execute(
+                "UPDATE foreground_root_state SET classification = 'legacy',
+                     admission_state = 'closed'
+                 WHERE root_task_id = ?1",
+                params![root.to_string()],
+            )?;
+            append_event(&transaction, &root, RuntimeEvent::TaskCancelled)?;
+            cancelled.push(root);
+        }
+        transaction.commit()?;
+        Ok(cancelled)
+    }
+
+    /// Closes business admission for every persisted foreground root.
+    ///
+    /// This is startup's default: a new daemon generation holds no authorization, so
+    /// a `managed` root keeps its identity (it must not be demoted to `Execution`,
+    /// which would hand it back to the worker watchdog) but may not do business until
+    /// it is re-authorized. `Pending` roots are additionally reaped by the startup
+    /// sweep, because nothing authenticates them any more.
+    pub fn close_foreground_admission(&mut self) -> Result<usize, RepositoryError> {
+        Ok(self.connection.execute(
+            "UPDATE foreground_root_state SET admission_state = 'closed'",
+            [],
+        )?)
+    }
+}
+
+/// A phase as it must be *read* after a restart.
+///
+/// Only `running` is rewritten. `waiting_*` is already an unknown wait detail (it is
+/// legal for a live daemon to be unsure whether it is waiting on children or on a
+/// permission prompt), and `idle`/`unknown` are already correct.
+fn project_reloaded_phase(phase: ActivityPhase) -> ActivityPhase {
+    match phase {
+        ActivityPhase::Running => ActivityPhase::Unknown,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+#[path = "foreground_tests.rs"]
+mod tests;

@@ -31,6 +31,7 @@ use helpers::{
 };
 mod application_root;
 mod event;
+pub mod foreground;
 mod mailbox;
 mod permission;
 mod read;
@@ -46,7 +47,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = 17;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -158,6 +159,16 @@ pub enum RepositoryError {
     /// it, keep the file) from "the database is corrupt".
     #[error("schema incompatible: {reason}")]
     SchemaIncompatible { reason: String },
+    /// A structured foreground rejection. Kept as a typed variant rather than a
+    /// flattened string: callers dispatch on [`ForegroundError::code`], and an
+    /// English message cannot be matched on without becoming a parsing problem.
+    #[error("foreground root lifecycle: {0}")]
+    Foreground(#[from] crate::foreground::ForegroundError),
+    /// A foreground fact that cannot be stored as asked (an out-of-range epoch, an
+    /// unknown enum spelling). Separate from `Foreground` because it is an internal
+    /// contract violation, not a client rejection.
+    #[error("foreground state for {root} is invalid: {reason}")]
+    InvalidForegroundFact { root: String, reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -1170,7 +1181,7 @@ mod extra_roots_tests {
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
-        assert_eq!(LATEST_SCHEMA_VERSION, 16);
+        assert_eq!(LATEST_SCHEMA_VERSION, 17);
     }
 
     /// v16 records who last owned a root and why it ended.
@@ -1180,18 +1191,21 @@ mod extra_roots_tests {
         let path = directory.path().join("runtime.sqlite");
         RuntimeRepository::open(&path).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
-        // Roll back to the v15 shape: drop the v16 table and its version row.
+        // Roll back to the v15 shape. `migrate` gates on `MAX(version)`, so deleting
+        // only the v16 row would leave a higher row behind and v16 would never re-run;
+        // every later version must go too. Written relative to the ceiling so each
+        // future migration does not have to edit this test.
         connection
             .execute_batch(
                 "DROP TABLE IF EXISTS root_owners;
-                 DELETE FROM schema_migrations WHERE version = 16;",
+                 DELETE FROM schema_migrations WHERE version >= 16;",
             )
             .unwrap();
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
         let version = repository.schema_version().unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let connection = rusqlite::Connection::open(&path).unwrap();
         let has_table: bool = connection
             .query_row(
