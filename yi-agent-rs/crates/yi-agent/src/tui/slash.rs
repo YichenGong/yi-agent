@@ -251,7 +251,20 @@ pub fn help_text(target: Option<&str>) -> String {
                     .unwrap_or_default(),
                 command.description()
             ),
-            None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+            None => match super::side::SIDE_HELP_ENTRIES.iter().find(|(usage, _)| {
+                let canonical = usage.split_whitespace().next().unwrap_or_default();
+                canonical == name
+                        // `/btw` 是 `/side` 的别名：帮助要能查到它，但目录里
+                        // 只保留规范名一行。
+                        || (canonical == super::side::SIDE_COMMAND
+                            && name == super::side::SIDE_ALIAS)
+            }) {
+                // 旁支命令不是 `SlashCommand`:它们在 `handle_key` 之前就被
+                // 拦截了（否则运行中敲 `/side` 会先打断父会话）。但 `/help`
+                // 必须能查到它们，否则用户只能靠猜。
+                Some((usage, description)) => format!("/{usage}\n{description}"),
+                None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+            },
         },
         None => {
             let mut text = String::from("可用命令:\n");
@@ -266,6 +279,10 @@ pub fn help_text(target: Option<&str>) -> String {
                     usage,
                     command.description()
                 ));
+            }
+            text.push_str("\n旁问:\n");
+            for (usage, description) in super::side::SIDE_HELP_ENTRIES {
+                text.push_str(&format!("  /{usage} {description}\n"));
             }
             text
         }
@@ -1219,6 +1236,36 @@ mod tests {
         assert_eq!(SlashCommand::Cost.unavailable_reason(), None);
         assert_eq!(SlashCommand::Daemon.unavailable_reason(), None);
         assert_eq!(SlashCommand::Kanban.unavailable_reason(), None);
+    }
+
+    #[test]
+    fn full_help_lists_side_commands_once_without_the_alias() {
+        let help = help_text(None);
+        assert!(help.contains("/side [问题]"), "目录必须列出 /side：{help}");
+        assert!(help.contains("/back"), "目录必须列出 /back：{help}");
+        assert!(
+            help.contains("/side-close"),
+            "目录必须列出 /side-close：{help}"
+        );
+        // btw 只作为别名出现在 /side 的描述里，不能自己占一行。
+        assert!(!help.contains("  /btw"), "别名不能作为独立条目出现：{help}");
+        assert_eq!(
+            help.lines()
+                .filter(|line| line.starts_with("  /side ["))
+                .count(),
+            1,
+            "规范名只列一次：{help}"
+        );
+    }
+
+    #[test]
+    fn contextual_help_resolves_side_commands_but_not_the_alias_entry() {
+        assert!(help_text(Some("side")).contains("/side [问题]"));
+        assert!(help_text(Some("back")).contains("返回主会话"));
+        assert!(help_text(Some("side-close")).contains("关闭当前旁问"));
+        // `/btw` 是别名：查它应给出 /side 的说明，而不是「未知命令」。
+        let btw = help_text(Some("btw"));
+        assert!(btw.contains("/side [问题]"), "{btw}");
     }
 
     #[test]

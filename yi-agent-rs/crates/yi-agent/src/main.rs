@@ -2305,20 +2305,44 @@ fn publish_side_source(
     update.commit(source);
 }
 
-/// 构造一次旁支来源快照。
+/// 启动时发布的旁支来源。
 ///
-/// 旁支继承的是**父此刻生效**的模型、system prompt 与 effort,并且复用同一个
-/// provider 实例（凭据只读一次）。历史取自主会话的 `Arc<Mutex<Session>>`,但
-/// `SideConversationRunner::new` 会 fork 出一份独立 Session,所以旁支的写入
-/// 永远碰不到父会话。
-fn side_source_snapshot(
+/// 必须携带 **resume 进来的历史**:driver 走到首帧 `publish_side_source`
+/// 之前，用户完全可能已经敲了 `/side`；用一个空 `Session` 会把「明明有一整段
+/// 历史」报成 parent_not_started。这是本函数存在的唯一理由，抽出来是为了让
+/// 测试跑的正是生产调用点，而不是一个平行实现。
+fn side_startup_source(
     agent_config: &yi_agent_core::AgentConfig,
     provider: Arc<dyn Provider>,
     primary: std::path::PathBuf,
+    initial_messages: &[yi_agent_core::Message],
+    initial_last_input: Option<u32>,
+) -> yi_agent_runtime::side_conversation::EffectiveSideSource {
+    let mut seeded = yi_agent_core::Session::from_messages(initial_messages.to_vec());
+    seeded.set_last_input_tokens(initial_last_input);
+    side_source_snapshot_with_session(
+        agent_config,
+        provider,
+        primary,
+        Arc::new(std::sync::Mutex::new(seeded)),
+    )
+}
+
+/// 同上,但直接复用主 driver 真实持有的那个 session `Arc`。
+///
+/// 发布器在 TUI 启动**之前**就发布一次来源,而这时的历史可能是 resume 带进来
+/// 的。如果只发布一个空 `Session`,用户一进 TUI 就敲 `/side`（driver 还没走到
+/// 首帧的 `publish_side_source`）会得到「父会话还没有可继承的历史」——明明刚
+/// resume 了一整个会话。传真实 `Arc` 让这条窗口消失,而不是靠「用户不会那么快」。
+fn side_source_snapshot_with_session(
+    agent_config: &yi_agent_core::AgentConfig,
+    provider: Arc<dyn Provider>,
+    primary: std::path::PathBuf,
+    session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
 ) -> yi_agent_runtime::side_conversation::EffectiveSideSource {
     let roots = vec![primary.clone()];
     yi_agent_runtime::side_conversation::EffectiveSideSource {
-        session: Arc::new(std::sync::Mutex::new(yi_agent_core::Session::new())),
+        session,
         provider,
         config: agent_config.clone(),
         primary: primary.clone(),
@@ -2431,51 +2455,6 @@ fn run_tui_agent(
             crate::tui::runtime_prefs::RuntimePreference::Never => "never",
         };
 
-        // 旁支:一份 source 发布器 + 一个独立调度任务。
-        //
-        // 发布器在这里创建,由主 driver 的每个重建入口（model/effort/compact/
-        // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
-        // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
-        let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
-        let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
-        let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
-            side_instance_home,
-            Arc::clone(&side_pool),
-        );
-        let mut side_commands_tx_for_driver = None;
-        let mut side_commands_tx_for_tui_exit: Option<
-            tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
-        > = None;
-        let mut side_driver_join_for_exit: Option<tokio::task::JoinHandle<()>> = None;
-        let (side_publisher, side_runtime) = match side_resources {
-            Ok(resources) => {
-                let publisher = Arc::new(yi_agent_runtime::side_conversation::SideSourcePublisher::new(
-                    side_source_snapshot(
-                        &agent_config,
-                        Arc::clone(&provider),
-                        snapshot_workdir.clone(),
-                    ),
-                ));
-                let handles = crate::side_driver::spawn_side_driver(
-                    Arc::clone(&publisher),
-                    resources,
-                    Arc::clone(&side_pool),
-                );
-                side_commands_tx_for_driver = Some(handles.commands.clone());
-                side_commands_tx_for_tui_exit = Some(handles.commands.clone());
-                side_driver_join_for_exit = Some(handles.join);
-                (
-                    Some(publisher),
-                    crate::tui::app::SideRuntime::new(handles.commands, handles.events),
-                )
-            }
-            Err(error) => {
-                // 旁支不可用不该阻止主 TUI 启动:能力缺失会由 `/side` 明确告知。
-                tracing::warn!(%error, "side conversations unavailable; continuing without them");
-                (None, crate::tui::app::SideRuntime::disabled())
-            }
-        };
-
         let tui_config = crate::tui::slash::TuiConfigSnapshot {
             provider: config.provider.clone(),
             model_injected: config.model_injected,
@@ -2582,6 +2561,54 @@ fn run_tui_agent(
                 }
             };
         let session_store_for_driver = session_store.clone();
+
+        // 旁支:一份 source 发布器 + 一个独立调度任务。
+        //
+        // 发布器在这里创建,由主 driver 的每个重建入口（model/effort/compact/
+        // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
+        // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
+        let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
+        let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
+        let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+            side_instance_home,
+            Arc::clone(&side_pool),
+        );
+        let mut side_commands_tx_for_driver = None;
+        let mut side_commands_tx_for_tui_exit: Option<
+            tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        > = None;
+        let mut side_driver_join_for_exit: Option<tokio::task::JoinHandle<()>> = None;
+        let (side_publisher, side_runtime) = match side_resources {
+            Ok(resources) => {
+                let publisher = Arc::new(yi_agent_runtime::side_conversation::SideSourcePublisher::new(
+                    side_startup_source(
+                        &agent_config,
+                        Arc::clone(&provider),
+                        snapshot_workdir.clone(),
+                        &initial_messages,
+                        initial_last_input,
+                    ),
+                ));
+                let handles = crate::side_driver::spawn_side_driver(
+                    Arc::clone(&publisher),
+                    resources,
+                    Arc::clone(&side_pool),
+                );
+                side_commands_tx_for_driver = Some(handles.commands.clone());
+                side_commands_tx_for_tui_exit = Some(handles.commands.clone());
+                side_driver_join_for_exit = Some(handles.join);
+                (
+                    Some(publisher),
+                    crate::tui::app::SideRuntime::new(handles.commands, handles.events),
+                )
+            }
+            Err(error) => {
+                // 旁支不可用不该阻止主 TUI 启动:能力缺失会由 `/side` 明确告知。
+                tracing::warn!(%error, "side conversations unavailable; continuing without them");
+                (None, crate::tui::app::SideRuntime::disabled())
+            }
+        };
+
 
         // resume/fork 带进来的提示词：预置进输入队列，driver 一启动就会
         // 把它当成第一条 prompt。容量 16 且尚未消费任何一条，try_send 不会失败。
@@ -3418,6 +3445,53 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 启动时发布的旁支来源必须携带 resume 进来的真实历史。
+    ///
+    /// 这里用空 `Session` 会打开一个竞态窗口:driver 走到首帧 `publish_side_source`
+    /// 之前，用户一进 TUI 敲 `/side` 就会收到「父会话还没有可继承的历史」，
+    /// 而屏幕上明明有一整段 resume 的历史。测试直接读发布器抓到的快照。
+    #[tokio::test]
+    async fn startup_side_source_carries_the_resumed_history() {
+        let mut session = yi_agent_core::Session::new();
+        session.push(yi_agent_core::Message::user("resume 里的问题"));
+        session.push(yi_agent_core::Message::assistant(vec![
+            yi_agent_core::ContentBlock::Text("resume 里的回答".into()),
+        ]));
+
+        let source = side_startup_source(
+            &yi_agent_core::AgentConfig::default(),
+            Arc::new(SideTestProvider),
+            std::path::PathBuf::from("/tmp/proj"),
+            session.messages(),
+            session.last_input_tokens(),
+        );
+        let publisher = yi_agent_runtime::side_conversation::SideSourcePublisher::new(source);
+        let snapshot = publisher.snapshot().await.expect("resume 历史必须可继承");
+        let messages = snapshot.session.lock().unwrap().messages().to_vec();
+        assert!(
+            messages
+                .iter()
+                .any(|m| format!("{m:?}").contains("resume 里的问题")),
+            "启动来源里必须能读到 resume 的历史: {messages:?}"
+        );
+    }
+
+    /// 这些测试只读来源，不发起任何 provider 请求；被调用即说明测试写错了。
+    struct SideTestProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SideTestProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::ProviderRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+            yi_agent_core::ProviderError,
+        > {
+            panic!("side test provider must not be called")
+        }
+    }
 
     #[test]
     fn resume_hint_names_the_real_thread_id() {

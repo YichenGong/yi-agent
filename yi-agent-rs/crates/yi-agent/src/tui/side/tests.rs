@@ -101,10 +101,25 @@ fn back_and_close_are_structural_commands_without_arguments() {
     // 带参数是错误,不是问题正文:静默忽略会让用户以为已经关闭。
     assert!(classify_conversation_input("/back now", true).is_err());
     assert!(classify_conversation_input("/side-close 现在", true).is_err());
+}
 
-    // 主会话里没有可返回/可关闭的对象。
-    assert!(classify_conversation_input("/back", false).is_err());
-    assert!(classify_conversation_input("/side-close", false).is_err());
+#[test]
+fn back_and_close_parse_in_the_main_view_too() {
+    // spec §4.1:主视图里的 `/back` 是空操作,`/side-close` 关闭后台旁支
+    // （没有旁支时幂等成功）。分类器只回答「这是不是旁支命令」;「有没有
+    // 可返回/可关闭的对象」需要真实生命周期状态,由调用方判断。
+    // 把这两条判成错误会让它们掉进「未知命令」,与桌面端语义分叉。
+    assert_eq!(
+        classify_conversation_input("/back", false).unwrap(),
+        RoutedInput::Side(SideInput::Back)
+    );
+    assert_eq!(
+        classify_conversation_input("/side-close", false).unwrap(),
+        RoutedInput::Side(SideInput::Close)
+    );
+    // 带参数在任何视图都是错误。
+    assert!(classify_conversation_input("/back now", false).is_err());
+    assert!(classify_conversation_input("/side-close 现在", false).is_err());
 }
 
 #[test]

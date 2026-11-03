@@ -1486,12 +1486,14 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 let history_text_width =
                     history.text_width(history_area.width, history_area.height);
                 if !in_side
+                    && history.pending_permission_info().is_none()
                     && intercept_side_command(
                         key,
                         input,
                         history,
                         history_text_width,
                         &channels,
+                        &mut side_session,
                         side_capable,
                     )
                 {
@@ -1508,7 +1510,9 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                         input,
                         history,
                         history_text_width,
+                        &mut side_session,
                         &channels,
+                        side_capable,
                     ) {
                         ApprovalRoute::Handled(KeyOutcome::Quit) => break,
                         ApprovalRoute::Handled(_) => continue,
@@ -1597,6 +1601,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                     &popup_stack.runtime_popup,
                     &mut loop_bk.pending_quit,
                     &mut popup_stack.popup,
+                    loop_bk.approval_mode,
                 );
             }
             Some(Event::Mouse(mouse)) => {
@@ -2798,53 +2803,135 @@ fn handle_key_intercepts(key: KeyEvent, ctx: &mut InterceptContext<'_>) -> bool 
 ///
 /// 分组依据是实测的使用频次：高频且互相纠缠的（history/input/popup/尺寸）
 /// 放 `View`；只读的运行时依赖放 `Runtime`；模型选择放 `Model`。
-/// 主视图里敲 `/side`、`/btw` 的拦截。
+/// 主视图里敲旁支命令（`/side`、`/btw`、`/back`、`/side-close`）的拦截。
 ///
 /// 必须在 `handle_key` **之前**:那里会把回车当成一次普通提交投进主 `input`
 /// 通道,于是运行中的父会话会被插话打断——正是旁支要避免的事。这里只拦
-/// 「首 token 是 /side 或 /btw」的回车,其余按键原样放行。
+/// 「首 token 是旁支命令」的回车,其余按键与其它斜杠命令原样放行。
+#[allow(clippy::too_many_arguments)]
 fn intercept_side_command(
     key: KeyEvent,
     input: &mut InputLine,
     history: &mut HistoryState,
     history_width: u16,
     channels: &TuiChannels,
+    side: &mut SideSession,
     side_capable: bool,
 ) -> bool {
     if key.code != KeyCode::Enter || !key.modifiers.is_empty() {
         return false;
     }
-    let text = input.buffer.trim();
-    let Some(rest) = text.strip_prefix('/') else {
+    let text = input.buffer.clone();
+    let trimmed = text.trim();
+    let Some(name) = side_command_name(trimmed) else {
         return false;
     };
+    // 命中旁支命令就由这里负责到底:即使分类失败（例如 `/back 参数`）
+    // 也不能落回「未知命令」或当成普通消息发给模型。
+    input.clear();
+    match crate::tui::side::classify_conversation_input(trimmed, false) {
+        Ok(crate::tui::side::RoutedInput::Side(command)) => {
+            execute_side_command_in_main(
+                command,
+                history,
+                history_width,
+                side,
+                channels,
+                side_capable,
+            );
+        }
+        Ok(crate::tui::side::RoutedInput::Main(_)) => {
+            unreachable!("side_command_name 已确认 {name} 是旁支命令,分类器不能再判成主会话")
+        }
+        Err(error) => {
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(error.message),
+                },
+                history_width,
+            );
+        }
+    }
+    true
+}
+
+/// 输入行的首 token 是否是一个旁支命令;是则返回命令名。
+///
+/// 只认完整 token:`/sidebar` 不是 `/side`。
+fn side_command_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
     let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let name = &rest[..name_end];
-    if name != super::side::SIDE_COMMAND && name != super::side::SIDE_ALIAS {
-        return false;
-    }
-    let question = rest[name_end..].trim();
-    let question = (!question.is_empty()).then(|| question.to_string());
+    matches!(
+        name,
+        crate::tui::side::SIDE_COMMAND
+            | crate::tui::side::SIDE_ALIAS
+            | crate::tui::side::BACK_COMMAND
+            | crate::tui::side::SIDE_CLOSE_COMMAND
+    )
+    .then_some(name)
+}
 
-    // 没有旁支能力时**不能**静默吞掉:用户敲了 `/side` 却没反应,只会以为
-    // 是输入没生效。清空输入并把原因写进主转录。
-    let Some(commands) = channels.side.as_ref().filter(|_| side_capable) else {
-        input.clear();
-        history.push(
-            HistoryCell::Separator {
-                label: Some("本次会话未启用旁支（/side 不可用）".to_string()),
-            },
-            history_width,
-        );
-        return true;
+/// 在主视图（含父审批的命令模式）里执行一条旁支命令。
+///
+/// 主视图里的语义（spec §4.1）:
+///
+/// - `/side`、`/btw` 打开/切到旁支;没有旁支能力时明确提示,不静默吞掉。
+/// - `/back` 是空操作:已经在主会话了,但要给出提示,否则像是命令没生效。
+/// - `/side-close` 关闭后台旁支;**没有旁支时幂等成功**,不报错。
+fn execute_side_command_in_main(
+    command: crate::tui::side::SideInput,
+    history: &mut HistoryState,
+    history_width: u16,
+    side: &mut SideSession,
+    channels: &TuiChannels,
+    side_capable: bool,
+) -> KeyOutcome {
+    use crate::tui::side::SideInput;
+
+    let notice = |history: &mut HistoryState, label: String| {
+        history.push(HistoryCell::Separator { label: Some(label) }, history_width);
     };
-    let command = crate::side_driver::SideDriverCommand::Open {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        question,
+
+    if !side_capable {
+        // 没有能力时所有旁支命令都只能提示,不能假装执行成功。
+        notice(history, "本次会话未启用旁支（/side 不可用）".to_string());
+        return KeyOutcome::None;
+    }
+    let Some(commands) = channels.side.as_ref() else {
+        notice(history, "本次会话未启用旁支（/side 不可用）".to_string());
+        return KeyOutcome::None;
     };
-    input.clear();
-    let _ = commands.try_send(command);
-    true
+
+    match command {
+        SideInput::Open { question } => {
+            let _ = commands.try_send(crate::side_driver::SideDriverCommand::Open {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                question,
+            });
+        }
+        SideInput::Back => {
+            notice(history, "已经在主会话了，无需 /back".to_string());
+        }
+        SideInput::Close => match side.active_side() {
+            None => notice(history, "当前没有旁问".to_string()),
+            Some(view) if !view.is_live() => {
+                let text = view
+                    .closed
+                    .map(crate::tui::side::close_reason_text)
+                    .unwrap_or_else(|| "旁问已关闭".to_string());
+                notice(history, text);
+            }
+            Some(_) => {
+                let _ = commands.try_send(crate::side_driver::SideDriverCommand::Close {
+                    expected_active_turn_id: side.active_turn_id.clone(),
+                });
+            }
+        },
+        // 分类器在主视图里不会产出这些变体。
+        SideInput::Submit(_) | SideInput::LocalCommand(_) => {}
+    }
+    KeyOutcome::None
 }
 
 /// 旁支视图里的按键裁决。
@@ -2993,7 +3080,9 @@ fn route_parent_approval_key(
     input: &mut InputLine,
     history: &mut HistoryState,
     history_width: u16,
+    side: &mut SideSession,
     channels: &TuiChannels,
+    side_capable: bool,
 ) -> ApprovalRoute {
     use crate::tui::side::{ApprovalInputMode, ApprovalKeyAction, route_approval_key};
 
@@ -3014,14 +3103,28 @@ fn route_parent_approval_key(
         ApprovalKeyAction::EditCommand(key) => {
             if key.code == KeyCode::Enter {
                 let text = input.take_submitted();
-                *saved_draft = None;
-                return ApprovalRoute::Handled(exec_approval_command(
+                let outcome = exec_approval_command(
                     text,
                     input,
                     history,
                     history_width,
+                    side,
                     channels,
-                ));
+                    side_capable,
+                );
+                if matches!(outcome, KeyOutcome::Quit) {
+                    return ApprovalRoute::Handled(outcome);
+                }
+                // 执行完一条命令就回到裁决模式:用户敲命令是为了「办一件事」,
+                // 不是为了离开审批。继续停在命令模式下,下一次回车会又一次
+                // 被当成命令,而用户以为自己在裁决——两者混淆比多按一次 `/` 危险得多。
+                // 进入命令模式时保存的原草稿也要还回去,否则草稿被命令顶掉。
+                *mode = ApprovalInputMode::Decision;
+                input.clear();
+                if let Some(draft) = saved_draft.take() {
+                    input.insert_str(&draft);
+                }
+                return ApprovalRoute::Handled(KeyOutcome::None);
             }
             // 命令模式下的普通编辑键：只改输入行，不碰裁决。
             let _ = input.handle_key(key);
@@ -3038,17 +3141,20 @@ fn route_parent_approval_key(
 /// 父审批态「命令模式」里执行一条命令。
 ///
 /// 白名单刻意很小:只有 `/side`(`/btw`)、`/back`、`/side-close`、`/help`
-/// 与 `/quit`。其余命令一律拒绝并**保留输入**——在审批提示上面执行
-/// `/clear`、`/model` 之类的命令会让用户误以为对话框还能继续编辑，
+/// 与 `/quit`（spec §10.2）。其余命令一律拒绝并**保留输入**——在审批提示
+/// 上面执行 `/clear`、`/model` 之类的命令会让用户误以为对话框还能继续编辑，
 /// 而且这些命令会在审批未决时改变父会话状态。
 ///
 /// 本函数**不**触碰 `decision` 通道:命令永远不等于批准。
+#[allow(clippy::too_many_arguments)]
 fn exec_approval_command(
     text: String,
     input: &mut InputLine,
     history: &mut HistoryState,
     history_width: u16,
+    side: &mut SideSession,
     channels: &TuiChannels,
+    side_capable: bool,
 ) -> KeyOutcome {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -3066,48 +3172,72 @@ fn exec_approval_command(
         return KeyOutcome::Quit;
     }
 
-    match crate::tui::side::classify_conversation_input(trimmed, false) {
-        Ok(crate::tui::side::RoutedInput::Side(crate::tui::side::SideInput::Open { question })) => {
-            let Some(commands) = channels.side.as_ref() else {
+    // 旁支命令在这里与主视图共用同一份执行逻辑:审批态不是另一套命令语义,
+    // 只是「Enter 的默认含义」不同。共用可以保证 /back 在主视图与审批态里
+    // 给出同一句话,而不是两处各写一份、慢慢长出分歧。
+    if side_command_name(trimmed).is_some() {
+        return match crate::tui::side::classify_conversation_input(trimmed, false) {
+            Ok(crate::tui::side::RoutedInput::Side(command)) => execute_side_command_in_main(
+                command,
+                history,
+                history_width,
+                side,
+                channels,
+                side_capable,
+            ),
+            Ok(crate::tui::side::RoutedInput::Main(_)) => KeyOutcome::None,
+            Err(error) => {
                 history.push(
                     HistoryCell::Separator {
-                        label: Some("本次会话未启用旁支（/side 不可用）".to_string()),
+                        label: Some(error.message),
                     },
                     history_width,
                 );
-                return KeyOutcome::None;
-            };
-            let _ = commands.try_send(crate::side_driver::SideDriverCommand::Open {
-                request_id: uuid::Uuid::new_v4().to_string(),
-                question,
-            });
-            KeyOutcome::None
-        }
-        _ if name == "help" => {
-            history.push(
-                HistoryCell::Separator {
-                    label: Some(
-                        "审批中的命令：/side（/btw）、/help、/quit。命令不会批准本请求".to_string(),
-                    ),
-                },
-                history_width,
-            );
-            KeyOutcome::None
-        }
-        _ => {
-            // 拒绝但保留原文：用户可能只是打错了，直接清空会让他重打一遍。
-            input.insert_str(&text);
-            history.push(
-                HistoryCell::Separator {
-                    label: Some(format!(
-                        "/{name} 不能在审批中使用（只允许 /side、/help、/quit）。这是命令，不会批准"
-                    )),
-                },
-                history_width,
-            );
-            KeyOutcome::None
-        }
+                KeyOutcome::None
+            }
+        };
     }
+
+    if name == "help" {
+        history.push(
+            HistoryCell::Separator {
+                label: Some(format!(
+                    "审批中的命令（Enter 只执行命令，不会批准）：{}\n{}\n命令不会批准本请求",
+                    approval_command_line(),
+                    "其余命令请先裁决或 Esc 退出命令模式"
+                )),
+            },
+            history_width,
+        );
+        return KeyOutcome::None;
+    }
+
+    // 拒绝但保留原文：用户可能只是打错了，直接清空会让他重打一遍。
+    input.insert_str(&text);
+    history.push(
+        HistoryCell::Separator {
+            label: Some(format!(
+                "/{name} 不能在审批中使用（只允许 {}）。这是命令，不会批准",
+                approval_command_line()
+            )),
+        },
+        history_width,
+    );
+    KeyOutcome::None
+}
+
+/// 审批命令模式的白名单文案。
+///
+/// 与 [`exec_approval_command`] 的分支必须同步:帮助里说能用的命令,
+/// 一定是真的能用的。桌面端 `/help` 的旁问分组同源（spec §4.1 三端一致）。
+fn approval_command_line() -> String {
+    format!(
+        "/{}（/{}）、/{}、/{}、/help、/quit",
+        crate::tui::side::SIDE_COMMAND,
+        crate::tui::side::SIDE_ALIAS,
+        crate::tui::side::BACK_COMMAND,
+        crate::tui::side::SIDE_CLOSE_COMMAND
+    )
 }
 
 /// 把一个问题发给旁支。
@@ -3572,8 +3702,16 @@ fn handle_paste(
     runtime_popup: &RuntimePopup,
     pending_quit: &mut bool,
     popup: &mut Option<CommandPopup>,
+    approval_mode: crate::tui::side::ApprovalInputMode,
 ) {
-    if runtime_popup.blocks_text_input() || history.pending_permission_info().is_some() {
+    // 审批提示可见时，裁决模式不接受文字（粘贴等于没发生），但**命令模式
+    // 必须接受**：那个模式的全部意义就是让用户敲一条命令。把粘贴一并挡掉，
+    // 命令模式就成了「只能逐字符手打」的半残输入，粘贴进来的 `/side`
+    // 会静默消失。
+    let command_mode = approval_mode == crate::tui::side::ApprovalInputMode::Command;
+    if runtime_popup.blocks_text_input()
+        || (history.pending_permission_info().is_some() && !command_mode)
+    {
         return;
     }
 
@@ -6916,6 +7054,211 @@ mod tests {
         );
     }
 
+    /// 审批命令模式的白名单确实包含 `/back` 与 `/side-close`。
+    ///
+    /// 规格 §10.2 要求这个模式只接受 `side/btw/back/side-close/help/退出`。
+    /// 之前实现里 `/back`、`/side-close` 掉进了「拒绝」分支，用户只能看到
+    /// 「不能在审批中使用」——而旁支恰恰是审批态最需要的能力（父被审批卡住
+    /// 时去旁支问一句）。测试逐条走一遍：每条命令都不得触发裁决。
+    #[test]
+    fn approval_command_mode_accepts_side_back_and_close() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        agent_tx
+            .try_send(AgentEvent::PermissionRequest {
+                request_id: 7,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            })
+            .unwrap();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        // 旁支通道存在（能收命令）但没人消费:这些命令在审批态只应被发出去,
+        // 不允许落到裁决上。用一个足够深的 channel 避免 try_send 失败。
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (_side_evt_tx, side_rx) = tokio::sync::mpsc::channel(8);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let events = ScriptedEvents {
+            // 逆序投递：先 /back，再 /side-close，最后 Ctrl+Q 退出。
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/side-close".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/back".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut title = crate::tui::title::TitleHandle::disabled();
+        let mut history = HistoryState::new();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_rx),
+        )
+        .unwrap();
+
+        // 两条命令都必须真的被**执行**（给出主视图语义的提示），而不是掉进
+        // 「不能在审批中使用」的拒绝分支。只看「没批准」不够：拒绝分支同样
+        // 不批准，那样测试对白名单缺失毫无分辨力。
+        let labels: Vec<String> = history
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::Separator { label: Some(label) } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        let joined = labels.join("\n");
+        assert!(
+            joined.contains("已经在主会话了，无需 /back"),
+            "/back 必须被当作合法命令执行，实际提示：{joined}"
+        );
+        assert!(
+            joined.contains("当前没有旁问"),
+            "/side-close 在无旁支时必须幂等成功而不是被拒绝，实际提示：{joined}"
+        );
+        assert!(
+            !joined.contains("不能在审批中使用"),
+            "白名单必须包含 /back 与 /side-close，实际提示：{joined}"
+        );
+
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "/back 与 /side-close 在审批命令模式下绝不能触发裁决"
+        );
+        // `/back` 在主视图/审批态是空操作,不该给 driver 发命令;
+        // `/side-close` 在没有打开的旁支时同样不发命令（幂等,只提示）。
+        assert!(
+            side_cmd_rx.try_recv().is_err(),
+            "没有旁支时 /side-close 不该向 driver 发 Close,更不该发别的命令"
+        );
+    }
+
+    /// 主视图里的 `/back`、`/side-close` 必须是旁支命令，不能掉进「未知命令」。
+    ///
+    /// spec §4.1:主视图 `/back` 是「已经在主会话」的空操作提示；`/side-close`
+    /// 没有旁支时幂等成功。之前它们被前面的 `/side` 专用拦截漏掉，落进
+    /// `handle_key` 的斜杠分发，用户看到的是「未知命令: /side-close」。
+    #[test]
+    fn main_view_back_and_side_close_are_not_unknown_commands() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (_side_evt_tx, side_rx) = tokio::sync::mpsc::channel(8);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/side-close".into()),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/back".into()),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut title = crate::tui::title::TitleHandle::disabled();
+        let mut history = HistoryState::new();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_rx),
+        )
+        .unwrap();
+
+        let labels: Vec<&str> = history
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::Separator { label: Some(label) } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("未知命令")),
+            "/back 与 /side-close 不能落进未知命令：{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("已经在主会话")),
+            "/back 在主视图应给出空操作提示：{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("当前没有旁问")),
+            "/side-close 在无旁支时应幂等提示：{labels:?}"
+        );
+        // 两条命令都不该被当成普通消息发给父会话。
+        assert!(
+            input_rx.try_recv().is_err(),
+            "/back 与 /side-close 不能被当作父会话消息发送"
+        );
+        assert!(
+            side_cmd_rx.try_recv().is_err(),
+            "没有旁支时 /side-close 不该发命令，/back 也不该"
+        );
+    }
+
     /// 旁支事件与旁支转录**绝不**能进入主 TurnLog / 主会话文件。
     ///
     /// 这是整个旁支设计最不能退化的一条：一旦漏进去，旁问就会被持久化、
@@ -8618,6 +8961,7 @@ mod tests {
             &runtime_popup,
             &mut pending_quit,
             &mut popup,
+            crate::tui::side::ApprovalInputMode::Decision,
         );
 
         assert_eq!(input.buffer, "/cl");
@@ -8644,6 +8988,7 @@ mod tests {
             &runtime_popup,
             &mut pending_quit,
             &mut popup,
+            crate::tui::side::ApprovalInputMode::Decision,
         );
 
         assert!(input.buffer.is_empty());
@@ -8667,6 +9012,7 @@ mod tests {
             &runtime_popup,
             &mut pending_quit,
             &mut popup,
+            crate::tui::side::ApprovalInputMode::Decision,
         );
 
         assert!(input.buffer.is_empty());

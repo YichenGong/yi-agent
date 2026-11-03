@@ -112,6 +112,19 @@ pub const SIDE_ALIAS: &str = "btw";
 pub const BACK_COMMAND: &str = "back";
 pub const SIDE_CLOSE_COMMAND: &str = "side-close";
 
+/// `/help` 目录里的旁支条目。
+///
+/// `btw` **不**进目录:它是 `/side` 的别名,列两行同名功能只会让用户不知道该
+/// 记哪个（桌面端 `SLASH_COMMANDS` 同一条规矩）。
+pub const SIDE_HELP_ENTRIES: [(&str, &str); 3] = [
+    (
+        "side [问题]",
+        "打开临时旁问（基于创建时上下文，只读）；/btw 是别名",
+    ),
+    ("back", "从旁问返回主会话，保留旁问及其在途轮次"),
+    ("side-close", "关闭当前旁问（取消在途轮次）"),
+];
+
 /// 旁支视图中允许的本地命令。
 ///
 /// `/cost` 在这里只统计旁支自身用量,不读父的费用累计。
@@ -129,8 +142,11 @@ fn invalid(message: impl Into<String>) -> SideError {
 /// - `/btw` 是 `/side` 的别名,行为完全一致。
 /// - `/back`、`/side-close` 不接受参数,带了参数是错误而不是「问题正文」:
 ///   静默忽略参数会让用户以为关掉了旁支。
-/// - 旁支已经打开时,`/side` 是错误（不嵌套）;主会话里 `/back`、
-///   `/side-close` 也是错误（没有可返回/可关闭的对象）。
+/// - 旁支已经打开时,`/side` 是错误（不嵌套）。
+/// - `/back`、`/side-close` **在任何视图都解析成功**:主会话里的语义由调用方
+///   决定（`/back` 是「已经在主会话」的空操作提示,`/side-close` 关闭后台旁支,
+///   没有旁支时幂等成功）。分类器只回答「这是不是旁支命令」,不替调用方猜
+///   有没有可返回/可关闭的对象——那需要真实生命周期状态,而这里是纯函数。
 pub fn classify_conversation_input(text: &str, in_side: bool) -> Result<RoutedInput, SideError> {
     let trimmed = text.trim_start();
     let Some(rest) = trimmed.strip_prefix('/') else {
@@ -160,17 +176,11 @@ pub fn classify_conversation_input(text: &str, in_side: bool) -> Result<RoutedIn
             if !args.is_empty() {
                 return Err(invalid("/back 不接受参数"));
             }
-            if !in_side {
-                return Err(invalid("当前不在旁支里,无需 /back"));
-            }
             Ok(RoutedInput::Side(SideInput::Back))
         }
         SIDE_CLOSE_COMMAND => {
             if !args.is_empty() {
                 return Err(invalid("/side-close 不接受参数"));
-            }
-            if !in_side {
-                return Err(invalid("当前不在旁支里,无需 /side-close"));
             }
             Ok(RoutedInput::Side(SideInput::Close))
         }
