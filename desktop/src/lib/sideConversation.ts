@@ -219,6 +219,31 @@ export class SideConversationStore {
     return [...this.bindings.values()].filter((b) => b.slot === slot);
   }
 
+  /**
+   * 全部绑定（只读快照）。
+   *
+   * 供「按 sideId 找归属」这类查询用：`sideId` 只在**一个宿主内**唯一，两个
+   * 宿主可以各自有一个 `s1`，所以必须先遍历绑定、再各自查视图，不能反过来。
+   */
+  allBindings(): SideHostBinding[] {
+    return [...this.bindings.values()];
+  }
+
+  /**
+   * 跨宿主按 `sideId` 查找视图，附带它所属的 `hostKey`。
+   *
+   * 返回第一个命中即返回：同一个 `sideId` 出现在两个宿主上时，调用方给的
+   * 上下文（当前绑定、最近一次操作）才该决定选哪个，故这里不替它猜——调用方
+   * 需要精确归属时应直接 `read(hostKey, sideId)`。
+   */
+  findView(sideId: string): { view: SideView; hostKey: SideHostKey } | undefined {
+    for (const binding of this.bindings.values()) {
+      const view = this.views.get(binding.key)?.get(sideId);
+      if (view) return { view, hostKey: binding.key };
+    }
+    return undefined;
+  }
+
   bind(binding: SideHostBinding): SideHostBinding {
     for (const existing of [...this.bindings.values()]) {
       if (existing.slot === binding.slot && existing.key !== binding.key) {

@@ -21,8 +21,16 @@ import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { canRunSlashDuringTurn, SLASH_COMMANDS } from "./lib/slash";
 import { ClientRegistry } from "./lib/clientRegistry";
-import { SideConversationStore } from "./lib/sideConversation";
+import { SideConversationStore, type SideView } from "./lib/sideConversation";
 import { useSideConversation } from "./hooks/useSideConversation";
+import {
+  parentStatusText,
+  useSideConversationController,
+  type CloseConfirmation,
+} from "./hooks/useSideConversationController";
+import { SideConversationHeader } from "./components/SideConversationHeader";
+import { sideItemsForChat } from "./lib/sideItems";
+import type { SideCommand } from "./lib/sideCommands";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
   remoteProfileIdForPath,
@@ -230,16 +238,41 @@ export default function App() {
     bumpSide((v) => v + 1);
   }, []);
 
+
   /**
-   * 可见的旁支会话（`null` = 正在看普通会话）。
+   * 关闭旁支的二次确认。
    *
-   * Task 16/17 才接上 UI；这里先留出状态位，因为尾帧探测与视图渲染都要按它
-   * 决定「要不要在后台继续 poll」。
+   * 非 null 表示「已经向服务端问过当前状态，等用户点头」。关一条正在回答的
+   * 旁支与关一条空闲的是两句话，所以确认文案由 `running` 决定，而不是一律
+   * 弹同一个框。
    */
-  const [sideTarget, setSideTarget] = useState<
-    { hostKey: string; sideId: string; parentId: string } | null
-  >(null);
-  void setSideTarget;
+  const [sideCloseConfirm, setSideCloseConfirm] =
+    useState<CloseConfirmation | null>(null);
+
+  /**
+   * 旁支作用域里的一行提示（`/help`、`/config`、`/usage` 的输出）。
+   *
+   * 与主会话的 `session.notice` 分开：旁支没有 `Session`，也不该把内容写进父的
+   * 转录。切走时清掉——提示属于那一次操作，跟到另一条会话上会误导。
+   *
+   * **必须声明在 `needsPairing`/`repairing` 那两个早退之前**：它们在上面的
+   * `return` 里，把 hook 放到后面会让「配对界面 ↔ 主界面」切换时 hook 数量变化，
+   * React 直接抛「Rendered fewer hooks than expected」。
+   */
+  const [sideNotice, setSideNotice] = useState<string | null>(null);
+
+  /**
+   * 旁支的 RPC 动作（open/submit/stop/close/back）。
+   *
+   * 依赖 `sideApi.controllerFor`，所以必须排在 `sideApi` 之后。
+   */
+  const sideConversation = useSideConversationController({
+    store: sideStoreRef.current,
+    controllerFor: (binding, parentId) => sideApiRef.current!.controllerFor(binding, parentId),
+    onChange: forceSide,
+  });
+  const sideConversationRef = useRef(sideConversation);
+  sideConversationRef.current = sideConversation;
 
   /**
    * effect 里的通知路由需要一个稳定的旁支 API 引用，而 hook 只能在组件体调用。
@@ -251,7 +284,10 @@ export default function App() {
     onChange: forceSide,
     subscribeParent: (client, parentId) =>
       client.request("thread/subscribe", { threadIds: [parentId] }).then(() => {}),
-    visibleParent: sideTarget?.parentId ?? null,
+    visibleParent:
+      sideConversation.active !== null && sideConversation.active.kind === "side"
+        ? sideConversation.active.parentId
+        : null,
   });
   sideApiRef.current = sideApi;
   const clientRef = useRef<RpcClient | null>(null);
@@ -2570,6 +2606,193 @@ export default function App() {
     );
   }
 
+  /**
+   * 当前正在显示的旁支视图。
+   *
+   * 只在 `activeConversation` 指向旁支**且**该视图仍存在时为非 null。视图被
+   * 另一端关掉（`side/closed`）之后指针还停在原处，此时回落主会话，而不是渲染
+   * 一个空壳。
+   */
+  const activeSide: SideView | null = (() => {
+    const a = sideConversation.active;
+    if (a === null || a.kind !== "side") return null;
+    const view = sideStoreRef.current.read(a.hostKey, a.sideId) ?? null;
+    return view !== null && !view.closed ? view : null;
+  })();
+  /** 正在显示的旁支所在宿主的绑定（能力/权限/连接态都从它读）。 */
+  const activeSideBinding = (() => {
+    const a = sideConversation.active;
+    if (a === null) return undefined;
+    return sideStoreRef.current.binding(a.hostKey);
+  })();
+  /** 旁支视图里可用的 Control 能力：Observe 只读，缺能力更是什么都不能做。 */
+  const sideCanControl =
+    activeSideBinding !== undefined &&
+    activeSideBinding.supported &&
+    activeSideBinding.scope !== "observe";
+
+  /** 输入框的会话上下文：视图、能力、可控制性三者一起传。 */
+  const composerConversation = {
+    view: (activeSide !== null ? "side" : "main") as "main" | "side",
+    supported: activeSideBinding?.supported ?? true,
+    canControl: activeSide !== null ? sideCanControl : true,
+  };
+
+  /**
+   * 打开（或续用）当前项目上的旁支。
+   *
+   * `parentId` 在这里捕获：`side/open` 是异步的，回包时用户可能已经切到别的
+   * 会话。把它抓成局部量，旁支就永远挂在「用户按下按钮时正在看的那条」上。
+   */
+  const openSide = async (question: string): Promise<boolean> => {
+    const binding =
+      sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    if (binding === undefined) {
+      setCurrentError("还没有连上，无法发起旁问");
+      return false;
+    }
+    const parentId = store.currentId;
+    if (parentId === null) {
+      setCurrentError("先打开一条会话，再发起旁问");
+      return false;
+    }
+    if (!binding.supported) {
+      setCurrentError("当前宿主不支持旁问");
+      return false;
+    }
+    const ok = await sideConversationRef.current.open(binding, parentId, question);
+    forceSide();
+    return ok;
+  };
+
+  /**
+   * 旁支作用域内的状态命令。
+   *
+   * 三条都不读父会话：`/config` 读旁支创建时固定的脱敏配置，`/usage` 只算旁支
+   * 自己那一份。读父的实现会让用户以为父的模型/费用就是旁支的。
+   */
+  const runSideScopedSlash = (name: string, args: string | null): void => {
+    const a = sideConversationRef.current.active;
+    if (a === null || a.kind !== "side") return;
+    const view = sideStoreRef.current.read(a.hostKey, a.sideId);
+    if (!view) return;
+    if (name === "help") {
+      setSideNotice(
+        `旁问基于创建时的上下文，只读。可执行 /back 返回、/side-close 关闭、` +
+          `/config 查看固定配置、/usage 查看本旁问用量。` +
+          (args ? `${args} 的帮助请在主会话查看。` : ""),
+      );
+      return;
+    }
+    if (name === "config") {
+      const cfg = view.effectiveConfig;
+      setSideNotice(
+        cfg === null
+          ? "这条旁问还没有生效配置。"
+          : `模型 ${cfg.model}，effort ${cfg.reasoning_effort ?? "默认"}，` +
+              `保留思考 ${cfg.preserve_thinking ? "开" : "关"}，` +
+              `只读 ${cfg.read_only ? "是" : "否"}，可用工具 ${cfg.tool_names.length} 个。`,
+      );
+      return;
+    }
+    if (name === "usage") {
+      const t = view.usage.total;
+      setSideNotice(
+        `输入 ${t.input}，输出 ${t.output}，缓存写 ${t.cache_creation}，` +
+          `缓存读 ${t.cache_read}，推理 ${t.reasoning}` +
+          (view.usage.complete ? "。" : "（进行中）。"),
+      );
+    }
+  };
+
+  /** 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。 */
+  const beginSideClose = async (): Promise<void> => {
+    const confirmation = await sideConversationRef.current.requestClose();
+    if (confirmation !== null) setSideCloseConfirm(confirmation);
+  };
+
+  /**
+   * 执行一条旁支命令。
+   *
+   * 返回 `false` 表示「没执行」（能力不足、没有连接等），输入框据此保留草稿。
+   * **所有分支都在这里落地**，`MessageInput` 只管把决定交过来——它不该知道
+   * 旁支怎么开、怎么关。
+   */
+  const runSideCommand = async (command: SideCommand): Promise<boolean> => {
+    switch (command.kind) {
+      case "invalid":
+        setCurrentError(command.message);
+        return false;
+      case "command":
+        // help/config/usage：走旁支作用域的实现，绝不溜回父会话的
+        // `onSlashCommand`（那会读到父的配置与父的用量）。
+        runSideScopedSlash(command.name, command.args);
+        return true;
+      case "back":
+        sideConversationRef.current.back();
+        return true;
+      case "close":
+        await beginSideClose();
+        return true;
+      case "open":
+        return await openSide(command.question);
+    }
+  };
+
+  /** 旁支视图的发送：目标在调用时捕获，绝不在 await 之后读「当前视图」。 */
+  const sendToSide = async (text: string): Promise<boolean> => {
+    const a = sideConversationRef.current.active;
+    if (a === null || a.kind !== "side") return false;
+    if (!text.trim()) return false;
+    const binding = sideStoreRef.current.binding(a.hostKey);
+    if (binding === undefined || !binding.connected) {
+      setCurrentError("连接已断开，请稍候再发");
+      return false;
+    }
+    const ok = await sideConversationRef.current.submit(text);
+    if (ok) {
+      sideStoreRef.current.setDraft(a.hostKey, a.sideId, "");
+      forceSide();
+    }
+    return ok;
+  };
+
+  /** 旁支视图的 Stop：只停旁支自己，绝不打父会话。 */
+  const stopSide = () => {
+    void sideConversationRef.current.stop();
+  };
+
+  /**
+   * 手机/桌面顶部的「旁问」入口。
+   *
+   * 父会话运行中、等待审批时都必须可达：这正是旁支存在的理由（spec §9.2/§9.3）。
+   * 点它不消费父草稿、不停主任务。
+   */
+  const sidebarEntry = (() => {
+    const binding = sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    if (binding === undefined || !binding.supported) return null;
+    if (binding.scope === "observe") return null;
+    if (store.currentId === null) return null;
+    const existing = sideStoreRef.current
+      .list(binding.key)
+      .find((v) => v.parentId === store.currentId && !v.closed);
+    return {
+      label: existing === undefined ? "旁问" : "继续旁问",
+      open: () => {
+        if (existing !== undefined) {
+          sideConversationRef.current.enter(
+            binding,
+            existing.parentId,
+            existing.sideId,
+            existing.generation,
+          );
+          return;
+        }
+        void openSide("");
+      },
+    };
+  })();
+
   return (
     <>
       {prefs.onboarding.needed && (
@@ -2767,8 +2990,144 @@ export default function App() {
                   }}
                 />
               </section>
+            ) : activeSide !== null ? (
+              /*
+               * 旁支视图。与主会话**共用** ChatView / 消息组件 / Markdown，
+               * 但顶栏、输入框、Stop、草稿、用量全部按旁支自己的身份走。
+               *
+               * 注意 `key`：不同旁支（或同一 sideId 的新一代）必须重挂，否则
+               * 滚动位置与展开状态会从上一代串过来。
+               */
+              <div
+                className="flex min-h-0 min-w-0 flex-1 flex-col"
+                key={`side:${sideConversation.active?.hostKey ?? ""}:${
+                  sideConversation.active?.kind === "side"
+                    ? `${sideConversation.active.sideId}:${sideConversation.active.generation}`
+                    : ""
+                }`}
+              >
+                <SideConversationHeader
+                  summary={activeSide.summary}
+                  parentStatus={parentStatusText(
+                    store.peek(activeSide.parentId)?.status ??
+                      (current?.status ?? null),
+                  )}
+                  canControl={sideCanControl}
+                  onBack={() => sideConversationRef.current.back()}
+                  onClose={
+                    sideCanControl
+                      ? () => {
+                          void beginSideClose();
+                        }
+                      : null
+                  }
+                  onStop={
+                    activeSide.summary.status === "running" && sideCanControl
+                      ? stopSide
+                      : null
+                  }
+                  closing={sideConversation.busy}
+                />
+                {activeSide.sync !== "synced" && (
+                  <div className="border-b border-line px-3 py-1 text-xs text-fg-muted">
+                    {activeSide.sync === "syncing"
+                      ? "正在读取旁问内容…"
+                      : "旁问内容尚未对齐，发送已暂停"}
+                  </div>
+                )}
+                {sideConversation.error !== null && (
+                  <div className="flex items-center gap-2 border-b border-line px-3 py-1 text-xs text-red-400">
+                    <span>{sideConversation.error}</span>
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => sideConversationRef.current.clearError()}
+                    >
+                      知道了
+                    </button>
+                  </div>
+                )}
+                {sideNotice !== null && (
+                  <div className="flex items-start gap-2 border-b border-line px-3 py-1 text-xs text-fg-muted">
+                    <span className="min-w-0 flex-1 whitespace-pre-wrap">
+                      {sideNotice}
+                    </span>
+                    <button
+                      type="button"
+                      className="shrink-0 underline"
+                      onClick={() => setSideNotice(null)}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                )}
+                <ErrorBoundary
+                  resetKey={`side:${activeSide.sideId}:${activeSide.generation}`}
+                  onError={(e) => console.error("side transcript render failed", e)}
+                  fallback={
+                    <TranscriptPlaceholder
+                      kind="crashed"
+                      reason="这段旁问无法渲染"
+                      onRetry={() => forceSide()}
+                    />
+                  }
+                >
+                  <ChatView
+                    // 旁支**没有**图片/附件能力：只给展示用的、剥掉媒体的
+                    // 数组，避免 `useImageData` 拿着旁支的宿主去读父的图。
+                    items={sideItemsForChat(activeSide.items)}
+                    error={activeSide.error?.message ?? null}
+                    // 旁支不读父的附件与图片：不传 call / threadId。
+                    threadId={null}
+                    anchor={undefined}
+                    syncing={activeSide.sync !== "synced"}
+                  />
+                </ErrorBoundary>
+                <MessageInput
+                  turnActive={activeSide.summary.status === "running"}
+                  onSend={sendToSide}
+                  onInterrupt={stopSide}
+                  mode={null}
+                  onModeChange={() => {
+                    // 模型/effort/权限在旁支里是**创建时固定**的只读值。
+                  }}
+                  onSlashCommand={async () => false}
+                  onSideCommand={runSideCommand}
+                  conversation={composerConversation}
+                  value={activeSide.draft}
+                  onDraftChange={(text) => {
+                    const a = sideConversationRef.current.active;
+                    if (a === null || a.kind !== "side") return;
+                    sideStoreRef.current.setDraft(a.hostKey, a.sideId, text);
+                    forceSide();
+                  }}
+                  attachments={[]}
+                  onPickAttachments={() => {}}
+                  onRemoveAttachment={() => {}}
+                  threadId={null}
+                  // 旁支没有任何图片/附件读取：给它一个必定失败的接缝，而不是
+                  // 父的 `imageCall`（那会把父会话的图片读进旁支视图）。
+                  call={() => Promise.reject(new Error("旁问不读取图片"))}
+                  disabled={!sideCanControl}
+                  isMobile={isMobile}
+                />
+              </div>
             ) : (
               <>
+                {sidebarEntry !== null && (
+                  <div className="flex items-center gap-2 border-b border-line px-3 py-1 text-xs">
+                    <button
+                      type="button"
+                      onClick={sidebarEntry.open}
+                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:bg-raised hover:text-fg"
+                    >
+                      {sidebarEntry.label}
+                    </button>
+                    <span className="text-fg-muted">
+                      临时旁问，基于当前上下文，只读
+                    </span>
+                  </div>
+                )}
                 {sess.currentId !== null &&
                   ((offline && cachedAt.current.has(sess.currentId)) ||
                     store.peek(sess.currentId)?.syncState === "syncing" ||
@@ -2891,6 +3250,11 @@ export default function App() {
                   mode={current?.mode ?? null}
                   onModeChange={setThreadMode}
                   onSlashCommand={onSlashCommand}
+                  // 主视图也要接旁支命令：`/btw`、`/side`、`/back`、
+                  // `/side-close` 必须能与 Enter/Send/按钮走同一条策略。
+                  // 不接的话它们会被当成普通文本发给模型（"模型收到 /btw"）。
+                  onSideCommand={runSideCommand}
+                  conversation={composerConversation}
                   value={current?.draft ?? ""}
                   onDraftChange={changeDraft}
                   cardRef={composerCardRef}
@@ -2930,6 +3294,48 @@ export default function App() {
                   }
                 />
               </>
+            )}
+            {/*
+              关闭旁支的确认。文案分两种：正在回答时明确告诉用户会打断那一轮，
+              空闲时就只是关掉。`expectedActiveTurnId` 来自服务端当前摘要
+              （`beginSideClose` 刚问过），所以这不是"拿本地缓存去猜"。
+            */}
+            {sideCloseConfirm !== null && (
+              <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+                <div
+                  role="dialog"
+                  aria-label="关闭旁问"
+                  className="w-full max-w-sm rounded-lg border border-line-strong bg-panel p-4 text-sm shadow-xl"
+                >
+                  <p className="mb-3 text-fg">
+                    {sideCloseConfirm.running
+                      ? "这条旁问还在回答，关闭会中止它。确定关闭？"
+                      : "关闭后这条旁问不再保留。确定关闭？"}
+                  </p>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md border border-line-strong px-3 py-1 text-fg-muted hover:bg-raised"
+                      onClick={() => setSideCloseConfirm(null)}
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md bg-red-600 px-3 py-1 font-medium text-white hover:bg-red-500"
+                      onClick={() => {
+                        const confirmation = sideCloseConfirm;
+                        setSideCloseConfirm(null);
+                        void sideConversationRef.current
+                          .confirmClose(confirmation)
+                          .then(() => forceSide());
+                      }}
+                    >
+                      关闭旁问
+                    </button>
+                  </div>
+                </div>
+              </div>
             )}
             <ApprovalBanner
               items={bannerItems}
