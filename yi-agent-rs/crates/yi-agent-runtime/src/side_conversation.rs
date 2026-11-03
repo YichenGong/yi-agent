@@ -20,6 +20,7 @@ pub mod policy;
 pub mod resources;
 pub mod runner;
 pub mod source;
+pub mod transcript;
 
 #[cfg(test)]
 mod test_support;
@@ -39,6 +40,10 @@ pub use runner::{
 pub use source::{
     EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SideWebPolicy,
     SourceUpdate,
+};
+pub use transcript::{
+    SIDE_TOOL_DISPLAY_BYTES, SIDE_TRANSCRIPT_BYTES, SIDE_TRANSCRIPT_CONTROL_RESERVE,
+    SIDE_TRANSCRIPT_MAX_ITEM_BYTES, SideItem, SideItemContent, SideToolStatus, SideTranscript,
 };
 
 use std::fmt;
