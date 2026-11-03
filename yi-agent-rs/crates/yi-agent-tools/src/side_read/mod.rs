@@ -22,6 +22,13 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub mod blocking;
+#[cfg(test)]
+mod blocking_tests;
+pub mod file_tools;
+#[cfg(test)]
+mod file_tools_tests;
+
 #[cfg(unix)]
 mod unix;
 
@@ -42,6 +49,9 @@ struct AuthorizedRoot {
 /// The live root set of the parent session.
 ///
 /// Read on every open so a revoked or narrowed root takes effect immediately.
+pub use blocking::SideBlockingPool;
+pub use file_tools::{SideFileToolContext, register_side_file_tools};
+
 pub trait SideRoots: Send + Sync {
     fn current_roots(&self) -> Vec<PathBuf>;
 }

@@ -143,6 +143,142 @@ fn openat_regular(dir_fd: libc::c_int, name: &OsStr) -> io::Result<std::fs::File
     Ok(std::fs::File::from(owned))
 }
 
+/// One entry of a directory listing taken from an open handle.
+pub(super) struct DirEntryInfo {
+    pub name: OsString,
+    pub is_dir: bool,
+}
+
+/// List a directory through its **open handle**.
+///
+/// `std::fs::read_dir` takes a path and would re-resolve it, so the traversal
+/// could be redirected after authorisation. Listing `/dev/fd/N` is not portable
+/// (it fails with `ENOTDIR` on macOS), so the handle is passed to `fdopendir`
+/// directly: the entries come from the very object that was authorised.
+///
+/// Symlinks are skipped rather than reported; callers descend by re-opening each
+/// entry through [`open_beneath`], which refuses them anyway.
+pub(super) fn read_dir_handle(dir: &std::fs::File) -> io::Result<Vec<DirEntryInfo>> {
+    // `fdopendir` takes ownership of the descriptor it is given, so hand it a
+    // duplicate and leave the caller's handle untouched.
+    let dup_fd = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dirp = unsafe { libc::fdopendir(dup_fd) };
+    if dirp.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(error);
+    }
+    // `closedir` releases the stream (and the duplicated descriptor) on every
+    // return path, including an early `?`.
+    let stream = DirStream(dirp);
+
+    let mut entries = Vec::new();
+    loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            // `readdir` returns null both at end of directory and on error, so
+            // errno is what distinguishes them.
+            let errno = current_errno();
+            if errno == 0 {
+                return Ok(entries);
+            }
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        let name = entry_name(unsafe { &*entry })?;
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
+        }
+        // `d_type` is not filled in on every filesystem, so ask the directory
+        // itself; `AT_SYMLINK_NOFOLLOW` keeps that answer truthful.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let c_name = to_cstring(&name)?;
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            // The entry vanished between listing and stat; skip it.
+            continue;
+        }
+        let mode = stat.st_mode & libc::S_IFMT;
+        if mode == libc::S_IFLNK {
+            continue;
+        }
+        entries.push(DirEntryInfo {
+            name,
+            is_dir: mode == libc::S_IFDIR,
+        });
+    }
+}
+
+/// Owns a `DIR*` and closes it on drop.
+struct DirStream(*mut libc::DIR);
+
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Copy the NUL-terminated `d_name` out of a `dirent`.
+fn entry_name(entry: &libc::dirent) -> io::Result<OsString> {
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+    Ok(OsStr::from_bytes(name.to_bytes()).to_os_string())
+}
+
+/// Reset errno so a later `readdir` null can be classified.
+fn clear_errno() {
+    set_errno(0);
+}
+
+fn current_errno() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        *libc::__error()
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        *libc::__errno_location()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        0
+    }
+}
+
+fn set_errno(value: i32) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        *libc::__error() = value;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        let _ = value;
+    }
+}
+
 /// Build a `CString`, rejecting interior NUL bytes.
 fn to_cstring(name: &OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes().to_vec())
