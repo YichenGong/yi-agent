@@ -13,6 +13,7 @@ import {
   isSideNotification,
   type SideConversationStore,
 } from "../lib/sideConversation";
+import type { SideNotification } from "../lib/sideConversation";
 import { parseTheme } from "../lib/theme";
 import { notifyModelCapabilitiesChanged } from "../lib/modelCapabilitiesBus";
 import type { ReasoningCapabilities } from "../lib/models";
@@ -73,6 +74,14 @@ export interface NotificationRouterDeps {
    * 就意味着换了一轮连接。缺省不给会让旁支帧被静默丢弃，所以它是必填的。
    */
   sideStore: SideConversationStore;
+  /**
+   * 把一帧旁支通知交给对账控制器。
+   *
+   * 为什么不直接 `sideStore.apply`：帧必须与**分页快照**对齐（连续 seq、
+   * 缺号重对账、缓存上限）。直接写 store 会得到一份「看起来合理、实际缺了
+   * 一段」的正文，而这正是旁支最难被用户描述的那类故障。
+   */
+  acceptSideNotification: (client: RpcClient, slot: Slot, n: SideNotification) => void;
 }
 
 export function createNotificationRouter(deps: NotificationRouterDeps) {
@@ -96,6 +105,7 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
     disposed,
     scheduleReconnect,
     sideStore,
+    acceptSideNotification,
   } = deps;
 
   const sideRouter = new SideConversationRouter(sideStore);
@@ -113,7 +123,9 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
         // 的是后续的 `schedulePersist` / `markThreadRead` 会把旁支活动记账到
         // 父会话上（父的未读点、内容落盘都被旁支污染）。
         if (isSideNotification(n)) {
-          sideRouter.accept(sideRouter.bindingFor(client, slot), n);
+          const binding = sideRouter.bindingFor(client, slot);
+          // 未握手时没有任何绑定：帧无处可归，丢弃而不是猜一条「当前连接」。
+          if (binding) acceptSideNotification(client, slot, n);
           return;
         }
         // 非活动槽位（别的远端项目、或本地而用户正看远端）的通知**不写**本视图。

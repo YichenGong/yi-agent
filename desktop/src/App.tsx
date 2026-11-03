@@ -22,6 +22,7 @@ import { ThreadStore } from "./lib/threadStore";
 import { canRunSlashDuringTurn, SLASH_COMMANDS } from "./lib/slash";
 import { ClientRegistry } from "./lib/clientRegistry";
 import { SideConversationStore } from "./lib/sideConversation";
+import { useSideConversation } from "./hooks/useSideConversation";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
   remoteProfileIdForPath,
@@ -217,6 +218,42 @@ export default function App() {
    * 跟着逐字流走，每次进 state 都会重建整棵树。
    */
   const sideStoreRef = useRef(new SideConversationStore());
+
+  /**
+   * 旁支视图变化后的重渲染计数。
+   *
+   * 与 `store`（ThreadStore）同一套机制：旁支的写入频率跟着逐字流走，写进
+   * state 每次都会重建整棵树；用一个 tick 触发一次重渲染最省。
+   */
+  const [, bumpSide] = useState(0);
+  const forceSide = useCallback(() => {
+    bumpSide((v) => v + 1);
+  }, []);
+
+  /**
+   * 可见的旁支会话（`null` = 正在看普通会话）。
+   *
+   * Task 16/17 才接上 UI；这里先留出状态位，因为尾帧探测与视图渲染都要按它
+   * 决定「要不要在后台继续 poll」。
+   */
+  const [sideTarget, setSideTarget] = useState<
+    { hostKey: string; sideId: string; parentId: string } | null
+  >(null);
+  void setSideTarget;
+
+  /**
+   * effect 里的通知路由需要一个稳定的旁支 API 引用，而 hook 只能在组件体调用。
+   * 与 `notifySyncActivity` 同一模式：ref 桥接，effect 运行时读到最新实现。
+   */
+  const sideApiRef = useRef<ReturnType<typeof useSideConversation> | null>(null);
+  const sideApi = useSideConversation({
+    store: sideStoreRef.current,
+    onChange: forceSide,
+    subscribeParent: (client, parentId) =>
+      client.request("thread/subscribe", { threadIds: [parentId] }).then(() => {}),
+    visibleParent: sideTarget?.parentId ?? null,
+  });
+  sideApiRef.current = sideApi;
   const clientRef = useRef<RpcClient | null>(null);
   /** 当前活动槽位：本地项目是 `local`，选中远端项目时换成它的 profile id。 */
   const activeSlotRef = useRef<Slot>(LOCAL_SLOT);
@@ -1735,6 +1772,9 @@ export default function App() {
     // 函数声明、调用发生在之后」等价。
     let scheduleReconnectRef: () => void = () => {};
 
+    // 旁支的帧走对账控制器（Task 15），不直接写 store：帧必须与分页快照
+    // 按连续 seq 对齐，缺号要触发全量重读。
+    const sideApi = sideApiRef.current!;
     // 通知/审批/状态回调与整段握手逻辑见
     // `hooks/useNotificationRouter.ts` / `hooks/useHandshakeRecovery.ts`。
     // 依赖由参数显式传入：这与原来「闭包直接抓 effect 局部量」等价，但把
@@ -1760,6 +1800,7 @@ export default function App() {
       disposed,
       scheduleReconnect: () => scheduleReconnectRef(),
       sideStore: sideStoreRef.current,
+      acceptSideNotification: sideApi.accept,
     });
     const handshake = createHandshakeRecovery({
       activeSlotRef,

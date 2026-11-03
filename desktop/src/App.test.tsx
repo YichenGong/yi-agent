@@ -6918,6 +6918,25 @@ describe("App 旁支通知路由", () => {
     expect(methods).not.toContain("side/turnInterrupt");
   });
 
+  it("subscribes the parent before letting a side frame be applied", async () => {
+    await ready();
+    const before = clients[0].requests.filter(
+      (r) => r.method === "thread/subscribe",
+    ).length;
+    act(() => {
+      for (const cb of state.notifHandlers) cb(sideChanged(1));
+    });
+    // 帧的落地必须先有一个父订阅：不订父就装视图，之后发布的帧根本到不了这里。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/subscribe").length,
+      ).toBeGreaterThan(before),
+    );
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/subscribe")[0].params,
+    ).toMatchObject({ threadIds: expect.arrayContaining(["t1"]) });
+  });
+
   it("keeps applying ordinary parent frames after a side frame", async () => {
     await ready();
     act(() => {

@@ -20,6 +20,7 @@
  */
 
 import type { RpcClient } from "./rpc";
+import type { SideReadItemsResult } from "./protocol";
 import type { Slot } from "./slots";
 import type {
   Item,
@@ -251,6 +252,140 @@ export class SideConversationStore {
 
   read(hostKey: SideHostKey, sideId: string): SideView | undefined {
     return this.views.get(hostKey)?.get(sideId);
+  }
+
+  /**
+   * 装入一份分页快照的基线（spec §8.2「最后原子替换本地基线」）。
+   *
+   * 这是**原子替换**，不是合并：调用方已经按连续 seq 把快照期间缓存的帧收成
+   * 一个有序序列，装完之后 `items` 就是那个时刻的全文。合并会把两段不同时刻的
+   * 正文拼起来，而快照的整个意义就是「一个确定的时刻」。
+   *
+   * `page` 里的 metadata（status/usage/active_turn_id/effective_config）只在
+   * 第一页有权威值，但每一页都携带同一份，所以这里无条件覆盖——重复写同一份
+   * 不可变 metadata 是幂等的。
+   */
+  installBaseline(
+    hostKey: SideHostKey,
+    sideId: string,
+    page: SideReadItemsResult,
+    items: Item[],
+  ): void {
+    const view = this.viewForBaseline(hostKey, sideId, page);
+    view.items = items;
+    view.seq = page.snapshot_seq;
+    view.summary = {
+      ...view.summary,
+      status: page.status,
+      last_seq: page.snapshot_seq,
+      active_turn_id: page.active_turn_id,
+    };
+    view.usage = page.usage;
+    view.effectiveConfig = page.effective_config;
+    // 基线只证明「到 snapshot_seq 为止」是一致的。若已经收到过更高的 atom
+    // （对账与缓存交错），调用方随后会把那些帧重新应用一遍；这里不把它标成
+    // synced，避免在中间态让「发送」短暂放行。
+    if (view.seq <= page.snapshot_seq) view.sync = "synced";
+  }
+
+  /** 设置同步态（禁发/对账中/已同步）。 */
+  setSync(hostKey: SideHostKey, sideId: string, sync: SideSyncState): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.sync = sync;
+  }
+
+  /** 写某条旁支的草稿。草稿按旁支隔离，绝不与父会话共用。 */
+  setDraft(hostKey: SideHostKey, sideId: string, draft: string): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.draft = draft;
+  }
+
+  /**
+   * 清掉某个父上的全部旁支视图。
+   *
+   * 只在 `side/list` **明确返回空**时调用：那时服务端说「这个父上没有旁支」，
+   * 本地留着的必然是幽灵。网络失败时绝不能走这里——那会把用户正在看的旁支
+   * 当成已消失。
+   */
+  clearParent(hostKey: SideHostKey, parentId: string): void {
+    const bySide = this.views.get(hostKey);
+    if (!bySide) return;
+    for (const [sideId, view] of [...bySide]) {
+      if (view.parentId === parentId) bySide.delete(sideId);
+    }
+  }
+
+  /** 设置（或清除）一次未确定提交。 */
+  setPending(
+    hostKey: SideHostKey,
+    sideId: string,
+    pending: PendingSideSubmission | null,
+  ): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.pending = pending;
+  }
+
+  /** 基线可能先于第一帧到达：没有视图时按快照建一个。 */
+  private viewForBaseline(
+    hostKey: SideHostKey,
+    sideId: string,
+    page: SideReadItemsResult,
+  ): SideView {
+    let bySide = this.views.get(hostKey);
+    if (!bySide) {
+      bySide = new Map();
+      this.views.set(hostKey, bySide);
+    }
+    const existing = bySide.get(sideId);
+    if (existing) return existing;
+    const view: SideView = {
+      sideId,
+      // 快照不带 parent id：调用方知道父，装基线时由 `SideSyncController` 用
+      // `view.parentId` 补。这里留空串，`installBaseline` 的调用方负责覆盖。
+      parentId: "",
+      generation: 0,
+      seq: 0,
+      summary: {
+        side_id: sideId,
+        parent_thread_id: "",
+        status: page.status,
+        snapshot_revision: 0,
+        last_seq: page.snapshot_seq,
+        active_turn_id: page.active_turn_id,
+        expires_at: null,
+        generation: 0,
+        stopping: false,
+      },
+      items: [],
+      draft: "",
+      pending: null,
+      usage: page.usage,
+      effectiveConfig: page.effective_config,
+      error: null,
+      anchor: null,
+      sync: "unsynced",
+      closed: false,
+    };
+    bySide.set(sideId, view);
+    return view;
+  }
+
+  /**
+   * 让基线视图认领父与代。
+   *
+   * 分页快照本身不带父/代（它只描述内容），而这两样决定「这帧归谁」。基线装
+   * 完之后由对账控制器调用一次，避免在 store 里再复制一份「哪个 side 属于哪个
+   * 父」的判定——那正是两处容易写歪的重复逻辑。
+   */
+  adopt(hostKey: SideHostKey, sideId: string, parentId: string, generation: number): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.parentId = parentId;
+    view.generation = generation;
+    view.summary = { ...view.summary, parent_thread_id: parentId, generation };
   }
 
   /** 该宿主上的全部旁支，供「继续旁问」入口与 list 对账使用。 */
