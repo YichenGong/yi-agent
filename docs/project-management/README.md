@@ -29,7 +29,7 @@
 | yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 81 / 82 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
-| superpowers-kanban | 19 / 21 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |
+| superpowers-kanban | 19 / 22 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |
 | desktop | 116 / 127 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
