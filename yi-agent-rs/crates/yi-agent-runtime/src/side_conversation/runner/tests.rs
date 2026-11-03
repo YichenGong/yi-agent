@@ -12,8 +12,9 @@ use futures::StreamExt;
 use super::*;
 use crate::side_conversation::SideHostResources;
 use crate::side_conversation::test_support::{
-    CapturingProvider, StaticRoots, source_with_pending_provider,
+    CapturingProvider, PendingProvider, StaticRoots, source_with_pending_provider,
 };
+use yi_agent_core::{ContentBlock, Provider, ToolRegistry};
 use yi_agent_tools::SideBlockingPool;
 
 const TEST_SIDE_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -144,6 +145,92 @@ async fn side_stale_interrupt_does_not_cancel_a_newer_turn() {
 
     runner.interrupt("turn-b").await.unwrap();
     runner.wait_quiescent().await.unwrap();
+    drop(second);
+}
+
+/// 旁支取消不得波及父轮，父的停止也不得波及正在跑的旁支。
+///
+/// spec §12.1 要求「`side_cancel_does_not_cancel_parent` 与反向取消；独立
+/// token/inbox/event」。这条用一个自己的 `PendingProvider` 冒充父轮：它的流
+/// 是否被 drop、它的 core 任务是否结束，都是父是否被牵连的直接证据，不靠
+/// 状态字段自证。
+#[tokio::test(start_paused = true)]
+async fn side_cancel_does_not_cancel_parent() {
+    let fixture = Fixture::new();
+    let (source, side_provider) = source_with_pending_provider();
+    let mut runner = fixture.runner(source).await;
+
+    // The parent turn: its own Agent, provider and cancellation, sharing nothing
+    // with the side but the process.
+    let parent_provider = Arc::new(PendingProvider::new());
+    let mut parent_agent = Agent::new(
+        Arc::clone(&parent_provider) as Arc<dyn Provider>,
+        Arc::new(ToolRegistry::new()),
+        AgentConfig::default(),
+    );
+    let mut parent_run = parent_agent
+        .run_managed_blocks(
+            vec![ContentBlock::Text("父问题".into())],
+            ManagedRunLimits::side_defaults(),
+        )
+        .await
+        .expect("the parent turn must start");
+    parent_provider.entered().await;
+
+    // Direction 1: cancelling the side must leave the parent alone.
+    let stream = runner
+        .start_turn("turn-a".into(), "旁问".into())
+        .await
+        .unwrap();
+    side_provider.entered().await;
+
+    runner.interrupt("turn-a").await.unwrap();
+    runner.wait_quiescent().await.unwrap();
+    drop(stream);
+
+    assert!(
+        side_provider.dropped(),
+        "cancelling the side must tear down the side's own provider stream"
+    );
+    assert!(
+        !parent_run.control.is_finished(),
+        "cancelling a side must not end the parent's core task"
+    );
+    assert!(
+        !parent_provider.dropped(),
+        "cancelling a side must not tear down the parent's provider stream"
+    );
+
+    // Direction 2 needs its own side: `PendingProvider::dropped` is one flag per
+    // provider instance, so reusing this one could not tell turn-b's stream apart
+    // from the turn-a stream we just proved was torn down.
+    let (source_b, side_provider_b) = source_with_pending_provider();
+    let mut runner_b = fixture.runner(source_b).await;
+    let second = runner_b
+        .start_turn("turn-b".into(), "第二问".into())
+        .await
+        .unwrap();
+    side_provider_b.entered().await;
+
+    parent_run
+        .control
+        .stop_and_join(Duration::from_millis(50))
+        .await
+        .expect("the parent must join cleanly");
+    assert!(parent_provider.dropped(), "the parent stop must be real");
+    assert_eq!(
+        runner_b.active_turn_id(),
+        Some("turn-b"),
+        "stopping the parent must not end the side's live turn"
+    );
+    assert_eq!(runner_b.status(), SideStatus::Running);
+    assert!(
+        !side_provider_b.dropped(),
+        "stopping the parent must not tear down the side's provider stream"
+    );
+
+    runner_b.interrupt("turn-b").await.unwrap();
+    runner_b.wait_quiescent().await.unwrap();
     drop(second);
 }
 
