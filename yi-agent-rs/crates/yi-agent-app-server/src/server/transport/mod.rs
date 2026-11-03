@@ -155,18 +155,15 @@ where
 
     // 保活。**唯一持有断言的进程**就是这里（spec「为什么是单一持有者」）。
     //
-    // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：它含子进程与
-    // 2 秒级 TCP 超时，放主循环会把 RPC 卡住。
-    // 只读一次盘：三个初值来自同一份 `Settings`，不会互相错位。
+    // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：一拍含
+    // `getifaddrs`、电源来源与可能的 IOKit 调用，放主循环会和 RPC 抢时间片。
+    // 只读一次盘：初值来自同一份 `Settings`，不会互相错位。
     let initial_settings = yi_agent_runtime::settings::load_from(&settings_path);
     let initial_enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(&initial_settings);
-    let (initial_grace_min, initial_remote_min) =
+    let (initial_grace_min, _initial_remote_min) =
         yi_agent_runtime::settings::power_windows_minutes(&initial_settings);
-    let power_guard = crate::power_guard::PowerGuard::spawn(
-        initial_enabled,
-        initial_grace_min * 60,
-        initial_remote_min * 60,
-    );
+    let power_guard =
+        crate::power_guard::PowerGuard::spawn(initial_enabled, initial_grace_min * 60);
     // daemon 侧的 busy 另由 `BusySampler` 采（同样是阻塞 IPC，同样不能进主循环）。
     let busy_sampler = crate::power_busy::BusySampler::spawn(Arc::clone(&runtimes));
     // 远端最后一次发来请求的时刻。**只**由非 local 客户端刷新：桌面壳用 stdio
@@ -674,10 +671,10 @@ where
                 // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
                 let daemon = busy_sampler.latest();
 
-                // 只写原子。探测与 IOKit 都在供电线程里，这里绝不阻塞。
-                power_guard.set_activity(local || remote || daemon);
-                power_guard.set_enabled(enabled);
-                power_guard.set_windows(grace_secs, remote_secs);
+                // 一次提交一致的三个业务值：探测与 IOKit 都在供电线程里，
+                // 这里只持锁写字段、放锁后唤醒，绝不阻塞。值没变就不唤醒，
+                // 避免每 10 秒一次无意义的 tick。
+                power_guard.update(local || remote || daemon, enabled, grace_secs);
             }
             _ = driver_ticker.tick() => {
                 // 通用会话驱动器内联跑一轮:问每个驱动插件「下一步起/续哪个

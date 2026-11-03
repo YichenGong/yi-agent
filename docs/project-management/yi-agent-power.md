@@ -87,7 +87,25 @@
       保持原规则——当它们是唯一出口时仍判 Offline，本轮不解决该拓扑。
       真机网络边界（IPv6-only、网关 80 丢包、Wi-Fi 断开）仍待 Task 7 人工验收。
 - [ ] P2 RPC/插件/cold lead 启动失败按 turn_id 回滚并收口；完成判据：plan Tasks 3–4 的 T1–T7，`cargo test -p yi-agent-app-server --lib sleep_hardening_`，warm 排队语义不回归。
-- [ ] P3 一致输入与可通知电源线程、真实已持断言停机测试；完成判据：plan Task 2 的 G1–G5、`cargo test -p yi-agent-app-server --lib sleep_hardening_`，可控预算1秒、真机预算2秒且不冒充硬实时。
+- [x] P3 一致输入与可通知电源线程、真实已持断言停机测试。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-app-server --lib sleep_hardening_` 6 项
+      （`power_guard::tests::sleep_hardening_` 前缀）：
+      `drop_releases_once_without_waiting_a_tick`（G1：enabled=true 且已 acquire 后 Drop，
+      预算 1 秒、release 恰一次）/ `disable_wakes_the_worker_and_skips_the_grace`（G2）/
+      `drop_during_a_blocked_tick_waits_then_stops`（G3：Barrier 卡住一次本地调用后
+      另线程 Drop，调用返回后不再新拍、释放一次）/
+      `repeated_identical_updates_do_not_tick`（G4：100 次相同 update 不额外 tick）/
+      `grace_changes_reach_the_policy`（G5）/ `spawn_and_drop_are_bounded`。
+      实现：`PowerGuard::spawn(enabled, grace_secs)` + `update(busy, enabled, grace_secs)`
+      一次提交一致快照；`Mutex<GuardInputs>` + `Condvar::wait_timeout_while`，
+      谓词同时处理「输入换版 / stop / 伪唤醒」，锁不跨任何 probe 或 FFI。
+      变异证据：`update` 去掉 `notify_one` → `repeated_identical_updates_do_not_tick` 红；
+      等待改回纯 `wait_timeout`（忽略谓词）→ `disable_wakes...`（"disable must release
+      immediately"）与 `grace_changes...`（Timeout）红；恢复后 6/6 绿。
+      预算语义：1 秒/2 秒是**测试预算**，不是 OS 调度或系统调用永不挂起的硬实时承诺；
+      stop 落进一次正在执行的本地 tick 时，join 等该调用返回。
+      真机 `#[ignore] disabling_the_guard_releases_the_real_assertion` 仍需手动
+      `--ignored` 跑并配合 Task 7 人工验收，本轮不声称 IOKit 实证。
 - [ ] P4 显式后台进程意图，默认false、活跃才参与busy；完成判据：plan Tasks 5–6 的 B1–B8，tools/app-server `sleep_hardening_` 与 desktop `npx tsc --noEmit && npx vitest run`。
 
 这四项只在本模块计数，tools/app-server 交叉引用不重复增加需求数。通过 spec/plan 不表示产品修复；原已完成项记录基线行为，实施后再同步替换旧探针说明。

@@ -1,8 +1,8 @@
 # Bug 列表
 
-- [ ] P1 防休眠网络资格误判：`yi-agent-rs/crates/yi-agent-power/src/probe.rs` 只考虑 IPv4，且网关 TCP 80 超时视为离线；IPv6-only 或端口丢包但链路可用时，忙碌任务过宽限可能释放断言。代码审查确认，未做真实网络切换复现。修复判据：[spec](superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) N1–N8、[plan](superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Task 1 与 Task 7 真机验收。
+- [x] P1 防休眠网络资格误判：`yi-agent-rs/crates/yi-agent-power/src/probe.rs` 只考虑 IPv4，且网关 TCP 80 超时视为离线；IPv6-only 或端口丢包但链路可用时，忙碌任务过宽限可能释放断言。代码审查确认，未做真实网络切换复现。修复判据：[spec](superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) N1–N8、[plan](superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Task 1 与 Task 7 真机验收。**自动化已通过**（`cargo test -p yi-agent-power sleep_hardening_` 19 项；变异：`network_state` 只认 v4 → IPv6/ULA 三条红）；真机网络边界仍待 Task 7 人工验收。
 - [ ] P2 turn 投递失败残留保活：RPC `server/turn/mod.rs` send 失败只清 active_turn_id、不恢复 Idle；组长 cold `server/driver/launcher.rs` prepare 后 send 失败未回滚。`power_busy::local_busy` 因状态/占位继续算忙。代码审查确认；计划复用按身份失败收口，不误伤 warm 正在运行的 turn。修复判据：同一 spec T1–T7、plan Tasks 3–4、`cargo test -p yi-agent-app-server --lib sleep_hardening_`。
-- [ ] P3 电源线程退出阻塞：`probe.rs` 的 route.output 无超时，PowerGuard Drop join 等完整 tick，50ms 仅能打断轮询等待。原始 PowerGuard 配合临时 route 延迟3秒替身实测 Drop 为 3.008996166s；该数值不是生产 route 耗时。修复判据：同一 spec G1–G5、plan Task 2，已持断言真实循环及 Task 7 真机退出预算。以上三项仅完成设计与计划，尚未修复。
+- [x] P3 电源线程退出阻塞：`probe.rs` 的 route.output 无超时，PowerGuard Drop join 等完整 tick，50ms 仅能打断轮询等待。原始 PowerGuard 配合临时 route 延迟3秒替身实测 Drop 为 3.008996166s；该数值不是生产 route 耗时。修复判据：同一 spec G1–G5、plan Task 2，已持断言真实循环及 Task 7 真机退出预算。**自动化已通过**（`cargo test -p yi-agent-app-server --lib sleep_hardening_` 6 项；变异：去 notify → G4 红，改回纯 wait_timeout → G2/G5 红）；真机退出预算仍待 Task 7 人工验收。
 
 - [x] 承上（第三处同形实现）：`GitDiffView` 自带一份秒级相对时间，提交时间戳缺失时渲染成「20758 天前」。
   **发现方式**：修完提示条后全仓库检索相对时间的实现，发现共有三份独立实现——`lib/relativeTime.ts`（已加固）、`CacheNotice`（已加固）、以及 `GitDiffView.tsx:32` 那份额外的秒级 `relativeTime`。
