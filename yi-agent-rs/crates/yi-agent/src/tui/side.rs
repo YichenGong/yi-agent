@@ -2,12 +2,12 @@
 //!
 //! 这个模块只做三件**与终端无关**的事,这样它们可以被确定性地测试:
 //!
-//! - [`classify_conversation_input`]:把一行输入精确分类成「主会话」还是
+//! - `classify_conversation_input`:把一行输入精确分类成「主会话」还是
 //!   「旁支动作」。命令判定必须发生在投递之前,否则运行中敲 `/side` 会先打断父;
 //!   问题正文只裁掉命令前缀的命令边界,不改写用户原字节。
-//! - [`TuiSideView`] / [`TuiSideViews`]:两份互不干扰的会话视图状态
+//! - `TuiSideView` / `TuiSideViews`:两份互不干扰的会话视图状态
 //!   （草稿、滚动位置、运行态、错误），以及它们之间的切换。
-//! - [`route_approval_key`]:父审批态下的显式命令编辑模式。它把「按 Enter
+//! - `route_approval_key`:父审批态下的显式命令编辑模式。它把「按 Enter
 //!   批准」和「敲命令」彻底分开:命令模式下 Enter 只会执行命令。
 //!
 //! 真正的调度（`spawn_side_driver`）在 `crate::side_driver`,事件合流与渲染在
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use yi_agent_runtime::side_conversation::{
-    CloseReason, SideError, SideErrorReason, SideItem, SideItemContent, SideStatus, SideUsage,
+    CloseReason, SideError, SideErrorReason, SideItem, SideStatus, SideUsage,
 };
 
 /// 当前可见的会话。
@@ -57,7 +57,12 @@ impl ConversationTarget {
 /// 不会把状态机往回拨。
 #[derive(Debug, Clone)]
 pub enum ConversationPayload {
-    Main(yi_agent_core::AgentEvent),
+    /// 主会话事件。
+    ///
+    /// **不带载荷**是刻意的:主事件本身直接写主视图的 `HistoryState`,这条
+    /// 变体只用于在类型上标记「这是一条主事件」,让路由层有一个明确的分支,
+    /// 而不是靠「我们记得不会有人把主事件发进旁支通道」的约定。
+    Main,
     SideItems(Vec<Arc<SideItem>>),
     SideStatus(SideStatus),
     SideUsage(SideUsage),
@@ -206,14 +211,12 @@ pub struct TuiSideView {
     pub error: Option<String>,
     /// 关闭原因,`Some` 之后视图只读。
     pub closed: Option<CloseReason>,
-    /// 本视图自己的草稿,与主视图互不影响。
-    pub draft: String,
-    /// 本视图的滚动位置。
-    pub scroll_offset: usize,
     /// 是否有活跃轮。
+    ///
+    /// 草稿、滚动位置与待确认请求**不**在这里:它们分别由 `SideSession` 的
+    /// `InputLine` / `HistoryState` / `pending_request` 持有。同一份状态存两处
+    /// 必然分叉——按键改一处、渲染读另一处,用户看到的就是"草稿没了"。
     pub running: bool,
-    /// 最近一次受理但尚未确认的请求 id（重试对账用）。
-    pub pending_request: Option<String>,
 }
 
 impl TuiSideView {
@@ -226,10 +229,7 @@ impl TuiSideView {
             items: Vec::new(),
             error: None,
             closed: None,
-            draft: String::new(),
-            scroll_offset: 0,
             running: false,
-            pending_request: None,
         }
     }
 
@@ -297,7 +297,10 @@ impl TuiSideView {
                 SideFrameEffect::Redraw
             }
             // 主事件不会以 `Side` 目标送达;真发生了说明路由错了,丢弃。
-            ConversationPayload::Main(_) => SideFrameEffect::Discard,
+            //
+            // 这个变体必须存在：它让「主事件」在类型上只可能走主视图，路由层
+            // 因此不必靠字符串/约定判断来源。
+            ConversationPayload::Main => SideFrameEffect::Discard,
         }
     }
 
@@ -365,12 +368,6 @@ impl TuiSideViews {
         self.active = Some(ConversationTarget::Main);
     }
 
-    /// 丢弃当前旁支（close 之后调用）。
-    pub fn drop_side(&mut self) {
-        self.side = None;
-        self.active = Some(ConversationTarget::Main);
-    }
-
     /// 把一份帧路由到正确的视图。
     ///
     /// 主事件只在**看主视图**时被交回调用方处理;旁支事件只写旁支视图。这条
@@ -387,7 +384,7 @@ impl TuiSideViews {
                 Some(view) => view.apply(side_id, *generation, payload.clone()),
                 None => SideFrameEffect::Discard,
             },
-            (ConversationTarget::Main, ConversationPayload::Main(_)) => SideFrameEffect::Redraw,
+            (ConversationTarget::Main, ConversationPayload::Main) => SideFrameEffect::Redraw,
             _ => SideFrameEffect::Discard,
         }
     }
@@ -403,7 +400,7 @@ pub fn visible_stop_target(
     side_running: bool,
 ) -> Option<ConversationTarget> {
     match active {
-        ConversationTarget::Main => main_running.then(|| ConversationTarget::Main),
+        ConversationTarget::Main => main_running.then_some(ConversationTarget::Main),
         target @ ConversationTarget::Side { .. } => side_running.then(|| target.clone()),
     }
 }
@@ -493,8 +490,6 @@ pub enum ApprovalKeyAction {
     ExitCommandMode,
     /// 应用级退出,任何模式都必须可达。
     ApplicationExit,
-    /// 无副作用地吃掉这个键（命令模式下的非法键）。
-    Consumed,
 }
 
 /// 命令模式下唯一能拆成「退出」的键:Ctrl+Q 与 Esc。
@@ -525,41 +520,6 @@ pub fn route_approval_key(key: KeyEvent, mode: &mut ApprovalInputMode) -> Approv
         (ApprovalInputMode::Command, KeyCode::Enter) => ApprovalKeyAction::EditCommand(key),
         (ApprovalInputMode::Command, _) => ApprovalKeyAction::EditCommand(key),
         (ApprovalInputMode::Decision, _) => ApprovalKeyAction::DecisionKey(key),
-    }
-}
-
-/// 把 runtime 的转录项翻译成 TUI 可渲染的文本行。
-///
-/// **不**在这里做裁剪:预算由 runtime 的 `SideTranscript` 统一负责
-/// （side 与桌面/手机共享同一份切分规则）,这里再裁一次会导致同一段正文在
-/// 两端长度不同。
-pub fn side_item_lines(content: &SideItemContent) -> Vec<String> {
-    match content {
-        SideItemContent::UserMessage { text } => text.lines().map(str::to_string).collect(),
-        SideItemContent::AgentMessage { text } => text.lines().map(str::to_string).collect(),
-        SideItemContent::Thinking { text, redacted } => {
-            let label = if *redacted {
-                "思考（已摘要）"
-            } else {
-                "思考"
-            };
-            let mut lines = vec![format!("[{label}]")];
-            lines.extend(text.lines().map(str::to_string));
-            lines
-        }
-        SideItemContent::ToolCall {
-            name,
-            result,
-            status,
-            ..
-        } => {
-            let mut lines = vec![format!("[工具 {name} · {status:?}]")];
-            if let Some(result) = result {
-                lines.extend(result.lines().map(str::to_string));
-            }
-            lines
-        }
-        SideItemContent::Notice { text } => vec![format!("[提示] {text}")],
     }
 }
 

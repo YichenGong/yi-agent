@@ -208,7 +208,16 @@ impl SideDriver {
                 self.report_error(outcome.err()).await;
             }
             SideDriverCommand::Interrupt { turn_id } => {
-                if let Some(runner) = self.runner.as_mut()
+                // 先用本任务自己记的 active 轮次校验一次:UI 可能拿着一帧旧
+                // turn id 发出停止,而那一轮早已结束。不校验就会把停止误发到
+                // 刚启动的下一轮上——用户看到的是「我没停它,它自己停了」。
+                let matches_active = self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.turn_id == turn_id);
+                if !matches_active {
+                    // 空闲或轮次已变:静默忽略,不算错误。
+                } else if let Some(runner) = self.runner.as_mut()
                     && let Err(error) = runner.interrupt(&turn_id).await
                 {
                     self.report_error(Some(error)).await;

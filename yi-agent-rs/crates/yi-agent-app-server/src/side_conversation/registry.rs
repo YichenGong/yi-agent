@@ -362,6 +362,11 @@ impl SideRegistry {
     /// two concurrent publishers can never emit the same number with different
     /// bodies. It is bumped before the frame leaves the lock: if the process dies in
     /// between, clients see a gap and re-read a snapshot — which is the contract.
+    ///
+    /// Only tests use this entry point: production paths already hold the entry
+    /// lock for a state change and call [`Self::stage`] inside that same critical
+    /// section, so they must not acquire it twice.
+    #[cfg(test)]
     pub(crate) async fn publish(
         &self,
         side_id: &str,

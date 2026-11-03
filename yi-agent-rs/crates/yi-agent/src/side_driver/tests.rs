@@ -320,7 +320,7 @@ async fn close_with_stale_turn_id_is_refused() {
 
 #[tokio::test]
 async fn parent_barrier_blocks_open_until_rolled_back() {
-    let mut fx = fixture();
+    let fx = fixture();
     let (tx, rx) = oneshot::channel();
     fx.handles
         .commands

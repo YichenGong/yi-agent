@@ -2,10 +2,7 @@
 
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
-}
+use yi_agent_runtime::side_conversation::SideItemContent;
 
 fn item(id: &str, ordinal: u64, text: &str) -> Arc<SideItem> {
     Arc::new(SideItem {
@@ -180,18 +177,18 @@ fn background_parent_events_do_not_change_side_history_or_running() {
     side.status = SideStatus::Running;
     side.running = true;
     side.apply_items(vec![item("a", 1, "旁支回答")]);
-    let before = (side.items.len(), side.running, side.draft.clone());
+    let before = (side.items.len(), side.running);
 
     let main_event = ConversationEvent {
         target: ConversationTarget::Main,
         turn_id: None,
-        event: ConversationPayload::Main(yi_agent_core::AgentEvent::Cancelled),
+        event: ConversationPayload::Main,
     };
     assert_eq!(views.route(&main_event), SideFrameEffect::Redraw);
 
     let side = views.side.as_ref().unwrap();
     assert_eq!(
-        (side.items.len(), side.running, side.draft.clone()),
+        (side.items.len(), side.running),
         before,
         "父会话的事件不能改旁支的 history/running/draft"
     );
@@ -264,12 +261,11 @@ fn opening_the_same_side_twice_keeps_its_content() {
 
 #[test]
 fn back_restores_main_draft_and_viewport() {
-    // 主视图的草稿与滚动位置存在主视图自己身上;这里断言切换不改动它们,
-    // 旁支的草稿/滚动也彼此独立（两者都由调用方按 active 选择）。
+    // 主视图的草稿与滚动位置存在主视图自己身上;这里断言切换不改动它们。
+    // 旁支自己的草稿/滚动由 `SideSession` 的 InputLine/HistoryState 持有,
+    // 不在 `TuiSideView` 里存第二份——同一份状态存两处必然分叉。
     let mut views = TuiSideViews::new();
     views.open("s".into(), 1);
-    views.side.as_mut().unwrap().draft = "旁支草稿".into();
-    views.side.as_mut().unwrap().scroll_offset = 42;
 
     views.back();
     assert!(!views.in_side());
@@ -278,19 +274,10 @@ fn back_restores_main_draft_and_viewport() {
         Some(ConversationTarget::Main),
         "back 只切视图,不丢弃旁支"
     );
-
-    let side = views.side.as_ref().expect("back 不能丢弃旁支状态");
-    assert_eq!(side.draft, "旁支草稿");
-    assert_eq!(side.scroll_offset, 42);
-}
-
-#[test]
-fn drop_side_returns_to_main() {
-    let mut views = TuiSideViews::new();
-    views.open("s".into(), 1);
-    views.drop_side();
-    assert!(views.side.is_none());
-    assert_eq!(views.active, Some(ConversationTarget::Main));
+    assert!(
+        views.side.is_some(),
+        "back 不能丢弃旁支状态（否则回去后正文全没了）"
+    );
 }
 
 // --- 停止目标 -----------------------------------------------------------
@@ -405,34 +392,6 @@ fn ctrl_q_exits_from_both_modes() {
 }
 
 // --- 呈现 ---------------------------------------------------------------
-
-#[test]
-fn side_item_lines_never_rewrite_the_text() {
-    let cases = vec![
-        SideItemContent::UserMessage {
-            text: "第一行\n第二行".into(),
-        },
-        SideItemContent::AgentMessage {
-            text: "答案".into(),
-        },
-        SideItemContent::Thinking {
-            text: "推理".into(),
-            redacted: false,
-        },
-        SideItemContent::Notice {
-            text: "提示".into(),
-        },
-    ];
-    for content in cases {
-        let lines = side_item_lines(&content);
-        assert!(!lines.is_empty());
-    }
-
-    let user = side_item_lines(&SideItemContent::UserMessage {
-        text: "第一行\n第二行".into(),
-    });
-    assert_eq!(user, vec!["第一行".to_string(), "第二行".to_string()]);
-}
 
 #[test]
 fn side_header_names_the_parent_state() {

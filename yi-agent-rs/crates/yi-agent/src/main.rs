@@ -2437,8 +2437,7 @@ fn run_tui_agent(
         // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
         // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
         let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
-        let side_instance_home = yi_agent_store::paths::instance_home()
-            .unwrap_or_else(|| snapshot_workdir.join(".yi-agent"));
+        let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
         let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
             side_instance_home,
             Arc::clone(&side_pool),
@@ -3303,10 +3302,12 @@ fn run_tui_agent(
         // 退出顺序是硬约束:**先**让旁支调度停下并 join,再做 TUI/reactor 收尾。
         // 旁支持有真实 owner（资源槽、blocking 工作、provider 流）,如果让它
         // 比主循环活得更久,进程退出时那些资源会被直接丢弃,而不是被释放。
-        let mut exit_coordinator = crate::tui::side::TuiExitCoordinator::new(
-            side_commands_tx_for_tui_exit,
-            side_driver_join_for_exit,
-        );
+        let mut exit_coordinator = match (side_commands_tx_for_tui_exit, side_driver_join_for_exit) {
+            (Some(commands), Some(join)) => {
+                crate::tui::side::TuiExitCoordinator::new(Some(commands), Some(join))
+            }
+            _ => crate::tui::side::TuiExitCoordinator::disabled(),
+        };
         match exit_coordinator.stop_all().await {
             Ok(true) => {}
             Ok(false) => {

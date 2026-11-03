@@ -759,12 +759,12 @@ impl SideSession {
                 self.pending_request = None;
                 self.active_turn_id = None;
             }
-            ConversationPayload::SideStatus(_) if effect == SideFrameEffect::Redraw => {
-                // 轮次结束时清掉 active turn id:Esc 不能在已结束的轮次上「停止」,
-                // 更不能误停下一轮。
-                if !self.side_running() {
-                    self.active_turn_id = None;
-                }
+            // 轮次结束时清掉 active turn id:Esc 不能在已结束的轮次上「停止」,
+            // 更不能误停下一轮。
+            ConversationPayload::SideStatus(_)
+                if effect == SideFrameEffect::Redraw && !self.side_running() =>
+            {
+                self.active_turn_id = None;
             }
             _ => {}
         }
@@ -773,6 +773,24 @@ impl SideSession {
         {
             self.active_turn_id = Some(turn_id.clone());
         }
+        effect
+    }
+
+    /// 主事件在旁支视图上的唯一正确结果:不改变任何旁支状态。
+    ///
+    /// 返回 `SideFrameEffect`,调用方可以据此断言「主事件没有写旁支」。
+    fn apply_main_frame(&mut self) -> SideFrameEffect {
+        let before = (self.active_turn_id.clone(), self.notice.clone());
+        let effect = self.views.route(&super::side::ConversationEvent {
+            target: super::side::ConversationTarget::Main,
+            turn_id: None,
+            event: super::side::ConversationPayload::Main,
+        });
+        debug_assert_eq!(
+            before,
+            (self.active_turn_id.clone(), self.notice.clone()),
+            "主事件绝不能改动旁支视图"
+        );
         effect
     }
 
@@ -953,6 +971,11 @@ impl LoopBookkeeping {
     }
 }
 
+/// 无旁支能力的测试入口。
+///
+/// 生产代码一律走 [`run_loop_with_side`]:旁支是 TUI 的一等能力,只有
+/// 「这个宿主持不支持旁支」的区别,没有「另一条主循环」的区别。
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_loop<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
@@ -1022,6 +1045,9 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
     title: &mut crate::tui::title::TitleHandle,
     side_runtime: SideRuntime,
 ) -> std::io::Result<usize> {
+    // 能力判定必须在拆通道**之前**:`SideRuntime::is_enabled` 是唯一判据,
+    // 拆开之后只剩 `Option`,各处很容易把「通道还在」当成「能力还在」。
+    let side_capable = side_runtime.is_enabled();
     let SideRuntime {
         commands: side_commands,
         events: mut side_events,
@@ -1061,6 +1087,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
     loop {
         // 当前可见的是哪一份视图。每帧重算:back/打开旁支只改状态,不重启循环。
         let in_side = side_session.in_side();
+
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -1146,6 +1173,10 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
         }
 
         for event in pending_events {
+            // 主事件必须被旁支视图明确拒绝,而不是「碰巧没人发过来」。
+            // 每帧都过一遍路由,零成本（变体不带载荷）,并且一旦有人把主事件
+            // 塞进旁支路径,这里立刻能看出来。
+            let _ = side_session.apply_main_frame();
             let is_turn_end = matches!(
                 event,
                 AgentEvent::Done { .. } | AgentEvent::Cancelled | AgentEvent::Error(_)
@@ -1455,7 +1486,14 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 let history_text_width =
                     history.text_width(history_area.width, history_area.height);
                 if !in_side
-                    && intercept_side_command(key, input, history, history_text_width, &channels)
+                    && intercept_side_command(
+                        key,
+                        input,
+                        history,
+                        history_text_width,
+                        &channels,
+                        side_capable,
+                    )
                 {
                     continue;
                 }
@@ -2771,6 +2809,7 @@ fn intercept_side_command(
     history: &mut HistoryState,
     history_width: u16,
     channels: &TuiChannels,
+    side_capable: bool,
 ) -> bool {
     if key.code != KeyCode::Enter || !key.modifiers.is_empty() {
         return false;
@@ -2789,7 +2828,7 @@ fn intercept_side_command(
 
     // 没有旁支能力时**不能**静默吞掉:用户敲了 `/side` 却没反应,只会以为
     // 是输入没生效。清空输入并把原因写进主转录。
-    let Some(commands) = channels.side.as_ref() else {
+    let Some(commands) = channels.side.as_ref().filter(|_| side_capable) else {
         input.clear();
         history.push(
             HistoryCell::Separator {
@@ -2898,7 +2937,15 @@ fn handle_side_key(key: KeyEvent, side: &mut SideSession, channels: &TuiChannels
                     side.notice = Some(match name.as_str() {
                         "cost" => format_side_usage(side),
                         "config" => "旁支继承父会话的模型与推理档；只读，不能改配置".to_string(),
-                        _ => "/back 返回主会话，/side-close 关闭旁支".to_string(),
+                        _ => {
+                            // 工具白名单直接取自调度侧的同一份策略,不在这里另抄一遍:
+                            // 两处各写一份,总有一天帮助里说能用的工具其实被拒。
+                            let tools = crate::side_driver::allowed_side_tools().join("、");
+                            format!(
+                                "/back 返回主会话，/side-close 关闭旁支。\
+旁支可用工具（只读）：{tools}"
+                            )
+                        }
                     });
                     KeyOutcome::None
                 }
@@ -2984,7 +3031,6 @@ fn route_parent_approval_key(
             // 理论上不可达（Command 分支已在上方返回），保守起见仍然消费掉。
             ApprovalRoute::Handled(KeyOutcome::None)
         }
-        ApprovalKeyAction::Consumed => ApprovalRoute::Handled(KeyOutcome::None),
         ApprovalKeyAction::DecisionKey(_) => ApprovalRoute::PassThrough,
     }
 }
