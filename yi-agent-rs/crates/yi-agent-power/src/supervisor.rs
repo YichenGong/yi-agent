@@ -598,4 +598,64 @@ mod tests {
         }
         assert_eq!(edges, 2, "unknown, unknown, online, unknown => two edges");
     }
+
+    /// B6：后台 busy 是**普通 busy 源**——它不为 Supervisor 引入任何新语义。
+    ///
+    /// 只要 `busy=true` 且网络合格、在电池上，两拍都持有；后台工作到终态后
+    /// `busy=false`，宽限未到仍持有、等于宽限释放；若另有 busy 源仍为 true，
+    /// 则继续持有（不因后台结束而释放）。
+    ///
+    /// 这里用 FakeClock 推进，**不**真实等待 15 分钟。
+    #[test]
+    fn sleep_hardening_background_busy_follows_the_grace_boundary() {
+        // 两拍 Hold（后台 busy 与 online+battery 同形）。
+        let clock = Arc::new(FakeClock::new());
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "background busy on battery must hold");
+        clock.advance(Duration::from_secs(10));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "still busy => keep holding");
+        assert_eq!(assertion.acquires.load(Ordering::SeqCst), 1);
+
+        // 后台终态：busy=false，宽限未到仍持有。
+        clock.advance(Duration::from_secs(899));
+        sup.tick(false, true);
+        assert!(sup.is_holding(), "grace has not elapsed yet");
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 0);
+
+        // 恰好等于宽限 => 释放（判据是 `<`）。
+        clock.advance(Duration::from_secs(1));
+        sup.tick(false, true);
+        assert!(
+            !sup.is_holding(),
+            "busy gone and grace elapsed must release"
+        );
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 1);
+
+        // 另一路 busy 仍为 true：不因后台结束而释放。
+        let clock = Arc::new(FakeClock::new());
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(sup.is_holding());
+        clock.advance(Duration::from_secs(10));
+        // 后台结束，但会话仍在跑 turn：聚合后的 busy 仍是 true。
+        sup.tick(true, true);
+        clock.advance(Duration::from_secs(3600));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "another busy source keeps it holding");
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 0);
+    }
 }

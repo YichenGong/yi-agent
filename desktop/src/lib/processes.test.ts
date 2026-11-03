@@ -76,3 +76,20 @@ describe("processes folding", () => {
     expect(formatElapsed(0)).toBe("0.0s");
   });
 });
+describe("prevent_idle_sleep backward compatibility", () => {
+  it("reads a missing field (old sidecar) as false", () => {
+    // 原有无字段 fixture：旧 sidecar 不返回该键。
+    const legacy = p("p1", "running");
+    expect(legacy.prevent_idle_sleep).toBeUndefined();
+    expect(legacy.prevent_idle_sleep ?? false).toBe(false);
+  });
+
+  it("carries true and false through the partition unchanged", () => {
+    const optedIn = { ...p("p1", "running"), prevent_idle_sleep: true };
+    const optedOut = { ...p("p2", "running"), prevent_idle_sleep: false };
+    const { active } = partitionProcesses([optedIn, optedOut]);
+    expect(active.map((info) => info.prevent_idle_sleep)).toEqual([true, false]);
+    // 原显示契约不变：同一个 state 仍然归到同一组、同一个名字。
+    expect(active.map((info) => processDisplayName(info))).toEqual(["p1", "p2"]);
+  });
+});
