@@ -1076,12 +1076,28 @@ impl BoardService {
             if live.merge_queued_at != ledger.merge_queued_at {
                 return Err("the card's queue position changed while dispatching".to_string());
             }
+            // 先只在内存里迁移;`with_board` 只在闭包返回 `Ok` 时才把看板落盘。
+            // 于是「安全记录落盘 → 看板落盘(Running)」是同一次提交,而**记录在
+            // 前**:中途崩溃留下的是「有记录 + 卡仍 MergeQueued」,重启会阻塞而不是
+            // 重派（spec §8.1）。反过来（先写 Running）会留下一个没有记录、却已
+            // 经在跑的合并。
             board
                 .transition(&card.id, CardState::Running)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            crate::merge_attempt::save(&self.state_dir, &record)
+                .map_err(|error| format!("could not record the merge attempt: {error}"))
         });
         if let Err(error) = staged {
-            // 状态没写进去 = 动作没交出去。安全记录与名额都不留,下一拍重来。
+            // 看板没提交 = `Running` 没落盘;动作也没交出去,名额与 holder 都不留。
+            //
+            // 记录可能已经写进去了（失败发生在写记录之后）。这里**能确认**动作没
+            // 交出去,所以按 spec §8.1 的允许做一次 CAS 清理;留一条没人能自动结算的
+            // 记录会把这个项目的合并永久堵死。
+            let _ = crate::merge_attempt::clear_if_matches(
+                &self.state_dir,
+                &card.id.0,
+                &ledger.action_id,
+            );
             eprintln!(
                 "superpowers-kanban: could not start the merge for {}: {error}",
                 card.id
@@ -1095,32 +1111,7 @@ impl BoardService {
             drop(lease);
             return None;
         }
-        // 安全记录**先于**动作。写不下去就不能交:否则崩溃后没人知道有一个合并
-        // 可能已经在飞（spec §8.1）。
-        if let Err(error) = crate::merge_attempt::save(&self.state_dir, &record) {
-            eprintln!(
-                "superpowers-kanban: could not record the merge attempt for {}: {error}",
-                card.id
-            );
-            let _ = persist::with_board(&self.state_dir, |board| {
-                board
-                    .transition(&card.id, CardState::MergeQueued)
-                    .map_err(|error| error.to_string())?;
-                if let Some(live) = board.get_mut(&card.id) {
-                    live.mark_merge_queued(ledger.merge_queued_at.unwrap_or_else(Local::now));
-                }
-                Ok(())
-            });
-            let _ = crate::merge_lock::clear_holder_if_matches(
-                &self.state_dir,
-                &card.id.0,
-                std::process::id(),
-            );
-            drop(gate);
-            drop(lease);
-            return None;
-        }
-        // 记录落盘了,才把 `Running` 与动作一起交出。
+        // 记录与 `Running` 都已落盘,现在才把动作交出去。
         if let Err(error) = persist::with_board(&self.state_dir, |board| {
             if let Some(live) = board.get_mut(&card.id) {
                 live.clear_merge_queued();
@@ -1205,6 +1196,8 @@ impl BoardService {
             phase: crate::merge_attempt::MergePhase::Pending,
             merge_queued_at: card.merge_queued_at,
         };
+        // 与 `dispatch_resume` 同一顺序:先在内存里迁移,再写安全记录,最后才是
+        // 看板提交。记录在前意味着崩溃留下「有记录、卡未 Running」——阻塞而非重派。
         let staged = persist::with_board(&self.state_dir, |board| {
             board
                 .transition(&card.id, CardState::Running)
@@ -1214,25 +1207,15 @@ impl BoardService {
             }
             board
                 .set_workdir(&card.id, workdir.clone())
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            crate::merge_attempt::save(&self.state_dir, &record)
+                .map_err(|error| format!("could not record the merge attempt: {error}"))
         });
         if let Err(error) = staged {
+            // 同 `dispatch_resume`:动作没交出去,记录若已写就 CAS 清掉。
+            let _ = crate::merge_attempt::clear_if_matches(&self.state_dir, &card.id.0, action_id);
             eprintln!(
                 "superpowers-kanban: could not start the merge for {}: {error}",
-                card.id
-            );
-            let _ = crate::merge_lock::clear_holder_if_matches(
-                &self.state_dir,
-                &card.id.0,
-                std::process::id(),
-            );
-            drop(gate);
-            drop(lease);
-            return None;
-        }
-        if let Err(error) = crate::merge_attempt::save(&self.state_dir, &record) {
-            eprintln!(
-                "superpowers-kanban: could not record the merge attempt for {}: {error}",
                 card.id
             );
             let _ = crate::merge_lock::clear_holder_if_matches(
@@ -3852,6 +3835,41 @@ mod tests {
         assert_eq!(record.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(record.phase, crate::merge_attempt::MergePhase::Pending);
         assert_eq!(state_of(&service, "card-1"), "running");
+    }
+
+    /// 顺序的**可观测**证明:安全记录写不下去时,卡绝不能已经变成 `Running`。
+    ///
+    /// 把 `merge.attempt.json` 占成一个目录,`save` 的 rename 必然失败。若实现
+    /// 先落 `Running`,这里就会看到一张「在跑但没有记录」的卡——正是 spec §8.1
+    /// 禁止的中间态:重启后没人知道有合并可能已经在飞。
+    #[test]
+    fn merge_resume_does_not_report_running_when_the_attempt_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        // 目录占位:create/rename 都会失败。
+        std::fs::create_dir_all(
+            service
+                .state_dir
+                .join(crate::merge_attempt::ATTEMPT_FILE)
+                .with_extension("json.tmp"),
+        )
+        .unwrap();
+
+        assert!(
+            resume_action(&service, &[facts("thread-1", true, true)]).is_none(),
+            "without a durable attempt no action may be handed out"
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "merge_queued",
+            "a card must not look running when its safety record never landed"
+        );
+        assert!(
+            matches!(crate::merge_attempt::read(&service.state_dir), Ok(None)),
+            "no record may be left behind when the write failed before delivery"
+        );
     }
 
     #[test]

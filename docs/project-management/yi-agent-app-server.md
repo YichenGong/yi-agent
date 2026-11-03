@@ -31,7 +31,41 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 
 ## Features
 
-- [ ] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`，补齐设计 §11 的恢复、忙碌、环境与契约用例，提交前通过 `just ci`。
+- [x] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`
+（69 passed / 4 ignored）、`--lib resume_append_`（21 passed）、
+`--lib kanban_original_session_`（4 passed）。代码位置：`session_driver.rs`
+（`SUPPORTED_ACTIONS` 含 `resume_append`，`parse_action` 分支）、`server/driver_resume.rs`
+（热追加与冷严格恢复）。
+
+  证据：
+  - 热会话不重建、thread 不变：`resume_append_keeps_the_live_thread_identity`、
+    `resume_append_registers_the_thread_exactly_once`、
+    `resume_append_after_a_real_first_turn_keeps_the_transcript`；
+    `kanban_original_session_hot_round_trip`（真实 `BoardService` +
+    `dispatch_with_service`，只留一份 meta 且 `thread_id` 未变）。
+  - 冷会话恢复历史/配置/usage：`resume_append_cold_restores_the_same_thread_and_history`、
+    `resume_append_cold_applies_the_restored_usage_to_the_built_agent`；
+    `kanban_original_session_cold_round_trip`（首个 Host 丢弃、空 `DriverState`、
+    真实 `attach_project_runtime`，真 bash 读到原 card id）。
+  - 恢复失败不建替代会话：`kanban_original_session_cold_reports_a_deleted_worktree`、
+    `kanban_original_session_cold_refuses_corrupt_history`——均 `needs_you`、无 Launch、
+    `thread_id` 不变。
+  - 注入环境不许丢：`resume_append_refuses_to_drop_an_injected_environment`。
+  - 忙碌不打断：`resume_append_refuses_a_busy_thread_without_touching_its_turn`
+    （同时断言既有的 turn 内容与状态原样保留）。
+  - 多项失败分类各有专测：`resume_append_reports_a_missing_workdir`、
+    `resume_append_reports_an_invalid_thread_id`、
+    `resume_append_reports_a_thread_without_history`、
+    `resume_append_reports_corrupt_history_without_rewriting_it`、
+    `resume_append_refuses_a_meta_only_cold_thread`、
+    `resume_append_refuses_a_thread_from_another_workdir`、
+    `resume_append_refuses_to_restore_without_a_lock`、
+    `resume_append_reports_a_busy_writer_lock`、
+    `resume_append_rolls_back_only_its_own_placeholder`。
+  - 宿主不解释看板业务：`resume_append` 只带通用 `objective` 与环境变量；卡号/状态
+    语义全在插件给的文本里（`Kanban` 类型不进宿主生产模块，看板依赖只在
+    `dev-dependencies`）。
+  - 门禁：`just ci` 通过（含 fmt、clippy --all-targets、bindings、msrv、audit）。
 
 - [x] crate 骨架 + workspace 注册 — `yi-agent-rs/crates/yi-agent-app-server/`；`yi-agent-rs/Cargo.toml` members 含 `crates/yi-agent-app-server`
 - [x] JSON-RPC 2.0 信封：`RequestEnvelope` / `ResponseEnvelope`（均 `Serialize` + `Deserialize`）/ `RequestId`（num/str 兼容）/ `RpcError`（标准错误码 + `-32010`~`-32012` 业务错误码）— `src/protocol.rs:18` / `src/protocol.rs:28` / `src/protocol.rs:12` / `src/protocol.rs:62`
