@@ -406,6 +406,119 @@ impl FrontendLease {
         })
     }
 
+    /// Asks the guardian for authority over one foreground root.
+    ///
+    /// The answer is the *root* capability: narrow, bound to this client run and this
+    /// daemon generation, and unusable for registering, renewing or acting for another
+    /// client. It is not derived from `intent.thread_key`, so knowing a conversation
+    /// key is not the same as owning the conversation.
+    ///
+    /// A refusal is `PermissionDenied`, and the reason text is the guardian's: the
+    /// shell needs to tell "no lease" from "another owner holds it" to decide whether
+    /// to ask again after taking a lease.
+    pub fn authorize_root(
+        &self,
+        intent: &crate::foreground::RootBindIntent,
+        deadline: &Deadline,
+    ) -> io::Result<types::RootAuthorization> {
+        self.request_control(
+            types::ControlRequest::AuthorizeRoot {
+                grant: self.grant.clone(),
+                intent: intent.clone(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::RootAuthorized(authorization) => Ok(authorization),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("root authorization", code, &reason))
+            }
+            types::ControlResponse::Unsupported { detail } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this runtime build cannot authorize a root: {detail}"),
+            )),
+            other => Err(unexpected("root authorization", &other)),
+        })
+    }
+
+    /// Asks the daemon (through the guardian) to prepare a recovery.
+    ///
+    /// `Ok(None)` means the daemon has no record of this operation; every other
+    /// answer is a [`crate::foreground::RecoveryOperationStatus`], where only
+    /// `Committed` is success.
+    pub fn prepare_root_recovery(
+        &self,
+        request: &crate::foreground::RecoveryRequest,
+        deadline: &Deadline,
+    ) -> io::Result<Option<crate::foreground::RecoveryOperationStatus>> {
+        self.request_control(
+            types::ControlRequest::PrepareRootRecovery {
+                grant: self.grant.clone(),
+                request: request.clone(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::RootRecovery(status) => Ok(status),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("recovery preparation", code, &reason))
+            }
+            other => Err(unexpected("recovery preparation", &other)),
+        })
+    }
+
+    /// Confirms a prepared recovery with the token the prepare returned.
+    ///
+    /// The token lives only in memory, so a restart turns every `ready` operation back
+    /// into `needs_preview`; that is why a lost answer is recovered by asking for the
+    /// operation again rather than by confirming twice.
+    pub fn confirm_root_recovery(
+        &self,
+        request: &crate::foreground::RecoveryRequest,
+        token: &crate::foreground::SecretCapability,
+        deadline: &Deadline,
+    ) -> io::Result<Option<crate::foreground::RecoveryOperationStatus>> {
+        self.request_control(
+            types::ControlRequest::ConfirmRootRecovery {
+                grant: self.grant.clone(),
+                request: request.clone(),
+                token: token.clone(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::RootRecovery(status) => Ok(status),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("recovery confirmation", code, &reason))
+            }
+            other => Err(unexpected("recovery confirmation", &other)),
+        })
+    }
+
+    /// Reads one recovery operation's stored status.
+    pub fn root_recovery_operation(
+        &self,
+        root: &crate::foreground::RootRef,
+        operation_id: &str,
+        deadline: &Deadline,
+    ) -> io::Result<Option<crate::foreground::RecoveryOperationStatus>> {
+        self.request_control(
+            types::ControlRequest::RootRecoveryOperation {
+                grant: self.grant.clone(),
+                root: root.clone(),
+                operation_id: operation_id.to_string(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::RootRecovery(status) => Ok(status),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("recovery operation query", code, &reason))
+            }
+            other => Err(unexpected("recovery operation query", &other)),
+        })
+    }
+
     fn request_control(
         &self,
         request: types::ControlRequest,

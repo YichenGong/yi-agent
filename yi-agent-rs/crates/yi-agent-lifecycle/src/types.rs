@@ -393,6 +393,46 @@ pub enum ControlRequest {
         /// skip a row.
         cursor: Option<String>,
     },
+    /// Ask the guardian for authority over one foreground root.
+    ///
+    /// This is a *host* operation. It is never registered as a model tool and never
+    /// reachable from the generic JSON-RPC surface: the capability it returns is the
+    /// only thing that may bind a driver, write activity or start a tool under that
+    /// root, so a model that could ask for one could grant itself the exemption.
+    ///
+    /// `grant` proves which client is asking. The guardian refuses unless that client
+    /// holds a live `Business` lease, so a `LeaseOnly` observer cannot mint authority.
+    /// `intent.thread_key` is never authority by itself: it is a lookup key, and the
+    /// answer carries a capability that cannot be derived from it.
+    AuthorizeRoot {
+        grant: ClientGrant,
+        intent: crate::foreground::RootBindIntent,
+    },
+    /// Ask the daemon to prepare a recovery of a root whose attempt was settled.
+    ///
+    /// Same shape as [`Self::AuthorizeRoot`]: the guardian verifies the lease and its
+    /// own view of the root before the request reaches the daemon. The daemon then
+    /// does the authorize-and-freeze half, which is where the transaction boundary
+    /// lives.
+    PrepareRootRecovery {
+        grant: ClientGrant,
+        request: crate::foreground::RecoveryRequest,
+    },
+    /// Confirm a prepared recovery with the token the prepare returned.
+    ConfirmRootRecovery {
+        grant: ClientGrant,
+        request: crate::foreground::RecoveryRequest,
+        token: crate::foreground::SecretCapability,
+    },
+    /// Read the stored status of one recovery operation.
+    ///
+    /// Grant-bearing like the rest: a read that answered for any root would let a
+    /// client enumerate sessions it does not own.
+    RootRecoveryOperation {
+        grant: ClientGrant,
+        root: crate::foreground::RootRef,
+        operation_id: String,
+    },
 }
 
 /// A narrow, owner-bound execution-admission question.
@@ -460,6 +500,12 @@ pub enum ControlResponse {
     /// every reply would otherwise be sized for the biggest one. The frame is
     /// encoded and dropped immediately, so one indirection costs nothing.
     Status(Box<RuntimeStatusSnapshot>),
+    /// The answer to [`ControlRequest::AuthorizeRoot`]: authority for this client to
+    /// bind, and nothing else. It cannot register, renew, or act for another client.
+    RootAuthorized(RootAuthorization),
+    /// The answer to the recovery requests. `None` means the daemon has no record of
+    /// that operation, which is *not* the same as "no recovery happened".
+    RootRecovery(Option<crate::foreground::RecoveryOperationStatus>),
 }
 
 /// A portable description of a bundled daemon artifact, emitted at build time and

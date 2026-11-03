@@ -168,6 +168,93 @@ pub enum AuthorityMessage {
     },
 }
 
+/// One frame on the private guardian <-> daemon authority bridge.
+///
+/// The bridge is bidirectional, and that is not an accident of convenience: the
+/// deadline bound only works if the *daemon* decides when the clock started. So the
+/// daemon asks first ([`Self::Challenge`]), records the instant locally, and only then
+/// accepts an [`AuthorityMessage`] that answers it.
+///
+/// The guardian must never send an `Authority` frame it was not asked for, and the
+/// daemon must never accept one that no challenge covers. A one-way "install" frame
+/// would let a replayed message outlive the lease that justified it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeFrame {
+    /// Guardian -> daemon: "the host wants authority for this root under this
+    /// operation".
+    ///
+    /// Nothing is installed by this frame. It only lets the daemon reserve the root,
+    /// check what it already knows, and *then* issue the [`Self::Challenge`] whose
+    /// issue instant starts the deadline clock. A guardian that instead pushed an
+    /// `Authority` frame first would be choosing its own deadline.
+    Prepare {
+        nonce: String,
+        root_id: String,
+        client_run_id: String,
+        scope_key: String,
+        generation: String,
+        /// The lowest sequence the daemon will accept an answer at. Derived from its
+        /// tombstones, so a revocation that already happened cannot be undone by a
+        /// message the guardian had queued.
+        requested_seq: u64,
+        intent: RootBindIntent,
+        /// Whether the request is for business authority or for the narrower
+        /// recovery-only scope.
+        scope: RootAuthorityScope,
+    },
+    /// Daemon -> guardian: "validate authority for this root under this nonce".
+    ///
+    /// `authority_seq` tells the guardian the lowest sequence it may use; a guardian
+    /// that answers with an older one is refused, which is what keeps a
+    /// post-revocation sequence from being reused.
+    Challenge {
+        nonce: String,
+        root_id: String,
+        authority_seq: u64,
+    },
+    /// Daemon -> guardian: the install was validated and committed in the same step.
+    ///
+    /// This is the only frame that answers "is this root now managed". A guardian that
+    /// treated its own `Authority` send as success would report a binding the daemon
+    /// had refused.
+    Committed {
+        nonce: String,
+        root_id: String,
+        binding_epoch: u64,
+    },
+    /// Daemon -> guardian: the prepare could not proceed, with a wire-safe reason.
+    Denied {
+        nonce: String,
+        root_id: String,
+        code: ForegroundErrorCode,
+    },
+    /// Guardian -> daemon: the ordered authority message answering a challenge.
+    Authority(AuthorityMessage),
+    /// Guardian -> daemon: what it could not do, so the wait ends explicitly.
+    ///
+    /// Without this the daemon's prepare would have to time out to learn that the
+    /// guardian refused, and a refusal would be indistinguishable from a wedged
+    /// guardian.
+    Refused {
+        nonce: String,
+        reason: AuthorityRefusal,
+    },
+}
+
+/// Why the guardian declined to answer a challenge.
+///
+/// Whitelisted phrases only: this crosses a process boundary into a log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityRefusal {
+    /// The guardian serves a different generation or scope than the daemon asks about.
+    WrongGeneration,
+    /// The asking root has no live owner the guardian knows of.
+    NoOwner,
+    /// The guardian could not reach its lease table in time; retry is meaningful.
+    Unavailable,
+}
+
 /// One explicit recovery request for a root whose attempt was settled by mistake.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRequest {

@@ -181,3 +181,101 @@ fn zero_budget_is_expired_not_immediately_usable() {
     assert_eq!(deadline.remaining(), Duration::ZERO);
     assert!(deadline.is_expired());
 }
+
+// ---------------------------------------------------------------------------
+// Foreground root authorization (Task 3)
+// ---------------------------------------------------------------------------
+
+fn bind_intent() -> yi_agent_lifecycle::foreground::RootBindIntent {
+    yi_agent_lifecycle::foreground::RootBindIntent {
+        operation_id: "bind-1".into(),
+        thread_key: "thread:test".into(),
+        workspace: std::path::PathBuf::from("/tmp/workspace"),
+        extra_roots: vec![std::path::PathBuf::from("/tmp/extra")],
+        previous_root_capability: None,
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_authorize_root_round_trips() {
+    // The request and its answer are the whole host->guardian contract; a codec change
+    // that only compiles would strand every frontend on a stale wire shape.
+    let grant = yi_agent_lifecycle::types::ClientGrant {
+        client_run_id: "run-1".into(),
+        credential: "credential".into(),
+        epoch: 7,
+        mode: yi_agent_lifecycle::types::LeaseMode::Business,
+    };
+    let request = ControlRequest::AuthorizeRoot {
+        grant,
+        intent: bind_intent(),
+    };
+    let frame = encode(&request).unwrap();
+    let decoded: ControlRequest = decode(&frame).unwrap();
+    assert_eq!(decoded, request);
+
+    let response = ControlResponse::RootAuthorized(yi_agent_lifecycle::types::RootAuthorization {
+        scope_key: "scope".into(),
+        daemon_instance_id: "daemon".into(),
+        client_run_id: "run-1".into(),
+        root_id: "root-1".into(),
+        capability: "secret".into(),
+    });
+    let frame = encode(&response).unwrap();
+    let decoded: ControlResponse = decode(&frame).unwrap();
+    assert_eq!(decoded, response);
+    // Redaction is part of the contract, not a formatting detail: this frame is
+    // logged on both sides.
+    let rendered = format!("{decoded:?}");
+    assert!(!rendered.contains("secret"), "{rendered}");
+}
+
+#[test]
+fn foreground_root_lifecycle_authority_messages_round_trip() {
+    // The guardian->daemon bridge carries the challenge nonce and the lease window, so
+    // a dropped field would silently turn the deadline bound into "whatever the
+    // receiver's clock says".
+    use yi_agent_lifecycle::foreground::{
+        AuthorityMessage, AuthorityStamp, RootAuthorityScope, RootRef,
+    };
+    let stamp = AuthorityStamp {
+        scope_key: "scope".into(),
+        generation: "gen-1".into(),
+        owner: "run-1".into(),
+        root_id: "root-1".into(),
+        binding_epoch: 4,
+        authority_seq: 9,
+        challenge_nonce: "nonce-1".into(),
+        remaining_lease_ms: 12_345,
+        authority_scope: RootAuthorityScope::Business,
+    };
+    let message = AuthorityMessage::Renew {
+        stamp: stamp.clone(),
+    };
+    let frame = encode(&message).unwrap();
+    let decoded: AuthorityMessage = decode(&frame).unwrap();
+    assert_eq!(decoded, message);
+
+    let authorization = yi_agent_lifecycle::types::RootAuthorization {
+        scope_key: "scope".into(),
+        daemon_instance_id: "daemon".into(),
+        client_run_id: "run-1".into(),
+        root_id: "root-1".into(),
+        capability: "secret".into(),
+    };
+    let message = AuthorityMessage::Install {
+        stamp,
+        authorization,
+    };
+    let frame = encode(&message).unwrap();
+    let decoded: AuthorityMessage = decode(&frame).unwrap();
+    assert_eq!(decoded, message);
+    assert!(!format!("{decoded:?}").contains("secret"));
+
+    let root = RootRef {
+        session_id: "session".into(),
+        root_id: "root-1".into(),
+        attempt_id: "attempt-1".into(),
+    };
+    assert!(!root.root_id.is_empty());
+}

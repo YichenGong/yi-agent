@@ -1145,9 +1145,9 @@ pub struct GuardianDaemon {
 }
 
 pub struct Guardian {
-    scope: RuntimeScope,
+    pub(super) scope: RuntimeScope,
     artifact: ArtifactIdentity,
-    generation: DaemonInstanceId,
+    pub(super) generation: DaemonInstanceId,
     /// The registry, kept alongside the reclaimer's backend.
     ///
     /// The backend is a trait object (`dyn ProcessBackend`) because reclamation only
@@ -1194,6 +1194,20 @@ pub struct Guardian {
     /// would let a release read a lease count that a concurrent registration had
     /// already changed.
     reclaim: super::reclaim::Reclaimer,
+    /// Roots this guardian has vouched for, plus the answers it owes the daemon.
+    ///
+    /// Separate from `reclaim` on purpose: a lease answers "may this client start
+    /// *any* work", while this answers "may this client bind *this* root". The two are
+    /// checked together at authorization time, but they expire and are revoked
+    /// independently.
+    pub(super) root_authority: super::root_authority::RootAuthorityTable,
+    /// The guardian's end of the private authority bridge, once its daemon is up.
+    ///
+    /// A *separate* descriptor from `daemon_lifeline`: the lifeline carries no
+    /// messages, and the bridge carries nothing else. Sharing one would make a
+    /// half-written frame look like a dropped lifeline, i.e. a live daemon reported
+    /// dead.
+    pub(super) bridge: Option<std::os::unix::net::UnixStream>,
 }
 
 impl Guardian {
@@ -1225,6 +1239,8 @@ impl Guardian {
             daemon_lifeline: None,
             switches: None,
             reclaim,
+            root_authority: super::root_authority::RootAuthorityTable::new(),
+            bridge: None,
         }
     }
 
@@ -1961,6 +1977,107 @@ fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeId
     }
 }
 
+/// Answers `ControlRequest::AuthorizeRoot`.
+///
+/// The order is the security property, so it is written once here rather than
+/// duplicated per caller:
+///
+/// 1. the client must hold a live `Business` lease (a `LeaseOnly` observer is refused
+///    with the same shape: the mode never authorizes work);
+/// 2. the root must not already belong to a different live client;
+/// 3. only then is authority minted, and the capability is generated rather than
+///    derived from `intent.thread_key`.
+///
+/// The answer is a *narrow* authorization: it binds one root in one generation and
+/// cannot register, renew, or act for another client.
+fn serve_authorize_root(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    intent: &yi_agent_lifecycle::foreground::RootBindIntent,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    let now = lease_now();
+    // A root id is derived from the operation so a retried prepare resolves to the
+    // same root instead of creating a second one.
+    let root_id = match guardian
+        .roots()
+        .reservation(&intent.operation_id)
+        .map(Ok)
+        .unwrap_or_else(|| Ok(derive_root_id(&guardian.scope.key, &intent.thread_key)))
+    {
+        Ok(root_id) => root_id,
+        Err(error) => {
+            return ControlResponse::Rejected {
+                code: ControlErrorCode::InvalidRequest,
+                reason: error,
+            };
+        }
+    };
+    let existing_owner = guardian
+        .roots()
+        .grant(&root_id)
+        .map(|granted| granted.client_run_id.clone());
+    let scope_key = guardian.scope.key.clone();
+    let generation = guardian.generation.to_string();
+    let request = super::root_authority::AuthorizeRequest {
+        intent,
+        root_id: &root_id,
+        client_run_id: &grant.client_run_id,
+        scope_key: &scope_key,
+        generation: &generation,
+        existing_owner: existing_owner.as_deref(),
+        scope: yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+    };
+    match guardian.authorize_root(grant, &request, now) {
+        Ok(authorization) => ControlResponse::RootAuthorized(authorization),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            ControlResponse::Rejected {
+                code: ControlErrorCode::Unauthenticated,
+                reason: error.to_string(),
+            }
+        }
+        Err(error) => ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Derives the stable root id for a conversation key in a scope.
+///
+/// Deterministic on purpose *for the key*, but the result is only a lookup handle: it
+/// carries no authority, and the capability that does is generated at authorization
+/// time. Two clients naming the same key therefore resolve to the same root, which is
+/// what makes "another client cannot take it over" a check rather than a coincidence.
+fn derive_root_id(scope_key: &str, thread_key: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(scope_key.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(thread_key.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        digest[4],
+        digest[5],
+        digest[6],
+        digest[7],
+        digest[8],
+        digest[9],
+        digest[10],
+        digest[11],
+        digest[12],
+        digest[13],
+        digest[14],
+        digest[15]
+    )
+}
+
 /// Answers `ControlRequest::Preview`.
 ///
 /// Read-only by construction: it takes no maintenance barrier, starts no drain, and
@@ -2031,6 +2148,64 @@ fn serve_preview(
         .previews_mut()
         .preview(grant, context, collected.input, now);
     ControlResponse::Preview(preview)
+}
+
+/// Answers `ControlRequest::PrepareRootRecovery`.
+///
+/// Task 8 implements the freeze/stop/preview transaction. Until then the honest answer
+/// is `Unsupported`: this build must not claim a preview it did not compute, and a
+/// client that sees `Unsupported` knows to stay on the old path rather than waiting for
+/// a token that will never arrive.
+fn serve_prepare_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    _request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    ControlResponse::RootRecovery(None)
+}
+
+/// Answers `ControlRequest::ConfirmRootRecovery`. Behaviour lands in Task 8.
+fn serve_confirm_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    _request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    _token: &yi_agent_lifecycle::foreground::SecretCapability,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    ControlResponse::RootRecovery(None)
+}
+
+/// Answers `ControlRequest::RootRecoveryOperation`. Behaviour lands in Task 8.
+fn serve_root_recovery_operation(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    _root: &yi_agent_lifecycle::foreground::RootRef,
+    _operation_id: &str,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    ControlResponse::RootRecovery(None)
 }
 
 /// Answers `ControlRequest::PreviewPage`: more rows, never a token.
@@ -2370,16 +2545,33 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             // connection (and the shell's explain-why path) unavailable exactly when
             // a frontend is quitting. The answer is therefore the *operation id*;
             // `ReclaimStatus` is how the result is collected.
-            let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
-            match guardian.reclaimer_mut().release(grant, budget) {
-                Ok(operation_id) => {
-                    guardian.reclaimer_mut().expire_results();
-                    ControlResponse::ReleaseStarted { operation_id }
-                }
+            // Root authority is withdrawn *before* the lease goes away. A release
+            // that reclaimed processes while leaving root authority installed would
+            // let the daemon keep admitting work for a client that is leaving; the
+            // sequence issued here is what refuses anything already in flight.
+            match guardian.withdraw_root_authority(&grant.client_run_id) {
+                // A bridge we cannot write to means the daemon may still admit this
+                // client's roots. Reporting the release as completed would hide that.
                 Err(error) => ControlResponse::Rejected {
-                    code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
-                    reason: error.to_string(),
+                    code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
+                    reason: format!(
+                        "root authority could not be withdrawn, so the release was not \
+                         started: {error}"
+                    ),
                 },
+                Ok(_) => {
+                    let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
+                    match guardian.reclaimer_mut().release(grant, budget) {
+                        Ok(operation_id) => {
+                            guardian.reclaimer_mut().expire_results();
+                            ControlResponse::ReleaseStarted { operation_id }
+                        }
+                        Err(error) => ControlResponse::Rejected {
+                            code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                            reason: error.to_string(),
+                        },
+                    }
+                }
             }
         }
         ControlRequest::ReclaimStatus {
@@ -2435,6 +2627,22 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                 }
             }
         }
+        ControlRequest::AuthorizeRoot { grant, intent } => {
+            serve_authorize_root(guardian, &grant, &intent)
+        }
+        ControlRequest::PrepareRootRecovery { grant, request } => {
+            serve_prepare_root_recovery(guardian, &grant, &request)
+        }
+        ControlRequest::ConfirmRootRecovery {
+            grant,
+            request,
+            token,
+        } => serve_confirm_root_recovery(guardian, &grant, &request, &token),
+        ControlRequest::RootRecoveryOperation {
+            grant,
+            root,
+            operation_id,
+        } => serve_root_recovery_operation(guardian, &grant, &root, &operation_id),
         ControlRequest::Preview { grant, target } => serve_preview(guardian, &grant, target),
         ControlRequest::PreviewPage {
             grant,

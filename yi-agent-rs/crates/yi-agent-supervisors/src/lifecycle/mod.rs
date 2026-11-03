@@ -30,6 +30,7 @@ pub mod processes;
 pub mod reclaim;
 pub mod retirement;
 pub mod roles;
+pub mod root_authority;
 pub mod scope;
 pub mod selection;
 pub mod switch;
