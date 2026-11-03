@@ -29,6 +29,7 @@ unset YI_AGENT_THREAD_ID YI_AGENT_SESSION   # tools 的 bash 用例对宿主变�
 | clippy | `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` | 干净 |
 | 前端 | `cd desktop && npx vitest run` | 158 文件 / 2201 passed |
 | 前端类型 | `cd desktop && npx tsc --noEmit` | 通过 |
+| 恢复端到端 | `cargo test -p yi-agent --test e2e_resume` | 4 passed, 0 failed |
 | 前端构建 | `cd desktop && npm run build` | 通过 |
 | 桌面图 | `just desktop-check` | 通过 |
 
