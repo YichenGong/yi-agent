@@ -374,6 +374,69 @@ JSON
     );
 }
 
+/// 受管清单必须**不**按它自己的 `command` 刷新。
+///
+/// # 这条防的是什么
+///
+/// 刷新会执行清单里的 `command`，再把它的自述写回磁盘。对受管插件，这等于
+/// 把"程序路径与 argv 由宿主决定"退回成"插件自己决定"：一份被改过的清单
+/// 只要能让 `command` 跑起来，就能把自己换成任意可执行文件，而且这份自述
+/// 会被持久化成下一轮的启动依据。
+///
+/// 所以断言两件事同时成立：刷新**被跳过**，且磁盘上的清单**逐字节未变**。
+/// 只看返回值不够——实现可以一边返回 `Skipped` 一边仍写盘。
+#[test]
+fn a_managed_manifest_is_not_refreshed_from_its_own_command() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let layout = layout_for(workdir);
+    std::fs::create_dir_all(layout.manifests_dir()).unwrap();
+
+    // "插件"会自述一份**完全不同**的清单。若刷新真的执行了它，磁盘就会变。
+    let liar = workdir.join("liar.sh");
+    std::fs::write(
+        &liar,
+        "#!/bin/sh\nprintf '%s' '{\"name\":\"demo\",\"command\":\"/bin/false\",\"args\":[],\"switch_key\":\"superpowers_kanban\",\"restart_backoff_ms\":50,\"restart_backoff_max_ms\":200}'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&liar).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&liar, perms).unwrap();
+    }
+
+    let path = layout.manifests_dir().join("demo.json");
+    let original = format!(
+        r#"{{"name":"demo","command":"{}","args":["--from","the-release"],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+        liar.display()
+    );
+    std::fs::write(&path, &original).unwrap();
+
+    let outcomes = yi_agent_supervisors::refresh::refresh_from_plugins_except(
+        &layout.manifests_dir(),
+        &["demo".to_string()],
+    );
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [yi_agent_supervisors::refresh::RefreshOutcome::Skipped { name, .. }] if name == "demo"
+        ),
+        "a managed manifest must be skipped, got {outcomes:?}"
+    );
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        after, original,
+        "a managed manifest must not be rewritten from its own description"
+    );
+    assert!(
+        !after.contains("/bin/false"),
+        "the plugin's self-description must never reach the managed manifest"
+    );
+}
+
 #[test]
 fn a_crashed_child_is_restarted_after_the_backoff() {
     let _guard = spawn_serial_guard();

@@ -299,6 +299,21 @@ pub enum IpcRequest {
         #[serde(default)]
         params: serde_json::Value,
     },
+    /// 询问一个插件此刻是否处于维护屏障之下。
+    ///
+    /// # 为什么这不是"通知"而是"重新查一次"
+    ///
+    /// 请求里**没有**"现在该停吗"的字段。结论永远来自磁盘上的生命周期
+    /// 日志，见 [`crate::ipc::MaintenanceBarrier`]。让调用方声明结论等于给它
+    /// 一条绕过屏障的后门：一条伪造的"不用停"就能把后端拉起来。
+    ///
+    /// `protocol` 是发起方支持的维护协议版本。缺失（旧客户端）会被当作
+    /// "不支持"，返回明确的兼容性错误而不是静默放行。
+    PluginMaintenance {
+        plugin: String,
+        #[serde(default)]
+        protocol: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +416,20 @@ pub enum IpcResponse {
     /// A plugin's answer, passed through untouched.
     PluginResult {
         value: serde_json::Value,
+    },
+    /// 一个插件此刻的维护状态。
+    ///
+    /// `state` 是 `open` / `closed` / `unknown` 三者之一。调用方**必须**
+    /// 把 `unknown` 当成"不能启动"：它表示权威记录读不出来，而不是"没有
+    /// 维护"。
+    PluginMaintenanceStatus {
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     TaskEvents {
         events: Vec<IpcEvent>,

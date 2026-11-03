@@ -229,6 +229,130 @@ pub enum Command {
     },
     /// 列出当前目录的会话。
     Threads,
+    /// 受管插件：执行与管理。
+    ///
+    /// 与 `flags` / `resident` 同一条边界：这里不读插件语义，只按签名清单
+    /// 声明的 effect 与注册表里的身份做判断。
+    Plugins {
+        #[command(subcommand)]
+        action: PluginsAction,
+    },
+}
+
+/// `yi-agent plugins` 的子命令。
+///
+/// 两族命令共用一层：`exec` 起进程，其余作用于实例状态。管理命令**不带**
+/// 任何页面/业务权限——它们能改的是"装了什么、授权给谁"，不是"替用户
+/// 在某个项目里干活"。
+#[derive(clap::Subcommand, Debug)]
+pub enum PluginsAction {
+    /// 以受管入口运行插件程序（前台，继承终端）。
+    ///
+    /// `--` 之后原样作为插件 argv 传递，不经过 shell。
+    Exec {
+        /// 插件 id。
+        #[arg(long)]
+        plugin: String,
+        /// 宿主生成的项目句柄。
+        #[arg(long = "project-handle")]
+        project_handle: String,
+        /// 宿主生成的会话绑定文件。不接受页面上传的文件作为授权。
+        #[arg(long = "binding-file")]
+        binding_file: PathBuf,
+        /// 插件 argv，原样透传。
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
+    },
+    /// 查询插件此刻是否处于维护屏障之下。
+    ///
+    /// 结论只来自磁盘上的生命周期日志，**不**来自任何缓存或通知：
+    /// 一条丢失的通知不能变成放行。`unknown` 表示权威记录读不出来，
+    /// 调用方必须把它当成"不能启动"。
+    Maintenance {
+        /// 插件 id。
+        #[arg(long)]
+        plugin: String,
+    },
+    /// 官方发布目录（T16 之前恒为未实现）。
+    Catalog,
+    /// 列出已安装与已授权的状态。
+    List,
+    /// 安装一个发布：`--release`，或本地 `--bundle` + `--metadata`。
+    Install {
+        /// 官方目录里的发布身份。
+        #[arg(long)]
+        release: Option<String>,
+        /// 本地官方签名包。
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// 与包配对的签名元数据。
+        #[arg(long)]
+        metadata: Option<PathBuf>,
+    },
+    /// 首次为某个项目启用。
+    EnableProject {
+        #[arg(long)]
+        plugin: String,
+        /// 项目路径（会被规范化）。
+        #[arg(long)]
+        project: String,
+        /// 能力，可重复：read|write|launch|quota-write|resident。
+        #[arg(long = "capability")]
+        capability: Vec<String>,
+        /// 覆盖宿主身份（测试与多实例诊断用）。
+        #[arg(long = "host-id")]
+        host_id: Option<String>,
+    },
+    /// 变更已有授权（能力集合整体替换，代次递增）。
+    ChangeGrant {
+        #[arg(long)]
+        plugin: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long = "capability")]
+        capability: Vec<String>,
+        #[arg(long = "host-id")]
+        host_id: Option<String>,
+    },
+    /// 停用某个项目（不等于卸载）。
+    DisableProject {
+        #[arg(long)]
+        plugin: String,
+        #[arg(long)]
+        project: String,
+    },
+    /// 激活一个已安装版本（建立事务；推进由 daemon 负责）。
+    Activate {
+        #[arg(long)]
+        plugin: String,
+        #[arg(long)]
+        version: String,
+    },
+    /// 回滚当前打开的事务。
+    Rollback {
+        #[arg(long)]
+        plugin: String,
+    },
+    /// 查询事务进度。
+    Transaction {
+        #[arg(long)]
+        plugin: String,
+    },
+    /// 取消一个尚未提交的事务。
+    CancelTransaction {
+        #[arg(long)]
+        plugin: String,
+    },
+    /// 卸载（默认保留数据）。
+    Uninstall,
+    /// 显式清除数据（独立于卸载）。
+    ClearData,
+    /// 只清引用安全的受管产物。
+    Gc,
+    /// 探测旧安装。
+    InspectLegacy,
+    /// 接管旧安装。
+    AdoptLegacy,
 }
 
 #[derive(clap::Subcommand, Debug)]

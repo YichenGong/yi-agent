@@ -549,11 +549,53 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 G1 受管 CLI；guardian 在 backend 重启期间持有 ProjectOwnership 并尊重 maintenance。所有受管启动先检查 registry、binding、文件完整性及许可，legacy supervisor 的一般逻辑不全局重写。现有 daemon 是独立进程：G2 必须定义维护请求/确认、事务 ID 与代次关联及 IPC 兼容策略，T14 将其接入 store 的实际 dispatcher。daemon 在启动、重连和每次重启决策前读取持久化屏障/恢复状态；RPC 通知丢失不能成为放行理由。旧 daemon 不支持维护协议时阻止激活并提示显式升级/停止，不能把解析错误视为已暂停。
 
-- [ ] Step 1：CLI subprocess 测试删除 PATH 中插件/yi-agent 后，以 `CARGO_BIN_EXE_yi-agent` 绝对路径仍能运行 counter；参数含空格/中文/分号只作为 argv，不被 shell 执行。
-- [ ] Step 2：supervisor 测“暂停维护时不重启”“旧 manifest 自述不得覆盖受管 launcher”“无授权不执行 command”“两个实例不能同时守护同项目”，先红后绿；启动真实 detached daemon，注入维护 IPC 丢包、旧协议拒绝和管理端崩溃，证明不抢跑。
-- [ ] Step 3：接入 launcher 和 guardian，保留宿主控制的 `YI_AGENT_HOME`、binding/代次/配额路径；插件 env 不得覆盖保留变量。健康检查只给候选维护凭据，不开放公共 CLI；CLI enum、dispatch、daemon dispatcher、协议握手及 `--help` 测试一起接线。按 G2 固定的失败窗口、重启次数和退避上限实现熔断，达到阈值关闭新自动任务并显示后端故障；用注入时钟测崩溃循环与手动恢复，不能无限重启或把后端失败显示为空数据。
-- [ ] Step 4：`cd yi-agent-rs && cargo test -p yi-agent --test plugins_exec && cargo test -p yi-agent-supervisors`；额外用真实子进程模拟 launch 后管理进程中断，确认不存在一边 rollback 一边继续启动新服务。
-- [ ] Step 5：按 C 提交 `feat: launch managed plugins through guarded host entrypoints`。
+- [x] Step 1：CLI subprocess 测试删除 PATH 中插件/yi-agent 后，以 `CARGO_BIN_EXE_yi-agent` 绝对路径仍能运行 counter；参数含空格/中文/分号只作为 argv，不被 shell 执行。
+  > 2026-11-03：`crates/yi-agent/tests/plugins_exec.rs` 13 项。`exec_runs_the_counter_with_no_path_at_all`
+  > 用 `env_remove("PATH")` 起真实二进制，证明程序路径来自注册表而非用户环境；
+  > `argv_with_spaces_cjk_and_semicolons_stays_literal` 同时断言内容与长度（只断言"包含"会让
+  > `a b` 拆成两行也通过），并断言 `$(id)` 原样出现——命令替换若被执行就看不到它。
+- [x] Step 2：supervisor 测“暂停维护时不重启”“旧 manifest 自述不得覆盖受管 launcher”“无授权不执行 command”“两个实例不能同时守护同项目”，先红后绿；启动真实 detached daemon，注入维护 IPC 丢包、旧协议拒绝和管理端崩溃，证明不抢跑。
+  > 2026-11-03：`crates/yi-agent-supervisors/tests/managed_launch.rs` 7 项 + `supervisor.rs` 新增 1 项，
+  > 真实签名包 + 真实授权表 + 真实对账循环。夹具里清单的 `command` 指向"篡改版"脚本、
+  > 受管入口指向包内程序，**各留一个标记文件**——只看"进程起来了"分不清这两条路。
+  > 「维护中不重启」= `maintenance_keeps_the_backend_stopped`；「旧 manifest 不得覆盖」=
+  > `a_legacy_manifest_cannot_override_the_managed_launcher`（先证明 fixture 本身能跑清单命令，再证明装配后被替换）；
+  > 「无授权不执行」= `the_guard_itself_refuses_a_launch_without_a_grant`（直接问 `ManagedGuard`，不经监督器——
+  > 监督器层还有"读不到闸门就拒"的兜底，删掉授权检查仍是绿的，等于没钉住）；
+  > 「两实例互斥」= `managed::tests::a_second_instance_cannot_guard_the_same_project`。
+  > 另有 `a_corrupt_journal_stops_a_backend_that_is_already_running` 钉"已在跑的后端必须被停"。
+  > 真实 detached daemon：`crates/yi-agent/tests/plugins_maintenance_daemon.rs` 4 项，
+  > 核心是 `killing_the_managing_side_does_not_open_the_barrier`——开事务 → 确认 closed →
+  > `kill -9` daemon → 重启 → **仍须** closed。变异（daemon 把结论固定成 open）单独打红它。
+- [x] Step 3：接入 launcher 和 guardian，保留宿主控制的 `YI_AGENT_HOME`、binding/代次/配额路径；插件 env 不得覆盖保留变量。健康检查只给候选维护凭据，不开放公共 CLI；CLI enum、dispatch、daemon dispatcher、协议握手及 `--help` 测试一起接线。按 G2 固定的失败窗口、重启次数和退避上限实现熔断，达到阈值关闭新自动任务并显示后端故障；用注入时钟测崩溃循环与手动恢复，不能无限重启或把后端失败显示为空数据。
+  > 2026-11-03：launcher = `supervisors/src/managed.rs`（`ManagedGuard`/`LaunchRequest`/`prepare`），
+  > 装配点 = `Supervisor::with_managed` + `ensure_running` 的闸门前置判断 + `spawn` 经
+  > `managed_command()` 改道。**加固的两处真实缺陷**：
+  > ① 常驻后端没有 CLI verb，原来一律按 `cli` 表查 verb 会拒掉所有后端启动。新增
+  > `LaunchMode::{Cli,Resident}`：前者走清单 verb→effect，后者按协议固定为 `Launch`
+  > （`plugin-host-protocol.md` §5.2：`Launch`/`QuotaWrite`/`Resident` 不要求 backing method）。
+  > 拿常驻 argv 查 verb 会谁也起不来；反过来默认成 `Read` 又会让"只读"授权拉起会写数据的常驻进程。
+  > ② `JournalGate::open` 原先预加载**全部**日志，一份无关的坏日志会让所有插件都不可启动。
+  > 改为 `JournalStore::at`（不预扫）+ 每次 `is_active` 单读本插件。
+  > 熔断/退避/注入时钟见 `managed.rs` 的 `Breaker`/`BACKOFF_STEPS_MS`/`Clock`，8 项单测钉住阈值(5)、
+  > 窗口(10min)、恢复(10min 无崩溃或手动)、退避上限(16s)、`Failed` 不等于空数据。
+  > 保留变量 `RESERVED_ENV` 与 `plugins/contracts/fixtures/host-v1.json` 的 `reservedEnv` 逐字一致，由测试钉住。
+  > **IPC 维护协议**：`yi-agent-store/src/ipc/managed.rs` 定义 `MaintenanceBarrier`/`MaintenanceState`/
+  > `Compatibility`，`protocol.rs` 加 `IpcRequest::PluginMaintenance` 与响应变体，daemon dispatcher 接线。
+  > 三条硬规则各有红例：旧协议明确拒绝并说清升级哪一侧（`an_old_client_is_refused_and_told_which_side_to_upgrade`）；
+  > 坏日志必须 `unknown` 不能 `open`（`an_unreadable_journal_answers_unknown_and_never_open`）；
+  > 判定只来自磁盘（`a_transaction_on_disk_closes_the_barrier_without_any_notification`——**不发通知**、
+  > 只改磁盘，daemon 答复必须改变）。
+  > `refresh.rs` 新增 `refresh_from_plugins_except`：受管清单**不**执行自身 `command`、**不**写盘
+  > （`a_managed_manifest_is_not_refreshed_from_its_own_command`），否则旧快照能把受管入口改写回自报路径。
+  > CLI：`plugins maintenance --plugin <id>`（问 daemon + 读盘双结论，退出码 `open`=0、其余=1）。
+- [x] Step 4：`cd yi-agent-rs && cargo test -p yi-agent --test plugins_exec && cargo test -p yi-agent-supervisors`；额外用真实子进程模拟 launch 后管理进程中断，确认不存在一边 rollback 一边继续启动新服务。
+  > 2026-11-03：`plugins_exec` 13/13、`yi-agent-supervisors` 72+7+24 全绿、
+  > `yi-agent-store` 全量 11 个二进制全绿、`yi-agent-plugins` 全量绿。
+  > `plugins_maintenance_daemon` 4/4（真实 `daemon start` → 真 socket → 真 `kill -9`）。
+  > `cargo fmt --all` 已跑；clippy `--all-targets --all-features` 四个 crate `-D warnings` 干净
+  > （仅剩 html5ever 的既有 future-incompat 提示，非本次引入）。
+- [x] Step 5：按 C 提交 `feat: launch managed plugins through guarded host entrypoints`。
 
 ### Task T15：接入会话、driver、skill 与恢复路径
 

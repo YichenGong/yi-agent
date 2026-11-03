@@ -22,6 +22,15 @@ yi-agent-store = { workspace = true }
 yi-agent-flags = { workspace = true }
 # `daemon` 用 setsid 让子进程脱离会话；`watchman` 读 uid 拼 launchd 域名。
 libc = "0.2"
+# 受管启动/守护：程序路径、激活代次与授权都从插件契约核心解析，
+# 不读监督器清单里的 `command`。
+yi-agent-plugins = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 装配测试要现场打签名包：与 `yi-agent/tests/plugins_exec.rs` 同一套夹具做法。
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"

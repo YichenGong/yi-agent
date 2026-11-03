@@ -51,10 +51,48 @@ pub enum RefreshOutcome {
 ///
 /// 返回每个**可解析**清单的结果。解析失败的文件不在此列：连 `command` 都读不出来，
 /// 也就无从问它是谁（`load_manifests` 已按既有规则 warn 并跳过）。
+///
+/// 受管清单不清单名一律跳过，见 [`refresh_from_plugins_except`]。
 pub fn refresh_from_plugins(dir: &Path) -> Vec<RefreshOutcome> {
+    refresh_from_plugins_except(dir, &[])
+}
+
+/// 同上，但**跳过**受管清单。
+///
+/// # 为什么受管清单必须跳过
+///
+/// 这条路径会执行清单里的 `command`，再把它的自述写回磁盘。对不受管的插件
+/// 这是"插件自己说自己是谁"的正确做法；对受管插件恰好是最该防的：
+///
+/// - 程序路径必须来自注册表与激活记录，不能来自上一份快照里的绝对路径。
+///   插件升级后旧路径指向的可能是任意文件（或已被删除后被同名顶替）。
+/// - 自述能改 `args`，而受管启动的 argv 由宿主装配。让它改等于把
+///   "宿主决定启动什么"退回成"插件自己决定"。
+/// - 执行 `command` 本身就绕过了完整性检查：被篡改的二进制会在这里先跑一遍。
+///
+/// 所以受管清单的刷新来源只能是安装包内那份签名清单（`managed::resolve`
+/// 每次启动都会读它），**不是**清单自称的 `command`。
+pub fn refresh_from_plugins_except(dir: &Path, managed: &[String]) -> Vec<RefreshOutcome> {
     load_manifests(dir)
         .into_iter()
-        .map(|stored| refresh_one(dir, &stored))
+        .map(|stored| {
+            if managed.iter().any(|name| name == &stored.name) {
+                // 不执行、不写盘。留一条 warn 让排查时能看出"为什么这份清单
+                // 没有跟着升级":否则用户会以为刷新坏了。
+                tracing::debug!(
+                    plugin = %stored.name,
+                    "skipping manifest refresh: this plugin is managed, so its manifest \
+                     comes from the signed release, not from the plugin's own command"
+                );
+                return RefreshOutcome::Skipped {
+                    name: stored.name.clone(),
+                    reason: "managed plugins do not refresh from their own `command`; \
+                             the signed release manifest is authoritative"
+                        .to_string(),
+                };
+            }
+            refresh_one(dir, &stored)
+        })
         .collect()
 }
 

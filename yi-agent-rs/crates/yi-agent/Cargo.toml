@@ -24,6 +24,7 @@ yi-agent-app-server = { workspace = true }
 yi-agent-relay = { workspace = true }
 yi-agent-subagent = { workspace = true }
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
+yi-agent-plugins = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -60,6 +61,13 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试现场打一个签名包：清单与元数据的编码规则复用生产实现，
+# 不在这里手抄一份（两份规则分叉正是签名验证被绕过的形状）。
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
 serde_json = { workspace = true }
 libc = "0.2"
 proptest = { workspace = true }

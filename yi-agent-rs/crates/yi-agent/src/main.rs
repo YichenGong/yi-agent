@@ -6,6 +6,7 @@ mod control_commands;
 mod flags_cmd;
 mod llm_prefix;
 mod onboarding_prompt;
+mod plugins_cmd;
 mod resume;
 mod schedule_intent;
 mod session_store;
@@ -97,6 +98,14 @@ fn main() -> Result<()> {
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
         Some(Command::Flags { ref action }) => run_flags(action),
+        Some(Command::Plugins { ref action }) => {
+            // `exec` 是前台命令，退出码就是插件进程的退出码。
+            let code = plugins_cmd::run(action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {

@@ -5182,10 +5182,13 @@ version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "clap_complete",
  "crossterm",
  "dirs",
+ "ed25519-dalek",
+ "flate2",
  "futures",
  "libc",
  "proptest",
@@ -5195,7 +5198,9 @@ dependencies = [
  "regex 1.13.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "syntect",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -5212,6 +5217,7 @@ dependencies = [
  "yi-agent-core",
  "yi-agent-flags",
  "yi-agent-mcp",
+ "yi-agent-plugins",
  "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-store",
@@ -5423,6 +5429,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yi-agent-core",
+ "yi-agent-plugins",
 ]
 
 [[package]]
@@ -5450,14 +5457,19 @@ dependencies = [
 name = "yi-agent-supervisors"
 version = "0.1.13"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tracing",
  "yi-agent-flags",
+ "yi-agent-plugins",
  "yi-agent-store",
 ]
 

@@ -242,6 +242,58 @@ pub fn validate_entry_name(name: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// 只读一个包内文件，供"安装前先看清单"这类调用。
+///
+/// 走的是与解包**同一套**遍历与路径校验：另写一份 tar 读取器会让
+/// "宿主读到的名字"与"安装落盘的名字"在某个边界条件上分叉，而那个分叉
+/// 正好是路径穿越能钻过去的缝。
+///
+/// 大小上限由调用方给出；超过即拒绝而不是截断——截断的清单会解析成一棵
+/// 缺字段的树，错误会出现在很远的地方。
+pub fn read_package_file(
+    archive: &[u8],
+    wanted: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, PluginError> {
+    validate_entry_name(wanted)?;
+    let mut found: Option<Vec<u8>> = None;
+    walk_archive(archive, |name, kind, size, reader| {
+        validate_entry_name(&name)?;
+        if name != wanted {
+            return Ok(());
+        }
+        if !matches!(kind, EntryKind::File(_)) {
+            return Err(PluginError::Integrity(format!(
+                "`{wanted}` is not a regular file in the archive"
+            )));
+        }
+        if size > max_bytes {
+            return Err(PluginError::Integrity(format!(
+                "`{wanted}` is {size} bytes, above the {max_bytes} byte limit for a manifest"
+            )));
+        }
+        let Some(reader) = reader else {
+            return Err(PluginError::Integrity(format!(
+                "`{wanted}` yielded no content stream"
+            )));
+        };
+        let mut buffer = Vec::new();
+        reader
+            .read_to_end(&mut buffer)
+            .map_err(|e| PluginError::Integrity(format!("could not read `{wanted}`: {e}")))?;
+        if buffer.len() as u64 != size {
+            return Err(PluginError::Integrity(format!(
+                "`{wanted}` declared {size} bytes but yielded {}",
+                buffer.len()
+            )));
+        }
+        found = Some(buffer);
+        Ok(())
+    })?;
+    found
+        .ok_or_else(|| PluginError::Integrity(format!("the package has no `{wanted}` at its root")))
+}
+
 /// 第二遍：写文件。
 fn write_plan(
     archive: &[u8],

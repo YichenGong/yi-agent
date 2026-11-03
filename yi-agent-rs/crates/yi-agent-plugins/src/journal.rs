@@ -390,10 +390,24 @@ pub struct JournalStore {
 
 impl JournalStore {
     /// 打开并**校验**所有已有日志。坏日志显式报错，不当成"没有事务"。
+    ///
+    /// 适合"启动时先恢复再放行"的路径：任何一份坏日志都该挡住整个宿主，
+    /// 因为那说明上次有人在写到一半时被打断。
     pub fn open(home: impl Into<PathBuf>) -> Result<JournalStore, PluginError> {
         let store = JournalStore { home: home.into() };
         store.load_all()?;
         Ok(store)
+    }
+
+    /// 只定位目录，不预读任何日志。
+    ///
+    /// 给"每次决策单独查一个插件"的调用方用（维护闸门）。两处语义不同：
+    /// [`JournalStore::open`] 的失败粒度是**整个实例**，而闸门只需要关心
+    /// **当前这个插件**——别的插件日志坏了不该让本插件也启动不了，否则一份
+    /// 无关的坏文件就能让所有插件永久停摆，那比它想防的问题更糟。
+    /// 损坏仍会经由 [`JournalStore::load`] 报 `RecoveryRequired`。
+    pub fn at(home: impl Into<PathBuf>) -> JournalStore {
+        JournalStore { home: home.into() }
     }
 
     fn dir(&self) -> PathBuf {
