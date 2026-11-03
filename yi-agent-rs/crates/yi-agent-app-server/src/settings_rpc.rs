@@ -50,10 +50,21 @@ fn current_value(current: &settings::Settings, spec: &FieldSpec) -> Value {
         "agent.max_resident_subagents" => option_to_json(current.agent.max_resident_subagents),
         "agent.system_prompt" => option_to_json(current.agent.system_prompt.as_deref()),
         "agent.skills_catalog_budget" => option_to_json(current.agent.skills_catalog_budget),
+        settings::PREVENT_IDLE_SLEEP_KEY => {
+            option_to_json(current.power.prevent_idle_sleep.as_deref())
+        }
+        "power.idle_grace_minutes" => option_to_json(current.power.idle_grace_minutes),
+        "power.remote_touch_minutes" => option_to_json(current.power.remote_touch_minutes),
         "compact.ratio" => option_to_json(current.compact.ratio),
         "compact.user_budget_tokens" => option_to_json(current.compact.user_budget_tokens),
         "compact.tool_budget_tokens" => option_to_json(current.compact.tool_budget_tokens),
         "startup.sandbox" => option_to_json(current.startup.sandbox.as_deref()),
+        "tui.notifications" => option_to_json(current.tui.notifications.as_deref()),
+        "tui.notification_method" => option_to_json(current.tui.notification_method.as_deref()),
+        "tui.notification_condition" => {
+            option_to_json(current.tui.notification_condition.as_deref())
+        }
+        "tui.terminal_title" => option_to_json(current.tui.terminal_title.as_deref()),
         // `FIELDS` 与这里的 match 必须同步。漏一个就会静默返回 null，
         // 故有一条测试遍历 FIELDS 断言每个键都能取到值。
         _ => Value::Null,

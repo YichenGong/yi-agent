@@ -48,6 +48,35 @@ describe("GitDiffView", () => {
     expect(screen.getByText("a.txt")).toBeTruthy();
   });
 
+  /**
+   * 提交时间同样不能编造。
+   *
+   * 这里原先自带一份秒级 `relativeTime`：`Math.max(0, now - ts) / 86400`。
+   * 时间戳缺失（0）会算出 20758 天前——正是用户报的那个「20xxxd」形状，
+   * 只是换了个组件；NaN 更糟，直接渲染成「NaN 天前」。改用共享的
+   * `formatRelativeTime` 后与其他两处同源。
+   */
+  it("does not invent a day count when a commit timestamp is missing", () => {
+    const broken = {
+      ...diff,
+      commits: [{ ...diff.commits[0], timestamp: 0 }],
+    };
+    render(<GitDiffView {...baseProps} diff={broken} />);
+    const body = document.body.textContent ?? "";
+    expect(body).not.toMatch(/\d{3,}d/);
+    expect(body).not.toContain("20758");
+    expect(body).not.toContain("NaN");
+  });
+
+  it("does not render NaN for a non-numeric commit timestamp", () => {
+    const broken = {
+      ...diff,
+      commits: [{ ...diff.commits[0], timestamp: Number.NaN }],
+    };
+    render(<GitDiffView {...baseProps} diff={broken} />);
+    expect(document.body.textContent ?? "").not.toContain("NaN");
+  });
+
   it("renders hunks by default and collapses them on click", () => {
     render(<GitDiffView {...baseProps} diff={diff} />);
     // a.txt 是第 0 个文件，落在 DEFAULT_EXPANDED（=3）内，默认应已展开。

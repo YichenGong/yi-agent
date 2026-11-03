@@ -7,8 +7,25 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use yi_agent_subagent::thread_root::ThreadRoot;
+
+/// Budget for "wait until the spawned child has done something observable".
+///
+/// A wide safety net, not a guess about scheduling speed. Every other wait in
+/// this file already uses 10s; this one used a fixed 5s, which encoded the
+/// assumption that a shell child starts and writes its marker within 5s. Under
+/// `nextest --workspace` the machine is saturated by every other test binary at
+/// once and that assumption is false — measured on an 18-core host, the
+/// supervisor test in this file failed 3 of 9 full-workspace runs with the
+/// marker simply absent (the child had been spawned; it had not yet run).
+///
+/// 20s matches `CHILD_START_BUDGET` in `yi-agent-supervisors/tests/supervisor.rs`
+/// so the two files no longer disagree about what "slow" means. The wait is a
+/// condition poll, so a genuine bug (a child that never starts) still trips the
+/// deadline instead of being masked.
+const CHILD_START_BUDGET: Duration = Duration::from_secs(20);
 
 fn init_git_repo(dir: &Path) {
     for args in [
@@ -51,6 +68,10 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: true,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }
 
@@ -540,7 +561,7 @@ fn arm_plugin(repo: &Path, marker: &Path) -> std::path::PathBuf {
 /// 且 daemon 的转发表里出现它的路由。
 #[test]
 fn a_process_that_owns_the_daemon_supervises_its_plugins() {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let repo = tempfile::TempDir::new().unwrap();
     let runtime_dir = tempfile::TempDir::new().unwrap();
     init_git_repo(repo.path());
@@ -564,8 +585,9 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
         "this test needs the process to own the daemon"
     );
 
-    // 子进程被拉起（监督循环 500ms 一轮，给足余量）。
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 子进程被拉起（监督循环 500ms 一轮）。预算见 CHILD_START_BUDGET：
+    // 这里是条件轮询，宽预算只吸收调度延迟，不会掩盖「永远起不来」的真实缺陷。
+    let deadline = Instant::now() + CHILD_START_BUDGET;
     let mut started = false;
     while Instant::now() < deadline {
         if marker.exists() {
@@ -580,7 +602,7 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
     );
 
     // 且它可被路由：转发表里出现 demo（清单声明了 query_socket）。
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + CHILD_START_BUDGET;
     let mut routable = false;
     while Instant::now() < deadline {
         if yi_agent_store::ipc::plugin_socket_for(runtime_dir.path(), "demo").is_some() {
@@ -1193,5 +1215,128 @@ async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
         child_count(&root),
         0,
         "the spawn must NOT have been replayed: no child may exist under the new root"
+    );
+}
+
+/// 启动瞬间的竞态: 别人正在起 daemon(socket 还没 bind)时, attach 必须等。
+///
+/// 真实形状(2026-11-01 desktop 冷启动): `daemon serve` 先拿到了实例锁,
+/// 而 `app-server` 在同一毫秒 probe 得 `Dead`(socket 文件还没建), 走
+/// `AlreadyRunning` 分支后立刻 `connect`, 撞上 ENOENT; 这条失败被永久缓存,
+/// 于是**整个 app-server 进程**后续所有会话都没有 `spawn_agent`。
+///
+/// 这里用 flock 精确复现那个窗口: 测试先像"刚启动的 daemon"一样占住实例锁,
+/// 200ms 后才真正 bind。修复前 `ensure_owned_runtime` 直接以
+/// `attach: No such file or directory` 失败; 修复后必须等它出现并 join。
+fn hold_instance_lock(path: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .expect("the instance lock file must open");
+    let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        outcome,
+        0,
+        "the test must be able to take the instance lock: {}",
+        std::io::Error::last_os_error()
+    );
+    file
+}
+
+#[test]
+fn a_socket_that_appears_just_after_the_probe_is_waited_for() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+    let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
+
+    // 尚未 bind, 但实例锁已被占: 这正是 `daemon serve` 启动中的样子。
+    let lock = hold_instance_lock(&runtime.path().join("runtime.lock"));
+    assert!(
+        !socket.exists(),
+        "precondition: the peer has not bound its socket yet"
+    );
+
+    let late = {
+        let socket = socket.clone();
+        let database = runtime.path().join("runtime.sqlite");
+        let factory =
+            yi_agent_subagent::attach::worker_factory(&cfg, socket, &models).expect("factory");
+        let runtime_dir = runtime.path().to_path_buf();
+        std::thread::spawn(move || {
+            // 让调用方先进入 `AlreadyRunning` + ENOENT 的那条路径。
+            std::thread::sleep(Duration::from_millis(200));
+            // 交棒: 释放锁后由真正的 daemon 重新持有并 bind。
+            drop(lock);
+            yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
+                .expect("the late daemon must start")
+        })
+    };
+
+    let attached = yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a socket that appears during the start window must be joined, not failed");
+
+    assert!(
+        attached.embedded_daemon.is_none(),
+        "the peer owns the runtime; this process must join it, not steal it"
+    );
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "the joined runtime must actually answer"
+    );
+
+    drop(attached);
+    drop(late.join().expect("the late daemon thread must not panic"));
+}
+
+/// 重试必须有界: 对端拿了锁却永远不 bind 时, `ensure_owned_runtime` 必须
+/// 在预算耗尽后**失败**, 而不是挂住桌面进程或无限重试。
+///
+/// 上限取 `PEER_START_TIMEOUT`(10s)加一点余量: 断言的是「它确实会停下来」,
+/// 不是「它停得多快」——后者由实现细节决定,钉住只会让用例变脆。
+#[test]
+fn a_peer_that_never_binds_fails_instead_of_retrying_forever() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    // 拿住实例锁再也不放: 对面永远停在「正在启动」。
+    let _lock = hold_instance_lock(&runtime.path().join("runtime.lock"));
+
+    let started = std::time::Instant::now();
+    let failure = match yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    ) {
+        Ok(_) => panic!("a peer that never binds must not be attached"),
+        Err(failure) => failure,
+    };
+    let waited = started.elapsed();
+
+    assert_eq!(failure.stage, "attach");
+    assert!(
+        failure.retryable,
+        "the failure is still about timing, so callers must not cache it: {failure}"
+    );
+    assert!(
+        waited >= Duration::from_secs(10),
+        "the retry budget must be spent before giving up, waited {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "giving up must be bounded, waited {waited:?}"
     );
 }

@@ -2,8 +2,8 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -16,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use yi_agent_core::AgentEvent;
+use yi_agent_core::{AgentEvent, DoneReason};
 
 use super::bash_popup::{BashPopup, ConfirmKill, DetailPopup, ListPopup};
 use super::cell::HistoryCell;
@@ -103,6 +103,35 @@ impl TuiChannels {
     }
 }
 
+/// 终端清理段。
+///
+/// 抽出来是为了让「标题还原发生在最后一步之后」可被测试断言。`step` 是
+/// 可注入的执行器：生产传入真实 crossterm 调用，测试传入记录器。
+///
+/// 标题还原刻意**不**参与 `cleanup_error`：`TitleHandle::clear` 返回 `()`，
+/// 签名层面就进不来。否则上百种不支持 OSC 2 的终端会在每次正常退出时
+/// 返回非零，被 `set -e` / CI 脚本当成崩溃。
+fn run_cleanup_with<F>(mut step: F, title: &mut crate::tui::title::TitleHandle) -> Option<io::Error>
+where
+    F: FnMut(&str) -> io::Result<()>,
+{
+    let mut cleanup_error: Option<io::Error> = None;
+    for name in [
+        "DisableBracketedPaste",
+        "DisableFocusChange",
+        "disable_raw_mode",
+        "LeaveAlternateScreen",
+    ] {
+        if let Err(error) = step(name) {
+            cleanup_error.get_or_insert(error);
+        }
+    }
+    // 必须在 `LeaveAlternateScreen` 之后：alternate screen 关闭时多数终端
+    // 会重置标题，先写空串等于白写。
+    title.clear();
+    cleanup_error
+}
+
 /// Run the ratatui TUI main loop with the real terminal.
 ///
 /// - `agent_rx`: receives agent events to display in history
@@ -126,8 +155,10 @@ pub fn run_tui(
     process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
     workdir: std::path::PathBuf,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
-    config: TuiConfigSnapshot,
+    mut config: TuiConfigSnapshot,
     catalog: yi_agent_runtime::models::ModelCatalog,
+    // resume 时的历史回放。空 vec 等价于全新会话。
+    replay_cells: Vec<crate::tui::cell::HistoryCell>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     // Detect the terminal background BEFORE the alternate screen takes over:
@@ -136,10 +167,33 @@ pub fn run_tui(
     let theme = TuiTheme::of(crate::tui::theme::detect_theme_from_terminal());
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+
+    // 焦点事件让 `unfocused` 条件才有意义。老 conhost 不支持这个序列，
+    // 失败不致命：Windows 上退化成 always（宁可多响，不静默），其它平台
+    // 只在日志里留痕。
+    let focus_degraded = match execute!(stdout, EnableFocusChange) {
+        Ok(()) => false,
+        Err(error) => {
+            if cfg!(windows) {
+                tracing::info!(error = %error, "focus tracking unavailable; notifications will always fire");
+                true
+            } else {
+                tracing::debug!(error = %error, "focus tracking unavailable");
+                false
+            }
+        }
+    };
+    config.focus_degraded = focus_degraded;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut history = HistoryState::with_theme(theme);
+    // resume 时把历史摊平成 cells。不注入的话上下文是对的但屏幕是空的，
+    // 用户会以为历史丢了。裁剪交给既有 `push` 里的 `enforce_history_cap`，
+    // 不新写裁剪逻辑。
+    for cell in replay_cells {
+        history.push(cell, terminal.size()?.width);
+    }
     let mut input = InputLine::new();
 
     let channels = TuiChannels {
@@ -149,6 +203,13 @@ pub fn run_tui(
         control: control_tx,
         decision: decision_tx,
     };
+
+    // 标题：必须在 `workdir` 被 move 进 `run_loop` 之前取项目名。
+    let mut title = crate::tui::title::TitleHandle::new(
+        config.terminal_title,
+        crate::tui::notify::is_multiplexed(&crate::tui::notify::TerminalEnv::from_process()),
+        &workdir,
+    );
 
     let result = run_loop(
         &mut terminal,
@@ -167,19 +228,19 @@ pub fn run_tui(
         &config,
         &catalog,
         theme,
+        &mut title,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
-    let mut cleanup_error: Option<io::Error> = None;
-    if let Err(error) = execute!(terminal.backend_mut(), DisableBracketedPaste) {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = disable_raw_mode() {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
-        cleanup_error.get_or_insert(error);
-    }
+    let cleanup_error = run_cleanup_with(
+        |name| match name {
+            "DisableBracketedPaste" => execute!(terminal.backend_mut(), DisableBracketedPaste),
+            "DisableFocusChange" => execute!(terminal.backend_mut(), DisableFocusChange),
+            "disable_raw_mode" => disable_raw_mode(),
+            _ => execute!(terminal.backend_mut(), LeaveAlternateScreen),
+        },
+        &mut title,
+    );
 
     // Report the dropped count only after the alternate screen is gone;
     // printing earlier would be erased along with it.
@@ -195,6 +256,107 @@ pub fn run_tui(
 }
 
 /// Event source trait so the loop can be tested with fake events.
+/// 焦点事件 → 原子标志。
+fn apply_focus_event(event: &Event, focused: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    match event {
+        Event::FocusGained => focused.store(true, Ordering::Relaxed),
+        Event::FocusLost => focused.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+/// 当前是否应当发送通知。`focused` 为真表示窗口在前台。
+fn should_notify(condition: crate::tui::notify::Condition, focused: bool) -> bool {
+    match condition {
+        crate::tui::notify::Condition::Always => true,
+        crate::tui::notify::Condition::Unfocused => !focused,
+    }
+}
+
+/// 待发通知。优先级数字小的压过数字大的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NotificationPriority {
+    TurnComplete = 0,
+    ApprovalRequested = 1,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNotification {
+    priority: NotificationPriority,
+    text: String,
+}
+
+/// 把 `AgentEvent` 收敛成「至多一条待发通知」。
+///
+/// 不直接写字节：通知必须等这一帧画完再发，否则会插进 ANSI 序列中间，
+/// 把一帧切开造成渲染残影。
+#[derive(Debug, Default)]
+struct NotificationState {
+    pending: Option<PendingNotification>,
+}
+
+impl NotificationState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 观察一个事件，可能更新候选通知。
+    ///
+    /// `enabled` 为假时什么都不做；`history` 用于取回合正文（`Done` 不带
+    /// 正文），必须在 `push_event` **之前**调用——`push_event` 会在末尾压
+    /// 一条 `Separator`，`last_assistant_text` 也就还能跳过它找到正文。
+    fn observe(&mut self, event: &AgentEvent, history: &HistoryState, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        let candidate = match event {
+            AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            } => Some(PendingNotification {
+                priority: NotificationPriority::TurnComplete,
+                text: history
+                    .last_assistant_text()
+                    .map(crate::tui::notify::text::summarize)
+                    .unwrap_or_else(|| crate::tui::notify::text::EMPTY_FALLBACK.to_string()),
+            }),
+            AgentEvent::PermissionRequest {
+                tool_name,
+                tool_input,
+                ..
+            } => Some(PendingNotification {
+                priority: NotificationPriority::ApprovalRequested,
+                text: format!(
+                    "等待批准: {}",
+                    crate::tui::notify::text::truncate_graphemes(
+                        &crate::tui::history::permission_summary(tool_name, tool_input),
+                        crate::tui::notify::text::MAX_GRAPHEMES,
+                    )
+                ),
+            }),
+            _ => None,
+        };
+
+        let Some(candidate) = candidate else { return };
+        match &self.pending {
+            // 同优先级或更高优先级的已有候选不被覆盖：一轮里先到的权限
+            // 请求不该被随后的回合完成盖掉。
+            Some(existing) if existing.priority >= candidate.priority => {}
+            _ => self.pending = Some(candidate),
+        }
+    }
+
+    /// 取出并清空。绘制完成后调用。
+    fn take(&mut self) -> Option<PendingNotification> {
+        self.pending.take()
+    }
+
+    #[cfg(test)]
+    fn pending_text(&self) -> Option<&str> {
+        self.pending.as_ref().map(|p| p.text.as_str())
+    }
+}
+
 pub trait EventSource {
     /// Poll for an event, waiting up to `timeout`. Returns `Ok(None)` on timeout.
     fn poll(&self, timeout: Duration) -> std::io::Result<Option<Event>>;
@@ -229,6 +391,13 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
         mcp_master: true,
         runtime_preference: "ask".into(),
         runtime_preference_path: std::path::PathBuf::from("/tmp/proj/.yi-agent/preferences.json"),
+        notifications: true,
+        notification_method: "auto".into(),
+        notification_condition: "unfocused".into(),
+        effective_backend: "bel".into(),
+        terminal_title: true,
+        title_status: "on".into(),
+        focus_degraded: false,
     }
 }
 
@@ -265,6 +434,7 @@ pub fn run_tui_with_backend<B: Backend>(
         control: control_tx.clone(),
         decision: decision_tx.clone(),
     };
+    let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
         terminal,
         agent_rx,
@@ -282,6 +452,7 @@ pub fn run_tui_with_backend<B: Backend>(
         &snapshot_for_tests(),
         &catalog_for_tests(),
         TuiTheme::DARK,
+        &mut title,
     )
     .map(|_dropped| ())
 }
@@ -349,6 +520,7 @@ pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
         control: control_tx.clone(),
         decision: decision_tx.clone(),
     };
+    let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
         terminal,
         agent_rx,
@@ -366,6 +538,7 @@ pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
         config,
         catalog,
         theme,
+        &mut title,
     )
     .map(|_dropped| ())
 }
@@ -426,6 +599,7 @@ fn run_loop<B: Backend, E: EventSource>(
     config: &TuiConfigSnapshot,
     catalog: &yi_agent_runtime::models::ModelCatalog,
     theme: TuiTheme,
+    title: &mut crate::tui::title::TitleHandle,
 ) -> std::io::Result<usize> {
     let mut current_model: String = model.to_string();
     // 用户选中的清单**显示名**（`/model <name>` 下发后记下，`/model default` 清空）。
@@ -468,6 +642,29 @@ fn run_loop<B: Backend, E: EventSource>(
     // Keep the rendered viewport location so geometry that changes between
     // frames (such as a resize or newly queued preview) has an old-width anchor.
     let mut previous_viewport: Option<(ViewportAnchor, u16, u16)> = None;
+
+    // 终端通知：候选在这里攒着，等这一帧画完再 flush（见下面 `notifications.take()`）。
+    let mut notifications = NotificationState::new();
+    let notifications_enabled = config.notifications;
+    let focused = std::sync::atomic::AtomicBool::new(true);
+    let mut notifier = {
+        let method = crate::tui::notify::Method::parse(&config.notification_method)
+            .unwrap_or(crate::tui::notify::Method::Auto);
+        let condition = crate::tui::notify::Condition::parse(&config.notification_condition)
+            .unwrap_or(crate::tui::notify::Condition::Unfocused);
+        // 终端拒绝了焦点事件时 `unfocused` 无从判定，按 always 处理：
+        // 宁可多弹一次，也不要静默到用户以为功能坏了。
+        let condition = if config.focus_degraded {
+            crate::tui::notify::Condition::Always
+        } else {
+            condition
+        };
+        crate::tui::notify::Notifier::new(
+            method,
+            condition,
+            &crate::tui::notify::TerminalEnv::from_process(),
+        )
+    };
 
     loop {
         let size = terminal.size()?;
@@ -565,6 +762,9 @@ fn run_loop<B: Backend, E: EventSource>(
             if let AgentEvent::ModelChanged { model: new_model } = &event {
                 current_model = new_model.clone();
             }
+            // 必须在 `push_event` 之前：`Done` 不带正文，只能从 history 反查，
+            // 而 `push_event` 会立刻压一条 `Separator`。
+            notifications.observe(&event, history, notifications_enabled);
             history.push_event(event, draw_text_width);
             // 回合结束:弹出下一条待发消息,立即发送并「转正」进 history。
             // 发送与转正是同一个动作,不再依赖 driver 是否取走。
@@ -664,8 +864,9 @@ fn run_loop<B: Backend, E: EventSource>(
                 f.render_widget(Paragraph::new(queued_lines.clone()), chunks[3]);
             }
 
-            let input_line = build_input_line_with(input, pending_quit, chunks[5].width, theme);
-            f.render_widget(input_line, chunks[5]);
+            let input_line =
+                build_input_line_with(input, pending_quit, chunks[INPUT_CHUNK].width, theme);
+            f.render_widget(input_line, chunks[INPUT_CHUNK]);
 
             if let Some(crate::tui::subagents::RuntimeStartupIntent::Prompt) = &runtime_intent {
                 let box_w = 58u16.min(chunks[0].width.saturating_sub(4));
@@ -705,6 +906,19 @@ fn run_loop<B: Backend, E: EventSource>(
                 theme,
             );
         })?;
+
+        // 通知只在两帧之间发：插在帧中间会把 ANSI 序列切断，留下渲染残影。
+        if let Some(pending) = notifications.take() {
+            let is_focused = focused.load(std::sync::atomic::Ordering::Relaxed);
+            if should_notify(notifier.condition(), is_focused) {
+                let _ = notifier.notify(&pending.text);
+            }
+        }
+
+        // 标题跟随运行态。值没变就不写（`TitleHandle` 内部 diff），所以每帧
+        // 调用是安全的：一次会话只在状态翻转点真正写字节。
+        title.sync(is_running.load(std::sync::atomic::Ordering::SeqCst));
+
         sync_trace_streams(
             &mut trace_streams,
             &mut runtime_popup,
@@ -714,6 +928,9 @@ fn run_loop<B: Backend, E: EventSource>(
 
         // Poll for events with timeout (33ms → ~30hz refresh)
         match events.poll(Duration::from_millis(33))? {
+            Some(event @ (Event::FocusGained | Event::FocusLost)) => {
+                apply_focus_event(&event, &focused);
+            }
             Some(Event::Key(key)) => {
                 // Ctrl+P opens the runtime popup (bash tasks tab) when no popup
                 // is active. Tab then switches to the managed-processes tab.
@@ -2669,7 +2886,12 @@ fn execute_slash_command(
                     width,
                 );
             } else {
-                let text = config.render(current_model);
+                let mut text = config.render(current_model);
+                if config.focus_degraded && config.notification_condition == "unfocused" {
+                    text.push_str(
+                        "\n  注意: 本终端不支持焦点事件，notify condition 已从 unfocused 退化为 always",
+                    );
+                }
                 history.push(HistoryCell::Markdown { text }, width);
             }
             KeyOutcome::None
@@ -3575,13 +3797,16 @@ fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("命令"))
 }
 
-/// The input stripe, painted for `theme`.
+/// The input card, painted for `theme`.
 ///
-/// The stripe used a hardcoded `Indexed(240)`, which is a dark gray band on a
-/// light terminal; it now asks the theme for its raised surface instead. The
-/// foreground is explicit too: `bg_raised` is light in the light theme, so
-/// leaving text at the terminal default would paint dark-terminal light text
-/// onto `#ededed` when a dark terminal is forced to `YI_AGENT_THEME=light`.
+/// The card is a contiguous band of `input_bg` three or more rows tall: one
+/// blank padding row, the input itself (one or more rows), and one blank
+/// padding row. The padding rows carry no characters, so selecting only the
+/// middle row with the terminal's native selection copies clean text.
+///
+/// The foreground is explicit because `input_bg` is a fixed gray in both
+/// themes: leaving text at the terminal default would be unreadable when a
+/// dark terminal is forced to `YI_AGENT_THEME=light` and vice versa.
 fn build_input_line_with(
     input: &InputLine,
     pending_quit: bool,
@@ -3593,27 +3818,39 @@ fn build_input_line_with(
         Style::new().add_modifier(Modifier::BOLD | Modifier::DIM),
     );
     if pending_quit {
-        return Paragraph::new(Line::from(vec![
-            prefix,
-            Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
+        // Ride the same three-row card: collapsing to one row would make the
+        // whole frame jump on Ctrl+C.
+        return Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(vec![
+                prefix,
+                Span::styled("再按 Ctrl+C 退出", Style::new().fg(theme.warn)),
+            ]),
+            Line::from(""),
         ]))
-        .style(Style::new().bg(theme.bg_raised).fg(theme.fg));
+        .style(Style::new().bg(theme.input_bg).fg(theme.fg));
     }
     let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width);
-    Paragraph::new(Text::from(lines)).style(Style::new().bg(theme.bg_raised).fg(theme.fg))
+    let mut padded = Vec::with_capacity(lines.len() + 2);
+    padded.push(Line::from(""));
+    padded.extend(lines);
+    padded.push(Line::from(""));
+    Paragraph::new(Text::from(padded)).style(Style::new().bg(theme.input_bg).fg(theme.fg))
 }
 
-/// Number of terminal lines the input will occupy when rendered.
+/// Number of terminal lines the input card occupies, including its two padding
+/// rows.
 fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) -> u16 {
     if pending_quit {
-        return 1;
+        return INPUT_CARD_PADDING * 2 + 1;
     }
-    // Derive the height from the exact same wrapping the renderer uses. The
-    // previous `div_ceil(width)` estimate was wrong for explicit newlines and
-    // for per-character wrapping, and a too-small height silently hides the
+    // Derive the height from the exact same wrapping the renderer uses. A
+    // `div_ceil(width)` estimate was wrong for explicit newlines and for
+    // per-character wrapping, and a too-small height silently hides the
     // overflow rows (the terminal only reserves `height` rows for the input).
     let prefix = Span::raw("> ");
-    wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width).len() as u16
+    let lines = wrap_input_buffer(&input.buffer, input.cursor, &prefix, area_width).len() as u16;
+    lines + INPUT_CARD_PADDING * 2
 }
 
 /// Pre-computed screen layout, shared between the draw closure and the mouse
@@ -3621,9 +3858,15 @@ fn compute_input_height(input: &InputLine, pending_quit: bool, area_width: u16) 
 #[derive(Clone, Debug)]
 struct LayoutInfo {
     /// Vertical chunks: [0]=history, [1]=popup, [2]=status, [3]=queued,
-    /// [4]=gap, [5]=input.
+    /// [4]=input card.
+    ///
+    /// The input card carries its own padding rows, so there is no separate
+    /// blank gap above it any more.
     chunks: Vec<ratatui::layout::Rect>,
 }
+
+/// Index of the input card chunk in [`LayoutInfo::chunks`].
+const INPUT_CHUNK: usize = 4;
 
 /// Compute the screen layout from the current terminal size and widget state.
 fn compute_layout(
@@ -3634,7 +3877,10 @@ fn compute_layout(
     queued_height: u16,
 ) -> LayoutInfo {
     let input_width = area.width;
-    let input_height = compute_input_height(input, pending_quit, input_width).min(6);
+    // Cap the text rows, not the card: the two padding rows are always present
+    // so the card keeps its shape once the input starts wrapping a lot.
+    let max_height = INPUT_MAX_TEXT_LINES + INPUT_CARD_PADDING * 2;
+    let input_height = compute_input_height(input, pending_quit, input_width).min(max_height);
     let popup_height = popup
         .as_ref()
         .map(|p| p.height(area.height) as u16)
@@ -3647,8 +3893,7 @@ fn compute_layout(
             Constraint::Length(popup_height),  // popup (0 when none)
             Constraint::Length(1),             // status bar
             Constraint::Length(queued_height), // queued preview
-            Constraint::Length(1),             // blank gap
-            Constraint::Length(input_height),  // input (wraps up to 6 lines)
+            Constraint::Length(input_height),  // input card (padding included)
         ])
         .split(area);
 
@@ -3657,11 +3902,30 @@ fn compute_layout(
     }
 }
 
+/// Blank padding rows above and below the input text inside the input card.
+///
+/// The card is deliberately more than one row tall so it reads as a card rather
+/// than a stripe. The padding carries no characters, so terminal-native
+/// selection over just the middle row copies clean text.
+const INPUT_CARD_PADDING: u16 = 1;
+
+/// Maximum number of text rows the input card shows before it stops growing.
+const INPUT_MAX_TEXT_LINES: u16 = 6;
+
+/// Width of the `"> "` prefix on the first input row.
+const INPUT_PREFIX_WIDTH: usize = 2;
+
 /// Wrap the input buffer into multiple `Line`s so all typed text is visible.
 ///
-/// The first line begins with the `"> "` prefix; continuation lines begin
-/// with `"  "` so the cursor column is visually aligned. Wrapping is
-/// character-based using unicode display width (so CJK / wide chars work).
+/// Only the first line carries the `"> "` prefix. Continuation lines start at
+/// column 0 with **no** indent: the two-space indent used to align the cursor
+/// column, but it leaked into every copied line as leading whitespace, and
+/// terminals do not trim leading spaces on copy. The ragged left edge is the
+/// price of clean copy.
+///
+/// Wrapping is character-based using unicode display width (so CJK / wide chars
+/// work). Because the first line is narrower by the prefix, the two row kinds
+/// have different capacities.
 ///
 /// The character at `cursor` (byte offset) is rendered with reverse video so
 /// the user can see the cursor.
@@ -3671,8 +3935,10 @@ fn wrap_input_buffer(
     prefix: &Span<'static>,
     area_width: u16,
 ) -> Vec<Line<'static>> {
-    const PREFIX_LEN: usize = 2; // "> " or "  "
-    let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
+    let first_avail = (area_width as usize)
+        .saturating_sub(INPUT_PREFIX_WIDTH)
+        .max(1);
+    let cont_avail = (area_width as usize).max(1);
     // Reverse video instead of a hardcoded white block: REVERSED is resolved by
     // the terminal against its own background, so the cursor stays visible on
     // both light and dark themes. A fixed `bg(White)` is 1.00:1 on a white
@@ -3731,7 +3997,6 @@ fn wrap_input_buffer(
             Span::styled(" ", cursor_style),
         ])];
     }
-
     // Split by explicit newlines first: a pasted multi-line block used to be
     // one span holding raw '\n's, which renders as a single over-wide (and
     // mis-shaped) line whose tail ratatui drops. Byte offsets are tracked so
@@ -3751,13 +4016,20 @@ fn wrap_input_buffer(
 
         for ch in segment.chars() {
             let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            // The first row is narrower by the prefix; continuation rows use the
+            // full width because they carry no indent.
+            let avail = if lines.is_empty() {
+                first_avail
+            } else {
+                cont_avail
+            };
             if current_width + ch_width > avail && !current.is_empty() {
                 let chunk = std::mem::take(&mut current);
                 let spans = build_spans(&chunk, chunk_start);
                 let mut all_spans = if lines.is_empty() {
                     vec![prefix.clone()]
                 } else {
-                    vec![Span::raw("  ")]
+                    Vec::new()
                 };
                 all_spans.extend(spans);
                 lines.push(Line::from(all_spans));
@@ -3773,7 +4045,7 @@ fn wrap_input_buffer(
         let mut all_spans = if lines.is_empty() {
             vec![prefix.clone()]
         } else {
-            vec![Span::raw("  ")]
+            Vec::new()
         };
         all_spans.extend(spans);
         lines.push(Line::from(all_spans));
@@ -3814,8 +4086,8 @@ mod tests {
         }
         assert_eq!(
             compute_input_height(&inp, false, width) as usize,
-            lines.len(),
-            "height must equal the wrapped line count"
+            lines.len() + INPUT_CARD_PADDING as usize * 2,
+            "height must equal the wrapped line count plus the card padding"
         );
     }
 
@@ -3865,7 +4137,7 @@ mod tests {
                 let expected = wrap_input_buffer(&inp.buffer, inp.cursor, &prefix, width).len();
                 assert_eq!(
                     compute_input_height(&inp, false, width) as usize,
-                    expected,
+                    expected + INPUT_CARD_PADDING as usize * 2,
                     "width {width} text {text:?}"
                 );
             }
@@ -5226,6 +5498,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5249,6 +5522,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5313,6 +5587,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5336,6 +5611,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5377,6 +5653,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5400,6 +5677,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5452,6 +5730,7 @@ mod tests {
             poll_count: Cell::new(0),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5475,6 +5754,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5569,6 +5849,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5592,6 +5873,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5643,6 +5925,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5666,6 +5949,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5697,6 +5981,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5720,6 +6005,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5758,6 +6044,7 @@ mod tests {
         };
         let project = tempfile::TempDir::new().unwrap();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -5781,6 +6068,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -5870,6 +6158,93 @@ mod tests {
         assert!(
             labels.iter().any(|l| l.contains("未创建")),
             "status 走进生命周期、如实报告没有看板：{labels:?}"
+        );
+    }
+
+    #[test]
+    fn config_warns_when_focus_events_are_unavailable() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+        let mut config = snapshot_for_tests();
+        config.focus_degraded = true;
+        config.notification_condition = "unfocused".into();
+
+        execute_slash_command(
+            SlashCommand::Config,
+            None,
+            None,
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &config,
+            "test-model",
+            None,
+            &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
+        );
+
+        let rendered: String = history
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::Markdown { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rendered.contains("退化为 always"),
+            "焦点事件不可用时必须提示条件已退化：{rendered}"
+        );
+    }
+
+    #[test]
+    fn config_stays_quiet_when_focus_events_work() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
+            kanban_harness();
+
+        execute_slash_command(
+            SlashCommand::Config,
+            None,
+            None,
+            &mut history,
+            80,
+            &cost,
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            project.path(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+            None,
+            &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
+        );
+
+        let rendered: String = history
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::Markdown { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !rendered.contains("退化为 always"),
+            "焦点事件正常时不该出现降级提示：{rendered}"
         );
     }
 
@@ -6150,6 +6525,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let mut history = HistoryState::new();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6177,6 +6553,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6213,6 +6590,7 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let mut history = HistoryState::new();
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6236,6 +6614,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6289,7 +6668,9 @@ mod tests {
 
         // After Ctrl+C, the input row should show the confirm message
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains("Ctrl") || row_text.contains("退出"),
@@ -6386,6 +6767,7 @@ mod tests {
             events: Rc::new(RefCell::new(delivery)),
         };
 
+        let mut title = crate::tui::title::TitleHandle::disabled();
         let dropped = run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -6409,6 +6791,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -6486,7 +6869,9 @@ mod tests {
             result
         );
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains('x'),
@@ -6582,7 +6967,9 @@ mod tests {
 
         // The terminal buffer should contain "hi" in the input row (last row)
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80).map(|x| buffer[(x, input_row)].symbol()).collect();
         assert!(
             row_text.contains("hi"),
@@ -6714,23 +7101,28 @@ mod tests {
     /// Unit test for `compute_input_height` with ASCII.
     #[test]
     fn compute_input_height_ascii() {
+        // The card always adds one padding row above and below the text, so
+        // the height is `text_rows + 2`. Width 20 leaves 18 for the first row
+        // (after `"> "`); continuation rows carry no indent and get all 20.
+        let pad = INPUT_CARD_PADDING * 2;
         let mut inp = InputLine::new();
-        // width=20, prefix=2, avail=18. 30 chars -> ceil(30/18) = 2 lines.
-        assert_eq!(compute_input_height(&inp, false, 20), 1);
+        assert_eq!(compute_input_height(&inp, false, 20), 1 + pad);
         inp.buffer = "a".repeat(18);
-        assert_eq!(compute_input_height(&inp, false, 20), 1, "18 fits in 18");
+        assert_eq!(compute_input_height(&inp, false, 20), 1 + pad, "18 fits");
         inp.buffer = "a".repeat(19);
-        assert_eq!(compute_input_height(&inp, false, 20), 2, "19 wraps to 2");
-        inp.buffer = "a".repeat(36);
+        assert_eq!(compute_input_height(&inp, false, 20), 2 + pad, "19 wraps");
+        // 18 (first row) + 20 (full continuation row) = 38 fits in 2 rows.
+        inp.buffer = "a".repeat(38);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            2,
-            "36 = 2 lines of 18"
+            2 + pad,
+            "38 = 18 + 20 fits two rows"
         );
-        inp.buffer = "a".repeat(37);
-        assert_eq!(compute_input_height(&inp, false, 20), 3, "37 wraps to 3");
-        // pending_quit overrides to 1
-        assert_eq!(compute_input_height(&inp, true, 20), 1);
+        inp.buffer = "a".repeat(39);
+        assert_eq!(compute_input_height(&inp, false, 20), 3 + pad, "39 wraps");
+        // pending_quit keeps the card at three rows: collapsing it would make
+        // the frame jump on Ctrl+C.
+        assert_eq!(compute_input_height(&inp, true, 20), 1 + pad);
     }
 
     /// Unit test for `compute_input_height` with CJK (double-width).
@@ -6739,16 +7131,17 @@ mod tests {
         let mut inp = InputLine::new();
         // width=20, prefix=2, avail=18. Each '你' is 2 cells. 9 chars = 18
         // cells fit on line 1; 10 chars = 20 cells -> 2 lines.
+        let pad = INPUT_CARD_PADDING * 2;
         inp.buffer = "你".repeat(9);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            1,
+            1 + pad,
             "9 cjk = 18 cells fits"
         );
         inp.buffer = "你".repeat(10);
         assert_eq!(
             compute_input_height(&inp, false, 20),
-            2,
+            2 + pad,
             "10 cjk = 20 cells wraps"
         );
     }
@@ -6756,42 +7149,108 @@ mod tests {
     /// The input stripe must follow the theme: on a light terminal the old
     /// hardcoded `Indexed(240)` painted a dark gray band across a white screen.
     #[test]
-    fn input_stripe_uses_theme_raised() {
+    fn input_card_uses_input_bg() {
         let input = InputLine::new();
         let dark = build_input_line_with(&input, false, 40, TuiTheme::DARK);
         let light = build_input_line_with(&input, false, 40, TuiTheme::LIGHT);
-        // Paragraph style is not directly readable, so render one row into a
-        // scratch buffer and inspect the background of the padded cells.
-        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+        // The card is three rows: padding / text / padding. Render the whole
+        // card so the padding rows are inspected too, not just the text row.
+        let area = ratatui::layout::Rect::new(0, 0, 40, 3);
         let mut dark_buf = ratatui::buffer::Buffer::empty(area);
         let mut light_buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(dark, area, &mut dark_buf);
         ratatui::widgets::Widget::render(light, area, &mut light_buf);
-        assert_eq!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
-        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
-        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
-        // A raised surface needs an explicit foreground: `bg_raised` is light in
-        // the light theme, so text left at the terminal default would vanish
-        // when a dark terminal is forced to `YI_AGENT_THEME=light`.
-        assert_eq!(dark_buf[(39, 0)].fg, TuiTheme::DARK.fg);
-        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+
+        for (buf, theme) in [(&dark_buf, TuiTheme::DARK), (&light_buf, TuiTheme::LIGHT)] {
+            for y in 0..3u16 {
+                assert_eq!(buf[(39, y)].bg, theme.input_bg, "row {y} background");
+            }
+        }
+        assert_ne!(dark_buf[(39, 0)].bg, TuiTheme::DARK.bg_raised);
+        assert_ne!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
+        // The card needs an explicit foreground: `input_bg` is a fixed gray in
+        // both themes, so text left at the terminal default would vanish when a
+        // dark terminal is forced to `YI_AGENT_THEME=light`.
+        assert_eq!(dark_buf[(39, 1)].fg, TuiTheme::DARK.fg);
+        assert_eq!(light_buf[(39, 1)].fg, TuiTheme::LIGHT.fg);
     }
 
-    /// The `Ctrl+C` quit prompt rides the same raised stripe: it used to
-    /// paint its own `Indexed(240)` band, so on a light terminal the hint
-    /// flashed as a dark strip over a white screen.
+    /// The card is a contiguous band: both padding rows carry no characters and
+    /// the same background as the text row. Terminal-native selection over the
+    /// middle row alone therefore copies clean text.
     #[test]
-    fn pending_quit_stripe_uses_theme_raised() {
+    fn input_card_pads_one_blank_row_each_side() {
+        let mut input = InputLine::new();
+        input.insert_str("hello");
+        let paragraph = build_input_line_with(&input, false, 20, TuiTheme::DARK);
+        let area = ratatui::layout::Rect::new(0, 0, 20, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(paragraph, area, &mut buf);
+
+        for y in [0u16, 2] {
+            let row: String = (0..20u16).map(|x| buf[(x, y)].symbol()).collect();
+            assert_eq!(row.trim(), "", "padding row {y} must be blank: {row:?}");
+            assert_eq!(buf[(0, y)].bg, TuiTheme::DARK.input_bg);
+        }
+        let text_row: String = (0..20u16).map(|x| buf[(x, 1)].symbol()).collect();
+        assert_eq!(text_row.trim_end(), "> hello");
+    }
+
+    /// Only the first row carries `"> "`; continuation rows start at column 0.
+    /// The old two-space indent leaked into every copied line as leading
+    /// whitespace, and terminals do not trim leading spaces on copy.
+    #[test]
+    fn wrapped_input_keeps_only_the_first_prefix() {
+        let mut input = InputLine::new();
+        // Width 12 leaves 10 for the first row; 25 chars wrap to 3 rows.
+        input.insert_str(&"x".repeat(25));
+        let lines = wrap_input_buffer(&input.buffer, input.cursor, &Span::raw("> "), 12);
+        assert!(lines.len() >= 2, "expected wrapping, got {}", lines.len());
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(rendered[0].starts_with("> "), "{:?}", rendered[0]);
+        for (i, line) in rendered.iter().enumerate().skip(1) {
+            assert!(
+                !line.starts_with(' ') && !line.starts_with('>'),
+                "continuation row {i} must start at column 0: {line:?}"
+            );
+        }
+        // Nothing but the prefix itself (plus the trailing cursor cell, which
+        // Ghostty trims on copy) may survive concatenation.
+        let joined: String = rendered.concat();
+        assert_eq!(joined.trim_end(), format!("> {}", "x".repeat(25)));
+    }
+
+    /// The `Ctrl+C` prompt rides the same three-row card. It used to be one
+    /// row, so pressing `Ctrl+C` shrank the card and made the whole frame jump.
+    #[test]
+    fn pending_quit_keeps_the_three_row_card() {
         let input = InputLine::new();
         let light = build_input_line_with(&input, true, 40, TuiTheme::LIGHT);
-        let area = ratatui::layout::Rect::new(0, 0, 40, 1);
-        let mut light_buf = ratatui::buffer::Buffer::empty(area);
-        ratatui::widgets::Widget::render(light, area, &mut light_buf);
-        assert_eq!(light_buf[(39, 0)].bg, TuiTheme::LIGHT.bg_raised);
-        assert_ne!(light_buf[(39, 0)].bg, Color::Indexed(240));
-        // Padded cells inherit the paragraph style, so this is the stripe
-        // foreground, not the `再按 Ctrl+C 退出` span's own `warn`.
-        assert_eq!(light_buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(light, area, &mut buf);
+
+        for y in 0..3u16 {
+            assert_eq!(buf[(39, y)].bg, TuiTheme::LIGHT.input_bg, "row {y}");
+        }
+        for y in [0u16, 2] {
+            let row: String = (0..40u16).map(|x| buf[(x, y)].symbol()).collect();
+            assert_eq!(row.trim(), "", "padding row {y} must be blank");
+        }
+        // Wide (CJK) glyphs occupy two cells and ratatui writes a space into
+        // the second one; drop all whitespace before matching.
+        let hint: String = (0..40u16)
+            .map(|x| buf[(x, 1)].symbol())
+            .filter(|s| !s.trim().is_empty())
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        assert!(hint.contains("再按Ctrl+C退出"), "{hint:?}");
+        // Padding cells inherit the paragraph foreground, not the hint's `warn`.
+        assert_eq!(buf[(39, 0)].fg, TuiTheme::LIGHT.fg);
     }
 
     /// Whole-frame acceptance: with the light theme, no cell may be painted with
@@ -7400,7 +7859,9 @@ mod tests {
 
         // The input row should contain "/clear" (completed by Tab)
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -7557,7 +8018,9 @@ mod tests {
 
         // After Down + Tab, the 2nd command (clear) should be completed into input
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -7843,7 +8306,9 @@ mod tests {
         // The cursor is reverse video, not a hardcoded white block: a white
         // block is invisible on a white terminal (contrast 1.00:1).
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
@@ -7892,7 +8357,9 @@ mod tests {
         .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
@@ -7948,7 +8415,9 @@ mod tests {
         // Input starts at x=2 (after "> " prefix). 'a' at x=2, 'b' at x=3, 'c' at x=4.
         // Cursor at byte offset 2 means 'c' is the cursor character, at x=4.
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let cursor_cell = &buffer[(4, input_row)];
         assert!(
             cursor_cell
@@ -8088,6 +8557,7 @@ mod tests {
         };
 
         crate::tui::cell::reset_lines_call_count();
+        let mut title = crate::tui::title::TitleHandle::disabled();
         run_loop(
             &mut terminal,
             &mut agent_rx,
@@ -8111,6 +8581,7 @@ mod tests {
             &snapshot_for_tests(),
             &catalog_for_tests(),
             TuiTheme::DARK,
+            &mut title,
         )
         .unwrap();
 
@@ -8540,7 +9011,9 @@ mod tests {
 
         // The input row should not contain 'a' — it was ignored while permission was pending.
         let buffer = terminal.backend().buffer();
-        let input_row = 23u16;
+        // The input card is three rows tall (padding / text / padding), so the
+        // text row sits at 22 in a 24-row terminal, not the last row.
+        let input_row = 22u16;
         let row_text: String = (0..80u16)
             .map(|x| buffer[(x, input_row)].symbol())
             .collect();
@@ -10785,7 +11258,7 @@ mod tests {
     #[test]
     fn mouse_scroll_in_input_region_ignores_history() {
         let (layout, _history_area) = layout_80x24();
-        let input_area = layout.chunks[5];
+        let input_area = layout.chunks[INPUT_CHUNK];
         let mut runtime_popup = RuntimePopup::None;
         let mut hist = HistoryState::new();
         for _ in 0..50 {
@@ -11059,6 +11532,243 @@ mod tests {
             "Up should scroll history while a permission is pending"
         );
     }
+
+    /// 按脚本逐帧设置 `is_running`，脚本走完后按 Ctrl+Q 退出。
+    struct TitleScriptEvents {
+        script: Vec<bool>,
+        is_running: Arc<AtomicBool>,
+        poll_count: Cell<usize>,
+    }
+
+    impl EventSource for TitleScriptEvents {
+        // `run_loop` 每帧的顺序是：draw → title.sync(is_running) → events.poll()。
+        // 也就是说第 N 帧的 sync 看到的是「第 N-1 次 poll 写入的值」。所以
+        // `is_running` 必须用脚本首帧的值初始化（首帧 sync 才能看到正确状态），
+        // 而 poll 里要写入的是**下一帧**该看到的值，即 `script[index + 1]`。
+        // 若在 poll 里就地写 `script[index]`，首帧 sync 会先看到初始的 false，
+        // 白写一次 "p"，断言序列变成 ["p", "● p", "p"]。
+        fn poll(&self, _timeout: Duration) -> std::io::Result<Option<Event>> {
+            let index = self.poll_count.get();
+            if index >= self.script.len() {
+                return Ok(Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                ))));
+            }
+            if let Some(next) = self.script.get(index + 1) {
+                self.is_running
+                    .store(*next, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.poll_count.set(index + 1);
+            Ok(None)
+        }
+    }
+
+    /// 跑 `run_loop` 直到事件源说停，返回记录到的标题写入序列。
+    ///
+    /// 用 `RecordingSink` 而非真 stdout：`cargo test` 的 stdout 不是 tty，
+    /// `StdoutSink` 会短路，写入次数根本看不见。
+    fn run_loop_for_title(workdir: &std::path::Path, script: Vec<bool>) -> Vec<String> {
+        let backend = Rc::new(RefCell::new(TestBackend::new(80, 24)));
+        let mut terminal = Terminal::new(ResizableTestBackend {
+            inner: Rc::clone(&backend),
+        })
+        .unwrap();
+        let (_agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        // 首帧 sync 发生在第一次 poll 之前，故初值必须取脚本首帧。
+        let first = script.first().copied().unwrap_or(false);
+        let is_running = Arc::new(AtomicBool::new(first));
+        let mut history = HistoryState::new();
+        let mut input = InputLine::new();
+        let source = TitleScriptEvents {
+            script,
+            is_running: Arc::clone(&is_running),
+            poll_count: Cell::new(0),
+        };
+
+        let sink = crate::tui::title::RecordingSink::default();
+        let probe = sink.clone();
+        let mut title =
+            crate::tui::title::TitleHandle::with_sink(true, false, workdir, Box::new(sink));
+        let config = snapshot_for_tests();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut history,
+            &mut input,
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &source,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            workdir.to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &config,
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+        )
+        .unwrap();
+
+        probe.calls()
+    }
+
+    #[test]
+    fn title_follows_the_running_flag() {
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true, false]);
+        assert_eq!(calls, vec!["● p".to_string(), "p".to_string()]);
+    }
+
+    #[test]
+    fn title_is_written_once_while_running_stays_true() {
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true; 60]);
+        assert_eq!(
+            calls,
+            vec!["● p".to_string()],
+            "60 identical frames must not rewrite the title (would flicker)"
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_returns_title_to_idle() {
+        // 与通知功能相反：`Done{Interrupted}` 不发通知，但标题必须回空闲。
+        // 这里用「置 false」等价于 `main.rs` 收尾处的 `store(false)`。
+        let calls = run_loop_for_title(std::path::Path::new("/work/p"), vec![true, false]);
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("p"),
+            "an interrupted turn must not leave the running dot on the tab"
+        );
+    }
+
+    /// 把清理步骤和标题写入放进**同一条**时间线。
+    ///
+    /// 为什么不用两个独立序列比较末尾：那样只能证明「标题还原是标题序列的
+    /// 最后一项」+「LeaveAlternateScreen 是步骤序列的最后一项」，证明不了
+    /// 两者的**相对顺序**。共享一条 log 才能断言 clear 严格落在最后一步之后。
+    #[derive(Debug, Clone, Default)]
+    struct TimelineSink {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TimelineSink {
+        fn entries(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// 只让**下一次**标题写入返回 `Err`（只生效一次）。
+        fn fail_next(&self) {
+            self.fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::tui::title::TitleSink for TimelineSink {
+        fn write_title(&mut self, text: &str) -> std::io::Result<()> {
+            self.log.lock().unwrap().push(format!("title:{text:?}"));
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn title_restore_failure_does_not_change_exit_code() {
+        let sink = TimelineSink::default();
+        let log = std::sync::Arc::clone(&sink.log);
+        let probe = sink.clone();
+        let mut title = crate::tui::title::TitleHandle::with_sink(
+            true,
+            false,
+            std::path::Path::new("/work/p"),
+            Box::new(sink),
+        );
+
+        // 先让一次写入**成功**：否则 writer 立刻进入 disabled，`clear` 短路，
+        // 失败根本落不到 clear 上，断言会恒真。
+        title.sync(true);
+        assert_eq!(probe.entries(), vec![r#"title:"● p""#.to_string()]);
+
+        // 只注入一次失败 —— 正好是接下来的 `clear`。
+        probe.fail_next();
+
+        let cleanup_error = run_cleanup_with(
+            |name| {
+                log.lock().unwrap().push(format!("step:{name}"));
+                Ok(())
+            },
+            &mut title,
+        );
+
+        assert!(
+            cleanup_error.is_none(),
+            "title restore must never contribute a cleanup error"
+        );
+
+        let entries = probe.entries();
+        assert_eq!(entries.len(), 6, "1 sync + 4 cleanup steps + 1 clear");
+        assert_eq!(entries[0], r#"title:"● p""#);
+        assert_eq!(entries[1], "step:DisableBracketedPaste");
+        assert_eq!(
+            entries[5], r#"title:"""#,
+            "clear must still be attempted even though it fails"
+        );
+    }
+
+    #[test]
+    fn clear_happens_after_leave_alternate_screen() {
+        let sink = TimelineSink::default();
+        let log = std::sync::Arc::clone(&sink.log);
+        let probe = sink.clone();
+        let mut title = crate::tui::title::TitleHandle::with_sink(
+            true,
+            false,
+            std::path::Path::new("/work/p"),
+            Box::new(sink),
+        );
+        title.sync(true);
+
+        let _ = run_cleanup_with(
+            |name| {
+                log.lock().unwrap().push(format!("step:{name}"));
+                Ok(())
+            },
+            &mut title,
+        );
+
+        assert_eq!(
+            probe.entries(),
+            vec![
+                r#"title:"● p""#.to_string(),
+                "step:DisableBracketedPaste".to_string(),
+                "step:DisableFocusChange".to_string(),
+                "step:disable_raw_mode".to_string(),
+                "step:LeaveAlternateScreen".to_string(),
+                r#"title:"""#.to_string(),
+            ],
+            "the empty title must be written strictly after the last cleanup step"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -11172,5 +11882,179 @@ mod runtime_restart_notice_tests {
             text.contains("重启"),
             "the dialog never mentions a restart: {text}"
         );
+    }
+}
+
+/// 终端通知的纯逻辑：事件 → 候选通知、焦点 → 是否发送。
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use crate::tui::history::HistoryState;
+
+    #[test]
+    fn turn_complete_uses_last_assistant_text() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let mut history = HistoryState::new();
+        history.push_event(AgentEvent::AssistantText("已完成重构".into()), 80);
+
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("已完成重构"));
+    }
+
+    #[test]
+    fn turn_complete_without_text_falls_back() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("yi-agent 回合完成"));
+    }
+
+    #[test]
+    fn permission_request_outranks_turn_complete() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        state.observe(
+            &AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "cargo test" }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("等待批准: cargo test"));
+    }
+
+    #[test]
+    fn lower_priority_candidate_does_not_replace_higher() {
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+
+        state.observe(
+            &AgentEvent::PermissionRequest {
+                request_id: 1,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "rm -rf /" }),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            },
+            &history,
+            true,
+        );
+        state.observe(
+            &AgentEvent::Done {
+                reason: yi_agent_core::DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        assert_eq!(state.pending_text(), Some("等待批准: rm -rf /"));
+    }
+
+    #[test]
+    fn non_notifying_events_are_ignored() {
+        use yi_agent_core::DoneReason;
+        let history = HistoryState::new();
+        for event in [
+            AgentEvent::Done {
+                reason: DoneReason::MaxTurns,
+            },
+            AgentEvent::Done {
+                reason: DoneReason::Interrupted {
+                    reason: "user".into(),
+                },
+            },
+            AgentEvent::Cancelled,
+            AgentEvent::Error(yi_agent_core::AgentError::ProviderTurnAdmission(
+                "boom".into(),
+            )),
+        ] {
+            let mut state = NotificationState::new();
+            state.observe(&event, &history, true);
+            assert_eq!(state.pending_text(), None, "{event:?} must not notify");
+        }
+    }
+
+    #[test]
+    fn disabled_notifications_produce_nothing() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            false,
+        );
+        assert_eq!(state.pending_text(), None);
+    }
+
+    #[test]
+    fn flush_clears_pending() {
+        use yi_agent_core::DoneReason;
+        let mut state = NotificationState::new();
+        let history = HistoryState::new();
+        state.observe(
+            &AgentEvent::Done {
+                reason: DoneReason::EndTurn,
+            },
+            &history,
+            true,
+        );
+        let taken = state.take();
+        assert!(taken.is_some());
+        assert_eq!(state.pending_text(), None);
+    }
+
+    #[test]
+    fn should_notify_respects_condition() {
+        use crate::tui::notify::Condition;
+        assert!(should_notify(Condition::Always, false));
+        assert!(should_notify(Condition::Always, true));
+        assert!(should_notify(Condition::Unfocused, false));
+        assert!(!should_notify(Condition::Unfocused, true));
+    }
+
+    #[test]
+    fn focus_events_flip_the_flag() {
+        let focused = std::sync::atomic::AtomicBool::new(true);
+        apply_focus_event(&Event::FocusLost, &focused);
+        assert!(!focused.load(std::sync::atomic::Ordering::Relaxed));
+
+        apply_focus_event(&Event::FocusGained, &focused);
+        assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unrelated_events_do_not_touch_the_focus_flag() {
+        let focused = std::sync::atomic::AtomicBool::new(true);
+        apply_focus_event(&Event::Resize(80, 24), &focused);
+        assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

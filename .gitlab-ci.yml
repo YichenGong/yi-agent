@@ -52,6 +52,25 @@ ci-mr:
   script:
     - just ci
 
+# 桌面端类型检查 + 单元测试。独立 job + node 镜像：MR 路径的 ci-mr 用的是
+# rust:latest，没有 Node。与 ci-mr 一样跑在云端 runner（不加 tags，不进
+# Mac mini），MR 与 push 两条路径统一走这里，不依赖 runner 上预装 node。
+#
+# 用 node:22：vite 8 允许 `^20.19.0 || >=22.12.0`，Node 20 也可行，
+# 取 22 是因为 v20 已停止发版（最后 v20.20.2 / 2026-03-24），v22 仍是活跃 LTS。
+ci-desktop:
+  stage: check
+  image: node:22
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates >/dev/null
+    - curl -sSf https://just.systems/install.sh | sh -s -- --to /usr/local/bin
+  script:
+    - cd yi-agent-rs
+    - just desktop-check
+
 # tag 推送时在 Mac mini 上构建并发布 macOS(arm64) 桌面 App 的 dmg。
 # 逻辑全部在 desktop/scripts/release-dmg.sh 里，job 保持薄。
 release:macos-dmg:

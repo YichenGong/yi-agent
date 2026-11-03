@@ -10,6 +10,9 @@
 //! 与 `.env` 无关，是第二层的实现。
 //! 运行参数现在读 `settings.json`（见 [`crate::settings`]），且它是**第三层**：
 //! 覆盖 > 真实环境变量 > settings.json > 默认值。
+//!
+//! 唯一还认得 `.env` 的是 [`crate::migrate`] 的存量迁移层，它计划在
+//! **`2027-01-01`** 整体退役；删除清单见那个模块的文档。
 
 use std::path::PathBuf;
 
@@ -121,6 +124,15 @@ pub struct RuntimeConfig {
     /// 本次配置是否来自「整包注入」（CLI flag 或真实进程环境变量）。
     /// 为真时它压过清单的 `default_model`（会话覆盖仍在其上）。
     pub model_injected: bool,
+    /// 是否发送终端通知（`tui.notifications`，默认 true）。
+    pub notifications: bool,
+    /// `auto` / `osc9` / `bel`（`tui.notification_method`，默认 `auto`）。
+    pub notification_method: String,
+    /// `unfocused` / `always`（`tui.notification_condition`，默认 `unfocused`）。
+    pub notification_condition: String,
+    /// 是否把项目名与运行状态写进终端标签页标题
+    /// （`tui.terminal_title`，默认 true）。
+    pub terminal_title: bool,
 }
 
 /// 来自 CLI flag 或 GUI 请求的纯数据覆盖项。不依赖 clap。
@@ -178,6 +190,9 @@ pub(crate) fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxM
 /// 注意：产品已不再读取 `.env`。保留这个路径解析是因为启动迁移
 /// （[`crate::migrate`]）仍要找到旧的 `.env` 把它改名作废——迁移必须先能
 /// 定位它，才谈得上「不再被读取」。
+///
+/// **退役计划 `2027-01-01`**：只服务于上述迁移，随迁移层整体删除。
+/// 完整删除清单见 [`crate::migrate`] 的模块文档。
 pub fn resolve_global_env_path() -> Option<PathBuf> {
     yi_agent_store::paths::home_join(".env")
 }
@@ -408,6 +423,25 @@ impl RuntimeConfig {
             .or(settings.agent.skills_catalog_budget)
             .unwrap_or(SKILLS_CATALOG_BUDGET_DEFAULT);
 
+        // 存储侧是字符串（见 settings.rs 的 TuiSettings 说明），这里解析成
+        // bool；空串与非法值已在 `normalized` 里清成 None，故只需处理默认。
+        let notifications = !matches!(settings.tui.notifications.as_deref(), Some("false"));
+        let notification_method = settings
+            .tui
+            .notification_method
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        let notification_condition = settings
+            .tui
+            .notification_condition
+            .clone()
+            .unwrap_or_else(|| "unfocused".to_string());
+        // 与 `notifications` 同理：存储侧是字符串，这里解析成 bool。
+        // 用 `!matches!(.., Some("false"))` 而不是 `== Some("true")`：
+        // 后者会让「键缺失」（最常见情况）得到 false，把默认的 true 变成
+        // false。
+        let terminal_title = !matches!(settings.tui.terminal_title.as_deref(), Some("false"));
+
         Ok(RuntimeConfig {
             provider,
             api_url,
@@ -432,6 +466,10 @@ impl RuntimeConfig {
             skills_catalog_budget,
             skills_catalog_budget_explicit,
             model_injected,
+            notifications,
+            notification_method,
+            notification_condition,
+            terminal_title,
         })
     }
 
@@ -504,6 +542,10 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: false,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }
 
@@ -515,6 +557,9 @@ mod tests {
     use std::path::Path;
 
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
+    ///
+    /// `cargo nextest` 下每个测试独立进程，环境变量天然不共享，这把锁退化为
+    /// 无害的空操作；`cargo test` 下它仍是必需的。两种运行器都必须保留。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvVarGuard {
@@ -658,6 +703,9 @@ mod tests {
     #[test]
     fn settings_metadata_defaults_track_these_constants() {
         use crate::settings::find_spec;
+        use crate::settings::{
+            POWER_IDLE_GRACE_MINUTES_DEFAULT, POWER_REMOTE_TOUCH_MINUTES_DEFAULT,
+        };
         let cases: &[(&str, String)] = &[
             ("agent.max_turns", MAX_TURNS_DEFAULT.to_string()),
             (
@@ -680,6 +728,14 @@ mod tests {
             (
                 "compact.tool_budget_tokens",
                 COMPACT_TOOL_BUDGET_DEFAULT.to_string(),
+            ),
+            (
+                "power.idle_grace_minutes",
+                POWER_IDLE_GRACE_MINUTES_DEFAULT.to_string(),
+            ),
+            (
+                "power.remote_touch_minutes",
+                POWER_REMOTE_TOUCH_MINUTES_DEFAULT.to_string(),
             ),
         ];
         for (key, expected) in cases {
@@ -710,6 +766,88 @@ mod tests {
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("settings.json"), json).unwrap();
         }
+    }
+
+    #[test]
+    fn tui_notification_settings_reach_runtime_config() {
+        // 端到端钉子：写进 settings.json 的三个值必须真的出现在 RuntimeConfig
+        // 上。缺了这条，字段名写错（比如 `tui.notification`）在编译期毫无反应，
+        // 用户改了配置却永远拿默认值。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(
+            r#"{"tui":{"notifications":"false","notification_method":"bel","notification_condition":"always"}}"#,
+        );
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!cfg.notifications);
+        assert_eq!(cfg.notification_method, "bel");
+        assert_eq!(cfg.notification_condition, "always");
+    }
+
+    #[test]
+    fn tui_notification_defaults_apply_when_absent() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(cfg.notifications, "通知默认开启");
+        assert_eq!(cfg.notification_method, "auto");
+        assert_eq!(cfg.notification_condition, "unfocused");
+    }
+
+    #[test]
+    fn tui_terminal_title_reaches_runtime_config() {
+        // 端到端钉子：写进 settings.json 的值必须真的出现在 RuntimeConfig
+        // 上。缺了这条，字段名写错（比如 `tui.terminaltitle`）在编译期毫无
+        // 反应，用户改了配置却永远拿默认值。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{"tui":{"terminal_title":"false"}}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!cfg.terminal_title, "explicit false must reach the config");
+    }
+
+    #[test]
+    fn tui_terminal_title_defaults_apply_when_absent() {
+        // 钉住 `!matches!(.., Some("false"))` 那行：键缺失时必须是 true。
+        // 若有人写成 `== Some("true")`，这条会红。
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = IsolatedInstance::new();
+        instance.write_settings(r#"{}"#);
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(instance.dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(cfg.terminal_title, "标题默认开启");
     }
 
     #[test]

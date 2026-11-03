@@ -377,10 +377,11 @@ describe("SettingsDialog phone layout hooks", () => {
     expect(screen.queryByRole("tab")).toBeNull();
     expect(document.querySelector(".settings-categories")).toBeTruthy();
     const rows = Array.from(document.querySelectorAll("[data-settings-category]"));
+    // 「远程访问」不在其中：它配的是桌面主机侧的配对与中继端点，手机端
+    // 既铸不出配对码、也改不了另一台机器的侧车地址。
     expect(rows.map((r) => r.getAttribute("data-settings-category"))).toEqual([
       "general",
       "runtime",
-      "remote",
       "plugins",
       "models",
       "skills",
@@ -481,5 +482,134 @@ describe("SettingsDialog phone layout hooks", () => {
     // 手机上遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape——触控目标不能还是桌面的
     // 小尺寸。44px 是 Apple HIG 下限，与抽屉按钮 `size-11` 同一标准。
     expect(close.className).toContain("size-11");
+  });
+});
+
+/**
+ * 字号档位的接线，以及「只显示当前平台需要的参数」。
+ *
+ * 两条都穿过真实接线（Dialog → GeneralTab），因为断线时子组件测试仍然全绿：
+ * Dialog 忘了透传 `fontScale` 就什么都不渲染，忘了吞掉值守 props 手机端就多出
+ * 一个能拨到桌面主机的开关。
+ */
+describe("SettingsDialog general tab per platform", () => {
+  it("passes the font scale down and reports the choice", () => {
+    const onFontScaleChange = vi.fn();
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        fontScale="small"
+        onFontScaleChange={onFontScaleChange}
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "大" }));
+    expect(onFontScaleChange).toHaveBeenCalledWith("large");
+  });
+
+  it("shows the watchman toggle on the desktop", () => {
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        watchmanEnabled
+        onToggleWatchman={() => {}}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText("后台值守（开机自启）开关")).toBeTruthy();
+  });
+
+  it("hides the watchman toggle on the phone, which cannot reach the host", () => {
+    // 值守装的是**桌面主机**的登录项。手机上拨它等于远程改另一台机器的开机项，
+    // 而手机端从没被赋予这个语义，故由宿主传 `undefined` 让它整节消失。
+    render(
+      <SettingsDialog
+        open
+        isMobile
+        theme="dark"
+        onThemeChange={() => {}}
+        fontScale="small"
+        onFontScaleChange={() => {}}
+        onClose={() => {}}
+      />,
+    );
+    // 手机端先落在分类列表，故先进「通用」子页再断言——否则这条会因为
+    // 「面板根本没渲染」而假通过。
+    fireEvent.click(
+      document.querySelector('[data-settings-category="general"]') as HTMLElement,
+    );
+    expect(screen.queryByLabelText("后台值守（开机自启）开关")).toBeNull();
+    // 字号在手机上必须有（这是它最需要的参数）。
+    expect(screen.getByRole("button", { name: "大" })).toBeTruthy();
+  });
+});
+
+describe("SettingsDialog hides desktop-only runtime groups on the phone", () => {
+  const runtimeFields = [
+    {
+      key: "agent.max_turns",
+      group: "agent",
+      label: "最大轮次",
+      type: "number",
+      value: null,
+      default: "200",
+      description: "最多执行的轮数",
+      options: [],
+      min: 1,
+      max: null,
+    },
+    {
+      key: "tui.notifications",
+      group: "tui",
+      label: "通知方式",
+      type: "select",
+      value: null,
+      default: "auto",
+      description: "回合结束时的提示",
+      options: ["auto", "osc9"],
+      min: null,
+      max: null,
+    },
+  ];
+  const runtimeCall = async (method: string) =>
+    method === "settings/read"
+      ? { fields: runtimeFields, path: "/x/settings.json" }
+      : { ok: true };
+
+  it("drops the tui group on the phone but keeps it on the desktop", async () => {
+    // 桌面上先确认基线：同一份数据要能渲染出「终端通知」。
+    const desktop = render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        runtimeSettingsCall={runtimeCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "运行参数" }));
+    expect(await screen.findByRole("heading", { name: "终端通知" })).toBeTruthy();
+    desktop.unmount();
+
+    // 手机端：进入「运行参数」子页后，桌面专属组消失，但普通组还在。
+    render(
+      <SettingsDialog
+        open
+        isMobile
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        runtimeSettingsCall={runtimeCall}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-settings-category="runtime"]') as HTMLElement,
+    );
+    expect(await screen.findByRole("heading", { name: "Agent" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "终端通知" })).toBeNull();
   });
 });

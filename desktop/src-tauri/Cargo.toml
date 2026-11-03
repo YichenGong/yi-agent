@@ -32,6 +32,17 @@ tokio = { version = "1", features = ["time"] }
 # `set_relay_url` has the handle, but the pure `configured_relay_in` used by
 # tests does not. `dirs` reads `$HOME`, which is what Tauri returns on macOS.
 dirs = "6"
+# remote.json / remote-status.json 的唯一临时名需要它（并发写者不得共用同一路径）。
+uuid = { version = "1", features = ["v4"] }
+# flock 用于跨进程的读-改-写互斥。
+libc = "0.2"
+# 远端二进制下载后必须校验 sha256 才允许落盘。
+sha2 = "0.10"
+# 复用 tauri 已经拉进来的 reqwest（0.13）做阻塞下载，避免再多一棵依赖树。
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# 开关判定的唯一真源。本 crate 刻意不依赖 `yi-agent-store`（它带 bundled
+# rusqlite），所以引入它不会把 SQLite 链进桌面二进制。
+yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.

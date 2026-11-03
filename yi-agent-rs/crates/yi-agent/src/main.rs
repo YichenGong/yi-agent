@@ -6,9 +6,12 @@ mod control_commands;
 mod flags_cmd;
 mod llm_prefix;
 mod onboarding_prompt;
+mod resume;
 mod schedule_intent;
+mod session_store;
 mod tracing_init;
 mod tui;
+mod turn_log;
 
 #[cfg(test)]
 mod control_commands_tests;
@@ -80,9 +83,11 @@ fn main() -> Result<()> {
             stdin,
             naked,
             subagents,
+            ref resume,
         }) => {
             let prompt = prompt.clone();
-            run_headless(cli, prompt, json, stdin, naked, subagents)
+            let resume = resume.clone();
+            run_headless(cli, prompt, json, stdin, naked, subagents, resume)
         }
         Some(Command::Daemon { action }) => control_daemon(&cli, action),
         Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
@@ -99,6 +104,31 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Some(Command::Resume {
+            ref thread_id,
+            last,
+            ref prompt,
+        }) => {
+            // `resume --last "x"` 的 positional 被 clap 绑到 thread_id 上，
+            // 但语义上它是提示词。clap 表达不了这种条件语义，在这里换位。
+            let positional = thread_id.clone();
+            let trailing = prompt.clone();
+            let (spec, prompt) = if last {
+                (None, positional.or(trailing))
+            } else {
+                (positional, trailing)
+            };
+            run_resume(cli, spec, last, prompt)
+        }
+        Some(Command::Threads) => run_threads(&cli),
+        Some(Command::Fork {
+            ref thread_id,
+            ref prompt,
+        }) => {
+            let spec = thread_id.clone();
+            let prompt = prompt.clone();
+            run_fork(cli, spec, prompt)
+        }
         None => run_agent(cli),
     }
 }
@@ -1295,8 +1325,145 @@ async fn load_permission_checker_for_workdir_async(
     .map_err(|e| anyhow::anyhow!("permission loader task failed: {e}"))?
 }
 
+/// resume 时带进 TUI 的既有会话。
+pub(crate) struct ResumeSeed {
+    /// 已按 `forkable_messages` 截断、可直接种进 `Session` 的转录。
+    pub messages: Vec<yi_agent_core::Message>,
+    /// 上次的 input token 数，让 auto-compact 在首轮即生效。
+    pub last_input_tokens: Option<u32>,
+    /// 启动后立即发送的提示词。
+    pub prompt: Option<String>,
+    /// 已打开的 store（持有跨进程锁）。
+    pub store: crate::session_store::TuiSessionStore,
+}
+
+fn run_resume(cli: Cli, spec: Option<String>, last: bool, prompt: Option<String>) -> Result<()> {
+    prepare_environment();
+    let config = config::load_lenient(&cli)?;
+    let workdir = config.workdir.clone();
+    let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
+
+    let thread_id = match (spec, last) {
+        (Some(spec), _) => crate::resume::resolve_thread_id(&store, &spec)?,
+        (None, true) => crate::resume::pick_last(&store, &workdir)
+            .map(|m| m.thread_id)
+            .ok_or_else(|| anyhow::anyhow!("当前目录没有可恢复的会话"))?,
+        (None, false) => anyhow::bail!("需要会话 id，或加 `--last`"),
+    };
+
+    // cwd 已删必须明确报错，不得回退到当前 workdir——回退会让历史里的相对
+    // 路径全部指向错误位置。`rebuild_meta` 重建出的老会话 cwd 是空串，那种
+    // 情况视为「与当前目录相同」放行。
+    let meta_cwd = store
+        .load(&thread_id)?
+        .map(|l| l.meta.cwd)
+        .unwrap_or_default();
+    if !meta_cwd.is_empty() && !std::path::Path::new(&meta_cwd).is_dir() {
+        anyhow::bail!(
+            "会话 {thread_id} 的工作目录已不存在：{meta_cwd}\n\
+             如有需要，用 `yi-agent fork {thread_id}` 在新目录继续"
+        );
+    }
+
+    // OpenError 区分「被占用」与「不存在」：前者提示 fork，后者提示 threads。
+    let session = crate::session_store::TuiSessionStore::open(&workdir, &thread_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (messages, last_input_tokens) = session.load_seed()?;
+
+    run_agent_with_seed(
+        cli,
+        Some(ResumeSeed {
+            messages,
+            last_input_tokens,
+            prompt,
+            store: session,
+        }),
+    )
+}
+
+fn run_threads(cli: &Cli) -> Result<()> {
+    prepare_environment();
+    let config = config::load_lenient(cli)?;
+    let store = yi_agent_app_server::thread_store::ThreadStore::new(&config.workdir);
+    let mut all = store.list()?;
+    if all.is_empty() {
+        println!("当前目录没有会话");
+        return Ok(());
+    }
+    all.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
+    println!("{:<44}  {:<26}  更新时间", "ID", "标题");
+    for m in all {
+        let title = m.title.unwrap_or_else(|| "(untitled)".to_string());
+        println!(
+            "{:<44}  {:<26}  {}",
+            m.thread_id,
+            title.chars().take(26).collect::<String>(),
+            crate::resume::format_millis_local(m.updated_at)
+        );
+    }
+    Ok(())
+}
+
+fn run_fork(cli: Cli, spec: String, prompt: Option<String>) -> Result<()> {
+    prepare_environment();
+    let config = config::load_lenient(&cli)?;
+    let workdir = config.workdir.clone();
+    let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
+    let source = crate::resume::resolve_thread_id(&store, &spec)?;
+
+    let new_id = format!("thread-{}", uuid::Uuid::new_v4());
+    let created = store.fork_thread(&source, &new_id)?;
+
+    let session = crate::session_store::TuiSessionStore::open(&workdir, &created)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (messages, last_input_tokens) = session.load_seed()?;
+
+    run_agent_with_seed(
+        cli,
+        Some(ResumeSeed {
+            messages,
+            last_input_tokens,
+            prompt,
+            store: session,
+        }),
+    )
+}
+
+/// 退出 TUI 后该怎么接上这场对话。
+///
+/// 返回 `None` 表示没有值得恢复的内容——刚启动就退出、或 `/clear` 之后，
+/// resume 出来仍是空的，提示只会让用户白跑一趟。
+///
+/// **必须在备用屏幕退出之后打印**：TUI 期间写的内容随备用屏幕一起消失
+/// （与 `report_dropped_pending` 同一条理由）。
+fn resume_hint(store: &crate::session_store::TuiSessionStore) -> Option<String> {
+    if !store.has_resumable_content().ok()? {
+        return None;
+    }
+    let id = store.thread_id();
+    Some(format!(
+        "会话已保存：{id}\n  yi-agent resume {id}   （或 yi-agent resume --last）\n"
+    ))
+}
+
 fn run_agent(cli: Cli) -> Result<()> {
-    // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
+    run_agent_with_seed(cli, None)
+}
+
+/// 配置加载**之前**必须完成的迁移：`.env` → `settings.json` / `models.json`。
+///
+/// 所有需要 `config` 的入口（新会话、resume、fork、threads、headless）都必须
+/// 先过这里。少调一次的后果不是「迁移没做」而是**解析到错误的 workdir**：老
+/// 格式 `.env` 里的设置迁移前在 `.env`、迁移后在 `settings.json`，两条读取路径
+/// 给出的 `workdir` 一旦不同，`resume` 就会去另一个目录的 threads 里找会话。
+///
+/// **只做非交互的事**：本函数会被 `threads`、headless 这类可能要跑在管道里的
+/// 入口调用，弹引导会让它们挂死在 stdin 上。首启引导由交互入口自己调。
+///
+/// 幂等：两个迁移各自检查状态。
+///
+/// 返回 `preferences.json` 的路径，供调用方判断要不要弹引导。
+fn prepare_environment() -> std::path::PathBuf {
     // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
     // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
     let env_path = config::resolve_global_env_path()
@@ -1317,6 +1484,13 @@ fn run_agent(cli: Cli) -> Result<()> {
         &yi_agent_tools::websearch_path(),
     );
     yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
+    prefs_path
+}
+
+fn run_agent_with_seed(cli: Cli, seed: Option<ResumeSeed>) -> Result<()> {
+    // 迁移与首启引导必须发生在 `config::load` 之前：此时还没有配置，
+    // 加载器会直接报错；而迁移会移动 `workdir` 的读取来源。
+    let prefs_path = prepare_environment();
     // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
     // 让 should_offer / prompt 与运行期读点一致。
     let models_path = yi_agent_runtime::models::models_path();
@@ -1427,6 +1601,7 @@ fn run_agent(cli: Cli) -> Result<()> {
         process_manager,
         prompt.catalog,
         mcp,
+        seed,
     )
 }
 
@@ -1462,6 +1637,7 @@ async fn drain_with_signals<W: std::io::Write, E: std::io::Write>(
     err: &mut E,
     json: bool,
     agent: &yi_agent_core::Agent,
+    turn_log: &mut crate::turn_log::TurnLog,
 ) -> i32 {
     use futures::StreamExt;
 
@@ -1485,6 +1661,8 @@ async fn drain_with_signals<W: std::io::Write, E: std::io::Write>(
             }
             event = stream.next() => {
                 let Some(event) = event else { break };
+                // 落盘口径与 TUI 完全一致：同一个 `TurnLog`，不存在第二套映射。
+                turn_log.feed(event.clone());
                 if json {
                     let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
                     let _ = writeln!(out, "{line}");
@@ -1708,7 +1886,11 @@ fn run_headless(
     from_stdin: bool,
     naked: bool,
     subagents: bool,
+    resume: Option<String>,
 ) -> Result<()> {
+    // 迁移必须在 `config::load` 之前：它决定了 `workdir` 从哪读。
+    // 不弹引导——headless 可能跑在管道里，弹了会挂死在 stdin 上。
+    let _ = prepare_environment();
     let config = config::load_lenient(&cli)?;
     // 与 TUI 同一条解析链：先让 `models.json` 的默认条目补上 provider/model/key，
     // 再判断是否可发起对话。只拿裸配置判定会把「模型只在清单里」的机器误判成
@@ -1791,17 +1973,76 @@ fn run_headless(
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
     let mcp = setup.mcp;
 
+    // 会话存储：resume 用既有的那份，否则新开一条。与 TUI 同一套 store，
+    // 所以 `run` 跑过的会话之后能被 `resume` / TUI 接上。
+    //
+    // 建失败不阻断：headless 的首要职责是把这一问跑完并输出，落盘是附加价值。
+    let session_store = match resume.as_deref() {
+        Some(spec) => {
+            let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
+            let id = resume::resolve_thread_id(&store, spec)?;
+            Some(
+                crate::session_store::TuiSessionStore::open(&workdir, &id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        }
+        None => {
+            let model = config.model.clone();
+            match crate::session_store::TuiSessionStore::create_new(
+                &workdir,
+                &model,
+                yi_agent_app_server::thread_store::ThreadMode::Normal,
+            ) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    eprintln!("[yi-agent] 本次会话不落盘: {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    // resume 的种子：先升格崩溃残留的轮次，再读转录。顺序固定——反过来会
+    // 读到未合流的旧状态。升格失败只记日志：`load` 自己也会合流 partial，
+    // 消息不会丢，升格的意义是让磁盘也收尾。
+    let mut seed_messages = Vec::new();
+    let mut seed_last_input = None;
+    if let Some(store) = &session_store {
+        if resume.is_some() {
+            if let Err(e) = store.promote_pending() {
+                eprintln!("[yi-agent] 未能升格未收尾的轮次: {e}");
+            }
+            let (messages, last_input) = store.load_seed()?;
+            seed_messages = messages;
+            seed_last_input = last_input;
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async move {
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let mut session = yi_agent_core::Session::from_messages(seed_messages);
+        session.set_last_input_tokens(seed_last_input);
+        let session_handle = Arc::new(std::sync::Mutex::new(session));
+
         let mut agent = yi_agent_core::Agent::new(provider, tools, agent_config)
-            .with_permission(checker, decision_rx);
+            .with_permission(checker, decision_rx)
+            .with_session_arc(Arc::clone(&session_handle));
         // The delegation tools were assembled with `runtime_caller`; binding it to
         // this agent's live session makes a `fork:true` spawn read the caller's
         // transcript at call time.
         if let Some(caller) = &runtime_caller {
             caller.bind(agent.session_handle());
         }
+
+        // 必须在 `agent.run` 之前取：run 内部会 push 本轮 user message。
+        let base_len = agent
+            .session_handle()
+            .lock()
+            .map(|s| s.messages().len())
+            .unwrap_or(0);
+        let prompt_for_log = prompt_text.clone();
 
         let stream = match agent.run(prompt_text).await {
             Ok(s) => s,
@@ -1811,11 +2052,40 @@ fn run_headless(
             }
         };
 
+        let mut turn_log = crate::turn_log::TurnLog::new(session_store.as_ref().map(|s| {
+            yi_agent_app_server::translate::Translator::new(
+                s.thread_id().to_string(),
+                s.baseline_totals(),
+            )
+        }));
+        turn_log.begin_turn();
+
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let mut out = stdout.lock();
         let mut err = stderr.lock();
-        drain_with_signals(stream, &mut out, &mut err, json, &agent).await
+        let code =
+            drain_with_signals(stream, &mut out, &mut err, json, &agent, &mut turn_log).await;
+
+        // 落盘。与 TUI 一样挂在 stream 结束上而不是 `Done`：取消路径不发 Done。
+        if let Some(store) = session_store.as_ref() {
+            let messages = agent
+                .session_handle()
+                .lock()
+                .map(|s| s.messages().to_vec())
+                .unwrap_or_default();
+            if let Some((items, usage, usage_total)) =
+                turn_log.finish(&prompt_for_log, &messages, base_len, true)
+            {
+                if let Err(e) = store.append_turn(&items, &messages, usage, usage_total) {
+                    eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                }
+                if let Err(e) = store.touch(&prompt_for_log) {
+                    eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                }
+            }
+        }
+        code
     });
 
     // Close MCP server connections on a running reactor so the child processes
@@ -1988,6 +2258,7 @@ fn run_tui_agent(
     process_manager: Arc<yi_agent_tools::ProcessManager>,
     catalog: Option<yi_agent_runtime::bootstrap::SkillsCatalogHandle>,
     mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
+    seed: Option<ResumeSeed>,
 ) -> Result<()> {
     use futures::StreamExt;
     use std::sync::atomic::AtomicBool;
@@ -2078,19 +2349,136 @@ fn run_tui_agent(
             mcp_master: mcp.master(),
             runtime_preference: runtime_preference.to_string(),
             runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
+            notifications: config.notifications,
+            // 归一化：配置里的非法值（手改 settings.json）按默认处理，同时
+            // 保证 `/config` 显示的是规范串而不是用户写错的原文。
+            notification_method: crate::tui::notify::Method::parse(&config.notification_method)
+                .unwrap_or(crate::tui::notify::Method::Auto)
+                .as_str()
+                .to_string(),
+            notification_condition: crate::tui::notify::Condition::parse(
+                &config.notification_condition,
+            )
+            .unwrap_or(crate::tui::notify::Condition::Unfocused)
+            .as_str()
+            .to_string(),
+            effective_backend: {
+                let method = crate::tui::notify::Method::parse(&config.notification_method)
+                    .unwrap_or(crate::tui::notify::Method::Auto);
+                crate::tui::notify::Notifier::new(
+                    method,
+                    crate::tui::notify::Condition::Unfocused,
+                    &crate::tui::notify::TerminalEnv::from_process(),
+                )
+                .effective_backend()
+                .to_string()
+            },
+            terminal_title: config.terminal_title,
+            title_status: {
+                let multiplexed = crate::tui::notify::is_multiplexed(
+                    &crate::tui::notify::TerminalEnv::from_process(),
+                );
+                crate::tui::title::TitleWriter::new(config.terminal_title, multiplexed)
+                    .status()
+                    .to_string()
+            },
+            focus_degraded: false,
         };
+
+        // 会话存储：resume/fork 用调用方已打开的那份（它已持锁），
+        // 否则现建一个新会话。建失败不阻断 TUI——只是这次会话不落盘，
+        // 用户仍能对话。
+        let (initial_messages, initial_last_input, startup_prompt, seeded_store, replay_cells) =
+            match seed {
+                Some(seed) => {
+                    // 回放要用落盘的 items，不是种进 session 的 messages：
+                    // 前者是用户可见的条目，后者是发给 provider 的转录。
+                    let cells = seed
+                        .store
+                        .load_for_replay()
+                        .map(|loaded| {
+                            let mut cells = crate::tui::replay::items_to_cells(&loaded.items);
+                            if loaded.pending_turn {
+                                cells.push(crate::tui::cell::HistoryCell::Separator {
+                                    label: Some("上一轮已中断".into()),
+                                });
+                            }
+                            cells
+                        })
+                        .unwrap_or_else(|e| {
+                            // 回放失败不阻断：上下文仍是对的，只是屏幕空着。
+                            eprintln!("[yi-agent] 历史回放失败（对话可继续）: {e}");
+                            Vec::new()
+                        });
+                    (
+                        seed.messages,
+                        seed.last_input_tokens,
+                        seed.prompt,
+                        Some(Arc::new(seed.store)),
+                        cells,
+                    )
+                }
+                None => (Vec::new(), None, None, None, Vec::new()),
+            };
+        let session_store: Option<Arc<crate::session_store::TuiSessionStore>> =
+            match seeded_store {
+                Some(store) => Some(store),
+                None => {
+                    let model = agent_config.model.clone();
+                    let mode = if config.yolo {
+                        yi_agent_app_server::thread_store::ThreadMode::Yolo
+                    } else {
+                        yi_agent_app_server::thread_store::ThreadMode::Normal
+                    };
+                    match crate::session_store::TuiSessionStore::create_new(
+                        &snapshot_workdir,
+                        &model,
+                        mode,
+                    ) {
+                        Ok(store) => Some(Arc::new(store)),
+                        Err(e) => {
+                            eprintln!("[yi-agent] 本次会话不落盘: {e}");
+                            None
+                        }
+                    }
+                }
+            };
+        let session_store_for_driver = session_store.clone();
+
+        // resume/fork 带进来的提示词：预置进输入队列，driver 一启动就会
+        // 把它当成第一条 prompt。容量 16 且尚未消费任何一条，try_send 不会失败。
+        if let Some(text) = startup_prompt {
+            let _ = input_tx.try_send(text);
+        }
 
         let driver_workdir = snapshot_workdir.clone();
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
+            // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
+            // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
+            let mut turn_log = crate::turn_log::TurnLog::new(session_store_for_driver.as_ref().map(
+                |s| {
+                    yi_agent_app_server::translate::Translator::new(
+                        s.thread_id().to_string(),
+                        s.baseline_totals(),
+                    )
+                },
+            ));
             let catalog = catalog;
+            // session 必须在首次构造时就存在，且要跨 rebuild 存活——子 agent
+            // 的 CallerContext 绑在它上面。resume 时用种子填进去；新会话等价于
+            // 原来的空 session，行为零变化。
+            let mut initial = yi_agent_core::Session::from_messages(initial_messages.clone());
+            initial.set_last_input_tokens(initial_last_input);
+            let session_handle = Arc::new(std::sync::Mutex::new(initial));
             let mut agent = yi_agent_core::Agent::new(
                 Arc::clone(&provider_clone),
                 Arc::clone(&current_tools),
                 config_clone,
             )
-            .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx));
+            .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx))
+            .with_session_arc(Arc::clone(&session_handle));
 
 
             loop {
@@ -2119,6 +2507,16 @@ fn run_tui_agent(
                             );
                             handle.lock().unwrap().replace_messages(Vec::new());
                             handle.lock().unwrap().set_last_input_tokens(None);
+                            // 持久化也要清：否则 resume 回来历史还在，与屏幕不符。
+                            if let Some(store) = session_store_for_driver.as_ref()
+                                && let Err(e) = store.clear()
+                            {
+                                eprintln!("[yi-agent] /clear 落盘失败: {e}");
+                            }
+                            // 用量累计归零：否则清空对话后状态栏仍显示旧总数，
+                            // 用户会以为清空没生效。app-server 在同一位置调
+                            // `translator.reset_totals()`（server.rs:5368）。
+                            turn_log.reset_totals();
                             tracing::info!("agent session cleared via /clear");
                         }
                         DriverControl::Compact => {
@@ -2152,6 +2550,17 @@ fn run_tui_agent(
                                     // count would re-trigger auto-compaction on
                                     // the very next turn.
                                     handle.lock().unwrap().set_last_input_tokens(None);
+                                    // 持久化：只换上下文、不写 items——/compact 不改
+                                    // 变用户可见的内容集合，回放时不该多出一段。
+                                    if let Some(store) = session_store_for_driver.as_ref() {
+                                        let snapshot = handle
+                                            .lock()
+                                            .map(|s| s.messages().to_vec())
+                                            .unwrap_or_default();
+                                        if let Err(e) = store.compact(&snapshot) {
+                                            eprintln!("[yi-agent] /compact 落盘失败: {e}");
+                                        }
+                                    }
                                     tracing::info!("agent session compacted via /compact");
                                     let _ = agent_tx
                                         .send(manual_compaction_outcome_event(
@@ -2527,6 +2936,21 @@ fn run_tui_agent(
                         agent.set_system_prompt(Some(prompt));
                     }
                 }
+
+                // 每轮重置累积器。`begin_turn` 内的 `set_turn` 必须先于
+                // `on_event`：`alloc_item_id` 依赖 turn_id。
+                // **不要**在这里重建 TurnLog 里的 Translator：那会清掉 committed 累计。
+                turn_log.begin_turn();
+                // 必须在 `agent.run` 之前取：run 内部会 push 本轮 user message，
+                // 取晚了基线含它，net 恒少 1。
+                let base_len = agent
+                    .session_handle()
+                    .lock()
+                    .map(|s| s.messages().len())
+                    .unwrap_or(0);
+                // `agent.run(text)` 会 move 掉 text；落盘与 touch 都需要它。
+                let prompt_for_log = text.clone();
+
                 match agent.run(text).await {
                     Ok(stream) => {
                         let mut stream = Box::pin(stream);
@@ -2539,6 +2963,10 @@ fn run_tui_agent(
                                 event = stream.next() => {
                                     match event {
                                         Some(ev) => {
+                                            // 翻译用 `ev.clone()`：AgentEvent 已派生 Clone。
+                                            // 落盘口径与 app-server 完全一致，不存在第二套映射
+                                            // （映射与裁剪都在 `TurnLog`，headless 共用同一份）。
+                                            turn_log.feed(ev.clone());
                                             if agent_tx.send(ev).await.is_err() {
                                                 break;
                                             }
@@ -2560,8 +2988,11 @@ fn run_tui_agent(
                                 _ = interrupt_rx.recv() => {
                                     // User pressed Ctrl+C/Esc: cancel agent
                                     agent.cancel();
-                                    // Drain remaining events until Cancelled/Done
+                                    // Drain remaining events until Cancelled/Done。
+                                    // **必须同样翻译**：取消轮也要落盘（只是会被下面的
+                                    // 裁剪截短），否则 Ctrl+C 那轮永久丢失。
                                     while let Some(ev) = stream.next().await {
+                                        turn_log.feed(ev.clone());
                                         if agent_tx.send(ev).await.is_err() { break; }
                                     }
                                     break;
@@ -2602,6 +3033,28 @@ fn run_tui_agent(
                         let _ = agent_tx.send(yi_agent_core::AgentEvent::Error(e)).await;
                     }
                 }
+
+                // 落盘。**不能只挂在 Done 上**：取消路径（agent.rs 里 truncate 之后
+                // 发 Cancelled 再 return）压根不发 Done，只挂 Done 会让每次 Ctrl+C
+                // 的那一轮静默丢失。stream 结束即落盘，是否截短由下面的 net 决定。
+                if let Some(store) = session_store_for_driver.as_ref() {
+                    let messages = agent
+                        .session_handle()
+                        .lock()
+                        .map(|s| s.messages().to_vec())
+                        .unwrap_or_default();
+
+                    if let Some((items, usage, usage_total)) =
+                        turn_log.finish(&prompt_for_log, &messages, base_len, true)
+                    {
+                        if let Err(e) = store.append_turn(&items, &messages, usage, usage_total) {
+                            eprintln!("[yi-agent] 落盘失败（对话继续）: {e}");
+                        }
+                        if let Err(e) = store.touch(&prompt_for_log) {
+                            eprintln!("[yi-agent] 更新 meta 失败: {e}");
+                        }
+                    }
+                }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             }
             if current_runtime.is_some() {
@@ -2637,6 +3090,7 @@ fn run_tui_agent(
                 // 读一次模型清单供 TUI 的 `/model` 显示（机器级全局文件）；
                 // 无文件即空清单，行为与今天一致。
                 yi_agent_runtime::models::load_catalog(),
+                replay_cells,
             )
         });
 
@@ -2645,6 +3099,21 @@ fn run_tui_agent(
             Ok(Err(e)) => Err(anyhow::Error::from(e)),
             Err(e) => Err(anyhow::Error::from(e)),
         };
+
+        // 退出后告诉用户怎么接上这场对话。
+        //
+        // **必须在这里打印**：TUI 用的是备用屏幕，进去写的东西随退出一起消失
+        // （与 `report_dropped_pending` 同一条理由）。此刻已恢复主屏幕。
+        //
+        // 空会话不提示：刚启动就退出时，resume 出来仍是空的，提示它等于让人
+        // 白跑一趟。写到 stderr 与既有的退出信息保持同一路，不污染 stdout。
+        if let Some(hint) = session_store
+            .as_ref()
+            .map(|s| s.as_ref())
+            .and_then(resume_hint)
+        {
+            eprint!("{hint}");
+        }
 
         if let Some((socket, root)) = runtime_detach
             .lock()
@@ -2732,6 +3201,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resume_hint_names_the_real_thread_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::session_store::TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            yi_agent_app_server::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        store
+            .append_turn(
+                &[yi_agent_app_server::protocol::Item::UserMessage {
+                    id: "u1".into(),
+                    text: "问".into(),
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                }],
+                &[yi_agent_core::Message {
+                    role: yi_agent_core::Role::User,
+                    content: vec![yi_agent_core::ContentBlock::Text("问".into())],
+                }],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let hint = resume_hint(&store).expect("有内容就该给提示");
+        // 必须是可直接粘贴的命令，不是占位符。
+        assert!(
+            hint.contains(&format!("yi-agent resume {}", store.thread_id())),
+            "提示里要带真实 id，实际: {hint}"
+        );
+        assert!(hint.contains("yi-agent resume --last"), "也要给省事的写法");
+    }
+
+    #[test]
+    fn resume_hint_is_silent_for_a_fresh_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::session_store::TuiSessionStore::create_new(
+            dir.path(),
+            "m",
+            yi_agent_app_server::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        assert!(
+            resume_hint(&store).is_none(),
+            "空会话 resume 出来还是空的，不该提示"
+        );
+    }
+
+    #[test]
     fn parse_listen_accepts_stdio() {
         assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
     }
@@ -2742,10 +3261,20 @@ mod tests {
         // app-server 一致），不是 workdir 内的本地路径。
         // Needles built from fragments so this test's own source cannot satisfy them.
         let source = include_str!("main.rs");
-        // 只取 `run_agent` 本体，到下一个列 0 的 `fn` 为止：否则 needle 会被文件后面
+        // 只取真正的入口本体，到下一个列 0 的 `fn` 为止：否则 needle 会被文件后面
         // 同名调用（`run_headless` 也调用 `load_lenient`）满足，断言就成了空转。
+        // 注意切片目标是 `run_agent_with_seed`：`run_agent` 只是转调它的薄包装，
+        // resume 复用的是同一个函数体，断言必须盯住真正执行逻辑的那个。
+        // 环境前置被抽成 `prepare_environment`，引导语句仍在入口本体里。
+        // 两段一起看：否则抽函数会让这条断言悄悄失效（它断的是「顺序」，
+        // 而顺序跨了函数边界）。
+        let helper = source
+            .split("fn prepare_environment(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("prepare_environment must exist");
         let body = source
-            .split("fn run_agent(")
+            .split("fn run_agent_with_seed(")
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("run_agent must exist");
@@ -2790,9 +3319,14 @@ mod tests {
             "a machine with neither a key nor a catalog entry must get the guidance line, \
              and the check must require a non-empty model as well as a key"
         );
+        // 全局 `.env` 路径在辅助函数里算，`prefs_path` 由它返回。
         assert!(
-            body.contains(&global),
+            helper.contains(&global),
             "onboarding must target the global env path"
+        );
+        assert!(
+            body.contains("prepare_environment()"),
+            "就绪步骤必须先跑一次，否则 workdir 会从旧路径解析"
         );
     }
 
@@ -2938,18 +3472,30 @@ mod tests {
     #[test]
     fn the_env_migration_runs_before_config_loading() {
         let source = include_str!("main.rs");
-        let run_agent_at = source.find("fn run_agent(").expect("run_agent must exist");
-        let body = &source[run_agent_at..];
-        let body = body.split("\nfn ").next().expect("body terminates");
-
-        let migration_at = body
+        // 迁移被抽进 `prepare_environment`，入口只负责先调它。这里断两件事：
+        // 迁移确实在辅助函数里、且辅助函数先于 `config::load_lenient` 被调。
+        let helper = source
+            .split("fn prepare_environment(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("prepare_environment must exist");
+        helper
             .find("migrate::migrate_env_settings(")
-            .expect("run_agent must migrate .env before loading config");
-        let load_at = body
+            .expect("prepare_environment must migrate .env");
+
+        let entry = source
+            .split("fn run_agent_with_seed(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("run_agent_with_seed must exist");
+        let prepare_at = entry
+            .find("prepare_environment()")
+            .expect("the entry must run the migration helper");
+        let load_at = entry
             .find("config::load_lenient(")
             .expect("run_agent must load config");
         assert!(
-            migration_at < load_at,
+            prepare_at < load_at,
             "the .env migration must run before the config is loaded, otherwise values get \
              injected into the process env and then lost on the next start"
         );
@@ -3717,7 +4263,10 @@ mod tests {
             Some(flags),
             Some("dev"),
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 宽预算：本测试断言的是「监督器会拉起子进程」，不是「它 3 秒内拉起」。
+        // 实测全量并发下这一拍要 3.03s（单跑 0.52s），固定 3s 只是把机器负载
+        // 写进了断言。30s 是 backstop，不是期望值——正常情况下 1s 内就返回。
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut started = false;
         while Instant::now() < deadline {
             if marker.exists() {
@@ -4014,6 +4563,10 @@ mod tests {
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
             model_injected: false,
+            notifications: true,
+            notification_method: "auto".into(),
+            notification_condition: "unfocused".into(),
+            terminal_title: true,
         }
     }
 
@@ -4441,7 +4994,15 @@ mod tests {
             .build()
             .expect("build runtime");
         let agent = test_agent();
-        rt.block_on(drain_with_signals(stream, out, err, false, &agent))
+        let mut turn_log = crate::turn_log::TurnLog::new(None);
+        rt.block_on(drain_with_signals(
+            stream,
+            out,
+            err,
+            false,
+            &agent,
+            &mut turn_log,
+        ))
     }
 
     fn drain_stream_json_sync<W: std::io::Write>(
@@ -4454,7 +5015,15 @@ mod tests {
             .expect("build runtime");
         let agent = test_agent();
         let mut err = Vec::new();
-        rt.block_on(drain_with_signals(stream, out, &mut err, true, &agent))
+        let mut turn_log = crate::turn_log::TurnLog::new(None);
+        rt.block_on(drain_with_signals(
+            stream,
+            out,
+            &mut err,
+            true,
+            &agent,
+            &mut turn_log,
+        ))
     }
 
     /// A real `Agent` over a provider that is never called. `drain_with_signals`

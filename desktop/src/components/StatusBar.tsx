@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { compact } from "../lib/compactNumber";
+import { connectionStatusLabel } from "../lib/connectionStatus";
 import type { SubagentTotals, Usage, UsageTotals } from "../lib/protocol";
 import { RollingNumber } from "./RollingNumber";
 import { UsagePanel } from "./UsagePanel";
@@ -117,7 +118,14 @@ export function StatusBar({
         className={`inline-block h-2 w-2 rounded-full ${connected ? "bg-emerald-500" : "bg-red-500"}`}
         title={status}
       />
-      <span className="text-fg-muted">{status}</span>
+      {/*
+        `title` 留着原始状态：底栏用的是中文说法（`connecting` / `exited` /
+        `error: …` 对用户没有意义），排查连接问题时把鼠标放上去仍能看到传输层
+        原值，两边各取所需。
+      */}
+      <span className="text-fg-muted" title={status}>
+        {connectionStatusLabel(status)}
+      </span>
       {cwd && <span className="truncate font-mono">{cwd}</span>}
       <div className="ml-auto flex items-center gap-3">
         {shown && (

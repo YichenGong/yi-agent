@@ -84,10 +84,20 @@ fn field_value(current: &settings::Settings, spec: &settings::FieldSpec) -> Valu
         }
         "agent.system_prompt" => opt(current.agent.system_prompt.clone().map(Value::from)),
         "agent.skills_catalog_budget" => opt(current.agent.skills_catalog_budget.map(Value::from)),
+        settings::PREVENT_IDLE_SLEEP_KEY => {
+            opt(current.power.prevent_idle_sleep.clone().map(Value::from))
+        }
+        "power.idle_grace_minutes" => opt(current.power.idle_grace_minutes.map(Value::from)),
+        "power.remote_touch_minutes" => opt(current.power.remote_touch_minutes.map(Value::from)),
         "compact.ratio" => opt(current.compact.ratio.map(Value::from)),
         "compact.user_budget_tokens" => opt(current.compact.user_budget_tokens.map(Value::from)),
         "compact.tool_budget_tokens" => opt(current.compact.tool_budget_tokens.map(Value::from)),
         "startup.sandbox" => opt(current.startup.sandbox.clone().map(Value::from)),
+        "tui.notifications" => opt(current.tui.notifications.clone().map(Value::from)),
+        "tui.notification_method" => opt(current.tui.notification_method.clone().map(Value::from)),
+        "tui.notification_condition" => {
+            opt(current.tui.notification_condition.clone().map(Value::from))
+        }
         _ => Value::Null,
     }
 }

@@ -107,5 +107,9 @@ pub(crate) fn test_config() -> RuntimeConfig {
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: false,
         model_injected: false,
+        notifications: true,
+        notification_method: "auto".to_string(),
+        notification_condition: "unfocused".to_string(),
+        terminal_title: true,
     }
 }

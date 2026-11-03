@@ -29,7 +29,7 @@ use crate::server::{
     chunk_items_for_replay, collect_pinned, detach_unused_runtimes, err_response,
     interrupt_and_wait_for_persist, item_id, linked_extra_roots, ok_response, require_known_thread,
     require_thread_id, resolve_thread_cwd, run_thread_driver, start_thread_core, store_lookup,
-    thread_summary_json, thread_summary_json_with_status, watch_processes,
+    thread_cwd, thread_summary_json, thread_summary_json_with_status, watch_processes,
     with_session_extra_roots, with_session_model_ref, with_session_preserve_thinking,
     with_session_reasoning_effort, worktree_json, write_notification, write_notification_await,
     write_response,
@@ -565,6 +565,33 @@ pub(crate) async fn handle(
             // 会让新 driver 永远收不到（旧 sender 的接收端已随旧 driver 退出）。
             let (subagent_tx, subagent_rx) =
                 tokio::sync::watch::channel(crate::protocol::SubagentTotals::default());
+            // 成为该 thread 的 writer 前必须拿到跨进程锁。拿不到就直接报错，
+            // 不建半个 session——半建状态会让后续 resume 看到不一致的运行时。
+            //
+            // 取锁点放在这里（即将 insert 进 threads 表）而不是更早：在此之前的
+            // 所有步骤（load、build_agent、attach_delegation）都只是**读**，
+            // 不构成双写。放在这里也保证失败时没有留下任何注册项。
+            // 只有 `Busy` 才拒绝：另一个 writer 真的在写它。
+            // `Io`（锁文件建不出来）不阻断——锁是防双写的附加保护，不是会话
+            // 能否打开的充要条件；此时退化为「无锁」并记一行，与加锁前行为一致。
+            let writer_lock =
+                match crate::thread_store::acquire_thread_lock(thread_store.root(), &thread_id) {
+                    Ok(lock) => Some(lock),
+                    Err(crate::thread_store::ThreadLockError::Busy(busy)) => {
+                        write_response(
+                            state.hub,
+                            state.client,
+                            err_response(id, RpcError::internal(busy.to_string())),
+                        )
+                        .await?;
+                        return Ok(Flow::Continue);
+                    }
+                    Err(e @ crate::thread_store::ThreadLockError::Io(_)) => {
+                        tracing::warn!(%e, thread_id = %thread_id, "会话写锁不可用，退化为无锁");
+                        None
+                    }
+                };
+
             state.threads.insert(
                 thread_id.clone(),
                 ThreadSession {
@@ -581,6 +608,7 @@ pub(crate) async fn handle(
                     store: Arc::clone(&thread_store),
                     status: Arc::clone(&store_status),
                     subagent_tx,
+                    writer_lock,
                 },
             );
 
@@ -727,6 +755,113 @@ pub(crate) async fn handle(
                 ),
             )
             .await?;
+        }
+        "thread/fork" => {
+            // 与 `thread/rename` / `thread/delete` 同档：Control 本就能
+            // `thread/start` + `turn/start`，单开此门不扩大能力面。
+            if state.client_scope < Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            // 冷会话必须能 fork：复制一个旧会话去分支正是主要用法，所以不能
+            // 只看 `state.threads`，要走 store_lookup。
+            let store = store_lookup(state.threads, state.workspaces, state.cfg, &thread_id);
+            let in_memory = state.threads.contains_key(&thread_id);
+            if !in_memory && !store.exists(&thread_id) {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+
+            // 运行中一律拒绝，且必须在任何磁盘动作之前：复制到半轮会产生一个
+            // 结尾停在裸 tool_use 上的坏副本。判据与 `power_busy::local_busy`
+            // 同一形状：有活跃 turn，或状态不是 Idle（含 awaiting_approval）。
+            if let Some(session) = state.threads.get(&thread_id) {
+                let status = *session
+                    .status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if session.active_turn_id.is_some() || !matches!(status, ThreadStatus::Idle) {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::turn_in_progress(&thread_id)),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
+            }
+
+            // 目录没了就没法写出一个能打开的会话：明确报错，而不是让它落盘之后
+            // 才在 resume 阶段失败。口径对齐 `thread/resume` 的同款检查。
+            let Some(cwd) = thread_cwd(state.threads, state.workspaces, state.cfg, &thread_id)
+            else {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            };
+            if !cwd.is_dir() {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        RpcError::invalid_params(format!(
+                            "working directory no longer exists: {}",
+                            cwd.display()
+                        )),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+
+            let new_id = format!("thread-{}", uuid::Uuid::new_v4());
+            match store.fork_thread(&thread_id, &new_id) {
+                Ok(created) => {
+                    // 标题从落盘的 meta 回读：`fork_thread` 已经算好（含无标题时的
+                    // 兜底派生），这里再推导一遍只会两处规则漂移。
+                    let title = store
+                        .read_meta(&created)
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.title);
+                    write_response(
+                        state.hub,
+                        state.client,
+                        ok_response(id, json!({ "thread_id": created, "title": title })),
+                    )
+                    .await?;
+                }
+                // `WouldBlock` 时 message 已是 `ThreadBusy` 的中文（「会话 X 正被
+                // 另一个 yi-agent 实例使用」），原样上抛，客户端不必再翻译。
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?;
+                }
+            }
         }
         "thread/rename" => {
             let Some(thread_id) =

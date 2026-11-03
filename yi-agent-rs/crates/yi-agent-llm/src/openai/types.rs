@@ -588,7 +588,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let json = serde_json::to_value(&OpenaiRequest::from(req)).unwrap();
+        let json = serde_json::to_value(OpenaiRequest::from(req)).unwrap();
         assert_eq!(
             json["reasoning_effort"], "none",
             "chat 通道用 effort=none 表达「不思考」: {json}"
@@ -605,7 +605,7 @@ mod tests {
             tools: vec![],
             params: GenParams::default(),
         };
-        let json = serde_json::to_value(&OpenaiRequest::from(req)).unwrap();
+        let json = serde_json::to_value(OpenaiRequest::from(req)).unwrap();
         assert!(json.get("reasoning_effort").is_none(), "{json}");
     }
 

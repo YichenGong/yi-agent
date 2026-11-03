@@ -27,11 +27,14 @@ use std::time::{Duration, Instant};
 
 use crate::manifest::{SupervisorManifest, load_manifests};
 
-/// 单次 `<plugin> manifest` 的上限。
+/// 等插件 `manifest` 子命令自述的超时。
 ///
-/// 自述是一次本地进程调用，正常在毫秒级；给到 5 秒是为了容忍冷启动与慢磁盘，
-/// 同时不让一个卡死的插件把 daemon 启动拖成几十秒。
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 5s 在冷进程启动 + CI 高并发下会被击穿（实测：并发跑 87 个测试时，一个
+/// 只做 `cat` 的 shell 脚本也能超过 5s，校准被误判成 `Skipped`）。代价分析：
+/// 这个超时只在**插件自己坏掉**时才会走满，走满的结果是回退到磁盘上的旧清单
+/// （`RefreshOutcome::Skipped`），不影响 reconcile 循环，也不影响启动延迟之外
+/// 的任何路径。因此把它放宽到 15s，用「坏插件多等 10s」换「好插件不被误判」。
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 一次刷新的结果，供调用方决定要不要记日志。
 #[derive(Debug, Clone, PartialEq, Eq)]

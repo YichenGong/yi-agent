@@ -140,6 +140,12 @@ codesign -v "$APP"   # 应 exit 0
 - **提交前必须跑 `cargo fmt --all`**(在 `yi-agent-rs/` 下),保证代码格式
   通过 `just fmt-check`。`git commit` 前的 hook 不自动跑 fmt,所以需要手动
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
+- **提交前必须自检 `just ci` 全绿**(在 `yi-agent-rs/` 下),合并到 `main` 后再
+  在合并结果上跑一次。它是 CI 的唯一入口(GitHub PR / GitLab MR 都只跑它),
+  涵盖 14 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
+  `test`、`build`、`bindings-check`、`secret-check` 等。实际清单以
+  `yi-agent-rs/justfile` 的 `ci:` 行为准(共 14 项依赖)。少跑一次就可能让
+  `main` 直接变红;本地几分钟,比事后回滚便宜。
 
 ## 磁盘占用:`target/` 会无限膨胀
 
@@ -182,39 +188,115 @@ Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉�
 
 ## cargo test 执行
 
+### 并发与锁: 先理解为什么"跑第二个像卡死"
+
+cargo 每次运行(包括 `cargo test`)在**编译阶段**都要抢两类文件锁。这不是项目
+特有的问题,是 cargo 的标准行为,理解它就不会把正常排队误判成死锁。
+
+| 锁文件 | 作用域 | 冲突时的输出 |
+|---|---|---|
+| `~/.cargo/.package-cache`、`~/.cargo/.package-cache-mutate` | **全局**,跨仓库、跨 worktree 共享 | `Blocking waiting for file lock on package cache` |
+| `<target>/{debug,release}/.cargo-lock` | **单个 target 目录** | `Blocking waiting for file lock on build directory` |
+
+实测结论(2026-11-01,cargo 1.98.1 / macOS / 128G 内存 18 核):
+
+- 锁**只在编译阶段持有**。测试真正跑起来后 `lsof <target>/debug/.cargo-lock` 为空,
+  所以编译完成后的测试执行可以真并行。
+- 同 target 并发 4 个 `cargo test`(需重新编译): 分别 1.0s / 2.0s / 2.5s / 6.4s
+  完成,**全部 rc=0**。是**串行排队**,不是死锁。
+- 不同 worktree(各自 `target/`)并发: 只在全局 package cache 上短暂互斥
+  (毫秒级),编译本身并行。用 `--offline` 可把 `Blocking` 次数从 3~4 次降到 2 次。
+
+**看着"永远卡死"的三个真实触发条件**,按可能性排序:
+
+1. **持锁进程被暂停**(Ctrl-Z / 终端挂起 / `SIGSTOP`)。锁由文件描述符持有,
+  进程没退出锁就不释放,后来者无限期等待。实测: 持锁进程 `stat=T` 时第二个
+  cargo 20 秒毫无进展,`kill -CONT` 或杀掉后立刻完成。**这是最像死锁的情形。**
+2. **前一个 cargo 在跑全量 workspace 编译**。一次十几分钟很正常,第二个全程只有
+  一行 `Blocking waiting`,看起来毫无反应。
+3. **多个 worktree 共用同一个 `target/`**(显式设了同一个 `CARGO_TARGET_DIR`
+  或软链)。才会撞 `build directory` 锁,各用各的 `target/` 不会。
+
+**诊断(一条命令看清谁占着锁、谁被暂停)**:
+
+```bash
+# stat 列出现 T 就是被挂起的元凶,kill -CONT <pid> 恢复或 kill -9 清掉
+ps ax -o pid=,stat=,etime=,command= | grep -E "cargo |rustc " | grep -v grep
+
+# 谁持有全局缓存锁 / 各 target 的构建锁(包含 .worktrees/ 下的)
+lsof ~/.cargo/.package-cache-mutate 2>/dev/null
+find . -name '.cargo-lock' 2>/dev/null | while read f; do
+  printf '%-45s -> %s\n' "$f" "$(lsof "$f" 2>/dev/null | tail -n +2 | awk '{print $1"/"$2}' | tr '\n' ' ')"
+done
+```
+
+**要在同一仓库并行跑测试**,按推荐度选:
+
+```bash
+# 1) 各自独立 target: 最彻底,代价是首次编译不共享缓存
+CARGO_TARGET_DIR=target/a cargo test -p yi-agent-core &
+CARGO_TARGET_DIR=target/b cargo test -p yi-agent-tools &
+
+# 2) 先统一编译,再并发跑二进制: 此时已无构建锁,最省时间
+cargo test --workspace --no-run
+target/debug/deps/yi_agent_tools-<hash> &
+target/debug/deps/yi_agent_store-<hash> &
+
+# 3) 串行跑: 最省事,用 && 而不是 &
+cargo test -p yi-agent-core && cargo test -p yi-agent-tools
+```
+
+> 用独立 `CARGO_TARGET_DIR` 时注意: `crates/yi-agent/tests/` 里有 5 处依赖
+> `CARGO_BIN_EXE_yi-agent` 或回退到相对路径 `target/debug/yi-agent`。前者由 cargo
+> 注入所以照常可用,后者在 cwd 不是 `yi-agent-rs/` 时会找不到二进制。
+
+### 排查具体测试卡住(与上面的构建锁是两回事)
+
+- **先分清是编译卡还是测试卡**: `cargo test --no-run` 秒级完成就说明编译没问题,
+  卡住的是测试运行阶段,此时与 cargo 锁无关。
+- 如果 `cargo test` 一直卡住(尤其是 cancel / interrupt 类测试),先怀疑测试代码
+  死锁: 检查测试是否在 `agent.run()` 之前捕获 cancel token,而 `Agent::run()`
+  会重置 token(`agent.rs` Fix 1),导致旧 token cancel 无效。正确写法是在
+  `run()` 之后捕获 token。
+- 单独跑一个卡住的测试名(如 `cargo test -p yi-agent-core --lib <test_name>`)
+  通常秒级返回,一个测试卡而其它不卡,基本是测试代码问题而非环境问题。
+- **定位是哪个测试死锁**: 不要靠猜,用 macOS `sample` 抓调用栈。
+  (1)`ps ax -o pid=,command= | grep yi_agent` 找到测试二进制 PID,
+  (2)`sample <pid> 2`,(3)看 `Call graph` 里的线程名和栈顶函数——线程名通常
+  直接显示 `shell::bash::tests::<test_name>`。比逐个 `--test <name>` 快得多。
+- 直接跑测试二进制(`target/debug/deps/<test_binary>`)可绕过 cargo 的进程管理,
+  配合 `sample` 定位死锁。
+
+### 关于残留进程(纠正一条常见误判)
+
+被中断的 `cargo test` 确实会留下**僵尸测试二进制**(进程名形如
+`yi_agent_tools-<hash>`)。但实测确认: **它们不持有 `.cargo-lock`**——用
+`kill -9` 杀掉 cargo 后残留的测试进程仍在运行,下一个 `cargo test --no-run`
+仍然是 0 秒完成。真正持锁的永远是 **cargo 进程本身**。
+
+所以清理残留进程的目的是回收 CPU/内存、避免端口和临时目录冲突,而**不是**解
+构建锁。解构建锁只有两条路: 让持锁进程结束,或恢复被 `SIGSTOP` 暂停的进程。
+
+```bash
+ps ax -o pid=,stat=,command= | grep -E "cargo|rustc" | grep -v grep
+# 只处理确实残留的(先确认 stat 不是 R 且在编译)
+kill <pid>
+```
+
+`find target -name "*.lock" -type f -delete` 删 incremental 下的 mutex 文件属于
+**最后手段**: 那 298 个文件是 cargo 正常重建的空锁文件,删了不会解开
+`.cargo-lock`,反而可能让正在编译的进程行为异常。
+
+### 跑范围
+
 - 在 worktree 里跑测试用 `cd <worktree>/yi-agent-rs && cargo test ...`,或在
   worktree 根目录用 `cargo test --manifest-path yi-agent-rs/Cargo.toml ...`。
   两种方式都用 worktree 自己的 `yi-agent-rs/target/`,与主仓库互不干扰。
-- **不要**在多个 shell / worktree 同时跑 `cargo test`:即便 target 目录独立,
-  cargo 对 workspace 元数据文件仍有锁竞争,可能导致编译卡死或 exit 137
-  (SIGKILL,通常被 OOM 杀掉)。跑测试前先 `ps aux | grep cargo` 确认没有其他
-  cargo 进程。
-- 如果 `cargo test` 一直卡住(尤其是 cancel/interrupt 类测试),先怀疑测试代码
-  死锁而不是编译卡住:检查测试是否在 `agent.run()` 之前捕获 cancel token,
-  但 `Agent::run()` 会重置 token(`agent.rs` Fix 1),导致旧 token cancel 无效。
-  正确写法是在 `run()` 之后捕获 token。
-- 单独跑一个卡住的测试名(如 `cargo test -p yi-agent-core --lib <test_name>`)
-  通常秒级返回;如果一个测试卡但其它测试不卡,基本是测试代码问题而非环境问题。
-- **被中断的 `cargo test` 会留下僵尸测试二进制进程**(进程名形如
-  `yi_agent_tools-<hash>`),即使 cargo 本身已退出,这些子进程仍在后台持有
-  target 目录锁,导致后续 `cargo test` 立即卡死或 exit 137。复现步骤:
-  跑 `cargo test -p yi-agent-tools --lib`,若被中断,下次再跑会立即卡住。
-  修复:`ps aux | grep -v grep | grep -E "cargo|rustc|yi_agent"`
-  找出残留进程并 `kill <pid>`,必要时 `find target -name "*.lock" -type f -delete`
-  清理 incremental lock 文件(空的 mutex 文件,删了 cargo 会重建)。
-- **定位卡住的测试**:不要靠猜,直接用 macOS `sample` 工具抓取卡住进程的
-  调用栈。步骤:(1) `ps aux | grep -v grep | grep yi_agent` 找到卡住的测试
-  二进制 PID;(2) `sample <pid> 2` 抓 2 秒样本;(3) 看 `Call graph` 里的线程名
-  和栈顶函数——线程名通常会显示 `shell::bash::tests::<test_name>`,直接定位
-  是哪个测试死锁。比逐个 `--test <name>` 排查快得多。
-- **避免 `cargo test --workspace` 全量跑**:workspace 全量编译 + 全量测试
-  会同时启动多个 crate 的测试二进制,容易触发 OOM(exit 137)或死锁级联。
-  优先按 crate 跑:`cargo test -p yi-agent`、`cargo test -p yi-agent-core`、
-  `cargo test -p yi-agent-tools`。确需全量跑时,用 `--jobs 2` 降低并行度,
-  并先 `ps aux | grep cargo` 确认没有残留进程。
-- **编译与运行分离排查**:`cargo test --no-run` 只编译不跑,秒级完成说明
-  编译没问题,卡住的是测试运行;`target/debug/deps/<test_binary>` 直接跑
-  测试二进制可以绕过 cargo 的进程管理,配合 `sample` 定位死锁测试。
+- **避免 `cargo test --workspace` 全量跑**: 全量编译 + 同时拉起多个 crate 的测试
+  二进制,容易 OOM(exit 137)或死锁级联。优先按 crate 跑:
+  `cargo test -p yi-agent`、`-p yi-agent-core`、`-p yi-agent-tools`。确需全量时用
+  `--jobs 2` 降低并行度。本机 128G 内存实测 4 个并发 crate 测试压力可忽略,但
+  低配机器/CI 上全量跑仍要留余量。
 
 ## 真实 LLM 测试
 
@@ -257,10 +339,11 @@ Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉�
   容易成为黑洞(进去就出不来)。
 - 每条 feature 必须带**可验证的完成判据**:代码位置(`file.rs:line`)或
   可执行命令,不要写"已实现权限管理"这种主观描述。
-- 更新模块文件后,同步更新 `README.md` 模块索引表的"完成 / 总计"计数。
+- 更新模块文件后,同步更新 `docs/project-management/README.md` 模块索引表的
+  "完成 / 总计"计数(根 `README.md` 是面向用户的精简版,不再放模块索引)。
 - **新增 crate 时**,同一 PR 内必须:
   1. 在 `docs/project-management/` 下创建对应模块文件
-  2. 在 `README.md` 模块索引表登记一行
+  2. 在 `docs/project-management/README.md` 模块索引表登记一行
 - `bug-list.md` 同理:只有 `[x]` 已修复 / `[ ]` 未修复两态,不用 `[~]`。
 - 维护规则详见 `docs/project-management/README.md` 末尾"维护规则"小节。
 

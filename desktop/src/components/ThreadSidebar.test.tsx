@@ -53,6 +53,7 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onSelect: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
+    onFork: vi.fn(),
     onTogglePin: vi.fn(),
     onReorderPinned: vi.fn(),
     onNew: vi.fn(),
@@ -313,6 +314,22 @@ describe("ThreadSidebar", () => {
     fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "无标签" }));
     expect(onSetTag).toHaveBeenCalledWith("1", null);
+  });
+
+  it("offers 创建副本 in the thread menu and reports the id", () => {
+    const onFork = vi.fn();
+    const { container } = renderSidebar({ onFork });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+    expect(onFork).toHaveBeenCalledWith("1");
+  });
+
+  it("closes the thread menu after 创建副本", () => {
+    const { container } = renderSidebar({ onFork: vi.fn() });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
   });
 
   it("marks the current tag as checked", () => {
@@ -2392,3 +2409,29 @@ describe("分组功能（常开）", () => {
   });
 });
 
+
+describe("ThreadSidebar relative time", () => {
+  /**
+   * 用户报的「20xxxd」：`formatRelativeTime(0)` 曾被算成 1970 年 ⇒ 20758d。
+   * 侧栏与离线提示条共用这个函数，故两处都必须钉住。
+   */
+  it("does not render a day count for a zero updated_at", () => {
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: [thread("1", "zero-time", "/work/projA")] }],
+    });
+    expect(container.textContent).not.toMatch(/\d{3,}d/);
+  });
+
+  it("still renders a normal age", () => {
+    const { container } = renderSidebar({
+      groups: [
+        {
+          workspace: "/work/projA",
+          exists: true,
+          threads: [{ ...thread("1", "fresh", "/work/projA"), updated_at: Date.now() - 5 * 24 * 3600_000 }],
+        },
+      ],
+    });
+    expect(container.textContent).toContain("5d");
+  });
+});

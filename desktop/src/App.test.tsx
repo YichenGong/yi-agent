@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import { CONNECTION_DISCONNECTED_TEXT, ConnectionError } from "./lib/connectionError";
 
 type Mode = "normal" | "yolo";
 type ThreadSeed = {
@@ -140,6 +141,8 @@ vi.mock("./lib/rpc", () => ({
     // Callbacks this instance registered, so `dispose` can remove exactly them —
     // mirroring the real client tearing down its transport subscription.
     private registered: Array<{ list: unknown[]; cb: unknown }> = [];
+    /** 在途请求的 reject，`dispose` 时统一失败（对齐真实客户端的契约）。 */
+    private pending: Array<(e: unknown) => void> = [];
     constructor(
       _transport?: unknown,
       recover?: (raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>,
@@ -170,6 +173,12 @@ vi.mock("./lib/rpc", () => ({
         if (i >= 0) list.splice(i, 1);
       }
       this.registered.length = 0;
+      // 与真实 `RpcClient.dispose` 同一契约：在途请求全部失败，调用方不会
+      // 永远等一个已经被换掉的连接。抛的是结构化连接错误（`formatError`
+      // 会把它翻成人话），这正是「手机端不该看到 rpc client disposed」的现场。
+      for (const reject of this.pending.splice(0)) {
+        reject(new ConnectionError("disconnected", "rpc client disposed"));
+      }
     }
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
@@ -177,8 +186,20 @@ vi.mock("./lib/rpc", () => ({
       if (forced !== undefined) throw { code: forced, message: `forced ${forced}` };
       // Per-test override hook — see `state.dataSources`. Its return value is
       // awaited by callers, so returning a pending promise defers the response.
+      // 若它永不 resolve，这条请求就算「在途」，`dispose` 时必须把它拒掉
+      // （与真实客户端一致），否则调用方会永远挂在一个已废弃的连接上。
       const dataSource = state.dataSources[method];
-      if (dataSource) return dataSource(params);
+      if (dataSource) {
+        const result = dataSource(params);
+        if (result instanceof Promise) {
+          // 登记 reject，好让 `dispose` 能像真实客户端那样把它拒掉。
+          return new Promise((resolve, reject) => {
+            this.pending.push(reject);
+            result.then(resolve, reject);
+          });
+        }
+        return result;
+      }
       if (method === "thread/listAll") {
         this.listCalls += 1;
         if (state.failList) throw { code: -1, message: "list failed" };
@@ -601,8 +622,9 @@ describe("App YOLO wiring", () => {
     state.failList = true;
     render(<App />);
 
-    // The mount path throws and surfaces an error status.
-    await waitFor(() => expect(screen.getByText(/error:/i)).toBeTruthy());
+    // The mount path throws and surfaces a failure status. 底栏显示的是中文说法
+    // （原始 `error: …` 只在 `title` 里），所以这里断言那一句。
+    await waitFor(() => expect(screen.getByText("连接失败，正在重试…")).toBeTruthy());
 
     const chip = modeTrigger() as HTMLButtonElement;
     expect(chip.disabled).toBe(true);
@@ -1571,6 +1593,121 @@ describe("App slash commands", () => {
     // 默认 mock 返回 {},没有 status 字段 → 视为 unknown,提示"未知结果"。
     await screen.findByText(/压缩/);
   });
+
+  it("creates a copy from the sidebar without switching threads", async () => {
+    // fork 之后 App 会 `refreshThreads()`：桩的 `thread/listAll` 只回 `state.threads`，
+    // 新会话不在里面就会被当成「已不存在」。故 fork 时要把它推进 seed。
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-copy", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-copy", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumeCountBefore = clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+    // 右键当前会话行，点「创建副本」。选择器要排除组长行（`data-lead-row`）：
+    // 它同样带 `data-thread-row`，但没有会话菜单。
+    const row = document.querySelector<HTMLElement>("[data-thread-row]:not([data-lead-row])");
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    fireEvent.click(screen.getByRole("menuitem", { name: "创建副本" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/fork")).toBe(true),
+    );
+    // 侧栏入口刻意不切会话：不该多出一次 resume。
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/resume").length,
+    ).toBe(resumeCountBefore);
+  });
+
+  it("forks on /fork and carries the message into the new thread's draft", async () => {
+    // 与侧栏用例同理：`refreshThreads` 之后新会话必须能从 listAll 里读到，
+    // 否则 `selectThread` 的对账会把它判成「服务端已删除」。
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-forked", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-forked", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork 换个思路试试" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/fork")).toBe(true),
+    );
+    // 切到新会话：之后必须为它发一次 resume。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/resume" && (r.params as any)?.threadId === "thread-forked",
+        ),
+      ).toBe(true),
+    );
+    // /fork 后面的文字成为新会话的草稿，不自动发送。
+    await waitFor(() =>
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("换个思路试试"),
+    );
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("leaves the new thread's draft empty when /fork has no message", async () => {
+    state.dataSources["thread/fork"] = () => {
+      state.threads = [
+        { thread_id: "thread-forked", title: "源 (fork)", permission_mode: state.mode },
+        ...(state.threads ?? []),
+      ];
+      return { thread_id: "thread-forked", title: "源 (fork)" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/resume" && (r.params as any)?.threadId === "thread-forked",
+        ),
+      ).toBe(true),
+    );
+    // 命令文本不能被当成草稿搬到新会话。
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("explains a refused /fork instead of switching threads", async () => {
+    state.rejectCode = { "thread/fork": -32012 };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumeCountBefore = clients[0].requests.filter((r) => r.method === "thread/resume").length;
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/fork" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/正在运行，跑完再 fork/);
+    expect(
+      clients[0].requests.filter((r) => r.method === "thread/resume").length,
+    ).toBe(resumeCountBefore);
+  });
 });
 
 /**
@@ -2042,6 +2179,49 @@ describe("App Superpowers 看板 enqueue", () => {
     ).toHaveLength(1);
   });
 
+  /**
+   * 顶栏「＋」→「预排队」是**容器级**动作：它发生在看板页，而看板页不属于任何
+   * 会话的讨论上下文（打开看板只改 `selectedBoard`，不动 `currentId`）。因此这里
+   * 投出去的卡不能带 `origin_thread_id`——`currentId` 是「上次打开的那条会话」，
+   * 与这张卡无关，甚至可能属于另一个项目。
+   *
+   * 会话内的溯源走另一条路径：会话里 `superpowers-kanban add-prequeued` 由宿主经
+   * `YI_AGENT_THREAD_ID` 注入，那里拿到的会话必然是这条讨论本身。
+   */
+  it("does not pin a discussion session on a card added from the board panel", async () => {
+    // 先开一条会话：`currentId` 非空，正是最容易串上脏值的态势。
+    state.threads = [{ thread_id: "t1", title: "discussion", permission_mode: "normal" }];
+    await openBoard();
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
+    fireEvent.change(screen.getByLabelText("预排队标题"), {
+      target: { value: "还没写 spec 的想法" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "预排队" }));
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter(
+          (r) =>
+            r.method === "plugin/query" &&
+            (r.params as { method?: string })?.method === "enqueue_prequeued",
+        ),
+      ).toHaveLength(1),
+    );
+    const [call] = clients[0].requests.filter(
+      (r) =>
+        r.method === "plugin/query" &&
+        (r.params as { method?: string })?.method === "enqueue_prequeued",
+    );
+    // 只有标题，没有来源会话。
+    expect((call.params as { params: Record<string, unknown> }).params).toEqual({
+      title: "还没写 spec 的想法",
+    });
+  });
+
   it("sends nothing when the picker is cancelled", async () => {
     await openBoard();
 
@@ -2059,13 +2239,15 @@ describe("App Superpowers 看板 enqueue", () => {
   });
 
   it("surfaces a rejected enqueue instead of crashing", async () => {
-    state.rpcError["enqueue"] = { code: -32000, message: "forced -32000" };
+    // 用一个中性的服务端错误码：-32000 是中继「没有电脑」的专用码，会被翻成
+    // 那句可操作的提示，本用例要验的是「任意失败都露出来」而非那条分支。
+    state.rpcError["enqueue"] = { code: -32603, message: "forced -32603" };
     await openBoard();
 
     state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
     clickEnqueue();
 
-    await waitFor(() => expect(screen.getByText(/forced -32000/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/forced -32603/)).toBeTruthy());
     // Still usable after the failure: 菜单没关，菜单项也没被禁用。
     expect(
       (screen.getByRole("menuitem", { name: "加入看板" }) as HTMLButtonElement).disabled,
@@ -2770,7 +2952,7 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(2);
     await flush();
     expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true);
-    expect(screen.getByText("connected")).toBeTruthy();
+    expect(screen.getByText("已连接")).toBeTruthy();
 
     // 成功之后的这一次断开,必须从 base(而不是被抬高过的档位)重新起算。
     exit();
@@ -2782,6 +2964,57 @@ describe("App reconnect resilience", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(clients.length).toBe(3);
+  });
+
+  it("shows a disconnect in plain Chinese and drops it once reconnected", async () => {
+    // 用户在这一场景里什么都不用做：退避重连是自动的。所以红条既要说清「发生了
+    // 什么」，也不能在已经连回来之后还挂着——那会让人以为问题还在。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 发一条消息，但服务端不回：这条请求正挂在线上时连接被换掉（dispose）。
+    state.dataSources["turn/start"] = () => new Promise(() => {});
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await flush();
+
+    exit();
+    await flush();
+    // 在途请求被旧客户端拒绝：这句是 `rpc client disposed` 的翻译。
+    // 假定时器下 `waitFor` 不推进时间，故 flush 后直接断言。
+    expect(screen.getByText(CONNECTION_DISCONNECTED_TEXT)).toBeTruthy();
+    // 原始英文一个都不该露面。
+    expect(screen.queryByText(/rpc client disposed/)).toBeNull();
+
+    // 重连并握手成功后，这条提示自动收起。
+    state.dataSources = {};
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(screen.queryByText(CONNECTION_DISCONNECTED_TEXT)).toBeNull();
+  });
+
+  it("keeps a business error when the connection comes back", async () => {
+    // 服务端的拒绝与连接无关：网通了也不该顺手把它抹掉。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    state.rejectCode["turn/start"] = -32602;
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await flush();
+    expect(screen.getByText(/forced -32602/)).toBeTruthy();
+
+    exit();
+    state.rejectCode = {};
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    // 握手成功（底栏回到「已连接」），但那条业务错误仍在。
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(screen.getByText(/forced -32602/)).toBeTruthy();
   });
 
   it("re-resumes a thread after a crash even though its status was live-running", async () => {
@@ -2843,7 +3076,7 @@ describe("App reconnect resilience", () => {
     await waitMounted();
     // 首连接握手成功:`connected` 已是 true(状态栏也这么说)。
     expect(clients.length).toBe(1);
-    expect(screen.getByText("connected")).toBeTruthy();
+    expect(screen.getByText("已连接")).toBeTruthy();
 
     // iOS 场景:切后台期间 socket 被系统静默掐断,却没有 close/exited 事件,
     // 于是 `connected` 一直停在 true。回到前台时不能信这个陈旧标志,必须重建
@@ -2860,6 +3093,37 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(2);
     await flush();
     expect(clients[1].requests.filter((r) => r.method === "initialize").length).toBe(1);
+  });
+});
+
+describe("App multi-slot wiring", () => {
+  /**
+   * 全局只读（`build/info` / `flags/list`）必须落在**本地**槽位。
+   *
+   * 这里直接对注册表断言而不是经 `App`：测试里的 fake transport 不区分槽位，
+   * 经 App 断言只能证明「问了一次」，证明不了「问的是哪一条连接」——而后者
+   * 正是本用例要钉住的东西（spec §5.2：问远端会得到那台机器的答案）。
+   */
+  it("reads build kind and flags from the local slot, never a remote one", async () => {
+    const { ClientRegistry } = await import("./lib/clientRegistry");
+    const registry = new ClientRegistry<{ dispose: () => void; name: string }>();
+    const local = { name: "local", dispose: () => {} };
+    const remote = { name: "remote", dispose: () => {} };
+    registry.put("local", local);
+    registry.put("proj-foo", remote);
+    // 用户正看着远端项目：活动槽位是远端，但全局只读仍须走本地。
+    registry.setActive("proj-foo");
+    expect(registry.current()).toBe(remote);
+    expect(registry.forGlobalReads()).toBe(local);
+  });
+
+  it("reconnects every connected slot on foreground, not just the active one", async () => {
+    const { ClientRegistry } = await import("./lib/clientRegistry");
+    const registry = new ClientRegistry<{ dispose: () => void }>();
+    registry.put("local", { dispose: () => {} });
+    registry.put("proj-foo", { dispose: () => {} });
+    // 前台唤醒的遍历依据就是这个列表：漏掉哪个槽位，哪个项目就永久半死。
+    expect(registry.keys().sort()).toEqual(["local", "proj-foo"]);
   });
 });
 
@@ -5600,6 +5864,39 @@ describe("App mobile offline UX", () => {
     // No turn/start went out, and the text is still there.
     await waitFor(() => expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false));
     expect((box as HTMLTextAreaElement).value).toBe("hello offline");
+  });
+
+  /**
+   * 用户报的「更新时间显示 20xxxd」。
+   *
+   * 现场条件（全部是冷启动的正常形状，不需要任何异常）：
+   * ① 手机端首帧 `status` 还不是 `connected` ⇒ `offline` 为真；
+   * ② 从列表缓存恢复的会话正在 `thread/resume`（`syncState === "syncing"`）；
+   * ③ 该会话**没有**内容缓存条目（首屏缓存里只有列表、或内容已被 LRU 淘汰）
+   *    ⇒ `cachedAt` 里没有它。
+   *
+   * 旧代码把 ② 当成「离线内容」，`savedAt` 取 `cachedAt.get(id) ?? null` 再被
+   * `?? 0` 兜成 0，`formatRelativeTime(0)` = 1970 年 ⇒ 渲染「更新于 20758d」。
+   * 提示条本该只在「确实正显示缓存内容」时出现，时间未知时也不该编造天数。
+   */
+  it("never renders a bogus day count in the offline notice", async () => {
+    asRemote();
+    seed("idle", "t1");
+    contentStore.current = new MemoryContentStore();
+    // 握手顺序是 initialize → listAll → selectThread(resume) → setStatus("connected")，
+    // 故让 resume 挂起就足以同时满足 ①②：status 仍停在 connecting（offline 为真），
+    // 而该会话的 syncState 已被置为 syncing。
+    state.dataSources["thread/resume"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const notice = await screen.findByText(/离线内容|正在同步|内容未缓存/);
+    expect(notice.textContent ?? "").not.toMatch(/\d{3,}d/);
+    // 时间真的算不出来（该会话没有内容缓存）时，不要编一个天数。
+    expect(notice.textContent ?? "").not.toContain("20758");
+    // 而且不能声称是「离线内容」：这个会话根本没有缓存条目，正文区是空的。
+    expect(notice.textContent ?? "").not.toContain("离线内容");
   });
 });
 

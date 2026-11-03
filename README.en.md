@@ -5,8 +5,7 @@ to read code, change code, and run commands.
 
 - **Terminal first** — a full-screen TUI with Markdown rendering, slash commands,
   and live token/cost readouts
-- **Lightweight** — one native binary, no runtime dependencies; plus a resident
-  daemon and a desktop app
+- **Lightweight** — one native binary, no runtime dependencies
 - **Controllable** — risky operations ask for confirmation first, with three
   built-in sandbox levels: read-only, workspace-write, and full access
 
@@ -16,9 +15,6 @@ to read code, change code, and run commands.
 
 ## Install
 
-One command installs the CLI; on Apple Silicon it also puts the desktop app into
-`/Applications`:
-
 ```bash
 npm install -g @yi-agent/yi-agent
 ```
@@ -26,97 +22,29 @@ npm install -g @yi-agent/yi-agent
 Requires Node.js 14 or newer. The package ships prebuilt binaries for macOS
 (Intel / Apple Silicon) and Linux (x64), so no compilation is needed.
 
-> Behind a slow or partial npm mirror, pass
-> `--registry=https://registry.npmjs.org` explicitly. Mirrors lag behind; a
-> missing platform subpackage shows up as `Platform package ... not installed`.
-
-### Homebrew (macOS / Linux)
+On macOS / Linux you can also use Homebrew:
 
 ```bash
 brew install YichenGong/yi-agent/yi-agent
 ```
 
-### Direct download
+> Behind a slow or partial npm mirror, pass
+> `--registry=https://registry.npmjs.org` explicitly. Mirrors lag behind; a
+> missing platform subpackage shows up as `Platform package ... not installed`.
 
-Grab the `.tar.gz` for your platform from
-[Releases](https://github.com/YichenGong/yi-agent/releases), unpack it, and put
-`yi-agent` on your `PATH`.
-
-### macOS desktop app (Apple Silicon)
-
-The `npm i -g` above runs a `postinstall` step that copies `yi-agent.app` into
-`/Applications` and clears the quarantine flag. It only runs on global installs,
-and only on Apple Silicon (Intel Macs are not supported).
-
-If `/Applications` is not writable (common on managed machines), the CLI still
-installs and you get a hint to finish the app install with `sudo cp`.
-
-Open `yi-agent` from Applications. If macOS says the developer cannot be
-verified, go to System Settings → Privacy & Security and click **Open Anyway**.
-
-### From source
-
-Requires Rust 1.85 or newer.
-
-```bash
-git clone https://github.com/YichenGong/yi-agent.git
-cd yi-agent/yi-agent-rs
-cargo build --release
-# binary: target/release/yi-agent
-```
-
-Verify the install:
-
-```bash
-yi-agent --version
-```
-
-## What it can do
-
-- Read and modify your codebase: read files, write files, apply exact edits,
-  search by pattern across the repo
-- Run shell commands; long jobs can be managed in the background, with live
-  output and one-command termination
-- Look things up on the web (WebFetch / WebSearch)
-- Connect external tools over MCP — GitHub, databases, internal systems
-- Load Skills, turning your own runbooks into procedures it can execute
-- Spawn subagents to work in parallel, watch their progress live, message them
-  or stop them
-- Auto-compact the conversation when it outgrows the context window
+The desktop app, offline dmg, and building from source are covered in the user
+guide ([docs/guide.md](docs/guide.md), Chinese).
 
 ## Quick start
-
-**1. Configure a model.** Just run it; the first launch walks you through
-API style, key and model identifier:
-
-```bash
-yi-agent
-```
-
-The connection is tested before anything is written to
-`~/.yi-agent/models.json`. The desktop app and the CLI share that one catalog.
-
-To skip the prompt, pass the whole package in one shot (all three are required):
-
-```bash
-yi-agent --provider anthropic --api-key sk-ant-... --model claude-sonnet-4-5
-```
-
-> Note: `export MODEL_API_KEY=...` alone is not a substitute — model config is
-> read only from `models.json` or the whole-package flags, and a partial one is
-> rejected outright.
-
-Anthropic is the default. To use OpenAI or another compatible endpoint, see
-"Switching models" below.
-
-**2. Go to your project and run it.**
 
 ```bash
 cd /path/to/your/project
 yi-agent
 ```
 
-**3. Just talk to it.**
+The first run walks you through an API key and model identifier, tests the
+connection, then writes `~/.yi-agent/models.json`. After that, just say what you
+want:
 
 ```
 > how do I run the tests here? start with the README and CI config
@@ -125,181 +53,59 @@ yi-agent
 It will read files and figure it out on its own, and ask once before running any
 command.
 
-> Exporting the key in every new shell gets old. See "Where configuration lives"
-> for persistent setup.
+## Core features
 
-## Three ways to use it
+- **Read and write code** — read, write, apply exact edits, search the repo by
+  pattern
+- **Run commands** — shell execution; long jobs move to the background with live
+  output and one-command termination
+- **Look things up** — WebFetch / WebSearch
+- **MCP** — connect GitHub, databases, internal systems. Just say "add a GitHub
+  MCP" and it writes the config and probes it on the spot
+- **Skills** — turn your own runbooks into procedures it can execute
+- **Subagents** — fan work out in parallel, watch progress live, message them or
+  stop them
+- **Auto-compact** — long conversations compact themselves instead of dying at
+  the context limit
 
-### 1. Interactive TUI (recommended)
+## Use it with superpowers (recommended)
 
-```bash
-yi-agent
-```
+[superpowers](https://github.com/obra/superpowers) is an open-source library that
+turns engineering process into skills: brainstorm the requirement, write a spec
+and a plan, implement test-first, then review and verify. yi-agent loads it
+as-is.
 
-This is the flow above. A few handy controls:
-
-| Control | Effect |
-| --- | --- |
-| Type `/` | Open the command menu: `/help` `/model` `/cost` `/clear` `/compact` `/config` `/runtime` `/mcp` `/quit` |
-| `Ctrl+P` | Open the runtime panel: bash tasks / managed processes / subagent traces |
-| `Esc` | Interrupt the current turn (does not quit) |
-| `Ctrl+C` twice | Quit |
-
-`/cost` shows what this session has spent; `/compact` compacts history manually.
-Long conversations compact automatically.
-
-### 2. Non-interactive mode (scripts / CI)
-
-Hand it one prompt, get an answer, exit. Good for scripts and pipelines:
+Clone it and copy the skill directories into your skill root
+(`~/.yi-agent/skills/`):
 
 ```bash
-yi-agent run "collect every TODO comment under src/ into a list"
-
-# JSONL output, easy to process (one event per line)
-yi-agent run --json "count the Rust lines in this repo" | jq -r 'select(.AssistantText) | .AssistantText'
-
-# read the prompt from a pipe
-echo "explain the deploy target in the Makefile" | yi-agent run
+git clone --depth 1 https://github.com/obra/superpowers.git /tmp/superpowers
+mkdir -p ~/.yi-agent/skills
+cp -r /tmp/superpowers/skills/* ~/.yi-agent/skills/
 ```
 
-### 3. Desktop app (macOS)
+They appear on your next turn — no restart: `brainstorming`, `writing-plans`,
+`executing-plans`, `test-driven-development`, `systematic-debugging`,
+`requesting-code-review`, `using-git-worktrees`, `verification-before-completion`,
+and seven more (15 in total).
 
-A native window with conversations, tool-call cards, approval prompts, and
-subagents. See [desktop/README.md](desktop/README.md) for setup and development.
+You do not have to remember commands. Describe the task and it will usually start
+with brainstorming; you can also name a skill directly:
 
-## Remote access (experimental)
-
-`app-server` can serve over WebSocket for network clients. **Every connection must
-authenticate with a paired device token** (`ws://host/ws?token=<t>` or
-`Authorization: Bearer <t>`; a missing/invalid token is closed with ws code
-`4401`), so multiple clients can connect at once:
-
-```bash
-yi-agent app-server --listen ws://127.0.0.1:8790   # warns when bound beyond loopback
+```
+> use brainstorming to pin down what I actually want here
+> use systematic-debugging to find out why this test fails
 ```
 
-The same sessions can be viewed and controlled from several devices: QR-style
-pairing (one-time `XXXX-XXXX` code, valid for 5 minutes, new devices default to
-`control` scope), device listing/revocation, and approvals broadcast to every
-connected device.
+To scope skills to one project, put them in `<project>/.yi-agent/skills/`.
 
-A client can call `thread/subscribe {threadIds}` to **receive only the sessions
-it cares about** (clients that never call it still receive everything); once
-subscribed, the per-token stream is coalesced (flushed every 100ms or 4KB,
-never merged across items, order preserved) to cut the traffic and noise on a
-phone over the WAN. See the
-[thread-scoped subscription design](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md).
+## More
 
-Delivery is split into three IM-style layers: the **list layer**
-(`thread/started`, `thread/status/updated`) and the **global layer**
-(`ui/settings/updated`, `error`, …) always reach every client, so the sidebar's
-session list and run status stay live on any device; only the **content layer**
-(`item/*`, `turn/*`, and the rest of the transcript) is filtered by
-`thread/subscribe`. A remote (iOS) client therefore keeps just an LRU warm
-window of at most 8 threads, rolling its subscription as the user selects them;
-threads outside the window stay quiet. When the user returns to a **running**
-cold thread the client catches it up with the read-only
-`thread/readItems {threadId, afterItemId?}` instead of `thread/resume`, which
-would interrupt the in-flight turn. The desktop (stdio) client never subscribes
-and so always receives everything.
-
-Pairing supports **QR codes**: the desktop's "Remote access" settings page shows a QR
-code beside the pairing code once a relay URL is entered, and
-`yi-agent pair code --relay <url>` prints one in the terminal; the iOS pairing
-screen's "Scan" button reads it and pairs automatically. The payload is
-`yiagent://pair?v=1&relay=<url>&code=<code>` — it carries the relay URL and the
-one-time pairing code, **never a token**. Manual text entry still works.
-
-> **Experimental**: the pairing flow is now **wired end-to-end** — a
-> `pair/create` code is **persisted** to `~/.yi-agent/pairing.json`, so a code
-> minted by the desktop stdio process can be redeemed by the separate
-> `--relay`/`ws://` process; iOS gets a first-launch pairing form (relay URL +
-> code) and the desktop settings gain a "Remote access" tab to mint codes and
-> manage devices. Known limits: **no QR scanning** yet (type the code) and **no
-> installable iOS build** (blocked on the Xcode runtime/signing). See
-> [iOS remote control and relay deployment](docs/relay-deploy.md).
-
-**The iOS app connects through a self-hosted reverse WSS relay** (both ends only
-make outbound connections; the computer opens no inbound port):
-
-```bash
-yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
-```
-
-See [iOS remote control and relay deployment](docs/relay-deploy.md) (Chinese) for
-relay deployment, domain + TLS, iOS build and pairing, and troubleshooting. Design
-rationale: [mobile remote access design](docs/superpowers/specs/2026-10-02-mobile-remote-access-design.md)
-(Tier 1).
-
-## Where configuration lives
-
-| Layer | Location | Managed by |
-|---|---|---|
-| Defaults | Rust constants (`yi-agent-runtime/src/config.rs`) | no file needed |
-| Models | `~/.yi-agent/models.json` | Settings → Models UI, or `model/*` RPCs |
-| Runtime settings | `~/.yi-agent/settings.json` | Settings → Runtime UI, or `settings/*` RPCs |
-| Temporary overrides | CLI flags, real environment variables | CI, scripts, one-off runs |
-
-`YI_AGENT_HOME` relocates the whole `~/.yi-agent` directory (used to isolate
-standalone instances). `.env` is no longer read: existing settings are migrated
-into `settings.json` on first start and the old file is renamed to `.env.migrated`
-so nothing is lost. `YI_AGENT_WORKDIR` is gone — the working directory comes only
-from `--workdir`, the launch directory, or the project picked in the desktop app.
-
-**One-liner**: `--model` is a model **string**; overriding it requires the whole
-package (`--provider` + `--api-key`, `--api-url` optional) — a partial injection
-is rejected outright.
-
-**GUI entry points**: the desktop app configures models under Settings → Models
-(writing `~/.yi-agent/models.json`) and turns/compaction/sandbox under
-Settings → Runtime (writing `~/.yi-agent/settings.json`); `yi-agent web`
-(<http://127.0.0.1:7292> by default) edits that same `settings.json`.
-
-## Common settings
-
-| Goal | Environment variable | CLI flag |
-| --- | --- | --- |
-| Switch model (whole package; all three required) | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` + `YI_AGENT_MODEL` | `--provider` + `--api-key` + `--model` (`--api-url` optional) |
-| API key | `MODEL_API_KEY` | `--api-key` |
-| Switch provider | `YI_AGENT_PROVIDER` (`anthropic` / `openai`) | `--provider` |
-| Model identifier | — (use the settings UI / `models.json`) | `--model` (needs `--provider` + `--api-key`) |
-| Custom API endpoint | `MODEL_API_URL` | `--api-url` |
-| Max steps per turn | `YI_AGENT_MAX_TURNS` (default 200) | `--max-turns` |
-| Auto-compact threshold | `YI_AGENT_COMPACT_RATIO` (default 80, percent of context) | `--compact-ratio` |
-| Web search | `BOCHA_API_KEY` | — |
-
-**Switching models**, for example to OpenAI (provide the whole package):
-
-```bash
-yi-agent --provider openai --api-key sk-... --model gpt-4o
-```
-
-**About permission prompts.** By default every risky operation asks for
-confirmation. These are the startup switches:
-
-- `--yolo` (or `--dangerously-skip-permissions`): skip confirmations. Recommended
-  only in containers or disposable environments
-- `--sandbox read-only`: the whole process is read-only; nothing can be modified
-- `--sandbox workspace-write`: writes limited to the workspace, network restricted
-
-Blacklisted commands are blocked in every mode.
-
-**About the subagent runtime.** The first time you delegate to a subagent in the
-TUI it asks whether to start the local runtime; afterwards, `/runtime always` /
-`/runtime never` / `/runtime ask` control whether it starts automatically.
-
-## Project layout and progress
-
-The code lives in `yi-agent-rs/` (a Rust workspace with 11 crates); the desktop
-client lives in `desktop/`. Per-module completion status, verification commands,
-and maintenance rules are in
-[docs/project-management/](docs/project-management/README.md).
-
-## More documentation
-
-- Known issues: [docs/bug-list.md](docs/bug-list.md)
-- Design docs: [docs/plans/](docs/plans/)
-- Contributing: [CLAUDE.md](CLAUDE.md) (branching, commits, testing rules)
+The details live in the user guide ([docs/guide.md](docs/guide.md), Chinese):
+non-interactive mode, remote access, configuration and file locations,
+hand-written MCP config, the desktop app. Module progress is in
+[docs/project-management/](docs/project-management/README.md), development rules
+in [CLAUDE.md](CLAUDE.md).
 
 ## License
 

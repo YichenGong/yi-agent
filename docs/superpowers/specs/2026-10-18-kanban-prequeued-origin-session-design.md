@@ -28,10 +28,10 @@
 
 - 预排队卡记录**提出它的讨论会话**，在桌面看板上可点击跳回那个会话。
 - 该关联**不与执行会话（`thread_id`）混淆**：提升、开跑都不覆盖它。
-- 覆盖两条真实投递路径：
-  1. 会话内的 agent 用 skill/CLI 投递（`superpowers-kanban add-prequeued <title>`）——
-     这是主路径；
-  2. 桌面看板面板的「预排队」输入框。
+- 覆盖主路径：会话内的 agent 用 skill/CLI 投递
+  （`superpowers-kanban add-prequeued <title>`）。
+- 桌面看板面板的「预排队」输入框**不**参与关联（见 §4.1）：它是容器级动作，
+  拿不到「正在讨论这件事」的会话。
 - 拿不到会话身份时**不阻断**投递（会话外手动记卡是合法操作）。
 
 **非目标**
@@ -87,9 +87,27 @@ id 不重算、来源会话随卡走。这是「溯源不断线」与「id 不�
 - `desktop/src/lib/superpowersKanbanSwitch.ts::enqueuePrequeuedCard` 增加
   `originThreadId: string | null` 参数，非空时放进 `plugin/query` 的 params：
   `{ title, origin_thread_id }`。
-- 投递点（`App.tsx` 的 `prequeue={(title) => ...}`）传 `sess.currentId`。
-  **注意**：`sess.currentId` 可能为 `null`（尚未开任何会话），此时传 `null`，
-  由 §4.4 的「静默留空」兜底。
+- 投递点（`App.tsx` 的 `prequeue={(title) => ...}`）**一律传 `null`**。
+
+**为什么面板入口不绑定会话**（2026-11 修正，原设计曾在此传 `sess.currentId`）：
+
+看板页右上角「＋」是**容器级**动作，它发生在看板页，而看板页不属于任何会话的讨论
+上下文。`sess.currentId` 是「上次打开的那条会话」，与这张卡没有必然关系：
+
+1. **可以跨项目**。侧栏按 cwd 分组（`WorkspaceGroup`），每个项目组下有自己独立的
+   看板条目（`ThreadSidebar.tsx::renderBoardEntry(workspace)`）。于是「在 A 项目会话里
+   聊天 → 点侧栏 B 项目组的看板 → 在 B 看板上记一张卡」完全合法，绑上去的却是 A 的
+   会话。插件侧不校验归属（`dispatch.rs` 只做 `as_str` + 非空过滤），脏值一路落盘。
+2. **可以是残留值**。看板页不重置 `currentId`，用户已很久不碰会话、或原本没有会话
+   （`null`）时，它代表什么完全不确定。
+
+而卡片渲染端把 `origin_thread_id` 当作唯一可见的会话标识来画跳转链接
+（`SuperpowersKanbanCard.tsx` 的 `card.threadId ?? card.originThreadId`）。绑错比不绑
+代价大得多：用户会点进一个无关对话，且没有任何提示表明这是错的。
+
+所以面板入口宁可不给链接。**会话内的溯源走 §4.2 的主路径**：在会话里
+`superpowers-kanban add-prequeued`，宿主经 `YI_AGENT_THREAD_ID` 注入，那里拿到的
+会话必然就是这次讨论本身。
 
 ### 4.2 会话内 CLI（主路径）
 
@@ -138,10 +156,9 @@ TUI（`yi-agent/src/main.rs::run_tui_agent`）是本地单会话进程，自己 
 
 ### 4.4 拿不到时静默留空
 
-`origin_thread_id` 是**尽力而为的附加信息**：会话外手动投递、`sess.currentId` 为
-`null`、TUI、以及任何未注入 env 的宿主路径，都照常投递、字段为 `None`，桌面端不
-画跳转按钮。关联缺失**不**报错、**不**阻断（`add-prequeued` 在任何环境下都是合法
-操作）。
+`origin_thread_id` 是**尽力而为的附加信息**：桌面面板入口（§4.1）、会话外手动投递、
+TUI、以及任何未注入 env 的宿主路径，都照常投递、字段为 `None`，桌面端不画跳转
+按钮。关联缺失**不**报错、**不**阻断（`add-prequeued` 在任何环境下都是合法操作）。
 
 ## 5. 写入路径：仍然全部走 inbox
 
@@ -219,7 +236,7 @@ TUI（`yi-agent/src/main.rs::run_tui_agent`）是本地单会话进程，自己 
 ## 8. 文档与 skill 同步
 
 - 插件 `README.md`：预排队一节补「关联讨论会话」：会话内投递经
-  `YI_AGENT_THREAD_ID` 自动关联，桌面面板自动带上当前会话，缺失时不阻断。
+  `YI_AGENT_THREAD_ID` 自动关联，缺失时不阻断；并说明桌面面板入口不绑定会话。
 - `plugins/superpowers-kanban/skills/superpowers-kanban/SKILL.md`：同步一句，让
   agent 知道在会话里 `add-prequeued` 会自动挂上当前会话（无需额外参数）。
 - `docs/project-management/`：同步 `desktop.md`（卡片字段与按钮）、
@@ -231,7 +248,9 @@ TUI（`yi-agent/src/main.rs::run_tui_agent`）是本地单会话进程，自己 
 - `cargo test -p superpowers-kanban-core -p superpowers-kanban-runner`
   （在 `plugins/superpowers-kanban/` 下）通过。
 - `cargo test -p yi-agent-tools -p yi-agent-runtime -p yi-agent-app-server` 通过。
-- `cd desktop && npm test` 通过。
+- `cd desktop && npm test` 通过，其中
+  `App.test.tsx::does not pin a discussion session on a card added from the board panel`
+  锁住「面板入口不带 `origin_thread_id`」（即使当前有活跃会话、`currentId` 非空）。
 - 手工路径：会话内 `superpowers-kanban add-prequeued "示例需求"` → 看板出现
   PRE-QUEUED 卡且带讨论会话链接 → `promote` 后链接仍在（卡变 QUEUED）→ 卡开跑后
   链接切换为执行会话。

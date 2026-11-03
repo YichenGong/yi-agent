@@ -64,6 +64,23 @@ const TERMINAL_TASK_STATES: [&str; 11] = [
     "recovery_attested",
 ];
 
+/// The settled states whose lease may be released on sight.
+///
+/// Narrower than [`TERMINAL_TASK_STATES`] on purpose: `recovery_required` and
+/// its two spellings are terminal for retention but *parked and resumable*, and
+/// the workspace/worktree lease is precisely what an explicit resume needs. A
+/// settled task can never be resumed, so nothing is lost by releasing there.
+const SETTLED_TASK_STATES: [&str; 8] = [
+    "completed",
+    "completed_no_changes",
+    "blocked",
+    "stalled",
+    "timed_out",
+    "budget_exhausted",
+    "failed",
+    "cancelled",
+];
+
 /// A single persisted row of a task's observation trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedTraceRow {
@@ -1601,6 +1618,19 @@ impl RuntimeRepository {
              WHERE id = ?1 AND task_id = ?2",
             params![attempt.to_string(), task.to_string()],
         )?;
+        // Delivery is a terminal state, so the child stops owning admission
+        // resources in the same transaction. Leaving them behind stranded
+        // `worker-worktree-context-*` / `worker-workspace-context-*` rows as
+        // `active` forever: they are `exclusive`, every other terminal path
+        // releases them, and nothing else revisits a delivered task's leases.
+        // `transition_task_and_attempt_with_terminal` already does exactly this
+        // for blocked/stalled/failed; delivery was the one terminal path that
+        // did not, so a long-lived daemon accumulated one leaked pair per child.
+        transaction.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE task_id = ?1 AND state = 'active'",
+            params![task.to_string()],
+        )?;
         transaction.execute(
             "INSERT INTO deliveries (id, task_id, attempt_id, payload_json)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1778,7 +1808,16 @@ impl RuntimeRepository {
         )?;
         // A worker that has reached a terminal state no longer owns admission
         // resources, including failures reported after a factory accepted it.
-        if matches!(state, "blocked" | "cancelled" | "failed") {
+        //
+        // This is "did the task settle?" rather than a list of settled states:
+        // the list used to be `blocked | cancelled | failed`, which silently
+        // omitted `completed`. The reducer sends a Completed with no delivery
+        // evidence (terminal replay) down exactly this path, so every such child
+        // stranded its `worker-worktree-context-*` and
+        // `worker-workspace-context-*` leases as `active` forever. Recovery
+        // states are excluded on purpose: those are parked and resumable, and
+        // their lease is what a resume needs.
+        if SETTLED_TASK_STATES.contains(&state) {
             transaction.execute(
                 "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
                  WHERE task_id = ?1 AND state = 'active'",
@@ -2256,6 +2295,36 @@ impl RuntimeRepository {
     /// accumulate forever, and any parent waiting on "all my children finished"
     /// waits forever too.
     ///
+    /// Releases leases still held by tasks that can never run again.
+    ///
+    /// [`Self::reclaim_orphaned_tasks`] covers the other half of the problem: a
+    /// task left live by a dead daemon. This covers the settled half. A settled
+    /// task (see [`SETTLED_TASK_STATES`]) is unreachable by every scheduling
+    /// path, so any `active` lease it still holds is unreleasable garbage, and
+    /// `worktree:` / `workspace:` rows are `exclusive`, so they occupy the
+    /// admission slot for that workspace forever.
+    ///
+    /// It runs at daemon boot because that is the only point where the whole
+    /// table can be swept without racing live work: nothing is admitted yet, so
+    /// every `active` lease on a settled task is provably stale. Recovery states
+    /// are skipped — they are parked and resumable, and their lease is what a
+    /// resume needs.
+    pub fn release_leases_of_settled_tasks(&mut self) -> Result<usize, RepositoryError> {
+        let settled = SETTLED_TASK_STATES
+            .iter()
+            .map(|state| format!("'{state}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(self.connection.execute(
+            &format!(
+                "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+                 WHERE state = 'active'
+                   AND task_id IN (SELECT id FROM tasks WHERE state_json IN ({settled}))"
+            ),
+            [],
+        )?)
+    }
+
     /// A task is an orphan when the application root that owns its session has
     /// no live attachment (`state = 'detached'`), or has no attachment at all
     /// and has not been touched for `grace_seconds` (a root that is mid-boot

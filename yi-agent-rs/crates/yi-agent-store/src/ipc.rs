@@ -878,6 +878,17 @@ impl Daemon {
         // there forever and pin its session's supervisor. Reclaim those, plus
         // tasks whose owning root has detached, before the coordinator hydrates.
         let reclaimed_orphans = repository.reclaim_orphaned_tasks(DEFAULT_ORPHAN_GRACE_SECS)?;
+        // Leases held by tasks that already settled are unreleasable garbage:
+        // nothing schedules a settled task again, and `worktree:` / `workspace:`
+        // rows are `exclusive`, so each one pins its workspace's admission slot
+        // for good. Boot is the only safe moment to sweep them — no work is
+        // admitted yet, so every such row is provably stale rather than in use.
+        let released_settled_leases = repository.release_leases_of_settled_tasks()?;
+        if released_settled_leases > 0 {
+            eprintln!(
+                "yi-agent: released {released_settled_leases} active lease(s) held by settled tasks"
+            );
+        }
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
         // A fresh daemon starts with no plugin routes; the supervisor republishes

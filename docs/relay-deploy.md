@@ -367,14 +367,14 @@ npx tauri ios init      # 生成/刷新 iOS 工程。注意：按 project.yml �
 | 签名身份 | `security find-identity -v -p codesigning` 能看到有效的 `Apple Development: …` |
 | 团队 | `DEVELOPMENT_TEAM = 4RN6G5K4D4`，已写入 `project.yml` 与 `desktop.xcodeproj`（见坑 2） |
 | 设备 | 手机与 Mac **在同一局域网**，`xcrun devicectl list devices` 显示 `available (paired)`；**手机须解锁且亮屏**（坑 1、坑 6）。**USB 不是必需**——已配对设备可直接走局域网安装（坑 6、§4.2「安装」） |
-| 系统代理 | **必须关闭**（坑 6）：Clash/Surge 等把 `127.0.0.1:7897` 设为系统代理时，`remotepairingd` 连设备的 49152 端口会被 SOCKS 劫持，ARP 探测失败被判 `unavailable` |
+| 系统代理 | **例外列表必须含 `*.local`**（坑 6）：Clash/Surge 等把 `127.0.0.1:7897` 设为系统代理时，若 bypass 例外为空，`remotepairingd` 连 `Yichen-iPhone.local:49152` 会被 SOCKS 劫持，ARP 探测失败被判 `unavailable`。**不必关闭代理**，加例外即可（命令见坑 6） |
 
 **构建**
 
 ```bash
 cd desktop
 export PATH="/opt/homebrew/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-npx tauri ios build --ci --export-method debugging
+npm run ios:build -- --ci --export-method debugging
 # 产物：
 #   desktop/src-tauri/gen/apple/build/arm64/yi-agent.ipa                （可分发的 ipa）
 #   desktop/src-tauri/gen/apple/build/desktop_iOS.xcarchive/Products/
@@ -383,6 +383,19 @@ npx tauri ios build --ci --export-method debugging
 
 `--export-method debugging` 产出 development 签名、可装到已注册真机
 （`app-store-connect` / `release-testing` 分别对应 App Store / TestFlight）；`--ci` 免交互。
+
+> **必须走 `npm run ios:build`，不要直接调 `npx tauri ios build`。**
+> 前者会先跑 `desktop/scripts/sync-ios-version.sh`，把 `yi-agent-rs/Cargo.toml`
+> 的 workspace 版本写进 `tauri.conf.json`、`project.yml` 与 `Info.plist`。
+> 漏掉这一步，装到手机上的包自报的是模板默认值 `0.1.0`，与主线版本无关——
+> 手机「设置 → 通用 → 关于本机」里看到的版本号就是这个值，用户无从判断该不该升级。
+> `--` 之后的参数会原样透传给 `tauri ios build`。
+>
+> 版本对不对，构建前后都可以单独核对：
+>
+> ```bash
+> bash desktop/scripts/sync-ios-version.sh --check   # 一致 exit 0，漂移 exit 1 并逐处列出
+> ```
 
 **安装**
 
@@ -399,7 +412,8 @@ xcrun devicectl device install app \
 **无需 USB（局域网安装，2026-10-17 实测）：** 上面的安装命令**不插线也能用**。前置是
 该设备此前**用 USB 配对过一次**（一次性，配对信息持久化在 Mac 上），此后同一局域网内
 `devicectl` 即可经 TCP 隧道安装——实测全程 `system_profiler SPUSBDataType` 无 iPhone、
-仍回 `App installed:`。两个前提：**手机解锁且亮屏**，以及**系统代理必须关闭**（坑 6）。
+仍回 `App installed:`。两个前提：**手机解锁且亮屏**，以及**系统代理的例外列表含
+`*.local`**（坑 6；不必关代理）。
 
 **常见坑**
 
@@ -422,14 +436,72 @@ xcrun devicectl device install app \
    `Output protocol connected (socksv5)` 与 `... 127.0.0.1:7897 ... Hostname#…:49152 ready proxy`
    之后紧跟 `CUNetLinkManager reported the device as unavailable using ARP. Invalidating connection`
    —— 即 `remotepairingd` 连设备 49152 端口时被 SOCKS 代理接管，其 ARP 在线探测随之失败。
-   **关闭系统代理后重试**即可（Clash Verge：关"系统代理"；或
-   `networksetup -setwebproxystate Wi-Fi off` + `-setsecurewebproxystate` +
-   `-setsocksfirewallproxystate`，改完记得开回来）。
+
+   **根因（2026-11-01 实测精确定位）：系统代理的例外列表为空。** 设备是通过
+   Bonjour 主机名访问的（`dns-sd -L <advert-id> _remotepairing._tcp local` 回
+   `Yichen-iPhone.local.:49152`），而代理匹配发生在**域名解析之前**——没有
+   `*.local` 例外，这个主机名就直接进了 SOCKS。注意 Clash 侧写着
+   `IP-CIDR6,fe80::/10,DIRECT` 也没用：流量在系统代理层就被截走了，压根没进
+   Clash 的规则引擎。验证一行搞定：
+
+   ```bash
+   scutil --proxy | sed -n '/ExceptionsList/,/}/p'
+   # 正常应有 *.local / 169.254/16 / ::1 / localhost / 127.0.0.1
+   # 只打印出空 array 就是命中本坑
+   ```
+
+   **首选修法不是关代理，是加例外**（关代理会打断所有正常上网）：
+
+   ```bash
+   sudo networksetup -setproxybypassdomains Wi-Fi \
+     "*.local" "169.254/16" "::1" "localhost" "127.0.0.1"
+   ```
+
+   必须 `sudo`——免密码执行会回 `Command requires admin privileges`。加完不必重启
+   `remotepairingd`，下一次重连即生效。**判据看行为不看配置**：刚加的例外可能还没被
+   任何连接走到，所以要证明「有新尝试、但没被劫持」：
+
+   ```bash
+   # 两个数都要看：第一个 > 0 说明进程确实在试，第二个 = 0 才算修好
+   log show --last 2m --predicate 'process CONTAINS "remotepairingd"' --style compact \
+     | grep -c "event: path:start"
+   log show --last 2m --predicate 'process CONTAINS "remotepairingd"' --style compact \
+     | grep -c "socksv5"
+   ```
+
+   实测（19:28 加例外，前后各 7 分钟窗口）：`socksv5` 4 → **0**、ARP 误判不可用
+   4 → **0**、`Pairing completed` 0 → **2**，是真正的「恢复」而不只是「没再报错」。
+
+   > **坑：例外会被别的代理客户端覆盖。** 本机同时装了 Clash Verge / Clash Mi /
+   > ClashX Pro / FlClash 等多个客户端、且有 3 个 root 提权助手在跑，任一客户端切
+   > 「系统代理」都会重写整份 bypass 列表。更麻烦的是配置与实际可能不一致——实测
+   > Clash Verge 的 `system_proxy_bypass` 写着正确的 `*.local`，但它
+   > `enable_system_proxy: false`，系统代理是别人写的，那份配置根本没生效。
+   > 所以要么在**真正管系统代理的那个客户端**里设 bypass，要么只留一个客户端。
+   > 也别忘了给非 Wi-Fi 服务补：`networksetup -getproxybypassdomains "USB 10/100 LAN"`。
+
    两个附带现象：① 被反复毒化后 `remotepairingd` 会**卡死**（实测膨胀到 23 GB 内存 /
-   93% CPU 空转、不再产生任何日志），此时 `sudo launchctl kickstart -k
-   system/com.apple.CoreDevice.remotepairingd` 重启即可；② 手机**息屏会停掉 Wi-Fi
-   常连接**（`ping` 全丢包、mDNS 仍能解析出旧 IP），安装窗口只有亮屏那几十秒，
-   建议保持解锁亮屏再执行。
+   93% CPU 空转、不再产生任何日志），此时重启该进程即可——**它跑在 `user/<uid>`
+   domain，不需要 sudo，也不需要 `system/`**：
+
+   ```bash
+   launchctl kickstart -k "user/$(id -u)/com.apple.CoreDevice.remotepairingd"
+   ```
+
+   （`launchctl print system/com.apple.CoreDevice.remotepairingd` 会回
+   `Could not find service`——它压根不在 system domain，老命令打不中目标。）
+   ② 手机**息屏会停掉 Wi-Fi 常连接**（`ping` 全丢包、mDNS 仍能解析出旧 IP），
+   安装窗口只有亮屏那几十秒，建议保持解锁亮屏再执行。
+7. **跑完 `tauri ios init` 必须重跑版本同步**（2026-11-01 实测）—— init 会按
+   `project.yml` 重生成 `desktop.xcodeproj` 与 `desktop_iOS/Info.plist`，期间：
+   ① `project.yml` 里写着的版本会被原样带回去，若此前没跑过
+   `desktop/scripts/sync-ios-version.sh`，版本就退回模板默认的 `0.1.0`；
+   ② `Info.plist` 里由 `src-tauri/Info.ios.plist` 在**构建期**合并进来的
+   `NSCameraUsageDescription` 会消失（init 不看那个文件）。前者由
+   `bash desktop/scripts/sync-ios-version.sh --check` 当场抓住，重跑一次同步即可；
+   后者在 `tauri ios build` 时会由 Tauri 重新合并，不影响产物。
+   顺带一条：`tauri ios init -c '{"version":"..."}'` 的 `-c` **不会**改 iOS 版本
+   （实测 `project.yml` 一行未变），别指望用 config 绕开同步脚本。
 
 ### 4.3 App 如何选择远端传输
 

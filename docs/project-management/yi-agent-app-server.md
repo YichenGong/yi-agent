@@ -44,6 +44,7 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - [x] 权限审批反向请求闭环（`AgentEvent::PermissionRequest` → 服务端反向请求 `item/toolCall/requestApproval`（id 取自进程级 `perm_seq` 计数器，跨 thread 全局唯一）→ 客户端响应 `ClientResponse` → `pending` 登记表路由 → `Decision` 回传 agent；审批等待内的中断按目标 turn id 过滤，超时/中断/畸形取值一律按 `Deny` fail-safe）— `src/protocol.rs:42` / `src/protocol.rs:54` / `src/server.rs:132` / `src/server.rs:871` / `src/server.rs:886` / `src/server.rs:1102`
 - [x] CLI `app-server` 子命令（装配 runtime 并驱动 stdio 循环，仅支持 `stdio://`）— `yi-agent-rs/crates/yi-agent/src/config.rs:154`（`Command::AppServer` 变体）/ `yi-agent-rs/crates/yi-agent/src/main.rs:74`（`ensure_stdio_listen`）/ `yi-agent-rs/crates/yi-agent/src/main.rs:85`（`run_app_server`）
 - [x] 会话持久化 + 历史方法（`thread_store.rs`：每 thread 一个只追加 `.jsonl` + 一个可变 `.meta.json`，落 `<workdir>/.yi-agent/threads/`；`thread/start` 分配 `thread-<uuid>` 并写 meta；driver 每 turn 落盘最终 Item + 完整 session `Message` 快照；新增 `thread/list` / `thread/resume`（回放 + `Agent::with_session` 恢复上下文）/ `thread/rename` / `thread/delete`；删除活跃 thread 时先中断并等 driver 落盘再删，避免 `create(true)` 复活文件；`thread/list` 虽被 design §5.2 标注为应由 `thread/listAll` 取代，但仍**有意保留**为兼容的单目录 RPC——只列 `cfg.workdir` 一个 store，跨目录汇总由前端实际使用的 `thread/listAll` 负责）— `src/thread_store.rs:1` / `src/server.rs:286`（thread/list）/ `src/server.rs:361`（thread/start）/ `src/server.rs:466`（thread/resume；目录已删时对内存 thread 回 `-32602`）/ `src/server.rs:639`（thread/rename）/ `src/server.rs:682`（thread/delete）/ `src/server.rs:1137`（driver `append_turn` 落盘）
+- [x] `thread/fork`：会话级复制（源会话不动）— 从既有会话整份克隆出新的 `thread-<uuid>`（历史 `.jsonl` + `.meta.json`），供用户在某个节点做分支尝试。**拒收顺序**：`Scope::Control` 门禁 → 缺 `threadId` 回 `-32602` → store 里既不在内存也不在盘上回 `-32011` → **运行中**（`active_turn_id.is_some()` 或状态非 `Idle`）回 `-32012`，且该判断在**任何磁盘动作之前**，故被拒时不留半个副本 → cwd 已删回 `-32602` → 跨进程写锁冲突把 `ThreadBusy` 的中文原样包进 `-32603`。**不发通知、不起 session**：新会话以 `Idle` 落盘，侧栏行只能由 `thread/listAll` 拉到（前端因此先刷新再切）。**附件随迁**：`copy_attachment_tree` 把 `.yi-agent/attachments/<源 id>/` 复制到 `<新 id>/`，`rewrite_attachment_paths` 用 `strip_prefix`（不是字符串替换）重写历史里 `Item::UserMessage` / `Item::UserInterjection` 的 `attachments[].path` 与 `images[].path`、`Item::ToolCall.images[].path`、以及 session `Message` 里 `ContentBlock::Image.path`（含 `ToolResult` 递归），避免前缀误伤；顺序是先重写再 `create`，之后才拿新锁。**标题**：先给 ` (fork)` 后缀留出位置再按 30 字上限截断，故长标题的副本不会把后缀吃掉；源标题为空时回退到首条用户文本。判据：`cargo test -p yi-agent-app-server --lib thread_fork_`（4 条 RPC：复制成功 / 未知 id / 运行中且不写盘 / cwd 已删）与 `cargo test -p yi-agent-app-server --lib fork_`（15 条 = 上面 4 条 + `thread_store::tests` 的 11 条：标题与后缀、附件目录随迁、四类历史路径重写、前缀不误伤、源会话不被改动、用量总量随迁）。代码：`src/rpc/thread.rs:759` 的 `"thread/fork"` 分支、`src/thread_store.rs:396` 的 `fork_thread` / `:279` `copy_attachment_tree` / `:301` `rewrite_attachment_paths` — [设计](../superpowers/specs/2026-11-01-desktop-thread-fork-design.md)、[计划](../superpowers/plans/2026-11-01-desktop-thread-fork.md)
 - [x] 进行中 turn 的 checkpoint（抗震杀/崩溃）：driver 在 turn 内把已 finalize 的 item
   （含提问）+ 上下文快照写 `<cwd>/.yi-agent/threads/<id>.partial.json`（每次 item finalize
   标脏、500ms 去抖、turn 收尾落主 jsonl 后删除）；`ThreadStore::load` 以 partial 首个 item id
@@ -149,3 +150,42 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
   **顺带修掉的主循环解析**：`thread/diff/read` 取锚点原用 `store.load()`（解析整份对话 jsonl），改 `read_meta`；`thread/delete` 只取 meta 三个字段却也走 `load()`，同样改 `read_meta`（meta 缺失时 `rebuild_meta` 对 `driver_ref` / `driver_project` 都填 `None`，与 `read_meta` 返回 `None` 落到同一分支，语义不变）。
 
   代码：`yi-agent-rs/crates/yi-agent-app-server/src/git_diff.rs`（`GIT_OK_TIMEOUT` / `GIT_POLL_INTERVAL` / `GIT_TIMED_OUT` / `run_git_bounded` / `MAX_UNTRACKED_FILE_BYTES` / `read_untracked_capped`）、`src/rpc/thread.rs`（`thread/diff/read` 与 `thread/view/read` 的 spawn 化、`read_meta` 取锚点）、`src/rpc/image.rs`（按区间读）、`src/git_diff_tool.rs`（超时回报模型）、`Cargo.toml`（`tempfile` 由 dev 依赖升为普通依赖，`Cargo.lock` 无变化）。验证：`cargo test -p yi-agent-app-server --lib`（1066 passed / 4 ignored，较修复前 1054 增 12 例）、`cargo test -p yi-agent-app-server --lib diff_read_does_not_block_the_main_loop`、`cargo test -p yi-agent-app-server --lib view_read_refresh_does_not_block_the_main_loop`、`cargo test -p yi-agent-app-server --lib read_untracked_capped_refuses_a_non_regular_file`（该用例用 `/dev/null` 承重：删掉 `!is_file()` 闸即变红，用目录则仍绿——目录是靠随后的 `read` 以 `EISDIR` 失败的，没有回归价值）、`cargo test -p yi-agent-app-server --lib image_read`、`cd desktop && npm test`（135 文件 / 1778 例，桌面端零改动）。已知遗留：`thread/view/read` 的 CAS 回写可能把刷新期间被删的帧写回（与 diff 泵的无条件插入同源，用每 thread 的墓碑 / 世代号可一并关掉）；一次 `thread_diff` 串行发 5~6 次 `git_ok`，各自 5s 预算，挂住的仓库最坏要等约 30s 才报错。 — [设计](../superpowers/specs/2026-10-29-app-server-diff-blocking-and-leaks-design.md)、[计划](../superpowers/plans/2026-10-29-app-server-diff-blocking-and-leaks.md)
+- [x] 干活期间防止空闲休眠：主循环每 10s 采 `busy`（本进程会话 / 项目 daemon /
+      远端 5 分钟内交互）与电源、网络，喂给 `yi-agent-power` 的 supervisor。
+      只有本进程持有断言，desktop 不持有。接线点：`server.rs` 的
+      `POWER_TICK` / `power_ticker` 分支 / 入站帧刷新 `last_remote_touch` /
+      `serve()` 末尾 `drop(power_guard)`；整条探测在 `power_guard.rs` 的独立
+      线程里（含 `route` 子进程与 2s TCP 超时，不能进主循环）。验证：
+      `pmset -g assertions | grep -A2 yi-agent`（应只见
+      `PreventUserIdleSystemSleep named: "yi-agent: keeping the machine awake for work"`）、
+      `cargo test -p yi-agent-app-server power_busy`、
+      `cargo test -p yi-agent-app-server probing_busy_does_not_prevent_runtime_eviction`。
+- [x] 测试代码按域下沉（C1 测试搬移，`server.rs` 10,972 → 7,567 行）——把长期塞在
+      `server.rs` 里的 11 个内联 `#[cfg(test)] mod` 平移到 `src/server/`，再把
+      21,434 行的 `src/rpc_tests.rs` 拆成 `src/server/tests/` 目录模块：`mod.rs`
+      （2,800 行，纯夹具 117 项 + 1 个测试）加 11 个域文件。域划分依据是**调用传递
+      闭包**（测试 → 辅助函数 → RPC 方法串），不是测试名关键词启发式；每个文件
+      测试数实测 `thread_index` 73 / `turn` 62 / `model_settings` 60 /
+      `thread_lifecycle` 40 / `image` 29 / `lead` 29 / `process` 24 /
+      `transport` 24 / `assembly` 20 / `plugin_theme` 16 / `title` 10，合计 388。
+
+      **三条必须守住的约束**：① 目录模块化后子模块名 `image` 会遮蔽同名 crate，
+      `image::RgbImage` / `ImageFormat` / `Rgb` 一律改 `::image::`（域文件与
+      `mod.rs` 共 12 处，替换正则须 `(?<![:\w])image::` 否则会把 `::image::` 二次
+      替换成 `::::image::`）；② 模块级文档注释必须转 `//!`，`///` 留在
+      `#[cfg(test)]` 之前会挂到第一条 `use` 上并触发
+      `clippy::empty_lines_after_doc_comment`（`-D warnings` 下是硬错误），删函数
+      时也必须连 `///` 一起删；③ `server::tests::child_holds_thread_lock` **留在
+      `mod.rs` 父层**——它被 `thread_index` 里的
+      `writer_lock_refuses_a_second_writer_on_the_same_thread` 以
+      `--exact "server::tests::child_holds_thread_lock" --ignored` 拉起，下沉后会
+      变成 `server::tests::thread_index::...` 而静默失败（`--exact` 不匹配时 libtest
+      返回 `0 passed` 且 **exit 0**，只有看到测试名出现在输出里才算真的验过）。
+
+      验收口径：`cargo test --lib -- --list` 的测试名集合与基线**完全相等**
+      （1,158 条，仅模块前缀变化）；`cargo test -p yi-agent-app-server --lib
+      --all-features` 为 1,151 passed / 0 failed / 7 ignored，与重构前一致；
+      `just ci` 全绿（nextest 3,957 passed / 27 skipped）。代码：
+      `src/server.rs`、`src/server/`（12 个 `.rs`）、`src/server/tests/`（12 个
+      `.rs`）。— [设计](../../superpowers/specs/2026-11-01-test-extraction-c1-design.md)、
+      [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)

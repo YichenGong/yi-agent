@@ -2,8 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Modal } from "../ui/Modal";
 import type { KeyboardEvent } from "react";
 import type { Theme } from "../lib/theme";
+import type { FontScale } from "../lib/fontScale";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
+import {
+  RemoteSettings,
+  defaultHostInvoke,
+  type RemoteInvoke,
+} from "../RemoteSettings";
 import { SettingsPluginsTab } from "./SettingsPluginsTab";
 import { SettingsModelsTab } from "./SettingsModelsTab";
 import { SettingsSkillsTab } from "./SettingsSkillsTab";
@@ -44,11 +50,14 @@ export function SettingsDialog({
   isMobile = false,
   theme,
   onThemeChange,
+  fontScale,
+  onFontScaleChange,
   watchmanEnabled,
   onToggleWatchman,
   watchmanWarning,
   onClose,
   remoteCall,
+  hostInvoke,
   pluginCall,
   modelCall,
   skillsCall,
@@ -81,8 +90,17 @@ export function SettingsDialog({
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   /**
+   * 当前字号档位。缺省时「通用」页不渲染这一节（见 `SettingsGeneralTab`），
+   * 与值守同一判据。
+   */
+  fontScale?: FontScale;
+  onFontScaleChange?: (scale: FontScale) => void;
+  /**
    * 宿主级「后台值守」。从看板面板迁到「通用」：它装的是通用登录项，服务所有
    * 已登记的项目，与当时选中的看板无关。
+   *
+   * **手机端由宿主传 `undefined`**：它装的是桌面主机的登录项，手机拨不到，
+   * 也不该让一个手机端去改另一台机器的开机项。
    */
   watchmanEnabled?: boolean;
   onToggleWatchman?: (next: boolean) => void;
@@ -91,6 +109,15 @@ export function SettingsDialog({
   onClose: () => void;
   /** 「远程访问」Tab 的 RPC 接缝，由宿主注入；缺省时该 Tab 只读。 */
   remoteCall?: RemoteCall;
+  /**
+   * 宿主 IPC 接缝，给「远程项目」面板用（它走的是 Tauri 命令而非 RPC：
+   * 增删项目要改本机进程表，app-server 做不到）。
+   *
+   * 可选，缺省走真实 `invoke`。`SettingsDialog` 的既有测试大量只关心某一个
+   * Tab 的接线，强制它们都提供一个 IPC 替身只会让那批测试变噪；而真正的接线
+   * 错误在 `App.tsx`（唯一的产量调用点）会是编译错误，不会静默。
+   */
+  hostInvoke?: RemoteInvoke;
   /** 「插件」Tab 的宿主 RPC 接缝（plugins/list、plugin/settings/*）。 */
   pluginCall?: (method: string, params: unknown) => Promise<unknown>;
   /** 「模型」Tab 的宿主 RPC 接缝（model/list、model/upsert、...）。 */
@@ -144,13 +171,22 @@ export function SettingsDialog({
    * 实际渲染的 Tab 表。`flags` 依赖宿主告诉我们的构建类型——不能靠「请求失败就
    * 隐藏」这种事后判断，那会让面板先闪一次错误。
    */
-  const visibleTabs = TABS.filter((tab) => tab.id !== "flags" || buildKind === "dev");
+  const visibleTabs = TABS.filter((tab) => {
+    if (tab.id === "flags") return buildKind === "dev";
+    // 「远程访问」是**桌面主机侧**的配置：铸配对码、填侧车要连的中继端点。
+    // 手机是已经被配对的那一端——它既铸不出码，也改不了另一台机器的侧车地址，
+    // 所以整页不出现（连分类行也不留，免得点进一个空页）。
+    if (tab.id === "remote" && isMobile) return false;
+    return true;
+  });
   const [active, setActive] = useState<TabId>("general");
   const [phonePane, setPhonePane] = useState<"list" | "panel">("panel");
   /** 从子页返回后要重新落焦的分类。`null` = 无需落焦。 */
   const [pendingFocus, setPendingFocus] = useState<TabId | null>(null);
   /** 分类行的 DOM 句柄，返回时把焦点还给对应行。 */
-  const categoryRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+  const categoryRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>(
+    {},
+  );
   /** 子页的返回按钮，进入子页时落焦于此。 */
   const backRef = useRef<HTMLButtonElement | null>(null);
   // roving tabIndex：只有选中的 Tab 是 Tab 停靠点，↑↓←→ 在表内移动。
@@ -167,7 +203,9 @@ export function SettingsDialog({
     // 上次停在哪个子页与本次打开无关，留着会让人以为设置只有那一页。
     setPhonePane(isMobile ? "list" : "panel");
     restoreRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     // 落焦在选中的 Tab 上：键盘用户一进来就在 tablist 里，箭头键随即可用。
     tabRefs.current[activeAtOpen.current]?.focus();
     // 关闭（open 转 false）或卸载时把焦点还给来处。
@@ -197,7 +235,8 @@ export function SettingsDialog({
     if (i < 0) return;
     // aria-orientation="vertical"，但左右键同样惯例可用。
     let next = i;
-    if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (i + 1) % visibleTabs.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowRight")
+      next = (i + 1) % visibleTabs.length;
     else if (e.key === "ArrowUp" || e.key === "ArrowLeft")
       next = (i - 1 + visibleTabs.length) % visibleTabs.length;
     else if (e.key === "Home") next = 0;
@@ -209,7 +248,6 @@ export function SettingsDialog({
     tabRefs.current[id]?.focus();
   };
 
-
   return (
     <Modal
       open={open}
@@ -217,7 +255,11 @@ export function SettingsDialog({
       overlayClassName="fixed inset-0 z-50 flex items-center justify-center"
       // 该 backdrop 必须留在遮罩内、面板前：手机上由 CSS 隐藏，也是测试的选择器。
       overlayBackdrop={
-        <div data-settings-backdrop className="absolute inset-0 bg-black/50" onClick={onClose} />
+        <div
+          data-settings-backdrop
+          className="absolute inset-0 bg-black/50"
+          onClick={onClose}
+        />
       }
       ariaLabel="设置"
       panelClassName="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
@@ -288,7 +330,9 @@ export function SettingsDialog({
             aria-label="关闭设置"
             onClick={onClose}
             className={`${
-              isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
+              isMobile
+                ? "flex size-11 shrink-0 items-center justify-center"
+                : "px-2"
             } rounded text-fg-subtle hover:text-fg`}
           >
             ×
@@ -331,16 +375,27 @@ export function SettingsDialog({
               <SettingsGeneralTab
                 theme={theme}
                 onThemeChange={onThemeChange}
+                fontScale={fontScale}
+                onFontScaleChange={onFontScaleChange}
                 watchmanEnabled={watchmanEnabled}
                 onToggleWatchman={onToggleWatchman}
                 watchmanWarning={watchmanWarning}
               />
-            ) : active === "remote" ? (
-              <SettingsRemoteTab
-                call={remoteCall}
-                initialRelayUrl={relayUrl}
-                saveRelayUrl={saveRelayUrl}
-              />
+            ) : active === "remote" && !isMobile ? (
+              // 手机端整页不显示：「远程访问」配的是**桌面主机侧**的配对
+              // （铸配对码、填侧车要连的中继端点）。手机是已经被配对的那一端，
+              // 手机上既铸不出码，也改不了另一台机器的侧车地址。
+              // 与「通用」页不传值守、「运行参数」页不显示 tui 组同一判据。
+              // 远端项目面板排在中继设置**之前**：先有项目，才有「经中继看到
+              // 哪个项目」可配。闸门关着时它自己 `return null`，不占位置。
+              <div className="flex flex-col gap-6">
+                <RemoteSettings invoke={hostInvoke ?? defaultHostInvoke} />
+                <SettingsRemoteTab
+                  call={remoteCall}
+                  initialRelayUrl={relayUrl}
+                  saveRelayUrl={saveRelayUrl}
+                />
+              </div>
             ) : active === "plugins" ? (
               <SettingsPluginsTab
                 call={pluginCall}
@@ -362,7 +417,7 @@ export function SettingsDialog({
                 defaultProject={mcpDefaultProject}
               />
             ) : active === "runtime" && runtimeSettingsCall ? (
-              <SettingsRuntimeTab call={runtimeSettingsCall} />
+              <SettingsRuntimeTab call={runtimeSettingsCall} isMobile={isMobile} />
             ) : active === "websearch" && websearchCall ? (
               <SettingsWebSearchTab call={websearchCall} />
             ) : active === "tags" ? (

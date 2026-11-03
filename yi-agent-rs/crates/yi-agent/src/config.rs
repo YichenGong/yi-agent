@@ -115,6 +115,13 @@ pub enum Command {
         /// Enable local subagent delegation for this headless run.
         #[arg(long)]
         subagents: bool,
+
+        /// 恢复一个既有会话再跑。跑完的内容会追加进同一份日志。
+        ///
+        /// 支持完整 id 或唯一前缀。这是 resume 链路在 TUI 之外唯一的
+        /// 可自动化载体（TUI 是全屏应用，测不了）。
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Start web config UI
     Web {
@@ -202,6 +209,26 @@ pub enum Command {
         #[command(subcommand)]
         action: ResidentAction,
     },
+    /// 恢复一个既有会话并继续对话。
+    Resume {
+        /// 会话 id（或唯一前缀）。`--last` 时省略；与 `--last` 同用时
+        /// 这个位置留给提示词（dispatch 层换位）。
+        thread_id: Option<String>,
+        /// 恢复同目录最近一条会话。
+        #[arg(long)]
+        last: bool,
+        /// 恢复后立即发送的提示词。
+        prompt: Option<String>,
+    },
+    /// 复制一份会话历史，在新会话里继续（源会话不受影响）。
+    Fork {
+        /// 源会话 id（或唯一前缀）。
+        thread_id: String,
+        /// fork 后立即发送的提示词。
+        prompt: Option<String>,
+    },
+    /// 列出当前目录的会话。
+    Threads,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -390,7 +417,57 @@ mod tests {
     use std::ffi::OsString;
     use yi_agent_runtime::config::ConfigOverrides;
 
+    #[test]
+    fn resume_last_with_positional_treats_it_as_prompt() {
+        let cli = Cli::try_parse_from(["yi-agent", "resume", "--last", "修复这个 bug"]).unwrap();
+        let Some(Command::Resume {
+            thread_id,
+            last,
+            prompt,
+        }) = cli.command
+        else {
+            panic!("应解析为 Resume");
+        };
+        assert!(last);
+        // clap 会把第一个 positional 绑到 thread_id，但语义上它是提示词。
+        // dispatch 层负责换位，这里钉住的是「clap 的绑定顺序」这个事实。
+        assert_eq!(thread_id.as_deref(), Some("修复这个 bug"));
+        assert_eq!(prompt, None);
+    }
+
+    #[test]
+    fn resume_without_last_treats_positional_as_thread_id() {
+        let cli = Cli::try_parse_from(["yi-agent", "resume", "thread-abc"]).unwrap();
+        let Some(Command::Resume {
+            thread_id,
+            last,
+            prompt,
+        }) = cli.command
+        else {
+            panic!("应解析为 Resume");
+        };
+        assert!(!last);
+        assert_eq!(thread_id.as_deref(), Some("thread-abc"));
+        assert_eq!(prompt, None);
+    }
+
+    #[test]
+    fn resume_accepts_id_then_prompt() {
+        let cli = Cli::try_parse_from(["yi-agent", "resume", "thread-abc", "继续做"]).unwrap();
+        let Some(Command::Resume {
+            thread_id, prompt, ..
+        }) = cli.command
+        else {
+            panic!("应解析为 Resume");
+        };
+        assert_eq!(thread_id.as_deref(), Some("thread-abc"));
+        assert_eq!(prompt.as_deref(), Some("继续做"));
+    }
+
     /// 测试用互斥锁:涉及环境变量的测试必须串行执行,避免并行干扰。
+    ///
+    /// `cargo nextest` 下每个测试独立进程，环境变量天然不共享，这把锁退化为
+    /// 无害的空操作；`cargo test` 下它仍是必需的。两种运行器都必须保留。
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvVarGuard {
@@ -648,6 +725,7 @@ mod tests {
                 stdin: _,
                 naked,
                 subagents: _,
+                resume: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(naked, "naked flag should be true");
@@ -667,6 +745,7 @@ mod tests {
                 stdin: _,
                 naked,
                 subagents: _,
+                resume: _,
             }) => {
                 assert_eq!(prompt.as_deref(), Some("hi"));
                 assert!(!naked, "naked flag should default to false");

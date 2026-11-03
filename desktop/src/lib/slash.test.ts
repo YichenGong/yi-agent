@@ -7,14 +7,24 @@ import {
 } from "./slash";
 
 describe("slash command catalog", () => {
-  it("lists exactly the five supported commands, in popup order", () => {
+  it("lists exactly the six supported commands, in popup order", () => {
     expect(SLASH_COMMANDS.map((c) => c.name)).toEqual([
       "clear",
       "compact",
+      "fork",
       "config",
       "usage",
       "help",
     ]);
+  });
+
+  it("offers /fork with an optional message argument", () => {
+    const fork = SLASH_COMMANDS.find((c) => c.name === "fork");
+    expect(fork).toBeDefined();
+    expect(fork!.usage).toBe("[message]");
+    // 不强制带参数：不带就是「只建副本」。
+    expect(fork!.needsArg).toBe(false);
+    expect(fork!.description).toContain("会话空闲");
   });
 
   it("does not offer /quit (closing the window is a system action)", () => {

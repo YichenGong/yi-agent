@@ -94,6 +94,48 @@
 }
 
 /*
+ * 字号档位（小 / 标准 / 大）。
+ *
+ * Tailwind v4 把字号定义在 `@layer theme` 里；下面这条未分层的 `:root` 优先级
+ * 高于任何 layer，所以就地重定义即可让全部 `text-xs/sm/base/lg` 跟着缩放，
+ * 不必改任何一个工具类。
+ *
+ * 只动字号：间距、圆角、44px 触控目标走的是 `--spacing` 等另一套变量，不受影响；
+ * 行高是单位无关的比值（`calc(1.5 / 1)`），缩放后行距比例自动保持。也就是
+ * 「字变小、版面不变」。
+ *
+ * 档位因子刻意贴在 `--font-scale` 上而不是各写一遍 `--text-*`：档位之间只差
+ * 一个数，加档只加一行。
+ */
+:root {
+  --font-scale: 1;
+  --text-xs: calc(0.75rem * var(--font-scale));
+  --text-sm: calc(0.875rem * var(--font-scale));
+  --text-base: calc(1rem * var(--font-scale));
+  --text-lg: calc(1.125rem * var(--font-scale));
+}
+/* 选择器必须带 `html`：`:root` 那条是 (0,1,0)，`html[...]` 是 (0,1,1)，
+   否则档位会被上面的 `--font-scale: 1` 压掉。 */
+html[data-font-scale="small"] {
+  --font-scale: 0.9375; /* 正文 16 → 15px */
+}
+html[data-font-scale="large"] {
+  --font-scale: 1.125; /* 正文 16 → 18px */
+}
+
+/*
+ * markdown 正文。
+ *
+ * typography 插件把 `.prose` 的字号**硬编码**成 `font-size: 1rem`，不引用
+ * Tailwind 变量。不补这一条，最需要变小的聊天区反而纹丝不动，而它正是用户
+ * 说的「显示的字有点大」的主要来源。`.prose` 内部标题/列表/代码的尺寸都是相对
+ * `em` 的，跟着自动缩放；行高 `1.75` 是比值，一并保持。
+ */
+html[data-font-scale] .prose {
+  font-size: var(--text-base);
+}
+
+/*
  * 手机端（配对后的 iPhone 客户端）布局。
  *
  * 桌面是两列常驻：会话侧栏固定 256px、子 agent 栏 288px，390pt 的屏幕上聊天区
@@ -427,10 +469,12 @@ html[data-mobile="true"] {
  * 字号 < 16px 的输入框时会自动放大页面——`lockZoom` 只能禁掉用户的手动捏合缩放，
  * 挡不住这条自动放大；放大后页面不再贴合屏幕，之后每次滑动都变成两轴平移。
  * 16px 是 iOS 不触发自动放大的下限，与侧栏搜索框那条（见上）同源、同理由。
+ * `textarea` 一并收进来：运行参数页的「系统提示词」用的就是它。
  * 桌面端不匹配 `[data-mobile]`，逐字节不变。
  */
 [data-mobile="true"] .settings-panel input,
-[data-mobile="true"] .settings-panel select {
+[data-mobile="true"] .settings-panel select,
+[data-mobile="true"] .settings-panel textarea {
   font-size: 16px;
 }
 

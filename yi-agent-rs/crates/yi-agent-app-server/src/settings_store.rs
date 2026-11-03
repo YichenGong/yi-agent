@@ -168,6 +168,98 @@ pub fn save_relay_url(workdir: &Path, url: Option<&str>) -> std::io::Result<()> 
 /// 颜色标签显示名覆盖（`preferences.json` 的 `tag_names` 键）。
 pub const TAG_NAMES_KEY: &str = "tag_names";
 
+/// 字号档位。只影响显示，不参与任何执行行为。
+///
+/// 与 [`Theme`] 一样在磁盘上是小写字符串；与它不同的是**必须能区分「未设置」**：
+/// 两个平台的默认值不一样（桌面 `Standard`、配对手机 `Small`），所以读路径返回
+/// `Option`，由客户端回落到自己平台的默认，而不是在这里猜一个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FontScale {
+    Small,
+    Standard,
+    Large,
+}
+
+impl FontScale {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FontScale::Small => "small",
+            FontScale::Standard => "standard",
+            FontScale::Large => "large",
+        }
+    }
+
+    /// 严格解析：大小写与空白不敏感，**未知值返回 `None`**。
+    ///
+    /// 刻意不像 [`Theme::parse`] 那样把坏值折成一个默认档：主题折成深色是安全的
+    /// （两种主题都在预期范围内），而字号折错会让「我的设置没生效」无从诊断——
+    /// `ui/settings/write` 用同一个解析器拒绝非法值，读写两侧口径因此一致。
+    pub fn parse(s: &str) -> Option<FontScale> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "small" => Some(FontScale::Small),
+            "standard" => Some(FontScale::Standard),
+            "large" => Some(FontScale::Large),
+            _ => None,
+        }
+    }
+}
+
+/// 字号偏好的平台归属。
+///
+/// 两个平台**各占一个键**：配对手机经 ws 写的是桌面主机上的同一个
+/// `preferences.json`，共用一个键就意味着一端改字号会顺手改掉另一端的观感。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontScalePlatform {
+    Desktop,
+    Ios,
+}
+
+impl FontScalePlatform {
+    pub fn key(self) -> &'static str {
+        match self {
+            FontScalePlatform::Desktop => FONT_SCALE_DESKTOP_KEY,
+            FontScalePlatform::Ios => FONT_SCALE_IOS_KEY,
+        }
+    }
+}
+
+/// 桌面客户端的字号键。
+pub const FONT_SCALE_DESKTOP_KEY: &str = "font_scale_desktop";
+
+/// 配对手机端的字号键。
+pub const FONT_SCALE_IOS_KEY: &str = "font_scale_ios";
+
+/// 读某个平台的字号档位。
+///
+/// 缺文件 / 坏文件 / 缺键 / 值非法一律 `None`——坏偏好绝不阻断启动，也不在磁盘
+/// 层替客户端挑一个档位（见 [`FontScale::parse`]）。
+pub fn load_font_scale(workdir: &Path, platform: FontScalePlatform) -> Option<FontScale> {
+    let path = preferences_path(workdir);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    value
+        .get(platform.key())
+        .and_then(|v| v.as_str())
+        .and_then(FontScale::parse)
+}
+
+/// 写某个平台的字号档位。`None` → **删除**该键（回到「未设置」，由客户端回落
+/// 平台默认），与 [`save_relay_url`] 对空值的处理同一口径。
+///
+/// 与 [`save`] 同一约定：读-改-写、保留无关键、原子替换。只碰本平台的键。
+pub fn save_font_scale(
+    workdir: &Path,
+    platform: FontScalePlatform,
+    scale: Option<FontScale>,
+) -> std::io::Result<()> {
+    read_write_key(
+        workdir,
+        platform.key(),
+        scale.map(|scale| serde_json::Value::String(scale.as_str().to_string())),
+    )
+}
+
 /// 读用户自定义的颜色标签显示名（颜色 id → 名称）。
 ///
 /// 返回磁盘上**实际存在的覆盖项**（可能只有 1 个键，也可能是空映射）。**刻意不**
@@ -876,5 +968,106 @@ mod watchman_tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value[WATCHMAN_KEY], false);
         assert!(!load_watchman_enabled(dir.path()));
+    }
+}
+
+/// 字号偏好的读写测试。
+///
+/// 它与 theme/值守/中继同处一个 `preferences.json`，因此除了往返之外还要断言
+/// 三个键互不覆盖——这正是本次「参数按平台隔离」的磁盘契约。
+#[cfg(test)]
+mod font_scale_tests {
+    use super::*;
+
+    /// 字号档位：两个平台各一个键，互不覆盖。
+    ///
+    /// 这是**磁盘契约**：桌面写 `font_scale_desktop`，配对手机写 `font_scale_ios`，
+    /// 而两者落在同一个 `preferences.json` 上（配对手机经 ws 写的是桌面主机那份）。
+    /// 一旦合并成一个键，在手机上改字号会顺手改掉桌面的观感。
+    #[test]
+    fn font_scale_keys_are_independent_per_platform() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_font_scale(
+            dir.path(),
+            FontScalePlatform::Desktop,
+            Some(FontScale::Small),
+        )
+        .unwrap();
+        assert_eq!(
+            load_font_scale(dir.path(), FontScalePlatform::Desktop),
+            Some(FontScale::Small)
+        );
+        assert_eq!(
+            load_font_scale(dir.path(), FontScalePlatform::Ios),
+            None,
+            "writing one platform must not populate the other"
+        );
+
+        save_font_scale(dir.path(), FontScalePlatform::Ios, Some(FontScale::Large)).unwrap();
+        assert_eq!(
+            load_font_scale(dir.path(), FontScalePlatform::Desktop),
+            Some(FontScale::Small)
+        );
+        assert_eq!(
+            load_font_scale(dir.path(), FontScalePlatform::Ios),
+            Some(FontScale::Large)
+        );
+    }
+
+    /// 与 theme/值守/中继同处一个文件：三方写路径不得互相覆盖。
+    #[test]
+    fn saving_the_font_scale_preserves_unrelated_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            format!(r#"{{"theme":"light","{WATCHMAN_KEY}":false,"relay_url":"wss://r/x"}}"#),
+        )
+        .unwrap();
+        save_font_scale(dir.path(), FontScalePlatform::Ios, Some(FontScale::Small)).unwrap();
+
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["theme"], "light");
+        assert_eq!(value[WATCHMAN_KEY], false);
+        assert_eq!(value["relay_url"], "wss://r/x");
+        assert_eq!(value[FONT_SCALE_IOS_KEY], "small");
+    }
+
+    /// `None` 删键：否则「未设置」与「设成默认」在文件里长得一样，手机端也
+    /// 分不出该不该回落到自己的默认档。
+    #[test]
+    fn clearing_a_font_scale_removes_the_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_font_scale(dir.path(), FontScalePlatform::Ios, Some(FontScale::Large)).unwrap();
+        save_font_scale(dir.path(), FontScalePlatform::Ios, None).unwrap();
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get(FONT_SCALE_IOS_KEY).is_none(), "{text}");
+        assert_eq!(load_font_scale(dir.path(), FontScalePlatform::Ios), None);
+        assert_eq!(value.get(FONT_SCALE_DESKTOP_KEY), None);
+    }
+
+    /// 坏值 / 坏文件 / 缺文件一律读作 `None`——由客户端回落到平台默认，
+    /// 而不是在磁盘层猜一个档位。
+    #[test]
+    fn a_bad_font_scale_reads_as_unset() {
+        for raw in ["\"tiny\"", "3", "null", "\"\""] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+            std::fs::write(
+                preferences_path(dir.path()),
+                format!(r#"{{"{FONT_SCALE_IOS_KEY}":{raw}}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                load_font_scale(dir.path(), FontScalePlatform::Ios),
+                None,
+                "raw: {raw}"
+            );
+        }
+
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(load_font_scale(empty.path(), FontScalePlatform::Ios), None);
     }
 }
