@@ -7,17 +7,21 @@
 
 pub mod bundle;
 pub mod error;
+pub mod grants;
 pub mod limits;
 pub mod locks;
 pub mod manifest;
+pub mod project;
 pub mod registry;
 pub mod trust;
 pub mod types;
 
 pub use bundle::{InstalledRelease, install_verified, verify_installed};
 pub use error::PluginError;
+pub use grants::{Grant, GrantTable};
 pub use limits::ExtractLimits;
 pub use manifest::{Manifest, MethodDecl, ViewDecl};
+pub use project::{ProjectResolver, ProjectRoot};
 pub use registry::{GrantSummary, InstalledVersion, PluginRecord, Registry};
 pub use trust::{TrustStore, VerifiedRelease};
 pub use types::{Binding, Effect, Operation, PluginId, ProjectId, ReleaseId};

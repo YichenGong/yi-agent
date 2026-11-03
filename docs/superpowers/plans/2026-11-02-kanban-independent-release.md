@@ -427,17 +427,25 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 `grant/check`、规范项目 ID/句柄、独立项目授权代次。业务 method/CLI effect 由签名清单解析，不接受客户端把 write 标成 read。
 
-- [ ] Step 1：加入跨项目、跨宿主、已停用旧 binding、同版本重启旧 binding、仓库伪造 supervisor/flag 的失败测试。
-- [ ] Step 2：核心断言：
+- [x] Step 1：加入跨项目、跨宿主、已停用旧 binding、同版本重启旧 binding、仓库伪造 supervisor/flag 的失败测试。
+  > 2026-11-03：跨项目 `revoking_one_project_leaves_the_other_usable`、跨宿主 `a_binding_from_another_host_is_rejected`、旧 binding `a_stale_grant_generation_is_rejected`、子目录路径下旧 binding `a_revoked_grant_cannot_be_reused_through_a_subdirectory_path`。两个项目用**两个真实目录**创建（设计明确不允许用同一 ProjectId 冒充两项目）。
+  > 「仓库伪造 supervisor/flag」一条**未在 T10 覆盖**：那属于投影可信度，T10 里没有任何输入来自仓库文件，所以这里没有可攻击面。已在 T12/T13 的投影任务里列为必测项，不在本任务假装测过。
+- [x] Step 2：核心断言：
+  > 2026-11-03：`revoking_one_project_leaves_the_other_usable` 覆盖前两条；`an_effect_that_was_not_granted_is_rejected` 覆盖第三条（`Launch` 未批即拒）。
   ```rust
   assert!(registry.check(&old_project_a, Effect::Write).is_err());
   assert!(registry.check(&unchanged_project_b, Effect::Write).is_ok());
   assert!(registry.check(&read_only_binding, Effect::Launch).is_err());
   ```
   测试在两个不同临时项目创建授权，只撤销 A；fixture 不允许用相同 ProjectId 代替两项目。
-- [ ] Step 3：实现能力差异比较与重新确认状态；把配额修改、自动任务、常驻分别授权。用户未批的新权限不得因升级获得；正常旧权限不无故重置。
-- [ ] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test grants`；覆盖真实 symlink 规范化、未登记 worktree、同名目录及授权持久化后重开。
-- [ ] Step 5：按 C 提交 `feat: authorize plugin projects with scoped bindings`。
+- [x] Step 3：实现能力差异比较与重新确认状态；把配额修改、自动任务、常驻分别授权。用户未批的新权限不得因升级获得；正常旧权限不无故重置。
+  > 2026-11-03：`src/project.rs` 的 `is_independent` 把 `Launch` / `QuotaWrite` / `Resident` 归为独立确认，`Read` / `Write` 归基本授权。`GrantTable::compare_capabilities` 保留旧能力、把新增放进 `pending`；`check` 即便 `granted` 里含该能力，只要它在 `pending` 里也拒绝。
+  > 反向也钉住了：`a_pure_version_bump_does_not_require_reconfirmation`（纯版本升级不打扰用户）、`regranting_the_same_terms_is_idempotent_and_does_not_bump_the_generation`（重复启用不递增代次，否则客户端刚落地的绑定会无故失效）。
+- [x] Step 4：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test grants`；覆盖真实 symlink 规范化、未登记 worktree、同名目录及授权持久化后重开。
+  > 2026-11-03：`grants` 26/26。symlink 用真实 `std::os::unix::fs::symlink`（`a_symlink_resolves_to_the_same_project_as_its_target`）；同名目录 `same_named_directories_are_different_projects`；worktree `a_worktree_resolves_back_to_its_registered_root_when_it_is_under_it`；持久化重开 `a_grant_table_survives_a_round_trip_and_still_rejects_stale_bindings`。
+  > 另补两条容易被漏掉的：`a_sibling_directory_sharing_a_prefix_is_not_a_subdirectory`（字符串前缀会把 `project-a-evil` 判成子目录）、`a_nested_registered_root_wins_over_its_parent`（取最短根会让子模块授权被父项目吞掉）。
+  > 11 项变异全部打红：删代次/宿主/能力/pending 检查、撤销不递增、比较不清 pending、重复启用误递增、把 `QuotaWrite` 归进基本授权、取错根、字面比较替代 `canonicalize`。
+- [x] Step 5：按 C 提交 `feat: authorize plugin projects with scoped bindings`。
 
 ### Task T11：实现活动准入、排空屏障与幂等操作记录
 

@@ -58,4 +58,12 @@
 - [x] registry 短锁防丢失更新 — 两个进程并发记录不同插件，两条都必须存活。判据：`two_processes_recording_different_plugins_do_not_lose_an_update`（删掉短锁即打红）
 - [x] 读者看不到半个文件 — 唯一临时文件 + 文件 fsync + rename + 目录 fsync。判据：`readers_never_observe_a_partial_file`（并发读线程，一次解析失败即红）
 - [x] 不同实例互不干扰 — 判据：`different_instance_homes_do_not_share_locks`
-- [ ] 项目授权与双代次 — T10
+- [x] 项目规范化 — `src/project.rs` 的 `ProjectResolver`：`canonicalize` 跟随 symlink，按路径**分量**而非字符串前缀判子目录。判据：`a_symlink_resolves_to_the_same_project_as_its_target`、`a_sibling_directory_sharing_a_prefix_is_not_a_subdirectory`、`same_named_directories_are_different_projects`、`a_nested_registered_root_wins_over_its_parent`
+- [x] 项目授权代次独立 — 撤销或变更只递增该项目代次，其他项目不受影响；旧代次绑定 → `StaleBinding`。判据：`revoking_one_project_leaves_the_other_usable`、`a_stale_grant_generation_is_rejected`、`a_real_change_does_bump_the_generation`
+- [x] 授权绑定宿主身份 — 别的宿主不能复用。判据：`a_binding_from_another_host_is_rejected`
+- [x] 无变更的重复启用幂等 — 不递增代次，否则客户端刚拿到的绑定会无故失效。判据：`regranting_the_same_terms_is_idempotent_and_does_not_bump_the_generation`
+- [x] 能力分类 — `Read`/`Write` 属基本授权；`Launch`/`QuotaWrite`/`Resident` 需独立确认（`is_independent`）。判据：`quota_and_resident_are_independent_confirmations`、`granting_basic_access_does_not_grant_residency`
+- [x] 升级不自动扩权 — 新能力进 `pending` 并要求重新确认，旧能力不重置；`pending` 里的能力即便在 `granted` 中也拒绝。判据：`a_capability_increase_requires_reconfirmation`、`a_pending_capability_is_refused_even_if_it_is_listed_as_granted`、`a_pure_version_bump_does_not_require_reconfirmation`、`confirming_a_reconfirmation_clears_pending_and_bumps_the_generation`
+- [x] 子目录不逃过根的撤销 — 判据：`a_revoked_grant_cannot_be_reused_through_a_subdirectory_path`
+- [x] 授权持久化后重开仍拒旧绑定 — 判据：`a_grant_table_survives_a_round_trip_and_still_rejects_stale_bindings`
+- [ ] 活动准入、排空屏障与幂等操作记录 — T11
