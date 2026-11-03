@@ -685,11 +685,11 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 远端 `assetRelease` 返回已认证的发布身份和受控包传输句柄，不返回供页面直接 fetch 的宿主凭据。缓存字节可去重；运行绑定始终包含远端宿主/代次。无桌面的安装与更新可用。
 
-- [ ] Step 1：两宿主同插件不同版本测试：切换到 B 不能展示 A 的 UI，错误摘要/撤回/过期新发布拒绝；远端平台二进制绝不在桌面 spawn。
-- [ ] Step 2：测试旧客户端不兼容只禁该视图、headless 更新可用、离线有匹配已验证缓存可恢复原授权视图、无缓存明确不可加载。
-- [ ] Step 3：实现独立签名/包校验、完整平台包静态资源提取、重连握手、旧通道撤销、连接切换清理和有界客户端关闭确认；断线写查结果，不重新提交。
-- [ ] Step 4：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib plugin_remote`；`cd ../desktop && npx vitest run src/lib/pluginHost/remote.test.ts`；用两个真实隔离 app-server 连接完成远程验收，不能仅把两个对象命名成两宿主。
-- [ ] Step 5：按 C 提交 `feat: bind plugin views to remote host release identities`。
+- [x] Step 1：两宿主同插件不同版本测试：切换到 B 不能展示 A 的 UI，错误摘要/撤回/过期新发布拒绝；远端平台二进制绝不在桌面 spawn。
+- [x] Step 2：测试旧客户端不兼容只禁该视图、headless 更新可用、离线有匹配已验证缓存可恢复原授权视图、无缓存明确不可加载。
+- [x] Step 3：实现独立签名/包校验、完整平台包静态资源提取、重连握手、旧通道撤销、连接切换清理和有界客户端关闭确认；断线写查结果，不重新提交。
+- [x] Step 4：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib plugin_remote`；`cd ../desktop && npx vitest run src/lib/pluginHost/remote.test.ts`；用两个真实隔离 app-server 连接完成远程验收，不能仅把两个对象命名成两宿主。
+- [x] Step 5：按 C 提交 `feat: bind plugin views to remote host release identities`。
 
 ## Phase 5：迁移完整看板插件
 
