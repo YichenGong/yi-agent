@@ -276,6 +276,17 @@ pub(crate) struct LoadedThreadFacts {
     pub idle: bool,
 }
 
+/// 快照里这一条算不算「空闲」。
+///
+/// 与 `driver_tick` 的旧 idle 快照逐字同一口径：`ThreadStatus::Idle` 且没有活跃
+/// turn。`AwaitingApproval` 与 `Running` 都不算——前者在等人，后者在跑，两者都不
+/// 是「这个会话这轮已经结束」。单独成函数是为了让这条口径能被直接钉住：它同时
+/// 决定插件看到的 `loaded_threads[].idle` 与旧 `threads[].idle`；写成内联表达式
+/// 时两条 `?` 短路极易在重构中悄悄放宽。
+pub(crate) fn snapshot_idle(status: ThreadStatus, active_turn: Option<&str>) -> bool {
+    matches!(status, ThreadStatus::Idle) && active_turn.is_none()
+}
+
 /// 本进程此刻加载着的**全部**会话快照（按 ID 排序，便于断言与比对）。
 ///
 /// 「完整」是这条协议的全部价值：插件据此区分「宿主明确说它不在」与「宿主没
@@ -296,7 +307,7 @@ pub(crate) fn loaded_threads_snapshot(
                 .unwrap_or_else(|poison| poison.into_inner());
             LoadedThreadFacts {
                 thread_id: thread_id.clone(),
-                idle: matches!(status, ThreadStatus::Idle) && session.active_turn_id.is_none(),
+                idle: snapshot_idle(status, session.active_turn_id.as_deref()),
             }
         })
         .collect();
@@ -881,6 +892,26 @@ mod tests {
         assert_eq!(payload[0]["alive"], true);
         assert_eq!(payload[1]["alive"], false);
         assert_eq!(payload[0]["idle"], true, "idle 语义不变");
+    }
+
+    /// K4：快照里的 `idle` 三态口径。
+    ///
+    /// 只有「Idle 且没有活跃 turn」算空闲。`AwaitingApproval` 在等人、
+    /// `Running` 在跑，两者都不算这轮结束——把任何一个当空闲，插件都会误判
+    /// 「这张卡的回合跑完了」并据此迁移卡片状态。
+    #[test]
+    fn kanban_observation_snapshot_idle_counts_only_idle_without_a_turn() {
+        assert!(snapshot_idle(ThreadStatus::Idle, None));
+        assert!(
+            !snapshot_idle(ThreadStatus::Idle, Some("turn-1")),
+            "a leftover turn id means the turn is not over"
+        );
+        assert!(!snapshot_idle(ThreadStatus::Running, None));
+        assert!(!snapshot_idle(ThreadStatus::Running, Some("turn-1")));
+        assert!(
+            !snapshot_idle(ThreadStatus::AwaitingApproval, None),
+            "waiting for a human is not an idle session"
+        );
     }
 
     /// 完整热表快照真的上送：字段名、排序、逐条 `idle`。
