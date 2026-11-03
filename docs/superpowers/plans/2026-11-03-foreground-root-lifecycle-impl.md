@@ -1258,4 +1258,3 @@ if managed && authority_bridge_ready && foreground_schema_supported {
 - 修订回查：同步spec与进度登记；保留11个任务、55个待执行步骤与C1–C16追踪。
   本轮只进行文档检查与临时内存SQLite约束验证；未执行Rust/桌面实现测试，未提交或合并。
   自审未发现的实现问题仍须由RED/GREEN、故障注入和独立代码审查发现，不据此宣称运行时正确。
-
