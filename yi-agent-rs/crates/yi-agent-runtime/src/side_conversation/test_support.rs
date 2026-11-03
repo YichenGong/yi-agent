@@ -111,3 +111,97 @@ fn source_from_session(session: Session) -> EffectiveSideSource {
         web_policy: SideWebPolicy::default(),
     }
 }
+
+/// A provider that blocks until its stream is dropped, for stop/close tests.
+///
+/// `entered` fires once the request arrived (so a test never guesses with a
+/// sleep), and `dropped` proves the real provider stream was torn down rather than
+/// merely abandoned by a consumer.
+pub struct PendingProvider {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    calls: Mutex<usize>,
+}
+
+impl PendingProvider {
+    pub fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            calls: Mutex::new(0),
+        }
+    }
+
+    /// Wait until a request has been received.
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Whether the blocking stream has been dropped.
+    pub fn dropped(&self) -> bool {
+        self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl Default for PendingProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stream that never yields and records its own drop.
+struct PendingStream {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    notified: bool,
+}
+
+impl futures::Stream for PendingStream {
+    type Item = ProviderEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.notified {
+            self.notified = true;
+            self.entered.notify_waiters();
+        }
+        let _ = cx.waker().clone();
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for PendingStream {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for PendingProvider {
+    async fn call_stream(
+        &self,
+        _req: ProviderRequest,
+    ) -> Result<futures::stream::BoxStream<'static, ProviderEvent>, ProviderError> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(Box::pin(PendingStream {
+            entered: Arc::clone(&self.entered),
+            dropped: Arc::clone(&self.dropped),
+            notified: false,
+        }))
+    }
+}
+
+/// A source whose provider blocks until the run is stopped.
+pub fn source_with_pending_provider() -> (EffectiveSideSource, Arc<PendingProvider>) {
+    let mut source = source_with_history("父问题", "父回答");
+    let provider = Arc::new(PendingProvider::new());
+    source.provider = provider.clone();
+    (source, provider)
+}

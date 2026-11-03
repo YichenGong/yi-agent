@@ -18,6 +18,7 @@
 pub mod ledger;
 pub mod policy;
 pub mod resources;
+pub mod runner;
 pub mod source;
 
 #[cfg(test)]
@@ -30,6 +31,10 @@ pub use policy::{SideToolPolicy, SideToolSetupFactory, build_side_tool_setup};
 pub use resources::{
     PreparedSideResources, SIDE_BINARY_BUDGET_BYTES, SIDE_RESOURCE_SLOTS, SideHostResources,
     SideResourceLease,
+};
+pub use runner::{
+    SIDE_STOP_GRACE, SIDE_TURN_TIMEOUT, SideConversationRunner, SideRunnerEvent, SideStatus,
+    SideTokenTotals, SideUsage,
 };
 pub use source::{
     EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SideWebPolicy,
