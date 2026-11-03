@@ -50,7 +50,8 @@ lopdf = "0.45"
 unicode-normalization = "0.1"
 # DOCX 只是 zip + DEFLATE。必须收紧默认特性：
 # 默认会拉 zstd-sys（C 代码，经 cc）。
-zip = { version = "8", default-features = false, features = ["deflate"] }
+# 9.x 只为修 RUSTSEC-2026-0429 而升；我们只用 by_name 读，不碰 extract。
+zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.38"
 
 # tracing

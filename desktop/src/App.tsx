@@ -114,6 +114,8 @@ import {
 } from "./lib/contentStore";
 import { resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
+import { useRuntimeLease } from "./hooks/useRuntimeLease";
+import { wantedProjects } from "./lib/runtimeLease";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
 
@@ -518,6 +520,30 @@ export default function App() {
     initialListCache,
     pairingVersion: prefs.pairingVersion,
   });
+  /**
+   * 本机项目租约跟随「用户真的在用哪个项目」，而不是侧栏里出现过什么。
+   *
+   * 判据在 `lib/runtimeLease.ts`（纯函数、有测试）：当前打开的会话所在项目，
+   * 加上任何仍在跑（或等审批）的会话所在项目。历史上出现过但没工作的项目会
+   * 在离开时释放，不让一个没人用的运行时被永远保活。
+   *
+   * 远端网页客户端没有本机壳、也没有自己的侧车，故整块在 hook 内部短路。
+   */
+  const leaseThreads = store.ids().flatMap((id) => {
+    const view = store.peek(id);
+    const cwd = view?.info?.cwd;
+    return cwd ? [{ cwd, status: view?.status }] : [];
+  });
+  const leaseActiveProject = store.current()?.info?.cwd ?? null;
+  useRuntimeLease({
+    activeProject: leaseActiveProject,
+    threads: leaseThreads,
+    revision: wantedProjects({
+      activeProject: leaseActiveProject,
+      threads: leaseThreads,
+    }).join("\n"),
+  });
+
   // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
   // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
   // 由下面切 Tab 与 `selectThread` 几处调用点自己收起详情。

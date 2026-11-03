@@ -852,3 +852,100 @@ async fn every_tui_notification_field_is_writable_and_readable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Desktop shell authorization over the local stdio handshake
+// ---------------------------------------------------------------------------
+
+/// The local stdio client is the only one that may speak for the shell, and the
+/// handshake must say back what it accepted.
+///
+/// This is the end-to-end half of `shell_authorization`'s unit tests: those prove
+/// the rules, this proves the rules are actually wired into `initialize`.
+#[tokio::test]
+async fn a_local_handshake_reports_the_shell_identity_it_accepted() {
+    let mut h = Harness::new();
+    // One line on purpose: the transport parses line by line, so a pretty-printed
+    // frame would be rejected before any rule here is reached.
+    h.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-1","scope_key":"/p/.yi-agent/runtime","issued_by_shell":true}}}"#,
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(1)))
+        .await;
+    assert_eq!(v["result"]["shell"]["clientRunId"], "app-run-1");
+    assert_eq!(v["result"]["shell"]["scopeKey"], "/p/.yi-agent/runtime");
+    h.shutdown().await;
+}
+
+/// A handshake without the field is the CLI's normal shape and must stay exactly
+/// as it was: no `shell` key invented out of nothing.
+#[tokio::test]
+async fn a_plain_handshake_reports_no_shell() {
+    let mut h = Harness::new();
+    // Sent directly rather than through the `initialize` helper: that helper
+    // consumes the response, and this test's whole assertion is about it.
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(1)))
+        .await;
+    assert!(
+        v["result"].get("shell").is_none(),
+        "a CLI handshake must not claim a shell: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// A websocket client that sends the same field must not be believed: over the
+/// network this is a phone claiming to be the App, not the shell speaking.
+///
+/// The merged harness carries one real ws client, so this exercises the identity
+/// check on a non-local `ClientId` rather than only in a unit test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_websocket_handshake_cannot_claim_the_desktop_shell() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let h = MergedHarness::new().await;
+    let mut ws = h.connect_ws().await;
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-1","scope_key":"/p/.runtime","issued_by_shell":true}}}"#
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = ws.next().await.unwrap().unwrap();
+    let response: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(response["id"], 1);
+    assert!(
+        response.get("result").is_some(),
+        "the handshake must still succeed: {response}"
+    );
+    assert!(
+        response["result"].get("shell").is_none(),
+        "a ws client must never be recognised as the shell: {response}"
+    );
+}
+
+/// A field the bridge would never write is ignored, not fatal: one bad hint must
+/// not turn a working handshake into a failed session.
+#[tokio::test]
+async fn a_handshake_claiming_a_forged_shell_is_ignored() {
+    let mut h = Harness::new();
+    h.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"x","issued_by_shell":false}}}"#,
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(1)))
+        .await;
+    assert!(
+        v.get("result").is_some(),
+        "the handshake must still succeed: {v}"
+    );
+    assert!(v["result"].get("shell").is_none());
+    h.shutdown().await;
+}

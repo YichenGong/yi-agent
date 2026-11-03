@@ -15,16 +15,26 @@
 //! - [`client`] — the blocking control-channel client.
 //! - [`leases`] — the frontend lease state machine (no I/O, injectable time).
 //! - [`managed`] — private managed-process channels, including descriptor passing.
+//! - [`scope`] — canonical runtime scope resolution and the socket names derived
+//!   from it. Here rather than in the supervisors because the desktop shell must
+//!   resolve the same paths without linking them.
 
 pub mod client;
 pub mod codec;
 pub mod deadline;
 pub mod leases;
 pub mod managed;
+pub mod scope;
 pub mod types;
 
 /// Control protocol version. Evolves independently of the business protocol.
 pub const CONTROL_VERSION: u16 = 1;
+
+/// The guardian's control socket file inside a runtime directory.
+///
+/// One definition, here, because the desktop shell and the supervisors must agree
+/// on the path or the shell would connect to a socket nobody is serving.
+pub const GUARDIAN_SOCKET_FILE: &str = "guardian-control.sock";
 
 /// Upper bound on one control frame, including its 4-byte length header.
 pub const MAX_CONTROL_FRAME: usize = 16 * 1024;

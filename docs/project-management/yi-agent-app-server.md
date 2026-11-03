@@ -200,3 +200,21 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
   `watchman_install_tests::a_retired_instance_never_reinstalls_the_watchman`、
   `plugin_theme::re_enabling_the_watchman_on_a_retired_instance_installs_nothing`）；**变异验证**：
   去掉任一处的退休判断 → 对应用例红（均实测 RED 后恢复）
+- [x] 本地 stdio 握手携带桌面壳的窄授权（Task 13） — 侧车不再自己猜「谁在替 App 干活」，
+  而是从**本地 stdio 的 `initialize`** 收一次壳的声明：`ShellAuthorization{client_run_id,
+  scope_key(可选), daemon_instance_id(可选), issued_by_shell}`。三条性质都是硬约束：
+  ① 只认 stdio —— `client == ClientId::local()` 才算，ws／relay 客户端发同一段 JSON
+  一律忽略（否则一台手机就能自称 App 的 owner）；② 不携带凭据 —— 过管道只有身份
+  与代际，没有 credential，所以继承进程环境的工具拿不到任何可续租的东西（单测断言
+  序列化结果不含 `credential`／`secret`／`token`）；③ `scope_key` 可选 —— 侧车启动
+  时用户还没打开任何项目，此时「没有 scope」是事实而不是无权限。畸形字段**不是**
+  握手失败（CLI 的常态就是没有这个字段），只当「没有壳」。被接受的声明以
+  `result.shell.{clientRunId,scopeKey}` 回显，让「壳被认出来」成为可观测事实而不是
+  内部写盘。代码：`src/shell_authorization.rs`、`src/server.rs` 的 `initialize` 分支
+  与 `ClientShellAuthorizations` 表、`src/ws.rs`（纯 ws 给空表）。判据：
+  `cargo test -p yi-agent-app-server --lib shell_authorization`（9 例：本地可带、
+  ws 伪造被拒、非 bridge 签发被拒、空 client/scope 被拒、无 scope 仍可识别、
+  缺字段视为无壳、畸形不破坏握手、roundtrip、不含密钥）+
+  `cargo test -p yi-agent-app-server --lib handshake`（含三条端到端：stdio 握手回显
+  壳身份、纯 CLI 握手无 `shell` 键、伪造 `issued_by_shell:false` 被忽略）+
+  `a_websocket_handshake_cannot_claim_the_desktop_shell`（真实 ws 连接上不被认作壳）

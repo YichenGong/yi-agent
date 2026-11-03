@@ -50,7 +50,10 @@ pub const READY_CONSUMED_ENV: &str = "YI_AGENT_MANAGED_READY_CONSUMED";
 /// Where the ownership journal lives inside the runtime directory.
 pub const JOURNAL_FILE: &str = "processes.json";
 /// The guardian's control socket name.
-pub const GUARDIAN_SOCKET_FILE: &str = "guardian-control.sock";
+///
+/// Re-exported from `yi-agent-lifecycle`: the desktop shell resolves the same
+/// socket to register its leases, and two constants would drift.
+pub const GUARDIAN_SOCKET_FILE: &str = yi_agent_lifecycle::GUARDIAN_SOCKET_FILE;
 
 /// Who a managed process belongs to.
 ///

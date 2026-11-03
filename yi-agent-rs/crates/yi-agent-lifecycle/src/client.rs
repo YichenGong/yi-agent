@@ -459,6 +459,15 @@ mod tests {
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // On macOS the accepted socket inherits the listener's
+                        // O_NONBLOCK, so a read that races the client's write
+                        // returns WouldBlock instead of waiting. Dropping the
+                        // connection there would surface to the client as EOF on a
+                        // registration that actually arrived. Block for real, with
+                        // a timeout so a silent peer cannot wedge the fixture.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         let frame = match crate::codec::read_frame(&mut stream) {
                             Ok(frame) => frame,
                             Err(_) => continue,
@@ -584,8 +593,22 @@ mod tests {
         );
     }
 
+    /// Both socket-backed tests bind a real file. They are cheap but not
+    /// instant, and the heartbeat thread keeps a connection open for seconds, so
+    /// running them concurrently makes the slow one look flaky when the machine
+    /// is busy. They are independent behaviours, so serialising them costs
+    /// nothing and removes the false negative.
+    static SOCKET_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn socket_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        SOCKET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn a_registered_lease_releases_and_reads_its_result() {
+        let _serial = socket_test_lock();
         let fixture = Fixture::new();
         let mut lease = FrontendLease::register_if_served(
             &fixture.path,
@@ -629,6 +652,7 @@ mod tests {
 
     #[test]
     fn a_refused_heartbeat_marks_the_lease_lost_without_retrying() {
+        let _serial = socket_test_lock();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("guardian-control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -649,6 +673,8 @@ mod tests {
                 // macOS, and a non-blocking read surfaces as an error rather than a
                 // frame. The real guardian normalises this the same way.
                 let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 let Ok(frame) = crate::codec::read_frame(&mut stream) else {
                     continue;
                 };

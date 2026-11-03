@@ -2564,6 +2564,8 @@ where
     let client_scopes: ClientScopes =
         Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
     let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
+    let client_shell_authorizations: ClientShellAuthorizations =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // ---------- 合并模式:把一条环回 ws 前端(与可选的中继客户端)接到同一个
     // `serve()` 上。`listener` 为 `None` 时以下整块都跳过,纯 stdio 因此与改造前
@@ -2641,6 +2643,7 @@ where
         build_agent,
         client_scopes,
         client_initialized,
+        client_shell_authorizations,
         stdio_eof_rx.take(),
         relay_url_for_targets,
     )
@@ -2746,6 +2749,13 @@ pub(crate) type ClientScopes = Arc<Mutex<HashMap<crate::broadcast::ClientId, Sco
 /// 否则每个 ws 连接都会永久留下一个 `ClientId` 键(连接可来去,表只增不减)。
 pub(crate) type ClientInitialized = Arc<Mutex<HashMap<crate::broadcast::ClientId, bool>>>;
 
+/// 每个客户端被告知的「它在替谁干活」。
+///
+/// 只由本地 stdio 的 `initialize` 写入（见 `shell_authorization`）：远端设备
+/// 自报同一个字段一律忽略，否则一台手机可以把身份栽赃给别人。
+pub(crate) type ClientShellAuthorizations =
+    Arc<Mutex<HashMap<crate::broadcast::ClientId, crate::shell_authorization::ShellAuthorization>>>;
+
 /// 主题变化守望者:把 [`crate::theme_tool::ThemeHandle`] 的广播翻译成
 /// `ui/settings/updated`,经 hub 扇出——stdio 的 `local` 与每个 ws 客户端都要收到。
 ///
@@ -2843,6 +2853,9 @@ pub(crate) async fn serve<F>(
     // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
     // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
     client_initialized: ClientInitialized,
+    // 每个客户端被告知的壳授权（见 [`ClientShellAuthorizations`]）。只有本地
+    // stdio 能写入；远端设备的自报在 `initialize` 里被拒。
+    client_shell_authorizations: ClientShellAuthorizations,
     // 合并模式下 stdio 读端关闭的信号(见 `serve_scoped_core` 里 `read_lines` 的
     // oneshot);纯 stdio / 纯 ws 传 `None`,该 `select!` 分支 `pending`。
     mut stdio_eof: Option<std::pin::Pin<Box<tokio::sync::oneshot::Receiver<()>>>>,
@@ -2916,6 +2929,7 @@ where
     // `initialized` 由调用方传入(共享表),理由同 `client_scopes`:断连时传输层
     // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
     let initialized = client_initialized;
+    let shell_authorizations = client_shell_authorizations;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
 
     // 保活。**唯一持有断言的进程**就是这里（spec「为什么是单一持有者」）。
@@ -3448,6 +3462,35 @@ where
                 match method.as_str() {
                     "initialize" => {
                         initialized.lock().await.insert(client.clone(), true);
+                        // The desktop shell stamps the local stdio handshake with
+                        // who this session speaks for. Only stdio may do so: over a
+                        // websocket the same JSON is a claim by a remote device, and
+                        // believing it would let a phone declare itself the App's
+                        // owner. A malformed or absent field is simply "no shell",
+                        // never a failed handshake.
+                        let mut accepted_shell = None;
+                        if let Some(authorization) =
+                            crate::shell_authorization::from_initialize_params(&req.params)
+                        {
+                            let is_local = client == crate::broadcast::ClientId::local();
+                            match authorization.accept(is_local) {
+                                Ok(authorization) => {
+                                    shell_authorizations
+                                        .lock()
+                                        .await
+                                        .insert(client.clone(), authorization.clone());
+                                    accepted_shell = Some(authorization.clone());
+                                }
+                                Err(reason) => {
+                                    // Not fatal: the session just has no shell
+                                    // behind it, which is the CLI's normal state.
+                                    eprintln!(
+                                        "[app-server] ignoring shell authorization from {}: {reason}",
+                                        client.as_str()
+                                    );
+                                }
+                            }
+                        }
                         // 客户端在**第一帧**声明它手上有什么（spec §4.1）：这不需要
                         // 新增往返——initialize 是连上那一刻必发的帧。仅手机端会带
                         // `resumeHints`；桌面/老客户端不带 ⇒ 空 plan，零回归。
@@ -3491,22 +3534,26 @@ where
                                 })
                             })
                             .collect();
-                        write_response(
-                            &hub, &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "serverInfo": {
-                                        "name": "yi-agent-app-server",
-                                        "version": env!("CARGO_PKG_VERSION"),
-                                    },
-                                    "protocolVersion": PROTOCOL_VERSION,
-                                    "capabilities": {},
-                                    "syncPlan": sync_plan,
-                                }),
-                            ),
-                        )
-                        .await?;
+                        // The handshake answers with the identity it accepted, so
+                        // "the shell was recognised" is an observable fact rather
+                        // than an internal write. A rejected or absent field is
+                        // simply omitted -- the CLI's normal shape is unchanged.
+                        let mut response = json!({
+                            "serverInfo": {
+                                "name": "yi-agent-app-server",
+                                "version": env!("CARGO_PKG_VERSION"),
+                            },
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "syncPlan": sync_plan,
+                        });
+                        if let Some(shell) = accepted_shell {
+                            response["shell"] = json!({
+                                "clientRunId": shell.client_run_id,
+                                "scopeKey": shell.scope_key,
+                            });
+                        }
+                        write_response(&hub, &client, ok_response(id, response)).await?;
                     }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))

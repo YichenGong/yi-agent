@@ -99,6 +99,19 @@
   `a_registered_lease_releases_and_reads_its_result`（注册 → 释放 → 读结果；
   并断言 release 之后不再出现 heartbeat）、`a_refused_heartbeat_marks_the_lease_lost_without_retrying`、
   `no_guardian_means_no_lease_rather_than_an_error`）；`cargo test -p yi-agent --test frontend_runtime_lease`（8 passed）
+- [x] canonical scope 解析共享给桌面壳（Task 13） — `scope.rs` 把「一个 runtime 的
+  身份就是它的**规范**目录」这件事从 supervisors 搬到本 crate：两个拼写（软链项目、
+  macOS 的 `/var` 与 `/private/var`）必须解析成同一个 scope，否则它们各拿一把锁、
+  各连一个 socket，却共用一个数据库——正是协调锁要防的损坏。首启时 runtime 目录
+  还不存在，故 `canonicalize_allowing_missing` 规范化**最深的已存在祖先**再补回缺失
+  尾巴，调用方在创建后 `ScopeExt::recheck`（尾巴本身可能是个稍后才出现的软链）。
+  搬过来的理由是可链接性：桌面壳必须算出**同一个**路径才能找到 guardian 的 socket，
+  而它刻意不链 supervisors（那里带 store ⇒ SQLite）。`GUARDIAN_SOCKET_FILE` 也由本
+  crate 定义、supervisors re-export，避免两处各写一个字面量。判据：
+  `cargo test -p yi-agent-lifecycle`（`scope::tests` 覆盖同目录两种拼写、缺失尾巴、
+  `/var`↔`/private/var`、`runtime_directory` 的 `YI_AGENT_RUNTIME_DIR` 覆盖、
+  `control_path` 落在 runtime 目录内）；`cargo tree --manifest-path
+  desktop/src-tauri/Cargo.toml | grep -c rusqlite` 为 0
 - [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
 - [x] 受管进程 spawn 客户端（`managed/{client,fdpass}.rs`） — 工具侧通过 guardian 签发的私有
   owner-bound 连接启动进程：`ManagedSpawnClient::connect(OwnedFd)` 接管一条已有连接（没有可连的路径，
