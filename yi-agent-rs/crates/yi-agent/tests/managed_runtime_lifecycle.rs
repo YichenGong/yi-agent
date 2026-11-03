@@ -45,10 +45,20 @@ const START_BUDGET: Duration = Duration::from_secs(20);
 
 struct RuntimeHarness {
     /// Held for the whole test: dropping it removes the project and the runtime.
+    ///
+    /// Never read, and that is the point: the guard is the value. Naming it `_root`
+    /// instead would be worse -- the field is what keeps the directory alive, so it
+    /// should read as a resource the harness owns, not as an unused variable.
+    #[allow(dead_code)]
     root: tempfile::TempDir,
     workdir: PathBuf,
     runtime_dir: PathBuf,
     instance_home: PathBuf,
+    /// The isolated `$HOME` handed to every real process this harness starts.
+    ///
+    /// Kept as a field rather than recomputed so a test can point the same value at
+    /// a second spawn; the processes read it from their environment, not from here.
+    #[allow(dead_code)]
     home: PathBuf,
     /// The leases this test holds, by client id.
     clients: Vec<(String, ClientKind, FrontendLease)>,

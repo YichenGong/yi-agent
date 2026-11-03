@@ -39,6 +39,15 @@ ci-push:
     - just --version 2>/dev/null || curl -sSf https://just.systems/install.sh | sh -s -- --to "$HOME/.local/bin"
     - just --version
     - just ci
+    # 共享运行时生命周期的真进程验收。放在 `just ci` 之后单独跑，理由同
+    # GitHub 侧：这些目标会真的 fork guardian／daemon／子进程，混进 `just ci`
+    # 的 nextest 批量运行后，失败定位与超时预算都会变得难以解释。
+    #
+    # 只放在 Mac mini 这条 push 路径上，云端 `ci-mr` 不跑：它用的是 Linux
+    # `rust:latest`，而进程组语义（以及 `kill(-pgid, 0)` 对只剩 zombie 的自有组
+    # 返回 EPERM 这类事实）在 Linux 与 macOS 上不等价 —— 在云端跑通不代表 macOS
+    # 上成立，那正是本期要验证的部分。
+    - just runtime-lifecycle-check
 
 # MR(Merge Request)走云端 runner
 ci-mr:

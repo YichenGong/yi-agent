@@ -4,6 +4,14 @@
 # 表示第 3 个 60s 周期结束（累计 180s）才终止；第 1、2 个周期只标 SLOW。
 # 写成 terminate-after = "180s" 是不行的——它只接受整数。
 
+# 固定 `#[ignore]` 的 OS fixture，只能由 harness 用 `--exact --ignored` 拉起。
+#
+# 它依据环境里的 nonce 决定是否动作，所以即使被误跑也只是立刻返回；但这个
+# filter 是**第二道**保险：`--run-ignored all` 会执行所有 ignored 测试，而这条
+# 用例的本意是「永远不作为一个普通用例被调度」。写成 filter 而不是靠约定，是
+# 因为 `--run-ignored all` 恰好是排查「为什么有个测试从没跑过」时最容易输入的。
+default-filter = "not test(runtime_process_helper)"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
 # 显式覆盖内建默认值 true：合并门禁需要知道一次 PR 里到底坏了几个地方，
