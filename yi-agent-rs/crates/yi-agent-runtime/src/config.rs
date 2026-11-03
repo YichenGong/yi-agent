@@ -516,6 +516,16 @@ impl RuntimeConfig {
 ///
 /// 值可以随便填,仅供只关心个别字段的测试使用;它**不等于** [`RuntimeConfig::load`]
 /// 的默认值,不要用它断言加载语义。
+/// A legal [`RuntimeConfig`] with arbitrary values, for tests outside this module.
+///
+/// Same purpose as [`sample_config`] but reachable from other modules' tests (for
+/// example the side-conversation assembly tests), which need a base config without
+/// asserting anything about loading semantics.
+#[cfg(test)]
+pub(crate) fn sample_config_for_side_test() -> RuntimeConfig {
+    sample_config()
+}
+
 #[cfg(test)]
 pub(crate) fn sample_config() -> RuntimeConfig {
     RuntimeConfig {
