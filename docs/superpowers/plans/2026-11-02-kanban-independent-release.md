@@ -283,11 +283,16 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 消费 G1；冻结 `LifecycleRequest`、`Progress`、`RuntimeControl`、事务阶段、锁顺序、崩溃恢复表和 trust store 规则。
 
-- [ ] Step 1：加入失败样本：未备份即迁移、候选服务公共可见、部分项目恢复准入、旧 turn 收尾被拒绝、无新授权扩权、共享配置修订被覆盖。
-- [ ] Step 2：运行 contract tests 证实这些样本红；逐个完成状态表，不通过删样本过关。
-- [ ] Step 3：冻结 Ed25519 签名原始 payload 字节、base64 编码、发布序号/有效期、根轮换/撤销、缓存已接受时间及离线规则；具体库版本经 audit 后锁定。固定锁顺序：插件生命周期锁 → 短期实例 registry 锁；不得持 registry 锁等待进程/网络/项目维护。项目所有权保持在 guardian，跨实例争用非阻塞失败；恢复先于准入。
+- [x] Step 1：加入失败样本：未备份即迁移、候选服务公共可见、部分项目恢复准入、旧 turn 收尾被拒绝、无新授权扩权、共享配置修订被覆盖。
+  > 2026-11-03：`check-contracts.mjs` 负样本 17 → 24；lifecycle 新增 4 条（journal 指向别的插件、回滚缺上一激活、未知 phase、`done` 仍带 error），root 1 条（公钥非 32 字节），release 2 条（签名覆盖的字段被删、信封多出未知字段）。
+- [x] Step 2：运行 contract tests 证实这些样本红；逐个完成状态表，不通过删样本过关。
+  > 2026-11-03：`positive: 9, negative: 24, failures: 0`；`--test` 42/42。正样本新增 lifecycle、root、release 三个 fixture 与两份现算签名信封。
+- [x] Step 3：冻结 Ed25519 签名原始 payload 字节、base64 编码、发布序号/有效期、根轮换/撤销、缓存已接受时间及离线规则；具体库版本经 audit 后锁定。固定锁顺序：插件生命周期锁 → 短期实例 registry 锁；不得持 registry 锁等待进程/网络/项目维护。项目所有权保持在 guardian，跨实例争用非阻塞失败；恢复先于准入。
+  > 2026-11-03：payload 编码冻结在 `scripts/plugins/sign-contracts.mjs`（`domain || 0x00 || field*`，字段序见 G2 §2.2），root/release fixture 带真实 Ed25519 签名（公开测试种子，非生产密钥）。`ed25519-dalek` 约束 `>= 2.0.0`（`RUSTSEC-2022-0093` 只影响 `< 2`），精确版本由 T07 在 `cargo audit` 后锁定。锁顺序、guardian 所有权、恢复先于准入见 G2 §5、§6。
 - [ ] Step 4：列出每一持久化阶段的“崩溃后下一动作、可否回滚、何时恢复准入”；固定后端失败窗口、重启次数/退避上限和熔断恢复条件，审阅 cross-instance 配额兼容和原生签名发布策略，获得 G2。
-- [ ] Step 5：按 C 提交 `docs: define plugin trust and lifecycle transactions`。
+  > 2026-11-03：材料已交付（G2 §6 八阶段表、§7 熔断默认值、§8 配额边界、§9 四项待决）。**等待人工批准，本条勾选只能由用户给出。**
+- [x] Step 5：按 C 提交 `docs: define plugin trust and lifecycle transactions`。
+  > 2026-11-03：commit `48e72e9f`。门禁 C：`just ci` 除 `audit` 外 14 项全绿；`audit` 因联网取 advisory-db 失败（`failed to fetch`），改用 `cargo audit --no-fetch --db ~/.cargo/advisory-db` 离线通过（1402 条公告，仅 1 条已在豁免清单的 yanked 告警）。
 
 ### Task T05：完成看板迁移子 spec，解除 G3
 
