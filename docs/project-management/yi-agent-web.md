@@ -39,6 +39,11 @@ yi-agent 的 Web 配置管理界面。通过 axum Web 服务器提供内嵌 HTML
 - [x] 垂直标签页 + 可折叠分区 UI — `assets/` 内嵌 HTML 实现 — [设计](../plans/2026-07-25-web-config-ui-restructure-design.md)
 - [x] 字段带 `label`（中文显示名）— `api.rs::get_config` 输出 `spec.label`，与桌面端 `settings_rpc.rs` 同源
   - 判据：`cargo test -p yi-agent-web --test api_test get_config_reports_a_label_for_every_field`
+- [x] `FIELDS` 里每个键都能读回非 null 值 — `api.rs::field_value` 的 match 覆盖全部 16 个键，漏一个键会红
+  - 判据：`cargo test -p yi-agent-web --test api_test get_config_reports_a_value_for_every_field`
+  - 这条守卫是为 `tui.terminal_title` 漏分支（`value` 恒为 null、页面永远显示「未设置」）而补的。原
+    `get_config_reports_a_label_for_every_field` 虽遍历 `FIELDS`，但只断言 `label`，而 `label` 直接来自
+    `spec.label`、与 `field_value` 无关，所以漏分支不会红。桌面端 `settings_rpc` 早有同构守卫，web 侧此前缺失。
 - [x] `value: null` 表示删键，支持前端「恢复默认」— `api.rs::UpdateItem::value` 为 `Option<String>`，`None` 转 `Value::Null`
   - 判据：`cargo test -p yi-agent-web --test api_test put_config_with_null_value_deletes_the_key`
   - 判据：`cargo test -p yi-agent-web --test api_test put_config_treats_a_missing_value_as_null`
@@ -48,4 +53,4 @@ yi-agent 的 Web 配置管理界面。通过 axum Web 服务器提供内嵌 HTML
 - [x] 页面显示中文标签、数字 `min`/`max`、select 空选项与「恢复默认」按钮 — `assets/index.html::renderField`
   - 判据：`cargo test -p yi-agent-web --test api_test index_html_derives_groups_instead_of_hardcoding_them`（弱契约，真正渲染靠人工验收）
 
-**验证命令：** `cargo test -p yi-agent-web`（10 个测试，全部在 `tests/api_test.rs`）
+**验证命令：** `cargo test -p yi-agent-web`（11 个测试，全部在 `tests/api_test.rs`）

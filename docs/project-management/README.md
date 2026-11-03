@@ -16,7 +16,7 @@
 | yi-agent-tui | 44 / 46 | [详情](./yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](./yi-agent-run.md) |
 | yi-agent-cli | 7 / 7 | [详情](./yi-agent-cli.md) |
-| yi-agent-web | 11 / 11 | [详情](./yi-agent-web.md) |
+| yi-agent-web | 12 / 12 | [详情](./yi-agent-web.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
 | ci-cd | 36 / 36 | [详情](./ci-cd.md) |
 | tooling | 11 / 11 | [详情](./tooling.md) |
