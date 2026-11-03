@@ -131,6 +131,18 @@ journalctl -u caddy -n 50 --no-pager
 3. 有无 `app connected`（手机侧是否连上）；无则查手机地址/网络；
 4. 两端 session 是否**完全一致**（大小写/空格）。
 
+## 长历史加载超时修复的升级方式
+
+2026-11-03 的修复同时涉及三层：中继手机出口与 app-server WebSocket 历史出口对短时满队列采用有界背压；手机前端在 resume 回包后立即结束同步看门狗，附属列表刷新不阻塞加载完成。
+
+- 重新构建并替换 VPS 上的 `yi-agent-relay`，随后在合适窗口重启 `yi-agent-relay` 服务。
+- 更新电脑端 sidecar 和手机前端包；只更新其中一端不能覆盖全部超时路径。
+- 保留现有域名、session 和设备 token，不需要重新配对。
+- 重启中继会短暂断开当前连接，手机应自动重连。不要在重要会话传输期间无提示重启。
+- 验收：弱网打开长历史，检查正文完整与连接状态；若中继记录 `app delivery stalled or closed; disconnecting for resync`，手机必须明确断线并自动重连，不能一直显示已连接。
+
+代码与自动化判据见 [yi-agent-relay 进度](../../docs/project-management/yi-agent-relay.md)。本说明不表示 VPS 或 iPhone 已经升级。
+
 ## 7. 多对多的扩展点（当前架构已预留）
 
 中继现在的模型是 `session → { 唯一电脑, 多台手机 }`（见 `yi-agent-relay/src/lib.rs`）：

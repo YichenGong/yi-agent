@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub mod backoff;
 pub mod client;
@@ -25,8 +26,11 @@ pub mod server;
 
 pub use client::run_client;
 
-/// 一个中继端点(电脑或手机)的出站队列容量。写满即视为慢消费者。
+/// 一个中继端点(电脑或手机)的出站队列容量。短时写满施加背压，不丢帧。
 pub const ENDPOINT_QUEUE: usize = 256;
+
+/// 单次投递等待队列排空的上限。持续阻塞时明确断开手机，让它重连对账。
+const APP_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 一端送帧**入**中继的入站队列容量。
 pub const INBOUND_QUEUE: usize = 256;
@@ -46,6 +50,8 @@ const NO_AGENT_ERROR_CODE: i64 = -32000;
 struct Slot {
     sink: mpsc::Sender<Message>,
     token: u64,
+    /// 手机被剔除时结束 attach_app，即便它的入站 socket 仍然活着。
+    disconnect: Option<oneshot::Sender<()>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -94,7 +100,14 @@ impl Relay {
         // 只换路由条目**不够**:被顶替的旧 socket 既收不到帧也收不到关闭,在它
         // 自己看来连接完全健康,于是永不重连;新连接一旦离开,该 session 就此
         // 再无电脑可用(实测一条误连的探针即可造成,见下方回归测试)。
-        let displaced = lock(&self.agents).insert(session.clone(), Slot { sink, token });
+        let displaced = lock(&self.agents).insert(
+            session.clone(),
+            Slot {
+                sink,
+                token,
+                disconnect: None,
+            },
+        );
         if let Some(prev) = displaced {
             // 在旧连接的**出站口**排一个 Close 帧:`split_bridge` 的写循环会把它
             // 发给旧 socket,旧客户端据此结束本次连接并退避重连。队列满则丢弃——
@@ -104,7 +117,7 @@ impl Relay {
 
         // 电脑 → 手机:扇出到该 session 的全部 App。
         while let Some(frame) = from_agent.recv().await {
-            self.fan_out_to_apps(&session, frame);
+            self.fan_out_to_apps(&session, frame).await;
         }
 
         // 断连:只摘除「仍是我」的登记,不误删可能已顶替我的新连接。
@@ -129,20 +142,39 @@ impl Relay {
         mut from_app: mpsc::Receiver<Message>,
     ) {
         let token = self.take_token();
+        let app_sink = sink.clone();
+        let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
         lock(&self.apps)
             .entry(session.clone())
             .or_default()
-            .push(Slot { sink, token });
+            .push(Slot {
+                sink,
+                token,
+                disconnect: Some(disconnect_tx),
+            });
 
-        // 手机 → 电脑:送给该 session 唯一的电脑连接;不存在则回一个错误帧。
-        while let Some(frame) = from_app.recv().await {
+        // 投递失败也必须结束连接，不能只从路由表摘掉、留下仍在读的僵尸 socket。
+        loop {
+            let frame = tokio::select! {
+                _ = &mut disconnect_rx => break,
+                _ = app_sink.closed() => break,
+                frame = from_app.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
             let agent = lock(&self.agents).get(&session).map(|s| s.sink.clone());
-            match agent {
-                Some(tx) => {
-                    // 电脑连接若恰在此刻消失,本帧丢弃;下一帧会走 no-agent 错误分支。
-                    let _ = tx.send(frame).await;
-                }
-                None => self.reply_no_agent(&session, frame),
+            tokio::select! {
+                _ = &mut disconnect_rx => break,
+                _ = app_sink.closed() => break,
+                _ = async {
+                    match agent {
+                        Some(tx) => {
+                            let _ = tx.send(frame).await;
+                        }
+                        None => self.reply_no_agent(&session, frame).await,
+                    }
+                } => {},
             }
         }
 
@@ -156,15 +188,36 @@ impl Relay {
         }
     }
 
-    /// 把一帧扇出给该 session 的全部 App;已关闭或**写满(慢消费者)**的连接就地剔除。
-    ///
-    /// 队列写满即摘除该连接,与 app-server 的 `Broadcaster::broadcast` 同源:对一条
-    /// 已经跟不上的连接,重连 + `thread/resume` 增量回放(spec §5.2/§11.4)是设计好
-    /// 的恢复路径,好过在 JSON-RPC 流中间静默丢一帧(那会让对端永远等一个响应)。
-    fn fan_out_to_apps(&self, session: &str, frame: Message) {
+    /// 扇出时对短时满队列施加有界背压。每台手机并发投递，不持注册表锁等待。
+    /// 一帧全部投递落定后再取下一帧，保证历史与最终 RPC 响应的顺序和有界内存。
+    async fn fan_out_to_apps(&self, session: &str, frame: Message) {
+        let targets: Vec<_> = lock(&self.apps)
+            .get(session)
+            .map(|list| list.iter().map(|s| (s.token, s.sink.clone())).collect())
+            .unwrap_or_default();
+        let results = futures::future::join_all(targets.into_iter().map(|(token, sink)| {
+            let frame = frame.clone();
+            async move {
+                let delivered = matches!(
+                    tokio::time::timeout(APP_SEND_TIMEOUT, sink.send(frame)).await,
+                    Ok(Ok(()))
+                );
+                (token, delivered)
+            }
+        }))
+        .await;
         let mut apps = lock(&self.apps);
         if let Some(list) = apps.get_mut(session) {
-            list.retain(|s| s.sink.try_send(frame.clone()).is_ok());
+            list.retain_mut(|slot| {
+                let failed = results.iter().any(|(token, delivered)| *token == slot.token && !delivered);
+                if failed {
+                    tracing::warn!(%session, token = slot.token, "app delivery stalled or closed; disconnecting for resync");
+                    if let Some(disconnect) = slot.disconnect.take() {
+                        let _ = disconnect.send(());
+                    }
+                }
+                !failed
+            });
             if list.is_empty() {
                 apps.remove(session);
             }
@@ -172,7 +225,7 @@ impl Relay {
     }
 
     /// 没有电脑可用时,回一个最小错误帧给发起 App(不解析其 JSON-RPC 语义)。
-    fn reply_no_agent(&self, session: &str, _frame: Message) {
+    async fn reply_no_agent(&self, session: &str, _frame: Message) {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "error": {
@@ -181,10 +234,7 @@ impl Relay {
             },
         });
         let frame = Message::Text(payload.to_string().into());
-        let mut apps = lock(&self.apps);
-        if let Some(list) = apps.get_mut(session) {
-            list.retain(|s| s.sink.try_send(frame.clone()).is_ok());
-        }
+        self.fan_out_to_apps(session, frame).await;
     }
 
     /// 观测:某 session 当前是否有电脑连接。
@@ -450,16 +500,98 @@ mod tests {
         );
     }
 
-    /// 慢消费者(出站队列写满)的连接在扇出时被摘除,与会阻塞的同伴互不影响。
-    ///
-    /// 与 app-server `Broadcaster` 的背压语义一致:跟不上的连接被摘除,重连 +
-    /// `thread/resume` 是恢复路径。
     #[tokio::test]
-    async fn a_slow_app_is_dropped_from_the_fan_out() {
+    async fn a_replay_burst_survives_a_temporarily_full_app_queue() {
+        let relay = Arc::new(Relay::new());
+        let (_agent_out, agent_in, _agent_task) = attach_agent(&relay, "s1");
+        let (mut app_out, _app_in, _app_task) = attach_app(&relay, "s1");
+        settle().await;
+        let producer = tokio::spawn(async move {
+            for i in 0..600 {
+                agent_in
+                    .send(Message::Text(format!("history-{i}").into()))
+                    .await
+                    .unwrap();
+            }
+            agent_in
+                .send(Message::Text("resume-response".into()))
+                .await
+                .unwrap();
+        });
+        // Let the relay fill the phone queue before it starts consuming.
+        settle().await;
+        assert_eq!(
+            relay.app_count("s1"),
+            1,
+            "a replay burst must not evict a connected phone"
+        );
+        for i in 0..600 {
+            assert_eq!(text(&recv(&mut app_out).await), format!("history-{i}"));
+        }
+        assert_eq!(text(&recv(&mut app_out).await), "resume-response");
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_phone_queue_does_not_block_fast_delivery_or_other_sessions() {
+        let relay = Arc::new(Relay::new());
+        let (_agent_out, agent_in, _agent_task) = attach_agent(&relay, "s1");
+        let (slow_out, _slow_in, slow_task) = attach_app(&relay, "s1");
+        let (mut fast_out, _fast_in, _fast_task) = attach_app(&relay, "s1");
+        let (_other_agent_out, other_in, _other_agent_task) = attach_agent(&relay, "s2");
+        let (mut other_out, _other_app_in, _other_app_task) = attach_app(&relay, "s2");
+        settle().await;
+        for i in 0..=ENDPOINT_QUEUE {
+            agent_in
+                .send(Message::Text(format!("f{i}").into()))
+                .await
+                .unwrap();
+            assert_eq!(text(&recv(&mut fast_out).await), format!("f{i}"));
+        }
+        // Fast delivery of the overflowing frame happens before the slow peer's deadline.
+        assert_eq!(relay.app_count("s1"), 2);
+        other_in
+            .send(Message::Text("independent-session".into()))
+            .await
+            .unwrap();
+        assert_eq!(text(&recv(&mut other_out).await), "independent-session");
+        drop(slow_out);
+        tokio::time::timeout(Duration::from_millis(500), slow_task)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_in
+            .send(Message::Text("after-slow-disconnect".into()))
+            .await
+            .unwrap();
+        assert_eq!(text(&recv(&mut fast_out).await), "after-slow-disconnect");
+    }
+
+    #[tokio::test]
+    async fn a_closed_phone_exits_even_while_its_request_waits_for_the_agent() {
+        let relay = Arc::new(Relay::new());
+        let (_agent_out, _agent_in, _agent_task) = attach_agent(&relay, "s1");
+        let (app_out, app_in, app_task) = attach_app(&relay, "s1");
+        settle().await;
+        for _ in 0..=ENDPOINT_QUEUE {
+            app_in.send(Message::Text("request".into())).await.unwrap();
+        }
+        settle().await;
+        drop(app_out);
+        tokio::time::timeout(Duration::from_millis(500), app_task)
+            .await
+            .expect("a closed phone must not wait on a full agent queue")
+            .unwrap();
+        assert_eq!(relay.app_count("s1"), 0);
+    }
+
+    /// 持续不读的手机在有界等待后断开，不留下仍可发送的僵尸连接。
+    #[tokio::test]
+    async fn a_slow_app_is_disconnected_after_the_delivery_deadline() {
         let relay = Arc::new(Relay::new());
         let (_agent_out, agent_in, _agent_task) = attach_agent(&relay, "s1");
         // 慢 App:注册后从不 recv,队列很快写满。
-        let (_slow_out, _slow_in, _slow_task) = attach_app(&relay, "s1");
+        let (_slow_out, slow_in, slow_task) = attach_app(&relay, "s1");
         // 快 App:持续排空。
         let (mut fast_out, _fast_in, _fast_task) = attach_app(&relay, "s1");
         settle().await;
@@ -475,11 +607,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
             let _ = fast_out.try_recv();
         }
-        // 慢消费者被摘除,只剩快消费者。
-        assert_eq!(
-            relay.app_count("s1"),
-            1,
-            "a slow app must be dropped from the session"
+        // 一时满队列还保持注册；永久停滞必须让 attach_app 退出，桥接据此关 socket。
+        assert_eq!(relay.app_count("s1"), 2);
+        tokio::time::timeout(APP_SEND_TIMEOUT + Duration::from_secs(1), slow_task)
+            .await
+            .expect("a stalled phone must terminate within the delivery deadline")
+            .unwrap();
+        assert!(
+            slow_in.is_closed(),
+            "eviction must close the inbound route too"
         );
+        assert_eq!(relay.app_count("s1"), 1);
     }
 }

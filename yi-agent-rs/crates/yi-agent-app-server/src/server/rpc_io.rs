@@ -135,8 +135,9 @@ pub(crate) async fn write_notification(
     Ok(())
 }
 /// 与 [`write_notification`] 同款序列化与投递键，但走**带背压**的
-/// [`crate::broadcast::Broadcaster::broadcast_await`]：本地 reliable 客户端队列
-/// 满时等待而非丢帧。用于历史回放这类「必须完整送达」的批量下发。
+/// [`crate::broadcast::Broadcaster::broadcast_await`]：本地 reliable 客户端等待
+/// 入队，WebSocket 对短时满队列有界等待，持续停滞则断开重同步。
+/// 用于历史回放这类「必须完整送达」的批量下发。
 pub(crate) async fn write_notification_await(
     hub: &crate::broadcast::Broadcaster,
     n: &Notification,

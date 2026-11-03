@@ -35,6 +35,8 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 
 ## Features
 
+- [x] **长历史 WebSocket 出口有界背压** — `broadcast.rs::Broadcaster::broadcast_await` 对历史与关键通知并发等待客户端入队：本地出口保持可靠等待，WebSocket 最多等待 10 秒，持续停滞才摘除，并由 `ws.rs` 的连接检测关闭；实时逐字流策略不变。判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib a_critical_notification_survives_a_full_outbound_queue`（本地/WS 满队列后关键帧完整送达）、`cargo test -p yi-agent-app-server --lib a_stalled_ws_is_removed_after_fast_clients_receive_the_critical_frame`（快端先收到当前帧、慢端有界剔除）。长历史完整生效还需更新中继和手机前端，见 [升级说明](../../deploy/relay/README.md)。真机弱网验收尚未执行。
+
 - [x] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`
 （69 passed / 4 ignored）、`--lib resume_append_`（21 passed）、
 `--lib kanban_original_session_`（4 passed）。代码位置：`session_driver.rs`
