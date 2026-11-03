@@ -4,6 +4,7 @@ pub mod client;
 pub mod inbox;
 pub mod lease;
 pub mod merge;
+pub mod merge_attempt;
 pub mod merge_lock;
 pub mod observation;
 pub mod tick;

@@ -31,6 +31,14 @@ pub(crate) const TAG_NAME_MAX_LEN: usize = 24;
 pub(crate) struct Activation {
     pub(crate) built: BuiltAgent,
     pub(crate) runtime: Option<Arc<ThreadRoot>>,
+    /// 降级装配的**真实原因**(`runtime: None` 时才有值;成功为 `None`)。
+    ///
+    /// 为什么需要它:降级会保留原 agent,而原 agent 的工具集里**没有**调用方要求
+    /// 注入的那些环境变量。对 RPC 起的会话这无所谓(它从不要 env);对驱动侧的冷
+    /// 装配则不行——插件注入的卡片句柄若是假的,合并 objective 里的状态命令会
+    /// 打到错误的地方。所以冷装配必须能看见「我确实降级了、原因是这个」,再由它
+    /// 决定是报 `RestoreFailed` 还是接受无委派(见 `server/driver_resume.rs`)。
+    pub(crate) tooling_error: Option<String>,
 }
 /// 为该 cwd 的 agent 接上委派能力。失败即降级:保留原 agent,只记 trace。
 ///
@@ -89,6 +97,7 @@ pub(crate) fn attach_delegation(
             return Activation {
                 built,
                 runtime: None,
+                tooling_error: Some(format!("subagent runtime unavailable: {cause}")),
             };
         }
     };
@@ -115,6 +124,7 @@ pub(crate) fn attach_delegation(
         return Activation {
             built,
             runtime: None,
+            tooling_error: Some(format!("subagent root could not attach: {cause}")),
         };
     }
     thread_roots
@@ -143,6 +153,7 @@ pub(crate) fn attach_delegation(
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
             runtime: Some(root),
+            tooling_error: None,
         },
         Err(cause) => {
             tracing::warn!(
@@ -154,6 +165,7 @@ pub(crate) fn attach_delegation(
             Activation {
                 built,
                 runtime: None,
+                tooling_error: Some(format!("runtime tooling could not be built: {cause}")),
             }
         }
     }

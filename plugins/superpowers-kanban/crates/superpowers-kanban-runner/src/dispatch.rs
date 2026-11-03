@@ -83,6 +83,28 @@ pub fn dispatch_with_home(
     dispatch_in(&service, state_dir, home, global, method, params)
 }
 
+/// 解析 `driver/next` 参数里的 `capabilities.actions`。
+///
+/// 缺这块（旧宿主）或任何形状不对的地方一律得到**空集**：能力是「宿主保证能执行
+/// 的动作」，猜错方向很贵——多认一个，插件会派一个宿主执行不了的动作；少认一个，
+/// 只是保守排队（并如实展示原因）。非字符串项直接忽略，不让一条脏数据整拍失败。
+pub(crate) fn parse_capabilities(params: &Value) -> crate::service::DriverCapabilities {
+    crate::service::DriverCapabilities {
+        actions: params
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("actions"))
+            .and_then(Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 /// 分派入口本体。`service` 必须是推进循环持有的那个实例——`list` 与 `board.*`
 /// 都从它读写看板与槽位租约，换成别的实例会让内存里的 lease 对不上账。
 pub fn dispatch_with_service(
@@ -274,7 +296,9 @@ fn dispatch_in(
                 .and_then(Value::as_u64)
                 .map(|running| running as u32);
 
-            match service.driver_step(&snapshot, &results, sessions_running)? {
+            let capabilities = parse_capabilities(params);
+
+            match service.driver_step(&snapshot, &results, sessions_running, &capabilities)? {
                 Some(action) => Ok(action.to_json()),
                 // 一拍无事可做：契约形状是 `{"action": null}`。
                 None => Ok(json!({ "action": null })),
@@ -358,6 +382,8 @@ fn dispatch_in(
             let status = match service.merge_finish(card_id)? {
                 crate::service::MergeFinish::Released => "released",
                 crate::service::MergeFinish::Cleared => "cleared",
+                // 有安全记录:名额由 daemon 按 journal + 观测放,这里只报告。
+                crate::service::MergeFinish::Waiting => "waiting",
             };
             Ok(json!({ "status": status }))
         }

@@ -1,7 +1,8 @@
 //! 通用会话驱动：把「该起/该继续哪个会话」交给插件决定。
 //!
 //! 本模块不认识看板、卡片、合并。它只认识两件事：宿主能提供的通用事实
-//! （某个会话闲不闲），与宿主能执行的两个通用动作（新建会话 / 追加一轮）。
+//! （某个会话闲不闲），与宿主能执行的通用动作（新建会话 / 追加一轮 / 恢复原会话
+//! 后追加）。
 //!
 //! 主循环里的 `driver_tick` 是消费方：它按通用常驻登记表遍历项目、用插件清单
 //! 发现「谁要驱动会话」（`driver_plugins`），再对每个 (项目, 插件) 组合拉一拍
@@ -13,6 +14,12 @@ use std::path::Path;
 
 use crate::protocol::ThreadStatus;
 use crate::session::ThreadSession;
+
+/// 本宿主能执行的通用动作（`driver/next` 请求的 `capabilities.actions`）。
+///
+/// 这是跨进程契约的一半：插件只在调度阶段读它，协议层不猜卡片语义。新增动作时
+/// 只在这里登记一次，两端的契约测试会把名字钉住。
+pub(crate) const SUPPORTED_ACTIONS: &[&str] = &["launch", "append", "resume_append"];
 
 /// 宿主能执行的通用动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +53,77 @@ pub(crate) enum DriverActionKind {
         thread_id: String,
         objective: String,
     },
+    /// 恢复一个**本进程看不见**的原会话，然后向它追加一轮。
+    ///
+    /// 与 `Append` 的区别是「先恢复、后投递」：宿主必须按 `workdir` 精确找到该
+    /// 会话的持久化历史，用**同一个** thread id 重新装配并登记，再走同一条投递
+    /// 内核。它不允许降级成 `Launch`（那样会切断上下文，而上下文正是这条动作
+    /// 存在的理由），也不允许落到 `cfg.cwd` 或别的目录里去找。
+    ///
+    /// 恢复失败时必须明确回报 `restore_failed`——调用方据此阻塞，而不是当作
+    /// 「这一拍没事可做」继续往后推。
+    ResumeAppend {
+        thread_id: String,
+        /// 原会话的精确定位目录（**不是**这次动作的目标目录）。
+        workdir: String,
+        objective: String,
+        /// 冷装配时要注入工具进程的环境变量；热会话不重建工具，故不生效。
+        env: Vec<(String, String)>,
+    },
 }
+
+/// 动作失败时被宿主**分类**过的错误码。
+///
+/// 它存在的唯一理由：插件要分清「这次 objective 确定没进 prompt 通道」与
+/// 「不知道有没有送到」。前者可以安全地退队/转 NeedsYou，后者必须保守阻塞。
+/// 因此宿主不能靠错误文本猜——分类必须由抛出方显式给出，文本只给人看。
+///
+/// 拼写与 spec §5.2 及两端契约逐字对齐（`driver-protocol.json`）。
+///
+/// 契约本身（错误码拼写）在 Task 1 就钉住；驱动侧的内核
+/// (`server/driver_resume.rs`) 现在按这些分类构造失败，插件据此分流。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverErrorCode {
+    /// 会话正忙（有 turn 在跑）。零副作用：没有取消、没有抢占、没有投递。
+    Busy,
+    /// 要续跑的会话不在本进程、也无法按要求恢复。
+    ThreadNotFound,
+    /// 动作给的 workdir 不存在或不可用。
+    WorkdirMissing,
+    /// 会话恢复/装配失败（历史损坏、partial 升格失败、锁拿不到……）。
+    RestoreFailed,
+    /// 投递（prepare/send）阶段失败，或准备阶段出现其他错误。
+    DeliveryFailed,
+}
+
+impl DriverErrorCode {
+    /// 线上的字符串拼写（spec §5.2 / 契约 `results[].error_code`）。
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::ThreadNotFound => "thread_not_found",
+            Self::WorkdirMissing => "workdir_missing",
+            Self::RestoreFailed => "restore_failed",
+            Self::DeliveryFailed => "delivery_failed",
+        }
+    }
+}
+
+/// 带分类的失败。用 `anyhow` 承载、由调用方 `downcast_ref` 取回分类，
+/// 而不是把错误塞成字符串再匹配前缀——字符串是给人看的，随时会改。
+#[derive(Debug, Clone)]
+pub(crate) struct DriverActionFailure {
+    pub code: DriverErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for DriverActionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DriverActionFailure {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DriverAction {
@@ -79,25 +156,39 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
                 .get("driver_ref")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            env: action
-                .get("env")
-                .and_then(Value::as_object)
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(key, value)| {
-                            value.as_str().map(|value| (key.clone(), value.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            env: parse_env(action),
         },
         "append" => DriverActionKind::Append {
             thread_id: action.get("thread_id")?.as_str()?.to_string(),
             objective: action.get("objective")?.as_str()?.to_string(),
         },
+        "resume_append" => DriverActionKind::ResumeAppend {
+            thread_id: action.get("thread_id")?.as_str()?.to_string(),
+            workdir: action.get("workdir")?.as_str()?.to_string(),
+            objective: action.get("objective")?.as_str()?.to_string(),
+            env: parse_env(action),
+        },
         _ => return None,
     };
     Some(DriverAction { action_id, kind })
+}
+
+/// `env` 的透传解析：插件给的键值对原样交给宿主，宿主不认识任何键。
+///
+/// 缺字段 / 非对象 / 非字符串值一律忽略（旧插件不发 `env`，此时为空集；
+/// 宁可少注入一个变量，也不要因为一个值类型不对而把整条动作判废）。
+fn parse_env(action: &Value) -> Vec<(String, String)> {
+    action
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 插件有没有**明确**答「这一拍无事可做」（契约形状 `{"action": null}`）。
@@ -132,6 +223,11 @@ pub(crate) struct ActionResult {
     pub ok: bool,
     pub thread_id: Option<String>,
     pub error: Option<String>,
+    /// 失败时宿主给出的**分类**（见 `DriverErrorCode`）。
+    ///
+    /// `None` 表示「宿主自己也没归类」——插件必须按不确定处理，不能拿错误文本
+    /// 猜「大概是 busy 吧」然后安全重试。成功的动作不带这个字段。
+    pub error_code: Option<String>,
 }
 
 /// 一个 (项目, 插件) 组合的驱动记账，随主循环存活、跨 tick 累积。
@@ -230,6 +326,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
                     "ok": result.ok,
                     "thread_id": result.thread_id,
                     "error": result.error,
+                    "error_code": result.error_code,
                 })
             })
             .collect(),
@@ -240,6 +337,10 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
         // 本进程此刻有几个会话在跑（口径见 `is_a_running_session`）。插件拿它
         // 算「全机余量」：限的是总流量，看板外的会话与看板会话吃同一份额度。
         "sessions": { "running": sessions_running },
+        // 本宿主能执行哪些通用动作。插件据此决定「这张卡该不该现在派」：
+        // 缺这一块（旧宿主）按**一个都不会**处理，插件保留排队并说明原因，
+        // 绝不猜「大概支持吧」然后交出一个自己执行不了的动作。
+        "capabilities": { "actions": SUPPORTED_ACTIONS },
     });
     let answer = match query(&params) {
         Ok(answer) => answer,
@@ -255,26 +356,51 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
 
     match launcher.launch(&action).await {
         Ok(thread_id) => {
-            if let DriverActionKind::Launch { .. } = &action.kind {
-                threads.push(DriverThread {
-                    thread_id: thread_id.clone(),
-                    // 刚起的会话当然活着；此后每拍由主循环按 `threads` 表刷新。
-                    alive: true,
-                });
+            // `Launch` 与 `ResumeAppend` 都产生/确认一个本进程看得见的会话：
+            // 前者是新起的，后者是刚被恢复的。两者都要登记进 `threads`，
+            // 否则插件永远收不到「这个会话还活着」的观测，也拿不到 idle 信号。
+            // `Append` 不登记：它只续跑**已经登记过**的会话，多推一次纯属噪声。
+            if matches!(
+                action.kind,
+                DriverActionKind::Launch { .. } | DriverActionKind::ResumeAppend { .. }
+            ) {
+                // 去重：同一 thread 反复出现时只刷新 `alive`，不能让插件看到
+                // 两条同 id 的观测（那会让它以为有两个会话，算错名额）。
+                if let Some(existing) = threads
+                    .iter_mut()
+                    .find(|thread| thread.thread_id == thread_id)
+                {
+                    existing.alive = true;
+                } else {
+                    threads.push(DriverThread {
+                        thread_id: thread_id.clone(),
+                        // 刚起的/刚恢复的会话当然活着；此后每拍由主循环按
+                        // `threads` 表刷新。
+                        alive: true,
+                    });
+                }
             }
             Some(ActionResult {
                 action_id: action.action_id,
                 ok: true,
                 thread_id: Some(thread_id),
                 error: None,
+                error_code: None,
             })
         }
-        Err(error) => Some(ActionResult {
-            action_id: action.action_id,
-            ok: false,
-            thread_id: None,
-            error: Some(error.to_string()),
-        }),
+        // 只有宿主**显式分类**过的失败才带 `error_code`；其他 anyhow 错误一律
+        // `None`（插件按不确定处理）。不要在这里按错误文本补分类——那会把
+        // 「不知道送没送到」伪装成「确定没送到」，正是这次要防的误重试。
+        Err(error) => {
+            let failure = error.downcast_ref::<DriverActionFailure>();
+            Some(ActionResult {
+                action_id: action.action_id,
+                ok: false,
+                thread_id: None,
+                error: Some(error.to_string()),
+                error_code: failure.map(|failure| failure.code.as_str().to_string()),
+            })
+        }
     }
 }
 
@@ -401,6 +527,25 @@ mod tests {
         }
     }
 
+    /// `resume_append` 是与 `append` 不同的动作：`append` 只续跑本进程**看得见**
+    /// 的会话，`resume_append` 要求宿主先按精确 workdir 恢复原会话（同 ID）再投递。
+    /// 两者若被解析成同一个 variant，插件就无法表达「冷会话也必须回到原 thread」，
+    /// 调度会悄悄退化成起一个新会话。
+    #[test]
+    fn resume_append_is_a_distinct_action() {
+        let value = serde_json::json!({
+            "action_id": "act-resume", "kind": "resume_append",
+            "thread_id": "thread-original", "workdir": "/w/card",
+            "objective": "merge authorized", "env": {"CARD": "card-1"}
+        });
+        let action = parse_action(&value).expect("new action must parse");
+        assert!(matches!(action.kind, DriverActionKind::ResumeAppend {
+            thread_id, workdir, objective, env
+        } if thread_id == "thread-original" && workdir == "/w/card"
+            && objective == "merge authorized"
+            && env == vec![("CARD".into(), "card-1".into())]));
+    }
+
     #[test]
     fn an_unknown_kind_is_ignored_rather_than_panicking() {
         assert!(parse_action(&json!({ "action_id": "a3", "kind": "reboot" })).is_none());
@@ -435,11 +580,28 @@ mod tests {
         seen: Vec<DriverAction>,
         thread_id: String,
         fail: Option<String>,
+        /// 分类失败：用 `DriverActionFailure` 承载，模拟真实 launcher 的用法。
+        fail_with: Option<DriverActionFailure>,
+    }
+
+    impl FakeLauncher {
+        fn failing_with(code: DriverErrorCode, message: &str) -> Self {
+            Self {
+                fail_with: Some(DriverActionFailure {
+                    code,
+                    message: message.to_string(),
+                }),
+                ..Default::default()
+            }
+        }
     }
 
     impl SessionLauncher for FakeLauncher {
         async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
             self.seen.push(action.clone());
+            if let Some(failure) = &self.fail_with {
+                return Err(anyhow::Error::new(failure.clone()));
+            }
             match &self.fail {
                 Some(detail) => Err(anyhow::anyhow!(detail.clone())),
                 None => Ok(self.thread_id.clone()),
@@ -546,6 +708,7 @@ mod tests {
             ok: false,
             thread_id: None,
             error: Some("boom".into()),
+            error_code: Some("delivery_failed".into()),
         }];
         let seen = std::sync::Mutex::new(Vec::new());
         let query = |params: &Value| {
@@ -578,6 +741,7 @@ mod tests {
             ok: true,
             thread_id: Some("thread-1".into()),
             error: None,
+            error_code: None,
         }];
         let query = |_params: &Value| Err("daemon down".to_string());
         let mut launcher = FakeLauncher::default();
@@ -610,6 +774,7 @@ mod tests {
             ok: false,
             thread_id: None,
             error: Some("boom".into()),
+            error_code: Some("delivery_failed".into()),
         }];
         let mut launcher = FakeLauncher::default();
 
@@ -746,10 +911,76 @@ mod tests {
             "append 已从契约里退役：合并由用户在会话里发话触发，插件不再追加一轮"
         );
 
+        // 新动作：恢复原会话后追加。宿主必须解析出全部四个字段——尤其 `workdir`
+        // 是**原会话的定位目录**，漏解析会让宿主去目标树里找一个不存在的会话。
+        let resume = parse_action(&answers["resume_append"]).expect("resume_append 必须解析得出");
+        assert_eq!(resume.action_id, "act-resume");
+        match resume.kind {
+            DriverActionKind::ResumeAppend {
+                thread_id,
+                workdir,
+                objective,
+                env,
+            } => {
+                assert_eq!(thread_id, "thread-1");
+                assert_eq!(workdir, "/w/card");
+                assert_eq!(objective, "merge authorized");
+                assert_eq!(
+                    env,
+                    vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+                    "resume_append 的 env 同样原样透传"
+                );
+            }
+            other => panic!("expected resume_append, got {other:?}"),
+        }
+
         assert!(
             parse_action(&answers["nothing"]).is_none(),
             "`{{\"action\": null}}` 是「这一拍无事可做」的契约形状"
         );
+    }
+
+    /// 契约里声明的能力必须与宿主实际发出的完全一致：宿主少报一个，插件就会
+    /// 把本来能做的动作当成不支持而永远排队；多报一个，插件会交出一个宿主执行
+    /// 不了的动作。
+    #[test]
+    fn the_contract_declares_exactly_the_actions_the_host_supports() {
+        let contract = driver_contract();
+        let declared = contract["request"]["capabilities"]["actions"]
+            .as_array()
+            .expect("契约必须钉住 capabilities.actions");
+        let declared: Vec<&str> = declared
+            .iter()
+            .map(|action| action.as_str().expect("能力名必须是字符串"))
+            .collect();
+        assert_eq!(declared, SUPPORTED_ACTIONS);
+    }
+
+    /// 契约里的失败样例必须能带上分类，且分类拼写与 `DriverErrorCode` 一致——
+    /// 插件按这些字符串分流「可安全退队」与「必须阻塞」，拼错一个就等于永不退队。
+    #[test]
+    fn the_contract_failure_sample_uses_a_known_error_code() {
+        let contract = driver_contract();
+        let failure = &contract["results"]["failure"];
+        let code = failure["error_code"]
+            .as_str()
+            .expect("失败样例必须带 error_code");
+        let known: Vec<&str> = [
+            DriverErrorCode::Busy,
+            DriverErrorCode::ThreadNotFound,
+            DriverErrorCode::WorkdirMissing,
+            DriverErrorCode::RestoreFailed,
+            DriverErrorCode::DeliveryFailed,
+        ]
+        .iter()
+        .map(DriverErrorCode::as_str)
+        .collect();
+        assert!(
+            known.contains(&code),
+            "契约里的 error_code `{code}` 不在已知分类 {:?} 里",
+            known
+        );
+        assert_eq!(code, DriverErrorCode::Busy.as_str());
     }
 
     /// 宿主**实际发出**的请求必须与契约里的 `request` 逐字一致：插件对
@@ -767,6 +998,7 @@ mod tests {
             ok: true,
             thread_id: Some("thread-1".into()),
             error: None,
+            error_code: None,
         }];
         let seen = std::sync::Mutex::new(Vec::new());
         let query = |params: &Value| {
@@ -821,6 +1053,224 @@ mod tests {
         assert_eq!(
             sent[0]["sessions"]["running"], 2,
             "计出来的在跑数必须原样上线"
+        );
+    }
+
+    /// 能力必须真的编进每一拍请求。插件靠它决定「这张卡该不该现在派」——
+    /// 缺了这一块，插件会把所有动作当成不支持而永远只排队。
+    #[tokio::test]
+    async fn the_wire_declares_the_supported_actions() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        let mut driver_threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher::default();
+        driver_step(
+            &query,
+            &mut driver_threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await;
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["capabilities"]["actions"],
+            json!(["launch", "append", "resume_append"]),
+            "宿主必须每拍声明它支持的动作"
+        );
+    }
+
+    /// 恢复原会话后追加：`launcher` 回的是**原** thread id，宿主必须原样回报，
+    /// 并把该 thread 登记进观测表（否则插件永远看不到它活着）。
+    #[tokio::test]
+    async fn a_resume_append_success_keeps_the_original_thread_identity() {
+        let reply = json!({
+            "action_id": "act-resume", "kind": "resume_append",
+            "thread_id": "thread-original", "workdir": "/w/card",
+            "objective": "merge authorized"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            thread_id: "thread-original".into(),
+            ..Default::default()
+        };
+
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.ok);
+        assert_eq!(outcome.thread_id.as_deref(), Some("thread-original"));
+        assert_eq!(
+            threads,
+            vec![DriverThread {
+                thread_id: "thread-original".into(),
+                alive: true,
+            }],
+            "恢复出来的原会话必须登记进观测表"
+        );
+    }
+
+    /// 同一个 thread 被恢复两次不能登记成两条——插件会把它们当成两个会话，
+    /// 名额就算错了。
+    #[tokio::test]
+    async fn a_repeated_resume_append_registers_the_thread_only_once() {
+        let reply = json!({
+            "action_id": "act-resume", "kind": "resume_append",
+            "thread_id": "thread-original", "workdir": "/w/card",
+            "objective": "merge authorized"
+        });
+        let mut threads = vec![DriverThread {
+            thread_id: "thread-original".into(),
+            alive: false,
+        }];
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            thread_id: "thread-original".into(),
+            ..Default::default()
+        };
+
+        driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(threads.len(), 1, "同 id 只能有一条观测：{threads:?}");
+        assert!(threads[0].alive, "恢复成功即视为活着");
+    }
+
+    /// `append` 不登记新 thread：它只续跑**已经登记过**的会话。行为必须与改动前
+    /// 一致，否则插件这两条动作的区别就被抹平了。
+    #[tokio::test]
+    async fn an_append_success_does_not_register_a_thread() {
+        let reply = json!({
+            "action_id": "act-append", "kind": "append",
+            "thread_id": "thread-1", "objective": "keep going"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            thread_id: "thread-1".into(),
+            ..Default::default()
+        };
+
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.ok);
+        assert!(threads.is_empty(), "append 不该登记会话：{threads:?}");
+    }
+
+    /// 分类过的失败必须把 `error_code` 送到线上：插件靠它区分「确定没投递」
+    /// （可安全退队）与「不知道」（必须阻塞）。
+    #[tokio::test]
+    async fn a_classified_failure_carries_its_error_code_on_the_wire() {
+        let reply = json!({
+            "action_id": "act-resume", "kind": "resume_append",
+            "thread_id": "thread-original", "workdir": "/w/card",
+            "objective": "merge authorized"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher::failing_with(DriverErrorCode::Busy, "thread is busy");
+
+        // 本拍的回报要下一拍才上线：`driver_step` 把结果**返回**给调用方（主循环
+        // 存入 `results`），故这里模拟主循环这一手，再跑一拍把它送出去。
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await
+        .expect("a failed action still produces a result to report");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error_code.as_deref(), Some("busy"));
+        results.push(outcome);
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await;
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["results"][0]["error_code"], "busy",
+            "分类必须原样上线：{sent:?}"
+        );
+    }
+
+    /// 没被分类的错误不许猜：`error_code` 必须是 `None`，让插件按不确定处理。
+    #[tokio::test]
+    async fn an_unclassified_failure_has_no_error_code() {
+        let reply = json!({
+            "action_id": "act-resume", "kind": "resume_append",
+            "thread_id": "thread-original", "workdir": "/w/card",
+            "objective": "merge authorized"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            fail: Some("some unknown breakage".into()),
+            ..Default::default()
+        };
+
+        // 本拍的回报由调用方（主循环）收进 `results`，下一拍才上线。
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+        )
+        .await
+        .expect("a failed action still produces a result to report");
+
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.error_code, None,
+            "未分类的错误不能被冒充成某个确定分类"
         );
     }
 

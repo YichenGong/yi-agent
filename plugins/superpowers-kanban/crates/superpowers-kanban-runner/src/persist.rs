@@ -31,6 +31,33 @@ pub fn load_board(path: &Path) -> Board {
         .unwrap_or_default()
 }
 
+/// 严格读队列状态:只有**文件不存在**才回空队列。
+///
+/// 与 [`load_board`] 的分工是刻意的:
+/// - `load_board` 服务显示(`list` / UI)。一份坏写不该让整个看板打不开,所以它
+///   吞错回退空队列。
+/// - `load_board_strict` 服务**决策**(调度、合并结算)。把「这份 board 读不懂」
+///   当成「看板是空的」,就等于用一份空看板去重写用户的数据——卡片会消失、安全
+///   门会被绕过。所以这里只能把错误交给调用者。
+pub fn load_board_strict(path: &Path) -> Result<Board, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Board::new()),
+        Err(error) => {
+            return Err(format!(
+                "could not read the board {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "the board {} is corrupt: {error}; refusing to overwrite it",
+            path.display()
+        )
+    })
+}
+
 /// 原子写：先写同目录的临时文件再 rename，读者永远看不到半个文件。
 pub fn save_board(path: &Path, board: &Board) -> Result<(), PersistError> {
     let json = serde_json::to_vec_pretty(board).map_err(PersistError::Encode)?;
@@ -81,6 +108,9 @@ fn acquire_board_lock(state_dir: &Path) -> std::io::Result<BoardLock> {
 ///
 /// 闭包返回 `Err` 时不落盘（失败不留半写状态）。这是 CLI 与 daemon 共用的
 /// 唯一数据入口——正因如此，一次性 CLI 写入不会再被 daemon 的陈旧内存覆盖。
+///
+/// 读走 [`load_board_strict`]：一份读不懂的 board 会让这次写入**失败**,而不是
+/// 被当成空看板覆盖掉。
 pub fn with_board<T>(
     state_dir: &Path,
     f: impl FnOnce(&mut Board) -> Result<T, String>,
@@ -88,7 +118,7 @@ pub fn with_board<T>(
     let _lock = acquire_board_lock(state_dir)
         .map_err(|error| format!("could not lock the board: {error}"))?;
     let path = state_dir.join("board.json");
-    let mut board = load_board(&path);
+    let mut board = load_board_strict(&path)?;
     let value = f(&mut board)?;
     save_board(&path, &board).map_err(|error| error.to_string())?;
     Ok(value)
@@ -132,6 +162,43 @@ mod tests {
         let path = dir.path().join("board.json");
         std::fs::write(&path, "{ not json").unwrap();
         assert!(load_board(&path).is_empty());
+    }
+
+    #[test]
+    fn a_broken_existing_board_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        std::fs::write(&path, b"broken-board").unwrap();
+        let outcome = with_board(dir.path(), |_| Ok(()));
+        assert!(
+            outcome.is_err(),
+            "a board that exists but cannot be parsed must block the write: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"broken-board",
+            "refusing must not destroy the file the user may still want back"
+        );
+    }
+
+    #[test]
+    fn a_missing_board_starts_empty_and_can_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        let count = with_board(dir.path(), |board| Ok(board.cards().len())).unwrap();
+        assert_eq!(count, 0);
+        assert!(path.exists(), "the first write creates the board");
+    }
+
+    #[test]
+    fn the_strict_loader_reports_what_the_lenient_one_hides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        // 显示用的宽松读法保持原样(UI 不该因为一份坏写就报错),但决策路径
+        // 必须能看到问题。
+        assert!(load_board(&path).is_empty());
+        assert!(load_board_strict(&path).is_err());
     }
 
     #[test]

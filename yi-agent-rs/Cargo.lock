@@ -3742,6 +3742,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "superpowers-kanban-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "superpowers-kanban-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "superpowers-kanban-runner"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "superpowers-kanban-core",
+ "superpowers-kanban-ipc",
+ "toml",
+]
+
+[[package]]
 name = "symlink"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5088,6 +5121,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "superpowers-kanban-core",
+ "superpowers-kanban-runner",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

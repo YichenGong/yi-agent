@@ -432,6 +432,15 @@ fn build_test_agent_with_provider(
     })
 }
 
+/// 供 `session_driver_tests` 使用:带真实用量的工厂。
+pub(crate) fn build_usage_agent_for_tests(
+    session: Option<yi_agent_core::Session>,
+    cwd: &std::path::Path,
+    mode: crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    build_usage_agent(session, cwd, mode)
+}
+
 fn build_usage_agent(
     session: Option<yi_agent_core::Session>,
     cwd: &std::path::Path,

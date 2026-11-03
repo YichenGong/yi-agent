@@ -67,6 +67,68 @@ pub enum MergeRequest {
 pub enum MergeFinish {
     Released,
     Cleared,
+    /// 有安全记录还没结算:名额要等 daemon 按 journal + 观测放,这里什么都不能做。
+    ///
+    /// 这不是失败,而是"你说的那一步还缺证据"。保留这个动词是为了兼容旧提示,
+    /// 但它**不再**能在合并回合中途把门放走（spec §8.2）。
+    Waiting,
+}
+
+/// 一条被受理的合并记录，此刻能不能安全地放掉（spec §8.2）。
+///
+/// 抽成纯函数是为了让释放与"故障矩阵"用同一个判据：这五条里少任何一条都会
+/// 变成"模型写个 done 就把门放走了"，而那正是旧行为的 bug。
+fn can_release_merge(
+    phase: &crate::merge_attempt::MergePhase,
+    pending: bool,
+    accepted_on_tick: Option<u64>,
+    tick_seq: u64,
+    card_matches_and_finished: bool,
+    thread: Option<&ThreadFacts>,
+) -> bool {
+    *phase == crate::merge_attempt::MergePhase::Accepted
+        // 还有在飞的续跑动作:结果都没回来,谈不上结束。
+        && !pending
+        // 必须**晚于**受理那一拍。同一个 `driver/next` 请求里带的 idle 快照
+        // 可能发生在结果生效之前,拿它当"已经停了"就是另一个早放。
+        && accepted_on_tick.is_some_and(|accepted| tick_seq > accepted)
+        && card_matches_and_finished
+        && thread.is_some_and(|fact| fact.alive && fact.idle)
+}
+
+/// 一张卡合并时的**来源分支**。
+///
+/// 独立合并卡把 source 落在 `source_ref` 上；实现卡没有这个字段——它的分支是
+/// `next_launch` 建 worktree 时按 `kanban/<slug>` 起的。于是「空」不等于「没有
+/// 来源」,只等于「按规则推导」:把空串拼进 objective 会让模型去合一个不存在的
+/// 分支,而这正是合并回合唯一一次的输入。
+fn merge_source(card: &superpowers_kanban_core::card::Card) -> String {
+    card.source_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("kanban/{}", slugify(&card.id)))
+}
+
+/// 本拍宿主上报的会话事实里有没有这一个。
+fn thread_fact<'a>(threads: &'a [ThreadFacts], thread_id: &str) -> Option<&'a ThreadFacts> {
+    threads.iter().find(|fact| fact.thread_id == thread_id)
+}
+
+/// 一张排队合并卡这一拍该怎么处置（`promote_merge_queue` 的分派结果）。
+#[derive(Debug, Clone)]
+enum MergeBinding {
+    /// 回到原开发会话追加一轮。动作 id 由调用方填。
+    Resume(ResumeLedger),
+    /// 独立合并卡（没有实现计划）:沿用 `Launch`。
+    Standalone,
+    /// 这一拍先不派,但保留排队与顺位（例如宿主还不支持所需动作）。
+    Defer { reason: String },
+    /// 这一拍明显不可用（会话正忙）,连候选地位都让出去。
+    Skip,
+    /// 绑定本身有问题,只能交给人工。
+    NeedsBinding { reason: String },
 }
 
 /// 插件交给宿主的**通用**动作（spec D4）。宿主不认识看板：它只执行、不解释。
@@ -96,6 +158,38 @@ pub enum DriverAction {
         /// 「这张卡是哪张」是插件自己的概念（`state --self` 靠它免去手写 id）。
         env: Vec<(String, String)>,
     },
+    /// 恢复**原开发会话**（同一 thread id）后追加一轮。
+    ///
+    /// 与 `Launch` 的区别是「回到原来那个会话」：`thread_id`/`workdir` 是原会话
+    /// 的精确定位（**不是**合并目标树），宿主必须用它恢复同一会话再投递。带上
+    /// `card_id` 是因为插件要记账「这张卡的动作属于哪张卡」，它**不进 JSON**。
+    ResumeAppend {
+        action_id: String,
+        card_id: String,
+        thread_id: String,
+        /// 原会话的精确定位目录（**不是** merge 目标树）。
+        workdir: PathBuf,
+        objective: String,
+        /// 冷装配时注入工具进程的环境变量；热会话不重建工具，故不生效。
+        env: Vec<(String, String)>,
+    },
+}
+
+/// 宿主在 `driver/next` 请求里声明的能力（spec §5.2）。
+///
+/// `Default` 是**一个都不支持**——旧宿主不发这块时，插件必须保留排队并说明
+/// 原因，绝不能猜「大概支持吧」然后交出一个宿主执行不了的动作，更不能退化成
+/// `Launch`（那会切断上下文，正是这次要修的行为）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriverCapabilities {
+    pub actions: Vec<String>,
+}
+
+impl DriverCapabilities {
+    /// 精确匹配：能力名是跨进程契约的一部分，不做前缀/大小写归一。
+    pub fn supports(&self, action: &str) -> bool {
+        self.actions.iter().any(|known| known == action)
+    }
 }
 
 impl DriverAction {
@@ -103,6 +197,22 @@ impl DriverAction {
     /// 用 `action_id` 作键而不是直接序列化枚举——枚举的形状是实现细节，不能外泄。
     pub fn to_json(&self) -> Value {
         match self {
+            DriverAction::ResumeAppend {
+                action_id,
+                thread_id,
+                workdir,
+                objective,
+                env,
+                // `card_id` 是插件内部记账键，**不进 JSON**：宿主不认识看板。
+                ..
+            } => json!({
+                "action_id": action_id,
+                "kind": "resume_append",
+                "thread_id": thread_id,
+                "workdir": workdir.to_string_lossy(),
+                "objective": objective,
+                "env": env.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            }),
             DriverAction::Launch {
                 action_id,
                 workdir,
@@ -149,6 +259,12 @@ pub struct DriverResult {
     /// 由 `list` 暴露给人和桌面（spec §4.6「失败 → 卡 `failed`（原因取 `error`）」）。
     #[serde(default)]
     pub error: Option<String>,
+    /// 宿主**显式分类**过的失败码（spec §5.2）。
+    ///
+    /// `None`（或旧宿主根本没这个字段）表示「宿主没归类」——插件必须按不确定
+    /// 处理，不能拿 `error` 文本猜「大概是 busy 吧」然后安全退队。
+    #[serde(default)]
+    pub error_code: Option<String>,
 }
 
 struct Inner {
@@ -174,12 +290,32 @@ struct Inner {
     /// 若 id 只有序号，上一进程遗留的回报会被误认成本进程的动作。
     next_action_seq: u64,
     action_nonce: String,
+    /// 第几拍。每拍 `driver_step` 单调 +1，**只活在进程内**：重启后从 0 再来，
+    /// 所以它绝不能是任何持久判据的一部分。它唯一的用途是回答「这条结果之后
+    /// 至少又过了一拍吗」——同一个 `driver/next` 请求里带来的 idle 观测可能发生
+    /// 在结果生效之前，用它卡住那次释放。
+    driver_tick_seq: u64,
+    /// 记录被受理（`Accepted`）在第几拍。`None` 表示还没有一条被受理的合并记录。
+    merge_accepted_on_tick: Option<u64>,
 }
 
 /// 一个已交出、等回报的动作。
 struct PendingAction {
     card_id: CardId,
     kind: PendingKind,
+    /// `ResumeForMerge` 的派发身份。结算必须能证明「这条回报属于我刚才发的那一
+    /// 次」：动作 id 由本进程的 nonce 保证不撞，加上 action id 与派发时绑定的
+    /// `(thread, workdir)`，迟到的旧回报、串了线的回报都对不上。
+    resume: Option<ResumeLedger>,
+}
+
+/// 一次续跑派发的账：动作 id、期望绑定的 thread/workdir、原入队时刻。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeLedger {
+    action_id: String,
+    thread_id: String,
+    expected_workdir: PathBuf,
+    merge_queued_at: Option<DateTime<Local>>,
 }
 
 /// 动作种类。回报的处置因种类而异：`launch` 靠 `thread_id` 让卡进入 `running`；
@@ -189,6 +325,13 @@ struct PendingAction {
 enum PendingKind {
     Launch,
     LaunchForMerge,
+    /// 给**实现卡的原会话**追加一轮合并指令（本需求的核心动作）。
+    ///
+    /// 与 `LaunchForMerge` 的两点不同必须记住：① 它不占新会话，成功回报只落到
+    /// 已有的 `card_id → thread_id` 上，而那张卡的绑定在派发时就已经定死；② 它的
+    /// 失败分两类——busy 证明**没投递**（可以安全退队重排），其余会把这张卡交给
+    /// 人工，但无论哪类都不能留下一个假的安全门。
+    ResumeForMerge,
 }
 
 pub struct BoardService {
@@ -231,6 +374,8 @@ impl BoardService {
                 pending_actions: Default::default(),
                 merge_gate: None,
                 next_action_seq: 0,
+                driver_tick_seq: 0,
+                merge_accepted_on_tick: None,
                 action_nonce: format!(
                     "{}-{}",
                     std::process::id(),
@@ -264,6 +409,9 @@ impl BoardService {
         threads: &[ThreadFacts],
         results: &[DriverResult],
         sessions_running: Option<u32>,
+        // 宿主声明的能力。缺省（旧宿主）=> 一个都不支持：保留排队并说明原因，
+        // 绝不猜、也绝不退化成本地能执行的动作。
+        capabilities: &DriverCapabilities,
     ) -> Result<Option<DriverAction>, String> {
         // 前置检查必须**早于**消费回报：拿不到全局租约目录时 `next_launch` 只会
         // 整拍报错，而错误会让宿主把这批回报当作「没送到」重发；可回报已经消费
@@ -271,12 +419,23 @@ impl BoardService {
         if self.lock().leases_dir.is_none() {
             return Err("no lease directory".into());
         }
+        // 本拍序号先进。回报、观测、释放、派发都用同一个数字,所以"这一拍"
+        // 在下面所有判断里含义一致。
+        let tick_seq = {
+            let mut inner = self.lock();
+            inner.driver_tick_seq += 1;
+            inner.driver_tick_seq
+        };
         // 1) 回报：宿主上一拍执行的结果在这里落账。
-        self.consume_results(results);
+        //
+        // 这一拍要是结算了一次续跑合并，就**不再派新的合并**：退队的卡马上又
+        // 满足条件，同一个 tick 里再派一次等于把"一拍一个动作"变成自旋重试，
+        // 而这一拍还没有任何新观测能证明它这次不会又忙。
+        let settled_merge = self.consume_results(results);
         // 2) 观测：只写旁路文件，绝不回写卡片状态。
         self.write_observations(threads);
         // 合并回合一结束就还名额：这一步只能由持有 flock 的本进程做。
-        self.release_gate_when_the_merge_is_over();
+        self.release_gate_when_the_merge_is_over(threads, tick_seq);
         // 本拍的**全机余量**：峰值 − 全机运行会话数。合并队列与启动共用这一份——
         // 两者都是真实的模型回合，吃的是同一份额度。
         //
@@ -288,9 +447,10 @@ impl BoardService {
         // 3) 合并队列：用户确认过的卡在这里排到队。放在启动之前——合并优先，
         //    且它一拍最多开一个、开完即返回，本拍不会再起新会话。
         //    余量为 0 时不动队：合并回合一样要跑一次真实的模型回合。
-        if budget > 0 {
+        if budget > 0 && !settled_merge {
             let mut inner = self.lock();
-            if let Some(action) = self.promote_merge_queue(&mut inner, limit) {
+            if let Some(action) = self.promote_merge_queue(&mut inner, limit, capabilities, threads)
+            {
                 return Ok(Some(action));
             }
         }
@@ -380,11 +540,15 @@ impl BoardService {
     /// `action_id` 不会二次生效，也不会重复记账名额。
     ///
     /// 摘除条目本身就是判重：第二条同 id 的回报从此查无此条。
-    fn consume_results(&self, results: &[DriverResult]) {
+    fn consume_results(&self, results: &[DriverResult]) -> bool {
+        let mut settled_merge = false;
         for result in results {
             let Some(pending) = self.take_pending(&result.action_id) else {
                 continue;
             };
+            if pending.kind == PendingKind::ResumeForMerge {
+                settled_merge = true;
+            }
             // 迁移失败不再把条目放回：能失败的都是**不会再成功**的那种
             // （卡不存在、当前状态不接受该迁移），重试只是原地打转；真正还要
             // 推进的卡，下一拍的对账会重新看到它。
@@ -395,6 +559,7 @@ impl BoardService {
                 );
             }
         }
+        settled_merge
     }
 
     /// 把一条已认领的回报落到看板上。
@@ -447,26 +612,251 @@ impl BoardService {
                 let _ = self.merge_finish(&pending.card_id.0);
                 Ok(())
             }
+            // 续跑原会话的结果。**所有分支都必须先证明这条结果属于我刚才发的那
+            // 一次**:动作 id 之外再核对绑定,迟到的旧结果、串线的结果才伤不到
+            // 当前的 attempt（spec §6.10）。
+            (PendingKind::ResumeForMerge, ok) => self.settle_resume_merge(pending, result, ok),
         }
+    }
+
+    /// 结算一次 `ResumeAppend` 的回报。
+    ///
+    /// 成功**不**写卡片状态:那张卡的状态是模型自己声明的（`state --self`）,
+    /// 插件替它翻成 `done` 就等于篡改事实。成功只意味着"指令进到 prompt 了",
+    /// 于是把安全记录从 `Pending` 升到 `Accepted`,并记下**第几拍**受理——清理
+    /// 还要等一拍之后的 idle 观测（spec §8.2）。
+    fn settle_resume_merge(
+        &self,
+        pending: &PendingAction,
+        result: &DriverResult,
+        ok: bool,
+    ) -> Result<(), String> {
+        let Some(ledger) = pending.resume.as_ref() else {
+            return Err("a resume result arrived with no dispatch record".to_string());
+        };
+        // 安全记录必须仍是**我这一条**。别人的记录说明世界已经变了,
+        // 这时唯一正确的动作是什么都不做(既不结算也不清门)。
+        let Some(current) = crate::merge_attempt::read(&self.state_dir)? else {
+            return Ok(());
+        };
+        if current.action_id != ledger.action_id
+            || current.card_id != pending.card_id.0
+            || current.thread_id.as_deref() != Some(ledger.thread_id.as_str())
+        {
+            eprintln!(
+                "superpowers-kanban: ignoring a result for {} that does not match the \
+                 merge attempt on record",
+                ledger.action_id
+            );
+            return Ok(());
+        }
+        if ok {
+            // 成功后必须回**原** thread id。回别的 id 等于把绑定写坏,按不安全处理。
+            if result.thread_id.as_deref() != Some(ledger.thread_id.as_str()) {
+                return self.mark_merge_uncertain(
+                    &current,
+                    "the resume reported a different thread id than the card's own session",
+                );
+            }
+            let accepted = crate::merge_attempt::MergeAttemptRecord {
+                phase: crate::merge_attempt::MergePhase::Accepted,
+                ..current
+            };
+            crate::merge_attempt::save(&self.state_dir, &accepted)?;
+            let mut inner = self.lock();
+            let tick = inner.driver_tick_seq;
+            inner.merge_accepted_on_tick = Some(tick);
+            return Ok(());
+        }
+        match result.error_code.as_deref() {
+            // busy 证明指令**没进** prompt 通道:可以安全地把卡退回队列,
+            // 保留原入队时刻(与顺位),并清掉本次的门与安全记录。
+            Some("busy") => self.requeue_after_busy_merge(pending, ledger, &current),
+            // 绑定不可用:再试也不会成功,交给人工。
+            Some("thread_not_found") | Some("workdir_missing") | Some("restore_failed") => self
+                .hand_merge_to_human(
+                    pending,
+                    &current,
+                    &format!(
+                        "the card's own session could not be resumed ({})",
+                        result.error_code.as_deref().unwrap_or_default()
+                    ),
+                ),
+            // 明确没投递,但原因不是绑定:同样确定可以重试,交人工是为了一次
+            // 只说清一次,而不是让队列反复抖。
+            Some("delivery_failed") => self.hand_merge_to_human(
+                pending,
+                &current,
+                "the merge instruction never reached the card's session",
+            ),
+            // 未知码 / 没有码:不知道有没有投递,只能保守阻塞。
+            other => self.mark_merge_uncertain(
+                &current,
+                &format!(
+                    "the resume failed without a recognised error code ({})",
+                    other.unwrap_or("none reported")
+                ),
+            ),
+        }
+    }
+
+    /// busy:退回 `MergeQueued`,**保留**原入队时刻与顺位。
+    ///
+    /// 只在卡确实还是本次派发推进去的 `Running` 且绑定没变时退。模型或用户
+    /// 这一拍已经写了别的状态,就不覆盖他们的判断。
+    fn requeue_after_busy_merge(
+        &self,
+        pending: &PendingAction,
+        ledger: &ResumeLedger,
+        current: &crate::merge_attempt::MergeAttemptRecord,
+    ) -> Result<(), String> {
+        let id = pending.card_id.clone();
+        let restored = persist::with_board(&self.state_dir, |board| {
+            let Some(live) = board.get(&id).cloned() else {
+                return Ok(false);
+            };
+            if live.state != CardState::Running
+                || live.thread_id.as_deref() != Some(ledger.thread_id.as_str())
+                || live.workdir.as_ref() != Some(&ledger.expected_workdir)
+            {
+                // 卡已经不在我留下的那个状态上了:不覆盖。
+                return Ok(false);
+            }
+            board
+                .transition(&id, CardState::MergeQueued)
+                .map_err(|error| error.to_string())?;
+            if let Some(live) = board.get_mut(&id) {
+                // 原时刻:重排的卡不该因为等过一次就掉到队尾。
+                match ledger.merge_queued_at {
+                    Some(at) => live.mark_merge_queued(at),
+                    None => live.clear_merge_queued(),
+                }
+            }
+            Ok(true)
+        })?;
+        // 卡已不归本次处置:记录也必须留着,因为它可能已经投递给别的 attempt。
+        if !restored {
+            return self.mark_merge_uncertain(
+                current,
+                "a busy result arrived after the card left the dispatching state",
+            );
+        }
+        self.release_dispatch_resources(&current.card_id, &current.action_id);
+        Ok(())
+    }
+
+    /// 确定不重试:交给人工，并清掉本次的资源与安全记录。
+    fn hand_merge_to_human(
+        &self,
+        pending: &PendingAction,
+        current: &crate::merge_attempt::MergeAttemptRecord,
+        reason: &str,
+    ) -> Result<(), String> {
+        let _ = persist::with_board(&self.state_dir, |board| {
+            if board
+                .get(&pending.card_id)
+                .is_some_and(|live| live.state == CardState::Running)
+            {
+                board
+                    .transition(&pending.card_id, CardState::NeedsYou)
+                    .map_err(|error| error.to_string())?;
+            }
+            board
+                .set_detail(&pending.card_id, Some(reason.to_string()))
+                .map_err(|error| error.to_string())
+        });
+        let _ = self.mark_terminal(&pending.card_id.0, "needs_you", Some(reason));
+        self.release_dispatch_resources(&current.card_id, &current.action_id);
+        Ok(())
+    }
+
+    /// 标成不确定:**保留**安全门，只把原因说出来。
+    fn mark_merge_uncertain(
+        &self,
+        current: &crate::merge_attempt::MergeAttemptRecord,
+        reason: &str,
+    ) -> Result<(), String> {
+        let uncertain = crate::merge_attempt::MergeAttemptRecord {
+            phase: crate::merge_attempt::MergePhase::Uncertain,
+            ..current.clone()
+        };
+        crate::merge_attempt::save(&self.state_dir, &uncertain)?;
+        eprintln!(
+            "superpowers-kanban: merge attempt {} is uncertain: {reason}",
+            current.action_id
+        );
+        Ok(())
+    }
+
+    /// 收回本次派发占的进程内资源（gate、租约）与磁盘上的安全记录。
+    ///
+    /// **只清属于本次的东西**:安全记录走 CAS（card + action 都对上才删）,
+    /// holder 走 CAS（card + 本进程 pid）。别人的记录一概不碰。
+    fn release_dispatch_resources(&self, card_id: &str, action_id: &str) {
+        let cleared = crate::merge_attempt::clear_if_matches(&self.state_dir, card_id, action_id);
+        if let Err(error) = cleared {
+            // 清不掉:安全门仍在,这是**正确**的保守结局,但必须让人看见。
+            eprintln!("superpowers-kanban: {error}");
+        }
+        let mut inner = self.lock();
+        inner.merge_gate = None;
+        inner.merge_accepted_on_tick = None;
+        inner.leases.remove(&CardId::new(card_id));
+        crate::merge_lock::clear_holder_if_matches(&self.state_dir, card_id, std::process::id());
     }
 
     /// 看板快照（克隆）：一次决策取一份，避免边决策边读到漂移的状态。
     ///
     /// 直接读盘（`persist::read_board`）而不是读内存：board.json 是唯一真相
     /// （单源点），别的进程（CLI、另一个 daemon）可能刚刚改过它。
-    /// 队列推进：名额空时把队首那张推进到 `Running` 并交出合并回合。
+    /// 队列推进：把队首那张可用的合并卡交出去。
     ///
-    /// **顺序是「先会话名额、后 merge.lock」**（spec §4.5）。反过来会占着合并锁
-    /// 等额度，期间本项目所有合并都被堵住，而它们本可以排在后面等着。
+    /// 这里有两类卡,处置**必须不同**（spec §6.8）:
     ///
-    /// 合并回合一律开**新会话**：旧的卡片会话早已跑完（甚至可能已经被回收），
-    /// 而合并要在一棵检出 base 的树里做，那棵树是 `merge::prepare` 现建的。
-    fn promote_merge_queue(&self, inner: &mut Inner, limit: u16) -> Option<DriverAction> {
-        let board = persist::read_board(&self.state_dir);
-        // 已经有人在合并：holder 指向任何卡，本拍就不动。锁本身是判定依据，
+    /// - **实现卡**:回到它自己的开发会话(`ResumeAppend`)。合并是那张卡的最后一步,
+    ///   上下文全在原会话里;另起一个会话去合并,等于让一个没有上下文的陌生人替
+    ///   它收尾——这正是本需求要修的 bug。
+    /// - **独立合并卡**(`kind == Merge`,没有实现计划):沿用 `Launch`。它的会话
+    ///   只做合并,本来就没有"原会话"可回。
+    ///
+    /// **顺序**是"先会话名额、后 merge.lock"（spec §6.4）。反过来会占着合并锁
+    /// 等额度,期间本项目所有合并都被堵住,而它们本可以排在后面等着。
+    fn promote_merge_queue(
+        &self,
+        inner: &mut Inner,
+        limit: u16,
+        capabilities: &DriverCapabilities,
+        threads: &[ThreadFacts],
+    ) -> Option<DriverAction> {
+        // 严格读:一份读不懂的看板不能让本拍凭"看起来是空的"就什么都不做,
+        // 更不能让后续写入覆盖它。直接报出来。
+        let board = match persist::load_board_strict(&self.state_dir.join("board.json")) {
+            Ok(board) => board,
+            Err(error) => {
+                eprintln!("superpowers-kanban: {error}");
+                return None;
+            }
+        };
+        // 已经有人在合并:holder 指向任何卡,本拍就不动。锁本身是判定依据,
         // 不另设 `Merging` 状态（spec §8）。
-        if crate::merge_lock::read_holder(&self.state_dir).is_some() {
-            return None;
+        match crate::merge_lock::read_holder_strict(&self.state_dir) {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(error) => {
+                // 记录写坏了:门的归属不可知,不能当成"没人合并"。
+                eprintln!("superpowers-kanban: {error}");
+                return None;
+            }
+        }
+        // 在飞的安全记录(含上一条还没结算的):本拍不派任何合并动作。
+        // 它独立于卡片,所以卡被归档/清掉了也照样拦（spec §8.1）。
+        match crate::merge_attempt::read(&self.state_dir) {
+            Ok(None) => {}
+            Ok(Some(_)) => return None,
+            Err(error) => {
+                eprintln!("superpowers-kanban: {error}");
+                return None;
+            }
         }
         let mut candidates: Vec<Card> = board
             .cards()
@@ -477,94 +867,417 @@ impl BoardService {
         if candidates.is_empty() {
             return None;
         }
-        // FIFO 只看入队时刻；同一时刻（旧数据没有时间戳）按 order 再按 id 兜底，
+        // FIFO 只看入队时刻;同一时刻（旧数据没有时间戳）按 order 再按 id 兜底,
         // 保证每拍挑中的是同一张。
         candidates.sort_by(|a, b| {
             (a.merge_queued_at, a.order, &a.id).cmp(&(b.merge_queued_at, b.order, &b.id))
         });
-        let Some(leases_dir) = inner.leases_dir.clone() else {
-            return None;
-        };
+        let leases_dir = inner.leases_dir.clone()?;
         for card in candidates {
-            // a) 会话名额。拿不到就整拍不推进——名额是全机共享的，换一张卡也
-            //    一样拿不到，继续试只是白烧 CPU。
-            let Some(lease) = lease::acquire_in(&leases_dir, limit as usize) else {
-                return None;
+            // 实现卡要先确认能回到原会话,否则连名额都不该拿:一张缺绑定的卡
+            // 交给人工,而不是占着额度反复重试。
+            let resume = match self.merge_binding(&card, capabilities, threads) {
+                MergeBinding::Resume(ledger) => Some(ledger),
+                MergeBinding::Standalone => None,
+                MergeBinding::Defer { reason } => {
+                    let _ = self.defer_merge(&card.id, &reason);
+                    continue;
+                }
+                MergeBinding::Skip => {
+                    // 这一拍明显不可用（会话正忙）:不占锁、不改时间,继续看后面的。
+                    continue;
+                }
+                MergeBinding::NeedsBinding { reason } => {
+                    let _ = self.mark_terminal(&card.id.0, "needs_you", Some(&reason));
+                    // 退队时刻一并清掉,免得它下次又被当成"排了很久"的候选。
+                    let _ = persist::with_board(&self.state_dir, |board| {
+                        if let Some(live) = board.get_mut(&card.id) {
+                            live.clear_merge_queued();
+                        }
+                        Ok(())
+                    });
+                    continue;
+                }
             };
-            // b) 合并锁。拿不到说明别的进程刚抢到：把会话名额放回，换下一张。
+            // a) 会话名额。拿不到就整拍不推进——名额是全机共享的,换一张卡也
+            //    一样拿不到,继续试只是白烧 CPU。
+            //
+            //    已经在跑的卡（绑定变了、或模型早写了一轮）不该再领第二份:
+            //    `reconcile_leases_locked` 已经按活会话给它记过一份。
+            let already_leased = inner.leases.contains_key(&card.id);
+            // 名额拿不到就整拍不推进（换一张卡也一样拿不到）。用 `then` +
+            // `?` 表达，而不是 `let...else`：后者在 `Option` 返回里会被
+            // Clippy 要求改成 `?`，但 `?` 只能直接返回 `None`，包不进 `Some`。
+            let lease = if already_leased {
+                None
+            } else {
+                let lease = (!already_leased)
+                    .then(|| lease::acquire_in(&leases_dir, limit as usize))
+                    .flatten()?;
+                Some(lease)
+            };
+            // b) 合并锁。拿不到说明别的进程刚抢到:把本次新领的名额放回,换下一张。
             let gate = match crate::merge_lock::acquire_with_holder(&self.state_dir, &card.id.0) {
-                crate::merge_lock::MergeAttempt::Granted(lock)
-                | crate::merge_lock::MergeAttempt::Reclaimed(lock) => lock,
-                crate::merge_lock::MergeAttempt::Busy { .. } => {
-                    drop(lease);
+                Ok(crate::merge_lock::MergeAttempt::Granted(lock))
+                | Ok(crate::merge_lock::MergeAttempt::Reclaimed(lock)) => lock,
+                Ok(crate::merge_lock::MergeAttempt::Busy { .. }) => {
+                    if let Some(lease) = lease {
+                        drop(lease);
+                    }
                     continue;
                 }
-            };
-            let base = card
-                .base_ref
-                .clone()
-                .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
-            let workdir = match merge::prepare(&self.project_root, &base) {
-                Ok(tree) => tree.path,
                 Err(error) => {
-                    eprintln!(
-                        "superpowers-kanban: cannot prepare a tree for {}: {error}",
-                        card.id.0
-                    );
-                    drop(gate);
+                    // 记录读不懂 / 写不下:门的归属不可知,这一拍不能派合并。
+                    // 只还本次名额,不动别人的记录。
+                    eprintln!("superpowers-kanban: {error}");
                     drop(lease);
-                    continue;
+                    return None;
                 }
             };
-            // 落到 `Running`：合并本来就是一次会话回合，执行态就是 running。
-            if persist::with_board(&self.state_dir, |board| {
-                board
-                    .transition(&card.id, CardState::Running)
-                    .map_err(|error| error.to_string())?;
-                if let Some(live) = board.get_mut(&card.id) {
-                    live.clear_merge_queued();
+            // c) 目标树与 objective。
+            let action_id = self.next_action_id(inner);
+            match resume {
+                Some(mut ledger) => {
+                    ledger.action_id = action_id.clone();
+                    if let Some(action) = self.dispatch_resume(inner, &card, &ledger, gate, lease) {
+                        return Some(action);
+                    }
+                    // 落盘失败:安全门与名额都留着,本拍不再派别的。下一拍重来。
+                    return None;
                 }
-                board
-                    .set_workdir(&card.id, workdir.clone())
-                    .map_err(|error| error.to_string())
-            })
-            .is_err()
-            {
-                drop(gate);
-                drop(lease);
-                continue;
+                None => {
+                    if let Some(action) =
+                        self.dispatch_standalone(inner, &card, &action_id, gate, lease)
+                    {
+                        return Some(action);
+                    }
+                    return None;
+                }
             }
-            inner.merge_gate = Some(gate);
-            inner.leases.insert(card.id.clone(), lease);
-            // 动作 id 与待办条目就地写进 `inner`：`mint_action_id` /
-            // `remember_pending` 都会再取同一把锁，在这里调用就是自锁。
-            inner.next_action_seq += 1;
-            let action_id = format!("act-{}-{}", inner.action_nonce, inner.next_action_seq);
-            inner.pending_actions.insert(
-                action_id.clone(),
-                PendingAction {
-                    card_id: card.id.clone(),
-                    kind: PendingKind::LaunchForMerge,
-                },
-            );
-            // daemon 已代持名额，所以用「不必再申请」的那版文案。
-            let objective = crate::tick::queued_merge_objective(
-                card.source_ref.as_deref().unwrap_or_default(),
-                &base,
-                &workdir,
-            );
-            return Some(DriverAction::Launch {
-                action_id,
-                driver_project: self.project_root.to_string_lossy().into_owned(),
-                driver_ref: card.id.0.clone(),
-                card_id: card.id.0.clone(),
-                workdir,
-                title: String::new(),
-                objective,
-                env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
-            });
         }
         None
+    }
+
+    /// 这张合并卡该走哪条路。
+    ///
+    /// 返回值刻意把"跳过"与"交给人工"分开:前者是这一拍的临时状态（会话正忙）,
+    /// 后者是已确定不可自动处理的绑定问题。把两者混在一起会让一张忙卡被错误地
+    /// 标成 `needs_you`。
+    fn merge_binding(
+        &self,
+        card: &Card,
+        capabilities: &DriverCapabilities,
+        threads: &[ThreadFacts],
+    ) -> MergeBinding {
+        if card.kind == CardKind::Merge {
+            return MergeBinding::Standalone;
+        }
+        // 能力先于预算:旧宿主不声明 `resume_append` 时,这一拍就算有余量也不能
+        // 交出它执行不了的动作,更不能退化成 `Launch`（那会切断上下文）。
+        if !capabilities.supports("resume_append") {
+            return MergeBinding::Defer {
+                reason: "the host does not declare the `resume_append` action; \
+                         upgrade the host (and restart the old daemon) so an authorized \
+                         merge can continue in this card's own session"
+                    .to_string(),
+            };
+        }
+        let thread_id = card
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let workdir = card.workdir.clone();
+        let (thread_id, workdir) = match (thread_id, workdir) {
+            (Some(thread_id), Some(workdir)) => (thread_id.to_string(), workdir),
+            _ => {
+                // 不猜、不去别的目录找一个"看着像"的会话。缺绑定就只能人工处理。
+                return MergeBinding::NeedsBinding {
+                    reason: "this card has no bound development session (thread id or \
+                             workdir is missing), so its authorized merge cannot continue \
+                             in the original conversation; resume it by hand"
+                        .to_string(),
+                };
+            }
+        };
+        // 观测说它活着且不空闲:很可能还在跑,这一拍不打断它。缺观测是允许的——
+        // 最终由宿主的 busy 判断兜底（spec §6.2）。
+        if let Some(fact) = thread_fact(threads, &thread_id)
+            && fact.alive
+            && !fact.idle
+        {
+            return MergeBinding::Skip;
+        }
+        MergeBinding::Resume(ResumeLedger {
+            action_id: String::new(),
+            thread_id,
+            expected_workdir: workdir,
+            merge_queued_at: card.merge_queued_at,
+        })
+    }
+
+    /// 派发前的最后一次重验与落盘。**全部在 board 锁内**:先写安全记录、
+    /// 再写 `Running`,两步都成功才把动作交出去。
+    fn dispatch_resume(
+        &self,
+        inner: &mut Inner,
+        card: &Card,
+        ledger: &ResumeLedger,
+        gate: crate::merge_lock::MergeLock,
+        lease: Option<Lease>,
+    ) -> Option<DriverAction> {
+        // 目标树要在写记录**之前**准备好:准备失败就不该留下任何安全记录。
+        // 合并在这棵树里做,而开发树只用来定位原会话。
+        let base = card
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
+        let target = match merge::prepare(&self.project_root, &base) {
+            Ok(tree) => tree.path,
+            Err(error) => {
+                eprintln!(
+                    "superpowers-kanban: cannot prepare a tree for {}: {error}",
+                    card.id.0
+                );
+                let _ = crate::merge_lock::clear_holder_if_matches(
+                    &self.state_dir,
+                    &card.id.0,
+                    std::process::id(),
+                );
+                drop(gate);
+                drop(lease);
+                return None;
+            }
+        };
+        let record = crate::merge_attempt::MergeAttemptRecord {
+            version: crate::merge_attempt::ATTEMPT_VERSION,
+            action_id: ledger.action_id.clone(),
+            card_id: card.id.0.clone(),
+            thread_id: Some(ledger.thread_id.clone()),
+            expected_workdir: ledger.expected_workdir.clone(),
+            phase: crate::merge_attempt::MergePhase::Pending,
+            merge_queued_at: ledger.merge_queued_at,
+        };
+        let staged = persist::with_board(&self.state_dir, |board| {
+            // CAS:重验这一张仍是 MergeQueued、绑定与原入队时间都没被换过。
+            let live = board
+                .get(&card.id)
+                .cloned()
+                .ok_or_else(|| "the card disappeared while dispatching".to_string())?;
+            if live.state != CardState::MergeQueued {
+                return Err(format!("the card is {:?}, not merge_queued", live.state));
+            }
+            if live.thread_id.as_deref() != Some(ledger.thread_id.as_str()) {
+                return Err("the card's session binding changed while dispatching".to_string());
+            }
+            if live.workdir.as_ref() != Some(&ledger.expected_workdir) {
+                return Err("the card's workdir changed while dispatching".to_string());
+            }
+            if live.merge_queued_at != ledger.merge_queued_at {
+                return Err("the card's queue position changed while dispatching".to_string());
+            }
+            // 先只在内存里迁移;`with_board` 只在闭包返回 `Ok` 时才把看板落盘。
+            // 于是「安全记录落盘 → 看板落盘(Running)」是同一次提交,而**记录在
+            // 前**:中途崩溃留下的是「有记录 + 卡仍 MergeQueued」,重启会阻塞而不是
+            // 重派（spec §8.1）。反过来（先写 Running）会留下一个没有记录、却已
+            // 经在跑的合并。
+            board
+                .transition(&card.id, CardState::Running)
+                .map_err(|error| error.to_string())?;
+            crate::merge_attempt::save(&self.state_dir, &record)
+                .map_err(|error| format!("could not record the merge attempt: {error}"))
+        });
+        if let Err(error) = staged {
+            // 看板没提交 = `Running` 没落盘;动作也没交出去,名额与 holder 都不留。
+            //
+            // 记录可能已经写进去了（失败发生在写记录之后）。这里**能确认**动作没
+            // 交出去,所以按 spec §8.1 的允许做一次 CAS 清理;留一条没人能自动结算的
+            // 记录会把这个项目的合并永久堵死。
+            let _ = crate::merge_attempt::clear_if_matches(
+                &self.state_dir,
+                &card.id.0,
+                &ledger.action_id,
+            );
+            eprintln!(
+                "superpowers-kanban: could not start the merge for {}: {error}",
+                card.id
+            );
+            let _ = crate::merge_lock::clear_holder_if_matches(
+                &self.state_dir,
+                &card.id.0,
+                std::process::id(),
+            );
+            drop(gate);
+            drop(lease);
+            return None;
+        }
+        // 记录与 `Running` 都已落盘,现在才把动作交出去。
+        if let Err(error) = persist::with_board(&self.state_dir, |board| {
+            if let Some(live) = board.get_mut(&card.id) {
+                live.clear_merge_queued();
+            }
+            Ok(())
+        }) {
+            eprintln!(
+                "superpowers-kanban: could not clear the queue mark for {}: {error}",
+                card.id
+            );
+        }
+        inner.merge_gate = Some(gate);
+        if let Some(lease) = lease {
+            inner.leases.insert(card.id.clone(), lease);
+        }
+        inner.pending_actions.insert(
+            ledger.action_id.clone(),
+            PendingAction {
+                card_id: card.id.clone(),
+                kind: PendingKind::ResumeForMerge,
+                resume: Some(ledger.clone()),
+            },
+        );
+        let source = merge_source(card);
+        let base = card
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
+        Some(DriverAction::ResumeAppend {
+            action_id: ledger.action_id.clone(),
+            card_id: card.id.0.clone(),
+            thread_id: ledger.thread_id.clone(),
+            workdir: ledger.expected_workdir.clone(),
+            objective: crate::tick::queued_merge_objective(
+                &card.id.0,
+                &source,
+                &base,
+                &ledger.expected_workdir,
+                &target,
+                &self.state_dir,
+            ),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
+        })
+    }
+
+    /// 独立合并卡:沿用既有 `Launch` 路径（spec §6.8）。
+    fn dispatch_standalone(
+        &self,
+        inner: &mut Inner,
+        card: &Card,
+        action_id: &str,
+        gate: crate::merge_lock::MergeLock,
+        lease: Option<Lease>,
+    ) -> Option<DriverAction> {
+        let base = card
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| crate::merge::default_branch(&self.project_root));
+        let workdir = match merge::prepare(&self.project_root, &base) {
+            Ok(tree) => tree.path,
+            Err(error) => {
+                eprintln!(
+                    "superpowers-kanban: cannot prepare a tree for {}: {error}",
+                    card.id.0
+                );
+                let _ = crate::merge_lock::clear_holder_if_matches(
+                    &self.state_dir,
+                    &card.id.0,
+                    std::process::id(),
+                );
+                drop(gate);
+                drop(lease);
+                return None;
+            }
+        };
+        let record = crate::merge_attempt::MergeAttemptRecord {
+            version: crate::merge_attempt::ATTEMPT_VERSION,
+            action_id: action_id.to_string(),
+            card_id: card.id.0.clone(),
+            thread_id: card.thread_id.clone(),
+            expected_workdir: workdir.clone(),
+            phase: crate::merge_attempt::MergePhase::Pending,
+            merge_queued_at: card.merge_queued_at,
+        };
+        // 与 `dispatch_resume` 同一顺序:先在内存里迁移,再写安全记录,最后才是
+        // 看板提交。记录在前意味着崩溃留下「有记录、卡未 Running」——阻塞而非重派。
+        let staged = persist::with_board(&self.state_dir, |board| {
+            board
+                .transition(&card.id, CardState::Running)
+                .map_err(|error| error.to_string())?;
+            if let Some(live) = board.get_mut(&card.id) {
+                live.clear_merge_queued();
+            }
+            board
+                .set_workdir(&card.id, workdir.clone())
+                .map_err(|error| error.to_string())?;
+            crate::merge_attempt::save(&self.state_dir, &record)
+                .map_err(|error| format!("could not record the merge attempt: {error}"))
+        });
+        if let Err(error) = staged {
+            // 同 `dispatch_resume`:动作没交出去,记录若已写就 CAS 清掉。
+            let _ = crate::merge_attempt::clear_if_matches(&self.state_dir, &card.id.0, action_id);
+            eprintln!(
+                "superpowers-kanban: could not start the merge for {}: {error}",
+                card.id
+            );
+            let _ = crate::merge_lock::clear_holder_if_matches(
+                &self.state_dir,
+                &card.id.0,
+                std::process::id(),
+            );
+            drop(gate);
+            drop(lease);
+            return None;
+        }
+        inner.merge_gate = Some(gate);
+        if let Some(lease) = lease {
+            inner.leases.insert(card.id.clone(), lease);
+        }
+        inner.pending_actions.insert(
+            action_id.to_string(),
+            PendingAction {
+                card_id: card.id.clone(),
+                kind: PendingKind::LaunchForMerge,
+                resume: None,
+            },
+        );
+        Some(DriverAction::Launch {
+            action_id: action_id.to_string(),
+            driver_project: self.project_root.to_string_lossy().into_owned(),
+            driver_ref: card.id.0.clone(),
+            card_id: card.id.0.clone(),
+            objective: crate::tick::queued_merge_objective(
+                &card.id.0,
+                card.source_ref.as_deref().unwrap_or_default(),
+                &base,
+                &card.workdir.clone().unwrap_or_default(),
+                &workdir,
+                &self.state_dir,
+            ),
+            workdir,
+            title: String::new(),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), card.id.0.clone())],
+        })
+    }
+
+    /// 记下"这张卡这一拍先不动"的原因,但不反复刷盘/刷日志（spec §5.2）。
+    fn defer_merge(&self, card_id: &CardId, reason: &str) -> Result<(), String> {
+        persist::with_board(&self.state_dir, |board| {
+            let current = board
+                .get(card_id)
+                .and_then(|card| card.detail.clone())
+                .unwrap_or_default();
+            if current == reason {
+                return Ok(());
+            }
+            board
+                .set_detail(card_id, Some(reason.to_string()))
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// 取下一个动作 id。就地递增,避免在已持有 `inner` 的地方再锁一次。
+    fn next_action_id(&self, inner: &mut Inner) -> String {
+        inner.next_action_seq += 1;
+        format!("act-{}-{}", inner.action_nonce, inner.next_action_seq)
     }
 
     /// 合并视图配置：并发字段来自注入的 home（`None` 时回退真实 `$HOME`）。
@@ -629,6 +1342,7 @@ impl BoardService {
             PendingAction {
                 card_id: card_id.clone(),
                 kind,
+                resume: None,
             },
         );
     }
@@ -1119,6 +1833,16 @@ impl BoardService {
     /// 还在不在我手上」。`Cleared` 表示本进程根本没持有名额（别人的合并、或
     /// 已经释放过一次），不是错误。
     pub fn merge_finish(&self, card_id: &str) -> Result<MergeFinish, String> {
+        // 安全记录还在:这一轮有没有结束不是调用方说了算。daemon 会在
+        // 「匹配结果之后的一拍、匹配会话明确 idle」时自己放门。
+        let attempt = crate::merge_attempt::read(&self.state_dir)?;
+        if let Some(record) = &attempt {
+            if record.card_id != card_id {
+                // 不是这张卡的账:零副作用（不碰 holder、不碰 gate）。
+                return Ok(MergeFinish::Waiting);
+            }
+            return Ok(MergeFinish::Waiting);
+        }
         let mut inner = self.lock();
         let Some(gate) = inner.merge_gate.take() else {
             // 本进程没有名额。但记录的持有者可能已经死了（崩溃、或被换掉了）：
@@ -1150,28 +1874,103 @@ impl BoardService {
     ///
     /// 判定只看卡片自己写下的状态：模型把合并收尾成 `done` / `failed` /
     /// `needs_you`（或退回 `awaiting_merge`）就说明这一轮结束了。
-    fn release_gate_when_the_merge_is_over(&self) {
-        let held = self.lock().merge_gate.is_some();
-        if !held {
+    fn release_gate_when_the_merge_is_over(&self, threads: &[ThreadFacts], tick_seq: u64) {
+        // 先看盘上的安全记录:它才是"这一轮到底结束没有"的真相。旧版只凭
+        // "卡不再是 Running"就放门,模型早写一个 `done` 就能把还在写目标树的
+        // 合并回合放走（spec §8.2）。
+        let record = match crate::merge_attempt::read(&self.state_dir) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                // 没有安全记录:那是旧版抛下的 holder。只做"死了就清"的回收,
+                // 不凭它推断任何合并已经结束。
+                return;
+            }
+            Err(error) => {
+                eprintln!("superpowers-kanban: {error}");
+                return;
+            }
+        };
+        let card_id = CardId::new(record.card_id.clone());
+        let board = match persist::load_board_strict(&self.state_dir.join("board.json")) {
+            Ok(board) => board,
+            Err(error) => {
+                eprintln!("superpowers-kanban: {error}");
+                return;
+            }
+        };
+        // 卡不存在:无从证明 git 子进程已经停。保留记录,等人工核对。
+        let Some(card) = board.get(&card_id) else {
+            return;
+        };
+        // "卡确实收尾了"= 存在、绑定的 thread/workdir 都没被换过、且已离开
+        // Running。绑定变了说明这张卡已经在过另一种生活,本次记录不再是它的。
+        let binding_holds = card.thread_id.as_deref() == record.thread_id.as_deref()
+            && card.workdir.as_ref() == Some(&record.expected_workdir);
+        let finished = binding_holds && card.state != CardState::Running;
+        // 只认**这个** thread 的观测:别的会话 idle 不能证明它在写的那棵树停了。
+        let fact = record
+            .thread_id
+            .as_deref()
+            .and_then(|thread_id| thread_fact(threads, thread_id));
+        let pending = self
+            .lock()
+            .pending_actions
+            .values()
+            .any(|pending| pending.kind == PendingKind::ResumeForMerge);
+        let accepted_on_tick = self.lock().merge_accepted_on_tick;
+        if can_release_merge(
+            &record.phase,
+            pending,
+            accepted_on_tick,
+            tick_seq,
+            finished,
+            fact,
+        ) {
+            // 先清记录:清不掉就不放门,继续阻塞。
+            match crate::merge_attempt::clear_if_matches(
+                &self.state_dir,
+                &record.card_id,
+                &record.action_id,
+            ) {
+                Ok(true) => {
+                    let mut inner = self.lock();
+                    inner.merge_gate = None;
+                    inner.merge_accepted_on_tick = None;
+                    inner
+                        .leases
+                        .retain(|id, _| id != &CardId::new(record.card_id.clone()));
+                    drop(inner);
+                    crate::merge_lock::clear_holder_if_matches(
+                        &self.state_dir,
+                        &record.card_id,
+                        std::process::id(),
+                    );
+                    if let Ok(mut board) = persist::with_board(&self.state_dir, |board| {
+                        board
+                            .set_detail(&CardId::new(record.card_id.clone()), None)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        let _ = &mut board;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("superpowers-kanban: {error}"),
+            }
             return;
         }
-        let card_id = match crate::merge_lock::read_holder(&self.state_dir) {
-            Some(holder) => holder.card_id,
-            None => return,
-        };
-        // holder 记录缺失时无从判断是哪张卡：宁可再等一拍，也不误放别人的名额。
-        if card_id.is_empty() {
-            return;
-        }
-        let board = persist::read_board(&self.state_dir);
-        let Some(card) = board.get(&CardId::new(card_id.clone())) else {
-            let _ = self.merge_finish(&card_id);
-            return;
-        };
-        // 合并回合期间卡就是 `Running`（队列推进时置的）。模型一收尾——`done`、
-        // `needs_you`、`failed`，或干脆退回别的状态——这一轮就结束了。
-        if card.state != CardState::Running {
-            let _ = self.merge_finish(&card_id);
+        // 该收尾了却没有足够证据:转 Uncertain,让人来核对,而不是继续等。
+        if record.phase == crate::merge_attempt::MergePhase::Accepted
+            && !pending
+            && finished
+            && fact.is_some_and(|fact| !fact.alive)
+        {
+            let uncertain = crate::merge_attempt::MergeAttemptRecord {
+                phase: crate::merge_attempt::MergePhase::Uncertain,
+                ..record
+            };
+            if let Err(error) = crate::merge_attempt::save(&self.state_dir, &uncertain) {
+                eprintln!("superpowers-kanban: {error}");
+            }
         }
     }
 
@@ -1218,7 +2017,26 @@ impl BoardService {
         let observations = crate::observation::load(&self.state_dir);
         // 一次读出，别在逐卡闭包里反复开文件。
         let holder = crate::merge_lock::read_holder(&self.state_dir);
+        // 安全记录是**顶层**字段:它必须看得见,哪怕卡已经被归档/清掉。
+        // 卡片的 detail 承载不了这件事,因为那时已经没有那张卡了。
+        let (merge_attempt, merge_blocked_reason) =
+            match crate::merge_attempt::read(&self.state_dir) {
+                Ok(Some(record)) => (
+                    json!({
+                        "action_id": record.action_id,
+                        "card_id": record.card_id,
+                        "thread_id": record.thread_id,
+                        "phase": record.phase,
+                        "expected_workdir": record.expected_workdir,
+                    }),
+                    None,
+                ),
+                Ok(None) => (Value::Null, None),
+                Err(error) => (Value::Null, Some(error)),
+            };
         json!({
+            "merge_attempt": merge_attempt,
+            "merge_blocked_reason": merge_blocked_reason,
             "cards": board.visible().map(|card| json!({
                 "id": card.id.0,
                 "state": card.state,
@@ -1251,6 +2069,15 @@ impl BoardService {
                     .map(|at| at.to_rfc3339()),
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// daemon 启动时的合并安全检查（spec §8.3）。
+    ///
+    /// **只能由 daemon 在取得 `plugin.lock` 之后、开始回答查询之前调用。**
+    /// 不能放进 `BoardService::new`：CLI 也会构造 service，那样一次 `list` 就会
+    /// 把一个活跃 attempt 标成 uncertain、误伤正在合并的项目。
+    pub fn recover_merge_attempt_on_startup(&self) -> Result<Option<String>, String> {
+        crate::merge_attempt::block_on_startup(&self.state_dir)
     }
 
     /// 看板上未被占用的合并卡 id（供 dispatch / CLI 共用）。
@@ -1410,6 +2237,18 @@ mod tests {
         }
     }
 
+    /// 宿主一个动作都不会（旧宿主、或契约里没声明能力）。
+    fn no_caps() -> DriverCapabilities {
+        DriverCapabilities::default()
+    }
+
+    /// 宿主声明支持这些动作。
+    fn caps(actions: &[&str]) -> DriverCapabilities {
+        DriverCapabilities {
+            actions: actions.iter().map(|action| action.to_string()).collect(),
+        }
+    }
+
     /// 宿主说这些会话都还忙着。
     fn busy(ids: &[&str]) -> Vec<crate::service::ThreadFacts> {
         ids.iter().map(|id| facts(id, false, true)).collect()
@@ -1418,7 +2257,7 @@ mod tests {
     /// 一拍 `driver_step`，断言它交出了一个 launch 并把它交出来。
     fn launched(service: &BoardService) -> DriverAction {
         service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a launch action")
     }
@@ -1846,6 +2685,24 @@ mod tests {
         (service, format!("kanban/{slug}"))
     }
 
+    /// 「实现卡」夹具：一张 `awaiting_merge` 卡，**并且**已经绑定真实开发树。
+    ///
+    /// 与 [`service_with_awaiting_card`] 的区别只在 workdir：那张只写 thread、没有
+    /// workdir 的卡是**缺绑定**的反例，续跑必须拒绝它。成功续跑需要一份真实存在的
+    /// 原开发树——合并要落到那里，而不是新检出的目标树。
+    fn service_with_merge_bound_card(project: &std::path::Path) -> (BoardService, String) {
+        let (service, source) = service_with_awaiting_card(project);
+        let id = CardId::new("card-1");
+        let development = crate::worktree::ensure_worktree(project, &id, &source).unwrap();
+        persist::with_board(&service.state_dir, |board| {
+            board
+                .set_workdir(&id, development)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        (service, source)
+    }
+
     fn git_run(project: &std::path::Path, args: &[&str]) {
         assert!(
             std::process::Command::new("git")
@@ -2002,7 +2859,7 @@ mod tests {
         git_run(&project, &["branch", &source]);
         // 名额由 daemon 在开跑那一拍拿到（这里模拟那一拍）。
         match crate::merge_lock::acquire_with_holder(&service.state_dir, "card-1") {
-            crate::merge_lock::MergeAttempt::Granted(lock) => {
+            Ok(crate::merge_lock::MergeAttempt::Granted(lock)) => {
                 service.lock().merge_gate = Some(lock)
             }
             other => panic!("expected Granted, got {other:?}"),
@@ -2019,7 +2876,7 @@ mod tests {
         assert!(
             wait_until(|| matches!(
                 crate::merge_lock::acquire_with_holder(&service.state_dir, "other"),
-                crate::merge_lock::MergeAttempt::Granted(_)
+                Ok(crate::merge_lock::MergeAttempt::Granted(_))
             )),
             "the gate must be free after merge_finish"
         );
@@ -2058,20 +2915,55 @@ mod tests {
         );
     }
 
+    /// 实现卡没有 `source_ref`,它的分支是 `kanban/<slug>`。指令里若拼进空串,
+    /// 模型就会去合一个不存在的分支——而这是合并回合唯一的输入。
+    #[test]
+    fn merge_resume_names_the_derived_branch_of_an_implementation_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = service
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                None,
+                &caps(&["resume_append"]),
+            )
+            .unwrap()
+            .expect("a merge turn");
+        let DriverAction::ResumeAppend { objective, .. } = action else {
+            panic!("expected a resume");
+        };
+        assert_eq!(source, "kanban/card-1");
+        assert!(
+            objective.contains(&format!("take '{source}' into")),
+            "the derived branch must be named verbatim: {objective}"
+        );
+        assert!(!objective.contains("take '' into"), "{objective}");
+    }
+
     #[test]
     fn the_queue_head_starts_merging_when_the_gate_is_free() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         service.merge_request("card-1").unwrap();
         let action = service
-            .driver_step(&[facts("thread-1", true, true)], &[], None)
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                None,
+                &caps(&["resume_append"]),
+            )
             .unwrap()
             .expect("a merge turn");
-        let DriverAction::Launch {
+        let DriverAction::ResumeAppend {
             card_id, objective, ..
-        } = action;
+        } = action
+        else {
+            panic!("expected a resume, got {action:?}");
+        };
         assert_eq!(card_id, "card-1");
         assert!(objective.contains("merge"), "{objective}");
         assert!(
@@ -2099,7 +2991,7 @@ mod tests {
         service.enqueue_card_for_test("card-2");
         peak_of(&service, 4);
 
-        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        let action = service.driver_step(&[], &[], Some(4), &no_caps()).unwrap();
         assert!(
             action.is_none(),
             "全机 4 个在跑、峰值 4：看板再起就是超发，实际得到 {action:?}"
@@ -2116,7 +3008,7 @@ mod tests {
         service.enqueue_card_for_test("card-2");
         peak_of(&service, 5);
 
-        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        let action = service.driver_step(&[], &[], Some(4), &no_caps()).unwrap();
         assert!(
             matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
             "余量 1 → 队首那张走"
@@ -2139,7 +3031,7 @@ mod tests {
         assert_eq!(service.board_running_count(), 1);
 
         let action = service
-            .driver_step(&busy(&["thread-1"]), &[], Some(4))
+            .driver_step(&busy(&["thread-1"]), &[], Some(4), &no_caps())
             .unwrap();
         assert!(
             action.is_none(),
@@ -2158,7 +3050,7 @@ mod tests {
         let service = service_with_card(&project);
         peak_of(&service, 4);
 
-        let action = service.driver_step(&[], &[], None).unwrap();
+        let action = service.driver_step(&[], &[], None, &no_caps()).unwrap();
         assert!(
             matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
             "缺字段不能拒绝调度，否则旧宿主上的看板彻底停摆"
@@ -2172,7 +3064,7 @@ mod tests {
         let service = service_with_card(&project);
         peak_of(&service, 2);
 
-        let action = service.driver_step(&[], &[], Some(7)).unwrap();
+        let action = service.driver_step(&[], &[], Some(7), &no_caps()).unwrap();
         assert!(action.is_none(), "saturating_sub：多于峰值也只会是 0");
         assert_eq!(state_of(&service, "card-1"), "queued");
     }
@@ -2185,8 +3077,7 @@ mod tests {
     fn the_merge_queue_waits_when_the_whole_machine_has_no_room() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         peak_of(&service, 4);
         service.merge_request("card-1").unwrap();
         assert_eq!(state_of(&service, "card-1"), "merge_queued");
@@ -2194,7 +3085,12 @@ mod tests {
         // 全机 4 个会话在跑 → 余量 0：本拍不动队。
         assert!(
             service
-                .driver_step(&[facts("thread-1", true, true)], &[], Some(4))
+                .driver_step(
+                    &[facts("thread-1", true, true)],
+                    &[],
+                    Some(4),
+                    &caps(&["resume_append"])
+                )
                 .unwrap()
                 .is_none(),
             "no room on the whole machine means no merge turn"
@@ -2211,11 +3107,16 @@ mod tests {
 
         // 余量回来（全机 3 个在跑）→ 队首照常开局。
         let action = service
-            .driver_step(&[facts("thread-1", true, true)], &[], Some(3))
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                Some(3),
+                &caps(&["resume_append"]),
+            )
             .unwrap()
             .expect("room is back: the queue head starts");
         assert!(
-            matches!(action, DriverAction::Launch { ref card_id, .. } if card_id == "card-1"),
+            matches!(action, DriverAction::ResumeAppend { ref card_id, .. } if card_id == "card-1"),
             "{action:?}"
         );
         assert_eq!(state_of(&service, "card-1"), "running");
@@ -2249,12 +3150,15 @@ mod tests {
         assert_eq!(merge_card.state, CardState::MergeQueued);
         let merge_id = merge_card.id.0.clone();
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a merge turn");
         let DriverAction::Launch {
             card_id, objective, ..
-        } = action;
+        } = action
+        else {
+            panic!("expected a launch, got {action:?}");
+        };
         assert_eq!(card_id, merge_id);
         assert!(objective.contains("feat/manual"), "{objective}");
         assert_eq!(state_of(&service, &merge_id), "running");
@@ -2265,8 +3169,7 @@ mod tests {
     fn list_marks_the_card_that_holds_the_merge_gate() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         service.merge_request("card-1").unwrap();
         let card = |service: &BoardService| {
             service.list()["cards"]
@@ -2279,7 +3182,9 @@ mod tests {
         };
         assert_eq!(card(&service)["merging"], false);
         assert!(card(&service)["merge_queued_at"].is_string());
-        let _ = service.driver_step(&[], &[], None).unwrap();
+        let _ = service
+            .driver_step(&[], &[], None, &caps(&["resume_append"]))
+            .unwrap();
         assert_eq!(card(&service)["merging"], true);
         // 已经开跑，队列时间就清掉了。
         assert!(card(&service)["merge_queued_at"].is_null());
@@ -2292,25 +3197,58 @@ mod tests {
     fn the_daemon_releases_the_gate_once_the_merge_turn_settles() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         service.merge_request("card-1").unwrap();
         service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &caps(&["resume_append"]))
             .unwrap()
             .expect("a merge turn");
         assert!(crate::merge_lock::read_holder(&service.state_dir).is_some());
 
         // 回合还没收尾（卡仍是 running）→ 名额继续握着。
-        service.driver_step(&[], &[], None).unwrap();
+        service
+            .driver_step(&[], &[], None, &caps(&["resume_append"]))
+            .unwrap();
         assert!(
             crate::merge_lock::read_holder(&service.state_dir).is_some(),
             "a merge still in flight must keep the gate"
         );
 
-        // 模型判定合并成功并落 `done` → 下一拍名额归还。
+        // 宿主的成功回报到达：记录由 pending 升到 accepted，但**仍然**不放门。
+        let action_id = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .expect("the attempt on record")
+            .action_id;
+        let ok = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+            error_code: None,
+        };
+        service
+            .driver_step(
+                &[facts("thread-1", false, true)],
+                &[ok],
+                Some(1),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_some(),
+            "a reported merge is not a finished merge"
+        );
+
+        // 模型判定合并成功并落 `done`，再下一拍匹配会话明确 idle → 名额归还。
         service.set_state("card-1", CardState::Done, None).unwrap();
-        service.driver_step(&[], &[], None).unwrap();
+        service
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                None,
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
         assert!(
             wait_until(|| crate::merge_lock::read_holder(&service.state_dir).is_none()),
             "the settled merge must hand the gate back"
@@ -2318,9 +3256,969 @@ mod tests {
         assert!(
             wait_until(|| matches!(
                 crate::merge_lock::acquire_with_holder(&service.state_dir, "next"),
-                crate::merge_lock::MergeAttempt::Granted(_)
+                Ok(crate::merge_lock::MergeAttempt::Granted(_))
             )),
             "the next project merge must be able to take the gate"
+        );
+    }
+
+    /// 授权合并必须回到**原开发会话**（spec §6.9）。这是本需求的核心：
+    /// 换一个新会话去合并，等于让一个没有上下文的陌生人替卡片收尾。
+    #[test]
+    fn an_implementation_merge_resumes_the_original_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        let before = service.list()["cards"][0]["workdir"].clone();
+        service.merge_request("card-1").unwrap();
+        let resume_caps = caps(&["resume_append"]);
+        let action = service
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(0), &resume_caps)
+            .unwrap()
+            .expect("authorized merge turn");
+        assert!(
+            matches!(action, DriverAction::ResumeAppend {
+                ref thread_id, ref card_id, ..
+            } if thread_id == "thread-1" && card_id == "card-1"),
+            "the merge must resume the card's own thread, got {action:?}"
+        );
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-1"));
+        assert_eq!(
+            service.list()["cards"][0]["workdir"],
+            before,
+            "resuming must not rebind the card to the merge tree"
+        );
+    }
+
+    // ---- Task 6.5:释放与崩溃恢复 ----
+
+    fn attempt_for(
+        card: &str,
+        action: &str,
+        phase: crate::merge_attempt::MergePhase,
+    ) -> crate::merge_attempt::MergeAttemptRecord {
+        crate::merge_attempt::MergeAttemptRecord {
+            version: crate::merge_attempt::ATTEMPT_VERSION,
+            action_id: action.to_string(),
+            card_id: card.to_string(),
+            thread_id: Some("thread-1".to_string()),
+            expected_workdir: PathBuf::from("/dev/tree"),
+            phase,
+            merge_queued_at: None,
+        }
+    }
+
+    #[test]
+    fn merge_recovery_blocks_a_graph_that_was_left_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        // 进程在写完记录、还没收到结果时死掉。
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-1",
+                "act-old",
+                crate::merge_attempt::MergePhase::Pending,
+            ),
+        )
+        .unwrap();
+        let reason = service
+            .recover_merge_attempt_on_startup()
+            .unwrap()
+            .expect("a leftover attempt blocks merges");
+        assert!(reason.contains("card-1"), "{reason}");
+        let record = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.phase, crate::merge_attempt::MergePhase::Uncertain);
+    }
+
+    #[test]
+    fn merge_recovery_does_not_redispatch_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-1",
+                "act-old",
+                crate::merge_attempt::MergePhase::Accepted,
+            ),
+        )
+        .unwrap();
+        service.recover_merge_attempt_on_startup().unwrap();
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]);
+        assert!(
+            action.is_none(),
+            "an unsettled attempt must stop every new merge: {action:?}"
+        );
+    }
+
+    #[test]
+    fn merge_recovery_blocks_on_an_old_holder_without_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        // 旧版:只有 holder,没有 journal。pid 已经死了也不算"工具停了"。
+        std::fs::write(
+            service.state_dir.join("merge.lock.holder"),
+            r#"{"card_id":"card-1","pid":0,"since":"2026-10-01T00:00:00+08:00"}"#,
+        )
+        .unwrap();
+        let reason = service.recover_merge_attempt_on_startup().unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("holder")),
+            "an orphaned holder must block, not be assumed harmless: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn merge_recovery_blocks_on_a_corrupt_record_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        std::fs::write(service.state_dir.join("merge.attempt.json"), b"{").unwrap();
+        assert!(service.recover_merge_attempt_on_startup().is_err());
+        assert!(service.recover_merge_attempt_on_startup().is_err());
+        assert_eq!(
+            std::fs::read(service.state_dir.join("merge.attempt.json")).unwrap(),
+            b"{",
+            "a corrupt record is never silently discarded"
+        );
+    }
+
+    #[test]
+    fn merge_recovery_refuses_without_acknowledging_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-1",
+                "act-old",
+                crate::merge_attempt::MergePhase::Uncertain,
+            ),
+        )
+        .unwrap();
+        let outcome =
+            crate::merge_attempt::recover_offline(&service.state_dir, "card-1", "act-old", false);
+        assert!(
+            outcome.is_err(),
+            "recovery needs an explicit stop confirmation"
+        );
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merge_recovery_requires_the_exact_action_and_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-1",
+                "act-old",
+                crate::merge_attempt::MergePhase::Uncertain,
+            ),
+        )
+        .unwrap();
+        assert!(
+            crate::merge_attempt::recover_offline(&service.state_dir, "card-1", "act-other", true)
+                .is_err(),
+            "a near-miss action id must not clear the record"
+        );
+        assert!(
+            crate::merge_attempt::recover_offline(&service.state_dir, "card-9", "act-old", true)
+                .is_err(),
+            "the wrong card must not clear the record"
+        );
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merge_recovery_refuses_while_the_card_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let action_id = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .unwrap()
+            .action_id;
+        assert_eq!(state_of(&service, "card-1"), "running");
+        let outcome =
+            crate::merge_attempt::recover_offline(&service.state_dir, "card-1", &action_id, true);
+        assert!(
+            outcome.is_err(),
+            "the outcome must be decided before the record is cleared"
+        );
+    }
+
+    #[test]
+    fn merge_recovery_clears_an_unknown_card_after_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        // 卡被 purge 了:记录独立于卡片,所以还在;人核对过就能清。
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-gone",
+                "act-old",
+                crate::merge_attempt::MergePhase::Uncertain,
+            ),
+        )
+        .unwrap();
+        crate::merge_attempt::recover_offline(&service.state_dir, "card-gone", "act-old", true)
+            .unwrap();
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none()
+        );
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_none());
+    }
+
+    #[test]
+    fn merge_recovery_refuses_while_the_daemon_still_holds_the_instance_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-1",
+                "act-old",
+                crate::merge_attempt::MergePhase::Uncertain,
+            ),
+        )
+        .unwrap();
+        let daemon = crate::single_instance::acquire(&service.state_dir).expect("daemon lock");
+        let outcome =
+            crate::merge_attempt::recover_offline(&service.state_dir, "card-1", "act-old", true);
+        assert!(
+            outcome.is_err(),
+            "recovering under a live daemon would race it"
+        );
+        drop(daemon);
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merge_recovery_leaves_a_pending_record_for_the_daemon_to_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let action_id = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .unwrap()
+            .action_id;
+        // 普通 merge-finish 不能清掉一条还没结算的记录。
+        assert_eq!(
+            service.merge_finish("card-1").unwrap(),
+            MergeFinish::Waiting
+        );
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_some()
+        );
+        // 另一张卡调用它:零副作用。
+        assert_eq!(
+            service.merge_finish("card-2").unwrap(),
+            MergeFinish::Waiting
+        );
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_some());
+        let _ = action_id;
+    }
+
+    #[test]
+    fn merge_recovery_lists_the_blocking_record_even_without_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &attempt_for(
+                "card-gone",
+                "act-old",
+                crate::merge_attempt::MergePhase::Uncertain,
+            ),
+        )
+        .unwrap();
+        let listed = service.list();
+        assert_eq!(listed["merge_attempt"]["card_id"], "card-gone");
+        assert_eq!(listed["merge_attempt"]["action_id"], "act-old");
+        assert_eq!(listed["merge_attempt"]["phase"], "uncertain");
+    }
+
+    #[test]
+    fn merge_recovery_reports_a_corrupt_record_through_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        std::fs::write(service.state_dir.join("merge.attempt.json"), b"{").unwrap();
+        let listed = service.list();
+        assert!(
+            listed["merge_blocked_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("corrupt")),
+            "{listed:?}"
+        );
+    }
+
+    // Task 6 的纯判据:五条缺一条就不该放。
+    #[test]
+    fn merge_recovery_release_predicate_needs_every_condition() {
+        use crate::merge_attempt::MergePhase;
+        let idle = ThreadFacts {
+            thread_id: "t".into(),
+            idle: true,
+            alive: true,
+        };
+        let busy = ThreadFacts {
+            thread_id: "t".into(),
+            idle: false,
+            alive: true,
+        };
+        assert!(can_release_merge(
+            &MergePhase::Accepted,
+            false,
+            Some(2),
+            3,
+            true,
+            Some(&idle)
+        ));
+        // pending 结果未回
+        assert!(!can_release_merge(
+            &MergePhase::Accepted,
+            true,
+            Some(2),
+            3,
+            true,
+            Some(&idle)
+        ));
+        // 同一拍:结果生效前带来的 idle 快照不能算
+        assert!(!can_release_merge(
+            &MergePhase::Accepted,
+            false,
+            Some(3),
+            3,
+            true,
+            Some(&idle)
+        ));
+        // 卡还在 running / 绑定变了
+        assert!(!can_release_merge(
+            &MergePhase::Accepted,
+            false,
+            Some(2),
+            3,
+            false,
+            Some(&idle)
+        ));
+        // 会话还忙
+        assert!(!can_release_merge(
+            &MergePhase::Accepted,
+            false,
+            Some(2),
+            3,
+            true,
+            Some(&busy)
+        ));
+        // 缺观测
+        assert!(!can_release_merge(
+            &MergePhase::Accepted,
+            false,
+            Some(2),
+            3,
+            true,
+            None
+        ));
+        // 还没受理
+        assert!(!can_release_merge(
+            &MergePhase::Pending,
+            false,
+            None,
+            3,
+            true,
+            Some(&idle)
+        ));
+        // 已经不确定的地方不自动放
+        assert!(!can_release_merge(
+            &MergePhase::Uncertain,
+            false,
+            Some(2),
+            3,
+            true,
+            Some(&idle)
+        ));
+    }
+
+    // ---- Task 5.5:续跑派发的边界 ----
+
+    fn resume_action(service: &BoardService, threads: &[ThreadFacts]) -> Option<DriverAction> {
+        service
+            .driver_step(threads, &[], Some(0), &caps(&["resume_append"]))
+            .unwrap()
+    }
+
+    fn resume_ok(action_id: &str) -> DriverResult {
+        DriverResult {
+            action_id: action_id.to_string(),
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+            error_code: None,
+        }
+    }
+
+    #[test]
+    fn merge_resume_skips_a_busy_head_and_starts_the_next_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.enqueue_card_for_test("card-2");
+        // card-2 也有自己的开发树与 thread:忙的 card-1 不该挡住它。
+        let id = CardId::new("card-2");
+        let branch = format!("kanban/{}", crate::worktree::slugify(&id));
+        let tree = crate::worktree::ensure_worktree(&project, &id, &branch).unwrap();
+        persist::with_board(&service.state_dir, |board| {
+            board.set_workdir(&id, tree).map_err(|e| e.to_string())?;
+            board
+                .set_thread_id(&id, "thread-2".to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        service
+            .set_state("card-2", CardState::AwaitingMerge, None)
+            .unwrap();
+        service.merge_request("card-1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        service.merge_request("card-2").unwrap();
+        let action = resume_action(
+            &service,
+            &[
+                facts("thread-1", false, true),
+                facts("thread-2", true, true),
+            ],
+        )
+        .expect("the next usable card must start");
+        assert!(
+            matches!(action, DriverAction::ResumeAppend { ref card_id, .. } if card_id == "card-2"),
+            "{action:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+    }
+
+    #[test]
+    fn merge_resume_dispatches_cold_without_any_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        // 缺观测:允许尝试,最终由宿主的 busy 判断兜底。
+        let action = resume_action(&service, &[]).expect("a cold resume must be attempted");
+        assert!(
+            matches!(action, DriverAction::ResumeAppend { ref thread_id, .. } if thread_id == "thread-1"),
+            "{action:?}"
+        );
+    }
+
+    #[test]
+    fn merge_resume_keeps_the_queue_and_explains_when_the_host_cannot_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        // 旧宿主:零能力、零预算。仍然要把原因说清楚,且不派任何动作。
+        let action = service
+            .driver_step(&[facts("thread-1", true, true)], &[], None, &no_caps())
+            .unwrap();
+        assert!(action.is_none(), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        let detail = service.list()["cards"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("resume_append"), "{detail}");
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_none());
+    }
+
+    #[test]
+    fn merge_resume_never_launches_a_replacement_when_the_host_cannot_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        for _ in 0..3 {
+            let action = service
+                .driver_step(&[facts("thread-1", true, true)], &[], Some(0), &no_caps())
+                .unwrap();
+            assert!(action.is_none(), "no fallback to a new session: {action:?}");
+        }
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn merge_resume_sends_the_card_to_you_when_the_binding_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        // 只写 thread、没有 workdir 的卡:绑定不全,不能猜一个目录去恢复。
+        let (service, _source) = service_with_awaiting_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]);
+        assert!(action.is_none(), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "needs_you");
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_none());
+    }
+
+    #[test]
+    fn merge_resume_reuses_an_existing_lease_instead_of_taking_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        peak_of(&service, 1);
+        service.merge_request("card-1").unwrap();
+        // 峰值 1,而这张卡自己的会话已经在跑并占着那一份。
+        // 先取租约再进锁:同一个表达式里锁两次就是自锁。
+        let leases_dir = service.lock().leases_dir.clone().unwrap();
+        let own_lease = crate::lease::acquire_in(&leases_dir, 1).expect("the card's own lease");
+        service
+            .lock()
+            .leases
+            .insert(CardId::new("card-1"), own_lease);
+        let action = resume_action(&service, &[facts("thread-1", true, true)]);
+        assert!(
+            action.is_some(),
+            "an already-leased card must still merge: {action:?}"
+        );
+    }
+
+    #[test]
+    fn merge_resume_writes_the_attempt_before_it_reports_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("expected a resume, got {action:?}");
+        };
+        let record = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .expect("the attempt must be on disk before the action is handed out");
+        assert_eq!(record.action_id, *action_id);
+        assert_eq!(record.card_id, "card-1");
+        assert_eq!(record.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(record.phase, crate::merge_attempt::MergePhase::Pending);
+        assert_eq!(state_of(&service, "card-1"), "running");
+    }
+
+    /// 顺序的**可观测**证明:安全记录写不下去时,卡绝不能已经变成 `Running`。
+    ///
+    /// 把 `merge.attempt.json` 占成一个目录,`save` 的 rename 必然失败。若实现
+    /// 先落 `Running`,这里就会看到一张「在跑但没有记录」的卡——正是 spec §8.1
+    /// 禁止的中间态:重启后没人知道有合并可能已经在飞。
+    #[test]
+    fn merge_resume_does_not_report_running_when_the_attempt_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        // 目录占位:create/rename 都会失败。
+        std::fs::create_dir_all(
+            service
+                .state_dir
+                .join(crate::merge_attempt::ATTEMPT_FILE)
+                .with_extension("json.tmp"),
+        )
+        .unwrap();
+
+        assert!(
+            resume_action(&service, &[facts("thread-1", true, true)]).is_none(),
+            "without a durable attempt no action may be handed out"
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "merge_queued",
+            "a card must not look running when its safety record never landed"
+        );
+        assert!(
+            matches!(crate::merge_attempt::read(&service.state_dir), Ok(None)),
+            "no record may be left behind when the write failed before delivery"
+        );
+    }
+
+    #[test]
+    fn merge_resume_keeps_the_original_queue_time_when_the_session_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let queued_at = service.list()["cards"][0]["merge_queued_at"].clone();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        let busy = DriverResult {
+            action_id: action_id.clone(),
+            ok: false,
+            thread_id: None,
+            error: Some("the session is busy".to_string()),
+            error_code: Some("busy".to_string()),
+        };
+        service
+            .driver_step(
+                &[facts("thread-1", false, true)],
+                &[busy],
+                Some(1),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        assert_eq!(
+            service.list()["cards"][0]["merge_queued_at"],
+            queued_at,
+            "requeueing must keep the original position"
+        );
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none(),
+            "a provably undelivered merge must not keep the gate"
+        );
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_none());
+    }
+
+    #[test]
+    fn merge_resume_does_not_overwrite_a_state_the_model_already_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        // 用户在宿主的 busy 回报之前就把它标成了 done。
+        service.set_state("card-1", CardState::Done, None).unwrap();
+        let busy = DriverResult {
+            action_id: action_id.clone(),
+            ok: false,
+            thread_id: None,
+            error: Some("busy".to_string()),
+            error_code: Some("busy".to_string()),
+        };
+        service
+            .driver_step(&[], &[busy], Some(0), &caps(&["resume_append"]))
+            .unwrap();
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "done",
+            "the user's verdict wins"
+        );
+    }
+
+    #[test]
+    fn merge_resume_success_does_not_write_the_card_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        service.set_state("card-1", CardState::Done, None).unwrap();
+        service
+            .driver_step(
+                &[facts("thread-1", false, true)],
+                &[resume_ok(action_id.as_str())],
+                Some(1),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert_eq!(state_of(&service, "card-1"), "done");
+        let record = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.phase, crate::merge_attempt::MergePhase::Accepted);
+        assert_eq!(
+            record.thread_id.as_deref(),
+            Some("thread-1"),
+            "an accepted merge keeps the card's original session"
+        );
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn merge_resume_treats_an_unknown_failure_code_as_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        let unknown = DriverResult {
+            action_id: action_id.clone(),
+            ok: false,
+            thread_id: None,
+            error: Some("something odd".to_string()),
+            error_code: None,
+        };
+        service
+            .driver_step(&[], &[unknown], Some(0), &caps(&["resume_append"]))
+            .unwrap();
+        let record = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .expect("an unclassified failure must keep the safety gate");
+        assert_eq!(record.phase, crate::merge_attempt::MergePhase::Uncertain);
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_some(),
+            "an uncertain merge must keep the gate"
+        );
+    }
+
+    #[test]
+    fn merge_resume_sends_the_card_to_you_when_the_session_cannot_be_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        let missing = DriverResult {
+            action_id: action_id.clone(),
+            ok: false,
+            thread_id: None,
+            error: Some("no such thread".to_string()),
+            error_code: Some("thread_not_found".to_string()),
+        };
+        service
+            .driver_step(&[], &[missing], Some(0), &caps(&["resume_append"]))
+            .unwrap();
+        assert_eq!(state_of(&service, "card-1"), "needs_you");
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none(),
+            "a binding that cannot come back must not leave a gate behind"
+        );
+        assert!(crate::merge_lock::read_holder(&service.state_dir).is_none());
+    }
+
+    #[test]
+    fn merge_resume_ignores_a_result_that_does_not_match_the_attempt_on_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        // 一份指向别处的"成功"回报:错 thread id 不能把绑定写坏。
+        let wrong_thread = DriverResult {
+            action_id: action_id.clone(),
+            ok: true,
+            thread_id: Some("thread-999".to_string()),
+            error: None,
+            error_code: None,
+        };
+        service
+            .driver_step(&[], &[wrong_thread], Some(0), &caps(&["resume_append"]))
+            .unwrap();
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-1"));
+        let record = crate::merge_attempt::read(&service.state_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.phase, crate::merge_attempt::MergePhase::Uncertain);
+    }
+
+    #[test]
+    fn merge_resume_does_not_settle_a_late_result_for_an_older_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        // 先让 busy 把它干净退队(本次安全记录已 CAS 清掉)。
+        let busy = DriverResult {
+            action_id: action_id.clone(),
+            ok: false,
+            thread_id: None,
+            error: Some("busy".to_string()),
+            error_code: Some("busy".to_string()),
+        };
+        service
+            .driver_step(&[], &[busy], Some(0), &caps(&["resume_append"]))
+            .unwrap();
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none()
+        );
+        // 同一份结果重投一遍:没有 pending 认领它,它绝不能把那次已经结算的
+        // 动作重新变成"已受理"。卡退队后确实可以被下一次派发重新拿下,所以
+        // 这里只断言"没有为旧动作伪造出 Accepted"。
+        service
+            .driver_step(
+                &[],
+                &[resume_ok(action_id.as_str())],
+                Some(0),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        if let Some(record) = crate::merge_attempt::read(&service.state_dir).unwrap() {
+            assert_ne!(
+                record.action_id.as_str(),
+                action_id.as_str(),
+                "a late result must not revive the settled attempt"
+            );
+            assert_eq!(
+                record.phase,
+                crate::merge_attempt::MergePhase::Pending,
+                "a new attempt can only start from pending"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_resume_does_not_dispatch_while_an_attempt_is_still_unsettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        // 记录已在盘上:哪怕卡片回到队列,也不能再派一个合并。
+        service
+            .set_state("card-1", CardState::AwaitingMerge, None)
+            .unwrap();
+        service.merge_request("card-1").unwrap();
+        let again = resume_action(&service, &[facts("thread-1", true, true)]);
+        assert!(
+            again.is_none(),
+            "a project with an unsettled attempt must not start another merge: {again:?}"
+        );
+    }
+
+    /// P7:模型早早写了 `done`,但会话还在跑那个合并回合——名额不能放手。
+    /// 只有"结果之后的**新**一拍里,匹配的 thread 明确 alive 且 idle"才证明它停了。
+    #[test]
+    fn merge_resume_done_while_busy_keeps_the_project_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)])
+            .expect("a merge turn")
+            .to_json();
+        let result = DriverResult {
+            action_id: action["action_id"].as_str().unwrap().to_string(),
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+            error_code: None,
+        };
+        // 模型先写 done,同一拍里回报到达,而观测说会话仍然忙。
+        service.set_state("card-1", CardState::Done, None).unwrap();
+        service
+            .driver_step(
+                &[facts("thread-1", false, true)],
+                &[result],
+                Some(1),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert!(
+            crate::merge_lock::acquire(&service.state_dir).is_none(),
+            "a merge still running must keep the project gate"
+        );
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_some(),
+            "and its safety record"
+        );
+        // 下一拍:会话明确 idle → 记录与门一起归还。
+        service
+            .driver_step(
+                &[facts("thread-1", true, true)],
+                &[],
+                Some(0),
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none(),
+            "an idle, finished card releases the safety record"
+        );
+        assert!(
+            crate::merge_lock::acquire(&service.state_dir).is_some(),
+            "and the project gate becomes acquirable again"
+        );
+    }
+
+    #[test]
+    fn merge_resume_standalone_merge_cards_still_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        git_run(&project, &["branch", "feat/manual"]);
+        // 独立合并卡就是 `add-merge` 投递的那种:没有实现计划,本来就没有
+        // "原会话"可回,所以它必须继续走 `Launch`（spec §6.8）。
+        crate::dispatch::dispatch_with_service(
+            &service,
+            &service.state_dir,
+            None,
+            "enqueue_merge",
+            &json!({ "source": "feat/manual" }),
+        )
+        .unwrap();
+        service.consume_inbox(chrono::Local::now());
+        let delivered = service.list()["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["kind"] == "merge")
+            .and_then(|card| card["id"].as_str().map(str::to_string))
+            .expect("the merge card was delivered");
+        let action = resume_action(&service, &[]).expect("a standalone merge launches");
+        assert!(
+            matches!(action, DriverAction::Launch { ref card_id, .. } if *card_id == delivered),
+            "{action:?}"
         );
     }
 
@@ -2328,8 +4226,7 @@ mod tests {
     fn only_one_merge_starts_per_tick() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         service.enqueue_card_for_test("card-2");
         service
             .set_state("card-2", CardState::AwaitingMerge, None)
@@ -2342,7 +4239,7 @@ mod tests {
             MergeRequest::Queued { position: 1 }
         );
         let _ = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &caps(&["resume_append"]))
             .unwrap()
             .expect("first merge");
         assert_eq!(state_of(&service, "card-2"), "merge_queued");
@@ -2357,8 +4254,16 @@ mod tests {
         git_run(&project, &["branch", &source]);
         service.merge_request("card-1").unwrap();
         let gate = crate::merge_lock::acquire_with_holder(&service.state_dir, "someone-else");
-        assert!(matches!(gate, crate::merge_lock::MergeAttempt::Granted(_)));
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(matches!(
+            gate,
+            Ok(crate::merge_lock::MergeAttempt::Granted(_))
+        ));
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "merge_queued");
         drop(gate);
     }
@@ -2366,19 +4271,35 @@ mod tests {
     /// 合并回合开在**新会话**里，所以旧会话忙不忙都不影响：一张排着队的卡
     /// 不该因为「它原来的会话还在跑」而被无限期压住。
     #[test]
-    fn a_busy_old_session_does_not_block_the_merge_turn() {
+    /// 原会话正忙时**不占门、不改时间**:它的候选地位让给后面那几张,
+    /// 最终由宿主的 busy 判断兜底（spec §6.2）。旧行为是"忙就另起一个会话",
+    /// 那正是这次要修掉的上下文断层。
+    fn a_busy_original_session_does_not_take_the_gate() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
-        let (service, source) = service_with_awaiting_card(&project);
-        git_run(&project, &["branch", &source]);
+        let (service, _source) = service_with_merge_bound_card(&project);
         service.merge_request("card-1").unwrap();
         let action = service
-            .driver_step(&[facts("thread-1", false, true)], &[], None)
-            .unwrap()
-            .expect("a merge turn");
-        let DriverAction::Launch { card_id, .. } = action;
-        assert_eq!(card_id, "card-1");
-        assert_eq!(state_of(&service, "card-1"), "running");
+            .driver_step(
+                &[facts("thread-1", false, true)],
+                &[],
+                None,
+                &caps(&["resume_append"]),
+            )
+            .unwrap();
+        assert!(
+            action.is_none(),
+            "a busy session is not interrupted: {action:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "merge_queued");
+        assert!(
+            crate::merge_lock::read_holder(&service.state_dir).is_none(),
+            "a skipped candidate must not hold the project gate"
+        );
+        assert!(
+            service.list()["cards"][0]["merge_queued_at"].is_string(),
+            "skipping must not rewrite the original queue time"
+        );
     }
 
     #[test]
@@ -2481,9 +4402,12 @@ mod tests {
             objective,
             ..
         } = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
-            .expect("a launch");
+            .expect("a launch")
+        else {
+            panic!("expected a launch");
+        };
         assert_eq!(card_id, "card-1", "队首（order 最小）先走");
         assert!(workdir.join(".git").exists(), "worktree 由插件建好");
         // objective 由插件给出，措辞是契约（宿主不再复刻）。
@@ -2510,7 +4434,7 @@ mod tests {
         let service = service_with_card(&project);
 
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("a launch");
         let value = action.to_json();
@@ -2536,13 +4460,16 @@ mod tests {
         one_slot_only(&service);
 
         let action = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
             .expect("the head launches");
         assert!(matches!(action, DriverAction::Launch { ref card_id, .. } if card_id == "card-1"));
         // 第一张还持着名额（`Launching` 也占租约）→ 第二张不出。
         assert!(
-            service.driver_step(&[], &[], None).unwrap().is_none(),
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none(),
             "no slot -> no launch"
         );
         assert_eq!(state_of(&service, "card-2"), "queued");
@@ -2560,14 +4487,19 @@ mod tests {
 
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[], None)
+                .driver_step(&busy(&["thread-1"]), &[], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
         assert_eq!(state_of(&service, "card-1"), "running", "还忙就不动它");
         // 宿主**完全没报**这台会话（重启后它不记得任何 thread）：状态照旧不动，
         // 只在观测里标 stale——这是展示，不是迁移。
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
         assert_eq!(service.list()["cards"][0]["stale"], true);
     }
@@ -2582,7 +4514,12 @@ mod tests {
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
         let threads = vec![facts("thread-1", true, true)];
-        assert!(service.driver_step(&threads, &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&threads, &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
     }
 
@@ -2594,7 +4531,12 @@ mod tests {
         let service = service_with_card(&project);
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
-        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&[], &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state_of(&service, "card-1"), "running");
     }
 
@@ -2612,12 +4554,17 @@ mod tests {
         service.set_state("card-1", CardState::Done, None).unwrap();
         // 会话仍活着 → 名额继续占着，第二张起不来。
         let threads = vec![facts("thread-1", false, true)];
-        assert!(service.driver_step(&threads, &[], None).unwrap().is_none());
+        assert!(
+            service
+                .driver_step(&threads, &[], None, &no_caps())
+                .unwrap()
+                .is_none()
+        );
         // 会话死了 → 名额归还，第二张起得来。
         let threads = vec![facts("thread-1", false, false)];
         assert!(
             wait_until(|| service
-                .driver_step(&threads, &[], None)
+                .driver_step(&threads, &[], None, &no_caps())
                 .unwrap()
                 .is_some_and(|action| matches!(
                     action,
@@ -2680,11 +4627,11 @@ mod tests {
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
         service
-            .driver_step(&[facts("thread-1", false, true)], &[], None)
+            .driver_step(&[facts("thread-1", false, true)], &[], None, &no_caps())
             .unwrap();
         assert_eq!(service.list()["cards"][0]["stale"], false);
         service
-            .driver_step(&[facts("thread-1", false, false)], &[], None)
+            .driver_step(&[facts("thread-1", false, false)], &[], None, &no_caps())
             .unwrap();
         let card = &service.list()["cards"][0];
         assert_eq!(card["stale"], true);
@@ -2707,9 +4654,12 @@ mod tests {
         let DriverAction::Launch {
             card_id, action_id, ..
         } = service
-            .driver_step(&[], &[], None)
+            .driver_step(&[], &[], None, &no_caps())
             .unwrap()
-            .expect("launch");
+            .expect("launch")
+        else {
+            panic!("expected a launch");
+        };
         // 回报带回 thread id（launch 已把卡置成 running）。
         service
             .driver_step(
@@ -2719,8 +4669,10 @@ mod tests {
                     ok: true,
                     thread_id: Some("thread-1".into()),
                     error: None,
+                    error_code: None,
                 }],
                 None,
+                &no_caps(),
             )
             .unwrap();
         assert_eq!(state_of(&service, &card_id), "running");
@@ -2728,7 +4680,7 @@ mod tests {
         // 会话空闲、模型什么都没写 → 状态不动。
         assert!(
             service
-                .driver_step(&[facts("thread-1", true, true)], &[], None)
+                .driver_step(&[facts("thread-1", true, true)], &[], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
@@ -2753,7 +4705,7 @@ mod tests {
         assert_eq!(state_of(&service, &card_id), "merge_queued");
         // 下一拍：名额空 → daemon 把卡推进到 running 并追一回合（见 promote_merge_queue）。
         match crate::merge_lock::acquire_with_holder(&service.state_dir, &card_id) {
-            crate::merge_lock::MergeAttempt::Granted(lock) => {
+            Ok(crate::merge_lock::MergeAttempt::Granted(lock)) => {
                 service.lock().merge_gate = Some(lock)
             }
             other => panic!("expected Granted, got {other:?}"),
@@ -2775,7 +4727,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
         assert_eq!(state_of(&service, "card-1"), "running");
 
         let result = DriverResult {
@@ -2783,10 +4737,11 @@ mod tests {
             ok: true,
             thread_id: Some("thread-1".to_string()),
             error: None,
+            error_code: None,
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[result], None)
+                .driver_step(&busy(&["thread-1"]), &[result], None, &no_caps())
                 .unwrap()
                 .is_none()
         );
@@ -2806,17 +4761,20 @@ mod tests {
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
         service.enqueue_card_for_test("card-2");
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: false,
             thread_id: None,
             error: Some("worktree not found".to_string()),
+            error_code: None,
         };
         // 同一拍就把名额让出来给队里下一张：失败的启动不是死胡同。
         let next = service
-            .driver_step(&[], &[result], None)
+            .driver_step(&[], &[result], None, &no_caps())
             .unwrap()
             .expect("the freed slot goes to the next card");
         assert!(
@@ -2847,15 +4805,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: false,
             thread_id: None,
             error: None,
+            error_code: None,
         };
-        service.driver_step(&[], &[result], None).unwrap();
+        service
+            .driver_step(&[], &[result], None, &no_caps())
+            .unwrap();
 
         assert_eq!(state_of(&service, "card-1"), "failed");
         assert_eq!(
@@ -2912,17 +4875,25 @@ mod tests {
         let service = service_with_card(&project);
         service.enqueue_card_for_test("card-2");
         one_slot_only(&service);
-        let DriverAction::Launch { action_id, .. } = launched(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            panic!("expected a launch");
+        };
 
         let result = DriverResult {
             action_id,
             ok: true,
             thread_id: Some("thread-1".to_string()),
             error: None,
+            error_code: None,
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
+                .driver_step(
+                    &busy(&["thread-1"]),
+                    std::slice::from_ref(&result),
+                    None,
+                    &no_caps()
+                )
                 .unwrap()
                 .is_none()
         );
@@ -2930,7 +4901,12 @@ mod tests {
         // 重复投递：不报错、不改状态、不多占一个名额。
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
+                .driver_step(
+                    &busy(&["thread-1"]),
+                    std::slice::from_ref(&result),
+                    None,
+                    &no_caps()
+                )
                 .unwrap()
                 .is_none()
         );
@@ -3049,6 +5025,117 @@ mod tests {
 
         // 「无事可做」的契约形状：`{"action": null}`。
         assert_eq!(answers["nothing"], serde_json::json!({ "action": null }));
+    }
+
+    /// `resume_append` 的线上形状同样是契约：宿主 `parse_action` 认的就是这几个
+    /// 键（`thread_id` / `workdir` / `objective` / `env`）。尤其 `card_id` 是插件
+    /// 内部记账键，**绝不能**出现在 JSON 里——宿主不认识看板。
+    #[test]
+    fn the_driver_contract_resume_append_matches_what_the_plugin_emits() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let expected = &contract["answers"]["resume_append"];
+
+        let action = DriverAction::ResumeAppend {
+            action_id: "act-resume".to_string(),
+            card_id: "card-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            workdir: PathBuf::from("/w/card"),
+            objective: "merge authorized".to_string(),
+            env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+        };
+        assert_eq!(
+            action.to_json(),
+            *expected,
+            "resume_append 的线上形状必须与契约逐字段一致"
+        );
+        assert!(
+            action.to_json().get("card_id").is_none(),
+            "card_id 是插件内部记账键，不能外泄给宿主：{}",
+            action.to_json()
+        );
+
+        // 两端同一份 JSON：宿主的 `resume_append_is_a_distinct_action` 断言的是
+        // 同一组字段值（thread_id/workdir/objective/env）。
+        assert_eq!(expected["thread_id"], "thread-1");
+        assert_eq!(expected["workdir"], "/w/card");
+        assert_eq!(expected["objective"], "merge authorized");
+    }
+
+    /// 契约里声明的能力列表就是插件认的那几个动作名：宿主少报/多报都会让调度
+    /// 做出错误决定（永远排队，或派一个执行不了的动作）。
+    #[test]
+    fn the_driver_contract_declares_the_actions_the_plugin_understands() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let actions = contract["request"]["capabilities"]["actions"]
+            .as_array()
+            .expect("契约必须钉住 capabilities.actions");
+        let names: Vec<&str> = actions
+            .iter()
+            .map(|action| action.as_str().expect("能力名必须是字符串"))
+            .collect();
+        assert_eq!(names, vec!["launch", "append", "resume_append"]);
+
+        let capabilities = caps(&names);
+        assert!(capabilities.supports("resume_append"));
+        assert!(capabilities.supports("launch"));
+        assert!(!capabilities.supports("rebase"));
+    }
+
+    /// **缺能力就当不支持**：旧宿主不发表格时，默认值必须是空集。默认成「全都
+    /// 支持」会让插件派出宿主执行不了的动作，最后卡在不确定状态。
+    #[test]
+    fn a_host_that_declares_no_capabilities_supports_nothing() {
+        let capabilities = DriverCapabilities::default();
+        assert!(capabilities.actions.is_empty());
+        assert!(!capabilities.supports("launch"));
+        assert!(!capabilities.supports("append"));
+        assert!(!capabilities.supports("resume_append"));
+    }
+
+    /// 能力名是精确匹配：大小写或前缀不同的名字不能被当成同一个动作。
+    #[test]
+    fn capabilities_are_matched_exactly() {
+        let capabilities = &caps(&["resume_append"]);
+        assert!(capabilities.supports("resume_append"));
+        assert!(!capabilities.supports("Resume_Append"));
+        assert!(!capabilities.supports("resume"));
+        assert!(!capabilities.supports("resume_append "));
+    }
+
+    /// 旧宿主回报的 `results[]` 没有 `error_code`：必须默认为 `None`（= 未归类），
+    /// 而不是反序列化失败——回报丢了比回报形状旧要贵得多。
+    #[test]
+    fn an_old_result_without_error_code_defaults_to_none() {
+        let old = serde_json::json!({
+            "action_id": "act-1",
+            "ok": false,
+            "thread_id": null,
+            "error": "boom"
+        });
+        let result: DriverResult = serde_json::from_value(old).expect("旧形状必须仍可解析");
+        assert_eq!(result.error_code, None);
+
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let failure: DriverResult =
+            serde_json::from_value(contract["results"]["failure"].clone()).expect("契约失败样例");
+        assert_eq!(failure.error_code.as_deref(), Some("busy"));
+    }
+
+    /// `capabilities` 真的从 `driver/next` 的参数进了调度：解析出的集合与参数
+    /// 一致，缺字段时为空集（不是「全都支持」）。
+    #[test]
+    fn driver_next_reads_capabilities_from_the_request() {
+        let params = serde_json::json!({
+            "threads": [], "results": [], "sessions": { "running": 0 },
+            "capabilities": { "actions": ["launch", "resume_append"] }
+        });
+        let capabilities = crate::dispatch::parse_capabilities(&params);
+        assert_eq!(capabilities.actions, vec!["launch", "resume_append"]);
+        assert!(capabilities.supports("resume_append"));
+
+        let old = serde_json::json!({ "threads": [], "results": [] });
+        let capabilities = crate::dispatch::parse_capabilities(&old);
+        assert!(capabilities.actions.is_empty(), "缺字段必须按不支持处理");
     }
 }
 

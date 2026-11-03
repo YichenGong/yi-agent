@@ -75,10 +75,28 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 ```
 
 ## 命令行
-`superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest>`——`run` 是 daemon 守护的推进循环，
+`superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|merge-cancel|done|state|archive|purge|list|on|off|workdir|manifest>`——`run` 是 daemon 守护的推进循环，
 其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根；`manifest` 把本二进制的
 监督清单打到 stdout（宿主 `plugin/install` 读它，不写盘）。
-`run` 每 tick 除消费看板投递外，还会认领一张待合并卡并执行合并（本项目同一时刻只有一张）。
+
+`run` 每 tick 除消费看板投递外，还会推进一张待合并卡（本项目同一时刻只有一张）。
+**合并不是新开一个会话去做**：daemon 排到那张卡后，会把合并这一轮送回**这张卡自己的
+开发会话**（`thread_id` 不变、开发 worktree 不变）。会话还在内存里就直接追加一轮；
+进程重启过就按原 `thread_id` 与开发 worktree 的持久历史**冷恢复**。恢复不了（开发树
+被删、日志损坏、锁被别的进程占着）时卡片转 `needs_you` 并附原因，**不会**换成另一个
+会话继续合并。
+
+合并轮自己声明结果：成功 `state <card-id> done`，冲突解决不了 `state <card-id> needs_you`。
+名额由 daemon 释放——要等到这一轮的结果已回报、且那个会话在**之后**的一拍被观测为空闲。
+
+`merge-cancel <card-id>` 只对 `merge_queued` 的卡成立，把它退回 `awaiting_merge` 并离开
+队列；已经开跑的合并不能取消。`state <card-id> <state> [--detail <text>]` 是模型的声明
+通路，会话里也可用 `--self`（卡号取自 `SUPERPOWERS_KANBAN_CARD`）；合并轮的提示词给出的
+是显式卡号加绝对 `--state-dir`，不依赖 `--self`。
+
+`list` 还会在末尾打印未结算的合并安全记录（`merge attempt <action-id> phase <phase> for
+<card-id>`），离线恢复要用的就是这里的 action id；记录损坏时打印
+`merge attempt UNREADABLE: …` 而不是当成没有记录。
 
 `done <card-id>` 把一张 `awaiting_merge` 的卡结算为 `done`（人工合并后的登记通路，会核对
 推导出的 `kanban/<slug>` 分支是否已并入默认分支并如实打印 `verified` / `branch-missing` /

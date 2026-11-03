@@ -11,7 +11,8 @@ description: "Use when the user works with the Superpowers kanban board instead 
 - **前植入队**——需求已定、两份文件还没写，先 `add-prequeued <title>` 记一张预排队卡
   （最左 `PRE-QUEUED` 列，不占并发槽、不会被起会话），等文件写好再
   `promote <card-id> <spec> <plan>`；
-- **合并**——实现卡跑完后会在原会话里申请名额，由你在名额给的 worktree 里执行合并；
+- **合并**——实现卡跑完后由用户确认、排进合并队列；**daemon 排到那张卡时会把合并
+  这一轮送回这张卡的开发会话**（同一个会话、同一段上下文），不是另起一个会话；
 - **收尾**——合并已落地后 `done` 登记，`archive` / `purge` 隐藏或删除。
 
 看板是一个独立插件：装了就可用，卸了就消失。
@@ -166,8 +167,15 @@ superpowers-kanban promote <card-id> <spec> <plan> [--title "<新标题>"]
    - 打印 `queued` + `position: N` → 告诉用户「已排队，前面还有 N 张」。
    - 报 `denied: …` 原样转述，**不要猜、不要绕**。
 
-   **这一步只是排队，不会立刻开跑。** 本项目同一时刻只跑一个合并；排到队时
-   daemon 会**新开一轮合并会话**去做 `git merge`，不需要你在这个会话里动手。
+   **这一步只是排队，不会立刻开跑。** 本项目同一时刻只跑一个合并。排到队时
+   daemon 会把合并这一轮送回**这张卡自己的开发会话**（`thread_id` 不变），由那个
+   会话里的模型执行合并；**不会**另起一个新会话去顶替它。
+
+   这意味着两件事：
+   - 合并轮的上下文就是这个会话的历史，模型不需要重新了解"这是什么卡、做到哪了"；
+   - 如果那个会话已经不在内存里（进程重启过），宿主会按原 `thread_id` 与开发
+     worktree 的持久历史**冷恢复**它。恢复失败（开发树被删、日志损坏、锁被别的
+     进程占着）时卡片转 `needs_you`，**不会**退化成"换一个会话继续合并"。
 
 2. **用户反悔时退队**：
 
@@ -178,11 +186,17 @@ superpowers-kanban promote <card-id> <spec> <plan> [--title "<新标题>"]
    只在 `merge_queued` 上成立，退回 `awaiting_merge`。卡已经排到队、合并回合
    开跑之后就不能退了——那会与一轮在跑的合并打架。
 
-那轮合并会话拿到的是**已持有**的合并名额，它按自己的提示词合并，然后自己
-`state --self done`（成功）或 `needs_you`（冲突解决不了）。**它一离开 `running`，
-daemon 下一拍就把名额还回去**——名额是 daemon 进程里的 `flock`，别的进程放不掉，
-所以那句 `merge-finish` 在回合里只会回 `cleared`，写不写都不影响。
-**你不要**替它判断成败，也不要在原会话里再跑一遍 `git merge`。
+那轮合并拿到的是**已持有**的合并名额，它按 daemon 给出的提示词合并，然后由模型
+自己声明结果：`state <card-id> done`（成功）或 `state <card-id> needs_you`
+（冲突解决不了）。注意合并轮的提示词用的是**显式卡号 + 绝对 `--state-dir`**，
+不依赖 `--self`——冷恢复出来的会话不一定有 `SUPERPOWERS_KANBAN_CARD`。
+
+释放名额的是 **daemon**，不是会话：它要看到「这一轮的结果已经回报、并且那个会话
+在**之后**的一拍被观测为空闲」才放门。名额是 daemon 进程里的 `flock`，别的进程
+放不掉，所以会话里那句 `merge-finish` 只会回 `cleared`，写不写都不影响，
+合并轮的提示词也明确要求**不要**调用它。
+
+**你不要**替它判断成败，也不要在别的会话里再跑一遍 `git merge`。
 
 **绝不绕过名额直接 `git merge`。** 名额（每项目一把 `merge.lock`）由 daemon 在
 开跑那一拍拿到，绕过去就会两条分支同改主检出。
@@ -299,8 +313,8 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 裁决顺序：
 
 1. 会话跑的是**看板卡片的 worktree**（路径含 `.worktrees/kanban/…`）→ 走 §2b：
-   用户确认后 `merge-request` 入队，等 daemon 开合并回合去合并；
-   你自己**不**执行 `git merge`。
+   用户确认后 `merge-request` 入队；daemon 排到后会**回到这个会话**再执行合并。
+   **你自己**（这一轮）不执行 `git merge`。
 2. 用户明确要在看板之外手工合并 → 让用户自己执行，再走 §4 的 `done` 登记。
 3. 不涉及看板卡片的普通分支 → 按 `finishing-a-development-branch` 走，本 skill 不插手。
 
@@ -324,6 +338,7 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 | `card <id> is not pre-queued (state: <State>)` | 卡已被提升过或根本不是预排队卡 | 如实回报状态，不要重试 |
 | `card <id> is <State>, not awaiting_merge` | `done` 用错了状态 | 让用户确认卡是否真的合并完 |
 | `busy: another merge is running…` | 本项目已有合并在跑 | 告诉用户排队中，等用户再说一次 |
+| `等待恢复` / 卡转 `needs_you` 且 detail 提到 `could not be resumed` | 原开发会话无法冷恢复（开发树被删、日志损坏、锁被占） | 让用户按 INSTALL 的「人工恢复」处理；**不要**另开一张卡或新开会话重跑 |
 | `denied: …` | 名额准入拒绝 | 原样转述原因，不要绕过 |
 | `illegal transition: <A> -> <B>` | `archive`/`purge` 的前提不满足 | 按 §4 的顺序处理（先归档再 purge） |
 | `list` 长时间只有 `pending` | 插件进程没跑，或开关是关的 | 先用 `on` 打开开关；仍不动则查插件是否在运行 |

@@ -481,6 +481,8 @@ mod plugin_query_tests;
 #[cfg(test)]
 mod plugins_tests;
 
+mod driver_resume;
+
 #[cfg(test)]
 mod session_driver_tests;
 

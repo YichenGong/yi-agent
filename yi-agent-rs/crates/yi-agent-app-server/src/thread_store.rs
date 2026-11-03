@@ -252,6 +252,7 @@ pub struct PartialTurn {
 }
 
 /// `load` 的结果:meta + 拼接后的 items + 最后一条记录的 messages/usage。
+#[derive(Debug)]
 pub struct LoadedThread {
     pub meta: ThreadMeta,
     pub items: Vec<Item>,
@@ -604,6 +605,217 @@ impl ThreadStore {
     fn partial_is_committed(partial: &PartialTurn, log_items: &[Item]) -> bool {
         let first = partial.items.first().and_then(crate::server::item_id);
         Self::log_contains_item_id(log_items, first)
+    }
+
+    /// 严格读一次，供驱动侧「恢复原会话」使用（spec §7）。
+    ///
+    /// 与 [`Self::load`] 的区别是**一处都不吞错**：meta 缺失/损坏、ID 或 cwd 与
+    /// 期望不符、日志坏行、partial 损坏，全部返回错误。为什么必须这么严：调用方
+    /// 要用它恢复一个**真实发生过**的会话并继续合并，一份被静默拼错的历史会让
+    /// 模型在失忆状态下操作仓库；宁可阻塞让人来处理。
+    ///
+    /// 调用方**必须**先持有 `acquire_thread_lock(store.root(), id)` 返回的锁——本方法
+    /// 不重复抢锁（同进程会拿到同一把 `Arc`，但跨进程的意义在调用方那一侧）。
+    ///
+    /// 语义边界（与 spec §7 逐条对齐）：
+    /// - 三个文件都不存在 ⇒ `Ok(None)`（这个会话根本没落过盘）。
+    /// - meta 存在且合法、log 合法为空 ⇒ 空历史可恢复（合法的空会话）。
+    /// - 只有 meta、没有 log 也没有可采纳的 partial ⇒ 拒绝：这包括用户 `/clear`
+    ///   后的 meta-only 冷会话，不能拿失忆上下文去合并。
+    /// - 有非空 items 却没有可恢复的 messages ⇒ 拒绝：那不是「合法空历史」，
+    ///   而是旧记录丢了上下文，续跑会比阻塞更糟。
+    /// - 坏 partial 即使主日志完好也拒绝：partial 可能是那一轮唯一的副本，
+    ///   静默丢掉等于丢数据。
+    ///
+    /// 失败时不改写任何文件——测试用 `std::fs::read` 逐字节验证过。
+    pub fn restore_for_driver(
+        &self,
+        id: &str,
+        expected_cwd: &Path,
+    ) -> io::Result<Option<LoadedThread>> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let meta_path = self.meta_path(id);
+        let log_path = self.log_path(id);
+        let partial_path = self.partial_path(id);
+
+        let meta_text = read_optional_text(&meta_path)?;
+        let log_text = read_optional_text(&log_path)?;
+        let partial_text = read_optional_text(&partial_path)?;
+
+        // 三个文件都没有：这个会话从未落过盘。
+        if meta_text.is_none() && log_text.is_none() && partial_text.is_none() {
+            return Ok(None);
+        }
+
+        // meta 必须存在且可解析：没有它就没有模型、cwd、权限、关联根等恢复材料，
+        // 用 `rebuild_meta` 猜一份等于换了个会话。
+        let meta_text = meta_text.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("thread {id} has history but no meta file"),
+            )
+        })?;
+        let meta: ThreadMeta = serde_json::from_str(&meta_text).map_err(io_err)?;
+        if meta.thread_id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "thread {id} meta names a different thread: {:?}",
+                    meta.thread_id
+                ),
+            ));
+        }
+
+        // cwd 必须精确对上（canonical 比较：同一个目录可以有尾斜杠等不同写法）。
+        // 对不上的话恢复出来的会话会在错误的仓库里干活——比不恢复危险得多。
+        let want = canonical_or_self(expected_cwd);
+        let got = canonical_or_self(Path::new(&meta.cwd));
+        if want != got {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "thread {id} lives in {} but was requested for {}",
+                    meta.cwd,
+                    expected_cwd.display()
+                ),
+            ));
+        }
+
+        // 日志：坏行不跳过（宽松入口才跳），逐行严格解析。
+        let mut items: Vec<Item> = Vec::new();
+        let mut messages: Vec<Message> = Vec::new();
+        let mut usage: Option<TurnUsage> = None;
+        let mut totals = UsageTotals::default();
+        if let Some(text) = &log_text {
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let turn: TurnLine = serde_json::from_str(line).map_err(io_err)?;
+                match turn {
+                    TurnLine::Turn {
+                        items: turn_items,
+                        usage: turn_usage,
+                        usage_total: turn_total,
+                        messages: turn_messages,
+                    } => {
+                        items.extend(turn_items);
+                        if !turn_messages.is_empty() {
+                            messages = turn_messages;
+                        }
+                        if let Some(total) = &turn_total {
+                            totals.add_turn_usage(total);
+                        } else if let Some(last) = &turn_usage {
+                            totals.add_turn_usage(last);
+                        }
+                        if turn_usage.is_some() {
+                            usage = turn_usage;
+                        }
+                    }
+                }
+            }
+        }
+
+        // partial：存在就必须是合法的，而且要先可靠升格，再交出新 turn。
+        let mut pending_turn = false;
+        if let Some(text) = &partial_text {
+            let partial: PartialTurn = serde_json::from_str(text).map_err(io_err)?;
+            if !partial.items.is_empty() {
+                // 升格（append 主日志 + 清 partial）。先算是否已收尾：
+                // 已收尾只清 partial，绝不重复 append。
+                let committed = Self::partial_is_committed(&partial, &items);
+                if !committed {
+                    for item in partial.items {
+                        // 防御性去重：正常不与已落盘 items 重叠。
+                        if !items
+                            .iter()
+                            .any(|it| crate::server::item_id(it) == crate::server::item_id(&item))
+                        {
+                            items.push(item);
+                        }
+                    }
+                    if !partial.messages.is_empty() {
+                        messages = partial.messages;
+                    }
+                    if let Some(total) = &partial.usage_total {
+                        totals.add_turn_usage(total);
+                    } else if let Some(last) = &partial.usage {
+                        totals.add_turn_usage(last);
+                    }
+                    if partial.usage.is_some() {
+                        usage = partial.usage;
+                    }
+                    pending_turn = true;
+                }
+                self.promote_partial_strict(id, committed)?;
+            }
+        }
+
+        // meta-only（没有 log、没有可采纳的 partial）拒绝：`/clear` 后的冷会话
+        // 正属此列，失忆续跑比让用户人工处理更危险。
+        if log_text.is_none() && items.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("thread {id} has only meta and no restorable history"),
+            ));
+        }
+        // 有内容却没有任何可恢复的 messages：旧记录丢了上下文。空 log（合法空会话）
+        // 不受影响，因为那时 items 本来就是空的。
+        if !items.is_empty() && messages.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("thread {id} has items but no restorable messages"),
+            ));
+        }
+
+        Ok(Some(LoadedThread {
+            meta,
+            items,
+            messages,
+            usage,
+            totals,
+            pending_turn,
+        }))
+    }
+
+    /// partial 的严格升格：append 成功才清；append 失败保留 partial 并报错。
+    ///
+    /// `committed` 由调用方用**严格读出的**主日志 items 经
+    /// [`Self::partial_is_committed`] 算好传入。刻意不在本函数里重读：宽松的
+    /// [`Self::read_log`] 会吞掉坏行，用它判断「这轮是否已 append」正是严格入口
+    /// 不该做的推断（spec §7「严格读取必须返回真实错误，不 validate 后再调宽松
+    /// load」）。判据本身仍与宽松入口共用，故两边语义不会漂移。
+    ///
+    /// 幂等：`committed == true`（该轮已进主日志，只是上次清 partial 失败）时只
+    /// 再清一次，绝不重复 append。
+    fn promote_partial_strict(&self, id: &str, committed: bool) -> io::Result<()> {
+        let Some(partial) = self.read_partial_strict(id)? else {
+            return Ok(());
+        };
+        if partial.items.is_empty() || committed {
+            return self.clear_partial(id);
+        }
+        self.append_turn(
+            id,
+            &TurnLine::Turn {
+                items: partial.items,
+                usage: partial.usage,
+                usage_total: partial.usage_total,
+                messages: partial.messages,
+            },
+        )?;
+        // append 成功才清；clear 失败时返回错误，调用方不得投递新轮。
+        self.clear_partial(id)
+    }
+
+    /// 严格读 partial：只有「文件不存在」才返回 `None`，损坏/不可读都是错误。
+    fn read_partial_strict(&self, id: &str) -> io::Result<Option<PartialTurn>> {
+        match read_optional_text(&self.partial_path(id))? {
+            Some(text) => serde_json::from_str(&text).map(Some).map_err(io_err),
+            None => Ok(None),
+        }
     }
 
     pub fn load(&self, id: &str) -> io::Result<Option<LoadedThread>> {
@@ -1218,8 +1430,34 @@ impl ThreadStore {
     }
 }
 
+/// 读一个可选文件：只有 `NotFound` 是「没有」，其余 I/O 错误一律上抛。
+///
+/// 宽松入口（`read_partial` / `read_log`）用 `.ok()` 把读错压成「没有」；恢复
+/// 原会话不能这样——「读不了」和「不存在」在恢复语义下是相反的结论。
+fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// canonical 比较用：路径不存在或不可 canonical 时退回原样，好让比较仍然确定。
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// 该串是否可能是一个 thread id。
+///
+/// 驱动侧在校验 `resume_append` 的绑定时要用它:一个明显不是 id 的串该报
+/// `ThreadNotFound`(插件的绑定坏了),而不是等到严格读才以 I/O 错误出现,
+/// 那样插件只能按「不确定」处理。
+pub(crate) fn is_valid_thread_id(id: &str) -> bool {
+    valid_id(id)
 }
 
 /// Generated ids look like `thread-<uuid>`; allow only a conservative charset so
@@ -1467,6 +1705,29 @@ fn process_locks() -> &'static LockTable {
     PROCESS_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// 把 `flock` 失败分类成「被占用」或「真故障」。
+///
+/// 单独成函数是为了能被**直接测试**：真实路径上的非 Busy 错误（EBADF 之类）
+/// 在进程里很难自然制造，而"打印后放行"正是要根除的行为——没有这条可直接驱动
+/// 的分类函数，就只能靠测文件 open 失败来假装覆盖，那条路根本走不到 flock。
+fn classify_flock_error(error: std::io::Error, thread_id: &str, path: &Path) -> ThreadLockError {
+    if matches!(
+        error.raw_os_error(),
+        Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN
+    ) {
+        return ThreadLockError::Busy(ThreadBusy {
+            thread_id: thread_id.to_string(),
+        });
+    }
+    // 真故障（坏描述符 / 不支持的 fs）不能被误报成「会话被占用」，也**不能
+    // 当作拿到锁放行**：放行等于两个进程同时写同一份历史。上抛 `Io`，由调用方
+    // 决定降级（原 RPC 调用者的选择不变，driver 恢复路径则必须失败）。
+    ThreadLockError::Io(std::io::Error::new(
+        error.kind(),
+        format!("flock failed on {}: {error}", path.display()),
+    ))
+}
+
 /// 取某个 thread 的写锁。进程内幂等（同一路径返回同一个 `Arc`）。
 ///
 /// 非阻塞：冲突立即返回 [`ThreadBusy`]，调用方决定是报错还是提示 `fork`。
@@ -1498,18 +1759,11 @@ pub fn acquire_thread_lock(
 
     let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if outcome != 0 {
-        let error = std::io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN
-        ) {
-            return Err(ThreadLockError::Busy(ThreadBusy {
-                thread_id: thread_id.to_string(),
-            }));
-        }
-        // 真故障（坏描述符 / 不支持的 fs）不能被误报成「会话被占用」，
-        // 否则用户永远查不出原因。这里退化为放行并记账，由调用方的 IO 错误暴露。
-        eprintln!("[thread_store] flock failed on {}: {error}", path.display());
+        return Err(classify_flock_error(
+            std::io::Error::last_os_error(),
+            thread_id,
+            &path,
+        ));
     }
 
     let lock = Arc::new(ThreadWriterLock {
@@ -1568,6 +1822,365 @@ mod tests {
             usage_total: None,
             messages,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // 严格恢复（`restore_for_driver`）：驱动侧恢复原会话的唯一入口。
+    // 每一条都断言「失败时不改写文件」，因为静默损坏比报错更难查。
+    // -----------------------------------------------------------------
+
+    fn restore_user_item(id: &str, text: &str) -> Item {
+        Item::UserMessage {
+            id: id.into(),
+            text: text.into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn dir_meta(id: &str, cwd: &Path) -> ThreadMeta {
+        let mut meta = meta(id);
+        meta.cwd = cwd.to_string_lossy().into_owned();
+        meta
+    }
+
+    fn write_meta(s: &ThreadStore, m: &ThreadMeta) {
+        write_file(
+            &s.meta_path(&m.thread_id),
+            serde_json::to_vec(m).unwrap().as_slice(),
+        );
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_corrupt_log_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        std::fs::create_dir_all(store.root()).unwrap();
+        let bad = b"not-json\n";
+        std::fs::write(store.log_path("thread-1"), bad).unwrap();
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+        assert_eq!(std::fs::read(store.log_path("thread-1")).unwrap(), bad);
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_corrupt_log_even_when_meta_is_good() {
+        // 关键：meta 合法，坏的是日志。若没有这条，上面那条可能只因「缺 meta」
+        // 就通过，等于没测到坏日志。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        let bad = b"{\"type\":\"turn\",\"items\":[]}\nnot-json\n";
+        write_file(&store.log_path("thread-1"), bad);
+        let error = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(store.log_path("thread-1")).unwrap(), bad);
+    }
+
+    #[test]
+    fn driver_restore_returns_none_when_nothing_was_ever_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        assert!(
+            store
+                .restore_for_driver("thread-1", dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn driver_restore_accepts_a_legitimately_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        let loaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .expect("empty log with meta is a legitimate fresh session");
+        assert!(loaded.items.is_empty());
+        assert!(!loaded.pending_turn);
+    }
+
+    #[test]
+    fn driver_restore_round_trips_items_messages_and_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        store
+            .append_turn(
+                "thread-1",
+                &turn(
+                    vec![restore_user_item("user-turn-1", "hi")],
+                    vec![Message::user("hi")],
+                ),
+            )
+            .unwrap();
+        let loaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.meta.thread_id, "thread-1");
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(loaded.messages, vec![Message::user("hi")]);
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_missing_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_file(
+            &store.log_path("thread-1"),
+            br#"{"type":"turn","items":[],"messages":[]}
+"#,
+        );
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_corrupt_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_file(&store.meta_path("thread-1"), b"{");
+        write_file(&store.log_path("thread-1"), b"");
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_meta_for_a_different_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-2", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_cwd_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_meta(&store, &dir_meta("thread-1", &other));
+        write_file(&store.log_path("thread-1"), b"");
+        let error = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn driver_restore_rejects_meta_only_sessions() {
+        // 用户 `/clear` 之后的冷会话正是这个形状：身份还在、历史没了。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_rejects_items_without_restorable_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        // 有 item、没有 messages：旧记录丢了上下文。
+        store
+            .append_turn(
+                "thread-1",
+                &turn(vec![restore_user_item("user-1", "hi")], vec![]),
+            )
+            .unwrap();
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_accepts_a_valid_partial_only_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        store
+            .write_partial(
+                "thread-1",
+                &PartialTurn {
+                    turn_id: "t1".into(),
+                    items: vec![restore_user_item("user-t1", "hi")],
+                    messages: vec![Message::user("hi")],
+                    usage: None,
+                    usage_total: None,
+                },
+            )
+            .unwrap();
+
+        let loaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(loaded.pending_turn, "recovered turn must be flagged");
+        assert_eq!(loaded.messages, vec![Message::user("hi")]);
+        // 升格后主日志里有了这一轮，partial 已清。
+        assert!(!store.partial_path("thread-1").exists());
+        let reloaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(!reloaded.pending_turn, "second read must not re-append");
+        assert_eq!(
+            std::fs::read_to_string(store.log_path("thread-1"))
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "promotion must be idempotent"
+        );
+    }
+
+    #[test]
+    fn driver_restore_rejects_a_corrupt_partial_even_with_a_good_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        store
+            .append_turn(
+                "thread-1",
+                &turn(
+                    vec![restore_user_item("user-1", "hi")],
+                    vec![Message::user("hi")],
+                ),
+            )
+            .unwrap();
+        let bad = b"{ not json";
+        write_file(&store.partial_path("thread-1"), bad);
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+        assert_eq!(std::fs::read(store.partial_path("thread-1")).unwrap(), bad);
+    }
+
+    #[test]
+    fn driver_restore_does_not_deliver_when_promotion_cannot_clear_the_partial() {
+        // 让 clear 失败：把 partial 路径换成目录。此时 append 已成功但清不掉
+        // checkpoint，必须报错（调用方不得投递新轮）。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        let partial = store.partial_path("thread-1");
+        std::fs::create_dir_all(&partial).unwrap();
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+    }
+
+    #[test]
+    fn driver_restore_does_not_duplicate_the_append_when_only_the_clear_failed() {
+        // 计划要求的那条精确路径：**append 成功、clear 失败**。用 immutable 位让
+        // 删除失败（与「partial 是目录」不同，那种在 append 之前就失败了）。
+        // 关键断言是重试幂等：第二次读必须认出「这轮已进主日志」，不再 append。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        write_file(&store.log_path("thread-1"), b"");
+        store
+            .write_partial(
+                "thread-1",
+                &PartialTurn {
+                    turn_id: "t1".into(),
+                    items: vec![restore_user_item("user-t1", "hi")],
+                    messages: vec![Message::user("hi")],
+                    usage: None,
+                    usage_total: None,
+                },
+            )
+            .unwrap();
+
+        let partial = store.partial_path("thread-1");
+        let c = std::ffi::CString::new(partial.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::chflags(c.as_ptr(), libc::UF_IMMUTABLE) },
+            0,
+            "the test needs the partial to resist deletion"
+        );
+
+        let error = store
+            .restore_for_driver("thread-1", dir.path())
+            .expect_err("a clear that cannot happen must be an error");
+        assert!(
+            partial.exists(),
+            "the checkpoint must survive a failed clear: {error}"
+        );
+        // append 确实发生了：主日志现在有整整一轮。
+        assert_eq!(
+            std::fs::read_to_string(store.log_path("thread-1"))
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "the turn must have been promoted before the clear failed"
+        );
+
+        // 放开不可变位后重试：判据命中「已收尾」⇒ 只清 partial，绝不重复 append。
+        assert_eq!(
+            unsafe { libc::chflags(c.as_ptr(), 0) },
+            0,
+            "the test must restore the partial"
+        );
+        let reloaded = store
+            .restore_for_driver("thread-1", dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !partial.exists(),
+            "the retry must finally clear the checkpoint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.log_path("thread-1"))
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "a retry must never append the same turn twice"
+        );
+        // 第一次读采纳了真实内容（pending_turn 标记它曾是未收尾轮）。
+        assert!(reloaded.messages.iter().any(|m| m == &Message::user("hi")));
+    }
+
+    #[test]
+    fn driver_restore_leaves_the_partial_when_the_append_fails() {
+        // append 失败（主日志路径是个目录）时，partial 是这一轮唯一的副本，
+        // 必须原样留着：既不清、也不报成功。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        write_meta(&store, &dir_meta("thread-1", dir.path()));
+        std::fs::create_dir_all(store.log_path("thread-1")).unwrap();
+        store
+            .write_partial(
+                "thread-1",
+                &PartialTurn {
+                    turn_id: "t1".into(),
+                    items: vec![restore_user_item("user-t1", "hi")],
+                    messages: vec![Message::user("hi")],
+                    usage: None,
+                    usage_total: None,
+                },
+            )
+            .unwrap();
+        let before = std::fs::read(store.partial_path("thread-1")).unwrap();
+
+        assert!(store.restore_for_driver("thread-1", dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(store.partial_path("thread-1")).unwrap(),
+            before,
+            "a failed append must not consume the only copy of the turn"
+        );
     }
 
     #[test]
@@ -4139,6 +4752,41 @@ mod tests {
         // 「关掉再打开同一会话」会永远返回同一个旧 Arc（且内核锁状态不明）。
         let again = acquire_thread_lock(root, "thread-reacq").unwrap();
         assert!(Arc::strong_count(&again) >= 1);
+    }
+
+    /// 非 Busy 的 flock 失败（这里用真实 EBADF）必须是 `Io`，**不能**打印后
+    /// 放行——放行意味着两个进程同时写同一份历史。走到这条路径需要真正的 flock
+    /// 失败，而不是文件 open 失败。
+    #[test]
+    fn a_real_flock_failure_classifies_as_io_not_busy() {
+        // 从无效 fd 上真跑一次 flock，拿到内核给的 EBADF。
+        let bad_fd: std::os::unix::io::RawFd = -1;
+        assert_ne!(
+            unsafe { libc::flock(bad_fd, libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let error = std::io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+
+        match classify_flock_error(error, "thread-ebadf", Path::new("/tmp/x.lock")) {
+            ThreadLockError::Io(io) => {
+                assert!(
+                    io.to_string().contains("flock failed"),
+                    "故障必须带上说明: {io}"
+                );
+            }
+            other => panic!("真故障必须报 Io，实际: {other:?}"),
+        }
+    }
+
+    /// EWOULDBLOCK 走同一分类函数时必须变成 Busy（而不是 Io）。
+    #[test]
+    fn a_would_block_flock_failure_classifies_as_busy() {
+        let error = std::io::Error::from_raw_os_error(libc::EWOULDBLOCK);
+        match classify_flock_error(error, "thread-busy", Path::new("/tmp/x.lock")) {
+            ThreadLockError::Busy(busy) => assert_eq!(busy.thread_id, "thread-busy"),
+            other => panic!("被占用必须报 Busy，实际: {other:?}"),
+        }
     }
 
     #[test]

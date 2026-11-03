@@ -30,7 +30,44 @@
 
 - [ ] **完整插件独立发布** — 界面、执行程序与 skill 统一版本，通过通用宿主安装和加载；官方包校验、显式项目启用、安全更新及远端版本匹配均须通过。完成判据：[设计](../superpowers/specs/2026-11-02-kanban-independent-release-design.md) §13 的 A01–A20 全部验收项，尤其在同一 yi-agent 应用包下更新看板界面且主程序发布物摘要不变。[实施总计划](../superpowers/plans/2026-11-02-kanban-independent-release.md) 已列出 27 个主任务、技术验证与子协议审阅门槛，当前仅完成设计、计划与多轮文档复查，尚未实现。
 
-- [ ] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`，测试覆盖设计 §11 的插件与契约判据。
+- [x] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`（225 lib + 45 bin 通过）。
+
+  实现与证据（提交 `e34757f7`、`c0fa47ae`..`2c7b8211`、`b0a5a9f2`、`741e1253`、`c2605709`、`ed9117a1`）：
+  - 决策：`service.rs` `promote_merge_queue` / `merge_binding` / `settle_resume_merge` /
+    `can_release_merge`。能力先于预算检查，宿主不声明 `resume_append` 时 `Defer`
+    而不是退化成 `Launch`（`merge_resume_never_launches_a_replacement_when_the_host_cannot_resume`）。
+  - 绑定不可用即人工：缺 thread/workdir → `NeedsBinding` → `needs_you`
+    （`merge_resume_sends_the_card_to_you_when_the_binding_is_missing`）；会话找不到
+    → `needs_you`（`merge_resume_sends_the_card_to_you_when_the_session_cannot_be_found`）。
+  - 忙时零副作用并保留原顺位：`merge_resume_skips_a_busy_head_and_starts_the_next_card`、
+    `merge_resume_keeps_the_original_queue_time_when_the_session_is_busy`。
+  - 安全记录先于动作：`merge_attempt.rs` 写入 `Pending` 后才落 `Running`
+    （`merge_resume_writes_the_attempt_before_it_reports_running`）；崩溃/损坏/卡被清掉
+    /legacy holder 均阻塞（`merge_recovery_blocks_a_graph_that_was_left_in_flight`、
+    `merge_recovery_blocks_on_a_corrupt_record_instead_of_dropping_it`、
+    `merge_recovery_clears_an_unknown_card_after_confirmation`、`..._old_holder_without_a_record`）。
+  - 释放判据：`merge_recovery_release_predicate_needs_every_condition`（pending 不释放、
+    结果同拍 idle 不释放、后续 idle 才释放）。
+  - 不重复领租约：`merge_resume_reuses_an_existing_lease_instead_of_taking_a_second`。
+  - 落盘顺序（spec §8.1「记录在前、`Running` 在后」）：`dispatch_resume` 与
+    `dispatch_standalone` 都在 `with_board` 闭包里先 `merge_attempt::save`、
+    再让闭包成功提交看板（`with_board` 只在 `Ok` 时写盘），两步是同一个提交点。
+    若看板提交失败而记录已写，按 spec 允许做一次 CAS 清理（动作确认未交出）。
+    证据：`merge_resume_does_not_report_running_when_the_attempt_cannot_be_written`
+    ——把记录路径占成目录强制写失败，断言卡仍是 `merge_queued`、无记录残留。
+    已做非空性验证：把顺序改回"先写 `Running`"时该测试变红。
+  - 自包含授权：`tick.rs` `queued_merge_objective` 全部参数过 `shell_quote`，
+    `merge_authorization_is_explicit_and_location_safe`、
+    `shell_quoting_survives_a_real_shell_round_trip`、
+    `shell_quoting_does_not_execute_injected_commands`。
+  - 离线恢复：`merge_attempt::recover_offline`（`merge_recovery_*` 13 项，含
+    `refuses_without_acknowledging_a_stop`、`requires_the_exact_action_and_card`、
+    `refuses_while_the_card_is_still_running`、
+    `refuses_while_the_daemon_still_holds_the_instance_lock`）。
+  - 发布文档：`INSTALL.md` §9（升级顺序、降级排空、离线恢复、三种不可自动恢复情形、
+    坏 journal）；`SKILL.md` 不再承诺新开合并会话。`list` 现在打印未结算 attempt 的
+    action id（`list_prints_the_unsettled_merge_attempt_and_its_action_id`），
+    否则 `merge-finish` 的 waiting 文案无法照做。
 
 - [x] 全局开关 `superpowers_kanban` 决定进程起停 — 清单 `supervisors/superpowers-kanban.json` 设 `stop_when_disabled: true`，注册表默认关。关掉 = 完全停掉 daemon 含调度（不再留进程轮询）；重开走设置页 `flags/set`（app-server 直写 `flags.json`，不经过 daemon），所以不是单向门。宿主侧同时收口：`plugin/query` 返回 `plugin_disabled`(-32025) 而不是 `daemon_unavailable`，`plugins/list` 每项带 `enabled`，桌面隐藏看板入口与全部 `driver_ref` 会话。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`（164 passed）；`cargo test -p yi-agent-app-server --lib a_switched_off_plugin`（含 `..._says_disabled_instead_of_broken`、`..._is_still_listed_but_marked_disabled`）；`cd desktop && vitest run src/App.test.tsx -t 看板开关关着时`
 - [x] 插件自述清单 — `manifest` 动词把 supervisor 清单打到 stdout，宿主 `plugin/install` 直接消费；`command` 取当前可执行文件绝对路径。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner manifest_`（含"与随包 `supervisors/superpowers-kanban.json` 逐字段相等"）
