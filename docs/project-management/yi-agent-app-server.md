@@ -189,3 +189,14 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
       `src/server.rs`、`src/server/`（12 个 `.rs`）、`src/server/tests/`（12 个
       `.rs`）。— [设计](../../superpowers/specs/2026-11-01-test-extraction-c1-design.md)、
       [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)
+- [x] 迁移后不再自动重装旧值守（Task 10） — `yi-agent-rs/crates/yi-agent-app-server/src/{server.rs,rpc/ui.rs}`、
+  `src/server/watchman_install_tests.rs`、`src/server/tests/plugin_theme.rs`。三处自愈入口都查实例级
+  退休标记（`yi_agent_supervisors::lifecycle::retirement`），缺一处就会「启动时卸载、装插件时又装回」：
+  `plugin/install` 的收尾（`ensure_watchman_installed_in`）、`ui/settings/write` 的开关臂
+  （已退休时只允许关，打开回 `warning` 说明登录项**故意**未重装）、会话期 `spawn_resident_watch_loop`
+  经 `watch::once_unattended`（退休后不再无人拉起 daemon）。偏好键不因迁移被改写：那是用户的配置。
+  反射源与迁移标记同属实例目录，故 `AppState` 的 `resident_dir` 同时充当实例根，测试注入的隔离
+  目录自然生效。判据：`cargo test -p yi-agent-app-server --lib`（1161 passed，含
+  `watchman_install_tests::a_retired_instance_never_reinstalls_the_watchman`、
+  `plugin_theme::re_enabling_the_watchman_on_a_retired_instance_installs_nothing`）；**变异验证**：
+  去掉任一处的退休判断 → 对应用例红（均实测 RED 后恢复）

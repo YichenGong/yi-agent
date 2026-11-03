@@ -116,4 +116,27 @@
   `cargo test -p yi-agent-supervisors`（91 lib + 集成全绿）、`cargo test -p yi-agent-store --lib lifecycle`
   （10 passed）；**变异验证**：把"仅最后客户端 drain"改成无条件 drain → 3 例红；把"terminate 已发"
   当作停止证明 → 2 例红；去掉 admission 先关 → 2 例红（均实测 RED 后恢复）
+- [x] 旧 watchman 与 unmanaged runtime 的安全迁移（Task 10） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{migration,retirement}.rs`。
+  **迁移是两阶段的，因为一次误判就是事故**：`MigrationPlan::inspect` 只读、零副作用（它跑在 UI 轮询里，
+  边显示边迁移等于给没提出请求的用户换掉运行时）；`execute` 才动手，且必须拿到**命名了本 scope 的确认串**
+  ——布尔确认是误点能产生的东西，而这个操作会停进程。`LegacyProbe` 把五种独立的失败分开问：
+  身份不可验证、影响面不完整、无法在不杀宿主的情况下退休、自愈仍活跃，各自对应一个具名
+  `MigrationBlocker`（"不 ready" 没有原因就等于 bug）。`LegacyEmbedded` 与
+  `can_retire_without_host_exit == false` 一律 `ManualActionRequired`：那种 daemon 就是 TUI 进程本身，
+  "退休" 只能等于杀用户的编辑器。**归还要双证据**：`launchctl print` 读到的 loaded job 必须
+  `program` 指向本产品（`LegacyWatchman::claims`），磁盘 plist 也必须命名该程序
+  （`plist_names_program`）——只按 plist 文本包含某路径判定会把日志路径或参数当成归属证据，
+  而只有 job 没有 plist 则无从分辨是不是别人的安装；两者不一致一律 `ManualActionRequired` 且不动手。
+  退休动作是 bootout **加删 plist**：launchd 下次登录会加载 `LaunchAgents` 里每个 plist，留下文件等于
+  重启后复活。`ai.yi-agent.board-watchman`（旧标签，跑的是已删除的子命令）先处理，失败即中止。
+  **自愈源用一份记录统一关掉**：`lifecycle::retirement` 的 `self-heal-retired.json` 存在即视为已退休
+  （存在性而非内容——半截文件被当成"未退休"会让旧 supervisor 复活，正是要防的方向），三处自愈源
+  都查它：`watchman` 的插件安装钩子（`ensure_watchman_installed_in`）、`watch::once_unattended`
+  （无人值守循环，`None` 与 `Some(0)` 刻意区分"不再归我管"与"我没活干"）、`ui/settings/write`
+  的开关臂（只许关、不许开，并回 `warning` 说明系统状态**故意**没变）。用户偏好不被改写：
+  偏好是配置，迁移是既成事实。判据：`cargo test -p yi-agent-supervisors --test runtime_migration`
+  （15 passed）、`cargo test -p yi-agent-supervisors`（98 lib + 集成全绿）、
+  `cargo test -p yi-agent-app-server --lib`（1161 passed）；**变异验证**：忽略"job 是不是我们的程序"
+  直接 bootout → 1 例红；跳过确认串校验 → 1 例红；无人值守循环忽略退休标记 → 1 例红；
+  插件安装钩子忽略退休标记 → 1 例红；`ui/settings/write` 忽略退休标记 → 1 例红（均实测 RED 后恢复）
 - [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)

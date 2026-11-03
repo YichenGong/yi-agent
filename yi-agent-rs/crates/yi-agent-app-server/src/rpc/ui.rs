@@ -165,10 +165,20 @@ pub(crate) async fn handle(
                 }
                 // 落盘成功但装/卸失败不能静默：开关状态与系统实际
                 // 状态已经不一致，前端需要拿到原因做内联提示。
+                //
+                // 已经迁移到 managed 的实例只允许「关」：打开会让旧自愈复活，
+                // 与启动路径的卸载互相打架，用户每次改设置就把旧值守装回来。
                 let outcome = if enabled {
-                    match std::env::current_exe() {
-                        Ok(exe) => (state.watchman_install)(&exe, state.watchman_home),
-                        Err(error) => Err(error.to_string()),
+                    if yi_agent_supervisors::lifecycle::retirement::is_retired(state.instance_home)
+                    {
+                        // 明确告知而不是假装成功：偏好已按用户意图落盘，但
+                        // 系统状态**故意**没变，前端要能解释这个差别。
+                        Err("this instance runs the managed runtime; the login item is retired and will not be reinstalled".to_string())
+                    } else {
+                        match std::env::current_exe() {
+                            Ok(exe) => (state.watchman_install)(&exe, state.watchman_home),
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
                 } else {
                     (state.watchman_uninstall)(state.watchman_home)

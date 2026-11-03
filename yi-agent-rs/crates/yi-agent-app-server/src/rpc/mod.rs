@@ -366,6 +366,11 @@ pub(crate) struct AppState<'a> {
     /// 通用常驻登记目录（`$HOME/.yi-agent`）。`resident/list` 的唯一输入，
     /// 与值守读登记表用的是同一份，故同属「路径与宿主偏好」这一层，按 `&` 借用。
     pub(crate) resident_dir: &'a Path,
+    /// 实例状态根，卖断「已经迁移到 managed」的标记就在这里。
+    ///
+    /// `ui/settings/write` 的开关臂要在迁移后停下安装旧值守：否则用户打开一个
+    /// 设置项就把旧自愈装回来了，与启动路径的卸载互相打架。
+    pub(crate) instance_home: &'a Path,
 
     // ---- 注入句柄(测试可替身) ----
     /// 安装常驻值守。搬移前臂里的 `watchman_install`。

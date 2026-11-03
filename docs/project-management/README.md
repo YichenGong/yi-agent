@@ -26,8 +26,8 @@
 | yi-agent-runtime | 25 / 25 | [详情](./yi-agent-runtime.md) |
 | yi-agent-power | 8 / 8 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 11 / 11 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 79 / 79 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 51 / 58 | [详情](./subagent-runtime.md) |
+| yi-agent-app-server | 80 / 80 | [详情](./yi-agent-app-server.md) |
+| subagent-runtime | 52 / 58 | [详情](./subagent-runtime.md) |
 | yi-agent-lifecycle | 12 / 13 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 18 / 18 | [详情](./superpowers-kanban.md) |
 | desktop | 115 / 125 | [详情](./desktop.md) |

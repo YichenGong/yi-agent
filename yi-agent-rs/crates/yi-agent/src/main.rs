@@ -357,11 +357,20 @@ fn run_resident_watch(interval_secs: u64) {
         eprintln!("yi-agent: cannot run the resident watch: HOME is not set");
         std::process::exit(1);
     };
+    let instance_home = resident_dir.clone();
     let interval = std::time::Duration::from_secs(interval_secs);
     loop {
-        yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
-            yi_agent_supervisors::watch::ensure_daemons(projects);
-        });
+        // A retired instance must stop being the thing that keeps daemons alive when
+        // no frontend is around. The loop keeps running rather than exiting so a
+        // migration confirmed while it is alive takes effect immediately; the marker
+        // is re-read every tick for exactly that reason.
+        yi_agent_supervisors::watch::once_unattended(
+            &instance_home,
+            &resident_dir,
+            &mut |projects| {
+                yi_agent_supervisors::watch::ensure_daemons(projects);
+            },
+        );
         std::thread::sleep(interval);
     }
 }

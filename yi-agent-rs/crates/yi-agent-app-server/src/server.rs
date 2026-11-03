@@ -596,7 +596,26 @@ pub(crate) fn production_watchman_uninstall() -> WatchmanUninstall {
 /// 调它。当前调用点是 `plugin/install` 成功之后。
 ///
 /// best-effort：装不上值守不该让一次已经成功的安装回滚成失败，故只记 warn。
+///
+/// 已经迁移到 managed runtime 的实例**不再装**：那条路径会在每次安装插件时把
+/// 旧自愈装回来，于是「启动时卸载、装插件时又装回」，用户永远收敛不到 managed。
+/// 判据是实例级标记（[`yi_agent_supervisors::lifecycle::retirement`]），不是偏好
+/// 键：偏好键是用户对「后台值守」的表态，迁移是既成事实，二者不能互相覆盖。
 pub(crate) fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
+    ensure_watchman_installed_in(workdir, home, install, &instance_home_dir());
+}
+
+/// [`ensure_watchman_installed`] 的可注入版：实例目录由调用方给定，测试不必
+/// 读写真实 `YI_AGENT_HOME`。
+pub(crate) fn ensure_watchman_installed_in(
+    workdir: &Path,
+    home: &Path,
+    install: &WatchmanInstall,
+    instance_home: &Path,
+) {
+    if yi_agent_supervisors::lifecycle::retirement::is_retired(instance_home) {
+        return;
+    }
     if !crate::settings_store::load_watchman_enabled(workdir) {
         return;
     }
@@ -1900,12 +1919,24 @@ pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBu
 ///
 /// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
 /// 与是哪个插件无关。
+///
+/// 迁移到 managed 之后这个循环就不再启动 daemon：登记仍然读，但「无人时应运行」
+/// 的旧语义已被 managed 生命周期取代。循环**不退出**，因为迁移标记可以在同一
+/// 进程存活期间写入（用户在 App 里确认迁移），退出会让状态永远停在旧判断上。
 pub(crate) fn spawn_resident_watch_loop(resident_dir: PathBuf) {
+    // The resident directory *is* the instance home (`paths::instance_home`), so the
+    // retirement marker sits beside the registration it governs. Deriving it instead
+    // of re-reading `YI_AGENT_HOME` also keeps the injected dir used in tests.
+    let instance_home = resident_dir.clone();
     tokio::spawn(async move {
         loop {
-            yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
-                yi_agent_supervisors::watch::ensure_daemons(projects);
-            });
+            yi_agent_supervisors::watch::once_unattended(
+                &instance_home,
+                &resident_dir,
+                &mut |projects| {
+                    yi_agent_supervisors::watch::ensure_daemons(projects);
+                },
+            );
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
@@ -3182,6 +3213,8 @@ where
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
                             resident_dir: &resident_dir,
+                            // 常驻登记目录就是实例根：迁移标记与它同处一个目录。
+                            instance_home: &resident_dir,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
                             uploads: &mut uploads,
