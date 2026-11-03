@@ -1611,7 +1611,7 @@ impl RuntimeCoordinator {
         // Every task-creating path shares this gate. Without it a descendant
         // spawned microseconds after its client's release would be admitted into
         // a tree nobody can reclaim.
-        let session_root = self.session_root(session)?;
+        let session_root = self.session_root(session).await?;
         self.ensure_root_open(&session_root.to_string())?;
         if self
             .repository
@@ -3618,13 +3618,20 @@ impl RuntimeCoordinator {
     }
 
     /// The session's root task id, which is the key ownership is bound under.
-    fn session_root(&self, session: &RootSessionId) -> Result<TaskId, RuntimeCoordinatorError> {
+    ///
+    /// Waits for the supervisor instead of `try_lock`: a busy supervisor means the
+    /// session is *running*, not that the request is invalid. Refusing on
+    /// contention turned a second concurrent spawn into `invalid_state: session is
+    /// busy` -- an error the caller can neither understand nor retry with
+    /// confidence, and one that showed up as a flaky e2e failure only when the
+    /// machine was loaded enough to overlap two requests.
+    async fn session_root(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<TaskId, RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
-        Ok(supervisor
-            .try_lock()
-            .map_err(|_| RuntimeCoordinatorError::Supervisor("session is busy".into()))?
-            .root_task_id()
-            .clone())
+        let guard = supervisor.lock().await;
+        Ok(guard.root_task_id().clone())
     }
 
     /// Refuses work under a root whose client has left or whose generation is
