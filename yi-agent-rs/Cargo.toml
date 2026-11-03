@@ -16,6 +16,7 @@ members = [
     "crates/yi-agent-supervisors",
     "crates/yi-agent-relay",
     "crates/yi-agent-power",
+    "crates/yi-agent-plugins",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ yi-agent-subagent = { path = "crates/yi-agent-subagent" }
 yi-agent-supervisors = { path = "crates/yi-agent-supervisors" }
 yi-agent-relay = { path = "crates/yi-agent-relay" }
 yi-agent-power = { path = "crates/yi-agent-power" }
+yi-agent-plugins = { path = "crates/yi-agent-plugins" }
 
 # 共享公共依赖
 tokio = { version = "1", features = ["full"] }

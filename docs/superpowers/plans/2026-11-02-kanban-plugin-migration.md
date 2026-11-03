@@ -2,7 +2,7 @@
 
 日期：2026-11-03
 
-状态：**等待 G3 批准**。G3 未批准前不开始 T21。
+状态：**G3 已批准（2026-11-03）**。前置 T19、T20 完成后开始 T21。
 
 对应总计划：[总计划](2026-11-02-kanban-independent-release.md)。
 对应子 spec：[看板迁移与受管命令契约](../specs/2026-11-02-kanban-plugin-migration.md)（G3）。
@@ -256,7 +256,7 @@ cd "$R/desktop" && npm ci && npm run build && npm test
 
 | 阻塞点 | 谁定 |
 |---|---|
-| `on`/`off` 归 QuotaWrite | G3 |
-| `board.mark_terminal`/`release` 归 Write | G3 |
-| `sessions.running` 聚合口径 | G3（实现细节归 T13） |
-| 旧安装探测范围 | G3 |
+| `on`/`off` 归 QuotaWrite | G3（2026-11-03 批准） |
+| `board.mark_terminal`/`release` 归 Write | G3（2026-11-03 批准） |
+| `sessions.running` 聚合口径 | G3（2026-11-03 批准；实现细节归 T13） |
+| 旧安装探测范围 | G3（2026-11-03 批准） |

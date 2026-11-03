@@ -308,8 +308,8 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
   > 2026-11-03：语义已在 G3 §6–§7 冻结——`Draining` 拒绝新 Launch/外部 Write 但允许旧 turn 收尾；`state --self` 的卡号取自宿主注入的 `SUPERPOWERS_KANBAN_CARD`（`main.rs:740-750`），未注入时明确报错而不是猜。实现落地在 T21/T22。
 - [x] Step 3：列明复制/移动的每个 UI 文件、保留的数据和旧别名。现有 `sessions.running` 是宿主进程上报，不能把它直接当成跨实例全机计数；冻结共享统计/租约协议与回退口径，避免在分发改造中扩大预算。
   > 2026-11-03：`sessions.running` 的口径由 `driver-protocol.json` 的 `request._comment` 原文佐证（"宿主**本进程**此刻的全机运行会话数"）。G3 §6.3 冻结正确口径：已登记活 owner 租约合计 + 本进程上报，同一租约不双扣；老宿主不发该字段时退化为看板内口径并标注范围，**不假设为 0**。UI 文件清单与旧别名在 T21/T25 逐项列出。
-- [ ] Step 4：固定上游 skills 的可验证依赖方式：有发布版本的按版本范围，普通文件按所需能力/命令契约检查，不能要求不存在的 skill semver。未知兼容性阻止自动任务但允许查看。获得 G3。
-  > 2026-11-03：材料已交付（G3 §8 旧安装探测与接管、§9 四项待决）。**等待人工批准，本条勾选只能由用户给出。**
+- [x] Step 4：固定上游 skills 的可验证依赖方式：有发布版本的按版本范围，普通文件按所需能力/命令契约检查，不能要求不存在的 skill semver。未知兼容性阻止自动任务但允许查看。获得 G3。
+  > 2026-11-03：材料交付（G3 §8 旧安装探测与接管、§9 四项待决）。**G3 批准（2026-11-03）**：`on`/`off` 归 QuotaWrite、`board.mark_terminal`/`release` 归 Write、`sessions.running` 不做跨实例直接相加、旧安装探测不递归扫盘，四项均按建议通过。
 - [x] Step 5：按 C 提交 `docs: define managed kanban migration contract`。
   > 2026-11-03：commit `f290d536`（G2 批准记录另作 `7c77eca8`）。门禁 C：`fmt-check`、`lint`、`secret-check` 全绿；契约 `positive: 10, negative: 24, failures: 0`，测试 51/51。变异验证：从契约删掉 `purge` → 检查报红并指名该动词。
 
@@ -323,7 +323,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 §3 值类型、`Manifest::parse` 和 §4 fixture API。核心路径只由调用方注入，不依赖 store/Tauri/app-server。新公共类型 derives 与 schema 保持一致。
 
-- [ ] Step 1：增加失败测试：
+- [x] Step 1：增加失败测试：
   ```rust
   #[test]
   fn absolute_ui_entry_is_rejected() {
@@ -333,10 +333,14 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
       assert!(Manifest::parse(&serde_json::to_vec(&v).unwrap()).is_err());
   }
   ```
-- [ ] Step 2：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test manifest`，先红后绿；同时覆盖非法 ID、重复贡献、未知必需字段和未知 effect。
-- [ ] Step 3：创建模块边界及公开测试 fixture builder；仅依赖通用序列化/验证库，按 G2 版本引入签名/归档 dev 依赖以生成夹具。测试私钥只能在 tests 源码，正式库不得嵌入。
-- [ ] Step 4：运行测试和 `cargo tree --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins`，确认无 sqlite、app-server、Tauri、看板依赖；新增模块进度条目带对应命令，不预标后续能力完成。
-- [ ] Step 5：按 C 提交 `feat: add independent plugin contract core`。
+- [x] Step 2：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test manifest`，先红后绿；同时覆盖非法 ID、重复贡献、未知必需字段和未知 effect。
+  > 2026-11-03：20 条测试。先红（15 条该拒绝的没拒绝），后绿（20/20）。变异验证 5 项各自打红：去掉绝对路径检查 1、去掉 `..` 检查 1、去掉 main 计数检查 2、去掉迁移相邻检查 1、去掉破坏性动词规则 1。
+- [x] Step 3：创建模块边界及公开测试 fixture builder；仅依赖通用序列化/验证库，按 G2 版本引入签名/归档 dev 依赖以生成夹具。测试私钥只能在 tests 源码，正式库不得嵌入。
+  > 2026-11-03：`tests/common/mod.rs` 直接读 `plugins/contracts/fixtures/`，不复制（复制品会分叉，而两份自测都绿）。本任务未引入签名/归档依赖——那是 T07/T08 的事，现在引入等于提前锁定尚未评审的实现选择。
+- [x] Step 4：运行测试和 `cargo tree --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins`，确认无 sqlite、app-server、Tauri、看板依赖；新增模块进度条目带对应命令，不预标后续能力完成。
+  > 2026-11-03：`cargo tree -p yi-agent-plugins` 只有 serde / serde_json / thiserror（dev 加 tempfile），grep `sqlite|rusqlite|tauri|app-server|store|tokio|superpowers` 无命中。`docs/project-management/yi-agent-plugins.md` 记 10/13，T07–T09 三条保持未勾。
+- [x] Step 5：按 C 提交 `feat: add independent plugin contract core`。
+  > 2026-11-03：门禁 C 全绿，含联网成功的 `cargo audit`（1 条已在豁免清单的 yanked 告警）。`Cargo.lock` 只新增本 crate 一条，未升级任何现有依赖。
 
 ### Task T07：实现发布信任、有效期与撤销状态
 

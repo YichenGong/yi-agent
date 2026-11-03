@@ -5175,6 +5175,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yi-agent-plugins"
+version = "0.1.13"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "yi-agent-power"
 version = "0.1.13"
 dependencies = [

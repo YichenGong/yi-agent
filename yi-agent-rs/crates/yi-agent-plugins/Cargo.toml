@@ -1,0 +1,19 @@
+[package]
+name = "yi-agent-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 本 crate 是插件的**契约核心**：值类型、清单解析、错误分类。
+# 刻意不依赖 store / app-server / Tauri / 看板，也不依赖 tokio——
+# 核心路径只由调用方注入，这样它可以被宿主、桌面壳和测试各自复用，
+# 而不会把任何一个运行时的假设带进来。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
