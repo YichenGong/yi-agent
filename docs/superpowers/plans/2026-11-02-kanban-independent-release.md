@@ -289,8 +289,8 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
   > 2026-11-03：`positive: 9, negative: 24, failures: 0`；`--test` 42/42。正样本新增 lifecycle、root、release 三个 fixture 与两份现算签名信封。
 - [x] Step 3：冻结 Ed25519 签名原始 payload 字节、base64 编码、发布序号/有效期、根轮换/撤销、缓存已接受时间及离线规则；具体库版本经 audit 后锁定。固定锁顺序：插件生命周期锁 → 短期实例 registry 锁；不得持 registry 锁等待进程/网络/项目维护。项目所有权保持在 guardian，跨实例争用非阻塞失败；恢复先于准入。
   > 2026-11-03：payload 编码冻结在 `scripts/plugins/sign-contracts.mjs`（`domain || 0x00 || field*`，字段序见 G2 §2.2），root/release fixture 带真实 Ed25519 签名（公开测试种子，非生产密钥）。`ed25519-dalek` 约束 `>= 2.0.0`（`RUSTSEC-2022-0093` 只影响 `< 2`），精确版本由 T07 在 `cargo audit` 后锁定。锁顺序、guardian 所有权、恢复先于准入见 G2 §5、§6。
-- [ ] Step 4：列出每一持久化阶段的“崩溃后下一动作、可否回滚、何时恢复准入”；固定后端失败窗口、重启次数/退避上限和熔断恢复条件，审阅 cross-instance 配额兼容和原生签名发布策略，获得 G2。
-  > 2026-11-03：材料已交付（G2 §6 八阶段表、§7 熔断默认值、§8 配额边界、§9 四项待决）。**等待人工批准，本条勾选只能由用户给出。**
+- [x] Step 4：列出每一持久化阶段的“崩溃后下一动作、可否回滚、何时恢复准入”；固定后端失败窗口、重启次数/退避上限和熔断恢复条件，审阅 cross-instance 配额兼容和原生签名发布策略，获得 G2。
+  > 2026-11-03：材料交付（G2 §6 八阶段表、§7 熔断默认值、§8 配额边界、§9 四项待决）。**G2 批准（2026-11-03）**：熔断默认值、`projecting` 不可回滚、共享配置回退 `RecoveryRequired`、`ed25519-dalek >= 2.0.0` 四项均按建议通过。
 - [x] Step 5：按 C 提交 `docs: define plugin trust and lifecycle transactions`。
   > 2026-11-03：commit `48e72e9f`。门禁 C：`just ci` 除 `audit` 外 14 项全绿；`audit` 因联网取 advisory-db 失败（`failed to fetch`），改用 `cargo audit --no-fetch --db ~/.cargo/advisory-db` 离线通过（1402 条公告，仅 1 条已在豁免清单的 yanked 告警）。
 
