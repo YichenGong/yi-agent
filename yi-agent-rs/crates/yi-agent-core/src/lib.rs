@@ -6,6 +6,7 @@ pub mod compact;
 pub mod message;
 pub mod permission;
 pub mod provider;
+pub mod side_context;
 pub mod subagent;
 pub(crate) mod system_prompt;
 pub mod thinking;
@@ -26,6 +27,10 @@ pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role, Thinkin
 pub use provider::{
     ApiStyle, GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderNotice,
     ProviderRequest, ProviderResponse, ReasoningKind, StopReason, StreamEnd, TokenUsage,
+};
+pub use side_context::{
+    SIDE_BOUNDARY, SIDE_SYSTEM_POLICY, SideContextError, SideContextSnapshot, side_system_prompt,
+    snapshot_for_side,
 };
 pub use subagent::task::{
     AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,
