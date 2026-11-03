@@ -147,6 +147,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
     let cold_store = crate::thread_store::ThreadStore::new(cold.path());
     cold_store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "cold".to_string(),
             cwd: cold.path().to_string_lossy().to_string(),
             model: "test".to_string(),

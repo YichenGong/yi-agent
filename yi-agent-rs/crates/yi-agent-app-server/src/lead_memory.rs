@@ -531,6 +531,7 @@ mod tests {
 
     fn lead_test_meta(id: &str, role: Option<&str>) -> crate::thread_store::ThreadMeta {
         crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.into(),
             cwd: "/tmp".into(),
             model: "m".into(),

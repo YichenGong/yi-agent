@@ -6921,6 +6921,7 @@ pub(crate) async fn start_thread_core(
     // 会话起点已在上面算好并交给 `attach_delegation`（同一个值也落进 meta）：
     // 两处必须是同一个 sha，否则「meta 里的起点」与「工具用的起点」会分叉。
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: thread_id.clone(),
         cwd: cwd.to_string(),
         model: model.clone(),

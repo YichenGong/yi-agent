@@ -2946,6 +2946,7 @@ async fn writer_lock_refuses_a_second_writer_on_the_same_thread() {
     let tid = "thread-lock-conflict".to_string();
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.clone(),
             cwd: cfg.workdir.display().to_string(),
             model: "claude-sonnet-4-5".to_string(),

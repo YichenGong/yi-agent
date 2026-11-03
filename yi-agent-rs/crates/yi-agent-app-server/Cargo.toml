@@ -33,6 +33,10 @@ yi-agent-mcp = { workspace = true }
 yi-agent-relay = { workspace = true }
 # `plugins/list` reads the plugin manifests under `<workdir>/.yi-agent/supervisors`.
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
+# 会话绑定（`ThreadMeta::plugin_bindings`）与 turn 准入（`TurnPermit`）。
+# 只用到 `Binding`/`Admission`/`TurnPermit` 与 `PluginError` 的种类判据，
+# 不链接任何插件实现。
+yi-agent-plugins = { path = "../yi-agent-plugins" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 # `lead::ensure_lead_meta` 给组长 meta 盖创建时间戳(epoch 毫秒)。与
@@ -70,3 +74,12 @@ tokio-tungstenite = "0.29"
 # dev-dependency and pattern already used by `yi-agent-store`'s
 # `error_logging_tests`; the shared workspace dependency avoids a new version.
 tracing-subscriber = { workspace = true }
+# `plugin_manager` 的测试现场打签名包（与 `yi-agent-supervisors/tests/managed_launch.rs`
+# 同一套做法）：tar 归档、gzip 压缩、Ed25519 测试种子签名。
+# 测试种子只出现在 `plugin_manager/tests.rs`，正式库不嵌入任何密钥。
+tar = "0.4"
+flate2 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+base64 = "0.22"
+tempfile = "3"

@@ -139,6 +139,18 @@ pub struct ThreadMeta {
     /// 所有既有 meta 平白加一个 `null`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// 该会话绑定的插件发布（零或多条）。
+    ///
+    /// 语义是「这个会话当初是为哪个**具体的**发布建的」，不是「这个插件现在
+    /// 是什么版本」。两者必须分开：插件升级后，旧会话仍应带着它建时的版本，
+    /// 于是用它发起的调用会被判为 `StaleBinding` 并被要求重建会话；如果这里
+    /// 存的是「插件名」或「当前版本」，升级就会静默地把旧会话接到新版本上——
+    /// 那等于让一个没验证过的新版本继承旧会话的上下文与权限。
+    ///
+    /// 旧 meta 缺该字段时为空（`Vec` 的内建默认），即「普通会话，不绑插件」，
+    /// 这是**正确**的缺省而不是迁移遗留：绝大多数会话与插件无关。
+    #[serde(default)]
+    pub plugin_bindings: Vec<yi_agent_plugins::Binding>,
 }
 
 impl ThreadMeta {
@@ -432,6 +444,7 @@ impl ThreadStore {
             });
 
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: new_id.to_string(),
             cwd: loaded.meta.cwd.clone(),
             model: loaded.meta.model.clone(),
@@ -1341,6 +1354,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         .map(|d| d.as_millis() as i64)
         .unwrap_or_else(now_millis);
     ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.to_string(),
         cwd: String::new(),
         model: String::new(),
@@ -1535,6 +1549,7 @@ mod tests {
 
     fn meta(id: &str) -> ThreadMeta {
         ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.into(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -1692,6 +1707,7 @@ mod tests {
                 "append_turn must reject escaping id {bad:?}"
             );
             let bad_meta = ThreadMeta {
+                plugin_bindings: Vec::new(),
                 thread_id: bad.into(),
                 role: None,
                 ..meta("placeholder")
@@ -2937,6 +2953,7 @@ mod tests {
 
     fn sample_meta(id: &str) -> ThreadMeta {
         ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.to_string(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -3332,6 +3349,7 @@ mod tests {
     #[test]
     fn driver_fields_round_trip() {
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t1".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -3385,6 +3403,7 @@ mod tests {
     #[test]
     fn the_new_keys_are_the_only_ones_written() {
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t1".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -3440,6 +3459,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = ThreadStore::new(dir.path());
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
             ..sample_meta("t-roots")
         };
@@ -3463,6 +3483,7 @@ mod tests {
         let store = ThreadStore::new(dir.path());
         let now = now_millis();
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -3591,6 +3612,7 @@ mod tests {
         let store = ThreadStore::new(dir.path());
 
         let lead = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "thread-lead-1".into(),
             cwd: dir.path().display().to_string(),
             model: "m".into(),
@@ -3673,6 +3695,7 @@ mod tests {
         for (id, created) in [("thread-lead-b", 20i64), ("thread-lead-a", 10i64)] {
             store
                 .create(&ThreadMeta {
+                    plugin_bindings: Vec::new(),
                     thread_id: id.into(),
                     cwd: dir.path().display().to_string(),
                     model: "m".into(),

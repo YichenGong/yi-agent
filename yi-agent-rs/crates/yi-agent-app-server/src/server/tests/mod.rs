@@ -1581,6 +1581,7 @@ fn write_meta(
     driver_ref: Option<&str>,
 ) {
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.into(),
         cwd: dir.to_string_lossy().into(),
         model: "m".into(),
@@ -1611,6 +1612,7 @@ fn write_meta(
 
 fn write_lead_meta(dir: &Path, id: &str) {
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.into(),
         cwd: dir.to_string_lossy().into(),
         model: String::new(),

@@ -410,6 +410,7 @@ mod tests {
 
     fn meta(id: &str, title: Option<&str>, updated_at: i64, role: Option<&str>) -> ThreadMeta {
         ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.into(),
             cwd: "/tmp".into(),
             model: "m".into(),

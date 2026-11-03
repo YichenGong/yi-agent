@@ -181,6 +181,7 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
     // 最早者,故此后所有读取都收敛到同一个;下面的复读让本次响应也以它为准。
     let now = chrono::Utc::now().timestamp_millis();
     let meta = ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: format!("thread-lead-{}", uuid::Uuid::new_v4()),
         cwd: cwd.display().to_string(),
         model: String::new(), // 空 = 跟随全局默认,与「损坏重建」同款兜底
@@ -504,6 +505,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let store = ThreadStore::new(&project);
         let mut existing = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "thread-existing-lead".into(),
             cwd: project.display().to_string(),
             model: String::new(),
