@@ -5219,6 +5219,51 @@ mod tests {
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
+    /// 旁支转录在窄终端里按显示宽度折行，不会溢出右边缘。
+    ///
+    /// 这里钉的是 `side_items_to_cells` 这条映射：旁支 item 必须落到与主会话
+    /// **同一个** `HistoryCell`，才能共用同一套折行。两边同时成立才算数——
+    /// 没有一行超过宽度（不溢出），且真的折成了多行（不是把内容截断）。
+    /// 折行本身由 `HistoryCell` 的渲染器负责，所以这条同时守住「不要给旁支
+    /// 另写一套渲染」。
+    #[test]
+    fn side_transcript_cells_wrap_cjk_at_display_width() {
+        use yi_agent_runtime::side_conversation::{SideItem, SideItemContent};
+
+        let item = SideItem {
+            id: "i1".into(),
+            turn_id: "t1".into(),
+            ordinal: 1,
+            content: SideItemContent::AgentMessage {
+                text: "旁支的一段中文回答，需要在窄终端里按显示宽度折行而不是溢出屏幕。".into(),
+            },
+        };
+
+        let width = 20u16;
+        let mut history = HistoryState::with_theme(TuiTheme::DARK);
+        for cell in side_items_to_cells(&[std::sync::Arc::new(item)]) {
+            history.push(cell, width);
+        }
+        let view = HistoryView {
+            state: &history,
+            width,
+            theme: TuiTheme::DARK,
+        };
+        let widths: Vec<usize> = view
+            .flattened_lines(width)
+            .iter()
+            .map(|(_, line)| UnicodeWidthStr::width(line.to_string().as_str()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w <= width as usize),
+            "旁支正文不得溢出窄终端: {widths:?}"
+        );
+        assert!(
+            widths.iter().filter(|w| **w > 0).count() > 1,
+            "这段中文必须真的折成多行，否则断言没有意义: {widths:?}"
+        );
+    }
+
     #[test]
     fn multiline_paste_respects_newlines_and_width() {
         // A paste with explicit newlines was pushed through as raw text: the

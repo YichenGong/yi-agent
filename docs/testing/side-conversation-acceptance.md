@@ -21,6 +21,7 @@ unset YI_AGENT_THREAD_ID YI_AGENT_SESSION   # tools 的 bash 用例对宿主变�
 | runtime 旁问 | `cargo test -p yi-agent-runtime --lib side_` | 89 passed, 0 failed |
 | app-server 旁问 | `cargo test -p yi-agent-app-server --lib side_` | 100 passed, 0 failed |
 | TUI 旁问 | `cargo test -p yi-agent --bin yi-agent tui::side` | 27 passed, 0 failed |
+| TUI 全量 | `cargo test -p yi-agent --bin yi-agent tui::` | 704 passed, 0 failed |
 | app-server 全量 | `cargo nextest run --offline -p yi-agent-app-server --all-features --profile ci` | 1311 passed, 7 skipped |
 | yi-agent 全量 | `cargo nextest run --offline -p yi-agent --all-features --profile ci` | 943 passed, 14 skipped |
 | core 全量 | `cargo nextest run --offline -p yi-agent-core --all-features --profile ci` | 417 passed |
@@ -66,6 +67,7 @@ msrv-check / audit 等）全部通过；`audit` 用本地缓存的 advisory-db�
 | 无 capability 旧 server 隐藏所有入口 | `hides every side entry when the host lacks the capability` | 通过 |
 | TUI：审批命令模式 Enter 不批准 | `parent_approval_command_mode_does_not_approve_on_enter` | 通过 |
 | TUI：旁支正文不落父 TurnLog | `side_events_never_reach_main_turn_log`（真实 `TuiSessionStore`） | 通过 |
+| TUI：旁支转录窄终端按显示宽度折行 | `side_transcript_cells_wrap_cjk_at_display_width`（`tui/app.rs`，20 列下无溢出且确实折成多行） | 通过 |
 
 ### 2.1 同宿主双端 / 断线重连（计划 Task 21 自动矩阵）
 
