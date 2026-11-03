@@ -80,7 +80,7 @@ pub fn dispatch_with_home(
     params: &Value,
 ) -> Result<Value, String> {
     let service = service_for(state_dir);
-    dispatch_in(&service, state_dir, home, global, method, params)
+    dispatch_ledgered(&service, state_dir, home, global, method, params)
 }
 
 /// 分派入口本体。`service` 必须是推进循环持有的那个实例——`list` 与 `board.*`
@@ -93,7 +93,7 @@ pub fn dispatch_with_service(
     params: &Value,
 ) -> Result<Value, String> {
     let home = superpowers_kanban_core::calendar::ConcurrencyCalendar::home_dir();
-    dispatch_in(service, state_dir, home.as_deref(), global, method, params)
+    dispatch_ledgered(service, state_dir, home.as_deref(), global, method, params)
 }
 
 /// 清单声明的业务方法名 → 本模块内部分派用的名字。
@@ -126,12 +126,19 @@ fn bare_method(method: &str) -> &str {
         "board/storePrefs" => "settings.write",
         "board/startLifecycle" => "lifecycle/create",
         "board/stopLifecycle" => "lifecycle/remove",
+        "board/operation" => "board.operation",
         other => other,
     }
 }
 
-/// 本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
-fn dispatch_in(
+/// 账本包装层：带 `request_id` 的写先结算，再进方法表。
+///
+/// 包装层刻意不叫 `dispatch_in`：那个名字属于契约，`check-contracts.mjs`
+/// 按它定位方法表并抽取 IPC 方法清单。把它挪给包装层，抽取器就抽不到任何
+/// 方法，而那条检查在空表时只报"正则过期"——很容易被当成无关噪声忽略掉。
+/// 方法表留在原名下，包装层另起一个名字。（这段文字也刻意不写出那个带括号
+/// 的函数签名：抽取器在源码里做字面量查找，写在注释里会先命中注释。）
+fn dispatch_ledgered(
     service: &BoardService,
     state_dir: &Path,
     home: Option<&Path>,
@@ -141,6 +148,71 @@ fn dispatch_in(
 ) -> Result<Value, String> {
     // 声明名在进入分派前翻译成内部名：见 `bare_method` 的两套名字说明。
     let method = bare_method(method);
+
+    // 写操作先过账本：带 `request_id` 的写按 `(id, method, params)` 幂等，
+    // 崩溃或断线后重复查询得到 committed/unknown，而不是再投递一次。
+    // 读操作与不带 id 的写（旧 supervisor 协议）直接走下面的分派——旧协议
+    // 没有 requestId 字段，替它编一个会让"重试"和"新请求"分不开。
+    if let Some(request_id) = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        if is_write(method) {
+            let ledger = crate::operations::OperationLedger::open(state_dir);
+            return match ledger.settle(request_id, method, params, || {
+                dispatch_in(service, state_dir, home, global, method, params)
+            }) {
+                Ok(crate::operations::Settled::Executed { result }) => Ok(result),
+                Ok(crate::operations::Settled::Replayed { result }) => Ok(result),
+                Ok(crate::operations::Settled::PreviouslyRejected { error }) => Err(error),
+                // 受理过但结论不可知：如实报告，不重跑。（重跑正是这条规则要防的。）
+                Ok(crate::operations::Settled::Unknown) => Err(format!(
+                    "request {request_id} was accepted but its outcome is unknown;                      query `board/operation` instead of retrying"
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+    }
+
+    dispatch_in(service, state_dir, home, global, method, params)
+}
+
+/// 带 `request_id` 的写操作需要结算；其余方法不记流水。
+///
+/// 判据是"改业务状态"，与 `contract/managed-v1.json` 的 effect 同源：
+/// Launch 产生新自动任务、Write/QuotaWrite/Resident 改状态，都算写。
+fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "enqueue"
+            | "enqueue_prequeued"
+            | "promote"
+            | "enqueue_merge"
+            | "switch.write"
+            | "board.next_launch"
+            | "board.mark_running"
+            | "board.mark_terminal"
+            | "board.release"
+            | "merge_request"
+            | "merge_finish"
+            | "merge_cancel"
+            | "card.state"
+            | "lifecycle/create"
+            | "lifecycle/remove"
+            | "settings.write"
+    )
+}
+
+/// 方法表本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
+fn dispatch_in(
+    service: &BoardService,
+    state_dir: &Path,
+    home: Option<&Path>,
+    global: Option<SwitchValue>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
     match method {
         "list" => Ok(service.list()),
         "enqueue" => {
@@ -473,6 +545,23 @@ fn dispatch_in(
                 .map_err(|error| format!("could not save the project settings: {error}"))?;
             Ok(json!({ "ok": true }))
         }
+        // 受管写的结果查询。宿主的 `plugins/v1/operationResult` 要到 T23 才
+        // 接上，而页面在断线后**必须**能问"那次写到底落没落"，否则只能重发。
+        // 这条业务方法把同一本账翻给页面看：`committed` 表示已落盘，
+        // `unknown` 表示受理过但结论不可知，`rejected` 表示执行过且失败。
+        "board.operation" => {
+            let request_id = params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "board.operation needs a `request_id`".to_string())?;
+            let ledger = crate::operations::OperationLedger::open(state_dir);
+            let result = ledger
+                .result(request_id)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(result)
+                .map_err(|error| format!("could not encode the operation result: {error}"))
+        }
         other => Err(format!("unknown method: {other}")),
     }
 }
@@ -609,6 +698,144 @@ mod tests {
             .expect("enqueue must return an id");
         let delivered = superpowers_kanban_core::inbox::enqueue_path(dir.path(), id);
         assert!(delivered.is_file(), "expected a delivery at {delivered:?}");
+    }
+
+    #[test]
+    fn the_same_request_id_delivers_a_card_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let params = json!({
+            "spec_path": spec, "plan_path": plan, "request_id": "req-1"
+        });
+
+        let first = dispatch_with_global(dir.path(), None, "enqueue", &params).unwrap();
+        let second = dispatch_with_global(dir.path(), None, "enqueue", &params).unwrap();
+
+        // 同一个 id 第二次不投递，直接把第一次的结果还回来。
+        assert_eq!(first, second);
+        let id = first["id"].as_str().unwrap();
+        let inbox = superpowers_kanban_core::inbox::inbox_dir(dir.path());
+        let deliveries = std::fs::read_dir(&inbox)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{id}."))
+            })
+            .count();
+        assert_eq!(deliveries, 1, "one request id must mean one delivery");
+    }
+
+    #[test]
+    fn the_same_request_id_with_different_params_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap();
+
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "title": "other", "request_id": "req-1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("different method or params"), "{error}");
+    }
+
+    #[test]
+    fn an_interrupted_write_is_reported_unknown_and_not_redelivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let params = json!({"spec_path": spec, "plan_path": plan});
+
+        // 模拟"已受理、执行中被杀"：磁盘上只有 pending，没有结论。
+        let ledger = crate::operations::OperationLedger::open(dir.path());
+        ledger
+            .record(
+                "req-1",
+                "enqueue",
+                &params,
+                crate::operations::Status::Pending,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown"), "must not guess: {error}");
+        assert!(
+            !superpowers_kanban_core::inbox::inbox_dir(dir.path()).exists(),
+            "an unknown outcome must not be re-delivered"
+        );
+
+        // 查询得到 unknown，页面据此显示"结果未知"而不是重发。
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "board.operation",
+            &json!({"request_id": "req-1"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "unknown");
+    }
+
+    #[test]
+    fn a_committed_write_can_be_queried_by_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap();
+
+        let queried = dispatch_with_global(
+            dir.path(),
+            None,
+            "board.operation",
+            &json!({"request_id": "req-1"}),
+        )
+        .unwrap();
+        assert_eq!(queried["status"], "committed");
+        assert_eq!(queried["result"], result);
+    }
+
+    #[test]
+    fn a_write_without_a_request_id_still_works() {
+        // 旧 supervisor 协议没有 requestId 字段。替它编一个会让"重试"与
+        // "新请求"分不开，所以不带 id 的写必须照旧直接执行。
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan}),
+        )
+        .unwrap();
+        assert!(result["id"].is_string());
+        assert!(
+            !crate::operations::OperationLedger::open(dir.path())
+                .lookup("req-1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// 项目层偏好落在状态目录**旁边**，所以测试必须用真实的 `<workdir>/.yi-agent/
@@ -906,6 +1133,49 @@ mod tests {
                 .unwrap();
         assert_eq!(value["status"], "denied");
         assert!(value["reason"].as_str().unwrap().contains("nope"));
+    }
+
+    /// 计划 T22 Step 2 点名的第二种写：重复投递合并授权不能占两次名额。
+    ///
+    /// `merge_request` 本身已经是幂等状态机（`merge_queued` 上再来一次不改
+    /// 队列位置），但那是**业务**幂等；这条测的是**传输**幂等——同一个
+    /// requestId 连投两次，第二次直接回放第一次的结果，不再走一遍业务逻辑。
+    #[test]
+    fn the_same_request_id_grants_a_merge_slot_only_once() {
+        use superpowers_kanban_core::card::{CardId, CardState};
+
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        // 落盘一张 awaiting_merge 的实现卡；BoardService 构造时读一次。
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            CardId::new("impl"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&CardId::new("impl"), CardState::AwaitingMerge)
+            .unwrap();
+        crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+
+        let params = json!({ "card_id": "impl", "request_id": "req-merge-1" });
+        let first = dispatch_with_global(&state, None, "merge_request", &params).unwrap();
+        let second = dispatch_with_global(&state, None, "merge_request", &params).unwrap();
+        assert_eq!(
+            first, second,
+            "a repeated request id replays the first answer"
+        );
+
+        // 队列里只有一张合并请求：重复投递没有把它变成两张。
+        let listed = dispatch_with_global(&state, None, "list", &json!({})).unwrap();
+        let queued = listed["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|card| card["state"] == "merge_queued")
+            .count();
+        assert_eq!(queued, 1, "{listed}");
     }
 
     #[test]
@@ -1687,7 +1957,10 @@ mod tests {
 
         let declared = dispatch_with_global(dir.path(), None, "board/list", &json!({})).unwrap();
         let bare = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
-        assert_eq!(declared, bare, "the declared name must reach the same branch");
+        assert_eq!(
+            declared, bare,
+            "the declared name must reach the same branch"
+        );
 
         // 未知名字仍然报错，不会被当成某个已知分支放行。
         let unknown = dispatch_with_global(dir.path(), None, "board/nope", &json!({}));

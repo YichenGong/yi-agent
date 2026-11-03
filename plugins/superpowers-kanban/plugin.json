@@ -9,13 +9,13 @@
       "id": "main",
       "kind": "main",
       "entry": "ui/dist/index.html",
-      "digest": "194d4f658bcaddddfdc8119113e1caa9ceac56a83d46edd4b0c18ef59a4ac054"
+      "digest": "33cba79b381e7676891c9cf925c5564be0af22921af864a444dfaede252bfc7f"
     },
     {
       "id": "settings",
       "kind": "settings",
       "entry": "ui/dist/index.html",
-      "digest": "194d4f658bcaddddfdc8119113e1caa9ceac56a83d46edd4b0c18ef59a4ac054"
+      "digest": "33cba79b381e7676891c9cf925c5564be0af22921af864a444dfaede252bfc7f"
     }
   ],
   "program": null,
@@ -65,6 +65,10 @@
     {
       "name": "board/stopLifecycle",
       "effect": "Resident"
+    },
+    {
+      "name": "board/operation",
+      "effect": "Read"
     }
   ],
   "cli": [
@@ -141,7 +145,17 @@
     ]
   },
   "dependencies": {
-    "workflows": []
+    "workflows": [
+      {
+        "name": "brainstorming"
+      },
+      {
+        "name": "writing-plans"
+      },
+      {
+        "name": "finishing-a-development-branch"
+      }
+    ]
   },
   "data": {
     "format": 1,

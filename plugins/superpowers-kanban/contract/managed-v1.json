@@ -112,37 +112,93 @@
   },
   "ipc": {
     "_comment": "来源：crates/superpowers-kanban-runner/src/dispatch.rs 的 dispatch_in 方法表。19 个方法。",
-    "list": { "effect": "Read", "idempotent": true },
-    "enqueue": { "effect": "Write", "idempotent": false },
-    "enqueue_prequeued": { "effect": "Write", "idempotent": false },
-    "promote": { "effect": "Write", "idempotent": false },
-    "enqueue_merge": { "effect": "Write", "idempotent": false },
-    "switch.read": { "effect": "Read", "idempotent": true },
-    "switch.write": { "effect": "QuotaWrite", "idempotent": true },
+    "list": {
+      "effect": "Read",
+      "idempotent": true
+    },
+    "enqueue": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "enqueue_prequeued": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "promote": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "enqueue_merge": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "switch.read": {
+      "effect": "Read",
+      "idempotent": true
+    },
+    "switch.write": {
+      "effect": "QuotaWrite",
+      "idempotent": true
+    },
     "driver/next": {
       "effect": "Launch",
       "idempotent": false,
       "why": "宿主每 tick 拉一拍，插件可回一个 launch 动作；这是产生新自动任务的路径"
     },
-    "board.next_launch": { "effect": "Launch", "idempotent": false },
-    "board.mark_running": { "effect": "Launch", "idempotent": true },
-    "board.mark_terminal": { "effect": "Write", "idempotent": true },
-    "board.release": { "effect": "Write", "idempotent": true },
-    "merge_request": { "effect": "Write", "idempotent": false },
-    "merge_finish": { "effect": "Write", "idempotent": false },
-    "merge_cancel": { "effect": "Write", "idempotent": false },
-    "card.state": { "effect": "Write", "idempotent": true },
+    "board.next_launch": {
+      "effect": "Launch",
+      "idempotent": false
+    },
+    "board.mark_running": {
+      "effect": "Launch",
+      "idempotent": true
+    },
+    "board.mark_terminal": {
+      "effect": "Write",
+      "idempotent": true
+    },
+    "board.release": {
+      "effect": "Write",
+      "idempotent": true
+    },
+    "merge_request": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "merge_finish": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "merge_cancel": {
+      "effect": "Write",
+      "idempotent": false
+    },
+    "card.state": {
+      "effect": "Write",
+      "idempotent": true
+    },
     "lifecycle/create": {
       "effect": "Resident",
       "idempotent": true,
       "why": "登记一个项目的常驻服务；设计 §6 把常驻列为独立确认项"
     },
-    "lifecycle/remove": { "effect": "Resident", "idempotent": true },
-    "settings.read": { "effect": "Read", "idempotent": true },
+    "lifecycle/remove": {
+      "effect": "Resident",
+      "idempotent": true
+    },
+    "settings.read": {
+      "effect": "Read",
+      "idempotent": true
+    },
     "settings.write": {
       "effect": "QuotaWrite",
       "idempotent": true,
       "why": "settings 含并发窗口与峰值，属于整机共享配额配置（设计 §7.1）"
+    },
+    "board.operation": {
+      "effect": "Read",
+      "idempotent": true,
+      "why": "只读操作账本，回答「那次写到底落没落」；不写任何业务状态"
     }
   },
   "reserved": {

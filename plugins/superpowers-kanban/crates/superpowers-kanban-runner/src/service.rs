@@ -26,6 +26,30 @@ use crate::persist;
 use crate::resident;
 use crate::worktree::{ensure_worktree, slugify};
 
+/// 解析实例根：`YI_AGENT_HOME` 优先，否则 `<HOME>/.yi-agent`。
+///
+/// 与 `yi_agent_store::paths::instance_home` 同一口径（含"值本身已叫
+/// `.yi-agent` 时不重复拼接"这一条）。插件不链接那个 crate，所以在这里写一份
+/// 同样的规则；`drain.rs` 只依赖它的**结果**目录形状。
+///
+/// 与 `home` 参数不同：`home` 是测试注入的全局层替身，实例根是宿主真正记账的
+/// 地方。把两者混为一谈会让注入 `home` 的测试永远看不到宿主日志。
+fn instance_home_from_env() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(value);
+        return Some(
+            if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+                dir
+            } else {
+                dir.join(".yi-agent")
+            },
+        );
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".yi-agent"))
+}
+
 /// 一次成功认领：卡片 id、它的 worktree、以及给会话用的标题。
 pub struct LaunchClaim {
     pub card_id: String,
@@ -199,9 +223,26 @@ enum PendingKind {
 pub struct BoardService {
     state_dir: PathBuf,
     project_root: PathBuf,
+    /// 实例根（`YI_AGENT_HOME` 解析出的 `<…>/.yi-agent`）。
+    ///
+    /// 只用来**读**宿主的事务日志（`plugins/lifecycle/<plugin>.json`）：排空
+    /// 期间要放行收尾、挡住新任务，而排空的权威在宿主。`None` 表示解析不出实例
+    /// 根——那时按"没在排空"处理，因为拿 `$HOME` 猜一个实例根会在多实例机器上
+    /// 读到另一个实例的日志。
+    instance_home: Option<PathBuf>,
     /// 通用常驻登记目录（`$HOME/.yi-agent`）。`home` 注入时为 `<home>/.yi-agent`，
     /// 于是测试不必碰真实 `$HOME`（与 `leases_dir` 同一手法）。
     resident_dir: Option<PathBuf>,
+    /// 是否跑在宿主的受管上下文里。
+    ///
+    /// 只影响一件事：**常驻登记的归属**。设计 §7.1 把"常驻项目登记与后台服务
+    /// 引用"划给宿主——插件通过能力接口请求，不直接改宿主登记文件。受管时我们
+    /// 没有那条能力接口（宿主尚未提供），所以诚实的做法是**不写**那个文件并把
+    /// 事实说出来，而不是继续用共享文件契约冒充"请求已经送达"。
+    ///
+    /// standalone（用户手敲命令、无 binding）时沿用旧行为：写共享登记文件，
+    /// 因为那时没有宿主可以代劳。
+    managed: bool,
     /// 全局配置所在的 home：`<home>/.yi-agent/plugins/superpowers-kanban/`。
     ///
     /// 注入后**不读**真实 `$HOME`——否则测试会读到跑测试那台机器上的真实配额，
@@ -217,6 +258,11 @@ impl BoardService {
             .as_ref()
             .map(|home| home.join(".yi-agent"))
             .or_else(resident::default_dir);
+        // 实例根与 `home` 注入无关：`home` 是测试用的全局层替身，实例根是宿主
+        // 真正记账的地方。注入 `home` 的测试若也把实例根指到那里，排空测试就
+        // 写不了宿主日志的真实落点；所以这里只认 `YI_AGENT_HOME` / 真实 `HOME`，
+        // 测试通过 `with_instance_home` 显式替换。
+        let instance_home = instance_home_from_env();
         let leases_dir = home
             .as_ref()
             .map(|home| {
@@ -228,7 +274,12 @@ impl BoardService {
         Self {
             state_dir,
             project_root,
+            instance_home,
             resident_dir,
+            // `new` 被 dispatch 的进程内单例与测试大量调用，所以这里**不**重新
+            // 解析环境（那会让每条单测都依赖开发机的环境变量）。默认 standalone，
+            // 受管入口显式打开。
+            managed: false,
             home,
             inner: Mutex::new(Inner {
                 leases: Default::default(),
@@ -244,6 +295,63 @@ impl BoardService {
                 activity: None,
             }),
         }
+    }
+
+    /// 覆盖实例根。测试用：让排空判定读一个 TempDir 里的宿主日志，而不是
+    /// 跑测试那台机器的真实实例。
+    ///
+    /// 生产路径不调它——`new` 已经从环境解析好了。
+    pub fn with_instance_home(mut self, instance_home: Option<PathBuf>) -> Self {
+        self.instance_home = instance_home;
+        self
+    }
+
+    /// 声明本实例跑在宿主的受管上下文里：常驻登记改由宿主负责，插件不写
+    /// 宿主登记文件（设计 §7.1）。
+    pub fn with_managed(mut self, managed: bool) -> Self {
+        self.managed = managed;
+        self
+    }
+
+    /// 当前是否在宿主的排空屏障内（只读宿主事务日志）。
+    ///
+    /// 解析不出实例根时报 [`Drain::Idle`]：没有实例根就没有可读的日志，"没在
+    /// 排空"是唯一不猜的答案。拿 `$HOME` 兜底会读到另一个实例的事务。
+    pub fn drain(&self) -> crate::drain::Drain {
+        match self.instance_home.as_deref() {
+            Some(home) => crate::drain::read(home),
+            None => crate::drain::Drain::Idle,
+        }
+    }
+
+    /// 上游依赖的就绪诊断（缺 skill / 同名冲突）。
+    ///
+    /// `instance_root` 是**实例根的父目录**（`skill_rpc::roots` 会再拼
+    /// `.yi-agent/skills`）；解析不出时退化为"只看项目层"——只报项目里缺什么，
+    /// 不凭空断言用户层也没有。
+    pub fn readiness(&self) -> crate::readiness::Readiness {
+        let declared = crate::readiness::declared_workflows(include_str!("../../../plugin.json"))
+            .unwrap_or_default();
+        let home = self
+            .instance_home
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.project_root.clone());
+        crate::readiness::check(&declared, &self.project_root, &home)
+    }
+
+    /// 为什么现在不能起新的自动任务（`None` 表示可以）。
+    ///
+    /// **只挡新会话**：只读、状态收尾、归档都不经过这里。两个来源：
+    /// 上游依赖不就绪（设计 §7.2），或宿主正在排空（设计 §7）。
+    pub fn launch_blocked_reason(&self) -> Option<String> {
+        let drain = self.drain();
+        if !drain.allows_new_work() {
+            return drain.reason();
+        }
+        let readiness = self.readiness();
+        readiness.view_only_reason()
     }
 
     /// 中毒的锁照样用：状态是一份纯数据，`panic` 不会留下半写状态，
@@ -756,6 +864,15 @@ impl BoardService {
         if budget == 0 {
             return Ok(None);
         }
+        // 自动任务闸门：排空中或上游依赖缺失时不认领新卡。
+        //
+        // 放在拿租约**之前**是硬要求：先占槽再发现起不了，槽会白占一拍，
+        // 而排空期间那一拍正是屏障在等的。返回 `Ok(None)` 而不是 `Err`：
+        // "本拍没有动作"是正常结论，报错会诱使宿主把已经消费的回报判成没送到。
+        if let Some(reason) = self.launch_blocked_reason() {
+            eprintln!("superpowers-kanban: not launching: {reason}");
+            return Ok(None);
+        }
         let mut inner = self.lock();
         let Some(dir) = inner.leases_dir.clone() else {
             return Err("no lease directory".into());
@@ -1040,6 +1157,12 @@ impl BoardService {
                 state_dir.display()
             )
         })?;
+        if self.managed {
+            // 受管：登记属于宿主（设计 §7.1）。这里只建自己的状态目录。悄悄写
+            // 共享文件会让"谁在管理常驻"变成两个写者，宿主下一次整表重写就把
+            // 插件刚写的条目抹掉，而插件还以为登记成功了。
+            return Ok(());
+        }
         resident::require(&resident_dir, project, Self::REQUESTER)
             .map_err(|error| format!("could not register the project as resident: {error}"))
     }
@@ -1057,8 +1180,11 @@ impl BoardService {
             .resident_dir
             .clone()
             .ok_or_else(|| "cannot locate the resident registry: HOME is unset".to_string())?;
-        resident::release(&resident_dir, project, Self::REQUESTER)
-            .map_err(|error| format!("could not release the project: {error}"))?;
+        if !self.managed {
+            // 受管时不碰宿主登记（同 `lifecycle_create`）；只删自己的状态目录。
+            resident::release(&resident_dir, project, Self::REQUESTER)
+                .map_err(|error| format!("could not release the project: {error}"))?;
+        }
         let state_dir = Self::state_dir_for(project);
         match std::fs::remove_dir_all(&state_dir) {
             Ok(()) => Ok(()),
@@ -1307,7 +1433,20 @@ impl BoardService {
         let observations = crate::observation::load(&self.state_dir);
         // 一次读出，别在逐卡闭包里反复开文件。
         let holder = crate::merge_lock::read_holder(&self.state_dir);
+        let drain = self.drain();
+        let readiness = self.readiness();
         json!({
+            // 为什么现在不起新卡。`null` 表示没有阻塞。页面拿它显示一条横幅，
+            // 而不是让用户面对一个"什么都没发生"的队列。
+            "launch_blocked": self.launch_blocked_reason(),
+            "drain": match &drain {
+                crate::drain::Drain::Idle => json!({"state": "idle"}),
+                crate::drain::Drain::OtherPlugin => json!({"state": "other_plugin"}),
+                crate::drain::Drain::Draining { phase } => json!({"state": "draining", "phase": phase}),
+                crate::drain::Drain::Unknown { detail } => json!({"state": "unknown", "detail": detail}),
+            },
+            "dependencies": readiness.dependencies,
+            "conflicts": readiness.conflicts,
             "cards": board.visible().map(|card| json!({
                 "id": card.id.0,
                 "state": card.state,
@@ -1486,8 +1625,32 @@ mod tests {
             at(),
         );
         persist::save_board(&state_dir.join("board.json"), &board).unwrap();
-        // home 指到临时目录，让 lease 落在隔离目录，不污染真实 HOME。
+        // home 指到临时目录，让 lease 落在隔离目录，不污染真实 HOME。实例根也
+        // 一起钉住：`new` 会从环境解析它，而测试绝不能读到开发机上的真实实例
+        // （那会让"排空中"和"依赖缺失"两条断言随机器状态而变）。
+        let service = BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+            .with_instance_home(Some(dir.join("home/.yi-agent")));
+        // 自动任务闸门会看上游依赖，而这些测试要测的是租约/队列本身。先把声明的
+        // 技能装齐，免得每条测试都变成"依赖缺失"的重复验证；专门验证缺依赖的
+        // 测试用 `service_with_missing_dependencies`。
+        make_ready(&dir.join("home/.yi-agent"));
+        service
+    }
+
+    /// 与 [`service_with_card`] 相同，但实例根里一个上游技能都没有。
+    fn service_with_missing_dependencies(dir: &std::path::Path) -> BoardService {
+        let state_dir = dir.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            superpowers_kanban_core::card::CardId::new("card-1"),
+            PathBuf::from("a.spec.md"),
+            PathBuf::from("a.plan.md"),
+            at(),
+        );
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
         BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+            .with_instance_home(Some(dir.join("home/.yi-agent")))
     }
 
     /// 再加一张排队卡（走内存 board + 落盘，与 `service_with_card` 同一份）。
@@ -3139,11 +3302,235 @@ mod tests {
         // 「无事可做」的契约形状：`{"action": null}`。
         assert_eq!(answers["nothing"], serde_json::json!({ "action": null }));
     }
+
+    /// 把宿主的事务日志写进实例根，形状与 `JournalStore` 落盘的一致。
+    fn write_journal(home: &Path, phase: &str) {
+        let path = crate::drain::journal_path(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "transactionId": "tx-00000000-aaaa",
+                "plugin": "superpowers-kanban",
+                "action": "update",
+                "phase": phase,
+                "target": {
+                    "release": {
+                        "plugin": "superpowers-kanban",
+                        "version": "0.1.0",
+                        "target": "darwin-aarch64",
+                        "sha256": "0".repeat(64),
+                    },
+                    "activation": 1,
+                },
+                "blocking": {"projects": [], "turns": []},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// 把声明的上游技能都装进实例根，让自动任务闸门放行。
+    fn make_ready(instance_home: &Path) {
+        for name in crate::readiness::declared_workflows(include_str!("../../../plugin.json"))
+            .unwrap()
+            .iter()
+            .map(|declared| declared.name.clone())
+        {
+            let skill = instance_home.join("skills").join(&name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "---\nname: x\n---\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_upstream_skill_stops_new_launches_but_not_the_board() {
+        // 设计 §7.2：缺依赖不启动自动任务，但允许查看与收尾。
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        // 这个装置的实例根是空的：声明的上游技能一个都不在。
+        let service = service_with_missing_dependencies(&project);
+
+        let blocked = service.launch_blocked_reason().expect("a reason");
+        assert!(blocked.contains("brainstorming"), "{blocked}");
+        assert!(
+            service.next_launch(1, at()).unwrap().is_none(),
+            "no card may be claimed while an upstream dependency is missing"
+        );
+        assert!(
+            service.driver_step(&[], &[], Some(0)).unwrap().is_none(),
+            "the tick must yield no launch either"
+        );
+        // 看板本身仍可读，且卡片状态没被改动。
+        assert_eq!(state_of(&service, "card-1"), "queued");
+        let listed = service.list();
+        assert!(listed["launch_blocked"].is_string());
+        assert_eq!(listed["dependencies"][0]["name"], "brainstorming");
+        assert_eq!(
+            listed["dependencies"][0]["found_at"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_ready_installation_launches_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+
+        assert!(service.launch_blocked_reason().is_none());
+        assert!(service.next_launch(1, at()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_draining_host_stops_new_launches_but_lets_a_running_card_finish() {
+        // 排空的死锁点：旧 turn 必须还能写状态、放名额，否则屏障等不到零。
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 排空前就已经在跑的一张卡。
+        let claim = service.next_launch(1, at()).unwrap().expect("the head");
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+
+        write_journal(
+            &service.instance_home.clone().expect("fixture sets it"),
+            "draining",
+        );
+        assert!(!service.drain().allows_new_work());
+        assert!(service.launch_blocked_reason().is_some());
+
+        // 新卡不被认领。
+        service.enqueue_card_for_test("card-2");
+        assert!(
+            service
+                .driver_step(&busy(&["thread-1"]), &[], Some(0))
+                .unwrap()
+                .is_none(),
+            "draining must stop new launches"
+        );
+        assert_eq!(state_of(&service, "card-2"), "queued");
+
+        // 但旧卡的收尾照常：状态写 + 名额释放都成功。
+        service
+            .set_state("card-1", CardState::AwaitingMerge, Some("done"))
+            .expect("a draining plugin must let the running card report its state");
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+        service
+            .merge_finish("card-1")
+            .expect("releasing the merge slot must work while draining");
+    }
+
+    #[test]
+    fn a_drain_that_has_finished_does_not_block_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        write_journal(
+            &service.instance_home.clone().expect("fixture sets it"),
+            "done",
+        );
+        assert!(service.launch_blocked_reason().is_none());
+    }
+
+    #[test]
+    fn the_board_says_which_lifecycle_phase_is_holding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        write_journal(
+            &service.instance_home.clone().expect("fixture sets it"),
+            "backing_up",
+        );
+        let listed = service.list();
+        assert_eq!(listed["drain"]["state"], "draining");
+        assert_eq!(listed["drain"]["phase"], "backing_up");
+    }
+
+    #[test]
+    fn a_plugin_may_not_override_a_reserved_environment_variable() {
+        // 宿主侧 `managed::build_command` 已经挡一次；插件侧再挡一次，因为插件
+        // 可能不经过那个 launcher 而被直接执行。
+        let rejected = crate::managed::rejected_env([
+            ("SUPERPOWERS_KANBAN_CARD", "card-1"),
+            ("YI_AGENT_HOME", "/somewhere/else"),
+        ]);
+        assert_eq!(rejected, vec!["YI_AGENT_HOME".to_string()]);
+        assert!(
+            crate::managed::rejected_env([("SUPERPOWERS_KANBAN_CARD", "card-1")]).is_empty(),
+            "non-reserved keys pass through"
+        );
+    }
 }
 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// 受管实例：登记归宿主，插件一个字节都不写宿主登记文件。
+    #[test]
+    fn a_managed_install_does_not_write_the_hosts_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let service = BoardService::new(
+            dir.path().join(".yi-agent/superpowers-kanban"),
+            project.clone(),
+            Some(dir.path().join("home")),
+        )
+        .with_managed(true);
+
+        service.lifecycle_create(&project).unwrap();
+
+        // 自己的状态目录照建——那是插件的数据目录，不归宿主。
+        assert!(project.join(".yi-agent/superpowers-kanban").is_dir());
+        // 宿主登记文件**不存在**：设计 §7.1 说这由宿主管。
+        assert!(
+            !registry(dir.path()).exists(),
+            "a managed plugin must not write the host's resident registry"
+        );
+    }
+
+    /// 受管实例的 remove 也不去动宿主登记（否则会把宿主别的条目一起重写）。
+    #[test]
+    fn a_managed_install_leaves_the_hosts_registry_alone_on_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // 先由"宿主"写一条别的项目的登记，再让受管插件 remove。
+        std::fs::create_dir_all(dir.path().join("home/.yi-agent")).unwrap();
+        let other = dir.path().join("other");
+        resident::require(&dir.path().join("home/.yi-agent"), &other, "someone-else").unwrap();
+        let before = std::fs::read_to_string(registry(dir.path())).unwrap();
+
+        let service = BoardService::new(
+            dir.path().join(".yi-agent/superpowers-kanban"),
+            project.clone(),
+            Some(dir.path().join("home")),
+        )
+        .with_managed(true);
+        service.lifecycle_remove(&project).unwrap();
+
+        let after = std::fs::read_to_string(registry(dir.path())).unwrap();
+        assert_eq!(before, after, "the host's registry must be byte-identical");
+    }
+
+    /// standalone（无宿主）仍写共享登记：那时没有宿主可以代劳。
+    #[test]
+    fn a_standalone_install_still_registers_as_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let service = BoardService::new(
+            dir.path().join(".yi-agent/superpowers-kanban"),
+            project.clone(),
+            Some(dir.path().join("home")),
+        );
+
+        service.lifecycle_create(&project).unwrap();
+
+        assert!(registry(dir.path()).exists());
+    }
 
     /// 建一个把 `home` 指到临时目录的 service（登记与租约都不碰真实 HOME）。
     fn service(dir: &Path) -> BoardService {

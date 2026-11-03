@@ -122,17 +122,19 @@ export async function writeSettings(
 }
 
 /**
- * Ask the host what became of a write whose reply never arrived.
+ * Ask the backend what became of a write whose reply never arrived.
  *
  * The protocol forbids treating "no answer" as failure and retrying (G1 §9.3):
- * the write may have committed. The host keeps a ledger keyed by requestId, so
- * the honest move is to look the id up rather than guess.
+ * the write may have committed. The backend keeps a ledger keyed by the write's
+ * own `request_id`, so the honest move is to look that id up rather than guess.
  *
- * Returns the ledger's verdict, or `null` when there is nothing to look up —
- * an error that carries no requestId (a parse failure, a dead bridge) has no
- * entry to query, and inventing one would claim knowledge we do not have.
+ * Two doors lead to the same ledger. The host's generic `result()` is the
+ * preferred one, but a host that does not implement it answers `NotSupported` —
+ * in that case the plugin's own declared `board/operation` method reads the
+ * same ledger. Falling through matters: without it, every unknown write on such
+ * a host would stay unknown even though the answer is one call away.
  *
- * A `pending` verdict is reported as unknown, not as success: the host is
+ * A `pending` verdict is reported as unknown, not as success: the backend is
  * still deciding, and the caller must refresh rather than assume.
  */
 export async function settleWrite(
@@ -140,16 +142,52 @@ export async function settleWrite(
   requestId: string | undefined,
 ): Promise<"committed" | "rejected" | "unknown"> {
   if (requestId === undefined || requestId === "") return "unknown";
+  const viaHost = await askHostResult(host, requestId);
+  if (viaHost !== null) return viaHost;
+  return askBoardOperation(host, requestId);
+}
+
+/** The host's generic ledger query, or `null` when this host cannot answer it. */
+async function askHostResult(
+  host: PluginHostApi,
+  requestId: string,
+): Promise<"committed" | "rejected" | "unknown" | null> {
   let result: OperationResult;
   try {
     result = await host.result(requestId);
   } catch {
-    // The query itself failing says nothing about the original write.
+    // The query itself failing says nothing about the original write, and it
+    // may mean this host simply has no such method. Try the plugin's own door.
+    return null;
+  }
+  if (result?.status === "committed") return "committed";
+  if (result?.status === "rejected") return "rejected";
+  return "unknown";
+}
+
+/**
+ * Read the ledger through `board/operation`.
+ *
+ * Declared locally rather than imported as an SDK type: the backend serialises
+ * `request_id` (snake_case), and borrowing the SDK's `OperationResult` would
+ * bake in a field-name assumption this plugin does not own. Only `status` is
+ * read, because that is all the caller acts on.
+ */
+async function askBoardOperation(
+  host: PluginHostApi,
+  requestId: string,
+): Promise<"committed" | "rejected" | "unknown"> {
+  try {
+    const result = await host.request<{ status?: unknown }>(METHODS.operation, {
+      request_id: requestId,
+    });
+    if (result?.status === "committed") return "committed";
+    if (result?.status === "rejected") return "rejected";
+    return "unknown";
+  } catch {
+    // Neither door answered. That is still not evidence the write failed.
     return "unknown";
   }
-  if (result.status === "committed") return "committed";
-  if (result.status === "rejected") return "rejected";
-  return "unknown";
 }
 
 /**
@@ -169,14 +207,33 @@ export async function settleWrite(
 async function requestWrite(
   host: PluginHostApi,
   method: string,
-  params: unknown,
+  params: Record<string, unknown>,
 ): Promise<void> {
+  // The backend ledger keys on the request id inside the params, not on the
+  // transport's own id: the transport id never reaches the backend, so a write
+  // without this field could never be looked up afterwards. Generating it here
+  // is what makes "the reply was lost" answerable at all.
+  const requestId = newRequestId();
   try {
-    await host.request(method, params);
+    await host.request(method, { ...params, request_id: requestId });
   } catch (error) {
     if (!isResultUnknown(error)) throw error;
-    const settled = await settleWrite(host, (error as { requestId?: string }).requestId);
+    // Look up the id we sent, not the transport's: only ours is in the ledger.
+    const settled = await settleWrite(host, requestId);
     if (settled === "committed") return;
     throw error;
   }
+}
+
+/**
+ * A fresh id for one write.
+ *
+ * `crypto.randomUUID` is available in the webview and in jsdom; the fallback
+ * keeps a test environment without it from producing the empty string, which
+ * `settleWrite` treats as "nothing to look up".
+ */
+function newRequestId(): string {
+  const maybe = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (typeof maybe?.randomUUID === "function") return maybe.randomUUID();
+  return `w-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }

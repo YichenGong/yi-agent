@@ -137,15 +137,27 @@ describe("SettingsPanel", () => {
 
   it("reports an unknown write outcome instead of claiming failure", async () => {
     const user = userEvent.setup();
-    render(
-      <SettingsPanel
-        host={host({
-          write: async () => {
-            throw { kind: "ResultUnknown", detail: "no answer" };
-          },
-        })}
-      />,
-    );
+    // A backend whose ledger cannot say: the write's reply was lost and looking
+    // the id up answers "still unknown". Claiming failure would invite a retry
+    // that could duplicate the write.
+    const h = host({
+      write: async () => {
+        throw { kind: "ResultUnknown", detail: "no answer" };
+      },
+    });
+    const base = h as unknown as {
+      result: (id: string) => Promise<unknown>;
+      request: (method: string, params: unknown) => Promise<unknown>;
+    };
+    base.result = async (id: string) => ({ status: "unknown", requestId: id, result: null });
+    const original = base.request;
+    base.request = async (method: string, params: unknown) => {
+      if (method === METHODS.operation) {
+        return { status: "unknown", request_id: (params as { request_id?: string }).request_id };
+      }
+      return original(method, params);
+    };
+    render(<SettingsPanel host={h} />);
     await screen.findByLabelText("全机并发上限");
     await user.click(screen.getByRole("button", { name: "保存" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/结果未知/);

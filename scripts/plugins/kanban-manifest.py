@@ -44,6 +44,25 @@ VIEWS = [
     ("settings", "settings", "ui/dist/index.html"),
 ]
 
+# Upstream Superpowers skills a card cannot be driven without (design §7.2, T22).
+#
+# Only the three that every card needs are listed. The driver objective offers
+# `superagent-driven-development` *or* `executing-plans` to execute the plan, so
+# either one missing is not a failure — and this manifest format is a flat list
+# with no "or". Declaring one of them would block a healthy installation that
+# uses the other, which is worse than not diagnosing that pair at all. The
+# readiness check reports exactly what is declared and nothing more.
+#
+# No `range`: these are file copies under `skills/<name>/`, with no published
+# semver to compare against (T05 Step 4 forbids inventing one). Absent range
+# means "any version present", which is the honest check here: the presence of
+# a `SKILL.md` under one of the host's skill roots.
+WORKFLOWS = [
+    "brainstorming",
+    "writing-plans",
+    "finishing-a-development-branch",
+]
+
 # The board's business methods. Names are `namespace/verb` with camelCase
 # segments because the manifest schema requires it; the backend translates them
 # in `dispatch.rs::bare_method`.
@@ -63,6 +82,9 @@ METHODS = [
     ("board/storePrefs", "QuotaWrite"),
     ("board/startLifecycle", "Resident"),
     ("board/stopLifecycle", "Resident"),
+    # Reads the operation ledger. Declared so the bridge lets the page ask
+    # "did that write land?" after a lost reply, instead of retrying it.
+    ("board/operation", "Read"),
 ]
 
 # CLI verbs, taken from `main.rs`'s USAGE line. Effects come from the frozen
@@ -174,7 +196,7 @@ def main() -> int:
             "required": ["Read", "Write"],
             "optional": ["Launch", "QuotaWrite", "Resident"],
         },
-        "dependencies": {"workflows": []},
+        "dependencies": {"workflows": [{"name": name} for name in WORKFLOWS]},
         "data": {"format": 1, "migrations": []},
         "compatibility": {"hostApi": "v1", "uiApi": "v1"},
     }

@@ -26,6 +26,13 @@ export const METHODS = {
   settingsWrite: "board/storePrefs",
   lifecycleCreate: "board/startLifecycle",
   lifecycleRemove: "board/stopLifecycle",
+  /**
+   * 按 requestId 查一次写操作的结论。
+   *
+   * 不是写：它只读账本。断线后页面用它回答"那次入队到底落没落"，
+   * 而不是凭一个 `ResultUnknown` 重发——重发正是幂等规则要防的事。
+   */
+  operation: "board/operation",
 } as const;
 
 export type KanbanMethod = (typeof METHODS)[keyof typeof METHODS];
