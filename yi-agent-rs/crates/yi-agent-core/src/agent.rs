@@ -655,10 +655,76 @@ impl Agent {
         self.start_run(None).await
     }
 
+    /// Run the agent loop with ownership of the real core task tree.
+    ///
+    /// Unlike [`Agent::run_blocks`], the returned stream comes with a control
+    /// that holds the loop's actual `JoinHandle` and every task it spawned, so
+    /// a side conversation can cancel and *join* the run instead of merely
+    /// dropping its consumer (spec §7.1). The `limits` bound the event queue
+    /// and supply the payload budgets the production path enforces.
+    pub async fn run_managed_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        limits: crate::managed_run::ManagedRunLimits,
+    ) -> Result<crate::managed_run::ManagedAgentRun, AgentError> {
+        let (events, control) = self
+            .start_run_inner(
+                Some(blocks),
+                crate::managed_run::EventSink::Budgeted(limits),
+            )
+            .await;
+        let events = events
+            .map(|queued| {
+                crate::managed_run::BudgetedAgentEvent::with_lease(queued.event, queued.lease)
+            })
+            .boxed();
+        Ok(crate::managed_run::ManagedAgentRun { events, control })
+    }
+
+    /// Run with task-tree ownership but ordinary event/text policy.
+    ///
+    /// This exists so the TUI can join the main session's real core task on
+    /// exit. It must not apply side budgets to the main conversation.
+    pub async fn run_tracked_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+    ) -> Result<crate::managed_run::TrackedAgentRun, AgentError> {
+        let (events, control) = self
+            .start_run_inner(Some(blocks), crate::managed_run::EventSink::Plain)
+            .await;
+        Ok(crate::managed_run::TrackedAgentRun {
+            events: plain_events(events),
+            control,
+        })
+    }
+
     async fn start_run(
         &mut self,
         blocks: Option<Vec<ContentBlock>>,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        let (events, control) = self
+            .start_run_inner(blocks, crate::managed_run::EventSink::Plain)
+            .await;
+        // The ordinary API keeps its historical semantics: the caller owns only
+        // the stream. Detaching the control here is exactly the old behaviour
+        // (`JoinHandle` dropped, run continues), never a new cancellation.
+        std::mem::forget(control);
+        Ok(plain_events(events))
+    }
+
+    /// Shared run construction for every entry point.
+    ///
+    /// `sink` decides the event channel policy. The reset, the provider/tool
+    /// clones and the loop invocation are identical in every variant so the
+    /// ordinary path cannot drift from the managed one.
+    async fn start_run_inner(
+        &mut self,
+        blocks: Option<Vec<ContentBlock>>,
+        sink: crate::managed_run::EventSink,
+    ) -> (
+        BoxStream<'static, QueuedEvent>,
+        crate::managed_run::ManagedRunControl,
+    ) {
         // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
         // ...and a fresh per-tool-call token map: an id from the previous run
@@ -687,9 +753,21 @@ impl Agent {
         let inbox = self.inbox.clone();
         let tool_call_tokens = self.tool_call_tokens.clone();
 
+        let children = crate::managed_run::ChildTasks::new();
+        let loop_children = children.clone();
+
         let (tx, rx) = mpsc::unbounded_channel();
-        let tx = EventTx(tx);
-        tokio::spawn(async move {
+        let tx = match sink {
+            crate::managed_run::EventSink::Plain => EventTx::plain(tx),
+            crate::managed_run::EventSink::Budgeted(limits) => EventTx::managed(
+                tx,
+                crate::managed_run::QueueBudget::new(limits),
+                cancel_token.clone(),
+            ),
+        };
+
+        let loop_cancel = cancel_token.clone();
+        let root = tokio::spawn(async move {
             if tx.send(AgentEvent::Start).await.is_err() {
                 return; // Receiver dropped, stop the loop
             }
@@ -699,18 +777,26 @@ impl Agent {
                 tools,
                 session,
                 config,
-                cancel_token,
+                loop_cancel,
                 permission_checker,
                 decision_rx,
                 provider_turn_gate,
                 inbox,
                 tool_call_tokens,
+                loop_children,
             )
             .await;
         });
 
-        Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed())
+        let events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed();
+        let control = crate::managed_run::ManagedRunControl::new(cancel_token, root, children);
+        (events, control)
     }
+}
+
+/// Strip the queue bookkeeping from an unmanaged run's stream.
+fn plain_events(events: BoxStream<'static, QueuedEvent>) -> BoxStream<'static, AgentEvent> {
+    events.map(|queued| queued.event).boxed()
 }
 
 /// How many leading messages of `session` form a provider-valid transcript:
@@ -784,33 +870,123 @@ fn retryable_provider_error_cause(error: &ProviderError) -> Option<RetryCause> {
 
 /// Sender half of the agent's event stream.
 ///
-/// Backed by an **unbounded** channel so streamed events are never dropped when
-/// the consumer renders more slowly than the provider emits. Previously this
-/// was a bounded `mpsc::Sender` whose streamed-text forwarding used `try_send`,
-/// which silently discarded deltas — including the tail of long messages — as
-/// soon as the buffer filled (see
+/// The ordinary run is backed by an **unbounded** channel so streamed events are
+/// never dropped when the consumer renders more slowly than the provider emits.
+/// Previously this was a bounded `mpsc::Sender` whose streamed-text forwarding
+/// used `try_send`, which silently discarded deltas — including the tail of long
+/// messages — as soon as the buffer filled (see
 /// `lagging_consumer_still_receives_every_text_delta`).
 ///
+/// A managed run (side conversation) instead uses a bounded channel plus a
+/// [`crate::managed_run::QueueBudget`]: production waits for a reservation
+/// before enqueueing, so neither the item count nor the byte count can grow
+/// without bound, and stopping wins over waiting.
+///
 /// The method shapes mirror `tokio::sync::mpsc::Sender` (`async send` +
-/// `try_send`) so call sites read uniformly. Neither call blocks, and both only
-/// fail once the receiver has been dropped.
+/// `try_send`) so call sites read uniformly.
 #[derive(Clone)]
-struct EventTx(tokio::sync::mpsc::UnboundedSender<AgentEvent>);
+struct EventTx {
+    inner: EventTxInner,
+}
+
+#[derive(Clone)]
+enum EventTxInner {
+    Plain(tokio::sync::mpsc::UnboundedSender<QueuedEvent>),
+    Managed {
+        tx: tokio::sync::mpsc::UnboundedSender<QueuedEvent>,
+        budget: Arc<crate::managed_run::QueueBudget>,
+        cancel: CancellationToken,
+    },
+}
+
+/// One queued event, with the queue slot it holds (if any).
+pub(crate) struct QueuedEvent {
+    pub(crate) event: AgentEvent,
+    pub(crate) lease: Option<crate::managed_run::QueueLease>,
+}
 
 impl EventTx {
-    fn send(
-        &self,
-        event: AgentEvent,
-    ) -> std::future::Ready<Result<(), tokio::sync::mpsc::error::SendError<AgentEvent>>> {
-        std::future::ready(self.0.send(event))
+    fn plain(tx: tokio::sync::mpsc::UnboundedSender<QueuedEvent>) -> Self {
+        Self {
+            inner: EventTxInner::Plain(tx),
+        }
     }
 
-    fn try_send(
-        &self,
-        event: AgentEvent,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<AgentEvent>> {
-        self.0.send(event)
+    fn managed(
+        tx: tokio::sync::mpsc::UnboundedSender<QueuedEvent>,
+        budget: Arc<crate::managed_run::QueueBudget>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            inner: EventTxInner::Managed { tx, budget, cancel },
+        }
     }
+
+    /// Queue an event, waiting for room in a managed run.
+    ///
+    /// In a managed run a full queue is a stop condition, not something to
+    /// ignore: the sender cancels the run so the producer cannot be silently
+    /// starved, and the caller learns the event did not land.
+    async fn send(&self, event: AgentEvent) -> Result<(), SendFailed> {
+        match &self.inner {
+            EventTxInner::Plain(tx) => tx
+                .send(QueuedEvent { event, lease: None })
+                .map_err(|_| SendFailed::Closed),
+            EventTxInner::Managed { tx, budget, cancel } => {
+                let bytes = crate::managed_run::approximate_event_bytes(&event);
+                let lease = match budget.reserve(bytes, cancel).await {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        cancel.cancel();
+                        return Err(SendFailed::Full);
+                    }
+                };
+                tx.send(QueuedEvent {
+                    event,
+                    lease: Some(lease),
+                })
+                .map_err(|_| SendFailed::Closed)
+            }
+        }
+    }
+
+    /// Non-blocking variant used by the provider-delta hot path.
+    ///
+    /// Unmanaged runs keep their historical "always succeeds until the receiver
+    /// drops" behaviour. A managed run never drops an authoritative delta: if
+    /// the queue has no room it cancels the run instead of discarding, which is
+    /// visible to the caller as `Full`.
+    fn try_send(&self, event: AgentEvent) -> Result<(), SendFailed> {
+        match &self.inner {
+            EventTxInner::Plain(tx) => tx
+                .send(QueuedEvent { event, lease: None })
+                .map_err(|_| SendFailed::Closed),
+            EventTxInner::Managed { tx, budget, cancel } => {
+                let bytes = crate::managed_run::approximate_event_bytes(&event);
+                let lease = match budget.try_reserve(bytes) {
+                    Some(lease) => lease,
+                    None => {
+                        cancel.cancel();
+                        return Err(SendFailed::Full);
+                    }
+                };
+                tx.send(QueuedEvent {
+                    event,
+                    lease: Some(lease),
+                })
+                .map_err(|_| SendFailed::Closed)
+            }
+        }
+    }
+}
+
+/// Why an event could not be queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailed {
+    /// The consumer is gone.
+    Closed,
+    /// The managed queue had no room; the run was cancelled.
+    Full,
 }
 
 /// Move every queued interjection into the transcript, announcing each one.
@@ -1237,6 +1413,7 @@ async fn act_phase(
     cancel_token: &CancellationToken,
     tool_uses: Vec<(String, String, Value)>,
     turn: u32,
+    children: &crate::managed_run::ChildTasks,
 ) -> Option<ActOutcome> {
     // 3. ACT - permission check + parallel execution
     info!(turn, tool_count = tool_uses.len(), tools = ?tool_uses.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(), "act: executing tools");
@@ -1381,7 +1558,7 @@ async fn act_phase(
                 let (event_tx, mut event_rx) = mpsc::channel::<ToolEvent>(64);
                 let fwd_tx = tx.clone();
                 let fwd_id = id.clone();
-                tokio::spawn(async move {
+                children.spawn(async move {
                     while let Some(ev) = event_rx.recv().await {
                         let agent_ev = match ev {
                             ToolEvent::OutputDelta { stream, text } => {
@@ -1513,6 +1690,7 @@ async fn run_loop(
     provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
     inbox: Option<InboxHandle>,
     tool_call_tokens: ToolCallTokens,
+    children: crate::managed_run::ChildTasks,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
     let mut turn = 0u32;
@@ -1661,6 +1839,7 @@ async fn run_loop(
             &cancel_token,
             tool_uses,
             turn,
+            &children,
         )
         .await
         else {
@@ -2319,6 +2498,82 @@ mod tests {
             });
             *idx += 1;
             Ok(futures::stream::iter(script).boxed())
+        }
+    }
+
+    /// Provider whose first stream never resolves on its own.
+    ///
+    /// Records that the run actually entered the stream (`entered`), and sets
+    /// `dropped` from a guard **inside** the returned stream, so a test can prove
+    /// the production side was torn down rather than merely unsubscribed.
+    struct PendingProvider {
+        entered: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Signals `dropped` when the stream carrying it is dropped.
+    struct DropGuard(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Provider for PendingProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let guard = DropGuard(self.dropped.clone());
+            let entered = self.entered.clone();
+            let stream = futures::stream::once(async move {
+                entered.notify_one();
+                std::future::pending::<ProviderEvent>().await
+            })
+            .chain(futures::stream::once(async move {
+                // Reached only if the pending arm somehow yields; keeps the
+                // guard alive for the stream's whole lifetime either way.
+                drop(guard);
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                }
+            }));
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// A tool that parks while holding its `ToolEvent` sender.
+    ///
+    /// That keeps the run loop's ToolEvent forwarder waiting on a channel that
+    /// is still open, which is exactly the child task a managed close has to
+    /// reap (the forwarder is `tokio::spawn`ed inside `act_phase`).
+    struct ParkingTool {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for ParkingTool {
+        fn name(&self) -> &str {
+            "park"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn description(&self) -> &str {
+            "Parks while holding its event sender"
+        }
+        async fn call(&self, _args: serde_json::Value) -> ToolResult {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            ToolResult::text("unreachable")
+        }
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata {
+                read_only: true,
+                ..Default::default()
+            }
         }
     }
 
@@ -6195,5 +6450,220 @@ mod tests {
             "with_session_arc must reuse the caller's Arc, not mint a new one"
         );
         assert_eq!(rebuilt.session().messages().len(), 1);
+    }
+
+    /// Build an agent whose provider blocks forever on its first call.
+    async fn managed_pending_agent() -> (
+        Agent,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(PendingProvider {
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+        });
+        let agent = Agent::new(
+            provider,
+            Arc::new(crate::ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        (agent, entered, dropped)
+    }
+
+    /// The managed close must join the *actual* core task, not just drop the
+    /// consumer. Before the fix the loop task was detached, so a blocked
+    /// provider stream could outlive every handle the caller had.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_close_joins_actual_core_task() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (mut agent, entered, dropped) = managed_pending_agent().await;
+        let mut run = agent
+            .run_managed_blocks(
+                vec![ContentBlock::Text("旁问".into())],
+                crate::managed_run::ManagedRunLimits::side_defaults(),
+            )
+            .await
+            .unwrap();
+        entered.notified().await;
+        run.control
+            .stop_and_join(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(run.control.is_finished());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// A token captured before the run must not stop the run: every run resets
+    /// its own token, and the managed control hands back *that* one.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_old_token_cannot_end_the_new_run() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (mut agent, entered, dropped) = managed_pending_agent().await;
+        let old_token = agent.cancel_token.clone();
+        let mut run = agent
+            .run_managed_blocks(
+                vec![ContentBlock::Text("旁问".into())],
+                crate::managed_run::ManagedRunLimits::side_defaults(),
+            )
+            .await
+            .unwrap();
+        entered.notified().await;
+        old_token.cancel();
+        // Yield so a wrongly-shared token would have cancelled the loop.
+        tokio::task::yield_now().await;
+        assert!(
+            !run.control.is_finished(),
+            "a pre-run token must not cancel the new run"
+        );
+        run.control
+            .stop_and_join(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(run.control.is_finished());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// Dropping the control is enough to stop the run — nothing is detached —
+    /// and the real core task reaches a terminal state afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_control_drop_stops_the_real_task() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (mut agent, entered, dropped) = managed_pending_agent().await;
+        let run = agent
+            .run_managed_blocks(
+                vec![ContentBlock::Text("旁问".into())],
+                crate::managed_run::ManagedRunLimits::side_defaults(),
+            )
+            .await
+            .unwrap();
+        entered.notified().await;
+        let control = run.control;
+        drop(control);
+        // Drop aborts synchronously; give the runtime a tick to run the abort.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the control must tear down the provider stream"
+        );
+    }
+
+    /// The plain API keeps its historical contract: dropping the stream does not
+    /// cancel the run, and the session still receives the completed turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordinary_run_stream_drop_keeps_historical_behaviour() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("finished".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        // Drop the stream immediately: the detached loop must still finish.
+        drop(agent.run("hi".into()).await.unwrap());
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let messages = agent.session().messages().to_vec();
+            if messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && !m.content.is_empty())
+            {
+                return;
+            }
+        }
+        panic!("the detached ordinary run must still complete after its stream drops");
+    }
+
+    /// Managed runs bound the queued event bytes: a consumer that never reads
+    /// cannot let a chatty producer grow memory without limit.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_queue_is_bounded_by_limits() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("x".repeat(4096)),
+            ProviderEvent::TextDelta("x".repeat(4096)),
+            ProviderEvent::TextDelta("x".repeat(4096)),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let mut limits = crate::managed_run::ManagedRunLimits::side_defaults();
+        limits.event_bytes = 2048;
+        limits.event_count = 4;
+        let mut run = agent
+            .run_managed_blocks(vec![ContentBlock::Text("q".into())], limits)
+            .await
+            .unwrap();
+        // Never poll `events`: the queue fills and the producer is cancelled
+        // instead of buffering everything.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        run.control
+            .stop_and_join(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(run.control.is_finished());
+    }
+
+    /// Closing a managed run must reap the ToolEvent forwarder too.
+    ///
+    /// The forwarder is spawned inside `act_phase`; before this task it was a
+    /// plain `tokio::spawn` and outlived every handle the caller had, so a
+    /// side close could not claim the task tree was quiet.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_close_reaps_the_tool_event_forwarder() {
+        use std::time::Duration;
+
+        let tool_entered = Arc::new(tokio::sync::Notify::new());
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "park".into(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: "t1".into() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ParkingTool {
+            entered: tool_entered.clone(),
+        }));
+        let mut agent = Agent::new(Arc::new(provider), Arc::new(tools), AgentConfig::default());
+
+        let mut run = agent
+            .run_managed_blocks(
+                vec![ContentBlock::Text("q".into())],
+                crate::managed_run::ManagedRunLimits::side_defaults(),
+            )
+            .await
+            .unwrap();
+        tool_entered.notified().await;
+
+        // The grace expires because the tool never returns; the forced abort
+        // must still leave nothing running.
+        run.control
+            .stop_and_join(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(run.control.is_finished());
     }
 }

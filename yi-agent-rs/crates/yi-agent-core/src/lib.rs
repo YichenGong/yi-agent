@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod autonomy;
 pub mod compact;
+pub mod managed_run;
 pub mod message;
 pub mod permission;
 pub mod provider;
@@ -22,6 +23,9 @@ pub use agent::{
 pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
     DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
+};
+pub use managed_run::{
+    BudgetedAgentEvent, ManagedAgentRun, ManagedRunControl, ManagedRunLimits, TrackedAgentRun,
 };
 pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role, ThinkingToken};
 pub use provider::{
