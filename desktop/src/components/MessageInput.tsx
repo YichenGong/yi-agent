@@ -3,10 +3,27 @@ import { AttachmentChips } from "./AttachmentChips";
 import { ModeChip } from "./ModeChip";
 import { SlashPopup } from "./SlashPopup";
 import { filterCommands, parseSlashInput } from "../lib/slash";
+import { sideInputPolicy, type SideCommand } from "../lib/sideCommands";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import type { ThreadMode } from "../lib/threadPermissionMode";
 import type { PendingAttachment } from "../lib/attachmentLimits";
 import type { ImageReadCall } from "../lib/useImageData";
+
+/** 输入框所属会话的形状。既有调用点不需要关心它（见 `DEFAULT_CONVERSATION`）。 */
+export interface ComposerConversation {
+  view: "main" | "side";
+  /** 该宿主是否声明了 `side_conversation_v1`。 */
+  supported: boolean;
+  /** 本设备能否下发 Control 类操作（Observe 不能）。 */
+  canControl: boolean;
+}
+
+/** 缺省上下文：主会话、宿主支持、可控制。 */
+const DEFAULT_CONVERSATION: ComposerConversation = {
+  view: "main",
+  supported: true,
+  canControl: true,
+};
 
 export function MessageInput({
   turnActive,
@@ -29,6 +46,8 @@ export function MessageInput({
   dropActive = false,
   caretSeek = null,
   onCaretChange,
+  conversation = DEFAULT_CONVERSATION,
+  onSideCommand = null,
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -107,6 +126,24 @@ export function MessageInput({
    * 用户当前的光标位置，报给上层。上层记着它，拖入时才知道该往哪里插。
    */
   onCaretChange?: (caret: number) => void;
+  /**
+   * 这个输入框属于哪条会话，以及它能不能下发 Control 操作。
+   *
+   * 缺省是 `main` / 支持 / 可控制 / 无附件：既有调用点逐字节不变。旁支传入
+   * `view: "side"`，`supported`/`canControl` 来自该宿主的握手结果。
+   *
+   * 为什么把 `supported`/`canControl` 放在这里而不是组件去查全局：一个进程
+   * 同时连本地与 N 个远端项目，它们的答案各不相同。查「当前连接」的那一份
+   * 会把一台只读的远端设备渲染成可写。
+   */
+  conversation?: ComposerConversation;
+  /**
+   * 旁支命令的执行入口（`open`/`back`/`close` 与旁支作用域内的状态命令）。
+   *
+   * 缺省 `null`：没有接旁支的调用点保持原样，旁支命令只会被当成普通文本——
+   * 这与改动前的行为一致（`side` 那时不是目录里的命令）。
+   */
+  onSideCommand?: ((command: SideCommand) => boolean | Promise<boolean>) | null;
 }) {
   const [sending, setSending] = useState(false);
   // Latch: whether the popup should currently be offered. Escape clears it to
@@ -131,6 +168,31 @@ export function MessageInput({
 
   const text = value;
   const parsed = parseSlashInput(text);
+  /**
+   * 这条输入该做什么。**所有入口都问它**：Enter、Send、禁用判定、手机例外。
+   *
+   * 散落成三处各自判断的话，旁支与手机 Stop-only 会各长出一个例外，而第四个
+   * 入口（新加的按钮、补全确认）永远会漏掉其中一个。
+   */
+  const policy = sideInputPolicy({
+    platform: isMobile ? "mobile" : "desktop",
+    view: conversation.view,
+    running: turnActive,
+    attachmentCount: attachments.length,
+    text,
+    supported: conversation.supported,
+    canControl: conversation.canControl,
+  });
+  /**
+   * 有没有一条**可执行**的命令（而不是普通文字）。
+   *
+   * 手机上运行中只显示 Stop，但旁支命令是显式例外：用户敲了 `/btw ...` 却只
+   * 看到 Stop，会以为功能不存在。为真时额外给出一颗「命令」按钮。
+   */
+  const hasSideCommand =
+    policy.action === "executeSideCommand" &&
+    (isMobile || conversation.view === "side");
+  const isSideView = conversation.view === "side";
   // Command names contain no spaces (the catalog has no argument-bearing
   // names), so a space means the caret left the name for the argument list and
   // the popup closes. A bare `/` opens the popup too, even though
@@ -171,9 +233,14 @@ export function MessageInput({
     }
   };
 
-  /** Commands and text share a submission lock, including same-tick Enter. */
+  /**
+   * Commands and text share a submission lock, including same-tick Enter.
+   *
+   * 守卫不再在这里判「手机运行中」：那条规则属于策略（见 `policy`），在这里
+   * 再判一次就会与策略分叉——旁支命令恰恰是手机运行中的合法例外。
+   */
   const runSlash = async (name: string, args: string | null) => {
-    if (submitting.current || disabled || (isMobile && turnActive)) return;
+    if (submitting.current || disabled) return;
     submitting.current = true;
     setSending(true);
     try {
@@ -187,10 +254,43 @@ export function MessageInput({
     }
   };
 
-  // Enter and Send use the same dispatch: a slash command must never leak to
-  // the agent just because the user clicked instead of pressing Enter.
+  /** 执行旁支命令。不带 `onSideCommand` 时按普通命令回落。 */
+  const runSideCommand = async (command: SideCommand) => {
+    if (submitting.current || disabled) return;
+    submitting.current = true;
+    setSending(true);
+    try {
+      const accepted =
+        command.kind === "command"
+          ? await onSlashCommand(command.name, command.args)
+          : await (onSideCommand?.(command) ?? false);
+      if (accepted) {
+        clearSubmittedDraft(text);
+        setPopupOpen(false);
+      }
+    } finally {
+      submitting.current = false;
+      setSending(false);
+    }
+  };
+
+  /** 策略拦截时的一句话。不清稿、不发请求。 */
+  const blockedReason = policy.reason ?? null;
+  void blockedReason;
+
+  /**
+   * Enter, Send 与手机上的命令按钮**共用**这一条分派。
+   *
+   * 顺序是：先问策略，再决定是命令、旁支还是普通消息。命令永远不能因为用户
+   * 点了按钮而不是按回车就漏给模型——那是「点了 /clear 结果模型收到一段
+   * 『/clear』」的由来。
+   */
   const handleSendClick = () => {
-    if (isMobile && turnActive) return;
+    if (policy.action === "stop" || policy.action === "blocked") return;
+    if (policy.action === "executeSideCommand" && policy.command) {
+      void runSideCommand(policy.command);
+      return;
+    }
     if (parsed.kind === "command") {
       // Desktop completion applies equally to Enter and Send. Mobile retains
       // its existing exact-command semantics because it has no Enter-to-send.
@@ -213,8 +313,15 @@ export function MessageInput({
 
   // 「没什么可发」时按钮就该是灰的，而不是点了没反应：文字与附件都是空时才算空；
   // 附件已在路上时按钮要亮着，否则「只发文件」这条路径在 UI 上根本走不通。
+  //
+  // 旁支里「运行中」时 Send 换成本会话的 Stop（见下方渲染）；策略判 `stop`
+  // 时只保留 Stop，普通文字不得插话。
   const sendDisabled =
-    disabled || sending || (!text.trim() && attachments.length === 0);
+    disabled ||
+    sending ||
+    (!text.trim() && attachments.length === 0) ||
+    policy.action === "stop" ||
+    policy.action === "blocked";
   // Stop 只受「这个输入区是否可用」约束：`sending` 表示**这次发送还没回包**，
   // 与「服务端这一轮是否在跑」无关——turn/started 可能早已到达、bash 可能已经在
   // 输出，而 Promise 仍挂着。把它算进来会让 Stop 在这段时间里点不动（真机上常见
@@ -376,7 +483,27 @@ export function MessageInput({
                   Stop
                 </button>
               )}
-              {(!turnActive || !isMobile) && (
+              {hasSideCommand && (
+                <button
+                  type="button"
+                  onClick={handleSendClick}
+                  disabled={disabled || sending}
+                  className="rounded-md border border-line-strong px-3 py-2 text-sm text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50 max-md:ml-auto"
+                >
+                  命令
+                </button>
+              )}
+              {(!turnActive || !isMobile) && !isSideView && (
+                <button
+                  type="button"
+                  onClick={handleSendClick}
+                  disabled={sendDisabled}
+                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
+                >
+                  Send
+                </button>
+              )}
+              {isSideView && !turnActive && (
                 <button
                   type="button"
                   onClick={handleSendClick}

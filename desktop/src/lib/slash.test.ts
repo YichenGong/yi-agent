@@ -1,14 +1,16 @@
 import { describe, it, expect } from "vitest";
 import {
   SLASH_COMMANDS,
+  SLASH_ALIASES,
   filterCommands,
   parseSlashInput,
   HELP_GROUPS,
   canRunSlashDuringTurn,
+  canonicalCommandName,
 } from "./slash";
 
 describe("slash command catalog", () => {
-  it("lists exactly the six supported commands, in popup order", () => {
+  it("lists exactly the supported commands, in popup order", () => {
     expect(SLASH_COMMANDS.map((c) => c.name)).toEqual([
       "clear",
       "compact",
@@ -16,7 +18,34 @@ describe("slash command catalog", () => {
       "config",
       "usage",
       "help",
+      "side",
+      "back",
+      "side-close",
     ]);
+  });
+
+  it("does not list the /btw alias as its own catalog row", () => {
+    // 别名进目录的话，帮助与补全里会出现两条一模一样的「打开旁问」。
+    expect(SLASH_COMMANDS.map((c) => c.name)).not.toContain("btw");
+    expect(SLASH_ALIASES.btw).toBe("side");
+    expect(canonicalCommandName("btw")).toBe("side");
+    expect(canonicalCommandName("side")).toBe("side");
+    expect(canonicalCommandName("usage")).toBe("usage");
+  });
+
+  it("resolves /btw to the canonical /side row in the popup", () => {
+    const hits = filterCommands("btw");
+    // 别名折回规范名后按前缀匹配：`side` 与 `side-close` 都以它开头，两条都算
+    // 合法候选（用户敲 /side 时自然该看到「关闭旁问」）。
+    expect(hits.map((c) => c.name)).toEqual(["side", "side-close"]);
+  });
+
+  it("offers the side commands mid-turn so the parent is not interrupted", () => {
+    for (const name of ["side", "back", "side-close"]) {
+      expect(canRunSlashDuringTurn(name)).toBe(true);
+    }
+    // btw 是 side 的别名：解析后仍应在白名单里。
+    expect(canRunSlashDuringTurn("btw")).toBe(true);
   });
 
   it("offers /fork with an optional message argument", () => {
@@ -86,8 +115,13 @@ describe("help groups", () => {
     expect(flat).toHaveLength(SLASH_COMMANDS.length);
   });
 
-  it("names the three groups", () => {
-    expect(HELP_GROUPS.map((g) => g.title)).toEqual(["会话", "状态", "帮助"]);
+  it("names the groups in display order", () => {
+    expect(HELP_GROUPS.map((g) => g.title)).toEqual([
+      "会话",
+      "旁问",
+      "状态",
+      "帮助",
+    ]);
   });
 });
 

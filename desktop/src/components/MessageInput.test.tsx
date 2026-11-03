@@ -836,3 +836,164 @@ describe("MessageInput asynchronous submission isolation", () => {
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("new external draft");
   });
 });
+
+// 旁支把「运行中」的语义从「父会话在跑」改成「这条会话在跑」。固化的断言是
+// 三个入口（Enter / Send / 手机命令按钮）必须给出同一个结论。
+describe("MessageInput side routing", () => {
+  const side = { view: "side" as const, supported: true, canControl: true };
+
+  it("sends to the side, not the parent, when the side is idle", async () => {
+    const onSend = vi.fn(async () => true);
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      conversation: side,
+      onSend,
+      onSideCommand,
+      value: "follow up",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("follow up"));
+    expect(onSideCommand).not.toHaveBeenCalled();
+  });
+
+  it("shows only Stop inside a running side, even on desktop", () => {
+    const onSend = vi.fn(async () => true);
+    renderInput({
+      conversation: side,
+      turnActive: true,
+      onSend,
+      value: "should not be sent",
+    });
+    // 旁支运行中：没有 Send，也没有「命令」按钮，只有它自己的 Stop。
+    expect(screen.queryByRole("button", { name: /^send$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "命令" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeTruthy();
+  });
+
+  it("dispatches /back through onSideCommand without touching onSlashCommand", async () => {
+    const onSlashCommand = vi.fn(() => true);
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      conversation: side,
+      onSideCommand,
+      onSlashCommand,
+      value: "/back",
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await waitFor(() =>
+      expect(onSideCommand).toHaveBeenCalledWith({ kind: "back" }),
+    );
+    expect(onSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("runs /help inside the side scope through the slash handler", async () => {
+    const onSlashCommand = vi.fn(() => true);
+    renderInput({ conversation: side, onSlashCommand, value: "/help" });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await waitFor(() =>
+      expect(onSlashCommand).toHaveBeenCalledWith("help", null),
+    );
+  });
+
+  it("keeps the draft and sends nothing for a blocked side command", async () => {
+    const onSend = vi.fn(async () => true);
+    const onDraftChange = vi.fn();
+    renderInput({
+      conversation: side,
+      onSend,
+      onDraftChange,
+      value: "/clear",
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("/clear");
+  });
+});
+
+describe("MessageInput mobile side commands", () => {
+  const main = { view: "main" as const, supported: true, canControl: true };
+
+  it("keeps ordinary text stop-only on a running mobile parent", async () => {
+    const onSend = vi.fn(async () => true);
+    renderInput({
+      isMobile: true,
+      conversation: main,
+      turnActive: true,
+      onSend,
+      value: "extra context",
+    });
+    expect(screen.queryByRole("button", { name: "命令" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
+    // Stop 打给本会话，普通文字不插话。
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("offers an exact /btw command on a running mobile parent", async () => {
+    const onSend = vi.fn(async () => true);
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      isMobile: true,
+      conversation: main,
+      turnActive: true,
+      onSend,
+      onSideCommand,
+      value: "/btw why is it slow",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "命令" }));
+    await waitFor(() =>
+      expect(onSideCommand).toHaveBeenCalledWith({
+        kind: "open",
+        question: "why is it slow",
+      }),
+    );
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("does not let a lookalike command bypass the mobile stop", async () => {
+    const onSend = vi.fn(async () => true);
+    const onSlashCommand = vi.fn(() => true);
+    renderInput({
+      isMobile: true,
+      conversation: main,
+      turnActive: true,
+      onSend,
+      onSlashCommand,
+      value: "/sidebar",
+    });
+    expect(screen.queryByRole("button", { name: "命令" })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("blocks side commands that carry attachments", async () => {
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      isMobile: true,
+      conversation: main,
+      turnActive: true,
+      onSideCommand,
+      value: "/btw look",
+      attachments: [{ id: "a1", name: "shot.png", kind: "document" } as never],
+    });
+    expect(screen.queryByRole("button", { name: "命令" })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {});
+    expect(onSideCommand).not.toHaveBeenCalled();
+  });
+
+  it("hides the side entry points entirely on an unsupporting host", async () => {
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      conversation: { view: "main", supported: false, canControl: true },
+      onSideCommand,
+      value: "/btw hi",
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {});
+    expect(onSideCommand).not.toHaveBeenCalled();
+  });
+});
