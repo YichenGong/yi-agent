@@ -41,6 +41,20 @@ pub(crate) fn signal_process_group(pid: u32, sig: i32) {
     }
 }
 
+/// 进程组 `pgid` 是否还有存活成员。
+///
+/// 用信号 `0` 探测「组」而不是查组长 pid：组长被 reap 之后 pid 在任何实现下都
+/// 查不到，只有对整组探测才能区分「子孙仍在」与「已清空」。
+#[cfg(unix)]
+pub(crate) fn group_exists(pgid: u32) -> bool {
+    unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn group_exists(_pgid: u32) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 pub(crate) fn signal_process_group(_pid: u32, _sig: i32) {}
 
