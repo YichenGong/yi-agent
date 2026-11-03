@@ -1,5 +1,7 @@
 # Bug 列表
 
+- [ ] P2 看板 running 卡误报“会话已经不在”：2026-11-03 现场两卡 `observations.json` 为 alive=false，但当前 sidecar 持有同 ID writer lock，meta/jsonl/partial 均仍存在。根因：`server/driver/tick.rs` 只刷新进程内 DriverState 已登记子集，重启后普通 RPC 恢复的热会话未被重新发现；插件 `service.rs::write_observations` 将未上报旧 ID 写为 false；桌面把“未观测到”错误表述为“已不存在”，把轮询时间表述为“最后活动”。根因调查、三轮 [spec](superpowers/specs/2026-11-03-kanban-stale-observation-design.md) 复核与 [plan](superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) 已完成，尚未实现或修复。完成判据：spec K1–K17，包含空 DriverState + 已恢复热会话的真 tick 回归、冷会话诚实文案、旧协议兼容及租约/合并安全测试。
+
 - [ ] P1 防休眠网络资格误判：`yi-agent-rs/crates/yi-agent-power/src/probe.rs` 只考虑 IPv4，且网关 TCP 80 超时视为离线；IPv6-only 或端口丢包但链路可用时，忙碌任务过宽限可能释放断言。代码审查确认，未做真实网络切换复现。修复判据：[spec](superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) N1–N8、[plan](superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Task 1 与 Task 7 真机验收。
 - [ ] P2 turn 投递失败残留保活：RPC `server/turn/mod.rs` send 失败只清 active_turn_id、不恢复 Idle；组长 cold `server/driver/launcher.rs` prepare 后 send 失败未回滚。`power_busy::local_busy` 因状态/占位继续算忙。代码审查确认；计划复用按身份失败收口，不误伤 warm 正在运行的 turn。修复判据：同一 spec T1–T7、plan Tasks 3–4、`cargo test -p yi-agent-app-server --lib sleep_hardening_`。
 - [ ] P3 电源线程退出阻塞：`probe.rs` 的 route.output 无超时，PowerGuard Drop join 等完整 tick，50ms 仅能打断轮询等待。原始 PowerGuard 配合临时 route 延迟3秒替身实测 Drop 为 3.008996166s；该数值不是生产 route 耗时。修复判据：同一 spec G1–G5、plan Task 2，已持断言真实循环及 Task 7 真机退出预算。以上三项仅完成设计与计划，尚未修复。

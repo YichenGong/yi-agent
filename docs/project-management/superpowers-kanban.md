@@ -28,6 +28,8 @@
 
 ## Features
 
+- [ ] **会话存活观测误报修复** — 根因调查、三轮 [spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) 复核与 [plan](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) 已完成，尚未实现。宿主 driver 登记在重启后为空，普通恢复的热会话未被重新发现；缺快照被判为死亡，UI 又把未加载写成历史不存在。完成判据：spec K1–K17，尤其真实 driver_tick + 普通 thread/resume 后同 ID loaded/stale=false、冷会话只提示当前宿主未加载、租约不重复且不释放不确定合并 attempt。验证入口：`cargo test -p yi-agent-app-server --lib kanban_observation_`、`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`，以及 spec §9 桌面与真机验收。
+
 - [ ] **完整插件独立发布** — 界面、执行程序与 skill 统一版本，通过通用宿主安装和加载；官方包校验、显式项目启用、安全更新及远端版本匹配均须通过。完成判据：[设计](../superpowers/specs/2026-11-02-kanban-independent-release-design.md) §13 的 A01–A20 全部验收项，尤其在同一 yi-agent 应用包下更新看板界面且主程序发布物摘要不变。[实施总计划](../superpowers/plans/2026-11-02-kanban-independent-release.md) 已列出 27 个主任务、技术验证与子协议审阅门槛，当前仅完成设计、计划与多轮文档复查，尚未实现。
 
 - [x] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`（225 lib + 45 bin 通过）。
