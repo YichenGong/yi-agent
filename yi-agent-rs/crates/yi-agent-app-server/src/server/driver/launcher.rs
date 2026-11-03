@@ -195,6 +195,30 @@ where
                         eprintln!("[app-server] could not append a turn to {thread_id}: {error}");
                     })
             }
+            DriverActionKind::ResumeAppend {
+                thread_id,
+                workdir,
+                objective,
+                env,
+            } => {
+                // 合并授权必须回到**原会话**。内核负责热追加与冷装配(见
+                // `server/driver_resume.rs`)；本臂只做透传。
+                //
+                // 这里**绝不**退化成分派 `Launch`：那会用新会话顶替原会话，静默
+                // 切断上下文，正是本次要修的行为。所有失败都带分类
+                // (`busy` / `thread_not_found` / `workdir_missing` /
+                // `restore_failed` / `delivery_failed`)，让插件能把卡转 NeedsYou
+                // 而不是盲目重派。
+                let thread_id = thread_id.clone();
+                self.resume_append_inner(&thread_id, workdir, objective, env.clone())
+                    .await
+                    .inspect_err(|error| {
+                        eprintln!(
+                            "[app-server] could not resume thread {thread_id} for a merge turn: \
+                         {error}"
+                        );
+                    })
+            }
         }
     }
 }
@@ -369,7 +393,7 @@ where
     ///
     /// 首轮(新建会话)与追问轮(已有会话)共用:两者只差 thread 是否已存在——
     /// 调用方负责保证它存在(首轮刚由 `start_thread_core` 登记,追问轮由调用方先探)。
-    async fn prepare_and_deliver(
+    pub(crate) async fn prepare_and_deliver(
         &mut self,
         thread_id: &str,
         objective: &str,
@@ -415,14 +439,27 @@ where
         // `desktop/src/lib/session.ts` 用它断开 reasoning run 并置 `turnActive`,
         // 少了它,被驱动会话在侧栏里「运行中」的标志就只剩余额更弱的
         // `thread/status/updated`。
-        write_notification(
+        // 从这里开始,**本次调用拥有** `prepared.turn_id` 的占位。任何后续失败都
+        // 只回滚这一个占位(见 `rollback_turn`),绝不碰别的 turn。
+        let announced = write_notification(
             &hub,
             &Notification::TurnStarted {
                 thread_id: prepared.thread_id.clone(),
                 turn_id: prepared.turn_id.clone(),
             },
         )
-        .await?;
+        .await;
+        if let Err(error) = announced {
+            // `turn/started` 都没发出去,界面上没有「运行中」需要收尾,但占位必须
+            // 撤回,否则该会话会永远显示忙、后续每一拍驱动都拿到假 idle。
+            self.rollback_turn(
+                &prepared.thread_id,
+                &prepared.turn_id,
+                &prepared.status_handle,
+            )
+            .await;
+            return Err(error);
+        }
         // 状态走 `thread/status/updated`(通知),不是向某个 client 的响应,故可发:
         // 侧栏据此看到该会话正在跑。用 prepared 的句柄,保证与 `active_turn_id`
         // 的占位来自同一个 session。
@@ -437,7 +474,7 @@ where
         // 这不是「向客户端发 RPC 帧」——它是 thread-keyed 的 content 通知,与
         // RPC 客户端收到的同一条流;少了它,会话点开后 objective 会像修复前
         // 那样被迟到追到最底部(见 `opening_user_item`)。
-        emit_item(
+        let opened = emit_item(
             &hub,
             &prepared.thread_id,
             opening_user_item(
@@ -447,11 +484,22 @@ where
                 prepared.image_refs.clone(),
             ),
         )
-        .await?;
-        if prepared
+        .await;
+        if let Err(error) = opened {
+            // 已经宣告了这一轮,必须补一条结束通知,否则界面会永久停在「运行中」。
+            self.fail_announced_turn(
+                &prepared.thread_id,
+                &prepared.turn_id,
+                &prepared.status_handle,
+                &error.to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+        if let Err(error) = prepared
             .prompt_tx
             .send(TurnPrompt {
-                turn_id: prepared.turn_id,
+                turn_id: prepared.turn_id.clone(),
                 prompt: prepared.prompt,
                 activate: prepared.activate,
                 attachments: prepared.attachments,
@@ -461,14 +509,72 @@ where
                 lead_request_id: None,
             })
             .await
-            .is_err()
         {
-            return Err(anyhow::anyhow!(
+            let _ = error;
+            let message = format!(
                 "thread driver for {} is gone before its prompt",
                 prepared.thread_id
-            ));
+            );
+            // 已经宣告过这一轮,必须补结束通知并撤回占位(只撤回本次那一个)。
+            self.fail_announced_turn(
+                &prepared.thread_id,
+                &prepared.turn_id,
+                &prepared.status_handle,
+                &message,
+            )
+            .await;
+            return Err(anyhow::anyhow!(message));
         }
+        // send 成功就是成功:此后绝不允许把这一次再回报成「未接收」。
         Ok(prepared.thread_id)
+    }
+
+    /// 撤回**本次**占用的 turn 占位,并把状态收回 `Idle`。
+    ///
+    /// 关键在那一句比较:只有当 `active_turn_id` 仍然是**本次的** turn_id 时才清。
+    /// 无条件清零会把另一个正在跑的 turn 变成无主(`turn/cancel` 静默失效、
+    /// `is_idle` 谎报空闲)。这是 spec §7「prepare/send 失败只回滚本次拥有的 turn
+    /// 占位;不能清掉已有 busy turn」的落点。
+    async fn rollback_turn(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        status_handle: &Arc<std::sync::Mutex<ThreadStatus>>,
+    ) {
+        let owned = self.threads.get_mut(thread_id).is_some_and(|session| {
+            if session.active_turn_id.as_deref() == Some(turn_id) {
+                session.active_turn_id = None;
+                true
+            } else {
+                false
+            }
+        });
+        if owned {
+            let _ = update_status(self.hub, status_handle, thread_id, ThreadStatus::Idle).await;
+        }
+    }
+
+    /// 已经发出过 `turn/started` 的这一轮失败了:补一条 `turn/completed`
+    /// (`failed`)再撤占位,让界面收敛而不是永久「运行中」。
+    async fn fail_announced_turn(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        status_handle: &Arc<std::sync::Mutex<ThreadStatus>>,
+        error: &str,
+    ) {
+        let _ = write_notification(
+            self.hub,
+            &Notification::TurnCompleted {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                status: crate::protocol::TurnStatus::Failed,
+                error: Some(error.to_string()),
+                completed_at: Some(crate::thread_store::now_millis()),
+            },
+        )
+        .await;
+        self.rollback_turn(thread_id, turn_id, status_handle).await;
     }
 
     /// 把一条投递给组长的消息转成组长 thread 的一次 turn。
