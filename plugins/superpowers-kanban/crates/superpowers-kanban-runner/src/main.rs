@@ -741,12 +741,39 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
             .map(|path| format!(" @ {}", path.display()))
             .unwrap_or_default();
         let archived = if card.archived { " [archived]" } else { "" };
-        let stale = if superpowers_kanban_runner::observation::stale(card, &observations).is_some()
-        {
-            " [stale]"
-        } else {
-            ""
-        };
+        // 加载态一律走 `for_card` 的**同一个**投影，CLI 不自己再读一遍 `alive`：
+        // 两处各自解释，迟早会出现「桌面说没加载、命令行说已加载」。
+        //
+        // 措辞刻意区分三件事：`not_loaded` 是**当前宿主**明确没加载（历史可能还在）
+        // 并带上观测时刻；`unknown` 是根本没有有效证据（旧格式、查询失败、这一拍
+        // 没问）；`loaded` 不加角标。只有**明确**没加载才落回旧的 `[stale]` 角标，
+        // 因为那是既有调用方（脚本、人眼）认得的那一个。
+        let observation = superpowers_kanban_runner::observation::for_card(card, &observations);
+        let stale =
+            match observation {
+                superpowers_kanban_runner::observation::SessionObservation::NotLoaded => match card
+                    .thread_id
+                    .as_deref()
+                    .and_then(|thread| observations.threads.get(thread))
+                    .and_then(superpowers_kanban_runner::observation::Observation::presentation_at)
+                {
+                    Some(at) => format!(
+                        " [stale] 当前宿主未加载（截至 {}；历史可能仍存在）",
+                        at.to_rfc3339()
+                    ),
+                    None => " [stale] 当前宿主未加载（历史可能仍存在）".to_string(),
+                },
+                // 只有 running 且带执行 ID 的卡才谈得上有「加载问题」；其余卡片
+                // `for_card` 已经回 unknown，这里不给它们加噪音角标。
+                superpowers_kanban_runner::observation::SessionObservation::Unknown
+                    if card.state == superpowers_kanban_core::card::CardState::Running
+                        && superpowers_kanban_runner::observation::execution_thread_id(card)
+                            .is_some() =>
+                {
+                    " [observation unknown] 当前宿主未观测到（历史可能仍存在）".to_string()
+                }
+                _ => String::new(),
+            };
         let merging = if holder
             .as_ref()
             .is_some_and(|holder| holder.card_id == card.id.0)
@@ -1699,6 +1726,118 @@ mod tests {
         std::fs::write(state_dir.join("merge.attempt.json"), b"{").unwrap();
         let listing = command_list(state_dir, false).unwrap();
         assert!(listing.contains("UNREADABLE"), "{listing}");
+    }
+
+    /// 旧格式观测（只有 `alive:false`，没有新字段）**不能**声称会话已经不存在。
+    ///
+    /// 那是旧 runner 写的「上一拍没看见」，不是当前宿主对热表的回答。旧文案
+    /// 「会话已不在」正是本次要根除的误报，这里钉住它不会以 shell 端的形式回来。
+    #[test]
+    fn kanban_observation_cli_legacy_does_not_claim_deletion() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let id = CardId::new("card-1");
+        let mut board = Board::new();
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board.transition(&id, CardState::Running).unwrap();
+        board.set_thread_id(&id, "thread-1".into()).unwrap();
+        superpowers_kanban_runner::persist::save_board(&dir.path().join("board.json"), &board)
+            .unwrap();
+        // 旧格式文件：没有任何新字段。
+        std::fs::write(
+            dir.path().join("observations.json"),
+            r#"{"threads":{"thread-1":{"alive":false}}}"#,
+        )
+        .unwrap();
+
+        let text = command_list(dir.path(), false).unwrap();
+        assert!(
+            text.contains("[observation unknown]"),
+            "旧格式只能报「未观测到」：{text}"
+        );
+        assert!(
+            !text.contains("[stale]"),
+            "没有明确证据就不许说没加载：{text}"
+        );
+        assert!(!text.contains("会话已不在"), "旧误报文案不得回归：{text}");
+        assert!(!text.contains("最后活动"), "旧误报文案不得回归：{text}");
+        assert_eq!(card_state(dir.path(), "card-1"), "running", "观测不是迁移");
+    }
+
+    /// 明确 `not_loaded` 才给 `[stale]`，并带上观测时刻（RFC3339）。
+    #[test]
+    fn kanban_observation_cli_not_loaded_names_the_observation_time() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let id = CardId::new("card-1");
+        let mut board = Board::new();
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board.transition(&id, CardState::Running).unwrap();
+        board.set_thread_id(&id, "thread-1".into()).unwrap();
+        superpowers_kanban_runner::persist::save_board(&dir.path().join("board.json"), &board)
+            .unwrap();
+
+        let now = chrono::Local::now();
+        let mut observations = superpowers_kanban_runner::observation::ObservationFile::default();
+        // 完整快照里没有它 = 当前宿主明确没加载。
+        observations.threads.insert(
+            "thread-1".to_string(),
+            superpowers_kanban_runner::observation::Observation {
+                alive: false,
+                last_seen_alive_at: None,
+                session_observation: Some("not_loaded".to_string()),
+                observed_at: Some(now.to_rfc3339()),
+            },
+        );
+        superpowers_kanban_runner::observation::save(dir.path(), &observations).unwrap();
+
+        let text = command_list(dir.path(), false).unwrap();
+        assert!(text.contains("[stale]"), "{text}");
+        assert!(text.contains("当前宿主未加载"), "{text}");
+        assert!(text.contains(&now.to_rfc3339()), "必须报观测时刻：{text}");
+        assert!(text.contains("历史可能仍存在"), "{text}");
+        assert_eq!(card_state(dir.path(), "card-1"), "running", "观测不是迁移");
+    }
+
+    /// 已加载的卡不加任何角标：健康状态不需要解释。
+    #[test]
+    fn kanban_observation_cli_loaded_card_has_no_badge() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let id = CardId::new("card-1");
+        let mut board = Board::new();
+        board.enqueue(
+            id.clone(),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board.transition(&id, CardState::Running).unwrap();
+        board.set_thread_id(&id, "thread-1".into()).unwrap();
+        superpowers_kanban_runner::persist::save_board(&dir.path().join("board.json"), &board)
+            .unwrap();
+
+        let mut observations = superpowers_kanban_runner::observation::ObservationFile::default();
+        observations.observe("thread-1", true, chrono::Local::now());
+        superpowers_kanban_runner::observation::save(dir.path(), &observations).unwrap();
+
+        let text = command_list(dir.path(), false).unwrap();
+        assert!(!text.contains("[stale]"), "{text}");
+        assert!(!text.contains("observation unknown"), "{text}");
+        assert!(text.contains("card-1"), "{text}");
     }
 
     #[test]
