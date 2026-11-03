@@ -5,7 +5,11 @@
 //! it, and the failure mode is not a crash -- it is a runtime that starts under one
 //! configuration and is reused under another.
 
-use yi_agent_subagent::attach::BringUpPolicy;
+use std::path::Path;
+use std::time::Duration;
+
+use yi_agent_runtime::config::RuntimeConfig;
+use yi_agent_subagent::attach::{BringUpPolicy, ensure_owned_runtime_with_policy};
 
 #[test]
 fn the_default_path_is_still_the_embedded_one() {
@@ -43,4 +47,60 @@ fn an_unknown_or_absent_selector_falls_back_to_the_build_default() {
         BringUpPolicy::Embedded,
         "the selector is exact: a near miss must not silently change the path"
     );
+}
+
+/// A managed bring-up with no expectation must refuse instead of guessing.
+///
+/// The refusal is the substantive part: a managed runtime is classified against the
+/// artifact the caller shipped with, and `Unknown` is deliberately not permission to
+/// run work. If this returned `Ok`, the caller would silently get either a wrongly
+/// accepted runtime or a mismatched one.
+#[test]
+fn a_managed_bring_up_without_an_expected_artifact_is_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let cfg = RuntimeConfig::load_lenient(&yi_agent_runtime::config::ConfigOverrides {
+        workdir: Some(directory.path().to_path_buf()),
+        ..Default::default()
+    })
+    .expect("a lenient load must not need a model catalogue");
+    let outcome = ensure_owned_runtime_with_policy(
+        &cfg,
+        directory.path().join("runtime"),
+        &directory.path().join("models.json"),
+        directory.path(),
+        BringUpPolicy::Managed,
+        None,
+    );
+    let failure = match outcome {
+        Ok(_) => panic!("a managed start must not guess the artifact it expects"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.stage, "runtime bring-up");
+    assert!(
+        failure.cause.contains("artifact identity"),
+        "the refusal must name what is missing, got: {}",
+        failure.cause
+    );
+    assert!(
+        !failure.retryable,
+        "retrying without an expectation cannot help, so this is not transient"
+    );
+    assert!(
+        !directory.path().join("runtime").exists(),
+        "a refused managed start must not create a runtime directory"
+    );
+}
+
+/// The managed budget has to be long enough for the work it covers.
+#[test]
+fn the_managed_budget_covers_a_cold_guardian_and_daemon_start() {
+    // The guardian alone may spend 20 s starting its daemon before reporting
+    // failure, so a smaller end-to-end budget would time out a path that was about
+    // to succeed -- which reads as "the runtime is broken" rather than "we stopped
+    // waiting".
+    assert!(
+        yi_agent_subagent::attach::MANAGED_START_BUDGET >= Duration::from_secs(25),
+        "the managed budget must exceed the guardian's own start allowance"
+    );
+    let _ = Path::new("/");
 }

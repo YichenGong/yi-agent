@@ -545,6 +545,72 @@ pub fn ensure_owned_runtime(
     }
 }
 
+/// Brings up a project runtime according to `policy`.
+///
+/// This is the seam Task 18 adds. Both callers that used to reach
+/// [`ensure_owned_runtime`] directly (the app-server's project attach and the
+/// binding's repair path) now come through here, so switching the default is one
+/// decision in one place rather than an edit at every call site.
+///
+/// The two branches differ in *who owns the daemon*, and that is not a detail:
+///
+/// * `Embedded` may start a daemon inside this process, so this process's exit can
+///   take the runtime down. That is the historical behaviour and stays available
+///   for a manual daemon and for an explicitly-chosen legacy runtime.
+/// * `Managed` never starts a daemon here. It goes through the guardian, which owns
+///   the daemon and every process group, so this process exiting cannot stop the
+///   runtime another frontend is still using.
+///
+/// `expected` is the artifact the caller expects. It is `None` for the embedded
+/// path, which has no version coordination to do, and required for the managed one:
+/// a managed bring-up without an expectation cannot classify the runtime it finds,
+/// and `Unknown` is deliberately not a licence to run work.
+pub fn ensure_owned_runtime_with_policy(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    instance_home: &Path,
+    policy: BringUpPolicy,
+    expected: Option<&yi_agent_lifecycle::types::ArtifactIdentity>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    match policy {
+        BringUpPolicy::Embedded => ensure_owned_runtime(cfg, runtime_dir, models_path),
+        BringUpPolicy::Managed => {
+            let Some(expected) = expected else {
+                // A managed start that cannot say what it expects would have to guess
+                // the version, and the whole point of the managed path is that the
+                // guess is not silent. Refusing is the honest answer.
+                return Err(AttachFailure::new(
+                    "runtime bring-up",
+                    "the managed policy needs the artifact identity this client expects, \
+                     and none was supplied",
+                ));
+            };
+            // A managed start may legitimately take longer than a single control
+            // exchange: it forks a guardian, the guardian starts a daemon, and the
+            // daemon has to answer. The budget matches the guardian's own start
+            // allowance plus room for the attach that follows.
+            let deadline = yi_agent_lifecycle::deadline::Deadline::after(MANAGED_START_BUDGET);
+            attach_managed_project_runtime(
+                cfg,
+                runtime_dir,
+                instance_home,
+                expected,
+                yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
+                deadline,
+            )
+        }
+    }
+}
+
+/// How long a managed bring-up may take, end to end.
+///
+/// The guardian's daemon start alone is allowed 20 s; another 10 s covers the
+/// guardian fork itself, the coordination lock and the business attach. It is a
+/// ceiling for a wedged path, not an expected duration -- a warm runtime answers in
+/// milliseconds.
+pub const MANAGED_START_BUDGET: Duration = Duration::from_secs(30);
+
 /// Retires a *wedged* daemon (listening, but every request answers `internal`)
 /// so a fresh `Daemon::start` can take over.
 ///

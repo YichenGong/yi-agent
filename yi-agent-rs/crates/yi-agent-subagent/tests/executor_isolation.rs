@@ -233,6 +233,9 @@ fn killing_the_executor_group_stops_its_children() {
         owner: owner.clone(),
         root: None,
         execution: None,
+        // A tool group is not an authorized managed role: it gets no bootstrap
+        // descriptor, and must not be able to claim one.
+        bootstrap: None,
     };
     registry
         .spawn(command, Deadline::after(Duration::from_secs(5)))

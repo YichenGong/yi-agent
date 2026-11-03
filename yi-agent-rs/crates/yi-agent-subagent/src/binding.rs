@@ -33,6 +33,35 @@ struct RepairPlan {
     /// here so a repaired daemon keeps reading the same catalog the original
     /// bring-up used instead of re-deriving it from `$HOME`.
     models_path: PathBuf,
+    /// Which bring-up a repair is allowed to use, and what artifact it expects.
+    ///
+    /// Carried on the plan rather than read from the environment at repair time:
+    /// the first bring-up already decided the mode, and a repair that silently
+    /// switched from embedded to managed would change *who owns the daemon* in the
+    /// middle of a session.
+    bringup: BringUpChoice,
+}
+
+/// The bring-up a binding uses, together with the artifact a managed one expects.
+#[derive(Clone, Debug)]
+pub struct BringUpChoice {
+    pub policy: crate::attach::BringUpPolicy,
+    pub expected: Option<yi_agent_lifecycle::types::ArtifactIdentity>,
+    /// The instance home the scope is resolved against. Only the managed path
+    /// reads it; the embedded path has no scope to resolve.
+    pub instance_home: Option<PathBuf>,
+}
+
+// Written out rather than derived: `Default` must agree with the build default,
+// and a derive would quietly give `Embedded` even if that ever changes.
+impl Default for BringUpChoice {
+    fn default() -> Self {
+        Self {
+            policy: crate::attach::BringUpPolicy::default_for_build(),
+            expected: None,
+            instance_home: None,
+        }
+    }
 }
 
 /// The mutable half: which handle is current, and -- for a managed binding -- the
@@ -76,6 +105,27 @@ impl RuntimeBinding {
         models_path: PathBuf,
         initial: Arc<AttachedProjectRuntime>,
     ) -> Arc<Self> {
+        // The four-argument form is what tests and the historical embedded path
+        // use. It keeps the embedded policy, so a caller that never opted in cannot
+        // silently start reasoning about guardians.
+        Self::managed_with(
+            cfg,
+            runtime_dir,
+            models_path,
+            initial,
+            BringUpChoice::default(),
+        )
+    }
+
+    /// [`Self::managed`] with an explicit bring-up choice, so a repair is bound to
+    /// the same policy the first bring-up used.
+    pub fn managed_with(
+        cfg: &RuntimeConfig,
+        runtime_dir: PathBuf,
+        models_path: PathBuf,
+        initial: Arc<AttachedProjectRuntime>,
+        bringup: BringUpChoice,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BindingState {
                 handle: Self::handle_of(&initial),
@@ -86,6 +136,7 @@ impl RuntimeBinding {
                 cfg: cfg.clone(),
                 runtime_dir,
                 models_path,
+                bringup,
             }),
             flight: Mutex::new(()),
             last_active: Mutex::new(Instant::now()),
@@ -257,9 +308,18 @@ impl RuntimeBinding {
                 return Ok((state.handle.clone(), state.generation));
             }
         }
-        let fresh =
-            attach::ensure_owned_runtime(&plan.cfg, plan.runtime_dir.clone(), &plan.models_path)
-                .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
+        let fresh = attach::ensure_owned_runtime_with_policy(
+            &plan.cfg,
+            plan.runtime_dir.clone(),
+            &plan.models_path,
+            plan.bringup
+                .instance_home
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("")),
+            plan.bringup.policy,
+            plan.bringup.expected.as_ref(),
+        )
+        .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
         let handle = Self::handle_of(&fresh);
         let mut state = self.lock_state();
         state.handle = handle.clone();
