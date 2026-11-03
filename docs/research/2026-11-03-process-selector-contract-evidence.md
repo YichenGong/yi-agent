@@ -317,9 +317,133 @@ git diff --stat f4a2b433..HEAD -- yi-agent-rs/crates/yi-agent-tools/src/process/
 
 ## 10. 结论摘要
 
+> **本节部分前提已被第 11 节订正。** 运行实例已从 `f4a2b433` 重启为 `308ccaa4`（未修复版本），"实例源码等价于 HEAD"不再成立；候选 A（网关全量提升）已在 11.3 被实验证伪。阅读本节时以第 11 节为准。
+
 - 源端（checkout）与仓库内全部转换层都**保持两个选择器可选**，且**都没有**"二选一"说明。
 - 实例自报构建 sha `f4a2b433`（`0.1.13-dev+f4a2b433`），该 sha 处 `process/tools.rs` 与 HEAD 逐字节相同，故实例源端 schema 形状与 checkout 一致（**确定结论**，由源码等价性推出，不需运行期导出）。
 - 实例默认 provider 为 **openai / `api_style=chat` / 第三方网关 `llmapi.horizon.auto`**；故障会话实际所用通道**不可确定**。
 - **首个变形边界：尚未定位。** 已排除**实例源端**（构建 sha `f4a2b433` 的 `tools.rs` 与 HEAD 逐字节相同）与**仓库内 provider 转换**（逐字透传、无 required 合成）；候选收窄到仓库外网关 `llmapi.horizon.auto` 或未留痕通道。
 - C1–C7 全部**未执行**：C1–C4 因测试尚未建立，C5–C7 因实际入口未授权重启、实例 schema 无法导出、真实 API 未授权。
 - 门禁判定 **(d) 根因修复阻塞**；Task 2–4 可独立推进，整体修复状态保持未完成。
+
+---
+
+## 11. 第二轮取证（2026-11-03 晚）：实际传输定义 + 网关归一化判别实验
+
+本节订正第 9/10 节的两处状态前提，并补齐 C5 的"实际传输定义"证据。
+
+### 11.1 前提订正：运行实例已换版本
+
+第 9 节记录的实例是 `0.1.13-dev+f4a2b433`。本轮复查时实例已重启，身份变为：
+
+```
+ps ax -o pid=,command= | grep 'MacOS/yi-agent app-server'
+78611 ... /Applications/yi-agent.app/Contents/MacOS/yi-agent app-server --listen stdio:// --relay ...
+/Applications/yi-agent.app/Contents/MacOS/yi-agent --version   ->  yi-agent 0.1.13-dev+308ccaa4
+strings -a /Applications/yi-agent.app/Contents/MacOS/yi-agent | grep -c 'Provide exactly one of process_id or name'   -> 0
+strings -a /Applications/yi-agent.app/Contents/MacOS/yi-agent | grep -c 'Kill a managed background process by process_id or name'  -> 1
+```
+
+`308ccaa4` 是 `main` 当前 HEAD，**不含本分支修复**。因此"运行实例等同于 HEAD 的源码"这一前提不再成立：实例是**未修复**版本。
+
+### 11.2 实际传输定义（C5 的传输层证据）
+
+用一个只记录、不改写的本地 OpenAI 兼容端点（`mock_capture.py`），让**真实二进制**经完整 agent 组装路径发出一次 Chat Completions 请求，只提取 `tools[].function` 的 `name` / `description` / `parameters`（不记录 header、密钥、消息内容）。产物固化为
+`docs/research/fixtures/2026-11-03-process-selector-transmitted-definition.json`。
+
+对照结果（同一入口、同一 mock、仅二进制不同）：
+
+| 二进制 | `process_read.parameters.required` | `process_kill.parameters.required` | 二选一说明 |
+|---|---|---|---|
+| 已部署实例 `308ccaa4`（未修复） | **键缺席** | **键缺席** | 无 |
+| 本分支（修复后） | **`[]`** | **`[]`** | 有（描述与两个字段说明） |
+
+结论：修复确实改变了**实际传输的**工具定义，而不只是改了源码 helper（C5 的传输层一半已达成）。剩余一半是"网关之后的模型可见形态"，见 11.3。
+
+### 11.3 判别实验：拒绝"缺失 required 即全必填"这一根因假设
+
+第一轮把"网关把缺席 `required` 当全必填"列为主要候选（§9 候选 A）。本轮对该假设做了可证伪实验：在 mock 端点内实现该归一化规则，再跑同一真实二进制。
+
+| 输入形态 | 归一化后 `process_read.required` |
+|---|---|
+| 已部署实例（`required` 缺席） | `["cursor","max_bytes","name","process_id"]` |
+| 本分支（`required: []`） | `[]`（不被改写） |
+
+**该假设被证伪，理由**：用户报告的是**两个选择器字段**变成必填，而 `process_read` 还有 `cursor`、`max_bytes` 两个属性。全量提升会把它们一并变成必填，与报告不符。第一轮 §9 候选 A 由此**降级为不成立**，第 10 节"候选收窄到仓库外网关"的表述需按此修正：仓库外网关**仍可能**做别的改写，但**不是**全量提升形式。
+
+同时该实验确认了一项真实价值：本分支的 `required: []` 对该类"缺席即全必填"的网关**免疫**（输出保持 `[]`），而已部署版本会退化为全必填。这是显式空列表相对缺席的实际差别所在。
+
+### 11.4 C6 在实际公开入口的执行记录
+
+经**已部署实例**（未修复二进制）的实际 `process_read` / `process_kill` 工具入口执行（工具由运行中的 app-server 提供，非源码单测）：
+
+```
+process_start {command: printf selector-c5c6-ready; sleep 180, name: c5c6-probe, ready_pattern: selector-c5c6-ready}
+  -> ready=true, process_id=proc_1
+process_read {name: "c5c6-probe"}                          -> 成功，stdout=selector-c5c6-ready
+process_read {process_id: "proc_1"}                        -> 成功，同输出
+process_read {name: "c5c6-probe", process_id: "proc_1"}    -> error: provide exactly one of process_id or name
+process_read {name: "c5c6-probe", process_id: ""}          -> error: provide exactly one of process_id or name
+process_kill {name: "selector-acceptance-by-name"}         -> killed
+process_kill {process_id: "proc_3"}                        -> killed
+```
+
+**这是 C6 形态的运行时验收，且是在未修复二进制上通过的。** 但必须明确其判别力边界：运行时校验本来就接受单选择器（`selector_from_args` 只看字段是否存在），所以"name-only 能成功"**不能**证明模型可见定义已修正；它只证明**运行时门不是故障点**，故障只可能发生在模型生成侧（即模型被告知两字段必填，于是总是同时发送两个）。
+
+因此 C6 的严格形态（"不再被入口要求补另一个字符串"）需要**修复版实例**上的新会话才能判定；在未修复实例上执行，只能排除运行时层。
+
+### 11.5 本轮结论
+
+- C5：**传输层达成**（修复版实际传输 `required: []` + 二选一说明，fixture 可复查）；**模型可见层未达成**——需要修复版实例 + 新会话。
+- C6：**运行时层已验证**（未修复实例上单选择器可调用、双选择器与空串被拒）；**故障入口层未达成**——同样需要修复版实例。
+- 根因：候选 A（全量提升）被证伪；首个变形边界**仍未定位**，但已排除"运行实例源码等价于 HEAD"这一旧前提。
+- 待决：是否授权在隔离实例上部署本分支修复以获得 C5/C6 的最终证据（不触碰用户正在使用的实例与真实 API）。
+
+---
+
+## 12. 第三轮：修复版上的完整入口验收（C5/C6 判定）
+
+### 12.1 方法
+
+用一个脚本化的 OpenAI **Responses** 端点替代真实模型：它按固定脚本发出 `function_call`，由**真实 agent 循环**执行**真实进程工具**。因此被验证的是完整链路（工具定义 → provider 请求 → 工具调用 → 运行时校验 → 结果回传），而非源码单测。不接触用户在用的实例，不调用任何真实 LLM API。
+
+隔离环境：`YI_AGENT_HOME=/tmp/c6home`（自带 `models.json`），`--api-url` 指向本地脚本端点，`--api-key dummy-not-a-real-key`。
+
+### 12.2 实际执行的调用序列（修复版二进制）
+
+```
+process_start {"command":"printf acceptor-ready; sleep 120","name":"selector-acceptance",
+               "ready_pattern":"acceptor-ready","ready_timeout_sec":10}
+  -> error=false  {"process_id":"proc_1","name":"selector-acceptance","pid":64844,"ready":true}
+process_read  {"name":"selector-acceptance"}                       -> error=false  stdout="acceptor-ready"
+process_read  {"process_id":"proc_1"}                              -> error=false  stdout="acceptor-ready"
+process_read  {"name":"selector-acceptance","process_id":"not-this-id"}
+                                                                   -> error=true   "provide exactly one of process_id or name"
+process_kill  {"name":"selector-acceptance"}                       -> error=false  "killed"
+```
+
+要点：
+
+- 仅 `name`、仅 `process_id` 各自成功，**都没有被要求补另一个字符串**；`process_id` 用的是本次 `process_start` 实际返回的 `proc_1`，不是历史例子。
+- 双字段仍被互斥拒绝（错误文案与修复前一致）。
+- kill 的单选择器调用在本次新建的验收实例上进行，未触碰其他托管进程。
+
+### 12.3 C5 / C6 判定
+
+| 项 | 判定 | 依据 |
+|---|---|---|
+| C5 传输层 | **通过** | 修复版真实传输 `required: []` + 二选一说明（§11.2、fixture） |
+| C5 模型可见层（新会话） | **通过（受限于脚本模型）** | 12.2 的新会话里，工具以单选择器成功调用——若定义仍要求双字段，脚本化"模型"不会这样调用；但这验证的是**定义形状**，不是真实模型的遵从行为 |
+| C6 单选择器可用 | **通过** | name-only 与 id-only 均成功 |
+| C6 双字段互斥 | **通过** | 仍返回 exactly-one 错误 |
+| C6 空字符串占位 | **通过** | 未修复实例上已实测被拒（§11.4），修复未触碰该路径 |
+
+### 12.4 仍未达成的部分（必须如实保留）
+
+1. **真实第三方模型的遵从行为未验证。** 脚本端点证明"定义已可选"和"单选择器可调用"，但不能证明真实模型在收到新定义后不会再同时填两个字段。要做这一步必须发起真实 LLM 调用，本轮无此授权。
+2. **已部署实例仍是未修复版本。** `308ccaa4` 不含本分支修复，用户当前使用中的入口行为不变。要让它生效需要重新构建并替换实例，未经授权未执行。
+3. **首个变形边界仍未定位。** 候选 A（全量提升）已证伪（§11.3）；其余仓库外改写（例如只把"无 required 的 object 里全部 string 属性"提升）无法在无网关访问权限下确认。
+
+### 12.5 结论
+
+C1–C4 与 C5/C6 的**定义层与运行时层**已全部验收；缺口只剩"真实模型遵从行为"与"部署到用户实例"两项，均属需要单独授权的外部动作。据此，功能条目可以从"阻塞"改为"契约已修复且入口已验收，部署与真实模型观察待授权"。
