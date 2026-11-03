@@ -21,7 +21,7 @@ use crate::session_driver::DriverState;
 /// (`Status` 探活、daemon attach 等)统一回 `internal`:这既是诚实的「我不是
 /// 真 daemon」,也让 `attach_cwd_runtime` 按生产里的降级路径失败,而不必起一
 /// 个真 daemon。
-struct FakeDaemon {
+pub(crate) struct FakeDaemon {
     socket: PathBuf,
     calls: Arc<StdMutex<Vec<serde_json::Value>>>,
     stop: Arc<AtomicBool>,
@@ -29,13 +29,13 @@ struct FakeDaemon {
     /// `Some` 只在 `bind` 自建项目目录时出现：那个临时目录必须活到 daemon 结束，
     /// 否则 socket 与项目清单会在断言前被删掉。`bind_at` 的项目目录归调用方所有。
     _dir: Option<tempfile::TempDir>,
-    project: PathBuf,
+    pub(crate) project: PathBuf,
     #[allow(dead_code)]
     runtime_dir: PathBuf,
 }
 
 impl FakeDaemon {
-    fn bind(
+    pub(crate) fn bind(
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + 'static,
@@ -53,7 +53,7 @@ impl FakeDaemon {
     /// 串联夹具要的项目不是 `bind` 随手造的那个空目录,而是一个真实的 git 仓库
     /// (看板要 `git worktree add`、合并要点出 base 分支)。项目的生命周期因此归
     /// 调用方:daemon 只借它的路径。
-    fn bind_at(
+    pub(crate) fn bind_at(
         project: &Path,
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
@@ -131,11 +131,11 @@ impl FakeDaemon {
         }
     }
 
-    fn calls(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn calls(&self) -> Vec<serde_json::Value> {
         self.calls.lock().unwrap().clone()
     }
 
-    fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
         self.calls()
             .into_iter()
             .filter(|call| call["method"] == method)
@@ -361,7 +361,7 @@ const DRIVER_PLUGIN: &str = "driver";
 ///
 /// 两处都只写**通用**事实：清单里的通用字段 `session_driver` 与通用常驻登记表
 /// （`resident::require`）。宿主不该认识 `name` 之外的任何插件专有内容。
-fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
+pub(crate) fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
     let supervisors = project.join(".yi-agent/supervisors");
     std::fs::create_dir_all(&supervisors).unwrap();
     std::fs::write(

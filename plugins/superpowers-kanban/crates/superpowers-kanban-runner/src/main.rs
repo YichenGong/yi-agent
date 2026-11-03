@@ -749,31 +749,30 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
         // 没问）；`loaded` 不加角标。只有**明确**没加载才落回旧的 `[stale]` 角标，
         // 因为那是既有调用方（脚本、人眼）认得的那一个。
         let observation = superpowers_kanban_runner::observation::for_card(card, &observations);
-        let stale =
-            match observation {
-                superpowers_kanban_runner::observation::SessionObservation::NotLoaded => match card
-                    .thread_id
-                    .as_deref()
-                    .and_then(|thread| observations.threads.get(thread))
-                    .and_then(superpowers_kanban_runner::observation::Observation::presentation_at)
-                {
-                    Some(at) => format!(
-                        " [stale] 当前宿主未加载（截至 {}；历史可能仍存在）",
-                        at.to_rfc3339()
-                    ),
-                    None => " [stale] 当前宿主未加载（历史可能仍存在）".to_string(),
-                },
-                // 只有 running 且带执行 ID 的卡才谈得上有「加载问题」；其余卡片
-                // `for_card` 已经回 unknown，这里不给它们加噪音角标。
-                superpowers_kanban_runner::observation::SessionObservation::Unknown
-                    if card.state == superpowers_kanban_core::card::CardState::Running
-                        && superpowers_kanban_runner::observation::execution_thread_id(card)
-                            .is_some() =>
-                {
-                    " [observation unknown] 当前宿主未观测到（历史可能仍存在）".to_string()
-                }
-                _ => String::new(),
-            };
+        let stale = match observation {
+            superpowers_kanban_runner::observation::SessionObservation::NotLoaded => match card
+                .thread_id
+                .as_deref()
+                .and_then(|thread| observations.threads.get(thread))
+                .and_then(superpowers_kanban_runner::observation::Observation::presentation_at)
+            {
+                Some(at) => format!(
+                    " [stale] 当前宿主未加载（截至 {}；历史可能仍存在）",
+                    at.to_rfc3339()
+                ),
+                None => " [stale] 当前宿主未加载（历史可能仍存在）".to_string(),
+            },
+            // 只有 running 且带执行 ID 的卡才谈得上有「加载问题」；其余卡片
+            // `for_card` 已经回 unknown，这里不给它们加噪音角标。
+            superpowers_kanban_runner::observation::SessionObservation::Unknown
+                if card.state == superpowers_kanban_core::card::CardState::Running
+                    && superpowers_kanban_runner::observation::execution_thread_id(card)
+                        .is_some() =>
+            {
+                " [observation unknown] 当前宿主未观测到（历史可能仍存在）".to_string()
+            }
+            _ => String::new(),
+        };
         let merging = if holder
             .as_ref()
             .is_some_and(|holder| holder.card_id == card.id.0)
