@@ -69,3 +69,5 @@
   - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
 
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
+
+- [ ] 临时旁问共享只读运行器 — 有效配置快照、独立取消/事件/用量与只读工具白名单，桌面/手机宿主与 TUI 共用；验收目标 `side_registry_rejects_mutation_even_with_yolo`、`side_cancel_does_not_cancel_parent`，执行 `cargo test -p yi-agent-runtime --lib side_`（测试待实现）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6–7、§12.1。
