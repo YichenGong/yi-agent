@@ -24,6 +24,9 @@ sha2 = "0.10"
 # 「逐类拒绝」——zip 的 Unix 元数据要靠额外字段，缺字段时行为取决于实现。
 tar = "0.4"
 flate2 = "1"
+# flock。跨进程互斥不能用进程内 Mutex——两个宿主进程各自持有自己的
+# Mutex，然后同时改写同一份 registry。
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

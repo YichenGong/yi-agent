@@ -50,6 +50,9 @@ pub enum PluginError {
     /// 无法安全回退，需人工恢复。
     #[error("recovery required: {0}")]
     RecoveryRequired(String),
+    /// 引用的对象不存在（插件未登记、版本未安装）。
+    #[error("not found: {0}")]
+    NotFound(String),
     /// 落盘/读取失败。
     #[error("io: {0}")]
     Io(String),
@@ -74,6 +77,7 @@ impl PluginError {
             PluginError::Busy(_) => "Busy",
             PluginError::ResultUnknown(_) => "ResultUnknown",
             PluginError::RecoveryRequired(_) => "RecoveryRequired",
+            PluginError::NotFound(_) => "NotFound",
             PluginError::Io(_) => "Io",
         }
     }

@@ -407,11 +407,17 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 `Registry::open/record_install`；增补 `Registry::list() -> Result<Vec<PluginRecord>, PluginError>`，`PluginRecord` 包含已安装版本、选中/激活状态和项目授权摘要。实现生命周期独占锁与短期 registry 锁，不持短锁做网络/等待。
 
-- [ ] Step 1：写同摘要重复安装幂等、同版本不同摘要冲突、坏 registry 不覆盖、两个进程并发安装的失败测试。
-- [ ] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test registry`，确认读者看不到半个 JSON 或未完成版本目录。
-- [ ] Step 3：实现带 schemaVersion 的原子记录、唯一临时文件、必要 fsync/目录 fsync、进程锁与坏数据显式错误；首次安装只设选中版本，不创建 grant 或启动记录。
-- [ ] Step 4：用 subprocess 真正争抢同一 registry，并验证不同 `instance_home` 不串；不能只用同进程 Mutex 测跨进程安全。
-- [ ] Step 5：按 C 提交 `feat: track managed plugin installations per instance`。
+- [x] Step 1：写同摘要重复安装幂等、同版本不同摘要冲突、坏 registry 不覆盖、两个进程并发安装的失败测试。
+  > 2026-11-03：`reinstalling_the_same_digest_is_idempotent` 比较**文件字节**而非记录条数——只比条数会漏掉「把 installed_at 改成 999」这种重写。`the_same_version_with_a_different_digest_is_a_conflict` 另断言拒绝后原记录未被改写。坏 registry 两条：`open` 时损坏、以及**打开之后**才损坏（后者是真正的风险：另一个版本写了本进程读不懂的格式）。
+- [x] Step 2：`cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test registry`，确认读者看不到半个 JSON 或未完成版本目录。
+  > 2026-11-03：`registry` 20/20（另 3 条 `#[ignore]` 子进程入口）；`readers_never_observe_a_partial_file` 用并发读线程 + 40 次写，一次解析失败即红，把「rename 换成直接 write」的变异打红。
+- [x] Step 3：实现带 schemaVersion 的原子记录、唯一临时文件、必要 fsync/目录 fsync、进程锁与坏数据显式错误；首次安装只设选中版本，不创建 grant 或启动记录。
+  > 2026-11-03：`src/registry.rs` + `src/locks.rs`。`schemaVersion` 不符返回 `Incompatible`，JSON 损坏返回 `RecoveryRequired`。临时文件名带 pid + 纳秒 + 计数器，固定名会让两个进程互相截断半成品。文件 fsync 后 rename，再 fsync 目录。
+  > 首次安装不建 grant 由 `the_first_install_selects_the_version_without_creating_a_grant` 钉住；第二个版本装进来不改变选中版本，由 `a_second_version_does_not_change_the_selected_one` 钉住。
+- [x] Step 4：用 subprocess 真正争抢同一 registry，并验证不同 `instance_home` 不串；不能只用同进程 Mutex 测跨进程安全。
+  > 2026-11-03：`a_lifecycle_lock_is_exclusive_across_processes`、`two_processes_do_not_both_hold_the_lock`（显式共同起跑线，否则第一个可能已释放，两个都成功）、`two_processes_recording_different_plugins_do_not_lose_an_update`（删短锁即打红，这条是 registry 短锁存在的唯一理由）、`different_instance_homes_do_not_share_locks`。
+  > `two_acquires_in_one_process_yield_the_same_lock` 钉住进程内去重：`flock` 按打开文件描述加锁，同进程两次 open 会各拿一把。
+- [x] Step 5：按 C 提交 `feat: track managed plugin installations per instance`。
 
 ### Task T10：实现项目授权、双代次与能力分类
 

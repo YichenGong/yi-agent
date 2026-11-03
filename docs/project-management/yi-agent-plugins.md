@@ -51,4 +51,11 @@
 - [x] 归档权限不采纳 — 普通文件 0444，只有清单 `program.entry` 设 0555；setuid 与原始 mode 丢弃。判据：`setuid_is_not_preserved`、`a_non_entry_file_is_not_executable`、`a_declared_program_entry_becomes_executable`
 - [x] 声明入口必须存在 — 清单声明了归档里没有的入口，在解包阶段就拒，而不是等宿启进程时才发现。判据：`a_declared_program_entry_missing_from_the_archive_is_rejected`
 - [x] 安装后完整性 — `.yi-agent-digests` 记录每文件摘要，`verify_installed` 启动前比对。判据：`an_unmodified_installation_passes_the_integrity_check`、`a_tampered_installed_file_fails_the_integrity_check`
-- [ ] 实例注册表 — T09
+- [x] 实例注册表与原子记录 — `src/registry.rs` 的 `Registry::open/record_install/select_version/list`；`schemaVersion` 不符 → `Incompatible`，JSON 损坏 → `RecoveryRequired`（不把损坏当空表，否则一次安装抹掉全部记录）。判据：`a_corrupt_registry_is_reported_and_left_untouched`、`a_registry_corrupted_after_open_is_not_clobbered_by_a_write`、`a_registry_with_an_unknown_schema_version_is_rejected`
+- [x] 安装幂等与冲突 — 同 `(plugin, version, sha256)` 幂等且不重写文件；同版本不同摘要 → `Conflict` 且不覆盖。判据：`reinstalling_the_same_digest_is_idempotent`（比对文件字节）、`the_same_version_with_a_different_digest_is_a_conflict`
+- [x] 安装不产生运行授权 — 首次安装只设选中版本，`grants` 为空；第二个版本装进来不改变选中版本。判据：`the_first_install_selects_the_version_without_creating_a_grant`、`a_second_version_does_not_change_the_selected_one`
+- [x] 跨进程互斥 — `src/locks.rs` 用 `flock`；进程内按路径去重（`flock` 按打开文件描述加锁，同进程两次 open 会各拿一把）。判据：`a_lifecycle_lock_is_exclusive_across_processes`、`two_processes_do_not_both_hold_the_lock`、`two_acquires_in_one_process_yield_the_same_lock`
+- [x] registry 短锁防丢失更新 — 两个进程并发记录不同插件，两条都必须存活。判据：`two_processes_recording_different_plugins_do_not_lose_an_update`（删掉短锁即打红）
+- [x] 读者看不到半个文件 — 唯一临时文件 + 文件 fsync + rename + 目录 fsync。判据：`readers_never_observe_a_partial_file`（并发读线程，一次解析失败即红）
+- [x] 不同实例互不干扰 — 判据：`different_instance_homes_do_not_share_locks`
+- [ ] 项目授权与双代次 — T10
