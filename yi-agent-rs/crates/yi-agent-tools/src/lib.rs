@@ -14,6 +14,7 @@ mod skill_tool;
 mod web;
 
 pub mod image_prep;
+pub mod side_read;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ pub use process::{
 pub use sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
+pub use side_read::{SIDE_READ_SUPPORTED, SideFileAlias, SideReadAccess, SideRoots};
 pub use skill_tool::SkillTool;
 pub use web::config::{
     EngineConfig, Freshness, WebSearchConfig, load_websearch_config, load_websearch_config_from,
