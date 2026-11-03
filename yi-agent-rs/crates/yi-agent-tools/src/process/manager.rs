@@ -11,11 +11,17 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time;
 
-use crate::process_group::{configure_process_group, signal_process_group};
+use crate::process_group::{self, configure_process_group, signal_process_group};
 use crate::sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 use crate::shell::blocklist;
 
 pub const DEFAULT_STREAM_CAP_BYTES: usize = 256 * 1024;
+
+/// kill 时留给进程响应 SIGTERM 的宽限期。
+const KILL_GRACE: Duration = Duration::from_secs(3);
+/// 升级到 SIGKILL 后等待整组消散的上限。
+const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -572,18 +578,68 @@ impl ProcessManager {
             process.status = ProcessStatus::Killed;
             process.ready = false;
             process.end_time = Some(Instant::now());
-            if let Some(child) = process.child.as_mut() {
-                let _ = child.start_kill();
-            }
             (pid, true)
         };
-        if let Some(pid) = pid {
-            signal_process_group(pid, libc::SIGTERM);
-        }
         if killed {
+            self.terminate_group(pid, &process_id).await;
             self.emit(ProcessEvent::Killed { process_id });
         }
         Ok(())
+    }
+
+    /// 整组优雅终止：先给 SIGTERM 让进程自己清理，宽限期过后整组升级到 SIGKILL。
+    ///
+    /// 「整组」不能省的正是这一步——直接子进程之外的子孙只会收到组信号。只对
+    /// 直接子进程 `start_kill()`（SIGKILL）会让忽略 SIGTERM 的子孙变成孤儿继续
+    /// 跑，而面板已经显示 killed。
+    async fn terminate_group(&self, pid: Option<u32>, process_id: &str) {
+        let Some(pid) = pid else {
+            // 没有 pid（进程尚未 spawn 完）：只能尽力杀掉已持有的 child。
+            if let Ok(mut processes) = self.processes.lock()
+                && let Some(child) = processes.get_mut(process_id).and_then(|p| p.child.as_mut())
+            {
+                let _ = child.start_kill();
+            }
+            return;
+        };
+
+        signal_process_group(pid, libc::SIGTERM);
+        if self.wait_until_gone(pid, KILL_GRACE).await {
+            return;
+        }
+        // 宽限期内没走干净：整组 SIGKILL，连忽略 SIGTERM 的子孙一并收掉。
+        // 先发组信号再补 child.start_kill()，覆盖组长已退出但 pid 已被复用等
+        // 组信号落空的边界。
+        signal_process_group(pid, libc::SIGKILL);
+        if let Ok(mut processes) = self.processes.lock()
+            && let Some(child) = processes.get_mut(process_id).and_then(|p| p.child.as_mut())
+        {
+            let _ = child.start_kill();
+        }
+        self.wait_until_gone(pid, KILL_REAP_WAIT).await;
+    }
+
+    /// 等到「直接子进程已被收割」且「整组已无存活成员」。
+    ///
+    /// 两个条件都要：组长被 reap 时子孙可能还在（正是本函数要等的情形），而整组
+    /// 清空时 `spawn_waiter` 也几乎同时把 child 置空。
+    async fn wait_until_gone(&self, pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.child_reaped(pid) && !process_group::group_exists(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    }
+    /// 直接子进程是否已被 `spawn_waiter` 收割（`child` 为 None 且状态已终态）。
+    fn child_reaped(&self, pid: u32) -> bool {
+        self.lock_processes().values().any(|process| {
+            process.pid == Some(pid) && process.child.is_none() && is_terminal(&process.status)
+        })
     }
 
     pub async fn shutdown(&self) -> Result<Vec<ManagedProcessSnapshot>, String> {
@@ -924,6 +980,9 @@ fn process_id_sort_key(process_id: &str) -> (u64, String) {
 fn terminate_child(mut child: Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         signal_process_group(pid, libc::SIGTERM);
+        // terminate_child 用在同步上下文（start 的关闭竞态/exit 清理），无法等待；
+        // 直接对整组补 SIGKILL，确保忽略 SIGTERM 的子孙也被收掉，而不是只杀组长。
+        signal_process_group(pid, libc::SIGKILL);
     }
     let _ = child.start_kill();
 }
@@ -960,6 +1019,60 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         assert!(predicate());
+    }
+
+    /// 进程组 `pgid` 里仍存活的成员。组长被 reap 之后仍能用来探测子孙。
+    /// 僵尸（`Z`）不算存活——它已被内核回收，不再占资源。
+    #[cfg(unix)]
+    fn group_members(pgid: u32) -> Vec<u32> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "pid=", "-o", "stat=", "-g", &pgid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                let stat = fields.next()?;
+                (!stat.starts_with('Z')).then_some(pid)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn group_is_alive(pgid: u32) -> bool {
+        group_members(pgid)
+            .iter()
+            .any(|pid| *pid != std::process::id())
+    }
+
+    /// 等到进程组里出现至少 `min` 个成员，返回观测到的成员数。
+    #[cfg(unix)]
+    async fn wait_until_group_size(pgid: u32, min: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let size = group_members(pgid).len();
+            if size >= min {
+                return size;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process group {pgid} never reached {min} members, saw {size}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 进程是否仍存在（不含僵尸：僵尸已被内核回收，不再占资源）。
+    #[cfg(unix)]
+    fn pid_exists(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
     }
 
     #[tokio::test]
@@ -1060,6 +1173,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keep.status, ProcessStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_kill_lets_the_child_shut_down_gracefully_before_killing() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let started = manager
+            .start(start_options(
+                "trap 'echo GRACEFUL_SHUTDOWN' TERM; sleep 300",
+                "graceful",
+            ))
+            .await
+            .unwrap();
+        // 保证 child 已装好 handler 再发信号（未命中默认动作会直接终止）。
+        sleep(Duration::from_millis(500)).await;
+
+        manager
+            .kill(ProcessSelector::Id(started.process_id.clone()))
+            .await
+            .unwrap();
+
+        // 直接子进程必须先拿到 SIGTERM 并跑完自己的 handler，而不是一上来就被 SIGKILL。
+        let out = manager
+            .read(ProcessSelector::Id(started.process_id.clone()), None, 4096)
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("GRACEFUL_SHUTDOWN"),
+            "kill must let the child handle SIGTERM, stdout was {:?}",
+            out.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_kill_reaps_grandchildren_that_ignore_sigterm() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // shell 自任组长；孙进程刻意忽略 SIGTERM，只有整组升级到 SIGKILL 才能收掉它。
+        let started = manager
+            .start(start_options(
+                "(trap '' TERM; exec sleep 300) & wait",
+                "stubborn",
+            ))
+            .await
+            .unwrap();
+        let pid = started.pid.expect("pid while running");
+        // 必须等到孙进程真的出现（组内比子孙只有组长时更多），否则「组为空」可能
+        // 只是子孙还没起来，测试会假通过。
+        let group_size_before = wait_until_group_size(pid, 2).await;
+
+        manager
+            .kill(ProcessSelector::Id(started.process_id.clone()))
+            .await
+            .unwrap();
+
+        // 对整组发信号 0：还有任何成员存活就返回 0，整组清空才返回 -1。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while group_is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "kill must reap the whole process group (had {group_size_before} members), survivors: {:?}",
+                group_members(pid)
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_kill_does_not_return_until_the_process_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        // 子进程收到 TERM 后要花 300ms 收尾：若 kill 发完信号就返回，断言会抓到它
+        // 还在跑。用 `sleep 300` 抓不到——它被 SIGKILL 时是瞬时的。
+        let started = manager
+            .start(start_options(
+                "trap 'sleep 0.3; exit 0' TERM; sleep 300",
+                "slow",
+            ))
+            .await
+            .unwrap();
+        let pid = started.pid.expect("pid while running");
+        sleep(Duration::from_millis(500)).await;
+
+        manager
+            .kill(ProcessSelector::Id(started.process_id.clone()))
+            .await
+            .unwrap();
+
+        // `kill` 返回即意味着进程已经不在：状态说是终态、进程也必须真没了。
+        assert!(
+            !pid_exists(pid),
+            "kill must not return while the child is still alive"
+        );
     }
 
     #[tokio::test]
