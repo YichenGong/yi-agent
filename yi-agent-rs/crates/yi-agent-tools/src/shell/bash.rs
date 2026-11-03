@@ -458,6 +458,66 @@ impl Tool for BashTool {
             );
         }
 
+        // Drain everything the readers already handed to the channels.
+        //
+        // Awaiting the readers only proves they finished *sending*; the chunks they
+        // sent may still be queued. The select loop stops as soon as the child's
+        // exit resolves, and an exit and the last chunk of stdout arrive in the same
+        // epoll round -- so without this pass `echo hello` can exit 0 with an empty
+        // buffer. That is not a timing nicety: it dropped real output.
+        if let Some(rx) = stdout_rx.as_mut() {
+            while let Ok(data) = rx.try_recv() {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let _ = tx
+                    .send(ToolEvent::OutputDelta {
+                        stream: OutputStream::Stdout,
+                        text,
+                    })
+                    .await;
+                let was_truncated = stdout_truncated;
+                append_with_truncation(
+                    &mut stdout_buf,
+                    &mut stdout_truncated,
+                    &mut stdout_skipped,
+                    &data,
+                );
+                if !was_truncated && stdout_truncated {
+                    let _ = tx
+                        .send(ToolEvent::Truncated {
+                            stream: OutputStream::Stdout,
+                            skipped_bytes: stdout_skipped,
+                        })
+                        .await;
+                }
+            }
+        }
+        if let Some(rx) = stderr_rx.as_mut() {
+            while let Ok(data) = rx.try_recv() {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let _ = tx
+                    .send(ToolEvent::OutputDelta {
+                        stream: OutputStream::Stderr,
+                        text,
+                    })
+                    .await;
+                let was_truncated = stderr_truncated;
+                append_with_truncation(
+                    &mut stderr_buf,
+                    &mut stderr_truncated,
+                    &mut stderr_skipped,
+                    &data,
+                );
+                if !was_truncated && stderr_truncated {
+                    let _ = tx
+                        .send(ToolEvent::Truncated {
+                            stream: OutputStream::Stderr,
+                            skipped_bytes: stderr_skipped,
+                        })
+                        .await;
+                }
+            }
+        }
+
         // Emit Exit event.
         let _ = tx.send(ToolEvent::Exit { code: exit_code }).await;
 
