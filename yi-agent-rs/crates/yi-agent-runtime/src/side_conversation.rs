@@ -17,6 +17,7 @@
 
 pub mod ledger;
 pub mod policy;
+pub mod resources;
 pub mod source;
 
 #[cfg(test)]
@@ -26,6 +27,10 @@ mod tests;
 
 pub use ledger::{AcceptedRequest, SideIdleDeadline, SideRequestLedger};
 pub use policy::{SideToolPolicy, SideToolSetupFactory, build_side_tool_setup};
+pub use resources::{
+    PreparedSideResources, SIDE_BINARY_BUDGET_BYTES, SIDE_RESOURCE_SLOTS, SideHostResources,
+    SideResourceLease,
+};
 pub use source::{
     EffectiveSideSource, SideAttachment, SideAttachmentCatalog, SideSourcePublisher, SideWebPolicy,
     SourceUpdate,

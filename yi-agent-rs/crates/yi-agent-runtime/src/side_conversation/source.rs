@@ -21,6 +21,13 @@ use yi_agent_core::{AgentConfig, ManagedRunLimits, Provider, Session, forkable_m
 
 use super::{SideError, SideErrorReason, SideResult, map_budget_error};
 
+/// The generated attachment path prefix a manifest line carries.
+///
+/// A catalog entry is only honoured when its marker — this prefix plus the
+/// generated file name — still appears in the safe history. The model reads
+/// attachments through this path, so it is the one reliable, non-guessed anchor.
+pub const MANIFEST_PATH_PREFIX: &str = ".yi-agent/attachments/";
+
 /// One attachment the side may keep reading, with the manifest marker that
 /// identified it when the request was accepted.
 ///
@@ -35,6 +42,36 @@ pub struct SideAttachment {
 /// The attachments a side inherited, in the order the parent listed them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SideAttachmentCatalog(pub Vec<SideAttachment>);
+
+impl SideAttachmentCatalog {
+    /// Resolve the catalog against a session's *safe* history.
+    ///
+    /// Only entries whose generated manifest marker is still present in the
+    /// forkable prefix are returned: if the parent's manifest line was trimmed
+    /// away, neither the model nor the side can refer to the file any more. The
+    /// session text is never scanned for arbitrary paths — only the host-supplied
+    /// markers are compared.
+    pub fn resolve(&self, session: &Arc<Mutex<Session>>) -> Result<Vec<PathBuf>, String> {
+        let guard = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retained: String = forkable_messages(&guard)
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                yi_agent_core::ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(self
+            .0
+            .iter()
+            .filter(|attachment| retained.contains(&attachment.manifest_marker))
+            .map(|attachment| attachment.original.clone())
+            .collect())
+    }
+}
 
 /// Whether the side may use the network at all.
 ///

@@ -169,6 +169,29 @@ impl SideBlockingPool {
         }
     }
 
+    /// Submit `job` without waiting for it, holding `owner` until it finishes.
+    ///
+    /// Used for work that must not block its initiator — cleanup after the last
+    /// owner drops. The job still consumes a host admission and runs on a pool
+    /// thread, so cleanup can never outrun the host's blocking quota.
+    ///
+    /// Returns `false` when the pool is closed or admission is unavailable; the
+    /// caller then leaves the work for startup reclamation instead of spinning.
+    pub fn submit_detached(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+        job: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let Some(host_lease) = self.host_admission.clone().try_acquire_owned().ok() else {
+            return false;
+        };
+        self.enqueue(Box::new(move || {
+            let _held = (host_lease, owner);
+            job();
+        }))
+        .is_ok()
+    }
+
     /// Take one per-side admission, waiting cancellably.
     async fn acquire_side(
         &self,

@@ -95,8 +95,13 @@ type OpenHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 /// An alias with its copy's directory held open.
 #[derive(Clone)]
 struct ResolvedAlias {
+    /// The original as the side will spell it, lexically resolved. macOS makes
+    /// this necessary: `/var` is a symlink to `/private/var`, so a request for
+    /// `/var/.../x.pdf` is lexically unrelated to the canonical root even though
+    /// it names the same file.
+    original_given: PathBuf,
+    /// The canonical original; authorisation is decided about this form.
     original: PathBuf,
-    copy: PathBuf,
     /// Handle to the directory that contains `copy`, so the copy can be opened
     /// without resolving a fresh absolute path.
     #[cfg(unix)]
@@ -172,6 +177,7 @@ impl SideReadAccess {
         }
         let mut resolved = Vec::with_capacity(aliases.len());
         for alias in aliases {
+            let original_given = abs_lexical(&self.primary, &alias.original);
             let original = canonical_file(&alias.original)?;
             let copy = abs_lexical(&self.primary, &alias.copy);
             let parent = copy.parent().ok_or_else(|| {
@@ -197,8 +203,8 @@ impl SideReadAccess {
             #[cfg(not(unix))]
             let _ = parent;
             resolved.push(ResolvedAlias {
+                original_given,
                 original,
-                copy,
                 #[cfg(unix)]
                 copy_dir,
                 copy_name: name,
@@ -325,10 +331,19 @@ impl SideReadAccess {
         effective
     }
 
+    /// The alias for a path the side asked for.
+    ///
+    /// The mapping the side sees is *original manifest path -> private copy*
+    /// (spec §5.2), so the request is matched on the original and served from the
+    /// copy. Matching the copy instead would leave the original served straight
+    /// from the parent's root, which silently defeats the point of the copy.
+    /// Exact match only: an alias must never become a directory capability.
     fn matching_alias(&self, target: &Path) -> Option<ResolvedAlias> {
         let aliases = self.aliases.lock().unwrap();
-        // Exact match only: an alias must never become a directory capability.
-        aliases.iter().find(|alias| alias.copy == target).cloned()
+        aliases
+            .iter()
+            .find(|alias| alias.original_given == target || alias.original == target)
+            .cloned()
     }
 
     fn run_open_hook(&self) {
@@ -632,15 +647,21 @@ mod tests {
                 copy: copy.clone(),
             }])
             .unwrap();
-        // The exact copy path is served while the original is authorised.
-        let mut file = access.open_regular(&copy).unwrap();
+        // Asking for the *original* manifest path serves the private copy: that
+        // is the mapping the side works from (spec §5.2).
+        let mut file = access.open_regular(&f.path.join("attachment.png")).unwrap();
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text).unwrap();
         assert_eq!(text, "copy-bytes");
 
+        // The copy path itself is not a capability the side is given.
+        assert!(access.open_regular(&copy).is_err());
+
         // Revoking the original's root revokes the alias too.
         f.roots.0.write().unwrap().clear();
-        let error = access.open_regular(&copy).unwrap_err();
+        let error = access
+            .open_regular(&f.path.join("attachment.png"))
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
         // And the alias does not leak the directory: a sibling is not served.
@@ -648,5 +669,8 @@ mod tests {
         let sibling = copies.path().join("sibling.png");
         write(&sibling, b"sibling");
         assert!(access.open_regular(&sibling).is_err());
+        // A relative spelling of the original resolves too, since `primary` is the
+        // parent's root.
+        assert!(access.open_regular(Path::new("attachment.png")).is_ok());
     }
 }
