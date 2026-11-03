@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/host-v1.schema.json",
+  "title": "Plugin host descriptor v1",
+  "description": "What the host guarantees to a plugin, and what the plugin may not touch. This is the plugin-facing half of the frozen G1 protocol: the plugin' runtime descriptor is produced by a verified release and may narrow these guarantees, never widen them.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "api", "reservedEnv", "bridge", "limits"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "api": {
+      "type": "string",
+      "enum": ["v1"],
+      "description": "Host API major. A plugin requesting anything else is Incompatible, not silently downgraded."
+    },
+    "reservedEnv": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]*$"
+      },
+      "description": "Environment variables the host owns and passes to managed processes. A plugin that redefines one of these would be able to redirect the host' instance root or inherit another instance' relay session, so the list must be explicit rather than empty."
+    },
+    "bridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["onlyBusinessMethods", "grantsAnyCapability"],
+      "properties": {
+        "onlyBusinessMethods": {
+          "const": true,
+          "description": "The bridge may only reach the plugin' own authorized backend. Any generic passthrough would make the declared effect matrix meaningless."
+        },
+        "grantsAnyCapability": {
+          "const": false,
+          "description": "A bridge call can never itself widen a grant. Capability changes go through the management RPC and a lifecycle transaction."
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageBytes", "extractedBytes", "singleFileBytes", "fileCount"],
+      "description": "Defaults fixed by G1: 256 MiB package, 1 GiB extracted, 128 MiB per file, 20 000 files. The host may lower them per instance; the values here are ceilings a plugin can never raise.",
+      "properties": {
+        "packageBytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "extractedBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+        "singleFileBytes": { "type": "integer", "minimum": 1, "maximum": 134217728 },
+        "fileCount": { "type": "integer", "minimum": 1, "maximum": 20000 }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "_comment": "Structure placeholder for the future root trust envelope (T04 freezes the cryptographically valid bytes). Only the shape is fixed now: what identities a root envelope binds, and that it carries an explicit serial and expiry so a stale root can be rejected without consulting the network.",
+  "schemaVersion": 1,
+  "root": {
+    "keyId": "root-2026-01",
+    "publicKey": "PLACEHOLDER-32-BYTE-ED25519-PUBLIC-KEY",
+    "serial": 1,
+    "notBefore": 1767225600,
+    "notAfter": 1798761600
+  },
+  "signature": "PLACEHOLDER-BASE64-ED25519-SIGNATURE"
+}

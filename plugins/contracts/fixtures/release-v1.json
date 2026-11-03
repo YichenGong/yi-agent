@@ -1,0 +1,14 @@
+{
+  "_comment": "Structure placeholder for the future signed release metadata (T04 freezes the cryptographically valid bytes and the exact signature payload encoding).",
+  "schemaVersion": 1,
+  "release": {
+    "plugin": "example-counter",
+    "version": "1.4.0",
+    "target": "darwin-aarch64",
+    "sha256": "3b1f2c9a7d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+    "serial": 7,
+    "publishedAt": 1767225600,
+    "expiresAt": 1798761600
+  },
+  "signature": "PLACEHOLDER-BASE64-ED25519-SIGNATURE"
+}

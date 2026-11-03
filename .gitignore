@@ -53,3 +53,6 @@ dist/
 
 # 探针运行产物（报告、运行元数据、stderr 副本）
 /.artifacts/
+
+# Node 依赖（contracts 的 schema 校验器按自己的 package-lock 安装）
+node_modules/

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/bridge-v1.schema.json",
+  "title": "Management bridge v1",
+  "description": "The complete set of management methods the plugin bridge may call. Closed on purpose: an open method set would let a new method appear without a schema, an effect and a review, which is exactly the `plugin/install`-as-authorization-bypass failure this design forbids.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "prefix", "methods", "responseVariants"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "prefix": {
+      "const": "plugins/v1/",
+      "description": "Every management method carries this prefix. Business methods do not: the bridge reaches only the plugin' own authorized backend."
+    },
+    "methods": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "effect"],
+        "properties": {
+          "name": {
+            "enum": [
+              "plugins/v1/catalog",
+              "plugins/v1/list",
+              "plugins/v1/install",
+              "plugins/v1/enableProject",
+              "plugins/v1/changeGrant",
+              "plugins/v1/disableProject",
+              "plugins/v1/activate",
+              "plugins/v1/rollback",
+              "plugins/v1/transaction",
+              "plugins/v1/cancelTransaction",
+              "plugins/v1/uninstall",
+              "plugins/v1/clearData",
+              "plugins/v1/gc",
+              "plugins/v1/inspectLegacy",
+              "plugins/v1/adoptLegacy",
+              "plugins/v1/assetRelease",
+              "plugins/v1/operationResult"
+            ]
+          },
+          "effect": {
+            "type": "string",
+            "enum": ["Read", "Write", "Launch", "QuotaWrite", "Resident"]
+          }
+        }
+      }
+    },
+    "responseVariants": {
+      "type": "array",
+      "description": "The full `OperationResult` discriminator set. `unknown` is mandatory: a crashed or drained operation whose outcome was never committed must be reportable as unknown rather than being guessed as rejected. Guessing it `rejected` would let a plugin retry a write that actually landed.",
+      "const": ["pending", "committed", "unknown", "rejected"],
+      "items": { "type": "string", "enum": ["pending", "committed", "unknown", "rejected"] }
+    }
+  }
+}

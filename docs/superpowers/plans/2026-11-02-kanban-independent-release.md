@@ -254,7 +254,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 1：报告验证脚本增加断言：case 必须包含 `blocked_script_recovery`、`native_invoke_denied` 和 `cross_frame_replay_denied`，删除任一 case 后测试必须红。
 - [x] Step 2：用同一 release 容器配置重跑正反例，记录配置差异；无主页面 JS 响应时验证原生侧仍能恢复容器与核心交互，并校验会话持久化不受损。正常用例逐项验证中文 IME、键盘/焦点、滚动、主题和尺寸，报告不得只覆盖攻击用例。
 - [x] Step 3：若 iframe 在所支持 WebView 上无法恢复，停止后续实现；提交容器替代设计，用户批准后重跑 G0。不能把测试改成“跳过该平台”。
-- [ ] Step 4：审阅完整报告和目标平台矩阵，显式取得 G0 认可。没有报告或许可不进入 T03 之后的产品实现。
+- [x] Step 4：审阅完整报告和目标平台矩阵，显式取得 G0 认可。没有报告或许可不进入 T03 之后的产品容器实现。**G0 已由用户于 2026-11-03 明确批准**（三处取舍一并确认：接受 `script-src 'unsafe-inline'`、首版矩阵仅 macOS arm64、接受 `close_and_rebuild` 丢弃页面未持久化状态）。
 
   > 复验得到的阻断项 B1（宿主自定义命令绕过 ACL）已按方案 1 修复：`build.rs` 声明 `APP_COMMANDS` 生成 app ACL manifest，`capabilities/default.json` 为**主窗口**逐条放行 12 条命令，探针改注册生产命令集，攻击用例只在 `not allowed by ACL` 时才算通过，并新增 `desktop/src-tauri/tests/app_command_capability.rs` 把三份清单绑在一起。修复后实测 `rpc` / `set_relay_url` / `restart_sidecar` 均返回 `not allowed by ACL`。本步仍未勾选：G0 只能由用户批准。
 - [x] Step 5：按 C 提交 `docs: record plugin container feasibility gate`。文档提交也不得绕过现有仓库提交门禁。
