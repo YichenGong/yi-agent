@@ -309,7 +309,10 @@ impl StopWitness {
             Self {
                 stopped: Arc::clone(&stopped),
             },
-            StopConfirmation { stopped },
+            StopConfirmation {
+                stopped,
+                gate: None,
+            },
         )
     }
 
@@ -331,14 +334,55 @@ impl StopWitness {
 }
 
 /// Read side of the stop proof, held by the worker handle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StopConfirmation {
     stopped: Arc<AtomicBool>,
+    /// A second, independent piece of evidence that must also hold.
+    ///
+    /// A worker's join proves its own task ended; it does not prove the process
+    /// groups its tools started are gone. Those are two different facts, and a
+    /// shell that forked a background job is exactly where they disagree: the task
+    /// joins while the job keeps running. Where a caller can consult the guardian,
+    /// it installs that check here, and "stopped" then means both.
+    ///
+    /// Absent for a runtime with no guardian to ask, where the join is all the
+    /// evidence that exists.
+    gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for StopConfirmation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopConfirmation")
+            .field("joined", &self.stopped.load(Ordering::Acquire))
+            .field("gated", &self.gate.is_some())
+            .finish()
+    }
 }
 
 impl StopConfirmation {
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        if !self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        match &self.gate {
+            Some(gate) => gate(),
+            None => true,
+        }
+    }
+
+    /// Requires `gate` to hold as well before this confirmation reports stopped.
+    ///
+    /// Shares the join flag, so installing a gate never loses a stop that already
+    /// happened. Multiple calls compose: every gate must hold.
+    pub fn also_requiring(&self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> StopConfirmation {
+        let previous = self.gate.clone();
+        StopConfirmation {
+            stopped: Arc::clone(&self.stopped),
+            gate: Some(match previous {
+                None => gate,
+                Some(previous) => Arc::new(move || previous() && gate()),
+            }),
+        }
     }
 
     /// A proof that can never be satisfied.
@@ -349,6 +393,7 @@ impl StopConfirmation {
     pub fn never() -> Self {
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
+            gate: None,
         }
     }
 }
@@ -955,6 +1000,57 @@ mod stop_confirmation_tests {
         });
         observer.join().unwrap();
         assert!(handle.execution_stopped());
+    }
+
+    /// A join alone is not enough when tools may still hold process groups.
+    ///
+    /// The join proves the task's own thread ended. A shell that forked a
+    /// background job ends with it while the job keeps running, so a lease released
+    /// on the join alone would free work that is still happening.
+    #[test]
+    fn task_join_without_tool_group_exit_retains_execution_lease() {
+        let (witness, confirmation) = StopWitness::pair();
+        let group_stopped = Arc::new(AtomicBool::new(false));
+        let gate_flag = Arc::clone(&group_stopped);
+        let gated =
+            confirmation.also_requiring(Arc::new(move || gate_flag.load(Ordering::Acquire)));
+
+        witness.mark_joined();
+        assert!(
+            !gated.is_stopped(),
+            "the task joined, but its tool groups have not been observed stopped"
+        );
+
+        group_stopped.store(true, Ordering::Release);
+        assert!(
+            gated.is_stopped(),
+            "both facts now hold: the task joined and its groups drained"
+        );
+    }
+
+    /// Installing a gate must not erase a stop that already happened, and every
+    /// gate must hold -- a later one cannot overrule an earlier one.
+    #[test]
+    fn gates_compose_and_never_mask_an_earlier_stop() {
+        let (witness, confirmation) = StopWitness::pair();
+        witness.mark_joined();
+
+        let first = Arc::new(AtomicBool::new(true));
+        let second = Arc::new(AtomicBool::new(false));
+        let first_flag = Arc::clone(&first);
+        let second_flag = Arc::clone(&second);
+        let gated = confirmation
+            .also_requiring(Arc::new(move || first_flag.load(Ordering::Acquire)))
+            .also_requiring(Arc::new(move || second_flag.load(Ordering::Acquire)));
+
+        assert!(!gated.is_stopped(), "the second gate is still closed");
+        second.store(true, Ordering::Release);
+        assert!(gated.is_stopped(), "the already-satisfied join is not lost");
+        first.store(false, Ordering::Release);
+        assert!(
+            !gated.is_stopped(),
+            "reopening an earlier gate closes the confirmation again"
+        );
     }
 
     /// `never` is the sentinel for a lost observer; it must not read as stopped.

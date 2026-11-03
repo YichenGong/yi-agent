@@ -5341,7 +5341,9 @@ dependencies = [
  "walkdir",
  "wiremock",
  "yi-agent-core",
+ "yi-agent-lifecycle",
  "yi-agent-skills",
+ "yi-agent-supervisors",
  "zip",
 ]
 

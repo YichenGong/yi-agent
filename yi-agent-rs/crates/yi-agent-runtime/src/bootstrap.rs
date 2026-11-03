@@ -207,6 +207,33 @@ pub fn build_tool_setup_with_controller(
     controller: yi_agent_tools::SandboxController,
     session_env: Vec<(String, String)>,
 ) -> Result<ToolSetup> {
+    build_tool_setup_owned(cfg, naked, roots, controller, session_env, None)
+}
+
+/// Where spawned processes belong, when this runtime has an owner.
+///
+/// A managed runtime names the frontend that owns every process the session
+/// starts, plus the channel it starts them on. `None` keeps the direct spawn.
+pub type ManagedOwner = (
+    yi_agent_tools::ManagedProcessPolicy,
+    yi_agent_tools::ManagedSpawner,
+);
+
+/// Same as [`build_tool_setup_with_controller`], but tools spawn through
+/// `managed`.
+///
+/// The MCP seam is wired from the same value: an MCP server started directly would
+/// be an unregistered child, which is the leak this path exists to prevent. The
+/// launcher is built here rather than inside the MCP crate so that crate keeps no
+/// dependency on the tools crate.
+pub fn build_tool_setup_owned(
+    cfg: &RuntimeConfig,
+    naked: bool,
+    roots: &[PathBuf],
+    controller: yi_agent_tools::SandboxController,
+    session_env: Vec<(String, String)>,
+    managed: Option<ManagedOwner>,
+) -> Result<ToolSetup> {
     if naked {
         // 空 root 的 manager:与空 registry 配套,保证结构体总是自洽。
         // naked 调用方只用 `tools`(空),不会起进程。
@@ -240,16 +267,23 @@ pub fn build_tool_setup_with_controller(
     sandbox_writable.sort();
     sandbox_writable.dedup();
 
-    yi_agent_tools::register_builtin_tools_with_controller_and_env(
+    yi_agent_tools::register_builtin_tools_managed(
         &mut registry,
         roots.to_vec(),
         controller.clone(),
         sandbox_writable.clone(),
-        session_env,
+        session_env.clone(),
+        managed.clone(),
     );
 
     let process_manager =
         yi_agent_tools::ProcessManager::with_controller(primary, controller, sandbox_writable);
+    let process_manager = match &managed {
+        Some((policy, spawner)) => {
+            Arc::clone(&process_manager).into_managed(policy.clone(), spawner.clone())
+        }
+        None => process_manager,
+    };
     yi_agent_tools::register_process_tools(&mut registry, Arc::clone(&process_manager));
 
     // MCP 配置是项目级文件(`.yi-agent/mcp.json`,被 gitignore),固定在项目根
@@ -258,7 +292,20 @@ pub fn build_tool_setup_with_controller(
     //
     // MCP 是可选子系统:配置缺失/损坏或探测初始化失败都不应阻断 agent 启动
     // (单个 server 的问题已在 yi-agent-mcp 内部 warn 并跳过)。
-    let mcp = match yi_agent_mcp::register_mcp_tools(&mut registry, &cfg.workdir) {
+    // A managed runtime must not leave the MCP probe's children unregistered, so
+    // the launcher is built from the same owner the tools use. `None` keeps the
+    // direct spawn, which is what an unmanaged daemon has always done.
+    let launcher: Option<Arc<dyn yi_agent_mcp::StdioLauncher>> =
+        managed.as_ref().map(|(_, spawner)| {
+            crate::mcp_launcher::ManagedStdioLauncher::new(spawner.clone())
+                as Arc<dyn yi_agent_mcp::StdioLauncher>
+        });
+    if managed.is_some() && launcher.is_none() {
+        // Unreachable by construction, but a silent fallback to direct spawning
+        // here is exactly the leak that must not be quiet.
+        anyhow::bail!("a managed session must launch MCP servers through its owner");
+    }
+    let mcp = match yi_agent_mcp::register_mcp_tools_with(&mut registry, &cfg.workdir, launcher) {
         Ok(manager) => manager,
         Err(err) => {
             tracing::warn!("MCP disabled: {err:#}");

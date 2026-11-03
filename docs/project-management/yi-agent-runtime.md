@@ -68,4 +68,14 @@
   - 判据：`grep -rn "migrate_model_keys\|migrate_env_settings\|parse_env_text\|resolve_global_env_path" yi-agent-rs/crates` 应无输出（`settings.rs` 的函数定义除外，届时已删）
   - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
 
+- [x] 受管运行时的装配入口（`build_tool_setup_owned` + `mcp_launcher.rs`） — runtime 原先只会
+  组装「自己 spawn」的工具集；新增 `ManagedOwner = (ManagedProcessPolicy, ManagedSpawner)` 让同一次
+  装配把受管能力同时接到三条路径：内置工具（`register_builtin_tools_managed`）、`ProcessManager`
+  （`into_managed`，必须在 spawn 之前调用，它会重建进程表）、MCP（`register_mcp_tools_with` 注入
+  `ManagedStdioLauncher`）。`build_tool_setup_with_controller` 保持旧签名、内部传 `None` 委托，故既有
+  调用点语义不变。`ManagedStdioLauncher` 实现 MCP 的 `StdioLauncher`，用 `std::env::current_dir()`
+  作为 server 的工作目录（与原先 `TokioChildProcess` 继承 daemon cwd 的行为对齐）。**当前生产路径
+  仍传 `None`**：真正的 guardian 连接签发属于 bring-up（Task 12），此时只有测试实现。判据：
+  `cargo test -p yi-agent-runtime`（261 passed）
+
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）

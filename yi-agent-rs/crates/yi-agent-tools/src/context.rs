@@ -1,6 +1,30 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::managed_process::{ManagedProcessPolicy, ManagedSpawner};
+
+/// Either an unmanaged context, or a managed one with its spawner.
+struct ManagedSpawn {
+    policy: ManagedProcessPolicy,
+    spawner: Option<ManagedSpawner>,
+}
+
+impl ManagedSpawn {
+    fn unmanaged() -> Self {
+        Self {
+            policy: ManagedProcessPolicy::Unmanaged,
+            spawner: None,
+        }
+    }
+
+    fn managed(policy: ManagedProcessPolicy, spawner: ManagedSpawner) -> Self {
+        Self {
+            policy,
+            spawner: Some(spawner),
+        }
+    }
+}
+
 /// Shared context for all builtin tools.
 ///
 /// `roots` is the session's root set: `roots[0]` is the primary root and is the
@@ -13,6 +37,13 @@ pub struct ToolsContext {
     /// 注入给 shell 子进程的环境变量（如当前会话的 thread id）。默认空集，
     /// 此时子进程行为与今天完全一致。
     session_env: Vec<(String, String)>,
+    /// How spawned processes are owned.
+    ///
+    /// `Unmanaged` keeps the original direct-spawn path: a manual daemon or a test
+    /// harness has no guardian and makes no promise that quitting stops anything.
+    /// In a managed runtime this is a frontend policy **and** a spawner, so every
+    /// child is registered under one owner before it runs.
+    managed: ManagedSpawn,
 }
 
 impl ToolsContext {
@@ -32,7 +63,29 @@ impl ToolsContext {
             roots,
             cwd: Mutex::new(cwd),
             session_env,
+            managed: ManagedSpawn::unmanaged(),
         }
+    }
+
+    /// The same context, with every spawned process owned by one frontend.
+    ///
+    /// Consuming `self` rather than mutating in place on purpose: a context that
+    /// switched owners mid-session would leave earlier children under the old
+    /// owner and later ones under the new, and "which client owns this?" would stop
+    /// being answerable.
+    pub fn into_managed(mut self, policy: ManagedProcessPolicy, spawner: ManagedSpawner) -> Self {
+        self.managed = ManagedSpawn::managed(policy, spawner);
+        self
+    }
+
+    /// The ownership policy for spawned processes.
+    pub fn managed_policy(&self) -> &ManagedProcessPolicy {
+        &self.managed.policy
+    }
+
+    /// The spawner to use, when this runtime is managed.
+    pub fn managed_spawner(&self) -> Option<&ManagedSpawner> {
+        self.managed.spawner.as_ref()
     }
 
     /// 注入给 shell 子进程的环境变量（默认空）。

@@ -306,3 +306,107 @@ pub struct BundledArtifactManifest {
     pub business_protocol_max: u32,
     pub capabilities: Vec<String>,
 }
+
+/// One process the guardian is asked to start on a frontend's behalf.
+///
+/// The fields deliberately stop short of anything that changes *who* the process
+/// is: no owner, no capability, no generation. Those come from the private
+/// descriptor the request arrives on, so a caller cannot ask to run as somebody
+/// else.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSpawnSpec {
+    /// Absolute path. A relative or empty program would be resolved against
+    /// whatever cwd the guardian happens to have, which is not the caller's.
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    /// Environment to *add* or override. The guardian's own environment is not
+    /// inherited wholesale: a provider key in the caller's environment has no
+    /// business reaching a tool process unless it was passed explicitly.
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+}
+
+/// `Debug` prints argument count and environment keys, never values.
+///
+/// A spawn spec routinely carries credentials in `env`, and a trace line is not
+/// the place to persist them.
+impl std::fmt::Debug for ManagedSpawnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedSpawnSpec")
+            .field("executable", &self.executable)
+            .field("arg_count", &self.args.len())
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("cwd", &self.cwd)
+            .finish()
+    }
+}
+
+/// What the guardian hands back after it registered the process.
+///
+/// `pid`/`pgid` are for diagnosis and for a caller that needs to name the group
+/// in a log. Control authority stays with the guardian: holding these numbers
+/// does not let anyone signal the group behind its back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSpawnReceipt {
+    pub process_id: ManagedProcessId,
+    pub pid: u32,
+    pub pgid: i32,
+}
+
+/// How a managed process ended.
+///
+/// `group_stopped` is what makes this usable as a stop proof: `code` describes
+/// the leader, and a leader can exit while a child it forked keeps running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedExit {
+    /// Exit code, when the leader exited normally.
+    pub code: Option<i32>,
+    /// Terminating signal, when the leader was signalled.
+    pub signal: Option<i32>,
+    /// Whether the whole group was observed empty.
+    pub group_stopped: bool,
+}
+
+/// One request on a private managed-process channel.
+///
+/// Frame-per-request and blocking, like the control protocol: these carry
+/// descriptors, so they travel on their own connection rather than through the
+/// public 16 KiB control frames.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManagedSpawnRequest {
+    /// Start one group. The three standard descriptors arrive out of band, as
+    /// `SCM_RIGHTS` ancillary data, so they are not part of this frame.
+    Spawn(ManagedSpawnSpec),
+    /// Wait for the group to end, within the caller's remaining budget.
+    Wait { process_id: ManagedProcessId },
+    /// Ask without waiting.
+    TryWait { process_id: ManagedProcessId },
+    /// Terminate the group and report what happened.
+    Terminate { process_id: ManagedProcessId },
+}
+
+impl std::fmt::Debug for ManagedSpawnRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(spec) => f.debug_tuple("Spawn").field(spec).finish(),
+            Self::Wait { process_id } => f.debug_tuple("Wait").field(process_id).finish(),
+            Self::TryWait { process_id } => f.debug_tuple("TryWait").field(process_id).finish(),
+            Self::Terminate { process_id } => f.debug_tuple("Terminate").field(process_id).finish(),
+        }
+    }
+}
+
+/// The guardian's answer on a managed-process channel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManagedSpawnResponse {
+    Spawned(ManagedSpawnReceipt),
+    Exit(ManagedExit),
+    /// Still running; the caller may ask again.
+    Running,
+    Failed {
+        reason: String,
+    },
+}

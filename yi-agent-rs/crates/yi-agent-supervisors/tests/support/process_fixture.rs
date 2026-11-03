@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use yi_agent_supervisors::lifecycle::guardian::{
-    ManagedCommand, ProcessOwner, READY_FD, READY_FD_ENV, TaskExecutionKey,
+    ManagedCommand, ProcessOwner, READY_CONSUMED_ENV, READY_FD, READY_FD_ENV, TaskExecutionKey,
 };
+
+/// Local alias so the fixture reads naturally at the call site.
+const YI_AGENT_READY_CONSUMED: &str = READY_CONSUMED_ENV;
 
 /// The ignored test that acts as the helper.
 pub const HELPER_TEST: &str = "process_fixture_helper";
@@ -193,6 +196,10 @@ pub fn run_helper_if_requested() {
         .collect();
     let role_args: Vec<&str> = role_args.iter().map(String::as_str).collect();
 
+    // A launcher in front of this program may have consumed the barrier already;
+    // reading it again would block forever on a byte that is gone.
+    let already_released = std::env::var(YI_AGENT_READY_CONSUMED).is_ok();
+
     // Without the guardian's descriptor there is no authority to run anything.
     let ready_fd: i32 = std::env::var(READY_FD_ENV)
         .ok()
@@ -202,7 +209,7 @@ pub fn run_helper_if_requested() {
         eprintln!("process_fixture_helper: no ready descriptor; refusing to start");
         std::process::exit(2);
     }
-    if read_one_byte(ready_fd).is_err() {
+    if !already_released && read_one_byte(ready_fd).is_err() {
         // EOF without a byte means the guardian died before registration became
         // durable. Exiting here, having run nothing, is the whole point.
         eprintln!("process_fixture_helper: ready barrier closed before start");
@@ -258,6 +265,49 @@ pub fn run_helper_if_requested() {
                 .join(",");
             std::fs::write(&marker, list).expect("record inherited descriptors");
             std::thread::sleep(Duration::from_secs(60));
+            std::process::exit(0);
+        }
+        "streams" => {
+            // Writes one line to each stream, then exits: proves the channel put
+            // the caller's two pipes on the right descriptors.
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let mut err = std::io::stderr();
+            let _ = out.write_all(b"on-stdout\n");
+            let _ = out.flush();
+            let _ = err.write_all(b"on-stderr\n");
+            let _ = err.flush();
+            std::process::exit(0);
+        }
+        "streams-then-hang" => {
+            // Writes both lines, then stays alive so the group outlives its leader
+            // only if the caller terminates it.
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let mut err = std::io::stderr();
+            let _ = out.write_all(b"on-stdout\n");
+            let _ = out.flush();
+            let _ = err.write_all(b"on-stderr\n");
+            let _ = err.flush();
+            // A grandchild in the same group, so "did the whole group stop"
+            // is not answered by the leader alone.
+            let grandchild = std::process::Command::new("/bin/sleep")
+                .arg("120")
+                .spawn()
+                .expect("fork a hanging grandchild");
+            eprintln!("helper: hanging grandchild {}", grandchild.id());
+            std::thread::sleep(Duration::from_secs(120));
+            std::process::exit(0);
+        }
+        "stdin-echo" => {
+            // Copies stdin to stdout until EOF. A merged or backwards stdio would
+            // produce nothing, or would block forever.
+            use std::io::{Read, Write};
+            let mut input = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut input);
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&input);
+            let _ = out.flush();
             std::process::exit(0);
         }
         "exit" => std::process::exit(0),

@@ -41,6 +41,12 @@ pub const READY_FD: RawFd = 9;
 /// Environment variable naming that descriptor, so a launcher does not have to
 /// hard-code the number.
 pub const READY_FD_ENV: &str = "YI_AGENT_MANAGED_READY_FD";
+/// Set when something in front of the program has already consumed the barrier.
+///
+/// The tool launcher reads the barrier and then `exec`s, so the program must not
+/// read it a second time: the first read consumed the only byte, and a second
+/// would block until the guardian happened to write again (never).
+pub const READY_CONSUMED_ENV: &str = "YI_AGENT_MANAGED_READY_CONSUMED";
 /// Where the ownership journal lives inside the runtime directory.
 pub const JOURNAL_FILE: &str = "processes.json";
 /// The guardian's control socket name.
@@ -268,6 +274,26 @@ impl ProcessRegistry {
         command: ManagedCommand,
         deadline: Deadline,
     ) -> io::Result<ManagedProcessId> {
+        self.spawn_with_stdio(command, None, deadline)
+    }
+
+    /// Starts `command` with caller-supplied standard descriptors.
+    ///
+    /// The descriptors are inherited copies: the child ends up with exactly these
+    /// open file descriptions on fd 0/1/2, so stdout and stderr stay two distinct
+    /// streams instead of one merged one, and stdin can be a pipe rather than
+    /// `/dev/null`. They are dup2'ed inside `pre_exec` before the blanket close of
+    /// fds above 2, because that close is what stops unrelated host descriptors
+    /// from leaking into a tool process.
+    ///
+    /// `stdio` is `None` for the daemon's own processes, which get `/dev/null` on
+    /// all three.
+    pub fn spawn_with_stdio(
+        &mut self,
+        command: ManagedCommand,
+        stdio: Option<[std::os::fd::OwnedFd; 3]>,
+        deadline: Deadline,
+    ) -> io::Result<ManagedProcessId> {
         if deadline.is_expired() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -313,14 +339,69 @@ impl ProcessRegistry {
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
 
-        let mut process = Command::new(&command.executable);
+        // Ask `Command` to keep the caller's descriptors open across the fork.
+        // They still have CLOEXEC set, so `pre_exec` is what turns each into the
+        // real stdio number before exec.
+        // Raw numbers, captured before the fork: `pre_exec` may only do
+        // async-signal-safe work, so it cannot touch the `OwnedFd`s themselves.
+        let stdio_raw = stdio.as_ref().map(|[stdin, stdout, stderr]| {
+            use std::os::fd::AsRawFd;
+            [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()]
+        });
+
+        // Why a launcher and not the program itself:
+        //
+        // The ready barrier must be read *after* the record is durable, and the
+        // parent only continues once `spawn` returns. A program that does not read
+        // fd 9 therefore either blocks the parent (if it reads in `pre_exec`) or
+        // has already run by the time the record is written (if it does not read
+        // at all). A tool program such as `sh` does neither.
+        //
+        // So the barrier is read by a one-line `sh` shim that then `exec`s the
+        // caller's program with the caller's arguments. `exec` preserves the pid
+        // and the process group, so ownership and reclamation still refer to the
+        // program that was asked for. The shim is only used for tool spawns (those
+        // that arrive with stdio descriptors); the daemon's own cooperative
+        // children keep reading the barrier themselves.
+        let mut process = if stdio_raw.is_some() {
+            let mut launcher = Command::new("/bin/sh");
+            launcher.arg("-c").arg(
+                // `read` returns non-zero on EOF, which is what a guardian that
+                // died before the record was durable leaves behind: exit without
+                // running the program.
+                "read -r managed_ready <&9 || exit 126; exec \"$@\"",
+            );
+            launcher.arg("managed-launch");
+            launcher.arg(&command.executable);
+            launcher.args(&command.args);
+            // Tell the program the barrier is already behind it.
+            launcher.env(READY_CONSUMED_ENV, "1");
+            launcher
+        } else {
+            let mut direct = Command::new(&command.executable);
+            direct.args(&command.args);
+            direct
+        };
         process
-            .args(&command.args)
             .current_dir(&command.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .env(READY_FD_ENV, READY_FD.to_string());
+        if let Some([stdin_fd, stdout_fd, stderr_fd]) = stdio_raw {
+            for fd in [stdin_fd, stdout_fd, stderr_fd] {
+                if fd < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a managed stdio descriptor must be a real descriptor",
+                    ));
+                }
+                // Let the descriptor survive the fork. `pre_exec` clears CLOEXEC
+                // again on the target number; this only keeps the *source* open
+                // long enough to be dup2'ed.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+            }
+        }
         for (key, value) in &command.env {
             process.env(key, value);
         }
@@ -334,6 +415,31 @@ impl ProcessRegistry {
                 // the group reaches grandchildren the child later forks.
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
+                }
+                // Move the caller's descriptors onto the standard numbers before
+                // the close loop below. `dup2` clears CLOEXEC on the target, which
+                // is what makes them survive exec.
+                if let Some([stdin_fd, stdout_fd, stderr_fd]) = stdio_raw {
+                    for (source, target) in [
+                        (stdin_fd, libc::STDIN_FILENO),
+                        (stdout_fd, libc::STDOUT_FILENO),
+                        (stderr_fd, libc::STDERR_FILENO),
+                    ] {
+                        if source != target && libc::dup2(source, target) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        // Even when `source == target`, a lingering CLOEXEC would
+                        // close the stream at exec.
+                        if libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        // The inherited copy is no longer needed: leaving it open
+                        // would let the child hold its own stdout write end and
+                        // never see EOF.
+                        if source != target && source > 2 {
+                            libc::close(source);
+                        }
+                    }
                 }
                 if libc::dup2(barrier_fd, READY_FD) < 0 {
                     return Err(io::Error::last_os_error());
@@ -350,6 +456,9 @@ impl ProcessRegistry {
                 // into the child and keep things alive that must not be kept alive.
                 // Only stdin/stdout/stderr and the ready barrier may cross exec.
                 for fd in 3..descriptor_limit {
+                    // 0..=2 hold the caller's descriptors (or /dev/null): closing
+                    // them would leave the child without stdio. The caller's source
+                    // descriptors were already closed above.
                     if fd != READY_FD {
                         libc::close(fd);
                     }
@@ -361,6 +470,10 @@ impl ProcessRegistry {
         // The child owns its copy now; the parent must drop this immediately or a
         // crashed child would still see an open barrier.
         drop(read_end);
+        // The child has its own copies on 0/1/2. Ours must go, or the caller's
+        // reads would never see EOF and the guardian would hold three descriptors
+        // per spawn forever.
+        drop(stdio);
 
         let pid = child.id() as i32;
         let fail = |mut child: Child, error: io::Error| -> io::Error {
@@ -522,6 +635,133 @@ impl ProcessRegistry {
             }
         }
         Ok(true)
+    }
+
+    /// Stops one group, but only if `owner` holds it.
+    ///
+    /// The ownership check is here rather than in the caller so a channel cannot
+    /// forget it: a frontend's private channel naming another frontend's
+    /// `process_id` must be refused, not obeyed.
+    pub fn terminate_granted(
+        &mut self,
+        owner: &ProcessOwner,
+        process_id: &str,
+        deadline: Deadline,
+    ) -> io::Result<yi_agent_lifecycle::types::ManagedExit> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.process_id == process_id)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no managed process {process_id}"),
+                )
+            })?;
+        if &record.owner != owner {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("process {process_id} is not owned by this channel"),
+            ));
+        }
+        if record.state == RecordState::Running {
+            self.stop(process_id, &deadline)?;
+        }
+        let mut exit = self.leader_status(&record);
+        exit.group_stopped = processes::group_is_empty(record.pgid)?;
+        Ok(exit)
+    }
+
+    /// Waits for the group behind `process_id` to end, describing how it did.
+    ///
+    /// Reports the leader's exit status *and* whether the whole group drained.
+    /// The two are not the same fact: a shell that exits leaves its foreground job
+    /// running in the same group, and a caller told only `code == 0` would report
+    /// work finished while children are still alive.
+    pub fn wait_exit(
+        &mut self,
+        process_id: &str,
+        deadline: Deadline,
+    ) -> io::Result<yi_agent_lifecycle::types::ManagedExit> {
+        if deadline.is_expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no budget left to wait for a managed process",
+            ));
+        }
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.process_id == process_id)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no managed process {process_id}"),
+                )
+            })?;
+        if processes::wait_for_group_stopped(record.pgid, deadline.remaining())? {
+            // The status is read *after* the group drains. Reading it first would
+            // describe a leader that was still running, which is exactly the
+            // `code: None` a caller then reports as a failed command.
+            let mut exit = self.leader_status(&record);
+            exit.group_stopped = true;
+            if record.state == RecordState::Running {
+                self.finish(process_id, RecordState::Reclaimed, None);
+            }
+            return Ok(exit);
+        }
+        // The budget ran out while the group was still alive: report what is known
+        // now, with `group_stopped` false so the caller does not read it as done.
+        Ok(self.leader_status(&record))
+    }
+
+    /// Reports the current state without waiting.
+    ///
+    /// `None` means the group is still alive. A caller polling this must not treat
+    /// it as a stop proof either way: only `group_stopped` on the returned value is.
+    pub fn try_exit(
+        &mut self,
+        process_id: &str,
+    ) -> io::Result<Option<yi_agent_lifecycle::types::ManagedExit>> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.process_id == process_id)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no managed process {process_id}"),
+                )
+            })?;
+        let mut exit = self.leader_status(&record);
+        if !processes::group_is_empty(record.pgid)? {
+            return Ok(None);
+        }
+        exit.group_stopped = true;
+        if record.state == RecordState::Running {
+            self.finish(process_id, RecordState::Reclaimed, None);
+        }
+        Ok(Some(exit))
+    }
+
+    /// Reads the leader's exit status, reaping it if it already ended.
+    ///
+    /// `try_wait` is what turns "the group is empty" into "the leader exited with
+    /// this status". Without reaping first, `WIFEXITED` has nothing to report.
+    fn leader_status(&mut self, record: &ProcessRecord) -> yi_agent_lifecycle::types::ManagedExit {
+        let mut exit = yi_agent_lifecycle::types::ManagedExit::default();
+        let Some(child) = self.children.get_mut(&record.process_id) else {
+            return exit;
+        };
+        if let Ok(Some(status)) = child.try_wait() {
+            use std::os::unix::process::ExitStatusExt;
+            exit.code = status.code();
+            exit.signal = status.signal();
+        }
+        exit
     }
 
     /// Classifies one managed group, refusing to call an unowned group stopped.
@@ -731,7 +971,9 @@ impl OwnedFd {
 
 fn write_barrier(write_end: &OwnedFd) -> io::Result<()> {
     let mut fd = write_end.0;
-    let bytes = b"1";
+    // A newline, not a bare byte: the shell launcher uses `read`, which only
+    // returns when it sees a line terminator.
+    let bytes = b"\n";
     // `write` on the raw descriptor, so the wrapper keeps sole ownership and
     // cannot close it twice.
     let written = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, 1) };

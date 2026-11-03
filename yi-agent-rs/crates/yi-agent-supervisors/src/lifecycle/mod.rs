@@ -18,7 +18,9 @@
 //! runtime.
 
 pub mod admission;
+pub mod demands;
 pub mod guardian;
+pub mod managed_channel;
 pub mod processes;
 pub mod scope;
 pub mod selection;

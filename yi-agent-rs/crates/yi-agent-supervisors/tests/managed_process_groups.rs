@@ -458,6 +458,111 @@ fn recovery_reclaims_a_group_whose_leader_is_verifiable() {
     assert_eq!(report.reclaimed, vec![process_id]);
 }
 
+/// A plugin whose launching parent exits still has its grandchildren reclaimed.
+///
+/// This is the shape a plugin service actually has: a supervisor starts a plugin,
+/// the plugin forks a worker, and the plugin's own parent is long gone. Reclaiming
+/// only the process that was spawned would leave the worker behind -- and the
+/// worker is the part that is doing work.
+#[test]
+fn a_plugin_parent_that_exits_still_has_its_grandchild_reclaimed() {
+    let directory = TempDir::new().unwrap();
+    let mut registry = registry(&directory);
+    let mut markers = fixture::MarkerGuard::new();
+    let owner = ProcessOwner::plugin("search");
+    let marker = markers.path("plugin-grandchild");
+
+    let process_id = registry
+        .spawn(
+            fixture::parent_exits_leaving_child(owner.clone(), &marker),
+            Deadline::after(Duration::from_secs(10)),
+        )
+        .unwrap();
+    // The parent exits on purpose; only the grandchild writes the marker.
+    assert!(
+        fixture::wait_for_marker(&marker, fixture::MARKER_TIMEOUT),
+        "the grandchild must be running before reclamation is attempted"
+    );
+    assert!(
+        !registry.owner_is_stopped(&owner).unwrap(),
+        "the group is still alive even though its leader exited"
+    );
+
+    registry
+        .terminate_owner(&owner, Deadline::after(Duration::from_secs(10)))
+        .unwrap();
+    assert!(
+        registry.owner_is_stopped(&owner).unwrap(),
+        "a group kill must reach the grandchild, not just the exited leader"
+    );
+    assert!(
+        registry
+            .records()
+            .iter()
+            .find(|record| record.process_id == process_id)
+            .map(|record| record.state != RecordState::Running)
+            .unwrap_or(false),
+        "the record must be marked reclaimed rather than left running"
+    );
+}
+
+/// One client's departure does not stop another client's tools.
+///
+/// The clients here are deliberately different *frontends*, not two tasks of one
+/// client: reclamation is scoped to the owner that departed, and a shared process
+/// tree would be exactly the cross-client leak the boundary exists to prevent.
+#[test]
+fn one_departed_client_does_not_stop_anothers_tools() {
+    let directory = TempDir::new().unwrap();
+    let mut registry = registry(&directory);
+    let mut markers = fixture::MarkerGuard::new();
+    let depart = ProcessOwner::frontend("client-a");
+    let stay = ProcessOwner::frontend("client-b");
+    let depart_marker = markers.path("client-a");
+    let stay_marker = markers.path("client-b");
+
+    registry
+        .spawn(
+            fixture::steady_writer(depart.clone(), &depart_marker, None),
+            Deadline::after(Duration::from_secs(10)),
+        )
+        .unwrap();
+    registry
+        .spawn(
+            fixture::steady_writer(stay.clone(), &stay_marker, None),
+            Deadline::after(Duration::from_secs(10)),
+        )
+        .unwrap();
+    assert!(fixture::wait_for_marker(
+        &depart_marker,
+        fixture::MARKER_TIMEOUT
+    ));
+    assert!(fixture::wait_for_marker(
+        &stay_marker,
+        fixture::MARKER_TIMEOUT
+    ));
+
+    registry
+        .terminate_owner(&depart, Deadline::after(Duration::from_secs(10)))
+        .unwrap();
+    assert!(registry.owner_is_stopped(&depart).unwrap());
+    assert!(
+        !registry.owner_is_stopped(&stay).unwrap(),
+        "client B's work must continue when client A departs"
+    );
+
+    let before = fixture::marker_len(&stay_marker);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        fixture::marker_len(&stay_marker) > before,
+        "client B's tool is still writing after client A left"
+    );
+
+    registry
+        .terminate_owner(&stay, Deadline::after(Duration::from_secs(10)))
+        .unwrap();
+}
+
 /// The helper runs as a test so the binary can re-exec itself.
 #[test]
 #[ignore = "internal fixture: requires the guardian's ready descriptor"]

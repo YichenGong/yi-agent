@@ -14,11 +14,13 @@
 //!   clock.
 //! - [`client`] — the blocking control-channel client.
 //! - [`leases`] — the frontend lease state machine (no I/O, injectable time).
+//! - [`managed`] — private managed-process channels, including descriptor passing.
 
 pub mod client;
 pub mod codec;
 pub mod deadline;
 pub mod leases;
+pub mod managed;
 pub mod types;
 
 /// Control protocol version. Evolves independently of the business protocol.

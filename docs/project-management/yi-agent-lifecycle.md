@@ -91,4 +91,14 @@
   `the_released_tombstone_table_stays_bounded`；**变异验证**：让 `disconnected` 不比对 epoch、让
   `heartbeat` 不查 tombstone → 2 个用例红（实测 RED）
 - [ ] 预览／确认／状态 DTO 与客户端方法 — 见 Task 14、16
-- [ ] 受管进程 spawn 客户端 — 见 Task 8
+- [x] 受管进程 spawn 客户端（`managed/{client,fdpass}.rs`） — 工具侧通过 guardian 签发的私有
+  owner-bound 连接启动进程：`ManagedSpawnClient::connect(OwnedFd)` 接管一条已有连接（没有可连的路径，
+  连接只能由 guardian 交给它），`spawn` 把 stdin／stdout／stderr 三个**独立** FD 用 `SCM_RIGHTS`
+  随帧送达，`wait`／`try_wait`／`terminate` 复用同一条连接并各占一帧。**owner 不来自请求**：它由服务端
+  在连接建立时确定（`ChannelGrant`），请求里只有 program、args、env、cwd——因此工具无法以别人的身份
+  spawn，也无法自己登记或续租。判据：`cargo test -p yi-agent-lifecycle --test managed_fdpass`
+  （5 passed），含 `three_standard_descriptors_arrive_as_three_distinguishable_streams`、
+  `more_descriptors_than_the_protocol_allows_are_refused_before_sending`、
+  `a_spawn_receipt_round_trips_through_the_wire_codec`、
+  `a_silent_peer_times_out_instead_of_wedging_the_serve_loop`；**变异验证**：让 `recv_with_fds`
+  丢弃辅助数据 → 三流用例红（实测 RED）
