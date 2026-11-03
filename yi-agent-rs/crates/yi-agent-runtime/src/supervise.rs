@@ -176,39 +176,23 @@ fn serve_inner(
         .map(str::to_string)
         .unwrap_or_else(|| yi_agent_flags::build_kind().to_string());
     let join = std::thread::spawn(move || {
-        // 先校准清单再进循环。
-        //
-        // 清单是**安装那一刻**的快照，插件升级后没有任何东西会刷新它。旧快照
-        // 会让新逻辑读旧结论（`stop_when_disabled` 就是这样：用户关掉开关、进程
-        // 却还在跑，界面上也看不出原因）。放在循环外只做一次：自述要起子进程，
-        // 每 500ms 跑一遍是浪费；而"装完就改清单"的窗口由安装路径自己覆盖。
-        if refresh_manifests {
-            yi_agent_supervisors::refresh::refresh_and_log(&layout.manifests_dir());
-        }
-        // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
-        // `stop()` 仍能安全 join 到这个已结束的线程。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut supervisor = Supervisor::new(layout, kind);
-            if let Some(path) = flags_path {
-                supervisor = supervisor.with_flags_path(path);
+        drive_supervision(layout, &scope, kind, flags_path, &flag, |dir, stop| {
+            // 先校准清单再进循环。
+            //
+            // 清单是**安装那一刻**的快照，插件升级后没有任何东西会刷新它。旧快照
+            // 会让新逻辑读旧结论（`stop_when_disabled` 就是这样：用户关掉开关、进程
+            // 却还在跑，界面上也看不出原因）。放在循环外只做一次：自述要起子进程，
+            // 每 500ms 跑一遍是浪费；而"装完就改清单"的窗口由安装路径自己覆盖。
+            //
+            // 停止请求必须传进去：一次卡住的自述会让 handle 的 join 白等满
+            // 15 秒（后代持写端时更久）。刷新在 catch 之内，所以它在展开路上
+            // 留下的资源也由执行器的 guard 收口。
+            if refresh_manifests {
+                yi_agent_supervisors::refresh::refresh_and_log_until(dir, || {
+                    stop.load(Ordering::SeqCst)
+                });
             }
-            while !flag.load(Ordering::SeqCst) {
-                supervisor.reconcile();
-                // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
-                // 每轮整体替换**本项目的分区**，停止或未声明的插件自然消失，
-                // 其他项目的路由不受影响。
-                yi_agent_store::ipc::register_plugin_sockets(&scope, supervisor.query_sockets());
-                std::thread::sleep(RECONCILE_INTERVAL);
-            }
-            // 已经没有在跑的东西了，也就不该留下任何可转发的路由。
-            yi_agent_store::ipc::clear_plugin_sockets(&scope);
-            supervisor.stop_all();
-        }));
-        if outcome.is_err() {
-            tracing::error!("plugin supervision loop panicked; plugins are no longer supervised");
-            // 表里可能还留着本进程登记过的路由，清掉免得指向死 socket。
-            yi_agent_store::ipc::clear_plugin_sockets(&scope);
-        }
+        });
     });
     SuperviseHandle {
         stop,
@@ -216,6 +200,55 @@ fn serve_inner(
         supervising: true,
     }
 }
+
+/// 监督线程的主体：刷新（可注入，便于测 panic 路由）→ 对账循环 → 收口。
+///
+/// `catch_unwind` 的位置**不在测试分支里**：真实刷新和生产对账循环共用同一条
+/// 展开保护，所以「刷新 panic 时清掉本项目的路由」不是只在测试里成立的行为。
+fn drive_supervision(
+    layout: Layout,
+    scope: &Path,
+    kind: String,
+    flags_path: Option<std::path::PathBuf>,
+    flag: &AtomicBool,
+    refresh: impl FnOnce(&Path, &AtomicBool),
+) {
+    // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
+    // `stop()` 仍能安全 join 到这个已结束的线程。
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refresh(&layout.manifests_dir(), flag);
+        let mut supervisor = Supervisor::new(layout, kind);
+        if let Some(path) = flags_path {
+            supervisor = supervisor.with_flags_path(path);
+        }
+        while !flag.load(Ordering::SeqCst) {
+            supervisor.reconcile();
+            // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
+            // 每轮整体替换**本项目的分区**，停止或未声明的插件自然消失，
+            // 其他项目的路由不受影响。
+            yi_agent_store::ipc::register_plugin_sockets(scope, supervisor.query_sockets());
+            std::thread::sleep(RECONCILE_INTERVAL);
+        }
+        // 已经没有在跑的东西了，也就不该留下任何可转发的路由。
+        yi_agent_store::ipc::clear_plugin_sockets(scope);
+        supervisor.stop_all();
+    }));
+    if outcome.is_err() {
+        tracing::error!("plugin supervision loop panicked; plugins are no longer supervised");
+        // 表里可能还留着本进程登记过的路由，清掉免得指向死 socket。只清本项目的
+        // 分区：其他项目的监督线程仍在跑，它们的路由不该被这里擦掉。
+        yi_agent_store::ipc::clear_plugin_sockets(scope);
+    }
+}
+
+/// 源码级共享假插件：与 supervisors 的测试用同一份 fixture 源文件。
+///
+/// 不是运行时依赖，也不是给 supervisors 开的测试 API：只在 cfg(test) 里按路径
+/// 编进本 crate 的测试模块。fixture 本身只依赖 std/tempfile/serde_json。
+#[cfg(test)]
+#[allow(dead_code)] // Shared fixture: each test crate uses a different subset of fields.
+#[path = "../../yi-agent-supervisors/src/refresh/describe/fixture.rs"]
+mod refresh_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -534,5 +567,213 @@ mod tests {
 
         bare.stop();
         with_plugin.stop();
+    }
+
+    // -----------------------------------------------------------------------
+    // 真实刷新入口的停机验收（Task 3）
+    // -----------------------------------------------------------------------
+
+    /// 自述已开始运行时的停止：必须在 2 秒 backstop 内 join 回来。
+    ///
+    /// 走真实 `serve_with_environment`（不是 `serve_without_manifest_refresh`），
+    /// 所以这里检验的是生产接线，而不是某条测试专用捷径。
+    fn assert_refresh_shutdown(use_drop: bool) {
+        let _guard = exclusive();
+        let fixture = super::refresh_fixture::PluginFixture::new();
+        let a = fixture.plugin("a", "hang", 0, 0);
+        let b = fixture.plugin("b", "small", 0, 0);
+        let flags = fixture.arm_flags();
+        let before = std::fs::read(&a.stored).unwrap();
+        let scope = scope_of(fixture.workdir());
+        yi_agent_store::ipc::register_plugin_sockets(
+            &scope,
+            vec![("a".into(), a.query_socket.clone())],
+        );
+        let handle = serve_with_environment(fixture.workdir(), &scope, Some(flags), Some("dev"));
+        // 先证明 child 真的进入了自述阶段，再要求停止——否则这条用例可能在
+        // 「还没来得及卡住」就通过。
+        assert!(
+            wait_for(&a.manifest_marker, SETTLE_BUDGET),
+            "the plugin must reach its manifest phase before we stop"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            if use_drop {
+                drop(handle);
+            } else {
+                handle.stop();
+            }
+            let _ = tx.send(());
+        });
+        let stopped = rx.recv_timeout(std::time::Duration::from_secs(2));
+        if stopped.is_err() {
+            // 失败分支不 join：fixture 目录消失是测试 child 自己的回收 backstop，
+            // 不是产品取消的替代品。在这里无限等待只会让整条测试挂死。
+            drop(fixture);
+            panic!("stopping did not cancel a running manifest description");
+        }
+        join.join().unwrap();
+        assert_eq!(
+            std::fs::read(&a.stored).unwrap(),
+            before,
+            "a cancelled description must leave the stored manifest alone"
+        );
+        assert!(
+            yi_agent_store::ipc::plugin_socket_for(&scope, "a").is_none(),
+            "this project's routes must be cleared on the way out"
+        );
+        assert!(!b.manifest_marker.exists(), "later plugins must not start");
+        assert!(!b.run_marker.exists());
+    }
+
+    #[test]
+    fn stopping_during_manifest_refresh_joins_promptly() {
+        assert_refresh_shutdown(false);
+    }
+
+    #[test]
+    fn dropping_during_manifest_refresh_joins_promptly() {
+        assert_refresh_shutdown(true);
+    }
+
+    /// 一个慢插件只该拖住它自己：生产 15 秒预算走完后，后面的插件正常起跑并可查询。
+    #[test]
+    fn a_slow_description_does_not_block_later_supervision() {
+        let _guard = exclusive();
+        let fixture = super::refresh_fixture::PluginFixture::new();
+        let a = fixture.plugin("a", "hang", 0, 0);
+        let b = fixture.plugin("b", "small", 0, 0);
+        let flags = fixture.arm_flags();
+        let a_before = std::fs::read(&a.stored).unwrap();
+        let b_before = std::fs::read(&b.stored).unwrap();
+        let scope = scope_of(fixture.workdir());
+        let handle = serve_with_environment(fixture.workdir(), &scope, Some(flags), Some("dev"));
+
+        // 外层至少 40 秒：a 要走满生产的 15 秒，再给 b 的自述 + 对账留足余量。
+        let outer = Instant::now() + Duration::from_secs(45);
+        assert!(
+            wait_for(&b.run_marker, Duration::from_secs(45)),
+            "the later plugin must still be started after a slow description"
+        );
+        assert!(Instant::now() < outer);
+
+        // b 的清单被正常刷新，a 的原字节不变。
+        let b_after = std::fs::read(&b.stored).unwrap();
+        assert_ne!(b_after, b_before, "b must have been refreshed");
+        let parsed = yi_agent_supervisors::manifest::SupervisorManifest::parse(
+            std::str::from_utf8(&b_after).unwrap(),
+        )
+        .expect("b's refreshed manifest parses");
+        assert!(parsed.stop_when_disabled);
+        assert_eq!(std::fs::read(&a.stored).unwrap(), a_before);
+
+        // 路由必须真的可查询：连上去发一条请求，而不是只看文件存在。
+        let socket = {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(path) = yi_agent_store::ipc::plugin_socket_for(&scope, "b") {
+                    break path;
+                }
+                assert!(Instant::now() < deadline, "b never became routable");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(
+            probe_plugin(&socket),
+            serde_json::json!({"ok": true}),
+            "the route must answer a real request"
+        );
+
+        handle.stop();
+    }
+
+    /// 连到插件 socket 发一行请求，读回一行 JSON。
+    fn probe_plugin(socket: &Path) -> serde_json::Value {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(socket).expect("connect to the plugin socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"{\"method\":\"ping\"}\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).expect("the plugin answers JSON")
+    }
+
+    /// 刷新 panic 时只清本项目的路由，别的项目不受影响。
+    #[test]
+    fn refresh_panic_clears_only_its_project_routes() {
+        let _guard = exclusive();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let a_scope = scope_of(a.path());
+        let b_scope = scope_of(b.path());
+        yi_agent_store::ipc::register_plugin_sockets(
+            &a_scope,
+            [("a".to_owned(), a.path().join("a.sock"))]
+                .into_iter()
+                .collect(),
+        );
+        yi_agent_store::ipc::register_plugin_sockets(
+            &b_scope,
+            [("b".to_owned(), b.path().join("b.sock"))]
+                .into_iter()
+                .collect(),
+        );
+        drive_supervision(
+            Layout::for_workdir(a.path()),
+            &a_scope,
+            "dev".into(),
+            None,
+            &AtomicBool::new(true),
+            |_, _| panic!("injected refresh panic"),
+        );
+        assert!(
+            yi_agent_store::ipc::plugin_socket_for(&a_scope, "a").is_none(),
+            "a panicking refresh must still clear this project's routes"
+        );
+        assert_eq!(
+            yi_agent_store::ipc::plugin_socket_for(&b_scope, "b"),
+            Some(b.path().join("b.sock")),
+            "another project's routes must survive"
+        );
+        yi_agent_store::ipc::clear_plugin_sockets(&b_scope);
+    }
+
+    /// 已经在停止、且没有走过任何对账时，收口分支仍要清本项目路由。
+    #[test]
+    fn an_already_stopped_loop_clears_its_project_routes() {
+        let _guard = exclusive();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let a_scope = scope_of(a.path());
+        let b_scope = scope_of(b.path());
+        yi_agent_store::ipc::register_plugin_sockets(
+            &a_scope,
+            [("a".to_owned(), a.path().join("a.sock"))]
+                .into_iter()
+                .collect(),
+        );
+        yi_agent_store::ipc::register_plugin_sockets(
+            &b_scope,
+            [("b".to_owned(), b.path().join("b.sock"))]
+                .into_iter()
+                .collect(),
+        );
+        drive_supervision(
+            Layout::for_workdir(a.path()),
+            &a_scope,
+            "dev".into(),
+            None,
+            &AtomicBool::new(true),
+            |_, _| {},
+        );
+        assert!(yi_agent_store::ipc::plugin_socket_for(&a_scope, "a").is_none());
+        assert!(yi_agent_store::ipc::plugin_socket_for(&b_scope, "b").is_some());
+        yi_agent_store::ipc::clear_plugin_sockets(&b_scope);
     }
 }
