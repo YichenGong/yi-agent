@@ -23,18 +23,16 @@
 //! 让插件凭空消失。
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::manifest::{SupervisorManifest, load_manifests};
 
-/// 等插件 `manifest` 子命令自述的超时。
-///
-/// 5s 在冷进程启动 + CI 高并发下会被击穿（实测：并发跑 87 个测试时，一个
-/// 只做 `cat` 的 shell 脚本也能超过 5s，校准被误判成 `Skipped`）。代价分析：
-/// 这个超时只在**插件自己坏掉**时才会走满，走满的结果是回退到磁盘上的旧清单
-/// （`RefreshOutcome::Skipped`），不影响 reconcile 循环，也不影响启动延迟之外
-/// 的任何路径。因此把它放宽到 15s，用「坏插件多等 10s」换「好插件不被误判」。
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 自述执行器：有界双流捕获、单一截止时间、一次性进程组收口。
+mod describe;
+
+#[cfg(test)]
+#[allow(dead_code)] // Shared fixture: each test crate uses a different subset of fields.
+#[path = "refresh/describe/fixture.rs"]
+mod fixture;
 
 /// 一次刷新的结果，供调用方决定要不要记日志。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,51 +104,14 @@ fn refresh_one(dir: &Path, stored: &SupervisorManifest) -> RefreshOutcome {
 
 /// 跑 `<command> manifest`，超时就杀掉。
 ///
-/// 不用 `Command::output()`：它没有超时，一个卡住的插件会让 daemon 永远起不来。
+/// 历史：这里曾是 `try_wait()` 轮询 + `wait_with_output()`，不读管道也把读取
+/// 放在 deadline 之外，于是大输出被误判超时、后代持写端时读取无界。现在实际
+/// 执行在私有模块 [`describe`]，预算见 [`DescribePolicy::production`]。
 fn describe(command: &str) -> Result<String, String> {
-    let mut child = std::process::Command::new(command)
-        .arg("manifest")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not run `{command} manifest`: {error}"))?;
-
-    let deadline = Instant::now() + DESCRIBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().map_err(|error| {
-                    format!("could not read `{command} manifest` output: {error}")
-                })?;
-                if !status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let first = stderr.lines().next().unwrap_or("").trim();
-                    let detail = if first.is_empty() {
-                        format!("exited with {status}")
-                    } else {
-                        first.to_string()
-                    };
-                    return Err(format!("`{command} manifest` failed: {detail}"));
-                }
-                return String::from_utf8(output.stdout)
-                    .map_err(|_| format!("`{command} manifest` did not print UTF-8"));
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "`{command} manifest` did not answer within {DESCRIBE_TIMEOUT:?}"
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => {
-                return Err(format!("could not wait for `{command} manifest`: {error}"));
-            }
-        }
-    }
+    describe::describe(command, describe::DescribePolicy::production(), &mut || {
+        false
+    })
+    .map_err(|error| error.render(command))
 }
 
 /// 同目录 `tmp` + `rename`：截断的清单会被 supervisor 当成坏清单**静默跳过**，

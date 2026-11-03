@@ -68,7 +68,7 @@
   - 判据：`grep -rn "migrate_model_keys\|migrate_env_settings\|parse_env_text\|resolve_global_env_path" yi-agent-rs/crates` 应无输出（`settings.rs` 的函数定义除外，届时已删）
   - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
 
-- [ ] 插件清单刷新全阶段限时与停机取消 — `yi-agent-supervisors/src/refresh.rs:110–153` 的原始函数已用合成插件复现管道背压误判超时及退出后超过 15s；runtime `src/supervise.rs:176–188` 启动刷新需传递已有 stop 信号，避免 shutdown join 被刷新拖住。待实现判据：`cargo test -p yi-agent-supervisors` 覆盖双流排空/期限/清理，`cargo test -p yi-agent-runtime --lib supervise` 覆盖 `stopping_during_manifest_refresh_joins_promptly` 与真实对账恢复（新测试待实现）；[修复 spec](../superpowers/specs/2026-11-03-supervisor-manifest-describe-bounds-design.md) §6 与 [实施 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) Tasks 1–4。设计已复核、计划已撰写；实现仍未完成。
+- [ ] 插件清单刷新全阶段限时与停机取消 — `yi-agent-supervisors/src/refresh.rs:110–153` 的原始函数已用合成插件复现管道背压误判超时及退出后超过 15s；runtime `src/supervise.rs:176–188` 启动刷新需传递已有 stop 信号，避免 shutdown join 被刷新拖住。待实现判据：`cargo test -p yi-agent-supervisors` 覆盖双流排空/期限/清理，`cargo test -p yi-agent-runtime --lib supervise` 覆盖 `stopping_during_manifest_refresh_joins_promptly` 与真实对账恢复（新测试待实现）；[修复 spec](../superpowers/specs/2026-11-03-supervisor-manifest-describe-bounds-design.md) §6 与 [实施 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) Tasks 1–4。设计已复核、计划已撰写。**阶段进度**：执行器层已落地（`cargo test -p yi-agent-supervisors` 93 单元 + 23 集成通过，含双流背压、退出后期限、1 MiB stdout 硬限、组清理与展开清理；三项变异各自转红）。批次取消（`refresh_*_until`）与 runtime 停止接线尚未完成，本项仍为 [ ]。
 
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
 
