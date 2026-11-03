@@ -15,7 +15,7 @@
 | `plugins/contracts/bridge-v1.schema.json` | 能力桥方法集与结果联合 |
 | `plugins/contracts/fixtures/*.json` | 黄金样本（公开测试身份，非生产信任根） |
 | `scripts/plugins/check-contracts.mjs` | 结构校验 + 跨请求行为校验 |
-| `scripts/plugins/check-contracts.test.mjs` | 上述行为的 21 条断言 |
+| `scripts/plugins/check-contracts.test.mjs` | 上述行为的 21 条断言（G2 起增至 42 条，见分发子 spec） |
 
 运行：
 
@@ -25,7 +25,7 @@ node scripts/plugins/check-contracts.mjs
 node --test scripts/plugins/check-contracts.test.mjs
 ```
 
-预期：`positive: 4, negative: 17, failures: 0` 与 21/21 通过。
+预期（G1 交付时）：`positive: 4, negative: 17, failures: 0` 与 21/21 通过。G2 之后样本集扩大为 `positive: 9, negative: 24` 与 42/42——G1 的 21 条断言没有减少或放宽。
 
 ## 1. 本文冻结什么、不冻结什么
 

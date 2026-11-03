@@ -10,7 +10,7 @@
 // 也不能临时下载未知版本，否则「契约冻结」这句话就没有意义。
 
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -50,6 +50,9 @@ const SCHEMA_FILES = {
   manifest: "manifest-v1.schema.json",
   host: "host-v1.schema.json",
   bridge: "bridge-v1.schema.json",
+  root: "root-v1.schema.json",
+  release: "release-v1.schema.json",
+  lifecycle: "lifecycle-v1.schema.json",
 };
 
 // 破坏性动词。声明为 Read 的 method / verb 若名字里带这些词，说明声明与语义
@@ -195,6 +198,54 @@ function checkManifestSemantics(doc) {
   return errors;
 }
 
+// 生命周期阶段顺序。journal 里的 phase 必须在这条链上；跳过任何一段都意味着
+// 某个持久化阶段没有对应的恢复动作。
+const LIFECYCLE_PHASES = [
+  "draining",
+  "drained",
+  "backing_up",
+  "migrating",
+  "health_checking",
+  "committing",
+  "projecting",
+  "done",
+];
+
+function checkLifecycleSemantics(doc) {
+  const errors = [];
+
+  if (!LIFECYCLE_PHASES.includes(doc.phase)) {
+    errors.push(`/phase: "${doc.phase}" is not a known lifecycle phase`);
+    return errors;
+  }
+
+  // target.release.plugin 必须与顶层 plugin 一致：否则事务日志会指向
+  // 另一个插件，恢复时会把 A 的进度套到 B 上。
+  if (doc.target?.release?.plugin && doc.target.release.plugin !== doc.plugin) {
+    errors.push(
+      `/target/release/plugin: "${doc.target.release.plugin}" does not match the transaction plugin "${doc.plugin}"`,
+    );
+  }
+
+  // done 之外的阶段一律不允许保留 error=null 却声称成功；done 阶段若有
+  // error 则是自相矛盾。
+  if (doc.phase === "done" && doc.error) {
+    errors.push("/error: a completed transaction must not carry an error");
+  }
+
+  // 回滚必须能说明上一代次；没有 previous 的 Rollback 无从回退。
+  if (doc.action === "Rollback" && !doc.previous) {
+    errors.push("/previous: a Rollback transaction must record the previous activation");
+  }
+  if (doc.previous && doc.previous.activation >= doc.target.activation) {
+    errors.push(
+      `/previous/activation: ${doc.previous.activation} must be lower than the target activation ${doc.target.activation}`,
+    );
+  }
+
+  return errors;
+}
+
 export function checkDocument(contracts, kind, doc) {
   const validate = contracts.validators[kind];
   if (!validate) {
@@ -207,6 +258,7 @@ export function checkDocument(contracts, kind, doc) {
     for (const err of validate.errors ?? []) errors.push(formatAjvError(err));
   }
   if (kind === "manifest") errors.push(...checkManifestSemantics(doc));
+  if (kind === "lifecycle") errors.push(...checkLifecycleSemantics(doc));
 
   return { ok: errors.length === 0, errors };
 }
@@ -248,7 +300,7 @@ function checkBindingShape(b, label, errors) {
   return good;
 }
 
-export function checkTrace(_contracts, trace) {
+export function checkTrace(_contracts, trace, options = {}) {
   const errors = [];
 
   if (!trace || typeof trace !== "object") {
@@ -293,6 +345,18 @@ export function checkTrace(_contracts, trace) {
         errors.push(
           `${label}: binding project "${req.binding.project}" does not match the trace binding project ` +
             `"${trace.binding.project}" — one request id may not span two grants`,
+        );
+      }
+    }
+
+    // 候选版本不是公共激活版本：客户端和普通 CLI 不可使用（设计 §9.2 第 6 步）。
+    // 请求可以继承 trace 级 binding，因此两级都要看，否则继承路径就是绕过口。
+    if (options.candidateActivation !== undefined) {
+      const effective = req.binding ?? trace.binding;
+      if (effective && Number.isInteger(effective.activation) && effective.activation === options.candidateActivation) {
+        errors.push(
+          `${label}: binding uses activation ${effective.activation}, which is a candidate release ` +
+            `under maintenance — candidate releases are not usable through a normal binding`,
         );
       }
     }
@@ -394,6 +458,44 @@ function negativeSamples(fixtures) {
       kind: "bridge",
       doc: tamper(fixtures.bridge, (d) => { d.responseVariants = ["pending", "committed", "rejected"]; }),
     },
+    {
+      name: "lifecycle: journal names another plugin",
+      kind: "lifecycle",
+      doc: tamper(fixtures.lifecycle, (d) => { d.target.release.plugin = "other-plugin"; }),
+    },
+    {
+      name: "lifecycle: rollback without a previous activation",
+      kind: "lifecycle",
+      doc: tamper(fixtures.lifecycle, (d) => { d.action = "Rollback"; d.previous = null; }),
+    },
+    {
+      name: "lifecycle: unknown phase",
+      kind: "lifecycle",
+      doc: tamper(fixtures.lifecycle, (d) => { d.phase = "teleporting"; }),
+    },
+    {
+      name: "lifecycle: completed transaction carrying an error",
+      kind: "lifecycle",
+      doc: tamper(fixtures.lifecycle, (d) => {
+        d.phase = "done";
+        d.error = { kind: "Dependency", message: "unresolved" };
+      }),
+    },
+    {
+      name: "root: public key is not 32 bytes",
+      kind: "root",
+      doc: tamper(fixtures.root, (d) => { d.root.publicKey = Buffer.alloc(16).toString("base64"); }),
+    },
+    {
+      name: "release: signature covers a field removed from the release",
+      kind: "release",
+      doc: tamper(fixtures.release, (d) => { delete d.release.sizeBytes; }),
+    },
+    {
+      name: "release: unknown extra envelope field",
+      kind: "release",
+      doc: tamper(fixtures.release, (d) => { d.trustLevel = "official"; }),
+    },
   ];
 }
 
@@ -440,12 +542,15 @@ function positiveTrace() {
   };
 }
 
-function main() {
+async function main() {
   const contracts = loadContracts();
   const fixtures = {
     manifest: readJSON(path.join(CONTRACTS_DIR, "fixtures", "manifest-v1.json")),
     host: readJSON(path.join(CONTRACTS_DIR, "fixtures", "host-v1.json")),
     bridge: readJSON(path.join(CONTRACTS_DIR, "fixtures", "bridge-v1.json")),
+    lifecycle: readJSON(path.join(CONTRACTS_DIR, "fixtures", "lifecycle-v1.json")),
+    root: readJSON(path.join(CONTRACTS_DIR, "fixtures", "root-v1.json")),
+    release: readJSON(path.join(CONTRACTS_DIR, "fixtures", "release-v1.json")),
   };
 
   let failures = 0;
@@ -463,6 +568,30 @@ function main() {
       failures += 1;
       console.log(`  FAIL  ${kind} fixture`);
       for (const line of result.errors) console.log(`          ${line}`);
+    }
+  }
+
+  // 签名信封是派生样本：payload 与 signature 由测试密钥现算，不能手写。
+  // 手写的"有效签名"必须有人验过才算有效，所以这里现算再验。
+  const { buildRootEnvelope, buildReleaseEnvelope, verifyEnvelope } = await import("./sign-contracts.mjs");
+  const signedSamples = [
+    ["root envelope (sig)", await buildRootEnvelope()],
+    [
+      "release envelope (sig)",
+      await buildReleaseEnvelope({
+        release: readJSON(path.join(CONTRACTS_DIR, "fixtures", "release-v1.json")).release,
+      }),
+    ],
+  ];
+  for (const [name, envelope] of signedSamples) {
+    positive += 1;
+    const verified = verifyEnvelope(envelope);
+    if (verified.ok) {
+      console.log(`  ok    ${name}`);
+    } else {
+      failures += 1;
+      console.log(`  FAIL  ${name}`);
+      for (const line of verified.errors) console.log(`          ${line}`);
     }
   }
 
@@ -511,5 +640,8 @@ function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main();
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
 }

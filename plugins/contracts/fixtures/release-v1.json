@@ -1,14 +1,17 @@
 {
-  "_comment": "Structure placeholder for the future signed release metadata (T04 freezes the cryptographically valid bytes and the exact signature payload encoding).",
   "schemaVersion": 1,
+  "keyId": "root-2026-01",
   "release": {
     "plugin": "example-counter",
     "version": "1.4.0",
     "target": "darwin-aarch64",
     "sha256": "3b1f2c9a7d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8",
+    "sizeBytes": 4194304,
+    "hostApi": "v1",
     "serial": 7,
     "publishedAt": 1767225600,
     "expiresAt": 1798761600
   },
-  "signature": "PLACEHOLDER-BASE64-ED25519-SIGNATURE"
+  "payloadB64": "eWktYWdlbnQtcGx1Z2luLXJlbGVhc2UtdjEAcGx1Z2luAAAAAA9leGFtcGxlLWNvdW50ZXJ2ZXJzaW9uAAAAAAUxLjQuMHRhcmdldAAAAAAOZGFyd2luLWFhcmNoNjRzaGEyNTYAAAAAQDNiMWYyYzlhN2Q0ZTVmNjA3MTgyOTNhNGI1YzZkN2U4ZjkwYTFiMmMzZDRlNWY2MDcxODI5M2E0YjVjNmQ3ZThzaXplQnl0ZXMAAAAABzQxOTQzMDRob3N0QXBpAAAAAAJ2MXNlcmlhbAAAAAABN3B1Ymxpc2hlZEF0AAAAAAoxNzY3MjI1NjAwZXhwaXJlc0F0AAAAAAoxNzk4NzYxNjAw",
+  "signature": "C6GZI7SRJeHfkUkvgZ1avENU+csaFRZ9fxXsNZylfY+W1m74Fv8kp/Yfoc+d8jHlUVNIeJOcFtYCt0srbQ+PDA=="
 }

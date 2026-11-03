@@ -272,7 +272,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 1：给 schema checker 写失败测试：合法 golden 可通过，未知必需字段、非法入口、错误 binding、任意 RPC 和重复请求 ID 参数冲突必须拒绝。（`scripts/plugins/check-contracts.test.mjs`，21 条断言，先红后绿）
 - [x] Step 2：`node --test scripts/plugins/check-contracts.test.mjs` 验证行为红，再补 schema/checker。依赖固定在 `plugins/contracts/package.json`（ajv 8.17.1 / ajv-formats 3.0.1）与 lock，脚本用 `createRequire` 指向该 package.json 解析依赖。schema 只测报文结构；重复 ID 参数冲突和生命周期顺序用 checker 中显式 trace validator 验证。
 - [x] Step 3：在子 spec 固定版本握手、项目句柄、双代次、消息顺序、原始签名 payload 的编码规则、错误恢复及权限矩阵，同步 §3 草案不留两套名字；固定默认安全限制：包 256 MiB、解压总量 1 GiB、单文件 128 MiB、文件数 20,000。见 `docs/superpowers/specs/2026-11-02-plugin-host-protocol.md`。**待 G1 审阅**：该 spec §14 列出 4 项需审阅者决定的事。
-- [ ] Step 4：运行 `npm ci --prefix plugins/contracts && node scripts/plugins/check-contracts.mjs && node --test scripts/plugins/check-contracts.test.mjs`；检查正反样本实际计数，审阅并获得 G1。（已实测：`positive: 4, negative: 17, failures: 0`、测试 21/21。**本步仍未勾选：G1 只能由用户批准。**）
+- [x] Step 4：运行 `npm ci --prefix plugins/contracts && node scripts/plugins/check-contracts.mjs && node --test scripts/plugins/check-contracts.test.mjs`；检查正反样本实际计数，审阅并获得 G1。（实测：`positive: 4, negative: 17, failures: 0`、测试 21/21。**G1 已由用户于 2026-11-03 批准**，四项待决事项均按建议通过：①保持 `namespace/verb` 加 T05 映射表；②破坏性动词表入协议；③句柄撤销粒度=项目，不建签发表；④未知能力一律视为必需。）
 - [x] Step 5：按 C 提交 `docs: define versioned plugin host contracts`（`d2a39de4`）。
 
 ### Task T04：完成分发/生命周期子 spec，解除 G2
