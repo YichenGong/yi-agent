@@ -255,4 +255,3 @@ README 计数相应为 8/12；tools 和 app-server 模块增加交叉引用，�
 - 复跑隔离文档 worktree 的 power 基线：58 passed / 0 failed。该结果只证明基线，不代表新增矩阵已实现。
 - 第 3 轮（spec/plan 交叉复核）：28 个矩阵 ID 均映射至 plan；补齐 Policy 首拍不 acquire 的测试前提，区分接口编译红/缺陷回归红/保护性绿，并明确固定生产 label 按 PID 验收、唯一 label 仅在 worker 工厂注入。章节顺序、相对链接与 8/12 进度计数经脚本校验通过。
 - 当前未发现阻塞编写 plan 的需求矛盾；真机网络 flags 行为仍作为实现阶段的人工验收，不声称纸面审查能代替系统实测。
-
