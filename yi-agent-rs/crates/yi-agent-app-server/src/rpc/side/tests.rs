@@ -5,8 +5,12 @@
 //! 那些规则。
 
 use super::*;
+use crate::protocol::{Item, ToolStatus};
+use crate::side_conversation::wire_item;
 use serde_json::json;
-use yi_agent_runtime::side_conversation::{SideItem, SideItemContent, SideToolStatus};
+use yi_agent_runtime::side_conversation::{
+    SIDE_TRANSCRIPT_MAX_ITEM_BYTES, SideItem, SideItemContent, SideToolStatus,
+};
 
 fn item(id: &str, content: SideItemContent) -> SideItem {
     SideItem {

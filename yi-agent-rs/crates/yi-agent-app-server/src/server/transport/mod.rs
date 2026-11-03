@@ -152,6 +152,12 @@ where
     // 旁支后台任务的统一持有者:宿主退出时 `abort_all()`,不让创建/关闭任务
     // 活过 server。
     let mut side_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // 旁支分页快照:一个宿主一份。连接断开时摘掉它的 token(见读循环的错误臂),
+    // 关闭 side 时由注册表撤销(见 `close`)。两侧共用同一份,否则「关闭即失效」
+    // 只会作用于其中一边。
+    let side_replay = crate::side_conversation::shared_replay_store();
+    side_registry.attach_replay(side_replay.clone()).await;
+    side_registry.attach_hub(Arc::clone(&hub));
 
     // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
     // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
@@ -340,6 +346,9 @@ where
                             return Err(e);
                         }
                         hub.unregister(&client);
+                        // 该连接的快照 token 随之作废:没人能再续页,继续钉住
+                        // item 只会白占宿主 128 MiB 额度。
+                        side_replay.lock().await.release_connection(client.as_str());
                         continue;
                     }
                 };
@@ -507,6 +516,7 @@ where
                             relay_url: relay_url.as_deref(),
                             side_registry: &side_registry,
                             side_tasks: &mut side_tasks,
+                            side_replay: &side_replay,
                         }
                     };
                 }

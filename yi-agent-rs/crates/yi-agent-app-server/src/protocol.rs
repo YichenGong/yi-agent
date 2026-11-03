@@ -1124,11 +1124,10 @@ pub struct SideReadItemsResult {
 
 /// `initialize.capabilities.side_conversation_v1` 的当前值。
 ///
-/// **在 Task 13 之前刻意保持 `false`。** 协议的形状(六个 RPC、四类通知)已在
-/// 本任务落地,但回放与广播要到 Task 13 才通;此时把能力位打开,前端会拿到一个
-/// 「能开旁支但收不到任何更新」的半成品。因此打开它是一个**单独的一行改动**,
-/// 且本文件有测试钉住当前值——不是靠记性。
-pub const SIDE_CONVERSATION_V1: bool = false;
+/// 打开它的前提是**回放与广播都通了**(Task 13):客户端拿到 `true` 就会把
+/// `side/*` 当成可用能力,后续所有视图都建立在「能分页读正文、能收到逐条修订」
+/// 之上。半通的宿主谎报 `true`,前端会停在一条永远收不到更新的路径上。
+pub const SIDE_CONVERSATION_V1: bool = true;
 
 /// 缺省即错的「必填可空」字段。
 ///
@@ -2118,15 +2117,14 @@ mod tests {
         }
     }
 
-    /// The capability is deliberately off until replay lands (Task 13). This pins the
-    /// current value so turning it on is a conscious one-line change.
+    /// 能力位现在必须是开着的:回放与广播已经落地,客户端要据此启用旁支视图。
     ///
-    /// 常量断言正是本测试的全部意图:它抓的是「有人顺手把开关翻成 true」,而不是
-    /// 某个运行时条件。`assertions_on_constants` 在这里是误报。
+    /// 常量断言正是本测试的全部意图:它钉住「没有回放就别打开」这条前置条件在
+    /// 代码里的落点。`assertions_on_constants` 在这里是误报。
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn side_capability_is_off_until_replay_lands() {
-        assert!(!SIDE_CONVERSATION_V1);
+    fn side_capability_is_on_once_replay_lands() {
+        assert!(SIDE_CONVERSATION_V1);
     }
 
     #[test]

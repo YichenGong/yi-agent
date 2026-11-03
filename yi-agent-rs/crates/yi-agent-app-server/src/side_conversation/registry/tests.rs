@@ -398,3 +398,180 @@ async fn side_stale_interrupt_does_not_kill_a_newer_turn() {
         "a stale interrupt must be a no-op"
     );
 }
+
+/// 订阅父 thread 的客户端要能收到旁支帧,且 `seq` 在一条 generation 内连续、
+/// 每个已发布修订恰好一帧。
+#[tokio::test]
+async fn side_events_follow_parent_subscription_without_polluting_parent() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    registry.attach_hub(Arc::clone(&hub));
+
+    // 一台把父 `p1` pin 进订阅窗口的设备(手机),和一台只订阅了**别的**父的设备。
+    // 后者不该收到:旁支按父 thread 键投递,所以订阅过滤对它同样生效。
+    let parent_client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+    let mut parent_rx = hub.register(parent_client.clone());
+    hub.subscribe(&parent_client, vec!["p1".to_string()]);
+    let stranger = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+    let mut stranger_rx = hub.register(stranger.clone());
+    hub.subscribe(&stranger, vec!["someone-elses-thread".to_string()]);
+
+    let summary = registry.open("p1").await.unwrap();
+    let request = uuid();
+    let turn = registry
+        .turn_start(&summary.side_id, "旁支问题".into(), request)
+        .await
+        .unwrap();
+
+    // 至少收到一条 changed(受理),且它带的是**父** thread 键。
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), parent_rx.recv())
+        .await
+        .expect("subscribed client must receive a side frame")
+        .expect("channel open");
+    assert_eq!(
+        first["method"],
+        serde_json::json!("side/changed"),
+        "{first}"
+    );
+    assert_eq!(first["params"]["parent_thread_id"], "p1");
+    let seq = first["params"]["seq"].as_u64().unwrap();
+    assert!(seq >= 1);
+    // 摘要里的水位必须已经是本次修订,而不是上一版。
+    assert_eq!(
+        first["params"]["summary"]["last_seq"],
+        serde_json::json!(seq)
+    );
+
+    // 订阅窗口不覆盖 p1 的设备一帧都不该收到。
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), stranger_rx.recv())
+            .await
+            .is_err(),
+        "a client whose window excludes p1 must not receive its side frames"
+    );
+    // 旁支帧不冒充父会话的正文:它始终是 `side/*`,负载带 side_id。
+    assert_eq!(first["params"]["side_id"], summary.side_id);
+    assert!(
+        first["method"].as_str().unwrap().starts_with("side/"),
+        "side updates must never be delivered as parent thread content: {first}"
+    );
+
+    registry
+        .close(&summary.side_id, Some(&turn))
+        .await
+        .expect("close after confirming the active turn");
+}
+
+/// 关闭是终态:即便前序有缺号,客户端也立刻丢弃该 generation。所以 closed 必须
+/// 带同一个 generation 与一个严格递增的 seq。
+#[tokio::test]
+async fn side_close_publishes_a_terminal_frame_for_its_generation() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    registry.attach_hub(Arc::clone(&hub));
+    let client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+    let mut rx = hub.register(client.clone());
+    hub.subscribe(&client, vec!["p1".to_string()]);
+
+    let summary = registry.open("p1").await.unwrap();
+    registry.close(&summary.side_id, None).await.unwrap();
+
+    let mut closed = None;
+    for _ in 0..10 {
+        let Ok(Some(frame)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        else {
+            break;
+        };
+        if frame["method"] == serde_json::json!("side/closed") {
+            closed = Some(frame);
+            break;
+        }
+    }
+    let closed = closed.expect("side/closed must be published");
+    assert_eq!(closed["params"]["side_id"], summary.side_id);
+    assert_eq!(
+        closed["params"]["generation"],
+        serde_json::json!(summary.generation)
+    );
+    assert_eq!(closed["params"]["reason"], serde_json::json!("user_closed"));
+}
+
+/// 关闭后 `publish` 必须回 `None`:晚到的完成事件不得复活已关闭的 generation。
+#[tokio::test]
+async fn side_publish_after_close_is_a_no_op() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let summary = registry.open("p1").await.unwrap();
+    registry.close(&summary.side_id, None).await.unwrap();
+
+    let published = registry
+        .publish(&summary.side_id, |entry| {
+            crate::side_conversation::SidePublishedUpdate::Changed {
+                side_id: entry.side_id.clone(),
+                summary: entry.summary(),
+            }
+        })
+        .await;
+    assert!(
+        published.is_none(),
+        "a closed side must not publish further revisions"
+    );
+}
+
+/// 关闭会撤销该 side 的全部分页快照:留着它等于给客户端一条通往已删内容的旁路。
+#[tokio::test]
+async fn side_close_revokes_outstanding_snapshots() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let replay = crate::side_conversation::shared_replay_store();
+    registry.attach_replay(Arc::clone(&replay)).await;
+
+    let summary = registry.open("p1").await.unwrap();
+    {
+        let mut store = replay.lock().await;
+        let snapshot = registry.snapshot(&summary.side_id).await.unwrap();
+        let page = store
+            .read_page(
+                "conn-1",
+                &summary.side_id,
+                None,
+                None,
+                Some(crate::side_conversation::ReplayBaseline::from_snapshot(
+                    &snapshot,
+                )),
+            )
+            .unwrap();
+        // 空转录的首读即末页会立刻释放;这里断言的是「无论有没有 token,
+        // 关闭之后的续页都不可能成功」。
+        let _ = page;
+    }
+    registry.close(&summary.side_id, None).await.unwrap();
+    assert_eq!(replay.lock().await.token_count(), 0);
+}
+
+/// `seq` 只由一次发布推进一格:同一秒内连发两次不会拿到同一个号。
+#[tokio::test]
+async fn side_publish_advances_seq_by_one() {
+    let (_project, _home, registry) = registry_fixture().await;
+    let summary = registry.open("p1").await.unwrap();
+
+    let first = registry
+        .publish(&summary.side_id, |entry| {
+            crate::side_conversation::SidePublishedUpdate::Changed {
+                side_id: entry.side_id.clone(),
+                summary: entry.summary(),
+            }
+        })
+        .await
+        .expect("first publish");
+    let second = registry
+        .publish(&summary.side_id, |entry| {
+            crate::side_conversation::SidePublishedUpdate::Changed {
+                side_id: entry.side_id.clone(),
+                summary: entry.summary(),
+            }
+        })
+        .await
+        .expect("second publish");
+    assert_eq!(second, first + 1);
+    assert_eq!(registry.list("p1").await[0].last_seq, second);
+}

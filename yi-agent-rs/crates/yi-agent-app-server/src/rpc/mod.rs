@@ -485,6 +485,9 @@ pub(crate) struct AppState<'a> {
     /// (创建要读盘、关闭要等核心任务收敛),没有统一持有者就无法在宿主退出时
     /// 收口,也无法在测试里确定地清空。
     pub(crate) side_tasks: &'a mut tokio::task::JoinSet<()>,
+    /// 旁支分页快照登记表。进程级共享:宿主级上限(8 份 / 128 MiB)是对**宿主**
+    /// 约束的资源,按连接各建一份就执行不了它。
+    pub(crate) side_replay: &'a crate::side_conversation::SharedReplayStore,
 
     // ---- 远端 SSH 执行(实验开关 `remote_ssh`) ----
     /// 实例状态根,`remote/relayTargets` 从它下面读 `remote.json` 与

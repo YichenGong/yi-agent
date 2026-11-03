@@ -158,13 +158,13 @@ async fn side_creating_open_does_not_block_the_loop() {
     h.shutdown().await;
 }
 
-/// 能力位此刻必须是 **false**,且宿主 id 必须已经给出来。
+/// 能力位与宿主 id 必须出自同一份宿主 resources。
 ///
-/// 两个断言合在一起才有意义:客户端拿到的语义是「这个宿主有身份,但回放还没
-/// 上,所以先别开旁支」。只翻能力位而不给 id,或给了 id 却谎称支持回放,都会让
-/// 客户端走进一条服务端还没准备好的路径。
+/// 两个断言合在一起才有意义:客户端拿到的语义是「这个宿主是谁、支持哪一版旁支
+/// 协议」。只翻能力位而不给 id,客户端就无法区分「重连」与「宿主换代」,会丢掉
+/// 全部本地基线。
 #[tokio::test]
-async fn side_initialize_advertises_capability_off_and_a_host_id() {
+async fn side_initialize_advertises_capability_and_a_host_id() {
     let home = tempfile::TempDir::new().unwrap();
     let registry = test_side_registry(home.path(), None);
     let expected = registry.host_instance_id().to_string();
@@ -180,6 +180,116 @@ async fn side_initialize_advertises_capability_off_and_a_host_id() {
         serde_json::json!(expected),
         "{v}"
     );
+
+    h.shutdown().await;
+}
+
+/// 旁支不存在时 `readItems` 必须是稳定的 `side_not_found`,而不是一台「看起来
+/// 通了但永远回空页」的分页器。客户端据此决定「清掉旧临时视图」。
+#[tokio::test]
+async fn side_read_items_reports_a_missing_side() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut h = Harness::with_scope_and_side_registry(Scope::Observe, registry).await;
+    initialize(&mut h).await;
+
+    let v = call(
+        &mut h,
+        2,
+        "side/readItems",
+        serde_json::json!({"sideId": "nope"}),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], serde_json::json!(-32031), "{v}");
+    assert_eq!(
+        v["error"]["data"]["reason"],
+        serde_json::json!("side_not_found"),
+        "{v}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `cursor` 不带 `snapshotToken` 必须在请求路径上就被拒:那个组合看不出属于
+/// 哪个快照,放过去就等于允许把两个时刻的页拼起来。
+#[tokio::test]
+async fn side_read_items_rejects_a_cursor_without_a_token() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut h = Harness::with_scope_and_side_registry(Scope::Observe, registry).await;
+    initialize(&mut h).await;
+
+    let v = call(
+        &mut h,
+        2,
+        "side/readItems",
+        serde_json::json!({"sideId": "s1", "cursor": "12"}),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+    assert_eq!(
+        v["error"]["data"]["reason"],
+        serde_json::json!("invalid_params"),
+        "{v}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 重连回放:同一个快照 token 只能被**同一条连接**续页。另一条连接拿着它读,
+/// 得到的必须是 `snapshot_expired`——否则两条连接会共用一条游标,页会互相覆盖。
+#[tokio::test]
+async fn side_snapshot_token_does_not_cross_connections() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut a = Harness::with_scope_and_side_registry(Scope::Observe, Arc::clone(&registry)).await;
+    let mut b = Harness::with_scope_and_side_registry(Scope::Observe, Arc::clone(&registry)).await;
+    initialize(&mut a).await;
+    initialize(&mut b).await;
+
+    // 两台连接对同一个不存在的 side 读,错误必须一致且不泄漏「谁先读过」。
+    for h in [&mut a, &mut b] {
+        let v = call(
+            h,
+            2,
+            "side/readItems",
+            serde_json::json!({"sideId": "s1", "snapshotToken": "made-up", "cursor": "1"}),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["data"]["reason"],
+            serde_json::json!("snapshot_expired"),
+            "{v}"
+        );
+    }
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// 能力位打开后,`initialize` 仍然要与 `side/list` 一起可用:客户端在握手的那
+/// 一刻就要能把「这个宿主支持旁支」与「当前有哪些 side」连起来。
+#[tokio::test]
+async fn side_handshake_and_list_work_together() {
+    let home = tempfile::TempDir::new().unwrap();
+    let registry = test_side_registry(home.path(), None);
+    let mut h = Harness::with_scope_and_side_registry(Scope::Observe, registry).await;
+
+    let hello = call(&mut h, 1, "initialize", serde_json::json!({})).await;
+    assert_eq!(
+        hello["result"]["capabilities"]["side_conversation_v1"],
+        serde_json::json!(crate::protocol::SIDE_CONVERSATION_V1)
+    );
+    assert!(hello["result"]["sideHostInstanceId"].is_string(), "{hello}");
+
+    let listed = call(
+        &mut h,
+        2,
+        "side/list",
+        serde_json::json!({"parentThreadId": "p1"}),
+    )
+    .await;
+    assert_eq!(listed["result"]["sides"], serde_json::json!([]));
 
     h.shutdown().await;
 }

@@ -27,12 +27,13 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use yi_agent_runtime::side_conversation::{
     CloseReason, SideConversationRunner, SideHostResources, SideIdleDeadline, SideRequestLedger,
-    SideStatus, SideToolSetupFactory, SideTranscript,
+    SideRunnerEvent, SideStatus, SideToolSetupFactory, SideTranscript,
 };
 
 use yi_agent_runtime::side_conversation::{SideError, SideErrorReason, SideUsage};
 use yi_agent_tools::SideBlockingPool;
 
+use super::replay::SIDE_ITEM_FLUSH_INTERVAL;
 use super::source::SideParentResolver;
 
 /// How many closed sides a host remembers for idempotent retries.
@@ -86,7 +87,7 @@ struct Tombstone {
 
 /// One side's mutable state, held behind an async mutex because a turn touches it
 /// across awaits.
-struct SideEntry {
+pub(crate) struct SideEntry {
     side_id: String,
     parent: String,
     generation: u64,
@@ -129,6 +130,156 @@ impl SideEntry {
     }
 }
 
+/// 投递一帧已定稿的修订。
+///
+/// 提成自由函数是为了让它能随任务搬走:spawn 出去的流任务只持有 hub 与 entry,
+/// 没有 `&SideRegistry`。没有 hub(纯 runtime 单测)时是空操作,序号照样已经在
+/// 锁内推进过了。
+async fn deliver_with(
+    hub: Option<Arc<crate::broadcast::Broadcaster>>,
+    staged: StagedRevision,
+) -> Option<u64> {
+    let StagedRevision {
+        parent,
+        generation,
+        seq,
+        update,
+    } = staged;
+    let side_id = update.side_id().map(str::to_string)?;
+    if let Some(hub) = hub {
+        let notification = update.into_notification(seq, &parent, &side_id, generation);
+        // 状态帧按父 thread 键投递,与普通 `turn/completed` 同一条路径。出站拥塞时
+        // 等出口泵抽干:终态被丢掉,客户端会永久停在 running。
+        let _ = crate::server::write_notification_await(&hub, &notification).await;
+    }
+    Some(seq)
+}
+
+/// 一轮旁支对话的发布任务。
+///
+/// 只持有 `hub` 与 `entry`:流事件在本任务里翻译并节流,结束时强制 flush 再发
+/// 终态。之所以不留在 `SideRegistry::turn_start` 的调用栈里,是因为它要跨整个
+/// 流生命周期存活,而请求必须立刻返回 turnId。
+struct TurnPublisher {
+    hub: Option<Arc<crate::broadcast::Broadcaster>>,
+    entry: Arc<Mutex<SideEntry>>,
+    turn_id: String,
+    /// 已变更但还没发出的 item id。一个 id 在一个窗口内只发**当前完整版本**。
+    dirty: std::collections::BTreeSet<String>,
+}
+
+impl TurnPublisher {
+    async fn run(mut self, stream: futures::stream::BoxStream<'static, SideRunnerEvent>) {
+        let mut stream = stream;
+        let mut ticker = tokio::time::interval(SIDE_ITEM_FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 第一个 tick 立即就绪;先吃掉它,否则每轮开头都会白刷一次。
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                next = stream.next() => {
+                    let Some(event) = next else { break };
+                    let mut guard = self.entry.lock().await;
+                    if let Ok(items) = guard.transcript.apply(&self.turn_id, event.event.event()) {
+                        for item in items {
+                            // 只关心本轮的 item:同一条 side 的其它轮已经结束,
+                            // 它们的 item 不会再变。
+                            if item.turn_id == self.turn_id {
+                                self.dirty.insert(item.id.clone());
+                            }
+                        }
+                    }
+                    drop(guard);
+                }
+                _ = ticker.tick() => self.flush_items().await,
+            }
+        }
+
+        // 结束前强制 flush:客户端必须先拿全这一轮的 item,再看到终态。
+        self.flush_items().await;
+        self.finish().await;
+    }
+
+    /// 发布一个节流窗口内积累的 item 当前版本。
+    async fn flush_items(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let wanted = std::mem::take(&mut self.dirty);
+        let pending: Vec<_> = {
+            let guard = self.entry.lock().await;
+            guard
+                .transcript
+                .items()
+                .into_iter()
+                .filter(|item| wanted.contains(&item.id))
+                .collect()
+        };
+        for item in pending {
+            let Ok(wire) = super::wire_item(&item) else {
+                // 单条超限是转录层的缺陷;跳过它而不是拖垮整条流,客户端下一次
+                // 全量对账会看到真实内容。
+                continue;
+            };
+            let turn_id = item.turn_id.clone();
+            let staged = {
+                let mut guard = self.entry.lock().await;
+                SideRegistry::stage(&mut guard, |entry| super::SidePublishedUpdate::Item {
+                    side_id: entry.side_id.clone(),
+                    turn_id,
+                    item: wire,
+                })
+            };
+            if let Some(staged) = staged {
+                deliver_with(self.hub.clone(), staged).await;
+            }
+        }
+    }
+
+    /// 收尾:等泵证明核心任务真的结束,再发布含终态的 completed。
+    async fn finish(self) {
+        let staged = {
+            let mut guard = self.entry.lock().await;
+            // 流结束但 `active` 仍在:只有 `wait_quiescent` 能证明泵已经 join 了
+            // 真实核心任务并发布了 Idle。不这样做,旁支会永远显示繁忙。
+            let _ = guard.runner.wait_quiescent().await;
+            guard.stopping.store(false, Ordering::SeqCst);
+            guard.deadline.touch(tokio::time::Instant::now());
+            let status = guard.summary().status;
+            // `reason` 是稳定的机器可读串,`error` 是给人看的短说明:两者同源但
+            // 不同用途,客户端按前者分支、按后者展示。
+            let failure = guard.runner.last_error().cloned();
+            let reason = failure.as_ref().map(|error| error.reason_str().to_string());
+            let error = failure.as_ref().map(|error| error.message.clone());
+            let usage = super::replay::wire_usage(guard.runner.usage());
+            let turn_id = self.turn_id.clone();
+            SideRegistry::stage(&mut guard, |entry| super::SidePublishedUpdate::Completed {
+                side_id: entry.side_id.clone(),
+                turn_id,
+                status: crate::protocol::SideStatusWire::from_runtime(status),
+                reason,
+                error,
+                usage,
+            })
+        };
+        if let Some(staged) = staged {
+            deliver_with(self.hub, staged).await;
+        }
+    }
+}
+
+/// 一次已在锁内定稿、等待投递的修订。
+///
+/// 存在这个中间类型的唯一理由是**锁边界**:字段在 entry 锁内读出,帧在锁外发出。
+struct StagedRevision {
+    parent: String,
+    generation: u64,
+    seq: u64,
+    update: super::SidePublishedUpdate,
+}
+
 /// How a parent is currently occupied.
 enum ParentSlot {
     /// A creation is in flight; everyone else waits on the notify.
@@ -151,6 +302,13 @@ pub struct SideRegistry {
     creating_notify: Mutex<HashMap<String, Arc<Notify>>>,
     /// Bumped on every successful create so a side id is never reused.
     next_generation: AtomicU64,
+    /// 分页快照登记表。`None` 表示宿主没装(纯 registry 单测),此时关闭不必
+    /// 撤销任何 token。
+    replay: tokio::sync::Mutex<Option<super::SharedReplayStore>>,
+    /// 状态修订的发布出口。`None` 表示没人订阅(纯 runtime 单测),此时
+    /// `publish` 仍然推进序号,只是不发帧——序号本身是协议状态,不能因为
+    /// 恰好没广播出口就停摆。
+    hub: std::sync::Mutex<Option<Arc<crate::broadcast::Broadcaster>>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -169,8 +327,88 @@ impl SideRegistry {
             tombstones: Mutex::new(HashMap::new()),
             creating_notify: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
+            replay: tokio::sync::Mutex::new(None),
+            hub: std::sync::Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Install the broadcast outlet used for state revisions.
+    ///
+    /// `serve()` calls this once with its hub. Everything that publishes a revision
+    /// (turn acceptance, transcript items, turn completion, close) goes through
+    /// [`SideRegistry::publish`], which allocates the sequence number under the same
+    /// lock that mutates the state, so a frame can never carry a stale `seq`.
+    pub fn attach_hub(&self, hub: Arc<crate::broadcast::Broadcaster>) {
+        *self.hub.lock().unwrap_or_else(|p| p.into_inner()) = Some(hub);
+    }
+
+    /// Install the host's pagination table.
+    ///
+    /// The registry needs it for one thing: closing a side must revoke its snapshot
+    /// tokens, otherwise a client could keep paging through a generation that no
+    /// longer exists.
+    pub async fn attach_replay(&self, replay: super::SharedReplayStore) {
+        *self.replay.lock().await = Some(replay);
+    }
+
+    /// Publish one revision for `side_id`.
+    ///
+    /// Returns the `seq` it was assigned, or `None` when the side is already gone
+    /// (a late completion after close must not resurrect it — the tombstone stays
+    /// authoritative).
+    ///
+    /// The sequence is allocated **under the same lock that reads the state**, so
+    /// two concurrent publishers can never emit the same number with different
+    /// bodies. It is bumped before the frame leaves the lock: if the process dies in
+    /// between, clients see a gap and re-read a snapshot — which is the contract.
+    pub(crate) async fn publish(
+        &self,
+        side_id: &str,
+        build: impl FnOnce(&SideEntry) -> super::SidePublishedUpdate,
+    ) -> Option<u64> {
+        let entry = self.entry(side_id).await.ok()?;
+        let staged = {
+            let mut guard = entry.lock().await;
+            Self::stage(&mut guard, build)
+        }?;
+        self.deliver(staged).await
+    }
+
+    /// 锁内：分配序号、构造修订、推进 `seq`。
+    ///
+    /// 拆成独立一步是为了让**已经持有 entry 锁**的调用方(受理、收尾)在同一个
+    /// 临界区里完成状态变更与序号推进,事后才投递。若把它们分成两次加锁,
+    /// 「状态已变但 seq 没推进」的窗口里另一条路径会读到一个自相矛盾的摘要。
+    fn stage(
+        guard: &mut SideEntry,
+        build: impl FnOnce(&SideEntry) -> super::SidePublishedUpdate,
+    ) -> Option<StagedRevision> {
+        let seq = super::next_seq(guard.seq.load(Ordering::SeqCst)).ok()?;
+        // 先推进序号再构造修订:`Changed` 的摘要里带 `last_seq`,先构造就会把
+        // 「上一版」的序号发出去,客户端据此判断水位时永远是旧值。
+        guard.seq.store(seq, Ordering::SeqCst);
+        let update = build(guard);
+        Some(StagedRevision {
+            parent: guard.parent.clone(),
+            generation: guard.generation,
+            seq,
+            update,
+        })
+    }
+
+    /// 锁外:投递一帧已定稿的修订。
+    ///
+    /// 没有 hub(纯 runtime 单测)时是空操作,序号照样推进。投递走带背压的路径:
+    /// `side/closed` 与 `turnCompleted` 是终态,丢掉它们客户端会永久停在
+    /// running,只能全量对账才恢复。
+    async fn deliver(&self, staged: StagedRevision) -> Option<u64> {
+        deliver_with(self.hub(), staged).await
+    }
+
+    /// 当前广播出口(可能没有:hub 由 `serve()` 装上,纯 runtime 单测没有它)。
+    fn hub(&self) -> Option<Arc<crate::broadcast::Broadcaster>> {
+        self.hub.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// This host process's identity.
@@ -401,32 +639,30 @@ impl SideRegistry {
                 return Err(error);
             }
         };
-        guard.seq.fetch_add(1, Ordering::SeqCst);
         guard.deadline.touch(tokio::time::Instant::now());
+        // 受理与「Running 已发布」在同一临界区内完成:客户端只有在收到这条
+        // changed 之后才敢认为自己发的这条消息被受理了。推迟到模型启动之后发,
+        // 一个启动很慢的 provider 就会让客户端长时间看不到受理结果。
+        let accepted = Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Changed {
+            side_id: entry.side_id.clone(),
+            summary: entry.summary(),
+        });
+        drop(guard);
+        if let Some(staged) = accepted {
+            self.deliver(staged).await;
+        }
 
         // Drain the stream off the request path. The pump already joined the core
         // task before it publishes a terminal event, so this task only translates.
-        let entry_for_task = Arc::clone(&entry);
-        let side_id_for_task = guard.side_id.clone();
-        let turn_for_task = turn_id.clone();
-        tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(event) = stream.next().await {
-                let mut guard = entry_for_task.lock().await;
-                let _ = guard.transcript.apply(&turn_for_task, event.event.event());
-                guard.seq.fetch_add(1, Ordering::SeqCst);
-            }
-            let mut guard = entry_for_task.lock().await;
-            // The stream ended, but `active` is still set: only `wait_quiescent`
-            // proves the pump joined the core task and publishes Idle. Without this
-            // the side would look busy forever and every later turn would be refused
-            // with `turn_in_progress` even though nothing was running.
-            let _ = guard.runner.wait_quiescent().await;
-            guard.stopping.store(false, Ordering::SeqCst);
-            guard.deadline.touch(tokio::time::Instant::now());
-            guard.seq.fetch_add(1, Ordering::SeqCst);
-            let _ = side_id_for_task;
-        });
+        let task = TurnPublisher {
+            // 把 hub 搬进任务:spawn 之后 `&self` 已经不在作用域里,而投递只需要
+            // 出站句柄与 entry。
+            hub: self.hub(),
+            entry,
+            turn_id: turn_id.clone(),
+            dirty: std::collections::BTreeSet::new(),
+        };
+        tokio::spawn(task.run(stream));
         Ok(turn_id)
     }
 
@@ -441,7 +677,16 @@ impl SideRegistry {
             guard.stopping.store(true, Ordering::SeqCst);
         }
         guard.runner.interrupt(turn_id).await?;
-        guard.seq.fetch_add(1, Ordering::SeqCst);
+        // 停止请求被受理也是一次**状态发布**:`stopping` 变了,另一端要立刻看到,
+        // 否则它仍显示可发送、直到终态才更新。
+        let staged = Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Changed {
+            side_id: entry.side_id.clone(),
+            summary: entry.summary(),
+        });
+        drop(guard);
+        if let Some(staged) = staged {
+            self.deliver(staged).await;
+        }
         Ok(())
     }
 
@@ -487,6 +732,20 @@ impl SideRegistry {
             let mut guard = entry.lock().await;
             guard.runner.close().await?;
         }
+        // `side/closed` 是**终态**,必须在本条 side 从表里消失之前发布:客户端收到
+        // 它就丢弃该 generation 的本地内容与在途分页,不等一个已经不存在的快照。
+        // 它走带背压的投递,拥塞时宁可阻塞也不丢——丢了另一端会停在旧视图。
+        let closed = {
+            let mut guard = entry.lock().await;
+            Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Closed {
+                side_id: entry.side_id.clone(),
+                reason: CloseReason::UserClosed,
+            })
+        };
+        if let Some(staged) = closed {
+            self.deliver(staged).await;
+        }
+        self.release_side_snapshots(side_id).await;
         self.sides.lock().await.remove(side_id);
         {
             let mut parents = self.parents.lock().await;
@@ -509,6 +768,17 @@ impl SideRegistry {
         );
         Self::prune_tombstones(&mut tombstones, tokio::time::Instant::now());
         Ok(())
+    }
+
+    /// 撤销某个 side 的全部分页快照。
+    ///
+    /// 关闭之后不得再从 tombstone 恢复正文:快照里只有标识与 item,没有「已关闭」
+    /// 这个事实,留着它等于给客户端一条通往已删内容的旁路。
+    pub async fn release_side_snapshots(&self, side_id: &str) {
+        let Some(replay) = self.replay.lock().await.clone() else {
+            return;
+        };
+        replay.lock().await.release_side(side_id);
     }
 
     fn prune_tombstones(tombstones: &mut HashMap<String, Tombstone>, now: tokio::time::Instant) {

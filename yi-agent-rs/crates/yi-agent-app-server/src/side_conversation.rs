@@ -9,11 +9,19 @@
 //! `ThreadStore`, `Item`, or the app-server's persisted wire types.
 
 pub mod registry;
+pub mod replay;
 pub mod source;
 
 pub use registry::{
     ClosedSide, ParentChangeGuard, SIDE_TOMBSTONE_TTL, SIDE_TOMBSTONES, SideEffectiveConfig,
     SideRegistry, SideSnapshot, SideSummary,
+};
+pub use replay::{
+    Page, ReplayBaseline, ReplayStore, SIDE_ENVELOPE_BUDGET_BYTES, SIDE_ITEM_FLUSH_INTERVAL,
+    SIDE_PAGE_BUDGET_BYTES, SIDE_PAGE_CONTROL_RESERVE, SIDE_SNAPSHOT_BYTES,
+    SIDE_TOKEN_ABSOLUTE_TTL, SIDE_TOKEN_IDLE_TTL, SIDE_TOKENS_PER_CONNECTION, SIDE_TOKENS_PER_HOST,
+    SharedReplayStore, SidePublishedUpdate, encode_side_envelope, log_page, next_seq,
+    shared_replay_store, wire_item,
 };
 pub use source::{
     ColdParent, SIDE_COLD_ATTEMPTS, SideParentResolver, SideResolverFactory, ThreadStoreResolver,

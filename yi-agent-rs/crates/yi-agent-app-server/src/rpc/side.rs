@@ -20,18 +20,14 @@
 use std::sync::Arc;
 
 use crate::protocol::{
-    Item, RequestEnvelope, RequestId, RpcError, Scope, SideCloseParams, SideEffectiveConfigWire,
-    SideListParams, SideListResult, SideOpenParams, SideReadItemsParams, SideReadItemsResult,
-    SideStatusWire, SideSummaryWire, SideTokenTotalsWire, SideTurnInterruptParams,
-    SideTurnStartParams, SideTurnStartResult, SideUsageWire, ToolStatus,
+    RequestEnvelope, RequestId, RpcError, Scope, SideCloseParams, SideListParams, SideListResult,
+    SideOpenParams, SideReadItemsParams, SideReadItemsResult, SideSummaryWire,
+    SideTurnInterruptParams, SideTurnStartParams, SideTurnStartResult,
 };
 use crate::rpc::{AppState, Flow};
 use crate::server::{SideResponseSender, err_response, ok_response, write_response};
-use crate::side_conversation::{SideEffectiveConfig, SideRegistry};
-use yi_agent_runtime::side_conversation::{
-    SIDE_TRANSCRIPT_MAX_ITEM_BYTES, SideError, SideErrorReason, SideItem, SideItemContent,
-    SideToolStatus, SideUsage,
-};
+use crate::side_conversation::{ReplayBaseline, SideRegistry};
+use yi_agent_runtime::side_conversation::{SideError, SideErrorReason};
 
 /// 本域认领的方法(与 `side_methods_baseline.txt` 一一对应)。
 pub(crate) fn owns(method: &str) -> bool {
@@ -149,8 +145,14 @@ pub(crate) async fn handle(
                 return Ok(Flow::Continue);
             }
             let id_for_task = id.clone();
+            let replay = Arc::clone(state.side_replay);
+            let connection = state.client.as_str().to_string();
             tasks.spawn(async move {
-                let result = read_items(&registry, &params).await;
+                // 分页表按连接记账,所以连接名必须在请求路径上取好再带走——
+                // spawn 出去之后拿不到 `AppState`。
+                let mut store = replay.lock().await;
+                let result = read_items(&registry, &mut store, &connection, &params).await;
+                drop(store);
                 responder.send(id_for_task, result).await;
             });
         }
@@ -223,141 +225,33 @@ fn parse<T: serde::de::DeserializeOwned>(params: &serde_json::Value) -> Result<T
     })
 }
 
-/// 一页最多装多少字节的**完整信封**。
+/// 读一页旁支正文。
 ///
-/// 512 KiB 是线上信封上限,这里留出四分之一给 JSON-RPC 外壳、转义膨胀与其它
-/// 字段。分页按真实序列化字节试装,不只按条数——一条 128 KiB 的 item 与一百条
-/// 1 KiB 的 item 条数差两个数量级,字节数却可能相同。
-const SIDE_PAGE_BUDGET_BYTES: usize = 384 * 1024;
-
+/// 一致性来自**一次**注册表快照:基线在锁内捕获,锁外按页序列化。`ReplayStore`
+/// 只做「同一快照的下一页」,所以拼页不可能跨时刻。
 async fn read_items(
     registry: &SideRegistry,
+    replay: &mut crate::side_conversation::ReplayStore,
+    connection: &str,
     params: &SideReadItemsParams,
 ) -> Result<SideReadItemsResult, SideError> {
-    let snapshot = registry.snapshot(&params.side_id).await?;
-    let mut items = Vec::with_capacity(snapshot.items.len());
-    let mut used = 0usize;
-    for item in &snapshot.items {
-        let wire = wire_item(item)?;
-        let size = serde_json::to_vec(&wire)
-            .map_err(|error| {
-                SideError::new(
-                    SideErrorReason::SnapshotTooLarge,
-                    format!("旁支条目无法序列化：{error}"),
-                )
-            })?
-            .len();
-        if !items.is_empty() && used + size > SIDE_PAGE_BUDGET_BYTES {
-            break;
-        }
-        used += size;
-        items.push(wire);
-    }
-
-    Ok(SideReadItemsResult {
-        items,
-        snapshot_seq: snapshot.summary.last_seq,
-        status: SideStatusWire::from_runtime(snapshot.summary.status),
-        usage: wire_usage(snapshot.usage),
-        active_turn_id: snapshot.summary.active_turn_id.clone(),
-        accepted_requests: snapshot.accepted.into_iter().collect(),
-        effective_config: wire_config(&snapshot.config),
-        snapshot_token: uuid::Uuid::new_v4().to_string(),
-        // 本任务只回一页(Task 13 的 ReplayStore 接手分页与 token 续期)。诚实地
-        // 回 `None`,而不是给一个客户端永远用不上的游标。
-        next_cursor: None,
-    })
-}
-
-fn wire_usage(usage: SideUsage) -> SideUsageWire {
-    SideUsageWire {
-        total: SideTokenTotalsWire {
-            input: usage.total.input,
-            output: usage.total.output,
-            cache_creation: usage.total.cache_creation,
-            cache_read: usage.total.cache_read,
-            reasoning: usage.total.reasoning,
-        },
-        complete: usage.complete,
-    }
-}
-
-fn wire_config(config: &SideEffectiveConfig) -> SideEffectiveConfigWire {
-    SideEffectiveConfigWire {
-        model: config.model.clone(),
-        reasoning_effort: config.reasoning_effort.clone(),
-        preserve_thinking: config.preserve_thinking,
-        // 旁支的工具集由白名单装配,且每个工具都必须自报只读才允许注册。
-        read_only: true,
-        tool_names: config.tool_names.clone(),
-    }
-}
-
-/// 把共享转录里的一个条目适配成协议 `Item`。
-///
-/// **只做形状适配,不重写切分或预算**:转录那边已经按 128 KiB 序列化预算切好,
-/// 这里再截断一次就会让「同一段文本在两端的边界」不一致。适配后再核一次字节数,
-/// 超了就是转录层的缺陷,如实报 `snapshot_too_large`,而不是悄悄砍掉。
-pub(crate) fn wire_item(item: &SideItem) -> Result<Item, SideError> {
-    let wire = match &item.content {
-        SideItemContent::UserMessage { text } => Item::UserMessage {
-            id: item.id.clone(),
-            text: text.clone(),
-            attachments: Vec::new(),
-            images: Vec::new(),
-        },
-        SideItemContent::AgentMessage { text } => Item::AgentMessage {
-            id: item.id.clone(),
-            text: text.clone(),
-        },
-        SideItemContent::Thinking { text, redacted } => Item::Thinking {
-            id: item.id.clone(),
-            text: text.clone(),
-            redacted: *redacted,
-        },
-        SideItemContent::ToolCall {
-            call_id,
-            name,
-            input,
-            result,
-            status,
-            ..
-        } => Item::ToolCall {
-            id: item.id.clone(),
-            call_id: call_id.clone(),
-            name: name.clone(),
-            input: input.clone(),
-            status: match status {
-                SideToolStatus::Running => ToolStatus::Running,
-                SideToolStatus::Completed => ToolStatus::Completed,
-                SideToolStatus::Failed => ToolStatus::Failed,
-            },
-            result: result.clone(),
-            // 图片二进制不进旁支通知或回放(spec §8.2):模型读图不等于两端要下载原图。
-            images: Vec::new(),
-        },
-        // 提示在被切成 item 时就已计入预算,这里只加一次固定前缀。
-        SideItemContent::Notice { text } => Item::AgentMessage {
-            id: item.id.clone(),
-            text: format!("提示：{text}"),
-        },
+    // 首读才捕获基线:续页必须复用已签发的快照,重读当前状态就等于拼页。
+    let baseline = if params.snapshot_token.is_none() {
+        let snapshot = registry.snapshot(&params.side_id).await?;
+        Some(ReplayBaseline::from_snapshot(&snapshot))
+    } else {
+        None
     };
-
-    let size = serde_json::to_vec(&wire)
-        .map_err(|error| {
-            SideError::new(
-                SideErrorReason::SnapshotTooLarge,
-                format!("旁支条目无法序列化：{error}"),
-            )
-        })?
-        .len();
-    if size > SIDE_TRANSCRIPT_MAX_ITEM_BYTES {
-        return Err(SideError::new(
-            SideErrorReason::SnapshotTooLarge,
-            format!("旁支条目序列化后 {size} 字节，超出单条上限"),
-        ));
-    }
-    Ok(wire)
+    let page = replay.read_page(
+        connection,
+        &params.side_id,
+        params.snapshot_token.as_deref(),
+        params.cursor.as_deref(),
+        baseline,
+    )?;
+    // 一页的形状可以进日志,正文不行。
+    crate::side_conversation::log_page(&params.side_id, page.page_len, page.finished);
+    Ok(page.result)
 }
 
 #[cfg(test)]
