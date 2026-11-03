@@ -22,6 +22,8 @@
 
 ## Features
 
+- [ ] 前台会话根生命周期与 watchdog 隔离 — [设计](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [实施计划](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md)。设计与计划已完成多轮交叉自审修订，功能未实施；完成判据：设计 C1–C16 全部通过，包括可信 guardian→daemon 授权闭环、原子准入、合法 owner 下跨 300/2700 秒仍可 spawn、等待 child 不被误级联取消、历史 stalled root 经停止证明与显式确认产生后继 attempt、租约退出有界回收及后台 worker watchdog 保持有效；用例统一 `foreground_root_lifecycle` 前缀并核对非零命中，执行命令见设计 §11 与计划 Task 11。
+
 - [ ] 任务、attempt 与两层父子状态机 — 验证：`cargo test -p yi-agent-core subagent::task::tests`
 - [ ] AgentSupervisor 与结构化 mailbox — 验证：`cargo test -p yi-agent-core subagent::supervisor::tests`
 - [ ] `spawn_agent` / `wait_agent` / `send_message` 工具 — 验证：`cargo test -p yi-agent-core subagent::tools::tests`
