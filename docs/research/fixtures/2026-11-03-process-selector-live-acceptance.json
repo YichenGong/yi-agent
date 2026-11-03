@@ -1,0 +1,140 @@
+{
+  "_note": "Real HORIZON-DeepSeek over the real gateway, against an isolated instance running the fixed build. Only tool names/arguments and truncated tool results; no credentials.",
+  "runs": [
+    {
+      "scenario": "name_only",
+      "build": "27490f29 (branch, fix applied)",
+      "instance_home": "/tmp/yi-iso-selector (isolated)",
+      "model": "HORIZON-DeepSeek",
+      "transport": "openai chat (llmapi.horizon.auto)",
+      "trace": [
+        {
+          "tool": "process_start",
+          "arguments": {
+            "command": "printf selector-live-ready; sleep 300",
+            "name": "selector-live",
+            "ready_pattern": "selector-live-ready",
+            "ready_timeout_sec": 20
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "{\n  \"process_id\": \"proc_1\",\n  \"name\": \"selector-live\",\n  \"pid\": 95740,\n  \"status\": {\n    \"state\": \"ready\"\n  },\n  \"ready\": true,\n  \"next_cursor\": 19,\n  \"start_warning\": null\n}"
+        },
+        {
+          "tool": "process_read",
+          "arguments": {
+            "name": "selector-live"
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "{\n  \"process_id\": \"proc_1\",\n  \"name\": \"selector-live\",\n  \"stdout\": \"selector-live-ready\",\n  \"stderr\": \"\",\n  \"next_cursor\": 19,\n  \"truncated\": false,\n  \"status\": {\n    \"state\": \"ready\"\n  },\n  \"ready\": true\n}"
+        },
+        {
+          "tool": "process_kill",
+          "arguments": {
+            "name": "selector-live"
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "killed"
+        },
+        {
+          "result_is_error": false,
+          "result": "[\n  {\n    \"process_id\": \"proc_1\",\n    \"name\": \"selector-live\",\n    \"pid\": 95740,\n    \"command\": \"printf selector-live-ready; sleep 300\",\n    \"cwd\": \"/private/tmp/c5live\",\n    \"status\": {\n      \"state\": \"killed\"\n    },\n  "
+        }
+      ]
+    },
+    {
+      "scenario": "id_only",
+      "build": "27490f29 (branch, fix applied)",
+      "instance_home": "/tmp/yi-iso-selector (isolated)",
+      "model": "HORIZON-DeepSeek",
+      "transport": "openai chat (llmapi.horizon.auto)",
+      "trace": [
+        {
+          "tool": "process_start",
+          "arguments": {
+            "command": "printf selector-idlive-ready; sleep 300",
+            "name": "selector-idlive",
+            "ready_pattern": "selector-idlive-ready",
+            "ready_timeout_sec": 20
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "{\n  \"process_id\": \"proc_1\",\n  \"name\": \"selector-idlive\",\n  \"pid\": 97949,\n  \"status\": {\n    \"state\": \"ready\"\n  },\n  \"ready\": true,\n  \"next_cursor\": 21,\n  \"start_warning\": null\n}"
+        },
+        {
+          "tool": "process_read",
+          "arguments": {
+            "process_id": "proc_1"
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "{\n  \"process_id\": \"proc_1\",\n  \"name\": \"selector-idlive\",\n  \"stdout\": \"selector-idlive-ready\",\n  \"stderr\": \"\",\n  \"next_cursor\": 21,\n  \"truncated\": false,\n  \"status\": {\n    \"state\": \"ready\"\n  },\n  \"ready\": true\n}"
+        },
+        {
+          "tool": "process_kill",
+          "arguments": {
+            "process_id": "proc_1"
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "killed"
+        }
+      ]
+    },
+    {
+      "scenario": "both_fields",
+      "build": "27490f29 (branch, fix applied)",
+      "instance_home": "/tmp/yi-iso-selector (isolated)",
+      "model": "HORIZON-DeepSeek",
+      "transport": "openai chat (llmapi.horizon.auto)",
+      "trace": [
+        {
+          "tool": "process_start",
+          "arguments": {
+            "command": "printf selector-both-ready; sleep 300",
+            "name": "selector-both",
+            "ready_pattern": "selector-both-ready",
+            "ready_timeout_sec": 15
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "{\n  \"process_id\": \"proc_1\",\n  \"name\": \"selector-both\",\n  \"pid\": 6657,\n  \"status\": {\n    \"state\": \"ready\"\n  },\n  \"ready\": true,\n  \"next_cursor\": 19,\n  \"start_warning\": null\n}"
+        },
+        {
+          "tool": "process_read",
+          "arguments": {
+            "name": "selector-both",
+            "process_id": "proc_1"
+          }
+        },
+        {
+          "result_is_error": true,
+          "result": "error: provide exactly one of process_id or name"
+        },
+        {
+          "tool": "process_kill",
+          "arguments": {
+            "name": "selector-both"
+          }
+        },
+        {
+          "result_is_error": false,
+          "result": "killed"
+        },
+        {
+          "result_is_error": false,
+          "result": "[\n  {\n    \"process_id\": \"proc_1\",\n    \"name\": \"selector-both\",\n    \"pid\": 6657,\n    \"command\": \"printf selector-both-ready; sleep 300\",\n    \"cwd\": \"/private/tmp/c5live\",\n    \"status\": {\n      \"state\": \"killed\"\n    },\n   "
+        }
+      ]
+    }
+  ]
+}

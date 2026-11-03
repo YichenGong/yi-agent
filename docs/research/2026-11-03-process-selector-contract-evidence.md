@@ -447,3 +447,66 @@ process_kill  {"name":"selector-acceptance"}                       -> error=fals
 ### 12.5 结论
 
 C1–C4 与 C5/C6 的**定义层与运行时层**已全部验收；缺口只剩"真实模型遵从行为"与"部署到用户实例"两项，均属需要单独授权的外部动作。据此，功能条目可以从"阻塞"改为"契约已修复且入口已验收，部署与真实模型观察待授权"。
+
+---
+
+## 13. 第四轮：真实模型 + 真实网关的入口验收（C5/C6 达成）
+
+用户授权：在隔离实例上部署修复版并用真实模型验证，指定 `HORIZON-DeepSeek`。
+
+### 13.1 条件
+
+| 项 | 值 |
+|---|---|
+| 二进制 | 本分支 HEAD `27490f29`（含修复）`target/debug/yi-agent` |
+| 实例 | `YI_AGENT_HOME=/tmp/yi-iso-selector`（隔离；`paths::instance_home` 自动补 `.yi-agent`） |
+| 模型条目 | `HORIZON-DeepSeek`，`provider=openai`，**`api_style=chat`**，`api_url=https://llmapi.horizon.auto/v1` |
+| 通道 | 真实第三方网关 Chat Completions（与用户报告故障的通道一致） |
+| 用户在用实例 | **未触碰**（`~/.yi-agent/threads/` 仍为 9 月旧文件；`/Applications` 下 app 未替换） |
+
+隔离实例的 `models.json` 权限 `0600`，密钥只存在于该文件，未打印、未写进任何提交。
+
+### 13.2 实际观察（`--json` 事件流，模型自己决定参数）
+
+**场景 A：仅 name**
+
+```
+process_read  {"name":"selector-live"}                 -> error=false, stdout="selector-live-ready"
+process_kill  {"name":"selector-live"}                 -> error=false, "killed"
+```
+
+`process_id` 键**完全不存在**于请求参数中。
+
+**场景 B：仅 process_id**
+
+```
+process_read  {"process_id":"proc_1"}                  -> error=false, stdout="selector-idlive-ready"
+process_kill  {"process_id":"proc_1"}                  -> error=false, "killed"
+```
+
+`name` 键**完全不存在**。
+
+**场景 C：双有效字段**
+
+```
+process_read  {"name":"selector-both","process_id":"proc_1"}
+                                                      -> error=true, "provide exactly one of process_id or name"
+```
+
+### 13.3 判定
+
+| 项 | 结果 |
+|---|---|
+| C5 实际公开定义 | **通过**：真实模型在真实网关上收到的定义使它能、且它确实只传一个选择器 |
+| C6 仅 name / 仅 id 可用 | **通过**：两者都读取成功，均未被要求补另一个字段 |
+| C6 双字段互斥 | **通过**：仍返回 exactly-one |
+| C6 空字符串占位 | 通过（未修复实例 §11.4 已验，修复未触碰该路径） |
+
+C5 之所以达成，关键在于是**真实模型自主决定参数**——若定义仍要求双字段，模型会按定义同时发送两个。这正是 §12.4 遗留缺口。
+
+### 13.4 仍未做的
+
+1. **用户在用实例仍是未修复版 `308ccaa4`**。本轮只在隔离实例验证，未替换 `/Applications` 下的 app；线上入口行为不变。
+2. **首个变形边界仍未定位**（候选 A 已证伪，见 §11.3）。但修复后的定义在该网关下工作正常，故对用户可见问题而言已闭环。
+
+证据 fixture：`docs/research/fixtures/2026-11-03-process-selector-live-acceptance.json`。
