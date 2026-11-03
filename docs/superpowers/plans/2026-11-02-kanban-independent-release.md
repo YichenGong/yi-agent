@@ -621,11 +621,11 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 实现 §3 的完整 `plugins/v1/*` 管理 API；app-server 的 RuntimeControl 适配 guardian/driver，不复制生命周期状态机。下载器输入受信发布标识，不能接受 iframe 传入任意 URL 或本地路径。
 
-- [ ] Step 1：测试 install 不调用 enable/daemon/launchd/manifest，enable 失败只回滚本次授权，权限增加等待确认，legacy plugin/install 不能绕过新管理流程。
-- [ ] Step 2：测试同一事务在两个客户端看到相同进度，CLI 与 RPC 争用统一锁；取消下载/磁盘不足/HTTP 重定向离开允许源明确失败，旧版本不受影响。本地包导入缺元数据、过期、错签拒绝；有效官方签名包导入仍不启用项目。headless subprocess 完成安装、启用、激活、查询与卸载，不能只测 exec。
-- [ ] Step 3：实现认证目录与流式下载，限制 HTTPS 官方来源及受认证宿主资源传输；超时分为无进展超时与总超时，使用注入时钟/fetcher 测试，不用长 sleep。管理进度/错误脱敏。自动检查只刷新受信元数据和可用更新提示，退避/离线不影响已有版本，绝不自动 activate；本地导入仍验证同一信任根、序号、大小与摘要。
-- [ ] Step 4：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib plugin_management`；运行 bindings-check 及 routes 测试；验证后台常驻只有显式授权时调用现有 resident adapter。
-- [ ] Step 5：按 C 提交 `feat: expose versioned plugin management operations`。
+- [x] Step 1：测试 install 不调用 enable/daemon/launchd/manifest，enable 失败只回滚本次授权，权限增加等待确认，legacy plugin/install 不能绕过新管理流程。见 `server/plugin_management_tests.rs`（`installing_a_local_bundle_does_not_enable_any_project` 断言 `projects=[]` 且无事务；`the_legacy_install_path_does_not_create_managed_state` 断言旧路径不产生受管记录）；`plugin_manager/service.rs::enable_project` 只写授权、不启动进程、不写清单。
+- [x] Step 2：测试同一事务在两个客户端看到相同进度，CLI 与 RPC 争用统一锁；取消下载/磁盘不足/HTTP 重定向离开允许源明确失败，旧版本不受影响。本地包导入缺元数据、过期、错签拒绝；有效官方签名包导入仍不启用项目。headless subprocess 完成安装、启用、激活、查询与卸载，不能只测 exec。见 `plugins/tests/lifecycle.rs::two_independent_clients_see_the_same_transaction_and_phase`（新增只读 `Lifecycle::observe`）、`operations.rs::two_processes_beginning_different_requests_do_not_lose_an_update`、`plugins_exec.rs::headless_management_walks_install_enable_activate_transaction_uninstall` 与 `two_separate_processes_observe_the_same_transaction`。
+- [x] Step 3：实现认证目录与流式下载，限制 HTTPS 官方来源及受认证宿主资源传输；超时分为无进展超时与总超时，使用注入时钟/fetcher 测试，不用长 sleep。管理进度/错误脱敏。自动检查只刷新受信元数据和可用更新提示，退避/离线不影响已有版本，绝不自动 activate；本地导入仍验证同一信任根、序号、大小与摘要。见 `yi-agent-plugins/src/catalog.rs`（`download` 双超时、逐跳重验源、`Catalog::agrees_with`）与 `plugin_manager/service.rs::install_from_catalog`（本地与目录共用 `install_verified_bytes`）。
+- [x] Step 4：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib plugin_management`；运行 bindings-check 及 routes 测试；验证后台常驻只有显式授权时调用现有 resident adapter。实测 app-server lib 1206 通过（7 ignored）、`export_bindings` 无 diff、`routes.test.ts` 2 通过；管理服务不触碰 resident adapter。
+- [x] Step 5：按 C 提交 `feat: expose versioned plugin management operations`。
 
 ### Task T17：实现生产资源加载与原生恢复容器
 

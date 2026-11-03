@@ -21,6 +21,7 @@ pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
+pub(crate) mod plugin_management;
 pub(crate) mod process;
 pub(crate) mod remote;
 pub(crate) mod resident;

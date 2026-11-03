@@ -344,9 +344,21 @@ pub enum PluginsAction {
         plugin: String,
     },
     /// 卸载（默认保留数据）。
-    Uninstall,
-    /// 显式清除数据（独立于卸载）。
-    ClearData,
+    Uninstall {
+        #[arg(long)]
+        plugin: String,
+    },
+    /// 显式清除数据（独立于卸载，需要 `--yes` 二次确认）。
+    ClearData {
+        #[arg(long)]
+        plugin: String,
+        /// 这些项目的数据将被删除。必须显式列出——"全部"不是一个安全默认值。
+        #[arg(long = "project", required = true)]
+        projects: Vec<String>,
+        /// 二次确认。没有它就什么都不删。
+        #[arg(long)]
+        yes: bool,
+    },
     /// 只清引用安全的受管产物。
     Gc,
     /// 探测旧安装。

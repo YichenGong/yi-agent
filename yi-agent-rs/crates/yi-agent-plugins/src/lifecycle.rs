@@ -512,6 +512,16 @@ impl Lifecycle {
         }
     }
 
+    /// 只读地看一眼某个事务现在到哪了。
+    ///
+    /// CLI 与 RPC 是两个进程，面板上的"当前阶段"必须来自磁盘上的 journal 而
+    /// 不是调用方自己的内存。这个方法**不推进、不取锁、不写回**：观察一个
+    /// 事务不该改变它，也不该让观察者挡住正在推进的一方。
+    pub fn observe(&self, id: &str) -> Result<Progress, PluginError> {
+        let journal = self.load_own_journal(id)?;
+        Ok(Progress::from_journal(&journal))
+    }
+
     /// 取消一个事务。
     ///
     /// 只在可安全退回的阶段允许。`projecting` 之后提交已经发生，

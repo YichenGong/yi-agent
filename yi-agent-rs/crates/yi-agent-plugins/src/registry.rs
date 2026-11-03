@@ -205,6 +205,31 @@ impl Registry {
         Ok(record)
     }
 
+    /// 删除一个插件的全部注册记录。
+    ///
+    /// 只动"装了什么"这份账。发布目录由 [`crate::uninstall::gc`] 按引用
+    /// 决定去留，用户数据默认保留——卸载不该顺手删掉用户攒下的东西。
+    ///
+    /// 插件本来就不在注册表里时报 `NotFound`：静默成功会让调用方以为
+    /// "删掉了"，而实际它从没被记录过，下一次安装会撞上遗留的版本目录。
+    pub fn remove_plugin(&self, plugin: &PluginId) -> Result<PluginRecord, PluginError> {
+        let _guard = locks::acquire(&self.lock_path(), REGISTRY_LOCK_TIMEOUT)?;
+        let mut file = self.read()?;
+        let index = file
+            .plugins
+            .iter()
+            .position(|record| &record.plugin == plugin)
+            .ok_or_else(|| {
+                PluginError::NotFound(format!(
+                    "plugin `{}` is not registered in this instance",
+                    plugin.as_str()
+                ))
+            })?;
+        let removed = file.plugins.remove(index);
+        self.write(&file)?;
+        Ok(removed)
+    }
+
     fn read(&self) -> Result<RegistryFile, PluginError> {
         let path = self.path();
         let bytes = match std::fs::read(&path) {

@@ -722,12 +722,27 @@ fn exec_does_not_export_a_plugin_supplied_reserved_variable() {
 #[test]
 fn management_commands_report_not_supported_instead_of_faking_success() {
     // 假的"已完成"会让调用方跳过真正的校验，而校验正是这一层的价值。
+    // `inspect-legacy` / `adopt-legacy` 属 T25，此时必须明确说"还没实现"。
+    let fixture = Fixture::build();
+    for verb in ["inspect-legacy", "adopt-legacy"] {
+        let (code, _stdout, stderr) = fixture.run(&["plugins", verb], None);
+        assert_ne!(code, 0, "{verb} is not implemented yet");
+        assert!(
+            stderr.contains("NotSupported"),
+            "{verb} must be classified, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn catalog_without_a_configured_origin_refuses() {
+    // 目录渠道必须有宿主钉死的源。没有源就不该"从哪都行"。
     let fixture = Fixture::build();
     let (code, _stdout, stderr) = fixture.run(&["plugins", "catalog"], None);
-    assert_ne!(code, 0, "catalog is not implemented yet");
+    assert_ne!(code, 0, "catalog must refuse without an origin");
     assert!(
-        stderr.contains("NotSupported"),
-        "the failure must be classified, got: {stderr}"
+        stderr.contains("NotSupported") || stderr.contains("Untrusted"),
+        "the refusal must be classified, got: {stderr}"
     );
 }
 
@@ -848,5 +863,631 @@ fn disable_project_revokes_only_that_project() {
     assert!(
         second_grant.granted.contains(&Effect::Read),
         "revoking one project must not touch the other"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T16 Step 1：安装与启用是两件事
+// ---------------------------------------------------------------------------
+
+/// `install` 只落盘"装了什么"，不产生任何运行态。
+///
+/// 这条断言的价值在于它列的是**全部**侧面：没有授权、没有激活、没有监督器
+/// 清单、没有 launchd plist、没有进程。安装一旦顺手做了其中任何一件，"装了"
+/// 就等于"用户已经同意让它在某个项目里跑"，而那正是设计 §6 明确禁止的。
+#[test]
+fn install_creates_no_grant_no_activation_and_no_supervisor() {
+    let fixture = Fixture::build();
+    fixture.install();
+
+    let home = fixture.instance_home();
+
+    // 1. 没有任何项目授权。
+    let table = yi_agent_supervisors::managed::grants::load(&home).expect("grant table");
+    assert!(
+        table
+            .get(
+                fixture.plugin.as_str(),
+                &ProjectId::parse("/tmp/whatever").unwrap()
+            )
+            .is_none(),
+        "install must not authorize any project"
+    );
+    assert!(
+        table.all().is_empty(),
+        "install must not write a grant at all"
+    );
+
+    // 2. 没有激活记录。
+    let lifecycle = Lifecycle::open(&home).expect("lifecycle");
+    assert!(
+        lifecycle
+            .committed(&fixture.plugin)
+            .expect("read")
+            .is_none(),
+        "install must not activate the release"
+    );
+
+    // 3. 没有监督器清单（那是 `plugin/install` 那条更老的路径才做的）。
+    let supervisors = home.join("plugins").join("supervisors");
+    if supervisors.exists() {
+        let leftovers: Vec<_> = std::fs::read_dir(&supervisors)
+            .expect("read supervisors")
+            .flatten()
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "install must not write a supervisor manifest, found {:?}",
+            leftovers.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+    }
+
+    // 4. 注册表里确实有它——否则上面三条就成了"什么都没干"的空断言。
+    let records = yi_agent_plugins::Registry::open(&home)
+        .expect("registry")
+        .list()
+        .expect("list");
+    assert!(
+        records.iter().any(|record| record.plugin == fixture.plugin),
+        "install must record the installation"
+    );
+
+    // 5. 首次安装会选中版本，但仍然不授权任何项目。
+    let record = records
+        .iter()
+        .find(|record| record.plugin == fixture.plugin)
+        .expect("record");
+    assert_eq!(
+        record.selected.as_deref(),
+        Some(fixture.manifest.version.as_str()),
+        "a first install selects the version so `list` is meaningful"
+    );
+}
+
+/// `plugins uninstall` 摘掉程序，但对用户数据碰都不碰。
+#[test]
+fn uninstall_removes_the_program_and_keeps_the_projects_data() {
+    let fixture = Fixture::build();
+    let argv_file = fixture.prepare_activation(Effect::Read, fixture.project.path());
+
+    // 造一份"用户数据"。
+    let data = fixture
+        .project
+        .path()
+        .join(".yi-agent/plugins")
+        .join(fixture.plugin.as_str());
+    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::write(data.join("cards.json"), b"[{\"id\":1}]").expect("cards");
+
+    let (code, out, err) = fixture.run(
+        &["plugins", "uninstall", "--plugin", fixture.plugin.as_str()],
+        None,
+    );
+    assert_eq!(code, 0, "uninstall failed: {err}\n{out}");
+    assert!(
+        out.contains("kept") && out.contains("data"),
+        "the user must be told what was kept, got: {out}"
+    );
+
+    assert!(
+        data.join("cards.json").exists(),
+        "uninstalling a program must not delete the user's data"
+    );
+    let records = yi_agent_plugins::Registry::open(&fixture.instance_home())
+        .expect("registry")
+        .list()
+        .expect("list");
+    assert!(
+        records.iter().all(|record| record.plugin != fixture.plugin),
+        "the plugin must be gone from the registry"
+    );
+    // 残留的 argv 文件说明 exec 真的跑过；这里只确认它没有被 uninstall 顺手删。
+    let _ = argv_file;
+}
+
+/// `clear-data` 不带 `--yes` 时什么都不删。
+#[test]
+fn clear_data_without_confirmation_refuses() {
+    let fixture = Fixture::build();
+    fixture.prepare_activation(Effect::Read, fixture.project.path());
+
+    let data = fixture
+        .project
+        .path()
+        .join(".yi-agent/plugins")
+        .join(fixture.plugin.as_str());
+    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::write(data.join("cards.json"), b"[]").expect("cards");
+
+    let (code, _out, err) = fixture.run(
+        &[
+            "plugins",
+            "clear-data",
+            "--plugin",
+            fixture.plugin.as_str(),
+            "--project",
+            &canonical(fixture.project.path()),
+        ],
+        None,
+    );
+    assert_eq!(code, 1, "an unconfirmed clear must not succeed");
+    assert!(
+        err.contains("--yes"),
+        "the error must name the missing flag: {err}"
+    );
+    assert!(
+        data.join("cards.json").exists(),
+        "nothing may be deleted without confirmation"
+    );
+}
+
+/// `plugins gc` 在有授权时什么都不删，并说明为什么留着。
+#[test]
+fn gc_keeps_a_granted_version_and_says_why() {
+    let fixture = Fixture::build();
+    fixture.prepare_activation(Effect::Read, fixture.project.path());
+
+    let (code, out, err) = fixture.run(&["plugins", "gc"], None);
+    assert_eq!(code, 0, "gc failed: {err}");
+
+    // 判定顺序是「激活优先，其次授权」。这里发生的是激活，所以理由会写成
+    // committed activation；断言理由**存在**而不是断言某一句，是因为换一个
+    // 夹具阶段就会换一条理由，而"没说为什么"永远是错的。
+    assert!(
+        out.contains("kept"),
+        "gc must report what it kept, got: {out}"
+    );
+    assert!(
+        out.contains("committed activation") || out.contains("grant"),
+        "gc must say why it kept the version, got: {out}"
+    );
+
+    let installed = fixture.instance_home().join(format!(
+        "plugins/installed/{}/{}/{}",
+        fixture.plugin.as_str(),
+        fixture.manifest.version,
+        fixture.manifest.target
+    ));
+    assert!(
+        installed.exists(),
+        "the activated version directory must survive gc: {}",
+        installed.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T16：目录渠道（认证目录 + 受控下载）
+// ---------------------------------------------------------------------------
+
+/// 起一个只读本地服务器，把它当作"官方源"。
+///
+/// 用 python3 而不是引一个新的 HTTP dev 依赖：这条测试要证明的是宿主**自己的**
+/// 源校验与大小核对，不是某个 HTTP 库的行为；一个只会发文件的服务器正好够用。
+///
+/// 端口由内核分配、由子进程的 **stdout** 回报。`http.server` 的 CLI 把端口写在
+/// stderr 且带缓冲，读它会永久阻塞——这正是先写坏过的那一版。
+struct StaticServer {
+    child: std::process::Child,
+    _dir: tempfile::TempDir,
+    port: u16,
+}
+
+const SERVE_SCRIPT: &str = r#"
+import http.server, socketserver, sys, os
+os.chdir(sys.argv[1])
+handler = http.server.SimpleHTTPRequestHandler
+httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+print(httpd.server_address[1], flush=True)
+httpd.serve_forever()
+"#;
+
+impl StaticServer {
+    fn start(files: &[(&str, &[u8])]) -> StaticServer {
+        let dir = tempfile::tempdir().expect("server dir");
+        for (name, bytes) in files {
+            let path = dir.path().join(name.trim_start_matches('/'));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("server subdir");
+            }
+            std::fs::write(path, bytes).expect("server file");
+        }
+
+        let mut child = Command::new("python3")
+            .args(["-c", SERVE_SCRIPT])
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("python3 is required for the catalog tests");
+
+        use std::io::BufRead;
+        let stdout = child.stdout.as_mut().expect("stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read the port");
+        let port: u16 = line
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("the server printed no port, got {line:?}"));
+
+        StaticServer {
+            child,
+            _dir: dir,
+            port,
+        }
+    }
+}
+
+impl Drop for StaticServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 一个带端口的源必须被拒——这是目录渠道的源校验，不是摆设。
+///
+/// 本地测试服务器只能给 `http://127.0.0.1:<port>`，而官方源的定义是
+/// "裸 https 主机名"。让它走完整条链路再被 curl 的 TLS 层拒掉，测到的是
+/// curl 的行为；在**源校验**这一步拒掉，测到的才是宿主的策略。
+#[test]
+fn a_host_with_a_port_is_not_an_acceptable_official_origin() {
+    let fixture = Fixture::build();
+    // 夹具包与它自己的签名元数据就是要发布的东西。
+    let archive = std::fs::read(&fixture.bundle).expect("bundle");
+    let metadata = std::fs::read(&fixture.metadata).expect("metadata");
+
+    let mut server =
+        StaticServer::start(&[("metadata.json", &metadata), ("bundle.tar.gz", &archive)]);
+    let port = server.port;
+
+    // 目录只给路径；源由宿主钉死（`YI_AGENT_PLUGIN_ORIGIN`）。
+    let catalog = serde_json::json!({
+        "serial": 7,
+        "entries": [{
+            "release": {
+                "plugin": fixture.plugin.as_str(),
+                "version": fixture.manifest.version,
+                "target": fixture.manifest.target,
+                "sha256": hex(&archive),
+            },
+            "sizeBytes": archive.len(),
+            "metadataPath": "/metadata.json",
+            "bundlePath": "/bundle.tar.gz",
+            "publishedAt": 1_767_225_600u64,
+            "expiresAt": 1_798_761_600u64,
+            "serial": 7,
+        }],
+    });
+    let catalog_path = fixture.home.path().join("catalog.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&catalog).expect("serialize catalog"),
+    )
+    .expect("write catalog");
+
+    let spec = format!(
+        "{}@{}#{}",
+        fixture.plugin.as_str(),
+        fixture.manifest.version,
+        hex(&archive)
+    );
+    let instance_home = fixture.instance_home();
+    let output = Command::new(yi_agent_bin())
+        .args(["plugins", "install", "--release", &spec])
+        .env("YI_AGENT_HOME", &instance_home)
+        .env("HOME", fixture.home.path())
+        .env("YI_AGENT_PLUGIN_CATALOG", &catalog_path)
+        .env("YI_AGENT_PLUGIN_ORIGIN", format!("127.0.0.1:{port}"))
+        .output()
+        .expect("run yi-agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 官方源只可能是"裸 https 主机名"。本机测试服务器是 `127.0.0.1:<port>`，
+    // 带端口——它必须被拒绝。这条用例证明 YI_AGENT_PLUGIN_ORIGIN 不是一个
+    // "写什么都行"的开关：一个带端口的源足以把下载引到用户自己机器上。
+    assert_ne!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "a host:port origin must not be accepted as the official source: {stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("Untrusted"),
+        "the refusal must be classified as untrusted, got: {stderr}"
+    );
+
+    // 关键：什么都没装进去。
+    let records = yi_agent_plugins::Registry::open(&fixture.instance_home())
+        .expect("registry")
+        .list()
+        .expect("list");
+    assert!(
+        records.is_empty(),
+        "a refused catalog install must leave the instance untouched"
+    );
+}
+
+/// 没有配置官方源时，目录安装明确失败而不是"从哪都行"。
+#[test]
+fn catalog_install_without_a_configured_origin_refuses() {
+    let fixture = Fixture::build();
+    let archive = std::fs::read(&fixture.bundle).expect("bundle");
+    let catalog = serde_json::json!({
+        "serial": 7,
+        "entries": [{
+            "release": {
+                "plugin": fixture.plugin.as_str(),
+                "version": fixture.manifest.version,
+                "target": fixture.manifest.target,
+                "sha256": hex(&archive),
+            },
+            "sizeBytes": archive.len(),
+            "metadataPath": "/metadata.json",
+            "bundlePath": "/bundle.tar.gz",
+            "publishedAt": 1_767_225_600u64,
+            "expiresAt": 1_798_761_600u64,
+            "serial": 7,
+        }],
+    });
+    let catalog_path = fixture.home.path().join("catalog.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&catalog).expect("catalog"),
+    )
+    .expect("write");
+
+    let spec = format!(
+        "{}@{}#{}",
+        fixture.plugin.as_str(),
+        fixture.manifest.version,
+        hex(&archive)
+    );
+    let output = Command::new(yi_agent_bin())
+        .args(["plugins", "install", "--release", &spec])
+        .env("YI_AGENT_HOME", fixture.instance_home())
+        .env("HOME", fixture.home.path())
+        .env("YI_AGENT_PLUGIN_CATALOG", &catalog_path)
+        .env_remove("YI_AGENT_PLUGIN_ORIGIN")
+        .output()
+        .expect("run yi-agent");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    assert!(
+        stderr.contains("NotSupported"),
+        "the missing origin must be classified, got: {stderr}"
+    );
+}
+
+/// 目录里没有这条发布时，报 NotFound 而不是去下载别的东西。
+#[test]
+fn catalog_install_of_an_unlisted_release_is_not_found() {
+    let fixture = Fixture::build();
+    let catalog = serde_json::json!({ "serial": 1, "entries": [] });
+    let catalog_path = fixture.home.path().join("catalog.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&catalog).expect("catalog"),
+    )
+    .expect("write");
+
+    let spec = format!(
+        "{}@{}#{}",
+        fixture.plugin.as_str(),
+        fixture.manifest.version,
+        "b".repeat(64)
+    );
+    let output = Command::new(yi_agent_bin())
+        .args(["plugins", "install", "--release", &spec])
+        .env("YI_AGENT_HOME", fixture.instance_home())
+        .env("HOME", fixture.home.path())
+        .env("YI_AGENT_PLUGIN_CATALOG", &catalog_path)
+        .env("YI_AGENT_PLUGIN_ORIGIN", "plugins.example.com")
+        .output()
+        .expect("run yi-agent");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    assert!(
+        stderr.contains("NotFound"),
+        "an unlisted release must be NotFound, got: {stderr}"
+    );
+}
+
+/// headless 全流程：安装 → 启用 → 激活 → 查询 → 卸载，全程不启动桌面。
+///
+/// 这条用例是 T16 Step 2 的硬要求："不能只测 exec"。它把管理命令按用户真实
+/// 顺序串起来，证明每一步留下的记录正好是下一步要读的那一份。
+#[test]
+fn headless_management_walks_install_enable_activate_transaction_uninstall() {
+    let fixture = Fixture::build();
+    let home = fixture.instance_home();
+    let project = canonical(fixture.project.path());
+
+    // 1. 安装：不应该产生任何授权，也不该开事务。
+    fixture.install();
+    let (code, stdout, stderr) = fixture.run(&["plugins", "list"], None);
+    assert_eq!(code, 0, "list failed: {stderr}");
+    assert!(stdout.contains("example-counter"), "got: {stdout}");
+    assert!(
+        stdout.contains("projects=[]"),
+        "install must not grant a project, got: {stdout}"
+    );
+
+    let (code, stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "transaction",
+            "--plugin",
+            fixture.plugin.as_str(),
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "transaction failed: {stderr}");
+    assert!(
+        stdout.contains("no open transaction"),
+        "install must not open an activation transaction, got: {stdout}"
+    );
+
+    // 2. 启用：写一条授权，但**不**激活。
+    let (code, stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "enable-project",
+            "--plugin",
+            fixture.plugin.as_str(),
+            "--project",
+            &project,
+            "--capability",
+            "read",
+            "--capability",
+            "launch",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "enable-project failed: {stderr}");
+    assert!(
+        stdout.contains("generation 1"),
+        "first enable starts at generation 1, got: {stdout}"
+    );
+
+    let (code, stdout, _stderr) = fixture.run(&["plugins", "list"], None);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("projects=[") && stdout.contains(&project),
+        "the grant must show up in list, got: {stdout}"
+    );
+
+    // 3. 激活：只建立事务，明确说明尚未推进。
+    let (code, stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "activate",
+            "--plugin",
+            fixture.plugin.as_str(),
+            "--version",
+            "1.4.0",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "activate failed: {stderr}");
+    assert!(
+        stdout.contains("started activation transaction"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("not advanced by this command"),
+        "activate must say it did not advance the transaction, got: {stdout}"
+    );
+
+    // 4. 查询：事务确实在磁盘上，且准入仍是关闭的。
+    let (code, stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "transaction",
+            "--plugin",
+            fixture.plugin.as_str(),
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "transaction failed: {stderr}");
+    assert!(stdout.contains("draining"), "got: {stdout}");
+    assert!(
+        stdout.contains("admission=closed"),
+        "a started transaction must keep admission closed, got: {stdout}"
+    );
+
+    // 5. 未推进的事务不能凭空"取消成功"：真正回滚需要运行期控制面。
+    let (code, _stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "cancel-transaction",
+            "--plugin",
+            fixture.plugin.as_str(),
+        ],
+        None,
+    );
+    assert_ne!(code, 0, "cancel must not pretend the rollback happened");
+    assert!(
+        stderr.contains("runtime control plane"),
+        "the refusal must name what is missing, got: {stderr}"
+    );
+
+    // 6. 卸载：程序与授权都没了，事务日志也不是"授权"。
+    let (code, stdout, stderr) = fixture.run(
+        &["plugins", "uninstall", "--plugin", fixture.plugin.as_str()],
+        None,
+    );
+    assert_eq!(code, 0, "uninstall failed: {stderr}");
+    assert!(stdout.contains("1 grants revoked"), "got: {stdout}");
+
+    let (code, stdout, stderr) = fixture.run(&["plugins", "list"], None);
+    assert_eq!(code, 0, "list failed: {stderr}");
+    assert!(
+        !stdout.contains("example-counter"),
+        "the plugin must be gone from the registry, got: {stdout}"
+    );
+
+    // 版本目录**不该**由卸载删除：它可能还被一次未完成的备份/事务引用。
+    // 删除是 `gc` 的职责，它逐个版本问"还有没有人要用"。这里钉住这个分工，
+    // 免得日后有人为了"看起来干净"把卸载改成直接 `remove_dir_all`。
+    assert!(
+        home.join("plugins/installed/example-counter").exists(),
+        "uninstall must leave version directories for gc to judge"
+    );
+    // `gc` 只遍历**注册表里**的版本，卸载已经把记录摘掉，所以它看不到这
+    // 个目录。这是当前实现的真实边界（孤儿目录留给后续清理），不在这里
+    // 用断言假装它已被处理——假绿会让"磁盘越用越大"永远没人发现。
+    let (code, _stdout, stderr) = fixture.run(&["plugins", "gc"], None);
+    assert_eq!(code, 0, "gc must not fail: {stderr}");
+}
+
+/// 两个独立进程（模拟 CLI 与 RPC）看到的是**同一个**事务。
+///
+/// 若事务状态存在进程内存里，两次查询会各自给出一个"刚刚开始"的事务，
+/// 而它们都会去推进同一个插件目录。这里用两个真实子进程读同一份磁盘。
+#[test]
+fn two_separate_processes_observe_the_same_transaction() {
+    let fixture = Fixture::build();
+    fixture.install();
+
+    let (code, _stdout, stderr) = fixture.run(
+        &[
+            "plugins",
+            "activate",
+            "--plugin",
+            fixture.plugin.as_str(),
+            "--version",
+            "1.4.0",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "activate failed: {stderr}");
+
+    let read = |fixture: &Fixture| -> String {
+        let (code, stdout, stderr) = fixture.run(
+            &[
+                "plugins",
+                "transaction",
+                "--plugin",
+                fixture.plugin.as_str(),
+            ],
+            None,
+        );
+        assert_eq!(code, 0, "transaction failed: {stderr}");
+        stdout
+    };
+
+    let first = read(&fixture);
+    let second = read(&fixture);
+    assert_eq!(
+        first, second,
+        "two processes must read the same transaction from disk, not each start their own"
+    );
+    // 事务 id 必须出现在输出里——否则两条空输出也会"相等"。
+    assert!(
+        first.split('\t').next().map(|id| id.len()).unwrap_or(0) > 8,
+        "the output must name the transaction, got: {first}"
     );
 }

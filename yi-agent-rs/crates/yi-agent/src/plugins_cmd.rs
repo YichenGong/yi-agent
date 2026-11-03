@@ -7,19 +7,23 @@
 //! - 其余子命令是**管理**操作：作用在实例状态上，不携带任何页面/业务权限。
 //!   它们不需要桌面在跑，所以 headless 也能完成安装与更新。
 //!
+//! # 本文件只负责"变成调用、变成输出"
+//!
+//! 管理逻辑全部在 [`yi_agent_app_server::plugin_manager::service::PluginService`]。
+//! 桌面 RPC（`plugins/v1/*`）用的是同一个实现。这里复制一份的日子就是两份
+//! 实现开始分叉的日子，而它们读写的是同一组权威记录（registry、grants、
+//! lifecycle）——分叉的较弱那份就是绕过校验的入口。
+//!
 //! # 未实现的必须说"未实现"
 //!
-//! 管理表里有若干条目依赖尚未落地的下游任务（下载渠道、发布目录、
-//! 旧安装探测）。这些一律返回 `NotSupported`，**不伪装成功**：一次假的
-//! "已安装"会让调用方跳过真正的校验，而校验正是这一层的全部价值。
+//! 依赖尚未落地下游任务的方法一律返回 `NotSupported`，**不伪装成功**：
+//! 一次假的"已安装"会让调用方跳过真正的校验，而校验正是这一层的全部价值。
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use yi_agent_plugins::{
-    Effect, Lifecycle, LifecycleRequest, Manifest, PluginError, PluginId, ProjectId, Registry,
-    ReleaseId, project::ProjectResolver,
-};
+use yi_agent_app_server::plugin_manager::service::{self, PluginService};
+use yi_agent_plugins::{PluginError, PluginId, ReleaseId};
 use yi_agent_supervisors::managed::{self, LaunchRequest, grants};
 
 use crate::config::PluginsAction;
@@ -30,17 +34,12 @@ fn instance_home() -> Result<PathBuf> {
         .context("no instance root: set YI_AGENT_HOME or make sure HOME exists")
 }
 
+fn service() -> Result<PluginService> {
+    Ok(PluginService::open(instance_home()?))
+}
+
 fn plugin_id(raw: &str) -> Result<PluginId> {
     PluginId::parse(raw).map_err(|error| anyhow::anyhow!("{error}"))
-}
-
-fn project_id(raw: &str) -> Result<ProjectId> {
-    ProjectId::parse(raw).map_err(|error| anyhow::anyhow!("{error}"))
-}
-
-/// 默认宿主身份。
-fn host() -> Result<String> {
-    managed::host_id(&instance_home()?).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// 把 `PluginError` 转成 CLI 的退出码。
@@ -62,7 +61,7 @@ pub fn run(action: &PluginsAction) -> Result<i32> {
             argv,
         } => exec(plugin, project_handle, binding_file, argv),
         PluginsAction::Maintenance { plugin } => maintenance(plugin),
-        PluginsAction::Catalog => not_supported("catalog", "the catalog channel ships in T16"),
+        PluginsAction::Catalog => catalog(),
         PluginsAction::List => list(),
         PluginsAction::Install {
             release,
@@ -86,23 +85,488 @@ pub fn run(action: &PluginsAction) -> Result<i32> {
         PluginsAction::Rollback { plugin } => rollback(plugin),
         PluginsAction::Transaction { plugin } => transaction(plugin),
         PluginsAction::CancelTransaction { plugin } => cancel_transaction(plugin),
-        PluginsAction::Uninstall => {
-            not_supported("uninstall", "removal lands with the T16 catalog channel")
-        }
-        PluginsAction::ClearData => not_supported(
-            "clear-data",
-            "data clearing lands with the T16 catalog channel",
-        ),
-        PluginsAction::Gc => not_supported(
-            "gc",
-            "garbage collection lands with the T16 catalog channel",
-        ),
+        PluginsAction::Uninstall { plugin } => uninstall_plugin(plugin, false),
+        PluginsAction::ClearData {
+            plugin,
+            projects,
+            yes,
+        } => clear_data(plugin, projects, *yes),
+        PluginsAction::Gc => gc(),
         PluginsAction::InspectLegacy => {
             not_supported("inspect-legacy", "legacy detection lands in T25")
         }
         PluginsAction::AdoptLegacy => not_supported("adopt-legacy", "legacy adoption lands in T25"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 管理子命令：全部委托给 PluginService
+// ---------------------------------------------------------------------------
+
+/// `plugins catalog`
+///
+/// 目录渠道的入口是"目录里有什么"。它**不**安装、不启用、不激活任何东西：
+/// 一个查询不该有副作用。
+fn catalog() -> Result<i32> {
+    // 目录内容不是信任凭据：它只说明"官方源上有这么个版本"。真正的授权
+    // 仍来自每一个包的签名。源的认证由"钉死的 https 主机名"提供，故这里
+    // 先校验源配置，再展示条目。
+    if let Err(error) = catalog_origin() {
+        return Ok(report(error));
+    }
+    let catalog = match load_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => return Ok(report(error)),
+    };
+    for entry in &catalog.entries {
+        println!(
+            "{}\t{}\t{}\t{}",
+            entry.release.plugin.as_str(),
+            entry.release.version,
+            entry.release.target,
+            entry.release.sha256
+        );
+    }
+    Ok(0)
+}
+
+/// `plugins list`
+fn list() -> Result<i32> {
+    let service = service()?;
+    let summaries = match service.list() {
+        Ok(summaries) => summaries,
+        Err(error) => return Ok(report(error)),
+    };
+    for summary in summaries {
+        let selected = summary.selected.as_deref().unwrap_or("-");
+        println!(
+            "{}\tselected={selected}\tinstalled=[{}]\tprojects=[{}]",
+            summary.plugin,
+            summary.installed.join(","),
+            summary.projects.join(",")
+        );
+    }
+    Ok(0)
+}
+
+/// `plugins install`
+///
+/// 二选一：官方目录的 release 身份，或本地 `--bundle` + `--metadata`。
+/// 两条路都走**同一个** `PluginService::install_verified_bytes`。
+fn install(release: Option<&str>, bundle: Option<&Path>, metadata: Option<&Path>) -> Result<i32> {
+    let service = service()?;
+    let root = match root_envelope() {
+        Ok(root) => root,
+        Err(error) => return Ok(report(error)),
+    };
+
+    let (Some(bundle), Some(metadata)) = (bundle, metadata) else {
+        if let Some(spec) = release {
+            return install_from_catalog(&service, spec, &root);
+        }
+        eprintln!("error: install needs either --release or both --bundle and --metadata");
+        return Ok(1);
+    };
+
+    match service.install_local(bundle, metadata, &root) {
+        Ok(line) => {
+            println!("{line}");
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// 目录安装：目录给路径，源由宿主钉死。
+///
+/// 发布身份由调用方给出（`plugin@version#sha`），而不是从目录里"猜最近一个"：
+/// 一次安装在身份上是明确的，否则用户点"安装"之后装到的可能不是他看的那条。
+fn install_from_catalog(service: &PluginService, spec: &str, root: &[u8]) -> Result<i32> {
+    let origin = match catalog_origin() {
+        Ok(origin) => origin,
+        Err(error) => return Ok(report(error)),
+    };
+    let release = match parse_release_spec(spec) {
+        Ok(release) => release,
+        Err(error) => return Ok(report(error)),
+    };
+    let catalog = match load_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => return Ok(report(error)),
+    };
+    let entry = match catalog.find(&release) {
+        Some(entry) => entry.clone(),
+        None => {
+            return Ok(report(PluginError::NotFound(format!(
+                "the official catalog has no {} {} for {}",
+                release.plugin.as_str(),
+                release.version,
+                release.target
+            ))));
+        }
+    };
+
+    let mut fetcher = CurlFetcher::default();
+    let limits = yi_agent_plugins::DownloadLimits::default();
+    let mut clock = MonotonicClock::new();
+    match service.install_from_catalog(
+        &entry,
+        &catalog,
+        &origin,
+        &mut fetcher,
+        &limits,
+        &mut clock,
+        root,
+    ) {
+        Ok(line) => {
+            println!("{line}");
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins enable-project`
+fn enable_project(
+    plugin: &str,
+    project: &str,
+    capability: &[String],
+    host_override: Option<&str>,
+) -> Result<i32> {
+    let service = service()?;
+    let plugin_id = plugin_id(plugin)?;
+    let host = match host_override {
+        Some(host) => host.to_string(),
+        None => match service.host_id() {
+            Ok(host) => host,
+            Err(error) => return Ok(report(error)),
+        },
+    };
+    let project = match service.resolve_project(project) {
+        Ok(project) => project,
+        Err(error) => return Ok(report(error)),
+    };
+    let effects = match capabilities(capability) {
+        Ok(effects) => effects,
+        Err(error) => return Ok(report(error)),
+    };
+    match service.enable_project(&plugin_id, project.clone(), &host, &effects) {
+        Ok(generation) => {
+            println!(
+                "enabled {} for {} (generation {generation})",
+                plugin_id.as_str(),
+                project.as_str()
+            );
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins change-grant`
+fn change_grant(
+    plugin: &str,
+    project: &str,
+    capability: &[String],
+    host_override: Option<&str>,
+) -> Result<i32> {
+    let service = service()?;
+    let plugin_id = plugin_id(plugin)?;
+    let host = match host_override {
+        Some(host) => host.to_string(),
+        None => match service.host_id() {
+            Ok(host) => host,
+            Err(error) => return Ok(report(error)),
+        },
+    };
+    let project = match service.resolve_project(project) {
+        Ok(project) => project,
+        Err(error) => return Ok(report(error)),
+    };
+    let effects = match capabilities(capability) {
+        Ok(effects) => effects,
+        Err(error) => return Ok(report(error)),
+    };
+    match service.change_grant(&plugin_id, &project, &host, &effects) {
+        Ok(generation) => {
+            println!(
+                "changed grant for {} in {} (generation {generation})",
+                plugin_id.as_str(),
+                project.as_str()
+            );
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins disable-project`
+fn disable_project(plugin: &str, project: &str) -> Result<i32> {
+    let service = service()?;
+    let plugin_id = plugin_id(plugin)?;
+    let project = match service.resolve_project(project) {
+        Ok(project) => project,
+        Err(error) => return Ok(report(error)),
+    };
+    match service.disable_project(&plugin_id, &project) {
+        Ok(generation) => {
+            println!(
+                "disabled {} for {} (generation {generation})",
+                plugin_id.as_str(),
+                project.as_str()
+            );
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins activate`
+///
+/// 激活是一个**事务**：本命令只建立它。推进需要运行期控制面（停旧版本、
+/// 起候选、健康检查、迁移、提交），那属于 daemon。这里必须明确报告
+/// "尚未推进"，而不是假装激活完成。
+fn activate(plugin: &str, version: &str) -> Result<i32> {
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    match service.activate(&plugin, version) {
+        Ok(activation) => {
+            println!(
+                "started activation transaction {} for {version} (generation {})",
+                activation.transaction, activation.activation
+            );
+            if !activation.advanced {
+                println!(
+                    "note: the transaction is not advanced by this command; the daemon drives \
+                     draining, migration and health checks"
+                );
+            }
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins transaction`
+fn transaction(plugin: &str) -> Result<i32> {
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    match service.transaction(&plugin) {
+        Ok(Some(view)) => {
+            println!(
+                "{}\t{}\t{}\tadmission={}",
+                view.transaction,
+                plugin.as_str(),
+                view.phase,
+                if view.admission_open {
+                    "open"
+                } else {
+                    "closed"
+                }
+            );
+            Ok(0)
+        }
+        Ok(None) => {
+            println!("no open transaction");
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins cancel-transaction`
+///
+/// 真正的回滚动作需要 `RuntimeControl`；这里只做前置判断并如实说明。
+fn cancel_transaction(plugin: &str) -> Result<i32> {
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    match service.cancel_transaction(&plugin) {
+        Ok(outcome) => {
+            eprintln!(
+                "transaction {} is at {} and can be cancelled, but undoing it needs the \
+                 runtime control plane; the daemon performs the rollback",
+                outcome.transaction, outcome.phase
+            );
+            Ok(1)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins rollback`
+fn rollback(plugin: &str) -> Result<i32> {
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    match service.transaction(&plugin) {
+        Ok(Some(view)) if !view.rollbackable => Ok(report(PluginError::RecoveryRequired(format!(
+            "transaction `{}` is at phase {}; rolling back after `projecting` would be a \
+                 second commit, so it must be repaired instead",
+            view.transaction, view.phase
+        )))),
+        Ok(_) => not_supported(
+            "rollback",
+            "needs RuntimeControl to stop the candidate and restore admission; that is the daemon's job",
+        ),
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins uninstall`
+fn uninstall_plugin(plugin: &str, remove_data: bool) -> Result<i32> {
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    match service.uninstall(&plugin, remove_data) {
+        Ok(outcome) => {
+            println!(
+                "uninstalled {} ({} versions, {} grants revoked)",
+                outcome.plugin, outcome.versions_removed, outcome.grants_revoked
+            );
+            for data in &outcome.retained {
+                match &data.path {
+                    Some(path) => println!("kept {} data at {path} — {}", data.project, data.why),
+                    None => println!("kept data for {} — {}", data.project, data.why),
+                }
+            }
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+/// `plugins clear-data`
+///
+/// 独立于卸载的一次显式动作：要 `--yes`，还要点名项目。两样缺一样就不动
+/// 磁盘——"把所有数据都删了"不该是一个可以被顺手敲出来的默认行为。
+fn clear_data(plugin: &str, projects: &[String], yes: bool) -> Result<i32> {
+    if !yes {
+        eprintln!("error: clearing plugin data is irreversible; re-run with --yes to confirm");
+        return Ok(1);
+    }
+    if projects.is_empty() {
+        eprintln!("error: name at least one --project whose plugin data should be deleted");
+        return Ok(1);
+    }
+    let service = service()?;
+    let plugin = plugin_id(plugin)?;
+    let mut outcome = match service.uninstall(&plugin, true) {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(report(error)),
+    };
+    let named: std::collections::BTreeSet<&str> = projects.iter().map(String::as_str).collect();
+    outcome
+        .retained
+        .retain(|data| named.contains(data.project.as_str()));
+    println!(
+        "cleared data for {} in {} project(s)",
+        outcome.plugin,
+        named.len()
+    );
+    Ok(0)
+}
+
+/// `plugins gc`
+fn gc() -> Result<i32> {
+    let service = service()?;
+    match service.gc() {
+        Ok(outcome) => {
+            for path in &outcome.removed {
+                println!("removed {path}");
+            }
+            for kept in &outcome.kept {
+                println!("kept {} — {}", kept.path, kept.why);
+            }
+            if outcome.removed.is_empty() && outcome.kept.is_empty() {
+                println!("nothing to collect");
+            }
+            Ok(0)
+        }
+        Err(error) => Ok(report(error)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 受管执行：留在 CLI 一侧（它要起前台子进程）
+// ---------------------------------------------------------------------------
+
+/// `plugins exec`
+///
+/// argv 在 CLI 层就已经是 `Vec<OsString>`（`trailing_var_arg`），到这里的
+/// 每一步都不经过 shell：空格、中文、分号都只是字符。
+fn exec(
+    plugin: &str,
+    project_handle: &str,
+    binding_file: &Path,
+    argv: &[std::ffi::OsString],
+) -> Result<i32> {
+    let home = instance_home()?;
+    let plugin = plugin_id(plugin)?;
+    let project = ProjectId::parse(project_handle)?;
+
+    let binding = read_binding(binding_file)?;
+    if binding.project != project {
+        return Ok(report(PluginError::PermissionDenied(format!(
+            "binding authorizes project `{}`, not `{project_handle}`",
+            binding.project.as_str()
+        ))));
+    }
+
+    let install = match managed::resolve(&home, &plugin) {
+        Ok(install) => install,
+        Err(error) => return Ok(report(error)),
+    };
+    let table = match grants::load(&home) {
+        Ok(table) => table,
+        Err(error) => return Ok(report(error)),
+    };
+
+    let workdir = home
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| home.clone());
+    // 插件声明的环境项在 v1 清单里没有落点（`manifest-v1.schema.json` 没有
+    // env 字段）。**不能**把宿主自己的 `YI_AGENT_PLUGIN_*` 当成"插件项"传进来：
+    // 那些正是保留变量，会让每次 exec 都被自己的检查拒绝。
+    let plugin_env: Vec<(String, String)> = Vec::new();
+
+    let request = LaunchRequest {
+        mode: managed::LaunchMode::Cli,
+        instance_home: &home,
+        install: &install,
+        binding: &binding,
+        workdir: &workdir,
+        argv,
+        plugin_env: &plugin_env,
+        grants: &table,
+    };
+    let mut command = match managed::prepare(&request) {
+        Ok(command) => command,
+        Err(error) => return Ok(report(error)),
+    };
+
+    // 子进程继承本进程的终端：`exec` 是前台命令，输出必须让用户看见。
+    command.stdout(std::process::Stdio::inherit());
+    command.stderr(std::process::Stdio::inherit());
+    let status = command.status().with_context(|| {
+        format!(
+            "could not launch plugin `{}`",
+            install.manifest.plugin.as_str()
+        )
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// 绑定文件由宿主生成。**不接受页面上传的文件作为授权**：授权来自这里
+/// 读到的绑定，而绑定必须由宿主绑定到当前会话与宿主身份。
+fn read_binding(path: &Path) -> Result<yi_agent_plugins::Binding> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("could not read the binding file {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("binding file {} is not a valid binding", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// 维护屏障查询
+// ---------------------------------------------------------------------------
 
 /// 查询维护屏障。
 ///
@@ -171,237 +635,92 @@ fn maintenance_runtime_dir() -> Result<PathBuf> {
     ))
 }
 
-fn not_supported(method: &str, why: &str) -> Result<i32> {
-    eprintln!("error [NotSupported]: {method} is not implemented yet: {why}");
-    Ok(1)
+// ---------------------------------------------------------------------------
+// 目录渠道的宿主侧输入
+// ---------------------------------------------------------------------------
+
+/// 目录文件的落点。由 `YI_AGENT_PLUGIN_CATALOG` 覆盖（测试与自托管用），
+/// 缺省是实例根下的 `plugins/catalog.json`。
+fn catalog_path() -> PathBuf {
+    match std::env::var_os("YI_AGENT_PLUGIN_CATALOG") {
+        Some(path) => PathBuf::from(path),
+        None => yi_agent_store::paths::instance_home()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("plugins")
+            .join("catalog.json"),
+    }
 }
 
-/// `plugins exec`
-///
-/// argv 在 CLI 层就已经是 `Vec<OsString>`（`trailing_var_arg`），到这里的
-/// 每一步都不经过 shell：空格、中文、分号都只是字符。
-fn exec(
-    plugin: &str,
-    project_handle: &str,
-    binding_file: &Path,
-    argv: &[std::ffi::OsString],
-) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin = plugin_id(plugin)?;
-    let project = project_id(project_handle)?;
-
-    let binding = read_binding(binding_file)?;
-    if binding.project != project {
-        return Ok(report(PluginError::PermissionDenied(format!(
-            "binding authorizes project `{}`, not `{project_handle}`",
-            binding.project.as_str()
-        ))));
-    }
-
-    let install = match managed::resolve(&home, &plugin) {
-        Ok(install) => install,
-        Err(error) => return Ok(report(error)),
-    };
-    let table = match grants::load(&home) {
-        Ok(table) => table,
-        Err(error) => return Ok(report(error)),
-    };
-
-    let workdir = home
-        .parent()
-        .map(|parent| parent.to_path_buf())
-        .unwrap_or_else(|| home.clone());
-    // 插件声明的环境项在 v1 清单里没有落点（`manifest-v1.schema.json` 没有
-    // env 字段）。**不能**把宿主自己的 `YI_AGENT_PLUGIN_*` 当成"插件项"传进来：
-    // 那些正是保留变量，会让每次 exec 都被自己的检查拒绝。
-    let plugin_env: Vec<(String, String)> = Vec::new();
-
-    let request = LaunchRequest {
-        mode: managed::LaunchMode::Cli,
-        instance_home: &home,
-        install: &install,
-        binding: &binding,
-        workdir: &workdir,
-        argv,
-        plugin_env: &plugin_env,
-        grants: &table,
-    };
-    let mut command = match managed::prepare(&request) {
-        Ok(command) => command,
-        Err(error) => return Ok(report(error)),
-    };
-
-    // 子进程继承本进程的终端：`exec` 是前台命令，输出必须让用户看见。
-    command.stdout(std::process::Stdio::inherit());
-    command.stderr(std::process::Stdio::inherit());
-    let status = command.status().with_context(|| {
-        format!(
-            "could not launch plugin `{}`",
-            install.manifest.plugin.as_str()
+/// 官方下载源。**不从目录里读**：目录只能指定路径，不能指定服务器的身份。
+fn catalog_origin() -> Result<yi_agent_plugins::AllowedOrigin, PluginError> {
+    let host = std::env::var("YI_AGENT_PLUGIN_ORIGIN").map_err(|_| {
+        PluginError::NotSupported(
+            "no official plugin origin is configured (set YI_AGENT_PLUGIN_ORIGIN); \
+             refusing to download from an origin nobody vouched for"
+                .to_string(),
         )
     })?;
-    Ok(status.code().unwrap_or(1))
-}
-
-/// 绑定文件由宿主生成。**不接受页面上传的文件作为授权**：授权来自这里
-/// 读到的绑定，而绑定必须由宿主绑定到当前会话与宿主身份。
-fn read_binding(path: &Path) -> Result<yi_agent_plugins::Binding> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("could not read the binding file {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("binding file {} is not a valid binding", path.display()))
-}
-
-/// `plugins list`
-fn list() -> Result<i32> {
-    let home = instance_home()?;
-    let records = match Registry::open(&home) {
-        Ok(registry) => registry.list(),
-        Err(error) => return Ok(report(error)),
-    };
-    let records = match records {
-        Ok(records) => records,
-        Err(error) => return Ok(report(error)),
-    };
-    let table = match grants::load(&home) {
-        Ok(table) => table,
-        Err(error) => return Ok(report(error)),
-    };
-    for record in records {
-        let selected = record.selected.as_deref().unwrap_or("-");
-        let versions = record
-            .installed
-            .iter()
-            .map(|version| version.version.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let authorized: Vec<String> = table
-            .all()
-            .iter()
-            .filter(|grant| grant.plugin == record.plugin.as_str())
-            .map(|grant| grant.project.as_str().to_string())
-            .collect();
-        println!(
-            "{}\tselected={selected}\tinstalled=[{versions}]\tprojects=[{}]",
-            record.plugin.as_str(),
-            authorized.join(",")
-        );
-    }
-    Ok(0)
-}
-
-/// `plugins install`
-///
-/// 二选一：官方目录的 release 身份，或本地 `--bundle` + `--metadata`。
-/// 两条路都走**同一个**验证流程（T07/T08 的 `verify_release` +
-/// `install_verified`）。这里只保留本地那条，因为目录渠道属于 T16。
-fn install(release: Option<&str>, bundle: Option<&Path>, metadata: Option<&Path>) -> Result<i32> {
-    let (Some(bundle), Some(metadata)) = (bundle, metadata) else {
-        if release.is_some() {
-            return not_supported(
-                "install --release",
-                "the official catalog channel ships in T16; use --bundle/--metadata",
-            );
-        }
-        eprintln!("error: install needs either --release or both --bundle and --metadata");
-        return Ok(1);
-    };
-
-    let home = instance_home()?;
-    match install_local(&home, bundle, metadata) {
-        Ok(report) => {
-            println!("{}", report);
-            Ok(0)
-        }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-fn install_local(
-    home: &Path,
-    bundle_path: &Path,
-    metadata_path: &Path,
-) -> Result<String, PluginError> {
-    use yi_agent_plugins::{ExtractLimits, TrustStore, install_verified};
-
-    let archive = std::fs::read(bundle_path)
-        .map_err(|e| PluginError::Io(format!("{}: {e}", bundle_path.display())))?;
-    let metadata = std::fs::read(metadata_path)
-        .map_err(|e| PluginError::Io(format!("{}: {e}", metadata_path.display())))?;
-
-    // 信任根来自仓库随发布附带的 golden 夹具；生产路径由 T16 换成随包分发的根。
-    let root = std::fs::read(root_envelope_path()).map_err(|e| {
-        PluginError::Untrusted(format!(
-            "no trust root available at {}: {e}",
-            root_envelope_path().display()
-        ))
-    })?;
-    let mut store = TrustStore::bootstrap(&root)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let verified = store.verify_release(&metadata, now, 0)?;
-
-    let manifest_bytes = read_manifest_from_archive(&archive)?;
-    let manifest = Manifest::parse(&manifest_bytes)?;
-    if manifest.plugin != verified.release.plugin
-        || manifest.version != verified.release.version
-        || manifest.target != verified.release.target
+    // 只接受一个裸主机名。带 scheme、端口或路径的值会被当成本地/内网源，
+    // 而"官方源"的定义里没有这些形状——一个带端口的源足以把下载引到
+    // 用户自己机器上的某个进程。
+    if host.is_empty()
+        || host.contains(':')
+        || host.contains('/')
+        || host.contains('@')
+        || host.starts_with('-')
     {
-        return Err(PluginError::Integrity(format!(
-            "the package manifest describes {}/{}/{} but the signed metadata is {}/{}/{}",
-            manifest.plugin.as_str(),
-            manifest.version,
-            manifest.target,
-            verified.release.plugin.as_str(),
-            verified.release.version,
-            verified.release.target
+        return Err(PluginError::Untrusted(format!(
+            "`{host}` is not an official plugin origin; expected a bare https host name"
         )));
     }
+    Ok(yi_agent_plugins::AllowedOrigin::official(host))
+}
 
-    let relative = format!(
-        "plugins/installed/{}/{}/{}",
-        manifest.plugin.as_str(),
-        manifest.version,
-        manifest.target
-    );
-    let destination = home.join(&relative);
-    if !destination.exists() {
-        std::fs::create_dir_all(
-            destination
-                .parent()
-                .expect("installation path always has a parent"),
-        )?;
-        install_verified(
-            &verified,
-            &manifest,
-            &archive,
-            &destination,
-            &ExtractLimits::default(),
-        )?;
+/// `plugin@version#sha256`。
+fn parse_release_spec(spec: &str) -> Result<ReleaseId, PluginError> {
+    let (identity, digest) = spec.rsplit_once('#').ok_or_else(|| {
+        PluginError::InvalidManifest(
+            "a release is `plugin@version#sha256`; the digest is not optional".to_string(),
+        )
+    })?;
+    let (plugin, version) = identity.rsplit_once('@').ok_or_else(|| {
+        PluginError::InvalidManifest(
+            "a release is `plugin@version#sha256`; the version is not optional".to_string(),
+        )
+    })?;
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(PluginError::InvalidManifest(format!(
+            "`{digest}` is not a sha256 digest"
+        )));
     }
+    Ok(ReleaseId {
+        plugin: PluginId::parse(plugin)?,
+        version: version.to_string(),
+        target: service::host_target(),
+        sha256: digest.to_ascii_lowercase(),
+    })
+}
 
-    let registry = Registry::open(home)?;
-    let installed_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    registry.record_install(
-        &manifest.plugin,
-        &manifest.version,
-        &verified.release.sha256,
-        &relative,
-        installed_at,
-    )?;
+fn load_catalog() -> Result<yi_agent_plugins::Catalog, PluginError> {
+    let path = catalog_path();
+    let bytes =
+        std::fs::read(&path).map_err(|e| PluginError::Io(format!("{}: {e}", path.display())))?;
+    // `Catalog` 刻意只实现 `Deserialize`（没有签名信封就谈不上"认证"），
+    // 所以解析错误要在这里翻成协议里的错误种类，而不是让 serde 的原文
+    // 漏到线协议上。
+    serde_json::from_slice(&bytes).map_err(|e| {
+        PluginError::InvalidManifest(format!("catalog at {} is not valid: {e}", path.display()))
+    })
+}
 
-    Ok(format!(
-        "installed {} {} ({}) at {}",
-        manifest.plugin.as_str(),
-        manifest.version,
-        manifest.target,
-        relative
-    ))
+fn root_envelope() -> Result<Vec<u8>, PluginError> {
+    let path = root_envelope_path();
+    std::fs::read(&path).map_err(|e| {
+        PluginError::Untrusted(format!(
+            "no trust root available at {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 fn root_envelope_path() -> PathBuf {
@@ -410,435 +729,109 @@ fn root_envelope_path() -> PathBuf {
         .join("plugins/contracts/fixtures/root-v1.json")
 }
 
-/// 从包里读 `plugin.json`。
+/// 用 `curl` 下载：macOS 自带，不引入新的 Rust HTTP 依赖。
 ///
-/// 用插件契约核心的归档读取器而不是自己再解一遍 tar：两次实现迟早会分叉，
-/// 而"宿主按 A 的规则读、安装按 B 的规则写"正是签名验证被绕过的经典形状。
-fn read_manifest_from_archive(archive: &[u8]) -> Result<Vec<u8>, PluginError> {
-    // 1 MiB 对一份清单绰绰有余；给它设界是为了让"包很大"不会变成
-    // "先把整个条目读进内存再说"。
-    yi_agent_plugins::bundle::read_package_file(archive, managed::MANAGED_MANIFEST, 1024 * 1024)
+/// 每次调用都带上无进展超时（`--speed-limit`/`--speed-time`），这样"连接
+/// 活着但不动"会被 curl 自己掐断，而不是永远挂着。重定向被关闭
+/// （`--max-redirs 0`）：`yi_agent_plugins::download` 对每次跳转都要重新
+/// 校验源，让 curl 自己跟就会绕过那一步。
+#[derive(Default)]
+struct CurlFetcher {
+    current: Option<std::io::BufReader<std::process::ChildStdout>>,
 }
 
-/// 有效的能力列表，按 `(plugin, project)` 写入新的授权。
-fn enable_project(
-    plugin: &str,
-    project: &str,
-    capability: &[String],
-    host_override: Option<&str>,
-) -> Result<i32> {
-    let home = instance_home()?;
-    let host = match host_override {
-        Some(host) => host.to_string(),
-        None => host()?,
-    };
-    let plugin_id = plugin_id(plugin)?;
-    let project = resolve_project(project)?;
-    let effects = capabilities(capability)?;
-
-    let release = match Registry::open(&home) {
-        Ok(registry) => registry.list(),
-        Err(error) => return Ok(report(error)),
-    };
-    let selected = match release {
-        Ok(records) => records
-            .into_iter()
-            .find(|record| record.plugin == plugin_id)
-            .and_then(|record| {
-                let selected = record.selected.clone()?;
-                record
-                    .installed
-                    .into_iter()
-                    .find(|version| version.version == selected)
-            }),
-        Err(error) => return Ok(report(error)),
-    };
-    let Some(selected) = selected else {
-        return Ok(report(PluginError::NotFound(format!(
-            "plugin `{plugin}` has no selected version; install one first"
-        ))));
-    };
-    let release = ReleaseId {
-        plugin: plugin_id.clone(),
-        version: selected.version,
-        target: manifest_target(&home, &plugin_id)?,
-        sha256: selected.sha256,
-    };
-
-    let outcome = grants::update(&home, |table| {
-        table
-            .grant(
-                plugin_id.as_str(),
-                project.clone(),
-                &release,
-                &host,
-                &effects,
-            )
-            .map(|grant| grant.generation)
-    });
-    match outcome {
-        Ok(generation) => {
-            println!(
-                "enabled {} for {} (generation {generation})",
-                plugin_id.as_str(),
-                project.as_str()
-            );
-            Ok(0)
+impl yi_agent_plugins::Fetcher for CurlFetcher {
+    fn head(
+        &mut self,
+        url: &yi_agent_plugins::Url,
+    ) -> Result<yi_agent_plugins::ResponseHead, yi_agent_plugins::FetchError> {
+        use yi_agent_plugins::FetchError;
+        let output = std::process::Command::new("curl")
+            .args(["-sS", "--max-redirs", "0", "-I", "--max-time", "30"])
+            .arg(format!("{}://{}{}", url.scheme, url.host, url.path))
+            .output()
+            .map_err(|error| FetchError::Transport(format!("could not run curl: {error}")))?;
+        if !output.status.success() {
+            return Err(FetchError::Transport(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
         }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-/// 变更已有授权：能力集合整体替换，代次递增。
-fn change_grant(
-    plugin: &str,
-    project: &str,
-    capability: &[String],
-    host_override: Option<&str>,
-) -> Result<i32> {
-    // 与 enable-project 的差别只在语义：这里要求授权已存在，避免把一次
-    // 拼错的 "change" 变成沉默的 "首次启用"。
-    let home = instance_home()?;
-    let plugin_id = plugin_id(plugin)?;
-    let project = resolve_project(project)?;
-    let effects = capabilities(capability)?;
-    let host = match host_override {
-        Some(host) => host.to_string(),
-        None => host()?,
-    };
-
-    let existing = match grants::load(&home) {
-        Ok(table) => table.get(plugin_id.as_str(), &project).cloned(),
-        Err(error) => return Ok(report(error)),
-    };
-    let Some(_existing) = existing else {
-        return Ok(report(PluginError::NotFound(format!(
-            "plugin `{plugin}` has no grant for `{}`; use enable-project first",
-            project.as_str()
-        ))));
-    };
-
-    let release = match selected_release(&home, &plugin_id) {
-        Ok(release) => release,
-        Err(error) => return Ok(report(error)),
-    };
-    let outcome = grants::update(&home, |table| {
-        table
-            .grant(
-                plugin_id.as_str(),
-                project.clone(),
-                &release,
-                &host,
-                &effects,
-            )
-            .map(|grant| grant.generation)
-    });
-    match outcome {
-        Ok(generation) => {
-            println!(
-                "changed grant for {} in {} (generation {generation})",
-                plugin_id.as_str(),
-                project.as_str()
-            );
-            Ok(0)
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let mut lines = text.lines();
+        let status_line = lines.next().unwrap_or_default();
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| FetchError::Transport("no status line".to_string()))?;
+        let mut location = None;
+        let mut content_length = None;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            match name.trim().to_ascii_lowercase().as_str() {
+                "location" => location = Some(value.trim().to_string()),
+                "content-length" => content_length = value.trim().parse::<u64>().ok(),
+                _ => {}
+            }
         }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-fn disable_project(plugin: &str, project: &str) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin_id = plugin_id(plugin)?;
-    let project = resolve_project(project)?;
-    let outcome = grants::update(&home, |table| table.revoke(plugin_id.as_str(), &project));
-    match outcome {
-        Ok(generation) => {
-            println!(
-                "disabled {} for {} (generation {generation})",
-                plugin_id.as_str(),
-                project.as_str()
-            );
-            Ok(0)
-        }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-/// 项目规整：路径必须存在，映射到规范路径构成的 `ProjectId`。
-///
-/// 不接受任意字符串当项目 id。设计里项目身份就是规范化路径：允许任意
-/// 字符串会让 `/a/repo` 与 `/a/repo/../repo` 变成两个授权域。
-fn resolve_project(raw: &str) -> Result<ProjectId> {
-    let mut resolver = ProjectResolver::new();
-    let root = resolver
-        .register(Path::new(raw))
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    Ok(root.id)
-}
-
-fn capabilities(raw: &[String]) -> Result<Vec<Effect>> {
-    raw.iter()
-        .map(|value| match value.as_str() {
-            "read" => Ok(Effect::Read),
-            "write" => Ok(Effect::Write),
-            "launch" => Ok(Effect::Launch),
-            "quota-write" => Ok(Effect::QuotaWrite),
-            "resident" => Ok(Effect::Resident),
-            "maintenance" => Err(anyhow::anyhow!(
-                "`maintenance` is issued only by a lifecycle transaction; a plugin may not request it"
-            )),
-            other => Err(anyhow::anyhow!(
-                "unknown capability `{other}`; expected read|write|launch|quota-write|resident"
-            )),
+        Ok(yi_agent_plugins::ResponseHead {
+            status,
+            location,
+            content_length,
         })
+    }
+
+    fn read(&mut self, max_bytes: usize) -> Result<Option<Vec<u8>>, yi_agent_plugins::FetchError> {
+        use std::io::Read;
+        let Some(reader) = self.current.as_mut() else {
+            return Ok(None);
+        };
+        let mut buffer = vec![0u8; max_bytes];
+        match reader.read(&mut buffer) {
+            Ok(0) => Ok(None),
+            Ok(n) => {
+                buffer.truncate(n);
+                Ok(Some(buffer))
+            }
+            Err(error) => Err(yi_agent_plugins::FetchError::Transport(error.to_string())),
+        }
+    }
+}
+
+/// 单调时钟：从构造那一刻起算。
+struct MonotonicClock {
+    started: std::time::Instant,
+}
+
+impl MonotonicClock {
+    fn new() -> MonotonicClock {
+        MonotonicClock {
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl yi_agent_plugins::Clock for MonotonicClock {
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+fn capabilities(raw: &[String]) -> Result<Vec<yi_agent_plugins::Effect>, PluginError> {
+    raw.iter()
+        .map(|value| service::parse_capability(value))
         .collect()
 }
 
-fn manifest_target(home: &Path, plugin: &PluginId) -> Result<String, PluginError> {
-    Ok(selected_release(home, plugin)?.target)
+fn not_supported(method: &str, why: &str) -> Result<i32> {
+    eprintln!("error [NotSupported]: {method} is not implemented yet: {why}");
+    Ok(1)
 }
 
-fn selected_release(home: &Path, plugin: &PluginId) -> Result<ReleaseId, PluginError> {
-    let record = Registry::open(home)?
-        .list()?
-        .into_iter()
-        .find(|record| &record.plugin == plugin)
-        .ok_or_else(|| {
-            PluginError::NotFound(format!("plugin `{}` is not registered", plugin.as_str()))
-        })?;
-    let version = record.selected.clone().ok_or_else(|| {
-        PluginError::NotFound(format!(
-            "plugin `{}` has no selected version",
-            plugin.as_str()
-        ))
-    })?;
-    let installed = record
-        .installed
-        .iter()
-        .find(|installed| installed.version == version)
-        .ok_or_else(|| {
-            PluginError::NotFound(format!(
-                "plugin `{}` selects `{version}` but it is not installed",
-                plugin.as_str()
-            ))
-        })?;
-    // target 取自安装在磁盘上的那份清单，而不是猜。
-    let manifest_path = home
-        .join(&installed.directory)
-        .join(managed::MANAGED_MANIFEST);
-    let bytes = std::fs::read(&manifest_path)
-        .map_err(|e| PluginError::Integrity(format!("{}: {e}", manifest_path.display())))?;
-    let manifest = Manifest::parse(&bytes)?;
-    Ok(ReleaseId {
-        plugin: plugin.clone(),
-        version: installed.version.clone(),
-        target: manifest.target,
-        sha256: installed.sha256.clone(),
-    })
-}
-
-/// 激活一个已安装版本。
-///
-/// 激活是一个**事务**：`Lifecycle::start` 只建立它，推进需要宿主提供
-/// `RuntimeControl`。CLI 没有运行期控制面（那属于 daemon），所以这里
-/// 完成后必须明确报告"事务已建立、尚未推进"，而不是假装激活完成。
-fn activate(plugin: &str, version: &str) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin = plugin_id(plugin)?;
-    let release = match release_for(&home, &plugin, version) {
-        Ok(release) => release,
-        Err(error) => return Ok(report(error)),
-    };
-
-    let lifecycle = match Lifecycle::open(&home) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => return Ok(report(error)),
-    };
-    let previous = match lifecycle.committed(&plugin) {
-        Ok(previous) => previous,
-        Err(error) => return Ok(report(error)),
-    };
-    let activation = previous.map(|active| active.activation + 1).unwrap_or(1);
-
-    let request = LifecycleRequest::activate(plugin.clone(), release, activation);
-    match lifecycle.start(request) {
-        Ok(transaction) => {
-            println!(
-                "started activation transaction {transaction} for {} (generation {activation})",
-                plugin.as_str()
-            );
-            println!(
-                "note: the transaction is not advanced by this command; the daemon drives \
-                 draining, migration and health checks"
-            );
-            Ok(0)
-        }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-fn rollback(plugin: &str) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin = plugin_id(plugin)?;
-    let journal = match yi_agent_plugins::JournalStore::open(&home) {
-        Ok(store) => store.load(&plugin),
-        Err(error) => return Ok(report(error)),
-    };
-    let journal = match journal {
-        Ok(journal) => journal,
-        Err(error) => return Ok(report(error)),
-    };
-    let Some(journal) = journal else {
-        return Ok(report(PluginError::NotFound(format!(
-            "plugin `{}` has no open transaction to roll back",
-            plugin.as_str()
-        ))));
-    };
-    if !journal.phase.rollbackable() {
-        return Ok(report(PluginError::RecoveryRequired(format!(
-            "transaction `{}` is at phase {}; rolling back after `projecting` would be a second \
-             commit, so it must be repaired instead",
-            journal.transaction_id,
-            journal.phase.as_str()
-        ))));
-    }
-    not_supported(
-        "rollback",
-        "needs RuntimeControl to stop the candidate and restore admission; that is the daemon's job",
-    )
-}
-
-fn transaction(plugin: &str) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin = plugin_id(plugin)?;
-    let journal = match yi_agent_plugins::JournalStore::open(&home) {
-        Ok(store) => store.load(&plugin),
-        Err(error) => return Ok(report(error)),
-    };
-    match journal {
-        Ok(Some(journal)) => {
-            println!(
-                "{}\t{}\t{}\tadmission={}",
-                journal.transaction_id,
-                journal.plugin.as_str(),
-                journal.phase.as_str(),
-                if journal.phase.admission_open() {
-                    "open"
-                } else {
-                    "closed"
-                }
-            );
-            Ok(0)
-        }
-        Ok(None) => {
-            println!("no open transaction");
-            Ok(0)
-        }
-        Err(error) => Ok(report(error)),
-    }
-}
-
-fn cancel_transaction(plugin: &str) -> Result<i32> {
-    let home = instance_home()?;
-    let plugin = plugin_id(plugin)?;
-    let journal = match yi_agent_plugins::JournalStore::open(&home) {
-        Ok(store) => store.load(&plugin),
-        Err(error) => return Ok(report(error)),
-    };
-    let journal = match journal {
-        Ok(journal) => journal,
-        Err(error) => return Ok(report(error)),
-    };
-    let Some(journal) = journal else {
-        return Ok(report(PluginError::NotFound(format!(
-            "plugin `{}` has no open transaction",
-            plugin.as_str()
-        ))));
-    };
-    if !journal.phase.rollbackable() {
-        return Ok(report(PluginError::RecoveryRequired(format!(
-            "transaction `{}` is at phase {}, past the point where a cancel is safe",
-            journal.transaction_id,
-            journal.phase.as_str()
-        ))));
-    }
-    not_supported(
-        "cancel-transaction",
-        "cancelling restores the previous activation through RuntimeControl; that is the daemon's job",
-    )
-}
-
-fn release_for(home: &Path, plugin: &PluginId, version: &str) -> Result<ReleaseId, PluginError> {
-    let record = Registry::open(home)?
-        .list()?
-        .into_iter()
-        .find(|record| &record.plugin == plugin)
-        .ok_or_else(|| {
-            PluginError::NotFound(format!("plugin `{}` is not registered", plugin.as_str()))
-        })?;
-    let installed = record
-        .installed
-        .iter()
-        .find(|installed| installed.version == version)
-        .ok_or_else(|| {
-            PluginError::NotFound(format!(
-                "plugin `{}` has no installed version `{version}`",
-                plugin.as_str()
-            ))
-        })?;
-    let manifest_path = home
-        .join(&installed.directory)
-        .join(managed::MANAGED_MANIFEST);
-    let bytes = std::fs::read(&manifest_path)
-        .map_err(|e| PluginError::Integrity(format!("{}: {e}", manifest_path.display())))?;
-    let manifest = Manifest::parse(&bytes)?;
-    Ok(ReleaseId {
-        plugin: plugin.clone(),
-        version: installed.version.clone(),
-        target: manifest.target,
-        sha256: installed.sha256.clone(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capabilities_reject_maintenance() {
-        // Maintenance 只由生命周期事务签发。CLI 若能直接授予它，管理面就
-        // 多了一条"自己给自己开维护能力"的旁路。
-        let error = capabilities(&["maintenance".to_string()])
-            .expect_err("a plugin may not request maintenance");
-        assert!(error.to_string().contains("lifecycle transaction"));
-    }
-
-    #[test]
-    fn an_unknown_capability_is_rejected_rather_than_ignored() {
-        let error = capabilities(&["read".to_string(), "everything".to_string()])
-            .expect_err("an unknown capability must not be silently dropped");
-        assert!(error.to_string().contains("unknown capability"));
-    }
-
-    #[test]
-    fn capabilities_map_to_the_declared_effects() {
-        let effects = capabilities(&[
-            "read".to_string(),
-            "write".to_string(),
-            "launch".to_string(),
-            "quota-write".to_string(),
-            "resident".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(
-            effects,
-            vec![
-                Effect::Read,
-                Effect::Write,
-                Effect::Launch,
-                Effect::QuotaWrite,
-                Effect::Resident
-            ]
-        );
-    }
-}
+use yi_agent_plugins::ProjectId;

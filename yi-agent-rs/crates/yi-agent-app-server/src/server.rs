@@ -7765,6 +7765,9 @@ mod resident_rpc_tests;
 mod plugin_query_tests;
 
 #[cfg(test)]
+mod plugin_management_tests;
+
+#[cfg(test)]
 mod plugins_tests;
 
 #[cfg(test)]

@@ -10,5 +10,8 @@ pub mod manifest;
 pub mod refresh;
 pub mod supervisor;
 pub mod switch;
+pub mod uninstall;
 pub mod watch;
 pub mod watchman;
+
+pub use uninstall::{GcOutcome, KeptArtifact, RetainedData, UninstallOutcome};

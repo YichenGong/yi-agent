@@ -766,3 +766,42 @@ fn a_bad_schema_version_is_incompatible_not_ignored() {
 #[allow(dead_code)]
 #[derive(Default)]
 struct UnusedCell(RefCell<u32>);
+
+/// 两个独立客户端（CLI 与 RPC）打开同一个实例，必须看到同一个事务、同一阶段。
+///
+/// 这条用例防的是"把事务状态放在进程内存里"那类实现：它在一个进程内自洽，
+/// 但在 CLI 与 RPC 同时操作时会各自拥有一个事务，两边对"现在到哪了"给出
+/// 不同答案，而它们**都**会去推进同一个插件目录。
+#[test]
+fn two_independent_clients_see_the_same_transaction_and_phase() {
+    let home = temp_home();
+    install("1.4.0", &home);
+
+    // 客户端 A 开启事务，并推进到 drain。
+    let client_a = Lifecycle::open(&home).expect("client A");
+    let id = client_a.start(request(&["demo"])).expect("start");
+    let runtime = RecordingRuntime::new();
+    let after_a = client_a.advance(&id, &runtime).expect("A advances");
+
+    // 客户端 B 是另一个 `Lifecycle`，不共享任何内存状态。
+    let client_b = Lifecycle::open(&home).expect("client B");
+    let after_b = client_b
+        .advance(&id, &runtime)
+        .expect("B must be able to advance the transaction A opened");
+
+    // B 接着 A 的位置往前走，而不是新建一个事务从头来：阶段严格递增。
+    assert!(
+        after_b.phase != after_a.phase,
+        "client B saw {:?} after client A reached {:?}; B either restarted the \
+         transaction or could not see A's journal",
+        after_b.phase,
+        after_a.phase
+    );
+
+    // A 现在再看，也必须看见 B 推进的结果——journal 是唯一事实来源。
+    let observed_by_a = client_a.observe(&id).expect("A observes");
+    assert_eq!(
+        observed_by_a.phase, after_b.phase,
+        "client A still sees its own stale phase after client B advanced"
+    );
+}

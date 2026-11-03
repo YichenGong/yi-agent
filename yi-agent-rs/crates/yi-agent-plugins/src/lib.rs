@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod bundle;
+pub mod catalog;
 pub mod error;
 pub mod grants;
 pub mod journal;
@@ -25,6 +26,10 @@ pub mod types;
 
 pub use admission::{Admission, Phase, TurnPermit};
 pub use bundle::{InstalledRelease, install_verified, verify_installed};
+pub use catalog::{
+    AllowedOrigin, Catalog, CatalogEntry, Clock, DownloadLimits, DownloadOutcome, DownloadRequest,
+    FetchError, Fetcher, ResponseHead, Url, download,
+};
 pub use error::PluginError;
 pub use grants::{Grant, GrantTable};
 pub use journal::{
