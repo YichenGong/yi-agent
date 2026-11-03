@@ -100,3 +100,12 @@
 - [x] 回收只列死 owner — 判据：`reclaimable_lists_only_dead_owners`、`reclaimable_is_empty_when_every_owner_is_alive`
 - [x] 项目键投影防撞名 — 可读前缀 + sha256 摘要；`/p/a/b` 与 `/p/a_b`、`a-b` 与 `a_b` 不共用锁文件。判据：`two_projects_whose_keys_sanitise_to_the_same_file_still_get_different_locks`、`project_keys_that_differ_only_in_separators_do_not_collide`
 - [x] 瞬时 fork 窗口不被当成"别人占着" — `fork` 与 `exec` 之间子进程与父进程共享打开文件描述，刚释放的锁短暂仍被持有。`acquire` 做 250ms 有界重试，仍必须真拿到 flock（不抢占）。判据：`a_free_project_is_acquired_even_when_a_fork_window_temporarily_holds_the_lock`
+- [x] 受管启动只走宿主入口，清单自述不能决定程序路径 — `yi-agent-supervisors/src/managed.rs` 的 `ManagedGuard`/`prepare`；`Supervisor::with_managed` 装配后 `spawn` 经 `managed_command()` 改道。判据：`a_managed_manifest_is_started_through_the_host_entrypoint`、`a_legacy_manifest_cannot_override_the_managed_launcher`
+- [x] 无授权不启动且不回退清单命令 — 拒绝时两个标记文件都不出现（回退会让"被拒绝的启动"变成"成功的启动"）。判据：`the_guard_itself_refuses_a_launch_without_a_grant`、`a_managed_manifest_without_a_grant_is_not_started_at_all`
+- [x] 常驻后端按 `Launch` 而非 CLI verb 判定效果 — `LaunchMode::{Cli,Resident}`。拿常驻 argv 查 verb 会拒掉所有后端；默认成 `Read` 又会让只读授权拉起会写数据的进程。判据：`capabilities_map_to_the_declared_effects`、`a_managed_manifest_is_started_through_the_host_entrypoint`
+- [x] 维护期间后端必须停且不重启 — 闸门判在"是否已在运行"之前，每次对账重读。判据：`maintenance_keeps_the_backend_stopped`、`a_corrupt_journal_stops_a_backend_that_is_already_running`
+- [x] 闸门判据只来自磁盘，通知丢失不放行 — `MaintenanceBarrier` 每次读日志；`unknown` 不等于 `open`。判据：`a_transaction_on_disk_closes_the_barrier_without_any_notification`、`an_unreadable_journal_answers_unknown_and_never_open`
+- [x] 旧协议对端被明确拒绝并指明升级哪一侧 — 不得把"不支持"读成"没在维护"。判据：`an_old_client_is_refused_and_told_which_side_to_upgrade`、`an_old_peer_is_reported_by_name_not_as_a_bare_failure`
+- [x] 管理端崩溃后屏障仍然关闭 — `kill -9` daemon 再重启，结论须仍为 `closed`。判据：`killing_the_managing_side_does_not_open_the_barrier`
+- [x] 受管清单不从自身 `command` 刷新 — 旧快照能把受管入口改写成任意可执行文件。判据：`a_managed_manifest_is_not_refreshed_from_its_own_command`
+- [x] 一份坏日志不连累其它插件 — `JournalStore::at` 不预扫全目录。判据：`one_broken_journal_does_not_hide_another_plugins_state`
