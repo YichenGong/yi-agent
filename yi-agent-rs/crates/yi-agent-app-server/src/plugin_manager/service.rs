@@ -72,6 +72,18 @@ pub struct InstalledSummary {
     pub installed: Vec<String>,
     /// 已授权的项目 id。
     pub projects: Vec<String>,
+    /// 上次卸载没清干净的项目。非空 = 这个插件的"卸载"还没真正完成。
+    ///
+    /// 读不出来就当没有：一条读不出的待清理记录不该让整个列表失败，那样
+    /// 用户连"装了什么"都看不到。真正的证据仍在盘上。
+    pub pending_cleanup: Vec<PendingCleanupSummary>,
+}
+
+/// 一条待清理记录在列表里的形状。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCleanupSummary {
+    pub project: String,
+    pub remaining: Vec<String>,
 }
 
 /// 管理服务。只持有实例根，其余状态都在磁盘上。
@@ -95,6 +107,9 @@ impl PluginService {
     pub fn list(&self) -> Result<Vec<InstalledSummary>, PluginError> {
         let records = Registry::open(&self.home)?.list()?;
         let table = grants::load(&self.home)?;
+        let pending = yi_agent_supervisors::pending::PendingCleanup::open(&self.home)
+            .list()
+            .unwrap_or_default();
         Ok(records
             .into_iter()
             .map(|record| InstalledSummary {
@@ -111,6 +126,14 @@ impl PluginService {
                     .map(|grant| grant.project.as_str().to_string())
                     .collect(),
                 plugin: record.plugin.as_str().to_string(),
+                pending_cleanup: pending
+                    .iter()
+                    .filter(|entry| entry.plugin == record.plugin)
+                    .map(|entry| PendingCleanupSummary {
+                        project: entry.project.clone(),
+                        remaining: entry.remaining.clone(),
+                    })
+                    .collect(),
             })
             .collect())
     }
@@ -480,6 +503,18 @@ impl PluginService {
         remove_data: bool,
     ) -> Result<managed_uninstall::UninstallOutcome, PluginError> {
         managed_uninstall::uninstall(&self.home, plugin, remove_data)
+    }
+
+    /// 清掉点名项目里的插件数据。
+    ///
+    /// 与 [`PluginService::uninstall`] 的区别只有两处：数据确实要删，且只删
+    /// 被点名的项目。范围必须显式给出——"全删"不该是一个可以被省略的默认值。
+    pub fn clear_data(
+        &self,
+        plugin: &PluginId,
+        projects: &[String],
+    ) -> Result<managed_uninstall::UninstallOutcome, PluginError> {
+        managed_uninstall::uninstall_scoped(&self.home, plugin, true, Some(projects))
     }
 
     /// 只清理引用安全的受管产物。

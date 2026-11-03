@@ -193,3 +193,182 @@ fn plugin_data_dir_requires_an_absolute_project_path() {
 fn _binding_shape_is_available(binding: Binding) -> ReleaseId {
     binding.release
 }
+
+/// 卸载必须摘掉 supervisor 清单与开关：否则"卸载"之后程序仍会被重新拉起。
+#[test]
+fn uninstall_removes_the_supervisor_manifest_and_switch() {
+    let project = setup();
+    let (home, _) = installed_home(project.path(), &["1.0.0"]);
+
+    // 装一个带 legacy.switch_key 的清单，再手工造出宿主入口。
+    let installed = home
+        .path()
+        .join("plugins/installed/demo/1.0.0/aarch64-apple-darwin");
+    std::fs::write(
+        installed.join("plugin.json"),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "packageFormat": 1,
+            "plugin": "demo",
+            "version": "1.0.0",
+            "target": "darwin-aarch64",
+            "views": [{ "id": "main", "kind": "main", "entry": "ui/dist/index.html", "digest": "a".repeat(64) }],
+            "program": null,
+            "skills": [],
+            "methods": [{ "name": "demo/advance", "effect": "Write" }],
+            "cli": [],
+            "capabilities": { "required": ["Read"], "optional": [] },
+            "dependencies": { "workflows": [] },
+            "data": {
+                "format": 1,
+                "migrations": [],
+                "legacy": { "switchKey": "demo_feature" }
+            },
+            "compatibility": { "hostApi": "v1", "uiApi": "v1" },
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+
+    let supervisors = project.path().join(".yi-agent/supervisors");
+    std::fs::create_dir_all(&supervisors).expect("supervisors");
+    let manifest = supervisors.join("demo.json");
+    std::fs::write(&manifest, b"{}").expect("supervisor manifest");
+    let preferences = project.path().join(".yi-agent/preferences.json");
+    std::fs::write(&preferences, r#"{"demo_feature":true,"other":true}"#).expect("prefs");
+
+    let outcome = uninstall(home.path(), &plugin(), false).expect("uninstall");
+
+    assert!(
+        !manifest.exists(),
+        "a leftover supervisor manifest restarts the program after uninstall"
+    );
+    // 只删自己的键，别人的偏好原样保留。
+    let prefs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&preferences).unwrap()).unwrap();
+    assert!(prefs.get("demo_feature").is_none(), "{prefs}");
+    assert_eq!(prefs["other"], serde_json::Value::Bool(true), "{prefs}");
+    assert!(outcome.pending.is_empty(), "{:?}", outcome.pending);
+}
+
+/// 项目不可达时报"待清理"，不能宣称卸载干净。
+#[test]
+fn an_unreachable_project_is_reported_as_pending_instead_of_clean() {
+    let project = setup();
+    let (home, _) = installed_home(project.path(), &["1.0.0"]);
+
+    // 授权指向一个已经不存在的目录（U 盘拔了、网络盘断了）。
+    let missing = project.path().join("gone");
+    let project_id = ProjectId::parse(&missing.display().to_string()).expect("project id");
+    grants::update(home.path(), |table| {
+        table
+            .grant(
+                plugin().as_str(),
+                project_id,
+                &release("1.0.0"),
+                "host-test",
+                &[Effect::Read],
+            )
+            .map(|_| ())
+    })
+    .expect("grant");
+
+    let outcome = uninstall(home.path(), &plugin(), false).expect("uninstall");
+
+    let pending = outcome
+        .pending
+        .iter()
+        .find(|entry| entry.project == missing.display().to_string())
+        .expect("the unreachable project must be pending");
+    assert!(
+        pending
+            .remaining
+            .iter()
+            .any(|line| line.contains("not reachable")),
+        "{pending:?}"
+    );
+}
+
+/// clearData 只删点名的项目；没点名的数据留在盘上。
+#[test]
+fn clear_data_deletes_only_the_named_projects() {
+    let first = setup();
+    let second = setup();
+    let (home, _) = installed_home(first.path(), &["1.0.0"]);
+
+    let second_id = ProjectId::parse(&second.path().display().to_string()).expect("project id");
+    grants::update(home.path(), |table| {
+        table
+            .grant(
+                plugin().as_str(),
+                second_id,
+                &release("1.0.0"),
+                "host-test",
+                &[Effect::Read],
+            )
+            .map(|_| ())
+    })
+    .expect("grant");
+
+    let first_data = first.path().join(".yi-agent/plugins/demo");
+    let second_data = second.path().join(".yi-agent/plugins/demo");
+    for dir in [&first_data, &second_data] {
+        std::fs::create_dir_all(dir).expect("data dir");
+        std::fs::write(dir.join("cards.json"), b"[]").expect("cards");
+    }
+
+    let named = vec![first.path().display().to_string()];
+    uninstall_scoped(home.path(), &plugin(), true, Some(&named)).expect("clear");
+
+    assert!(
+        !first_data.exists(),
+        "the named project's data must be gone"
+    );
+    assert!(
+        second_data.exists(),
+        "an unnamed project's data must survive: clearing is scoped, not global"
+    );
+}
+
+/// 点名一个没有授权的项目要拒绝，而不是静默什么都不删。
+#[test]
+fn clear_data_refuses_a_project_that_was_never_authorised() {
+    let project = setup();
+    let (home, _) = installed_home(project.path(), &["1.0.0"]);
+    let stray = vec!["/definitely/not/authorised".to_string()];
+
+    let error =
+        uninstall_scoped(home.path(), &plugin(), true, Some(&stray)).expect_err("unlisted project");
+    assert!(matches!(error, PluginError::NotFound(_)), "{error:?}");
+}
+
+/// 卸载不删共享资源：别的插件还在用的版本目录与其它键的偏好都留着。
+#[test]
+fn uninstall_leaves_shared_resources_alone() {
+    let project = setup();
+    let (home, _) = installed_home(project.path(), &["1.0.0"]);
+
+    // 另一个插件的版本目录。
+    let other = home
+        .path()
+        .join("plugins/installed/other/1.0.0/aarch64-apple-darwin");
+    std::fs::create_dir_all(&other).expect("other version");
+
+    let preferences = project.path().join(".yi-agent/preferences.json");
+    std::fs::create_dir_all(preferences.parent().unwrap()).expect("state dir");
+    std::fs::write(&preferences, r#"{"other_feature":true}"#).expect("prefs");
+
+    uninstall(home.path(), &plugin(), false).expect("uninstall");
+
+    assert!(
+        other.exists(),
+        "another plugin's version dir is not ours to remove"
+    );
+    let prefs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&preferences).unwrap()).unwrap();
+    assert_eq!(
+        prefs["other_feature"],
+        serde_json::Value::Bool(true),
+        "{prefs}"
+    );
+}

@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod install;
 pub mod managed;
 pub mod manifest;
+pub mod pending;
 pub mod refresh;
 pub mod supervisor;
 pub mod switch;

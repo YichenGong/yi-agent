@@ -12,10 +12,12 @@ import {
   stateAllowsWrite,
   stateLabel,
   stateRendersView,
+  uninstallPlugin,
   type CapabilityChoice,
   type LegacyFinding,
   type LegacyReport,
   type ManagedPluginRow,
+  type PendingCleanup,
   type PluginState,
 } from "../hooks/usePlugins";
 
@@ -64,6 +66,8 @@ export function PluginCatalog({ call, project, onOpenView, declarations = {}, tr
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // 卸载后仍有宿主入口留在盘上的项目。非空就显示"待清理"，不说"已卸载"。
+  const [pending, setPending] = useState<PendingCleanup[]>([]);
 
   useEffect(() => {
     if (!call) {
@@ -173,6 +177,21 @@ export function PluginCatalog({ call, project, onOpenView, declarations = {}, tr
               if (!call || !project) return;
               void act(row.plugin, () => disableProject(call, { plugin: row.plugin, project }));
             }}
+            onUninstall={
+              call
+                ? () =>
+                    void act(row.plugin, async () => {
+                      const report = await uninstallPlugin(call, row.plugin);
+                      // 有残留就不能说"已卸载"：留下的 supervisor 清单会在
+                      // 项目重新可达后再把程序拉起来。
+                      setPending(report.pending);
+                      if (report.pending.length > 0) {
+                        throw new Error(`卸载未完成，${report.pending.length} 个项目待清理`);
+                      }
+                    })
+                : undefined
+            }
+            pending={pending}
           />
         </section>
       ))}
@@ -410,6 +429,8 @@ function StateBody({
   onChangeGrant,
   onDisable,
   onOpenView,
+  onUninstall,
+  pending,
 }: {
   row: Row;
   project?: string;
@@ -418,6 +439,9 @@ function StateBody({
   onChangeGrant: (granted: string[]) => void;
   onDisable: () => void;
   onOpenView?: (plugin: string, view: string) => void;
+  onUninstall?: () => void;
+  /** 上一次卸载留下的待清理项目；只属于当前行。 */
+  pending?: PendingCleanup[];
 }) {
   const choice = useCapabilityChoice(row, row.state.kind === "read-only" ? ["Read"] : row.required, row.state);
 
@@ -487,7 +511,18 @@ function StateBody({
             >
               停用
             </button>
+            {onUninstall && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onUninstall}
+                className="rounded border border-line px-3 py-1 text-xs"
+              >
+                卸载
+              </button>
+            )}
           </div>
+          <PendingNotice pending={pending} />
         </div>
       );
 
@@ -522,8 +557,19 @@ function StateBody({
             >
               停用
             </button>
+            {onUninstall && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onUninstall}
+                className="rounded border border-line px-3 py-1 text-xs"
+              >
+                卸载
+              </button>
+            )}
           </div>
           {!stateAllowsWrite(row.state) && <p className="text-xs text-amber-500">当前授权不允许写入。</p>}
+          <PendingNotice pending={pending} />
         </div>
       );
 
@@ -536,14 +582,27 @@ function StateBody({
           <p className="text-xs text-fg-subtle">
             故障期间不执行自动任务。可以停用后重新启用，或在日志里定位原因。
           </p>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onDisable}
-            className="rounded border border-line px-3 py-1 text-xs"
-          >
-            停用
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onDisable}
+              className="rounded border border-line px-3 py-1 text-xs"
+            >
+              停用
+            </button>
+            {onUninstall && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onUninstall}
+                className="rounded border border-line px-3 py-1 text-xs"
+              >
+                卸载
+              </button>
+            )}
+          </div>
+          <PendingNotice pending={pending} />
         </div>
       );
 
@@ -575,6 +634,7 @@ function StateBody({
           <p className="text-xs text-fg-subtle">
             项目不可达时不会宣称卸载完成。记录会保留到能确认清理为止。
           </p>
+          <PendingNotice pending={pending} />
         </div>
       );
   }
@@ -638,4 +698,31 @@ function dedupe(values: string[]): string[] {
 /** 供测试与调用方复用：把一次选择收敛成请求体。 */
 export function grantRequest(choice: CapabilityChoice): { capabilities: string[] } {
   return { capabilities: dedupe(choice.granted) };
+}
+
+/**
+ * 卸载后仍有残留时的提示。
+ *
+ * 单独一块而不是塞进一句 `notice`：用户需要看到**哪个项目**、**剩了什么**。
+ * 只有"卸载失败"四个字会让人重试一次，然后以为已经好了。
+ */
+function PendingNotice({ pending }: { pending?: PendingCleanup[] }) {
+  if (!pending || pending.length === 0) return null;
+  return (
+    <div role="alert" className="space-y-1">
+      <p className="text-xs text-amber-500">
+        还有 {pending.length} 个项目没有清干净，插件可能在这些项目里再次启动：
+      </p>
+      {pending.map((entry) => (
+        <div key={entry.project} className="rounded border border-line px-2 py-1">
+          <p className="font-mono text-[11px] text-fg-subtle">{entry.project}</p>
+          {entry.remaining.map((line) => (
+            <p key={line} className="text-xs text-fg-muted">
+              {line}
+            </p>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
 }

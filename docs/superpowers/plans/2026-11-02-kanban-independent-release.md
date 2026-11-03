@@ -786,11 +786,15 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 停用/卸载复用 Admission 和 Lifecycle，不另造一套杀进程逻辑。GC 输入受管引用清单，保护旧会话可读 skill、事务、备份、活进程与其他实例共享资源。
 
-- [ ] Step 1：活动回合卸载必须等待/允许用户显式取消，用户拒绝时恢复旧状态；停止写准入后新任务不能穿过。
-- [ ] Step 2：测试默认保留数据、显式 clear 列明项目范围、项目不可达留下 pending cleanup、其他插件常驻引用保留、共享配额不删除、卸载后旧 supervisor 不启动。
-- [ ] Step 3：实现按引用清理、可见空间占用与手工清理入口；保留数据清单不是运行授权。重装只在明确选择项目、校验格式后重新接管，不自动恢复过去授权。
-- [ ] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test uninstall && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test gc`；UI 回归停用/待清理与错误提示。
-- [ ] Step 5：按 C 提交 `feat: uninstall managed plugins without deleting user data`。
+- [x] Step 1：活动回合卸载必须等待/允许用户显式取消，用户拒绝时恢复旧状态；停止写准入后新任务不能穿过。
+  （复用 `Admission::begin_drain`/`cancel_drain`：卸载走同一道闸门，不另造杀进程逻辑；拒绝取消时旧状态原样恢复。）
+- [x] Step 2：测试默认保留数据、显式 clear 列明项目范围、项目不可达留下 pending cleanup、其他插件常驻引用保留、共享配额不删除、卸载后旧 supervisor 不启动。
+  （`yi-agent-supervisors/src/uninstall/tests.rs`：`uninstall_keeps_user_data_by_default_and_lists_it`、`clear_data_deletes_only_the_named_projects`、`an_unreachable_project_is_reported_as_pending_instead_of_clean`、`uninstall_leaves_shared_resources_alone`、`uninstall_removes_the_supervisor_manifest_and_switch`；RPC 侧 `plugin_management_tests.rs` 两条。）
+- [x] Step 3：实现按引用清理、可见空间占用与手工清理入口；保留数据清单不是运行授权。重装只在明确选择项目、校验格式后重新接管，不自动恢复过去授权。
+  （`uninstall.rs::gc` 逐版本查激活/授权/备份三条引用；`uninstall_scoped` 只删点名项目；`pending.rs` 让"待清理"跨重启存活；重装走 `install` + `adopt`/`enableProject` 两条显式步骤。）
+- [x] Step 4：`cd yi-agent-rs && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test uninstall && cargo test --manifest-path "$R/yi-agent-rs/Cargo.toml" -p yi-agent-plugins --test gc`；UI 回归停用/待清理与错误提示。
+  （卸载契约测试落在 `yi-agent-supervisors`（读写注册表 + 授权表的那一层）；`PluginCatalog` 新增卸载入口与待清理提示，15 条组件测试、UI 全量 2094 通过。）
+- [x] Step 5：按 C 提交 `feat: uninstall managed plugins without deleting user data`。
 
 ### Task T25：移除宿主看板专属路径并验收独立发布
 

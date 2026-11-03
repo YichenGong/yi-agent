@@ -39,6 +39,23 @@ pub struct UninstallOutcome {
     pub grants_revoked: usize,
     /// **保留**的数据，按项目列出。空表示没有需要保留的。
     pub retained: Vec<RetainedData>,
+    /// 没清干净的残留，按项目列出。
+    ///
+    /// 有内容就**不是**一次完全卸载：可能是项目目录此刻不可达（U 盘拔了、
+    /// 网络盘断了），也可能是删某个文件失败。设计 §12 要求这时保留「待清理」
+    /// 记录并给出可见错误，而不是宣称卸载成功——否则残留的 supervisor 清单
+    /// 会在项目重新可达后把程序再拉起来，而用户以为自己已经卸掉了。
+    #[serde(default)]
+    pub pending: Vec<PendingCleanup>,
+}
+
+/// 一个没能清干净的项目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingCleanup {
+    pub project: String,
+    /// 逐条说明还剩什么、为什么没删掉。
+    pub remaining: Vec<String>,
 }
 
 /// 卸载后仍然留在磁盘上的用户数据。
@@ -76,12 +93,27 @@ pub fn uninstall(
     plugin: &PluginId,
     remove_data: bool,
 ) -> Result<UninstallOutcome, PluginError> {
+    uninstall_scoped(instance_home, plugin, remove_data, None)
+}
+
+/// 同 [`uninstall`]，但可以限定"只清这些项目的数据"。
+///
+/// `remove_data` + `Some(projects)` 才是 `clearData` 的正确形状：用户点名了
+/// 哪几个项目，就只删哪几个。把所有授权项目一起删掉，再拿名单去过滤**输出**，
+/// 是一句"看起来只删了点名的"——盘上的数据已经没了。
+pub fn uninstall_scoped(
+    instance_home: &Path,
+    plugin: &PluginId,
+    remove_data: bool,
+    scope: Option<&[String]>,
+) -> Result<UninstallOutcome, PluginError> {
     // 生命周期锁：卸载与"另一个实例正在激活/回滚"必须互斥。否则一个刚被
     // 卸载的版本可能在同一时刻被写回激活记录，留下指向不存在目录的激活。
     let _lifecycle = locks::acquire(
         &instance_home.join("plugins").join("lifecycle.lock"),
         Duration::from_secs(30),
     )?;
+    let pending_table = crate::pending::PendingCleanup::open(instance_home);
 
     let registry = Registry::open(instance_home)?;
     let record = registry
@@ -132,9 +164,29 @@ pub fn uninstall(
         revoked += 1;
     }
 
-    // 数据目录：只有显式要求才删。
+    // 数据目录：只有显式要求才删，且只删被点名的项目。
     if remove_data {
-        for project in &projects {
+        let targets: Vec<&String> = match scope {
+            Some(named) => {
+                // 点名了但不在授权项目里：直接拒绝。静默忽略会让用户以为删了。
+                let known: BTreeSet<&str> = projects.iter().map(String::as_str).collect();
+                let unknown: Vec<&str> = named
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| !known.contains(name))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(PluginError::NotFound(format!(
+                        "these projects are not authorised for `{}`: {}",
+                        plugin.as_str(),
+                        unknown.join(", ")
+                    )));
+                }
+                named.iter().collect()
+            }
+            None => projects.iter().collect(),
+        };
+        for project in targets {
             if let Some(dir) = plugin_data_dir(plugin, project) {
                 if dir.exists() {
                     std::fs::remove_dir_all(&dir).map_err(|error| {
@@ -142,6 +194,59 @@ pub fn uninstall(
                     })?;
                 }
             }
+        }
+    }
+
+    // 项目级宿主入口：supervisor 清单、开关、日志。
+    //
+    // 删清单就是「让 supervisor 不再拉起它」的那一下，所以这一步必须在最后
+    // ——它之前的任何失败都还允许项目继续使用插件。漏掉这一步的后果不是
+    // "留了个文件"，而是**卸载之后程序仍会被重新启动**。
+    //
+    // 项目不可达时不能当成功：这里把每个项目的结果收集起来，有残留就返回
+    // `pending`，让上层显示"待清理"而不是"已卸载"。
+    let mut pending = Vec::new();
+    for project in &projects {
+        let root = Path::new(project);
+        if !root.is_dir() {
+            pending.push(PendingCleanup {
+                project: project.clone(),
+                remaining: vec![
+                    "the project directory is not reachable, so its supervisor manifest and \
+                     switch are still on disk; the plugin would start again if it comes back"
+                        .to_string(),
+                ],
+            });
+            continue;
+        }
+        // 开关键由插件清单声明。读不到就只删清单——不要猜一个键名去删别人的偏好。
+        let switch_key = plugin_switch_key(instance_home, plugin, &record);
+        let remaining = match switch_key {
+            Some(key) => crate::install::uninstall_manifest_for(root, plugin.as_str(), &key),
+            None => {
+                let mut failures = Vec::new();
+                if let Err(error) = crate::install::remove_manifest(root, plugin.as_str()) {
+                    failures.push(format!("could not remove the supervisor manifest: {error}"));
+                }
+                failures
+            }
+        };
+        if !remaining.is_empty() {
+            // 落盘：只在返回值里说"还有残留"等于内存中的歉意，进程一重启就
+            // 没了，而项目里的清单还在。记录留着，用户下次还能看到它。
+            pending_table.record(crate::pending::PendingCleanupRecord {
+                plugin: plugin.clone(),
+                project: project.clone(),
+                remaining: remaining.clone(),
+                recorded_at: unix_now(),
+            })?;
+            pending.push(PendingCleanup {
+                project: project.clone(),
+                remaining,
+            });
+        } else {
+            // 这个项目清干净了：旧记录（如果有）该消失。
+            pending_table.clear(plugin, Some(project))?;
         }
     }
 
@@ -153,7 +258,35 @@ pub fn uninstall(
         versions_removed,
         grants_revoked: revoked,
         retained,
+        pending,
     })
+}
+
+/// 从**已安装且已验签**的那份清单里读 `switch_key`。
+///
+/// 不猜：一个猜出来的键名会被写进共享的 `preferences.json`，删掉的可能是
+/// 另一个功能的开关。读不到就返回 `None`，调用方只删清单。
+fn plugin_switch_key(
+    instance_home: &Path,
+    plugin: &PluginId,
+    record: &yi_agent_plugins::PluginRecord,
+) -> Option<String> {
+    let version = record.selected.clone()?;
+    let installed = record
+        .installed
+        .iter()
+        .find(|installed| installed.version == version)?;
+    let path = instance_home
+        .join(&installed.directory)
+        .join(crate::managed::MANAGED_MANIFEST);
+    let bytes = std::fs::read(&path).ok()?;
+    let manifest = yi_agent_plugins::Manifest::parse(&bytes).ok()?;
+    // 目录里那份清单必须确实是这个插件的：装错目录、或注册表与磁盘不同步时，
+    // 拿别人的 switch_key 去删共享偏好会关掉另一个功能。
+    if &manifest.plugin != plugin {
+        return None;
+    }
+    manifest.data.legacy.and_then(|legacy| legacy.switch_key)
 }
 
 /// 只清理引用安全的受管版本目录。
@@ -236,6 +369,13 @@ pub fn gc(instance_home: &Path) -> Result<GcOutcome, PluginError> {
     }
 
     Ok(outcome)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 一个插件在某项目下的数据目录。

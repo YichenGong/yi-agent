@@ -348,16 +348,19 @@ fn adopt_legacy(
 
 /// 支持的能力名 → `Effect`。未知名字报错，不静默丢弃。
 fn effect_from_name(name: &str) -> Result<yi_agent_plugins::Effect, PluginError> {
+    // 接受两种拼写：协议里的 `quota-write`（与清单一致，小写 kebab）与
+    // Rust 变体名 `QuotaWrite`（UI 从清单里读到的就是这个名字）。同一个
+    // `capabilities` 字段在不同入口要求不同写法，是最容易让用户踩空的地方。
     Ok(match name {
-        "Read" => yi_agent_plugins::Effect::Read,
-        "Write" => yi_agent_plugins::Effect::Write,
-        "Launch" => yi_agent_plugins::Effect::Launch,
-        "QuotaWrite" => yi_agent_plugins::Effect::QuotaWrite,
-        "Resident" => yi_agent_plugins::Effect::Resident,
-        "Maintenance" => yi_agent_plugins::Effect::Maintenance,
+        "read" | "Read" => yi_agent_plugins::Effect::Read,
+        "write" | "Write" => yi_agent_plugins::Effect::Write,
+        "launch" | "Launch" => yi_agent_plugins::Effect::Launch,
+        "quota-write" | "QuotaWrite" => yi_agent_plugins::Effect::QuotaWrite,
+        "resident" | "Resident" => yi_agent_plugins::Effect::Resident,
+        "maintenance" | "Maintenance" => yi_agent_plugins::Effect::Maintenance,
         other => {
             return Err(PluginError::Conflict(format!(
-                "unknown capability `{other}`"
+                "unknown capability `{other}`; expected read|write|launch|quota-write|resident"
             )));
         }
     })
@@ -576,6 +579,13 @@ fn list(service: &PluginService) -> Result<Value, PluginError> {
                 "selected": summary.selected,
                 "installed": summary.installed,
                 "projects": summary.projects,
+                // 重启之后也要能看见：只在卸载的返回值里报"待清理"，
+                // 进程一重启就没人知道还有残留了。
+                "pendingCleanup": summary
+                    .pending_cleanup
+                    .iter()
+                    .map(|entry| json!({ "project": entry.project, "remaining": entry.remaining }))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -744,6 +754,13 @@ fn uninstall(service: &PluginService, params: &Value) -> Result<Value, PluginErr
             .iter()
             .map(|data| json!({ "project": data.project, "path": data.path, "why": data.why }))
             .collect::<Vec<_>>(),
+        // 空 = 真的清干净了。非空 = 还有宿主入口留在盘上，界面必须显示
+        // "待清理"而不是"已卸载"——那些残留会在项目重新可达后再拉起程序。
+        "pending": outcome
+            .pending
+            .iter()
+            .map(|entry| json!({ "project": entry.project, "remaining": entry.remaining }))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -778,12 +795,18 @@ fn clear_data(service: &PluginService, params: &Value) -> Result<Value, PluginEr
         ));
     }
     let plugin = plugin_arg(params)?;
-    let mut outcome = service.uninstall(&plugin, true)?;
-    let named: std::collections::BTreeSet<&str> = projects.iter().map(String::as_str).collect();
-    outcome
-        .retained
-        .retain(|data| named.contains(data.project.as_str()));
-    Ok(json!({ "plugin": outcome.plugin, "projects": projects }))
+    // 名字必须传下去：先按全部授权项目删一遍再过滤输出，等于"看起来只删了
+    // 点名的"，而盘上的其它项目数据已经没了。
+    let outcome = service.clear_data(&plugin, &projects)?;
+    Ok(json!({
+        "plugin": outcome.plugin,
+        "projects": projects,
+        "pending": outcome
+            .pending
+            .iter()
+            .map(|entry| json!({ "project": entry.project, "remaining": entry.remaining }))
+            .collect::<Vec<_>>(),
+    }))
 }
 
 fn gc(service: &PluginService) -> Result<Value, PluginError> {

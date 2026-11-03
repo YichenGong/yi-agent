@@ -213,7 +213,7 @@ async fn adopting_a_legacy_install_backs_up_and_grants() {
     let params = json!({
         "plugin": "example-counter",
         "project": project.path().to_string_lossy(),
-        "capabilities": ["Read", "Write"],
+        "capabilities": ["read", "write"],
     })
     .to_string();
     let resp = call(&mut h, 2, "plugins/v1/adoptLegacy", &params).await;
@@ -306,7 +306,7 @@ async fn adopting_while_the_legacy_process_is_alive_reports_busy() {
     let params = json!({
         "plugin": "example-counter",
         "project": project.path().to_string_lossy(),
-        "capabilities": ["Read", "Write"],
+        "capabilities": ["read", "write"],
     })
     .to_string();
     let resp = call(&mut h, 2, "plugins/v1/adoptLegacy", &params).await;
@@ -323,6 +323,133 @@ async fn adopting_while_the_legacy_process_is_alive_reports_busy() {
         resp["result"]["plugins"][0]["projects"],
         json!([]),
         "{resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 卸载默认保留数据，并且**摘掉宿主入口**：留下的 supervisor 清单会在项目
+/// 下次可达时把程序再拉起来。
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstalling_keeps_data_but_removes_the_host_entry_points() {
+    let mut h = Harness::with_scope(Scope::Admin).await;
+    initialize(&mut h).await;
+
+    let fixture = crate::plugin_manager::service::tests_support::Fixture::build();
+    let params = json!({
+        "bundlePath": fixture.bundle().to_string_lossy(),
+        "metadataPath": fixture.metadata().to_string_lossy(),
+    })
+    .to_string();
+    let resp = call(&mut h, 1, "plugins/v1/install", &params).await;
+    assert!(resp.get("error").is_none(), "install must succeed: {resp}");
+
+    // 项目里既有插件数据，也有一个旧式 supervisor 清单。
+    let project = tempfile::tempdir().expect("project");
+    let data = project.path().join(".yi-agent/plugins/example-counter");
+    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::write(data.join("counter.json"), b"{\"n\":1}").expect("data");
+    let supervisors = project.path().join(".yi-agent/supervisors");
+    std::fs::create_dir_all(&supervisors).expect("supervisors");
+    let manifest = supervisors.join("example-counter.json");
+    std::fs::write(&manifest, b"{}").expect("supervisor manifest");
+
+    let params = json!({
+        "plugin": "example-counter",
+        "project": project.path().to_string_lossy(),
+        "capabilities": ["read", "write"],
+    })
+    .to_string();
+    let resp = call(&mut h, 2, "plugins/v1/enableProject", &params).await;
+    assert!(resp.get("error").is_none(), "enable must succeed: {resp}");
+
+    let resp = call(
+        &mut h,
+        3,
+        "plugins/v1/uninstall",
+        &json!({ "plugin": "example-counter" }).to_string(),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "uninstall must succeed: {resp}"
+    );
+    assert_eq!(resp["result"]["versionsRemoved"], json!(1), "{resp}");
+    assert_eq!(resp["result"]["pending"], json!([]), "{resp}");
+
+    assert!(data.exists(), "uninstall must keep user data by default");
+    assert!(
+        !manifest.exists(),
+        "a leftover supervisor manifest restarts the plugin after uninstall"
+    );
+    h.shutdown().await;
+}
+
+/// `clearData` 只删点名的项目：没点名的一个字节都不动。
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_data_is_scoped_to_the_named_projects() {
+    let mut h = Harness::with_scope(Scope::Admin).await;
+    initialize(&mut h).await;
+
+    let fixture = crate::plugin_manager::service::tests_support::Fixture::build();
+    let params = json!({
+        "bundlePath": fixture.bundle().to_string_lossy(),
+        "metadataPath": fixture.metadata().to_string_lossy(),
+    })
+    .to_string();
+    let resp = call(&mut h, 1, "plugins/v1/install", &params).await;
+    assert!(resp.get("error").is_none(), "install must succeed: {resp}");
+
+    let first = tempfile::tempdir().expect("first project");
+    let second = tempfile::tempdir().expect("second project");
+    // 授权表存的是**规范化后的项目句柄**，不是原始路径。要把句柄记下来，
+    // 因为 clearData 点名的是它。
+    let mut handles = Vec::new();
+    for project in [&first, &second] {
+        let data = project.path().join(".yi-agent/plugins/example-counter");
+        std::fs::create_dir_all(&data).expect("data dir");
+        std::fs::write(data.join("counter.json"), b"{\"n\":1}").expect("data");
+        let params = json!({
+            "plugin": "example-counter",
+            "project": project.path().to_string_lossy(),
+            "capabilities": ["read", "write"],
+        })
+        .to_string();
+        let id = if project.path() == first.path() { 2 } else { 3 };
+        let resp = call(&mut h, id, "plugins/v1/enableProject", &params).await;
+        assert!(resp.get("error").is_none(), "enable must succeed: {resp}");
+        handles.push(
+            resp["result"]["project"]
+                .as_str()
+                .expect("handle")
+                .to_string(),
+        );
+    }
+
+    let params = json!({
+        "plugin": "example-counter",
+        "projects": [handles[0].clone()],
+        "confirm": true,
+    })
+    .to_string();
+    let resp = call(&mut h, 4, "plugins/v1/clearData", &params).await;
+    assert!(
+        resp.get("error").is_none(),
+        "clearData must succeed: {resp}"
+    );
+
+    assert!(
+        !first
+            .path()
+            .join(".yi-agent/plugins/example-counter")
+            .exists(),
+        "the named project's data must be gone"
+    );
+    assert!(
+        second
+            .path()
+            .join(".yi-agent/plugins/example-counter")
+            .exists(),
+        "an unnamed project's data must survive: clearing is scoped, not global"
     );
     h.shutdown().await;
 }

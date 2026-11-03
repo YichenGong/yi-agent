@@ -267,3 +267,57 @@ describe("PluginCatalog legacy adoption", () => {
     ]);
   });
 });
+
+describe("PluginCatalog uninstall", () => {
+  /** 一个"装了、且当前项目已授权"的实例，用来露出卸载入口。 */
+  function installedRpc(calls: Array<[string, unknown]>, uninstall: unknown) {
+    return rpc((method, params) => {
+      calls.push([method, params]);
+      if (method === "plugins/v1/list") return rowsPlugin(["ph1_aaaa"], ["1.0.0"]);
+      if (method === "plugins/v1/uninstall") return uninstall;
+      if (method === "plugins/v1/transaction") return { phase: "idle", granted: ["Read", "Write"] };
+      return {};
+    });
+  }
+
+  it("uninstalls without asking to delete data", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(
+      <PluginCatalog
+        call={installedRpc(calls, { versionsRemoved: 1, grantsRevoked: 1, retained: [], pending: [] })}
+        project="ph1_aaaa"
+        declarations={declarations}
+      />,
+    );
+
+    fireEvent.click(await screen.findByText("卸载"));
+
+    await waitFor(() => {
+      const call = calls.find(([method]) => method === "plugins/v1/uninstall");
+      // 数据默认保留：删数据是另一个显式动作，不该被顺带做掉。
+      expect(call?.[1]).toEqual({ plugin: "example-counter", removeData: false });
+    });
+  });
+
+  it("reports the projects that still need cleanup instead of claiming success", async () => {
+    const calls: Array<[string, unknown]> = [];
+    render(
+      <PluginCatalog
+        call={installedRpc(calls, {
+          versionsRemoved: 1,
+          grantsRevoked: 1,
+          retained: [],
+          pending: [{ project: "/mnt/usb/proj", remaining: ["the project directory is not reachable"] }],
+        })}
+        project="ph1_aaaa"
+        declarations={declarations}
+      />,
+    );
+
+    fireEvent.click(await screen.findByText("卸载"));
+
+    expect(await screen.findByText("/mnt/usb/proj")).toBeTruthy();
+    expect(screen.getByText(/还有 1 个项目没有清干净/)).toBeTruthy();
+    expect(screen.getByText("the project directory is not reachable")).toBeTruthy();
+  });
+});

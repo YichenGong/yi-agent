@@ -16,11 +16,23 @@ function row(overrides: Partial<ManagedPluginRow> = {}): ManagedPluginRow {
     selected: "1.0.0",
     installed: ["1.0.0"],
     projects: [],
+    pendingCleanup: [],
     ...overrides,
   };
 }
 
 describe("state derivation keeps every case distinct", () => {
+  // 待清理记录来自磁盘：重启后界面仍要显示它。只在卸载的返回值里报一次，
+  // 等于重启之后没人知道还有残留。
+  it("reads a persisted pending cleanup from the row itself", () => {
+    const state = deriveState(
+      row({ pendingCleanup: [{ project: "/mnt/usb/proj", remaining: ["manifest still on disk"] }] }),
+      { project: "ph1_aaaa" },
+    );
+    expect(state.kind).toBe("pending-cleanup");
+    expect(stateLabel(state)).toBe("待清理");
+  });
+
   it("reports not-installed before looking at grants", () => {
     const state = deriveState(row({ installed: [], selected: null }), { project: "ph1_aaaa" });
     expect(state.kind).toBe("not-installed");

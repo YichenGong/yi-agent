@@ -28,6 +28,8 @@ export interface ManagedPluginRow {
   installed: string[];
   /** 已授权的项目句柄。 */
   projects: string[];
+  /** 上次卸载没清干净的项目。非空 = "卸载"其实还没完成。 */
+  pendingCleanup: PendingCleanup[];
 }
 
 export type PluginState =
@@ -74,12 +76,18 @@ export function deriveState(row: ManagedPluginRow, options: PluginCatalogOptions
   }
   const version = row.selected ?? row.installed[row.installed.length - 1] ?? null;
 
-  if (options.health?.phase === "pending-cleanup") {
+  // 盘上记录的待清理优先于内存里的健康快照：记录能跨重启存活，快照不能。
+  const pending = options.health?.phase === "pending-cleanup"
+    ? { project: options.health.project ?? project, detail: options.health.detail }
+    : row.pendingCleanup?.[0]
+      ? { project: row.pendingCleanup[0].project, detail: row.pendingCleanup[0].remaining.join("；") }
+      : null;
+  if (pending) {
     return {
       kind: "pending-cleanup",
       plugin: row.plugin,
-      project: options.health.project ?? project,
-      detail: options.health.detail ?? "项目不可达，卸载未完成",
+      project: pending.project,
+      detail: pending.detail ?? "项目不可达，卸载未完成",
     };
   }
 
@@ -172,6 +180,17 @@ export async function loadManagedPlugins(call: RpcCall): Promise<ManagedPluginRo
       projects: Array.isArray(row.projects)
         ? row.projects.filter((project): project is string => typeof project === "string")
         : [],
+      pendingCleanup: Array.isArray(row.pendingCleanup)
+        ? row.pendingCleanup
+            .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+            .filter((entry) => typeof entry.project === "string")
+            .map((entry) => ({
+              project: entry.project as string,
+              remaining: Array.isArray(entry.remaining)
+                ? entry.remaining.filter((line): line is string => typeof line === "string")
+                : [],
+            }))
+        : [],
     }));
 }
 
@@ -214,6 +233,75 @@ export async function disableProject(
   params: { plugin: string; project: string },
 ): Promise<void> {
   await call(RPC.pluginsV1DisableProject, { plugin: params.plugin, project: params.project });
+}
+
+/** 一个没清干净的项目。与宿主 `PendingCleanup` 的 serde 表示一致。 */
+export interface PendingCleanup {
+  project: string;
+  remaining: string[];
+}
+
+export interface UninstallReport {
+  plugin: string;
+  versionsRemoved: number;
+  grantsRevoked: number;
+  retained: Array<{ project: string; path?: string; why: string }>;
+  /** 空 = 真的清干净了。非空 = 还有宿主入口留在盘上。 */
+  pending: PendingCleanup[];
+}
+
+/**
+ * 卸载一个插件。**默认保留项目数据**。
+ *
+ * 删数据是另一个方法（[`clearData`]），因为它是不可逆的，而且要用户点名
+ * 项目。把两者合成一个 `deleteData` 布尔，迟早会有人在自动流程里传 `true`。
+ */
+export async function uninstallPlugin(call: RpcCall, plugin: string): Promise<UninstallReport> {
+  const result = await call<Record<string, unknown>>(RPC.pluginsV1Uninstall, {
+    plugin,
+    removeData: false,
+  });
+  return readUninstallReport(plugin, result);
+}
+
+/**
+ * 清掉点名项目里的插件数据。**不可逆**，所以必须显式 `confirm`。
+ *
+ * 项目名必须由用户逐个点名：宿主只删名单上的项目，名单外的一个字节都不动。
+ */
+export async function clearData(
+  call: RpcCall,
+  params: { plugin: string; projects: string[] },
+): Promise<UninstallReport> {
+  const result = await call<Record<string, unknown>>(RPC.pluginsV1ClearData, {
+    plugin: params.plugin,
+    projects: params.projects,
+    confirm: true,
+  });
+  return readUninstallReport(params.plugin, result);
+}
+
+function readUninstallReport(plugin: string, result: Record<string, unknown> | undefined): UninstallReport {
+  const pending = Array.isArray(result?.pending)
+    ? result.pending
+        .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+        .filter((entry) => typeof entry.project === "string")
+        .map((entry) => ({
+          project: entry.project as string,
+          remaining: Array.isArray(entry.remaining)
+            ? entry.remaining.filter((line): line is string => typeof line === "string")
+            : [],
+        }))
+    : [];
+  return {
+    plugin,
+    versionsRemoved: typeof result?.versionsRemoved === "number" ? result.versionsRemoved : 0,
+    grantsRevoked: typeof result?.grantsRevoked === "number" ? result.grantsRevoked : 0,
+    retained: Array.isArray(result?.retained)
+      ? (result.retained as UninstallReport["retained"])
+      : [],
+    pending,
+  };
 }
 
 export async function readTransaction(call: RpcCall, plugin: string): Promise<TransactionSnapshot> {
