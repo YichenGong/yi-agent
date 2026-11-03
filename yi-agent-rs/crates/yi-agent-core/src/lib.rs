@@ -7,6 +7,7 @@ pub mod managed_run;
 pub mod message;
 pub mod permission;
 pub mod provider;
+pub mod run_budget;
 pub mod side_context;
 pub mod subagent;
 pub(crate) mod system_prompt;
@@ -31,6 +32,10 @@ pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role, Thinkin
 pub use provider::{
     ApiStyle, GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderNotice,
     ProviderRequest, ProviderResponse, ReasoningKind, StopReason, StreamEnd, TokenUsage,
+};
+pub use run_budget::{
+    BudgetExceeded, BudgetLease, RunBudget, SideHistorySize, measure_message_size,
+    measure_messages, measure_side_history,
 };
 pub use side_context::{
     SIDE_BOUNDARY, SIDE_SYSTEM_POLICY, SideContextError, SideContextSnapshot, side_system_prompt,

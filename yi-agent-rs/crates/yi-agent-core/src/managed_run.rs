@@ -138,18 +138,38 @@ impl QueueBudget {
         })
     }
 
+    /// Capacity available to ordinary (non-terminal) events.
+    ///
+    /// A terminal event (`Done`/`Error`/`Cancelled`) is the only signal that a
+    /// run ended, so one slot and one maximum-size event are kept out of the
+    /// body's reach. Without this, a full queue would swallow the very event
+    /// that tells the consumer to stop (spec §7.1).
+    /// Largest single event this queue accepts.
+    pub(crate) fn max_event_bytes(&self) -> usize {
+        self.limits.max_event_bytes
+    }
+
+    fn body_limits(&self) -> ManagedRunLimits {
+        let mut limits = self.limits;
+        limits.event_count = limits.event_count.saturating_sub(1);
+        limits.event_bytes = limits.event_bytes.saturating_sub(limits.max_event_bytes);
+        limits
+    }
+
     fn fits(state: &QueueState, limits: &ManagedRunLimits, bytes: usize) -> bool {
         state.items < limits.event_count && state.bytes.saturating_add(bytes) <= limits.event_bytes
     }
 
     /// Wait until the queue has room for one more event of `bytes`.
     ///
-    /// Cancellation wins over waiting: a stopped run must not park here.
+    /// Cancellation wins over waiting: a stopped run must not park here. Body
+    /// events may not consume the terminal headroom.
     pub(crate) async fn reserve(
         self: &Arc<Self>,
         bytes: usize,
         cancel: &CancellationToken,
     ) -> Result<QueueLease, QueueFull> {
+        let body = self.body_limits();
         loop {
             // Register the waiter before re-checking: otherwise a release that
             // lands between the check and `notified()` would be missed and this
@@ -159,7 +179,7 @@ impl QueueBudget {
             notified.as_mut().enable();
             {
                 let mut state = self.state.lock().unwrap();
-                if Self::fits(&state, &self.limits, bytes) {
+                if Self::fits(&state, &body, bytes) {
                     state.items += 1;
                     state.bytes += bytes;
                     return Ok(QueueLease {
@@ -176,9 +196,30 @@ impl QueueBudget {
     }
 
     /// Non-blocking reservation: `None` means the queue has no room right now.
+    ///
+    /// Body events honour the terminal headroom; only
+    /// [`Self::try_reserve_terminal`] may spend it.
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<QueueLease> {
+        let body = self.body_limits();
         let mut state = self.state.lock().unwrap();
-        if Self::fits(&state, &self.limits, bytes) {
+        if Self::fits(&state, &body, bytes) {
+            state.items += 1;
+            state.bytes += bytes;
+            return Some(QueueLease {
+                budget: Arc::clone(self),
+                bytes,
+            });
+        }
+        None
+    }
+
+    /// Reserve from the full queue, including the headroom kept for a terminal
+    /// event. Used only for `Done`/`Error`/`Cancelled`.
+    pub(crate) fn try_reserve_terminal(self: &Arc<Self>, bytes: usize) -> Option<QueueLease> {
+        let mut state = self.state.lock().unwrap();
+        let fits = state.items < self.limits.event_count
+            && state.bytes.saturating_add(bytes) <= self.limits.event_bytes;
+        if fits {
             state.items += 1;
             state.bytes += bytes;
             return Some(QueueLease {
@@ -225,38 +266,97 @@ impl Drop for QueueLease {
     }
 }
 
-/// Cheap size estimate for queue accounting.
+/// What one queued event costs the *queue*.
 ///
-/// Strings dominate an event's footprint; fixed per-variant overhead plus the
-/// string lengths is enough to bound the queue without serializing every delta.
-pub(crate) fn approximate_event_bytes(event: &AgentEvent) -> usize {
+/// Splittable text is bounded by [`split_event_for_queue`] and charged its
+/// length. A payload-carrying event (tool call/result, thinking block) travels
+/// as an `Arc` and its body is charged to the run's payload budget instead, so
+/// the queue only pays for the handle — never for a second copy of a 64 MiB
+/// image or a large tool result (spec §7.1).
+pub(crate) fn queue_event_bytes(event: &AgentEvent) -> usize {
     const OVERHEAD: usize = 64;
-    let payload = match event {
+    const HANDLE: usize = 64;
+    match event {
         AgentEvent::AssistantText(text)
         | AgentEvent::DecodeDelta(text)
         | AgentEvent::ReasoningDelta { text, .. }
-        | AgentEvent::Notice { text, .. } => text.len(),
-        AgentEvent::ThinkingBlock { text, token } => text.len() + format!("{token:?}").len(),
-        AgentEvent::ToolCall { name, input, .. } => name.len() + input.to_string().len(),
-        AgentEvent::ToolResult { result, .. } => result.content.iter().map(block_bytes).sum(),
-        AgentEvent::ToolOutputDelta { text, .. } => text.len(),
-        AgentEvent::Error(error) => format!("{error}").len(),
-        _ => 0,
-    };
-    OVERHEAD + payload
+        | AgentEvent::Notice { text, .. }
+        | AgentEvent::ToolOutputDelta { text, .. } => OVERHEAD + text.len(),
+        // Payload-carrying: the body is already charged to the payload budget.
+        AgentEvent::ThinkingBlock { .. }
+        | AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. } => OVERHEAD + HANDLE,
+        AgentEvent::Error(error) => OVERHEAD + error.to_string().len(),
+        _ => OVERHEAD,
+    }
 }
 
-fn block_bytes(block: &crate::message::ContentBlock) -> usize {
-    match block {
-        crate::message::ContentBlock::Text(text) => text.len(),
-        crate::message::ContentBlock::ToolUse { name, input, .. } => {
-            name.len() + input.to_string().len()
+/// Split one event so that no queued event exceeds `max_bytes`.
+///
+/// Only text-carrying deltas are splittable; they are pure display fragments
+/// that consumers concatenate, so splitting is transparent. Splits never land
+/// inside a UTF-8 sequence. A credential, tool argument or tool result is *not*
+/// splittable and is returned unchanged: it travels as a shared handle instead
+/// of being copied into the queue.
+pub(crate) fn split_event_for_queue(event: AgentEvent, max_bytes: usize) -> Vec<AgentEvent> {
+    let max = max_bytes.saturating_sub(64).max(1);
+    match event {
+        AgentEvent::AssistantText(text) if text.len() > max => split_utf8(&text, max)
+            .into_iter()
+            .map(AgentEvent::AssistantText)
+            .collect(),
+        AgentEvent::DecodeDelta(text) if text.len() > max => split_utf8(&text, max)
+            .into_iter()
+            .map(AgentEvent::DecodeDelta)
+            .collect(),
+        AgentEvent::ToolOutputDelta { id, stream, text } if text.len() > max => {
+            split_utf8(&text, max)
+                .into_iter()
+                .map(|chunk| AgentEvent::ToolOutputDelta {
+                    id: id.clone(),
+                    stream,
+                    text: chunk,
+                })
+                .collect()
         }
-        crate::message::ContentBlock::ToolResult { content, .. } => {
-            content.iter().map(block_bytes).sum()
-        }
-        other => format!("{other:?}").len(),
+        other => vec![other],
     }
+}
+
+/// Split `text` into chunks of at most `max` bytes on char boundaries.
+pub(crate) fn split_utf8(text: &str, max: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + max).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // `max` is smaller than one character; take the whole character so
+            // the loop always advances.
+            end = start
+                + text[start..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// Whether this event is the run's terminal signal.
+pub(crate) fn is_terminal_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Done { .. } | AgentEvent::Error(_) | AgentEvent::Cancelled
+    )
 }
 
 /// A tracked run: its event stream and the ownership of the real task tree.
@@ -386,6 +486,101 @@ impl Drop for ManagedRunControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_event(len: usize) -> AgentEvent {
+        AgentEvent::AssistantText("x".repeat(len))
+    }
+
+    #[test]
+    fn side_terminal_events_are_recognised() {
+        assert!(is_terminal_event(&AgentEvent::Done {
+            reason: crate::agent::DoneReason::EndTurn
+        }));
+        assert!(is_terminal_event(&AgentEvent::Cancelled));
+        assert!(!is_terminal_event(&text_event(1)));
+    }
+
+    #[test]
+    fn side_queue_reserves_headroom_for_the_terminal_event() {
+        let limits = ManagedRunLimits::side_defaults();
+        let budget = QueueBudget::new(ManagedRunLimits {
+            event_count: 2,
+            event_bytes: 1024 + limits.max_event_bytes,
+            ..limits
+        });
+        // Body events may only use one slot and 1 KiB: the second slot and one
+        // maximum-size event stay free.
+        let _first = budget.try_reserve(1024).expect("first body event fits");
+        assert!(
+            budget.try_reserve(1).is_none(),
+            "the last slot and one max event must stay reserved for the terminal"
+        );
+        // The terminal event still fits, which is what makes it observable.
+        assert!(budget.try_reserve_terminal(1024).is_some());
+    }
+
+    #[test]
+    fn side_text_event_splitting_never_breaks_utf8() {
+        let event = text_event(4096);
+        let parts = split_event_for_queue(event, 512);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(queue_event_bytes(part) <= 512);
+        }
+
+        // Multi-byte characters must not be cut in half.
+        let cjk = AgentEvent::AssistantText("中".repeat(200));
+        let parts = split_event_for_queue(cjk, 512);
+        let joined: String = parts
+            .iter()
+            .map(|part| match part {
+                AgentEvent::AssistantText(text) => text.as_str(),
+                _ => panic!("unexpected variant"),
+            })
+            .collect();
+        assert_eq!(joined, "中".repeat(200));
+        for part in &parts {
+            if let AgentEvent::AssistantText(text) = part {
+                assert!(text.len() <= 512 - 64 || text.chars().count() == 1);
+            }
+        }
+    }
+
+    #[test]
+    fn side_credentials_are_never_split_into_the_queue() {
+        // A thinking credential is not a display fragment: splitting it would
+        // corrupt the value the provider must verify.
+        let event = AgentEvent::ThinkingBlock {
+            text: String::new(),
+            token: crate::message::ThinkingToken::Signature("s".repeat(4096)),
+        };
+        let parts = split_event_for_queue(event, 512);
+        assert_eq!(parts.len(), 1);
+        // Only the handle is charged to the queue, not the credential body:
+        // the payload budget owns those bytes.
+        assert!(queue_event_bytes(&parts[0]) <= 512);
+    }
+
+    #[test]
+    fn side_queue_size_estimate_does_not_copy_payloads() {
+        // A 1 MiB inline image is measured by its handle, so the estimate stays
+        // tiny; formatting it into a debug string would have allocated 1 MiB.
+        let event = AgentEvent::ToolResult {
+            id: "t".into(),
+            result: crate::tool::ToolResult {
+                content: vec![crate::message::ContentBlock::Image {
+                    source: crate::message::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "A".repeat(1024 * 1024),
+                    },
+                    detail: crate::message::ImageDetail::High,
+                    path: None,
+                }],
+                is_error: false,
+            },
+        };
+        assert!(queue_event_bytes(&event) < 256);
+    }
 
     #[test]
     fn side_defaults_match_the_design_constraints() {

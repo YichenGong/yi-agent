@@ -242,12 +242,35 @@ pub enum StreamEnd {
 /// hanging forever when the provider connection goes silent without a proper
 /// terminal event.
 pub async fn accumulate_stream<F>(
-    mut stream: BoxStream<'static, ProviderEvent>,
-    mut on_event: F,
+    stream: BoxStream<'static, ProviderEvent>,
+    on_event: F,
     idle_timeout: Option<std::time::Duration>,
 ) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), ProviderError>
 where
     F: FnMut(ProviderEvent),
+{
+    accumulate_stream_guarded(stream, on_event, idle_timeout, |_| true).await
+}
+
+/// The reason a guarded accumulation stopped early.
+pub const BUDGET_EXHAUSTED: &str = "side production budget exhausted";
+
+/// [`accumulate_stream`] with a production-side admission check.
+///
+/// `admit(bytes)` is called **before** a fragment is appended to the in-flight
+/// buffers (assistant text, tool-call JSON), so a side run cannot grow its
+/// accumulation area without bound (spec §5.3, §7.1). When `admit` returns
+/// `false` the stream breaks immediately and the partial content is *not*
+/// returned as a valid result: the caller must not commit it to the session.
+pub async fn accumulate_stream_guarded<F, G>(
+    mut stream: BoxStream<'static, ProviderEvent>,
+    mut on_event: F,
+    idle_timeout: Option<std::time::Duration>,
+    mut admit: G,
+) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), ProviderError>
+where
+    F: FnMut(ProviderEvent),
+    G: FnMut(usize) -> bool,
 {
     let mut content = Vec::new();
     let mut current_text = String::new();
@@ -286,6 +309,13 @@ where
         event_count += 1;
         match event {
             ProviderEvent::TextDelta(s) => {
+                // Reserve before appending: the budget must refuse the bytes
+                // before they exist in the accumulator, not after.
+                if !admit(s.len()) {
+                    end = StreamEnd::Failed(ProviderError::Stream(BUDGET_EXHAUSTED.into()));
+                    transport_failed = true;
+                    break false;
+                }
                 current_text.push_str(&s);
                 on_event(ProviderEvent::TextDelta(s));
             }
@@ -309,8 +339,15 @@ where
                 tool_uses.insert(id, (name, String::new()));
             }
             ProviderEvent::ToolUseDelta { id, partial_json } => {
-                if let Some((_, json)) = tool_uses.get_mut(&id) {
-                    json.push_str(&partial_json);
+                if tool_uses.contains_key(&id) {
+                    if !admit(partial_json.len()) {
+                        end = StreamEnd::Failed(ProviderError::Stream(BUDGET_EXHAUSTED.into()));
+                        transport_failed = true;
+                        break false;
+                    }
+                    if let Some((_, json)) = tool_uses.get_mut(&id) {
+                        json.push_str(&partial_json);
+                    }
                 }
                 on_event(ProviderEvent::ToolUseDelta { id, partial_json });
             }
@@ -364,6 +401,11 @@ where
                 on_event(ProviderEvent::ReasoningDelta { text, kind });
             }
             ProviderEvent::ThinkingBlock { text, token } => {
+                if !admit(text.len()) {
+                    end = StreamEnd::Failed(ProviderError::Stream(BUDGET_EXHAUSTED.into()));
+                    transport_failed = true;
+                    break false;
+                }
                 // Flush any buffered text first, mirroring the ToolUseStart
                 // drain: a block-level event must not jump ahead of text that
                 // arrived before it, or wire order within `content` differs

@@ -477,6 +477,10 @@ pub enum AgentError {
     ProviderTurnAdmission(String),
     #[error("compaction error: {0}")]
     Compact(#[from] crate::compact::CompactError),
+    /// A side run refused to grow: the per-side text/binary budget is spent.
+    /// The turn stops instead of accumulating without bound (spec §5.3).
+    #[error("side conversation budget exhausted: {0}")]
+    Budget(#[from] crate::run_budget::BudgetExceeded),
 }
 
 impl Agent {
@@ -762,6 +766,7 @@ impl Agent {
             crate::managed_run::EventSink::Budgeted(limits) => EventTx::managed(
                 tx,
                 crate::managed_run::QueueBudget::new(limits),
+                Arc::new(crate::run_budget::RunBudget::new(limits)),
                 cancel_token.clone(),
             ),
         };
@@ -895,6 +900,7 @@ enum EventTxInner {
     Managed {
         tx: tokio::sync::mpsc::UnboundedSender<QueuedEvent>,
         budget: Arc<crate::managed_run::QueueBudget>,
+        pay: Arc<crate::run_budget::RunBudget>,
         cancel: CancellationToken,
     },
 }
@@ -915,10 +921,24 @@ impl EventTx {
     fn managed(
         tx: tokio::sync::mpsc::UnboundedSender<QueuedEvent>,
         budget: Arc<crate::managed_run::QueueBudget>,
+        pay: Arc<crate::run_budget::RunBudget>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
-            inner: EventTxInner::Managed { tx, budget, cancel },
+            inner: EventTxInner::Managed {
+                tx,
+                budget,
+                pay,
+                cancel,
+            },
+        }
+    }
+
+    /// The payload budget of a managed run, or `None` for an ordinary run.
+    fn payload_budget(&self) -> Option<&Arc<crate::run_budget::RunBudget>> {
+        match &self.inner {
+            EventTxInner::Plain(_) => None,
+            EventTxInner::Managed { pay, .. } => Some(pay),
         }
     }
 
@@ -932,20 +952,39 @@ impl EventTx {
             EventTxInner::Plain(tx) => tx
                 .send(QueuedEvent { event, lease: None })
                 .map_err(|_| SendFailed::Closed),
-            EventTxInner::Managed { tx, budget, cancel } => {
-                let bytes = crate::managed_run::approximate_event_bytes(&event);
-                let lease = match budget.reserve(bytes, cancel).await {
-                    Ok(lease) => lease,
-                    Err(_) => {
-                        cancel.cancel();
-                        return Err(SendFailed::Full);
+            EventTxInner::Managed {
+                tx, budget, cancel, ..
+            } => {
+                // A terminal event must be able to land even when the body
+                // exhausted the queue: it is the only way the consumer learns
+                // the run ended (spec §7.1 "给终态预留空间").
+                let terminal = crate::managed_run::is_terminal_event(&event);
+                for part in
+                    crate::managed_run::split_event_for_queue(event, budget.max_event_bytes())
+                {
+                    let bytes = crate::managed_run::queue_event_bytes(&part);
+                    let lease = match if terminal {
+                        budget.try_reserve_terminal(bytes)
+                    } else {
+                        budget.reserve(bytes, cancel).await.ok()
+                    } {
+                        Some(lease) => lease,
+                        None => {
+                            cancel.cancel();
+                            return Err(SendFailed::Full);
+                        }
+                    };
+                    if tx
+                        .send(QueuedEvent {
+                            event: part,
+                            lease: Some(lease),
+                        })
+                        .is_err()
+                    {
+                        return Err(SendFailed::Closed);
                     }
-                };
-                tx.send(QueuedEvent {
-                    event,
-                    lease: Some(lease),
-                })
-                .map_err(|_| SendFailed::Closed)
+                }
+                Ok(())
             }
         }
     }
@@ -961,20 +1000,36 @@ impl EventTx {
             EventTxInner::Plain(tx) => tx
                 .send(QueuedEvent { event, lease: None })
                 .map_err(|_| SendFailed::Closed),
-            EventTxInner::Managed { tx, budget, cancel } => {
-                let bytes = crate::managed_run::approximate_event_bytes(&event);
-                let lease = match budget.try_reserve(bytes) {
-                    Some(lease) => lease,
-                    None => {
-                        cancel.cancel();
-                        return Err(SendFailed::Full);
+            EventTxInner::Managed {
+                tx, budget, cancel, ..
+            } => {
+                let terminal = crate::managed_run::is_terminal_event(&event);
+                for part in
+                    crate::managed_run::split_event_for_queue(event, budget.max_event_bytes())
+                {
+                    let bytes = crate::managed_run::queue_event_bytes(&part);
+                    let lease = match if terminal {
+                        budget.try_reserve_terminal(bytes)
+                    } else {
+                        budget.try_reserve(bytes)
+                    } {
+                        Some(lease) => lease,
+                        None => {
+                            cancel.cancel();
+                            return Err(SendFailed::Full);
+                        }
+                    };
+                    if tx
+                        .send(QueuedEvent {
+                            event: part,
+                            lease: Some(lease),
+                        })
+                        .is_err()
+                    {
+                        return Err(SendFailed::Closed);
                     }
-                };
-                tx.send(QueuedEvent {
-                    event,
-                    lease: Some(lease),
-                })
-                .map_err(|_| SendFailed::Closed)
+                }
+                Ok(())
             }
         }
     }
@@ -1074,6 +1129,7 @@ async fn think_phase(
     provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
     messages: &mut Vec<Message>,
     turn: u32,
+    payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
 ) -> ThinkOutcome {
     // 1. THINK
     //
@@ -1108,7 +1164,7 @@ async fn think_phase(
     // two. Each attempt is a fresh provider turn (own lease); a failed
     // attempt's partial content is never committed to the session.
     let mut stall_retries: u16 = 0;
-    let (content, end, last_usage) = loop {
+    let (content, end, last_usage, frag_leases) = loop {
         let provider_turn_lease = match provider_turn_gate {
             Some(gate) => match tokio::select! {
                 lease = gate.acquire() => lease,
@@ -1322,11 +1378,33 @@ async fn think_phase(
     let exhausted_stall = matches!(end, StreamEnd::Stopped(StopReason::Stalled));
     let exhausted_timeout = matches!(end, StreamEnd::Failed(ProviderError::Network(_)));
     if !exhausted_stall && !exhausted_timeout {
-        messages.push(Message::assistant(content.clone()));
-        session
-            .lock()
-            .unwrap()
-            .push(Message::assistant(content.clone()));
+        // The committed message is charged as a whole (serialized envelope
+        // included) *before* it enters the session. The in-flight fragment
+        // leases are then released: they stood in for exactly this content
+        // while it was still being accumulated, so keeping both would charge
+        // the same bytes twice.
+        let message = Message::assistant(content.clone());
+        if let Some(budget) = tx.payload_budget() {
+            let size = crate::run_budget::measure_message_size(&message);
+            let text = budget.reserve_text(size.text_bytes).and_then(|lease| {
+                budget
+                    .reserve_binary(size.binary_bytes)
+                    .map(|binary| (lease, binary))
+            });
+            match text {
+                Ok((text_lease, binary_lease)) => {
+                    payload_leases.push(text_lease);
+                    payload_leases.push(binary_lease);
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentEvent::Error(AgentError::Budget(error))).await;
+                    return ThinkOutcome::Stopped;
+                }
+            }
+        }
+        drop(frag_leases);
+        messages.push(message.clone());
+        session.lock().unwrap().push(message);
     }
 
     let stop_reason = match end {
@@ -1652,7 +1730,9 @@ fn observe_phase(
     session: &Arc<Mutex<Session>>,
     results: Vec<(String, Option<ToolResult>)>,
     denied: Vec<(String, ToolResult)>,
-) {
+    budget: Option<&Arc<crate::run_budget::RunBudget>>,
+    payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
+) -> Result<(), crate::run_budget::BudgetExceeded> {
     // 4. OBSERVE - feed results back in tool_use_id order
     let mut tool_results: Vec<ContentBlock> = results
         .into_iter()
@@ -1673,8 +1753,18 @@ fn observe_phase(
         });
     }
     let tool_results_msg = Message::tool_results(tool_results);
+    // Charge before the results enter the session: a tool output is exactly the
+    // kind of unbounded payload the side budget exists to stop (§5.3).
+    if let Some(budget) = budget {
+        let size = crate::run_budget::measure_message_size(&tool_results_msg);
+        let text_lease = budget.reserve_text(size.text_bytes)?;
+        let binary_lease = budget.reserve_binary(size.binary_bytes)?;
+        payload_leases.push(text_lease);
+        payload_leases.push(binary_lease);
+    }
     messages.push(tool_results_msg.clone());
     session.lock().unwrap().push(tool_results_msg);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1693,6 +1783,10 @@ async fn run_loop(
     children: crate::managed_run::ChildTasks,
 ) {
     let mut messages = session.lock().unwrap().messages().to_vec();
+    // Payload leases for everything this run committed. They must outlive the
+    // run so the session's bytes stay charged (a lease frees its budget when
+    // dropped), and so a second turn cannot reuse the first turn's accounting.
+    let mut payload_leases: Vec<crate::run_budget::BudgetLease> = Vec::new();
     let mut turn = 0u32;
     // Cursor for incremental request logging: only log messages[last_logged..] each turn.
     let mut last_logged = 0usize;
@@ -1786,6 +1880,7 @@ async fn run_loop(
             &provider_turn_gate,
             &mut messages,
             turn,
+            &mut payload_leases,
         )
         .await
         {
@@ -1847,7 +1942,19 @@ async fn run_loop(
         };
 
         // 4. OBSERVE - feed results back in tool_use_id order
-        observe_phase(&mut messages, &session, outcome.results, outcome.denied);
+        if let Err(error) = observe_phase(
+            &mut messages,
+            &session,
+            outcome.results,
+            outcome.denied,
+            tx.payload_budget(),
+            &mut payload_leases,
+        ) {
+            // Over budget: report it and end the run rather than keeping an
+            // unaccounted transcript.
+            let _ = tx.send(AgentEvent::Error(AgentError::Budget(error))).await;
+            return;
+        }
     }
 }
 
@@ -1993,10 +2100,28 @@ async fn accumulate_provider_stream(
     tx: &EventTx,
     model: &str,
     idle_timeout: Option<std::time::Duration>,
-) -> Result<(Vec<ContentBlock>, StreamEnd, Option<TokenUsage>), AgentError> {
+) -> Result<
+    (
+        Vec<ContentBlock>,
+        StreamEnd,
+        Option<TokenUsage>,
+        Vec<crate::run_budget::BudgetLease>,
+    ),
+    AgentError,
+> {
     let tx = tx.clone();
     let model = model.to_string();
-    let (content, end, last_usage) = crate::provider::accumulate_stream(
+    // A managed (side) run charges every fragment to the payload budget before
+    // it enters the accumulator. An ordinary run has no budget and admits
+    // everything, preserving its historical behaviour byte for byte.
+    let budget = tx.payload_budget().cloned();
+    // Fragments are charged as they arrive and the leases are handed back to
+    // the run, which holds them for its lifetime: the accumulated bytes stay
+    // accounted for instead of being freed at the end of the attempt.
+    let frag_leases: Arc<std::sync::Mutex<Vec<crate::run_budget::BudgetLease>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let charge = Arc::clone(&frag_leases);
+    let (content, end, last_usage) = crate::provider::accumulate_stream_guarded(
         stream,
         move |event| match event {
             ProviderEvent::TextDelta(s) => {
@@ -2023,9 +2148,22 @@ async fn accumulate_provider_stream(
             _ => {}
         },
         idle_timeout,
+        move |bytes| match &budget {
+            Some(budget) => match budget.reserve_text(bytes) {
+                Ok(lease) => {
+                    charge.lock().unwrap().push(lease);
+                    true
+                }
+                Err(_) => false,
+            },
+            None => true,
+        },
     )
     .await?;
-    Ok((content, end, last_usage))
+    let leases = Arc::try_unwrap(frag_leases)
+        .map(|inner| inner.into_inner().unwrap())
+        .unwrap_or_default();
+    Ok((content, end, last_usage, leases))
 }
 
 /// Heuristic token estimate: ASCII ~4 chars/token, non-ASCII (CJK etc.) ~1.5 chars/token.
@@ -6570,8 +6708,14 @@ mod tests {
             Arc::new(ToolRegistry::new()),
             AgentConfig::default(),
         );
-        // Drop the stream immediately: the detached loop must still finish.
-        drop(agent.run("hi".into()).await.unwrap());
+        // Take the first event first. That proves the producer actually began:
+        // dropping an unpolled stream instead lets the loop's very first
+        // `Start` send discover the closed channel and legitimately return, so
+        // the test would measure scheduling luck rather than the contract.
+        let mut stream = agent.run("hi".into()).await.unwrap();
+        assert!(matches!(stream.next().await, Some(AgentEvent::Start)));
+        // From here on nobody reads: the detached loop must still finish.
+        drop(stream);
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let messages = agent.session().messages().to_vec();
@@ -6583,6 +6727,39 @@ mod tests {
             }
         }
         panic!("the detached ordinary run must still complete after its stream drops");
+    }
+
+    /// The ordinary path must stay unbudgeted: a normal conversation can
+    /// exceed the side budgets without being stopped.
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_run_is_not_subject_to_side_budgets() {
+        let payload_len = 64 * 1024;
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("y".repeat(payload_len)),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let mut stream = agent.run("hi".into()).await.unwrap();
+        let mut text = String::new();
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::AssistantText(chunk) => text.push_str(&chunk),
+                AgentEvent::Done { .. } => {
+                    saw_done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_done, "an ordinary run must complete normally");
+        assert_eq!(text.len(), payload_len);
     }
 
     /// Managed runs bound the queued event bytes: a consumer that never reads
@@ -6617,6 +6794,136 @@ mod tests {
             .await
             .unwrap();
         assert!(run.control.is_finished());
+    }
+
+    /// A managed run must stop when the provider out-produces the text budget
+    /// instead of accumulating without bound (spec §5.3).
+    ///
+    /// The scenario is the dangerous one: a provider streams far more text than
+    /// the budget allows and the consumer never reads. Before the budget was
+    /// wired into the accumulation path, every delta landed in the session and
+    /// in the queue regardless.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_run_stops_when_provider_exceeds_the_text_budget() {
+        // 64 deltas of 4 KiB = 256 KiB, far over the 16 KiB text budget.
+        let mut script: Vec<ProviderEvent> = (0..64)
+            .map(|_| ProviderEvent::TextDelta("x".repeat(4096)))
+            .collect();
+        script.push(ProviderEvent::Stop {
+            reason: StopReason::EndTurn,
+        });
+        let provider = ScriptedProvider::new(vec![script]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let mut limits = crate::managed_run::ManagedRunLimits::side_defaults();
+        limits.text_bytes = 16 * 1024;
+        limits.control_reserve = 1024;
+        let mut run = agent
+            .run_managed_blocks(vec![ContentBlock::Text("q".into())], limits)
+            .await
+            .unwrap();
+
+        // Drain as a well-behaved consumer would, so the queue bound is not the
+        // thing under test; the text budget must be.
+        let mut terminal = None;
+        let mut text_bytes = 0usize;
+        while let Some(item) = run.events.next().await {
+            match item.event() {
+                AgentEvent::AssistantText(text) => text_bytes += text.len(),
+                AgentEvent::Done { .. } | AgentEvent::Error(_) | AgentEvent::Cancelled => {
+                    terminal = Some(item.event().clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        run.control
+            .stop_and_join(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(run.control.is_finished());
+        assert!(
+            terminal.is_some(),
+            "an over-budget run must still end with a terminal event"
+        );
+        // The stop must be attributable to the budget, not to an unrelated
+        // transport failure: only the budget may refuse valid provider text.
+        match &terminal {
+            Some(AgentEvent::Error(AgentError::Provider(ProviderError::Stream(message)))) => {
+                assert!(
+                    message.contains("budget"),
+                    "the terminal error must name the budget, got: {message}"
+                );
+            }
+            Some(AgentEvent::Error(AgentError::Budget(_))) => {}
+            other => panic!("expected a budget terminal error, got: {other:?}"),
+        }
+        // The stop must happen *while accumulating*, not after the whole
+        // 256 KiB has been buffered and then rejected at commit time: the point
+        // of the admission check is that the bytes never exist (spec §5.3).
+        assert!(
+            text_bytes < 64 * 1024,
+            "the producer must be stopped as it grows; {text_bytes} bytes of the              256 KiB the provider offered were accumulated"
+        );
+        // Nothing entered the transcript either.
+        let history = agent.session.lock().unwrap().messages().to_vec();
+        let committed: usize = history
+            .iter()
+            .filter_map(|message| serde_json::to_string(message).ok())
+            .map(|json| json.len())
+            .sum();
+        assert!(
+            committed < 64 * 1024,
+            "committed history ({committed} bytes) must stay near the budget"
+        );
+    }
+
+    /// A large text delta must be split on UTF-8 boundaries so no queued event
+    /// exceeds the per-event limit, and the consumer must still see every byte.
+    #[tokio::test(start_paused = true)]
+    async fn side_managed_large_delta_is_split_without_losing_text() {
+        let payload = "中".repeat(2000); // 6000 bytes, well over a 512-byte event
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta(payload.clone()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+        );
+        let mut limits = crate::managed_run::ManagedRunLimits::side_defaults();
+        limits.max_event_bytes = 512;
+        limits.event_bytes = 64 * 1024;
+        let mut run = agent
+            .run_managed_blocks(vec![ContentBlock::Text("q".into())], limits)
+            .await
+            .unwrap();
+
+        let mut rebuilt = String::new();
+        while let Some(item) = run.events.next().await {
+            match item.event() {
+                AgentEvent::AssistantText(text) => {
+                    assert!(
+                        crate::managed_run::queue_event_bytes(item.event()) <= 512,
+                        "queued event exceeded the per-event limit"
+                    );
+                    rebuilt.push_str(text);
+                }
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        run.control
+            .stop_and_join(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rebuilt, payload, "splitting must not lose or reorder text");
     }
 
     /// Closing a managed run must reap the ToolEvent forwarder too.
