@@ -9,6 +9,7 @@ mod onboarding_prompt;
 mod resume;
 mod schedule_intent;
 mod session_store;
+mod side_driver;
 mod tracing_init;
 mod tui;
 mod turn_log;
@@ -2242,6 +2243,96 @@ impl LiveRebuild {
     }
 }
 
+/// 向旁支请求一次父变更屏障。
+///
+/// 返回的 permit 必须在主操作**成功之后**才 `commit`;提前 drop 就等价于
+/// 「主操作失败,回滚」，旧旁支继续可用。拿不到 permit（没有旁支能力、调度
+/// 已退出、或超时）时返回 `None`，主操作照常进行。
+async fn side_parent_barrier(
+    commands: &Option<tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>>,
+) -> Option<crate::side_driver::ParentChangePermit> {
+    let commands = commands.as_ref()?;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::side_driver::SideDriverCommand::ParentBarrier {
+            reason: yi_agent_runtime::side_conversation::CloseReason::ParentCleared,
+            reply,
+        })
+        .await
+        .ok()?;
+    // 屏障只是逻辑状态,不该拖住清空:1 秒够调度回合应一次命令。
+    tokio::time::timeout(std::time::Duration::from_secs(1), outcome)
+        .await
+        .ok()?
+        .ok()
+}
+
+/// 把父会话的当前状态重新发布给旁支。
+///
+/// 每个改变「父会话有效来源」的入口都必须调用它:模型切换、effort 切换、
+/// compact、clear、MCP 刷新。发布走 `begin_update` + `commit`,读侧因此永远
+/// 不会看到「新 provider + 旧 config」这种半更新状态。
+fn publish_side_source(
+    publisher: Option<&Arc<yi_agent_runtime::side_conversation::SideSourcePublisher>>,
+    live: &LiveRebuild,
+    session: &Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    primary: &std::path::Path,
+) {
+    let Some(publisher) = publisher else {
+        return;
+    };
+    let Ok(update) = publisher.begin_update() else {
+        // 另一个更新正在进行:放弃这一次,下一次重建会再发布。绝不能在这里
+        // 强行覆盖,那会让读侧读到混搭的来源。
+        return;
+    };
+    let revision = publisher.revision().unwrap_or(1).saturating_add(1);
+    let roots = vec![primary.to_path_buf()];
+    let mut source = yi_agent_runtime::side_conversation::EffectiveSideSource {
+        session: Arc::clone(session),
+        provider: Arc::clone(&live.provider),
+        config: live.config.clone(),
+        primary: primary.to_path_buf(),
+        roots: roots.clone(),
+        current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
+        attachments: Default::default(),
+        revision,
+        generation: 1,
+        provider_gate: None,
+        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+    };
+    source.revision = revision;
+    update.commit(source);
+}
+
+/// 构造一次旁支来源快照。
+///
+/// 旁支继承的是**父此刻生效**的模型、system prompt 与 effort,并且复用同一个
+/// provider 实例（凭据只读一次）。历史取自主会话的 `Arc<Mutex<Session>>`,但
+/// `SideConversationRunner::new` 会 fork 出一份独立 Session,所以旁支的写入
+/// 永远碰不到父会话。
+fn side_source_snapshot(
+    agent_config: &yi_agent_core::AgentConfig,
+    provider: Arc<dyn Provider>,
+    primary: std::path::PathBuf,
+) -> yi_agent_runtime::side_conversation::EffectiveSideSource {
+    let roots = vec![primary.clone()];
+    yi_agent_runtime::side_conversation::EffectiveSideSource {
+        session: Arc::new(std::sync::Mutex::new(yi_agent_core::Session::new())),
+        provider,
+        config: agent_config.clone(),
+        primary: primary.clone(),
+        roots: roots.clone(),
+        current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
+        attachments: Default::default(),
+        revision: 1,
+        // generation 与父会话一致:父 clear/delete 会推进它并作废旁支。
+        generation: 1,
+        provider_gate: None,
+        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+    }
+}
+
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
 #[allow(clippy::too_many_arguments)]
 fn run_tui_agent(
@@ -2329,6 +2420,7 @@ fn run_tui_agent(
         let caller = crate::tui::subagents::CallerContext::unbound();
         let caller_for_attach = caller.clone();
 
+
         // `workdir` is moved into the driver closure below, and `config` is moved
         // into it too, so both the snapshot and the TUI call site need values built
         // before the closure and a cloned workdir.
@@ -2338,6 +2430,53 @@ fn run_tui_agent(
             crate::tui::runtime_prefs::RuntimePreference::Always => "always",
             crate::tui::runtime_prefs::RuntimePreference::Never => "never",
         };
+
+        // 旁支:一份 source 发布器 + 一个独立调度任务。
+        //
+        // 发布器在这里创建,由主 driver 的每个重建入口（model/effort/compact/
+        // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
+        // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
+        let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
+        let side_instance_home = yi_agent_store::paths::instance_home()
+            .unwrap_or_else(|| snapshot_workdir.join(".yi-agent"));
+        let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+            side_instance_home,
+            Arc::clone(&side_pool),
+        );
+        let mut side_commands_tx_for_driver = None;
+        let mut side_commands_tx_for_tui_exit: Option<
+            tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        > = None;
+        let mut side_driver_join_for_exit: Option<tokio::task::JoinHandle<()>> = None;
+        let (side_publisher, side_runtime) = match side_resources {
+            Ok(resources) => {
+                let publisher = Arc::new(yi_agent_runtime::side_conversation::SideSourcePublisher::new(
+                    side_source_snapshot(
+                        &agent_config,
+                        Arc::clone(&provider),
+                        snapshot_workdir.clone(),
+                    ),
+                ));
+                let handles = crate::side_driver::spawn_side_driver(
+                    Arc::clone(&publisher),
+                    resources,
+                    Arc::clone(&side_pool),
+                );
+                side_commands_tx_for_driver = Some(handles.commands.clone());
+                side_commands_tx_for_tui_exit = Some(handles.commands.clone());
+                side_driver_join_for_exit = Some(handles.join);
+                (
+                    Some(publisher),
+                    crate::tui::app::SideRuntime::new(handles.commands, handles.events),
+                )
+            }
+            Err(error) => {
+                // 旁支不可用不该阻止主 TUI 启动:能力缺失会由 `/side` 明确告知。
+                tracing::warn!(%error, "side conversations unavailable; continuing without them");
+                (None, crate::tui::app::SideRuntime::disabled())
+            }
+        };
+
         let tui_config = crate::tui::slash::TuiConfigSnapshot {
             provider: config.provider.clone(),
             model_injected: config.model_injected,
@@ -2452,6 +2591,9 @@ fn run_tui_agent(
         }
 
         let driver_workdir = snapshot_workdir.clone();
+        let side_publisher_for_driver = side_publisher.as_ref().cloned();
+        // 主 driver 也需要一个命令端:clear 前要建立父变更屏障。
+        let side_commands_for_driver = side_publisher.as_ref().and(side_commands_tx_for_driver);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -2480,6 +2622,14 @@ fn run_tui_agent(
             .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx))
             .with_session_arc(Arc::clone(&session_handle));
 
+            // 启动即发布一次来源:旁支继承的是「此刻父会话真正在用的东西」,
+            // 所以每个可能改变它的入口都要重新发布（见下面的 publish_side_source 调用）。
+            publish_side_source(
+                side_publisher_for_driver.as_ref(),
+                &live,
+                &session_handle,
+                &driver_workdir,
+            );
 
             loop {
                 // Wait for user input, runtime startup choice, or a control command.
@@ -2494,6 +2644,11 @@ fn run_tui_agent(
                 if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
                         DriverControl::Clear => {
+                            // 先向旁支建立逻辑屏障:主清空**真的成功**之后才提交
+                            // 作废。拿不到 permit（旁支不可用/通道关闭）就照常清空,
+                            // 只是没有旁支需要作废。屏障本身不等待 5 秒关闭:它只
+                            // 冻结创建/提问,作废是提交之后的事。
+                            let permit = side_parent_barrier(&side_commands_for_driver).await;
                             // Rebuild agent with empty session. The session Arc is
                             // reused (not replaced) so the `CallerContext` bound to
                             // it stays live; the contents are emptied in place, and
@@ -2517,6 +2672,21 @@ fn run_tui_agent(
                             // 用户会以为清空没生效。app-server 在同一位置调
                             // `translator.reset_totals()`（server.rs:5368）。
                             turn_log.reset_totals();
+                            // clear 之后父的可继承历史为空:旁支不能再基于旧上下文,
+                            // 所以这里先作废现有旁支（屏障 -> close）。发布新来源
+                            // 让之后打开的空父旁支立刻得到 parent_not_started 的明确错误。
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
+                            );
+                            // 到这里清空已经落地（内存 + 磁盘都成功才走到这）,
+                            // 旁支必须随之作废。失败路径不会执行到这里,
+                            // permit 随作用域 drop 并自动回滚。
+                            if let Some(permit) = permit {
+                                permit.commit();
+                            }
                             tracing::info!("agent session cleared via /clear");
                         }
                         DriverControl::Compact => {
@@ -2561,6 +2731,15 @@ fn run_tui_agent(
                                             eprintln!("[yi-agent] /compact 落盘失败: {e}");
                                         }
                                     }
+                                    // compact 只改变「未来的来源」,不关闭已开的旁支:
+                                    // 旁支继承的是它创建时的上下文,父压缩不该把用户
+                                    // 正在问的旁支腰斩。
+                                    publish_side_source(
+                                        side_publisher_for_driver.as_ref(),
+                                        &live,
+                                        &handle,
+                                        &driver_workdir,
+                                    );
                                     tracing::info!("agent session compacted via /compact");
                                     let _ = agent_tx
                                         .send(manual_compaction_outcome_event(
@@ -2640,6 +2819,12 @@ fn run_tui_agent(
                                     text: label,
                                 })
                                 .await;
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
+                            );
                             tracing::info!("MCP config reloaded from disk");
                         }
                         DriverControl::McpRefresh => {
@@ -2654,6 +2839,12 @@ fn run_tui_agent(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 handle,
+                            );
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
@@ -2683,6 +2874,12 @@ fn run_tui_agent(
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                         handle,
+                                    );
+                                    publish_side_source(
+                                        side_publisher_for_driver.as_ref(),
+                                        &live,
+                                        &agent.session_handle(),
+                                        &driver_workdir,
                                     );
                                     tracing::info!(
                                         model = %effective.model,
@@ -2732,6 +2929,12 @@ fn run_tui_agent(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 handle,
+                            );
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
                             );
                             tracing::info!(
                                 ?effort,
@@ -3087,6 +3290,7 @@ fn run_tui_agent(
                 // 无文件即空清单，行为与今天一致。
                 yi_agent_runtime::models::load_catalog(),
                 replay_cells,
+                side_runtime,
             )
         });
 
@@ -3095,6 +3299,24 @@ fn run_tui_agent(
             Ok(Err(e)) => Err(anyhow::Error::from(e)),
             Err(e) => Err(anyhow::Error::from(e)),
         };
+
+        // 退出顺序是硬约束:**先**让旁支调度停下并 join,再做 TUI/reactor 收尾。
+        // 旁支持有真实 owner（资源槽、blocking 工作、provider 流）,如果让它
+        // 比主循环活得更久,进程退出时那些资源会被直接丢弃,而不是被释放。
+        let mut exit_coordinator = crate::tui::side::TuiExitCoordinator::new(
+            side_commands_tx_for_tui_exit,
+            side_driver_join_for_exit,
+        );
+        match exit_coordinator.stop_all().await {
+            Ok(true) => {}
+            Ok(false) => {
+                // 不谎称清理完成:旁支任务仍在后台，它的 owner 尚未释放。
+                eprintln!("[yi-agent] 旁支未在 5 秒内结束，资源将在进程退出时释放");
+            }
+            Err(error) => {
+                eprintln!("[yi-agent] 旁支退出通知失败: {}", error.message);
+            }
+        }
 
         // 退出后告诉用户怎么接上这场对话。
         //

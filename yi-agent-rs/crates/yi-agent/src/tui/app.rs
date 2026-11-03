@@ -27,6 +27,10 @@ use super::process_popup::{
     ConfirmProcessKill as ConfirmProcessKillPopup, ProcessDetailPopup, ProcessListPopup,
     ProcessPopup, RuntimeTab,
 };
+use super::side::{
+    ConversationPayload, ConversationTarget, RoutedInput, SideFrameEffect, SideInput, TuiSideView,
+    TuiSideViews, classify_conversation_input, side_header_line,
+};
 use super::slash::{
     CommandPopup, McpAction, SlashCommand, TuiConfigSnapshot, help_text, parse_mcp_args,
     render_mcp_status,
@@ -78,6 +82,9 @@ pub(crate) struct TuiChannels {
     /// TUI→driver 的重建指令（Step 0 已改名为 `DriverControl`）。
     pub control: tokio::sync::mpsc::Sender<crate::DriverControl>,
     pub decision: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+    /// 旁支命令通道。`None` 表示本次会话没有旁支能力（测试构造与不支持
+    /// 的宿主），此时 `/side` 会明确报「不可用」而不是静默什么都不做。
+    pub side: Option<tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>>,
 }
 
 impl TuiChannels {
@@ -99,7 +106,41 @@ impl TuiChannels {
             kill: kill.clone(),
             control: control.clone(),
             decision: decision.clone(),
+            side: None,
         }
+    }
+}
+
+/// 旁支在 TUI 这一侧的两端通道。
+///
+/// `None` 表示本次会话没有旁支能力:测试构造与不支持旁支的宿主走这条路径,
+/// 此时 `/side` 会明确提示不可用,而不是静默吞掉命令。
+pub struct SideRuntime {
+    pub commands: Option<tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>>,
+    pub events: Option<tokio::sync::mpsc::Receiver<super::side::ConversationEvent>>,
+}
+
+impl SideRuntime {
+    /// 无旁支能力。
+    pub fn disabled() -> Self {
+        Self {
+            commands: None,
+            events: None,
+        }
+    }
+
+    pub fn new(
+        commands: tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        events: tokio::sync::mpsc::Receiver<super::side::ConversationEvent>,
+    ) -> Self {
+        Self {
+            commands: Some(commands),
+            events: Some(events),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.commands.is_some()
     }
 }
 
@@ -159,6 +200,7 @@ pub fn run_tui(
     catalog: yi_agent_runtime::models::ModelCatalog,
     // resume 时的历史回放。空 vec 等价于全新会话。
     replay_cells: Vec<crate::tui::cell::HistoryCell>,
+    side_runtime: SideRuntime,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     // Detect the terminal background BEFORE the alternate screen takes over:
@@ -202,6 +244,7 @@ pub fn run_tui(
         kill: kill_tx,
         control: control_tx,
         decision: decision_tx,
+        side: side_runtime.commands.clone(),
     };
 
     // 标题：必须在 `workdir` 被 move 进 `run_loop` 之前取项目名。
@@ -211,7 +254,7 @@ pub fn run_tui(
         &workdir,
     );
 
-    let result = run_loop(
+    let result = run_loop_with_side(
         &mut terminal,
         &mut agent_rx,
         &mut history,
@@ -229,6 +272,7 @@ pub fn run_tui(
         &catalog,
         theme,
         &mut title,
+        side_runtime,
     );
 
     // Try every cleanup step so a failed write cannot leave the terminal in another mode.
@@ -433,6 +477,7 @@ pub fn run_tui_with_backend<B: Backend>(
         kill: kill_tx.clone(),
         control: control_tx.clone(),
         decision: decision_tx.clone(),
+        side: None,
     };
     let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
@@ -519,6 +564,7 @@ pub fn run_tui_with_backend_and_events_themed<B: Backend, E: EventSource>(
         kill: kill_tx.clone(),
         control: control_tx.clone(),
         decision: decision_tx.clone(),
+        side: None,
     };
     let mut title = crate::tui::title::TitleHandle::disabled();
     run_loop(
@@ -611,6 +657,215 @@ impl SessionUi {
     }
 }
 
+/// 旁支会话在 TUI 里的整套状态。
+///
+/// 与主视图**完全分开**地持有 `HistoryState` / `InputLine`:两份视图各有自己的
+/// 转录、草稿、滚动位置与折行缓存。渲染器是共用的（`HistoryView`），所以
+/// 主题、resize、CJK 换行、缓存上限对两份视图一致，不需要第二套实现。
+struct SideSession {
+    /// 主/旁视图切换与每份视图的运行态。
+    views: TuiSideViews,
+    /// 旁支自己的转录。
+    history: HistoryState,
+    /// 旁支自己的输入行（草稿与历史不串到主会话）。
+    input: InputLine,
+    /// 旁支自己的用量，从零累计，不混入父会话的 `cost_tracker`。
+    usage: yi_agent_runtime::side_conversation::SideUsage,
+    /// 已发出但还没被 driver 确认的请求 id + 原文（用于同 id 重试）。
+    pending_request: Option<(String, String)>,
+    /// 旁支当前轮次 id（来自 driver 的定向帧）。Esc 只停这个轮次。
+    active_turn_id: Option<String>,
+    /// 错误/状态提示行。
+    notice: Option<String>,
+}
+
+impl SideSession {
+    fn new(theme: TuiTheme) -> Self {
+        Self {
+            views: TuiSideViews::new(),
+            history: HistoryState::with_theme(theme),
+            input: InputLine::new(),
+            usage: Default::default(),
+            pending_request: None,
+            active_turn_id: None,
+            notice: None,
+        }
+    }
+
+    fn in_side(&self) -> bool {
+        self.views.in_side()
+    }
+
+    fn active_side(&self) -> Option<&TuiSideView> {
+        self.views.side.as_ref()
+    }
+
+    fn side_running(&self) -> bool {
+        self.active_side().is_some_and(|view| view.running)
+    }
+
+    /// 把一条事件写进旁支视图与转录。
+    ///
+    /// 返回是否需要重绘。**主事件在这里被丢弃**:它们由主循环写主 history,
+    /// 这正是「后台父输出不污染旁支」的落点。
+    fn apply_event(
+        &mut self,
+        event: &super::side::ConversationEvent,
+        width: u16,
+    ) -> SideFrameEffect {
+        // 已经关闭的旁支不再接受任何帧：迟到的事件不能让一个已关闭的视图
+        // 「复活」，否则用户会看到一个说已关闭、却还在长正文的旁支。
+        if self.views.side.as_ref().is_some_and(|view| !view.is_live()) {
+            return SideFrameEffect::Discard;
+        }
+        // 用 `matches_side` 而不是就地再写一遍 `side_id`/`generation` 比较：
+        // 这个谓词是「过期帧必须被丢弃」的唯一判据，散成多份就会有一天只改到一半。
+        if let (ConversationPayload::SideItems(items), Some(view)) =
+            (&event.event, self.views.side.as_mut())
+            && event.target.matches_side(&view.side_id, view.generation)
+        {
+            view.apply_items(items.to_vec());
+            self.render_items(width);
+            return SideFrameEffect::Redraw;
+        }
+        // 第一条旁支帧就是「旁支已创建」的信号:此时才建立视图并切过去。
+        // 在此之前不预先造一个空视图,否则创建失败会留下一个永远空着的旁支。
+        if let ConversationTarget::Side {
+            side_id,
+            generation,
+        } = &event.target
+            && self.views.side.is_none()
+        {
+            self.views.open(side_id.clone(), *generation);
+            self.history.clear();
+        }
+        // 定向帧先决定「是不是当前这个旁支」,再写状态:过期的 generation 与
+        // 别的 side_id 的帧必须原样丢弃,不能把新视图往回拨。
+        let stale = match (event.target.is_side(), self.views.side.as_ref()) {
+            (true, Some(view)) => !event.target.matches_side(&view.side_id, view.generation),
+            (true, None) => true,
+            _ => false,
+        };
+        if stale {
+            return SideFrameEffect::Discard;
+        }
+        let effect = self.views.route(event);
+        match &event.event {
+            ConversationPayload::SideUsage(usage) if effect == SideFrameEffect::Redraw => {
+                self.usage = *usage;
+            }
+            ConversationPayload::SideClosed(reason) if effect == SideFrameEffect::Redraw => {
+                self.notice = Some(super::side::close_reason_text(*reason));
+                self.pending_request = None;
+                self.active_turn_id = None;
+            }
+            ConversationPayload::SideStatus(_) if effect == SideFrameEffect::Redraw => {
+                // 轮次结束时清掉 active turn id:Esc 不能在已结束的轮次上「停止」,
+                // 更不能误停下一轮。
+                if !self.side_running() {
+                    self.active_turn_id = None;
+                }
+            }
+            _ => {}
+        }
+        if let Some(turn_id) = &event.turn_id
+            && effect == SideFrameEffect::Redraw
+        {
+            self.active_turn_id = Some(turn_id.clone());
+        }
+        effect
+    }
+
+    /// 把旁支转录整批重画。
+    ///
+    /// 整批重画而不是增量插入:旁支的 item 是**可变**的（流式 delta 会更新同一个
+    /// id），增量插入会在每帧留下旧文本。重画走 `enforce_history_cap`，所以长
+    /// 旁支同样受既有缓存上限约束。
+    fn render_items(&mut self, width: u16) {
+        let Some(view) = self.views.side.as_ref() else {
+            return;
+        };
+        let cells = side_items_to_cells(&view.items);
+        self.history.clear();
+        for cell in cells {
+            self.history.push(cell, width);
+        }
+    }
+}
+
+/// 把 runtime 的转录项映射成既有 `HistoryCell`，复用现成的渲染与折行。
+///
+/// 刻意不把旁支 item 转成 `AgentEvent` 再喂 `TurnLog`:那条路径会写父会话的
+/// 落盘与用量，而旁支一个字节都不该进父文件。
+fn side_items_to_cells(
+    items: &[std::sync::Arc<yi_agent_runtime::side_conversation::SideItem>],
+) -> Vec<HistoryCell> {
+    use yi_agent_runtime::side_conversation::SideItemContent;
+    let mut cells = Vec::with_capacity(items.len());
+    for item in items {
+        match &item.content {
+            SideItemContent::UserMessage { text } => {
+                cells.push(HistoryCell::UserMessage { text: text.clone() });
+            }
+            SideItemContent::AgentMessage { text } => {
+                cells.push(HistoryCell::AssistantMessage {
+                    markdown: text.clone(),
+                });
+            }
+            SideItemContent::Thinking { text, .. } => {
+                cells.push(HistoryCell::Reasoning {
+                    text: text.clone(),
+                    expanded: false,
+                });
+            }
+            SideItemContent::ToolCall {
+                call_id,
+                name,
+                input,
+                result,
+                status,
+                ..
+            } => {
+                let state = match status {
+                    yi_agent_runtime::side_conversation::SideToolStatus::Running => {
+                        super::cell::CallState::Running
+                    }
+                    yi_agent_runtime::side_conversation::SideToolStatus::Completed => {
+                        super::cell::CallState::Success
+                    }
+                    yi_agent_runtime::side_conversation::SideToolStatus::Failed => {
+                        super::cell::CallState::Failed
+                    }
+                };
+                cells.push(HistoryCell::ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    state,
+                    expanded: false,
+                });
+                if let Some(result) = result {
+                    cells.push(HistoryCell::ToolResult {
+                        id: call_id.clone(),
+                        result_text: result.clone(),
+                        is_error: matches!(
+                            status,
+                            yi_agent_runtime::side_conversation::SideToolStatus::Failed
+                        ),
+                        expanded: false,
+                    });
+                }
+            }
+            SideItemContent::Notice { text } => {
+                cells.push(HistoryCell::Separator {
+                    label: Some(text.clone()),
+                });
+            }
+        }
+    }
+    cells
+}
+
 /// 当前浮在最上层的东西：命令补全弹窗、运行时选择弹窗、子 agent 列表、
 /// trace 流、运行时提示。同一时刻通常只有一个非空，但它们各自独立开关。
 struct PopupStack {
@@ -644,6 +899,14 @@ impl PopupStack {
 /// 通知状态。
 struct LoopBookkeeping {
     pending_quit: bool,
+    /// 父审批提示显示时，是否处于「敲命令」模式。
+    ///
+    /// 这必须与审批裁决分开存：模式本身不表达任何批准意图，只有
+    /// `Decision` 模式下的数字/Enter 才会发给父 driver。
+    approval_mode: crate::tui::side::ApprovalInputMode,
+    /// 进入命令模式前用户正在输入的草稿。Esc 退出时原样恢复，
+    /// 避免「按了 / 又按 Esc，已经打了一半的追加内容没了」。
+    saved_approval_draft: Option<String>,
     queued: crate::tui::queued::DeliveredInterjections,
     task_registry: RunningTaskRegistry,
     runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
@@ -671,6 +934,8 @@ impl LoopBookkeeping {
     ) -> Self {
         Self {
             pending_quit: false,
+            approval_mode: crate::tui::side::ApprovalInputMode::Decision,
+            saved_approval_draft: None,
             queued: crate::tui::queued::DeliveredInterjections::new(),
             task_registry: RunningTaskRegistry::new(),
             runtime_notice_pending: matches!(
@@ -710,10 +975,66 @@ fn run_loop<B: Backend, E: EventSource>(
     theme: TuiTheme,
     title: &mut crate::tui::title::TitleHandle,
 ) -> std::io::Result<usize> {
+    // 默认入口没有旁支能力:测试与不支持旁支的宿主走这条路径。真正的生产入口
+    // 用 `run_loop_with_side` 注入通道,这样不必给 16 处测试调用点各加一个参数。
+    run_loop_with_side(
+        terminal,
+        agent_rx,
+        history,
+        input,
+        channels,
+        is_running,
+        events,
+        model,
+        runtime_intent,
+        runtime_choice_tx,
+        process_manager,
+        workdir,
+        mcp,
+        config,
+        catalog,
+        theme,
+        title,
+        SideRuntime::disabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_with_side<B: Backend, E: EventSource>(
+    terminal: &mut Terminal<B>,
+    agent_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    history: &mut HistoryState,
+    input: &mut InputLine,
+    channels: TuiChannels,
+    is_running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: &E,
+    model: &str,
+    runtime_intent: Option<crate::tui::subagents::RuntimeStartupIntent>,
+    runtime_choice_tx: Option<
+        tokio::sync::mpsc::Sender<crate::tui::subagents::RuntimeStartupChoice>,
+    >,
+    process_manager: std::sync::Arc<yi_agent_tools::ProcessManager>,
+    workdir: std::path::PathBuf,
+    mcp: std::sync::Arc<yi_agent_mcp::McpManager>,
+    config: &TuiConfigSnapshot,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+    theme: TuiTheme,
+    title: &mut crate::tui::title::TitleHandle,
+    side_runtime: SideRuntime,
+) -> std::io::Result<usize> {
+    let SideRuntime {
+        commands: side_commands,
+        events: mut side_events,
+    } = side_runtime;
+    // 旁支命令通道挂在 `TuiChannels.side` 上,于是所有按键/斜杠入口都能从
+    // 同一处取到它,不必再往下传一个参数。`None` 表示本会话没有旁支能力。
+    let mut channels = channels;
+    channels.side = side_commands;
     // 三组状态各自打包：会话/模型选择、浮层、循环记账。它们的共同点是
     // 「活到下一帧、任何时刻可读可写」，没有 D1 那种「必须在此之前释放」
     // 的时序约束，散在那里只是让 538 行的循环更难读。
     let mut session_ui = SessionUi::new(model);
+    let mut side_session = SideSession::new(theme);
     let mut popup_stack = PopupStack::new();
     let notifications_enabled = config.notifications;
     let focused = std::sync::atomic::AtomicBool::new(true);
@@ -738,6 +1059,8 @@ fn run_loop<B: Backend, E: EventSource>(
     let mut loop_bk = LoopBookkeeping::new(runtime_intent, &process_manager, notifier);
 
     loop {
+        // 当前可见的是哪一份视图。每帧重算:back/打开旁支只改状态,不重启循环。
+        let in_side = side_session.in_side();
         let size = terminal.size()?;
         let width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -745,15 +1068,22 @@ fn run_loop<B: Backend, E: EventSource>(
             crate::tui::queued::render_queued_preview_with(loop_bk.queued.items(), width, theme);
         let initial_layout = compute_layout(
             area,
-            input,
+            if in_side { &side_session.input } else { input },
             loop_bk.pending_quit,
             &popup_stack.popup,
             initial_queued_lines.len() as u16,
         );
         let initial_history_area = initial_layout.chunks[0];
+        // 当前可见的是哪一份视图:主视图或旁支。两份各有自己的转录与滚动位置,
+        // 渲染器共用,所以这里只切换「读谁」。
+        let active_history: &mut HistoryState = if in_side {
+            &mut side_session.history
+        } else {
+            history
+        };
         let initial_text_width =
-            history.text_width(initial_history_area.width, initial_history_area.height);
-        history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
+            active_history.text_width(initial_history_area.width, initial_history_area.height);
+        active_history.reconcile_scroll_offset(initial_text_width, initial_history_area.height);
         let viewport_anchor = match loop_bk.previous_viewport.take() {
             Some((anchor, previous_width, previous_height))
                 if previous_width != initial_text_width
@@ -761,11 +1091,20 @@ fn run_loop<B: Backend, E: EventSource>(
             {
                 Some(anchor)
             }
-            _ => history.capture_viewport_anchor(initial_text_width, initial_history_area.height),
+            _ => active_history
+                .capture_viewport_anchor(initial_text_width, initial_history_area.height),
         };
         let mut pending_events = Vec::new();
         while let Ok(event) = agent_rx.try_recv() {
             pending_events.push(event);
+        }
+        // 旁支事件走独立通道。它们**只**写旁支视图,所以这里的顺序无关紧要,
+        // 正是「父后台输出不改旁支、旁支不改父」的实现点。
+        let mut pending_side_events = Vec::new();
+        if let Some(rx) = side_events.as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                pending_side_events.push(event);
+            }
         }
 
         // A completed turn promotes one queued item into history and sends it.
@@ -787,7 +1126,7 @@ fn run_loop<B: Backend, E: EventSource>(
         );
         let final_layout = compute_layout(
             area,
-            input,
+            if in_side { &side_session.input } else { input },
             loop_bk.pending_quit,
             &popup_stack.popup,
             final_queued_lines.len() as u16,
@@ -800,7 +1139,11 @@ fn run_loop<B: Backend, E: EventSource>(
         // would re-render the whole scrollback at one width and then again at
         // the other -- once per streamed token.
         let draw_text_width =
-            history.text_width(final_history_area.width, final_history_area.height);
+            active_history.text_width(final_history_area.width, final_history_area.height);
+
+        for event in &pending_side_events {
+            side_session.apply_event(event, draw_text_width);
+        }
 
         for event in pending_events {
             let is_turn_end = matches!(
@@ -848,16 +1191,51 @@ fn run_loop<B: Backend, E: EventSource>(
             }
         }
 
-        let final_text_width =
-            history.text_width(final_history_area.width, final_history_area.height);
+        let final_text_width = {
+            let active_history: &mut HistoryState = if side_session.in_side() {
+                &mut side_session.history
+            } else {
+                history
+            };
+            active_history.text_width(final_history_area.width, final_history_area.height)
+        };
+        let viewport_anchor = viewport_anchor.or_else(|| {
+            let active_history: &HistoryState = if side_session.in_side() {
+                &side_session.history
+            } else {
+                history
+            };
+            active_history.capture_viewport_anchor(final_text_width, final_history_area.height)
+        });
         if let Some(anchor) = viewport_anchor {
-            history.restore_viewport_anchor(anchor, final_text_width, final_history_area.height);
+            let active_history: &mut HistoryState = if side_session.in_side() {
+                &mut side_session.history
+            } else {
+                history
+            };
+            active_history.restore_viewport_anchor(
+                anchor,
+                final_text_width,
+                final_history_area.height,
+            );
         } else {
-            history.reconcile_scroll_offset(final_text_width, final_history_area.height);
+            let active_history: &mut HistoryState = if side_session.in_side() {
+                &mut side_session.history
+            } else {
+                history
+            };
+            active_history.reconcile_scroll_offset(final_text_width, final_history_area.height);
         }
-        loop_bk.previous_viewport = history
-            .capture_viewport_anchor(final_text_width, final_history_area.height)
-            .map(|anchor| (anchor, final_text_width, final_history_area.height));
+        loop_bk.previous_viewport = {
+            let active_history: &HistoryState = if side_session.in_side() {
+                &side_session.history
+            } else {
+                history
+            };
+            active_history
+                .capture_viewport_anchor(final_text_width, final_history_area.height)
+                .map(|anchor| (anchor, final_text_width, final_history_area.height))
+        };
 
         let queued_lines =
             crate::tui::queued::render_queued_preview_with(loop_bk.queued.items(), width, theme);
@@ -911,12 +1289,41 @@ fn run_loop<B: Backend, E: EventSource>(
         terminal.draw(|f| {
             let chunks = layout.chunks.clone();
 
+            // 渲染器共用:旁支只换 state 与顶部提示条,主题/折行/缓存上限一致。
+            let (visible_history, header): (&HistoryState, Option<String>) = if in_side {
+                (
+                    &side_session.history,
+                    Some(side_header_line(
+                        is_running.load(std::sync::atomic::Ordering::SeqCst),
+                        false,
+                    )),
+                )
+            } else {
+                (history, None)
+            };
             let history_view = HistoryView {
-                state: history,
+                state: visible_history,
                 width: chunks[0].width,
                 theme,
             };
             f.render_widget(history_view, chunks[0]);
+            if let Some(header) = header {
+                // 提示条画在可视区最上方,不遮输入行（输入行在最底部）。
+                let area = ratatui::layout::Rect {
+                    x: chunks[0].x,
+                    y: chunks[0].y,
+                    width: chunks[0].width,
+                    height: 1,
+                };
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Paragraph::new(ratatui::text::Line::styled(
+                        header,
+                        Style::default().fg(theme.fg_faint),
+                    )),
+                    area,
+                );
+            }
 
             // Render popup if active
             if let Some(p) = &popup_stack.popup {
@@ -944,7 +1351,7 @@ fn run_loop<B: Backend, E: EventSource>(
             }
 
             let input_line = build_input_line_with(
-                input,
+                if in_side { &side_session.input } else { input },
                 loop_bk.pending_quit,
                 chunks[INPUT_CHUNK].width,
                 theme,
@@ -1032,9 +1439,48 @@ fn run_loop<B: Backend, E: EventSource>(
                 ) {
                     continue;
                 }
+                // 路由顺序是硬约束:先应用级退出/弹窗,再**可见视图**,最后才是
+                // 父审批。旁支视图绝不经过主视图的 pending_permission 分支,
+                // 否则在旁支里按 Enter 会替父会话批准一次工具调用。
+                if in_side {
+                    match handle_side_key(key, &mut side_session, &channels) {
+                        KeyOutcome::Quit => break,
+                        _ => {
+                            sync_popup(&mut popup_stack.popup, &side_session.input.buffer);
+                            continue;
+                        }
+                    }
+                }
                 let history_area = layout.chunks[0];
                 let history_text_width =
                     history.text_width(history_area.width, history_area.height);
+                if !in_side
+                    && intercept_side_command(key, input, history, history_text_width, &channels)
+                {
+                    continue;
+                }
+                // 父审批提示显示时，先走「裁决 vs 命令」模式路由。这必须在
+                // `handle_key` 之前：那里对 Enter 的处理是「默认批准」，而命令
+                // 模式下的 Enter 只执行命令，两者绝不能共用一条分支。
+                if history.pending_permission_info().is_some() {
+                    match route_parent_approval_key(
+                        key,
+                        &mut loop_bk.approval_mode,
+                        &mut loop_bk.saved_approval_draft,
+                        input,
+                        history,
+                        history_text_width,
+                        &channels,
+                    ) {
+                        ApprovalRoute::Handled(KeyOutcome::Quit) => break,
+                        ApprovalRoute::Handled(_) => continue,
+                        ApprovalRoute::PassThrough => {}
+                    }
+                } else {
+                    // 审批消失后模式必须复位，否则下一次审批会凭空处于命令模式。
+                    loop_bk.approval_mode = crate::tui::side::ApprovalInputMode::Decision;
+                    loop_bk.saved_approval_draft = None;
+                }
                 let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
                 // 每次按键现算:覆盖刚被 `/effort` 改过,清单也可能被 `/model`
                 // 选中新条目——两者都不该缓存住。
@@ -2314,6 +2760,352 @@ fn handle_key_intercepts(key: KeyEvent, ctx: &mut InterceptContext<'_>) -> bool 
 ///
 /// 分组依据是实测的使用频次：高频且互相纠缠的（history/input/popup/尺寸）
 /// 放 `View`；只读的运行时依赖放 `Runtime`；模型选择放 `Model`。
+/// 主视图里敲 `/side`、`/btw` 的拦截。
+///
+/// 必须在 `handle_key` **之前**:那里会把回车当成一次普通提交投进主 `input`
+/// 通道,于是运行中的父会话会被插话打断——正是旁支要避免的事。这里只拦
+/// 「首 token 是 /side 或 /btw」的回车,其余按键原样放行。
+fn intercept_side_command(
+    key: KeyEvent,
+    input: &mut InputLine,
+    history: &mut HistoryState,
+    history_width: u16,
+    channels: &TuiChannels,
+) -> bool {
+    if key.code != KeyCode::Enter || !key.modifiers.is_empty() {
+        return false;
+    }
+    let text = input.buffer.trim();
+    let Some(rest) = text.strip_prefix('/') else {
+        return false;
+    };
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if name != super::side::SIDE_COMMAND && name != super::side::SIDE_ALIAS {
+        return false;
+    }
+    let question = rest[name_end..].trim();
+    let question = (!question.is_empty()).then(|| question.to_string());
+
+    // 没有旁支能力时**不能**静默吞掉:用户敲了 `/side` 却没反应,只会以为
+    // 是输入没生效。清空输入并把原因写进主转录。
+    let Some(commands) = channels.side.as_ref() else {
+        input.clear();
+        history.push(
+            HistoryCell::Separator {
+                label: Some("本次会话未启用旁支（/side 不可用）".to_string()),
+            },
+            history_width,
+        );
+        return true;
+    };
+    let command = crate::side_driver::SideDriverCommand::Open {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        question,
+    };
+    input.clear();
+    let _ = commands.try_send(command);
+    true
+}
+
+/// 旁支视图里的按键裁决。
+///
+/// 旁支**绝不**经过主视图的 `pending_permission` 分支:父会话的审批必须 `back`
+/// 回去才能处理,在旁支里按 Enter 不能替父做决定。这也是把旁支按键单独抽出来
+/// 的原因——它不是「主视图按键的一个分支」,而是一条独立的、只读的路。
+fn handle_side_key(key: KeyEvent, side: &mut SideSession, channels: &TuiChannels) -> KeyOutcome {
+    // 应用级退出在任何视图都必须可达,且不被字符输入吞掉。
+    match key.code {
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return KeyOutcome::Quit;
+        }
+        KeyCode::Esc => {
+            // Esc 只停**当前可见**的旁支轮次,不退出、不碰父会话。
+            //
+            // 判定统一走 `visible_stop_target`:旁支空闲时它返回 `None`,
+            // 也就是「什么也不做」。这条规则只写一遍,免得按键层与退出层
+            // 各自实现一套、慢慢长出分歧。
+            let active = match &side.active_side() {
+                Some(view) => crate::tui::side::ConversationTarget::Side {
+                    side_id: view.side_id.clone(),
+                    generation: view.generation,
+                },
+                None => crate::tui::side::ConversationTarget::Main,
+            };
+            if let Some(crate::tui::side::ConversationTarget::Side { .. }) =
+                crate::tui::side::visible_stop_target(&active, false, side.side_running())
+                && let (Some(turn_id), Some(commands)) =
+                    (side.active_turn_id.clone(), channels.side.as_ref())
+            {
+                let _ =
+                    commands.try_send(crate::side_driver::SideDriverCommand::Interrupt { turn_id });
+            }
+            return KeyOutcome::None;
+        }
+        _ => {}
+    }
+
+    match key.code {
+        KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+            side.history.select_up();
+            return KeyOutcome::None;
+        }
+        KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+            side.history.select_down();
+            return KeyOutcome::None;
+        }
+        KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+            side.history.toggle_fold_selected();
+            return KeyOutcome::None;
+        }
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+            let max = side.history.max_scroll_offset(80, 24);
+            side.history.scroll_up(10, max);
+            return KeyOutcome::None;
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            side.history.scroll_down(10);
+            return KeyOutcome::None;
+        }
+        _ => {}
+    }
+
+    match side.input.handle_key(key) {
+        InputAction::Submit => {
+            let text = side.input.take_submitted();
+            if text.trim().is_empty() {
+                return KeyOutcome::None;
+            }
+            match classify_conversation_input(&text, true) {
+                Ok(RoutedInput::Side(SideInput::Back)) => {
+                    side.views.back();
+                    KeyOutcome::None
+                }
+                Ok(RoutedInput::Side(SideInput::Close)) => {
+                    if let Some(commands) = channels.side.as_ref() {
+                        let expected = side.active_turn_id.clone();
+                        let _ = commands.try_send(crate::side_driver::SideDriverCommand::Close {
+                            expected_active_turn_id: expected,
+                        });
+                    }
+                    KeyOutcome::None
+                }
+                Ok(RoutedInput::Side(SideInput::Submit(question))) => {
+                    submit_side_question(side, channels, question);
+                    KeyOutcome::None
+                }
+                Ok(RoutedInput::Side(SideInput::LocalCommand(name))) => {
+                    side.notice = Some(match name.as_str() {
+                        "cost" => format_side_usage(side),
+                        "config" => "旁支继承父会话的模型与推理档；只读，不能改配置".to_string(),
+                        _ => "/back 返回主会话，/side-close 关闭旁支".to_string(),
+                    });
+                    KeyOutcome::None
+                }
+                Ok(RoutedInput::Side(SideInput::Open { .. })) => {
+                    side.notice = Some("已经在旁支里了，不能再开一个旁支".to_string());
+                    KeyOutcome::None
+                }
+                Ok(RoutedInput::Main(_)) => {
+                    // 分类器在旁支内不会返回 Main;真发生了说明规则被改坏了。
+                    side.notice = Some("旁支里只能提问或使用 /back、/side-close".to_string());
+                    KeyOutcome::None
+                }
+                Err(error) => {
+                    side.notice = Some(error.message);
+                    KeyOutcome::None
+                }
+            }
+        }
+        InputAction::Consumed | InputAction::NotHandled => KeyOutcome::None,
+    }
+}
+
+/// 审批模式路由的结果。
+enum ApprovalRoute {
+    /// 这一键已被审批/命令逻辑消费。
+    Handled(KeyOutcome),
+    /// 交给后续的常规按键处理（例如滚动、Ctrl+C）。
+    PassThrough,
+}
+
+/// 父审批提示显示时的一层按键前置路由。
+///
+/// 顺序是硬约束（设计 §10.3）：
+///
+/// 1. 应用级退出（Ctrl+Q）在任何模式下都可达；
+/// 2. `/` 从裁决模式进入命令模式，并保存当前草稿；
+/// 3. 命令模式下的 Enter 只执行命令，**永不**发裁决；
+/// 4. Esc 在命令模式里只退出命令模式并恢复草稿；
+/// 5. 其余键仍交给原有裁决逻辑（数字/Enter 批准）。
+#[allow(clippy::too_many_arguments)]
+fn route_parent_approval_key(
+    key: KeyEvent,
+    mode: &mut crate::tui::side::ApprovalInputMode,
+    saved_draft: &mut Option<String>,
+    input: &mut InputLine,
+    history: &mut HistoryState,
+    history_width: u16,
+    channels: &TuiChannels,
+) -> ApprovalRoute {
+    use crate::tui::side::{ApprovalInputMode, ApprovalKeyAction, route_approval_key};
+
+    match route_approval_key(key, mode) {
+        ApprovalKeyAction::ApplicationExit => ApprovalRoute::Handled(KeyOutcome::Quit),
+        ApprovalKeyAction::EnterCommandMode => {
+            *saved_draft = Some(input.buffer.clone());
+            input.clear();
+            ApprovalRoute::Handled(KeyOutcome::None)
+        }
+        ApprovalKeyAction::ExitCommandMode => {
+            input.clear();
+            if let Some(draft) = saved_draft.take() {
+                input.insert_str(&draft);
+            }
+            ApprovalRoute::Handled(KeyOutcome::None)
+        }
+        ApprovalKeyAction::EditCommand(key) => {
+            if key.code == KeyCode::Enter {
+                let text = input.take_submitted();
+                *saved_draft = None;
+                return ApprovalRoute::Handled(exec_approval_command(
+                    text,
+                    input,
+                    history,
+                    history_width,
+                    channels,
+                ));
+            }
+            // 命令模式下的普通编辑键：只改输入行，不碰裁决。
+            let _ = input.handle_key(key);
+            ApprovalRoute::Handled(KeyOutcome::None)
+        }
+        ApprovalKeyAction::DecisionKey(_) if *mode == ApprovalInputMode::Command => {
+            // 理论上不可达（Command 分支已在上方返回），保守起见仍然消费掉。
+            ApprovalRoute::Handled(KeyOutcome::None)
+        }
+        ApprovalKeyAction::Consumed => ApprovalRoute::Handled(KeyOutcome::None),
+        ApprovalKeyAction::DecisionKey(_) => ApprovalRoute::PassThrough,
+    }
+}
+
+/// 父审批态「命令模式」里执行一条命令。
+///
+/// 白名单刻意很小:只有 `/side`(`/btw`)、`/back`、`/side-close`、`/help`
+/// 与 `/quit`。其余命令一律拒绝并**保留输入**——在审批提示上面执行
+/// `/clear`、`/model` 之类的命令会让用户误以为对话框还能继续编辑，
+/// 而且这些命令会在审批未决时改变父会话状态。
+///
+/// 本函数**不**触碰 `decision` 通道:命令永远不等于批准。
+fn exec_approval_command(
+    text: String,
+    input: &mut InputLine,
+    history: &mut HistoryState,
+    history_width: u16,
+    channels: &TuiChannels,
+) -> KeyOutcome {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return KeyOutcome::None;
+    }
+    let name = trimmed
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    // 退出类：与主视图一致。
+    if matches!(name.as_str(), "quit" | "q") && trimmed.starts_with('/') {
+        return KeyOutcome::Quit;
+    }
+
+    match crate::tui::side::classify_conversation_input(trimmed, false) {
+        Ok(crate::tui::side::RoutedInput::Side(crate::tui::side::SideInput::Open { question })) => {
+            let Some(commands) = channels.side.as_ref() else {
+                history.push(
+                    HistoryCell::Separator {
+                        label: Some("本次会话未启用旁支（/side 不可用）".to_string()),
+                    },
+                    history_width,
+                );
+                return KeyOutcome::None;
+            };
+            let _ = commands.try_send(crate::side_driver::SideDriverCommand::Open {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                question,
+            });
+            KeyOutcome::None
+        }
+        _ if name == "help" => {
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(
+                        "审批中的命令：/side（/btw）、/help、/quit。命令不会批准本请求".to_string(),
+                    ),
+                },
+                history_width,
+            );
+            KeyOutcome::None
+        }
+        _ => {
+            // 拒绝但保留原文：用户可能只是打错了，直接清空会让他重打一遍。
+            input.insert_str(&text);
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(format!(
+                        "/{name} 不能在审批中使用（只允许 /side、/help、/quit）。这是命令，不会批准"
+                    )),
+                },
+                history_width,
+            );
+            KeyOutcome::None
+        }
+    }
+}
+
+/// 把一个问题发给旁支。
+///
+/// 请求 id 在「第一次发送」时生成并记住;同一条草稿重试时复用同一个 id,
+/// 这样 driver 侧的去重记录能把它认成同一次请求,而不是又跑一轮。
+fn submit_side_question(side: &mut SideSession, channels: &TuiChannels, question: String) {
+    let Some(commands) = channels.side.as_ref() else {
+        side.notice = Some("本次会话未启用旁支".to_string());
+        return;
+    };
+    let request_id = side
+        .pending_request
+        .as_ref()
+        .filter(|(_, pending)| *pending == question)
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    side.pending_request = Some((request_id.clone(), question.clone()));
+    let command = crate::side_driver::SideDriverCommand::Submit {
+        request_id,
+        text: question,
+    };
+    if commands.try_send(command).is_err() {
+        side.notice = Some("旁支忙，问题未送达（请稍后重试）".to_string());
+    }
+}
+
+/// 旁支用量的一行摘要。从零累计,不读父会话的费用。
+fn format_side_usage(side: &SideSession) -> String {
+    let total = side.usage.total;
+    format!(
+        "旁支用量：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {}{}",
+        total.input,
+        total.output,
+        total.cache_read,
+        total.cache_creation,
+        if side.usage.complete {
+            ""
+        } else {
+            "（部分轮次未拿到供应商最终值）"
+        }
+    )
+}
+
 struct KeyContext<'a> {
     view: ViewContext<'a>,
     runtime: RuntimeContext<'a>,
@@ -6004,6 +6796,194 @@ mod tests {
             handle.await.unwrap();
             assert_eq!(input_rx.recv().await.unwrap(), "hello");
         });
+    }
+
+    /// 父审批提示显示时敲 `/` 进入命令模式，Enter 只执行命令。
+    ///
+    /// 这是设计 §10.3 最危险的一条：Enter 平时是「默认批准」。如果命令模式
+    /// 复用了同一条分支，用户想敲命令却意外批准了一次工具调用。测试必须断言
+    /// **decision 通道一个字节都没收到**，而不只是断言界面文字。
+    #[test]
+    fn parent_approval_command_mode_does_not_approve_on_enter() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        agent_tx
+            .try_send(AgentEvent::PermissionRequest {
+                request_id: 7,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            })
+            .unwrap();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let events = ScriptedEvents {
+            // `poll` pops from the back, so this is delivered in reverse:
+            // Ctrl+Q gets the loop out without ever approving.
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/help".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut title = crate::tui::title::TitleHandle::disabled();
+
+        run_loop(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+        )
+        .unwrap();
+
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "命令模式下的 Enter 绝不能批准父会话的工具调用"
+        );
+    }
+
+    /// 旁支事件与旁支转录**绝不**能进入主 TurnLog / 主会话文件。
+    ///
+    /// 这是整个旁支设计最不能退化的一条：一旦漏进去，旁问就会被持久化、
+    /// 被 resume 回放，父任务的历史被污染。测试用真实 `TuiSessionStore` +
+    /// 真实 `TurnLog`，把主/旁事件同时喂进同一个 TUI 循环，然后直接读盘断言。
+    #[test]
+    fn side_events_never_reach_main_turn_log() {
+        let project = tempfile::TempDir::new().unwrap();
+        let store = crate::session_store::TuiSessionStore::create_new(
+            project.path(),
+            "test-model",
+            yi_agent_app_server::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        let thread_id = store.thread_id().to_string();
+
+        // 主会话落一轮：只有主消息，旁问文本不在其中。
+        let main_items = vec![yi_agent_app_server::protocol::Item::UserMessage {
+            id: "user-main".into(),
+            text: "主会话的问题".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }];
+        let main_messages = vec![yi_agent_core::Message::user("主会话的问题")];
+        store
+            .append_turn(&main_items, &main_messages, None, None)
+            .unwrap();
+
+        // 旁问走了它自己的通道（`ConversationPayload::SideItems`），
+        // 这段文本只出现在旁支视图里，从不经过 `TurnLog`。
+        let side_only_marker = "SIDE-ONLY-MARKER";
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(16);
+        let (side_cmd_tx, mut side_cmd_rx) = tokio::sync::mpsc::channel(8);
+        side_tx
+            .try_send(crate::tui::side::ConversationEvent {
+                target: crate::tui::side::ConversationTarget::Side {
+                    side_id: "side-1".into(),
+                    generation: 1,
+                },
+                turn_id: Some("turn-1".into()),
+                event: crate::tui::side::ConversationPayload::SideItems(vec![std::sync::Arc::new(
+                    yi_agent_runtime::side_conversation::SideItem {
+                        id: "side-item".into(),
+                        turn_id: "turn-1".into(),
+                        ordinal: 1,
+                        content:
+                            yi_agent_runtime::side_conversation::SideItemContent::AgentMessage {
+                                text: side_only_marker.into(),
+                            },
+                    },
+                )]),
+            })
+            .unwrap();
+        drop(agent_tx);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            ))])),
+        };
+        let mut title = crate::tui::title::TitleHandle::disabled();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_rx),
+        )
+        .unwrap();
+
+        // 落盘内容只含主消息。
+        let loaded = store.load_for_replay().unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        let serialized = format!("{:?}{:?}", loaded.items, loaded.messages);
+        assert!(
+            !serialized.contains(side_only_marker),
+            "旁支正文绝不能进父会话文件: {serialized}"
+        );
+        assert!(serialized.contains("主会话的问题"));
+
+        // 主 store 的 thread id 与回放 hint 仍是主会话，不是旁支。
+        assert_eq!(thread_id, store.thread_id());
+        let _ = side_cmd_rx.try_recv();
     }
 
     #[test]

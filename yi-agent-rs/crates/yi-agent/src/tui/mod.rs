@@ -13,6 +13,7 @@ pub mod process_popup;
 pub mod queued;
 pub mod replay;
 pub mod runtime_prefs;
+pub mod side;
 pub mod slash;
 pub mod state;
 pub mod statusbar;
