@@ -116,7 +116,15 @@ fn the_lead_tick_arm_is_gated_by_the_flag() {
     // `serve()` 里、位于本模块之后。改用完整源码，并取**最后一处**——本
     // 测试自己的 `.split("...")` 字面量也是一次命中，只有生产代码那处才在
     // 它后面还有 `if !lead_agent_enabled`。
-    let source = include_str!("../server.rs");
+    //
+    // 搬移（wave2 C2 batch 8）后 `serve()` 在 `server/transport/mod.rs`，所以
+    // 两段都要看。`server.rs` 放前面：它的 `.split` 命中的是本测试自己的字面量，
+    // 排在后面才能让 `rsplit` 取到真正的那一处。
+    let source = concat!(
+        include_str!("../server.rs"),
+        "\n",
+        include_str!("../server/transport/mod.rs"),
+    );
     let arm = source
         .rsplit("_ = lead_ticker.tick() => {")
         .next()
@@ -140,11 +148,18 @@ fn the_lead_tick_arm_is_gated_by_the_flag() {
 /// ② 迁移函数的**文档注释**里提到了那个即将被删的 crate 名(说明为何用字面量
 /// 而不是引用它),那是 prose 而非依赖,不该被当成命中。
 fn production_source() -> String {
-    let source = include_str!("../server.rs");
-    let production = source
+    // 搬移（wave2 C2 batch 8）后 `run` / `serve_stdio_with_relay` 在
+    // `server/transport/scoped.rs`，迁移调用点跟着走了。两段都要读：本文件的断言
+    // 问的是「生产入口有没有调」，与代码落在哪个文件无关。
+    //
+    // 逐文件截断再拼接：`#[cfg(test)]` 标记只在 `server.rs` 里，若先拼接再
+    // split，`scoped.rs` 会被并进"测试之后"的那一半而整段丢失。
+    let own = include_str!("../server.rs")
         .split("#[cfg(test)]\nmod legacy_migration_tests")
         .next()
         .expect("this module must exist");
+    let entries = include_str!("../server/transport/scoped.rs");
+    let production = format!("{own}\n{entries}");
     production
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
@@ -228,7 +243,7 @@ fn the_ws_test_seam_does_no_startup_work() {
 /// 入口（典型是 ws）静默不迁移。
 #[test]
 fn the_startup_migration_runs_both_model_and_settings_migrations() {
-    let source = include_str!("../server.rs");
+    let source = include_str!("../server/migration.rs");
     let start = source
         .find("pub(crate) fn migrate_legacy_model_keys_on_startup()")
         .expect("the startup migration function must exist");
