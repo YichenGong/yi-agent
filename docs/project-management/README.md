@@ -28,7 +28,7 @@
 | yi-agent-power | 12 / 12 | [详情](./yi-agent-power.md) |
 | yi-agent-subagent | 12 / 12 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 84 / 85 | [详情](./yi-agent-app-server.md) |
-| subagent-runtime | 62 / 73 | [详情](./subagent-runtime.md) |
+| subagent-runtime | 62 / 74 | [详情](./subagent-runtime.md) · [前台根生命周期 spec](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [plan](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md) |
 | yi-agent-lifecycle | 19 / 19 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 19 / 22 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |
 | desktop | 128 / 140 | [详情](./desktop.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) |
