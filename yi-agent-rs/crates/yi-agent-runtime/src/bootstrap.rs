@@ -915,6 +915,7 @@ mod tests {
                         on_exit: Default::default(),
                         ready_pattern: None,
                         ready_timeout_sec: None,
+                        prevent_idle_sleep: false,
                     }),
             )
             .expect("start");

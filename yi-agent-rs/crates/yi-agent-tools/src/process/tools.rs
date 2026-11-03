@@ -32,6 +32,10 @@ struct ProcessStartArgs {
     on_exit: OnExitPolicy,
     ready_pattern: Option<String>,
     ready_timeout_sec: Option<u64>,
+    /// 严格 boolean：缺省为 false。`serde(default)` 只在**字段不存在**时给默认值，
+    /// 显式的 `"true"` / `null` / `1` 仍会被 serde 拒绝（类型不符），这正是要的。
+    #[serde(default)]
+    prevent_idle_sleep: bool,
 }
 
 #[async_trait]
@@ -79,6 +83,11 @@ impl Tool for ProcessStartTool {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Seconds to wait for ready_pattern before returning with a warning."
+                },
+                "prevent_idle_sleep": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Request idle-sleep protection for finite background work while the owning app-server session is alive. Default false; do not enable for persistent servers/watchers. Independent of readiness and on_exit. Other entrypoints only retain this intent; they do not own a sleep assertion."
                 }
             },
             "required": ["command"]
@@ -99,6 +108,7 @@ impl Tool for ProcessStartTool {
             on_exit: args.on_exit,
             ready_pattern: args.ready_pattern,
             ready_timeout_sec: args.ready_timeout_sec,
+            prevent_idle_sleep: args.prevent_idle_sleep,
         };
 
         match self.manager.start(opts).await {
@@ -444,5 +454,67 @@ mod tests {
         let kill = ProcessKillTool::new(Arc::clone(&manager)).metadata();
         assert!(kill.requires_confirmation);
         assert!(!kill.read_only);
+    }
+}
+
+#[cfg(test)]
+mod sleep_hardening_tests {
+    use serde_json::json;
+    use yi_agent_core::Tool;
+
+    use super::{ProcessStartArgs, ProcessStartTool};
+    use crate::process::manager::ProcessManager;
+
+    /// B1：schema 暴露一个**可选**、默认 false 的严格 boolean。
+    #[test]
+    fn sleep_hardening_schema_exposes_explicit_boolean() {
+        let tool = ProcessStartTool::new(ProcessManager::new(std::env::temp_dir()));
+        let schema = tool.schema();
+        assert_eq!(
+            schema["properties"]["prevent_idle_sleep"]["type"],
+            "boolean"
+        );
+        assert_eq!(schema["properties"]["prevent_idle_sleep"]["default"], false);
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "prevent_idle_sleep"),
+            "the intent must stay optional"
+        );
+    }
+
+    /// B1：省略 / false / true 分别是 false / false / true。
+    #[test]
+    fn sleep_hardening_omitted_false_true_deserialize_as_expected() {
+        let omitted: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1" })).unwrap();
+        assert!(!omitted.prevent_idle_sleep);
+
+        let explicit_false: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1", "prevent_idle_sleep": false }))
+                .unwrap();
+        assert!(!explicit_false.prevent_idle_sleep);
+
+        let explicit_true: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1", "prevent_idle_sleep": true }))
+                .unwrap();
+        assert!(explicit_true.prevent_idle_sleep);
+    }
+
+    /// B1：非 boolean 一律拒绝，而不是被宽松地转成 true/false。
+    #[test]
+    fn sleep_hardening_non_boolean_is_rejected() {
+        for bad in [json!("true"), json!(null), json!(1)] {
+            let parsed: Result<ProcessStartArgs, _> = serde_json::from_value(json!({
+                "command": "sleep 1",
+                "prevent_idle_sleep": bad,
+            }));
+            assert!(
+                parsed.is_err(),
+                "prevent_idle_sleep={bad} must be rejected, not coerced"
+            );
+        }
     }
 }
