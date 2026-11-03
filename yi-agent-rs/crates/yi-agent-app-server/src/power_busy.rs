@@ -73,15 +73,21 @@ pub(crate) fn state_counts_as_busy(state: &str) -> bool {
 /// 的进程表遍历（两者是不同的锁，嵌套会引入不必要的耦合）。
 pub(crate) fn local_busy(threads: &HashMap<String, ThreadSession>) -> bool {
     threads.values().any(|session| {
-        session.active_turn_id.is_some()
-            || !matches!(
-                *session
-                    .status
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ThreadStatus::Idle
-            )
-            || session.process_manager.has_sleep_preventing_processes()
+        if session.active_turn_id.is_some() {
+            return true;
+        }
+        // 先算成 `bool` 再比较：写成 `!matches!(*status.lock()... , Idle) || ...`
+        // 时，锁 guard 作为操作数的临时值会活到**整条语句**结束，于是下面那次
+        // 进程表遍历仍持着状态锁——正是上面说的嵌套。显式作用域让 guard 在这里
+        // 结束。
+        let status_busy = {
+            let status = session
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            !matches!(*status, ThreadStatus::Idle)
+        };
+        status_busy || session.process_manager.has_sleep_preventing_processes()
     })
 }
 
