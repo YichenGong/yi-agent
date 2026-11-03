@@ -18,6 +18,8 @@
 //! runtime.
 
 pub mod admission;
+pub mod bringup;
+pub mod claim;
 pub mod demands;
 pub mod guardian;
 pub mod managed_channel;
@@ -25,6 +27,7 @@ pub mod migration;
 pub mod processes;
 pub mod reclaim;
 pub mod retirement;
+pub mod roles;
 pub mod scope;
 pub mod selection;
 

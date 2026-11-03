@@ -139,4 +139,30 @@
   `cargo test -p yi-agent-app-server --lib`（1161 passed）；**变异验证**：忽略"job 是不是我们的程序"
   直接 bootout → 1 例红；跳过确认串校验 → 1 例红；无人值守循环忽略退休标记 → 1 例红；
   插件安装钩子忽略退休标记 → 1 例红；`ui/settings/write` 忽略退休标记 → 1 例红（均实测 RED 后恢复）
+- [x] 唯一 managed bring-up 与私有运行角色（Task 11） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/{bringup,claim,roles}.rs`、`yi-agent-rs/crates/yi-agent/src/{managed_runtime,config,main}.rs`、`yi-agent-rs/crates/yi-agent-subagent/src/attach.rs`。
+  四件事各自防一种具体的错：**① 探测三态，`Unresponsive` 永不等于 `Absent`**（`ProbeOutcome`）——超时、权限错误、wedge 的监听者在两态模型里都会读成"没人跑"，于是再起一个 daemon 落在同一个库上；
+  三态让"问了没答"只能等到预算耗尽后报 `ManualActionRequired`。**② 协调锁内先探再决**（`ensure_managed_with`）：并发 attach 排队后观察同一个 daemon，
+  锁内重探若只是"尚未 bind"的暂态则在**调用方总预算**内继续等，而不是当成 wedge 立刻放弃——guardian 刚起来时 socket 已监听但还没读完请求，
+  这个窗口真实存在，判成 wedge 会把每次成功启动变成间歇失败。**③ Inspect 从不登记、不取锁、不建目录**（`BringUpIntent::may_start`，
+  自带 2 秒上限）：探测跑在 UI 轮询里，"看一眼谁在跑"若创建了 runtime 目录，就是这一 intent 存在的理由本身被违反。**④ 一个目录一个 scope**
+  （`lifecycle/claim.rs`，`scope.json` 0600 原子写）：`YI_AGENT_RUNTIME_DIR` 能让两个项目／两个配置实例指向同一个目录，路径完全相同无法区分，
+  首个协调者在锁内写下 project_key 与 instance home，后来者只比对、只报错（消息点名两边与换目录的出路），绝不另建库或起第二个 daemon；损坏的 claim 是
+  `InvalidData` 而不是 `None`（读成"未认领"会让占用中的 runtime 被覆盖）。
+  **产物固定为校验副本**（`pin_artifact` / `verify_pinned`）：`<instance>/artifacts/<build_id>/yi-agent`，流式复制 + SHA-256，目录 0700／文件 0700，
+  复制前后 digest 不符即删临时文件报 `InvalidData`；selection 指向该缓存并带 digest，bundle 被替换或删除都不会让旧客户端改用 PATH。
+  **私有角色无授权不起**（`roles.rs`）：`internal-runtime guardian` / `daemon` 都 `hide = true`，必须持有 launcher dup 进来的 `YI_AGENT_BOOTSTRAP_FD`
+  与 `YI_AGENT_SCOPE_KEY`；std 流号（≤2）被拒，且 `from_raw_fd` 前必须 `fcntl(F_GETFD)` 探活——对已关闭的号取所有权会以 `IO Safety violation` 直接 abort
+  （实测踩到，是 abort 不是 Err）。guardian 的授权检查先于 scope 解析：错误必须是"这不是你的角色"，而不是"去设个 scope key"。
+  `attach_managed_project_runtime` 走同一套 attach 请求且 `embedded_daemon: None`——受管模式下客户端退出不得带走 runtime；
+  `BringUpPolicy::default_for_build()` 仍为 `Embedded`，默认切换留 Task 18。
+  判据：`cargo test -p yi-agent-supervisors --test managed_bringup`（22 passed）、`cargo test -p yi-agent-supervisors --lib claim`（7 passed）、
+  `cargo test -p yi-agent --test managed_roles`（5 passed）、`cargo test -p yi-agent-subagent --test bringup_policy`（3 passed）、
+  `cargo test -p yi-agent-supervisors`（110 lib + 集成全绿）、`cargo test -p yi-agent --bin yi-agent`（842 passed）；
+  **变异验证**：把 `Unresponsive` 当 `Absent` → 1 例红；`may_start()` 恒真 → 1 例红；legacy 当作同构建 → 1 例红；
+  跳过 schema 预检 → 1 例红；release 的 grace 重新 clamp 到调用方预算 → 1 例红（均实测 RED 后恢复）
+- [x] 回收窗口不被调用方预算截断（Task 9 修正） — `Reclaimer::release` 曾把 10 秒优雅窗口 clamp 到控制请求的 2 秒超时，
+  等于 spec 承诺的 10 + 5 秒从未生效，仍在干净退出的客户端工作会被提前终止。现在 `deadline` 只约束同步段（耗尽即 `WouldBlock`，尚未改动任何状态），
+  后台回收线程用固定的 `RECLAIM_GRACE` / `RECLAIM_CONFIRM`。判据：`cargo test -p yi-agent-supervisors --test client_reclamation`
+  （20 passed，含 `a_short_callers_budget_does_not_shorten_the_grace_window`——停得慢的组在 700ms 优雅期内自行退出时不得出现 terminate 调用）；
+  变异验证：恢复 `deadline.clamp(self.grace)` → 该例红（实测 RED 后恢复）
 - [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)

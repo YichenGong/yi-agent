@@ -976,3 +976,155 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Managed bring-up
+// ---------------------------------------------------------------------------
+
+/// Which way a runtime is brought up.
+///
+/// The default stays the embedded path until the managed one has been through real
+/// process validation (Task 18): switching the default here would make every user
+/// the test of a path that has not run end to end yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BringUpPolicy {
+    /// Today's behaviour: the caller may embed a daemon in its own process.
+    Embedded,
+    /// The one managed path: guardian, then the daemon under it.
+    Managed,
+}
+
+impl BringUpPolicy {
+    /// The policy this build uses by default.
+    ///
+    /// Deliberately `Embedded`. Flipping it is a separate, validated step, and
+    /// doing it here would hide the choice inside a default that no test names.
+    pub fn default_for_build() -> Self {
+        Self::Embedded
+    }
+
+    /// Explicit selection, e.g. from an internal mode a test drives.
+    pub fn from_env() -> Self {
+        Self::from_value(std::env::var("YI_AGENT_BRINGUP").ok().as_deref())
+    }
+
+    /// The pure part of [`Self::from_env`], so the mapping can be tested without
+    /// mutating a process-global variable every other test also reads.
+    pub fn from_value(value: Option<&str>) -> Self {
+        match value {
+            Some("managed") => Self::Managed,
+            _ => Self::default_for_build(),
+        }
+    }
+}
+
+/// Attaches to a project's runtime through the managed bring-up path.
+///
+/// Difference from [`attach_project_runtime`]: it never starts a daemon in this
+/// process. The guardian owns the daemon, so this process exiting cannot take the
+/// runtime down while another frontend is still using it — which is the whole point
+/// of the managed mode.
+///
+/// `expected` describes the artifact this caller wants. A runtime that answers with
+/// anything else comes back as a version choice rather than being used silently.
+pub fn attach_managed_project_runtime(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    instance_home: &Path,
+    expected: &yi_agent_lifecycle::types::ArtifactIdentity,
+    intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
+    deadline: yi_agent_lifecycle::deadline::Deadline,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    use yi_agent_supervisors::lifecycle::bringup::{
+        BringUpResult, ensure_managed, scope_for_existing,
+    };
+
+    let scope = scope_for_existing(&runtime_dir, &cfg.workdir, instance_home)
+        .map_err(|error| AttachFailure::new("runtime scope", error))?;
+    match ensure_managed(&scope, expected, intent, deadline) {
+        Ok(BringUpResult::Connected { .. }) => {}
+        Ok(BringUpResult::VersionChoiceRequired { identity }) => {
+            // Not a failure to work around: the user has to choose. Reporting it as
+            // a plain attach error would look like a bug rather than a decision.
+            return Err(AttachFailure::new(
+                "runtime version",
+                format!(
+                    "the running runtime is build {} and differs from this client; \
+                     it must be switched or temporarily accepted explicitly",
+                    identity.daemon_build_id.as_deref().unwrap_or("unknown")
+                ),
+            ));
+        }
+        Ok(BringUpResult::ManualActionRequired { reason }) => {
+            return Err(AttachFailure::new("runtime bring-up", reason));
+        }
+        Err(error) => return Err(AttachFailure::new("runtime bring-up", error)),
+    }
+    attach_to_answer(
+        cfg,
+        &runtime_dir,
+        // The managed path never owns the daemon, so it never supervises plugins.
+        None,
+    )
+}
+
+/// Attaches one root over an already-decided runtime.
+///
+/// Split from the bring-up so both paths share the attach request: a second copy of
+/// it is exactly how the two would drift apart on what a rejection means.
+fn attach_to_answer(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    instance_home: Option<&Path>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    let socket_path = yi_agent_store::ipc::socket_path_for(runtime_dir)
+        .map_err(|error| AttachFailure::new("runtime directory", error))?;
+    let idempotency_key = format!(
+        "project:{}:{}:{}",
+        std::process::id(),
+        cfg.workdir.display(),
+        uuid::Uuid::new_v4()
+    );
+    let response = send_request(
+        &socket_path,
+        yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
+            idempotency_key,
+            workspace: cfg.workdir.clone(),
+            extra_roots: Vec::new(),
+        },
+    )
+    .map_err(|error| match &error {
+        IpcError::Io(io) if is_startup_io(io) => AttachFailure::transient("attach", error),
+        _ => AttachFailure::new("attach", error),
+    })?;
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        workspace,
+    } = response
+    else {
+        return Err(AttachFailure::new("attach", describe_rejection(&response)));
+    };
+    let _ = instance_home;
+    Ok(AttachedProjectRuntime {
+        socket_path,
+        workspace_root: workspace.path.clone(),
+        project_root: cfg.workdir.clone(),
+        attached_root: AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
+        },
+        // Managed mode never owns a daemon: the guardian does, and a client that
+        // held a handle to it would reintroduce "the client's exit kills the
+        // runtime".
+        embedded_daemon: None,
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &cfg.workdir,
+            runtime_dir,
+            false,
+        ),
+    })
+}

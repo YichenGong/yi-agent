@@ -265,6 +265,21 @@ pub enum InternalRuntimeAction {
         #[arg(long)]
         models: Option<std::path::PathBuf>,
     },
+    #[command(hide = true)]
+    /// Serve one runtime as its guardian.
+    ///
+    /// Started by a bring-up with an inherited bootstrap descriptor and the scope
+    /// key in the environment; never typed by a user. Refuses to run without both:
+    /// a guardian that accepted its scope from a command line could adopt another
+    /// project's process groups.
+    Guardian,
+    #[command(hide = true)]
+    /// Serve one runtime's business daemon, under its guardian.
+    ///
+    /// Same authorization as `guardian`; this is the *only* daemon start that
+    /// carries the exit guarantees, which is why it is a private role and not a
+    /// flag on the public `daemon serve`.
+    Daemon,
 }
 
 #[derive(clap::Subcommand, Debug)]

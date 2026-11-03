@@ -58,11 +58,32 @@ struct RecordingBackend {
     stopped: Vec<String>,
     /// Owners whose groups can never be proven stopped, whatever is sent.
     immortal: Vec<String>,
+    /// Owners that stop cleanly, but only after cooperating for a while:
+    /// `(owner, delay after the stop request)`. The delay is real time, because the
+    /// grace window is real time -- the guarantee is about elapsed seconds, not
+    /// about the injected clock.
+    stops_after: Vec<(String, Duration, std::time::Instant)>,
+}
+
+impl RecordingBackend {
+    /// Makes `owner` take `delay` to stop after being asked, instead of exiting at
+    /// once. Models a group that is still finishing its own cleanup.
+    fn stops_after(&mut self, owner: &str, delay: Duration) {
+        self.stops_after
+            .push((owner.to_string(), delay, std::time::Instant::now()));
+    }
 }
 
 impl ProcessBackend for RecordingBackend {
     fn request_stop(&mut self, owner: &ProcessOwner) -> Vec<String> {
-        self.stops_requested.push(owner_label(owner));
+        let label = owner_label(owner);
+        self.stops_requested.push(label.clone());
+        for (slow, delay, started) in self.stops_after.iter_mut() {
+            if *slow == label {
+                *started = std::time::Instant::now();
+                let _ = delay;
+            }
+        }
         Vec::new()
     }
 
@@ -78,7 +99,14 @@ impl ProcessBackend for RecordingBackend {
     }
 
     fn is_stopped(&mut self, owner: &ProcessOwner) -> std::io::Result<bool> {
-        Ok(self.stopped.contains(&owner_label(owner)))
+        let label = owner_label(owner);
+        if self.stopped.contains(&label) {
+            return Ok(true);
+        }
+        Ok(self
+            .stops_after
+            .iter()
+            .any(|(slow, delay, started)| *slow == label && started.elapsed() >= *delay))
     }
 }
 
@@ -773,4 +801,69 @@ fn expiry_and_release_drive_the_same_reclamation() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(reclaimer.result(&operation).is_some());
+}
+
+/// The caller's request budget must not shorten the published grace window.
+///
+/// The control connection answers a release within 2 seconds, and that timeout used
+/// to be reused as the teardown budget: every release therefore got 2 seconds of
+/// grace instead of 10, and client work still stopping cleanly was terminated. The
+/// bug is invisible from a fast test backend, so this one makes the stop slow
+/// relative to the caller's budget and asserts the graceful phase still wins.
+#[test]
+fn a_short_callers_budget_does_not_shorten_the_grace_window() {
+    let directory = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let backend = Arc::new(Mutex::new(RecordingBackend::default()));
+    // 700 ms of grace against a 50 ms caller budget: if the two were conflated the
+    // terminate would happen almost immediately.
+    let grace = Duration::from_millis(700);
+    let mut reclaimer = Reclaimer::with_windows(
+        scope(&directory),
+        "gen-1",
+        clock.clone(),
+        backend.clone(),
+        grace,
+        Duration::from_millis(300),
+    );
+    let now = clock.now();
+    let grant = reclaimer
+        .register("app".to_string(), ClientKind::App, LeaseMode::Business, now)
+        .unwrap();
+    reclaimer
+        .clients_mut()
+        .bind_root("app", "thread:a", "gen-1")
+        .unwrap();
+    // Stop lazily: the group leaves only after the graceful phase has had time to
+    // run, so an escalation that happened early is visible as a terminate call.
+    backend
+        .lock()
+        .unwrap()
+        .stops_after("app", Duration::from_millis(250));
+
+    let started = std::time::Instant::now();
+    let operation = reclaimer
+        .release(grant, Deadline::after(Duration::from_millis(50)))
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a release must return at once, not wait out the grace window"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while reclaimer.result(&operation).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the release never finished"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = reclaimer.result(&operation).unwrap();
+    assert!(result.stopped, "{:?}", result.failures);
+    assert!(
+        backend.lock().unwrap().terminated.is_empty(),
+        "the group stopped on its own inside the grace window, so nothing may be \
+         terminated -- a terminate here means the 10 s grace was cut to the caller's \
+         50 ms budget"
+    );
 }

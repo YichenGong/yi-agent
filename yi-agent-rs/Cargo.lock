@@ -5303,6 +5303,7 @@ version = "0.1.13"
 dependencies = [
  "chrono",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

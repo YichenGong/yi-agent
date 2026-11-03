@@ -305,7 +305,22 @@ impl Reclaimer {
     /// the caller for the whole 10 + 5 seconds would make the control connection —
     /// and with it the explain-why path — unavailable exactly when a frontend is
     /// trying to shut down.
+    ///
+    /// `deadline` bounds **only** that synchronous part. The teardown windows that
+    /// the background thread uses are [`RECLAIM_GRACE`] and [`RECLAIM_CONFIRM`], and
+    /// they are deliberately not derived from the caller's budget: the caller's
+    /// deadline is the control connection's request timeout (2 seconds), so folding
+    /// the two together would silently cap a 10-second grace at 2 seconds and
+    /// terminate client work while it was still stopping cleanly.
     pub fn release(&mut self, grant: ClientGrant, deadline: Deadline) -> io::Result<OperationId> {
+        if deadline.is_expired() {
+            // Nothing has changed yet, so refusing costs the client nothing and
+            // avoids starting a 15-second teardown it can never observe.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the caller's budget was already spent before the release began",
+            ));
+        }
         let client = match self.leases.release(&grant) {
             Ok(ReleaseOutcome::Reclaim(client)) => client,
             Ok(ReleaseOutcome::AlreadyReleased) => {
@@ -360,7 +375,8 @@ impl Reclaimer {
         let scope = self.scope.clone();
         let generation = self.generation.clone();
         let owner = ProcessOwner::frontend(client.clone());
-        let grace = deadline.clamp(self.grace);
+        // The published windows, never the caller's request budget.
+        let grace = self.grace;
         let confirm = self.confirm;
         let started = self.clock.now();
         let operation_for_thread = operation.clone();

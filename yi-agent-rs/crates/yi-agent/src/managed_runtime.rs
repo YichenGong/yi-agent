@@ -75,9 +75,97 @@ fn inherited_descriptor() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Takes the guardian's bootstrap descriptor, refusing before any side effect.
+///
+/// Split out so the refusal happens *before* the scope is resolved: a hand-started
+/// guardian must not create a control socket, let alone take ownership of process
+/// groups, and reporting "no scope key" first would tell a user to set one instead
+/// of telling them this role is not theirs to run.
+pub fn take_guardian_bootstrap() -> anyhow::Result<std::os::fd::OwnedFd> {
+    Ok(yi_agent_supervisors::lifecycle::roles::inherited_bootstrap(
+        yi_agent_supervisors::lifecycle::roles::ManagedRole::Guardian,
+    )?)
+}
+
+/// Serves one runtime as its guardian.
+///
+/// The scope comes from the environment the launcher set, never from an argument:
+/// a guardian that parsed a path from its command line could be pointed at another
+/// project's process journal and would then adopt groups it does not own.
+pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::Result<()> {
+    let artifact = crate::build_info::artifact_identity(
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("yi-agent")),
+    );
+    yi_agent_supervisors::lifecycle::guardian::serve(scope, artifact, || false)
+        .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
+}
+
+/// Serves one runtime's business daemon under its guardian.
+///
+/// This is the only daemon start that carries the exit guarantees. It is
+/// deliberately not reachable through the public `daemon serve`: those callers are
+/// unmanaged by contract, and the manual `daemon start/serve` semantics must not
+/// change.
+pub fn run_managed_daemon(
+    invocation: yi_agent_runtime::config::RuntimeConfig,
+) -> anyhow::Result<()> {
+    use yi_agent_supervisors::lifecycle::roles::{ManagedRole, inherited_bootstrap};
+    let _bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
+    // The instance's configuration is inherited from the process that started us,
+    // not re-derived from the project cwd: a shared daemon must keep reading the
+    // same `YI_AGENT_HOME` and model catalogue its launcher used. Only the workdir
+    // (the *root* being served) is taken from the invocation.
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
+    let database = runtime_dir.join("runtime.sqlite");
+    let factory = yi_agent_subagent::attach::worker_factory(
+        &invocation,
+        runtime_dir.clone(),
+        &yi_agent_runtime::models::models_path(),
+    )?;
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
+        .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
+    // The business daemon supervises its own plugin children -- that is not handed
+    // to the guardian, which knows process groups but not plugin manifests. The
+    // second argument is the *runtime directory*: the route table is partitioned by
+    // it, and passing the socket path would publish every route into a partition
+    // nobody reads.
+    let _supervisor = yi_agent_runtime::supervise::serve(&invocation.workdir, &runtime_dir);
+    daemon
+        .wait()
+        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The managed daemon must serve plugins from the daemon's runtime directory.
+    ///
+    /// The plugin route table is partitioned by runtime directory, so a daemon that
+    /// published into a different partition (the socket path, say) would look like
+    /// "the plugin is running but nothing can find it". Pinned as a source-level
+    /// check because the call is what carries the guarantee and there is no value to
+    /// assert on: `serve` starts a thread.
+    #[test]
+    fn the_managed_daemon_supervises_the_runtime_directory_not_the_socket() {
+        let source = include_str!("managed_runtime.rs");
+        let body = source
+            .split("pub fn run_managed_daemon")
+            .nth(1)
+            .expect("the managed daemon entry point must exist");
+        let call = body
+            .lines()
+            .find(|line| line.contains("supervise::serve("))
+            .expect("the managed daemon must supervise plugin children");
+        assert!(
+            call.contains("&runtime_dir"),
+            "plugin routes are partitioned by runtime directory: {call}"
+        );
+        assert!(
+            !call.contains("socket"),
+            "passing the socket path partitions routes where nothing reads them: {call}"
+        );
+    }
 
     /// Runs this test binary again in a child, invoking `probe` as the only test.
     ///

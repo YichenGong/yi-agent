@@ -103,6 +103,8 @@ fn main() -> Result<()> {
             InternalRuntimeAction::Executor { owner, models } => {
                 run_internal_executor(owner.clone(), models.clone())
             }
+            InternalRuntimeAction::Guardian => run_internal_guardian(),
+            InternalRuntimeAction::Daemon => run_internal_daemon(),
         },
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
@@ -323,6 +325,38 @@ fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> R
     let overrides = yi_agent_runtime::config::ConfigOverrides::default();
     let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
     managed_runtime::run_executor(owner, models, config)
+}
+
+/// Serves one runtime as its guardian, resolving the scope from the environment.
+///
+/// The canonicalisation runs here rather than in the launcher so both sides agree
+/// on the scope key even when the caller passed a symlinked path: a guardian and a
+/// client that disagree about the key would watch different directories.
+fn run_internal_guardian() -> Result<()> {
+    // Authorization first: the descriptor is what proves this role was assigned by
+    // a launcher, so its absence must be the reported reason.
+    let _bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    let key = yi_agent_supervisors::lifecycle::roles::scope_key()?;
+    let runtime_dir = std::path::PathBuf::from(&key);
+    let instance_home = std::env::var_os("YI_AGENT_INSTANCE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            yi_agent_store::paths::instance_home().unwrap_or_else(|| runtime_dir.clone())
+        });
+    let project = std::env::current_dir()?;
+    let scope = yi_agent_supervisors::lifecycle::bringup::scope_for_existing(
+        &runtime_dir,
+        &project,
+        &instance_home,
+    )?;
+    managed_runtime::run_guardian(scope)
+}
+
+/// Serves one runtime's business daemon as the managed role.
+fn run_internal_daemon() -> Result<()> {
+    let overrides = yi_agent_runtime::config::ConfigOverrides::default();
+    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
+    managed_runtime::run_managed_daemon(config)
 }
 
 fn run_internal_identity(json: bool) -> Result<()> {
