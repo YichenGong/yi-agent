@@ -272,6 +272,11 @@ fn log_records(records: Vec<RefreshRecord>) -> Vec<String> {
     refreshed
 }
 
+/// 目录本身：与 `install::manifests_dir` 同一落点。
+pub fn manifests_dir(project: &Path) -> std::path::PathBuf {
+    crate::install::manifests_dir(project)
+}
+
 fn outcome_name(outcome: &RefreshOutcome) -> &str {
     match outcome {
         RefreshOutcome::Current(name)
