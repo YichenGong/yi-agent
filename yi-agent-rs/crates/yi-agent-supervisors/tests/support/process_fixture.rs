@@ -88,6 +88,9 @@ pub fn helper(
         owner,
         root: None,
         execution,
+        // Fixture helpers are tools, not managed roles: they are authorised by the
+        // registry that spawned them, never by an inherited bootstrap.
+        bootstrap: None,
     }
 }
 
@@ -249,6 +252,36 @@ pub fn run_helper_if_requested() {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+        }
+        "report-bootstrap" => {
+            // Reports the bootstrap descriptor exactly, and whether it is a socket.
+            // Scanning for "the highest open descriptor" would find the ready
+            // barrier instead, since the child reads that one without closing it --
+            // which is how the first version of this probe measured the wrong thing.
+            let marker = PathBuf::from(&role_args[1]);
+            let expected: i32 = role_args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8);
+            let open = unsafe { libc::fcntl(expected, libc::F_GETFD) } != -1;
+            let mut is_socket = false;
+            if open {
+                // A pipe would mean the barrier was copied here; only a socket can be
+                // the authorization channel the launcher established.
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(expected, &mut stat) } == 0 {
+                    is_socket = (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK;
+                }
+            }
+            std::fs::write(
+                &marker,
+                format!("{expected}:{}:{}", open as i32, is_socket as i32),
+            )
+            .expect("write bootstrap marker");
+            if open {
+                let _ = read_one_byte(expected);
+            }
+            std::process::exit(0);
         }
         "list-fds" => {
             let marker = PathBuf::from(&role_args[1]);

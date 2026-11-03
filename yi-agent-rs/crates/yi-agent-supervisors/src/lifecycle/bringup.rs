@@ -495,12 +495,34 @@ pub struct ProcessGuardian {
 impl GuardianLauncher for ProcessGuardian {
     fn launch(&self, scope: &RuntimeScope, expected: &ArtifactIdentity) -> io::Result<()> {
         let program = pinned_program(&self.instance_home, expected)?;
+        // The guardian refuses to run without an inherited descriptor, and that
+        // refusal is the whole security boundary: "my parent started me as a managed
+        // role" must be unfalsifiable by the child. A launcher that only set the
+        // variable would hand the guardian a number that is not open (which aborts it
+        // on `from_raw_fd`) or teach it to accept a hand-started process.
+        //
+        // A socketpair rather than a pipe because the descriptor is a *lifeline*, not
+        // a message: the parent keeps its end open for exactly as long as it lives,
+        // so EOF means "whoever assigned me this role is gone". A single byte could
+        // express "started" but never "still here".
+        let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()?;
+        let child_fd = {
+            use std::os::fd::AsRawFd;
+            child_end.as_raw_fd()
+        };
         let mut command = std::process::Command::new(&program);
         command
             .args(["internal-runtime", "guardian"])
             .current_dir(&scope.runtime_dir)
             .env("YI_AGENT_SCOPE_KEY", &scope.key)
             .env("YI_AGENT_INSTANCE_HOME", &scope.instance_home)
+            // The number, not the descriptor: `pre_exec` installs it on a fixed
+            // number, because a descriptor inherited at an arbitrary number could
+            // collide with one the child opens before reading the variable.
+            .env(
+                super::roles::BOOTSTRAP_FD_ENV,
+                BOOTSTRAP_CHILD_FD.to_string(),
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -508,16 +530,64 @@ impl GuardianLauncher for ProcessGuardian {
         // must not take down the daemon a TUI still uses.
         unsafe {
             use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // `dup2` into the same number is a no-op and *keeps* CLOEXEC, which
+                // would close the lifeline exactly at `exec`: the child would then
+                // refuse to run with "no descriptor" for a reason nobody could see.
+                if libc::dup2(child_fd, BOOTSTRAP_CHILD_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(BOOTSTRAP_CHILD_FD, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        command.spawn()?;
+        let child = command.spawn()?;
+        // Our copy of the child's end must go now. Holding it would make that end
+        // look alive forever, so the guardian would never see its lifeline fire.
+        drop(child_end);
+        // The parent's end is handed to a detached thread that holds it until this
+        // process exits. Keeping it in a local would close it on return and hand the
+        // guardian an immediate EOF -- a guardian that exits the moment it finished
+        // starting, the exact opposite of outliving its client.
+        hold_lifeline(parent_end, child.id());
         Ok(())
     }
+}
+
+/// The number the guardian's bootstrap descriptor is installed on.
+///
+/// Above the standard streams and away from [`super::guardian::READY_FD`]: the two
+/// descriptors carry different protocols, and sharing a number would make one read
+/// the other's bytes.
+const BOOTSTRAP_CHILD_FD: i32 = super::guardian::BOOTSTRAP_FD;
+
+/// Keeps the launcher's end of the bootstrap lifeline open for this process's life.
+///
+/// A thread blocked reading the peer is the mechanism: the descriptor stays open
+/// until the process exits, and a socketpair only produces EOF when the *other* end
+/// closes. That makes "the launcher is gone" observable without inventing an extra
+/// protocol. Detached on purpose: there is nothing to join, and joining it would
+/// block the caller until the guardian exits.
+fn hold_lifeline(parent_end: std::os::unix::net::UnixStream, guardian_pid: u32) {
+    std::thread::Builder::new()
+        .name(format!("guardian-lifeline-{guardian_pid}"))
+        .spawn(move || {
+            let mut sink = [0u8; 64];
+            let mut stream = parent_end;
+            // No frame is ever sent in either direction: this descriptor proves
+            // liveness, and a payload would quietly turn it into a command channel.
+            while let Ok(read) = stream.read(&mut sink) {
+                if read == 0 {
+                    break;
+                }
+            }
+        })
+        .ok();
 }
 
 /// Where a pinned copy of the artifact lives for one build.

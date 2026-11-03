@@ -277,6 +277,24 @@ impl Reclaimer {
         self.clients.in_global_drain()
     }
 
+    /// Whether a reclaim operation is still in progress.
+    ///
+    /// The guardian uses this to decide when it may exit. Leaving with an operation
+    /// in flight is not a cosmetic problem: the reclaim runs on its own thread, so
+    /// the process ending cuts it off *after* admission was closed and *before* the
+    /// answer was recorded. The departing client then polls a socket that is gone
+    /// and reports a failed quit for work that may well have stopped.
+    pub fn has_running_operations(&self) -> bool {
+        self.operations
+            .lock()
+            .map(|operations| {
+                operations
+                    .values()
+                    .any(|state| matches!(state, OperationState::Running))
+            })
+            .unwrap_or(false)
+    }
+
     /// Register a client, downgrading it to a waiting observer when the scope is
     /// already draining.
     ///
@@ -416,18 +434,21 @@ impl Reclaimer {
 
         std::thread::spawn(move || {
             let result = reclaim_owner(&backend, &owner, &client, grace, confirm);
+            // Persist *before* publishing "finished". The guardian decides it may exit
+            // by asking whether any operation is still running, so publishing first
+            // opened a window in which the process could leave between "no longer
+            // running" and "answer on disk" -- and the client that asked for the
+            // teardown would then find neither. Losing the file is not a reason to
+            // report a different outcome, so this stays best effort.
+            let _ = write_result(&scope, &generation, &operation_for_thread, &result);
             if let Ok(mut operations) = operations.lock() {
                 if let Some(state) = operations.get_mut(&operation_for_thread) {
                     *state = OperationState::Finished {
                         started_at: started,
-                        result: result.clone(),
+                        result,
                     };
                 }
             }
-            // Best effort and after the in-memory record is settled: a shell that
-            // outlives this guardian can still read its own result. Losing the file
-            // is not a reason to report a different outcome.
-            let _ = write_result(&scope, &generation, &operation_for_thread, &result);
         });
 
         operation

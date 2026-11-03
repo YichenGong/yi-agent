@@ -41,6 +41,19 @@ pub const READY_FD: RawFd = 9;
 /// Environment variable naming that descriptor, so a launcher does not have to
 /// hard-code the number.
 pub const READY_FD_ENV: &str = "YI_AGENT_MANAGED_READY_FD";
+/// First number the bootstrap source may be hoisted to before the fork.
+///
+/// Above the ready barrier, the stdio slots and any plausible pipe number a
+/// three-descriptor spawn could produce, so the bootstrap and the barrier can never
+/// be installed over one another.
+const DEDICATED_FD_BASE: i32 = 32;
+
+/// The number the guardian's bootstrap descriptor is installed on.
+///
+/// Distinct from [`READY_FD`] because the two are different protocols: the ready
+/// barrier is a one-byte permit to start, and the bootstrap is the inherited proof
+/// of who assigned the role. Sharing a number would let one read the other's bytes.
+pub const BOOTSTRAP_FD: RawFd = 8;
 /// Set when something in front of the program has already consumed the barrier.
 ///
 /// The tool launcher reads the barrier and then `exec`s, so the program must not
@@ -114,7 +127,10 @@ impl TaskExecutionKey {
 /// `env` values are secrets in the general case (a provider key, a token), so this
 /// type's `Debug` prints only the keys. Nothing here is ever written to the
 /// journal.
-#[derive(Clone, PartialEq, Eq)]
+// No `Clone`/`PartialEq`: the command may own a live descriptor, and duplicating
+// one would create two claims to the same authorization. Nothing compares two
+// commands either -- a test that did would be asserting on a resource identity.
+// `Debug` is written by hand below, because env values are secrets.
 pub struct ManagedCommand {
     pub executable: PathBuf,
     pub args: Vec<String>,
@@ -123,6 +139,15 @@ pub struct ManagedCommand {
     pub owner: ProcessOwner,
     pub root: Option<RootId>,
     pub execution: Option<TaskExecutionKey>,
+    /// A private descriptor the child is authorised with, installed on
+    /// [`BOOTSTRAP_FD`] after `setsid`.
+    ///
+    /// Only the guardian's own daemon start uses this. It is a field rather than a
+    /// second spawn method because the authorization and the process that receives
+    /// it must be recorded together: a daemon started by a path that forgot the
+    /// descriptor would refuse to run, and a descriptor passed to a path that forgot
+    /// to record the process would be an unjournaled child.
+    pub bootstrap: Option<std::os::fd::OwnedFd>,
 }
 
 impl std::fmt::Debug for ManagedCommand {
@@ -140,6 +165,7 @@ impl std::fmt::Debug for ManagedCommand {
             .field("owner", &self.owner)
             .field("root", &self.root)
             .field("execution", &self.execution)
+            .field("has_bootstrap", &self.bootstrap.is_some())
             .finish()
     }
 }
@@ -409,6 +435,31 @@ impl ProcessRegistry {
             process.env(key, value);
         }
         let barrier_fd = read_end.0;
+        // The bootstrap descriptor, if this command carries one, must survive the
+        // fork at a number the close loop below will not touch. `pre_exec` moves it
+        // onto `BOOTSTRAP_FD`; the source stays CLOEXEC-clear only until then.
+        // The bootstrap descriptor is moved to a dedicated high number *before* the
+        // fork. Using the caller's number directly is what broke the first version of
+        // this: the ready-barrier pipe can land on 8, `dup2`-ing the bootstrap onto 8
+        // then overwrote the barrier's read end, and the parent's own barrier write
+        // failed with `BrokenPipe` while the child sat on a socket it never read from.
+        // A number above every reserved slot makes the two protocols unable to collide.
+        let hoisted_bootstrap = command.bootstrap.as_ref().and_then(|fd| {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+            let hoisted = unsafe { libc::fcntl(raw, libc::F_DUPFD, DEDICATED_FD_BASE) };
+            if hoisted < 0 {
+                return None;
+            }
+            // Survives the fork; `pre_exec` clears CLOEXEC on the target number.
+            unsafe { libc::fcntl(hoisted, libc::F_SETFD, 0) };
+            // The local `OwnedFd` closes its number on drop, which is what keeps the
+            // hoisted copy from leaking once the child has been forked.
+            Some(OwnedFd::from_raw(hoisted))
+        });
+        if command.bootstrap.is_some() && hoisted_bootstrap.is_none() {
+            return Err(io::Error::last_os_error());
+        }
+        let bootstrap_raw = hoisted_bootstrap.as_ref().map(|fd| fd.0);
         // Computed before the fork: `pre_exec` may only do async-signal-safe work,
         // and the descriptor table size does not change between here and there.
         let descriptor_limit = unsafe { libc::getdtablesize() }.clamp(64, 1 << 17);
@@ -444,6 +495,9 @@ impl ProcessRegistry {
                         }
                     }
                 }
+                // The barrier is installed first so that a bootstrap install can
+                // never overwrite it, and so that the barrier's own source number is
+                // free to be reused by the bootstrap afterwards.
                 if libc::dup2(barrier_fd, READY_FD) < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -453,6 +507,28 @@ impl ProcessRegistry {
                 if libc::fcntl(READY_FD, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                if let Some(raw) = bootstrap_raw {
+                    // Refuse a collision instead of silently closing one protocol
+                    // with the other: a bootstrap on the ready number would make the
+                    // child read a permit as proof of who started it.
+                    if BOOTSTRAP_FD == READY_FD || raw <= 2 || raw == READY_FD {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "a bootstrap descriptor must not share a number with stdio or the ready barrier",
+                        ));
+                    }
+                    if libc::dup2(raw, BOOTSTRAP_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // Same CLOEXEC trap as the ready barrier: `dup2` into the same
+                    // number is a no-op and keeps the flag.
+                    if libc::fcntl(BOOTSTRAP_FD, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if raw != BOOTSTRAP_FD && raw > 2 {
+                        libc::close(raw);
+                    }
+                }
                 // Close every other descriptor. Relying on CLOEXEC would only cover
                 // descriptors *we* opened; anything the host process inherited (a
                 // lifecycle pipe, a lease FD, a logging socket) would otherwise pass
@@ -461,8 +537,9 @@ impl ProcessRegistry {
                 for fd in 3..descriptor_limit {
                     // 0..=2 hold the caller's descriptors (or /dev/null): closing
                     // them would leave the child without stdio. The caller's source
-                    // descriptors were already closed above.
-                    if fd != READY_FD {
+                    // descriptors were already closed above. The bootstrap number is
+                    // kept only when this child was actually authorised with one.
+                    if fd != READY_FD && !(bootstrap_raw.is_some() && fd == BOOTSTRAP_FD) {
                         libc::close(fd);
                     }
                 }
@@ -1044,6 +1121,29 @@ fn write_journal(path: &Path, records: &[ProcessRecord]) -> io::Result<()> {
 /// daemon, so it must not depend on the daemon's database: a guardian that opened
 /// `runtime.sqlite` would take the schema forward, and then an older daemon could
 /// no longer serve the same runtime.
+/// What a guardian knows about the business daemon it started.
+///
+/// Deliberately a record of *facts the daemon reported*, not of what the guardian
+/// hoped it would be: [`Self::identity`] is only ever filled from the daemon's own
+/// handshake, so a daemon that failed to start cannot be described as one that did.
+#[derive(Clone, Debug)]
+pub struct GuardianDaemon {
+    /// The generation this daemon instance announced. Random per start, so a client
+    /// can prove a switch really produced a new daemon rather than a stale answer.
+    pub instance_id: yi_agent_lifecycle::types::DaemonInstanceId,
+    /// The build the daemon reported, which is what compatibility is judged against.
+    pub build_id: yi_agent_lifecycle::types::BuildId,
+    /// The build's display version, for a human-facing mismatch message.
+    pub display_version: String,
+    /// The business protocol the daemon speaks.
+    pub business_protocol: u32,
+    /// Capabilities the daemon advertises.
+    pub capabilities: Vec<String>,
+    /// The `process_id` the registry assigned, so stopping it goes through the one
+    /// path that can prove a group stopped.
+    pub process_id: ManagedProcessId,
+}
+
 pub struct Guardian {
     scope: RuntimeScope,
     artifact: ArtifactIdentity,
@@ -1067,6 +1167,20 @@ pub struct Guardian {
     /// than an empty one: a guardian that cannot see the daemon must not report that
     /// the runtime is idle.
     coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+    /// The business daemon this guardian started, once it answered.
+    ///
+    /// `None` means "no daemon is serving this scope", which is not the same as
+    /// "unknown": a guardian that never started one reports a *managed* runtime whose
+    /// daemon fields are empty, and every compatibility check then refuses business.
+    /// Filling these from the guardian's own artifact would be the exact conflation
+    /// of guardian and daemon identity that [`RuntimeIdentity`] exists to prevent.
+    daemon: Option<GuardianDaemon>,
+    /// The guardian's end of the daemon's authorization lifeline.
+    ///
+    /// Held for as long as the daemon should consider itself supervised. Dropping it
+    /// is how the daemon learns its guardian is gone, so keeping it in a local would
+    /// make every daemon believe that.
+    daemon_lifeline: Option<std::os::unix::net::UnixStream>,
     /// Version switches this guardian is running, so a client can poll one.
     ///
     /// Shared rather than owned because the switch runs on its own thread and outlives
@@ -1107,9 +1221,194 @@ impl Guardian {
             demands: None,
             previews: yi_agent_lifecycle::preview::PreviewStore::new(),
             coordinator: std::sync::Arc::new(super::preview::NoCoordinator),
+            daemon: None,
+            daemon_lifeline: None,
             switches: None,
             reclaim,
         }
+    }
+
+    /// Starts the business daemon for this scope and waits until it really serves.
+    ///
+    /// The guardian is the only thing that may start a daemon with exit guarantees,
+    /// and that is what makes the guarantees checkable: this process owns the child,
+    /// journals the group, and can prove the group stopped. A client that started its
+    /// own daemon could not make any of those three claims.
+    ///
+    /// `daemon` is left `None` when the start fails. That is deliberate: an identity
+    /// that described a daemon nobody could reach would make the runtime look
+    /// compatible, and the client would then send work into a missing socket.
+    ///
+    /// The wait is for the *business* socket answering `Status`, not for `spawn` to
+    /// return. A forked process that has not bound yet is not a daemon: reporting it
+    /// as one turns the client's first request into a startup race.
+    pub fn start_daemon(&mut self, program: &Path, budget: Duration) -> io::Result<()> {
+        let registry = self
+            .registry
+            .clone()
+            .ok_or_else(|| io::Error::other("a daemon needs the process registry that owns it"))?;
+        let deadline = Deadline::after(budget);
+        // The daemon's own instance name: a new daemon is a new generation, and a
+        // client that compared only build ids would call a restart "no change".
+        let instance_id = format!(
+            "daemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        // The descriptor that proves to the daemon that it was started by a guardian.
+        // The guardian-side end is kept for the daemon's whole life: closing it would
+        // tell the daemon its launcher is gone while the guardian still supervises it.
+        let (guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair()?;
+        let command = ManagedCommand {
+            executable: program.to_path_buf(),
+            args: vec!["internal-runtime".to_string(), "daemon".to_string()],
+            env: vec![
+                (
+                    super::roles::SCOPE_KEY_ENV.to_string(),
+                    self.scope.key.clone(),
+                ),
+                (
+                    "YI_AGENT_INSTANCE_HOME".to_string(),
+                    self.scope.instance_home.to_string_lossy().into_owned(),
+                ),
+                // The daemon derives its runtime directory from its workdir, and the
+                // guardian derived this scope's directory from its own launcher. Passing
+                // the directory explicitly is what keeps those two from being merely
+                // *usually* equal: a symlinked project path would otherwise give the
+                // daemon a second socket that no client in this scope ever looks at.
+                (
+                    "YI_AGENT_RUNTIME_DIR".to_string(),
+                    self.scope.runtime_dir.to_string_lossy().into_owned(),
+                ),
+                // The descriptor that authorizes the daemon role. The number is the one
+                // `spawn` dup's it to, declared here rather than guessed by the child.
+                (
+                    super::roles::BOOTSTRAP_FD_ENV.to_string(),
+                    BOOTSTRAP_FD.to_string(),
+                ),
+            ],
+            cwd: self.scope.project_key.clone().into(),
+            owner: ProcessOwner::daemon(instance_id.clone()),
+            root: None,
+            execution: None,
+            bootstrap: Some(daemon_end.into()),
+        };
+        // `spawn` consumes its deadline, and the wait below needs the same budget:
+        // re-deriving it rather than shrinking it keeps "start plus bind" inside one
+        // caller-visible window instead of two.
+        let started = registry
+            .lock()
+            .map_err(|_| io::Error::other("process registry mutex poisoned"))?
+            .spawn(command, Deadline::after(budget));
+        let process_id = match started {
+            Ok(process_id) => process_id,
+            Err(error) => {
+                // The lifeline goes with the failed start: holding it would suggest a
+                // daemon exists.
+                drop(guardian_end);
+                return Err(error);
+            }
+        };
+
+        let socket = yi_agent_store::ipc::socket_path_for(&self.scope.runtime_dir)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        // The socket may be the *previous* daemon's leftover node. Waiting for a
+        // `Status` answer, rather than for the file to exist, is what distinguishes
+        // "our daemon bound" from "a dead node is still on disk".
+        while !deadline.is_expired() {
+            if yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status)
+                .is_ok()
+            {
+                self.daemon = Some(GuardianDaemon {
+                    instance_id,
+                    // The bytes are the ones this guardian launched: the guardian is
+                    // the authority on which artifact it pinned, and it does not
+                    // pretend to have read a self-description the daemon never sends.
+                    build_id: self.artifact.build_id.clone(),
+                    display_version: self.artifact.display_version.clone(),
+                    business_protocol: self.artifact.business_protocol_max,
+                    capabilities: self.artifact.capabilities.clone(),
+                    process_id,
+                });
+                self.daemon_lifeline = Some(guardian_end);
+                return Ok(());
+            }
+            std::thread::sleep(deadline.clamp(Duration::from_millis(20)));
+        }
+        // A daemon that never answered is not a daemon, and leaving it running would
+        // put an unreachable process group beside the next generation.
+        let mut registry = registry
+            .lock()
+            .map_err(|_| io::Error::other("process registry mutex poisoned"))?;
+        let _ = registry.terminate_granted(
+            &ProcessOwner::daemon(&instance_id),
+            &process_id,
+            Deadline::after(Duration::from_secs(5)),
+        );
+        drop(guardian_end);
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the managed daemon did not answer within {}s",
+                budget.as_secs()
+            ),
+        ))
+    }
+
+    /// Stops the daemon this guardian started, proving its group stopped.
+    ///
+    /// Idempotent: a guardian with no daemon has nothing to stop, and a second call
+    /// after a successful stop returns immediately. That matters because both the
+    /// drain path and the final exit path call it, and whichever runs first must not
+    /// make the other look like a failure.
+    pub fn stop_daemon(&mut self, deadline: Deadline) -> io::Result<()> {
+        let Some(daemon) = self.daemon.take() else {
+            return Ok(());
+        };
+        let result = match self.registry.as_ref() {
+            Some(registry) => registry
+                .lock()
+                .map_err(|_| io::Error::other("process registry mutex poisoned"))?
+                .terminate_granted(
+                    &ProcessOwner::daemon(&daemon.instance_id),
+                    &daemon.process_id,
+                    deadline,
+                )
+                .map(|_| ()),
+            // Without a registry nothing proves the group stopped, so claiming the
+            // stop succeeded would be the false success this design forbids.
+            None => Err(io::Error::other(
+                "cannot stop a managed daemon without its process registry",
+            )),
+        };
+        // The lifeline closes either way: a failed stop must not leave the daemon
+        // believing its guardian still exists.
+        self.daemon_lifeline = None;
+        result
+    }
+
+    /// Whether this guardian has a daemon it started and has not stopped.
+    pub fn daemon(&self) -> Option<&GuardianDaemon> {
+        self.daemon.as_ref()
+    }
+
+    /// Whether every *business* client is gone and the scope is draining.
+    ///
+    /// The guardian uses this to decide that its work is finished. Lease-only
+    /// observers do not count, and that is not a convenience: an observer is by
+    /// definition watching for the exit, so counting it would keep alive exactly the
+    /// runtime it is waiting to see stop. `active_count` would do that -- it counts
+    /// observers -- which is why this reads `business_active_count`.
+    pub fn drained(&self) -> bool {
+        self.reclaim.global_drain_started()
+            && self.reclaim.leases().business_active_count() == 0
+            // An in-flight reclaim is still this generation's work. Exiting now
+            // would cut off the thread that is proving the stop, and the client
+            // that asked for it would never receive its answer.
+            && !self.reclaim.has_running_operations()
     }
 
     /// Points reclamation at the registry that really owns the process groups.
@@ -1350,6 +1649,23 @@ pub fn serve_with(
     shutdown: impl Fn() -> bool,
     coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
 ) -> io::Result<()> {
+    serve_with_daemon(scope, selected, shutdown, coordinator, None)
+}
+
+/// [`serve_with`], optionally starting the business daemon this guardian owns.
+///
+/// `daemon_program` is `None` for a guardian that only serves leases (tests, and a
+/// window in which no daemon should exist). Passing a program is what turns the
+/// guardian into the runtime's lifecycle owner: it spawns the daemon with an
+/// inherited authorization, waits for that daemon to answer, reports its identity,
+/// and stops it when the last client leaves.
+pub fn serve_with_daemon(
+    scope: RuntimeScope,
+    selected: ArtifactIdentity,
+    shutdown: impl Fn() -> bool,
+    coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+    daemon_program: Option<&Path>,
+) -> io::Result<()> {
     let generation = format!("guardian-{}", std::process::id());
     let mut guardian = Guardian::new(scope, selected, generation);
     guardian.attach_coordinator(coordinator);
@@ -1370,6 +1686,22 @@ pub fn serve_with(
     // stop. Dropping the registry still stops and reaps every group it owns.
     let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
     guardian.attach_registry(std::sync::Arc::clone(&registry));
+
+    // The daemon starts only after the control socket is bound, and that ordering is
+    // observable to clients: a caller that can reach the guardian is entitled to see
+    // an honest identity, so "guardian up, daemon coming" is never reported as "no
+    // runtime". A start failure is recorded and the guardian keeps serving, because
+    // refusing to serve would also take away the preview/status channel a user needs
+    // to find out *why* the start failed.
+    if let Some(program) = daemon_program {
+        // A start failure is recorded and the guardian keeps serving: refusing to
+        // serve would also take away the status channel a user needs to find out why
+        // the daemon did not start.
+        if let Err(error) = guardian.start_daemon(program, START_DAEMON_BUDGET) {
+            tracing::warn!(error = %error, "the managed daemon did not start; serving without it");
+        }
+    }
+
     // Non-blocking accept, woken by a bounded wait, so the loop can also do
     // maintenance. A plain blocking `accept` would make lease expiry depend on
     // traffic: a runtime whose last client crashed would have no traffic at all,
@@ -1395,10 +1727,34 @@ pub fn serve_with(
                 }
             }
         }
-        guardian.maintain(lease_now());
+        let _ = guardian.maintain(lease_now());
+        // The last client leaving ends this generation: the daemon is stopped with
+        // proof, then the loop returns and the process exits. Leaving from inside the
+        // loop (rather than waiting for an external signal) is what makes "the last
+        // client leaving stops the runtime" a property of the code instead of a
+        // convention someone has to remember. The database is untouched: history is
+        // the project's, not this generation's.
+        if guardian.drained() {
+            break;
+        }
+    }
+    // Bounded, and through the registry, so "stopped" means a verified-empty group
+    // rather than a signal that was sent.
+    if let Err(error) = guardian.stop_daemon(Deadline::after(STOP_DAEMON_BUDGET)) {
+        tracing::warn!(error = %error, "the managed daemon did not stop cleanly");
     }
     Ok(())
 }
+
+/// How long the guardian waits for its daemon to bind and answer.
+///
+/// Inside the bring-up budget a client is already waiting on, so this is not a new
+/// deadline: it is the part of that budget the daemon gets before the guardian
+/// reports it as absent.
+const START_DAEMON_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long a stop may take before it is reported as unclean.
+const STOP_DAEMON_BUDGET: Duration = Duration::from_secs(10);
 
 /// How often the guardian looks for expired leases when nothing else happens.
 ///
@@ -1570,17 +1926,37 @@ fn serve_status(
 /// the guardian's generation as the daemon's -- exactly the conflation the two
 /// identities exist to prevent.
 fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeIdentity {
+    // The daemon half comes from what *that process* announced, never from this
+    // guardian's own artifact. A guardian that filled those fields with its own build
+    // would make a runtime with no daemon look compatible, and the client would then
+    // send work to a socket nobody listens on.
+    let daemon = guardian.daemon.as_ref();
     yi_agent_lifecycle::types::RuntimeIdentity {
         scope_key: guardian.scope.key.clone(),
-        daemon_instance_id: None,
+        daemon_instance_id: daemon.map(|daemon| daemon.instance_id.clone()),
         guardian_build_id: Some(guardian.artifact.build_id.clone()),
-        daemon_build_id: None,
+        daemon_build_id: daemon.map(|daemon| daemon.build_id.clone()),
         mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
-        business_protocol: None,
-        daemon_display_version: None,
+        business_protocol: daemon.map(|daemon| daemon.business_protocol),
+        daemon_display_version: daemon.map(|daemon| daemon.display_version.clone()),
         guardian_display_version: Some(guardian.artifact.display_version.clone()),
-        capabilities: guardian.artifact.capabilities.clone(),
-        schema_min: guardian.artifact.schema_min,
+        // The intersection, not the union: a capability only one side has cannot be
+        // used by a client that needs both halves to honour it.
+        capabilities: daemon.map_or_else(
+            || guardian.artifact.capabilities.clone(),
+            |daemon| {
+                guardian
+                    .artifact
+                    .capabilities
+                    .iter()
+                    .filter(|have| daemon.capabilities.iter().any(|their| their == *have))
+                    .cloned()
+                    .collect()
+            },
+        ),
+        schema_min: daemon.map_or(guardian.artifact.schema_min, |_| {
+            guardian.artifact.schema_min
+        }),
         schema_max: guardian.artifact.schema_max,
     }
 }

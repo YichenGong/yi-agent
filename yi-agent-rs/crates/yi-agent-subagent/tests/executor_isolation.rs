@@ -93,6 +93,7 @@ fn a_worker_that_ignores_cancel_is_stopped_only_by_killing_its_executor() {
         owner: owner.clone(),
         root: None,
         execution: None,
+        bootstrap: None,
     };
     registry
         .spawn(command, Deadline::after(Duration::from_secs(5)))

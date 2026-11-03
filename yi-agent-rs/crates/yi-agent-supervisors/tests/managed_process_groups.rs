@@ -569,3 +569,67 @@ fn one_departed_client_does_not_stop_anothers_tools() {
 fn process_fixture_helper() {
     fixture::run_helper_if_requested();
 }
+
+/// A bootstrap descriptor must not collide with the ready barrier.
+///
+/// Regression test for a real defect found by running the managed runtime for real:
+/// `pipe()` in a three-descriptor spawn hands back 8 and 9, and 8 is exactly where
+/// the bootstrap is installed. `dup2`-ing the bootstrap onto 8 overwrote the
+/// barrier's read end, so the parent's own barrier write failed with `BrokenPipe`
+/// and no daemon ever started. Hoisting the bootstrap to a dedicated high number
+/// before the fork is what fixed it, and this pins it.
+#[test]
+fn a_bootstrap_descriptor_does_not_collide_with_the_ready_barrier() {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let directory = TempDir::new().unwrap();
+    let mut registry = registry(&directory);
+    let mut markers = fixture::MarkerGuard::new();
+    let owner = ProcessOwner::daemon("daemon-1");
+    let marker = markers.path("bootstrap-fd");
+
+    // One end stays with the "guardian", the other is the child's authorization --
+    // the same shape as the real daemon start.
+    let (guardian_end, child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let expected = yi_agent_supervisors::lifecycle::guardian::BOOTSTRAP_FD.to_string();
+    let mut command = fixture::helper(
+        owner.clone(),
+        &["report-bootstrap", &marker.to_string_lossy(), &expected],
+        None,
+    );
+    // The local `OwnedFd` in `guardian` is a plain `RawFd` wrapper; the field takes
+    // the std type, so the child end is adopted by number.
+    command.bootstrap = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_end.into_raw_fd()) });
+
+    registry
+        .spawn(command, Deadline::after(Duration::from_secs(10)))
+        .unwrap();
+    // The spawn returning at all is half the assertion: before the fix, the barrier
+    // write failed right here with `BrokenPipe`.
+    assert!(
+        fixture::wait_for_marker(&marker, fixture::MARKER_TIMEOUT),
+        "the child must have run, which means the barrier released it"
+    );
+    // `fd:open:is_socket` -- all three matter. The number is where the launcher
+    // promised it; "open" proves it survived the exec; "socket" proves it is the
+    // authorization channel and not the barrier pipe that used to land here.
+    let reported = fixture::read_marker(&marker);
+    let mut fields = reported.trim().split(':');
+    let fd: i32 = fields.next().unwrap().parse().unwrap();
+    let open: i32 = fields.next().unwrap().parse().unwrap();
+    let is_socket: i32 = fields.next().unwrap().parse().unwrap();
+    assert_eq!(
+        fd,
+        yi_agent_supervisors::lifecycle::guardian::BOOTSTRAP_FD,
+        "the bootstrap must be installed on the documented number, not wherever it landed"
+    );
+    assert_eq!(open, 1, "the bootstrap descriptor must survive exec");
+    assert_eq!(
+        is_socket, 1,
+        "the bootstrap must be the launcher's socket, not the barrier pipe that collided with it"
+    );
+    drop(guardian_end);
+    registry
+        .terminate_owner(&owner, Deadline::after(Duration::from_secs(10)))
+        .unwrap();
+}

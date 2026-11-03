@@ -93,11 +93,19 @@ pub fn take_guardian_bootstrap() -> anyhow::Result<std::os::fd::OwnedFd> {
 /// a guardian that parsed a path from its command line could be pointed at another
 /// project's process journal and would then adopt groups it does not own.
 pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::Result<()> {
-    let artifact = crate::build_info::artifact_identity(
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("yi-agent")),
-    );
-    yi_agent_supervisors::lifecycle::guardian::serve(scope, artifact, || false)
-        .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
+    let executable = std::env::current_exe()?;
+    let artifact = crate::build_info::artifact_identity(executable.clone());
+    // The guardian starts the daemon from *this* executable, which is what makes the
+    // pinned selection meaningful: the bytes the guardian was authorised with are the
+    // bytes the daemon runs, and a bundle replaced afterwards cannot change them.
+    yi_agent_supervisors::lifecycle::guardian::serve_with_daemon(
+        scope,
+        artifact,
+        || false,
+        std::sync::Arc::new(yi_agent_supervisors::lifecycle::preview::NoCoordinator),
+        Some(&executable),
+    )
+    .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
 }
 
 /// Serves one runtime's business daemon under its guardian.

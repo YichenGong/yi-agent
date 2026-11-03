@@ -103,6 +103,10 @@ pub fn serve_channel(
                     owner: grant.owner.clone(),
                     root: grant.root.clone(),
                     execution: grant.execution.clone(),
+                    // A tool spawn is authorised by the channel that carried it, not
+                    // by an inherited bootstrap: giving a tool process one would let
+                    // it claim to be a managed role itself.
+                    bootstrap: None,
                 };
                 let deadline = Deadline::after(budget);
                 match registry.spawn_with_stdio(command, Some(stdio), deadline) {
