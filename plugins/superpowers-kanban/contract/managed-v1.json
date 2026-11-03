@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "_comment": "看板插件的受管命令契约（G3 冻结）。把现有 CLI 动词与 IPC 方法逐个映射到 G1 §5.1 的 effect。缺一条映射即视为未分类，checker 拒绝。`run` 与 `manifest` 只允许 Maintenance：它们是宿主拉起后端与安装插件用的，不是用户业务入口。",
+  "plugin": "superpowers-kanban",
+  "cli": {
+    "_comment": "来源：crates/superpowers-kanban-runner/src/main.rs 的 USAGE 常量（第 144 行起）。17 个动词。",
+    "run": {
+      "effect": "Maintenance",
+      "why": "宿主 supervisor 用清单里的 args 拉起后端；不是用户业务入口",
+      "requiresProject": false
+    },
+    "manifest": {
+      "effect": "Maintenance",
+      "why": "打印 supervisor 清单供宿主 plugin/install 消费；安装期动作",
+      "requiresProject": false
+    },
+    "add": {
+      "effect": "Write",
+      "why": "投递 spec+plan 对，写入队列",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "add-prequeued": {
+      "effect": "Write",
+      "why": "记录一张尚未有 spec/plan 的想法",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "promote": {
+      "effect": "Write",
+      "why": "把 pre-queued 卡片提升为 queued；要求卡片当前是 pre_queued",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "add-merge": {
+      "effect": "Write",
+      "why": "投递合并卡，改变合并队列",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "merge-request": {
+      "effect": "Write",
+      "why": "请求本项目的合并槽位；入队即写状态，不是只读查询",
+      "requiresProject": true,
+      "idempotent": false,
+      "note": "设计 §4 要求它不能被声明为 Read：它改 merge_queued 状态并占用合并锁"
+    },
+    "merge-finish": {
+      "effect": "Write",
+      "why": "释放或清除合并槽位",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "merge-cancel": {
+      "effect": "Write",
+      "why": "退出合并队列；仅在 merge_queued 上成立",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "done": {
+      "effect": "Write",
+      "why": "标记卡片完成并归档",
+      "requiresProject": true,
+      "idempotent": false
+    },
+    "state": {
+      "effect": "Write",
+      "why": "模型声明卡片状态；daemon 之外唯一写状态入口",
+      "requiresProject": true,
+      "idempotent": true,
+      "note": "幂等指同一 card+state+detail 重复设置结果相同，不是指可不经授权调用"
+    },
+    "archive": {
+      "effect": "Write",
+      "why": "归档已完成/失败卡片",
+      "requiresProject": true,
+      "idempotent": true
+    },
+    "purge": {
+      "effect": "Write",
+      "why": "永久删除已归档卡片记录",
+      "requiresProject": true,
+      "idempotent": false,
+      "destructive": true
+    },
+    "list": {
+      "effect": "Read",
+      "why": "只读列举卡片",
+      "requiresProject": true,
+      "idempotent": true
+    },
+    "on": {
+      "effect": "QuotaWrite",
+      "why": "打开开关会恢复调度。开关本身写在项目偏好层，但真正影响的是整机自动任务是否运行",
+      "requiresProject": true,
+      "idempotent": true,
+      "note": "G3 判定：不并入 Write。理由见子 spec §4.2——它决定是否产生新的自动任务，与 G1 §5.1 把 Launch 独立授权同一道理"
+    },
+    "off": {
+      "effect": "QuotaWrite",
+      "why": "同上，关闭调度",
+      "requiresProject": true,
+      "idempotent": true,
+      "note": "同上"
+    },
+    "workdir": {
+      "effect": "Read",
+      "why": "打印本项目看板工作目录，供会话定位",
+      "requiresProject": true,
+      "idempotent": true
+    }
+  },
+  "ipc": {
+    "_comment": "来源：crates/superpowers-kanban-runner/src/dispatch.rs 的 dispatch_in 方法表。19 个方法。",
+    "list": { "effect": "Read", "idempotent": true },
+    "enqueue": { "effect": "Write", "idempotent": false },
+    "enqueue_prequeued": { "effect": "Write", "idempotent": false },
+    "promote": { "effect": "Write", "idempotent": false },
+    "enqueue_merge": { "effect": "Write", "idempotent": false },
+    "switch.read": { "effect": "Read", "idempotent": true },
+    "switch.write": { "effect": "QuotaWrite", "idempotent": true },
+    "driver/next": {
+      "effect": "Launch",
+      "idempotent": false,
+      "why": "宿主每 tick 拉一拍，插件可回一个 launch 动作；这是产生新自动任务的路径"
+    },
+    "board.next_launch": { "effect": "Launch", "idempotent": false },
+    "board.mark_running": { "effect": "Launch", "idempotent": true },
+    "board.mark_terminal": { "effect": "Write", "idempotent": true },
+    "board.release": { "effect": "Write", "idempotent": true },
+    "merge_request": { "effect": "Write", "idempotent": false },
+    "merge_finish": { "effect": "Write", "idempotent": false },
+    "merge_cancel": { "effect": "Write", "idempotent": false },
+    "card.state": { "effect": "Write", "idempotent": true },
+    "lifecycle/create": {
+      "effect": "Resident",
+      "idempotent": true,
+      "why": "登记一个项目的常驻服务；设计 §6 把常驻列为独立确认项"
+    },
+    "lifecycle/remove": { "effect": "Resident", "idempotent": true },
+    "settings.read": { "effect": "Read", "idempotent": true },
+    "settings.write": {
+      "effect": "QuotaWrite",
+      "idempotent": true,
+      "why": "settings 含并发窗口与峰值，属于整机共享配额配置（设计 §7.1）"
+    }
+  },
+  "reserved": {
+    "_comment": "以下方法必须由宿主签发，插件不得自行调用；出现在契约里是为了让 checker 能断言它们没被插件声明为业务方法。",
+    "Maintenance": "生命周期事务内专有；manifest 的 effect enum 刻意不含它"
+  }
+}

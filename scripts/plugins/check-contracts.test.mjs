@@ -18,7 +18,15 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { loadContracts, checkDocument, checkTrace } from "./check-contracts.mjs";
+import {
+  loadContracts,
+  checkDocument,
+  checkTrace,
+  cliVerbsFromSource,
+  ipcMethodsFromSource,
+  loadManagedContract,
+  checkManagedContract,
+} from "./check-contracts.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..", "..");
@@ -490,4 +498,122 @@ test("a root envelope with a short public key is rejected", () => {
   const doc = fixture("root-v1.json");
   doc.root.publicKey = Buffer.alloc(16).toString("base64");
   rejects("root", doc, /publicKey|pattern/i);
+});
+
+// ---------------------------------------------------------------------------
+// 受管命令契约（G3）：每个 CLI 动词与 IPC 方法都必须有 effect 分类。
+//
+// 这一组的重点是**证明检查本身会红**。一个「源码里加了新动词但检查还是绿」的
+// checker 比没有 checker 更糟：它让人以为覆盖是完整的。
+// ---------------------------------------------------------------------------
+
+const RUNNER_SRC = path.join(
+  REPO_ROOT,
+  "plugins",
+  "superpowers-kanban",
+  "crates",
+  "superpowers-kanban-runner",
+  "src",
+);
+
+function managedInputs() {
+  return {
+    cliVerbs: cliVerbsFromSource(readFileSync(path.join(RUNNER_SRC, "main.rs"), "utf8")),
+    ipcMethods: ipcMethodsFromSource(readFileSync(path.join(RUNNER_SRC, "dispatch.rs"), "utf8")),
+  };
+}
+
+test("the managed contract classifies every CLI verb and IPC method in the source", () => {
+  const inputs = managedInputs();
+  assert.ok(inputs.cliVerbs.length >= 15, `only extracted ${inputs.cliVerbs.length} CLI verbs`);
+  assert.ok(inputs.ipcMethods.length >= 18, `only extracted ${inputs.ipcMethods.length} IPC methods`);
+  const errors = checkManagedContract(loadManagedContract(), inputs);
+  assert.deepEqual(errors, []);
+});
+
+test("a CLI verb that exists in the source but not the contract is rejected", () => {
+  const inputs = managedInputs();
+  inputs.cliVerbs = [...inputs.cliVerbs, "delete-everything"];
+  const errors = checkManagedContract(loadManagedContract(), inputs);
+  assert.ok(
+    errors.some((line) => line.includes("delete-everything") && line.includes("no effect classification")),
+    `an unclassified verb must be reported, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("a contract entry with no matching source verb is rejected as drift", () => {
+  const contract = structuredClone(loadManagedContract());
+  contract.cli["ghost-verb"] = { effect: "Read" };
+  const errors = checkManagedContract(contract, managedInputs());
+  assert.ok(
+    errors.some((line) => line.includes("ghost-verb") && line.includes("no longer exists")),
+    `a stale contract entry must be reported, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("an IPC method that appears in dispatch but not the contract is rejected", () => {
+  const inputs = managedInputs();
+  inputs.ipcMethods = [...inputs.ipcMethods, "secret/eval"];
+  const errors = checkManagedContract(loadManagedContract(), inputs);
+  assert.ok(
+    errors.some((line) => line.includes("secret/eval")),
+    `an unclassified IPC method must be reported, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("run and manifest may not be declared as anything but Maintenance", () => {
+  const contract = structuredClone(loadManagedContract());
+  contract.cli.run.effect = "Write";
+  const errors = checkManagedContract(contract, managedInputs());
+  assert.ok(
+    errors.some((line) => line.includes('"run"') && line.includes("must be Maintenance")),
+    `run as a business entry must be rejected, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("merge-request may not be declared Read", () => {
+  const contract = structuredClone(loadManagedContract());
+  contract.cli["merge-request"].effect = "Read";
+  const errors = checkManagedContract(contract, managedInputs());
+  assert.ok(
+    errors.some((line) => line.includes("merge-request") && line.includes("Read")),
+    `merge-request as Read must be rejected, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("a plugin method may not claim Maintenance", () => {
+  const contract = structuredClone(loadManagedContract());
+  contract.ipc["card.state"].effect = "Maintenance";
+  const errors = checkManagedContract(contract, managedInputs());
+  assert.ok(
+    errors.some((line) => line.includes("card.state") && line.includes("Maintenance")),
+    `a plugin method claiming Maintenance must be rejected, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+test("an unknown effect value is rejected", () => {
+  const contract = structuredClone(loadManagedContract());
+  contract.cli.list.effect = "Everything";
+  const errors = checkManagedContract(contract, managedInputs());
+  assert.ok(
+    errors.some((line) => line.includes("unknown effect")),
+    `an unknown effect must be reported, got: ${JSON.stringify(errors)}`,
+  );
+});
+
+// 提取器本身会失败，这是这一组里最重要的一条。若正则失配后返回空数组，
+// 上面那条「源码里多了动词」的检查会永远绿。
+test("the source extractors fail loudly rather than returning empty", () => {
+  assert.deepEqual(cliVerbsFromSource("fn main() {}"), []);
+  assert.deepEqual(ipcMethodsFromSource("fn other() {}"), []);
+
+  const errors = checkManagedContract(loadManagedContract(), { cliVerbs: [], ipcMethods: [] });
+  assert.ok(
+    errors.some((line) => line.includes("could not extract any CLI verb")),
+    `empty extraction must be reported as a stale regex, got: ${JSON.stringify(errors)}`,
+  );
+  assert.ok(
+    errors.some((line) => line.includes("could not extract any IPC method")),
+    `empty extraction must be reported as a stale regex, got: ${JSON.stringify(errors)}`,
+  );
 });

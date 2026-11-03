@@ -105,6 +105,158 @@ export function loadContracts() {
   return { validators, ajv };
 }
 
+// ---------------------------------------------------------------------------
+// 受管命令契约（G3）：每个 CLI 动词与 IPC 方法都必须有 effect 分类。
+//
+// 两份名单**从源码抽取**，不是手抄。手抄的名单只能证明"我抄的时候是对的"，
+// 而源码改名后手抄名单不会自己变红。抽取一旦拿不到东西也算失败——否则
+// 正则失配会让检查静默通过，那是最坏的一种绿。
+// ---------------------------------------------------------------------------
+
+const RUNNER_MAIN = path.join(
+  REPO_ROOT,
+  "plugins",
+  "superpowers-kanban",
+  "crates",
+  "superpowers-kanban-runner",
+  "src",
+  "main.rs",
+);
+const RUNNER_DISPATCH = path.join(
+  REPO_ROOT,
+  "plugins",
+  "superpowers-kanban",
+  "crates",
+  "superpowers-kanban-runner",
+  "src",
+  "dispatch.rs",
+);
+const MANAGED_CONTRACT = path.join(
+  REPO_ROOT,
+  "plugins",
+  "superpowers-kanban",
+  "contract",
+  "managed-v1.json",
+);
+
+/// USAGE 第一行是 `<run|add|...>`，是 CLI 动词的权威清单。
+export function cliVerbsFromSource(source) {
+  const match = source.match(/usage:\s*superpowers-kanban\s*<([^>]+)>/);
+  if (!match) return [];
+  return match[1]
+    .split("|")
+    .map((verb) => verb.trim())
+    .filter(Boolean);
+}
+
+/// `dispatch_in` 的 match 表：只认顶层 8 空格缩进的 `"name" =>`。
+/// 内层的 match（如 `parse_state` 的 `"queued" =>`）缩进更深或不在该函数内。
+export function ipcMethodsFromSource(source) {
+  const start = source.indexOf("fn dispatch_in(");
+  if (start < 0) return [];
+  // 函数体到下一个顶层 `}` 之前足够；用下一个 `\npub fn ` / `\nfn ` 切片更省心。
+  const rest = source.slice(start);
+  const end = rest.search(/\n(pub )?fn /);
+  const body = end < 0 ? rest : rest.slice(0, end);
+  const methods = [];
+  const re = /^\s{8}"([a-zA-Z0-9_./-]+)"\s*=>/gm;
+  let hit;
+  while ((hit = re.exec(body)) !== null) methods.push(hit[1]);
+  return [...new Set(methods)];
+}
+
+export function loadManagedContract() {
+  return readJSON(MANAGED_CONTRACT);
+}
+
+export function checkManagedContract(contract, { cliVerbs, ipcMethods }) {
+  const errors = [];
+  const allowed = new Set(["Read", "Write", "Launch", "QuotaWrite", "Resident", "Maintenance"]);
+
+  if (cliVerbs.length === 0) {
+    errors.push("managed: could not extract any CLI verb from the runner source — the extraction regex is stale");
+  }
+  if (ipcMethods.length === 0) {
+    errors.push("managed: could not extract any IPC method from dispatch.rs — the extraction regex is stale");
+  }
+
+  for (const section of ["cli", "ipc"]) {
+    const table = contract[section];
+    if (!table || typeof table !== "object") {
+      errors.push(`managed: contract is missing its "${section}" table`);
+    }
+  }
+
+  const check = (section, names) => {
+    const table = contract[section] ?? {};
+    const declared = new Set(Object.keys(table).filter((key) => !key.startsWith("_")));
+    for (const name of names) {
+      if (!declared.has(name)) {
+        errors.push(
+          `managed/${section}: "${name}" exists in the source but has no effect classification ` +
+            `— an unclassified verb could be granted under the wrong capability`,
+        );
+      }
+    }
+    for (const name of declared) {
+      if (!names.includes(name)) {
+        errors.push(
+          `managed/${section}: "${name}" is classified in the contract but no longer exists in the source ` +
+            `— the contract drifted away from the code`,
+        );
+      }
+    }
+    for (const [name, entry] of Object.entries(table)) {
+      if (name.startsWith("_")) continue;
+      if (!entry || typeof entry !== "object") {
+        errors.push(`managed/${section}: "${name}" entry is not an object`);
+        continue;
+      }
+      if (!allowed.has(entry.effect)) {
+        errors.push(`managed/${section}: "${name}" has unknown effect "${entry.effect}"`);
+      }
+    }
+  };
+
+  check("cli", cliVerbs);
+  check("ipc", ipcMethods);
+
+  // 设计 §4 的硬要求：`run` / `manifest` 只能维护使用，不能当业务入口。
+  for (const name of ["run", "manifest"]) {
+    const entry = contract.cli?.[name];
+    if (entry && entry.effect !== "Maintenance") {
+      errors.push(
+        `managed/cli: "${name}" is ${entry.effect} but must be Maintenance — it is how the host ` +
+          `launches the backend and installs the plugin, not a user-facing business entry`,
+      );
+    }
+  }
+
+  // merge-request 改状态并占合并锁，不能自称 Read（与 destructive-verb 规则同源）。
+  const mergeRequest = contract.cli?.["merge-request"];
+  if (mergeRequest && mergeRequest.effect === "Read") {
+    errors.push(
+      'managed/cli: "merge-request" is declared Read but it changes state to merge_queued and ' +
+        "takes the merge lock — the design forbids treating it as a read",
+    );
+  }
+
+  // Maintenance 只由生命周期事务签发：插件自己的方法不得声明它。
+  for (const section of ["cli", "ipc"]) {
+    for (const [name, entry] of Object.entries(contract[section] ?? {})) {
+      if (name.startsWith("_") || !entry) continue;
+      if (entry.effect === "Maintenance" && !(section === "cli" && (name === "run" || name === "manifest"))) {
+        errors.push(
+          `managed/${section}: "${name}" declares Maintenance, which only lifecycle transactions issue ` +
+            `— plugin methods may not claim it`,
+        );
+      }
+    }
+  }
+
+  return errors;
+}
+
 function formatAjvError(err) {
   const where = err.instancePath === "" ? "(root)" : err.instancePath;
   return `${where}: ${err.message}`;
@@ -603,6 +755,20 @@ async function main() {
     failures += 1;
     console.log("  FAIL  idempotent retry trace");
     for (const line of traceResult.errors) console.log(`          ${line}`);
+  }
+
+  // 受管命令契约：CLI 动词与 IPC 方法必须逐个有 effect 分类。
+  const managedContract = loadManagedContract();
+  const cliVerbs = cliVerbsFromSource(readFileSync(RUNNER_MAIN, "utf8"));
+  const ipcMethods = ipcMethodsFromSource(readFileSync(RUNNER_DISPATCH, "utf8"));
+  positive += 1;
+  const managedErrors = checkManagedContract(managedContract, { cliVerbs, ipcMethods });
+  if (managedErrors.length === 0) {
+    console.log(`  ok    managed contract (${cliVerbs.length} cli verbs, ${ipcMethods.length} ipc methods)`);
+  } else {
+    failures += 1;
+    console.log("  FAIL  managed contract");
+    for (const line of managedErrors) console.log(`          ${line}`);
   }
 
   console.log("contract checker: negative samples (each must be rejected)");
