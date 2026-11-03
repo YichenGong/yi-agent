@@ -16,6 +16,8 @@ use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
+use crate::server::turn::failure::{fail_announced_turn, rollback_turn};
+
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
 use crate::server::{
     BuiltAgent, LeadTarget, ProcessWatch, ProjectRuntimes, ThreadRoots, TurnEvent, apply_session,
@@ -133,6 +135,12 @@ pub(crate) struct ServeLauncher<'a, F> {
     /// 组长开关的生效值。交给 `start_thread_core`，使被驱动的会话与手工会话
     /// 用同一个判定。
     pub(crate) lead_agent_enabled: bool,
+    /// 测试专用：在**真实** prepare 完成之后、**真实** send 之前插入一次实例级
+    /// 回调。回调只替换本次 `prepared` 的发送端为「接收端已关闭」的真实 mpsc，
+    /// 让 `send` 自己失败——不模拟 `send` 的结果，也不替换 prepare / launcher
+    /// 的整条逻辑。生产构造永远为 `None`。
+    #[cfg(test)]
+    pub(crate) before_prompt_send: Option<fn(&mut crate::server::turn::PreparedTurn)>,
 }
 /// 通用动作的执行者:插件说「起一个会话」或「往已有会话追加一轮」,这里照做。
 ///
@@ -403,7 +411,8 @@ where
             "threadId": thread_id,
             "input": [{ "type": "text", "text": objective }],
         });
-        let prepared =
+        #[allow(unused_mut)]
+        let mut prepared =
             match prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
                 .await
             {
@@ -452,10 +461,11 @@ where
         if let Err(error) = announced {
             // `turn/started` 都没发出去,界面上没有「运行中」需要收尾,但占位必须
             // 撤回,否则该会话会永远显示忙、后续每一拍驱动都拿到假 idle。
-            self.rollback_turn(
+            rollback_turn(
+                self.threads,
+                self.hub,
                 &prepared.thread_id,
                 &prepared.turn_id,
-                &prepared.status_handle,
             )
             .await;
             return Err(error);
@@ -487,18 +497,24 @@ where
         .await;
         if let Err(error) = opened {
             // 已经宣告了这一轮,必须补一条结束通知,否则界面会永久停在「运行中」。
-            self.fail_announced_turn(
+            fail_announced_turn(
+                self.threads,
+                self.hub,
                 &prepared.thread_id,
                 &prepared.turn_id,
-                &prepared.status_handle,
                 &error.to_string(),
             )
             .await;
             return Err(error);
         }
+        #[cfg(test)]
+        if let Some(hook) = self.before_prompt_send {
+            hook(&mut prepared);
+        }
         if let Err(error) = prepared
             .prompt_tx
             .send(TurnPrompt {
+                // 失败收口要用身份，`turn_id` 随即被 move 进 prompt，故先 clone。
                 turn_id: prepared.turn_id.clone(),
                 prompt: prepared.prompt,
                 activate: prepared.activate,
@@ -516,10 +532,11 @@ where
                 prepared.thread_id
             );
             // 已经宣告过这一轮,必须补结束通知并撤回占位(只撤回本次那一个)。
-            self.fail_announced_turn(
+            fail_announced_turn(
+                self.threads,
+                self.hub,
                 &prepared.thread_id,
                 &prepared.turn_id,
-                &prepared.status_handle,
                 &message,
             )
             .await;
@@ -527,54 +544,6 @@ where
         }
         // send 成功就是成功:此后绝不允许把这一次再回报成「未接收」。
         Ok(prepared.thread_id)
-    }
-
-    /// 撤回**本次**占用的 turn 占位,并把状态收回 `Idle`。
-    ///
-    /// 关键在那一句比较:只有当 `active_turn_id` 仍然是**本次的** turn_id 时才清。
-    /// 无条件清零会把另一个正在跑的 turn 变成无主(`turn/cancel` 静默失效、
-    /// `is_idle` 谎报空闲)。这是 spec §7「prepare/send 失败只回滚本次拥有的 turn
-    /// 占位;不能清掉已有 busy turn」的落点。
-    async fn rollback_turn(
-        &mut self,
-        thread_id: &str,
-        turn_id: &str,
-        status_handle: &Arc<std::sync::Mutex<ThreadStatus>>,
-    ) {
-        let owned = self.threads.get_mut(thread_id).is_some_and(|session| {
-            if session.active_turn_id.as_deref() == Some(turn_id) {
-                session.active_turn_id = None;
-                true
-            } else {
-                false
-            }
-        });
-        if owned {
-            let _ = update_status(self.hub, status_handle, thread_id, ThreadStatus::Idle).await;
-        }
-    }
-
-    /// 已经发出过 `turn/started` 的这一轮失败了:补一条 `turn/completed`
-    /// (`failed`)再撤占位,让界面收敛而不是永久「运行中」。
-    async fn fail_announced_turn(
-        &mut self,
-        thread_id: &str,
-        turn_id: &str,
-        status_handle: &Arc<std::sync::Mutex<ThreadStatus>>,
-        error: &str,
-    ) {
-        let _ = write_notification(
-            self.hub,
-            &Notification::TurnCompleted {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                status: crate::protocol::TurnStatus::Failed,
-                error: Some(error.to_string()),
-                completed_at: Some(crate::thread_store::now_millis()),
-            },
-        )
-        .await;
-        self.rollback_turn(thread_id, turn_id, status_handle).await;
     }
 
     /// 把一条投递给组长的消息转成组长 thread 的一次 turn。
@@ -732,7 +701,8 @@ where
             "input": [{ "type": "text",
                         "text": format!("[来自会话 {}] {}", envelope.from_thread_id, envelope.text) }],
         });
-        let prepared =
+        #[allow(unused_mut)]
+        let mut prepared =
             prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
                 .await
                 .map_err(|error| {
@@ -741,10 +711,17 @@ where
                         turn_prepare_rpc_error(error).message
                     )
                 })?;
-        if prepared
+        #[cfg(test)]
+        if let Some(hook) = self.before_prompt_send {
+            hook(&mut prepared);
+        }
+        // 冷启动这条路径**不**发 `turn/started`（投递不是客户端请求，见上文），
+        // 所以失败时不该编造开始/完成事件：只按身份撤回本次占位，保留原字符串
+        // 作为对外错误。
+        let send_result = prepared
             .prompt_tx
             .send(TurnPrompt {
-                turn_id: prepared.turn_id,
+                turn_id: prepared.turn_id.clone(),
                 prompt: prepared.prompt,
                 activate: prepared.activate,
                 attachments: prepared.attachments,
@@ -753,9 +730,15 @@ where
                 display_text: prepared.display_text,
                 lead_request_id: envelope.request_id.clone(),
             })
-            .await
-            .is_err()
-        {
+            .await;
+        if send_result.is_err() {
+            rollback_turn(
+                self.threads,
+                self.hub,
+                &prepared.thread_id,
+                &prepared.turn_id,
+            )
+            .await;
             return Err(anyhow::anyhow!(
                 "lead driver is gone before its first prompt"
             ));

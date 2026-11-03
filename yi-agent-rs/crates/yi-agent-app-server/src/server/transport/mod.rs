@@ -781,6 +781,8 @@ where
                         lead_control: &lead_control,
                         lead_control_replies: &lead_control_replies,
                         lead_target: Some(delivery.lead),
+                        #[cfg(test)]
+                        before_prompt_send: None,
                     };
                     if let Err(error) = launcher.deliver_to_lead(&envelope).await {
                         eprintln!("[app-server] lead background delivery failed: {error}");
@@ -836,6 +838,8 @@ where
                     lead_control: &lead_control,
                     lead_control_replies: &lead_control_replies,
                     lead_target: Some(target),
+                    #[cfg(test)]
+                    before_prompt_send: None,
                 };
                 if let Err(error) = launcher.deliver_to_lead(&envelope).await {
                     eprintln!("[app-server] lead delivery failed: {error}");
@@ -882,6 +886,8 @@ where
                     lead_control_replies: &lead_control_replies,
                     // 写指令不投递给组长，故没有 lead target。
                     lead_target: None,
+                    #[cfg(test)]
+                    before_prompt_send: None,
                 };
                 let request_id = cmd.request_id.clone();
                 let outcome = launcher.apply_lead_control(cmd).await;
