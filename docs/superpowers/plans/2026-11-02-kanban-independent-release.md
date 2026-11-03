@@ -609,7 +609,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 2：测试新会话获取正确 skill、同名副本阻止自动任务、旧会话正常聊天但调用插件返回 StaleBinding、resume 不丢版本绑定。CLI 和桌面线程建模两条路径均覆盖，不只改 app-server。见 `yi-agent-app-server/src/plugin_manager/tests.rs`、`yi-agent-skills/tests/managed_source.rs`（`ManagedRoot` + `SkillScope::Managed` + 同名冲突）、`yi-agent-app-server/src/thread_store.rs` 的 `plugin_bindings` 往返、`yi-agent/src/session_store.rs`（CLI 侧 resume 保留绑定）。
 - [x] Step 3：接入 begin_turn/finish 与命令许可的实际生命周期，包括 AwaitingApproval、cancel、模型失败、会话重建、后台 driver 和普通用户追加回合；所有路径释放正确 permit，不在 Agent::run 重置 token 前捕获错误 cancel token。见 `session.rs` 的 `ThreadSession::turn_permit`（RAII，drop 即释放）与 `server.rs` 三处清空活跃 turn 的站点；`server/tests/plugin_admission.rs` 四个用例覆盖：排空期被拒且不留占位、正常结束释放、会话移除释放、普通回合不受排空影响。cancel/模型失败/命令路径都汇流到同一 `TurnEvent::Finished`（`server.rs:3494` 与 `:4423`），故共用同一释放点。
 - [x] Step 4：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib plugin_binding && cargo test -p yi-agent-skills && cargo test -p yi-agent --test plugins_exec`。检查筛选结果非零；回归现有 session_driver、resume、thread 元数据兼容测试。实测 9 / 43 / 13 全绿，`cargo test -p yi-agent-app-server` 全量 1187 通过。
-- [ ] Step 5：按 C 提交 `feat: bind plugin skills and sessions to managed releases`。
+- [x] Step 5：按 C 提交 `feat: bind plugin skills and sessions to managed releases`。（`be8866be`）
 
 ## Phase 4：管理界面、隔离桥与远程资源
 
