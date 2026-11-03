@@ -23,8 +23,11 @@
 - [x] `assertion` IOKit `PreventUserIdleSystemSleep`，`Drop` 幂等释放；
       非 macOS no-op。验证：`cargo test -p yi-agent-power assertion`；
       真机 `cargo test -p yi-agent-power assertion -- --ignored`
-- [x] `probe` 电源（UPS/未知算插电）与网络（候选接口 + 网关探测，
-      `ECONNREFUSED` 计为在线）。验证：`cargo test -p yi-agent-power probe`
+- [x] `probe` 电源（UPS/未知算插电）与网络**被动双栈资格**（2026-11-03 起：
+      一次 `getifaddrs` 快照，不再 `route`/TCP 80 主动探测）。三态
+      `NetworkState::{Online,Offline,Unknown}`：`Unknown`（采样失败，无可信快照）
+      也提供资格，成功但无合格接口才是 `Offline`。验证：
+      `cargo test -p yi-agent-power probe`
 - [x] `supervisor` 10s 拍状态机，只在迁移边沿调 FFI（`Hold` 边沿才
       `acquire`，`Idle` 与 `Drop` 都 `release`）。验证：
       `cargo test -p yi-agent-power supervisor`
@@ -62,7 +65,27 @@
 设计：[任务运行防休眠加固 spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)；
 计划：[实施 plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md)。仅文档审查完成，以下产品需求尚未实现。
 
-- [ ] P1 被动双栈链路资格，移除 route/TCP 80 判据；完成判据：plan Task 1 的 N1–N8 用例及 `cargo test -p yi-agent-power sleep_hardening_`，真机网络边界按 Task 7 验收。
+- [x] P1 被动双栈链路资格，移除 route/TCP 80 判据。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-power sleep_hardening_` 19 项，其中
+      `probe::tests::sleep_hardening_ipv6_only_is_online` /
+      `_usable_single_addresses_are_online`（v4 公网、v4 私网、v6 global、v6 ULA）/
+      `_unusable_addresses_do_not_qualify`（N3 地址）/ `_interfaces_without_a_live_link_are_offline`
+      （N4 DOWN、只有 UP、loopback、utun/awdl/llw/bridge）/
+      `_successful_empty_snapshot_is_offline`（N5）/ `_sockaddr_in_bytes_round_trip`、
+      `_sockaddr_in6_bytes_round_trip`、`_same_interface_keeps_both_families`、
+      `_snapshot_holder_releases_exactly_once`（N7）/
+      `supervisor::tests::sleep_hardening_unknown_network_still_holds`、
+      `_unknown_does_not_bypass_the_other_conditions`、
+      `_offline_network_releases_after_the_grace`、
+      `_entered_unknown_logs_only_on_the_edge`、`_unknown_edge_after_recovery_logs_again`（N8）。
+      保 API 变异证据：把 `network_state` 改成只认 IPv4（旧 `has_v4` 行为）后，
+      `sleep_hardening_ipv6_only_is_online`、`_usable_single_addresses_are_online`、
+      `_one_qualifying_interface_is_enough` 三条失败（`2001:db8::1234 alone must be online`），
+      恢复后 19/19 绿。
+      词义边界：资格 = **本机存在可用本地链路**，不表示互联网/provider 可达；局域网有地址、
+      上游断开时仍保活。虚拟/旁路前缀（utun/awdl/llw/bridge/anpi/ap/tun/tap/docker/br-/veth/virbr/lo）
+      保持原规则——当它们是唯一出口时仍判 Offline，本轮不解决该拓扑。
+      真机网络边界（IPv6-only、网关 80 丢包、Wi-Fi 断开）仍待 Task 7 人工验收。
 - [ ] P2 RPC/插件/cold lead 启动失败按 turn_id 回滚并收口；完成判据：plan Tasks 3–4 的 T1–T7，`cargo test -p yi-agent-app-server --lib sleep_hardening_`，warm 排队语义不回归。
 - [ ] P3 一致输入与可通知电源线程、真实已持断言停机测试；完成判据：plan Task 2 的 G1–G5、`cargo test -p yi-agent-app-server --lib sleep_hardening_`，可控预算1秒、真机预算2秒且不冒充硬实时。
 - [ ] P4 显式后台进程意图，默认false、活跃才参与busy；完成判据：plan Tasks 5–6 的 B1–B8，tools/app-server `sleep_hardening_` 与 desktop `npx tsc --noEmit && npx vitest run`。
