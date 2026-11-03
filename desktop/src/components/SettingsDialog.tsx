@@ -70,6 +70,7 @@ export function SettingsDialog({
   mcpDefaultProject,
   pluginProjects,
   pluginDefaultProject,
+  pluginProjectHandle,
   relayUrl,
   saveRelayUrl,
   tagNames,
@@ -132,6 +133,16 @@ export function SettingsDialog({
   pluginProjects?: string[];
   /** 「插件」Tab 首选项目（当前对话的工作目录）。 */
   pluginDefaultProject?: string;
+  /**
+   * 受管插件协议用来标识项目的键。
+   *
+   * 与上面的**路径**是两个协议：旧 supervisor 协议按路径装清单，受管协议
+   * 按 `ProjectId` 索引授权，而 `ProjectId` 由 `ProjectResolver::register`
+   * 取**规范化后的绝对路径**（`project.rs`），不是 spec 早期草案里的
+   * `ph1_...`。所以这里传的就是 canonical 路径；缺省时不显示受管分区，
+   * 而不是拿一个猜出来的键去冒充已授权项目。
+   */
+  pluginProjectHandle?: string;
   /** 「MCP」Tab 的宿主 RPC 接缝（mcp/list）。 */
   mcpCall?: McpCall;
   /** 「网页搜索」Tab 的宿主 RPC 接缝（websearch/get|set|test）。 */
@@ -401,6 +412,7 @@ export function SettingsDialog({
                 call={pluginCall}
                 projects={pluginProjects ?? []}
                 defaultProject={pluginDefaultProject}
+                projectHandle={pluginProjectHandle}
               />
             ) : active === "models" ? (
               <SettingsModelsTab call={modelCall} isMobile={isMobile} />

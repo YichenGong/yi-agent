@@ -26,6 +26,8 @@ import {
   ipcMethodsFromSource,
   loadManagedContract,
   checkManagedContract,
+  checkPluginManifest,
+  checkViewDigests,
 } from "./check-contracts.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -616,4 +618,60 @@ test("the source extractors fail loudly rather than returning empty", () => {
     errors.some((line) => line.includes("could not extract any IPC method")),
     `empty extraction must be reported as a stale regex, got: ${JSON.stringify(errors)}`,
   );
+});
+
+// --- 已迁出主程序的插件：真实清单与产物摘要 ---
+
+const KANBAN_DIR = path.join(REPO_ROOT, "plugins", "superpowers-kanban");
+const KANBAN_MANIFEST = path.join(KANBAN_DIR, "plugin.json");
+
+function kanbanManifest() {
+  return JSON.parse(readFileSync(KANBAN_MANIFEST, "utf8"));
+}
+
+test("the shipped kanban manifest passes the same schema as the fixture", () => {
+  const result = checkPluginManifest(contracts, kanbanManifest());
+  assert.deepEqual(result.errors, [], "plugin.json must satisfy manifest-v1");
+});
+
+test("the kanban manifest declares the methods the plugin UI calls", () => {
+  // 桥只转发清单声明过的方法。两边名字对不上时，失败发生在用户点按钮的那一刻，
+  // 而不是构建时——所以这里用 UI 的 methods.ts 作为对照。
+  const source = readFileSync(
+    path.join(KANBAN_DIR, "ui", "src", "lib", "methods.ts"),
+    "utf8",
+  );
+  const declared = new Set(kanbanManifest().methods.map((m) => m.name));
+  const used = [...source.matchAll(/"((?:board)\/(?:[A-Za-z0-9]+))"/g)].map((m) => m[1]);
+  assert.ok(used.length >= 10, `expected the UI method table, found ${used.length}`);
+  for (const name of used) {
+    assert.ok(declared.has(name), `UI calls "${name}" but the manifest does not declare it`);
+  }
+});
+
+test("a view digest that disagrees with the built bytes is reported", () => {
+  const doc = kanbanManifest();
+  const results = checkViewDigests(doc, KANBAN_DIR, {
+    hashFile: () => "0".repeat(64),
+  });
+  const mismatched = results.filter((r) => !r.skipped && !r.ok);
+  assert.equal(mismatched.length, results.length);
+  assert.ok(mismatched.every((r) => r.actual === "0".repeat(64)));
+});
+
+test("an unbuilt view is skipped rather than reported as a mismatch", () => {
+  // 没有字节就没有可比对的东西：报红会让「只跑契约、不构建 UI」的环境无法验证，
+  // 那是另一种假失败。
+  const results = checkViewDigests(kanbanManifest(), KANBAN_DIR, { hashFile: () => null });
+  assert.ok(results.every((r) => r.skipped));
+});
+
+test("the checked-in manifest matches the built assets when they exist", () => {
+  const results = checkViewDigests(kanbanManifest(), KANBAN_DIR);
+  const skipped = results.filter((r) => r.skipped);
+  if (skipped.length > 0) {
+    // 产物不入版本控制；没构建过时这条不适用。
+    return;
+  }
+  assert.deepEqual(results.filter((r) => !r.ok), []);
 });

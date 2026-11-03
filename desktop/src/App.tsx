@@ -3106,6 +3106,12 @@ export default function App() {
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
         pluginProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         pluginDefaultProject={current?.info?.cwd}
+        // 受管插件分区用的项目键。`ProjectId` 在实现里是 `ProjectResolver`
+        // 规范化后的绝对路径（`yi-agent-plugins/src/project.rs`），而
+        // `resolve_thread_cwd` 已经把会话 cwd 规范化过，所以会话的 cwd 就是
+        // 一个合法的受管项目键。没有当前会话时不传：宁可整节不出现，也不拿
+        // 一个猜出来的键去冒充已授权项目。
+        pluginProjectHandle={current?.info?.cwd || undefined}
         relayUrl={prefs.relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : prefs.saveRelayUrl}

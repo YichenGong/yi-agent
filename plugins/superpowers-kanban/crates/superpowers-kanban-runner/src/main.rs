@@ -160,6 +160,16 @@ const USAGE: &str =
   workdir       [--state-dir <d>]
   manifest      打印本插件的 supervisor 清单（宿主的通用 plugin/install 消费）";
 
+/// The namespace the manifest puts in front of every CLI verb.
+///
+/// The release manifest names verbs `kanban:add`, because the manifest schema
+/// requires a leading namespace and forbids hyphens in it (several real verbs
+/// are hyphenated: `add-prequeued`, `merge-request`). The bare spelling is what
+/// the skill and every existing invocation use, so both must resolve to the same
+/// command: strip the prefix on the way in rather than carrying two names
+/// through the whole parser.
+const VERB_NAMESPACE: &str = "kanban:";
+
 /// Parsed from an explicit iterator so tests can drive it without a process.
 ///
 /// The verb is mandatory: `run` used to be the implicit default, which left no
@@ -169,7 +179,11 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut args = tokens.into_iter();
-    match args.next().as_deref() {
+    let first = args.next().map(|verb| match verb.strip_prefix(VERB_NAMESPACE) {
+        Some(stripped) => stripped.to_string(),
+        None => verb,
+    });
+    match first.as_deref() {
         Some("run") => Ok(Subcommand::Run(parse_run_args(args)?)),
         Some("add") => {
             let (state_dir, rest) = parse_state_dir(args)?;
@@ -1922,6 +1936,26 @@ mod tests {
             parse(&["promote", "idea", "a.spec.md", "a.plan.md", "--title", "新标题"]),
             Ok(Subcommand::Promote { title: Some(t), .. }) if t == "新标题"
         ));
+    }
+
+    /// 清单里的 `kanban:` 前缀必须与裸动词等价。
+    ///
+    /// 两套写法都有真实调用方：清单是按 schema 要求带命名空间的那份，裸名是
+    /// skill 与所有既有文档用的那份。只认一种，另一种就会在用户的命令行里失效，
+    /// 而且失效方式只是「未知子命令」，看不出是前缀问题。
+    #[test]
+    fn the_manifested_namespace_is_optional_on_the_command_line() {
+        assert!(matches!(
+            parse(&["kanban:add-prequeued", "一个想法"]),
+            Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
+        ));
+        assert!(matches!(
+            parse(&["kanban:promote", "idea", "a.spec.md", "a.plan.md"]),
+            Ok(Subcommand::Promote { card_id, .. }) if card_id == "idea"
+        ));
+        // 前缀只剥离一次、只在开头：别的位置出现 `kanban:` 仍是普通参数。
+        assert!(parse(&["kanban:kanban:add", "a", "b"]).is_err());
+        assert!(parse(&["kanban:"]).is_err());
     }
 
     #[test]

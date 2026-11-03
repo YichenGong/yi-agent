@@ -104,11 +104,18 @@ export interface PluginHostApi {
   confirm(request: ConfirmRequest): Promise<boolean>;
 }
 
-/** `connect()` 失败时抛出，携带稳定的 kind，便于页面分支处理。 */
+/**
+ * `connect()` 或请求失败时抛出，携带稳定的 kind，便于页面分支处理。
+ *
+ * `requestId` 只在宿主回了一个**可查询**的失败时才有值（`ResultUnknown`
+ * 与抛错响应都带）。页面拿它调 `result(requestId)` 才知道那次写到底落没落，
+ * 而不是凭错误码猜——协议禁止把"没拿到结果"当成失败来重试（G1 §9.3）。
+ */
 export class PluginBridgeError extends Error {
   constructor(
     readonly kind: ErrorKind,
     readonly detail: string,
+    readonly requestId?: string,
   ) {
     super(`${kind}: ${detail}`);
     this.name = "PluginBridgeError";
@@ -217,7 +224,15 @@ export async function connect(options: ConnectOptions = {}): Promise<PluginHostA
           const error = data.error;
           settled.reject(
             isRecord(error)
-              ? new PluginBridgeError(error.kind as ErrorKind, String(error.detail ?? ""))
+              ? new PluginBridgeError(
+                  error.kind as ErrorKind,
+                  String(error.detail ?? ""),
+                  // The id is what makes `ResultUnknown` actionable: without it
+                  // the page can only tell the user "maybe it worked". A reply
+                  // with no id never reaches this line (it cannot be matched to
+                  // its pending request), so the empty check is defensive.
+                  requestId === "" ? undefined : requestId,
+                )
               : new PluginBridgeError("Io", "host returned an unreadable error"),
           );
         }

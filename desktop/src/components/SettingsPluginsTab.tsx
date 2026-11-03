@@ -43,11 +43,13 @@ export function SettingsPluginsTab({
   /** 首选项目（当前对话的工作目录）。不在 `projects` 里时回落到第一个项目。 */
   defaultProject?: string;
   /**
-   * 当前项目的受管句柄（`ph1_...`）。
+   * 当前项目的受管键。
    *
-   * 与上面的**路径**是两个东西：旧 supervisor 协议按路径装清单，受管协议
-   * 的授权、事务与视图都按句柄。把路径当句柄传会得到一个永远"未授权"的
-   * 面板，所以这里必须分开，缺省时不显示受管分区。
+   * 与上面的**路径**是两个协议：旧 supervisor 协议按路径装清单，受管协议按
+   * `ProjectId` 索引授权，而 `ProjectId` 由 `ProjectResolver::register` 取
+   * **规范化后的绝对路径**（`yi-agent-plugins/src/project.rs`），不是 spec
+   * 早期草案里的 `ph1_...`。两者在这里的取值恰好相同，但语义仍是"受管键"而
+   * 非"旧协议路径"，缺省时不显示受管分区，而不是拿一个猜出来的键去冒充。
    */
   projectHandle?: string;
 }) {

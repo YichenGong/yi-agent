@@ -96,6 +96,40 @@ pub fn dispatch_with_service(
     dispatch_in(service, state_dir, home.as_deref(), global, method, params)
 }
 
+/// 清单声明的业务方法名 → 本模块内部分派用的名字。
+///
+/// 两套名字各有来源，谁都不能改对方。发布清单的 `methods[].name` 由 G1 的
+/// schema 固定为 `namespace/verb` 且每段只允许 camelCase——`switch.read` 与
+/// `enqueue_prequeued` 在那里都是非法写法。而这里的 match 臂是旧 supervisor
+/// 协议（`plugin/query`）的线上名字，已在用的调用方按裸名问话，改名会打断它们。
+///
+/// 所以翻译放在这一层：清单名是**对外契约**，裸名是**内部实现**，中间这张表
+/// 是唯一允许两者发生关系的地方。把别名写进 match 臂做不到——契约检查器会从
+/// `dispatch_in` 的 match 表抽取 IPC 方法清单，多出来的名字会被判为「源码里
+/// 存在但契约里没分类」，而它们本来就不该出现在旧协议的方法表里。
+///
+/// 表必须与 `plugins/superpowers-kanban/plugin.json` 的 `methods` 逐条对应；
+/// 漏一条会让那个方法在受管入口下报 `unknown method`，多一条则是死代码。
+fn bare_method(method: &str) -> &str {
+    match method {
+        "board/list" => "list",
+        "board/enqueue" => "enqueue",
+        "board/enqueuePrequeued" => "enqueue_prequeued",
+        "board/promote" => "promote",
+        "board/readSwitch" => "switch.read",
+        "board/writeSwitch" => "switch.write",
+        // Settings reads are `board/prefs`, not `board/readSettings`: the
+        // manifest checker refuses any Read method whose name contains a
+        // destructive verb ("settings" contains "set"), and the rule is worth
+        // keeping blunt rather than teaching it about word boundaries.
+        "board/prefs" => "settings.read",
+        "board/storePrefs" => "settings.write",
+        "board/startLifecycle" => "lifecycle/create",
+        "board/stopLifecycle" => "lifecycle/remove",
+        other => other,
+    }
+}
+
 /// 本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
 fn dispatch_in(
     service: &BoardService,
@@ -105,6 +139,8 @@ fn dispatch_in(
     method: &str,
     params: &Value,
 ) -> Result<Value, String> {
+    // 声明名在进入分派前翻译成内部名：见 `bare_method` 的两套名字说明。
+    let method = bare_method(method);
     match method {
         "list" => Ok(service.list()),
         "enqueue" => {
@@ -1631,6 +1667,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["id"], "my-idea");
+    }
+
+    /// 清单声明的名字必须真的分派得动：改名或漏改别名表都会在这里红。
+    ///
+    /// 这条用声明名走一遍 `list`，证明翻译表把名字接到了真实分支上——只断言
+    /// `bare_method("board/list") == "list"` 会漏掉「接到哪个分支」这半件事。
+    #[test]
+    fn the_declared_manifest_names_dispatch_to_the_same_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "声明名".into(),
+            None,
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+
+        let declared = dispatch_with_global(dir.path(), None, "board/list", &json!({})).unwrap();
+        let bare = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        assert_eq!(declared, bare, "the declared name must reach the same branch");
+
+        // 未知名字仍然报错，不会被当成某个已知分支放行。
+        let unknown = dispatch_with_global(dir.path(), None, "board/nope", &json!({}));
+        assert!(unknown.is_err());
+    }
+
+    /// 别名表与清单必须逐条对应。
+    ///
+    /// 「清单里有、表里没有」会让那个方法在受管入口下报 `unknown method`；
+    /// 「表里有、清单里没有」是死代码，也说明有人改了名字却只改了一边。
+    #[test]
+    fn every_declared_method_has_a_rename_and_every_rename_is_declared() {
+        // Parse the manifest rather than scanning lines: it is indented JSON, so
+        // any line-prefix trick silently finds zero methods and the assertion
+        // below would pass for the wrong reason. `include_str!` also makes this
+        // a compile-time dependency, so the test breaks if the file moves.
+        let manifest: Value =
+            serde_json::from_str(include_str!("../../../plugin.json")).expect("plugin.json parses");
+        let declared: Vec<String> = manifest["methods"]
+            .as_array()
+            .expect("methods is an array")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .filter(|name| name.starts_with("board/"))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            declared.len() >= 10,
+            "expected the manifest to declare the board methods, found {}",
+            declared.len()
+        );
+
+        for name in &declared {
+            assert_ne!(
+                bare_method(name),
+                name.as_str(),
+                "the manifest declares \"{name}\" but the rename table does not know it"
+            );
+        }
+
+        // 反向：表里的每条别名都必须在清单里声明。
+        let known = [
+            "board/list",
+            "board/enqueue",
+            "board/enqueuePrequeued",
+            "board/promote",
+            "board/readSwitch",
+            "board/writeSwitch",
+            "board/prefs",
+            "board/storePrefs",
+            "board/startLifecycle",
+            "board/stopLifecycle",
+        ];
+        for name in known {
+            assert!(
+                declared.iter().any(|entry| entry == name),
+                "the rename table knows \"{name}\" but the manifest does not declare it"
+            );
+        }
     }
 
     #[test]

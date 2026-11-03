@@ -46,6 +46,10 @@ yi-agent-rs/yi-agent-cli/platforms/*/binaries/
 yi-agent-rs/yi-agent-cli/platforms/*/yi-agent.app/
 .worktrees/
 dist/
+# 例外：看板插件的发布清单为每个 view 记录了构建产物的 sha256。产物不入库，
+# 清单就指向一个克隆里不存在的文件——那正是“看起来完整”的假象，装的时候才
+# 报错。所以这条产物的字节必须和清单一起进版本库。
+!/plugins/superpowers-kanban/ui/dist/
 
 # cargo-mutants 的输出目录（每次跑 `just mutants` 会重建，不进版本库）
 /yi-agent-rs/mutants.out/

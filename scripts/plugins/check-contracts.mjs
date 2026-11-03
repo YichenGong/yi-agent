@@ -9,6 +9,7 @@
 // package-lock，根 scripts/ 没有 node_modules，靠 Node 的目录上溯找不到。
 // 也不能临时下载未知版本，否则「契约冻结」这句话就没有意义。
 
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -18,6 +19,10 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..", "..");
 const CONTRACTS_DIR = path.join(REPO_ROOT, "plugins", "contracts");
+
+// 已迁移到独立工程的插件：它们的发布清单不是 fixture，而是真会被安装的那份。
+const KANBAN_DIR = path.join(REPO_ROOT, "plugins", "superpowers-kanban");
+const KANBAN_MANIFEST = path.join(KANBAN_DIR, "plugin.json");
 
 // ajv 只从 plugins/contracts 解析，且必须用它自己的 package.json 作为锚点。
 const contractsRequire = createRequire(path.join(CONTRACTS_DIR, "package.json"));
@@ -397,6 +402,55 @@ function checkLifecycleSemantics(doc) {
   }
 
   return errors;
+}
+
+/**
+ * 校验已迁移插件的真实发布清单。
+ *
+ * fixture 证明的是 schema 本身可用；这一条证明**要发布的那个文件**也满足它。
+ * 少了它，`plugin.json` 可以悄悄漂移，直到安装时才被拒。
+ */
+export function checkPluginManifest(contracts, doc) {
+  return checkDocument(contracts, "manifest", doc);
+}
+
+/**
+ * 清单里每个 view 的摘要必须等于构建产物的真实字节。
+ *
+ * 摘要的作用是「安装后不能再被替换」；如果清单里的值不是从产物算出来的，
+ * 它就只能证明「有人填了一个 64 位十六进制串」。产物未构建时返回 `skipped`，
+ * 因为那时没有可比的字节——但构建过就必须对得上。
+ */
+export function checkViewDigests(doc, pluginDir, { hashFile } = {}) {
+  const read = hashFile ?? defaultHashFile;
+  const results = [];
+  for (const view of doc.views ?? []) {
+    const target = path.join(pluginDir, view.entry);
+    const actual = read(target);
+    if (actual === null) {
+      results.push({ view: view.id, entry: view.entry, skipped: true });
+      continue;
+    }
+    results.push({
+      view: view.id,
+      entry: view.entry,
+      skipped: false,
+      ok: actual === view.digest,
+      expected: view.digest,
+      actual,
+    });
+  }
+  return results;
+}
+
+function defaultHashFile(file) {
+  let bytes;
+  try {
+    bytes = readFileSync(file);
+  } catch {
+    return null;
+  }
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 export function checkDocument(contracts, kind, doc) {
@@ -961,6 +1015,41 @@ async function main() {
     failures += 1;
     console.log("  FAIL  managed contract");
     for (const line of managedErrors) console.log(`          ${line}`);
+  }
+
+  // 已迁出主程序的插件：真实发布清单 + 构建产物摘要。
+  {
+    const pluginManifest = readJSON(KANBAN_MANIFEST);
+    positive += 1;
+    const pluginResult = checkPluginManifest(contracts, pluginManifest);
+    if (pluginResult.ok) {
+      console.log("  ok    superpowers-kanban plugin.json");
+    } else {
+      failures += 1;
+      console.log("  FAIL  superpowers-kanban plugin.json");
+      for (const line of pluginResult.errors) console.log(`          ${line}`);
+    }
+
+    positive += 1;
+    const digests = checkViewDigests(pluginManifest, KANBAN_DIR);
+    const mismatched = digests.filter((entry) => !entry.skipped && !entry.ok);
+    const skipped = digests.filter((entry) => entry.skipped);
+    if (mismatched.length > 0) {
+      failures += 1;
+      console.log("  FAIL  superpowers-kanban view digests");
+      for (const entry of mismatched) {
+        console.log(
+          `          view ${entry.view}: manifest says ${entry.expected}, ${entry.entry} hashes to ${entry.actual}`,
+        );
+      }
+      console.log("          regenerate: python3 scripts/plugins/kanban-manifest.py");
+    } else if (skipped.length > 0) {
+      console.log(
+        `  ok    superpowers-kanban view digests (skipped ${skipped.length}: ui/dist not built)`,
+      );
+    } else {
+      console.log(`  ok    superpowers-kanban view digests (${digests.length} views)`);
+    }
   }
 
   console.log("contract checker: negative samples (each must be rejected)");

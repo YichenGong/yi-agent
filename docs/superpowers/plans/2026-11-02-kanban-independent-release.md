@@ -701,11 +701,50 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** UI 中 `host.ts` 从 SDK 获得 PluginHost，不再 import `desktop/src/lib/rpc`；业务 backend adapter 只调用声明的看板 method，打开会话和主题用宿主能力。UI 更新无需重编主程序。SDK 用固定版本的本地 `file:../../sdk` 开发依赖和 lock，SDK 先构建出声明/JS；发布 UI 是自包含静态产物，不要求用户机器存在 SDK 目录。原 RpcCall/routes/RpcClient 依赖改为插件自己的 adapter 类型和声明 method 常量，不复制整个宿主网络客户端。
 
-- [ ] Step 1：先复制而不立即删除宿主组件，在独立工程跑原有卡片/设置/刷新测试，记录它们因私有 import 失败的清单。
-- [ ] Step 2：加入结构测试禁止 `desktop/src`、`@tauri-apps`、宿主私有 CSS/store/RPC import；依赖的 React/markdown/style 包显式记入新 lock，使用主题令牌补齐样式，不通过复制整个 App store 解决。
-- [ ] Step 3：改造主视图、设置、入队、看板项目选择与事件刷新；写操作带 requestId 并处理 Unknown，断线不画空看板。业务设置中的常驻和共享配额请求转为受控宿主能力，不由插件改 registry 文件。
-- [ ] Step 4：`npm ci --prefix plugins/sdk && npm run build --prefix plugins/sdk && npm ci --prefix plugins/superpowers-kanban/ui && npm test --prefix plugins/superpowers-kanban/ui && npm run build --prefix plugins/superpowers-kanban/ui`；在同一宿主安装新 UI 包验证卡片、时间窗口设置、入队和会话跳转。Vitest 用 jsdom + React setup，测试计数不低于迁移前保留的业务用例；缺 import/样式依赖逐项闭合。此阶段允许源码短暂双份，但不作为最终发布物。
-- [ ] Step 5：按 C 提交 `feat: build kanban views as a standalone plugin ui`。
+- [x] Step 1：先复制而不立即删除宿主组件，在独立工程跑原有卡片/设置/刷新测试，记录它们因私有 import 失败的清单。
+  > 私有 import 清单（复制后逐项替换，均落成测试）：`desktop/src/lib/rpc` 的
+  > `RpcClient` → `host.request`；`desktop/src/lib/pluginSettings.ts` 的业务
+  > 转换 → `ui/src/lib/board.ts`，通用管理留宿主；`desktop/src/lib/errorMessage`
+  > 与 `connectionError` → `ui/src/lib/errors.ts`；`desktop/src/ui/Popover.tsx`
+  > → 插件自有 `components/Popover.tsx`；`desktop/src` 的 tailwind 主题类 →
+  > `styles.css` 的主题令牌。结构测试 `src/boundary.test.ts` 把这几条钉成硬门禁。
+- [x] Step 2：加入结构测试禁止 `desktop/src`、`@tauri-apps`、宿主私有 CSS/store/RPC import；依赖的 React/markdown/style 包显式记入新 lock，使用主题令牌补齐样式，不通过复制整个 App store 解决。
+  > `src/boundary.test.ts`（12 例）扫全部源码，禁 `desktop/src`、`@tauri-apps`、
+  > `host.request` 之外的宿主私有模块；同时校验 UI 的 method 常量与
+  > `plugin.json` 的声明集合相等。依赖写进 `ui/package-lock.json`（React 19、
+  > Testing Library、jsdom、vite 8、vitest 3、TypeScript 6）。
+- [x] Step 3：改造主视图、设置、入队、看板项目选择与事件刷新；写操作带 requestId 并处理 Unknown，断线不画空看板。业务设置中的常驻和共享配额请求转为受控宿主能力，不由插件改 registry 文件。
+  > `useBoardState` 用 `host.request` 轮询两秒，断线保留旧卡片并单独标记
+  > `plugin_missing`，不清空成空看板。写操作经 `board.ts::requestWrite`：SDK 把
+  > 宿主失败响应里的 `requestId` 带到 `PluginBridgeError` 上，`ResultUnknown`
+  > 时页面调 `host.result(requestId)`，`committed` 视为成功，`unknown` 如实显示
+  > "结果未知"而**不重发**。常驻与共享配额只调 `board/startLifecycle`、
+  > `board/stopLifecycle`、`board/writeSwitch`，不碰 registry 文件。
+  > 偏差记录：宿主桥冻结的 7 个能力里没有文件选择，WebView 的
+  > `<input type="file">` 也拿不到真实路径，所以入队与卡片提升改为**显式路径
+  > 输入**，由后端 `validate_promotion` 校验；页面不读文件。
+- [x] Step 4：`npm ci --prefix plugins/sdk && npm run build --prefix plugins/sdk && npm ci --prefix plugins/superpowers-kanban/ui && npm test --prefix plugins/superpowers-kanban/ui && npm run build --prefix plugins/superpowers-kanban/ui`；在同一宿主安装新 UI 包验证卡片、时间窗口设置、入队和会话跳转。Vitest 用 jsdom + React setup，测试计数不低于迁移前保留的业务用例；缺 import/样式依赖逐项闭合。此阶段允许源码短暂双份，但不作为最终发布物。
+  > 命令链与计数：SDK 18 passed + build；UI `tsc --noEmit` 干净、vitest
+  > **162 passed / 13 files**、`vite build` 成功；后端
+  > `cargo test -p superpowers-kanban-runner` 43 passed，插件全量
+  > 116 + 30 + 182 + 43 passed；契约 `positive: 14, negative: 26, failures: 0`
+  > 与 `node --test` 56 passed。
+  >
+  > **未完成的部分如实记录：同一宿主装包验证做不了。** 生产宿主没有把插件桥
+  > 接到 WebView：`desktop/src/lib/pluginHost/bridge.ts` 在生产代码里没有任何
+  > 实例化点，`plugin_host/host.rs::open_plugin_view` 只建窗口与加载
+  > `plugin-asset://`，没有 `initialization_script` 注入 `__yiAgentPluginHost`、
+  > 没有 MessagePort 握手、也没有 `BridgeBackend::forward` 到插件后端；
+  > `plugin_host/run.rs::bootstrap_script` 只写探针用的
+  > `__YI_PLUGIN_PROBE__`。同时 `plugins/v1/operationResult` 在管理 RPC 里仍是
+  > `NotSupported`（计划留给 T23）。这两条使"在真实宿主里打开新页面并验证
+  > 卡片/时间窗口/入队/跳转"无法如实完成，本任务不把它写成通过。T21 交付的是
+  > 独立工程、静态产物、契约与单测；端到端验证挂到 T22（受管后端与
+  > operationResult）之后。
+  >
+  > 另记：本阶段 manifest 是 view-only（`program: null`），所以即使宿主桥接好，
+  > 也没有后端程序可打——这也是把端到端验收放 T22 的原因。
+- [x] Step 5：按 C 提交 `feat: build kanban views as a standalone plugin ui`。
 
 ### Task T22：接入看板受管后端、命令、幂等与工作流依赖
 

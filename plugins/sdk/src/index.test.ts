@@ -146,6 +146,32 @@ describe("request", () => {
     expect(failure.detail).toBe("request id reused");
   });
 
+  it("carries the request id so an unknown outcome can be looked up", async () => {
+    // Without the id the page can only say "maybe it worked"; with it the host
+    // ledger answers committed/unknown, and the UI stops inviting a retry that
+    // would deliver the same card twice.
+    const port = new FakePort((message, reply) => {
+      if (message.type === "init") {
+        reply({ type: "hello", api: "v1", context, token: "tok" });
+        return;
+      }
+      reply({
+        type: "response",
+        requestId: message.requestId,
+        ok: false,
+        error: { kind: "ResultUnknown", detail: "the binding changed" },
+      });
+    });
+    const api = await connect({ port, nonce: "n", helloTimeoutMs: 500 });
+
+    const failure = await api
+      .request("counter/increment", { by: 1 })
+      .catch((error) => error as PluginBridgeError);
+    expect(failure.kind).toBe("ResultUnknown");
+    const sent = port.sent.filter((m) => m.type === "request").at(-1);
+    expect(failure.requestId).toBe(sent?.requestId);
+  });
+
   it("mints a distinct request id per call", async () => {
     const port = new FakePort(requestHost(null));
     const api = await connect({ port, nonce: "n", helloTimeoutMs: 500 });
