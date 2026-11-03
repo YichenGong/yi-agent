@@ -215,15 +215,15 @@ Task 2–4 可以独立交付源端契约与护栏；**但不得越权宣称 C5/
 
 | 编号 | 验收内容 | 状态 | 证据位置 / 阻塞原因 |
 |---|---|---|---|
-| C1 | schema 合同：object、两选择器均非单独必填、说明含"必须且只能选填一个及省略另一字段"、`required: []` 不破坏兼容性测试 | **未执行** | 合同测试 `process_selector_schema_contract` **尚不存在**（由 Task 2 建立）。附当前源码事实：无 `required` 键、说明不含 exactly-one（§2.1），即当前源码**不满足**该合同 |
-| C2 | 参数与运行时：§5.2 输入矩阵，按 name / id 读同一输出，独立实例按 name / id kill | **未执行** | 测试 `process_selector_argument_contract` **尚不存在**（Task 3） |
-| C3 | 拒绝副作用：双字段（含 `""` 占位）与缺席字段的 kill 不改变进程状态 | **未执行** | 同上（Task 3） |
-| C4 | provider 边界：wiremock 捕获 Anthropic / Chat / Responses 实际请求，断言两个字符串未都被改为必填 | **未执行** | 测试 `process_selector_request_contract` **尚不存在**（Task 4）。附间接证据：三条转发路径逐字透传，无 required 合成（§3.2） |
+| C1 | schema 合同：object、两选择器均非单独必填、说明含"必须且只能选填一个及省略另一字段"、`required: []` 不破坏兼容性测试 | **通过** | `cargo test -p yi-agent-tools --lib process::tools::tests::process_selector_schema_contract`（Task 2）。先红后绿：红因 `required` 缺失（`left: Null / right: Array []`），不是编译错误。既有 `process_selector_schemas_are_openai_compatible` 同时绿灯，证明 `required: []` 未破坏兼容性 |
+| C2 | 参数与运行时：§5.2 输入矩阵，按 name / id 读同一输出，独立实例按 name / id kill | **通过** | `cargo test -p yi-agent-tools --lib process::tools::tests::process_selector_argument_contract`（Task 3）。四种合法 kill 输入各用独立 manager/进程；read 按 name 与 id 读到同一 `selector-ready` 输出 |
+| C3 | 拒绝副作用：双字段（含 `""` 占位）与缺席字段的 kill 不改变目标进程状态 | **通过** | 同上：8 组非法输入逐个断言 `status`/`pid`/`ready` 不变且进程仍可读。突变验证：双字段默选其一、空串归一化为 None、kill 拒绝 null 三种突变均被该测试捕获 |
+| C4 | provider 边界：wiremock 捕获 Anthropic / Chat / Responses 实际请求，断言两个字符串未都被改为必填 | **通过** | `cargo test -p yi-agent-tools --test process_selector_request_contract`（Task 4）。三条路径各发出一次真实 POST；突变验证：在任一条路径上把 `properties` 全部提升为 required，该测试立即失败（三条路径逐一验证） |
 | C5 | 实际公开定义：故障入口 + 新会话中两字段可选、二选一说明可见，保留实例版本与脱敏 schema | **未执行（阻塞）** | (1) 需故障对应的实际入口，但**未授权**重启/更新实例，且**无法取得**实例导出的 schema（§2.2）；(2) 故障会话原始签名**未留存**（§3.3、§4） |
 | C6 | 故障入口重验：仅传 name / 仅传 id 可读输出，双有效字段仍互斥报错 | **未执行（阻塞）** | 同上；另需**真实 API 调用**，未授权 |
-| C7 | 生效与回归：记录重建/更新/刷新步骤，跑 process 工具兼容性、分页、权限回归 | **未执行** | 依赖 C5/C6 的实际入口验收；回归命令属实施阶段（`cargo test -p yi-agent-tools --lib process::` 等） |
+| C7 | 生效与回归：记录重建/更新/刷新步骤，跑 process 工具兼容性、分页、权限回归 | **部分完成** | 回归已跑：`cargo test -p yi-agent-tools --lib process::`（28 passed，含分页/游标/整组回收/槽位/权限元数据）、`cargo test -p yi-agent-llm`（188 passed）。**生效步骤未验证**：需重建并替换实例二进制、再按 C5/C6 在真实入口确认，两件都**未授权** |
 
-说明：C5/C6 的"未执行"是**授权与入口层面的阻塞**，不是"跑过但失败"。不得把仓库单测绿灯当作 C5 的替代证据（spec §6 明文）。
+说明：C1–C4 的"通过"只覆盖**仓库内**的源端契约与传输边界。C5/C6 的"未执行"是**授权与入口层面的阻塞**，不是"跑过但失败"；不得把仓库单测绿灯当作 C5 的替代证据（spec §6 明文）。C7 的生效步骤同样未验证。
 
 ---
 
@@ -242,12 +242,38 @@ Task 2–4 可以独立交付源端契约与护栏；**但不得越权宣称 C5/
 
 ### 由此确定的实施边界
 
-1. **Task 2–4 可以继续**：它们只建立源端契约与传输护栏，不依赖根因定位（spec §4「定位门禁」允许 §5.1 与 §6 独立完成）。
+1. **Task 2–4 已完成**（见 §7 C1–C4 通过）：源端契约、运行时护栏、传输护栏均已交付并各自做过突变验证。它们不依赖根因定位（spec §4「定位门禁」允许 §5.1 与 §6 独立完成）。
 2. **不得**在本仓库实施任何"猜测性的转换层修改"——没有可指认的文件，改了也无法证明对应真实故障。
 3. **整体修复状态保持未完成**。实例源端已由构建 sha 排除，所以解除阻塞只需下列之一：
    - 授权捕获一次真实的 Chat Completions 出站请求体（**只保留** `tools[].function.name/description/parameters`，丢弃 headers 与密钥）。若出站已是"无 `required`、两字段可选"而模型可见端仍为必填，则**根因锁定在网关**；这是最省的一次取证。
    - 取得 `llmapi.horizon.auto` 网关侧的 schema 转换配置或文档，交付对应的外部修复与验收证据。
    - 若网关侧确认"`required` 键缺席 = 全部属性必填"，则 Task 2 的显式 `required: []` 就是对该网关的**实际修复**（而非仅说明改进），但仍须按 C5/C6 在真实入口重验后才能宣告完成。
+
+### Task 5 实际执行结果（仓库外转换边界分支）
+
+Task 5 依据上面的门禁判定只执行了「仓库外转换边界」分支，未实施任何猜测性转换层修改。
+
+**本仓库侧已完成的支撑（Task 2–4）：**
+
+| 项 | 结果 |
+|---|---|
+| 源端显式契约 | `process_selector_schema()` 现在返回 `required: []`；工具与字段说明写明"exactly one / 省略另一字段 / 不用空字符串占位"（`tools.rs`） |
+| 源端合同测试 | `process_selector_schema_contract` 先红（`required` 缺失）后绿 |
+| 运行时护栏 | `process_selector_argument_contract` 覆盖 4 种合法单选择器与 8 组非法输入；3 种突变均被捕获 |
+| 传输护栏 | `process_selector_request_contract` 覆盖 Anthropic / Chat / Responses；三条路径的"全量 required"突变均被捕获 |
+
+**交付给有权限维护者的脱敏回归步骤**（针对 `llmapi.horizon.auto` 或任何候选网关）：
+
+1. **输入（期望行为）**：`tools[].function.parameters` 为
+   ```json
+   {"type":"object","properties":{"process_id":{"type":"string"},"name":{"type":"string"},"cursor":{"type":"integer"},"max_bytes":{"type":"integer"}},"required":[]}
+   ```
+2. **观察点**：该网关实际转发给上游模型（或渲染进提示）的工具签名里，`process_id` 与 `name` 是否仍被标为必填。
+3. **期望输出**：两者均为可选，且"必须且只能选一个"的说明可见。
+4. **判定**：若入参已是 `required: []` 而出参仍为必填 → 根因锁定在该网关的 schema 规范化；若入参即被改写 → 根因在更上游的客户端/中转。
+5. 拿到结论后，把网关侧修复与本文件 §7 的 C5/C6 重验结果一起回填。
+
+**本仓库没有可指认的变形文件，因此没有提交任何"修复转换层"的源码改动**——那会是无法验证的猜测（plan Task 5 Step 1 明文禁止）。
 
 ### 对 Task 5 的提示
 
