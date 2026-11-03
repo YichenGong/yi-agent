@@ -32,10 +32,25 @@ export interface BoardCard {
   /**
    * 卡写着 running，但宿主报这个会话已经不在了。**只是角标**：插件不会因此
    * 改状态，卡片仍是 running，等人或模型决定下一步。
+   *
+   * 旧插件只给这个布尔；新插件会同时给 `sessionObservation`。两者都在时以新字段
+   * 为准（`stale` 保留给旧调用方与旧插件）。
    */
   stale?: boolean;
   /** 该会话最后一次被看到还活着的时刻（ISO 串）。只用于 stale 卡的说明。 */
   lastAliveAt?: string;
+  /**
+   * 当前宿主热表里有没有这张卡的执行会话：
+   * - `loaded`：在（无论闲不闲）；
+   * - `not_loaded`：**明确**不在——历史可能仍在磁盘上；
+   * - `unknown`：没有有效证据（旧格式、查询失败、这一拍没问）。
+   *
+   * **缺键 ≠ `unknown`**：旧插件根本不发这个键，那种情况下我们只能回退到
+   * `stale` 布尔。所以这里保持 `undefined`，不预归一化。
+   */
+  sessionObservation?: "loaded" | "not_loaded" | "unknown";
+  /** 这条加载观测的采集时刻（RFC3339）。`unknown` 时插件不给。 */
+  observedAt?: string;
   /** 排进合并队列的时刻（ISO 串）。插件未提供则不设。 */
   mergeQueuedAt?: string;
   /**
@@ -58,6 +73,23 @@ export function deriveTitle(specPath: string, id: string): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/**
+ * 加载态字段的归一化。
+ *
+ * 三重区分是**故意**的：
+ * - 键缺失（`undefined`）→ 旧插件，留给调用方回退到 `stale` 布尔；
+ * - 键存在但值不合法（null、数字、未知字符串）→ `unknown`，因为新插件确实发了
+ *   这个字段，只是我们读不懂——这时绝不能假装"没问过旧插件"；
+ * - 合法值原样保留。
+ */
+function optionalObservation(
+  value: unknown,
+): "loaded" | "not_loaded" | "unknown" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "loaded" || value === "not_loaded" || value === "unknown") return value;
+  return "unknown";
 }
 
 /**
@@ -118,6 +150,8 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     order,
     stale: record.stale === true,
     lastAliveAt: optionalString(record.last_alive_at),
+    sessionObservation: optionalObservation(record.session_observation),
+    observedAt: optionalString(record.observed_at),
     mergeQueuedAt: optionalString(record.merge_queued_at),
     merging: record.merging === true,
   };

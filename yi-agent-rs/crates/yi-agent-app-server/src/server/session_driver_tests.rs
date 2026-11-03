@@ -21,7 +21,7 @@ use crate::session_driver::DriverState;
 /// (`Status` 探活、daemon attach 等)统一回 `internal`:这既是诚实的「我不是
 /// 真 daemon」,也让 `attach_cwd_runtime` 按生产里的降级路径失败,而不必起一
 /// 个真 daemon。
-struct FakeDaemon {
+pub(crate) struct FakeDaemon {
     socket: PathBuf,
     calls: Arc<StdMutex<Vec<serde_json::Value>>>,
     stop: Arc<AtomicBool>,
@@ -29,13 +29,13 @@ struct FakeDaemon {
     /// `Some` 只在 `bind` 自建项目目录时出现：那个临时目录必须活到 daemon 结束，
     /// 否则 socket 与项目清单会在断言前被删掉。`bind_at` 的项目目录归调用方所有。
     _dir: Option<tempfile::TempDir>,
-    project: PathBuf,
+    pub(crate) project: PathBuf,
     #[allow(dead_code)]
     runtime_dir: PathBuf,
 }
 
 impl FakeDaemon {
-    fn bind(
+    pub(crate) fn bind(
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + 'static,
@@ -53,7 +53,7 @@ impl FakeDaemon {
     /// 串联夹具要的项目不是 `bind` 随手造的那个空目录,而是一个真实的 git 仓库
     /// (看板要 `git worktree add`、合并要点出 base 分支)。项目的生命周期因此归
     /// 调用方:daemon 只借它的路径。
-    fn bind_at(
+    pub(crate) fn bind_at(
         project: &Path,
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
@@ -131,11 +131,11 @@ impl FakeDaemon {
         }
     }
 
-    fn calls(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn calls(&self) -> Vec<serde_json::Value> {
         self.calls.lock().unwrap().clone()
     }
 
-    fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
         self.calls()
             .into_iter()
             .filter(|call| call["method"] == method)
@@ -363,7 +363,7 @@ const DRIVER_PLUGIN: &str = "driver";
 ///
 /// 两处都只写**通用**事实：清单里的通用字段 `session_driver` 与通用常驻登记表
 /// （`resident::require`）。宿主不该认识 `name` 之外的任何插件专有内容。
-fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
+pub(crate) fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
     let supervisors = project.join(".yi-agent/supervisors");
     std::fs::create_dir_all(&supervisors).unwrap();
     std::fs::write(
@@ -2776,6 +2776,108 @@ async fn kanban_original_session_hot_round_trip() {
     let metas = store.list().unwrap();
     assert_eq!(metas.len(), 1, "no replacement session may be created");
     assert_eq!(metas[0].thread_id, tid);
+}
+
+// ---------------------------------------------------------------------------
+// Task 4/7.1:宿主热表快照——驱动记账丢了,热会话仍必须被认出来
+// ---------------------------------------------------------------------------
+
+/// 宿主重启的等价物:**清空驱动记账**(`drivers.clear()`),但会话还在热表里。
+///
+/// 这是本次改造真正要修的场景。旧实现只能从 `DriverState.threads`（「宿主为该
+/// 插件起过哪些会话」）推出 alive/idle，记账一丢，插件看到的是一份空 `threads[]`，
+/// 于是「全员消失」——卡片角标说会话已经没了，而它其实好好躺在热表里。
+///
+/// 断言必须打在**真实请求**上：`loaded_threads` 里要有那个 ID，且 `list` 报
+/// `loaded`、不 stale，同时卡片状态/绑定/工作目录/判词一个都不许变。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_observation_empty_driver_state_keeps_loaded_card() {
+    let project = KanbanProject::new();
+    let home = tempfile::TempDir::new().unwrap();
+    let service = Arc::new(superpowers_kanban_runner::service::BoardService::new(
+        project.state_dir.clone(),
+        project.root.clone(),
+        Some(home.path().to_path_buf()),
+    ));
+    project.enqueue(&service);
+
+    let daemon = FakeDaemon::bind_at(&project.root, {
+        let service = Arc::clone(&service);
+        let state_dir = project.state_dir.clone();
+        move |_project, method, params| {
+            superpowers_kanban_runner::dispatch::dispatch_with_service(
+                &service, &state_dir, None, method, params,
+            )
+        }
+    });
+    let resident_dir = tempfile::TempDir::new().unwrap();
+    install_driver_plugin(&project.root, resident_dir.path(), "superpowers-kanban");
+
+    let mut host = Host::new();
+    let dev_worktree = superpowers_kanban_runner::worktree::worktree_path(
+        &project.root,
+        &superpowers_kanban_core::card::CardId::new(project.card_id.clone()),
+    );
+    block_delegation_for(&host, &dev_worktree);
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+
+    // 起一个会话并把回报落账（同 `kanban_original_session_hot_round_trip`）。
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    assert_eq!(host.threads.len(), 1, "the launch registers one session");
+    let tid = host.threads.keys().next().cloned().unwrap();
+    assert!(
+        host.settle_turn(&tid, Duration::from_secs(20)).await,
+        "the first turn must finish"
+    );
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    let bound = project.card(&service);
+    assert_eq!(bound["state"], "running");
+    assert_eq!(bound["thread_id"], tid);
+
+    // 记账丢失：宿主重启/断链后 `DriverState` 是空的，但会话仍然是热的。
+    drivers.clear();
+
+    let before = project.card(&service);
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+
+    // ① 真请求里必须带上完整快照，且含这个 ID。
+    let ticks = daemon.calls_to("driver/next");
+    let last = ticks.last().expect("the tick must have asked the plugin");
+    let loaded = last["params"]["loaded_threads"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the tick must carry loaded_threads: {last}"));
+    assert!(
+        loaded
+            .iter()
+            .any(|fact| fact["thread_id"] == serde_json::Value::String(tid.clone())),
+        "a hot session must appear in the complete snapshot: {loaded:?}"
+    );
+    // ② 旧 `threads[]` 这一拍是空的（记账丢了），所以这条不能掩盖问题。
+    assert!(
+        last["params"]["threads"]
+            .as_array()
+            .is_some_and(|threads| threads.is_empty()),
+        "this case is only meaningful when the legacy list is empty: {last}"
+    );
+
+    // ③ 展示：loaded、不 stale。
+    let after = project.card(&service);
+    assert_eq!(after["session_observation"], "loaded");
+    assert_eq!(after["stale"], false);
+    assert!(after["observed_at"].as_str().is_some(), "{after}");
+
+    // ④ 观测绝不改卡片：状态、绑定、工作目录、判词原样。
+    for key in ["state", "thread_id", "workdir", "detail"] {
+        assert_eq!(after[key], before[key], "{key} must not move");
+    }
+    assert_eq!(
+        host.threads.len(),
+        1,
+        "no replacement session may be created"
+    );
 }
 
 // ---------------------------------------------------------------------------

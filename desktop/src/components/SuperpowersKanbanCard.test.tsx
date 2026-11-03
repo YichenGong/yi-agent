@@ -39,20 +39,40 @@ describe("SuperpowersKanbanCard", () => {
     expect(screen.getByText("merge_queued")).toBeTruthy();
   });
 
-  it("stale 卡显示角标与最后活动时间", () => {
+  it("被当前宿主杀掉热会话的卡：明确说未加载，不说已删除", () => {
     // 会话没了但卡还写着 running：看板不改状态，只给人和模型一个可判读的信号。
     render(
       <SuperpowersKanbanCard
-        card={card({ state: "running", stale: true, lastAliveAt: "2026-10-22T10:00:00+08:00" })}
+        card={card({
+          state: "running",
+          sessionObservation: "not_loaded",
+          observedAt: "2026-10-22T10:00:00+08:00",
+        })}
       />,
     );
-    expect(screen.getByLabelText("会话已不在")).toBeTruthy();
-    expect(screen.getByText(/最后活动/)).toBeTruthy();
+    expect(screen.getByLabelText("会话未加载")).toBeTruthy();
+    expect(screen.getByText(/最后观测到已加载/)).toBeTruthy();
   });
 
-  it("活着的运行卡不显示 stale 角标", () => {
-    render(<SuperpowersKanbanCard card={card({ state: "running", stale: false })} />);
-    expect(screen.queryByLabelText("会话已不在")).toBeNull();
+  it("旧插件载荷（没有 session_observation）仍按 stale 显示未加载", () => {
+    // 混装：旧 runner 只发 `stale: true`。新 UI 必须继续认这个旧信号——若把
+    // 「缺新字段」一律当成"未知"，升级 UI 反而会把已知的未加载降级成不提示。
+    render(
+      <SuperpowersKanbanCard
+        card={card({ state: "running", stale: true, sessionObservation: undefined })}
+      />,
+    );
+    expect(screen.getByLabelText("会话未加载")).toBeTruthy();
+  });
+
+  it("活着的运行卡不显示加载角标", () => {
+    render(
+      <SuperpowersKanbanCard
+        card={card({ state: "running", sessionObservation: "loaded", observedAt: "2026-10-22T10:00:00+08:00" })}
+      />,
+    );
+    expect(screen.queryByLabelText("会话未加载")).toBeNull();
+    expect(screen.queryByLabelText("会话未观测到")).toBeNull();
   });
 
   it("合并卡没有会话时不渲染跳转按钮", () => {

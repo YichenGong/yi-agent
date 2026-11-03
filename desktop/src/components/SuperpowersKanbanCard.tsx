@@ -1,3 +1,4 @@
+import { observationDate, observationNotice } from "../lib/kanbanObservation";
 import type { BoardCard } from "../lib/superpowersKanbanState";
 
 /** id 中间省略：头尾各留一段，够认出是哪张卡。 */
@@ -20,6 +21,10 @@ export function SuperpowersKanbanCard({
   // 一张卡同一时刻只显示一个会话链接：pre-queued/queued 阶段 `threadId` 为空，
   // 显示提出它的**讨论会话**；卡跑起来后 `threadId` 有值，自动切到**执行会话**。
   const sessionId = card.threadId ?? card.originThreadId;
+  // 加载态角标：新字段优先，缺键时回退到旧 `stale` 布尔（旧插件）。
+  // 文案**不再**声称「会话已不在」：宿主热表里没有，不等于历史已经没了。
+  const notice = observationNotice(card);
+  const observedAt = observationDate(card.observedAt);
   return (
     // `min-w-0`：卡片要能被列压窄，标题的 `truncate` 才真正生效。
     <li className="min-w-0 rounded border border-line bg-panel p-2 text-sm">
@@ -41,13 +46,15 @@ export function SuperpowersKanbanCard({
             ⇄
           </span>
         )}
-        {card.stale && (
+        {notice && (
           <span
-            aria-label="会话已不在"
-            className="shrink-0 text-amber-400"
-            title="卡片写着 running，但会话已经不在了"
+            aria-label={notice.label}
+            className={
+              notice.tone === "warning" ? "shrink-0 text-amber-400" : "shrink-0 text-fg-subtle"
+            }
+            title={notice.title}
           >
-            ⚠
+            {notice.tone === "warning" ? "⚠" : "?"}
           </span>
         )}
       </div>
@@ -62,13 +69,9 @@ export function SuperpowersKanbanCard({
           {card.detail}
         </div>
       ) : null}
-      {card.stale && card.lastAliveAt ? (
+      {notice && notice.tone === "warning" ? (
         <div className="mt-1 text-xs text-fg-subtle">
-          最后活动{" "}
-          {new Date(card.lastAliveAt).toLocaleTimeString("zh-CN", {
-            hour: "2-digit",
-            minute: "2-digit",
-          })}
+          {observedAt ? `最后观测到已加载 ${observedAt}` : notice.label}
         </div>
       ) : null}
       {sessionId ? (

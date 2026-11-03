@@ -240,7 +240,9 @@ superpowers-kanban state --self <state> [--detail "<原因>"]
 - 一轮里问了用户一句话 → `needs_you`。会话空闲不等于活儿干完了，但「我在等人」正是
   `needs_you` 的语义。
 - 用户回话后你继续干活 → `running`。
-- 会话被杀了、你没能写状态时卡会停在 `running`，看板显示 `stale` + 最后活动时间。
+- 会话被杀了、你没能写状态时卡会停在 `running`，看板显示 `[stale] 当前宿主未加载`
+  或 `[observation unknown] 当前宿主未观测到`。两者都**只说明当前宿主的热表里没有它**，
+  不说明会话的历史已经没了——历史可能仍在磁盘上，只是当前进程没加载。
   这不是插件的错，是这里没写。
 - 终态（`done` / `failed` / `cancelled`）不可复活。要重做，让用户新建一张卡。
 - `--self` 依赖 `SUPERPOWERS_KANBAN_CARD`：插件给卡片会话的 shell 注入。缺失就说明
@@ -258,8 +260,12 @@ superpowers-kanban list --all  # 连归档卡一起列（行尾标 [archived]）
 - `1. <id> queued` —— 排队中，按顺序编号，看板会依次启动它们；
 - `<id> <State> [@ <worktree>] [archived]` —— 其他状态的卡。`<State>` 是 Rust 枚举名：
   `PreQueued` / `Queued` / `Running` / `NeedsYou` / `AwaitingMerge` / `MergeQueued` /
-  `Done` / `Failed` / `Cancelled`（行尾另有 `[stale]` 表示卡写着 running 但会话已经不在了，
-  `[merging]` 表示本项目此刻的合并名额在它手里）；
+  `Done` / `Failed` / `Cancelled`。行尾可能还有：
+  - `[stale] 当前宿主未加载（截至 <RFC3339>；历史可能仍存在）`——宿主**明确**报告
+    热表里没有这张卡的会话；
+  - `[observation unknown] 当前宿主未观测到（历史可能仍存在）`——没有有效证据
+    （旧格式观测、查询失败、这一拍没问），**不是**「已经没了」；
+  - `[merging]`——本项目此刻的合并名额在它手里。
 - `<id> pending (waiting for the next tick)` —— 刚投递、还没被插件消费的卡。
   刚 `add` 完看到这条是**正常**的，不是失败。
 
@@ -342,6 +348,22 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 | `denied: …` | 名额准入拒绝 | 原样转述原因，不要绕过 |
 | `illegal transition: <A> -> <B>` | `archive`/`purge` 的前提不满足 | 按 §4 的顺序处理（先归档再 purge） |
 | `list` 长时间只有 `pending` | 插件进程没跑，或开关是关的 | 先用 `on` 打开开关；仍不动则查插件是否在运行 |
+
+### 观测角标的升级矩阵
+
+「当前宿主是否加载着这个会话」这条信息要**宿主、插件、UI 三者都新**才完整。混装时
+按下面理解，别把降级当故障：
+
+| 组合 | 你会看到 | 含义 |
+|---|---|---|
+| 新 UI + 旧 runner | 只有旧文案（可能说「会话已不在」/「最后活动」） | UI 的修正没生效，**不是**看板在撒谎；升级 runner |
+| 新 runner + 旧宿主 | 角标只有 `[observation unknown]`，热发现的卡仍可能被标未加载 | 旧宿主不发完整热表快照，插件无法区分「没加载」与「没问」；升级宿主 + 重启 daemon |
+| 旧 UI + 新 runner/宿主 | 旧硬编码文案 | 数据已经对了，只是渲染没更新；升级 UI |
+| 三者都新 | `[stale] 当前宿主未加载（截至 <时间>）` / `[observation unknown] …` / 无角标 | 完整验收 |
+
+升级顺序与重启要求（旧 daemon 持有旧 inode、skill 是文件副本只对新会话生效）见
+`INSTALL.md` 第 9.1、9.6 节。**不要**为了让角标消失而自动执行 `on`/`off`/`state`/`restart`：
+观测只描述事实，状态永远由模型或用户写明。
 
 ## 安装与升级
 

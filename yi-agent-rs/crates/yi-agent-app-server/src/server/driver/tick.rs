@@ -2,7 +2,6 @@
 //!
 //! 从 `server.rs` 逐字搬出（wave2 C2 batch 7）。
 
-use crate::protocol::ThreadStatus;
 use crate::session::ThreadSession;
 use crate::session_driver::DriverState;
 use crate::workspace_index::WorkspaceIndex;
@@ -91,19 +90,21 @@ pub(crate) async fn driver_tick<F>(
             );
         }
         for plugin in plugins {
-            // 先快照 idle(owned `HashMap`):闭包因此不再借用 `threads`,与下面
-            // launcher 的 `&mut threads` 不冲突。
-            let snapshot: HashMap<String, bool> = threads
+            // 先采**一次**热表快照（owned），两处用途共用它：`loaded_threads`
+            // 原样上送，旧 `threads[].idle` 由同一份读数导出。这样同一个 ID 在
+            // 一拍里的两个字段不可能给出互相矛盾的答案（一个说闲、一个说忙），
+            // 也不会因为采两次而让「这一拍」有两个时刻。
+            //
+            // 采样必须在构造 launcher **之前**：launcher 持有 `&mut threads`，
+            // 之后再借 `threads` 就是借用冲突（这正是原来那份 owned `HashMap`
+            // 存在的原因）。
+            let snapshot = crate::session_driver::loaded_threads_snapshot(threads);
+            let idle_snapshot: HashMap<String, bool> = snapshot
                 .iter()
-                .map(|(thread_id, session)| {
-                    let idle = matches!(
-                        *session.status.lock().unwrap_or_else(|p| p.into_inner()),
-                        ThreadStatus::Idle
-                    ) && session.active_turn_id.is_none();
-                    (thread_id.clone(), idle)
-                })
+                .map(|fact| (fact.thread_id.clone(), fact.idle))
                 .collect();
-            let idle = move |thread_id: &str| snapshot.get(thread_id).copied().unwrap_or(false);
+            let idle =
+                move |thread_id: &str| idle_snapshot.get(thread_id).copied().unwrap_or(false);
             // 全机运行会话数:必须在构造 launcher **之前**算——launcher 持有
             // `&mut threads`,之后再借 `threads` 就是借用冲突。口径与上面的 idle
             // 快照同源(同一份 `ThreadSession`),所有归属的会话都在内:手动开的、
@@ -196,6 +197,7 @@ pub(crate) async fn driver_tick<F>(
                 &mut launcher,
                 &idle,
                 sessions_running,
+                &snapshot,
             )
             .await;
             // 本拍的结果**不在此处收割**:插件靠 `results` 才知道动作成没成、

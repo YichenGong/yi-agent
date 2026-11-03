@@ -10,6 +10,7 @@ pub mod observation;
 pub mod tick;
 
 pub mod dispatch;
+pub mod driver_observation;
 pub mod persist;
 pub mod resident;
 pub mod service;
