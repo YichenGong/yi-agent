@@ -3378,6 +3378,13 @@ impl RuntimeCoordinator {
     /// daemon process; restart owns recovery and future admissions.
     pub async fn begin_draining(&self) -> Result<(), RuntimeCoordinatorError> {
         self.draining.store(true, Ordering::Release);
+        // The ownership table has to agree with the coordinator's own flag. A
+        // project-level drain that left `authorize` answering "yes" would admit new
+        // roots into a runtime that is already going away.
+        self.clients
+            .lock()
+            .expect("runtime clients mutex poisoned")
+            .begin_global_drain();
         let supervisors = self
             .supervisors
             .lock()
@@ -3651,6 +3658,24 @@ impl RuntimeCoordinator {
                 crate::lifecycle::store::record_exit(&repository, root, ExitReason::ClientReleased);
         }
         roots
+    }
+
+    /// Close one client's admission and report whether it was the last one.
+    ///
+    /// Returns `true` when the departing client was the final open one, i.e. when
+    /// this exit means the whole scope must drain. That distinction is the whole
+    /// point: a single frontend leaving closes only its own tree, and a still-open
+    /// TUI must never be told the project is draining.
+    pub fn release_client(&self, client: &str) -> bool {
+        let _ = self.close_client_admission(client);
+        let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        if clients.open_clients() == 0 {
+            clients.begin_global_drain();
+            self.draining.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 
     /// Every root a client owns, for reclamation and diagnostics.

@@ -32,3 +32,13 @@ yi-agent 的会话持久化 crate。目标是保存和恢复 `yi-agent-core::Ses
 - [x] 只读 schema 兼容探针 + `migrate` 拒绝未来 schema — 两半都要，缺一半就没有保护：**探针**（`yi-agent-rs/crates/yi-agent-store/src/schema_compat.rs`）用 `SQLITE_OPEN_READ_ONLY` 打开、不发写 PRAGMA、不建 `schema_migrations`，返回 `Ok(None)`（文件不存在）/ `Ok(Some(0))`（有库但还没迁移过）/ `Ok(Some(n))`；非数据库文件是 `Err` 而不是 `None`（当成「没有库」会让 daemon 在坏文件上新建）。`SUPPORTED_SCHEMA_MIN = 0`（aborted first migration 的版本 0 是**可恢复**的，排除它等于拒绝恰好能修的那种库），`SUPPORTED_SCHEMA_MAX` 直接取 `LATEST_SCHEMA_VERSION`——**不硬编码 15**，Task 5 加迁移时自动跟上。**执行点**（`repository/helpers.rs::migrate`）：原判据 `current_version >= LATEST_SCHEMA_VERSION → Ok(())` 把「更新」当成「已是最新」，于是新版本写的库会被旧版本继续写。改为 `>` 返回 `RepositoryError::SchemaIncompatible`（映射到 `IpcErrorCode::InvalidState`，属用户可见状态而非 internal）、`==` 才成功。判据：`cargo test -p yi-agent-store --test schema_compat`（9 passed），其中 `future_schema_is_rejected_without_writing` 逐字节比对库文件、mtime 不变且不产生 `-wal`/`-shm`/`-journal`，`opening_a_future_database_through_the_repository_is_refused` 从 `RuntimeRepository::open` 走真实迁移路径——**把 `migrate` 的判据改回 `>=` 该用例即红（实测 RED）**，证明它不是装饰
 
 - [x] schema 预检进入 daemon 启动路径，且在任何写之前 — `ipc/daemon.rs::start_with_factory` 在取得实例锁之后、`remove_if_exists(socket)`／`RuntimeRepository::open`／`recover_inflight_tasks`／`reclaim_orphaned_tasks`／`RuntimeCoordinator::open` **之前**调用 `schema_compat::require_compatible`，失败转成 `IpcError::SchemaIncompatible`（`IpcErrorCode::InvalidState`，用户可见「升级或停掉另一个构建」而不是 internal）。只读探针先行的意义在这里才成立：`RuntimeRepository::open` 会先发 `PRAGMA journal_mode = WAL` 再 migrate，而恢复与孤儿回收会直接改行——一个更高版本的库会被旧代码写坏。判据：`cargo test -p yi-agent-store --lib schema_preflight` 的 `a_future_schema_database_is_refused_before_any_write`（断言错误是 `SchemaIncompatible`、库文件逐字节未变、**没有留下 socket**）；**变异验证**：注释掉 pre-flight 调用即红（实测 RED，失败点在 `SchemaIncompatible` 断言——即库被直接打开了）；`cargo test -p yi-agent-store --test runtime_ipc`（98 passed）无回归
+- [x] 项目级 drain 与"最后客户端"判定（`RuntimeClients::begin_global_drain` / `open_clients`） —
+  原先 store 只有一个 coordinator 私有 `draining` 标志，所有权表并不知道这件事，于是
+  `authorize` 在项目级 drain 之后仍可能答"可以"。现在 `begin_draining` 同时置位两张表，
+  `authorize` 与 `root_is_open` 都在最前面拒绝已 drain 的代际。`open_clients` 从**已绑定 root**
+  统计仍开放的 owner（而不是另立名册）：没有绑定任何 root 的客户端在本代际没有工作，不该把
+  代际保活。`RuntimeCoordinator::release_client(client)` 关单个客户端的准入并回答"它是不是最后一个"
+  —— 这个布尔值就是 client drain 与 project drain 的分界线。判据：
+  `cargo test -p yi-agent-store --lib lifecycle`（10 passed，含
+  `a_global_drain_refuses_every_client_not_only_the_departing_one`、
+  `one_client_leaving_does_not_start_a_global_drain`、`open_clients_counts_only_those_still_admitting`）

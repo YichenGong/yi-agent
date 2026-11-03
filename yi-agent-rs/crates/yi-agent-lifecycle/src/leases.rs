@@ -316,6 +316,18 @@ impl LeaseTable {
     pub fn active_count(&self) -> usize {
         self.leases.len()
     }
+
+    /// How many live leases may actually run work.
+    ///
+    /// Lease-only observers are excluded on purpose: they are watching. Counting
+    /// them would mean a scope can never drain while someone is observing the
+    /// upgrade, so the teardown everyone is waiting for would never begin.
+    pub fn business_active_count(&self) -> usize {
+        self.leases
+            .values()
+            .filter(|lease| lease.mode == LeaseMode::Business)
+            .count()
+    }
 }
 
 /// 256-bit credential from the OS CSPRNG, hex encoded.

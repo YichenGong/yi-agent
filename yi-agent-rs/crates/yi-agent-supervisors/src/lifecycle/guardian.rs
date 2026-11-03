@@ -1045,21 +1045,69 @@ pub struct Guardian {
     scope: RuntimeScope,
     artifact: ArtifactIdentity,
     generation: DaemonInstanceId,
-    leases: yi_agent_lifecycle::leases::LeaseTable,
+    /// Leases *and* reclamation.
+    ///
+    /// One object rather than two because "may this client admit work" and "is the
+    /// last client gone" have to be answered against the same view: two tables
+    /// would let a release read a lease count that a concurrent registration had
+    /// already changed.
+    reclaim: super::reclaim::Reclaimer,
 }
 
 impl Guardian {
+    /// A guardian whose reclamation talks to no process registry.
+    ///
+    /// Releases still close admission and produce a *failed* result rather than a
+    /// pretend success; `serve` attaches the real registry before accepting
+    /// connections.
     pub fn new(
         scope: RuntimeScope,
         artifact: ArtifactIdentity,
         generation: DaemonInstanceId,
     ) -> Self {
+        let clock: std::sync::Arc<dyn yi_agent_lifecycle::deadline::Clock> =
+            std::sync::Arc::new(yi_agent_lifecycle::deadline::MonotonicClock::new());
+        let backend: std::sync::Arc<std::sync::Mutex<dyn super::reclaim::ProcessBackend>> =
+            std::sync::Arc::new(std::sync::Mutex::new(super::reclaim::DetachedBackend));
+        let reclaim =
+            super::reclaim::Reclaimer::new(scope.clone(), generation.clone(), clock, backend);
         Self {
             scope,
             artifact,
             generation,
-            leases: yi_agent_lifecycle::leases::LeaseTable::new(),
+            reclaim,
         }
+    }
+
+    /// Points reclamation at the registry that really owns the process groups.
+    ///
+    /// Called once, before the control loop starts accepting: a release that ran
+    /// before this point must not be able to report a stop it never verified.
+    pub fn attach_registry(&mut self, registry: std::sync::Arc<std::sync::Mutex<ProcessRegistry>>) {
+        let clock: std::sync::Arc<dyn yi_agent_lifecycle::deadline::Clock> =
+            std::sync::Arc::new(yi_agent_lifecycle::deadline::MonotonicClock::new());
+        let backend: std::sync::Arc<std::sync::Mutex<dyn super::reclaim::ProcessBackend>> =
+            std::sync::Arc::new(std::sync::Mutex::new(super::reclaim::RegistryBackend::new(
+                registry,
+            )));
+        let leases = std::mem::take(self.reclaim.leases_mut());
+        let clients = std::mem::take(self.reclaim.clients_mut());
+        self.reclaim = super::reclaim::Reclaimer::new(
+            self.scope.clone(),
+            self.generation.clone(),
+            clock,
+            backend,
+        );
+        *self.reclaim.leases_mut() = leases;
+        *self.reclaim.clients_mut() = clients;
+    }
+
+    pub fn reclaimer(&self) -> &super::reclaim::Reclaimer {
+        &self.reclaim
+    }
+
+    pub fn reclaimer_mut(&mut self) -> &mut super::reclaim::Reclaimer {
+        &mut self.reclaim
     }
 
     pub fn scope(&self) -> &RuntimeScope {
@@ -1071,7 +1119,7 @@ impl Guardian {
     }
 
     pub fn leases_mut(&mut self) -> &mut yi_agent_lifecycle::leases::LeaseTable {
-        &mut self.leases
+        self.reclaim.leases_mut()
     }
 
     /// Opens the process registry, reporting what an earlier guardian left behind.
@@ -1175,8 +1223,11 @@ pub fn serve(
     let deadline = Deadline::after(Duration::from_secs(2));
     let listener = guardian.bind_control(&deadline)?;
 
-    // Dropping the registry stops and reaps every group it owns.
-    let mut registry = registry;
+    // Reclamation must talk to the real registry, and it must be attached before
+    // the first connection: a release that ran earlier could not have verified any
+    // stop. Dropping the registry still stops and reaps every group it owns.
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+    guardian.attach_registry(std::sync::Arc::clone(&registry));
     while !shutdown() {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -1184,7 +1235,7 @@ pub fn serve(
                 // malformed or already-closed peer is not a reason to lose the
                 // process groups this guardian is responsible for.
                 if prepare_control_stream(&stream).is_ok() {
-                    serve_control_connection(&mut guardian, &mut registry, stream);
+                    serve_control_connection(&mut guardian, stream);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1217,19 +1268,14 @@ pub fn serve_one_for_test(
     stream: std::os::unix::net::UnixStream,
 ) -> io::Result<()> {
     prepare_control_stream(&stream)?;
-    serve_control_connection(
-        guardian,
-        &mut ProcessRegistry::without_journal("test", guardian.artifact.clone()),
-        stream,
-    );
+    // No registry is attached here on purpose: a test that asks for a release
+    // without owning process groups gets a *failed* reclamation, not a claim that
+    // something stopped.
+    serve_control_connection(guardian, stream);
     Ok(())
 }
 
-fn serve_control_connection(
-    guardian: &mut Guardian,
-    registry: &mut ProcessRegistry,
-    mut stream: std::os::unix::net::UnixStream,
-) {
+fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::net::UnixStream) {
     use yi_agent_lifecycle::types::{ControlRequest, ControlResponse};
     let frame = match yi_agent_lifecycle::codec::read_frame(&mut stream) {
         Ok(frame) => frame,
@@ -1264,7 +1310,7 @@ fn serve_control_connection(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
             match guardian
-                .leases_mut()
+                .reclaimer_mut()
                 .register(client_run_id, kind, mode, now)
             {
                 Ok(grant) => ControlResponse::Granted(grant),
@@ -1275,34 +1321,39 @@ fn serve_control_connection(
             }
         }
         ControlRequest::Release { grant } => {
-            match guardian.leases_mut().release(&grant) {
-                Ok(yi_agent_lifecycle::leases::ReleaseOutcome::Reclaim(client)) => {
-                    // Reclaim this client's processes before answering, so a
-                    // successful release means the work is really gone.
-                    // Reclaim by the id the lease table released, not by the grant
-                    // we were handed: they agree here, but the table's answer is the
-                    // one that decided a reclaim was due.
-                    let owner = ProcessOwner::frontend(client);
-                    let deadline = Deadline::after(Duration::from_secs(5));
-                    match registry.terminate_owner(&owner, deadline) {
-                        Ok(()) => ControlResponse::Ack,
-                        Err(error) => ControlResponse::Rejected {
-                            code: yi_agent_lifecycle::types::ControlErrorCode::Internal,
-                            reason: error.to_string(),
-                        },
-                    }
+            // Answering only after the 10 + 5 second teardown would keep this
+            // connection (and the shell's explain-why path) unavailable exactly when
+            // a frontend is quitting. The answer is therefore the *operation id*;
+            // `ReclaimStatus` is how the result is collected.
+            let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
+            match guardian.reclaimer_mut().release(grant, budget) {
+                Ok(operation_id) => {
+                    guardian.reclaimer_mut().expire_results();
+                    ControlResponse::ReleaseStarted { operation_id }
                 }
-                Ok(yi_agent_lifecycle::leases::ReleaseOutcome::AlreadyReleased) => {
-                    // Idempotent: a second release of the same run is not an error,
-                    // and its groups were already reclaimed by the first.
-                    ControlResponse::Ack
-                }
-                Err(reason) => ControlResponse::Rejected {
+                Err(error) => ControlResponse::Rejected {
                     code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
-                    reason,
+                    reason: error.to_string(),
                 },
             }
         }
+        ControlRequest::ReclaimStatus {
+            grant,
+            operation_id,
+        } => match guardian.reclaimer().query(&operation_id, &grant) {
+            Ok(Some(result)) => ControlResponse::ReclaimStatus {
+                operation_id,
+                result: Some(result),
+            },
+            Ok(None) => ControlResponse::ReclaimStatus {
+                operation_id,
+                result: None,
+            },
+            Err(reason) => ControlResponse::Rejected {
+                code: yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated,
+                reason,
+            },
+        },
         ControlRequest::Admission { asked } => {
             // The guardian, not the daemon, decides whether this client may still
             // start work. That ordering is the point: a release that has already
@@ -1319,7 +1370,7 @@ fn serve_control_connection(
                     reason: "an admission question must name its task and attempt".into(),
                 }
             } else {
-                match guardian.leases.admits(&asked.grant, now) {
+                match guardian.reclaimer().leases().admits(&asked.grant, now) {
                     Err(reason) => ControlResponse::Rejected {
                         code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
                         reason,

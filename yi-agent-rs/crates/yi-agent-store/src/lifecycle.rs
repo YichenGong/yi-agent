@@ -73,6 +73,13 @@ pub struct RuntimeClients {
     exited: VecDeque<ExitedRoot>,
     /// Set while a maintenance barrier is in effect.
     maintenance: Option<u64>,
+    /// Set once the last client left and the whole scope is draining.
+    ///
+    /// Distinct from [`Self::closed`] (which is per client) and from `maintenance`
+    /// (which is a version switch): a global drain means "this generation is
+    /// finishing, send newcomers to the next one". Conflating them would let a
+    /// version switch look like an ordinary client exit.
+    global_drain: bool,
 }
 
 impl RuntimeClients {
@@ -190,6 +197,9 @@ impl RuntimeClients {
 
     /// May this client admit work under this root in this generation?
     pub fn authorize(&self, client: &str, root: &str, generation: &str) -> Result<(), String> {
+        if self.global_drain {
+            return Err("this runtime generation is draining; wait for the next one".to_string());
+        }
         if self.closed.contains(client) {
             return Err(format!("client {client} has closed admission"));
         }
@@ -329,6 +339,9 @@ impl RuntimeClients {
     /// identity is checked separately, by [`Self::authorize`], using an id the
     /// guardian verified rather than one the business RPC supplied.
     pub fn root_is_open(&self, root: &str, generation: &str) -> Result<(), String> {
+        if self.global_drain {
+            return Err("this runtime generation is draining; wait for the next one".to_string());
+        }
         if self.is_exited(root) {
             return Err(format!("root {root} has stopped accepting work"));
         }
@@ -373,6 +386,35 @@ impl RuntimeClients {
     /// Whether a client's admission is closed.
     pub fn is_closed(&self, client: &str) -> bool {
         self.closed.contains(client)
+    }
+
+    /// Refuse all new work for this generation because its last client left.
+    ///
+    /// Idempotent, and it does not unbind anything: a task still running has to be
+    /// able to explain itself. It exists so a newcomer can be told to wait for the
+    /// next generation instead of being admitted into a runtime that is going away.
+    pub fn begin_global_drain(&mut self) {
+        self.global_drain = true;
+    }
+
+    /// Whether this generation stopped admitting work entirely.
+    pub fn in_global_drain(&self) -> bool {
+        self.global_drain
+    }
+
+    /// How many clients still have an open admission.
+    ///
+    /// Counted from bound roots rather than from a separate roster: a client that
+    /// never bound anything has no work here, and it must not keep a generation
+    /// alive after everyone who *does* have work has left.
+    pub fn open_clients(&self) -> usize {
+        let mut owners: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for binding in self.roots.values() {
+            if !self.closed.contains(&binding.owner) {
+                owners.insert(binding.owner.as_str());
+            }
+        }
+        owners.len()
     }
 
     /// Bound roots, for persistence and diagnostics.
@@ -475,6 +517,41 @@ mod tests {
         let mut clients = RuntimeClients::new();
         clients.bind_root("app", "thread:a", "g1").unwrap();
         assert!(clients.execution_stopped("thread:a", "", "g1").is_err());
+    }
+
+    #[test]
+    fn a_global_drain_refuses_every_client_not_only_the_departing_one() {
+        // A project-wide drain is not "this client left": a TUI still present must
+        // also stop admitting work, because the generation it would run in is gone.
+        let mut clients = RuntimeClients::new();
+        clients.bind_root("app", "thread:a", "g1").unwrap();
+        clients.bind_root("tui", "thread:t", "g1").unwrap();
+        clients.begin_global_drain();
+        assert!(clients.authorize("app", "thread:a", "g1").is_err());
+        assert!(clients.authorize("tui", "thread:t", "g1").is_err());
+        assert!(clients.root_is_open("thread:t", "g1").is_err());
+    }
+
+    #[test]
+    fn one_client_leaving_does_not_start_a_global_drain() {
+        let mut clients = RuntimeClients::new();
+        clients.bind_root("app", "thread:a", "g1").unwrap();
+        clients.bind_root("tui", "thread:t", "g1").unwrap();
+        clients.close_client_admission("app");
+        assert!(!clients.in_global_drain());
+        assert!(clients.authorize("tui", "thread:t", "g1").is_ok());
+    }
+
+    #[test]
+    fn open_clients_counts_only_those_still_admitting() {
+        let mut clients = RuntimeClients::new();
+        clients.bind_root("app", "thread:a", "g1").unwrap();
+        clients.bind_root("tui", "thread:t", "g1").unwrap();
+        assert_eq!(clients.open_clients(), 2);
+        clients.close_client_admission("app");
+        assert_eq!(clients.open_clients(), 1);
+        clients.close_client_admission("tui");
+        assert_eq!(clients.open_clients(), 0);
     }
 
     #[test]

@@ -97,4 +97,23 @@
   不能因为「记得停过」而永远跳过）、`cargo test -p yi-agent-core --lib stop_confirmation`（7 passed，含
   `task_join_without_tool_group_exit_retains_execution_lease`、`gates_compose_and_never_mask_an_earlier_stop`）；
   **变异验证**：去掉 gate 判定 → 租约保留用例红（实测 RED）
+- [x] 有界客户端回收与最后客户端 drain（Task 9） — `yi-agent-rs/crates/yi-agent-supervisors/src/lifecycle/reclaim.rs`。
+  三个决定被刻意分开，合在一起正是这个模块要修的 bug：
+  **① 准入先关**。`release` 第一件事是 `close_client_admission`，再才去停进程——反过来做的话，
+  枚举完工作和停掉工作之间派生出来的任务会挂在已交还的客户端名下，没人会再去回收它。
+  **② 只有最后一个业务租约才 drain 整个 scope**。一个前端退出不能让仍在用的 TUI 收到
+  项目级 draining（那会拒绝它自己的任务，读起来像自伤）。`LeaseMode::LeaseOnly` 的观察者
+  不计入 `business_active_count`——否则"有人在看升级"会让它等的收尾永远不开始。
+  **③ 停止是证据而不是请求**。`ProcessBackend` 的 `request_stop` 只是请求，
+  只有 `is_stopped` 为真（或 terminate 后被它确认）才允许 `ReclaimResult.stopped == true`。
+  两个窗口是**绝对**的（10 秒优雅 + 5 秒确认，不分对象），按对象计预算会随客户端数量相乘。
+  Release 立即返回 operation id，结果用 `ReclaimStatus` 轮询——同步阻塞 15 秒会让正在退出的
+  shell 无法问"到底停没停"。租约已被消费，所以只读查询权用凭据的 SHA-256 摘要校验，
+  且只保留 60 秒、按受控访问清理（不靠定时器，不为清理保活 guardian）。结果落盘 0600 原子写、
+  不含凭据，读取时同时校验 scope 与文件名形状（防路径穿越）。guardian 通过
+  `attach_registry` 单点接入 `ProcessRegistry`；未接入时用 `DetachedBackend` 明确失败，
+  绝不假装停成功。判据：`cargo test -p yi-agent-supervisors --test client_reclamation`（19 passed）、
+  `cargo test -p yi-agent-supervisors`（91 lib + 集成全绿）、`cargo test -p yi-agent-store --lib lifecycle`
+  （10 passed）；**变异验证**：把"仅最后客户端 drain"改成无条件 drain → 3 例红；把"terminate 已发"
+  当作停止证明 → 2 例红；去掉 admission 先关 → 2 例红（均实测 RED 后恢复）
 - [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
