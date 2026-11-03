@@ -148,3 +148,29 @@ describe("SettingsPluginsTab", () => {
     expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
   });
 });
+
+describe("SettingsPluginsTab managed section", () => {
+  it("shows managed plugins only when a project handle is supplied", async () => {
+    const call = async (method: string) => {
+      if (method === "plugins/list") return { plugins: [] };
+      if (method === "plugins/v1/list") {
+        return {
+          plugins: [
+            { plugin: "example-counter", selected: "1.0.0", installed: ["1.0.0"], projects: ["ph1_aaaa"] },
+          ],
+        };
+      }
+      return {};
+    };
+
+    const { unmount } = render(<SettingsPluginsTab call={call} projects={[]} />);
+    await screen.findByText("未安装任何插件");
+    // 没有句柄时不显示受管分区：路径不能冒充句柄。
+    expect(screen.queryByText("受管插件")).toBeNull();
+    unmount();
+
+    render(<SettingsPluginsTab call={call} projects={[]} projectHandle="ph1_aaaa" />);
+    expect(await screen.findByText("受管插件")).toBeTruthy();
+    expect(await screen.findByText("example-counter")).toBeTruthy();
+  });
+});

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ComponentType } from "react";
 import { listPlugins, type PluginRpc, type PluginSummary } from "../lib/pluginSettings";
 import { SuperpowersKanbanPluginSettings } from "./SuperpowersKanbanPluginSettings";
+import { PluginCatalog } from "./PluginCatalog";
 
 /**
  * 宿主注入的插件 RPC 接缝。
@@ -34,12 +35,21 @@ export function SettingsPluginsTab({
   call,
   projects,
   defaultProject,
+  projectHandle,
 }: {
   call?: PluginsCall;
   /** 可选项目（绝对路径）。空表时面板回落宿主 workdir，行为与旧版一致。 */
   projects: string[];
   /** 首选项目（当前对话的工作目录）。不在 `projects` 里时回落到第一个项目。 */
   defaultProject?: string;
+  /**
+   * 当前项目的受管句柄（`ph1_...`）。
+   *
+   * 与上面的**路径**是两个东西：旧 supervisor 协议按路径装清单，受管协议
+   * 的授权、事务与视图都按句柄。把路径当句柄传会得到一个永远"未授权"的
+   * 面板，所以这里必须分开，缺省时不显示受管分区。
+   */
+  projectHandle?: string;
 }) {
   const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +109,17 @@ export function SettingsPluginsTab({
 
   return (
     <div>
+      {/*
+        受管插件分区：由管理 API（`plugins/v1/*`）驱动，与下面那组旧的
+        supervisor 插件互不替代。把它放在最前，是因为"装了什么、授权给谁、
+        能不能跑"是用户先要回答的问题；旧面板是具体插件的业务配置。
+      */}
+      {projectHandle && (
+        <section className="border-b border-line">
+          <h2 className="px-4 pt-4 text-sm font-medium text-fg">受管插件</h2>
+          <PluginCatalog call={rpc} project={projectHandle} />
+        </section>
+      )}
       {options.length > 0 && (
         <label className="flex items-center gap-3 border-b border-line p-4 text-sm">
           <span>项目</span>

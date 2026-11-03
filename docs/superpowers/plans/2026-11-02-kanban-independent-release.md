@@ -671,11 +671,11 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 清单贡献生成主视图与设置入口；PluginCatalog 只调用管理 API，PluginView 只使用受管 view handle。example-counter 的 read/write method 使用不同能力，验证宿主无需知道看板。counter 原生 fixture 按 G1 实现维护健康检查、无副作用的运行描述与 read/increment，并通过受管数据路径存储计数；其独立 Rust workspace 用于开发/验收编译，不要求用户安装 Rust。`cargo test --manifest-path plugins/fixtures/example-counter/backend/Cargo.toml` 必须先证明协议和幂等，正式 WebView 不能请求不存在的 counter 后端。
 
-- [ ] Step 1：写 UI 失败测试：未安装/已安装未启用/只读启用/运行故障/更新等待/待清理逐个有独立状态，不用一个 enabled 布尔；安装按钮不能隐式开常驻。
-- [ ] Step 2：counter 清单增加第二设置入口，宿主不改注册代码即显示；安装前只渲染静态介绍，业务 iframe 不创建。
-- [ ] Step 3：实现目标宿主提示、原生信任提示、基本数据/自动任务/配额/常驻分项授权、依赖冲突诊断、错误及事务进度。停用后有宿主管理入口但不能继续调用业务后端。
-- [ ] Step 4：`cd desktop && npx vitest run src/components/PluginView.test.tsx src/components/PluginCatalog.test.tsx src/hooks/usePlugins.test.ts src/components/SettingsPluginsTab.test.tsx && npm run build`；正式 WebView 加载 counter 主视图/设置页。
-- [ ] Step 5：按 C 提交 `feat: manage official plugins through generic desktop views`。
+- [x] Step 1：写 UI 失败测试：未安装/已安装未启用/只读启用/运行故障/更新等待/待清理逐个有独立状态，不用一个 enabled 布尔；安装按钮不能隐式开常驻。
+- [x] Step 2：counter 清单增加第二设置入口，宿主不改注册代码即显示；安装前只渲染静态介绍，业务 iframe 不创建。
+- [x] Step 3：实现目标宿主提示、原生信任提示、基本数据/自动任务/配额/常驻分项授权、依赖冲突诊断、错误及事务进度。停用后有宿主管理入口但不能继续调用业务后端。
+- [x] Step 4：`cd desktop && npx vitest run src/components/PluginView.test.tsx src/components/PluginCatalog.test.tsx src/hooks/usePlugins.test.ts src/components/SettingsPluginsTab.test.tsx && npm run build`；正式 WebView 加载 counter 主视图/设置页。
+- [x] Step 5：按 C 提交 `feat: manage official plugins through generic desktop views`。
 
 ### Task T20：接入远程精确版本资源与多客户端撤销
 

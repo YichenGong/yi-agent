@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "packageFormat": 1,
+  "plugin": "example-counter",
+  "version": "1.0.0",
+  "target": "darwin-aarch64",
+  "views": [
+    {
+      "id": "main",
+      "kind": "main",
+      "entry": "ui/index.html",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "settings",
+      "kind": "settings",
+      "entry": "ui/settings.html",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "program": null,
+  "skills": [
+    { "name": "example-counter", "path": "skills/example-counter" }
+  ],
+  "methods": [
+    { "name": "counters/health", "effect": "Read" },
+    { "name": "counters/describe", "effect": "Read" },
+    { "name": "counters/read", "effect": "Read" },
+    { "name": "counters/increment", "effect": "Write" }
+  ],
+  "cli": [
+    { "verb": "status", "effect": "Read" },
+    { "verb": "increment", "effect": "Write" }
+  ],
+  "capabilities": {
+    "required": ["Read"],
+    "optional": ["Write", "Launch", "Resident"]
+  },
+  "dependencies": {
+    "workflows": []
+  },
+  "data": {
+    "format": 1,
+    "migrations": []
+  },
+  "compatibility": {
+    "hostApi": "v1",
+    "uiApi": "v1"
+  }
+}

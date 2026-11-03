@@ -1,0 +1,19 @@
+[package]
+name = "example-counter-backend"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "Minimal managed plugin backend used to prove the plugin protocol outside the desktop app. Its own workspace: building it must not pull in the host."
+
+# 独立 workspace：这个 fixture 只证明协议与幂等，正式 WebView 从不请求一个
+# 不存在的 counter 后端。所以它不依赖 yi-agent 的任何 crate——一旦依赖了，
+# "独立"就只是目录独立。
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
