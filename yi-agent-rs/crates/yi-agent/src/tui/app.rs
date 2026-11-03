@@ -713,9 +713,15 @@ impl SideSession {
         event: &super::side::ConversationEvent,
         width: u16,
     ) -> SideFrameEffect {
-        // 已经关闭的旁支不再接受任何帧：迟到的事件不能让一个已关闭的视图
-        // 「复活」，否则用户会看到一个说已关闭、却还在长正文的旁支。
-        if self.views.side.as_ref().is_some_and(|view| !view.is_live()) {
+        // 已经关闭的旁支不再接受**属于它自己**的帧：迟到的事件不能让一个已关闭
+        // 的视图「复活」，否则用户会看到一个说已关闭、却还在长正文的旁支。
+        //
+        // 判据必须带上 side_id/generation：关闭之后用户可以再开一个新旁支，
+        // 新旁支的帧来自另一个身份，拿「当前视图已关闭」一概拦掉，就等于
+        // 关过一次之后再也开不了旁支。
+        if self.views.side.as_ref().is_some_and(|view| {
+            !view.is_live() && event.target.matches_side(&view.side_id, view.generation)
+        }) {
             return SideFrameEffect::Discard;
         }
         // 用 `matches_side` 而不是就地再写一遍 `side_id`/`generation` 比较：
@@ -730,11 +736,22 @@ impl SideSession {
         }
         // 第一条旁支帧就是「旁支已创建」的信号:此时才建立视图并切过去。
         // 在此之前不预先造一个空视图,否则创建失败会留下一个永远空着的旁支。
+        //
+        // 判据是「没有视图，或视图已死且属于**别的**旁支」，而不是只看
+        // `is_none()`：关闭旧旁支后视图仍留着（`closed` 有值），只把
+        // `is_none()` 当唯一触发条件会让新旁支永远建不出视图——用户看到的
+        // 就是关掉后再也开不了。
+        //
+        // 反过来，「已死就重建」也不行：旧旁支的迟到帧身份不同，会把已关闭的
+        // 旧视图重新造出来、再被 stale 检查放过，等于让关掉的旁支复活。所以
+        // 只有视图已死**且**目标不是它自己时，才建立新视图。
         if let ConversationTarget::Side {
             side_id,
             generation,
         } = &event.target
-            && self.views.side.is_none()
+            && self.views.side.as_ref().is_none_or(|view| {
+                !view.is_live() && (view.side_id != *side_id || view.generation != *generation)
+            })
         {
             self.views.open(side_id.clone(), *generation);
             self.history.clear();
@@ -1497,6 +1514,11 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                         side_capable,
                     )
                 {
+                    // 拦截分支会 `continue`,从而跳过循环末尾那次 `sync_popup`。
+                    // 弹窗是按输入缓冲算的:缓冲刚被 `input.clear()` 清空,
+                    // 不在这里同步一次,补全面板就会一直挂在屏幕上,看起来
+                    // 像命令没执行。旁支命令同样要遵守「弹窗跟随输入」。
+                    sync_popup(&mut popup_stack.popup, &input.buffer);
                     continue;
                 }
                 // 父审批提示显示时，先走「裁决 vs 命令」模式路由。这必须在
@@ -2905,6 +2927,16 @@ fn execute_side_command_in_main(
 
     match command {
         SideInput::Open { question } => {
+            // 已经把旁支建出来了就先把视图切回去,别等 driver 回帧:
+            // 已有旁支时 driver 走幂等路径,只补一帧 `SideStatus`,而那个帧
+            // 更新状态但不切视图（否则后台流式输出会把正在看主会话的人拽走）。
+            // 用户显式敲 `/side` 才是「我要看旁支」的信号,必须当场生效。
+            if let Some(view) = side.active_side()
+                && view.is_live()
+            {
+                let (side_id, generation) = (view.side_id.clone(), view.generation);
+                side.views.open(side_id, generation);
+            }
             let _ = commands.try_send(crate::side_driver::SideDriverCommand::Open {
                 request_id: uuid::Uuid::new_v4().to_string(),
                 question,
@@ -3014,6 +3046,11 @@ fn handle_side_key(key: KeyEvent, side: &mut SideSession, channels: &TuiChannels
                             expected_active_turn_id: expected,
                         });
                     }
+                    // spec §4.1：旁支里的 `/side-close` 是「取消并关闭，返回父视图」。
+                    // 返回必须当场发生，不能等 `SideClosed` 帧——用户已经关掉了旁支，
+                    // 却还被留在那个视图里，正是最不该出现的位置。终态帧随后只负责
+                    // 把关闭原因显示出来（`apply_event` 已把它写进 notice）。
+                    side.views.back();
                     KeyOutcome::None
                 }
                 Ok(RoutedInput::Side(SideInput::Submit(question))) => {
@@ -7302,6 +7339,410 @@ mod tests {
             side_cmd_rx.try_recv().is_err(),
             "没有旁支时 /side-close 不该发命令，/back 也不该"
         );
+    }
+
+    /// 把整屏读成字符串，供「当前在看哪份视图」这类渲染级断言使用。
+    ///
+    /// 宽字符（CJK）占用两个单元格，第二个单元格是空白占位，直接拼起来会把
+    /// 「旁问（只读）」读成「旁 问 （ 只 读 ）」。这里去掉空白再拼，断言就能
+    /// 用连续的中文子串。
+    fn frame_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                if symbol.trim().is_empty() {
+                    continue;
+                }
+                out.push_str(symbol);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 主视图执行 `/side` 后，命令补全弹窗不能留在屏幕上。
+    ///
+    /// 真实终端里曾出现：敲 `/side` 回车后旁支开了，但「命令」弹窗还挂在输入框
+    /// 上方，看起来像命令没执行、提示在等用户再选一次。根因是旁支拦截分支
+    /// `continue` 掉了，跳过了循环末尾的 `sync_popup`。这条测试要求：命令执行后
+    /// 弹窗必须消失。
+    #[test]
+    fn side_command_from_main_view_clears_the_command_popup() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (_agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (_side_tx, side_rx) = tokio::sync::mpsc::channel(16);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Paste("/side".into()),
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut title = crate::tui::title::TitleHandle::disabled();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_rx),
+        )
+        .unwrap();
+
+        let frame = frame_text(&terminal);
+        // `/side` 不在补全目录里（目录只列 `/help` 认识的管理命令），过滤后
+        // 弹窗只剩一个空列表 + 边框标题。边框标题 `命令` 是「弹窗还在」的可靠
+        // 探针：本测试的 history 是空的，正文里不会出现这两个字。
+        assert!(
+            !frame.contains("命令"),
+            "命令执行后补全弹窗必须收起，实际屏幕：\n{frame}"
+        );
+        assert!(
+            matches!(
+                side_cmd_rx.try_recv(),
+                Ok(crate::side_driver::SideDriverCommand::Open { .. })
+            ),
+            "弹窗消失不能以「命令没执行」为代价"
+        );
+    }
+
+    /// 旁支视图里的数字键与 Enter 绝不能替父会话作出审批裁决（spec §12.4）。
+    ///
+    /// 这是硬约束里最容易写错的一条：主视图在 `pending_permission` 下把
+    /// Enter 当「默认批准」、数字当「选第 N 项」，而旁支是按可见视图派发的。
+    /// 一旦路由顺序写反，用户只是想在旁支里问一句、顺手敲了个 `1`，父会话
+    /// 的工具调用就被批准了——旁支的「只读」承诺当场破掉。
+    ///
+    /// 用真实 `run_loop_with_side` 跑：先喂一帧旁支状态把视图建起来，再让父
+    /// 审批挂起，然后在旁支里敲 `1` + Enter。断言裁决通道收到 **0** 条，且
+    /// 这些键确实进了旁支（否则「没批准」可能只是「键被吞了」）。
+    #[test]
+    fn parent_approval_cannot_be_answered_from_side() {
+        use yi_agent_runtime::side_conversation::SideStatus;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        agent_tx
+            .try_send(AgentEvent::PermissionRequest {
+                request_id: 7,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            })
+            .unwrap();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(16);
+        side_tx
+            .try_send(crate::tui::side::ConversationEvent {
+                target: crate::tui::side::ConversationTarget::Side {
+                    side_id: "side-1".into(),
+                    generation: 1,
+                },
+                turn_id: None,
+                event: crate::tui::side::ConversationPayload::SideStatus(SideStatus::Idle),
+            })
+            .unwrap();
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let events = ScriptedEvents {
+            // `poll` pops from the back, so this runs in reverse: 先让循环把
+            // 旁支帧应用掉（`in_side` 在下一轮才生效），再在旁支里敲 `1` + Enter。
+            events: Rc::new(RefCell::new(vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+                Event::FocusGained,
+            ])),
+        };
+        let project = tempfile::TempDir::new().unwrap();
+        let mut title = crate::tui::title::TitleHandle::disabled();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut InputLine::new(),
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_rx),
+        )
+        .unwrap();
+
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "旁支里的数字键与 Enter 绝不能替父会话作出裁决"
+        );
+        // 反向确认：这些键确实进了旁支（`1` 作为问题发出），不是被静默吞掉。
+        // 旁支视图由第一帧 `SideStatus` 建立（不发 `Open`），所以这里第一个
+        // 命令就该是 `Submit`。
+        let command = side_cmd_rx
+            .try_recv()
+            .expect("旁支里的 `1`+Enter 应作为旁支提问发出");
+        match command {
+            crate::side_driver::SideDriverCommand::Submit { text, .. } => assert_eq!(
+                text, "1",
+                "旁支里的输入必须原样成为旁支提问，而不是被审批逻辑消费"
+            ),
+            other => panic!("期望旁支 Submit，实际是 {other:?}"),
+        }
+    }
+
+    /// 主视图 `/side` 在旁支已存在时必须把**视图**切回去（spec §4.1「有旁支则打开」）。
+    ///
+    /// 真实终端复现过：旁支建好、`/back` 回主会话后，再敲 `/side` 屏幕仍停在
+    /// 主会话。原因是 `apply_event` 只在 `views.side.is_none()` 时建立视图，
+    /// 重复 open 之后 driver 回的 `SideStatus` 帧只更新状态、不切视图。
+    /// 视图切换必须由「用户显式 open」驱动，而不是由后台帧驱动——否则旁支
+    /// 流式输出会把正在看主会话的用户硬拽走。
+    #[test]
+    fn opening_a_side_from_main_view_switches_back_to_the_existing_view() {
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        side.views
+            .side
+            .as_mut()
+            .unwrap()
+            .apply_items(vec![std::sync::Arc::new(
+                yi_agent_runtime::side_conversation::SideItem {
+                    id: "a".into(),
+                    turn_id: "turn-1".into(),
+                    ordinal: 1,
+                    content: yi_agent_runtime::side_conversation::SideItemContent::AgentMessage {
+                        text: "旁支已有正文".into(),
+                    },
+                },
+            )]);
+        side.views.back();
+        assert!(!side.in_side(), "前置条件：/back 之后在主会话");
+
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let mut channels = TuiChannels::from_senders(
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+        );
+        channels.side = Some(side_cmd_tx);
+        let mut history = HistoryState::new();
+
+        execute_side_command_in_main(
+            crate::tui::side::SideInput::Open { question: None },
+            &mut history,
+            80,
+            &mut side,
+            &channels,
+            true,
+        );
+
+        assert!(
+            side.in_side(),
+            "主视图 /side 必须切回已有旁支视图，而不是停在主会话"
+        );
+        assert_eq!(
+            side.active_side().map(|view| view.items.len()),
+            Some(1),
+            "切回的必须是**同一个**旁支，已有正文不能丢"
+        );
+        assert!(
+            matches!(
+                side_cmd_rx.try_recv(),
+                Ok(crate::side_driver::SideDriverCommand::Open { .. })
+            ),
+            "切视图不能替代通知 driver：多旁支宿主仍需这次 Open 来定位旁支"
+        );
+    }
+
+    /// 旁支视图里 `/side-close` 必须当场回到父视图（spec §4.1「取消并关闭，返回父视图」）。
+    ///
+    /// 真实终端复现：在旁支里敲 `/side-close` 回车，屏幕停在旁支不动——因为
+    /// 返回父视图原本只发生在 `SideClosed` 帧到达之后，而那一刻视图仍是
+    /// "活着"的，用户反而留在了一个已死的旁支上。关闭是用户显式动作，视图
+    /// 切换必须当场发生；随后的终态帧只负责把关闭原因显示出来。
+    #[test]
+    fn closing_a_side_from_its_own_view_returns_to_the_parent() {
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        assert!(side.in_side(), "前置条件：在旁支视图里");
+
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let mut channels = TuiChannels::from_senders(
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+        );
+        channels.side = Some(side_cmd_tx);
+
+        // 复刻 `handle_side_key` 对 `/side-close` 的处理。
+        let outcome = handle_side_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut side,
+            &channels,
+        );
+        // 先把命令敲进旁支输入行，再回车。
+        assert!(matches!(outcome, KeyOutcome::None));
+        for ch in "/side-close".chars() {
+            handle_side_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut side,
+                &channels,
+            );
+        }
+        handle_side_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut side,
+            &channels,
+        );
+
+        assert!(
+            !side.in_side(),
+            "旁支里 /side-close 必须返回父视图，不能停在已关闭的旁支上"
+        );
+        assert!(
+            matches!(
+                side_cmd_rx.try_recv(),
+                Ok(crate::side_driver::SideDriverCommand::Close { .. })
+            ),
+            "返回父视图不能替代真的关闭：Close 必须发给 driver"
+        );
+    }
+
+    /// 关闭一个旁支后再 `/side`，新的旁支帧必须能建立新视图。
+    ///
+    /// 真实终端复现：`/side` → `/side-close` → 再 `/side`，屏幕完全没反应。
+    /// 原因有两个叠在一起：① `apply_event` 开头「已关闭视图不再接受帧」的守卫
+    /// 不区分 side_id/generation，新旁支的帧也被判成迟到帧；② 建立视图的条件是
+    /// `views.side.is_none()`，而关闭后视图仍在（只是 `closed` 有值），于是新旁支
+    /// 永远建不出视图。已关闭视图只该丢掉**属于它自己**的迟到帧。
+    #[test]
+    fn a_new_side_can_open_after_the_previous_one_closed() {
+        use yi_agent_runtime::side_conversation::{CloseReason, SideStatus};
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target: crate::tui::side::ConversationTarget::Side {
+                    side_id: "side-1".into(),
+                    generation: 1,
+                },
+                turn_id: None,
+                event: crate::tui::side::ConversationPayload::SideClosed(CloseReason::UserClosed),
+            },
+            80,
+        );
+        assert!(
+            !side.active_side().unwrap().is_live(),
+            "前置条件：旧旁支已关闭"
+        );
+        side.views.back();
+
+        let effect = side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target: crate::tui::side::ConversationTarget::Side {
+                    side_id: "side-2".into(),
+                    generation: 2,
+                },
+                turn_id: None,
+                event: crate::tui::side::ConversationPayload::SideStatus(SideStatus::Idle),
+            },
+            80,
+        );
+        assert_eq!(
+            effect,
+            SideFrameEffect::Redraw,
+            "新旁支的帧不能被当作旧旁支的迟到帧丢掉"
+        );
+        let view = side.active_side().expect("必须为新旁支建立视图");
+        assert_eq!(view.side_id, "side-2");
+        assert_eq!(view.generation, 2);
+        assert!(view.is_live(), "新旁支必须是可用的");
+
+        // 而旧旁支的迟到帧仍必须被丢弃，且不能顶掉新视图。
+        let stale = side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target: crate::tui::side::ConversationTarget::Side {
+                    side_id: "side-1".into(),
+                    generation: 1,
+                },
+                turn_id: None,
+                event: crate::tui::side::ConversationPayload::SideStatus(SideStatus::Running),
+            },
+            80,
+        );
+        assert_eq!(stale, SideFrameEffect::Discard);
+        assert_eq!(side.active_side().unwrap().side_id, "side-2");
     }
 
     /// 旁支事件与旁支转录**绝不**能进入主 TurnLog / 主会话文件。
