@@ -638,8 +638,8 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 1：Rust 测试缓存损坏、包外路径、跨包/版本 token、已撤销代次、symlink 文件替换拒绝；正常 Unicode 安装根可用。
 - [x] Step 2：重跑 T01 probe，将其改为调用生产 container/assets 模块，检查 containerConfigSha256 与发布配置一致。
 - [x] Step 3：实现包独立验证与只读缓存、代次绑定的资源服务和原生恢复；CSP 不再 `null`，对主窗口已有合法资源需求做回归，不用全开 `*` 修报错。
-- [ ] Step 4：`cargo test --manifest-path desktop/src-tauri/Cargo.toml plugin_host`，以及正式 probe isolation suite；不能只跑 Rust MockRuntime 就声称原生 invoke 被拦截。
-- [ ] Step 5：按 C 提交 `feat: load verified plugin views in isolated containers`。
+- [x] Step 4：`cargo test --manifest-path desktop/src-tauri/Cargo.toml plugin_host`，以及正式 probe isolation suite；不能只跑 Rust MockRuntime 就声称原生 invoke 被拦截。
+- [x] Step 5：按 C 提交 `feat: load verified plugin views in isolated containers`。
 
 ### Task T18：实现宿主桥与独立 SDK
 
