@@ -152,6 +152,9 @@ codesign -v "$APP"   # 应 exit 0
   **改依赖后必须同步 `rust-version`**:它只声明、不校验,写错了没有门禁会报
   (`msrv-check` 就是为此加的)。真实下限 = 依赖图里最高的 `rust-version`,
   用 `cargo metadata` 查:剔除 `--all-features` 拉进来的可选依赖后取最大值。
+- **例外:纯文档合并免跑 CI 和单测。** 若本次改动只涉及文档(`docs/`、`CLAUDE.md`、
+  `README.md` 等),不含任何代码、测试或构建配置改动,则合并时无需跑 `just ci`
+  或 `cargo test`;但仍要走正常的 worktree + `git merge --no-ff` 流程。
 
 ## 磁盘占用:`target/` 会无限膨胀
 
