@@ -14,7 +14,8 @@
 // 很诚实，实际上报告会少一条通过、却也没失败，读的人容易当成「无关紧要」。
 // 所以本文件**不产生 `skipped`**，词汇表只有 pass / fail / unsupported。
 
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -249,6 +250,259 @@ export function assembleReport({ buildKind, suite, results, capabilities = {}, n
     ...(isNonEmptyString(suite) ? { suite } : {}),
     cases,
   };
+}
+
+/// 一次命令执行的结局。
+///
+/// `missing` 是刻意与 `fail` 分开的：命令根本跑不起来（可执行文件不存在、
+/// 超时被强杀）与「跑了但断言不过」是两种不同的坏消息，报告里要能分辨，
+/// 否则读的人会去修错的实现。两者在判词上都算失败，见 [`verdictFor`]。
+export const OUTCOMES = Object.freeze(["pass", "fail", "missing"]);
+
+/// 解析一条命令里的可执行文件与环境变量。
+///
+/// 命令是**字符串**而不是 argv 数组，因为映射表要能被人读懂、能直接复制到终端
+/// 里复算。这里自己拆分而不是过 shell，是为了让报告里的命令就是真正跑的那条：
+/// 过 shell 会引入引号、变量展开、管道这些无法从字符串反推的东西。
+export function parseCommand(raw) {
+  if (!isNonEmptyString(raw)) fail("a command must be a non-empty string");
+  // 只支持前置 `FOO=bar` 形式的环境变量，够用且能一眼看懂。
+  const tokens = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const env = {};
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) {
+    const token = tokens[index];
+    const split = token.indexOf("=");
+    env[token.slice(0, split)] = token.slice(split + 1).replace(/^["']|["']$/g, "");
+    index += 1;
+  }
+  const rest = tokens.slice(index).map((token) => token.replace(/^["']|["']$/g, ""));
+  if (rest.length === 0) fail(`command has no executable: ${raw}`);
+  return { command: rest[0], args: rest.slice(1), env };
+}
+
+/// 缺这个可执行文件，就说明这条命令不可能有意义地跑起来。
+///
+/// 命令里可能带 `cargo` —— 它不在默认 PATH 上。这里**不**猜路径、也不替用户
+/// 装工具链：`ENOENT` 会被如实记成 missing，判词是 fail，读的人自己知道是环境
+/// 问题。猜路径的代价是把「环境没配好」伪装成「验收通过」。
+function looksLikeEnoent(error) {
+  return (
+    error &&
+    (error.code === "ENOENT" ||
+      /ENOENT|command not found|not found/.test(String(error.message ?? "")))
+  );
+}
+
+/// 跑一条命令并把结局归一成 `pass` / `fail` / `missing`。
+///
+/// `runner` 可注入，测试因此不需要真的 fork 一个进程；生产路径用
+/// `execFileSync`。超时用 SIGKILL 收尾，且**超时算 missing 而不是 fail**：
+/// 我们不知道它是卡在实现里还是卡在环境里，把它说成「实现失败」会误导。
+export function runCommand(
+  raw,
+  { cwd = process.cwd(), timeoutMs = 30 * 60 * 1000, runner = execFileSync, env = process.env } = {},
+) {
+  const parsed = parseCommand(raw);
+  try {
+    const stdout = runner(parsed.command, parsed.args, {
+      cwd,
+      encoding: "utf8",
+      env: { ...env, ...parsed.env },
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: 512 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { outcome: "pass", stdout: String(stdout ?? ""), stderr: "", command: raw };
+  } catch (error) {
+    const stdout = String(error?.stdout ?? "");
+    const stderr = String(error?.stderr ?? "");
+    // 非零退出码但进程跑起来了：这是货真价实的失败。
+    const exitCode = error?.status;
+    if (typeof exitCode === "number") {
+      return { outcome: "fail", exitCode, stdout, stderr, command: raw };
+    }
+    // 超时（execFileSync 用 SIGTERM/SIGKILL 且 status 为 null）。
+    if (error?.signal) {
+      return { outcome: "missing", reason: `killed by ${error.signal}`, stdout, stderr, command: raw };
+    }
+    if (looksLikeEnoent(error)) {
+      return {
+        outcome: "missing",
+        reason: `executable not found: ${parsed.command}`,
+        stdout,
+        stderr,
+        command: raw,
+      };
+    }
+    return {
+      outcome: "missing",
+      reason: error?.message ?? "unknown execution error",
+      stdout,
+      stderr,
+      command: raw,
+    };
+  }
+}
+
+/// 探测这台机器能提供哪些能力。
+///
+/// 只认**显式配置**：远端主机要么来自 `--remote-host`，要么来自
+/// `YI_AGENT_ACCEPTANCE_REMOTE_HOST`；官方构建同理。刻意不从任何历史产物里
+/// 反推「上次跑过所以这次也算」——那会让一份旧报告悄悄成为新证据。
+export function detectCapabilities({ env = process.env, flags = {} } = {}) {
+  const remoteHost = (flags.remoteHost ?? env.YI_AGENT_ACCEPTANCE_REMOTE_HOST ?? "").trim();
+  const officialBuild = flags.official ?? env.YI_AGENT_ACCEPTANCE_OFFICIAL === "1";
+  return {
+    remote: remoteHost !== "",
+    remoteHost,
+    official: Boolean(officialBuild),
+  };
+}
+
+/// 把一条用例的多条命令折成一条结局。
+///
+/// 任一条 missing 即 missing（我们没能证明它），任一条 fail 即 fail；只有全部
+/// pass 才 pass。
+///
+/// **能力缺席时一条命令都不跑**。这是从一次真实误判改出来的：A16/A17 要求
+/// 非 loopback 的远端主机，没有主机时硬跑 `e2e-remote.mjs` 只会得到一个
+/// 「文件/环境不存在」的失败，判词落成 `fail`，读报告的人于是以为远端实现坏
+/// 了——真正缺的是那台机器。既然 `unsupportedWithout` 已经声明了缺什么，就
+/// 直接按 `missing` 交给 `verdictFor` 降级，不去伪造执行痕迹。
+export function runCase(caseSpec, options = {}) {
+  const capabilities = options.capabilities ?? {};
+  const without = caseSpec.unsupportedWithout;
+  if (without && capabilities[without] !== true) {
+    return {
+      caseSpec,
+      outcome: "missing",
+      evidence: [],
+      outcomes: [],
+      skippedBecause: without,
+    };
+  }
+
+  const outcomes = [];
+  for (const command of caseSpec.commands) {
+    const result = runCommand(command.run, options);
+    outcomes.push({ ...result, kind: command.kind });
+  }
+  const evidence = outcomes
+    .filter((result) => result.outcome === "pass")
+    .map((result) => buildEvidenceEntry({ kind: result.kind, detail: result.command }));
+  const anyMissing = outcomes.find((result) => result.outcome === "missing");
+  const anyFailed = outcomes.find((result) => result.outcome === "fail");
+  const outcome = anyMissing ? "missing" : anyFailed ? "fail" : "pass";
+  return { caseSpec, outcome, evidence, outcomes };
+}
+
+/// 执行选中的用例，得到 `assembleReport` 需要的结果列表。
+export function runSelected(selected, options = {}) {
+  return selected.map((caseSpec) => runCase(caseSpec, options));
+}
+
+/// 命令行入口。
+///
+/// 参数：
+///   --suite <all|A01,A02>            选哪些用例（默认 all）
+///   --output <path>                  报告写到哪（默认 .artifacts/plugins/acceptance.json）
+///   --build <probe|release>          被测构建的类别（默认 probe）
+///   --remote-host <id>               提供远端主机身份（含 OS/架构/版本可选）
+///   --require-pass                   全绿才退出 0
+///   --dry-run                        只打印计划，不跑任何命令
+export function parseArgs(argv) {
+  const options = {
+    suite: "all",
+    output: ".artifacts/plugins/acceptance.json",
+    buildKind: "probe",
+    remoteHost: "",
+    requirePass: false,
+    dryRun: false,
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    switch (arg) {
+      case "--suite":
+        options.suite = argv[++index] ?? "";
+        break;
+      case "--output":
+        options.output = argv[++index] ?? "";
+        break;
+      case "--build":
+        options.buildKind = argv[++index] ?? "";
+        break;
+      case "--remote-host":
+        options.remoteHost = argv[++index] ?? "";
+        break;
+      case "--require-pass":
+        options.requirePass = true;
+        break;
+      case "--dry-run":
+        options.dryRun = true;
+        break;
+      default:
+        fail(`unknown argument: ${arg}`);
+    }
+  }
+  if (!["probe", "release"].includes(options.buildKind)) {
+    fail(`--build must be probe or release, got ${JSON.stringify(options.buildKind)}`);
+  }
+  if (!isNonEmptyString(options.output)) fail("--output needs a path");
+  return options;
+}
+
+export function main(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
+  const options = parseArgs(argv);
+  const map = loadCommandMap();
+  const selected = planSuites(map, options.suite);
+  const capabilities = detectCapabilities({ flags: { remoteHost: options.remoteHost } });
+
+  if (options.dryRun) {
+    stdout.write(`e2e: ${selected.length} case(s), build=${options.buildKind}\n`);
+    for (const entry of selected) {
+      stdout.write(`  ${entry.id}  ${entry.unsupportedWithout ?? "-"}  ${entry.commands.map((c) => c.run).join(" ; ")}\n`);
+    }
+    return 0;
+  }
+
+  const results = runSelected(selected, { capabilities });
+  const report = assembleReport({
+    buildKind: options.buildKind,
+    suite: options.suite,
+    results,
+    capabilities,
+    now: new Date().toISOString(),
+  });
+
+  const outputPath = path.resolve(process.cwd(), options.output);
+  mkdirSync(path.dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
+
+  const counts = report.cases.reduce((acc, entry) => {
+    acc[entry.verdict] = (acc[entry.verdict] ?? 0) + 1;
+    return acc;
+  }, {});
+  stdout.write(
+    `e2e: wrote ${outputPath} — pass=${counts.pass ?? 0} fail=${counts.fail ?? 0} ` +
+      `unsupported=${counts.unsupported ?? 0}\n`,
+  );
+  for (const entry of report.cases) {
+    if (entry.verdict === "pass") continue;
+    stderr.write(`  ${entry.id} ${entry.verdict}${entry.reason ? `: ${entry.reason}` : ""}\n`);
+  }
+
+  return options.requirePass ? requiresPassExitCode(report) : 0;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    process.exit(main(process.argv.slice(2)));
+  } catch (error) {
+    process.stderr.write(`e2e: ${error.message}\n`);
+    process.exit(2);
+  }
 }
 
 /// `--require-pass` 的退出码：只有每一条都是 `pass` 才是 0。
