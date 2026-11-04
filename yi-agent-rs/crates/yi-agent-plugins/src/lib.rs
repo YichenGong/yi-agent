@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod migration;
 pub mod operations;
 pub mod ownership;
+pub mod pack;
 pub mod project;
 pub mod quota;
 pub mod registry;
@@ -47,6 +48,7 @@ pub use manifest::{Manifest, MethodDecl, ViewDecl};
 pub use migration::{Backup, BackupEntry, BackupManifest};
 pub use operations::{OperationLedger, OperationOutcome};
 pub use ownership::{OwnerGuard, OwnerRecord, ProjectOwnership};
+pub use pack::{Packed, pack_directory, write_release};
 pub use project::{ProjectResolver, ProjectRoot};
 pub use quota::{
     ActivityObservation, ObservationScope, QuotaContext, SharedQuota, SharedQuotaConfig,

@@ -820,8 +820,8 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** `plugin-pack` 使用同一 manifest/trust/bundle 契约，确定性归档后签名；私钥从受保护文件读取，不进 argv、日志、仓库或前端。目录发布在所有包上传/校验成功之后，禁止先发布目录再上传包。
 
-- [ ] Step 1：pack round-trip 红例：有效包经生产 verifier/extractor 安装；单字节篡改失败；相同输入两次包内容一致。跨平台 UI/skill 摘要相同，原生 executable 分别检查。
-- [ ] Step 2：release script 单测确保插件 tag 不触发主程序版本流水线、检查 tag 在 main 且匹配插件 workspace/UI 版本、缺平台产物不更新目录、主程序版本未变化。插件 tag 采用 `plugin-superpowers-kanban-v*.*.*`，不冒用主程序 `v*.*.*`。
+- [x] Step 1：pack round-trip 红例：有效包经生产 verifier/extractor 安装；单字节篡改失败；相同输入两次包内容一致。跨平台 UI/skill 摘要相同，原生 executable 分别检查。判据：`cargo test -p yi-agent-plugins --lib pack::`（6 passed）与 `cargo test -p yi-agent-plugins --test pack`（4 passed）；真机验证 `plugin-pack pack` 两次产出 `cmp` 逐字节相同（92 files / sha256 `2bf46ddb…`）；变异验证：改 mtime 与关掉 digest 比较各让对应用例失败。
+- [x] Step 2：release script 单测确保插件 tag 不触发主程序版本流水线、检查 tag 在 main 且匹配插件 workspace/UI 版本、缺平台产物不更新目录、主程序版本未变化。插件 tag 采用 `plugin-superpowers-kanban-v*.*.*`，不冒用主程序 `v*.*.*`。判据：`just plugin-release-check`（11 passed，已进 `just ci`）；变异验证：删掉 main 祖先检查、删掉 Cargo 版本比较，各让对应用例失败。
 - [ ] Step 3：新增独立插件 Rust、UI、SDK、contracts 与脚本检查 recipe/jobs；Node 检查放独立 job，不把 Node 强塞进无 Node 的主 Rust `just ci`。云端不可信 PR 不能接触 self-hosted runner 或签名密钥；签名发布仅受保护 main/tag 环境审批。
 - [ ] Step 4：依目标平台签名/公证程序后再归档/签插件元数据，验证真实下载后的 OS 执行策略。构建正式主程序时默认不启用 probe、不携带 fixture/测试 root；正式插件包不含测试密钥/攻击页/开发端口。不向用户建议关闭 Gatekeeper。
 - [ ] Step 5：按 C 提交 `ci: build and verify independently versioned plugin releases`。本任务只实现发布机制；真正上传、签名生产包和发布目录必须再次获发布授权。
