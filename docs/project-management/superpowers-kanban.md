@@ -49,8 +49,7 @@ T27 已落地的部分：
 - Step 2（故障注入矩阵）：`scripts/plugins/fault-matrix.json` 把断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管、待清理卸载、每阶段崩溃十项绑到 41 个既有测试；`just plugin-fault-matrix` 真跑 nextest 得 10/10 项、41/41 测试 ok。改名任一测试即 9/10 并以退出码 1 失败。
 - Step 4（同一 `.app` 上的 v1→v2）：`just plugin-update-check /Applications/yi-agent.app` 得 UI `board-v1`→`board-v2`、主程序 desktop 与 bundle 摘要前后一致、`verify-active-release.py` 校验活跃版本/view 摘要/skill 来源、卸载后项目数据保留且托管入口消失。五种变异各自被拦。
 
-**仍未完成：** T26 Step 4（平台签名/公证与真实下载后的 OS 执行策略验证）需要发布授权与签名密钥；T27 Step 3（真实非 loopback 远端宿主证据）需要可访问的外部机器，A16/A17 因此保持未完成；T27 Step 4 的脱敏报告与截图、以及 Step 5 的最终验收提交同样待办。因此本条保持 `[ ]`。>>>>>>> kanban/2026-11-02-kanban-independent-release-design-2026-11-02-kanban-independent-release
-
+**仍未完成：** T26 Step 4（平台签名/公证与真实下载后的 OS 执行策略验证）需要发布授权与签名密钥；T27 Step 3（真实非 loopback 远端宿主证据）需要可访问的外部机器，A16/A17 因此保持未完成；T27 Step 4 的脱敏报告与截图、以及 Step 5 的最终验收提交同样待办。因此本条保持 `[ ]`。
 - [x] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`（225 lib + 45 bin 通过）。
 
   实现与证据（提交 `e34757f7`、`c0fa47ae`..`2c7b8211`、`b0a5a9f2`、`741e1253`、`c2605709`、`ed9117a1`）：
