@@ -2588,6 +2588,27 @@ export default function App() {
     activeSideBinding.supported &&
     activeSideBinding.scope !== "observe";
 
+  /**
+   * 当前会话的完整身份，只用于隔离输入框的本地提交锁。
+   *
+   * 必须带 generation：同一 sideId 换代之后是另一条会话，上一代的在途回包不能
+   * 解开新一代的锁（spec §5.2「双击或重复 Enter 不重复发送」）。
+   */
+  const composerConversationKey = (() => {
+    const a = sideConversation.active;
+    if (a !== null && a.kind === "side") {
+      return JSON.stringify([
+        "side",
+        a.hostKey,
+        a.parentId,
+        a.sideId,
+        a.generation,
+      ]);
+    }
+    if (a !== null) return JSON.stringify(["main", a.hostKey, a.parentId]);
+    return JSON.stringify(["main", activeSlotRef.current, sess.currentId]);
+  })();
+
   /** 输入框的会话上下文：视图、能力、可控制性三者一起传。 */
   const composerConversation = {
     view: (activeSide !== null ? "side" : "main") as "main" | "side",
@@ -2939,6 +2960,15 @@ export default function App() {
                   // `/side-close` 必须能与 Enter/Send/按钮走同一条策略。
                   // 不接的话它们会被当成普通文本发给模型（"模型收到 /btw"）。
                   onSideCommand={runSideCommand}
+                  // 旁支正文走三态收据：清稿由 store 按身份 + 草稿修订裁决，
+                  // 不经父 `send` 的「true 就清稿」分支（那会清掉 await 期间的
+                  // 新编辑，也无法区分「不确定」与「明确失败」）。
+                  onSubmitSide={
+                    activeSide === null
+                      ? null
+                      : (text) => sideConversationRef.current.submit(text)
+                  }
+                  conversationKey={composerConversationKey}
                   conversation={composerConversation}
                   value={current?.draft ?? ""}
                   onDraftChange={changeDraft}

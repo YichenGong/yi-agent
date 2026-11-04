@@ -886,13 +886,26 @@ describe("MessageInput side routing", () => {
     expect(onSlashCommand).not.toHaveBeenCalled();
   });
 
-  it("runs /help inside the side scope through the slash handler", async () => {
+  it("runs /help inside the side scope through the side handler, never the parent", async () => {
+    // `/help`、`/config`、`/usage` 读的是**这条旁支**的固定配置与用量。转给
+    // `onSlashCommand` 会把父会话的模型和父会话的费用显示成旁支的。
     const onSlashCommand = vi.fn(() => true);
-    renderInput({ conversation: side, onSlashCommand, value: "/help" });
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      conversation: side,
+      onSlashCommand,
+      onSideCommand,
+      value: "/help",
+    });
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
     await waitFor(() =>
-      expect(onSlashCommand).toHaveBeenCalledWith("help", null),
+      expect(onSideCommand).toHaveBeenCalledWith({
+        kind: "command",
+        name: "help",
+        args: null,
+      }),
     );
+    expect(onSlashCommand).not.toHaveBeenCalled();
   });
 
   it("keeps the draft and sends nothing for a blocked side command", async () => {
@@ -941,7 +954,10 @@ describe("MessageInput mobile side commands", () => {
       onSideCommand,
       value: "/btw why is it slow",
     });
-    fireEvent.click(screen.getByRole("button", { name: "命令" }));
+    // 只有一颗主动作：命令与 Stop 不并排，也不存在额外的「命令」按钮。
+    expect(screen.queryByRole("button", { name: "命令" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "执行命令" }));
     await waitFor(() =>
       expect(onSideCommand).toHaveBeenCalledWith({
         kind: "open",
@@ -949,6 +965,20 @@ describe("MessageInput mobile side commands", () => {
       }),
     );
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("keeps only Stop on a running mobile side", async () => {
+    renderInput({
+      isMobile: true,
+      conversation: { view: "side", supported: true, canControl: true },
+      turnActive: true,
+      value: "/back",
+    });
+    // 旁支里的 `/back` 永远可执行，但运行中不能因此多出一颗按钮：同一条命令
+    // 仍要靠 Enter/键盘，界面上只保留它自己的 Stop（spec §4.2 手机单主动作）。
+    expect(screen.queryByRole("button", { name: "执行命令" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^send$/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /^stop$/i })).toBeTruthy();
   });
 
   it("does not let a lookalike command bypass the mobile stop", async () => {
@@ -995,5 +1025,193 @@ describe("MessageInput mobile side commands", () => {
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
     await act(async () => {});
     expect(onSideCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe("MessageInput side submission receipts", () => {
+  const side = { view: "side" as const, supported: true, canControl: true };
+
+  it("sends side text through the receipt API instead of the parent send", async () => {
+    const onSend = vi.fn(async () => true);
+    const onSubmitSide = vi.fn(async () => ({
+      kind: "accepted" as const,
+      requestId: "r1",
+    }));
+    renderInput({
+      conversation: side,
+      onSend,
+      onSubmitSide,
+      conversationKey: '["side","local","p1","s1",1]',
+      value: "追问一句",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(onSubmitSide).toHaveBeenCalledWith("追问一句"));
+    // 父 onSend 的「true 就清稿」分支绝不能碰旁支的正文。
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("keeps the text after a rejection and does not clear it itself", async () => {
+    const onDraftChange = vi.fn();
+    const onSubmitSide = vi.fn(async () => ({
+      kind: "rejected" as const,
+      requestId: "r1",
+      message: "旁问还没同步完成，暂时不能发送",
+    }));
+    renderInput({
+      conversation: side,
+      onSubmitSide,
+      onDraftChange,
+      value: "keep me",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(onSubmitSide).toHaveBeenCalled());
+    // 清稿只能由 store 按「身份 + 草稿修订」决定；组件层不得自己清。
+    expect(onDraftChange).not.toHaveBeenCalledWith("", expect.anything());
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("keep me");
+  });
+
+  it("never clears the draft on an uncertain receipt either", async () => {
+    const onDraftChange = vi.fn();
+    const onSubmitSide = vi.fn(async () => ({
+      kind: "uncertain" as const,
+      requestId: "r1",
+    }));
+    renderInput({
+      conversation: side,
+      onSubmitSide,
+      onDraftChange,
+      value: "maybe sent",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(onSubmitSide).toHaveBeenCalled());
+    expect(onDraftChange).not.toHaveBeenCalledWith("", expect.anything());
+  });
+
+  it("does not submit twice while a side receipt is still pending", async () => {
+    let release: (() => void) | null = null;
+    const onSubmitSide = vi.fn(
+      () =>
+        new Promise<{ kind: "accepted"; requestId: string }>((resolve) => {
+          release = () => resolve({ kind: "accepted", requestId: "r1" });
+        }),
+    );
+    renderInput({ conversation: side, onSubmitSide, value: "one" });
+    const button = screen.getByRole("button", { name: /^send$/i });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {});
+    expect(onSubmitSide).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      release?.();
+    });
+  });
+
+  it("lets /back run while a side submission is still in flight", async () => {
+    // 提交还在路上时，本地返回必须立刻可用：它不发任何请求，也不该排队等网络。
+    const onSubmitSide = vi.fn(() => new Promise<never>(() => {}));
+    const onSideCommand = vi.fn(() => true);
+    renderInput({
+      conversation: side,
+      onSubmitSide,
+      onSideCommand,
+      value: "slow question",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => {});
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // 输入区仍然可用（没有被 sending 冻住）。
+    expect(textarea.disabled).toBe(false);
+    fireEvent.change(textarea, { target: { value: "/back" } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await waitFor(() =>
+      expect(onSideCommand).toHaveBeenCalledWith({ kind: "back" }),
+    );
+  });
+
+  it("does not let a stale receipt release another conversation's latch", async () => {
+    let release: (() => void) | null = null;
+    const onSubmitSide = vi.fn(
+      () =>
+        new Promise<{ kind: "accepted"; requestId: string }>((resolve) => {
+          release = () => resolve({ kind: "accepted", requestId: "r1" });
+        }),
+    );
+    const { rerender } = renderInput({
+      conversation: side,
+      onSubmitSide,
+      conversationKey: '["side","local","p1","s1",1]',
+      value: "第一句",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => {});
+    // 切到另一条会话（另一代），提交它。
+    const second = vi.fn(async () => ({ kind: "accepted" as const, requestId: "r2" }));
+    rerender(
+      <MessageInput
+        turnActive={false}
+        onSend={vi.fn(async () => true)}
+        onInterrupt={vi.fn()}
+        mode="normal"
+        onModeChange={vi.fn()}
+        onSlashCommand={vi.fn(() => true)}
+        value="第二句"
+        onDraftChange={vi.fn()}
+        attachments={[]}
+        onPickAttachments={vi.fn()}
+        onRemoveAttachment={vi.fn()}
+        call={vi.fn(async () => ({}))}
+        conversation={side}
+        onSubmitSide={second}
+        conversationKey='["side","local","p1","s1",2]'
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => {});
+    // 旧会话的 finally 落地：不能顺手解开新会话的锁。
+    await act(async () => {
+      release?.();
+    });
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MessageInput blocked feedback", () => {
+  it("shows why a command was refused and keeps the draft", () => {
+    const onSend = vi.fn(async () => true);
+    const onDraftChange = vi.fn();
+    renderInput({
+      conversation: { view: "side", supported: true, canControl: true },
+      onSend,
+      onDraftChange,
+      value: "/clear",
+    });
+    const status = screen.getByRole("status");
+    expect(status.textContent).toContain("/clear");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+  });
+
+  it("reserves no space when nothing is blocked", () => {
+    renderInput({ value: "ordinary text" });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("names the missing capability instead of silently doing nothing", () => {
+    renderInput({
+      conversation: { view: "main", supported: false, canControl: true },
+      value: "/btw hello",
+    });
+    expect(screen.getByRole("status").textContent).toContain("不支持");
+  });
+
+  it("keeps /back reachable on a read-only device", () => {
+    renderInput({
+      conversation: { view: "side", supported: false, canControl: false },
+      value: "/back",
+    });
+    // 失能设备也必须有返回的出路：没有它，用户会被困在一条读不了的旁支里。
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: /^send$/i })).toBeTruthy();
   });
 });
