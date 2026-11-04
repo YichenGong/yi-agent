@@ -282,7 +282,30 @@ git diff --check                                        # 无输出
 | T09 | 上列两条 Full/Closed 用例 + driver 的 `stale_close_target_reports_error_and_keeps_the_live_side`、`stale_interrupt_does_not_stop_the_live_turn`、`failed_open_reports_a_main_target_error` | 未执行 |
 | T10 | `side_status_bar_labels_the_conversation_without_covering_the_first_item`（80×24 与 32×12 × 深/浅）、`main_view_has_no_standalone_side_banner`、`side_events_never_reach_main_turn_log` | 未执行 |
 
-W01–W16（桌面/手机）本轮**未改动对应实现**，也**未在真机复验**；本表不据此宣称通过。
+W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`b7945d47`、`14c579b3`、`eb13ca07`、
+`156322b2`、`635a7480`、`182dc82d`、`b1474baf`）。ID 定义见 spec §8.1，逐条对应到真实用例：
+
+| ID | 自动证据（真实用例名） | 真机 |
+| --- | --- | --- |
+| W01 | `App.test.tsx`：`expectNoSideChrome()`（无 `side-header` / `side-conversation-header` / 六个入口按钮）；`StatusBar.test.tsx:241` `conversationLabel` 显示 `/side · 只读 · /back 返回` 且 connected 点仍绿 | 未执行 |
+| W02 | `App.test.tsx`：`opens an empty side from /side without a module or a model call`、`opens with the question typed after /btw, and only once`；`useSideConversationController.test.tsx:161` `merges a repeated open into the same side instead of opening twice` | 未执行 |
+| W03 | `App.test.tsx`：`renders the side transcript without reading parent images`；`sideSync.test.ts:323` `applies only contiguous sequence numbers`、`:332` `re-reconciles instead of skipping a gap` | 未执行 |
+| W04 | `App.test.tsx`：`does not interrupt a running parent when opening a side`、`stops only the side's own turn`、`keeps the parent's approval dialog out of the side view`；`useSideConversationController.test.tsx:495` `interrupts the side's own turn, never the parent` | 未执行 |
+| W05 | `App.test.tsx`：`keeps each conversation's draft to itself`、`returns to the parent without stopping or closing the running side`、`marks a vanished side as lost instead of falling back to the parent`；`useSideConversationController.test.tsx:462` | 未执行 |
+| W06 | `useSideConversationController.test.tsx:289` `routes a submission to the side and host it was captured from`、`:339` `rejects a submission aimed at a generation that has already been replaced`、`:397` `only surfaces an error for the side that produced it`、`:426` `does not let one host's failure show up as another host's` | 未执行 |
+| W07 | `sideSync.test.ts:270` `keeps the placeholder and marks unsynced on a network failure`；`useSideConversationController.test.tsx:327` `returns a receipt from submit and rejects when no side is open`；`App.test.tsx`：`keeps the typed question when the side's first turn is refused` | 未执行 |
+| W08 | `sideSync.test.ts:484` `retries uncertain submission with the same request id`；`sideConversation.test.ts:350` 相同文字仍 +2 | 未执行 |
+| W09 | `useSideConversation.test.tsx:120` `opens the tail poll on a controller created while its parent is visible`、`:140` `keeps a background host's controller invisible`、`:175` `stops polling everything when the side view closes`、`:227` `disposes every controller on unmount` | 未执行 |
+| W10 | `MessageInput.test.tsx:364` `keeps mobile running turns Stop-only and Enter inert`、`:334` `sends from a separate Send button while retaining Stop`、`:93` `does not send when Enter confirms an IME candidate (keyCode 229)` | 未执行 |
+| W11 | `useSideConversationController.test.tsx:762` `lists existing sides instead of opening one`、`:810` `rejects an observe-only request to start a conversation`、`:819` `still lets a read-only device return locally`、`:721` `refuses to close on an observe-only host`；`App.test.tsx`：`hides every side entry point when the host lacks the capability` | 未执行 |
+| W12 | `MessageInput.test.tsx:898` `runs /help inside the side scope through the side handler, never the parent`、`:873` `dispatches /back through onSideCommand without touching onSlashCommand`；`App.test.tsx`：`explains a /back taken from the main view` | 未执行 |
+| W13 | `useSideConversationController.test.tsx:226` `does not yank the user back into a side that opened after they left`、`:248` `re-enters a side the user explicitly asked for after the open landed`、`:266` `keeps the automatic first question as a draft when the user left first`、`:362` `keeps a local return independent from an in-flight submission lock` | 未执行 |
+| W14 | `useSideConversationController.test.tsx:565` `reads the server's current turn before confirming`、`:587` `closes the side it was confirmed for, not the one now on screen`、`:625` `does not yank the user back if they navigated while the close was pending`、`:687` `refuses a confirmation whose connection has been replaced`、`:705` `refuses a confirmation from a generation that has been replaced`、`:734` `does not force a close when the turn changed after confirmation` | 未执行 |
+| W15 | `App.test.tsx`：`keeps the parent's pending attachments out of the side`、`renders the side transcript without reading parent images`、`never routes side notifications into the parent's mark-read or resume` | 未执行 |
+| W16 | `App.test.tsx`：`closes a background side from the main view`、`says so instead of pretending when there is nothing to close`；`useSideConversationController.test.tsx:654`、`:673` `is idempotent when there is nothing to close` | 未执行 |
+
+这些是源码级断言（`npx vitest run` = 159 files / 2226 passed，其中相关八个文件 522 passed）。
+**真机一列全部未执行**，所以本表只证明「自动侧有覆盖」，不宣称 W01–W16 验收通过。
 
 ### 5.4 明确未执行项
 
