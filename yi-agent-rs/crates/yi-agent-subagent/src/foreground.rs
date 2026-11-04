@@ -520,6 +520,131 @@ impl ForegroundDriver {
     }
 }
 
+/// One host process's authority to drive foreground roots.
+///
+/// This exists so the three hosts do not each re-derive two things that are easy to
+/// get subtly wrong:
+///
+/// * **One lease per process, not per thread.** The control channel accounts for
+///   *clients*; a host that registered a lease per conversation would look like N
+///   frontends and would keep the runtime alive after the window closed.
+/// * **Authorize once per root, reuse the authorization across turns.** The guardian
+///   mints a new capability on every authorize, so re-authorizing each turn would churn
+///   the authority table for no reason and would let a transient refusal silently
+///   disable a conversation that was already working.
+///
+/// Every method is fallible only in the ways a caller can act on. `None` means "this
+/// runtime does not serve the foreground contract for this root" and the host should
+/// keep legacy semantics; it is never an error to surface to the user.
+pub struct ForegroundHost {
+    lease: yi_agent_lifecycle::client::FrontendLease,
+    /// Authorizations by root key. The queue is per process because a bind needs the
+    /// same authorization across a retry around the host's own reconnection.
+    authorized: std::sync::Mutex<std::collections::HashMap<String, RootAuthorization>>,
+}
+
+impl ForegroundHost {
+    /// Registers this process as a frontend of `runtime_dir`'s runtime.
+    ///
+    /// `Ok(None)` for embedded mode and for a runtime with no guardian: both are
+    /// normal, and neither should stop a launch.
+    pub fn connect(
+        runtime_dir: &std::path::Path,
+        kind: yi_agent_lifecycle::types::ClientKind,
+        client_run_id: String,
+    ) -> std::io::Result<Option<Self>> {
+        let control_path = yi_agent_lifecycle::scope::control_path(runtime_dir);
+        let deadline =
+            yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(2));
+        let Some(lease) = yi_agent_lifecycle::client::FrontendLease::register_if_served(
+            &control_path,
+            client_run_id,
+            kind,
+            yi_agent_lifecycle::types::LeaseMode::Business,
+            &deadline,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            lease,
+            authorized: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }))
+    }
+
+    /// This root's authorization, asking the guardian only the first time.
+    ///
+    /// Cached on purpose. The guardian mints a *new* capability on every authorize, so
+    /// asking per turn would churn the authority table and -- worse -- let one transient
+    /// refusal disable a conversation that was already reporting. `None` means the
+    /// guardian said no (or is not there), which the host treats as legacy semantics.
+    pub fn authorization(
+        &self,
+        root: &Arc<crate::thread_root::ThreadRoot>,
+        operation_id: &str,
+    ) -> Result<Option<RootAuthorization>, String> {
+        let key = crate::thread_root::application_root_key(root.thread_id());
+        let mut authorized = self
+            .authorized
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = authorized.get(&key) {
+            return Ok(Some(existing.clone()));
+        }
+        let Some(fresh) = root.authorize_foreground_root(&self.lease, operation_id)? else {
+            return Ok(None);
+        };
+        authorized.insert(key, fresh.clone());
+        Ok(Some(fresh))
+    }
+
+    /// Opens a turn for `root`, binding this host as its driver on first use.
+    ///
+    /// Returns `Ok(None)` whenever the contract is not offered (no guardian, a
+    /// refusal, an unsupported build) -- the host then runs the turn with legacy
+    /// semantics. A [`ForegroundTurn`] is returned only when the daemon really issued a
+    /// binding, because reporting activity against an unbound root would be a lie.
+    pub fn begin(
+        &self,
+        root: &Arc<crate::thread_root::ThreadRoot>,
+        operation_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<ForegroundTurn>, String> {
+        let Some(authorization) = self.authorization(root, operation_id)? else {
+            return Ok(None);
+        };
+        let mut turn = match root.bind_foreground_driver(authorization, operation_id)? {
+            Some(turn) => turn,
+            None => return Ok(None),
+        };
+        turn.begin(turn_id);
+        Ok(Some(turn))
+    }
+}
+
+/// Runs one activity write and reports its failure as a diagnostic, never as an error.
+///
+/// The hosts call this around `ForegroundTurn` so that the rule "activity is
+/// description, never control" lives in one place instead of being re-derived by
+/// three entry points. A host that used `?` here would abort a working conversation
+/// because a display update failed, which is exactly backwards.
+///
+/// Returns the warning the caller may surface, or `None` when the write succeeded.
+/// No secret reaches the message: `ForegroundClientError` is built to print without
+/// its capability, and the stage names are literals.
+pub fn foreground_activity_sync_warning(
+    outcome: Result<(), ForegroundClientError>,
+    stage: &'static str,
+) -> Option<String> {
+    match outcome {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(stage, %error, "foreground activity could not be reported");
+            Some(format!("{stage}: {error}"))
+        }
+    }
+}
+
 /// A host's per-turn view of one foreground root.
 ///
 /// The three hosts (desktop, TUI, headless) all need the same sequence: open the turn
@@ -539,6 +664,12 @@ impl ForegroundDriver {
 #[allow(dead_code)]
 pub struct ForegroundTurn<T: ForegroundTransport = SocketTransport> {
     driver: DriverState<T>,
+    /// The turn this handle opened.
+    ///
+    /// Kept so `finish` can name it without the host threading the id through every
+    /// exit path. A host that had to remember it would eventually pass the wrong one
+    /// after a resume, and the daemon would refuse the close.
+    turn_id: String,
     /// The last problem this turn saw, for the host's diagnostics panel.
     warning: Option<String>,
 }
@@ -558,6 +689,7 @@ impl ForegroundTurn<SocketTransport> {
         let driver = ForegroundDriver::bind(root, authorization, operation_id)?;
         Ok(Self {
             driver: driver.state,
+            turn_id: String::new(),
             warning: None,
         })
     }
@@ -571,6 +703,7 @@ impl<T: ForegroundTransport> ForegroundTurn<T> {
     /// around their own recovery, and a retry is not a second statement.
     pub fn begin(&mut self, turn_id: &str) {
         if self.driver.committed.turn_id.as_deref() == Some(turn_id) {
+            self.turn_id = turn_id.to_string();
             self.warning = None;
             return;
         }
@@ -578,6 +711,7 @@ impl<T: ForegroundTransport> ForegroundTurn<T> {
             self.record("begin", error);
             return;
         }
+        self.turn_id = turn_id.to_string();
         self.warning = None;
     }
 
@@ -600,13 +734,20 @@ impl<T: ForegroundTransport> ForegroundTurn<T> {
     /// Closes `turn_id`. Must run on every exit path -- success, provider error and
     /// cancellation -- because a turn left open would make the next one look like a
     /// second statement about a turn that never ended.
-    pub fn finish(&mut self, turn_id: &str) {
+    /// Closes the turn [`Self::begin`] opened.
+    ///
+    /// Takes no id: the handle already knows which turn it opened, and a host forced to
+    /// thread the id through every exit path would eventually pass a stale one after a
+    /// resume -- which the daemon would refuse, leaving the turn open for the next one
+    /// to collide with.
+    pub fn finish(&mut self) {
         // Already closed: the overlapping exit paths both reached the same end, and
         // reporting that as a problem would train the host to ignore real ones.
         if self.driver.committed.turn_id.is_none() {
             return;
         }
-        if let Err(error) = self.driver.finish(turn_id) {
+        let turn_id = self.turn_id.clone();
+        if let Err(error) = self.driver.finish(&turn_id) {
             self.record("finish", error);
         } else {
             self.warning = None;
@@ -850,6 +991,7 @@ mod tests {
     fn turn_over(fake: FakeTransport, last_seq: u64) -> ForegroundTurn<FakeTransport> {
         ForegroundTurn {
             driver: driver(fake, last_seq),
+            turn_id: String::new(),
             warning: None,
         }
     }
@@ -896,8 +1038,8 @@ mod tests {
         let fake = FakeTransport::default();
         let mut turn = turn_over(fake, 0);
         turn.begin("turn-1");
-        turn.finish("turn-1");
-        turn.finish("turn-1");
+        turn.finish();
+        turn.finish();
         assert!(
             turn.warning().is_none(),
             "a duplicate finish is a no-op, not a problem to report"

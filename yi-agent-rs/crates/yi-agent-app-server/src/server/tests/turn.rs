@@ -604,6 +604,7 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1258,6 +1259,7 @@ async fn driver_uses_unique_item_ids_across_turns() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -1514,6 +1516,7 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     prompt_tx
@@ -2267,6 +2270,7 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     prompt_tx
