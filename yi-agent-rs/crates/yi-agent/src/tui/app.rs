@@ -32,8 +32,8 @@ use super::side::{
     TuiSideViews, classify_conversation_input, side_header_line,
 };
 use super::slash::{
-    CommandPopup, McpAction, SlashCommand, TuiConfigSnapshot, help_text, parse_mcp_args,
-    render_mcp_status,
+    CommandPopup, McpAction, PopupScope, SlashCommand, TuiConfigSnapshot, help_text,
+    parse_mcp_args, render_mcp_status,
 };
 use super::state::RunningTaskRegistry;
 use super::statusbar::{StatusBarState, render_statusbar_with};
@@ -1490,11 +1490,20 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 // 路由顺序是硬约束:先应用级退出/弹窗,再**可见视图**,最后才是
                 // 父审批。旁支视图绝不经过主视图的 pending_permission 分支,
                 // 否则在旁支里按 Enter 会替父会话批准一次工具调用。
-                if in_side {
-                    match handle_side_key(key, &mut side_session, &channels) {
+                // 用**此刻**的可见视图判断，而不是本帧开头算出的 `in_side`
+                // 快照：旁支帧是在本帧中途才应用的，拿快照路由会让「刚进入
+                // 旁支」后的第一个键落进父输入行。spec §6.1 要求按键与粘贴
+                // 统一选择当前可见的 InputLine。
+                if side_session.in_side() {
+                    match handle_side_key(key, &mut side_session, &channels, &mut popup_stack.popup)
+                    {
                         KeyOutcome::Quit => break,
                         _ => {
-                            sync_popup(&mut popup_stack.popup, &side_session.input.buffer);
+                            sync_popup(
+                                &mut popup_stack.popup,
+                                &side_session.input.buffer,
+                                PopupScope::Side,
+                            );
                             continue;
                         }
                     }
@@ -1502,7 +1511,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 let history_area = layout.chunks[0];
                 let history_text_width =
                     history.text_width(history_area.width, history_area.height);
-                if !in_side
+                if !side_session.in_side()
                     && history.pending_permission_info().is_none()
                     && intercept_side_command(
                         key,
@@ -1518,7 +1527,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                     // 弹窗是按输入缓冲算的:缓冲刚被 `input.clear()` 清空,
                     // 不在这里同步一次,补全面板就会一直挂在屏幕上,看起来
                     // 像命令没执行。旁支命令同样要遵守「弹窗跟随输入」。
-                    sync_popup(&mut popup_stack.popup, &input.buffer);
+                    sync_popup(&mut popup_stack.popup, &input.buffer, PopupScope::Main);
                     continue;
                 }
                 // 父审批提示显示时，先走「裁决 vs 命令」模式路由。这必须在
@@ -1613,18 +1622,26 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                     KeyOutcome::None => {}
                 }
                 // After any key, sync popup state with the (possibly modified) buffer
-                sync_popup(&mut popup_stack.popup, &input.buffer);
+                sync_popup(&mut popup_stack.popup, &input.buffer, PopupScope::Main);
             }
             Some(Event::Paste(text)) => {
-                handle_paste(
-                    text,
-                    input,
-                    history,
-                    &popup_stack.runtime_popup,
-                    &mut loop_bk.pending_quit,
-                    &mut popup_stack.popup,
-                    loop_bk.approval_mode,
-                );
+                // 粘贴也必须按**可见会话**路由（spec §6.1）。旁支里把字节写进
+                // 父 input 是「粘贴一条 /back 结果父草稿变了」的直接原因；而走
+                // 父 `handle_paste` 还会被父的待审批守卫整条挡掉——旁支的粘贴
+                // 与父审批无关，用户的字节不该因为别处的审批消失。
+                if side_session.in_side() {
+                    handle_side_paste(text, &mut side_session, &mut popup_stack.popup);
+                } else {
+                    handle_paste(
+                        text,
+                        input,
+                        history,
+                        &popup_stack.runtime_popup,
+                        &mut loop_bk.pending_quit,
+                        &mut popup_stack.popup,
+                        loop_bk.approval_mode,
+                    );
+                }
             }
             Some(Event::Mouse(mouse)) => {
                 handle_mouse(
@@ -2971,7 +2988,245 @@ fn execute_side_command_in_main(
 /// 旁支**绝不**经过主视图的 `pending_permission` 分支:父会话的审批必须 `back`
 /// 回去才能处理,在旁支里按 Enter 不能替父做决定。这也是把旁支按键单独抽出来
 /// 的原因——它不是「主视图按键的一个分支」,而是一条独立的、只读的路。
-fn handle_side_key(key: KeyEvent, side: &mut SideSession, channels: &TuiChannels) -> KeyOutcome {
+/// Paste into the **visible** side input.
+///
+/// Deliberately unlike the parent's `handle_paste`: no runtime-popup check and
+/// no pending-permission check. Both belong to the parent view — a parent's
+/// approval must not swallow bytes the user is typing into a side draft, and
+/// the side has no approval UI to be protected from. Paste only edits the
+/// draft; it never executes anything, so a pasted `/back` still needs Enter.
+fn handle_side_paste(text: String, side: &mut SideSession, popup: &mut Option<CommandPopup>) {
+    side.input.insert_str(&text);
+    sync_popup(popup, &side.input.buffer, PopupScope::Side);
+}
+
+/// 是否是一条「管理命令」（主会话的斜杠命令）。
+///
+/// 判据是**命令目录**而不是硬编码名单:主会话新增一条 `/foo` 时,旁支自动
+/// 把它当管理命令拒绝,而不需要有人记得来这里补一行。
+fn is_management_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_whitespace().next().unwrap_or("");
+    // `/help`、`/cost`、`/config` 同时存在于主目录与旁支本地命令里。它在这里
+    // 的语义是**旁支只读版本**（不读父费用、不改配置），所以必须先排除，
+    // 否则判定函数会说「这是管理命令」而分类器说「这是本地命令」——两处规则
+    // 一旦分歧，改哪一边都只是在赌当前的匹配顺序。
+    if crate::tui::side::SIDE_LOCAL_COMMANDS.contains(&name) {
+        return false;
+    }
+    // `/quit`、`/q` 也是主目录成员，但它们在旁支里是**应用退出**（spec §6.2
+    // 明确例外），归退出分支处理，不能被这条拒绝规则先拦下来。
+    if is_exit_command(text) {
+        return false;
+    }
+    !name.is_empty() && SlashCommand::from_name(name).is_some()
+}
+
+/// 管理命令在旁支里的拒绝文案。
+fn management_command_rejection(text: &str) -> String {
+    let name = text
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    format!("旁支只读：/{name} 只能在主会话使用（输入已保留）")
+}
+
+/// 是否为应用退出命令（`/quit`、`/q`）。
+///
+/// 主视图与旁支共用这一条：两处各写一份 `matches!` 迟早会出现「主视图能退出、
+/// 旁支把 `/q` 当成提问」的分歧。退出的承受者是整个应用，与当前可见哪个视图
+/// 无关。
+pub(crate) fn is_exit_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    matches!(
+        trimmed
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or(""),
+        "quit" | "q"
+    )
+}
+
+/// Submit whatever is in the visible side input, and put the text back when the
+/// input is refused.
+///
+/// `take_submitted()` consumes the buffer, so every refusal path must restore
+/// it. Otherwise a rejected management command (`/clear`) or a refused nested
+/// `/side` silently deletes what the user typed — the spec's rule is "拒绝不清稿".
+/// Local navigation is the exception: `text` is not restored after `/back` or
+/// `/side-close`, because the command has been consumed and re-entering a side
+/// must not leave a stale command sitting in the draft to be executed again.
+fn submit_side_draft(side: &mut SideSession, channels: &TuiChannels) -> KeyOutcome {
+    let text = side.input.take_submitted();
+    if text.trim().is_empty() {
+        return KeyOutcome::None;
+    }
+    // 退出命令必须在旁支分类**之前**处理。分类器只认旁支自己的三五个命令，
+    // 其余一律当问题——于是旁支里的 `/q` 会被当成一句话发给模型，而主视图里
+    // 同样的输入是退出（spec §6.2：/q、/quit 在旁问中也不能被当问题发送）。
+    if is_exit_command(&text) {
+        return KeyOutcome::Quit;
+    }
+    match classify_conversation_input(&text, true) {
+        Ok(RoutedInput::Side(SideInput::Back)) => {
+            side.views.back();
+            KeyOutcome::None
+        }
+        Ok(RoutedInput::Side(SideInput::Close)) => {
+            // 关闭命令本身即确认（原生 TUI 没有远端确认弹窗），所以要先返回，
+            // 再把返回**是否送达**说清楚。心跳帧只负责显示真正的终态。
+            let delivered = match channels.side.as_ref() {
+                Some(commands) => {
+                    let expected = side.active_turn_id.clone();
+                    commands
+                        .try_send(crate::side_driver::SideDriverCommand::Close {
+                            expected_active_turn_id: expected,
+                        })
+                        .is_ok()
+                }
+                None => false,
+            };
+            side.views.back();
+            if !delivered {
+                // 不能假报已关闭：本地返回仍然成立，但后台旁支还在跑。
+                side.notice =
+                    Some("已返回主视图，但旁问关闭未送达（旁问仍在后台运行，可再试）".to_string());
+            }
+            KeyOutcome::None
+        }
+        Ok(RoutedInput::Side(SideInput::Submit(body))) => {
+            // 分类器把所有「旁支不认识的 `/xxx`」也归到 Submit——它分不清那是
+            // 一句话还是被误用的管理命令。这一步必须自己判（spec W12）：
+            // `/clear`、`/model` 之类在旁支里**拒绝并保留原稿**，既不能执行
+            // （会改父会话），也不能当问题发给模型（模型会认真回答一个跟旁问
+            // 无关的斜杠串，同时用户以为命令生效了）。
+            if matches!(body.trim_start().strip_prefix('/'), Some(rest) if !rest.trim().is_empty())
+                && is_management_command(&body)
+            {
+                restore_rejected_side_draft(side, &text);
+                side.notice = Some(management_command_rejection(&body));
+                return KeyOutcome::None;
+            }
+            submit_side_question(side, channels, body);
+            KeyOutcome::None
+        }
+        Ok(RoutedInput::Side(SideInput::LocalCommand(name))) => {
+            side.notice = Some(side_local_command_text(side, &name));
+            KeyOutcome::None
+        }
+        Ok(RoutedInput::Side(SideInput::Open { .. })) => {
+            restore_rejected_side_draft(side, &text);
+            side.notice = Some("已经在旁支里了，不能再开一个旁支".to_string());
+            KeyOutcome::None
+        }
+        Ok(RoutedInput::Main(_)) => {
+            // 分类器在旁支内不会返回 Main;真发生了说明规则被改坏了。
+            restore_rejected_side_draft(side, &text);
+            side.notice = Some("旁支里只能提问或使用 /back、/side-close".to_string());
+            KeyOutcome::None
+        }
+        Err(error) => {
+            restore_rejected_side_draft(side, &text);
+            side.notice = Some(error.message);
+            KeyOutcome::None
+        }
+    }
+}
+
+/// 被拒的提交要把原文还给用户。
+///
+/// 只在输入行仍是空的时候写回：如果用户在等待期间已经开始敲新东西，覆盖它
+/// 等于把新稿丢掉。不承诺找回用户自己手动改掉的旧文字。
+fn restore_rejected_side_draft(side: &mut SideSession, text: &str) {
+    if side.input.buffer.is_empty() {
+        side.input.insert_str(text);
+    }
+}
+
+/// 旁支本地命令（`/cost`、`/config`、`/help`）的输出文案。
+fn side_local_command_text(side: &SideSession, name: &str) -> String {
+    match name {
+        "cost" => format_side_usage(side),
+        "config" => "旁支继承父会话的模型与推理档；只读，不能改配置".to_string(),
+        _ => {
+            // 工具白名单直接取自调度侧的同一份策略,不在这里另抄一遍:
+            // 两处各写一份,总有一天帮助里说能用的工具其实被拒。
+            let tools = crate::side_driver::allowed_side_tools().join("、");
+            format!(
+                "/back 返回主会话，/side-close 关闭旁支。\
+旁支可用工具（只读）：{tools}"
+            )
+        }
+    }
+}
+
+fn handle_side_key(
+    key: KeyEvent,
+    side: &mut SideSession,
+    channels: &TuiChannels,
+    popup: &mut Option<CommandPopup>,
+) -> KeyOutcome {
+    // 补全弹窗只吃自己那几个键。它读写的是**可见的**旁支输入行：候选按这一行
+    // 过滤，Tab 也写回这一行——显示的候选和真正会提交的正文因此不可能分叉
+    // （spec §6.1「不能显示候选却由另一套输入分支忽略」）。
+    if popup.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(p) = popup.as_mut() {
+                    p.move_up();
+                }
+                return KeyOutcome::None;
+            }
+            KeyCode::Down => {
+                if let Some(p) = popup.as_mut() {
+                    p.move_down();
+                }
+                return KeyOutcome::None;
+            }
+            KeyCode::Tab => {
+                // Tab 只补全文本，绝不提交：补全与执行是两个明确动作。
+                if let Some(p) = popup.as_ref()
+                    && let Some(completion) = p.selected()
+                {
+                    side.input.buffer = completion.insertion();
+                    side.input.cursor = side.input.buffer.len();
+                }
+                *popup = None;
+                return KeyOutcome::None;
+            }
+            KeyCode::Esc => {
+                // Esc 先关补全（退出优先级），不停止旁支轮次。
+                *popup = None;
+                return KeyOutcome::None;
+            }
+            KeyCode::Enter => {
+                // 确认候选 = 把候选文本写进输入行，然后走与手打完全相同的提交
+                // 路径。这样「补全后回车」绝不会长成第三种语义。
+                if let Some(p) = popup.as_ref()
+                    && let Some(completion) = p.selected()
+                {
+                    side.input.buffer = completion.insertion();
+                    side.input.cursor = side.input.buffer.len();
+                }
+                *popup = None;
+                return submit_side_draft(side, channels);
+            }
+            _ => {}
+        }
+    } else if key.code == KeyCode::Tab {
+        // 没有候选时 Tab 不该被当成正文插进草稿。
+        return KeyOutcome::None;
+    }
+
     // 应用级退出在任何视图都必须可达,且不被字符输入吞掉。
     match key.code {
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3029,65 +3284,7 @@ fn handle_side_key(key: KeyEvent, side: &mut SideSession, channels: &TuiChannels
     }
 
     match side.input.handle_key(key) {
-        InputAction::Submit => {
-            let text = side.input.take_submitted();
-            if text.trim().is_empty() {
-                return KeyOutcome::None;
-            }
-            match classify_conversation_input(&text, true) {
-                Ok(RoutedInput::Side(SideInput::Back)) => {
-                    side.views.back();
-                    KeyOutcome::None
-                }
-                Ok(RoutedInput::Side(SideInput::Close)) => {
-                    if let Some(commands) = channels.side.as_ref() {
-                        let expected = side.active_turn_id.clone();
-                        let _ = commands.try_send(crate::side_driver::SideDriverCommand::Close {
-                            expected_active_turn_id: expected,
-                        });
-                    }
-                    // spec §4.1：旁支里的 `/side-close` 是「取消并关闭，返回父视图」。
-                    // 返回必须当场发生，不能等 `SideClosed` 帧——用户已经关掉了旁支，
-                    // 却还被留在那个视图里，正是最不该出现的位置。终态帧随后只负责
-                    // 把关闭原因显示出来（`apply_event` 已把它写进 notice）。
-                    side.views.back();
-                    KeyOutcome::None
-                }
-                Ok(RoutedInput::Side(SideInput::Submit(question))) => {
-                    submit_side_question(side, channels, question);
-                    KeyOutcome::None
-                }
-                Ok(RoutedInput::Side(SideInput::LocalCommand(name))) => {
-                    side.notice = Some(match name.as_str() {
-                        "cost" => format_side_usage(side),
-                        "config" => "旁支继承父会话的模型与推理档；只读，不能改配置".to_string(),
-                        _ => {
-                            // 工具白名单直接取自调度侧的同一份策略,不在这里另抄一遍:
-                            // 两处各写一份,总有一天帮助里说能用的工具其实被拒。
-                            let tools = crate::side_driver::allowed_side_tools().join("、");
-                            format!(
-                                "/back 返回主会话，/side-close 关闭旁支。\
-旁支可用工具（只读）：{tools}"
-                            )
-                        }
-                    });
-                    KeyOutcome::None
-                }
-                Ok(RoutedInput::Side(SideInput::Open { .. })) => {
-                    side.notice = Some("已经在旁支里了，不能再开一个旁支".to_string());
-                    KeyOutcome::None
-                }
-                Ok(RoutedInput::Main(_)) => {
-                    // 分类器在旁支内不会返回 Main;真发生了说明规则被改坏了。
-                    side.notice = Some("旁支里只能提问或使用 /back、/side-close".to_string());
-                    KeyOutcome::None
-                }
-                Err(error) => {
-                    side.notice = Some(error.message);
-                    KeyOutcome::None
-                }
-            }
-        }
+        InputAction::Submit => submit_side_draft(side, channels),
         InputAction::Consumed | InputAction::NotHandled => KeyOutcome::None,
     }
 }
@@ -3205,7 +3402,7 @@ fn exec_approval_command(
         .to_string();
 
     // 退出类：与主视图一致。
-    if matches!(name.as_str(), "quit" | "q") && trimmed.starts_with('/') {
+    if is_exit_command(trimmed) {
         return KeyOutcome::Quit;
     }
 
@@ -3505,9 +3702,14 @@ fn handle_key(key: KeyEvent, ctx: &mut KeyContext<'_>) -> KeyOutcome {
                 return KeyOutcome::None;
             }
             KeyCode::Enter => {
-                // Execute the selected command
+                // Execute the selected command. The popup now yields a
+                // `Completion`; resolve it back through `from_name` so the
+                // executed command is exactly the one that was drawn.
                 if let Some(p) = ctx.view.popup.as_ref() {
-                    if let Some(cmd) = p.selected() {
+                    let selected = p
+                        .selected()
+                        .and_then(|completion| SlashCommand::from_name(completion.name()));
+                    if let Some(cmd) = selected {
                         // Check if buffer has args (text after command name)
                         let buffer = &ctx.view.input.buffer;
                         let cmd_full = format!("/{}", cmd.name());
@@ -3752,13 +3954,18 @@ fn handle_paste(
 
     input.insert_str(&text);
     *pending_quit = false;
-    sync_popup(popup, &input.buffer);
+    sync_popup(popup, &input.buffer, PopupScope::Main);
 }
 
 /// Synchronize popup state with the current input buffer.
 /// Shows popup when buffer starts with '/' and cursor is in command name region.
 /// Hides popup otherwise.
-fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
+fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str, scope: PopupScope) {
+    // 切视图后旧候选必须作废：候选是按视图生成的，留着上一份就等于「显示的
+    // 候选来自另一个输入分支」。`scope()` 不同就直接重建。
+    if popup.as_ref().is_some_and(|p| p.scope() != scope) {
+        *popup = None;
+    }
     if let Some(filter_text) = buffer.strip_prefix('/') {
         // Check if we're still in the command name region (no space yet)
         let in_name_region = !buffer.contains(' ');
@@ -3766,7 +3973,7 @@ fn sync_popup(popup: &mut Option<CommandPopup>, buffer: &str) {
             if let Some(p) = popup.as_mut() {
                 p.filter(filter_text);
             } else {
-                let mut p = CommandPopup::new();
+                let mut p = CommandPopup::with_scope(scope);
                 p.filter(filter_text);
                 *popup = Some(p);
             }
@@ -4944,13 +5151,11 @@ fn build_popup_with<'a>(popup: &'a CommandPopup, height: u16, theme: TuiTheme) -
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
-            let name = format!(
-                "/{}{}",
-                cmd.name(),
-                cmd.argument_usage()
-                    .map(|usage| format!(" {usage}"))
-                    .unwrap_or_default()
-            );
+            let arguments = SlashCommand::from_name(cmd.name())
+                .and_then(|resolved| resolved.argument_usage())
+                .map(|usage| format!(" {usage}"))
+                .unwrap_or_default();
+            let name = format!("/{}{}", cmd.name(), arguments);
             let desc = cmd.description();
             let is_selected = window_start + i == popup.selected_index();
             let style = if is_selected {
@@ -7427,7 +7632,6 @@ mod tests {
     /// 这些键确实进了旁支（否则「没批准」可能只是「键被吞了」）。
     #[test]
     fn parent_approval_cannot_be_answered_from_side() {
-        use yi_agent_runtime::side_conversation::SideStatus;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
@@ -7456,7 +7660,9 @@ mod tests {
                     generation: 1,
                 },
                 turn_id: None,
-                event: crate::tui::side::ConversationPayload::SideStatus(SideStatus::Idle),
+                event: crate::tui::side::ConversationPayload::SideStatus(
+                    yi_agent_runtime::side_conversation::SideStatus::Idle,
+                ),
             })
             .unwrap();
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -7622,25 +7828,32 @@ mod tests {
         );
         channels.side = Some(side_cmd_tx);
 
-        // 复刻 `handle_side_key` 对 `/side-close` 的处理。
-        let outcome = handle_side_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut side,
-            &channels,
-        );
-        // 先把命令敲进旁支输入行，再回车。
-        assert!(matches!(outcome, KeyOutcome::None));
+        // 复刻 `handle_side_key` 对 `/side-close` 的处理：先把命令敲进旁支
+        // 输入行，再回车。（空行上的 Enter 什么也不做，不能当作前置动作。）
+        let mut popup = None;
+        assert!(matches!(
+            handle_side_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut side,
+                &channels,
+                &mut popup,
+            ),
+            KeyOutcome::None
+        ));
+        assert!(side.input.buffer.is_empty(), "空输入行回车不该产生任何正文");
         for ch in "/side-close".chars() {
             handle_side_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
                 &mut side,
                 &channels,
+                &mut popup,
             );
         }
         handle_side_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut side,
             &channels,
+            &mut popup,
         );
 
         assert!(
@@ -7692,7 +7905,9 @@ mod tests {
                     generation: 2,
                 },
                 turn_id: None,
-                event: crate::tui::side::ConversationPayload::SideStatus(SideStatus::Idle),
+                event: crate::tui::side::ConversationPayload::SideStatus(
+                    yi_agent_runtime::side_conversation::SideStatus::Idle,
+                ),
             },
             80,
         );
@@ -7727,6 +7942,265 @@ mod tests {
     /// 这是整个旁支设计最不能退化的一条：一旦漏进去，旁问就会被持久化、
     /// 被 resume 回放，父任务的历史被污染。测试用真实 `TuiSessionStore` +
     /// 真实 `TurnLog`，把主/旁事件同时喂进同一个 TUI 循环，然后直接读盘断言。
+    /// 完整事件循环：旁支里粘贴 `/back` + Enter 必须回到主视图，父草稿一字不动。
+    ///
+    /// 只调 `handle_side_key` 证不了路由：真实复现的故障在**循环**里——`Paste`
+    /// 曾经无条件交给父 `handle_paste`，于是旁支里的粘贴写进父草稿、还会被
+    /// 父的待审批守卫整条丢掉，用户按了回车却发现什么也没发生。这里跑真循环。
+    #[allow(clippy::too_many_arguments)]
+    fn side_repair_run_loop_with(
+        delivered_in_order: Vec<Event>,
+        parent_agent_events: Vec<AgentEvent>,
+        decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+        side_cmd_tx: tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        side_events: tokio::sync::mpsc::Receiver<crate::tui::side::ConversationEvent>,
+        parent_draft: &str,
+    ) -> (String, InputLine) {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        for event in parent_agent_events {
+            agent_tx.try_send(event).unwrap();
+        }
+        drop(agent_tx);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // `poll` 从尾部弹出，所以交付顺序要反过来存。
+        let mut events = delivered_in_order;
+        events.reverse();
+        let events = ScriptedEvents {
+            events: Rc::new(RefCell::new(events)),
+        };
+
+        let project = tempfile::TempDir::new().unwrap();
+        let mut input = InputLine::new();
+        input.insert_str(parent_draft);
+        let mut title = crate::tui::title::TitleHandle::disabled();
+
+        run_loop_with_side(
+            &mut terminal,
+            &mut agent_rx,
+            &mut HistoryState::new(),
+            &mut input,
+            TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            ),
+            &is_running,
+            &events,
+            "test-model",
+            None,
+            None,
+            yi_agent_tools::ProcessManager::new(project.path().to_path_buf()),
+            project.path().to_path_buf(),
+            yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            &catalog_for_tests(),
+            TuiTheme::DARK,
+            &mut title,
+            crate::tui::app::SideRuntime::new(side_cmd_tx, side_events),
+        )
+        .unwrap();
+
+        (frame_text(&terminal), input)
+    }
+
+    fn side_repair_status_frame() -> crate::tui::side::ConversationEvent {
+        crate::tui::side::ConversationEvent {
+            target: crate::tui::side::ConversationTarget::Side {
+                side_id: "side-1".into(),
+                generation: 1,
+            },
+            turn_id: None,
+            event: crate::tui::side::ConversationPayload::SideStatus(
+                yi_agent_runtime::side_conversation::SideStatus::Idle,
+            ),
+        }
+    }
+
+    #[test]
+    fn side_repair_paste_back_through_the_loop_returns_to_main_and_keeps_the_parent_draft() {
+        const PARENT_DRAFT: &str = "PARENT-DRAFT";
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(8);
+        side_tx.try_send(side_repair_status_frame()).unwrap();
+        drop(side_tx);
+        let _ = (&input_tx, &interrupt_tx, &kill_tx, &control_tx);
+
+        let (screen, input) = side_repair_run_loop_with(
+            vec![
+                Event::Paste("/back".into()),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            ],
+            Vec::new(),
+            decision_tx,
+            side_cmd_tx,
+            side_rx,
+            PARENT_DRAFT,
+        );
+
+        assert_eq!(
+            input.buffer, PARENT_DRAFT,
+            "旁支里的粘贴绝不能改动父会话草稿"
+        );
+        assert!(
+            !screen.contains("旁问（只读）"),
+            "回车之后必须已经回到主视图，实际屏幕:\n{screen}"
+        );
+        // 「主视图」的判据是旁支提示条消失、父草稿回到输入行。状态栏里的
+        // `/side` 标签属于 Task 10，不能在这里顺带要求，否则这条用例会因为
+        // 另一个任务的缺口而红——红的位置必须指向真正的原因。
+        assert!(
+            screen.contains(PARENT_DRAFT),
+            "回到主视图后父草稿应可见，实际屏幕:\n{screen}"
+        );
+        assert!(
+            interrupt_rx.try_recv().is_err(),
+            "返回视图不是停止轮次：不该打父 interrupt"
+        );
+        while let Ok(command) = side_cmd_rx.try_recv() {
+            assert!(
+                !matches!(
+                    command,
+                    crate::side_driver::SideDriverCommand::Interrupt { .. }
+                        | crate::side_driver::SideDriverCommand::Close { .. }
+                ),
+                "粘贴 /back 不该发出 Interrupt/Close，实际: {command:?}"
+            );
+        }
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "旁支按键绝不能替父会话作出裁决"
+        );
+    }
+
+    /// 父审批挂起时，旁支里的粘贴与回车仍然不被父审批守卫吞掉。
+    #[test]
+    fn side_repair_paste_back_survives_a_parent_approval_through_the_loop() {
+        const PARENT_DRAFT: &str = "PARENT-DRAFT";
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, mut decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(8);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(8);
+        // 第一帧先把视图切进旁支，此时父会话那边还挂着一个审批请求。
+        side_tx.try_send(side_repair_status_frame()).unwrap();
+        drop(side_tx);
+        let _ = (&input_tx, &interrupt_tx, &kill_tx, &control_tx);
+
+        let (screen, input) = side_repair_run_loop_with(
+            vec![
+                Event::Paste("/back".into()),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            ],
+            vec![AgentEvent::PermissionRequest {
+                request_id: 7,
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                prefix_suggestion: None,
+                kind: yi_agent_core::permission::PermissionKind::Normal,
+            }],
+            decision_tx,
+            side_cmd_tx,
+            side_rx,
+            PARENT_DRAFT,
+        );
+
+        assert_eq!(input.buffer, PARENT_DRAFT, "父草稿必须原样保留");
+        assert!(
+            !screen.is_empty(),
+            "循环必须真的画过帧（否则断言的是空屏幕）"
+        );
+        assert!(
+            decision_rx.try_recv().is_err(),
+            "旁支里的回车不能替父会话批准工具调用"
+        );
+        while let Ok(command) = side_cmd_rx.try_recv() {
+            assert!(
+                !matches!(
+                    command,
+                    crate::side_driver::SideDriverCommand::Interrupt { .. }
+                        | crate::side_driver::SideDriverCommand::Close { .. }
+                ),
+                "不该发出 Interrupt/Close，实际: {command:?}"
+            );
+        }
+    }
+
+    /// 循环里逐字符 `/back` 与 Tab 补全后回车都必须真的回到主视图。
+    #[test]
+    fn side_repair_typed_and_completed_back_work_through_the_loop() {
+        for keys in [
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ],
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ],
+        ] {
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+            let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+            let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+            let (decision_tx, mut decision_rx) =
+                tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+            let (side_cmd_tx, _side_cmd_rx) =
+                tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+            let (side_tx, side_rx) = tokio::sync::mpsc::channel(8);
+            side_tx.try_send(side_repair_status_frame()).unwrap();
+            drop(side_tx);
+            let _ = (&input_tx, &interrupt_tx, &kill_tx, &control_tx);
+
+            let mut delivered = keys;
+            delivered.push(Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            )));
+            let (screen, _input) = side_repair_run_loop_with(
+                delivered,
+                Vec::new(),
+                decision_tx,
+                side_cmd_tx,
+                side_rx,
+                "PARENT-DRAFT",
+            );
+
+            assert!(
+                !screen.contains("旁问（只读）"),
+                "手打或补全的 /back 都要真的回到主视图，实际屏幕:\n{screen}"
+            );
+            assert!(decision_rx.try_recv().is_err());
+        }
+    }
+
     #[test]
     fn side_events_never_reach_main_turn_log() {
         let project = tempfile::TempDir::new().unwrap();
@@ -9113,8 +9587,8 @@ mod tests {
         assert_eq!(input.buffer, "/cl");
         assert!(!pending_quit);
         assert_eq!(
-            popup.and_then(|popup| popup.selected()),
-            Some(SlashCommand::Clear)
+            popup.and_then(|popup| popup.selected()).map(|c| c.name()),
+            Some("clear")
         );
     }
 
@@ -13881,6 +14355,367 @@ mod notification_tests {
 
         apply_focus_event(&Event::FocusGained, &focused);
         assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // --- 可见输入 / Paste / 补全（计划 Task 8） -------------------------------
+
+    /// 构造一套真实的 TUI 通道，返回它们与需要断言的接收端。
+    struct SideRepairHarness {
+        input: InputLine,
+        channels: TuiChannels,
+        input_rx: tokio::sync::mpsc::Receiver<String>,
+        interrupt_rx: tokio::sync::mpsc::Receiver<()>,
+        side_cmd_rx: tokio::sync::mpsc::Receiver<crate::side_driver::SideDriverCommand>,
+        decision_rx: tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
+        _input_tx: tokio::sync::mpsc::Sender<String>,
+        _interrupt_tx: tokio::sync::mpsc::Sender<()>,
+        _kill_tx: tokio::sync::mpsc::Sender<String>,
+        _control_tx: tokio::sync::mpsc::Sender<crate::DriverControl>,
+        _decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+        _side_cmd_tx: tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+    }
+
+    fn side_repair_harness() -> SideRepairHarness {
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
+        let (side_cmd_tx, side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let mut channels = TuiChannels::from_senders(
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+        );
+        channels.side = Some(side_cmd_tx.clone());
+        SideRepairHarness {
+            input: InputLine::new(),
+            channels,
+            input_rx,
+            interrupt_rx,
+            side_cmd_rx,
+            decision_rx,
+            _input_tx: input_tx,
+            _interrupt_tx: interrupt_tx,
+            _kill_tx: kill_tx,
+            _control_tx: control_tx,
+            _decision_tx: decision_tx,
+            _side_cmd_tx: side_cmd_tx,
+        }
+    }
+
+    fn type_into_side(side: &mut SideSession, channels: &TuiChannels, text: &str) {
+        let mut popup = None;
+        for ch in text.chars() {
+            handle_side_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                side,
+                channels,
+                &mut popup,
+            );
+        }
+    }
+
+    fn press_side(side: &mut SideSession, channels: &TuiChannels, code: KeyCode) -> KeyOutcome {
+        let mut popup = None;
+        handle_side_key(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            side,
+            channels,
+            &mut popup,
+        )
+    }
+
+    /// 旁支里粘贴只改可见草稿，绝不自动执行，也不碰父输入。
+    #[test]
+    fn side_repair_paste_stays_in_the_visible_side_draft() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        h.input.buffer = "PARENT_DRAFT".into();
+        h.input.cursor = h.input.buffer.len();
+
+        let mut popup = None;
+        handle_side_paste("/back".to_string(), &mut side, &mut popup);
+
+        assert_eq!(side.input.buffer, "/back");
+        assert_eq!(
+            h.input.buffer, "PARENT_DRAFT",
+            "旁支粘贴绝不能写进父会话草稿"
+        );
+        assert!(
+            side.in_side(),
+            "粘贴只插入字节，不执行命令，视图不能因此切走"
+        );
+        assert!(h.side_cmd_rx.try_recv().is_err(), "粘贴不该发任何旁支命令");
+        assert!(h.input_rx.try_recv().is_err(), "粘贴不该发父会话消息");
+    }
+
+    /// 粘贴进来的 `/back` 仍需一次 Enter，且只返回视图，不发 Close。
+    #[test]
+    fn side_repair_pasted_back_needs_enter_and_sends_no_close() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+
+        let mut popup = None;
+        handle_side_paste("/back".to_string(), &mut side, &mut popup);
+        assert!(side.in_side());
+
+        let outcome = press_side(&mut side, &h.channels, KeyCode::Enter);
+        assert!(matches!(outcome, KeyOutcome::None));
+        assert!(!side.in_side(), "回车之后才返回主视图");
+        assert!(
+            h.side_cmd_rx.try_recv().is_err(),
+            "返回视图不是关闭旁支：不该发 Close"
+        );
+        assert!(h.interrupt_rx.try_recv().is_err());
+        assert!(h.decision_rx.try_recv().is_err());
+    }
+
+    /// 逐字符敲 `/back` 与粘贴走同一条提交路径。
+    #[test]
+    fn side_repair_typed_back_matches_the_pasted_one() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+
+        type_into_side(&mut side, &h.channels, "/back");
+        let outcome = press_side(&mut side, &h.channels, KeyCode::Enter);
+        assert!(matches!(outcome, KeyOutcome::None));
+        assert!(!side.in_side());
+        assert!(h.side_cmd_rx.try_recv().is_err());
+    }
+
+    /// 补全弹窗只列旁支真正接受的命令，且读写同一份可见输入。
+    #[test]
+    fn side_repair_completion_offers_only_executable_side_commands() {
+        let popup = crate::tui::slash::CommandPopup::with_scope(PopupScope::Side);
+        let names: Vec<&str> = popup.visible(20).iter().map(|c| c.name()).collect();
+        assert_eq!(
+            names,
+            vec!["back", "side-close", "help", "config", "cost", "quit", "q"],
+            "旁支候选必须恰好是分类器接受的那些命令"
+        );
+        for name in &names {
+            assert!(
+                matches!(
+                    classify_conversation_input(&format!("/{name}"), true),
+                    Ok(RoutedInput::Side(_))
+                ),
+                "候选 /{name} 必须能被旁支执行，否则就是「显示了却忽略」"
+            );
+            assert!(
+                !is_management_command(&format!("/{name}")),
+                "/{name} 不能被当成管理命令拒绝"
+            );
+        }
+        // 主会话的管理命令绝不能出现在旁支候选里。
+        for hidden in ["clear", "model", "compact", "runtime", "plugins"] {
+            assert!(!names.contains(&hidden), "旁支候选不该列出 /{hidden}");
+        }
+    }
+
+    /// Tab 只补全文本，Enter 才执行，且两者都基于可见输入缓冲。
+    #[test]
+    fn side_repair_tab_completes_then_enter_executes() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+
+        let mut popup = None;
+        for ch in "/si".chars() {
+            handle_side_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut side,
+                &h.channels,
+                &mut popup,
+            );
+            sync_popup(&mut popup, &side.input.buffer, PopupScope::Side);
+        }
+        assert_eq!(
+            popup.as_ref().and_then(|p| p.selected()).map(|c| c.name()),
+            Some("side-close"),
+            "旁支输入 /si 时弹窗应直接选中唯一匹配项"
+        );
+        // 多按一次 Down 会落到 `q`，这里保持第一项，模拟用户直接 Tab。
+        handle_side_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut side,
+            &h.channels,
+            &mut popup,
+        );
+        assert_eq!(side.input.buffer, "/side-close", "Tab 写入可见输入行");
+        assert!(popup.is_none(), "补全之后弹窗关闭");
+        assert!(h.side_cmd_rx.try_recv().is_err(), "Tab 只补全，绝不能提交");
+        assert!(side.in_side(), "Tab 不该切视图");
+
+        let outcome = press_side(&mut side, &h.channels, KeyCode::Enter);
+        assert!(matches!(outcome, KeyOutcome::None));
+        assert!(!side.in_side(), "Enter 执行 /side-close 后回到主视图");
+        assert!(
+            matches!(
+                h.side_cmd_rx.try_recv(),
+                Ok(crate::side_driver::SideDriverCommand::Close { .. })
+            ),
+            "完整的 /side-close 一次 Enter 就该发出 Close"
+        );
+    }
+
+    /// 没有候选时 Tab 不能被当作正文插进草稿。
+    #[test]
+    fn side_repair_tab_without_popup_does_not_edit_the_draft() {
+        let h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        type_into_side(&mut side, &h.channels, "hello");
+
+        press_side(&mut side, &h.channels, KeyCode::Tab);
+        assert_eq!(side.input.buffer, "hello");
+    }
+
+    /// Esc 先关补全，不能被解释为停止旁支轮次。
+    #[test]
+    fn side_repair_esc_closes_the_popup_before_stopping() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        side.active_turn_id = Some("turn-1".into());
+        side.views.side.as_mut().unwrap().running = true;
+
+        let mut popup = None;
+        for ch in "/ba".chars() {
+            handle_side_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut side,
+                &h.channels,
+                &mut popup,
+            );
+            sync_popup(&mut popup, &side.input.buffer, PopupScope::Side);
+        }
+        assert!(popup.is_some());
+
+        handle_side_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut side,
+            &h.channels,
+            &mut popup,
+        );
+        assert!(popup.is_none(), "Esc 的第一职责是关掉补全");
+        assert!(
+            h.side_cmd_rx.try_recv().is_err(),
+            "关补全不能顺带停掉旁支轮次"
+        );
+        assert_eq!(side.input.buffer, "/ba", "Esc 不该吃掉已经敲下的文本");
+    }
+
+    /// 管理命令在旁支里拒绝并保留原稿，绝不投给模型。
+    #[test]
+    fn side_repair_management_commands_are_refused_without_clearing_the_draft() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+
+        type_into_side(&mut side, &h.channels, "/clear");
+        press_side(&mut side, &h.channels, KeyCode::Enter);
+
+        assert_eq!(
+            side.input.buffer, "/clear",
+            "被拒的管理命令必须把原文还给用户"
+        );
+        assert!(
+            h.side_cmd_rx.try_recv().is_err(),
+            "管理命令既不能执行，也不能当问题发给模型"
+        );
+        let notice = side.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("clear") && notice.contains("主会话"),
+            "拒绝必须说明原因，实际: {notice}"
+        );
+    }
+
+    /// 嵌套 `/side` 被拒时同样保留原稿。
+    #[test]
+    fn side_repair_nested_side_is_refused_without_clearing_the_draft() {
+        let mut h = side_repair_harness();
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+
+        type_into_side(&mut side, &h.channels, "/side 另一个问题");
+        press_side(&mut side, &h.channels, KeyCode::Enter);
+
+        assert_eq!(side.input.buffer, "/side 另一个问题");
+        assert!(h.side_cmd_rx.try_recv().is_err());
+    }
+
+    /// 旁支里的 `/q`、`/quit` 是应用退出，不能被当作问题发给模型。
+    #[test]
+    fn side_repair_exit_commands_quit_instead_of_reaching_the_model() {
+        for command in ["/q", "/quit"] {
+            let mut h = side_repair_harness();
+            let mut side = SideSession::new(TuiTheme::DARK);
+            side.views.open("side-1".into(), 1);
+
+            type_into_side(&mut side, &h.channels, command);
+            let outcome = press_side(&mut side, &h.channels, KeyCode::Enter);
+            assert!(
+                matches!(outcome, KeyOutcome::Quit),
+                "{command} 在旁支里也必须退出应用"
+            );
+            assert!(
+                h.side_cmd_rx.try_recv().is_err(),
+                "{command} 不能被当成旁支提问"
+            );
+        }
+    }
+
+    /// 提交时通道已满：命令照常返回视图，但失败必须可见，且不能谎报已关闭。
+    #[test]
+    fn side_repair_close_reports_an_undelivered_command() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, mut side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(1);
+        // 预先填满容量 1 的旁支命令通道，让随后的 try_send 必然失败。
+        side_cmd_tx
+            .try_send(crate::side_driver::SideDriverCommand::Interrupt {
+                turn_id: "occupied".into(),
+            })
+            .unwrap();
+        let mut channels = TuiChannels::from_senders(
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &decision_tx,
+        );
+        channels.side = Some(side_cmd_tx);
+
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        type_into_side(&mut side, &channels, "/side-close");
+        let outcome = press_side(&mut side, &channels, KeyCode::Enter);
+
+        assert!(matches!(outcome, KeyOutcome::None), "命令不能被卡住");
+        assert!(!side.in_side(), "本地返回不等后台通道");
+        let notice = side.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("未送达"),
+            "关闭未送达必须显式可见，实际: {notice}"
+        );
+        assert!(
+            side.active_side().unwrap().closed.is_none(),
+            "未送达不能标记为已关闭"
+        );
+        assert!(side_cmd_rx.try_recv().is_ok(), "只应有那一条占位命令");
     }
 
     #[test]
