@@ -248,7 +248,7 @@ spec 与 plan：`docs/superpowers/specs/2026-11-05-side-conversation-repair-desi
 
 ```bash
 (cd desktop && npx tsc --noEmit && npx vitest run)     # 159 files / 2226 tests passed
-(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 710 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 712 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_)       # 21 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_driver)        # 9 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log)
@@ -265,7 +265,9 @@ git diff --check                                        # 无输出
 
 ### 5.3 W/T 覆盖
 
-自动侧覆盖（测试全名见 plan Task 8–10 证据）：
+自动侧覆盖（测试全名见 plan Task 8–10 证据）。补充两条自查用例：
+`side_heartbeat_does_not_erase_a_close_delivery_failure`（心跳不得擦掉「关闭未送达」）、
+`side_label_never_overflows_on_a_very_narrow_bar`（0/1/2/5/10/20 列不 panic 不溢出）。
 
 | 验收 ID | 自动证据 | 真机/真实 PTY |
 | --- | --- | --- |

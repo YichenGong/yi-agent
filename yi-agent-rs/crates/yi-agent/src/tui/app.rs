@@ -805,8 +805,12 @@ impl SideSession {
                 if effect == SideFrameEffect::Redraw && !self.side_running() =>
             {
                 self.active_turn_id = None;
-                // 旁支又能正常出帧了：之前那条「投递失败/已退出」已经过时。
-                self.clear_main_operation_notice(None, &event.target);
+                // **不**清 `main_notice`。
+                //
+                // 一条状态心跳说明这个旁支还活着——也就是说「关闭未送达、
+                // 旁问仍在后台运行」这句话**依然成立**。在这里清掉，用户只会
+                // 看到提示闪一帧就消失，等于没提示。清理只有两处：
+                // 真正收到 `SideClosed`，或用户重新发出了关闭命令。
             }
             _ => {}
         }
@@ -1555,13 +1559,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 // 一遇到打开的 popup 就整键消费。
                 let visible_target =
                     visible_side_target(&side_session).unwrap_or(ConversationTarget::Main);
-                match decide_exit_key(
-                    key,
-                    &visible_target,
-                    is_running.load(std::sync::atomic::Ordering::SeqCst),
-                    side_session.side_running(),
-                    &mut loop_bk.pending_quit,
-                ) {
+                match decide_exit_key(key, &mut loop_bk.pending_quit) {
                     ExitKeyVerdict::Quit => break,
                     ExitKeyVerdict::ArmConfirm => {
                         // 第一次 Ctrl+C：确认态已置位，并且只停**可见**会话。
@@ -2866,21 +2864,15 @@ enum ExitKeyVerdict {
 ///
 /// 规则（spec §6.2）：
 /// - Ctrl+Q 永远退出，任何视图、任何弹窗、任何审批态。
-/// - Ctrl+C 第一次只「确认」，第二次才退出；第一次同时按**可见会话**分派
-///   停止（主会话跑着就停主会话，旁支跑着就停旁支），两处都不跑时不动任何
-///   东西。
+/// - Ctrl+C 第一次只「确认」，第二次才退出。第一次的「停可见会话」由调用方
+///   在 `ArmConfirm` 分支完成（主会话跑着就停主会话，旁支跑着就停旁支，
+///   两处都不跑时不动任何东西）。
 /// - `/q`、`/quit` 归各视图的提交路径处理（旁支那边见 `submit_side_draft`），
 ///   这里只管按键。
 ///
 /// 只维护 `pending_quit` **一个**状态：主视图与旁支各存一份，切视图后就会
 /// 出现「旁支里按过 Ctrl+C，回主会话按一次就退出」这种莫名其妙的行为。
-fn decide_exit_key(
-    key: KeyEvent,
-    visible: &ConversationTarget,
-    main_running: bool,
-    side_running: bool,
-    pending_quit: &mut bool,
-) -> ExitKeyVerdict {
+fn decide_exit_key(key: KeyEvent, pending_quit: &mut bool) -> ExitKeyVerdict {
     if matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         return ExitKeyVerdict::Quit;
     }
@@ -2891,10 +2883,9 @@ fn decide_exit_key(
         return ExitKeyVerdict::Quit;
     }
     *pending_quit = true;
-    // 第一次 Ctrl+C 的第二个作用：停住用户正在看的那个会话。停错会话比不停
-    // 更糟——在旁支里按 Ctrl+C 却把父会话的中途任务打断，是这一轮修复要消灭
-    // 的典型故障。
-    let _ = crate::tui::side::visible_stop_target(visible, main_running, side_running);
+    // 停哪个会话不在这里决定：这个函数不碰通道，调用方在 `ArmConfirm` 分支
+    // 调 `stop_visible_conversation`。**不要**在这里顺手算一次
+    // `visible_stop_target` 再丢掉——那会让读者以为停止已经发出去了。
     ExitKeyVerdict::ArmConfirm
 }
 
@@ -3184,13 +3175,21 @@ fn execute_side_command_in_main(
                 match send_side_command(
                     channels,
                     crate::side_driver::SideDriverCommand::Close {
-                        expected_target: target,
+                        expected_target: target.clone(),
                         expected_active_turn_id: side.active_turn_id.clone(),
                     },
                     SideOperation::Close,
                 ) {
-                    Ok(()) => notice(history, "正在关闭旁问…".to_string()),
-                    Err(message) => notice(history, message),
+                    Ok(()) => {
+                        // 重新受理了关闭请求：上一次「未送达」已经不适用，
+                        // 现在的状态是「正在关」。不清就会同时说两句互相矛盾
+                        // 的话。只清同目标、同操作的提示，免得顺手擦掉别的。
+                        side.clear_main_operation_notice(Some(SideOperation::Close), &target);
+                        notice(history, "正在关闭旁问…".to_string())
+                    }
+                    Err(message) => {
+                        side.main_notice = Some((SideOperation::Close, target, message))
+                    }
                 }
             }
         },
@@ -15539,6 +15538,59 @@ mod notification_tests {
                 "{command} 不能被当成旁支提问"
             );
         }
+    }
+
+    /// 关闭没送达之后，旁支的心跳**不能**把这条提示擦掉。
+    ///
+    /// 心跳恰恰证明「它还在跑」，也就是证明那句话仍然成立。若在每个
+    /// `SideStatus` 上都清 `main_notice`，用户只会看到提示闪一帧就消失，
+    /// 正是这一轮要消灭的「按了没反应」。只有真正关闭成功或重新受理关闭
+    /// 命令，才有资格清它。
+    #[test]
+    fn side_heartbeat_does_not_erase_a_close_delivery_failure() {
+        let mut side = SideSession::new(TuiTheme::DARK);
+        let target = ConversationTarget::Side {
+            side_id: "side-1".into(),
+            generation: 1,
+        };
+        side.views.open("side-1".into(), 1);
+        side.main_notice = Some((
+            SideOperation::Close,
+            target.clone(),
+            "已返回主视图，但旁问关闭未送达".into(),
+        ));
+
+        // 同一条旁支的普通状态心跳（它还在跑 → 确实没关掉）。
+        side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target: target.clone(),
+                turn_id: None,
+                event: ConversationPayload::SideStatus(
+                    yi_agent_runtime::side_conversation::SideStatus::Idle,
+                ),
+            },
+            80,
+        );
+        assert!(
+            side.main_operation_notice().is_some(),
+            "心跳不能擦掉关闭未送达的提示"
+        );
+
+        // 真正关闭成功后必须清掉。
+        side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target,
+                turn_id: None,
+                event: ConversationPayload::SideClosed(
+                    yi_agent_runtime::side_conversation::CloseReason::UserClosed,
+                ),
+            },
+            80,
+        );
+        assert!(
+            side.main_operation_notice().is_none(),
+            "关闭成功之后提示必须消失"
+        );
     }
 
     /// 旧代的失败帧不能写进新旁支的可见状态。

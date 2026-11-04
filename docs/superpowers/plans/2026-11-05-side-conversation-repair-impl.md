@@ -439,6 +439,20 @@ assert!(side_rx.try_recv().is_ok());
   `stale_interrupt_does_not_stop_the_live_turn`（空 turn_id 也不能误停）、
   `failed_open_reports_a_main_target_error`（无 runner 时发 Main 目标错误）
 
+自查又发现并修掉一处（评审前的自我审查）：
+
+- **旁支心跳会擦掉「关闭未送达」。** 原来每个 `SideStatus` 都会 `clear_main_operation_notice`，
+  可一条心跳恰恰证明那个旁支还活着，也就是证明「没关掉」这句话仍然成立。
+  用户会看到提示闪一帧就消失。现在清理只有两处：真正收到 `SideClosed`，或用户
+  重新发出关闭命令（`execute_side_command_in_main` 的成功分支按 operation+target
+  精确清除）。主视图 `/side-close` 投递失败也改为写 `main_notice`，不再是往
+  转录里塞一行就结束。回归用例 `side_heartbeat_does_not_erase_a_close_delivery_failure`。
+- `decide_exit_key` 里原本算了一次 `visible_stop_target` 又用 `let _ =` 丢掉，
+  读者会以为停止已经发出。函数签名收窄为只维护 `pending_quit`，停止由调用方
+  在 `ArmConfirm` 分支执行。
+- 补 `side_label_never_overflows_on_a_very_narrow_bar`：宽度 0/1/2/5/10/20 下
+  不得 panic、不得溢出（该处用 `saturating_sub`，改成普通减法会下溢）。
+
 红已证实（临时改回旧行为，跑完即恢复）：
 - 把 `SideOperationError` 分支移回 `stale` 检查之后 →
   `stale_operation_error_does_not_touch_the_current_side_view` FAILED。

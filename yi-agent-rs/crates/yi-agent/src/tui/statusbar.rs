@@ -447,6 +447,35 @@ mod tests {
         );
     }
 
+    /// 极窄终端不能 panic，也不能画出超过宽度的行。
+    ///
+    /// 这里是唯一用 `saturating_sub` 算预算再截断的地方：一旦有人改成普通减法，
+    /// 宽度小于已用列数时会整数下溢（debug 下直接 panic，release 下变成天文数字
+    /// 的预算、整行溢出）。
+    #[test]
+    fn side_label_never_overflows_on_a_very_narrow_bar() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let label = SideStatusLabel::side(Some("父会话运行中"));
+        for width in [0u16, 1, 2, 5, 10, 20] {
+            let line = render_statusbar_with_side(
+                &state,
+                &tasks,
+                0,
+                0,
+                "test-model",
+                width,
+                TuiTheme::LIGHT,
+                Some(&label),
+            );
+            let text = line_text(&line);
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                "宽度 {width} 时状态栏溢出: {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn side_error_text_is_not_dropped_by_the_cost_segments() {
         let state = StatusBarState::default();
