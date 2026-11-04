@@ -325,7 +325,22 @@ W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`
 - 门禁：`tui::` = 713 passed、`side_driver` = 10 passed、`side_repair_` = 21 passed、
   `just ci` = CI passed。
 
-### 5.5 明确未执行项
+### 5.5 自查发现的第五个缺陷：轮次 id 未回传时停止键静默
+
+同一条因果链的另一半。心跳 `SideStatus` 帧**不带** turn id（`side_driver.rs:337/430/441`
+都传 `None`），只有提交那一刻 `report_turn_id` 发一次（`:638`）。于是「视图显示在跑、
+本地 `active_turn_id` 还是 `None`」是一个真实存在的窗口。
+
+- `stop_visible_conversation` 原来是 `let Some(turn_id) = ... else { return; }`；
+  Esc 路径是 `if let ... && let Some(turn_id)`。两处都静默跳过。
+- 危害不只是「没反应」：用户按 Ctrl+C 见无反应会再按一次，**而第二次 Ctrl+C 是退出**。
+  「停掉这个回答」于是变成「关掉整个应用」。
+- 修复：两处都在轮次未知时写 `旁支正在启动，请稍候再停止`，并且不发出 Interrupt。
+- 红已证实：`stopping_a_side_whose_turn_is_not_known_yet_says_so`、
+  `esc_on_a_side_whose_turn_is_not_known_yet_says_so`，各自把提示改回静默即 FAILED。
+- 门禁：`tui::` = 715 passed、`just ci` = CI passed。
+
+### 5.6 明确未执行项
 
 - 真实 WebView 桌面验收（本 worktree 只跑源码级测试，未打包 `.app`）。
 - iPhone / relay / 双端同一 side id、后台唤醒重连、close 冲突二次确认。

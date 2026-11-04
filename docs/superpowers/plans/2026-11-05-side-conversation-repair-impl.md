@@ -644,6 +644,11 @@ git diff --check
   且从未出现过确认。已修为「本地未知但实际在跑」也判冲突，并区分两种冲突文案。
   红/绿：`a_close_without_a_turn_id_refuses_a_running_side`（修复前 FAILED）、
   `a_refused_close_shows_why_in_the_visible_side`（把 notice 写入删掉即 FAILED）。
+- 自查第五个缺陷：心跳不带 turn id，于是「视图在跑、本地未知轮次」是真实窗口；
+  Ctrl+C 与 Esc 两处原本静默跳过。危害是用户以为没生效再按 Ctrl+C——第二次就是退出。
+  两处改为写「旁支正在启动，请稍候再停止」且不发 Interrupt。
+  红/绿：`stopping_a_side_whose_turn_is_not_known_yet_says_so`、
+  `esc_on_a_side_whose_turn_is_not_known_yet_says_so`（改回静默即 FAILED）。
 - **Step 5 部分未做**:代码评审没能以 `requesting-code-review` 子代理形式完成——
   daemon 拒绝了该派发(`invalid_state: a settled parent task (state: stalled) cannot spawn
   descendants`)。改为协调者逐文件自查,并据此修出三个真实缺陷(心跳擦掉「关闭未送达」、

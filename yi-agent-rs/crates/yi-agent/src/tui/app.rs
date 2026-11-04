@@ -2905,7 +2905,11 @@ fn stop_visible_conversation(
             let _ = channels.interrupt.try_send(());
         }
         Some(ConversationTarget::Side { .. }) => {
+            // 显示「在跑」但本地不知道是哪一轮：turn id 是异步事件回传的，
+            // 提交后、事件被消费前就会短暂落到这里。静默 return 会让用户以为
+            // Ctrl+C 没生效，于是连按——第二次就退出了应用。
             let Some(turn_id) = side.active_turn_id.clone() else {
+                side.notice = Some("旁支正在启动，请稍候再停止".to_string());
                 return;
             };
             if let Err(message) = send_side_command(
@@ -3567,19 +3571,26 @@ fn handle_side_key(
             };
             if let Some(crate::tui::side::ConversationTarget::Side { .. }) =
                 crate::tui::side::visible_stop_target(&active, false, side.side_running())
-                && let Some(turn_id) = side.active_turn_id.clone()
             {
                 // 停止失败同样必须可见：用户按了 Esc 却什么都没发生，比直接
                 // 报错更糟——他会以为轮次还在跑。
-                if let Err(message) = send_side_command(
-                    channels,
-                    crate::side_driver::SideDriverCommand::Interrupt {
-                        expected_target: active.clone(),
-                        turn_id,
-                    },
-                    SideOperation::Interrupt,
-                ) {
-                    side.notice = Some(message);
+                //
+                // `None` 轮次同理：视图说在跑、本地还没拿到 turn id 时，
+                // 静默跳过等于假装停下。宁可说一句「还在启动」。
+                match side.active_turn_id.clone() {
+                    Some(turn_id) => {
+                        if let Err(message) = send_side_command(
+                            channels,
+                            crate::side_driver::SideDriverCommand::Interrupt {
+                                expected_target: active.clone(),
+                                turn_id,
+                            },
+                            SideOperation::Interrupt,
+                        ) {
+                            side.notice = Some(message);
+                        }
+                    }
+                    None => side.notice = Some("旁支正在启动，请稍候再停止".to_string()),
                 }
             }
             return KeyOutcome::None;
@@ -15656,6 +15667,102 @@ mod notification_tests {
         let notice = side.notice.clone().unwrap_or_default();
         assert!(notice.contains("停止"), "实际: {notice}");
         assert!(side.main_operation_notice().is_none());
+    }
+
+    /// Esc 与 Ctrl+C 走同一条判定：轮次未知时也必须留下提示，不能静默。
+    #[test]
+    fn esc_on_a_side_whose_turn_is_not_known_yet_says_so() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_tx, mut side_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(4);
+        let channels = {
+            let mut c = TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            );
+            c.side = Some(side_tx);
+            c
+        };
+
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        side.views.side.as_mut().unwrap().running = true;
+        side.active_turn_id = None;
+        side.notice = None;
+
+        let outcome = press_side(&mut side, &channels, KeyCode::Esc);
+        assert!(matches!(outcome, KeyOutcome::None), "Esc 在旁支里不退出");
+        let notice = side.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("启动") || notice.contains("停止"),
+            "轮次未知时必须说明，实际: {notice:?}"
+        );
+        assert!(
+            side_rx.try_recv().is_err(),
+            "不知道轮次 id 就不该发出 Interrupt"
+        );
+    }
+
+    /// 可见旁支显示「在跑」，但本地还不知道轮次 id：Ctrl+C 必须留下可读提示。
+    ///
+    /// 静默 `return` 会让人以为没生效，于是再按一次——而第二次 Ctrl+C 是退出。
+    /// 用户想要的「停掉这个回答」于是变成「关掉整个应用」。
+    #[test]
+    fn stopping_a_side_whose_turn_is_not_known_yet_says_so() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_tx, _side_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(4);
+        let channels = {
+            let mut c = TuiChannels::from_senders(
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &decision_tx,
+            );
+            c.side = Some(side_tx);
+            c
+        };
+
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-1".into(), 1);
+        // 关键组合：视图认为在跑，但 turn id 还没回来。
+        side.views.side.as_mut().unwrap().running = true;
+        side.active_turn_id = None;
+        side.notice = None;
+
+        stop_visible_conversation(
+            &ConversationTarget::Side {
+                side_id: "side-1".into(),
+                generation: 1,
+            },
+            false,
+            &mut side,
+            &channels,
+        );
+
+        let notice = side.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("停止") || notice.contains("启动"),
+            "不知道轮次 id 时必须说明，实际提示: {notice:?}"
+        );
+        assert!(
+            interrupt_rx.try_recv().is_err(),
+            "旁支的停止绝不能落到父会话的中断通道上"
+        );
     }
 
     /// driver 拒绝关闭（旁支正在回答、本地又不知道轮次 id）时，拒绝原因必须
