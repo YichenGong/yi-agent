@@ -6865,3 +6865,21 @@ describe("App 旁支视图", () => {
     expect(methods()).not.toContain("thread/resume");
   });
 });
+
+/**
+ * 收集回归：App 模块本身必须能被解析和导入。
+ *
+ * 这一组测试的价值是**结构**上的：`src/App.tsx` 曾经留下一个孤立的 JSX 结束符，
+ * esbuild 在 transform 阶段就报错，整个 `App.test.tsx` 一条都用不了——包括下面
+ * 所有旁支接线用例。用一条显式导入把「模块可解析」变成可执行断言，而不是靠
+ * 「测试文件没报错」这种隐式证据。
+ *
+ * 断言是 `typeof === "function"`（组件就是函数），不是快照：快照会把解析错误
+ * 一起吞进去，而且是另一种「写死的输出」。
+ */
+describe("App 模块收集", () => {
+  it("App 模块可导入", async () => {
+    const module = await import("./App");
+    expect(typeof module.default).toBe("function");
+  });
+});

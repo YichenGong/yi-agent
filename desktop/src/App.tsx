@@ -24,12 +24,9 @@ import { ClientRegistry } from "./lib/clientRegistry";
 import { SideConversationStore, type SideView } from "./lib/sideConversation";
 import { useSideConversation } from "./hooks/useSideConversation";
 import {
-  parentStatusText,
   useSideConversationController,
   type CloseConfirmation,
 } from "./hooks/useSideConversationController";
-import { SideConversationHeader } from "./components/SideConversationHeader";
-import { sideItemsForChat } from "./lib/sideItems";
 import type { SideCommand } from "./lib/sideCommands";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
@@ -241,7 +238,9 @@ export default function App() {
    * `return` 里，把 hook 放到后面会让「配对界面 ↔ 主界面」切换时 hook 数量变化，
    * React 直接抛「Rendered fewer hooks than expected」。
    */
-  const [sideNotice, setSideNotice] = useState<string | null>(null);
+  // 值的渲染位置随旁支 JSX 分支一起被删掉了；`setSideNotice` 仍是 scoped
+  // slash 的落地出口，Task 4 会把渲染接回来（见计划 Task 4/7）。
+  const [, setSideNotice] = useState<string | null>(null);
 
   /**
    * 旁支的 RPC 动作（open/submit/stop/close/back）。
@@ -2685,60 +2684,6 @@ export default function App() {
     }
   };
 
-  /** 旁支视图的发送：目标在调用时捕获，绝不在 await 之后读「当前视图」。 */
-  const sendToSide = async (text: string): Promise<boolean> => {
-    const a = sideConversationRef.current.active;
-    if (a === null || a.kind !== "side") return false;
-    if (!text.trim()) return false;
-    const binding = sideStoreRef.current.binding(a.hostKey);
-    if (binding === undefined || !binding.connected) {
-      setCurrentError("连接已断开，请稍候再发");
-      return false;
-    }
-    const ok = await sideConversationRef.current.submit(text);
-    if (ok) {
-      sideStoreRef.current.setDraft(a.hostKey, a.sideId, "");
-      forceSide();
-    }
-    return ok;
-  };
-
-  /** 旁支视图的 Stop：只停旁支自己，绝不打父会话。 */
-  const stopSide = () => {
-    void sideConversationRef.current.stop();
-  };
-
-  /**
-   * 手机/桌面顶部的「旁问」入口。
-   *
-   * 父会话运行中、等待审批时都必须可达：这正是旁支存在的理由（spec §9.2/§9.3）。
-   * 点它不消费父草稿、不停主任务。
-   */
-  const sidebarEntry = (() => {
-    const binding = sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
-    if (binding === undefined || !binding.supported) return null;
-    if (binding.scope === "observe") return null;
-    if (store.currentId === null) return null;
-    const existing = sideStoreRef.current
-      .list(binding.key)
-      .find((v) => v.parentId === store.currentId && !v.closed);
-    return {
-      label: existing === undefined ? "旁问" : "继续旁问",
-      open: () => {
-        if (existing !== undefined) {
-          sideConversationRef.current.enter(
-            binding,
-            existing.parentId,
-            existing.sideId,
-            existing.generation,
-          );
-          return;
-        }
-        void openSide("");
-      },
-    };
-  })();
-
   return (
     <>
       {prefs.onboarding.needed && (
@@ -3005,8 +2950,7 @@ export default function App() {
                     ) : null
                   }
                 />
-              </>
-            )}
+            </>
             {/*
               关闭旁支的确认。文案分两种：正在回答时明确告诉用户会打断那一轮，
               空闲时就只是关掉。`expectedActiveTurnId` 来自服务端当前摘要
