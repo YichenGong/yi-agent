@@ -382,7 +382,7 @@ let events = ScriptedEvents { events: Rc::new(RefCell::new(delivered)) };
 - SideSession 记录带 target 的待显示操作错误，Main 可呈现后台 Close 失败；不能把错误当父 transcript 或落盘。
 - 本任务最小扩展本地 `SideDriverCommand::Close { expected_target: ConversationTarget, expected_active_turn_id: Option<String> }` 与 `Interrupt { expected_target: ConversationTarget, turn_id: String }`。driver 处理前核对真实 side_id/generation，不匹配则产生该旧目标的操作失败，不作用到当前 runner。更新全部构造点及测试；该 Rust 进程内类型不生成网络绑定，原 RPC 不变。
 
-- [ ] **Step 1:** 用 Task 8 的完整循环用例初始化方法新增：side Idle/Running Ctrl+C、Ctrl+C→编辑→Ctrl+C、runtime popup/父审批弹窗 Ctrl+Q，以及 `/q`、`/quit`。断言仅第一次 Ctrl+C 向可见 side Interrupt，第二次走 Quit；父 interrupt_rx 为空。Close/Interrupt 用容量1且预填满的 channel、drop receiver 两组，命令仍立刻返回/可退出，屏幕可见失败。
+- [x] **Step 1:** 用 Task 8 的完整循环用例初始化方法新增：side Idle/Running Ctrl+C、Ctrl+C→编辑→Ctrl+C、runtime popup/父审批弹窗 Ctrl+Q，以及 `/q`、`/quit`。断言仅第一次 Ctrl+C 向可见 side Interrupt，第二次走 Quit；父 interrupt_rx 为空。Close/Interrupt 用容量1且预填满的 channel、drop receiver 两组，命令仍立刻返回/可退出，屏幕可见失败。
 
 ```rust
 let (side_tx, mut side_rx) = tokio::sync::mpsc::channel(1);
@@ -399,12 +399,64 @@ assert!(side_rx.try_recv().is_ok());
 ```
 
 这段验证 fixture 确实满；产品回归必须通过循环输入 `/side-close` 并断言 Main + “已返回，旁问关闭未送达”，不是以此通道单测替代。driver 模拟 close conflict 要产生 SideOperationError(Close)，在 Main 可见且仍能 `/side-close` 重试；旧代错误不污染新代。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Ctrl+C 在 side 无效、popup 吞退出或失败无反馈。
-- [ ] **Step 3:** 将 Ctrl+Q/Ctrl+C 的应用级判断放在 handle_key_intercepts/runtime popup 之前，只维护 loop_bk.pending_quit；第一次按 visible_stop_target 分派当前轮、第二次 KeyOutcome::Quit，普通有效编辑/导航/提交清确认。退出命令在 side 分类前处理，不将其投给模型。Esc仍先关 popup，再仅停可见 side；Idle无动作。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Ctrl+C 在 side 无效、popup 吞退出或失败无反馈。
+- [x] **Step 3:** 将 Ctrl+Q/Ctrl+C 的应用级判断放在 handle_key_intercepts/runtime popup 之前，只维护 loop_bk.pending_quit；第一次按 visible_stop_target 分派当前轮、第二次 KeyOutcome::Quit，普通有效编辑/导航/提交清确认。退出命令在 side 分类前处理，不将其投给模型。Esc仍先关 popup，再仅停可见 side；Idle无动作。
 
 所有 side try_send 改为显式 match Full/Closed，失败保存 target/message 并呈现。Close 无论投递与否立即 back，不能标 closed；保留原后台 side 可重试。driver handle_command 在各错误分支向 report_error 传 operation；report_error 保留 transcript Notice，另 dispatch 带原目标的 SideOperationError，即使无 active turn 也可显示操作失败。Open 尚无 runner 时发 `ConversationEvent { target: ConversationTarget::Main, turn_id: None, event: ConversationPayload::SideOperationError { operation: SideOperation::Open, message } }`；主循环须在父事件/落盘管线前单独识别此本地操作反馈，写入按需 notice，不交给丢弃 Main 的 SideSession::apply_event，也不伪造 side 身份。已有 runner 的错误使用其真实 side_id/generation。主视图只渲染该后台操作错误，不写 HistoryState/TurnLog。close 成功/新重试受理后清对应提示，其他 side 状态帧不能导航。
-- [ ] **Step 4:** 跑 TUI 全组及 side_driver 测试；验证关闭后重开、旧 generation 帧、后台状态不拉回。使用真实清理器测试确认 Quit 取消父/side、有界等待、租约释放；不能只断言 KeyOutcome::Quit 或用 kill -9 代替收尾。未建立租约 fixture 时先补现有清理器测试，不删 spec 的租约断言。
-- [ ] **Step 5:** 更新 TUI 判据，统一门禁后提交 `fix: make TUI side exit and command failures observable`。
+- [x] **Step 4:** 跑 TUI 全组及 side_driver 测试；验证关闭后重开、旧 generation 帧、后台状态不拉回。使用真实清理器测试确认 Quit 取消父/side、有界等待、租约释放；不能只断言 KeyOutcome::Quit 或用 kill -9 代替收尾。未建立租约 fixture 时先补现有清理器测试，不删 spec 的租约断言。
+- [x] **Step 5:** 更新 TUI 判据，统一门禁后提交 `fix: make TUI side exit and command failures observable`。
+
+**证据（2026-11-05,本 worktree）:**
+
+发现并修掉三处真实缺陷（不是「测试写错了」）：
+
+1. **旁支通知从未渲染。** `/cost`、管理命令拒绝、`/side-close` 未送达都写进
+   `SideSession::notice`，而绘制只调 `side_header_line(...)`——这个字段从来没被
+   读出来。用户看到的是「按了没反应」。现在 `side_status_line` 在有通知时**只画
+   通知**（状态行只有一行，把长中文 header 接在前面会把错误尾部裁掉，「未送达」
+   恰好在末尾）。
+2. **过期目标的错误被静默丢弃。** `apply_event` 里 `stale` 检查在
+   `SideOperationError` 分支之前 `return Discard`，于是「旧代关闭失败」——最需
+   要告诉用户的那种——永远到不了界面。错误帧现在先于过期检查处理，并按目标分流：
+   当前可见旁支进 `notice`，主视图或旧旁支进 `main_notice`。
+3. **关闭未送达的提示落在不可见处。** `submit_side_draft` 先 `views.back()` 再写
+   `side.notice`，那一刻用户已在主视图、旁支状态行不再渲染。改为投递结果落在
+   切换之后可见的位置（`main_notice`），并带上 operation + target。
+
+新增/更新用例：
+- `side_repair_first_ctrl_c_in_side_stops_only_the_side`（第一下只发 side
+  Interrupt、父 `interrupt_rx` 为空；第二下退出，用「后续输入不再产生 Submit」
+  判定，不用退出后的屏幕内容——退出后循环不重绘，屏幕停在前一帧的旁支视图）
+- `side_repair_ctrl_q_quits_even_with_the_runtime_popup_open`、
+  `side_repair_ctrl_q_quits_with_a_pending_parent_approval`、
+  `side_repair_quit_commands_leave_the_side_without_a_submit`、
+  `side_repair_editing_after_ctrl_c_rearms_the_confirmation`
+- `side_repair_close_survives_a_full_side_channel`（容量 1 预填满）、
+  `side_repair_close_survives_a_dropped_side_receiver`（drop receiver）
+- `visible_operation_error_goes_to_the_side_notice`、
+  `stale_operation_error_does_not_touch_the_current_side_view`
+- driver：`stale_close_target_reports_error_and_keeps_the_live_side`、
+  `stale_interrupt_does_not_stop_the_live_turn`（空 turn_id 也不能误停）、
+  `failed_open_reports_a_main_target_error`（无 runner 时发 Main 目标错误）
+
+红已证实（临时改回旧行为，跑完即恢复）：
+- 把 `SideOperationError` 分支移回 `stale` 检查之后 →
+  `stale_operation_error_does_not_touch_the_current_side_view` FAILED。
+- 把关闭未送达提示写回 `side.notice` →
+  `side_repair_close_survives_a_full_side_channel` 与
+  `..._a_dropped_side_receiver` 同时 FAILED。
+
+测试基础设施修正（真实缺陷，非放宽断言）：`frame_text` 之前逐格拼接缓冲区，
+而 ratatui 的 `Buffer::diff` 会**跳过**紧跟宽字符的那一格（真实终端画汉字时连带
+覆盖右侧格，故不下发），`TestBackend::draw` 只是逐格赋值，那一格保留上一帧内容。
+于是把「旁问（只读）…」换成「关闭旁问失败…」时读出来会交错成
+「旁·问父关会闭话未空送闲达」。`frame_text` 现在按终端语义推进 x（宽字符占两列），
+这与真实终端显示一致。
+
+门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 706 passed, 0 failed；
+`cargo test -p yi-agent --bin yi-agent side_repair_` = 21 passed；
+`cargo test -p yi-agent --bin yi-agent side_driver` = 9 passed；
+`cargo fmt --all` + `just fmt-check` 通过；`cargo clippy -p yi-agent --all-targets` 无告警。
 
 ### Task 10: 删除 TUI 介绍条，保持既有状态栏与落盘隔离
 

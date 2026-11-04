@@ -67,6 +67,43 @@ pub enum ConversationPayload {
     SideStatus(SideStatus),
     SideUsage(SideUsage),
     SideClosed(CloseReason),
+    /// 某个旁支操作失败，**带上它原本的目标**。
+    ///
+    /// 为什么不复用 `SideStatus(Failed)` 或往转录里塞一条 Notice：
+    /// - `Open` 失败时根本还没有 runner，也就没有转录可写，旧实现直接
+    ///   `return`，用户按了回车什么也看不到；
+    /// - 后台 `Close` 失败时 TUI 已经回到主视图，旁支转录不可见，错误等于
+    ///   消失，而用户以为关掉了；
+    /// - 旧目标（旧 generation）上的失败不能被当成当前旁支的状态错误，否则
+    ///   一个已经关掉的旁支能把新旁支显示成失败。
+    ///
+    /// 所以它是**独立的一条本地帧**：调用方按 `target` 决定放哪、按
+    /// `operation` 决定什么时候清掉。
+    SideOperationError {
+        operation: SideOperation,
+        message: String,
+    },
+}
+
+/// 可能失败、且必须让用户看见的旁支操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideOperation {
+    Open,
+    Submit,
+    Interrupt,
+    Close,
+}
+
+impl SideOperation {
+    /// 面向用户的动词（错误文案的前缀）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "打开旁问失败",
+            Self::Submit => "旁问提问失败",
+            Self::Interrupt => "停止旁问失败",
+            Self::Close => "关闭旁问失败",
+        }
+    }
 }
 
 /// 一条带目标标签的事件。
@@ -306,6 +343,11 @@ impl TuiSideView {
                 self.error = Some(close_reason_text(reason));
                 SideFrameEffect::Redraw
             }
+            // 操作失败只由 `SideSession::apply_event` 转成提示，不写进视图
+            // 状态：视图的 status 描述的是「旁支现在怎样」，而失败描述的是
+            // 「刚才那次操作怎样」，两者混用会让一个旧代的失败把新旁支显示成
+            // Failed。这里明确丢弃，避免未来有人在这里顺手改状态。
+            ConversationPayload::SideOperationError { .. } => SideFrameEffect::Discard,
             // 主事件不会以 `Side` 目标送达;真发生了说明路由错了,丢弃。
             //
             // 这个变体必须存在：它让「主事件」在类型上只可能走主视图，路由层

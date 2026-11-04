@@ -236,7 +236,7 @@ async fn close_reports_closed_and_stops_the_runner() {
         })
         .await
         .unwrap();
-    recv_until(&mut fx.handles.events, |event| {
+    let opened = recv_until(&mut fx.handles.events, |event| {
         matches!(
             event.event,
             ConversationPayload::SideStatus(SideStatus::Idle)
@@ -247,6 +247,7 @@ async fn close_reports_closed_and_stops_the_runner() {
     fx.handles
         .commands
         .send(SideDriverCommand::Close {
+            expected_target: opened.target.clone(),
             expected_active_turn_id: None,
         })
         .await
@@ -286,7 +287,7 @@ async fn close_with_stale_turn_id_is_refused() {
         })
         .await
         .unwrap();
-    recv_until(&mut fx.handles.events, |event| {
+    let opened = recv_until(&mut fx.handles.events, |event| {
         matches!(
             event.event,
             ConversationPayload::SideStatus(SideStatus::Idle)
@@ -297,6 +298,7 @@ async fn close_with_stale_turn_id_is_refused() {
     fx.handles
         .commands
         .send(SideDriverCommand::Close {
+            expected_target: opened.target.clone(),
             expected_active_turn_id: Some("already-finished".into()),
         })
         .await
@@ -343,6 +345,200 @@ async fn parent_barrier_blocks_open_until_rolled_back() {
         .unwrap();
 
     // 回滚:旧状态继续可用,之后可以正常打开。
+    permit.commit();
+    let _ = fx.handles.commands.send(SideDriverCommand::Exit).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
+}
+
+/// 目标已过期（用户看的是旧旁支代际）的关闭：必须报错，且**不能**关掉
+/// 当前这个真正在用的旁支。这是「按了关闭、界面什么也没发生」的根因。
+#[tokio::test]
+async fn stale_close_target_reports_error_and_keeps_the_live_side() {
+    let mut fx = fixture();
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Open {
+            request_id: request_id(),
+            question: Some("问题".into()),
+        })
+        .await
+        .unwrap();
+    let opened = recv_until(&mut fx.handles.events, |event| {
+        matches!(
+            event.event,
+            ConversationPayload::SideStatus(SideStatus::Idle)
+        )
+    })
+    .await;
+    let ConversationTarget::Side {
+        side_id,
+        generation,
+        ..
+    } = opened.target.clone()
+    else {
+        panic!("旁支事件必须带 Side 目标")
+    };
+
+    // 一个不存在的代际：属于「旧视图」。
+    let stale = ConversationTarget::Side {
+        side_id: side_id.clone(),
+        generation: generation + 7,
+    };
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Close {
+            expected_target: stale.clone(),
+            expected_active_turn_id: None,
+        })
+        .await
+        .unwrap();
+
+    let error = recv_until(&mut fx.handles.events, |event| {
+        matches!(event.event, ConversationPayload::SideOperationError { .. })
+    })
+    .await;
+    assert_eq!(error.target, stale, "错误必须回到发起它的那个旧目标");
+    match error.event {
+        ConversationPayload::SideOperationError { operation, message } => {
+            assert_eq!(operation, SideOperation::Close);
+            assert!(
+                message.contains("变化"),
+                "错误文案要说清目标已经变了，实际: {message}"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // 真正的旁支仍然能用：旧目标的关闭不能顺手把它关掉。
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Submit {
+            request_id: request_id(),
+            text: "旧目标关闭之后仍能提问".into(),
+        })
+        .await
+        .unwrap();
+    let turn = recv_until(&mut fx.handles.events, |event| event.turn_id.is_some()).await;
+    assert!(turn.turn_id.is_some());
+
+    let _ = fx.handles.commands.send(SideDriverCommand::Exit).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
+}
+
+/// 旧代的中断不能停掉当前轮次，错误必须带旧目标回去。
+#[tokio::test]
+async fn stale_interrupt_does_not_stop_the_live_turn() {
+    let mut fx = fixture();
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Open {
+            request_id: request_id(),
+            question: Some("问题".into()),
+        })
+        .await
+        .unwrap();
+    let opened = recv_until(&mut fx.handles.events, |event| {
+        matches!(
+            event.event,
+            ConversationPayload::SideStatus(SideStatus::Idle)
+        )
+    })
+    .await;
+    let ConversationTarget::Side { side_id, .. } = opened.target.clone() else {
+        panic!("旁支事件必须带 Side 目标")
+    };
+    let stale = ConversationTarget::Side {
+        side_id,
+        generation: 999,
+    };
+
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Interrupt {
+            expected_target: stale.clone(),
+            // 轮次 id 故意留空：旧实现里空 id 会让比较退化，从而误停新轮次。
+            turn_id: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let error = recv_until(&mut fx.handles.events, |event| {
+        matches!(event.event, ConversationPayload::SideOperationError { .. })
+    })
+    .await;
+    assert_eq!(error.target, stale);
+    match error.event {
+        ConversationPayload::SideOperationError { operation, .. } => {
+            assert_eq!(operation, SideOperation::Interrupt)
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // 旁支仍然能正常答完一轮（没被打断）。
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Submit {
+            request_id: request_id(),
+            text: "旧中断之后仍能提问".into(),
+        })
+        .await
+        .unwrap();
+    recv_until(&mut fx.handles.events, |event| {
+        matches!(
+            event.event,
+            ConversationPayload::SideStatus(SideStatus::Idle)
+        )
+    })
+    .await;
+
+    let _ = fx.handles.commands.send(SideDriverCommand::Exit).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
+}
+
+/// 屏障期间开旁支：必须产生一条主目标的 `Open` 错误，而不是静默失败。
+///
+/// 旧实现里 `Open` 失败时还没有 runner，`report_operation_error` 直接 return，
+/// 用户按完 `/side` 看到的是「什么都没发生」。
+#[tokio::test]
+async fn failed_open_reports_a_main_target_error() {
+    let mut fx = fixture();
+    let (tx, rx) = oneshot::channel();
+    fx.handles
+        .commands
+        .send(SideDriverCommand::ParentBarrier {
+            reason: CloseReason::ParentCleared,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    let permit = rx.await.unwrap();
+
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Open {
+            request_id: request_id(),
+            question: None,
+        })
+        .await
+        .unwrap();
+
+    let error = recv_until(&mut fx.handles.events, |event| {
+        matches!(event.event, ConversationPayload::SideOperationError { .. })
+    })
+    .await;
+    assert_eq!(
+        error.target,
+        ConversationTarget::Main,
+        "还没有旁支身份时，错误属于主视图那次 /side 请求"
+    );
+    match error.event {
+        ConversationPayload::SideOperationError { operation, message } => {
+            assert_eq!(operation, SideOperation::Open);
+            assert!(!message.is_empty(), "错误必须有可读文案");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
     permit.commit();
     let _ = fx.handles.commands.send(SideDriverCommand::Exit).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
