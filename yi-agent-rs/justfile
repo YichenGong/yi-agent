@@ -219,8 +219,13 @@ plugin-boundary-check:
     python3 ../scripts/plugins/check-host-boundary.py
     python3 -m unittest discover -s ../scripts/plugins -p 'test_check_host_boundary.py'
 
+# 验收报告校验器：A01–A20 必须各有且仅有一个最终结果，全部 pass，且证据形态
+# 合规（probe 构建不能冒充正式包；A16/A17 不能用 loopback 冒充远端）。
+plugin-acceptance-check:
+    node --test ../scripts/plugins/e2e-report.test.mjs
+
 # 一次跑完插件的全部门禁（本地用；CI 拆成独立 job 以便并行与隔离权限）。
-plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check
+plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check plugin-acceptance-check
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。

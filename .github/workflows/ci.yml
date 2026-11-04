@@ -99,6 +99,10 @@ jobs:
         working-directory: yi-agent-rs
         run: just plugin-contracts-check plugin-boundary-check
 
+      - name: Plugin acceptance report checker
+        working-directory: yi-agent-rs
+        run: just plugin-acceptance-check
+
   macos:
     # macOS 专属代码在 PR 阶段就该有信号：21 处 cfg(target_os = "macos")
     # （power 8 / tools 6 / app-server 7）在 ubuntu runner 上根本不会被编译。

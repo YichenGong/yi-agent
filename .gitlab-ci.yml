@@ -97,6 +97,7 @@ ci-plugins:
     - just plugin-ui-check
     - just plugin-contracts-check
     - just plugin-boundary-check
+    - just plugin-acceptance-check
 
 # tag 推送时在 Mac mini 上构建并发布 macOS(arm64) 桌面 App 的 dmg。
 # 逻辑全部在 desktop/scripts/release-dmg.sh 里，job 保持薄。

@@ -834,7 +834,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** `e2e.mjs --suite all --output .artifacts/plugins/acceptance.json` 构建/启动隔离实例，使用真实 Tauri WebView、本机两个独立 app-server 和本机认证网络远端连接完成 A16/A17，不触碰真实账号/LLM。平台差异需要对应平台报告，不把交叉编译代替运行。证据分为 probe 构建的攻击注入报告与不启用 probe 的正式发布物验收：后者由宿主外部 OS UI 自动化/人工可复核操作及管理 CLI 采集，不给正式包新增测试 invoke、报告后门或测试信任根。正式平台/官方签名包验收需要另行授权的签名 release candidate；未授权只运行测试根构建并记“尚无正式包证据”，不能据此把 A20/整体 feature 标完成。
 
-- [ ] Step 1：报告校验测试确保 A01–A20 各有且仅有一个最终结果，任何缺项、skipped、unsupported、timeout、失败退出均非通过；mutation 删除 A07 或令 A10 缺 evidence，checker 必须失败。
+- [x] Step 1：报告校验测试确保 A01–A20 各有且仅有一个最终结果，任何缺项、skipped、unsupported、timeout、失败退出均非通过；mutation 删除 A07 或令 A10 缺 evidence，checker 必须失败。判据：`scripts/plugins/acceptance-cases.json`（A01–A20 唯一真相）+ `scripts/plugins/e2e-report.mjs` + `just plugin-acceptance-check`（24 passed）。变异验证：删掉缺项检查 → 2 用例失败；空证据算作通过 → 1 失败；loopback 别名不识别 → 1 失败。另加固 probe 构建不得冒充正式包（A20 必须 unsupported）、A16/A17 远端证据必须给出非 loopback 的主机身份（loopback/127.0.0.0/8/::1 均拒绝）、official 证据必须 `notarized: true` 且有 `signingIdentity`。
 - [ ] Step 2：按矩阵执行安全/故障注入，包括断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管和 pending uninstall；所有数据为 TempDir/专属 `YI_AGENT_HOME`。
 - [ ] Step 3：至少做一次实际可访问的远程执行宿主连接验证（认证、目标 OS/架构与下载执行），记录两端身份和版本；不能只凭 loopback 证明跨机器行为。无真实远端证据时 A16/A17 保持未完成，阻止发布但可保留已通过的本机报告。
 - [ ] Step 4：在相同主程序包上执行插件 UI v1→v2 更新；比对主程序整个发布物摘要、插件摘要、活跃版本/代次和 skill 来源；卸载后验证核心聊天和默认数据保留。保存脱敏报告、截图、平台版本及每项对应测试命令。
