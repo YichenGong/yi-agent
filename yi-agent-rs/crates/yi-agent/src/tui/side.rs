@@ -575,19 +575,5 @@ pub fn route_approval_key(key: KeyEvent, mode: &mut ApprovalInputMode) -> Approv
     }
 }
 
-/// 顶部来源提示:旁支只读,并说明父会话此刻的状态。
-///
-/// 只陈述事实,不做裁剪:窄屏裁剪交给 renderer（它已经处理 CJK 宽度）。
-pub fn side_header_line(parent_running: bool, parent_awaiting_approval: bool) -> String {
-    let parent = if parent_awaiting_approval {
-        "父会话等待审批"
-    } else if parent_running {
-        "父会话运行中"
-    } else {
-        "父会话空闲"
-    };
-    format!("旁问（只读）：继承父会话上下文 · {parent} · /back 返回 · /side-close 关闭")
-}
-
 #[cfg(test)]
 mod tests;

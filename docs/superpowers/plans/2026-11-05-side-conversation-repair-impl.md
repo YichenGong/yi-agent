@@ -467,7 +467,7 @@ assert!(side_rx.try_recv().is_ok());
 - Consumes: 既有 render_statusbar_with、HistoryView、side_header_line 调用位置、Task 9 按需错误。
 - Produces: 原状态行内 `/side · /back 返回` 短标签；不增加 Rect/行高，不遮历史首行。
 
-- [ ] **Step 1:** TestBackend 80×24、32×12 各用深/浅主题绘制，旁问首条文本设 `FIRST_SIDE_ITEM`，断言首条不被 Clear/header 覆盖；status 有 `/side` 与 `/back`，普通父视图无常驻旁问提示。CJK 字符宽度使用现有渲染工具，不以 byte len 截断。
+- [x] **Step 1:** TestBackend 80×24、32×12 各用深/浅主题绘制，旁问首条文本设 `FIRST_SIDE_ITEM`，断言首条不被 Clear/header 覆盖；status 有 `/side` 与 `/back`，普通父视图无常驻旁问提示。CJK 字符宽度使用现有渲染工具，不以 byte len 截断。
 
 ```rust
 assert!(screen.contains("FIRST_SIDE_ITEM"));
@@ -477,11 +477,37 @@ assert!(!screen.contains("旁支可用工具（只读）"));
 ```
 
 `screen` 从该用例实际 terminal.backend().buffer() 按行收集可见字符得到；帮助命令主动显示工具说明不在此禁止范围。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期旧独立介绍条遮行/占位失败。
-- [ ] **Step 3:** 去掉 HistoryView 上额外 Clear/Paragraph 的 header 绘制；在已有状态文本预算中选 side 标签，窄屏优先身份/返回，错误按需显示且不被父费用覆盖。父视图照旧，side helper 不再用于宣传条，删除无调用代码/测试，不移除主动 `/help`。
-- [ ] **Step 4:** `cargo test -p yi-agent --bin yi-agent tui::`，再 `cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log`；确认过滤器实际执行至少一条测试。检查 side 错误/正文没有进入父 resume/TurnLog。
-- [ ] **Step 5:** 更新 TUI 阶段证据，统一门禁后提交 `fix: keep TUI side identity in the existing status line`。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期旧独立介绍条遮行/占位失败。
+- [x] **Step 3:** 去掉 HistoryView 上额外 Clear/Paragraph 的 header 绘制；在已有状态文本预算中选 side 标签，窄屏优先身份/返回，错误按需显示且不被父费用覆盖。父视图照旧，side helper 不再用于宣传条，删除无调用代码/测试，不移除主动 `/help`。
+- [x] **Step 4:** `cargo test -p yi-agent --bin yi-agent tui::`，再 `cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log`；确认过滤器实际执行至少一条测试。检查 side 错误/正文没有进入父 resume/TurnLog。
+- [x] **Step 5:** 更新 TUI 阶段证据，统一门禁后提交 `fix: keep TUI side identity in the existing status line`。
 
+**证据（2026-11-05,本 worktree）:**
+
+删掉了占据转录首行的旁问 header。旧实现在 history 区域顶上盖一行并 `Clear`，而
+旁支第一条正文正好在那一行——开旁支先丢掉第一句回答（spec §7）。
+
+- `tui/statusbar.rs` 新增 `SideStatusLabel { must, full }` 与
+  `render_statusbar_with_side`。`must`（旁问 + `/side` + `/back`）单独存一份，
+  不从完整文本切：切字符串很容易把 `/back` 拦腰截断，那正是窄屏最需要的字符。
+  预算只够 `must` 时仍显示它，够时追加父会话状态/错误。旁支段排在费用段之前：
+  「我在哪、怎么出去」比 token 计数要紧。
+- `tui/app.rs` 的 `side_status_label` 决定内容，规则是**错误优先于身份**；主视图
+  只在有后台旁支操作失败时才出 `/side <失败说明>`，不带「旁问」身份词（否则用户
+  会以为还在旁支里）。
+- `SideParentState` 把「等待审批」排在「运行中」之前：卡在审批上的父会话技术上
+  仍在跑，但对用户来说是停住的。审批详情仍只能回父视图看（spec §7）。
+- 删除 `side_header_line` 与其单测（已无调用点），保留主动 `/help` 的工具说明。
+
+红已证实（临时改回旧行为，跑完即恢复）：
+- `render_statusbar_with_side(..., None)`（状态栏不出旁支段）→
+  `side_status_bar_labels_the_conversation_without_covering_the_first_item` FAILED。
+- 在 history 区域顶部重新 `Clear` 一行 → 同一条用例 FAILED（首条正文被遮）。
+
+门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 710 passed, 0 failed；
+`side_repair_` = 21 passed；`side_events_never_reach_main_turn_log` 实跑通过
+（1 passed，父 TurnLog 里不含旁支正文；断言未被过滤成 0 条）；
+`cargo fmt --all` + `just fmt-check` 通过；`cargo clippy -p yi-agent --all-targets` 无告警。
 ## 3. 汇合验证与交付
 
 ### Task 11: 三端证据、验收覆盖和全量门禁

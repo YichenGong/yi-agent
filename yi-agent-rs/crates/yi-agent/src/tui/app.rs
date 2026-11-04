@@ -29,14 +29,14 @@ use super::process_popup::{
 };
 use super::side::{
     ConversationPayload, ConversationTarget, RoutedInput, SideFrameEffect, SideInput,
-    SideOperation, TuiSideView, TuiSideViews, classify_conversation_input, side_header_line,
+    SideOperation, TuiSideView, TuiSideViews, classify_conversation_input,
 };
 use super::slash::{
     CommandPopup, McpAction, PopupScope, SlashCommand, TuiConfigSnapshot, help_text,
     parse_mcp_args, render_mcp_status,
 };
 use super::state::RunningTaskRegistry;
-use super::statusbar::{StatusBarState, render_statusbar_with};
+use super::statusbar::{SideStatusLabel, StatusBarState, render_statusbar_with_side};
 use super::theme::TuiTheme;
 use super::trace::{
     SubagentListState, TraceDetailPopup, TraceListPopup, TracePopup, render_subagent_list_with,
@@ -1425,50 +1425,30 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
             let chunks = layout.chunks.clone();
 
             // 渲染器共用:旁支只换 state 与顶部提示条,主题/折行/缓存上限一致。
-            let (visible_history, header): (&HistoryState, Option<String>) = if in_side {
-                (
-                    &side_session.history,
-                    Some(side_status_line(
-                        is_running.load(std::sync::atomic::Ordering::SeqCst),
-                        side_session.notice.as_deref(),
-                    )),
-                )
+            // 旁支身份与按需通知都进**既有状态栏**，不再占用转录首行。
+            //
+            // 旧实现在 history 区域顶上盖一行 header 并 `Clear`：旁支第一条
+            // 正文正好在那一行，开旁支就先丢掉第一句回答（spec §7）。状态栏
+            // 本来就每帧都画、且已有宽度预算，把身份放进去不新增布局行。
+            let visible_history: &HistoryState = if in_side {
+                &side_session.history
             } else {
-                // 主视图只显示**后台旁支操作失败**，不显示旁支身份/正文。
-                // 这是唯一能在「用户已经回到主视图、旁支转录不可见」时把
-                // 「关闭没送达」说出来的位置（spec §6.2）。
-                (history, side_session.main_operation_notice())
+                history
             };
+            let side_label = side_status_label(
+                in_side,
+                SideParentState {
+                    running: is_running.load(std::sync::atomic::Ordering::SeqCst),
+                    awaiting_approval: history.pending_permission_info().is_some(),
+                },
+                &side_session,
+            );
             let history_view = HistoryView {
                 state: visible_history,
                 width: chunks[0].width,
                 theme,
             };
             f.render_widget(history_view, chunks[0]);
-            if let Some(header) = header {
-                // 提示条画在可视区最上方,不遮输入行（输入行在最底部）。
-                //
-                // 先 `Clear` 再画一行、并按可用宽度截断：这一行在旁支 ↔ 主视图
-                // 之间切换内容，超宽会让 ratatui 折到最后一行，与旧内容叠加成
-                // 「旁·问父关会闭话未空送闲达」。错误文案的尾部（「未送达」）
-                // 恰好在末尾，被裁掉就等于没显示。
-                let area = ratatui::layout::Rect {
-                    x: chunks[0].x,
-                    y: chunks[0].y,
-                    width: chunks[0].width,
-                    height: 1,
-                };
-                f.render_widget(Clear, area);
-                let rendered =
-                    crate::tui::wrap::truncate_to_width(&header, chunks[0].width as usize);
-                f.render_widget(
-                    Paragraph::new(ratatui::text::Line::styled(
-                        rendered.clone(),
-                        Style::default().fg(theme.fg_faint),
-                    )),
-                    area,
-                );
-            }
 
             // Render popup if active
             if let Some(p) = &popup_stack.popup {
@@ -1479,7 +1459,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
             }
 
             // Status bar.
-            let statusbar_line = render_statusbar_with(
+            let statusbar_line = render_statusbar_with_side(
                 &session_ui.statusbar_state,
                 &loop_bk.task_registry,
                 active_process_count,
@@ -1487,6 +1467,7 @@ fn run_loop_with_side<B: Backend, E: EventSource>(
                 &session_ui.current_model,
                 chunks[2].width,
                 theme,
+                side_label.as_ref(),
             );
             f.render_widget(statusbar_line, chunks[2]);
 
@@ -3292,18 +3273,59 @@ pub(crate) fn is_exit_command(text: &str) -> bool {
     )
 }
 
-/// 旁支视图顶部的状态行。
+/// 状态栏里该显示的旁支段。
 ///
-/// 通知（拒绝原因、投递失败、`/cost` 输出）以前只写进 `SideSession::notice`
-/// 这个字段，**从来没有被渲染过**——用户看到的是「按了没反应」。
+/// 规则只有一条：**错误优先于身份**。用户此刻需要知道的是「刚才那一下为什么
+/// 没生效」，而不是「你在旁支里」。所以有通知时完整文本换成通知，但窄屏必留
+/// 段仍是「旁问 · /back」——错误再重要，也不能让人不知道自己在哪、怎么出去。
 ///
-/// 有通知时**只画通知**，不把它接在基础提示后面：状态行只有一行，基础提示
-/// 本身就有四十多个列宽的中文，接上去会超宽，错误信息被裁掉最关键的尾部
-/// （「没送达」恰好在末尾）。错误优先于身份提示，这与主视图同一条规则。
-fn side_status_line(parent_running: bool, notice: Option<&str>) -> String {
-    match notice.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(notice) => notice.to_string(),
-        None => side_header_line(parent_running, false),
+/// 主视图只显示后台操作失败（spec §6.2）：旁支正文和身份都不进父视图，
+/// 否则用户会以为自己在旁支里。
+fn side_status_label(
+    in_side: bool,
+    parent: SideParentState,
+    side: &SideSession,
+) -> Option<SideStatusLabel> {
+    let notice = side
+        .notice
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if in_side {
+        // 错误优先：用户此刻要知道的是「刚才那一下为什么没生效」。
+        let extra = match notice {
+            Some(notice) => notice.to_string(),
+            None => side_parent_state_text(parent),
+        };
+        return Some(SideStatusLabel::side(Some(&extra)));
+    }
+    // 回到主视图后，后台关闭失败仍然要能看到；旁支身份则不再显示。
+    side.main_operation_notice()
+        .map(|notice| SideStatusLabel::main(&notice))
+}
+
+/// 主会话此刻的状态，从旁支角度看。
+///
+/// 「等待审批」必须先于「运行中」判断：卡在审批上的父会话在技术上仍在运行，
+/// 但对用户来说它是**停住了**，只说「运行中」会让人以为不用管。
+#[derive(Debug, Clone, Copy)]
+struct SideParentState {
+    running: bool,
+    awaiting_approval: bool,
+}
+
+/// 旁支里父会话状态的短文案。
+///
+/// 这三个词现在是旁支身份的唯一措辞来源（原来的转录首行 header 已删除，
+/// 因为它遮住旁支第一条正文）。父会话的审批**详情**只能回父视图看，
+/// 这里只允许一句状态（spec §7）。
+fn side_parent_state_text(parent: SideParentState) -> String {
+    if parent.awaiting_approval {
+        "父会话等待审批".to_string()
+    } else if parent.running {
+        "父会话运行中".to_string()
+    } else {
+        "父会话空闲".to_string()
     }
 }
 
@@ -8276,7 +8298,170 @@ mod tests {
         side_events: tokio::sync::mpsc::Receiver<crate::tui::side::ConversationEvent>,
         parent_draft: &str,
     ) -> (String, InputLine) {
-        let backend = TestBackend::new(80, 24);
+        side_repair_run_loop_sized(
+            delivered_in_order,
+            parent_agent_events,
+            decision_tx,
+            side_cmd_tx,
+            side_events,
+            parent_draft,
+            (80, 24),
+            TuiTheme::DARK,
+        )
+    }
+
+    /// 在旁支视图里跑一拍循环，返回该帧的屏幕文本。
+    fn side_repair_run_loop_in_side(
+        size: (u16, u16),
+        theme: TuiTheme,
+        first_item: &str,
+    ) -> (String, InputLine) {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, _side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(8);
+        side_tx.try_send(side_repair_status_frame()).unwrap();
+        side_tx
+            .try_send(crate::tui::side::ConversationEvent {
+                target: ConversationTarget::Side {
+                    side_id: "side-1".into(),
+                    generation: 1,
+                },
+                turn_id: Some("turn-1".into()),
+                event: ConversationPayload::SideItems(vec![std::sync::Arc::new(
+                    yi_agent_runtime::side_conversation::SideItem {
+                        id: "first".into(),
+                        turn_id: "turn-1".into(),
+                        ordinal: 1,
+                        content:
+                            yi_agent_runtime::side_conversation::SideItemContent::AgentMessage {
+                                text: first_item.to_string(),
+                            },
+                    },
+                )]),
+            })
+            .unwrap();
+        drop(side_tx);
+        let _ = (&input_tx, &interrupt_tx, &kill_tx, &control_tx);
+
+        // 先给一个不改状态的事件，让循环真正画一帧再退出：`Ctrl+Q` 在退出前
+        // 不会补画，直接把它当第一个事件会得到一张空屏，测不到任何东西。
+        side_repair_run_loop_sized(
+            vec![Event::Resize(size.0, size.1), ctrl('q')],
+            Vec::new(),
+            decision_tx,
+            side_cmd_tx,
+            side_rx,
+            "",
+            size,
+            theme,
+        )
+    }
+
+    /// 主视图（没有任何旁支帧）的一帧屏幕文本。
+    fn side_repair_main_view_screen() -> (String, InputLine) {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, _kill_tx) = tokio::sync::mpsc::channel::<String>(4);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(4);
+        let (decision_tx, _decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(4);
+        let (side_cmd_tx, _side_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::side_driver::SideDriverCommand>(8);
+        let (side_tx, side_rx) = tokio::sync::mpsc::channel(1);
+        drop(side_tx);
+        let _ = (&input_tx, &interrupt_tx, &kill_tx, &control_tx);
+
+        side_repair_run_loop_sized(
+            vec![Event::Resize(80, 24), ctrl('q')],
+            Vec::new(),
+            decision_tx,
+            side_cmd_tx,
+            side_rx,
+            "",
+            (80, 24),
+            TuiTheme::DARK,
+        )
+    }
+
+    /// 旁支身份不能占转录首行：第一条正文必须完整可见。
+    ///
+    /// 旧实现把 header 盖在 history 区域顶上并 `Clear`，而旁支的第一条正文
+    /// 恰好就在那一行——开旁支先丢第一句回答（spec §7）。身份改到状态栏后，
+    /// 首条正文和 `/side · /back` 必须同时出现在屏幕上。
+    #[test]
+    fn side_status_bar_labels_the_conversation_without_covering_the_first_item() {
+        const FIRST_SIDE_ITEM: &str = "FIRST_SIDE_ITEM";
+        for (size, theme) in [
+            ((80u16, 24u16), TuiTheme::DARK),
+            ((80, 24), TuiTheme::LIGHT),
+            ((32, 12), TuiTheme::DARK),
+            ((32, 12), TuiTheme::LIGHT),
+        ] {
+            let (screen, _) = side_repair_run_loop_in_side(size, theme, FIRST_SIDE_ITEM);
+            assert!(
+                screen.contains(FIRST_SIDE_ITEM),
+                "{size:?} {theme:?} 下旁支第一条正文不能被身份标识覆盖，实际屏幕:\n{screen}"
+            );
+            assert!(
+                screen.contains("/side"),
+                "{size:?} {theme:?} 下状态栏要标明旁支入口，实际屏幕:\n{screen}"
+            );
+            assert!(
+                screen.contains("/back"),
+                "{size:?} {theme:?} 下窄屏也必须留下返回命令，实际屏幕:\n{screen}"
+            );
+            assert!(
+                screen.contains("旁问"),
+                "{size:?} {theme:?} 下读屏要能识别当前在旁支，实际屏幕:\n{screen}"
+            );
+            assert!(
+                !screen.contains("旁支可用工具（只读）"),
+                "介绍文案只能在主动 /help 时出现，不能常驻，实际屏幕:\n{screen}"
+            );
+            // 状态行只有一行：溢出会折行并挤掉输入区。
+            assert!(
+                screen.contains("test-model") || screen.contains("/back"),
+                "{size:?} 下状态栏不能被拼到溢出，实际屏幕:\n{screen}"
+            );
+        }
+    }
+
+    /// 普通父视图不挂常驻旁支提示（spec §7：不增加「可继续旁问」模块）。
+    #[test]
+    fn main_view_has_no_standalone_side_banner() {
+        let (screen, _) = side_repair_run_loop_in_side((80, 24), TuiTheme::DARK, "SIDE_ITEM");
+        assert!(screen.contains("旁问"));
+
+        let (main_screen, _) = side_repair_main_view_screen();
+        assert!(
+            !main_screen.contains("旁问"),
+            "回到主视图后不该再有常驻旁支提示，实际屏幕:\n{main_screen}"
+        );
+        assert!(!main_screen.contains("旁支可用工具"));
+    }
+
+    /// 同 `side_repair_run_loop_with`，但可指定终端尺寸与主题。
+    ///
+    /// 窄屏（32 列）是状态栏预算真正吃紧的地方：`.expect("FULL")` 之外再加
+    /// 「旁问 · /back」就可能超宽。窗口尺寸写死 80×24 的用例看不出这个。
+    #[allow(clippy::too_many_arguments)]
+    fn side_repair_run_loop_sized(
+        delivered_in_order: Vec<Event>,
+        parent_agent_events: Vec<AgentEvent>,
+        decision_tx: tokio::sync::mpsc::Sender<(u64, yi_agent_core::permission::Decision)>,
+        side_cmd_tx: tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        side_events: tokio::sync::mpsc::Receiver<crate::tui::side::ConversationEvent>,
+        parent_draft: &str,
+        (width, height): (u16, u16),
+        theme: TuiTheme,
+    ) -> (String, InputLine) {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         for event in parent_agent_events {
@@ -8323,7 +8508,7 @@ mod tests {
             yi_agent_mcp::McpManager::empty(),
             &snapshot_for_tests(),
             &catalog_for_tests(),
-            TuiTheme::DARK,
+            theme,
             &mut title,
             crate::tui::app::SideRuntime::new(side_cmd_tx, side_events),
         )
