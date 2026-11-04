@@ -544,7 +544,7 @@ assert!(side_rx.try_recv().is_ok());
 「旁·问父关会闭话未空送闲达」。`frame_text` 现在按终端语义推进 x（宽字符占两列），
 这与真实终端显示一致。
 
-门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 712 passed, 0 failed；
+门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 715 passed, 0 failed；
 `cargo test -p yi-agent --bin yi-agent side_repair_` = 21 passed；
 `cargo test -p yi-agent --bin yi-agent side_driver` = 9 passed；
 `cargo fmt --all` + `just fmt-check` 通过；`cargo clippy -p yi-agent --all-targets` 无告警。

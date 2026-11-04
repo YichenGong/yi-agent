@@ -248,7 +248,7 @@ spec 与 plan：`docs/superpowers/specs/2026-11-05-side-conversation-repair-desi
 
 ```bash
 (cd desktop && npx tsc --noEmit && npx vitest run)     # 159 files / 2226 tests passed
-(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 712 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 715 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_)       # 21 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_driver)        # 9 passed
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log)
@@ -279,7 +279,7 @@ git diff --check                                        # 无输出
 | T06 | `side_repair_first_ctrl_c_in_side_stops_only_the_side`、`side_repair_editing_after_ctrl_c_rearms_the_confirmation` | 未执行（真实清理器/租约未单测覆盖，见 5.4） |
 | T07 | `side_repair_ctrl_q_quits_even_with_the_runtime_popup_open`、`side_repair_ctrl_q_quits_with_a_pending_parent_approval`、`side_repair_quit_commands_leave_the_side_without_a_submit` | 未执行 |
 | T08 | `side_repair_esc_closes_the_popup_before_stopping` | 未执行 |
-| T09 | 上列两条 Full/Closed 用例 + driver 的 `stale_close_target_reports_error_and_keeps_the_live_side`、`stale_interrupt_does_not_stop_the_live_turn`、`failed_open_reports_a_main_target_error` | 未执行 |
+| T09 | 上列两条 Full/Closed 用例 + driver 的 `stale_close_target_reports_error_and_keeps_the_live_side`、`stale_interrupt_does_not_stop_the_live_turn`、`failed_open_reports_a_main_target_error`、`a_close_without_a_turn_id_refuses_a_running_side`、`a_refused_close_shows_why_in_the_visible_side`；`stopping_a_side_whose_turn_is_not_known_yet_says_so`、`esc_on_a_side_whose_turn_is_not_known_yet_says_so` | 未执行 |
 | T10 | `side_status_bar_labels_the_conversation_without_covering_the_first_item`（80×24 与 32×12 × 深/浅）、`main_view_has_no_standalone_side_banner`、`side_events_never_reach_main_turn_log` | 未执行 |
 
 W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`b7945d47`、`14c579b3`、`eb13ca07`、
@@ -322,7 +322,7 @@ W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`
   并断言冲突错误回到**发起关闭的那个旁支**且文案含「正在回答」。
 - 可见性已验证：`tui::app::notification_tests::a_refused_close_shows_why_in_the_visible_side`。
   临时把 `apply_operation_error` 的 `notice` 写入删掉 → 该用例 FAILED，恢复后通过。
-- 门禁：`tui::` = 713 passed、`side_driver` = 10 passed、`side_repair_` = 21 passed、
+- 门禁：`tui::` = 713 passed（修完该缺陷当时）、`side_driver` = 10 passed、`side_repair_` = 21 passed、
   `just ci` = CI passed。
 
 ### 5.5 自查发现的第五个缺陷：轮次 id 未回传时停止键静默
