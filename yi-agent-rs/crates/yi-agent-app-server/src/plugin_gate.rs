@@ -17,7 +17,7 @@ use yi_agent_supervisors::supervisor::Layout;
 /// `switch_key` 在当前清单格式里必填且非空（`ManifestError::EmptySwitchKey`），
 /// 所以不需要 `Option` 分支。
 pub fn flag_is_on(flags_path: &Path, switch_key: &str, build_kind: &str) -> bool {
-    yi_agent_flags::store::status_at(flags_path, switch_key, build_kind, None).0
+    yi_agent_flags::store::status_for_switch_at(flags_path, switch_key, build_kind, None).0
 }
 
 /// 这个插件在清单里声明的 flag 名。没有清单（未安装）→ `None`。
@@ -94,10 +94,10 @@ mod tests {
         let path = dir.path().join("flags.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
-        assert!(flag_is_on(&path, "superpowers_kanban", "dev"));
+        assert!(flag_is_on(&path, "example_plugin_switch", "dev"));
     }
 
     #[test]
@@ -106,11 +106,11 @@ mod tests {
         let path = dir.path().join("flags.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
         assert!(
-            !flag_is_on(&path, "superpowers_kanban", "release"),
+            !flag_is_on(&path, "example_plugin_switch", "release"),
             "stable must never let a dev flag through"
         );
     }
@@ -120,18 +120,28 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!flag_is_on(
             &dir.path().join("flags.json"),
-            "superpowers_kanban",
+            "example_plugin_switch",
             "dev"
         ));
     }
 
     #[test]
-    fn an_unregistered_name_is_off() {
-        // `read_at` 对未注册的名字一律返回 `None`：只有注册表里的才能开。
+    fn a_switch_key_the_manifest_declares_is_honoured() {
+        // 清单自述的 `switch_key` 不需要在宿主注册表里登记——否则装一个插件
+        // 就得改一次主程序，第二个插件永远忘了改。
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("flags.json");
-        std::fs::write(&path, r#"{"version":1,"flags":{"not_registered":true}}"#).unwrap();
-        assert!(!flag_is_on(&path, "not_registered", "dev"));
+        std::fs::write(&path, r#"{"version":1,"flags":{"plain_on":true}}"#).unwrap();
+        assert!(flag_is_on(&path, "plain_on", "dev"));
+    }
+
+    #[test]
+    fn a_key_absent_from_the_file_is_off() {
+        // 未知键不等于开：文件里没有就当作关。
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("flags.json");
+        std::fs::write(&path, r#"{"version":1,"flags":{"other":true}}"#).unwrap();
+        assert!(!flag_is_on(&path, "not_present", "dev"));
     }
 
     #[test]

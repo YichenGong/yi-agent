@@ -34,7 +34,7 @@ fn a_managed_skill_is_reported_with_its_own_source_not_as_user_or_system() {
         vec![(user.path().to_path_buf(), SkillScope::User)],
         vec![ManagedRoot {
             path: managed.path().to_path_buf(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.4.0".into(),
         }],
     );
@@ -49,7 +49,7 @@ fn a_managed_skill_is_reported_with_its_own_source_not_as_user_or_system() {
     );
     match &skills[0].source {
         SkillSource::Managed { plugin, version } => {
-            assert_eq!(plugin, "superpowers-kanban");
+            assert_eq!(plugin, "example-plugin");
             assert_eq!(version, "1.4.0");
         }
         other => panic!("expected a managed source, got {other:?}"),
@@ -88,7 +88,7 @@ fn a_name_clash_between_managed_and_user_is_reported_with_both_paths() {
         vec![(user.path().to_path_buf(), SkillScope::User)],
         vec![ManagedRoot {
             path: managed.path().to_path_buf(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.4.0".into(),
         }],
     );
@@ -127,7 +127,7 @@ fn a_clash_blocks_automation_but_still_publishes_a_catalog() {
         vec![(user.path().to_path_buf(), SkillScope::User)],
         vec![ManagedRoot {
             path: managed.path().to_path_buf(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.4.0".into(),
         }],
     );
@@ -156,7 +156,7 @@ fn no_clash_means_automation_is_allowed() {
         Vec::new(),
         vec![ManagedRoot {
             path: managed.path().to_path_buf(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.4.0".into(),
         }],
     );
@@ -186,7 +186,7 @@ fn only_the_given_release_directory_is_scanned() {
         Vec::new(),
         vec![ManagedRoot {
             path: old.clone(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.3.0".into(),
         }],
     );
@@ -207,7 +207,7 @@ fn a_missing_managed_root_yields_no_skill_and_no_error() {
         Vec::new(),
         vec![ManagedRoot {
             path: Path::new("/nonexistent/release/dir").to_path_buf(),
-            plugin: "superpowers-kanban".into(),
+            plugin: "example-plugin".into(),
             version: "1.4.0".into(),
         }],
     );

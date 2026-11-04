@@ -2518,7 +2518,6 @@ fn handle_key(key: KeyEvent, ctx: &mut KeyContext<'_>) -> KeyOutcome {
                         ctx.view.input.clear();
                         return execute_slash_command(
                             cmd,
-                            None,
                             args_str,
                             ctx.view.history,
                             ctx.view.history_width,
@@ -2610,7 +2609,6 @@ fn handle_key(key: KeyEvent, ctx: &mut KeyContext<'_>) -> KeyOutcome {
                     *ctx.view.popup = None;
                     return execute_slash_command(
                         cmd,
-                        Some(name.to_string()),
                         args,
                         ctx.view.history,
                         ctx.view.history_width,
@@ -2995,8 +2993,6 @@ fn handle_model_command(
 #[allow(clippy::too_many_arguments)]
 fn execute_slash_command(
     cmd: SlashCommand,
-    // 用户实际敲的命令名（用于提示已改名的过渡别名）。
-    invoked_as: Option<String>,
     args: Option<String>,
     history: &mut HistoryState,
     width: u16,
@@ -3230,25 +3226,6 @@ fn execute_slash_command(
                 Err(usage) => usage,
             };
             history.push(HistoryCell::Separator { label: Some(label) }, width);
-            KeyOutcome::None
-        }
-        SlashCommand::Kanban => {
-            // `/kanban` 是过渡别名；命中时先提示规范名，避免肌肉记忆继续传播旧名。
-            if invoked_as.as_deref() == Some("kanban") {
-                history.push(
-                    HistoryCell::Separator {
-                        label: Some("已更名为 /superpowers-kanban".to_string()),
-                    },
-                    width,
-                );
-            }
-            // 全部子命令（含 create/remove/status）都经**通用插件通道**：宿主
-            // 已不再有看板登记表或看板生命周期，创建/移除是插件自己的动作。
-            let args = args.as_deref().unwrap_or("");
-            let lines = crate::tui::superpowers_kanban::handle_kanban(workdir, args).lines;
-            for line in lines {
-                history.push(HistoryCell::Separator { label: Some(line) }, width);
-            }
             KeyOutcome::None
         }
         SlashCommand::Plugins => {
@@ -6274,322 +6251,6 @@ mod tests {
             .collect()
     }
 
-    // ----- /superpowers-kanban dispatch tests -----
-
-    /// /superpowers-kanban dispatch 测试的前置件：history、成本表、四个命令通道
-    /// 与已投递插话账本。抽成别名以免 `type_complexity` 报警。
-    type KanbanHarness = (
-        HistoryState,
-        CostTracker,
-        tokio::sync::mpsc::Sender<String>,
-        tokio::sync::mpsc::Sender<()>,
-        tokio::sync::mpsc::Sender<String>,
-        tokio::sync::mpsc::Sender<crate::DriverControl>,
-        crate::tui::queued::DeliveredInterjections,
-    );
-
-    /// 建一个 command 的通道与 history，返回可复用的前置件。
-    fn kanban_harness() -> KanbanHarness {
-        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
-        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
-        let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::DriverControl>(8);
-        (
-            HistoryState::new(),
-            CostTracker::default(),
-            input_tx,
-            interrupt_tx,
-            kill_tx,
-            control_tx,
-            crate::tui::queued::DeliveredInterjections::new(),
-        )
-    }
-
-    #[test]
-    fn kanban_status_for_a_directory_without_a_board_points_at_create() {
-        let project = tempfile::TempDir::new().unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        let outcome = execute_slash_command(
-            SlashCommand::Kanban,
-            None,
-            Some("status".into()),
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            project.path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        assert_eq!(outcome, KeyOutcome::None);
-        let labels = separator_labels(&history);
-        assert!(
-            labels.iter().any(|l| l.contains("未创建")),
-            "status 走进生命周期、如实报告没有看板：{labels:?}"
-        );
-    }
-
-    #[test]
-    fn config_warns_when_focus_events_are_unavailable() {
-        let project = tempfile::TempDir::new().unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-        let mut config = snapshot_for_tests();
-        config.focus_degraded = true;
-        config.notification_condition = "unfocused".into();
-
-        execute_slash_command(
-            SlashCommand::Config,
-            None,
-            None,
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            project.path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &config,
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        let rendered: String = history
-            .cells
-            .iter()
-            .filter_map(|c| match c {
-                HistoryCell::Markdown { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            rendered.contains("退化为 always"),
-            "焦点事件不可用时必须提示条件已退化：{rendered}"
-        );
-    }
-
-    #[test]
-    fn config_stays_quiet_when_focus_events_work() {
-        let project = tempfile::TempDir::new().unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        execute_slash_command(
-            SlashCommand::Config,
-            None,
-            None,
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            project.path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        let rendered: String = history
-            .cells
-            .iter()
-            .filter_map(|c| match c {
-                HistoryCell::Markdown { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !rendered.contains("退化为 always"),
-            "焦点事件正常时不该出现降级提示：{rendered}"
-        );
-    }
-
-    #[test]
-    fn kanban_create_is_dispatched_through_the_plugin_channel() {
-        // 用一个「不是目录」的 workdir 让 create 在起 daemon 之前就被拒：既不
-        // 碰真实 $HOME 登记，也钉住 create 确实被派给了**插件通道**（宿主已不再
-        // 自己管看板生命周期）。
-        let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("not-a-dir");
-        std::fs::write(&file, "x").unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        let outcome = execute_slash_command(
-            SlashCommand::Kanban,
-            None,
-            Some("create".into()),
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            file.as_path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        assert_eq!(outcome, KeyOutcome::None);
-        let labels = separator_labels(&history);
-        assert!(
-            labels.iter().any(|l| l.contains("create 失败")),
-            "create 必须走通用插件通道并如实报告失败：{labels:?}"
-        );
-    }
-
-    #[test]
-    fn kanban_plugin_arguments_still_go_through_the_plugin_channel() {
-        // 非生命周期子命令（这里是拼错的 sideways）仍归插件通道：它给的是
-        // 插件那条 usage，而不是生命周期的 usage——两条通道各管各的。
-        let project = tempfile::TempDir::new().unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        execute_slash_command(
-            SlashCommand::Kanban,
-            None,
-            Some("sideways".into()),
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            project.path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        let labels = separator_labels(&history);
-        assert!(
-            labels
-                .iter()
-                .any(|l| l.contains("usage: /superpowers-kanban") && l.contains("add")),
-            "插件通道的 usage 必须保留：{labels:?}"
-        );
-    }
-
-    #[test]
-    fn kanban_lifecycle_with_extra_words_does_not_run_the_lifecycle() {
-        // `create garbage` 是打错了子命令，不是「带着参数去 create」。放它过去会
-        // 真起一个 daemon，所以只能给用法。这里用一个不存在的路径当 workdir：一旦
-        // 真的派给 create，报错会是「看板创建失败」而不是 usage，测试即失败。
-        let dir = tempfile::TempDir::new().unwrap();
-        let missing = dir.path().join("never-created");
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        execute_slash_command(
-            SlashCommand::Kanban,
-            None,
-            Some("create garbage".into()),
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            missing.as_path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        let labels = separator_labels(&history);
-        assert!(
-            labels
-                .iter()
-                .any(|l| l.contains("usage: /superpowers-kanban")),
-            "多余参数必须只给用法：{labels:?}"
-        );
-        assert!(
-            !labels.iter().any(|l| l.contains("看板创建")),
-            "多余参数不得触发生命周期：{labels:?}"
-        );
-    }
-
-    #[test]
-    fn the_legacy_kanban_alias_still_prints_the_rename_notice() {
-        // `/kanban` 作为过渡别名仍可用，但命中时先提示规范名——这条逻辑不能被
-        // 新子命令的分发挤掉。
-        let project = tempfile::TempDir::new().unwrap();
-        let (mut history, cost, input_tx, interrupt_tx, kill_tx, control_tx, mut queued) =
-            kanban_harness();
-
-        execute_slash_command(
-            SlashCommand::Kanban,
-            Some("kanban".to_string()),
-            Some("sideways".into()),
-            &mut history,
-            80,
-            &cost,
-            &input_tx,
-            &interrupt_tx,
-            &kill_tx,
-            &control_tx,
-            project.path(),
-            &mut queued,
-            &yi_agent_mcp::McpManager::empty(),
-            &snapshot_for_tests(),
-            "test-model",
-            None,
-            &catalog_for_tests(),
-            None,
-            EffortSource::Unset,
-        );
-
-        assert_eq!(
-            separator_labels(&history)[0],
-            "已更名为 /superpowers-kanban",
-            "旧别名的改名提示必须还在"
-        );
-    }
-
     #[test]
     fn hidden_commands_explain_themselves_instead_of_unknown() {
         for (command, needle) in [
@@ -6606,7 +6267,6 @@ mod tests {
             let mut queued = crate::tui::queued::DeliveredInterjections::new();
             let _ = execute_slash_command(
                 command,
-                None,
                 None,
                 &mut history,
                 80,
@@ -10362,7 +10022,6 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Clear,
             None,
-            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -10663,7 +10322,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Effort,
-            None,
             Some("high".into()),
             &mut history,
             80,
@@ -10693,7 +10351,6 @@ mod tests {
         // `/effort` 无参:只打印,不发命令。
         let outcome = execute_slash_command(
             SlashCommand::Effort,
-            None,
             None,
             &mut history,
             80,
@@ -10824,7 +10481,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Model,
-            None,
             Some("B".into()),
             &mut history,
             80,
@@ -10856,7 +10512,6 @@ mod tests {
         // `/model default` → 清空标记,跟随 default_model。
         let outcome = execute_slash_command(
             SlashCommand::Model,
-            None,
             Some("default".into()),
             &mut history,
             80,
@@ -10893,7 +10548,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outcome = execute_slash_command(
             SlashCommand::Daemon,
-            None,
             Some("status".into()),
             &mut history,
             80,
@@ -10932,7 +10586,6 @@ mod tests {
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let _ = execute_slash_command(
             SlashCommand::Daemon,
-            None,
             Some("start".into()),
             &mut history,
             80,
@@ -10980,7 +10633,6 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Cost,
             None,
-            None,
             &mut history,
             80,
             &cost,
@@ -11027,7 +10679,6 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Config,
             None,
-            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -11070,7 +10721,6 @@ mod tests {
         let mut queued = crate::tui::queued::DeliveredInterjections::new();
         let outcome = execute_slash_command(
             SlashCommand::Cost,
-            None,
             None,
             &mut history,
             80,
@@ -11117,7 +10767,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
-            None,
             Some("on".into()),
             &mut history,
             80,
@@ -11157,7 +10806,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
-            None,
             Some("disable nope".into()),
             &mut history,
             80,
@@ -11207,7 +10855,6 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Mcp,
             None,
-            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -11252,7 +10899,6 @@ mod tests {
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
             None,
-            None,
             &mut history,
             80,
             &CostTracker::default(),
@@ -11296,7 +10942,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
-            None,
             Some("never".into()),
             &mut history,
             80,
@@ -11343,7 +10988,6 @@ mod tests {
 
         let outcome = execute_slash_command(
             SlashCommand::Runtime,
-            None,
             Some("sometimes".into()),
             &mut history,
             80,

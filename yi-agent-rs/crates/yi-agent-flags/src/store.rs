@@ -87,6 +87,38 @@ pub fn read_at(path: &Path, name: &str) -> Result<Option<bool>, FlagError> {
     Ok(load_map(path).get(name).and_then(|v| v.as_bool()))
 }
 
+/// 插件清单声明的开关：**不要求**名字在宿主注册表里登记过。
+///
+/// # 为什么必须另开一条路
+///
+/// 宿主注册表（[`REGISTRY`]）是**宿主自己**的功能开关清单。插件清单里的
+/// `switch_key` 是插件自述的，主程序拿到的是字符串而不是一个注册项——要求它
+/// 先登记就等于「装一个插件要在主程序里改一次代码」，与「加插件不用改主程序」
+/// 直接冲突，而且第二个插件永远忘了改。
+///
+/// 拼写保护仍然存在，但落在**清单**这一层：`switch_key` 必填非空，且它决定
+/// 的是「这个插件该不该起」，读不到的键一律当作关——不会把未知键当成开。
+pub fn status_for_switch_at(
+    path: &Path,
+    switch_key: &str,
+    build_kind: &str,
+    env_override: Option<&str>,
+) -> (bool, Source) {
+    if build_kind != "dev" {
+        return (false, Source::BuildKind);
+    }
+    if let Some(raw) = env_override {
+        return (raw == "1", Source::Env);
+    }
+    match load_map(path)
+        .get(switch_key)
+        .and_then(|value| value.as_bool())
+    {
+        Some(value) => (value, Source::File),
+        None => (false, Source::Default),
+    }
+}
+
 /// 「默认 → 文件 → 环境变量 → 构建类型」的完整取值链。
 pub fn status_at(
     path: &Path,
@@ -246,6 +278,40 @@ mod tests {
         let path = dir.path().join("flags.json");
         let err = write_at(&path, "no_such_flag", true).unwrap_err();
         assert!(matches!(err, FlagError::UnknownFlag(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_manifest_declared_switch_needs_no_registry_entry() {
+        // 插件清单自述 `switch_key`；主程序不该要求它先在注册表登记。
+        // 第二个插件因此不需要改主程序代码。
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("flags.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"flags":{"some_plugin_switch":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_for_switch_at(&path, "some_plugin_switch", "dev", None),
+            (true, Source::File)
+        );
+        // 清单里没有的键仍然是关，不会被当成开。
+        assert_eq!(
+            status_for_switch_at(&path, "never_declared", "dev", None),
+            (false, Source::Default)
+        );
+    }
+
+    #[test]
+    fn a_manifest_switch_is_still_subject_to_the_build_kind_gate() {
+        // 这条捷径只跳过「注册表登记」，不跳过 stable 硬闸。
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("flags.json");
+        std::fs::write(&path, r#"{"version":1,"flags":{"k":true}}"#).unwrap();
+        assert_eq!(
+            status_for_switch_at(&path, "k", "release", Some("1")),
+            (false, Source::BuildKind)
+        );
     }
 
     #[test]

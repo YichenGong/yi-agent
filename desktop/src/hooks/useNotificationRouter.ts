@@ -52,7 +52,7 @@ export interface NotificationRouterDeps {
   force: (updater: (v: number) => number) => void;
   markThreadRead: (id: string) => void;
   schedulePersist: (id: string) => void;
-  selectThread: (id: string, opts?: { leaveBoard?: boolean }) => Promise<void>;
+  selectThread: (id: string, opts?: { forceResume?: boolean }) => Promise<void>;
   /**
    * 该 thread 收到了活动（任意帧），用来给 resume 的停滞检测续命。
    * 只在 `ownsThreadView` 判定之后调用——非活动槽位的帧不写本视图，用它们

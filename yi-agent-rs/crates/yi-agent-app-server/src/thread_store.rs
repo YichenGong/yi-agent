@@ -4235,7 +4235,7 @@ mod tests {
         let binding = yi_agent_plugins::Binding {
             host_id: "host-abc".into(),
             release: yi_agent_plugins::ReleaseId {
-                plugin: yi_agent_plugins::PluginId::parse("superpowers-kanban").unwrap(),
+                plugin: yi_agent_plugins::PluginId::parse("example-plugin").unwrap(),
                 version: "1.4.0".into(),
                 target: "darwin-aarch64".into(),
                 sha256: "ab".repeat(32),

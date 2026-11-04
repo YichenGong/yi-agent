@@ -13,7 +13,6 @@ import { createNotificationRouter } from "./hooks/useNotificationRouter";
 import { createHandshakeRecovery } from "./hooks/useHandshakeRecovery";
 import { createConnectionLifecycle } from "./hooks/connectionLifecycle";
 import { useProcessState } from "./hooks/useProcessState";
-import { useBoardState } from "./hooks/useBoardState";
 import { useSessionState } from "./hooks/useSessionState";
 import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
@@ -77,18 +76,8 @@ import {
 import { writeSelectedThread } from "./lib/selectedThread";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
-import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
-import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
-import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
-import {
-  enqueueBoardCard,
-  enqueuePrequeuedCard,
-  promoteBoardCard,
-  writeBoardWatchman,
-} from "./lib/superpowersKanbanSwitch";
-import { type BoardErrorKind, boardErrorKind } from "./lib/boardIndex";
-import { createBoard, removeBoard } from "./lib/superpowersKanbanBoards";
 import { pluginProjectPaths } from "./lib/pluginSettings";
+import { writeWatchman } from "./lib/watchman";
 import { threadStartParams, usesLocalPaths } from "./lib/threadStart";
 import {
   permissionModeFromResponse,
@@ -116,19 +105,6 @@ import { resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
-
-/**
- * 看板失败的三种说法。
- *
- * 两种可操作的状态各自点名下一步：进程不可达就说明是连接问题而不是插件问题，
- * 插件没装才让用户去装。`other` 不猜原因。**没有「未创建」这一支**：宿主不再
- * 发这个码——「有没有看板」由登记表（`resident/list`）表达，不是一个错误。
- */
-const BOARD_ERROR_TEXT: Record<BoardErrorKind, string> = {
-  daemon_down: "看板进程不可达",
-  plugin_missing: "插件未安装",
-  other: "看板读写失败",
-};
 
 /**
  * Read the persisted permission mode for a thread from the `thread/listAll`
@@ -296,13 +272,6 @@ export default function App() {
   const [leadAgentEnabled, setLeadAgentEnabled] = useState<boolean | null>(
     null,
   );
-  /**
-   * Superpowers 看板开关（`flags/list` 里的 `superpowers_kanban`）。`null` = 还不知道。
-   *
-   * 与组长同一口径：stable 上服务端恒为关，不需要再判 `buildKind`；`null` 时按
-   * **关**处理，因为关掉会停掉整个 daemon，先藏一帧远好过画出一堆点不动的东西。
-   */
-  const [kanbanEnabled, setKanbanEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -496,7 +465,7 @@ export default function App() {
   // **必须排在 `sess` 之前**：`useSessionState` 要拿 `prefs.pairingVersion` 判断
   // 「服务端换了没有」，写在后面会踩 TDZ。反过来 `useSettingsState` 只依赖
   // `rpc`/`force`/`setCurrentError`，三者此刻都已可用，不依赖 `sess`/`proc`/
-  // `diff`/`board`——两者没有循环，只是原先的书写顺序恰好相反。
+  // `diff`——两者没有循环，只是原先的书写顺序恰好相反。
   // `isMobile` 决定字号偏好的归属：两个平台各占 preferences.json 里的一个键，
   // 默认档也不同（手机 small、桌面 standard）。`isMobile` 在本函数开头就已求值
   // （`useIsMobile()`），故这里不踩 TDZ。
@@ -531,16 +500,13 @@ export default function App() {
   // 见 `hooks/useDiffState.ts`。面板开合不在这里：它属会话关注点，由下面几处
   // 调用点在重置 diff 的同一现场自己收起。
   const diff = useDiffState({ rpc, currentIdRef: sess.currentIdRef });
-  // 看板关注点（看板页状态/侧栏登记表与摘要/后台值守）整体搬进 hook，见
-  // `hooks/useBoardState.ts`。跨关注点的编排不在这里：`selectThread`/`newThread`
-  // 的「离开看板」、`onCreateBoard` 等几个动作（要写会话错误位与 force）、以及
-  // 握手后拉登记表与注册 2 秒计时器那两个现场，都留在 App，只把引用改成 `board.*`。
-  //  `kanbanEnabled` 传 `=== true`：`null`（还不知道）时按关处理，一个请求都不发。
-  //  开关值在握手后读取，读回来会让本 hook 的两个 callback 换新，从而重挂计时器。
-  const board = useBoardState({
-    clientRef,
-    kanbanEnabled: kanbanEnabled === true,
-  });
+  // 后台值守是**宿主级**设置（登录项），不属于任何插件。以前它挂在看板 hook
+  // 里，随看板一起被删掉了；这里只留它自己的三样东西。
+  const [watchmanEnabled, setWatchmanEnabled] = useState<boolean | undefined>(
+    undefined,
+  );
+  const [watchmanWarning, setWatchmanWarning] = useState<string | null>(null);
+  const watchmanTouchedRef = useRef(false);
 
   /**
    * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
@@ -652,7 +618,6 @@ export default function App() {
         const read = (name: string) =>
           rows.find((row) => row.name === name)?.enabled === true;
         setLeadAgentEnabled(read("lead_agent"));
-        setKanbanEnabled(read("superpowers_kanban"));
         // 关掉远端开关时立刻清掉所有远端连接与进程（spec §5.4）。只改
         // `flags.json` 的话，已经连上的 ssh 会一直跑，用户看到的是「开关关了，
         // 远端还在」。写后处理放在前端而不是 Rust 侧：`flags/set` 在宿主里是
@@ -752,7 +717,6 @@ export default function App() {
   const canSearchRef = useRef(false);
   canSearchRef.current =
     sess.currentId !== null &&
-    board.selectedBoard === null &&
     !prefs.settingsOpen &&
     current?.approval == null;
 
@@ -874,7 +838,7 @@ export default function App() {
    */
   const selectThread = async (
     id: string,
-    opts?: { leaveBoard?: boolean; forceResume?: boolean },
+    opts?: { forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
     if (prevId !== id) captureTranscriptRef.current?.();
@@ -899,12 +863,6 @@ export default function App() {
       prefillFromCache(id);
     // 切走即把上一条会话的在途内容落盘（切回时预填的就是它）。
     if (prevId && prevId !== id) void flushContent(prevId);
-    // 会话页成为当前页：离开看板（若正在看）。这样点侧栏任意会话即「跳转」
-    // 过去，不必再点一次「收起看板」。setSelectedBoard 幂等，不在看板时无害。
-    // 仅当这是「用户切到会话」时才是离场：重连后重放选中的那条会话不代表用户
-    // 换了页，此时必须留在看板上（opts.leaveBoard === false），否则一次 sidecar
-    // 重启就会把人从看板踢回会话。
-    if (opts?.leaveBoard !== false) board.setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
     if (changed) {
@@ -975,7 +933,7 @@ export default function App() {
             const first =
               sess.pinned[0] ?? sess.groups.flatMap((g) => g.threads)[0];
             if (first)
-              void selectThread(first.thread_id, { leaveBoard: false });
+              void selectThread(first.thread_id);
           }
           return;
         }
@@ -1251,8 +1209,6 @@ export default function App() {
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
-      // 新建会话同样把焦点带回会话页：与点会话一致。
-      board.setSelectedBoard(null);
       force((v) => v + 1);
       // Remote-only (S2): register the fresh thread in the subscription window
       // *now*. It picks a new id (not previously warm) and gets `warm` below, so
@@ -1277,75 +1233,12 @@ export default function App() {
     }
   };
 
-  /**
-   * 登记一个项目的看板并立刻刷新侧栏。
-   *
-   * 失败写进当前会话的错误位（与其它侧栏动作一致），刷新仍然执行：宿主可能
-   * 已经建了一半，界面必须与它保持一致，而不是停在「看起来什么都没发生」。
-   */
-  const onCreateBoard = async (path: string) => {
-    board.setBoardError(null);
-    try {
-      await createBoard(board.boardRpc, path);
-    } catch (e) {
-      setCurrentError(formatError(e));
-      force((v) => v + 1);
-    }
-    await board.refreshBoards();
-  };
-
-  /**
-   * 移除看板。决策 5 说这一下不可逆（队列状态会被删掉），所以先问一句；
-   * 用户说不，就连 RPC 都不发。
-   */
-  const onRemoveBoard = async (path: string) => {
-    if (
-      !window.confirm(`移除看板会删除 ${path} 的队列状态，且不可恢复。继续？`)
-    )
-      return;
-    board.setBoardError(null);
-    try {
-      await removeBoard(board.boardRpc, path);
-    } catch (e) {
-      setCurrentError(formatError(e));
-      force((v) => v + 1);
-    }
-    // 正在看的看板被移除了：主区域不能再展示一个已经不存在的看板。
-    if (board.selectedBoard === path) board.setSelectedBoard(null);
-    await board.refreshBoards();
-  };
-
-  /**
-   * 打开看板只改 selectedBoard，不动 currentId。
-   *
-   * 主区域只有「会话页 / 看板页」两态（见 spec 2026-10-04）：「收起」已被删除，
-   * 离开看板统一走「切到某条会话」（selectThread/newThread 清 selectedBoard）。
-   */
-  const onOpenBoard = (path: string) => {
-    // 已经在该看板页：纯 no-op，不重读、不清屏。
-    if (path === board.selectedBoard) return;
-    captureTranscriptRef.current?.();
-    // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
-    board.setBoardError(null);
-    board.setBoardCards([]);
-    board.setDoneExpanded(false); // 换项目 → 新看板从折叠开始
-    board.setSelectedBoard(path);
-  };
-
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
   const pickDirectory = async (): Promise<string | null> => {
     // 远程(iOS)构建没有 Tauri dialog 插件:不动态 import,直接当作取消。
     if (isRemoteClient()) return null;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: true, multiple: false });
-    return typeof picked === "string" ? picked : null;
-  };
-
-  /** 原生选择器选一个文件；取消返回 null。与 pickDirectory 同款动态 import。 */
-  const pickFile = async (): Promise<string | null> => {
-    if (isRemoteClient()) return null;
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const picked = await open({ directory: false, multiple: false });
     return typeof picked === "string" ? picked : null;
   };
 
@@ -1758,7 +1651,6 @@ export default function App() {
       leadEnsured,
       sess,
       prefs,
-      board,
       store,
       isMobile,
       setStatus,
@@ -1766,7 +1658,8 @@ export default function App() {
       setCurrentError,
       setBuildKind,
       setLeadAgentEnabled,
-      setKanbanEnabled,
+      watchmanTouchedRef,
+      setWatchmanEnabled,
       force,
       selectThread,
       connectRemoteTargets: (c) => connectRemoteTargetsRef!(c),
@@ -1814,16 +1707,10 @@ export default function App() {
     void handshake(lifecycle.connect());
     // 手机/iPad 切回前台时 socket 多半已被系统掐断,而状态不会自己回来。
     document.addEventListener("visibilitychange", lifecycle.onForegroundWake);
-    // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
-    const boardTimer = window.setInterval(
-      () => board.boardTick.current(),
-      2000,
-    );
     return () => {
       disposed = true;
       if (restartTimer.current !== null) window.clearTimeout(restartTimer.current);
       document.removeEventListener("visibilitychange", lifecycle.onForegroundWake);
-      window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefs.pairingVersion]);
@@ -2077,7 +1964,7 @@ export default function App() {
           //（spec §7.3「草稿保留」）。
           session.dropLocalUserMessage(text);
           force((n) => n + 1);
-          void selectThread(id, { leaveBoard: false, forceResume: true });
+          void selectThread(id, { forceResume: true });
           return false;
         }
         lastError = e;
@@ -2379,13 +2266,13 @@ export default function App() {
   const onToggleWatchman = async (next: boolean) => {
     // 先标记已触碰，再发写入（与 changeTheme 对 theme 的做法一致）：此刻若还有
     // 一趟 ui/settings/read 在途（如重启重放的握手），它回来时必须让位。
-    board.watchmanTouchedRef.current = true;
+    watchmanTouchedRef.current = true;
     try {
-      const result = await writeBoardWatchman(board.boardRpc, next);
-      board.setWatchmanEnabled(next);
-      board.setWatchmanWarning(result?.warning ?? null);
+      const result = await writeWatchman(pluginCall, next);
+      setWatchmanEnabled(next);
+      setWatchmanWarning(result?.warning ?? null);
     } catch (error) {
-      board.setWatchmanWarning(formatError(error));
+      setWatchmanWarning(formatError(error));
     }
   };
 
@@ -2549,19 +2436,12 @@ export default function App() {
               onNew={onNew}
               onRemoveWorkspace={removeWorkspace}
               onBrowse={onBrowse}
-              boards={board.boards}
-              boardSummaries={board.boardSummaries}
-              selectedBoard={board.selectedBoard}
-              onCreateBoard={(path) => void onCreateBoard(path)}
-              onRemoveBoard={(path) => void onRemoveBoard(path)}
-              onOpenBoard={onOpenBoard}
               isMobile={isMobile}
               statusStale={offline}
               onOpenSettings={() => prefs.setSettingsOpen(true)}
               onLinkFolder={linkFolder}
               onUnlinkFolder={unlinkFolder}
               leadAgentEnabled={leadAgentEnabled === true}
-              kanbanEnabled={kanbanEnabled === true}
             />
           </div>
           <div className="app-main relative flex min-w-0 flex-1 flex-col">
@@ -2587,104 +2467,13 @@ export default function App() {
                 </svg>
               </button>
             )}
-            {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
-              离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
-              没有选中时主区域就是原来的对话。 */}
-            {kanbanEnabled === true && board.selectedBoard !== null ? (
-              <section
-                aria-label="Superpowers 看板"
-                className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
-              >
-                {/* 顶栏：项目路径 + 入队「＋」。入队是低频动作，收进菜单后
-                  卡片列表能直接从这一行开始。 */}
-                <div className="flex items-center gap-3 px-4 pt-3">
-                  <span
-                    className="truncate font-mono text-xs text-fg-muted"
-                    title={board.selectedBoard}
-                  >
-                    {board.selectedBoard}
-                  </span>
-                  <div className="ml-auto shrink-0">
-                    <SuperpowersKanbanEnqueue
-                      pickFile={pickFile}
-                      enqueue={(spec, plan) =>
-                        enqueueBoardCard(
-                          board.boardRpc,
-                          board.selectedBoard!,
-                          spec,
-                          plan,
-                        )
-                      }
-                      prequeue={(title) =>
-                        enqueuePrequeuedCard(
-                          board.boardRpc,
-                          board.selectedBoard!,
-                          title,
-                          // 这里的「＋」是看板页的容器级动作，不在任何会话的讨论
-                          // 上下文里：`sess.currentId` 是「上次打开的那条会话」
-                          // （打开看板只改 `selectedBoard`，不动 `currentId`），
-                          // 未必和这张卡有关，甚至可能属于另一个项目。绑上去会让
-                          // 卡片链接跳进一个不相干的对话，故一律不绑。
-                          //
-                          // 会话内的溯源走另一条路径：会话里
-                          // `superpowers-kanban add-prequeued`，宿主经
-                          // `YI_AGENT_THREAD_ID` 注入当前会话，那里必然正确。
-                          null,
-                        )
-                      }
-                    />
-                  </div>
-                </div>
-                <SuperpowersKanbanSettings
-                  switchOn={board.boardOn}
-                  source={board.boardSource}
-                />
-                {board.boardError !== null && (
-                  <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
-                    <span>{BOARD_ERROR_TEXT[board.boardError]}</span>
-                  </div>
-                )}
-                <SuperpowersKanbanView
-                  switchOn={board.boardOn}
-                  source={board.boardSource}
-                  cards={board.boardCards}
-                  pluginMissing={board.boardPluginMissing}
-                  expandedDone={board.doneExpanded}
-                  onToggleDone={() => board.setDoneExpanded((v) => !v)}
-                  onOpenThread={(id) => {
-                    // 点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）：
-                    // 看板是对话的兄弟视图，回去走侧栏，不再盖在会话上。
-                    board.setSelectedBoard(null);
-                    void selectThread(id);
-                  }}
-                  onPromote={(cardId) => {
-                    // 提升要先补上 spec/plan（两下选择器，任一下取消就整个不作数），
-                    // 再让插件下个 tick 把预排队卡翻成排队卡。
-                    void (async () => {
-                      board.setBoardError(null);
-                      try {
-                        const spec = await pickFile();
-                        if (spec === null) return;
-                        const plan = await pickFile();
-                        if (plan === null) return;
-                        await promoteBoardCard(
-                          board.boardRpc,
-                          board.selectedBoard!,
-                          cardId,
-                          spec,
-                          plan,
-                        );
-                        board.refreshBoards();
-                      } catch (error) {
-                        // 与看板其它写入同一条通路：把失败翻成面板上那句可操作的说法。
-                        board.setBoardError(boardErrorKind(error));
-                      }
-                    })();
-                  }}
-                />
-              </section>
-            ) : (
-              <>
+            {/*
+            主区域没有插件专属页面。以前这里有一块"选中某个项目的看板"区域，
+            它是主程序替一个插件留的业务入口；现在插件的页面由插件自己的受管
+            视图渲染（`PluginView`），宿主不再知道任何卡片的形状。
+            这里只剩会话页。
+            */}
+            <>
                 {sess.currentId !== null &&
                   ((offline && cachedAt.current.has(sess.currentId)) ||
                     store.peek(sess.currentId)?.syncState === "syncing" ||
@@ -2847,8 +2636,7 @@ export default function App() {
                     ) : null
                   }
                 />
-              </>
-            )}
+            </>
             <ApprovalBanner
               items={bannerItems}
               onJump={(id) => void selectThread(id)}
@@ -3071,9 +2859,9 @@ export default function App() {
         // **手机端整节不传**：它装的是桌面主机的登录项，手机拨不到，也不该让
         // 一个手机端去改另一台机器的开机项。与 `saveRelayUrl` 的守卫同一先例
         // （宿主传 `undefined`，组件自身的 `showWatchman` 判据负责不渲染）。
-        watchmanEnabled={isMobile ? undefined : board.watchmanEnabled}
+        watchmanEnabled={isMobile ? undefined : watchmanEnabled}
         onToggleWatchman={isMobile ? undefined : (next) => void onToggleWatchman(next)}
-        watchmanWarning={isMobile ? undefined : board.watchmanWarning}
+        watchmanWarning={isMobile ? undefined : watchmanWarning}
         onClose={() => prefs.setSettingsOpen(false)}
         // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
         // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。
@@ -3091,7 +2879,7 @@ export default function App() {
         // 复用插件那份——两者指的都是「项目目录下的 .yi-agent」，来源分叉会让用户
         // 在两个面板里看到不同的项目列表。
         skillsCall={skillsCall}
-        skillsProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        skillsProjects={pluginProjectPaths(sess.workspaces)}
         skillsDefaultProject={current?.info?.cwd}
         // MCP 的配置也是项目级文件（<项目>/.yi-agent/mcp.json），候选与默认值直接
         // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
@@ -3099,12 +2887,12 @@ export default function App() {
         mcpCall={mcpCall}
         websearchCall={websearchCall}
         runtimeSettingsCall={runtimeSettingsCall}
-        mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        mcpProjects={pluginProjectPaths(sess.workspaces)}
         mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
-        pluginProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        pluginProjects={pluginProjectPaths(sess.workspaces)}
         pluginDefaultProject={current?.info?.cwd}
         // 受管插件分区用的项目键。`ProjectId` 在实现里是 `ProjectResolver`
         // 规范化后的绝对路径（`yi-agent-plugins/src/project.rs`），而

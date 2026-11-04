@@ -6,7 +6,7 @@ use super::*;
 fn the_app_side_loop_ensures_every_registered_project() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
-    yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+    yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
     let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects| {
         seen.extend_from_slice(projects)

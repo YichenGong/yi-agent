@@ -1039,7 +1039,7 @@ mod tests {
         let home = root.path().join(".yi-agent");
         let project = root.path().join("proj");
         std::fs::create_dir_all(&home).unwrap();
-        let state = project.join(".yi-agent/superpowers-kanban");
+        let state = project.join(".yi-agent/example-plugin");
         std::fs::create_dir_all(&state).unwrap();
         let board = r#"{"cards":[],"next_order":0}"#;
         std::fs::write(state.join("board.json"), board).unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
             &home,
             &PluginService::open(&home),
             &json!({
-                "plugin": "superpowers-kanban",
+                "plugin": "example-plugin",
                 "projects": [project.to_string_lossy()],
             }),
             "",

@@ -4400,7 +4400,7 @@ mod tests {
             format!(
                 // 键必须在注册表里：未注册的名字一律读成关（只有注册表里的
                 // 才能开），用一个自造的键会让这条测试永远等不到子进程。
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"example_plugin_switch","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
                 child.display()
             ),
         )
@@ -4410,7 +4410,7 @@ mod tests {
         let flags = workdir.join("flags.json");
         std::fs::write(
             &flags,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
 
@@ -5983,8 +5983,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
-        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
-        yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
+        yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
+        yi_agent_store::resident::require(dir.path(), &b, "example-plugin").unwrap();
 
         let mut seen: Vec<PathBuf> = Vec::new();
         let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects: &[PathBuf]| {

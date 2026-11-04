@@ -190,8 +190,8 @@ async fn a_project_scoped_plugins_list_finds_a_project_installed_plugin() {
     let sup = project.path().join(".yi-agent/supervisors");
     std::fs::create_dir_all(&sup).unwrap();
     std::fs::write(
-        sup.join("superpowers-kanban.json"),
-        r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        sup.join("example-plugin.json"),
+        r#"{"name":"example-plugin","command":"x","switch_key":"example_plugin_switch","query_socket":"{state_dir}/example-plugin.sock"}"#,
     )
     .unwrap();
 
@@ -219,7 +219,7 @@ async fn a_project_scoped_plugins_list_finds_a_project_installed_plugin() {
     let scoped = read_response(&mut h, 3).await;
     let plugins = scoped["result"]["plugins"].as_array().unwrap();
     assert_eq!(plugins.len(), 1, "按项目作用域应看到看板：{scoped}");
-    assert_eq!(plugins[0]["name"], "superpowers-kanban");
+    assert_eq!(plugins[0]["name"], "example-plugin");
     assert_eq!(plugins[0]["queryable"], true);
     h.shutdown().await;
 }
@@ -244,7 +244,7 @@ async fn project_scoped_settings_read_reaches_the_project_daemon() {
     std::fs::create_dir_all(&sup).unwrap();
     std::fs::write(
         sup.join("superpowers-kanban.json"),
-        r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        r#"{"name":"example-plugin","command":"x","switch_key":"example_plugin_switch","query_socket":"{state_dir}/example-plugin.sock"}"#,
     )
     .unwrap();
     let (_socket, _seen, handle) = fake_daemon(
@@ -257,7 +257,7 @@ async fn project_scoped_settings_read_reaches_the_project_daemon() {
 
     // 不带 project：宿主 workdir（= home）下没有清单 → 读成没装。
     h.send(
-        r#"{"jsonrpc":"2.0","id":2,"method":"plugin/settings/read","params":{"plugin":"superpowers-kanban"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"plugin/settings/read","params":{"plugin":"example-plugin"}}"#,
     )
     .await;
     let bare = read_response(&mut h, 2).await;
@@ -273,7 +273,7 @@ async fn project_scoped_settings_read_reaches_the_project_daemon() {
             "id": 3,
             "method": "plugin/settings/read",
             "params": {
-                "plugin": "superpowers-kanban",
+                "plugin": "example-plugin",
                 "project": project.path().to_string_lossy(),
             },
         })
@@ -306,7 +306,7 @@ fn a_manifest_with_a_query_socket_is_queryable() {
     std::fs::create_dir_all(&sup).unwrap();
     std::fs::write(
         sup.join("superpowers-kanban.json"),
-        r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        r#"{"name":"example-plugin","command":"x","switch_key":"example_plugin_switch","query_socket":"{state_dir}/example-plugin.sock"}"#,
     )
     .unwrap();
     std::fs::write(
@@ -317,11 +317,12 @@ fn a_manifest_with_a_query_socket_is_queryable() {
     let mut plugins = list_installed_plugins(dir.path(), None);
     plugins.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(plugins.len(), 2);
-    assert_eq!(plugins[0].name, "plain");
-    assert!(!plugins[0].queryable);
-    assert_eq!(plugins[1].name, "superpowers-kanban");
-    assert!(plugins[1].queryable);
-    assert_eq!(plugins[1].switch_key, "superpowers_kanban");
+    // 排序按名字：`example-plugin` 在 `plain` 之前，与判定逻辑无关。
+    assert_eq!(plugins[0].name, "example-plugin");
+    assert!(plugins[0].queryable);
+    assert_eq!(plugins[0].switch_key, "example_plugin_switch");
+    assert_eq!(plugins[1].name, "plain");
+    assert!(!plugins[1].queryable);
 }
 
 /// 开关关着时仍要列出这个插件——用户得能在设置页里看见它、把它打开——
@@ -332,8 +333,8 @@ fn a_switched_off_plugin_is_still_listed_but_marked_disabled() {
     let sup = dir.path().join(".yi-agent/supervisors");
     std::fs::create_dir_all(&sup).unwrap();
     std::fs::write(
-        sup.join("superpowers-kanban.json"),
-        r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban"}"#,
+        sup.join("example-plugin.json"),
+        r#"{"name":"example-plugin","command":"x","switch_key":"example_plugin_switch"}"#,
     )
     .unwrap();
 
@@ -346,12 +347,12 @@ fn a_switched_off_plugin_is_still_listed_but_marked_disabled() {
 
     let plugins = list_installed_plugins(dir.path(), Some(&gate));
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0].name, "superpowers-kanban");
+    assert_eq!(plugins[0].name, "example-plugin");
     assert!(!plugins[0].enabled, "off must read as disabled");
 
     std::fs::write(
         &flags,
-        r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
     )
     .unwrap();
     let plugins = list_installed_plugins(dir.path(), Some(&gate));
@@ -366,7 +367,7 @@ fn without_a_gate_a_plugin_is_not_reported_disabled() {
     std::fs::create_dir_all(&sup).unwrap();
     std::fs::write(
         sup.join("superpowers-kanban.json"),
-        r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban"}"#,
+        r#"{"name":"example-plugin","command":"x","switch_key":"example_plugin_switch"}"#,
     )
     .unwrap();
     assert!(list_installed_plugins(dir.path(), None)[0].enabled);

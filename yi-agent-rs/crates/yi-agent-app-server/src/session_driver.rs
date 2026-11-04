@@ -107,7 +107,7 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
 /// 后者是真的断链（字段漂移、插件比宿主新、应答不是约定形状）。没有这个判据，
 /// 宿主只能「`None` 就当没事」，那正是静默停摆的现场。
 ///
-/// 只认契约形状（见 `contract/driver-protocol.json` 的 `answers.nothing`）：
+/// 只认契约形状（见 `plugins/contracts/fixtures/driver-protocol.json` 的 `answers.nothing`）：
 /// 裸 `null`、`{}`、或 `action` 存在但非 null 都不是约定形状，一律算「说不清」，
 /// 由调用方记一行。
 pub(crate) fn is_explicit_no_action(value: &Value) -> bool {
@@ -739,7 +739,7 @@ mod tests {
     }
 
     /// 宿主与插件共用的 `driver/next` 线协议契约（**与插件 `service.rs` 的测试读的是
-    /// 同一份文件**，两侧都用 `include_str!`，与 `plugin-socket.json` 同一套做法）。
+    /// 同一份文件**，位于 `plugins/contracts/fixtures/`，与 `plugin-socket.json` 同一套做法）。
     ///
     /// 契约此前只存在于两侧手写的 JSON 字面量里：改一侧的字段名，两边测试照样全绿，
     /// 而生产上宿主 `parse_action` 悄悄回 `None`（这一拍什么都不做）、插件的
@@ -749,9 +749,8 @@ mod tests {
     /// `include_str!` 而非运行时读取：编译期依赖能同时钉住「文件还在不在」——契约
     /// 被改名/删除时**编译**就失败，运行时读取会静默跳过而失去意义。它只作用于
     /// `#[cfg(test)]`，`cargo build` 不受影响。
-    const DRIVER_CONTRACT: &str = include_str!(
-        "../../../../plugins/superpowers-kanban/crates/superpowers-kanban-runner/contract/driver-protocol.json"
-    );
+    const DRIVER_CONTRACT: &str =
+        include_str!("../../../../plugins/contracts/fixtures/driver-protocol.json");
 
     fn driver_contract() -> Value {
         serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON")
@@ -777,13 +776,13 @@ mod tests {
                 env,
             } => {
                 assert_eq!(workdir, "/w/card-1");
-                assert_eq!(title, "看板 · a.spec");
-                assert_eq!(objective, "do the card");
+                assert_eq!(title, "item · a.spec");
+                assert_eq!(objective, "do the item");
                 assert_eq!(driver_project.as_deref(), Some("/proj"));
                 assert_eq!(driver_ref.as_deref(), Some("card-1"));
                 assert_eq!(
                     env,
-                    vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+                    vec![("PLUGIN_ITEM".to_string(), "card-1".to_string())],
                     "插件的 env 必须原样透传，宿主不解释键名"
                 );
             }

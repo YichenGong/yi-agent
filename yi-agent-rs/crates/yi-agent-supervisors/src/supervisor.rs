@@ -12,7 +12,7 @@ use crate::manifest::{SupervisorManifest, load_manifests};
 /// 本 crate **不认识任何插件**，因此不写死任何插件的目录名：项目级状态根是
 /// `<workdir>/.yi-agent`，某个插件的状态目录由**它的清单名**派生
 /// （[`Layout::state_dir`]）。对清单名 `superpowers-kanban` 来说，派生结果仍是
-/// `<workdir>/.yi-agent/superpowers-kanban`——与磁盘上的既有契约逐字一致，
+/// `<workdir>/.yi-agent/example-plugin`——与磁盘上的既有契约逐字一致，
 /// 故不需要迁移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -224,7 +224,7 @@ impl Supervisor {
         else {
             return false;
         };
-        yi_agent_flags::store::status_at(&path, name, &self.build_kind, None).0
+        yi_agent_flags::store::status_for_switch_at(&path, name, &self.build_kind, None).0
     }
 
     /// 一次对齐：重新扫描清单，起应起、停应停。
@@ -604,7 +604,7 @@ mod child_log_tests {
         assert!(
             !layout
                 .logs_dir()
-                .starts_with(layout.state_dir("superpowers-kanban"))
+                .starts_with(layout.state_dir("example-plugin"))
         );
     }
 
@@ -616,12 +616,12 @@ mod child_log_tests {
         // 路径由**清单名**派生：两个不同的名字必得两个不同的目录，且都等于
         // `<state_base>/<name>`。这条比字符串扫描有力——它证明的是行为。
         let layout = Layout::for_workdir(Path::new("/tmp/project"));
-        let kanban = layout.state_dir("superpowers-kanban");
+        let kanban = layout.state_dir("example-plugin");
         let other = layout.state_dir("some-other-plugin");
         assert_ne!(kanban, other, "the state dir must follow the manifest name");
         assert_eq!(
             kanban,
-            PathBuf::from("/tmp/project/.yi-agent/superpowers-kanban")
+            PathBuf::from("/tmp/project/.yi-agent/example-plugin")
         );
         assert_eq!(
             other,
@@ -658,7 +658,7 @@ mod child_log_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !production.contains("superpowers-kanban"),
+            !production.contains("example-plugin"),
             "the supervisor crate's production code must not name a plugin"
         );
     }

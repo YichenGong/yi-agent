@@ -39,7 +39,7 @@
 | CLI 动词 17 个 | `crates/superpowers-kanban-runner/src/main.rs:144` `USAGE` |
 | IPC 方法 20 个 | `crates/superpowers-kanban-runner/src/dispatch.rs:100` `dispatch_in` |
 | effect 分类契约 | `plugins/superpowers-kanban/contract/managed-v1.json` |
-| `sessions.running` 是宿主本进程上报 | `crates/superpowers-kanban-runner/contract/driver-protocol.json` 的 `request._comment` |
+| `sessions.running` 是宿主本进程上报 | `plugins/contracts/fixtures/driver-protocol.json` 的 `request._comment`（公共夹具，宿主与插件共读） |
 | supervisor 清单 | `crates/superpowers-kanban-runner/src/main.rs` 的 `manifest_json` |
 | 现有共享配额域 | `crates/superpowers-kanban-runner/src/lease.rs:42` |
 | 状态目录默认值风险 | `--state-dir` 可省；设计 §7.3 禁止默认成 worktree cwd |

@@ -160,8 +160,8 @@ mod tests {
     fn require_is_idempotent_and_lists_the_project() {
         let dir = tempfile::tempdir().unwrap();
         let project = PathBuf::from("/proj/a");
-        require(dir.path(), &project, "superpowers-kanban").unwrap();
-        require(dir.path(), &project, "superpowers-kanban").unwrap();
+        require(dir.path(), &project, "example-plugin").unwrap();
+        require(dir.path(), &project, "example-plugin").unwrap();
         assert_eq!(list(dir.path()), vec![project]);
     }
 
@@ -169,9 +169,9 @@ mod tests {
     fn two_requesters_share_one_entry_and_release_only_their_own() {
         let dir = tempfile::tempdir().unwrap();
         let project = PathBuf::from("/proj/a");
-        require(dir.path(), &project, "superpowers-kanban").unwrap();
+        require(dir.path(), &project, "example-plugin").unwrap();
         require(dir.path(), &project, "another-plugin").unwrap();
-        release(dir.path(), &project, "superpowers-kanban").unwrap();
+        release(dir.path(), &project, "example-plugin").unwrap();
         assert_eq!(
             list(dir.path()),
             vec![project.clone()],
@@ -189,8 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(registry_path(dir.path()), "{ not json").unwrap();
         assert!(list(dir.path()).is_empty(), "readers must not crash");
-        let error =
-            require(dir.path(), &PathBuf::from("/proj/a"), "superpowers-kanban").unwrap_err();
+        let error = require(dir.path(), &PathBuf::from("/proj/a"), "example-plugin").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(
             std::fs::read_to_string(registry_path(dir.path())).unwrap(),
@@ -205,12 +204,12 @@ mod tests {
     fn entries_reports_the_requester_alongside_the_project() {
         let dir = tempfile::tempdir().unwrap();
         let project = PathBuf::from("/proj/a");
-        require(dir.path(), &project, "superpowers-kanban").unwrap();
+        require(dir.path(), &project, "example-plugin").unwrap();
 
         let entries = entries(dir.path());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].project, project);
-        assert_eq!(entries[0].required_by, vec!["superpowers-kanban"]);
+        assert_eq!(entries[0].required_by, vec!["example-plugin"]);
     }
 
     #[test]
@@ -221,13 +220,9 @@ mod tests {
         let legacy = dir.path().join("boards.json");
         std::fs::write(&legacy, r#"{"boards":[{"project":"/p","created_at":"x"}]}"#).unwrap();
 
-        let imported = import_legacy_projects(
-            &[PathBuf::from("/p")],
-            &legacy,
-            &resident,
-            "superpowers-kanban",
-        )
-        .unwrap();
+        let imported =
+            import_legacy_projects(&[PathBuf::from("/p")], &legacy, &resident, "example-plugin")
+                .unwrap();
 
         assert_eq!(imported, 1);
         assert_eq!(list(&resident), vec![PathBuf::from("/p")]);
@@ -243,22 +238,14 @@ mod tests {
         let legacy = dir.path().join("boards.json");
         std::fs::write(&legacy, r#"{"boards":[{"project":"/p"}]}"#).unwrap();
 
-        let first = import_legacy_projects(
-            &[PathBuf::from("/p")],
-            &legacy,
-            &resident,
-            "superpowers-kanban",
-        )
-        .unwrap();
+        let first =
+            import_legacy_projects(&[PathBuf::from("/p")], &legacy, &resident, "example-plugin")
+                .unwrap();
         assert_eq!(first, 1);
 
-        let second = import_legacy_projects(
-            &[PathBuf::from("/p")],
-            &legacy,
-            &resident,
-            "superpowers-kanban",
-        )
-        .unwrap();
+        let second =
+            import_legacy_projects(&[PathBuf::from("/p")], &legacy, &resident, "example-plugin")
+                .unwrap();
         assert_eq!(second, 0, "the legacy file is gone, so nothing is imported");
         assert_eq!(
             list(&resident),
@@ -275,8 +262,7 @@ mod tests {
         let resident = dir.path().join("resident");
         let legacy = dir.path().join("boards.json");
 
-        let imported =
-            import_legacy_projects(&[], &legacy, &resident, "superpowers-kanban").unwrap();
+        let imported = import_legacy_projects(&[], &legacy, &resident, "example-plugin").unwrap();
 
         assert_eq!(imported, 0);
         assert!(!resident.exists(), "no registry is created out of nothing");
@@ -294,7 +280,7 @@ mod tests {
             &[PathBuf::from("/a"), PathBuf::from("/b")],
             &legacy,
             &resident,
-            "superpowers-kanban",
+            "example-plugin",
         )
         .unwrap();
 
@@ -305,7 +291,7 @@ mod tests {
         );
         assert_eq!(
             entries(&resident)[0].required_by,
-            vec!["superpowers-kanban"],
+            vec!["example-plugin"],
             "the importing caller is recorded as the requester"
         );
     }

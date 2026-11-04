@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState, type ComponentType } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listPlugins, type PluginRpc, type PluginSummary } from "../lib/pluginSettings";
-import { SuperpowersKanbanPluginSettings } from "./SuperpowersKanbanPluginSettings";
 import { PluginCatalog } from "./PluginCatalog";
 
 /**
@@ -12,16 +11,14 @@ import { PluginCatalog } from "./PluginCatalog";
  */
 export type PluginsCall = (method: string, params: unknown) => Promise<unknown>;
 
-/** 插件面板接缝：`project` 是这些设置所属的项目（清单与 socket 都在它下面）。 */
-type PanelProps = { rpc: PluginRpc; project?: string };
-
 /**
- * 插件名 → 设置面板。未注册的插件仍列出来，只是没有面板——不静默消失。
- * 加一个插件 = 往这里加一行。
+ * 主程序**不**知道任何插件名对应的设置组件。
+ *
+ * 这里曾经有一张 `插件名 → 组件` 的表，加一个插件就得改一次主程序；而且它只能
+ * 覆盖主程序自己打包进来的组件，装上去的插件永远走不到。现在每个插件的设置页
+ * 由插件自己声明、由 `PluginCatalog` 经受管视图打开，主程序只提供"打开它"这个
+ * 通用动作。
  */
-const REGISTRY: Record<string, ComponentType<PanelProps>> = {
-  "superpowers-kanban": SuperpowersKanbanPluginSettings,
-};
 
 /**
  * 「插件」Tab。
@@ -145,28 +142,23 @@ export function SettingsPluginsTab({
         <p className="p-4 text-sm text-fg-muted">未安装任何插件</p>
       ) : (
         <div className="divide-y divide-line">
-          {plugins.map((plugin) => {
-            const Panel = REGISTRY[plugin.name];
-            return (
-              <section key={plugin.name} className="p-4">
-                <h2 className="text-sm font-medium text-fg">
-                  {plugin.name}
-                  {plugin.enabled ? null : (
-                    // 仍列出来：用户要能看见它、去「实验功能」把它打开。这里只标状态，
-                    // 不藏面板——藏了就等于让人没法从这一页判断它为什么没在跑。
-                    <span className="ml-2 text-xs font-normal text-fg-subtle">
-                      （已停用：在「实验功能」里打开）
-                    </span>
-                  )}
-                </h2>
-                {Panel ? (
-                  <Panel rpc={rpc as PluginRpc} project={selected || undefined} />
-                ) : (
-                  <p className="mt-2 text-xs text-fg-subtle">该插件暂无可配置项</p>
+          {plugins.map((plugin) => (
+            <section key={plugin.name} className="p-4">
+              <h2 className="text-sm font-medium text-fg">
+                {plugin.name}
+                {plugin.enabled ? null : (
+                  // 仍列出来：用户要能看见它、去「实验功能」把它打开。这里只标状态，
+                  // 不藏面板——藏了就等于让人没法从这一页判断它为什么没在跑。
+                  <span className="ml-2 text-xs font-normal text-fg-subtle">
+                    （已停用：在「实验功能」里打开）
+                  </span>
                 )}
-              </section>
-            );
-          })}
+              </h2>
+              <p className="mt-2 text-xs text-fg-subtle">
+                该插件的设置由它自己提供，见上方「受管插件」里的设置入口。
+              </p>
+            </section>
+          ))}
         </div>
       )}
     </div>

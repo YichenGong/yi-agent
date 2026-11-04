@@ -3226,13 +3226,14 @@ mod tests {
     }
 
     /// 宿主与插件共用的 `driver/next` 契约（**与宿主 `session_driver.rs` 的测试读
-    /// 同一份文件**，两侧都用 `include_str!`）。
+    /// 同一份公共夹具**，位于 `plugins/contracts/fixtures/`）。
     ///
     /// 这里钉住插件这一侧的两件事：① `DriverAction::to_json` 交出的形状与契约字面量
     /// **按值**相等（键序不是契约，故比较解析后的 `Value`）；② 契约里的 `results[]`
     /// 条目能反序列化成 `DriverResult`。插件若改字段名，这两条就红——否则宿主
     /// `parse_action` 会悄悄回 `None`，或插件的 `DriverResult` 反序列化失败。
-    const DRIVER_CONTRACT: &str = include_str!("../contract/driver-protocol.json");
+    const DRIVER_CONTRACT: &str =
+        include_str!("../../../../contracts/fixtures/driver-protocol.json");
 
     /// 契约里的**请求**字段名，插件手工解析 `driver/next` 参数时认的就是它们
     /// （`dispatch.rs`）。宿主改了发出侧的名字，这条会红。
@@ -3281,17 +3282,33 @@ mod tests {
             action_id: "act-2".to_string(),
             card_id: "card-1".to_string(),
             workdir: PathBuf::from("/w/card-1"),
-            title: "看板 · a.spec".to_string(),
-            objective: "do the card".to_string(),
+            title: "item · a.spec".to_string(),
+            objective: "do the item".to_string(),
             driver_project: "/proj".to_string(),
             driver_ref: "card-1".to_string(),
-            env: vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+            env: vec![("PLUGIN_ITEM".to_string(), "card-1".to_string())],
         };
+        // 公共夹具只冻结**形状**，取值是通用示例；插件产出的是自己的业务取值
+        // （标题、env 键名都不该被公共契约绑死）。因此比较键集合 + 值类型，
+        // 字段名漂移照样会红——那才是这条契约要防的东西。
+        let emitted = launch.to_json();
         assert_eq!(
-            launch.to_json(),
-            answers["launch"],
+            sorted_keys(&emitted),
+            sorted_keys(&answers["launch"]),
             "launch 的字段名与契约必须一致"
         );
+        for key in [
+            "action_id",
+            "kind",
+            "workdir",
+            "title",
+            "objective",
+            "driver_project",
+            "driver_ref",
+        ] {
+            assert!(emitted[key].is_string(), "`{key}` 必须是字符串：{emitted}");
+        }
+        assert!(emitted["env"].is_object(), "`env` 必须是对象：{emitted}");
 
         // 插件不再发 `append`：合并由用户在会话里发话触发，插件只负责启动。
         assert!(
@@ -3301,6 +3318,18 @@ mod tests {
 
         // 「无事可做」的契约形状：`{"action": null}`。
         assert_eq!(answers["nothing"], serde_json::json!({ "action": null }));
+    }
+
+    /// 一个 JSON 对象的键，排序后返回：键序不是契约，键集合是。
+    fn sorted_keys(value: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("契约比较的对象")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// 把宿主的事务日志写进实例根，形状与 `JournalStore` 落盘的一致。

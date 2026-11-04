@@ -29,6 +29,26 @@
 | `lifecycle-v1.json` | 一个处于 `draining` 阶段的激活事务 |
 | `root-v1.json` | **含真实 Ed25519 签名的**信任根信封 |
 | `release-v1.json` | **含真实 Ed25519 签名的**发布元数据 |
+| `driver-protocol.json` | 宿主 `session_driver` 与插件 `driver/next` 共用的线协议 |
+| `plugin-socket.json` | 宿主转发表与插件服务端共用的 socket 回退契约 |
+
+### 跨端共享夹具（`driver-protocol.json` / `plugin-socket.json`）
+
+这两个文件原本住在看板插件的 crate 目录里，宿主测试反向引用插件源码路径。
+那让「编译主程序」与「插件源码是否在检出的树里」绑在一起，也让主程序的测试
+文件里出现插件业务字样——独立发布后两者都不可接受。
+
+现在它们是**公共夹具**，宿主与插件各自读同一份：
+
+- 宿主：`session_driver.rs` 用 `include_str!`（编译期钉住文件存在）；
+  `supervisors/src/manifest.rs` 运行时读取，目录缺失则跳过该条断言。
+- 插件：`superpowers-kanban-ipc/src/socket.rs` 与
+  `superpowers-kanban-runner/src/service.rs` 读同一份。
+
+**它们只冻结形状，不冻结业务取值。** 里面的人名/标题/环境变量名都是通用
+示例（`item · a.spec`、`PLUGIN_ITEM`），不含任何单个插件的业务语义；插件侧
+的断言因此比较**键集合与值类型**，而不是逐字相等——字段名漂移会红，取值
+不同不会。
 
 ### 关于 `root-v1.json` / `release-v1.json` 的签名
 
@@ -54,6 +74,9 @@ node --test scripts/plugins/check-contracts.test.mjs
 ```
 
 期望：`positive: 9, negative: 24, failures: 0` 与 42/42 通过。
+
+`driver-protocol.json` 与 `plugin-socket.json` 不是 schema 黄金样本，不参与
+上面的正/负样本计数；它们由宿主与插件两侧的 Rust 测试各自断言。
 
 ### schema 负责什么、不负责什么
 

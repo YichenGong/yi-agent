@@ -71,21 +71,30 @@ impl QuotaContext {
     }
 }
 
-/// 配额域的根：`<home>/.yi-agent/superpowers-kanban`。
+/// 配额域的根：`.yi-agent/` 下**任何一个**具名子目录，例如
+/// `<home>/.yi-agent/<plugin-name>`。
 ///
-/// 用"路径里 `superpowers-kanban` 那一段的父目录"而不是"上两级"来判定：
-/// `leases` 与 `quota.json` 在域内的相对位置可以不同，但都在同一个
-/// 具名目录下。
+/// 判据是**结构**（`.yi-agent/<name>` 这个两段形状），不是某个插件的名字：
+/// 宿主不认识任何具体插件，第二个插件要复用整机配额域时不需要改这里。
+/// 取 `.yi-agent` 的直接子目录而不是"上两级"，是因为 `leases`、`quota.json`、
+/// `activity` 在域内的相对位置可以不同，但它们必须在同一个具名目录下。
 fn domain_of(path: &Path) -> Result<PathBuf, PluginError> {
-    let mut current = path;
-    while let Some(parent) = current.parent() {
-        if current.file_name().and_then(|name| name.to_str()) == Some("superpowers-kanban") {
-            return Ok(current.to_path_buf());
+    for candidate in path.ancestors() {
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // `.yi-agent/<name>`：candidate 是 `<name>`，它的父目录必须叫 `.yi-agent`。
+        let parent_is_agent_dir = candidate
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|parent| parent.to_str())
+            == Some(".yi-agent");
+        if parent_is_agent_dir && !name.is_empty() {
+            return Ok(candidate.to_path_buf());
         }
-        current = parent;
     }
     Err(PluginError::Conflict(format!(
-        "{} is not inside a `superpowers-kanban` quota domain; refusing to guess one, because \
+        "{} is not inside a `.yi-agent/<name>` quota domain; refusing to guess one, because \
          an invented domain hands this instance its own full budget",
         path.display()
     )))

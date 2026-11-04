@@ -142,12 +142,12 @@ mod tests {
         std::fs::create_dir_all(&sup).unwrap();
         std::fs::write(
             sup.join("superpowers-kanban.json"),
-            r#"{"name":"superpowers-kanban","command":"x","switch_key":"k","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+            r#"{"name":"example-plugin","command":"x","switch_key":"k","query_socket":"{state_dir}/example-plugin.sock"}"#,
         )
         .unwrap();
         let lines = handle_plugins(dir.path(), "");
         assert!(
-            lines.iter().any(|line| line.contains("superpowers-kanban")),
+            lines.iter().any(|line| line.contains("example-plugin")),
             "{lines:?}"
         );
     }
@@ -171,12 +171,12 @@ mod tests {
         std::fs::write(sup.join("broken.json"), "{ not json").unwrap();
         std::fs::write(
             sup.join("superpowers-kanban.json"),
-            r#"{"name":"superpowers-kanban","command":"x","switch_key":"k","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+            r#"{"name":"example-plugin","command":"x","switch_key":"k","query_socket":"{state_dir}/example-plugin.sock"}"#,
         )
         .unwrap();
         let lines = handle_plugins(dir.path(), "");
         assert!(
-            lines.iter().any(|line| line.contains("superpowers-kanban")),
+            lines.iter().any(|line| line.contains("example-plugin")),
             "{lines:?}"
         );
         assert!(

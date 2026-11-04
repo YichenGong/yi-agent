@@ -530,7 +530,7 @@ fn write_fake_child(dir: &Path, marker: &Path) -> std::path::PathBuf {
 /// 一次"自述与磁盘不同"的重写而掩盖真正的接线问题。
 fn manifest_json(command: &Path) -> String {
     format!(
-        r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
+        r#"{{"name":"demo","command":"{}","args":[],"switch_key":"example_plugin_switch","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
         command.display()
     )
 }
@@ -548,7 +548,7 @@ fn arm_plugin(repo: &Path, marker: &Path) -> std::path::PathBuf {
     let flags = repo.join("flags.json");
     std::fs::write(
         &flags,
-        r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
     )
     .unwrap();
     flags

@@ -6068,7 +6068,7 @@ async fn driver_tick<F>(
                 //
                 // 两个前提使它不误报:本拍 `results` 为空——非空就说明至少交出了
                 // 一个动作,或上一拍的动作还在等回报;且只认契约形状
-                // `{"action": null}` 为「正常空闲」(见 driver-protocol.json 的
+                // `{"action": null}` 为「正常空闲」(见 plugins/contracts/fixtures/driver-protocol.json 的
                 // `answers.nothing`),那是唯一能合法回 `None` 的稀有情形。
                 // 剩下仍回 `None` 的,只能是对不上契约的应答。
                 let answer = last_answer

@@ -17,7 +17,6 @@ pub mod slash;
 pub mod state;
 pub mod statusbar;
 pub mod subagents;
-pub mod superpowers_kanban;
 pub mod theme;
 pub mod title;
 pub mod trace;

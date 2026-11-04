@@ -23,9 +23,10 @@ fn temp_dir() -> PathBuf {
     tempfile::TempDir::new().expect("temp").keep()
 }
 
-/// 建一个 `superpowers-kanban` 配额域。
+/// 建一个配额域。域是 `.yi-agent/<name>` 这个结构，名字本身不承载语义——
+/// 用它是为了让测试同时覆盖"第二个插件也能有自己的域"。
 fn domain(root: &Path) -> PathBuf {
-    let domain = root.join(".yi-agent").join("superpowers-kanban");
+    let domain = root.join(".yi-agent").join("example-plugin");
     std::fs::create_dir_all(domain.join("leases")).unwrap();
     domain
 }
@@ -52,7 +53,7 @@ fn a_config_and_lease_directory_in_different_domains_is_refused() {
     // 读 A 的配置、抢 B 的槽位：两个实例都"遵守"自己的上限，合计仍然超。
     let root = temp_dir();
     let a = domain(&root).join("quota.json");
-    let other = root.join("other").join("superpowers-kanban");
+    let other = root.join("other").join("example-plugin");
     std::fs::create_dir_all(other.join("leases")).unwrap();
 
     let error = QuotaContext::new(a, other.join("leases"), 0)

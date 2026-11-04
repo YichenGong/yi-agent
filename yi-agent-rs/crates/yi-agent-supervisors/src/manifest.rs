@@ -339,14 +339,15 @@ mod tests {
         );
     }
 
-    /// 读宿主与插件共用的 socket 契约（**与插件 `socket.rs` 是同一份文件**）。
+    /// 读宿主与插件共用的 socket 契约（**与插件 `socket.rs` 是同一份文件**，
+    /// 位于 `plugins/contracts/fixtures/plugin-socket.json`）。
     ///
     /// 运行时读取而非 `include_str!`：插件是可独立安装/卸载的，宿主单独 checkout
     /// 时这个目录可能不存在，编译期依赖会让宿主构建直接失败。这里文件缺失就
     /// 跳过——本测试锁的是「monorepo 内两侧一致」，不是宿主的构建前提。
     fn contract() -> Option<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../plugins/superpowers-kanban/crates/superpowers-kanban-ipc/contract/plugin-socket.json");
+            .join("../../../plugins/contracts/fixtures/plugin-socket.json");
         std::fs::read_to_string(path).ok()
     }
 
@@ -383,7 +384,7 @@ mod tests {
         );
 
         let manifest = SupervisorManifest::parse(&format!(
-            r#"{{"name":"superpowers-kanban","command":"c","args":[],"switch_key":"k",
+            r#"{{"name":"example-plugin","command":"c","args":[],"switch_key":"k",
                 "query_socket":"{template}"}}"#
         ))
         .unwrap();
