@@ -46,11 +46,20 @@ fn scope(directory: &TempDir) -> RuntimeScope {
     }
 }
 
-/// Starts the channel server on a background thread and returns the peer.
+/// Starts the channel server on a background thread and returns the peer and the
+/// shared registry.
 ///
-/// The registry is created inside the thread because it is not `Sync`; a real
-/// guardian owns exactly one and serves from one thread in the same way.
-fn start_channel(directory: &TempDir, grant: ChannelGrant) -> UnixStream {
+/// The registry is `Arc<Mutex<..>>` because that is what a real guardian holds: a
+/// channel that owned it outright would stop the guardian's maintenance for as long
+/// as the channel lived. The test keeps a clone so it can inspect `records()` after
+/// the channel ends and so dropping the last clone still stops every group.
+fn start_channel_with_registry(
+    directory: &TempDir,
+    grant: ChannelGrant,
+) -> (
+    UnixStream,
+    std::sync::Arc<std::sync::Mutex<ProcessRegistry>>,
+) {
     let (guardian_side, client_side) = UnixStream::pair().expect("socketpair");
     let (registry, report) = match ProcessRegistry::open(&scope(directory), "gen-1", &artifact()) {
         Ok(pair) => pair,
@@ -60,20 +69,21 @@ fn start_channel(directory: &TempDir, grant: ChannelGrant) -> UnixStream {
         }
     };
     assert!(report.is_safe(), "a fresh runtime has nothing to recover");
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+    let shared = std::sync::Arc::clone(&registry);
     std::thread::spawn(move || {
-        let mut registry = registry;
-        if let Err(error) = serve_channel(
-            &mut registry,
-            &grant,
-            guardian_side,
-            Duration::from_secs(10),
-        ) {
+        if let Err(error) = serve_channel(shared, &grant, guardian_side, Duration::from_secs(10)) {
             eprintln!("serve_channel error: {error}");
         }
-        // Dropping the registry stops every group it started: the test's cleanup
-        // path, and the same guarantee a real guardian gives on exit.
+        // Dropping the last registry clone stops every group it started: the
+        // test's cleanup path, and the same guarantee a real guardian gives.
     });
-    client_side
+    (client_side, registry)
+}
+
+/// Starts the channel server on a background thread and returns the peer.
+fn start_channel(directory: &TempDir, grant: ChannelGrant) -> UnixStream {
+    start_channel_with_registry(directory, grant).0
 }
 
 fn pipes() -> (
@@ -355,6 +365,114 @@ fn a_spawn_without_three_stdio_descriptors_is_refused() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// A pending `Wait` must not hold the registry.
+///
+/// This is the property that makes the channel usable from a real guardian: the
+/// guardian's lease maintenance and owner reclamation need the same registry, and a
+/// channel that held it for the whole wait would stop them for as long as any tool
+/// was running.
+///
+/// The child is a long sleeper stopped only at the end, so the wait window is
+/// deterministic. Two channels share one registry, exactly as a real guardian's do:
+/// one holds the `Wait`, the other performs the `Terminate` (a single channel answers
+/// requests in order, so it cannot do both). With a wait that keeps the lock across
+/// its budget, the probe below cannot succeed.
+#[test]
+fn a_pending_wait_does_not_hold_the_registry() {
+    let directory = TempDir::new().unwrap();
+    let (registry, report) =
+        ProcessRegistry::open(&scope(&directory), "gen-1", &artifact()).expect("registry");
+    assert!(report.is_safe(), "a fresh runtime has nothing to recover");
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+
+    let spawn_channel = |shared: std::sync::Arc<std::sync::Mutex<ProcessRegistry>>| {
+        let (guardian_side, client_side) = UnixStream::pair().expect("socketpair");
+        let grant = ChannelGrant::new(ProcessOwner::frontend("app"));
+        std::thread::spawn(move || {
+            let _ = serve_channel(shared, &grant, guardian_side, Duration::from_secs(30));
+        });
+        client_side
+    };
+
+    // Channel 1: spawn and hold the wait.
+    let mut waiter_client = ManagedSpawnClient::connect(owned_stream(spawn_channel(
+        std::sync::Arc::clone(&registry),
+    )))
+    .expect("connect");
+    let (stdin_read, _stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) = pipes();
+    let receipt = waiter_client
+        .spawn(
+            helper_spec(&["streams-then-hang"]),
+            StdioFds {
+                stdin: owned(stdin_read),
+                stdout: owned(stdout_write),
+                stderr: owned(stderr_write),
+            },
+        )
+        .expect("spawn");
+    // Keep the reader ends open; dropping them early would let the child die on its
+    // first write and shrink the window this test depends on.
+    let _keep_stdout = stdout_read;
+    let _keep_stderr = stderr_read;
+    let process_id = receipt.process_id.clone();
+
+    let waiter = {
+        let process_id = process_id.clone();
+        std::thread::spawn(move || {
+            waiter_client
+                .wait(&process_id, &Deadline::after(Duration::from_secs(20)))
+                .expect("the wait answers once the group is stopped")
+        })
+    };
+
+    // Channel 2: same owner, own connection -- the shape a guardian really has when
+    // two tools of one frontend are live at once.
+    let mut terminator = ManagedSpawnClient::connect(owned_stream(spawn_channel(
+        std::sync::Arc::clone(&registry),
+    )))
+    .expect("connect");
+
+    // The child sleeps far longer than the window below, so a `Wait` that held the
+    // lock could not release it in time.
+    std::thread::sleep(Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    let mut acquired = false;
+    while start.elapsed() < Duration::from_millis(800) {
+        match registry.try_lock() {
+            Ok(guard) => {
+                // Reading records is what a recovering guardian does under this lock.
+                let _ = guard.records().len();
+                acquired = true;
+                break;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _ = poisoned.into_inner().records().len();
+                acquired = true;
+                break;
+            }
+        }
+    }
+
+    // End the child regardless of the verdict, so the in-flight wait answers and the
+    // thread joins instead of leaking into the next test.
+    let terminated = terminator.terminate(&process_id, &Deadline::after(Duration::from_secs(10)));
+    let exit = waiter.join().expect("wait thread");
+    let _ = exit;
+
+    assert!(
+        acquired,
+        "a pending Wait must not hold the registry: the guardian's reclaim loop \
+         could never run while a tool was alive"
+    );
+    assert!(
+        terminated.map(|e| e.group_stopped).unwrap_or(false),
+        "the terminating channel must prove the group stopped"
+    );
 }
 
 /// The helper entry point, same contract as the other supervisor test binaries:
