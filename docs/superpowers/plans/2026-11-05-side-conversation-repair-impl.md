@@ -638,6 +638,12 @@ git diff --check
   仍为 `[ ]`(真机未验),`docs/project-management/yi-agent-tui.md` 同理。
 - **Step 3 未做**:本 worktree 无真实 WebView、无 iPhone/relay、无真实 PTY、未获真实模型
   授权。因此本条保持未勾,Task 11 不算完成,整体功能不勾完成、不宣布修复验收通过。
+- 自查第四个缺陷（在 Step 5 的替代评审里发现）：`side_driver.rs` 的 `close` 把
+  `expected_active_turn_id: None` 当成「无条件关闭」，而 TUI 传的是本地异步回传的
+  轮次 id——提交后、事件被消费前按 `/side-close`，正在回答的旁支会被连回答一起关掉，
+  且从未出现过确认。已修为「本地未知但实际在跑」也判冲突，并区分两种冲突文案。
+  红/绿：`a_close_without_a_turn_id_refuses_a_running_side`（修复前 FAILED）、
+  `a_refused_close_shows_why_in_the_visible_side`（把 notice 写入删掉即 FAILED）。
 - **Step 5 部分未做**:代码评审没能以 `requesting-code-review` 子代理形式完成——
   daemon 拒绝了该派发(`invalid_state: a settled parent task (state: stalled) cannot spawn
   descendants`)。改为协调者逐文件自查,并据此修出三个真实缺陷(心跳擦掉「关闭未送达」、

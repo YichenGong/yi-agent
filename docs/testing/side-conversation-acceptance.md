@@ -307,7 +307,25 @@ W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`
 这些是源码级断言（`npx vitest run` = 159 files / 2226 passed，其中相关八个文件 522 passed）。
 **真机一列全部未执行**，所以本表只证明「自动侧有覆盖」，不宣称 W01–W16 验收通过。
 
-### 5.4 明确未执行项
+### 5.4 自查发现的第四个缺陷：不知道轮次 id 时仍会关掉在跑的旁支
+
+`side_driver.rs` 的 `close` 原本写成「带了 `expected_active_turn_id` 才做冲突检查」，
+于是 `None` 等价于「无条件关闭」。TUI 的 `/side-close` 传的是**本地**那份
+`active_turn_id`，而 turn id 是 driver 通过事件异步回传的：用户提交问题后、那条事件
+被消费前按 `/side-close`，本地就是 `None`。此时一个正在回答的旁支会被连回答一起
+关掉，而界面上从未出现过任何确认。
+
+- 修复：`unconfirmed_while_running = expected_active_turn_id.is_none() && actual.is_some()`
+  也判为冲突；两种情况给不同的文案（「确认过期」vs「正在回答」），因为下一步动作不同。
+- 红已证实：`side_driver::tests::a_close_without_a_turn_id_refuses_a_running_side`
+  在修复前 FAILED（`本地不知道轮次 id 时关闭了正在运行的旁支`），修复后通过，
+  并断言冲突错误回到**发起关闭的那个旁支**且文案含「正在回答」。
+- 可见性已验证：`tui::app::notification_tests::a_refused_close_shows_why_in_the_visible_side`。
+  临时把 `apply_operation_error` 的 `notice` 写入删掉 → 该用例 FAILED，恢复后通过。
+- 门禁：`tui::` = 713 passed、`side_driver` = 10 passed、`side_repair_` = 21 passed、
+  `just ci` = CI passed。
+
+### 5.5 明确未执行项
 
 - 真实 WebView 桌面验收（本 worktree 只跑源码级测试，未打包 `.app`）。
 - iPhone / relay / 双端同一 side id、后台唤醒重连、close 冲突二次确认。

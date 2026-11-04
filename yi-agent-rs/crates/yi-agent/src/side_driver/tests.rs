@@ -320,6 +320,88 @@ async fn close_with_stale_turn_id_is_refused() {
     let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
 }
 
+/// 关闭请求没有带轮次 id，但旁支其实**正在跑**——必须拒绝。
+///
+/// 这不是理论窗口：TUI 的 `/side-close` 用的是它本地那份 `active_turn_id`，
+/// 而 turn id 是 driver 通过事件异步回传的。用户提交问题后、那条事件被消费前
+/// 按 `/side-close`，本地就是 `None`。此时若按「没带 id 就无条件关」执行，
+/// 用户会在一个正在回答的旁支上把它连人带答案一起关掉，而界面上从未出现过
+/// 「确认关闭」这一问。
+#[tokio::test]
+async fn a_close_without_a_turn_id_refuses_a_running_side() {
+    let mut fx = fixture();
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Open {
+            request_id: request_id(),
+            question: Some("问题".into()),
+        })
+        .await
+        .unwrap();
+    let opened = recv_until(&mut fx.handles.events, |event| {
+        matches!(
+            event.event,
+            ConversationPayload::SideStatus(SideStatus::Idle)
+        )
+    })
+    .await;
+
+    // 让旁支跑起来，并**不等**它的 turn 事件被消费——这正是 TUI 丢帧的时刻。
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Submit {
+            request_id: request_id(),
+            text: "第二个问题".into(),
+        })
+        .await
+        .unwrap();
+
+    fx.handles
+        .commands
+        .send(SideDriverCommand::Close {
+            expected_target: opened.target.clone(),
+            expected_active_turn_id: None,
+        })
+        .await
+        .unwrap();
+
+    // 不能关掉一个在跑的旁支，而且拒绝的原因必须回到**发起它的那个目标**上，
+    // 否则 TUI 既没关成、也不知道为什么。
+    let mut saw_closed = false;
+    let mut conflict = None;
+    for _ in 0..60 {
+        match tokio::time::timeout(Duration::from_millis(200), fx.handles.events.recv()).await {
+            Ok(Some(event)) => {
+                if matches!(event.event, ConversationPayload::SideClosed(_)) {
+                    saw_closed = true;
+                    break;
+                }
+                if let ConversationPayload::SideOperationError { operation, message } = &event.event
+                    && *operation == SideOperation::Close
+                {
+                    conflict = Some((event.target.clone(), message.clone()));
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        !saw_closed,
+        "本地不知道轮次 id 时关闭了正在运行的旁支：用户会连回答一起丢掉"
+    );
+    let (target, message) = conflict.expect("拒绝关闭必须报一条 Close 冲突，不能静默什么都不做");
+    assert_eq!(target, opened.target, "冲突必须回到发起关闭的那个旁支");
+    assert!(
+        message.contains("正在回答"),
+        "提示要说清是「正在回答」而不是「确认过期」，实际: {message}"
+    );
+
+    let _ = fx.handles.commands.send(SideDriverCommand::Exit).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), fx.handles.join).await;
+}
+
 #[tokio::test]
 async fn parent_barrier_blocks_open_until_rolled_back() {
     let fx = fixture();

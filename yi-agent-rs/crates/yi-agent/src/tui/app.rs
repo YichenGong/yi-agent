@@ -15658,6 +15658,46 @@ mod notification_tests {
         assert!(side.main_operation_notice().is_none());
     }
 
+    /// driver 拒绝关闭（旁支正在回答、本地又不知道轮次 id）时，拒绝原因必须
+    /// 出现在**用户正看着的那个旁支**的状态行上。
+    ///
+    /// 只测 driver 返回 Err 不够：那条错误要走 `SideOperationError` 回到 TUI，
+    /// 中间任何一处把它丢掉，用户就只会看到「按了 /side-close，界面没动」——
+    /// 正是这次要修的那类症状。
+    #[test]
+    fn a_refused_close_shows_why_in_the_visible_side() {
+        let mut side = SideSession::new(TuiTheme::DARK);
+        side.views.open("side-a".into(), 1);
+        side.notice = None;
+
+        side.apply_event(
+            &crate::tui::side::ConversationEvent {
+                target: ConversationTarget::Side {
+                    side_id: "side-a".into(),
+                    generation: 1,
+                },
+                turn_id: None,
+                event: ConversationPayload::SideOperationError {
+                    operation: SideOperation::Close,
+                    // 与 `side_driver.rs` 的 `close` 冲突分支逐字一致。
+                    message: "旁支正在回答，请等它结束或先停止再关闭".into(),
+                },
+            },
+            80,
+        );
+
+        let notice = side.notice.clone().unwrap_or_default();
+        assert!(notice.contains("正在回答"), "实际: {notice}");
+        assert!(
+            !side.active_side().unwrap().closed.is_some(),
+            "拒绝关闭不能被当成已关闭"
+        );
+        assert!(
+            side.main_operation_notice().is_none(),
+            "可见旁支自己的失败不该同时污染主视图"
+        );
+    }
+
     /// 提交时通道已满：命令照常返回视图，但失败必须可见，且不能谎报已关闭。
     #[test]
     fn side_repair_close_reports_an_undelivered_command() {

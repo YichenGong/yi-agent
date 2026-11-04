@@ -455,14 +455,26 @@ impl SideDriver {
             return Ok(());
         };
         let actual = runner.active_turn_id().map(str::to_string);
-        if expected_active_turn_id.is_some() && expected_active_turn_id != actual {
+        // 没带轮次 id 不代表「旁支是空闲的」——只代表调用方**不知道**当前跑的是
+        // 哪一轮。TUI 拿到 turn id 是通过异步事件，用户提交问题后、那条事件被
+        // 消费前按 `/side-close`，本地就是 `None`。此时放行等于在用户没看到
+        // 任何确认的情况下，把一个正在回答的旁支连回答一起关掉。
+        //
+        // 只有「调用方认为空闲」且「实际也空闲」才是无条件关闭。
+        let unconfirmed_while_running = expected_active_turn_id.is_none() && actual.is_some();
+        if unconfirmed_while_running || expected_active_turn_id != actual {
             // 条件冲突:把 runner 放回去,什么都不改。误停一个更新的轮次比拒绝
             // 这次关闭糟得多。
             self.runner = Some(runner);
-            return Err(SideError::new(
-                SideErrorReason::CloseConflict,
-                "旁支已经开始了新的一轮，请确认后再关闭",
-            ));
+            // 两种冲突分开说：一种是「你确认的是旧轮次」，另一种是「你压根还
+            // 不知道它在跑」。后者的下一步动作不同（先看它跑完没有），用同一
+            // 句话会让人以为自己的确认过期了。
+            let message = if unconfirmed_while_running {
+                "旁支正在回答，请等它结束或先停止再关闭"
+            } else {
+                "旁支已经开始了新的一轮，请确认后再关闭"
+            };
+            return Err(SideError::new(SideErrorReason::CloseConflict, message));
         }
         let side_id = runner.side_id().to_string();
         let generation = runner.generation();
