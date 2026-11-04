@@ -5040,3 +5040,249 @@ fn foreground_root_lifecycle_daemon_startup_keeps_a_managed_container_and_parks_
 
     drop(daemon);
 }
+
+/// A root that is still pending authentication may not dispatch: it runs nothing,
+/// so a child created under it would be work in a tree with no owner to stop it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_pending_root_refuses_dispatch() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_pending().unwrap();
+    let refusal = fixture
+        .root_dispatch_refusal()
+        .expect_err("a pending root must refuse dispatch");
+    assert!(
+        matches!(refusal, RuntimeCoordinatorError::AdmissionClosed(_)),
+        "a pending root is a closed admission, not a supervisor failure, got {refusal:?}"
+    );
+    let spawned = fixture.spawn("never admitted").await;
+    assert!(
+        matches!(spawned, Err(RuntimeCoordinatorError::AdmissionClosed(_))),
+        "the spawn path must reach the same verdict as the guard, got {spawned:?}"
+    );
+    assert!(
+        fixture.child_ids().is_empty(),
+        "a refused dispatch must not persist a child row"
+    );
+    fixture.assert_no_started_workers();
+}
+
+/// A record that contradicts its own attachment is refused rather than exempted.
+/// Guessing an exemption is how an immortal container gets created.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_corrupt_root_refuses_dispatch() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_corrupt().unwrap();
+    let refusal = fixture
+        .root_dispatch_refusal()
+        .expect_err("a corrupt root must refuse dispatch");
+    assert!(
+        matches!(refusal, RuntimeCoordinatorError::AdmissionClosed(_)),
+        "a corrupt root is a closed admission, got {refusal:?}"
+    );
+    assert!(fixture.spawn("never admitted").await.is_err());
+    fixture.assert_no_started_workers();
+}
+
+/// One owner's release must not drain another's tree, and the other owner must still
+/// be able to dispatch afterwards.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_leaves_another_owner_alone() {
+    let fixture = ForegroundFixture::managed().await;
+    let (other_session, other_root) = fixture.bind_second_owner("tui").unwrap();
+
+    let before = fixture
+        .spawn_under(&other_session, &other_root, "before")
+        .await
+        .expect("the second owner may dispatch while both are open");
+    fixture.release_owner().await.unwrap();
+
+    // The released owner's tree is closed...
+    assert!(matches!(
+        fixture.spawn("after release").await,
+        Err(RuntimeCoordinatorError::AdmissionClosed(_))
+    ));
+    // ...and the other owner still dispatches.
+    let after = fixture
+        .spawn_under(&other_session, &other_root, "after")
+        .await
+        .expect("a release of app must not drain tui");
+    assert_ne!(before, after);
+    assert!(
+        fixture
+            .coordinator()
+            .authorize_work("tui", &other_root.to_string())
+            .is_ok(),
+        "the second owner's admission must still be open"
+    );
+}
+
+/// A release must not be held hostage by a long wait elsewhere in the runtime: it
+/// closes admission and settles its own slots without waiting for unrelated work.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_is_not_blocked_by_a_parked_start() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("parked").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-commit barrier");
+    let started = tokio::time::Instant::now();
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    // Admission closes *before* the parked slot is settled: the release must not wait
+    // for the factory that the barrier is holding.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closing admission must not wait for the parked start"
+    );
+    barrier.release();
+    let _ = tokio::time::timeout(Duration::from_secs(5), spawning).await;
+    tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish once the slot settles")
+        .unwrap()
+        .unwrap();
+    fixture.assert_all_owned();
+    fixture.assert_no_started_workers();
+}
+
+/// The third window: a handle exists but has not been published when the release
+/// lands. The cancel must reach that handle, not a token nobody is watching.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_during_factory_return_cancels_the_handle() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_factory_returned();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("racing factory").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-factory barrier");
+    // Release concurrently: awaiting it here would deadlock on the very slot the
+    // barrier is holding, and the release would honestly report StopUnproven after
+    // its bounded wait. Close admission first, then let the parked start answer.
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    barrier.release();
+    tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish once the parked start answers")
+        .unwrap()
+        .unwrap();
+    let spawned = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawning task must answer")
+        .unwrap();
+    assert!(
+        spawned.is_err(),
+        "a worker whose start was released must not be reported as started, got {spawned:?}"
+    );
+    // The window really was the interesting one: the factory did run (so a handle
+    // existed), and yet nothing was published.
+    assert_eq!(
+        fixture.started_workers().len(),
+        1,
+        "the barrier must sit after the factory ran, not before it"
+    );
+    assert!(
+        fixture.no_live_executions(),
+        "a cancelled handle must leave no live execution behind"
+    );
+    fixture.assert_all_owned();
+    assert!(
+        !fixture.child_ids().contains(fixture.root()),
+        "the root itself is not a spawned child"
+    );
+}
+
+#[cfg(feature = "foreground-test-support")]
+mod foreground_support;
+
+#[cfg(feature = "foreground-test-support")]
+use foreground_support::ForegroundFixture;
+
+/// The release wins the race before the child row exists: the spawn must be refused,
+/// not admitted into a tree nobody owns.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_before_commit_refuses_spawn() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_before_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("late").await })
+    };
+    // Bounded waits everywhere: a RED run must fail the assertion, not hang the suite.
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the pre-commit barrier");
+    fixture.release_owner().await.unwrap();
+    barrier.release();
+    let spawned = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawn must answer after the barrier opens")
+        .unwrap();
+    assert!(
+        matches!(spawned, Err(RuntimeCoordinatorError::AdmissionClosed(_))),
+        "a spawn that lost the race to a release must be refused, got {spawned:?}"
+    );
+    assert!(
+        fixture.child_ids().is_empty(),
+        "a refused spawn must not persist a child row"
+    );
+    fixture.assert_no_started_workers();
+}
+
+/// The spawn wins the race to the commit: the child exists and its starting slot is
+/// registered, so the release must cancel it and leave nothing started.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_tracks_committed_pending_start() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("admitted").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-commit barrier");
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    // Release only after the admission is confirmed closed: awaiting the release
+    // itself here would deadlock on the very starting slot it is waiting for.
+    barrier.release();
+    let _outcome = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawn must answer once the slot is cancelled")
+        .unwrap();
+    let released = tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish")
+        .unwrap();
+    released.unwrap();
+    assert!(
+        !fixture.child_ids().is_empty(),
+        "the spawn committed before the release, so the child must exist"
+    );
+    fixture.assert_all_owned();
+    fixture.assert_no_started_workers();
+}

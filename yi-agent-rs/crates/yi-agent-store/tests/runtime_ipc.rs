@@ -5776,3 +5776,67 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
         "the shared root must not be cancelled by one conversation leaving"
     );
 }
+
+/// A spawn over the real socket that loses its race with a release must leave
+/// nothing behind.
+///
+/// The store-level tests drive the coordinator directly. This one exists because the
+/// wire path is a second entry point into the same admission decision: a daemon that
+/// answered `TaskSpawned` for a refused commit would be indistinguishable from a
+/// correct one from the coordinator's point of view.
+#[test]
+#[cfg(feature = "foreground-test-support")]
+fn foreground_root_lifecycle_a_refused_wire_spawn_leaves_no_child_and_no_owner() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "foreground-race".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    // Close the owner's admission first, exactly as a release does, then ask for a
+    // child over the socket. The owner is the attach idempotency key, which is what
+    // makes "the App's work" a stable set across app-server restarts.
+    daemon
+        .coordinator_for_test()
+        .close_client_admission("foreground-race");
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "too late".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a spawn for a closed owner must be refused on the wire, got {response:?}"
+    );
+    let coordinator = daemon.coordinator_for_test();
+    assert_eq!(
+        coordinator.owned_roots_of("foreground-race"),
+        vec![root_task_id.clone()],
+        "a refused spawn must not add an owned root"
+    );
+}

@@ -481,3 +481,86 @@ impl ForegroundActivation {
         }
     }
 }
+
+/// A two-way barrier for interleaving a test thread with a production code path.
+///
+/// `arrived_and_wait` reports that the code reached the point and parks until the
+/// test releases it. Two one-shots rather than a `Notify`: a `Notify` that fires
+/// before anyone waits is a lost wakeup, and a race test that hangs is worse than
+/// no test at all. The waiting side times out for the same reason.
+///
+/// Available only under `foreground-test-support` (or a unit test), so production
+/// code has no path to one.
+#[cfg(any(test, feature = "foreground-test-support"))]
+pub struct TestBarrier {
+    arrived: std::sync::atomic::AtomicBool,
+    arrived_notify: tokio::sync::Notify,
+    released: std::sync::atomic::AtomicBool,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "foreground-test-support"))]
+impl TestBarrier {
+    pub fn new() -> Self {
+        Self {
+            arrived: std::sync::atomic::AtomicBool::new(false),
+            arrived_notify: tokio::sync::Notify::new(),
+            released: std::sync::atomic::AtomicBool::new(false),
+            release_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Called by the production path: report arrival, then wait for release.
+    pub async fn arrived_and_wait(&self) {
+        use std::sync::atomic::Ordering;
+        self.arrived.store(true, Ordering::Release);
+        // `notify_waiters` rather than `notify_one`: the flag is the real state, and
+        // this only wakes whoever is already waiting. A waiter that arrives first
+        // sees the flag, so neither order can lose the wakeup.
+        self.arrived_notify.notify_waiters();
+        let deadline = std::time::Duration::from_secs(10);
+        let _ = tokio::time::timeout(deadline, async {
+            while !self.released.load(Ordering::Acquire) {
+                self.release_notify.notified().await;
+            }
+        })
+        .await;
+    }
+
+    /// Called by the test through a shared handle: wait until the code path reports
+    /// arrival.
+    pub async fn wait_arrival(&self) {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Duration::from_secs(5);
+        let _ = tokio::time::timeout(deadline, async {
+            while !self.arrived.load(Ordering::Acquire) {
+                self.arrived_notify.notified().await;
+            }
+        })
+        .await;
+    }
+
+    /// Called by the test: let the parked code continue.
+    pub fn release_shared(&self) {
+        use std::sync::atomic::Ordering;
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    /// Called by the test: wait until the code path reports arrival.
+    pub async fn arrived(&mut self) {
+        self.wait_arrival().await;
+    }
+
+    /// Called by the test: let the parked code continue.
+    pub fn release(self) {
+        self.release_shared();
+    }
+}
+
+#[cfg(any(test, feature = "foreground-test-support"))]
+impl Default for TestBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}

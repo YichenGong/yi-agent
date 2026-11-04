@@ -419,19 +419,18 @@ async fn release_and_spawn_racing_never_leaves_an_admitted_orphan() {
         release.await.unwrap();
         let spawned = spawn.await.unwrap();
 
-        // Each iteration asserts the invariant that matters: a child is admitted
-        // *only* if it can be bound to its owner, and a child that could not be
-        // bound must not exist as admitted work. The binding and the admission
-        // share the same closed-owner state, so they cannot disagree.
+        // Each iteration asserts the invariant that matters: a child that was
+        // admitted is attributable to its owner, and a child that could not be
+        // admitted does not exist as work. Both properties must hold without the
+        // test binding anything itself -- the production path records ownership as
+        // part of the commit, and a helper doing it here would hide the case where it
+        // does not.
         match spawned {
             Ok(child) => {
-                coordinator
-                    .bind_child_root(&root.to_string(), &child.to_string())
-                    .expect("an admitted descendant must inherit ownership");
                 // The client may already be closed by now, so authorization is
-                // *not* the invariant. The invariant is discoverability: the
-                // child must be enumerable as the app's, or reclamation could
-                // never find the work it admitted.
+                // *not* the invariant. The invariant is discoverability: the child
+                // must already be enumerable as the app's, or reclamation could never
+                // find the work it admitted.
                 assert!(
                     coordinator
                         .owned_roots_of("app")
@@ -497,4 +496,47 @@ async fn a_released_owner_cannot_reattach() {
         error.to_string().contains("closed admission"),
         "the refusal must name the reason, got: {error}"
     );
+}
+
+#[test]
+fn foreground_root_lifecycle_descendants_are_part_of_the_closing_tree() {
+    // A release that reclaimed only the roots bound directly to the frontend would
+    // leave grandchildren running with nobody to ask. Descendants record the client as
+    // their owner, so the returned tree must already contain them -- the property is
+    // that the reclaim set is complete, not that a walk happens.
+    let mut clients = RuntimeClients::new();
+    clients.bind_root("app", "thread:a", "g1").unwrap();
+    clients.bind_root("tui", "thread:b", "g1").unwrap();
+    clients.bind_child_root("thread:a", "task:1", "g1").unwrap();
+    clients.bind_child_root("task:1", "task:2", "g1").unwrap();
+    clients
+        .bind_child_root("thread:b", "task:other", "g1")
+        .unwrap();
+
+    assert_eq!(
+        clients.close_client_admission("app"),
+        vec![
+            "task:1".to_string(),
+            "task:2".to_string(),
+            "thread:a".to_string()
+        ],
+        "the closing client's whole tree, and nothing of the TUI's"
+    );
+    // Nothing of the other client's tree moved.
+    assert!(clients.authorize("tui", "task:other", "g1").is_ok());
+    assert!(clients.authorize("app", "task:2", "g1").is_err());
+}
+
+#[test]
+fn foreground_root_lifecycle_release_is_reported_once() {
+    // A reclaim loop may run twice (a retry after a transient stop failure); the
+    // second pass must return the same tree rather than an empty or growing one, or
+    // the retry would look like there was nothing left to reclaim.
+    let mut clients = RuntimeClients::new();
+    clients.bind_root("app", "thread:a", "g1").unwrap();
+    clients.bind_child_root("thread:a", "task:1", "g1").unwrap();
+    let first = clients.close_client_admission("app");
+    let second = clients.close_client_admission("app");
+    assert_eq!(first, second);
+    assert_eq!(clients.exited().len(), 2);
 }

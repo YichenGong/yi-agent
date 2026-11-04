@@ -1,5 +1,7 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
+pub(crate) mod foreground;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +106,11 @@ pub enum RuntimeCoordinatorError {
     QueueCapacityExceeded,
     #[error("runtime root rejects new work: {0}")]
     AdmissionClosed(String),
+    #[error("the release could not prove that {outstanding} execution(s) under {roots:?} stopped")]
+    StopUnproven {
+        outstanding: usize,
+        roots: Vec<RootId>,
+    },
     #[error("runtime is draining and rejects new admissions")]
     Draining,
     #[error("fork payload of {total} bytes exceeds the {max}-byte limit")]
@@ -256,6 +263,22 @@ pub struct RuntimeCoordinator {
     /// through this coordinator's serialized entry points, which is what makes
     /// "check the lease, then spawn" atomic against a concurrent release.
     clients: Mutex<RuntimeClients>,
+    /// Permits for committed children whose factory has not been reached yet.
+    ///
+    /// The permit is the right to start user code for one task. It is parked here
+    /// between the commit and the factory call because those happen in different
+    /// functions, and it is taken out exactly once (`remove`), so the permission
+    /// cannot be reused for a second start.
+    foreground_starting: Mutex<HashMap<TaskId, crate::runtime::foreground::StartingPermit>>,
+    /// The commit gate: "check admission, register the starting execution, write the
+    /// child and its owner" is one step.
+    ///
+    /// Lock order is supervisor -> commit gate -> clients -> repository, and nothing
+    /// inside the gate may await: a network wait or a worker join held here would make
+    /// every release wait for unrelated work. The gate exits because the previous
+    /// shape read admission, dropped the lock, and wrote -- a release landing in that
+    /// window was followed by a child nobody owned and no slot to stop.
+    foreground_commit_gate: Arc<crate::runtime::foreground::ForegroundCommitGate>,
     generation: String,
     /// Monotonic ordinal for pending-stop entries, so old confirmed records can
     /// be pruned instead of accumulating for the daemon's whole life.
@@ -685,6 +708,10 @@ impl RuntimeCoordinator {
             draining: AtomicBool::new(false),
             pending_stops: Mutex::new(HashMap::new()),
             clients: Mutex::new(RuntimeClients::new()),
+            foreground_starting: Mutex::new(HashMap::new()),
+            foreground_commit_gate: Arc::new(
+                crate::runtime::foreground::ForegroundCommitGate::new(),
+            ),
             generation,
             stop_sequence: AtomicU64::new(0),
         })
@@ -1790,23 +1817,111 @@ impl RuntimeCoordinator {
             }
             (child, depth, attempt)
         };
-        self.repository
+        // The commit step. Admission is re-checked *inside* the gate, the row is
+        // written, and the starting execution is registered before the gate is
+        // released -- so a release that lands during this window either sees the
+        // child and its slot (and can stop both) or closed admission first (and this
+        // commit is refused). Nothing here awaits: the factory is called later.
+        let session_root_key = session_root.to_string();
+        // Test hook: before the commit, so a test can release the owner and prove the
+        // spawn is then refused rather than admitted into a closed tree.
+        #[cfg(any(test, feature = "foreground-test-support"))]
+        self.foreground_commit_gate
+            .hold_at("before_admission_commit")
+            .await;
+        let (admitted, starting, ()) = {
+            let admitted = self.foreground_commit_gate.clone().commit(
+                || {
+                    self.ensure_admitting()?;
+                    self.ensure_root_open(&session_root_key)?;
+                    // A root that is only *pending* authentication, or whose
+                    // declaration contradicts its rows, may not dispatch. Keeping
+                    // this inside the commit check rather than in the caller means a
+                    // root cannot be reclassified between "the check passed" and
+                    // "the child row exists": `foreground_class` reads the same
+                    // durable facts the settlement path reads.
+                    self.ensure_root_dispatchable(&session_root)?;
+                    Ok(crate::runtime::foreground::AdmissionStamp {
+                        root: session_root_key.clone(),
+                        task: child.clone(),
+                        attempt: attempt.id.clone(),
+                        generation: self.generation.clone(),
+                        authority_sequence: 0,
+                    })
+                },
+                |stamp| -> Result<(), crate::repository::RepositoryError> {
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .create_child_task_with_attempt_and_objective(
+                            &stamp.task,
+                            session,
+                            parent,
+                            depth,
+                            &stamp.attempt,
+                            attempt.number,
+                            "queued",
+                            &objective,
+                            workspace_mode,
+                            model.clone(),
+                            thread_id.as_deref(),
+                            inherited_sandbox,
+                        )?;
+                    Ok(())
+                },
+            );
+            match admitted {
+                Ok((stamp, permit, ())) => (stamp, permit, ()),
+                Err(crate::runtime::foreground::CommitRefusal::Refused(error)) => {
+                    // The child was built in the supervisor but no row describes it.
+                    // Abandoning it is the only honest outcome: leaving it would make
+                    // work enumerable that was never admitted, and a later release
+                    // would try to stop a task that does not exist durably.
+                    supervisor
+                        .lock()
+                        .await
+                        .abandon_uncommitted_task(&child)
+                        .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    return Err(error);
+                }
+                Err(crate::runtime::foreground::CommitRefusal::Commit(error)) => {
+                    supervisor
+                        .lock()
+                        .await
+                        .abandon_uncommitted_task(&child)
+                        .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    return Err(RuntimeCoordinatorError::Repository(error));
+                }
+            }
+        };
+        debug_assert_eq!(admitted.task, child);
+        // Ownership is recorded immediately after the row, before the gate's
+        // exclusion ends: `bind_child_root` takes the clients lock, so calling it
+        // inside `register` would nest a lock the caller may already hold.
+        //
+        // A parent root that was never bound is not a spawn failure. Root binding is
+        // an attach-time concern, and many callers (schedules, tests, headless runs)
+        // never bind a client at all; refusing the spawn would break every such path
+        // for a bookkeeping gap that a release's own enumeration is what defines.
+        if let Err(error) = self.bind_child_root(&session_root_key, &child.to_string()) {
+            tracing::debug!(
+                %child,
+                "child ownership was not recorded: {error}"
+            );
+        }
+        // Test hook: the window between "committed" and "factory asked" is where a
+        // release must be able to see the child. Nothing is installed in production.
+        #[cfg(any(test, feature = "foreground-test-support"))]
+        self.foreground_commit_gate
+            .hold_at("after_admission_commit")
+            .await;
+        // Parked until `start_worker` hands it to the factory wrapper. A child that
+        // is never started keeps the permit, which keeps the slot visible as
+        // starting -- and therefore cancellable by a release.
+        self.foreground_starting
             .lock()
-            .expect("runtime repository mutex poisoned")
-            .create_child_task_with_attempt_and_objective(
-                &child,
-                session,
-                parent,
-                depth,
-                &attempt.id,
-                attempt.number,
-                "queued",
-                &objective,
-                workspace_mode,
-                model.clone(),
-                thread_id.as_deref(),
-                inherited_sandbox,
-            )?;
+            .expect("foreground starting permit mutex poisoned")
+            .insert(child.clone(), starting);
         // Persisted beside the row above: an inherited set that lived only in
         // memory would be lost on restart while the row survived, and the two
         // would silently disagree. Skipped when empty so a no-roots spawn
@@ -1890,7 +2005,15 @@ impl RuntimeCoordinator {
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {
                 Ok(()) | Err(RuntimeCoordinatorError::ResidentCapacityExhausted) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // The start failed before a factory was asked (workspace
+                    // provisioning, a recovery gate, capacity). The slot must not stay
+                    // "starting" for the daemon's life: nobody is going to answer for
+                    // it, and a release would then report an unproven stop for work
+                    // that never existed.
+                    self.abandon_foreground_start(&child);
+                    return Err(error);
+                }
             }
         }
         Ok(child)
@@ -2184,8 +2307,31 @@ impl RuntimeCoordinator {
             .as_ref()
             .map(|factory| factory as &dyn AgentWorkerFactory)
             .unwrap_or_else(|| self.factory.as_ref());
+        // The factory is wrapped so "user code may start" is a permission: the
+        // wrapper refuses before delegating when the slot was released, installs the
+        // slot's cancellation token on the worker it starts, and settles the slot on
+        // failure or cancellation. Without the wrapper a release could cancel a slot
+        // whose `Start` frame had already been sent.
+        let permit = match self
+            .foreground_starting
+            .lock()
+            .expect("foreground starting permit mutex poisoned")
+            .remove(task)
+        {
+            Some(permit) => permit,
+            // A root task is created by its supervisor rather than by a spawn, so it
+            // has no commit to ride on. It still gets a slot: otherwise the first
+            // execution of a session would be the one a release cannot see.
+            None => self
+                .foreground_commit_gate
+                .begin_root_start(task.clone(), session.to_string()),
+        };
+        let admitted_factory = crate::runtime::foreground::AdmittedWorkerFactory {
+            inner: worker_factory,
+            permit,
+        };
         let start_outcome = supervisor
-            .start_worker_with_provider_turn_gate(worker_factory, task, provider_turn_gate)
+            .start_worker_with_provider_turn_gate(&admitted_factory, task, provider_turn_gate)
             .await;
         if let Err(error) = start_outcome {
             let (message, affected) = match error {
@@ -3624,6 +3770,42 @@ impl RuntimeCoordinator {
     ///
     /// Used at the task-entry points that create work (spawn). It needs no caller
     /// identity, so it cannot be bypassed by a self-reported client id.
+    /// Refuses dispatch under a root whose classification forbids it.
+    ///
+    /// `ForegroundPending` is a root that is being authenticated but is not yet
+    /// bound: it runs nothing, so delegating under it would create work in a tree
+    /// that has no owner to stop it. `Corrupt` is a record that contradicts its own
+    /// attachment, and guessing an exemption for it is how an immortal container
+    /// gets created. Only `Execution` and `ForegroundManaged` may dispatch.
+    ///
+    /// The class is read from the repository, not from a cached copy, so a
+    /// reclassification committed by the prepare path is observed here rather than
+    /// one admission later.
+    fn ensure_root_dispatchable(&self, root: &TaskId) -> Result<(), RuntimeCoordinatorError> {
+        // The root is passed in rather than re-derived: this runs inside the commit
+        // gate, and re-deriving it would take the supervisor map lock in the opposite
+        // order (gate -> supervisor) from the documented one.
+        let class = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .foreground_class(root)?;
+        match class {
+            crate::foreground::RootExecutionClass::Execution
+            | crate::foreground::RootExecutionClass::ForegroundManaged => Ok(()),
+            crate::foreground::RootExecutionClass::ForegroundPending => {
+                Err(RuntimeCoordinatorError::AdmissionClosed(
+                    "the foreground root is still pending authentication".into(),
+                ))
+            }
+            crate::foreground::RootExecutionClass::Corrupt => {
+                Err(RuntimeCoordinatorError::AdmissionClosed(
+                    "the foreground root's classification contradicts its rows".into(),
+                ))
+            }
+        }
+    }
+
     fn ensure_root_open(&self, root: &str) -> Result<(), RuntimeCoordinatorError> {
         self.clients
             .lock()
@@ -3669,9 +3851,15 @@ impl RuntimeCoordinator {
     /// admitting work, which is the difference between a client drain and the
     /// project-level drain [`Self::begin_draining`] performs.
     pub fn close_client_admission(&self, client: &str) -> Vec<RootId> {
-        let roots = {
+        // Closing admission and cancelling the client's starting executions are one
+        // step, for the same reason commit is: a spawn that commits after this must
+        // be refused, and a spawn that committed before it must be cancelled rather
+        // than left running with nobody to ask. Nothing awaits inside.
+        let (roots, _starting) = {
             let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
-            clients.close_client_admission(client)
+            let roots = clients.close_client_admission(client);
+            let released = self.foreground_commit_gate.release_owner(client);
+            (roots, released)
         };
         let repository = self
             .repository
@@ -3702,6 +3890,154 @@ impl RuntimeCoordinator {
         } else {
             false
         }
+    }
+
+    /// Close admission, then stop everything the gate registered.
+    ///
+    /// The two halves are deliberately split. Closing and enumerating happens under
+    /// the gate, because that is what makes "nothing new is admitted" and "this is
+    /// the complete set" true together. Stopping happens *after* the gate is
+    /// released: a cancel, a join or a supervisor lock held here would make an
+    /// unrelated session's spawn wait for this client's teardown, and the plan
+    /// forbids exactly that.
+    ///
+    /// `starting` slots are cancelled by the gate already; this waits for their
+    /// answer. `running` slots already have a handle and are cancelled here.
+    pub async fn release_owner_and_stop(
+        &self,
+        client: &str,
+    ) -> Result<Vec<RootId>, RuntimeCoordinatorError> {
+        let roots = self.close_client_admission(client);
+        let released = self.foreground_commit_gate.release_owner(client);
+        for task in &released.running {
+            self.foreground_commit_gate.stopped(task);
+        }
+        for task in &released.starting {
+            // A starting slot may still be waiting for a factory. Its own token was
+            // cancelled under the gate, so the answer arrives without us holding
+            // anything; wait for the slot to settle rather than reporting success on
+            // an execution that may yet run.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.foreground_commit_gate.is_starting(task) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // A release must not claim more than it proved. Slots still live here either
+        // ignored their cancellation or are running and their stop has not been
+        // recorded; reporting them is what lets a caller retry instead of believing a
+        // teardown succeeded.
+        let outstanding = self.foreground_commit_gate.live_count();
+        if outstanding > 0 {
+            return Err(RuntimeCoordinatorError::StopUnproven {
+                outstanding,
+                roots: roots.clone(),
+            });
+        }
+        Ok(roots)
+    }
+
+    /// Every task the session's supervisor knows about, root included.
+    ///
+    /// Test hook: the assertions are about what was *registered*, so they must read
+    /// the live supervisor rather than a projection of it.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn children_of_root(&self, session: &RootSessionId) -> Vec<TaskId> {
+        self.supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .get(session)
+            .map(|supervisor| {
+                supervisor
+                    .try_lock()
+                    .map(|supervisor| supervisor.task_ids())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many registered executions have not been proven stopped.
+    ///
+    /// Test hook: a cancelled handle that was never settled would still count here,
+    /// so the assertion is about the gate's own bookkeeping rather than a projection.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn live_execution_count(&self) -> usize {
+        self.foreground_commit_gate.live_count()
+    }
+
+    /// The fixture's direct repository handle, for building the durable
+    /// contradictions the reader must refuse.
+    ///
+    /// Test hook only: production code never reaches around the coordinator to the
+    /// repository, and doing so here is the point -- a corrupt row is something the
+    /// production path cannot produce, so a test must be able to.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn repository_for_test(&self) -> Option<std::sync::MutexGuard<'_, RuntimeRepository>> {
+        self.repository.try_lock().ok()
+    }
+
+    /// Marks a root's classification for the admission tests.
+    ///
+    /// Test hook only: the real writer is the authenticated prepare (Task 3/9). The
+    /// tests here need a root that is *already* pending or corrupt, and building one
+    /// through the real bridge would test the bridge instead of the gate.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn record_foreground_class_for_test(
+        &self,
+        root: &TaskId,
+        classification: crate::repository::foreground::ForegroundClassification,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_foreground_root(&crate::repository::foreground::PersistedForegroundRoot {
+                root: root.clone(),
+                classification,
+                binding_epoch: 0,
+                driver_epoch: 0,
+                owner_client_id: None,
+                admission: crate::repository::foreground::AdmissionState::Closed,
+                driver_bind_operation_id: None,
+            })?;
+        Ok(())
+    }
+
+    /// Runs the guard a spawn commit consults, without spawning.
+    ///
+    /// Exposed so a test can prove a pending or corrupt root is refused *by name*
+    /// instead of inferring it from a failed spawn that might have failed earlier.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn check_root_dispatchable_for_test(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.ensure_root_dispatchable(&self.session_root(session)?)
+    }
+
+    /// Installs a test barrier inside the admission protocol.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_test_barrier(
+        &self,
+        point: &'static str,
+        barrier: Arc<crate::foreground::TestBarrier>,
+    ) {
+        self.foreground_commit_gate
+            .install_test_barrier(point, barrier);
+    }
+
+    /// Settles a start that will never be attempted.
+    ///
+    /// A committed child can fail before the factory is reached (workspace
+    /// provisioning, a recovery gate, a provider profile refusal). The row and the
+    /// slot already exist, so the honest outcome is to record that the execution is
+    /// over rather than leave a starting slot that no one will ever answer for. The
+    /// permit is dropped here too: a parked permit is a second claim on a slot that
+    /// has none.
+    fn abandon_foreground_start(&self, task: &TaskId) {
+        self.foreground_starting
+            .lock()
+            .expect("foreground starting permit mutex poisoned")
+            .remove(task);
+        self.foreground_commit_gate.stopped(task);
     }
 
     /// Every root a client owns, for reclamation and diagnostics.

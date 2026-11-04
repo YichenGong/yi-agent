@@ -338,6 +338,17 @@ impl Daemon {
         &self.socket_path
     }
 
+    /// The coordinator this daemon serves.
+    ///
+    /// Test hook: the foreground lifecycle tests drive a real daemon over its socket
+    /// and then assert on coordinator state (which children exist, which are
+    /// attributable to an owner). Reading it from a projection instead would let the
+    /// two disagree, which is the failure class this work is about.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn coordinator_for_test(&self) -> &Arc<RuntimeCoordinator> {
+        &self.coordinator
+    }
+
     /// 每分钟的周期维护。抽成方法是为了让测试能驱动**线程每分会调用的同一条
     /// 路径**，而不是等墙上时钟走到下一个整分（否则测试只能绕过驱动路径
     /// 直调各方法，那正好测不到「接线」本身）。

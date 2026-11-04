@@ -509,6 +509,23 @@ impl RuntimeRepository {
         Ok(Self { connection })
     }
 
+    /// Runs one statement against the fixture database.
+    ///
+    /// Test-only escape hatch: `foreground_class` treats a hand-made contradiction
+    /// as `Corrupt`, and the production writer cannot make one (that is the point of
+    /// the migration writing no classification rows). A test that wants the reader's
+    /// verdict on a corrupt row therefore has to build the row itself.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_statement(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<(), RepositoryError> {
+        self.connection
+            .execute(statement, rusqlite::params![parameter])?;
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<i64, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
