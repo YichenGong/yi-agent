@@ -49,6 +49,8 @@ T27 已落地的部分：
 - Step 2（故障注入矩阵）：`scripts/plugins/fault-matrix.json` 把断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管、待清理卸载、每阶段崩溃十项绑到 41 个既有测试；`just plugin-fault-matrix` 真跑 nextest 得 10/10 项、41/41 测试 ok。改名任一测试即 9/10 并以退出码 1 失败。
 - Step 4（同一 `.app` 上的 v1→v2）：`just plugin-update-check /Applications/yi-agent.app` 得 UI `board-v1`→`board-v2`、主程序 desktop 与 bundle 摘要前后一致、`verify-active-release.py` 校验活跃版本/view 摘要/skill 来源、卸载后项目数据保留且托管入口消失。五种变异各自被拦。
 
+- Step 3（执行器真跑 A01–A20）：`scripts/plugins/e2e.mjs` 把验收目录的每条用例绑到一条可复算命令并真执行，`--suite all` 产出 `.artifacts/plugins/acceptance.json`；`scripts/plugins/acceptance-commands.json` 是映射表，`just plugin-acceptance-check` 现为 40 个 node 测试 + 24 个契约测试 + 11 个边界测试。本轮实测 **14 pass / 6 unsupported / 0 fail**，报告归档于 [acceptance 报告](../superpowers/reports/2026-11-02-kanban-independent-release-acceptance.md)。六条 unsupported 逐条点名缺什么：A03/A20 缺官方签名包，A07/A08 缺已构建 `.app`，A16/A17 缺 `e2e-remote.mjs` 执行器与真实远端主机。跑这一遍修掉四个只有真跑才暴露的缺陷：cargo 命令未声明工作目录（报「找不到 Cargo.toml」被误读成实现失败）、fault-matrix 脚本路径相对根目录（根本找不到）、十几条用例各自重跑整个故障矩阵（一次验收变一小时，已改为同命令一次运行内复用）、A07/A08/A16/A17 把「缺产物/缺执行器」记成 fail。
+
 **仍未完成：** T26 Step 4（平台签名/公证与真实下载后的 OS 执行策略验证）需要发布授权与签名密钥；T27 Step 3（真实非 loopback 远端宿主证据）需要可访问的外部机器，A16/A17 因此保持未完成；T27 Step 4 的脱敏报告与截图、以及 Step 5 的最终验收提交同样待办。因此本条保持 `[ ]`。
 - [x] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`（225 lib + 45 bin 通过）。
 
