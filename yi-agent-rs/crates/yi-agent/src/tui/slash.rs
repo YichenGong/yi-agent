@@ -226,6 +226,9 @@ impl SlashCommand {
                 Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
             }
             Self::Budget | Self::Priority => Some("daemon 尚未提供预算/优先级写接口"),
+            Self::RecoverRoot => {
+                Some("TUI 的恢复入口尚未接到本进程的租约授权；恢复需要宿主已有 lease 才能确认")
+            }
             _ => None,
         }
     }
@@ -881,6 +884,17 @@ mod tests {
                 .expect("recover-root takes an operation id")
                 .contains("status"),
             "the usage must offer the read-only form, not only the mutating one"
+        );
+        // It resolves and documents itself, but must not be offered in completion:
+        // a command the host cannot actually confirm would look usable and then
+        // refuse, which is worse than not listing it.
+        assert!(
+            SlashCommand::RecoverRoot.unavailable_reason().is_some(),
+            "an unwired command must not appear as usable in completion"
+        );
+        assert!(
+            !SlashCommand::completable().contains(&SlashCommand::RecoverRoot),
+            "completion must not offer a command with no backend"
         );
     }
 
