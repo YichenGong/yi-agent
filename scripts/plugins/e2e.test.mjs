@@ -397,8 +397,15 @@ test("an unsupported case runs nothing and records why", () => {
 
 test("a case with its capability present does run and can fail honestly", () => {
   // 反向钉住上一条：能力在的时候必须真跑。否则「不跑」会变成绕过验收的后门。
-  const map = loadCommandMap();
-  const a16 = planSuites(map, "A16")[0];
+  //
+  // 用一份自造用例而不是映射表里的 A16：A16 现在还声明了它需要一个尚未实现的
+  // 执行器（`e2e-remote.mjs`），那是另一条独立规则，混在这里会让本用例
+  // 因为别的原因通过或失败。
+  const a16 = {
+    id: "A16",
+    unsupportedWithout: "remote",
+    commands: [{ kind: "remote", run: "remote-driver" }],
+  };
   let ran = 0;
   const results = runSelected([a16], {
     capabilities: { remote: true },
@@ -423,4 +430,175 @@ test("parseArgs rejects an unknown build kind and unknown flags", () => {
   assert.throws(() => parseArgs(["--build", "signed"]), /must be probe or release/);
   assert.throws(() => parseArgs(["--nope"]), /unknown argument/);
   assert.deepEqual(parseArgs(["--suite", "A01", "--require-pass"]).requirePass, true);
+});
+
+test("a command's cwd is resolved against the run root", () => {
+  // 这条是从一次真实的 16/20 全红改出来的：cargo 必须在 `yi-agent-rs/` 里跑，
+  // 从仓库根跑得到「找不到 Cargo.toml」，报告里却只写 fail、看不出是环境错。
+  let seenCwd = null;
+  runCommand("cargo nextest list", {
+    cwd: "/repo",
+    commandCwd: "yi-agent-rs",
+    runner: (_command, _args, options) => {
+      seenCwd = options.cwd;
+      return "";
+    },
+  });
+  assert.equal(seenCwd, path.resolve("/repo", "yi-agent-rs"));
+});
+
+test("no cwd on a command keeps the run root", () => {
+  let seenCwd = null;
+  runCommand("python3 x.py", {
+    cwd: "/repo",
+    runner: (_command, _args, options) => {
+      seenCwd = options.cwd;
+      return "";
+    },
+  });
+  assert.equal(seenCwd, "/repo");
+});
+
+test("every cargo command in the map declares the rust workspace as its cwd", () => {
+  // 映射表自身的回归：新增一条 cargo 命令却忘了写 cwd，就会静默地重新变成
+  // 「16 条全红」。这里直接钉住，不靠人记住。
+  for (const entry of map.cases) {
+    for (const command of entry.commands) {
+      if (command.run.startsWith("cargo ")) {
+        assert.equal(
+          command.cwd,
+          "yi-agent-rs",
+          `${entry.id} runs cargo without cwd, so it would fail from the repo root`,
+        );
+      }
+    }
+  }
+});
+
+test("a missing prerequisite degrades to unsupported and names the artefact", () => {
+  // 又一条从真实误判改出来的：A07 需要先构建 `.app`。没有 bundle 时命令会报
+  // 「文件不存在」，判词是 fail，读报告的人去查 probe 实现——真正缺的是构建。
+  const caseSpec = {
+    id: "A07",
+    unsupportedWithout: null,
+    commands: [
+      { kind: "command", run: "probe", needs: ["definitely/not/here.app"] },
+    ],
+  };
+  let ran = 0;
+  const results = runSelected([caseSpec], {
+    cwd: "/repo",
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 0, "a command whose artefact is absent must not run");
+  const report = assembleReport({
+    buildKind: "probe",
+    results,
+    capabilities: {},
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "unsupported");
+  assert.match(report.cases[0].reason, /definitely\/not\/here\.app/);
+});
+
+test("a missing prerequisite never masks a build that is actually present", () => {
+  // 反向：产物在的时候必须真跑，否则前置检查会变成绕过验收的后门。
+  const caseSpec = {
+    id: "A07",
+    unsupportedWithout: null,
+    commands: [{ kind: "command", run: "probe", needs: ["scripts/plugins/e2e.mjs"] }],
+  };
+  let ran = 0;
+  const results = runSelected([caseSpec], {
+    cwd: path.resolve("."),
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 1);
+  assert.equal(results[0].outcome, "pass");
+});
+
+test("a per-command capability gate records which capability was missing", () => {
+  const caseSpec = {
+    id: "A03",
+    unsupportedWithout: null,
+    commands: [{ kind: "artifact", run: "verify", requires: "official" }],
+  };
+  let ran = 0;
+  const results = runSelected([caseSpec], {
+    capabilities: {},
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 0);
+  assert.equal(results[0].skippedBecause, "official");
+  assert.match(results[0].reason, /official/);
+});
+
+test("a command shared by several cases runs once per run", () => {
+  // 十几条用例共享同一条 fault-matrix 命令，每条都重跑会让一次全量验收变成
+  // 一小时，结果是没人跑它。复用是正确性要求，不只是性能。
+  const shared = { kind: "command", run: "expensive" };
+  const cases = [
+    { id: "A09", unsupportedWithout: null, commands: [shared] },
+    { id: "A10", unsupportedWithout: null, commands: [shared] },
+    { id: "A11", unsupportedWithout: null, commands: [shared] },
+  ];
+  let ran = 0;
+  const results = runSelected(cases, {
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 1, "a shared command must not run once per case");
+  assert.deepEqual(results.map((r) => r.outcome), ["pass", "pass", "pass"]);
+});
+
+test("commands that differ in cwd are not shared", () => {
+  // 复用键必须带上工作目录，否则两条同名命令会在不同目录下共用一次结果。
+  const cases = [
+    { id: "A09", unsupportedWithout: null, commands: [{ kind: "command", run: "x", cwd: "a" }] },
+    { id: "A10", unsupportedWithout: null, commands: [{ kind: "command", run: "x", cwd: "b" }] },
+  ];
+  let ran = 0;
+  runSelected(cases, {
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 2);
+});
+
+test("a case naming a missing driver degrades instead of pretending to fail", () => {
+  // A16 的执行器（e2e-remote.mjs）还没实现。没有远端主机时它已经会是
+  // unsupported；但**即使**声明了主机，也不能让一步不存在的脚本冒充
+  // 「跑过但失败」——把缺执行器说成实现失败会指向完全错误的修法。
+  const map = loadCommandMap();
+  const a16 = planSuites(map, "A16")[0];
+  let ran = 0;
+  const results = runSelected([a16], {
+    capabilities: { remote: true },
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 0, "an unbuilt driver must not be executed");
+  const report = assembleReport({
+    buildKind: "probe",
+    results,
+    capabilities: { remote: true },
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "unsupported");
+  assert.match(report.cases[0].reason, /e2e-remote\.mjs/);
 });

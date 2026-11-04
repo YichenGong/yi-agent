@@ -15,7 +15,7 @@
 // 所以本文件**不产生 `skipped`**，词汇表只有 pass / fail / unsupported。
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -89,6 +89,22 @@ export function loadCommandMap(file = COMMANDS_PATH) {
       }
       if (!isNonEmptyString(command.run)) {
         fail(`${file}: ${id} has a command entry with no "run"`);
+      }
+      if (command.cwd !== undefined && !isNonEmptyString(command.cwd)) {
+        fail(`${file}: ${id} has a command entry whose "cwd" is not a path`);
+      }
+      if (command.requires !== undefined) {
+        if (!CAPABILITIES.includes(command.requires)) {
+          fail(
+            `${file}: ${id} requires unknown capability ${JSON.stringify(command.requires)} ` +
+              `(allowed: ${CAPABILITIES.join(", ")})`,
+          );
+        }
+      }
+      if (command.needs !== undefined) {
+        if (!Array.isArray(command.needs) || command.needs.some((p) => !isNonEmptyString(p))) {
+          fail(`${file}: ${id} has a command whose "needs" is not a list of paths`);
+        }
       }
     }
 
@@ -192,10 +208,18 @@ export function verdictFor({ caseSpec, outcome, capabilities = {} } = {}) {
   if (outcome === "pass") return "pass";
   if (outcome === "fail") return "fail";
 
-  // 走到这里说明 outcome 是 missing。只有声明的能力确实缺席时才降级成
-  // unsupported，且必须给出理由——理由会写进报告，读的人才知道缺的是什么。
+  // 走到这里说明 outcome 是 missing。两种情况会降级成 unsupported：
+  //
+  //   1. 该用例声明的能力（远端主机 / 官方签名包）确实缺席；
+  //   2. 它需要的**前置产物**不在（没有构建好的 `.app` 等）。
+  //
+  // 两者都是「这台机器此刻证明不了它」，不是「实现坏了」。除此之外的 missing
+  // 一律是 fail：命令明明该能跑却跑不起来，那是真问题。
   const without = caseSpec.unsupportedWithout;
   if (without !== null && without !== undefined && capabilities[without] !== true) {
+    return "unsupported";
+  }
+  if (caseSpec.prerequisiteMissing === true) {
     return "unsupported";
   }
   return "fail";
@@ -301,12 +325,22 @@ function looksLikeEnoent(error) {
 /// 我们不知道它是卡在实现里还是卡在环境里，把它说成「实现失败」会误导。
 export function runCommand(
   raw,
-  { cwd = process.cwd(), timeoutMs = 30 * 60 * 1000, runner = execFileSync, env = process.env } = {},
+  {
+    cwd = process.cwd(),
+    timeoutMs = 30 * 60 * 1000,
+    runner = execFileSync,
+    env = process.env,
+    commandCwd = null,
+  } = {},
 ) {
   const parsed = parseCommand(raw);
+  // 每条命令可以声明自己的工作目录。cargo 与 fault-matrix 都必须在
+  // `yi-agent-rs/` 里跑；从仓库根跑得到的是「找不到 Cargo.toml」，那种错误
+  // 会被读成实现失败，而真正的问题是工作目录。相对路径按传入的 `cwd` 解析。
+  const effectiveCwd = commandCwd ? path.resolve(cwd, commandCwd) : cwd;
   try {
     const stdout = runner(parsed.command, parsed.args, {
-      cwd,
+      cwd: effectiveCwd,
       encoding: "utf8",
       env: { ...env, ...parsed.env },
       timeout: timeoutMs,
@@ -361,6 +395,20 @@ export function detectCapabilities({ env = process.env, flags = {} } = {}) {
   };
 }
 
+/// 命令声明的**前置产物**是否就位。
+///
+/// 这是从一次真实的误判加的：A03/A07/A08 需要先构建好的 `.app`，A20 需要官方
+/// 签名包。缺产物时命令跑起来只会报「文件不存在」，判词落成 `fail`，读报告的
+/// 人于是去查实现——真正缺的是一个构建步骤。前置不满足属于**环境未就绪**，
+/// 与「能力未授信」是同一类：如实记 unsupported 并说明缺什么。
+export function missingPrerequisites(command, { root = process.cwd() } = {}) {
+  const missing = [];
+  for (const relative of command.needs ?? []) {
+    if (!existsSync(path.resolve(root, relative))) missing.push(relative);
+  }
+  return missing;
+}
+
 /// 把一条用例的多条命令折成一条结局。
 ///
 /// 任一条 missing 即 missing（我们没能证明它），任一条 fail 即 fail；只有全部
@@ -384,9 +432,44 @@ export function runCase(caseSpec, options = {}) {
     };
   }
 
+  for (const command of caseSpec.commands) {
+    if (command.requires && (options.capabilities ?? {})[command.requires] !== true) {
+      return {
+        caseSpec: { ...caseSpec, prerequisiteMissing: true },
+        outcome: "missing",
+        evidence: [],
+        outcomes: [],
+        skippedBecause: command.requires,
+        reason: `missing capability: ${command.requires}`,
+      };
+    }
+    const missing = missingPrerequisites(command, { root: options.cwd ?? process.cwd() });
+    if (missing.length > 0) {
+      // 前置产物不在：这条用例无法被证据覆盖，但也不是实现失败。
+      return {
+        // 不改调用方传进来的对象：映射表被复用于多个用例时，一份副本更安全。
+        caseSpec: { ...caseSpec, prerequisiteMissing: true },
+        outcome: "missing",
+        evidence: [],
+        outcomes: [],
+        skippedBecause: "prerequisite",
+        reason: `missing prerequisite: ${missing.join(", ")}`,
+      };
+    }
+  }
+
+  const memo = options.memo ?? new Map();
   const outcomes = [];
   for (const command of caseSpec.commands) {
-    const result = runCommand(command.run, options);
+    const key = `${command.cwd ?? ""}\u0000${command.run}`;
+    let result = memo.get(key);
+    if (result === undefined) {
+      result = runCommand(command.run, {
+        ...options,
+        commandCwd: command.cwd ?? null,
+      });
+      memo.set(key, result);
+    }
     outcomes.push({ ...result, kind: command.kind });
   }
   const evidence = outcomes
@@ -399,8 +482,19 @@ export function runCase(caseSpec, options = {}) {
 }
 
 /// 执行选中的用例，得到 `assembleReport` 需要的结果列表。
+///
+/// 同一条命令（`run` + `cwd` 相同）在一次运行里只执行一次，结果按命令复用。
+/// 这不是优化癖：映射表里 A09–A19 十几条用例都由 `fault-matrix.mjs` 证明，
+/// 而它自己要跑十几分钟的 nextest。逐条重跑会让「跑一次全量验收」变成一小时，
+/// 实际结果是没人跑它——一份没人跑的报告等于没有报告。
 export function runSelected(selected, options = {}) {
-  return selected.map((caseSpec) => runCase(caseSpec, options));
+  const memo = new Map();
+  return selected.map((caseSpec) =>
+    runCase(caseSpec, {
+      ...options,
+      memo,
+    }),
+  );
 }
 
 /// 命令行入口。
