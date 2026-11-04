@@ -397,6 +397,40 @@ fn a_real_guardian_serves_the_scope_and_outsides_its_first_client() -> anyhow::R
     Ok(())
 }
 
+/// A managed runtime must be able to promise foreground isolation.
+///
+/// This is the evidence that the original bug is fixed rather than merely
+/// unreachable: the whole contract only helps if the runtime a frontend actually
+/// talks to advertises the capability, because that advertisement is what a
+/// registering client checks before it reports delegation as available.
+///
+/// The guardian withholds it when its bridge is missing or the schema is too new.
+/// A managed bring-up has both, so the assertion here fails the moment the wiring
+/// regresses -- whether that is the bring-up, the bridge, or the capability gate.
+#[test]
+fn foreground_root_lifecycle_a_managed_runtime_advertises_the_contract() -> anyhow::Result<()> {
+    let harness = RuntimeHarness::start()?;
+    match ask(&harness.control_socket(), &ControlRequest::Identity) {
+        ControlResponse::Identity(identity) => {
+            assert!(
+                identity.capabilities.iter().any(|capability| {
+                    capability == yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY
+                }),
+                "a managed runtime must advertise the foreground capability it can honour; \
+                 advertised: {:?}",
+                identity.capabilities
+            );
+            assert_eq!(
+                identity.mode,
+                yi_agent_lifecycle::types::RuntimeMode::Managed,
+                "the capability is only meaningful on a managed runtime"
+            );
+        }
+        other => panic!("identity must answer with an identity: {other:?}"),
+    }
+    Ok(())
+}
+
 /// Two frontends, one exit: the survivor keeps its lease and its admission.
 ///
 /// Asserted from the *survivor's* point of view, because a bug here looks like
