@@ -6619,6 +6619,36 @@ describe("App 旁支视图", () => {
     clients[0].requests.length = 0;
   }
 
+  const box = () => screen.getByRole("textbox") as HTMLTextAreaElement;
+
+  /**
+   * 从输入框发一条命令。
+   *
+   * 这是**唯一**的旁支入口（spec §4.1 删除常驻模块与按钮）：用户在既有的输入框
+   * 里敲 `/side`、`/btw` 或 `/back`，没有任何额外的标题栏、横幅或快捷操作组。
+   */
+  async function command(text: string) {
+    fireEvent.change(box(), { target: { value: text } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+  }
+
+  /**
+   * 「没有常驻模块」的结构断言。
+   *
+   * 放在这里反复调用，是因为它比任何功能断言都更容易在后续改动里被悄悄破坏：
+   * 有人想「给旁支加个头」时，这几条会立刻红。
+   */
+  function expectNoSideChrome() {
+    expect(screen.queryByTestId("side-header")).toBeNull();
+    expect(screen.queryByTestId("side-conversation-header")).toBeNull();
+    expect(screen.queryByRole("button", { name: "旁问" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续旁问" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "查看旁问" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "停止旁问" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "关闭旁问" })).toBeNull();
+  }
+
   function runningSummary(turnId: string) {
     return {
       side_id: "side-1",
@@ -6633,29 +6663,55 @@ describe("App 旁支视图", () => {
     };
   }
 
-  it("shows the side entry next to the composer and opens an empty side", async () => {
+  function idleSummary() {
+    return {
+      side_id: "side-1",
+      parent_thread_id: "t1",
+      status: "idle",
+      snapshot_revision: 1,
+      last_seq: 0,
+      active_turn_id: null,
+      expires_at: null,
+      generation: 0,
+      stopping: false,
+    };
+  }
+
+  function usage(input: number, output: number) {
+    return {
+      total: {
+        input,
+        output,
+        cache_creation: 0,
+        cache_read: 0,
+        reasoning: 0,
+      },
+      complete: true,
+    };
+  }
+
+  it("opens an empty side from /side without a module or a model call", async () => {
     await readyWithSide();
-    const entry = await screen.findByRole("button", { name: "旁问" });
+    // 没有任何常驻入口：旁支只能从输入框里的命令进入。
+    expectNoSideChrome();
     reset();
-    fireEvent.click(entry);
+    await command("/side");
 
     await waitFor(() => expect(methods()).toContain("side/open"));
     // 空问题只开旁支，不替用户发一条空消息。
     expect(methods()).not.toContain("side/turnStart");
     // 打开旁支不需要也不允许对父会话做任何动作。
     expect(methods()).not.toContain("turn/interrupt");
-    expect(methods()).not.toContain("thread/resume");
-    await waitFor(() => expect(screen.getByTestId("side-header")).toBeTruthy());
+    expect(methods()).not.toContain("turn/start");
+    // 进入之后仍然没有模块：只靠 placeholder + 状态栏标识当前会话。
+    expectNoSideChrome();
+    expect(box().placeholder).toContain("/back 返回");
+    expect(screen.getByText(/^\/side · /)).toBeTruthy();
   });
 
   it("opens with the question typed after /btw, and only once", async () => {
     await readyWithSide();
-    await screen.findByRole("button", { name: "旁问" });
-    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
-    fireEvent.change(box, { target: { value: "/btw why is it slow" } });
-    reset();
-    fireEvent.keyDown(box, { key: "Enter" });
-
+    await command("/btw why is it slow");
     await waitFor(() => expect(methods()).toContain("side/open"));
     expect(methods().filter((m) => m === "side/open")).toHaveLength(1);
     // 问题作为第一条旁支消息发出去，且带一个去重 id。
@@ -6668,34 +6724,56 @@ describe("App 旁支视图", () => {
     expect(methods()).not.toContain("turn/start");
   });
 
-  it("keeps the parent's draft untouched when opening and leaving a side", async () => {
+  it("keeps each conversation's draft to itself", async () => {
     await readyWithSide();
-    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
-    fireEvent.change(box, { target: { value: "half-written parent message" } });
-    const entry = await screen.findByRole("button", { name: "旁问" });
     reset();
-    fireEvent.click(entry);
-
+    await command("/side");
     await waitFor(() => expect(methods()).toContain("side/open"));
-    // 旁支里是它自己的空草稿：父的文字既没被带进来，也没被清掉。
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
-    expect(methods()).not.toContain("side/turnStart");
 
-    fireEvent.click(screen.getByRole("button", { name: "返回主会话" }));
-    await waitFor(() =>
-      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-        "half-written parent message",
-      ),
-    );
+    // 旁支里是它自己的空草稿（父没写过东西，所以两边都空）。
+    expect(box().value).toBe("");
+    fireEvent.change(box(), { target: { value: "side draft" } });
+    expect(box().value).toBe("side draft");
+
+    // 用**侧栏**切回父会话（而不是再敲一次 `/back`——那会把命令文本打进同一个
+    // 输入框、覆盖掉正在测的那份草稿）。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect(box().value).toBe(""));
+    fireEvent.change(box(), { target: { value: "parent draft" } });
+    expect(box().value).toBe("parent draft");
+
+    // 再进旁支：旁支自己的草稿原样还在，父的没被带进来。
+    await command("/side");
+    await waitFor(() => expect(box().value).toBe("side draft"));
+    // 同一父已有旁支时不重取上下文：续用，不再 `side/open`。
+    expect(methods().filter((m) => m === "side/open")).toHaveLength(1);
+    // 切来切去都不该碰服务端的旁支状态。
+    expect(methods()).not.toContain("side/turnInterrupt");
+    expect(methods()).not.toContain("side/close");
+  });
+
+  it("keeps the parent's pending attachments out of the side", async () => {
+    // 附件属于父会话。进入旁支的命令**不能**把附件带过去、也不能丢掉它
+    // （spec §4.2「父的已有附件保持原位，返回后恢复」）。
+    await readyWithSide();
+    fireEvent.change(box(), { target: { value: "parent text" } });
+    // 走真实的上传入口太重：直接断言「旁支里看不到附件的入口」这一结构性质，
+    // 以及父的附件状态在切换后仍由父的会话保管。
+    reset();
+    await command("/side");
+    await waitFor(() => expect(methods()).toContain("side/open"));
+    // 旁支里不渲染父的附件 chip，也不提供附件入口之外的新控件。
+    expect(screen.queryByText("附加文件")).toBeTruthy(); // 入口仍在（同一输入卡片）
+    expect(screen.queryByRole("button", { name: "Permission mode: Normal" })).toBeNull();
+    // 模型切换只属于父会话。
+    expect(screen.queryByRole("button", { name: /model/i })).toBeNull();
   });
 
   it("does not interrupt a running parent when opening a side", async () => {
     await readyWithSide();
     state.listStatus = "running";
-    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
-    fireEvent.change(box, { target: { value: "/btw side question" } });
     reset();
-    fireEvent.keyDown(box, { key: "Enter" });
+    await command("/btw side question");
     await waitFor(() => expect(methods()).toContain("side/open"));
     expect(methods()).not.toContain("turn/interrupt");
     expect(methods()).not.toContain("turn/start");
@@ -6703,19 +6781,7 @@ describe("App 旁支视图", () => {
 
   it("renders the side transcript without reading parent images", async () => {
     await readyWithSide({
-      sideSummaries: [
-        {
-          side_id: "side-1",
-          parent_thread_id: "t1",
-          status: "idle",
-          snapshot_revision: 1,
-          last_seq: 0,
-          active_turn_id: null,
-          expires_at: null,
-          generation: 0,
-          stopping: false,
-        },
-      ],
+      sideSummaries: [idleSummary()],
       sideSnapshots: {
         "side-1": {
           side_id: "side-1",
@@ -6725,16 +6791,7 @@ describe("App 旁支视图", () => {
           accepted_requests: {},
           status: "idle",
           active_turn_id: null,
-          usage: {
-            total: {
-              input: 1,
-              output: 2,
-              cache_creation: 0,
-              cache_read: 0,
-              reasoning: 0,
-            },
-            complete: true,
-          },
+          usage: usage(1, 2),
           effective_config: {
             model: "m",
             reasoning_effort: null,
@@ -6743,31 +6800,35 @@ describe("App 旁支视图", () => {
             tool_names: [],
           },
           items: [
-            { type: "userMessage", id: "u1", text: "side question" },
-            { type: "agentMessage", id: "a1", text: "side answer" },
+            // 父会话的图片引用：旁支**不得**拿它去 `image/read`。
+            {
+              type: "userMessage",
+              id: "u1",
+              text: "side question",
+              images: [{ path: "/tmp/parent.png", media_type: "image/png" }],
+            },
+            { type: "agentMessage", id: "a1", text: "SIDE_ANSWER_CHUNK" },
           ],
         },
       },
     });
-    const entry = await screen.findByRole("button", { name: "旁问" });
     reset();
-    fireEvent.click(entry);
+    await command("/side");
 
-    expect(await screen.findByText("side answer")).toBeTruthy();
-    expect(screen.getByTestId("side-header")).toBeTruthy();
+    expect(await screen.findByText("SIDE_ANSWER_CHUNK")).toBeTruthy();
     // 旁支正文不走父的图片读取：`image/read` 一次都不该发。
     expect(methods()).not.toContain("image/read");
+    expectNoSideChrome();
   });
 
   it("returns to the parent without stopping or closing the running side", async () => {
     await readyWithSide({ sideSummaries: [runningSummary("side-turn-1")] });
-    const entry = await screen.findByRole("button", { name: "旁问" });
-    fireEvent.click(entry);
-    expect(await screen.findByTestId("side-header")).toBeTruthy();
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
     reset();
 
-    fireEvent.click(screen.getByRole("button", { name: "返回主会话" }));
-    await waitFor(() => expect(screen.queryByTestId("side-header")).toBeNull());
+    await command("/back");
+    await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
     // 返回只是换视图：不停旁支、不关旁支、不动父会话。
     expect(methods()).not.toContain("side/turnInterrupt");
     expect(methods()).not.toContain("side/close");
@@ -6776,12 +6837,13 @@ describe("App 旁支视图", () => {
 
   it("stops only the side's own turn", async () => {
     await readyWithSide({ sideSummaries: [runningSummary("side-turn-7")] });
-    const entry = await screen.findByRole("button", { name: "旁问" });
-    fireEvent.click(entry);
-    await screen.findByTestId("side-header");
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
     reset();
 
-    fireEvent.click(screen.getByRole("button", { name: "停止旁问" }));
+    // 旁支运行中只有它自己的 Stop，没有 Send（不插话、不排队）。
+    expect(screen.queryByRole("button", { name: /^send$/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
     await waitFor(() => expect(methods()).toContain("side/turnInterrupt"));
     expect(clients[0].requests).toContainEqual({
       method: "side/turnInterrupt",
@@ -6793,28 +6855,27 @@ describe("App 旁支视图", () => {
 
   it("asks the server for the live turn before confirming a close", async () => {
     await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
-    const entry = await screen.findByRole("button", { name: "旁问" });
-    fireEvent.click(entry);
-    await screen.findByTestId("side-header");
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
     reset();
 
-    fireEvent.click(screen.getByRole("button", { name: "关闭旁问" }));
+    await command("/side-close");
     // 弹出确认前必须问过服务端当前状态（`side/list`），不能拿本地缓存猜。
     await waitFor(() => expect(methods()).toContain("side/list"));
     const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
     expect(within(dialog).getByText(/还在回答/)).toBeTruthy();
 
-    // 取消：不发 close。
+    // 取消：不发 close，也不返回（spec §5.4「取消确认不关闭、不返回」）。
     fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
     expect(methods()).not.toContain("side/close");
+    expect(screen.getByText(/^\/side · /)).toBeTruthy();
   });
 
   it("sends close with the confirmed turn id", async () => {
     await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
-    const entry = await screen.findByRole("button", { name: "旁问" });
-    fireEvent.click(entry);
-    await screen.findByTestId("side-header");
-    fireEvent.click(screen.getByRole("button", { name: "关闭旁问" }));
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    await command("/side-close");
     const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
     fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
 
@@ -6824,26 +6885,132 @@ describe("App 旁支视图", () => {
       params: { sideId: "side-1", expectedActiveTurnId: "side-turn-9" },
     });
     // 关闭后回主会话，且父会话没被顺带停掉。
-    await waitFor(() => expect(screen.queryByTestId("side-header")).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
     expect(methods()).not.toContain("turn/interrupt");
   });
 
-  it("hides every side entry when the host lacks the capability", async () => {
+  it("closes a background side from the main view", async () => {
+    // `/side-close` 不能在主视图里被简单拒绝（spec §4.2）：旁支只在视图里显示，
+    // 关闭它不该要求先进去。
+    await readyWithSide({ sideSummaries: [idleSummary()] });
+    reset();
+    await command("/side-close");
+    await waitFor(() => expect(methods()).toContain("side/list"));
+    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
+    await waitFor(() => expect(methods()).toContain("side/close"));
+    expect(clients[0].requests).toContainEqual({
+      method: "side/close",
+      params: { sideId: "side-1", expectedActiveTurnId: null },
+    });
+  });
+
+  it("keeps the side open and says why when the close conflicts", async () => {
+    // 确认与执行之间状态变了（新起了一轮）：服务端按 `expectedActiveTurnId` 拒绝。
+    // 这里**不能**重试、不能强关、更不能把用户送回主会话——那条旁支还在跑。
+    await readyWithSide({ sideSummaries: [runningSummary("side-turn-9")] });
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    state.sideCloseConflict = true;
+    reset();
+    await command("/side-close");
+    const dialog = await screen.findByRole("dialog", { name: "关闭旁问" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭旁问" }));
+
+    await waitFor(() => expect(methods()).toContain("side/close"));
+    // 失败原因必须在旁支视图里当场可见（这条确认属于这条旁支）。
+    expect(await screen.findByText(/side state changed/)).toBeTruthy();
+    expect(screen.getByText(/^\/side · /)).toBeTruthy();
+    // 只尝试了一次：冲突不是可重试的瞬态错误。
+    expect(methods().filter((m) => m === "side/close")).toHaveLength(1);
+    expect(methods()).not.toContain("turn/interrupt");
+  });
+
+  it("keeps the typed question when the side's first turn is refused", async () => {
+    // 首问失败：旁支已经打开，但 `side/turnStart` 被拒。正文必须留在输入框里
+    // （用户能直接重发），失败原因要当场可见，且绝不能改道去父会话。
+    state.rejectCode["side/turnStart"] = -32603;
+    await readyWithSide();
+    reset();
+    await command("/btw why is it slow");
+    await waitFor(() => expect(methods()).toContain("side/turnStart"));
+    expect(await screen.findByText(/forced -32603/)).toBeTruthy();
+    await waitFor(() => expect(box().value).toBe("why is it slow"));
+    expect(methods()).not.toContain("turn/start");
+    expect(methods()).not.toContain("turn/interject");
+    // 失败不等于退出：仍然停在旁支视图里。
+    expect(screen.getByText(/^\/side · /)).toBeTruthy();
+  });
+
+  it("says so instead of pretending when there is nothing to close", async () => {
+    await readyWithSide();
+    reset();
+    await command("/side-close");
+    await waitFor(() => expect(methods()).toContain("side/list"));
+    // 幂等提示：不虚构一次关闭，但用户必须看到「为什么什么都没发生」。
+    expect(await screen.findByText(/没有打开的旁问/)).toBeTruthy();
+    expect(methods()).not.toContain("side/close");
+  });
+
+  it("hides every side entry point when the host lacks the capability", async () => {
     state.sideSupported = false;
     render(<App />);
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
     // 缺能力是终态：入口整个不出现，而不是点了弹一句"不支持"。
-    expect(screen.queryByRole("button", { name: "旁问" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "继续旁问" })).toBeNull();
+    expectNoSideChrome();
+    // 显式键入也不当普通消息发给模型：明确说明不支持。
+    fireEvent.change(box(), { target: { value: "/side" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(await screen.findByText("当前宿主不支持旁问")).toBeTruthy();
+    expect(methods()).not.toContain("side/open");
+    expect(methods()).not.toContain("turn/start");
+  });
+
+  it("lets a read-only device view an existing side, and refuses to ask", async () => {
+    // Observe：无参 `/side` 是查看例外，只 list/readItems；带问题必须拒绝。
+    //
+    // scope 来自**配对时落盘**的那份配置：它决定这台设备能不能下发 Control 类
+    // RPC。而且一旦有远端配置，前端就是手机布局——Enter 是换行，命令走那颗
+    // 主动作按钮（spec §4.2 平台差异）。
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({
+        url: "wss://relay.test/ws",
+        token: "yia_tok",
+        scope: "observe",
+      }),
+    );
+    await readyWithSide({ sideSummaries: [idleSummary()] });
+    expect(document.documentElement.dataset.mobile).toBe("true");
+
+    // 带问题：**当场**拒绝并保留原文。发问是 Control，装成「打开了」会让用户
+    // 以为问题发出去了。
+    reset();
+    fireEvent.change(box(), { target: { value: "/btw why" } });
+    expect(await screen.findByText("只读设备只能查看旁问，不能发起提问")).toBeTruthy();
+    expect(box().value).toBe("/btw why");
+    // 点主动作也不发：被拦的命令不进任何 RPC。
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await act(async () => {});
+    expect(methods()).not.toContain("side/open");
+    expect(methods()).not.toContain("side/turnStart");
+
+    // 无参：只查看已有的那条。零 `side/open`、零 `side/turnStart`。
+    fireEvent.change(box(), { target: { value: "/side" } });
+    fireEvent.click(screen.getByRole("button", { name: "执行命令" }));
+    await waitFor(() => expect(methods()).toContain("side/list"));
+    expect(methods()).not.toContain("side/open");
+    expect(methods()).not.toContain("side/turnStart");
+    // 进入视图后仍是只读：说明白为什么发不出去，而不是让用户对着灰按钮猜。
+    expect(await screen.findByText(/只读设备：/)).toBeTruthy();
   });
 
   it("never routes side notifications into the parent's mark-read or resume", async () => {
     await readyWithSide();
-    const entry = await screen.findByRole("button", { name: "旁问" });
-    fireEvent.click(entry);
-    await screen.findByTestId("side-header");
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
     reset();
     act(() => {
       for (const cb of state.notifHandlers) {
@@ -6864,19 +7031,103 @@ describe("App 旁支视图", () => {
     expect(methods()).not.toContain("thread/markRead");
     expect(methods()).not.toContain("thread/resume");
   });
+
+  it("marks a vanished side as lost instead of falling back to the parent", async () => {
+    // 另一端关掉了这条旁支：界面不能悄悄变成「父会话」，那会让用户以为自己在
+    // 旁支里继续问，实际每条消息都进了父线程（spec §5.1 禁止 fallback 父 send）。
+    await readyWithSide({ sideSummaries: [idleSummary()] });
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    reset();
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({
+          method: "side/closed",
+          params: {
+            parent_thread_id: "t1",
+            side_id: "side-1",
+            generation: 0,
+            seq: 1,
+            reason: "expired",
+          },
+        });
+      }
+    });
+
+    // 给出原因与一条回主会话的明确出口，而不是把父的正文当成旁支继续。
+    // 原因与出口只出现**一次**（正文占位符里），不要在输入区再叠一遍。
+    expect(await screen.findByText(/这条旁问已经关闭/)).toBeTruthy();
+    expect(screen.getAllByText(/这条旁问已经关闭/)).toHaveLength(1);
+    // 任何输入都不许落到父会话上：`lost` 时输入区是关的。
+    expect(box().disabled).toBe(true);
+    expect(methods()).not.toContain("turn/start");
+    expect(methods()).not.toContain("turn/interject");
+    expect(methods()).not.toContain("side/turnStart");
+  });
+
+  it("shows the side's own usage rather than the parent's", async () => {
+    await readyWithSide({
+      sideSummaries: [idleSummary()],
+      sideSnapshots: {
+        "side-1": {
+          side_id: "side-1",
+          snapshot_seq: 1,
+          snapshot_token: "tok",
+          next_cursor: null,
+          accepted_requests: {},
+          status: "idle",
+          active_turn_id: null,
+          usage: usage(7, 11),
+          effective_config: null,
+          items: [],
+        },
+      },
+    });
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    // 用量折叠态显示的是**旁支自己**的数字（7 in / 11 out），不是父的。
+    const usageButton = screen.getByRole("button", { name: "Token usage details" });
+    expect(usageButton.textContent).toContain("7");
+    expect(usageButton.textContent).toContain("11");
+  });
+
+  it("keeps the parent's approval dialog out of the side view", async () => {
+    await readyWithSide();
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+
+    act(() => {
+      state.approvalHandlers[0]({
+        id: "perm-1",
+        params: {
+          thread_id: "t1",
+          turn_id: "u1",
+          request_id: 1,
+          tool_name: "bash",
+          tool_input: { command: "rm -rf /tmp/x" },
+          prefix_suggestion: null,
+          kind: "Normal",
+        },
+      });
+    });
+    // 审批 id 属于父线程：在旁支里点它会把一次批准落到错误的线程上。
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // 但「父在等审批」必须可见——只提示，操作只能回父视图。
+    expect(screen.getByText(/父会话等待审批/)).toBeTruthy();
+  });
+
+  it("explains a /back taken from the main view", async () => {
+    await readyWithSide();
+    reset();
+    await command("/back");
+    // 主视图里的 `/back` 是空操作，但必须说一句，否则像没生效。
+    expect(await screen.findByText("已经在主会话了")).toBeTruthy();
+    expect(methods()).not.toContain("side/open");
+    expect(methods()).not.toContain("turn/start");
+  });
 });
 
-/**
- * 收集回归：App 模块本身必须能被解析和导入。
- *
- * 这一组测试的价值是**结构**上的：`src/App.tsx` 曾经留下一个孤立的 JSX 结束符，
- * esbuild 在 transform 阶段就报错，整个 `App.test.tsx` 一条都用不了——包括下面
- * 所有旁支接线用例。用一条显式导入把「模块可解析」变成可执行断言，而不是靠
- * 「测试文件没报错」这种隐式证据。
- *
- * 断言是 `typeof === "function"`（组件就是函数），不是快照：快照会把解析错误
- * 一起吞进去，而且是另一种「写死的输出」。
- */
 describe("App 模块收集", () => {
   it("App 模块可导入", async () => {
     const module = await import("./App");

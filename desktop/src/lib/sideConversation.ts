@@ -363,6 +363,18 @@ export class SideConversationStore {
   }
 
   /** 设置同步态（禁发/对账中/已同步）。 */
+  /**
+   * 记住这条旁支的阅读位置（最后可见 item id）。
+   *
+   * 只存在内存里：旁支没有持久化入口（见 `SideView` 的注释），删掉重建就该从头
+   * 开始。它是**浏览状态**，不该触发任何重渲染——滚动每帧都会写一次。
+   */
+  setAnchor(hostKey: SideHostKey, sideId: string, anchor: string | null): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.anchor = anchor;
+  }
+
   setSync(hostKey: SideHostKey, sideId: string, sync: SideSyncState): void {
     const view = this.views.get(hostKey)?.get(sideId);
     if (!view) return;

@@ -324,8 +324,11 @@ export function MessageInput({
     if (command.kind === "back") {
       // 返回是纯本地动作：不占提交锁、不看 `sending`、不等任何在途请求。
       // 把它排到一次提交后面就等于「网络慢的时候回不去」（spec §4.2）。
-      // 它也不清稿——用户名下的正文仍属于那条旁支。
-      await onSideCommand?.(command);
+      //
+      // 受理后仍要清掉**这次提交的命令文本**（与 `runSlash` 同一条规则）：留着
+      // `/back` 会让用户下次进来看到输入框里躺着一句命令。清稿条件仍是「正文
+      // 与提交时完全一致」，所以不会动他没提交过的编辑。
+      if (await onSideCommand?.(command)) clearSubmittedDraft(text);
       return;
     }
     if (!takeLock()) return;

@@ -873,10 +873,12 @@ describe("MessageInput side routing", () => {
   it("dispatches /back through onSideCommand without touching onSlashCommand", async () => {
     const onSlashCommand = vi.fn(() => true);
     const onSideCommand = vi.fn(() => true);
+    const onDraftChange = vi.fn();
     renderInput({
       conversation: side,
       onSideCommand,
       onSlashCommand,
+      onDraftChange,
       value: "/back",
     });
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -884,6 +886,13 @@ describe("MessageInput side routing", () => {
       expect(onSideCommand).toHaveBeenCalledWith({ kind: "back" }),
     );
     expect(onSlashCommand).not.toHaveBeenCalled();
+    // 受理后清掉这次提交的命令文本（与 `runSlash` 同一规则）：否则下次进来
+    // 输入框里还躺着一句 `/back`。
+    await waitFor(() =>
+      // 只看正文：第二个参数是「这条草稿属于哪条会话」，由 App 传 `null`
+      // （旁支）或某个 threadId（父），与本用例无关。
+      expect(onDraftChange.mock.calls[0][0]).toBe(""),
+    );
   });
 
   it("runs /help inside the side scope through the side handler, never the parent", async () => {
@@ -1111,7 +1120,9 @@ describe("MessageInput side submission receipts", () => {
     // 提交还在路上时，本地返回必须立刻可用：它不发任何请求，也不该排队等网络。
     const onSubmitSide = vi.fn(() => new Promise<never>(() => {}));
     const onSideCommand = vi.fn(() => true);
+    const onDraftChange = vi.fn();
     renderInput({
+      onDraftChange,
       conversation: side,
       onSubmitSide,
       onSideCommand,
@@ -1127,6 +1138,13 @@ describe("MessageInput side submission receipts", () => {
     await waitFor(() =>
       expect(onSideCommand).toHaveBeenCalledWith({ kind: "back" }),
     );
+    // 返回不受提交锁影响。清稿只清**这次提交的** `/back`（第一次改动是用户自己
+    // 敲进去的 `/back`，最后这一次才是受理后的清空），且没有动那条在路上的提问。
+    await waitFor(() => {
+      const calls = onDraftChange.mock.calls;
+      expect(calls[calls.length - 1][0]).toBe("");
+    });
+    expect(onSubmitSide).toHaveBeenCalledTimes(1);
   });
 
   it("does not let a stale receipt release another conversation's latch", async () => {
