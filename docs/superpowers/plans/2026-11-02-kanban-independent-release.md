@@ -804,11 +804,11 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 
 **Interfaces:** 主程序只保留通用插件贡献/命令。看板卡片语义由插件持有；宿主驱动会话分组保留通用 driver 字段，不能因删除看板 UI 丢失其他驱动会话。
 
-- [ ] Step 1：边界扫描测试对带有旧 import、硬编码注册、看板私有 flag 的人工宿主 fixture 必须失败；对 ID 仅作为测试数据/迁移声明或插件目录内容不误报。新增第二插件无需改扫描规则。
-- [ ] Step 2：删除宿主看板组件和注册，切换 App 到通用视图；TUI 用通用插件 CLI 帮助，不在核心保留 `/kanban` 私有业务 switch。插件内业务测试迁移保留，不直接删测试数量来过关。
-- [ ] Step 3：`python3 -m unittest discover -s scripts/plugins -p 'test_check_host_boundary.py' && python3 scripts/plugins/check-host-boundary.py`；build 主程序后检查发布物不含业务资源、程序、skill。宿主测试 contract 改用独立公共 fixture，避免编译主程序必须带插件源码：实际命中包括 app-server `src/session_driver.rs`、store `src/ipc/protocol.rs` 和 supervisors `src/manifest.rs`。主程序不复制插件业务 schema；插件 workspace 反向验证公共 driver/socket 契约兼容。
+- [x] Step 1：边界扫描测试对带有旧 import、硬编码注册、看板私有 flag 的人工宿主 fixture 必须失败；对 ID 仅作为测试数据/迁移声明或插件目录内容不误报。新增第二插件无需改扫描规则。判据：`scripts/plugins/check-host-boundary.py`（对 `crates/` 下宿主源码扫描，负例 fixture 必须被拦、`legacy_compat.rs` 这类迁移声明不误报）+ `scripts/plugins/test_check_host_boundary.py`（10 passed）；`just plugin-boundary-check` 与 CI `plugins` / `ci-plugins` job 均执行它。实际运行：`host boundary check passed: no kanban-only paths in the host`，脚本退出码 0。
+- [x] Step 2：删除宿主看板组件和注册，切换 App 到通用视图；TUI 用通用插件 CLI 帮助，不在核心保留 `/kanban` 私有业务 switch。插件内业务测试迁移保留，不直接删测试数量来过关。判据：提交 `0c0323bb`（-4262 行宿主看板代码）；`desktop/src/components/SuperpowersKanban*.tsx`、`desktop/src/lib/superpowersKanban*.ts` 与 `boardIndex*` 已不存在，宿主只剩通用 `plugin/query`、`plugins/list`、`plugin/settings/*` 通道（`desktop/src/lib/routes.ts`）。测试迁移核对：被删的 152 个 desktop 看板用例在插件侧由 162 个用例对应覆盖（`plugins/superpowers-kanban/ui/src/**/*.test.*`，13 文件 165 passed），开关语义（层级继承、写回、未知来源）与状态机用例均有对应项，不是靠删测试过关。
+- [x] Step 3：`python3 -m unittest discover -s scripts/plugins -p 'test_check_host_boundary.py' && python3 scripts/plugins/check-host-boundary.py`；build 主程序后检查发布物不含业务资源、程序、skill。宿主测试 contract 改用独立公共 fixture，避免编译主程序必须带插件源码：实际命中包括 app-server `src/session_driver.rs`、store `src/ipc/protocol.rs` 和 supervisors `src/manifest.rs`。主程序不复制插件业务 schema；插件 workspace 反向验证公共 driver/socket 契约兼容。判据：unittest 10 passed + 脚本退出 0；`cargo build -p yi-agent --bin yi-agent` 后检查二进制：`plugins/superpowers-kanban` 源码路径 0 处、`KanbanBoard`/`board-v1` 0 处，残留的 `superpowers-kanban` 与 `LegacyBoard` 全部来自 `crates/yi-agent-app-server/src/legacy_compat.rs` 的**旧数据迁移兼容**（`boards.json` 迁移、旧 plist 标签清理、旧偏好键读取），属于计划允许的迁移声明而非业务 UI/程序/skill；`.app` 侧由 `scripts/verify-plugin-update.sh` 的 `find "$APP" -iname '*kanban*'` 必须为空来守。
 - [x] Step 4：构建看板 1.0/1.1 fixture 包（版本号为测试版本，不修改正式发布版本），只改插件 UI 标记并更新插件包版本；在同一 `.app` 上安装/更新，断言 UI 标记变化而 appSha256 不变。判据：`bash scripts/verify-plugin-update.sh <built .app> .`（UI marker `board-v1` → `board-v2`，`Contents/MacOS/desktop` sha256 `ac9782d9…` 与 bundle 摘要前后一致；同一实例 `installed=[1.0.0,1.1.0]` 且 `activate 1.1.0` 起事务）；变异验证：安装后往 bundle 塞一个文件，门禁报 `the app bundle changed`。
-- [ ] Step 5：按 C 提交 `refactor: remove kanban business paths from the host`；同步 desktop、app-server、TUI、skills/flags 和看板模块的实际完成条目。
+- [x] Step 5：按 C 提交 `refactor: remove kanban business paths from the host`；同步 desktop、app-server、TUI、skills/flags 和看板模块的实际完成条目。判据：提交 `0c0323bb`；同一提交把插件 `switch_key` 从宿主 flag registry 解耦（`status_for_switch_at`），并把宿主测试里的看板 fixture 中性化为 `example_plugin_switch` / `example-plugin`，避免主程序测试依赖插件业务名。
 
 ## Phase 6：完整发布与证据门禁
 
@@ -824,7 +824,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 2：release script 单测确保插件 tag 不触发主程序版本流水线、检查 tag 在 main 且匹配插件 workspace/UI 版本、缺平台产物不更新目录、主程序版本未变化。插件 tag 采用 `plugin-superpowers-kanban-v*.*.*`，不冒用主程序 `v*.*.*`。判据：`just plugin-release-check`（11 passed，已进 `just ci`）；变异验证：删掉 main 祖先检查、删掉 Cargo 版本比较，各让对应用例失败。
 - [x] Step 3：新增独立插件 Rust、UI、SDK、contracts 与脚本检查 recipe/jobs；Node 检查放独立 job，不把 Node 强塞进无 Node 的主 Rust `just ci`。云端不可信 PR 不能接触 self-hosted runner 或签名密钥；签名发布仅受保护 main/tag 环境审批。判据：`just plugin-check` 四项全绿（workspace 454 passed、UI 165 passed、contracts 14/26 cases + 56 self-tests、boundary 10 passed）；GitHub `ci.yml` 新增 `plugins` job（`ubuntu-latest`）、GitLab 新增 `ci-plugins`（`rust:latest`，无 `tags:`），两者都不进 self-hosted；YAML 经 Ruby `YAML.load_file` 解析且 job 名唯一。
 - [ ] Step 4：依目标平台签名/公证程序后再归档/签插件元数据，验证真实下载后的 OS 执行策略。构建正式主程序时默认不启用 probe、不携带 fixture/测试 root；正式插件包不含测试密钥/攻击页/开发端口。不向用户建议关闭 Gatekeeper。
-- [ ] Step 5：按 C 提交 `ci: build and verify independently versioned plugin releases`。本任务只实现发布机制；真正上传、签名生产包和发布目录必须再次获发布授权。
+- [x] Step 5：按 C 提交 `ci: build and verify independently versioned plugin releases`。本任务只实现发布机制；真正上传、签名生产包和发布目录必须再次获发布授权。判据：提交 `859bdc1b`（`plugin-pack` 确定性打包 + 签名元数据 + `check-plugin-release.sh` 插件 tag 门禁，已进 `just ci` 为第 16 道门禁）。该提交**不含**任何上传、生产签名或目录发布动作，Step 4 的签名/公证发布仍为未完成，等待发布授权。
 
 ### Task T27：完成 A01–A20 正式验收与交付
 
@@ -837,7 +837,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [x] Step 1：报告校验测试确保 A01–A20 各有且仅有一个最终结果，任何缺项、skipped、unsupported、timeout、失败退出均非通过；mutation 删除 A07 或令 A10 缺 evidence，checker 必须失败。判据：`scripts/plugins/acceptance-cases.json`（A01–A20 唯一真相）+ `scripts/plugins/e2e-report.mjs` + `just plugin-acceptance-check`（24 passed）。变异验证：删掉缺项检查 → 2 用例失败；空证据算作通过 → 1 失败；loopback 别名不识别 → 1 失败。另加固 probe 构建不得冒充正式包（A20 必须 unsupported）、A16/A17 远端证据必须给出非 loopback 的主机身份（loopback/127.0.0.0/8/::1 均拒绝）、official 证据必须 `notarized: true` 且有 `signingIdentity`。
 - [x] Step 2：按矩阵执行安全/故障注入，包括断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管和 pending uninstall；所有数据为 TempDir/专属 `YI_AGENT_HOME`。判据：`scripts/plugins/fault-matrix.json` 把 10 个场景绑到 41 个既有测试，`just plugin-fault-matrix` 真跑 nextest 得 10/10 项、41/41 测试 ok（报告 `.artifacts/plugins/fault-matrix.json`）；`just plugin-acceptance-check` 另含 11 项归一化/判定自测。变异验证：把任一测试名改成不存在的名字，矩阵报 9/10 并以退出码 1 失败，且指出缺失项。
 - [ ] Step 3：至少做一次实际可访问的远程执行宿主连接验证（认证、目标 OS/架构与下载执行），记录两端身份和版本；不能只凭 loopback 证明跨机器行为。无真实远端证据时 A16/A17 保持未完成，阻止发布但可保留已通过的本机报告。
-- [ ] Step 4：在相同主程序包上执行插件 UI v1→v2 更新；比对主程序整个发布物摘要、插件摘要、活跃版本/代次和 skill 来源；卸载后验证核心聊天和默认数据保留。保存脱敏报告、截图、平台版本及每项对应测试命令。
+- [ ] Step 4：在相同主程序包上执行插件 UI v1→v2 更新；比对主程序整个发布物摘要、插件摘要、活跃版本/代次和 skill 来源；卸载后验证核心聊天和默认数据保留。保存脱敏报告、截图、平台版本及每项对应测试命令。**部分完成**：同一 `.app` 上的机械链路已可复现——`just plugin-update-check /Applications/yi-agent.app` 得 UI `board-v1`→`board-v2`、主程序 desktop 与 bundle 摘要前后一致（`fe2ee448…`）、`scripts/plugins/verify-active-release.py` 校验活跃版本 1.1.0 / 2 个 view 摘要 / 1 个 skill 来源一致、卸载后项目数据 `board.json` 保留且托管入口消失。变异验证：篡改 view 字节、改版本号、删 SKILL.md、给纯 UI 插件塞 `program`、让卸载删数据，五种变异各自被拦。**未完成**：脱敏报告与截图尚未归档（本机 `.app` 是本地构建产物，非官方签名包），且未在正式平台发布包上执行，故本条保持未勾选。
 - [ ] Step 5：运行 C、所有独立 workspace/前端/脚本/正式平台门禁，审阅证据后提交 `test: verify independent kanban plugin delivery end to end`。仅此时将完整独立发布 feature 标 `[x]`；执行合并后再次验证，再按仓库规则回收不再使用的 worktree/构建产物。
 
 ## 5. 完整验收映射

@@ -114,10 +114,41 @@ step "both versions coexist and the newer one can be selected"
 "$BIN" plugins activate --plugin superpowers-kanban --version 1.1.0 >/dev/null \
   || fail "activation of 1.1.0 did not start"
 
+step "the activated release matches its own manifest"
+# 只比「UI 变了」不够：验收要求版本、UI 摘要与 skill 来源都对得上被激活的那
+# 一代。清单里的 digest 可能和磁盘内容不一致，skill 路径也可能指向空目录。
+python3 "$REPO/scripts/plugins/verify-active-release.py" \
+  "$YI_AGENT_HOME/.yi-agent/plugins/installed/superpowers-kanban/1.1.0/darwin-aarch64" \
+  1.1.0 \
+  || fail "the activated release does not match its own manifest"
+
 step "the app digest must be unchanged"
 after_binary="$(shasum -a 256 "$APP/Contents/MacOS/desktop" | awk '{print $1}')"
 after_bundle="$(find "$APP" -type f | sort | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}')"
 [ "$before_binary" = "$after_binary" ] || fail "the app binary changed: $before_binary -> $after_binary"
 [ "$before_bundle" = "$after_bundle" ] || fail "the app bundle changed: $before_bundle -> $after_bundle"
 
+step "uninstalling keeps the user's project data and removes the managed entry"
+# 「卸载」不能等于「删数据」。验收要求卸载后默认数据保留，而插件入口、授权与
+# 运行记录消失。这里用真实数据文件验证，不靠日志措辞。
+PROJECT="$WORK/project"
+mkdir -p "$PROJECT/.yi-agent/superpowers-kanban"
+printf '{"card":"keep-me"}\n' > "$PROJECT/.yi-agent/superpowers-kanban/board.json"
+"$BIN" plugins enable-project --plugin superpowers-kanban --project "$PROJECT" \
+  --capability read --capability write >/dev/null \
+  || fail "enable-project refused a fresh project"
+"$BIN" plugins list | grep -q 'projects=\[' || fail "the project grant is not visible"
+
+"$BIN" plugins uninstall --plugin superpowers-kanban >/dev/null \
+  || fail "uninstall failed"
+[ -f "$PROJECT/.yi-agent/superpowers-kanban/board.json" ] \
+  || fail "uninstall deleted the user's project data"
+[ "$(cat "$PROJECT/.yi-agent/superpowers-kanban/board.json")" = '{"card":"keep-me"}' ] \
+  || fail "uninstall changed the user's project data"
+[ -z "$("$BIN" plugins list)" ] \
+  || fail "uninstall left the plugin listed: $("$BIN" plugins list)"
+supervisor_entry="$YI_AGENT_HOME/.yi-agent/plugins/supervisors/superpowers-kanban.json"
+[ ! -f "$supervisor_entry" ] || fail "uninstall left the supervisor manifest at $supervisor_entry"
+
 printf '\nUI marker %s -> %s, app digest unchanged (%s)\n' "$first" "$second" "$after_bundle"
+printf 'uninstall kept %s and removed the managed entry\n' "$PROJECT/.yi-agent/superpowers-kanban/board.json"

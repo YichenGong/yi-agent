@@ -230,6 +230,12 @@ plugin-acceptance-check:
 plugin-fault-matrix:
     node ../scripts/plugins/fault-matrix.mjs --output ../.artifacts/plugins/fault-matrix.json
 
+# 同一 .app 上插件 v1→v2 的完整验收（T27 Step 4）：UI 变了、清单摘要与 skill
+# 来源对得上、主程序字节没变、卸载后用户数据还在。需要一个已构建的 .app：
+#   just plugin-update-check /Applications/yi-agent.app
+plugin-update-check app:
+    bash scripts/verify-plugin-update.sh "{{app}}" ..
+
 # 一次跑完插件的全部门禁（本地用；CI 拆成独立 job 以便并行与隔离权限）。
 plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check plugin-acceptance-check
 
