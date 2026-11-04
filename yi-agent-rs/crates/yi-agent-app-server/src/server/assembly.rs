@@ -94,6 +94,25 @@ embedded daemon, which cannot authorize a foreground root"
     yi_agent_subagent::attach::ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path)
 }
 
+/// The bring-up a binding created here must use, now and on every repair.
+///
+/// `expected` and `instance_home` are resolved once so a repair cannot disagree with
+/// the first start. A missing instance home or artifact leaves the plan embedded,
+/// which is exactly what `bring_up_runtime` falls back to.
+fn bring_up_choice(models_path: &Path) -> yi_agent_subagent::binding::BringUpChoice {
+    let _ = models_path;
+    let instance_home = yi_agent_store::paths::instance_home();
+    let expected = this_process_artifact();
+    match (instance_home, expected) {
+        (Some(instance_home), Some(expected)) => yi_agent_subagent::binding::BringUpChoice {
+            policy: yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend(),
+            expected: Some(expected),
+            instance_home: Some(instance_home),
+        },
+        _ => yi_agent_subagent::binding::BringUpChoice::default(),
+    }
+}
+
 /// This process's own artifact identity, read from the binary it is running in.
 ///
 /// Read rather than constructed. The identity's `build_id` has to be the one the
@@ -188,11 +207,17 @@ pub(crate) fn attach_cwd_runtime(
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
     let outcome = bring_up_runtime(cfg, runtime_dir, models_path).map(|attached| {
-        RuntimeBinding::managed(
+        // The binding carries the bring-up it was created with, because a *repair*
+        // must ask the same party to own the runtime. Handing it `managed()`'s
+        // default would make a managed daemon get replaced by an embedded one the
+        // first time it needed healing -- silently changing who owns the runtime
+        // mid-session, and taking the guardian away with it.
+        RuntimeBinding::managed_with(
             cfg,
             runtime_dir.to_path_buf(),
             models_path.to_path_buf(),
             Arc::new(attached),
+            bring_up_choice(models_path),
         )
     });
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
@@ -654,6 +679,40 @@ mod foreground_root_lifecycle_tests {
     /// reports that honestly rather than inventing a build id. The real value is
     /// covered by `crates/yi-agent/tests/managed_runtime_lifecycle.rs`, which runs
     /// the production binary.
+    /// A repair must ask the same party that owns the runtime.
+    ///
+    /// The binding records the bring-up it was built with precisely so a later
+    /// `repair()` cannot switch owners mid-session. Passing `managed()`'s default
+    /// would make the first heal replace a guardian-owned daemon with an embedded
+    /// one, taking the authority channel with it -- and the conversation would keep
+    /// running, which is what makes it hard to notice.
+    #[test]
+    fn foreground_root_lifecycle_repair_keeps_the_bring_up_the_binding_started_with() {
+        let choice = super::bring_up_choice(std::path::Path::new("/tmp/models.json"));
+        // Either both halves are present (managed is usable) or the plan is the
+        // build default (embedded). A half-filled managed plan would fail every
+        // repair with "needs the artifact identity" long after the launch that
+        // seemed fine.
+        match choice.policy {
+            yi_agent_subagent::attach::BringUpPolicy::Managed => {
+                assert!(
+                    choice.expected.is_some(),
+                    "a managed repair without an expected artifact would be refused"
+                );
+                assert!(
+                    choice.instance_home.is_some(),
+                    "a managed repair with no instance home cannot resolve its scope"
+                );
+            }
+            yi_agent_subagent::attach::BringUpPolicy::Embedded => {
+                assert!(
+                    choice.expected.is_none() && choice.instance_home.is_none(),
+                    "an embedded plan does not carry managed-only fields"
+                );
+            }
+        }
+    }
+
     #[test]
     fn foreground_root_lifecycle_artifact_lookup_never_invents_a_build_id() {
         match super::this_process_artifact() {
