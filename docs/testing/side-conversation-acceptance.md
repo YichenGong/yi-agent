@@ -49,6 +49,31 @@ become ready`，带 `FAIL + LEAK`），当时另一个 worktree 正在跑自己�
 最终这轮等对方跑完再启动，同一套用例全绿。这是资源竞争，不是用例或本次改动的
 回归。
 
+### 1.1 合入 main 时的两次返工（都已修复）
+
+分支收尾时 `main` 已前进 92 个提交（daemon 生命周期那条线），所以合并本身成了
+一次真实的集成，暴露两件事：
+
+1. **`fmt-check` 在 `main` 上立刻变红。** 合并里三处「双方各自新增模块声明」的
+   冲突按「两边都保留」解决后，声明顺序不是 rustfmt 想要的；我在 worktree 里跑了
+   `cargo fmt --all` 却**没有提交那三个文件**就快进合并，于是 CI 是在「工作区已
+   格式化的树」上通过的，而提交进去的版本没有。代价很直接：`main` 落地即失败。
+   修复 `2fb3b5dc`（纯排序，无语义变化）。教训：`cargo fmt` 之后必须把结果一起
+   提交，再让 CI 去评价那棵树。
+2. **`--list` 阶段挂起。** 在 `main` 上重跑 `just ci` 时，nextest 卡在
+   `subagent_fork_ipc` 等二进制的 `--list --format terse`，`sample` 抓到调用栈只有
+   `_dyld_start`（卡在动态链接），同时另一个 worktree 正在全量编译。这几条测试文件
+   本次并没有改动（`git log -1 -- yi-agent-rs/crates/yi-agent/tests/subagent_fork_ipc.rs`
+   与合并无关）。它们不是失败，是等锁/被干扰下的挂起；等对方跑完再启动即正常。
+   所以**在共享 target 的并发环境里，「CI 卡住」要先看有没有别的 worktree 在编译**。
+
+合入 `main` 后的最终验证：`2fb3b5dc` 上跑完整 `just ci` → `EXIT=0`、`CI passed`，
+`4979 tests run: 4979 passed, 32 skipped`（比本分支的 4378 多，因为含 `main` 的 92
+个提交）。日志 `/tmp/ci_main_final3.log`。同一套用例在并发环境下曾 9 条失败
+（`supervisors` 的 20 秒超时类与 `store` 的分片帧用例），等对方 CI 结束后
+`cargo test -p yi-agent-supervisors -p yi-agent-subagent -p yi-agent-store` 是
+全绿（`SERIAL_EXIT=0`），确认是资源竞争。
+
 ## 2. 自动矩阵覆盖（spec §11）
 
 | 场景 | 落点测试 | 状态 |
