@@ -26,7 +26,7 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 
 ## Features
 
-- [ ] TUI 旁问可靠返回与退出修复 — spec 已复核，[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md) 已编写，代码未修：修正可见会话的 Paste/补全路由、Ctrl+C 两步退出、应用级退出优先级及 Close/Interrupt 投递失败反馈；删除介绍 header，复用状态栏。完成判据：[修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md) §8.2 T01–T10（真实事件循环 + PTY）、§8.3 验证命令与§9；不能以旧纯按键测试通过代替本轮验收。
+- [ ] TUI 旁问可靠返回与退出修复 — spec 已复核，[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md) 已编写；**Task 8（可见输入/Paste/补全）已修，Task 9–10 未修**。Task 8 落点：`tui/app.rs` 的 `Event::Paste`/按键/旁支命令拦截一律按**此刻**可见视图路由（不再用本帧开头的 `in_side` 快照）、`handle_side_paste`（不走父 `handle_paste` 的审批守卫）、`submit_side_draft`（提交前保存原文；`/back`·`/side-close` 消费命令，拒绝与投递失败都回填）、`is_management_command`（旁支里 `/clear` 等管理命令**拒绝并留稿**，不投给模型）、`is_exit_command`（`/q`·`/quit` 在任何视图都退出，不再被当问题发送）、Close 未送达时显式提示且不标记已关闭；`tui/slash.rs` 新增 `PopupScope` + `Completion`，旁支候选恰为 `back/side-close/help/config/cost/quit/q`，`sync_popup` 按 scope 重建以免旧候选跨视图残留。验收：`cargo test -p yi-agent --bin yi-agent side_repair_`（14 通过，含 3 条真实 `run_loop_with_side` 循环回归）、`cargo test -p yi-agent --bin yi-agent tui::`（697 通过）。红已实测：把 `Event::Paste` 退回父 `handle_paste`、把路由退回 `in_side` 快照，对应循环用例分别失败，恢复后全绿。**仍未完成**：Ctrl+C 两步退出与退出优先级（Task 9）、删除介绍 header 复用状态栏（Task 10）、§8.2 T01–T10 的真实 PTY 验收与 §8.3 全量门禁——这些未跑之前本条不得勾完成。
 
 - [x] ratatui 全屏 TUI 架构 — `tui/app.rs` 实现事件循环 + 布局 — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] 结构化对话历史 — `tui/cell.rs` 定义 `HistoryCell` 枚举 + `tui/history.rs` 管理 — [设计](../plans/2026-07-25-tui-history-redesign.md)

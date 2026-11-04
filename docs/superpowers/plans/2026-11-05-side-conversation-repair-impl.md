@@ -335,7 +335,7 @@ Task 8–10 可与前端 Task 2–7 并行，但不能由两个代理同时修�
 - Consumes: 既有 SideSession.input/history/views、InputLine、classify_conversation_input、sync_popup、run_loop_with_side、ScriptedEvents、TestBackend。
 - Produces: Event::Paste 依据 side.views.active 路由；补全显示和执行使用同一可见 input；不改 SideDriverCommand。
 
-- [ ] **Step 1:** 在 app.rs tests 复制既有 `side_events_never_reach_main_turn_log` 的完整 run_loop_with_side 初始化（保留真实 channels/SideRuntime），新增命名含 `side_repair_` 的循环回归。初始化父草稿 `PARENT_DRAFT`，预投有效 side status 帧并显式进入 side；事件按交付顺序逆序存进 ScriptedEvents。最小序列为 Paste(`/back`)、Enter、Ctrl+Q；断言最终父 input 为 PARENT_DRAFT，最后绘制是 Main，side_cmd_rx 没收到 Interrupt/Close，decision_rx 为空。另加逐字符 `/back`、Tab补全后 Enter；不能只直接调 handle_side_key。
+- [x] **Step 1:** 在 app.rs tests 复制既有 `side_events_never_reach_main_turn_log` 的完整 run_loop_with_side 初始化（保留真实 channels/SideRuntime），新增命名含 `side_repair_` 的循环回归。初始化父草稿 `PARENT_DRAFT`，预投有效 side status 帧并显式进入 side；事件按交付顺序逆序存进 ScriptedEvents。最小序列为 Paste(`/back`)、Enter、Ctrl+Q；断言最终父 input 为 PARENT_DRAFT，最后绘制是 Main，side_cmd_rx 没收到 Interrupt/Close，decision_rx 为空。另加逐字符 `/back`、Tab补全后 Enter；不能只直接调 handle_side_key。
 
 ```rust
 let mut delivered = vec![
@@ -348,10 +348,26 @@ let events = ScriptedEvents { events: Rc::new(RefCell::new(delivered)) };
 ```
 
 为最终屏幕检查保留 TestBackend buffer，在退出前至少一次绘制（用既有 loop 的事件轮次，不加任意 sleep）。父 pending approval 再跑相同序列，decision channel 零消息；拒绝的 nested side/管理命令和 Running 文本恢复原稿，不被 take_submitted 吞掉。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Paste 写错父草稿/不能回 Main 或输入被审批吞掉断言失败。若用例没执行到侧视图，先修测试时序，不能宣布红已证实。
-- [ ] **Step 3:** Paste 在 side 分支调用 side.input 的粘贴 API，按普通编辑保留字节，不自动执行；不得调用父 handle_paste 的审批守卫。补全从同一可见 input 获取 query，side 候选限制为 back/side-close/help/config/cost/quit/q，Tab写入不提交，完整命令一次 Enter 执行。切视图清 popup 的候选/选中索引。提交前保存 text；返回消费命令，拒绝/发送未投递恢复 text；不声称找回用户手动覆盖掉的旧文字。滚动与折叠继续只改可见 history。
-- [ ] **Step 4:** 跑 `cargo test -p yi-agent --bin yi-agent tui::` 与 side_repair_；覆盖 resize、Shift滚动和父审批 Command/Decision 原规则不变，断线 back 不等 driver。
-- [ ] **Step 5:** 更新 TUI 模块阶段证据，统一门禁后提交 `fix: route TUI side paste and completion to visible input`。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Paste 写错父草稿/不能回 Main 或输入被审批吞掉断言失败。若用例没执行到侧视图，先修测试时序，不能宣布红已证实。
+- [x] **Step 3:** Paste 在 side 分支调用 side.input 的粘贴 API，按普通编辑保留字节，不自动执行；不得调用父 handle_paste 的审批守卫。补全从同一可见 input 获取 query，side 候选限制为 back/side-close/help/config/cost/quit/q，Tab写入不提交，完整命令一次 Enter 执行。切视图清 popup 的候选/选中索引。提交前保存 text；返回消费命令，拒绝/发送未投递恢复 text；不声称找回用户手动覆盖掉的旧文字。滚动与折叠继续只改可见 history。
+- [x] **Step 4:** 跑 `cargo test -p yi-agent --bin yi-agent tui::` 与 side_repair_；覆盖 resize、Shift滚动和父审批 Command/Decision 原规则不变，断线 back 不等 driver。
+- [x] **Step 5:** 更新 TUI 模块阶段证据，统一门禁后提交 `fix: route TUI side paste and completion to visible input`。
+
+**证据（2026-11-05,本 worktree）:**
+- 循环回归（真实 `run_loop_with_side` + `ScriptedEvents` + `TestBackend`）:
+  `side_repair_paste_back_through_the_loop_returns_to_main_and_keeps_the_parent_draft`、
+  `side_repair_paste_back_survives_a_parent_approval_through_the_loop`、
+  `side_repair_typed_and_completed_back_work_through_the_loop`。
+- 按键级:`side_repair_completion_offers_only_executable_side_commands`、
+  `side_repair_tab_completes_then_enter_executes`、`side_repair_tab_without_popup_does_not_edit_the_draft`、
+  `side_repair_esc_closes_the_popup_before_stopping`、`side_repair_management_commands_are_refused_without_clearing_the_draft`、
+  `side_repair_nested_side_is_refused_without_clearing_the_draft`、`side_repair_exit_commands_quit_instead_of_reaching_the_model`、
+  `side_repair_close_reports_an_undelivered_command`。
+- 红已证实（不是「没跑到」）:临时把 `Event::Paste` 路由退回父 `handle_paste` →
+  `side_repair_paste_back_through_the_loop_...` FAILED；临时把按键/粘贴路由退回本帧开头
+  的 `in_side` 快照 → 两条循环用例同时 FAILED。恢复后全绿。
+- `cargo test -p yi-agent --bin yi-agent side_repair_` = 14 passed；
+  `cargo test -p yi-agent --bin yi-agent tui::` = 697 passed, 0 failed。
 
 ### Task 9: 全局退出优先级、两步 Ctrl+C 与失败反馈
 
