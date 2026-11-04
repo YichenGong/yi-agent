@@ -36,7 +36,13 @@ T25 Step 4 已完成并可复现：`bash yi-agent-rs/scripts/verify-plugin-updat
 
 T26 Step 3 已完成：`just plugin-check`（`plugin-workspace-check` / `plugin-ui-check` / `plugin-contracts-check` / `plugin-boundary-check`）本地全绿，GitHub `plugins` job 与 GitLab `ci-plugins` job 均跑在云端 runner、不带 `tags:`，插件门禁不再借用 self-hosted runner 或任何签名密钥。
 
-**仍未完成：** T26 Step 4–5（平台签名/公证与真实下载后的 OS 执行策略验证、发布提交）需要发布授权与签名密钥，不在本轮范围内；T27 A01–A20 正式验收（尤其 A16/A17 要求真实远端宿主证据）同样未完成。因此本条保持 `[ ]`。
+T27 已落地的部分：
+
+- Step 1（报告校验器）：`scripts/plugins/acceptance-cases.json` 是 A01–A20 唯一真相，`scripts/plugins/e2e-report.mjs` 要求每条**有且仅有一个**最终结果、只认 `pass`，并拒绝三种伪造：probe 构建冒充正式包（A20 必须 `unsupported`）、A16/A17 用 loopback 或 `127.0.0.0/8` 冒充远端、`official` 证据缺签名身份或未公证。`just plugin-acceptance-check` 24 passed；变异验证三项各自被拦。
+- Step 2（故障注入矩阵）：`scripts/plugins/fault-matrix.json` 把断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管、待清理卸载、每阶段崩溃十项绑到 41 个既有测试；`just plugin-fault-matrix` 真跑 nextest 得 10/10 项、41/41 测试 ok。改名任一测试即 9/10 并以退出码 1 失败。
+- Step 4（同一 `.app` 上的 v1→v2）：`just plugin-update-check /Applications/yi-agent.app` 得 UI `board-v1`→`board-v2`、主程序 desktop 与 bundle 摘要前后一致、`verify-active-release.py` 校验活跃版本/view 摘要/skill 来源、卸载后项目数据保留且托管入口消失。五种变异各自被拦。
+
+**仍未完成：** T26 Step 4（平台签名/公证与真实下载后的 OS 执行策略验证）需要发布授权与签名密钥；T27 Step 3（真实非 loopback 远端宿主证据）需要可访问的外部机器，A16/A17 因此保持未完成；T27 Step 4 的脱敏报告与截图、以及 Step 5 的最终验收提交同样待办。因此本条保持 `[ ]`。
 
 - [x] 全局开关 `superpowers_kanban` 决定进程起停 — 清单 `supervisors/superpowers-kanban.json` 设 `stop_when_disabled: true`，注册表默认关。关掉 = 完全停掉 daemon 含调度（不再留进程轮询）；重开走设置页 `flags/set`（app-server 直写 `flags.json`，不经过 daemon），所以不是单向门。宿主侧同时收口：`plugin/query` 返回 `plugin_disabled`(-32025) 而不是 `daemon_unavailable`，`plugins/list` 每项带 `enabled`，桌面隐藏看板入口与全部 `driver_ref` 会话。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`（164 passed）；`cargo test -p yi-agent-app-server --lib a_switched_off_plugin`（含 `..._says_disabled_instead_of_broken`、`..._is_still_listed_but_marked_disabled`）；`cd desktop && vitest run src/App.test.tsx -t 看板开关关着时`
 - [x] 插件自述清单 — `manifest` 动词把 supervisor 清单打到 stdout，宿主 `plugin/install` 直接消费；`command` 取当前可执行文件绝对路径。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner manifest_`（含"与随包 `supervisors/superpowers-kanban.json` 逐字段相等"）
