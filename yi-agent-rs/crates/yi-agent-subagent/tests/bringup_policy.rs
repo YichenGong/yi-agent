@@ -123,3 +123,52 @@ fn foreground_root_lifecycle_the_desktop_sidecar_is_a_managed_frontend() {
         "a frontend that holds a lease must ask the guardian, not start its own daemon"
     );
 }
+
+/// A managed start that cannot succeed must fail fast, not burn the whole budget.
+///
+/// The sidecar calls this from an async request path, synchronously. If a missing
+/// or unusable guardian took the full 30 s allowanace, every thread start on a
+/// machine without a managed runtime would stall for half a minute before falling
+/// back -- a launch that looks hung. The budget is a ceiling for a wedged path, not
+/// an expected duration.
+#[test]
+fn foreground_root_lifecycle_an_impossible_managed_start_fails_fast() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let cfg = RuntimeConfig::load_lenient(&yi_agent_runtime::config::ConfigOverrides {
+        workdir: Some(directory.path().to_path_buf()),
+        ..Default::default()
+    })
+    .expect("a lenient load must not need a model catalogue");
+    let expected = yi_agent_lifecycle::types::ArtifactIdentity {
+        build_id: "fails-fast-probe".into(),
+        display_version: "0.0.0".into(),
+        // Nothing is installed here, so the guardian cannot be launched.
+        executable: directory.path().join("no-such-binary"),
+        sha256: String::new(),
+        schema_min: 0,
+        schema_max: 17,
+        handover_version: 1,
+        business_protocol_min: 1,
+        business_protocol_max: 1,
+        capabilities: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    let outcome = ensure_owned_runtime_with_policy(
+        &cfg,
+        directory.path().join("runtime"),
+        &directory.path().join("models.json"),
+        directory.path(),
+        BringUpPolicy::Managed,
+        Some(&expected),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        outcome.is_err(),
+        "a managed start with no installed guardian must not claim success"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "an impossible managed start took {elapsed:?}; the caller blocks an async \
+         request path and would look hung"
+    );
+}
