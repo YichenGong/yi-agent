@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use yi_agent_core::subagent::task::AttemptId;
+
 use futures::future::BoxFuture;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -417,6 +420,87 @@ impl ForegroundFixture {
                 None,
             )
             .await
+    }
+
+    /// The root's TASK id, which is what ownership and watchdogs are keyed by.
+    pub fn root_task(&self) -> TaskId {
+        self.root.clone()
+    }
+
+    /// The active attempt of a task, read from the live supervisor.
+    pub fn active_attempt(&self, task: &TaskId) -> AttemptId {
+        self.coordinator
+            .active_attempt_for_test(task)
+            .expect("the task has an active attempt")
+    }
+
+    /// Gives a task the default watchdog budgets and no meaningful progress yet.
+    ///
+    /// The clock is the caller's: `advance_watchdog` moves the *observation* the
+    /// watchdog compares against, which is the only way to test a 2700-second budget
+    /// without waiting 45 minutes. Real leases and heartbeats are untouched, because a
+    /// test that froze the lease would prove nothing about an owner staying alive.
+    pub fn seed_watchdog(&self, task: &TaskId, last_meaningful_at: DateTime<Utc>) {
+        let attempt = self.active_attempt(task);
+        self.coordinator
+            .repository_for_test()
+            .expect("the fixture's repository lock is free")
+            .save_attempt_watchdog_snapshot(
+                task,
+                &attempt,
+                &yi_agent_store::schedule::WatchdogLimits::default(),
+                &yi_agent_store::schedule::WatchdogUsage::default(),
+                None,
+                last_meaningful_at,
+                None,
+            )
+            .expect("the fixture can seed a watchdog snapshot");
+    }
+
+    /// Runs one watchdog scan as of `now`.
+    pub async fn advance_watchdog_to(&self, now: DateTime<Utc>) -> usize {
+        self.coordinator
+            .evaluate_watchdogs(now)
+            .await
+            .expect("a watchdog scan does not fail")
+    }
+
+    /// The root's state before any watchdog scan, so a test can assert "unchanged"
+    /// without assuming which non-terminal state it happened to be in.
+    pub fn initial_root_state(&self) -> String {
+        self.root_state()
+    }
+
+    /// The root's durable task state.
+    pub fn root_state(&self) -> String {
+        self.coordinator
+            .task_state(&self.root)
+            .expect("the root has a state")
+    }
+
+    /// Whether the root's active attempt carries a watchdog terminal.
+    pub fn root_has_watchdog_terminal(&self) -> bool {
+        let attempt = self.active_attempt(&self.root);
+        self.coordinator
+            .repository_for_test()
+            .expect("the fixture's repository lock is free")
+            .attempt_has_terminal(&attempt)
+            .expect("the attempt row is readable")
+    }
+
+    /// How many meaningful-progress events the root's attempt recorded.
+    pub fn root_meaningful_progress_count(&self) -> usize {
+        let attempt = self.active_attempt(&self.root);
+        self.coordinator
+            .repository_for_test()
+            .expect("the fixture's repository lock is free")
+            .meaningful_progress_count(&attempt)
+            .expect("the attempt row is readable")
+    }
+
+    /// Every child the coordinator registered for this root, root excluded.
+    pub async fn wait_children(&self) -> Vec<TaskId> {
+        self.child_ids()
     }
 
     /// Every task the factory was asked to start, in order.

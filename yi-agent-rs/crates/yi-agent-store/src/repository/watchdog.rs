@@ -234,19 +234,64 @@ impl RuntimeRepository {
         })
     }
 
+    /// Whether the attempt row carries a watchdog (or any) terminal verdict.
+    ///
+    /// Test/support reader: the assertions are about what the durable commit wrote,
+    /// not about a projection the coordinator might build differently.
+    pub fn attempt_has_terminal(&self, attempt: &AttemptId) -> Result<bool, RepositoryError> {
+        let terminal: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT terminal_json FROM attempts WHERE id = ?1",
+                params![attempt.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(terminal.flatten().is_some())
+    }
+
+    /// How many meaningful-progress events an attempt recorded.
+    ///
+    /// A skipped watchdog decision must not create one, so counting the events is how
+    /// a test proves the scan did not manufacture activity. `last_meaningful_event_id`
+    /// is the same fact from the attempt's own side, and a non-NULL value there with
+    /// zero such events would mean the two disagree.
+    pub fn meaningful_progress_count(&self, attempt: &AttemptId) -> Result<usize, RepositoryError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE kind = 'task_progress'
+               AND task_id = (SELECT task_id FROM attempts WHERE id = ?1)",
+            params![attempt.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Returns watchdog facts only for the currently active attempt of a task
     /// that remains eligible for a terminal watchdog decision.
     pub fn active_attempt_watchdogs(&self) -> Result<Vec<PersistedWatchdogTask>, RepositoryError> {
         let rows = {
             let mut statement = self.connection.prepare(
+                // A confirmed foreground container is excluded here, not filtered
+                // afterwards: the candidate query and the terminal commit must share
+                // one policy, or a root could be skipped by the scan and still be
+                // settled by a stale snapshot.
+                //
+                // Only `managed` is excluded. `pending` and `corrupt` still appear,
+                // because their verdict is "refuse the terminal", not "might be a
+                // container". A pending root must not be quietly kept alive by
+                // looking like something the watchdog has no opinion about.
                 "SELECT tasks.root_session_id, tasks.id, attempt_watchdogs.attempt_id
                  FROM attempt_watchdogs
                  JOIN tasks ON tasks.id = attempt_watchdogs.task_id
+                 LEFT JOIN foreground_root_state AS foreground
+                        ON foreground.root_task_id = tasks.id
                  WHERE tasks.active_attempt_id = attempt_watchdogs.attempt_id
                    AND tasks.state_json IN (
                        'queued', 'running', 'waiting_for_resource',
                        'waiting_for_permission', 'waiting_for_children'
-                   )",
+                   )
+                   AND COALESCE(foreground.classification, '') <> 'managed'",
             )?;
             statement
                 .query_map([], |row| {
@@ -346,9 +391,64 @@ impl RuntimeRepository {
         terminal: WatchdogTerminal,
         evidence: &WatchdogEvidence,
     ) -> Result<Option<i64>, RepositoryError> {
+        self.record_watchdog_terminal_with_policy(task, attempt, terminal, evidence)
+            .map(|outcome| outcome.committed_event_id())
+    }
+
+    /// The same commit, reporting *why* it did not settle a task.
+    ///
+    /// A skipped write needs a reason: "the snapshot was stale", "the root is a
+    /// container", and "the root is not admissible at all" all mean different things
+    /// to the caller, and collapsing them into `Ok(None)` would hide a root that is
+    /// only being kept alive because nobody can classify it.
+    pub fn record_watchdog_terminal_with_policy(
+        &mut self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        terminal: WatchdogTerminal,
+        evidence: &WatchdogEvidence,
+    ) -> Result<WatchdogTerminalOutcome, RepositoryError> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Re-read the policy inside the write transaction. The scan already excluded
+        // containers, but a snapshot can be minutes old: a root may have become
+        // managed after the scan listed it, and settling it then would kill a live
+        // conversation over a budget it no longer has.
+        let classification = {
+            let mut statement = transaction.prepare(
+                "SELECT classification FROM foreground_root_state WHERE root_task_id = ?1",
+            )?;
+            statement
+                .query_row(params![task.to_string()], |row| row.get::<_, String>(0))
+                .ok()
+        };
+        match classification.as_deref() {
+            // A migrated-but-unauthorized root takes no business, so it must not be
+            // kept alive by the watchdog's silence either. Refusing here means the
+            // caller has to explain it (reclaim, re-authorize, or diagnose).
+            Some("pending") => {
+                transaction.commit()?;
+                return Ok(WatchdogTerminalOutcome::ClosedRoot {
+                    reason: "the foreground root is still pending authentication".into(),
+                });
+            }
+            Some("managed") => {
+                transaction.commit()?;
+                return Ok(WatchdogTerminalOutcome::ForegroundContainer);
+            }
+            // `legacy` keeps the execution policy: the migration records the role, it
+            // does not grant the exemption. A corrupt record is refused by the
+            // classifier before it ever becomes `Execution`, so it lands here as an
+            // unknown value only if the row was written by hand; treat that as closed.
+            Some("legacy") | None => {}
+            Some(other) => {
+                transaction.commit()?;
+                return Ok(WatchdogTerminalOutcome::ClosedRoot {
+                    reason: format!("unrecognised foreground classification {other}"),
+                });
+            }
+        }
         let changed = transaction.execute(
             "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2 AND active_attempt_id = ?3
@@ -358,7 +458,7 @@ impl RuntimeRepository {
         )?;
         if changed == 0 {
             transaction.commit()?;
-            return Ok(None);
+            return Ok(WatchdogTerminalOutcome::StaleSnapshot);
         }
 
         let terminal_json = terminal.terminal_json(evidence)?;
@@ -380,7 +480,9 @@ impl RuntimeRepository {
         let event_id =
             append_event_with_payload(&transaction, task, terminal.event(), &terminal_json)?;
         transaction.commit()?;
-        Ok(Some(event_id))
+        Ok(WatchdogTerminalOutcome::Committed {
+            event_id: Some(event_id),
+        })
     }
 
     /// Activates a successor attempt while returning the task to the queue.

@@ -296,7 +296,43 @@ pub struct PersistedAttemptWatchdog {
     pub current_wait: Option<WatchdogResourceWait>,
 }
 
+/// What one watchdog terminal commit actually did.
+///
+/// The distinction is load-bearing: `StaleSnapshot` is "someone else already
+/// decided", `ForegroundContainer` is "this root is not governed by these budgets",
+/// and `ClosedRoot` is "this root is not admissible, so neither settling nor
+/// ignoring it is correct". Collapsing them into a bool would let a caller report
+/// "settled" for work it skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogTerminalOutcome {
+    /// The terminal was written and its audit event appended.
+    Committed { event_id: Option<i64> },
+    /// The attempt is no longer the task's active attempt, or the task is already
+    /// terminal: a later scan is a no-op rather than a second audit event.
+    StaleSnapshot,
+    /// The root is a confirmed foreground container. Its budgets are the host's,
+    /// not this watchdog's, so nothing is written and nothing is kept alive.
+    ForegroundContainer,
+    /// The root declares a foreground role but may not accept business (pending or
+    /// an unrecognised/corrupt classification). The caller must reclaim or diagnose
+    /// it; the watchdog must not manufacture a liveness verdict for it.
+    ClosedRoot { reason: String },
+}
+
+impl WatchdogTerminalOutcome {
+    /// The event id when the terminal was actually committed.
+    pub fn committed_event_id(&self) -> Option<i64> {
+        match self {
+            Self::Committed { event_id } => *event_id,
+            Self::StaleSnapshot | Self::ForegroundContainer | Self::ClosedRoot { .. } => None,
+        }
+    }
+
+    pub fn committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+}
+
 pub struct PersistedWatchdogTask {
     pub session_id: RootSessionId,
     pub task_id: TaskId,

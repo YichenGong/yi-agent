@@ -3304,6 +3304,10 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         panic!("expected a spawned child task");
     };
 
+    // 10ms 与同文件 `daemon_wait_agent_timeout_returns_partial_completed_reports`
+    // 里记录过的抖动是同一类问题：超时本身是必然的，但全量并发时 daemon 调度可能
+    // 让请求在 child 落库可见之前就返回，于是 `children` 对不上。200ms 仍是断言级
+    // 的短等待（远小于任何真实等待），却给调度留出了确定性的余量。
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::WaitAgent {
@@ -3311,7 +3315,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
-            timeout_ms: Some(10),
+            timeout_ms: Some(200),
         },
     )
     .unwrap();
@@ -3322,7 +3326,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         reports,
     } = response
     else {
-        panic!("expected bounded wait response");
+        panic!("expected bounded wait response, got {response:?}");
     };
     assert_eq!(status, "timeout");
     assert_eq!(children, vec![task_id]);

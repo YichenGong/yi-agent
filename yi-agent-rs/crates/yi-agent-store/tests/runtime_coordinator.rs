@@ -5210,6 +5210,151 @@ async fn foreground_root_lifecycle_release_during_factory_return_cancels_the_han
     );
 }
 
+/// A live foreground container is not settled by the worker budgets: no idle budget
+/// (300s) and no wall-time budget (2700s) may end it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_survives_idle_and_wall_time_without_progress() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture
+        .coordinator()
+        .record_foreground_class_for_test(
+            &fixture.root_task(),
+            yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+        )
+        .unwrap();
+    let started = Utc::now();
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    let state_before = fixture.initial_root_state();
+
+    // Past the idle budget, then past the wall-time budget. The owner's liveness is
+    // the guardian lease's business, not the watchdog's: this layer must require no
+    // progress at all, which is why the only clock that moves is the observation the
+    // budget is measured against.
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(started + chrono::Duration::seconds(301))
+            .await,
+        0,
+        "a container must not be settled for 301s of idleness"
+    );
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(started + chrono::Duration::seconds(2_701))
+            .await,
+        0,
+        "a container must not be settled by the wall-time budget"
+    );
+    assert_eq!(
+        fixture.root_state(),
+        state_before,
+        "a container's task state must be untouched by the watchdog"
+    );
+    assert!(
+        !fixture.root_has_watchdog_terminal(),
+        "no watchdog terminal may be recorded for a container"
+    );
+    assert_eq!(
+        fixture.root_meaningful_progress_count(),
+        0,
+        "skipping the decision must not manufacture progress"
+    );
+    assert!(fixture.spawn("still admitted").await.is_ok());
+}
+
+/// A child that makes progress and has budget left stays alive; the same child with
+/// no progress is still settled, so the exemption is confined to the container.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_child_keeps_its_execution_budget() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture
+        .coordinator()
+        .record_foreground_class_for_test(
+            &fixture.root_task(),
+            yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+        )
+        .unwrap();
+    let child = fixture.spawn("working child").await.unwrap();
+    let started = Utc::now();
+    fixture.seed_watchdog(&child, started);
+
+    // Progress resets the observation, so an old snapshot no longer trips the budget.
+    fixture.seed_watchdog(&child, Utc::now());
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(Utc::now() + chrono::Duration::seconds(1))
+            .await,
+        0,
+        "a child with fresh progress must not be settled"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+
+    // The child's own budget still bites: past idle with no progress, it is settled.
+    let stale = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&child, stale);
+    assert_eq!(
+        fixture.advance_watchdog_to(Utc::now()).await,
+        1,
+        "a child with no progress past the idle budget is still stalled"
+    );
+}
+
+/// A pending root is not admissible, so the watchdog must neither settle it into a
+/// fake liveness verdict nor quietly ignore it. It refuses with a reason.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_pending_root_is_not_settled_by_the_watchdog() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_pending().unwrap();
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    assert_eq!(
+        fixture.advance_watchdog_to(Utc::now()).await,
+        0,
+        "a pending root must not produce a watchdog terminal"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+    assert_eq!(
+        fixture.root_state(),
+        fixture.initial_root_state(),
+        "a refused verdict must not change the task state either way"
+    );
+    assert_eq!(fixture.root_meaningful_progress_count(), 0);
+}
+
+/// The snapshot can be older than the classification: a managed bind landing after
+/// the scan must still prevent the terminal, which is why the commit re-checks it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_managed_bind_after_the_scan_still_wins() {
+    let fixture = ForegroundFixture::managed().await;
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    // The scan lists the root while it is still an execution task, and the bind
+    // lands before the terminal commit. The SQL exclusion cannot help here (the
+    // candidate was already chosen); only the commit-time re-check can.
+    let coordinator = fixture.coordinator();
+    let root = fixture.root_task();
+    assert_eq!(
+        coordinator
+            .evaluate_watchdogs_with_stale_candidates(Utc::now(), || {
+                coordinator
+                    .record_foreground_class_for_test(
+                        &root,
+                        yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+                    )
+                    .expect("the classification is rewritable between phases");
+            })
+            .await
+            .unwrap(),
+        0,
+        "the commit must observe the classification the scan did not"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+    assert_eq!(fixture.root_state(), fixture.initial_root_state());
+}
+
 #[cfg(feature = "foreground-test-support")]
 mod foreground_support;
 

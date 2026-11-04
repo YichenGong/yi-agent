@@ -2549,13 +2549,32 @@ impl RuntimeCoordinator {
             .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
             .active_attempt_id()
             .clone();
-        let committed = self
+        let outcome = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .record_watchdog_terminal(task, &attempt, terminal.clone(), &evidence)?;
-        if committed.is_none() {
-            return Ok(false);
+            .record_watchdog_terminal_with_policy(task, &attempt, terminal.clone(), &evidence)?;
+        match outcome {
+            crate::repository::WatchdogTerminalOutcome::Committed { .. } => {}
+            crate::repository::WatchdogTerminalOutcome::StaleSnapshot => return Ok(false),
+            // A container is not governed by worker budgets. Say so rather than
+            // reporting "nothing to do": a silent skip is indistinguishable from a
+            // watcher that never ran.
+            crate::repository::WatchdogTerminalOutcome::ForegroundContainer => {
+                tracing::debug!(
+                    %task,
+                    "watchdog verdict skipped: the root is a foreground container"
+                );
+                return Ok(false);
+            }
+            crate::repository::WatchdogTerminalOutcome::ClosedRoot { reason } => {
+                tracing::warn!(
+                    %task,
+                    %reason,
+                    "watchdog verdict refused: the root may not accept business"
+                );
+                return Ok(false);
+            }
         }
 
         // The repository transaction above durably recorded the watchdog
@@ -3953,6 +3972,83 @@ impl RuntimeCoordinator {
                     .unwrap_or_default()
             })
             .unwrap_or_default()
+    }
+
+    /// One watchdog scan that lists its candidates *before* the caller acts.
+    ///
+    /// Exists so a test can hold the scan's view of the world still while the
+    /// classification changes underneath it -- the exact shape of the race the
+    /// commit-time re-check defends against. Production calls
+    /// [`Self::evaluate_watchdogs`] directly; this only splits the two phases.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub async fn evaluate_watchdogs_with_stale_candidates(
+        &self,
+        now: DateTime<Utc>,
+        on_listed: impl FnOnce(),
+    ) -> Result<usize, RuntimeCoordinatorError> {
+        let watchdogs = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .active_attempt_watchdogs()?;
+        // The world changes after the scan read it.
+        on_listed();
+        let mut terminal_count = 0;
+        for watchdog in watchdogs {
+            let Some(outcome) = evaluate_watchdog(
+                &watchdog.snapshot.limits,
+                &watchdog.snapshot.observation,
+                now,
+            ) else {
+                continue;
+            };
+            let terminal = match outcome {
+                WatchdogOutcome::Stalled => WatchdogTerminal::Stalled,
+                WatchdogOutcome::TimedOut(kind) => WatchdogTerminal::TimedOut(kind),
+                WatchdogOutcome::BudgetExhausted(kind) => WatchdogTerminal::BudgetExhausted(kind),
+            };
+            let elapsed_secs = now
+                .signed_duration_since(watchdog.snapshot.observation.last_meaningful_at)
+                .num_seconds()
+                .max(0) as u64;
+            let evidence = WatchdogEvidence {
+                last_meaningful_event_id: watchdog.snapshot.last_meaningful_event_id,
+                last_meaningful_at: watchdog.snapshot.observation.last_meaningful_at,
+                elapsed_secs,
+                current_wait: watchdog.snapshot.current_wait.clone(),
+            };
+            if self
+                .record_watchdog_terminal(
+                    &watchdog.session_id,
+                    &watchdog.task_id,
+                    terminal,
+                    evidence,
+                )
+                .await?
+            {
+                terminal_count += 1;
+            }
+        }
+        Ok(terminal_count)
+    }
+
+    /// A task's active attempt, read from the live supervisor.
+    ///
+    /// Test hook: watchdog tests must name the attempt the durable row points at,
+    /// which is exactly the value a stale snapshot would disagree with.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn active_attempt_for_test(&self, task: &TaskId) -> Option<AttemptId> {
+        self.supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .find_map(|supervisor| {
+                supervisor.try_lock().ok().and_then(|supervisor| {
+                    supervisor
+                        .task(task)
+                        .map(|task| task.active_attempt_id().clone())
+                })
+            })
     }
 
     /// How many registered executions have not been proven stopped.
