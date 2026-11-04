@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "api": "v1",
+  "reservedEnv": ["YI_AGENT_HOME", "YI_AGENT_PLUGIN_INSTANCE", "YI_AGENT_PLUGIN_BINDING"],
+  "bridge": {
+    "onlyBusinessMethods": true,
+    "grantsAnyCapability": false
+  },
+  "limits": {
+    "packageBytes": 268435456,
+    "extractedBytes": 1073741824,
+    "singleFileBytes": 134217728,
+    "fileCount": 20000
+  }
+}

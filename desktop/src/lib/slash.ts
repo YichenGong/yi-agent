@@ -24,7 +24,27 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
   { name: "config", description: "显示当前配置", usage: null, needsArg: false, availableDuringTurn: true },
   { name: "usage", description: "查看 token 用量与上下文占用", usage: null, needsArg: false, availableDuringTurn: true },
   { name: "help", description: "显示帮助信息", usage: "[command]", needsArg: false, availableDuringTurn: true },
+  // 旁支命令。`side` 是规范名，`btw` 是别名（见 `SLASH_ALIASES`）：两者语义完全
+  // 相同，但**只有规范名进目录**——别名也进目录的话，帮助与补全里会出现两条
+  // 一模一样的「打开旁问」，用户没法判断该记哪个。
+  { name: "side", description: "打开临时旁问（基于创建时上下文，只读）", usage: "[问题]", needsArg: false, availableDuringTurn: true },
+  { name: "back", description: "从旁问返回主会话", usage: null, needsArg: false, availableDuringTurn: true },
+  { name: "side-close", description: "关闭当前旁问", usage: null, needsArg: false, availableDuringTurn: true },
 ];
+
+/**
+ * 命令别名 → 规范名。
+ *
+ * `btw`（by the way）是用户更自然的说法，也是最容易在别处被抄进文档的一个。
+ * 搜索与补全都通过这张表把别名映射回规范名，于是「键入 /btw」能命中，
+ * 「/help 的列表」里却只有 `/side` 一条。
+ */
+export const SLASH_ALIASES: Record<string, string> = { btw: "side" };
+
+/** 把别名折回规范名；不是别名则原样返回。 */
+export function canonicalCommandName(name: string): string {
+  return SLASH_ALIASES[name] ?? name;
+}
 
 /**
  * `/help` 卡片的分组——纯呈现层，不改变 `SLASH_COMMANDS` 的顺序（Popup 的顺序
@@ -35,15 +55,24 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
  */
 export const HELP_GROUPS: { title: string; commands: string[] }[] = [
   { title: "会话", commands: ["clear", "compact", "fork"] },
+  { title: "旁问", commands: ["side", "back", "side-close"] },
   { title: "状态", commands: ["config", "usage"] },
   { title: "帮助", commands: ["help"] },
 ];
 
-/** Prefix filter, matching the TUI's `CommandPopup::filter` (not fuzzy). */
+/**
+ * Prefix filter, matching the TUI's `CommandPopup::filter` (not fuzzy).
+ *
+ * 别名也参与前缀匹配，但命中的是**规范名那一条**：`/btw` 在候选里显示
+ * `side`，执行时也走 `side`。候选集里因此不会出现同一功能的两行。
+ */
 export function filterCommands(prefix: string): SlashCommandSpec[] {
   const p = prefix.trim();
   if (p === "") return SLASH_COMMANDS;
-  return SLASH_COMMANDS.filter((c) => c.name.startsWith(p));
+  const canonical = canonicalCommandName(p);
+  return SLASH_COMMANDS.filter(
+    (c) => c.name.startsWith(canonical) || c.name.startsWith(p),
+  );
 }
 
 export type ParsedSlashInput =
@@ -74,5 +103,6 @@ export function parseSlashInput(text: string): ParsedSlashInput {
 
 /** Unknown commands are never implicitly allowed to mutate an active turn. */
 export function canRunSlashDuringTurn(name: string): boolean {
-  return SLASH_COMMANDS.some(c => c.name === name && c.availableDuringTurn);
+  const canonical = canonicalCommandName(name);
+  return SLASH_COMMANDS.some((c) => c.name === canonical && c.availableDuringTurn);
 }

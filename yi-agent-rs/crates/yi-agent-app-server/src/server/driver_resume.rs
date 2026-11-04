@@ -299,6 +299,8 @@ where
                 subagent_tx,
                 // 锁已经在上面拿到了,交给会话持有;它 drop 时 flock 释放。
                 writer_lock,
+                // 准入许可随 turn 生命周期管理；驱动会话起会话时尚未申请。
+                turn_permit: None,
             },
         );
 

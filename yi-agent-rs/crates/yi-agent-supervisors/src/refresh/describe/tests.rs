@@ -228,11 +228,9 @@ fn describe_drains_large_stdout_without_a_false_timeout() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "small", 256 * 1024, 0);
     let before = std::fs::read(&plugin.stored).unwrap();
-    let result =
-        crate::refresh::refresh_from_plugins(&fixture.workdir().join(".yi-agent/supervisors"));
     assert_eq!(
-        result,
-        vec![crate::refresh::RefreshOutcome::Refreshed("a".into())]
+        refreshed_with_a_wide_budget(&fixture),
+        vec!["a".to_string()]
     );
     let after = std::fs::read(&plugin.stored).unwrap();
     assert_ne!(after, before);
@@ -248,11 +246,9 @@ fn describe_drains_stderr_after_its_capture_limit() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "noisy", 0, 0);
     let before = std::fs::read(&plugin.stored).unwrap();
-    let result =
-        crate::refresh::refresh_from_plugins(&fixture.workdir().join(".yi-agent/supervisors"));
     assert_eq!(
-        result,
-        vec![crate::refresh::RefreshOutcome::Refreshed("a".into())]
+        refreshed_with_a_wide_budget(&fixture),
+        vec!["a".to_string()]
     );
     let after = std::fs::read(&plugin.stored).unwrap();
     assert_ne!(after, before);
@@ -418,20 +414,65 @@ fn describe_reports_cancellation_before_the_deadline() {
 }
 
 /// 取消发生在子进程启动之后：资源同样被收口。
+///
+/// The clock is frozen until the child has actually written its marker, then it
+/// expires the budget. Advancing on wall time instead made the test a race
+/// against the machine: `spawn python3` under load can take longer than the five
+/// second budget, so `Timeout` won and the assertion saw the wrong variant --
+/// a red test that said nothing about the cancellation path. The 20 second
+/// wall-clock backstop keeps a genuinely stuck child from hanging the suite.
 #[test]
 fn describe_cancels_and_cleans_up_a_running_child() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "hang", 0, 0);
     let policy = DescribePolicy::shortened(Duration::from_secs(5));
+    let base = Instant::now();
+    let wall_start = Instant::now();
+    let mut ran = false;
+    let mut clock = |_| {
+        if plugin.manifest_marker.exists() {
+            ran = true;
+        }
+        if ran || wall_start.elapsed() >= Duration::from_secs(20) {
+            base + policy.timeout
+        } else {
+            base
+        }
+    };
     let result = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || plugin.manifest_marker.exists(),
-        &mut |_| Instant::now(),
+        &mut clock,
     );
+    assert!(ran, "the plugin never started before the backstop expired");
     assert!(matches!(result, Err(DescribeError::Cancelled)));
     assert!(plugin.manifest_marker.exists(), "the plugin did run");
     assert_process_gone(&plugin.manifest_marker);
+}
+
+/// 冻结时钟 + 真实墙钟兜底。
+///
+/// The budget here exists to stop a stuck child, not to grade how fast this
+/// machine spawns `python3`. Advancing with `Instant::now()` made the assertion
+/// race the machine: under load a spawn can outlast the budget, `Timeout` wins,
+/// and the test reports a wrong-variant failure that says nothing about the
+/// behaviour under test. Freezing the clock keeps `check_limits` satisfied until
+/// the backstop fires, so only a genuinely hung child reaches the deadline.
+fn backstop_clock(
+    policy: &DescribePolicy,
+    backstop: Duration,
+) -> impl FnMut(Checkpoint) -> Instant {
+    let base = Instant::now();
+    let timeout = policy.timeout;
+    let wall_start = Instant::now();
+    move |_| {
+        if wall_start.elapsed() >= backstop {
+            base + timeout
+        } else {
+            base
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,11 +487,12 @@ fn describe_rejects_stdout_over_limit_without_rewriting() {
     // helper 的 print 会补一个换行：补齐到 limit-1 才是恰好 limit。
     fixture.set_manifest_stdout_bytes(&plugin, 4096);
     let policy = DescribePolicy::with_stdout_limit(Duration::from_secs(10), 4096);
+    let mut clock = backstop_clock(&policy, Duration::from_secs(60));
     let exact = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     );
     assert!(
         exact.is_ok(),
@@ -463,7 +505,7 @@ fn describe_rejects_stdout_over_limit_without_rewriting() {
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     );
     assert!(
         matches!(over, Err(DescribeError::StdoutLimit(4096))),
@@ -487,16 +529,34 @@ fn describe_rejects_stdout_over_limit_without_rewriting() {
 }
 
 /// 超时清理必须杀掉整个进程组，而不只是直接子进程。
+///
+/// Same frozen-clock shape as above: expire only once the descendant marker
+/// proves the grandchild is running. A wall-clock budget made the assertion
+/// depend on how fast `spawn` returns under load, which is not what this test
+/// is about -- it is about the group kill.
 #[test]
 fn describe_cleanup_stops_its_process_group() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "inherited", 0, 0);
     let policy = DescribePolicy::shortened(Duration::from_secs(5));
+    let base = Instant::now();
+    let wall_start = Instant::now();
+    let mut started = false;
+    let mut clock = |_| {
+        if plugin.descendant_marker.exists() {
+            started = true;
+        }
+        if started || wall_start.elapsed() >= Duration::from_secs(20) {
+            base + policy.timeout
+        } else {
+            base
+        }
+    };
     let result = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     );
     assert!(matches!(result, Err(DescribeError::Timeout(_))));
     assert!(
@@ -512,11 +572,12 @@ fn describe_success_still_cleans_up_a_closed_survivor() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "inherited_closed", 0, 0);
     let policy = DescribePolicy::shortened(Duration::from_secs(30));
+    let mut clock = backstop_clock(&policy, Duration::from_secs(60));
     let result = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     );
     assert!(
         result.is_ok(),
@@ -532,11 +593,12 @@ fn describe_keeps_bounded_failure_diagnostics() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "nonzero", 0, 3);
     let policy = DescribePolicy::shortened(Duration::from_secs(10));
+    let mut clock = backstop_clock(&policy, Duration::from_secs(60));
     let error = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     )
     .expect_err("a nonzero exit is a failure");
     let rendered = error.render(&plugin.command.display().to_string());
@@ -558,11 +620,12 @@ fn describe_rejects_non_utf8_stdout() {
     let fixture = PluginFixture::new();
     let plugin = fixture.plugin("a", "invalid_utf8", 0, 0);
     let policy = DescribePolicy::shortened(Duration::from_secs(10));
+    let mut clock = backstop_clock(&policy, Duration::from_secs(60));
     let error = describe_with_clock(
         plugin.command.to_str().unwrap(),
         policy,
         &mut || false,
-        &mut |_| Instant::now(),
+        &mut clock,
     )
     .expect_err("invalid UTF-8 must fail");
     assert!(matches!(error, DescribeError::InvalidUtf8));
@@ -653,6 +716,29 @@ fn observing_a_running_child_reports_none() {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// 走**真实批次路径**，但用一份不会因为机器忙而到期的预算。
+///
+/// These two cases are about backpressure: a 256 KiB manifest and 2 MiB of
+/// stderr must not look like a hung plugin. Grading them against the production
+/// 15 s budget made them race the machine -- the same case takes 0.8 s alone and
+/// exceeded 15 s while the rest of the suite ran, which surfaced as a
+/// `Skipped(Timeout)` failure that said nothing about draining (reproduced on
+/// 2 of 6 runs here on 2026-11-04). A wide deadline keeps every other production
+/// parameter and still fails a genuinely stuck plugin.
+fn refreshed_with_a_wide_budget(fixture: &PluginFixture) -> Vec<String> {
+    crate::refresh::refresh_records(
+        &fixture.workdir().join(".yi-agent/supervisors"),
+        DescribePolicy::wide_budget(Duration::from_secs(120)),
+        &mut |_| false,
+    )
+    .into_iter()
+    .filter_map(|record| match record.outcome {
+        crate::refresh::RefreshOutcome::Refreshed(name) => Some(name),
+        _ => None,
+    })
+    .collect()
+}
 
 /// 观测「子进程已进入目标阶段」的预算。**宽 backstop，不是期望值**：全量测试
 /// 并发跑时 python3 冷启动实测能超过 10 秒（2026-11-03 本机 nextest 并发下复现），

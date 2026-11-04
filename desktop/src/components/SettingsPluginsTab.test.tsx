@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SettingsPluginsTab } from "./SettingsPluginsTab";
 
 afterEach(cleanup);
@@ -12,25 +12,37 @@ describe("SettingsPluginsTab", () => {
     expect(await screen.findByText("未安装任何插件")).toBeTruthy();
   });
 
-  it("renders a neutral row for a plugin without a registered panel", async () => {
+  it("renders a neutral row for any plugin, without a host-side panel registry", async () => {
+    // 主程序不再有「插件名 → 组件」的表：任何名字都走同一条中性行，设置由插件
+    // 自己提供的受管视图打开。
     const call = async () => ({
       plugins: [{ name: "mystery", queryable: true, switch_key: "mystery_on" }],
     });
     render(<SettingsPluginsTab call={call} projects={[]} />);
     expect(await screen.findByText("mystery")).toBeTruthy();
-    expect(screen.getByText("该插件暂无可配置项")).toBeTruthy();
+    expect(
+      screen.getByText("该插件的设置由它自己提供，见上方「受管插件」里的设置入口。"),
+    ).toBeTruthy();
   });
 
-  it("renders the kanban panel for the kanban plugin", async () => {
-    const call = async (method: string) => {
-      if (method === "plugins/list") {
-        return { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] };
-      }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
-    };
-    render(<SettingsPluginsTab call={call} projects={[]} />);
-    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
-    expect(await screen.findByLabelText("推进间隔秒数")).toBeTruthy();
+  it("treats a plugin the host knows nothing about like any other", async () => {
+    // 回归：曾经有一个插件名在注册表里、其余走中性行；现在两者必须一模一样，
+    // 否则"加一个插件不用改主程序"就是假的。
+    const call = async () => ({
+      plugins: [
+        { name: "superpowers-kanban", queryable: true, switch_key: "a" },
+        { name: "example-counter", queryable: true, switch_key: "b" },
+      ],
+    });
+    const { container } = render(<SettingsPluginsTab call={call} projects={[]} />);
+    await screen.findByText("superpowers-kanban");
+    const rows = Array.from(container.querySelectorAll("section"));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(
+        row.textContent,
+      ).toContain("该插件的设置由它自己提供");
+    }
   });
 
   it("scopes plugins/list to the selected project", async () => {
@@ -38,7 +50,7 @@ describe("SettingsPluginsTab", () => {
     const call = async (method: string, params: unknown) => {
       calls.push([method, params]);
       if (method === "plugins/list") return { plugins: [] };
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+      return {};
     };
     render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
     await screen.findByText("未安装任何插件");
@@ -53,14 +65,12 @@ describe("SettingsPluginsTab", () => {
         calls.push(params);
         const project = (params as { project?: string }).project;
         return project === "/p/second"
-          ? { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] }
+          ? { plugins: [{ name: "second-only", queryable: true, switch_key: "k" }] }
           : { plugins: [] };
       }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+      return {};
     };
-    render(
-      <SettingsPluginsTab call={call} projects={["/p/first", "/p/second"]} />,
-    );
+    render(<SettingsPluginsTab call={call} projects={["/p/first", "/p/second"]} />);
     await screen.findByText("未安装任何插件");
     expect(calls[0]).toEqual({ project: "/p/first" });
 
@@ -68,12 +78,12 @@ describe("SettingsPluginsTab", () => {
       target: { value: "/p/second" },
     });
 
-    // 换项目 = 换作用域：重新枚举，且这次能看到该项目里的看板面板。
-    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
+    // 换项目 = 换作用域：重新枚举，且这次能看到该项目里的插件。
+    expect(await screen.findByText("second-only")).toBeTruthy();
     expect(calls[1]).toEqual({ project: "/p/second" });
   });
 
-  it("marks a switched-off plugin without hiding its panel", async () => {
+  it("marks a switched-off plugin without hiding it", async () => {
     const call = async (method: string) => {
       if (method === "plugins/list") {
         return {
@@ -82,14 +92,12 @@ describe("SettingsPluginsTab", () => {
           ],
         };
       }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+      return {};
     };
     render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
     expect(await screen.findByText(/已停用/)).toBeTruthy();
-    // 面板仍在：用户得能从这一页看出它为什么没在跑，而不是整块消失。
-    // 必须 `findBy`：设置本身是异步读的，"已停用"那行先到、面板后到，
-    // 用同步 `getBy` 会变成一条随机失败的测试。
-    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
+    // 仍列出来：用户得能从这一页看出它为什么没在跑，而不是整块消失。
+    expect(screen.getByText("superpowers-kanban")).toBeTruthy();
   });
 
   it("treats an old host that omits enabled as running", async () => {
@@ -97,54 +105,36 @@ describe("SettingsPluginsTab", () => {
       if (method === "plugins/list") {
         return { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] };
       }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+      return {};
     };
     render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
-    await screen.findByLabelText("全机并发上限");
+    await screen.findByText("superpowers-kanban");
     expect(screen.queryByText(/已停用/)).toBeNull();
   });
+});
 
-  it("keeps the user's input and shows an inline error when saving fails", async () => {
+describe("SettingsPluginsTab managed section", () => {
+  it("shows managed plugins only when a project handle is supplied", async () => {
     const call = async (method: string) => {
-      if (method === "plugins/list") {
-        return { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] };
+      if (method === "plugins/list") return { plugins: [] };
+      if (method === "plugins/v1/list") {
+        return {
+          plugins: [
+            { plugin: "example-counter", selected: "1.0.0", installed: ["1.0.0"], projects: ["ph1_aaaa"] },
+          ],
+        };
       }
-      // 写入失败：插件不可用。
-      if (method === "plugin/settings/write") {
-        throw new Error("plugin_unavailable: the plugin is not available");
-      }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+      return {};
     };
-    render(<SettingsPluginsTab call={call} projects={[]} />);
-    const input = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "7" } });
-    expect(input.value).toBe("7");
 
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-    expect(await screen.findByRole("alert")).toBeTruthy();
-    // 失败绝不乐观更新：用户改的值必须还在，且显示的就是他的输入。
-    expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
-  });
+    const { unmount } = render(<SettingsPluginsTab call={call} projects={[]} />);
+    await screen.findByText("未安装任何插件");
+    // 没有句柄时不显示受管分区：路径不能冒充句柄。
+    expect(screen.queryByText("受管插件")).toBeNull();
+    unmount();
 
-  it("keeps unsaved edits when the call seam identity changes on re-render", async () => {
-    const makeCall = () => async (method: string) => {
-      if (method === "plugins/list") {
-        return { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] };
-      }
-      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
-    };
-    const { rerender } = render(
-      <SettingsPluginsTab call={makeCall()} projects={["/p/proj"]} />,
-    );
-    const input = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "7" } });
-    expect(input.value).toBe("7");
-
-    // 宿主重渲染换新接缝身份：看板的 2 秒轮询会反复触发这一情形。
-    rerender(<SettingsPluginsTab call={makeCall()} projects={["/p/proj"]} />);
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
-
-    // 未保存的编辑不得被重新读回来的服务端值冲掉。
-    expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
+    render(<SettingsPluginsTab call={call} projects={[]} projectHandle="ph1_aaaa" />);
+    expect(await screen.findByText("受管插件")).toBeTruthy();
+    expect(await screen.findByText("example-counter")).toBeTruthy();
   });
 });

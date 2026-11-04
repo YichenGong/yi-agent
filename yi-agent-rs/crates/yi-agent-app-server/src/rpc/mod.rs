@@ -21,10 +21,12 @@ pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
+pub(crate) mod plugin_management;
 pub(crate) mod process;
 pub(crate) mod remote;
 pub(crate) mod resident;
 pub(crate) mod runtime;
+pub(crate) mod side;
 pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
@@ -187,12 +189,31 @@ pub(crate) enum Flow {
 pub(crate) struct PluginChannelState {
     pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
     pub(crate) client: crate::broadcast::ClientId,
+    /// 发起这次请求的客户端权限。受管管理方法（`plugins/v1/*`）要求 `Admin`：
+    /// 装包、授权、激活动的是**宿主**的状态，一个只读观察者不该能做。
+    ///
+    /// 门禁在这里而不是在 `server.rs` 的 `ADMIN_METHODS` 常量里，因为那个常量
+    /// 按方法名字面量硬编码；`plugins/v1/*` 是前缀域，逐个列举会漏。
+    pub(crate) client_scope: crate::protocol::Scope,
     /// 通用常驻登记目录。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
     /// 值守安装所针对的 home。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_home: std::path::PathBuf,
+    /// 受管插件的**实例根**：`plugins/registry.json`、`plugins/grants.json`、
+    /// `plugins/releases/**` 都在它下面。
+    ///
+    /// 之前这里错用了 `watchman_home`（= 真实 `$HOME`），于是 `plugins/v1/install`
+    /// 会把包装进 `~/plugins/`，与实例根下的登记表对不上。`watchman_home` 是
+    /// 「往哪个 `Library/LaunchAgents` 写」，和插件存储是两件事，不能共用一个字段。
+    pub(crate) plugin_home: std::path::PathBuf,
+    /// 官方目录文件。**按连接注入**而不是读进程环境变量。
+    ///
+    /// 进程级 `YI_AGENT_PLUGIN_CATALOG` 有两个毛病：同一进程里两个 app-server
+    /// 连接无法各自持有一份目录（远端与本地必须能指向不同源），以及并行测试
+    /// 会互相改写。按连接注入把这两件事一起修掉。
+    pub(crate) plugin_catalog: std::path::PathBuf,
     /// 安装句柄。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_install: crate::server::WatchmanInstall,
     /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。见
@@ -273,6 +294,8 @@ pub(crate) enum Domain {
     Flags,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
+    /// `side/*`(旁支会话:开/列/读/发问/停止/关闭,spec §8.1)。
+    Side,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
     Agent,
     /// `remote/*`(手机端「本项目清单 + 每项目的 relay session」)。
@@ -307,6 +330,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("websearch") => Domain::WebSearch,
         Some("flags") | Some("build") => Domain::Flags,
         Some("thread") => Domain::Thread,
+        Some("side") => Domain::Side,
         Some("agent") => Domain::Agent,
         Some("remote") => Domain::Remote,
         Some("runtime") => Domain::Runtime,
@@ -491,6 +515,20 @@ pub(crate) struct AppState<'a> {
     /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
     /// 读一次的判定输入。
     pub(crate) lead_agent_enabled: bool,
+
+    // ---- 旁支会话(spec §8) ----
+    /// 旁支注册表。`Arc` 是进程级唯一实例:`open` 必须让桌面与手机拿到**同一个**
+    /// runner,按连接各建一份就会给同一个父开两条供应商流。
+    pub(crate) side_registry: &'a Arc<crate::side_conversation::SideRegistry>,
+    /// 宿主级的旁支后台任务集合。`serve()` 在返回前 `abort_all()`。
+    ///
+    /// 之所以是 `JoinSet` 而不是裸 `spawn`:旁支任务的寿命可以长于一个请求
+    /// (创建要读盘、关闭要等核心任务收敛),没有统一持有者就无法在宿主退出时
+    /// 收口,也无法在测试里确定地清空。
+    pub(crate) side_tasks: &'a mut tokio::task::JoinSet<()>,
+    /// 旁支分页快照登记表。进程级共享:宿主级上限(8 份 / 128 MiB)是对**宿主**
+    /// 约束的资源,按连接各建一份就执行不了它。
+    pub(crate) side_replay: &'a crate::side_conversation::SharedReplayStore,
 
     // ---- 远端 SSH 执行(实验开关 `remote_ssh`) ----
     /// 实例状态根,`remote/relayTargets` 从它下面读 `remote.json` 与

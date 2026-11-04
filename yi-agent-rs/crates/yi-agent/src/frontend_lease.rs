@@ -31,6 +31,13 @@ use yi_agent_lifecycle::types::{ClientKind, LeaseMode};
 /// a shell that gives up waiting can still read it.
 pub const RELEASE_WAIT: Duration = Duration::from_secs(5);
 
+/// How long opening one private spawn channel may take.
+///
+/// Short for the same reason a control exchange is short: the guardian serves it
+/// from its own loop, so a slow answer means the loop is busy, not that the
+/// channel is expensive to make.
+const CHANNEL_BUDGET: Duration = Duration::from_secs(2);
+
 /// One frontend process's lease, or nothing when embedded mode is in use.
 pub struct FrontendLeaseHandle {
     lease: FrontendLease,
@@ -67,6 +74,59 @@ impl FrontendLeaseHandle {
     /// The client run this frontend registered under.
     pub fn client_run_id(&self) -> &str {
         self.lease.client_run_id()
+    }
+
+    /// Builds the owner a managed tool spawn needs, opening one channel per spawn.
+    ///
+    /// The factory opens a *new* channel each time it is called, and that is not an
+    /// optimisation to revisit: a channel's owner is fixed when the guardian creates
+    /// it, so reusing one would let a second owner's processes answer on the first
+    /// owner's connection. Opening one per child is also what keeps a tool from
+    /// holding a channel across a guardian restart.
+    ///
+    /// `None` when the guardian will not issue a channel: a lease-only observer does
+    /// not authorize work, and a runtime that owns no registry cannot reclaim what it
+    /// starts. In both cases the tool layer must keep its direct spawn rather than
+    /// inventing an owner -- an unmanaged child is at least honestly unmanaged.
+    pub fn managed_owner(
+        &self,
+    ) -> Option<(
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    )> {
+        use std::sync::Arc;
+        // Probe once, now: deciding per spawn would turn a refused channel into a
+        // per-tool failure long after the session already looked healthy.
+        let probe = self
+            .lease
+            .open_managed_channel(&Deadline::after(CHANNEL_BUDGET))
+            .ok()?;
+        let owner = probe.owner().to_string();
+        // The probe's channel is spent on the first real spawn, so it is handed to
+        // the factory rather than closed and reopened.
+        let first = Arc::new(std::sync::Mutex::new(Some(probe)));
+        let control_path = self.lease.control_path().to_path_buf();
+        // The grant is this process's own credential. It is captured here so later
+        // channels are opened without re-registering: a second registration would
+        // mint a second lease for one process and make "the last frontend" wrong.
+        let grant = self.lease.grant().clone();
+        let factory: yi_agent_tools::ChannelFactory = Arc::new(move || {
+            if let Some(channel) = first.lock().ok().and_then(|mut slot| slot.take()) {
+                return Ok(channel.into_parts().0);
+            }
+            let channel = yi_agent_lifecycle::client::FrontendLease::open_channel_with(
+                &control_path,
+                &grant,
+                &Deadline::after(CHANNEL_BUDGET),
+            )?;
+            Ok(channel.into_parts().0)
+        });
+        Some((
+            yi_agent_tools::ManagedProcessPolicy::Frontend {
+                client_run_id: owner,
+            },
+            yi_agent_tools::ManagedSpawner::new(factory),
+        ))
     }
 
     /// Whether the runtime has stopped counting this frontend as present.

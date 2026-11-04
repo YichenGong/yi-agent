@@ -68,6 +68,7 @@ fn test_session(project: &Path, thread_id: &str, turn: Option<&str>) -> ThreadSe
         cwd: project.display().to_string(),
         model: "test".to_string(),
         active_turn_id: turn.map(str::to_string),
+        turn_permit: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         prompt_tx,

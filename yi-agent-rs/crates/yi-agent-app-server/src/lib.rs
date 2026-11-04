@@ -23,6 +23,7 @@ pub mod onboarding_rpc;
 pub mod pair_uri;
 pub mod pairing;
 pub mod plugin_gate;
+pub mod plugin_manager;
 pub(crate) mod plugin_worktree;
 /// 插件被自己的 flag 关掉的判定。与 `lead_gate` 同一手法：构造点算一次。
 pub(crate) mod power_busy;
@@ -38,6 +39,8 @@ pub(crate) mod session_driver;
 pub mod settings_rpc;
 pub mod settings_store;
 pub mod shell_authorization;
+pub mod side_cold;
+pub mod side_conversation;
 pub mod skill_rpc;
 /// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
 ///

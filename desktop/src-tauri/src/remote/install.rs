@@ -150,6 +150,11 @@ pub type Progress<'a> = &'a dyn Fn(InstallStage);
 ///
 /// 三条路径的共同终点相同：远端出现 `<instance_root>/bin/<version>/yi-agent`
 /// 且可执行。
+///
+/// 九个参数全部是独立输入（取字节的方式、本地 home、远端根、目标三元组、
+/// 版本、远端能力、主机、可选本地包、进度回调）。折成结构体会让"这是哪两个"
+/// 隐式化，而这里每一项都决定一次 ssh/scp 的自由度。
+#[allow(clippy::too_many_arguments)]
 pub fn install(
     fetcher: &dyn crate::remote::fetch::Fetcher,
     home: &Path,

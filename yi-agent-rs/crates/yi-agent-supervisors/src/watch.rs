@@ -124,7 +124,7 @@ mod tests {
     fn once_reads_the_registry_and_hands_it_to_the_ensurer() {
         let dir = tempfile::tempdir().unwrap();
         let a = PathBuf::from("/a");
-        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+        yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
         let mut seen: Vec<PathBuf> = Vec::new();
         let count = once(dir.path(), &mut |projects| seen.extend_from_slice(projects));
         assert_eq!(count, 1);

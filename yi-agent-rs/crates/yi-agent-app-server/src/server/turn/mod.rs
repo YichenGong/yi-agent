@@ -37,11 +37,14 @@ pub(crate) use title::generate_title_for_first_input;
 /// `prepare_turn_core` 的失败。每一种都对应 `turn/start` 的一条固定错误响应,
 /// 由 `start_turn_core` 负责把它写出去(这样「校验」与「写响应」解耦,驱动器可以
 /// 只复用前者而不向任何客户端广播)。
+#[derive(Debug)]
 pub(crate) enum TurnPrepareError {
     MissingThreadId,
     EmptyInput,
     UnknownThread(String),
     TurnInProgress(String),
+    /// 插件正在排空（或准入被拒）。带原因，用户能看到"等这次维护结束"。
+    NotAdmitted(String),
     /// 附件不可读 / 超出上限 / 不是文件。
     InvalidAttachment(String),
     /// 显式路径的图片输入（`{type:"image", path}`）不可用。带 `data.code =
@@ -81,6 +84,14 @@ pub(crate) async fn prepare_turn_core(
     pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
     uploads: &mut crate::image_upload::UploadRegistry,
     params: &serde_json::Value,
+    // 插件准入。`None` = 不设准入（RPC 起的普通会话，与改动前逐字一致）。
+    //
+    // # 为什么准入只对"已绑定插件"的会话生效
+    //
+    // 排空屏障要等的是**插件发起的回合**，普通用户聊天与插件无关，拿它去占
+    // 排空名额会让"卸载插件"卡在一个正在打字的用户身上。所以调用方只在会话
+    // 有插件绑定时才传 `Some`。
+    admission: Option<(&yi_agent_plugins::Admission, yi_agent_plugins::Binding)>,
 ) -> Result<PreparedTurn, TurnPrepareError> {
     let thread_id = params
         .get("threadId")
@@ -266,6 +277,17 @@ pub(crate) async fn prepare_turn_core(
         }
     }
 
+    // 取准入凭据。必须在占位**之前**：被排空拒绝时不该留下 `active_turn_id`,
+    // 否则这个会话会永远报 turn_in_progress 直到进程重启。
+    let permit = match admission {
+        Some((admission, binding)) => Some(
+            admission
+                .admit_turn(&turn_id, binding)
+                .map_err(|error| TurnPrepareError::NotAdmitted(error.to_string()))?,
+        ),
+        None => None,
+    };
+
     // 占位(复制成功之后)。
     {
         let Some(session) = threads.get_mut(&thread_id) else {
@@ -275,6 +297,9 @@ pub(crate) async fn prepare_turn_core(
             return Err(TurnPrepareError::TurnInProgress(thread_id));
         }
         session.active_turn_id = Some(turn_id.clone());
+        // permit 与 active_turn_id 同生共死：所有清空活跃 turn 的地方把它一起
+        // 置 `None`，`TurnPermit::drop` 即释放 flock 与登记表条目。
+        session.turn_permit = permit;
     }
     let activate = pending_activation.get(&thread_id).cloned().flatten();
     // prompt 送进模型时带上附件清单;气泡文本仍是原话(见 `display_text`)。
@@ -302,6 +327,7 @@ pub(crate) fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
         TurnPrepareError::EmptyInput => RpcError::invalid_params("missing or empty input text"),
         TurnPrepareError::UnknownThread(thread_id) => RpcError::unknown_thread(&thread_id),
         TurnPrepareError::TurnInProgress(thread_id) => RpcError::turn_in_progress(&thread_id),
+        TurnPrepareError::NotAdmitted(reason) => RpcError::invalid_params(reason),
         TurnPrepareError::InvalidAttachment(msg) => RpcError::invalid_params(msg),
         TurnPrepareError::InvalidImage(msg) => RpcError::invalid_image(msg),
     }
@@ -412,7 +438,9 @@ async fn start_turn_core_inner(
     id: RequestId,
     fault: Option<StartStage>,
 ) -> anyhow::Result<Option<String>> {
-    let prepared = match prepare_turn_core(threads, pending_activation, uploads, params).await {
+    // 普通 RPC 回合不占插件准入：用户聊天与插件排空无关。
+    let prepared = match prepare_turn_core(threads, pending_activation, uploads, params, None).await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             write_response(hub, client, err_response(id, turn_prepare_rpc_error(error))).await?;

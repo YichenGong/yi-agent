@@ -1082,6 +1082,42 @@ impl ProcessRegistry {
     }
 }
 
+/// Last-resort reclamation for the groups this registry started.
+///
+/// `std::process::Child`'s `Drop` neither kills nor waits, and every managed child
+/// calls `setsid` in `pre_exec`, so a dropped-but-not-terminated registry leaves
+/// groups that are not in our process group: neither the test harness nor the
+/// shell will ever signal them. They outlive the owner and are reparented to init.
+///
+/// The normal path stays `terminate_owner` / `terminate_execution`, which drain the
+/// group and journal the outcome. This exists for the paths that cannot reach them:
+/// a caller that returns early, a panicking test, or code that deliberately keeps a
+/// group running to observe it. It signals groups directly instead of going through
+/// `stop`, because the journal is no longer meaningful to a dying owner and a
+/// journal write must not run during unwinding.
+impl Drop for ProcessRegistry {
+    fn drop(&mut self) {
+        for record in &self.records {
+            if record.state != RecordState::Running {
+                continue;
+            }
+            // Without the `Child` handle, ownership rests on the leader's birth
+            // identity: a PGID whose leader vanished may since have been recycled.
+            let leader_alive = self.children.contains_key(&record.process_id)
+                || ProcessBirth::from_recorded(record.pid, record.start_micros).is_alive();
+            if !leader_alive {
+                continue;
+            }
+            let _ = processes::kill_group(record.pgid);
+        }
+        // Reap what we hold, so no zombie is left behind by our own exit. The group
+        // kill above is what stops the members; this only collects the leader.
+        for (_, mut child) in std::mem::take(&mut self.children) {
+            let _ = child.wait();
+        }
+    }
+}
+
 /// What one managed group currently looks like.
 enum GroupState {
     /// No live member remains, and the group was proven ours.
@@ -1266,6 +1302,11 @@ pub struct Guardian {
     /// half-written frame look like a dropped lifeline, i.e. a live daemon reported
     /// dead.
     pub(super) bridge: Option<std::os::unix::net::UnixStream>,
+    /// Authority to attach roots, minted for the daemon this guardian started.
+    ///
+    /// `None` until a daemon answers: authority that named no daemon could not be
+    /// checked by one, and the daemon instance id is part of the binding.
+    authorizations: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
 }
 
 impl Guardian {
@@ -1299,6 +1340,7 @@ impl Guardian {
             reclaim,
             root_authority: super::root_authority::RootAuthorityTable::new(),
             bridge: None,
+            authorizations: None,
         }
     }
 
@@ -1332,13 +1374,32 @@ impl Guardian {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or_default()
         );
+        // Authority has a generation to name from the moment the daemon exists, so
+        // the ledger is built before the fork rather than after the handshake.
+        // Building it late would mean the greeting could only be sent once the
+        // daemon answered -- but the daemon *waits* for the greeting before it
+        // serves, so "wait for Status, then greet" is a deadlock, not an ordering.
+        let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+            self.scope.key.clone(),
+            instance_id.clone(),
+        );
+        let hello = yi_agent_lifecycle::authorization::LifelineHello::new(
+            self.scope.key.clone(),
+            instance_id.clone(),
+            ledger.generation_secret(),
+        );
         // The descriptor that proves to the daemon that it was started by a guardian.
         // The guardian-side end is kept for the daemon's whole life: closing it would
         // tell the daemon its launcher is gone while the guardian still supervises it.
-        let (guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair()?;
-        // A second pair for authorization frames. Sharing the lifeline would make a
-        // half-written frame look like a dropped daemon, and the lifeline carries no
-        // messages by design.
+        let (mut guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair()?;
+        if let Err(error) =
+            guardian_end.set_write_timeout(Some(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT))
+        {
+            tracing::warn!(error = %error, "could not bound the lifeline write timeout");
+        }
+        // A second pair for foreground authority frames. Sharing the lifeline would
+        // make a half-written frame look like a dropped daemon, and the lifeline's
+        // own reads are bounded by the hello handshake.
         let (bridge_guardian_end, bridge_daemon_end) = std::os::unix::net::UnixStream::pair()?;
         let command = ManagedCommand {
             executable: program.to_path_buf(),
@@ -1398,6 +1459,18 @@ impl Guardian {
             }
         };
 
+        // The greeting goes out before we wait for the socket: the daemon reads it
+        // first thing and refuses to serve without it. Failing to write here is not
+        // fatal to the start -- the daemon falls back to unmanaged, which is the
+        // compatibility path -- but it is recorded, because an App attach will then
+        // be refused with a reason nobody could otherwise explain.
+        if let Err(error) = yi_agent_lifecycle::codec::write_frame(&mut guardian_end, &hello) {
+            tracing::warn!(
+                error = %error,
+                "the managed daemon could not be told its authorization secret"
+            );
+        }
+
         let socket = yi_agent_store::ipc::socket_path_for(&self.scope.runtime_dir)
             .map_err(|error| io::Error::other(error.to_string()))?;
         // The socket may be the *previous* daemon's leftover node. Waiting for a
@@ -1408,7 +1481,7 @@ impl Guardian {
                 .is_ok()
             {
                 self.daemon = Some(GuardianDaemon {
-                    instance_id,
+                    instance_id: instance_id.clone(),
                     // The bytes are the ones this guardian launched: the guardian is
                     // the authority on which artifact it pinned, and it does not
                     // pretend to have read a self-description the daemon never sends.
@@ -1418,6 +1491,7 @@ impl Guardian {
                     capabilities: self.artifact.capabilities.clone(),
                     process_id,
                 });
+                self.authorizations = Some(ledger);
                 self.daemon_lifeline = Some(guardian_end);
                 // Only now: a bridge attached to a daemon that never answered would
                 // invite the guardian to install authority into a process that is not
@@ -1479,6 +1553,99 @@ impl Guardian {
         // believing its guardian still exists.
         self.daemon_lifeline = None;
         result
+    }
+
+    /// Mints authority to attach one root, and pushes the binding to the daemon.
+    ///
+    /// The `grant` is the whole authentication: it must match the live lease, and
+    /// the lease must be business. There is deliberately no path that mints
+    /// authority from a client id alone -- a caller that could name a client would
+    /// be naming an owner it does not speak for, which is exactly the confusion
+    /// `RootAuthorization` exists to prevent.
+    ///
+    /// A guardian with no daemon answers `Unsupported` rather than minting into a
+    /// void: the binding names a `daemon_instance_id`, and authority for a daemon
+    /// that is not serving could never be honoured by one.
+    pub fn mint_root_capability(
+        &mut self,
+        grant: &yi_agent_lifecycle::types::ClientGrant,
+        root_id: &str,
+    ) -> Result<yi_agent_lifecycle::types::RootAuthorization, String> {
+        let now = lease_now();
+        // Same check an admission gets: released, expired, stale-epoch and
+        // `LeaseOnly` all fail here, so no weaker path exists.
+        self.reclaim.leases().admits(grant, now)?;
+        let mode = grant.mode;
+        let client = grant.client_run_id.clone();
+        // Scoped so the borrow ends before the push: publishing needs `&mut self`
+        // too, and the ledger is only re-borrowed if the push fails.
+        let authorization = {
+            let Some(ledger) = self.authorizations.as_mut() else {
+                return Err(
+                    "this guardian started no daemon, so it has no generation to authorize in"
+                        .to_string(),
+                );
+            };
+            ledger.issue(&client, root_id, mode)?
+        };
+        // Pushed before the answer is returned: a client that got a capability the
+        // daemon has never heard of would be told "authorized" and then refused at
+        // the attach, which is the one failure mode this type exists to make
+        // impossible.
+        if let Err(error) = self.push_authorization(
+            yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(
+                authorization.clone(),
+            )),
+        ) {
+            // The ledger already holds it; withdraw so memory cannot outlive the
+            // daemon's knowledge of it.
+            if let Some(ledger) = self.authorizations.as_mut() {
+                let _ = ledger.apply(
+                    yi_agent_lifecycle::authorization::AuthorizationUpdate::RevokeRoot {
+                        root_id: root_id.to_string(),
+                    },
+                );
+            }
+            return Err(format!("the daemon could not be told: {error}"));
+        }
+        Ok(authorization)
+    }
+
+    /// Withdraws one client's authority and tells the daemon.
+    ///
+    /// Called on release and on lease expiry -- both are "this owner is gone", and
+    /// leaving authority behind would let a departed App attach work nobody will
+    /// reclaim. The local ledger is updated even when the push fails: a guardian
+    /// that kept honouring a released client because a socket write failed would be
+    /// worse than one whose daemon learns late.
+    pub fn revoke_client_authority(&mut self, client_run_id: &str) {
+        let update = yi_agent_lifecycle::authorization::AuthorizationUpdate::RevokeClient {
+            client_run_id: client_run_id.to_string(),
+        };
+        if let Some(ledger) = self.authorizations.as_mut() {
+            let _ = ledger.apply(update.clone());
+        }
+        let _ = self.push_authorization(update);
+    }
+
+    /// Publishes one update on the daemon's lifeline.
+    ///
+    /// The lifeline is the daemon's death monitor as well as its authorization
+    /// channel. Those two uses do not conflict: the monitor fires when the socket
+    /// *closes*, not when it is idle, and a frame is just bytes on a stream that is
+    /// already open for its whole life.
+    fn push_authorization(
+        &mut self,
+        update: yi_agent_lifecycle::authorization::AuthorizationUpdate,
+    ) -> io::Result<()> {
+        let Some(lifeline) = self.daemon_lifeline.as_mut() else {
+            return Err(io::Error::other(
+                "no daemon lifeline: there is nothing to tell",
+            ));
+        };
+        lifeline.set_write_timeout(Some(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT))?;
+        yi_agent_lifecycle::codec::write_frame(&mut &*lifeline, &update)
+            .map_err(|error| io::Error::other(format!("lifeline write failed: {error}")))
     }
 
     /// Whether this guardian has a daemon it started and has not stopped.
@@ -1640,6 +1807,15 @@ impl Guardian {
         &mut self,
         now: std::time::Duration,
     ) -> Vec<yi_agent_lifecycle::types::OperationId> {
+        // Expiry is a client going silent, and it ends that client's authority for
+        // the same reason a release does: the work it would have attached has no
+        // one left to reclaim it. Reading the expiring ids *before* the sweep is
+        // what lets this revoke the right ones -- afterwards the table no longer
+        // knows who left.
+        let expiring = self.reclaim.leases().expiring_at(now);
+        for client in expiring {
+            self.revoke_client_authority(&client);
+        }
         self.reclaim.expire_leases(now)
     }
 
@@ -2673,6 +2849,96 @@ fn prepare_control_stream(stream: &std::os::unix::net::UnixStream) -> io::Result
     Ok(())
 }
 
+/// Opens a private spawn channel for one authenticated client.
+///
+/// Authentication is the grant, checked against the live lease table exactly as an
+/// admission question is: the guardian must not hand a spawn channel to a client it
+/// has already released, nor to a `LeaseOnly` observer, which by definition never
+/// authorizes a task.
+///
+/// The refusal is written as an ordinary frame, so a client that cannot have a
+/// channel learns *why* instead of seeing a bare EOF.
+fn serve_open_channel(
+    guardian: &mut Guardian,
+    stream: &mut std::os::unix::net::UnixStream,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+) {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    let refuse =
+        |stream: &mut std::os::unix::net::UnixStream, code: ControlErrorCode, reason: String| {
+            let _ = yi_agent_lifecycle::codec::write_frame(
+                stream,
+                &ControlResponse::Rejected { code, reason },
+            );
+        };
+
+    // No registry means nothing to start a group in, and a channel that accepted a
+    // spawn it could never stop would be worse than no channel at all.
+    let Some(registry) = guardian.registry.as_ref().map(std::sync::Arc::clone) else {
+        let _ = yi_agent_lifecycle::codec::write_frame(
+            stream,
+            &ControlResponse::Unsupported {
+                detail: "this runtime owns no process registry, so it cannot issue a \
+                         managed channel"
+                    .to_string(),
+            },
+        );
+        return;
+    };
+
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits(grant, now) {
+        let code = if reason.contains("lease is") {
+            ControlErrorCode::Unauthenticated
+        } else {
+            ControlErrorCode::StaleEpoch
+        };
+        refuse(stream, code, reason);
+        return;
+    }
+
+    let owner = super::guardian::ProcessOwner::frontend(grant.client_run_id.clone());
+    let channel = super::managed_channel::ChannelGrant::new(owner.clone());
+    let budget = yi_agent_lifecycle::MANAGED_CHANNEL_BUDGET;
+    let descriptor = match super::managed_channel::open_channel(registry, channel, budget) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            refuse(
+                stream,
+                ControlErrorCode::Internal,
+                format!("the channel could not be opened: {error}"),
+            );
+            return;
+        }
+    };
+    // The descriptor goes out *with* the frame in one message: a client that read
+    // the frame alone would have no way to pair an owner with a descriptor, and a
+    // descriptor arriving without its owner would be unattributable.
+    let answer = ControlResponse::ChannelOpened {
+        owner: grant.client_run_id.clone(),
+        generation: guardian.generation.clone(),
+    };
+    let frame = match yi_agent_lifecycle::codec::encode(&answer) {
+        Ok(frame) => frame,
+        Err(error) => {
+            refuse(
+                stream,
+                ControlErrorCode::Internal,
+                format!("the channel answer could not be encoded: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) =
+        yi_agent_lifecycle::managed::fdpass::send_with_fds(stream, &frame, &[descriptor])
+    {
+        // Nothing useful can be written now: the frame and the descriptor share one
+        // message, so a partial send has already broken the pairing.
+        tracing::warn!(error = %error, "a managed channel descriptor could not be sent");
+    }
+}
+
 /// Serves exactly one control connection.
 ///
 /// Exposed for integration tests that own their accept loop: a test must be able
@@ -2770,8 +3036,15 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                 },
                 Ok(_) => {
                     let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
+                    let released_client = grant.client_run_id.clone();
                     match guardian.reclaimer_mut().release(grant, budget) {
                         Ok(operation_id) => {
+                            // Authority must not outlive the lease that justified it:
+                            // the reclaimer has accepted the release, so the daemon is
+                            // told to stop honouring this client's capabilities *now*,
+                            // not when the teardown finishes. Both channels carry the
+                            // same decision for the two subsystems that enforce it.
+                            guardian.revoke_client_authority(&released_client);
                             guardian.reclaimer_mut().expire_results();
                             ControlResponse::ReleaseStarted { operation_id }
                         }
@@ -2852,6 +3125,14 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             root,
             operation_id,
         } => serve_root_recovery_operation(guardian, &grant, &root, &operation_id),
+        ControlRequest::OpenManagedChannel { grant } => {
+            // Answered here rather than as a plain `ControlResponse`, because the
+            // answer is a *descriptor*: it must travel beside the frame, and the
+            // frame must be written last so a client cannot receive a descriptor
+            // it does not know the owner of.
+            serve_open_channel(guardian, &mut stream, &grant);
+            return;
+        }
         ControlRequest::Preview { grant, target } => serve_preview(guardian, &grant, target),
         ControlRequest::PreviewPage {
             grant,
@@ -2930,5 +3211,324 @@ mod foreground_root_lifecycle_capability_tests {
             advertised,
             vec!["lease.v1".to_string(), "switch.preview.v1".to_string()]
         );
+    }
+}
+
+mod authorization_tests {
+    //! What a guardian mints, and what it tells the daemon.
+    //!
+    //! Driven through the real `Guardian` and a real `socketpair`, because the
+    //! property under test is "the daemon was actually told": a ledger that holds a
+    //! binding the peer never received would make every App attach fail with an
+    //! error nobody can act on.
+
+    use super::*;
+    use std::time::Duration;
+    use yi_agent_lifecycle::authorization::{
+        AuthorizationLedger, AuthorizationUpdate, LifelineHello,
+    };
+    use yi_agent_lifecycle::types::{ClientKind, LeaseMode, RuntimeScope};
+
+    fn scope(directory: &std::path::Path) -> RuntimeScope {
+        RuntimeScope {
+            key: directory.to_string_lossy().into_owned(),
+            runtime_dir: directory.to_path_buf(),
+            project_key: "/project".to_string(),
+            instance_home: directory.to_path_buf(),
+        }
+    }
+
+    fn artifact() -> ArtifactIdentity {
+        ArtifactIdentity {
+            build_id: "test-build".to_string(),
+            display_version: "0.0.0".to_string(),
+            executable: "/usr/bin/true".into(),
+            sha256: "00".to_string(),
+            schema_min: 1,
+            schema_max: 1,
+            handover_version: 1,
+            business_protocol_min: 1,
+            business_protocol_max: 1,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// A guardian wired to a daemon-shaped peer: the ledger and the lifeline are
+    /// installed exactly as `start_daemon` installs them, minus the process.
+    fn guardian_with_peer(
+        directory: &std::path::Path,
+        generation: &str,
+    ) -> (
+        Guardian,
+        std::os::unix::net::UnixStream,
+        AuthorizationLedger,
+    ) {
+        let mut guardian = Guardian::new(scope(directory), artifact(), generation.to_string());
+        let (guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ledger =
+            AuthorizationLedger::new(guardian.scope.key.clone(), guardian.generation.clone());
+        // A test that expects a frame must fail rather than hang when none comes:
+        // without this, a missing write looks like a stuck suite instead of a bug.
+        daemon_end
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        guardian.daemon_lifeline = Some(guardian_end);
+        guardian.authorizations = Some(ledger.clone());
+        // The daemon's half, with the same secret: what the real handshake delivers.
+        let verifier = AuthorizationLedger::verifier(
+            guardian.scope.key.clone(),
+            "daemon-1".to_string(),
+            ledger.generation_secret(),
+        );
+        (guardian, daemon_end, verifier)
+    }
+
+    #[test]
+    fn a_business_lease_mints_authority_and_tells_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
+        assert_eq!(authorization.client_run_id, "app-run-1");
+        assert_eq!(authorization.root_id, "/project");
+
+        // The frame really reached the peer, and it is the binding just minted.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        match update {
+            AuthorizationUpdate::Bind(bound) => assert_eq!(*bound, authorization),
+            other => panic!("expected a binding, got {other:?}"),
+        }
+    }
+
+    /// The lease mode is the security boundary, and it is enforced at the guardian,
+    /// not merely in the ledger.
+    #[test]
+    fn a_lease_only_observer_cannot_be_authorized() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "observer".to_string(),
+                ClientKind::App,
+                LeaseMode::LeaseOnly,
+                lease_now(),
+            )
+            .unwrap();
+
+        let error = guardian
+            .mint_root_capability(&grant, "/project")
+            .unwrap_err();
+        assert!(error.contains("never authorizes"), "{error}");
+        // Nothing was sent: an observer must not even cause a frame to appear.
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        use std::io::Read;
+        assert!(peer.read(&mut byte).is_err(), "no frame may be written");
+    }
+
+    /// A stale grant must be refused: the credential is what proves the caller
+    /// speaks for the client, and an old epoch no longer does.
+    #[test]
+    fn a_stale_grant_cannot_mint_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, _peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let mut grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        grant.credential = "not-the-credential".to_string();
+        assert!(guardian.mint_root_capability(&grant, "/project").is_err());
+    }
+
+    /// A guardian with no daemon has no generation to authorize in, and says so
+    /// rather than minting something nothing can honour.
+    #[test]
+    fn a_guardian_without_a_daemon_refuses_to_mint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut guardian = Guardian::new(
+            scope(directory.path()),
+            artifact(),
+            "guardian-1".to_string(),
+        );
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        let error = guardian
+            .mint_root_capability(&grant, "/project")
+            .unwrap_err();
+        assert!(error.contains("no generation"), "{error}");
+    }
+
+    /// Releasing a client must withdraw its authority on the wire, because that is
+    /// how the daemon learns to stop honouring it.
+    #[test]
+    fn a_release_withdraws_the_clients_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
+        // Drain the binding frame so the next read is the revocation.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+
+        guardian.revoke_client_authority("app-run-1");
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert_eq!(
+            update,
+            AuthorizationUpdate::RevokeClient {
+                client_run_id: "app-run-1".to_string()
+            }
+        );
+        // And locally, the capability no longer verifies.
+        let ledger = guardian.authorizations.as_ref().unwrap();
+        assert!(ledger.verify(&authorization).is_err());
+    }
+
+    /// The `Release` *request* is what withdraws authority, not just the method.
+    ///
+    /// Driven through `serve_control_connection` on a real socketpair, because the
+    /// wiring is the part that can silently go missing: a `revoke_client_authority`
+    /// that only tests itself would keep passing if the handler forgot to call it,
+    /// and the daemon would then keep honouring a departed App.
+    #[test]
+    fn a_release_request_withdraws_authority_over_the_wire() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, lifeline_peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        guardian.mint_root_capability(&grant, "/project").unwrap();
+        // Drain the binding so the next lifeline frame is the revocation.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &lifeline_peer).unwrap();
+        let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+
+        // A real control connection carrying the release.
+        let (mut client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        yi_agent_lifecycle::codec::write_frame(
+            &mut client_end,
+            &yi_agent_lifecycle::types::ControlRequest::Release { grant },
+        )
+        .unwrap();
+        serve_control_connection(&mut guardian, server_end);
+        // The answer is `ReleaseStarted`, so the shell's explain-why path stays
+        // available while teardown runs.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut client_end).unwrap();
+        let response: yi_agent_lifecycle::types::ControlResponse =
+            yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert!(
+            matches!(
+                response,
+                yi_agent_lifecycle::types::ControlResponse::ReleaseStarted { .. }
+            ),
+            "expected a release to be accepted, got {response:?}"
+        );
+
+        // And the daemon was told.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &lifeline_peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert_eq!(
+            update,
+            AuthorizationUpdate::RevokeClient {
+                client_run_id: "app-run-1".to_string()
+            }
+        );
+    }
+
+    /// Lease expiry is a client going silent; it ends authority for the same reason
+    /// a release does.
+    #[test]
+    fn an_expired_lease_withdraws_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, peer, _) = guardian_with_peer(directory.path(), "guardian-1");
+        let grant = guardian
+            .reclaimer_mut()
+            .register(
+                "app-run-1".to_string(),
+                ClientKind::App,
+                LeaseMode::Business,
+                lease_now(),
+            )
+            .unwrap();
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+
+        // 31 seconds later, with no heartbeat.
+        guardian.maintain(lease_now() + Duration::from_secs(31));
+
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert_eq!(
+            update,
+            AuthorizationUpdate::RevokeClient {
+                client_run_id: "app-run-1".to_string()
+            }
+        );
+        assert!(
+            guardian
+                .authorizations
+                .as_ref()
+                .unwrap()
+                .verify(&authorization)
+                .is_err()
+        );
+    }
+
+    /// The handshake itself: the secret in the greeting is what lets the daemon
+    /// verify, so it must be exactly the ledger's.
+    #[test]
+    fn the_greeting_carries_the_generation_secret() {
+        let ledger = AuthorizationLedger::new("/project", "daemon-1");
+        let hello = LifelineHello::new("/project", "daemon-1", ledger.generation_secret());
+        assert_eq!(hello.secret().unwrap(), ledger.generation_secret());
+        assert_eq!(hello.scope_key, "/project");
+        assert_eq!(hello.daemon_instance_id, "daemon-1");
+    }
+
+    #[test]
+    fn a_malformed_greeting_secret_is_refused() {
+        let mut hello = LifelineHello::new("/project", "daemon-1", [0u8; 32]);
+        hello.generation_secret = "abcd".to_string();
+        assert!(hello.secret().is_err());
+        hello.generation_secret = "zz".repeat(32);
+        assert!(hello.secret().is_err());
     }
 }

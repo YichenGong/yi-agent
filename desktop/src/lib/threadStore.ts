@@ -290,6 +290,17 @@ export class ThreadStore {
       // 无 thread 归属的全局错误归当前 thread。
       return this.current()?.session.apply(n) ?? false;
     }
+    if (
+      n.method === "side/changed" ||
+      n.method === "side/itemUpdated" ||
+      n.method === "side/turnCompleted" ||
+      n.method === "side/closed"
+    ) {
+      // 旁支通知按**父**会话路由(`parent_thread_id`),没有 `thread_id`。
+      // 旁支的侧栏与会话正文视图是后续任务的事,这里必须显式吞掉:掉进下面的
+      // 兜底分支会去读一个不存在的字段,把正文写进 `undefined` 这个假会话。
+      return false;
+    }
     const id = n.params.thread_id;
     const v = this.view(id);
     const visible = v.session.apply(n);

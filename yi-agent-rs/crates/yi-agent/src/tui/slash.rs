@@ -44,7 +44,6 @@ pub enum SlashCommand {
     Daemon,
     Mcp,
     Runtime,
-    Kanban,
     Plugins,
     RecoverRoot,
 }
@@ -78,7 +77,6 @@ impl SlashCommand {
             | Self::Compact
             | Self::Config
             | Self::Runtime
-            | Self::Kanban
             | Self::Plugins
             | Self::RecoverRoot => {
                 return None;
@@ -101,7 +99,6 @@ impl SlashCommand {
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
             SlashCommand::Runtime => "runtime",
-            SlashCommand::Kanban => "superpowers-kanban",
             SlashCommand::Plugins => "plugins",
             SlashCommand::RecoverRoot => "recover-root",
             // 其余变体都由上面的 `control_spec()` 提前返回。
@@ -123,7 +120,6 @@ impl SlashCommand {
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
-            SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
             SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
             SlashCommand::RecoverRoot => {
                 "恢复卡死的前台会话根（先预览影响，再确认；不可用时可查看状态）"
@@ -146,9 +142,6 @@ impl SlashCommand {
             // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some(
-                "[on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]",
-            ),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
             // `status <id>` reads a stored operation without preparing anything;
             // `<id>` alone starts the preview, and confirmation is a separate step
@@ -194,7 +187,6 @@ impl SlashCommand {
             SlashCommand::Daemon,
             SlashCommand::Mcp,
             SlashCommand::Runtime,
-            SlashCommand::Kanban,
             SlashCommand::Plugins,
             SlashCommand::RecoverRoot,
         ]
@@ -238,10 +230,6 @@ impl SlashCommand {
         if name == "?" {
             return Some(Self::Help);
         }
-        // `/kanban` 是过渡别名：老名字仍可解析，但规范名是 `/superpowers-kanban`。
-        if name == "kanban" {
-            return Some(Self::Kanban);
-        }
         if name == "plugins" {
             return Some(Self::Plugins);
         }
@@ -265,7 +253,20 @@ pub fn help_text(target: Option<&str>) -> String {
                     .unwrap_or_default(),
                 command.description()
             ),
-            None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+            None => match super::side::SIDE_HELP_ENTRIES.iter().find(|(usage, _)| {
+                let canonical = usage.split_whitespace().next().unwrap_or_default();
+                canonical == name
+                        // `/btw` 是 `/side` 的别名：帮助要能查到它，但目录里
+                        // 只保留规范名一行。
+                        || (canonical == super::side::SIDE_COMMAND
+                            && name == super::side::SIDE_ALIAS)
+            }) {
+                // 旁支命令不是 `SlashCommand`:它们在 `handle_key` 之前就被
+                // 拦截了（否则运行中敲 `/side` 会先打断父会话）。但 `/help`
+                // 必须能查到它们，否则用户只能靠猜。
+                Some((usage, description)) => format!("/{usage}\n{description}"),
+                None => format!("未知命令: /{name}\n使用 /help 查看可用命令。"),
+            },
         },
         None => {
             let mut text = String::from("可用命令:\n");
@@ -280,6 +281,10 @@ pub fn help_text(target: Option<&str>) -> String {
                     usage,
                     command.description()
                 ));
+            }
+            text.push_str("\n旁问:\n");
+            for (usage, description) in super::side::SIDE_HELP_ENTRIES {
+                text.push_str(&format!("  /{usage} {description}\n"));
             }
             text
         }
@@ -1201,30 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_kanban_name_still_resolves_to_the_command() {
-        assert_eq!(
-            SlashCommand::from_name("kanban"),
-            Some(SlashCommand::Kanban)
-        );
-        assert_eq!(
-            SlashCommand::from_name("superpowers-kanban"),
-            Some(SlashCommand::Kanban)
-        );
-    }
-
-    #[test]
-    fn kanban_is_a_known_slash_command_with_a_description() {
-        let command = SlashCommand::Kanban;
-        assert_eq!(command.name(), "superpowers-kanban");
-        assert!(
-            command.description().contains("Superpowers 看板"),
-            "{}",
-            command.description()
-        );
-        assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
-    }
-
-    #[test]
     fn plugins_is_a_known_command() {
         assert_eq!(
             SlashCommand::from_name("plugins"),
@@ -1278,7 +1259,36 @@ mod tests {
         assert_eq!(SlashCommand::Quit.unavailable_reason(), None);
         assert_eq!(SlashCommand::Cost.unavailable_reason(), None);
         assert_eq!(SlashCommand::Daemon.unavailable_reason(), None);
-        assert_eq!(SlashCommand::Kanban.unavailable_reason(), None);
+    }
+
+    #[test]
+    fn full_help_lists_side_commands_once_without_the_alias() {
+        let help = help_text(None);
+        assert!(help.contains("/side [问题]"), "目录必须列出 /side：{help}");
+        assert!(help.contains("/back"), "目录必须列出 /back：{help}");
+        assert!(
+            help.contains("/side-close"),
+            "目录必须列出 /side-close：{help}"
+        );
+        // btw 只作为别名出现在 /side 的描述里，不能自己占一行。
+        assert!(!help.contains("  /btw"), "别名不能作为独立条目出现：{help}");
+        assert_eq!(
+            help.lines()
+                .filter(|line| line.starts_with("  /side ["))
+                .count(),
+            1,
+            "规范名只列一次：{help}"
+        );
+    }
+
+    #[test]
+    fn contextual_help_resolves_side_commands_but_not_the_alias_entry() {
+        assert!(help_text(Some("side")).contains("/side [问题]"));
+        assert!(help_text(Some("back")).contains("返回主会话"));
+        assert!(help_text(Some("side-close")).contains("关闭当前旁问"));
+        // `/btw` 是别名：查它应给出 /side 的说明，而不是「未知命令」。
+        let btw = help_text(Some("btw"));
+        assert!(btw.contains("/side [问题]"), "{btw}");
     }
 
     #[test]
@@ -1367,9 +1377,8 @@ mod tests {
             }
         }
 
-        /// 别名也要收敛：`from_name("kanban")` 得到 `Kanban`，
-        /// 而 `Kanban.name()` 是 "superpowers-kanban"（`:89` 的 `name()` 实现）。
-        /// 这条保证「用户输入别名」与「用规范名再解析」指向同一命令。
+        /// 规范名必须收敛：任何能被解析出来的名字，用它的 `name()` 再解析
+        /// 必须回到同一个命令。这条保证补全、帮助与分发认的是同一份目录。
         #[test]
         fn prop_aliases_converge(name in "\\PC{0,60}") {
             let Some(first) = SlashCommand::from_name(&name) else { return Ok(()) };

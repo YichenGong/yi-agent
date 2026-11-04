@@ -21,9 +21,21 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 dirs = "5"
+# Side conversations: shared primitives only, aligned with the versions the
+# crates that already use them declare (there is no workspace entry for these).
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true
+base64 = "0.22"
+sha2 = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The side tests mock `Provider`/`Tool`, whose traits are `#[async_trait]`.
+async-trait = "0.1"
+# `start_paused` / `advance` for the 30-minute idle-deadline test.
+tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 # 仅测试用:借助 ValueEnum 枚举 SandboxMode 的全部变体,给手写解析加编译器守卫。
 # 生产依赖里绝不能出现 clap。

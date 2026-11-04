@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "source": "docs/superpowers/specs/2026-11-02-kanban-independent-release-design.md §13",
+  "note": "A01–A20 的权威定义。验收报告必须为这里每一条给出且只给出一个最终结果；本文件是唯一真相，报告里出现未知 ID 或漏掉任何一条都判失败。",
+  "cases": [
+    {
+      "id": "A01",
+      "title": "干净主程序发布物不含看板业务 UI、程序、skill 或专属入口；核心聊天正常",
+      "layer": "artifact + desktop regression",
+      "requires": ["command"],
+      "why": "主程序包若仍打包看板资源，「独立发布」就没有意义。"
+    },
+    {
+      "id": "A02",
+      "title": "安装签名包后由清单创建入口，无插件 ID 硬编码分支；安装不运行业务代码、不启动任务/常驻",
+      "layer": "install integration",
+      "requires": ["command"],
+      "why": "入口必须来自清单，否则第二个插件无法通用；安装期执行插件代码是越权。"
+    },
+    {
+      "id": "A03",
+      "title": "同一应用包下更新看板 UI，主程序摘要不变，UI/程序/skill 摘要及版本匹配",
+      "layer": "release e2e",
+      "requires": ["command", "artifact"],
+      "why": "摘要不变是可验证的事实，不能只看「版本号不同」。"
+    },
+    {
+      "id": "A04",
+      "title": "无用户 PATH、含空格/非 ASCII 的安装路径、worktree 会话、恢复会话都调用正确托管版本与项目",
+      "layer": "cli/session integration",
+      "requires": ["command"],
+      "why": "托管版本解析错误会静默跑错二进制。"
+    },
+    {
+      "id": "A05",
+      "title": "未授权、能力增加未重批、仓库伪造清单/开关、错误宿主/项目/代次不能启动托管任务",
+      "layer": "authorization",
+      "requires": ["command"],
+      "why": "全部是拒绝路径，必须证明拒绝而不是「没观察到问题」。"
+    },
+    {
+      "id": "A06",
+      "title": "同名 skill、缺上游工作流、缓存未刷新均明确诊断，不误启任务、不覆盖用户文件",
+      "layer": "skill integration",
+      "requires": ["command"],
+      "why": "诊断缺失会让用户以为插件坏了，覆盖用户文件是数据损失。"
+    },
+    {
+      "id": "A07",
+      "title": "插件不能读宿主 DOM/存储、直接 invoke、跨包/版本读资源、跨 frame 冒领、重放初始化或外送数据",
+      "layer": "webview security",
+      "requires": ["command"],
+      "why": "隔离是被攻击验证的，不是被设计声明验证的。"
+    },
+    {
+      "id": "A08",
+      "title": "iframe 焦点、中文输入、滚动、主题与尺寸正常；异常/阻塞脚本/大量分配故障下原生侧可恢复容器与核心交互，会话持久化不受损，滥发消息被限流",
+      "layer": "webview fault injection",
+      "requires": ["command"],
+      "why": "插件崩坏不得拖垮核心交互。"
+    },
+    {
+      "id": "A09",
+      "title": "错签/撤回/回放/过期元数据、错误平台/API、链接/穿越/碰撞/炸弹包和磁盘不足在执行前被拒绝",
+      "layer": "package + trust",
+      "requires": ["command"],
+      "why": "拒绝必须发生在执行之前，事后崩溃不算通过。"
+    },
+    {
+      "id": "A10",
+      "title": "多项目、多客户端、CLI/driver 并发更新不会启动新任务或混版本；已有回合可继续状态报告/释放锁，候选服务不被公共访问，已有回合/合并不被打断",
+      "layer": "lifecycle concurrency",
+      "requires": ["command"],
+      "why": "并发下混版本是最难事后发现的故障。"
+    },
+    {
+      "id": "A11",
+      "title": "队列非空但无活跃回合可更新，等待审批的回合仍被识别；等待超时/取消恢复旧准入；活跃任务需用户显式取消",
+      "layer": "scheduling",
+      "requires": ["command"],
+      "why": "更新不得静默杀掉正在跑的模型执行。"
+    },
+    {
+      "id": "A12",
+      "title": "每个事务阶段崩溃后可恢复；supervisor/watchman 不抢跑；迁移失败不半开新版本",
+      "layer": "fault injection",
+      "requires": ["command"],
+      "why": "半开状态会让两代程序同时写同一份数据。"
+    },
+    {
+      "id": "A13",
+      "title": "多项目迁移与回退覆盖全部数据；共享配置修订冲突不覆盖其他实例更新；无法恢复时关闭执行",
+      "layer": "migration",
+      "requires": ["command"],
+      "why": "回退必须真的能回去，否则迁移是单程票。"
+    },
+    {
+      "id": "A14",
+      "title": "实例私有包/授权/会话隔离；单项目授权代次变更不误伤其他项目；整机配额共享且格式兼容，不兼容迁移拒绝；同项目维护/运行所有权互斥",
+      "layer": "multi-instance",
+      "requires": ["command"],
+      "why": "隔离与配额是整机共享资源上最容易互相踩踏的两处。"
+    },
+    {
+      "id": "A15",
+      "title": "断线/超时/重载不重放写请求；结果未知可查询；项目切换不把旧写落入新项目",
+      "layer": "bridge idempotency",
+      "requires": ["command"],
+      "why": "重放写请求会造成重复投递，跨项目落地是数据污染。"
+    },
+    {
+      "id": "A16",
+      "title": "远程 UI 精确匹配宿主发布包，两端兼容各自检查，独立签名验证；本地不运行远端程序",
+      "layer": "dual-host desktop e2e",
+      "requires": ["command", "remote"],
+      "why": "跨机器行为不能用 loopback 证明，必须有真实远端身份。"
+    },
+    {
+      "id": "A17",
+      "title": "远端切换、失联、离线缓存、过期客户端及重连不复用旧绑定；headless 更新可用，旧桌面不永久阻塞更新，离线重启已验证版本不误当新安装",
+      "layer": "remote fault injection",
+      "requires": ["command", "remote"],
+      "why": "同上：无真实远端证据时本条必须保持未完成。"
+    },
+    {
+      "id": "A18",
+      "title": "旧安装接管保留业务关联、不复制配额池、不覆盖用户文件、不并跑新旧服务；旧 RPC 不能绕过",
+      "layer": "upgrade migration",
+      "requires": ["command"],
+      "why": "接管最容易变成两个服务同时跑。"
+    },
+    {
+      "id": "A19",
+      "title": "停用/卸载等待活跃操作，保留默认数据；项目不可达明确待清理；不误删共享资源",
+      "layer": "lifecycle e2e",
+      "requires": ["command"],
+      "why": "卸载删除用户数据是不可逆伤害。"
+    },
+    {
+      "id": "A20",
+      "title": "实际下载的原生程序满足目标 OS 运行策略，不要求用户关闭系统安全机制；插件故障不影响核心功能",
+      "layer": "release platform e2e",
+      "requires": ["command", "official"],
+      "why": "未经官方签名/公证的包不能代表真实下载后的执行策略。"
+    }
+  ]
+}

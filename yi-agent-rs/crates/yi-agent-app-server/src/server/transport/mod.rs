@@ -110,6 +110,8 @@ where
         onboarding_preferences_path,
         resident_dir,
         skills_home,
+        instance_home,
+        plugin_catalog,
         remote_dir,
         theme,
         git_diff,
@@ -123,11 +125,49 @@ where
         lead_replies,
         lead_control,
         lead_control_replies,
+        // 旁支注册表:注入优先(测试),否则本函数自建(生产)。
+        side_registry,
         // 结论由装配方算好：生产走 `from_process_environment`，测试直接给值。
         // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
     } = attachments;
+    // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
+    // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
+    let plugin_home = instance_home.clone();
+    // 旁支注册表:一个进程一份。注入的那份(测试)已经带好替身 resolver;生产
+    // 在这里自建,resolver 用「按 threadId 定位 store 后严格冷读」那条路径。
+    let side_registry = match side_registry {
+        Some(registry) => registry,
+        None => {
+            let pool = std::sync::Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
+            let resources =
+                // 实例状态根:与 `remote.json` 同一处,旁支目录落在它下面的
+                // `side-conversations/`。
+                yi_agent_runtime::side_conversation::SideHostResources::new(
+                    remote_dir.clone(),
+                    std::sync::Arc::clone(&pool),
+                )
+                .map_err(|error| anyhow::anyhow!("无法初始化旁支资源: {error}"))?;
+            let resolver = std::sync::Arc::new(crate::side_conversation::WorkspaceResolver::new(
+                std::sync::Arc::clone(&workspaces),
+                cfg.clone(),
+            ));
+            Arc::new(crate::side_conversation::SideRegistry::new(
+                resolver, resources, pool,
+            ))
+        }
+    };
+    // 旁支后台任务的统一持有者:宿主退出时 `abort_all()`,不让创建/关闭任务
+    // 活过 server。
+    let mut side_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // 旁支分页快照:一个宿主一份。连接断开时摘掉它的 token(见读循环的错误臂),
+    // 关闭 side 时由注册表撤销(见 `close`)。两侧共用同一份,否则「关闭即失效」
+    // 只会作用于其中一边。
+    let side_replay = crate::side_conversation::shared_replay_store();
+    side_registry.attach_replay(side_replay.clone()).await;
+    side_registry.attach_hub(Arc::clone(&hub));
+
     // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
     // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
     let probes = crate::model_rpc::ProbeRegistry::default();
@@ -313,6 +353,9 @@ where
                             return Err(e);
                         }
                         hub.unregister(&client);
+                        // 该连接的快照 token 随之作废:没人能再续页,继续钉住
+                        // item 只会白占宿主 128 MiB 额度。
+                        side_replay.lock().await.release_connection(client.as_str());
                         continue;
                     }
                 };
@@ -491,6 +534,9 @@ where
                             pending_lead_replies: &mut pending_lead_replies,
                             remote_dir: &remote_dir,
                             relay_url: relay_url.as_deref(),
+                            side_registry: &side_registry,
+                            side_tasks: &mut side_tasks,
+                            side_replay: &side_replay,
                         }
                     };
                 }
@@ -524,9 +570,12 @@ where
                         let state = std::sync::Arc::new(crate::rpc::PluginChannelState {
                             hub: std::sync::Arc::clone(&hub),
                             client: client.clone(),
+                            client_scope,
                             resident_dir: resident_dir.clone(),
                             theme_handle: theme_handle.clone(),
                             watchman_home: watchman_home.clone(),
+                            plugin_home: plugin_home.clone(),
+                            plugin_catalog: plugin_catalog.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
@@ -569,6 +618,7 @@ where
                     crate::rpc::Domain::Mcp => dispatch_domain!(crate::rpc::mcp::handle),
                     crate::rpc::Domain::WebSearch => dispatch_domain!(crate::rpc::websearch::handle),
                     crate::rpc::Domain::Thread => dispatch_domain!(crate::rpc::thread::handle),
+                    crate::rpc::Domain::Side => dispatch_domain!(crate::rpc::side::handle),
                     // 所有域都已有自己的模块:只有 `Domain::Unknown`(即 `initialize`
                     // 与未识别前缀)会落到这里,再走原始 dispatch。
                     // `Domain` 已是穷尽匹配,这里必须显式写出唯一剩下的变体 —— 用
@@ -591,6 +641,20 @@ where
                             let is_local = client == crate::broadcast::ClientId::local();
                             match authorization.accept(is_local) {
                                 Ok(authorization) => {
+                                    // Hand the attach path what the shell authorized.
+                                    // The app-server speaks for one App run, so the
+                                    // set is replaced rather than merged: an older
+                                    // generation's capabilities must stop working the
+                                    // moment a new handshake arrives.
+                                    yi_agent_subagent::attach::install_root_capabilities(
+                                        authorization
+                                            .root_authorizations
+                                            .iter()
+                                            .map(|root| {
+                                                (root.root_id.clone(), root.capability.clone())
+                                            })
+                                            .collect(),
+                                    );
                                     shell_authorizations
                                         .lock()
                                         .await
@@ -650,17 +714,26 @@ where
                                 })
                             })
                             .collect();
-                        // The handshake answers with the identity it accepted, so
-                        // "the shell was recognised" is an observable fact rather
-                        // than an internal write. A rejected or absent field is
-                        // simply omitted -- the CLI's normal shape is unchanged.
+                        // 两边都改了这一帧，必须合并语义而不是二选一：
+                        // - 本分支要通告旁支能力位与宿主 id（三端靠它决定是否
+                        //   显示入口、靠 host id 判断「重连」还是「宿主换代」）；
+                        // - main 要回答它刚认可的 shell 身份，让「shell 被识别」
+                        //   成为可观测事实；被拒或没有该字段时就不出现，CLI 的
+                        //   正常形状保持不变。
                         let mut response = json!({
                             "serverInfo": {
                                 "name": "yi-agent-app-server",
                                 "version": env!("CARGO_PKG_VERSION"),
                             },
                             "protocolVersion": PROTOCOL_VERSION,
-                            "capabilities": {},
+                            // 旁支能力位与宿主 id 出自同一份宿主 resources:
+                            // 同一个进程的所有连接(stdio、直连 ws、经 relay)
+                            // 必须看到同一个 id,否则客户端会把「重连」当成
+                            // 「宿主换代」而丢掉本地基线。
+                            "capabilities": {
+                                "side_conversation_v1": crate::protocol::SIDE_CONVERSATION_V1,
+                            },
+                            "sideHostInstanceId": side_registry.host_instance_id(),
                             "syncPlan": sync_plan,
                         });
                         if let Some(shell) = accepted_shell {
@@ -696,6 +769,19 @@ where
                         &mut pending_lead_replies,
                         &lead_replies,
                     );
+                }
+            }
+            // 旁支后台任务必须在这里被**轮询**才真的跑:`JoinSet` 的 task 只在
+            // 集合被 poll 时推进(它持有 spawn 出去的 future)。丢掉这一臂,所有
+            // `side/open` 都会永远挂着不回。`if !is_empty()` 让集合空时该 future
+            // 不参与竞争,省掉每轮一次的空转。
+            Some(joined) = side_tasks.join_next(), if !side_tasks.is_empty() => {
+                // 任务自己负责把结果/错误写回客户端(`SideResponseSender`),这里
+                // 只剩「panic 也要留个痕」——静默吞掉 join 错误会让一个每次都
+                // panic 的处理路径看起来只是「客户端没收到回复」。
+                if let Err(error) = joined
+                    && error.is_panic() {
+                    eprintln!("[app-server] side task panicked: {error}");
                 }
             }
             Some(error) = fatal_rx.recv() => return Err(error),
@@ -757,6 +843,7 @@ where
                     &lead_control,
                     &lead_control_replies,
                     lead_agent_enabled,
+                    &instance_home,
                 )
                 .await;
 
@@ -833,6 +920,11 @@ where
                         lead_control: &lead_control,
                         lead_control_replies: &lead_control_replies,
                         lead_target: Some(delivery.lead),
+                        // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                        session_binding: None,
+                        admission: None,
+                        instance_home: None,
+                        driver_gate: None,
                         #[cfg(test)]
                         before_prompt_send: None,
                     };
@@ -890,6 +982,11 @@ where
                     lead_control: &lead_control,
                     lead_control_replies: &lead_control_replies,
                     lead_target: Some(target),
+                    // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                    session_binding: None,
+                    admission: None,
+                    instance_home: None,
+                    driver_gate: None,
                     #[cfg(test)]
                     before_prompt_send: None,
                 };
@@ -938,6 +1035,11 @@ where
                     lead_control_replies: &lead_control_replies,
                     // 写指令不投递给组长，故没有 lead target。
                     lead_target: None,
+                    // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                    session_binding: None,
+                    admission: None,
+                    instance_home: None,
+                    driver_gate: None,
                     #[cfg(test)]
                     before_prompt_send: None,
                 };
@@ -959,6 +1061,12 @@ where
     // 见 `power_guard::sleep_until_stop`），不会拖慢退出。
     drop(power_guard);
     drop(busy_sampler);
+
+    // 旁支收口:先掐掉还在跑的创建/关闭任务,再让注册表把各 runner 停干净
+    // (它要等核心任务真正 quiescent,所以必须 await)。放在 detached runtime
+    // 之前:runner 里的工具可能还握着项目 root 的资源。
+    side_tasks.abort_all();
+    side_registry.shutdown().await;
 
     // 进程退出前断开所有项目 root。同步调用:已经不在热路径上,而进程即将结束。
     for binding in attached_runtimes(&runtimes) {

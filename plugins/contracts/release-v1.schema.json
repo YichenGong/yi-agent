@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/release-v1.schema.json",
+  "title": "Signed plugin release envelope v1",
+  "description": "Release metadata plus the exact bytes that were signed. `payloadB64` is carried rather than re-derived so a verifier checks the signer's bytes, not its own reconstruction of them; a disagreement between the payload and the `release` fields is itself an integrity failure.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "keyId", "release", "payloadB64", "signature"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "keyId": {
+      "type": "string",
+      "pattern": "^root-[a-z0-9-]{3,63}$",
+      "description": "Signing key. Must be in the trust set; the package never chooses its own verifier key."
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plugin", "version", "target", "sha256", "sizeBytes", "hostApi", "serial", "publishedAt", "expiresAt"],
+      "description": "Every field here is inside the signature. Design section 5 requires the signature to bind id, version, platform, digest, size, compatibility range and release serial.",
+      "properties": {
+        "plugin": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+        "target": { "type": "string", "pattern": "^(darwin|linux|win32)-(aarch64|x86_64)$" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+        "hostApi": { "type": "string", "pattern": "^v[0-9]+$" },
+        "serial": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonic release serial per plugin. A serial below the accepted one is a replay or an unauthorized downgrade and is refused."
+        },
+        "publishedAt": { "type": "integer", "minimum": 0 },
+        "expiresAt": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "payloadB64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+      "description": "The exact canonical payload bytes that were signed, standard base64."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    }
+  }
+}

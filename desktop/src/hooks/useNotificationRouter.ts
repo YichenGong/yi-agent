@@ -8,6 +8,12 @@ import type { useProcessState } from "./useProcessState";
 import type { SubagentRailStore } from "../lib/subagents";
 import { SubscriptionWindow } from "../lib/subscriptionWindow";
 import { ownsThreadView } from "../lib/slotRouting";
+import {
+  SideConversationRouter,
+  isSideNotification,
+  type SideConversationStore,
+} from "../lib/sideConversation";
+import type { SideNotification } from "../lib/sideConversation";
 import { parseTheme } from "../lib/theme";
 import { notifyModelCapabilitiesChanged } from "../lib/modelCapabilitiesBus";
 import type { ReasoningCapabilities } from "../lib/models";
@@ -52,7 +58,7 @@ export interface NotificationRouterDeps {
   force: (updater: (v: number) => number) => void;
   markThreadRead: (id: string) => void;
   schedulePersist: (id: string) => void;
-  selectThread: (id: string, opts?: { leaveBoard?: boolean }) => Promise<void>;
+  selectThread: (id: string, opts?: { forceResume?: boolean }) => Promise<void>;
   /**
    * 该 thread 收到了活动（任意帧），用来给 resume 的停滞检测续命。
    * 只在 `ownsThreadView` 判定之后调用——非活动槽位的帧不写本视图，用它们
@@ -61,6 +67,21 @@ export interface NotificationRouterDeps {
   notifySyncActivity: (threadId: string) => void;
   disposed: boolean;
   scheduleReconnect: () => void;
+  /**
+   * 旁支的视图 store 与路由。
+   *
+   * 传进来的必须是**这一个 effect** 建的那一份：绑定按连接身份记，换了 effect
+   * 就意味着换了一轮连接。缺省不给会让旁支帧被静默丢弃，所以它是必填的。
+   */
+  sideStore: SideConversationStore;
+  /**
+   * 把一帧旁支通知交给对账控制器。
+   *
+   * 为什么不直接 `sideStore.apply`：帧必须与**分页快照**对齐（连续 seq、
+   * 缺号重对账、缓存上限）。直接写 store 会得到一份「看起来合理、实际缺了
+   * 一段」的正文，而这正是旁支最难被用户描述的那类故障。
+   */
+  acceptSideNotification: (client: RpcClient, slot: Slot, n: SideNotification) => void;
 }
 
 export function createNotificationRouter(deps: NotificationRouterDeps) {
@@ -83,10 +104,30 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
     schedulePersist,
     disposed,
     scheduleReconnect,
+    sideStore,
+    acceptSideNotification,
   } = deps;
+
+  const sideRouter = new SideConversationRouter(sideStore);
 
   return (client: RpcClient, slot: Slot = LOCAL_SLOT) => {
       client.onNotification((n) => {
+        // 旁支帧先按**连接身份**路由，再做视图归属判定。
+        //
+        // 顺序反了会有具体后果：`ownsThreadView` 只让活动槽位写视图，而旁支
+        // 的归属是「哪条连接送的」。先判归属会把非活动槽位上的旁支帧整条丢掉，
+        // 用户切回那个项目时看到的是一份停住的旧视图——而这条连接明明还活着。
+        //
+        // `side/*` 分支必须**立即 return**：这些帧不属于任何普通会话，喂给
+        // `ThreadStore.applyNotification` 会把它当成未知帧而静默无效果，更糟
+        // 的是后续的 `schedulePersist` / `markThreadRead` 会把旁支活动记账到
+        // 父会话上（父的未读点、内容落盘都被旁支污染）。
+        if (isSideNotification(n)) {
+          const binding = sideRouter.bindingFor(client, slot);
+          // 未握手时没有任何绑定：帧无处可归，丢弃而不是猜一条「当前连接」。
+          if (binding) acceptSideNotification(client, slot, n);
+          return;
+        }
         // 非活动槽位（别的远端项目、或本地而用户正看远端）的通知**不写**本视图。
         //
         // spec §4.6 判据 17：A 项目跑一个多步任务时，B 项目的会话视图里不得
@@ -293,6 +334,7 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
           // `app-server://message` 是全局事件名，宿主拉起新侧车后，陈旧监听照样
           // 会收到新进程的帧——不摘掉就会与重连后的新客户端各应用一遍（逐字流
           // 重复，直到 item/completed 按 id 整条替换才"收敛"）。
+          sideRouter.disconnected(sideRouter.bindingFor(client, slot));
           client.dispose();
           // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
           // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。

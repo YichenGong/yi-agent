@@ -8,7 +8,7 @@ import { formatError } from "../lib/errorMessage";
 import { parseSyncPlan } from "../lib/syncPlan";
 import { parseTheme } from "../lib/theme";
 import { parseFontScale } from "../lib/fontScale";
-import { watchmanFromSettings } from "../lib/superpowersKanbanSwitch";
+import { watchmanFromSettings } from "../lib/watchman";
 import { resolveTagNames } from "../lib/threadTags";
 import { onboardingStatus } from "../lib/onboarding";
 import { readSelectedThread } from "../lib/selectedThread";
@@ -16,18 +16,21 @@ import { writeListCache } from "../lib/sessionCache";
 import { clearConnectionErrorFrom } from "../lib/connectionError";
 import type { useSettingsState } from "./useSettingsState";
 import type { useSessionState } from "./useSessionState";
-import type { useBoardState } from "./useBoardState";
+import {
+  parseSideHandshake,
+  type SideConversationStore,
+} from "../lib/sideConversation";
+import { storedRemoteConfig } from "../lib/remoteConfig";
 
 type SettingsState = ReturnType<typeof useSettingsState>;
 type SessionState = ReturnType<typeof useSessionState>;
-type BoardState = ReturnType<typeof useBoardState>;
 
 /**
  * 一次完整握手的**全部**逻辑（原 `App.tsx` 巨型 effect 内 `handshake`，
  * 221 行，L1948–L2170）。每次重连都要重放它，因为新进程的记忆是空的。
  *
  * 与 `useNotificationRouter` 同样做成「工厂」而非 hook，理由见那里的说明：
- * 原闭包捕获的是 effect 运行那一帧的 `sess`/`prefs`/`board`，改成 hook 会
+ * 原闭包捕获的是 effect 运行那一帧的 `sess`/`prefs`，改成 hook 会
  * 改变取值时机；做成工厂则由调用方在 effect 里现建，依赖由参数显式传入。
  */
 export interface HandshakeRecoveryDeps {
@@ -38,7 +41,6 @@ export interface HandshakeRecoveryDeps {
   leadEnsured: React.MutableRefObject<boolean>;
   sess: SessionState;
   prefs: SettingsState;
-  board: BoardState;
   store: ThreadStore;
   isMobile: boolean;
   setStatus: (v: string) => void;
@@ -46,14 +48,18 @@ export interface HandshakeRecoveryDeps {
   setCurrentError: (msg: string) => void;
   setBuildKind: (v: "dev" | "nogit" | "release") => void;
   setLeadAgentEnabled: (v: boolean) => void;
-  setKanbanEnabled: (v: boolean) => void;
+  /** 用户是否已拨过后台值守开关；拨过就不再被迟到的 read 覆盖。 */
+  watchmanTouchedRef: React.MutableRefObject<boolean>;
+  setWatchmanEnabled: (v: boolean) => void;
   force: (updater: (v: number) => number) => void;
-  selectThread: (id: string, opts?: { leaveBoard?: boolean }) => Promise<void>;
+  selectThread: (id: string, opts?: { forceResume?: boolean }) => Promise<void>;
   connectRemoteTargets: (client: RpcClient) => Promise<void>;
   scheduleReconnect: () => void;
   /** 退避计数清零（握手成功即复位）。 */
   resetAttempt: () => void;
   buildResumeHints: () => unknown;
+  /** 旁支绑定登记处。每条连接各自解析能力与宿主 id，不借 globalReader。 */
+  sideStore: SideConversationStore;
 }
 
 export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
@@ -65,7 +71,6 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
     leadEnsured,
     sess,
     prefs,
-    board,
     store,
     isMobile,
     setStatus,
@@ -73,13 +78,15 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
     setCurrentError,
     setBuildKind,
     setLeadAgentEnabled,
-    setKanbanEnabled,
+    watchmanTouchedRef,
+    setWatchmanEnabled,
     force,
     selectThread,
     connectRemoteTargets,
     scheduleReconnect,
     resetAttempt,
     buildResumeHints,
+    sideStore,
   } = deps;
 
   return async (client: RpcClient) => {
@@ -91,6 +98,19 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
           },
         );
         syncPlanRef.current = parseSyncPlan(initialized);
+        // 旁支能力与宿主身份必须按**这条连接**解析（spec §8.1）：本地和每个远端
+        // 项目各跑一个 app-server，它们各自的能力位与随机宿主 id 互不相干。借
+        // `globalReader`（永远本地）的答案，会让一台还没升级的远端项目看起来
+        // 「支持旁支」，点下去每一条请求都是 method not found。
+        //
+        // scope 取持久化的配对结果：远端设备的能力由 token 决定，本地 stdio
+        // 连接始终是 Admin。缺省按 control（与配对协议一致）。
+        const slot = activeSlotRef.current;
+        const scope = isRemoteClient()
+          ? (storedRemoteConfig(localStorage)?.scope ?? "control")
+          : "admin";
+        const sideBinding = parseSideHandshake(slot, client, initialized, scope);
+        if (sideBinding) sideStore.bind(sideBinding);
         // 构建类型只在 dev 上开放「实验功能」；读失败按 release 处理（fail-closed，
         // 与 Rust 侧的硬闸同一口径），不让面板因为一次网络抖动冒出来。
         // 全局只读一律问**本地**槽位（spec §5.2）：远端跑的是它自己的二进制，
@@ -112,24 +132,16 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
         // 局部量而不是直接读 state：`setLeadAgentEnabled` 要下一次渲染才生效，
         // 而本函数后面的补建循环就在**这一轮**里跑，读 state 拿到的还是 `null`。
         let leadOn = false;
-        // 同一份 `flags/list` 里就有看板开关，不再多发请求。
-        let kanbanOn = false;
         try {
           const flags = await globalReader.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
           }>("flags/list", {});
           const lead = (flags.flags ?? []).find((f) => f.name === "lead_agent");
           leadOn = lead?.enabled === true;
-          const kanban = (flags.flags ?? []).find(
-            (f) => f.name === "superpowers_kanban",
-          );
-          kanbanOn = kanban?.enabled === true;
         } catch {
           leadOn = false;
-          kanbanOn = false;
         }
         setLeadAgentEnabled(leadOn);
-        setKanbanEnabled(kanbanOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -163,11 +175,11 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
         );
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
         // `ui/settings/read`。读序（新名优先、旧名兜底）与缺省口径都在
-        // `watchmanFromSettings` 里，与 readBoardWatchman 共用同一份实现。
+        // `watchmanFromSettings` 里，与 `readWatchman` 共用同一份实现。
         // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
         // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
-        if (!board.watchmanTouchedRef.current) {
-          board.setWatchmanEnabled(
+        if (!watchmanTouchedRef.current) {
+          setWatchmanEnabled(
             watchmanFromSettings(settings as Record<string, unknown>),
           );
         }
@@ -271,11 +283,11 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
             g.threads.some((t) => t.thread_id === keptId),
           );
         if (kept) {
-          await selectThread(keptId!, { leaveBoard: false });
+          await selectThread(keptId!);
         } else {
           const first =
             (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-          if (first) await selectThread(first.thread_id, { leaveBoard: false });
+          if (first) await selectThread(first.thread_id);
         }
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
@@ -292,10 +304,6 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
         prefs.repairDismissedRef.current = false;
-        // 看板登记表要等握手完成后再拉：`resident/list` 是普通请求，服务端在
-        // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
-        // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
-        await board.refreshBoards();
       } catch (e) {
         const msg = formatError(e);
         setCurrentError(msg);

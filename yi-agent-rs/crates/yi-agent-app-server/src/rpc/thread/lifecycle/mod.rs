@@ -163,6 +163,8 @@ pub(crate) async fn handle(
                 Some(state.lead_agent_enabled),
                 // RPC 起的会话没有驱动方句柄，不额外注入环境变量。
                 Vec::new(),
+                // RPC 起的会话不绑插件（绑定由驱动方按已提交激活算好传入）。
+                Vec::new(),
             )
             .await?;
 

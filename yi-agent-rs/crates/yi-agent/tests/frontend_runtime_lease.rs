@@ -655,3 +655,134 @@ impl Drop for PtyTerminal {
         unsafe { libc::close(self.master) };
     }
 }
+
+/// A model that asks for one `bash` call, then ends the turn after seeing its
+/// result. Enough to force the real tool path without a real provider.
+fn spawn_tool_calling_gateway(
+    listener: TcpListener,
+    command: String,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = vec![0u8; 65536];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let body = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let request_line = body.lines().next().unwrap_or("");
+            if request_line.contains("/responses") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let saw_tool_result =
+                body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\"");
+            let frames = if saw_tool_result {
+                vec![
+                    r#"{"choices":[{"delta":{"content":"done"}}]}"#.to_string(),
+                    r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#.to_string(),
+                ]
+            } else {
+                let args = serde_json::json!({ "command": command, "timeout": 60 }).to_string();
+                vec![
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":""}}]}}]}"#
+                        .to_string(),
+                    format!(
+                        r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":{}}}}}]}}}}]}}"#,
+                        serde_json::to_string(&args).unwrap()
+                    ),
+                    r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#.to_string(),
+                ]
+            };
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for frame in frames {
+                out.push_str(&format!("data: {frame}\n\n"));
+            }
+            out.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(out.as_bytes());
+            let _ = stream.flush();
+        }
+    })
+}
+
+/// The process journal the guardian writes, read as the same type it writes.
+fn journal_records(runtime_dir: &Path) -> Vec<serde_json::Value> {
+    let path = runtime_dir.join(yi_agent_supervisors::lifecycle::guardian::JOURNAL_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("process journal {} is unreadable: {error}", path.display()))
+}
+
+/// A headless run's tool processes are owned by *that run*, not by nobody.
+///
+/// This is the end of the wiring the plan calls Task 8 Step 3: a real `bash` call
+/// must reach the guardian's registry through the private channel the run opened
+/// for itself. Two things could silently be untrue and this test is what catches
+/// both: the tool set built without a managed owner (tools spawn directly, the
+/// journal stays empty), and a channel bound to the wrong owner (the journal has a
+/// `daemon` or plugin owner instead of this run's client id).
+#[test]
+fn a_headless_runs_tool_processes_are_owned_by_that_run() {
+    let fixture = Fixture::new();
+    let _guardian = GuardianFixture::start(&fixture);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock gateway");
+    let port = listener.local_addr().unwrap().port();
+    let marker = fixture.workdir.join("managed-channel-marker.txt");
+    let _gateway = spawn_tool_calling_gateway(
+        listener,
+        format!("printf managed-channel-ok > {}", marker.display()),
+    );
+
+    let output = headless_command(&fixture, port, "run the command")
+        .output()
+        .expect("run yi-agent");
+    assert!(
+        output.status.success(),
+        "the run must finish cleanly: stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The bash call really executed, otherwise an empty journal would only mean the
+    // model never asked for a tool. The marker is the tool's own side effect, which
+    // a headless run does not echo to stdout.
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "managed-channel-ok",
+        "the bash tool did not run; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let records = journal_records(&fixture.runtime_dir);
+    let owner = records
+        .iter()
+        .find_map(|record| record.get("owner").cloned())
+        .unwrap_or_else(|| {
+            panic!(
+                "the run's tool process never reached the guardian's journal: {}",
+                std::fs::read_to_string(
+                    fixture
+                        .runtime_dir
+                        .join(yi_agent_supervisors::lifecycle::guardian::JOURNAL_FILE)
+                )
+                .unwrap_or_else(|_| "<no journal>".to_string())
+            )
+        });
+    let owner_text = serde_json::to_string(&owner).unwrap();
+    assert!(
+        owner_text.contains("\"frontend\""),
+        "a tool process must be owned by the frontend that asked for it, got {owner_text}"
+    );
+    assert!(
+        owner_text.contains("run:"),
+        "the owner must be this run's client id, got {owner_text}"
+    );
+}

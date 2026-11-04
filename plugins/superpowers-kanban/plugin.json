@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "packageFormat": 1,
+  "plugin": "superpowers-kanban",
+  "version": "0.1.0",
+  "target": "darwin-aarch64",
+  "views": [
+    {
+      "id": "main",
+      "kind": "main",
+      "entry": "ui/dist/index.html",
+      "digest": "33cba79b381e7676891c9cf925c5564be0af22921af864a444dfaede252bfc7f"
+    },
+    {
+      "id": "settings",
+      "kind": "settings",
+      "entry": "ui/dist/index.html",
+      "digest": "33cba79b381e7676891c9cf925c5564be0af22921af864a444dfaede252bfc7f"
+    }
+  ],
+  "program": null,
+  "skills": [
+    {
+      "name": "superpowers-kanban",
+      "path": "skills/superpowers-kanban"
+    }
+  ],
+  "methods": [
+    {
+      "name": "board/list",
+      "effect": "Read"
+    },
+    {
+      "name": "board/enqueue",
+      "effect": "Write"
+    },
+    {
+      "name": "board/enqueuePrequeued",
+      "effect": "Write"
+    },
+    {
+      "name": "board/promote",
+      "effect": "Write"
+    },
+    {
+      "name": "board/readSwitch",
+      "effect": "Read"
+    },
+    {
+      "name": "board/writeSwitch",
+      "effect": "QuotaWrite"
+    },
+    {
+      "name": "board/prefs",
+      "effect": "Read"
+    },
+    {
+      "name": "board/storePrefs",
+      "effect": "QuotaWrite"
+    },
+    {
+      "name": "board/startLifecycle",
+      "effect": "Resident"
+    },
+    {
+      "name": "board/stopLifecycle",
+      "effect": "Resident"
+    },
+    {
+      "name": "board/operation",
+      "effect": "Read"
+    }
+  ],
+  "cli": [
+    {
+      "verb": "kanban:add",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:add-prequeued",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:promote",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:add-merge",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:merge-request",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:merge-finish",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:merge-cancel",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:done",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:state",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:archive",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:purge",
+      "effect": "Write"
+    },
+    {
+      "verb": "kanban:list",
+      "effect": "Read"
+    },
+    {
+      "verb": "kanban:on",
+      "effect": "QuotaWrite"
+    },
+    {
+      "verb": "kanban:off",
+      "effect": "QuotaWrite"
+    },
+    {
+      "verb": "kanban:workdir",
+      "effect": "Read"
+    }
+  ],
+  "capabilities": {
+    "required": [
+      "Read",
+      "Write"
+    ],
+    "optional": [
+      "Launch",
+      "QuotaWrite",
+      "Resident"
+    ]
+  },
+  "dependencies": {
+    "workflows": [
+      {
+        "name": "brainstorming"
+      },
+      {
+        "name": "writing-plans"
+      },
+      {
+        "name": "finishing-a-development-branch"
+      }
+    ]
+  },
+  "data": {
+    "format": 1,
+    "migrations": [],
+    "legacy": {
+      "binaries": [
+        "superpowers-kanban",
+        "superpowers-kanban-runner"
+      ],
+      "supervisor": "superpowers-kanban.json",
+      "stateDirs": [
+        ".yi-agent/superpowers-kanban"
+      ],
+      "preferences": ".yi-agent/preferences.json",
+      "switchKey": "superpowers_kanban",
+      "skill": "superpowers-kanban"
+    }
+  },
+  "compatibility": {
+    "hostApi": "v1",
+    "uiApi": "v1"
+  }
+}

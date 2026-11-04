@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::managed::ManagedGuard;
 use crate::manifest::{SupervisorManifest, load_manifests};
 
 /// 监督运行所需的目录布局。目录名对外固定，方便清单的占位展开。
@@ -11,7 +12,7 @@ use crate::manifest::{SupervisorManifest, load_manifests};
 /// 本 crate **不认识任何插件**，因此不写死任何插件的目录名：项目级状态根是
 /// `<workdir>/.yi-agent`，某个插件的状态目录由**它的清单名**派生
 /// （[`Layout::state_dir`]）。对清单名 `superpowers-kanban` 来说，派生结果仍是
-/// `<workdir>/.yi-agent/superpowers-kanban`——与磁盘上的既有契约逐字一致，
+/// `<workdir>/.yi-agent/example-plugin`——与磁盘上的既有契约逐字一致，
 /// 故不需要迁移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -119,6 +120,16 @@ impl ChildLog {
     }
 }
 
+/// 受管清单的启动命令来源。
+enum ManagedCommand {
+    /// 宿主构造的受管命令。
+    Managed(Command),
+    /// 非受管清单：沿用清单自己的 `command` + `args`。
+    Unmanaged,
+    /// 受管清单但宿主拒绝了启动。**不回退**到清单命令。
+    Refused,
+}
+
 /// 按清单 + 开关键托管子进程。生命周期与 daemon 一致。
 pub struct Supervisor {
     layout: Layout,
@@ -138,6 +149,19 @@ pub struct Supervisor {
     /// **刻意不是 `#[cfg(test)]`**：`tests/` 下的集成测试编译的是普通 lib，
     /// `cfg(test)` 字段在那里根本不存在，注入也就无从谈起。
     flags_path: Option<PathBuf>,
+    /// 受管模式：清单名 → 受管启动器。
+    ///
+    /// 命中的清单**不再**按它自己的 `command`/`args` 启动。清单是插件自述的
+    /// 快照，受管插件有签名与授权，按快照启动等于把摘要检查和授权检查一起
+    /// 绕过——一份被改过的清单就能把宿主指到任意可执行文件上。
+    ///
+    /// 未命中的清单保持原有行为：`Layout`/`Supervisor` 仍然不认识任何插件，
+    /// 受管与否由装配点决定。
+    managed: BTreeMap<String, ManagedGuard>,
+    /// 受管插件对应的项目。清单名本身不带项目信息，而授权正是按项目记的。
+    managed_projects: BTreeMap<String, yi_agent_plugins::ProjectId>,
+    /// 受管插件的常驻 argv（`--` 之后的参数）。
+    managed_argv: BTreeMap<String, Vec<std::ffi::OsString>>,
 }
 
 impl Supervisor {
@@ -149,7 +173,28 @@ impl Supervisor {
             spawned: None,
             spawned_log: None,
             flags_path: None,
+            managed: BTreeMap::new(),
+            managed_projects: BTreeMap::new(),
+            managed_argv: BTreeMap::new(),
         }
+    }
+
+    /// 把这个清单名改成受管启动。
+    ///
+    /// 装配点负责决定"哪些插件是受管的"。本 crate 不认识插件，也不该在
+    /// 这里硬编码任何一个名字。
+    pub fn with_managed(
+        mut self,
+        manifest_name: impl Into<String>,
+        guard: ManagedGuard,
+        project: yi_agent_plugins::ProjectId,
+        argv: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> Self {
+        let name = manifest_name.into();
+        self.managed.insert(name.clone(), guard);
+        self.managed_projects.insert(name.clone(), project);
+        self.managed_argv.insert(name, argv.into_iter().collect());
+        self
     }
 
     /// 从指定的 `flags.json` 读开关。测试用；生产用 [`Supervisor::new`]。
@@ -179,7 +224,7 @@ impl Supervisor {
         else {
             return false;
         };
-        yi_agent_flags::store::status_at(&path, name, &self.build_kind, None).0
+        yi_agent_flags::store::status_for_switch_at(&path, name, &self.build_kind, None).0
     }
 
     /// 一次对齐：重新扫描清单，起应起、停应停。
@@ -293,6 +338,31 @@ impl Supervisor {
     }
 
     fn ensure_running(&mut self, manifest: &SupervisorManifest) {
+        // 维护闸门**先**判，且每次 reconcile 都重新问。
+        //
+        // 判在"是否已在运行"之前是有意的：维护开始后应当把后端停下，而不是
+        // 等它自己崩。只看重启路径会留下一个正在写数据的进程，而迁移正是要
+        // 独占它。这里不缓存结论——IPC 通知丢过一次，缓存就会把"正在维护"
+        // 记成"没在维护"。
+        if let Some(guard) = self.managed.get(&manifest.name) {
+            match guard.blocks_launch() {
+                Ok(true) => {
+                    self.stop(&manifest.name, "maintenance transaction is open");
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // 读不到闸门状态时必须**保守**：不能因为"读失败"就当它是
+                    // 关着的，那会在迁移期间拉起后端。
+                    self.stop(
+                        &manifest.name,
+                        &format!("cannot read maintenance state: {error}"),
+                    );
+                    return;
+                }
+            }
+        }
+
         // 幂等：已有实例在 `query_socket` 上应答 → 不重复 spawn。
         // 这从源头消除「健康孤儿持锁 + 监督器不断补位」的空转循环。
         if self.answers(manifest) {
@@ -358,11 +428,6 @@ impl Supervisor {
     }
 
     fn spawn(&mut self, manifest: &SupervisorManifest) -> std::io::Result<()> {
-        let args = manifest.expand_args(
-            &self.layout.workdir,
-            &self.layout.state_dir(&manifest.name),
-            &self.layout.runtime_dir,
-        );
         // The log is best effort: `ChildLog::open` never fails outright, it just
         // yields an inactive log when the path is unusable. Only stderr is
         // redirected -- stdout stays swallowed, because a long-running child
@@ -375,8 +440,34 @@ impl Supervisor {
             .and_then(|file| file.try_clone().ok())
             .map(Stdio::from)
             .unwrap_or_else(Stdio::null);
-        let child = Command::new(&manifest.command)
-            .args(args)
+
+        let mut command = match self.managed_command(manifest) {
+            // 受管插件：程序、argv 与保留环境变量全部由宿主决定。清单里的
+            // `command` 与 `args` **不参与**——它们是插件自述的快照，用它们
+            // 启动等于把摘要与授权检查一起绕过。
+            ManagedCommand::Managed(command) => command,
+            ManagedCommand::Refused => {
+                // 受管清单被拒绝时**不**退回清单命令：那会把一次被拒绝的
+                // 启动变成一次成功的启动，而拒绝的理由（无授权/维护中/
+                // 完整性不符）恰恰是最需要被看见的信息。
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the managed launcher refused this plugin",
+                ));
+            }
+            ManagedCommand::Unmanaged => {
+                let args = manifest.expand_args(
+                    &self.layout.workdir,
+                    &self.layout.state_dir(&manifest.name),
+                    &self.layout.runtime_dir,
+                );
+                let mut command = Command::new(&manifest.command);
+                command.args(args);
+                command
+            }
+        };
+
+        let child = command
             .current_dir(&self.layout.workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -385,6 +476,40 @@ impl Supervisor {
         self.spawned = Some(child);
         self.spawned_log = Some(log);
         Ok(())
+    }
+
+    /// 受管清单走宿主入口，其余清单沿用它们自己的 `command`。
+    ///
+    /// 失败时退化成"不启动"而不是"按清单启动"：`spawn_and_track` 会把
+    /// 错误写进日志，用户能看到"插件没起来"及其原因。悄悄回退到清单里的
+    /// `command` 会让一条被拒绝的启动变成一次成功的启动，那正是最坏的形状。
+    fn managed_command(&self, manifest: &SupervisorManifest) -> ManagedCommand {
+        let Some(guard) = self.managed.get(&manifest.name) else {
+            return ManagedCommand::Unmanaged;
+        };
+        let Some(project) = self.managed_projects.get(&manifest.name) else {
+            tracing::warn!(
+                plugin = %manifest.name,
+                "managed plugin has no project; refusing to launch it"
+            );
+            return ManagedCommand::Refused;
+        };
+        let argv = self
+            .managed_argv
+            .get(&manifest.name)
+            .cloned()
+            .unwrap_or_default();
+        match guard.command_in(project, &argv, &self.layout.workdir) {
+            Ok(command) => ManagedCommand::Managed(command),
+            Err(error) => {
+                tracing::warn!(
+                    plugin = %manifest.name,
+                    %error,
+                    "the managed launcher refused to start this plugin"
+                );
+                ManagedCommand::Refused
+            }
+        }
     }
 
     /// 停掉一个子进程并记下原因。
@@ -479,7 +604,7 @@ mod child_log_tests {
         assert!(
             !layout
                 .logs_dir()
-                .starts_with(layout.state_dir("superpowers-kanban"))
+                .starts_with(layout.state_dir("example-plugin"))
         );
     }
 
@@ -491,12 +616,12 @@ mod child_log_tests {
         // 路径由**清单名**派生：两个不同的名字必得两个不同的目录，且都等于
         // `<state_base>/<name>`。这条比字符串扫描有力——它证明的是行为。
         let layout = Layout::for_workdir(Path::new("/tmp/project"));
-        let kanban = layout.state_dir("superpowers-kanban");
+        let kanban = layout.state_dir("example-plugin");
         let other = layout.state_dir("some-other-plugin");
         assert_ne!(kanban, other, "the state dir must follow the manifest name");
         assert_eq!(
             kanban,
-            PathBuf::from("/tmp/project/.yi-agent/superpowers-kanban")
+            PathBuf::from("/tmp/project/.yi-agent/example-plugin")
         );
         assert_eq!(
             other,
@@ -533,7 +658,7 @@ mod child_log_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !production.contains("superpowers-kanban"),
+            !production.contains("example-plugin"),
             "the supervisor crate's production code must not name a plugin"
         );
     }

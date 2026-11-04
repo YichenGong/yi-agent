@@ -102,9 +102,15 @@ impl ManagedSpawnClient {
 
     /// Waits for the group to end, up to the deadline.
     pub fn wait(&mut self, process_id: &str, deadline: &Deadline) -> io::Result<ManagedExitArg> {
+        // Round *up*: a sub-second remainder would otherwise be sent as 0, which
+        // the server reads as "no budget" and answers with the channel budget --
+        // an hour of waiting for a caller that asked for a fraction of a second.
+        let budget_secs =
+            deadline.remaining().as_secs() + u64::from(deadline.remaining().subsec_nanos() > 0);
         let response = self.request(
             ManagedSpawnRequest::Wait {
                 process_id: process_id.to_string(),
+                budget_secs,
             },
             deadline,
         )?;
@@ -144,7 +150,17 @@ impl ManagedSpawnClient {
         request: ManagedSpawnRequest,
         deadline: &Deadline,
     ) -> io::Result<ManagedSpawnResponse> {
-        let budget = deadline.clamp(Duration::from_secs(30));
+        // `Wait` is the one request whose answer is legitimately as late as its own
+        // budget: the server waits that long before reporting "still running". The
+        // 30 s clamp below is a per-exchange bound for control requests and would cut
+        // such a wait off at 30 s, so a wait is given its full budget plus room for
+        // the answer to travel back.
+        let budget = match &request {
+            ManagedSpawnRequest::Wait { budget_secs, .. } => Duration::from_secs(*budget_secs)
+                .saturating_add(Duration::from_secs(1))
+                .min(deadline.remaining().saturating_add(Duration::from_secs(1))),
+            _ => deadline.clamp(Duration::from_secs(30)),
+        };
         if budget.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

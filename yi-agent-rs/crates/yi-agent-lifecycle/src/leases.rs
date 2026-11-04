@@ -250,6 +250,25 @@ impl LeaseTable {
         Ok(ReleaseOutcome::Reclaim(grant.client_run_id.clone()))
     }
 
+    /// The run ids whose lease has lapsed at `now`, without removing them.
+    ///
+    /// Split from [`Self::expire`] so a caller can act on *who* is leaving before
+    /// the table forgets them: authority revocations have to name a client, and
+    /// after the sweep the lease no longer knows the name.
+    ///
+    /// Sorted, like `expire`, so two callers observing the same instant agree on
+    /// the order.
+    pub fn expiring_at(&self, now: Duration) -> Vec<ClientRunId> {
+        let mut expiring: Vec<ClientRunId> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expiring.sort();
+        expiring
+    }
+
     /// Drop every lease whose deadline has passed, returning the run ids.
     ///
     /// Sorted so a caller emitting reclaims gets a deterministic order.

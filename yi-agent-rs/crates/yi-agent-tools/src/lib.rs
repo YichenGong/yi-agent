@@ -5,7 +5,7 @@
 
 mod context;
 mod error;
-mod fs;
+pub(crate) mod fs;
 mod managed_process;
 mod process;
 mod process_group;
@@ -15,6 +15,7 @@ mod skill_tool;
 mod web;
 
 pub mod image_prep;
+pub mod side_read;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
@@ -38,6 +39,10 @@ pub use process::{
 pub use sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
+pub use side_read::{
+    SIDE_READ_SUPPORTED, SideBlockingPool, SideFileAlias, SideReadAccess, SideRoots,
+    StaticSideRoots, register_side_file_tools,
+};
 pub use skill_tool::SkillTool;
 pub use web::config::{
     EngineConfig, Freshness, WebSearchConfig, load_websearch_config, load_websearch_config_from,

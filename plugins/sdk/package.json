@@ -1,0 +1,31 @@
+{
+  "name": "@yi-agent/plugin-sdk",
+  "version": "0.1.0",
+  "description": "Client SDK for yi-agent plugin views: resolves the host bridge and sends protocol messages. No host RPC client, no Tauri import.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": false,
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^3.2.4"
+  }
+}

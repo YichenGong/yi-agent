@@ -198,7 +198,7 @@ fn parse_env(action: &Value) -> Vec<(String, String)> {
 /// 后者是真的断链（字段漂移、插件比宿主新、应答不是约定形状）。没有这个判据，
 /// 宿主只能「`None` 就当没事」，那正是静默停摆的现场。
 ///
-/// 只认契约形状（见 `contract/driver-protocol.json` 的 `answers.nothing`）：
+/// 只认契约形状（见 `plugins/contracts/fixtures/driver-protocol.json` 的 `answers.nothing`）：
 /// 裸 `null`、`{}`、或 `action` 存在但非 null 都不是约定形状，一律算「说不清」，
 /// 由调用方记一行。
 pub(crate) fn is_explicit_no_action(value: &Value) -> bool {
@@ -244,10 +244,32 @@ pub(crate) struct DriverState {
     pub results: Vec<ActionResult>,
 }
 
+/// 驱动动作的准入闸门。
+///
+/// # 为什么是一个 trait 而不是直接判权限
+///
+/// 判定要读磁盘上的绑定、授权表与生命周期（见 `plugin_manager`），而
+/// `session_driver` 是纯协议层：它不该知道那些文件长什么样。更实际的理由是
+/// 测试：要证明"没有 Launch 权限时不会起会话"，必须能注入一个"现在拒绝"的
+/// 判定，而不是去构造一整套实例根、签名包与授权表——那测的是夹具，不是门禁。
+///
+/// 返回 `Err` 即拒绝，错误原样上行到动作结果。**不做重试、不转成"无事可做"**：
+/// 一次权限拒绝若被伪装成"插件没安排活"，用户会看到系统安静地停摆。
+pub(crate) trait DriverGate: Send + Sync {
+    /// 允许这个插件在这个项目里**新建**会话吗。
+    ///
+    /// 只用于 `Launch`。`Append` 续跑的是宿主已持有的会话，它的准入在建会话时
+    /// 已经判过一次；每轮再判会导致插件升级后正在跑的会话被拦腰截断。
+    fn may_launch(&self, project: &Path, plugin: &str) -> Result<(), String>;
+}
+
 /// 执行动作的副作用。真实现复用 `start_thread_core` / `prepare_turn_core` 的
 /// 无响应帧路径；测试用替身驱动纯逻辑。
 pub(crate) trait SessionLauncher {
-    async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String>;
+    /// 执行一个动作。`plugin` 是给出该动作的插件名——闸门要按它判权限，
+    /// 而它**不能**从动作内容推断：动作里没有插件名，且凭内容猜等于让插件
+    /// 自报身份。
+    async fn launch(&mut self, plugin: &str, action: &DriverAction) -> anyhow::Result<String>;
 }
 
 /// 一个会话此刻算不算「运行中」。
@@ -374,11 +396,16 @@ pub(crate) fn threads_payload(
 ///
 /// `results` 里是上一拍尚未回报的结果；本拍把它们上送，**送达之后**才清空
 /// （`query` 失败时保留，下一拍重发）。
+// 参数多是有意的：它们各自来自主循环的不同状态，收成结构体只会把同样的
+// 八个字段再抄一遍，并在每个调用点(含 18 处测试)制造一次无信息的构造。
+// 仓库内同类装配函数(如 `driver_tick`)沿用同一约定。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn driver_step<L: SessionLauncher>(
     query: &(dyn Fn(&Value) -> Result<Value, String> + Sync),
     threads: &mut Vec<DriverThread>,
     results: &mut Vec<ActionResult>,
     launcher: &mut L,
+    plugin: &str,
     idle: &(dyn Fn(&str) -> bool + Sync),
     sessions_running: u32,
     // 本进程此刻加载着的全部会话。与 `threads`（本插件起过哪些）是两件事：
@@ -427,7 +454,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
 
     let action = parse_action(&answer)?;
 
-    match launcher.launch(&action).await {
+    match launcher.launch(plugin, &action).await {
         Ok(thread_id) => {
             // `Launch` 与 `ResumeAppend` 都产生/确认一个本进程看得见的会话：
             // 前者是新起的，后者是刚被恢复的。两者都要登记进 `threads`，
@@ -651,6 +678,9 @@ mod tests {
     #[derive(Default)]
     struct FakeLauncher {
         seen: Vec<DriverAction>,
+        /// 每次 `launch` 收到的插件名。起动路径要拿它查授权表，传错就等于
+        /// 拿别人的授权去放行，故这里如实记下来供断言。
+        plugins: Vec<String>,
         thread_id: String,
         fail: Option<String>,
         /// 分类失败：用 `DriverActionFailure` 承载，模拟真实 launcher 的用法。
@@ -670,8 +700,9 @@ mod tests {
     }
 
     impl SessionLauncher for FakeLauncher {
-        async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
+        async fn launch(&mut self, plugin: &str, action: &DriverAction) -> anyhow::Result<String> {
             self.seen.push(action.clone());
+            self.plugins.push(plugin.to_string());
             if let Some(failure) = &self.fail_with {
                 return Err(anyhow::Error::new(failure.clone()));
             }
@@ -712,6 +743,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -722,6 +754,13 @@ mod tests {
         assert_eq!(outcome.action_id, "a1");
         assert!(outcome.ok);
         assert_eq!(launcher.seen.len(), 1, "the launcher runs exactly once");
+        // 插件名必须原样传下去：起动路径拿它查授权表，传错（比如传死一个常量，
+        // 或传成项目名）就会拿别人的授权放行，而调用方完全看不出来。
+        assert_eq!(
+            launcher.plugins,
+            vec!["example-plugin".to_string()],
+            "the plugin that asked must be the plugin the launcher is asked about"
+        );
     }
 
     #[tokio::test]
@@ -742,6 +781,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -765,6 +805,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -798,6 +839,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -828,6 +870,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -861,6 +904,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -960,6 +1004,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &snapshot,
@@ -989,6 +1034,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1031,6 +1077,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "test-plugin",
             &idle,
             0,
             &[],
@@ -1051,7 +1098,7 @@ mod tests {
     }
 
     /// 宿主与插件共用的 `driver/next` 线协议契约（**与插件 `service.rs` 的测试读的是
-    /// 同一份文件**，两侧都用 `include_str!`，与 `plugin-socket.json` 同一套做法）。
+    /// 同一份文件**，位于 `plugins/contracts/fixtures/`，与 `plugin-socket.json` 同一套做法）。
     ///
     /// 契约此前只存在于两侧手写的 JSON 字面量里：改一侧的字段名，两边测试照样全绿，
     /// 而生产上宿主 `parse_action` 悄悄回 `None`（这一拍什么都不做）、插件的
@@ -1061,9 +1108,8 @@ mod tests {
     /// `include_str!` 而非运行时读取：编译期依赖能同时钉住「文件还在不在」——契约
     /// 被改名/删除时**编译**就失败，运行时读取会静默跳过而失去意义。它只作用于
     /// `#[cfg(test)]`，`cargo build` 不受影响。
-    const DRIVER_CONTRACT: &str = include_str!(
-        "../../../../plugins/superpowers-kanban/crates/superpowers-kanban-runner/contract/driver-protocol.json"
-    );
+    const DRIVER_CONTRACT: &str =
+        include_str!("../../../../plugins/contracts/fixtures/driver-protocol.json");
 
     fn driver_contract() -> Value {
         serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON")
@@ -1126,13 +1172,13 @@ mod tests {
                 env,
             } => {
                 assert_eq!(workdir, "/w/card-1");
-                assert_eq!(title, "看板 · a.spec");
-                assert_eq!(objective, "do the card");
+                assert_eq!(title, "item · a.spec");
+                assert_eq!(objective, "do the item");
                 assert_eq!(driver_project.as_deref(), Some("/proj"));
                 assert_eq!(driver_ref.as_deref(), Some("card-1"));
                 assert_eq!(
                     env,
-                    vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+                    vec![("PLUGIN_ITEM".to_string(), "card-1".to_string())],
                     "插件的 env 必须原样透传，宿主不解释键名"
                 );
             }
@@ -1246,6 +1292,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "test-plugin",
             &idle,
             3,
             &[],
@@ -1286,6 +1333,7 @@ mod tests {
             &mut driver_threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             2,
             &[],
@@ -1316,6 +1364,7 @@ mod tests {
             &mut driver_threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1351,6 +1400,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1394,6 +1444,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1425,6 +1476,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1456,6 +1508,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1476,6 +1529,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],
@@ -1510,6 +1564,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            "example-plugin",
             &nobody_idle(),
             0,
             &[],

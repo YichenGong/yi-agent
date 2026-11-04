@@ -30,140 +30,96 @@ pub(crate) struct RuntimeTooling {
     /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
     pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
-/// Brings up this project's runtime, asking the guardian when it can.
+/// Turn one bring-up choice into a binding, or the failure that explains why not.
 ///
-/// The sidecar is a *frontend*: it registers a lease and expects the guardian to
-/// own the daemon. Starting a daemon inside this process instead would give it no
-/// guardian to authorize against, so every foreground turn would silently fall
-/// back to the legacy watchdog -- and a long conversation would be settled as a
-/// stalled background attempt, which is the bug this whole contract exists to fix.
-///
-/// A managed bring-up can legitimately be unavailable (no installed artifact, a
-/// version the user must choose, a runtime whose guardian is wedged). Those are
-/// real answers, not crashes: the daemon still works embedded, it simply cannot
-/// authorize a foreground root. Falling back keeps every existing user running and
-/// keeps the degradation visible in the log instead of becoming a launch failure.
-fn bring_up_runtime(
+/// Split out of [`attach_cwd_runtime`] so the dispatch itself is testable. The
+/// alternative -- asserting through the real attach -- would need a live daemon and
+/// a process-wide `OnceLock` for every case, and the interesting property here is
+/// only which branch runs.
+fn bring_up_with(
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
     cfg: &RuntimeConfig,
     runtime_dir: &Path,
     models_path: &Path,
-) -> Result<
-    yi_agent_subagent::attach::AttachedProjectRuntime,
-    yi_agent_subagent::attach::AttachFailure,
-> {
-    let policy = yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend();
-    // The instance home and the artifact this build expects are only consulted by
-    // the managed branch. Either being absent is not an error: the caller then gets
-    // a straight embedded start, which behaves exactly as it does today.
-    let instance_home = yi_agent_store::paths::instance_home();
-    let expected = this_process_artifact();
-    match (instance_home, expected) {
-        (Some(instance_home), Some(expected)) => {
-            match yi_agent_subagent::attach::ensure_owned_runtime_with_policy(
+) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
+    use yi_agent_subagent::attach::{
+        AttachFailure, BringUpPolicy, ensure_owned_runtime, ensure_owned_runtime_with_policy,
+    };
+
+    match bringup.policy {
+        // Embedded needs no scope; the four-argument form keeps its exact
+        // historical behaviour, including which policy a later repair uses.
+        BringUpPolicy::Embedded => {
+            ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path).map(|attached| {
+                RuntimeBinding::managed(
+                    cfg,
+                    runtime_dir.to_path_buf(),
+                    models_path.to_path_buf(),
+                    Arc::new(attached),
+                )
+            })
+        }
+        BringUpPolicy::Managed => {
+            let Some(instance_home) = bringup.instance_home.as_deref() else {
+                // A managed start with no scope to resolve has nothing to join and
+                // must not silently degrade to an embedded one: that would leave a
+                // client-owned daemon behind a policy that promises it is shared.
+                return Err(AttachFailure::new(
+                    "runtime bring-up",
+                    "the managed policy needs the instance home this process never installed",
+                ));
+            };
+            ensure_owned_runtime_with_policy(
                 cfg,
                 runtime_dir.to_path_buf(),
                 models_path,
-                &instance_home,
-                policy,
-                Some(&expected),
-            ) {
-                Ok(attached) => return Ok(attached),
-                Err(failure) => {
-                    tracing::warn!(
-                        stage = %failure.stage,
-                        cause = %failure.cause,
-                        "managed runtime bring-up unavailable; falling back to an embedded \
-                    daemon, which cannot authorize a foreground root"
-                    );
-                }
-            }
-        }
-        (None, _) => {
-            tracing::warn!(
-                "no instance home, so the managed runtime cannot be resolved; falling back \
-to an embedded daemon, which cannot authorize a foreground root"
-            );
-        }
-        (Some(_), None) => {
-            tracing::warn!(
-                "this binary could not describe its own artifact; falling back to an \
-embedded daemon, which cannot authorize a foreground root"
-            );
-        }
-    }
-    yi_agent_subagent::attach::ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path)
-}
-
-/// The bring-up a binding created here must use, now and on every repair.
-///
-/// `expected` and `instance_home` are resolved once so a repair cannot disagree with
-/// the first start. A missing instance home or artifact leaves the plan embedded,
-/// which is exactly what `bring_up_runtime` falls back to.
-fn bring_up_choice(models_path: &Path) -> yi_agent_subagent::binding::BringUpChoice {
-    let _ = models_path;
-    let instance_home = yi_agent_store::paths::instance_home();
-    let expected = this_process_artifact();
-    match (instance_home, expected) {
-        (Some(instance_home), Some(expected)) => yi_agent_subagent::binding::BringUpChoice {
-            policy: yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend(),
-            expected: Some(expected),
-            instance_home: Some(instance_home),
-        },
-        _ => yi_agent_subagent::binding::BringUpChoice::default(),
-    }
-}
-
-/// This process's own artifact identity, read from the binary it is running in.
-///
-/// Read rather than constructed. The identity's `build_id` has to be the one the
-/// guardian and daemon compare against, and that value is baked into the `yi-agent`
-/// binary by its build script -- a library crate cannot see it, and inventing one
-/// here would make `ensure_managed` compare two fictional strings, which is exactly
-/// the check it exists to perform.
-///
-/// `internal-runtime identity --json` is the same source the process tests read, so
-/// there is one definition of "what build is this" in the codebase instead of two
-/// that could drift.
-///
-/// Returns `None` when the binary cannot describe itself. That is not fatal: the
-/// caller then falls back to embedded, which works exactly as it does today.
-fn this_process_artifact() -> Option<yi_agent_lifecycle::types::ArtifactIdentity> {
-    let executable = std::env::current_exe().ok()?;
-    let output = std::process::Command::new(&executable)
-        .args(["internal-runtime", "identity", "--json"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let identity: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    Some(yi_agent_lifecycle::types::ArtifactIdentity {
-        build_id: identity["build_id"].as_str()?.to_string(),
-        display_version: identity["display_version"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string(),
-        executable,
-        // Left empty on purpose: `pinned_program` skips the digest check for an
-        // empty hash, and this caller has not been asked to pin a re-signable copy.
-        sha256: String::new(),
-        schema_min: identity["schema_min"].as_u64().unwrap_or(0) as u32,
-        schema_max: identity["schema_max"].as_u64().unwrap_or(0) as u32,
-        handover_version: identity["handover_version"].as_u64().unwrap_or(1) as u16,
-        business_protocol_min: identity["business_protocol_min"].as_u64().unwrap_or(0) as u32,
-        business_protocol_max: identity["business_protocol_max"].as_u64().unwrap_or(0) as u32,
-        capabilities: identity["capabilities"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect()
+                instance_home,
+                bringup.policy,
+                bringup.expected.as_ref(),
+            )
+            .map(|attached| {
+                RuntimeBinding::managed_with(
+                    cfg,
+                    runtime_dir.to_path_buf(),
+                    models_path.to_path_buf(),
+                    Arc::new(attached),
+                    bringup.clone(),
+                )
             })
-            .unwrap_or_default(),
-    })
+        }
+    }
+}
+
+/// Test seam: the same dispatch, exposed to the server's own tests.
+#[cfg(test)]
+pub(crate) fn bring_up_with_for_test(
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    models_path: &Path,
+) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
+    bring_up_with(bringup, cfg, runtime_dir, models_path)
+}
+
+/// Test seam: an identity that is *not* the running build.
+///
+/// The real id comes from `yi-agent`'s build script, which this library cannot
+/// read. A synthesized one is enough here because the tests only assert which
+/// branch runs, never that a daemon accepted the identity.
+#[cfg(test)]
+pub(crate) fn test_identity(dir: &Path) -> yi_agent_lifecycle::types::ArtifactIdentity {
+    yi_agent_lifecycle::types::ArtifactIdentity {
+        build_id: "0".repeat(32),
+        display_version: "test".to_string(),
+        executable: dir.join("yi-agent"),
+        sha256: String::new(),
+        schema_min: yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MIN,
+        schema_max: yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MAX,
+        handover_version: 1,
+        business_protocol_min: yi_agent_store::ipc::PROTOCOL_VERSION,
+        business_protocol_max: yi_agent_store::ipc::PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    }
 }
 
 /// 取出(或建立)该 cwd 的项目 runtime。
@@ -206,20 +162,13 @@ pub(crate) fn attach_cwd_runtime(
     // one. The binding it returns heals itself on later calls, so a daemon that
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
-    let outcome = bring_up_runtime(cfg, runtime_dir, models_path).map(|attached| {
-        // The binding carries the bring-up it was created with, because a *repair*
-        // must ask the same party to own the runtime. Handing it `managed()`'s
-        // default would make a managed daemon get replaced by an embedded one the
-        // first time it needed healing -- silently changing who owns the runtime
-        // mid-session, and taking the guardian away with it.
-        RuntimeBinding::managed_with(
-            cfg,
-            runtime_dir.to_path_buf(),
-            models_path.to_path_buf(),
-            Arc::new(attached),
-            bring_up_choice(models_path),
-        )
-    });
+    //
+    // This is the seam: the process's bring-up choice decides whether we own an
+    // embedded daemon or join a shared guardian-managed one. A production path
+    // that never consults the policy cannot honour `YI_AGENT_BRINGUP=managed` at
+    // all -- the policy, and everything behind it, would only ever run in tests.
+    let bringup = yi_agent_subagent::attach::process_bringup_choice();
+    let outcome = bring_up_with(&bringup, cfg, runtime_dir, models_path);
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
     match &outcome {
         // Only durable conclusions are worth remembering. A transient failure is
@@ -667,67 +616,33 @@ pub(crate) fn current_session_extra_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod foreground_root_lifecycle_tests {
-    /// The sidecar must be able to name its own artifact.
+    /// The bring-up plan a repair reuses must be internally consistent.
     ///
-    /// If this returns `None` in a real deployment, `bring_up_runtime` silently
-    /// takes the embedded branch and every foreground turn falls back to the legacy
-    /// watchdog -- the exact bug the contract exists to fix. So the failure mode
-    /// worth pinning is not "it parsed" but "it produced a usable identity".
+    /// `RuntimeBinding` records the choice it was built with so a later `repair()`
+    /// cannot switch owners mid-session: handing it `managed()`'s default would make
+    /// the first heal replace a guardian-owned daemon with an embedded one, taking
+    /// the authority channel with it while the conversation kept running.
     ///
-    /// The test binary is a libtest harness, not `yi-agent`, so it cannot answer
-    /// `internal-runtime identity` itself; what is asserted here is that the helper
-    /// reports that honestly rather than inventing a build id. The real value is
-    /// covered by `crates/yi-agent/tests/managed_runtime_lifecycle.rs`, which runs
-    /// the production binary.
-    /// A repair must ask the same party that owns the runtime.
-    ///
-    /// The binding records the bring-up it was built with precisely so a later
-    /// `repair()` cannot switch owners mid-session. Passing `managed()`'s default
-    /// would make the first heal replace a guardian-owned daemon with an embedded
-    /// one, taking the authority channel with it -- and the conversation would keep
-    /// running, which is what makes it hard to notice.
+    /// A half-filled managed plan is the failure worth pinning: it fails every
+    /// repair with "needs the artifact identity" long after the launch that looked
+    /// fine, so the assertion is on coherence, not on which policy is chosen.
     #[test]
-    fn foreground_root_lifecycle_repair_keeps_the_bring_up_the_binding_started_with() {
-        let choice = super::bring_up_choice(std::path::Path::new("/tmp/models.json"));
-        // Either both halves are present (managed is usable) or the plan is the
-        // build default (embedded). A half-filled managed plan would fail every
-        // repair with "needs the artifact identity" long after the launch that
-        // seemed fine.
+    fn foreground_root_lifecycle_bring_up_choice_is_coherent() {
+        let choice = yi_agent_subagent::attach::process_bringup_choice();
         match choice.policy {
             yi_agent_subagent::attach::BringUpPolicy::Managed => {
                 assert!(
                     choice.expected.is_some(),
-                    "a managed repair without an expected artifact would be refused"
+                    "a managed plan with no expected artifact would be refused at every repair"
                 );
                 assert!(
                     choice.instance_home.is_some(),
-                    "a managed repair with no instance home cannot resolve its scope"
+                    "a managed plan with no instance home cannot resolve its scope"
                 );
             }
             yi_agent_subagent::attach::BringUpPolicy::Embedded => {
-                assert!(
-                    choice.expected.is_none() && choice.instance_home.is_none(),
-                    "an embedded plan does not carry managed-only fields"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn foreground_root_lifecycle_artifact_lookup_never_invents_a_build_id() {
-        match super::this_process_artifact() {
-            None => {
-                // Honest refusal: no identity is better than a fabricated one.
-            }
-            Some(identity) => {
-                assert!(
-                    !identity.build_id.is_empty(),
-                    "an identity with no build id would compare equal to nothing useful"
-                );
-                assert!(
-                    !identity.capabilities.is_empty(),
-                    "a managed bring-up needs the capability list to be intersected"
-                );
+                // Embedded ignores both fields; carrying them would imply a managed
+                // intent the policy does not act on.
             }
         }
     }

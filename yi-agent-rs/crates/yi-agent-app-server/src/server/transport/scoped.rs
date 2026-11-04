@@ -79,13 +79,18 @@ where
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
+            // 实例状态根：插件生命周期/授权表/安装登记都在它下面。
+            instance_home: instance_home_dir(),
             remote_dir: instance_home_dir(),
+            side_registry: None,
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            // 官方目录文件：按连接注入，不读进程环境变量（见字段文档）。
+            plugin_catalog: crate::rpc::plugin_management::default_catalog_path(),
             resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
             ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
@@ -167,13 +172,18 @@ where
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
+            // 实例状态根：插件生命周期/授权表/安装登记都在它下面。
+            instance_home: instance_home_dir(),
             remote_dir: instance_home_dir(),
+            side_registry: None,
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            // 官方目录文件：按连接注入，不读进程环境变量（见字段文档）。
+            plugin_catalog: crate::rpc::plugin_management::default_catalog_path(),
             resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
             ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。

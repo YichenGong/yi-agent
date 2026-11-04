@@ -1,5 +1,9 @@
 #[cfg(desktop)]
 mod bridge;
+// 正式容器与探针共用这一个入口：容器本身始终编译，`probe`/`run` 子模块
+// 由 `plugin-probe` feature 单独门控（见 `plugin_host/mod.rs`）。
+#[cfg(desktop)]
+pub mod plugin_host;
 #[cfg(desktop)]
 mod remote;
 /// 桌面壳持有的 runtime 租约、退出屏障。
@@ -30,6 +34,24 @@ const WRAPPER_VERSION: &str = match option_env!("YI_AGENT_WRAPPER_VERSION") {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 全进程只展开一次 `generate_context!()`：探针与正式启动共用同一份
+    // context，否则两份 `_EMBED_INFO_PLIST` 静态符号会在链接期撞车。
+    let context = tauri::generate_context!();
+
+    // 探针构建在创建任何窗口之前接管整个进程：它需要清空窗口配置、走自己的
+    // 资源协议，且绝不能顺手拉起正式 sidecar（那会污染开发者的真实实例）。
+    #[cfg(all(desktop, feature = "plugin-probe"))]
+    if let Some(parsed) = plugin_host::run::ProbeOptions::from_args(std::env::args()) {
+        let code = match parsed {
+            Ok(options) => plugin_host::run::run_probe(context, options),
+            Err(error) => {
+                eprintln!("[plugin-probe] {error}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+
     // 必须在任何开关判定之前。OnceLock：重复调用无副作用。
     #[cfg(desktop)]
     yi_agent_flags::set_build_info(BUILD_KIND, WRAPPER_VERSION);
@@ -41,10 +63,18 @@ pub fn run() {
     // 桌面端自带 app-server 侧车（经 stdio 驱动）；iOS 是纯 WebSocket 客户端，
     // **没有侧车**（见 `desktop/src/transportFactory.ts`）。故侧车管理只在桌面注册，
     // 否则 iOS 构建会去找一个它用不上的 externalBin（并试图 spawn 它）。
+    // 宿主状态先拿到手：`manage` 之后从 Builder 上取不回来，而注册协议需要
+    // 同一个实例。
+    #[cfg(desktop)]
+    let plugin_host_state = plugin_host::host_state();
+
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .manage(bridge::Sidecar::new())
+        // 宿主状态与资源协议都要在 Builder 阶段就位：协议注册是 Builder
+        // 方法，且窗口创建后禁止再注册。
+        .manage(std::sync::Arc::clone(&plugin_host_state))
         .invoke_handler(tauri::generate_handler![
             bridge::rpc,
             bridge::rpc_respond,
@@ -68,7 +98,12 @@ pub fn run() {
             runtime_lifecycle::runtime_operation,
             runtime_lifecycle::runtime_active_operation,
             runtime_lifecycle::runtime_known_scopes,
-            runtime_lifecycle::runtime_scope_for_project
+            runtime_lifecycle::runtime_scope_for_project,
+            plugin_host::host::open_plugin_view,
+            plugin_host::host::close_plugin_view,
+            plugin_host::host::plugin_committed_activation,
+            bridge::plugin_host_identity,
+            bridge::plugin_bind_host
         ])
         .setup(|app| {
             // 先装生命周期状态：`spawn` 起的监督循环与窗口事件都可能立刻用到它。
@@ -81,8 +116,11 @@ pub fn run() {
             Ok(())
         });
 
+    #[cfg(desktop)]
+    let builder = plugin_host::host::register_protocol(builder, plugin_host_state);
+
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
 
     // Two policies run on every platform:

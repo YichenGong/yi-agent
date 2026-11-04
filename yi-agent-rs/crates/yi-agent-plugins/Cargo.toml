@@ -1,0 +1,33 @@
+[package]
+name = "yi-agent-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 本 crate 是插件的**契约核心**：值类型、清单解析、错误分类。
+# 刻意不依赖 store / app-server / Tauri / 看板，也不依赖 tokio——
+# 核心路径只由调用方注入，这样它可以被宿主、桌面壳和测试各自复用，
+# 而不会把任何一个运行时的假设带进来。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = "2"
+# 签名验证。约束 >= 2.0.0 是安全下界而非随手取的值：RUSTSEC-2022-0093
+# （公私钥可分离建模导致的签名预言机攻击）只影响 < 2.0。精确补丁版本
+# 由 `cargo audit` 通过后锁定，见 G2 §3.4。
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+sha2 = "0.10"
+# 归档读取。tar 的条目类型是显式枚举（普通文件/链接/设备…），比 zip 更适合
+# 「逐类拒绝」——zip 的 Unix 元数据要靠额外字段，缺字段时行为取决于实现。
+tar = "0.4"
+flate2 = "1"
+# flock。跨进程互斥不能用进程内 Mutex——两个宿主进程各自持有自己的
+# Mutex，然后同时改写同一份 registry。
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

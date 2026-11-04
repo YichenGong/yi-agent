@@ -49,8 +49,84 @@ pub enum RefreshOutcome {
 ///
 /// 返回每个**可解析**清单的结果。解析失败的文件不在此列：连 `command` 都读不出来，
 /// 也就无从问它是谁（`load_manifests` 已按既有规则 warn 并跳过）。
+///
+/// 受管清单不清单名一律跳过，见 [`refresh_from_plugins_except`]。
 pub fn refresh_from_plugins(dir: &Path) -> Vec<RefreshOutcome> {
     refresh_from_plugins_until(dir, || false)
+}
+
+/// 同上，但**跳过**受管清单。
+///
+/// # 为什么受管清单必须跳过
+///
+/// 这条路径会执行清单里的 `command`，再把它的自述写回磁盘。对不受管的插件
+/// 这是"插件自己说自己是谁"的正确做法；对受管插件恰好是最该防的：
+///
+/// - 程序路径必须来自注册表与激活记录，不能来自上一份快照里的绝对路径。
+///   插件升级后旧路径指向的可能是任意文件（或已被删除后被同名顶替）。
+/// - 自述能改 `args`，而受管启动的 argv 由宿主装配。让它改等于把
+///   "宿主决定启动什么"退回成"插件自己决定"。
+/// - 执行 `command` 本身就绕过了完整性检查：被篡改的二进制会在这里先跑一遍。
+///
+/// 所以受管清单的刷新来源只能是安装包内那份签名清单（`managed::resolve`
+/// 每次启动都会读它），**不是**清单自称的 `command`。
+///
+/// 与 [`refresh_from_plugins_until`] 合流的实现见 [`refresh_from_plugins_with`]：
+/// 「跳过受管清单」与「可被取消」是两件正交的事，两个入口都必须同时具备，
+/// 否则要么受管清单被自己的 `command` 覆盖（安全问题），要么取消失灵（挂死）。
+pub fn refresh_from_plugins_except(dir: &Path, managed: &[String]) -> Vec<RefreshOutcome> {
+    refresh_from_plugins_with(dir, managed, || false)
+}
+
+/// 两个维度一起给：跳过 `managed` 里的清单，并允许 `should_stop` 中断。
+///
+/// `refresh_from_plugins_until` 与 `refresh_from_plugins_except` 都收敛到这里，
+/// 这样「受管插件不被自己的 `command` 覆盖」不会因为走了带取消的路径而失效。
+pub fn refresh_from_plugins_with(
+    dir: &Path,
+    managed: &[String],
+    should_stop: impl FnMut() -> bool,
+) -> Vec<RefreshOutcome> {
+    let mut managed_by_name: Vec<&str> = managed.iter().map(String::as_str).collect();
+    managed_by_name.sort_unstable();
+    let mut should_stop = should_stop;
+    refresh_records_with(
+        dir,
+        &managed_by_name,
+        describe::DescribePolicy::production(),
+        &mut |_| should_stop(),
+    )
+    .into_iter()
+    .map(|record| record.outcome)
+    .collect()
+}
+
+/// The startup description budget in production.
+///
+/// 15 s is the calibrated conclusion: 5 s was breached on CI under concurrency (a
+/// `cat`-only script took over 5 s while 87 descriptions ran in parallel), and the
+/// budget is only ever spent in full when a plugin is actually broken.
+pub const PRODUCTION_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// [`refresh_from_plugins`], with the description budget spelled out.
+///
+/// Exists for callers that already own a policy seam. The one test it serves in
+/// `yi-agent-runtime` needs a deliberately slow description to prove that one
+/// slow plugin holds up only itself, and the production 15 s budget makes that
+/// test grade how fast this machine cold-starts `python3` instead of the
+/// property under test. Production callers keep using the one-argument form.
+pub fn refresh_from_plugins_with_budget(
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Vec<RefreshOutcome> {
+    refresh_records(
+        dir,
+        describe::DescribePolicy::wide_budget(timeout),
+        &mut |_| false,
+    )
+    .into_iter()
+    .map(|record| record.outcome)
+    .collect()
 }
 
 /// 与 [`refresh_from_plugins`] 相同，但每次可能开始新工作前问一次 `should_stop`。
@@ -115,6 +191,20 @@ fn refresh_records(
     policy: describe::DescribePolicy,
     should_stop: &mut dyn FnMut(RefreshPhase) -> bool,
 ) -> Vec<RefreshRecord> {
+    refresh_records_with(dir, &[], policy, should_stop)
+}
+
+/// [`refresh_records`] 的完整形态：`managed` 里的清单不执行、不写回。
+///
+/// 受管清单必须跳过，原因见 [`refresh_from_plugins_except`]。把过滤放在这一层
+/// 而不是外面，是为了让**每个**入口（含带预算、带取消的）都自动继承这条安全
+/// 性质，而不是靠调用方记得传名单。
+fn refresh_records_with(
+    dir: &Path,
+    managed: &[&str],
+    policy: describe::DescribePolicy,
+    should_stop: &mut dyn FnMut(RefreshPhase) -> bool,
+) -> Vec<RefreshRecord> {
     // 一开始就要求停止：什么都不做，也**不读目录**。返回空结果，而不是伪造一串
     // Skipped——那些插件根本没被考虑过。
     if should_stop(RefreshPhase::BeforeLoad) {
@@ -124,6 +214,22 @@ fn refresh_records(
     for stored in load_manifests(dir) {
         if should_stop(RefreshPhase::BeforeItem) {
             break;
+        }
+        if managed.binary_search(&stored.name.as_str()).is_ok() {
+            // 不执行、不写盘。留一条 debug 让排查时能看出"为什么这份清单
+            // 没有跟着升级":否则用户会以为刷新坏了。
+            tracing::debug!(
+                plugin = %stored.name,
+                "skipping manifest refresh: this plugin is managed, so its manifest \
+                 comes from the signed release, not from the plugin's own command"
+            );
+            records.push(RefreshRecord::plain(RefreshOutcome::Skipped {
+                name: stored.name.clone(),
+                reason: "managed plugins do not refresh from their own `command`; \
+                         the signed release manifest is authoritative"
+                    .to_string(),
+            }));
+            continue;
         }
         let record = refresh_one(dir, &stored, policy, should_stop);
         let stop_after = record.cancelled || should_stop(RefreshPhase::AfterItem);
@@ -226,6 +332,23 @@ pub fn refresh_and_log_until(dir: &Path, mut should_stop: impl FnMut() -> bool) 
     let records = refresh_records(dir, describe::DescribePolicy::production(), &mut |_| {
         should_stop()
     });
+    log_records(records)
+}
+
+/// [`refresh_and_log`], with the description budget spelled out.
+///
+/// The production budget is [`PRODUCTION_DESCRIBE_TIMEOUT`]; this form exists for
+/// callers that own a policy seam and whose test must not grade machine speed.
+pub fn refresh_and_log_with_budget(
+    dir: &Path,
+    timeout: std::time::Duration,
+    mut should_stop: impl FnMut() -> bool,
+) -> Vec<String> {
+    let records = refresh_records(
+        dir,
+        describe::DescribePolicy::wide_budget(timeout),
+        &mut |_| should_stop(),
+    );
     log_records(records)
 }
 

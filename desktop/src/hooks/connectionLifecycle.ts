@@ -10,6 +10,10 @@ import {
 import { storedRemoteConfig } from "../lib/remoteConfig";
 import { wsTransport } from "../wsTransport";
 import { formatError } from "../lib/errorMessage";
+import {
+  parseSideHandshake,
+  type SideConversationStore,
+} from "../lib/sideConversation";
 
 /**
  * 连接生命周期（原 `App.tsx` 巨型 effect 内的建连/重连/前台唤醒，约 250 行）。
@@ -41,6 +45,13 @@ export interface ConnectionLifecycleDeps {
   handshake: (client: RpcClient) => Promise<void>;
   /** 由 `createNotificationRouter` 提供：给新客户端挂回调。 */
   wireClient: (client: RpcClient, slot: Slot) => void;
+  /**
+   * 旁支绑定登记处。
+   *
+   * 手机为每个远端项目各建一条连接，每条都要**独立**解析自己的能力位与宿主
+   * id：不能拿本地那条答案去渲染远端项目，也不能因为本地支持就假定远端支持。
+   */
+  sideStore: SideConversationStore;
 }
 
 export interface ConnectionLifecycle {
@@ -86,6 +97,7 @@ export function createConnectionLifecycle(
     recoveryRef,
     handshake,
     wireClient,
+    sideStore,
   } = deps;
 
   /**
@@ -156,7 +168,21 @@ export function createConnectionLifecycle(
         wireClient(next, target.profileId);
         // 与主连接同样握手：不做 `initialize` 的话该连接上任何 `thread/*` 都
         // 会得到 `-32010 not initialized`。
-        await next.request("initialize", {});
+        const initialized = await next.request<Record<string, unknown>>(
+          "initialize",
+          {},
+        );
+        // 旁路连接也要解析旁支能力与宿主 id（spec §8.1「包括旁路连接握手」）。
+        // 漏了这一条，手机上从「项目列表」切进某个远端项目时旁支入口永远不出现
+        // ——而那条连接其实完全支持。
+        const scope = storedRemoteConfig(localStorage)?.scope ?? "control";
+        const binding = parseSideHandshake(
+          target.profileId,
+          next,
+          initialized,
+          scope,
+        );
+        if (binding) sideStore.bind(binding);
       } catch (e) {
         // 只记这个项目：把它从注册表摘掉，避免留一条半死连接反复报错。
         registryRef.current.remove(target.profileId);

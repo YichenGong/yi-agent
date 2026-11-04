@@ -12,6 +12,9 @@ authors.workspace = true
 yi-agent-core = { workspace = true }
 # Cross-process foreground root DTOs (shared with guardian, host and desktop shell).
 yi-agent-lifecycle = { workspace = true }
+# 维护屏障读的是插件契约核心的日志格式。store 只依赖契约核心，
+# 不反向依赖 app-server —— 那会让 daemon 把整个宿主拖进来。
+yi-agent-plugins = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 uuid = { workspace = true }
@@ -23,6 +26,9 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 futures = { workspace = true }
 sha2 = "0.10"
+# The managed daemon verifies root authority minted by its guardian, and the
+# foreground DTOs are shared with the guardian, host and desktop shell. The
+# dependency direction is one-way: `yi-agent-lifecycle` never links this crate.
 # Fork payloads travel over the IPC as base64 text and are decoded here.
 base64 = "0.22"
 # Advisory file locking for the daemon instance lock (`flock`).

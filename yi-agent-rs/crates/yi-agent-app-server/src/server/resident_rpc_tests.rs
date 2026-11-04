@@ -58,7 +58,7 @@ async fn plugin_query_answers_for_a_project_that_never_registered() {
         "plugin/query",
         json!({
             "project": project.to_string_lossy(),
-            "plugin": "superpowers-kanban",
+            "plugin": "example-plugin",
             "method": "list",
             "params": {},
         }),

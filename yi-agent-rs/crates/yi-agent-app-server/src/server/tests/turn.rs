@@ -925,6 +925,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
     let tid = "thread-persist-toggle";
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.into(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -1041,6 +1042,7 @@ async fn a_turn_while_off_persists_without_credentials() {
     let tid = "thread-persist-turn";
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.into(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -1144,6 +1146,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
     let tid = "thread-persist-default";
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.into(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -1940,6 +1943,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
     let tid = "thread-crash";
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.into(),
             cwd: dir.path().to_string_lossy().to_string(),
             model: "m".into(),
@@ -2057,6 +2061,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
     let tid = "thread-promote";
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.into(),
             cwd: dir.path().to_string_lossy().to_string(),
             model: "m".into(),

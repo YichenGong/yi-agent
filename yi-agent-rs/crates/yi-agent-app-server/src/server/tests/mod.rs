@@ -558,6 +558,12 @@ pub(crate) struct Harness {
     /// 被删除，后续 `thread/start` 就写不进去。`None` 表示调用方自带 workdir。
     pub(crate) _fallback_workdir: Option<tempfile::TempDir>,
     pub(crate) _watchman_home: tempfile::TempDir,
+    /// 本次连接的官方目录路径。测试要往它写一份目录再断言 RPC 读到的是这份。
+    ///
+    /// lib test 里读它的是 `plugin_remote_tests`（同为 lib 模块），但那里的
+    /// 用例经本文件编译不到同一份 `dead_code` 视图，故显式标注。
+    #[allow(dead_code)]
+    pub(crate) plugin_catalog: std::path::PathBuf,
     pub(crate) skills_home_dir: tempfile::TempDir,
     pub(crate) lead_inbox: crate::lead::LeadInbox,
     pub(crate) lead_replies: crate::lead::LeadReplies,
@@ -611,6 +617,77 @@ impl Harness {
 
     pub(crate) async fn with_scope(scope: Scope) -> Self {
         Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
+    }
+
+    /// 带注入旁支注册表的 harness。scope 可指定,用来验证 `side/*` 的门禁。
+    pub(crate) async fn with_scope_and_side_registry(
+        scope: Scope,
+        registry: Arc<crate::side_conversation::SideRegistry>,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            Some(registry),
+        )
+    }
+
+    /// 与 [`Harness::with_scope`] 相同，但实例根由调用方钉死。
+    ///
+    /// 用来模拟"同一台宿主的第二次连接"：两条 stdio 管道、两个主循环，读写的
+    /// 却是同一份 `plugins/registry.json` 与授权表。默认构造每次都给一个新
+    /// tempdir，那只能证明"两个宿主互不可见"，证明不了重连后读到权威状态。
+    // 只被 `plugin_remote_tests` 的"两次连接"用例使用；同一理由见
+    // `plugin_catalog` 的 `allow`。
+    #[allow(dead_code)]
+    pub(crate) async fn with_scope_and_instance_home(scope: Scope, home: &Path) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            Some(home.to_path_buf()),
+        )
     }
 
     pub(crate) async fn with_lead_flag(enabled: bool) -> Self {
@@ -693,6 +770,7 @@ impl Harness {
             }),
             calls,
             lead_agent_enabled,
+            None,
         )
     }
 
@@ -710,6 +788,7 @@ impl Harness {
             uninstall,
             Arc::new(StdMutex::new(Vec::new())),
             false,
+            None,
         )
     }
 
@@ -754,11 +833,12 @@ impl Harness {
             }),
             calls,
             false,
+            None,
         )
     }
 
-    // 8 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
-    // 开关。再拆一个 builder 只会让"哪些组合真的存在"更难读。
+    // 9 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
+    // 开关 + 旁支注册表。再拆一个 builder 只会让"哪些组合真的存在"更难读。
     #[allow(clippy::too_many_arguments)]
     fn with_config_and_scope_and_watchman<F>(
         cfg: RuntimeConfig,
@@ -772,6 +852,48 @@ impl Harness {
         // 且共享进程级 `YI_AGENT_HOME`，并行测试必然互相污染；本 crate 的 lib
         // 测试从不注入 build info，`build_kind()` 恒为 "release"，写文件也无效。
         lead_agent_enabled: bool,
+        // 旁支注册表:注入后 `side/*` 走替身 resolver,不读真实项目目录。
+        // `None` 时 `serve()` 按本进程实例家目录自建(生产路径)。
+        side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::with_config_and_scope_and_watchman_in(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            install,
+            uninstall,
+            calls,
+            lead_agent_enabled,
+            side_registry,
+            None,
+        )
+    }
+
+    /// 见 [`Harness::with_scope_and_instance_home`]。`instance_home_override`
+    /// 为 `Some` 时不再自造 tempdir，而是复用调用方给的根。
+    #[allow(clippy::too_many_arguments)]
+    fn with_config_and_scope_and_watchman_in<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        install: WatchmanInstall,
+        uninstall: WatchmanUninstall,
+        calls: WatchmanCalls,
+        lead_agent_enabled: bool,
+        side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
+        instance_home_override: Option<PathBuf>,
     ) -> Self
     where
         F: Fn(
@@ -827,6 +949,10 @@ impl Harness {
         // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
         // 触碰真实的 `~/Library/LaunchAgents`。
         let watchman_home = tempfile::TempDir::new().unwrap();
+        let catalog_path = watchman_home.path().join("plugins").join("catalog.json");
+        if let Some(parent) = catalog_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         // 假的插件可执行目录:注入的解析器只在它里面找名字,故既不依赖本机
         // 装了什么插件,也不必改动进程级 `PATH`(那会污染同进程的并行用例)。
         let plugins_dir = tempfile::TempDir::new().unwrap();
@@ -886,7 +1012,11 @@ impl Harness {
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
+                instance_home: instance_home_override
+                    .clone()
+                    .unwrap_or_else(|| skills_home.path().to_path_buf()),
                 remote_dir: index_dir.path().to_path_buf(),
+                side_registry,
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
@@ -895,6 +1025,9 @@ impl Harness {
                 watchman_install: install,
                 watchman_uninstall: uninstall,
                 watchman_home: watchman_home.path().to_path_buf(),
+                // 官方目录也落隔离目录：`plugins/v1/catalog` 与 `assetRelease`
+                // 不得读开发者真实的 `~/.yi-agent/plugins/catalog.json`。
+                plugin_catalog: watchman_home.path().join("plugins").join("catalog.json"),
                 // 假插件目录 + 记账式 daemon 拉起:安装路径可测,且绝不真的
                 // `spawn` 一个 detached `daemon serve`。
                 resolve_plugin,
@@ -923,6 +1056,7 @@ impl Harness {
             hub,
             watchman_calls: calls,
             _watchman_home: watchman_home,
+            plugin_catalog: catalog_path,
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
@@ -939,6 +1073,15 @@ impl Harness {
     }
 
     pub(crate) fn skills_home(&self) -> std::path::PathBuf {
+        self.skills_home_dir.path().to_path_buf()
+    }
+
+    /// 本 harness 的实例根。
+    ///
+    /// 与 `skills_home` 取同一个隔离目录：`serve` 装配时 `instance_home` 就是这个
+    /// 值（见 `tests/mod.rs` 里 `RuntimeAttachments` 的构造），驱动闸门读授权表
+    /// 也必须读这里，否则测试会去碰开发者真实的 `~/.yi-agent`。
+    pub(crate) fn instance_home(&self) -> std::path::PathBuf {
         self.skills_home_dir.path().to_path_buf()
     }
 
@@ -1590,6 +1733,7 @@ fn write_meta(
     driver_ref: Option<&str>,
 ) {
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.into(),
         cwd: dir.to_string_lossy().into(),
         model: "m".into(),
@@ -1620,6 +1764,7 @@ fn write_meta(
 
 fn write_lead_meta(dir: &Path, id: &str) {
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.into(),
         cwd: dir.to_string_lossy().into(),
         model: String::new(),
@@ -1775,6 +1920,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         cwd: project.display().to_string(),
         model: "test".to_string(),
         active_turn_id: None,
+        turn_permit: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         prompt_tx,
@@ -2537,7 +2683,11 @@ impl MergedHarness {
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
+                instance_home: PathBuf::new(),
                 remote_dir: PathBuf::new(),
+                // 与手工装配的 serve_stdio 用例同一个约束:空 remote_dir +
+                // `None` 会让 serve() 把旁支宿主目录建到当前工作目录。
+                side_registry: Some(test_side_registry(index_dir.path(), None)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2545,6 +2695,7 @@ impl MergedHarness {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                plugin_catalog: PathBuf::new(),
                 // 测试注入:同上,不拉起真实 daemon。
                 resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
                 ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
@@ -2827,6 +2978,58 @@ fn child_holds_thread_lock() {
     std::thread::sleep(std::time::Duration::from_secs(30));
 }
 
+/// 只认 `p1` 的替身解析:测试用它把「打开旁支」从真实项目目录里摘出来。
+///
+/// `gate` 不是装饰:它让 `resolve` 卡在屏障上,于是「主循环有没有被堵住」变成
+/// 可断言的事实,而不是靠计时猜测(见 `tests::side` 的不阻塞用例)。
+pub(crate) struct StubSideResolver {
+    pub(crate) gate: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl crate::side_conversation::SideParentResolver for StubSideResolver {
+    fn resolve<'a>(
+        &'a self,
+        parent: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        yi_agent_runtime::side_conversation::SideResult<
+            yi_agent_runtime::side_conversation::EffectiveSideSource,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
+            Err(yi_agent_runtime::side_conversation::SideError::new(
+                yi_agent_runtime::side_conversation::SideErrorReason::UnknownThread,
+                format!("stub 不解析 {parent}"),
+            ))
+        })
+    }
+}
+
+/// 测试用旁支注册表:宿主资源落在 `home` 下,调用方负责保活那个临时目录。
+///
+/// 手工装配 `RuntimeAttachments` 的用例必须用它,而**不能**留
+/// `side_registry: None` + 空 `remote_dir`:那会让 `serve()` 把
+/// `side-conversations/` 建到当前工作目录(即源码树里),实测已经发生。
+pub(crate) fn test_side_registry(
+    home: &Path,
+    gate: Option<Arc<tokio::sync::Barrier>>,
+) -> Arc<crate::side_conversation::SideRegistry> {
+    let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
+    let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+        home.to_path_buf(),
+        Arc::clone(&pool),
+    )
+    .expect("test side host resources");
+    Arc::new(crate::side_conversation::SideRegistry::new(
+        Arc::new(StubSideResolver { gate }),
+        resources,
+        pool,
+    ))
+}
+
 #[cfg(test)]
 mod assembly;
 #[cfg(test)]
@@ -2836,11 +3039,14 @@ mod lead;
 #[cfg(test)]
 mod model_settings;
 #[cfg(test)]
+mod plugin_admission;
+#[cfg(test)]
 mod plugin_theme;
 #[cfg(test)]
 mod process;
-#[cfg(test)]
 mod runtime_status;
+#[cfg(test)]
+mod side;
 #[cfg(test)]
 mod thread_index;
 #[cfg(test)]

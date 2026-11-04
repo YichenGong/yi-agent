@@ -191,24 +191,49 @@
   `the_managed_budget_covers_a_cold_guardian_and_daemon_start`）；`cargo test -p yi-agent-subagent`（100 lib + 集成全绿）
 
 - [ ] 按客户端隔离的 worker executor 尚未接入生产装配（Task 7 已完成机制，Task 11 完成接线）— 机制本身落地在 `yi-agent-rs/crates/yi-agent-subagent/src/executor/`（协议、proxy、serve、按 owner 懒建的 `ProcessWorkerFactory`、gate 代理）与 `yi-agent-rs/crates/yi-agent/src/managed_runtime.rs`（隐藏的 `internal-runtime executor` 入口，只从继承的私有 FD 取控制通道），并由 `crates/yi-agent-supervisors/src/lifecycle/admission.rs` 向 guardian 做 owner-bound 准入。**但 daemon 侧的 `DaemonAgentWorkerFactory` 仍是线程实现**：真正按 client spawn sibling executor、走 guardian 就绪屏障／登记 ACK 的 launcher 属于 Task 11 的受管私有运行角色，本任务只保证接口可用（`ExecutorConnector` 目前只有测试实现，生产实现待接）。因此当前**不能**宣称「卡死 worker 也能按客户端强停」。判据：当 `crates/yi-agent-store/src/runtime.rs` 的 worker 工厂构造点改为装配 `ProcessWorkerFactory`，且存在通过 guardian 就绪管道启动的真实 `ExecutorConnector` 时，勾掉本项。
-  **2026-11-03 复核：缺的不是「少写一个 connector」，而是三处结构性前提都不存在，因此判定为需要设计决策，不能在本期收口。**
-  ① **控制协议没有「发通道」这个操作**：`ManagedSpawnClient::connect` 只接受**继承来的**描述符（路径连接被刻意禁止，否则任何本地进程都能要求 guardian 代它 spawn），
+  **2026-11-04 进展：① 与 ③ 已补齐，剩下 ② 与 daemon 侧的启动路径。**
+  ① **控制协议已有「发通道」这个操作（已解决）**：`ControlRequest::OpenManagedChannel { grant }` → guardian 建 socketpair、
+  在自身线程按共享 registry 服务 guardian 端、回 `ChannelOpened { owner, generation }` 并把客户端端以 `SCM_RIGHTS` 附发；
+  准入在开通道之前用 `LeaseTable::admits` 校验，owner 取自 grant 而非请求自报。前端侧 `FrontendLease::managed_owner()` 已用它把
+  bash／`process_start`／MCP 的 spawn 变成 owner-bound（TUI 与 headless 都已接线，见下一条）。
+  ③ **工具侧已离开接口层（已解决）**：`build_tool_setup_owned` 的生产调用点现在传 `Some(..)`，`ManagedSpawner::new` 有非测试调用者。
+  仍未解决的是 ② **daemon 不认识客户端身份**（`yi-agent-store` 里 `ClientGrant` 出现次数仍为 0，只有字符串式的 `RuntimeClients`），
+  以及 daemon 侧 `DaemonAgentWorkerFactory` 仍是线程实现、`ExecutorConnector` 仍只有测试实现。
+  因此 § 下面那条 `quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 依然**不能**诚实实现：它要的是「释放 app 后 app 的 executor 组真的被终止，
+  而两个 TUI 的 executor 继续推进新 marker 序号」，这需要把客户端身份从业务 IPC（`AttachApplicationRoot`）传到 coordinator，
+  并让 daemon 侧真正起 sibling executor。**这条属设计决策，不在本轮擅自落地。**
+  以下为 2026-11-03 的原始复核记录，保留以示当时判断：
+  ① **控制协议（当时）没有「发通道」这个操作**：`ManagedSpawnClient::connect` 只接受**继承来的**描述符（路径连接被刻意禁止，否则任何本地进程都能要求 guardian 代它 spawn），
   但 `ControlRequest` 的全部变体（`Identity`／`Register`／`Resume`／`Heartbeat`／`Release`／`ReclaimStatus`／`Operation`／`Admission`／`Preview`／`PreviewPage`／`Confirm`／`Status`）
   里没有任何一项会被 guardian 应答以一个描述符；`codec` 是裸 JSON（u32 长度 + body），没有 `SCM_RIGHTS` 通道。也就是说「guardian 如何把 owner-bound 通道交给 daemon」这一步在设计上还没落地。
   ② **daemon 不认识客户端身份**：`yi-agent-store`（daemon 侧）里 `ClientGrant` 出现次数为 0，它只有自己的 `RuntimeClients`（root→owner 的字符串绑定）。
   而 `GuardianAdmission::new(runtime_dir, grant)` 要求客户端 grant，`guardian` 的 `Admission` 分支按 grant 校验 owner——所以 daemon 目前**无法**通过准入检查，即便有了 connector。
-  ③ **工具侧同样停在接口层**：`ManagedSpawner::new(ChannelFactory)` 的生产注入点 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 全仓只有一处调用且传 `None`
+  ③ **工具侧（当时）停在接口层**：`ManagedSpawner::new(ChannelFactory)` 的生产注入点 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 全仓只有一处调用且传 `None`
   （`bootstrap.rs:210`），`ManagedSpawner::new` 的调用者全部在 `crates/yi-agent-tools/tests/managed_bash.rs`。这与 executor 是同一个洞：缺通道能力，两条链都是「机制齐、接线空」。
   因此 `quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 这一条**不能**诚实实现——它需要「释放 app 后 app 的 executor 组真的被终止，而两个 TUI 的 executor 继续推进新 marker 序号」，
   而这正需要上述①②③。补齐它需要先决定：通道由 guardian 在 `Admission` ACK 时一并交出（控制帧需扩 `SCM_RIGHTS`），还是 daemon 从自己的 bootstrap 通道上再派生；
   以及客户端身份如何从业务 IPC（`AttachApplicationRoot`）传到 coordinator。这两项都改变控制协议与 daemon 的会话模型，属设计决策，不在本轮擅自落地。验证现状：`cargo test -p yi-agent-subagent`（100 lib + 36 集成）、`cargo test -p yi-agent-supervisors --test execution_admission`（7 passed）、`cargo test -p yi-agent --bin yi-agent managed_runtime`（4 passed）— [设计](../superpowers/specs/2026-11-02-shared-daemon-lifecycle-and-upgrade-design.md)、[计划](../superpowers/plans/2026-11-02-shared-daemon-lifecycle-and-upgrade.md)
-- [ ] 工具与插件 spawn 全部走 owner-bound 受管通道（Task 8 Step 3 的后半） — 机制齐全但生产装配仍为空：`ManagedSpawner` 有 `Frontend` 策略、
-  `ManagedProcessPolicy` 能拒绝 `keep`、`PluginDemandTable` 能按 owner 计数，但 `build_tool_setup_owned(..., managed: Option<ManagedOwner>)` 的**唯一**生产调用点
-  （`yi-agent-runtime/src/bootstrap.rs:210`）传 `None`，而 `ManagedSpawner::new` 的两个调用者都在 `crates/yi-agent-tools/tests/managed_bash.rs`。
-  shell／bash、`process_start`、MCP `manager.rs` 的 `TokioChildProcess::new(cmd)` 因此仍直接 spawn，未登记到 guardian。
-  判据：`grep -rn "build_tool_setup_owned" --include=*.rs crates/` 的调用点传入 `Some(..)`；`grep -rn "ManagedSpawner::new" --include=*.rs crates/` 出现非测试调用者。
-  **与下方 executor 条目同根**：`ChannelFactory` 需要一条从 guardian 继承来的私有通道，而控制协议目前没有「应答一个描述符」的操作（见该条 ①②③）。
-  所以这条不能靠改调用点单独完成，须先定通道交付方式。
+- [x] 工具与插件 spawn 全部走 owner-bound 受管通道（Task 8 Step 3 的后半） — **已接线（TUI 与 headless）**。控制协议补上唯一缺的操作：
+  `ControlRequest::OpenManagedChannel { grant }` → guardian 建 `socketpair`、在自己的线程上按共享 registry 服务 guardian 端、
+  回 `ControlResponse::ChannelOpened { owner, generation }` 并把客户端端以 `SCM_RIGHTS` 附带发出
+  （`yi-agent-lifecycle/src/types.rs`、`yi-agent-supervisors/src/lifecycle/guardian.rs::serve_open_channel`）。
+  **owner 不可由请求自报**：它由 `Reclaimer::leases().admits(grant, now)` 解析，所以 lease-only 观察者、已释放客户端、过期 epoch 都在**开通道之前**被拒
+  （`crates/yi-agent-supervisors/tests/managed_channel_authority.rs`，3 passed）。guardian 没有 registry 时返回 `Unsupported`——不能签发它无法回收的通道。
+  前端侧 `FrontendLease::managed_owner()`（`yi-agent/src/frontend_lease.rs`）把通道变成 `(ManagedProcessPolicy::Frontend, ManagedSpawner)`：
+  probe 通道用于首个 spawn，之后每次 spawn 用 `open_channel_with` 开**新**通道（不复用：owner 在创建时固定，复用会让第二个 owner 的进程答在第一个的连接上）。
+  headless 改为一次 `build_tool_setup_owned(..., managed)`，bash／`process_start`／MCP 共用同一 owner；
+  TUI 先 register 得 lease 再建工具，并用 `ProcessManager::adopt_managed` **就地**升级已注册的 manager（重建会丢掉在跑子进程的句柄）。
+  判据：`grep -rn "ManagedSpawner::new" --include=*.rs crates/` 有非测试调用者 `crates/yi-agent/src/frontend_lease.rs`；
+  `crates/yi-agent/src/main.rs::build_headless_root_tools` 把 `managed` 透传给 `build_tool_setup_owned`；
+  端到端 `a_headless_runs_tool_processes_are_owned_by_that_run`（`crates/yi-agent/tests/frontend_runtime_lease.rs`）让模型真的调一次 `bash`，
+  断言 guardian journal `processes.json` 里该进程的 owner 是 `frontend` 且形如 `run:...`——去掉 guardian 后该测试失败（已用变异验证）。
+  **仍未接的是 App/sidecar 路径**：`yi-agent-app-server/src/server/assembly.rs::build_runtime_tooling` 仍传 `None`。sidecar 刻意不持可再生凭据
+  （见 `shell_authorization` 设计），要它 spawn 受管进程必须先由壳把能力传下去，属下方 executor 条目（Task 11/13）的范围。
+  另修一个此路径首次可达才暴露的缺陷：`ManagedSpawnRequest::Wait` 原来不带预算，服务端拿**通道读超时**当等待预算，
+  导致跑得比通道预算久的命令被答成 `group_stopped: false`、无退出码（调用方渲染成 `exit: -1`）。现在预算随请求传递
+  （`budget_secs`），客户端按自身 deadline 放宽读超时，服务端提前 `REPLY_MARGIN` 收尾，避免答案被调用方自己的读超时吃掉。
+  判据：`cargo test -p yi-agent-supervisors --test managed_channel`（7 passed + 1 ignored，含 `a_wait_is_bounded_by_the_requests_own_budget`，
+  用 1s 请求预算对抗 120s 通道预算，服务端若忽略请求预算该测试超时）。
 
 - [x] 租约过期必须真的回收，而不是只从表里删掉（Task 12） — 原来 `LeaseTable::expire` 存在但 guardian 的 serve 循环从不调用它：前端崩溃后心跳停止，
   它的租约永远活着，而它启动的进程组既没有 owner 也没有人回收——这正是租约机制存在的理由被绕过。现在三处补齐：**①** `Reclaimer::expire_leases(now)`

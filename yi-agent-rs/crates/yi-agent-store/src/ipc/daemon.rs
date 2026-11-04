@@ -174,11 +174,13 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
-        Self::start_with_factory_and_activation(
+        Self::start_with_factory_and_authority(
             runtime_dir,
             database_path,
             factory,
             crate::foreground::ForegroundActivation::Disabled,
+            None,
+            None,
         )
     }
 
@@ -194,21 +196,38 @@ impl Daemon {
         factory: Arc<dyn AgentWorkerFactory>,
         activation: crate::foreground::ForegroundActivation,
     ) -> Result<Self, IpcError> {
-        Self::start_with_bridge(runtime_dir, database_path, factory, activation, None)
+        Self::start_with_factory_and_authority(
+            runtime_dir,
+            database_path,
+            factory,
+            activation,
+            None,
+            None,
+        )
     }
 
-    /// [`Self::start_with_factory_and_activation`] plus the guardian's authority bridge.
+    /// Starts the daemon with the guardian's authority already installed.
     ///
-    /// The descriptor is optional because an embedded daemon has no guardian: nobody
-    /// could vouch for a root, so there is no bridge and managed roots stay closed.
-    /// A guardian-started daemon must pass the descriptor here, or it will refuse every
-    /// authorization the guardian mints -- the exact failure this entry point exists to
-    /// make impossible to reach by accident.
-    pub fn start_with_bridge(
+    /// Installed *before* the listener binds on purpose: an attach that raced the
+    /// handshake would be judged by the unmanaged default and admitted with no
+    /// authorization at all. `None` keeps the old behaviour exactly.
+    ///
+    /// `activation` and `managed` are independent: the first decides whether this
+    /// daemon reconciles persisted foreground facts at startup, the second is the
+    /// verifier half of the guardian's capability ledger. A managed daemon needs
+    /// both; an embedded one passes `Disabled` and `None`.
+    pub fn start_with_factory_and_authority(
         runtime_dir: impl AsRef<Path>,
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
         activation: crate::foreground::ForegroundActivation,
+        managed: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
+        // The daemon's end of the guardian's *foreground* authority bridge. A
+        // separate descriptor from the lifeline that carried `managed`: the lifeline
+        // is the daemon's death monitor and capability feed, while this channel
+        // carries the challenge/answer exchange that installs a root. Sharing one
+        // descriptor would make a half-written foreground frame look like a dropped
+        // lifeline, i.e. a live daemon reported dead.
         bridge: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self, IpcError> {
         raise_file_descriptor_limit();
@@ -278,6 +297,9 @@ impl Daemon {
             factory,
             activation,
         )?);
+        if let Some(ledger) = managed {
+            coordinator.adopt_managed_authority(ledger);
+        }
         // A fresh daemon starts with no plugin routes; the supervisor republishes
         // them as soon as it reconciles. Only this project's routes are dropped:
         // another project's daemon in the same process keeps serving.
@@ -511,6 +533,12 @@ impl Daemon {
     /// printing the historical one-liner.
     pub fn reclaimed_orphans(&self) -> usize {
         self.reclaimed_orphans
+    }
+
+    /// The coordinator this daemon serves, for a managed launcher that has to
+    /// install the guardian's authority before the socket is reachable.
+    pub fn coordinator(&self) -> &Arc<RuntimeCoordinator> {
+        &self.coordinator
     }
 
     /// Stop this manually started daemon and release its local runtime files.
@@ -1152,6 +1180,68 @@ impl RequestContext {
     }
 }
 
+/// 维护屏障查询。
+///
+/// # 三条判定，顺序不能换
+///
+/// 1. **协议兼容**先判：对端太旧时它根本不会理解"closed"这个回答，而它
+///    自己的启动路径也不会来问。此时唯一安全的答复是明确拒绝，并告诉用户
+///    该升级哪一侧。把它读成"没有维护"会让旧 daemon 在迁移期间照常拉起
+///    后端——那正是这条协议要防的事。
+/// 2. 插件 id 必须可解析。解析失败不是"没有这个插件"，而是"我看不懂这条
+///    请求"，同样不能当成放行。
+/// 3. 最后才读磁盘。**每次都读**：内存里的结论在通知丢失、或事务由别的
+///    进程推进时，会与事实相反。
+fn plugin_maintenance(plugin: String, protocol: Option<u32>) -> Result<IpcResponse, IpcError> {
+    use crate::ipc::managed::{Compatibility, MaintenanceBarrier, MaintenanceState};
+
+    // 直接回 `IpcResponse::Error` 而不是 `Err(IpcError::...)`：`error_response`
+    // 刻意把 Io 类错误的 message 抹成 `None`，而这里必须把"升级哪一侧"
+    // 送到用户眼前——只说"validation failed"等于什么都没说。这与
+    // `CancelTask` 的处理方式一致：可预期的对端错误带上消息直接回。
+    let compatibility = Compatibility::check(protocol);
+    if !compatibility.is_supported() {
+        return Ok(IpcResponse::Error {
+            code: IpcErrorCode::Validation,
+            message: Some(format!(
+                "maintenance protocol {} is not supported by this daemon: {}",
+                protocol.unwrap_or(0),
+                compatibility.advice()
+            )),
+        });
+    }
+
+    let plugin = match crate::ipc::managed::parse_plugin(&plugin) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            return Ok(IpcResponse::Error {
+                code: IpcErrorCode::Validation,
+                message: Some(error.to_string()),
+            });
+        }
+    };
+
+    // 实例根可能不存在（测试、或宿主还没初始化）。没有实例根就**没有**
+    // 任何事务日志，因此结论是 `open`——但这是"确实没有记录"，
+    // 不是"读失败"，两者在 `MaintenanceState` 里必须分开。
+    let Some(home) = crate::paths::instance_home() else {
+        return Ok(IpcResponse::PluginMaintenanceStatus {
+            state: MaintenanceState::Open.as_str().to_string(),
+            transaction_id: None,
+            phase: None,
+            detail: Some("no instance home is configured; no transaction can be recorded".into()),
+        });
+    };
+
+    let status = MaintenanceBarrier::at(home).state(&plugin);
+    Ok(IpcResponse::PluginMaintenanceStatus {
+        state: status.state.as_str().to_string(),
+        transaction_id: status.transaction_id,
+        phase: status.phase,
+        detail: status.detail,
+    })
+}
+
 pub(crate) fn respond(
     context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
@@ -1349,6 +1439,7 @@ pub(crate) fn respond(
             method,
             params,
         } => forward_plugin_query(&context.scope, &plugin, &method, params),
+        IpcRequest::PluginMaintenance { plugin, protocol } => plugin_maintenance(plugin, protocol),
         IpcRequest::DeleteSchedule { schedule_id } => {
             if !context.with_repository(|repository| {
                 repository
@@ -1672,8 +1763,11 @@ pub(crate) fn respond(
             };
             let (status, children, reports) = match outcome {
                 Err(_) => {
-                    let (children, reports) =
-                        coordinator.child_completion_snapshot(&session_id, &caller_task_id)?;
+                    // Same runtime as the wait itself: the snapshot needs the
+                    // supervisor guard, and the wait may have just released it.
+                    let (children, reports) = runtime.block_on(
+                        coordinator.child_completion_snapshot(&session_id, &caller_task_id),
+                    )?;
                     (
                         "timeout".into(),
                         children

@@ -182,3 +182,20 @@
   `a_spawn_receipt_round_trips_through_the_wire_codec`、
   `a_silent_peer_times_out_instead_of_wedging_the_serve_loop`；**变异验证**：让 `recv_with_fds`
   丢弃辅助数据 → 三流用例红（实测 RED）
+
+- [x] 控制协议可以向前端签发私有 spawn 通道（Task 11／12／18 的接线前提） —
+  `ControlRequest::OpenManagedChannel { grant }` 是唯一会应答描述符的控制请求：guardian 建 `socketpair`，
+  在自己线程上按共享 registry 服务 guardian 端，回 `ControlResponse::ChannelOpened { owner, generation }`
+  并把客户端端作为 `SCM_RIGHTS` 辅助数据随帧发出。**请求不能自报 owner**，owner 取自 grant，
+  由服务端用租约表解析（lease-only 观察者、已释放客户端、过期 epoch 都在开通道之前被拒）。
+  前端侧 `FrontendLease::open_managed_channel`／`open_channel_with`／`control_path` 是配套的客户端封装；
+  `open_channel_with` 复用已有 grant 而不重新 register，因为重复 register 会给同一进程造出第二条租约，
+  让「最后一个前端离开」无法判定。判据：`cargo test -p yi-agent-supervisors --test managed_channel_authority`
+  （3 passed：业务租约拿到绑定自身 owner 的通道、lease-only 被拒、已释放客户端被拒）；
+  `cargo test -p yi-agent-lifecycle`（33 + 3 + 21 + 5 + 14 + 4 passed）
+- [x] `Wait` 的预算随请求传递，不再借用通道读超时 — 通道的读超时是为了发现死掉的对端，不是用来限制一次合法等待；
+  把两者混用会让跑得比通道预算久的命令被答成 `group_stopped: false`、无退出码，调用方读作 `exit: -1`。
+  现在 `Wait { process_id, budget_secs }`（`#[serde(default)]`，0 表示老客户端，服务端退回通道预算=旧行为），
+  客户端读超时按自身 deadline 放宽，服务端提前 `REPLY_MARGIN = 100ms` 收尾，避免"服务端刚写完"与"客户端刚好读超时"撞在一起。
+  判据：`cargo test -p yi-agent-supervisors --test managed_channel`（7 passed + 1 ignored），
+  `a_wait_is_bounded_by_the_requests_own_budget` 用 1s 请求预算对抗 120s 通道预算

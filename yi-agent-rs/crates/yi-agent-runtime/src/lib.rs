@@ -8,4 +8,5 @@ pub mod models;
 pub mod onboarding;
 pub mod reasoning_probe;
 pub mod settings;
+pub mod side_conversation;
 pub mod supervise;

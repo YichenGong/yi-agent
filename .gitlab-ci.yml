@@ -84,6 +84,34 @@ ci-desktop:
     - cd yi-agent-rs
     - just desktop-check
 
+# 插件是独立 workspace + 独立 Node 前端，门禁单独一个 job，且**只跑云端
+# runner**（不加 tags，因此不进 Mac mini）。签名私钥只在受保护环境的插件
+# release workflow 里，这个 job 碰不到；不可信 MR 因此无法借它读取密钥。
+#
+# 用 rust:latest 而不是 node: 镜像：要在同一个 job 里跑 Rust 与 Node 两套，
+# 装 Node 比装整套 Rust 便宜。
+ci-plugins:
+  stage: check
+  image: rust:latest
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg git >/dev/null
+    - curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource.sh
+    - bash /tmp/nodesource.sh >/dev/null
+    - apt-get install -y --no-install-recommends nodejs >/dev/null
+    - curl -sSf https://just.systems/install.sh -o /tmp/install-just.sh
+    - sh /tmp/install-just.sh --to /usr/local/bin
+    - rustup component add rustfmt
+  script:
+    - cd yi-agent-rs
+    - just plugin-workspace-check
+    - just plugin-ui-check
+    - just plugin-contracts-check
+    - just plugin-boundary-check
+    - just plugin-acceptance-check
+
 # tag 推送时在 Mac mini 上构建并发布 macOS(arm64) 桌面 App 的 dmg。
 # 逻辑全部在 desktop/scripts/release-dmg.sh 里，job 保持薄。
 release:macos-dmg:

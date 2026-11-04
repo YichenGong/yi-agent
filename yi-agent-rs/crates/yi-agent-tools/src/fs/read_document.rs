@@ -415,50 +415,113 @@ impl ReadDocumentTool {
                 max: MAX_DOCUMENT_BYTES,
             });
         }
-        let bytes = std::fs::read(path).map_err(ToolsError::Io)?;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-
-        let (text, any_text) = match ext.as_str() {
-            "pdf" => extract_pdf(&bytes, pages)?,
-            "docx" => (extract_docx(&bytes)?, true),
-            "html" | "htm" => {
-                let raw = String::from_utf8_lossy(&bytes);
-                (html2md::parse_html(&raw), true)
-            }
-            _ => {
-                let raw = String::from_utf8(bytes).map_err(|_| {
-                    ToolsError::DocumentParse(format!(
-                        "{} is not a UTF-8 text document; supported: pdf, docx, html, txt, md, csv",
-                        path.display()
-                    ))
-                })?;
-                (raw, true)
-            }
-        };
-
-        if !any_text {
-            return Ok(format!(
-                "read {}: no text layer found (无文本层，疑似扫描件); \
-                 PDF rendering/OCR is not supported",
-                path.display()
-            ));
-        }
-
-        let mut body = text;
-        let total = body.chars().count();
-        if total > self.max_chars {
-            body = body.chars().take(self.max_chars).collect();
-            body.push_str(&format!(
-                "\n[truncated: showed {shown} of {total} chars; narrow with `pages` or read a smaller range]",
-                shown = self.max_chars,
-            ));
-        }
-        Ok(format!("read {} ({total} chars)\n{body}", path.display()))
+        let bytes = read_bounded(path, MAX_DOCUMENT_BYTES as usize)?;
+        read_document_body(
+            &bytes,
+            &path.display().to_string(),
+            &ext,
+            pages,
+            self.max_chars,
+        )
     }
+}
+
+/// Read at most `limit` bytes, failing when the file is larger.
+///
+/// The `take(limit + 1)` shape is what makes this a check of the *actual* bytes
+/// rather than of a `metadata` length that can change between the two calls
+/// (spec §5.4: "不能仅信预先 metadata").
+pub fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ToolsError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(ToolsError::Io)?;
+    let mut buffer = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(ToolsError::Io)?;
+    if buffer.len() > limit {
+        return Err(ToolsError::DocumentTooLarge {
+            size: buffer.len() as u64,
+            max: limit as u64,
+        });
+    }
+    Ok(buffer)
+}
+
+/// Parse an already-read document buffer.
+///
+/// This is the single implementation behind both the path-based tool and the
+/// handle-based side tool: `pages` validation, CJK repair, the scanned-file
+/// notice and the bounded output all live here, so the two entry points cannot
+/// drift apart. `display_name` is what the caller called the file.
+pub fn read_document_bytes(
+    bytes: &[u8],
+    display_name: &str,
+    extension: &str,
+    pages: Option<&str>,
+    max_chars: usize,
+) -> Result<String, ToolsError> {
+    let pages = match pages {
+        Some(spec) => match parse_pages(spec) {
+            Some(range) => Some(range),
+            None => {
+                return Err(ToolsError::DocumentParse(format!(
+                    "invalid pages spec {spec:?}: use \"3\" or \"1-5\""
+                )));
+            }
+        },
+        None => None,
+    };
+    let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+    read_document_body(bytes, display_name, &ext, pages, max_chars)
+}
+
+/// Shared core: parse and format, with `pages` already validated.
+fn read_document_body(
+    bytes: &[u8],
+    display_name: &str,
+    ext: &str,
+    pages: Option<(u32, u32)>,
+    max_chars: usize,
+) -> Result<String, ToolsError> {
+    let (text, any_text) = match ext {
+        "pdf" => extract_pdf(bytes, pages)?,
+        "docx" => (extract_docx(bytes)?, true),
+        "html" | "htm" => {
+            let raw = String::from_utf8_lossy(bytes);
+            (html2md::parse_html(&raw), true)
+        }
+        _ => {
+            let raw = String::from_utf8(bytes.to_vec()).map_err(|_| {
+                ToolsError::DocumentParse(format!(
+                    "{display_name} is not a UTF-8 text document; supported: pdf, docx, html, txt, md, csv"
+                ))
+            })?;
+            (raw, true)
+        }
+    };
+
+    if !any_text {
+        return Ok(format!(
+            "read {display_name}: no text layer found (无文本层，疑似扫描件); \
+             PDF rendering/OCR is not supported"
+        ));
+    }
+
+    let mut body = text;
+    let total = body.chars().count();
+    if total > max_chars {
+        body = body.chars().take(max_chars).collect();
+        body.push_str(&format!(
+            "\n[truncated: showed {max_chars} of {total} chars; narrow with `pages` or read a smaller range]"
+        ));
+    }
+    Ok(format!("read {display_name} ({total} chars)\n{body}"))
 }
 
 #[cfg(test)]

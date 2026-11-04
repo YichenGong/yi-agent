@@ -170,6 +170,21 @@ pub fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &ta
             event: tauri::WindowEvent::CloseRequested { api, .. },
             ..
         } => hide_on_close(app, label, api),
+        // 插件窗口被销毁时撤销它的资源句柄。不做这一步，白名单会一直留在
+        // 内存里，而且一个"已关闭"的实例仍然能读文件——前端拿旧句柄
+        // 调 invoke 就能复现。
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => {
+            use tauri::Manager;
+            if let Some(host) =
+                app.try_state::<std::sync::Arc<crate::plugin_host::host::PluginHost>>()
+            {
+                host.close_window(label);
+            }
+        }
         // `has_visible_windows == true` means the app is merely behind
         // another one: macOS already brings it forward, and calling `show()`
         // there would steal focus the user is in the middle of moving.

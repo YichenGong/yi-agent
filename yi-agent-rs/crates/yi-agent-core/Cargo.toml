@@ -29,5 +29,5 @@ glob = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "env-filter"] }

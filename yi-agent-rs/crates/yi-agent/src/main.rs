@@ -8,9 +8,11 @@ mod frontend_lease;
 mod llm_prefix;
 mod managed_runtime;
 mod onboarding_prompt;
+mod plugins_cmd;
 mod resume;
 mod schedule_intent;
 mod session_store;
+mod side_driver;
 mod tracing_init;
 mod tui;
 mod turn_log;
@@ -41,12 +43,46 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
     }
 }
 
+/// Tell the subagent layer what artifact this process is and where its instance
+/// state lives.
+///
+/// The expected identity names *this* executable: for the TUI the daemon it owns
+/// is itself, and for the desktop the sidecar is a copied build of the same crate,
+/// so the same id describes both. The path is resolved at runtime because the
+/// artifact may sit in an app bundle, a cached copy, or `target/debug`.
+///
+/// Best effort, like everything else about *optional* delegation: without a home
+/// directory there is no instance to scope to, and refusing to start the CLI over
+/// that would be worse than an embedded runtime.
+fn install_managed_context() {
+    let Some(instance_home) = yi_agent_store::paths::instance_home() else {
+        return;
+    };
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(%error, "cannot resolve the executable path for managed bring-up");
+            return;
+        }
+    };
+    yi_agent_subagent::attach::install_managed_context(yi_agent_subagent::attach::ManagedContext {
+        expected: build_info::artifact_identity(executable),
+        instance_home,
+    });
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 开关的构建类型硬闸读的是本 crate `build.rs` 注入的值；别的 crate 读不到
     // `rustc-env`，所以必须在这里显式注入一次。
     yi_agent_flags::set_build_info(build_info::BUILD_KIND, build_info::VERSION);
+
+    // Only the binary knows its own artifact identity (`YI_AGENT_DAEMON_BUILD_ID`)
+    // and where this instance keeps its state. Install both once, before any
+    // command runs, so the app-server's project attach can consult the bring-up
+    // policy without every transport signature growing two parameters.
+    install_managed_context();
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their
@@ -107,6 +143,14 @@ fn main() -> Result<()> {
             InternalRuntimeAction::Guardian => run_internal_guardian(),
             InternalRuntimeAction::Daemon => run_internal_daemon(),
         },
+        Some(Command::Plugins { ref action }) => {
+            // `exec` 是前台命令，退出码就是插件进程的退出码。
+            let code = plugins_cmd::run(action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {
@@ -833,6 +877,64 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
 }
 
 /// 停止句柄：置位后循环退出并 `stop_all`，用于测试与 daemon 退出时的回收。
+/// `daemon start` 等待后端应答的总预算。
+///
+/// 原先是 50 次 × 10ms = 500ms。这个值只在轻载机器上够用：`just ci` 里全量
+/// nextest 会同时拉起上千个测试与多个进程，`daemon serve` 光是走到监听就
+/// 可能超过 500ms，于是 `daemon start` 报"未就绪"、测试判红，而 daemon 其实
+/// 几百毫秒后就会正常起来。**这是测试环境暴露出来的真实缺陷**，不是测试写得
+/// 太急：给后端启动留的预算必须覆盖真实负载，且失败原因要能区分。
+///
+/// 15s 的取舍：正常情况仍会在几十毫秒内返回（每 10ms 轮询一次），只有真的
+/// 卡住才走满；同时远小于 nextest 的 slow-timeout，不会把慢测试变成超时。
+const DAEMON_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 轮询间隔。
+const DAEMON_READY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DaemonReady {
+    /// 后端已应答。
+    Ready,
+    /// 子进程在我们放弃等待之前就退出了。
+    ///
+    /// 与 `TimedOut` 分开，因为两种情况的下一步完全不同：退出通常是配置或
+    /// 端口冲突（重试无用，需要看它为什么死），超时则可能只是慢。
+    Exited(String),
+    /// 预算耗尽但子进程还活着。
+    TimedOut,
+}
+
+/// 等待后端就绪。
+///
+/// `probe` 返回是否已应答；`reaped` 在子进程已退出时返回它的状态。
+/// 两个闭包注入进来是为了能测"退出早于就绪"和"超时"，而不必真的起进程。
+///
+/// # 为什么每轮先 probe 再看 reaped
+///
+/// 后端可能在发出最后一个应答后立刻退出（例如被人 kill）。先 probe 能把这
+/// 次已经成立的应答算成功；反过来先看 reaped 会把它误报成失败。
+pub(crate) fn wait_for_daemon(
+    mut probe: impl FnMut() -> bool,
+    mut reaped: impl FnMut() -> Option<std::process::ExitStatus>,
+    budget: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> DaemonReady {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if probe() {
+            return DaemonReady::Ready;
+        }
+        if let Some(status) = reaped() {
+            return DaemonReady::Exited(status.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return DaemonReady::TimedOut;
+        }
+        sleep(DAEMON_READY_POLL);
+    }
+}
+
 pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
@@ -848,26 +950,37 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // A manually started daemon creates the same project-local state
             // root the embedded runtimes do, so it must self-ignore it too.
             ignore_project_local_runtime_state(&workdir);
-            std::process::Command::new(std::env::current_exe()?)
+            let mut child = std::process::Command::new(std::env::current_exe()?)
                 .args(["daemon", "serve"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .current_dir(&workdir)
                 .spawn()?;
-            for _ in 0..50 {
-                if yi_agent_store::ipc::send_request(
-                    &runtime,
-                    yi_agent_store::ipc::IpcRequest::Status,
-                )
-                .is_ok()
-                {
+            match wait_for_daemon(
+                || {
+                    yi_agent_store::ipc::send_request(
+                        &runtime,
+                        yi_agent_store::ipc::IpcRequest::Status,
+                    )
+                    .is_ok()
+                },
+                || child.try_wait().ok().flatten(),
+                DAEMON_READY_BUDGET,
+                std::thread::sleep,
+            ) {
+                DaemonReady::Ready => {
                     println!("daemon started");
-                    return Ok(());
+                    Ok(())
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                DaemonReady::Exited(status) => {
+                    anyhow::bail!("daemon exited before it became ready ({status})")
+                }
+                DaemonReady::TimedOut => anyhow::bail!(
+                    "daemon process did not become ready within {}ms",
+                    DAEMON_READY_BUDGET.as_millis()
+                ),
             }
-            anyhow::bail!("daemon process did not become ready")
         }
         DaemonAction::Serve => {
             // `daemon start` spawns this subcommand detached; a directly
@@ -987,9 +1100,28 @@ fn build_headless_root_tools(
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
+    managed: Option<(
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    )>,
 ) -> Result<HeadlessSetup> {
-    let setup =
-        build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
+    // Both the builtin tools and the process manager are built from the same owner:
+    // `build_tool_setup_owned` wires the managed spawner into `bash`, the process
+    // tools *and* the MCP launcher. Building the builtins separately and patching
+    // them afterwards would leave the process tools spawning directly, which is the
+    // inconsistency this path exists to avoid.
+    let mut setup = yi_agent_runtime::bootstrap::build_tool_setup_owned(
+        config,
+        false,
+        std::slice::from_ref(&attached_root.workspace.path),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+            config.sandbox,
+            config.sandbox_promotable,
+        ),
+        Vec::new(),
+        managed,
+    )?;
     let mut registry = (*setup.tools).clone();
     let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
     let delegation_controller = yi_agent_tools::SandboxController::new(
@@ -1003,13 +1135,8 @@ fn build_headless_root_tools(
         delegation_controller,
         caller,
     );
-    Ok(HeadlessSetup {
-        tools: Arc::new(registry),
-        catalog: setup.catalog,
-        system_prompt: setup.system_prompt,
-        mcp: setup.mcp,
-        process_manager: setup.process_manager,
-    })
+    setup.tools = Arc::new(registry);
+    Ok(setup)
 }
 
 struct HeadlessRuntimeSession {
@@ -1037,6 +1164,9 @@ fn attach_application_root_request(
 }
 
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
+    if let Some(session) = attach_managed_headless_runtime(config) {
+        return session;
+    }
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
@@ -1118,6 +1248,10 @@ fn build_tui_root_tools(
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
+    managed: Option<(
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    )>,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
     // `base_registry` 只有 skills,`mcp_reload` 是在主注册表上登记的;切根目录
@@ -1132,11 +1266,23 @@ fn build_tui_root_tools(
         Some(blocklist_fn),
     );
     // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
-    yi_agent_tools::register_builtin_tools_with_sandbox(
+    //
+    // A managed frontend spawns through the guardian so a tool process outlives no
+    // client silently: `managed` carries the owner this TUI registered as plus the
+    // factory that opens a private channel per child. `None` (embedded mode) keeps
+    // the direct spawn, because there is no guardian to reclaim for.
+    let controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
+    yi_agent_tools::register_builtin_tools_managed(
         &mut registry,
         vec![attached_root.workspace.path.clone()],
-        config.sandbox,
+        controller,
         config.sandbox_writable_roots.clone(),
+        Vec::new(),
+        managed,
     );
     let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
     let delegation_controller = yi_agent_tools::SandboxController::new(
@@ -1307,7 +1453,133 @@ fn startup_intent_for(
 ///
 /// `cli` is kept because the daemon worker factory resolves the user's model
 /// configuration from the same overrides the TUI itself uses.
+/// The headless half of the managed dispatch.
+///
+/// Unlike the TUI this returns `Result`: `run` is a one-shot command whose exit
+/// status is its contract, so a runtime the user explicitly asked for by policy
+/// must not be silently swapped for an embedded one either.
+fn attach_managed_headless_runtime(
+    config: &config::Config,
+) -> Option<Result<HeadlessRuntimeSession>> {
+    use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
+
+    let choice = process_bringup_choice();
+    if choice.policy != BringUpPolicy::Managed {
+        return None;
+    }
+    let (Some(expected), Some(instance_home)) = (choice.expected, choice.instance_home) else {
+        return Some(Err(anyhow::anyhow!(
+            "managed runtime: this process never installed its artifact identity or instance home"
+        )));
+    };
+    Some((|| {
+        let runtime_dir = runtime_directory_for(&config.workdir);
+        ignore_project_local_runtime_state(&config.workdir);
+        let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+            yi_agent_subagent::attach::MANAGED_START_BUDGET,
+        );
+        let attached = yi_agent_subagent::attach::attach_managed_project_runtime(
+            config,
+            runtime_dir.clone(),
+            &instance_home,
+            &expected,
+            yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
+            deadline,
+        )
+        .map_err(|failure| anyhow::anyhow!("managed runtime: {}", failure.cause))?;
+        // The lease goes on only after the attach succeeded: registering for a
+        // project this process never joined would make the guardian wait for a
+        // frontend that has no work.
+        let frontend_lease = crate::frontend_lease::FrontendLeaseHandle::register(
+            &runtime_dir,
+            yi_agent_lifecycle::types::ClientKind::Headless,
+            crate::frontend_lease::new_client_run_id("run"),
+        )
+        .ok()
+        .flatten();
+        Ok(HeadlessRuntimeSession {
+            socket_path: attached.socket_path.clone(),
+            attached_root: crate::tui::subagents::AttachedRoot {
+                session_id: attached.attached_root.session_id,
+                task_id: attached.attached_root.task_id,
+                capability: attached.attached_root.capability,
+                workspace: attached.attached_root.workspace,
+            },
+            embedded_daemon: None,
+            frontend_lease,
+        })
+    })())
+}
+
+/// Attach through the managed policy, or report `None` when the policy is embedded.
+///
+/// `None` and `Unavailable` mean different things and must not be conflated: the
+/// caller falls through to the embedded path on `None`, while `Unavailable` is the
+/// managed path's own verdict and has to reach the user. Folding them together
+/// would silently start an embedded daemon under a policy that forbids one.
+fn attach_managed_tui_runtime(config: &config::Config) -> Option<TuiRuntimeSession> {
+    use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
+
+    let choice = process_bringup_choice();
+    if choice.policy != BringUpPolicy::Managed {
+        return None;
+    }
+    let Some(expected) = choice.expected else {
+        let reason = "managed runtime: this build did not identify its artifact".to_string();
+        tracing::warn!("{reason}");
+        return Some(TuiRuntimeSession::unavailable(reason));
+    };
+    let Some(instance_home) = choice.instance_home else {
+        let reason = "managed runtime: no instance home to scope the daemon to".to_string();
+        tracing::warn!("{reason}");
+        return Some(TuiRuntimeSession::unavailable(reason));
+    };
+    let runtime_dir = runtime_directory_for(&config.workdir);
+    ignore_project_local_runtime_state(&config.workdir);
+    let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+        yi_agent_subagent::attach::MANAGED_START_BUDGET,
+    );
+    match yi_agent_subagent::attach::attach_managed_project_runtime(
+        config,
+        runtime_dir,
+        &instance_home,
+        &expected,
+        yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
+        deadline,
+    ) {
+        Ok(attached) => Some(TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
+            socket_path: attached.socket_path.clone(),
+            attached_root: crate::tui::subagents::AttachedRoot {
+                session_id: attached.attached_root.session_id,
+                task_id: attached.attached_root.task_id,
+                capability: attached.attached_root.capability,
+                workspace: attached.attached_root.workspace,
+            },
+            // Managed mode never owns the daemon; the guardian does.
+            embedded_daemon: None,
+            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+                &attached.project_root,
+                // The directory, not the socket: supervision reads the flags file
+                // beside it. `owns_daemon` is false here, so this only decides what
+                // an idle handle would have looked at.
+                &runtime_directory_for(&attached.project_root),
+                false,
+            ),
+        }))),
+        Err(failure) => {
+            let reason = format!("managed runtime: {}", failure.cause);
+            tracing::warn!(stage = failure.stage, cause = %failure.cause, "{reason}");
+            Some(TuiRuntimeSession::unavailable(reason))
+        }
+    }
+}
+
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> TuiRuntimeSession {
+    // The policy decides *who owns the daemon*; everything below this branch is
+    // the embedded path, which stays byte-for-byte as it was.
+    if let Some(session) = attach_managed_tui_runtime(config) {
+        return session;
+    }
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     // A socket path that cannot be derived is a configuration problem, not a
@@ -2093,11 +2365,16 @@ fn run_headless(
             // after the agent is built below. A `fork:true` spawn in `run` mode
             // reads this handle at call time.
             let caller = crate::tui::subagents::CallerContext::unbound();
+            let managed_owner = runtime
+                .frontend_lease
+                .as_ref()
+                .and_then(|lease| lease.managed_owner());
             let setup = build_headless_root_tools(
                 &config,
                 runtime.socket_path.clone(),
                 &runtime.attached_root,
                 caller.clone(),
+                managed_owner,
             )?;
             runtime_caller = Some(caller);
             setup
@@ -2396,6 +2673,120 @@ impl LiveRebuild {
     }
 }
 
+/// 向旁支请求一次父变更屏障。
+///
+/// 返回的 permit 必须在主操作**成功之后**才 `commit`;提前 drop 就等价于
+/// 「主操作失败,回滚」，旧旁支继续可用。拿不到 permit（没有旁支能力、调度
+/// 已退出、或超时）时返回 `None`，主操作照常进行。
+async fn side_parent_barrier(
+    commands: &Option<tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>>,
+) -> Option<crate::side_driver::ParentChangePermit> {
+    let commands = commands.as_ref()?;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::side_driver::SideDriverCommand::ParentBarrier {
+            reason: yi_agent_runtime::side_conversation::CloseReason::ParentCleared,
+            reply,
+        })
+        .await
+        .ok()?;
+    // 屏障只是逻辑状态,不该拖住清空:1 秒够调度回合应一次命令。
+    tokio::time::timeout(std::time::Duration::from_secs(1), outcome)
+        .await
+        .ok()?
+        .ok()
+}
+
+/// 把父会话的当前状态重新发布给旁支。
+///
+/// 每个改变「父会话有效来源」的入口都必须调用它:模型切换、effort 切换、
+/// compact、clear、MCP 刷新。发布走 `begin_update` + `commit`,读侧因此永远
+/// 不会看到「新 provider + 旧 config」这种半更新状态。
+fn publish_side_source(
+    publisher: Option<&Arc<yi_agent_runtime::side_conversation::SideSourcePublisher>>,
+    live: &LiveRebuild,
+    session: &Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    primary: &std::path::Path,
+) {
+    let Some(publisher) = publisher else {
+        return;
+    };
+    let Ok(update) = publisher.begin_update() else {
+        // 另一个更新正在进行:放弃这一次,下一次重建会再发布。绝不能在这里
+        // 强行覆盖,那会让读侧读到混搭的来源。
+        return;
+    };
+    let revision = publisher.revision().unwrap_or(1).saturating_add(1);
+    let roots = vec![primary.to_path_buf()];
+    let mut source = yi_agent_runtime::side_conversation::EffectiveSideSource {
+        session: Arc::clone(session),
+        provider: Arc::clone(&live.provider),
+        config: live.config.clone(),
+        primary: primary.to_path_buf(),
+        roots: roots.clone(),
+        current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
+        attachments: Default::default(),
+        revision,
+        generation: 1,
+        provider_gate: None,
+        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+    };
+    source.revision = revision;
+    update.commit(source);
+}
+
+/// 启动时发布的旁支来源。
+///
+/// 必须携带 **resume 进来的历史**:driver 走到首帧 `publish_side_source`
+/// 之前，用户完全可能已经敲了 `/side`；用一个空 `Session` 会把「明明有一整段
+/// 历史」报成 parent_not_started。这是本函数存在的唯一理由，抽出来是为了让
+/// 测试跑的正是生产调用点，而不是一个平行实现。
+fn side_startup_source(
+    agent_config: &yi_agent_core::AgentConfig,
+    provider: Arc<dyn Provider>,
+    primary: std::path::PathBuf,
+    initial_messages: &[yi_agent_core::Message],
+    initial_last_input: Option<u32>,
+) -> yi_agent_runtime::side_conversation::EffectiveSideSource {
+    let mut seeded = yi_agent_core::Session::from_messages(initial_messages.to_vec());
+    seeded.set_last_input_tokens(initial_last_input);
+    side_source_snapshot_with_session(
+        agent_config,
+        provider,
+        primary,
+        Arc::new(std::sync::Mutex::new(seeded)),
+    )
+}
+
+/// 同上,但直接复用主 driver 真实持有的那个 session `Arc`。
+///
+/// 发布器在 TUI 启动**之前**就发布一次来源,而这时的历史可能是 resume 带进来
+/// 的。如果只发布一个空 `Session`,用户一进 TUI 就敲 `/side`（driver 还没走到
+/// 首帧的 `publish_side_source`）会得到「父会话还没有可继承的历史」——明明刚
+/// resume 了一整个会话。传真实 `Arc` 让这条窗口消失,而不是靠「用户不会那么快」。
+fn side_source_snapshot_with_session(
+    agent_config: &yi_agent_core::AgentConfig,
+    provider: Arc<dyn Provider>,
+    primary: std::path::PathBuf,
+    session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
+) -> yi_agent_runtime::side_conversation::EffectiveSideSource {
+    let roots = vec![primary.clone()];
+    yi_agent_runtime::side_conversation::EffectiveSideSource {
+        session,
+        provider,
+        config: agent_config.clone(),
+        primary: primary.clone(),
+        roots: roots.clone(),
+        current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
+        attachments: Default::default(),
+        revision: 1,
+        // generation 与父会话一致:父 clear/delete 会推进它并作废旁支。
+        generation: 1,
+        provider_gate: None,
+        web_policy: yi_agent_runtime::side_conversation::SideWebPolicy::default(),
+    }
+}
+
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
 #[allow(clippy::too_many_arguments)]
 fn run_tui_agent(
@@ -2489,6 +2880,7 @@ fn run_tui_agent(
         let caller = crate::tui::subagents::CallerContext::unbound();
         let caller_for_attach = caller.clone();
 
+
         // `workdir` is moved into the driver closure below, and `config` is moved
         // into it too, so both the snapshot and the TUI call site need values built
         // before the closure and a cloned workdir.
@@ -2498,6 +2890,7 @@ fn run_tui_agent(
             crate::tui::runtime_prefs::RuntimePreference::Always => "always",
             crate::tui::runtime_prefs::RuntimePreference::Never => "never",
         };
+
         let tui_config = crate::tui::slash::TuiConfigSnapshot {
             provider: config.provider.clone(),
             model_injected: config.model_injected,
@@ -2605,6 +2998,54 @@ fn run_tui_agent(
             };
         let session_store_for_driver = session_store.clone();
 
+        // 旁支:一份 source 发布器 + 一个独立调度任务。
+        //
+        // 发布器在这里创建,由主 driver 的每个重建入口（model/effort/compact/
+        // clear/MCP）提交新快照;调度任务在下面独立 spawn,不排在主
+        // `DriverControl` 队列后面,所以主任务跑到一半也能开旁支。
+        let side_pool = Arc::new(yi_agent_tools::SideBlockingPool::new(8, 2, 8, 2));
+        let side_instance_home = crate::side_driver::side_host_root(&snapshot_workdir);
+        let side_resources = yi_agent_runtime::side_conversation::SideHostResources::new(
+            side_instance_home,
+            Arc::clone(&side_pool),
+        );
+        let mut side_commands_tx_for_driver = None;
+        let mut side_commands_tx_for_tui_exit: Option<
+            tokio::sync::mpsc::Sender<crate::side_driver::SideDriverCommand>,
+        > = None;
+        let mut side_driver_join_for_exit: Option<tokio::task::JoinHandle<()>> = None;
+        let (side_publisher, side_runtime) = match side_resources {
+            Ok(resources) => {
+                let publisher = Arc::new(yi_agent_runtime::side_conversation::SideSourcePublisher::new(
+                    side_startup_source(
+                        &agent_config,
+                        Arc::clone(&provider),
+                        snapshot_workdir.clone(),
+                        &initial_messages,
+                        initial_last_input,
+                    ),
+                ));
+                let handles = crate::side_driver::spawn_side_driver(
+                    Arc::clone(&publisher),
+                    resources,
+                    Arc::clone(&side_pool),
+                );
+                side_commands_tx_for_driver = Some(handles.commands.clone());
+                side_commands_tx_for_tui_exit = Some(handles.commands.clone());
+                side_driver_join_for_exit = Some(handles.join);
+                (
+                    Some(publisher),
+                    crate::tui::app::SideRuntime::new(handles.commands, handles.events),
+                )
+            }
+            Err(error) => {
+                // 旁支不可用不该阻止主 TUI 启动:能力缺失会由 `/side` 明确告知。
+                tracing::warn!(%error, "side conversations unavailable; continuing without them");
+                (None, crate::tui::app::SideRuntime::disabled())
+            }
+        };
+
+
         // resume/fork 带进来的提示词：预置进输入队列，driver 一启动就会
         // 把它当成第一条 prompt。容量 16 且尚未消费任何一条，try_send 不会失败。
         if let Some(text) = startup_prompt {
@@ -2612,6 +3053,14 @@ fn run_tui_agent(
         }
 
         let driver_workdir = snapshot_workdir.clone();
+        // The driver learns this session's owner mid-flight (on runtime attach) and
+        // must be able to upgrade the shared process manager from inside the spawned
+        // task. A clone of the same `Arc` is what makes that upgrade visible to the
+        // TUI's process tools, which hold their own clone.
+        let process_manager_for_driver = Arc::clone(&process_manager);
+        let side_publisher_for_driver = side_publisher.as_ref().cloned();
+        // 主 driver 也需要一个命令端:clear 前要建立父变更屏障。
+        let side_commands_for_driver = side_publisher.as_ref().and(side_commands_tx_for_driver);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut lease_lost_reported = false;
@@ -2655,6 +3104,14 @@ fn run_tui_agent(
             .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx))
             .with_session_arc(Arc::clone(&session_handle));
 
+            // 启动即发布一次来源:旁支继承的是「此刻父会话真正在用的东西」,
+            // 所以每个可能改变它的入口都要重新发布（见下面的 publish_side_source 调用）。
+            publish_side_source(
+                side_publisher_for_driver.as_ref(),
+                &live,
+                &session_handle,
+                &driver_workdir,
+            );
 
             loop {
                 // Wait for user input, runtime startup choice, or a control command.
@@ -2669,6 +3126,11 @@ fn run_tui_agent(
                 if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
                         DriverControl::Clear => {
+                            // 先向旁支建立逻辑屏障:主清空**真的成功**之后才提交
+                            // 作废。拿不到 permit（旁支不可用/通道关闭）就照常清空,
+                            // 只是没有旁支需要作废。屏障本身不等待 5 秒关闭:它只
+                            // 冻结创建/提问,作废是提交之后的事。
+                            let permit = side_parent_barrier(&side_commands_for_driver).await;
                             // Rebuild agent with empty session. The session Arc is
                             // reused (not replaced) so the `CallerContext` bound to
                             // it stays live; the contents are emptied in place, and
@@ -2692,6 +3154,21 @@ fn run_tui_agent(
                             // 用户会以为清空没生效。app-server 在同一位置调
                             // `translator.reset_totals()`（server.rs:5368）。
                             turn_log.reset_totals();
+                            // clear 之后父的可继承历史为空:旁支不能再基于旧上下文,
+                            // 所以这里先作废现有旁支（屏障 -> close）。发布新来源
+                            // 让之后打开的空父旁支立刻得到 parent_not_started 的明确错误。
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
+                            );
+                            // 到这里清空已经落地（内存 + 磁盘都成功才走到这）,
+                            // 旁支必须随之作废。失败路径不会执行到这里,
+                            // permit 随作用域 drop 并自动回滚。
+                            if let Some(permit) = permit {
+                                permit.commit();
+                            }
                             tracing::info!("agent session cleared via /clear");
                         }
                         DriverControl::Compact => {
@@ -2736,6 +3213,15 @@ fn run_tui_agent(
                                             eprintln!("[yi-agent] /compact 落盘失败: {e}");
                                         }
                                     }
+                                    // compact 只改变「未来的来源」,不关闭已开的旁支:
+                                    // 旁支继承的是它创建时的上下文,父压缩不该把用户
+                                    // 正在问的旁支腰斩。
+                                    publish_side_source(
+                                        side_publisher_for_driver.as_ref(),
+                                        &live,
+                                        &handle,
+                                        &driver_workdir,
+                                    );
                                     tracing::info!("agent session compacted via /compact");
                                     let _ = agent_tx
                                         .send(manual_compaction_outcome_event(
@@ -2815,6 +3301,12 @@ fn run_tui_agent(
                                     text: label,
                                 })
                                 .await;
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
+                            );
                             tracing::info!("MCP config reloaded from disk");
                         }
                         DriverControl::McpRefresh => {
@@ -2829,6 +3321,12 @@ fn run_tui_agent(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 handle,
+                            );
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
@@ -2858,6 +3356,12 @@ fn run_tui_agent(
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                         handle,
+                                    );
+                                    publish_side_source(
+                                        side_publisher_for_driver.as_ref(),
+                                        &live,
+                                        &agent.session_handle(),
+                                        &driver_workdir,
                                     );
                                     tracing::info!(
                                         model = %effective.model,
@@ -2907,6 +3411,12 @@ fn run_tui_agent(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 handle,
+                            );
+                            publish_side_source(
+                                side_publisher_for_driver.as_ref(),
+                                &live,
+                                &agent.session_handle(),
+                                &driver_workdir,
                             );
                             tracing::info!(
                                 ?effort,
@@ -2990,6 +3500,29 @@ fn run_tui_agent(
                                         attached_root.clone(),
                                     );
                                     let runtime_workdir = attached_root.workspace.path.clone();
+                                    // The lease is taken *before* the tools are built:
+                                    // a managed tool spawn needs the owner this process
+                                    // registered as, and a tool set built first would
+                                    // have to spawn directly with no owner to reclaim
+                                    // for. Embedded mode still answers `None` here.
+                                    let lease_handle =
+                                        crate::frontend_lease::FrontendLeaseHandle::register(
+                                            &runtime_directory_for(&runtime_workdir),
+                                            yi_agent_lifecycle::types::ClientKind::Tui,
+                                            crate::frontend_lease::new_client_run_id("tui"),
+                                        )
+                                        .ok()
+                                        .flatten();
+                                    let managed_owner = lease_handle
+                                        .as_ref()
+                                        .and_then(|lease| lease.managed_owner());
+                                    // The process manager is upgraded only after the
+                                    // rebuild succeeds (see below). Upgrading it here
+                                    // would leave it owned by a lease this arm may
+                                    // still have to release, and a released lease
+                                    // refuses every later channel -- so the tools
+                                    // would fail one by one, minutes later.
+                                    let managed_for_process = managed_owner.clone();
                                     let mut next_registry = build_tui_root_tools(
                                         &base_registry,
                                         &config,
@@ -2997,6 +3530,7 @@ fn run_tui_agent(
                                         &attached_root,
                                         caller_for_attach.clone(),
                                         &mcp_for_driver,
+                                        managed_owner,
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
@@ -3016,23 +3550,26 @@ fn run_tui_agent(
                                                 Arc::clone(&handle),
                                             );
                                             caller_for_attach.bind(handle);
-                                            // A runtime with a guardian counts this
-                                            // process as a frontend; without the
+                                            // The process tools were registered at
+                                            // startup, before this session had an
+                                            // owner. Upgrade the *same* manager so
+                                            // later `process_start` calls belong to
+                                            // this frontend too; rebuilding it would
+                                            // drop the handles to anything already
+                                            // running.
+                                            if let Some((policy, spawner)) = managed_for_process
+                                            {
+                                                process_manager_for_driver
+                                                    .adopt_managed(policy, spawner);
+                                            }
+                                            // The lease was taken above, before the
+                                            // tools were built; hand it to the driver
+                                            // now that the rebuild succeeded. A
+                                            // runtime with a guardian counts this
+                                            // process as a frontend, and without the
                                             // lease its work would be reclaimed as
                                             // abandoned after 30 s of tool calls.
-                                            // Embedded mode has no guardian, and
-                                            // `None` is the honest answer there.
-                                            if let Some(lease) =
-                                                crate::frontend_lease::FrontendLeaseHandle::register(
-                                                    &runtime_directory_for(
-                                                        &attached_root.workspace.path,
-                                                    ),
-                                                    yi_agent_lifecycle::types::ClientKind::Tui,
-                                                    crate::frontend_lease::new_client_run_id("tui"),
-                                                )
-                                                .ok()
-                                                .flatten()
-                                            {
+                                            if let Some(lease) = lease_handle {
                                                 *frontend_lease_for_driver
                                                     .lock()
                                                     .expect("frontend lease mutex poisoned") =
@@ -3062,6 +3599,19 @@ fn run_tui_agent(
                                             foreground = None;
                                         }
                                         Err(error) => {
+                                            // The rebuild failed, so nothing here
+                                            // holds a managed owner. Give the lease
+                                            // back rather than dropping it: a
+                                            // dropped lease stops renewing, and the
+                                            // guardian would then reclaim work for a
+                                            // frontend that is still running. Off the
+                                            // driver task so a slow guardian cannot
+                                            // stall the UI.
+                                            if let Some(lease) = lease_handle {
+                                                tokio::task::spawn_blocking(move || {
+                                                    let _ = lease.release();
+                                                });
+                                            }
                                             if let Some((socket, root)) = runtime_detach_for_driver
                                                 .lock()
                                                 .expect("runtime detach mutex poisoned")
@@ -3366,6 +3916,7 @@ fn run_tui_agent(
                 // 无文件即空清单，行为与今天一致。
                 yi_agent_runtime::models::load_catalog(),
                 replay_cells,
+                side_runtime,
             )
         });
 
@@ -3374,6 +3925,26 @@ fn run_tui_agent(
             Ok(Err(e)) => Err(anyhow::Error::from(e)),
             Err(e) => Err(anyhow::Error::from(e)),
         };
+
+        // 退出顺序是硬约束:**先**让旁支调度停下并 join,再做 TUI/reactor 收尾。
+        // 旁支持有真实 owner（资源槽、blocking 工作、provider 流）,如果让它
+        // 比主循环活得更久,进程退出时那些资源会被直接丢弃,而不是被释放。
+        let mut exit_coordinator = match (side_commands_tx_for_tui_exit, side_driver_join_for_exit) {
+            (Some(commands), Some(join)) => {
+                crate::tui::side::TuiExitCoordinator::new(Some(commands), Some(join))
+            }
+            _ => crate::tui::side::TuiExitCoordinator::disabled(),
+        };
+        match exit_coordinator.stop_all().await {
+            Ok(true) => {}
+            Ok(false) => {
+                // 不谎称清理完成:旁支任务仍在后台，它的 owner 尚未释放。
+                eprintln!("[yi-agent] 旁支未在 5 秒内结束，资源将在进程退出时释放");
+            }
+            Err(error) => {
+                eprintln!("[yi-agent] 旁支退出通知失败: {}", error.message);
+            }
+        }
 
         // 退出后告诉用户怎么接上这场对话。
         //
@@ -3494,6 +4065,141 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 启动时发布的旁支来源必须携带 resume 进来的真实历史。
+    ///
+    /// 这里用空 `Session` 会打开一个竞态窗口:driver 走到首帧 `publish_side_source`
+    /// 之前，用户一进 TUI 敲 `/side` 就会收到「父会话还没有可继承的历史」，
+    /// 而屏幕上明明有一整段 resume 的历史。测试直接读发布器抓到的快照。
+    #[tokio::test]
+    async fn startup_side_source_carries_the_resumed_history() {
+        let mut session = yi_agent_core::Session::new();
+        session.push(yi_agent_core::Message::user("resume 里的问题"));
+        session.push(yi_agent_core::Message::assistant(vec![
+            yi_agent_core::ContentBlock::Text("resume 里的回答".into()),
+        ]));
+
+        let source = side_startup_source(
+            &yi_agent_core::AgentConfig::default(),
+            Arc::new(SideTestProvider),
+            std::path::PathBuf::from("/tmp/proj"),
+            session.messages(),
+            session.last_input_tokens(),
+        );
+        let publisher = yi_agent_runtime::side_conversation::SideSourcePublisher::new(source);
+        let snapshot = publisher.snapshot().await.expect("resume 历史必须可继承");
+        let messages = snapshot.session.lock().unwrap().messages().to_vec();
+        assert!(
+            messages
+                .iter()
+                .any(|m| format!("{m:?}").contains("resume 里的问题")),
+            "启动来源里必须能读到 resume 的历史: {messages:?}"
+        );
+    }
+
+    /// 这些测试只读来源，不发起任何 provider 请求；被调用即说明测试写错了。
+    struct SideTestProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SideTestProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::ProviderRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+            yi_agent_core::ProviderError,
+        > {
+            panic!("side test provider must not be called")
+        }
+    }
+
+    /// 后端一起手就死，必须在**预算内**立刻报 `Exited`。
+    ///
+    /// 防的是"所有失败都说没就绪"：那样用户看到的是"再等等"，而实际
+    /// 需要看的是子进程为什么死。用 15s 的真实预算跑这条，如果实现退化成
+    /// 等满预算，这条会因为测试时长而被看出（并且 `calls` 会远超 2）。
+    #[test]
+    fn a_daemon_that_exits_early_is_reported_as_exited_not_as_a_timeout() {
+        let mut calls = 0;
+        let mut slept = std::time::Duration::ZERO;
+        let outcome = wait_for_daemon(
+            || {
+                calls += 1;
+                false
+            },
+            || {
+                Some(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 3"])
+                        .status()
+                        .unwrap(),
+                )
+            },
+            DAEMON_READY_BUDGET,
+            |d| slept += d,
+        );
+        let DaemonReady::Exited(status) = outcome else {
+            panic!("expected Exited, got {outcome:?}");
+        };
+        assert!(
+            status.contains('3'),
+            "the status must carry the exit code: {status}"
+        );
+        assert_eq!(
+            calls, 1,
+            "must give up on the first observation, not poll forever"
+        );
+        assert_eq!(
+            slept,
+            std::time::Duration::ZERO,
+            "must not sleep before reporting"
+        );
+    }
+
+    /// 子进程一直活着但不应答，预算到了必须报 `TimedOut`，而不是无限等。
+    #[test]
+    fn a_live_but_silent_daemon_times_out_instead_of_waiting_forever() {
+        let budget = std::time::Duration::from_millis(80);
+        let mut now = std::time::Duration::ZERO;
+        let mut probes = 0;
+        let outcome = wait_for_daemon(
+            || {
+                probes += 1;
+                false
+            },
+            || None,
+            budget,
+            |d| now += d,
+        );
+        assert_eq!(outcome, DaemonReady::TimedOut);
+        // 预算内应当轮询多次（10ms 一次 ≈ 8 次），而不是只试一次就放弃。
+        assert!(
+            probes >= 4,
+            "expected repeated polling within the budget, got {probes}"
+        );
+    }
+
+    /// 已经应答就算成功，哪怕子进程紧接着退出。
+    ///
+    /// 先 probe 再看 reaped 的顺序由这条钉住：反过来会把这个已经成立的
+    /// 成功报成失败。
+    #[test]
+    fn an_answered_daemon_is_ready_even_if_it_exits_right_after() {
+        let outcome = wait_for_daemon(
+            || true,
+            || {
+                Some(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 0"])
+                        .status()
+                        .unwrap(),
+                )
+            },
+            DAEMON_READY_BUDGET,
+            |_| panic!("must not sleep when the daemon already answered"),
+        );
+        assert_eq!(outcome, DaemonReady::Ready);
+    }
 
     #[test]
     fn resume_hint_names_the_real_thread_id() {
@@ -4529,7 +5235,7 @@ mod tests {
             format!(
                 // 键必须在注册表里：未注册的名字一律读成关（只有注册表里的
                 // 才能开），用一个自造的键会让这条测试永远等不到子进程。
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"example_plugin_switch","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
                 child.display()
             ),
         )
@@ -4539,7 +5245,7 @@ mod tests {
         let flags = workdir.join("flags.json");
         std::fs::write(
             &flags,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
 
@@ -4895,6 +5601,7 @@ mod tests {
             "/tmp/runtime.sock".into(),
             &root,
             crate::tui::subagents::CallerContext::unbound(),
+            None,
         )
         .expect("attached headless setup");
         let names = registry
@@ -4989,6 +5696,7 @@ mod tests {
             &root,
             crate::tui::subagents::CallerContext::unbound(),
             &mcp,
+            None,
         );
         let names = registry
             .schemas()
@@ -6112,8 +6820,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
-        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
-        yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
+        yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
+        yi_agent_store::resident::require(dir.path(), &b, "example-plugin").unwrap();
 
         let mut seen: Vec<PathBuf> = Vec::new();
         let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
@@ -6160,5 +6868,78 @@ mod tests {
             Some("root-1"),
             "the already-attached root must be adopted, not re-minted"
         );
+    }
+
+    /// Both frontends must consult the bring-up policy before starting a daemon.
+    ///
+    /// A source assertion is the honest tool here: the property is "this exact
+    /// call site branches on the policy", and a behavioural test would need a real
+    /// guardian plus a process-wide `OnceLock` for every case. Needles are built
+    /// from fragments so the test's own source cannot satisfy them.
+    #[test]
+    fn both_frontends_dispatch_on_the_bring_up_policy() {
+        let source = include_str!("main.rs");
+        let caller = ["process_bringup", "_choice()"].concat();
+        let managed = ["BringUpPolicy", "::Managed"].concat();
+
+        for (name, anchor) in [
+            ("tui", ["fn attach_managed_tui", "_runtime("].concat()),
+            (
+                "headless",
+                ["fn attach_managed_headless", "_runtime("].concat(),
+            ),
+        ] {
+            let body = source
+                .split(&anchor)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{name} managed dispatch must exist"));
+            assert!(
+                body.contains(&caller),
+                "{name} must read the process bring-up choice"
+            );
+            assert!(
+                body.contains(&managed),
+                "{name} must branch on the managed policy"
+            );
+        }
+
+        // And the embedded path must stay reachable: a policy that is not managed
+        // returns early, which is what keeps today's behaviour byte-for-byte.
+        let tui = source
+            .split(&["fn attach_managed_tui", "_runtime("].concat())
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("tui dispatch");
+        assert!(
+            tui.contains("!= BringUpPolicy::Managed") && tui.contains("return None"),
+            "a non-managed policy must fall through to the embedded path"
+        );
+
+        // The dispatch has to be *called*. Defining it and forgetting to invoke it
+        // is the exact failure this whole change exists to fix, so assert the call
+        // site in each entry point rather than only the helper's body.
+        for (name, anchor, call) in [
+            (
+                "attach_tui_runtime",
+                ["fn attach_tui", "_runtime(cli"].concat(),
+                ["attach_managed_tui", "_runtime(config"].concat(),
+            ),
+            (
+                "attach_headless_runtime",
+                ["fn attach_headless", "_runtime(cli"].concat(),
+                ["attach_managed_headless", "_runtime(config"].concat(),
+            ),
+        ] {
+            let body = source
+                .split(&anchor)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                body.contains(&call),
+                "{name} must call its managed dispatch before starting a daemon"
+            );
+        }
     }
 }

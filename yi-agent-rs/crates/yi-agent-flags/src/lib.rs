@@ -6,7 +6,9 @@ pub mod store;
 
 pub use error::FlagError;
 pub use registry::{FlagDef, REGISTRY, find};
-pub use store::{FlagView, Source, all_at, is_enabled, status, status_at, write_at};
+pub use store::{
+    FlagView, Source, all_at, is_enabled, status, status_at, status_for_switch_at, write_at,
+};
 
 /// 当前构建类型：`release` / `dev` / `nogit`。
 ///

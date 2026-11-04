@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/root-v1.schema.json",
+  "title": "Plugin trust root envelope v1",
+  "description": "A trust root plus the signature that authorizes it. Bootstrap accepts only a host-built-in root: a root envelope fetched from the network may never be its own anchor. Rotation must additionally carry `authorizedBy`, naming the previous root that signed it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "root", "signature"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyId", "publicKey", "serial", "notBefore", "notAfter"],
+      "properties": {
+        "keyId": { "type": "string", "pattern": "^root-[a-z0-9-]{3,63}$" },
+        "publicKey": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "32-byte Ed25519 public key, standard base64 with padding. Not hex, not URL-safe: the signature payload encodes exactly this string (spec section 8.2)."
+        },
+        "serial": { "type": "integer", "minimum": 1 },
+        "notBefore": { "type": "integer", "minimum": 0 },
+        "notAfter": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{86}==$",
+      "description": "64-byte Ed25519 signature over the canonical root payload, standard base64 with padding."
+    },
+    "authorizedBy": {
+      "type": "string",
+      "pattern": "^root-[a-z0-9-]{3,63}$",
+      "description": "Present only on rotation. Names the previous root that authorized this one; rotation without it is rejected because it would let anyone replace the anchor."
+    }
+  }
+}

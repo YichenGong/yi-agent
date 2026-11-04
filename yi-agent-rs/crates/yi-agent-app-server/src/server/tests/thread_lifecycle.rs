@@ -130,6 +130,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             cwd: warm.path().to_string_lossy().to_string(),
             model: "test".to_string(),
             active_turn_id: None,
+            turn_permit: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             prompt_tx,
@@ -147,6 +148,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
     let cold_store = crate::thread_store::ThreadStore::new(cold.path());
     cold_store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "cold".to_string(),
             cwd: cold.path().to_string_lossy().to_string(),
             model: "test".to_string(),
@@ -1999,6 +2001,7 @@ async fn kanban_observation_plain_rpc_resume_is_discovered() {
             forked_from: None,
             extra_roots: Vec::new(),
             role: None,
+            plugin_bindings: Vec::new(),
         })
         .unwrap();
 

@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "packageFormat": 1,
+  "plugin": "example-counter",
+  "version": "1.4.0",
+  "target": "darwin-aarch64",
+  "views": [
+    {
+      "id": "main",
+      "kind": "main",
+      "entry": "ui/index.html",
+      "digest": "3b1f2c9a7d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+    },
+    {
+      "id": "settings",
+      "kind": "settings",
+      "entry": "ui/settings.html",
+      "digest": "9c8b7a69584736251403f2e1d0c9b8a7968574635241302f1e0d9c8b7a695847"
+    }
+  ],
+  "program": {
+    "entry": "bin/example-counter",
+    "digest": "5d41402abc4b2a76b9719d911017c5920e1a2b3c4d5e6f708192a3b4c5d6e7f8"
+  },
+  "skills": [
+    {
+      "name": "example-counter",
+      "path": "skills/example-counter"
+    }
+  ],
+  "methods": [
+    { "name": "counters/increment", "effect": "Write" },
+    { "name": "counters/read", "effect": "Read" },
+    { "name": "counters/reset", "effect": "Write" }
+  ],
+  "cli": [
+    { "verb": "increment", "effect": "Write" },
+    { "verb": "status", "effect": "Read" }
+  ],
+  "capabilities": {
+    "required": ["Read", "Write"],
+    "optional": ["Launch", "Resident"]
+  },
+  "dependencies": {
+    "workflows": [
+      { "name": "superpowers-kanban", "range": ">=1.0.0 <2.0.0" }
+    ]
+  },
+  "data": {
+    "format": 1,
+    "migrations": []
+  },
+  "compatibility": {
+    "hostApi": "v1",
+    "uiApi": "v1"
+  }
+}

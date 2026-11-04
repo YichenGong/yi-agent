@@ -135,6 +135,17 @@ pub struct ThreadSession {
     pub model: String,
     /// 当前活跃 turn 的 id;无活跃 turn 时为 None。
     pub active_turn_id: Option<String>,
+    /// 活跃 turn 的准入凭据（插件会话才有；普通会话恒 `None`）。
+    ///
+    /// # 为什么是 RAII 字段而不是显式 end_turn 调用
+    ///
+    /// 释放准入的时机有七八处（正常结束、取消、模型失败、会话被移除、driver
+    /// 退出、重建……）。逐个补 `end_turn` 调用，漏一处就是"插件永远排空不完"，
+    /// 而那种 bug 只在卸载插件时才暴露。改成随 `active_turn_id` 一起被清：
+    /// 每个清空活跃 turn 的地方只要顺手把它置 `None`，`TurnPermit::drop` 就
+    /// 释放 flock 与登记表条目；漏掉的话下一个 turn 会被 `active_turn_id`
+    /// 的既有守卫挡住，立刻可见而不是拖到卸载时。
+    pub(crate) turn_permit: Option<yi_agent_plugins::TurnPermit>,
     /// 该线程的运行时自主权开关(与沙箱、权限层共享同一 `Arc`)。
     pub yolo: yi_agent_core::autonomy::YoloSwitch,
     /// 该 thread 生效的进程管理器(与它的工具集同行),供 `process/*` 查询。

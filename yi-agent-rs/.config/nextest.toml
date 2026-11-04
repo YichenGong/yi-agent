@@ -30,3 +30,25 @@ retries = 0
 [profile.ci.junit]
 # 相对路径解析到 target/nextest/<profile>/ 下，即 target/nextest/ci/junit.xml。
 path = "junit.xml"
+
+# ---------------------------------------------------------------------------
+# spawn-heavy：把「fork 子进程后等它就绪」的测试二进制串行化
+# ---------------------------------------------------------------------------
+#
+# 为什么需要这一层：这些测试自带 `SPAWN_LOCK`，但那把锁只在**同进程多线程**
+# 下有效。nextest 每个测试是独立进程，锁跨不过进程边界（`supervisor.rs` 顶部
+# 注释已写明这一点，并明确要求「别再往那里加锁来修并发问题」）。
+#
+# 后果是实测出来的，不是推测：`--workspace` 默认并行度下，多个测试同时 fork
+# `/bin/sh`，机器被上千个测试进程塞满，子进程在 20s 预算内都没被调度到，
+# 于是 9 个 supervisor 测试一起红；同一批测试单独跑 103/103 全绿，全量降并行
+# 度到 6 也 4248/4248 全绿。也就是说红的是**调度延迟**，不是被测逻辑。
+#
+# 用 runner 的 test-group 把这几个二进制的测试串行，正是原注释期待的解法：
+# 一次只 fork 一个子进程，延迟回到几百毫秒，远低于预算。这不放宽任何断言。
+[test-groups.spawn-heavy]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(yi-agent-supervisors::supervisor) + binary_id(yi-agent-supervisors::managed_launch) + binary_id(yi-agent::plugins_maintenance_daemon)'
+test-group = 'spawn-heavy'

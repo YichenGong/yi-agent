@@ -6,7 +6,7 @@ use super::*;
 fn the_app_side_loop_ensures_every_registered_project() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
-    yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+    yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
     let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects| {
         seen.extend_from_slice(projects)
@@ -1159,4 +1159,77 @@ fn rebuilding_the_thread_agent_keeps_the_approval_path() {
         rebuilt.agent.decision_rx().is_some(),
         "the rebuilt agent must keep the decision receiver"
     );
+}
+
+/// A managed bring-up that has no instance home must fail loudly.
+///
+/// The failure mode this guards is the tempting one: fall back to an embedded
+/// daemon so *something* starts. That would leave a client-owned process behind a
+/// policy whose entire promise is that the daemon is shared, and nobody would ever
+/// observe the difference until the client exited and took the runtime with it.
+///
+/// No daemon is started here, which is the point: the refusal happens before any
+/// process work, so the test needs no socket and no project.
+#[test]
+fn a_managed_choice_without_an_instance_home_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+
+    let choice = yi_agent_subagent::binding::BringUpChoice {
+        policy: yi_agent_subagent::attach::BringUpPolicy::Managed,
+        expected: Some(crate::server::assembly::test_identity(dir.path())),
+        // Deliberately absent: the process never installed a context.
+        instance_home: None,
+    };
+
+    let error = match crate::server::assembly::bring_up_with_for_test(
+        &choice,
+        &cfg,
+        &dir.path().join("runtime"),
+        &isolated_models_path(dir.path()),
+    ) {
+        Ok(_) => panic!("a managed choice with no scope must not produce a binding"),
+        Err(error) => error,
+    };
+    assert!(
+        error.cause.contains("instance home"),
+        "the failure must name the missing scope, got: {}",
+        error.cause
+    );
+    assert!(
+        !dir.path().join("runtime").exists(),
+        "refusing must not create the runtime directory"
+    );
+}
+
+/// An embedded choice keeps using the historical path and needs no context.
+///
+/// This is the pair to the test above: the two policies must differ in *whether*
+/// a scope is required, not merely in which error they raise.
+#[test]
+fn an_embedded_choice_needs_no_instance_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let choice = yi_agent_subagent::binding::BringUpChoice {
+        policy: yi_agent_subagent::attach::BringUpPolicy::Embedded,
+        expected: None,
+        instance_home: None,
+    };
+    // Reaching the actual attach is enough: there is no rejection up front. A
+    // failure here would be about the (non-git) directory, not about the policy.
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let outcome = crate::server::assembly::bring_up_with_for_test(
+        &choice,
+        &cfg,
+        &dir.path().join("runtime"),
+        &isolated_models_path(dir.path()),
+    );
+    if let Err(error) = outcome {
+        assert!(
+            !error.cause.contains("instance home"),
+            "embedded must never be rejected for lacking a scope, got: {}",
+            error.cause
+        );
+    }
 }

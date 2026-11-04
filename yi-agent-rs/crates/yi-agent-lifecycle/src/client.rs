@@ -128,6 +128,53 @@ fn connect_with_timeout(path: &Path, budget: Duration) -> io::Result<UnixStream>
 /// How often a live frontend renews its lease.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// One private channel the guardian opened for a frontend.
+///
+/// The descriptor is the authorization: the guardian decided the owner when it
+/// created the pair, so nothing on this channel can ask to run as somebody else.
+/// Each tool child gets a *new* channel (`tools` takes a factory rather than a
+/// handle), because one stream cannot be shared between concurrent spawns without
+/// interleaving their answers.
+pub struct ManagedChannel {
+    stream: std::os::unix::net::UnixStream,
+    owner: String,
+    generation: String,
+}
+
+impl ManagedChannel {
+    /// The owner the guardian bound this channel to.
+    ///
+    /// Taken from the guardian's answer, never from what the caller asked for: a
+    /// client that mislabelled its own processes would otherwise make its work look
+    /// like another client's.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// The runtime generation this channel belongs to.
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    /// Hands out the descriptor, leaving this value spent.
+    ///
+    /// The tools layer speaks its own protocol on the stream and owns the number
+    /// afterwards. Splitting it into "descriptor plus owner" here is what keeps
+    /// this crate free of the tools layer's types.
+    pub fn into_parts(self) -> (std::os::unix::net::UnixStream, String, String) {
+        (self.stream, self.owner, self.generation)
+    }
+}
+
+impl std::fmt::Debug for ManagedChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedChannel")
+            .field("owner", &self.owner)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A lease held by one frontend process for the whole time it is using a runtime.
 ///
 /// Three decisions are baked in, each because the obvious alternative is wrong:
@@ -248,6 +295,11 @@ impl FrontendLease {
         &self.grant.client_run_id
     }
 
+    /// The control socket this lease's runtime serves.
+    pub fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+
     /// Whether a renewal was refused, i.e. the runtime no longer counts this
     /// frontend as present.
     pub fn is_lost(&self) -> bool {
@@ -318,6 +370,83 @@ impl FrontendLease {
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the runtime answered a release with {other:?}"),
+            )),
+        }
+    }
+
+    /// Asks for one private spawn channel.
+    ///
+    /// The descriptor arrives as `SCM_RIGHTS` beside the answer; the guardian keeps
+    /// the other end. Every call yields a *new* channel, because a channel's owner
+    /// is fixed at creation: reusing one across two clients would make the second
+    /// client's processes belong to the first.
+    ///
+    /// `grant` is presented only here, at open time. A channel that has been opened
+    /// carries the owner already, so no spawn request needs to (or can) restate it.
+    pub fn open_managed_channel(&self, deadline: &Deadline) -> io::Result<ManagedChannel> {
+        Self::open_channel_with(&self.control_path, &self.grant, deadline)
+    }
+
+    /// Opens a channel with an explicit grant and socket.
+    ///
+    /// Split out so a caller that already holds this lease's grant can open further
+    /// channels without re-registering: registering again would mint a second lease
+    /// for the same process and make "the last frontend" impossible to compute.
+    pub fn open_channel_with(
+        control_path: &Path,
+        grant: &types::ClientGrant,
+        deadline: &Deadline,
+    ) -> io::Result<ManagedChannel> {
+        let client = ControlClient::connect(control_path, deadline)?;
+        let request = types::ControlRequest::OpenManagedChannel {
+            grant: grant.clone(),
+        };
+        let frame = codec::encode(&request)?;
+        let budget = deadline.clamp(CONTROL_REQUEST_TIMEOUT);
+        if budget.is_zero() {
+            return Err(expired());
+        }
+        let stream = client.into_stream();
+        stream.set_write_timeout(Some(budget))?;
+        stream.set_read_timeout(Some(budget))?;
+        // The request itself carries no descriptors, but it must go out as one
+        // message together with the answer's read: `sendmsg` is used for the plain
+        // write too, so the two halves cannot interleave with a second caller.
+        crate::managed::fdpass::send_with_fds(&stream, &frame, &[])?;
+        let mut buffer = vec![0u8; crate::MAX_CONTROL_FRAME];
+        let (filled, fds) = crate::managed::fdpass::recv_with_fds(&stream, &mut buffer)?;
+        if filled == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the runtime closed before answering the channel request",
+            ));
+        }
+        let answer: ControlResponse = codec::decode(&buffer[..filled])?;
+        match answer {
+            ControlResponse::ChannelOpened { owner, generation } => {
+                let Some(fd) = fds.into_iter().next() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the runtime reported a channel but sent no descriptor",
+                    ));
+                };
+                Ok(ManagedChannel {
+                    stream: std::os::unix::net::UnixStream::from(fd),
+                    owner,
+                    generation,
+                })
+            }
+            ControlResponse::Rejected { code, reason } => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the runtime refused a managed channel: {code:?}: {reason}"),
+            )),
+            ControlResponse::Unsupported { detail } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this runtime does not issue managed channels: {detail}"),
+            )),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered a channel request with {other:?}"),
             )),
         }
     }

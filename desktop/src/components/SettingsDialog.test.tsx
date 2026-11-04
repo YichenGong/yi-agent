@@ -119,6 +119,36 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText("未安装任何插件")).toBeTruthy();
   });
 
+  it("passes the managed project key through to the managed plugins section", async () => {
+    // 受管分区只在拿到项目键时才渲染。`SettingsDialog` 是它唯一的产量入口，
+    // 少传一个 prop 不会报错，只会让「受管插件」整节静默消失——所以这条测试
+    // 断言的是键真的走完了 App → SettingsDialog → SettingsPluginsTab 三跳。
+    const pluginCall = async (method: string) => {
+      if (method === "plugins/list") return { plugins: [] };
+      if (method === "plugins/v1/list") {
+        return {
+          plugins: [
+            { plugin: "example-counter", selected: "1.0.0", installed: ["1.0.0"], projects: ["/p/a"] },
+          ],
+        };
+      }
+      return {};
+    };
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        pluginCall={pluginCall}
+        pluginProjectHandle="/p/a"
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "插件" }));
+    expect(await screen.findByText("受管插件")).toBeTruthy();
+    expect(await screen.findByText("example-counter")).toBeTruthy();
+  });
+
   it("shows a 模型 tab backed by the injected modelCall", async () => {
     const modelCall = async (method: string) =>
       method === "model/list" ? { models: [], default_model: null, subagent_model: null } : { ok: true };

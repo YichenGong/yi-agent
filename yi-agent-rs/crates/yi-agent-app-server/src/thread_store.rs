@@ -139,6 +139,18 @@ pub struct ThreadMeta {
     /// 所有既有 meta 平白加一个 `null`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// 该会话绑定的插件发布（零或多条）。
+    ///
+    /// 语义是「这个会话当初是为哪个**具体的**发布建的」，不是「这个插件现在
+    /// 是什么版本」。两者必须分开：插件升级后，旧会话仍应带着它建时的版本，
+    /// 于是用它发起的调用会被判为 `StaleBinding` 并被要求重建会话；如果这里
+    /// 存的是「插件名」或「当前版本」，升级就会静默地把旧会话接到新版本上——
+    /// 那等于让一个没验证过的新版本继承旧会话的上下文与权限。
+    ///
+    /// 旧 meta 缺该字段时为空（`Vec` 的内建默认），即「普通会话，不绑插件」，
+    /// 这是**正确**的缺省而不是迁移遗留：绝大多数会话与插件无关。
+    #[serde(default)]
+    pub plugin_bindings: Vec<yi_agent_plugins::Binding>,
 }
 
 impl ThreadMeta {
@@ -370,11 +382,22 @@ impl ThreadStore {
         &self.root
     }
 
-    fn meta_path(&self, id: &str) -> PathBuf {
+    /// 该 store 所属的工作区（`root()` 是它下面的 `.yi-agent/threads`）。
+    ///
+    /// 测试与调用方要构造一份「cwd 与 store 对得上」的 meta：直接由 store 反推，
+    /// 比再传一遍路径更不容易写错（写错的表现是冷读报「没有可继承的历史」）。
+    pub fn workdir(&self) -> &Path {
+        self.root
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&self.root)
+    }
+
+    pub(crate) fn meta_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.meta.json"))
     }
 
-    fn log_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn log_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.jsonl"))
     }
 
@@ -433,6 +456,7 @@ impl ThreadStore {
             });
 
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: new_id.to_string(),
             cwd: loaded.meta.cwd.clone(),
             model: loaded.meta.model.clone(),
@@ -1321,7 +1345,7 @@ impl ThreadStore {
         Ok(existed)
     }
 
-    fn partial_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn partial_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.partial.json"))
     }
 
@@ -1434,7 +1458,7 @@ impl ThreadStore {
 ///
 /// 宽松入口（`read_partial` / `read_log`）用 `.ok()` 把读错压成「没有」；恢复
 /// 原会话不能这样——「读不了」和「不存在」在恢复语义下是相反的结论。
-fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
+pub(crate) fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1447,7 +1471,7 @@ pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn io_err(e: serde_json::Error) -> io::Error {
+pub(crate) fn io_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
@@ -1462,7 +1486,7 @@ pub(crate) fn is_valid_thread_id(id: &str) -> bool {
 
 /// Generated ids look like `thread-<uuid>`; allow only a conservative charset so
 /// an id can never name a path outside the store root or a nested file.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -1580,6 +1604,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         .map(|d| d.as_millis() as i64)
         .unwrap_or_else(now_millis);
     ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: id.to_string(),
         cwd: String::new(),
         model: String::new(),
@@ -1790,6 +1815,7 @@ mod tests {
 
     fn meta(id: &str) -> ThreadMeta {
         ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.into(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -2306,6 +2332,7 @@ mod tests {
                 "append_turn must reject escaping id {bad:?}"
             );
             let bad_meta = ThreadMeta {
+                plugin_bindings: Vec::new(),
                 thread_id: bad.into(),
                 role: None,
                 ..meta("placeholder")
@@ -3551,6 +3578,7 @@ mod tests {
 
     fn sample_meta(id: &str) -> ThreadMeta {
         ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: id.to_string(),
             cwd: "/tmp".into(),
             model: "m".into(),
@@ -3946,6 +3974,7 @@ mod tests {
     #[test]
     fn driver_fields_round_trip() {
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t1".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -3999,6 +4028,7 @@ mod tests {
     #[test]
     fn the_new_keys_are_the_only_ones_written() {
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t1".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -4054,6 +4084,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = ThreadStore::new(dir.path());
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
             ..sample_meta("t-roots")
         };
@@ -4077,6 +4108,7 @@ mod tests {
         let store = ThreadStore::new(dir.path());
         let now = now_millis();
         let meta = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "t".into(),
             cwd: "/w".into(),
             model: "m".into(),
@@ -4205,6 +4237,7 @@ mod tests {
         let store = ThreadStore::new(dir.path());
 
         let lead = ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "thread-lead-1".into(),
             cwd: dir.path().display().to_string(),
             model: "m".into(),
@@ -4287,6 +4320,7 @@ mod tests {
         for (id, created) in [("thread-lead-b", 20i64), ("thread-lead-a", 10i64)] {
             store
                 .create(&ThreadMeta {
+                    plugin_bindings: Vec::new(),
                     thread_id: id.into(),
                     cwd: dir.path().display().to_string(),
                     model: "m".into(),
@@ -4822,6 +4856,65 @@ mod tests {
         assert_eq!(
             loaded.meta.cwd, "/tmp/keep-me",
             "cwd 被冲成空串说明反序列化失败了，走了 rebuild_meta 兜底"
+        );
+    }
+
+    /// 旧 meta 没有 `plugin_bindings`：必须零迁移读成空表（普通会话）。
+    ///
+    /// 若缺 `#[serde(default)]`，反序列化会整份失败，`load` 走 `rebuild_meta`
+    /// 兜底——那会把 cwd 等字段一起冲掉。所以这里同时断言 cwd 还在。
+    #[test]
+    fn old_meta_without_plugin_bindings_reads_as_an_empty_list() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-plain"),
+            r#"{"thread_id":"thread-plain","cwd":"/tmp/keep-me","model":"m","created_at":1,
+                "updated_at":1,"title":null,"permission_mode":"normal"}"#,
+        )
+        .unwrap();
+        let loaded = s.load("thread-plain").unwrap().expect("meta must parse");
+        assert!(
+            loaded.meta.plugin_bindings.is_empty(),
+            "a session that never bound a plugin has no bindings"
+        );
+        assert_eq!(
+            loaded.meta.cwd, "/tmp/keep-me",
+            "cwd 被冲成空串说明反序列化失败了，走了 rebuild_meta 兜底"
+        );
+    }
+
+    /// resume 一个插件会话：绑定的**具体版本与代次**必须原样回来。
+    ///
+    /// 这是"插件升级后旧会话被判陈旧"唯一的信息来源。若 resume 时把绑定丢了
+    /// （或改写成"当前版本"），旧会话就会被静默接到新版本上——正是设计里
+    /// 明确要避免的那条路。
+    #[test]
+    fn resuming_a_plugin_session_keeps_the_exact_plugin_binding() {
+        let (_dir, s) = store();
+        let binding = yi_agent_plugins::Binding {
+            host_id: "host-abc".into(),
+            release: yi_agent_plugins::ReleaseId {
+                plugin: yi_agent_plugins::PluginId::parse("example-plugin").unwrap(),
+                version: "1.4.0".into(),
+                target: "darwin-aarch64".into(),
+                sha256: "ab".repeat(32),
+            },
+            activation: 3,
+            project: yi_agent_plugins::ProjectId::parse("/tmp/project").unwrap(),
+            grant: 2,
+        };
+        let mut meta = meta("thread-plugin");
+        meta.cwd = "/tmp/project".into();
+        meta.plugin_bindings = vec![binding.clone()];
+        std::fs::create_dir_all(&s.root).unwrap();
+        s.create(&meta).unwrap();
+
+        let loaded = s.load("thread-plugin").unwrap().expect("meta must parse");
+        assert_eq!(
+            loaded.meta.plugin_bindings,
+            vec![binding],
+            "resume must not drop or rewrite the binding"
         );
     }
 

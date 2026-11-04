@@ -59,12 +59,6 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onNew: vi.fn(),
     onRemoveWorkspace: vi.fn(),
     onBrowse: vi.fn(),
-    boards: [],
-    boardSummaries: {},
-    selectedBoard: null,
-    onCreateBoard: vi.fn(),
-    onRemoveBoard: vi.fn(),
-    onOpenBoard: vi.fn(),
     onOpenSettings: vi.fn(),
     onLinkFolder: vi.fn(),
     onUnlinkFolder: vi.fn(),
@@ -671,208 +665,69 @@ describe("ThreadSidebar status", () => {
 });
 
 /**
- * 看板条目：只给已登记的项目显示，右键菜单按登记状态二选一。
- *
- * 用例自带一份最小 groups，避免改动上面共享的 fixture（那会让既有断言跟着
- * 漂移）。路径用 /proj，与计划里的验收片段一致。
+ * 驱动会话分组：`driver_ref` 非空的会话由某个插件驱动，宿主只认这个字段本身，
+ * 不知道也不该知道是哪个插件。
  */
-const boardGroups: WorkspaceGroup[] = [
-  { workspace: "/proj", exists: true, threads: [thread("b1", "board-thread", "/proj")] },
+const driverGroups: WorkspaceGroup[] = [
+  { workspace: "/proj", exists: true, threads: [thread("b1", "plain-thread", "/proj")] },
 ];
 
-/** 在某个工作区分组头上打开右键菜单（与键盘路径同一条处理链）。 */
-function openWorkspaceMenu(container: HTMLElement, workspace: string) {
-  const title = container.querySelector(`[title="${workspace}"]`)!;
-  const header = title.closest<HTMLElement>("div[tabindex]")!;
-  fireEvent.contextMenu(header);
-}
-
-describe("ThreadSidebar 看板", () => {
-  it("项目右键菜单提供创建看板", () => {
-    const onCreateBoard = vi.fn();
-    const { container } = renderSidebar({ groups: boardGroups, boards: [], onCreateBoard });
-
-    openWorkspaceMenu(container, "/proj");
-    const item = screen.getByText("创建 Superpowers 看板");
-    fireEvent.click(item);
-
-    expect(onCreateBoard).toHaveBeenCalledWith("/proj");
-  });
-
-  it("全局开关关着时右键菜单不提供看板项", () => {
-    const { container } = renderSidebar({
-      groups: boardGroups,
-      boards: [],
-      kanbanEnabled: false,
-    });
-
-    openWorkspaceMenu(container, "/proj");
-    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
-    expect(screen.queryByText("移除看板")).toBeNull();
-  });
-
-  it("已登记的项目右键菜单改为移除看板，且不再提供创建", () => {
-    const onRemoveBoard = vi.fn();
-    const onCreateBoard = vi.fn();
-    const { container } = renderSidebar({
-      groups: boardGroups,
-      boards: ["/proj"],
-      onCreateBoard,
-      onRemoveBoard,
-    });
-
-    openWorkspaceMenu(container, "/proj");
-    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
-    fireEvent.click(screen.getByText("移除看板"));
-
-    expect(onRemoveBoard).toHaveBeenCalledWith("/proj");
-    expect(onCreateBoard).not.toHaveBeenCalled();
-  });
-
-  it("已登记的项目显示看板条目并可打开", () => {
-    const onOpenBoard = vi.fn();
-    const { container } = renderSidebar({
-      groups: boardGroups,
-      boards: ["/proj"],
-      boardSummaries: { "/proj": "2 排队 · 1 运行中" },
-      selectedBoard: null,
-      onOpenBoard,
-    });
-
-    // aria-label 与可见文字都是「看板」，条目本身带完整路径的 title。
-    const entry = container.querySelector<HTMLElement>('[aria-label="看板"]')!;
-    expect(entry.getAttribute("title")).toBe("/proj");
-    expect(entry.textContent).toContain("2 排队 · 1 运行中");
-
-    fireEvent.click(screen.getByText("看板"));
-    expect(onOpenBoard).toHaveBeenCalledWith("/proj");
-  });
-
-  it("未登记的项目没有看板条目", () => {
-    const { container } = renderSidebar({ groups: boardGroups, boards: [] });
-    expect(screen.queryByText("看板")).toBeNull();
-    expect(container.querySelector('[aria-label="看板"]')).toBeNull();
-  });
-
-  it("只给已登记的那个项目画条目", () => {
-    const onOpenBoard = vi.fn();
-    const groups2: WorkspaceGroup[] = [
-      ...boardGroups,
-      { workspace: "/other", exists: true, threads: [thread("o1", "other-thread", "/other")] },
-    ];
-    const { container } = renderSidebar({
-      groups: groups2,
-      boards: ["/other"],
-      boardSummaries: { "/other": "空" },
-      onOpenBoard,
-    });
-
-    const entries = container.querySelectorAll('[aria-label="看板"]');
-    expect(entries).toHaveLength(1);
-    expect(entries[0].getAttribute("title")).toBe("/other");
-
-    fireEvent.click(screen.getByText("看板"));
-    expect(onOpenBoard).toHaveBeenCalledWith("/other");
-  });
-
-  it("选中的看板条目用与线程行相同的 token，未选中只有 hover", () => {
-    // 断言的是**语义 token**而不是某个字面色阶：看板条目与线程行的选中态必须
-    // 逐类名一致（`bg-raised`/`text-fg`），否则切到浅色主题时其中一边会失读。
-    // 早先这里比对的是某个字面灰阶类名，把「字面色阶」这一漂移固化进了测试。
-    //
-    // 两组选中态同时成立才有可比性：看板条目由 `selectedBoard` 选中，线程行由
-    // `currentId` 选中——传一个只选中看板，线程行会是未选中态，比较就没有意义。
-    const selected = renderSidebar({
-      groups: boardGroups,
-      boards: ["/proj"],
-      selectedBoard: "/proj",
-      currentId: "b1",
-    });
-    const selectedClasses = selected.container
-      .querySelector('[aria-label="看板"]')!
-      .className.split(/\s+/);
-    expect(selectedClasses).toContain("bg-raised");
-    expect(selectedClasses).toContain("text-fg");
-
-    // 线程行用同一套 token——两边同源，改一边而另一边没跟上就会在此失败。
-    const threadRow = selected.container
-      .querySelector('[title="board-thread"]')!
-      .closest("div[tabindex]")!
-      .className.split(/\s+/);
-    expect(threadRow).toContain("bg-raised");
-    expect(threadRow).toContain("text-fg");
-
-    const idle = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: null });
-    const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
-    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-raised/50 被当选中态。
-    expect(idleClasses).not.toContain("bg-raised");
-  });
-
-  it("把卡片会话收进默认折叠的「看板会话」小节，展开后可见", () => {
+describe("ThreadSidebar 驱动会话", () => {
+  it("把驱动会话收进默认折叠的小节，展开后可见", () => {
     const withCard: WorkspaceGroup[] = [
       {
         workspace: "/proj",
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
+          { ...thread("t-card", "driven · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
-    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    const { container } = renderSidebar({ groups: withCard });
 
-    // 小节存在，但默认折叠 → 卡片行不可见，普通行仍在。
-    expect(screen.getByLabelText("看板会话")).toBeTruthy();
-    expect(container.textContent).not.toContain("看板 · card-1");
+    // 小节存在，但默认折叠 → 驱动会话不可见，普通行仍在。
+    expect(screen.getByLabelText("驱动会话")).toBeTruthy();
+    expect(container.textContent).not.toContain("driven · card-1");
     expect(container.textContent).toContain("plain-thread");
 
-    fireEvent.click(screen.getByLabelText("看板会话"));
-    expect(container.textContent).toContain("看板 · card-1");
+    fireEvent.click(screen.getByLabelText("驱动会话"));
+    expect(container.textContent).toContain("driven · card-1");
   });
 
-  it("看板会话行比项目组直属会话行多缩进一档", () => {
+  it("驱动会话行比项目组直属会话行多缩进一档", () => {
     const withCard: WorkspaceGroup[] = [
       {
         workspace: "/proj",
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
+          { ...thread("t-card", "driven · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
-    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
-    fireEvent.click(screen.getByLabelText("看板会话"));
+    const { container } = renderSidebar({ groups: withCard });
+    fireEvent.click(screen.getByLabelText("驱动会话"));
 
     const rows = Array.from(container.querySelectorAll("[data-group-row]"));
     const plain = rows.find((r) => r.textContent!.includes("plain-thread"))!;
-    const card = rows.find((r) => r.textContent!.includes("看板 · card-1"))!;
-    // 直属行 pl-3；卡片会话 pl-7，缩进一档让层级可读。
+    const card = rows.find((r) => r.textContent!.includes("driven · card-1"))!;
+    // 直属行 pl-3；驱动会话 pl-7，缩进一档让层级可读。
     expect(plain.className).toContain("pl-3");
     expect(card.className).toContain("pl-7");
   });
 
-  it("没有卡片会话时不渲染「看板会话」小节", () => {
-    const { container } = renderSidebar({ groups: boardGroups, boards: ["/proj"] });
-    expect(container.querySelector('[aria-label="看板会话"]')).toBeNull();
-    expect(container.textContent).toContain("board-thread");
+  it("没有驱动会话时不渲染该小节", () => {
+    const { container } = renderSidebar({ groups: driverGroups });
+    expect(container.querySelector('[aria-label="驱动会话"]')).toBeNull();
+    expect(container.textContent).toContain("plain-thread");
   });
 
-  it("看板被移除后卡片会话仍留在小节里（不整批消失）", () => {
-    const withCard: WorkspaceGroup[] = [
-      {
-        workspace: "/proj",
-        exists: true,
-        threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
-        ],
-      },
-    ];
-    // boards 为空 = 该项目的看板已被移除。
-    const { container } = renderSidebar({ groups: withCard, boards: [] });
-    expect(screen.getByLabelText("看板会话")).toBeTruthy();
-    fireEvent.click(screen.getByLabelText("看板会话"));
-    expect(container.textContent).toContain("看板 · card-1");
+  it("驱动会话照常出现在置顶区", () => {
+    // 置顶区分流不经过项目组，宿主不该因为它由插件驱动就把它藏起来。
+    const card = { ...thread("t-card", "driven · card-1", "/proj"), driver_ref: "card-1", pinned: true };
+    const { container } = renderSidebar({ groups: driverGroups, pinned: [card] });
+    expect(container.textContent).toContain("driven · card-1");
   });
 });
 
@@ -1244,25 +1099,25 @@ describe("ThreadSidebar 搜索", () => {
     expect(content!.parentElement).toBe(scroller);
   });
 
-  it("搜索命中藏在「看板会话」折叠小节里时，该小节搜索期间自动展开", () => {
+  it("搜索命中藏在「驱动会话」折叠小节里时，该小节搜索期间自动展开", () => {
     const withCard: WorkspaceGroup[] = [
       {
         workspace: "/proj",
         exists: true,
         threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
+          { ...thread("t-card", "driven · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
-    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    const { container } = renderSidebar({ groups: withCard });
     // 默认折叠：空闲时命中行不可见。
-    expect(container.textContent).not.toContain("看板 · card-1");
+    expect(container.textContent).not.toContain("driven · card-1");
     fireEvent.change(searchBox(), { target: { value: "card-1" } });
     // 搜索期间小节自动展开：命中行可见。
-    expect(container.textContent).toContain("看板 · card-1");
+    expect(container.textContent).toContain("driven · card-1");
     fireEvent.change(searchBox(), { target: { value: "" } });
     // 清空后恢复折叠。
-    expect(container.textContent).not.toContain("看板 · card-1");
+    expect(container.textContent).not.toContain("driven · card-1");
   });
 
   it("搜索栏在 New thread 之后、会话列表之前", () => {
@@ -1321,13 +1176,6 @@ describe("ThreadSidebar 搜索", () => {
     expect(container.textContent).not.toContain("alpha-thread");
   });
 
-  it("搜索期间隐藏「看板」条目行", () => {
-    const { container } = renderSidebar({ groups: boardGroups, boards: ["/proj"] });
-    expect(container.querySelector('[aria-label="看板"]')).not.toBeNull();
-    fireEvent.change(searchBox(), { target: { value: "proj" } });
-    expect(container.querySelector('[aria-label="看板"]')).toBeNull();
-  });
-
   it("清除按钮仅在有内容时出现，点击后恢复完整列表", () => {
     const { container } = renderSidebar();
     expect(screen.queryByLabelText("清除搜索")).toBeNull();
@@ -1359,27 +1207,27 @@ describe("ThreadSidebar 搜索", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
+          { ...thread("t-card", "driven · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
-    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    const { container } = renderSidebar({ groups: withCard });
     fireEvent.change(searchBox(), { target: { value: "proj" } });
 
     const collapse = container.querySelector<HTMLButtonElement>('[aria-label="Collapse"]')!;
-    const boardToggle = container.querySelector<HTMLButtonElement>('[aria-label="看板会话"]')!;
-    // 默认态：项目组展开（caret 是 Collapse），看板小节折叠（aria-expanded=false）。
+    const boardToggle = container.querySelector<HTMLButtonElement>('[aria-label="驱动会话"]')!;
+    // 默认态：项目组展开（caret 是 Collapse），驱动会话小节折叠（aria-expanded=false）。
     expect(collapse.disabled).toBe(true);
     expect(boardToggle.disabled).toBe(true);
     expect(boardToggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(collapse);
     fireEvent.click(boardToggle);
 
-    // 清空后回到搜索前的折叠态：项目组仍展开、看板小节仍折叠。
+    // 清空后回到搜索前的折叠态：项目组仍展开、驱动会话小节仍折叠。
     // 若上面两次点击写进了 Set，二者之一就会翻转，这里即失败。
     fireEvent.change(searchBox(), { target: { value: "" } });
     expect(container.querySelector('[aria-label="Collapse"]')).not.toBeNull();
-    expect(container.querySelector('[aria-label="看板会话"]')!.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[aria-label="驱动会话"]')!.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("搜索期间置顶分区处于展开态", () => {

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "transactionId": "tx-activate-0001",
+  "plugin": "example-counter",
+  "action": "Activate",
+  "phase": "draining",
+  "target": {
+    "release": {
+      "plugin": "example-counter",
+      "version": "1.4.0",
+      "target": "darwin-aarch64",
+      "sha256": "3b1f2c9a7d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+    },
+    "activation": 7
+  },
+  "previous": { "activation": 6, "version": "1.3.2" },
+  "blocking": { "projects": ["project-1"], "turns": ["turn-a"] },
+  "sharedConfigRevision": 12,
+  "error": null
+}

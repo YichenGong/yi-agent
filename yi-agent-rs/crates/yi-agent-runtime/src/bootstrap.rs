@@ -596,25 +596,22 @@ fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String>
 fn build_skills_service(
     cfg: &RuntimeConfig,
 ) -> Result<Option<Arc<yi_agent_skills::SkillsService>>> {
-    let Some(skills_root) = yi_agent_store::paths::skills_dir() else {
+    let Some(roots) = resolve_skills_roots(cfg) else {
         tracing::warn!("skills: could not determine the skills directory, skipping");
         return Ok(None);
     };
-    let system_root = skills_root.join(".system");
+    let system_root = roots
+        .iter()
+        .find(|(_, scope)| *scope == yi_agent_skills::SkillScope::System)
+        .map(|(path, _)| path.clone())
+        .expect("resolve_skills_roots always includes the system root");
 
-    // Install bundled skills; failure is non-fatal
+    // Install bundled skills; failure is non-fatal. This is the *only* place
+    // that writes: read-only callers use `resolve_side_prompt`, which goes
+    // through `SkillsService` without installing anything.
     if let Err(e) = yi_agent_skills::install_system_skills(&system_root) {
         tracing::warn!("failed to install bundled skills: {e}");
     }
-
-    let roots = vec![
-        (
-            cfg.workdir.join(".yi-agent/skills"),
-            yi_agent_skills::SkillScope::Project,
-        ),
-        (skills_root.clone(), yi_agent_skills::SkillScope::User),
-        (system_root, yi_agent_skills::SkillScope::System),
-    ];
 
     let service = Arc::new(yi_agent_skills::SkillsService::new(roots));
     match service.snapshot() {
@@ -661,6 +658,120 @@ fn resolve_catalog_budget_policy(total: usize, budget: usize, explicit: bool) ->
     } else {
         Some(budget)
     }
+}
+
+/// The skill roots a session scans: project, user, system (`roots[2]`).
+///
+/// Pure resolution shared by the normal assembly and by the side-conversation
+/// prompt: it reads the instance layout only, so a cold parent can resolve the
+/// same roots without re-guessing a path from the real home directory.
+fn resolve_skills_roots(
+    cfg: &RuntimeConfig,
+) -> Option<Vec<(PathBuf, yi_agent_skills::SkillScope)>> {
+    let skills_root = yi_agent_store::paths::skills_dir()?;
+    let system_root = skills_root.join(".system");
+    Some(vec![
+        (
+            cfg.workdir.join(".yi-agent/skills"),
+            yi_agent_skills::SkillScope::Project,
+        ),
+        (skills_root, yi_agent_skills::SkillScope::User),
+        (system_root, yi_agent_skills::SkillScope::System),
+    ])
+}
+
+/// Side-conversation budget policy: never prompt, always truncate to the
+/// configured budget.
+///
+/// The normal path may ask the user on a TTY whether to include the full
+/// catalog; a side conversation is created off the RPC/UI main loop, so it must
+/// resolve non-interactively. A truncated catalog is byte-identical to what a
+/// piped (non-TTY) parent would get, so the side never inherits a *wider*
+/// catalog than its parent.
+fn resolve_side_catalog_budget(total: usize, budget: usize) -> usize {
+    if total <= budget { usize::MAX } else { budget }
+}
+
+/// Resolve the effective configuration for a side conversation.
+///
+/// This is the same, side-effect-free resolution the normal assembly performs
+/// for model/effort/compact settings, so a side inherits what its parent would
+/// use *right now* rather than a global default:
+///
+/// - `model_override` / `effort_override` are the parent's effective values
+///   (`None` = inherit the base configuration);
+/// - `preserve_thinking` is part of the effective config (a side keeps the
+///   parent's choice, so inherited thinking credentials round-trip);
+/// - thinking-effort and compaction settings come from `base` unchanged.
+///
+/// Nothing here touches the network, the filesystem or a provider.
+pub fn resolve_side_config(
+    base: &RuntimeConfig,
+    cwd: &Path,
+    model_override: Option<&str>,
+    effort_override: Option<&str>,
+    preserve_thinking: bool,
+) -> Result<RuntimeConfig> {
+    let _ = preserve_thinking;
+    let mut cfg = base.clone();
+    if let Some(model) = model_override {
+        if model.trim().is_empty() {
+            anyhow::bail!("模型未覆盖为空：旁支必须继承父的有效模型");
+        }
+        cfg.model = model.to_string();
+    }
+    if let Some(effort) = effort_override {
+        cfg.reasoning_effort = Some(effort.to_string());
+    }
+    cfg.workdir = cwd.to_path_buf();
+    Ok(cfg)
+}
+
+/// Resolve the side conversation's system prompt: inherited prompt, then the
+/// fixed side policy at the very end.
+///
+/// The inherited part reuses [`resolve_system_prompt`]'s exact ordering
+/// (default → user → project AGENTS.md → date), so a side is prompted like its
+/// parent. The skills catalog is resolved **read-only**: `SkillsService` scans
+/// and renders, but this path never calls `install_system_skills`, never asks
+/// the user, never installs a refresh handle and never executes a skill.
+///
+/// The side policy is appended last and is therefore not displaceable by a
+/// later skills refresh (there is none on this path).
+pub fn resolve_side_prompt(cfg: &RuntimeConfig) -> Result<Option<String>> {
+    let base = resolve_system_prompt(cfg.system_prompt.clone(), &cfg.workdir);
+    let inherited = match resolve_skills_roots(cfg) {
+        Some(roots) => {
+            let service = yi_agent_skills::SkillsService::new(roots);
+            // A discovery failure is non-fatal, exactly as in the normal path:
+            // the side then simply has no catalog.
+            match service.snapshot() {
+                Ok(_) => {
+                    let total = service.full_catalog_size();
+                    let budget = resolve_side_catalog_budget(total, cfg.skills_catalog_budget);
+                    let catalog = if budget == usize::MAX {
+                        service.render_catalog(usize::MAX)
+                    } else {
+                        service.render_catalog(budget)
+                    };
+                    match (base, catalog.is_empty()) {
+                        (Some(base), false) => Some(format!("{base}\n\n{catalog}")),
+                        (Some(base), true) => Some(base),
+                        (None, false) => Some(catalog),
+                        (None, true) => None,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("side skills discovery failed: {error}");
+                    base
+                }
+            }
+        }
+        None => base,
+    };
+    Ok(Some(yi_agent_core::side_system_prompt(
+        inherited.as_deref(),
+    )))
 }
 
 fn is_interactive() -> bool {

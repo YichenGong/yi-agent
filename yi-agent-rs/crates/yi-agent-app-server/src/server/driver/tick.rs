@@ -69,6 +69,10 @@ pub(crate) async fn driver_tick<F>(
     // 组长开关：被驱动的会话与手工会话必须是同一个判定，否则「关掉开关」
     // 只对用户手工开的会话生效，而看板/驱动会话仍会注册组长工具。
     lead_agent_enabled: bool,
+    // 实例根：驱动闸门要读它的授权表。**显式传入**而不是在函数里读环境变量：
+    // 读进程环境会让测试撞上开发者真实的 `~/.yi-agent`，而且同一个进程里
+    // 多实例（桌面壳 + sidecar）会读到同一个值。
+    instance_home: &Path,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -76,6 +80,13 @@ pub(crate) async fn driver_tick<F>(
         crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent>,
 {
+    // 驱动闸门只装配一次，本拍所有 (项目, 插件) 共用。取不到实例根时
+    // **不放行任何驱动动作**：一个猜不出的实例根意味着读不到真实授权表，
+    // 而"读不到就放行"正是这套闸门要防的事。
+    let gate = crate::plugin_manager::GrantGate::new(instance_home);
+    // 插件准入：本拍起出的所有会话共用一份（同一个实例根就是同一个准入表）。
+    // 它记录"哪些 turn 还没结束"，排空屏障靠它判断能不能关。
+    let admission = yi_agent_plugins::Admission::new(instance_home);
     for project in yi_agent_store::resident::list(resident_dir) {
         // 「没人可问」必须与「问了、失败了」在日志里分得开:项目已在常驻登记表里,
         // 却拿不出任何声明 `session_driver` 的插件(清单目录缺失,或里面每份清单都
@@ -152,6 +163,13 @@ pub(crate) async fn driver_tick<F>(
                 // 替所有项目写一遍 meta,并把「谁拉起组长」变成驱动器。`None`
                 // 是诚实取值:该 launcher 只负责起被驱动的会话。
                 lead_target: None,
+                // 驱动动作要过闸：只有持有该项目 Launch 授权的插件才能建会话。
+                driver_gate: Some(&gate as &dyn crate::session_driver::DriverGate),
+                // 起会话时还要写"绑了哪个发布"，故实例根一并交下去。
+                instance_home: Some(instance_home),
+                // 绑定与准入都在 `launch_inner` 里按本次解析结果填。
+                session_binding: None,
+                admission: Some(&admission),
                 #[cfg(test)]
                 before_prompt_send: None,
             };
@@ -195,6 +213,7 @@ pub(crate) async fn driver_tick<F>(
                 &mut state.threads,
                 &mut state.results,
                 &mut launcher,
+                &plugin,
                 &idle,
                 sessions_running,
                 &snapshot,
