@@ -3214,6 +3214,7 @@ mod foreground_root_lifecycle_capability_tests {
     }
 }
 
+#[cfg(test)]
 mod authorization_tests {
     //! What a guardian mints, and what it tells the daemon.
     //!

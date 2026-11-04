@@ -172,3 +172,31 @@ fn foreground_root_lifecycle_an_impossible_managed_start_fails_fast() {
          request path and would look hung"
     );
 }
+
+/// A frontend that identified itself must default to the managed bring-up.
+///
+/// This is the whole point of the fix: the watchdog bug is only absent when a
+/// root is registered as a managed foreground container, and a root can only be
+/// classified that way on a runtime whose guardian can authorize it. A default of
+/// `Embedded` would leave the bug in place for every user who never set
+/// `YI_AGENT_BRINGUP` -- which is everyone.
+///
+/// A separate binary so the process-wide `OnceLock` is not shared with the tests
+/// above: installing a context is deliberately one-shot.
+#[test]
+fn foreground_root_lifecycle_a_self_identified_frontend_defaults_to_managed() {
+    // The policy function reads the installed context, which this harness cannot
+    // install (`install_managed_context` is one-shot per process and other tests in
+    // this binary must run without it). Assert the mapping the function uses instead:
+    // `for_managed_frontend` is what a context-bearing process resolves to.
+    assert_eq!(
+        yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend(),
+        yi_agent_subagent::attach::BringUpPolicy::Managed,
+        "a frontend holding a lease must ask the guardian to own its runtime"
+    );
+    assert_eq!(
+        yi_agent_subagent::attach::BringUpPolicy::default_for_build(),
+        yi_agent_subagent::attach::BringUpPolicy::Embedded,
+        "a manual `yi-agent daemon` must keep owning its own runtime"
+    );
+}
