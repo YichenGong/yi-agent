@@ -238,8 +238,9 @@ export default function App() {
    * `return` 里，把 hook 放到后面会让「配对界面 ↔ 主界面」切换时 hook 数量变化，
    * React 直接抛「Rendered fewer hooks than expected」。
    */
-  // 值的渲染位置随旁支 JSX 分支一起被删掉了；`setSideNotice` 仍是 scoped
-  // slash 的落地出口，Task 4 会把渲染接回来（见计划 Task 4/7）。
+  // `setSideNotice` 是 scoped slash 与关闭命令的落地出口；它的渲染位置在 Task 7
+  // 的轻量 UI 里接回来。旁支**失败**的来源化存储已在 controller 里
+  // （`errorTarget` / `visibleError`），Task 7 一并渲染（spec §5.3）。
   const [, setSideNotice] = useState<string | null>(null);
 
   /**
@@ -996,6 +997,12 @@ export default function App() {
       prefillFromCache(id);
     // 切走即把上一条会话的在途内容落盘（切回时预填的就是它）。
     if (prevId && prevId !== id) void flushContent(prevId);
+    // 用户在主视图里显式换会话 = 一次真实导航：旁支的入场意图随之作废，迟到的
+    // `side/open` 回包不得再把用户拽走（spec §5.2）。
+    const navBinding = sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    if (navBinding !== undefined) {
+      sideConversationRef.current.selectMain(navBinding, id);
+    }
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
     if (changed) {
@@ -2650,8 +2657,18 @@ export default function App() {
     }
   };
 
-  /** 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。 */
+  /**
+   * 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。
+   *
+   * 没有旁问可关时给一句明确提示，而不是「发完命令什么也没发生」（Task 4 会把
+   * 确认对象改成携带完整原目标，那时父与宿主在这里定格）。
+   */
   const beginSideClose = async (): Promise<void> => {
+    const current = sideConversationRef.current.active;
+    if (current === null || current.kind !== "side") {
+      setSideNotice("当前没有打开的旁问");
+      return;
+    }
     const confirmation = await sideConversationRef.current.requestClose();
     if (confirmation !== null) setSideCloseConfirm(confirmation);
   };

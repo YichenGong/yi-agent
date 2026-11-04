@@ -2,7 +2,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { RpcClient } from "../lib/rpc";
-import { SideConversationStore, sideHostKey } from "../lib/sideConversation";
+import {
+  SideConversationStore,
+  sideHostKey,
+  type SideSubmitReceipt,
+} from "../lib/sideConversation";
+import type { SideStatusWire } from "../lib/protocol";
+import type { SideSummaryWire } from "../lib/generated/SideSummaryWire";
 import type { SideSyncController } from "../lib/sideSync";
 import {
   parentStatusText,
@@ -34,10 +40,13 @@ function fakeController() {
   return {
     // 真控制器的 `submit` 返回三态收据（Task 2）：fake 必须同样返回，否则
     // hook 里 `receipt?.kind === "accepted"` 的判定在测试中永远为假。
-    submit: vi.fn(async (_sideId: string, _text: string, requestId: string) => ({
-      kind: "accepted" as const,
-      requestId,
-    })),
+    submit: vi.fn(
+      async (
+        _sideId: string,
+        _text: string,
+        requestId: string,
+      ): Promise<SideSubmitReceipt> => ({ kind: "accepted", requestId }),
+    ),
     reconcile: vi.fn(async () => {}),
     client: null as unknown,
     dispose: vi.fn(),
@@ -138,7 +147,10 @@ describe("useSideConversationController.open", () => {
     await act(async () => {
       await s.hook.result.current.open(s.binding, "t1", "why slow?");
     });
-    expect(s.controllers[0].submit).toHaveBeenCalledWith(
+    // 提交只认完整来源身份（hostKey/parentId/sideId/generation），不认「当前视图」：
+    // 生产里 `controllerFor` 按 (binding, parentId) 记忆化，这里是每次新建，故取最后一个。
+    const controller = s.controllers[s.controllers.length - 1];
+    expect(controller.submit).toHaveBeenCalledWith(
       "s1",
       "why slow?",
       "00000000-0000-4000-a000-000000000001",
@@ -191,6 +203,257 @@ describe("useSideConversationController.open", () => {
     expect(ok).toBe(false);
     expect(s.client.requests.some((r) => r.method === "side/open")).toBe(false);
     expect(s.hook.result.current.error).toContain("不支持");
+  });
+});
+
+describe("useSideConversationController navigation intent", () => {
+  function summary(over: Record<string, unknown> = {}): SideSummaryWire {
+    return {
+      side_id: "s1",
+      parent_thread_id: "t1",
+      status: "idle" as SideStatusWire,
+      snapshot_revision: 1,
+      last_seq: 0,
+      active_turn_id: null,
+      expires_at: null,
+      generation: 1,
+      stopping: false,
+      ...over,
+    } as SideSummaryWire;
+  }
+
+  it("does not yank the user back into a side that opened after they left", async () => {
+    let release!: (value: unknown) => void;
+    const wait = new Promise((resolve) => {
+      release = resolve;
+    });
+    const s = setup({ responses: { "side/open": () => wait } });
+    let opening!: Promise<boolean>;
+    act(() => {
+      opening = s.hook.result.current.open(s.binding, "t1", "");
+    });
+    // 用户等不及网络，先返回了主会话。
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      release(summary());
+      await opening;
+    });
+    // 迟到的 open 回包不得抢当前视图。
+    expect(s.hook.result.current.active?.kind).not.toBe("side");
+    // 但也不能丢掉：这条旁支照样对账进了原身份的 store，之后 `/side` 能重入。
+    expect(s.controllers[0].reconcile).toHaveBeenCalledWith("t1");
+  });
+
+  it("re-enters a side the user explicitly asked for after the open landed", async () => {
+    const s = setup({ responses: { "side/open": () => summary() } });
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
+    // 对账会把基线装进真 store；这里用假控制器手动补上等价的一步。
+    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
+    s.store.adopt(s.binding.key, "s1", "t1", 1);
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      await s.hook.result.current.open(s.binding, "t1", "");
+    });
+    // 显式再开一次是新的导航意图：视图回来，且不重复请求服务端。
+    expect(s.hook.result.current.active).toMatchObject({ kind: "side", sideId: "s1" });
+    expect(s.client.requests.filter((r) => r.method === "side/open")).toHaveLength(1);
+  });
+
+  it("keeps the automatic first question as a draft when the user left first", async () => {
+    let release!: (value: unknown) => void;
+    const wait = new Promise((resolve) => {
+      release = resolve;
+    });
+    const s = setup({ responses: { "side/open": () => wait } });
+    let opening!: Promise<boolean>;
+    act(() => {
+      opening = s.hook.result.current.open(s.binding, "t1", "why slow?");
+    });
+    act(() => s.hook.result.current.back());
+    await act(async () => {
+      release(summary());
+      await opening;
+    });
+    // 返回发生在首问下发之前：不替用户在后台发出这句问题……
+    expect(
+      s.controllers.some((c) =>
+        (c.submit as unknown as { mock: { calls: unknown[][] } }).mock.calls.length > 0,
+      ),
+    ).toBe(false);
+  });
+
+  it("routes a submission to the side and host it was captured from", async () => {
+    const s = setup();
+    const other = s.store.bind({
+      key: sideHostKey("proj-b" as never, "host-2"),
+      slot: "proj-b" as never,
+      instanceId: "host-2",
+      client: s.client,
+      supported: true,
+      scope: "control",
+      connected: true,
+    });
+    const baseline = (hostKey: string) => {
+      s.store.installBaseline(hostKey, "s1", { snapshot_seq: 0 } as never, []);
+      s.store.adopt(hostKey, "s1", "t1", 1);
+      s.store.setSync(hostKey, "s1", "synced");
+    };
+    baseline(s.binding.key);
+    baseline(other.key);
+    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
+    let submitting!: Promise<unknown>;
+    act(() => {
+      submitting = s.hook.result.current.submit("hello A");
+    });
+    // 提交在路上时用户切到 B 宿主上的同名 s1。
+    act(() => s.hook.result.current.enter(other, "t1", "s1", 1));
+    await act(async () => {
+      await submitting;
+    });
+    // 提交只认出发时的身份：A 的控制器收到它，B 的控制器一次都没收到。
+    const aController = s.controllers[0];
+    expect(aController.submit).toHaveBeenCalledWith(
+      "s1",
+      "hello A",
+      expect.any(String),
+    );
+    expect(s.controllers.slice(1).every((c) => c.submit.mock.calls.length === 0)).toBe(true);
+  });
+
+  it("returns a receipt from submit and rejects when no side is open", async () => {
+    const s = setup();
+    const receipt = await s.hook.result.current.submit("hello");
+    expect(receipt).toEqual({
+      kind: "rejected",
+      requestId: "",
+      message: "当前没有打开的旁问",
+    });
+    // 没有旁支就没有请求，也不该凭空造一个 requestId。
+    expect(s.client.requests).toHaveLength(0);
+  });
+
+  it("rejects a submission aimed at a generation that has already been replaced", async () => {
+    const s = setup();
+    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
+    s.store.adopt(s.binding.key, "s1", "t1", 1);
+    s.store.setSync(s.binding.key, "s1", "synced");
+    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
+    // 宿主换代：同一 sideId 已经是另一条旁支。
+    s.store.apply(s.binding.key, {
+      method: "side/changed",
+      params: {
+        parent_thread_id: "t1",
+        side_id: "s1",
+        generation: 2,
+        seq: 1,
+        summary: summary({ generation: 2 }),
+      },
+    });
+    const receipt = await s.hook.result.current.submit("stale");
+    expect(receipt.kind).toBe("rejected");
+    expect(receipt.requestId).toBe("");
+    expect(s.controllers.every((c) => c.submit.mock.calls.length === 0)).toBe(true);
+  });
+
+  it("keeps a local return independent from an in-flight submission lock", async () => {
+    const s = setup();
+    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
+    s.store.adopt(s.binding.key, "s1", "t1", 1);
+    s.store.setSync(s.binding.key, "s1", "synced");
+    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
+    let release!: (v: unknown) => void;
+    s.controllers.length = 0;
+    s.controllerFor.mockImplementationOnce(() => {
+      const c = fakeController();
+      c.submit.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve as (v: unknown) => void;
+          }),
+      );
+      s.controllers.push(c);
+      return c as unknown as SideSyncController;
+    });
+    let submitting!: Promise<unknown>;
+    act(() => {
+      submitting = s.hook.result.current.submit("slow");
+    });
+    // 本地返回不依赖那条 RPC：网络还在路上也要立刻生效。
+    act(() => s.hook.result.current.back());
+    expect(s.hook.result.current.active).toMatchObject({ kind: "main" });
+    await act(async () => {
+      release({ kind: "accepted", requestId: "x" });
+      await submitting;
+    });
+    expect(s.client.requests.some((r) => r.method === "side/turnStart")).toBe(false);
+  });
+});
+
+describe("useSideConversationController error attribution", () => {
+  it("only surfaces an error for the side that produced it", async () => {
+    const s = setup();
+    s.store.installBaseline(s.binding.key, "s1", { snapshot_seq: 0 } as never, []);
+    s.store.adopt(s.binding.key, "s1", "t1", 1);
+    s.store.setSync(s.binding.key, "s1", "synced");
+    s.controllerFor.mockImplementationOnce(() => {
+      const c = fakeController();
+      c.submit.mockResolvedValueOnce({
+        kind: "rejected",
+        requestId: "r",
+        message: "模型拒绝了这条问题",
+      });
+      return c as unknown as SideSyncController;
+    });
+    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
+    await act(async () => {
+      await s.hook.result.current.submit("hello");
+    });
+    expect(s.hook.result.current.visibleError).toBe("模型拒绝了这条问题");
+    expect(s.hook.result.current.errorTarget).toMatchObject({
+      hostKey: s.binding.key,
+      sideId: "s1",
+    });
+    // 回到主会话：那条失败仍然属于原旁支，但不再是「当前」可展示的错误。
+    act(() => s.hook.result.current.back());
+    expect(s.hook.result.current.visibleError).toBeNull();
+    expect(s.hook.result.current.error).toBe("模型拒绝了这条问题");
+  });
+
+  it("does not let one host's failure show up as another host's", async () => {
+    const s = setup();
+    const other = s.store.bind({
+      key: sideHostKey("proj-b" as never, "host-2"),
+      slot: "proj-b" as never,
+      instanceId: "host-2",
+      client: s.client,
+      supported: true,
+      scope: "control",
+      connected: true,
+    });
+    for (const hostKey of [s.binding.key, other.key]) {
+      s.store.installBaseline(hostKey, "s1", { snapshot_seq: 0 } as never, []);
+      s.store.adopt(hostKey, "s1", "t1", 1);
+      s.store.setSync(hostKey, "s1", "synced");
+    }
+    s.controllerFor.mockImplementationOnce(() => {
+      const c = fakeController();
+      c.submit.mockResolvedValueOnce({
+        kind: "rejected",
+        requestId: "r",
+        message: "A 失败了",
+      });
+      return c as unknown as SideSyncController;
+    });
+    act(() => s.hook.result.current.enter(s.binding, "t1", "s1", 1));
+    await act(async () => {
+      await s.hook.result.current.submit("hello");
+    });
+    // 用户切到 B 宿主上的同名 s1：A 的失败不能当成 B 的错误横幅。
+    act(() => s.hook.result.current.enter(other, "t1", "s1", 1));
+    expect(s.hook.result.current.visibleError).toBeNull();
   });
 });
 
