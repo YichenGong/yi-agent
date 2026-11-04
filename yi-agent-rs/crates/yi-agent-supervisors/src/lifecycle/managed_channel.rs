@@ -64,6 +64,12 @@ const WAIT_LOCK_SLICE: Duration = Duration::from_millis(50);
 /// How long a `Wait` sleeps between registry slices.
 const WAIT_POLL: Duration = Duration::from_millis(10);
 
+/// How much of a caller's `Wait` budget is left unused so the answer can be
+/// written and read before the caller's own deadline. Without it the server's
+/// last slice and the client's read timeout expire together, and a caller that
+/// should learn "still running" gets a socket error instead.
+const REPLY_MARGIN: Duration = Duration::from_millis(100);
+
 /// Locks the registry, surviving a poison from an unrelated panic.
 ///
 /// A channel peer must not be able to take a guardian down by panicking on another
@@ -76,6 +82,45 @@ fn lock_registry(
     registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Opens one private channel and serves it on a thread of its own.
+///
+/// Returns the guardian's end's peer: the descriptor sent to the client, wrapped so
+/// a caller cannot forget to close it on a failure path. The client end is the one
+/// the guardian keeps, and it is what the new thread serves until the client hangs
+/// up.
+///
+/// Two decisions here are load-bearing:
+///
+/// * **A fresh pair per channel.** The descriptor *is* the authorization, so a
+///   channel cannot be re-pointed at a second owner afterwards. Handing out a
+///   shared stream would let one client's spawn be answered on another's channel.
+/// * **The registry is shared, not moved.** A channel lives as long as its owner,
+///   and the guardian's own maintenance -- lease expiry, owner reclamation -- needs
+///   the same registry. Moving it into the channel would stop the watchdog exactly
+///   while a tool is running, which is when it matters.
+pub fn open_channel(
+    registry: std::sync::Arc<std::sync::Mutex<ProcessRegistry>>,
+    grant: ChannelGrant,
+    budget: Duration,
+) -> io::Result<OwnedFd> {
+    let (client_side, guardian_side) = UnixStream::pair()?;
+    // The guardian's end must not inherit the client's timeout settings: each
+    // request sets its own, and a leftover short timeout would cut a legitimate
+    // long `Wait` short.
+    guardian_side.set_read_timeout(Some(budget))?;
+    guardian_side.set_write_timeout(Some(budget))?;
+    let served_grant = grant.clone();
+    std::thread::Builder::new()
+        .name("managed-channel".to_string())
+        .spawn(move || {
+            // The channel's lifetime is the owner's lifetime: a failure here means
+            // the client is gone, and owner reclamation -- not this thread -- is what
+            // stops the groups it left behind.
+            let _ = serve_channel(registry, &served_grant, guardian_side, budget);
+        })?;
+    Ok(OwnedFd::from(client_side))
 }
 
 /// Serves one channel until its peer disconnects.
@@ -158,8 +203,24 @@ pub fn serve_channel(
                     },
                 }
             }
-            ManagedSpawnRequest::Wait { process_id } => {
-                wait_in_slices(&registry, grant, &process_id, budget)
+            ManagedSpawnRequest::Wait {
+                process_id,
+                budget_secs,
+            } => {
+                // The caller's budget when it sent one; otherwise the channel
+                // budget, which is what every request used to be served with.
+                // A zero budget from a caller that meant "wait forever" would read
+                // as "no budget" here, so it is treated as the channel budget.
+                let wait_budget = if budget_secs == 0 {
+                    budget
+                } else {
+                    // Stop waiting a little before the caller's own deadline: at the
+                    // deadline itself the caller's read would time out at the same
+                    // instant this answer is written, and the honest "still running"
+                    // status would be lost to a socket timeout.
+                    Duration::from_secs(budget_secs).saturating_sub(REPLY_MARGIN)
+                };
+                wait_in_slices(&registry, grant, &process_id, wait_budget)
             }
             ManagedSpawnRequest::TryWait { process_id } => {
                 let mut registry = lock_registry(&registry);

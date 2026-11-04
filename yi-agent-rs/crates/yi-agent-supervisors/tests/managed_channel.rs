@@ -486,3 +486,70 @@ fn a_pending_wait_does_not_hold_the_registry() {
 fn process_fixture_helper() {
     fixture::run_helper_if_requested();
 }
+
+/// A `Wait` is bounded by the *caller's* budget, not by the channel's read timeout.
+///
+/// These are different things and mixing them up is silently wrong in the
+/// direction that matters: the channel budget exists to notice a dead peer and is
+/// large (an hour in production), so serving `Wait` with it would answer a long
+/// wait with `group_stopped: false` and no exit code while the command was still
+/// running -- which a caller reads as "the command failed".
+///
+/// The channel here is served with a long budget on purpose, and the request asks
+/// for a short one. A server that ignored `budget_secs` would take the whole long
+/// budget to answer and this test would time out.
+#[test]
+fn a_wait_is_bounded_by_the_requests_own_budget() {
+    let directory = TempDir::new().unwrap();
+    let (guardian_side, client_side) = UnixStream::pair().expect("socketpair");
+    let (registry, report) =
+        ProcessRegistry::open(&scope(&directory), "gen-1", &artifact()).expect("registry");
+    assert!(report.is_safe(), "a fresh runtime has nothing to recover");
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+    let shared = std::sync::Arc::clone(&registry);
+    let grant = ChannelGrant::new(ProcessOwner::frontend("app"));
+    std::thread::spawn(move || {
+        // Deliberately far longer than the request's budget below.
+        let _ = serve_channel(shared, &grant, guardian_side, Duration::from_secs(120));
+    });
+    let mut client = ManagedSpawnClient::connect(owned_stream(client_side)).expect("connect");
+
+    let (stdin_read, _stdin_write, stdout_read, stdout_write, stderr_read, stderr_write) = pipes();
+    let receipt = client
+        .spawn(
+            helper_spec(&["streams-then-hang"]),
+            StdioFds {
+                stdin: owned(stdin_read),
+                stdout: owned(stdout_write),
+                stderr: owned(stderr_write),
+            },
+        )
+        .expect("spawn");
+    let _keep_stdout = stdout_read;
+    let _keep_stderr = stderr_read;
+
+    let start = std::time::Instant::now();
+    let exit = client
+        .wait(
+            &receipt.process_id,
+            // One second of caller budget against a 120 s channel budget.
+            &Deadline::after(Duration::from_secs(1)),
+        )
+        .expect("the wait answers");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the server used the channel budget instead of the request's: {elapsed:?}"
+    );
+    // The honest answer for an unfinished command: still running, no exit code.
+    assert!(
+        !exit.group_stopped,
+        "a wait that ran out of the caller's budget must not claim the group stopped"
+    );
+
+    // Stop the child so the registry's drop does not have to.
+    let _ = client.terminate(
+        &receipt.process_id,
+        &Deadline::after(Duration::from_secs(10)),
+    );
+}

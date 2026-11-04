@@ -409,6 +409,15 @@ pub struct ProcessManager {
     /// `Unmanaged` keeps the original behaviour: a manual daemon or a test has no
     /// guardian to register with and makes no promise that quitting stops
     /// anything.
+    ///
+    /// Both halves sit behind one mutex so a manager cannot be observed with a
+    /// policy and a spawner that disagree -- exactly the state that would let a
+    /// process be labelled owned while spawning directly.
+    ownership: Mutex<Ownership>,
+}
+
+/// The owner this manager's processes belong to, once it has one.
+struct Ownership {
     policy: crate::managed_process::ManagedProcessPolicy,
     spawner: Option<crate::managed_process::ManagedSpawner>,
 }
@@ -428,9 +437,31 @@ impl ProcessManager {
             shutting_down: AtomicBool::new(false),
             processes: Arc::new(Mutex::new(HashMap::new())),
             events,
-            policy: crate::managed_process::ManagedProcessPolicy::Unmanaged,
-            spawner: None,
+            ownership: Mutex::new(Ownership {
+                policy: crate::managed_process::ManagedProcessPolicy::Unmanaged,
+                spawner: None,
+            }),
         })
+    }
+
+    /// Binds this manager to an owner, keeping the processes it already runs.
+    ///
+    /// Distinct from [`Self::into_managed`], which rebuilds: a session can learn its
+    /// owner *after* it has started processes (a TUI attaches its runtime mid-session),
+    /// and rebuilding would drop the handles to what is already running. Upgrading in
+    /// place keeps one `ProcessManager` for the session while making every *later*
+    /// spawn belong to the frontend.
+    pub fn adopt_managed(
+        &self,
+        policy: crate::managed_process::ManagedProcessPolicy,
+        spawner: crate::managed_process::ManagedSpawner,
+    ) {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ownership.policy = policy;
+        ownership.spawner = Some(spawner);
     }
 
     /// Build a process manager backed by an externally-owned sandbox controller.
@@ -465,17 +496,27 @@ impl ProcessManager {
             shutting_down: AtomicBool::new(self.shutting_down.load(Ordering::SeqCst)),
             processes: Arc::new(Mutex::new(HashMap::new())),
             events: self.events.clone(),
-            policy,
-            spawner: Some(spawner),
+            ownership: Mutex::new(Ownership {
+                policy,
+                spawner: Some(spawner),
+            }),
         })
     }
 
-    fn managed_policy(&self) -> &crate::managed_process::ManagedProcessPolicy {
-        &self.policy
+    fn managed_policy(&self) -> crate::managed_process::ManagedProcessPolicy {
+        self.ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .policy
+            .clone()
     }
 
-    fn managed_spawner(&self) -> Option<&crate::managed_process::ManagedSpawner> {
-        self.spawner.as_ref()
+    fn managed_spawner(&self) -> Option<crate::managed_process::ManagedSpawner> {
+        self.ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .spawner
+            .clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ProcessEvent> {
@@ -514,7 +555,7 @@ impl ProcessManager {
             OnExitPolicy::Kill => "kill",
             OnExitPolicy::Keep => "keep",
         };
-        crate::managed_process::validate_on_exit(self.managed_policy(), on_exit_value)?;
+        crate::managed_process::validate_on_exit(&self.managed_policy(), on_exit_value)?;
         let process_id = self.next_process_id();
         let name = opts.name.clone();
         let on_exit = opts.on_exit;

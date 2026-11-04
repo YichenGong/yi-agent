@@ -1022,9 +1022,28 @@ fn build_headless_root_tools(
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
+    managed: Option<(
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    )>,
 ) -> Result<HeadlessSetup> {
-    let setup =
-        build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
+    // Both the builtin tools and the process manager are built from the same owner:
+    // `build_tool_setup_owned` wires the managed spawner into `bash`, the process
+    // tools *and* the MCP launcher. Building the builtins separately and patching
+    // them afterwards would leave the process tools spawning directly, which is the
+    // inconsistency this path exists to avoid.
+    let mut setup = yi_agent_runtime::bootstrap::build_tool_setup_owned(
+        config,
+        false,
+        std::slice::from_ref(&attached_root.workspace.path),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+            config.sandbox,
+            config.sandbox_promotable,
+        ),
+        Vec::new(),
+        managed,
+    )?;
     let mut registry = (*setup.tools).clone();
     let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
     let delegation_controller = yi_agent_tools::SandboxController::new(
@@ -1038,13 +1057,8 @@ fn build_headless_root_tools(
         delegation_controller,
         caller,
     );
-    Ok(HeadlessSetup {
-        tools: Arc::new(registry),
-        catalog: setup.catalog,
-        system_prompt: setup.system_prompt,
-        mcp: setup.mcp,
-        process_manager: setup.process_manager,
-    })
+    setup.tools = Arc::new(registry);
+    Ok(setup)
 }
 
 struct HeadlessRuntimeSession {
@@ -1156,6 +1170,10 @@ fn build_tui_root_tools(
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
+    managed: Option<(
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    )>,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
     // `base_registry` 只有 skills,`mcp_reload` 是在主注册表上登记的;切根目录
@@ -1170,11 +1188,23 @@ fn build_tui_root_tools(
         Some(blocklist_fn),
     );
     // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
-    yi_agent_tools::register_builtin_tools_with_sandbox(
+    //
+    // A managed frontend spawns through the guardian so a tool process outlives no
+    // client silently: `managed` carries the owner this TUI registered as plus the
+    // factory that opens a private channel per child. `None` (embedded mode) keeps
+    // the direct spawn, because there is no guardian to reclaim for.
+    let controller = yi_agent_tools::SandboxController::new(
+        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+        config.sandbox,
+        config.sandbox_promotable,
+    );
+    yi_agent_tools::register_builtin_tools_managed(
         &mut registry,
         vec![attached_root.workspace.path.clone()],
-        config.sandbox,
+        controller,
         config.sandbox_writable_roots.clone(),
+        Vec::new(),
+        managed,
     );
     let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
     let delegation_controller = yi_agent_tools::SandboxController::new(
@@ -2229,11 +2259,16 @@ fn run_headless(
             // after the agent is built below. A `fork:true` spawn in `run` mode
             // reads this handle at call time.
             let caller = crate::tui::subagents::CallerContext::unbound();
+            let managed_owner = runtime
+                .frontend_lease
+                .as_ref()
+                .and_then(|lease| lease.managed_owner());
             let setup = build_headless_root_tools(
                 &config,
                 runtime.socket_path.clone(),
                 &runtime.attached_root,
                 caller.clone(),
+                managed_owner,
             )?;
             runtime_caller = Some(caller);
             setup
@@ -2912,6 +2947,11 @@ fn run_tui_agent(
         }
 
         let driver_workdir = snapshot_workdir.clone();
+        // The driver learns this session's owner mid-flight (on runtime attach) and
+        // must be able to upgrade the shared process manager from inside the spawned
+        // task. A clone of the same `Arc` is what makes that upgrade visible to the
+        // TUI's process tools, which hold their own clone.
+        let process_manager_for_driver = Arc::clone(&process_manager);
         let side_publisher_for_driver = side_publisher.as_ref().cloned();
         // 主 driver 也需要一个命令端:clear 前要建立父变更屏障。
         let side_commands_for_driver = side_publisher.as_ref().and(side_commands_tx_for_driver);
@@ -3332,6 +3372,29 @@ fn run_tui_agent(
                                         attached_root.clone(),
                                     );
                                     let runtime_workdir = attached_root.workspace.path.clone();
+                                    // The lease is taken *before* the tools are built:
+                                    // a managed tool spawn needs the owner this process
+                                    // registered as, and a tool set built first would
+                                    // have to spawn directly with no owner to reclaim
+                                    // for. Embedded mode still answers `None` here.
+                                    let lease_handle =
+                                        crate::frontend_lease::FrontendLeaseHandle::register(
+                                            &runtime_directory_for(&runtime_workdir),
+                                            yi_agent_lifecycle::types::ClientKind::Tui,
+                                            crate::frontend_lease::new_client_run_id("tui"),
+                                        )
+                                        .ok()
+                                        .flatten();
+                                    let managed_owner = lease_handle
+                                        .as_ref()
+                                        .and_then(|lease| lease.managed_owner());
+                                    // The process manager is upgraded only after the
+                                    // rebuild succeeds (see below). Upgrading it here
+                                    // would leave it owned by a lease this arm may
+                                    // still have to release, and a released lease
+                                    // refuses every later channel -- so the tools
+                                    // would fail one by one, minutes later.
+                                    let managed_for_process = managed_owner.clone();
                                     let mut next_registry = build_tui_root_tools(
                                         &base_registry,
                                         &config,
@@ -3339,6 +3402,7 @@ fn run_tui_agent(
                                         &attached_root,
                                         caller_for_attach.clone(),
                                         &mcp_for_driver,
+                                        managed_owner,
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
@@ -3358,23 +3422,26 @@ fn run_tui_agent(
                                                 Arc::clone(&handle),
                                             );
                                             caller_for_attach.bind(handle);
-                                            // A runtime with a guardian counts this
-                                            // process as a frontend; without the
+                                            // The process tools were registered at
+                                            // startup, before this session had an
+                                            // owner. Upgrade the *same* manager so
+                                            // later `process_start` calls belong to
+                                            // this frontend too; rebuilding it would
+                                            // drop the handles to anything already
+                                            // running.
+                                            if let Some((policy, spawner)) = managed_for_process
+                                            {
+                                                process_manager_for_driver
+                                                    .adopt_managed(policy, spawner);
+                                            }
+                                            // The lease was taken above, before the
+                                            // tools were built; hand it to the driver
+                                            // now that the rebuild succeeded. A
+                                            // runtime with a guardian counts this
+                                            // process as a frontend, and without the
                                             // lease its work would be reclaimed as
                                             // abandoned after 30 s of tool calls.
-                                            // Embedded mode has no guardian, and
-                                            // `None` is the honest answer there.
-                                            if let Some(lease) =
-                                                crate::frontend_lease::FrontendLeaseHandle::register(
-                                                    &runtime_directory_for(
-                                                        &attached_root.workspace.path,
-                                                    ),
-                                                    yi_agent_lifecycle::types::ClientKind::Tui,
-                                                    crate::frontend_lease::new_client_run_id("tui"),
-                                                )
-                                                .ok()
-                                                .flatten()
-                                            {
+                                            if let Some(lease) = lease_handle {
                                                 *frontend_lease_for_driver
                                                     .lock()
                                                     .expect("frontend lease mutex poisoned") =
@@ -3392,6 +3459,19 @@ fn run_tui_agent(
                                             root_activated = false;
                                         }
                                         Err(error) => {
+                                            // The rebuild failed, so nothing here
+                                            // holds a managed owner. Give the lease
+                                            // back rather than dropping it: a
+                                            // dropped lease stops renewing, and the
+                                            // guardian would then reclaim work for a
+                                            // frontend that is still running. Off the
+                                            // driver task so a slow guardian cannot
+                                            // stall the UI.
+                                            if let Some(lease) = lease_handle {
+                                                tokio::task::spawn_blocking(move || {
+                                                    let _ = lease.release();
+                                                });
+                                            }
                                             if let Some((socket, root)) = runtime_detach_for_driver
                                                 .lock()
                                                 .expect("runtime detach mutex poisoned")
@@ -5253,6 +5333,7 @@ mod tests {
             "/tmp/runtime.sock".into(),
             &root,
             crate::tui::subagents::CallerContext::unbound(),
+            None,
         )
         .expect("attached headless setup");
         let names = registry
@@ -5347,6 +5428,7 @@ mod tests {
             &root,
             crate::tui::subagents::CallerContext::unbound(),
             &mcp,
+            None,
         );
         let names = registry
             .schemas()

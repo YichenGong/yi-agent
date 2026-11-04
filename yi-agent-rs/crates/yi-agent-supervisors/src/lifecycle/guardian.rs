@@ -2289,6 +2289,96 @@ fn prepare_control_stream(stream: &std::os::unix::net::UnixStream) -> io::Result
     Ok(())
 }
 
+/// Opens a private spawn channel for one authenticated client.
+///
+/// Authentication is the grant, checked against the live lease table exactly as an
+/// admission question is: the guardian must not hand a spawn channel to a client it
+/// has already released, nor to a `LeaseOnly` observer, which by definition never
+/// authorizes a task.
+///
+/// The refusal is written as an ordinary frame, so a client that cannot have a
+/// channel learns *why* instead of seeing a bare EOF.
+fn serve_open_channel(
+    guardian: &mut Guardian,
+    stream: &mut std::os::unix::net::UnixStream,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+) {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    let refuse =
+        |stream: &mut std::os::unix::net::UnixStream, code: ControlErrorCode, reason: String| {
+            let _ = yi_agent_lifecycle::codec::write_frame(
+                stream,
+                &ControlResponse::Rejected { code, reason },
+            );
+        };
+
+    // No registry means nothing to start a group in, and a channel that accepted a
+    // spawn it could never stop would be worse than no channel at all.
+    let Some(registry) = guardian.registry.as_ref().map(std::sync::Arc::clone) else {
+        let _ = yi_agent_lifecycle::codec::write_frame(
+            stream,
+            &ControlResponse::Unsupported {
+                detail: "this runtime owns no process registry, so it cannot issue a \
+                         managed channel"
+                    .to_string(),
+            },
+        );
+        return;
+    };
+
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits(grant, now) {
+        let code = if reason.contains("lease is") {
+            ControlErrorCode::Unauthenticated
+        } else {
+            ControlErrorCode::StaleEpoch
+        };
+        refuse(stream, code, reason);
+        return;
+    }
+
+    let owner = super::guardian::ProcessOwner::frontend(grant.client_run_id.clone());
+    let channel = super::managed_channel::ChannelGrant::new(owner.clone());
+    let budget = yi_agent_lifecycle::MANAGED_CHANNEL_BUDGET;
+    let descriptor = match super::managed_channel::open_channel(registry, channel, budget) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            refuse(
+                stream,
+                ControlErrorCode::Internal,
+                format!("the channel could not be opened: {error}"),
+            );
+            return;
+        }
+    };
+    // The descriptor goes out *with* the frame in one message: a client that read
+    // the frame alone would have no way to pair an owner with a descriptor, and a
+    // descriptor arriving without its owner would be unattributable.
+    let answer = ControlResponse::ChannelOpened {
+        owner: grant.client_run_id.clone(),
+        generation: guardian.generation.clone(),
+    };
+    let frame = match yi_agent_lifecycle::codec::encode(&answer) {
+        Ok(frame) => frame,
+        Err(error) => {
+            refuse(
+                stream,
+                ControlErrorCode::Internal,
+                format!("the channel answer could not be encoded: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) =
+        yi_agent_lifecycle::managed::fdpass::send_with_fds(stream, &frame, &[descriptor])
+    {
+        // Nothing useful can be written now: the frame and the descriptor share one
+        // message, so a partial send has already broken the pairing.
+        tracing::warn!(error = %error, "a managed channel descriptor could not be sent");
+    }
+}
+
 /// Serves exactly one control connection.
 ///
 /// Exposed for integration tests that own their accept loop: a test must be able
@@ -2434,6 +2524,14 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                     Ok(()) => ControlResponse::Ack,
                 }
             }
+        }
+        ControlRequest::OpenManagedChannel { grant } => {
+            // Answered here rather than as a plain `ControlResponse`, because the
+            // answer is a *descriptor*: it must travel beside the frame, and the
+            // frame must be written last so a client cannot receive a descriptor
+            // it does not know the owner of.
+            serve_open_channel(guardian, &mut stream, &grant);
+            return;
         }
         ControlRequest::Preview { grant, target } => serve_preview(guardian, &grant, target),
         ControlRequest::PreviewPage {
