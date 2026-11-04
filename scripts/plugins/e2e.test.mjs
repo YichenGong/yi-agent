@@ -607,3 +607,54 @@ test("a case naming a missing driver degrades instead of pretending to fail", ()
   assert.equal(report.cases[0].verdict, "unsupported");
   assert.match(report.cases[0].reason, /e2e-remote\.mjs/);
 });
+
+test("a timeout with the capability present is a failure, not a capability gap", () => {
+  // 最危险的一种粉饰：A03/A20 声明了「缺官方包」，但这次官方包是在的、命令
+  // 却挂到超时。若超时被归进「缺能力」，报告会写 unsupported，读的人以为
+  // 只是没授权，实际是命令挂死——真正要修的东西被藏起来了。
+  const caseSpec = {
+    id: "A03",
+    unsupportedWithout: "official",
+    commands: [{ kind: "command", run: "x", requires: "official" }],
+  };
+  const result = runCase(caseSpec, {
+    capabilities: { official: true },
+    cwd: "/tmp",
+    runner: () => {
+      const error = new Error("timed out");
+      error.signal = "SIGKILL";
+      error.status = null;
+      throw error;
+    },
+  });
+  assert.equal(result.outcomes.length, 1, "the command was actually attempted");
+  assert.equal(
+    verdictFor({ caseSpec: result.caseSpec, outcome: result.outcome, capabilities: { official: true } }),
+    "fail",
+  );
+});
+
+test("a capability gap is decided before any command runs", () => {
+  // 反向：能力缺席时一条命令都不许跑。否则为了让报告好看，会先跑出一堆
+  // 环境错误再拿它们当理由。
+  let ran = 0;
+  const caseSpec = {
+    id: "A20",
+    unsupportedWithout: "official",
+    commands: [{ kind: "command", run: "x" }],
+  };
+  const result = runCase(caseSpec, {
+    capabilities: { official: false },
+    cwd: "/tmp",
+    runner: () => {
+      ran += 1;
+      return "";
+    },
+  });
+  assert.equal(ran, 0);
+  assert.equal(result.outcome, "missing");
+  assert.equal(
+    verdictFor({ caseSpec: result.caseSpec, outcome: result.outcome, capabilities: { official: false } }),
+    "unsupported",
+  );
+});
