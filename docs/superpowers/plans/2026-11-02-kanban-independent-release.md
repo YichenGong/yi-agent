@@ -807,7 +807,7 @@ WebView E2E 输出 JSON 报告，字段至少为 `suite`、`appSha256`、`contai
 - [ ] Step 1：边界扫描测试对带有旧 import、硬编码注册、看板私有 flag 的人工宿主 fixture 必须失败；对 ID 仅作为测试数据/迁移声明或插件目录内容不误报。新增第二插件无需改扫描规则。
 - [ ] Step 2：删除宿主看板组件和注册，切换 App 到通用视图；TUI 用通用插件 CLI 帮助，不在核心保留 `/kanban` 私有业务 switch。插件内业务测试迁移保留，不直接删测试数量来过关。
 - [ ] Step 3：`python3 -m unittest discover -s scripts/plugins -p 'test_check_host_boundary.py' && python3 scripts/plugins/check-host-boundary.py`；build 主程序后检查发布物不含业务资源、程序、skill。宿主测试 contract 改用独立公共 fixture，避免编译主程序必须带插件源码：实际命中包括 app-server `src/session_driver.rs`、store `src/ipc/protocol.rs` 和 supervisors `src/manifest.rs`。主程序不复制插件业务 schema；插件 workspace 反向验证公共 driver/socket 契约兼容。
-- [ ] Step 4：构建看板 1.0/1.1 fixture 包（版本号为测试版本，不修改正式发布版本），只改插件 UI 标记并更新插件包版本；在同一 `.app` 上安装/更新，断言 UI 标记变化而 appSha256 不变。
+- [x] Step 4：构建看板 1.0/1.1 fixture 包（版本号为测试版本，不修改正式发布版本），只改插件 UI 标记并更新插件包版本；在同一 `.app` 上安装/更新，断言 UI 标记变化而 appSha256 不变。判据：`bash scripts/verify-plugin-update.sh <built .app> .`（UI marker `board-v1` → `board-v2`，`Contents/MacOS/desktop` sha256 `ac9782d9…` 与 bundle 摘要前后一致；同一实例 `installed=[1.0.0,1.1.0]` 且 `activate 1.1.0` 起事务）；变异验证：安装后往 bundle 塞一个文件，门禁报 `the app bundle changed`。
 - [ ] Step 5：按 C 提交 `refactor: remove kanban business paths from the host`；同步 desktop、app-server、TUI、skills/flags 和看板模块的实际完成条目。
 
 ## Phase 6：完整发布与证据门禁
