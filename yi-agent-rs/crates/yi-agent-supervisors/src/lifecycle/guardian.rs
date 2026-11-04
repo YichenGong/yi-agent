@@ -54,6 +54,13 @@ const DEDICATED_FD_BASE: i32 = 32;
 /// barrier is a one-byte permit to start, and the bootstrap is the inherited proof
 /// of who assigned the role. Sharing a number would let one read the other's bytes.
 pub const BOOTSTRAP_FD: RawFd = 8;
+
+/// The number the guardian's authority-bridge descriptor is installed on.
+///
+/// A third protocol, a third number. The bridge is duplex and long-lived, so it
+/// cannot borrow the bootstrap's one-shot proof slot or the ready barrier's permit
+/// slot without one side eventually reading the other's bytes.
+pub const BRIDGE_FD: RawFd = 7;
 /// Set when something in front of the program has already consumed the barrier.
 ///
 /// The tool launcher reads the barrier and then `exec`s, so the program must not
@@ -148,6 +155,14 @@ pub struct ManagedCommand {
     /// descriptor would refuse to run, and a descriptor passed to a path that forgot
     /// to record the process would be an unjournaled child.
     pub bootstrap: Option<std::os::fd::OwnedFd>,
+    /// The guardian's end of the private authority bridge, when this child is the
+    /// daemon that bridge talks to.
+    ///
+    /// Separate from `bootstrap` because the two are different protocols with
+    /// different lifetimes: the bootstrap is read once to prove who started the
+    /// process, and the bridge stays open for authorization frames. See
+    /// [`super::roles::BRIDGE_FD_ENV`].
+    pub bridge: Option<std::os::fd::OwnedFd>,
 }
 
 impl std::fmt::Debug for ManagedCommand {
@@ -166,6 +181,7 @@ impl std::fmt::Debug for ManagedCommand {
             .field("root", &self.root)
             .field("execution", &self.execution)
             .field("has_bootstrap", &self.bootstrap.is_some())
+            .field("has_bridge", &self.bridge.is_some())
             .finish()
     }
 }
@@ -460,6 +476,22 @@ impl ProcessRegistry {
             return Err(io::Error::last_os_error());
         }
         let bootstrap_raw = hoisted_bootstrap.as_ref().map(|fd| fd.0);
+        // The bridge descriptor is hoisted the same way and for the same reason: the
+        // close loop below decides what survives by *number*, so the source has to be
+        // above every reserved slot before the fork.
+        let hoisted_bridge = command.bridge.as_ref().and_then(|fd| {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+            let hoisted = unsafe { libc::fcntl(raw, libc::F_DUPFD, DEDICATED_FD_BASE) };
+            if hoisted < 0 {
+                return None;
+            }
+            unsafe { libc::fcntl(hoisted, libc::F_SETFD, 0) };
+            Some(OwnedFd::from_raw(hoisted))
+        });
+        if command.bridge.is_some() && hoisted_bridge.is_none() {
+            return Err(io::Error::last_os_error());
+        }
+        let bridge_raw = hoisted_bridge.as_ref().map(|fd| fd.0);
         // Computed before the fork: `pre_exec` may only do async-signal-safe work,
         // and the descriptor table size does not change between here and there.
         let descriptor_limit = unsafe { libc::getdtablesize() }.clamp(64, 1 << 17);
@@ -507,6 +539,29 @@ impl ProcessRegistry {
                 if libc::fcntl(READY_FD, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                if let Some(raw) = bridge_raw {
+                    // Same collision rule as the bootstrap: a bridge on the ready or
+                    // bootstrap number would let one protocol read another's bytes.
+                    if BRIDGE_FD == READY_FD
+                        || BRIDGE_FD == BOOTSTRAP_FD
+                        || raw <= 2
+                        || raw == READY_FD
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "a bridge descriptor must not share a number with stdio, the ready barrier or the bootstrap",
+                        ));
+                    }
+                    if libc::dup2(raw, BRIDGE_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::fcntl(BRIDGE_FD, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if raw != BRIDGE_FD && raw > 2 {
+                        libc::close(raw);
+                    }
+                }
                 if let Some(raw) = bootstrap_raw {
                     // Refuse a collision instead of silently closing one protocol
                     // with the other: a bootstrap on the ready number would make the
@@ -539,7 +594,10 @@ impl ProcessRegistry {
                     // them would leave the child without stdio. The caller's source
                     // descriptors were already closed above. The bootstrap number is
                     // kept only when this child was actually authorised with one.
-                    if fd != READY_FD && !(bootstrap_raw.is_some() && fd == BOOTSTRAP_FD) {
+                    if fd != READY_FD
+                        && !(bootstrap_raw.is_some() && fd == BOOTSTRAP_FD)
+                        && !(bridge_raw.is_some() && fd == BRIDGE_FD)
+                    {
                         libc::close(fd);
                     }
                 }
@@ -1278,6 +1336,10 @@ impl Guardian {
         // The guardian-side end is kept for the daemon's whole life: closing it would
         // tell the daemon its launcher is gone while the guardian still supervises it.
         let (guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair()?;
+        // A second pair for authorization frames. Sharing the lifeline would make a
+        // half-written frame look like a dropped daemon, and the lifeline carries no
+        // messages by design.
+        let (bridge_guardian_end, bridge_daemon_end) = std::os::unix::net::UnixStream::pair()?;
         let command = ManagedCommand {
             executable: program.to_path_buf(),
             args: vec!["internal-runtime".to_string(), "daemon".to_string()],
@@ -1305,12 +1367,19 @@ impl Guardian {
                     super::roles::BOOTSTRAP_FD_ENV.to_string(),
                     BOOTSTRAP_FD.to_string(),
                 ),
+                // Declared so the child knows which number to take; the number is
+                // fixed by `spawn`, not chosen by the child.
+                (
+                    super::roles::BRIDGE_FD_ENV.to_string(),
+                    BRIDGE_FD.to_string(),
+                ),
             ],
             cwd: self.scope.project_key.clone().into(),
             owner: ProcessOwner::daemon(instance_id.clone()),
             root: None,
             execution: None,
             bootstrap: Some(daemon_end.into()),
+            bridge: Some(bridge_daemon_end.into()),
         };
         // `spawn` consumes its deadline, and the wait below needs the same budget:
         // re-deriving it rather than shrinking it keeps "start plus bind" inside one
@@ -1350,6 +1419,12 @@ impl Guardian {
                     process_id,
                 });
                 self.daemon_lifeline = Some(guardian_end);
+                // Only now: a bridge attached to a daemon that never answered would
+                // invite the guardian to install authority into a process that is not
+                // serving anything. The pair is non-blocking so a wedged peer can never
+                // stall the control loop that owns it.
+                bridge_guardian_end.set_nonblocking(true)?;
+                self.attach_bridge(bridge_guardian_end);
                 return Ok(());
             }
             std::thread::sleep(deadline.clamp(Duration::from_millis(20)));
@@ -1480,6 +1555,16 @@ impl Guardian {
     /// The switch controller, when this guardian can perform a switch.
     pub fn switches(&self) -> Option<&std::sync::Arc<super::switch::SwitchController>> {
         self.switches.as_ref()
+    }
+
+    /// Attaches the daemon end of a private authority bridge, for tests only.
+    ///
+    /// Test entry, not a production seam: production attaches the bridge only after
+    /// the daemon answered its ready barrier (see `start_daemon`), because a bridge to
+    /// a process that is not serving would invite an install nobody can honour.
+    /// Named like `serve_one_for_test` for the same reason: the suffix is the warning.
+    pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
+        self.bridge = Some(bridge);
     }
 
     /// Whether this guardian holds the handles needed to stop what it started.
@@ -1958,18 +2043,39 @@ fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeId
         guardian_display_version: Some(guardian.artifact.display_version.clone()),
         // The intersection, not the union: a capability only one side has cannot be
         // used by a client that needs both halves to honour it.
-        capabilities: daemon.map_or_else(
-            || guardian.artifact.capabilities.clone(),
-            |daemon| {
-                guardian
-                    .artifact
-                    .capabilities
-                    .iter()
-                    .filter(|have| daemon.capabilities.iter().any(|their| their == *have))
-                    .cloned()
-                    .collect()
-            },
-        ),
+        capabilities: {
+            let intersection: Vec<String> = daemon.map_or_else(
+                || guardian.artifact.capabilities.clone(),
+                |daemon| {
+                    guardian
+                        .artifact
+                        .capabilities
+                        .iter()
+                        .filter(|have| daemon.capabilities.iter().any(|their| their == *have))
+                        .cloned()
+                        .collect()
+                },
+            );
+            // The foreground capability is advertised only when this runtime can honour
+            // it: the build supports it, the private bridge is attached (so an install
+            // can actually reach the daemon), and the schema carries the foreground
+            // rows. Any one missing and a registering client would be promised
+            // isolation that the first bind would refuse.
+            let bridge_ready = guardian.bridge.is_some();
+            // Only the upper side can be too high: `SUPPORTED_SCHEMA_MIN` is this
+            // type's floor, so "the daemon schema is at least that" is always true and
+            // clippy is right to refuse it. What actually can fail is a runtime whose
+            // database is newer than this build can read.
+            let schema_supported =
+                guardian.artifact.schema_min <= yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MAX;
+            intersection
+                .into_iter()
+                .filter(|capability| {
+                    capability != yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY
+                        || (bridge_ready && schema_supported)
+                })
+                .collect()
+        },
         schema_min: daemon.map_or(guardian.artifact.schema_min, |_| {
             guardian.artifact.schema_min
         }),
@@ -2030,7 +2136,43 @@ fn serve_authorize_root(
         scope: yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
     };
     match guardian.authorize_root(grant, &request, now) {
-        Ok(authorization) => ControlResponse::RootAuthorized(authorization),
+        // The minted capability is only half the answer. Until the daemon confirms it
+        // installed the authority, no client can bind a driver with it, so answering
+        // here would hand the host a secret it could not use. The exchange is what
+        // turns "the guardian vouched" into "the runtime admits this root".
+        Ok(authorization) => match guardian.exchange(
+            &authorization,
+            intent,
+            yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+            &intent.operation_id,
+        ) {
+            Ok(super::root_authority::BridgeOutcome::Committed { .. }) => {
+                ControlResponse::RootAuthorized(authorization)
+            }
+            Ok(super::root_authority::BridgeOutcome::NoBridge) => {
+                // Embedded or guardian-less runtimes keep the pre-existing behaviour
+                // and say so: the spec's promise is limited to supported managed
+                // entries, and pretending otherwise would make an unsupported runtime
+                // look like a managed one that silently forgot to authorize.
+                ControlResponse::Rejected {
+                    code: ControlErrorCode::InvalidRequest,
+                    reason: "foreground_lifecycle_unsupported: this runtime has no \
+                             authority bridge, so a managed root cannot be authorized"
+                        .to_string(),
+                }
+            }
+            Ok(outcome) => {
+                let error = outcome.into_error();
+                ControlResponse::Rejected {
+                    code: ControlErrorCode::InvalidRequest,
+                    reason: error.to_string(),
+                }
+            }
+            Err(error) => ControlResponse::Rejected {
+                code: ControlErrorCode::InvalidRequest,
+                reason: error.to_string(),
+            },
+        },
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             ControlResponse::Rejected {
                 code: ControlErrorCode::Unauthenticated,
@@ -2449,6 +2591,57 @@ fn lease_now() -> std::time::Duration {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+}
+
+/// Serves one guardian whose authority bridge is the given daemon end.
+///
+/// Exposed for the integration test that has to prove the *forward* path: an
+/// authorization is only handed out after the daemon confirmed the install, so a
+/// fixture with no bridge can only ever observe refusals. The peer here is the test's
+/// own daemon stand-in, not a stub of the guardian: the real handler, codec, and
+/// budget all run.
+pub fn serve_with_bridge_for_test(
+    scope: RuntimeScope,
+    selected: ArtifactIdentity,
+    shutdown: impl Fn() -> bool,
+    bridge: std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let generation = format!("guardian-{}", std::process::id());
+    let mut guardian = Guardian::new(scope, selected, generation);
+    guardian.attach_bridge_for_test(bridge);
+    serve_control_loop(&mut guardian, shutdown)
+}
+
+/// The accept/maintenance loop both [`serve_with_daemon`] and the test entry share.
+///
+/// Split out so the two cannot drift: the test path must exercise the same lease
+/// maintenance and teardown as production, or it would pass while the real loop
+/// leaked a bridge.
+fn serve_control_loop(guardian: &mut Guardian, shutdown: impl Fn() -> bool) -> io::Result<()> {
+    let deadline = Deadline::after(Duration::from_secs(2));
+    let listener = guardian.bind_control(&deadline)?;
+    listener.set_nonblocking(true)?;
+    while !shutdown() {
+        if wait_for_connection(&listener, LEASE_MAINTENANCE_TICK)? {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if prepare_control_stream(&stream).is_ok() {
+                            serve_control_connection(guardian, stream);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let _ = guardian.maintain(lease_now());
+        if guardian.drained() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Prepares an accepted control connection for one request/response exchange.

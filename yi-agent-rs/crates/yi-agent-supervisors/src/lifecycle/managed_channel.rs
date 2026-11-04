@@ -105,8 +105,11 @@ pub fn serve_channel(
                     execution: grant.execution.clone(),
                     // A tool spawn is authorised by the channel that carried it, not
                     // by an inherited bootstrap: giving a tool process one would let
-                    // it claim to be a managed role itself.
+                    // it claim to be a managed role itself. The bridge is refused for
+                    // the same reason -- installing authority is the guardian's job,
+                    // and a tool that could send install frames would be minting it.
                     bootstrap: None,
+                    bridge: None,
                 };
                 let deadline = Deadline::after(budget);
                 match registry.spawn_with_stdio(command, Some(stdio), deadline) {

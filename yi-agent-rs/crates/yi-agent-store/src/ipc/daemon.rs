@@ -57,12 +57,92 @@ impl ConfirmationStore {
     }
 }
 
+/// Serves the guardian's private authority bridge until it reaches EOF.
+///
+/// Runs on its own thread rather than inside the accept loop, because the two have
+/// opposite cadences: the accept loop must answer clients promptly, while a bridge
+/// frame can sit waiting for a guardian that is busy with another client's lease. One
+/// loop for both would let a slow bridge stall every business request.
+///
+/// A frame the daemon does not answer (a `Challenge`, which only the daemon sends)
+/// yields nothing to write, and that is not an error. A write failure ends the loop:
+/// the peer is gone, and the bridge's EOF path is what closes admission.
+fn serve_authority_bridge(
+    stream: std::os::unix::net::UnixStream,
+    coordinator: std::sync::Arc<crate::runtime::RuntimeCoordinator>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    let mut stream = stream;
+    if let Err(error) = stream.set_read_timeout(Some(std::time::Duration::from_millis(200))) {
+        tracing::warn!(error = %error, "authority bridge could not be made pollable");
+        return;
+    }
+    coordinator.bridge_reconnected();
+    let mut reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(error = %error, "authority bridge could not be duplicated");
+            coordinator.bridge_closed();
+            return;
+        }
+    };
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let raw = match yi_agent_lifecycle::codec::read_frame(&mut reader) {
+            Ok(raw) => raw,
+            // A bounded read that produced nothing is the normal idle state; the bridge
+            // is a request/response channel that is silent most of the time.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            // EOF: the guardian is gone. Admission closes and stays closed, but no
+            // tombstone is written -- a crashed guardian is not a decision to revoke.
+            Err(_) => break,
+        };
+        let frame: yi_agent_lifecycle::foreground::BridgeFrame =
+            match yi_agent_lifecycle::codec::decode(&raw) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    // One malformed frame is that frame's problem, not the runtime's: the
+                    // guardian may still be healthy and simply speaking a newer protocol.
+                    tracing::warn!(error = %error, "authority bridge received an undecodable frame");
+                    continue;
+                }
+            };
+        let Some(answer) = coordinator.serve_bridge_frame(frame) else {
+            continue;
+        };
+        if let Err(error) = yi_agent_lifecycle::codec::write_frame(&mut stream, &answer) {
+            tracing::warn!(error = %error, "authority bridge answer could not be written");
+            break;
+        }
+        let _ = stream.flush();
+    }
+    coordinator.bridge_closed();
+}
+
 /// A manually owned, current-user-only local daemon socket.
 pub struct Daemon {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
     coordinator: Arc<RuntimeCoordinator>,
     listener: Option<JoinHandle<()>>,
+    /// The guardian authority bridge thread, when this daemon has one.
+    ///
+    /// Joined on teardown so a bridge answer cannot be written to a descriptor whose
+    /// socket has already been unlinked. `None` means "no guardian", which is the
+    /// embedded case and not a degraded managed one.
+    bridge_thread: Option<JoinHandle<()>>,
     /// Orphaned tasks the startup sweep reclaimed, reported to the caller
     /// instead of printed. Whoever owns the terminal must decide how this
     /// reaches the user: a bare write corrupts a live TUI frame, because the
@@ -113,6 +193,23 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
         activation: crate::foreground::ForegroundActivation,
+    ) -> Result<Self, IpcError> {
+        Self::start_with_bridge(runtime_dir, database_path, factory, activation, None)
+    }
+
+    /// [`Self::start_with_factory_and_activation`] plus the guardian's authority bridge.
+    ///
+    /// The descriptor is optional because an embedded daemon has no guardian: nobody
+    /// could vouch for a root, so there is no bridge and managed roots stay closed.
+    /// A guardian-started daemon must pass the descriptor here, or it will refuse every
+    /// authorization the guardian mints -- the exact failure this entry point exists to
+    /// make impossible to reach by accident.
+    pub fn start_with_bridge(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+        bridge: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self, IpcError> {
         raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
@@ -202,6 +299,18 @@ impl Daemon {
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        // The bridge thread starts before the socket answers clients. A client that
+        // could reach the daemon but not a bounded authority channel would be told
+        // "managed" by a runtime that cannot install anything yet.
+        let bridge_thread = bridge.map(|fd| {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            // SAFETY: the descriptor came from the guardian's inherited handle, which
+            // proved it open; this is the only conversion and it takes ownership.
+            let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd.into_raw_fd()) };
+            let coordinator = Arc::clone(&coordinator);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || serve_authority_bridge(stream, coordinator, stop))
+        });
         let thread_stop = Arc::clone(&stop);
         let daemon_coordinator = Arc::clone(&coordinator);
         let confirmations = Arc::new(ConfirmationStore::default());
@@ -330,6 +439,7 @@ impl Daemon {
             stop,
             coordinator: daemon_coordinator,
             listener: Some(listener),
+            bridge_thread,
             reclaimed_orphans,
             _instance_lock: instance_lock,
         })
@@ -416,6 +526,12 @@ impl Daemon {
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
+        }
+        // After the listener, not before: a client mid-request may still need an
+        // install to land, and tearing the bridge down first would turn that request
+        // into a timeout it does not deserve.
+        if let Some(bridge) = self.bridge_thread.take() {
+            let _ = bridge.join();
         }
         Ok(())
     }

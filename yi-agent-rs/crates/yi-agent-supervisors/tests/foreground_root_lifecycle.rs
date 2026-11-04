@@ -31,7 +31,7 @@ use yi_agent_lifecycle::types::{
     RootAuthorization, RuntimeScope,
 };
 use yi_agent_supervisors::lifecycle::guardian::{
-    GUARDIAN_SOCKET_FILE, Guardian, serve, serve_one_for_test,
+    GUARDIAN_SOCKET_FILE, Guardian, serve_one_for_test, serve_with_bridge_for_test,
 };
 
 /// Why a fixture operation failed.
@@ -96,6 +96,8 @@ struct BridgeFixture {
     /// Kept alive so the server thread's stop flag is owned by the fixture.
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<io::Result<()>>>,
+    /// The daemon stand-in on the far side of the authority bridge.
+    peer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl BridgeFixture {
@@ -106,8 +108,26 @@ impl BridgeFixture {
         let selected = artifact();
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
+        // A real peer for the authority bridge, answering the same frames the daemon
+        // does. Without it the fixture could only ever observe refusals, and the
+        // forward path -- "an install is confirmed before the capability is handed
+        // out" -- would go untested.
+        let (guardian_end, peer_end) = std::os::unix::net::UnixStream::pair()
+            .expect("a socket pair is required to serve a bridge");
+        // Mirror production, which hands the guardian a non-blocking descriptor: a
+        // fixture that passed a blocking one could not catch the bug where a timeout
+        // is silently ignored on a non-blocking socket.
+        guardian_end
+            .set_nonblocking(true)
+            .expect("the guardian end must be made non-blocking");
+        let peer = std::thread::spawn(move || answer_as_daemon(peer_end));
         let server = std::thread::spawn(move || {
-            serve(scope, selected, move || server_stop.load(Ordering::SeqCst))
+            serve_with_bridge_for_test(
+                scope,
+                selected,
+                move || server_stop.load(Ordering::SeqCst),
+                guardian_end,
+            )
         });
 
         // Wait for the socket node rather than sleeping a fixed interval: a fixed delay
@@ -141,6 +161,7 @@ impl BridgeFixture {
             lease_only,
             stop,
             server: Some(server),
+            peer: Some(peer),
         }
     }
 
@@ -271,6 +292,9 @@ impl BridgeFixture {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
+        if let Some(peer) = self.peer.take() {
+            let _ = peer.join();
+        }
     }
 
     /// One request on its own connection.
@@ -292,6 +316,57 @@ impl Drop for BridgeFixture {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
+    }
+}
+
+/// Answers bridge frames the way the daemon does, so the fixture exercises the real
+/// exchange instead of a stub that always agrees.
+///
+/// Two rules, both taken from the daemon's own state machine: a `Prepare` yields a
+/// `Challenge` carrying the sequence it will accept, and an `Authority` yields
+/// `Committed` with the epoch it would write. Anything else ends the peer, because a
+/// protocol surprise in a fixture must fail the test rather than be swallowed.
+fn answer_as_daemon(mut stream: std::os::unix::net::UnixStream) {
+    use std::io::Write;
+    use yi_agent_lifecycle::foreground::BridgeFrame;
+    let mut epoch = 1u64;
+    while let Ok(raw) = yi_agent_lifecycle::codec::read_frame(&mut stream) {
+        let Ok(frame) = yi_agent_lifecycle::codec::decode::<BridgeFrame>(&raw) else {
+            return;
+        };
+        let answer = match frame {
+            BridgeFrame::Prepare {
+                nonce,
+                root_id,
+                requested_seq,
+                ..
+            } => BridgeFrame::Challenge {
+                nonce,
+                root_id,
+                authority_seq: requested_seq,
+            },
+            // The nonce and root must echo the challenge the guardian answered: the
+            // guardian refuses a commit that names a different root, which is the same
+            // check the daemon performs in the other direction.
+            BridgeFrame::Authority(message) => {
+                let stamp = match &message {
+                    yi_agent_lifecycle::foreground::AuthorityMessage::Install { stamp, .. }
+                    | yi_agent_lifecycle::foreground::AuthorityMessage::Renew { stamp } => stamp,
+                    _ => return,
+                };
+                BridgeFrame::Committed {
+                    nonce: stamp.challenge_nonce.clone(),
+                    root_id: stamp.root_id.clone(),
+                    binding_epoch: epoch,
+                }
+            }
+            _ => return,
+        };
+        epoch += 1;
+        if yi_agent_lifecycle::codec::write_frame(&mut stream, &answer).is_err() {
+            return;
+        }
+        let _ = stream.flush();
     }
 }
 
@@ -539,6 +614,74 @@ fn foreground_root_lifecycle_without_a_registry_a_release_cannot_claim_a_stop() 
     let guardian = Guardian::new(scope, artifact(), "gen-1".to_string());
     assert!(guardian.holds_registry().not());
     let _ = SecretCapability::new("unused");
+}
+
+/// A peer that accepts the bridge and then says nothing must fail the request inside
+/// the budget, not hang the control loop and not report success.
+///
+/// The regression this pins down is real: the bridge arrives non-blocking, and
+/// `SO_RCVTIMEO` is ignored on a non-blocking socket, so a read returns `WouldBlock`
+/// at once. Without switching to blocking mode the exchange would look "denied"
+/// immediately; without the timeout it would pin the control loop forever.
+#[test]
+fn foreground_root_lifecycle_a_silent_bridge_times_out_instead_of_hanging() {
+    let directory = short_temp_dir();
+    let scope = scope_for(&directory);
+    let socket = scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let (guardian_end, peer_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    guardian_end.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        serve_with_bridge_for_test(
+            scope,
+            artifact(),
+            move || server_stop.load(Ordering::SeqCst),
+            guardian_end,
+        )
+    });
+    let readiness_deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < readiness_deadline,
+            "the guardian never bound"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // `peer_end` is deliberately kept open and never read or written: the guardian can
+    // send, and nothing answers.
+    let business = register(&socket, "run-silent", ClientKind::App, LeaseMode::Business);
+    let started = Instant::now();
+    let error = ask(
+        &socket,
+        &ControlRequest::AuthorizeRoot {
+            grant: business,
+            intent: RootBindIntent {
+                operation_id: "silent-1".to_string(),
+                thread_key: "thread:test".to_string(),
+                workspace: directory.path().to_path_buf(),
+                extra_roots: Vec::new(),
+                previous_root_capability: None,
+            },
+        },
+    )
+    .expect_err("a silent bridge must not authorize anything");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the exchange must end inside the budget, took {elapsed:?}"
+    );
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ),
+        "expected a bounded refusal, got {error:?}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::os::unix::net::UnixStream::connect(&socket);
+    let _ = server.join();
+    drop(peer_end);
 }
 
 /// Tiny boolean helper so the assertion above reads as a sentence.

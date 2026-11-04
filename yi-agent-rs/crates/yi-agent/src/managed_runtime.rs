@@ -117,8 +117,16 @@ pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::R
 pub fn run_managed_daemon(
     invocation: yi_agent_runtime::config::RuntimeConfig,
 ) -> anyhow::Result<()> {
-    use yi_agent_supervisors::lifecycle::roles::{ManagedRole, inherited_bootstrap};
+    use yi_agent_supervisors::lifecycle::roles::{
+        ManagedRole, inherited_bootstrap, inherited_bridge,
+    };
     let _bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
+    // The guardian's half of the authority bridge. Taking it here, before the daemon
+    // starts, is what makes the two halves meet: without it the daemon would accept no
+    // install this guardian mints, and every managed root would be refused at its first
+    // bind with a reason that pointed at the client instead of at this omission.
+    let bridge = inherited_bridge()
+        .map_err(|error| anyhow::anyhow!("could not take the authority bridge: {error}"))?;
     // The instance's configuration is inherited from the process that started us,
     // not re-derived from the project cwd: a shared daemon must keep reading the
     // same `YI_AGENT_HOME` and model catalogue its launcher used. Only the workdir
@@ -130,8 +138,18 @@ pub fn run_managed_daemon(
         runtime_dir.clone(),
         &yi_agent_runtime::models::models_path(),
     )?;
-    let daemon = yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
-        .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
+    let daemon = yi_agent_store::ipc::Daemon::start_with_bridge(
+        &runtime_dir,
+        &database,
+        factory,
+        // Enabled, and unconditionally: this is the *managed* daemon, the only entry
+        // whose guardian can vouch for a root. Not reachable from an environment
+        // variable, because a switch a user can flip would let a runtime classify
+        // containers without an authority channel to fence them.
+        yi_agent_store::foreground::ForegroundActivation::Enabled,
+        bridge,
+    )
+    .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
     // The business daemon supervises its own plugin children -- that is not handed
     // to the guardian, which knows process groups but not plugin manifests. The
     // second argument is the *runtime directory*: the route table is partitioned by

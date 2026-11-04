@@ -4036,6 +4036,46 @@ impl RuntimeCoordinator {
         Ok(authorization)
     }
 
+    /// Serves one frame from the guardian's private authority bridge.
+    ///
+    /// This is the production half that was missing: `ForegroundBridge::handle` existed
+    /// and was only ever called from test hooks, so a real daemon never installed any
+    /// authority and every managed root would have been refused at its first bind.
+    ///
+    /// Holds the bridge lock and then the repository lock, in that order, for the whole
+    /// frame. That order is the daemon's single rule for these two (`bind_foreground_driver`
+    /// takes them the same way); the reverse order somewhere else would be a deadlock
+    /// that only a concurrent install plus bind would ever surface.
+    pub fn serve_bridge_frame(
+        &self,
+        frame: yi_agent_lifecycle::foreground::BridgeFrame,
+    ) -> Option<yi_agent_lifecycle::foreground::BridgeFrame> {
+        let now = Instant::now();
+        self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(frame, &mut repository, now)
+        })
+    }
+
+    /// Notes that a new bridge connection was accepted.
+    ///
+    /// Challenges issued to the previous connection are dropped by the table itself:
+    /// an answer to a question nobody is waiting for must not be honoured.
+    pub fn bridge_reconnected(&self) {
+        self.with_foreground_bridge(|bridge| bridge.bridge_reconnected());
+    }
+
+    /// Notes that the bridge reached EOF, closing admission for managed roots.
+    ///
+    /// Closing is one-way on purpose: a crashed guardian is not a decision to revoke,
+    /// so nothing is tombstoned, but nothing new is admitted either.
+    pub fn bridge_closed(&self) {
+        self.with_foreground_bridge(|bridge| bridge.bridge_eof());
+    }
+
     /// Whether the foreground lifecycle semantics are enabled for this coordinator.
     pub fn foreground_activation(&self) -> crate::foreground::ForegroundActivation {
         self.foreground_activation

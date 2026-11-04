@@ -21,6 +21,7 @@ use yi_agent_lifecycle::foreground::{
     AuthorityMessage, AuthorityRefusal, AuthorityStamp, BridgeFrame, RootAuthorityScope,
     RootBindIntent,
 };
+use yi_agent_lifecycle::leases::LEASE_EXPIRY;
 use yi_agent_lifecycle::types::RootAuthorization;
 
 use super::guardian::Guardian;
@@ -73,6 +74,12 @@ pub struct RootAuthorityTable {
     revoked: HashMap<String, u64>,
     /// Roots reserved by an in-flight prepare, keyed by their operation id.
     reserved: HashMap<String, ReservedRoot>,
+    /// Roots the daemon has confirmed it installed.
+    ///
+    /// Not the same set as `granted`: a grant is minted by a prepare, and only the
+    /// daemon's `Committed` answer proves the install landed. Keeping them apart is what
+    /// lets a retried bind answer `Install` again after a crash between the two.
+    installed: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +215,22 @@ impl RootAuthorityTable {
         })
     }
 
+    /// Whether this root has ever been installed into a daemon, as far as this
+    /// guardian's table knows.
+    ///
+    /// The distinction decides which frame answers a challenge, and getting it wrong is
+    /// silent: a `Renew` for a root the daemon has never installed is refused with
+    /// `RecoveryAuthorityMissing`, so the host would be handed a capability that the
+    /// daemon will never accept.
+    pub fn is_installed(&self, root_id: &str) -> bool {
+        self.installed.contains(root_id)
+    }
+
+    /// Marks a root as installed once the daemon confirmed the commit.
+    pub fn mark_installed(&mut self, root_id: &str) {
+        self.installed.insert(root_id.to_string());
+    }
+
     /// Answers one daemon challenge with the authority this guardian holds.
     ///
     /// The answer's sequence is the asked-for one or higher, never lower: a reply below
@@ -244,6 +267,14 @@ impl RootAuthorityTable {
         let _ = daemon_instance_id;
         BridgeFrame::Authority(AuthorityMessage::Renew { stamp })
     }
+}
+
+/// Whether an I/O error was a bounded wait running out rather than a broken peer.
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn new_capability_nonce() -> String {
@@ -359,6 +390,172 @@ impl Guardian {
         Ok(frame)
     }
 
+    /// Runs one prepare/install exchange with the daemon.
+    ///
+    /// The order is the security property, so it lives in one place:
+    ///
+    /// 1. the daemon reserves the root and issues the challenge (it owns the clock);
+    /// 2. this guardian answers that challenge with the capability it minted;
+    /// 3. only the daemon's `Committed` frame proves the install landed.
+    ///
+    /// A guardian that reported the binding on its own send would be describing an
+    /// intent, not a fact. Returns [`BridgeOutcome::NoBridge`] for a runtime with no
+    /// guardian-started daemon, which is a normal embedded state rather than an error.
+    pub fn exchange(
+        &mut self,
+        authorization: &RootAuthorization,
+        intent: &RootBindIntent,
+        scope: RootAuthorityScope,
+        operation_id: &str,
+    ) -> std::io::Result<BridgeOutcome> {
+        if self.bridge.is_none() {
+            return Ok(BridgeOutcome::NoBridge);
+        }
+        let nonce = new_capability_nonce();
+        let root_id = authorization.root_id.clone();
+        let requested_seq = self
+            .root_authority
+            .granted
+            .get(&root_id)
+            .map_or(1, |grant| grant.last_authority_seq);
+        let prepare = BridgeFrame::Prepare {
+            nonce: nonce.clone(),
+            root_id: root_id.clone(),
+            client_run_id: authorization.client_run_id.clone(),
+            scope_key: authorization.scope_key.clone(),
+            generation: authorization.daemon_instance_id.clone(),
+            requested_seq,
+            intent: intent.clone(),
+            scope,
+        };
+        let Some(answer) = self.round_trip(&prepare)? else {
+            return Ok(BridgeOutcome::TimedOut);
+        };
+        let authority_seq = match answer {
+            BridgeFrame::Challenge {
+                authority_seq,
+                root_id: asked,
+                nonce: asked_nonce,
+            } if asked == root_id && asked_nonce == nonce => authority_seq,
+            BridgeFrame::Denied { code, .. } => return Ok(BridgeOutcome::Denied { code }),
+            // Any other frame is a peer that is not following the protocol. Saying so
+            // is better than guessing which half of the exchange failed.
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("the daemon answered a prepare with {other:?}"),
+                ));
+            }
+        };
+
+        // The lease this answer may claim is the one the guardian can still verify at
+        // the moment it answers, not the one it had when the prepare was sent.
+        let remaining = self
+            .root_authority
+            .granted
+            .get(&root_id)
+            .filter(|grant| grant.belongs_to(&authorization.client_run_id))
+            .map(|_| LEASE_EXPIRY)
+            .unwrap_or(Duration::ZERO);
+        let stamp_binding_epoch = self
+            .root_authority
+            .granted
+            .get(&root_id)
+            .map_or(1, |grant| grant.binding_epoch);
+        let stamp = AuthorityStamp {
+            scope_key: authorization.scope_key.clone(),
+            generation: authorization.daemon_instance_id.clone(),
+            owner: authorization.client_run_id.clone(),
+            root_id: root_id.clone(),
+            binding_epoch: stamp_binding_epoch,
+            authority_seq,
+            challenge_nonce: nonce.clone(),
+            remaining_lease_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+            authority_scope: scope,
+        };
+        // A root the daemon has never installed needs an `Install`; a later bind of the
+        // same root needs a `Renew`, because an install for an already-installed root
+        // would be a second classification of the same container.
+        let message = if self.roots().is_installed(&root_id) {
+            AuthorityMessage::Renew { stamp }
+        } else {
+            AuthorityMessage::Install {
+                stamp,
+                authorization: authorization.clone(),
+            }
+        };
+        if let Some(grant) = self.root_authority.granted.get_mut(&root_id) {
+            grant.last_authority_seq = authority_seq;
+        }
+        // A renew changes admission, not the persisted identity, so the daemon answers
+        // it with nothing (see the daemon's `Renew` arm). Waiting for a frame there
+        // would turn a successful renew into a timed-out one, so the installed case
+        // stops after the send.
+        if matches!(message, AuthorityMessage::Renew { .. }) {
+            let sent = BridgeFrame::Authority(message);
+            self.send_bridge_frame(&sent)?;
+            return Ok(BridgeOutcome::Committed {
+                binding_epoch: stamp_binding_epoch,
+            });
+        }
+        let sent = BridgeFrame::Authority(message);
+        let Some(answer) = self.round_trip(&sent)? else {
+            return Ok(BridgeOutcome::TimedOut);
+        };
+        match answer {
+            BridgeFrame::Committed {
+                binding_epoch,
+                root_id: told,
+                ..
+            } if told == root_id => {
+                self.roots_mut().mark_installed(&root_id);
+                let _ = operation_id;
+                Ok(BridgeOutcome::Committed { binding_epoch })
+            }
+            BridgeFrame::Denied { code, .. } => Ok(BridgeOutcome::Denied { code }),
+            BridgeFrame::Refused { reason, .. } => Ok(BridgeOutcome::Refused { reason }),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the daemon answered an authority frame with {other:?}"),
+            )),
+        }
+    }
+
+    /// Writes one frame and reads the next one, both inside [`PREPARE_BUDGET`].
+    ///
+    /// `Ok(None)` means nothing arrived in time. The stream stays attached: one
+    /// silent peer is a failed request, not a reason to tear down a bridge that other
+    /// requests may still use.
+    fn round_trip(&mut self, frame: &BridgeFrame) -> std::io::Result<Option<BridgeFrame>> {
+        let Some(stream) = self.bridge.as_mut() else {
+            return Ok(None);
+        };
+        // The bridge is left non-blocking by `start_daemon` so a wedged peer cannot
+        // stall the control loop. That is the opposite of what a bounded exchange
+        // needs: `SO_RCVTIMEO` has no effect on a non-blocking socket, so a read would
+        // return `WouldBlock` at once and a healthy daemon would look dead. Blocking
+        // mode plus explicit timeouts is what gives a real deadline.
+        stream.set_nonblocking(false)?;
+        stream.set_write_timeout(Some(PREPARE_BUDGET))?;
+        stream.set_read_timeout(Some(PREPARE_BUDGET))?;
+        if let Err(error) = yi_agent_lifecycle::codec::write_frame(&mut *stream, frame) {
+            if is_timeout(&error) {
+                return Ok(None);
+            }
+            // A closed peer is terminal: the daemon is gone, and pretending the bridge
+            // still works would make every later request wait out its own timeout.
+            return Err(error);
+        }
+        match yi_agent_lifecycle::codec::read_frame(&mut *stream) {
+            Ok(raw) => {
+                let frame: BridgeFrame = yi_agent_lifecycle::codec::decode(&raw)?;
+                Ok(Some(frame))
+            }
+            Err(error) if is_timeout(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Sends one frame over the private bridge, when this guardian has one.
     ///
     /// A guardian with no bridge (tests, and a runtime whose daemon was never started)
@@ -370,6 +567,63 @@ impl Guardian {
             return Ok(());
         };
         yi_agent_lifecycle::codec::write_frame(stream, frame)
+    }
+}
+
+/// Reads nothing, but names the wait so a wedged peer cannot hang a caller forever.
+///
+/// The guardian's control connection has a two-second read timeout; the bridge waits
+/// under the same budget because a client waiting for an authorization is waiting on
+/// both hops. A peer that says nothing therefore fails the request rather than pinning
+/// the control loop that owns every other client's lease.
+pub const PREPARE_BUDGET: Duration = Duration::from_secs(2);
+
+/// The outcome of one prepare/install exchange over the private bridge.
+///
+/// A struct rather than the raw frame so the caller cannot mistake "the guardian sent
+/// an install" for "the daemon committed": only [`Self::Committed`] carries the epoch
+/// the daemon wrote, and that epoch is what every later activity report is fenced by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BridgeOutcome {
+    /// The daemon installed the authority and reported the binding epoch.
+    Committed { binding_epoch: u64 },
+    /// The daemon refused, with a wire-safe code.
+    Denied {
+        code: yi_agent_lifecycle::foreground::ForegroundErrorCode,
+    },
+    /// The guardian refused to vouch for this root.
+    Refused {
+        reason: yi_agent_lifecycle::foreground::AuthorityRefusal,
+    },
+    /// No answer arrived inside the budget. Distinct from a refusal: a request that
+    /// timed out must not be reported as "the guardian said no".
+    TimedOut,
+    /// The bridge is not attached (an embedded runtime, or a daemon that never started).
+    NoBridge,
+}
+
+impl BridgeOutcome {
+    /// Turns a non-commit outcome into the error a control handler answers with.
+    pub fn into_error(self) -> std::io::Error {
+        match self {
+            Self::Committed { .. } => std::io::Error::other("a committed exchange is not an error"),
+            Self::Denied { code } => std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("the daemon refused the install: {code:?}"),
+            ),
+            Self::Refused { reason } => std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("this guardian will not vouch for the root: {reason:?}"),
+            ),
+            Self::TimedOut => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the daemon did not answer the authority prepare in time",
+            ),
+            Self::NoBridge => std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this runtime has no authority bridge, so a root cannot be managed here",
+            ),
+        }
     }
 }
 

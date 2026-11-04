@@ -293,7 +293,7 @@ impl<T: ForegroundTransport> DriverState<T> {
 /// A trait rather than direct `send_request` calls so the ordering state machine above
 /// has a fake; production uses [`SocketTransport`], which goes through
 /// [`ThreadRoot::send_as_root`] and therefore inherits its liveness handling.
-pub(crate) trait ForegroundTransport {
+pub trait ForegroundTransport {
     fn bind(
         &self,
         authorization: &RootAuthorization,
@@ -314,7 +314,8 @@ pub(crate) trait ForegroundTransport {
 }
 
 /// The real transport: one attached conversation root, over the daemon socket.
-struct SocketTransport {
+#[allow(dead_code)]
+pub struct SocketTransport {
     root: Arc<ThreadRoot>,
 }
 
@@ -530,12 +531,19 @@ impl ForegroundDriver {
 /// returns `()` and reports problems through [`Self::warning`] (and a `tracing::warn`
 /// line that carries no secrets). A caller that wanted to abort a turn because the
 /// activity write failed would be turning a display problem into a lost answer.
+///
+/// `allow(dead_code)`: the hosts are wired in a follow-up (app-server's turn driver,
+/// the TUI loop and headless). Until then nothing constructs this type, and deleting
+/// it would throw away the tested ordering machine that the wiring needs. The
+/// attribute goes away with the last host, not before.
+#[allow(dead_code)]
 pub struct ForegroundTurn<T: ForegroundTransport = SocketTransport> {
     driver: DriverState<T>,
     /// The last problem this turn saw, for the host's diagnostics panel.
     warning: Option<String>,
 }
 
+#[allow(dead_code)]
 impl ForegroundTurn<SocketTransport> {
     /// Binds the host as this root's driver.
     ///
@@ -555,6 +563,7 @@ impl ForegroundTurn<SocketTransport> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: ForegroundTransport> ForegroundTurn<T> {
     /// Opens `turn_id`. A failure is recorded and swallowed.
     ///

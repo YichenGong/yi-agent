@@ -21,6 +21,15 @@ pub const BOOTSTRAP_FD_ENV: &str = "YI_AGENT_BOOTSTRAP_FD";
 /// The scope key a managed role must serve, passed alongside the descriptor.
 pub const SCOPE_KEY_ENV: &str = "YI_AGENT_SCOPE_KEY";
 
+/// Environment variable naming the inherited *authority bridge* descriptor.
+///
+/// A second descriptor, not the bootstrap one: the bootstrap is a one-shot proof of
+/// who assigned the role and is consumed before the process does anything, while the
+/// bridge is a long-lived duplex channel that carries authorization frames for the
+/// daemon's whole life. Sharing a number would let one protocol consume the other's
+/// bytes, which is exactly the failure the two-number split exists to prevent.
+pub const BRIDGE_FD_ENV: &str = "YI_AGENT_AUTHORITY_BRIDGE_FD";
+
 /// Which private role is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedRole {
@@ -91,6 +100,45 @@ pub fn inherited_bootstrap(role: ManagedRole) -> io::Result<OwnedFd> {
 }
 
 use std::os::fd::FromRawFd;
+
+/// Takes the inherited authority-bridge descriptor, or explains why it is absent.
+///
+/// `Ok(None)` is the honest answer for a runtime that has no guardian (an embedded
+/// daemon): there is nobody who could vouch for a root, so there is no bridge and the
+/// daemon starts with admission closed for managed roots. Only a *malformed* value is
+/// an error -- a variable naming a closed descriptor means the launcher died between
+/// the fork and the exec, which must not be mistaken for "no bridge".
+pub fn inherited_bridge() -> io::Result<Option<std::os::fd::OwnedFd>> {
+    let Some(raw) = std::env::var_os(BRIDGE_FD_ENV) else {
+        return Ok(None);
+    };
+    // SAFETY: this runs before the daemon starts any thread, so no reader can race
+    // the removal.
+    unsafe { std::env::remove_var(BRIDGE_FD_ENV) };
+    let raw = raw
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad bridge descriptor"))?;
+    if raw <= 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the authority bridge must not be a standard stream",
+        ));
+    }
+    // SAFETY: `fcntl(F_GETFD)` only reads flags; it neither closes nor opens.
+    if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{BRIDGE_FD_ENV} names descriptor {raw}, which is not open; the managed \
+                 daemon must be started by a live guardian"
+            ),
+        ));
+    }
+    // SAFETY: the descriptor is open and was dup'd into this child by the launcher;
+    // taking ownership here is what closes it on exit.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
 
 /// The scope key a managed role must serve.
 pub fn scope_key() -> io::Result<String> {
