@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "note": "计划 T27 Step 2 的故障注入矩阵。每项列出支撑它的真实测试（crate + 测试全名），由 fault-matrix.mjs 逐个执行并记录输出。矩阵只引用已存在的测试，不新造「看着通过」的断言；某项没有任何测试通过时该项即为未通过。",
+  "items": [
+    {
+      "id": "disconnect-commit",
+      "title": "断线提交：断线后写请求不重放，结果可查询",
+      "acceptance": ["A15"],
+      "tests": [
+        "yi-agent-plugins::operations a_replay_of_an_unknown_request_returns_unknown_not_a_fresh_start",
+        "yi-agent-plugins::operations the_same_request_with_the_same_params_replays_the_recorded_result",
+        "yi-agent-plugins::operations a_failed_outcome_is_recorded_and_replayed"
+      ]
+    },
+    {
+      "id": "stale-frame-replay",
+      "title": "旧 frame 重放：过期的信任序列与订阅 frame 不得被当作新请求",
+      "acceptance": ["A09", "A15"],
+      "tests": [
+        "yi-agent-plugins::trust a_serial_below_the_accepted_one_is_rejected_as_a_replay",
+        "yi-agent-store::runtime_ipc subscription_frames_are_versioned_and_correlated_to_the_request",
+        "yi-agent-store::runtime_ipc subscription_filters_apply_to_replay_and_live_events"
+      ]
+    },
+    {
+      "id": "two-instance-budget",
+      "title": "两实例预算：同机两个实例共享配额，互不越权",
+      "acceptance": ["A14"],
+      "tests": [
+        "yi-agent-plugins::quota a_machine_wide_observation_counts_every_owner",
+        "yi-agent-plugins::quota a_limit_smaller_than_usage_saturates_at_zero",
+        "yi-agent-plugins::quota a_config_and_lease_directory_in_different_domains_is_refused"
+      ]
+    },
+    {
+      "id": "active-approval",
+      "title": "活跃审批：等待审批的回合仍被识别，排空不被其阻塞收尾",
+      "acceptance": ["A11"],
+      "tests": [
+        "yi-agent-plugins::admission a_turn_waiting_on_approval_keeps_the_barrier_from_completing",
+        "yi-agent-plugins::admission the_barrier_wait_counts_only_live_before_barrier_permits",
+        "yi-agent-app-server::server::tests::turn approval_timeout_leaves_awaiting_status"
+      ]
+    },
+    {
+      "id": "update-wrap-up",
+      "title": "更新收尾：活跃回合继续完成并可释放锁，事务不被打断",
+      "acceptance": ["A10", "A11"],
+      "tests": [
+        "yi-agent-plugins::lifecycle a_live_turn_keeps_the_transaction_at_drained",
+        "yi-agent-plugins::admission a_single_turn_can_wrap_up_several_writes_and_release_once",
+        "yi-agent-plugins::lifecycle two_independent_clients_see_the_same_transaction_and_phase"
+      ]
+    },
+    {
+      "id": "candidate-invisible",
+      "title": "候选不可见：候选版本不能通过普通绑定或被公共访问",
+      "acceptance": ["A10"],
+      "tests": [
+        "yi-agent-plugins::lifecycle a_candidate_release_is_not_usable_through_a_normal_binding",
+        "yi-agent-plugins::lifecycle a_failed_health_check_stops_the_candidate_without_committing",
+        "yi-agent-plugins::recovery recovery_from_health_checking_stops_the_candidate"
+      ]
+    },
+    {
+      "id": "shared-config-revision",
+      "title": "共享配置修订冲突：旧修订写入被拒，不覆盖其他实例的更新",
+      "acceptance": ["A13"],
+      "tests": [
+        "yi-agent-plugins::quota writing_with_a_stale_revision_is_refused_and_keeps_the_newer_value",
+        "yi-agent-plugins::quota a_write_must_advance_the_revision_by_exactly_one",
+        "yi-agent-plugins::recovery recovery_does_not_overwrite_a_shared_config_revision_that_moved"
+      ]
+    },
+    {
+      "id": "old-install-takeover",
+      "title": "旧安装接管：迁移失败不半开新版本，已回滚的绑定被认作过期",
+      "acceptance": ["A18", "A12"],
+      "tests": [
+        "yi-agent-plugins::lifecycle a_binding_from_a_rolled_back_transaction_is_stale",
+        "yi-agent-plugins::lifecycle a_failed_migration_does_not_restore_admission_for_any_project",
+        "yi-agent-plugins::lifecycle a_failed_migration_reports_every_blocked_project",
+        "yi-agent-plugins::lifecycle every_phase_declares_its_recovery_action"
+      ]
+    },
+    {
+      "id": "pending-uninstall",
+      "title": "待清理卸载：项目不可达时报 pending 而非宣称已清理，默认保留用户数据",
+      "acceptance": ["A19"],
+      "tests": [
+        "yi-agent-supervisors::uninstall::tests an_unreachable_project_is_reported_as_pending_instead_of_clean",
+        "yi-agent-supervisors::uninstall::tests uninstall_keeps_user_data_by_default_and_lists_it",
+        "yi-agent-supervisors::uninstall::tests uninstall_leaves_shared_resources_alone",
+        "yi-agent-supervisors::uninstall::tests clear_data_deletes_only_the_named_projects"
+      ]
+    },
+    {
+      "id": "crash-each-phase",
+      "title": "每个事务阶段崩溃后可恢复",
+      "acceptance": ["A12"],
+      "tests": [
+        "yi-agent-plugins::lifecycle a_corrupt_journal_is_reported_rather_than_treated_as_no_transaction",
+        "yi-agent-plugins::lifecycle a_second_transaction_is_refused_while_one_is_open",
+        "yi-agent-plugins::lifecycle a_successful_activation_walks_every_phase_in_order",
+        "yi-agent-plugins::admission a_crashed_process_releases_its_permit"
+      ]
+    }
+  ]
+}

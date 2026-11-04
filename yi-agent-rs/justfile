@@ -223,6 +223,12 @@ plugin-boundary-check:
 # 合规（probe 构建不能冒充正式包；A16/A17 不能用 loopback 冒充远端）。
 plugin-acceptance-check:
     node --test ../scripts/plugins/e2e-report.test.mjs
+    node --test ../scripts/plugins/fault-matrix.test.mjs
+
+# 真跑故障注入矩阵（T27 Step 2）。慢（要编译三个 crate），故不进 `ci`；
+# 想留证据时加 `just plugin-fault-matrix`，报告写到 .artifacts/。
+plugin-fault-matrix:
+    node ../scripts/plugins/fault-matrix.mjs --output ../.artifacts/plugins/fault-matrix.json
 
 # 一次跑完插件的全部门禁（本地用；CI 拆成独立 job 以便并行与隔离权限）。
 plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check plugin-acceptance-check
