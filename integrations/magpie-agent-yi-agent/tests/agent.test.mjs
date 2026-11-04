@@ -87,6 +87,74 @@ test("toEntry accepts u32::MAX as a valid context length", () => {
   assert.equal(entry.context_length, 4294967295);
 });
 
+test("toEntry writes api_style from native_endpoints chat-completions", () => {
+  const gateway = { v1: "g/v1", key: "k" };
+  const chat = _internal.toEntry(
+    { id: "a", native_endpoints: ["/v1/chat/completions"] },
+    gateway,
+  );
+  assert.equal(chat.api_style, "chat");
+
+  // Non-chat native endpoints (responses / messages) leave api_style unset,
+  // so Yi Agent's `auto` detection runs instead of pinning a wrong channel.
+  const responses = _internal.toEntry(
+    { id: "b", native_endpoints: ["/v1/responses"] },
+    gateway,
+  );
+  assert.equal(responses.api_style, undefined);
+  const messages = _internal.toEntry(
+    { id: "c", native_endpoints: ["/v1/messages"] },
+    gateway,
+  );
+  assert.equal(messages.api_style, undefined);
+  const none = _internal.toEntry({ id: "d" }, gateway);
+  assert.equal(none.api_style, undefined);
+});
+
+test("toEntry writes reasoning_capabilities from model.efforts", () => {
+  const gateway = { v1: "g/v1", key: "k" };
+  const entry = _internal.toEntry(
+    { id: "a", efforts: ["low", "medium", "high", "ultra"] },
+    gateway,
+  );
+  assert.deepEqual(entry.reasoning_capabilities, {
+    responses: { supported: ["low", "medium", "high"], probed_at: 0, error: null },
+  });
+});
+
+test("toEntry puts capabilities on the chat channel when api_style is chat", () => {
+  const gateway = { v1: "g/v1", key: "k" };
+  const entry = _internal.toEntry(
+    { id: "a", efforts: ["low"], native_endpoints: ["/v1/chat/completions"] },
+    gateway,
+  );
+  assert.equal(entry.api_style, "chat");
+  assert.deepEqual(entry.reasoning_capabilities, {
+    chat: { supported: ["low"], probed_at: 0, error: null },
+  });
+});
+
+test("toEntry omits reasoning_capabilities when efforts are absent or unusable", () => {
+  const gateway = { v1: "g/v1", key: "k" };
+  const cases = [
+    { id: "a" }, // absent
+    { id: "a", efforts: undefined },
+    { id: "a", efforts: null },
+    { id: "a", efforts: "low" }, // not an array
+    { id: "a", efforts: [] }, // empty
+    { id: "a", efforts: [5, true, {}] }, // no usable strings
+    { id: "a", efforts: ["ultra", "bogus"] }, // nothing in Yi Agent's whitelist
+  ];
+  for (const model of cases) {
+    const entry = _internal.toEntry(model, gateway);
+    assert.equal(
+      entry.reasoning_capabilities,
+      undefined,
+      `reasoning_capabilities must be omitted for ${JSON.stringify(model)}`,
+    );
+  }
+});
+
 test("connect maps every model and syncs subagent_model to the selection", () => {
   const input = {
     gateway: { v1: "http://127.0.0.1:3425/v1", key: "yi-agent-key" },

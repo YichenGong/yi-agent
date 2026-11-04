@@ -26,6 +26,13 @@ const PREFIX = "magpie/";
 // make serde reject the whole entry, so it is omitted instead of passed through.
 const U32_MAX = 4294967295;
 
+// Yi Agent's seven-tier reasoning-effort whitelist (see
+// `yi-agent-runtime/src/models.rs` `REASONING_TIERS`, and the desktop/TUI copies
+// of it). Magpie's model `efforts` may carry values outside this list (e.g.
+// "ultra"); those are dropped, since Yi Agent's serde would drop them on load
+// anyway and its pickers only offer these seven.
+const REASONING_TIERS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 // Magpie's Agents page draws the row icon from the agent module's own `icon`
 // (agentplug Desc.Icon) and does not fall back to package.json's
 // `magpie.icon` — that one only feeds the Installed list. moejs cannot read
@@ -44,6 +51,15 @@ export const agent = {
   // The key of the model in models.json.
   model: "default_model",
   prefix: PREFIX,
+  // Words of Yi Agent's User-Agent, so Magpie names its requests in Usage
+  // when they come without the agent's own key.
+  ua: ["yi-agent"],
+  // Yi Agent already discovers SKILL.md folders under its user skills root
+  // (`~/.yi-agent/skills`, see yi-agent-store/src/paths.rs `skills_dir` and
+  // yi-agent-runtime/src/bootstrap.rs `build_skills_service`). Declaring it in
+  // the Library lets Magpie write its own skills there too, where Yi Agent
+  // picks them up with no further configuration.
+  library: { skills: "~/.yi-agent/skills" },
   notice:
     "A running yi-agent TUI does not hot-reload models.json — restart it, or run /model default after connecting or switching, to pick up the new model.",
 };
@@ -70,7 +86,58 @@ function toEntry(model, gateway) {
   ) {
     entry.context_length = context;
   }
+  // Pin the gateway's native API so Yi Agent skips its `/responses`-first
+  // probe (which would otherwise round-trip once per unknown model). When the
+  // gateway exposes a model on native chat-completions, speak Chat; otherwise
+  // leave `api_style` unset so Yi Agent's `auto` detection runs.
+  const style = nativeApiStyle(model);
+  if (style !== "") {
+    entry.api_style = style;
+  }
+  // Magpie already knows which reasoning efforts a model supports; write that
+  // into the entry's `reasoning_capabilities` on the channel Yi Agent will
+  // actually use, so its picker shows the real tiers and it never re-probes.
+  const caps = capabilities(model, entry);
+  if (caps !== undefined) {
+    entry.reasoning_capabilities = caps;
+  }
   return entry;
+}
+
+// The gateway's native endpoint for this model, when Magpie reports one, else
+// "". `native_endpoints` lists gateway paths a request for the model goes on
+// untranslated, such as `["/v1/chat/completions"]`.
+function nativeApiStyle(model) {
+  const eps = model && Array.isArray(model.native_endpoints) ? model.native_endpoints : [];
+  const has = (suffix) => eps.some((p) => typeof p === "string" && p.includes(suffix));
+  if (has("/chat/completions")) {
+    return "chat";
+  }
+  // "/responses" and "/v1/messages" are the `auto` default already; only
+  // chat-completions is worth pinning to avoid Yi Agent's responses-first probe.
+  return "";
+}
+
+// Build a `reasoning_capabilities` object carrying the Magpie-reported effort
+// tiers on the channel Yi Agent will resolve for this entry (see
+// `effective_channel` in yi-agent-runtime/src/models.rs). Returns undefined when
+// Magpie reports no usable efforts, so the entry stays "unprobed" and Yi Agent's
+// own probe runs.
+//
+// `probed_at` is 0: Yi Agent never reads the timestamp for trust — it only
+// checks that a channel has a non-error record (`has_trustworthy`), so a
+// zeroed value is both deterministic here (the plugin has no clock) and read
+// as trustworthy, exactly like a fresh probe.
+function capabilities(model, entry) {
+  const efforts = (model && Array.isArray(model.efforts) ? model.efforts : [])
+    .filter((e) => typeof e === "string" && REASONING_TIERS.includes(e));
+  if (efforts.length === 0) {
+    return undefined;
+  }
+  const channel = entry.api_style === "chat" ? "chat" : "responses";
+  return {
+    [channel]: { supported: efforts, probed_at: 0, error: null },
+  };
 }
 
 // `connect(input)` returns the keys Magpie writes beside the model. It is called
@@ -105,4 +172,4 @@ export function connect(input) {
 }
 
 // Test seams only. Magpie ignores every export other than `agent`/`connect`.
-export const _internal = { PREFIX, toEntry };
+export const _internal = { PREFIX, REASONING_TIERS, toEntry, nativeApiStyle, capabilities };

@@ -27,11 +27,37 @@ agent is connected, Magpie rewrites that file:
 | `models[].api_key` | the key Magpie assigned to Yi Agent |
 | `models[].model` | the Magpie model id, passed through unchanged |
 | `models[].context_length` | filled in when Magpie reports a valid positive context length |
+| `models[].api_style` | `chat` when Magpie reports a native `/chat/completions` endpoint, else unset (Yi Agent's `auto` detection runs) |
+| `models[].reasoning_capabilities` | the model's reasoning-effort tiers on the channel Yi Agent will use, when Magpie reports any |
 | `default_model` | written by Magpie as `magpie/` + the selected model id |
 | `subagent_model` | `magpie/` + the selected model id while connected |
 
 The gateway translates requests to whatever API each model speaks, so Yi Agent
 talks to every Magpie model through one OpenAI-compatible endpoint.
+
+### Reasoning efforts and the native endpoint
+
+Magpie already knows each model's reasoning-effort tiers (`model.efforts`) and
+its native gateway path (`model.native_endpoints`). The plugin folds both into
+the catalog entry so Yi Agent doesn't have to discover them by round-tripping:
+
+- `model.efforts` is mapped to `reasoning_capabilities` on the channel Yi Agent
+  resolves for the entry (`chat` when `api_style` is pinned to chat, else
+  `responses`). Only tiers in Yi Agent's seven-value whitelist
+  (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) are kept; a value like
+  `ultra` that Magpie reports for some models is dropped. `probed_at` is written
+  as `0`: Yi Agent reads trust from a non-error record, not from the timestamp.
+- `model.native_endpoints` containing `/chat/completions` pins `api_style` to
+  `chat`, so Yi Agent skips its `/responses`-first probe for those models.
+  Responses- or Messages-native models are left unset (that is Yi Agent's
+  `auto` default already).
+
+### Library skills
+
+Yi Agent already discovers `SKILL.md` folders under `~/.yi-agent/skills`. The
+plugin declares that directory as its Library `skills`, so skills the user
+turns on in Magpie's Library are written there and picked up by Yi Agent with
+no further configuration.
 
 ## Things to know
 
@@ -81,7 +107,8 @@ I/O. The tests exercise the pure mapping directly, plus a simulation of
 Magpie's per-key write protocol (backup → write → restore) covering: no
 existing config, existing entries, switching the default model, model
 add/remove, repeated `connect()`, disconnect restoration, `subagent_model`
-with/without a prior value, and unusable model metadata.
+with/without a prior value, unusable model metadata, `api_style` from
+`native_endpoints`, and `reasoning_capabilities` from `model.efforts`.
 
 ## Publishing
 
