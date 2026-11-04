@@ -1358,6 +1358,9 @@ mod tests {
 
     #[test]
     fn add_requires_exactly_two_paths() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             parse(&["add", "a.spec.md"]).is_err(),
             "one path is not enough"
@@ -1383,6 +1386,9 @@ mod tests {
 
     #[test]
     fn list_on_and_off_take_no_positional_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["list"]),
             Ok(Subcommand::List { all: false, .. })
@@ -1707,11 +1713,17 @@ mod tests {
 
     #[test]
     fn add_merge_requires_a_source() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(parse(&["add-merge"]).is_err());
     }
 
     #[test]
     fn merge_request_and_finish_parse_one_card_id() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["merge-request", "card-1", "--state-dir", "/s"]),
             Ok(Subcommand::MergeRequest { .. })
@@ -1979,6 +1991,9 @@ mod tests {
 
     #[test]
     fn parses_add_prequeued_and_promote() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["add-prequeued", "一个想法"]),
             Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
@@ -2001,6 +2016,9 @@ mod tests {
     /// 而且失效方式只是「未知子命令」，看不出是前缀问题。
     #[test]
     fn the_manifested_namespace_is_optional_on_the_command_line() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["kanban:add-prequeued", "一个想法"]),
             Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
@@ -2016,6 +2034,9 @@ mod tests {
 
     #[test]
     fn add_prequeued_and_promote_reject_missing_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(parse(&["add-prequeued"]).is_err());
         assert!(parse(&["promote", "idea"]).is_err());
         assert!(parse(&["promote", "idea", "a.spec.md"]).is_err());
@@ -2319,6 +2340,9 @@ mod tests {
 
     #[test]
     fn manifest_takes_no_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(parse(&["manifest"]), Ok(Subcommand::Manifest)));
         assert!(
             parse(&["manifest", "--state-dir", "/s"]).is_err(),

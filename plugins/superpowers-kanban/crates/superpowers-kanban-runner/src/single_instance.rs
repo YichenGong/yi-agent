@@ -181,9 +181,25 @@ mod tests {
         let Ok(dir) = std::env::var("LEASE_HOLD_DIR") else {
             return;
         };
-        let _lock = acquire(Path::new(&dir)).expect("holder must take the lock");
+        // 必须轮询而不是一次成功：父测试为等待「子进程已占锁」每 20ms 探一次
+        // `acquire`，那个探测会短暂拿到锁再立刻 drop。单次 `acquire` 恰好撞上
+        // 探测窗口就会拿到 `None`，把父测试的等待误判成「子进程抢不到锁」
+        // （实测 60 轮里复现 1 次）。有界重试消除这个竞争，不影响被测性质：
+        // 它要证明的只是「持有者最终占住锁并一直占着」。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let lock = loop {
+            if let Some(lock) = acquire(Path::new(&dir)) {
+                break lock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "holder must take the lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         println!("LOCK-HELD");
         std::thread::sleep(Duration::from_secs(30));
+        drop(lock);
     }
 
     #[test]
