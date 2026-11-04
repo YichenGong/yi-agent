@@ -1072,6 +1072,9 @@ fn attach_application_root_request(
 }
 
 fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
+    if let Some(session) = attach_managed_headless_runtime(config) {
+        return session;
+    }
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
@@ -1342,7 +1345,133 @@ fn startup_intent_for(
 ///
 /// `cli` is kept because the daemon worker factory resolves the user's model
 /// configuration from the same overrides the TUI itself uses.
+/// The headless half of the managed dispatch.
+///
+/// Unlike the TUI this returns `Result`: `run` is a one-shot command whose exit
+/// status is its contract, so a runtime the user explicitly asked for by policy
+/// must not be silently swapped for an embedded one either.
+fn attach_managed_headless_runtime(
+    config: &config::Config,
+) -> Option<Result<HeadlessRuntimeSession>> {
+    use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
+
+    let choice = process_bringup_choice();
+    if choice.policy != BringUpPolicy::Managed {
+        return None;
+    }
+    let (Some(expected), Some(instance_home)) = (choice.expected, choice.instance_home) else {
+        return Some(Err(anyhow::anyhow!(
+            "managed runtime: this process never installed its artifact identity or instance home"
+        )));
+    };
+    Some((|| {
+        let runtime_dir = runtime_directory_for(&config.workdir);
+        ignore_project_local_runtime_state(&config.workdir);
+        let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+            yi_agent_subagent::attach::MANAGED_START_BUDGET,
+        );
+        let attached = yi_agent_subagent::attach::attach_managed_project_runtime(
+            config,
+            runtime_dir.clone(),
+            &instance_home,
+            &expected,
+            yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
+            deadline,
+        )
+        .map_err(|failure| anyhow::anyhow!("managed runtime: {}", failure.cause))?;
+        // The lease goes on only after the attach succeeded: registering for a
+        // project this process never joined would make the guardian wait for a
+        // frontend that has no work.
+        let frontend_lease = crate::frontend_lease::FrontendLeaseHandle::register(
+            &runtime_dir,
+            yi_agent_lifecycle::types::ClientKind::Headless,
+            crate::frontend_lease::new_client_run_id("run"),
+        )
+        .ok()
+        .flatten();
+        Ok(HeadlessRuntimeSession {
+            socket_path: attached.socket_path.clone(),
+            attached_root: crate::tui::subagents::AttachedRoot {
+                session_id: attached.attached_root.session_id,
+                task_id: attached.attached_root.task_id,
+                capability: attached.attached_root.capability,
+                workspace: attached.attached_root.workspace,
+            },
+            embedded_daemon: None,
+            frontend_lease,
+        })
+    })())
+}
+
+/// Attach through the managed policy, or report `None` when the policy is embedded.
+///
+/// `None` and `Unavailable` mean different things and must not be conflated: the
+/// caller falls through to the embedded path on `None`, while `Unavailable` is the
+/// managed path's own verdict and has to reach the user. Folding them together
+/// would silently start an embedded daemon under a policy that forbids one.
+fn attach_managed_tui_runtime(config: &config::Config) -> Option<TuiRuntimeSession> {
+    use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
+
+    let choice = process_bringup_choice();
+    if choice.policy != BringUpPolicy::Managed {
+        return None;
+    }
+    let Some(expected) = choice.expected else {
+        let reason = "managed runtime: this build did not identify its artifact".to_string();
+        tracing::warn!("{reason}");
+        return Some(TuiRuntimeSession::unavailable(reason));
+    };
+    let Some(instance_home) = choice.instance_home else {
+        let reason = "managed runtime: no instance home to scope the daemon to".to_string();
+        tracing::warn!("{reason}");
+        return Some(TuiRuntimeSession::unavailable(reason));
+    };
+    let runtime_dir = runtime_directory_for(&config.workdir);
+    ignore_project_local_runtime_state(&config.workdir);
+    let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+        yi_agent_subagent::attach::MANAGED_START_BUDGET,
+    );
+    match yi_agent_subagent::attach::attach_managed_project_runtime(
+        config,
+        runtime_dir,
+        &instance_home,
+        &expected,
+        yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
+        deadline,
+    ) {
+        Ok(attached) => Some(TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
+            socket_path: attached.socket_path.clone(),
+            attached_root: crate::tui::subagents::AttachedRoot {
+                session_id: attached.attached_root.session_id,
+                task_id: attached.attached_root.task_id,
+                capability: attached.attached_root.capability,
+                workspace: attached.attached_root.workspace,
+            },
+            // Managed mode never owns the daemon; the guardian does.
+            embedded_daemon: None,
+            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+                &attached.project_root,
+                // The directory, not the socket: supervision reads the flags file
+                // beside it. `owns_daemon` is false here, so this only decides what
+                // an idle handle would have looked at.
+                &runtime_directory_for(&attached.project_root),
+                false,
+            ),
+        }))),
+        Err(failure) => {
+            let reason = format!("managed runtime: {}", failure.cause);
+            tracing::warn!(stage = failure.stage, cause = %failure.cause, "{reason}");
+            Some(TuiRuntimeSession::unavailable(reason))
+        }
+    }
+}
+
 fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> TuiRuntimeSession {
+    // The policy decides *who owns the daemon*; everything below this branch is
+    // the embedded path, which stays byte-for-byte as it was.
+    if let Some(session) = attach_managed_tui_runtime(config) {
+        return session;
+    }
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
     // A socket path that cannot be derived is a configuration problem, not a
@@ -6350,5 +6479,77 @@ mod tests {
         });
         assert_eq!(count, 2);
         assert_eq!(seen, vec![a, b]);
+    }
+    /// Both frontends must consult the bring-up policy before starting a daemon.
+    ///
+    /// A source assertion is the honest tool here: the property is "this exact
+    /// call site branches on the policy", and a behavioural test would need a real
+    /// guardian plus a process-wide `OnceLock` for every case. Needles are built
+    /// from fragments so the test's own source cannot satisfy them.
+    #[test]
+    fn both_frontends_dispatch_on_the_bring_up_policy() {
+        let source = include_str!("main.rs");
+        let caller = ["process_bringup", "_choice()"].concat();
+        let managed = ["BringUpPolicy", "::Managed"].concat();
+
+        for (name, anchor) in [
+            ("tui", ["fn attach_managed_tui", "_runtime("].concat()),
+            (
+                "headless",
+                ["fn attach_managed_headless", "_runtime("].concat(),
+            ),
+        ] {
+            let body = source
+                .split(&anchor)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{name} managed dispatch must exist"));
+            assert!(
+                body.contains(&caller),
+                "{name} must read the process bring-up choice"
+            );
+            assert!(
+                body.contains(&managed),
+                "{name} must branch on the managed policy"
+            );
+        }
+
+        // And the embedded path must stay reachable: a policy that is not managed
+        // returns early, which is what keeps today's behaviour byte-for-byte.
+        let tui = source
+            .split(&["fn attach_managed_tui", "_runtime("].concat())
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("tui dispatch");
+        assert!(
+            tui.contains("!= BringUpPolicy::Managed") && tui.contains("return None"),
+            "a non-managed policy must fall through to the embedded path"
+        );
+
+        // The dispatch has to be *called*. Defining it and forgetting to invoke it
+        // is the exact failure this whole change exists to fix, so assert the call
+        // site in each entry point rather than only the helper's body.
+        for (name, anchor, call) in [
+            (
+                "attach_tui_runtime",
+                ["fn attach_tui", "_runtime(cli"].concat(),
+                ["attach_managed_tui", "_runtime(config"].concat(),
+            ),
+            (
+                "attach_headless_runtime",
+                ["fn attach_headless", "_runtime(cli"].concat(),
+                ["attach_managed_headless", "_runtime(config"].concat(),
+            ),
+        ] {
+            let body = source
+                .split(&anchor)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                body.contains(&call),
+                "{name} must call its managed dispatch before starting a daemon"
+            );
+        }
     }
 }
