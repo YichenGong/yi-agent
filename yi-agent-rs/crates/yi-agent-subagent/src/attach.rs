@@ -1069,6 +1069,23 @@ impl BringUpPolicy {
         Self::Embedded
     }
 
+    /// The policy a frontend that holds a lease must use.
+    ///
+    /// Distinct from [`Self::default_for_build`] on purpose. The build default stays
+    /// embedded so a manual `yi-agent daemon` and any caller that never opted in keep
+    /// owning their own runtime. But a frontend that registers a lease -- the desktop
+    /// sidecar, the TUI, a headless run -- is asking the *guardian* to own the daemon,
+    /// and a runtime it started itself would have no guardian to authorize it. Such a
+    /// caller therefore never wants the build default; it wants this.
+    ///
+    /// Naming it separately keeps the two decisions from being one: "what does an
+    /// unconfigured build do" and "what does a lease-holding frontend do" can change
+    /// independently, and collapsing them is how a manual daemon would start being
+    /// guardian-owned by accident.
+    pub fn for_managed_frontend() -> Self {
+        Self::Managed
+    }
+
     /// Explicit selection, e.g. from an internal mode a test drives.
     pub fn from_env() -> Self {
         Self::from_value(std::env::var("YI_AGENT_BRINGUP").ok().as_deref())

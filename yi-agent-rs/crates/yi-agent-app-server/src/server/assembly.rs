@@ -30,6 +30,123 @@ pub(crate) struct RuntimeTooling {
     /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
     pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
+/// Brings up this project's runtime, asking the guardian when it can.
+///
+/// The sidecar is a *frontend*: it registers a lease and expects the guardian to
+/// own the daemon. Starting a daemon inside this process instead would give it no
+/// guardian to authorize against, so every foreground turn would silently fall
+/// back to the legacy watchdog -- and a long conversation would be settled as a
+/// stalled background attempt, which is the bug this whole contract exists to fix.
+///
+/// A managed bring-up can legitimately be unavailable (no installed artifact, a
+/// version the user must choose, a runtime whose guardian is wedged). Those are
+/// real answers, not crashes: the daemon still works embedded, it simply cannot
+/// authorize a foreground root. Falling back keeps every existing user running and
+/// keeps the degradation visible in the log instead of becoming a launch failure.
+fn bring_up_runtime(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    models_path: &Path,
+) -> Result<
+    yi_agent_subagent::attach::AttachedProjectRuntime,
+    yi_agent_subagent::attach::AttachFailure,
+> {
+    let policy = yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend();
+    // The instance home and the artifact this build expects are only consulted by
+    // the managed branch. Either being absent is not an error: the caller then gets
+    // a straight embedded start, which behaves exactly as it does today.
+    let instance_home = yi_agent_store::paths::instance_home();
+    let expected = this_process_artifact();
+    match (instance_home, expected) {
+        (Some(instance_home), Some(expected)) => {
+            match yi_agent_subagent::attach::ensure_owned_runtime_with_policy(
+                cfg,
+                runtime_dir.to_path_buf(),
+                models_path,
+                &instance_home,
+                policy,
+                Some(&expected),
+            ) {
+                Ok(attached) => return Ok(attached),
+                Err(failure) => {
+                    tracing::warn!(
+                        stage = %failure.stage,
+                        cause = %failure.cause,
+                        "managed runtime bring-up unavailable; falling back to an embedded \
+                    daemon, which cannot authorize a foreground root"
+                    );
+                }
+            }
+        }
+        (None, _) => {
+            tracing::warn!(
+                "no instance home, so the managed runtime cannot be resolved; falling back \
+to an embedded daemon, which cannot authorize a foreground root"
+            );
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                "this binary could not describe its own artifact; falling back to an \
+embedded daemon, which cannot authorize a foreground root"
+            );
+        }
+    }
+    yi_agent_subagent::attach::ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path)
+}
+
+/// This process's own artifact identity, read from the binary it is running in.
+///
+/// Read rather than constructed. The identity's `build_id` has to be the one the
+/// guardian and daemon compare against, and that value is baked into the `yi-agent`
+/// binary by its build script -- a library crate cannot see it, and inventing one
+/// here would make `ensure_managed` compare two fictional strings, which is exactly
+/// the check it exists to perform.
+///
+/// `internal-runtime identity --json` is the same source the process tests read, so
+/// there is one definition of "what build is this" in the codebase instead of two
+/// that could drift.
+///
+/// Returns `None` when the binary cannot describe itself. That is not fatal: the
+/// caller then falls back to embedded, which works exactly as it does today.
+fn this_process_artifact() -> Option<yi_agent_lifecycle::types::ArtifactIdentity> {
+    let executable = std::env::current_exe().ok()?;
+    let output = std::process::Command::new(&executable)
+        .args(["internal-runtime", "identity", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let identity: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(yi_agent_lifecycle::types::ArtifactIdentity {
+        build_id: identity["build_id"].as_str()?.to_string(),
+        display_version: identity["display_version"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        executable,
+        // Left empty on purpose: `pinned_program` skips the digest check for an
+        // empty hash, and this caller has not been asked to pin a re-signable copy.
+        sha256: String::new(),
+        schema_min: identity["schema_min"].as_u64().unwrap_or(0) as u32,
+        schema_max: identity["schema_max"].as_u64().unwrap_or(0) as u32,
+        handover_version: identity["handover_version"].as_u64().unwrap_or(1) as u16,
+        business_protocol_min: identity["business_protocol_min"].as_u64().unwrap_or(0) as u32,
+        business_protocol_max: identity["business_protocol_max"].as_u64().unwrap_or(0) as u32,
+        capabilities: identity["capabilities"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 /// 取出(或建立)该 cwd 的项目 runtime。
 pub(crate) fn attach_cwd_runtime(
     runtimes: &ProjectRuntimes,
@@ -70,12 +187,7 @@ pub(crate) fn attach_cwd_runtime(
     // one. The binding it returns heals itself on later calls, so a daemon that
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
-    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(
-        cfg,
-        runtime_dir.to_path_buf(),
-        models_path,
-    )
-    .map(|attached| {
+    let outcome = bring_up_runtime(cfg, runtime_dir, models_path).map(|attached| {
         RuntimeBinding::managed(
             cfg,
             runtime_dir.to_path_buf(),
@@ -526,4 +638,38 @@ pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() 
 /// （断言槽位里真正可见的根集）。
 pub(crate) fn current_session_extra_roots() -> Vec<PathBuf> {
     SESSION_EXTRA_ROOTS.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+mod foreground_root_lifecycle_tests {
+    /// The sidecar must be able to name its own artifact.
+    ///
+    /// If this returns `None` in a real deployment, `bring_up_runtime` silently
+    /// takes the embedded branch and every foreground turn falls back to the legacy
+    /// watchdog -- the exact bug the contract exists to fix. So the failure mode
+    /// worth pinning is not "it parsed" but "it produced a usable identity".
+    ///
+    /// The test binary is a libtest harness, not `yi-agent`, so it cannot answer
+    /// `internal-runtime identity` itself; what is asserted here is that the helper
+    /// reports that honestly rather than inventing a build id. The real value is
+    /// covered by `crates/yi-agent/tests/managed_runtime_lifecycle.rs`, which runs
+    /// the production binary.
+    #[test]
+    fn foreground_root_lifecycle_artifact_lookup_never_invents_a_build_id() {
+        match super::this_process_artifact() {
+            None => {
+                // Honest refusal: no identity is better than a fabricated one.
+            }
+            Some(identity) => {
+                assert!(
+                    !identity.build_id.is_empty(),
+                    "an identity with no build id would compare equal to nothing useful"
+                );
+                assert!(
+                    !identity.capabilities.is_empty(),
+                    "a managed bring-up needs the capability list to be intersected"
+                );
+            }
+        }
+    }
 }

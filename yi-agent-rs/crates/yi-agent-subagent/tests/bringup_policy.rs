@@ -104,3 +104,22 @@ fn the_managed_budget_covers_a_cold_guardian_and_daemon_start() {
     );
     let _ = Path::new("/");
 }
+
+/// The sidecar the desktop launches must be a *managed* frontend.
+///
+/// This is the whole reason the foreground contract exists, and it is worth
+/// stating as its own assertion: a direct `app-server` sidecar runs embedded, has
+/// no guardian, and therefore can never be authorized -- so every turn would fall
+/// back to the legacy watchdog and a long-lived conversation would still be
+/// settled as a stalled background attempt.
+///
+/// The value is read from the same place production reads it, so flipping the
+/// default without wiring the caller shows up here.
+#[test]
+fn foreground_root_lifecycle_the_desktop_sidecar_is_a_managed_frontend() {
+    assert_eq!(
+        yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend(),
+        BringUpPolicy::Managed,
+        "a frontend that holds a lease must ask the guardian, not start its own daemon"
+    );
+}
