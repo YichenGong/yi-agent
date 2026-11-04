@@ -1,0 +1,206 @@
+{
+  "schemaVersion": 1,
+  "note": "A01–A20 各自由哪条命令证明。这是执行器的唯一真相：报告里任何用例的 pass 都必须能追到这里的某条命令真的跑过。缺命令即为缺证据，不是可以跳过的项；有 unsupportedWithout 的用例在该能力缺席时如实记 unsupported，而不是把失败粉饰成跳过。",
+  "cases": [
+    {
+      "id": "A01",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "python3 scripts/plugins/check-host-boundary.py"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A02",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-supervisors -E 'test(install::tests)'"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A03",
+      "commands": [
+        {
+          "kind": "artifact",
+          "run": "bash yi-agent-rs/scripts/verify-plugin-update.sh --help"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A04",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-supervisors -E 'test(managed_launch)'"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A05",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-plugins -E 'test(admission)'"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A06",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-skills -E 'test(managed_source)'"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A07",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A08",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A09",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A10",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A11",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A12",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A13",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A14",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A15",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A16",
+      "commands": [
+        {
+          "kind": "remote",
+          "run": "node scripts/plugins/e2e-remote.mjs --case A16"
+        }
+      ],
+      "unsupportedWithout": "remote"
+    },
+    {
+      "id": "A17",
+      "commands": [
+        {
+          "kind": "remote",
+          "run": "node scripts/plugins/e2e-remote.mjs --case A17"
+        }
+      ],
+      "unsupportedWithout": "remote"
+    },
+    {
+      "id": "A18",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A19",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node scripts/plugins/fault-matrix.mjs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A20",
+      "commands": [
+        {
+          "kind": "official",
+          "run": "python3 scripts/plugins/verify-active-release.py"
+        }
+      ],
+      "unsupportedWithout": "official"
+    }
+  ]
+}
