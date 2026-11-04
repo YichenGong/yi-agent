@@ -40,9 +40,19 @@ export interface SideConversationControllerDeps {
   newRequestId?: () => string;
 }
 
-/** 关闭前的确认需要服务端**当前**的 turn 身份，不能拿本地缓存去猜。 */
+/**
+ * 关闭前的确认。
+ *
+ * 这里带的是**完整的出发身份**，不是「当前旁支」：确认弹窗开着的时候用户可能
+ * 已经切走、切回，或者连接换了。确认一旦生成，就只对这份身份有效——
+ * `target` + `client` 决定请求打给谁，`navigationRevision` 决定成功后**要不要**
+ * 把用户送回父会话（中途走开的人不该被一个过期的确认拽回去）。
+ */
 export interface CloseConfirmation {
-  sideId: string;
+  target: SideTarget;
+  client: RpcClient;
+  /** 生成这份确认时的导航修订；成功后必须仍然相同才回父。 */
+  navigationRevision: number;
   /** `null` = 服务端说它空闲；非 null = 正在跑的那一轮，需要用户确认后传回。 */
   activeTurnId: string | null;
   running: boolean;
@@ -71,8 +81,17 @@ export interface SideConversationController {
    */
   submit: (text: string) => Promise<SideSubmitReceipt>;
   stop: () => Promise<void>;
-  /** 请求关闭：先读当前 summary，把确认所需信息交回 UI。 */
-  requestClose: () => Promise<CloseConfirmation | null>;
+  /**
+   * 请求关闭：先读这个父在服务端的**当前**摘要，把确认所需信息交回 UI。
+   *
+   * 传 `binding`/`parentId` 而不是「当前旁支」：主视图也要能关闭后台旁问。
+   * 返回 `null` 表示没有可关闭的对象（已关闭、或这个父本来就没有旁问），
+   * 此时只留下一条幂等提示，绝不虚构一次关闭。
+   */
+  requestClose: (
+    binding: SideHostBinding,
+    parentId: string,
+  ) => Promise<CloseConfirmation | null>;
   /** 用户确认后真正关闭。`expectedActiveTurnId` 必须来自 `requestClose`。 */
   confirmClose: (confirmation: CloseConfirmation) => Promise<boolean>;
   /** 正在处理一条旁支 RPC（按钮据此禁用）。 */
@@ -88,6 +107,12 @@ export interface SideConversationController {
   errorTarget: SideTarget | null;
   /** 仅当失败来源就是当前显示的旁支时为非 null。 */
   visibleError: string | null;
+  /**
+   * 一条「操作完成了，但本来就没有可做的事」的提示（例如没有可关闭的旁问）。
+   *
+   * 它不是错误：渲染方可以把它显示在中性位置。任何新的用户动作都会清掉它。
+   */
+  notice: string | null;
   /** 清掉错误（用户已看到）。 */
   clearError: () => void;
 }
@@ -126,6 +151,8 @@ export function useSideConversationController(
   const [active, setActive] = useState<ActiveConversation | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 一条不含错误语义的提示（没有可关闭的旁问等）。 */
+  const [notice, setNotice] = useState<string | null>(null);
   /** `error` 属于哪条旁支。`null` 表示来源未知（例如根本没有目标可指）。 */
   const [errorTarget, setErrorTarget] = useState<SideTarget | null>(null);
   /**
@@ -140,13 +167,22 @@ export function useSideConversationController(
   const recordError = useCallback((message: string, target: SideTarget | null) => {
     setError(message);
     setErrorTarget(target);
+    setNotice(null);
     lastErrorRef.current = { message, target };
+  }, []);
+  /** 记一条「没有可做的事」的提示。它是幂等的：重复触发只留一条。 */
+  const recordNotice = useCallback((message: string) => {
+    setError(null);
+    setErrorTarget(null);
+    setNotice(message);
   }, []);
   const clearScopedError = useCallback((target: SideTarget) => {
     setErrorTarget((prev) => {
       if (prev !== null && sameTarget(prev, target)) setError(null);
       return prev !== null && sameTarget(prev, target) ? null : prev;
     });
+    // 这条旁支刚刚成功了一次：上一条「没有可做的事」的提示已经过时。
+    setNotice(null);
   }, []);
   // 异步动作在 await 之后需要读到"最新"的 active，但读取必须显式，不能让它
   // 在闭包里悄悄变旧。这里同时保留一份 ref 影子。
@@ -218,6 +254,107 @@ export function useSideConversationController(
   >(async () => ({ kind: "rejected", requestId: "", message: "" }));
 
   /**
+   * Observe 的「打开」= 找到已有的那条并查看。
+   *
+   * 三个约束都直接来自 spec §4.3：
+   * - 只发 `side/list` / `side/readItems`（`reconcile` 恰好只用这两个），**零**
+   *   `side/open`、零 `side/turnStart`。
+   * - 带问题一律拒绝并说明：发问需要 Control，装成「打开了」只会让用户以为
+   *   问题发出去了。
+   * - 没有已存在的旁问时明确说「没有可查看的旁问」，不虚构一个空壳。
+   */
+  const observeOnly = useCallback(
+    async (
+      binding: SideHostBinding,
+      parentId: string,
+      question: string,
+    ): Promise<boolean> => {
+      if (question.trim() !== "") {
+        recordError("只读设备只能查看旁问，不能发起提问", {
+          kind: "side",
+          hostKey: binding.key,
+          parentId,
+          sideId: "",
+          generation: 0,
+        });
+        return false;
+      }
+      const existing = store
+        .list(binding.key)
+        .find((v) => v.parentId === parentId && !v.closed);
+      const target: SideTarget = {
+        kind: "side",
+        hostKey: binding.key,
+        parentId,
+        sideId: existing?.sideId ?? "",
+        generation: existing?.generation ?? 0,
+      };
+      setNotice(null);
+      const key = lockKey(binding.key, parentId, "open");
+      if (inFlight.current.has(key)) return true;
+      inFlight.current.add(key);
+      const revision = bumpNavigation();
+      try {
+        // 本地没有就用 list 发现：`side/list` 是 Observe 允许的读取，且它返回
+        // 全部摘要，不会像 `side/open` 那样创建 runner。
+        let sideId = existing?.sideId ?? "";
+        if (sideId === "") {
+          const sides = await run(async () => {
+            const r = await binding.client.request<{ sides: SideSummaryWire[] }>(
+              "side/list",
+              { parentThreadId: parentId },
+            );
+            return r.sides;
+          });
+          if (sides === null) {
+            recordError(lastErrorRef.current?.message ?? "读取旁问失败", target);
+            return false;
+          }
+          const summary = sides.find((x) => x.parent_thread_id === parentId);
+          if (summary === undefined) {
+            recordNotice("这条会话还没有旁问");
+            return false;
+          }
+          sideId = summary.side_id;
+        }
+        const view = store.read(binding.key, sideId);
+        if (view === undefined) {
+          // 发现了但本地还没有正文：`reconcile` 只做 list + readItems。
+          await controllerFor(binding, parentId).reconcile(parentId);
+          onChange();
+        }
+        if (navigationRevision.current !== revision) return true;
+        const fresh = store.read(binding.key, sideId);
+        if (fresh === undefined || fresh.closed) {
+          recordNotice("这条会话还没有旁问");
+          return false;
+        }
+        entryIntent.current = null;
+        setActiveBoth({
+          kind: "side",
+          hostKey: binding.key,
+          parentId,
+          sideId,
+          generation: fresh.generation,
+        });
+        return true;
+      } finally {
+        inFlight.current.delete(key);
+      }
+    },
+    [
+      store,
+      run,
+      controllerFor,
+      onChange,
+      setActiveBoth,
+      bumpNavigation,
+      recordError,
+      recordNotice,
+    ],
+  );
+
+  /**
    * 打开（或续用）某个父上的旁支。
    *
    * 返回值只表示「这条命令被接纳了」：首问的结果留在精确的 `SideView` 里（成功
@@ -235,6 +372,12 @@ export function useSideConversationController(
       if (!binding.supported) {
         recordError("当前宿主不支持旁问", null);
         return false;
+      }
+      if (binding.scope === "observe") {
+        // Observe 只能**查看**已有的旁问（spec §4.3）：`side/list` 与
+        // `side/readItems` 是 Observe 级，`side/open` 不是。所以这里绝不发
+        // open，而是把服务端已有的那条找出来、装进本地再导航过去。
+        return observeOnly(binding, parentId, question);
       }
       const key = lockKey(binding.key, parentId, "open");
       // 重复点击合并到同一次开场：服务端 `side/open` 幂等，但本地若并发走两遍
@@ -328,7 +471,16 @@ export function useSideConversationController(
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [store, controllerFor, onChange, run, setActiveBoth, bumpNavigation],
+    [
+      store,
+      controllerFor,
+      onChange,
+      run,
+      setActiveBoth,
+      bumpNavigation,
+      observeOnly,
+      recordError,
+    ],
   );
 
   /**
@@ -490,77 +642,175 @@ export function useSideConversationController(
     }
   }, [store, run, onChange, recordError]);
 
-  const requestClose = useCallback(async (): Promise<CloseConfirmation | null> => {
-    const current = activeRef.current;
-    if (current === null || current.kind !== "side") return null;
-    const binding = store.binding(current.hostKey);
-    if (!binding) {
-      setError("旁问所在的项目没有连接");
-      return null;
-    }
-    // 必须向服务端要一份**当前**的状态：本地缓存可能还停在 idle，而旁支其实
-    // 已经跑起来了。关掉一个正在回答的旁支与关掉一个空闲旁支是两种确认。
-    //
-    // 用 `side/list` 而不是给单条旁支加读接口：`list` 已经是 Observe 级、返回
-    // 全部摘要，且**不产生新状态**。这里找不到那条旁支意味着它已经被另一端
-    // 关掉了，回主会话即可，不能拿本地缓存的旧 turn 去关。
-    const sides = await run(async () => {
-      const r = await binding.client.request<{ sides: SideSummaryWire[] }>(
-        "side/list",
-        { parentThreadId: current.parentId },
-      );
-      return r.sides;
-    });
-    if (sides === null) return null;
-    const summary = sides.find((s) => s.side_id === current.sideId);
-    if (summary === undefined) {
-      setActiveBoth({
-        kind: "main",
-        hostKey: current.hostKey,
-        parentId: current.parentId,
-      });
-      return null;
-    }
-    return {
-      sideId: current.sideId,
-      activeTurnId: summary.active_turn_id,
-      running: summary.status === "running",
-    };
-  }, [store, run]);
+  /**
+   * 关闭的第一步：读**这个父**在服务端的当前摘要，把确认所需信息交回 UI。
+   *
+   * 为什么必须读服务端而不是本地缓存：本地可能还停在 idle，而旁支其实已经跑
+   * 起来了。关掉一个正在回答的旁支与关掉一个空闲旁支是两种确认，不能猜。
+   *
+   * 为什么用 `side/list` 而不是给单条旁支加读接口：`list` 已经是 Observe 级、
+   * 返回全部摘要、且**不产生新状态**。找不到那条旁支意味着它已被另一端关掉，
+   * 此时只留一条幂等提示，绝不虚构一次关闭。
+   */
+  /**
+   * 若当前正显示这个父的某条旁支，就切回主会话。
+   *
+   * 传 `guard` 时还要求「显示的就是那条」且 `navigationRevision` 仍是生成确认时
+   * 的那一个——关闭是在等网络，期间用户可能已经返回、进了别的旁支，或者重新
+   * 导航过。这种情况下切换视图是替他做决定。
+   */
+  const leaveIfShowing = useCallback(
+    (
+      hostKey: SideHostKey,
+      parentId: string,
+      guard: { sideId: string; revision: number } | null,
+    ): void => {
+      const current = activeRef.current;
+      if (current === null || current.kind !== "side") return;
+      if (current.hostKey !== hostKey || current.parentId !== parentId) return;
+      if (guard !== null) {
+        if (current.sideId !== guard.sideId) return;
+        if (navigationRevision.current !== guard.revision) return;
+      }
+      setActiveBoth({ kind: "main", hostKey, parentId });
+    },
+    [setActiveBoth],
+  );
 
+  const requestClose = useCallback(
+    async (
+      binding: SideHostBinding,
+      parentId: string,
+    ): Promise<CloseConfirmation | null> => {
+      if (!binding.supported) {
+        recordError("当前宿主不支持旁问", null);
+        return null;
+      }
+      if (binding.scope === "observe") {
+        recordError("只读设备不能关闭旁问", null);
+        return null;
+      }
+      setNotice(null);
+      const key = lockKey(binding.key, parentId, "close");
+      if (inFlight.current.has(key)) return null;
+      inFlight.current.add(key);
+      // 目标身份在**出发前**定格：确认弹窗开着的时候用户可能已经切走。
+      const revision = bumpNavigation();
+      const target: SideTarget = {
+        kind: "side",
+        hostKey: binding.key,
+        parentId,
+        sideId: "",
+        generation: 0,
+      };
+      try {
+        const sides = await run(async () => {
+          const r = await binding.client.request<{ sides: SideSummaryWire[] }>(
+            "side/list",
+            { parentThreadId: parentId },
+          );
+          return r.sides;
+        });
+        if (sides === null) {
+          recordError(lastErrorRef.current?.message ?? "读取旁问失败", target);
+          return null;
+        }
+        const summary = sides.find(
+          (x) => x.parent_thread_id === parentId && x.side_id !== "",
+        );
+        if (summary === undefined) {
+          recordNotice("当前没有打开的旁问");
+          leaveIfShowing(binding.key, parentId, null);
+          return null;
+        }
+        return {
+          target: {
+            ...target,
+            sideId: summary.side_id,
+            generation: summary.generation,
+          },
+          client: binding.client,
+          navigationRevision: revision,
+          activeTurnId: summary.active_turn_id,
+          running: summary.status === "running",
+        };
+      } finally {
+        inFlight.current.delete(key);
+        onChange();
+      }
+    },
+    [run, onChange, bumpNavigation, recordError, recordNotice],
+  );
+
+  /**
+   * 用户确认后真正关闭。
+   *
+   * 发请求前把 `confirmation` 与**当前**绑定再核对一次：连接换了（client 变了）
+   * 就不能往旧 client 上发；权限降成 Observe 也不能发。请求用的是
+   * `confirmation.client` 与 `confirmation.activeTurnId`——即用户确认时看到的那
+   * 一轮，而不是「此刻 store 里最新的那一轮」。新起的一轮绝不能被这次关闭顺手
+   * 停掉（服务端会按 expectedActiveTurnId 拒绝，这正是它的作用）。
+   */
   const confirmClose = useCallback(
     async (confirmation: CloseConfirmation): Promise<boolean> => {
-      const current = activeRef.current;
-      const found = store.findView(confirmation.sideId);
-      const hostKey = current?.hostKey ?? found?.hostKey;
-      if (hostKey === undefined) return false;
-      const binding = store.binding(hostKey);
-      if (!binding) return false;
-      const parentId = current?.parentId ?? found?.view.parentId ?? null;
-      const ok = await run(async () => {
-        await binding.client.request("side/close", {
-          sideId: confirmation.sideId,
-          expectedActiveTurnId: confirmation.activeTurnId,
+      const { target } = confirmation;
+      const binding = store.binding(target.hostKey);
+      if (!binding) {
+        recordError("旁问所在的项目没有连接", target);
+        return false;
+      }
+      if (binding.client !== confirmation.client) {
+        recordError("连接已经更换，请重新确认关闭", target);
+        return false;
+      }
+      if (!binding.supported || binding.scope === "observe") {
+        recordError("当前权限不能关闭旁问", target);
+        return false;
+      }
+      // 换代：这份确认描述的那一代已经不在了，关它没有意义（也不安全）。
+      const view = store.read(target.hostKey, target.sideId);
+      if (view !== undefined && view.generation !== target.generation) {
+        recordError("这条旁问已经被新的会话取代", target);
+        return false;
+      }
+      setNotice(null);
+      const key = lockKey(target.hostKey, target.parentId, "close");
+      if (inFlight.current.has(key)) return false;
+      inFlight.current.add(key);
+      try {
+        const ok = await run(async () => {
+          await confirmation.client.request("side/close", {
+            sideId: target.sideId,
+            expectedActiveTurnId: confirmation.activeTurnId,
+          });
+          return true;
         });
+        if (ok !== true) {
+          recordError(lastErrorRef.current?.message ?? "关闭旁问失败", target);
+          return false;
+        }
+        // 只有「还看着这一条」且「用户没再导航过」才把视图送回父会话。在等待
+        // 期间走开又回来的人，不该被一份过期确认强行送走。
+        leaveIfShowing(
+          target.hostKey,
+          target.parentId,
+          { sideId: target.sideId, revision: confirmation.navigationRevision },
+        );
+        await controllerFor(binding, target.parentId).reconcile(target.parentId);
+        onChange();
         return true;
-      });
-      if (ok !== true) return false;
-      if (parentId !== null) {
-        setActiveBoth({ kind: "main", hostKey, parentId });
+      } finally {
+        inFlight.current.delete(key);
+        onChange();
       }
-      const controller = controllerFor(binding, parentId ?? "");
-      if (parentId !== null) {
-        await controller.reconcile(parentId);
-      }
-      onChange();
-      return true;
     },
-    [store, controllerFor, run, onChange, setActiveBoth],
+    [store, controllerFor, run, onChange, recordError],
   );
 
   const clearError = useCallback(() => {
     setError(null);
     setErrorTarget(null);
+    setNotice(null);
   }, []);
 
   const visibleError = (() => {
@@ -584,6 +834,7 @@ export function useSideConversationController(
     error,
     errorTarget,
     visibleError,
+    notice,
     clearError,
   };
 }

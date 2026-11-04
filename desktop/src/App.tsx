@@ -2660,16 +2660,22 @@ export default function App() {
   /**
    * 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。
    *
-   * 没有旁问可关时给一句明确提示，而不是「发完命令什么也没发生」（Task 4 会把
-   * 确认对象改成携带完整原目标，那时父与宿主在这里定格）。
+   * 父身份与宿主**在这里定格**：确认弹窗开着的时候用户可能切走，而关闭请求仍
+   * 应打给他当时要关的那条。主视图也能关后台旁问——旁支只在视图里显示，不该
+   * 成为「必须先进入才能关」的东西。
    */
   const beginSideClose = async (): Promise<void> => {
-    const current = sideConversationRef.current.active;
-    if (current === null || current.kind !== "side") {
+    const binding =
+      sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    const parentId = store.currentId;
+    if (binding === undefined || parentId === null) {
       setSideNotice("当前没有打开的旁问");
       return;
     }
-    const confirmation = await sideConversationRef.current.requestClose();
+    const confirmation = await sideConversationRef.current.requestClose(
+      binding,
+      parentId,
+    );
     if (confirmation !== null) setSideCloseConfirm(confirmation);
   };
 
