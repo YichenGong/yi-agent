@@ -641,6 +641,20 @@ where
                             let is_local = client == crate::broadcast::ClientId::local();
                             match authorization.accept(is_local) {
                                 Ok(authorization) => {
+                                    // Hand the attach path what the shell authorized.
+                                    // The app-server speaks for one App run, so the
+                                    // set is replaced rather than merged: an older
+                                    // generation's capabilities must stop working the
+                                    // moment a new handshake arrives.
+                                    yi_agent_subagent::attach::install_root_capabilities(
+                                        authorization
+                                            .root_authorizations
+                                            .iter()
+                                            .map(|root| {
+                                                (root.root_id.clone(), root.capability.clone())
+                                            })
+                                            .collect(),
+                                    );
                                     shell_authorizations
                                         .lock()
                                         .await

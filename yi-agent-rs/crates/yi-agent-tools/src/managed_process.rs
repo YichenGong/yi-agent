@@ -316,6 +316,7 @@ impl ManagedHandle {
             .request(
                 ManagedSpawnRequest::Wait {
                     process_id: self.process_id.clone(),
+                    budget_secs: timeout.as_secs(),
                 },
                 timeout,
             )

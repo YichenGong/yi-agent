@@ -634,7 +634,9 @@ pub fn retire_if_wedged(socket_path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeProbe, probe_runtime, project_runtime_directory, worker_factory};
+    use super::{
+        BringUpPolicy, RuntimeProbe, probe_runtime, project_runtime_directory, worker_factory,
+    };
     use yi_agent_store::ipc::Daemon;
 
     /// A fully-populated config for the factory tests. Every field the resolved
@@ -1041,6 +1043,52 @@ mod tests {
             "a fixed catalog must take effect on the next call"
         );
     }
+    /// The mapping must be pure and pinned: flipping the default is a deliberate
+    /// release decision, and a typo in the variable's value must not silently
+    /// select the managed path.
+    #[test]
+    fn only_the_exact_managed_value_selects_managed() {
+        assert_eq!(
+            BringUpPolicy::from_value(Some("managed")),
+            BringUpPolicy::Managed
+        );
+        assert_eq!(
+            BringUpPolicy::from_value(Some("Managed")),
+            BringUpPolicy::default_for_build()
+        );
+        assert_eq!(
+            BringUpPolicy::from_value(Some("embedded")),
+            BringUpPolicy::default_for_build()
+        );
+        assert_eq!(
+            BringUpPolicy::from_value(None),
+            BringUpPolicy::default_for_build()
+        );
+    }
+
+    /// The default must stay embedded until flipping it is validated separately.
+    #[test]
+    fn the_build_default_is_embedded() {
+        assert_eq!(BringUpPolicy::default_for_build(), BringUpPolicy::Embedded);
+    }
+
+    /// With no context installed the choice still names a policy but carries no
+    /// expectation, which is exactly what makes a *managed* bring-up refuse
+    /// rather than compare against an identity it invented.
+    ///
+    /// The installed branch is not asserted here: `OnceLock` is process-wide and
+    /// every test in this binary shares it, so the result would depend on test
+    /// order. The install path is covered where it matters instead -- the
+    /// app-server rejects a managed bring-up that has no context.
+    #[test]
+    fn an_uninstalled_context_yields_no_expectation() {
+        if crate::attach::managed_context().is_some() {
+            return;
+        }
+        let choice = crate::attach::process_bringup_choice();
+        assert!(choice.expected.is_none());
+        assert!(choice.instance_home.is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1129,64 @@ impl BringUpPolicy {
             Some("managed") => Self::Managed,
             _ => Self::default_for_build(),
         }
+    }
+}
+
+/// The inputs a managed bring-up needs that only the *binary* can supply.
+///
+/// `ArtifactIdentity` carries the build id and executable that `yi-agent`'s build
+/// script produced; `yi-agent-app-server` is a library the binary depends on, so it
+/// cannot read them. Rather than thread two more parameters through every transport
+/// and test-only entry point, the binary installs them once at startup, exactly like
+/// the other process-wide facts this codebase already pins (`YI_AGENT_HOME`,
+/// the model catalogue).
+///
+/// `None` here is not "unmanaged": the policy alone decides that. It means the
+/// process never said what it is, so a *managed* bring-up has nothing to classify
+/// against and must refuse rather than guess.
+#[derive(Clone, Debug)]
+pub struct ManagedContext {
+    /// The artifact this process expects the runtime to be.
+    pub expected: yi_agent_lifecycle::types::ArtifactIdentity,
+    /// The instance home the scope is resolved against.
+    pub instance_home: PathBuf,
+}
+
+static MANAGED_CONTEXT: std::sync::OnceLock<ManagedContext> = std::sync::OnceLock::new();
+
+/// Installs the process-wide managed bring-up context.
+///
+/// Called by the `yi-agent` binary at startup. A second install is ignored: the
+/// first one belongs to the process that is actually running, and silently
+/// replacing it mid-flight would change what a later attach classifies against.
+pub fn install_managed_context(context: ManagedContext) {
+    let _ = MANAGED_CONTEXT.set(context);
+}
+
+/// The installed context, or `None` when this process never identified itself.
+pub fn managed_context() -> Option<&'static ManagedContext> {
+    MANAGED_CONTEXT.get()
+}
+
+/// The bring-up choice this process should use, assembled from the installed context.
+///
+/// One function so the two call sites (the app-server's project attach and the
+/// binding's repair) cannot disagree about which policy or which expectation to use.
+/// When no context was installed this still returns the policy, with `expected: None`
+/// — which is precisely what makes a managed bring-up refuse instead of guess.
+pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
+    let policy = BringUpPolicy::from_env();
+    match managed_context() {
+        Some(context) => crate::binding::BringUpChoice {
+            policy,
+            expected: Some(context.expected.clone()),
+            instance_home: Some(context.instance_home.clone()),
+        },
+        None => crate::binding::BringUpChoice {
+            policy,
+            expected: None,
+            instance_home: None,
+        },
     }
 }
 
@@ -1126,12 +1232,56 @@ pub fn attach_managed_project_runtime(
         }
         Err(error) => return Err(AttachFailure::new("runtime bring-up", error)),
     }
+    // The shell's capability, if it sent one. On a daemon whose guardian signed
+    // this root, it is required; on an unmanaged one the daemon ignores it and the
+    // generated key is used, which keeps the embedded path byte-for-byte unchanged.
+    let capability = managed_root_capability(&cfg.workdir);
     attach_to_answer(
         cfg,
         &runtime_dir,
         // The managed path never owns the daemon, so it never supervises plugins.
         None,
+        capability,
     )
+}
+
+/// Root capabilities the desktop shell minted, keyed by project path.
+///
+/// Filled on `initialize` rather than at start-up: a capability is bound to one App
+/// run and one generation, so it cannot outlive the handshake that carried it. The
+/// store is replaced wholesale on each handshake, never merged -- a reconnect to a
+/// restarted guardian must not leave the previous generation's keys attachable.
+static ROOT_CAPABILITIES: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records what the shell authorized for this process.
+pub fn install_root_capabilities(capabilities: Vec<(String, String)>) {
+    let mut stored = ROOT_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stored = capabilities;
+}
+
+/// The root capability the desktop shell handed this process, if any.
+///
+/// Read from the shared store rather than from an argument, for the same reason
+/// `expected` is: the shell speaks once, on `initialize`, and every attach this
+/// sidecar performs afterwards has to use the same answer. A project the shell never
+/// authorized yields `None`, and the attach then fails on the daemon's gate with a
+/// reason that names the missing authorization.
+pub fn managed_root_capability(workdir: &Path) -> Option<String> {
+    let wanted = canonical_or_self(workdir);
+    let stored = ROOT_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stored
+        .iter()
+        .find(|(root, _)| canonical_or_self(Path::new(root)) == wanted)
+        .map(|(_, capability)| capability.clone())
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Attaches one root over an already-decided runtime.
@@ -1142,15 +1292,22 @@ fn attach_to_answer(
     cfg: &RuntimeConfig,
     runtime_dir: &Path,
     instance_home: Option<&Path>,
+    idempotency_key: Option<String>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     let socket_path = yi_agent_store::ipc::socket_path_for(runtime_dir)
         .map_err(|error| AttachFailure::new("runtime directory", error))?;
-    let idempotency_key = format!(
-        "project:{}:{}:{}",
-        std::process::id(),
-        cfg.workdir.display(),
-        uuid::Uuid::new_v4()
-    );
+    // When the guardian minted authority for this root, the capability *is* the
+    // attach key: the daemon resolves it to the binding the guardian pushed, and
+    // that is the only way it can learn whose root this is. Inventing a key here
+    // would be an unattributed attach on a managed daemon, which it refuses.
+    let idempotency_key = idempotency_key.unwrap_or_else(|| {
+        format!(
+            "project:{}:{}:{}",
+            std::process::id(),
+            cfg.workdir.display(),
+            uuid::Uuid::new_v4()
+        )
+    });
     let response = send_request(
         &socket_path,
         yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {

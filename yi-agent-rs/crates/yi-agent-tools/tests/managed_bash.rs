@@ -54,27 +54,33 @@ fn channel(directory: &tempfile::TempDir) -> (ManagedSpawner, ObservedSpawns, Ob
     let owners = Arc::new(Mutex::new(Vec::new()));
     let owners_in_thread = Arc::clone(&owners);
     std::thread::spawn(move || {
-        let mut registry = registry;
-        let record_owner = |registry: &ProcessRegistry, owners: &Arc<Mutex<Vec<String>>>| {
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let record_owner = |registry: &std::sync::Mutex<ProcessRegistry>,
+                            owners: &Arc<Mutex<Vec<String>>>,
+                            observed: &ObservedSpawns| {
+            let registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for record in registry.records() {
                 let text = format!("{:?}", record.owner);
                 let mut owners = owners.lock().unwrap();
                 if !owners.contains(&text) {
                     owners.push(text);
                 }
-                let mut observed = observed_in_thread.lock().unwrap();
+                let mut observed = observed.lock().unwrap();
                 observed.push((record.process_id.clone(), record.pgid.to_string()));
             }
         };
         // One request at a time: serve_channel handles a spawn, we record, then it
         // waits for the next request (the terminate that ends the group).
+        let shared = std::sync::Arc::clone(&registry);
         let _ = serve_channel(
-            &mut registry,
+            shared,
             &ChannelGrant::new(ProcessOwner::frontend("app")),
             guardian_side,
             Duration::from_secs(20),
         );
-        record_owner(&registry, &owners_in_thread);
+        record_owner(&registry, &owners_in_thread, &observed_in_thread);
     });
 
     // A factory has to hand out a fresh connection per child, but this test starts

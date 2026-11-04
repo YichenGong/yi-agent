@@ -371,6 +371,21 @@ pub enum ControlRequest {
         token: ConfirmationToken,
         operation_id: OperationId,
     },
+    /// Asks for a fresh private descriptor to start tool processes on.
+    ///
+    /// This is the one control operation whose *answer* is a descriptor rather
+    /// than a frame: the guardian creates the pair, keeps one end and hands the
+    /// other back over `SCM_RIGHTS`. It is deliberately not a socket path a tool
+    /// could dial by itself -- the owner of a channel is then a fact of who the
+    /// guardian gave it to, not a string in a request.
+    ///
+    /// `grant` is what makes it owner-bound. A lease-only observer cannot ask:
+    /// observers never authorize a task, and a tool process is work. The guardian
+    /// answers `Unsupported` when it holds no process registry, because a channel
+    /// with nothing behind it would accept a spawn it could never reclaim.
+    OpenManagedChannel {
+        grant: ClientGrant,
+    },
     /// Read-only status: identity, whole-runtime counts, one page of clients, and
     /// any switch in flight.
     ///
@@ -392,6 +407,25 @@ pub enum ControlRequest {
         /// a client registering between two page reads would make page 2 repeat or
         /// skip a row.
         cursor: Option<String>,
+    },
+    /// Mint the authority to attach one root on this client's behalf.
+    ///
+    /// Owner-bound like every other state-changing request: `grant` must match the
+    /// live lease, and the lease must be [`LeaseMode::Business`]. That is the whole
+    /// security claim -- a `LeaseOnly` observer can watch and control upgrades but
+    /// can never name an owner, so it cannot obtain this.
+    ///
+    /// Answering with a capability rather than a boolean is what makes the result
+    /// usable by a *different* process. The sidecar cannot hold the App's renewable
+    /// credential (`shell_authorization` is explicit about that), so "yes" would
+    /// leave it with nothing to present. The capability is not a credential: it
+    /// cannot register, renew, or spawn -- it names one root in one generation.
+    AuthorizeRoot {
+        grant: ClientGrant,
+        /// The root this authority is for, exactly as the business attach will
+        /// name it. Deriving it here rather than at the attach is what makes the
+        /// binding checkable by the daemon, which never sees the grant.
+        root_id: RootId,
     },
 }
 
@@ -460,6 +494,23 @@ pub enum ControlResponse {
     /// every reply would otherwise be sized for the biggest one. The frame is
     /// encoded and dropped immediately, so one indirection costs nothing.
     Status(Box<RuntimeStatusSnapshot>),
+    /// The private channel was created; the descriptor travels beside this frame.
+    ///
+    /// Carrying the owner back is not a convenience: the client must build the
+    /// spawn policy from *this* answer rather than from the id it asked about, so a
+    /// guardian that granted a different owner cannot be silently mislabelled.
+    ChannelOpened {
+        /// The owner the guardian actually bound the channel to.
+        owner: String,
+        /// The runtime generation the channel belongs to.
+        generation: String,
+    },
+    /// The requested authority, minted for this client, root and generation.
+    ///
+    /// The guardian answers with the full binding rather than a bare capability so
+    /// the caller can see *whose* authority it is: a guardian that bound a
+    /// different client would be visibly wrong instead of silently mislabelled.
+    RootAuthorized(RootAuthorization),
 }
 
 /// A portable description of a bundled daemon artifact, emitted at build time and
@@ -558,7 +609,20 @@ pub enum ManagedSpawnRequest {
     /// `SCM_RIGHTS` ancillary data, so they are not part of this frame.
     Spawn(ManagedSpawnSpec),
     /// Wait for the group to end, within the caller's remaining budget.
-    Wait { process_id: ManagedProcessId },
+    ///
+    /// `budget_secs` is the caller's own wait budget, and it has to travel with
+    /// the request: the channel's read timeout exists to notice a dead peer, not
+    /// to bound a legitimate wait. Serving `Wait` with the channel budget meant a
+    /// command that ran longer than that would be answered with the status read
+    /// at that moment (`group_stopped: false`, no exit code) while its process
+    /// group was still alive -- indistinguishable from "the command failed".
+    /// Zero means the caller sent no budget (an older build); the server then
+    /// falls back to the channel budget, which is the old behaviour.
+    Wait {
+        process_id: ManagedProcessId,
+        #[serde(default)]
+        budget_secs: u64,
+    },
     /// Ask without waiting.
     TryWait { process_id: ManagedProcessId },
     /// Terminate the group and report what happened.
@@ -569,7 +633,14 @@ impl std::fmt::Debug for ManagedSpawnRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(spec) => f.debug_tuple("Spawn").field(spec).finish(),
-            Self::Wait { process_id } => f.debug_tuple("Wait").field(process_id).finish(),
+            Self::Wait {
+                process_id,
+                budget_secs,
+            } => f
+                .debug_tuple("Wait")
+                .field(process_id)
+                .field(budget_secs)
+                .finish(),
             Self::TryWait { process_id } => f.debug_tuple("TryWait").field(process_id).finish(),
             Self::Terminate { process_id } => f.debug_tuple("Terminate").field(process_id).finish(),
         }
