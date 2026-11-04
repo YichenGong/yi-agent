@@ -32,7 +32,12 @@ function fakeClient(responses: Record<string, (params: any) => unknown> = {}) {
 /** 只实现本 hook 用到的那几个方法。 */
 function fakeController() {
   return {
-    submit: vi.fn(async () => {}),
+    // 真控制器的 `submit` 返回三态收据（Task 2）：fake 必须同样返回，否则
+    // hook 里 `receipt?.kind === "accepted"` 的判定在测试中永远为假。
+    submit: vi.fn(async (_sideId: string, _text: string, requestId: string) => ({
+      kind: "accepted" as const,
+      requestId,
+    })),
     reconcile: vi.fn(async () => {}),
     client: null as unknown,
     dispose: vi.fn(),

@@ -194,12 +194,10 @@ export function useSideConversationController(
         return false;
       }
       const controller = controllerFor(binding, found.view.parentId);
-      const ok = await run(async () => {
-        await controller.submit(sideId, text, newRequestId());
-        return true;
-      });
+      const receipt = await run(async () => controller.submit(sideId, text, newRequestId()));
       onChange();
-      return ok === true;
+      // 只有明确受理才算「命令已接纳」；不确定与拒绝都要让调用方按各自语义处理。
+      return receipt?.kind === "accepted";
     },
     [store, controllerFor, onChange, run, newRequestId],
   );

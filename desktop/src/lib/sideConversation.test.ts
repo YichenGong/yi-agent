@@ -334,6 +334,94 @@ describe("SideConversationStore", () => {
     expect(store.read(b.key, "s")!.pending!.state).toBe("uncertain");
   });
 
+  it("writes a draft version only when the text actually changed", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, changed("s", 1));
+    store.setDraft(b.key, "s", "question");
+    const before = store.read(b.key, "s")!.draftVersion;
+    expect(before).toBeGreaterThan(0);
+    // 受控输入框在无关重渲染时会重复写同一个值：那不算一次编辑。
+    store.setDraft(b.key, "s", "question");
+    expect(store.read(b.key, "s")!.draftVersion).toBe(before);
+    // 改走再改回来是**两次**变化：只比正文的话，一个在途提交会误以为草稿没动过。
+    store.setDraft(b.key, "s", "other");
+    store.setDraft(b.key, "s", "question");
+    expect(store.read(b.key, "s")!.draftVersion).toBe(before + 2);
+  });
+
+  it("keeps the local draft version when a baseline is installed again", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, changed("s", 1));
+    store.setDraft(b.key, "s", "half-written");
+    const version = store.read(b.key, "s")!.draftVersion;
+    store.read(b.key, "s")!.pending = {
+      requestId: "00000000-0000-4000-8000-000000000001",
+      text: "q",
+      draftVersion: version,
+      state: "submitting",
+    };
+    // 基线替换的是正文，不是用户此刻正在写的东西。
+    store.installBaseline(
+      b.key,
+      "s",
+      {
+        items: [],
+        snapshot_seq: 3,
+        status: "idle",
+        usage: {
+          total: { input: 0, output: 0, cache_creation: 0, cache_read: 0, reasoning: 0 },
+          complete: true,
+        },
+        active_turn_id: null,
+        accepted_requests: {},
+        effective_config: {
+          model: "m",
+          reasoning_effort: null,
+          preserve_thinking: false,
+          read_only: true,
+          tool_names: [],
+        },
+        snapshot_token: "t",
+        next_cursor: null,
+      },
+      [],
+    );
+    const view = store.read(b.key, "s")!;
+    expect(view.draftVersion).toBe(version);
+    expect(view.draft).toBe("half-written");
+    expect(view.pending?.requestId).toBe(
+      "00000000-0000-4000-8000-000000000001",
+    );
+  });
+
+  it("drops the previous generation's pending, rejected and draft version", () => {
+    const store = new SideConversationStore();
+    const b = store.bind(binding(fakeClient("c")));
+    store.apply(b.key, changed("s", 1));
+    store.setDraft(b.key, "s", "old question");
+    const view = store.read(b.key, "s")!;
+    view.pending = {
+      requestId: "00000000-0000-4000-8000-000000000001",
+      text: "old question",
+      draftVersion: view.draftVersion,
+      state: "uncertain",
+    };
+    view.rejectedSubmission = {
+      requestId: "00000000-0000-4000-8000-000000000002",
+      text: "rejected",
+      message: "boom",
+    };
+    store.apply(b.key, changed("s", 1, { generation: 2 }));
+    const fresh = store.read(b.key, "s")!;
+    // 新一代是宿主给的另一条旁支：上一代的提交不得跟着搬过去。
+    expect(fresh.draft).toBe("");
+    expect(fresh.draftVersion).toBe(0);
+    expect(fresh.pending).toBeNull();
+    expect(fresh.rejectedSubmission).toBeNull();
+  });
+
   it("records the usage and error of a finished turn", () => {
     const store = new SideConversationStore();
     const b = store.bind(binding(fakeClient("c")));
