@@ -1157,6 +1157,46 @@ pub(crate) fn respond(
             ),
             Err(error) => Err(error.into()),
         },
+        IpcRequest::PrepareApplicationRootRecovery {
+            authorization,
+            request,
+        } => match coordinator.prepare_foreground_recovery(&authorization, &request) {
+            Ok(status) => Ok(IpcResponse::ForegroundRecovery { status }),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
+        IpcRequest::RecoverApplicationRoot {
+            authorization,
+            request,
+            confirmation_token,
+        } => {
+            match coordinator.recover_foreground_root(&authorization, &request, &confirmation_token)
+            {
+                Ok(result) => Ok(IpcResponse::ForegroundRecovery {
+                    status: yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(
+                        result,
+                    ),
+                }),
+                Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                    IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+                ),
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::GetApplicationRootRecovery {
+            authorization,
+            root,
+            operation_id,
+        } => match coordinator.foreground_recovery_status(&authorization, &root, &operation_id) {
+            Ok(Some(status)) => Ok(IpcResponse::ForegroundRecovery { status }),
+            Ok(None) => Ok(IpcResponse::ForegroundRecoveryAbsent),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
         IpcRequest::CreateSchedule { cron, objective } => {
             let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))

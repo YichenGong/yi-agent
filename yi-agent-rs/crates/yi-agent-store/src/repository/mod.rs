@@ -562,6 +562,55 @@ impl RuntimeRepository {
         Ok(())
     }
 
+    /// Runs one query against the fixture database and returns a single number.
+    ///
+    /// Test-only, next to `execute_test_statement` and for the same reason: some
+    /// assertions are about what the writer left behind (how many attempts exist, what
+    /// a settled attempt's terminal says) and reading that back through a projection
+    /// the test is meant to distrust would defeat the purpose.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_scalar(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<i64, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(statement, rusqlite::params![parameter], |row| row.get(0))?)
+    }
+
+    /// Runs one statement against the fixture database with several parameters.
+    ///
+    /// The single-parameter variant covers most fixtures; settling a task *and* its
+    /// attempt in one statement needs more than one value, and splitting it would let
+    /// the two rows disagree between the two writes.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_statement_params(
+        &self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> Result<(), RepositoryError> {
+        let parameters: Vec<&dyn rusqlite::ToSql> = parameters
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect();
+        self.connection.execute(statement, parameters.as_slice())?;
+        Ok(())
+    }
+
+    /// The text twin of `execute_test_scalar`, for one optional column.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_scalar_text(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(statement, rusqlite::params![parameter], |row| row.get(0))
+            .optional()?)
+    }
+
     pub fn schema_version(&self) -> Result<i64, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",

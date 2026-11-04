@@ -485,6 +485,48 @@ impl RuntimeRepository {
         })
     }
 
+    /// Writes the `stalled` history a pre-exemption build would have left behind.
+    ///
+    /// Test-only, and deliberately narrow: it takes the task it is told to settle and
+    /// writes the same two rows the real writer writes, with the same terminal encoding.
+    /// It does not consult the classification, because the whole point is to recreate a
+    /// row the current policy would refuse to create.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn import_stalled_snapshot(
+        &mut self,
+        task: &TaskId,
+        evidence: &WatchdogEvidence,
+    ) -> Result<(), RepositoryError> {
+        let terminal = WatchdogTerminal::Stalled;
+        let terminal_json = terminal.terminal_json(evidence)?;
+        let attempt = self.active_attempt_id(task)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE tasks SET state_json = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![terminal.state_name(), task.to_string(), attempt.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET state = ?1, ended_at = CURRENT_TIMESTAMP, terminal_json = ?2
+             WHERE id = ?3 AND task_id = ?4",
+            params![
+                terminal.state_name(),
+                terminal_json,
+                attempt.to_string(),
+                task.to_string()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
+             WHERE task_id = ?1 AND state = 'active'",
+            params![task.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Activates a successor attempt while returning the task to the queue.
     /// The task's active-attempt pointer and attempt row must commit together
     /// before a worker may receive the new attempt ID.

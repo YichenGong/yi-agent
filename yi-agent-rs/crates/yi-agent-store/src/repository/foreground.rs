@@ -135,6 +135,24 @@ pub struct DriverBindingRecord {
     pub attempt: String,
 }
 
+/// The attempt one root's row currently points at.
+///
+/// Read inside a write transaction so a caller cannot observe a CAS that already
+/// moved, and `None` for a root whose task has vanished -- which is a corrupt row, not
+/// an empty answer.
+fn active_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    root: &TaskId,
+) -> Result<Option<String>, RepositoryError> {
+    Ok(transaction
+        .query_row(
+            "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+            params![root.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 /// The committed activity sequence of one root, if a snapshot exists.
 fn activity_seq_of(
     connection: &rusqlite::Connection,
@@ -932,6 +950,58 @@ impl RuntimeRepository {
         Ok(snapshot)
     }
 
+    /// Whether one root's active attempt carries a `stalled` watchdog terminal.
+    ///
+    /// Recovery is only for a root the watchdog settled by mistake. Anything else --
+    /// completed, failed, cancelled, `recovery_required` -- is a real terminal state,
+    /// and reading it as recoverable would let a caller undo a decision that was
+    /// actually made.
+    pub fn foreground_attempt_is_stalled(&self, root: &TaskId) -> Result<bool, RepositoryError> {
+        let terminal: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT attempts.terminal_json
+                 FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
+                 WHERE tasks.id = ?1",
+                params![root.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(terminal.flatten().is_some_and(|json| {
+            serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("outcome")
+                        .and_then(|outcome| outcome.get("kind"))
+                        .and_then(|kind| kind.as_str())
+                        .map(|kind| kind == "stalled")
+                })
+                .unwrap_or(false)
+        }))
+    }
+
+    /// The terminal JSON of the root's first attempt, which is the settled one.
+    ///
+    /// Keyed by attempt number rather than "everything but the active attempt": before
+    /// a recovery the stalled attempt *is* active, and after it the same row is
+    /// history, so only the number names the same row on both sides.
+    pub fn first_attempt_terminal_json(
+        &self,
+        root: &TaskId,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT terminal_json FROM attempts
+                 WHERE task_id = ?1 ORDER BY number ASC LIMIT 1",
+                params![root.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// The durable receipt of a committed recovery, if that exact operation happened.
     ///
     /// `None` means "no committed result"; it does **not** mean "safe to start a new
@@ -972,6 +1042,256 @@ impl RuntimeRepository {
                 |row| row.get::<_, String>(0),
             )
             .optional()?)
+    }
+
+    /// Records the prepared shape of one recovery operation.
+    ///
+    /// Written before any stop request goes out, because the set being stopped must
+    /// be reconstructible after a crash: a daemon that stopped executions and then
+    /// died would otherwise leave a root with no record of what it had already
+    /// closed. The fingerprint binds the request, so a different request under the
+    /// same operation id is a conflict rather than a silent reuse.
+    pub fn record_foreground_recovery_prepare(
+        &mut self,
+        root: &TaskId,
+        operation: &str,
+        expected_attempt: &str,
+        fingerprint: &str,
+        request_json: &str,
+        impact: &yi_agent_lifecycle::foreground::RecoveryImpact,
+    ) -> Result<(), RepositoryError> {
+        if operation.trim().is_empty() || fingerprint.trim().is_empty() {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::OperationConflict,
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT request_fingerprint, expected_attempt_id
+                 FROM foreground_recovery_operations
+                 WHERE root_task_id = ?1 AND operation_id = ?2",
+                params![root.to_string(), operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored, stored_attempt)) = existing {
+            if stored != fingerprint {
+                // Same id, different request: replaying either answer would be a lie
+                // about one of the two.
+                return Err(RepositoryError::Foreground(
+                    ForegroundError::OperationConflict,
+                ));
+            }
+            if stored_attempt != expected_attempt {
+                return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+            }
+            transaction.execute(
+                "UPDATE foreground_recovery_operations
+                 SET phase = 'ready', impact_json = ?1
+                 WHERE root_task_id = ?2 AND operation_id = ?3 AND phase != 'committed'",
+                params![serde_json::to_string(impact)?, root.to_string(), operation],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let ready = active_attempt(&transaction, root)?
+            .filter(|attempt| attempt == expected_attempt)
+            .ok_or(RepositoryError::Foreground(ForegroundError::StaleAttempt))?;
+        let _ = ready;
+        transaction.execute(
+            "INSERT INTO foreground_recovery_operations
+                (root_task_id, operation_id, expected_attempt_id, request_fingerprint,
+                 original_request_json, phase, impact_json, result_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, NULL)",
+            params![
+                root.to_string(),
+                operation,
+                expected_attempt,
+                fingerprint,
+                request_json,
+                serde_json::to_string(impact)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits one successor attempt, or answers with the receipt already stored.
+    ///
+    /// Everything is re-checked inside the transaction: the operation's fingerprint,
+    /// the expected attempt, the root's live state and the frozen set. That is not
+    /// belt-and-braces -- the confirmation was issued earlier, so between it and this
+    /// commit the attempt could have moved, and acting on the old view would create a
+    /// successor for a conversation that had already recovered.
+    ///
+    /// A failed step rolls the whole transaction back, so a refusal never leaves half
+    /// an attempt behind.
+    pub fn commit_foreground_recovery(
+        &mut self,
+        root: &TaskId,
+        operation: &str,
+        fingerprint: &str,
+        expected_attempt: &str,
+        successor: &str,
+    ) -> Result<RecoveryResult, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored: Option<(String, String, String, Option<String>)> = transaction
+            .query_row(
+                "SELECT request_fingerprint, expected_attempt_id, phase, result_json
+                 FROM foreground_recovery_operations
+                 WHERE root_task_id = ?1 AND operation_id = ?2",
+                params![root.to_string(), operation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_fingerprint, stored_attempt, phase, result)) = stored else {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::ConfirmationRequired,
+            ));
+        };
+        if stored_fingerprint != fingerprint {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::OperationConflict,
+            ));
+        }
+        if stored_attempt != expected_attempt {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        if phase == "committed" {
+            // A replay answers with the receipt. Re-creating the attempt would give
+            // one operation two successors.
+            let Some(result) = result else {
+                return Err(RepositoryError::Foreground(ForegroundError::CorruptBinding));
+            };
+            return Ok(serde_json::from_str(&result)?);
+        }
+        if phase != "ready" {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::ConfirmationRequired,
+            ));
+        }
+        // The old attempt must still be the active one and still be stalled. A root
+        // that recovered, settled or moved on in the meantime has nothing to recover.
+        let (active, session): (String, String) = transaction.query_row(
+            "SELECT active_attempt_id, root_session_id FROM tasks WHERE id = ?1",
+            params![root.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if active != expected_attempt {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        let stalled: Option<String> = transaction
+            .query_row(
+                "SELECT terminal_json FROM attempts WHERE id = ?1",
+                params![expected_attempt],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let stalled_reason = stalled.as_deref().unwrap_or_default();
+        if !stalled_reason.contains("stalled") {
+            // Recovery is for a root the watchdog settled by mistake. A completed,
+            // failed or cancelled root is not "recoverable" -- that would resurrect a
+            // real terminal state.
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryRequired,
+            ));
+        }
+        let number: i64 = transaction.query_row(
+            "SELECT number FROM attempts WHERE id = ?1",
+            params![expected_attempt],
+            |row| row.get(0),
+        )?;
+        let next = u32::try_from(number)
+            .ok()
+            .and_then(|number| number.checked_add(1))
+            .ok_or(RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        let successor_id: AttemptId = successor
+            .parse()
+            .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        // The successor has no worker: recovery re-points the root, it does not
+        // silently restart work the user never asked to resume.
+        insert_attempt(&transaction, &successor_id, root, next, "running")?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET state_json = 'running', active_attempt_id = ?1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND active_attempt_id = ?3",
+            params![successor, root.to_string(), expected_attempt],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        // The old attempt keeps its stalled state, its evidence and its timestamps:
+        // history is what lets a user see why the recovery happened.
+        let binding_epoch: i64 = transaction.query_row(
+            "SELECT binding_epoch FROM foreground_root_state WHERE root_task_id = ?1",
+            params![root.to_string()],
+            |row| row.get(0),
+        )?;
+        let driver_epoch: i64 = transaction.query_row(
+            "SELECT driver_epoch FROM foreground_root_state WHERE root_task_id = ?1",
+            params![root.to_string()],
+            |row| row.get(0),
+        )?;
+        let next_binding = binding_epoch.saturating_add(1);
+        let next_driver = driver_epoch.saturating_add(1);
+        transaction.execute(
+            "UPDATE foreground_root_state
+             SET binding_epoch = ?1, driver_epoch = ?2, activity_json = NULL,
+                 driver_bind_operation_id = NULL, admission_state = 'closed'
+             WHERE root_task_id = ?3",
+            params![next_binding, next_driver, root.to_string()],
+        )?;
+        // The freeze belonged to the attempt that is now history.
+        transaction.execute(
+            "DELETE FROM foreground_frozen_executions WHERE root_task_id = ?1",
+            params![root.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM foreground_freeze WHERE root_task_id = ?1",
+            params![root.to_string()],
+        )?;
+        let result = RecoveryResult {
+            operation_id: operation.to_string(),
+            previous: yi_agent_lifecycle::foreground::RootRef {
+                session_id: session,
+                root_id: root.to_string(),
+                attempt_id: expected_attempt.to_string(),
+            },
+            successor: yi_agent_lifecycle::foreground::RootRef {
+                session_id: transaction.query_row(
+                    "SELECT root_session_id FROM tasks WHERE id = ?1",
+                    params![root.to_string()],
+                    |row| row.get(0),
+                )?,
+                root_id: root.to_string(),
+                attempt_id: successor.to_string(),
+            },
+            binding_epoch: u64::try_from(next_binding)
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+            driver_epoch: u64::try_from(next_driver)
+                .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+        };
+        transaction.execute(
+            "UPDATE foreground_recovery_operations
+             SET phase = 'committed', result_json = ?1
+             WHERE root_task_id = ?2 AND operation_id = ?3",
+            params![serde_json::to_string(&result)?, root.to_string(), operation],
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// Rewrites every uncommitted recovery operation to `needs_preview`.

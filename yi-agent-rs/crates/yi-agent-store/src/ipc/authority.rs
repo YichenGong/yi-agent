@@ -404,9 +404,33 @@ impl AuthorityTable {
         capability: &str,
         now: Instant,
     ) -> bool {
+        self.presents_capability_in(
+            root,
+            client_run_id,
+            capability,
+            now,
+            RootAuthorityScope::Business,
+        )
+    }
+
+    /// The same check, narrowed to an explicit scope.
+    ///
+    /// Recovery needs to prove the same secret without holding business authority:
+    /// a `RecoveryOnly` install can inspect, freeze, stop and prepare, but this
+    /// accessor is the only door it opens. Binding, spawning and activity writes keep
+    /// going through [`Self::presents_capability`], so accepting a recovery scope here
+    /// cannot grant ownership by accident.
+    pub fn presents_capability_in(
+        &self,
+        root: &str,
+        client_run_id: &str,
+        capability: &str,
+        now: Instant,
+        scope: RootAuthorityScope,
+    ) -> bool {
         self.authorities.get(root).is_some_and(|authority| {
             authority.expires_at > now
-                && authority.scope == RootAuthorityScope::Business
+                && authority.scope == scope
                 && authority.client_run_id == client_run_id
                 && constant_time_eq(
                     &authority.capability_digest,

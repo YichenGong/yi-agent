@@ -96,6 +96,28 @@ impl ForegroundBridge {
                 .presents_capability(root, client_run_id, capability, now)
     }
 
+    /// The recovery-scoped variant: the same secret, a narrower scope.
+    ///
+    /// A closed bridge still refuses everything. Only the scope of the installed
+    /// authority differs, which is what lets a stopped conversation be repaired by a
+    /// party that may not own it.
+    pub fn presents_recovery_capability(
+        &self,
+        root: &str,
+        client_run_id: &str,
+        capability: &str,
+        now: Instant,
+    ) -> bool {
+        !self.closed
+            && self.authority.presents_capability_in(
+                root,
+                client_run_id,
+                capability,
+                now,
+                yi_agent_lifecycle::foreground::RootAuthorityScope::RecoveryOnly,
+            )
+    }
+
     /// Handles one frame from the guardian.
     ///
     /// Returns the frame to send back, if any. A frame this side does not answer
@@ -306,8 +328,21 @@ impl ForegroundBridge {
         }
         // `Business` is the only scope that may create a managed container: a
         // `RecoveryOnly` authorization can inspect and stop, never own.
+        //
+        // A recovery install therefore classifies nothing. It is issued for a root
+        // that already has a row (the conversation being repaired), and letting it
+        // rewrite the classification would be the ownership it is defined not to have.
+        // The row is checked, not written, so a recovery scope for an unknown root is
+        // refused rather than silently creating state.
         if pending.scope != RootAuthorityScope::Business {
-            return Err(ForegroundError::AuthorityDenied);
+            if repository
+                .persisted_foreground_root(&root)
+                .map_err(|_| ForegroundError::CorruptBinding)?
+                .is_none()
+            {
+                return Err(ForegroundError::RecoveryAuthorityMissing);
+            }
+            return Ok(());
         }
         repository
             .record_foreground_root(&PersistedForegroundRoot {

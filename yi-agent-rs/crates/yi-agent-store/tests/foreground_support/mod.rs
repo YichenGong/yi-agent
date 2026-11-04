@@ -206,6 +206,11 @@ pub struct ForegroundFixture {
     session: RootSessionId,
     root: TaskId,
     factory: Arc<RecordingFactory>,
+    /// The authorization the guardian would hand the host, when the fixture installed
+    /// one. `managed()` leaves it empty: that fixture predates authority.
+    authorization: Mutex<Option<yi_agent_lifecycle::types::RootAuthorization>>,
+    /// The fence of the driver the fixture bound, for the same reason.
+    fence: Mutex<Option<yi_agent_lifecycle::foreground::ForegroundFence>>,
 }
 
 impl ForegroundFixture {
@@ -238,6 +243,76 @@ impl ForegroundFixture {
             session,
             root,
             factory,
+            authorization: Mutex::new(None),
+            fence: Mutex::new(None),
+        }
+    }
+
+    /// A database-backed coordinator with the foreground lifecycle enabled, real
+    /// authority installed through the private bridge, and a bound driver.
+    ///
+    /// Recovery needs all three: the switch gates every new entry point, the authority
+    /// table is what `prepare` authenticates against, and the fence names a driver
+    /// epoch that only a bind creates.
+    pub async fn managed_live() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Self::managed_live_in(directory.path()).await;
+        // The fixture owns the directory so dropping it cleans up; `managed_live_in`
+        // leaves ownership with the caller.
+        Self {
+            _directory: directory,
+            ..fixture
+        }
+    }
+
+    /// `managed_live` in a caller-owned directory, for tests that reopen the database.
+    pub async fn managed_live_in(path: &Path) -> Self {
+        let directory = tempfile::TempDir::new_in(path).unwrap();
+        let factory = Arc::new(RecordingFactory::default());
+        let coordinator = RuntimeCoordinator::open_with_activation(
+            path.join("runtime.sqlite"),
+            Arc::new(RecordingFactoryWithWorkspaces {
+                inner: Arc::clone(&factory),
+                workspaces: Arc::new(InPlaceWorkspaces {
+                    path: path.to_path_buf(),
+                }),
+            }),
+            yi_agent_store::foreground::ForegroundActivation::for_test(true),
+        )
+        .expect("the fixture's database opens");
+        let session = coordinator
+            .create_session()
+            .expect("a session can be created");
+        let root = coordinator
+            .root_task_id(&session)
+            .expect("a session has a root task");
+        coordinator
+            .bind_root("app", &root.to_string())
+            .expect("the fixture's owner binds");
+        let authorization = coordinator
+            .install_foreground_authority_for_test(
+                &root.to_string(),
+                "app",
+                yi_agent_lifecycle::foreground::RootBindIntent {
+                    operation_id: "fixture-prepare".into(),
+                    thread_key: "fixture-thread".into(),
+                    workspace: path.to_path_buf(),
+                    extra_roots: Vec::new(),
+                    previous_root_capability: None,
+                },
+            )
+            .expect("the bridge installs authority");
+        let binding = coordinator
+            .bind_foreground_driver(&authorization, "fixture-bind")
+            .expect("the fixture's driver binds");
+        Self {
+            _directory: directory,
+            coordinator: Arc::new(coordinator),
+            session,
+            root,
+            factory,
+            authorization: Mutex::new(Some(authorization)),
+            fence: Mutex::new(Some(binding.fence)),
         }
     }
 
@@ -270,6 +345,145 @@ impl ForegroundFixture {
                 None,
             )
             .await
+    }
+
+    /// A live fixture whose root carries a `stalled` terminal from a pre-exemption
+    /// build, then revived into recovery-only authority.
+    ///
+    /// The stall cannot be produced by today's writer: Task 5 made it refuse a managed
+    /// container. What recovery must handle is history, so the fixture imports the exact
+    /// rows that older build wrote (see `import_stalled_snapshot`), then revokes the
+    /// business authority the way the guardian does when an owner leaves and installs a
+    /// `RecoveryOnly` one for the same capability.
+    pub async fn stalled_from_watchdog() -> Self {
+        let fixture = Self::managed_live().await;
+        fixture.settle_root_stalled();
+        fixture
+    }
+
+    /// The same fixture in a directory the caller owns, so the database outlives it.
+    ///
+    /// A restart test needs the file, and `TempDir` drops with the fixture.
+    pub async fn stalled_from_watchdog_in(path: &Path) -> Self {
+        let fixture = Self::managed_live_in(path).await;
+        fixture.settle_root_stalled();
+        fixture
+    }
+
+    /// Imports the historical stall, then downgrades authority to recovery scope.
+    fn settle_root_stalled(&self) {
+        let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let evidence = yi_agent_store::repository::WatchdogEvidence {
+            last_meaningful_event_id: Some(42),
+            last_meaningful_at: timestamp,
+            elapsed_secs: 301,
+            current_wait: None,
+        };
+        self.coordinator
+            .import_stalled_snapshot_for_test(&self.root, evidence)
+            .expect("the historical snapshot is importable");
+        self.revoke_business_and_install_recovery();
+    }
+
+    /// Drops the installed business authority and re-installs the same capability as
+    /// `RecoveryOnly`.
+    fn revoke_business_and_install_recovery(&self) {
+        let old = self
+            .authorization
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the live fixture installed authority");
+        self.coordinator
+            .install_recovery_authority_for_test(&old)
+            .expect("the bridge installs recovery-scoped authority");
+    }
+
+    /// The authorization the fixture currently holds.
+    pub fn authorization(&self) -> yi_agent_lifecycle::types::RootAuthorization {
+        self.authorization
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("this fixture installs authority")
+    }
+
+    /// The fence of the driver the fixture bound.
+    pub fn fence(&self) -> yi_agent_lifecycle::foreground::ForegroundFence {
+        self.fence
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("this fixture binds a driver")
+    }
+
+    /// Builds a recovery request against the fixture's live fence.
+    pub fn recovery_request(
+        &self,
+        operation: &str,
+    ) -> yi_agent_lifecycle::foreground::RecoveryRequest {
+        yi_agent_lifecycle::foreground::RecoveryRequest {
+            expected: self.fence(),
+            operation_id: operation.to_string(),
+        }
+    }
+
+    /// Prepares a recovery through the coordinator.
+    pub fn prepare_recovery(
+        &self,
+        operation: &str,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryOperationStatus, RuntimeCoordinatorError>
+    {
+        self.coordinator
+            .prepare_foreground_recovery(&self.authorization(), &self.recovery_request(operation))
+    }
+
+    /// Commits a prepared recovery with the token its preview carried.
+    pub fn recover(
+        &self,
+        preview: &yi_agent_lifecycle::foreground::RecoveryPreview,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryResult, RuntimeCoordinatorError> {
+        self.coordinator.recover_foreground_root(
+            &self.authorization(),
+            &preview.request,
+            preview
+                .confirmation_token
+                .as_ref()
+                .expect("a ready preview carries a token"),
+        )
+    }
+
+    /// How many attempts the root owns, including the settled one.
+    pub fn attempt_count(&self) -> usize {
+        let repository = self
+            .coordinator
+            .repository_for_test()
+            .expect("the fixture's repository lock is free");
+        repository
+            .execute_test_scalar(
+                "SELECT COUNT(*) FROM attempts WHERE task_id = ?1",
+                &self.root.to_string(),
+            )
+            .expect("attempts are countable") as usize
+    }
+
+    /// The terminal JSON of the root's non-active (settled) attempt.
+    pub fn previous_terminal_json(&self) -> String {
+        let repository = self
+            .coordinator
+            .repository_for_test()
+            .expect("the fixture's repository lock is free");
+        repository
+            .first_attempt_terminal_json(&self.root)
+            .expect("the settled attempt has a terminal")
+            .expect("the settled attempt row exists")
+    }
+
+    /// How many workers the factory was asked to start.
+    pub fn worker_start_count(&self) -> usize {
+        self.factory.started().len()
     }
 
     /// Releases the owner the way a frontend going away does: admission closes, then

@@ -5431,3 +5431,358 @@ async fn foreground_root_lifecycle_release_tracks_committed_pending_start() {
     fixture.assert_all_owned();
     fixture.assert_no_started_workers();
 }
+
+/// A stalled root can be repaired exactly once, and the repair leaves no scar.
+///
+/// The assertions are the spec's C9 in one place: one successor, the old attempt's
+/// evidence untouched, children untouched, no worker restarted, root running again.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_is_idempotent_without_restarting_children() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let old_terminal = fixture.previous_terminal_json();
+    let old_children = fixture.child_ids();
+    let starts = fixture.worker_start_count();
+    let count = fixture.attempt_count();
+
+    let preview = match fixture.prepare_recovery("recover-1").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("a proven stop must produce a ready preview, got {other:?}"),
+    };
+    let first = fixture.recover(&preview).unwrap();
+    // The response was lost and the host retries the same operation. It must get the
+    // same receipt, not a second successor.
+    let second = fixture.recover(&preview).unwrap();
+
+    assert_eq!(first, second, "a replay returns the committed receipt");
+    assert_eq!(
+        fixture.attempt_count(),
+        count + 1,
+        "exactly one successor attempt"
+    );
+    assert_eq!(
+        fixture.previous_terminal_json(),
+        old_terminal,
+        "the settled attempt keeps its stall and its evidence"
+    );
+    assert_eq!(
+        fixture.child_ids(),
+        old_children,
+        "recovery re-points the root; it does not touch children"
+    );
+    assert_eq!(
+        fixture.worker_start_count(),
+        starts,
+        "recovery never restarts a worker"
+    );
+    assert_eq!(fixture.root_state(), "running");
+}
+
+/// Only a stalled root may be recovered.
+///
+/// A completed, failed or cancelled root is a real terminal state; reviving it would
+/// undo a decision the user or the system actually made.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_root_that_is_not_stalled() {
+    for state in ["completed", "failed", "cancelled", "recovery_required"] {
+        let fixture = ForegroundFixture::managed_live().await;
+        {
+            let repository = fixture
+                .coordinator()
+                .repository_for_test()
+                .expect("the repository lock is free");
+            repository
+                .execute_test_statement_params(
+                    "UPDATE tasks SET state_json = ?1 WHERE id = ?2",
+                    &[state, &fixture.root().to_string()],
+                )
+                .expect("the test can settle the root");
+            repository
+                .execute_test_statement_params(
+                    "UPDATE attempts SET state = ?1 WHERE id = (
+                         SELECT active_attempt_id FROM tasks WHERE id = ?2
+                     )",
+                    &[state, &fixture.root().to_string()],
+                )
+                .expect("the test can settle the attempt");
+        }
+        let refusal = fixture
+            .prepare_recovery(&format!("recover-{state}"))
+            .expect_err("only a stalled root is recoverable");
+        assert!(
+            matches!(
+                refusal,
+                RuntimeCoordinatorError::Repository(
+                    yi_agent_store::repository::RepositoryError::Foreground(
+                        yi_agent_store::foreground::ForegroundError::RecoveryRequired
+                    )
+                )
+            ),
+            "{state} must be refused as not-recoverable, got {refusal:?}"
+        );
+    }
+}
+
+/// A recovery scope may prepare and query, but may never own.
+///
+/// This is the boundary that makes `RecoveryOnly` safe to hand out before a stop: it
+/// cannot bind a driver, spawn, write activity or start a tool.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_scope_cannot_own_or_spawn() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let authorization = fixture.authorization();
+    let root = fixture.root().to_string();
+
+    // Prepare and query are allowed.
+    let status = fixture
+        .prepare_recovery("recover-scope")
+        .expect("a recovery scope may prepare");
+    assert!(
+        matches!(
+            status,
+            yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(_)
+        ),
+        "the fixture's single proven execution yields a ready preview, got {status:?}"
+    );
+    fixture
+        .coordinator()
+        .foreground_recovery_status(&authorization, &fixture.fence().root, "recover-scope")
+        .expect("a recovery scope may query");
+
+    // Binding is not.
+    let bound = fixture
+        .coordinator()
+        .bind_foreground_driver(&authorization, "recovery-scope-bind");
+    assert!(
+        matches!(bound, Err(RuntimeCoordinatorError::AuthorityDenied(_))),
+        "a recovery scope must not bind a driver, got {bound:?}"
+    );
+
+    // Spawning is not.
+    let spawned = fixture.spawn("must not start").await;
+    assert!(
+        spawned.is_err(),
+        "a stalled root under recovery authority must not admit a spawn, got {spawned:?}"
+    );
+    let _ = root;
+}
+
+/// A second operation cannot steal the same stalled attempt.
+///
+/// Two operations that both saw the same stalled root must not both commit: the CAS on
+/// the expected attempt is what turns "at most one successor" from a hope into a fact.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_only_one_recovery_operation_can_commit() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let count = fixture.attempt_count();
+    let first = match fixture.prepare_recovery("recover-a").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    // The second prepare is refused because the root is already frozen under the first
+    // operation's set, which is the honest answer: it did not get its own impact.
+    let second = fixture.prepare_recovery("recover-b");
+    assert!(
+        second.is_err(),
+        "a second freeze over the same root must be refused, got {second:?}"
+    );
+
+    let result = fixture.recover(&first).unwrap();
+    assert_eq!(result.operation_id, "recover-a");
+    assert_eq!(
+        fixture.attempt_count(),
+        count + 1,
+        "one committed operation, one successor"
+    );
+}
+
+/// A recovery receipt survives the token that produced it.
+///
+/// The host may lose the answer and ask later, possibly after the confirmation expired
+/// or the daemon restarted. The receipt is durable history, so the query must still
+/// answer — and it must still require authority.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_committed_receipt_outlives_its_token() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let preview = match fixture.prepare_recovery("recover-durable").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let committed = fixture.recover(&preview).unwrap();
+
+    let status = fixture
+        .coordinator()
+        .foreground_recovery_status(
+            &fixture.authorization(),
+            &preview.request.expected.root,
+            "recover-durable",
+        )
+        .expect("the query is authorized")
+        .expect("the operation exists");
+    match status {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(result) => {
+            assert_eq!(result, committed);
+        }
+        other => panic!("a committed operation must read back committed, got {other:?}"),
+    }
+
+    // An unknown operation is absent, not an error and not a false success.
+    let absent = fixture
+        .coordinator()
+        .foreground_recovery_status(
+            &fixture.authorization(),
+            &preview.request.expected.root,
+            "never-prepared",
+        )
+        .expect("the query is authorized");
+    assert!(absent.is_none());
+}
+
+/// A stale fence cannot prepare, and a forged token cannot commit.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_stale_fence_or_a_forged_token() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let mut stale = fixture.fence();
+    stale.binding_epoch = stale.binding_epoch.saturating_sub(1);
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: stale,
+        operation_id: "recover-stale".into(),
+    };
+    let refused = fixture
+        .coordinator()
+        .prepare_foreground_recovery(&fixture.authorization(), &request)
+        .expect_err("a stale binding epoch must be refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::StaleDriver
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+
+    let preview = match fixture.prepare_recovery("recover-forged").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let forged = yi_agent_lifecycle::foreground::SecretCapability::new("not-the-token");
+    let refused = fixture
+        .coordinator()
+        .recover_foreground_root(&fixture.authorization(), &preview.request, &forged)
+        .expect_err("a wrong token must not commit");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::ConfirmationRequired
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// Recovering under another operation id with different parameters is a conflict.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_reused_operation_with_other_parameters() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    match fixture.prepare_recovery("recover-same-id").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(_) => {}
+        other => panic!("expected a ready preview, got {other:?}"),
+    }
+    // Same id, different fence (a moved attempt): the stored fingerprint disagrees.
+    let mut other = fixture.fence();
+    other.driver_epoch = other.driver_epoch.saturating_add(7);
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: other,
+        operation_id: "recover-same-id".into(),
+    };
+    let refused = fixture
+        .coordinator()
+        .prepare_foreground_recovery(&fixture.authorization(), &request)
+        .expect_err("reusing an id with other parameters must be refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::StaleDriver
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// A committed recovery is a durable fact, and reopening the database agrees.
+///
+/// The successor, the root pointer and the receipt are all read back through a second
+/// coordinator: anything that only lived in memory would vanish here, which is the
+/// failure a "recovery" that cannot survive a restart would produce.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_survives_a_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let fixture = ForegroundFixture::stalled_from_watchdog_in(directory.path()).await;
+    let old_terminal = fixture.previous_terminal_json();
+    let preview = match fixture.prepare_recovery("recover-restart").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let committed = fixture.recover(&preview).unwrap();
+    let successor = committed.successor.attempt_id.clone();
+    drop(fixture);
+
+    let reopened = RuntimeCoordinator::open_with_activation(
+        &database,
+        Arc::new(RecordingFactory),
+        yi_agent_store::foreground::ForegroundActivation::for_test(true),
+    )
+    .expect("the database reopens");
+    let root: TaskId = committed.previous.root_id.parse().unwrap();
+    // Read the durable pointer, not the live supervisor: a reopened daemon has not
+    // hydrated this session yet, and the question is what the database says.
+    assert_eq!(
+        reopened
+            .repository_for_test()
+            .expect("the repository lock is free")
+            .active_attempt_id(&root)
+            .expect("the root row is readable")
+            .to_string(),
+        successor,
+        "the active attempt is the successor after a reopen"
+    );
+    assert_eq!(
+        reopened.task_state(&root).unwrap(),
+        "running",
+        "the root is running, not falsely stalled"
+    );
+    let receipt = reopened
+        .repository_for_test()
+        .expect("the repository lock is free")
+        .foreground_recovery_result(&root, "recover-restart")
+        .expect("the receipt is readable")
+        .expect("the receipt persisted");
+    assert_eq!(receipt.successor.attempt_id, successor);
+    assert_eq!(
+        reopened
+            .repository_for_test()
+            .expect("the repository lock is free")
+            .first_attempt_terminal_json(&root)
+            .expect("the settled attempt is readable")
+            .expect("the settled attempt kept its terminal"),
+        old_terminal,
+        "the old attempt's evidence is history, not something recovery rewrites"
+    );
+}

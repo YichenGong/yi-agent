@@ -6708,3 +6708,107 @@ fn foreground_root_lifecycle_a_record_that_disagrees_about_its_attempt_is_refuse
         "got {error:?}"
     );
 }
+
+/// A recovery over the real socket walks Preparing/Ready then Committed, and the
+/// receipt is readable afterwards.
+///
+/// The wire path is the point: the host talks to the daemon, not to the coordinator,
+/// so an API that only works in-process is not an API. The status read after commit is
+/// what proves the answer to a lost response survives.
+#[test]
+fn foreground_root_lifecycle_recovery_round_trip_on_the_wire() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = foreground_daemon(&directory, &database);
+    let (_session, root_task_id, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let coordinator = daemon.coordinator_for_test();
+    // The original driver binds first, while business authority is still live: the
+    // fence recovery re-points is the one that driver held.
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "pre-recovery-bind".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the original driver binds under business authority");
+    };
+    // A stalled root, imported the way a pre-exemption build would have left it. The
+    // production writer refuses this now, which is exactly why the history needs an
+    // import hook.
+    coordinator
+        .import_stalled_snapshot_for_test(
+            &root_task_id.parse().unwrap(),
+            yi_agent_store::repository::WatchdogEvidence {
+                last_meaningful_event_id: Some(7),
+                last_meaningful_at: chrono::Utc::now(),
+                elapsed_secs: 301,
+                current_wait: None,
+            },
+        )
+        .unwrap();
+    // Recovery authority: the owner is gone, so only a RecoveryOnly install can act.
+    coordinator
+        .install_recovery_authority_for_test(&authorization)
+        .unwrap();
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: binding.fence.clone(),
+        operation_id: "wire-recovery".into(),
+    };
+
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PrepareApplicationRootRecovery {
+            authorization: authorization.clone(),
+            request: request.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("prepare must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) = status else {
+        panic!("the fixture has nothing to stop, so prepare must be ready, got {status:?}");
+    };
+
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::RecoverApplicationRoot {
+            authorization: authorization.clone(),
+            request: request.clone(),
+            confirmation_token: preview
+                .confirmation_token
+                .clone()
+                .expect("a ready preview carries a token"),
+        },
+    )
+    .unwrap() else {
+        panic!("recover must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(result) = status else {
+        panic!("recover must commit, got {status:?}");
+    };
+    assert_eq!(result.operation_id, "wire-recovery");
+
+    // The host lost that answer and asks again. Same receipt, no second attempt.
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::GetApplicationRootRecovery {
+            authorization,
+            root: result.successor.clone(),
+            operation_id: "wire-recovery".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the status query must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(again) = status else {
+        panic!("a committed operation reads back committed, got {status:?}");
+    };
+    assert_eq!(again, result);
+    assert!(
+        starts.lock().unwrap().is_empty(),
+        "recovery must not start a worker"
+    );
+}

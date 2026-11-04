@@ -92,6 +92,26 @@ pub enum IpcRequest {
         authorization: yi_agent_lifecycle::types::RootAuthorization,
         root: yi_agent_lifecycle::foreground::RootRef,
     },
+    /// Freezes and stops a root's executions, then offers a confirmation if proven.
+    ///
+    /// Separate from the commit so the host can show the impact first. Not a model
+    /// tool: the confirmation has to come from a party the user actually sees.
+    PrepareApplicationRootRecovery {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+    },
+    /// Commits a prepared recovery against the confirmation the daemon issued.
+    RecoverApplicationRoot {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+        confirmation_token: yi_agent_lifecycle::foreground::SecretCapability,
+    },
+    /// Reads one recovery operation's state, after re-authenticating the caller.
+    GetApplicationRootRecovery {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        root: yi_agent_lifecycle::foreground::RootRef,
+        operation_id: String,
+    },
     CreateSchedule {
         cron: String,
         objective: String,
@@ -375,6 +395,12 @@ pub enum IpcResponse {
     },
     /// The activity snapshot of a root that has never reported one.
     ForegroundActivityAbsent,
+    /// The state of one recovery operation: preparing, blocked, ready or committed.
+    ForegroundRecovery {
+        status: yi_agent_lifecycle::foreground::RecoveryOperationStatus,
+    },
+    /// No recovery operation exists under that id.
+    ForegroundRecoveryAbsent,
     /// A structured foreground refusal.
     ///
     /// This is a response rather than an `Error` because the client has to dispatch on
