@@ -1192,23 +1192,7 @@ pub fn managed_context() -> Option<&'static ManagedContext> {
 /// When no context was installed this still returns the policy, with `expected: None`
 /// — which is precisely what makes a managed bring-up refuse instead of guess.
 pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
-    // A frontend that installed its own identity has already declared it holds a
-    // lease -- the desktop sidecar, the TUI and headless `run` all install it at
-    // startup, and `yi-agent daemon` does not. Such a process wants the guardian to
-    // own its runtime: one it started itself has no guardian to authorize a root
-    // against, so every foreground turn would fall back to the legacy watchdog and
-    // a long conversation would be settled as a stalled background attempt. That is
-    // the bug this contract exists to fix, and defaulting to `Embedded` here would
-    // leave it unfixed for every user who never set an environment variable.
-    //
-    // `YI_AGENT_BRINGUP` still overrides, in both directions: an explicit value wins
-    // so an operator can pin the old behaviour back on.
-    let policy = match std::env::var("YI_AGENT_BRINGUP").ok().as_deref() {
-        Some("managed") => BringUpPolicy::Managed,
-        Some("embedded") => BringUpPolicy::Embedded,
-        _ if managed_context().is_some() => BringUpPolicy::for_managed_frontend(),
-        _ => BringUpPolicy::default_for_build(),
-    };
+    let policy = BringUpPolicy::from_env();
     match managed_context() {
         Some(context) => crate::binding::BringUpChoice {
             policy,

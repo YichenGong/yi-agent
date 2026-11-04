@@ -173,22 +173,20 @@ fn foreground_root_lifecycle_an_impossible_managed_start_fails_fast() {
     );
 }
 
-/// A frontend that identified itself must default to the managed bring-up.
+/// The two policy decisions stay separable.
 ///
-/// This is the whole point of the fix: the watchdog bug is only absent when a
-/// root is registered as a managed foreground container, and a root can only be
-/// classified that way on a runtime whose guardian can authorize it. A default of
-/// `Embedded` would leave the bug in place for every user who never set
-/// `YI_AGENT_BRINGUP` -- which is everyone.
+/// `default_for_build` answers "what does an unconfigured build do" and must keep
+/// answering `Embedded`, so a manually started `yi-agent daemon` owns its own
+/// runtime. `for_managed_frontend` answers a different question -- "what does a
+/// frontend that registered a lease do" -- and must answer `Managed`, because a
+/// runtime it started itself has no guardian to authorize a root against, so its
+/// foreground turns would fall back to the legacy watchdog and a long conversation
+/// would be reported as a stalled background attempt.
 ///
-/// A separate binary so the process-wide `OnceLock` is not shared with the tests
-/// above: installing a context is deliberately one-shot.
+/// Kept as two assertions rather than one collapsed constant: if these ever become
+/// the same value, a manual daemon silently becomes guardian-owned.
 #[test]
-fn foreground_root_lifecycle_a_self_identified_frontend_defaults_to_managed() {
-    // The policy function reads the installed context, which this harness cannot
-    // install (`install_managed_context` is one-shot per process and other tests in
-    // this binary must run without it). Assert the mapping the function uses instead:
-    // `for_managed_frontend` is what a context-bearing process resolves to.
+fn foreground_root_lifecycle_the_two_policy_decisions_stay_separable() {
     assert_eq!(
         yi_agent_subagent::attach::BringUpPolicy::for_managed_frontend(),
         yi_agent_subagent::attach::BringUpPolicy::Managed,
@@ -198,5 +196,34 @@ fn foreground_root_lifecycle_a_self_identified_frontend_defaults_to_managed() {
         yi_agent_subagent::attach::BringUpPolicy::default_for_build(),
         yi_agent_subagent::attach::BringUpPolicy::Embedded,
         "a manual `yi-agent daemon` must keep owning its own runtime"
+    );
+}
+
+/// An explicit selector overrides in both directions, and an unknown value does not.
+///
+/// The environment variable is the only way an operator can pin behaviour back, so
+/// `embedded` must still be reachable even once the managed path is the supported
+/// one. Tested through `from_value` rather than `from_env` so the mapping can be
+/// checked without mutating a process-global every other test also reads.
+#[test]
+fn foreground_root_lifecycle_an_explicit_selector_wins_both_ways() {
+    use yi_agent_subagent::attach::BringUpPolicy;
+
+    assert_eq!(
+        BringUpPolicy::from_value(Some("managed")),
+        BringUpPolicy::Managed
+    );
+    assert_eq!(
+        BringUpPolicy::from_value(Some("embedded")),
+        BringUpPolicy::Embedded
+    );
+    assert_eq!(
+        BringUpPolicy::from_value(Some("nonsense")),
+        BringUpPolicy::default_for_build(),
+        "an unrecognised selector must not silently opt a build into managed"
+    );
+    assert_eq!(
+        BringUpPolicy::from_value(None),
+        BringUpPolicy::default_for_build()
     );
 }
