@@ -266,9 +266,14 @@ export default function App() {
     onChange: forceSide,
     subscribeParent: (client, parentId) =>
       client.request("thread/subscribe", { threadIds: [parentId] }).then(() => {}),
-    visibleParent:
+    // 完整身份，不是裸 parentId：两个宿主可以各有 `t1`，只按 id 同步会把两边
+    // 的尾帧探测同时打开（见 `useSideConversation` 的 `visible` 说明）。
+    visible:
       sideConversation.active !== null && sideConversation.active.kind === "side"
-        ? sideConversation.active.parentId
+        ? {
+            hostKey: sideConversation.active.hostKey,
+            parentId: sideConversation.active.parentId,
+          }
         : null,
   });
   sideApiRef.current = sideApi;

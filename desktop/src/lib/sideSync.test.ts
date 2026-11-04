@@ -717,6 +717,34 @@ describe("SideSyncController.setVisible", () => {
   });
 });
 
+describe("SideSyncController re-entering a side after a reconnect", () => {
+  it("catches up a lost tail frame without anyone re-entering the view", async () => {
+    // 场景：用户在旁支里，连接断了又回来（控制器重建），期间最后一帧丢了。
+    // 新控制器在**创建时**就被告知可见，所以推进 5 秒后应当发现 last_seq 变化
+    // 并触发全量对账——不需要用户再点一次旁支。
+    vi.useFakeTimers();
+    try {
+      const f = makeSideSyncFixture();
+      await f.controller.reconcile(PARENT);
+      // 服务端已经多了一帧，而本地没收到。
+      f.rpc.mockImplementation(async (method: string) => {
+        if (method === "side/list") {
+          return listResult([{ side_id: SIDE, generation: 1, last_seq: 7 }]);
+        }
+        if (method === "side/readItems") return page({ snapshot_seq: 7 });
+        return {};
+      });
+      // 新控制器一创建就可见（`useSideConversation` 会立刻 setVisible）。
+      f.controller.setVisible(PARENT);
+      await vi.advanceTimersByTimeAsync(5100);
+      const reads = methodsOf(f).filter((m) => m === "side/readItems").length;
+      expect(reads).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("SideSyncController.dispose", () => {
   it("cancels an in-flight reconcile so its baseline never lands", async () => {
     const f = makeSideSyncFixture();
