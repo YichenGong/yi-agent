@@ -324,11 +324,23 @@ pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBu
 /// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
 /// 与是哪个插件无关。
 pub(crate) fn spawn_resident_watch_loop(resident_dir: PathBuf) {
+    // The resident directory *is* the instance home (`paths::instance_home`), so the
+    // retirement marker sits beside the registration it governs. Deriving it instead
+    // of re-reading `YI_AGENT_HOME` also keeps the injected dir used in tests.
+    let instance_home = resident_dir.clone();
     tokio::spawn(async move {
         loop {
-            yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
-                yi_agent_supervisors::watch::ensure_daemons(projects);
-            });
+            // 迁移到 managed 之后这个循环就不再启动 daemon：登记仍然读，但「无人时
+            // 应运行」的旧语义已被 managed 生命周期取代。循环**不退出**，因为迁移
+            // 标记可以在同一进程存活期间写入（用户在 App 里确认迁移），退出会让状态
+            // 永远停在旧判断上。
+            yi_agent_supervisors::watch::once_unattended(
+                &instance_home,
+                &resident_dir,
+                &mut |projects| {
+                    yi_agent_supervisors::watch::ensure_daemons(projects);
+                },
+            );
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });

@@ -32,6 +32,10 @@ struct ProcessStartArgs {
     on_exit: OnExitPolicy,
     ready_pattern: Option<String>,
     ready_timeout_sec: Option<u64>,
+    /// 严格 boolean：缺省为 false。`serde(default)` 只在**字段不存在**时给默认值，
+    /// 显式的 `"true"` / `null` / `1` 仍会被 serde 拒绝（类型不符），这正是要的。
+    #[serde(default)]
+    prevent_idle_sleep: bool,
 }
 
 #[async_trait]
@@ -79,6 +83,11 @@ impl Tool for ProcessStartTool {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Seconds to wait for ready_pattern before returning with a warning."
+                },
+                "prevent_idle_sleep": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Request idle-sleep protection for finite background work while the owning app-server session is alive. Default false; do not enable for persistent servers/watchers. Independent of readiness and on_exit. Other entrypoints only retain this intent; they do not own a sleep assertion."
                 }
             },
             "required": ["command"]
@@ -99,6 +108,7 @@ impl Tool for ProcessStartTool {
             on_exit: args.on_exit,
             ready_pattern: args.ready_pattern,
             ready_timeout_sec: args.ready_timeout_sec,
+            prevent_idle_sleep: args.prevent_idle_sleep,
         };
 
         match self.manager.start(opts).await {
@@ -183,7 +193,7 @@ impl Tool for ProcessReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read buffered stdout and stderr from a managed background process."
+        "Read buffered stdout and stderr from a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder."
     }
 
     fn schema(&self) -> Value {
@@ -255,7 +265,7 @@ impl Tool for ProcessKillTool {
     }
 
     fn description(&self) -> &str {
-        "Kill a managed background process by process_id or name."
+        "Kill a managed background process. Provide exactly one of process_id or name. Omit the other field; do not use an empty string as a placeholder."
     }
 
     fn schema(&self) -> Value {
@@ -304,11 +314,11 @@ fn process_selector_schema(extra_properties: Value) -> Value {
     let mut properties = serde_json::json!({
         "process_id": {
             "type": "string",
-            "description": "Managed process id returned by process_start or process_list."
+            "description": "Optional managed process id returned by process_start or process_list. Provide exactly one of process_id or name; omit name when using process_id."
         },
         "name": {
             "type": "string",
-            "description": "Unique managed process name."
+            "description": "Optional unique managed process name. Provide exactly one of process_id or name; omit process_id when using name."
         }
     });
     if let (Some(base), Some(extra)) = (properties.as_object_mut(), extra_properties.as_object()) {
@@ -319,7 +329,8 @@ fn process_selector_schema(extra_properties: Value) -> Value {
 
     serde_json::json!({
         "type": "object",
-        "properties": properties
+        "properties": properties,
+        "required": []
     })
 }
 
@@ -402,6 +413,159 @@ mod tests {
         assert!(text(&result).contains("max_bytes must be greater than 0"));
     }
 
+    #[tokio::test]
+    async fn process_selector_argument_contract() {
+        // 四种合法 kill 输入各用独立 manager/进程，不复用已终止实例。
+        for kill_case in ["name", "id", "name-with-null", "id-with-null"] {
+            let temp = TempDir::new().unwrap();
+            let manager = ProcessManager::new(temp.path().to_path_buf());
+            let start = ProcessStartTool::new(manager.clone());
+            let read = ProcessReadTool::new(manager.clone());
+            let kill = ProcessKillTool::new(manager.clone());
+            let started = start
+                .call(serde_json::json!({
+                    "command": "printf selector-ready; sleep 30",
+                    "name": "selector-contract",
+                    "ready_pattern": "selector-ready",
+                    "ready_timeout_sec": 5
+                }))
+                .await;
+            assert!(!started.is_error, "{}", text(&started));
+            let started_json: Value = serde_json::from_str(text(&started)).unwrap();
+            assert_eq!(started_json["ready"], true);
+            let id = started_json["process_id"].as_str().unwrap().to_owned();
+
+            let valid_reads = [
+                serde_json::json!({"process_id": id}),
+                serde_json::json!({"name": "selector-contract"}),
+                serde_json::json!({"process_id": id, "name": null}),
+                serde_json::json!({"name": "selector-contract", "process_id": null}),
+            ];
+            for args in valid_reads {
+                let result = read.call(args).await;
+                assert!(!result.is_error, "{}", text(&result));
+                let output: Value = serde_json::from_str(text(&result)).unwrap();
+                assert_eq!(output["process_id"], id);
+                assert_eq!(output["stdout"], "selector-ready");
+            }
+
+            // want 是手工选择的错误类别；不从被测函数计算期望。
+            let invalid = [
+                (serde_json::json!({}), "exactly one"),
+                (
+                    serde_json::json!({"process_id": null, "name": null}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": id, "name": "selector-contract"}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": "", "name": "selector-contract"}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": id, "name": ""}),
+                    "exactly one",
+                ),
+                (
+                    serde_json::json!({"process_id": "", "name": ""}),
+                    "exactly one",
+                ),
+                (serde_json::json!({"process_id": ""}), "process not found"),
+                (serde_json::json!({"name": ""}), "process not found"),
+            ];
+            for (args, want) in invalid {
+                let before = manager
+                    .list()
+                    .into_iter()
+                    .find(|p| p.process_id == id)
+                    .unwrap();
+                let read_result = read.call(args.clone()).await;
+                assert!(read_result.is_error, "read accepted {args}");
+                assert!(text(&read_result).contains(want), "{}", text(&read_result));
+                let kill_result = kill.call(args.clone()).await;
+                assert!(kill_result.is_error, "kill accepted {args}");
+                assert!(text(&kill_result).contains(want), "{}", text(&kill_result));
+                let after = manager
+                    .list()
+                    .into_iter()
+                    .find(|p| p.process_id == id)
+                    .unwrap();
+                assert_eq!(
+                    after.status, before.status,
+                    "invalid kill changed status: {args}"
+                );
+                assert_eq!(after.pid, before.pid);
+                assert_eq!(after.ready, before.ready);
+                let still_readable = read.call(serde_json::json!({"process_id": id})).await;
+                assert!(!still_readable.is_error, "{}", text(&still_readable));
+                let output: Value = serde_json::from_str(text(&still_readable)).unwrap();
+                assert_eq!(output["stdout"], "selector-ready");
+            }
+
+            let kill_args = match kill_case {
+                "name" => serde_json::json!({"name": "selector-contract"}),
+                "id" => serde_json::json!({"process_id": id}),
+                "name-with-null" => {
+                    serde_json::json!({"name": "selector-contract", "process_id": null})
+                }
+                "id-with-null" => serde_json::json!({"process_id": id, "name": null}),
+                _ => unreachable!(),
+            };
+            let killed = kill.call(kill_args).await;
+            assert!(!killed.is_error, "{}", text(&killed));
+            let snapshot = manager
+                .list()
+                .into_iter()
+                .find(|p| p.process_id == id)
+                .unwrap();
+            assert_eq!(
+                snapshot.status,
+                crate::process::manager::ProcessStatus::Killed
+            );
+            manager.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn process_selector_schema_contract() {
+        let temp = TempDir::new().unwrap();
+        let manager = ProcessManager::new(temp.path().to_path_buf());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ProcessReadTool::new(manager.clone())),
+            Box::new(ProcessKillTool::new(manager)),
+        ];
+        for tool in tools {
+            let schema = tool.schema();
+            assert_eq!(schema["type"], "object", "{}", tool.name());
+            assert_eq!(schema["required"], serde_json::json!([]), "{}", tool.name());
+            assert!(
+                tool.description().contains("exactly one"),
+                "{}",
+                tool.name()
+            );
+            assert!(tool.description().contains("Omit"), "{}", tool.name());
+            assert!(
+                tool.description().contains("empty string"),
+                "{}",
+                tool.name()
+            );
+            for (field, other) in [("process_id", "name"), ("name", "process_id")] {
+                assert_eq!(schema["properties"][field]["type"], "string");
+                let description = schema["properties"][field]["description"]
+                    .as_str()
+                    .expect("field description");
+                assert!(description.contains("Optional"), "{}.{field}", tool.name());
+                assert!(description.contains("omit"), "{}.{field}", tool.name());
+                assert!(description.contains(other), "{}.{field}", tool.name());
+            }
+            for key in ["oneOf", "anyOf", "allOf", "not", "enum", "const"] {
+                assert!(schema.get(key).is_none(), "{}: {key}", tool.name());
+            }
+        }
+    }
+
     #[test]
     fn process_selector_schemas_are_openai_compatible() {
         let temp = TempDir::new().unwrap();
@@ -444,5 +608,67 @@ mod tests {
         let kill = ProcessKillTool::new(Arc::clone(&manager)).metadata();
         assert!(kill.requires_confirmation);
         assert!(!kill.read_only);
+    }
+}
+
+#[cfg(test)]
+mod sleep_hardening_tests {
+    use serde_json::json;
+    use yi_agent_core::Tool;
+
+    use super::{ProcessStartArgs, ProcessStartTool};
+    use crate::process::manager::ProcessManager;
+
+    /// B1：schema 暴露一个**可选**、默认 false 的严格 boolean。
+    #[test]
+    fn sleep_hardening_schema_exposes_explicit_boolean() {
+        let tool = ProcessStartTool::new(ProcessManager::new(std::env::temp_dir()));
+        let schema = tool.schema();
+        assert_eq!(
+            schema["properties"]["prevent_idle_sleep"]["type"],
+            "boolean"
+        );
+        assert_eq!(schema["properties"]["prevent_idle_sleep"]["default"], false);
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "prevent_idle_sleep"),
+            "the intent must stay optional"
+        );
+    }
+
+    /// B1：省略 / false / true 分别是 false / false / true。
+    #[test]
+    fn sleep_hardening_omitted_false_true_deserialize_as_expected() {
+        let omitted: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1" })).unwrap();
+        assert!(!omitted.prevent_idle_sleep);
+
+        let explicit_false: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1", "prevent_idle_sleep": false }))
+                .unwrap();
+        assert!(!explicit_false.prevent_idle_sleep);
+
+        let explicit_true: ProcessStartArgs =
+            serde_json::from_value(json!({ "command": "sleep 1", "prevent_idle_sleep": true }))
+                .unwrap();
+        assert!(explicit_true.prevent_idle_sleep);
+    }
+
+    /// B1：非 boolean 一律拒绝，而不是被宽松地转成 true/false。
+    #[test]
+    fn sleep_hardening_non_boolean_is_rejected() {
+        for bad in [json!("true"), json!(null), json!(1)] {
+            let parsed: Result<ProcessStartArgs, _> = serde_json::from_value(json!({
+                "command": "sleep 1",
+                "prevent_idle_sleep": bad,
+            }));
+            assert!(
+                parsed.is_err(),
+                "prevent_idle_sleep={bad} must be rejected, not coerced"
+            );
+        }
     }
 }

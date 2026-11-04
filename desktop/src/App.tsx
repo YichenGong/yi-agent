@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
@@ -125,6 +126,11 @@ import {
 } from "./lib/contentStore";
 import { resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
+import { useRuntimeLease } from "./hooks/useRuntimeLease";
+import { localRuntimeControl } from "./lib/runtimeLifecycle";
+import { useRuntimeScopeKey } from "./hooks/useRuntimeLifecycle";
+import { RuntimeVersionBanner } from "./components/RuntimeVersionBanner";
+import { wantedProjects } from "./lib/runtimeLease";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
 
@@ -601,6 +607,51 @@ export default function App() {
     initialListCache,
     pairingVersion: prefs.pairingVersion,
   });
+  /**
+   * 本机项目租约跟随「用户真的在用哪个项目」，而不是侧栏里出现过什么。
+   *
+   * 判据在 `lib/runtimeLease.ts`（纯函数、有测试）：当前打开的会话所在项目，
+   * 加上任何仍在跑（或等审批）的会话所在项目。历史上出现过但没工作的项目会
+   * 在离开时释放，不让一个没人用的运行时被永远保活。
+   *
+   * 远端网页客户端没有本机壳、也没有自己的侧车，故整块在 hook 内部短路。
+   */
+  const leaseThreads = store.ids().flatMap((id) => {
+    const view = store.peek(id);
+    const cwd = view?.info?.cwd;
+    return cwd ? [{ cwd, status: view?.status }] : [];
+  });
+  const leaseActiveProject = store.current()?.info?.cwd ?? null;
+  useRuntimeLease({
+    activeProject: leaseActiveProject,
+    threads: leaseThreads,
+    revision: wantedProjects({
+      activeProject: leaseActiveProject,
+      threads: leaseThreads,
+    }).join("\n"),
+  });
+
+  // 运行时版本生命周期（状态横幅 / 预览 / 确认 / 轮询）整体在 hook 与
+  // `lib/runtimeLifecycle.ts` 里，见那两处注释：控制面刻意不走 `RpcClient`，
+  // 免得确认请求被重连重放成第二次重启。
+  //
+  // 远端客户端没有本机控制通道，故不给 control。
+  const runtimeControl = useMemo(
+    () => (isRemoteClient() ? null : localRuntimeControl()),
+    [],
+  );
+  // scope key 只由壳解析（见 `useRuntimeScopeKey`）：WebView 自己拼 canonical
+  // 路径可能与壳不一致，从而指向一个壳从未打开过的 scope。
+  const runtimeScopeKey = useRuntimeScopeKey(leaseActiveProject, runtimeControl !== null);
+
+  // 操作 id 记在壳里（确认请求的发起方），所以重载页面恢复的是同一次操作，
+  // 也不会把上一次运行留下的 id 误当成本次的。
+  const readRuntimeOperationId = useCallback(
+    async (key: string) =>
+      (await invoke<string | null>("runtime_active_operation", { scopeKey: key })) ?? null,
+    [],
+  );
+
   // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
   // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
   // 由下面切 Tab 与 `selectThread` 几处调用点自己收起详情。
@@ -1236,6 +1287,9 @@ export default function App() {
       }>("thread/resume", {
         threadId: id,
       });
+      // resume 回包意味着历史回放已结束；附属列表刷新不属于内容加载，
+      // 必须在等待它之前停机，否则慢 listAll 会把已加载的内容反向判失败。
+      watchdog.stop();
       const replayed = replaySession.endReplay();
       // 只有真收到过回放帧才允许删项。空集是不能下「服务端没有这些 item」结论的：
       // 它既可能是「服务端历史本来就空」，也可能是「这趟 resume 压根没投递帧」。
@@ -1272,12 +1326,17 @@ export default function App() {
         typeof resumed.reasoning_effort === "string"
           ? resumed.reasoning_effort
           : null;
-      // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
-      // 不把已确定的模式打回 null。
-      const gs = await sess.refreshThreads();
-      if (gs !== null)
-        view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
+      // listAll 只是附属兜底，不能阻塞内容同步收尾或连接握手。
+      // 重连/删除后晚到的列表也不能再修改旧视图。
       force((v) => v + 1);
+      void sess.refreshThreads().then((gs) => {
+        if (gs !== null && clientRef.current === c && store.peek(id) === view) {
+          view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
+          force((v) => v + 1);
+        }
+      }).catch(() => {
+        // 内容已成功加载；附属刷新失败不能将其标为同步失败。
+      });
     } catch (e) {
       replaySession.endReplay();
       // 失败路径只在视图仍存在时构造文案，避免 re-create 一个已被 drop 的
@@ -3336,6 +3395,14 @@ export default function App() {
                   </div>
                 </div>
               </div>
+            )}
+            {/* 运行时版本横幅：与本功能无关，来自 main 的 daemon 生命周期计划。 */}
+            {runtimeScopeKey !== null && runtimeControl !== null && (
+              <RuntimeVersionBanner
+                scopeKey={runtimeScopeKey}
+                control={runtimeControl}
+                readOperationId={readRuntimeOperationId}
+              />
             )}
             <ApprovalBanner
               items={bannerItems}

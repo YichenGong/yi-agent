@@ -4,6 +4,7 @@ import {
   isActive,
   partitionProcesses,
   processDisplayName,
+  requestsIdleSleepPrevention,
   statusColor,
   statusLabel,
 } from "./processes";
@@ -74,5 +75,48 @@ describe("processes folding", () => {
   it("formats elapsed seconds with one decimal", () => {
     expect(formatElapsed(1.54)).toBe("1.5s");
     expect(formatElapsed(0)).toBe("0.0s");
+  });
+});
+describe("prevent_idle_sleep backward compatibility", () => {
+  it("reads a missing field (old sidecar) as false", () => {
+    // 原有无字段 fixture：旧 sidecar 不返回该键。
+    const legacy = p("p1", "running");
+    expect(legacy.prevent_idle_sleep).toBeUndefined();
+    expect(requestsIdleSleepPrevention(legacy)).toBe(false);
+  });
+
+  it("keeps explicit false and true distinct", () => {
+    expect(
+      requestsIdleSleepPrevention({ ...p("p1", "running"), prevent_idle_sleep: false }),
+    ).toBe(false);
+    expect(
+      requestsIdleSleepPrevention({ ...p("p1", "running"), prevent_idle_sleep: true }),
+    ).toBe(true);
+  });
+
+  it("carries true and false through the partition unchanged", () => {
+    const optedIn = { ...p("p1", "running"), prevent_idle_sleep: true };
+    const optedOut = { ...p("p2", "running"), prevent_idle_sleep: false };
+    const { active } = partitionProcesses([optedIn, optedOut]);
+    expect(active.map(requestsIdleSleepPrevention)).toEqual([true, false]);
+    // 原显示契约不变：同一个 state 仍然归到同一组、同一个名字。
+    expect(active.map((info) => processDisplayName(info))).toEqual(["p1", "p2"]);
+  });
+
+  it("reads process/read results with the same rule", () => {
+    const legacyRead = {
+      process_id: "p1",
+      name: null,
+      stdout: "",
+      stderr: "",
+      next_cursor: 0,
+      truncated: false,
+      status: st("running"),
+      ready: true,
+    };
+    expect(requestsIdleSleepPrevention(legacyRead)).toBe(false);
+    expect(
+      requestsIdleSleepPrevention({ ...legacyRead, prevent_idle_sleep: true }),
+    ).toBe(true);
   });
 });

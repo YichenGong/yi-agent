@@ -171,6 +171,9 @@ where
             build_agent,
             serve_scopes,
             serve_initialized,
+            // 纯 ws 路径没有本地 stdio 客户端,永远不会有壳授权落表;给一张
+            // 空表即可（写入路径由 `initialize` 里的「仅 stdio」判定把关）。
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 纯 ws 路径无 stdio 读端,故无 EOF 观察者。
             None,
             // 纯 ws 入口没有 `--relay`:它是「别人连进来」的入口,不是中继客户

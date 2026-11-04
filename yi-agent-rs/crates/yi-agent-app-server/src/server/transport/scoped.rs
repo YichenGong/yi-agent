@@ -13,11 +13,12 @@ use yi_agent_runtime::config::RuntimeConfig;
 
 // 这些项仍由 `server.rs`（或其子模块经其 re-export）提供。
 use crate::server::{
-    BuiltAgent, ClientInitialized, ClientScopes, PERMISSION_TIMEOUT, ProjectRuntimes,
-    RuntimeAttachments, ThreadRoots, home_dir, install_device_registry, instance_home_dir,
-    migrate_legacy_model_keys_on_startup, migrate_legacy_resident_requests_on_startup,
-    production_factory, production_watchman_install, production_watchman_uninstall, pump_stdout,
-    read_lines, serve, skills_home_dir, spawn_resident_watch_loop,
+    BuiltAgent, ClientInitialized, ClientScopes, ClientShellAuthorizations, PERMISSION_TIMEOUT,
+    ProjectRuntimes, RuntimeAttachments, ThreadRoots, home_dir, install_device_registry,
+    instance_home_dir, migrate_legacy_model_keys_on_startup,
+    migrate_legacy_resident_requests_on_startup, production_factory, production_watchman_install,
+    production_watchman_uninstall, pump_stdout, read_lines, serve, skills_home_dir,
+    spawn_resident_watch_loop,
 };
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
@@ -356,6 +357,8 @@ where
     let client_scopes: ClientScopes =
         Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
     let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
+    let client_shell_authorizations: ClientShellAuthorizations =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // ---------- 合并模式:把一条环回 ws 前端(与可选的中继客户端)接到同一个
     // `serve()` 上。`listener` 为 `None` 时以下整块都跳过,纯 stdio 因此与改造前
@@ -433,6 +436,7 @@ where
         build_agent,
         client_scopes,
         client_initialized,
+        client_shell_authorizations,
         stdio_eof_rx.take(),
         relay_url_for_targets,
     )

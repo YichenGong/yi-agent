@@ -91,10 +91,22 @@ async fn bridge_app(relay: Arc<Relay>, session: String, socket: WebSocket) {
     tracing::info!(%session, "app connected");
     let (out_tx, out_rx) = mpsc::channel::<Message>(ENDPOINT_QUEUE);
     let (in_tx, in_rx) = mpsc::channel::<Message>(INBOUND_QUEUE);
-    let relay_task = tokio::spawn(async move { relay.attach_app(session, out_tx, in_rx).await });
-    let (read, write) = split_bridge(socket, in_tx, out_rx);
-    let _ = tokio::join!(read, write);
-    relay_task.abort();
+    let mut relay_task =
+        tokio::spawn(async move { relay.attach_app(session, out_tx, in_rx).await });
+    let (mut read, mut write) = split_bridge(socket, in_tx, out_rx);
+    // 任一半退出（包括慢消费者被路由层关闭），都必须结束整个 socket。
+    // join!(read, write) 会永久等待仍健康的读半，手机因此看不到断线。
+    tokio::select! {
+        _ = &mut read => {},
+        _ = &mut write => {},
+        _ = &mut relay_task => {},
+    }
+    read.abort();
+    write.abort();
+    // 读泵退出会关闭 from_app；让 attach_app 正常收尾、摘掉自己的登记。
+    if !relay_task.is_finished() {
+        let _ = relay_task.await;
+    }
 }
 
 /// 把一条 socket 拆成「读 → `in_tx`」与「`out_rx` → 写」两半。

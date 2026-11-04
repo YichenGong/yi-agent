@@ -23,8 +23,11 @@
 - [x] `assertion` IOKit `PreventUserIdleSystemSleep`，`Drop` 幂等释放；
       非 macOS no-op。验证：`cargo test -p yi-agent-power assertion`；
       真机 `cargo test -p yi-agent-power assertion -- --ignored`
-- [x] `probe` 电源（UPS/未知算插电）与网络（候选接口 + 网关探测，
-      `ECONNREFUSED` 计为在线）。验证：`cargo test -p yi-agent-power probe`
+- [x] `probe` 电源（UPS/未知算插电）与网络**被动双栈资格**（2026-11-03 起：
+      一次 `getifaddrs` 快照，不再 `route`/TCP 80 主动探测）。三态
+      `NetworkState::{Online,Offline,Unknown}`：`Unknown`（采样失败，无可信快照）
+      也提供资格，成功但无合格接口才是 `Offline`。验证：
+      `cargo test -p yi-agent-power probe`
 - [x] `supervisor` 10s 拍状态机，只在迁移边沿调 FFI（`Hold` 边沿才
       `acquire`，`Idle` 与 `Drop` 都 `release`）。验证：
       `cargo test -p yi-agent-power supervisor`
@@ -56,6 +59,106 @@
     文件外面。判据 `cargo test -p yi-agent-runtime power_windows`
   - 前端分组：`desktop/src/components/SettingsRuntimeTab.tsx`；判据
     `npx vitest run src/components/SettingsRuntimeTab.test.tsx`
+
+## 待实现加固（2026-11-03）
+
+设计：[任务运行防休眠加固 spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)；
+计划：[实施 plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md)。仅文档审查完成，以下产品需求尚未实现。
+
+- [x] P1 被动双栈链路资格，移除 route/TCP 80 判据。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-power sleep_hardening_` 19 项，其中
+      `probe::tests::sleep_hardening_ipv6_only_is_online` /
+      `_usable_single_addresses_are_online`（v4 公网、v4 私网、v6 global、v6 ULA）/
+      `_unusable_addresses_do_not_qualify`（N3 地址）/ `_interfaces_without_a_live_link_are_offline`
+      （N4 DOWN、只有 UP、loopback、utun/awdl/llw/bridge）/
+      `_successful_empty_snapshot_is_offline`（N5）/ `_sockaddr_in_bytes_round_trip`、
+      `_sockaddr_in6_bytes_round_trip`、`_same_interface_keeps_both_families`、
+      `_snapshot_holder_releases_exactly_once`（N7）/
+      `supervisor::tests::sleep_hardening_unknown_network_still_holds`、
+      `_unknown_does_not_bypass_the_other_conditions`、
+      `_offline_network_releases_after_the_grace`、
+      `_entered_unknown_logs_only_on_the_edge`、`_unknown_edge_after_recovery_logs_again`（N8）。
+      保 API 变异证据：把 `network_state` 改成只认 IPv4（旧 `has_v4` 行为）后，
+      `sleep_hardening_ipv6_only_is_online`、`_usable_single_addresses_are_online`、
+      `_one_qualifying_interface_is_enough` 三条失败（`2001:db8::1234 alone must be online`），
+      恢复后 19/19 绿。
+      词义边界：资格 = **本机存在可用本地链路**，不表示互联网/provider 可达；局域网有地址、
+      上游断开时仍保活。虚拟/旁路前缀（utun/awdl/llw/bridge/anpi/ap/tun/tap/docker/br-/veth/virbr/lo）
+      保持原规则——当它们是唯一出口时仍判 Offline，本轮不解决该拓扑。
+      真机网络边界（IPv6-only、网关 80 丢包、Wi-Fi 断开）仍待 Task 7 人工验收。
+- [x] P2 RPC/插件/cold lead 启动失败按 turn_id 回滚并收口。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-app-server --lib sleep_hardening_` 17 项；
+      共享收口在 `crates/yi-agent-app-server/src/server/turn/failure.rs`
+      （`rollback_turn` 按 `active_turn_id` 身份回滚、`fail_announced_turn` 一次
+      `now_millis` 同时落完成水位与广播 failed、通知/落盘失败不阻止内存回滚）。
+      - RPC（T1–T3/T7）：`turn::failure_tests::sleep_hardening_rpc_start_with_closed_receiver_settles_once`
+        （真实关掉的 receiver → 成功响应仍在、failed 恰一次、无第二个同 id 响应、
+        回 Idle 且 `local_busy` 为 false；基线该测试红）、
+        `..._rollback_by_identity_spares_the_new_turn` / `..._rollback_clears_its_own_placeholder`、
+        `..._failed_completion_matches_the_stored_watermark`、
+        `..._store_failure_still_rolls_back` / `..._notify_failure_still_rolls_back`。
+      - 出站注入（T2）：`..._opening_failure_settles_the_turn` /
+        `..._running_failure_settles_the_turn` / `..._response_failure_settles_the_turn`
+        复用同一 `start_turn_core_inner`，仅 `fault: Option<StartStage>` 不同。
+      - 插件 / cold lead / warm（T4–T6）：
+        `session_driver_tests::sleep_hardening_launch_prompt_failure_settles_the_announced_turn`、
+        `..._cold_lead_prompt_failure_rolls_back_without_fabricating_events`、
+        `..._warm_append_failure_leaves_the_live_turn_alone`。
+      变异证据：send 失败只清占位不发 failed → T1 红（断言 "the session must return to Idle"）；
+      `rollback_turn` 去掉身份比较 → `..._by_identity_spares...` 红；
+      水位改用 `now_millis()+1` → `..._matches_the_stored_watermark` 红；
+      删 cold lead 的 `rollback_turn` → T5 红；插件改回"只广播不写水位" → T4 红。
+      真机/IOKit 无关；warm 排队语义未改。
+- [x] P3 一致输入与可通知电源线程、真实已持断言停机测试。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-app-server --lib sleep_hardening_` 6 项
+      （`power_guard::tests::sleep_hardening_` 前缀）：
+      `drop_releases_once_without_waiting_a_tick`（G1：enabled=true 且已 acquire 后 Drop，
+      预算 1 秒、release 恰一次）/ `disable_wakes_the_worker_and_skips_the_grace`（G2）/
+      `drop_during_a_blocked_tick_waits_then_stops`（G3：Barrier 卡住一次本地调用后
+      另线程 Drop，调用返回后不再新拍、释放一次）/
+      `repeated_identical_updates_do_not_tick`（G4：100 次相同 update 不额外 tick）/
+      `grace_changes_reach_the_policy`（G5）/ `spawn_and_drop_are_bounded`。
+      实现：`PowerGuard::spawn(enabled, grace_secs)` + `update(busy, enabled, grace_secs)`
+      一次提交一致快照；`Mutex<GuardInputs>` + `Condvar::wait_timeout_while`，
+      谓词同时处理「输入换版 / stop / 伪唤醒」，锁不跨任何 probe 或 FFI。
+      变异证据：`update` 去掉 `notify_one` → `repeated_identical_updates_do_not_tick` 红；
+      等待改回纯 `wait_timeout`（忽略谓词）→ `disable_wakes...`（"disable must release
+      immediately"）与 `grace_changes...`（Timeout）红；恢复后 6/6 绿。
+      预算语义：1 秒/2 秒是**测试预算**，不是 OS 调度或系统调用永不挂起的硬实时承诺；
+      stop 落进一次正在执行的本地 tick 时，join 等该调用返回。
+      真机 `#[ignore] disabling_the_guard_releases_the_real_assertion` 仍需手动
+      `--ignored` 跑并配合 Task 7 人工验收，本轮不声称 IOKit 实证。
+- [x] P4 显式后台进程意图，默认 false、活跃才参与 busy。完成判据（自动化已通过）：
+      `cargo test -p yi-agent-tools --lib sleep_hardening` 6 项 +
+      `cargo test -p yi-agent-app-server --lib sleep_hardening_`（含 `power_busy`
+      与 `server::tests::process`）+ `cargo test -p yi-agent-power --lib
+      sleep_hardening_background`；desktop `npx tsc --noEmit` 与
+      `npx vitest run`（2049 passed）。
+      - B1：`process::tools::sleep_hardening_tests::sleep_hardening_schema_exposes_explicit_boolean`、
+        `..._omitted_false_true_deserialize_as_expected`、`..._non_boolean_is_rejected`
+        （`"true"` / `null` / `1` 全部拒绝）。
+      - B2/B3/B4：`process::manager::sleep_hardening_tests::sleep_hardening_predicate_covers_every_status`
+        （6 态逐一；终态仍保留原意图）、`..._gated_process_reports_the_intent_end_to_end`
+        （临时文件门闩的有限后台工作：Ready 时 `list`/`read`/`start` 都读回 true，
+        写门闩后有界等到终态、谓词变 false）、`..._default_false_process_is_not_busy`。
+      - B5/B6/B8：`power_busy::tests::sleep_hardening_idle_session_with_background_work_is_busy`
+        （会话 Idle/无 turn，仅因 opted-in 后台上限任务判 busy；终态后回 false；
+        删会话后不再聚合）、`..._with_opted_out_work_is_not_busy`。
+      - B6 宽限边界：`supervisor::tests::sleep_hardening_background_busy_follows_the_grace_boundary`
+        （FakeClock：两拍 Hold、宽限 899s 仍持、恰 900s 释放、另一路 busy 仍 true 则不释放）。
+      - B7：`server::tests::process::sleep_hardening_process_dtos_expose_the_retained_intent`
+        （`process/list` 与 `process/read` 都带 true/false；缺省读回 false），
+        desktop `src/lib/processes.test.ts` 的 "prevent_idle_sleep backward
+        compatibility" 两个用例（旧 sidecar 缺字段 ⇒ `?? false` 为 false）。
+      变异证据：去掉 `local_busy` 的 `has_sleep_preventing_processes()` → B5 红；
+      `ProcessStartOptions` 丢 `prevent_idle_sleep` 字段 → 端到端读回红。
+      实现：`ProcessStartOptions` / `ManagedProcess` / `ManagedProcessSnapshot` /
+      `ProcessStartResult` / `ProcessReadResult` 都携带意图，只在构造时写、
+      不按状态改写；`ProcessManager::has_sleep_preventing_processes` 只遍历内存表
+      （Starting/Running/Ready），主循环 10s 采样不变。desktop 两个手写 DTO 加
+      `prevent_idle_sleep?: boolean`，当前无 UI 消费者。
+
+这四项只在本模块计数，tools/app-server 交叉引用不重复增加需求数。通过 spec/plan 不表示产品修复；原已完成项记录基线行为，实施后再同步替换旧探针说明。
 
 ## 非目标
 

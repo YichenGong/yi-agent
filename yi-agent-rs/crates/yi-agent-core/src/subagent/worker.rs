@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -281,6 +282,122 @@ mod tests {
     }
 }
 
+/// Proof that an execution unit's thread has actually joined.
+///
+/// This is deliberately *not* derived from what the worker reports about itself.
+/// A worker saying `Completed` says its agent loop is done; its thread may still
+/// be unwinding, and the process group, tools, and provider stream it owns may
+/// still be alive. Only the observer that owns the join handle can mint this
+/// proof, after the join returned -- normally, or having caught a panic.
+///
+/// The proof is minted by a drop guard rather than by the worker's last
+/// statement, so unwinding also produces it. If the observer itself dies and
+/// never joins, nobody mints it and [`WorkerHandle::execution_stopped`] stays
+/// false, which is the safe direction: an unconfirmed stop must never release a
+/// running lease.
+#[derive(Debug)]
+pub struct StopWitness {
+    stopped: Arc<AtomicBool>,
+}
+
+impl StopWitness {
+    /// Creates the witness/confirmation pair. Only the returned witness can
+    /// report a stop; the handle holds only the read side.
+    pub fn pair() -> (Self, StopConfirmation) {
+        let stopped = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                stopped: Arc::clone(&stopped),
+            },
+            StopConfirmation {
+                stopped,
+                gate: None,
+            },
+        )
+    }
+
+    /// Records that the observed execution has finished.
+    pub fn mark_joined(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// A witness for an execution that never produced a live thread.
+    ///
+    /// Two legitimate uses: a worker that failed before starting, and tests
+    /// driving the handle directly. A production factory never calls this; it
+    /// spawns an observer that joins the real thread.
+    pub fn already_joined() -> Self {
+        let (witness, _confirmation) = Self::pair();
+        witness.mark_joined();
+        witness
+    }
+}
+
+/// Read side of the stop proof, held by the worker handle.
+#[derive(Clone)]
+pub struct StopConfirmation {
+    stopped: Arc<AtomicBool>,
+    /// A second, independent piece of evidence that must also hold.
+    ///
+    /// A worker's join proves its own task ended; it does not prove the process
+    /// groups its tools started are gone. Those are two different facts, and a
+    /// shell that forked a background job is exactly where they disagree: the task
+    /// joins while the job keeps running. Where a caller can consult the guardian,
+    /// it installs that check here, and "stopped" then means both.
+    ///
+    /// Absent for a runtime with no guardian to ask, where the join is all the
+    /// evidence that exists.
+    gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for StopConfirmation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopConfirmation")
+            .field("joined", &self.stopped.load(Ordering::Acquire))
+            .field("gated", &self.gate.is_some())
+            .finish()
+    }
+}
+
+impl StopConfirmation {
+    pub fn is_stopped(&self) -> bool {
+        if !self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        match &self.gate {
+            Some(gate) => gate(),
+            None => true,
+        }
+    }
+
+    /// Requires `gate` to hold as well before this confirmation reports stopped.
+    ///
+    /// Shares the join flag, so installing a gate never loses a stop that already
+    /// happened. Multiple calls compose: every gate must hold.
+    pub fn also_requiring(&self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> StopConfirmation {
+        let previous = self.gate.clone();
+        StopConfirmation {
+            stopped: Arc::clone(&self.stopped),
+            gate: Some(match previous {
+                None => gate,
+                Some(previous) => Arc::new(move || previous() && gate()),
+            }),
+        }
+    }
+
+    /// A proof that can never be satisfied.
+    ///
+    /// Used when the observer was lost before its proof could be captured. It
+    /// keeps the caller from mistaking "no observer" for "already stopped" and
+    /// freeing a lease that may still be in use.
+    pub fn never() -> Self {
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            gate: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerHandle {
     cancellation: CancellationToken,
@@ -290,6 +407,7 @@ pub struct WorkerHandle {
     trace_events: Arc<Mutex<Vec<TraceFact>>>,
     messages: Arc<Mutex<VecDeque<WorkerMessage>>>,
     message_updates: watch::Sender<u64>,
+    stop_confirmation: StopConfirmation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,9 +505,16 @@ pub enum WorkerWatchdogEvent {
 }
 
 impl WorkerHandle {
+    /// A handle that reports **no** stop evidence.
+    ///
+    /// Deliberately not the default: a worker whose execution nobody observed
+    /// must keep its lease, so callers that really do own a join must say so via
+    /// [`Self::with_confirmation`]. Reporting `stopped` by default would let a
+    /// fabricated terminal state free a live lease.
     pub fn new(cancellation: CancellationToken) -> Self {
         let (message_updates, _) = watch::channel(0_u64);
         let (pause_updates, _) = watch::channel(false);
+        let (_witness, confirmation) = StopWitness::pair();
         Self {
             cancellation,
             pause_updates,
@@ -398,7 +523,28 @@ impl WorkerHandle {
             trace_events: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(VecDeque::new())),
             message_updates,
+            stop_confirmation: confirmation,
         }
+    }
+
+    /// Attaches the stop proof produced by the observer that owns the join.
+    pub fn with_confirmation(mut self, confirmation: StopConfirmation) -> Self {
+        self.stop_confirmation = confirmation;
+        self
+    }
+
+    /// Whether an observer has confirmed the execution actually joined.
+    ///
+    /// `false` means "no evidence", not "still running": the observer may simply
+    /// not have reported yet. Callers must not read this as failure.
+    pub fn execution_stopped(&self) -> bool {
+        self.stop_confirmation.is_stopped()
+    }
+
+    /// The read side of the stop proof, for a caller that must keep it after the
+    /// handle is dropped.
+    pub fn stop_confirmation(&self) -> StopConfirmation {
+        self.stop_confirmation.clone()
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -554,6 +700,22 @@ impl WorkerHandle {
             .push_back(message);
         self.message_updates
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+    }
+
+    /// Requeues an event that a transport delivered.
+    ///
+    /// Used when a worker's execution lives in another process: the transport
+    /// reconstructs the event and hands it back here, so the coordinator keeps
+    /// reading one buffer regardless of where the worker ran. Deliberately the
+    /// same funnel as a locally reported event -- there must not be a second,
+    /// differently-behaving path into the queue.
+    pub fn report_transported_event(&self, event: WorkerEvent) {
+        self.report(event);
+    }
+
+    /// Records a watchdog fact that a transport delivered.
+    pub fn report_transported_watchdog(&self, event: WorkerWatchdogEvent) {
+        self.report_watchdog(event);
     }
 
     fn report(&self, event: WorkerEvent) {
@@ -759,5 +921,144 @@ pub trait AgentWorkerFactory: Send + Sync {
         _gate: Option<Arc<dyn ProviderTurnGate>>,
     ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
         self.start(request)
+    }
+}
+
+#[cfg(test)]
+mod stop_confirmation_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A worker that reports a terminal state about itself must not thereby prove
+    /// that its thread stopped. This is the failure the temporary `cancelled`
+    /// servant helper in the settle-race tests was introduced to catch.
+    #[test]
+    fn a_terminal_report_is_not_stop_evidence() {
+        let handle = WorkerHandle::new(CancellationToken::new());
+        handle.report_completed("done");
+        handle.report_paused();
+        handle.report_cancelled();
+        handle.report_failure("boom");
+        assert!(
+            !handle.execution_stopped(),
+            "a self-reported terminal state says nothing about the thread"
+        );
+    }
+
+    /// The default is "no evidence", not "stopped": assuming stopped would free a
+    /// running lease.
+    #[test]
+    fn a_fresh_handle_has_no_stop_evidence() {
+        let handle = WorkerHandle::new(CancellationToken::new());
+        assert!(!handle.execution_stopped());
+    }
+
+    /// The proof only flips after the real join returns, so a live thread can
+    /// never be reported as stopped.
+    #[test]
+    fn the_join_observer_proves_the_stop() {
+        let (witness, confirmation) = StopWitness::pair();
+        let handle = WorkerHandle::new(CancellationToken::new()).with_confirmation(confirmation);
+
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // Stay alive until the test allows the join to complete.
+            let _ = stop_rx.recv();
+        });
+        let observer = std::thread::spawn(move || {
+            let _ = worker.join();
+            witness.mark_joined();
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            !handle.execution_stopped(),
+            "the thread is still running, so the handle must not claim a stop"
+        );
+        stop_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        observer.join().unwrap();
+        assert!(
+            handle.execution_stopped(),
+            "after the join, the stop is proven"
+        );
+    }
+
+    /// A panicking worker still stops: the thread unwinds and the observer's join
+    /// returns. Treating a panic as "not stopped" would leak its lease forever.
+    #[test]
+    fn a_panicking_worker_still_proves_its_stop() {
+        let (witness, confirmation) = StopWitness::pair();
+        let handle = WorkerHandle::new(CancellationToken::new()).with_confirmation(confirmation);
+
+        let worker = std::thread::spawn(|| panic!("worker exploded"));
+        let observer = std::thread::spawn(move || {
+            assert!(worker.join().is_err(), "the panic surfaces as a join error");
+            witness.mark_joined();
+        });
+        observer.join().unwrap();
+        assert!(handle.execution_stopped());
+    }
+
+    /// A join alone is not enough when tools may still hold process groups.
+    ///
+    /// The join proves the task's own thread ended. A shell that forked a
+    /// background job ends with it while the job keeps running, so a lease released
+    /// on the join alone would free work that is still happening.
+    #[test]
+    fn task_join_without_tool_group_exit_retains_execution_lease() {
+        let (witness, confirmation) = StopWitness::pair();
+        let group_stopped = Arc::new(AtomicBool::new(false));
+        let gate_flag = Arc::clone(&group_stopped);
+        let gated =
+            confirmation.also_requiring(Arc::new(move || gate_flag.load(Ordering::Acquire)));
+
+        witness.mark_joined();
+        assert!(
+            !gated.is_stopped(),
+            "the task joined, but its tool groups have not been observed stopped"
+        );
+
+        group_stopped.store(true, Ordering::Release);
+        assert!(
+            gated.is_stopped(),
+            "both facts now hold: the task joined and its groups drained"
+        );
+    }
+
+    /// Installing a gate must not erase a stop that already happened, and every
+    /// gate must hold -- a later one cannot overrule an earlier one.
+    #[test]
+    fn gates_compose_and_never_mask_an_earlier_stop() {
+        let (witness, confirmation) = StopWitness::pair();
+        witness.mark_joined();
+
+        let first = Arc::new(AtomicBool::new(true));
+        let second = Arc::new(AtomicBool::new(false));
+        let first_flag = Arc::clone(&first);
+        let second_flag = Arc::clone(&second);
+        let gated = confirmation
+            .also_requiring(Arc::new(move || first_flag.load(Ordering::Acquire)))
+            .also_requiring(Arc::new(move || second_flag.load(Ordering::Acquire)));
+
+        assert!(!gated.is_stopped(), "the second gate is still closed");
+        second.store(true, Ordering::Release);
+        assert!(gated.is_stopped(), "the already-satisfied join is not lost");
+        first.store(false, Ordering::Release);
+        assert!(
+            !gated.is_stopped(),
+            "reopening an earlier gate closes the confirmation again"
+        );
+    }
+
+    /// `never` is the sentinel for a lost observer; it must not read as stopped.
+    #[test]
+    fn a_lost_observer_never_confirms() {
+        let confirmation = StopConfirmation::never();
+        assert!(!confirmation.is_stopped());
+        let handle = WorkerHandle::new(CancellationToken::new()).with_confirmation(confirmation);
+        assert!(!handle.execution_stopped());
     }
 }

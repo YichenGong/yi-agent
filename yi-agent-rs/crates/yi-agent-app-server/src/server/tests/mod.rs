@@ -403,7 +403,7 @@ pub(crate) fn build_test_agent(
     })
 }
 
-fn build_test_agent_with_provider(
+pub(crate) fn build_test_agent_with_provider(
     provider: Arc<dyn yi_agent_core::Provider>,
     session: Option<yi_agent_core::Session>,
     _cwd: &std::path::Path,
@@ -2936,6 +2936,7 @@ mod plugin_theme;
 mod process;
 #[cfg(test)]
 mod side;
+mod runtime_status;
 #[cfg(test)]
 mod thread_index;
 #[cfg(test)]

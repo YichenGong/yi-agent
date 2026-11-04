@@ -28,12 +28,13 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 
 // `serve()` 的签名与函数体用到的其余名字仍由 `server.rs` 提供。
 use crate::server::{
-    BuiltAgent, ChildrenWatch, ClientInitialized, ClientScopes, DRIVER_TICK, EVICT_IDLE_AFTER,
-    LEAD_LOOP_SENDER, LEAD_TICK, POWER_TICK, ProcessWatch, RuntimeAttachments, ServeLauncher,
-    SyncAction, TraceWatch, TurnEvent, attached_runtimes, decision_label, driver_tick,
-    err_response, evict_idle_runtimes, lead_tick_once, ok_response, parse_resume_hints, plan_sync,
-    resolve_lead_target, route_client_response, settle_pending_lead_replies, store_lookup,
-    take_changed_digests, write_notification, write_response,
+    BuiltAgent, ChildrenWatch, ClientInitialized, ClientScopes, ClientShellAuthorizations,
+    DRIVER_TICK, EVICT_IDLE_AFTER, LEAD_LOOP_SENDER, LEAD_TICK, POWER_TICK, ProcessWatch,
+    RuntimeAttachments, ServeLauncher, SyncAction, TraceWatch, TurnEvent, attached_runtimes,
+    decision_label, driver_tick, err_response, evict_idle_runtimes, lead_tick_once, ok_response,
+    parse_resume_hints, plan_sync, resolve_lead_target, route_client_response,
+    settle_pending_lead_replies, store_lookup, take_changed_digests, write_notification,
+    write_response,
 };
 pub(crate) mod scoped;
 pub(crate) mod stdio;
@@ -78,6 +79,9 @@ pub(crate) async fn serve<F>(
     // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
     // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
     client_initialized: ClientInitialized,
+    // 每个客户端被告知的壳授权（见 [`ClientShellAuthorizations`]）。只有本地
+    // stdio 能写入；远端设备的自报在 `initialize` 里被拒。
+    client_shell_authorizations: ClientShellAuthorizations,
     // 合并模式下 stdio 读端关闭的信号(见 `serve_scoped_core` 里 `read_lines` 的
     // oneshot);纯 stdio / 纯 ws 传 `None`,该 `select!` 分支 `pending`。
     mut stdio_eof: Option<std::pin::Pin<Box<tokio::sync::oneshot::Receiver<()>>>>,
@@ -186,22 +190,20 @@ where
     // `initialized` 由调用方传入(共享表),理由同 `client_scopes`:断连时传输层
     // 要能摘键,主循环持有私有 `HashMap` 就够不着它。
     let initialized = client_initialized;
+    let shell_authorizations = client_shell_authorizations;
     let mut threads: HashMap<String, ThreadSession> = HashMap::new();
 
     // 保活。**唯一持有断言的进程**就是这里（spec「为什么是单一持有者」）。
     //
-    // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：它含子进程与
-    // 2 秒级 TCP 超时，放主循环会把 RPC 卡住。
-    // 只读一次盘：三个初值来自同一份 `Settings`，不会互相错位。
+    // 整条 tick 在独立线程里跑（见 `power_guard` 的模块注释）：一拍含
+    // `getifaddrs`、电源来源与可能的 IOKit 调用，放主循环会和 RPC 抢时间片。
+    // 只读一次盘：初值来自同一份 `Settings`，不会互相错位。
     let initial_settings = yi_agent_runtime::settings::load_from(&settings_path);
     let initial_enabled = yi_agent_runtime::settings::prevent_idle_sleep_enabled(&initial_settings);
-    let (initial_grace_min, initial_remote_min) =
+    let (initial_grace_min, _initial_remote_min) =
         yi_agent_runtime::settings::power_windows_minutes(&initial_settings);
-    let power_guard = crate::power_guard::PowerGuard::spawn(
-        initial_enabled,
-        initial_grace_min * 60,
-        initial_remote_min * 60,
-    );
+    let power_guard =
+        crate::power_guard::PowerGuard::spawn(initial_enabled, initial_grace_min * 60);
     // daemon 侧的 busy 另由 `BusySampler` 采（同样是阻塞 IPC，同样不能进主循环）。
     let busy_sampler = crate::power_busy::BusySampler::spawn(Arc::clone(&runtimes));
     // 远端最后一次发来请求的时刻。**只**由非 local 客户端刷新：桌面壳用 stdio
@@ -466,6 +468,15 @@ where
                 // 域 handler 需要主循环的局部量;每个域臂按需构造一次
                 // [`crate::rpc::AppState`],借用到臂末(通常 `continue`)为止,故主循环
                 // 各局部量的所有权与借用关系与搬移前完全一致。
+                // 本次请求的壳授权（只有本地 stdio 的 `initialize` 写得进）。
+                // 每轮现取而不是缓存到循环外：同一连接上 `initialize` 与随后的
+                // `runtime/status` 到达顺序由客户端决定，缓存的副本可能是握手前的
+                // 空值，那样状态视图会无缘无故降级成 `Unknown`。
+                let request_shell_authorization = shell_authorizations
+                    .lock()
+                    .await
+                    .get(&client)
+                    .cloned();
                 macro_rules! app_state {
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
@@ -475,6 +486,8 @@ where
                         crate::rpc::AppState {
                             hub: &hub,
                             client: &client,
+                            is_remote: client != crate::broadcast::ClientId::local(),
+                            shell_authorization: request_shell_authorization.as_ref(),
                             client_scope,
                             cfg: &cfg,
                             theme_handle: &theme_handle,
@@ -485,6 +498,8 @@ where
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
                             resident_dir: &resident_dir,
+                            // 常驻登记目录就是实例根：迁移标记与它同处一个目录。
+                            instance_home: &resident_dir,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
                             uploads: &mut uploads,
@@ -539,6 +554,7 @@ where
                     crate::rpc::Domain::Model => dispatch_domain!(crate::rpc::model::handle),
                     crate::rpc::Domain::Onboarding => dispatch_domain!(crate::rpc::onboarding::handle),
                     crate::rpc::Domain::Resident => dispatch_domain!(crate::rpc::resident::handle),
+                    crate::rpc::Domain::Runtime => dispatch_domain!(crate::rpc::runtime::handle),
                     crate::rpc::Domain::Plugin => {
                         // 门禁（initialize / scope）已在上面同步做完；这里只把
                         // **处理** detach 出去。主循环是单 task，内联 await 会串行
@@ -604,6 +620,35 @@ where
                 match method.as_str() {
                     "initialize" => {
                         initialized.lock().await.insert(client.clone(), true);
+                        // The desktop shell stamps the local stdio handshake with
+                        // who this session speaks for. Only stdio may do so: over a
+                        // websocket the same JSON is a claim by a remote device, and
+                        // believing it would let a phone declare itself the App's
+                        // owner. A malformed or absent field is simply "no shell",
+                        // never a failed handshake.
+                        let mut accepted_shell = None;
+                        if let Some(authorization) =
+                            crate::shell_authorization::from_initialize_params(&req.params)
+                        {
+                            let is_local = client == crate::broadcast::ClientId::local();
+                            match authorization.accept(is_local) {
+                                Ok(authorization) => {
+                                    shell_authorizations
+                                        .lock()
+                                        .await
+                                        .insert(client.clone(), authorization.clone());
+                                    accepted_shell = Some(authorization.clone());
+                                }
+                                Err(reason) => {
+                                    // Not fatal: the session just has no shell
+                                    // behind it, which is the CLI's normal state.
+                                    eprintln!(
+                                        "[app-server] ignoring shell authorization from {}: {reason}",
+                                        client.as_str()
+                                    );
+                                }
+                            }
+                        }
                         // 客户端在**第一帧**声明它手上有什么（spec §4.1）：这不需要
                         // 新增往返——initialize 是连上那一刻必发的帧。仅手机端会带
                         // `resumeHints`；桌面/老客户端不带 ⇒ 空 plan，零回归。
@@ -647,29 +692,35 @@ where
                                 })
                             })
                             .collect();
-                        write_response(
-                            &hub, &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "serverInfo": {
-                                        "name": "yi-agent-app-server",
-                                        "version": env!("CARGO_PKG_VERSION"),
-                                    },
-                                    "protocolVersion": PROTOCOL_VERSION,
-                                    // 旁支能力位与宿主 id 出自同一份宿主 resources:
-                                    // 同一个进程的所有连接(stdio、直连 ws、经 relay)
-                                    // 必须看到同一个 id,否则客户端会把「重连」当成
-                                    // 「宿主换代」而丢掉本地基线。
-                                    "capabilities": {
-                                        "side_conversation_v1": crate::protocol::SIDE_CONVERSATION_V1,
-                                    },
-                                    "sideHostInstanceId": side_registry.host_instance_id(),
-                                    "syncPlan": sync_plan,
-                                }),
-                            ),
-                        )
-                        .await?;
+                        // 两边都改了这一帧，必须合并语义而不是二选一：
+                        // - 本分支要通告旁支能力位与宿主 id（三端靠它决定是否
+                        //   显示入口、靠 host id 判断「重连」还是「宿主换代」）；
+                        // - main 要回答它刚认可的 shell 身份，让「shell 被识别」
+                        //   成为可观测事实；被拒或没有该字段时就不出现，CLI 的
+                        //   正常形状保持不变。
+                        let mut response = json!({
+                            "serverInfo": {
+                                "name": "yi-agent-app-server",
+                                "version": env!("CARGO_PKG_VERSION"),
+                            },
+                            "protocolVersion": PROTOCOL_VERSION,
+                            // 旁支能力位与宿主 id 出自同一份宿主 resources:
+                            // 同一个进程的所有连接(stdio、直连 ws、经 relay)
+                            // 必须看到同一个 id,否则客户端会把「重连」当成
+                            // 「宿主换代」而丢掉本地基线。
+                            "capabilities": {
+                                "side_conversation_v1": crate::protocol::SIDE_CONVERSATION_V1,
+                            },
+                            "sideHostInstanceId": side_registry.host_instance_id(),
+                            "syncPlan": sync_plan,
+                        });
+                        if let Some(shell) = accepted_shell {
+                            response["shell"] = json!({
+                                "clientRunId": shell.client_run_id,
+                                "scopeKey": shell.scope_key,
+                            });
+                        }
+                        write_response(&hub, &client, ok_response(id, response)).await?;
                     }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
@@ -736,10 +787,10 @@ where
                 // `latest()` 永远立刻返回（上一拍的结果），绝不等待。
                 let daemon = busy_sampler.latest();
 
-                // 只写原子。探测与 IOKit 都在供电线程里，这里绝不阻塞。
-                power_guard.set_activity(local || remote || daemon);
-                power_guard.set_enabled(enabled);
-                power_guard.set_windows(grace_secs, remote_secs);
+                // 一次提交一致的三个业务值：探测与 IOKit 都在供电线程里，
+                // 这里只持锁写字段、放锁后唤醒，绝不阻塞。值没变就不唤醒，
+                // 避免每 10 秒一次无意义的 tick。
+                power_guard.update(local || remote || daemon, enabled, grace_secs);
             }
             _ = driver_ticker.tick() => {
                 // 通用会话驱动器内联跑一轮:问每个驱动插件「下一步起/续哪个
@@ -846,6 +897,8 @@ where
                         lead_control: &lead_control,
                         lead_control_replies: &lead_control_replies,
                         lead_target: Some(delivery.lead),
+                        #[cfg(test)]
+                        before_prompt_send: None,
                     };
                     if let Err(error) = launcher.deliver_to_lead(&envelope).await {
                         eprintln!("[app-server] lead background delivery failed: {error}");
@@ -901,6 +954,8 @@ where
                     lead_control: &lead_control,
                     lead_control_replies: &lead_control_replies,
                     lead_target: Some(target),
+                    #[cfg(test)]
+                    before_prompt_send: None,
                 };
                 if let Err(error) = launcher.deliver_to_lead(&envelope).await {
                     eprintln!("[app-server] lead delivery failed: {error}");
@@ -947,6 +1002,8 @@ where
                     lead_control_replies: &lead_control_replies,
                     // 写指令不投递给组长，故没有 lead target。
                     lead_target: None,
+                    #[cfg(test)]
+                    before_prompt_send: None,
                 };
                 let request_id = cmd.request_id.clone();
                 let outcome = launcher.apply_lead_control(cmd).await;

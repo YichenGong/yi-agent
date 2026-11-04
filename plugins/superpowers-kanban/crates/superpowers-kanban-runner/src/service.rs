@@ -393,6 +393,113 @@ impl BoardService {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// 本拍**允许写进观测旁路**的会话 ID 集合。
+    ///
+    /// 只收「看板里真的有约束关系」的 ID，绝不把宿主整张热表抄进来：那样
+    /// `observations.json` 会变成一份会话世界地图，谁在别的项目里聊过什么都要落
+    /// 到本项目的 state-dir 里。
+    ///
+    /// 来源（全部要求非空 ID）：
+    ///
+    /// - 看板全体卡片的执行 `thread_id`（**含已归档**：归档卡的状态还要经
+    ///   `list` 展示，剪掉就等于把它们的时间线抹了）；
+    /// - 仍有效 merge attempt 记录里绑定的会话；
+    /// - 本进程 `ResumeForMerge` 待办里的派发身份；
+    /// - 命中本进程待办、且成功回报带来的 `Launch`/`LaunchForMerge` 会话。
+    ///
+    /// 明确排除：`origin_thread_id`（它是「用户在哪里点的」来源会话，不是执行
+    /// 绑定）、陌生 `action_id` 带回来的 ID、purge 掉的孤儿记录、空/纯空白 ID。
+    ///
+    /// 锁顺序：先在短锁内复制待办标识，立刻释放，再去读 board/attempt。**绝不**
+    /// 持 `inner` 读磁盘，也不持 board 锁等 `inner`。
+    fn related_thread_ids(
+        &self,
+        results: &[DriverResult],
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        // 1) 短锁：只复制「动作 id → 种类/卡片/续跑身份」，马上放锁。
+        let pending: Vec<(String, PendingKind, CardId, Option<String>)> = {
+            let inner = self.lock();
+            inner
+                .pending_actions
+                .iter()
+                .map(|(action_id, action)| {
+                    (
+                        action_id.clone(),
+                        action.kind,
+                        action.card_id.clone(),
+                        action
+                            .resume
+                            .as_ref()
+                            .map(|ledger| ledger.thread_id.clone()),
+                    )
+                })
+                .collect()
+        };
+
+        let mut relevant = std::collections::BTreeSet::new();
+        let mut insert = |id: &str| {
+            if !id.trim().is_empty() {
+                relevant.insert(id.to_string());
+            }
+        };
+
+        // 2) 看板：首次运行（文件不存在）= 空看板；坏读 = Err（回报还没消费，
+        //    下一拍可以重试）。
+        let board = persist::load_board_strict(&self.state_dir.join("board.json"))?;
+        for card in board.cards() {
+            if let Some(thread_id) = card.thread_id.as_deref() {
+                insert(thread_id);
+            }
+        }
+
+        // 3) 合并安全记录：它绑定的会话仍是本项目的一张卡在执行。
+        if let Some(record) = crate::merge_attempt::read(&self.state_dir)? {
+            if let Some(thread_id) = record.thread_id.as_deref() {
+                insert(thread_id);
+            }
+        }
+
+        // 4) 待办的续跑身份：那是「这条指令要投给谁」的既有绑定。
+        for (_, kind, _, resume_thread) in &pending {
+            if *kind == PendingKind::ResumeForMerge {
+                if let Some(thread_id) = resume_thread.as_deref() {
+                    insert(thread_id);
+                }
+            }
+        }
+
+        // 5) 本拍成功回报带来的新绑定：只认命中本进程待办的动作。
+        for result in results.iter().filter(|result| result.ok) {
+            let Some((_, kind, _, resume_thread)) = pending
+                .iter()
+                .find(|(action_id, ..)| action_id == &result.action_id)
+            else {
+                continue;
+            };
+            match kind {
+                // 新会话：回报带来的 ID 本身就是绑定。
+                PendingKind::Launch | PendingKind::LaunchForMerge => {
+                    if let Some(thread_id) = result.thread_id.as_deref() {
+                        insert(thread_id);
+                    }
+                }
+                // 续跑：只认**等于**派发身份的 ID。回别的 id 属于串线，
+                // 结算层会把它标成 uncertain，观测层更不能替它建立新绑定。
+                PendingKind::ResumeForMerge => {
+                    if let (Some(reported), Some(expected)) =
+                        (result.thread_id.as_deref(), resume_thread.as_deref())
+                    {
+                        if reported == expected {
+                            insert(reported);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(relevant)
+    }
+
     /// 本插件**唯一**的推进入口（spec D1 / §4.6）。
     ///
     /// 宿主每 tick 调一次。这里只做三件事：
@@ -404,6 +511,14 @@ impl BoardService {
     /// 它**不**判断任何卡片的意图：会话空闲不等于跑完了，git 有新提交也不等于
     /// 该验收，宿主重启更不等于卡死了。这些判断只有模型做得了，所以它们全部走
     /// `set_state`（CLI 的 `state` 动词）。
+    /// 兼容入口：旧的 typed `threads` 调用面保留，内部委托给新入口。
+    ///
+    /// 显式 typed `ThreadFacts.alive` 是宿主**已提供**的证据（缺字段的保守默认
+    /// 在 `dispatch` 解析时就已经分开了），所以这里把每个条目都算作
+    /// `reported_alive`，`loaded` 为 `None`（没有完整快照能力）。
+    ///
+    /// 这不是「另一套流程」：归一化、保存、回报消费、gate、出租约全在
+    /// [`Self::driver_step_with_loaded`] 里，只有一处顺序。
     pub fn driver_step(
         &self,
         threads: &[ThreadFacts],
@@ -413,12 +528,53 @@ impl BoardService {
         // 绝不猜、也绝不退化成本地能执行的动作。
         capabilities: &DriverCapabilities,
     ) -> Result<Option<DriverAction>, String> {
+        let input = crate::driver_observation::ObservationInput {
+            legacy: threads.to_vec(),
+            reported_alive: threads
+                .iter()
+                .map(|thread| (thread.thread_id.clone(), thread.alive))
+                .collect(),
+            loaded: None,
+        };
+        self.driver_step_with_loaded(&input, results, sessions_running, capabilities)
+    }
+
+    /// 本插件**唯一**的推进入口（新签名）。
+    ///
+    /// 顺序是安全性质的一部分，不要重排：
+    ///
+    /// 1. 前置检查（租约目录）与相关 ID 读取；
+    /// 2. 归一化本拍观测；
+    /// 3. **原子保存**旁路——失败就整拍返回错误，绝不消费回报；
+    /// 4. 推进 tick 序号、消费回报、gate 结算、补账、调度。
+    ///
+    /// 为什么保存必须早于消费：消费之后的租约对账读的是**已落盘**的旁路；
+    /// 若先消费再落盘而落盘失败，回报已经没了、名额却还按旧文件算，那张卡
+    /// 的账就永久丢了。失败时把错误交回宿主，下一拍会重发同一批 results。
+    pub fn driver_step_with_loaded(
+        &self,
+        input: &crate::driver_observation::ObservationInput,
+        results: &[DriverResult],
+        sessions_running: Option<u32>,
+        capabilities: &DriverCapabilities,
+    ) -> Result<Option<DriverAction>, String> {
         // 前置检查必须**早于**消费回报：拿不到全局租约目录时 `next_launch` 只会
         // 整拍报错，而错误会让宿主把这批回报当作「没送到」重发；可回报已经消费
         // 掉了，重发的那份会被当成陌生动作丢弃，那次账就永久丢了。
         if self.lock().leases_dir.is_none() {
             return Err("no lease directory".into());
         }
+        // 2) 相关 ID：只持久化看板真正绑定的执行会话，别把宿主全表抄进来。
+        //    坏 board / 坏 attempt 在这里就报错——回报还没消费，下一拍可重试。
+        let relevant = self.related_thread_ids(results)?;
+        let previous = crate::observation::load(&self.state_dir);
+        let normalized =
+            crate::driver_observation::normalize(input, &relevant, &previous, chrono::Local::now());
+        // 3) 旁路先落盘。失败 => 不推进序号、不消费回报、不释放任何资源。
+        crate::observation::save(&self.state_dir, &normalized.file)
+            .map_err(|error| format!("could not save session observations: {error}"))?;
+        let threads = &normalized.facts;
+
         // 本拍序号先进。回报、观测、释放、派发都用同一个数字,所以"这一拍"
         // 在下面所有判断里含义一致。
         let tick_seq = {
@@ -426,14 +582,12 @@ impl BoardService {
             inner.driver_tick_seq += 1;
             inner.driver_tick_seq
         };
-        // 1) 回报：宿主上一拍执行的结果在这里落账。
+        // 4) 回报：宿主上一拍执行的结果在这里落账。
         //
         // 这一拍要是结算了一次续跑合并，就**不再派新的合并**：退队的卡马上又
         // 满足条件，同一个 tick 里再派一次等于把"一拍一个动作"变成自旋重试，
         // 而这一拍还没有任何新观测能证明它这次不会又忙。
         let settled_merge = self.consume_results(results);
-        // 2) 观测：只写旁路文件，绝不回写卡片状态。
-        self.write_observations(threads);
         // 合并回合一结束就还名额：这一步只能由持有 flock 的本进程做。
         self.release_gate_when_the_merge_is_over(threads, tick_seq);
         // 本拍的**全机余量**：峰值 − 全机运行会话数。合并队列与启动共用这一份——
@@ -502,34 +656,6 @@ impl BoardService {
                 eprintln!("superpowers-kanban: launch failed: {error}");
                 Ok(None)
             }
-        }
-    }
-
-    /// 把本拍的会话事实写进观测旁路。**只写 observations.json**，绝不改 board.json。
-    fn write_observations(&self, threads: &[ThreadFacts]) {
-        let now = chrono::Local::now();
-        let mut file = crate::observation::load(&self.state_dir);
-        let seen: std::collections::HashSet<&str> = threads
-            .iter()
-            .map(|thread| thread.thread_id.as_str())
-            .collect();
-        for thread in threads {
-            file.observe(&thread.thread_id, thread.alive, now);
-        }
-        // 这一拍完全没被提到的会话按「已经没了」记，但保留最后一次活着的时刻
-        // （`observe(false)` 正是这个语义）。宿主重启后 `threads` 为空，这里的
-        // 结果就是「全体 stale」——这是**展示**，不是状态迁移。
-        let missing: Vec<String> = file
-            .threads
-            .keys()
-            .filter(|id| !seen.contains(id.as_str()))
-            .cloned()
-            .collect();
-        for id in missing {
-            file.observe(&id, false, now);
-        }
-        if let Err(error) = crate::observation::save(&self.state_dir, &file) {
-            eprintln!("superpowers-kanban: could not write observations: {error}");
         }
     }
 
@@ -1347,6 +1473,30 @@ impl BoardService {
         );
     }
 
+    /// 测试用：登记一条带派发身份的待办（生产侧只有 `dispatch_resume` 会建这种）。
+    #[cfg(test)]
+    fn remember_pending_with_resume(
+        &self,
+        action_id: &str,
+        card_id: &CardId,
+        kind: PendingKind,
+        thread_id: &str,
+    ) {
+        self.lock().pending_actions.insert(
+            action_id.to_string(),
+            PendingAction {
+                card_id: card_id.clone(),
+                kind,
+                resume: Some(ResumeLedger {
+                    action_id: action_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    expected_workdir: self.project_root.clone(),
+                    merge_queued_at: None,
+                }),
+            },
+        );
+    }
+
     /// 取出并摘除待办条目：摘除即「这条回报已生效」，重复投递自然落空。
     fn take_pending(&self, action_id: &str) -> Option<PendingAction> {
         self.lock().pending_actions.remove(action_id)
@@ -1492,6 +1642,26 @@ impl BoardService {
             .filter(|pending| pending.kind == PendingKind::Launch)
             .map(|pending| pending.card_id.clone())
             .collect();
+        // 合并安全记录保护的卡集合：这三个阶段都说明「一次合并可能还在写目标
+        // 树」。它们的会话这一拍哪怕没被完整快照命中，也**不能**凭一次未加载
+        // 就把 lease 提前放走——放走的一瞬间别的项目就会在同一个名额上再起一个
+        // 会话。记录坏读时同样不启动新动作：宁可本拍不动，也不猜。
+        let protected: std::collections::HashSet<CardId> =
+            match crate::merge_attempt::read(&self.state_dir) {
+                Ok(Some(record)) => match record.phase {
+                    crate::merge_attempt::MergePhase::Pending
+                    | crate::merge_attempt::MergePhase::Accepted
+                    | crate::merge_attempt::MergePhase::Uncertain => {
+                        std::collections::HashSet::from([CardId::new(record.card_id)])
+                    } // 未知阶段是坏记录，上面 `read` 已经会报错；这里保守不保护。
+                },
+                // 坏 journal：不新增动作（下面的 retain/acquire 全部跳过）。
+                Err(error) => {
+                    eprintln!("superpowers-kanban: {error}; leaving leases untouched");
+                    return;
+                }
+                Ok(None) => std::collections::HashSet::new(),
+            };
         let live: std::collections::HashSet<CardId> = cards
             .iter()
             .filter(
@@ -1524,9 +1694,14 @@ impl BoardService {
             )
             .map(|card| card.id.clone())
             .collect();
-        // 放：不再对应活会话的租约一律 drop（drop 即归还名额）。
-        inner.leases.retain(|card_id, _| live.contains(card_id));
+        // 放：不再对应活会话的租约一律 drop（drop 即归还名额）。受保护的合并卡
+        // 例外——见 `protected` 的注释。
+        inner
+            .leases
+            .retain(|card_id, _| live.contains(card_id) || protected.contains(card_id));
         // 领：活的卡还没有租约就补一个（领不到只做尽力而为，不 panic）。
+        // 领：只给「活着的」卡补租约。受保护但这一拍看起来不活的卡不在 `live`
+        // 里，所以也不会被领第二份——同卡永远只持一份 lease。
         for card in cards.iter().filter(|card| live.contains(&card.id)) {
             if inner.leases.contains_key(&card.id) {
                 continue;
@@ -2061,6 +2236,26 @@ impl BoardService {
                     .as_ref()
                     .is_some_and(|holder| holder.card_id == card.id.0),
                 "stale": crate::observation::stale(card, &observations).is_some(),
+                // 加载态投影：**唯一**的解读入口在 `observation`，这里不许
+                // 自己再拿 `alive` 猜一遍。非 running / 无绑定 ID 就是 unknown
+                // ——「没会话」和「没观测到」都不该冒充「已经没了」。
+                "session_observation": card
+                    .thread_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|_| crate::observation::for_card(card, &observations).as_str()),
+                // 这条观测是什么时候采的。unknown 不报时间：旧格式文件里的
+                // `last_alive_at` 不是「这一拍看见了」的证据。
+                "observed_at": card
+                    .thread_id
+                    .as_deref()
+                    .and_then(|thread| observations.threads.get(thread))
+                    .filter(|observation| {
+                        observation.presentation()
+                            != crate::observation::SessionObservation::Unknown
+                    })
+                    .and_then(crate::observation::Observation::presentation_at)
+                    .map(|at| at.to_rfc3339()),
                 "last_alive_at": card
                     .thread_id
                     .as_deref()
@@ -2246,6 +2441,22 @@ mod tests {
     fn caps(actions: &[&str]) -> DriverCapabilities {
         DriverCapabilities {
             actions: actions.iter().map(|action| action.to_string()).collect(),
+        }
+    }
+
+    /// 一拍「宿主给了完整热表快照」的输入。
+    fn loaded_input(ids: &[&str]) -> crate::driver_observation::ObservationInput {
+        crate::driver_observation::ObservationInput {
+            legacy: Vec::new(),
+            reported_alive: Default::default(),
+            loaded: Some(
+                ids.iter()
+                    .map(|id| crate::driver_observation::LoadedThreadFacts {
+                        thread_id: (*id).to_string(),
+                        idle: true,
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -4493,7 +4704,8 @@ mod tests {
         );
         assert_eq!(state_of(&service, "card-1"), "running", "还忙就不动它");
         // 宿主**完全没报**这台会话（重启后它不记得任何 thread）：状态照旧不动，
-        // 只在观测里标 stale——这是展示，不是迁移。
+        // 展示降级为 unknown。旧宿主「这一拍没提」不是「它已经没了」的证据——
+        // 那正是本次要根除的误报，所以不标 stale，也不声称加载过。
         assert!(
             service
                 .driver_step(&[], &[], None, &no_caps())
@@ -4501,7 +4713,571 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state_of(&service, "card-1"), "running");
-        assert_eq!(service.list()["cards"][0]["stale"], true);
+        let card = &service.list()["cards"][0];
+        assert_eq!(card["stale"], false, "缺证据不等于会话已经不存在");
+        assert_eq!(card["session_observation"], "unknown");
+    }
+
+    /// 一拍完整的「Launch → 回报」：绑定还没落盘时，观测旁路就已经记下了这个
+    /// 会话。
+    ///
+    /// 顺序是安全性质：`related_thread_ids` 会把命中本进程待办的成功回报 ID
+    /// 纳入本拍范围，而保存发生在消费之前，所以同一拍的 `list` 就看得到
+    /// `loaded`。反过来（先消费再保存），这里会看到 `unknown`。
+    #[test]
+    fn kanban_observation_observes_a_launch_before_the_binding_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        // 手写一条待办，模拟 `driver_step` 刚刚交出这个 launch。
+        service.remember_pending(
+            "act-1",
+            &superpowers_kanban_core::card::CardId::new(claim.card_id.clone()),
+            PendingKind::Launch,
+        );
+        let result = DriverResult {
+            action_id: "act-1".to_string(),
+            ok: true,
+            thread_id: Some("thread-9".to_string()),
+            error: None,
+            error_code: None,
+        };
+        service
+            .driver_step_with_loaded(
+                &loaded_input(&["thread-9"]),
+                std::slice::from_ref(&result),
+                Some(1),
+                &no_caps(),
+            )
+            .unwrap();
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-9"));
+        assert_eq!(
+            service.list()["cards"][0]["session_observation"],
+            "loaded",
+            "绑定落盘前就该被观测到"
+        );
+
+        // 同一批回报再来一次：待办已摘除，不得重新生效，也不得写旁路。
+        let before = std::fs::read_to_string(service.state_dir.join("observations.json")).unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[result], Some(1), &no_caps())
+            .unwrap();
+        let after = std::fs::read_to_string(service.state_dir.join("observations.json")).unwrap();
+        assert_ne!(before, after, "本拍的完整快照仍然会推进观测时间");
+        assert_eq!(
+            service.list()["cards"][0]["session_observation"],
+            "not_loaded",
+            "重复回报不再把 ID 带进本拍范围"
+        );
+    }
+
+    /// 陌生 `action_id` 带回的会话不进旁路：宿主手里可能有别的项目的动作 id，
+    /// 照单全收就把无关会话写进了本项目。
+    #[test]
+    fn kanban_observation_ignores_a_stranger_action_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let result = DriverResult {
+            action_id: "act-stranger".to_string(),
+            ok: true,
+            thread_id: Some("thread-foreign".to_string()),
+            error: None,
+            error_code: None,
+        };
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[result], None, &no_caps())
+            .unwrap();
+        let file = crate::observation::load(&service.state_dir);
+        assert!(
+            !file.threads.contains_key("thread-foreign"),
+            "陌生动作带来的会话不得落进本项目旁路"
+        );
+    }
+
+    /// 续跑回报带回的 ID 必须**等于**派发身份；串线的 ID 不建立新绑定。
+    #[test]
+    fn kanban_observation_rejects_a_resume_with_the_wrong_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.mark_running("card-1", "thread-1").unwrap();
+        service.remember_pending_with_resume(
+            "act-resume",
+            &superpowers_kanban_core::card::CardId::new("card-1"),
+            PendingKind::ResumeForMerge,
+            "thread-1",
+        );
+        let result = DriverResult {
+            action_id: "act-resume".to_string(),
+            ok: true,
+            thread_id: Some("thread-elsewhere".to_string()),
+            error: None,
+            error_code: None,
+        };
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[result], None, &no_caps())
+            .unwrap();
+        let file = crate::observation::load(&service.state_dir);
+        assert!(
+            !file.threads.contains_key("thread-elsewhere"),
+            "串线的续跑 ID 不能写进旁路"
+        );
+        assert!(
+            file.threads.contains_key("thread-1"),
+            "卡自己的绑定仍在观测范围内"
+        );
+    }
+
+    /// 已受理（`Accepted`）那一拍就算 idle 也**不放**门：同一份请求里的 idle
+    /// 快照可能发生在结果生效之前。下一拍合规 idle 才按旧规则释放。
+    #[test]
+    fn kanban_observation_accepted_idle_waits_one_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_merge_bound_card(&project);
+        peak_of(&service, 1);
+        service.merge_request("card-1").unwrap();
+        let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+        let DriverAction::ResumeAppend { action_id, .. } = &action else {
+            panic!("expected a resume, got {action:?}");
+        };
+        // 模型收尾 + 回报：这一拍受理，idle 观测**不得**当拍放门。
+        service.set_state("card-1", CardState::Done, None).unwrap();
+        assert!(
+            service
+                .driver_step(
+                    &[facts("thread-1", true, true)],
+                    &[resume_ok(action_id)],
+                    Some(1),
+                    &no_caps(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .map(|record| record.phase),
+            Some(crate::merge_attempt::MergePhase::Accepted),
+            "同一拍不得结算"
+        );
+        // 下一拍：合规 idle → 记录清掉、门释放。
+        service
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(
+            crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .is_none(),
+            "晚于受理一拍且明确 idle 才允许释放"
+        );
+    }
+
+    /// `Pending` / `Uncertain` 阶段：新事实里缺合并会话也**不得**提前放租约。
+    ///
+    /// 这是本次改动最容易出事的边界——完整快照的「未命中」看起来像死亡，
+    /// 但一次未加载不能证明目标树那边已经停了。
+    #[test]
+    fn kanban_observation_merge_attempt_keeps_its_lease() {
+        for phase in [
+            crate::merge_attempt::MergePhase::Pending,
+            crate::merge_attempt::MergePhase::Uncertain,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = project_with_worktree(dir.path());
+            let (service, _source) = service_with_merge_bound_card(&project);
+            peak_of(&service, 1);
+            service.merge_request("card-1").unwrap();
+            let action = resume_action(&service, &[facts("thread-1", true, true)]).unwrap();
+            let DriverAction::ResumeAppend { action_id, .. } = &action else {
+                panic!("expected a resume, got {action:?}");
+            };
+            // 先把安全记录改成要测的阶段。
+            let record = crate::merge_attempt::read(&service.state_dir)
+                .unwrap()
+                .expect("an attempt");
+            crate::merge_attempt::save(
+                &service.state_dir,
+                &crate::merge_attempt::MergeAttemptRecord {
+                    phase: phase.clone(),
+                    ..record
+                },
+            )
+            .unwrap();
+            // 卡自己的会话这一拍没被完整快照命中。
+            let before = service.lock().leases.len();
+            assert_eq!(before, 1, "派发时就该拿到那份 lease");
+            service
+                .driver_step_with_loaded(&loaded_input(&[]), &[], Some(0), &no_caps())
+                .unwrap();
+            assert_eq!(
+                service.lock().leases.len(),
+                1,
+                "{phase:?} 期间不得因一次未加载就把 lease 放走"
+            );
+            assert!(
+                crate::merge_attempt::read(&service.state_dir)
+                    .unwrap()
+                    .is_some(),
+                "{phase:?} 期间安全记录必须还在"
+            );
+            let _ = action_id;
+        }
+    }
+
+    /// 热 ID 从宿主热表消失、但会话历史还在磁盘上：`list` 必须降级成
+    /// `not_loaded`，而卡的绑定与历史字节一个不动。
+    ///
+    /// 这是「宿主忘了它」这一侧的证据：完整快照是权威的，未命中就是明确未加载；
+    /// 但看板**不许**因此改写 `thread_id`、`state`、`workdir`——会话历史仍然存在，
+    /// 人还能点开看（`thread_id` 就是入口）。
+    #[test]
+    fn kanban_observation_forgotten_hot_thread_keeps_card_binding_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        // 会话历史（夹具里的「磁盘上的字节」）：观测读不读它都必须一字不动。
+        let history = project.join(".yi-agent/threads/thread-1.jsonl");
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(&history, "{\"type\":\"user\"}\n").unwrap();
+        let bytes_before = std::fs::read(&history).unwrap();
+        let workdir_before = service.list()["cards"][0]["workdir"].clone();
+
+        service
+            .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+            .unwrap();
+        let loaded = service.list();
+        assert_eq!(loaded["cards"][0]["session_observation"], "loaded");
+        assert_eq!(loaded["cards"][0]["stale"], false);
+
+        // 宿主不再报告它（完整快照里没有）。
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[], Some(1), &no_caps())
+            .unwrap();
+        let after = service.list();
+        assert_eq!(
+            after["cards"][0]["session_observation"], "not_loaded",
+            "a complete snapshot that omits the thread is explicit not-loaded"
+        );
+        assert_eq!(after["cards"][0]["stale"], true);
+        assert_eq!(
+            after["cards"][0]["state"], "running",
+            "never migrates state"
+        );
+        assert_eq!(after["cards"][0]["thread_id"], "thread-1");
+        assert_eq!(
+            after["cards"][0]["workdir"], workdir_before,
+            "observation never rewrites the workdir"
+        );
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            bytes_before,
+            "observation must not touch the session history"
+        );
+    }
+
+    /// 归档一张**热**卡：它从人看的列表里消失，但会话仍占着名额，所以那份
+    /// lease 必须继续算它。
+    ///
+    /// 归档只接受终态卡（`Board::archive` 明确拒绝 queued/running），所以这里
+    /// 用一张 `failed` 卡：它已交付、可以归档，而 `is_terminal()` 不能当作
+    /// 「不占名额」的依据——`release` 的契约就是「会话还活着就继续占」。
+    ///
+    /// 关键点是归档**不**把卡排除出观测集合：`related_thread_ids` 收的是看板
+    /// 全体（含 archived），否则下一次原子保存就会把这张卡唯一的热记录剪掉，
+    /// 名额随之被放开。
+    #[test]
+    fn kanban_observation_archived_card_still_holds_its_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert_eq!(service.lock().leases.len(), 1, "the launch holds one slot");
+
+        // 报失败（会话可能还活着，`release` 契约如此），然后归档。
+        service
+            .mark_terminal(&claim.card_id, "failed", Some("boom"))
+            .unwrap();
+        persist::with_board(&service.state_dir, |board| {
+            board
+                .archive(&CardId::new(&claim.card_id))
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(
+            !service.list()["cards"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|card| card["id"] == claim.card_id
+                    && card["archived"] == false
+                    && card["state"] != "failed"),
+            "the card is archived"
+        );
+
+        // 它这一拍仍然被宿主报告为已加载 → 名额必须留着。
+        service
+            .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(
+            crate::observation::load(&service.state_dir)
+                .threads
+                .contains_key("thread-1"),
+            "an archived card stays in the observed set"
+        );
+        assert_eq!(
+            service.lock().leases.len(),
+            1,
+            "an archived card whose session is still loaded keeps its slot"
+        );
+        assert!(
+            service.next_launch(1, at()).unwrap().is_none(),
+            "the pool stays full, so nothing new may start"
+        );
+    }
+
+    /// `purge_archived` 之后的旁路清理：没有 attempt 引用的记录必须走，
+    /// **有** attempt 引用的那张必须留。
+    #[test]
+    fn kanban_observation_purge_drops_only_unreferenced_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(
+            crate::observation::load(&service.state_dir)
+                .threads
+                .contains_key("thread-1")
+        );
+
+        // 一次仍在飞的合并安全记录把 `thread-1` 钉住。
+        crate::merge_attempt::save(
+            &service.state_dir,
+            &crate::merge_attempt::MergeAttemptRecord {
+                version: crate::merge_attempt::ATTEMPT_VERSION,
+                action_id: "a1".to_string(),
+                card_id: claim.card_id.clone(),
+                thread_id: Some("thread-1".to_string()),
+                expected_workdir: project.canonicalize().unwrap(),
+                phase: crate::merge_attempt::MergePhase::Uncertain,
+                merge_queued_at: None,
+            },
+        )
+        .unwrap();
+        // 卡已交付并归档 → 从活跃列表消失；只剩 attempt 还引用着那个会话。
+        service
+            .mark_terminal(&claim.card_id, "failed", Some("boom"))
+            .unwrap();
+        persist::with_board(&service.state_dir, |board| {
+            board
+                .archive(&CardId::new(&claim.card_id))
+                .map_err(|error| error.to_string())?;
+            board.purge_archived();
+            Ok(())
+        })
+        .unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(
+            crate::observation::load(&service.state_dir)
+                .threads
+                .contains_key("thread-1"),
+            "a thread named by a live merge attempt must keep its record"
+        );
+
+        // 记录撤掉、卡也不再引用它：旁路随之清干净。
+        std::fs::remove_file(service.state_dir.join(crate::merge_attempt::ATTEMPT_FILE)).unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&[]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(
+            crate::observation::load(&service.state_dir)
+                .threads
+                .is_empty(),
+            "an unreferenced record must be pruned"
+        );
+    }
+
+    /// 余量为 0 时**不派发**，但重启补账照做：已经跑着的会话必须占住名额，
+    /// 而且同一张卡永远只有**一份** lease。
+    #[test]
+    fn kanban_observation_zero_budget_still_adopts_exactly_one_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        // 模拟重启：进程内的租约账本清空，磁盘上头还活着。
+        service.lock().leases.clear();
+        assert_eq!(service.lock().leases.len(), 0);
+
+        // 全机已跑满（limit=1，sessions_running=1）→ 余量 0。
+        let action = service
+            .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+            .unwrap();
+        assert!(action.is_none(), "budget 0 must not dispatch anything");
+        assert_eq!(
+            service.lock().leases.len(),
+            1,
+            "the running session's slot is re-adopted even with no budget"
+        );
+
+        // 再拍两次都仍是已加载：绝不允许补出第二份。
+        for _ in 0..2 {
+            service
+                .driver_step_with_loaded(&loaded_input(&["thread-1"]), &[], Some(1), &no_caps())
+                .unwrap();
+            assert_eq!(
+                service.lock().leases.len(),
+                1,
+                "one card holds exactly one lease across repeated loaded ticks"
+            );
+        }
+    }
+
+    /// 坏 journal：整拍**前置拒绝**（回报未消费），租约保持原样。
+    ///
+    /// 为什么不「跳过合并、照常派发」：读不懂的记录说明门的归属不可知。这一拍
+    /// 仍然可以派新会话，但一旦派了，宿主就会认为上一批 results 已送达；而
+    /// 我们其实连「那次合并到底交没交出去」都答不上来。
+    #[test]
+    fn kanban_observation_corrupt_attempt_is_rejected_before_any_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(1), &no_caps())
+            .unwrap();
+        assert_eq!(service.lock().leases.len(), 1);
+        std::fs::write(
+            service.state_dir.join(crate::merge_attempt::ATTEMPT_FILE),
+            "{ not json",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(service.state_dir.join("observations.json")).unwrap();
+        let error = service
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(1), &no_caps())
+            .unwrap_err();
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(
+            service.lock().leases.len(),
+            1,
+            "坏记录不得导致租约被提前释放"
+        );
+        assert_eq!(
+            std::fs::read_to_string(service.state_dir.join("observations.json")).unwrap(),
+            before,
+            "前置拒绝发生在保存之前"
+        );
+    }
+
+    /// 观测落盘失败时**整拍不生效**：不消费回报、不推进序号、不动租约。
+    ///
+    /// 用目录占据临时文件名让 `fs::write` 明确失败（不用 chmod：root／ACL
+    /// 环境下不可靠）。去掉占位后重试必须成功一次——证明失败是可恢复的，
+    /// 宿主重发同一批 results 就能把账补回来。
+    #[test]
+    fn kanban_observation_save_failure_consumes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 先让一张在跑的卡占住一个租约，好让「租约没动」有东西可比。
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .driver_step(&[facts("thread-1", true, true)], &[], Some(1), &no_caps())
+            .unwrap();
+        let observations_before =
+            std::fs::read(service.state_dir.join("observations.json")).unwrap();
+        let leases_before = service.lock().leases.len();
+        let tick_before = service.lock().driver_tick_seq;
+        service.remember_pending(
+            "act-2",
+            &superpowers_kanban_core::card::CardId::new("card-1"),
+            PendingKind::Launch,
+        );
+        let pending_before = service.lock().pending_actions.len();
+        let result = DriverResult {
+            action_id: "act-2".to_string(),
+            ok: true,
+            thread_id: Some("thread-2".to_string()),
+            error: None,
+            error_code: None,
+        };
+
+        // 占住临时文件名：`observations.json.tmp` 是目录 => 写入失败。
+        let blocker = service.state_dir.join("observations.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+
+        let error = service
+            .driver_step_with_loaded(
+                &loaded_input(&["thread-2"]),
+                std::slice::from_ref(&result),
+                Some(1),
+                &no_caps(),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("could not save session observations"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(service.state_dir.join("observations.json")).unwrap(),
+            observations_before,
+            "旁路文件必须原样不动"
+        );
+        assert_eq!(
+            service.lock().pending_actions.len(),
+            pending_before,
+            "回报不得被消费：宿主重发时还要能对上"
+        );
+        assert_eq!(service.lock().driver_tick_seq, tick_before, "序号不得推进");
+        assert_eq!(service.lock().leases.len(), leases_before, "租约不得变动");
+        assert_eq!(
+            thread_of(&service, "card-1").as_deref(),
+            Some("thread-1"),
+            "绑定不得被覆盖"
+        );
+
+        // 去掉占位后重试：这一拍成功，回报生效。
+        std::fs::remove_dir_all(&blocker).unwrap();
+        service
+            .driver_step_with_loaded(&loaded_input(&["thread-2"]), &[result], Some(1), &no_caps())
+            .unwrap();
+        assert_eq!(thread_of(&service, "card-1").as_deref(), Some("thread-2"));
+        assert!(service.lock().pending_actions.is_empty());
+    }
+
+    /// 坏 board：同样在前置阶段拒绝，观测文件都不该被创建或改写。
+    #[test]
+    fn kanban_observation_corrupt_board_is_rejected_before_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        std::fs::write(service.state_dir.join("board.json"), "{ not json").unwrap();
+        let error = service
+            .driver_step_with_loaded(&loaded_input(&[]), &[], None, &no_caps())
+            .unwrap_err();
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(
+            !service.state_dir.join("observations.json").exists(),
+            "前置读取失败不得留下半份观测"
+        );
     }
 
     /// 会话空闲**不再**等于「跑完了」：一张 running 卡在会话 idle 时状态必须

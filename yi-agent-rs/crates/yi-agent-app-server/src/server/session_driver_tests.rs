@@ -21,7 +21,7 @@ use crate::session_driver::DriverState;
 /// (`Status` 探活、daemon attach 等)统一回 `internal`:这既是诚实的「我不是
 /// 真 daemon」,也让 `attach_cwd_runtime` 按生产里的降级路径失败,而不必起一
 /// 个真 daemon。
-struct FakeDaemon {
+pub(crate) struct FakeDaemon {
     socket: PathBuf,
     calls: Arc<StdMutex<Vec<serde_json::Value>>>,
     stop: Arc<AtomicBool>,
@@ -29,13 +29,13 @@ struct FakeDaemon {
     /// `Some` 只在 `bind` 自建项目目录时出现：那个临时目录必须活到 daemon 结束，
     /// 否则 socket 与项目清单会在断言前被删掉。`bind_at` 的项目目录归调用方所有。
     _dir: Option<tempfile::TempDir>,
-    project: PathBuf,
+    pub(crate) project: PathBuf,
     #[allow(dead_code)]
     runtime_dir: PathBuf,
 }
 
 impl FakeDaemon {
-    fn bind(
+    pub(crate) fn bind(
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + 'static,
@@ -53,7 +53,7 @@ impl FakeDaemon {
     /// 串联夹具要的项目不是 `bind` 随手造的那个空目录,而是一个真实的 git 仓库
     /// (看板要 `git worktree add`、合并要点出 base 分支)。项目的生命周期因此归
     /// 调用方:daemon 只借它的路径。
-    fn bind_at(
+    pub(crate) fn bind_at(
         project: &Path,
         on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
         + Send
@@ -131,11 +131,11 @@ impl FakeDaemon {
         }
     }
 
-    fn calls(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn calls(&self) -> Vec<serde_json::Value> {
         self.calls.lock().unwrap().clone()
     }
 
-    fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn calls_to(&self, method: &str) -> Vec<serde_json::Value> {
         self.calls()
             .into_iter()
             .filter(|call| call["method"] == method)
@@ -257,6 +257,8 @@ impl Host {
             git_diff: &self.git_diff,
             workspaces: &self.workspaces,
             build_agent,
+            #[cfg(test)]
+            before_prompt_send: None,
         }
     }
 
@@ -361,7 +363,7 @@ const DRIVER_PLUGIN: &str = "driver";
 ///
 /// 两处都只写**通用**事实：清单里的通用字段 `session_driver` 与通用常驻登记表
 /// （`resident::require`）。宿主不该认识 `name` 之外的任何插件专有内容。
-fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
+pub(crate) fn install_driver_plugin(project: &Path, resident_dir: &Path, name: &str) {
     let supervisors = project.join(".yi-agent/supervisors");
     std::fs::create_dir_all(&supervisors).unwrap();
     std::fs::write(
@@ -2777,6 +2779,108 @@ async fn kanban_original_session_hot_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 4/7.1:宿主热表快照——驱动记账丢了,热会话仍必须被认出来
+// ---------------------------------------------------------------------------
+
+/// 宿主重启的等价物:**清空驱动记账**(`drivers.clear()`),但会话还在热表里。
+///
+/// 这是本次改造真正要修的场景。旧实现只能从 `DriverState.threads`（「宿主为该
+/// 插件起过哪些会话」）推出 alive/idle，记账一丢，插件看到的是一份空 `threads[]`，
+/// 于是「全员消失」——卡片角标说会话已经没了，而它其实好好躺在热表里。
+///
+/// 断言必须打在**真实请求**上：`loaded_threads` 里要有那个 ID，且 `list` 报
+/// `loaded`、不 stale，同时卡片状态/绑定/工作目录/判词一个都不许变。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_observation_empty_driver_state_keeps_loaded_card() {
+    let project = KanbanProject::new();
+    let home = tempfile::TempDir::new().unwrap();
+    let service = Arc::new(superpowers_kanban_runner::service::BoardService::new(
+        project.state_dir.clone(),
+        project.root.clone(),
+        Some(home.path().to_path_buf()),
+    ));
+    project.enqueue(&service);
+
+    let daemon = FakeDaemon::bind_at(&project.root, {
+        let service = Arc::clone(&service);
+        let state_dir = project.state_dir.clone();
+        move |_project, method, params| {
+            superpowers_kanban_runner::dispatch::dispatch_with_service(
+                &service, &state_dir, None, method, params,
+            )
+        }
+    });
+    let resident_dir = tempfile::TempDir::new().unwrap();
+    install_driver_plugin(&project.root, resident_dir.path(), "superpowers-kanban");
+
+    let mut host = Host::new();
+    let dev_worktree = superpowers_kanban_runner::worktree::worktree_path(
+        &project.root,
+        &superpowers_kanban_core::card::CardId::new(project.card_id.clone()),
+    );
+    block_delegation_for(&host, &dev_worktree);
+    let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+
+    // 起一个会话并把回报落账（同 `kanban_original_session_hot_round_trip`）。
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    assert_eq!(host.threads.len(), 1, "the launch registers one session");
+    let tid = host.threads.keys().next().cloned().unwrap();
+    assert!(
+        host.settle_turn(&tid, Duration::from_secs(20)).await,
+        "the first turn must finish"
+    );
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+    let bound = project.card(&service);
+    assert_eq!(bound["state"], "running");
+    assert_eq!(bound["thread_id"], tid);
+
+    // 记账丢失：宿主重启/断链后 `DriverState` 是空的，但会话仍然是热的。
+    drivers.clear();
+
+    let before = project.card(&service);
+    host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+        .await;
+
+    // ① 真请求里必须带上完整快照，且含这个 ID。
+    let ticks = daemon.calls_to("driver/next");
+    let last = ticks.last().expect("the tick must have asked the plugin");
+    let loaded = last["params"]["loaded_threads"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the tick must carry loaded_threads: {last}"));
+    assert!(
+        loaded
+            .iter()
+            .any(|fact| fact["thread_id"] == serde_json::Value::String(tid.clone())),
+        "a hot session must appear in the complete snapshot: {loaded:?}"
+    );
+    // ② 旧 `threads[]` 这一拍是空的（记账丢了），所以这条不能掩盖问题。
+    assert!(
+        last["params"]["threads"]
+            .as_array()
+            .is_some_and(|threads| threads.is_empty()),
+        "this case is only meaningful when the legacy list is empty: {last}"
+    );
+
+    // ③ 展示：loaded、不 stale。
+    let after = project.card(&service);
+    assert_eq!(after["session_observation"], "loaded");
+    assert_eq!(after["stale"], false);
+    assert!(after["observed_at"].as_str().is_some(), "{after}");
+
+    // ④ 观测绝不改卡片：状态、绑定、工作目录、判词原样。
+    for key in ["state", "thread_id", "workdir", "detail"] {
+        assert_eq!(after[key], before[key], "{key} must not move");
+    }
+    assert_eq!(
+        host.threads.len(),
+        1,
+        "no replacement session may be created"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 7.4:真插件冷串联——重启后必须恢复**同一** thread id,并带上 bash env
 // ---------------------------------------------------------------------------
 
@@ -3218,5 +3322,279 @@ async fn kanban_original_session_cold_refuses_corrupt_history() {
     assert_eq!(
         after, corrupted,
         "a refused restore must not rewrite the history it could not read"
+    );
+}
+
+// ---- Task 4 (T4/T5/T6): 启动期失败收口共享给 launcher ----------------
+
+/// 把本次 prepared 的发送端换成「接收端已关闭」的真实 mpsc。
+///
+/// 这是**真实** send 失败，不是模拟 send 的返回值：`send` 自己发现没有接收者。
+fn close_prepared_delivery(prepared: &mut crate::server::turn::PreparedTurn) {
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    prepared.prompt_tx = tx;
+}
+
+/// T4：插件 `Launch` 的 prepare 成功、但 driver 已退出。
+///
+/// 必须恰好一条 failed `turn/completed`（水位同源）、按身份回滚到 Idle，且错误
+/// 原样上传——这是基线里真实缺的那条收口。
+#[tokio::test(flavor = "multi_thread")]
+async fn sleep_hardening_launch_prompt_failure_settles_the_announced_turn() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let client = crate::broadcast::ClientId::local();
+    let mut output = host.hub.register(client);
+
+    let error = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launcher.before_prompt_send = Some(close_prepared_delivery);
+        launch_via_driver(
+            &mut launcher,
+            &workdir_str,
+            "driven · card-1",
+            "work",
+            (None, None),
+        )
+        .await
+        .expect_err("a closed prompt channel must fail the launch")
+    };
+    assert!(
+        error.to_string().contains("gone before its prompt"),
+        "unexpected error: {error}"
+    );
+
+    let thread_id = host
+        .threads
+        .keys()
+        .next()
+        .expect("the thread is registered before the prompt is delivered")
+        .clone();
+    assert!(
+        host.threads[&thread_id].active_turn_id.is_none(),
+        "the failed launch must roll its own placeholder back"
+    );
+    assert_eq!(
+        *host.threads[&thread_id].status.lock().unwrap(),
+        ThreadStatus::Idle
+    );
+
+    let mut frames = Vec::new();
+    while let Ok(frame) = output.try_recv() {
+        frames.push(frame);
+    }
+    let failed: Vec<_> = frames
+        .iter()
+        .filter(|f| f["method"] == "turn/completed" && f["params"]["status"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "exactly one failed turn/completed");
+    let completed_at = failed[0]["params"]["completed_at"]
+        .as_i64()
+        .expect("failed turn/completed carries completed_at");
+    let meta = host.threads[&thread_id]
+        .store
+        .read_meta(&thread_id)
+        .unwrap()
+        .expect("meta exists");
+    assert_eq!(
+        meta.last_completed_at, completed_at,
+        "launcher watermark must equal the broadcast instant"
+    );
+}
+
+/// T5：cold lead 路径在同一位置失败。
+///
+/// 该路径**不**发 `turn/started`（投递不是客户端请求），所以不得编造
+/// 开始/完成事件、不得写完成水位；只需按身份撤回占位并保留原错误字符串。
+#[tokio::test(flavor = "multi_thread")]
+async fn sleep_hardening_cold_lead_prompt_failure_rolls_back_without_fabricating_events() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+    let lead_id = "thread-lead-cold".to_string();
+
+    // 先真起一个会话并落盘，再摘掉内存登记 ⇒ 冷启动形态。
+    let seed = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launch_via_driver(&mut launcher, &workdir_str, "lead", "seed", (None, None))
+            .await
+            .expect("the seed session must start")
+    };
+    assert!(host.settle_turn(&seed, Duration::from_secs(10)).await);
+    std::fs::rename(
+        workdir
+            .join(".yi-agent/threads")
+            .join(format!("{seed}.meta.json")),
+        workdir
+            .join(".yi-agent/threads")
+            .join(format!("{lead_id}.meta.json")),
+    )
+    .unwrap();
+    std::fs::rename(
+        workdir
+            .join(".yi-agent/threads")
+            .join(format!("{seed}.jsonl")),
+        workdir
+            .join(".yi-agent/threads")
+            .join(format!("{lead_id}.jsonl")),
+    )
+    .unwrap();
+    // 播种那一轮自己会写完成水位；冷投递不得改动它。
+    // （上面已把文件改名成 `lead_id`，所以按新 id 读。）
+    let watermark_before = crate::thread_store::ThreadStore::new(&workdir)
+        .read_meta(&lead_id)
+        .unwrap()
+        .expect("seed meta exists")
+        .last_completed_at;
+    assert!(
+        watermark_before > 0,
+        "the seed turn must have written a real completion watermark"
+    );
+    host.threads.remove(&seed);
+    host.pending_activation.remove(&seed);
+
+    // **在播种之后**才登记监听端：播种那一轮自己会发 `turn/started`，把它算进
+    // 「冷投递有没有编造事件」会得到假阳性。
+    let client = crate::broadcast::ClientId::local();
+    let mut output = host.hub.register(client);
+
+    let error = {
+        let mut launcher = host.launcher(&build_test_agent);
+        launcher.before_prompt_send = Some(close_prepared_delivery);
+        launcher.lead_target = Some(LeadTarget {
+            cwd: workdir_str.clone(),
+            thread_id: lead_id.clone(),
+        });
+        launcher
+            .deliver_to_lead(&crate::lead::LeadEnvelope {
+                project_key: "proj".into(),
+                from_thread_id: "thread-caller".into(),
+                text: "please merge".into(),
+                request_id: None,
+            })
+            .await
+            .expect_err("a closed lead driver must fail the delivery")
+    };
+    assert_eq!(
+        error.to_string(),
+        "lead driver is gone before its first prompt",
+        "the original error string must be preserved"
+    );
+
+    assert!(
+        host.threads[&lead_id].active_turn_id.is_none(),
+        "the cold lead failure must roll its own placeholder back"
+    );
+    assert_eq!(
+        *host.threads[&lead_id].status.lock().unwrap(),
+        ThreadStatus::Idle
+    );
+
+    let mut frames = Vec::new();
+    while let Ok(frame) = output.try_recv() {
+        frames.push(frame);
+    }
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f["method"] == "turn/completed")
+            .count(),
+        0,
+        "no turn/started was announced, so no completion may be fabricated"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f["method"] == "turn/started")
+            .count(),
+        0,
+        "the cold lead path announces nothing at all"
+    );
+    let meta = crate::thread_store::ThreadStore::new(&workdir)
+        .read_meta(&lead_id)
+        .unwrap()
+        .expect("lead meta exists");
+    assert_eq!(
+        meta.last_completed_at, watermark_before,
+        "no completion watermark may be written for an unannounced turn"
+    );
+}
+
+/// T6：warm（已存在会话的追问）是非回归保护。
+///
+/// warm 分支没有 prepared、不走 hook；它失败时**必须**保持原有 turn 的占位与
+/// Running 状态不动，且不得发 failed、不得写水位。
+#[tokio::test(flavor = "multi_thread")]
+async fn sleep_hardening_warm_append_failure_leaves_the_live_turn_alone() {
+    let mut host = Host::new();
+    let workdir = host.workdir.clone();
+    let workdir_str = workdir.to_string_lossy().to_string();
+
+    // warm = 组长已在本进程内：`deliver_to_lead` 直接往既有 driver 投递，
+    // 不 prepare、不占位、不碰 `active_turn_id`。
+    let thread_id = {
+        let mut launcher = host.launcher(&build_slow_agent);
+        launch_via_driver(&mut launcher, &workdir_str, "live", "slow", (None, None))
+            .await
+            .expect("the slow session must start")
+    };
+    let live_turn = host.threads[&thread_id]
+        .active_turn_id
+        .clone()
+        .expect("the slow turn must be running");
+    *host.threads[&thread_id].status.lock().unwrap() = ThreadStatus::Running;
+
+    let client = crate::broadcast::ClientId::local();
+    let mut output = host.hub.register(client);
+    let (dead_tx, dead_rx) = mpsc::channel::<TurnPrompt>(1);
+    drop(dead_rx);
+    host.threads.get_mut(&thread_id).unwrap().prompt_tx = dead_tx;
+
+    let error = {
+        let mut launcher = host.launcher(&build_slow_agent);
+        launcher.lead_target = Some(LeadTarget {
+            cwd: workdir_str.clone(),
+            thread_id: thread_id.clone(),
+        });
+        launcher
+            .deliver_to_lead(&crate::lead::LeadEnvelope {
+                project_key: "proj".into(),
+                from_thread_id: "thread-caller".into(),
+                text: "more work".into(),
+                request_id: None,
+            })
+            .await
+            .expect_err("a closed warm lead driver must fail the delivery")
+    };
+    assert_eq!(
+        error.to_string(),
+        "lead driver is gone",
+        "the warm path keeps its existing error string"
+    );
+
+    assert_eq!(
+        host.threads[&thread_id].active_turn_id.as_deref(),
+        Some(live_turn.as_str()),
+        "a failed warm append must not clear the existing turn"
+    );
+    assert_eq!(
+        *host.threads[&thread_id].status.lock().unwrap(),
+        ThreadStatus::Running,
+        "a failed warm append must not report Idle"
+    );
+
+    let mut frames = Vec::new();
+    while let Ok(frame) = output.try_recv() {
+        frames.push(frame);
+    }
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f["method"] == "turn/completed")
+            .count(),
+        0,
+        "the warm failure must not fabricate a completion for the live turn"
     );
 }

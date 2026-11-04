@@ -1919,3 +1919,221 @@ async fn thread_fork_refuses_when_the_working_directory_is_gone() {
     );
     h.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 看板加载观测:普通 RPC `thread/resume` 恢复的会话必须被热发现
+// ---------------------------------------------------------------------------
+
+/// 走**普通** `thread/resume`（不是插件的 `resume_append`）把一个冷会话拉回热表，
+/// 看板必须从「未观测到 / 未加载」变成「已加载」，且不额外花钱。
+///
+/// 这是整条链路唯一不能靠插件自测证明的一环：`loaded_threads` 必须由 serve 主循环
+/// 从**真实** `threads` 表采样发出。插件自己的测试只能证明「给了快照我就会用」。
+///
+/// 断言用真实请求与真实 `list`：
+/// - 首个 tick 之后是 `not_loaded`（热表确实空，看板的卡预置在 running）；
+/// - resume 之后 `loaded`，`thread_id` / `state` 一个不动；
+/// - 计数 mock Provider 证明恢复与 tick **没有**多跑一次模型回合——观测绝不能
+///   为了清角标而发 turn。
+#[tokio::test(flavor = "multi_thread")]
+async fn kanban_observation_plain_rpc_resume_is_discovered() {
+    use std::sync::atomic::AtomicUsize;
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let project = project_dir.path().canonicalize().unwrap();
+    init_git_repo(&project);
+    let thread_id = "thread-observation-cold";
+
+    // 开发工作目录先建出来：卡的 workdir 与冷会话的 cwd 都用它（见下文隔离说明）。
+    let workdir = project.join("dev-tree");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    // 一张预置的 running 卡，执行会话就是这个 ID（fixture 数据，不是生产卡）。
+    let state_dir = project.join(".yi-agent/superpowers-kanban");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let card_id = superpowers_kanban_core::card::CardId::new("card-obs");
+    let mut board = superpowers_kanban_core::board::Board::new();
+    board.enqueue(
+        card_id.clone(),
+        "a.spec.md".into(),
+        "a.plan.md".into(),
+        chrono::Local::now(),
+    );
+    board
+        .transition(&card_id, superpowers_kanban_core::card::CardState::Running)
+        .unwrap();
+    board
+        .set_thread_id(&card_id, thread_id.to_string())
+        .unwrap();
+    board.set_workdir(&card_id, workdir.clone()).unwrap();
+    superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+
+    // 一个**真的**存在于磁盘、但不在热表里的会话（合法空日志）。
+    //
+    // cwd 刻意指到 `dev-tree` 而不是项目根：`thread/resume` 会给会话所属目录 attach
+    // 一个**真** runtime（`<cwd>/.yi-agent/runtime`），而假 daemon 正听着项目根的那个
+    // 路径。两者撞上时真 daemon 启动会按路径 unlink 掉假 daemon 的 socket 节点，
+    // 假 daemon 就再也收不到请求、也醒不过来。把两者分开放，才是真实隔离。
+    let store = crate::thread_store::ThreadStore::new(&project);
+    store
+        .create(&crate::thread_store::ThreadMeta {
+            thread_id: thread_id.to_string(),
+            cwd: workdir.to_string_lossy().to_string(),
+            model: "test".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            title: None,
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            driver_project: None,
+            driver_ref: None,
+            model_ref: None,
+            reasoning_effort: None,
+            tag: None,
+            preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
+            anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
+            forked_from: None,
+            extra_roots: Vec::new(),
+            role: None,
+        })
+        .unwrap();
+
+    let home = tempfile::TempDir::new().unwrap();
+    let service = Arc::new(superpowers_kanban_runner::service::BoardService::new(
+        state_dir.clone(),
+        project.clone(),
+        Some(home.path().to_path_buf()),
+    ));
+    // 假 transport、真判定：驱动插件的每个请求原样交给真实 dispatch。
+    let daemon = super::super::session_driver_tests::FakeDaemon::bind_at(&project, {
+        let service = Arc::clone(&service);
+        let state_dir = state_dir.clone();
+        move |_project, method, params| {
+            superpowers_kanban_runner::dispatch::dispatch_with_service(
+                &service, &state_dir, None, method, params,
+            )
+        }
+    });
+
+    // 计数 provider：只记**真正**发起的模型调用，用来证明观测不发 turn。
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl yi_agent_core::Provider for CountingProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(futures::stream::iter(Vec::new()).boxed())
+        }
+    }
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingProvider {
+        calls: Arc::clone(&counted),
+    });
+
+    let mut cfg = test_config();
+    cfg.workdir = project.clone();
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(Arc::clone(&provider), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    super::super::session_driver_tests::install_driver_plugin(
+        &project,
+        h.resident_dir.path(),
+        "superpowers-kanban",
+    );
+    initialize(&mut h).await;
+    let calls_before = calls.load(Ordering::SeqCst);
+
+    // 首个 tick 之后：热表是空的，所以是「明确未加载」。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let listed = service.list();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the driver tick never reported the held card: {listed}"
+        );
+        if listed["cards"][0]["session_observation"] == "not_loaded" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 真实普通入口：不是插件的 `resume_append`。
+    let resumed = rpc(
+        &mut h,
+        2,
+        "thread/resume",
+        serde_json::json!({ "threadId": thread_id }),
+    )
+    .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+
+    // 下一次 tick 就能在完整快照里看到它。
+    loop {
+        let listed = service.list();
+        if listed["cards"][0]["session_observation"] == "loaded" {
+            assert_eq!(listed["cards"][0]["thread_id"], thread_id);
+            assert_eq!(listed["cards"][0]["state"], "running");
+            assert_eq!(listed["cards"][0]["stale"], false);
+            assert_eq!(
+                listed["cards"][0]["workdir"],
+                serde_json::Value::String(workdir.to_string_lossy().into_owned()),
+                "观测不得改写工作目录"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resumed session was never observed: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 观测不花钱：恢复本身不会起 turn，tick 也不会。
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before,
+        "observation must not spend a model turn"
+    );
+
+    // 请求里确实带了完整快照，且没伪造 Launch/ResumeAppend 结果。
+    let ticks = daemon.calls_to("driver/next");
+    assert!(!ticks.is_empty(), "the tick must have asked the plugin");
+    assert!(
+        ticks.iter().any(
+            |call| call["params"]["loaded_threads"]
+                .as_array()
+                .is_some_and(|loaded| loaded
+                    .iter()
+                    .any(|fact| fact["thread_id"] == serde_json::Value::String(thread_id.into())))
+        ),
+        "the serve loop must report the resumed session in loaded_threads"
+    );
+    assert!(
+        ticks.iter().all(|call| call["params"]["results"]
+            .as_array()
+            .is_some_and(|results| results.is_empty())),
+        "a plain resume is not a driver action: no fabricated results"
+    );
+
+    // 先收 daemon 再收 server:`shutdown` 会拆掉项目 runtime 目录连带删掉 socket,
+    // 之后 `FakeDaemon::drop` 的「连接一下把自己唤醒」就落到不存在的路径上,
+    // `join()` 会永远等一个还在 `accept()` 的线程。
+    drop(daemon);
+    h.shutdown().await;
+}

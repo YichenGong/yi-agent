@@ -1,5 +1,31 @@
 # yi-agent-tools
 
+## 防休眠加固交叉引用（已实现）
+
+显式后台进程保活意图与读回见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md) §7、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 5–6。需求 P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数。
+
+完成判据（自动化已通过，详见 [verification](../research/2026-11-03-idle-sleep-hardening-verification.md)）：
+`cargo test -p yi-agent-tools --lib sleep_hardening` 6 项（B1–B4），加
+`cargo test -p yi-agent-tools --lib process::` 32 项无回归。
+实现位置：`crates/yi-agent-tools/src/process/tools.rs`（`ProcessStartArgs` 的
+`#[serde(default)] prevent_idle_sleep: bool` + schema `type: boolean` /
+`default: false`、不在 `required` 里；`"true"` / `null` / `1` 被 serde 拒绝）与
+`crates/yi-agent-tools/src/process/manager.rs`
+（`ProcessStartOptions` / `ManagedProcess` / snapshot / 结果 DTO 都携带意图，
+只在构造时写入、不按状态改写；`has_sleep_preventing_processes()` 只遍历内存表，
+`Starting | Running | Ready` 算活跃，`Ready` 不是终态）。
+
+desktop 侧同一意图由 `ProcessInfo` / `ProcessReadResult` 的可选字段承载，
+`desktop/src/lib/processes.ts` 的 `requestsIdleSleepPrevention` 把「缺值按 false」
+固化成唯一入口（当前无 UI 消费者）；`npx vitest run` 2051 passed。
+
+变异证据：schema 改 `type: "string"` → `sleep_hardening_schema_exposes_explicit_boolean` 红；
+谓词去掉 `Ready` → `..._predicate_covers_every_status` 与
+`..._gated_process_reports_the_intent_end_to_end` 红（"status Ready with
+prevent_idle_sleep=true must yield true"）。
+
+遗留的既有跳转（`JumpToProcess`）与 old `App` 老流程无关，不受影响。
+
 ## 模块说明
 
 yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统）、Shell、Web、Skill 核心工具能力，通过实现 `yi-agent-core` 的 `Tool` trait 接入 agent。
@@ -48,6 +74,22 @@ yi-agent 的内置工具实现 crate，提供 coding agent 的 FS（文件系统
 - [x] FS 工具的多根会话（根集替代单根）— `ToolsContext` 从**单一 root** 改为**根集**（`crates/yi-agent-tools/src/context.rs:21` `with_roots` / `:38` `roots()`，`roots[0]` 恒为主根；`:18` 单根构造等价于单元素根集，既有调用点语义不变），`relative_to_roots`（`:45` / `:61`）在命中根上算相对路径供 glob/grep 渲染；越界检查改为**逐根** `crates/yi-agent-tools/src/fs/path_util.rs:64`（`resolve_and_check_roots`：相对路径拼**主根**，绝对路径必须落在**任一**根内，`:137` `resolve_for_write_roots` 同理并额外允许尚不存在的父目录）；逃逸检查强度与单根时**一致**（`..`、根外绝对路径、末段符号链接、中间目录符号链接四类 × 每个根）。空根集是错误而非"放行一切"（`:434` / `:455`）。验证 `cd yi-agent-rs && cargo test -p yi-agent-tools`（`fs::path_util` 多根 10 例：`roots_resolve_relative_against_primary` / `roots_accept_absolute_path_inside_secondary` / `roots_reject_dotdot_escape_out_of_all_roots` / `roots_reject_absolute_outside_all_roots` / `roots_reject_symlink_escape_from_secondary` / `roots_reject_symlinked_parent_escape_on_write` / `roots_write_rejects_symlink_escape_from_secondary` / `roots_write_allows_nonexistent_parent_in_secondary` / `empty_roots_is_an_error`（读与写各一）等；`context.rs` 的 `with_roots_keeps_primary_first_and_shares_paths` / `relative_to_roots_reports_the_matching_root`）— [设计](../superpowers/specs/2026-10-17-linked-workspace-roots-design.md)
 - [x] 注册 API 的**根集**参数语义 + git 内部根只进沙箱 — `register_builtin_tools_with_sandbox`（`crates/yi-agent-tools/src/lib.rs:71`）与 `register_builtin_tools_with_controller`（`lib.rs:90`）收**两个刻意分开**的根列表：`roots` 是 FS 工具的多根集（`roots[0]` 恒为主根，`crates/yi-agent-tools/src/context.rs:21` 的 `with_roots`；`read`/`write`/`edit`/`glob`/`grep` 的逃逸检查与相对路径解析以整集为准，见 `fs/path_util.rs:64`），`sandbox_writable_roots` 是 **shell 沙箱**的额外可写根（`lib.rs:75` → `SandboxPolicy::with_controller(ctx.root(), sandbox_writable_roots, controller)` `lib.rs:99`）。单根入口 `register_builtin_tools`（`lib.rs:53`）等价于 `roots = [root]` + 空沙箱可写根，既有调用点语义不变。**约束**：`git_writable_roots_for_worktree` 产出的 git 内部目录（`yi-agent-rs/crates/yi-agent-subagent/src/lib.rs:1239`）只能作为 `sandbox_writable_roots` 传入、**绝不**并入 `roots`，否则 `write` 能直写 `.git`；该 worker 侧的分离由 `cargo test -p yi-agent-subagent --lib fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs` 钉住。验证：`cargo test -p yi-agent-tools --lib with_roots_keeps_primary_first_and_shares_paths`、`cargo test -p yi-agent-tools --lib relative_to_roots_reports_the_matching_root`（`crates/yi-agent-tools/src/context.rs:89` / `:100`）— [设计](../superpowers/specs/2026-10-17-linked-workspace-roots-design.md)
 - [x] 注入会话环境变量到 shell 子进程（`YI_AGENT_THREAD_ID`）— `ToolsContext` 新增 `session_env` 字段（`crates/yi-agent-tools/src/context.rs:15`，默认空 → 子进程行为与今天逐字节一致），构造器 `with_roots_and_env`（`context.rs:29`）与读取器 `session_env()`（`context.rs:39`），既有 `with_roots`（`context.rs:24`）委托传空集；`BashTool` spawn 时 `.envs(self.ctx.session_env().iter().cloned())`（`crates/yi-agent-tools/src/shell/bash.rs:171`）——让会话内经 bash 调用的命令知道自己是哪个会话（如 `superpowers-kanban add-prequeued` 用它记下来源会话）。新注册入口 `register_builtin_tools_with_controller_and_env`（`crates/yi-agent-tools/src/lib.rs:107`）带第 5 参 `session_env`；既有 `register_builtin_tools_with_controller`（`lib.rs:90`）签名不变、内部委托传空集，故 7 个既有调用点无需改动。验证：`cargo test -p yi-agent-tools`（`context::tests::a_context_carries_its_session_env`、`shell::bash::tests::bash_injects_the_session_env_into_the_child`、`lib::tests::the_env_carrying_registration_reaches_the_bash_tool`——真实调用 bash 断言子进程读到注入值）
+- [x] 受管进程客户端的工具侧（`managed_process.rs` + `register_builtin_tools_managed`） —
+  `ManagedChild` 不再是「一把锁住 socket 的结构体」：它只持三条管道，连接交给一个专属线程
+  （`serve_child`）按帧**串行**处理 `Ask { request, timeout, reply }`。理由是被取消的 caller
+  future 会连同它持有的 `&mut` 一起消失，而 socket 里可能正停在半帧上——由线程独占连接后，取消只丢掉
+  一个 `oneshot`，协议不会错位。方法因此都是 `&self`：`wait` / `try_wait` / `terminate_group` /
+  `retain_group`，另给后台 exit watcher 一个轻量的 `ManagedWatcher`。**正常结束必须调
+  `retain_group()`**：`Drop` 的默认动作是尽力终止整组，而 `nohup ... &` 这类有意留下的后台进程正需要
+  「连接关了但组还活着」。注册入口 `register_builtin_tools_managed`（`crates/yi-agent-tools/src/lib.rs`）
+  把 `(ManagedProcessPolicy, ManagedSpawner)` 同时接到 bash 与 `ProcessManager::into_managed`；
+  `resolve_program` 转 `pub` 供 runtime 的 MCP 启动器复用。判据：
+  `cargo test -p yi-agent-tools`（295 lib passed）、`cargo test -p yi-agent-tools --test managed_bash`
+  （3 passed，含 `a_managed_command_with_slow_output_does_not_stall_the_wait_loop`——10 个 tick ×
+  100ms 期间 stderr 必须持续到达）、`cargo test -p yi-agent-tools --test managed_process_policy`
+  （2 passed）
+
 **验证命令：** `cargo test -p yi-agent-tools`（lib + 集成全绿；新增 `session_env` 3 例）
 
 - [x] 临时旁问受限文件访问 — `SideReadAccess`（`side_read/mod.rs:99`）用侧用接口覆盖 read/read_document/view_image/glob/grep：每次调用重查动态根授权、打开前后校验路径未被换掉，附件映射同样走这套检查不能借它绕过撤权；有界阻塞 IO 由 `SideBlockingPool`（`side_read/blocking.rs:56`，2 线程 / 每任务 1 并发 / 8 队列 / 4 秒超时）承担，旁支不会饿死父的线程池。验收：`cargo test -p yi-agent-tools --lib side_` → 40 通过（含 `side_read_access_rechecks_roots_and_blocks_path_races`）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6、§12.1。
+- [x] 托管进程选择器公开参数契约修复 — C1–C7 全部验收。C1：`process_selector_schema()` 显式 `required: []`，工具与字段说明写明「exactly one / 省略另一字段 / 不用空字符串占位」（`crates/yi-agent-tools/src/process/tools.rs`），`cargo test -p yi-agent-tools --lib process::tools::tests::process_selector_schema_contract`（先红于缺失 `required`）。C2/C3：`process_selector_argument_contract` 覆盖 4 种合法单选择器与 8 组非法输入，拒绝不改变 status/pid/ready；3 种突变均被捕获。C4：`crates/yi-agent-tools/tests/process_selector_request_contract.rs` 让真实 `ToolRegistry` schema 穿过 Anthropic / Chat / Responses 三条真实 provider 路径。C5/C6：**隔离实例（`YI_AGENT_HOME=/tmp/yi-iso-selector`）+ 修复版二进制 + 真实 HORIZON-DeepSeek + 真实网关 `llmapi.horizon.auto`（chat 通道）**实测：模型仅传 `name` 读取成功、仅传 `process_id` 读取成功、双有效字段返回 exactly-one 错误；用户在用实例未触碰。C7：`just ci` exit 0（16 道门禁）。取证与判别实验见 [取证记录](../research/2026-11-03-process-selector-contract-evidence.md) §11–§13，其中「缺失 required 即全必填」的根因假设已由实验证伪（`process_read` 另有 cursor/max_bytes，与报告现象不符）。**遗留（不影响本条目验收）**：①已部署实例仍为未修复版 `308ccaa4`，线上生效需按发布流程替换；②首个变形边界仍未定位，但修复后的定义在真实网关下已验证可用。fixture：`docs/research/fixtures/2026-11-03-process-selector-{transmitted-definition,live-acceptance}.json`。

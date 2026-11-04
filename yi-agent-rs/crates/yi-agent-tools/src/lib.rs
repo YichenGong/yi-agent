@@ -6,6 +6,7 @@
 mod context;
 mod error;
 pub(crate) mod fs;
+mod managed_process;
 mod process;
 mod process_group;
 mod sandbox;
@@ -25,6 +26,11 @@ use yi_agent_core::ToolRegistry;
 pub use context::ToolsContext;
 pub use error::ToolsError;
 pub use fs::{EditTool, GlobTool, GrepTool, ReadDocumentTool, ReadTool, ViewImageTool, WriteTool};
+pub use managed_process::resolve_program;
+pub use managed_process::{
+    ChannelFactory, ManagedChild, ManagedExit, ManagedProcessPolicy, ManagedSpawner,
+    ON_EXIT_VALUES, validate_on_exit,
+};
 pub use process::{
     ManagedProcessSnapshot, OnExitPolicy, ProcessEvent, ProcessKillTool, ProcessListTool,
     ProcessManager, ProcessReadResult, ProcessReadTool, ProcessSelector, ProcessStartOptions,
@@ -124,9 +130,37 @@ pub fn register_builtin_tools_with_controller_and_env(
     sandbox_writable_roots: Vec<PathBuf>,
     session_env: Vec<(String, String)>,
 ) {
+    register_builtin_tools_managed(
+        registry,
+        roots,
+        controller,
+        sandbox_writable_roots,
+        session_env,
+        None,
+    );
+}
+
+/// Same as [`register_builtin_tools_with_controller_and_env`], but every process
+/// the tools start goes through `managed`.
+///
+/// `managed` carries the owner a spawned group belongs to and the channel it is
+/// started on. Without it, `bash` and the process tools keep their original direct
+/// spawn, which is correct only where there is no frontend to reclaim for.
+pub fn register_builtin_tools_managed(
+    registry: &mut ToolRegistry,
+    roots: Vec<PathBuf>,
+    controller: SandboxController,
+    sandbox_writable_roots: Vec<PathBuf>,
+    session_env: Vec<(String, String)>,
+    managed: Option<(ManagedProcessPolicy, ManagedSpawner)>,
+) {
     // FS 根集 = 整集（关联根也进工具层）；shell 沙箱的主根仍取 `ctx.root()`（主根），
     // 额外可写根只认调用方给的沙箱汇总项。
-    let ctx = Arc::new(ToolsContext::with_roots_and_env(roots, session_env));
+    let mut context = ToolsContext::with_roots_and_env(roots, session_env);
+    if let Some((policy, spawner)) = managed {
+        context = context.into_managed(policy, spawner);
+    }
+    let ctx = Arc::new(context);
     let sandbox = SandboxPolicy::with_controller(ctx.root(), sandbox_writable_roots, controller);
     // A read-only session has no write/edit tool surface, in addition to the
     // process-level file-write denial enforced for shell commands.

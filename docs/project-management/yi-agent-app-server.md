@@ -1,5 +1,35 @@
 # yi-agent-app-server（GUI app-server）
 
+## 防休眠加固交叉引用（已实现）
+
+启动失败收口、电源线程生命周期及后台 busy 接线见 [spec](../superpowers/specs/2026-11-03-idle-sleep-hardening-design.md)、[plan](../superpowers/plans/2026-11-03-idle-sleep-hardening-impl.md) Tasks 2–4、6。需求 P2/P3/P4 统一计入 [yi-agent-power](./yi-agent-power.md)，本模块不重复计数。
+
+完成判据（自动化已通过，详见 [verification](../research/2026-11-03-idle-sleep-hardening-verification.md)）：
+`cargo test -p yi-agent-app-server --lib sleep_hardening` 22 项（T1–T7 / G1–G5 / B5–B7），
+加整包 `--lib` 1230 passed / 7 ignored 无回归。
+
+关键位置：
+- `server/turn/failure.rs`：`rollback_turn`（按 `active_turn_id` 身份回滚）与
+  `fail_announced_turn`（一次 `now_millis` 同时用于落盘水位与 `turn/completed`
+  广播；落盘/广播失败只记日志、不跳过回滚）。`server/turn/mod.rs` 的
+  `start_turn_core_inner` 在 `turn/started` 之后的任一失败（outbound 或
+  prompt 投递）都走它，且投递失败**不再**补第二个同 id 的 RPC 响应。
+- `server/driver/launcher.rs`：插件 launch 与 cold lead 首投失败复用同一组
+  共享 helper（删掉了 launcher 私有的重复实现）；cold lead 仍报原错误串
+  `"lead driver is gone before its first prompt"` 且不伪造 `turn/completed`；
+  warm 分支不 prepare、不占位，行为不变。
+- `power_guard.rs`：`spawn` / `update` 一次提交一致快照，
+  `Mutex<GuardInputs>` + `Condvar::wait_timeout_while` 同时处理输入换版 / stop /
+  伪唤醒；锁不跨 probe 或 FFI。
+- `power_busy.rs::local_busy`：`active_turn_id` 或非 Idle 状态，或
+  `process_manager.has_sleep_preventing_processes()`，任一成立即忙；遍历进程表时
+  不持状态锁。
+
+变异证据：RPC 投递失败只清占位 → T1 红（"the session must return to Idle"）；
+`rollback_turn` 去掉身份比较 → T3 红；落盘另取一个较早时间 → 水位同源断言红；
+删 cold lead 的 `rollback_turn` → T5 红；`update` 不发 `notify_one` → G4 红；
+等待谓词恒真 → G2/G4/G5 红。
+
 ## 模块说明
 
 `yi-agent-app-server` 是桌面 GUI 的后端进程：一个长驻进程，通过 **stdio 上的
@@ -30,6 +60,8 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 - 不在本 crate 实现前端 UI（Tauri/前端另仓）
 
 ## Features
+
+- [x] **长历史 WebSocket 出口有界背压** — `broadcast.rs::Broadcaster::broadcast_await` 对历史与关键通知并发等待客户端入队：本地出口保持可靠等待，WebSocket 最多等待 10 秒，持续停滞才摘除，并由 `ws.rs` 的连接检测关闭；实时逐字流策略不变。判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib a_critical_notification_survives_a_full_outbound_queue`（本地/WS 满队列后关键帧完整送达）、`cargo test -p yi-agent-app-server --lib a_stalled_ws_is_removed_after_fast_clients_receive_the_critical_frame`（快端先收到当前帧、慢端有界剔除）。长历史完整生效还需更新中继和手机前端，见 [升级说明](../../deploy/relay/README.md)。真机弱网验收尚未执行。
 
 - [x] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`
 （69 passed / 4 ignored）、`--lib resume_append_`（21 passed）、
@@ -227,3 +259,51 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
       [计划](../../superpowers/plans/2026-11-01-test-extraction-c1-impl.md)
 
 - [x] 临时旁问生命周期与多端协议 — 宿主侧六个 RPC（`side/open|list|readItems|turnStart|turnInterrupt|close`）与四类通知（`side/changed|itemUpdated|turnCompleted|closed`）已落地：分页快照在注册表锁内捕获一致基线（`src/side_conversation/replay.rs` 的 `ReplayBaseline::from_snapshot`，`SideRegistry::snapshot`），锁外按**完整信封字节**试装（`SIDE_ENVELOPE_BUDGET_BYTES = 512 KiB`、`SIDE_PAGE_BUDGET_BYTES = 512 KiB - 8 KiB`、`encode_side_envelope`）；token 绑定 connection+side+generation，cursor 必须等于已发条数，每连接每 side 一份、宿主 8 份 / 128 MiB，末页/断连/关闭三种释放路径（`read_page` / `release_connection` / `release_side`，断连在 `server/transport/mod.rs` 错误臂、关闭经 `SideRegistry::attach_replay` + `release_side_snapshots`）；修订序号在**同一把 entry 锁内**推进（`SideRegistry::stage`），逐字 item 按 50ms 节流且收尾强制 flush （`TurnPublisher`），`turnCompleted` 带 `reason`（机器串）与 `error`（人读消息），`side/closed` 为终态且走带背压投递；所有旁支帧按**父** threadId 过滤（`Notification::thread_key`）。能力位已翻为 `true`。验收：`cargo test -p yi-agent-app-server --lib side_`（100 例，含 `side_events_follow_parent_subscription_without_polluting_parent`、`side_close_publishes_a_terminal_frame_for_its_generation`、`side_publish_after_close_is_a_no_op`、`pages_are_cut_by_bytes_not_by_count`、`side_frame_size_uses_full_envelope`、`side_snapshot_token_does_not_cross_connections`）、`cargo test -p yi-agent-app-server --lib`（1310）、`cargo clippy --workspace --all-targets` 干净；桌面端已接线（Task 14–17）：连接/宿主隔离（`desktop/src/lib/sideConversation.ts` 的 `sideHostKey`/`SideConversationRouter`）、快照对账与未确定提交（`desktop/src/lib/sideSync.ts`）、共享命令策略（`desktop/src/lib/sideCommands.ts`）、旁支视图与关闭确认（`desktop/src/hooks/useSideConversationController.ts`、`desktop/src/components/SideConversationHeader.tsx`、`desktop/src/lib/sideItems.ts`）。TUI（Task 18–20）已接线（见 `yi-agent-tui.md`）。剩余：§12.5 桌面 + 手机同 relay 的真实设备联合验收。— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §8、§12.2。
+- [x] 迁移后不再自动重装旧值守（Task 10） — `yi-agent-rs/crates/yi-agent-app-server/src/{server.rs,rpc/ui.rs}`、
+  `src/server/watchman_install_tests.rs`、`src/server/tests/plugin_theme.rs`。三处自愈入口都查实例级
+  退休标记（`yi_agent_supervisors::lifecycle::retirement`），缺一处就会「启动时卸载、装插件时又装回」：
+  `plugin/install` 的收尾（`ensure_watchman_installed_in`）、`ui/settings/write` 的开关臂
+  （已退休时只允许关，打开回 `warning` 说明登录项**故意**未重装）、会话期 `spawn_resident_watch_loop`
+  经 `watch::once_unattended`（退休后不再无人拉起 daemon）。偏好键不因迁移被改写：那是用户的配置。
+  反射源与迁移标记同属实例目录，故 `AppState` 的 `resident_dir` 同时充当实例根，测试注入的隔离
+  目录自然生效。判据：`cargo test -p yi-agent-app-server --lib`（1161 passed，含
+  `watchman_install_tests::a_retired_instance_never_reinstalls_the_watchman`、
+  `plugin_theme::re_enabling_the_watchman_on_a_retired_instance_installs_nothing`）；**变异验证**：
+  去掉任一处的退休判断 → 对应用例红（均实测 RED 后恢复）
+- [x] 本地 stdio 握手携带桌面壳的窄授权（Task 13） — 侧车不再自己猜「谁在替 App 干活」，
+  而是从**本地 stdio 的 `initialize`** 收一次壳的声明：`ShellAuthorization{client_run_id,
+  scope_key(可选), daemon_instance_id(可选), issued_by_shell}`。三条性质都是硬约束：
+  ① 只认 stdio —— `client == ClientId::local()` 才算，ws／relay 客户端发同一段 JSON
+  一律忽略（否则一台手机就能自称 App 的 owner）；② 不携带凭据 —— 过管道只有身份
+  与代际，没有 credential，所以继承进程环境的工具拿不到任何可续租的东西（单测断言
+  序列化结果不含 `credential`／`secret`／`token`）；③ `scope_key` 可选 —— 侧车启动
+  时用户还没打开任何项目，此时「没有 scope」是事实而不是无权限。畸形字段**不是**
+  握手失败（CLI 的常态就是没有这个字段），只当「没有壳」。被接受的声明以
+  `result.shell.{clientRunId,scopeKey}` 回显，让「壳被认出来」成为可观测事实而不是
+  内部写盘。代码：`src/shell_authorization.rs`、`src/server.rs` 的 `initialize` 分支
+  与 `ClientShellAuthorizations` 表、`src/ws.rs`（纯 ws 给空表）。判据：
+  `cargo test -p yi-agent-app-server --lib shell_authorization`（9 例：本地可带、
+  ws 伪造被拒、非 bridge 签发被拒、空 client/scope 被拒、无 scope 仍可识别、
+  缺字段视为无壳、畸形不破坏握手、roundtrip、不含密钥）+
+  `cargo test -p yi-agent-app-server --lib handshake`（含三条端到端：stdio 握手回显
+  壳身份、纯 CLI 握手无 `shell` 键、伪造 `issued_by_shell:false` 被忽略）+
+  `a_websocket_handshake_cannot_claim_the_desktop_shell`（真实 ws 连接上不被认作壳）
+- [x] 只读运行时状态 `runtime/status` 与兼容矩阵（Task 16） — 新增 `Domain::Runtime`
+  与 `src/rpc/runtime.rs`，本域**只有** `runtime/status` 一个方法。刻意没有
+  `runtime/confirmRestart`／`runtime/stop`：业务 RPC 能经 websocket／relay 抵达，
+  而控制通道是本机 unix socket，把它放进 dispatcher 就等于给远端一个本机才有的权力；
+  桌面壳自己持有租约与身份，preview／confirm 由它经控制通道发起，多一条业务 RPC 就是
+  第二处能消费一次性 token 的地方。兼容答案是**分类**而非布尔：`same_build`／
+  `compatible_mismatch`／`control_only`／`legacy_temporary_choice_required`／
+  `unknown` 各对应不同的 UI 决定；业务不兼容但带 `control.v1` 是 `control_only`
+  （可被切换、不能跑任务），没有该能力则是 `unknown`（绝不假装控制通道存在）。无应答
+  也是答案：`unknown` + 一句解释，而不是错误或一串零。`counts.complete` 在 guardian
+  侧恒为 false —— 它看不到 daemon 的 executor／plugin 队列。scope 由会话自己的 workdir
+  推导，**不接受请求参数**：能指定 scope 就能打听别人项目的运行时。远端
+  `localRestartAvailable` 恒假。代码：`src/runtime_status.rs`（DTO + `view` + `classify`
+  + `read_status`）、`src/rpc/runtime.rs`、`src/rpc/mod.rs`（`Domain::Runtime`）、
+  `src/server.rs`（dispatch 臂与 `is_remote`）。判据：
+  `cargo test -p yi-agent-app-server --lib runtime_status`（28 passed：兼容矩阵、
+  control-only 需要能力、无应答、远程无本地重启、字段不丢、JSON roundtrip、preview
+  逐字段、真实 dispatcher 四条 —— 破坏性方法确实 `-32601`、谓词与 dispatcher 一致、
+  状态帧不含凭据）

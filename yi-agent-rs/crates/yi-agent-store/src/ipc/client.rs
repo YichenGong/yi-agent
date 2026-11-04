@@ -166,6 +166,49 @@ pub(crate) fn write_request(
 }
 
 #[cfg(test)]
+mod kanban_observation_frame_limit_tests {
+    use super::*;
+
+    /// 完整会话快照（`loaded_threads`）变大之后，请求体不能被 IPC **截断**。
+    ///
+    /// 截断比报错危险得多：服务端会解析出一个少了尾巴的 JSON，要么整条拒绝
+    /// （看起来像插件不回答），要么在宽容解析下收下一个**假的**完整快照——
+    /// 于是「热表里没有某个会话」变成一次凭空的结论。这里构造一个确定超过
+    /// 1 MiB 的 `driver/next` 形状请求，断言客户端在写盘之前就报
+    /// `FrameTooLarge`，而不是把半截帧发出去。
+    #[test]
+    fn kanban_observation_oversized_snapshot_is_refused_not_truncated() {
+        // 每个条目约 40 字节，3 万个 ID 稳稳超过 1 MiB。
+        let loaded: Vec<serde_json::Value> = (0..30_000)
+            .map(|index| {
+                serde_json::json!({
+                    "thread_id": format!("thread-{index:012}"),
+                    "idle": index % 2 == 0,
+                })
+            })
+            .collect();
+        let request = IpcRequest::PluginQuery {
+            plugin: "superpowers-kanban".into(),
+            method: "driver/next".into(),
+            params: serde_json::json!({
+                "threads": [],
+                "loaded_threads": loaded,
+                "results": [],
+                "sessions": {"running": 0},
+            }),
+        };
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = client;
+        let error = write_request(&mut client, PROTOCOL_VERSION, "req-1".into(), request)
+            .expect_err("an oversized frame must be refused");
+        assert!(
+            matches!(error, IpcError::FrameTooLarge),
+            "expected FrameTooLarge, got {error:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod socket_path_tests {
     use super::*;
 

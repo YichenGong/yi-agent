@@ -253,4 +253,42 @@ describe("normalizeCard", () => {
     expect(card.stale).toBe(false);
     expect(card.lastAliveAt).toBeUndefined();
   });
+
+  it("keeps the new observation fields when the plugin sends them", () => {
+    const [card] = parseBoard(
+      JSON.stringify({
+        cards: [
+          {
+            id: "a",
+            state: "running",
+            session_observation: "not_loaded",
+            observed_at: "2026-10-22T10:00:00+08:00",
+          },
+        ],
+      }),
+    );
+    expect(card.sessionObservation).toBe("not_loaded");
+    expect(card.observedAt).toBe("2026-10-22T10:00:00+08:00");
+  });
+
+  it("leaves a missing observation key undefined so legacy stale still reads", () => {
+    // 旧插件不发 `session_observation`。若这里预归一化成 "unknown"，旧数据里的
+    // `stale: true` 就永远轮不到，用户会看到「未知」而不是「未加载」。
+    const [card] = parseBoard(
+      JSON.stringify({ cards: [{ id: "a", state: "running", stale: true }] }),
+    );
+    expect(card.sessionObservation).toBeUndefined();
+    expect(card.observedAt).toBeUndefined();
+  });
+
+  it("degrades a malformed observation value to unknown, not to missing", () => {
+    // 键存在但读不懂 = 新插件发了个我们不认识的形状。这与「旧插件没发」不同：
+    // 假装没发会把坏数据当成旧兼容路径，掩盖版本漂移。
+    for (const value of [null, 3, "garbage", { loaded: true }]) {
+      const [card] = parseBoard(
+        JSON.stringify({ cards: [{ id: "a", state: "running", session_observation: value }] }),
+      );
+      expect(card.sessionObservation).toBe("unknown");
+    }
+  });
 });

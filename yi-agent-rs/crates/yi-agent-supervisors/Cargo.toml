@@ -20,8 +20,14 @@ yi-agent-store = { workspace = true }
 # 全局开关来自 flags.json。supervisor 每 500ms 对账一次，必须自己读得到
 # 当前值：由上层传一次性结论会漏掉"进程跑着时用户改了开关"。
 yi-agent-flags = { workspace = true }
+# Wire types and the total-budget deadline for the lifecycle control protocol.
+# Dependency-light by design (no SQLite, no Tokio), so linking it here costs nothing.
+yi-agent-lifecycle = { workspace = true }
 # `daemon` 用 setsid 让子进程脱离会话；`watchman` 读 uid 拼 launchd 域名。
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+yi-agent-lifecycle = { workspace = true }
+# 集成测试要造一个「未来 schema」的库，证明启动前就被拒绝。
+rusqlite = { version = "0.32", features = ["bundled"] }

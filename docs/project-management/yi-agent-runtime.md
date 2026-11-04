@@ -68,6 +68,17 @@
   - 判据：`grep -rn "migrate_model_keys\|migrate_env_settings\|parse_env_text\|resolve_global_env_path" yi-agent-rs/crates` 应无输出（`settings.rs` 的函数定义除外，届时已删）
   - 判据：`cargo test -p yi-agent-runtime --lib migrate` 与 `cargo test -p yi-agent --test settings_migration` 已随代码删除
 
+- [x] 插件清单刷新全阶段限时与停机取消 — 自述执行器在 `yi-agent-supervisors/src/refresh/describe.rs`（进程侧 `describe/process.rs`）：每轮同时排空双流、`waitid(WNOWAIT)` 观察退出而不提前回收、单一截止时间覆盖「父进程已退出但后代仍持管道」、stdout 1 MiB 硬限、诊断按字符 512 截断、清理顺序「组信号 → 关管道 → 子信号 → 解除组能力 → 回收」且展开路同样收口；`refresh.rs:52/61/220/225` 提供可取消入口（取消批次 + 写回闸门 + 按结果类型分级的日志）；`yi-agent-runtime/src/supervise.rs:191` 把 stop 信号传入真实刷新，`:208` 的 `drive_supervision` 让刷新与对账共用同一条 panic 保护、只清本项目的 socket 路由。**判据（macOS 14 / arm64 实跑）**：`cargo test -p yi-agent-supervisors` → 100 单元 + 23 集成通过；`cargo test -p yi-agent-runtime --lib supervise` → 12 通过，其中 `stopping_during_manifest_refresh_joins_promptly` / `dropping_during_manifest_refresh_joins_promptly` 在自述进行中要求 2s 内 join 回来且不改写磁盘、`a_slow_description_does_not_block_later_supervision` 证明慢插件只拖住自己（生产 15s 预算后 b 正常起跑并可真实查询）、`refresh_panic_clears_only_its_project_routes` 证明 panic 后只清本项目路由；`cargo clippy -p yi-agent-supervisors -p yi-agent-runtime --all-targets -- -D warnings` 干净；`just ci` exit 0。变异：换回不可取消刷新 → 停机用例红；删 panic 路由清理 → 路由用例红；日志按文本分类 → 分类用例红；去写回闸门 → 存盘字节用例红；去批次 break → 一次性停止用例红。**未覆盖**：`ECHILD`（外部回收）分支按设计降级为解除组信号能力 + 关闭读端 + `ownership lost`，不保证后代已终止；自行 `setsid` 的恶意后代可能存活（宿主仅保证不受其管道阻塞）。Linux 机制未在本机验证，由 CI 的同一组 Rust 门禁覆盖编译与测试，不作平台行为断言。[修复 spec](../superpowers/specs/2026-11-03-supervisor-manifest-describe-bounds-design.md) §6、[实施 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md)。
+- [x] 受管运行时的装配入口（`build_tool_setup_owned` + `mcp_launcher.rs`） — runtime 原先只会
+  组装「自己 spawn」的工具集；新增 `ManagedOwner = (ManagedProcessPolicy, ManagedSpawner)` 让同一次
+  装配把受管能力同时接到三条路径：内置工具（`register_builtin_tools_managed`）、`ProcessManager`
+  （`into_managed`，必须在 spawn 之前调用，它会重建进程表）、MCP（`register_mcp_tools_with` 注入
+  `ManagedStdioLauncher`）。`build_tool_setup_with_controller` 保持旧签名、内部传 `None` 委托，故既有
+  调用点语义不变。`ManagedStdioLauncher` 实现 MCP 的 `StdioLauncher`，用 `std::env::current_dir()`
+  作为 server 的工作目录（与原先 `TokioChildProcess` 继承 daemon cwd 的行为对齐）。**当前生产路径
+  仍传 `None`**：真正的 guardian 连接签发属于 bring-up（Task 12），此时只有测试实现。判据：
+  `cargo test -p yi-agent-runtime`（261 passed）
+
 **验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）
 
 - [x] 临时旁问共享只读运行器 — `SideConversationRunner`（`side_conversation/runner.rs:217`）持有有效配置快照、独立取消/事件/用量，工具白名单只读（yolo 也不放宽）；`SideSourcePublisher`（`side_conversation/source.rs:148`）负责父来源重发，`SideHostResources`（`side_conversation/resources.rs:66`）统一 per-parent runner 与阻塞池，桌面/手机宿主与 TUI 共用同一套。验收：`cargo test -p yi-agent-runtime --lib side_` → 89 通过（含 `side_registry_rejects_mutation_even_with_yolo`、`side_cancel_does_not_cancel_parent`）— [三端 spec](../superpowers/specs/2026-11-03-side-conversation-design.md) · [实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md) §6–7、§12.1。

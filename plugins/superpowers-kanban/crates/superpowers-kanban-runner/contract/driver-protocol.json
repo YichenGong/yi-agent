@@ -1,7 +1,38 @@
 {
   "_comment": "宿主 `session_driver` 与插件 `driver/next` 共用的线协议契约。两侧的测试都用 include_str! 读它（编译期依赖，改名/删除也会红）——同一份文件、两端各自断言。任一侧改了字段名而没同步这里，那一侧的测试就红。",
   "request": {
-    "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。`alive` 只表示宿主这一拍还看得见该会话，与 `idle`（此刻有没有 turn 在跑）是两件事；插件据此持有/释放会话名额，与卡片状态无关。`sessions.running` 是宿主**本进程**此刻的全机运行会话数（`AwaitingApproval` 与人闲都不计），供插件算全机余量；旧宿主不发时插件退化为看板内口径。`capabilities.actions` 是本宿主能执行的通用动作；旧宿主不发时插件按**一个都不支持**处理，保留排队并说明原因。",
+    "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。`alive` 只表示宿主这一拍还看得见该会话，与 `idle`（此刻有没有 turn 在跑）是两件事；插件据此持有/释放会话名额，与卡片状态无关。`loaded_threads` 是宿主热会话表（`HashMap<String, ThreadSession>`）的**完整**快照，不是 driver 登记的子集：字段出现即声明完整，空数组表示热表确实为空；字段缺失表示旧宿主没有这份能力。每项只有 ID 与 idle，不传消息、路径、标题、权限或 secrets。`sessions.running` 是宿主**本进程**此刻的全机运行会话数（`AwaitingApproval` 与人闲都不计），供插件算全机余量；旧宿主不发时插件退化为看板内口径。`capabilities.actions` 是本宿主能执行的通用动作；旧宿主不发时插件按**一个都不支持**处理，保留排队并说明原因。",
+    "threads": [
+      {
+        "thread_id": "thread-1",
+        "idle": true,
+        "alive": true
+      }
+    ],
+    "loaded_threads": [
+      {
+        "thread_id": "thread-1",
+        "idle": true
+      }
+    ],
+    "results": [
+      {
+        "action_id": "act-1",
+        "ok": true,
+        "thread_id": "thread-1",
+        "error": null,
+        "error_code": null
+      }
+    ],
+    "sessions": {
+      "running": 3
+    },
+    "capabilities": {
+      "actions": ["launch", "append", "resume_append"]
+    }
+  },
+  "legacy_request": {
+    "_comment": "旧宿主发出的 `driver/next` 参数：与本契约的 `request` 逐字段相同，**只是没有** `loaded_threads`。插件必须把它读成「没有完整快照能力」（`loaded = None`），而不是「热表为空」——把缺字段当成空数组会让所有 running 卡被误报为未加载。",
     "threads": [
       {
         "thread_id": "thread-1",

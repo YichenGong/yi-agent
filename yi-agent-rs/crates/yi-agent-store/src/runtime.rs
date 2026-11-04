@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +32,12 @@ use yi_agent_core::subagent::task::{
 };
 use yi_agent_core::subagent::trace::TraceFact;
 use yi_agent_core::subagent::worker::{
-    AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerRecoveryPreflight,
-    WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent, WorkerWorkspace,
+    AgentWorkerFactory, StopConfirmation, WorkerError, WorkerHandle, WorkerRecoveryContext,
+    WorkerRecoveryPreflight, WorkerRecoveryPreflightResult, WorkerStart, WorkerWatchdogEvent,
+    WorkerWorkspace,
 };
 
+use crate::lifecycle::{ExitReason, RootId, RuntimeClients};
 use crate::repository::{
     RepositoryError, RuntimeEvent, RuntimeRepository, ScheduleOccurrenceResult, WatchdogEvidence,
     WatchdogTerminal,
@@ -43,9 +45,17 @@ use crate::repository::{
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, WatchdogTokenDelta, evaluate_watchdog};
 use crate::terminal::text_completion_report;
 
+/// How many confirmed stop records a coordinator keeps before pruning the
+/// oldest. Bounded so a daemon opening thousands of sessions does not grow.
+const MAX_REMEMBERED_STOPS: usize = 1024;
+
+/// How long a reconcile pass waits for join observers to publish their proofs
+/// before returning with the lease still held.
+const STOP_CONFIRMATION_GRACE: Duration = Duration::from_millis(250);
+
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
 /// absent or unparsable.
-pub const DEFAULT_FORK_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_FORK_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Overrides `DEFAULT_FORK_MAX_BYTES` for one daemon process.
 const FORK_MAX_BYTES_ENV: &str = "YI_AGENT_FORK_MAX_BYTES";
@@ -92,6 +102,8 @@ pub enum RuntimeCoordinatorError {
     ResidentCapacityExhausted,
     #[error("global queued subagent capacity is exhausted")]
     QueueCapacityExceeded,
+    #[error("runtime root rejects new work: {0}")]
+    AdmissionClosed(String),
     #[error("runtime is draining and rejects new admissions")]
     Draining,
     #[error("fork payload of {total} bytes exceeds the {max}-byte limit")]
@@ -230,6 +242,36 @@ pub struct RuntimeCoordinator {
     /// Direct-child limit inherited by every supervisor this coordinator creates.
     max_direct_children: usize,
     draining: AtomicBool,
+    /// Stop proofs taken off worker handles, kept after the supervisor drops the
+    /// handle on a terminal transition.
+    ///
+    /// The handle itself disappears exactly when the task goes terminal, which is
+    /// the moment a caller would ask whether the execution really stopped, so the
+    /// read side has to outlive it. Entries are removed when the stop is
+    /// confirmed and recorded.
+    pending_stops: Mutex<HashMap<TaskId, PendingStop>>,
+    /// Root ownership and admission, in the daemon's own generation vocabulary.
+    ///
+    /// Plain state, deliberately not a second lock: it is only ever mutated
+    /// through this coordinator's serialized entry points, which is what makes
+    /// "check the lease, then spawn" atomic against a concurrent release.
+    clients: Mutex<RuntimeClients>,
+    generation: String,
+    /// Monotonic ordinal for pending-stop entries, so old confirmed records can
+    /// be pruned instead of accumulating for the daemon's whole life.
+    stop_sequence: AtomicU64,
+}
+
+/// A task whose terminal state is durable but whose execution is not yet proven
+/// gone, together with everything needed to record the stop when it is.
+struct PendingStop {
+    attempt: String,
+    confirmation: StopConfirmation,
+    abnormal: bool,
+    /// Set once the lease has actually been released for this stop.
+    released: bool,
+    /// Insertion order, used to prune old confirmed entries in a long-lived daemon.
+    sequence: u64,
 }
 
 struct WorkspaceAssignedFactory<'a> {
@@ -440,6 +482,11 @@ impl RuntimeCoordinator {
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
         repository.release_provider_turn_leases()?;
+        // A fresh generation for every process. Root bindings from a previous
+        // generation are recorded in `root_owners` for explanation, but never
+        // authorize work here: a restart must not resurrect an identity whose
+        // lease was already gone.
+        let generation = Uuid::new_v4().to_string();
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator =
             ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
@@ -609,6 +656,10 @@ impl RuntimeCoordinator {
             fork_max_bytes,
             max_direct_children,
             draining: AtomicBool::new(false),
+            pending_stops: Mutex::new(HashMap::new()),
+            clients: Mutex::new(RuntimeClients::new()),
+            generation,
+            stop_sequence: AtomicU64::new(0),
         })
     }
 
@@ -747,6 +798,17 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime application root attach mutex poisoned");
         self.ensure_admitting()?;
+        // Every root attach passes the same admission barrier as task creation.
+        // The owner is the application root's stable idempotency key: it survives
+        // an app-server restart, which is what makes "the App's work" a stable
+        // set rather than something tied to one process lifetime.
+        //
+        // This is the business attach, not the authenticated guardian lease: the
+        // plan's requirement that the *client id* come from a verified private
+        // channel is wired with the guardian in a later task. Binding here means
+        // a released owner cannot silently re-attach, which is the part that can
+        // be enforced today.
+        self.ensure_owner_open(idempotency_key)?;
         if idempotency_key.trim().is_empty() {
             return Err(RuntimeCoordinatorError::Supervisor(
                 "application root idempotency key is required".into(),
@@ -820,6 +882,9 @@ impl RuntimeCoordinator {
                 .capability_secret
                 .clone()
                 .unwrap_or_else(|| legacy_application_root_capability(idempotency_key));
+            // Re-attaching in this generation re-establishes ownership: the root
+            // is that app's again, and a closed owner was refused above.
+            self.bind_root(idempotency_key, &existing.root_task_id.to_string())?;
             return Ok(AttachedApplicationRoot {
                 session_id: existing.root_session_id,
                 root_task_id: existing.root_task_id,
@@ -898,6 +963,7 @@ impl RuntimeCoordinator {
             &root_task_id,
             extra_roots.iter().map(PathBuf::from).collect(),
         );
+        self.bind_root(idempotency_key, &root_task_id.to_string())?;
         Ok(AttachedApplicationRoot {
             session_id,
             root_task_id,
@@ -1542,6 +1608,11 @@ impl RuntimeCoordinator {
         fork_token: Option<String>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
+        // Every task-creating path shares this gate. Without it a descendant
+        // spawned microseconds after its client's release would be admitted into
+        // a tree nobody can reclaim.
+        let session_root = self.session_root(session).await?;
+        self.ensure_root_open(&session_root.to_string())?;
         if self
             .repository
             .lock()
@@ -2434,19 +2505,50 @@ impl RuntimeCoordinator {
                 (task.clone(), attempt)
             })
             .collect::<Vec<_>>();
-        let mut repository = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned");
-        for (task, attempt) in cancelled_attempts {
-            repository.transition_task_and_attempt_with_terminal(
-                &task,
-                &attempt,
-                "cancelled",
-                RuntimeEvent::TaskCancelled,
-                r#"{"reason":"cancelled"}"#,
-            )?;
-            self.release_resident_lease(&task);
+        // Capture proofs before the transition: the reducer drops the worker
+        // handle (and its proof) as it records the terminal state.
+        let confirmations = supervisor.worker_stop_confirmations();
+        let awaiting_stop = {
+            // Scoped so the repository guard is provably gone before the wait
+            // below: the wait yields, and holding a blocking mutex across it
+            // would stall every other session's reconcile.
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let mut awaiting_stop = Vec::new();
+            for (task, attempt) in cancelled_attempts {
+                repository.transition_task_and_attempt_with_terminal(
+                    &task,
+                    &attempt,
+                    "cancelled",
+                    RuntimeEvent::TaskCancelled,
+                    r#"{"reason":"cancelled"}"#,
+                )?;
+                // Cancellation is the *request*. The lease may go only once the
+                // execution is proven gone; otherwise a replacement task can start
+                // writing the worktree while the cancelled thread still runs.
+                let confirmed = confirmations
+                    .get(&task)
+                    .is_some_and(StopConfirmation::is_stopped);
+                if confirmed {
+                    self.release_resident_lease(&task);
+                } else {
+                    self.remember_pending_stop(
+                        &task,
+                        &attempt.to_string(),
+                        confirmations.get(&task),
+                        false,
+                    );
+                    awaiting_stop.push(task);
+                }
+            }
+            awaiting_stop
+        };
+        if !awaiting_stop.is_empty() {
+            self.await_confirmed_stops(&awaiting_stop, STOP_CONFIRMATION_GRACE)
+                .await;
+            self.release_confirmed_stops();
         }
         Ok(())
     }
@@ -2930,29 +3032,40 @@ impl RuntimeCoordinator {
         self.wait_for_children(session, caller, mode).await
     }
 
-    pub fn direct_children(
+    pub async fn direct_children(
         &self,
         session: &RootSessionId,
         caller: &TaskId,
     ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
-        Ok(self.child_completion_snapshot(session, caller)?.0)
+        Ok(self.child_completion_snapshot(session, caller).await?.0)
     }
 
-    pub fn child_completion_snapshot(
+    /// Reads the completion snapshot for `caller`'s direct children.
+    ///
+    /// Waits for the supervisor instead of `try_lock`: this is a pure read, and
+    /// a briefly held guard means a turn is progressing, not that the request is
+    /// invalid. Reporting contention as `invalid_state: supervisor is busy` broke
+    /// the bounded wait path -- the timeout branch takes this snapshot to report
+    /// partial completions, so a busy supervisor turned a legitimate timeout into
+    /// a protocol error the caller could not act on.
+    pub async fn child_completion_snapshot(
         &self,
         session: &RootSessionId,
         caller: &TaskId,
     ) -> Result<(Vec<TaskId>, Vec<CompletedChildReport>), RuntimeCoordinatorError> {
         let supervisor = self.supervisor(session)?;
-        let supervisor = supervisor
-            .try_lock()
-            .map_err(|_| RuntimeCoordinatorError::Supervisor("supervisor is busy".into()))?;
+        let supervisor = supervisor.lock().await;
         Ok(supervisor.child_completion_snapshot(caller))
     }
 
     /// Drains facts emitted by application workers and persists their reducer
     /// outcomes. Workers themselves never write task snapshots or events.
     pub async fn reconcile_worker_events(&self) -> Result<(), RuntimeCoordinatorError> {
+        // Release anything a previous pass left waiting whose join has since
+        // been proven. Without this, a proof that landed just after the bounded
+        // wait would hold its lease until some unrelated event triggered another
+        // pass.
+        self.release_confirmed_stops();
         let supervisors = self
             .supervisors
             .lock()
@@ -2964,6 +3077,8 @@ impl RuntimeCoordinator {
         let mut deliveries = Vec::new();
         let mut consumed_overrides = Vec::new();
         let mut watchdog_updates = Vec::new();
+        // Stop proofs for every terminal task in this pass, keyed by task.
+        let mut confirmations: HashMap<TaskId, StopConfirmation> = HashMap::new();
         // A failure in one session's supervisor (a wedged reducer, a delivery
         // that can no longer be routed to a terminal parent) must not discard
         // the transitions already collected from every other session: those
@@ -2989,6 +3104,10 @@ impl RuntimeCoordinator {
                 continue;
             }
             watchdog_updates.extend(supervisor.take_worker_watchdog_events());
+            // Capture the stop proof *before* reconciling: the reducer drops the
+            // handle on a terminal transition, and the proof is exactly what is
+            // needed afterwards to decide whether the running lease may go.
+            confirmations.extend(supervisor.worker_stop_confirmations());
             let changed = match supervisor.reconcile_worker_events() {
                 Ok(changed) => changed,
                 Err(error) => {
@@ -3123,12 +3242,31 @@ impl RuntimeCoordinator {
         // 交付即终态：这里落库的是 `task_delivered`，它才是「已交付子任务」的终止
         // 标记（交付子任务不会再发 `task_completed`）。v14 只把历史 review 行改成
         // `task_completed`，不要因此改动新事件类型，否则重启的逐字事件断言会失效。
+        // A terminal state is the *agent loop* finishing, not proof that its
+        // thread and tool children are gone. The running lease therefore stays
+        // held until an independent observer confirms the join; releasing it here
+        // would let a new task write the same worktree while the old one is still
+        // running.
+        let mut awaiting_stop: Vec<TaskId> = Vec::new();
         for (task_id, attempt, delivery) in deliveries {
             self.repository
                 .lock()
                 .expect("runtime repository mutex poisoned")
                 .record_delivery(&task_id, &attempt, &delivery)?;
-            self.release_resident_lease(&task_id);
+            let confirmed = confirmations
+                .get(&task_id)
+                .is_some_and(StopConfirmation::is_stopped);
+            if confirmed {
+                self.release_resident_lease(&task_id);
+            } else {
+                self.remember_pending_stop(
+                    &task_id,
+                    &attempt.to_string(),
+                    confirmations.get(&task_id),
+                    false,
+                );
+                awaiting_stop.push(task_id);
+            }
         }
         for (task_id, attempt, state, event, terminal_json) in updates {
             let mut repository = self
@@ -3146,10 +3284,37 @@ impl RuntimeCoordinator {
             } else {
                 repository.transition_task_and_attempt(&task_id, &attempt, state, event)?;
             }
-            self.release_resident_lease(&task_id);
+            let confirmed = confirmations
+                .get(&task_id)
+                .is_some_and(StopConfirmation::is_stopped);
+            if confirmed {
+                self.release_resident_lease(&task_id);
+            } else {
+                // Any terminal state reached here is a non-steady one from the
+                // worker's own account: a pause for draining, a cancellation, a
+                // failure. Paused and recovery_required are legitimate endings;
+                // anything else that goes terminal without a join is recorded as
+                // abnormal so the lease is not silently freed forever.
+                let abnormal = !matches!(state, "paused" | "recovery_required");
+                self.remember_pending_stop(
+                    &task_id,
+                    &attempt.to_string(),
+                    confirmations.get(&task_id),
+                    abnormal,
+                );
+                awaiting_stop.push(task_id);
+            }
         }
         if let Some(error) = first_error {
             return Err(error);
+        }
+        // Give the observers a bounded chance to publish their joins before this
+        // pass returns. Anything still unconfirmed stays in `pending_stops` and
+        // keeps holding its lease -- including across the next pass.
+        if !awaiting_stop.is_empty() {
+            let _unconfirmed = self
+                .await_confirmed_stops(&awaiting_stop, STOP_CONFIRMATION_GRACE)
+                .await;
         }
         Ok(())
     }
@@ -3218,6 +3383,13 @@ impl RuntimeCoordinator {
     /// daemon process; restart owns recovery and future admissions.
     pub async fn begin_draining(&self) -> Result<(), RuntimeCoordinatorError> {
         self.draining.store(true, Ordering::Release);
+        // The ownership table has to agree with the coordinator's own flag. A
+        // project-level drain that left `authorize` answering "yes" would admit new
+        // roots into a runtime that is already going away.
+        self.clients
+            .lock()
+            .expect("runtime clients mutex poisoned")
+            .begin_global_drain();
         let supervisors = self
             .supervisors
             .lock()
@@ -3370,6 +3542,321 @@ impl RuntimeCoordinator {
             tasks.extend(supervisor.lock().await.worker_task_ids().cloned());
         }
         tasks
+    }
+
+    /// The daemon generation this coordinator belongs to.
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    /// Binds a root (session) to the client that attached it.
+    ///
+    /// The client id must come from the guardian's authenticated connection, not
+    /// from a field on the business RPC; that private channel is wired in a later
+    /// task, so this method only takes the already-verified id.
+    pub fn bind_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        clients
+            .bind_root(client, root, &self.generation)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        crate::lifecycle::store::record_binding(
+            &repository,
+            &root.to_string(),
+            client,
+            &self.generation,
+        )?;
+        Ok(())
+    }
+
+    /// Records a descendant's ownership, inheriting from its parent root.
+    pub fn bind_child_root(
+        &self,
+        parent_root: &str,
+        root: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        clients
+            .adopt_descendant(parent_root, root, &self.generation)
+            .map_err(RuntimeCoordinatorError::Supervisor)?;
+        let owner = clients
+            .owner_of(root)
+            .expect("just-bound root has an owner");
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        crate::lifecycle::store::record_binding(
+            &repository,
+            &root.to_string(),
+            &owner,
+            &self.generation,
+        )?;
+        Ok(())
+    }
+
+    /// Refuses new work under a root whose client has left, whose generation is
+    /// stale, or while a maintenance barrier is up.
+    ///
+    /// Used at the task-entry points that create work (spawn). It needs no caller
+    /// identity, so it cannot be bypassed by a self-reported client id.
+    fn ensure_root_open(&self, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        self.clients
+            .lock()
+            .expect("runtime clients mutex poisoned")
+            .root_is_open(root, &self.generation)
+            .map_err(RuntimeCoordinatorError::AdmissionClosed)
+    }
+
+    /// Refuses a fresh attach (and with it any work) for an owner whose
+    /// admission was closed.
+    fn ensure_owner_open(&self, owner: &str) -> Result<(), RuntimeCoordinatorError> {
+        let clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        if clients.is_closed(owner) {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(format!(
+                "client {owner} has closed admission"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The session's root task id, which is the key ownership is bound under.
+    ///
+    /// Waits for the supervisor instead of `try_lock`: a busy supervisor means the
+    /// session is *running*, not that the request is invalid. Refusing on
+    /// contention turned a second concurrent spawn into `invalid_state: session is
+    /// busy` -- an error the caller can neither understand nor retry with
+    /// confidence, and one that showed up as a flaky e2e failure only when the
+    /// machine was loaded enough to overlap two requests.
+    async fn session_root(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<TaskId, RuntimeCoordinatorError> {
+        let supervisor = self.supervisor(session)?;
+        let guard = supervisor.lock().await;
+        Ok(guard.root_task_id().clone())
+    }
+
+    /// Refuses work under a root whose client has left or whose generation is
+    /// stale. Every path that can create work consults this before acting.
+    pub fn authorize_work(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
+        let clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        clients
+            .authorize(client, root, &self.generation)
+            .map_err(RuntimeCoordinatorError::Supervisor)
+    }
+
+    /// Closes one client's admission and returns the roots it owned.
+    ///
+    /// Idempotent. Only this client's tree is affected: other clients keep
+    /// admitting work, which is the difference between a client drain and the
+    /// project-level drain [`Self::begin_draining`] performs.
+    pub fn close_client_admission(&self, client: &str) -> Vec<RootId> {
+        let roots = {
+            let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
+            clients.close_client_admission(client)
+        };
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        for root in &roots {
+            // Best effort: a failure to *record* the exit must not reopen
+            // admission that the in-memory table already closed.
+            let _ =
+                crate::lifecycle::store::record_exit(&repository, root, ExitReason::ClientReleased);
+        }
+        roots
+    }
+
+    /// Close one client's admission and report whether it was the last one.
+    ///
+    /// Returns `true` when the departing client was the final open one, i.e. when
+    /// this exit means the whole scope must drain. That distinction is the whole
+    /// point: a single frontend leaving closes only its own tree, and a still-open
+    /// TUI must never be told the project is draining.
+    pub fn release_client(&self, client: &str) -> bool {
+        let _ = self.close_client_admission(client);
+        let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
+        if clients.open_clients() == 0 {
+            clients.begin_global_drain();
+            self.draining.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Every root a client owns, for reclamation and diagnostics.
+    pub fn owned_roots_of(&self, client: &str) -> Vec<RootId> {
+        self.clients
+            .lock()
+            .expect("runtime clients mutex poisoned")
+            .roots_of(client)
+    }
+
+    /// Whether a task's execution is proven to have stopped.
+    ///
+    /// Stays true after the lease is released, so a caller that checks late
+    /// still sees the proof rather than "no record". `false` means "no evidence
+    /// yet", never "assume stopped".
+    pub fn execution_stopped(&self, task: &TaskId) -> bool {
+        self.pending_stops
+            .lock()
+            .expect("pending stops mutex poisoned")
+            .get(task)
+            .is_some_and(|pending| pending.confirmation.is_stopped())
+    }
+
+    /// Tasks whose terminal state is durable but whose execution is unproven.
+    pub fn unconfirmed_stops(&self) -> Vec<(TaskId, String)> {
+        self.pending_stops
+            .lock()
+            .expect("pending stops mutex poisoned")
+            .iter()
+            .filter(|(_, pending)| !pending.confirmation.is_stopped())
+            .map(|(task, pending)| (task.clone(), pending.attempt.clone()))
+            .collect()
+    }
+
+    /// Tasks whose lease is still held while their stop is unproven.
+    pub fn unproven_lease_tasks(&self) -> Vec<TaskId> {
+        self.pending_stops
+            .lock()
+            .expect("pending stops mutex poisoned")
+            .iter()
+            .filter(|(_, pending)| !pending.released)
+            .map(|(task, _)| task.clone())
+            .collect()
+    }
+
+    /// Waits until every listed task's execution is confirmed stopped, or the
+    /// grace period runs out. Returns the tasks that never confirmed.
+    ///
+    /// Poll-based on purpose: the proof is published by a join observer thread
+    /// that has no channel to this coordinator, and the poll is bounded by the
+    /// caller's budget rather than running forever.
+    async fn await_confirmed_stops(&self, tasks: &[TaskId], grace: Duration) -> Vec<TaskId> {
+        let deadline = Instant::now() + grace;
+        loop {
+            let remaining: Vec<TaskId> = tasks
+                .iter()
+                .filter(|task| !self.execution_stopped(task))
+                .cloned()
+                .collect();
+            if remaining.is_empty() || Instant::now() >= deadline {
+                return remaining;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Remembers a task whose execution is not yet proven stopped, so a later
+    /// reconcile pass can release its lease once the join lands.
+    fn remember_pending_stop(
+        &self,
+        task: &TaskId,
+        attempt: &str,
+        confirmation: Option<&StopConfirmation>,
+        abnormal: bool,
+    ) {
+        let mut pending = self
+            .pending_stops
+            .lock()
+            .expect("pending stops mutex poisoned");
+        // Keep the first record: a later pass observes the same unconfirmed
+        // execution, and overwriting the attempt would lose which attempt the
+        // proof belongs to.
+        if pending.contains_key(task) {
+            return;
+        }
+        let sequence = self.stop_sequence.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            task.clone(),
+            PendingStop {
+                attempt: attempt.to_string(),
+                // No confirmation at all means the supervisor already dropped the
+                // handle before anyone captured its proof. Such a task can never
+                // confirm, so it must keep its lease rather than be guessed stopped.
+                confirmation: confirmation
+                    .cloned()
+                    .unwrap_or_else(StopConfirmation::never),
+                abnormal,
+                released: false,
+                sequence,
+            },
+        );
+    }
+
+    /// Releases the running lease for tasks whose joins have now been proven.
+    ///
+    /// Returns the tasks released in this call, so the caller can log or assert
+    /// on them. A task that ends abnormally is recorded in `root_owners` with
+    /// `recovery_required` before its lease goes, which keeps the reason visible
+    /// after a restart without changing the delivery or workspace retention rules.
+    fn release_confirmed_stops(&self) -> Vec<TaskId> {
+        let confirmed: Vec<(TaskId, String, bool, u64)> = {
+            let pending = self
+                .pending_stops
+                .lock()
+                .expect("pending stops mutex poisoned");
+            pending
+                .iter()
+                .filter(|(_, entry)| !entry.released && entry.confirmation.is_stopped())
+                .map(|(task, entry)| {
+                    (
+                        task.clone(),
+                        entry.attempt.clone(),
+                        entry.abnormal,
+                        entry.sequence,
+                    )
+                })
+                .collect()
+        };
+        for (task, _attempt, abnormal, sequence) in &confirmed {
+            {
+                let mut pending = self
+                    .pending_stops
+                    .lock()
+                    .expect("pending stops mutex poisoned");
+                if let Some(entry) = pending.get_mut(task) {
+                    entry.released = true;
+                }
+                // Keep only a bounded window of confirmed records: the proof is
+                // for in-flight bookkeeping and diagnostics, not a permanent
+                // ledger. Unconfirmed records are never pruned -- they represent
+                // a lease that is still held.
+                if pending.len() > MAX_REMEMBERED_STOPS {
+                    let mut released: Vec<(TaskId, u64)> = pending
+                        .iter()
+                        .filter(|(_, entry)| entry.released)
+                        .map(|(task, entry)| (task.clone(), entry.sequence))
+                        .collect();
+                    released.sort_by_key(|(_, sequence)| *sequence);
+                    let excess = pending.len().saturating_sub(MAX_REMEMBERED_STOPS);
+                    for (task, _) in released.into_iter().take(excess) {
+                        pending.remove(&task);
+                    }
+                }
+            }
+            if *abnormal {
+                let repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                let _ = crate::lifecycle::store::record_exit(
+                    &repository,
+                    &task.to_string(),
+                    ExitReason::Maintenance,
+                );
+            }
+            let _ = sequence;
+            self.release_resident_lease(task);
+        }
+        confirmed.into_iter().map(|(task, _, _, _)| task).collect()
     }
 
     fn ensure_admitting(&self) -> Result<(), RuntimeCoordinatorError> {
@@ -4318,6 +4805,84 @@ mod provider_turn_admission_tests {
                 .has_active_lease_prefix(&task, "llm:")
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod child_snapshot_contention_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A factory is never started here; only the coordinator's bookkeeping is
+    /// exercised, so an unavailable worker is the honest answer.
+    struct IdleFactory;
+
+    impl AgentWorkerFactory for IdleFactory {
+        fn is_available(&self) -> bool {
+            false
+        }
+        fn start(
+            &self,
+            _request: yi_agent_core::subagent::worker::WorkerStart,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<WorkerHandle, yi_agent_core::subagent::worker::WorkerError>,
+        > {
+            Box::pin(async {
+                Err(yi_agent_core::subagent::worker::WorkerError::Startup(
+                    "unused".into(),
+                ))
+            })
+        }
+    }
+
+    /// Reading the snapshot while the supervisor guard is held must wait, not
+    /// report `supervisor is busy`.
+    ///
+    /// This is the contract the bounded `wait_agent` path depends on: after a
+    /// timeout it takes this snapshot to report partial completions, and it runs
+    /// right after the wait released the guard. The old `try_lock` turned that
+    /// ordinary hand-off into `invalid_state`, which the caller could neither
+    /// explain nor retry. The test holds the guard itself, so it fails
+    /// deterministically instead of only under load.
+    #[tokio::test]
+    async fn a_held_supervisor_guard_delays_the_snapshot_instead_of_failing_it() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator = RuntimeCoordinator::open(&database, Arc::new(IdleFactory)).unwrap();
+
+        let session = RootSessionId::new();
+        let supervisor = Arc::new(AsyncMutex::new(AgentSupervisor::new(session.clone())));
+        let caller = supervisor.lock().await.root_task_id().clone();
+        coordinator
+            .supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .insert(session.clone(), Arc::clone(&supervisor));
+
+        let guard = supervisor.lock().await;
+        let reader = tokio::spawn({
+            let coordinator_session = session.clone();
+            let coordinator_caller = caller.clone();
+            async move {
+                coordinator
+                    .child_completion_snapshot(&coordinator_session, &coordinator_caller)
+                    .await
+            }
+        });
+        // Give the reader a chance to run into the held guard.
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "the snapshot must wait for the guard, not return while it is held"
+        );
+
+        drop(guard);
+        let snapshot = reader
+            .await
+            .expect("the reader task must not panic")
+            .expect("a held guard must not surface as an error");
+        assert!(snapshot.0.is_empty(), "the root has no children yet");
     }
 }
 

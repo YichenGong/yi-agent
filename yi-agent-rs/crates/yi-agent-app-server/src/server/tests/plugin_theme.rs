@@ -612,3 +612,49 @@ async fn plugin_uninstall_rejects_an_unusable_plugin_name() {
 
     h.shutdown().await;
 }
+
+/// 迁移到 managed 后，把「后台值守」开关重新打开**不得**装回旧值守。
+///
+/// 开关是用户对后台值守的表态，迁移是既成事实：若这里照旧安装，用户每改一次设置
+/// 就会把刚退休的自愈源装回来，和启动路径的卸载永远收敛不到一起。回复必须带
+/// warning——偏好已落盘而系统状态**故意**没变，静默成功会让用户以为它生效了。
+#[tokio::test(flavor = "multi_thread")]
+async fn re_enabling_the_watchman_on_a_retired_instance_installs_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    initialize(&mut h).await;
+
+    // harness 的 resident_dir 就是该实例的 home。
+    yi_agent_supervisors::lifecycle::retirement::retire(
+        h.resident_dir.path(),
+        "managed runtime took over",
+    )
+    .unwrap();
+    let calls = Arc::clone(&h.watchman_calls);
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"resident_daemon_watchman_enabled":true}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+
+    assert_eq!(
+        v["result"]["ok"], true,
+        "the preference is still stored: {v}"
+    );
+    assert!(
+        v["result"]["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("retired")),
+        "the refusal must be explained, not silent: {v}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a retired instance must not get a login item back"
+    );
+    // 用户的偏好仍按他的意图落盘：迁移回滚后不应丢失原本的选择。
+    assert!(crate::settings_store::load_watchman_enabled(dir.path()));
+    h.shutdown().await;
+}

@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 pub(crate) mod command;
+pub(crate) mod failure;
+#[cfg(test)]
+mod failure_tests;
 pub(crate) mod persist;
 pub(crate) mod replay;
 pub(crate) mod start;
@@ -368,6 +371,47 @@ pub(crate) async fn start_turn_core(
     params: &serde_json::Value,
     id: RequestId,
 ) -> anyhow::Result<Option<String>> {
+    start_turn_core_inner(
+        threads,
+        pending_activation,
+        uploads,
+        hub,
+        client,
+        params,
+        id,
+        None,
+    )
+    .await
+}
+
+/// 出站阶段中可在测试里注入失败的那三个点。
+///
+/// 只影响测试：生产包装永远传 `None`，走的仍是同一段 async 流程（三个真实函数
+/// 一个都没被替换掉），因此注入点不会把生产路径测成另一条逻辑。
+///
+/// 生产构建里没有任何调用方构造它的变体（包装永远传 `None`），故允许死代码；
+/// 测试直接调用 `start_turn_core_inner` 并传入具体阶段。
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum StartStage {
+    Opening,
+    Running,
+    Response,
+}
+
+/// 参数与 `start_turn_core` 一一对应，另加一个测试注入点；拆成结构体只会让
+/// 「哪些是真实参数」更难看清。
+#[allow(clippy::too_many_arguments)]
+async fn start_turn_core_inner(
+    threads: &mut HashMap<String, ThreadSession>,
+    pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
+    uploads: &mut crate::image_upload::UploadRegistry,
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    client: &crate::broadcast::ClientId,
+    params: &serde_json::Value,
+    id: RequestId,
+    fault: Option<StartStage>,
+) -> anyhow::Result<Option<String>> {
     let prepared = match prepare_turn_core(threads, pending_activation, uploads, params).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -376,46 +420,85 @@ pub(crate) async fn start_turn_core(
         }
     };
 
+    // 失败收口要用的身份先存下来：`prepared.turn_id` 之后会随 `TurnPrompt` move 走。
+    let thread_id = prepared.thread_id.clone();
+    let turn_id = prepared.turn_id.clone();
+
     // 顺序确定:先 turn/started 通知,再发本轮开启项(用户提问),再推 Running
     // 状态,再响应,最后投递 prompt。开启项排在 agent 任何 item 之前,实时观看与
     // 事后回放的顺序才一致(见 `opening_user_item`)。
-    write_notification(
+    //
+    // `turn/started` 之前失败只需回滚自己的占位；一旦宣告成功，之后任何失败都
+    // 必须补一次失败收口（否则界面永远停在「运行中」）。
+    if let Err(error) = write_notification(
         hub,
         &Notification::TurnStarted {
-            thread_id: prepared.thread_id.clone(),
-            turn_id: prepared.turn_id.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
         },
     )
-    .await?;
-    emit_item(
-        hub,
-        &prepared.thread_id,
-        opening_user_item(
-            &prepared.turn_id,
-            &prepared.display_text,
-            prepared.attachments.clone(),
-            prepared.image_refs.clone(),
-        ),
-    )
-    .await?;
-    update_status(
-        hub,
-        &prepared.status_handle,
-        &prepared.thread_id,
-        ThreadStatus::Running,
-    )
-    .await?;
-    write_response(
-        hub,
-        client,
-        ok_response(id, json!({ "turn_id": prepared.turn_id.clone() })),
-    )
-    .await?;
+    .await
+    {
+        super::turn::failure::rollback_turn(threads, hub, &thread_id, &turn_id).await;
+        return Err(error);
+    }
+
+    let outbound = async {
+        if matches!(fault, Some(StartStage::Opening)) {
+            return Err(anyhow::anyhow!("injected opening failure"));
+        }
+        emit_item(
+            hub,
+            &thread_id,
+            opening_user_item(
+                &turn_id,
+                &prepared.display_text,
+                prepared.attachments.clone(),
+                prepared.image_refs.clone(),
+            ),
+        )
+        .await?;
+        if matches!(fault, Some(StartStage::Running)) {
+            return Err(anyhow::anyhow!("injected running failure"));
+        }
+        update_status(
+            hub,
+            &prepared.status_handle,
+            &thread_id,
+            ThreadStatus::Running,
+        )
+        .await?;
+        if matches!(fault, Some(StartStage::Response)) {
+            return Err(anyhow::anyhow!("injected response failure"));
+        }
+        write_response(
+            hub,
+            client,
+            ok_response(id, json!({ "turn_id": turn_id.clone() })),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = outbound {
+        // 已宣告的 turn 必须恰好一次失败收口：先落完成水位、广播 failed，再按
+        // 身份回滚。原始错误仍向调用方传播（不伪装成成功）。
+        super::turn::failure::fail_announced_turn(
+            threads,
+            hub,
+            &thread_id,
+            &turn_id,
+            &error.to_string(),
+        )
+        .await;
+        return Err(error);
+    }
 
     if prepared
         .prompt_tx
         .send(TurnPrompt {
-            turn_id: prepared.turn_id,
+            turn_id: turn_id.clone(),
             prompt: prepared.prompt,
             activate: prepared.activate,
             attachments: prepared.attachments,
@@ -427,11 +510,19 @@ pub(crate) async fn start_turn_core(
         .await
         .is_err()
     {
-        // driver 已退出(理论上不会):清掉活跃标记,
-        // 避免后续 turn 永远报 turn_in_progress。
-        if let Some(s) = threads.get_mut(&prepared.thread_id) {
-            s.active_turn_id = None;
-        }
+        // 成功响应已经发出，绝不能再补第二个同 id 的 RPC 响应；以失败完成通知
+        // 终结这个已宣告的 turn，并按身份恢复 Idle。函数正常返回主循环，不把
+        // 一次投递失败升级成 transport fatal（那会把整个 app-server 退出）。
+        super::turn::failure::fail_announced_turn(
+            threads,
+            hub,
+            &thread_id,
+            &turn_id,
+            "turn driver closed before prompt delivery",
+        )
+        .await;
+        return Ok(Some(thread_id));
     }
-    Ok(Some(prepared.thread_id))
+    // send 成功即由 driver 接手：此处不得再发 failed、不得回滚。
+    Ok(Some(thread_id))
 }

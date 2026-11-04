@@ -4,7 +4,9 @@ mod build_info;
 mod config;
 mod control_commands;
 mod flags_cmd;
+mod frontend_lease;
 mod llm_prefix;
+mod managed_runtime;
 mod onboarding_prompt;
 mod resume;
 mod schedule_intent;
@@ -29,8 +31,8 @@ use yi_agent_core::Provider;
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{
-    AgentAction, Cli, Command, DaemonAction, FlagsAction, PairAction, ResidentAction,
-    ScheduleAction,
+    AgentAction, Cli, Command, DaemonAction, FlagsAction, InternalRuntimeAction, PairAction,
+    ResidentAction, ScheduleAction,
 };
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
@@ -98,6 +100,14 @@ fn main() -> Result<()> {
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
         Some(Command::Flags { ref action }) => run_flags(action),
+        Some(Command::InternalRuntime { ref action }) => match action {
+            InternalRuntimeAction::Identity { json } => run_internal_identity(*json),
+            InternalRuntimeAction::Executor { owner, models } => {
+                run_internal_executor(owner.clone(), models.clone())
+            }
+            InternalRuntimeAction::Guardian => run_internal_guardian(),
+            InternalRuntimeAction::Daemon => run_internal_daemon(),
+        },
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {
@@ -302,6 +312,78 @@ fn run_flags(action: &FlagsAction) -> Result<()> {
     Ok(())
 }
 
+/// Report this executable's static artifact identity.
+///
+/// Reads no configuration, opens no database, and starts nothing: it is what the
+/// packaging pipeline and the bundle-manifest generator ask on a machine where no
+/// runtime exists. `--json` is the machine form; the human form is for debugging
+/// a version mismatch by hand.
+/// Runs one client's worker executor.
+///
+/// Resolves the local runtime configuration the same way every other entry point
+/// does, then hands the inherited descriptor to the executor. No public RPC is
+/// involved, so a local process cannot ask this binary to execute anything.
+fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> Result<()> {
+    let overrides = yi_agent_runtime::config::ConfigOverrides::default();
+    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
+    managed_runtime::run_executor(owner, models, config)
+}
+
+/// Serves one runtime as its guardian, resolving the scope from the environment.
+///
+/// The canonicalisation runs here rather than in the launcher so both sides agree
+/// on the scope key even when the caller passed a symlinked path: a guardian and a
+/// client that disagree about the key would watch different directories.
+fn run_internal_guardian() -> Result<()> {
+    // Authorization first: the descriptor is what proves this role was assigned by
+    // a launcher, so its absence must be the reported reason.
+    let _bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    let key = yi_agent_supervisors::lifecycle::roles::scope_key()?;
+    let runtime_dir = std::path::PathBuf::from(&key);
+    let instance_home = std::env::var_os("YI_AGENT_INSTANCE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            yi_agent_store::paths::instance_home().unwrap_or_else(|| runtime_dir.clone())
+        });
+    let project = std::env::current_dir()?;
+    let scope = yi_agent_supervisors::lifecycle::bringup::scope_for_existing(
+        &runtime_dir,
+        &project,
+        &instance_home,
+    )?;
+    managed_runtime::run_guardian(scope)
+}
+
+/// Serves one runtime's business daemon as the managed role.
+fn run_internal_daemon() -> Result<()> {
+    let overrides = yi_agent_runtime::config::ConfigOverrides::default();
+    let config = yi_agent_runtime::config::RuntimeConfig::load_lenient(&overrides)?;
+    managed_runtime::run_managed_daemon(config)
+}
+
+fn run_internal_identity(json: bool) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let identity = build_info::artifact_identity(&executable);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&identity)?);
+    } else {
+        println!("build id          {}", identity.build_id);
+        println!("display version   {}", identity.display_version);
+        println!("executable        {}", identity.executable.display());
+        println!(
+            "schema range      {}..{}",
+            identity.schema_min, identity.schema_max
+        );
+        println!(
+            "business protocol {}..{}",
+            identity.business_protocol_min, identity.business_protocol_max
+        );
+        println!("handover version  {}", identity.handover_version);
+        println!("capabilities      {}", identity.capabilities.join(", "));
+    }
+    Ok(())
+}
+
 /// 常驻值守循环。由 launchd 托管，KeepAlive 负责它自己的存活。
 ///
 /// 通用：读通用常驻登记，保证登记在册的项目各有一个活着的 daemon。见
@@ -311,11 +393,20 @@ fn run_resident_watch(interval_secs: u64) {
         eprintln!("yi-agent: cannot run the resident watch: HOME is not set");
         std::process::exit(1);
     };
+    let instance_home = resident_dir.clone();
     let interval = std::time::Duration::from_secs(interval_secs);
     loop {
-        yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
-            yi_agent_supervisors::watch::ensure_daemons(projects);
-        });
+        // A retired instance must stop being the thing that keeps daemons alive when
+        // no frontend is around. The loop keeps running rather than exiting so a
+        // migration confirmed while it is alive takes effect immediately; the marker
+        // is re-read every tick for exactly that reason.
+        yi_agent_supervisors::watch::once_unattended(
+            &instance_home,
+            &resident_dir,
+            &mut |projects| {
+                yi_agent_supervisors::watch::ensure_daemons(projects);
+            },
+        );
         std::thread::sleep(interval);
     }
 }
@@ -926,6 +1017,12 @@ struct HeadlessRuntimeSession {
     socket_path: std::path::PathBuf,
     attached_root: crate::tui::subagents::AttachedRoot,
     embedded_daemon: Option<yi_agent_store::ipc::Daemon>,
+    /// The lease for this whole `run` invocation, or `None` under embedded mode.
+    ///
+    /// One per invocation, not one per task: `run` is a single frontend of the
+    /// shared runtime even when it fans out to many subagents, and its exit is what
+    /// says "stop reclaiming on my behalf".
+    frontend_lease: Option<crate::frontend_lease::FrontendLeaseHandle>,
 }
 
 fn attach_application_root_request(
@@ -982,6 +1079,17 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
     else {
         anyhow::bail!("{}", runtime_attached_root_rejection(&response));
     };
+    // A shared runtime with a guardian needs to know this process is alive while it
+    // works; without the lease a long first turn looks like an abandoned client and
+    // its work gets reclaimed. Embedded mode has no guardian to tell, and
+    // `register` reports that as `None` rather than inventing a lease.
+    let frontend_lease = crate::frontend_lease::FrontendLeaseHandle::register(
+        &runtime_dir,
+        yi_agent_lifecycle::types::ClientKind::Headless,
+        crate::frontend_lease::new_client_run_id("run"),
+    )
+    .ok()
+    .flatten();
     Ok(HeadlessRuntimeSession {
         socket_path,
         attached_root: crate::tui::subagents::AttachedRoot {
@@ -991,6 +1099,7 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
             workspace,
         },
         embedded_daemon,
+        frontend_lease,
     })
 }
 
@@ -2096,11 +2205,28 @@ fn run_headless(
         rt.block_on(manager.shutdown());
     }
 
-    if let Some(runtime) = &headless_runtime {
-        detach_headless_runtime_root(runtime);
+    if let Some(mut runtime) = headless_runtime {
+        detach_headless_runtime_root(&runtime);
+        // The detach comes first: the root is closed while this process is still a
+        // live client, so the reclaim that follows cannot race an attach. Both the
+        // success and the failure path land here -- a run that errored still owns
+        // whatever work it started.
+        if let Some(lease) = runtime.frontend_lease.take() {
+            match lease.release() {
+                Some(result) if !result.stopped => {
+                    // Say it out loud: `run` exits with the turn's code, and a
+                    // silent failed teardown would look like a clean exit.
+                    eprintln!(
+                        "[yi-agent] 退出时仍有工作未停止: {}",
+                        result.failures.join("; ")
+                    );
+                }
+                _ => {}
+            }
+        }
         let _embedded_daemon = runtime.embedded_daemon.as_ref();
+        drop(runtime);
     }
-    drop(headless_runtime);
     std::process::exit(exit_code);
 }
 
@@ -2396,6 +2522,11 @@ fn run_tui_agent(
             std::path::PathBuf,
             crate::tui::subagents::AttachedRoot,
         )>));
+        // The TUI is one frontend for the whole session: every thread it opens
+        // shares this lease, and the lease is released once, on exit.
+        let frontend_lease = Arc::new(std::sync::Mutex::new(
+            None::<crate::frontend_lease::FrontendLeaseHandle>,
+        ));
         let is_running = Arc::new(AtomicBool::new(false));
 
         // `always` reuses the existing attach path by pre-seeding the choice the
@@ -2432,6 +2563,7 @@ fn run_tui_agent(
         let mut live = LiveRebuild::new(Arc::clone(&provider), agent_config.clone());
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
+        let frontend_lease_for_driver = Arc::clone(&frontend_lease);
         let mcp_for_driver = Arc::clone(&mcp);
         let mcp_for_teardown = Arc::clone(&mcp);
 
@@ -2622,6 +2754,7 @@ fn run_tui_agent(
         let side_commands_for_driver = side_publisher.as_ref().and(side_commands_tx_for_driver);
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
+            let mut lease_lost_reported = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
@@ -3062,6 +3195,28 @@ fn run_tui_agent(
                                                 Arc::clone(&handle),
                                             );
                                             caller_for_attach.bind(handle);
+                                            // A runtime with a guardian counts this
+                                            // process as a frontend; without the
+                                            // lease its work would be reclaimed as
+                                            // abandoned after 30 s of tool calls.
+                                            // Embedded mode has no guardian, and
+                                            // `None` is the honest answer there.
+                                            if let Some(lease) =
+                                                crate::frontend_lease::FrontendLeaseHandle::register(
+                                                    &runtime_directory_for(
+                                                        &attached_root.workspace.path,
+                                                    ),
+                                                    yi_agent_lifecycle::types::ClientKind::Tui,
+                                                    crate::frontend_lease::new_client_run_id("tui"),
+                                                )
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                *frontend_lease_for_driver
+                                                    .lock()
+                                                    .expect("frontend lease mutex poisoned") =
+                                                    Some(lease);
+                                            }
                                             current_runtime =
                                                 Some(TuiRuntimeSession::Attached(Box::new(
                                                     AttachedTuiRuntime {
@@ -3282,6 +3437,28 @@ fn run_tui_agent(
                     }
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                // If the runtime stopped counting this session as present, say so
+                // once. The user is otherwise staring at a working UI while the
+                // guardian is on its way to reclaiming this client's work, and the
+                // first symptom would be a task that quietly vanished.
+                let lost_client = frontend_lease_for_driver
+                    .lock()
+                    .expect("frontend lease mutex poisoned")
+                    .as_ref()
+                    .filter(|lease| lease.is_lost())
+                    .map(|lease| lease.client_run_id().to_string());
+                if let Some(client_run_id) = lost_client.filter(|_| !lease_lost_reported) {
+                    lease_lost_reported = true;
+                    tracing::warn!(%client_run_id, "frontend lease lost");
+                    let _ = agent_tx
+                        .send(yi_agent_core::AgentEvent::Notice {
+                            level: yi_agent_core::NoticeLevel::Warn,
+                            text: "运行时不再把本会话视为在线，其工作可能已被回收"
+                                .to_string(),
+                        })
+                        .await;
+                }
             }
             if current_runtime.is_some()
                 && let Some((socket, root)) = runtime_detach_for_driver
@@ -3367,6 +3544,26 @@ fn run_tui_agent(
             .take()
         {
             detach_tui_runtime_root(&socket, &root);
+        }
+
+        // Leaving is explicit, and it happens after the detach: the root is closed
+        // first so the reclaim that follows has nothing of ours left to interrupt.
+        // A `None` result means the answer did not arrive -- the work may still be
+        // stopping, and saying otherwise would be a claim nobody verified.
+        if let Some(lease) = frontend_lease
+            .lock()
+            .expect("frontend lease mutex poisoned")
+            .take()
+        {
+            match lease.release() {
+                Some(result) if !result.stopped => {
+                    tracing::warn!(
+                        failures = ?result.failures,
+                        "some work had not stopped when this session left"
+                    );
+                }
+                _ => {}
+            }
         }
 
         // TUI exited; abort the driver task to clean up

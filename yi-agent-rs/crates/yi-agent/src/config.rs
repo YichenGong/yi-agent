@@ -197,6 +197,14 @@ pub enum Command {
         #[command(subcommand)]
         action: FlagsAction,
     },
+    /// Internal runtime roles. Hidden: these are spawned by the guardian and the
+    /// desktop shell with an inherited private bootstrap FD, never typed by a
+    /// user. Without that FD each role refuses to run.
+    #[command(hide = true, name = "internal-runtime")]
+    InternalRuntime {
+        #[command(subcommand)]
+        action: InternalRuntimeAction,
+    },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
     ///
     /// 通用子命令：它只读通用常驻登记，不认识任何插件。
@@ -229,6 +237,49 @@ pub enum Command {
     },
     /// 列出当前目录的会话。
     Threads,
+}
+
+/// Hidden runtime roles plus the one statically-reportable command.
+#[derive(clap::Subcommand, Debug)]
+pub enum InternalRuntimeAction {
+    /// Print this executable's static artifact identity and exit.
+    ///
+    /// Deliberately does NOT connect to a runtime, read the database, or start
+    /// anything: the build pipeline and the bundle manifest generator call it on a
+    /// machine where no runtime exists.
+    Identity {
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one client's worker executor.
+    ///
+    /// Started by the daemon with an inherited control descriptor; never typed by
+    /// a user. Refuses to run without that descriptor.
+    Executor {
+        /// The client this executor serves, as the daemon established it.
+        #[arg(long)]
+        owner: String,
+        /// The model catalogue to resolve providers from. Defaults to this
+        /// machine's catalogue.
+        #[arg(long)]
+        models: Option<std::path::PathBuf>,
+    },
+    #[command(hide = true)]
+    /// Serve one runtime as its guardian.
+    ///
+    /// Started by a bring-up with an inherited bootstrap descriptor and the scope
+    /// key in the environment; never typed by a user. Refuses to run without both:
+    /// a guardian that accepted its scope from a command line could adopt another
+    /// project's process groups.
+    Guardian,
+    #[command(hide = true)]
+    /// Serve one runtime's business daemon, under its guardian.
+    ///
+    /// Same authorization as `guardian`; this is the *only* daemon start that
+    /// carries the exit guarantees, which is why it is a private role and not a
+    /// flag on the public `daemon serve`.
+    Daemon,
 }
 
 #[derive(clap::Subcommand, Debug)]

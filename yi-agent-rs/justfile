@@ -239,6 +239,38 @@ desktop-check:
     cd ../desktop && npx tsc --noEmit
     cd ../desktop && npx vitest run
 
+# 共享运行时生命周期：真进程验收 + 各层集成目标。
+#
+# 为什么是单独 recipe 而不是塞进 `test`：这里的目标多数会真的 spawn guardian／
+# daemon／子进程，且个别用例要等真实的 10 秒优雅窗口。放进 `cargo nextest run
+# --workspace` 会让普通 `just test` 从十几秒变成几分钟，而日常改动大多用不到真
+# 进程。CI 的 macos job 单独调用本 recipe（见 .github/workflows/ci.yml）。
+#
+# `runtime_process_helper` 是固定 `#[ignore]` 的 OS fixture，只由 harness 用
+# `--exact --ignored` 启动；默认运行与 `--run-ignored all` 都必须排除它
+# （见 .config/nextest.toml 的 default-filter）。
+runtime-lifecycle-check:
+    cargo test -p yi-agent --test managed_runtime_lifecycle
+    cargo test -p yi-agent --test managed_roles
+    cargo test -p yi-agent --test frontend_runtime_lease
+    cargo test -p yi-agent-supervisors --test managed_bringup
+    cargo test -p yi-agent-supervisors --test managed_process_groups
+    cargo test -p yi-agent-supervisors --test managed_channel
+    cargo test -p yi-agent-supervisors --test client_reclamation
+    cargo test -p yi-agent-supervisors --test execution_admission
+    cargo test -p yi-agent-supervisors --test guardian_control
+    cargo test -p yi-agent-supervisors --test guardian_status
+    cargo test -p yi-agent-supervisors --test guardian_handover
+    cargo test -p yi-agent-supervisors --test runtime_switch
+    cargo test -p yi-agent-supervisors --test runtime_migration
+    cargo test -p yi-agent-supervisors --test runtime_scope
+    cargo test -p yi-agent-supervisors --test runtime_restart_preview
+    cargo test -p yi-agent-subagent --test executor_isolation
+    cargo test -p yi-agent-subagent --test executor_bridge
+    cargo test -p yi-agent-subagent --test executor_gate
+    cargo test -p yi-agent-subagent --test bringup_policy
+    cargo test -p yi-agent-tools --test managed_bash
+
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:

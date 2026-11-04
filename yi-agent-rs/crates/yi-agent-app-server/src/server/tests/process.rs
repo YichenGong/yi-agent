@@ -452,6 +452,7 @@ async fn process_list_and_read_observe_the_managers_the_factory_handed_over() {
             on_exit: Default::default(),
             ready_pattern: Some("alpha".into()),
             ready_timeout_sec: Some(5),
+            prevent_idle_sleep: false,
         })
         .await
         .expect("start");
@@ -557,6 +558,7 @@ async fn process_kill_terminates_a_held_manager_process() {
                 on_exit: Default::default(),
                 ready_pattern: None,
                 ready_timeout_sec: None,
+                prevent_idle_sleep: false,
             })
             .await
             .expect("start");
@@ -665,6 +667,7 @@ async fn resume_of_a_live_thread_rebinds_process_watcher_to_the_effective_manage
             on_exit: Default::default(),
             ready_pattern: None,
             ready_timeout_sec: None,
+            prevent_idle_sleep: false,
         })
         .await
         .expect("start");
@@ -759,4 +762,99 @@ async fn clear_resets_persisted_totals() {
         0,
         "{v}"
     );
+}
+
+/// B7（RPC 侧）：`process/list` 与 `process/read` 都直接序列化 manager 的 DTO，
+/// 因此新增的意图字段必须两处都出现；缺省 false 也必须可读。
+///
+/// 这里**不**新增 RPC 字段或 `process/updated` 载荷——只验证既有两条读路径。
+#[tokio::test]
+async fn sleep_hardening_process_dtos_expose_the_retained_intent() {
+    use std::sync::Arc;
+
+    let held: Arc<yi_agent_tools::ProcessManager> =
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir());
+    let for_factory = Arc::clone(&held);
+    let mut cfg = test_config();
+    cfg.provider = "t5-isolated".to_string();
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            let mut built = build_test_agent(session, cwd, mode)?;
+            built.process_manager = Arc::clone(&for_factory);
+            Ok(built)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    let thread_id = start_thread(&mut h).await;
+
+    let opted_in = held
+        .start(yi_agent_tools::ProcessStartOptions {
+            command: "printf READY; sleep 30".into(),
+            name: Some("brake".into()),
+            cwd: None,
+            env: Default::default(),
+            on_exit: Default::default(),
+            ready_pattern: Some("READY".into()),
+            ready_timeout_sec: Some(5),
+            prevent_idle_sleep: true,
+        })
+        .await
+        .expect("the opted-in process starts");
+    let opted_out = held
+        .start(yi_agent_tools::ProcessStartOptions {
+            command: "sleep 30".into(),
+            name: Some("resident".into()),
+            cwd: None,
+            env: Default::default(),
+            on_exit: Default::default(),
+            ready_pattern: None,
+            ready_timeout_sec: None,
+            prevent_idle_sleep: false,
+        })
+        .await
+        .expect("the opted-out process starts");
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"process/list","params":{{"thread_id":"{thread_id}"}}}}"#
+    ))
+    .await;
+    let listed = read_response(&mut h, 3).await;
+    assert!(listed["error"].is_null(), "{listed}");
+    let by_name = |name: &str| -> serde_json::Value {
+        listed["result"]["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("{name} must be listed: {listed}"))
+            .clone()
+    };
+    assert_eq!(
+        by_name("brake")["prevent_idle_sleep"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        by_name("resident")["prevent_idle_sleep"],
+        serde_json::json!(false),
+        "the omitted intent reads back as false, not as a missing key"
+    );
+
+    for (id, process_id) in [(4u64, &opted_in.process_id), (5u64, &opted_out.process_id)] {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{process_id}"}}}}"#
+        ))
+        .await;
+        let read = read_response(&mut h, id).await;
+        assert!(read["error"].is_null(), "{read}");
+        let expected = if id == 4 {
+            serde_json::json!(true)
+        } else {
+            serde_json::json!(false)
+        };
+        assert_eq!(read["result"]["prevent_idle_sleep"], expected, "{read}");
+    }
+
+    let _ = held.shutdown().await;
+    h.shutdown().await;
 }

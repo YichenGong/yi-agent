@@ -20,7 +20,7 @@ use yi_agent_core::ToolRegistry;
 
 pub use cache::CachedTool;
 pub use config::{McpConfig, ServerConfig, ServerKind, Transport, config_path};
-pub use manager::{McpManager, now_unix};
+pub use manager::{LaunchedStdio, McpManager, StdioLauncher, now_unix};
 pub use reload_tool::{McpReloadTool, TOOL_NAME as MCP_RELOAD_TOOL_NAME};
 pub use tool::McpTool;
 
@@ -93,11 +93,26 @@ pub fn register_mcp_tools(
     registry: &mut ToolRegistry,
     workdir: &Path,
 ) -> Result<Option<Arc<McpManager>>> {
+    register_mcp_tools_with(registry, workdir, None)
+}
+
+/// Same as [`register_mcp_tools`], but stdio servers are started through
+/// `launcher`.
+///
+/// A managed runtime passes a launcher that goes through the guardian's
+/// owner-bound channel: probe and reconnect children then belong to the frontend
+/// that asked for them. Passing `None` keeps the direct spawn, which is correct
+/// only where there is no owner to reclaim for.
+pub fn register_mcp_tools_with(
+    registry: &mut ToolRegistry,
+    workdir: &Path,
+    launcher: Option<Arc<dyn StdioLauncher>>,
+) -> Result<Option<Arc<McpManager>>> {
     let Some(cfg) = McpConfig::load(workdir)? else {
         return Ok(None);
     };
 
-    let manager = run_blocking(move || McpManager::load_and_probe(cfg, workdir))?;
+    let manager = run_blocking(move || McpManager::load_and_probe_with(cfg, workdir, launcher))?;
 
     for tool in manager.enabled_tools() {
         registry.register(tool);

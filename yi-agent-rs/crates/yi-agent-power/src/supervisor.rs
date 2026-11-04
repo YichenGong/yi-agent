@@ -5,7 +5,13 @@ use std::time::Duration;
 use crate::assertion::Assertion;
 use crate::clock::Clock;
 use crate::policy::{Decision, Policy, Snapshot};
-use crate::probe::{NetProbe, PowerProbe};
+use crate::probe::{NetProbe, NetworkState, PowerProbe};
+
+/// 是否「刚进入未知」。只在状态边沿记日志：持续 Unknown 不该每 10 秒刷屏，
+/// 恢复后再未知才算一次新的边沿。
+fn entered_unknown(previous: Option<NetworkState>, next: NetworkState) -> bool {
+    next == NetworkState::Unknown && previous != Some(NetworkState::Unknown)
+}
 
 pub struct Supervisor {
     clock: Arc<dyn Clock>,
@@ -13,6 +19,8 @@ pub struct Supervisor {
     net: Box<dyn NetProbe>,
     assertion: Box<dyn Assertion>,
     policy: Policy,
+    /// 上一拍采到的网络状态，仅用于 Unknown 边沿日志。
+    last_network_state: Option<NetworkState>,
 }
 
 impl Supervisor {
@@ -33,6 +41,7 @@ impl Supervisor {
             net,
             assertion,
             policy,
+            last_network_state: None,
         }
     }
 
@@ -59,9 +68,20 @@ impl Supervisor {
             return;
         };
 
+        // 每拍只采一次网络状态：没有主动探测，这次调用只是本地 FFI 快照。
+        let state = self.net.state();
+        if entered_unknown(self.last_network_state, state) {
+            eprintln!(
+                "[yi-agent-power] network state is unknown (no trustworthy interface snapshot); \
+                 keeping the sleep assertion eligible while other conditions hold"
+            );
+        }
+        self.last_network_state = Some(state);
+
         let snapshot = Snapshot {
             on_ac: self.power.on_ac(),
-            online: self.net.online(),
+            // 只有确认离线才不给资格；Unknown 仍是资格。策略本身不知道采样错误。
+            online: state.eligible(),
             busy,
         };
         match self.policy.decide(&snapshot, now) {
@@ -142,10 +162,23 @@ mod tests {
         }
     }
 
-    struct FixedNet(bool);
-    impl NetProbe for FixedNet {
-        fn online(&self) -> bool {
-            self.0
+    /// 可切换的三态假探针：测试要在同一 supervisor 上跨过状态边沿。
+    struct FixedNet(std::sync::Mutex<NetworkState>);
+
+    impl FixedNet {
+        fn new(state: NetworkState) -> Self {
+            Self(std::sync::Mutex::new(state))
+        }
+        fn set(&self, state: NetworkState) {
+            *self.0.lock().unwrap() = state;
+        }
+    }
+
+    // 与测试里 `impl Assertion for Arc<CountingAssertion>` 同一手法：
+    // 让 `Arc` 本身成为探针，测试才能在外面切换状态。
+    impl NetProbe for Arc<FixedNet> {
+        fn state(&self) -> NetworkState {
+            *self.0.lock().unwrap()
         }
     }
 
@@ -189,23 +222,46 @@ mod tests {
     fn supervisor_with(
         clock: Arc<FakeClock>,
         on_ac: bool,
-        online: bool,
+        state: NetworkState,
         assertion: Arc<CountingAssertion>,
     ) -> Supervisor {
         Supervisor::new(
             clock,
             Box::new(FixedPower(on_ac)),
-            Box::new(FixedNet(online)),
+            Box::new(Arc::new(FixedNet::new(state))),
             Box::new(assertion),
             true,
         )
+    }
+
+    /// 需要跨网络状态边沿测试的夹具：网络探针是可切换的 `Arc`。
+    fn supervisor_with_switchable_net(
+        clock: Arc<FakeClock>,
+        on_ac: bool,
+        state: NetworkState,
+        assertion: Arc<CountingAssertion>,
+    ) -> (Supervisor, Arc<FixedNet>) {
+        let net = Arc::new(FixedNet::new(state));
+        let sup = Supervisor::new(
+            clock,
+            Box::new(FixedPower(on_ac)),
+            Box::new(net.clone()),
+            Box::new(assertion),
+            true,
+        );
+        (sup, net)
     }
 
     #[test]
     fn holding_then_ticking_again_does_not_touch_the_ffi() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), true, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         sup.tick(false, true);
         assert_eq!(assertion.acquires.load(Ordering::SeqCst), 1);
         assert!(sup.is_holding());
@@ -225,7 +281,12 @@ mod tests {
     fn disabling_releases_immediately_without_waiting_for_the_grace() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), true, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         sup.tick(false, true);
         assert!(sup.is_holding());
         clock.advance(Duration::from_secs(10));
@@ -238,7 +299,12 @@ mod tests {
     fn re_enabling_holds_again_on_the_next_tick() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), true, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         sup.tick(false, false);
         assert!(!sup.is_holding());
         clock.advance(Duration::from_secs(10));
@@ -252,7 +318,12 @@ mod tests {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
         assertion.fail_next.store(true, Ordering::SeqCst);
-        let mut sup = supervisor_with(Arc::clone(&clock), true, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         sup.tick(false, true);
         assert_eq!(assertion.acquires.load(Ordering::SeqCst), 1);
         assert!(!sup.is_holding());
@@ -267,7 +338,12 @@ mod tests {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
         {
-            let mut sup = supervisor_with(Arc::clone(&clock), true, true, Arc::clone(&assertion));
+            let mut sup = supervisor_with(
+                Arc::clone(&clock),
+                true,
+                NetworkState::Online,
+                Arc::clone(&assertion),
+            );
             sup.tick(false, true);
             assert!(assertion.held.load(Ordering::SeqCst));
         }
@@ -279,7 +355,12 @@ mod tests {
     fn the_snapshot_reflects_the_injected_probes() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), true, false, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Offline,
+            Arc::clone(&assertion),
+        );
         sup.tick(false, true);
         assert!(!sup.is_holding());
     }
@@ -289,7 +370,12 @@ mod tests {
     fn battery_work_finishing_releases_after_the_grace() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), false, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         sup.tick(true, true);
         assert!(sup.is_holding());
         clock.advance(Duration::from_secs(899));
@@ -307,7 +393,12 @@ mod tests {
     fn set_windows_reaches_the_policy() {
         let clock = FakeClock::new();
         let assertion = CountingAssertion::new();
-        let mut sup = supervisor_with(Arc::clone(&clock), false, true, Arc::clone(&assertion));
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
         // 电池 + 有活 → 持有。
         sup.tick(true, true);
         assert!(sup.is_holding());
@@ -331,5 +422,240 @@ mod tests {
             sup.is_holding(),
             "with a 60-minute grace, 20 minutes of idle must still hold"
         );
+    }
+
+    // ---- P1：三态网络资格在 Supervisor 里的行为 ---------------------------
+
+    /// Unknown 与 Online 一样提供资格：busy + 电池下两拍都持有（N5）。
+    #[test]
+    fn sleep_hardening_unknown_network_still_holds() {
+        for state in [NetworkState::Online, NetworkState::Unknown] {
+            let clock = FakeClock::new();
+            let assertion = CountingAssertion::new();
+            let mut sup = supervisor_with(Arc::clone(&clock), false, state, Arc::clone(&assertion));
+            sup.tick(true, true);
+            assert!(sup.is_holding(), "{state:?} with busy must hold");
+            clock.advance(Duration::from_secs(10));
+            sup.tick(true, true);
+            assert!(
+                sup.is_holding(),
+                "{state:?} must keep holding without a new edge"
+            );
+            assert_eq!(
+                assertion.acquires.load(Ordering::SeqCst),
+                1,
+                "{state:?}: only the hold edge touches the FFI"
+            );
+        }
+    }
+
+    /// 确认离线（Offline）后进入宽限，满 15 分钟释放。
+    #[test]
+    fn sleep_hardening_offline_network_releases_after_the_grace() {
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let (mut sup, net) = supervisor_with_switchable_net(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(sup.is_holding());
+
+        net.set(NetworkState::Offline);
+        clock.advance(Duration::from_secs(899));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "grace not yet elapsed");
+        clock.advance(Duration::from_secs(1));
+        sup.tick(true, true);
+        assert!(!sup.is_holding(), "offline past the grace must release");
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// Unknown 不是无条件保活：开关关、无活、电池，三条任一都仍能阻止持有。
+    #[test]
+    fn sleep_hardening_unknown_does_not_bypass_the_other_conditions() {
+        // enabled = false
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Unknown,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, false);
+        assert!(!sup.is_holding(), "disabled must release even when unknown");
+
+        // busy = false 且电池：没有活可保，插电才算 ok
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Unknown,
+            Arc::clone(&assertion),
+        );
+        sup.tick(false, true);
+        assert!(!sup.is_holding(), "no work on battery must not hold");
+
+        // on_ac = false 但 busy = true 才是该持有的那一组（对照）
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Unknown,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(
+            sup.is_holding(),
+            "unknown + busy on battery is the eligible case"
+        );
+
+        // 插电：即使无活也持有（策略非回归，不是 Unknown 的特权）
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            true,
+            NetworkState::Unknown,
+            Arc::clone(&assertion),
+        );
+        sup.tick(false, true);
+        assert!(sup.is_holding(), "on AC holds regardless of busy");
+    }
+
+    /// N6：网络采样每拍一次即可——线缆恢复后的下一拍就能重新获得资格。
+    #[test]
+    fn sleep_hardening_network_recovery_regains_eligibility_on_next_tick() {
+        let clock = FakeClock::new();
+        let assertion = CountingAssertion::new();
+        let (mut sup, net) = supervisor_with_switchable_net(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Offline,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(!sup.is_holding(), "offline never acquires");
+
+        net.set(NetworkState::Online);
+        clock.advance(Duration::from_secs(10));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "recovered link holds on the next tick");
+        assert_eq!(assertion.acquires.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- N8：Unknown 只在边沿记日志 -------------------------------------
+
+    #[test]
+    fn sleep_hardening_entered_unknown_logs_only_on_the_edge() {
+        assert!(
+            entered_unknown(None, NetworkState::Unknown),
+            "first sample unknown is an edge"
+        );
+        assert!(
+            !entered_unknown(Some(NetworkState::Unknown), NetworkState::Unknown),
+            "persistent unknown must not log every tick"
+        );
+        assert!(
+            entered_unknown(Some(NetworkState::Online), NetworkState::Unknown),
+            "online -> unknown is an edge"
+        );
+        assert!(
+            entered_unknown(Some(NetworkState::Offline), NetworkState::Unknown),
+            "offline -> unknown is an edge"
+        );
+        assert!(
+            !entered_unknown(Some(NetworkState::Unknown), NetworkState::Online),
+            "leaving unknown is not an entering edge"
+        );
+        assert!(
+            !entered_unknown(Some(NetworkState::Online), NetworkState::Offline),
+            "known -> known is not an edge"
+        );
+    }
+
+    /// 边沿之后恢复、再次未知要重新记一次：状态本身是「上一次采样」，
+    /// 不是「曾经未知过」。
+    #[test]
+    fn sleep_hardening_unknown_edge_after_recovery_logs_again() {
+        let mut previous = None;
+        let mut edges = 0;
+        for state in [
+            NetworkState::Unknown,
+            NetworkState::Unknown,
+            NetworkState::Online,
+            NetworkState::Unknown,
+        ] {
+            if entered_unknown(previous, state) {
+                edges += 1;
+            }
+            previous = Some(state);
+        }
+        assert_eq!(edges, 2, "unknown, unknown, online, unknown => two edges");
+    }
+
+    /// B6：后台 busy 是**普通 busy 源**——它不为 Supervisor 引入任何新语义。
+    ///
+    /// 只要 `busy=true` 且网络合格、在电池上，两拍都持有；后台工作到终态后
+    /// `busy=false`，宽限未到仍持有、等于宽限释放；若另有 busy 源仍为 true，
+    /// 则继续持有（不因后台结束而释放）。
+    ///
+    /// 这里用 FakeClock 推进，**不**真实等待 15 分钟。
+    #[test]
+    fn sleep_hardening_background_busy_follows_the_grace_boundary() {
+        // 两拍 Hold（后台 busy 与 online+battery 同形）。
+        let clock = Arc::new(FakeClock::new());
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "background busy on battery must hold");
+        clock.advance(Duration::from_secs(10));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "still busy => keep holding");
+        assert_eq!(assertion.acquires.load(Ordering::SeqCst), 1);
+
+        // 后台终态：busy=false，宽限未到仍持有。
+        clock.advance(Duration::from_secs(899));
+        sup.tick(false, true);
+        assert!(sup.is_holding(), "grace has not elapsed yet");
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 0);
+
+        // 恰好等于宽限 => 释放（判据是 `<`）。
+        clock.advance(Duration::from_secs(1));
+        sup.tick(false, true);
+        assert!(
+            !sup.is_holding(),
+            "busy gone and grace elapsed must release"
+        );
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 1);
+
+        // 另一路 busy 仍为 true：不因后台结束而释放。
+        let clock = Arc::new(FakeClock::new());
+        let assertion = CountingAssertion::new();
+        let mut sup = supervisor_with(
+            Arc::clone(&clock),
+            false,
+            NetworkState::Online,
+            Arc::clone(&assertion),
+        );
+        sup.tick(true, true);
+        assert!(sup.is_holding());
+        clock.advance(Duration::from_secs(10));
+        // 后台结束，但会话仍在跑 turn：聚合后的 busy 仍是 true。
+        sup.tick(true, true);
+        clock.advance(Duration::from_secs(3600));
+        sup.tick(true, true);
+        assert!(sup.is_holding(), "another busy source keeps it holding");
+        assert_eq!(assertion.releases.load(Ordering::SeqCst), 0);
     }
 }

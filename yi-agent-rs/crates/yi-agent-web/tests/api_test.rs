@@ -180,6 +180,65 @@ async fn get_config_reports_a_label_for_every_field() {
     }
 }
 
+/// `FIELDS` 里的每个键都必须能从 `/api/config` 读回非 null 的值。
+///
+/// 与 `settings_rpc::tests::every_field_in_fields_can_be_read_back` 同构。
+/// 这条守卫曾经缺失：`get_config_reports_a_label_for_every_field` 也遍历
+/// `FIELDS`，但它只断言 `label`，而 `label` 直接来自 `spec.label`、与
+/// `field_value` 无关。于是 `tui.terminal_title` 漏了 value 分支之后，
+/// 接口照旧 200、label 照旧正确，只是 `value` 恒为 null——页面上那个开关
+/// 永远显示「未设置」，且没有任何测试会红。
+///
+/// 所以这里断言 `value`，而不是 `label`。给每个字段都写一个合法值，
+/// 读回后不允许有 null：漏一个分支就从这个键开始报。
+#[tokio::test]
+async fn get_config_reports_a_value_for_every_field() {
+    use yi_agent_runtime::settings::{self, FieldType};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    // 先按 FIELDS 把每个键都写成一个合法值，确保「读回 null」只可能是因为
+    // `field_value` 漏了分支，而不是因为文件里本来就没设。
+    let mut patch = serde_json::Map::new();
+    for spec in settings::FIELDS {
+        let value = match spec.field_type {
+            FieldType::Number => serde_json::json!(spec.min.unwrap_or(1)),
+            FieldType::Text => serde_json::json!("set"),
+            FieldType::Select => serde_json::json!(spec.options[0]),
+        };
+        patch.insert(spec.key.to_string(), value);
+    }
+    settings::write_to(&path, &serde_json::Value::Object(patch)).unwrap();
+
+    let response = app(path)
+        .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+
+    let vars: Vec<serde_json::Value> = value["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["vars"].as_array().unwrap().clone())
+        .collect();
+
+    for spec in settings::FIELDS {
+        let var = vars
+            .iter()
+            .find(|v| v["key"] == spec.key)
+            .unwrap_or_else(|| panic!("missing field {}", spec.key));
+        assert!(
+            !var["value"].is_null(),
+            "{} is in FIELDS but field_value returned null for it \
+             (the match arm in yi-agent-web/src/api.rs is missing)",
+            spec.key
+        );
+    }
+}
+
 /// 显式 `value: null` 必须表示「删掉这个键」，而不是报错或写成 null 字面量。
 #[tokio::test]
 async fn put_config_with_null_value_deletes_the_key() {

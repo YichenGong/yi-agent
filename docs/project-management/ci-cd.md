@@ -50,6 +50,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] 桌面端类型检查与单元测试进流水线 — `just desktop-check`（`tsc --noEmit` + `vitest run`）；GitHub `desktop` job、GitLab `ci-desktop` job（node:22，无 `tags` 故不进 Mac mini）各自独立，不进 `just ci`（`rust:latest` 无 Node）。判据：`cd desktop && npx vitest run` 输出 `Test Files 146 passed (146)` / `Tests 1932 passed (1932)`；`cd yi-agent-rs && just desktop-check` 端到端通过；故意改坏一条断言后 push，对应 job 必须红（待首次 CI 跑验证）。分支保护的 required check 需网页端勾选：GitHub Settings → Branches → `main` → 勾 `desktop`；GitLab Settings → Merge requests → 确认 `ci-desktop` 参与合并检查（**待所有者配置**）
 - [x] Rust 测试迁移到 nextest — `yi-agent-rs/.config/nextest.toml`（profile `ci`，`inherits = "default"`，`retries = 0`，JUnit 落 `target/nextest/ci/junit.xml`）；`justfile` 的 `test` / `bindings-check` 改调 `cargo nextest`（版本钉 0.9.150）。判据：`just test` 先打印 `cargo-nextest 0.9.150` 再输出 `3954 tests run: 3954 passed, 27 skipped`；`ls target/nextest/ci/junit.xml` 存在且 mtime 为本次；`cargo nextest show-config test-groups 2>&1 | grep -i "unknown configuration key"` 无输出（`inherits` 拼错只会 warning、不报错，靠这一条卡住）；`bindings-check` 的 `export_bindings` 选中 18 个测试，过滤器写错时 nextest 以 `error: no tests to run` 失败而非静默通过
 - [x] 时间预算型脆弱测试消除 — 固定观测窗口改为条件轮询 / 宽 backstop：`supervisor.rs` 的 `wait_until` 改 `impl FnMut` 后轮询「退出已被记录」（原 20×50ms）、`yi-agent/src/main.rs` 3s→30s、`supervisors/src/daemon.rs` 2s→20s 且去掉超时后的 `unwrap()` panic（改为先给可读诊断）、`runtime/src/supervise.rs` 新增 `SETTLE_BUDGET`(20s) 替换 7 处固定 3s；另有生产常量 `refresh.rs` 的 `DESCRIBE_TIMEOUT` 5s→15s（单独提交，代价只落在「插件已坏」路径）。判据：`cargo nextest run --all-features --workspace --profile ci` **连跑四轮全绿**（实测 3953/3953 ×4，机器负载 6.7~8.1）；`cargo test` 路径仍可用（supervisor 23 passed、--lib 64 passed）
+- [x] 清单刷新测试不再按机器速度打分 — 三个用例把「机器有多空」写进了断言：`refreshing_a_stale_manifest_makes_switch_off_actually_stop_the_child` 要证明旧快照被插件自述覆盖，却要求每次 describe 都在生产的 15s 内完成；全量并发时 describe 返回 `Skipped(Timeout)`，断言就在一个与本意无关的情形上变红。`a_slow_description_does_not_block_later_supervision` 需要一个插件跑满预算好让第二个启动，15s 下先超时的是**第二个**插件自己的 describe。`stopping/dropping_during_manifest_refresh_joins_promptly` 用 `SETTLE_BUDGET`(20s) 等插件进入自述阶段——那是要拉起 `python3` 子进程的**前置条件**，不是被测的 2s join；两个 crate 二进制一起跑时实测 20.03s 走满，单跑 0.44s。修法沿用本仓库既有 seam（同 `serve_without_manifest_refresh`，不在普通 lib 里塞 `#[cfg(test)]`）：新增 `refresh_from_plugins_with_budget` / `refresh_and_log_with_budget` 与 `serve_with_manifest_budget`，生产预算收敛为 `refresh::PRODUCTION_DESCRIBE_TIMEOUT`(15s)；只放宽 deadline，stdout 1 MiB 上限、stderr 64 KiB 捕获、取消路径仍是生产值。前置条件单独用 `SPAWN_BUDGET`(120s)，`recv_timeout(2s)` 保持原样——2s 内 join 回来本身就是被测属性。判据：`cargo nextest run -p yi-agent-supervisors -p yi-agent-runtime --lib --profile ci` → 461/461；`just ci` → `CI passed`，JUnit `4675 tests, 0 failures`；反向验证——把启动刷新短路成 `filter(|_| false)`，`a_slow_description_does_not_block_later_supervision` 精确报 `b must have been refreshed`
 - [x] headless 测试端口与临时文件加固 — `crates/yi-agent/tests/headless_signal_reap.rs` 的 `spawn_mock_gateway` 改为接收**已绑定** listener（调用方 `TcpListener::bind("127.0.0.1:0")` 由内核分配端口）；pid 文件从 `/tmp` 挪进 `tempfile::tempdir()`。判据：`grep -n "9000 +" crates/yi-agent/tests/headless_signal_reap.rs` 与 `grep -n '"/tmp/' ...` 均无输出；`cargo nextest run -p yi-agent --test headless_signal_reap --profile ci` 连跑三次 `2 passed`
 - [x] 进程级静态的语义说明 — `SPAWN_LOCK`（`supervisors/tests/supervisor.rs`）、`ENV_TEST_MUTEX`（`runtime/src/config.rs` 与 `yi-agent/src/config.rs`）、`TEST_CONNECTOR`（`mcp/src/manager.rs`）的注释注明「`cargo test` 下有效、nextest 下跨不过进程边界」，并写明别再靠加锁修并发。判据：`git diff -U0 <这四个文件> | grep -E "^[+-]" | grep -vE "^[+-]{3}" | grep -vE "^[+-]\s*(//|///)"` 无输出（即只动了注释）
 - [x] `attach_delegation.rs` 的 5s 等待预算对齐 — `a_process_that_owns_the_daemon_supervises_its_plugins` 的两处 `Duration::from_secs(5)`（原文注释「监督循环 500ms 一轮，给足余量」）是全仓库最后一处未改的固定短预算，而同文件其余 5 处早已是 10s。改为模块级 `CHILD_START_BUDGET = 20s`，与 `supervisors/tests/supervisor.rs` 的同名常量取值一致，两文件不再对「慢」给出不同定义。判据：`grep -c "from_secs(5)" crates/yi-agent-subagent/tests/attach_delegation.rs` 为 0；`cargo nextest run -p yi-agent-subagent` → `102 tests run: 102 passed`；全量 5 轮（负载 16~30，18 核）中 supervisor 族**零失败**（改动前同族 9 轮里失败 3 轮）
@@ -69,3 +70,47 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] golden-set eval 的 baseline 快照 — 原 case 断言是绝对阈值（`max_tool_calls=7` 等），只能抓「彻底崩了」，抓不到「慢慢变差」（3 步变 6 步、token 8000 涨到 34000，只要没撞上限就一直是绿的）。新增 `tests/eval/baseline.rs` + `baseline/` 下 30 条快照 + justfile 的 `eval bless=1`。**设计核心：不比对工具调用序列**——这个 agent 写同一文件在 `write`/`edit`/`cat >`/`printf >`/`sed -i`/`perl -pi` 之间随机选，四轮实测轨迹各不相同但结果全对，严格比对序列等于把正确实现判成回归（假红会训练人无脑 bless，比没有基线更糟）。四层判定：L0 硬契约（正常结束、改过文件）必须一致；L1 语义（复用 case 已声明的正则是否仍匹配）；L2 预算（步数 `max(基线×1.5, 基线+4)`、token +150%）；L3 形状（工具名集合）只警告。设计被实测推翻四次，每次留 diff：①内容 hash 逐字节比对 → 刚建完基线 5/30 假红（case 006 两次都对，只差有无文档注释）；②token 容忍 50% → case 027 假红（9829→14923，+52%，答案正确，因 token 随步数累积）；③单次采样 → case 018/026 假红（实测 018 连跑 4 次是 3/5/4/5 步，026 连跑 7 次是 3/3/3/5/4/4/7 步，单次采样落在低端就天天红），改为 bless 默认采样 3 次取**中位数**（不用均值：均值被偶发 12 步拉高会让基线过松）；④百分比在低步数太紧 → 026 中位 3 步，+50% 只到 5，而 7 步是实际长尾，改为叠加固定余量 4 步。报告把 `case 自身断言失败`（agent 没完成，能力信号）与 `相对基线回归`（仍做对但代价变高）分开统计，否则回归信号被能力失败淹没。判据：3 次采样建基线后全量比对 → `case 自身断言失败 1 条 / 相对基线回归 0 条`（假红清零）；`just eval-baseline-check` → 32 passed（不需 API key，已进 `ci`）；**反向验证**：把内容比对写成恒真、把容忍度改成 1000%，对应测试各自变红。bless 绝不进 CI（CI 里 bless = 基线永远等于最新代码，检测能力归零）
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做
+
+- [x] 共享运行时生命周期的真进程门禁（Task 18） — `yi-agent-rs/justfile` 新增 `runtime-lifecycle-check`，跑 20 个会 fork guardian／daemon／executor 的集成目标外加 lifecycle 单元族：
+  `managed_runtime_lifecycle`、`managed_roles`、`frontend_runtime_lease`、`managed_bringup`、`managed_process_groups`、`managed_channel`、`client_reclamation`、
+  `execution_admission`、`guardian_control`、`guardian_status`、`guardian_handover`、`runtime_switch`、`runtime_migration`、`runtime_scope`、
+  `runtime_restart_preview`、`executor_isolation`、`executor_bridge`、`executor_gate`、`bringup_policy`、`managed_bash`。
+  **为什么单独 recipe 不进 `just ci`**：这些目标会真的 spawn 进程组，个别用例要等真实的 10 秒优雅窗口；塞进 `cargo nextest --workspace` 会把日常 `just test` 从十几秒拖到几分钟。
+  **为什么只在 macOS job 跑**：进程组语义不可移植——`kill(-pgid, 0)` 对「只剩 zombie 的自有组」在 macOS 返回 `EPERM`，而与另一个用户的活组不可区分；守护者的 `group_state` 正是在这两者之上做判断，Linux 全绿不代表本平台成立。
+  GitHub `.github/workflows/ci.yml` 的 `macos` job 扩到 lifecycle／supervisors／subagent／store／CLI 八个 crate 并新增 `just runtime-lifecycle-check` 一步（同时补 `extractions/setup-just@v2`，否则该步会以 `command not found` 失败）；
+  GitLab `.gitlab-ci.yml` 的 `ci-push`（Mac mini）在 `just ci` 之后跑同一 recipe，云端 `ci-mr` 不跑（`rust:latest` 是 Linux，且无 macOS 进程组语义）。
+  **`runtime_process_helper` 的排除**：它是固定 `#[ignore]` 的 OS fixture，只由 harness 用 `--exact --ignored` 拉起；`.config/nextest.toml` 用 `default-filter = "not test(runtime_process_helper)"` 把它从默认调度排除，
+  因为 `--run-ignored all` 恰好是排查「某用例从没跑过」时最容易输入的，而这条用例的本意是永远不被当普通用例调度。
+  判据：`just runtime-lifecycle-check` 实测 20 个目标全绿，**205 用例：191 passed / 4 ignored / 0 failed**（单目标最长 30.06s 是 `runtime_switch` 的真实优雅窗口，
+  整轮约 46s）；
+  `cargo nextest list -p yi-agent --test managed_runtime_lifecycle` 的输出里**不含** `runtime_process_helper`（排除生效）。
+  **残余限制**：真实 Cmd+Q 属本机隔离 App 手动冒烟，无头 CI 不声称覆盖；`quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis` 仍缺（见 subagent-runtime.md 的 executor 生产装配缺口）
+- [x] 合并期两处门禁红：（1）**`ProcessManager::kill` 丢掉 SIGTERM→SIGKILL 升级** —
+  `yi-agent-tools/src/process/manager.rs` 的 `SpawnedChild::terminate` 在合并时只发 SIGTERM + `start_kill()`，
+  main 留着的 `terminate_group`（3s 宽限 → 整组 SIGKILL → 2s 收尾等待）成了无调用者的死代码。
+  后果是 `manager_kill_lets_the_child_shut_down_gracefully_before_killing`（对照组 `sleep 300` 被 `start_kill()`
+  直接 `SIGKILL`，handler 没跑）与 `manager_kill_reaps_grandchildren_that_ignore_sigterm`（忽略 TERM 的孙进程存活）
+  实测双红。修法：把升级搬回 `terminate` 的 Local 分支，新增 `local_group_drained`（`try_wait` + `group_exists`
+  双条件、按 `KILL_GRACE` / `KILL_REAP_WAIT` 有界），并删掉 kill 里重复的 SIGTERM 与已无调用者的
+  `wait_until_gone` / `child_reaped`。（2）**`two_executors_share_one_global_limit` 断言了未定义的顺序** —
+  两个 executor 各自独立向 daemon 申请 permit，daemon 只承诺上限、不承诺谁先拿到；测试却固定要求
+  「first 先拿到」，于是合并后首次整轮门禁（机器正编译、负载高）实测红，单跑 15 次 + 并发 40 次均不红。
+  改为「先断言两者之一持有时 `held == 1`，再取消持有者并断言等待者接手」，末尾两侧都 cancel（只取消一侧会
+  让另一个持满 20s 窗口、把用例拖到 5s 超时）。**变异验证**：把 gate 的 `limit` 改成 2 → 用例红；恢复后绿。
+  判据：`cargo test -p yi-agent-tools --lib manager_kill`（3 passed）+
+  `cargo test -p yi-agent-subagent --test executor_gate`（5 passed，0.35s）+ 合并结果上 `just ci`
+  （4671 passed / 32 skipped）与 `just runtime-lifecycle-check`（20 目标、191 passed / 4 ignored）全绿。
+
+- [x] 首次全量门禁暴露的两个红：一个是真缺陷，一个是测试测错了对象 — 本分支第一次跑 `just ci` 报 2 failed（4495 passed）。
+  **① `managed_process_groups a_bootstrap_descriptor_does_not_collide_with_the_ready_barrier` 偶发 `Operation not permitted`（真缺陷）**：
+  `kill_group` 把 `EPERM` 一律当失败，但 macOS 上 `kill(-pgid, SIGKILL)` 对两种情况都返回 `EPERM`——**别的用户的活组**，与**自己的、成员已全部退出但尚未 reap 的组**。
+  后者是正常终态（没有可运行的东西，也没有可发的信号），却被报成故障，于是短命令在「证明归属 → 发信号」之间退出时，守护者把自己的组报成 `managed groups not stopped`。
+  只有该窗口被撞上才失败，所以表现为偶发（同 target 13 个用例并发时 3/3 红，单跑 8 次红 1 次）。修复：`EPERM` 时再枚举一次，组内无存活成员即视为已停；**仍有存活成员则保持报错**（不能把别人的组当成自己的）。
+  判据：`cargo nextest run -p yi-agent-supervisors --test managed_process_groups` 连跑 6 轮全绿；新增单测 `signalling_a_group_of_zombies_is_not_a_failure`，**变异验证**撤掉修复即红（实测 RED 后恢复）。
+  **② `yi-agent-tools shell::bash bash_without_a_session_env_leaves_the_variable_unset` 必红（测试测错了对象）**：
+  它断言 `echo "[$YI_AGENT_THREAD_ID]"` 展开为空，前提是宿主环境没有该变量；但 app-server 会为所服务的线程注入它（`server.rs` 有一处 `YI_AGENT_THREAD_ID`），
+  任何 agent 托管下的 `just ci` 都带着它，于是这条在裸 shell 过、在门禁里红。这不是产品行为错误——`bash_injects_the_session_env_into_the_child` 已经覆盖注入方向。
+  修复：命令改为 `env -u YI_AGENT_THREAD_ID sh -c ...`，把「没有 session 注入 ⇒ 空展开」测在命令层面，而不是去测调用者的环境。
+  判据：宿主持有该变量时该用例仍绿；`just ci` 从 `2 failed` 变为 `4498 tests run: 4498 passed, 32 skipped`。
+
+- [x] 发布门禁核对运行时清单与 sidecar digest — `.github/workflows/release.yml` 的 "Verify the desktop app is in the npm package" 步骤。原来只有 `codesign --verify --deep --strict`：`--deep` 与发布时的实际签名顺序（sidecar 先签、外层后签、全程不 `--deep`）语义不一致，且**完全没检查 daemon 身份**——一个 `runtime-sidecar.json` 缺失或 digest 与包里 sidecar 不符的 App 也能发出去，而桌面壳启动时会拒绝它。现在改为 `codesign --verify --strict`，并新增：清单必须存在、`sha256` 必须等于 `sha256(yi-agent.app/Contents/MacOS/yi-agent)`、打印 build id。判据：`grep -c "runtime-sidecar.json" .github/workflows/release.yml` ≥ 1；本地等价断言由 `bash desktop/scripts/test_runtime_build_identity.sh` 覆盖（20 passed）

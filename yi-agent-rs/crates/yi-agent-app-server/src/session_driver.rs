@@ -265,6 +265,71 @@ pub(crate) fn is_a_running_session(status: ThreadStatus, active_turn: Option<&st
     active_turn.is_some() || matches!(status, ThreadStatus::Running)
 }
 
+/// 宿主热会话表里的一条事实，与插件侧的共读契约同名同形。
+///
+/// 只有 ID 与「此刻是否空闲」：宿主对看板没有归属信息，插件也不该从这份快照
+/// 推断某会话属于哪个插件。这里刻意不复用 `DriverThread`——后者是「宿主为该
+/// 插件起过哪些会话」的记账，与「本进程此刻还加载着谁」是两件事。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedThreadFacts {
+    pub thread_id: String,
+    pub idle: bool,
+}
+
+/// 快照里这一条算不算「空闲」。
+///
+/// 与 `driver_tick` 的旧 idle 快照逐字同一口径：`ThreadStatus::Idle` 且没有活跃
+/// turn。`AwaitingApproval` 与 `Running` 都不算——前者在等人，后者在跑，两者都不
+/// 是「这个会话这轮已经结束」。单独成函数是为了让这条口径能被直接钉住：它同时
+/// 决定插件看到的 `loaded_threads[].idle` 与旧 `threads[].idle`；写成内联表达式
+/// 时两条 `?` 短路极易在重构中悄悄放宽。
+pub(crate) fn snapshot_idle(status: ThreadStatus, active_turn: Option<&str>) -> bool {
+    matches!(status, ThreadStatus::Idle) && active_turn.is_none()
+}
+
+/// 本进程此刻加载着的**全部**会话快照（按 ID 排序，便于断言与比对）。
+///
+/// 「完整」是这条协议的全部价值：插件据此区分「宿主明确说它不在」与「宿主没
+/// 能力回答」。所以这里**只能**读内存里的会话表，不读磁盘、不读插件元数据，
+/// 也不按任何归属过滤——少报一条就等于替插件伪造一次「没加载」。
+///
+/// `idle` 的口径与 `driver_tick` 的旧 idle 快照逐字一致：`ThreadStatus::Idle`
+/// 且没有活跃 turn。`AwaitingApproval` 与 `Running` 都不算 idle。
+pub(crate) fn loaded_threads_snapshot(
+    threads: &HashMap<String, ThreadSession>,
+) -> Vec<LoadedThreadFacts> {
+    let mut out: Vec<LoadedThreadFacts> = threads
+        .iter()
+        .map(|(thread_id, session)| {
+            let status = *session
+                .status
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            LoadedThreadFacts {
+                thread_id: thread_id.clone(),
+                idle: snapshot_idle(status, session.active_turn_id.as_deref()),
+            }
+        })
+        .collect();
+    out.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    out
+}
+
+/// 把快照编成 `driver/next` 的 `loaded_threads` 参数。
+pub(crate) fn loaded_threads_payload(threads: &[LoadedThreadFacts]) -> Value {
+    Value::Array(
+        threads
+            .iter()
+            .map(|fact| {
+                serde_json::json!({
+                    "thread_id": fact.thread_id,
+                    "idle": fact.idle,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// 本进程此刻有几个会话在跑。
 ///
 /// 宿主不认识看板：**所有归属**的会话都在内（手工开的、别的插件起的、看板起的）。
@@ -316,6 +381,10 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     launcher: &mut L,
     idle: &(dyn Fn(&str) -> bool + Sync),
     sessions_running: u32,
+    // 本进程此刻加载着的全部会话。与 `threads`（本插件起过哪些）是两件事：
+    // 前者回答「插件那张卡绑定的会话现在还加载着吗」，后者只能回答「我派过的
+    // 会话还活着吗」。宿主重启/会话被别处关闭后，前者才是唯一可信的来源。
+    loaded_threads: &[LoadedThreadFacts],
 ) -> Option<ActionResult> {
     let results_payload = Value::Array(
         results
@@ -333,6 +402,10 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     );
     let params = serde_json::json!({
         "threads": threads_payload(threads, idle),
+        // 完整热表快照。它是可选的：旧插件不读就忽略；新插件凭它区分
+        // 「明确不在」与「宿主没能力回答」。空数组是**有信息**的答案（热表
+        // 确实为空），与「不带这个字段」不是一回事。
+        "loaded_threads": loaded_threads_payload(loaded_threads),
         "results": results_payload,
         // 本进程此刻有几个会话在跑（口径见 `is_a_running_session`）。插件拿它
         // 算「全机余量」：限的是总流量，看板外的会话与看板会话吃同一份额度。
@@ -641,6 +714,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -670,6 +744,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -692,6 +767,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -724,6 +800,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -753,6 +830,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -785,6 +863,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -815,6 +894,114 @@ mod tests {
         assert_eq!(payload[0]["idle"], true, "idle 语义不变");
     }
 
+    /// K4：快照里的 `idle` 三态口径。
+    ///
+    /// 只有「Idle 且没有活跃 turn」算空闲。`AwaitingApproval` 在等人、
+    /// `Running` 在跑，两者都不算这轮结束——把任何一个当空闲，插件都会误判
+    /// 「这张卡的回合跑完了」并据此迁移卡片状态。
+    #[test]
+    fn kanban_observation_snapshot_idle_counts_only_idle_without_a_turn() {
+        assert!(snapshot_idle(ThreadStatus::Idle, None));
+        assert!(
+            !snapshot_idle(ThreadStatus::Idle, Some("turn-1")),
+            "a leftover turn id means the turn is not over"
+        );
+        assert!(!snapshot_idle(ThreadStatus::Running, None));
+        assert!(!snapshot_idle(ThreadStatus::Running, Some("turn-1")));
+        assert!(
+            !snapshot_idle(ThreadStatus::AwaitingApproval, None),
+            "waiting for a human is not an idle session"
+        );
+    }
+
+    /// 完整热表快照真的上送：字段名、排序、逐条 `idle`。
+    ///
+    /// 这条防的是「实现了快照函数但忘了接到请求里」——那种情况下插件永远看不到
+    /// `loaded_threads`，会一直按旧宿主处理，热发现永远不发生，而所有别的测试
+    /// 都能通过。
+    #[test]
+    fn kanban_observation_loaded_snapshot_reaches_the_wire() {
+        let snapshot = vec![
+            LoadedThreadFacts {
+                thread_id: "a-busy".into(),
+                idle: false,
+            },
+            LoadedThreadFacts {
+                thread_id: "b-idle".into(),
+                idle: true,
+            },
+        ];
+        let payload = loaded_threads_payload(&snapshot);
+        assert_eq!(payload[0]["thread_id"], "a-busy");
+        assert_eq!(payload[0]["idle"], false);
+        assert_eq!(payload[1]["thread_id"], "b-idle");
+        assert_eq!(payload[1]["idle"], true);
+        // 数组顺序即快照顺序（快照函数自己按 ID 排序）。
+        assert_eq!(payload.as_array().unwrap().len(), 2);
+    }
+
+    /// 快照进请求体的位置：与 `threads[]` 并列，一条不少、一条不多。
+    #[tokio::test]
+    async fn kanban_observation_snapshot_is_sent_with_every_tick() {
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let snapshot = vec![LoadedThreadFacts {
+            thread_id: "hot".into(),
+            idle: true,
+        }];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        let mut launcher = FakeLauncher::default();
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+            &snapshot,
+        )
+        .await;
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["loaded_threads"],
+            json!([{"thread_id": "hot", "idle": true}]),
+            "热表快照必须进请求：{sent:?}"
+        );
+    }
+
+    /// 空热表是**有信息**的答案：要发空数组，不能省掉字段。
+    #[tokio::test]
+    async fn kanban_observation_empty_snapshot_is_still_sent() {
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        let mut launcher = FakeLauncher::default();
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            0,
+            &[],
+        )
+        .await;
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["loaded_threads"],
+            json!([]),
+            "「一个都没加载」必须显式给出，不能靠缺字段表达"
+        );
+    }
+
     /// 空闲快照必须真的进到 `threads[]` 里：插件唯一的「这轮跑完了」信号就是它
     /// （spec §4.6）。接线时若把参数丢掉、退回写死的 `false`，插件就永远推进不了
     /// 卡片状态，故这里钉住快照与 thread_id 的对应关系。
@@ -839,7 +1026,16 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "done";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 0).await;
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &idle,
+            0,
+            &[],
+        )
+        .await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -871,6 +1067,43 @@ mod tests {
 
     fn driver_contract() -> Value {
         serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON")
+    }
+
+    /// 宿主上送的完整快照与契约样例**逐字对齐**：键名、条数、`idle` 取值。
+    ///
+    /// 两侧读同一份文件（插件侧 `driver_observation.rs` 也 `include_str!` 它），
+    /// 所以这条同时钉住「宿主发的形状」与「插件期望的形状」不是各写各的。
+    #[test]
+    fn kanban_observation_contract_request_matches_the_host_payload() {
+        let contract = driver_contract();
+        let request = &contract["request"];
+        let loaded = request["loaded_threads"]
+            .as_array()
+            .expect("契约的 request 必须带 loaded_threads 样例");
+        assert!(!loaded.is_empty(), "样例不能是空的，否则形状没被钉住");
+
+        let facts: Vec<LoadedThreadFacts> = loaded
+            .iter()
+            .map(|fact| LoadedThreadFacts {
+                thread_id: fact["thread_id"].as_str().expect("thread_id").to_string(),
+                idle: fact["idle"].as_bool().expect("idle"),
+            })
+            .collect();
+        assert_eq!(
+            loaded_threads_payload(&facts),
+            Value::Array(loaded.clone()),
+            "宿主编码必须与契约样例逐字一致"
+        );
+
+        // 旧宿主样例：没有 `loaded_threads`，插件读成「没能力回答」。
+        assert!(
+            contract["legacy_request"].get("loaded_threads").is_none(),
+            "legacy_request 必须**不带**这个字段"
+        );
+        assert!(
+            contract["legacy_request"]["threads"].is_array(),
+            "legacy_request 仍要有旧 threads 数组"
+        );
     }
 
     /// 契约里插件那三种应答的字面量，宿主都必须解析得出来（`launch` / `append`
@@ -1008,7 +1241,16 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "thread-1";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 3).await;
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &idle,
+            3,
+            &[],
+        )
+        .await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -1046,6 +1288,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             2,
+            &[],
         )
         .await;
 
@@ -1075,6 +1318,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -1109,6 +1353,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -1151,6 +1396,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -1181,6 +1427,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -1211,6 +1458,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .expect("a failed action still produces a result to report");
@@ -1230,6 +1478,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await;
 
@@ -1263,6 +1512,7 @@ mod tests {
             &mut launcher,
             &nobody_idle(),
             0,
+            &[],
         )
         .await
         .expect("a failed action still produces a result to report");

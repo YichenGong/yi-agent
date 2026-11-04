@@ -6668,6 +6668,65 @@ describe("App 同步状态机（手机端黑屏）", () => {
     }
   });
 
+  it("keeps a successful replay synced while the sidebar refresh is stalled", async () => {
+    vi.useFakeTimers();
+    try {
+      asRemote();
+      state.dataSources["thread/resume"] = () => {
+        state.notifHandlers[0]({
+          method: "items/completed",
+          params: {
+            thread_id: "t1",
+            items: [{ type: "agentMessage", id: "history-1", text: "完整历史已加载" }],
+          },
+        });
+        // Only the post-replay list refresh stalls; the startup list has arrived.
+        state.dataSources["thread/listAll"] = () => new Promise(() => {});
+        return resumeOk("t1");
+      };
+      render(<App />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(document.body.textContent).toContain("完整历史已加载");
+      expect(document.querySelector(".app-statusbar")?.textContent).toContain("已连接");
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(document.body.textContent).not.toContain("内容加载超时");
+      expect(document.querySelector('[data-testid="sync-failed"]')).toBeNull();
+      // Content is authoritative even if auxiliary metadata has not returned.
+      expect(document.querySelector('[role="status"]')?.textContent ?? "").not.toContain("正在同步");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a long replay alive while history chunks continue arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      asRemote();
+      let finish!: (value: unknown) => void;
+      state.dataSources["thread/resume"] = () => new Promise(resolve => { finish = resolve; });
+      render(<App />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      for (let i = 0; i < 6; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10_000);
+          state.notifHandlers[0]({
+            method: "items/completed",
+            params: {
+              thread_id: "t1",
+              items: [{ type: "agentMessage", id: `history-${i}`, text: `历史分块 ${i}` }],
+            },
+          });
+        });
+        expect(document.body.textContent).not.toContain("内容加载超时");
+      }
+      await act(async () => { finish(resumeOk("t1")); });
+      expect(document.body.textContent).toContain("历史分块 5");
+      expect(document.body.textContent).not.toContain("正在同步");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retrying from the failure pane re-issues thread/resume", async () => {
     asRemote();
     state.dataSources["thread/resume"] = () => {
