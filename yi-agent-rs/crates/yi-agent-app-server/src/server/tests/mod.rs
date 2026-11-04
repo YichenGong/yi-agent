@@ -2934,9 +2934,9 @@ mod model_settings;
 mod plugin_theme;
 #[cfg(test)]
 mod process;
+mod runtime_status;
 #[cfg(test)]
 mod side;
-mod runtime_status;
 #[cfg(test)]
 mod thread_index;
 #[cfg(test)]

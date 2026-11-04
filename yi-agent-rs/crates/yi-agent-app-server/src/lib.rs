@@ -37,9 +37,9 @@ pub mod session;
 pub(crate) mod session_driver;
 pub mod settings_rpc;
 pub mod settings_store;
+pub mod shell_authorization;
 pub mod side_cold;
 pub mod side_conversation;
-pub mod shell_authorization;
 pub mod skill_rpc;
 /// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
 ///
