@@ -34,7 +34,9 @@
 
 T25 Step 4 已完成并可复现：`bash yi-agent-rs/scripts/verify-plugin-update.sh <built .app> .` 在同一 `.app` 上装 1.0.0 再装 1.1.0，UI 标记 `board-v1` → `board-v2`，主程序 `Contents/MacOS/desktop` 与整个 bundle 摘要前后一致。
 
-**仍未完成：** T25 Step 5 提交、T26 Step 3–5（独立 CI job、签名/公证发布、提交）、T27 A01–A20 正式验收。因此本条保持 `[ ]`。
+T26 Step 3 已完成：`just plugin-check`（`plugin-workspace-check` / `plugin-ui-check` / `plugin-contracts-check` / `plugin-boundary-check`）本地全绿，GitHub `plugins` job 与 GitLab `ci-plugins` job 均跑在云端 runner、不带 `tags:`，插件门禁不再借用 self-hosted runner 或任何签名密钥。
+
+**仍未完成：** T26 Step 4–5（平台签名/公证与真实下载后的 OS 执行策略验证、发布提交）需要发布授权与签名密钥，不在本轮范围内；T27 A01–A20 正式验收（尤其 A16/A17 要求真实远端宿主证据）同样未完成。因此本条保持 `[ ]`。
 
 - [x] 全局开关 `superpowers_kanban` 决定进程起停 — 清单 `supervisors/superpowers-kanban.json` 设 `stop_when_disabled: true`，注册表默认关。关掉 = 完全停掉 daemon 含调度（不再留进程轮询）；重开走设置页 `flags/set`（app-server 直写 `flags.json`，不经过 daemon），所以不是单向门。宿主侧同时收口：`plugin/query` 返回 `plugin_disabled`(-32025) 而不是 `daemon_unavailable`，`plugins/list` 每项带 `enabled`，桌面隐藏看板入口与全部 `driver_ref` 会话。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`（164 passed）；`cargo test -p yi-agent-app-server --lib a_switched_off_plugin`（含 `..._says_disabled_instead_of_broken`、`..._is_still_listed_but_marked_disabled`）；`cd desktop && vitest run src/App.test.tsx -t 看板开关关着时`
 - [x] 插件自述清单 — `manifest` 动词把 supervisor 清单打到 stdout，宿主 `plugin/install` 直接消费；`command` 取当前可执行文件绝对路径。判据：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner manifest_`（含"与随包 `supervisors/superpowers-kanban.json` 逐字段相等"）

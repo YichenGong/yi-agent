@@ -191,6 +191,37 @@ desktop-check:
     cd ../desktop && npx tsc --noEmit
     cd ../desktop && npx vitest run
 
+# 插件 workspace 的独立门禁：插件有自己的 Cargo workspace 与版本号，
+# 主程序 `just ci` 不编译它（否则改一次看板就要重编整个宿主）。
+#
+# 刻意**不**进 `ci`：这里需要 Node（UI）与插件自己的 target 目录，塞进主
+# Rust 门禁会让没有 Node 的环境（GitLab MR 的 `rust:latest`）整条挂掉。
+plugin-workspace-check:
+    cd ../plugins/superpowers-kanban && cargo fmt --all -- --check
+    cd ../plugins/superpowers-kanban && cargo test --workspace
+
+# 插件的 UI 门禁。与 `desktop-check` 同形：`npm ci` 严格按 lock，
+# `tsc --noEmit` 查类型，`vitest run` 跑一次就退（不进 watch）。
+plugin-ui-check:
+    cd ../plugins/superpowers-kanban/ui && npm ci
+    cd ../plugins/superpowers-kanban/ui && npx tsc --noEmit
+    cd ../plugins/superpowers-kanban/ui && npx vitest run
+
+# 公共契约（socket / driver / IPC）的唯一权威在 `plugins/contracts/`，
+# 宿主与插件两侧都读它。改动任何一侧都必须先改契约并让这里通过。
+plugin-contracts-check:
+    node ../scripts/plugins/check-contracts.mjs
+    node --test ../scripts/plugins/check-contracts.test.mjs
+
+# 宿主边界：主程序里不得出现看板专属路径。与上面三项合起来构成
+# 「插件可以独立发版」的静态证据。
+plugin-boundary-check:
+    python3 ../scripts/plugins/check-host-boundary.py
+    python3 -m unittest discover -s ../scripts/plugins -p 'test_check_host_boundary.py'
+
+# 一次跑完插件的全部门禁（本地用；CI 拆成独立 job 以便并行与隔离权限）。
+plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check
+
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:

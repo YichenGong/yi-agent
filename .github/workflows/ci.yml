@@ -55,6 +55,50 @@ jobs:
         working-directory: yi-agent-rs
         run: just desktop-check
 
+  plugins:
+    # 插件是独立 workspace、独立版本、独立的 Node 前端。它的门禁必须单独一个
+    # job：
+    #
+    #   1. 主 Rust `just ci` 不编译插件（否则改一次看板要重编整个宿主）；
+    #   2. Node 检查不能塞进无 Node 的 Rust 镜像；
+    #   3. **权限隔离**——这个 job 只跑在云端 ubuntu runner，不碰 self-hosted
+    #      runner，也不接触任何签名密钥。云端不可信的 PR 代码因此拿不到发布
+    #      私钥，即使它改了本文件也一样（密钥只在受保护环境的 release
+    #      workflow 里，且那条只在 main 的 tag 上跑）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/superpowers-kanban
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # 插件 workspace 有自己的 Cargo.toml，`just` 的 recipe 从主 workspace
+      # 目录 cd 过去，所以工作目录仍是 yi-agent-rs。
+      - name: Plugin Rust workspace
+        working-directory: yi-agent-rs
+        run: just plugin-workspace-check
+
+      - name: Plugin UI
+        working-directory: yi-agent-rs
+        run: just plugin-ui-check
+
+      - name: Plugin contracts and host boundary
+        working-directory: yi-agent-rs
+        run: just plugin-contracts-check plugin-boundary-check
+
   macos:
     # macOS 专属代码在 PR 阶段就该有信号：21 处 cfg(target_os = "macos")
     # （power 8 / tools 6 / app-server 7）在 ubuntu runner 上根本不会被编译。
