@@ -22,8 +22,12 @@
 // emit must carry that exact string as its `name`, or Yi Agent can't resolve it.
 const PREFIX = "magpie/";
 
-// `context_length` in Yi Agent is Option<u32>. A value outside this range would
-// make serde reject the whole entry, so it is omitted instead of passed through.
+// `context_length` in Yi Agent is Option<u32>. A value outside this range makes
+// serde fail on that one entry, and `parse_catalog` skips it (see
+// `yi-agent-runtime/src/models.rs`) — i.e. the model would silently disappear
+// from the catalog. Out-of-range values are therefore omitted instead of passed
+// through. (If *every* entry were skipped the whole file would read as invalid,
+// so this is not only a per-entry concern.)
 const U32_MAX = 4294967295;
 
 // Yi Agent's seven-tier reasoning-effort whitelist (see
@@ -51,8 +55,13 @@ export const agent = {
   // The key of the model in models.json.
   model: "default_model",
   prefix: PREFIX,
-  // Words of Yi Agent's User-Agent, so Magpie names its requests in Usage
-  // when they come without the agent's own key.
+  // Words of Yi Agent's User-Agent, so Magpie names its requests in Usage when
+  // they come without the agent's own key.
+  //
+  // Caveat: today Yi Agent's model providers build a bare `reqwest::Client`
+  // (`yi-agent-llm/src/{openai,anthropic}/client.rs`) and set no User-Agent, so
+  // this only starts matching once those providers send one. Harmless while it
+  // does not — Magpie simply falls back to matching by the agent's key.
   ua: ["yi-agent"],
   // Yi Agent already discovers SKILL.md folders under its user skills root
   // (`~/.yi-agent/skills`, see yi-agent-store/src/paths.rs `skills_dir` and
@@ -61,7 +70,7 @@ export const agent = {
   // picks them up with no further configuration.
   library: { skills: "~/.yi-agent/skills" },
   notice:
-    "A running yi-agent TUI does not hot-reload models.json — restart it, or run /model default after connecting or switching, to pick up the new model.",
+    "A running yi-agent TUI does not hot-reload models.json — restart it, or run /model default to fall back to the newly written default_model. To switch to a magpie/* entry by name in an already-running TUI, restart it first: its /model list is a snapshot taken at startup.",
 };
 
 // A Magpie model id (e.g. "anthropic/claude-sonnet-4-5") mapped to a Yi Agent

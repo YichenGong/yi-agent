@@ -11,7 +11,8 @@
     "magpie",
     "magpie-plugin",
     "agent",
-    "yi-agent"
+    "yi-agent",
+    "magpie-agent"
   ],
   "license": "MIT",
   "repository": {

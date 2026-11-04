@@ -89,10 +89,26 @@ no further configuration.
   an empty string, which would leave Magpie writing `/models.json`. Use the
   default location, or leave this plugin off.
 - **A running TUI does not hot-reload the model.** Yi Agent's TUI reads
-  `models.json` at startup and re-reads it only when you switch the model with
-  `/model`. After connecting, switching models, or disconnecting in Magpie, a
-  TUI that was already running keeps using the old model — restart it, or run
-  `/model default` to pick up the change.
+  `models.json` at startup, and its `/model` list is that startup snapshot — it
+  never re-reads the file while running. After connecting, switching models, or
+  disconnecting in Magpie, an already-running TUI therefore:
+  - keeps using the old model, and
+  - cannot switch to a `magpie/*` entry by name: `/model magpie/…` answers
+    "unknown model name", because the entries were not in the list it loaded.
+
+  `/model default` still works while running: it clears the session override and
+  the driver resolves `default_model` against a fresh read of the file. So
+  `/model default` picks up a new Magpie default, but to *choose* a different
+  `magpie/*` model by name, restart the TUI first.
+- **The first connection creates `models.json` with mode 0644.** Yi Agent writes
+  that file itself as 0600 because it holds API keys; Magpie creates it with its
+  own umask when the file does not exist yet (it keeps 0600 when the file
+  already existed). After your very first connect, run
+  `chmod 600 ~/.yi-agent/models.json` to restore the tighter permissions.
+- **`ua` is declared but not yet effective.** The agent declares
+  `ua: ["yi-agent"]` so Magpie can name Yi Agent's requests in Usage. Yi Agent's
+  model providers currently send no `User-Agent` header, so the field only
+  starts matching once they do; until then Magpie falls back to the agent's key.
 
 ## Development
 
@@ -100,6 +116,9 @@ no further configuration.
 cd integrations/magpie-agent-yi-agent
 npm test            # node --test tests/agent.test.mjs
 ```
+
+Tests write scratch files under `tests/.tmp/` (gitignored) and remove them when
+each test finishes.
 
 The plugin entry (`yi-agent.agent.js`) runs in Magpie's restricted agent
 runtime (not Node.js and not Bun): it has no dependencies, no Node APIs, and no

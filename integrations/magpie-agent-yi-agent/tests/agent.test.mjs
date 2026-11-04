@@ -274,11 +274,18 @@ function restore(path, backup) {
 
 function tempModelsPath() {
   // macOS TMPDIR (/var/folders/...) can be sandboxed with EPERM for the test
-  // runner, so isolate under this plugin's own directory instead.
+  // runner, so isolate under this plugin's own directory instead. `.tmp/` is
+  // gitignored (see this package's .gitignore).
   const here = dirname(fileURLToPath(import.meta.url));
   const root = join(here, ".tmp");
   mkdirSync(root, { recursive: true });
   return join(mkdtempSync(join(root, "models-")), "models.json");
+}
+
+// Remove the whole per-test directory, not just `models.json`: deleting the
+// file alone would leave one empty `models-XXXXXX/` behind on every run.
+function cleanupModels(path) {
+  rmSync(dirname(path), { recursive: true, force: true });
 }
 
 test("no existing config file: connect creates it, disconnect removes it", () => {
@@ -302,7 +309,7 @@ test("no existing config file: connect creates it, disconnect removes it", () =>
 
   restore(path, backup);
   assert.deepEqual(loadModels(path), {}, "disconnect must remove every managed key");
-  rmSync(path);
+  cleanupModels(path);
 });
 
 test("existing config with unrelated keys and a subagent_model is restored", () => {
@@ -338,7 +345,7 @@ test("existing config with unrelated keys and a subagent_model is restored", () 
   assert.equal(restored.default_model, "mine");
   assert.equal(restored.subagent_model, "mine");
   assert.equal(restored.future_key, 42, "unrelated top-level keys survive");
-  rmSync(path);
+  cleanupModels(path);
 });
 
 test("subagent_model with no prior value is removed on disconnect", () => {
@@ -363,7 +370,7 @@ test("subagent_model with no prior value is removed on disconnect", () => {
     !Object.prototype.hasOwnProperty.call(loadModels(path), "subagent_model"),
     "subagent_model must be removed when it was not there before",
   );
-  rmSync(path);
+  cleanupModels(path);
 });
 
 test("repeated connect reflects model add/remove and selection change", () => {
@@ -392,5 +399,5 @@ test("repeated connect reflects model add/remove and selection change", () => {
   assert.deepEqual(names, ["magpie/b"]);
   assert.equal(loadModels(path).default_model, "magpie/b");
   assert.equal(loadModels(path).subagent_model, "magpie/b");
-  rmSync(path);
+  cleanupModels(path);
 });
