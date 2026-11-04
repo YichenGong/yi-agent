@@ -260,6 +260,19 @@ pub struct RuntimeCoordinator {
     /// Monotonic ordinal for pending-stop entries, so old confirmed records can
     /// be pruned instead of accumulating for the daemon's whole life.
     stop_sequence: AtomicU64,
+    /// Who may attach a root, when a guardian is watching.
+    ///
+    /// `Unmanaged` by default, and that default is the compatibility contract: a
+    /// daemon started by `daemon serve` or embedded in the CLI has no guardian to
+    /// vouch for anyone, and its attach behaviour must not change. A managed
+    /// daemon swaps in the verifier its launcher filled.
+    attach_authority: Mutex<yi_agent_lifecycle::authorization::AttachAuthority>,
+    /// The guardian's authorization ledger, when this daemon is managed.
+    ///
+    /// `None` is the unmanaged daemon: no guardian, so nobody can be resolved and
+    /// nothing is gated. `Some` holds a *verifier*, not a signer -- it can only
+    /// accept capabilities the guardian actually minted.
+    managed_authorizations: Mutex<Option<yi_agent_lifecycle::authorization::AuthorizationLedger>>,
 }
 
 /// A task whose terminal state is durable but whose execution is not yet proven
@@ -660,6 +673,10 @@ impl RuntimeCoordinator {
             clients: Mutex::new(RuntimeClients::new()),
             generation,
             stop_sequence: AtomicU64::new(0),
+            attach_authority: Mutex::new(
+                yi_agent_lifecycle::authorization::AttachAuthority::Unmanaged,
+            ),
+            managed_authorizations: Mutex::new(None),
         })
     }
 
@@ -798,17 +815,31 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime application root attach mutex poisoned");
         self.ensure_admitting()?;
-        // Every root attach passes the same admission barrier as task creation.
-        // The owner is the application root's stable idempotency key: it survives
-        // an app-server restart, which is what makes "the App's work" a stable
-        // set rather than something tied to one process lifetime.
+        // On a managed daemon the presented key *is* the guardian's capability, so
+        // this both authenticates the attach and names its owner. The client id is
+        // then read from the verified binding, never from the request: a caller
+        // that could fill in "who I am" would be naming an owner it does not speak
+        // for, which is the exact confusion this gate exists to prevent.
         //
-        // This is the business attach, not the authenticated guardian lease: the
-        // plan's requirement that the *client id* come from a verified private
-        // channel is wired with the guardian in a later task. Binding here means
-        // a released owner cannot silently re-attach, which is the part that can
-        // be enforced today.
-        self.ensure_owner_open(idempotency_key)?;
+        // On an unmanaged daemon (CLI, tests, `daemon serve`) nothing changes: the
+        // key is the app-server's own idempotency key and the owner is that key.
+        let authorized = self.authorize_attach_key(idempotency_key)?;
+        let owner = authorized
+            .as_ref()
+            .map(|authorization| authorization.client_run_id.clone())
+            .unwrap_or_else(|| idempotency_key.to_string());
+        if let Some(authorization) = authorized.as_ref()
+            && !same_root(&authorization.root_id, requested_workspace)
+        {
+            // A capability from another project names a root that does not exist
+            // here; attaching it would be work in the wrong runtime.
+            return Err(RuntimeCoordinatorError::AdmissionClosed(format!(
+                "root authorization names {} but this attach requested {}",
+                authorization.root_id,
+                requested_workspace.display()
+            )));
+        }
+        self.ensure_owner_open(&owner)?;
         if idempotency_key.trim().is_empty() {
             return Err(RuntimeCoordinatorError::Supervisor(
                 "application root idempotency key is required".into(),
@@ -884,7 +915,7 @@ impl RuntimeCoordinator {
                 .unwrap_or_else(|| legacy_application_root_capability(idempotency_key));
             // Re-attaching in this generation re-establishes ownership: the root
             // is that app's again, and a closed owner was refused above.
-            self.bind_root(idempotency_key, &existing.root_task_id.to_string())?;
+            self.bind_root(&owner, &existing.root_task_id.to_string())?;
             return Ok(AttachedApplicationRoot {
                 session_id: existing.root_session_id,
                 root_task_id: existing.root_task_id,
@@ -963,7 +994,7 @@ impl RuntimeCoordinator {
             &root_task_id,
             extra_roots.iter().map(PathBuf::from).collect(),
         );
-        self.bind_root(idempotency_key, &root_task_id.to_string())?;
+        self.bind_root(&owner, &root_task_id.to_string())?;
         Ok(AttachedApplicationRoot {
             session_id,
             root_task_id,
@@ -3554,6 +3585,97 @@ impl RuntimeCoordinator {
     /// The client id must come from the guardian's authenticated connection, not
     /// from a field on the business RPC; that private channel is wired in a later
     /// task, so this method only takes the already-verified id.
+    /// Installs the guardian's verifier, making this a managed daemon.
+    ///
+    /// Called once, before the business socket binds: an attach that raced the
+    /// handshake would otherwise be judged by the unmanaged default and admitted
+    /// with no authorization at all.
+    pub fn adopt_managed_authority(
+        &self,
+        ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
+    ) {
+        *self
+            .managed_authorizations
+            .lock()
+            .expect("managed authorizations mutex poisoned") = Some(ledger);
+        self.refresh_attach_authority();
+    }
+
+    /// Applies one authority update from the guardian.
+    pub fn apply_authority_update(
+        &self,
+        update: yi_agent_lifecycle::authorization::AuthorizationUpdate,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .managed_authorizations
+            .lock()
+            .expect("managed authorizations mutex poisoned");
+        let Some(ledger) = guard.as_mut() else {
+            return Err("this daemon has no guardian authority to update".to_string());
+        };
+        let result = ledger.apply(update);
+        drop(guard);
+        self.refresh_attach_authority();
+        result
+    }
+
+    /// Whether this daemon is supervised by a guardian.
+    pub fn is_managed(&self) -> bool {
+        self.managed_authorizations
+            .lock()
+            .expect("managed authorizations mutex poisoned")
+            .is_some()
+    }
+
+    /// Recomputes the client set the attach gate consults.
+    ///
+    /// Derived from the ledger rather than tracked separately: two views of "who is
+    /// authorized" would eventually disagree, and the disagreement would be an
+    /// attach admitted for a client whose authority was withdrawn.
+    fn refresh_attach_authority(&self) {
+        let managed = self
+            .managed_authorizations
+            .lock()
+            .expect("managed authorizations mutex poisoned");
+        let authority = match managed.as_ref() {
+            None => yi_agent_lifecycle::authorization::AttachAuthority::Unmanaged,
+            Some(ledger) => yi_agent_lifecycle::authorization::AttachAuthority::Managed(
+                ledger.authorized_clients(),
+            ),
+        };
+        *self
+            .attach_authority
+            .lock()
+            .expect("attach authority mutex poisoned") = authority;
+    }
+
+    /// Checks the presented key against the guardian's authority, when managed.
+    ///
+    /// An unmanaged daemon returns `Ok(None)` and the caller keeps its old
+    /// behaviour byte for byte. A managed one must resolve the key to a binding the
+    /// guardian minted: the key *is* the capability, so resolving it and verifying
+    /// it is the same act.
+    fn authorize_attach_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<yi_agent_lifecycle::types::RootAuthorization>, RuntimeCoordinatorError> {
+        let managed = self
+            .managed_authorizations
+            .lock()
+            .expect("managed authorizations mutex poisoned");
+        let Some(ledger) = managed.as_ref() else {
+            return Ok(None);
+        };
+        let authorization = ledger
+            .resolve(idempotency_key)
+            .map_err(|reason| RuntimeCoordinatorError::AdmissionClosed(reason.clone()))?
+            .clone();
+        ledger
+            .verify(&authorization)
+            .map_err(RuntimeCoordinatorError::AdmissionClosed)?;
+        Ok(Some(authorization))
+    }
+
     pub fn bind_root(&self, client: &str, root: &str) -> Result<(), RuntimeCoordinatorError> {
         let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
         clients
@@ -4982,4 +5104,22 @@ fn truncate_diff(diff: String) -> String {
     let mut truncated = diff[..boundary].to_owned();
     truncated.push_str("\n... diff truncated\n");
     truncated
+}
+
+/// Whether a root authorization names this workspace.
+///
+/// Canonicalised when both paths resolve, because the shell records the project as
+/// it sees it while the sidecar derives the same directory from its own invocation:
+/// `/p`, `/p/` and a symlinked alias are one root. Falls back to a textual
+/// comparison when a path does not resolve, rather than claiming a mismatch it
+/// cannot prove.
+fn same_root(recorded: &str, requested: &std::path::Path) -> bool {
+    let requested_path = std::path::Path::new(recorded);
+    match (
+        std::fs::canonicalize(requested_path),
+        std::fs::canonicalize(requested),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => requested_path == requested,
+    }
 }

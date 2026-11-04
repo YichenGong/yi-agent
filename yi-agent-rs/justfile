@@ -257,6 +257,7 @@ runtime-lifecycle-check:
     cargo test -p yi-agent-supervisors --test managed_process_groups
     cargo test -p yi-agent-supervisors --test managed_channel
     cargo test -p yi-agent-supervisors --test managed_channel_authority
+    cargo test -p yi-agent-store --test managed_attach_authority
     cargo test -p yi-agent-supervisors --test client_reclamation
     cargo test -p yi-agent-supervisors --test execution_admission
     cargo test -p yi-agent-supervisors --test guardian_control

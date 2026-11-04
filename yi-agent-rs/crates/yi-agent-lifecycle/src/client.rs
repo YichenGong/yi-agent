@@ -387,6 +387,44 @@ impl FrontendLease {
         Self::open_channel_with(&self.control_path, &self.grant, deadline)
     }
 
+    /// Mints authority to attach one root, on this lease.
+    ///
+    /// Answered by the guardian, not the daemon: the guardian is the only party that
+    /// authenticated the lease, so it is the only one that can say whose root this
+    /// is. The result is *not* a credential -- it cannot renew, register or spawn --
+    /// which is exactly why a process that cannot hold the App's renewable
+    /// credential can still attach on its behalf.
+    ///
+    /// A refusal is returned as an error rather than an `Option`: a caller that
+    /// treated "no authority" as "proceed unauthenticated" would defeat the gate.
+    pub fn authorize_root(
+        &self,
+        root_id: impl Into<String>,
+        deadline: &Deadline,
+    ) -> io::Result<types::RootAuthorization> {
+        let mut client = ControlClient::connect(&self.control_path, deadline)?;
+        let answer = client.request(
+            &types::ControlRequest::AuthorizeRoot {
+                grant: self.grant.clone(),
+                root_id: root_id.into(),
+            },
+            deadline,
+        )?;
+        match answer {
+            types::ControlResponse::RootAuthorized(authorization) => Ok(authorization),
+            types::ControlResponse::Rejected { code, reason } => Err(io::Error::other(format!(
+                "root authorization refused ({code:?}): {reason}"
+            ))),
+            types::ControlResponse::Unsupported { detail } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("this guardian cannot authorize roots: {detail}"),
+            )),
+            other => Err(io::Error::other(format!(
+                "unexpected answer to an authorization request: {other:?}"
+            ))),
+        }
+    }
+
     /// Opens a channel with an explicit grant and socket.
     ///
     /// Split out so a caller that already holds this lease's grant can open further

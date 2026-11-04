@@ -609,8 +609,14 @@ fn internal_worker_is_not_a_frontend_kind() {
 - [x] **Step 3:** TUI 启动生成一次 client_run_id，连接的所有会话共享该身份；退出先关闭自己的前台 Agent／受管工具，再 release 并有界等结果。headless run 结束无论成功失败都走同一路径，signal handler 只置退出信号，不在 handler 做锁／IPC。
   实现：`frontend_lease::new_client_run_id("tui"/"run")` 每次进程启动生成一次；TUI 的 `lease_handle` 在 attach 成功后才交给 driver，
   失败分支显式 `release()`（不能靠 Drop——Drop 只停心跳，租约要等 30s 过期，期间该前端的活会被当作无主）。
-- [ ] **Step 4:** lease heartbeat 不交给 executor／工具；通知显示构建差异、切换、任务中断及不兼容需升级。新版停机后旧期望构建不能覆盖 selection。只读 daemon status／内部调用不登记，不从 history 扫描项目常驻。
-- [ ] **Step 5:** 多 TUI＋App 角色集成验证一个退出其他继续；执行 §0.4，提交 `feat: tie tui and headless runtime work to frontend lifetimes`。
+- [x] **Step 4:** lease heartbeat 不交给 executor／工具；通知显示构建差异、切换、任务中断及不兼容需升级。新版停机后旧期望构建不能覆盖 selection。只读 daemon status／内部调用不登记，不从 history 扫描项目常驻。
+  实现：心跳线程由 `FrontendLeaseHandle` 自己持有（`crates/yi-agent/src/frontend_lease.rs`），不进 executor、不交给工具；
+  只读命令走 `attach_tui_runtime` 之外的分支，不 register。App 端由桌面壳持连接（Task 13）。
+  判据：`cargo test -p yi-agent --test frontend_runtime_lease`（9 passed，含 `a_read_only_command_never_registers_a_frontend`）。
+- [x] **Step 5:** 多 TUI＋App 角色集成验证一个退出其他继续；执行 §0.4，提交 `feat: tie tui and headless runtime work to frontend lifetimes`。
+  实现：`one_frontend_leaving_does_not_reclaim_anothers_work` 与 supervisor 侧 `client_reclamation` 的 A+B 用例共同覆盖；
+  第四个前端只会让 scope 继续服务，最后一个离开才 drain。
+  判据：`cargo test -p yi-agent --test frontend_runtime_lease`、`cargo test -p yi-agent-supervisors --test client_reclamation`。
 
 ## Task 13: 桌面壳拥有身份、侧车恢复与真正退出屏障
 

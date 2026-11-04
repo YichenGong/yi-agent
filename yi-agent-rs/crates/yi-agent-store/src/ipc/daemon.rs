@@ -93,6 +93,20 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
+        Self::start_with_factory_and_authority(runtime_dir, database_path, factory, None)
+    }
+
+    /// Starts the daemon with the guardian's authority already installed.
+    ///
+    /// Installed *before* the listener binds on purpose: an attach that raced the
+    /// handshake would be judged by the unmanaged default and admitted with no
+    /// authorization at all. `None` keeps the old behaviour exactly.
+    pub fn start_with_factory_and_authority(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        managed: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
+    ) -> Result<Self, IpcError> {
         raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
         fs::create_dir_all(runtime_dir)?;
@@ -132,6 +146,9 @@ impl Daemon {
         }
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
+        if let Some(ledger) = managed {
+            coordinator.adopt_managed_authority(ledger);
+        }
         // A fresh daemon starts with no plugin routes; the supervisor republishes
         // them as soon as it reconciles. Only this project's routes are dropped:
         // another project's daemon in the same process keeps serving.
@@ -341,6 +358,12 @@ impl Daemon {
     /// printing the historical one-liner.
     pub fn reclaimed_orphans(&self) -> usize {
         self.reclaimed_orphans
+    }
+
+    /// The coordinator this daemon serves, for a managed launcher that has to
+    /// install the guardian's authority before the socket is reachable.
+    pub fn coordinator(&self) -> &Arc<RuntimeCoordinator> {
+        &self.coordinator
     }
 
     /// Stop this manually started daemon and release its local runtime files.

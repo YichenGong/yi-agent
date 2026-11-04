@@ -21,6 +21,9 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 futures = { workspace = true }
 sha2 = "0.10"
+# The managed daemon verifies root authority minted by its guardian. The
+# dependency direction is one-way: `yi-agent-lifecycle` never links this crate.
+yi-agent-lifecycle = { workspace = true }
 # Fork payloads travel over the IPC as base64 text and are decoded here.
 base64 = "0.22"
 # Advisory file locking for the daemon instance lock (`flock`).

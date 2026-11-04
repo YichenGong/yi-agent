@@ -5187,6 +5187,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
@@ -5315,6 +5316,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yi-agent-core",
+ "yi-agent-lifecycle",
 ]
 
 [[package]]

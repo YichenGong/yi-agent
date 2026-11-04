@@ -8,6 +8,7 @@
 //!
 //! Contents:
 //! - [`types`] — wire DTOs and identity types.
+//! - [`authorization`] — who may attach a root, as decided by the guardian.
 //! - [`codec`] — length-prefixed, version-checked framing bounded by
 //!   [`MAX_CONTROL_FRAME`].
 //! - [`deadline`] — one total budget per operation on an injectable monotonic
@@ -19,6 +20,7 @@
 //!   from it. Here rather than in the supervisors because the desktop shell must
 //!   resolve the same paths without linking them.
 
+pub mod authorization;
 pub mod client;
 pub mod codec;
 pub mod deadline;

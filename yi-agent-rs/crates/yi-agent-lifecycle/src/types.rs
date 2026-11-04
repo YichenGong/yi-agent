@@ -408,6 +408,25 @@ pub enum ControlRequest {
         /// skip a row.
         cursor: Option<String>,
     },
+    /// Mint the authority to attach one root on this client's behalf.
+    ///
+    /// Owner-bound like every other state-changing request: `grant` must match the
+    /// live lease, and the lease must be [`LeaseMode::Business`]. That is the whole
+    /// security claim -- a `LeaseOnly` observer can watch and control upgrades but
+    /// can never name an owner, so it cannot obtain this.
+    ///
+    /// Answering with a capability rather than a boolean is what makes the result
+    /// usable by a *different* process. The sidecar cannot hold the App's renewable
+    /// credential (`shell_authorization` is explicit about that), so "yes" would
+    /// leave it with nothing to present. The capability is not a credential: it
+    /// cannot register, renew, or spawn -- it names one root in one generation.
+    AuthorizeRoot {
+        grant: ClientGrant,
+        /// The root this authority is for, exactly as the business attach will
+        /// name it. Deriving it here rather than at the attach is what makes the
+        /// binding checkable by the daemon, which never sees the grant.
+        root_id: RootId,
+    },
 }
 
 /// A narrow, owner-bound execution-admission question.
@@ -486,6 +505,12 @@ pub enum ControlResponse {
         /// The runtime generation the channel belongs to.
         generation: String,
     },
+    /// The requested authority, minted for this client, root and generation.
+    ///
+    /// The guardian answers with the full binding rather than a bare capability so
+    /// the caller can see *whose* authority it is: a guardian that bound a
+    /// different client would be visibly wrong instead of silently mislabelled.
+    RootAuthorized(RootAuthorization),
 }
 
 /// A portable description of a bundled daemon artifact, emitted at build time and

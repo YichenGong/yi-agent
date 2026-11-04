@@ -108,6 +108,124 @@ pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::R
     .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
 }
 
+/// Reads the guardian's opening frame, if one arrives in time.
+///
+/// `Ok(None)` means "no greeting, treat as unmanaged". Silence is deliberately not
+/// a refusal: the only way to see none is a guardian from an older build, or one
+/// that failed to write before we asked. Refusing there would turn a compatibility
+/// case into a broken runtime, and the design's security claim is about *managed*
+/// daemons.
+///
+/// The guardian writes this frame right after a successful spawn, before it waits
+/// for the socket. That ordering is load-bearing: this daemon reads the greeting
+/// before it binds, so a guardian that waited for `Status` first would deadlock
+/// against the daemon it just started.
+fn read_lifeline_hello(
+    lifeline: &std::os::fd::OwnedFd,
+) -> io::Result<Option<yi_agent_lifecycle::authorization::LifelineHello>> {
+    use std::io::Read;
+    let mut probe = [0u8; 1];
+    // A one-byte peek with a bounded wait: the frame is small and the guardian is a
+    // local process, so hitting the budget means nothing is coming.
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(lifeline),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let budget = yi_agent_lifecycle::authorization::LIFELINE_READ_BUDGET
+        .as_millis()
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: `poll` only inspects the descriptor's readiness.
+    let ready = unsafe { libc::poll(&mut poll, 1, budget) };
+    if ready == 0 {
+        return Ok(None);
+    }
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is an open socket; `Read` on it does not change
+    // ownership. `poll` said a byte is available, so this cannot block.
+    let mut stream = unsafe {
+        use std::os::fd::FromRawFd;
+        // Borrow, do not take: the `OwnedFd` above stays the owner.
+        std::mem::ManuallyDrop::new(std::os::unix::net::UnixStream::from_raw_fd(
+            std::os::fd::AsRawFd::as_raw_fd(lifeline),
+        ))
+    };
+    stream.set_read_timeout(Some(
+        yi_agent_lifecycle::authorization::LIFELINE_READ_BUDGET,
+    ))?;
+    stream.read_exact(&mut probe)?;
+    // The frame header is four bytes and the read above consumed one, so the frame
+    // reader is given the header back by reading it directly and prepending.
+    let mut header = [0u8; 3];
+    stream.read_exact(&mut header)?;
+    let length = u32::from_be_bytes([probe[0], header[0], header[1], header[2]]) as usize;
+    if length == 0 || length + 4 > yi_agent_lifecycle::MAX_CONTROL_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("lifeline frame length {length} is out of range"),
+        ));
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    // `decode` takes a *whole* frame, header included. Handing it the body alone
+    // made it read the first four JSON bytes as a length and refuse the frame as
+    // oversized -- a bug the tests never saw only because the greeting was never
+    // actually sent before the daemon started serving.
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(length as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    let hello: yi_agent_lifecycle::authorization::LifelineHello =
+        yi_agent_lifecycle::codec::decode(&frame)?;
+    Ok(Some(hello))
+}
+
+/// Applies every authority update the guardian sends, until the channel closes.
+///
+/// The loop ending *is* the daemon's notice that its guardian is gone; the caller
+/// keeps it running for the daemon's whole life for that reason. A malformed or
+/// refused frame is logged and skipped rather than fatal: one bad binding must not
+/// take down a serving daemon, and the refusal is the guardian's bug to fix.
+fn pump_lifeline_authority(
+    lifeline: std::os::fd::OwnedFd,
+    coordinator: std::sync::Arc<yi_agent_store::runtime::RuntimeCoordinator>,
+) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: this thread is the sole owner of `lifeline` now, and the stream takes
+    // over exactly that descriptor.
+    let mut stream = std::mem::ManuallyDrop::new(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(lifeline.as_raw_fd())
+    });
+    loop {
+        match yi_agent_lifecycle::codec::read_frame(&mut &mut *stream) {
+            Ok(frame) => {
+                match yi_agent_lifecycle::codec::decode::<
+                    yi_agent_lifecycle::authorization::AuthorizationUpdate,
+                >(&frame)
+                {
+                    Ok(update) => {
+                        if let Err(error) = coordinator.apply_authority_update(update) {
+                            tracing::warn!(error = %error, "refused an authority update");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "undecodable authority update");
+                    }
+                }
+            }
+            // EOF is the guardian dying. There is nothing to report to: the process
+            // is on its own from here, and the reclaimer's own leases are what stop
+            // any work it still owns.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return,
+            Err(error) => {
+                tracing::warn!(error = %error, "the guardian lifeline failed");
+                return;
+            }
+        }
+    }
+}
+
 /// Serves one runtime's business daemon under its guardian.
 ///
 /// This is the only daemon start that carries the exit guarantees. It is
@@ -118,7 +236,44 @@ pub fn run_managed_daemon(
     invocation: yi_agent_runtime::config::RuntimeConfig,
 ) -> anyhow::Result<()> {
     use yi_agent_supervisors::lifecycle::roles::{ManagedRole, inherited_bootstrap};
-    let _bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
+    let bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
+    // The guardian's first frame carries the generation secret. It is read before
+    // the daemon serves because authority must be verifiable from the first attach:
+    // a daemon that bound its socket first would spend a window admitting calls it
+    // could not check. A guardian that says nothing leaves the daemon unmanaged
+    // rather than broken -- the handshake is on a channel the guardian owns, and
+    // treating silence as "refuse everything" would make a launch race look like a
+    // permission bug.
+    let managed = match read_lifeline_hello(&bootstrap) {
+        Ok(Some(hello)) => {
+            let secret = hello.secret().map_err(|error| anyhow::anyhow!(error))?;
+            if hello.scope_key
+                != yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir)
+                    .to_string_lossy()
+                    .into_owned()
+                && hello.scope_key.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "the guardian authorized a different runtime scope"
+                ));
+            }
+            let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+                hello.scope_key.clone(),
+                hello.daemon_instance_id.clone(),
+                secret,
+            );
+            // The channel stays open for the daemon's whole life: it is both the
+            // death monitor and the authority feed, and closing it early would tell
+            // the guardian the daemon is gone.
+            Some((ledger, bootstrap))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "the guardian's authorization handshake failed: {error}"
+            ));
+        }
+    };
     // The instance's configuration is inherited from the process that started us,
     // not re-derived from the project cwd: a shared daemon must keep reading the
     // same `YI_AGENT_HOME` and model catalogue its launcher used. Only the workdir
@@ -130,8 +285,28 @@ pub fn run_managed_daemon(
         runtime_dir.clone(),
         &yi_agent_runtime::models::models_path(),
     )?;
-    let daemon = yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
-        .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
+    let (ledger, lifeline) = match managed {
+        Some((ledger, lifeline)) => (Some(ledger), Some(lifeline)),
+        None => (None, None),
+    };
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_and_authority(
+        &runtime_dir,
+        &database,
+        factory,
+        ledger,
+    )
+    .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
+    // Only now does listening for further authority make sense: the coordinator
+    // exists, so a binding frame has somewhere to land. Until the daemon stops, this
+    // loop also *is* the death monitor -- it returns when the guardian closes the
+    // channel, which is the signal that nothing supervises this process any more.
+    if let Some(lifeline) = lifeline {
+        let coordinator = std::sync::Arc::clone(daemon.coordinator());
+        std::thread::Builder::new()
+            .name("lifeline-authority".to_string())
+            .spawn(move || pump_lifeline_authority(lifeline, coordinator))
+            .map_err(|error| anyhow::anyhow!("could not watch the guardian lifeline: {error}"))?;
+    }
     // The business daemon supervises its own plugin children -- that is not handed
     // to the guardian, which knows process groups but not plugin manifests. The
     // second argument is the *runtime directory*: the route table is partitioned by
