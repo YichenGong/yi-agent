@@ -571,7 +571,8 @@ fn inspection_cannot_create_runtime() {
 
 `empty_scope_and_artifact() -> (RuntimeScope, ArtifactIdentity, TempDir)` 在本测试文件定义，artifact 指向只输出静态身份的测试 helper，不运行真实 LLM。
 
-- [ ] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test managed_bringup` 和 `cargo test -p yi-agent-subagent --test attach_delegation`。
+- [x] **Step 2:** 运行 `cargo test -p yi-agent-supervisors --test managed_bringup` 和 `cargo test -p yi-agent-subagent --test attach_delegation`。
+  实测 22 passed 与 16 passed（2026-11-04 复核）。
 - [ ] **Step 3:** 协调锁内探测 control、核对 scope／instance／selection／schema；首次启动 guardian，guardian 再启动唯一 daemon，未登记期间禁止恢复执行。多个 attach 等同一启动结果，不按项目别名起新 daemon。startup 默认总预算 30 秒，Inspect 每次不超过 2 秒。
 - [ ] **Step 4:** 保留 YI_AGENT_HOME、模型目录与基础配置，root 覆盖显式下发。Task 2 目标产物以受控私有目录中的校验副本固定字节、0700 目录／可执行只对当前用户；selection 指向该受控副本并保留 digest，避免 bundle 被替换后旧客户端改用 PATH。复制前后复核 digest／build identity，启动握手再次核对；失败不回退。副本是程序产物缓存，不是新 runtime 数据库。已选定且摘要正确的缓存即正式目标，原 bundle 被删不使它自动失效；新 App 点击切换仍必须先验证其当前 bundle 清单并生成目标缓存。选定缓存丢失／被替换则报错，不偷偷从旧 bundle／PATH 修复。
 - [ ] **Step 5:** 替换 attach 中 embedded 自动路径为 managed 分支，但最终默认开关留 Task 18；binding 代际退休保留 SingleShot 不重放。手工 daemon、兼容旧版暂用走显式 legacy 分支；unknown 不放行业务。
@@ -588,7 +589,7 @@ fn inspection_cannot_create_runtime() {
 
 **Interfaces:** lightweight crate client 模块新增 `FrontendLease::register(scope: &RuntimeScope, id: ClientRunId, kind: ClientKind, mode: LeaseMode, deadline: Deadline) -> io::Result<Self>`、`grant(&self) -> &ClientGrant`、`release(&mut self, deadline: Deadline) -> io::Result<OperationId>`；心跳在拥有者前端线程／runtime 内运行，Drop 仅尽力关闭连接，不阻塞 15 秒。
 
-- [ ] **Step 1:** 为 TUI 正常退出、Ctrl+C、headless 成功／失败、只读命令加回收测试；关键 shell 角色断言写入新 integration target：
+- [x] **Step 1:** 为 TUI 正常退出、Ctrl+C、headless 成功／失败、只读命令加回收测试；关键 shell 角色断言写入新 integration target：
 
 ```rust
 #[test]
@@ -601,8 +602,13 @@ fn internal_worker_is_not_a_frontend_kind() {
 
 同时真实启动 headless fake provider，退出后从 guardian Identity 观察该 identity 已释放；不能仅依赖枚举测试。
 
-- [ ] **Step 2:** 运行 `cargo test -p yi-agent --test frontend_runtime_lease`。
-- [ ] **Step 3:** TUI 启动生成一次 client_run_id，连接的所有会话共享该身份；退出先关闭自己的前台 Agent／受管工具，再 release 并有界等结果。headless run 结束无论成功失败都走同一路径，signal handler 只置退出信号，不在 handler 做锁／IPC。
+- [x] **Step 2:** 运行 `cargo test -p yi-agent --test frontend_runtime_lease`。
+  实测 9 passed（`a_headless_run_registers_and_releases_its_lease`、`a_read_only_command_never_registers_a_frontend`、
+  `one_frontend_leaving_does_not_reclaim_anothers_work`、`a_tui_exit_releases_its_lease` 等），
+  其中新增的 `a_headless_runs_tool_processes_are_owned_by_that_run` 是 Task 8 Step 3 的端到端判据。
+- [x] **Step 3:** TUI 启动生成一次 client_run_id，连接的所有会话共享该身份；退出先关闭自己的前台 Agent／受管工具，再 release 并有界等结果。headless run 结束无论成功失败都走同一路径，signal handler 只置退出信号，不在 handler 做锁／IPC。
+  实现：`frontend_lease::new_client_run_id("tui"/"run")` 每次进程启动生成一次；TUI 的 `lease_handle` 在 attach 成功后才交给 driver，
+  失败分支显式 `release()`（不能靠 Drop——Drop 只停心跳，租约要等 30s 过期，期间该前端的活会被当作无主）。
 - [ ] **Step 4:** lease heartbeat 不交给 executor／工具；通知显示构建差异、切换、任务中断及不兼容需升级。新版停机后旧期望构建不能覆盖 selection。只读 daemon status／内部调用不登记，不从 history 扫描项目常驻。
 - [ ] **Step 5:** 多 TUI＋App 角色集成验证一个退出其他继续；执行 §0.4，提交 `feat: tie tui and headless runtime work to frontend lifetimes`。
 
@@ -873,6 +879,19 @@ fn quitting_app_reclaims_stuck_app_worker_but_preserves_two_tuis() -> anyhow::Re
 
 - [ ] **Step 2:** 扩展 spec §10 每行的测试，按下方覆盖表核对；必须包括真 SIGKILL daemon／guardian、前台宿主死亡、App-server respawn、exec 交接和异常残留阻断。数据库复用用已保存报告＋交付＋中断任务，断言无外部副作用重播；trace 仅在保留期内断言。
 - [ ] **Step 3:** 接通 TUI／App／headless／插件实际默认自动入口到 ensure_managed，移除本期临时内部测试路径的启用限制；保留手工 unmanaged CLI 分支及旧版明确暂用。逐一查找自动启动／ensure_running／embedded 路径，确认没有绕过迁移和选择策略的默认入口。
+  **2026-11-04 状态：TUI 与 headless 已接（工具 spawn 走受管通道），App/sidecar 与默认开关未接。**
+  TUI（`main.rs` 的 attach 分支）与 headless（`build_headless_root_tools`）现在通过
+  `FrontendLease::managed_owner()` 拿到 owner，bash／`process_start`／MCP 的 spawn 都经 guardian 签发的私有通道；
+  判据是 `a_headless_runs_tool_processes_are_owned_by_that_run`（去掉 guardian 后失败）。
+  **App/sidecar 仍未接**：`yi-agent-app-server` 里没有 `FrontendLease`（`ClientKind::App` 只出现在
+  `runtime_status.rs` 的 DTO 映射里），而 `build_runtime_tooling` 仍调 `build_tool_setup_with_controller`（内部传 `None`）。
+  sidecar 不能借用桌面壳的 `ClientGrant`：租约按**进程**计，把壳的凭据交给子进程会造出「一条租约两个进程」，
+  让「最后一个前端离开」既算不准也回收不了。它需要自己的客户端身份，而 sidecar 刻意不持可再生凭据
+  （见 `shell_authorization` 设计），所以这一步要么新增一条壳→sidecar 的授权路径，要么让 sidecar 自己登记租约——
+  两者都改变会话模型，属 Task 13 的设计决策，本轮不擅自落地。
+  **默认开关仍为 `Embedded`**（`yi-agent-subagent/src/attach.rs::default_for_build`）：daemon 侧
+  `DaemonAgentWorkerFactory` 仍是线程实现、`ExecutorConnector` 仍只有测试实现，此时把默认切到 managed
+  等于给每个用户一个 worker 隔离尚未接线的运行时。
 - [ ] **Step 4:** 添加 `just runtime-lifecycle-check` recipe，运行 CLI 新集成目标与 lifecycle／supervisors／subagent 的 lease／process-group／switch／handover／executor 集成测试；将适合当前 CI OS 的必需测试纳入 `just ci` 的既有 test 入口。更新 `.github/workflows/ci.yml` 的既有 macos job（当前只跑 power／tools／app-server），加入 lifecycle／store／supervisors／subagent／CLI 的指定集成目标，并补 Node／just 与隔离 sidecar 测试资源，运行桌面 Rust 生命周期测试；`.gitlab-ci.yml` 的 macOS push job 同步执行相同 macOS recipe，不把云端 Linux MR 当 macOS 验证。更新 nextest filter 确保 helper 不被默认单独执行、故障注入目标有界超时且 panic 清理有效。平台缺能力不能静默显示通过；真实 wake／Tauri run-event 在 CI 无 GUI 能力时只验证适配／mock，并明确另有本机隔离 App 的手动冒烟门禁，不能声称无头测试已覆盖系统 Cmd+Q。
 - [ ] **Step 5:** 在 worktree 跑完整验证，命令如下；所有失败先诊断修复，不能依赖“纯文档计划已通过”代替实现门禁。
 
