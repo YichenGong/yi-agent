@@ -512,8 +512,13 @@ test("a missing prerequisite never masks a build that is actually present", () =
     commands: [{ kind: "command", run: "probe", needs: ["scripts/plugins/e2e.mjs"] }],
   };
   let ran = 0;
+  // 根必须是**仓库根**（映射表里的 `needs` 都相对它），且不能取进程 cwd：
+  // `just` 从 `yi-agent-rs/` 调起测试，用进程 cwd 会让这条用例在门禁里红、
+  // 在仓库根绿——那种「只在门禁里红」的测试最容易被当成环境抖动忽略掉。
+  // 本文件在 `scripts/plugins/`，向上两级即仓库根。
+  const repoRoot = path.resolve(import.meta.dirname, "..", "..");
   const results = runSelected([caseSpec], {
-    cwd: path.resolve("."),
+    cwd: repoRoot,
     runner: () => {
       ran += 1;
       return "";
