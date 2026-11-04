@@ -224,3 +224,73 @@ $ grep -c "布尔代数" *.jsonl
 未执行原因：需要至少一台真实手机、relay 宿主与移动端工程；Vitest 的 jsdom
 视口不能替代真实设备。桌面端本轮只到单测 + 构建 + `just desktop-check`，
 §12.5 真机部分仍未验收。
+
+## 5. 2026-11-05 修复验收
+
+本轮修的是「旁问进去以后退不出来 / 按了没反应」这一类可见性缺陷，
+spec 与 plan：`docs/superpowers/specs/2026-11-05-side-conversation-repair-design.md`、
+`docs/superpowers/plans/2026-11-05-side-conversation-repair-impl.md`。
+
+### 5.1 构建身份与执行环境
+
+| 项 | 值 |
+| --- | --- |
+| 基线 commit | `d25822ca`（Task 10 提交后），修复起点 `f35b2066` |
+| 平台 | macOS aarch64（本机 worktree，未打包 .app） |
+| 桌面端 | 源码 + `npx tsc --noEmit` + `npx vitest run`（未跑真实 WebView） |
+| 移动端 | **未执行**：本 worktree 无移动端工程、无真机 |
+| relay / hostKey | **未执行**：未连接任何 relay 宿主，无脱敏标识可记 |
+| TUI | 源码级 TestBackend（80×24、32×12）与 `just ci`；**未跑真实 PTY** |
+
+按要求不复制用户原始问题、不记录完整配置。
+
+### 5.2 自动验证（已执行，全部通过）
+
+```bash
+(cd desktop && npx tsc --noEmit && npx vitest run)     # 159 files / 2226 tests passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 710 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_)       # 21 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_driver)        # 9 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log)
+(cd yi-agent-rs && just desktop-check)                 # 2226 passed
+(cd yi-agent-rs && just ci)                            # 16 道门禁，CI passed（5428 tests）
+git diff --check                                        # 无输出
+```
+
+一次说明：首轮 `just ci` 出现 `yi-agent-app-server ws::tests::a_client_leaving_does_not_kill_the_shared_loop` 单条失败。
+该用例依赖真实 socket + 300ms sleep，单独重跑连跑 5 次全部通过，
+随后完整 `just ci` 重跑通过；与本次改动无关（改动集中在 `crates/yi-agent/src/tui/`、
+`side_driver`）。**不把基线 parser 错误或该类偶发项当成可接受失败**，此处只记录
+已复现通过的事实。
+
+### 5.3 W/T 覆盖
+
+自动侧覆盖（测试全名见 plan Task 8–10 证据）：
+
+| 验收 ID | 自动证据 | 真机/真实 PTY |
+| --- | --- | --- |
+| T01 | `side_repair_paste_stays_in_the_visible_side_draft`、`side_repair_typed_and_completed_back_work_through_the_loop`、`side_repair_tab_completes_then_enter_executes` | 未执行 |
+| T02 | `side_repair_close_survives_a_full_side_channel`、`side_repair_close_survives_a_dropped_side_receiver` | 未执行 |
+| T03 | `side_repair_paste_back_survives_a_parent_approval_through_the_loop` | 未执行 |
+| T04 | `side_repair_paste_back_through_the_loop_returns_to_main_and_keeps_the_parent_draft`、`a_new_side_can_open_after_the_previous_one_closed` | 未执行 |
+| T05 | `side_repair_tab_without_popup_does_not_edit_the_draft`、`side_repair_esc_closes_the_popup_before_stopping` | 未执行 |
+| T06 | `side_repair_first_ctrl_c_in_side_stops_only_the_side`、`side_repair_editing_after_ctrl_c_rearms_the_confirmation` | 未执行（真实清理器/租约未单测覆盖，见 5.4） |
+| T07 | `side_repair_ctrl_q_quits_even_with_the_runtime_popup_open`、`side_repair_ctrl_q_quits_with_a_pending_parent_approval`、`side_repair_quit_commands_leave_the_side_without_a_submit` | 未执行 |
+| T08 | `side_repair_esc_closes_the_popup_before_stopping` | 未执行 |
+| T09 | 上列两条 Full/Closed 用例 + driver 的 `stale_close_target_reports_error_and_keeps_the_live_side`、`stale_interrupt_does_not_stop_the_live_turn`、`failed_open_reports_a_main_target_error` | 未执行 |
+| T10 | `side_status_bar_labels_the_conversation_without_covering_the_first_item`（80×24 与 32×12 × 深/浅）、`main_view_has_no_standalone_side_banner`、`side_events_never_reach_main_turn_log` | 未执行 |
+
+W01–W16（桌面/手机）本轮**未改动对应实现**，也**未在真机复验**；本表不据此宣称通过。
+
+### 5.4 明确未执行项
+
+- 真实 WebView 桌面验收（本 worktree 只跑源码级测试，未打包 `.app`）。
+- iPhone / relay / 双端同一 side id、后台唤醒重连、close 冲突二次确认。
+- 真实 PTY 的 bracketed paste（`\x1b[200~/back\x1b[201~\r`、
+  `\x1b[200~/side-close\x1b[201~\r`）、Esc、Ctrl+C×2、Ctrl+Q、退出命令。
+- 真实模型流式回答（未取得授权，未调用真实 LLM）。
+- 退出清理器/租约释放的真进程用例：当前无对应 fixture，本轮以源码级退出路径
+  测试代替，**不作为已验收**。
+
+因此本轮**不宣布修复验收通过**，`docs/project-management/yi-agent-tui.md` 中该条
+保持未勾。
