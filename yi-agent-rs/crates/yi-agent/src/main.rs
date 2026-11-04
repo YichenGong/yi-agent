@@ -8,6 +8,7 @@ mod frontend_lease;
 mod llm_prefix;
 mod managed_runtime;
 mod onboarding_prompt;
+mod plugins_cmd;
 mod resume;
 mod schedule_intent;
 mod session_store;
@@ -108,6 +109,14 @@ fn main() -> Result<()> {
             InternalRuntimeAction::Guardian => run_internal_guardian(),
             InternalRuntimeAction::Daemon => run_internal_daemon(),
         },
+        Some(Command::Plugins { ref action }) => {
+            // `exec` 是前台命令，退出码就是插件进程的退出码。
+            let code = plugins_cmd::run(action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {
@@ -834,6 +843,64 @@ fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
 }
 
 /// 停止句柄：置位后循环退出并 `stop_all`，用于测试与 daemon 退出时的回收。
+/// `daemon start` 等待后端应答的总预算。
+///
+/// 原先是 50 次 × 10ms = 500ms。这个值只在轻载机器上够用：`just ci` 里全量
+/// nextest 会同时拉起上千个测试与多个进程，`daemon serve` 光是走到监听就
+/// 可能超过 500ms，于是 `daemon start` 报"未就绪"、测试判红，而 daemon 其实
+/// 几百毫秒后就会正常起来。**这是测试环境暴露出来的真实缺陷**，不是测试写得
+/// 太急：给后端启动留的预算必须覆盖真实负载，且失败原因要能区分。
+///
+/// 15s 的取舍：正常情况仍会在几十毫秒内返回（每 10ms 轮询一次），只有真的
+/// 卡住才走满；同时远小于 nextest 的 slow-timeout，不会把慢测试变成超时。
+const DAEMON_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 轮询间隔。
+const DAEMON_READY_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DaemonReady {
+    /// 后端已应答。
+    Ready,
+    /// 子进程在我们放弃等待之前就退出了。
+    ///
+    /// 与 `TimedOut` 分开，因为两种情况的下一步完全不同：退出通常是配置或
+    /// 端口冲突（重试无用，需要看它为什么死），超时则可能只是慢。
+    Exited(String),
+    /// 预算耗尽但子进程还活着。
+    TimedOut,
+}
+
+/// 等待后端就绪。
+///
+/// `probe` 返回是否已应答；`reaped` 在子进程已退出时返回它的状态。
+/// 两个闭包注入进来是为了能测"退出早于就绪"和"超时"，而不必真的起进程。
+///
+/// # 为什么每轮先 probe 再看 reaped
+///
+/// 后端可能在发出最后一个应答后立刻退出（例如被人 kill）。先 probe 能把这
+/// 次已经成立的应答算成功；反过来先看 reaped 会把它误报成失败。
+pub(crate) fn wait_for_daemon(
+    mut probe: impl FnMut() -> bool,
+    mut reaped: impl FnMut() -> Option<std::process::ExitStatus>,
+    budget: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> DaemonReady {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if probe() {
+            return DaemonReady::Ready;
+        }
+        if let Some(status) = reaped() {
+            return DaemonReady::Exited(status.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return DaemonReady::TimedOut;
+        }
+        sleep(DAEMON_READY_POLL);
+    }
+}
+
 pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     let workdir = config::resolve_workdir(cli)?;
     let runtime_dir = runtime_directory_for(&workdir);
@@ -849,26 +916,37 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // A manually started daemon creates the same project-local state
             // root the embedded runtimes do, so it must self-ignore it too.
             ignore_project_local_runtime_state(&workdir);
-            std::process::Command::new(std::env::current_exe()?)
+            let mut child = std::process::Command::new(std::env::current_exe()?)
                 .args(["daemon", "serve"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .current_dir(&workdir)
                 .spawn()?;
-            for _ in 0..50 {
-                if yi_agent_store::ipc::send_request(
-                    &runtime,
-                    yi_agent_store::ipc::IpcRequest::Status,
-                )
-                .is_ok()
-                {
+            match wait_for_daemon(
+                || {
+                    yi_agent_store::ipc::send_request(
+                        &runtime,
+                        yi_agent_store::ipc::IpcRequest::Status,
+                    )
+                    .is_ok()
+                },
+                || child.try_wait().ok().flatten(),
+                DAEMON_READY_BUDGET,
+                std::thread::sleep,
+            ) {
+                DaemonReady::Ready => {
                     println!("daemon started");
-                    return Ok(());
+                    Ok(())
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                DaemonReady::Exited(status) => {
+                    anyhow::bail!("daemon exited before it became ready ({status})")
+                }
+                DaemonReady::TimedOut => anyhow::bail!(
+                    "daemon process did not become ready within {}ms",
+                    DAEMON_READY_BUDGET.as_millis()
+                ),
             }
-            anyhow::bail!("daemon process did not become ready")
         }
         DaemonAction::Serve => {
             // `daemon start` spawns this subcommand detached; a directly
@@ -3690,6 +3768,94 @@ mod tests {
         }
     }
 
+    /// 后端一起手就死，必须在**预算内**立刻报 `Exited`。
+    ///
+    /// 防的是"所有失败都说没就绪"：那样用户看到的是"再等等"，而实际
+    /// 需要看的是子进程为什么死。用 15s 的真实预算跑这条，如果实现退化成
+    /// 等满预算，这条会因为测试时长而被看出（并且 `calls` 会远超 2）。
+    #[test]
+    fn a_daemon_that_exits_early_is_reported_as_exited_not_as_a_timeout() {
+        let mut calls = 0;
+        let mut slept = std::time::Duration::ZERO;
+        let outcome = wait_for_daemon(
+            || {
+                calls += 1;
+                false
+            },
+            || {
+                Some(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 3"])
+                        .status()
+                        .unwrap(),
+                )
+            },
+            DAEMON_READY_BUDGET,
+            |d| slept += d,
+        );
+        let DaemonReady::Exited(status) = outcome else {
+            panic!("expected Exited, got {outcome:?}");
+        };
+        assert!(
+            status.contains('3'),
+            "the status must carry the exit code: {status}"
+        );
+        assert_eq!(
+            calls, 1,
+            "must give up on the first observation, not poll forever"
+        );
+        assert_eq!(
+            slept,
+            std::time::Duration::ZERO,
+            "must not sleep before reporting"
+        );
+    }
+
+    /// 子进程一直活着但不应答，预算到了必须报 `TimedOut`，而不是无限等。
+    #[test]
+    fn a_live_but_silent_daemon_times_out_instead_of_waiting_forever() {
+        let budget = std::time::Duration::from_millis(80);
+        let mut now = std::time::Duration::ZERO;
+        let mut probes = 0;
+        let outcome = wait_for_daemon(
+            || {
+                probes += 1;
+                false
+            },
+            || None,
+            budget,
+            |d| now += d,
+        );
+        assert_eq!(outcome, DaemonReady::TimedOut);
+        // 预算内应当轮询多次（10ms 一次 ≈ 8 次），而不是只试一次就放弃。
+        assert!(
+            probes >= 4,
+            "expected repeated polling within the budget, got {probes}"
+        );
+    }
+
+    /// 已经应答就算成功，哪怕子进程紧接着退出。
+    ///
+    /// 先 probe 再看 reaped 的顺序由这条钉住：反过来会把这个已经成立的
+    /// 成功报成失败。
+    #[test]
+    fn an_answered_daemon_is_ready_even_if_it_exits_right_after() {
+        let outcome = wait_for_daemon(
+            || true,
+            || {
+                Some(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 0"])
+                        .status()
+                        .unwrap(),
+                )
+            },
+            DAEMON_READY_BUDGET,
+            |_| panic!("must not sleep when the daemon already answered"),
+        );
+        assert_eq!(outcome, DaemonReady::Ready);
+    }
+
     #[test]
     fn resume_hint_names_the_real_thread_id() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4724,7 +4890,7 @@ mod tests {
             format!(
                 // 键必须在注册表里：未注册的名字一律读成关（只有注册表里的
                 // 才能开），用一个自造的键会让这条测试永远等不到子进程。
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"example_plugin_switch","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
                 child.display()
             ),
         )
@@ -4734,7 +4900,7 @@ mod tests {
         let flags = workdir.join("flags.json");
         std::fs::write(
             &flags,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
 
@@ -6307,8 +6473,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
-        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
-        yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
+        yi_agent_store::resident::require(dir.path(), &a, "example-plugin").unwrap();
+        yi_agent_store::resident::require(dir.path(), &b, "example-plugin").unwrap();
 
         let mut seen: Vec<PathBuf> = Vec::new();
         let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects: &[PathBuf]| {

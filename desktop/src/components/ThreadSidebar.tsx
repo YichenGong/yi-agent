@@ -10,7 +10,6 @@ import type {
 import { layoutWorkspace } from "../lib/sessionGroups";
 
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
-import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
 import { countRunningSessions, runningSessionsLabel } from "../lib/runningSessions";
 import { supportsWaapi } from "../lib/spinPhase";
@@ -164,19 +163,12 @@ export function ThreadSidebar({
   onNew,
   onRemoveWorkspace,
   onBrowse,
-  boards,
-  boardSummaries,
-  selectedBoard,
-  onCreateBoard,
-  onRemoveBoard,
-  onOpenBoard,
   onOpenSettings,
   onLinkFolder,
   onUnlinkFolder,
   isMobile = false,
   statusStale = false,
   leadAgentEnabled = true,
-  kanbanEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -220,15 +212,6 @@ export function ThreadSidebar({
   onRemoveWorkspace: (cwd: string) => void;
   /** Open the native folder picker (App adds the dir + creates a thread). */
   onBrowse: () => void;
-  /** 登记了看板的项目路径；决定哪些分组画看板条目、菜单给创建还是移除。 */
-  boards: string[];
-  /** 项目路径 → 卡片摘要（如 "2 排队 · 1 运行中"）。 */
-  boardSummaries: Record<string, string>;
-  /** 当前在主区域展示看板的项目（点会话会离开看板）。 */
-  selectedBoard: string | null;
-  onCreateBoard: (path: string) => void;
-  onRemoveBoard: (path: string) => void;
-  onOpenBoard: (path: string) => void;
   onOpenSettings: () => void;
   /** 把某个主根与用户选中的目录关联（由 App 弹原生目录选择器）。 */
   onLinkFolder: (primary: string) => void;
@@ -246,16 +229,6 @@ export function ThreadSidebar({
    * 所有既有侧栏渲染突然少一行组长。生产路径由 `App` 显式传入真实开关值。
    */
   leadAgentEnabled?: boolean;
-  /**
-   * 整个 Superpowers 看板是否开启（`flags/list` 里的 `superpowers_kanban`）。
-   *
-   * 关掉时这里**什么都不画**：看板入口、菜单里的「创建/移除看板」，以及所有
-   * `driver_ref` 非空的卡片会话（含置顶区）——包括已经存在的。理由是这个开关
-   * 停掉的是整个 daemon，留着入口只会点出 `plugin_disabled`。
-   *
-   * 缺省 `true`，与 `leadAgentEnabled` 同一理由：既有用法与测试不传它。
-   */
-  kanbanEnabled?: boolean;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -1355,39 +1328,15 @@ export function ThreadSidebar({
     );
   };
 
-  const renderBoardEntry = (workspace: string) => {
-    const active = selectedBoard === workspace;
-    return (
-      <div
-        key={`board:${workspace}`}
-        aria-label="看板"
-        title={workspace}
-        onClick={(e) => {
-          if (e.detail > 1) return;
-          onOpenBoard(workspace);
-        }}
-        className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-sm ${
-          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
-        }`}
-      >
-        <span className="shrink-0">看板</span>
-        {/* 摘要是这一眼要看的全部：排队几件、在跑几件。 */}
-        {boardSummaries[workspace] ? (
-          <span className="truncate text-xs text-fg-subtle">{boardSummaries[workspace]}</span>
-        ) : null}
-      </div>
-    );
-  };
-
   /**
-   * 项目组内的「看板会话」小节：只收 `driver_ref` 非空的会话，默认折叠。
+   * 项目组内的「驱动会话」小节：只收 `driver_ref` 非空的会话，默认折叠。
    * 折叠状态独立于项目组（键 `board:${workspace}`），互不牵连。
    *
-   * 刻意不依赖看板是否仍登记：看板被移除后（spec §5），卡片会话仍须留在这个
-   * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
+   * 这是**通用**分组：`driver_ref` 表示"这条会话由某个插件驱动"，宿主并不知道
+   * 是哪个插件、也不该知道。以前这里按看板命名，是因为只有一个驱动；现在任何
+   * 插件都可以驱动会话，宿主只认得这个字段本身。
    */
-  const renderBoardThreads = (g: WorkspaceGroup) => {
-    if (!kanbanEnabled) return null;
+  const renderDriverThreads = (g: WorkspaceGroup) => {
     const cards = g.threads.filter((t) => !t.pinned && t.driver_ref && t.thread_id !== leadId);
     if (cards.length === 0) return null;
     // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
@@ -1397,14 +1346,14 @@ export function ThreadSidebar({
       <div key={`board-threads:${g.workspace}`}>
         <button
           type="button"
-          aria-label="看板会话"
+          aria-label="驱动会话"
           aria-expanded={!isBoardCollapsed}
           disabled={searching}
           onClick={() => toggleBoardCollapse(g.workspace)}
           className="flex w-full items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
         >
           <span className="shrink-0 px-0.5">{isBoardCollapsed ? "▸" : "▾"}</span>
-          <span className="min-w-0 flex-1 truncate text-left">看板会话 ({cards.length})</span>
+          <span className="min-w-0 flex-1 truncate text-left">驱动会话 ({cards.length})</span>
         </button>
         {!isBoardCollapsed && cards.map((t) => renderThread(t, { rowAttr: "group", indentLevel: 1 }))}
       </div>
@@ -1480,12 +1429,9 @@ export function ThreadSidebar({
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
   const filtered = filterThreadTree(groups, pinned, query, tagNames);
-  // 看板关着时，卡片会话（`driver_ref` 非空）在哪儿都不该出现——置顶区是一处
-  // 独立的分流，`filterThreadTree` 不会替我们滤掉它。组内那几处已有各自的
-  // `!row.thread.driver_ref` / `renderBoardThreads` 守卫。
-  const visiblePinned = kanbanEnabled
-    ? filtered.pinned
-    : filtered.pinned.filter((t) => !t.driver_ref);
+  // 置顶区是一条独立的分流，`filterThreadTree` 不会替我们滤掉驱动会话；
+  // 它们在这里照常可见，组内的分组由 `renderDriverThreads` 负责。
+  const visiblePinned = filtered.pinned;
   // 过滤之后再按 linked_to 归拢：搜索 / 置顶 / 看板会话三个既有分支都不受影响。
   // 搜索期间不复用归拢结果——`filterThreadTree` 只留下命中的组，附属根会临时回到
   // 顶层；渲染时用下面的 isLinkedChild 兜住"顶层但其实是附属根"这一情形。
@@ -1613,20 +1559,6 @@ export function ThreadSidebar({
                 New thread here
               </button>
             )}
-            {!isChild && kanbanEnabled && (
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  closeMenus();
-                  if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
-                  else onCreateBoard(g.workspace);
-                }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                {kanbanItemFor(g.workspace, boards) ? "移除看板" : "创建 Superpowers 看板"}
-              </button>
-            )}
             {isChild ? (
               <button
                 type="button"
@@ -1667,13 +1599,7 @@ export function ThreadSidebar({
             )}
           </div>
         </Popover>
-        {!isCollapsed &&
-          !isChild &&
-          !searching &&
-          kanbanEnabled &&
-          kanbanItemFor(g.workspace, boards) &&
-          renderBoardEntry(g.workspace)}
-        {!isCollapsed && renderBoardThreads(g)}
+        {!isCollapsed && renderDriverThreads(g)}
         {!isCollapsed &&
           layoutWorkspace(g)
             // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。

@@ -84,7 +84,14 @@ pub fn save(path: &Path, config: &RemoteConfig) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = path.with_extension("json.lock");
-    let lock = File::options().create(true).write(true).open(&lock_path)?;
+    // 锁文件只用来 `flock`，内容永远不读也不写；显式 `truncate(false)` 是为了
+    // 说明"不截断"是有意的：`create(true)` 配 `write(true)` 在 clippy 看来是
+    // 未定义意图，而截断一个正被别人持锁的锁文件没有任何好处。
+    let lock = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
     // 与 `device_store.rs` 同款：阻塞式独占锁，写完随 `lock` 析构释放。
     lock_exclusive(&lock)?;
 

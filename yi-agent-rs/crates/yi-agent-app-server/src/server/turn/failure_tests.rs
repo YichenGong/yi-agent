@@ -50,6 +50,7 @@ fn test_session(dir: &Path, thread_id: &str) -> (ThreadSession, mpsc::Receiver<T
             status: ThreadSession::new_status(),
             subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
             writer_lock: None,
+            turn_permit: None,
         },
         receiver,
     )

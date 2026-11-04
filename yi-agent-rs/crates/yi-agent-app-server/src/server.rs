@@ -316,6 +316,12 @@ pub(crate) struct RuntimeAttachments {
     /// `resident_dir` is: `skill/list` / `skill/read` must be testable without
     /// reading the developer's real `~/.yi-agent/skills`.
     pub(crate) skills_home: PathBuf,
+    /// 实例状态根（插件生命周期状态、授权表、安装登记所在处）。
+    ///
+    /// 可注入的理由同 `resident_dir`：驱动闸门要读它下面的授权表，测试必须能
+    /// 指到隔离目录，否则会读到开发者真实的 `~/.yi-agent`，而"读到别人机器上
+    /// 的授权"这种测试既不稳定也不安全。
+    pub(crate) instance_home: PathBuf,
     /// 实例状态根（`remote.json` / `remote-status.json` 所在目录）。可注入的
     /// 理由同 `resident_dir`：手机端项目清单必须能在测试里读隔离 tempdir。
     pub(crate) remote_dir: PathBuf,
@@ -345,6 +351,10 @@ pub(crate) struct RuntimeAttachments {
     /// 它是「往哪个 `Library/LaunchAgents` 写」与「读哪个 plist 判已装」的
     /// 唯一来源，抽出来测试才不会误判真实 home 里的安装状态。
     pub(crate) watchman_home: PathBuf,
+    /// 官方插件目录文件。**按连接注入**：同一进程里的两个 app-server（本地与
+    /// 远端，或多账号）必须能各自指向不同的官方源，而进程级
+    /// `YI_AGENT_PLUGIN_CATALOG` 只能有一个值。并行测试也靠它隔离。
+    pub(crate) plugin_catalog: PathBuf,
     /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。可注入的理由
     /// 见 [`ResolvePlugin`]：靠改 `PATH` 来测会在并行用例间互相污染。
     pub(crate) resolve_plugin: ResolvePlugin,

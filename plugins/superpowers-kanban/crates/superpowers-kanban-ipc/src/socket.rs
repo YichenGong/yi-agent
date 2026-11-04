@@ -114,10 +114,11 @@ mod tests {
     /// 与宿主 `yi-agent-store::ipc` 测试里同一个深路径，用来锁住两侧一致。
     const LONG_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
 
-    /// 宿主与插件共用的 socket 契约（同一份文件，两端各自 `include_str!`）。
+    /// 宿主与插件共用的 socket 契约（同一份文件，位于
+    /// `plugins/contracts/fixtures/`，两端各自读它）。
     ///
     /// 这是"两侧规则不得漂移"的唯一权威：谁改了规则却没同步这里，测试就红。
-    const CONTRACT: &str = include_str!("../contract/plugin-socket.json");
+    const CONTRACT: &str = include_str!("../../../../contracts/fixtures/plugin-socket.json");
 
     fn contract_str(key: &str) -> String {
         let needle = format!("\"{key}\": \"");

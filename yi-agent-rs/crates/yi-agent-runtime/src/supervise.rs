@@ -339,7 +339,7 @@ mod tests {
         std::fs::write(
             manifests.join("demo.json"),
             format!(
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"example_plugin_switch","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
                 child.display()
             ),
         )
@@ -347,7 +347,7 @@ mod tests {
         let flags = workdir.join("flags.json");
         std::fs::write(
             &flags,
-            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+            r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
         )
         .unwrap();
         (child, flags)

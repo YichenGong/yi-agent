@@ -66,8 +66,8 @@ pub fn load(workdir: &Path) -> RuntimePreference {
 /// within one filesystem is atomic — a crash cannot leave a half-written file.
 ///
 /// The write is a **read-modify-write**: `preferences.json` is shared with other
-/// writers (notably the Superpowers Kanban switch, which stores
-/// `superpowers_kanban`), so saving the runtime preference must preserve every
+/// writers (project preferences written by whatever plugin runs there, and the
+/// TUI's own keys), so saving the runtime preference must preserve every
 /// unrelated key instead of replacing the file with a single-key object.
 pub fn save(workdir: &Path, pref: RuntimePreference) -> std::io::Result<()> {
     let dir = workdir.join(".yi-agent");

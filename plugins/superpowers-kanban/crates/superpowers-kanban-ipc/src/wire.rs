@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// 宿主的 `wire` 形状（信封字段、命令/回复变体）在两版之间**没有变**，
 /// 变版本号只是为了拒绝旧 daemon 时给出清晰错误而非解析错误。
-/// 宿主侧有测试读这个文件比对版本，漂移会立刻炸。
+/// 版本号的单一对照物是 `plugins/contracts/fixtures/ipc-protocol.json`：
+/// 宿主与插件各自读同一份公共夹具，侧改一侧而没同步就会测试失败。
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -138,6 +139,22 @@ impl<'de> Deserialize<'de> for Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 与宿主共用的 IPC 协议版本契约（公共夹具，宿主 `yi-agent-store` 读同一份）。
+    const IPC_CONTRACT: &str = include_str!("../../../../contracts/fixtures/ipc-protocol.json");
+
+    #[test]
+    fn the_plugin_speaks_the_version_the_shared_contract_declares() {
+        let contract: serde_json::Value =
+            serde_json::from_str(IPC_CONTRACT).expect("契约必须是合法 JSON");
+        let declared = contract["protocolVersion"]
+            .as_u64()
+            .expect("契约必须声明 protocolVersion") as u32;
+        assert_eq!(
+            declared, PROTOCOL_VERSION,
+            "契约说 {declared}、插件说 {PROTOCOL_VERSION}：daemon 会拒绝插件的每一个请求"
+        );
+    }
 
     #[test]
     fn a_create_request_serializes_with_the_daemons_tag() {

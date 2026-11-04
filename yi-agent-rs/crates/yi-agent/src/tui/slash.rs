@@ -44,7 +44,6 @@ pub enum SlashCommand {
     Daemon,
     Mcp,
     Runtime,
-    Kanban,
     Plugins,
 }
 
@@ -77,7 +76,6 @@ impl SlashCommand {
             | Self::Compact
             | Self::Config
             | Self::Runtime
-            | Self::Kanban
             | Self::Plugins => {
                 return None;
             }
@@ -99,7 +97,6 @@ impl SlashCommand {
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
             SlashCommand::Runtime => "runtime",
-            SlashCommand::Kanban => "superpowers-kanban",
             SlashCommand::Plugins => "plugins",
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
@@ -120,7 +117,6 @@ impl SlashCommand {
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
-            SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
             SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
@@ -140,9 +136,6 @@ impl SlashCommand {
             // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some(
-                "[on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]",
-            ),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
@@ -184,7 +177,6 @@ impl SlashCommand {
             SlashCommand::Daemon,
             SlashCommand::Mcp,
             SlashCommand::Runtime,
-            SlashCommand::Kanban,
             SlashCommand::Plugins,
         ]
     }
@@ -223,10 +215,6 @@ impl SlashCommand {
     pub fn from_name(name: &str) -> Option<SlashCommand> {
         if name == "?" {
             return Some(Self::Help);
-        }
-        // `/kanban` 是过渡别名：老名字仍可解析，但规范名是 `/superpowers-kanban`。
-        if name == "kanban" {
-            return Some(Self::Kanban);
         }
         if name == "plugins" {
             return Some(Self::Plugins);
@@ -1158,30 +1146,6 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_kanban_name_still_resolves_to_the_command() {
-        assert_eq!(
-            SlashCommand::from_name("kanban"),
-            Some(SlashCommand::Kanban)
-        );
-        assert_eq!(
-            SlashCommand::from_name("superpowers-kanban"),
-            Some(SlashCommand::Kanban)
-        );
-    }
-
-    #[test]
-    fn kanban_is_a_known_slash_command_with_a_description() {
-        let command = SlashCommand::Kanban;
-        assert_eq!(command.name(), "superpowers-kanban");
-        assert!(
-            command.description().contains("Superpowers 看板"),
-            "{}",
-            command.description()
-        );
-        assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
-    }
-
-    #[test]
     fn plugins_is_a_known_command() {
         assert_eq!(
             SlashCommand::from_name("plugins"),
@@ -1235,7 +1199,6 @@ mod tests {
         assert_eq!(SlashCommand::Quit.unavailable_reason(), None);
         assert_eq!(SlashCommand::Cost.unavailable_reason(), None);
         assert_eq!(SlashCommand::Daemon.unavailable_reason(), None);
-        assert_eq!(SlashCommand::Kanban.unavailable_reason(), None);
     }
 
     #[test]
@@ -1354,9 +1317,8 @@ mod tests {
             }
         }
 
-        /// 别名也要收敛：`from_name("kanban")` 得到 `Kanban`，
-        /// 而 `Kanban.name()` 是 "superpowers-kanban"（`:89` 的 `name()` 实现）。
-        /// 这条保证「用户输入别名」与「用规范名再解析」指向同一命令。
+        /// 规范名必须收敛：任何能被解析出来的名字，用它的 `name()` 再解析
+        /// 必须回到同一个命令。这条保证补全、帮助与分发认的是同一份目录。
         #[test]
         fn prop_aliases_converge(name in "\\PC{0,60}") {
             let Some(first) = SlashCommand::from_name(&name) else { return Ok(()) };

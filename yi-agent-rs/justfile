@@ -218,7 +218,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -271,6 +271,54 @@ runtime-lifecycle-check:
     cargo test -p yi-agent-subagent --test bringup_policy
     cargo test -p yi-agent-tools --test managed_bash
 
+# 插件 workspace 的独立门禁：插件有自己的 Cargo workspace 与版本号，
+# 主程序 `just ci` 不编译它（否则改一次看板就要重编整个宿主）。
+#
+# 刻意**不**进 `ci`：这里需要 Node（UI）与插件自己的 target 目录，塞进主
+# Rust 门禁会让没有 Node 的环境（GitLab MR 的 `rust:latest`）整条挂掉。
+plugin-workspace-check:
+    cd ../plugins/superpowers-kanban && cargo fmt --all -- --check
+    cd ../plugins/superpowers-kanban && cargo test --workspace
+
+# 插件的 UI 门禁。与 `desktop-check` 同形：`npm ci` 严格按 lock，
+# `tsc --noEmit` 查类型，`vitest run` 跑一次就退（不进 watch）。
+plugin-ui-check:
+    cd ../plugins/superpowers-kanban/ui && npm ci
+    cd ../plugins/superpowers-kanban/ui && npx tsc --noEmit
+    cd ../plugins/superpowers-kanban/ui && npx vitest run
+
+# 公共契约（socket / driver / IPC）的唯一权威在 `plugins/contracts/`，
+# 宿主与插件两侧都读它。改动任何一侧都必须先改契约并让这里通过。
+plugin-contracts-check:
+    node ../scripts/plugins/check-contracts.mjs
+    node --test ../scripts/plugins/check-contracts.test.mjs
+
+# 宿主边界：主程序里不得出现看板专属路径。与上面三项合起来构成
+# 「插件可以独立发版」的静态证据。
+plugin-boundary-check:
+    python3 ../scripts/plugins/check-host-boundary.py
+    python3 -m unittest discover -s ../scripts/plugins -p 'test_check_host_boundary.py'
+
+# 验收报告校验器：A01–A20 必须各有且仅有一个最终结果，全部 pass，且证据形态
+# 合规（probe 构建不能冒充正式包；A16/A17 不能用 loopback 冒充远端）。
+plugin-acceptance-check:
+    node --test ../scripts/plugins/e2e-report.test.mjs
+    node --test ../scripts/plugins/fault-matrix.test.mjs
+
+# 真跑故障注入矩阵（T27 Step 2）。慢（要编译三个 crate），故不进 `ci`；
+# 想留证据时加 `just plugin-fault-matrix`，报告写到 .artifacts/。
+plugin-fault-matrix:
+    node ../scripts/plugins/fault-matrix.mjs --output ../.artifacts/plugins/fault-matrix.json
+
+# 同一 .app 上插件 v1→v2 的完整验收（T27 Step 4）：UI 变了、清单摘要与 skill
+# 来源对得上、主程序字节没变、卸载后用户数据还在。需要一个已构建的 .app：
+#   just plugin-update-check /Applications/yi-agent.app
+plugin-update-check app:
+    bash scripts/verify-plugin-update.sh "{{app}}" ..
+
+# 一次跑完插件的全部门禁（本地用；CI 拆成独立 job 以便并行与隔离权限）。
+plugin-check: plugin-workspace-check plugin-ui-check plugin-contracts-check plugin-boundary-check plugin-acceptance-check
+
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:
@@ -318,6 +366,12 @@ rebuild-install-check:
 # 只打包不跑测试，所以打在未合并功能分支上的 tag 会被直接发出去。
 tag-gate-check:
     bash scripts/test_check_tag_on_main.sh
+
+# 插件发布门禁自测：插件 tag 必须与主程序 tag 分开，且版本与插件 workspace/UI
+# 一致。插件独立发版的前提是"一次插件改动不推动主程序版本号"，而那条规则
+# 只能靠 tag 形状与两处版本号的一致性来守。
+plugin-release-check:
+    bash scripts/test_check_plugin_release.sh
 
 # 构建环境门禁自测：PATH 必须让 rustup 的 Rust 优先于 Homebrew 的 Rust，
 # 否则交叉编译会以 E0463 "can't find crate for core" 秒挂（实测 0.5~3 秒），

@@ -20,9 +20,12 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
     let state = crate::rpc::PluginChannelState {
         hub: std::sync::Arc::new(hub),
         client: local,
+        client_scope: crate::protocol::Scope::Admin,
         resident_dir: PathBuf::new(),
         theme_handle: crate::theme_tool::ThemeHandle::new(std::env::temp_dir()),
         watchman_home: PathBuf::new(),
+        plugin_catalog: PathBuf::new(),
+        plugin_home: PathBuf::new(),
         watchman_install: std::sync::Arc::new(|_exe: &Path, _home: &Path| -> Result<(), String> {
             Ok(())
         }),
@@ -112,6 +115,7 @@ async fn agent_factory_failure_returns_internal_error() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            instance_home: PathBuf::new(),
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
@@ -126,6 +130,7 @@ async fn agent_factory_failure_returns_internal_error() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            plugin_catalog: PathBuf::new(),
             // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
             // 二进制当 daemon、并白等 10s)。
             resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),

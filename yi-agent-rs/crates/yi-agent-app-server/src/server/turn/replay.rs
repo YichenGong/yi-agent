@@ -169,6 +169,7 @@ pub(crate) async fn interrupt_and_wait_for_persist(
                 && s.active_turn_id.as_deref() == Some(done_turn.as_str())
             {
                 s.active_turn_id = None;
+                s.turn_permit = None;
             }
             // 这枚完成事件不会回到主循环了,它的回填机会就在此处(见函数说明)。
             // 同样只认事件自己携带的身份:别的 thread 的那一轮与这里的等待方无关。

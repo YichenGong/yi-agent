@@ -110,6 +110,8 @@ where
         onboarding_preferences_path,
         resident_dir,
         skills_home,
+        instance_home,
+        plugin_catalog,
         remote_dir,
         theme,
         git_diff,
@@ -130,6 +132,9 @@ where
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
     } = attachments;
+    // 受管插件存储就是实例根：`plugins/v1/*` 的登记、授权、发布目录全在它下面。
+    // 与 `watchman_home`（真实 `$HOME`，只用于登录项）刻意分开。
+    let plugin_home = instance_home.clone();
     // 旁支注册表:一个进程一份。注入的那份(测试)已经带好替身 resolver;生产
     // 在这里自建,resolver 用「按 threadId 定位 store 后严格冷读」那条路径。
     let side_registry = match side_registry {
@@ -565,9 +570,12 @@ where
                         let state = std::sync::Arc::new(crate::rpc::PluginChannelState {
                             hub: std::sync::Arc::clone(&hub),
                             client: client.clone(),
+                            client_scope,
                             resident_dir: resident_dir.clone(),
                             theme_handle: theme_handle.clone(),
                             watchman_home: watchman_home.clone(),
+                            plugin_home: plugin_home.clone(),
+                            plugin_catalog: plugin_catalog.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
@@ -821,6 +829,7 @@ where
                     &lead_control,
                     &lead_control_replies,
                     lead_agent_enabled,
+                    &instance_home,
                 )
                 .await;
 
@@ -897,6 +906,11 @@ where
                         lead_control: &lead_control,
                         lead_control_replies: &lead_control_replies,
                         lead_target: Some(delivery.lead),
+                        // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                        session_binding: None,
+                        admission: None,
+                        instance_home: None,
+                        driver_gate: None,
                         #[cfg(test)]
                         before_prompt_send: None,
                     };
@@ -954,6 +968,11 @@ where
                     lead_control: &lead_control,
                     lead_control_replies: &lead_control_replies,
                     lead_target: Some(target),
+                    // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                    session_binding: None,
+                    admission: None,
+                    instance_home: None,
+                    driver_gate: None,
                     #[cfg(test)]
                     before_prompt_send: None,
                 };
@@ -1002,6 +1021,11 @@ where
                     lead_control_replies: &lead_control_replies,
                     // 写指令不投递给组长，故没有 lead target。
                     lead_target: None,
+                    // 组长路径（投递 / 写指令）：不绑插件、不设准入闸门、不落绑定。
+                    session_binding: None,
+                    admission: None,
+                    instance_home: None,
+                    driver_gate: None,
                     #[cfg(test)]
                     before_prompt_send: None,
                 };

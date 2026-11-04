@@ -1333,31 +1333,32 @@ mod tests {
         }
     }
 
+    /// 没有 session env 时，工具**不额外注入** `YI_AGENT_THREAD_ID`。
+    ///
+    /// 断言「变量为空」只在测试进程本身干净时成立，而这个测试经常被跑在
+    /// yi-agent 自己的会话里（工具调用会继承 `YI_AGENT_THREAD_ID`），子进程
+    /// 于是继承了父进程的值，测试就假失败。工具不 `env_clear` 是既定行为
+    /// （会话要继承 PATH/HOME 等），所以这里断言的是工具层的事实：
+    /// 注入集合为空 → 子进程看到的值等于父进程的值，绝不会是本测试编造的
+    /// 某个 session 值。
     #[tokio::test]
-    async fn bash_without_a_session_env_leaves_the_variable_unset() {
+    async fn bash_without_a_session_env_does_not_inject_one() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
+        // 断言的对象是「工具层没有额外注入」，不是「环境里没有这个变量」：子进程
+        // 继承父进程的环境，而真实宿主都会设它（app-server 为所服务的 thread
+        // 注入，agent 自己跑的测试也会继承）。所以把父进程的值取下来，再要求
+        // 子进程看到的**恰是这个值**——工具若多注入了一个，这里就会不同。
+        let inherited = std::env::var("YI_AGENT_THREAD_ID").unwrap_or_default();
         let result = tool
             .call(serde_json::json!({"command": "echo \"[$YI_AGENT_THREAD_ID]\""}))
             .await;
         assert!(!result.is_error);
-        // The variable is scrubbed from the *command*, not assumed absent from the
-        // environment. A shell child inherits the parent's environment, and every
-        // real host sets this one: the app-server injects `YI_AGENT_THREAD_ID` for
-        // the thread it is serving, and an agent-hosted test run inherits it too.
-        // Asserting on an unsanitised expansion made the test measure the caller's
-        // environment rather than "no session env means no injection", and it failed
-        // for exactly that reason under `just ci` while passing from a bare shell.
-        let result = tool
-            .call(serde_json::json!({
-                "command": "env -u YI_AGENT_THREAD_ID sh -c 'echo \"[$YI_AGENT_THREAD_ID]\"'"
-            }))
-            .await;
-        assert!(!result.is_error);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert!(
-                s.contains("[]"),
-                "no session env means an empty expansion: {s}"
+                s.contains(&format!("[{inherited}]")),
+                "no session env means the child sees exactly what it inherited \
+                 ({inherited:?}): {s}"
             );
         } else {
             panic!("expected text block");

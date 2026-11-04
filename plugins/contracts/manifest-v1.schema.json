@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/manifest-v1.schema.json",
+  "title": "Plugin release manifest v1",
+  "description": "Release manifest bound into the signed package. This is the authoritative static declaration of version, entries, capabilities and compatibility (design §3.3). Installing must never execute plugin code to learn these facts. Each supported platform ships a complete package, so `target` is singular: the same version on two targets is two different releases with two signatures. Layers are closed (`additionalProperties: false`) because a required field the host does not understand means the plugin is newer than the host; guessing a default would silently demote a required field to optional.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageFormat",
+    "plugin",
+    "version",
+    "target",
+    "views",
+    "program",
+    "skills",
+    "methods",
+    "cli",
+    "capabilities",
+    "dependencies",
+    "data",
+    "compatibility"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "description": "Contract version of this document. Compared exactly, not by range."
+    },
+    "packageFormat": {
+      "const": 1,
+      "description": "Package layout version. Separate from schemaVersion so the archive format can evolve without rewriting the declaration contract."
+    },
+    "plugin": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "description": "Stable plugin id. Lowercase ASCII, digits and hyphens: used as a directory name and a data key, so it must not need escaping. Two plugins cannot share an id (design §5 rejects duplicate ids)."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+      "description": "Semver core only. Pre-release metadata is refused in v1: the host treats a version as an immutable identity and cannot order arbitrary pre-release strings."
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^(darwin|linux|win32)-(aarch64|x86_64)$"
+    },
+    "views": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Main view and settings entries (design §5). Navigation and settings are declared here so adding a plugin never requires a plugin-name-to-component map in the host (design §3.1).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "entry", "digest"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,31}$",
+            "description": "View identifier, unique inside the manifest."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["main", "settings"],
+            "description": "`main` is the primary workspace; `settings` is a settings entry. Exactly one `main` view is required, any number of `settings` views is allowed."
+          },
+          "entry": { "$ref": "#/$defs/packagePath" },
+          "digest": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "program": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["entry", "digest"],
+      "description": "Native program entry for this target, or null for a view-only plugin. The host sets the executable bit only on this declared entry; every other extracted file stays read-only (design §5).",
+      "properties": {
+        "entry": { "$ref": "#/$defs/packagePath" },
+        "digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "description": "Skill directories shipped inside the package. Never copied into a user-global directory (design §7.2); discovery is bound to the verified release.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "path"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          },
+          "path": { "$ref": "#/$defs/packagePath" }
+        }
+      }
+    },
+    "methods": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Business methods the plugin backend exposes. The host does not interpret card semantics; it only enforces the declared effect. `Maintenance` is absent from the effect enum on purpose: it is issued only by a lifecycle transaction.",
+      "items": { "$ref": "#/$defs/methodDeclaration" }
+    },
+    "cli": {
+      "type": "array",
+      "description": "CLI verbs the plugin accepts. Verbs that mutate state must not be declared Read.",
+      "items": { "$ref": "#/$defs/cliDeclaration" }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "optional"],
+      "description": "Capabilities the plugin asks the user to grant at enable time (design §6: read business data, modify business data, launch automatic tasks, modify machine-wide quota, background residency). This is a request, not a grant; the binding comes from the host registry. Required and optional are separate because a missing optional capability degrades features, while a missing required one blocks the project.",
+      "properties": {
+        "required": { "$ref": "#/$defs/effectSet" },
+        "optional": { "$ref": "#/$defs/effectSet" }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflows"],
+      "description": "Required host workflow capabilities (design §7.2: the manifest lists required skills/host workflow capabilities and their supported range). A missing or incompatible dependency allows install and data viewing but blocks automatic tasks.",
+      "properties": {
+        "workflows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+              "range": {
+                "type": "string",
+                "pattern": "^[><=^~0-9. ,|-]+$",
+                "description": "Optional version range. Absent means `any`; a plain file dependency must be expressed by capability or command contract instead of a fabricated version."
+              }
+            }
+          }
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "migrations"],
+      "description": "Data read/write format version and migration entries (design §5). Migration is an explicit managed operation of a verified release, never an install hook (design §9).",
+      "properties": {
+        "format": { "type": "integer", "minimum": 1 },
+        "migrations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["from", "to", "entry"],
+            "properties": {
+              "from": { "type": "integer", "minimum": 1 },
+              "to": { "type": "integer", "minimum": 1 },
+              "entry": { "$ref": "#/$defs/packagePath" }
+            }
+          }
+        },
+        "legacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "How to recognise this plugin's pre-managed install (design §8.1). Declared here so the host's probe stays generic: adding a plugin must not require teaching the host that plugin's old file names. Absent means the plugin has no legacy layout to look for.",
+          "properties": {
+            "binaries": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+              "description": "Legacy executable names to look for on PATH. The host records where they are and never runs them to identify themselves."
+            },
+            "supervisor": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.json$",
+              "description": "Legacy supervisor manifest file name under <project>/.yi-agent/supervisors/."
+            },
+            "stateDirs": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^\\.?[A-Za-z0-9._/-]+$" },
+              "description": "Legacy state directories relative to the project root. One holding board.json is adoptable."
+            },
+            "preferences": {
+              "type": "string",
+              "pattern": "^\\.?[A-Za-z0-9._/-]+$",
+              "description": "Legacy project preferences file relative to the project root."
+            },
+            "switchKey": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_]+$",
+              "description": "Key in that preferences file that used to switch the plugin on. Reported as a clue, never as a grant."
+            },
+            "skill": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "description": "Skill directory name to look for under the known skill roots."
+            }
+          }
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostApi", "uiApi"],
+      "description": "Two independent ranges. Remote host compatibility does not imply local desktop compatibility, so both are checked separately (design §5).",
+      "properties": {
+        "hostApi": {
+          "type": "string",
+          "pattern": "^v[0-9]+$",
+          "description": "Execution host API major version this manifest is written against."
+        },
+        "uiApi": {
+          "type": "string",
+          "pattern": "^v[0-9]+$",
+          "description": "Desktop UI API major version this manifest is written against. Checked by the desktop, not by the execution host."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "packagePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[^\\\\\\u0000]+$",
+      "description": "Relative path inside the package. Rejects absolute paths, any `..` segment and backslashes so the value is safe as a path component on every supported target (design §5: entries must not escape the package root)."
+    },
+    "effect": {
+      "type": "string",
+      "enum": ["Read", "Write", "Launch", "QuotaWrite", "Resident"],
+      "description": "Maintenance is deliberately absent: it is issued only by a lifecycle transaction and must never be something a plugin can declare or request."
+    },
+    "effectSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "methodDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "effect"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*(/[a-z][a-zA-Z0-9]*)+$",
+          "description": "`namespace/verb`. The namespace is part of the declared name so two plugins cannot collide on a bare verb, and so the host never has to guess an effect from a name it does not know."
+        },
+        "effect": { "$ref": "#/$defs/effect" }
+      }
+    },
+    "cliDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verb", "effect"],
+      "properties": {
+        "verb": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(:[a-z][a-z0-9-]*)*$"
+        },
+        "effect": { "$ref": "#/$defs/effect" }
+      }
+    }
+  }
+}

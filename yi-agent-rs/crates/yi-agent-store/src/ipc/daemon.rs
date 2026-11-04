@@ -976,6 +976,68 @@ impl RequestContext {
     }
 }
 
+/// 维护屏障查询。
+///
+/// # 三条判定，顺序不能换
+///
+/// 1. **协议兼容**先判：对端太旧时它根本不会理解"closed"这个回答，而它
+///    自己的启动路径也不会来问。此时唯一安全的答复是明确拒绝，并告诉用户
+///    该升级哪一侧。把它读成"没有维护"会让旧 daemon 在迁移期间照常拉起
+///    后端——那正是这条协议要防的事。
+/// 2. 插件 id 必须可解析。解析失败不是"没有这个插件"，而是"我看不懂这条
+///    请求"，同样不能当成放行。
+/// 3. 最后才读磁盘。**每次都读**：内存里的结论在通知丢失、或事务由别的
+///    进程推进时，会与事实相反。
+fn plugin_maintenance(plugin: String, protocol: Option<u32>) -> Result<IpcResponse, IpcError> {
+    use crate::ipc::managed::{Compatibility, MaintenanceBarrier, MaintenanceState};
+
+    // 直接回 `IpcResponse::Error` 而不是 `Err(IpcError::...)`：`error_response`
+    // 刻意把 Io 类错误的 message 抹成 `None`，而这里必须把"升级哪一侧"
+    // 送到用户眼前——只说"validation failed"等于什么都没说。这与
+    // `CancelTask` 的处理方式一致：可预期的对端错误带上消息直接回。
+    let compatibility = Compatibility::check(protocol);
+    if !compatibility.is_supported() {
+        return Ok(IpcResponse::Error {
+            code: IpcErrorCode::Validation,
+            message: Some(format!(
+                "maintenance protocol {} is not supported by this daemon: {}",
+                protocol.unwrap_or(0),
+                compatibility.advice()
+            )),
+        });
+    }
+
+    let plugin = match crate::ipc::managed::parse_plugin(&plugin) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            return Ok(IpcResponse::Error {
+                code: IpcErrorCode::Validation,
+                message: Some(error.to_string()),
+            });
+        }
+    };
+
+    // 实例根可能不存在（测试、或宿主还没初始化）。没有实例根就**没有**
+    // 任何事务日志，因此结论是 `open`——但这是"确实没有记录"，
+    // 不是"读失败"，两者在 `MaintenanceState` 里必须分开。
+    let Some(home) = crate::paths::instance_home() else {
+        return Ok(IpcResponse::PluginMaintenanceStatus {
+            state: MaintenanceState::Open.as_str().to_string(),
+            transaction_id: None,
+            phase: None,
+            detail: Some("no instance home is configured; no transaction can be recorded".into()),
+        });
+    };
+
+    let status = MaintenanceBarrier::at(home).state(&plugin);
+    Ok(IpcResponse::PluginMaintenanceStatus {
+        state: status.state.as_str().to_string(),
+        transaction_id: status.transaction_id,
+        phase: status.phase,
+        detail: status.detail,
+    })
+}
+
 pub(crate) fn respond(
     context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
@@ -1098,6 +1160,7 @@ pub(crate) fn respond(
             method,
             params,
         } => forward_plugin_query(&context.scope, &plugin, &method, params),
+        IpcRequest::PluginMaintenance { plugin, protocol } => plugin_maintenance(plugin, protocol),
         IpcRequest::DeleteSchedule { schedule_id } => {
             if !context.with_repository(|repository| {
                 repository

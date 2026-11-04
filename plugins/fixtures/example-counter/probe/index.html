@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>plugin probe</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #171717;
+        --fg: #ededed;
+        --muted: #a1a1aa;
+        --accent: #60a5fa;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+      }
+      #probe-status {
+        font-weight: 600;
+        margin-bottom: 12px;
+      }
+      #probe-log {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: pre-wrap;
+        max-height: 50vh;
+        overflow: auto;
+      }
+      #probe-input {
+        margin-top: 12px;
+        width: 100%;
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid #3f3f46;
+        background: #0a0a0a;
+        color: var(--fg);
+      }
+      .probe-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 8px;
+      }
+      button {
+        border: 1px solid #3f3f46;
+        background: #27272a;
+        color: var(--fg);
+        border-radius: 6px;
+        padding: 6px 12px;
+      }
+      button:focus-visible {
+        outline: 2px solid var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="probe-status">running isolation probe…</div>
+    <div id="probe-log"></div>
+    <input id="probe-input" type="text" placeholder="IME / keyboard probe" autocomplete="off" />
+    <div class="probe-row">
+      <button id="probe-scroll" type="button">scroll</button>
+      <button id="probe-focus" type="button">focus</button>
+    </div>
+    <script src="attacks.js"></script>
+  </body>
+</html>

@@ -588,6 +588,7 @@ async fn eof_exits_gracefully() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            instance_home: PathBuf::new(),
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
@@ -602,6 +603,7 @@ async fn eof_exits_gracefully() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            plugin_catalog: PathBuf::new(),
             // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
             // 二进制当 daemon、并白等 10s)。
             resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
@@ -680,6 +682,7 @@ async fn oversized_frame_returns_err() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
+            instance_home: PathBuf::new(),
             remote_dir: PathBuf::new(),
             // 旁支宿主资源必须落在隔离目录:空 remote_dir + None 会让 serve()
             // 把 side-conversations/ 建到当前工作目录(源码树)。
@@ -694,6 +697,7 @@ async fn oversized_frame_returns_err() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            plugin_catalog: PathBuf::new(),
             // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
             // 二进制当 daemon、并白等 10s)。
             resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
@@ -2962,6 +2966,7 @@ async fn writer_lock_refuses_a_second_writer_on_the_same_thread() {
     let tid = "thread-lock-conflict".to_string();
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: tid.clone(),
             cwd: cfg.workdir.display().to_string(),
             model: "claude-sonnet-4-5".to_string(),

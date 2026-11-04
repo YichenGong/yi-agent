@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type ComponentType } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listPlugins, type PluginRpc, type PluginSummary } from "../lib/pluginSettings";
-import { SuperpowersKanbanPluginSettings } from "./SuperpowersKanbanPluginSettings";
+import { PluginCatalog } from "./PluginCatalog";
 
 /**
  * 宿主注入的插件 RPC 接缝。
@@ -11,16 +11,14 @@ import { SuperpowersKanbanPluginSettings } from "./SuperpowersKanbanPluginSettin
  */
 export type PluginsCall = (method: string, params: unknown) => Promise<unknown>;
 
-/** 插件面板接缝：`project` 是这些设置所属的项目（清单与 socket 都在它下面）。 */
-type PanelProps = { rpc: PluginRpc; project?: string };
-
 /**
- * 插件名 → 设置面板。未注册的插件仍列出来，只是没有面板——不静默消失。
- * 加一个插件 = 往这里加一行。
+ * 主程序**不**知道任何插件名对应的设置组件。
+ *
+ * 这里曾经有一张 `插件名 → 组件` 的表，加一个插件就得改一次主程序；而且它只能
+ * 覆盖主程序自己打包进来的组件，装上去的插件永远走不到。现在每个插件的设置页
+ * 由插件自己声明、由 `PluginCatalog` 经受管视图打开，主程序只提供"打开它"这个
+ * 通用动作。
  */
-const REGISTRY: Record<string, ComponentType<PanelProps>> = {
-  "superpowers-kanban": SuperpowersKanbanPluginSettings,
-};
 
 /**
  * 「插件」Tab。
@@ -34,12 +32,23 @@ export function SettingsPluginsTab({
   call,
   projects,
   defaultProject,
+  projectHandle,
 }: {
   call?: PluginsCall;
   /** 可选项目（绝对路径）。空表时面板回落宿主 workdir，行为与旧版一致。 */
   projects: string[];
   /** 首选项目（当前对话的工作目录）。不在 `projects` 里时回落到第一个项目。 */
   defaultProject?: string;
+  /**
+   * 当前项目的受管键。
+   *
+   * 与上面的**路径**是两个协议：旧 supervisor 协议按路径装清单，受管协议按
+   * `ProjectId` 索引授权，而 `ProjectId` 由 `ProjectResolver::register` 取
+   * **规范化后的绝对路径**（`yi-agent-plugins/src/project.rs`），不是 spec
+   * 早期草案里的 `ph1_...`。两者在这里的取值恰好相同，但语义仍是"受管键"而
+   * 非"旧协议路径"，缺省时不显示受管分区，而不是拿一个猜出来的键去冒充。
+   */
+  projectHandle?: string;
 }) {
   const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +108,17 @@ export function SettingsPluginsTab({
 
   return (
     <div>
+      {/*
+        受管插件分区：由管理 API（`plugins/v1/*`）驱动，与下面那组旧的
+        supervisor 插件互不替代。把它放在最前，是因为"装了什么、授权给谁、
+        能不能跑"是用户先要回答的问题；旧面板是具体插件的业务配置。
+      */}
+      {projectHandle && (
+        <section className="border-b border-line">
+          <h2 className="px-4 pt-4 text-sm font-medium text-fg">受管插件</h2>
+          <PluginCatalog call={rpc} project={projectHandle} />
+        </section>
+      )}
       {options.length > 0 && (
         <label className="flex items-center gap-3 border-b border-line p-4 text-sm">
           <span>项目</span>
@@ -122,28 +142,23 @@ export function SettingsPluginsTab({
         <p className="p-4 text-sm text-fg-muted">未安装任何插件</p>
       ) : (
         <div className="divide-y divide-line">
-          {plugins.map((plugin) => {
-            const Panel = REGISTRY[plugin.name];
-            return (
-              <section key={plugin.name} className="p-4">
-                <h2 className="text-sm font-medium text-fg">
-                  {plugin.name}
-                  {plugin.enabled ? null : (
-                    // 仍列出来：用户要能看见它、去「实验功能」把它打开。这里只标状态，
-                    // 不藏面板——藏了就等于让人没法从这一页判断它为什么没在跑。
-                    <span className="ml-2 text-xs font-normal text-fg-subtle">
-                      （已停用：在「实验功能」里打开）
-                    </span>
-                  )}
-                </h2>
-                {Panel ? (
-                  <Panel rpc={rpc as PluginRpc} project={selected || undefined} />
-                ) : (
-                  <p className="mt-2 text-xs text-fg-subtle">该插件暂无可配置项</p>
+          {plugins.map((plugin) => (
+            <section key={plugin.name} className="p-4">
+              <h2 className="text-sm font-medium text-fg">
+                {plugin.name}
+                {plugin.enabled ? null : (
+                  // 仍列出来：用户要能看见它、去「实验功能」把它打开。这里只标状态，
+                  // 不藏面板——藏了就等于让人没法从这一页判断它为什么没在跑。
+                  <span className="ml-2 text-xs font-normal text-fg-subtle">
+                    （已停用：在「实验功能」里打开）
+                  </span>
                 )}
-              </section>
-            );
-          })}
+              </h2>
+              <p className="mt-2 text-xs text-fg-subtle">
+                该插件的设置由它自己提供，见上方「受管插件」里的设置入口。
+              </p>
+            </section>
+          ))}
         </div>
       )}
     </div>

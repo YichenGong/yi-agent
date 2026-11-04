@@ -56,6 +56,7 @@ fn only_the_lead_sees_the_memory_tools() {
     let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "thread-plain".to_string(),
             cwd: cfg.workdir.to_string_lossy().to_string(),
             model: "test-model".to_string(),
@@ -188,6 +189,7 @@ fn only_the_lead_sees_the_view_tools() {
     let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
     store
         .create(&crate::thread_store::ThreadMeta {
+            plugin_bindings: Vec::new(),
             thread_id: "thread-plain".to_string(),
             cwd: cfg.workdir.to_string_lossy().to_string(),
             model: "test-model".to_string(),
@@ -1193,6 +1195,7 @@ async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
         let store = crate::thread_store::ThreadStore::new(dir.path());
         store
             .create(&crate::thread_store::ThreadMeta {
+                plugin_bindings: Vec::new(),
                 thread_id: tid.into(),
                 cwd: dir.path().to_string_lossy().into(),
                 model: "m".into(),
@@ -1665,6 +1668,7 @@ fn the_lead_does_not_get_ask_lead() {
 
     // 负臂:落过盘的普通会话照旧有 `ask_lead`——排除的是组长,不是功能。
     let plain = crate::thread_store::ThreadMeta {
+        plugin_bindings: Vec::new(),
         thread_id: "thread-plain".to_string(),
         cwd: project_root.display().to_string(),
         model: String::new(),

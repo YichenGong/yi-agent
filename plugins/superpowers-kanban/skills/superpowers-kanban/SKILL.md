@@ -37,6 +37,45 @@ description: "Use when the user works with the Superpowers kanban board instead 
 spec——先 `add-prequeued` 记一张预排队卡持续追踪，等文件齐了再 `promote` 提升。
 用户说"这个还没做设计、但先记着"时，就是这条路径。
 
+## 命令怎么被调起来：受管入口优先
+
+**卡片会话里不要自己拼 `superpowers-kanban` 的绝对路径。** 宿主会给会话注入一个
+受管入口：它按绑定的项目、版本代次和原样参数数组启动插件，不依赖用户 `PATH`，也不
+修改全机 `PATH`。你只管照本文件的动词调用；定位二进制是宿主的事。
+
+受管入口会同时注入三个环境变量，它们决定"我在哪个项目的看板上说话"：
+
+| 变量 | 含义 | 你要知道的 |
+|---|---|---|
+| `YI_AGENT_HOME` | 实例根 | 只读。宿主的东西，别覆盖 |
+| `YI_AGENT_PLUGIN_INSTANCE` | 宿主实例 id | 只读。多实例机器上靠它区分 |
+| `YI_AGENT_PLUGIN_BINDING` | `项目:grant:activation:effect` | **项目归属的唯一来源** |
+
+**项目归属取绑定，不取 cwd。** 卡片会话的 cwd 是实现用的 `.worktrees/<卡号>`，它
+不是项目——拿它当项目会在一个不存在的看板上工作，而且不会有任何报错。这就是
+§0 里"最容易错的一步"的根因：以前靠 `cd` 和 `--state-dir` 手工绕，现在有绑定时
+插件自己就落对了。
+
+三种情况要分清：
+
+- **受管且绑定完整**：不用给 `--state-dir`，插件按绑定项目定位看板。
+- **受管但绑定残缺**（宿主启动脚本改了、插件没跟上）：插件**拒绝启动**并指出缺哪
+  一项。这是故意的——猜一个项目会让写入落到错的地方。此时不要自己补环境变量，
+  把错误原样报给用户。
+- **standalone**（你手敲命令、三个变量都没有）：按 `--state-dir` 或 cwd 工作，与
+  以前一致。standalone 不是"已获授权"的证明，别用它绕过受管入口。
+
+## 上游依赖没装齐时
+
+看板是下游，依赖上游工作流。发布清单声明的必需 skill 缺失或同名冲突时：
+
+- 插件**不启动新的自动任务**（不会认领新卡），并在 `list` 里给出原因；
+- **查看、状态收尾、合并、归档照常可用**——卡不会因此卡死；
+- 同名冲突只报告不覆盖用户文件：**不要**替用户删或改他的 skill。
+
+遇到这种状态，如实告诉用户缺哪个、冲突路径在哪，装好并让用户重新确认后再推进。
+不要试图用改配置或改环境变量的方式"绕过"依赖检查。
+
 ## 命令全景（唯一动作面）
 
 `superpowers-kanban <verb>`；下表的动词就是全部能力，没有表外的隐藏命令。
@@ -76,12 +115,18 @@ spec——先 `add-prequeued` 记一张预排队卡持续追踪，等文件齐�
 
 ### 0. 先确认状态目录（最容易错的一步）
 
-不带 `--state-dir` 时，状态目录取**当前工作目录**下的 `.yi-agent/superpowers-kanban`。
+状态目录是 `<项目根>/.yi-agent/superpowers-kanban`。**项目根从哪来，看模式**：
 
-- 在项目根执行：默认就落在 `<项目根>/.yi-agent/superpowers-kanban`，无需参数。
-- **卡片会话的 cwd 是实现用的 worktree，不是项目根。** 在卡片会话里裸跑 `add`/`list`
-  会指向 worktree 下那个空目录（表现为"卡不见了"）。此时要么先 `cd` 回项目根，要么显式给
-  `--state-dir <项目根>/.yi-agent/superpowers-kanban`。
+- **有绑定**（受管入口注入的 `YI_AGENT_PLUGIN_BINDING`）：项目 = 绑定里的项目，不用
+  给 `--state-dir`。卡片会话的 cwd 是 worktree，**不是**项目根，这正是这一节过去
+  最容易错的地方；有绑定时插件自己就落对了。
+- **无绑定**（standalone）：项目 = 当前工作目录，所以在项目根执行就落在
+  `<项目根>/.yi-agent/superpowers-kanban`。
+- 两者都可以用 `--state-dir` 显式覆盖（跨项目、或用户给了别处）。
+
+判断自己属于哪种：`superpowers-kanban workdir` 会打印当前状态目录对应的项目根。
+若它打出的路径长在 `.worktrees/` 下，说明你在没有绑定的 shell 里裸跑了命令——
+先 `cd` 回项目根，别在那儿继续写。
 
 不确定某个状态目录对应哪个项目时：
 
@@ -247,6 +292,11 @@ superpowers-kanban state --self <state> [--detail "<原因>"]
 - 终态（`done` / `failed` / `cancelled`）不可复活。要重做，让用户新建一张卡。
 - `--self` 依赖 `SUPERPOWERS_KANBAN_CARD`：插件给卡片会话的 shell 注入。缺失就说明
   当前不在卡片会话里，别硬猜 id。
+- **写操作自带幂等键。** 受管入口转发的写请求带一个 `request_id`；同一次业务调用
+  重复投递只落一次账。报"结果未知"（超时、连接中断）时**不要盲目重发**：先用同样的
+  `request_id` 查一次结果（`board/operation`），拿到 `committed` 就是已经落盘了。
+  插件不替你承诺任意外部 `git` 操作的 exactly-once——合并、push 这类动作失败后要
+  自己看清仓库现状再决定，别假设"没写进去"。
 
 ### 3. 确认状态
 
@@ -348,6 +398,9 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 | `denied: …` | 名额准入拒绝 | 原样转述原因，不要绕过 |
 | `illegal transition: <A> -> <B>` | `archive`/`purge` 的前提不满足 | 按 §4 的顺序处理（先归档再 purge） |
 | `list` 长时间只有 `pending` | 插件进程没跑，或开关是关的 | 先用 `on` 打开开关；仍不动则查插件是否在运行 |
+| `YI_AGENT_PLUGIN_BINDING is not set` / `malformed` | 受管上下文残缺 | 原样报给用户；不要自己补环境变量猜项目 |
+| `launch_blocked` 非空 / `dependencies` 里有缺项 | 上游 skill 缺失或同名冲突 | 报出缺什么、冲突路径；装齐后让用户确认再推进 |
+| `status: unknown` | 写入结果未知（进程中断等） | 用同一 `request_id` 查一次；不要直接重发 |
 
 ### 观测角标的升级矩阵
 

@@ -135,6 +135,28 @@ pub(crate) struct ServeLauncher<'a, F> {
     /// 组长开关的生效值。交给 `start_thread_core`，使被驱动的会话与手工会话
     /// 用同一个判定。
     pub(crate) lead_agent_enabled: bool,
+    /// 驱动动作的准入闸门。`None` = 不设闸（RPC 路径用不着它：`turn/start` 的
+    /// 权限由 RPC scope 管，与插件无关）。
+    ///
+    /// # 为什么闸门在 launcher 里而不是在 driver_step 里
+    ///
+    /// `driver_step` 是纯协议逻辑（问插件、解析动作），它不该认识"谁能起会话"。
+    /// 但**执行**动作的是 launcher，所以判定必须紧贴执行点：解析成功但没权限时，
+    /// 既不能执行，也不能把失败记成"插件给了坏动作"——那会把一次权限拒绝伪装成
+    /// 插件 bug。放在这里，"拒绝"发生在任何会话被创建之前，且原因能原样上送。
+    pub(crate) driver_gate: Option<&'a (dyn crate::session_driver::DriverGate + 'a)>,
+    /// 本 launcher 起出的插件会话一律绑这条发布（`launch_inner` 算好后设上）。
+    ///
+    /// 用 owned 值而不是每次从 meta 读：`launch_inner` 刚算过一次，重读只会
+    /// 多一次磁盘往返，还会在"刚写 meta 但读回来的两份不一致"时给出两种答案。
+    pub(crate) session_binding: Option<yi_agent_plugins::Binding>,
+    /// 插件准入。驱动会话的每一轮都要在这里占一个 permit（排空要等它）。
+    pub(crate) admission: Option<&'a yi_agent_plugins::Admission>,
+    /// 宿主实例根。驱动会话要在这里解析「该绑哪个已提交发布」并写进 meta。
+    ///
+    /// 与 `driver_gate` 同一条注入链、同一个理由：读它下面的授权表/生命周期，
+    /// 测试必须能指到隔离目录。`None` = 不写绑定（RPC 路径、组长投递）。
+    pub(crate) instance_home: Option<&'a Path>,
     /// 测试专用：在**真实** prepare 完成之后、**真实** send 之前插入一次实例级
     /// 回调。回调只替换本次 `prepared` 的发送端为「接收端已关闭」的真实 mpsc，
     /// 让 `send` 自己失败——不模拟 `send` 的结果，也不替换 prepare / launcher
@@ -158,7 +180,7 @@ where
         crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent>,
 {
-    async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
+    async fn launch(&mut self, plugin: &str, action: &DriverAction) -> anyhow::Result<String> {
         match &action.kind {
             DriverActionKind::Launch {
                 workdir,
@@ -167,24 +189,34 @@ where
                 driver_project,
                 driver_ref,
                 env,
-            } => self
-                // 归属由插件在动作里给出（`driver_project` 项目根 / `driver_ref` 驱动
-                // 方句柄），宿主原样落进 meta。缺字段（旧插件）时为 `None`，退化成
-                // 「未分组」，与改动前一致——绝不让缺字段把整条动作判废。
-                .launch_inner(
-                    workdir,
-                    title,
-                    objective,
-                    driver_project.as_deref(),
-                    driver_ref.as_deref(),
-                    env.clone(),
-                )
-                .await
-                .inspect_err(|error| {
-                    // 插件只把失败记成 `{ok:false, error}`,自己不留日志;不在这里说清
-                    // 原因,「这个会话为什么没起来」就没有任何线索。
-                    eprintln!("[app-server] could not launch a session in {workdir}: {error}");
-                }),
+            } => {
+                // 起会话之前先过闸。顺序是"先判权限，再解析归属/建会话"：
+                // 反过来的话，一次被拒绝的启动已经动了 `threads` 并落了盘，
+                // "拒绝"就只是给用户看的字。
+                if let Some(gate) = self.driver_gate {
+                    gate.may_launch(Path::new(workdir), plugin)
+                        .map_err(|reason| anyhow::anyhow!(reason))?;
+                }
+                self
+                    // 归属由插件在动作里给出（`driver_project` 项目根 / `driver_ref` 驱动
+                    // 方句柄），宿主原样落进 meta。缺字段（旧插件）时为 `None`，退化成
+                    // 「未分组」，与改动前一致——绝不让缺字段把整条动作判废。
+                    .launch_inner(LaunchRequest {
+                        plugin,
+                        workdir,
+                        title,
+                        objective,
+                        driver_project: driver_project.as_deref(),
+                        driver_ref: driver_ref.as_deref(),
+                        env: env.clone(),
+                    })
+                    .await
+                    .inspect_err(|error| {
+                        // 插件只把失败记成 `{ok:false, error}`,自己不留日志;不在这里说清
+                        // 原因,「这个会话为什么没起来」就没有任何线索。
+                        eprintln!("[app-server] could not launch a session in {workdir}: {error}");
+                    })
+            }
             DriverActionKind::Append {
                 thread_id,
                 objective,
@@ -248,18 +280,35 @@ where
     /// 方句柄的是插件)。宿主只做透传:`driver_project` 让 `thread/listAll` 把会话折
     /// 进项目组,`driver_ref` 让桌面侧栏把它归入「驱动会话」小节。旧插件不发时为
     /// `None`,退化成未分组(与改动前逐字一致)。
-    async fn launch_inner(
-        &mut self,
-        workdir: &str,
-        title: &str,
-        objective: &str,
-        driver_project: Option<&str>,
-        driver_ref: Option<&str>,
-        // 插件要注入本会话 shell 的环境变量。宿主不解释任何一个键：它们的含义
-        // 属于插件（「这张卡是哪张」不是宿主的通用事实）。
-        env: Vec<(String, String)>,
-    ) -> anyhow::Result<String> {
+    async fn launch_inner(&mut self, request: LaunchRequest<'_>) -> anyhow::Result<String> {
+        let LaunchRequest {
+            plugin,
+            workdir,
+            title,
+            objective,
+            driver_project,
+            driver_ref,
+            env,
+        } = request;
         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
+
+        // 先算出「这个会话绑哪个发布」。必须在建 agent 之前：会话的 skill 来源
+        // 要按这个发布给，先建 agent 再补绑定会让第一个回合看到错的 skill。
+        //
+        // 失败处理分两种：
+        // - 解析不出（未安装/未激活/未授权）：不是错误，会话照建，只是**不绑**
+        //   插件。驱动动作能否执行已由闸门判过；这里判的是"会话该记住哪个
+        //   版本"，判不出来时记空比记一个猜的版本安全。
+        // - 解析出来：写进 meta，并让本次会话的 skill 发现带上该发布的受管根。
+        let plugin_plan = match self.instance_home {
+            Some(home) => plugin_binding_for_session(home, workdir, plugin),
+            None => None,
+        };
+        // 记住本会话的绑定：本函数接下来要投递首轮，那一轮必须用同一条绑定
+        // 占准入（见 `prepare_and_deliver`）。用刚算出来的值，而不是再读回
+        // meta——两次读在"刚写完还没落盘"的窗口里可能给出不同答案。
+        self.session_binding = plugin_plan.as_ref().map(|plan| plan.binding.clone());
+
         let built = (self.build_agent)(
             None,
             Path::new(workdir),
@@ -309,6 +358,8 @@ where
             self.lead_control_replies,
             Some(self.lead_agent_enabled),
             env,
+            // 本次会话绑定的插件发布（`None` = 普通/未绑定会话）。
+            plugin_plan.map(|plan| plan.binding).into_iter().collect(),
         )
         .await?;
 
@@ -411,37 +462,49 @@ where
             "threadId": thread_id,
             "input": [{ "type": "text", "text": objective }],
         });
+        // 插件会话的首轮必须过准入：它正是"排空时要等的那一轮"。
+        // 绑定来自 launcher 起会话时算好的那条（`launch_inner` 已写进 meta），
+        // 这里从 meta 读回来的代价不值得——调用方已持有同一个 plan。
+        let admission = match (self.admission, self.session_binding.as_ref()) {
+            (Some(admission), Some(binding)) => Some((admission, binding.clone())),
+            _ => None,
+        };
         #[allow(unused_mut)]
-        let mut prepared =
-            match prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
-                .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    // **绝不在这里碰 `active_turn_id`**(曾有一版在此清占位,是错的)。
-                    //
-                    // `prepare_turn_core` 只在**最后一步**(复制附件成功之后)才写占位
-                    // (`server.rs` 的「占位(复制成功之后)」),而它所有失败返回
-                    // (`UnknownThread` / `TurnInProgress` / `InvalidAttachment` /
-                    // `InvalidImage` …)都在那之前,之后没有任何可能失败的步骤。所以
-                    // 走到这里意味着**本次调用从未设定过占位**:该 thread 上的
-                    // `active_turn_id` 只可能属于**另一个正在跑的 turn**——追问轮撞上
-                    // 忙会话的 TOCTOU(spec §10)。
-                    //
-                    // 清零它就是把那个活 turn 变成无主:`turn/cancel` 静默失效、
-                    // `interrupt_and_wait_for_persist` 立即返回(`thread/delete` 于是可能
-                    // 拆掉一个还在跑的会话)、`is_idle` 谎报空闲(下一拍驱动会收到假的
-                    // 「这轮已结束」)。spec §10 对本行的处置只有一条:干净地回报
-                    // `ok:false`,对既有会话零副作用。
-                    //
-                    // 把具体原因带上:调用方只把它写进 `{ok:false, error}`,
-                    // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
-                    return Err(anyhow::anyhow!(
-                        "could not prepare a turn for {thread_id}: {}",
-                        turn_prepare_rpc_error(error).message
-                    ));
-                }
-            };
+        let mut prepared = match prepare_turn_core(
+            self.threads,
+            self.pending_activation,
+            self.uploads,
+            &params,
+            admission,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // **绝不在这里碰 `active_turn_id`**(曾有一版在此清占位,是错的)。
+                //
+                // `prepare_turn_core` 只在**最后一步**(复制附件成功之后)才写占位
+                // (`server.rs` 的「占位(复制成功之后)」),而它所有失败返回
+                // (`UnknownThread` / `TurnInProgress` / `InvalidAttachment` /
+                // `InvalidImage` …)都在那之前,之后没有任何可能失败的步骤。所以
+                // 走到这里意味着**本次调用从未设定过占位**:该 thread 上的
+                // `active_turn_id` 只可能属于**另一个正在跑的 turn**——追问轮撞上
+                // 忙会话的 TOCTOU(spec §10)。
+                //
+                // 清零它就是把那个活 turn 变成无主:`turn/cancel` 静默失效、
+                // `interrupt_and_wait_for_persist` 立即返回(`thread/delete` 于是可能
+                // 拆掉一个还在跑的会话)、`is_idle` 谎报空闲(下一拍驱动会收到假的
+                // 「这轮已结束」)。spec §10 对本行的处置只有一条:干净地回报
+                // `ok:false`,对既有会话零副作用。
+                //
+                // 把具体原因带上:调用方只把它写进 `{ok:false, error}`,
+                // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
+                return Err(anyhow::anyhow!(
+                    "could not prepare a turn for {thread_id}: {}",
+                    turn_prepare_rpc_error(error).message
+                ));
+            }
+        };
         // 照 spec §4.4 的可见性要求:两个动作(首轮与追问轮)都发 `turn/started`,
         // 且与 `turn/start` 的 RPC 路径同序——它是该轮的第一帧。这是 thread-keyed
         // 的**内容通知**,不是 RPC 响应帧(不引入任何 `write_response`):桌面
@@ -692,6 +755,8 @@ where
             Some(self.lead_agent_enabled),
             // 组长会话不是驱动会话，没有插件句柄可注入。
             Vec::new(),
+            // 组长会话不绑插件。
+            Vec::new(),
         )
         .await?;
 
@@ -703,7 +768,8 @@ where
         });
         #[allow(unused_mut)]
         let mut prepared =
-            prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
+            // 组长投递不占插件准入：它不属于任何插件。
+            prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params, None)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -744,5 +810,51 @@ where
             ));
         }
         Ok(target.thread_id)
+    }
+}
+
+/// 收成结构体而不是七个位置参数：认位置会错（`driver_project` 与 `driver_ref` 都是
+/// `Option<&str>`，写反了编译器一声不响），而这两者的含义完全不同——一个决定会话
+/// 折进哪个项目组，一个决定它归入哪条驱动小节。命名参数把这件事交给编译器。
+struct LaunchRequest<'a> {
+    plugin: &'a str,
+    workdir: &'a str,
+    title: &'a str,
+    objective: &'a str,
+    /// 落进 meta 的项目根；让 `thread/listAll` 把会话折进项目组。
+    driver_project: Option<&'a str>,
+    /// 落进 meta 的驱动方句柄；让桌面侧栏归入「驱动会话」。
+    driver_ref: Option<&'a str>,
+    /// 插件要注入本会话 shell 的环境变量。宿主不解释任何一个键：它们的含义
+    /// 属于插件（「这张卡是哪张」不是宿主的通用事实）。
+    env: Vec<(String, String)>,
+}
+
+/// 按已提交激活算出「这个会话该绑哪个发布」。
+///
+/// 任何一步判不出来都返回 `None`，而不是让会话创建失败：
+/// - 插件没装/没激活 → 会话照建，只是不绑；
+/// - 授权表里没有该项目 → 同上（能否起会话已由闸门判过，这里只回答"绑哪个"）。
+///
+/// 反过来，**判出来就一定绑对**：计划里的 release/activation 与 skill 根来自
+/// 同一次 `managed::resolve`，不会出现"绑 1.4.0、看 1.5.0 的 skill"。
+pub(crate) fn plugin_binding_for_session(
+    instance_home: &Path,
+    workdir: &str,
+    plugin: &str,
+) -> Option<crate::plugin_manager::SessionPlan> {
+    // 项目键用 canonical：授权表按 canonical 项目路径索引，动作给的是原样路径。
+    let project = std::fs::canonicalize(workdir).unwrap_or_else(|_| PathBuf::from(workdir));
+    let project_id = yi_agent_plugins::ProjectId::parse(&project.to_string_lossy()).ok()?;
+    match crate::plugin_manager::plan_session(instance_home, &project_id, plugin) {
+        Ok(plan) => Some(plan),
+        Err(error) => {
+            // 不静默：会话不带绑定是有后果的（它之后调插件会得到"未绑定"）。
+            // 但这不该阻断起会话本身——闸门已经判过能不能起。
+            eprintln!(
+                "[app-server] session in {workdir} will not be bound to plugin `{plugin}`: {error}"
+            );
+            None
+        }
     }
 }

@@ -53,12 +53,53 @@ fn effective_interval(cli: Option<Duration>, state_dir: &std::path::Path) -> Dur
     Duration::from_secs(secs)
 }
 
-/// 默认状态目录：`<cwd>/.yi-agent/superpowers-kanban`，与 supervisor 清单里
-/// `{state_dir}` 的取值一致；`--state-dir` 可覆盖（测试与多项目场景用）。
+/// 默认状态目录：`<项目>/.yi-agent/superpowers-kanban`。
+///
+/// **项目从哪来取决于模式**（设计 §7.3：不能默认为 worktree cwd，那会让会话
+/// 写到另一块看板）：
+///
+/// - 受管（宿主注入了 binding）：项目 = binding 里的项目。一张卡的会话跑在
+///   `.worktrees/<card>` 里，cwd 根本不是项目。
+/// - standalone（无 binding，用户手动敲命令）：项目 = cwd，并沿用 supervisor
+///   清单里 `{state_dir}` 的取值。
+///
+/// `--state-dir` 一律可覆盖（测试与多项目场景用）。
 fn default_state_dir() -> Result<PathBuf, String> {
+    if let Some(project) = managed_project()? {
+        return Ok(project.join(".yi-agent").join("superpowers-kanban"));
+    }
     std::env::current_dir()
         .map(|cwd| cwd.join(".yi-agent").join("superpowers-kanban"))
         .map_err(|error| format!("could not read the current directory: {error}"))
+}
+
+/// 受管模式下的绑定项目（standalone 时 `None`）。
+///
+/// 半套上下文是错误而不是 standalone：宿主启动脚本改了、插件没跟上时，继续跑
+/// 会拿 cwd 冒充项目，写进另一块看板且不报错。所以这里把 `Missing` 原样抛出，
+/// 由调用方决定是拒绝启动还是报错退出。
+fn managed_project() -> Result<Option<PathBuf>, String> {
+    match superpowers_kanban_runner::managed::context_from_env(|name| std::env::var(name).ok()) {
+        Ok(Some(context)) => Ok(Some(context.binding.project)),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 受管上下文的自检：保留键不得被插件自己的环境占用。
+///
+/// 只检查**当前进程环境**里出现的保留名——它们本来由宿主注入，所以"出现在环境
+/// 里"是正常的；真正要拦的是插件在启动子进程/写配置时自行设置它们。当前实现
+/// 不设置任何环境变量，因此这里只在**受管启动**时核对 binding 自洽（项目存在），
+/// 不做猜测性的拒绝：拒绝一个由宿主自己注入的变量会让插件永远起不来。
+fn check_managed_context() -> Result<(), String> {
+    let Some(project) = managed_project()? else {
+        return Ok(());
+    };
+    if project.as_os_str().is_empty() {
+        return Err("the managed binding names an empty project".to_string());
+    }
+    Ok(())
 }
 
 fn parse_args() -> Result<Subcommand, String> {
@@ -164,6 +205,16 @@ const USAGE: &str =
   workdir       [--state-dir <d>]
   manifest      打印本插件的 supervisor 清单（宿主的通用 plugin/install 消费）";
 
+/// The namespace the manifest puts in front of every CLI verb.
+///
+/// The release manifest names verbs `kanban:add`, because the manifest schema
+/// requires a leading namespace and forbids hyphens in it (several real verbs
+/// are hyphenated: `add-prequeued`, `merge-request`). The bare spelling is what
+/// the skill and every existing invocation use, so both must resolve to the same
+/// command: strip the prefix on the way in rather than carrying two names
+/// through the whole parser.
+const VERB_NAMESPACE: &str = "kanban:";
+
 /// Parsed from an explicit iterator so tests can drive it without a process.
 ///
 /// The verb is mandatory: `run` used to be the implicit default, which left no
@@ -173,7 +224,13 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut args = tokens.into_iter();
-    match args.next().as_deref() {
+    let first = args
+        .next()
+        .map(|verb| match verb.strip_prefix(VERB_NAMESPACE) {
+            Some(stripped) => stripped.to_string(),
+            None => verb,
+        });
+    match first.as_deref() {
         Some("run") => Ok(Subcommand::Run(parse_run_args(args)?)),
         Some("add") => {
             let (state_dir, rest) = parse_state_dir(args)?;
@@ -463,9 +520,9 @@ where
     for token in rest {
         if token == all_flag {
             all = true;
-        } else if token.starts_with("--") {
-            return Err(format!("unexpected argument: {token}"));
-        } else if card_id.is_some() {
+        } else if token.starts_with("--") || card_id.is_some() {
+            // 两种情形给出同一条结论：这个位置只能有一个 card id，多出来的
+            // 位置要么是第二个 id，要么是一个没人认识的选项。
             return Err(format!("unexpected argument: {token}"));
         } else {
             card_id = Some(token);
@@ -1263,6 +1320,14 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
 /// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
+    // 受管启动的前置自检：半套上下文、空项目都拒绝，而不是拿 cwd 兜底。
+    //
+    // 只在 `run` 上做：一次性命令（add/list/state）缺 context 是合法的
+    // standalone 用法，用户手敲命令时就该按 `--state-dir` 或 cwd 工作。
+    if let Err(error) = check_managed_context() {
+        eprintln!("superpowers-kanban: {error}");
+        std::process::exit(1);
+    }
     let calendar = ConcurrencyCalendar::load_merged(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
     // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
@@ -1289,11 +1354,16 @@ fn run_daemon(args: Args) {
         .map(Arc::new);
 
     // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
-    let service = Arc::new(BoardService::new(
-        args.state_dir.clone(),
-        args.project_root.clone(),
-        None,
-    ));
+    //
+    // `managed` 决定常驻登记归谁：命中 binding 就是宿主管，插件不写宿主登记
+    // 文件（设计 §7.1）。这里是 `run`，正是宿主拉起的入口，所以照实打开。
+    let managed = managed_project()
+        .map_err(|error| error.to_string())
+        .is_ok_and(|p| p.is_some());
+    let service = Arc::new(
+        BoardService::new(args.state_dir.clone(), args.project_root.clone(), None)
+            .with_managed(managed),
+    );
 
     // 合并安全检查必须在开始回答任何请求**之前**：此时还没有新合并可能被派出去。
     // 发现残留就标 uncertain 并阻塞本项目的合并，等人工确认（spec §8.3）。
@@ -1366,8 +1436,8 @@ mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
         command_list, command_manifest, command_merge_request, command_prequeued, command_promote,
-        command_purge, command_set_switch, effective_interval, manifest_json, parse_subcommand,
-        sweep_one_socket, sweep_stale_sockets,
+        command_purge, command_set_switch, default_state_dir, effective_interval, manifest_json,
+        parse_subcommand, sweep_one_socket, sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1406,6 +1476,9 @@ mod tests {
 
     #[test]
     fn add_requires_exactly_two_paths() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             parse(&["add", "a.spec.md"]).is_err(),
             "one path is not enough"
@@ -1431,6 +1504,9 @@ mod tests {
 
     #[test]
     fn list_on_and_off_take_no_positional_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["list"]),
             Ok(Subcommand::List { all: false, .. })
@@ -1912,11 +1988,17 @@ mod tests {
 
     #[test]
     fn add_merge_requires_a_source() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(parse(&["add-merge"]).is_err());
     }
 
     #[test]
     fn merge_request_and_finish_parse_one_card_id() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["merge-request", "card-1", "--state-dir", "/s"]),
             Ok(Subcommand::MergeRequest { .. })
@@ -2239,6 +2321,9 @@ mod tests {
 
     #[test]
     fn parses_add_prequeued_and_promote() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             parse(&["add-prequeued", "一个想法"]),
             Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
@@ -2254,8 +2339,34 @@ mod tests {
         ));
     }
 
+    /// 清单里的 `kanban:` 前缀必须与裸动词等价。
+    ///
+    /// 两套写法都有真实调用方：清单是按 schema 要求带命名空间的那份，裸名是
+    /// skill 与所有既有文档用的那份。只认一种，另一种就会在用户的命令行里失效，
+    /// 而且失效方式只是「未知子命令」，看不出是前缀问题。
+    #[test]
+    fn the_manifested_namespace_is_optional_on_the_command_line() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            parse(&["kanban:add-prequeued", "一个想法"]),
+            Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
+        ));
+        assert!(matches!(
+            parse(&["kanban:promote", "idea", "a.spec.md", "a.plan.md"]),
+            Ok(Subcommand::Promote { card_id, .. }) if card_id == "idea"
+        ));
+        // 前缀只剥离一次、只在开头：别的位置出现 `kanban:` 仍是普通参数。
+        assert!(parse(&["kanban:kanban:add", "a", "b"]).is_err());
+        assert!(parse(&["kanban:"]).is_err());
+    }
+
     #[test]
     fn add_prequeued_and_promote_reject_missing_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(parse(&["add-prequeued"]).is_err());
         assert!(parse(&["promote", "idea"]).is_err());
         assert!(parse(&["promote", "idea", "a.spec.md"]).is_err());
@@ -2421,6 +2532,26 @@ mod tests {
         }
     }
 
+    /// 进程级 cwd 的临时改动，drop 时还原。与 `EnvVarGuard` 同样要求串行。
+    struct SetCurrentDir {
+        original: std::path::PathBuf,
+    }
+
+    impl SetCurrentDir {
+        fn new(dir: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for SetCurrentDir {
+        fn drop(&mut self) {
+            // 还原失败只能忽略：panic 里的第二个 panic 会盖掉真正的失败原因。
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             // SAFETY: 同上。
@@ -2429,6 +2560,78 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.name) },
             }
         }
+    }
+
+    /// 绑定项目才是项目：会话 cwd 在 worktree 里、绑定指向项目根时，默认状态目录
+    /// 必须落在项目根下，而不是 cwd 下（设计 §7.3）。
+    #[test]
+    fn the_managed_binding_decides_the_project_not_the_working_directory() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let worktree = project.join(".worktrees/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let _home = EnvVarGuard::set(
+            "YI_AGENT_HOME",
+            &dir.path().join("inst/.yi-agent").to_string_lossy(),
+        );
+        let _host = EnvVarGuard::set("YI_AGENT_PLUGIN_INSTANCE", "host-1");
+        let _binding = EnvVarGuard::set(
+            "YI_AGENT_PLUGIN_BINDING",
+            &format!("{}:3:7:Write", project.display()),
+        );
+        let _cwd = SetCurrentDir::new(&worktree);
+
+        assert_eq!(
+            default_state_dir().unwrap(),
+            project.join(".yi-agent/superpowers-kanban"),
+            "the binding's project wins over the worktree cwd"
+        );
+    }
+
+    /// 无绑定 = standalone：仍按 cwd 定位，行为与以前一致。
+    #[test]
+    fn without_a_binding_the_default_state_dir_follows_the_working_directory() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::unset("YI_AGENT_HOME");
+        let _host = EnvVarGuard::unset("YI_AGENT_PLUGIN_INSTANCE");
+        let _binding = EnvVarGuard::unset("YI_AGENT_PLUGIN_BINDING");
+        let _cwd = SetCurrentDir::new(dir.path());
+
+        // macOS 的 `/var` 是指向 `/private/var` 的软链：`current_dir` 返回规范化
+        // 后的路径，`tempdir` 给的是未规范化的。只比项目根本身（它存在），不比
+        // 还不存在的 `.yi-agent/...` 尾巴。
+        let state_dir = default_state_dir().unwrap();
+        assert!(
+            state_dir.ends_with(".yi-agent/superpowers-kanban"),
+            "{}",
+            state_dir.display()
+        );
+        assert_eq!(
+            state_dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    /// 半套上下文是错误，不是 standalone：缺哪项要说出来。
+    #[test]
+    fn a_half_set_managed_context_is_an_error_not_a_fallback() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::unset("YI_AGENT_HOME");
+        let _host = EnvVarGuard::set("YI_AGENT_PLUGIN_INSTANCE", "host-1");
+        let _binding = EnvVarGuard::unset("YI_AGENT_PLUGIN_BINDING");
+        let _cwd = SetCurrentDir::new(dir.path());
+
+        let error = default_state_dir().expect_err("half a context must not be guessed");
+        assert!(error.contains("YI_AGENT_HOME"), "{error}");
     }
 
     #[test]
@@ -2467,6 +2670,9 @@ mod tests {
 
     #[test]
     fn manifest_takes_no_arguments() {
+        // 这些用例不带 --state-dir，`parse` 会走 default_state_dir() 读进程环境；
+        // 不持锁就与其他改环境的用例竞争（实测偶发失败）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(parse(&["manifest"]), Ok(Subcommand::Manifest)));
         assert!(
             parse(&["manifest", "--state-dir", "/s"]).is_err(),

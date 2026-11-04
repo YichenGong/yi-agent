@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "prefix": "plugins/v1/",
+  "methods": [
+    { "name": "plugins/v1/catalog", "effect": "Read" },
+    { "name": "plugins/v1/list", "effect": "Read" },
+    { "name": "plugins/v1/install", "effect": "Write" },
+    { "name": "plugins/v1/enableProject", "effect": "Write" },
+    { "name": "plugins/v1/changeGrant", "effect": "Write" },
+    { "name": "plugins/v1/disableProject", "effect": "Write" },
+    { "name": "plugins/v1/activate", "effect": "Write" },
+    { "name": "plugins/v1/rollback", "effect": "Write" },
+    { "name": "plugins/v1/transaction", "effect": "Read" },
+    { "name": "plugins/v1/cancelTransaction", "effect": "Write" },
+    { "name": "plugins/v1/uninstall", "effect": "Write" },
+    { "name": "plugins/v1/clearData", "effect": "Write" },
+    { "name": "plugins/v1/gc", "effect": "Write" },
+    { "name": "plugins/v1/inspectLegacy", "effect": "Read" },
+    { "name": "plugins/v1/adoptLegacy", "effect": "Write" },
+    { "name": "plugins/v1/assetRelease", "effect": "Read" },
+    { "name": "plugins/v1/operationResult", "effect": "Read" }
+  ],
+  "responseVariants": ["pending", "committed", "unknown", "rejected"]
+}

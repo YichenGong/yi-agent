@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::model::{SkillError, SkillMetadata, SkillScope, is_valid_skill_name};
+use crate::model::{SkillError, SkillMetadata, SkillScope, SkillSource, is_valid_skill_name};
 
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
@@ -20,6 +20,7 @@ pub fn parse_skill_md(
     content: &str,
     path: &Path,
     scope: SkillScope,
+    source: &SkillSource,
 ) -> Result<SkillMetadata, SkillError> {
     let (frontmatter_text, body) = split_frontmatter(content).ok_or_else(|| {
         SkillError::ParseError(path.to_path_buf(), "missing YAML frontmatter".to_string())
@@ -40,6 +41,7 @@ pub fn parse_skill_md(
         path: path.to_path_buf(),
         scope,
         body: body.to_string(),
+        source: source.clone(),
     })
 }
 
@@ -72,7 +74,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse(content: &str, scope: SkillScope) -> Result<SkillMetadata, SkillError> {
-        parse_skill_md(content, &PathBuf::from("/test/SKILL.md"), scope)
+        parse_skill_md(
+            content,
+            &PathBuf::from("/test/SKILL.md"),
+            scope,
+            &crate::model::SkillSource::Local,
+        )
     }
 
     #[test]

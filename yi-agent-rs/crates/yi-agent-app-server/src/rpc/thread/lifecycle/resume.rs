@@ -263,6 +263,8 @@ pub(crate) async fn handle(
                     status: Arc::clone(&store_status),
                     subagent_tx,
                     writer_lock,
+                    // 准入许可随 turn 生命周期管理；新建/恢复会话时尚未申请。
+                    turn_permit: None,
                 },
             );
 

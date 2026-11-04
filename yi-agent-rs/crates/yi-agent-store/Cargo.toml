@@ -10,6 +10,9 @@ authors.workspace = true
 
 [dependencies]
 yi-agent-core = { workspace = true }
+# 维护屏障读的是插件契约核心的日志格式。store 只依赖契约核心，
+# 不反向依赖 app-server —— 那会让 daemon 把整个宿主拖进来。
+yi-agent-plugins = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 uuid = { workspace = true }

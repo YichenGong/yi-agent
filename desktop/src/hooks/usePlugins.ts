@@ -1,0 +1,380 @@
+/**
+ * 受管插件的桌面侧状态模型。
+ *
+ * 关键决定：**不用一个 `enabled` 布尔表示插件状态**。真实状态有七个，彼此
+ * 不可合并（计划 T19 Step 1 明确要求逐个独立）：
+ *
+ * | 状态 | 含义 |
+ * |---|---|
+ * | `not-installed` | 目录里有，但本机没装 |
+ * | `installed-disabled` | 装了，但当前项目没授权 |
+ * | `read-only` | 只授权了 Read：能看，不能写 |
+ * | `running` | 授权且当前有已提交的激活代次 |
+ * | `failing` | 授权在，但运行/健康检查失败 |
+ * | `update-waiting` | 能力增加的更新在等用户重新确认 |
+ * | `pending-cleanup` | 卸载时项目不可达，留着待清理记录 |
+ *
+ * 把 `read-only` 折进 `enabled=true` 会直接导致"只读"被说成"能用"——协议
+ * spec §5.3 明确禁止这种措辞，因为它只限制桥调用，不限制原生文件访问。
+ */
+
+import { RPC } from "../lib/routes";
+import type { RpcCall } from "../lib/rpcCall";
+
+/** 与 `PluginSummary`（旧 supervisor 协议）不是同一个东西，别混用。 */
+export interface ManagedPluginRow {
+  plugin: string;
+  selected: string | null;
+  installed: string[];
+  /** 已授权的项目句柄。 */
+  projects: string[];
+  /** 上次卸载没清干净的项目。非空 = "卸载"其实还没完成。 */
+  pendingCleanup: PendingCleanup[];
+}
+
+export type PluginState =
+  | { kind: "not-installed"; plugin: string; versions: string[] }
+  | { kind: "installed-disabled"; plugin: string; version: string | null }
+  | { kind: "read-only"; plugin: string; version: string | null; project: string }
+  | { kind: "running"; plugin: string; version: string | null; project: string; activation: number }
+  | { kind: "failing"; plugin: string; version: string | null; detail: string }
+  | { kind: "update-waiting"; plugin: string; version: string | null; requires: string[] }
+  | { kind: "pending-cleanup"; plugin: string; project: string; detail: string };
+
+export interface TransactionSnapshot {
+  phase?: string;
+  /** 这次更新新增需要确认的能力。 */
+  requiresConfirmation?: string[];
+  /** 当前项目实际获批的能力。 */
+  granted?: string[];
+  activation?: number;
+}
+
+export interface HealthSnapshot {
+  phase?: "failing" | "pending-cleanup";
+  project?: string;
+  detail?: string;
+}
+
+export interface PluginCatalogOptions {
+  /** 当前项目句柄（`ph1_...`），用于判定授权状态。 */
+  project?: string;
+  transaction?: TransactionSnapshot;
+  health?: HealthSnapshot;
+}
+
+/**
+ * 从管理 API 读出的原始行推导状态。**纯函数**：所有分支都能单测，
+ * 不需要挂一个 React 树。
+ */
+export function deriveState(row: ManagedPluginRow, options: PluginCatalogOptions = {}): PluginState {
+  const project = options.project ?? "";
+  const installed = row.installed.length > 0;
+
+  if (!installed) {
+    return { kind: "not-installed", plugin: row.plugin, versions: [] };
+  }
+  const version = row.selected ?? row.installed[row.installed.length - 1] ?? null;
+
+  // 盘上记录的待清理优先于内存里的健康快照：记录能跨重启存活，快照不能。
+  const pending = options.health?.phase === "pending-cleanup"
+    ? { project: options.health.project ?? project, detail: options.health.detail }
+    : row.pendingCleanup?.[0]
+      ? { project: row.pendingCleanup[0].project, detail: row.pendingCleanup[0].remaining.join("；") }
+      : null;
+  if (pending) {
+    return {
+      kind: "pending-cleanup",
+      plugin: row.plugin,
+      project: pending.project,
+      detail: pending.detail ?? "项目不可达，卸载未完成",
+    };
+  }
+
+  if (options.transaction?.phase === "draining" && options.transaction.requiresConfirmation?.length) {
+    return {
+      kind: "update-waiting",
+      plugin: row.plugin,
+      version,
+      requires: options.transaction.requiresConfirmation,
+    };
+  }
+
+  if (!project || !row.projects.includes(project)) {
+    return { kind: "installed-disabled", plugin: row.plugin, version };
+  }
+
+  if (options.health?.phase === "failing") {
+    return {
+      kind: "failing",
+      plugin: row.plugin,
+      version,
+      detail: options.health.detail ?? "运行检查失败",
+    };
+  }
+
+  const granted = options.transaction?.granted ?? [];
+  const onlyRead = granted.length > 0 && granted.every((capability) => capability === "Read");
+  if (onlyRead) {
+    return { kind: "read-only", plugin: row.plugin, version, project };
+  }
+
+  return {
+    kind: "running",
+    plugin: row.plugin,
+    version,
+    project,
+    activation: options.transaction?.activation ?? 1,
+  };
+}
+
+/** 一个状态的中文标题。UI 与测试共用同一份措辞。 */
+export function stateLabel(state: PluginState): string {
+  switch (state.kind) {
+    case "not-installed":
+      return "未安装";
+    case "installed-disabled":
+      return "已安装，未在本项目启用";
+    case "read-only":
+      return "只读启用";
+    case "running":
+      return "运行中";
+    case "failing":
+      return "运行故障";
+    case "update-waiting":
+      return "更新等待确认";
+    case "pending-cleanup":
+      return "待清理";
+  }
+}
+
+/** 这个状态是否允许渲染业务视图（iframe）。 */
+export function stateRendersView(state: PluginState): boolean {
+  return state.kind === "running" || state.kind === "read-only" || state.kind === "failing";
+}
+
+/** 这个状态是否允许写。`read-only` 明确不允许。 */
+export function stateAllowsWrite(state: PluginState): boolean {
+  return state.kind === "running";
+}
+
+/**
+ * 读全部已安装插件，**不按项目过滤**。
+ *
+ * 按项目过滤会把"装了但没在这个项目启用"的行一起滤掉，于是 UI 只能显示
+ * "未安装"或干脆空白——用户看不到它、也就没法去启用它。项目只用于**推导
+ * 状态**（`deriveState`），不用于裁剪列表。
+ */
+export async function loadManagedPlugins(call: RpcCall): Promise<ManagedPluginRow[]> {
+  const result = await call<{ plugins?: unknown }>(RPC.pluginsV1List, {});
+  const rows = Array.isArray(result?.plugins) ? result.plugins : [];
+  return rows
+    .filter((row): row is Record<string, unknown> => typeof row === "object" && row !== null)
+    .filter((row) => typeof row.plugin === "string")
+    .map((row) => ({
+      plugin: row.plugin as string,
+      selected: typeof row.selected === "string" ? row.selected : null,
+      installed: Array.isArray(row.installed)
+        ? row.installed.filter((version): version is string => typeof version === "string")
+        : [],
+      projects: Array.isArray(row.projects)
+        ? row.projects.filter((project): project is string => typeof project === "string")
+        : [],
+      pendingCleanup: Array.isArray(row.pendingCleanup)
+        ? row.pendingCleanup
+            .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+            .filter((entry) => typeof entry.project === "string")
+            .map((entry) => ({
+              project: entry.project as string,
+              remaining: Array.isArray(entry.remaining)
+                ? entry.remaining.filter((line): line is string => typeof line === "string")
+                : [],
+            }))
+        : [],
+    }));
+}
+
+export interface CapabilityChoice {
+  /** 用户勾选的能力。必需项必须始终包含。 */
+  granted: string[];
+}
+
+/**
+ * 授权变更的请求体。
+ *
+ * `granted` 是**分项**能力列表，不是一个 `enabled` 布尔。只读授权就是
+ * `granted=["Read"]`；它不阻止原生文件访问，UI 文案必须说清楚。
+ */
+export async function changeGrant(
+  call: RpcCall,
+  params: { plugin: string; project: string; granted: string[] },
+): Promise<void> {
+  await call(RPC.pluginsV1ChangeGrant, {
+    plugin: params.plugin,
+    project: params.project,
+    capabilities: params.granted,
+  });
+}
+
+/** 启用某项目。安装按钮**不得**顺带调用它（计划 T19 Step 1）。 */
+export async function enableProject(
+  call: RpcCall,
+  params: { plugin: string; project: string; granted: string[] },
+): Promise<void> {
+  await call(RPC.pluginsV1EnableProject, {
+    plugin: params.plugin,
+    project: params.project,
+    capabilities: params.granted,
+  });
+}
+
+export async function disableProject(
+  call: RpcCall,
+  params: { plugin: string; project: string },
+): Promise<void> {
+  await call(RPC.pluginsV1DisableProject, { plugin: params.plugin, project: params.project });
+}
+
+/** 一个没清干净的项目。与宿主 `PendingCleanup` 的 serde 表示一致。 */
+export interface PendingCleanup {
+  project: string;
+  remaining: string[];
+}
+
+export interface UninstallReport {
+  plugin: string;
+  versionsRemoved: number;
+  grantsRevoked: number;
+  retained: Array<{ project: string; path?: string; why: string }>;
+  /** 空 = 真的清干净了。非空 = 还有宿主入口留在盘上。 */
+  pending: PendingCleanup[];
+}
+
+/**
+ * 卸载一个插件。**默认保留项目数据**。
+ *
+ * 删数据是另一个方法（[`clearData`]），因为它是不可逆的，而且要用户点名
+ * 项目。把两者合成一个 `deleteData` 布尔，迟早会有人在自动流程里传 `true`。
+ */
+export async function uninstallPlugin(call: RpcCall, plugin: string): Promise<UninstallReport> {
+  const result = await call<Record<string, unknown>>(RPC.pluginsV1Uninstall, {
+    plugin,
+    removeData: false,
+  });
+  return readUninstallReport(plugin, result);
+}
+
+/**
+ * 清掉点名项目里的插件数据。**不可逆**，所以必须显式 `confirm`。
+ *
+ * 项目名必须由用户逐个点名：宿主只删名单上的项目，名单外的一个字节都不动。
+ */
+export async function clearData(
+  call: RpcCall,
+  params: { plugin: string; projects: string[] },
+): Promise<UninstallReport> {
+  const result = await call<Record<string, unknown>>(RPC.pluginsV1ClearData, {
+    plugin: params.plugin,
+    projects: params.projects,
+    confirm: true,
+  });
+  return readUninstallReport(params.plugin, result);
+}
+
+function readUninstallReport(plugin: string, result: Record<string, unknown> | undefined): UninstallReport {
+  const pending = Array.isArray(result?.pending)
+    ? result.pending
+        .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+        .filter((entry) => typeof entry.project === "string")
+        .map((entry) => ({
+          project: entry.project as string,
+          remaining: Array.isArray(entry.remaining)
+            ? entry.remaining.filter((line): line is string => typeof line === "string")
+            : [],
+        }))
+    : [];
+  return {
+    plugin,
+    versionsRemoved: typeof result?.versionsRemoved === "number" ? result.versionsRemoved : 0,
+    grantsRevoked: typeof result?.grantsRevoked === "number" ? result.grantsRevoked : 0,
+    retained: Array.isArray(result?.retained)
+      ? (result.retained as UninstallReport["retained"])
+      : [],
+    pending,
+  };
+}
+
+export async function readTransaction(call: RpcCall, plugin: string): Promise<TransactionSnapshot> {
+  const result = await call<{ phase?: string; admissionOpen?: boolean }>(RPC.pluginsV1Transaction, {
+    plugin,
+  });
+  return { phase: result?.phase };
+}
+
+/** 旧安装探测报告里的一条痕迹。字段名与宿主 `Finding` 的 serde 表示一致。 */
+export interface LegacyFinding {
+  kind: string;
+  path: string;
+  project?: string;
+  detail: string;
+}
+
+export interface LegacyReport {
+  findings: LegacyFinding[];
+  rejectedInputs: string[];
+}
+
+/**
+ * 探测某个插件的旧安装。**只读**，可以随时调用。
+ *
+ * `plugin` 必填：旧布局的自述（旧二进制名、旧数据目录、旧开关键）来自那份插件
+ * 的清单，不给插件就无从知道该找什么。宿主不会用"猜一个插件"来代替这个参数。
+ *
+ * `projects` 由调用方显式给出：宿主只查"点名的项目 + 已登记项目 + 已知技能根"，
+ * 不扫盘。省略时宿主只查后两者。
+ */
+export async function inspectLegacy(
+  call: RpcCall,
+  params: { plugin: string; projects?: string[] },
+): Promise<LegacyReport> {
+  const result = await call<{ findings?: unknown; rejectedInputs?: unknown }>(
+    RPC.pluginsV1InspectLegacy,
+    params.projects ? { plugin: params.plugin, projects: params.projects } : { plugin: params.plugin },
+  );
+  const findings = Array.isArray(result?.findings)
+    ? result.findings
+        .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+        .filter((entry) => typeof entry.path === "string")
+        .map((entry) => ({
+          kind: typeof entry.kind === "string" ? entry.kind : "unknown",
+          path: entry.path as string,
+          project: typeof entry.project === "string" ? entry.project : undefined,
+          detail: typeof entry.detail === "string" ? entry.detail : "",
+        }))
+    : [];
+  const rejectedInputs = Array.isArray(result?.rejectedInputs)
+    ? result.rejectedInputs.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return { findings, rejectedInputs };
+}
+
+/**
+ * 接管一个旧安装。
+ *
+ * `capabilities` **必须**由用户显式勾选后传入：旧开关不是授权（迁移 spec §8.1），
+ * 宿主在没有这个字段时直接拒绝，而不是替他补齐。
+ */
+export async function adoptLegacy(
+  call: RpcCall,
+  params: { plugin: string; project: string; granted: string[] },
+): Promise<{ activation: number; backup?: string }> {
+  const result = await call<{ activation?: unknown; backup?: unknown }>(RPC.pluginsV1AdoptLegacy, {
+    plugin: params.plugin,
+    project: params.project,
+    capabilities: params.granted,
+  });
+  return {
+    activation: typeof result?.activation === "number" ? result.activation : 0,
+    backup: typeof result?.backup === "string" ? result.backup : undefined,
+  };
+}

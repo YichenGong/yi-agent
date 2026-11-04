@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "root": {
+    "keyId": "root-2026-01",
+    "publicKey": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+    "serial": 1,
+    "notBefore": 1767225600,
+    "notAfter": 1798761600
+  },
+  "signature": "aHzX+Ugr2KrokGp4ObT8oIM+xpGX+pJ0Lv5ztN28J6JvMwZuk5B096NReDO2fh7E5NzTFdQ4j7Lu62XqoCkCAg=="
+}

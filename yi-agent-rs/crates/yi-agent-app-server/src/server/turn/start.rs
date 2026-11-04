@@ -82,6 +82,12 @@ pub(crate) async fn start_thread_core(
     // 调用方额外注入给本会话 shell 的环境变量。被驱动的会话用它带插件给的卡片
     // 句柄；RPC 起的会话传空集（与改动前逐字一致）。
     extra_session_env: Vec<(String, String)>,
+    // 本会话绑定的插件发布（零或多条）。驱动会话由 launcher 按已提交激活算好
+    // 传进来；RPC 起的会话传空集（= 普通会话，不绑插件）。
+    //
+    // 为什么由调用方给而不是在这里算：算它需要插件名，而 `start_thread_core`
+    // 对插件一无所知——这正是宿主的边界（不认识任何具体插件）。
+    plugin_bindings: Vec<yi_agent_plugins::Binding>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -143,6 +149,7 @@ pub(crate) async fn start_thread_core(
     // 会话起点已在上面算好并交给 `attach_delegation`（同一个值也落进 meta）：
     // 两处必须是同一个 sha，否则「meta 里的起点」与「工具用的起点」会分叉。
     let meta = crate::thread_store::ThreadMeta {
+        plugin_bindings,
         thread_id: thread_id.clone(),
         cwd: cwd.to_string(),
         model: model.clone(),
@@ -220,6 +227,7 @@ pub(crate) async fn start_thread_core(
             cwd: cwd.to_string(),
             model: model.clone(),
             active_turn_id: None,
+            turn_permit: None,
             yolo,
             process_manager: Arc::clone(&process_manager),
             prompt_tx,

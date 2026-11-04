@@ -29,6 +29,13 @@ pub(crate) async fn handle_shared(
     req: &RequestEnvelope,
     id: RequestId,
 ) -> anyhow::Result<Flow> {
+    // `plugins/v1/*` 是受管协议，与下面这套旧的 supervisor 协议**不共享**名称
+    // 空间：旧的 `plugin/install` 不会因为这里多了一条分支就变成新授权。
+    // 先分流，避免旧前缀的将来扩展误吞新方法。
+    if crate::rpc::plugin_management::handles(req.method.as_str()) {
+        return crate::rpc::plugin_management::handle(state, req, id).await;
+    }
+
     match req.method.as_str() {
         "plugin/query" => {
             // `project` names the project being queried, not the server's cwd:

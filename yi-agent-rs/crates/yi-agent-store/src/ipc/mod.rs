@@ -39,6 +39,7 @@ pub(crate) use crate::schedule::ScheduleDefinition;
 mod client;
 mod daemon;
 mod error;
+mod managed;
 mod plugin_socket;
 mod protocol;
 mod subscription;
@@ -50,6 +51,10 @@ mod trace;
 pub(crate) use client::*;
 pub(crate) use daemon::*;
 pub(crate) use error::*;
+pub use managed::{
+    Compatibility, MAINTENANCE_PROTOCOL_VERSION, MaintenanceBarrier, MaintenanceRequest,
+    MaintenanceState, MaintenanceStatus,
+};
 pub(crate) use plugin_socket::*;
 pub(crate) use protocol::*;
 pub(crate) use subscription::*;

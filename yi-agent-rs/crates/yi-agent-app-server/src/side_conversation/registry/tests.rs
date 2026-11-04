@@ -41,6 +41,7 @@ fn meta(id: &str, cwd: &std::path::Path) -> crate::thread_store::ThreadMeta {
         last_read_at: 0,
         last_completed_at: 0,
         forked_from: None,
+        plugin_bindings: Vec::new(),
     }
 }
 
@@ -418,17 +419,34 @@ async fn side_second_turn_is_accepted_after_the_first_completes() {
         .unwrap();
 
     // Wait for the mock provider's turn to finish so the side is idle again.
-    for _ in 0..200 {
+    //
+    // 判定条件必须是「取到了这条旁支，且它没有进行中的轮次」。原先用
+    // `listed.first().and_then(active_turn_id).is_none()`：`list()` 在父槽位仍是
+    // `Creating` 或摘要读不出时返回空数组，`first()` 一次 `None` 就让循环提前
+    // 退出，随后 `turn_start` 撞上 `TurnInProgress`——失败时报的是「旁支不可
+    // 复用」，真因却是「还没开始等」。
+    //
+    // 剩余的不稳定来自产品侧：pump 偶尔在 `SIDE_STOP_GRACE` 内没能 join 完，
+    // `active` 迟迟不清（`status=Running`）。这在本次改动之前的 main 上同样可
+    // 复现（10 次里 4 次），故本用例把窗口从 2s 放宽到 30s，与
+    // `test_support::EVENT_WAIT` 同一口径：断言的是「最终会空闲」，不是「在
+    // 2 秒内空闲」。真正的 join 缺陷另案处理，不在这里用短窗口假装已修好。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut idle = false;
+    while std::time::Instant::now() < deadline {
         let listed = registry.list("p1").await;
-        if listed
-            .first()
-            .and_then(|s| s.active_turn_id.as_ref())
-            .is_none()
+        if let Some(side) = listed.iter().find(|side| side.side_id == summary.side_id)
+            && side.active_turn_id.is_none()
         {
+            idle = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert!(
+        idle,
+        "the first turn must finish before the side is reusable"
+    );
     let second = registry
         .turn_start(&summary.side_id, "第二问".into(), uuid())
         .await

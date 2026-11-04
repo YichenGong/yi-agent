@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yi-agent.dev/contracts/lifecycle-v1.schema.json",
+  "title": "Lifecycle transaction journal v1",
+  "description": "The persisted progress record of one activation/rollback/disable/uninstall transaction. Its purpose is crash recovery: every phase names what the next action is, whether it can roll back, and whether admission may be open. Recovery happens before admission is opened, which is why only the final phase opens it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "transactionId", "plugin", "action", "phase", "target"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "transactionId": { "type": "string", "pattern": "^tx-[a-z0-9-]{8,63}$" },
+    "plugin": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "action": {
+      "type": "string",
+      "enum": ["Activate", "DisableProject", "Uninstall", "Rollback"],
+      "description": "Exactly four actions. Package download never borrows Activate to enable a project implicitly."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["draining", "drained", "backing_up", "migrating", "health_checking", "committing", "projecting", "done"],
+      "description": "Ordered. Recovery reads this field and applies the matching next action; recovery runs before admission is opened."
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release", "activation"],
+      "properties": {
+        "release": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["plugin", "version", "target", "sha256"],
+          "properties": {
+            "plugin": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+            "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+            "target": { "type": "string", "pattern": "^(darwin|linux|win32)-(aarch64|x86_64)$" },
+            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          }
+        },
+        "activation": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "previous": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["activation"],
+      "properties": {
+        "activation": { "type": "integer", "minimum": 1 },
+        "version": { "type": "string" }
+      }
+    },
+    "blocking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projects", "turns"],
+      "description": "What the barrier is still waiting for. Listed so a user can see which project or turn blocks an update instead of a bare timeout.",
+      "properties": {
+        "projects": { "type": "array", "items": { "type": "string" } },
+        "turns": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "sharedConfigRevision": {
+      "type": ["integer", "null"],
+      "description": "Revision of the shared quota config observed when the backup was taken. Rollback refuses to overwrite a revision someone else advanced."
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["Dependency", "Conflict", "Draining", "ResultUnknown", "RecoveryRequired", "Io", "Incompatible", "Integrity"] },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

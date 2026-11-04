@@ -35,7 +35,21 @@
   判据与证据：K1–K17 逐条测试表见 `[plan 的 K1–K17 证据表](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md#k1k17-证据表2026-11-03)`（每条含测试函数、退出码、commit；真机列为待验收）。门禁实测：`just ci` 通过（nextest 4082 项全绿，含 msrv/audit/secret/bindings）、`cargo test -p superpowers-kanban-runner` 267+48、`-p superpowers-kanban-ipc` 30、`npx tsc --noEmit` + `npx vitest run` 2063/153 全绿、`git diff --check` 干净。变异证据：删宿主上送 → 4 failed；`normalize` 忽略完整快照 → 9 failed；删前置保存 → 6 failed。
   尚未完成（故本条不勾）：Task 8 Step 4/5 的独立实例真机验收——独立 bundle id + 绝对 `YI_AGENT_HOME` 打包、真实宿主重启后原卡未加载语义、手动打开原 thread 后下一 tick 角标消失、无额外 turn / 无新 thread ID、热表移除但保留历史只提示未加载、旧载荷下新 UI 只说未观测到。本会话已在真实插件二进制上验证 CLI 投影（`not_loaded` 带时间、旧 `alive:false` 与非法日期均落 `unknown`），但**未**在真实宿主 + 桌面实例上走完上述矩阵。验证入口：`cargo test -p yi-agent-app-server --lib kanban_observation_`、`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`、`cd desktop && npx vitest run src/lib/kanbanObservation.test.ts`。
 
-- [ ] **完整插件独立发布** — 界面、执行程序与 skill 统一版本，通过通用宿主安装和加载；官方包校验、显式项目启用、安全更新及远端版本匹配均须通过。完成判据：[设计](../superpowers/specs/2026-11-02-kanban-independent-release-design.md) §13 的 A01–A20 全部验收项，尤其在同一 yi-agent 应用包下更新看板界面且主程序发布物摘要不变。[实施总计划](../superpowers/plans/2026-11-02-kanban-independent-release.md) 已列出 27 个主任务、技术验证与子协议审阅门槛，当前仅完成设计、计划与多轮文档复查，尚未实现。
+- [ ] **完整插件独立发布** — 界面、执行程序与 skill 统一版本，通过通用宿主安装和加载；官方包校验、显式项目启用、安全更新及远端版本匹配均须通过。完成判据：[设计](../superpowers/specs/2026-11-02-kanban-independent-release-design.md) §13 的 A01–A20 全部验收项，尤其在同一 yi-agent 应用包下更新看板界面且主程序发布物摘要不变。
+
+  T01–T24 已实现（宿主通用插件核心、受管安装/激活、桥与 SDK、看板迁移与旧安装接管）。T25 的 Step 1–3 已完成并可验证：`python3 -m unittest discover -s scripts/plugins -p 'test_check_host_boundary.py'`（10 passed）、`python3 scripts/plugins/check-host-boundary.py`（exit 0），宿主不再含看板专属路径。T26 Step 1–2 已完成：`plugin-pack`（确定性 tar.gz + 签名，`cargo test -p yi-agent-plugins --test pack` 4 passed）与插件发布 tag 门禁（`just plugin-release-check` 11 passed，已进 `just ci` 成为第 16 道门禁）。
+
+T25 Step 4 已完成并可复现：`bash yi-agent-rs/scripts/verify-plugin-update.sh <built .app> .` 在同一 `.app` 上装 1.0.0 再装 1.1.0，UI 标记 `board-v1` → `board-v2`，主程序 `Contents/MacOS/desktop` 与整个 bundle 摘要前后一致。
+
+T26 Step 3 已完成：`just plugin-check`（`plugin-workspace-check` / `plugin-ui-check` / `plugin-contracts-check` / `plugin-boundary-check`）本地全绿，GitHub `plugins` job 与 GitLab `ci-plugins` job 均跑在云端 runner、不带 `tags:`，插件门禁不再借用 self-hosted runner 或任何签名密钥。
+
+T27 已落地的部分：
+
+- Step 1（报告校验器）：`scripts/plugins/acceptance-cases.json` 是 A01–A20 唯一真相，`scripts/plugins/e2e-report.mjs` 要求每条**有且仅有一个**最终结果、只认 `pass`，并拒绝三种伪造：probe 构建冒充正式包（A20 必须 `unsupported`）、A16/A17 用 loopback 或 `127.0.0.0/8` 冒充远端、`official` 证据缺签名身份或未公证。`just plugin-acceptance-check` 24 passed；变异验证三项各自被拦。
+- Step 2（故障注入矩阵）：`scripts/plugins/fault-matrix.json` 把断线提交、旧 frame 重放、两实例预算、活跃审批、更新收尾、候选不可见、共享配置修订冲突、旧安装接管、待清理卸载、每阶段崩溃十项绑到 41 个既有测试；`just plugin-fault-matrix` 真跑 nextest 得 10/10 项、41/41 测试 ok。改名任一测试即 9/10 并以退出码 1 失败。
+- Step 4（同一 `.app` 上的 v1→v2）：`just plugin-update-check /Applications/yi-agent.app` 得 UI `board-v1`→`board-v2`、主程序 desktop 与 bundle 摘要前后一致、`verify-active-release.py` 校验活跃版本/view 摘要/skill 来源、卸载后项目数据保留且托管入口消失。五种变异各自被拦。
+
+**仍未完成：** T26 Step 4（平台签名/公证与真实下载后的 OS 执行策略验证）需要发布授权与签名密钥；T27 Step 3（真实非 loopback 远端宿主证据）需要可访问的外部机器，A16/A17 因此保持未完成；T27 Step 4 的脱敏报告与截图、以及 Step 5 的最终验收提交同样待办。因此本条保持 `[ ]`。>>>>>>> kanban/2026-11-02-kanban-independent-release-design-2026-11-02-kanban-independent-release
 
 - [x] **合并续跑原开发会话（方案 B）** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：实现卡获授权后只续跑原 `thread_id`，冷会话由宿主恢复；忙碌时等待，不可恢复时 `NeedsYou`，不降级新建；开发 `workdir` 不被合并目录覆盖，并发租约不重复领取。验证入口：`cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`（225 lib + 45 bin 通过）。
 

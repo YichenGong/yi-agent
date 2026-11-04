@@ -14,6 +14,13 @@ edition = "2021"
 name = "desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# 隔离 WebView 技术探针。**永远不出现在正式构建里**：它编译额外的原生窗口
+# 编排与测试身份注入，开启后 `--plugin-probe-run` 才会被识别。默认关闭，
+# `tauri build` 不带它，因此正式包不可能带上测试后门。
+plugin-probe = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 # Reads the sidecar's `internal-runtime identity --json` output at build time.
@@ -50,6 +57,9 @@ yi-agent-flags = { path = "../../yi-agent-rs/crates/yi-agent-flags" }
 # serde/libc。桌面壳**直接**持有租约与心跳（App 的身份不随 sidecar 重启改变），
 # 所以它必须是桌面自己的依赖，而不是经 supervisors 间接获得（那会拖进 SQLite）。
 yi-agent-lifecycle = { path = "../../yi-agent-rs/crates/yi-agent-lifecycle" }
+# 插件视图的资源服务要复用验签/清单/生命周期的**值类型与校验**，不能自己
+# 再造一份。这个 crate 不依赖 SQLite，所以不会把数据库链进桌面二进制。
+yi-agent-plugins = { path = "../../yi-agent-rs/crates/yi-agent-plugins" }
 
 [dev-dependencies]
 # Bridge tests write/read `preferences.json` in a throwaway home.

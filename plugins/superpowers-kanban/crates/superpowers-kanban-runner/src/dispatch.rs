@@ -80,7 +80,7 @@ pub fn dispatch_with_home(
     params: &Value,
 ) -> Result<Value, String> {
     let service = service_for(state_dir);
-    dispatch_in(&service, state_dir, home, global, method, params)
+    dispatch_ledgered(&service, state_dir, home, global, method, params)
 }
 
 /// 解析 `driver/next` 参数里的 `capabilities.actions`。
@@ -115,10 +115,118 @@ pub fn dispatch_with_service(
     params: &Value,
 ) -> Result<Value, String> {
     let home = superpowers_kanban_core::calendar::ConcurrencyCalendar::home_dir();
-    dispatch_in(service, state_dir, home.as_deref(), global, method, params)
+    dispatch_ledgered(service, state_dir, home.as_deref(), global, method, params)
 }
 
-/// 本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
+/// 清单声明的业务方法名 → 本模块内部分派用的名字。
+///
+/// 两套名字各有来源，谁都不能改对方。发布清单的 `methods[].name` 由 G1 的
+/// schema 固定为 `namespace/verb` 且每段只允许 camelCase——`switch.read` 与
+/// `enqueue_prequeued` 在那里都是非法写法。而这里的 match 臂是旧 supervisor
+/// 协议（`plugin/query`）的线上名字，已在用的调用方按裸名问话，改名会打断它们。
+///
+/// 所以翻译放在这一层：清单名是**对外契约**，裸名是**内部实现**，中间这张表
+/// 是唯一允许两者发生关系的地方。把别名写进 match 臂做不到——契约检查器会从
+/// `dispatch_in` 的 match 表抽取 IPC 方法清单，多出来的名字会被判为「源码里
+/// 存在但契约里没分类」，而它们本来就不该出现在旧协议的方法表里。
+///
+/// 表必须与 `plugins/superpowers-kanban/plugin.json` 的 `methods` 逐条对应；
+/// 漏一条会让那个方法在受管入口下报 `unknown method`，多一条则是死代码。
+fn bare_method(method: &str) -> &str {
+    match method {
+        "board/list" => "list",
+        "board/enqueue" => "enqueue",
+        "board/enqueuePrequeued" => "enqueue_prequeued",
+        "board/promote" => "promote",
+        "board/readSwitch" => "switch.read",
+        "board/writeSwitch" => "switch.write",
+        // Settings reads are `board/prefs`, not `board/readSettings`: the
+        // manifest checker refuses any Read method whose name contains a
+        // destructive verb ("settings" contains "set"), and the rule is worth
+        // keeping blunt rather than teaching it about word boundaries.
+        "board/prefs" => "settings.read",
+        "board/storePrefs" => "settings.write",
+        "board/startLifecycle" => "lifecycle/create",
+        "board/stopLifecycle" => "lifecycle/remove",
+        "board/operation" => "board.operation",
+        other => other,
+    }
+}
+
+/// 账本包装层：带 `request_id` 的写先结算，再进方法表。
+///
+/// 包装层刻意不叫 `dispatch_in`：那个名字属于契约，`check-contracts.mjs`
+/// 按它定位方法表并抽取 IPC 方法清单。把它挪给包装层，抽取器就抽不到任何
+/// 方法，而那条检查在空表时只报"正则过期"——很容易被当成无关噪声忽略掉。
+/// 方法表留在原名下，包装层另起一个名字。（这段文字也刻意不写出那个带括号
+/// 的函数签名：抽取器在源码里做字面量查找，写在注释里会先命中注释。）
+fn dispatch_ledgered(
+    service: &BoardService,
+    state_dir: &Path,
+    home: Option<&Path>,
+    global: Option<SwitchValue>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    // 声明名在进入分派前翻译成内部名：见 `bare_method` 的两套名字说明。
+    let method = bare_method(method);
+
+    // 写操作先过账本：带 `request_id` 的写按 `(id, method, params)` 幂等，
+    // 崩溃或断线后重复查询得到 committed/unknown，而不是再投递一次。
+    // 读操作与不带 id 的写（旧 supervisor 协议）直接走下面的分派——旧协议
+    // 没有 requestId 字段，替它编一个会让"重试"和"新请求"分不开。
+    if let Some(request_id) = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        if is_write(method) {
+            let ledger = crate::operations::OperationLedger::open(state_dir);
+            return match ledger.settle(request_id, method, params, || {
+                dispatch_in(service, state_dir, home, global, method, params)
+            }) {
+                Ok(crate::operations::Settled::Executed { result }) => Ok(result),
+                Ok(crate::operations::Settled::Replayed { result }) => Ok(result),
+                Ok(crate::operations::Settled::PreviouslyRejected { error }) => Err(error),
+                // 受理过但结论不可知：如实报告，不重跑。（重跑正是这条规则要防的。）
+                Ok(crate::operations::Settled::Unknown) => Err(format!(
+                    "request {request_id} was accepted but its outcome is unknown;                      query `board/operation` instead of retrying"
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+    }
+
+    dispatch_in(service, state_dir, home, global, method, params)
+}
+
+/// 带 `request_id` 的写操作需要结算；其余方法不记流水。
+///
+/// 判据是"改业务状态"，与 `contract/managed-v1.json` 的 effect 同源：
+/// Launch 产生新自动任务、Write/QuotaWrite/Resident 改状态，都算写。
+fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "enqueue"
+            | "enqueue_prequeued"
+            | "promote"
+            | "enqueue_merge"
+            | "switch.write"
+            | "board.next_launch"
+            | "board.mark_running"
+            | "board.mark_terminal"
+            | "board.release"
+            | "merge_request"
+            | "merge_finish"
+            | "merge_cancel"
+            | "card.state"
+            | "lifecycle/create"
+            | "lifecycle/remove"
+            | "settings.write"
+    )
+}
+
+/// 方法表本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
 fn dispatch_in(
     service: &BoardService,
     state_dir: &Path,
@@ -452,6 +560,23 @@ fn dispatch_in(
                 .map_err(|error| format!("could not save the project settings: {error}"))?;
             Ok(json!({ "ok": true }))
         }
+        // 受管写的结果查询。宿主的 `plugins/v1/operationResult` 要到 T23 才
+        // 接上，而页面在断线后**必须**能问"那次写到底落没落"，否则只能重发。
+        // 这条业务方法把同一本账翻给页面看：`committed` 表示已落盘，
+        // `unknown` 表示受理过但结论不可知，`rejected` 表示执行过且失败。
+        "board.operation" => {
+            let request_id = params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "board.operation needs a `request_id`".to_string())?;
+            let ledger = crate::operations::OperationLedger::open(state_dir);
+            let result = ledger
+                .result(request_id)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(result)
+                .map_err(|error| format!("could not encode the operation result: {error}"))
+        }
         other => Err(format!("unknown method: {other}")),
     }
 }
@@ -588,6 +713,144 @@ mod tests {
             .expect("enqueue must return an id");
         let delivered = superpowers_kanban_core::inbox::enqueue_path(dir.path(), id);
         assert!(delivered.is_file(), "expected a delivery at {delivered:?}");
+    }
+
+    #[test]
+    fn the_same_request_id_delivers_a_card_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let params = json!({
+            "spec_path": spec, "plan_path": plan, "request_id": "req-1"
+        });
+
+        let first = dispatch_with_global(dir.path(), None, "enqueue", &params).unwrap();
+        let second = dispatch_with_global(dir.path(), None, "enqueue", &params).unwrap();
+
+        // 同一个 id 第二次不投递，直接把第一次的结果还回来。
+        assert_eq!(first, second);
+        let id = first["id"].as_str().unwrap();
+        let inbox = superpowers_kanban_core::inbox::inbox_dir(dir.path());
+        let deliveries = std::fs::read_dir(&inbox)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{id}."))
+            })
+            .count();
+        assert_eq!(deliveries, 1, "one request id must mean one delivery");
+    }
+
+    #[test]
+    fn the_same_request_id_with_different_params_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap();
+
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "title": "other", "request_id": "req-1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("different method or params"), "{error}");
+    }
+
+    #[test]
+    fn an_interrupted_write_is_reported_unknown_and_not_redelivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let params = json!({"spec_path": spec, "plan_path": plan});
+
+        // 模拟"已受理、执行中被杀"：磁盘上只有 pending，没有结论。
+        let ledger = crate::operations::OperationLedger::open(dir.path());
+        ledger
+            .record(
+                "req-1",
+                "enqueue",
+                &params,
+                crate::operations::Status::Pending,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown"), "must not guess: {error}");
+        assert!(
+            !superpowers_kanban_core::inbox::inbox_dir(dir.path()).exists(),
+            "an unknown outcome must not be re-delivered"
+        );
+
+        // 查询得到 unknown，页面据此显示"结果未知"而不是重发。
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "board.operation",
+            &json!({"request_id": "req-1"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "unknown");
+    }
+
+    #[test]
+    fn a_committed_write_can_be_queried_by_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan, "request_id": "req-1"}),
+        )
+        .unwrap();
+
+        let queried = dispatch_with_global(
+            dir.path(),
+            None,
+            "board.operation",
+            &json!({"request_id": "req-1"}),
+        )
+        .unwrap();
+        assert_eq!(queried["status"], "committed");
+        assert_eq!(queried["result"], result);
+    }
+
+    #[test]
+    fn a_write_without_a_request_id_still_works() {
+        // 旧 supervisor 协议没有 requestId 字段。替它编一个会让"重试"与
+        // "新请求"分不开，所以不带 id 的写必须照旧直接执行。
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let result = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue",
+            &json!({"spec_path": spec, "plan_path": plan}),
+        )
+        .unwrap();
+        assert!(result["id"].is_string());
+        assert!(
+            !crate::operations::OperationLedger::open(dir.path())
+                .lookup("req-1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// 项目层偏好落在状态目录**旁边**，所以测试必须用真实的 `<workdir>/.yi-agent/
@@ -885,6 +1148,49 @@ mod tests {
                 .unwrap();
         assert_eq!(value["status"], "denied");
         assert!(value["reason"].as_str().unwrap().contains("nope"));
+    }
+
+    /// 计划 T22 Step 2 点名的第二种写：重复投递合并授权不能占两次名额。
+    ///
+    /// `merge_request` 本身已经是幂等状态机（`merge_queued` 上再来一次不改
+    /// 队列位置），但那是**业务**幂等；这条测的是**传输**幂等——同一个
+    /// requestId 连投两次，第二次直接回放第一次的结果，不再走一遍业务逻辑。
+    #[test]
+    fn the_same_request_id_grants_a_merge_slot_only_once() {
+        use superpowers_kanban_core::card::{CardId, CardState};
+
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        // 落盘一张 awaiting_merge 的实现卡；BoardService 构造时读一次。
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            CardId::new("impl"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&CardId::new("impl"), CardState::AwaitingMerge)
+            .unwrap();
+        crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+
+        let params = json!({ "card_id": "impl", "request_id": "req-merge-1" });
+        let first = dispatch_with_global(&state, None, "merge_request", &params).unwrap();
+        let second = dispatch_with_global(&state, None, "merge_request", &params).unwrap();
+        assert_eq!(
+            first, second,
+            "a repeated request id replays the first answer"
+        );
+
+        // 队列里只有一张合并请求：重复投递没有把它变成两张。
+        let listed = dispatch_with_global(&state, None, "list", &json!({})).unwrap();
+        let queued = listed["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|card| card["state"] == "merge_queued")
+            .count();
+        assert_eq!(queued, 1, "{listed}");
     }
 
     #[test]
@@ -1228,6 +1534,191 @@ mod tests {
                 .state,
             superpowers_kanban_core::card::CardState::Queued
         );
+    }
+
+    /// 两个实例、两个项目、同一份整机峰值：不允许各自再得到全额。
+    ///
+    /// 这条是 T13 的核心红例。只用 `sessions.running` 实现时它会绿——两个实例
+    /// 各自上报 0，各自看到"峰值 2 还有 2 个名额"，于是合计起 4 个。只有真的
+    /// 读整机活动表（别人持锁登记的会话数）才会红。
+    #[test]
+    fn two_instances_do_not_each_get_the_full_machine_peak() {
+        let workdir = tempfile::tempdir().unwrap();
+        let dir_a = workdir.path().join("a");
+        let dir_b = workdir.path().join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let project_a = project_with_worktree(&dir_a);
+        let project_b = project_with_worktree(&dir_b);
+        let state_a = state_dir(&project_a);
+        let state_b = state_dir(&project_b);
+
+        // 两份看板共用一个 home，因此共用一份配额域。
+        let home = workdir.path().join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        // 两个实例的看板里**各自**都有一张排队卡。少了这一步，实例 B 即使
+        // 拿到全额余量也无卡可起，测试会以"没有动作"通过——那是假绿。
+        let enqueue = |state: &Path| {
+            std::fs::create_dir_all(state).unwrap();
+            let mut board = superpowers_kanban_core::board::Board::new();
+            board.enqueue(
+                superpowers_kanban_core::card::CardId::new("card-1"),
+                "a.spec.md".into(),
+                "a.plan.md".into(),
+                chrono::Local::now(),
+            );
+            crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+        };
+        enqueue(&state_a);
+        enqueue(&state_b);
+
+        let service_a = crate::service::BoardService::new(
+            state_a.clone(),
+            project_a.clone(),
+            Some(home.clone()),
+        );
+        let service_b = crate::service::BoardService::new(
+            state_b.clone(),
+            project_b.clone(),
+            Some(home.clone()),
+        );
+
+        // 实例 A 已经在跑 2 个会话（宿主上报，同时它会把 2 写进活动表）。
+        dispatch_with_service(
+            &service_a,
+            &state_a,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+        )
+        .unwrap();
+
+        // 实例 B 自己也上报 0 —— 它只能看到自己。若直接拿 0 去比峰值，
+        // 它会以为还有 2 个名额。
+        let value = dispatch_with_service(
+            &service_b,
+            &state_b,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 0 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["kind"].as_str(),
+            None,
+            "整机已被实例 A 占满，实例 B 不许再起：{value}"
+        );
+        // 也必须真的**没有认领**：卡还是 queued。只看返回值会漏掉
+        // "返回了动作但字段名不对" 这一整类错误。
+        assert_eq!(
+            crate::persist::read_board(&state_b)
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued,
+            "the card must stay queued when the machine is full"
+        );
+    }
+
+    /// 普通非看板回合也消耗预算。
+    ///
+    /// 看板只起自己那几张卡，但用户的**手动**会话也在调模型。`sessions.running`
+    /// 的口径本来就包含它们；活动表也照抄这个口径，所以一个纯手动会话必须
+    /// 让看板少一个名额。
+    #[test]
+    fn a_plain_non_board_turn_consumes_the_shared_budget() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 1,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        // 峰值 1，一个与看板无关的会话正开着。
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 1 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["kind"].as_str(),
+            None,
+            "手动会话也吃同一份额度：{value}"
+        );
+        assert_eq!(
+            crate::persist::read_board(&state)
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued,
+            "a plain manual turn must leave no room for an automatic launch"
+        );
+    }
+
+    /// 实例关停后不能留下虚假活动继续扣额度。
+    #[test]
+    fn a_closed_instance_leaves_no_phantom_activity() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        {
+            let service = crate::service::BoardService::new(
+                state.clone(),
+                project.clone(),
+                Some(home.clone()),
+            );
+            dispatch_with_service(
+                &service,
+                &state,
+                None,
+                "driver/next",
+                &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+            )
+            .unwrap();
+        }
+
+        // 实例已 drop（flock 释放）。新实例必须看到整机空闲，而不是被
+        // 上一实例留下的数字继续扣着。
+        let fresh =
+            crate::service::BoardService::new(state.clone(), project.clone(), Some(home.clone()));
+        let domain = fresh.quota_domain().expect("shared domain");
+        // 有界收敛而不是一拍断言：`flock` 的释放与探测之间没有同步保证（内核
+        // 异步释放；`fork`/`exec` 之间的子进程共享描述符）。生产调用方每拍都
+        // 重算，同样只依赖最终一致。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let total = crate::quota::observe_machine(&domain).unwrap().total();
+            if total == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a closed instance must not keep burning the machine budget; still {total}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// 端到端跨进程契约：一张排队卡 → 恰好一个 `launch`，字段名逐字对齐宿主
@@ -1657,6 +2148,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["id"], "my-idea");
+    }
+
+    /// 清单声明的名字必须真的分派得动：改名或漏改别名表都会在这里红。
+    ///
+    /// 这条用声明名走一遍 `list`，证明翻译表把名字接到了真实分支上——只断言
+    /// `bare_method("board/list") == "list"` 会漏掉「接到哪个分支」这半件事。
+    #[test]
+    fn the_declared_manifest_names_dispatch_to_the_same_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "声明名".into(),
+            None,
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+
+        let declared = dispatch_with_global(dir.path(), None, "board/list", &json!({})).unwrap();
+        let bare = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        assert_eq!(
+            declared, bare,
+            "the declared name must reach the same branch"
+        );
+
+        // 未知名字仍然报错，不会被当成某个已知分支放行。
+        let unknown = dispatch_with_global(dir.path(), None, "board/nope", &json!({}));
+        assert!(unknown.is_err());
+    }
+
+    /// 别名表与清单必须逐条对应。
+    ///
+    /// 「清单里有、表里没有」会让那个方法在受管入口下报 `unknown method`；
+    /// 「表里有、清单里没有」是死代码，也说明有人改了名字却只改了一边。
+    #[test]
+    fn every_declared_method_has_a_rename_and_every_rename_is_declared() {
+        // Parse the manifest rather than scanning lines: it is indented JSON, so
+        // any line-prefix trick silently finds zero methods and the assertion
+        // below would pass for the wrong reason. `include_str!` also makes this
+        // a compile-time dependency, so the test breaks if the file moves.
+        let manifest: Value =
+            serde_json::from_str(include_str!("../../../plugin.json")).expect("plugin.json parses");
+        let declared: Vec<String> = manifest["methods"]
+            .as_array()
+            .expect("methods is an array")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .filter(|name| name.starts_with("board/"))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            declared.len() >= 10,
+            "expected the manifest to declare the board methods, found {}",
+            declared.len()
+        );
+
+        for name in &declared {
+            assert_ne!(
+                bare_method(name),
+                name.as_str(),
+                "the manifest declares \"{name}\" but the rename table does not know it"
+            );
+        }
+
+        // 反向：表里的每条别名都必须在清单里声明。
+        let known = [
+            "board/list",
+            "board/enqueue",
+            "board/enqueuePrequeued",
+            "board/promote",
+            "board/readSwitch",
+            "board/writeSwitch",
+            "board/prefs",
+            "board/storePrefs",
+            "board/startLifecycle",
+            "board/stopLifecycle",
+        ];
+        for name in known {
+            assert!(
+                declared.iter().any(|entry| entry == name),
+                "the rename table knows \"{name}\" but the manifest does not declare it"
+            );
+        }
     }
 
     #[test]

@@ -17,14 +17,6 @@ pub struct FlagDef {
 /// 组长（lead agent）的总开关。名字一旦发布就是 `flags.json` 的键，不能改。
 pub const LEAD_AGENT_FLAG: &str = "lead_agent";
 
-/// Superpowers 看板的总开关。
-///
-/// 与 `preferences.json` 里的 `superpowers_kanban` 键**同名但不是同一个东西**：
-/// 那个按项目存、管"这个项目要不要干活"，由插件 daemon 自己写；这个是全局闸门，
-/// 管"插件进程起不起"，由设置页经 app-server 写。两者分工见
-/// `yi-agent-supervisors::supervisor::Supervisor::desired_on` 的注释。
-pub const SUPERPOWERS_KANBAN_FLAG: &str = "superpowers_kanban";
-
 /// 远程 SSH 执行的总开关。dev-only：stable 构建下恒关（spec §5.3.1）。
 pub const REMOTE_SSH_FLAG: &str = "remote_ssh";
 
@@ -34,13 +26,6 @@ pub const REGISTRY: &[FlagDef] = &[
         summary: "组长：项目级常驻会话，负责分派与回收子任务",
         owner: "yichen",
         expires_on: "2027-01-31",
-        default: false,
-    },
-    FlagDef {
-        name: SUPERPOWERS_KANBAN_FLAG,
-        summary: "Superpowers 看板：项目级看板、卡片会话与后台值守",
-        owner: "yichen",
-        expires_on: "2027-03-31",
         default: false,
     },
     FlagDef {
@@ -180,13 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn the_superpowers_kanban_flag_is_registered() {
-        let def = find("superpowers_kanban").expect("superpowers_kanban must be in the registry");
-        assert!(!def.default, "the kanban must default to off");
+    fn a_plugin_switch_is_not_a_host_flag() {
+        // 插件自己的开关由插件在清单里声明 `switch_key` 并经受管生命周期推进，
+        // 不进宿主 flag 注册表——否则主程序就得替每个插件预先登记一个名字，
+        // 也和「加插件不用改主程序」直接冲突。
         assert!(
-            !def.summary.is_empty(),
-            "a summary is what the settings page shows"
+            find("superpowers_kanban").is_none(),
+            "per-plugin switches belong to the plugin manifest, not the host registry"
         );
-        assert_eq!(def.expires_on, "2027-03-31");
     }
 }

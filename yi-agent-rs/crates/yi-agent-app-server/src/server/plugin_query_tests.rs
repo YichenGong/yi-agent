@@ -69,7 +69,7 @@ fn a_query_is_not_gated_on_the_registry() {
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     // 不放 boards.json，也不要 nonce：这个项目从未登记过。
-    let error = plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
+    let error = plugin_query(&project, "list", "example-plugin", json!({}), None).unwrap_err();
     assert_eq!(error.code, "daemon_unavailable", "{error}");
     assert_ne!(error.code, "board_not_created", "{error}");
 }
@@ -87,7 +87,7 @@ fn an_unregistered_project_still_reaches_its_daemon() {
         json!({ "type": "PluginResult", "value": { "cards": [] } }),
     );
 
-    let value = plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap();
+    let value = plugin_query(&project, "list", "example-plugin", json!({}), None).unwrap();
 
     assert_eq!(value["cards"], json!([]));
     let request = seen.lock().unwrap().clone();
@@ -107,7 +107,7 @@ fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
     plugin_query(
         &project,
         "list",
-        "superpowers-kanban",
+        "example-plugin",
         json!({ "verbose": true }),
         None,
     )
@@ -116,7 +116,7 @@ fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
 
     let request = seen.lock().unwrap().clone();
     assert_eq!(request["command"]["type"], "PluginQuery");
-    assert_eq!(request["command"]["plugin"], "superpowers-kanban");
+    assert_eq!(request["command"]["plugin"], "example-plugin");
     assert_eq!(request["command"]["method"], "list");
     assert_eq!(request["command"]["params"]["verbose"], true);
 }
@@ -142,7 +142,7 @@ fn write_manifest(project: &Path, name: &str, switch_key: &str) {
 fn a_switched_off_plugin_says_disabled_instead_of_broken() {
     let dir = tempfile::tempdir().unwrap();
     let project = project_dir(dir.path());
-    write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+    write_manifest(&project, "example-plugin", "example_plugin_switch");
 
     let flags = dir.path().join("flags.json");
     std::fs::write(&flags, r#"{"version":1,"flags":{}}"#).unwrap();
@@ -152,18 +152,12 @@ fn a_switched_off_plugin_says_disabled_instead_of_broken() {
     };
 
     // 故意不起 daemon：若实现走到连 socket，返回的会是 `daemon_unavailable`。
-    let error = plugin_query(
-        &project,
-        "list",
-        "superpowers-kanban",
-        json!({}),
-        Some(&gate),
-    )
-    .unwrap_err();
+    let error =
+        plugin_query(&project, "list", "example-plugin", json!({}), Some(&gate)).unwrap_err();
 
     assert_eq!(error.code, "plugin_disabled", "{error}");
     assert!(
-        error.message.contains("superpowers_kanban"),
+        error.message.contains("example_plugin_switch"),
         "the message must name the switch to flip: {error}"
     );
 }
@@ -172,12 +166,12 @@ fn a_switched_off_plugin_says_disabled_instead_of_broken() {
 fn a_switched_on_plugin_still_reaches_the_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let project = project_dir(dir.path());
-    write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+    write_manifest(&project, "example-plugin", "example_plugin_switch");
 
     let flags = dir.path().join("flags.json");
     std::fs::write(
         &flags,
-        r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
     )
     .unwrap();
     let gate = crate::plugin_gate::Gate {
@@ -189,14 +183,7 @@ fn a_switched_on_plugin_still_reaches_the_daemon() {
         &project,
         json!({ "type": "PluginResult", "value": { "cards": [] } }),
     );
-    let value = plugin_query(
-        &project,
-        "list",
-        "superpowers-kanban",
-        json!({}),
-        Some(&gate),
-    )
-    .unwrap();
+    let value = plugin_query(&project, "list", "example-plugin", json!({}), Some(&gate)).unwrap();
     assert_eq!(value["cards"], json!([]));
     handle.join().unwrap();
 }
@@ -205,12 +192,12 @@ fn a_switched_on_plugin_still_reaches_the_daemon() {
 fn a_stable_build_never_lets_the_flag_through() {
     let dir = tempfile::tempdir().unwrap();
     let project = project_dir(dir.path());
-    write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+    write_manifest(&project, "example-plugin", "example_plugin_switch");
 
     let flags = dir.path().join("flags.json");
     std::fs::write(
         &flags,
-        r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        r#"{"version":1,"flags":{"example_plugin_switch":true}}"#,
     )
     .unwrap();
     let gate = crate::plugin_gate::Gate {
@@ -218,14 +205,8 @@ fn a_stable_build_never_lets_the_flag_through() {
         flags_path: flags,
     };
 
-    let error = plugin_query(
-        &project,
-        "list",
-        "superpowers-kanban",
-        json!({}),
-        Some(&gate),
-    )
-    .unwrap_err();
+    let error =
+        plugin_query(&project, "list", "example-plugin", json!({}), Some(&gate)).unwrap_err();
     assert_eq!(error.code, "plugin_disabled", "{error}");
 }
 
@@ -245,7 +226,7 @@ fn a_missing_plugin_name_is_refused_before_touching_the_daemon() {
 fn an_unreachable_daemon_reports_that_the_plugin_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let project = project_dir(dir.path());
-    let error = plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
+    let error = plugin_query(&project, "list", "example-plugin", json!({}), None).unwrap_err();
     assert!(error.message.contains("daemon is unavailable"), "{error}");
     assert_eq!(error.code, "daemon_unavailable", "{error}");
 }
@@ -263,7 +244,7 @@ fn a_daemon_that_does_not_supervise_the_plugin_reports_plugin_unavailable() {
         }),
     );
 
-    let error = plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
+    let error = plugin_query(&project, "list", "example-plugin", json!({}), None).unwrap_err();
     handle.join().unwrap();
 
     assert_eq!(error.code, "plugin_unavailable", "{error}");
@@ -335,7 +316,7 @@ async fn the_rpc_reports_a_missing_daemon_in_data_for_an_unregistered_project() 
             "method": "plugin/query",
             "params": {
                 "project": project.to_string_lossy(),
-                "plugin": "superpowers-kanban",
+                "plugin": "example-plugin",
                 "method": "list",
                 "params": {},
             },

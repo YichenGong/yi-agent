@@ -3,7 +3,10 @@ use std::sync::RwLock;
 
 use crate::discovery::{SkillRoot, discover_skills};
 use crate::loader::split_frontmatter;
-use crate::model::{SkillError, SkillMetadata, SkillScope};
+use crate::model::{
+    ManagedRoot, SkillConflict, SkillConflictEntry, SkillError, SkillMetadata, SkillScope,
+    SkillSource, SkillVisibility,
+};
 
 const CATALOG_HEADER: &str = "## Skills\n\n\
 A skill is a set of instructions. Each skill is listed below with its name, a brief description, \
@@ -20,11 +23,93 @@ impl SkillsService {
     pub fn new(roots: Vec<(PathBuf, SkillScope)>) -> Self {
         let roots = roots
             .into_iter()
-            .map(|(path, scope)| SkillRoot { path, scope })
+            .map(|(path, scope)| SkillRoot {
+                path,
+                scope,
+                source: SkillSource::Local,
+            })
             .collect();
         Self {
             roots,
             cache: RwLock::new(None),
+        }
+    }
+
+    /// 普通来源 + 插件受管来源。
+    ///
+    /// 受管来源各占一个 root，scope 固定 `Managed`、source 带上插件与版本：
+    /// 这样 catalog 能排、冲突能说清是谁的。
+    pub fn with_managed(roots: Vec<(PathBuf, SkillScope)>, managed: Vec<ManagedRoot>) -> Self {
+        let mut all: Vec<SkillRoot> = roots
+            .into_iter()
+            .map(|(path, scope)| SkillRoot {
+                path,
+                scope,
+                source: SkillSource::Local,
+            })
+            .collect();
+        all.extend(managed.into_iter().map(|root| SkillRoot {
+            path: root.path,
+            scope: SkillScope::Managed,
+            source: SkillSource::Managed {
+                plugin: root.plugin,
+                version: root.version,
+            },
+        }));
+        Self {
+            roots: all,
+            cache: RwLock::new(None),
+        }
+    }
+
+    /// 同名 skill 出现在多个来源里。
+    ///
+    /// 只在**涉及受管来源**时算冲突：两条普通 skill 同名是用户自己的排布，
+    /// 已有的 Project→User→System 排序已经说明了谁优先，宿主不该替用户裁决
+    /// 他自己写的两份东西。
+    pub fn conflicts(&self) -> Result<Vec<SkillConflict>, SkillError> {
+        let skills = self.snapshot()?;
+        let mut by_name: std::collections::BTreeMap<&str, Vec<&SkillMetadata>> =
+            std::collections::BTreeMap::new();
+        for skill in &skills {
+            by_name.entry(skill.name.as_str()).or_default().push(skill);
+        }
+        let mut out = Vec::new();
+        for (name, entries) in by_name {
+            if entries.len() < 2 {
+                continue;
+            }
+            if !entries.iter().any(|s| s.source.is_managed()) {
+                continue;
+            }
+            out.push(SkillConflict {
+                name: name.to_string(),
+                entries: entries
+                    .into_iter()
+                    .map(|skill| SkillConflictEntry {
+                        path: skill.path.clone(),
+                        source: skill.source.clone(),
+                        root: root_of(&self.roots, &skill.path),
+                    })
+                    .collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// 插件自有 skill 现在能不能驱动自动任务。
+    ///
+    /// 只回答「能不能自动跑」——冲突时普通聊天和只读查看都该照旧，所以这是
+    /// 一个可单独查询的结论，而不是让 snapshot/catalog 失败。
+    pub fn managed_visibility(&self) -> SkillVisibility {
+        match self.conflicts() {
+            Ok(conflicts) if !conflicts.is_empty() => SkillVisibility::Blocked {
+                reason: "conflict".to_string(),
+            },
+            Ok(_) => SkillVisibility::Available,
+            Err(error) => SkillVisibility::Blocked {
+                reason: error.to_string(),
+            },
         }
     }
 
@@ -99,7 +184,20 @@ fn scope_order(scope: SkillScope) -> u8 {
         SkillScope::Project => 0,
         SkillScope::User => 1,
         SkillScope::System => 2,
+        // 受管 skill 排在最后：它们不属于用户，也不该盖过用户自己的同名条目。
+        // 冲突要显式呈现（见 `conflicts`），而不是靠排序静默选一个赢家。
+        SkillScope::Managed => 3,
     }
+}
+
+/// 一个 skill 文件属于哪个 root。冲突提示要给人看的"目录"是 root，不是文件。
+fn root_of(roots: &[SkillRoot], path: &Path) -> PathBuf {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(&root.path))
+        .max_by_key(|root| root.path.components().count())
+        .map(|root| root.path.clone())
+        .unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default())
 }
 
 fn catalog_entry(s: &SkillMetadata) -> String {
@@ -169,6 +267,7 @@ mod tests {
             path: PathBuf::from(format!("/skills/{}/SKILL.md", name)),
             scope,
             body: String::new(),
+            source: SkillSource::Local,
         }
     }
 
@@ -241,6 +340,7 @@ mod tests {
                 path: PathBuf::from("/user/skills/foo/SKILL.md"),
                 scope: SkillScope::User,
                 body: String::new(),
+                source: SkillSource::Local,
             },
             SkillMetadata {
                 name: "foo".to_string(),
@@ -248,6 +348,7 @@ mod tests {
                 path: PathBuf::from("/project/skills/foo/SKILL.md"),
                 scope: SkillScope::Project,
                 body: String::new(),
+                source: SkillSource::Local,
             },
         ];
         let s = SkillsService::new(vec![]);
@@ -341,6 +442,7 @@ mod tests {
             path: PathBuf::from(p),
             scope: SkillScope::User,
             body: String::new(),
+            source: SkillSource::Local,
         };
         let s = SkillsService::new(vec![]);
         // Seed zzz BEFORE aaa so readdir/insertion order cannot mask a

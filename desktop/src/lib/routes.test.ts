@@ -11,6 +11,25 @@ describe("RPC route table", () => {
     expect(RPC.pluginInstall).toBe("plugin/install");
     expect(RPC.pluginUninstall).toBe("plugin/uninstall");
     expect(RPC.pluginsList).toBe("plugins/list");
+    // 受管协议。这些名字在 `plugins/contracts/bridge-v1.schema.json` 的
+    // `enum` 里逐条列出，任何一侧改动都会让 contract checker 与这里同时红。
+    expect(RPC.pluginsV1Catalog).toBe("plugins/v1/catalog");
+    expect(RPC.pluginsV1List).toBe("plugins/v1/list");
+    expect(RPC.pluginsV1Install).toBe("plugins/v1/install");
+    expect(RPC.pluginsV1EnableProject).toBe("plugins/v1/enableProject");
+    expect(RPC.pluginsV1ChangeGrant).toBe("plugins/v1/changeGrant");
+    expect(RPC.pluginsV1DisableProject).toBe("plugins/v1/disableProject");
+    expect(RPC.pluginsV1Activate).toBe("plugins/v1/activate");
+    expect(RPC.pluginsV1Rollback).toBe("plugins/v1/rollback");
+    expect(RPC.pluginsV1Transaction).toBe("plugins/v1/transaction");
+    expect(RPC.pluginsV1CancelTransaction).toBe("plugins/v1/cancelTransaction");
+    expect(RPC.pluginsV1Uninstall).toBe("plugins/v1/uninstall");
+    expect(RPC.pluginsV1ClearData).toBe("plugins/v1/clearData");
+    expect(RPC.pluginsV1Gc).toBe("plugins/v1/gc");
+    expect(RPC.pluginsV1InspectLegacy).toBe("plugins/v1/inspectLegacy");
+    expect(RPC.pluginsV1AdoptLegacy).toBe("plugins/v1/adoptLegacy");
+    expect(RPC.pluginsV1AssetRelease).toBe("plugins/v1/assetRelease");
+    expect(RPC.pluginsV1OperationResult).toBe("plugins/v1/operationResult");
     expect(RPC.residentList).toBe("resident/list");
     expect(RPC.onboardingStatus).toBe("onboarding/status");
     expect(RPC.onboardingApply).toBe("onboarding/apply");

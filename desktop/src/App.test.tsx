@@ -57,13 +57,7 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // that is itself an array models a **multi-select** `open()` (the document
     // picker in Task 10), which returns every chosen path in one call.
     picks: [] as (string | string[] | null)[],
-    // Per-project 看板 (Task 7): what `resident/list` reports as registered, and
-    // what the plugin's `list` answers with.
-    boards: [] as unknown,
-    cards: [] as unknown[],
-    // Workspace groups `thread/listAll` reports. `null` → a single "/w", which
-    // is what the pre-board tests assume. Board tests set the real project
-    // paths, since the sidebar only offers a board row for a group it lists.
+    // Workspace groups `thread/listAll` reports. `null` → a single "/w".
     groupWorkspaces: null as string[] | null,
     // 会话分组：`thread/listAll` 把它们挂到同 workspace 的分组上。
     workspaceGroups: [] as Array<{
@@ -103,9 +97,6 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // 首屏渲染组长条目）测的都是"开关打开时的行为"，缺省成关会让它们全部
     // 变成在测另一条分支。
     leadFlagEnabled: true,
-    // `flags/list` 里 `superpowers_kanban` 的值。默认**开**：既有看板用例测的
-    // 都是"开关打开时的行为"。
-    kanbanFlagEnabled: true,
     // 该宿主是否声明 `side_conversation_v1`。默认**关**：旁支是新增能力，既有
     // 用例（都是老宿主）不该因为多了一条通知命名空间而改变行为。
     sideSupported: false,
@@ -388,13 +379,6 @@ vi.mock("./lib/rpc", () => ({
               expires_on: "2027-01-31",
               source: state.leadFlagEnabled ? "file" : "default",
             },
-            {
-              name: "superpowers_kanban",
-              summary: "Superpowers 看板",
-              enabled: state.kanbanFlagEnabled,
-              expires_on: "2027-03-31",
-              source: state.kanbanFlagEnabled ? "file" : "default",
-            },
           ],
         };
       }
@@ -403,7 +387,6 @@ vi.mock("./lib/rpc", () => ({
         // 否则"设置页拨完开关，界面要跟着变"这条路径根本测不出来。
         const { name, enabled } = params as { name: string; enabled: boolean };
         if (name === "lead_agent") state.leadFlagEnabled = enabled;
-        if (name === "superpowers_kanban") state.kanbanFlagEnabled = enabled;
         return { name, enabled };
       }
       if (method === "thread/lead") {
@@ -457,13 +440,10 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "process/kill") return { ok: true };
-      if (method === "resident/list") return { projects: state.boards };
       if (method === "plugin/query") {
         const inner = (params as { method?: string }).method ?? "";
         const failure = state.hostError[inner] ?? state.rpcError[inner];
         if (failure !== undefined) throw failure;
-        if (inner === "list") return { cards: state.cards };
-        if (inner === "switch.read") return { on: true, source: "project" };
         return {};
       }
       return {};
@@ -530,8 +510,6 @@ beforeEach(() => {
   state.watermarks = {};
   state.pinnedIds = [];
   state.picks = [];
-  state.boards = [];
-  state.cards = [];
   state.groupWorkspaces = null;
   state.workspaceGroups = [];
   state.rpcError = {};
@@ -543,7 +521,6 @@ beforeEach(() => {
   state.failLead = false;
   state.leadAttempts = [];
   state.leadFlagEnabled = true;
-  state.kanbanFlagEnabled = true;
   // 旁支的 fixture 同样要逐用例清：摘要/快照是「服务端此刻有什么」的替身，
   // 留着上一条用例的 side-1 会让下一条用例莫名其妙看到一个已存在、状态却过期的
   // 旁支（表现为「Stop 按钮不出现」这类看似 UI bug 的失败）。
@@ -1817,21 +1794,6 @@ describe("App slash commands", () => {
   });
 });
 
-/**
- * 主区域看板（Task 7）。
- *
- * 侧栏条目是入口（Task 6 已有自己的用例），这里要的是：点开之后主区域给出的
- * 是「那个项目」的看板，而不是某个全局左列——后者连同折叠条一起被删掉了。
- */
-async function openBoardFor(project: string) {
-  // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
-  const header = document.querySelector<HTMLElement>("[data-ws-header]")!;
-  fireEvent.contextMenu(header);
-  await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-  fireEvent.click(screen.getByLabelText("看板"));
-  return project;
-}
-
 describe("App driven-session sidebar refresh", () => {
   it("lists a newly started running card session before its turn completes", async () => {
     state.groupWorkspaces = ["/proj"];
@@ -1842,12 +1804,11 @@ describe("App driven-session sidebar refresh", () => {
       expect(clients[0].requests.some((request) => request.method === "thread/resume")).toBe(true),
     );
 
-    // The driver creates a card thread directly in the server while its turn
-    // starts; only the running status notification tells the desktop about it.
-    // `thread/listAll` knows about it after that notification refreshes groups.
+    // 插件驱动的会话由服务端直接建好、turn 立刻开跑；桌面端只靠 running 状态
+    // 通知得知它的存在，之后由 `thread/listAll` 刷出分组。
     state.threads.push({
       thread_id: "card-thread",
-      title: "看板 · card-1",
+      title: "driven · card-1",
       permission_mode: "yolo",
       driver_project: "/proj",
       driver_ref: "card-1",
@@ -1862,505 +1823,12 @@ describe("App driven-session sidebar refresh", () => {
       }
     });
 
-    await waitFor(() => expect(screen.getByText("看板会话 (1)")).toBeTruthy());
-    fireEvent.click(screen.getByLabelText("看板会话"));
-    expect(screen.getByText("看板 · card-1")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("驱动会话 (1)")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("驱动会话"));
+    expect(screen.getByText("driven · card-1")).toBeTruthy();
   });
 });
 
-describe("App 主区域看板", () => {
-  it("未选中看板时不渲染看板面板，也没有全局左列", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-
-    // 看板只在选中时才进主区域；没点之前一个都不该有。
-    expect(screen.queryByText("Superpowers 看板")).toBeNull();
-    expect(screen.queryByLabelText("收起看板")).toBeNull();
-    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
-  });
-
-  it("在设置页打开看板开关后，侧栏入口立刻出现，不用重启", async () => {
-    // 现场回归：开关是在设置页拨的，而 `kanbanEnabled` 原先只在握手时读一次。
-    // 结果用户打开开关后界面上什么也不会发生——必须重启 app 才生效，
-    // 而用户无法从界面上得知这一点。
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.kanbanFlagEnabled = false;
-    render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
-    );
-    expect(screen.queryByLabelText("看板")).toBeNull();
-
-    // 走真实的设置页路径：设置 → 实验功能 → 勾上看板开关。
-    fireEvent.click(screen.getByRole("button", { name: "设置" }));
-    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
-    const box = (await screen.findByLabelText("superpowers_kanban 开关")) as HTMLInputElement;
-    expect(box.checked).toBe(false);
-    fireEvent.click(box);
-
-    // 不重启、不重新握手：侧栏必须自己长出来。
-    expect(await screen.findByLabelText("看板")).toBeTruthy();
-  });
-
-  it("在设置页关掉看板开关后，侧栏入口立刻消失", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-
-    fireEvent.click(screen.getByRole("button", { name: "设置" }));
-    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
-    const box = (await screen.findByLabelText("superpowers_kanban 开关")) as HTMLInputElement;
-    expect(box.checked).toBe(true);
-    fireEvent.click(box);
-
-    await waitFor(() => expect(screen.queryByLabelText("看板")).toBeNull());
-  });
-
-  it("看板开关关着时侧栏没有入口，且不朝插件发任何读", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.kanbanFlagEnabled = false;
-    render(<App />);
-    // 先等首屏落定（会话已渲染），再断言"没有"——否则可能只是还没到那一步。
-    await waitFor(() => expect(state.statusHandlers.length).toBe(1));
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
-    );
-
-    expect(screen.queryByLabelText("看板")).toBeNull();
-    // daemon 已被开关停掉，任何 `plugin/query` 都只会白等超时。
-    expect(clients[0].requests.filter((r) => r.method === "plugin/query")).toEqual([]);
-  });
-
-  it("看板开关关着时，workspace 右键菜单里也没有看板项", async () => {
-    // 现场回归：全局开关只藏了侧栏的看板入口与卡片会话，用户右键工作区文件夹
-    // 仍能看到「创建 Superpowers 看板」——点下去只会得到一个已停掉的 daemon。
-    state.boards = [];
-    state.groupWorkspaces = ["/proj"];
-    state.kanbanFlagEnabled = false;
-    render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
-    );
-    await waitFor(() => expect(screen.getByText("proj")).toBeTruthy());
-
-    const header = screen.getByText("proj").closest<HTMLElement>("div[tabindex]")!;
-    fireEvent.contextMenu(header);
-
-    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
-    expect(screen.queryByText("移除看板")).toBeNull();
-  });
-
-  it("看板开关关着时，已有的卡片会话也一并隐藏", async () => {
-    state.kanbanFlagEnabled = false;
-    state.threads = [
-      {
-        thread_id: "card-a",
-        title: "卡片会话",
-        permission_mode: "normal",
-        driver_project: "/proj",
-        driver_ref: "k1",
-      },
-    ];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
-    );
-    // 侧栏拿到会话列表的同一轮里，卡片会话必须仍被挡在外面。
-    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true));
-    expect(screen.queryByText("卡片会话")).toBeNull();
-    expect(screen.queryByText(/看板会话/)).toBeNull();
-  });
-
-  it("看板列表读不到时明说「无法读取」，而不是留空", async () => {
-    // 摘要是侧栏那一眼的全部。读失败若留空，就和「空看板」长得一模一样——
-    // 而这两件事对用户是两码事：一个要去看 daemon/插件，一个什么都不用做。
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.rpcError["list"] = new Error("daemon is unavailable: connection refused");
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-
-    expect(await screen.findByText("无法读取")).toBeTruthy();
-  });
-
-  it("选中看板时主区域显示该项目看板，且不再有全局左列", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-
-    expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
-    // 收起已删除：离开看板走「点会话」，不再有「收起看板」按钮。
-    expect(screen.queryByLabelText("收起看板")).toBeNull();
-    // 入队仍可达，但收在「＋」菜单里，不再占一整行。
-    expect(screen.getByRole("button", { name: "添加到看板" })).toBeTruthy();
-    expect(screen.queryByRole("menuitem", { name: "加入看板" })).toBeNull();
-  });
-
-  it("看板的所有读写都带上该项目的 project", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.cards = [{ id: "c1", state: "queued", progress: null, detail: "/w" }];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    await waitFor(() => {
-      const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
-      expect(queries.some((r) => (r.params as { method?: string })?.method === "list")).toBe(true);
-      expect(queries.some((r) => (r.params as { method?: string })?.method === "switch.read")).toBe(true);
-    });
-    // 只认带着 project 的那些：漏掉 project 就会读到 app 自己的 cwd。
-    const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
-    expect(queries.every((r) => (r.params as { project?: string }).project === "/proj")).toBe(true);
-    expect(queries.map((r) => (r.params as { method?: string }).method)).toContain("list");
-  });
-
-  it("看板面板里没有开关可拨：创建时已经决定过了", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    // 一个看板存在 = 建它的时候插件已装、开关已开。再问一次是多余的问题。
-    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
-    // 值守也不再在这里：它管的是宿主，已迁到设置页「通用」。
-    expect(screen.queryByLabelText("后台值守（开机自启）开关")).toBeNull();
-    // 状态本身必须留下：它是「这个看板为什么不动」的唯一线索。
-    expect(screen.getByText(/运行中|已停用/)).toBeTruthy();
-    expect(screen.getByText(/default|project|global/)).toBeTruthy();
-  });
-
-  it("移除看板会真的卸载插件，而不只是撤销登记", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    const header = await waitFor(() => {
-      const h = document.querySelector<HTMLElement>('[data-ws-header="/proj"]');
-      expect(h).not.toBeNull();
-      return h!;
-    });
-    fireEvent.contextMenu(header);
-    // 「移除看板会删除…且不可恢复」的二次确认。
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    fireEvent.click(screen.getByText("移除看板"));
-    confirm.mockRestore();
-
-    // 只发 lifecycle/remove 的话，daemon 还在跑、清单还在——插件下一拍就把
-    // 状态目录重建出来，用户看到的是「删不掉」。
-    await waitFor(() =>
-      expect(clients[0].requests).toContainEqual({
-        method: "plugin/uninstall",
-        params: { project: "/proj", plugin: "superpowers-kanban" },
-      }),
-    );
-    const lifecycle = clients[0].requests.filter(
-      (r) =>
-        r.method === "plugin/uninstall" ||
-        (r.method === "plugin/query" &&
-          (r.params as { method?: string })?.method === "lifecycle/remove"),
-    );
-    expect(lifecycle[0].method).toBe("plugin/uninstall");
-  });
-
-  it("侧栏「创建」入口先装插件、再走通用 plugin/query 建盘", async () => {
-    state.groupWorkspaces = ["/proj"];
-    state.boards = [];
-    render(<App />);
-    const header = await waitFor(() => {
-      const h = document.querySelector<HTMLElement>('[data-ws-header="/proj"]');
-      expect(h).not.toBeNull();
-      return h!;
-    });
-    fireEvent.contextMenu(header);
-
-    fireEvent.click(screen.getByText("创建 Superpowers 看板"));
-
-    await waitFor(() =>
-      expect(clients[0].requests).toContainEqual({
-        method: "plugin/install",
-        params: { project: "/proj", plugin: "superpowers-kanban" },
-      }),
-    );
-    expect(clients[0].requests).toContainEqual({
-      method: "plugin/query",
-      params: {
-        plugin: "superpowers-kanban",
-        project: "/proj",
-        method: "lifecycle/create",
-        params: { project: "/proj" },
-      },
-    });
-    // 顺序是契约：全新项目没有清单，宿主不会拉起插件，plugin/query 无处可拨。
-    const lifecycle = clients[0].requests.filter(
-      (r) => r.method === "plugin/install" || r.method === "plugin/query",
-    );
-    expect(lifecycle.map((r) => r.method)).toEqual(["plugin/install", "plugin/query"]);
-  });
-
-  it("切回同一个看板不会重读（选中同一个不算换项目）", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    const reads = () =>
-      clients[0].requests.filter(
-        (r) =>
-          r.method === "plugin/query" &&
-          (r.params as { method?: string }).method === "list",
-      ).length;
-    const before = reads();
-    fireEvent.click(screen.getByLabelText("看板"));
-
-    // 再点一次同一个项目只是「还是这个」：重读会白白清空并重画面板。
-    await new Promise((r) => setTimeout(r, 10));
-    expect(reads()).toBe(before);
-  });
-
-  it("切换项目后看板问的是新项目", async () => {
-    state.boards = [{ project: "/proj" }, { project: "/other" }];
-    state.groupWorkspaces = ["/proj", "/other"];
-    render(<App />);
-    await waitFor(() => expect(screen.getAllByLabelText("看板")).toHaveLength(2));
-
-    fireEvent.click(screen.getAllByLabelText("看板")[1]);
-    await waitFor(() => {
-      const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
-      expect(queries.some((r) => (r.params as { project?: string }).project === "/other")).toBe(true);
-    });
-  });
-
-  it("看板打开时点侧栏另一条会话 → 跳到该会话页，看板消失（无需点收起）", async () => {
-    state.threads = [
-      { thread_id: "t1", title: "one", permission_mode: "normal" },
-      { thread_id: "t2", title: "two", permission_mode: "normal" },
-    ];
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    // 启动自动选第一条会话（t1），再看板页。
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    // 点侧栏另一条会话：应当直接跳过去，看板退场。
-    fireEvent.click(screen.getByText("two"));
-
-    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
-    await waitFor(() =>
-      expect(clients[0].requests).toContainEqual({
-        method: "thread/resume",
-        params: { threadId: "t2" },
-      }),
-    );
-  });
-
-  it("看板打开时新建会话 → 落到会话页，看板消失", async () => {
-    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    // 「+ New thread」在有最近目录时弹菜单，点其中一项即 onNew(path)。
-    state.dataSources["workspace/list"] = () => ({
-      workspaces: [{ path: "/proj", exists: true }],
-    });
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    fireEvent.click(screen.getByText("+ New thread"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "proj" }));
-
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(true),
-    );
-    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
-  });
-
-  it("切到会话后点侧栏看板条目 → 看板重新出现", async () => {
-    state.threads = [
-      { thread_id: "t1", title: "one", permission_mode: "normal" },
-      { thread_id: "t2", title: "two", permission_mode: "normal" },
-    ];
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    // 切到另一条会话：离开看板。
-    fireEvent.click(screen.getByText("two"));
-    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
-
-    // 再点侧栏的看板条目：看板重新出现。收起已删除，回到看板只有这条入口。
-    fireEvent.click(screen.getByLabelText("看板"));
-    expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
-  });
-
-  it("点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）", async () => {
-    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.cards = [{ id: "card-1", state: "queued", progress: null, detail: "/w", thread_id: "t1" }];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    // 卡片组件用 thread id 作为按钮文字；点它 = 去看那条会话。
-    fireEvent.click(
-      within(screen.getByLabelText("Superpowers 看板")).getByRole("button", { name: "t1" }),
-    );
-
-    // 看板是会话的兄弟视图：离开看板，回到对话，而不是把看板盖在会话上。
-    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
-    expect(screen.queryByLabelText("收起看板")).toBeNull();
-    // 会话确实切过去了。
-    await waitFor(() =>
-      expect(clients[0].requests).toContainEqual({
-        method: "thread/resume",
-        params: { threadId: "t1" },
-      }),
-    );
-  });
-});
-
-describe("App Superpowers 看板 enqueue", () => {
-  beforeEach(() => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-  });
-
-  /** 入队入口收在顶栏「＋」里：先开菜单，再点菜单项。 */
-  const clickEnqueue = () => {
-    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "加入看板" }));
-  };
-
-  /** 选中 /proj 的看板，等主区域把面板画出来。 */
-  const openBoard = async () => {
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByRole("button", { name: "添加到看板" });
-  };
-
-  it("sends one enqueue with both picked paths", async () => {
-    await openBoard();
-
-    state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
-    clickEnqueue();
-
-    await waitFor(() =>
-      expect(clients[0].requests).toContainEqual({
-        method: "plugin/query",
-        params: {
-          plugin: "superpowers-kanban",
-          // 主区域渲染的是选中项目的看板，投递也带该项目。
-          project: "/proj",
-          method: "enqueue",
-          params: { spec_path: "/p/a.spec.md", plan_path: "/p/a.plan.md" },
-        },
-      }),
-    );
-    expect(
-      clients[0].requests.filter(
-        (r) =>
-          r.method === "plugin/query" &&
-          (r.params as { method?: string })?.method === "enqueue",
-      ),
-    ).toHaveLength(1);
-  });
-
-  /**
-   * 顶栏「＋」→「预排队」是**容器级**动作：它发生在看板页，而看板页不属于任何
-   * 会话的讨论上下文（打开看板只改 `selectedBoard`，不动 `currentId`）。因此这里
-   * 投出去的卡不能带 `origin_thread_id`——`currentId` 是「上次打开的那条会话」，
-   * 与这张卡无关，甚至可能属于另一个项目。
-   *
-   * 会话内的溯源走另一条路径：会话里 `superpowers-kanban add-prequeued` 由宿主经
-   * `YI_AGENT_THREAD_ID` 注入，那里拿到的会话必然是这条讨论本身。
-   */
-  it("does not pin a discussion session on a card added from the board panel", async () => {
-    // 先开一条会话：`currentId` 非空，正是最容易串上脏值的态势。
-    state.threads = [{ thread_id: "t1", title: "discussion", permission_mode: "normal" }];
-    await openBoard();
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
-    fireEvent.change(screen.getByLabelText("预排队标题"), {
-      target: { value: "还没写 spec 的想法" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "预排队" }));
-
-    await waitFor(() =>
-      expect(
-        clients[0].requests.filter(
-          (r) =>
-            r.method === "plugin/query" &&
-            (r.params as { method?: string })?.method === "enqueue_prequeued",
-        ),
-      ).toHaveLength(1),
-    );
-    const [call] = clients[0].requests.filter(
-      (r) =>
-        r.method === "plugin/query" &&
-        (r.params as { method?: string })?.method === "enqueue_prequeued",
-    );
-    // 只有标题，没有来源会话。
-    expect((call.params as { params: Record<string, unknown> }).params).toEqual({
-      title: "还没写 spec 的想法",
-    });
-  });
-
-  it("sends nothing when the picker is cancelled", async () => {
-    await openBoard();
-
-    state.picks = [null];
-    clickEnqueue();
-
-    await waitFor(() => expect(state.picks).toHaveLength(0));
-    expect(
-      clients[0].requests.filter(
-        (r) =>
-          r.method === "plugin/query" &&
-          (r.params as { method?: string })?.method === "enqueue",
-      ),
-    ).toHaveLength(0);
-  });
-
-  it("surfaces a rejected enqueue instead of crashing", async () => {
-    // 用一个中性的服务端错误码：-32000 是中继「没有电脑」的专用码，会被翻成
-    // 那句可操作的提示，本用例要验的是「任意失败都露出来」而非那条分支。
-    state.rpcError["enqueue"] = { code: -32603, message: "forced -32603" };
-    await openBoard();
-
-    state.picks = ["/p/a.spec.md", "/p/a.plan.md"];
-    clickEnqueue();
-
-    await waitFor(() => expect(screen.getByText(/forced -32603/)).toBeTruthy());
-    // Still usable after the failure: 菜单没关，菜单项也没被禁用。
-    expect(
-      (screen.getByRole("menuitem", { name: "加入看板" }) as HTMLButtonElement).disabled,
-    ).toBe(false);
-  });
-});
 
 describe("App session pinning", () => {
   it("renders a pinned thread in the Pinned section from thread/listAll", async () => {
@@ -2758,9 +2226,7 @@ describe("App settings & theme wiring", () => {
     // plugin/query）：这里只是把这趟 read 的值 stub 成 false；默认口径其实是开
     // （配置里没这个键也当开），点一下要写回 true。
     //
-    // 它原先挂在看板面板里，但它装的是服务所有项目的通用登录项——放在看板页
-    // 等于让用户以为自己只对这个项目生效。
-    state.boards = [{ project: "/proj" }];
+    // 值守服务所有项目，放在某个项目页里会让用户以为自己只对这个项目生效。
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", resident_daemon_watchman_enabled: false });
     render(<App />);
@@ -2782,7 +2248,6 @@ describe("App settings & theme wiring", () => {
   it("reads the legacy watchman field when an older host only returns that one", async () => {
     // 新旧宿主未必同批升级：旧宿主只回旧字段名。读不到新名时必须回退到旧名，
     // 否则用户关掉的值守会被 parseBoardWatchman 的缺省（开）悄悄翻回开。
-    state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
     render(<App />);
@@ -2795,7 +2260,6 @@ describe("App settings & theme wiring", () => {
   });
 
   it("surfaces the watchman warning ui/settings/write returns", async () => {
-    state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", resident_daemon_watchman_enabled: true });
     // 写入落盘了，但宿主没能装上登录项：它把原因放在 warning 里，面板必须原样
@@ -2823,7 +2287,6 @@ describe("App settings & theme wiring", () => {
   });
 
   it("does not let an in-flight re-handshake read clobber a fresh watchman toggle", async () => {
-    state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     // 两趟 read 都返回 true：迟到的旧值一旦被采纳，开关会弹回 true，断言即红。
     const resolveRead = deferRead();

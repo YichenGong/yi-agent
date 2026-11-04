@@ -1,6 +1,6 @@
 //! 主题偏好：读写 `<workdir>/.yi-agent/preferences.json` 的 `theme` 键。
 //!
-//! 该文件是共享的（`subagent_runtime`、`superpowers_kanban` 也写它），因此
+//! 该文件是共享的（`subagent_runtime`、`example_plugin_switch` 也写它），因此
 //! 写必须是读-改-写并保留无关键；落盘用「临时文件 + rename」保证原子性，
 //! 与 `yi-agent/src/tui/runtime_prefs.rs` 同一约定。
 
@@ -582,7 +582,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
             preferences_path(dir.path()),
-            r#"{"subagent_runtime":"never","superpowers_kanban":true}"#,
+            r#"{"subagent_runtime":"never","example_plugin_switch":true}"#,
         )
         .unwrap();
         save(dir.path(), Theme::Light).unwrap();
@@ -590,7 +590,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["theme"], "light");
         assert_eq!(value["subagent_runtime"], "never");
-        assert_eq!(value["superpowers_kanban"], true);
+        assert_eq!(value["example_plugin_switch"], true);
     }
 
     #[test]
