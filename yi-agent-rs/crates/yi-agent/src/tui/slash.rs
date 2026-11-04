@@ -46,6 +46,7 @@ pub enum SlashCommand {
     Runtime,
     Kanban,
     Plugins,
+    RecoverRoot,
 }
 
 impl SlashCommand {
@@ -78,7 +79,8 @@ impl SlashCommand {
             | Self::Config
             | Self::Runtime
             | Self::Kanban
-            | Self::Plugins => {
+            | Self::Plugins
+            | Self::RecoverRoot => {
                 return None;
             }
         };
@@ -101,6 +103,7 @@ impl SlashCommand {
             SlashCommand::Runtime => "runtime",
             SlashCommand::Kanban => "superpowers-kanban",
             SlashCommand::Plugins => "plugins",
+            SlashCommand::RecoverRoot => "recover-root",
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
         }
@@ -122,6 +125,9 @@ impl SlashCommand {
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
             SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
             SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
+            SlashCommand::RecoverRoot => {
+                "恢复卡死的前台会话根（先预览影响，再确认；不可用时可查看状态）"
+            }
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
         }
@@ -144,6 +150,10 @@ impl SlashCommand {
                 "[on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]",
             ),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
+            // `status <id>` reads a stored operation without preparing anything;
+            // `<id>` alone starts the preview, and confirmation is a separate step
+            // so a mistaken Enter cannot stop a running conversation.
+            SlashCommand::RecoverRoot => Some("[status <operation-id>|<operation-id>]"),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
         }
@@ -186,6 +196,7 @@ impl SlashCommand {
             SlashCommand::Runtime,
             SlashCommand::Kanban,
             SlashCommand::Plugins,
+            SlashCommand::RecoverRoot,
         ]
     }
 
@@ -848,6 +859,41 @@ mod tests {
         assert_eq!(popup.selected(), Some(SlashCommand::Clear));
         popup.move_down();
         assert_eq!(popup.selected(), Some(SlashCommand::Model));
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_is_a_host_command() {
+        // Reaching recovery from the TUI must go through this host's own
+        // authorization, which is why the command is host-local: a supervisor
+        // control command would carry a task id, and a task id is exactly the thing
+        // that must not be enough to stop a conversation.
+        assert_eq!(
+            SlashCommand::from_name("recover-root"),
+            Some(SlashCommand::RecoverRoot)
+        );
+        assert!(
+            SlashCommand::RecoverRoot.control_spec().is_none(),
+            "recovery is not a supervisor control command"
+        );
+        assert!(
+            SlashCommand::RecoverRoot
+                .argument_usage()
+                .expect("recover-root takes an operation id")
+                .contains("status"),
+            "the usage must offer the read-only form, not only the mutating one"
+        );
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_help_explains_the_preview() {
+        let help = help_text(Some("recover-root"));
+        assert!(help.contains("/recover-root"));
+        assert!(
+            help.contains("预览"),
+            "help must say the impact is shown before confirming"
+        );
+        // The former `/agents` listing keeps working untouched.
+        assert!(help_text(Some("agents")).contains("/agents"));
     }
 
     #[test]

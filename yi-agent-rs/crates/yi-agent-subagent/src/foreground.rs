@@ -622,6 +622,137 @@ impl ForegroundHost {
     }
 }
 
+/// The host's recovery entry point: inspect, prepare, confirm, query.
+///
+/// Deliberately *not* reachable from a thread id. Recovery stops a running
+/// conversation, so the ability to do it has to come from something the caller
+/// already earned -- the host's own lease. `new` therefore takes that lease, and
+/// there is no constructor that resolves one from an id. Nothing here is a model
+/// tool: a recovery an LLM could trigger by asserting `confirmed=true` would make
+/// the preview step theatre.
+///
+/// The lease is taken by value rather than borrowed from a binding because the
+/// binding does not own one: the guardian issues a lease to a *frontend*, and the
+/// host is the frontend. Passing the lease in is what keeps recovery on the same
+/// credential the driver uses instead of minting a second client.
+///
+/// Every method keeps the design's shape. `inspect` reads stored state and never
+/// freezes; `prepare` is the first mutating step and may come back `Blocked` with
+/// the impact it could not prove stopped; `confirm` is the only way to commit. A
+/// lost answer is resolved by querying the *same* operation id, never by
+/// preparing a new one.
+pub struct ForegroundRecoveryHost {
+    lease: yi_agent_lifecycle::client::FrontendLease,
+}
+
+impl ForegroundRecoveryHost {
+    /// Builds the entry point from the host's own lease.
+    pub fn new(lease: yi_agent_lifecycle::client::FrontendLease) -> Self {
+        Self { lease }
+    }
+
+    fn deadline() -> yi_agent_lifecycle::deadline::Deadline {
+        yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5))
+    }
+
+    /// Reads a recovery operation's stored state. Never freezes, never mutates.
+    ///
+    /// This is the honest meaning of "inspect": there is no separate preview IPC,
+    /// and freezing just to learn the impact would make a read destructive. What a
+    /// caller can show before committing is whatever the daemon already stored --
+    /// a `Blocked` answer carries the impact and its open stop gaps, `Ready` carries
+    /// the preview, and `NeedsPreview` says a restart dropped the token so it must be
+    /// prepared again under a valid authorization. `None` means no such operation.
+    pub fn inspect(
+        &mut self,
+        root: &RootRef,
+        operation_id: &str,
+    ) -> Result<
+        Option<yi_agent_lifecycle::foreground::RecoveryOperationStatus>,
+        ForegroundClientError,
+    > {
+        self.operation(root, operation_id)
+    }
+
+    /// The first mutating step: freeze, stop, and issue a token only if proven.
+    pub fn prepare(
+        &mut self,
+        request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryOperationStatus, ForegroundClientError>
+    {
+        match self.lease.prepare_root_recovery(request, &Self::deadline()) {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(ForegroundClientError::Protocol(
+                "the daemon has no record of this recovery operation".into(),
+            )),
+            Err(error) => Err(Self::classify("prepare", error)),
+        }
+    }
+
+    /// Commits a prepared recovery with the token `prepare` returned.
+    pub fn confirm(
+        &mut self,
+        request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+        token: &SecretCapability,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryOperationStatus, ForegroundClientError>
+    {
+        match self
+            .lease
+            .confirm_root_recovery(request, token, &Self::deadline())
+        {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(ForegroundClientError::Protocol(
+                "the daemon has no record of this recovery operation".into(),
+            )),
+            Err(error) => Err(Self::classify("confirm", error)),
+        }
+    }
+
+    /// Reads one operation's stored status.
+    ///
+    /// This is how a lost answer is resolved: the caller asks about the *same*
+    /// operation instead of minting a new one, and a `NeedsPreview` answer means a
+    /// restart dropped the token rather than that the work was undone.
+    pub fn operation(
+        &mut self,
+        root: &RootRef,
+        id: &str,
+    ) -> Result<
+        Option<yi_agent_lifecycle::foreground::RecoveryOperationStatus>,
+        ForegroundClientError,
+    > {
+        self.lease
+            .root_recovery_operation(root, id, &Self::deadline())
+            .map_err(|error| Self::classify("operation", error))
+    }
+
+    /// Maps a control-channel error onto the caller-visible split.
+    ///
+    /// `Unsupported` is a refusal, not a transport failure: the build simply does
+    /// not serve recovery, and a host that retried it would spin. The rest keeps the
+    /// design's distinction between "refused" (act on it) and "unknown" (query the
+    /// same operation).
+    fn classify(stage: &'static str, error: std::io::Error) -> ForegroundClientError {
+        match error.kind() {
+            std::io::ErrorKind::Unsupported => ForegroundClientError::Rejected(
+                yi_agent_lifecycle::foreground::ForegroundFailure::new(
+                    ForegroundErrorCode::Unsupported,
+                    format!("{stage}: this runtime does not serve recovery"),
+                ),
+            ),
+            std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotFound => ForegroundClientError::Rejected(
+                yi_agent_lifecycle::foreground::ForegroundFailure::new(
+                    ForegroundErrorCode::AuthorityDenied,
+                    format!("{stage}: the recovery was refused"),
+                ),
+            ),
+            _ => ForegroundClientError::Transport(format!("{stage}: {error}")),
+        }
+    }
+}
+
 /// Runs one activity write and reports its failure as a diagnostic, never as an error.
 ///
 /// The hosts call this around `ForegroundTurn` so that the rule "activity is
@@ -1043,6 +1174,39 @@ mod tests {
         assert!(
             turn.warning().is_none(),
             "a duplicate finish is a no-op, not a problem to report"
+        );
+    }
+
+    /// Recovery is reachable only from a host that already holds an authorization.
+    ///
+    /// The point of the type is that there is no path from "I know a thread id" to
+    /// "I can stop that conversation". A constructor that took an id and looked the
+    /// rest up would be exactly that path, so the only way in is an authorization
+    /// the host already had to earn through its own lease.
+    #[test]
+    fn foreground_root_lifecycle_recovery_host_needs_a_host_authorization() {
+        // The type has no `from_thread_id`: the only way in is a lease the host
+        // already holds, so knowing a thread id does not grant recovery.
+        let _constructor: fn(yi_agent_lifecycle::client::FrontendLease) -> ForegroundRecoveryHost =
+            ForegroundRecoveryHost::new;
+    }
+
+    /// Recovery is not a model tool.
+    ///
+    /// A recovery that an LLM could trigger with `confirmed=true` would defeat the
+    /// whole preview/confirm design, so the host type lives outside any tool
+    /// registry and nothing here implements a tool interface.
+    #[test]
+    fn foreground_root_lifecycle_recovery_is_not_a_model_tool() {
+        // The durable guarantee is structural: this type needs a lease the host
+        // earned, and a model has no way to hold one. What this scan adds is a cheap
+        // tripwire for the one way a future edit could undo that -- giving the type a
+        // tool adapter. The marker is assembled so the scan cannot match this test.
+        let source = include_str!("foreground.rs");
+        let tool_impl = ["impl ", "Tool", " for ForegroundRecoveryHost"].concat();
+        assert!(
+            !source.contains(&tool_impl),
+            "recovery must not be reachable as a model tool"
         );
     }
 

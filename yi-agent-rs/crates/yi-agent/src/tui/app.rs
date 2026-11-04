@@ -3041,6 +3041,21 @@ fn execute_slash_command(
             let _ = control_tx.blocking_send(crate::DriverControl::Clear);
             KeyOutcome::None
         }
+        SlashCommand::RecoverRoot => {
+            // The command exists so the catalog, help and completion do not lie about
+            // it, but the TUI's authorization lives with the frontend lease and is not
+            // reachable from this synchronous dispatch. Rather than emit a preview the
+            // host cannot actually confirm, say what is missing.
+            history.push(
+                HistoryCell::Separator {
+                    label: Some(
+                        "恢复入口尚未接入 TUI 的授权通道：本版本无法在此确认恢复".to_string(),
+                    ),
+                },
+                width,
+            );
+            KeyOutcome::None
+        }
         SlashCommand::Help => {
             history.push(
                 HistoryCell::UserMessage {
