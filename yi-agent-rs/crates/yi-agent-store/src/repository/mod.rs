@@ -47,7 +47,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 17;
+pub const LATEST_SCHEMA_VERSION: i64 = 18;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -1234,7 +1234,7 @@ mod extra_roots_tests {
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
-        assert_eq!(LATEST_SCHEMA_VERSION, 17);
+        assert_eq!(LATEST_SCHEMA_VERSION, 18);
     }
 
     /// v16 records who last owned a root and why it ended.
@@ -1268,6 +1268,41 @@ mod extra_roots_tests {
             )
             .unwrap();
         assert!(has_table, "v16 must create root_owners");
+    }
+
+    /// v18 adds the freeze tables, and they survive a reopen.
+    ///
+    /// The point is not "the DDL ran" but "a restarted daemon can still learn what a
+    /// freeze covered": after a crash the in-memory set is gone, and without this the
+    /// only available answer would be "nothing was frozen", which reads as stopped.
+    #[test]
+    fn a_version_seventeen_database_gains_the_freeze_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS foreground_frozen_executions;
+                 DROP TABLE IF EXISTS foreground_freeze;
+                 DELETE FROM schema_migrations WHERE version >= 18;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for table in ["foreground_freeze", "foreground_frozen_executions"] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "v18 must create {table}");
+        }
     }
 
     /// Re-running the v16 step must not fail on the objects it already created.

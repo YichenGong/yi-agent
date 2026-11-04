@@ -625,5 +625,37 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
         transaction.commit()?;
     }
+
+    // v18：一次冻结对应的**封闭执行集合**。
+    //
+    // 停止证明的正确性取决于"证明的是同一批执行"。若集合只存在于内存，重启后 daemon
+    // 只剩一组证据，却不知道它们原本该覆盖谁——那样"集合里每个执行都有证明"就退化成
+    // "有证据的执行都停了"，冻结后新准入的东西会被静默漏掉。
+    //
+    // `foreground_freeze`：每个 root 当前那一次冻结，`execution_set_version` 单调递增，
+    // 旧证据只能匹配自己那一版。`foreground_frozen_executions`：集合成员，带不可复用的
+    // execution identity 与所属 attempt。二者与 v17 的 `foreground_stop_evidence`
+    // 一起，让"冻结、证明、核验"三步都能在重启后重放。
+    if current_version < 18 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS foreground_freeze (
+                root_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                execution_set_version INTEGER NOT NULL CHECK(execution_set_version > 0),
+                frozen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS foreground_frozen_executions (
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                execution_set_version INTEGER NOT NULL,
+                execution_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('driver', 'worker')),
+                PRIMARY KEY(root_task_id, execution_set_version, execution_id)
+            );",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }

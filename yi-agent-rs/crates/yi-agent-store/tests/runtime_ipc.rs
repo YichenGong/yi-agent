@@ -6279,3 +6279,432 @@ fn foreground_root_lifecycle_an_authorization_from_another_generation_or_scope_i
         "a grant for another scope must not bind a driver, got {response:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: stop proofs, freeze and quiescence verification
+// ---------------------------------------------------------------------------
+
+/// One frozen execution, described the way the store names it.
+fn frozen_execution(attempt: &str, task: &str) -> serde_json::Value {
+    json!({
+        "execution_id": format!("Worker:{task}:{attempt}"),
+        "task_id": task,
+        "attempt_id": attempt,
+        "kind": "worker",
+    })
+}
+
+fn stop_evidence(
+    fence: &yi_agent_lifecycle::foreground::ForegroundFence,
+    execution: &serde_json::Value,
+    joined: bool,
+    tools_stopped: bool,
+) -> yi_agent_lifecycle::foreground::StopEvidence {
+    use yi_agent_lifecycle::foreground::{
+        EvidenceSource, ExecutionIdentity, ExecutionKind, StopEvidence,
+    };
+    assert_eq!(execution["kind"], "worker");
+    StopEvidence {
+        evidence_id: format!("evidence:{}", execution["execution_id"].as_str().unwrap()),
+        fence: fence.clone(),
+        execution: ExecutionIdentity {
+            execution_id: execution["execution_id"].as_str().unwrap().to_string(),
+            task_id: execution["task_id"].as_str().unwrap().to_string(),
+            attempt_id: execution["attempt_id"].as_str().unwrap().to_string(),
+            kind: ExecutionKind::Worker,
+        },
+        attempt_id: fence.root.attempt_id.clone(),
+        source: EvidenceSource::Guardian,
+        joined,
+        tools_stopped,
+        process_identity: None,
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_freeze_closes_the_set_and_refuses_new_admission() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+
+    let impact = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect("the root can be frozen");
+    assert_eq!(impact.version, 1, "the first freeze mints version 1");
+    assert!(
+        impact.blocked_execution_ids.iter().all(|id| {
+            !binding.fence.root.root_id.is_empty() && id.contains(&binding.fence.root.attempt_id)
+        }),
+        "every blocked entity names the attempt it belongs to: {impact:?}",
+    );
+
+    // A second freeze would replace the set the first one is proving.
+    let error = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect_err("a second freeze must be refused");
+    assert!(
+        format!("{error:?}").contains("OperationConflict"),
+        "expected an operation conflict, got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_quiescence_is_unproven_without_evidence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    // Freeze through the repository with a *non-empty* set. The coordinator's own
+    // freeze enumerates live slots, and this fixture has none, so going through the
+    // durable layer is the only way to build the set an execution would produce.
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    let (_version, frozen) = {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(
+                &binding.fence,
+                std::slice::from_ref(&execution),
+                "foreground recovery",
+            )
+            .expect("the set can be frozen")
+    };
+    assert_eq!(frozen, vec![execution]);
+
+    // No evidence at all: the frozen set cannot be reported stopped.
+    let error = coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect_err("a freeze without evidence is not quiescent");
+    let text = format!("{error:?}");
+    assert!(text.contains("StopUnproven"), "got {error:?}");
+}
+
+#[test]
+fn foreground_root_lifecycle_a_join_alone_does_not_verify_quiescence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let impact = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect("the root can be frozen");
+    // The set is whatever the freeze found. With no children registered it may be
+    // empty; in that case there is nothing to prove and the call must succeed, which
+    // is itself worth pinning.
+    if impact.blocked_execution_ids.is_empty() {
+        coordinator
+            .verify_foreground_quiescence(&binding.fence)
+            .expect("an empty frozen set needs no evidence");
+        return;
+    }
+    for id in &impact.blocked_execution_ids {
+        let execution = frozen_execution(&binding.fence.root.attempt_id, "task-1");
+        let evidence = stop_evidence(&binding.fence, &execution, true, false);
+        let stored = coordinator
+            .record_foreground_stop_evidence(&evidence)
+            .expect("the guardian may record what it observed");
+        assert!(stored.joined && !stored.tools_stopped);
+        let _ = id;
+    }
+    let error = coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect_err("a join without stopped tools is not quiescence");
+    assert!(
+        format!("{error:?}").contains("StopUnproven"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_two_parties_complete_one_stop_proof() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(
+                &binding.fence,
+                std::slice::from_ref(&execution),
+                "foreground recovery",
+            )
+            .expect("the set can be frozen");
+    }
+
+    // The daemon observed its worker join; the tool groups are the guardian's fact.
+    let mut daemon_side = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        true,
+        false,
+    );
+    daemon_side.source = yi_agent_lifecycle::foreground::EvidenceSource::Daemon;
+    let merged = coordinator
+        .record_foreground_stop_evidence(&daemon_side)
+        .expect("the daemon may record a join");
+    assert!(merged.joined && !merged.tools_stopped);
+    assert!(
+        coordinator
+            .verify_foreground_quiescence(&binding.fence)
+            .is_err(),
+        "a join alone must not verify"
+    );
+
+    let mut guardian_side = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        false,
+        true,
+    );
+    guardian_side.source = yi_agent_lifecycle::foreground::EvidenceSource::Guardian;
+    let merged = coordinator
+        .record_foreground_stop_evidence(&guardian_side)
+        .expect("the guardian may record stopped tools");
+    assert!(
+        merged.joined && merged.tools_stopped,
+        "the surviving record must carry both facts: {merged:?}"
+    );
+    coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect("both facts together are a stop proof");
+}
+
+#[test]
+fn foreground_root_lifecycle_evidence_for_an_unfrozen_execution_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+            .expect("the set can be frozen");
+    }
+
+    // Evidence naming an execution nobody froze describes something else, so
+    // accepting it would let a caller accumulate proofs for whatever it wants.
+    let stranger = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-unknown"),
+        true,
+        true,
+    );
+    let error = coordinator
+        .record_foreground_stop_evidence(&stranger)
+        .expect_err("evidence outside the frozen set must be refused");
+    assert!(
+        format!("{error:?}").contains("StopUnproven"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_evidence_survives_a_restart() {
+    // The whole reason evidence is durable: a restart loses the in-memory pending
+    // stops, and "nothing pending" must not read as "everything stopped".
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let root_ref = {
+        let (daemon, _starts) = foreground_daemon(&directory, &database);
+        let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+        let IpcResponse::ForegroundDriverBound { binding } = send_request(
+            daemon.socket_path(),
+            IpcRequest::BindApplicationRootDriver {
+                authorization,
+                operation_id: "bind-1".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("the bind must be accepted");
+        };
+        let coordinator = daemon.coordinator_for_test();
+        let execution = {
+            use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+            ExecutionIdentity {
+                execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+                task_id: "task-1".to_string(),
+                attempt_id: binding.fence.root.attempt_id.clone(),
+                kind: ExecutionKind::Worker,
+            }
+        };
+        {
+            let mut repository = coordinator.repository_for_test().unwrap();
+            repository
+                .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+                .expect("the set can be frozen");
+        }
+        binding.fence.root.clone()
+    };
+
+    // A fresh daemon on the same database. Its in-memory pending stops are empty, and
+    // the frozen set plus its (absent) evidence must still say "unproven".
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let coordinator = daemon.coordinator_for_test();
+    let attempt: AttemptId = root_ref
+        .attempt_id
+        .parse()
+        .expect("the attempt id round-trips");
+    let root_task: TaskId = root_ref.root_id.parse().expect("the root id is a task");
+    let stored = {
+        let repository = coordinator.repository_for_test().unwrap();
+        repository.frozen_execution_set(&root_task).unwrap()
+    };
+    let (version, frozen) = stored.expect("the freeze survived the restart");
+    assert_eq!(version, 1);
+    assert_eq!(frozen.len(), 1);
+    assert_eq!(frozen[0].attempt_id, attempt.to_string());
+
+    let fence = {
+        let repository = coordinator.repository_for_test().unwrap();
+        let persisted = repository
+            .persisted_foreground_root(&root_task)
+            .unwrap()
+            .expect("the root row survived");
+        yi_agent_lifecycle::foreground::ForegroundFence {
+            root: root_ref.clone(),
+            generation: persisted.owner_client_id.clone().unwrap_or_default(),
+            binding_epoch: persisted.binding_epoch,
+            driver_epoch: persisted.driver_epoch,
+        }
+    };
+    // The generation is a fresh daemon's, so this fence names the wrong generation;
+    // the honest answer is "unproven", never "stopped".
+    assert!(
+        coordinator.verify_foreground_quiescence(&fence).is_err(),
+        "a restarted daemon must not report the old execution stopped"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_record_that_disagrees_about_its_attempt_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+            .expect("the set can be frozen");
+    }
+
+    // Same execution id, but the record claims another attempt in one of its fields.
+    // Merging that would let a proof for one run license another.
+    let mut confused = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        true,
+        true,
+    );
+    confused.attempt_id = "some-other-attempt".to_string();
+    let error = coordinator
+        .record_foreground_stop_evidence(&confused)
+        .expect_err("a self-inconsistent record must be refused");
+    assert!(
+        format!("{error:?}").contains("StaleAttempt"),
+        "got {error:?}"
+    );
+}

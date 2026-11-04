@@ -61,6 +61,12 @@ pub(crate) enum StartPhase {
 
 /// One execution the coordinator knows about, whether or not it has a handle yet.
 struct ExecutionSlot {
+    /// The root this execution belongs to.
+    ///
+    /// Kept per slot so a freeze can be scoped: freezing root A must not refuse
+    /// root B's spawns in the same session tree, and a rebind of one conversation
+    /// must not stop another's work.
+    root: RootId,
     phase: StartPhase,
     cancellation: CancellationToken,
     /// Present once a handle exists.
@@ -174,10 +180,12 @@ struct GateState {
     /// production.
     #[cfg(any(test, feature = "foreground-test-support"))]
     barriers: HashMap<&'static str, Arc<crate::foreground::TestBarrier>>,
-    /// Set by [`ForegroundCommitGate::freeze`]. Sticky within a generation: a
-    /// frozen gate refuses every new admission, because the point of freezing is
-    /// that nothing new appears while the old set is being stopped.
-    frozen: bool,
+    /// Roots frozen by [`ForegroundCommitGate::freeze_root`]. Sticky within a
+    /// generation: a frozen root refuses every new admission under it, because the
+    /// point of freezing is that nothing new appears while the old set is being
+    /// stopped. Scoped to the root rather than the whole gate so one conversation's
+    /// recovery does not stall unrelated work.
+    frozen_roots: HashSet<RootId>,
     /// Owners whose admission was closed. A closed owner cannot commit again even
     /// if its root binding has not been removed yet.
     closed_owners: HashSet<String>,
@@ -207,19 +215,23 @@ impl ForegroundCommitGate {
         register: impl FnOnce(&AdmissionStamp) -> Result<T, E>,
     ) -> Result<(AdmissionStamp, StartingPermit, T), CommitRefusal<E>> {
         let mut state = self.state.lock().expect("foreground gate mutex poisoned");
-        if state.frozen {
+        let stamp = may_admit().map_err(CommitRefusal::Refused)?;
+        if state.frozen_roots.contains(&stamp.root) {
+            // Checked after the caller's own admission check so the refusal names the
+            // real reason when both apply, and inside the lock so a freeze that landed
+            // during `may_admit` is observed.
             return Err(CommitRefusal::Refused(
                 RuntimeCoordinatorError::AdmissionClosed(
-                    "the foreground gate is frozen for a rebind".into(),
+                    "the foreground root is frozen for a rebind".into(),
                 ),
             ));
         }
-        let stamp = may_admit().map_err(CommitRefusal::Refused)?;
         let produced = register(&stamp).map_err(CommitRefusal::Commit)?;
         let (witness, _confirmation) = StopWitness::pair();
         state.slots.insert(
             stamp.task.clone(),
             ExecutionSlot {
+                root: stamp.root.clone(),
                 phase: StartPhase::Starting,
                 cancellation: CancellationToken::new(),
                 handle: None,
@@ -313,16 +325,24 @@ impl ForegroundCommitGate {
         released
     }
 
-    /// Freezes the gate and returns the whole live set for a rebind.
+    /// Freezes one root and returns its whole live set for a rebind.
     ///
-    /// Used by the stop-proof task's rebind; kept beside `release_owner` so the two
-    /// enumerate slots the same way.
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the rebind path"))]
-    pub(crate) fn freeze(&self) -> FrozenSet {
+    /// Scoped to the root: slots under other roots keep admitting work, which is
+    /// what makes "stop this conversation" different from "stop the app". Kept
+    /// beside `release_owner` so the two enumerate slots the same way.
+    ///
+    /// Starting slots are cancelled here for the same reason a release cancels
+    /// them: their factory has not returned, so the token is the only signal they
+    /// can observe, and a freeze that only recorded them would let a late worker
+    /// start under a fresh attempt.
+    pub(crate) fn freeze_root(&self, root: &RootId) -> FrozenSet {
         let mut state = self.state.lock().expect("foreground gate mutex poisoned");
-        state.frozen = true;
+        state.frozen_roots.insert(root.clone());
         let mut frozen = FrozenSet::default();
         for (task, slot) in state.slots.iter_mut() {
+            if &slot.root != root {
+                continue;
+            }
             match slot.phase {
                 StartPhase::Starting => {
                     slot.cancellation.cancel();
@@ -335,6 +355,16 @@ impl ForegroundCommitGate {
         frozen.starting.sort_by_key(|task| task.to_string());
         frozen.running.sort_by_key(|task| task.to_string());
         frozen
+    }
+
+    /// Whether one root is frozen, so a rebind can refuse a second freeze that would
+    /// silently replace the set the first one is proving.
+    pub(crate) fn is_frozen(&self, root: &RootId) -> bool {
+        self.state
+            .lock()
+            .expect("foreground gate mutex poisoned")
+            .frozen_roots
+            .contains(root)
     }
 
     /// Records that a slot's execution is over.
@@ -412,6 +442,7 @@ impl ForegroundCommitGate {
             state.slots.insert(
                 task.clone(),
                 ExecutionSlot {
+                    root: root.clone(),
                     phase: StartPhase::Starting,
                     cancellation: CancellationToken::new(),
                     handle: None,
@@ -419,9 +450,8 @@ impl ForegroundCommitGate {
                 },
             );
         }
-        // The root id is accepted for symmetry with `commit`; the slot is keyed by
-        // task, which is unique across roots.
-        let _ = root;
+        // The slot is keyed by task, which is unique across roots; the root is
+        // recorded so a freeze can scope itself to one conversation.
         drop(state);
         StartingPermit {
             gate: Arc::clone(self),
@@ -663,7 +693,7 @@ mod tests {
     #[test]
     fn foreground_root_lifecycle_a_frozen_gate_refuses_before_writing() {
         let gate = gate();
-        gate.freeze();
+        gate.freeze_root(&stamp("thread:a").root);
         let wrote = std::cell::Cell::new(false);
         let outcome = gate.commit(
             || Ok(stamp("thread:a")),
@@ -729,10 +759,46 @@ mod tests {
     }
 
     #[test]
+    fn foreground_root_lifecycle_freezing_one_root_keeps_another_root_running() {
+        // A rebind is one conversation's problem. Freezing must not stop, cancel or
+        // refuse another root's work -- that is the difference between recovering a
+        // session and draining the app.
+        let gate = gate();
+        let (a, permit_a, ()) = gate
+            .commit(|| Ok(stamp("thread:a")), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let (b, permit_b, ()) = gate
+            .commit(|| Ok(stamp("thread:b")), |_| Ok::<_, ()>(()))
+            .unwrap();
+        let frozen = gate.freeze_root(&a.root);
+        assert!(
+            frozen.starting == vec![a.task.clone()],
+            "only the frozen root's slot is enumerated: {frozen:?}"
+        );
+        assert!(
+            gate.is_live(&b.task),
+            "the other root's starting slot must stay live"
+        );
+        assert!(
+            !gate.is_live(&a.task),
+            "the frozen root's slot is cancelled, not merely recorded"
+        );
+        assert!(
+            !refused(gate.commit(|| Ok(stamp("thread:c")), |_| Ok::<_, ()>(()))),
+            "a root unrelated to the freeze may still admit"
+        );
+        drop((permit_a, permit_b));
+    }
+
+    #[test]
     fn foreground_root_lifecycle_freeze_is_sticky() {
         let gate = gate();
-        let frozen = gate.freeze();
+        let frozen = gate.freeze_root(&stamp("thread:a").root);
         assert!(frozen.starting.is_empty());
+        assert!(
+            !refused(gate.commit(|| Ok(stamp("thread:b")), |_| Ok::<_, ()>(()))),
+            "freezing one root must not refuse an unrelated root's admission"
+        );
         assert!(refused(
             gate.commit(|| Ok(stamp("thread:a")), |_| Ok::<_, ()>(()))
         ));

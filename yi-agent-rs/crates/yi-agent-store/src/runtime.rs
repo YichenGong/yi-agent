@@ -4254,6 +4254,14 @@ impl RuntimeCoordinator {
                 root.root_id.clone(),
             ));
         }
+        if authorization.daemon_instance_id != self.generation {
+            // A query answered across generations would describe a table this process
+            // does not have: the rows were written by a daemon that is gone, and the
+            // in-memory authority that justified them went with it.
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root.root_id.clone(),
+            ));
+        }
         let now = Instant::now();
         self.with_foreground_bridge(|bridge| {
             if !bridge.presents_capability(
@@ -4262,6 +4270,17 @@ impl RuntimeCoordinator {
                 &authorization.capability,
                 now,
             ) {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root.root_id.clone(),
+                ));
+            }
+            if bridge
+                .authority()
+                .installed_identity(&authorization.root_id)
+                .is_none_or(|(_, scope_key, _, _)| scope_key != authorization.scope_key)
+            {
+                // Same rule as a bind: a capability carried under another scope's key
+                // was issued for a different project decision.
                 return Err(RuntimeCoordinatorError::AuthorityDenied(
                     root.root_id.clone(),
                 ));
@@ -4279,6 +4298,248 @@ impl RuntimeCoordinator {
         repository
             .foreground_activity(&task)
             .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Freezes one root for a rebind and reports what it must stop.
+    ///
+    /// Three steps, and the order is the whole guarantee:
+    ///
+    /// 1. freeze the root in the gate, which refuses new admissions and cancels
+    ///    starting slots, and returns the live set the gate knows;
+    /// 2. merge that set with what the supervisor has registered, so a child that was
+    ///    admitted but whose factory has not been reached is still in the set;
+    /// 3. persist that closed set with a fresh version.
+    ///
+    /// The merge is why this cannot be "read the supervisors and freeze": between
+    /// those two reads a spawn would be admitted and land in neither view. Freezing
+    /// first means anything arriving later is refused, so the set read afterwards is
+    /// already closed.
+    ///
+    /// The gate is released before any waiting. Nothing here awaits, blocks on a
+    /// worker, or talks to a process: stopping is the caller's job, outside this call.
+    pub fn freeze_foreground_root(
+        &self,
+        root: &yi_agent_lifecycle::foreground::RootRef,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryImpact, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            ExecutionIdentity, ExecutionKind, ForegroundFence, RecoveryImpact, RootRef,
+        };
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let task: TaskId = root
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        if self.foreground_commit_gate.is_frozen(&root.root_id.clone()) {
+            // A second freeze would replace the set the first one is proving, and the
+            // caller would then be verifying evidence against a different set than the
+            // one its stop requests went out for.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::OperationConflict),
+            ));
+        }
+        // The persisted row is the fence: an attempt that has already moved on must not
+        // be frozen as if it were still current.
+        let persisted = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.persisted_foreground_root(&task)?
+        };
+        let Some(persisted) = persisted else {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(
+                    crate::foreground::ForegroundError::RecoveryAuthorityMissing,
+                ),
+            ));
+        };
+        let fence = ForegroundFence {
+            root: RootRef {
+                session_id: root.session_id.clone(),
+                root_id: root.root_id.clone(),
+                attempt_id: root.attempt_id.clone(),
+            },
+            generation: self.generation.clone(),
+            binding_epoch: persisted.binding_epoch,
+            driver_epoch: persisted.driver_epoch,
+        };
+        // Freeze first: from here on nothing new is admitted under this root, so the
+        // set collected next cannot grow.
+        let frozen_slots = self
+            .foreground_commit_gate
+            .freeze_root(&root.root_id.clone());
+        let mut executions: Vec<ExecutionIdentity> = Vec::new();
+        let mut child_ids: Vec<String> = Vec::new();
+        let mut push = |task: &TaskId, kind: ExecutionKind| {
+            // One identity per task *and* attempt. Restarting the same task mints a new
+            // attempt, so evidence written here can never match the new execution.
+            let attempt = root.attempt_id.clone();
+            let execution = ExecutionIdentity {
+                execution_id: format!("{kind:?}:{}:{attempt}", task),
+                task_id: task.to_string(),
+                attempt_id: attempt,
+                kind,
+            };
+            if !executions.iter().any(|seen| seen == &execution) {
+                executions.push(execution);
+            }
+            let id = task.to_string();
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        };
+        for task in frozen_slots
+            .starting
+            .iter()
+            .chain(frozen_slots.running.iter())
+        {
+            push(task, ExecutionKind::Worker);
+        }
+        // Registered children that never reached the gate still belong to the set.
+        // The root itself is *excluded*: it has no daemon worker, so demanding a
+        // worker join for it would invent evidence the spec forbids. Its foreground
+        // turn is stopped by the host and proven through its tool groups instead.
+        let session: RootSessionId = root.session_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::Supervisor("session id is not a session".into())
+        })?;
+        for child in self.registered_tasks_of(&session)? {
+            if child == task {
+                continue;
+            }
+            push(&child, ExecutionKind::Worker);
+        }
+        child_ids.sort();
+        let (version, frozen) = {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.freeze_foreground_root(&fence, &executions, "foreground recovery")?
+        };
+        Ok(RecoveryImpact {
+            root: fence.root.clone(),
+            stopped_execution_ids: Vec::new(),
+            blocked_execution_ids: frozen
+                .iter()
+                .map(|execution| execution.execution_id.clone())
+                .collect(),
+            child_ids,
+            version,
+            reason: "foreground recovery".to_string(),
+        })
+    }
+
+    /// Re-checks the stored evidence against the frozen set, inside one transaction.
+    ///
+    /// Called before a confirmation is issued and again inside the recovery commit,
+    /// because between those two moments the evidence could have been superseded. The
+    /// set is read from persistence rather than memory: after a restart the in-memory
+    /// set is gone, and "no pending stop" would otherwise read as "everything
+    /// stopped".
+    pub fn verify_foreground_quiescence(
+        &self,
+        fence: &yi_agent_lifecycle::foreground::ForegroundFence,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let task: TaskId =
+            fence.root.root_id.parse().map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("root id is not a task id".into())
+            })?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        let Some((version, frozen)) = repository.frozen_execution_set(&task)? else {
+            // No freeze at all: nothing was ever closed, so nothing can be verified.
+            // Reporting success here is what would let a rebind skip the stop proof.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StopUnproven(
+                    vec![fence.root.root_id.clone()],
+                )),
+            ));
+        };
+        let _ = version;
+        let evidence = repository.stop_evidence_for(&task, &fence.root.attempt_id)?;
+        let report =
+            yi_agent_lifecycle::foreground::assess_quiescence(fence, version, &frozen, &evidence);
+        if !report.blocked.is_empty() {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StopUnproven(
+                    report
+                        .blocked
+                        .iter()
+                        .map(|execution| execution.execution_id.clone())
+                        .collect(),
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records one trusted party's stop observation for a frozen execution.
+    ///
+    /// Not reachable from the business socket: the daemon's own join observer and the
+    /// guardian's private bridge are the only callers. A business client that could
+    /// reach this would be able to mint the very proof the freeze exists to demand.
+    pub fn record_foreground_stop_evidence(
+        &self,
+        evidence: &yi_agent_lifecycle::foreground::StopEvidence,
+    ) -> Result<yi_agent_lifecycle::foreground::StopEvidence, RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .record_stop_evidence(evidence)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Every task a session's supervisor has registered, sorted.
+    ///
+    /// Reads through `try_lock` rather than awaiting: this runs while a root is frozen
+    /// and a supervisor lock held across an await here would stall unrelated work. A
+    /// busy supervisor yields an empty list, which makes the freeze look smaller than
+    /// it is — so the caller must verify against persistence, not against this.
+    fn registered_tasks_of(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        let mut tasks = {
+            let supervisors = self
+                .supervisors
+                .lock()
+                .expect("runtime supervisor mutex poisoned");
+            let Some(supervisor) = supervisors.get(session) else {
+                return Ok(Vec::new());
+            };
+            match supervisor.try_lock() {
+                Ok(supervisor) => supervisor.task_ids(),
+                // A busy supervisor is an error, not an empty list: a set that
+                // silently came back smaller would make the freeze look complete when
+                // it was not, and the missing children would never be proven stopped.
+                Err(_) => {
+                    return Err(RuntimeCoordinatorError::Supervisor(
+                        "the session is busy; the frozen execution set could not be enumerated"
+                            .into(),
+                    ));
+                }
+            }
+        };
+        tasks.sort_by_key(|task| task.to_string());
+        Ok(tasks)
     }
 
     /// Closes one client's admission and returns the roots it owned.

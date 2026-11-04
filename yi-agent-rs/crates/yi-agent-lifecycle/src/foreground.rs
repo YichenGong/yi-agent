@@ -277,6 +277,116 @@ pub struct RecoveryImpact {
     pub reason: String,
 }
 
+/// One accepted execution the daemon knows about, named the way a stop proof must
+/// name it.
+///
+/// `identity` is not a task id. A task can be restarted under a new attempt, and a
+/// process can be respawned under a recycled pid; a proof bound to either would
+/// outlive the thing it proved. The identity is therefore minted once per execution
+/// (attempt plus a per-generation nonce) and never reused, so old evidence cannot be
+/// matched to a later run.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExecutionIdentity {
+    pub execution_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    /// `driver` (a foreground turn) or `worker` (a daemon child).
+    pub kind: ExecutionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionKind {
+    Driver,
+    Worker,
+}
+
+/// Which trusted party observed a fact.
+///
+/// Recorded so a reader can tell "the daemon's own join observer said so" from "the
+/// guardian's process registry said so". It is never a business client: the only
+/// install path is the private bridge or the daemon's own commit, which is what keeps
+/// an RPC from self-reporting `stopped = true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    /// The host/daemon awaited the foreground turn.
+    Host,
+    /// The daemon's worker handle reported a join.
+    Daemon,
+    /// The guardian observed the managed process groups gone.
+    Guardian,
+}
+
+/// The two facts a stop proof needs, kept apart on purpose.
+///
+/// A worker's join proves its own task ended; it says nothing about the process
+/// groups its tools started. A shell that forked a background job is exactly where
+/// the two disagree. So neither fact alone is a stop: `joined && tools_stopped` is,
+/// and each may be installed by the party that can actually observe it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopEvidence {
+    pub evidence_id: String,
+    pub fence: ForegroundFence,
+    pub execution: ExecutionIdentity,
+    /// The attempt whose managed tool groups were checked, so a proof cannot be
+    /// replayed against the same task's next attempt.
+    pub attempt_id: String,
+    pub source: EvidenceSource,
+    /// The execution itself ended: a worker joined, or a turn was awaited to its end.
+    pub joined: bool,
+    /// Every managed process group that execution started is observed gone.
+    pub tools_stopped: bool,
+    /// Kernel-level identity of the process group that was proven gone, if any.
+    /// `None` for a foreground turn hosted in the daemon's own process, where the
+    /// turn's join plus its tool groups is the whole proof.
+    pub process_identity: Option<ProcessIdentity>,
+}
+
+impl StopEvidence {
+    /// Whether this record alone licenses "stopped".
+    ///
+    /// Both facts are required. A record that proves one of them is still useful —
+    /// it merges with the other party's record — but it is not a proof by itself.
+    pub fn proves_stop(&self) -> bool {
+        self.joined && self.tools_stopped
+    }
+}
+
+/// A managed process identity that a recycled pid cannot satisfy.
+///
+/// Deliberately not just a pid: `pid` plus the kernel start time is what makes
+/// "the same numeric pid" distinguishable from "the same process".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: i32,
+    pub start_micros: u64,
+}
+
+/// A reference to stop evidence, as the wire may carry it.
+///
+/// The wire carries only this: it names durable evidence, it cannot create it. A
+/// reference whose `fence` or `execution_id` does not match a stored record is
+/// refused, which is what keeps "the client said it stopped" out of the protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuiescenceRef {
+    pub fence: ForegroundFence,
+    pub execution_id: String,
+    pub evidence_id: String,
+}
+
+/// What may be reported as stopped once a freeze and its stop proofs are collected.
+///
+/// `stopped` and `blocked` are computed from the frozen set, not from what a caller
+/// claims: an execution in the set with no matching evidence is `blocked`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuiescenceReport {
+    pub fence: ForegroundFence,
+    pub execution_set_version: u64,
+    pub stopped: Vec<QuiescenceRef>,
+    pub blocked: Vec<ExecutionIdentity>,
+}
+
 /// The result of preparing a recovery: what it would do, and whether it may proceed.
 ///
 /// `confirmation_token` is `None` while stops are unproven. `expires_at` is only
@@ -416,6 +526,59 @@ impl std::fmt::Debug for SecretCapability {
     }
 }
 
+/// Judges a frozen execution set against the evidence stored for it.
+///
+/// Pure on purpose. The daemon has to answer "is everything in this set proven
+/// stopped" both before it issues a confirmation and again inside the recovery
+/// transaction, and both answers must come from the same rule rather than two
+/// hand-written loops. It is also the only place that decides what "matching
+/// evidence" means, so a test can pin it without a database.
+///
+/// An execution counts as stopped only when a record matches its `execution_id`
+/// *and* its attempt. The attempt check is what makes a proof non-transferable:
+/// restarting the same task mints a new attempt, and a proof written for the old one
+/// must not license the new one. A record whose own fields disagree about its
+/// attempt never reaches here -- the writer refuses it (see
+/// `repository::foreground::record_stop_evidence`), so the two can be compared
+/// directly.
+pub fn assess_quiescence(
+    fence: &ForegroundFence,
+    execution_set_version: u64,
+    frozen: &[ExecutionIdentity],
+    evidence: &[StopEvidence],
+) -> QuiescenceReport {
+    let mut stopped = Vec::new();
+    let mut blocked = Vec::new();
+    for execution in frozen {
+        let matched = evidence.iter().find(|record| {
+            record.execution.execution_id == execution.execution_id
+                && record.execution.kind == execution.kind
+                && record.attempt_id == execution.attempt_id
+                && record.fence.root == fence.root
+                && record.fence.generation == fence.generation
+                && record.fence.binding_epoch == fence.binding_epoch
+                && record.fence.driver_epoch == fence.driver_epoch
+                && record.proves_stop()
+        });
+        match matched {
+            Some(record) => stopped.push(QuiescenceRef {
+                fence: fence.clone(),
+                execution_id: execution.execution_id.clone(),
+                evidence_id: record.evidence_id.clone(),
+            }),
+            None => blocked.push(execution.clone()),
+        }
+    }
+    stopped.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
+    blocked.sort();
+    QuiescenceReport {
+        fence: fence.clone(),
+        execution_set_version,
+        stopped,
+        blocked,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +682,144 @@ mod tests {
         assert_eq!(json["blocked_execution_ids"][0], "exec-1");
         let decoded: ForegroundFailure = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, failure);
+    }
+
+    fn fenced(attempt: &str, driver_epoch: u64) -> ForegroundFence {
+        ForegroundFence {
+            root: RootRef {
+                session_id: "session-1".into(),
+                root_id: "root-1".into(),
+                attempt_id: attempt.into(),
+            },
+            generation: "gen-1".into(),
+            binding_epoch: 2,
+            driver_epoch,
+        }
+    }
+
+    fn execution_of(attempt: &str) -> ExecutionIdentity {
+        ExecutionIdentity {
+            execution_id: format!("exec-{attempt}"),
+            task_id: format!("task-{attempt}"),
+            attempt_id: attempt.into(),
+            kind: ExecutionKind::Worker,
+        }
+    }
+
+    fn proof(fence: &ForegroundFence, execution: &ExecutionIdentity) -> StopEvidence {
+        StopEvidence {
+            evidence_id: format!("evidence-{}", execution.execution_id),
+            fence: fence.clone(),
+            execution: execution.clone(),
+            source: EvidenceSource::Daemon,
+            joined: true,
+            tools_stopped: true,
+            attempt_id: execution.attempt_id.clone(),
+            process_identity: None,
+        }
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_quiescence_needs_evidence_for_the_same_execution() {
+        let fence = fenced("attempt-1", 3);
+        let frozen = vec![execution_of("attempt-1")];
+        let report = assess_quiescence(&fence, 7, &frozen, &[]);
+        assert_eq!(report.execution_set_version, 7);
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.blocked, frozen);
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_quiescence_rejects_evidence_for_another_attempt() {
+        // The task id is the same, the attempt is not: this is exactly the shape a
+        // re-run produces, and the old proof must not license it.
+        let fence = fenced("attempt-2", 3);
+        let frozen = vec![execution_of("attempt-2")];
+        let stale = proof(&fenced("attempt-1", 3), &execution_of("attempt-1"));
+        let report = assess_quiescence(&fence, 7, &frozen, &[stale]);
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_quiescence_rejects_a_reused_execution_id() {
+        // The id alone must not be enough. If execution ids ever regress to being
+        // derived from the task (rather than the attempt), a record from the previous
+        // run would carry the same id -- the attempt is what keeps it from matching.
+        let fence = fenced("attempt-2", 3);
+        let mut frozen = execution_of("attempt-2");
+        frozen.execution_id = "exec-reused".into();
+        let mut stale = execution_of("attempt-1");
+        stale.execution_id = "exec-reused".into();
+        let record = proof(&fenced("attempt-1", 3), &stale);
+        let report = assess_quiescence(&fence, 5, &[frozen], &[record]);
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_quiescence_rejects_evidence_from_another_fence() {
+        let fence = fenced("attempt-1", 4);
+        let frozen = vec![execution_of("attempt-1")];
+        // Same executions, weaker driver epoch: a proof taken under the previous
+        // driver does not describe the driver that was actually frozen.
+        let older_driver = proof(&fenced("attempt-1", 3), &execution_of("attempt-1"));
+        let report = assess_quiescence(&fence, 7, &frozen, &[older_driver]);
+        assert!(report.stopped.is_empty());
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_quiescence_reports_each_matching_execution_once() {
+        let fence = fenced("attempt-1", 3);
+        let frozen = vec![execution_of("attempt-1"), execution_of("attempt-3")];
+        let records = vec![
+            proof(&fence, &execution_of("attempt-1")),
+            proof(&fence, &execution_of("attempt-3")),
+            proof(&fence, &execution_of("attempt-1")),
+        ];
+        let report = assess_quiescence(&fence, 9, &frozen, &records);
+        assert_eq!(report.stopped.len(), 2);
+        assert!(report.blocked.is_empty());
+        assert_eq!(report.stopped[0].execution_id, "exec-attempt-1");
+        assert_eq!(report.stopped[1].execution_id, "exec-attempt-3");
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_a_join_without_stopped_tools_is_not_a_stop() {
+        // The worker joined, the tool group it forked is still alive. This is the
+        // shape a shell with a background job produces, and reporting it as stopped
+        // is exactly the lie a rebind would act on.
+        let fence = fenced("attempt-1", 3);
+        let frozen = vec![execution_of("attempt-1")];
+        let mut record = proof(&fence, &execution_of("attempt-1"));
+        record.tools_stopped = false;
+        let report = assess_quiescence(&fence, 1, &frozen, &[record]);
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_stopped_tools_without_a_join_is_not_a_stop() {
+        let fence = fenced("attempt-1", 3);
+        let frozen = vec![execution_of("attempt-1")];
+        let mut record = proof(&fence, &execution_of("attempt-1"));
+        record.joined = false;
+        let report = assess_quiescence(&fence, 1, &frozen, &[record]);
+        assert!(report.stopped.is_empty());
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_a_quiescence_ref_names_the_stored_evidence() {
+        let fence = fenced("attempt-1", 3);
+        let frozen = vec![execution_of("attempt-1")];
+        let record = proof(&fence, &execution_of("attempt-1"));
+        let report = assess_quiescence(&fence, 4, &frozen, std::slice::from_ref(&record));
+        assert_eq!(report.stopped[0].evidence_id, record.evidence_id);
+        assert_eq!(report.stopped[0].fence, *fence_ref(&fence));
+    }
+
+    fn fence_ref(fence: &ForegroundFence) -> Box<ForegroundFence> {
+        Box::new(fence.clone())
     }
 
     #[test]

@@ -16,7 +16,8 @@
 use super::*;
 use crate::foreground::{ActivityApply, ForegroundError, RootExecutionClass, reduce_activity};
 use yi_agent_lifecycle::foreground::{
-    ActivityPhase, ActivitySnapshot, ActivityUpdate, RecoveryResult,
+    ActivityPhase, ActivitySnapshot, ActivityUpdate, ExecutionIdentity, ExecutionKind,
+    ForegroundFence, RecoveryResult, StopEvidence,
 };
 
 /// The migration's `classification` column, as a value rather than a string.
@@ -463,6 +464,303 @@ impl RuntimeRepository {
             session,
             attempt,
         })
+    }
+
+    /// Freezes one root for a rebind and returns the execution set that freeze owns.
+    ///
+    /// The whole point is that "close admission" and "here is the complete set" are
+    /// one step: the store writes the freeze row, the frozen set and the version in a
+    /// single transaction, so a later read cannot observe a frozen root with a set
+    /// that still admits members. The version increments per freeze, which is what
+    /// makes evidence from an earlier freeze unable to license a later one.
+    ///
+    /// Membership comes from the caller because only the coordinator knows its live
+    /// slots; the store's job is to persist them atomically and to bump the version.
+    pub fn freeze_foreground_root(
+        &mut self,
+        fence: &ForegroundFence,
+        executions: &[ExecutionIdentity],
+        reason: &str,
+    ) -> Result<(u64, Vec<ExecutionIdentity>), RepositoryError> {
+        if reason.trim().is_empty() {
+            // A freeze without a reason cannot be shown to a user, and an empty
+            // string is a placeholder, not an explanation.
+            return Err(RepositoryError::Foreground(ForegroundError::CorruptBinding));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The fence must still describe the row: freezing an attempt that has since
+        // been replaced would close the wrong conversation.
+        let persisted = transaction
+            .query_row(
+                "SELECT f.binding_epoch, f.driver_epoch, t.active_attempt_id, t.root_session_id
+                 FROM foreground_root_state f JOIN tasks t ON t.id = f.root_task_id
+                 WHERE f.root_task_id = ?1",
+                params![fence.root.root_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((binding_epoch, driver_epoch, attempt, session)) = persisted else {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryAuthorityMissing,
+            ));
+        };
+        if u64::try_from(binding_epoch).ok() != Some(fence.binding_epoch)
+            || u64::try_from(driver_epoch).ok() != Some(fence.driver_epoch)
+        {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleDriver));
+        }
+        if attempt != fence.root.attempt_id || session != fence.root.session_id {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        let previous: Option<i64> = transaction
+            .query_row(
+                "SELECT execution_set_version FROM foreground_freeze WHERE root_task_id = ?1",
+                params![fence.root.root_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let version = previous
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))
+            })
+            .transpose()?
+            .unwrap_or(0)
+            .saturating_add(1);
+        transaction.execute(
+            "INSERT INTO foreground_freeze (root_task_id, execution_set_version)
+             VALUES (?1, ?2)
+             ON CONFLICT(root_task_id) DO UPDATE SET
+                 execution_set_version = excluded.execution_set_version,
+                 frozen_at = CURRENT_TIMESTAMP",
+            params![
+                fence.root.root_id,
+                i64::try_from(version)
+                    .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?
+            ],
+        )?;
+        // A new freeze replaces the previous set rather than appending to it: the old
+        // members were proven against the old version and cannot be carried forward.
+        transaction.execute(
+            "DELETE FROM foreground_frozen_executions WHERE root_task_id = ?1",
+            params![fence.root.root_id],
+        )?;
+        let mut frozen: Vec<ExecutionIdentity> = Vec::new();
+        for execution in executions {
+            if execution.attempt_id != fence.root.attempt_id {
+                // A member from another attempt is not part of this root's current
+                // execution set. Persisting it would make the set unprovable by
+                // construction, so refuse the freeze instead of silently dropping it.
+                return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+            }
+            if !frozen.iter().any(|seen| seen == execution) {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO foreground_frozen_executions
+                         (root_task_id, execution_set_version, execution_id, task_id,
+                          attempt_id, kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        fence.root.root_id,
+                        i64::try_from(version).map_err(|_| RepositoryError::Foreground(
+                            ForegroundError::CorruptBinding
+                        ))?,
+                        execution.execution_id,
+                        execution.task_id,
+                        execution.attempt_id,
+                        match execution.kind {
+                            ExecutionKind::Driver => "driver",
+                            ExecutionKind::Worker => "worker",
+                        },
+                    ],
+                )?;
+                frozen.push(execution.clone());
+            }
+        }
+        // The row itself records the freeze, so `bind` refuses a rebind until a
+        // recovery clears it. `closed` would look like an ordinary exit.
+        transaction.execute(
+            "UPDATE foreground_root_state SET admission_state = 'frozen'
+             WHERE root_task_id = ?1",
+            params![fence.root.root_id],
+        )?;
+        transaction.commit()?;
+        frozen.sort();
+        Ok((version, frozen))
+    }
+
+    /// The executions belonging to one root's current freeze, with its version.
+    ///
+    /// Returns `None` when the root was never frozen, so "no freeze" stays
+    /// distinguishable from "a freeze whose set happens to be empty".
+    pub fn frozen_execution_set(
+        &self,
+        root: &TaskId,
+    ) -> Result<Option<(u64, Vec<ExecutionIdentity>)>, RepositoryError> {
+        let version: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT execution_set_version FROM foreground_freeze WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        let version = u64::try_from(version)
+            .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        let mut statement = self.connection.prepare(
+            "SELECT execution_id, task_id, attempt_id, kind
+             FROM foreground_frozen_executions
+             WHERE root_task_id = ?1 AND execution_set_version = ?2",
+        )?;
+        let rows = statement.query_map(params![root.to_string(), version], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut frozen = Vec::new();
+        for row in rows {
+            let (execution_id, task_id, attempt_id, kind) = row?;
+            frozen.push(ExecutionIdentity {
+                execution_id,
+                task_id,
+                attempt_id,
+                kind: match kind.as_str() {
+                    "driver" => ExecutionKind::Driver,
+                    "worker" => ExecutionKind::Worker,
+                    _ => return Err(RepositoryError::Foreground(ForegroundError::CorruptBinding)),
+                },
+            });
+        }
+        frozen.sort();
+        Ok(Some((version, frozen)))
+    }
+
+    /// Records one trusted party's observation about an execution.
+    ///
+    /// Two parties may write about the same execution (the daemon's join, the
+    /// guardian's tool groups), and the surviving record must carry both facts. So a
+    /// second write merges rather than replaces: `joined` and `tools_stopped` are
+    /// each sticky once proven, and the source lists stay append-only by keeping the
+    /// first provenance. Writing a `false` never erases an earlier `true`, which
+    /// would let a slow observer undo a proof.
+    pub fn record_stop_evidence(
+        &mut self,
+        evidence: &StopEvidence,
+    ) -> Result<StopEvidence, RepositoryError> {
+        // A record that disagrees with itself cannot be merged meaningfully: the
+        // attempt in the row key and the attempt inside the execution would then
+        // describe two different runs, and whichever won would make a proof look
+        // wider than it is.
+        if evidence.attempt_id != evidence.execution.attempt_id
+            || evidence.attempt_id != evidence.fence.root.attempt_id
+        {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let executions = transaction.query_row(
+            "SELECT COUNT(*) FROM foreground_frozen_executions
+             WHERE root_task_id = ?1 AND execution_id = ?2 AND attempt_id = ?3",
+            params![
+                evidence.fence.root.root_id,
+                evidence.execution.execution_id,
+                evidence.execution.attempt_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if executions == 0 {
+            // Evidence for an execution that is not in the frozen set describes
+            // something else, and accepting it would let a client accumulate proofs
+            // for executions it wants to appear stopped.
+            return Err(RepositoryError::Foreground(ForegroundError::StopUnproven(
+                vec![evidence.execution.execution_id.clone()],
+            )));
+        }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT evidence_json FROM foreground_stop_evidence
+                 WHERE root_task_id = ?1 AND attempt_id = ?2 AND execution_id = ?3",
+                params![
+                    evidence.fence.root.root_id,
+                    evidence.attempt_id,
+                    evidence.execution.execution_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let merged = match existing {
+            Some(json) => {
+                let previous: StopEvidence = serde_json::from_str(&json)?;
+                StopEvidence {
+                    evidence_id: previous.evidence_id.clone(),
+                    fence: previous.fence.clone(),
+                    execution: previous.execution.clone(),
+                    attempt_id: previous.attempt_id.clone(),
+                    source: previous.source,
+                    joined: previous.joined || evidence.joined,
+                    tools_stopped: previous.tools_stopped || evidence.tools_stopped,
+                    process_identity: previous
+                        .process_identity
+                        .clone()
+                        .or_else(|| evidence.process_identity.clone()),
+                }
+            }
+            None => evidence.clone(),
+        };
+        transaction.execute(
+            "INSERT INTO foreground_stop_evidence
+                 (root_task_id, attempt_id, execution_id, evidence_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root_task_id, attempt_id, execution_id) DO UPDATE SET
+                 evidence_json = excluded.evidence_json",
+            params![
+                evidence.fence.root.root_id,
+                merged.attempt_id,
+                merged.execution.execution_id,
+                serde_json::to_string(&merged)?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(merged)
+    }
+
+    /// Every stored record for one root's current attempt.
+    ///
+    /// Scoped to the attempt so a proof from the previous attempt can never be
+    /// returned as if it described the current one.
+    pub fn stop_evidence_for(
+        &self,
+        root: &TaskId,
+        attempt: &str,
+    ) -> Result<Vec<StopEvidence>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT evidence_json FROM foreground_stop_evidence
+             WHERE root_task_id = ?1 AND attempt_id = ?2
+             ORDER BY execution_id",
+        )?;
+        let rows = statement.query_map(params![root.to_string(), attempt], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(serde_json::from_str(&row?)?);
+        }
+        Ok(records)
     }
 
     /// The committed activity snapshot, if one exists.
