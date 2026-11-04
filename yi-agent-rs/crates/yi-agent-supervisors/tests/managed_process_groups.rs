@@ -633,3 +633,120 @@ fn a_bootstrap_descriptor_does_not_collide_with_the_ready_barrier() {
         .terminate_owner(&owner, Deadline::after(Duration::from_secs(10)))
         .unwrap();
 }
+
+/// Dropping a registry must stop every group it started.
+///
+/// The tests in this file all reach an explicit `terminate_*` call, so they never
+/// exposed the gap: a test that returns early (a failed assertion, a panic, a
+/// `?`), or one that deliberately leaves a group running, drops the registry with
+/// live children. `std::process::Child`'s own `Drop` neither kills nor waits, and
+/// each managed child called `setsid`, so it is not in our process group and will
+/// never receive a signal from the test harness or the shell. The process then
+/// outlives the test binary and is reparented to init, still writing to the
+/// fixtures' marker files.
+#[test]
+fn dropping_a_registry_stops_the_groups_it_started() {
+    let directory = TempDir::new().unwrap();
+    let mut markers = fixture::MarkerGuard::new();
+    let marker = markers.path("dropped");
+    let owner = ProcessOwner::frontend("app");
+
+    let mut registry = registry(&directory);
+    let process_id = registry
+        .spawn(
+            fixture::steady_writer(owner, &marker, None),
+            Deadline::after(Duration::from_secs(10)),
+        )
+        .unwrap();
+    assert!(
+        fixture::wait_for_marker(&marker, fixture::MARKER_TIMEOUT),
+        "the writer must actually be running before the registry is dropped"
+    );
+    let pgid = registry
+        .records()
+        .iter()
+        .find(|record| record.process_id == process_id)
+        .expect("the group is journaled")
+        .pgid;
+
+    // No `terminate_*` call: the drop itself is what must clean up.
+    drop(registry);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = yi_agent_supervisors::lifecycle::processes::live_group_members(pgid)
+            .expect("the group is inspectable");
+        if members.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dropping the registry left group {pgid} running with members {members:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A group whose members were stopped must still be reclaimed.
+///
+/// This is not hypothetical: `lsof <target>/debug/.cargo-lock` and the leaked
+/// processes in a real session both showed members in `T` state. A stopped process
+/// does not run its signal handlers and ignores `SIGTERM`'s default terminating
+/// action until it is continued, so a reclamation path that waits on `SIGTERM`
+/// would hang here. The group kill uses `SIGKILL`, which is delivered regardless.
+#[test]
+fn a_stopped_group_member_is_still_reclaimed() {
+    let directory = TempDir::new().unwrap();
+    let mut markers = fixture::MarkerGuard::new();
+    let marker = markers.path("stopped");
+    let owner = ProcessOwner::frontend("app");
+
+    let mut registry = registry(&directory);
+    let process_id = registry
+        .spawn(
+            fixture::steady_writer(owner.clone(), &marker, None),
+            Deadline::after(Duration::from_secs(10)),
+        )
+        .unwrap();
+    assert!(
+        fixture::wait_for_marker(&marker, fixture::MARKER_TIMEOUT),
+        "the writer must be running before it is stopped"
+    );
+
+    let pid = registry
+        .records()
+        .iter()
+        .find(|record| record.process_id == process_id)
+        .expect("the group is journaled")
+        .pid;
+
+    // Simulate the debugger/terminal case that produced the original report.
+    let stopped = unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(stopped, 0, "SIGSTOP must be accepted");
+
+    registry
+        .terminate_owner(&owner, Deadline::after(Duration::from_secs(10)))
+        .expect("a stopped member must still be reclaimed");
+
+    // The group must be gone, not merely signalled: a `SIGTERM`-only path would
+    // leave the stopped leader alive forever.
+    let pgid = registry
+        .records()
+        .iter()
+        .find(|record| record.process_id == process_id)
+        .expect("the group is journaled")
+        .pgid;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = yi_agent_supervisors::lifecycle::processes::live_group_members(pgid)
+            .expect("the group is inspectable");
+        if members.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped group {pgid} survived reclamation with members {members:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

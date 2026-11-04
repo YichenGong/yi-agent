@@ -1024,6 +1024,42 @@ impl ProcessRegistry {
     }
 }
 
+/// Last-resort reclamation for the groups this registry started.
+///
+/// `std::process::Child`'s `Drop` neither kills nor waits, and every managed child
+/// calls `setsid` in `pre_exec`, so a dropped-but-not-terminated registry leaves
+/// groups that are not in our process group: neither the test harness nor the
+/// shell will ever signal them. They outlive the owner and are reparented to init.
+///
+/// The normal path stays `terminate_owner` / `terminate_execution`, which drain the
+/// group and journal the outcome. This exists for the paths that cannot reach them:
+/// a caller that returns early, a panicking test, or code that deliberately keeps a
+/// group running to observe it. It signals groups directly instead of going through
+/// `stop`, because the journal is no longer meaningful to a dying owner and a
+/// journal write must not run during unwinding.
+impl Drop for ProcessRegistry {
+    fn drop(&mut self) {
+        for record in &self.records {
+            if record.state != RecordState::Running {
+                continue;
+            }
+            // Without the `Child` handle, ownership rests on the leader's birth
+            // identity: a PGID whose leader vanished may since have been recycled.
+            let leader_alive = self.children.contains_key(&record.process_id)
+                || ProcessBirth::from_recorded(record.pid, record.start_micros).is_alive();
+            if !leader_alive {
+                continue;
+            }
+            let _ = processes::kill_group(record.pgid);
+        }
+        // Reap what we hold, so no zombie is left behind by our own exit. The group
+        // kill above is what stops the members; this only collects the leader.
+        for (_, mut child) in std::mem::take(&mut self.children) {
+            let _ = child.wait();
+        }
+    }
+}
+
 /// What one managed group currently looks like.
 enum GroupState {
     /// No live member remains, and the group was proven ours.

@@ -189,12 +189,76 @@ wait_gone() {
   return 1
 }
 
+# 测试残留的 helper 子进程：单独一类，不进主匹配。
+#
+# 这些是本仓库测试二进制的 `--exact <helper> --ignored` 子进程（见
+# `crates/yi-agent-supervisors/tests/support/process_fixture.rs`）。它们与
+# 生产的 `yi-agent` 无关，所以**不能**塞进 `is_target_command`：那条规则按
+# basename 精确匹配是为了避免误杀，放宽成「路径含 deps/」会命中任何在
+# `target/` 下跑的东西。
+#
+# 为什么要单独清扫：managed 子进程在 `pre_exec` 里 `setsid()`，自成会话与
+# 进程组。测试二进制退出（或被 Ctrl-C）后它们收不到任何信号，直接挂到
+# launchd 名下继续跑。`ProcessRegistry` 的 `Drop` 已经兜底回收，但历史遗留
+# 与被打断的编译产物仍可能留在表里。
+#
+# 规则刻意收窄成三条同时成立：路径在 `target/{debug,release}/deps/`、
+# 带 `--exact`、带 `--ignored`——正常构建产物与正在跑的 `cargo test` 主进程
+# 都不匹配。
+test_helper_pids() {
+  ps -axo pid=,command= 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      # 测试二进制的 `--exact <helper> --ignored` 子进程
+      # （`crates/yi-agent-supervisors/tests/support/process_fixture.rs`）。
+      #
+      # 只认 deps/ 下的这一形态。`internal-runtime guardian` 不在此列：它的
+      # basename 就是 `yi-agent`，主流程的 `is_target_command` 已经按 basename
+      # 全量覆盖，在这里重复一遍只会让两处规则各自漂移。
+      */target/debug/deps/*|*/target/release/deps/*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      *--exact*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      *--ignored*) ;;
+      *) continue ;;
+    esac
+    printf '%s\n' "${line%% *}"
+  done
+}
+
+# 停止测试二进制留下的 helper。返回已停止的个数（供日志用）。
+stop_test_helpers() {
+  local pids count=0
+  pids="$(test_helper_pids | tr '\n' ' ')"
+  [ -n "${pids// /}" ] || return 0
+  for pid in $pids; do
+    # 先 CONT：被 SIGSTOP 暂停的进程收到 SIGTERM 只会挂起信号，永不退出。
+    kill -CONT "$pid" 2>/dev/null || true
+    if kill -TERM "$pid" 2>/dev/null; then
+      count=$((count + 1))
+    fi
+  done
+  # 给它们一点时间走 SIGTERM；仍在的交给 stop_dependents 之外的收尾。
+  wait_gone 3 $pids || true
+  for pid in $pids; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  if [ "$count" -gt 0 ]; then
+    echo "测试残留 -> 已停止 $count 个 helper"
+  fi
+}
+
 # stop_dependents <子命令名>：把依附旧二进制的进程停干净。
 #
 # <子命令名> 用于事件日志与汇总文案；`stop` 只停不编。
 stop_dependents() {
   local cmd="${1:-all}"
   log "停止依附旧二进制的进程"
+
+  stop_test_helpers
 
   # ① 先 bootout 值守。KeepAlive=true：先 kill 会在 10s 内复活一个新的
   #    resident watch，而它的第一个动作就是把刚杀掉的 daemon 拉回来。
