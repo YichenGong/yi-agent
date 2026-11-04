@@ -519,6 +519,110 @@ impl ForegroundDriver {
     }
 }
 
+/// A host's per-turn view of one foreground root.
+///
+/// The three hosts (desktop, TUI, headless) all need the same sequence: open the turn
+/// before any work, close it when the turn really ends, and never let a failed report
+/// turn a working conversation into a failed one. Putting that here means the hosts
+/// cannot disagree about it, and Kanban still gets no special branch.
+///
+/// The invariant is that activity is *description*, never control: every method
+/// returns `()` and reports problems through [`Self::warning`] (and a `tracing::warn`
+/// line that carries no secrets). A caller that wanted to abort a turn because the
+/// activity write failed would be turning a display problem into a lost answer.
+pub struct ForegroundTurn<T: ForegroundTransport = SocketTransport> {
+    driver: DriverState<T>,
+    /// The last problem this turn saw, for the host's diagnostics panel.
+    warning: Option<String>,
+}
+
+impl ForegroundTurn<SocketTransport> {
+    /// Binds the host as this root's driver.
+    ///
+    /// A refusal here is a normal outcome, not an error to propagate: a build or a
+    /// runtime that does not serve the foreground contract must still run the
+    /// conversation, just without activity reporting (the legacy policy).
+    pub fn bind(
+        root: Arc<ThreadRoot>,
+        authorization: RootAuthorization,
+        operation_id: String,
+    ) -> Result<Self, ForegroundClientError> {
+        let driver = ForegroundDriver::bind(root, authorization, operation_id)?;
+        Ok(Self {
+            driver: driver.state,
+            warning: None,
+        })
+    }
+}
+
+impl<T: ForegroundTransport> ForegroundTurn<T> {
+    /// Opens `turn_id`. A failure is recorded and swallowed.
+    ///
+    /// Opening the turn that is already open is a no-op, not a failure: hosts retry
+    /// around their own recovery, and a retry is not a second statement.
+    pub fn begin(&mut self, turn_id: &str) {
+        if self.driver.committed.turn_id.as_deref() == Some(turn_id) {
+            self.warning = None;
+            return;
+        }
+        if let Err(error) = self.driver.open_turn(turn_id) {
+            self.record("begin", error);
+            return;
+        }
+        self.warning = None;
+    }
+
+    /// Reports a waiting phase inside the open turn. Same posture as `begin`.
+    pub fn waiting(&mut self, phase: ActivityPhase) {
+        let Some(turn) = self.driver.committed.turn_id.clone() else {
+            self.record(
+                "waiting",
+                ForegroundClientError::Protocol(
+                    "no turn is open, so nothing can be waiting".into(),
+                ),
+            );
+            return;
+        };
+        if let Err(error) = self.driver.report(Some(&turn), phase) {
+            self.record("waiting", error);
+        }
+    }
+
+    /// Closes `turn_id`. Must run on every exit path -- success, provider error and
+    /// cancellation -- because a turn left open would make the next one look like a
+    /// second statement about a turn that never ended.
+    pub fn finish(&mut self, turn_id: &str) {
+        // Already closed: the overlapping exit paths both reached the same end, and
+        // reporting that as a problem would train the host to ignore real ones.
+        if self.driver.committed.turn_id.is_none() {
+            return;
+        }
+        if let Err(error) = self.driver.finish(turn_id) {
+            self.record("finish", error);
+        } else {
+            self.warning = None;
+        }
+    }
+
+    /// The last problem, if any. The host shows this; it never retries a turn because
+    /// of it.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+
+    /// The binding the daemon issued, for hosts that need to name the fence.
+    pub fn binding(&self) -> &DriverBinding {
+        &self.driver.binding
+    }
+
+    fn record(&mut self, stage: &'static str, error: ForegroundClientError) {
+        // Diagnostics carry the stage and the error's own text, never the capability:
+        // `ForegroundClientError` does not print secrets by construction.
+        tracing::warn!(stage, %error, "foreground activity could not be reported");
+        self.warning = Some(format!("{stage}: {error}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -726,6 +830,68 @@ mod tests {
             driver.transport.sent().len(),
             1,
             "only the open turn was sent"
+        );
+    }
+
+    /// A host helper over a driver whose transport is a fake.
+    ///
+    /// `ForegroundTurn` is generic over nothing, so the test builds the real struct
+    /// from a real `ForegroundDriver` and swaps the transport for the fake -- the
+    /// failure posture is what is under test, not the transport.
+    fn turn_over(fake: FakeTransport, last_seq: u64) -> ForegroundTurn<FakeTransport> {
+        ForegroundTurn {
+            driver: driver(fake, last_seq),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_a_host_turn_swallows_a_failed_report() {
+        // The whole point of the host wrapper: a lost activity report must leave the
+        // conversation running and just be visible as a warning.
+        let fake = FakeTransport::default();
+        *fake.fail_next.lock().unwrap() = 1;
+        let mut turn = turn_over(fake, 0);
+
+        turn.begin("turn-1");
+        assert!(
+            turn.warning().is_some(),
+            "a failed begin is recorded, not returned"
+        );
+        assert_eq!(
+            turn.driver.last_snapshot().seq,
+            0,
+            "the committed sequence did not advance"
+        );
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_a_host_turn_clears_its_warning_on_success() {
+        let fake = FakeTransport::default();
+        *fake.fail_next.lock().unwrap() = 1;
+        let mut turn = turn_over(fake, 0);
+        turn.begin("turn-1");
+        assert!(turn.warning().is_some());
+
+        // The retry is the host's business, not the wrapper's; once the turn opens the
+        // stale warning must not keep describing a problem that is over.
+        turn.driver.retry_pending().unwrap();
+        turn.begin("turn-1");
+        assert!(turn.warning().is_none());
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_a_host_turn_finish_is_idempotent_from_the_host_side() {
+        // Exit paths overlap (error plus cancellation both finalize). A second finish
+        // must not panic and must not surface as a warning the user has to act on.
+        let fake = FakeTransport::default();
+        let mut turn = turn_over(fake, 0);
+        turn.begin("turn-1");
+        turn.finish("turn-1");
+        turn.finish("turn-1");
+        assert!(
+            turn.warning().is_none(),
+            "a duplicate finish is a no-op, not a problem to report"
         );
     }
 
