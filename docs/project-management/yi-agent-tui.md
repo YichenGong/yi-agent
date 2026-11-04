@@ -26,6 +26,8 @@ yi-agent 的终端用户界面（TUI），基于 ratatui 实现全屏布局。�
 
 ## Features
 
+- [ ] TUI 旁问可靠返回与退出修复 — spec 已复核，[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md) 已编写，代码未修：修正可见会话的 Paste/补全路由、Ctrl+C 两步退出、应用级退出优先级及 Close/Interrupt 投递失败反馈；删除介绍 header，复用状态栏。完成判据：[修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md) §8.2 T01–T10（真实事件循环 + PTY）、§8.3 验证命令与§9；不能以旧纯按键测试通过代替本轮验收。
+
 - [x] ratatui 全屏 TUI 架构 — `tui/app.rs` 实现事件循环 + 布局 — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] 结构化对话历史 — `tui/cell.rs` 定义 `HistoryCell` 枚举 + `tui/history.rs` 管理 — [设计](../plans/2026-07-25-tui-history-redesign.md)
 - [x] Markdown 渲染 — `tui/markdown.rs` 用 pulldown-cmark + 表格 Unicode box drawing — [设计](../plans/2026-07-25-tui-history-redesign.md)
