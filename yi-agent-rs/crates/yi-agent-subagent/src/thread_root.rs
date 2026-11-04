@@ -13,15 +13,47 @@ use crate::binding::{RuntimeBinding, RuntimeHandle, is_liveness_error, is_stale_
 /// 不可重放的请求（发消息、spawn）遇到陈旧 root 时，重放会产生真实的第二次副作用，
 /// 所以只做「丢弃缓存 + 修好运行时」，然后把下一步交给调用方。这句话必须说清
 /// 「已经修好了、再来一次就行」，否则模型会以为这个能力坏了。
+/// 传输层含糊失败时对模型说的话。
+///
+/// 修好运行时之后才走到这里，所以"再来一次"是真的可用；重点是先让调用方**检查**
+/// 上一次到底有没有发生，而不是闭着眼睛重放一个有副作用的请求。
+pub(crate) fn ambiguous_delivery_hint() -> &'static str {
+    "the runtime connection was replaced, but this request is not safe to replay: \
+     it may already have been applied before the response was lost. The conversation \
+     root has been re-attached; check whether the change happened before retrying."
+}
+
 pub(crate) fn stale_root_hint() -> &'static str {
     "the conversation root was replaced by a restarted runtime and has been \
      re-attached; the request was NOT re-sent because it changes daemon state. \
      Retry this call once."
 }
 
+/// 这是否一个"请求根本没写出去"的失败。
+///
+/// `connect` 在写任何字节之前就失败了，所以服务端不可能已经执行它。与之相对的
+/// `TimedOut` / `UnexpectedEof` / `TruncatedFrame` 都发生在写入之后：应答丢了，
+/// 副作用可能已经发生，那才是真正含糊的情形。
+fn never_left_the_client(error: &yi_agent_store::ipc::IpcError) -> bool {
+    use yi_agent_store::ipc::IpcError;
+    match error {
+        // Only the errors a `connect` on a unix socket can produce before the request
+        // is written. `ConnectionReset` / `ConnectionAborted` look similar but may
+        // happen *during* a write that already reached the peer, so they stay on the
+        // ambiguous side. `TimedOut` and `UnexpectedEof` are read-side by construction.
+        IpcError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
 /// 一条请求能否在身份层失败后被重发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RetryPolicy {
+pub enum RetryPolicy {
     /// 请求本身幂等（只读查询，或在 daemon 侧按稳定键幂等）：可以安全重发。
     Idempotent,
     /// 请求会改变 daemon 状态（发消息、spawn、fork 上传）：绝不重发，
@@ -236,7 +268,11 @@ impl ThreadRoot {
     /// 七个工具过去各自 `handle()` + 裸 `send_request`，结果是**没人**处理失效。
     ///
     /// 三条分支：
-    /// 1. 传输层失败（`is_liveness_error`）：与过去一致，重取句柄后重发一次。
+    /// 1. 传输层失败（`is_liveness_error`）：`Idempotent` 修好运行时后重发一次；
+    ///    `SingleShot` **只修连接，不重发**。过去这里不看策略、无条件重发，等于把
+    ///    "请求根本没送达"当成已知事实——而 `is_liveness_error` 也覆盖
+    ///    `TimedOut` 和 `UnexpectedEof`：服务端可能已经执行完，只是应答没回来。
+    ///    对 spawn/发消息这类请求，重发的代价是真实的第二次副作用。
     /// 2. 身份层失败（`is_stale_root_response`）：丢弃缓存 root、修好运行时；
     ///    `Idempotent` 重发一次，`SingleShot` 返回 [`stale_root_hint`]。
     /// 3. 其余：原样返回，绝不重试。
@@ -270,10 +306,10 @@ impl ThreadRoot {
             }
             Ok(response) => Ok(response),
             Err(error) if is_liveness_error(&error) => {
-                // 传输层失败说明请求根本没送达，重发一次是安全的。但**不能**直接
-                // `handle()`：缓存 root 仍属于当前 generation，`attach()` 会短路
-                // 返回 Ok，重发于是又打向同一个死 socket——这正是要修的那个 bug。
-                // 必须先 `repair()`（它推进 generation，使缓存失效），再重挂。
+                // **不能**直接 `handle()`：缓存 root 仍属于当前 generation，
+                // `attach()` 会短路返回 Ok，重发于是又打向同一个死 socket——这正是
+                // 要修的那个 bug。必须先 `repair()`（它推进 generation，使缓存失效），
+                // 再重挂。
                 if let Err(repair_error) = self.binding.repair() {
                     // fixed binding 无从 repair（TUI / daemon worker 的情形）。
                     // 这里返回**原始传输错误**，不要把内部措辞泄漏给模型；
@@ -281,11 +317,38 @@ impl ThreadRoot {
                     tracing::debug!(%repair_error, "could not repair a dead runtime");
                     return Err(error.to_string());
                 }
+                if policy == RetryPolicy::SingleShot && !never_left_the_client(&error) {
+                    // 连接已修好，但这次请求的**结果未知**：服务端可能已执行而应答
+                    // 丢失。自动重发会让 spawn/发消息发生第二次。
+                    //
+                    // 例外是"连都没连上"：`connect` 失败意味着一个字节都没写出去，
+                    // 结果不可能是"未知"，重发是安全的。把它一并当成含糊失败会让
+                    // "终端被关掉"这种最常见的失效形态变成永远无法自愈。
+                    return Err(ambiguous_delivery_hint().to_string());
+                }
                 let handle = self.handle()?;
                 send_request(&handle.socket_path, build(&handle)).map_err(|e| e.to_string())
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    /// [`Self::send_as_root`] for integration tests.
+    ///
+    /// The production callers are the seven tools in `lib.rs`, which are the wrong
+    /// layer for a test that only needs "what does this transport failure turn into
+    /// under this policy". Exposing the seam rather than re-implementing the branch
+    /// keeps the test honest: if the policy stops being consulted, this fails.
+    #[doc(hidden)]
+    pub fn send_as_root_for_test<F>(
+        &self,
+        policy: RetryPolicy,
+        build: F,
+    ) -> Result<IpcResponse, String>
+    where
+        F: Fn(&RuntimeHandle) -> IpcRequest,
+    {
+        self.send_as_root(policy, build)
     }
 
     /// Activates this conversation's root with its first objective. Idempotent

@@ -68,6 +68,30 @@ pub enum IpcRequest {
         root_task_id: String,
         capability: String,
     },
+    /// Binds the one driver allowed to report this root's activity.
+    ///
+    /// The authorization is the guardian-issued one, not a client-reported id: the
+    /// daemon validates it against its own authority table, so a tool process cannot
+    /// obtain a driver by naming an owner. `operation_id` is the identity of the bind:
+    /// a retried request replays the issued epoch instead of minting a second one.
+    BindApplicationRootDriver {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        operation_id: String,
+    },
+    /// Reports what the conversation is doing, under the driver's own fence.
+    ///
+    /// This is not a heartbeat: applying a report never extends the owner's lease and
+    /// never marks progress. A report that is stale, from another epoch, or about
+    /// another turn is refused with a stable code.
+    SetApplicationRootActivity {
+        driver_capability: yi_agent_lifecycle::foreground::SecretCapability,
+        update: yi_agent_lifecycle::foreground::ActivityUpdate,
+    },
+    /// Reads the committed activity of one root. Never writes, never extends.
+    GetApplicationRootActivity {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        root: yi_agent_lifecycle::foreground::RootRef,
+    },
     CreateSchedule {
         cron: String,
         objective: String,
@@ -339,6 +363,25 @@ pub enum IpcResponse {
     },
     ApplicationRootActivated,
     ApplicationRootDetached,
+    /// The driver binding the daemon issued. The capability is narrow: it authorises
+    /// activity writes for this epoch only, and is never shown to the UI.
+    ForegroundDriverBound {
+        binding: yi_agent_lifecycle::foreground::DriverBinding,
+    },
+    /// The activity snapshot after the report was applied (or the already-committed
+    /// one, when the report was a duplicate).
+    ForegroundActivity {
+        snapshot: yi_agent_lifecycle::foreground::ActivitySnapshot,
+    },
+    /// The activity snapshot of a root that has never reported one.
+    ForegroundActivityAbsent,
+    /// A structured foreground refusal.
+    ///
+    /// This is a response rather than an `Error` because the client has to dispatch on
+    /// `ForegroundErrorCode` and report exactly which executions blocked a stop. An
+    /// `invalid_state` with a message would force the caller to match English text,
+    /// which is the thing the design explicitly forbids.
+    ForegroundFailure(yi_agent_lifecycle::foreground::ForegroundFailure),
     ScheduleCreated {
         schedule_id: String,
     },

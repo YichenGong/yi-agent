@@ -283,6 +283,43 @@ pub struct RuntimeCoordinator {
     /// Monotonic ordinal for pending-stop entries, so old confirmed records can
     /// be pruned instead of accumulating for the daemon's whole life.
     stop_sequence: AtomicU64,
+    /// The daemon's end of the guardian's private authority bridge.
+    ///
+    /// Owned here rather than by the socket loop because a bind has to validate against
+    /// the same table the install wrote: two copies would let "authorized" and
+    /// "bindable" disagree. Lock order is bridge -> repository, never the reverse.
+    foreground_bridge: Mutex<crate::ipc::ForegroundBridge>,
+    /// Whether the foreground lifecycle semantics are on for this coordinator.
+    ///
+    /// Production entry points pass `Disabled` until the whole closed loop exists, so a
+    /// wire client cannot reach the new admission rules early. Bind refuses with
+    /// `admission_closed` in that mode rather than pretending to succeed.
+    foreground_activation: crate::foreground::ForegroundActivation,
+    /// The narrow driver capability of each root, held only in memory.
+    ///
+    /// The secret never reaches a row: a process that could read it back would inherit
+    /// the rights of a driver that is gone. A restart therefore issues a new secret on
+    /// the next bind, which is exactly what "the driver reconnects" means.
+    foreground_drivers: Mutex<HashMap<String, LiveDriver>>,
+}
+
+/// A driver capability the daemon issued and has not revoked.
+struct LiveDriver {
+    driver_epoch: u64,
+    binding_epoch: u64,
+    /// The owner that was authorized when this driver bound.
+    ///
+    /// Kept so a release can drop exactly this owner's drivers without a repository
+    /// read: the bind already validated the owner, and re-reading it later would let a
+    /// re-bind between the two steps look like the same driver.
+    owner: String,
+    /// The bind operation that minted this capability.
+    ///
+    /// A caller that retries `bind` after losing the response must get the *same* secret
+    /// back, not a fresh one: minting again would revoke the capability the first answer
+    /// already delivered, and the caller has no way to know which copy is live.
+    operation_id: String,
+    capability: String,
 }
 
 /// A task whose terminal state is durable but whose execution is not yet proven
@@ -534,6 +571,10 @@ impl RuntimeCoordinator {
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator =
             ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
+        // Read before the moves below; the coordinator records the switch so every
+        // foreground entry point can refuse while production keeps it disabled.
+        let foreground_activation = activation;
+        let foreground_bridge = Mutex::new(crate::ipc::ForegroundBridge::new(generation.clone()));
         if let Some(cursor) = resident_cursor {
             resource_coordinator.restore_admission_cursor(
                 "resident:global",
@@ -714,6 +755,9 @@ impl RuntimeCoordinator {
             ),
             generation,
             stop_sequence: AtomicU64::new(0),
+            foreground_bridge,
+            foreground_activation,
+            foreground_drivers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3864,6 +3908,379 @@ impl RuntimeCoordinator {
             .map_err(RuntimeCoordinatorError::Supervisor)
     }
 
+    /// Installs authority for one root through the private bridge's own frames.
+    ///
+    /// Test support only, and deliberately shaped like the real two-phase install: a
+    /// `Prepare` is answered by a `Challenge`, and only the `Authority(Install)` frame
+    /// commits the managed row. A fixture that wrote the authority table directly would
+    /// let the bridge's validation rot while its tests kept passing.
+    ///
+    /// The returned authorization is what the *guardian* would hand the host, capability
+    /// included, so a test presents exactly what a real caller presents.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_foreground_authority_for_test(
+        &self,
+        root_id: &str,
+        client_run_id: &str,
+        intent: yi_agent_lifecycle::foreground::RootBindIntent,
+    ) -> Result<yi_agent_lifecycle::types::RootAuthorization, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            AuthorityMessage, AuthorityStamp, BridgeFrame, RootAuthorityScope,
+        };
+
+        let now = Instant::now();
+        let nonce = Uuid::new_v4().to_string();
+        let capability = format!("cap-{}-{root_id}", Uuid::new_v4());
+        // The challenge (and therefore the deadline) is issued by the bridge itself, then
+        // the install answers with the nonce it was given. Awaiting the real pair is what
+        // exercises `consume_challenge`, the deadline and the tombstone checks.
+        let authority_seq = {
+            // Bridge before repository, the same order `bind_foreground_driver` takes
+            // them: two paths that disagree would be a deadlock waiting for a test that
+            // runs them concurrently.
+            let challenge = self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.handle(
+                    BridgeFrame::Prepare {
+                        nonce: nonce.clone(),
+                        root_id: root_id.to_string(),
+                        client_run_id: client_run_id.to_string(),
+                        scope_key: "test-scope".into(),
+                        generation: self.generation.clone(),
+                        requested_seq: 1,
+                        intent: intent.clone(),
+                        scope: RootAuthorityScope::Business,
+                    },
+                    &mut repository,
+                    now,
+                )
+            });
+            match challenge {
+                Some(BridgeFrame::Challenge { authority_seq, .. }) => authority_seq,
+                other => {
+                    return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                        "the bridge refused the prepare: {other:?}"
+                    )));
+                }
+            }
+        };
+
+        let authorization = yi_agent_lifecycle::types::RootAuthorization {
+            scope_key: "test-scope".into(),
+            daemon_instance_id: self.generation.clone(),
+            client_run_id: client_run_id.to_string(),
+            root_id: root_id.to_string(),
+            capability,
+        };
+        let stamp = AuthorityStamp {
+            scope_key: "test-scope".into(),
+            generation: self.generation.clone(),
+            owner: client_run_id.to_string(),
+            root_id: root_id.to_string(),
+            binding_epoch: 1,
+            authority_seq,
+            challenge_nonce: nonce,
+            remaining_lease_ms: 30_000,
+            authority_scope: RootAuthorityScope::Business,
+        };
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Authority(AuthorityMessage::Install {
+                    stamp,
+                    authorization: authorization.clone(),
+                }),
+                &mut repository,
+                now,
+            )
+        });
+        if let Some(BridgeFrame::Denied { code, .. }) = answer {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the install was refused: {code:?}"
+            )));
+        }
+        Ok(authorization)
+    }
+
+    /// Whether the foreground lifecycle semantics are enabled for this coordinator.
+    pub fn foreground_activation(&self) -> crate::foreground::ForegroundActivation {
+        self.foreground_activation
+    }
+
+    /// Runs `f` against the private authority bridge.
+    ///
+    /// One accessor so the socket loop and the business handlers share the table: a
+    /// second copy would let an install and a bind disagree about who owns a root.
+    pub(crate) fn with_foreground_bridge<R>(
+        &self,
+        f: impl FnOnce(&mut crate::ipc::ForegroundBridge) -> R,
+    ) -> R {
+        let mut bridge = self
+            .foreground_bridge
+            .lock()
+            .expect("foreground bridge mutex poisoned");
+        f(&mut bridge)
+    }
+
+    /// Binds the one driver that may report this root's activity.
+    ///
+    /// The authorization is validated against the daemon's own authority table, in the
+    /// same lock a revocation would take: a client that names a root and an owner is
+    /// not authority, and a table consulted *after* the bind could already have revoked
+    /// the client whose driver just took over.
+    ///
+    /// `operation_id` is the identity of the bind, not of the driver. A transport that
+    /// lost the answer retries with the same id and gets the same epoch and sequence
+    /// back; only a proven stop may mint a new epoch (Task 7), so a second operation
+    /// here is a refusal rather than a takeover.
+    /// Binds, or replays, the one driver allowed to report this root.
+    ///
+    /// Synchronous on purpose: every step is a lock-and-check, so an `async fn` would
+    /// only invite the caller to build a runtime around it (and the socket loop did).
+    pub fn bind_foreground_driver(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        operation_id: &str,
+    ) -> Result<yi_agent_lifecycle::foreground::DriverBinding, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            DriverBinding, ForegroundFence, RootRef, SecretCapability,
+        };
+        if !self.foreground_activation.is_enabled() {
+            // The switch exists so a wire client cannot reach the new admission rules
+            // before the whole loop is wired. Answering anything but a refusal would
+            // advertise a contract this build does not honour.
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        if operation_id.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "a driver bind needs an operation id".into(),
+            ));
+        }
+        let root: TaskId = authorization
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        if authorization.daemon_instance_id != self.generation {
+            // An authorization minted by another daemon generation names a runtime this
+            // process is not: its authority table is gone, and accepting it would let a
+            // stale grant be spent twice (once per generation).
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                authorization.root_id.clone(),
+            ));
+        }
+        let now = Instant::now();
+        let binding_epoch = self.with_foreground_bridge(|bridge| {
+            if !bridge.presents_capability(
+                &authorization.root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) {
+                // Covers a revoked client, an expired lease, a capability for another
+                // root, and a capability the guardian never issued. They are one answer
+                // on purpose: telling them apart would describe the table.
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    authorization.root_id.clone(),
+                ));
+            }
+            if bridge
+                .authority()
+                .installed_identity(&authorization.root_id)
+                .is_none_or(|(_, scope_key, _, _)| scope_key != authorization.scope_key)
+            {
+                // The scope key is how the bridge remembers which project an authority
+                // belongs to. An authorization that carries a different one was issued
+                // for another scope, so binding through it would classify this root
+                // under a decision nobody made about it.
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    authorization.root_id.clone(),
+                ));
+            }
+            bridge
+                .authority()
+                .binding_epoch(&authorization.root_id)
+                .ok_or_else(|| {
+                    RuntimeCoordinatorError::AuthorityDenied(authorization.root_id.clone())
+                })
+        })?;
+        let record = {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.bind_foreground_driver(
+                &root,
+                &authorization.client_run_id,
+                binding_epoch,
+                operation_id,
+            )?
+        };
+        // The capability is minted here and kept only in this process. A row that could
+        // be read back would hand a future process the rights of a dead driver.
+        let capability = {
+            let mut drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            match drivers.get(&authorization.root_id) {
+                // Same operation, same driver epoch: this is the caller's retry of a bind
+                // whose answer it lost. Hand back the secret it was already given.
+                Some(live)
+                    if live.operation_id == operation_id
+                        && live.driver_epoch == record.driver_epoch
+                        && live.owner == authorization.client_run_id =>
+                {
+                    SecretCapability::new(live.capability.clone())
+                }
+                _ => {
+                    let capability = SecretCapability::new(format!(
+                        "{}:{}:{}",
+                        Uuid::new_v4(),
+                        record.driver_epoch,
+                        record.attempt
+                    ));
+                    drivers.insert(
+                        authorization.root_id.clone(),
+                        LiveDriver {
+                            driver_epoch: record.driver_epoch,
+                            binding_epoch,
+                            owner: authorization.client_run_id.clone(),
+                            operation_id: operation_id.to_string(),
+                            capability: capability.expose().to_string(),
+                        },
+                    );
+                    capability
+                }
+            }
+        };
+        Ok(DriverBinding {
+            fence: ForegroundFence {
+                root: RootRef {
+                    session_id: record.session,
+                    root_id: authorization.root_id.clone(),
+                    attempt_id: record.attempt,
+                },
+                generation: self.generation.clone(),
+                binding_epoch,
+                driver_epoch: record.driver_epoch,
+            },
+            last_seq: record.last_seq,
+            driver_capability: capability,
+        })
+    }
+
+    /// Applies one activity report from the driver that holds this root.
+    ///
+    /// The capability is checked against the live in-memory entry *and* the reported
+    /// fence, and then the repository re-checks everything against the persisted row.
+    /// Both are needed: the memory check gives a fast `stale_driver` without a write, the
+    /// persisted check is what stops a bind committed after either read.
+    pub fn set_foreground_activity(
+        &self,
+        driver_capability: &yi_agent_lifecycle::foreground::SecretCapability,
+        update: &yi_agent_lifecycle::foreground::ActivityUpdate,
+    ) -> Result<yi_agent_lifecycle::foreground::ActivitySnapshot, RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        {
+            let drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            let live = drivers.get(&update.fence.root.root_id).ok_or_else(|| {
+                // No driver was ever issued, or the daemon restarted. Either way this
+                // capability cannot be the current one.
+                RuntimeCoordinatorError::AuthorityDenied(update.fence.root.root_id.clone())
+            })?;
+            if live.driver_epoch != update.fence.driver_epoch
+                || live.binding_epoch != update.fence.binding_epoch
+            {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(crate::foreground::ForegroundError::StaleDriver),
+                ));
+            }
+            if live.capability != driver_capability.expose() {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    update.fence.root.root_id.clone(),
+                ));
+            }
+        }
+        if update.fence.generation != self.generation {
+            // A report minted for a previous daemon process: its epoch numbers mean
+            // nothing here, and accepting it would let a restart be overwritten by a
+            // message written before it.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StaleAttempt),
+            ));
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .apply_foreground_activity(update)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Reads the committed activity of one root, without writing anything.
+    ///
+    /// Read-only on purpose: a query must never refresh a deadline or a phase. The
+    /// caller's authorization is checked against the live table exactly like a bind, so
+    /// an observer cannot poll a conversation it does not own.
+    pub fn get_foreground_activity(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        root: &yi_agent_lifecycle::foreground::RootRef,
+    ) -> Result<Option<yi_agent_lifecycle::foreground::ActivitySnapshot>, RuntimeCoordinatorError>
+    {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        if root.root_id != authorization.root_id {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root.root_id.clone(),
+            ));
+        }
+        let now = Instant::now();
+        self.with_foreground_bridge(|bridge| {
+            if !bridge.presents_capability(
+                &authorization.root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root.root_id.clone(),
+                ));
+            }
+            Ok(())
+        })?;
+        let task: TaskId = root
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .foreground_activity(&task)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
     /// Closes one client's admission and returns the roots it owned.
     ///
     /// Idempotent. Only this client's tree is affected: other clients keep
@@ -3880,6 +4297,16 @@ impl RuntimeCoordinator {
             let released = self.foreground_commit_gate.release_owner(client);
             (roots, released)
         };
+        {
+            // A released owner's driver capability must stop working with its
+            // admission: leaving it in the map would let a driver that outlived the
+            // release keep writing activity for a root nobody owns.
+            let mut drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            drivers.retain(|_, driver| driver.owner != client);
+        }
         let repository = self
             .repository
             .lock()

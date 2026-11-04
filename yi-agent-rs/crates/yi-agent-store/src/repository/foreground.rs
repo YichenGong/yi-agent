@@ -115,6 +115,45 @@ pub struct PersistedForegroundRoot {
     pub driver_bind_operation_id: Option<String>,
 }
 
+/// What a driver bind committed, as the daemon must report it back.
+///
+/// Deliberately no capability: the narrow driver secret is minted and held by the
+/// coordinator's live authority, never by a persisted row. A row that could be read
+/// back would hand a future process the rights of a dead driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverBindingRecord {
+    /// The epoch this driver owns. Monotonic per root and never reused.
+    pub driver_epoch: u64,
+    /// The last activity sequence this root has committed. The driver's first report
+    /// is `last_seq + 1`; recovery must not depend on a client guessing zero.
+    pub last_seq: u64,
+    /// The session the root belongs to, so the caller can build a complete fence
+    /// without a second read that could observe a different attempt.
+    pub session: String,
+    /// The attempt the root is on *now*, read in the same transaction as the epoch.
+    pub attempt: String,
+}
+
+/// The committed activity sequence of one root, if a snapshot exists.
+fn activity_seq_of(
+    connection: &rusqlite::Connection,
+    root: &TaskId,
+) -> Result<Option<u64>, RepositoryError> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT activity_json FROM foreground_root_state WHERE root_task_id = ?1",
+            params![root.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let snapshot: ActivitySnapshot = serde_json::from_str(&stored)?;
+    Ok(Some(snapshot.update.seq))
+}
+
 impl RuntimeRepository {
     /// Persists the initial (or replacement) foreground identity of one root.
     ///
@@ -270,6 +309,162 @@ impl RuntimeRepository {
         )?)
     }
 
+    /// Binds (or re-binds) the driver of one managed root.
+    ///
+    /// The whole decision is one transaction, for the same reason the admission gate
+    /// is one critical section: "is this operation id the current binding?" and
+    /// "issue the next driver epoch" must not be separable, or a retry that lands
+    /// between them mints a second epoch for the same bind.
+    ///
+    /// Three outcomes, all decided here rather than by the caller:
+    ///
+    /// * the same `operation_id` as the recorded binding replays that binding — the
+    ///   transport may have lost the first answer, and re-minting would silently
+    ///   invalidate the driver that is actually running;
+    /// * a *different* operation against a root whose current binding was never
+    ///   proven stopped is refused. Task 7 is what proves a stop; until then the only
+    ///   legal second bind is a replay;
+    /// * a root with no binding yet gets driver epoch 1.
+    ///
+    /// `binding_epoch` and the attempt come from the caller's validated authority, not
+    /// from this row: a row that disagreed with the authority is a corrupt binding,
+    /// not something to quietly overwrite.
+    pub fn bind_foreground_driver(
+        &mut self,
+        root: &TaskId,
+        owner: &str,
+        binding_epoch: u64,
+        operation_id: &str,
+    ) -> Result<DriverBindingRecord, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Named rather than a six-tuple: the fields end up in three different checks, and
+        // positional access is how `owner_id` and `admission` get swapped.
+        struct BindingRow {
+            classification: String,
+            persisted_epoch: i64,
+            driver_epoch: i64,
+            owner_id: Option<String>,
+            admission: String,
+            operation: Option<String>,
+        }
+        let row = transaction
+            .query_row(
+                "SELECT classification, binding_epoch, driver_epoch, owner_client_id,
+                        admission_state, driver_bind_operation_id
+                 FROM foreground_root_state WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| {
+                    Ok(BindingRow {
+                        classification: row.get(0)?,
+                        persisted_epoch: row.get(1)?,
+                        driver_epoch: row.get(2)?,
+                        owner_id: row.get(3)?,
+                        admission: row.get(4)?,
+                        operation: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(BindingRow {
+            classification,
+            persisted_epoch,
+            driver_epoch,
+            owner_id,
+            admission,
+            operation,
+        }) = row
+        else {
+            // No managed row: a driver may only bind a root an authenticated prepare
+            // classified. Creating the row here would let the wire mint the
+            // classification that the prepare is supposed to be the only writer of.
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryAuthorityMissing,
+            ));
+        };
+        if ForegroundClassification::parse(&classification)? != ForegroundClassification::Managed {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryAuthorityMissing,
+            ));
+        }
+        if AdmissionState::parse(&admission)? == AdmissionState::Frozen {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::AdmissionClosed,
+            ));
+        }
+        let persisted_epoch = u64::try_from(persisted_epoch)
+            .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        let driver_epoch = u64::try_from(driver_epoch)
+            .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?;
+        if persisted_epoch != binding_epoch {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        // Ownership is part of the authority, not a hint: another owner's operation id
+        // must not be able to replay (and thereby adopt) this root's driver.
+        if owner_id.as_deref() != Some(owner) {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::AuthorityDenied,
+            ));
+        }
+        // Session and attempt are read in the same transaction as the epoch, so a
+        // fence built from this record cannot mix two attempts.
+        let (session, attempt) = transaction.query_row(
+            "SELECT root_session_id, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let last_seq = activity_seq_of(&transaction, root)?.unwrap_or(0);
+
+        if operation.as_deref() == Some(operation_id) {
+            // A replay answers with what was issued, never with a new epoch.
+            return Ok(DriverBindingRecord {
+                driver_epoch,
+                last_seq,
+                session,
+                attempt,
+            });
+        }
+        if driver_epoch > 0 && operation.is_some() {
+            // A live binding exists and no stop proof was supplied. Refusing is the
+            // honest answer: Task 7 is the only caller allowed to rotate a driver.
+            return Err(RepositoryError::Foreground(ForegroundError::StopUnproven(
+                vec![driver_epoch.to_string()],
+            )));
+        }
+        let next_epoch = driver_epoch.saturating_add(1);
+        let changed = transaction.execute(
+            "UPDATE foreground_root_state
+             SET driver_epoch = ?1, driver_bind_operation_id = ?2
+             WHERE root_task_id = ?3 AND driver_epoch = ?4
+               AND (driver_bind_operation_id IS ?5)",
+            params![
+                i64::try_from(next_epoch)
+                    .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+                operation_id,
+                root.to_string(),
+                i64::try_from(driver_epoch)
+                    .map_err(|_| RepositoryError::Foreground(ForegroundError::CorruptBinding))?,
+                operation,
+            ],
+        )?;
+        if changed == 0 {
+            // Someone else bound in between: the CAS is what makes the epoch
+            // monotonic even when two binds genuinely race (a Task 7 rotation and a
+            // transport retry, say).
+            return Err(RepositoryError::Foreground(
+                ForegroundError::OperationConflict,
+            ));
+        }
+        transaction.commit()?;
+        Ok(DriverBindingRecord {
+            driver_epoch: next_epoch,
+            last_seq,
+            session,
+            attempt,
+        })
+    }
+
     /// The committed activity snapshot, if one exists.
     ///
     /// A historical `running` phase is projected to `Unknown`: after a restart the
@@ -318,6 +513,58 @@ impl RuntimeRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The fence is validated against the *persisted* identity, in the same
+        // transaction that writes the snapshot. Reading it from a cached copy would
+        // let a bind committed after the read be overwritten by a report that was
+        // minted for the previous driver.
+        let identity: Option<(String, i64, i64, String)> = transaction
+            .query_row(
+                "SELECT classification, binding_epoch, driver_epoch, admission_state
+                 FROM foreground_root_state WHERE root_task_id = ?1",
+                params![root.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((classification, binding_epoch, driver_epoch, admission)) = identity else {
+            // An activity report for a root no authenticated prepare ever
+            // classified: there is no driver this daemon could have issued, so the
+            // report cannot be about one.
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryAuthorityMissing,
+            ));
+        };
+        if ForegroundClassification::parse(&classification)? != ForegroundClassification::Managed {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::RecoveryAuthorityMissing,
+            ));
+        }
+        if AdmissionState::parse(&admission)? == AdmissionState::Frozen {
+            return Err(RepositoryError::Foreground(
+                ForegroundError::AdmissionClosed,
+            ));
+        }
+        if i64::try_from(update.fence.binding_epoch).ok() != Some(binding_epoch) {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        if i64::try_from(update.fence.driver_epoch).ok() != Some(driver_epoch) {
+            // A superseded driver is a different answer from a superseded attempt:
+            // the first means "reconnect and re-bind", the second means "this
+            // conversation has moved on".
+            return Err(RepositoryError::Foreground(ForegroundError::StaleDriver));
+        }
+        let (active_session, active_attempt) = transaction.query_row(
+            "SELECT root_session_id, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        if update.fence.root.session_id != active_session {
+            // A report that names another session's path to this root is not about
+            // this root, whatever else agrees: refuse rather than reconcile.
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
+        if update.fence.root.attempt_id != active_attempt {
+            return Err(RepositoryError::Foreground(ForegroundError::StaleAttempt));
+        }
         let current: Option<String> = transaction
             .query_row(
                 "SELECT activity_json FROM foreground_root_state WHERE root_task_id = ?1",
@@ -332,12 +579,25 @@ impl RuntimeRepository {
             .transpose()?;
 
         let Some(committed) = committed else {
-            // The first report ever: nothing to order against, but a driver still may
-            // not open with `Unknown` (only the daemon produces it).
-            if update.phase == ActivityPhase::Unknown {
-                return Err(RepositoryError::Foreground(
-                    ForegroundError::InvalidActivity,
-                ));
+            // The first report ever. It is still not exempt from the turn rules:
+            // a synthetic `idle` baseline at the same fence is ordered against the
+            // real reducer, so a driver cannot open the conversation in
+            // `waiting_for_children` (a state only meaningful inside a turn) or in
+            // `unknown` (a phase only the daemon may produce). `seq` starts at 0,
+            // so the first report must be at least 1.
+            let baseline = ActivityUpdate {
+                fence: update.fence.clone(),
+                turn_id: None,
+                seq: 0,
+                phase: ActivityPhase::Idle,
+            };
+            match reduce_activity(&baseline, update)? {
+                ActivityApply::Applied | ActivityApply::Duplicate => {}
+                ActivityApply::Stale => {
+                    return Err(RepositoryError::Foreground(
+                        ForegroundError::InvalidActivity,
+                    ));
+                }
             }
             let snapshot = ActivitySnapshot {
                 update: update.clone(),

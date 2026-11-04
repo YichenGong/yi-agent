@@ -48,10 +48,15 @@ fn seed_scheduled_root(repository: &mut RuntimeRepository) -> (RootSessionId, Ta
     (session, task, attempt)
 }
 
-fn fence(root: &TaskId, attempt: &AttemptId, driver_epoch: u64) -> ForegroundFence {
+fn fence(
+    session: &RootSessionId,
+    root: &TaskId,
+    attempt: &AttemptId,
+    driver_epoch: u64,
+) -> ForegroundFence {
     ForegroundFence {
         root: RootRef {
-            session_id: "session".into(),
+            session_id: session.to_string(),
             root_id: root.to_string(),
             attempt_id: attempt.to_string(),
         },
@@ -62,6 +67,7 @@ fn fence(root: &TaskId, attempt: &AttemptId, driver_epoch: u64) -> ForegroundFen
 }
 
 fn activity(
+    session: &RootSessionId,
     root: &TaskId,
     attempt: &AttemptId,
     seq: u64,
@@ -69,7 +75,7 @@ fn activity(
     phase: ActivityPhase,
 ) -> ActivityUpdate {
     ActivityUpdate {
-        fence: fence(root, attempt, 1),
+        fence: fence(session, root, attempt, 1),
         turn_id: turn.map(str::to_owned),
         seq,
         phase,
@@ -416,7 +422,7 @@ fn foreground_root_lifecycle_activity_read_projects_a_reloaded_running_turn_as_u
     // `idle` would let the host start a second turn inside a live one.
     let directory = tempfile::tempdir().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
-    let (_, root, attempt) = seed_scheduled_root(&mut repository);
+    let (session, root, attempt) = seed_scheduled_root(&mut repository);
     repository
         .record_foreground_root(&PersistedForegroundRoot {
             root: root.clone(),
@@ -430,6 +436,7 @@ fn foreground_root_lifecycle_activity_read_projects_a_reloaded_running_turn_as_u
         .unwrap();
     repository
         .apply_foreground_activity(&activity(
+            &session,
             &root,
             &attempt,
             1,
@@ -458,7 +465,7 @@ fn foreground_root_lifecycle_duplicate_activity_does_not_refresh_changed_at() {
     // Replaying a report must not make an old statement look new.
     let directory = tempfile::tempdir().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
-    let (_, root, attempt) = seed_scheduled_root(&mut repository);
+    let (session, root, attempt) = seed_scheduled_root(&mut repository);
     repository
         .record_foreground_root(&PersistedForegroundRoot {
             root: root.clone(),
@@ -470,7 +477,14 @@ fn foreground_root_lifecycle_duplicate_activity_does_not_refresh_changed_at() {
             driver_bind_operation_id: None,
         })
         .unwrap();
-    let update = activity(&root, &attempt, 1, Some("turn-1"), ActivityPhase::Running);
+    let update = activity(
+        &session,
+        &root,
+        &attempt,
+        1,
+        Some("turn-1"),
+        ActivityPhase::Running,
+    );
     let first = repository.apply_foreground_activity(&update).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let replayed = repository.apply_foreground_activity(&update).unwrap();
@@ -481,7 +495,7 @@ fn foreground_root_lifecycle_duplicate_activity_does_not_refresh_changed_at() {
 fn foreground_root_lifecycle_stale_activity_is_not_written() {
     let directory = tempfile::tempdir().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
-    let (_, root, attempt) = seed_scheduled_root(&mut repository);
+    let (session, root, attempt) = seed_scheduled_root(&mut repository);
     repository
         .record_foreground_root(&PersistedForegroundRoot {
             root: root.clone(),
@@ -493,9 +507,17 @@ fn foreground_root_lifecycle_stale_activity_is_not_written() {
             driver_bind_operation_id: None,
         })
         .unwrap();
-    let newest = activity(&root, &attempt, 5, Some("turn-1"), ActivityPhase::Running);
+    let newest = activity(
+        &session,
+        &root,
+        &attempt,
+        5,
+        Some("turn-1"),
+        ActivityPhase::Running,
+    );
     repository.apply_foreground_activity(&newest).unwrap();
     let older = activity(
+        &session,
         &root,
         &attempt,
         4,
@@ -513,7 +535,7 @@ fn foreground_root_lifecycle_late_finish_of_an_old_turn_is_refused_by_the_store(
     // message that merely arrived last.
     let directory = tempfile::tempdir().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
-    let (_, root, attempt) = seed_scheduled_root(&mut repository);
+    let (session, root, attempt) = seed_scheduled_root(&mut repository);
     repository
         .record_foreground_root(&PersistedForegroundRoot {
             root: root.clone(),
@@ -527,6 +549,7 @@ fn foreground_root_lifecycle_late_finish_of_an_old_turn_is_refused_by_the_store(
         .unwrap();
     repository
         .apply_foreground_activity(&activity(
+            &session,
             &root,
             &attempt,
             5,
@@ -534,7 +557,14 @@ fn foreground_root_lifecycle_late_finish_of_an_old_turn_is_refused_by_the_store(
             ActivityPhase::Running,
         ))
         .unwrap();
-    let late = activity(&root, &attempt, 6, Some("old-turn"), ActivityPhase::Idle);
+    let late = activity(
+        &session,
+        &root,
+        &attempt,
+        6,
+        Some("old-turn"),
+        ActivityPhase::Idle,
+    );
     let error = repository.apply_foreground_activity(&late).unwrap_err();
     assert!(matches!(
         error,
@@ -617,7 +647,7 @@ fn foreground_root_lifecycle_recovery_result_is_stored_and_read_back() {
 fn foreground_root_lifecycle_uncommitted_operations_need_a_fresh_preview_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
-    let (_, root, attempt) = seed_scheduled_root(&mut repository);
+    let (_session, root, attempt) = seed_scheduled_root(&mut repository);
     for (operation, phase) in [("op-preparing", "preparing"), ("op-ready", "ready")] {
         repository
             .connection
@@ -683,4 +713,190 @@ fn foreground_root_lifecycle_no_capability_is_written_to_the_new_tables() {
             );
         }
     }
+}
+
+/// A managed root an owner may bind a driver to, with the given driver epoch.
+fn seed_managed_root(
+    repository: &mut RuntimeRepository,
+    driver_epoch: u64,
+) -> (RootSessionId, TaskId, AttemptId) {
+    let (session, root, attempt) = seed_attached_root(repository);
+    repository
+        .record_foreground_root(&PersistedForegroundRoot {
+            root: root.clone(),
+            classification: ForegroundClassification::Managed,
+            binding_epoch: 1,
+            driver_epoch,
+            owner_client_id: Some("owner-a".into()),
+            admission: AdmissionState::Closed,
+            driver_bind_operation_id: None,
+        })
+        .unwrap();
+    (session, root, attempt)
+}
+
+#[test]
+fn foreground_root_lifecycle_the_same_bind_operation_replays_the_same_epoch() {
+    // The transport can lose an answer. Re-minting on retry would invalidate the
+    // driver that is actually running, so the operation id has to be the identity.
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (session, root, attempt) = seed_managed_root(&mut repository, 0);
+
+    let first = repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+    let replay = repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+    assert_eq!(first, replay, "a replay must not mint a second epoch");
+    assert_eq!(first.driver_epoch, 1);
+    assert_eq!(first.last_seq, 0);
+    assert_eq!(first.attempt, attempt.to_string());
+    assert_eq!(
+        first.session,
+        session.to_string(),
+        "the record must carry the root's own session, so a caller can build the fence"
+    );
+    assert_eq!(replay.last_seq, 0);
+}
+
+#[test]
+fn foreground_root_lifecycle_a_second_bind_without_a_stop_proof_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, _) = seed_managed_root(&mut repository, 0);
+    repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+
+    let refused = repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-2")
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            RepositoryError::Foreground(ForegroundError::StopUnproven(_))
+        ),
+        "an unproven takeover must say so; a generic conflict would hide it, got {refused:?}"
+    );
+    // The refusal must not have advanced the epoch: the live driver keeps its rights.
+    let persisted = repository
+        .persisted_foreground_root(&root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.driver_epoch, 1);
+    assert_eq!(
+        persisted.driver_bind_operation_id.as_deref(),
+        Some("bind-1")
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_another_owner_cannot_bind_the_same_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, _) = seed_managed_root(&mut repository, 0);
+    let error = repository
+        .bind_foreground_driver(&root, "owner-b", 1, "bind-1")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RepositoryError::Foreground(ForegroundError::AuthorityDenied)
+    ));
+}
+
+#[test]
+fn foreground_root_lifecycle_a_bind_with_a_stale_binding_epoch_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, _) = seed_managed_root(&mut repository, 0);
+    let error = repository
+        .bind_foreground_driver(&root, "owner-a", 7, "bind-1")
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            RepositoryError::Foreground(ForegroundError::StaleAttempt)
+        ),
+        "a bind from another binding epoch is a stale attempt, got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_frozen_root_refuses_a_driver_bind() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, _) = seed_managed_root(&mut repository, 0);
+    repository
+        .connection
+        .execute(
+            "UPDATE foreground_root_state SET admission_state = 'frozen' WHERE root_task_id = ?1",
+            params![root.to_string()],
+        )
+        .unwrap();
+    let error = repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RepositoryError::Foreground(ForegroundError::AdmissionClosed)
+    ));
+}
+
+#[test]
+fn foreground_root_lifecycle_activity_for_an_older_driver_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (session, root, attempt) = seed_managed_root(&mut repository, 0);
+    repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+    // The committed activity names driver epoch 1; a report from epoch 0 is a
+    // superseded driver, which is a different refusal from a superseded attempt.
+    let mut update = activity(
+        &session,
+        &root,
+        &attempt,
+        1,
+        Some("turn-1"),
+        ActivityPhase::Running,
+    );
+    update.fence.driver_epoch = 0;
+    let error = repository.apply_foreground_activity(&update).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            RepositoryError::Foreground(ForegroundError::StaleDriver)
+        ),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_activity_after_a_bind_continues_from_the_committed_seq() {
+    // The daemon tells the driver `last_seq`; the driver's first report is +1. A
+    // restart must therefore never require the client to guess zero.
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (session, root, attempt) = seed_managed_root(&mut repository, 0);
+    repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+    for (seq, turn, phase) in [
+        (1, Some("turn-1"), ActivityPhase::Running),
+        (2, Some("turn-1"), ActivityPhase::Idle),
+        (3, Some("turn-2"), ActivityPhase::Running),
+    ] {
+        repository
+            .apply_foreground_activity(&activity(&session, &root, &attempt, seq, turn, phase))
+            .unwrap();
+    }
+    let rebound = repository
+        .bind_foreground_driver(&root, "owner-a", 1, "bind-1")
+        .unwrap();
+    assert_eq!(
+        rebound.last_seq, 3,
+        "a replayed bind answers with the committed sequence, not zero"
+    );
 }

@@ -1340,3 +1340,174 @@ fn a_peer_that_never_binds_fails_instead_of_retrying_forever() {
         "giving up must be bounded, waited {waited:?}"
     );
 }
+
+/// Starts a peer that answers health probes and silently drops every real request.
+///
+/// This is the only way to build the *ambiguous* failure the policy exists for: the peer
+/// reads the request and never answers, so the client cannot know whether it was applied.
+/// A stopped daemon is not enough — `connect` then fails before a byte is written, which
+/// is a *known* non-delivery.
+///
+/// Returns the observed commands, so a test can prove how many times a request was sent.
+fn serve_probes_but_drop_requests(socket: &Path) -> std::sync::mpsc::Receiver<String> {
+    let _ = std::fs::remove_file(socket);
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("the fake peer binds");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let Ok(cloned) = stream.try_clone() else {
+                break;
+            };
+            let mut line = String::new();
+            if BufReader::new(cloned).read_line(&mut line).is_err() || line.is_empty() {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let command = request
+                .get("command")
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            // `IpcRequest` is an internally tagged enum, so `Status` serializes as
+            // `{"type":"Status"}` and not as the bare string.
+            let is_probe = request
+                .get("command")
+                .and_then(|value| value.get("type"))
+                .is_some_and(|kind| kind == "Status");
+            if is_probe {
+                // A healthy probe keeps `repair()` on its "already healthy" short path, so
+                // the test reaches the policy branch instead of racing a real restart.
+                let envelope = serde_json::json!({
+                    "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                    "request_id": request.get("request_id").cloned().unwrap_or_default(),
+                    "result": { "type": "Status", "high_water_event_id": 0 },
+                });
+                let _ = stream.write_all(envelope.to_string().as_bytes());
+                let _ = stream.write_all(b"\n");
+                let _ = stream.flush();
+                continue;
+            }
+            let _ = sender.send(command);
+            // Drop the connection without an answer: the request was delivered, its
+            // outcome is unknown, and the effect may already have happened.
+        }
+    });
+    receiver
+}
+
+/// `SingleShot` 在**含糊**传输失败后不得自动重发。
+///
+/// 修复前 `Err(error) if is_liveness_error(..)` 分支不看策略，`repair()` 之后无条件
+/// 重发。`is_liveness_error` 覆盖 `TimedOut` 与 `UnexpectedEof`，也就是说"服务端
+/// 可能已经执行完、只是应答没回来"同样会走进来；对 spawn / 发消息来说，重发就是
+/// 第二次真实副作用。
+///
+/// 断言两件事，缺一不可：调用方拿到可行动提示；同样的失败下 `Idempotent` 确实重发
+/// 了（否则"分支对所有策略都返回提示"也能通过）。
+///
+/// 这里用假服务端而不是先停 daemon：停掉 daemon 让 `connect` 失败，那是**已知未送达**，
+/// 重发是安全的，由 `a_tool_repairs_a_daemon_that_died` 负责。两种形状必须分开测。
+#[test]
+fn a_single_shot_request_is_not_replayed_after_an_ambiguous_failure() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+
+    // Swap the real daemon for the dropping peer. The binding still believes in the old
+    // runtime, which is exactly the state the branch has to handle.
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(std::time::Instant::now() < deadline, "the daemon must stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let observed = serve_probes_but_drop_requests(&socket);
+
+    let single_shot = root
+        .send_as_root_for_test(
+            yi_agent_subagent::thread_root::RetryPolicy::SingleShot,
+            |handle| yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+                session_id: Some(handle.session_id.clone()),
+                active_only: false,
+            },
+        )
+        .expect_err("the peer read the request and never answered");
+    assert!(
+        single_shot.contains("not safe to replay"),
+        "a SingleShot transport failure must report an unknown result instead of \
+         replaying the request; got {single_shot}"
+    );
+    assert!(
+        !single_shot.contains("os error") && !single_shot.contains("No such file"),
+        "the caller needs a decision it can act on, not a raw io error: {single_shot}"
+    );
+    // Re-attaching after the repair legitimately sends its own frames, so count the
+    // request under test rather than "anything that is not a probe".
+    let drain = |wait: Duration| {
+        let mut commands = Vec::new();
+        while let Ok(command) = observed.recv_timeout(wait) {
+            commands.push(command);
+        }
+        commands
+    };
+    let after_single_shot = drain(Duration::from_millis(500));
+    let reads = after_single_shot
+        .iter()
+        .filter(|command| command.contains("ListTaskSummaries"))
+        .count();
+    assert_eq!(
+        reads, 1,
+        "the side-effecting request was sent again after its answer was lost: \
+         {after_single_shot:?}"
+    );
+
+    // Contrast: the same failure under `Idempotent` must go back to the wire. It cannot
+    // complete here (this peer answers no attach), but the *attempt* is the observable
+    // difference: SingleShot stopped after the hint, Idempotent re-established and tried
+    // again. Without this, "the branch returns the hint for every policy" would pass.
+    let idempotent = root.send_as_root_for_test(
+        yi_agent_subagent::thread_root::RetryPolicy::Idempotent,
+        |handle| yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(handle.session_id.clone()),
+            active_only: false,
+        },
+    );
+    let after_idempotent = drain(Duration::from_millis(500));
+    let replays = after_idempotent
+        .iter()
+        .filter(|command| command.contains("ListTaskSummaries"))
+        .count();
+    // Two writes, not one: the drain above was taken before this call, so both frames
+    // belong to it -- the first attempt, then the replay after the repair.
+    assert_eq!(
+        replays, 2,
+        "the idempotent read must be written twice: once, then once more after the \
+         repair. That resend is what proves the policy is consulted. \
+         frames: {after_idempotent:?}, result: {idempotent:?}"
+    );
+}

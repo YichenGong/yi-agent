@@ -63,7 +63,9 @@ pub use client::{
 };
 pub use daemon::Daemon;
 pub use error::IpcError;
-pub use foreground::{ForegroundBridge, code_of as foreground_failure_code};
+pub use foreground::{
+    ForegroundBridge, code_of as foreground_failure_code, failure_of as foreground_failure,
+};
 pub use plugin_socket::{clear_plugin_sockets, plugin_socket_for, register_plugin_sockets};
 pub use protocol::{
     IpcCancelDelivery, IpcCancelLease, IpcCompletedChildReport, IpcErrorCode, IpcEvent,

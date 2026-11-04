@@ -77,6 +77,25 @@ impl ForegroundBridge {
         !self.closed && self.authority.owns_business(root, client_run_id, now)
     }
 
+    /// Whether a caller presents the capability the bridge installed for this root.
+    ///
+    /// This is the bridge's single answer to "may this caller act for that root?", so a
+    /// bind, an activity write and a read cannot disagree about what counts as
+    /// authority. A closed bridge refuses everything: the guardian is the only thing
+    /// that can vouch for a root, so without it nothing is vouched for.
+    pub fn presents_capability(
+        &self,
+        root: &str,
+        client_run_id: &str,
+        capability: &str,
+        now: Instant,
+    ) -> bool {
+        !self.closed
+            && self
+                .authority
+                .presents_capability(root, client_run_id, capability, now)
+    }
+
     /// Handles one frame from the guardian.
     ///
     /// Returns the frame to send back, if any. A frame this side does not answer
@@ -262,20 +281,51 @@ impl ForegroundBridge {
         let root = root_id
             .parse()
             .map_err(|_| ForegroundError::CorruptBinding)?;
+        // The install must complete the reservation that asked for it, and the check has
+        // to happen *before* the row is written: classifying first would leave a managed
+        // container persisted under authority that was never issued for it.
+        //
+        // Both sides were validated separately (the guardian checked the intent's scope,
+        // the daemon checked the stamp's), so the join is where a disagreement surfaces.
+        let matches_prepare = self.authority.installed_identity(root_id).is_some_and(
+            |(owner, scope_key, epoch, _)| {
+                owner == pending.client_run_id
+                    && scope_key == pending.scope_key
+                    && epoch == binding_epoch
+            },
+        );
+        if !matches_prepare {
+            return Err(ForegroundError::AuthorityDenied);
+        }
+        // The reservation must still be about the same conversation. The install frame
+        // carries no workspace or thread key, so this is the only place the pair can be
+        // joined: a commit for a re-pointed operation would classify one conversation's
+        // root using another's intent.
+        if !self.authority.reservation_matches(root_id, &pending.intent) {
+            return Err(ForegroundError::OperationConflict);
+        }
+        // `Business` is the only scope that may create a managed container: a
+        // `RecoveryOnly` authorization can inspect and stop, never own.
+        if pending.scope != RootAuthorityScope::Business {
+            return Err(ForegroundError::AuthorityDenied);
+        }
         repository
             .record_foreground_root(&PersistedForegroundRoot {
                 root,
                 classification: ForegroundClassification::Managed,
                 binding_epoch,
-                driver_epoch: 1,
+                // No driver exists yet: the install authorized the *owner*, and a
+                // driver epoch belongs to the `ForegroundDriver::bind` that will
+                // present it. Recording 1 here would make the first real bind look
+                // like an unproven takeover of a driver that never existed.
+                driver_epoch: 0,
                 owner_client_id: Some(pending.client_run_id.clone()),
                 // The install authorizes the owner but admits no work yet: the driver
                 // bind (Task 6) is what opens admission for an attempt.
                 admission: crate::repository::foreground::AdmissionState::Closed,
-                driver_bind_operation_id: Some(pending.intent.operation_id.clone()),
+                driver_bind_operation_id: None,
             })
             .map_err(|_| ForegroundError::CorruptBinding)?;
-        let _ = (&pending.scope_key, pending.scope);
         Ok(())
     }
 
@@ -307,6 +357,38 @@ fn root_of(message: &AuthorityMessage) -> Option<&str> {
         }
         AuthorityMessage::RevokeOwner { .. } | AuthorityMessage::Drain { .. } => None,
     }
+}
+
+/// Turns an internal failure into the structured wire rejection.
+///
+/// The code comes from [`code_of`] so a new variant cannot be reported as a different
+/// code in one place than in another. `reason` is a fixed phrase: the wire contract is
+/// a code plus entities, not a message a client would have to parse.
+pub fn failure_of(error: &ForegroundError) -> yi_agent_lifecycle::foreground::ForegroundFailure {
+    use yi_agent_lifecycle::foreground::ForegroundFailure;
+    let reason = match error {
+        ForegroundError::Unsupported => "foreground roots are not supported by this daemon",
+        ForegroundError::AuthorityDenied => "the caller does not hold authority for this root",
+        ForegroundError::AdmissionClosed => "this root is not admitting work",
+        ForegroundError::StaleAttempt => "the root has moved on to a newer attempt",
+        ForegroundError::StaleDriver => "a newer driver holds this root",
+        ForegroundError::InvalidActivity => "the reported activity is not a legal transition",
+        ForegroundError::SequenceConflict => "another report already used this sequence",
+        ForegroundError::RecoveryRequired => "this root needs recovery before it can proceed",
+        ForegroundError::RecoveryAuthorityMissing => {
+            "no authenticated authority exists for this root"
+        }
+        ForegroundError::StopUnproven(_) => "an execution is not yet proven stopped",
+        ForegroundError::ConfirmationRequired => "the user must confirm this recovery",
+        ForegroundError::ConfirmationExpired => "the confirmation has expired",
+        ForegroundError::OperationConflict => "another operation is in flight for this root",
+        ForegroundError::CorruptBinding => "the persisted binding contradicts itself",
+    };
+    let mut failure = ForegroundFailure::new(code_of(error), reason);
+    if let ForegroundError::StopUnproven(blocked) = error {
+        failure.blocked_execution_ids = blocked.clone();
+    }
+    failure
 }
 
 /// Turns an internal failure into the wire discriminant.

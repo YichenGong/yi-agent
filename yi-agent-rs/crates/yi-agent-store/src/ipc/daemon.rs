@@ -1,4 +1,5 @@
 use super::*;
+use crate::repository::RepositoryError;
 
 pub(crate) const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
@@ -1121,6 +1122,41 @@ pub(crate) fn respond(
             // Running it on a detached thread looks harmless but is unbounded
             Ok(IpcResponse::ApplicationRootDetached)
         }
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id,
+        } => {
+            match coordinator.bind_foreground_driver(&authorization, &operation_id) {
+                Ok(binding) => Ok(IpcResponse::ForegroundDriverBound { binding }),
+                // A foreground refusal is a policy answer with a code the client
+                // dispatches on, so it must not be flattened into `invalid_state`.
+                Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                    IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+                ),
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability,
+            update,
+        } => match coordinator.set_foreground_activity(&driver_capability, &update) {
+            Ok(snapshot) => Ok(IpcResponse::ForegroundActivity { snapshot }),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
+        IpcRequest::GetApplicationRootActivity {
+            authorization,
+            root,
+        } => match coordinator.get_foreground_activity(&authorization, &root) {
+            Ok(Some(snapshot)) => Ok(IpcResponse::ForegroundActivity { snapshot }),
+            Ok(None) => Ok(IpcResponse::ForegroundActivityAbsent),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
         IpcRequest::CreateSchedule { cron, objective } => {
             let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))

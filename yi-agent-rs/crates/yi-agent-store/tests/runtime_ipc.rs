@@ -5844,3 +5844,438 @@ fn foreground_root_lifecycle_a_refused_wire_spawn_leaves_no_child_and_no_owner()
         "a refused spawn must not add an owned root"
     );
 }
+
+/// A daemon whose coordinator serves the foreground lifecycle rules.
+///
+/// `start_with_factory` always passes `Disabled`, and that is the point: a production
+/// listener must not serve the new rules before Task 11 wires the rest of the loop. The
+/// foreground tests therefore have to ask for `Enabled` explicitly, and they are the only
+/// place that does.
+fn foreground_daemon(
+    directory: &TempDir,
+    database: &std::path::Path,
+) -> (Daemon, Arc<Mutex<Vec<WorkerStart>>>) {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_activation(
+        directory.path().join("runtime"),
+        database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::for_test(true),
+    )
+    .unwrap();
+    (daemon, starts)
+}
+
+/// An attached application root plus installed authority for it.
+///
+/// Returns `(session_id, root_task_id, authorization)`.
+fn foreground_root_with_authority(
+    daemon: &Daemon,
+    owner: &str,
+) -> (String, String, yi_agent_lifecycle::types::RootAuthorization) {
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: format!("{owner}-attach"),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let intent = yi_agent_lifecycle::foreground::RootBindIntent {
+        operation_id: format!("{owner}-prepare"),
+        thread_key: format!("{owner}-thread"),
+        workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        extra_roots: Vec::new(),
+        previous_root_capability: None,
+    };
+    let authorization = daemon
+        .coordinator_for_test()
+        .install_foreground_authority_for_test(&root_task_id, owner, intent)
+        .expect("the bridge installs authority for an attached root");
+    (session_id, root_task_id, authorization)
+}
+
+#[test]
+fn foreground_root_lifecycle_a_bind_retried_under_one_operation_keeps_its_epoch_and_secret() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding: first } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // The caller lost the answer and retries the same operation. It must land on the same
+    // epoch *and* the same secret: minting a new one would revoke the copy it already has
+    // and give it no way to learn which of the two is live.
+    let IpcResponse::ForegroundDriverBound { binding: second } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("a replay of the same operation must be accepted");
+    };
+
+    assert_eq!(first.fence.driver_epoch, second.fence.driver_epoch);
+    assert_eq!(first.last_seq, second.last_seq);
+    assert_eq!(
+        first.driver_capability.expose(),
+        second.driver_capability.expose(),
+        "a replay hands back the capability it already issued"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_second_bind_without_a_stop_proof_is_refused_on_the_wire() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-2".into(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a takeover without a stop proof must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::StopUnproven
+    );
+    assert_eq!(
+        failure.blocked_execution_ids,
+        vec![binding.fence.driver_epoch.to_string()],
+        "the refusal names the driver that has not been proven stopped"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_activity_within_the_fence_is_stored_and_read_back() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = foreground_daemon(&directory, &database);
+    let (session_id, root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // The task row is the thing an activity report must never touch. Snapshot it first so
+    // the assertion below compares what the report did, not what the daemon happens to
+    // hold afterwards.
+    let before: (String, String, String) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT delivery_json, state_json, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root.clone()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    let update = yi_agent_lifecycle::foreground::ActivityUpdate {
+        fence: binding.fence.clone(),
+        turn_id: Some("turn-1".into()),
+        seq: binding.last_seq + 1,
+        phase: yi_agent_lifecycle::foreground::ActivityPhase::Running,
+    };
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability: binding.driver_capability.clone(),
+            update,
+        },
+    )
+    .unwrap() else {
+        panic!("a report inside the fence is accepted");
+    };
+    assert_eq!(
+        snapshot.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Running
+    );
+
+    let IpcResponse::ForegroundActivity { snapshot: read } = send_request(
+        daemon.socket_path(),
+        IpcRequest::GetApplicationRootActivity {
+            authorization,
+            root: yi_agent_lifecycle::foreground::RootRef {
+                session_id: session_id.clone(),
+                root_id: root.clone(),
+                attempt_id: binding.fence.root.attempt_id.clone(),
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("the committed snapshot is readable");
+    };
+    // Reading is a *diagnostic* view: a persisted `running` cannot be trusted to mean a
+    // live turn (the driver may be gone), so it is projected to `Unknown` rather than
+    // reported as active. Everything else about the report is preserved.
+    assert_eq!(
+        read.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Unknown,
+        "a reloaded running turn must not read back as live"
+    );
+    assert_eq!(read.update.seq, snapshot.update.seq);
+    assert_eq!(read.update.turn_id, snapshot.update.turn_id);
+    // The projection is a view, not a rewrite: the stored snapshot keeps `running` so it
+    // stays usable as evidence of what the driver actually reported.
+    let connection = Connection::open(&database).unwrap();
+    let stored: String = connection
+        .query_row(
+            "SELECT activity_json FROM foreground_root_state WHERE root_task_id = ?1",
+            params![root.clone()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("\"running\""),
+        "the stored evidence must still say what the driver reported, got {stored}"
+    );
+
+    // Reporting activity is not progress: the report must not start a worker, and it must
+    // not rewrite the objective the conversation was attached with.
+    assert!(
+        starts.lock().unwrap().is_empty(),
+        "an activity report must never start a worker"
+    );
+    let after: (String, String, String) = connection
+        .query_row(
+            "SELECT delivery_json, state_json, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "an activity report must not rewrite the conversation's contract or state"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_superseded_driver_cannot_advance_activity() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // A superseded driver epoch is the "reconnect and re-bind" answer, distinct from a
+    // stale attempt: a caller has to be able to tell them apart to know what to do next.
+    let mut stale = binding.fence.clone();
+    stale.driver_epoch += 1;
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability: binding.driver_capability.clone(),
+            update: yi_agent_lifecycle::foreground::ActivityUpdate {
+                fence: stale,
+                turn_id: None,
+                seq: binding.last_seq + 1,
+                phase: yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+            },
+        },
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a report from a superseded driver must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::StaleDriver
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_ordering_keeps_a_late_finish_from_closing_a_newer_turn() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    let report = |seq: u64, turn: Option<&str>, phase| IpcRequest::SetApplicationRootActivity {
+        driver_capability: binding.driver_capability.clone(),
+        update: yi_agent_lifecycle::foreground::ActivityUpdate {
+            fence: binding.fence.clone(),
+            turn_id: turn.map(str::to_owned),
+            seq,
+            phase,
+        },
+    };
+
+    // turn-1 opens.
+    let IpcResponse::ForegroundActivity { .. } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 1,
+            Some("turn-1"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Running,
+        ),
+    )
+    .unwrap() else {
+        panic!("opening a turn is a legal report");
+    };
+
+    // A finish for some other turn, at a *larger* sequence, must not close turn-1. The
+    // sequence only orders reports; it does not let one name another turn.
+    let response = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 2,
+            Some("turn-0"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+        ),
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a finish naming another turn must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::InvalidActivity
+    );
+
+    // The matching finish is accepted.
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 3,
+            Some("turn-1"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+        ),
+    )
+    .unwrap() else {
+        panic!("the matching finish closes the open turn");
+    };
+    assert_eq!(
+        snapshot.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Idle
+    );
+
+    // And the conversation continues: a new turn opens after the finish.
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 4,
+            Some("turn-2"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Running,
+        ),
+    )
+    .unwrap() else {
+        panic!("a finished turn makes room for the next one");
+    };
+    assert_eq!(snapshot.update.turn_id.as_deref(), Some("turn-2"));
+}
+
+#[test]
+fn foreground_root_lifecycle_an_authorization_from_another_generation_or_scope_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    // A grant minted by a previous daemon generation names authority this process never
+    // installed. Accepting it would let one grant be spent once per generation.
+    let mut other_generation = authorization.clone();
+    other_generation.daemon_instance_id = "a-previous-daemon".into();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: other_generation,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        !matches!(
+            response,
+            IpcResponse::ForegroundDriverBound { .. } | IpcResponse::ForegroundActivity { .. }
+        ),
+        "a grant from another generation must not bind a driver, got {response:?}"
+    );
+
+    // The scope key is what ties an authority to one project. A different one was issued
+    // for a scope nobody decided anything about here.
+    let mut other_scope = authorization;
+    other_scope.scope_key = "another-project".into();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: other_scope,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error { .. } | IpcResponse::ForegroundFailure(_)
+        ),
+        "a grant for another scope must not bind a driver, got {response:?}"
+    );
+}

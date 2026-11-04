@@ -31,6 +31,10 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The foreground lifecycle is disabled in production builds (Task 11 turns it on), so a
+# dev-dependency on the store's test hooks is the only way an integration test can serve
+# those requests. Feature unification keeps this out of the shipped binary.
+yi-agent-store = { workspace = true, features = ["foreground-test-support"] }
 tempfile = "3"
 yi-agent-lifecycle = { workspace = true }
 # 集成测试用 flock 精确复现「别人正在起 daemon」的启动窗口。

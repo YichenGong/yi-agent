@@ -55,9 +55,23 @@ struct Challenge {
 #[derive(Clone, Debug)]
 struct InstalledAuthority {
     client_run_id: String,
+    /// The scope key the guardian validated this root under.
+    ///
+    /// Kept so the install's commit can be checked against the *prepare* that reserved
+    /// the root: without it, a reservation made for one scope could be completed by an
+    /// install that validated a different one, and the two sides would disagree about
+    /// which project the authority belongs to.
+    scope_key: String,
     binding_epoch: u64,
     authority_seq: u64,
     scope: RootAuthorityScope,
+    /// SHA-256 of the capability the guardian issued for this root.
+    ///
+    /// Only the digest is kept: the table has to *recognise* the capability a caller
+    /// presents, never be able to reproduce it. Without this, any process that could
+    /// guess a root id and an owner name could ask the daemon to bind a driver for a
+    /// root it does not own.
+    capability_digest: [u8; 32],
     /// The last moment this authority may be used, on the daemon's monotonic clock.
     expires_at: Instant,
 }
@@ -188,9 +202,11 @@ impl AuthorityTable {
                     stamp.root_id.clone(),
                     InstalledAuthority {
                         client_run_id: stamp.owner.clone(),
+                        scope_key: authorization.scope_key.clone(),
                         binding_epoch: stamp.binding_epoch,
                         authority_seq: stamp.authority_seq,
                         scope: stamp.authority_scope,
+                        capability_digest: digest_of_capability(&authorization.capability),
                         expires_at: now + Duration::from_millis(stamp.remaining_lease_ms),
                     },
                 );
@@ -342,6 +358,21 @@ impl AuthorityTable {
     }
 
     /// The binding epoch the guardian assigned, for the binding commit to record.
+    /// The owner, scope key, binding epoch and authority sequence of a live install.
+    ///
+    /// One accessor rather than four so a caller that has to agree with the table checks
+    /// a single snapshot of it, not four reads that a concurrent renew could straddle.
+    pub fn installed_identity(&self, root: &str) -> Option<(String, String, u64, u64)> {
+        self.authorities.get(root).map(|authority| {
+            (
+                authority.client_run_id.clone(),
+                authority.scope_key.clone(),
+                authority.binding_epoch,
+                authority.authority_seq,
+            )
+        })
+    }
+
     pub fn binding_epoch(&self, root: &str) -> Option<u64> {
         self.authorities
             .get(root)
@@ -359,6 +390,29 @@ impl AuthorityTable {
     pub fn next_authority_seq(&self, root: &str) -> u64 {
         self.tombstone_seq(root)
             .map_or(1, |seq| seq.saturating_add(1))
+    }
+
+    /// Whether `capability` is the one the guardian issued for this root and owner.
+    ///
+    /// This is the daemon's half of "a client cannot set a verified flag": knowing the
+    /// root id and the owner name is not authority, so the presented secret has to
+    /// match the digest of the one that arrived over the private bridge.
+    pub fn presents_capability(
+        &self,
+        root: &str,
+        client_run_id: &str,
+        capability: &str,
+        now: Instant,
+    ) -> bool {
+        self.authorities.get(root).is_some_and(|authority| {
+            authority.expires_at > now
+                && authority.scope == RootAuthorityScope::Business
+                && authority.client_run_id == client_run_id
+                && constant_time_eq(
+                    &authority.capability_digest,
+                    &digest_of_capability(capability),
+                )
+        })
     }
 
     /// Records a reservation made by a prepare that has not completed.
@@ -406,6 +460,21 @@ impl AuthorityTable {
             .map(|reservation| reservation.client_run_id.as_str())
     }
 
+    /// Whether the reservation for `root` still describes exactly this intent.
+    ///
+    /// The install carries only the stamp and the authorization; neither names the
+    /// workspace or the thread key. Without this check the commit could classify a root
+    /// under an operation whose intent was about a different conversation, which is the
+    /// one thing a reservation exists to prevent.
+    pub fn reservation_matches(&self, root: &str, intent: &RootBindIntent) -> bool {
+        self.reservations.get(root).is_some_and(|reservation| {
+            reservation.operation_id == intent.operation_id
+                && reservation.thread_key == intent.thread_key
+                && reservation.workspace == intent.workspace
+                && reservation.extra_roots == intent.extra_roots
+        })
+    }
+
     /// Drops a reservation that failed to install.
     ///
     /// Idempotent and safe to call for a reservation that is already gone: a failed
@@ -450,6 +519,27 @@ impl AuthorityTable {
         self.authorities.clear();
         self.challenges.clear();
     }
+}
+
+/// SHA-256 of a capability, as the table stores it.
+fn digest_of_capability(capability: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(capability.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Compares two digests without an early exit on the first differing byte.
+///
+/// The digests are not secrets, but the comparison decides an admission, and a
+/// timing signal that reveals how many leading bytes matched would let a caller
+/// search for a capability digest byte by byte.
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 
 #[cfg(test)]

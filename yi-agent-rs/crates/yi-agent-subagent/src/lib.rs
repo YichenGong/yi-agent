@@ -8,6 +8,7 @@
 pub mod attach;
 pub mod binding;
 pub mod executor;
+pub mod foreground;
 pub mod thread_root;
 
 use std::collections::HashMap;
