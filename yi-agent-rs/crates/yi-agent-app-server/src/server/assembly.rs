@@ -30,6 +30,98 @@ pub(crate) struct RuntimeTooling {
     /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
     pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
+/// Turn one bring-up choice into a binding, or the failure that explains why not.
+///
+/// Split out of [`attach_cwd_runtime`] so the dispatch itself is testable. The
+/// alternative -- asserting through the real attach -- would need a live daemon and
+/// a process-wide `OnceLock` for every case, and the interesting property here is
+/// only which branch runs.
+fn bring_up_with(
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    models_path: &Path,
+) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
+    use yi_agent_subagent::attach::{
+        AttachFailure, BringUpPolicy, ensure_owned_runtime, ensure_owned_runtime_with_policy,
+    };
+
+    match bringup.policy {
+        // Embedded needs no scope; the four-argument form keeps its exact
+        // historical behaviour, including which policy a later repair uses.
+        BringUpPolicy::Embedded => {
+            ensure_owned_runtime(cfg, runtime_dir.to_path_buf(), models_path).map(|attached| {
+                RuntimeBinding::managed(
+                    cfg,
+                    runtime_dir.to_path_buf(),
+                    models_path.to_path_buf(),
+                    Arc::new(attached),
+                )
+            })
+        }
+        BringUpPolicy::Managed => {
+            let Some(instance_home) = bringup.instance_home.as_deref() else {
+                // A managed start with no scope to resolve has nothing to join and
+                // must not silently degrade to an embedded one: that would leave a
+                // client-owned daemon behind a policy that promises it is shared.
+                return Err(AttachFailure::new(
+                    "runtime bring-up",
+                    "the managed policy needs the instance home this process never installed",
+                ));
+            };
+            ensure_owned_runtime_with_policy(
+                cfg,
+                runtime_dir.to_path_buf(),
+                models_path,
+                instance_home,
+                bringup.policy,
+                bringup.expected.as_ref(),
+            )
+            .map(|attached| {
+                RuntimeBinding::managed_with(
+                    cfg,
+                    runtime_dir.to_path_buf(),
+                    models_path.to_path_buf(),
+                    Arc::new(attached),
+                    bringup.clone(),
+                )
+            })
+        }
+    }
+}
+
+/// Test seam: the same dispatch, exposed to the server's own tests.
+#[cfg(test)]
+pub(crate) fn bring_up_with_for_test(
+    bringup: &yi_agent_subagent::binding::BringUpChoice,
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    models_path: &Path,
+) -> Result<Arc<RuntimeBinding>, yi_agent_subagent::attach::AttachFailure> {
+    bring_up_with(bringup, cfg, runtime_dir, models_path)
+}
+
+/// Test seam: an identity that is *not* the running build.
+///
+/// The real id comes from `yi-agent`'s build script, which this library cannot
+/// read. A synthesized one is enough here because the tests only assert which
+/// branch runs, never that a daemon accepted the identity.
+#[cfg(test)]
+pub(crate) fn test_identity(dir: &Path) -> yi_agent_lifecycle::types::ArtifactIdentity {
+    yi_agent_lifecycle::types::ArtifactIdentity {
+        build_id: "0".repeat(32),
+        display_version: "test".to_string(),
+        executable: dir.join("yi-agent"),
+        sha256: String::new(),
+        schema_min: yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MIN,
+        schema_max: yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MAX,
+        handover_version: 1,
+        business_protocol_min: yi_agent_store::ipc::PROTOCOL_VERSION,
+        business_protocol_max: yi_agent_store::ipc::PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    }
+}
+
 /// 取出(或建立)该 cwd 的项目 runtime。
 pub(crate) fn attach_cwd_runtime(
     runtimes: &ProjectRuntimes,
@@ -70,19 +162,13 @@ pub(crate) fn attach_cwd_runtime(
     // one. The binding it returns heals itself on later calls, so a daemon that
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
-    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(
-        cfg,
-        runtime_dir.to_path_buf(),
-        models_path,
-    )
-    .map(|attached| {
-        RuntimeBinding::managed(
-            cfg,
-            runtime_dir.to_path_buf(),
-            models_path.to_path_buf(),
-            Arc::new(attached),
-        )
-    });
+    //
+    // This is the seam: the process's bring-up choice decides whether we own an
+    // embedded daemon or join a shared guardian-managed one. A production path
+    // that never consults the policy cannot honour `YI_AGENT_BRINGUP=managed` at
+    // all -- the policy, and everything behind it, would only ever run in tests.
+    let bringup = yi_agent_subagent::attach::process_bringup_choice();
+    let outcome = bring_up_with(&bringup, cfg, runtime_dir, models_path);
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());
     match &outcome {
         // Only durable conclusions are worth remembering. A transient failure is

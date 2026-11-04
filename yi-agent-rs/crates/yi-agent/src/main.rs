@@ -42,12 +42,46 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
     }
 }
 
+/// Tell the subagent layer what artifact this process is and where its instance
+/// state lives.
+///
+/// The expected identity names *this* executable: for the TUI the daemon it owns
+/// is itself, and for the desktop the sidecar is a copied build of the same crate,
+/// so the same id describes both. The path is resolved at runtime because the
+/// artifact may sit in an app bundle, a cached copy, or `target/debug`.
+///
+/// Best effort, like everything else about *optional* delegation: without a home
+/// directory there is no instance to scope to, and refusing to start the CLI over
+/// that would be worse than an embedded runtime.
+fn install_managed_context() {
+    let Some(instance_home) = yi_agent_store::paths::instance_home() else {
+        return;
+    };
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(%error, "cannot resolve the executable path for managed bring-up");
+            return;
+        }
+    };
+    yi_agent_subagent::attach::install_managed_context(yi_agent_subagent::attach::ManagedContext {
+        expected: build_info::artifact_identity(executable),
+        instance_home,
+    });
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 开关的构建类型硬闸读的是本 crate `build.rs` 注入的值；别的 crate 读不到
     // `rustc-env`，所以必须在这里显式注入一次。
     yi_agent_flags::set_build_info(build_info::BUILD_KIND, build_info::VERSION);
+
+    // Only the binary knows its own artifact identity (`YI_AGENT_DAEMON_BUILD_ID`)
+    // and where this instance keeps its state. Install both once, before any
+    // command runs, so the app-server's project attach can consult the bring-up
+    // policy without every transport signature growing two parameters.
+    install_managed_context();
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their
