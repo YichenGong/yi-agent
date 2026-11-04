@@ -197,7 +197,7 @@ export function buildEvidenceEntry({
 ///
 /// `outcome` 来自执行层，取值 `pass` / `fail` / `missing`。注意 `missing` 是
 /// **fail** 而不是跳过：一条命令没找到、没运行，恰恰说明这条验收没有被验证。
-export function verdictFor({ caseSpec, outcome, capabilities = {} } = {}) {
+export function verdictFor({ caseSpec, outcome, capabilities = {}, executorUnsupported = null } = {}) {
   if (caseSpec === null || typeof caseSpec !== "object") {
     fail("verdictFor needs a case specification");
   }
@@ -205,6 +205,9 @@ export function verdictFor({ caseSpec, outcome, capabilities = {} } = {}) {
     fail(`unknown outcome ${JSON.stringify(outcome)}`);
   }
 
+  // 执行器自己说 unsupported 时优先信它：它知道哪些判据没被证明，退出码只知道
+  // 「跑完了」。这是 A17 那种「证明了一部分」的用例唯一诚实的记法。
+  if (executorUnsupported) return "unsupported";
   if (outcome === "pass") return "pass";
   if (outcome === "fail") return "fail";
 
@@ -253,6 +256,7 @@ export function assembleReport({ buildKind, suite, results, capabilities = {}, n
       caseSpec: result.caseSpec,
       outcome: result.outcome,
       capabilities,
+      executorUnsupported: result.executorUnsupported ?? null,
     });
     if (!VERDICTS.includes(verdict)) {
       fail(`internal: verdict ${verdict} is outside the vocabulary`);
@@ -263,7 +267,7 @@ export function assembleReport({ buildKind, suite, results, capabilities = {}, n
       evidence: result.evidence ?? [],
     };
     if (verdict === "unsupported") {
-      entry.reason = result.reason ?? unsupportedReason(result.caseSpec);
+      entry.reason = result.executorUnsupported ?? result.reason ?? unsupportedReason(result.caseSpec);
     }
     return entry;
   });
@@ -472,13 +476,103 @@ export function runCase(caseSpec, options = {}) {
     }
     outcomes.push({ ...result, kind: command.kind });
   }
+  // 声明了 `emitsRemoteIdentity` 的命令必须交出一行合规的身份 JSON。
+  // 这里先校验再决定 outcome：跑成功了但没按契约输出，是**失败**而不是跳过。
+  let remoteIdentityFailure = null;
+  let executorUnsupported = null;
+  const identities = new Map();
+  for (const [index, command] of caseSpec.commands.entries()) {
+    if (command.emitsRemoteIdentity !== true) continue;
+    const outcome = outcomes[index];
+    const parsed = outcome?.outcome === "pass" ? parseRemoteIdentity(outcome.stdout) : null;
+    if (parsed.error) {
+      remoteIdentityFailure = `${command.run}: ${parsed.error}`;
+      break;
+    }
+    identities.set(index, parsed.identity);
+    // 执行器自己判 unsupported 时，退出码仍是 0（它不是执行错误），所以
+    // 只看退出码会把「只证明了一部分」记成通过。这正是要避免的粉饰：
+    // A17 只证明了四条判据里的一条，报告里必须是 unsupported。
+    if (parsed.verdict === "unsupported") {
+      executorUnsupported = parsed.reason ?? "the executor reported unsupported";
+    }
+  }
+
   const evidence = outcomes
-    .filter((result) => result.outcome === "pass")
-    .map((result) => buildEvidenceEntry({ kind: result.kind, detail: result.command }));
+    .map((result, index) =>
+      result.outcome === "pass"
+        ? buildEvidenceEntry({
+            kind: result.kind,
+            detail: result.command,
+            remoteIdentity: identities.get(index),
+          })
+        : null,
+    )
+    .filter((entry) => entry !== null);
+
   const anyMissing = outcomes.find((result) => result.outcome === "missing");
   const anyFailed = outcomes.find((result) => result.outcome === "fail");
-  const outcome = anyMissing ? "missing" : anyFailed ? "fail" : "pass";
-  return { caseSpec, outcome, evidence, outcomes };
+  const outcome = remoteIdentityFailure
+    ? "fail"
+    : anyMissing
+      ? "missing"
+      : anyFailed
+        ? "fail"
+        : "pass";
+  return {
+    caseSpec,
+    outcome,
+    evidence,
+    outcomes,
+    ...(remoteIdentityFailure ? { reason: remoteIdentityFailure } : {}),
+    // 由 `verdictFor` 消费：执行器说 unsupported 的用例按 unsupported 记，
+    // 不看它的退出码。
+    ...(executorUnsupported ? { executorUnsupported } : {}),
+  };
+}
+
+/// 解析命令 stdout 里的远端身份。
+///
+/// 契约：stdout 的**首行**是一个 JSON 对象，含
+/// `{hostId, os, arch, version}` 四个非空字符串。四个字段缺一不可——缺了
+/// 某个字段的身份在报告里看起来像证据，实际无法复核是哪台机器。
+export function parseRemoteIdentity(stdout) {
+  const firstLine = String(stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line !== "");
+  if (!firstLine) return { error: "no output to read a remote identity from" };
+  let parsed;
+  try {
+    parsed = JSON.parse(firstLine);
+  } catch {
+    return { error: "stdout is not the promised JSON remote identity" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: "remote identity must be a JSON object" };
+  }
+  // 两种形状都收：顶层 `{hostId,...}`，以及远端执行器输出的
+  // `{verdict, checks, remoteIdentity:{...}}`。后者的身份是嵌套的，读顶层
+  // 会得到「缺 hostId」——一个看起来像脚本坏了的误报。
+  const identity = parsed.remoteIdentity ?? parsed;
+  if (identity === null || typeof identity !== "object") {
+    return { error: "remote identity must be a JSON object" };
+  }
+  for (const field of ["hostId", "os", "arch", "version"]) {
+    if (typeof identity[field] !== "string" || identity[field].trim() === "") {
+      return { error: `remote identity is missing ${field}` };
+    }
+  }
+  return {
+    identity: {
+      hostId: identity.hostId,
+      os: identity.os,
+      arch: identity.arch,
+      version: identity.version,
+    },
+    ...(typeof parsed.verdict === "string" ? { verdict: parsed.verdict } : {}),
+    ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+  };
 }
 
 /// 执行选中的用例，得到 `assembleReport` 需要的结果列表。
@@ -511,7 +605,10 @@ export function parseArgs(argv) {
     suite: "all",
     output: ".artifacts/plugins/acceptance.json",
     buildKind: "probe",
-    remoteHost: "",
+    // null 而不是 ""：空串会作为 `flags.remoteHost` 覆盖掉环境变量，让
+    // 「设了 YI_AGENT_ACCEPTANCE_REMOTE_HOST 却仍判 unsupported」变成一个
+    // 极难查的谜。
+    remoteHost: null,
     requirePass: false,
     dryRun: false,
   };
@@ -551,7 +648,9 @@ export function main(argv, { stdout = process.stdout, stderr = process.stderr } 
   const options = parseArgs(argv);
   const map = loadCommandMap();
   const selected = planSuites(map, options.suite);
-  const capabilities = detectCapabilities({ flags: { remoteHost: options.remoteHost } });
+  const capabilities = detectCapabilities({
+    flags: options.remoteHost === null ? {} : { remoteHost: options.remoteHost },
+  });
 
   if (options.dryRun) {
     stdout.write(`e2e: ${selected.length} case(s), build=${options.buildKind}\n`);

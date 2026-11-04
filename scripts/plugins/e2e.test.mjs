@@ -18,6 +18,7 @@ import {
   requiresPassExitCode,
   unsupportedReason,
   parseCommand,
+  parseRemoteIdentity,
   runCommand,
   runCase,
   runSelected,
@@ -583,21 +584,33 @@ test("commands that differ in cwd are not shared", () => {
   assert.equal(ran, 2);
 });
 
-test("a case naming a missing driver degrades instead of pretending to fail", () => {
-  // A16 的执行器（e2e-remote.mjs）还没实现。没有远端主机时它已经会是
-  // unsupported；但**即使**声明了主机，也不能让一步不存在的脚本冒充
-  // 「跑过但失败」——把缺执行器说成实现失败会指向完全错误的修法。
-  const map = loadCommandMap();
-  const a16 = planSuites(map, "A16")[0];
+test("a case naming a missing prerequisite degrades instead of pretending to fail", () => {
+  // 用例声明了一个不存在的前置文件时，不能让这一步「跑了然后失败」——
+  // 把缺东西说成实现失败会指向完全错误的修法。
+  //
+  // 这里用一个确实不存在的路径，而不是映射表里的 A16：`e2e-remote.mjs` 现在
+  // 有了，拿它当反例会在某天悄悄变成「测试因为别的原因通过」。
+  const caseSpec = {
+    id: "AX",
+    unsupportedWithout: "remote",
+    commands: [
+      {
+        kind: "remote",
+        run: "missing-driver",
+        needs: ["scripts/plugins/__this_file_does_not_exist__.mjs"],
+      },
+    ],
+  };
   let ran = 0;
-  const results = runSelected([a16], {
+  const results = runSelected([caseSpec], {
+    cwd: path.resolve(import.meta.dirname, "..", ".."),
     capabilities: { remote: true },
     runner: () => {
       ran += 1;
       return "";
     },
   });
-  assert.equal(ran, 0, "an unbuilt driver must not be executed");
+  assert.equal(ran, 0, "an unbuilt prerequisite must not be executed");
   const report = assembleReport({
     buildKind: "probe",
     results,
@@ -605,7 +618,6 @@ test("a case naming a missing driver degrades instead of pretending to fail", ()
     now: "2026-11-05T00:00:00Z",
   });
   assert.equal(report.cases[0].verdict, "unsupported");
-  assert.match(report.cases[0].reason, /e2e-remote\.mjs/);
 });
 
 test("a timeout with the capability present is a failure, not a capability gap", () => {
@@ -657,4 +669,182 @@ test("a capability gap is decided before any command runs", () => {
     verdictFor({ caseSpec: result.caseSpec, outcome: result.outcome, capabilities: { official: false } }),
     "unsupported",
   );
+});
+
+test("a command that emits a remote identity carries it into the evidence", () => {
+  // 校验器对 kind: "remote" 要求 remoteIdentity {hostId, os, arch, version}，
+  // 但执行层原先只把命令行当 detail 传下去，身份根本到不了证据里——于是
+  // A16/A17 无论远端跑得多正确都会被判 unsupported。
+  const caseSpec = {
+    id: "A16",
+    unsupportedWithout: null,
+    commands: [
+      {
+        kind: "remote",
+        run: "remote-probe",
+        emitsRemoteIdentity: true,
+      },
+    ],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    runner: () =>
+      JSON.stringify({
+        hostId: "agenticlabsMac-mini-2.local",
+        os: "macOS 26.5.2",
+        arch: "aarch64-apple-darwin",
+        version: "0.1.13",
+      }),
+  });
+  assert.equal(result.outcome, "pass");
+  assert.deepEqual(result.evidence[0].remoteIdentity, {
+    hostId: "agenticlabsMac-mini-2.local",
+    os: "macOS 26.5.2",
+    arch: "aarch64-apple-darwin",
+    version: "0.1.13",
+  });
+});
+
+test("a promised remote identity that is not JSON is a failure, not a skip", () => {
+  // 脚本跑了却没按契约输出，是它的缺陷。记成 unsupported 会让人去查网络。
+  const caseSpec = {
+    id: "A16",
+    unsupportedWithout: null,
+    commands: [{ kind: "remote", run: "remote-probe", emitsRemoteIdentity: true }],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    runner: () => "host: nope\nos: nope",
+  });
+  assert.equal(result.outcome, "fail");
+});
+
+test("a remote identity missing a required field is a failure", () => {
+  const caseSpec = {
+    id: "A16",
+    unsupportedWithout: null,
+    commands: [{ kind: "remote", run: "remote-probe", emitsRemoteIdentity: true }],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    runner: () => JSON.stringify({ hostId: "h", os: "macOS 26" }),
+  });
+  assert.equal(result.outcome, "fail");
+});
+
+test("a command without the flag keeps its old behaviour", () => {
+  // 回归：只有声明了 emitsRemoteIdentity 的命令才被解析，别的命令的普通
+  // stdout 不能被当成 JSON 去读。
+  const caseSpec = {
+    id: "A01",
+    unsupportedWithout: null,
+    commands: [{ kind: "command", run: "plain" }],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    runner: () => "not json at all",
+  });
+  assert.equal(result.outcome, "pass");
+  assert.equal(result.evidence[0].remoteIdentity, undefined);
+});
+
+test("the environment host is not masked by an unset --remote-host flag", () => {
+  // parseArgs 曾经把 remoteHost 默认成 ""，那会作为 flags 覆盖环境变量，
+  // 于是「明明设了 YI_AGENT_ACCEPTANCE_REMOTE_HOST 却仍判 unsupported」——
+  // 一个只能靠读源码才能想明白的谜。
+  const options = parseArgs(["--suite", "A16"]);
+  assert.equal(options.remoteHost, null);
+  const capabilities = detectCapabilities({
+    env: { YI_AGENT_ACCEPTANCE_REMOTE_HOST: "remote.internal" },
+    flags: options.remoteHost === null ? {} : { remoteHost: options.remoteHost },
+  });
+  assert.equal(capabilities.remote, true);
+  assert.equal(capabilities.remoteHost, "remote.internal");
+});
+
+test("a nested remote identity is read from the executor's own output shape", () => {
+  // e2e-remote.mjs 输出 {verdict, checks, remoteIdentity:{...}}。只读顶层会得到
+  // 「缺 hostId」，看起来像脚本坏了，实际是解析方读错了层。
+  const parsed = parseRemoteIdentity(
+    JSON.stringify({
+      verdict: "pass",
+      checks: [],
+      remoteIdentity: {
+        hostId: "h.internal",
+        os: "macOS 26.5.2",
+        arch: "aarch64-apple-darwin",
+        version: "0.1.13",
+      },
+    }),
+  );
+  assert.deepEqual(parsed.identity, {
+    hostId: "h.internal",
+    os: "macOS 26.5.2",
+    arch: "aarch64-apple-darwin",
+    version: "0.1.13",
+  });
+});
+
+test("an executor that reports unsupported is not recorded as a pass", () => {
+  // A17 只证明了四条判据里的一条。执行器如实返回 unsupported，但退出码是 0
+  // （unsupported 不是执行错误）。只看退出码会把「部分证明」记成通过——这正是
+  // 这份报告最不该出现的粉饰。
+  const caseSpec = {
+    id: "A17",
+    unsupportedWithout: "remote",
+    commands: [{ kind: "remote", run: "probe", emitsRemoteIdentity: true }],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    capabilities: { remote: true },
+    runner: () =>
+      JSON.stringify({
+        verdict: "unsupported",
+        reason: "only one of four criteria is proven",
+        remoteIdentity: {
+          hostId: "h.internal",
+          os: "macOS 26",
+          arch: "aarch64-apple-darwin",
+          version: "1",
+        },
+      }),
+  });
+  assert.equal(result.outcome, "pass", "the command itself exited 0");
+  const report = assembleReport({
+    buildKind: "probe",
+    results: [result],
+    capabilities: { remote: true },
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "unsupported");
+  assert.match(report.cases[0].reason, /one of four/);
+});
+
+test("an executor that reports pass is still recorded as a pass", () => {
+  const caseSpec = {
+    id: "A16",
+    unsupportedWithout: "remote",
+    commands: [{ kind: "remote", run: "probe", emitsRemoteIdentity: true }],
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    capabilities: { remote: true },
+    runner: () =>
+      JSON.stringify({
+        verdict: "pass",
+        remoteIdentity: {
+          hostId: "h.internal",
+          os: "macOS 26",
+          arch: "aarch64-apple-darwin",
+          version: "1",
+        },
+      }),
+  });
+  const report = assembleReport({
+    buildKind: "probe",
+    results: [result],
+    capabilities: { remote: true },
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "pass");
 });

@@ -309,6 +309,9 @@ plugin-acceptance-check:
     node --test ../scripts/plugins/e2e-report.test.mjs
     node --test ../scripts/plugins/fault-matrix.test.mjs
     node --test ../scripts/plugins/e2e.test.mjs
+    node --test ../scripts/plugins/remote-facts.test.mjs
+    node --test ../scripts/plugins/remote-client.test.mjs
+    node --test ../scripts/plugins/e2e-remote.test.mjs
 
 # 真跑 A01–A20 并写出验收报告（T27）。默认只跑 probe 构建：A16/A17 在没有
 # 远端主机时如实记 unsupported，A20 在没有官方签名包时同样记 unsupported——
