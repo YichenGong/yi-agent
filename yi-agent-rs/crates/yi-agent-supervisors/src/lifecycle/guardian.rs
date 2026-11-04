@@ -2068,19 +2068,35 @@ fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeId
             // database is newer than this build can read.
             let schema_supported =
                 guardian.artifact.schema_min <= yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MAX;
-            intersection
-                .into_iter()
-                .filter(|capability| {
-                    capability != yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY
-                        || (bridge_ready && schema_supported)
-                })
-                .collect()
+            advertise_capabilities(intersection, bridge_ready && schema_supported)
         },
         schema_min: daemon.map_or(guardian.artifact.schema_min, |_| {
             guardian.artifact.schema_min
         }),
         schema_max: guardian.artifact.schema_max,
     }
+}
+
+/// Drops the foreground capability unless this runtime can actually honour it.
+///
+/// A capability is a promise, and this one promises that a registered root will be
+/// isolated from the worker watchdog. The guardian can only make that promise when
+/// its own build supports it, the private bridge is attached (so an install can
+/// reach the daemon at all), and the database can carry the foreground rows. Any
+/// one missing and a client that believed the advertisement would be refused at its
+/// first bind -- after it had already told the user delegation was available.
+///
+/// Split out from [`runtime_identity`] because it is a pure decision over two
+/// booleans, and the interesting cases ("bridge missing", "schema too new") should
+/// be testable without standing up a guardian.
+fn advertise_capabilities(capabilities: Vec<String>, foreground_ready: bool) -> Vec<String> {
+    capabilities
+        .into_iter()
+        .filter(|capability| {
+            capability != yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY
+                || foreground_ready
+        })
+        .collect()
 }
 
 /// Answers `ControlRequest::AuthorizeRoot`.
@@ -2864,4 +2880,55 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
         },
     };
     let _ = yi_agent_lifecycle::codec::write_frame(&mut stream, &response);
+}
+
+#[cfg(test)]
+mod foreground_root_lifecycle_capability_tests {
+    use super::advertise_capabilities;
+
+    fn capability() -> String {
+        yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY.to_string()
+    }
+
+    /// A runtime that cannot honour the promise must not make it.
+    ///
+    /// Without this the first `AuthorizeRoot` would be refused -- after the client
+    /// had already told the user delegation was available, which is the failure
+    /// mode that reads as "spawn_agent is broken".
+    #[test]
+    fn foreground_root_lifecycle_capability_is_withheld_without_a_bridge() {
+        let advertised = advertise_capabilities(vec!["lease.v1".into(), capability()], false);
+        assert_eq!(advertised, vec!["lease.v1".to_string()]);
+        assert!(
+            !advertised.contains(&capability()),
+            "a guardian with no bridge cannot install authority, so it must not promise it"
+        );
+    }
+
+    /// With the bridge attached and the schema readable, the capability is offered.
+    #[test]
+    fn foreground_root_lifecycle_capability_is_offered_when_ready() {
+        let advertised = advertise_capabilities(vec!["lease.v1".into(), capability()], true);
+        assert!(
+            advertised.contains(&capability()),
+            "a ready runtime must advertise the capability it can honour"
+        );
+        assert!(
+            advertised.contains(&"lease.v1".to_string()),
+            "advertising the foreground capability must not drop the others"
+        );
+    }
+
+    /// The filter touches only its own capability.
+    #[test]
+    fn foreground_root_lifecycle_capability_filter_is_not_a_blanket_denial() {
+        let advertised = advertise_capabilities(
+            vec!["lease.v1".into(), "switch.preview.v1".into(), capability()],
+            false,
+        );
+        assert_eq!(
+            advertised,
+            vec!["lease.v1".to_string(), "switch.preview.v1".to_string()]
+        );
+    }
 }
