@@ -11,8 +11,8 @@ use super::scheduler::AdmissionPriority;
 use super::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
     InheritedSandbox, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, TransitionResult,
-    WatchdogEvidence, WorkspaceLeaseId,
+    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskRole, TaskState, TimeoutKind,
+    TransitionResult, WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 use super::worker::{
@@ -138,6 +138,11 @@ pub struct AgentSupervisor {
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
+    /// Containers explicitly closed through the lifecycle API. Distinct from a
+    /// terminal `state`: this is the tombstone a plain attach/restart cannot
+    /// clear, and the only thing that stops new business messages reaching an
+    /// otherwise-open session.
+    closed_containers: std::collections::HashSet<TaskId>,
 }
 
 impl AgentSupervisor {
@@ -177,6 +182,7 @@ impl AgentSupervisor {
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
+            closed_containers: std::collections::HashSet::new(),
         }
     }
 
@@ -184,6 +190,83 @@ impl AgentSupervisor {
     pub fn with_max_direct_children(mut self, max_direct_children: usize) -> Self {
         self.max_direct_children = max_direct_children;
         self
+    }
+
+    /// A supervisor whose root is a session container.
+    ///
+    /// The root will not be started as a worker and its historical state will not
+    /// cascade; children it spawns are ordinary executions with the normal
+    /// budgets and depth rules.
+    pub fn new_session_container(root_session_id: RootSessionId) -> Self {
+        Self::new_session_container_with_objective(
+            root_session_id,
+            "Root session objective not specified.".into(),
+        )
+    }
+
+    pub fn new_session_container_with_objective(
+        root_session_id: RootSessionId,
+        objective: String,
+    ) -> Self {
+        let mut supervisor = Self::new_with_objective(root_session_id.clone(), objective);
+        let root_id = supervisor.root_task_id.clone();
+        supervisor
+            .tasks
+            .insert(root_id, AgentTask::new_session_container(root_session_id));
+        supervisor
+    }
+
+    /// Explicitly closes the container: cancels the live subtree and refuses new
+    /// work. Idempotent, and independent of any historical `TaskState`.
+    ///
+    /// This is the *only* place a session's open lifetime ends. A normal turn
+    /// end, a temporary detach or a daemon restart must not call it.
+    pub fn close_session_container(&mut self) -> Result<Vec<TaskId>, String> {
+        let root = self.root_task_id.clone();
+        if self
+            .tasks
+            .get(&root)
+            .map(|task| task.role() != TaskRole::SessionContainer)
+            != Some(false)
+        {
+            return Err("this supervisor's root is not a session container".into());
+        }
+        self.closed_containers.insert(root.clone());
+        let mut changed = Vec::new();
+        for id in self.collect_subtree(&root) {
+            if id == root {
+                continue;
+            }
+            let Some(task) = self.tasks.get_mut(&id) else {
+                continue;
+            };
+            if classify_terminal(task.state()) != TerminalKind::NonTerminal {
+                continue;
+            }
+            if let Some(worker) = self.workers.get(&id) {
+                worker.cancel();
+            }
+            let attempt_id = task.active_attempt_id().clone();
+            if task
+                .reduce(
+                    TaskEvent::CancelRequested {
+                        attempt_id,
+                        reason: CancelReason("session container was closed".into()),
+                    },
+                    chrono::Utc::now(),
+                )
+                .is_ok()
+            {
+                changed.push(id);
+            }
+        }
+        self.notify_update();
+        Ok(changed)
+    }
+
+    /// Whether this container is explicitly closed.
+    pub fn session_container_closed(&self) -> bool {
+        self.closed_containers.contains(&self.root_task_id)
     }
 
     pub fn from_recovered_root(
@@ -225,6 +308,7 @@ impl AgentSupervisor {
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
+            closed_containers: std::collections::HashSet::new(),
         }
     }
 
@@ -282,6 +366,7 @@ impl AgentSupervisor {
             pending_user_override_acks: Vec::new(),
             events: Vec::new(),
             updates,
+            closed_containers: std::collections::HashSet::new(),
         }
     }
 
@@ -1309,9 +1394,26 @@ impl AgentSupervisor {
         // classify_terminal, not is_terminal: recovery_required is terminal for
         // bookkeeping but parked and resumable, and a resumed parent keeps
         // spawning.
-        if let TerminalKind::Settled = classify_terminal(parent.state()) {
+        //
+        // A session container is exempt on purpose: its `state` describes the
+        // *last execution*, which may be stalled or completed long ago, while the
+        // container itself is still open. Its admission is decided by the daemon's
+        // binding/turn fence before this point; the role check here is the
+        // authoritative second half of that rule, not a replacement for it.
+        if execution_is_settled(parent) {
             return Err(SpawnError::ParentSettled {
                 state: task_state_label(parent.state()),
+            });
+        }
+        // An explicitly closed container is the one case where a role does *not*
+        // keep admitting: the tombstone outranks the historical state, and the
+        // daemon's admission check cannot be the only enforcement (the store's
+        // pre-check and this authoritative check must agree).
+        if parent.role() == TaskRole::SessionContainer
+            && self.closed_containers.contains(&parent_id)
+        {
+            return Err(SpawnError::ParentSettled {
+                state: "session_closed",
             });
         }
         let child_depth = parent
@@ -1408,7 +1510,16 @@ impl AgentSupervisor {
             .tasks
             .get(&recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
-        if recipient_task.state().is_terminal() {
+        // A container's historical terminal state is evidence about an old
+        // execution, not "this mailbox is gone". Only an execution's terminal
+        // state closes its mailbox; a closed container is refused by the daemon's
+        // admission check (and by `close_session_container` here).
+        if recipient_task.role() == TaskRole::Execution && recipient_task.state().is_terminal() {
+            return Err(MessageDeliveryError::RecipientTerminal);
+        }
+        if recipient_task.role() == TaskRole::SessionContainer
+            && self.closed_containers.contains(&recipient)
+        {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         let is_parent = self
@@ -1759,12 +1870,14 @@ impl AgentSupervisor {
     }
 
     pub fn start_task(&mut self, task_id: &TaskId) -> Result<(), String> {
-        let attempt_id = self
+        let task = self
             .tasks
             .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt_id()
-            .clone();
+            .ok_or_else(|| "task does not exist".to_string())?;
+        if task.role() == TaskRole::SessionContainer {
+            return Err("a session container does not run as a worker".into());
+        }
+        let attempt_id = task.active_attempt_id().clone();
         self.reduce_task(task_id, TaskEvent::AdmissionGranted { attempt_id })?;
         self.notify_update();
         Ok(())
@@ -1857,13 +1970,16 @@ impl AgentSupervisor {
     /// Creates a fresh attempt only after a terminal outcome, preserving the
     /// prior attempt's evidence for later user inspection.
     pub fn retry_task(&mut self, task_id: &TaskId) -> Result<super::task::TaskAttempt, String> {
-        if !self
+        let task = self
             .tasks
             .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .state()
-            .is_terminal()
-        {
+            .ok_or_else(|| "task does not exist".to_string())?;
+        if task.role() == TaskRole::SessionContainer {
+            // Re-delegation is a fresh binding/turn, never a re-run of the old
+            // execution and never a new worker attempt.
+            return Err("a session container is refreshed by a new turn, not a retry".into());
+        }
+        if !task.state().is_terminal() {
             return Err("retry requires a terminal task state".into());
         }
         // A cancelled worker may still have a handle until its asynchronous
@@ -1907,6 +2023,17 @@ impl AgentSupervisor {
         let Some(state) = self.tasks.get(task_id).map(|task| task.state().clone()) else {
             return Vec::new();
         };
+        // A container's state is a historical execution result. Cascading on it
+        // would kill children that the *open* session still owns — exactly the
+        // behaviour this feature removes. Explicit close cancels the subtree
+        // instead (`close_session_container`).
+        if self
+            .tasks
+            .get(task_id)
+            .is_some_and(|task| task.role() == TaskRole::SessionContainer)
+        {
+            return Vec::new();
+        }
         if classify_terminal(&state) != TerminalKind::Settled {
             return Vec::new();
         }
@@ -2039,6 +2166,15 @@ pub enum TerminalKind {
     NonTerminal,
     Settled,
     RecoveryRequired,
+}
+
+/// The single rule for "this task may not spawn because its execution ended".
+///
+/// A settled `Execution` is finished; a `SessionContainer` is not, however its
+/// last execution went. Keeping this in one function is what makes the store
+/// pre-check and this authoritative check agree instead of drifting.
+pub fn execution_is_settled(task: &AgentTask) -> bool {
+    task.role() == TaskRole::Execution && classify_terminal(task.state()) == TerminalKind::Settled
 }
 
 pub fn classify_terminal(state: &TaskState) -> TerminalKind {
@@ -2233,6 +2369,141 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn session_delegation_lifecycle_old_terminal_is_not_container_admission() {
+        let (session, root, attempt) = (RootSessionId::new(), TaskId::new(), AttemptId::new());
+        let mut historical = AgentTask::hydrated_review_task(
+            session,
+            root.clone(),
+            None,
+            super::super::task::TaskDepth::Root,
+            attempt.clone(),
+            1,
+            TaskState::Failed(TaskFailure::new("old failure")),
+        );
+        historical
+            .hydrate_session_role(TaskRole::SessionContainer)
+            .unwrap();
+        let mut supervisor =
+            AgentSupervisor::from_hydrated_review_root(historical, "old objective".into());
+        let child = supervisor.spawn(root.clone()).unwrap();
+        assert_eq!(supervisor.task(&child).unwrap().role(), TaskRole::Execution);
+        assert_eq!(
+            supervisor.task(&root).unwrap().active_attempt_id(),
+            &attempt
+        );
+        assert!(matches!(
+            supervisor.task(&root).unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        supervisor.close_session_container().unwrap();
+        assert!(supervisor.spawn(root).is_err());
+    }
+
+    #[test]
+    fn session_delegation_lifecycle_execution_stays_settled() {
+        for (label, state) in settled_states() {
+            let mut task = AgentTask::hydrated_review_task(
+                RootSessionId::new(),
+                TaskId::new(),
+                None,
+                super::super::task::TaskDepth::Root,
+                AttemptId::new(),
+                1,
+                state.clone(),
+            );
+            let mut supervisor =
+                AgentSupervisor::from_hydrated_review_root(task.clone(), "objective".into());
+            assert!(
+                supervisor.spawn(supervisor.root_task_id().clone()).is_err(),
+                "execution in {label} must not spawn"
+            );
+
+            task.hydrate_session_role(TaskRole::SessionContainer)
+                .unwrap();
+            let mut container =
+                AgentSupervisor::from_hydrated_review_root(task, "objective".into());
+            let root = container.root_task_id().clone();
+            let child = container
+                .spawn(root.clone())
+                .unwrap_or_else(|error| panic!("container in {label} must spawn: {error:?}"));
+            assert_eq!(
+                container.task(&child).unwrap().role(),
+                TaskRole::Execution,
+                "a container's child is always an execution"
+            );
+            // The historical outcome is preserved, not rewritten.
+            assert_eq!(container.task(&root).unwrap().state(), &state);
+        }
+    }
+
+    #[test]
+    fn session_delegation_lifecycle_container_close_cascades_and_is_idempotent() {
+        let mut supervisor = AgentSupervisor::new_session_container(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        assert_eq!(
+            supervisor.task(&root).unwrap().role(),
+            TaskRole::SessionContainer
+        );
+        let child = supervisor.spawn(root.clone()).unwrap();
+        supervisor.start_task(&child).unwrap();
+
+        let cancelled = supervisor.close_session_container().unwrap();
+        assert_eq!(cancelled, vec![child.clone()]);
+        assert!(matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::Cancelled(_)
+        ));
+        assert!(supervisor.session_container_closed());
+        assert_eq!(
+            supervisor.close_session_container().unwrap(),
+            Vec::<TaskId>::new()
+        );
+        assert!(supervisor.spawn(root.clone()).is_err());
+
+        // A delivery to a closed container is refused; the mailbox does not
+        // become a back door around the tombstone.
+        let draft = MailboxMessageDraft::new(
+            child.clone(),
+            root.clone(),
+            MessageKind::UserInstruction(UserInstruction("late work".into())),
+            None,
+        );
+        assert_eq!(
+            supervisor
+                .deliver_message(&child, draft, false)
+                .unwrap_err(),
+            MessageDeliveryError::RecipientTerminal
+        );
+    }
+
+    fn settled_states() -> Vec<(&'static str, TaskState)> {
+        vec![
+            ("completed", TaskState::Completed),
+            ("completed_no_changes", TaskState::CompletedNoChanges),
+            ("blocked", TaskState::Blocked(BlockReason("blocked".into()))),
+            (
+                "stalled",
+                TaskState::Stalled(WatchdogEvidence {
+                    last_meaningful_event_id: None,
+                    last_meaningful_at: chrono::Utc::now(),
+                    elapsed_secs: 309,
+                    current_wait: None,
+                }),
+            ),
+            ("timed_out", TaskState::TimedOut(TimeoutKind::WallClock)),
+            (
+                "budget_exhausted",
+                TaskState::BudgetExhausted(BudgetKind::Tokens),
+            ),
+            ("failed", TaskState::Failed(TaskFailure::new("failed"))),
+            (
+                "cancelled",
+                TaskState::Cancelled(CancelReason("cancelled".into())),
+            ),
+        ]
+    }
 
     #[test]
     fn set_workdir_binds_a_directory_to_the_root() {
