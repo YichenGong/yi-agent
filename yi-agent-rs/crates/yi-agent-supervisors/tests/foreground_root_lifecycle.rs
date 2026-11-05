@@ -360,6 +360,68 @@ fn answer_as_daemon(mut stream: std::os::unix::net::UnixStream) {
                     binding_epoch: epoch,
                 }
             }
+            // Recovery answers echo the nonce and report what this stand-in decided.
+            // A real daemon computes an impact or a status; this peer proves the
+            // *forwarding* path, so a fixed outcome is enough -- and it deliberately
+            // differs per operation so a test cannot pass by ignoring which frame it
+            // got.
+            BridgeFrame::Recovery(recovery) => {
+                use yi_agent_lifecycle::foreground::{
+                    BridgeRecovery, BridgeRecoveryAnswer, BridgeRecoveryOutcome, RecoveryImpact,
+                    RecoveryOperationStatus, RootRef,
+                };
+                let outcome = match recovery.as_ref() {
+                    BridgeRecovery::Inspect { expected, .. } => {
+                        BridgeRecoveryOutcome::Impact(RecoveryImpact {
+                            root: expected.root.clone(),
+                            stopped_execution_ids: Vec::new(),
+                            blocked_execution_ids: vec!["exec-blocked".into()],
+                            child_ids: vec!["task-child".into()],
+                            version: 7,
+                            reason: "stalled".into(),
+                        })
+                    }
+                    // The operation id decides the status, so a test that reads a
+                    // different operation than it prepared sees a different answer.
+                    BridgeRecovery::Prepare { request, .. } => {
+                        if request.operation_id == "conflict" {
+                            BridgeRecoveryOutcome::Failed(
+                                yi_agent_lifecycle::foreground::ForegroundErrorCode::OperationConflict,
+                            )
+                        } else {
+                            BridgeRecoveryOutcome::Status(Some(
+                                RecoveryOperationStatus::NeedsPreview,
+                            ))
+                        }
+                    }
+                    BridgeRecovery::Confirm { request, .. } => {
+                        BridgeRecoveryOutcome::Status(Some(RecoveryOperationStatus::Committed(
+                            yi_agent_lifecycle::foreground::RecoveryResult {
+                                operation_id: request.operation_id.clone(),
+                                previous: request.expected.root.clone(),
+                                successor: RootRef {
+                                    session_id: request.expected.root.session_id.clone(),
+                                    root_id: request.expected.root.root_id.clone(),
+                                    attempt_id: "attempt-successor".into(),
+                                },
+                                binding_epoch: 2,
+                                driver_epoch: 0,
+                            },
+                        )))
+                    }
+                    BridgeRecovery::Operation { operation_id, .. } => {
+                        if operation_id == "absent" {
+                            BridgeRecoveryOutcome::Status(None)
+                        } else {
+                            BridgeRecoveryOutcome::Status(Some(RecoveryOperationStatus::Preparing))
+                        }
+                    }
+                };
+                BridgeFrame::RecoveryAnswer(Box::new(BridgeRecoveryAnswer {
+                    nonce: recovery.nonce().to_string(),
+                    outcome,
+                }))
+            }
             _ => return,
         };
         epoch += 1;
@@ -546,8 +608,10 @@ fn foreground_root_lifecycle_an_expired_lease_is_refused_by_the_guardian() {
 
 #[test]
 fn foreground_root_lifecycle_recovery_requests_are_not_silently_successful() {
-    // Task 8 implements recovery. Until then the guardian must answer "no such
-    // operation" rather than a fabricated `Committed`, and must still require a lease.
+    // A client with a live lease asking about a root it never owned must be refused,
+    // not answered with "no such operation". The difference matters: `None` reads as
+    // "nothing happened here", which a shell would show as a safe state, while the
+    // truth is that this client has no business asking.
     let mut fixture = BridgeFixture::start();
     let root = RootRef {
         session_id: "session-1".to_string(),
@@ -563,8 +627,13 @@ fn foreground_root_lifecycle_recovery_requests_are_not_silently_successful() {
         })
         .unwrap()
     {
-        ControlResponse::RootRecovery(None) => {}
-        other => panic!("recovery must not report a result yet: {other:?}"),
+        ControlResponse::Rejected { code, .. } => {
+            assert_eq!(
+                code,
+                yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated
+            );
+        }
+        other => panic!("a foreign root must be refused, got {other:?}"),
     }
 }
 
@@ -692,5 +761,166 @@ trait Not {
 impl Not for bool {
     fn not(self) -> bool {
         !self
+    }
+}
+
+/// A fence naming the root a business authorize just minted.
+///
+/// The epochs are the ones the fixture's stand-in daemon reports, so the request a
+/// recovery carries describes the same binding the authorize established.
+fn fence_for(authorization: &RootAuthorization) -> yi_agent_lifecycle::foreground::ForegroundFence {
+    yi_agent_lifecycle::foreground::ForegroundFence {
+        root: RootRef {
+            session_id: "session-1".into(),
+            root_id: authorization.root_id.clone(),
+            attempt_id: "attempt-1".into(),
+        },
+        generation: authorization.daemon_instance_id.clone(),
+        binding_epoch: 1,
+        driver_epoch: 1,
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_inspect_is_forwarded_and_reports_the_impact() {
+    let mut fixture = BridgeFixture::start();
+    let intent = fixture.intent("bind-inspect");
+    let authorization = fixture.authorize_business(&intent).unwrap();
+    let expected = fence_for(&authorization);
+    let answer = fixture
+        .request(ControlRequest::InspectRootRecovery {
+            grant: fixture.business.clone(),
+            expected: expected.clone(),
+        })
+        .expect("the control channel answers");
+    let impact = match answer {
+        ControlResponse::RootRecoveryImpact(impact) => impact,
+        other => panic!("inspect was not answered with an impact: {other:?}"),
+    };
+    // The impact must describe *this* root: a forwarding path that forgot to carry
+    // the fence would report a different conversation's blocked set.
+    assert_eq!(impact.root.root_id, expected.root.root_id);
+    assert_eq!(
+        impact.blocked_execution_ids,
+        vec!["exec-blocked".to_string()]
+    );
+    assert_eq!(impact.child_ids, vec!["task-child".to_string()]);
+    assert_eq!(impact.version, 7);
+}
+
+#[test]
+fn foreground_root_lifecycle_a_recovery_of_somebody_elses_root_is_refused() {
+    // Two clients, one root. The second must not be able to inspect or repair a
+    // conversation it does not own, whatever lease it holds.
+    let mut fixture = BridgeFixture::start();
+    let intent = fixture.intent("bind-owned");
+    let authorization = fixture.authorize_business(&intent).unwrap();
+    let expected = fence_for(&authorization);
+    let other = register(
+        &fixture.socket,
+        "run-other",
+        ClientKind::App,
+        LeaseMode::Business,
+    );
+    let answer = fixture
+        .request(ControlRequest::InspectRootRecovery {
+            grant: other,
+            expected,
+        })
+        .expect("the control channel answers");
+    match answer {
+        ControlResponse::Rejected { code, .. } => {
+            assert_eq!(
+                code,
+                yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated
+            );
+        }
+        other => panic!("a foreign client must be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_recovery_statuses_round_trip_the_operation_id() {
+    let mut fixture = BridgeFixture::start();
+    let intent = fixture.intent("bind-statuses");
+    let authorization = fixture.authorize_business(&intent).unwrap();
+    let expected = fence_for(&authorization);
+
+    // Prepare answers with the status the daemon chose.
+    let prepared = fixture
+        .request(ControlRequest::PrepareRootRecovery {
+            grant: fixture.business.clone(),
+            request: yi_agent_lifecycle::foreground::RecoveryRequest {
+                expected: expected.clone(),
+                operation_id: "op-1".into(),
+            },
+        })
+        .expect("the control channel answers");
+    match prepared {
+        ControlResponse::RootRecovery(Some(
+            yi_agent_lifecycle::foreground::RecoveryOperationStatus::NeedsPreview,
+        )) => {}
+        other => panic!("prepare was not forwarded: {other:?}"),
+    }
+
+    // Confirm answers with the committed result, naming the successor attempt.
+    let confirmed = fixture
+        .request(ControlRequest::ConfirmRootRecovery {
+            grant: fixture.business.clone(),
+            request: yi_agent_lifecycle::foreground::RecoveryRequest {
+                expected: expected.clone(),
+                operation_id: "op-1".into(),
+            },
+            token: SecretCapability::new("confirmation-token"),
+        })
+        .expect("the control channel answers");
+    match confirmed {
+        ControlResponse::RootRecovery(Some(
+            yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(result),
+        )) => {
+            assert_eq!(result.operation_id, "op-1");
+            assert_eq!(result.successor.attempt_id, "attempt-successor");
+            assert_ne!(result.successor.attempt_id, expected.root.attempt_id);
+        }
+        other => panic!("confirm was not forwarded: {other:?}"),
+    }
+
+    // A read of an unknown operation is `None`, which is not a failure.
+    let absent = fixture
+        .request(ControlRequest::RootRecoveryOperation {
+            grant: fixture.business.clone(),
+            root: expected.root.clone(),
+            operation_id: "absent".into(),
+        })
+        .expect("the control channel answers");
+    match absent {
+        ControlResponse::RootRecovery(None) => {}
+        other => panic!("an unknown operation must read as absent, got {other:?}"),
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_a_daemon_refusal_reaches_the_caller_as_a_code() {
+    // The daemon's structured refusal must survive the bridge. Losing it would turn
+    // "this operation id is already used for something else" into a generic failure,
+    // and the shell would then advise a retry that cannot work.
+    let mut fixture = BridgeFixture::start();
+    let intent = fixture.intent("bind-refusal");
+    let authorization = fixture.authorize_business(&intent).unwrap();
+    let expected = fence_for(&authorization);
+    let answer = fixture
+        .request(ControlRequest::PrepareRootRecovery {
+            grant: fixture.business.clone(),
+            request: yi_agent_lifecycle::foreground::RecoveryRequest {
+                expected,
+                operation_id: "conflict".into(),
+            },
+        })
+        .expect("the control channel answers");
+    match answer {
+        ControlResponse::Rejected { code, .. } => {
+            assert_eq!(code, yi_agent_lifecycle::types::ControlErrorCode::Conflict);
+        }
+        other => panic!("a daemon refusal must be a rejection, got {other:?}"),
     }
 }

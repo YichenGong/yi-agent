@@ -430,6 +430,20 @@ impl ForegroundFixture {
         }
     }
 
+    /// Reads the impact a recovery would have, without freezing anything.
+    pub fn inspect_recovery(
+        &self,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryImpact, RuntimeCoordinatorError> {
+        self.coordinator
+            .inspect_foreground_recovery(&self.authorization(), &self.fence())
+    }
+
+    /// Whether the coordinator's in-memory gate has frozen this root.
+    pub fn is_frozen(&self) -> bool {
+        self.coordinator
+            .is_foreground_root_frozen_for_test(&self.root.to_string())
+    }
+
     /// Prepares a recovery through the coordinator.
     pub fn prepare_recovery(
         &self,

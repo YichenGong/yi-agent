@@ -367,6 +367,30 @@ impl ForegroundCommitGate {
             .contains(root)
     }
 
+    /// Enumerates one root's live slots without freezing or cancelling anything.
+    ///
+    /// The read-only twin of [`Self::freeze_root`], for the inspect step: it answers
+    /// "what would a freeze stop" so a user can see the impact before deciding. It
+    /// shares the enumeration order and the slot filter with `freeze_root` so the two
+    /// cannot describe different sets.
+    pub(crate) fn snapshot_root(&self, root: &RootId) -> FrozenSet {
+        let state = self.state.lock().expect("foreground gate mutex poisoned");
+        let mut snapshot = FrozenSet::default();
+        for (task, slot) in state.slots.iter() {
+            if &slot.root != root {
+                continue;
+            }
+            match slot.phase {
+                StartPhase::Starting => snapshot.starting.push(task.clone()),
+                StartPhase::Running => snapshot.running.push(task.clone()),
+                StartPhase::Stopped => {}
+            }
+        }
+        snapshot.starting.sort_by_key(|task| task.to_string());
+        snapshot.running.sort_by_key(|task| task.to_string());
+        snapshot
+    }
+
     /// Records that a slot's execution is over.
     ///
     /// A slot stopped while starting has its witness finished here, so a release

@@ -570,6 +570,35 @@ impl FrontendLease {
         })
     }
 
+    /// Reads what a recovery of this root would stop, without stopping anything.
+    ///
+    /// Split from [`Self::prepare_root_recovery`] because looking must not mutate:
+    /// the impact is what a user reads before deciding, and a read that froze the
+    /// root would stop the work being decided about.
+    pub fn inspect_root_recovery(
+        &self,
+        expected: &crate::foreground::ForegroundFence,
+        deadline: &Deadline,
+    ) -> io::Result<crate::foreground::RecoveryImpact> {
+        self.request_control(
+            types::ControlRequest::InspectRootRecovery {
+                grant: self.grant.clone(),
+                expected: expected.clone(),
+            },
+            deadline,
+        )
+        .and_then(|response| match response {
+            types::ControlResponse::RootRecoveryImpact(impact) => Ok(impact),
+            types::ControlResponse::Rejected { code, reason } => {
+                Err(refused("recovery inspection", code, &reason))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the control channel answered an inspect with {other:?}"),
+            )),
+        })
+    }
+
     /// Asks the daemon (through the guardian) to prepare a recovery.
     ///
     /// `Ok(None)` means the daemon has no record of this operation; every other

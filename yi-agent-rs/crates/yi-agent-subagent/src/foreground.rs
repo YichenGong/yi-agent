@@ -655,23 +655,19 @@ impl ForegroundRecoveryHost {
         yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5))
     }
 
-    /// Reads a recovery operation's stored state. Never freezes, never mutates.
+    /// Reads what a recovery of this root would stop. Never freezes, never mutates.
     ///
-    /// This is the honest meaning of "inspect": there is no separate preview IPC,
-    /// and freezing just to learn the impact would make a read destructive. What a
-    /// caller can show before committing is whatever the daemon already stored --
-    /// a `Blocked` answer carries the impact and its open stop gaps, `Ready` carries
-    /// the preview, and `NeedsPreview` says a restart dropped the token so it must be
-    /// prepared again under a valid authorization. `None` means no such operation.
+    /// This is the honest meaning of "inspect": the daemon's own read-only entry
+    /// reports the impact without writing a freeze row, so a host can show the user
+    /// what is at stake while the conversation keeps running. A caller that used
+    /// `prepare` for this would stop work the user had not yet agreed to stop.
     pub fn inspect(
         &mut self,
-        root: &RootRef,
-        operation_id: &str,
-    ) -> Result<
-        Option<yi_agent_lifecycle::foreground::RecoveryOperationStatus>,
-        ForegroundClientError,
-    > {
-        self.operation(root, operation_id)
+        expected: &yi_agent_lifecycle::foreground::ForegroundFence,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryImpact, ForegroundClientError> {
+        self.lease
+            .inspect_root_recovery(expected, &Self::deadline())
+            .map_err(|error| Self::classify("inspect", error))
     }
 
     /// The first mutating step: freeze, stop, and issue a token only if proven.

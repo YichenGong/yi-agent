@@ -448,6 +448,16 @@ pub enum ControlRequest {
         root: crate::foreground::RootRef,
         operation_id: String,
     },
+    /// Read what a recovery of this root would stop, without freezing anything.
+    ///
+    /// Split from [`Self::PrepareRootRecovery`] because looking must not stop work:
+    /// a user who opens the recovery panel and then walks away has not asked for
+    /// their conversation to be halted. `expected` is the fence the host believes is
+    /// current; the daemon refuses a stale one rather than describing another attempt.
+    InspectRootRecovery {
+        grant: ClientGrant,
+        expected: crate::foreground::ForegroundFence,
+    },
 }
 
 /// A narrow, owner-bound execution-admission question.
@@ -521,6 +531,13 @@ pub enum ControlResponse {
     /// The answer to the recovery requests. `None` means the daemon has no record of
     /// that operation, which is *not* the same as "no recovery happened".
     RootRecovery(Option<crate::foreground::RecoveryOperationStatus>),
+    /// The answer to [`ControlRequest::InspectRootRecovery`]: what a freeze would stop.
+    ///
+    /// Its own variant rather than a [`crate::foreground::RecoveryOperationStatus`]
+    /// because an impact is not a status: `Blocked` names a *reason a token is
+    /// withheld*, while an impact is what the user reads before deciding whether to
+    /// ask for one.
+    RootRecoveryImpact(crate::foreground::RecoveryImpact),
     /// The private channel was created; the descriptor travels beside this frame.
     ///
     /// Carrying the owner back is not a convenience: the client must build the

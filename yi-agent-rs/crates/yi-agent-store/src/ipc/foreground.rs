@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use yi_agent_lifecycle::foreground::{
-    AuthorityMessage, BridgeFrame, ForegroundErrorCode, RootAuthorityScope, RootBindIntent,
+    AuthorityMessage, BridgeFrame, BridgeRecoveryAnswer, BridgeRecoveryOutcome,
+    ForegroundErrorCode, RootAuthorityScope, RootBindIntent,
 };
 
 use crate::foreground::ForegroundError;
@@ -214,6 +215,19 @@ impl ForegroundBridge {
             | BridgeFrame::Committed { .. }
             | BridgeFrame::Denied { .. }
             | BridgeFrame::Refused { .. } => None,
+            // A recovery is answered by the coordinator, not here: the prepare half
+            // needs the in-memory confirmation table, which only the coordinator owns,
+            // and reaching it from inside this lock would re-enter the repository.
+            // `RuntimeCoordinator::serve_bridge_frame` peels these frames off before
+            // calling this method, so a frame that arrives here is one the caller
+            // bypassed that seam with.
+            BridgeFrame::Recovery(recovery) => Some(BridgeFrame::RecoveryAnswer(Box::new(
+                BridgeRecoveryAnswer {
+                    nonce: recovery.nonce().to_string(),
+                    outcome: BridgeRecoveryOutcome::Failed(ForegroundErrorCode::Unsupported),
+                },
+            ))),
+            BridgeFrame::RecoveryAnswer(_) => None,
         }
     }
 

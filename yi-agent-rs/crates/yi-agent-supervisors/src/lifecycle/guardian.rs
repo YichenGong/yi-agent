@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use yi_agent_lifecycle::deadline::Deadline;
+use yi_agent_lifecycle::foreground::{BridgeFrame, BridgeRecovery, BridgeRecoveryOutcome};
 use yi_agent_lifecycle::types::{
     ArtifactIdentity, ClientRunId, DaemonInstanceId, ManagedProcessId, RootId, RuntimeScope,
 };
@@ -1730,6 +1731,18 @@ impl Guardian {
     /// the daemon answered its ready barrier (see `start_daemon`), because a bridge to
     /// a process that is not serving would invite an install nobody can honour.
     /// Named like `serve_one_for_test` for the same reason: the suffix is the warning.
+    /// Installs the authorization ledger a test guardian authorizes in.
+    ///
+    /// Test entry only: production sets this inside `start_daemon` after the daemon
+    /// answered, because a ledger naming a daemon nobody started would mint
+    /// capabilities for a process that cannot check them.
+    pub fn authorizations_for_test(
+        &mut self,
+        ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
+    ) {
+        self.authorizations = Some(ledger);
+    }
+
     pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
         self.bridge = Some(bridge);
     }
@@ -2484,16 +2497,262 @@ fn serve_preview(
     ControlResponse::Preview(preview)
 }
 
+/// One recovery operation as the guardian forwards it.
+///
+/// Kept private: the wire shape is [`BridgeRecovery`], and this exists so the four
+/// control handlers can share one forwarding path instead of each spelling out the
+/// authorization lookup.
+enum RecoveryForward {
+    Inspect {
+        expected: yi_agent_lifecycle::foreground::ForegroundFence,
+    },
+    Prepare {
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+    },
+    Confirm {
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+        token: yi_agent_lifecycle::foreground::SecretCapability,
+    },
+    Operation {
+        root: yi_agent_lifecycle::foreground::RootRef,
+        operation_id: String,
+    },
+}
+
+impl RecoveryForward {
+    /// The root this operation is about, so the ownership check has one input.
+    fn root_id(&self) -> &str {
+        match self {
+            Self::Inspect { expected } => &expected.root.root_id,
+            Self::Prepare { request } | Self::Confirm { request, .. } => {
+                &request.expected.root.root_id
+            }
+            Self::Operation { root, .. } => &root.root_id,
+        }
+    }
+}
+
+/// Forwards one recovery operation to the daemon over the private bridge.
+///
+/// Two things happen here that no other layer can do:
+///
+/// 1. **Ownership.** The grant says which client is asking. The guardian's own table
+///    says which client owns the root. A different live client must not read or
+///    repair a conversation it does not own, so this refuses before the daemon is
+///    asked anything.
+/// 2. **Authorization material.** The daemon re-checks the *capability*, not the
+///    grant, so the guardian must hand it the authorization it minted for that
+///    (client, root) pair. `issue` is deterministic, so re-deriving it here yields
+///    the same secret the host already holds rather than a second one.
+///
+/// Returns the daemon's outcome, or the wire code and a whitelisted reason when the
+/// request never reached it.
+fn forward_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    forward: RecoveryForward,
+) -> Result<BridgeRecoveryOutcome, (yi_agent_lifecycle::types::ControlErrorCode, String)> {
+    use yi_agent_lifecycle::types::ControlErrorCode;
+
+    let root_id = forward.root_id().to_string();
+    // An unowned root is not an error the guardian can explain further: either the
+    // table never knew it (so recovery would be an unauthenticated takeover) or it is
+    // owned by somebody else.
+    let owner = guardian
+        .roots()
+        .grant(&root_id)
+        .map(|granted| granted.client_run_id.clone());
+    if owner.as_deref() != Some(grant.client_run_id.as_str()) {
+        return Err((
+            ControlErrorCode::Unauthenticated,
+            "this client does not own the root it asked to recover".to_string(),
+        ));
+    }
+    let authorization = {
+        let Some(ledger) = guardian.authorizations.as_mut() else {
+            return Err((
+                ControlErrorCode::Unsupported,
+                "this guardian started no daemon, so there is no generation to recover in"
+                    .to_string(),
+            ));
+        };
+        ledger
+            .issue(&grant.client_run_id, &root_id, grant.mode)
+            .map_err(|reason| (ControlErrorCode::Unauthenticated, reason))?
+    };
+    if guardian.bridge.is_none() {
+        return Err((
+            ControlErrorCode::Unsupported,
+            "this runtime has no authority bridge, so a recovery cannot be run here".to_string(),
+        ));
+    }
+    let nonce = super::root_authority::new_capability_nonce();
+    let recovery = match forward {
+        RecoveryForward::Inspect { expected } => BridgeRecovery::Inspect {
+            nonce: nonce.clone(),
+            authorization,
+            expected,
+        },
+        RecoveryForward::Prepare { request } => BridgeRecovery::Prepare {
+            nonce: nonce.clone(),
+            authorization,
+            request,
+        },
+        RecoveryForward::Confirm { request, token } => BridgeRecovery::Confirm {
+            nonce: nonce.clone(),
+            authorization,
+            request,
+            token,
+        },
+        RecoveryForward::Operation { root, operation_id } => BridgeRecovery::Operation {
+            nonce: nonce.clone(),
+            authorization,
+            root,
+            operation_id,
+        },
+    };
+    let sent = BridgeFrame::Recovery(Box::new(recovery));
+    let answer = guardian
+        .round_trip(&sent)
+        .map_err(|error| (ControlErrorCode::Internal, error.to_string()))?
+        .ok_or_else(|| {
+            (
+                ControlErrorCode::Internal,
+                "the daemon did not answer the recovery in time".to_string(),
+            )
+        })?;
+    // The nonce check is what keeps one request's answer from answering another: the
+    // bridge is one stream, and a late frame from a timed-out request would otherwise
+    // be handed to the next caller.
+    let outcome = match answer {
+        BridgeFrame::RecoveryAnswer(answer) if answer.nonce == nonce => answer.outcome,
+        BridgeFrame::RecoveryAnswer(answer) => {
+            return Err((
+                ControlErrorCode::Internal,
+                format!(
+                    "the daemon answered a different recovery (asked {nonce}, got {})",
+                    answer.nonce
+                ),
+            ));
+        }
+        other => {
+            return Err((
+                ControlErrorCode::Internal,
+                format!("the daemon answered a recovery with {other:?}"),
+            ));
+        }
+    };
+    // A structured refusal is carried as a code, not as a string: the shell switches
+    // on the code to decide whether a retry is meaningful, and `Conflict` (this
+    // operation id already describes different work) must never look retryable.
+    match outcome {
+        BridgeRecoveryOutcome::Failed(code) => Err((
+            recovery_code_to_control(code),
+            recovery_code_to_reason(code).to_string(),
+        )),
+        outcome => Ok(outcome),
+    }
+}
+
+/// Maps a forwarded foreground failure onto the control channel's taxonomy.
+///
+/// Two enums because the control channel predates the foreground codes. The mapping
+/// is by kind, not by message: `StopUnproven` and `ConfirmationRequired` are both
+/// "not yet", while `OperationConflict` is "this cannot succeed as asked".
+fn recovery_code_to_control(
+    code: yi_agent_lifecycle::foreground::ForegroundErrorCode,
+) -> yi_agent_lifecycle::types::ControlErrorCode {
+    use yi_agent_lifecycle::foreground::ForegroundErrorCode as From;
+    use yi_agent_lifecycle::types::ControlErrorCode as To;
+    match code {
+        From::Unsupported => To::Unsupported,
+        From::AuthorityDenied | From::RecoveryAuthorityMissing => To::Unauthenticated,
+        From::AdmissionClosed | From::RecoveryRequired => To::Released,
+        From::StaleAttempt | From::StaleDriver => To::StaleEpoch,
+        From::OperationConflict | From::SequenceConflict => To::Conflict,
+        From::InvalidActivity | From::CorruptBinding => To::Internal,
+        From::ConfirmationRequired | From::ConfirmationExpired | From::StopUnproven => {
+            To::InvalidRequest
+        }
+    }
+}
+
+/// The whitelisted reason that accompanies a forwarded failure.
+///
+/// Fixed phrases only: this string crosses into the shell, and free-form error text
+/// has carried paths and secrets before.
+fn recovery_code_to_reason(
+    code: yi_agent_lifecycle::foreground::ForegroundErrorCode,
+) -> &'static str {
+    use yi_agent_lifecycle::foreground::ForegroundErrorCode as Code;
+    match code {
+        Code::Unsupported => "this runtime cannot run a foreground recovery",
+        Code::AuthorityDenied | Code::RecoveryAuthorityMissing => {
+            "no authorization for this root is available here"
+        }
+        Code::AdmissionClosed | Code::RecoveryRequired => {
+            "the root is closed to new work until it is recovered"
+        }
+        Code::StaleAttempt => "the root has moved on; inspect it again",
+        Code::StaleDriver => "a different driver holds this root now",
+        Code::InvalidActivity => "the activity update was rejected",
+        Code::SequenceConflict => "another update got there first",
+        Code::StopUnproven => "an execution under this root is not proven stopped",
+        Code::ConfirmationRequired => "this recovery needs a confirmation first",
+        Code::ConfirmationExpired => "the confirmation expired; prepare the recovery again",
+        Code::OperationConflict => {
+            "this operation id already describes different work; use a new one"
+        }
+        Code::CorruptBinding => "the stored binding for this root is inconsistent",
+    }
+}
+
+/// Answers `ControlRequest::InspectRootRecovery`.
+///
+/// The host asks what a freeze would stop before committing to one, so this must be
+/// read-only all the way down: the guardian checks the lease and forwards, and the
+/// daemon's inspect writes no freeze row.
+fn serve_inspect_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    expected: &yi_agent_lifecycle::foreground::ForegroundFence,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Inspect {
+            expected: expected.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Impact(impact) => ControlResponse::RootRecoveryImpact(impact),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered an inspect with {other:?}"),
+            },
+        },
+    )
+}
+
 /// Answers `ControlRequest::PrepareRootRecovery`.
 ///
-/// Task 8 implements the freeze/stop/preview transaction. Until then the honest answer
-/// is `Unsupported`: this build must not claim a preview it did not compute, and a
-/// client that sees `Unsupported` knows to stay on the old path rather than waiting for
-/// a token that will never arrive.
+/// The freeze/stop/preview transaction itself lives in the daemon; this handler's job
+/// is the part only the guardian can do: prove the asking client holds a live lease and
+/// owns (or may recover) the root, then carry the daemon's answer back unmodified.
 fn serve_prepare_root_recovery(
     guardian: &mut Guardian,
     grant: &yi_agent_lifecycle::types::ClientGrant,
-    _request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    request: &yi_agent_lifecycle::foreground::RecoveryRequest,
 ) -> yi_agent_lifecycle::types::ControlResponse {
     use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
     let now = lease_now();
@@ -2503,15 +2762,31 @@ fn serve_prepare_root_recovery(
             reason,
         };
     }
-    ControlResponse::RootRecovery(None)
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Prepare {
+            request: request.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered a prepare with {other:?}"),
+            },
+        },
+    )
 }
 
-/// Answers `ControlRequest::ConfirmRootRecovery`. Behaviour lands in Task 8.
+/// Answers `ControlRequest::ConfirmRootRecovery`.
 fn serve_confirm_root_recovery(
     guardian: &mut Guardian,
     grant: &yi_agent_lifecycle::types::ClientGrant,
-    _request: &yi_agent_lifecycle::foreground::RecoveryRequest,
-    _token: &yi_agent_lifecycle::foreground::SecretCapability,
+    request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    token: &yi_agent_lifecycle::foreground::SecretCapability,
 ) -> yi_agent_lifecycle::types::ControlResponse {
     use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
     let now = lease_now();
@@ -2521,15 +2796,32 @@ fn serve_confirm_root_recovery(
             reason,
         };
     }
-    ControlResponse::RootRecovery(None)
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Confirm {
+            request: request.clone(),
+            token: token.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered a confirm with {other:?}"),
+            },
+        },
+    )
 }
 
-/// Answers `ControlRequest::RootRecoveryOperation`. Behaviour lands in Task 8.
+/// Answers `ControlRequest::RootRecoveryOperation`.
 fn serve_root_recovery_operation(
     guardian: &mut Guardian,
     grant: &yi_agent_lifecycle::types::ClientGrant,
-    _root: &yi_agent_lifecycle::foreground::RootRef,
-    _operation_id: &str,
+    root: &yi_agent_lifecycle::foreground::RootRef,
+    operation_id: &str,
 ) -> yi_agent_lifecycle::types::ControlResponse {
     use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
     let now = lease_now();
@@ -2539,7 +2831,24 @@ fn serve_root_recovery_operation(
             reason,
         };
     }
-    ControlResponse::RootRecovery(None)
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Operation {
+            root: root.clone(),
+            operation_id: operation_id.to_string(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered an operation read with {other:?}"),
+            },
+        },
+    )
 }
 
 /// Answers `ControlRequest::PreviewPage`: more rows, never a token.
@@ -2799,7 +3108,18 @@ pub fn serve_with_bridge_for_test(
     bridge: std::os::unix::net::UnixStream,
 ) -> io::Result<()> {
     let generation = format!("guardian-{}", std::process::id());
+    // The ledger is what names a generation to authorize in, and a guardian without
+    // one cannot mint a root capability at all. Production installs it only after the
+    // daemon answered its ready barrier; this entry stands in for that daemon, so it
+    // installs one up front -- otherwise every recovery test would be asserting
+    // against "this guardian started no daemon" instead of the forwarding it exists
+    // to prove.
+    let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.key.clone(),
+        generation.clone(),
+    );
     let mut guardian = Guardian::new(scope, selected, generation);
+    guardian.authorizations_for_test(ledger);
     guardian.attach_bridge_for_test(bridge);
     serve_control_loop(&mut guardian, shutdown)
 }
@@ -3125,6 +3445,9 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             root,
             operation_id,
         } => serve_root_recovery_operation(guardian, &grant, &root, &operation_id),
+        ControlRequest::InspectRootRecovery { grant, expected } => {
+            serve_inspect_root_recovery(guardian, &grant, &expected)
+        }
         ControlRequest::OpenManagedChannel { grant } => {
             // Answered here rather than as a plain `ControlResponse`, because the
             // answer is a *descriptor*: it must travel beside the frame, and the

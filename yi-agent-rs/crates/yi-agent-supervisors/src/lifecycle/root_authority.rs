@@ -277,7 +277,7 @@ fn is_timeout(error: &std::io::Error) -> bool {
     )
 }
 
-fn new_capability_nonce() -> String {
+pub(crate) fn new_capability_nonce() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -526,7 +526,10 @@ impl Guardian {
     /// `Ok(None)` means nothing arrived in time. The stream stays attached: one
     /// silent peer is a failed request, not a reason to tear down a bridge that other
     /// requests may still use.
-    fn round_trip(&mut self, frame: &BridgeFrame) -> std::io::Result<Option<BridgeFrame>> {
+    pub(crate) fn round_trip(
+        &mut self,
+        frame: &BridgeFrame,
+    ) -> std::io::Result<Option<BridgeFrame>> {
         let Some(stream) = self.bridge.as_mut() else {
             return Ok(None);
         };
@@ -685,7 +688,11 @@ pub fn answer(
         | BridgeFrame::Refused { .. }
         | BridgeFrame::Prepare { .. }
         | BridgeFrame::Committed { .. }
-        | BridgeFrame::Denied { .. } => None,
+        | BridgeFrame::Denied { .. }
+        // Recovery frames travel guardian -> daemon and are answered there; a daemon
+        // asking the guardian to answer one is confused.
+        | BridgeFrame::Recovery(_)
+        | BridgeFrame::RecoveryAnswer(_) => None,
     }
 }
 

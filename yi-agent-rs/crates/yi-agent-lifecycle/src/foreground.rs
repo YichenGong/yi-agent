@@ -239,6 +239,91 @@ pub enum BridgeFrame {
         nonce: String,
         reason: AuthorityRefusal,
     },
+    /// Guardian -> daemon: run one recovery control operation for a root.
+    ///
+    /// Recovery reaches the daemon over this bridge rather than the business socket
+    /// because the freeze/stop/commit transaction must be driven by the party that
+    /// checked the lease. The frame carries the guardian's own authorization for the
+    /// root, so the daemon re-checks the capability it installed instead of trusting a
+    /// "the guardian said yes" flag.
+    Recovery(Box<BridgeRecovery>),
+    /// Daemon -> guardian: the answer to one [`Self::Recovery`] frame.
+    ///
+    /// A separate frame from [`Self::Committed`] on purpose: a recovery is not a
+    /// binding, so reusing the install answer would let a reader mistake "the root was
+    /// recovered" for "authority was installed".
+    RecoveryAnswer(Box<BridgeRecoveryAnswer>),
+}
+
+/// One recovery control operation, as the private bridge carries it.
+///
+/// Every variant carries the authorization the guardian minted for the root. That is
+/// the same secret the host presented, so the daemon's `ensure_foreground_authority`
+/// is the only gate -- there is no variant that says "trust me".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeRecovery {
+    /// Read what a freeze would stop, without freezing anything.
+    Inspect {
+        nonce: String,
+        authorization: crate::types::RootAuthorization,
+        expected: ForegroundFence,
+    },
+    /// Freeze and stop, then report whether a confirmation may be issued.
+    Prepare {
+        nonce: String,
+        authorization: crate::types::RootAuthorization,
+        request: RecoveryRequest,
+    },
+    /// Commit a prepared recovery with the token the prepare returned.
+    Confirm {
+        nonce: String,
+        authorization: crate::types::RootAuthorization,
+        request: RecoveryRequest,
+        token: SecretCapability,
+    },
+    /// Read one operation's stored status.
+    Operation {
+        nonce: String,
+        authorization: crate::types::RootAuthorization,
+        root: RootRef,
+        operation_id: String,
+    },
+}
+
+impl BridgeRecovery {
+    /// The nonce this operation is answered under.
+    pub fn nonce(&self) -> &str {
+        match self {
+            Self::Inspect { nonce, .. }
+            | Self::Prepare { nonce, .. }
+            | Self::Confirm { nonce, .. }
+            | Self::Operation { nonce, .. } => nonce,
+        }
+    }
+}
+
+/// What the daemon answers one [`BridgeRecovery`] with.
+///
+/// The error arm carries a wire code rather than an `io::Error`: this crosses a
+/// process boundary, and the reason text has leaked paths before. `Inspect` answers
+/// with an impact in the same `Ok` arm as a status so a reader cannot mistake one for
+/// the other -- the variant of the operation says which shape `Ok` holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeRecoveryAnswer {
+    pub nonce: String,
+    pub outcome: BridgeRecoveryOutcome,
+}
+
+/// The two shapes a recovery answer can take.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeRecoveryOutcome {
+    /// The answer to [`BridgeRecovery::Inspect`].
+    Impact(RecoveryImpact),
+    /// The answer to `Prepare`, `Confirm` and `Operation`. `None` means the daemon has
+    /// no record of that operation, which is not the same as "no recovery happened".
+    Status(Option<RecoveryOperationStatus>),
+    /// The operation could not run, for a whitelisted reason.
+    Failed(ForegroundErrorCode),
 }
 
 /// Why the guardian declined to answer a challenge.

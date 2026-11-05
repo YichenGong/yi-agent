@@ -5432,6 +5432,48 @@ async fn foreground_root_lifecycle_release_tracks_committed_pending_start() {
     fixture.assert_no_started_workers();
 }
 
+/// Looking at a recovery must not perform it.
+///
+/// The inspect step exists so a user can read the impact before deciding, which means
+/// it must be observationally inert: no freeze, no stopped executions, no token. A
+/// version that froze while inspecting would stop the very conversation the user was
+/// still deciding whether to repair.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_inspect_reports_the_impact_without_freezing() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let starts = fixture.worker_start_count();
+    let count = fixture.attempt_count();
+
+    let impact = fixture
+        .inspect_recovery()
+        .expect("a stalled root is inspectable");
+    assert_eq!(impact.root.root_id, fixture.fence().root.root_id);
+    assert!(
+        !fixture.is_frozen(),
+        "inspecting must leave the root unfrozen: freezing stops the conversation"
+    );
+    // Nothing was repaired: the inspect reports what *would* stop, it does not stop it.
+    assert_eq!(
+        fixture.attempt_count(),
+        count,
+        "inspect creates no successor"
+    );
+    assert_eq!(
+        fixture.worker_start_count(),
+        starts,
+        "inspect restarts nothing"
+    );
+    // The preparation still works afterwards: an inspect that consumed the one
+    // allowed freeze would make the following prepare fail.
+    match fixture.prepare_recovery("recover-after-inspect").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => {
+            assert!(preview.confirmation_token.is_some());
+        }
+        other => panic!("prepare after inspect must still be ready, got {other:?}"),
+    }
+}
+
 /// A stalled root can be repaired exactly once, and the repair leaves no scar.
 ///
 /// The assertions are the spec's C9 in one place: one successor, the old attempt's
