@@ -721,7 +721,7 @@ fn foreground_root_lifecycle_a_silent_bridge_times_out_instead_of_hanging() {
     // send, and nothing answers.
     let business = register(&socket, "run-silent", ClientKind::App, LeaseMode::Business);
     let started = Instant::now();
-    let error = ask(
+    let answer = ask(
         &socket,
         &ControlRequest::AuthorizeRoot {
             grant: business,
@@ -733,20 +733,38 @@ fn foreground_root_lifecycle_a_silent_bridge_times_out_instead_of_hanging() {
                 previous_root_capability: None,
             },
         },
-    )
-    .expect_err("a silent bridge must not authorize anything");
+    );
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(6),
         "the exchange must end inside the budget, took {elapsed:?}"
     );
-    assert!(
-        matches!(
-            error.kind(),
-            io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+
+    // Two shapes are both correct, and which one arrives is genuinely racy:
+    //
+    // - the guardian gives up on the bridge first and answers `Rejected` (this is
+    //   the newer, better shape: the caller learns *why*, and the control loop
+    //   stays up);
+    // - the client's own `CONTROL_REQUEST_TIMEOUT` expires first and the call
+    //   returns a transport error.
+    //
+    // Both budgets are 2.0s, so pinning one shape makes the test a coin flip that
+    // lands differently under `cargo test` (in-process) and nextest (one process
+    // per test). What must hold either way: it ends inside the budget and it
+    // never authorizes anything.
+    match answer {
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+            ),
+            "expected a bounded refusal, got {error:?}"
         ),
-        "expected a bounded refusal, got {error:?}"
-    );
+        Ok(ControlResponse::Rejected { .. }) | Ok(ControlResponse::Unsupported { .. }) => {}
+        Ok(other) => panic!("a silent bridge must not authorize anything, got {other:?}"),
+    }
     stop.store(true, Ordering::SeqCst);
     let _ = std::os::unix::net::UnixStream::connect(&socket);
     let _ = server.join();
