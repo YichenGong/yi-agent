@@ -155,8 +155,29 @@ describe("sideInputPolicy: opening a side", () => {
     expect(decision.reason).toContain("不支持");
   });
 
-  it("refuses to open on a read-only device", () => {
-    const decision = sideInputPolicy(base({ canControl: false, text: "/side" }));
+  it("lets a read-only device view an existing side with a bare /side", () => {
+    // 无参 `/side` 在 Observe 上是「查看已有旁问」：只 list + readItems，
+    // 不创建 runner、不提问，所以不该被权限挡住（spec §4.3）。
+    expect(
+      sideInputPolicy(base({ canControl: false, text: "/side" })),
+    ).toEqual({ action: "executeSideCommand", command: { kind: "open", question: "" } });
+    expect(
+      sideInputPolicy(base({ canControl: false, text: "/btw  " })).action,
+    ).toBe("executeSideCommand");
+  });
+
+  it("refuses to ask a question from a read-only device", () => {
+    const decision = sideInputPolicy(
+      base({ canControl: false, text: "/btw why is it slow?" }),
+    );
+    expect(decision.action).toBe("blocked");
+    expect(decision.reason).toContain("只能查看");
+  });
+
+  it("refuses a question from a read-only device even without extra words", () => {
+    const decision = sideInputPolicy(
+      base({ canControl: false, text: "/side ping" }),
+    );
     expect(decision.action).toBe("blocked");
     expect(decision.reason).toContain("只读");
   });
@@ -227,10 +248,19 @@ describe("sideInputPolicy: side view", () => {
     expect(decision.action).toBe("blocked");
   });
 
-  it("refuses /side-close when no side is open", () => {
-    expect(sideInputPolicy(base({ view: "main", text: "/side-close" })).action).toBe(
-      "blocked",
-    );
+  it("allows /side-close from the main view for a Control device", () => {
+    // 主视图也能关掉后台旁问：旁支只在视图里显示，不该成为「必须先进入」的
+    // 前提。没有旁问时由执行方给幂等提示，而不是在这里预先拒绝。
+    expect(
+      sideInputPolicy(base({ view: "main", text: "/side-close" })),
+    ).toEqual({ action: "executeSideCommand", command: { kind: "close" } });
+  });
+
+  it("refuses /side-close from the main view on a read-only device", () => {
+    expect(
+      sideInputPolicy(base({ view: "main", canControl: false, text: "/side-close" }))
+        .action,
+    ).toBe("blocked");
   });
 
   it("still allows /back from the main view as a no-op command", () => {

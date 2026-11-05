@@ -484,10 +484,39 @@ describe("SideSyncController.submit", () => {
   it("retries uncertain submission with the same request id", async () => {
     const f = await synced();
     f.rpc.mockRejectedValueOnce(new Error("disconnected"));
-    await f.controller.submit(SIDE, "question", REQ_UUID);
-    const pending = f.store.read(f.hostKey, SIDE)!.pending!;
-    expect(pending.state).toBe("uncertain");
-    expect(pending.requestId).toBe(REQ_UUID);
+    const receipt = await f.controller.submit(SIDE, "question", REQ_UUID);
+    // 应答丢了不是失败：既不能清稿，也不能让调用方以为可以换个 id 重发。
+    expect(receipt).toEqual({ kind: "uncertain", requestId: REQ_UUID });
+    const view = f.store.read(f.hostKey, SIDE)!;
+    expect(view.pending!.state).toBe("uncertain");
+    expect(view.pending!.requestId).toBe(REQ_UUID);
+    expect(view.draft).toBe("question");
+  });
+
+  it("does not touch a newer generation when a stale reply lands", async () => {
+    const f = await synced();
+    f.store.setDraft(f.hostKey, SIDE, "old question");
+    let reject!: (e: unknown) => void;
+    f.rpc.mockImplementationOnce(
+      () =>
+        new Promise((_, rej) => {
+          reject = rej;
+        }),
+    );
+    const submitting = f.controller.submit(SIDE, "old question", REQ_UUID);
+    await flush();
+    // 期间宿主给了一条全新旁支（新一代）。
+    f.deliver(itemUpdated(1, agentItem("fresh", "n1"), 2));
+    f.store.setDraft(f.hostKey, SIDE, "new generation draft");
+    reject({ code: -32602, message: "invalid params" });
+    const receipt = await submitting;
+    expect(receipt.kind).toBe("rejected");
+    const view = f.store.read(f.hostKey, SIDE)!;
+    // 上一代的拒绝不得写进新一代：不能还回旧稿，也不能留下旧的拒绝记录。
+    expect(view.generation).toBe(2);
+    expect(view.draft).toBe("new generation draft");
+    expect(view.rejectedSubmission).toBeNull();
+    expect(view.pending).toBeNull();
   });
 
   it("clears the pending submission once accepted", async () => {
@@ -499,26 +528,103 @@ describe("SideSyncController.submit", () => {
   it("restores the question text when the server rejects it outright", async () => {
     const f = await synced();
     f.rpc.mockRejectedValueOnce({ code: -32602, message: "invalid params" });
-    await expect(f.controller.submit(SIDE, "kept question", REQ_UUID)).rejects.toBeTruthy();
+    const receipt = await f.controller.submit(SIDE, "kept question", REQ_UUID);
+    // 明确拒绝要回一句能读的原因，而不是把 RPC 对象丢给 UI（`[object Object]`）。
+    expect(receipt).toEqual({
+      kind: "rejected",
+      requestId: REQ_UUID,
+      message: "invalid params",
+    });
     const view = f.store.read(f.hostKey, SIDE)!;
     expect(view.pending).toBeNull();
     expect(view.draft).toBe("kept question");
+    expect(view.rejectedSubmission).toBeNull();
   });
 
-  it("does not overwrite newer edits when restoring a rejected question", async () => {
+  it("keeps the newer draft and records the rejected one separately", async () => {
     const f = await synced();
     f.store.setDraft(f.hostKey, SIDE, "brand new edit");
     f.rpc.mockRejectedValueOnce({ code: -32602, message: "invalid params" });
-    await expect(f.controller.submit(SIDE, "old question", REQ_UUID)).rejects.toBeTruthy();
-    expect(f.store.read(f.hostKey, SIDE)!.draft).toBe("brand new edit");
+    const receipt = await f.controller.submit(SIDE, "old question", REQ_UUID);
+    expect(receipt.kind).toBe("rejected");
+    const view = f.store.read(f.hostKey, SIDE)!;
+    // 用户正在写的东西不能被一次失败的旧提交覆盖。
+    expect(view.draft).toBe("brand new edit");
+    expect(view.rejectedSubmission).toEqual({
+      requestId: REQ_UUID,
+      text: "old question",
+      message: "invalid params",
+    });
   });
 
-  it("refuses to submit before the view is synced", async () => {
+  it("refuses to submit before the view is synced without touching the store", async () => {
     const f = makeSideSyncFixture({ list: listResult([{ side_id: SIDE, generation: 1, last_seq: 0 }]) });
     await f.controller.reconcile(PARENT);
+    f.store.setDraft(f.hostKey, SIDE, "q");
     f.store.setSync(f.hostKey, SIDE, "unsynced");
-    await expect(f.controller.submit(SIDE, "q", REQ_UUID)).rejects.toBeTruthy();
+    const receipt = await f.controller.submit(SIDE, "q", REQ_UUID);
+    // 请求没发出去：调用方留着原稿、提示重试即可。
+    expect(receipt.kind).toBe("rejected");
     expect(methodsOf(f)).not.toContain("side/turnStart");
+    const view = f.store.read(f.hostKey, SIDE)!;
+    expect(view.pending).toBeNull();
+    expect(view.draft).toBe("q");
+  });
+
+  it("reports acceptance without clearing a draft the user has reworded", async () => {
+    const f = await synced();
+    f.store.setDraft(f.hostKey, SIDE, "question");
+    // 让 turnStart 停在半路：回包之前用户改了草稿，又改回同一段文字。
+    let release!: () => void;
+    f.rpc.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ turn_id: "turn-1" });
+        }),
+    );
+    const submitting = f.controller.submit(SIDE, "question", REQ_UUID);
+    await flush();
+    f.store.setDraft(f.hostKey, SIDE, "something else");
+    f.store.setDraft(f.hostKey, SIDE, "question");
+    release();
+    const receipt = await submitting;
+    expect(receipt).toEqual({ kind: "accepted", requestId: REQ_UUID });
+    const view = f.store.read(f.hostKey, SIDE)!;
+    // 文字回到原文，但版本变了两次：这一次清稿的条件不成立。
+    expect(view.draft).toBe("question");
+    expect(view.pending).toBeNull();
+  });
+
+  it("clears the draft when it is still exactly what was submitted", async () => {
+    const f = await synced();
+    f.store.setDraft(f.hostKey, SIDE, "question");
+    const receipt = await f.controller.submit(SIDE, "question", REQ_UUID);
+    expect(receipt.kind).toBe("accepted");
+    const view = f.store.read(f.hostKey, SIDE)!;
+    expect(view.draft).toBe("");
+    expect(view.pending).toBeNull();
+  });
+
+  it("installs an automatic first question as the draft it will clear", async () => {
+    const f = await synced();
+    // 空旁支的自动首问：正文不是从输入框来的，也得先落进草稿。
+    await f.controller.submit(SIDE, "why slow?", REQ_UUID);
+    const view = f.store.read(f.hostKey, SIDE)!;
+    expect(view.draft).toBe("");
+    expect(view.draftVersion).toBeGreaterThan(0);
+  });
+
+  it("keeps a rejected automatic first question and its reason", async () => {
+    const f = await synced();
+    f.rpc.mockRejectedValueOnce({ code: -32031, message: "side_not_found" });
+    const receipt = await f.controller.submit(SIDE, "auto question", REQ_UUID);
+    expect(receipt).toEqual({
+      kind: "rejected",
+      requestId: REQ_UUID,
+      message: "side_not_found",
+    });
+    // 失败的首问留在旁问待发送草稿里，重新进来还能看见并重发。
+    expect(f.store.read(f.hostKey, SIDE)!.draft).toBe("auto question");
   });
 
   it("confirms an uncertain submission via accepted_requests", async () => {
@@ -605,6 +711,34 @@ describe("SideSyncController.setVisible", () => {
       f.controller.setVisible(PARENT);
       await vi.advanceTimersByTimeAsync(5100);
       expect(f.store.read(f.hostKey, SIDE)!.closed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("SideSyncController re-entering a side after a reconnect", () => {
+  it("catches up a lost tail frame without anyone re-entering the view", async () => {
+    // 场景：用户在旁支里，连接断了又回来（控制器重建），期间最后一帧丢了。
+    // 新控制器在**创建时**就被告知可见，所以推进 5 秒后应当发现 last_seq 变化
+    // 并触发全量对账——不需要用户再点一次旁支。
+    vi.useFakeTimers();
+    try {
+      const f = makeSideSyncFixture();
+      await f.controller.reconcile(PARENT);
+      // 服务端已经多了一帧，而本地没收到。
+      f.rpc.mockImplementation(async (method: string) => {
+        if (method === "side/list") {
+          return listResult([{ side_id: SIDE, generation: 1, last_seq: 7 }]);
+        }
+        if (method === "side/readItems") return page({ snapshot_seq: 7 });
+        return {};
+      });
+      // 新控制器一创建就可见（`useSideConversation` 会立刻 setVisible）。
+      f.controller.setVisible(PARENT);
+      await vi.advanceTimersByTimeAsync(5100);
+      const reads = methodsOf(f).filter((m) => m === "side/readItems").length;
+      expect(reads).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
     }
