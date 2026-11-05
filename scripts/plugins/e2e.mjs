@@ -269,6 +269,15 @@ export function assembleReport({ buildKind, suite, results, capabilities = {}, n
     if (verdict === "unsupported") {
       entry.reason = result.executorUnsupported ?? result.reason ?? unsupportedReason(result.caseSpec);
     }
+    // fail 同样要写原因。PASS/UNSUPPORTED 之外留空的报告会把「为什么红」这件事
+    // 丢掉，等于让人凭猜去修。
+    if (verdict === "fail") {
+      entry.reason =
+        result.reason ??
+        (result.caseSpec?.commands?.length
+          ? `no command output was captured for ${result.caseSpec.commands.map((c) => c.run).join("; ")}`
+          : "the case has no commands to prove it");
+    }
     return entry;
   });
 
@@ -413,6 +422,47 @@ export function missingPrerequisites(command, { root = process.cwd() } = {}) {
   return missing;
 }
 
+/// `.app` 是不是一个能独立运行的正式构建。
+///
+/// 来源是一次 240 秒超时：产物目录里躺着一个 dev 构建的 `.app`（`frontendDist`
+/// 没打进去，二进制里写死 `http://localhost:1420`）。探针启动它，页面永远加载
+/// 不出来，于是干等到超时被杀，报告记成 A07/A08「实现失败」——真正缺的是一次
+/// 正式构建。文件在、但内容不是正式产物，光看路径存在判断不出来。
+export function isDevBuild(appPath) {
+  const binary = path.join(appPath, "Contents", "MacOS", "desktop");
+  if (!existsSync(binary)) return false;
+  try {
+    return readFileSync(binary).includes("localhost:1420");
+  } catch {
+    // 读不到二进制就不下结论：当成可用，让真正的问题自己暴露。
+    return false;
+  }
+}
+
+/// 前置里那些「存在但是 dev 构建」的 `.app`。
+export function devBuildPrerequisites(command, { root = process.cwd() } = {}) {
+  return (command.needs ?? [])
+    .map((relative) => path.resolve(root, relative))
+    .filter((absolute) => absolute.endsWith(".app") && existsSync(absolute) && isDevBuild(absolute));
+}
+
+/// 从一次失败里取出最能说明问题的一行。
+///
+/// 报告曾经在 fail 时只写 `{id, verdict, evidence: []}`——没有原因、没有证据。
+/// 那次全量跑出 15 条 fail 全是这个形状，读的人根本不知道要去修什么（真实原因
+/// 是 PATH 里没有 cargo）。失败必须自带原因，否则这份报告不如不生成。
+export function failureSummary(result) {
+  const command = result.command ?? "(unknown command)";
+  const exitCode = typeof result.exitCode === "number" ? ` exited ${result.exitCode}` : "";
+  // `missing` 的原因不在 stderr 里（进程根本没起来），在 reason 上。
+  // 漏掉它会让「找不到 cargo」这种最该直接看懂的失败变成一句空话。
+  const declared = String(result.reason ?? "").trim();
+  const stderr = String(result.stderr ?? "").trim();
+  const lastLine = stderr.split("\n").filter((line) => line.trim() !== "").pop();
+  const detail = declared ? `: ${declared}` : lastLine ? `: ${lastLine.trim().slice(0, 300)}` : "";
+  return `${command}${exitCode}${detail}`;
+}
+
 /// 把一条用例的多条命令折成一条结局。
 ///
 /// 任一条 missing 即 missing（我们没能证明它），任一条 fail 即 fail；只有全部
@@ -447,7 +497,23 @@ export function runCase(caseSpec, options = {}) {
         reason: `missing capability: ${command.requires}`,
       };
     }
-    const missing = missingPrerequisites(command, { root: options.cwd ?? process.cwd() });
+    const root = options.cwd ?? process.cwd();
+    const missing = missingPrerequisites(command, { root });
+    const devApps = devBuildPrerequisites(command, { root });
+    if (devApps.length > 0) {
+      // 产物在，但是 dev 构建：跑起来只会连不上的开发服务器，等出来的是一个超时。
+      // 这是环境未就绪，不是实现失败。
+      return {
+        caseSpec: { ...caseSpec, prerequisiteMissing: true },
+        outcome: "missing",
+        evidence: [],
+        outcomes: [],
+        skippedBecause: "prerequisite",
+        reason: `the .app is a dev build (it points at localhost:1420), not a release build: ${devApps
+          .map((absolute) => path.relative(root, absolute))
+          .join(", ")}`,
+      };
+    }
     if (missing.length > 0) {
       // 前置产物不在：这条用例无法被证据覆盖，但也不是实现失败。
       return {
@@ -519,12 +585,20 @@ export function runCase(caseSpec, options = {}) {
       : anyFailed
         ? "fail"
         : "pass";
+  // 取第一个非 pass 的结局作原因。之前只看 fail，于是 `missing`（例如
+  // 「找不到 cargo」）走完降级成为 fail 之后没有任何原因，报告里只剩一行
+  // 「no command output was captured」。
+  const problemOutcome = outcomes.find((result) => result.outcome !== "pass");
   return {
     caseSpec,
     outcome,
     evidence,
     outcomes,
-    ...(remoteIdentityFailure ? { reason: remoteIdentityFailure } : {}),
+    ...(remoteIdentityFailure
+      ? { reason: remoteIdentityFailure }
+      : problemOutcome
+        ? { reason: failureSummary(problemOutcome), failedOutcome: problemOutcome.command }
+        : {}),
     // 由 `verdictFor` 消费：执行器说 unsupported 的用例按 unsupported 记，
     // 不看它的退出码。
     ...(executorUnsupported ? { executorUnsupported } : {}),

@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -19,6 +19,8 @@ import {
   unsupportedReason,
   parseCommand,
   parseRemoteIdentity,
+  failureSummary,
+  isDevBuild,
   runCommand,
   runCase,
   runSelected,
@@ -847,4 +849,106 @@ test("an executor that reports pass is still recorded as a pass", () => {
     now: "2026-11-05T00:00:00Z",
   });
   assert.equal(report.cases[0].verdict, "pass");
+});
+
+test("a failing case reports why it failed, not just that it failed", () => {
+  // 全量跑出 15 条 fail 全是 {id, verdict, evidence: []}——没有原因。真实原因
+  // 是 PATH 里没有 cargo，但报告读不出这一点，等于让人凭猜去修。
+  const caseSpec = {
+    id: "A02",
+    commands: [{ kind: "command", run: "definitely-not-a-real-binary --x", cwd: "/tmp" }],
+  };
+  const result = runCase(caseSpec, { cwd: "/tmp", capabilities: {} });
+  const report = assembleReport({
+    buildKind: "probe",
+    results: [result],
+    capabilities: {},
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "fail");
+  assert.ok(
+    typeof report.cases[0].reason === "string" && report.cases[0].reason.trim() !== "",
+    "a fail must carry a reason",
+  );
+  assert.match(report.cases[0].reason, /definitely-not-a-real-binary/);
+});
+
+test("failureSummary names the command, the exit code and the last stderr line", () => {
+  const summary = failureSummary({
+    command: "cargo nextest run",
+    exitCode: 127,
+    stderr: "warning: something\nsh: cargo: command not found\n",
+  });
+  assert.match(summary, /cargo nextest run/);
+  assert.match(summary, /exited 127/);
+  assert.match(summary, /command not found/);
+  assert.ok(!summary.includes("warning"), "the warning line is noise, not the reason");
+});
+
+test("a dev build .app is unproven, not a failure", () => {
+  // 一次真实事故：产物目录里躺着 dev 构建的 .app，探针启动后连不上
+  // localhost:1420，240 秒超时被杀，报告写成 A07/A08「实现失败」。
+  const root = mkdtempSync(path.join(tmpdir(), "e2e-devbuild-"));
+  try {
+    const app = path.join(root, "yi-agent.app");
+    mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
+    writeFileSync(
+      path.join(app, "Contents", "MacOS", "desktop"),
+      "binary with http://localhost:1420 baked in",
+    );
+    const caseSpec = {
+      id: "A07",
+      commands: [{ kind: "command", run: "node probe.mjs", needs: ["yi-agent.app"] }],
+    };
+    const result = runCase(caseSpec, { cwd: root, capabilities: {} });
+    assert.equal(result.outcome, "missing", "a dev build cannot prove anything");
+    const report = assembleReport({
+      buildKind: "probe",
+      results: [result],
+      capabilities: {},
+      now: "2026-11-05T00:00:00Z",
+    });
+    assert.equal(report.cases[0].verdict, "unsupported");
+    assert.match(report.cases[0].reason, /dev build/);
+    assert.match(report.cases[0].reason, /localhost:1420/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a release .app is not mistaken for a dev build", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "e2e-relbuild-"));
+  try {
+    const app = path.join(root, "yi-agent.app");
+    mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
+    writeFileSync(path.join(app, "Contents", "MacOS", "desktop"), "a real release binary");
+    assert.equal(isDevBuild(app), false);
+    const caseSpec = {
+      id: "A07",
+      commands: [{ kind: "command", run: "true", needs: ["yi-agent.app"] }],
+    };
+    const result = runCase(caseSpec, { cwd: root, capabilities: {} });
+    assert.notEqual(result.outcome, "missing");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a command that could not start explains itself", () => {
+  // 「找不到 cargo」是最该一眼看懂的失败。它走的是 missing 分支（进程根本没
+  // 起来，没有 stderr），原因在 reason 上，不看就会退化成一句空话。
+  const caseSpec = {
+    id: "A02",
+    commands: [{ kind: "command", run: "cargo nextest run -p x", cwd: "/tmp" }],
+  };
+  const result = runCase(caseSpec, { cwd: "/tmp", capabilities: {} });
+  const report = assembleReport({
+    buildKind: "probe",
+    results: [result],
+    capabilities: {},
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "fail", "a command that should run but cannot is a real failure");
+  assert.match(report.cases[0].reason, /cargo/);
+  assert.ok(!/no command output was captured/.test(report.cases[0].reason));
 });
