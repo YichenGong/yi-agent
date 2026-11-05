@@ -24,12 +24,10 @@ import { ClientRegistry } from "./lib/clientRegistry";
 import { SideConversationStore, type SideView } from "./lib/sideConversation";
 import { useSideConversation } from "./hooks/useSideConversation";
 import {
-  parentStatusText,
+  canControlSide,
   useSideConversationController,
   type CloseConfirmation,
 } from "./hooks/useSideConversationController";
-import { SideConversationHeader } from "./components/SideConversationHeader";
-import { sideItemsForChat } from "./lib/sideItems";
 import type { SideCommand } from "./lib/sideCommands";
 import { LOCAL_SLOT, type Slot } from "./lib/slots";
 import {
@@ -72,6 +70,11 @@ import {
   type TagId,
 } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
+import type { UsageTotals } from "./lib/protocol";
+import type { CurrentConversation } from "./lib/currentConversation";
+import type { ImageReadCall } from "./lib/useImageData";
+import type { ViewAnchor } from "./lib/viewAnchor";
+import { sideItemsForChat } from "./lib/sideItems";
 import { createWatchdog, SYNC_IDLE_TIMEOUT_MS, type Watchdog } from "./lib/syncWatchdog";
 import { ConnectionError } from "./lib/connectionError";
 import { formatError } from "./lib/errorMessage";
@@ -241,6 +244,8 @@ export default function App() {
    * `return` 里，把 hook 放到后面会让「配对界面 ↔ 主界面」切换时 hook 数量变化，
    * React 直接抛「Rendered fewer hooks than expected」。
    */
+  // scoped slash 的落地出口。它属于「那一次操作」，渲染在输入区上方唯一的一条
+  // 反馈行里（spec §4.1：不另造横幅，按需显示、无事件时不占位）。
   const [sideNotice, setSideNotice] = useState<string | null>(null);
 
   /**
@@ -256,6 +261,49 @@ export default function App() {
   const sideConversationRef = useRef(sideConversation);
   sideConversationRef.current = sideConversation;
 
+  /*
+   * 旁支的展示状态。**必须声明在配对/修复那两个早退之前**：hook 放在 `return`
+   * 后面会让「配对界面 ↔ 主界面」切换时 hook 数量变化，React 直接抛
+   * 「Rendered more hooks than during the previous render」。
+   */
+
+  /**
+   * 旁支的滚动锚：**只存内存、不进父的持久化位置表**（spec §5.1）。
+   *
+   * 父的锚点按 `threadId` 落盘，旁支没有 threadId（它根本不是一条 thread）。用
+   * 会话键做键，切走再回来落在原处；换代即换键，旧的自然失效。
+   */
+  const sideAnchors = useRef(new Map<string, ViewAnchor>());
+  /** 旁支正文的结构版本：`items` 是可变数组，插入/替换要靠一个数字让 memo 重算。 */
+  const sideStructuralVersion = useRef(new Map<string, number>());
+  const sideLastShape = useRef(new Map<string, string>());
+
+  /**
+   * 旁支的图片读取**一律拒绝**：旁支正文已经剥掉媒体引用（`sideItemsForChat`），
+   * 这道函数只是 `ImageReadCall` 类型上必填的那个接缝。绝不传父的 `imageCall`
+   * ——那会拿宿主去读一张属于父会话、在旁支进程里根本不存在的图。
+   */
+  const rejectImageRead = useMemo<ImageReadCall>(
+    () => () => Promise.reject(new Error("旁问不读取父会话的图片")),
+    [],
+  );
+
+  /**
+   * 切会话（含切到/离开旁支）就清掉上一条 scoped 提示。
+   *
+   * 提示属于**那一次操作**，跟着走到另一条会话上会把「刚才那条旁支的配置」
+   * 说成这一条的（与 `session.notice` 同一条理由）。
+   *
+   * 依赖用的是**指针自身**而不是后面由 `sess.currentId` 参与的完整会话键：这里
+   * 必须声明在配对/修复的早退之前（hook 顺序不能变），而那时 `sess` 还不能用。
+   * 旁支的身份变化全部体现在 `sideConversation.active` 里，主会话之间的切换则由
+   * 主会话自己的 `session.notice` 处理，这里不需要覆盖。
+   */
+  const sideNoticeScope = JSON.stringify(sideConversation.active);
+  useEffect(() => {
+    setSideNotice(null);
+  }, [sideNoticeScope]);
+
   /**
    * effect 里的通知路由需要一个稳定的旁支 API 引用，而 hook 只能在组件体调用。
    * 与 `notifySyncActivity` 同一模式：ref 桥接，effect 运行时读到最新实现。
@@ -266,9 +314,14 @@ export default function App() {
     onChange: forceSide,
     subscribeParent: (client, parentId) =>
       client.request("thread/subscribe", { threadIds: [parentId] }).then(() => {}),
-    visibleParent:
+    // 完整身份，不是裸 parentId：两个宿主可以各有 `t1`，只按 id 同步会把两边
+    // 的尾帧探测同时打开（见 `useSideConversation` 的 `visible` 说明）。
+    visible:
       sideConversation.active !== null && sideConversation.active.kind === "side"
-        ? sideConversation.active.parentId
+        ? {
+            hostKey: sideConversation.active.hostKey,
+            parentId: sideConversation.active.parentId,
+          }
         : null,
   });
   sideApiRef.current = sideApi;
@@ -997,6 +1050,12 @@ export default function App() {
       prefillFromCache(id);
     // 切走即把上一条会话的在途内容落盘（切回时预填的就是它）。
     if (prevId && prevId !== id) void flushContent(prevId);
+    // 用户在主视图里显式换会话 = 一次真实导航：旁支的入场意图随之作废，迟到的
+    // `side/open` 回包不得再把用户拽走（spec §5.2）。
+    const navBinding = sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    if (navBinding !== undefined) {
+      sideConversationRef.current.selectMain(navBinding, id);
+    }
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
     if (changed) {
@@ -2552,36 +2611,208 @@ export default function App() {
     );
   }
 
-  /**
-   * 当前正在显示的旁支视图。
-   *
-   * 只在 `activeConversation` 指向旁支**且**该视图仍存在时为非 null。视图被
-   * 另一端关掉（`side/closed`）之后指针还停在原处，此时回落主会话，而不是渲染
-   * 一个空壳。
-   */
-  const activeSide: SideView | null = (() => {
-    const a = sideConversation.active;
-    if (a === null || a.kind !== "side") return null;
-    const view = sideStoreRef.current.read(a.hostKey, a.sideId) ?? null;
-    return view !== null && !view.closed ? view : null;
-  })();
   /** 正在显示的旁支所在宿主的绑定（能力/权限/连接态都从它读）。 */
   const activeSideBinding = (() => {
     const a = sideConversation.active;
     if (a === null) return undefined;
     return sideStoreRef.current.binding(a.hostKey);
   })();
-  /** 旁支视图里可用的 Control 能力：Observe 只读，缺能力更是什么都不能做。 */
-  const sideCanControl =
-    activeSideBinding !== undefined &&
-    activeSideBinding.supported &&
-    activeSideBinding.scope !== "observe";
+
+  /**
+   * 当前会话的完整身份，只用于隔离输入框的本地提交锁。
+   *
+   * 必须带 generation：同一 sideId 换代之后是另一条会话，上一代的在途回包不能
+   * 解开新一代的锁（spec §5.2「双击或重复 Enter 不重复发送」）。
+   */
+  const composerConversationKey = (() => {
+    const a = sideConversation.active;
+    if (a !== null && a.kind === "side") {
+      return JSON.stringify([
+        "side",
+        a.hostKey,
+        a.parentId,
+        a.sideId,
+        a.generation,
+      ]);
+    }
+    if (a !== null) return JSON.stringify(["main", a.hostKey, a.parentId]);
+    return JSON.stringify(["main", activeSlotRef.current, sess.currentId]);
+  })();
+
+
+  /**
+   * 当前会话的**单一判别投影**（spec §5.1）。
+   *
+   * 正文、输入、动作三者的身份必须来自这同一份值：它们曾经是三处各自 `if
+   * (side)` 拼出来的，于是「界面显示旁支、发出去却进了父」这种错配只需要一处
+   * 漏判就能发生。这里只做一次判别，下面所有分支都从它读。
+   *
+   * `side` 分支已经过校验：必须是 store 里**精确** `(hostKey, sideId)` 的那条
+   * 视图，且 `parentId`/`generation` 与指针一致。任何一项不匹配都当作「目标已
+   * 失效」（`lost`）——绝不回落到父 send，那会把旁支的问题发进父会话。
+   */
+  const conversation: CurrentConversation = (() => {
+    const a = sideConversation.active;
+    if (a !== null && a.kind === "side") {
+      const view = sideStoreRef.current.read(a.hostKey, a.sideId);
+      if (view === undefined || view.closed) {
+        return { kind: "lost", reason: "这条旁问已经关闭，用 /side 可以重新打开" };
+      }
+      if (view.parentId !== a.parentId || view.generation !== a.generation) {
+        return {
+          kind: "lost",
+          reason: "这条旁问已被新的会话取代，用 /side 重新进入",
+        };
+      }
+      return { kind: "side", identity: a, view };
+    }
+    return {
+      kind: "main",
+      hostKey: a?.hostKey ?? null,
+      parentId: a?.parentId ?? sess.currentId,
+    };
+  })();
+  /** 当前正在显示的旁支视图；主会话与失效目标都是 `null`。 */
+  const activeSide: SideView | null =
+    conversation.kind === "side" ? conversation.view : null;
+
+  // 用「长度 + id 序列」识别旁支正文的结构变化（纯文本追加不算）：与父
+  // `Session` 的 `structuralVersion` 同一判据，避免流式每个 delta 都重建前缀。
+  if (conversation.kind === "side") {
+    const key = composerConversationKey;
+    const shape = `${conversation.view.items.length}:${conversation.view.items.map((i) => i.id).join(",")}`;
+    if (sideLastShape.current.get(key) !== shape) {
+      sideLastShape.current.set(key, shape);
+      sideStructuralVersion.current.set(
+        key,
+        (sideStructuralVersion.current.get(key) ?? 0) + 1,
+      );
+    }
+  }
+
+  /**
+   * 当前槽位的旁支绑定。主视图用它判断「本设备能不能发起旁支操作」——只看
+   **当前显示**的那条会话的绑定是不够的：主视图里没有 active 旁支，但命令
+   仍在主视图发起（spec §4.3 只读设备必须当场拒绝，而不是发出去再失败）。
+   */
+  const slotSideBinding = sideStoreRef.current.bindingsForSlot(
+    activeSlotRef.current,
+  )[0];
+  /**
+   * 能不能下发 Control 类旁支操作：Observe 只读，缺能力更是什么都不能做。
+   *
+   * 旁支视图里按**那条旁支所在宿主**判定（用户可能停在另一台设备的旁支上），
+   * 主视图里按当前槽位判定。
+   */
+  const sideCanControl = canControlSide(
+    activeSide !== null ? activeSideBinding : slotSideBinding,
+  );
+
+  /**
+   * 旁支自己的用量，映射成状态栏的客户端形状。
+   *
+   * 三个映射都来自协议命名差异（wire 是 snake_case 的 `cache_creation`/
+   * `cache_read`，客户端是 `cacheWrite`/`cacheRead`）。subagent 三项在旁支里
+   * 恒为零：旁支是只读问答，没有子任务。
+   */
+  const sideUsageTotals: UsageTotals | null =
+    activeSide === null
+      ? null
+      : {
+          input: activeSide.usage.total.input,
+          output: activeSide.usage.total.output,
+          cacheRead: activeSide.usage.total.cache_read,
+          cacheWrite: activeSide.usage.total.cache_creation,
+        };
+
+  /**
+   * 输入区上方那**唯一**一条反馈（错误 / 待确认 / 提示）。
+   *
+   * 一条而不是三条：同一时刻用户只关心「我这次操作怎么了」。优先级是
+   * 失败 > 待确认 > 提示——把「没关成」压在「没有可关闭的旁问」下面会误导。
+   *
+   * 来源边界：旁支的内容只在旁支视图里出现。父视图只显示**属于父**的错误
+   * （`currentError` 已由 `setCurrentError` 按来源写），不把旁支的失败说成父的。
+   */
+  const composerFeedback: { tone: "error" | "warn" | "info"; text: string } | null =
+    (() => {
+      if (activeSide !== null) {
+        if (sideConversation.visibleError !== null) {
+          return { tone: "error", text: sideConversation.visibleError };
+        }
+        if (activeSide.pending?.state === "uncertain") {
+          return {
+            tone: "warn",
+            text: "发送结果待确认，对账前不会重发",
+          };
+        }
+        if (activeSide.rejectedSubmission !== null) {
+          return {
+            tone: "error",
+            text:
+              activeSide.rejectedSubmission.message ||
+              "上一条没有发出去，正文已留在输入框",
+          };
+        }
+        // 两条提示来源合并：controller 的 `notice` 是「没有可关闭的旁问」这类
+        // 幂等提示，App 的 `sideNotice` 是 `/config`、`/usage` 的输出。
+        const notice = sideConversation.notice ?? sideNotice;
+        if (notice !== null) return { tone: "info", text: notice };
+        if (!sideCanControl) {
+          // 只读设备：说明**为什么**发不出去，而不是让用户对着灰按钮猜。
+          return {
+            tone: "info",
+            text: "只读设备：可以查看旁问与 /back 返回，不能提问或关闭",
+          };
+        }
+        return null;
+      }
+      if (conversation.kind === "lost") {
+        // 原因已经由正文区的 `TranscriptPlaceholder` 连同「返回主会话」的出口一起
+        // 显示。这里再说一遍等于同一句话出现两次，反而让人以为有两件事。
+        return null;
+      }
+      // 主视图里发起的旁支操作（`/side-close`、只读设备的 `/btw`）失败时，
+      // 原因必须**当场可见**：只写进 controller 的话，用户看到的是「什么都没
+      // 发生」。按 parentId 过滤，A 宿主的失败不会显示成 B 会话的横幅。
+      if (
+        sideConversation.error !== null &&
+        sideConversation.errorTarget !== null &&
+        sideConversation.errorTarget.parentId === sess.currentId
+      ) {
+        return { tone: "error", text: sideConversation.error };
+      }
+      const notice = sideConversation.notice ?? sideNotice;
+      return notice !== null ? { tone: "info", text: notice } : null;
+    })();
+
+  /**
+   * 状态栏里的会话标识（spec §4.1：只借**已有**文本位）。
+   *
+   * 只标三件事：我在旁支、它只读、怎么回去。父的审批状态也在这里简述一句——
+   * 详情与操作只能回父视图（旁支没有父的审批入口）。
+   */
+  const statusConversationLabel: string | null = (() => {
+    if (activeSide === null) return null;
+    const parts = ["/side", sideCanControl ? "只读" : "只读设备", "/back 返回"];
+    const parent = store.currentId !== null ? store.peek(store.currentId) : undefined;
+    if (parent?.approval !== null && parent?.approval !== undefined) {
+      parts.push("父会话等待审批，回主会话处理");
+    }
+    return parts.join(" · ");
+  })();
 
   /** 输入框的会话上下文：视图、能力、可控制性三者一起传。 */
   const composerConversation = {
     view: (activeSide !== null ? "side" : "main") as "main" | "side",
-    supported: activeSideBinding?.supported ?? true,
-    canControl: activeSide !== null ? sideCanControl : true,
+    // 「这个宿主是否声明了旁支」也按同一份绑定读：缺能力的宿主上，命令候选
+    // 不该出现，显式键入也要当场说明（spec §4.3）。
+    supported:
+      (activeSide !== null ? activeSideBinding : slotSideBinding)?.supported ??
+      // 还没握手：保持「支持」以免在首帧闪一句「不支持」，真正的答案一到
+      // 就会重渲染。
+      true,
+    canControl: sideCanControl,
   };
 
   /**
@@ -2651,9 +2882,25 @@ export default function App() {
     }
   };
 
-  /** 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。 */
+  /**
+   * 关闭旁支的第一步：问服务端当前状态，把确认所需信息交给弹窗。
+   *
+   * 父身份与宿主**在这里定格**：确认弹窗开着的时候用户可能切走，而关闭请求仍
+   * 应打给他当时要关的那条。主视图也能关后台旁问——旁支只在视图里显示，不该
+   * 成为「必须先进入才能关」的东西。
+   */
   const beginSideClose = async (): Promise<void> => {
-    const confirmation = await sideConversationRef.current.requestClose();
+    const binding =
+      sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
+    const parentId = store.currentId;
+    if (binding === undefined || parentId === null) {
+      setSideNotice("当前没有打开的旁问");
+      return;
+    }
+    const confirmation = await sideConversationRef.current.requestClose(
+      binding,
+      parentId,
+    );
     if (confirmation !== null) setSideCloseConfirm(confirmation);
   };
 
@@ -2675,6 +2922,11 @@ export default function App() {
         runSideScopedSlash(command.name, command.args);
         return true;
       case "back":
+        // 主视图里 `/back` 是空操作，但**必须说一句**：否则用户敲了之后既没
+        // 换视图也没有反馈，会以为没生效（spec §4.2）。
+        if (sideConversationRef.current.active?.kind !== "side") {
+          setSideNotice("已经在主会话了");
+        }
         sideConversationRef.current.back();
         return true;
       case "close":
@@ -2684,60 +2936,6 @@ export default function App() {
         return await openSide(command.question);
     }
   };
-
-  /** 旁支视图的发送：目标在调用时捕获，绝不在 await 之后读「当前视图」。 */
-  const sendToSide = async (text: string): Promise<boolean> => {
-    const a = sideConversationRef.current.active;
-    if (a === null || a.kind !== "side") return false;
-    if (!text.trim()) return false;
-    const binding = sideStoreRef.current.binding(a.hostKey);
-    if (binding === undefined || !binding.connected) {
-      setCurrentError("连接已断开，请稍候再发");
-      return false;
-    }
-    const ok = await sideConversationRef.current.submit(text);
-    if (ok) {
-      sideStoreRef.current.setDraft(a.hostKey, a.sideId, "");
-      forceSide();
-    }
-    return ok;
-  };
-
-  /** 旁支视图的 Stop：只停旁支自己，绝不打父会话。 */
-  const stopSide = () => {
-    void sideConversationRef.current.stop();
-  };
-
-  /**
-   * 手机/桌面顶部的「旁问」入口。
-   *
-   * 父会话运行中、等待审批时都必须可达：这正是旁支存在的理由（spec §9.2/§9.3）。
-   * 点它不消费父草稿、不停主任务。
-   */
-  const sidebarEntry = (() => {
-    const binding = sideStoreRef.current.bindingsForSlot(activeSlotRef.current)[0];
-    if (binding === undefined || !binding.supported) return null;
-    if (binding.scope === "observe") return null;
-    if (store.currentId === null) return null;
-    const existing = sideStoreRef.current
-      .list(binding.key)
-      .find((v) => v.parentId === store.currentId && !v.closed);
-    return {
-      label: existing === undefined ? "旁问" : "继续旁问",
-      open: () => {
-        if (existing !== undefined) {
-          sideConversationRef.current.enter(
-            binding,
-            existing.parentId,
-            existing.sideId,
-            existing.generation,
-          );
-          return;
-        }
-        void openSide("");
-      },
-    };
-  })();
 
   return (
     <>
@@ -2876,52 +3074,107 @@ export default function App() {
                       />
                     }
                   >
-                    <ChatView
-                      items={current?.session.items ?? []}
-                      error={current?.session.lastError ?? null}
-                      retrying={current?.session.retrying ?? null}
-                      threadId={sess.currentId}
-                      // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
-                      // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
-                      call={imageCall}
-                      structuralVersion={current?.session.structuralVersion ?? 0}
-                      query={searchQuery}
-                      anchor={
-                        sess.currentId
-                          ? sess.anchorFor(sess.currentId)
-                          : undefined
-                      }
-                      // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
-                      // "还没到"（继续等）与"真的没了"（回退到底部）。
-                      syncing={
-                        sess.currentId
-                          ? store.peek(sess.currentId)?.syncState === "syncing"
-                          : false
-                      }
-                      // 失败原因：非 null 即失败态。有内容时不渲染占位（ChatView 内判）。
-                      syncError={
-                        sess.currentId
-                          ? store.peek(sess.currentId)?.syncState === "failed"
-                            ? (store.peek(sess.currentId)?.syncError ?? "加载失败")
+                    {conversation.kind === "side" ? (
+                      <ChatView
+                        // 旁支的正文是服务端的只读快照，**剥掉**图片与附件：
+                        // 旁支不能调 `image/read`，也不该把父的字节流进来。
+                        items={sideItemsForChat(conversation.view.items)}
+                        // 只放**这一轮**的失败（服务端在帧里给的）。操作失败
+                        // （关不掉、Stop 没发出去）属于「我刚才那一下」的反馈，
+                        // 统一走输入框上方那一条；两处都写会把同一句话说两遍。
+                        error={
+                          conversation.view.error !== null
+                            ? conversation.view.error.message ||
+                              conversation.view.error.reason ||
+                              "旁问这一轮失败了"
                             : null
-                          : null
-                      }
-                      onRetrySync={() => {
-                        const id = sess.currentId;
-                        // `forceResume` 跳过 selectThread 的全部早退，是唯一可靠的
-                        // 强制重同步路径（设计 §4.3）。
-                        if (id) void selectThread(id, { forceResume: true });
-                      }}
-                      // 只有远端才渲染骨架屏：桌面端不加任何新视觉元素（设计 §6.1）。
-                      isRemote={isRemoteClient()}
-                      // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
-                      // 注释），所以直接透传，不在闭包里另读 currentId。
-                      onRememberView={sess.rememberView}
-                      scrollerRef={transcriptRef}
-                      captureViewRef={captureTranscriptRef}
-                    />
+                        }
+                        // 旁支没有「重试」语义：它的正文来自快照，失败只说明
+                        // 这一轮没答完，没有可以重放的请求。
+                        retrying={null}
+                        // 合成一个稳定 id：`ChatView` 用它做滚动采集的归属判定，
+                        // 而旁支根本不是一条 thread。旁支的媒体已被剥离，所以
+                        // 这个 id 不会被当成宿主去读图。
+                        threadId={`side:${conversation.identity.sideId}:${conversation.identity.generation}`}
+                        // 稳定的**拒绝**函数：绝不传父 `imageCall`。
+                        call={rejectImageRead}
+                        structuralVersion={
+                          sideStructuralVersion.current.get(composerConversationKey) ?? 0
+                        }
+                        // 搜索只覆盖父会话的转录（旁支正文不在搜索索引里）。
+                        query=""
+                        anchor={sideAnchors.current.get(composerConversationKey)}
+                        onRememberView={(_owner, next) => {
+                          // 只存内存、不落盘（spec §5.1）。
+                          if (next === null) sideAnchors.current.delete(composerConversationKey);
+                          else sideAnchors.current.set(composerConversationKey, next);
+                        }}
+                        syncing={conversation.view.sync === "syncing"}
+                        syncError={null}
+                        isRemote={isRemoteClient()}
+                        scrollerRef={transcriptRef}
+                        captureViewRef={captureTranscriptRef}
+                      />
+                    ) : conversation.kind === "lost" ? (
+                      // 目标已失效：显示原因，**不**渲染任何可发送的正文。
+                      <TranscriptPlaceholder
+                        kind="failed"
+                        reason={conversation.reason}
+                        onRetry={() => sideConversationRef.current.back()}
+                      />
+                    ) : (
+                      <ChatView
+                        items={current?.session.items ?? []}
+                        error={current?.session.lastError ?? null}
+                        retrying={current?.session.retrying ?? null}
+                        threadId={sess.currentId}
+                        // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                        // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                        call={imageCall}
+                        structuralVersion={current?.session.structuralVersion ?? 0}
+                        query={searchQuery}
+                        anchor={
+                          sess.currentId
+                            ? sess.anchorFor(sess.currentId)
+                            : undefined
+                        }
+                        // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
+                        // "还没到"（继续等）与"真的没了"（回退到底部）。
+                        syncing={
+                          sess.currentId
+                            ? store.peek(sess.currentId)?.syncState === "syncing"
+                            : false
+                        }
+                        // 失败原因：非 null 即失败态。有内容时不渲染占位（ChatView 内判）。
+                        syncError={
+                          sess.currentId
+                            ? store.peek(sess.currentId)?.syncState === "failed"
+                              ? (store.peek(sess.currentId)?.syncError ?? "加载失败")
+                              : null
+                            : null
+                        }
+                        onRetrySync={() => {
+                          const id = sess.currentId;
+                          // `forceResume` 跳过 selectThread 的全部早退，是唯一可靠的
+                          // 强制重同步路径（设计 §4.3）。
+                          if (id) void selectThread(id, { forceResume: true });
+                        }}
+                        // 只有远端才渲染骨架屏：桌面端不加任何新视觉元素（设计 §6.1）。
+                        isRemote={isRemoteClient()}
+                        // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                        // 注释），所以直接透传，不在闭包里另读 currentId。
+                        onRememberView={sess.rememberView}
+                        scrollerRef={transcriptRef}
+                        captureViewRef={captureTranscriptRef}
+                      />
+                    )}
                   </ErrorBoundary>
-                  {searchOpen && (
+                  {/*
+                   会话内搜索只覆盖**父**的转录：旁支正文不在搜索索引里
+                   （不进 ThreadStore/搜索/未读/排序，spec §5.1）。在旁支里
+                   还显示一条父的搜索栏会让用户以为在搜旁支。
+                  */}
+                  {searchOpen && conversation.kind === "main" && (
                     <SearchBar
                       value={searchInput}
                       total={search.total}
@@ -2932,7 +3185,12 @@ export default function App() {
                       onClose={closeSearch}
                     />
                   )}
-                  {approval && (
+                  {/*
+                   父审批的**操作 UI 只在父视图**（spec §4.1）。旁支里显示它
+                   会让一次批准落到错误的线程上——approval id 属于父会话。
+                   父等待审批这件事由状态栏那句简述提示，详情只能回父看。
+                  */}
+                  {approval && conversation.kind === "main" && (
                     <ApprovalDialog
                       key={approval.id}
                       request={approval}
@@ -2955,40 +3213,114 @@ export default function App() {
                     />
                   )}
                 </div>
+                {/*
+                 旁支/失效目标的反馈行。
+                 - 被拒（policy 或服务端）与失败都按**来源会话**显示在这里；
+                   不写进父的 `lastError`（那会把 A 的失败说成 B 的）。
+                 - `uncertain` 是「发送结果待确认」：既不重发也不清稿。
+                 - 只是提示（`/config` 输出、没有可关闭的旁问）时同样占这一行。
+                 无事件时整行不渲染，不占固定高度（spec §4.1）。
+                */}
+                {composerFeedback !== null && (
+                  <p
+                    role="status"
+                    className={`px-4 pt-2 text-xs ${
+                      composerFeedback.tone === "error"
+                        ? "text-red-500"
+                        : composerFeedback.tone === "warn"
+                          ? "text-amber-600"
+                          : "text-fg-muted"
+                    }`}
+                  >
+                    {composerFeedback.text}
+                  </p>
+                )}
                 <MessageInput
-                  turnActive={current?.session.turnActive ?? false}
+                  // 侧栏里「这一轮在跑」指**当前显示的那条**会话在跑。
+                  turnActive={
+                    conversation.kind === "side"
+                      ? conversation.view.summary.status === "running"
+                      : (current?.session.turnActive ?? false)
+                  }
                   onSend={send}
-                  onInterrupt={interrupt}
-                  mode={current?.mode ?? null}
+                  onInterrupt={
+                    conversation.kind === "side"
+                      ? () => void sideConversationRef.current.stop()
+                      : interrupt
+                  }
+                  // 模式属于父会话的权限设置。旁支只读、没有自己的权限模式，
+                  // 传 `null` 让 chip 自身置灰（不是「继承父的 YOLO」）。
+                  mode={conversation.kind === "side" ? null : (current?.mode ?? null)}
                   onModeChange={setThreadMode}
                   onSlashCommand={onSlashCommand}
                   // 主视图也要接旁支命令：`/btw`、`/side`、`/back`、
                   // `/side-close` 必须能与 Enter/Send/按钮走同一条策略。
                   // 不接的话它们会被当成普通文本发给模型（"模型收到 /btw"）。
                   onSideCommand={runSideCommand}
+                  // 旁支正文走三态收据：清稿由 store 按身份 + 草稿修订裁决，
+                  // 不经父 `send` 的「true 就清稿」分支（那会清掉 await 期间的
+                  // 新编辑，也无法区分「不确定」与「明确失败」）。
+                  onSubmitSide={
+                    conversation.kind === "side"
+                      ? (text) => sideConversationRef.current.submit(text)
+                      : null
+                  }
+                  conversationKey={composerConversationKey}
                   conversation={composerConversation}
-                  value={current?.draft ?? ""}
-                  onDraftChange={changeDraft}
+                  // 正文身份与输入身份来自同一份投影：旁支读它自己的草稿，
+                  // 主会话读父的。失效目标保留空白且不可发送。
+                  value={
+                    conversation.kind === "side"
+                      ? conversation.view.draft
+                      : (current?.draft ?? "")
+                  }
+                  onDraftChange={
+                    conversation.kind === "side"
+                      ? (text) => {
+                          const c = conversation;
+                          if (c.kind !== "side") return;
+                          sideStoreRef.current.setDraft(
+                            c.identity.hostKey,
+                            c.identity.sideId,
+                            text,
+                          );
+                          forceSide();
+                        }
+                      : changeDraft
+                  }
                   cardRef={composerCardRef}
-                  dropActive={dragDrop.active}
+                  // 拖放落点判定的是父输入卡片的矩形；旁支没有附件入口，
+                  // 因此不在旁支里高亮（也不接 drop）。
+                  dropActive={conversation.kind === "main" && dragDrop.active}
                   caretSeek={caretSeek}
                   onCaretChange={(caret) => {
                     composerCaret.current = caret;
                   }}
                   // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
+                  // 旁支**不显示任何附件**（spec §4.2），父的保持原位。
                   attachments={
-                    sess.currentId ? (pending[sess.currentId] ?? []) : []
+                    conversation.kind === "side"
+                      ? []
+                      : sess.currentId
+                        ? (pending[sess.currentId] ?? [])
+                        : []
                   }
                   onPickAttachments={() => void pickAttachments()}
                   onRemoveAttachment={removePendingAttachment}
-                  threadId={sess.currentId}
+                  threadId={conversation.kind === "side" ? null : sess.currentId}
                   // 稳定的 `imageCall`（见上）：待发图片 chip 的缩略图也经它读取，
                   // 内联箭头会让每张缩略图每次渲染都重拉。
                   call={imageCall}
-                  disabled={current === null}
+                  disabled={
+                    conversation.kind === "lost" ||
+                    (conversation.kind === "main" && current === null)
+                  }
                   isMobile={isMobile}
+                  // 模型切换改的是父会话的落盘配置，旁支里不提供（spec §4.2）。
                   modelPicker={
-                    current !== null && sess.currentId !== null ? (
+                    conversation.kind === "main" &&
+                    current !== null &&
+                    sess.currentId !== null ? (
                       <ModelPicker
                         call={modelCall}
                         threadId={sess.currentId}
@@ -3005,8 +3337,7 @@ export default function App() {
                     ) : null
                   }
                 />
-              </>
-            )}
+            </>
             {/*
               关闭旁支的确认。文案分两种：正在回答时明确告诉用户会打断那一轮，
               空闲时就只是关掉。`expectedActiveTurnId` 来自服务端当前摘要
@@ -3036,6 +3367,8 @@ export default function App() {
                       type="button"
                       className="rounded-md bg-red-600 px-3 py-1 font-medium text-white hover:bg-red-500"
                       onClick={() => {
+                        // 只操作**捕获的**那份确认：弹窗开着时用户可能已经切走，
+                        // 关闭请求仍应打给他当时要关的那条（spec §5.4）。
                         const confirmation = sideCloseConfirm;
                         setSideCloseConfirm(null);
                         void sideConversationRef.current
@@ -3080,14 +3413,21 @@ export default function App() {
                     }
                   : undefined
               }
+              // 旁支没有「自己的标题栏」，当前会话只能借这个已有文本位表达。
+              conversationLabel={statusConversationLabel}
               // 累计值是主体；`usage` 快照只作老服务端的兜底。
-              totals={current?.session.usageTotals ?? null}
-              // subagent 累计：折叠态把它加进合计，展开面板分开显示。
-              subagentTotals={current?.session.subagentTotals ?? NO_SUBAGENTS}
-              subagentCount={sess.railRows.length}
-              fallbackUsage={current?.session.usage ?? null}
-              // 切换会话时数字直接跳终值，不从上一个会话滚过来。
-              usageId={sess.currentId}
+              // 旁支有它**自己**的一份用量，绝不与父相加（spec §5.1）。
+              totals={sideUsageTotals ?? current?.session.usageTotals ?? null}
+              subagentTotals={
+                activeSide !== null
+                  ? NO_SUBAGENTS
+                  : (current?.session.subagentTotals ?? NO_SUBAGENTS)
+              }
+              subagentCount={activeSide !== null ? 0 : sess.railRows.length}
+              // 旁支没有「最后一轮快照」这个概念，也不该拿父的去兜底。
+              fallbackUsage={activeSide !== null ? null : (current?.session.usage ?? null)}
+              // 切换会话（含旁支换代）时数字直接跳终值，不从上一个会话滚过来。
+              usageId={activeSide !== null ? composerConversationKey : sess.currentId}
               /*
                * 右侧详情栏（子 agent + Git Diff）的**常驻**入口：收起动作够不着的
                * 地方必须留一条回去的路，否则收起就成了单向操作。常驻图标在收起后

@@ -28,7 +28,7 @@ use yi_agent_runtime::side_conversation::{
     SideSourcePublisher, SideStatus, SideToolPolicy, SideToolSetupFactory, SideTranscript,
 };
 
-use crate::tui::side::{ConversationEvent, ConversationPayload, ConversationTarget};
+use crate::tui::side::{ConversationEvent, ConversationPayload, ConversationTarget, SideOperation};
 
 /// 旁支事件通道容量。一个满通道只会让调度任务等一下,不会丢正文。
 const SIDE_EVENT_CHANNEL: usize = 256;
@@ -53,10 +53,20 @@ pub enum SideDriverCommand {
     },
     /// 在已打开的旁支里提一个新问题。
     Submit { request_id: String, text: String },
-    /// 停止某个确定轮次（不匹配则忽略,防止误停新轮）。
-    Interrupt { turn_id: String },
-    /// 关闭旁支。`expected_active_turn_id` 是调用方确认过的轮次,冲突时拒绝。
+    /// 停止某个确定轮次。
+    ///
+    /// 除了 `turn_id`，还带上调用方**以为**在操作的目标：UI 手里的视图可能
+    /// 已经过期（用户切到了另一个旁支，或旧旁支被关掉后新开了一个），只比
+    /// `turn_id` 挡不住「旧视图的停止落到新旁支上」——两个代际的轮次 id 不
+    /// 会相同，但**空 id** 会让比较退化。目标不符时产生该旧目标的
+    /// `SideOperationError(Interrupt)`，不作用到当前 runner。
+    Interrupt {
+        expected_target: ConversationTarget,
+        turn_id: String,
+    },
+    /// 关闭旁支。两个字段都是调用方确认过的条件，任一不符就拒绝。
     Close {
+        expected_target: ConversationTarget,
         expected_active_turn_id: Option<String>,
     },
     /// 父会话即将 clear/delete:先建立逻辑屏障,主操作成功才提交作废。
@@ -201,37 +211,57 @@ impl SideDriver {
                 question,
             } => {
                 let outcome = self.open(request_id, question).await;
-                self.report_error(outcome.err()).await;
+                self.report_operation_error(SideOperation::Open, outcome.err())
+                    .await;
             }
             SideDriverCommand::Submit { request_id, text } => {
                 let outcome = self.submit(request_id, text).await;
-                self.report_error(outcome.err()).await;
+                self.report_operation_error(SideOperation::Submit, outcome.err())
+                    .await;
             }
-            SideDriverCommand::Interrupt { turn_id } => {
-                // 先用本任务自己记的 active 轮次校验一次:UI 可能拿着一帧旧
-                // turn id 发出停止,而那一轮早已结束。不校验就会把停止误发到
-                // 刚启动的下一轮上——用户看到的是「我没停它,它自己停了」。
+            SideDriverCommand::Interrupt {
+                expected_target,
+                turn_id,
+            } => {
+                // 先比目标:UI 手里的视图可能已经过期。目标不符时**必须报出来**,
+                // 否则用户按了停止、界面毫无反应,而真正该停的东西还在跑。
+                if !self.target_matches(&expected_target) {
+                    self.report_stale_target(SideOperation::Interrupt, &expected_target)
+                        .await;
+                    return;
+                }
+                // 再比轮次:空闲或轮次已变时不算错误——那是「这一轮已经结束」,
+                // 用户看到的状态本身是对的。
                 let matches_active = self
                     .active
                     .as_ref()
                     .is_some_and(|active| active.turn_id == turn_id);
                 if !matches_active {
-                    // 空闲或轮次已变:静默忽略,不算错误。
-                } else if let Some(runner) = self.runner.as_mut()
+                    return;
+                }
+                if let Some(runner) = self.runner.as_mut()
                     && let Err(error) = runner.interrupt(&turn_id).await
                 {
-                    self.report_error(Some(error)).await;
+                    self.report_operation_error(SideOperation::Interrupt, Some(error))
+                        .await;
                 }
                 // 真正的结束由流自己上报:pump 在 join 完 core 任务后才发终态,
                 // 所以这里不伪造 Idle。
             }
             SideDriverCommand::Close {
+                expected_target,
                 expected_active_turn_id,
             } => {
+                if !self.target_matches(&expected_target) {
+                    self.report_stale_target(SideOperation::Close, &expected_target)
+                        .await;
+                    return;
+                }
                 let outcome = self
                     .close(expected_active_turn_id, CloseReason::UserClosed)
                     .await;
-                self.report_error(outcome.err()).await;
+                self.report_operation_error(SideOperation::Close, outcome.err())
+                    .await;
             }
             SideDriverCommand::ParentBarrier { reason, reply } => {
                 self.begin_parent_barrier(reason, reply);
@@ -425,14 +455,26 @@ impl SideDriver {
             return Ok(());
         };
         let actual = runner.active_turn_id().map(str::to_string);
-        if expected_active_turn_id.is_some() && expected_active_turn_id != actual {
+        // 没带轮次 id 不代表「旁支是空闲的」——只代表调用方**不知道**当前跑的是
+        // 哪一轮。TUI 拿到 turn id 是通过异步事件，用户提交问题后、那条事件被
+        // 消费前按 `/side-close`，本地就是 `None`。此时放行等于在用户没看到
+        // 任何确认的情况下，把一个正在回答的旁支连回答一起关掉。
+        //
+        // 只有「调用方认为空闲」且「实际也空闲」才是无条件关闭。
+        let unconfirmed_while_running = expected_active_turn_id.is_none() && actual.is_some();
+        if unconfirmed_while_running || expected_active_turn_id != actual {
             // 条件冲突:把 runner 放回去,什么都不改。误停一个更新的轮次比拒绝
             // 这次关闭糟得多。
             self.runner = Some(runner);
-            return Err(SideError::new(
-                SideErrorReason::CloseConflict,
-                "旁支已经开始了新的一轮，请确认后再关闭",
-            ));
+            // 两种冲突分开说：一种是「你确认的是旧轮次」，另一种是「你压根还
+            // 不知道它在跑」。后者的下一步动作不同（先看它跑完没有），用同一
+            // 句话会让人以为自己的确认过期了。
+            let message = if unconfirmed_while_running {
+                "旁支正在回答，请等它结束或先停止再关闭"
+            } else {
+                "旁支已经开始了新的一轮，请确认后再关闭"
+            };
+            return Err(SideError::new(SideErrorReason::CloseConflict, message));
         }
         let side_id = runner.side_id().to_string();
         let generation = runner.generation();
@@ -599,28 +641,98 @@ impl SideDriver {
         .await
     }
 
-    /// 把错误变成旁支里的一条 Notice:静默失败会让用户以为问题发出去了。
-    async fn report_error(&mut self, error: Option<SideError>) {
+    /// 当前 runner 是否就是调用方以为的那个旁支。
+    fn target_matches(&self, expected: &ConversationTarget) -> bool {
+        match (expected, self.runner.as_ref()) {
+            (
+                ConversationTarget::Side {
+                    side_id,
+                    generation,
+                },
+                Some(runner),
+            ) => runner.side_id() == side_id && runner.generation() == *generation,
+            // 主目标不是旁支调度的动作对象。
+            (ConversationTarget::Main, _) => false,
+            (_, None) => false,
+        }
+    }
+
+    /// 报告一个针对**已不匹配目标**的操作失败。
+    ///
+    /// 目标已经不在了，所以没有 runner、也没有转录可写：错误必须靠独立帧
+    /// 回给发起它的那个视图，否则就是「按了关闭，界面什么也没发生」。
+    async fn report_stale_target(
+        &mut self,
+        operation: SideOperation,
+        expected: &ConversationTarget,
+    ) {
+        let message = match operation {
+            SideOperation::Close => "旁问已经变化（可能已关闭或被替换），请刷新后再试",
+            SideOperation::Interrupt => "旁问已经变化（可能已关闭或被替换），停止未生效",
+            _ => "旁问已经变化（可能已关闭或被替换），请重试",
+        };
+        let _ = self
+            .dispatch_operation_error(expected.clone(), operation, message.to_string())
+            .await;
+    }
+
+    /// 把一次操作失败同时写进转录与独立错误帧。
+    ///
+    /// 两条路径都不是冗余的：转录让**正在看**这个旁支的人看到前后文，独立帧
+    /// 让**已经回到主视图**的人也能看到后台关闭失败——后者恰恰是最容易静默
+    /// 的一种（主视图不渲染旁支转录）。
+    async fn report_operation_error(&mut self, operation: SideOperation, error: Option<SideError>) {
         let Some(error) = error else {
             return;
         };
         tracing::warn!(
             reason = error.reason.as_str(),
             message = %error.message,
+            operation = ?operation,
             "side driver error"
         );
         let Some(runner) = self.runner.as_ref() else {
+            // `Open` 失败时还没有 runner：这是旧实现静默丢掉错误的那个分支。
+            // 错误必须回到发起方，目标用 `Main`——它是「用户在主视图里敲了
+            // /side」的那次请求，不属于任何旁支身份。
+            let _ = self
+                .dispatch_operation_error(
+                    ConversationTarget::Main,
+                    operation,
+                    error.message.clone(),
+                )
+                .await;
             return;
         };
-        let (side_id, generation) = (runner.side_id().to_string(), runner.generation());
+        let target = ConversationTarget::Side {
+            side_id: runner.side_id().to_string(),
+            generation: runner.generation(),
+        };
         let turn_id = runner.active_turn_id().unwrap_or_default().to_string();
-        let _ = (&side_id, generation);
         if let Some(transcript) = self.transcript.as_mut()
             && let Ok(items) = transcript.push_notice(&turn_id, &error.message)
         {
             self.queue_items(items);
             self.flush_items().await;
         }
+        let _ = self
+            .dispatch_operation_error(target, operation, error.message)
+            .await;
+    }
+
+    async fn dispatch_operation_error(
+        &mut self,
+        target: ConversationTarget,
+        operation: SideOperation,
+        message: String,
+    ) -> SideResult<()> {
+        dispatch(
+            &self.events,
+            target,
+            None,
+            ConversationPayload::SideOperationError { operation, message },
+        )
+        .await
     }
 
     fn ui_gone() -> SideError {

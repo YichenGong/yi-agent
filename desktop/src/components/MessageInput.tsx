@@ -4,6 +4,7 @@ import { ModeChip } from "./ModeChip";
 import { SlashPopup } from "./SlashPopup";
 import { filterCommands, parseSlashInput } from "../lib/slash";
 import { sideInputPolicy, type SideCommand } from "../lib/sideCommands";
+import type { SideSubmitReceipt } from "../lib/sideConversation";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import type { ThreadMode } from "../lib/threadPermissionMode";
 import type { PendingAttachment } from "../lib/attachmentLimits";
@@ -48,6 +49,8 @@ export function MessageInput({
   onCaretChange,
   conversation = DEFAULT_CONVERSATION,
   onSideCommand = null,
+  onSubmitSide = null,
+  conversationKey = "",
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -144,6 +147,25 @@ export function MessageInput({
    * 这与改动前的行为一致（`side` 那时不是目录里的命令）。
    */
   onSideCommand?: ((command: SideCommand) => boolean | Promise<boolean>) | null;
+  /**
+   * 旁支的普通文本提交。返回**三态收据**而不是 boolean。
+   *
+   * 收据必须留在 controller/store 手里：`accepted` 可以清稿，`rejected` 要把
+   * 原文还回去并给原因，`uncertain` 既不能清稿也不能当失败重发（服务端可能已经
+   * 受理，重发会让同一个问题被回答两次）。这里压成一个 boolean 就必然会丢掉
+   * 其中一种语义——那正是「清掉用户正在写的字」的来源之一。
+   *
+   * 因此本组件对三种结果都**不**清稿：清稿条件（身份 + 草稿修订全匹配）只有
+   * store 知道。
+   */
+  onSubmitSide?: ((text: string) => Promise<SideSubmitReceipt>) | null;
+  /**
+   * 当前会话的完整身份（主会话是父身份，旁支是含 generation 的完整序列化）。
+   *
+   * 只用来隔离本地 latch：一次还在路上的提交，其 `finally` 不能清掉用户切到
+   * 另一条会话之后新建的那次提交。
+   */
+  conversationKey?: string;
 }) {
   const [sending, setSending] = useState(false);
   // Latch: whether the popup should currently be offered. Escape clears it to
@@ -160,6 +182,28 @@ export function MessageInput({
   const latestDraft = useRef({ threadId, value });
   latestDraft.current = { threadId, value };
   const submitting = useRef(false);
+  /**
+   * 提交锁归属哪条会话。
+   *
+   * 一次提交的 `finally` 必须只清掉**它自己那条会话**的锁。否则：用户提交 A，
+   * 立刻切到 B 并提交，A 的回包落地时会把 B 的锁也解开——同一条消息就可能在
+   * 服务端被受理两次（spec §5.2「双击或重复 Enter 不重复发送」）。
+   *
+   * 旁支用 store 的收据管清稿，所以这里只负责「别重复发」这一件事。
+   */
+  const lockOwner = useRef<string | null>(null);
+  const holdsLock = () => submitting.current && lockOwner.current === conversationKey;
+  const takeLock = (): boolean => {
+    if (holdsLock()) return false;
+    submitting.current = true;
+    lockOwner.current = conversationKey;
+    return true;
+  };
+  const releaseLock = () => {
+    if (lockOwner.current !== conversationKey) return;
+    submitting.current = false;
+    lockOwner.current = null;
+  };
   const clearSubmittedDraft = (submittedText: string) => {
     if (latestDraft.current.threadId === threadId && latestDraft.current.value === submittedText) {
       onDraftChange("", threadId);
@@ -216,11 +260,31 @@ export function MessageInput({
     el.setSelectionRange(caretSeek.pos, caretSeek.pos);
   }, [caretSeek]);
 
+  /**
+   * 旁支里的一次普通提交。
+   *
+   * 三态收据都不在这里清稿：`accepted` 由 store 按「身份 + 草稿修订」清，
+   * `rejected` 把原文留在输入框（用户能直接改），`uncertain` 保持 pending 并
+   * 拒绝重复发送。组件层唯一能做的事是「别再发一次」。
+   */
+  const handleSideSend = async () => {
+    if (!text.trim() || disabled || onSubmitSide === null) return;
+    if (!takeLock()) return;
+    const submitted = text;
+    setSending(true);
+    try {
+      await onSubmitSide(submitted);
+    } finally {
+      releaseLock();
+      setSending(false);
+    }
+  };
+
   const handleSend = async () => {
     // 附件本身就是一条消息：只要有文字**或**至少一个附件就可以发；两者都空时
     // 才拦住（空 turn 没有意义）。
-    if ((!text.trim() && attachments.length === 0) || submitting.current || disabled) return;
-    submitting.current = true;
+    if ((!text.trim() && attachments.length === 0) || disabled) return;
+    if (!takeLock()) return;
     setSending(true);
     try {
       const ok = await onSend(text);
@@ -228,7 +292,7 @@ export function MessageInput({
       // the user's text would be lost on a rejected turn/start.
       if (ok) clearSubmittedDraft(text);
     } finally {
-      submitting.current = false;
+      releaseLock();
       setSending(false);
     }
   };
@@ -240,8 +304,8 @@ export function MessageInput({
    * 再判一次就会与策略分叉——旁支命令恰恰是手机运行中的合法例外。
    */
   const runSlash = async (name: string, args: string | null) => {
-    if (submitting.current || disabled) return;
-    submitting.current = true;
+    if (disabled) return;
+    if (!takeLock()) return;
     setSending(true);
     try {
       if (await onSlashCommand(name, args)) {
@@ -249,34 +313,48 @@ export function MessageInput({
         setPopupOpen(false);
       }
     } finally {
-      submitting.current = false;
+      releaseLock();
       setSending(false);
     }
   };
 
-  /** 执行旁支命令。不带 `onSideCommand` 时按普通命令回落。 */
+  /** 执行旁支命令。**所有**里层命令都交给 `onSideCommand`，绝不溜回父 slash。 */
   const runSideCommand = async (command: SideCommand) => {
-    if (submitting.current || disabled) return;
-    submitting.current = true;
+    if (disabled) return;
+    if (command.kind === "back") {
+      // 返回是纯本地动作：不占提交锁、不看 `sending`、不等任何在途请求。
+      // 把它排到一次提交后面就等于「网络慢的时候回不去」（spec §4.2）。
+      //
+      // 受理后仍要清掉**这次提交的命令文本**（与 `runSlash` 同一条规则）：留着
+      // `/back` 会让用户下次进来看到输入框里躺着一句命令。清稿条件仍是「正文
+      // 与提交时完全一致」，所以不会动他没提交过的编辑。
+      if (await onSideCommand?.(command)) clearSubmittedDraft(text);
+      return;
+    }
+    if (!takeLock()) return;
     setSending(true);
     try {
-      const accepted =
-        command.kind === "command"
-          ? await onSlashCommand(command.name, command.args)
-          : await (onSideCommand?.(command) ?? false);
+      // `command` 分支（help/config/usage）也必须走 `onSideCommand`：它读的是
+      // 旁支固定的脱敏配置与旁支自己的用量。转给 `onSlashCommand` 会把父的
+      // 模型和父的费用显示成旁支的（spec §4.2）。
+      const accepted = await (onSideCommand?.(command) ?? false);
       if (accepted) {
         clearSubmittedDraft(text);
         setPopupOpen(false);
       }
     } finally {
-      submitting.current = false;
+      releaseLock();
       setSending(false);
     }
   };
 
-  /** 策略拦截时的一句话。不清稿、不发请求。 */
-  const blockedReason = policy.reason ?? null;
-  void blockedReason;
+  /**
+   * 策略拦截时的一句话。不清稿、不发请求。
+   *
+   * 必须**可见**：用户敲了 `/clear` 却什么都没发生时，唯一能解释原因的地方
+   * 就是这里。语义上不是错误，所以用中性文字而不是红色横幅。
+   */
+  const blockedReason = policy.action === "blocked" ? (policy.reason ?? null) : null;
 
   /**
    * Enter, Send 与手机上的命令按钮**共用**这一条分派。
@@ -308,6 +386,12 @@ export function MessageInput({
       }
       return;
     }
+    if (isSideView && onSubmitSide !== null) {
+      // 旁支正文走收据接口：清稿由 store 按身份与草稿修订裁决，不经父 onSend
+      // 那条「true 就清稿」的分支（那会清掉 await 期间的新编辑）。
+      void handleSideSend();
+      return;
+    }
     void handleSend();
   };
 
@@ -316,9 +400,13 @@ export function MessageInput({
   //
   // 旁支里「运行中」时 Send 换成本会话的 Stop（见下方渲染）；策略判 `stop`
   // 时只保留 Stop，普通文字不得插话。
+  //
+  // 旁支里不用 `sending` 禁用输入区：一次提交还在路上时用户仍要能编辑、能打
+  // `/back`、能点 Stop。「别重复发」由 `takeLock` 按会话身份保证，而不是把整个
+  // 编辑器冻住（spec 全局约束「操作锁不禁用整个编辑器」）。
   const sendDisabled =
     disabled ||
-    sending ||
+    (sending && !isSideView) ||
     (!text.trim() && attachments.length === 0) ||
     policy.action === "stop" ||
     policy.action === "blocked";
@@ -331,6 +419,14 @@ export function MessageInput({
   return (
     <div className="relative border-t border-line bg-panel p-3">
       {showPopup && <SlashPopup commands={options} selected={selected} />}
+      {blockedReason !== null && (
+        // 明确拒绝必须可见：命令没执行、稿也没清，用户唯一能知道原因的途径
+        // 就是这一行（spec §5.3「错误、未确定提交、关闭冲突和权限不足属于操作
+        // 反馈，在现有消息/错误位置按需显示，无事件时不占位」）。
+        <p role="status" className="mb-2 px-1 text-xs text-amber-600">
+          {blockedReason}
+        </p>
+      )}
       {/*
        * 输入卡片：整卡承载边框、圆角与底色，聚焦（textarea 或卡内任意控件）时整卡高亮。
        * 边框从 textarea 搬到卡片上——这样"输入的地方"是一个整体，而不是一块输入框加
@@ -425,12 +521,18 @@ export function MessageInput({
             }}
             // Active turns stay editable. Only an in-flight submission or the
             // parent availability guard disables the textarea.
-            disabled={disabled || sending}
+            // 不用 `sending` 冻结文本区：一次提交还在路上时用户必须仍能编辑、
+            // 打 `/back`、点 Stop。重复发送由 `takeLock` 按会话身份拦住。
+            disabled={disabled}
             rows={3}
             placeholder={
-              isMobile
-                ? "Type a message… (Enter for newline, tap Send to send)"
-                : "Type a message… (Enter to send, Shift+Enter for newline)"
+              isSideView
+                ? isMobile
+                  ? "旁问 · 输入问题（Enter 换行，点发送）· /back 返回"
+                  : "旁问 · 输入问题（Enter 发送，Shift+Enter 换行）· /back 返回"
+                : isMobile
+                  ? "Type a message… (Enter for newline, tap Send to send)"
+                  : "Type a message… (Enter to send, Shift+Enter for newline)"
             }
             // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。卡片内是竖排，
             // 故 textarea 直接占满整行；宽度由 `w-full` 决定，不再需要 `flex-1` / `max-md:*`。
@@ -473,6 +575,29 @@ export function MessageInput({
             <div className="flex items-center gap-2 max-md:flex-wrap max-md:min-w-0 max-md:basis-full">
               <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
               {modelPicker}
+              {/*
+               * **一个主动作**。手机上尤其重要：软键盘没有 Enter-to-send，用户
+               * 唯一的出口就是这颗按钮，所以它必须根据输入自己变成「执行命令 /
+               * Stop / Send」，而不是并排三个按钮让用户猜该点哪个。
+               *
+               * 顺序就是策略的顺序：
+               * 1. 有一条**可执行**命令 → 执行它（桌面与手机都一样；这条是手机
+               *    Stop-only 的精确例外，`/btw ...`、`/back` 都走这里）。
+               * 2. 该轮在跑 → Stop（旁支里是旁支自己的 Stop）。
+               * 3. 否则 → Send。
+               */}
+              {/*
+               * Stop 与 Send 是**两颗独立**的按钮（桌面如此，也是既有行为）：
+               * 运行中仍然可以投递插话，同时 Stop 必须随手可点。
+               *
+               * 手机只留**一个主动作**：软键盘没有 Enter-to-send，用户唯一的出口
+               * 就是这颗按钮，所以它按输入自己变成「执行命令 / Stop / Send」。
+               * 也不能靠前缀（`/b`）绕过 Stop-only——只有**精确可执行**的命令
+               * 才切走 Stop（`policy.action === "executeSideCommand"`）。
+               *
+               * 任何情况下都不再有第三颗「命令」按钮：命令与发送共用同一条分派
+               * 与同一个主动作（spec §4.2）。
+               */}
               {turnActive && (
                 <button
                   type="button"
@@ -483,35 +608,32 @@ export function MessageInput({
                   Stop
                 </button>
               )}
-              {hasSideCommand && (
+              {/*
+               * 旁支运行中：只有它自己的 Stop。文字仍可编辑，但「可编辑」不等于
+               * 「可发送」——旁支不插话、不排队（spec §4.2）。这里不能因为桌面
+               * 端主会话可以插话，就把 Send 也留给旁支。
+               */}
+              {/* 手机：命令与 Stop 共用同一颗主动作（不并排第三颗按钮）。 */}
+              {isSideView && turnActive ? null : isMobile && hasSideCommand ? (
                 <button
                   type="button"
                   onClick={handleSendClick}
-                  disabled={disabled || sending}
-                  className="rounded-md border border-line-strong px-3 py-2 text-sm text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50 max-md:ml-auto"
-                >
-                  命令
-                </button>
-              )}
-              {(!turnActive || !isMobile) && !isSideView && (
-                <button
-                  type="button"
-                  onClick={handleSendClick}
-                  disabled={sendDisabled}
+                  disabled={disabled}
                   className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
                 >
-                  Send
+                  执行命令
                 </button>
-              )}
-              {isSideView && !turnActive && (
-                <button
-                  type="button"
-                  onClick={handleSendClick}
-                  disabled={sendDisabled}
-                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
-                >
-                  Send
-                </button>
+              ) : (
+                (!isMobile || !turnActive) && (
+                  <button
+                    type="button"
+                    onClick={handleSendClick}
+                    disabled={sendDisabled}
+                    className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
+                  >
+                    Send
+                  </button>
+                )
               )}
             </div>
           </div>

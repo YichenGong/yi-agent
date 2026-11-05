@@ -409,15 +409,6 @@ fn ctrl_q_exits_from_both_modes() {
 // --- 呈现 ---------------------------------------------------------------
 
 #[test]
-fn side_header_names_the_parent_state() {
-    assert!(side_header_line(false, false).contains("父会话空闲"));
-    assert!(side_header_line(true, false).contains("父会话运行中"));
-    assert!(side_header_line(true, true).contains("父会话等待审批"));
-    let header = side_header_line(true, false);
-    assert!(header.contains("只读") && header.contains("/back") && header.contains("/side-close"));
-}
-
-#[test]
 fn close_reason_text_is_explicit_for_every_reason() {
     // 每一个关闭原因都得有话说:静默关闭会让用户不知道旁支去哪了。
     for reason in [

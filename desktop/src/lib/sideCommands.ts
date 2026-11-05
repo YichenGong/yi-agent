@@ -171,27 +171,32 @@ function validateSideCommand(
       // 已在调用方按白名单筛过；这里只把它原样交给作用域内执行。
       return { action: "executeSideCommand", command };
     case "back":
-      // 返回永远可用：它不改变任何服务端状态。主视图里执行它等于空操作，
-      // 由调用方自己决定是否提示。
+      // 返回永远可用：它不改变任何服务端状态，所以能力、权限、连接态、同步态
+      // 都不该拦住它。Creating 中也要能撤销「完成后进入」的意图（spec §4.2）。
+      // 主视图里执行它等于空操作，由调用方给一句「已在主会话」。
       return { action: "executeSideCommand", command };
     case "close":
+      // 关闭需要 Control：它改变服务端状态。但**不**要求当前就在旁支视图里
+      // ——主视图也应能关掉后台旁问（spec §4.2「不能因未在旁问视图而简单拒绝」）。
       if (!input.canControl) {
         return { action: "blocked", reason: "只读设备不能关闭旁问" };
-      }
-      if (input.view !== "side") {
-        return { action: "blocked", reason: "当前没有打开的旁问" };
       }
       return { action: "executeSideCommand", command };
     case "open":
       if (!input.supported) {
         return { action: "blocked", reason: "当前宿主不支持旁问" };
       }
-      if (!input.canControl) {
-        return { action: "blocked", reason: "只读设备不能发起旁问" };
-      }
       if (input.view === "side") {
         // 不嵌套：转成主输入会把用户的话发到父会话上，那是更糟的误解。
         return { action: "blocked", reason: "旁问里不能再次发起旁问" };
+      }
+      if (!input.canControl) {
+        // 只读设备**无参**的 open 是查看例外：它只 list/readItems 已有旁问，
+        // 不创建 runner、不提问（spec §4.3）。带问题就必须拒绝——发问是 Control。
+        if (command.question !== "") {
+          return { action: "blocked", reason: "只读设备只能查看旁问，不能发起提问" };
+        }
+        return { action: "executeSideCommand", command };
       }
       // 父会话跑着也能开旁支——这正是它存在的理由。手机上 Stop-only 的既有
       // 约束只管普通文字，不管这条显式命令（spec §9.3「精确例外」）。
