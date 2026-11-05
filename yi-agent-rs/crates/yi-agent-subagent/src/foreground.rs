@@ -532,9 +532,50 @@ pub enum RecoveryAction {
     /// Freeze and stop, then report whether a confirmation may be issued.
     Prepare { operation_id: String },
     /// Commit a prepared recovery.
-    Confirm { operation_id: String, token: String },
+    ///
+    /// Carries no token. The confirmation token is issued to `prepare`, and the
+    /// component that ran it keeps it in memory and hands it here through
+    /// [`ConfirmedRecovery::token`]. Putting it in the command line would put a
+    /// secret into shell history, `ps` output and the transcript.
+    Confirm { operation_id: String },
     /// Read one operation's stored status.
     Operation { operation_id: String },
+}
+
+/// A confirmation plus the token that authorizes it.
+///
+/// Separate from [`RecoveryAction`] so the action itself stays printable and
+/// loggable: `Debug` on this type redacts the token, and only the call site that
+/// actually speaks to the daemon reads it. The token never crosses the control
+/// channel as a command argument.
+#[derive(Clone)]
+pub struct ConfirmedRecovery {
+    pub operation_id: String,
+    token: String,
+}
+
+impl ConfirmedRecovery {
+    pub fn new(operation_id: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            token: token.into(),
+        }
+    }
+
+    /// Only the daemon call reads this. Keeping it a method makes the read sites
+    /// greppable, which is the point of `SecretCapability::expose`.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for ConfirmedRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmedRecovery")
+            .field("operation_id", &self.operation_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What one recovery action produced, shaped for the host to render.
@@ -570,6 +611,16 @@ pub struct ForegroundHost {
     /// Authorizations by root key. The queue is per process because a bind needs the
     /// same authorization across a retry around the host's own reconnection.
     authorized: std::sync::Mutex<std::collections::HashMap<String, RootAuthorization>>,
+    /// Confirmation tokens issued to this host by its own `prepare`, by operation id.
+    ///
+    /// Kept here rather than handed back to the caller because a token that crossed
+    /// the control channel would become a command argument, and a command argument
+    /// lands in shell history and `ps`. The host is the only party that can run
+    /// `confirm` on the same lease anyway, so it is the right holder.
+    ///
+    /// Not persisted: a token lives 60 seconds and dies with the process, which is
+    /// the durability it is supposed to have.
+    pending: std::sync::Mutex<std::collections::HashMap<String, ConfirmedRecovery>>,
 }
 
 impl ForegroundHost {
@@ -598,6 +649,7 @@ impl ForegroundHost {
         Ok(Some(Self {
             lease,
             authorized: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -657,22 +709,47 @@ impl ForegroundHost {
                     operation_id: operation_id.clone(),
                 };
                 match self.lease.prepare_root_recovery(&request, &deadline) {
-                    Ok(Some(status)) => Ok(RecoveryOutcome::Status(status)),
+                    Ok(Some(status)) => {
+                        // Remember the token only when the daemon actually issued one.
+                        // A blocked preparation has no token, and storing a placeholder
+                        // would make `confirm` look available for work that is still
+                        // running.
+                        if let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(
+                            preview,
+                        ) = &status
+                            && let Some(token) = &preview.confirmation_token
+                        {
+                            self.remember_confirmation(ConfirmedRecovery::new(
+                                operation_id.clone(),
+                                token.expose(),
+                            ));
+                        }
+                        Ok(RecoveryOutcome::Status(status))
+                    }
                     Ok(None) => Err(ForegroundClientError::Protocol(
                         "the daemon has no record of this recovery operation".into(),
                     )),
                     Err(error) => Err(ForegroundRecoveryHost::classify("prepare", error)),
                 }
             }
-            RecoveryAction::Confirm {
-                operation_id,
-                token,
-            } => {
+            RecoveryAction::Confirm { operation_id } => {
+                let confirmed = self
+                    .pending_confirmation(operation_id)
+                    .ok_or_else(|| {
+                        ForegroundClientError::Rejected(
+                            yi_agent_lifecycle::foreground::ForegroundFailure::new(
+                                yi_agent_lifecycle::foreground::ForegroundErrorCode::ConfirmationRequired,
+                                "confirm: no prepared token is held for this operation; run prepare first",
+                            ),
+                        )
+                    })?;
                 let request = yi_agent_lifecycle::foreground::RecoveryRequest {
                     expected: fence.clone(),
                     operation_id: operation_id.clone(),
                 };
-                let secret = yi_agent_lifecycle::foreground::SecretCapability::new(token.clone());
+                let secret = yi_agent_lifecycle::foreground::SecretCapability::new(
+                    confirmed.token().to_string(),
+                );
                 match self
                     .lease
                     .confirm_root_recovery(&request, &secret, &deadline)
@@ -690,6 +767,27 @@ impl ForegroundHost {
                 .map(RecoveryOutcome::Operation)
                 .map_err(|error| ForegroundRecoveryHost::classify("operation", error)),
         }
+    }
+
+    /// Keeps the token a successful prepare issued, so the matching confirm can use it.
+    ///
+    /// Replacing an older token for the same id is correct: a re-prepare mints a new
+    /// token and invalidates the old one, so keeping both would let a stale value be
+    /// tried against a live operation.
+    fn remember_confirmation(&self, confirmed: ConfirmedRecovery) {
+        self.pending
+            .lock()
+            .expect("pending confirmation mutex poisoned")
+            .insert(confirmed.operation_id.clone(), confirmed);
+    }
+
+    /// The token this host holds for `operation_id`, if any.
+    fn pending_confirmation(&self, operation_id: &str) -> Option<ConfirmedRecovery> {
+        self.pending
+            .lock()
+            .expect("pending confirmation mutex poisoned")
+            .get(operation_id)
+            .cloned()
     }
 
     /// Opens a turn for `root`, binding this host as its driver on first use.
@@ -1298,6 +1396,84 @@ mod tests {
             !source.contains(&tool_impl),
             "recovery must not be reachable as a model tool"
         );
+    }
+
+    /// The token the host keeps after a prepare must never appear in a `Debug`
+    /// rendering. A confirmation is logged by callers that hold the struct, and a
+    /// secret in a log line is a secret in whatever the user later shares.
+    #[test]
+    fn foreground_root_lifecycle_confirmed_recovery_redacts_its_token() {
+        let confirmed = ConfirmedRecovery::new("op-1", "super-secret-token");
+        let rendered = format!("{confirmed:?}");
+        assert!(rendered.contains("op-1"));
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "the debug rendering leaked the token: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
+        // The token is still reachable where it is actually needed.
+        assert_eq!(confirmed.token(), "super-secret-token");
+    }
+
+    /// Only a prepare that the daemon actually issued a token for may be remembered.
+    ///
+    /// A blocked preparation carries no token, and storing a placeholder would make
+    /// `confirm` look available for work that is still running. The rule is asserted
+    /// over the status shape rather than a live daemon, because the point is what the
+    /// host does with an existing answer.
+    #[test]
+    fn foreground_root_lifecycle_only_a_ready_preview_yields_a_token() {
+        use yi_agent_lifecycle::foreground::{
+            RecoveryImpact, RecoveryOperationStatus, RecoveryPreview, RecoveryRequest, RootRef,
+            SecretCapability,
+        };
+
+        let root = RootRef {
+            session_id: "s".into(),
+            root_id: "r".into(),
+            attempt_id: "a".into(),
+        };
+        let request = RecoveryRequest {
+            expected: ForegroundFence {
+                root: root.clone(),
+                generation: "g".into(),
+                binding_epoch: 1,
+                driver_epoch: 1,
+            },
+            operation_id: "op-1".into(),
+        };
+        let impact = RecoveryImpact {
+            root: root.clone(),
+            stopped_execution_ids: Vec::new(),
+            blocked_execution_ids: vec!["exec-1".into()],
+            child_ids: Vec::new(),
+            version: 1,
+            reason: "frozen".into(),
+        };
+
+        // Blocked: no token to remember.
+        let blocked = RecoveryOperationStatus::Blocked(impact.clone());
+        assert!(matches!(blocked, RecoveryOperationStatus::Blocked(_)));
+
+        // Ready: exactly the shape whose token the host stores.
+        let ready = RecoveryOperationStatus::Ready(RecoveryPreview {
+            request,
+            impact,
+            confirmation_token: Some(SecretCapability::new("token-1")),
+            expires_at: Some("2026-11-04T00:00:00Z".into()),
+        });
+        match ready {
+            RecoveryOperationStatus::Ready(preview) => {
+                assert_eq!(
+                    preview
+                        .confirmation_token
+                        .expect("a ready preview must carry a token")
+                        .expose(),
+                    "token-1"
+                );
+            }
+            other => panic!("expected ready, got {other:?}"),
+        }
     }
 
     #[test]

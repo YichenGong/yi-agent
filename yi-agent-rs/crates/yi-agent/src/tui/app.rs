@@ -2821,9 +2821,11 @@ enum KeyOutcome {
 /// * no argument / `status <id>` / `<id>` -- read the stored operation, or read the
 ///   impact for this conversation. Neither stops anything.
 /// * `prepare <id>` -- the first mutating step, which is why it must be typed out.
-/// * `confirm <id>` -- commits a prepared operation. The token is **not** an argument:
-///   it is read from `YI_AGENT_RECOVERY_TOKEN`. A token in argv would land in shell
-///   history, `ps` output and any transcript that echoes the command.
+/// * `confirm <id>` -- commits a prepared operation.
+///
+/// No shape accepts a token. The driver keeps the token its own `prepare` was
+/// issued, in memory, so nothing secret ever becomes a command argument (and thus
+/// shell history, `ps` output, or a transcript that echoes the command).
 ///
 /// The operation id is chosen by the user and reused across retries; this parser never
 /// invents one, because a lost answer must be resolved by asking about the *same*
@@ -2831,25 +2833,9 @@ enum KeyOutcome {
 fn parse_recover_args(
     args: Option<&str>,
 ) -> Result<yi_agent_subagent::foreground::RecoveryAction, String> {
-    // Reading the environment is the *only* place a secret enters this path, and it
-    // is read here rather than in the driver so the driver never has to know how the
-    // user supplied it.
-    let token = std::env::var("YI_AGENT_RECOVERY_TOKEN").ok();
-    parse_recover_args_with_token(args, token.as_deref())
-}
-
-/// The parse without the environment, so the rules can be tested directly.
-///
-/// Split from [`parse_recover_args`] because setting a process-wide variable from a
-/// test is `unsafe` (other threads may read it) and would make these assertions
-/// order-dependent. The production wrapper is the only caller that reads the env.
-fn parse_recover_args_with_token(
-    args: Option<&str>,
-    token: Option<&str>,
-) -> Result<yi_agent_subagent::foreground::RecoveryAction, String> {
     use yi_agent_subagent::foreground::RecoveryAction;
 
-    let usage = "用法: /recover-root [status <operation-id>] | /recover-root <operation-id> | /recover-root prepare <operation-id> | /recover-root confirm <operation-id>（token 经 YI_AGENT_RECOVERY_TOKEN 传入）";
+    let usage = "用法: /recover-root [status <operation-id>] | /recover-root <operation-id> | /recover-root prepare <operation-id> | /recover-root confirm <operation-id>";
     let text = args.unwrap_or("").trim();
     if text.is_empty() {
         return Ok(RecoveryAction::Inspect);
@@ -2872,18 +2858,9 @@ fn parse_recover_args_with_token(
             operation_id: (*id).to_string(),
         }),
         ("prepare", _) => Err(usage.to_string()),
-        ("confirm", [id]) => {
-            let token = token
-                .filter(|token| !token.trim().is_empty())
-                .ok_or_else(|| {
-                    "确认恢复需要 token：请从预览结果取出并设入 YI_AGENT_RECOVERY_TOKEN 后重试（不接受命令行参数，以免进入 shell 历史）"
-                        .to_string()
-                })?;
-            Ok(RecoveryAction::Confirm {
-                operation_id: (*id).to_string(),
-                token: token.to_string(),
-            })
-        }
+        ("confirm", [id]) => Ok(RecoveryAction::Confirm {
+            operation_id: (*id).to_string(),
+        }),
         ("confirm", _) => Err(usage.to_string()),
         _ => Err(usage.to_string()),
     }
@@ -15982,7 +15959,7 @@ mod notification_tests {
 
 #[cfg(test)]
 mod foreground_recover_args_tests {
-    use super::{parse_recover_args, parse_recover_args_with_token};
+    use super::parse_recover_args;
     use yi_agent_subagent::foreground::RecoveryAction;
 
     /// A bare invocation only reads. Opening the panel must not stop work the user
@@ -16018,31 +15995,21 @@ mod foreground_recover_args_tests {
         assert!(parse_recover_args(Some("prepare")).is_err());
     }
 
-    /// The token must not be reachable as an argument. This is the property that
-    /// keeps it out of shell history, `ps` output and any echoed transcript.
+    /// No shape takes a token. The driver holds the one its own prepare was issued,
+    /// so a token can never become a command argument -- and thus shell history,
+    /// `ps` output, or an echoed transcript.
     #[test]
-    fn foreground_root_lifecycle_recover_root_confirm_takes_the_token_from_the_environment() {
-        // No token: refuse, and say where the token belongs.
-        let refused = parse_recover_args_with_token(Some("confirm op-1"), None);
-        assert!(refused.is_err());
-        assert!(
-            refused.unwrap_err().contains("YI_AGENT_RECOVERY_TOKEN"),
-            "the refusal must name the environment variable"
-        );
-        // A blank token is the same as none: `YI_AGENT_RECOVERY_TOKEN=` must not
-        // become an empty capability the daemon would reject as a protocol error.
-        assert!(parse_recover_args_with_token(Some("confirm op-1"), Some("  ")).is_err());
-
+    fn foreground_root_lifecycle_recover_root_confirm_takes_no_token() {
         assert_eq!(
-            parse_recover_args_with_token(Some("confirm op-1"), Some("secret-token")),
+            parse_recover_args(Some("confirm op-1")),
             Ok(RecoveryAction::Confirm {
                 operation_id: "op-1".to_string(),
-                token: "secret-token".to_string(),
             })
         );
-        // The token is never accepted as an argument, so a command line that carried
-        // one is rejected rather than silently ignored.
-        assert!(parse_recover_args_with_token(Some("confirm op-1 secret-token"), None).is_err());
+        // A command line that carried a token is refused rather than silently
+        // ignored, so a user who believed they had supplied it is told otherwise.
+        assert!(parse_recover_args(Some("confirm op-1 secret-token")).is_err());
+        assert!(parse_recover_args(Some("confirm")).is_err());
     }
 
     #[test]

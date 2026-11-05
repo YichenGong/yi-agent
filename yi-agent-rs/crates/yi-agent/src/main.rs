@@ -4123,7 +4123,7 @@ fn describe_recovery(
             )
         }
         (RecoveryAction::Prepare { operation_id }, RecoveryOutcome::Status(status))
-        | (RecoveryAction::Confirm { operation_id, .. }, RecoveryOutcome::Status(status)) => {
+        | (RecoveryAction::Confirm { operation_id }, RecoveryOutcome::Status(status)) => {
             match status {
                 RecoveryOperationStatus::Preparing => {
                     format!("恢复 {operation_id} 正在停止旧执行…")
