@@ -41,6 +41,10 @@
 
 /target
 
+# Probe-only build tree (plugin-probe feature; never shipped)
+/target-probe/
+desktop/src-tauri/target-probe/
+
 # npm package binaries (构建时填充,不入版本控制)
 yi-agent-rs/yi-agent-cli/platforms/*/binaries/
 yi-agent-rs/yi-agent-cli/platforms/*/yi-agent.app/

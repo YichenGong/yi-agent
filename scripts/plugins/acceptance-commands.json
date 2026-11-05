@@ -1,0 +1,237 @@
+{
+  "schemaVersion": 1,
+  "note": "A01–A20 各自由哪条命令证明。这是执行器的唯一真相：报告里任何用例的 pass 都必须能追到这里的某条命令真的跑过。缺命令即为缺证据，不是可以跳过的项；有 unsupportedWithout 的用例在该能力缺席时如实记 unsupported，而不是把失败粉饰成跳过。`cwd` 是相对仓库根的工作目录——cargo 与 fault-matrix 都必须在 yi-agent-rs 里跑，从仓库根跑会得到「找不到 Cargo.toml」，把环境错误冒充成实现失败。 A16/A17 绑定的 e2e-remote.mjs 尚未实现，因此它们把该文件列为前置需求：文件不在即 unsupported 并点名缺它，而不是让一个不存在的脚本变成「跑过但失败」。 A16/A17 现在绑到 e2e-remote.mjs：它要求 --host/--remote-path（以及 A16 的 --local-version）由环境变量给出，缺主机时判 unsupported，连不上或握手失败判 fail。 A16/A17 绑到 e2e-remote.mjs；主机与路径从环境读（YI_AGENT_ACCEPTANCE_REMOTE_HOST / _REMOTE_PATH / _LOCAL_VERSION），因为 e2e.mjs 的 parseCommand 不过 shell、不展开 $VAR，把变量写进命令里只会得到字面量。缺主机判 unsupported，连不上或握手失败判 fail。",
+  "cases": [
+    {
+      "id": "A01",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "python3 scripts/plugins/check-host-boundary.py"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A02",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-supervisors -E 'test(install::tests)'",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A03",
+      "commands": [
+        {
+          "kind": "artifact",
+          "run": "bash scripts/verify-plugin-update.sh \"$YI_AGENT_ACCEPTANCE_APP\" .",
+          "needs": [
+            "yi-agent-rs/target/debug/yi-agent",
+            "yi-agent-rs/target/debug/plugin-pack"
+          ],
+          "requires": "official"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A04",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-supervisors -E 'test(managed_launch)'",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A05",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-plugins -E 'test(admission)'",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A06",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "cargo nextest run -p yi-agent-skills --test managed_source",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A07",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "CARGO_TARGET_DIR=target-probe npm run tauri -- build --bundles app --features plugin-probe",
+          "cwd": "desktop"
+        },
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A08",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "CARGO_TARGET_DIR=target-probe npm run tauri -- build --bundles app --features plugin-probe",
+          "cwd": "desktop"
+        },
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A09",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A10",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A11",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A12",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A13",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A14",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A15",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A16",
+      "commands": [
+        {
+          "kind": "remote",
+          "run": "node scripts/plugins/e2e-remote.mjs --case A16 --json",
+          "emitsRemoteIdentity": true
+        }
+      ],
+      "unsupportedWithout": "remote"
+    },
+    {
+      "id": "A17",
+      "commands": [
+        {
+          "kind": "remote",
+          "run": "node scripts/plugins/e2e-remote.mjs --case A17 --json",
+          "emitsRemoteIdentity": true
+        }
+      ],
+      "unsupportedWithout": "remote"
+    },
+    {
+      "id": "A18",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A19",
+      "commands": [
+        {
+          "kind": "command",
+          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "cwd": "yi-agent-rs"
+        }
+      ],
+      "unsupportedWithout": null
+    },
+    {
+      "id": "A20",
+      "commands": [
+        {
+          "kind": "official",
+          "run": "python3 scripts/plugins/verify-active-release.py",
+          "requires": "official"
+        }
+      ],
+      "unsupportedWithout": "official"
+    }
+  ]
+}

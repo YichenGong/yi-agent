@@ -301,11 +301,25 @@ plugin-boundary-check:
     python3 ../scripts/plugins/check-host-boundary.py
     python3 -m unittest discover -s ../scripts/plugins -p 'test_check_host_boundary.py'
 
-# 验收报告校验器：A01–A20 必须各有且仅有一个最终结果，全部 pass，且证据形态
-# 合规（probe 构建不能冒充正式包；A16/A17 不能用 loopback 冒充远端）。
+# 验收报告校验器与执行器：A01–A20 必须各有且仅有一个最终结果，全部 pass，且
+# 证据形态合规（probe 构建不能冒充正式包；A16/A17 不能用 loopback 冒充远端）。
+# 执行器自身的决策/执行层也要在这里自测——它是产出证据的唯一来源，
+# 它错了，上面的校验器只会忠实地校验一份错的报告。
 plugin-acceptance-check:
     node --test ../scripts/plugins/e2e-report.test.mjs
     node --test ../scripts/plugins/fault-matrix.test.mjs
+    node --test ../scripts/plugins/e2e.test.mjs
+    node --test ../scripts/plugins/remote-facts.test.mjs
+    node --test ../scripts/plugins/remote-client.test.mjs
+    node --test ../scripts/plugins/e2e-remote.test.mjs
+
+# 真跑 A01–A20 并写出验收报告（T27）。默认只跑 probe 构建：A16/A17 在没有
+# 远端主机时如实记 unsupported，A20 在没有官方签名包时同样记 unsupported——
+# 这两条是发布门槛，不是本地能糊过去的东西。
+#   just plugin-acceptance-run                       # 写 report.json
+#   just plugin-acceptance-run --suite A01 --require-pass
+plugin-acceptance-run *args:
+    node ../scripts/plugins/e2e.mjs --output ../.artifacts/plugins/acceptance.json {{args}}
 
 # 真跑故障注入矩阵（T27 Step 2）。慢（要编译三个 crate），故不进 `ci`；
 # 想留证据时加 `just plugin-fault-matrix`，报告写到 .artifacts/。

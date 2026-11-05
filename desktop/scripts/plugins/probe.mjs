@@ -53,6 +53,7 @@ function parseArgs(argv) {
   let suite = DEFAULT_SUITE;
   let output = null;
   let fixture = null;
+  let app = null;
   let keep = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -66,6 +67,13 @@ function parseArgs(argv) {
         break;
       case "--fixture-root":
         fixture = argv[++index] ?? null;
+        break;
+      case "--app":
+        // 显式 bundle 路径。tauri CLI 会把 CARGO_TARGET_DIR 相对 src-tauri/
+        // 再解析一次，所以靠环境变量把构建隔离到别处时，探针按 cargo metadata
+        // 找到的目录和产物实际落点不是同一个（实测被拼成 desktop/src-tauri/
+        // desktop/src-tauri/...）。由调用方给出产物路径最不容易出错。
+        app = argv[++index] ?? null;
         break;
       case "--keep-instance":
         keep = true;
@@ -90,6 +98,7 @@ function parseArgs(argv) {
       fixture ?? path.join("plugins", "fixtures", "example-counter", "probe"),
     ),
     keep,
+    app: app === null ? null : path.resolve(REPO_ROOT, app),
   };
 }
 
@@ -101,6 +110,7 @@ function printUsage() {
       "  --output <path>        where the native report is written (required)",
       "  --suite <name>         probe suite to run (default: isolation)",
       "  --fixture-root <path>  plugin fixture to serve (default: example-counter/probe)",
+      "  --app <path>           build this bundle instead of resolving one via cargo metadata",
       "  --keep-instance        keep the temporary instance root for inspection",
       "",
     ].join("\n"),
@@ -168,9 +178,10 @@ function productName() {
   return name;
 }
 
-function resolveBundle(targetDirectoryPath) {
+function resolveBundle(targetDirectoryPath, explicitBundle = null) {
   const appName = productName();
-  const bundle = path.join(targetDirectoryPath, "release", "bundle", "macos", `${appName}.app`);
+  const bundle =
+    explicitBundle ?? path.join(targetDirectoryPath, "release", "bundle", "macos", `${appName}.app`);
   if (!existsSync(bundle)) {
     throw new Error(
       `bundle not found at ${bundle}\n` +
@@ -258,7 +269,7 @@ async function runProbe(options) {
   }
 
   const targetDirectoryPath = targetDirectory();
-  const { bundle, executable } = resolveBundle(targetDirectoryPath);
+  const { bundle, executable } = resolveBundle(targetDirectoryPath, options.app);
   const executableSha256 = sha256File(executable);
   const bundleSha256 = sha256Tree(bundle);
 
