@@ -68,6 +68,50 @@ pub enum IpcRequest {
         root_task_id: String,
         capability: String,
     },
+    /// Binds the one driver allowed to report this root's activity.
+    ///
+    /// The authorization is the guardian-issued one, not a client-reported id: the
+    /// daemon validates it against its own authority table, so a tool process cannot
+    /// obtain a driver by naming an owner. `operation_id` is the identity of the bind:
+    /// a retried request replays the issued epoch instead of minting a second one.
+    BindApplicationRootDriver {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        operation_id: String,
+    },
+    /// Reports what the conversation is doing, under the driver's own fence.
+    ///
+    /// This is not a heartbeat: applying a report never extends the owner's lease and
+    /// never marks progress. A report that is stale, from another epoch, or about
+    /// another turn is refused with a stable code.
+    SetApplicationRootActivity {
+        driver_capability: yi_agent_lifecycle::foreground::SecretCapability,
+        update: yi_agent_lifecycle::foreground::ActivityUpdate,
+    },
+    /// Reads the committed activity of one root. Never writes, never extends.
+    GetApplicationRootActivity {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        root: yi_agent_lifecycle::foreground::RootRef,
+    },
+    /// Freezes and stops a root's executions, then offers a confirmation if proven.
+    ///
+    /// Separate from the commit so the host can show the impact first. Not a model
+    /// tool: the confirmation has to come from a party the user actually sees.
+    PrepareApplicationRootRecovery {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+    },
+    /// Commits a prepared recovery against the confirmation the daemon issued.
+    RecoverApplicationRoot {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+        confirmation_token: yi_agent_lifecycle::foreground::SecretCapability,
+    },
+    /// Reads one recovery operation's state, after re-authenticating the caller.
+    GetApplicationRootRecovery {
+        authorization: yi_agent_lifecycle::types::RootAuthorization,
+        root: yi_agent_lifecycle::foreground::RootRef,
+        operation_id: String,
+    },
     CreateSchedule {
         cron: String,
         objective: String,
@@ -354,6 +398,31 @@ pub enum IpcResponse {
     },
     ApplicationRootActivated,
     ApplicationRootDetached,
+    /// The driver binding the daemon issued. The capability is narrow: it authorises
+    /// activity writes for this epoch only, and is never shown to the UI.
+    ForegroundDriverBound {
+        binding: yi_agent_lifecycle::foreground::DriverBinding,
+    },
+    /// The activity snapshot after the report was applied (or the already-committed
+    /// one, when the report was a duplicate).
+    ForegroundActivity {
+        snapshot: yi_agent_lifecycle::foreground::ActivitySnapshot,
+    },
+    /// The activity snapshot of a root that has never reported one.
+    ForegroundActivityAbsent,
+    /// The state of one recovery operation: preparing, blocked, ready or committed.
+    ForegroundRecovery {
+        status: yi_agent_lifecycle::foreground::RecoveryOperationStatus,
+    },
+    /// No recovery operation exists under that id.
+    ForegroundRecoveryAbsent,
+    /// A structured foreground refusal.
+    ///
+    /// This is a response rather than an `Error` because the client has to dispatch on
+    /// `ForegroundErrorCode` and report exactly which executions blocked a stop. An
+    /// `invalid_state` with a message would force the caller to match English text,
+    /// which is the thing the design explicitly forbids.
+    ForegroundFailure(yi_agent_lifecycle::foreground::ForegroundFailure),
     ScheduleCreated {
         schedule_id: String,
     },

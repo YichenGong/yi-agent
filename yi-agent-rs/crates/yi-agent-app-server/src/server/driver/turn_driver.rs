@@ -67,7 +67,27 @@ pub(crate) async fn run_thread_driver(
     // 该 thread 的 cwd：`config.workdir` 在 driver 里被 clone 过多次，但
     // MCP 配置固定在 thread cwd 下的 `.yi-agent/mcp.json`，故显式传入更清楚。
     mcp_workdir: std::path::PathBuf,
+    // This process's authority to drive foreground roots, when it has one.
+    //
+    // `None` is the honest answer for an embedded runtime, a build without the
+    // contract and a runtime whose guardian refused; in every one of those the turn
+    // runs with legacy semantics, which is exactly the promise the contract makes.
+    // The host is shared by every thread because the control channel accounts for
+    // *clients*: one lease per thread would look like several frontends.
+    foreground_host: Option<Arc<crate::server::foreground::ForegroundDispatch>>,
 ) {
+    // Foreground authority is per *process*, so it is resolved once -- lazily, from
+    // the first root this thread is handed -- and kept for the life of the driver. A
+    // lease registered per turn would look like a new client every time and keep the
+    // runtime alive after the window closed.
+    let mut foreground_host: Option<Arc<crate::server::foreground::ForegroundDispatch>> =
+        foreground_host;
+    let mut foreground_host_resolved = foreground_host.is_some();
+    // The root this thread drives its activity through, captured on the turn that
+    // activated it. Later turns carry `activate: None` (activation is once per thread),
+    // so the driver has to remember instead of asking the prompt again.
+    let mut foreground_root: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>> = None;
+
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
     // 累计基线：本 thread 已落盘轮次之和。读失败按 0 处理——最坏是首次打开时
@@ -142,6 +162,9 @@ pub(crate) async fn run_thread_driver(
         if !activation_attempted {
             activation_attempted = true;
             if let Some(binding) = activate {
+                // Kept so every turn after this one can still report activity: the
+                // activation happens once per thread, so later prompts carry `None`.
+                foreground_root = Some(Arc::clone(&binding));
                 let objective = prompt.clone();
                 // 同步调用放到阻塞线程池:driver 是 async 任务,直接调用会占住 executor。
                 // `activate` 先探活、必要时重建 runtime,所以即便 daemon 在这轮之前
@@ -165,6 +188,26 @@ pub(crate) async fn run_thread_driver(
                 }
             }
         }
+        // Foreground activity for this turn. Resolved on the first root the driver sees
+        // and reused afterwards; a failure here leaves the turn running with legacy
+        // semantics rather than aborting a working conversation.
+        let mut foreground_turn: Option<yi_agent_subagent::foreground::ForegroundTurn> = None;
+        if !foreground_host_resolved {
+            foreground_host_resolved = true;
+            if let Some(root) = foreground_root.as_ref() {
+                match crate::server::foreground::ForegroundDispatch::connect_root(root) {
+                    Ok(Some(host)) => foreground_host = Some(Arc::new(host)),
+                    Ok(None) => {}
+                    Err(cause) => {
+                        tracing::warn!(%cause, "foreground authority unavailable for this thread")
+                    }
+                }
+            }
+        }
+        if let (Some(host), Some(root)) = (foreground_host.as_ref(), foreground_root.as_ref()) {
+            foreground_turn = host.begin(root, &turn_id);
+        }
+
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
         // `last_usage` 记录的是本轮**最后一次** provider 调用的完整快照
         // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
@@ -305,6 +348,11 @@ pub(crate) async fn run_thread_driver(
                 // 与其它 clear 站点同款：尽力删，失败只记 stderr，绝不影响 turn 收尾。
                 if let Err(e) = store.clear_partial(&thread_id) {
                     eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                }
+                // A failed run is still a finished turn: closing it here keeps the
+                // daemon's view from holding a turn that can never end.
+                if let Some(mut turn) = foreground_turn.take() {
+                    turn.finish();
                 }
                 continue;
             }
@@ -709,6 +757,9 @@ pub(crate) async fn run_thread_driver(
             if let Err(e) = store.clear_partial(&thread_id) {
                 eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
             }
+            if let Some(mut turn) = foreground_turn.take() {
+                turn.finish();
+            }
             continue;
         }
 
@@ -742,6 +793,12 @@ pub(crate) async fn run_thread_driver(
         // 收尾已把整轮 append 进主 jsonl；checkpoint 的使命结束。
         if let Err(e) = store.clear_partial(&thread_id) {
             eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+        }
+        // Closed on the normal path too, and after the turn is persisted: a close that
+        // ran first would tell the daemon the turn ended while it was still being
+        // written, which is the one ordering a reader can observe.
+        if let Some(mut turn) = foreground_turn.take() {
+            turn.finish();
         }
     }
 }

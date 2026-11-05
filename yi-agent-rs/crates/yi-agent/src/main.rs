@@ -1680,6 +1680,34 @@ fn activate_tui_runtime_root(
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+/// The `ThreadRoot` a TUI conversation drives its foreground activity through.
+///
+/// A *fixed* binding, because the TUI owns its daemon for the whole session: a
+/// liveness failure must not be repaired behind the conversation's back. It still
+/// carries the runtime directory, which is what lets the guardian be found at all --
+/// without it a managed deployment would silently behave like an embedded one.
+fn build_tui_foreground_root(
+    workdir: &std::path::Path,
+    socket_path: std::path::PathBuf,
+    attached_root: crate::tui::subagents::AttachedRoot,
+) -> Arc<yi_agent_subagent::thread_root::ThreadRoot> {
+    let handle = yi_agent_subagent::binding::RuntimeHandle {
+        socket_path,
+        workspace_root: attached_root.workspace.path.clone(),
+        session_id: attached_root.session_id.clone(),
+        task_id: attached_root.task_id.clone(),
+        capability: attached_root.capability.clone(),
+    };
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed_in(
+        runtime_directory_for(workdir),
+        handle,
+    );
+    // The root is already attached -- the TUI got it from `attach_tui_runtime` -- so
+    // this must adopt rather than re-attach: a second attach would be a new session
+    // for the same conversation.
+    yi_agent_subagent::thread_root::ThreadRoot::from_handle(binding, attached_root)
+}
+
 fn detach_tui_runtime_root(
     socket_path: &std::path::Path,
     root: &crate::tui::subagents::AttachedRoot,
@@ -3036,6 +3064,20 @@ fn run_tui_agent(
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut lease_lost_reported = false;
+            // The foreground driver for this conversation, once the runtime has
+            // authorized one. `None` is the honest state for an embedded runtime, a
+            // build without the contract, or a guardian that refused -- in all three
+            // the turn simply runs with legacy semantics.
+            let mut foreground: Option<yi_agent_subagent::foreground::ForegroundTurn> = None;
+            // Kept apart from `current_runtime` because the driver holds it across
+            // turns and must not be rebuilt when the agent is.
+            let mut foreground_root: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>> = None;
+            // One lease for this process, not one per conversation: the control channel
+            // accounts for *clients*, and a lease per thread would look like several
+            // frontends and keep the runtime alive after the window closed.
+            let foreground_host = std::sync::Arc::new(std::sync::Mutex::new(
+                None::<yi_agent_subagent::foreground::ForegroundHost>,
+            ));
             let mut current_runtime: Option<TuiRuntimeSession> = None;
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
@@ -3350,6 +3392,41 @@ fn run_tui_agent(
                                 }
                             }
                         }
+                        DriverControl::RecoverRoot(action) => {
+                            // Recovery runs here, in the task that holds the lease and
+                            // the binding fence. The slash handler cannot: it is
+                            // synchronous and sees neither, so a recovery it attempted
+                            // would have to invent the fence -- which is exactly the
+                            // caller-supplied id this design refuses.
+                            let outcome = match (foreground_host.lock(), foreground.as_ref()) {
+                                (Ok(host), Some(turn)) => match host.as_ref() {
+                                    Some(host) => host
+                                        .recover(&turn.binding().fence, &action)
+                                        .map_err(|error| error.to_string()),
+                                    None => Err(
+                                        "this runtime serves no foreground contract for this conversation"
+                                            .to_string(),
+                                    ),
+                                },
+                                // No open turn means nothing is known to be current:
+                                // a fence built from a guess would describe an attempt
+                                // nobody verified, and the daemon would refuse it
+                                // anyway. Say so instead of asking.
+                                _ => Err(
+                                    "no foreground binding is open for this conversation; start a turn first"
+                                        .to_string(),
+                                ),
+                            };
+                            let text = describe_recovery(&action, outcome);
+                            if let Some(hint) = text {
+                                let _ = agent_tx
+                                    .send(yi_agent_core::AgentEvent::Notice {
+                                        level: yi_agent_core::NoticeLevel::Info,
+                                        text: hint,
+                                    })
+                                    .await;
+                            }
+                        }
                         DriverControl::SetReasoningEffort(effort) => {
                             // `effort` 已由 TUI 按七档白名单校验；`None` = 清
                             // 覆盖，回落当前条目默认（`apply_selection` 写回的
@@ -3418,6 +3495,14 @@ fn run_tui_agent(
                                         embedded_daemon,
                                         supervisor,
                                     } = *attached;
+                                    // Captured before the fields are consumed by the
+                                    // tooling rebuild below: the foreground root needs
+                                    // the same socket and root triple the tools were
+                                    // handed.
+                                    let socket_path_for_foreground = socket_path.clone();
+                                    let attached_root_for_foreground = attached_root.clone();
+                                    let runtime_workdir_for_foreground =
+                                        attached_root.workspace.path.clone();
                                     if let Some(daemon) = &embedded_daemon {
                                         tracing::info!("embedded subagent runtime started for TUI");
                                         // A started daemon may have swept orphaned
@@ -3535,6 +3620,18 @@ fn run_tui_agent(
                                                     },
                                                 )));
                                             root_activated = false;
+                                            // The runtime is attached, so this
+                                            // conversation now has a root a host could
+                                            // drive. Whether it *may* is the guardian's
+                                            // answer, asked on the first turn (the
+                                            // authorization carries the objective's
+                                            // operation, which does not exist yet).
+                                            foreground_root = Some(build_tui_foreground_root(
+                                                &runtime_workdir_for_foreground,
+                                                socket_path_for_foreground.clone(),
+                                                attached_root_for_foreground.clone(),
+                                            ));
+                                            foreground = None;
                                         }
                                         Err(error) => {
                                             // The rebuild failed, so nothing here
@@ -3608,6 +3705,39 @@ fn run_tui_agent(
                             continue;
                         }
                     root_activated = true;
+                }
+
+                // Foreground activity is opened for this turn before any work runs,
+                // and closed on every exit path below. A failure here is a diagnostic,
+                // never a reason to abort: activity describes the conversation, it does
+                // not control it.
+                if let Some(root) = foreground_root.as_ref() {
+                    let mut host_slot = foreground_host
+                        .lock()
+                        .expect("foreground host mutex poisoned");
+                    if host_slot.is_none() {
+                        // A missing lease is normal (embedded mode) and means the
+                        // conversation keeps legacy semantics.
+                        if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
+                            &runtime_directory_for(&driver_workdir),
+                            yi_agent_lifecycle::types::ClientKind::Tui,
+                            crate::frontend_lease::new_client_run_id("tui-foreground"),
+                        ) {
+                            *host_slot = Some(host);
+                        }
+                    }
+                    if let Some(host) = host_slot.as_ref() {
+                        let turn_id = format!("tui-turn-{}", uuid::Uuid::new_v4());
+                        match host.begin(root, &format!("tui-bind-{}", std::process::id()), &turn_id)
+                        {
+                            Ok(Some(turn)) => foreground = Some(turn),
+                            Ok(None) => foreground = None,
+                            Err(cause) => {
+                                tracing::warn!(%cause, "foreground activity unavailable");
+                                foreground = None;
+                            }
+                        }
+                    }
                 }
 
                 // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
@@ -3756,6 +3886,13 @@ fn run_tui_agent(
                             eprintln!("[yi-agent] 更新 meta 失败: {e}");
                         }
                     }
+                }
+                // Close the turn on every path -- success, provider error and
+                // cancellation all reach here, which is why this is not inside any one
+                // of them. A turn left open would make the next one look like a second
+                // statement about a turn that never ended.
+                if let Some(mut turn) = foreground.take() {
+                    turn.finish();
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
 
@@ -3940,6 +4077,90 @@ pub(crate) enum DriverControl {
     /// then rebuild the agent. Backs `/mcp reload`: the user may have edited the
     /// file themselves, so this cannot rely on `mcp/set` having been called.
     McpReload,
+    /// Run one foreground-root recovery action on this host's own lease.
+    ///
+    /// Carried over the control channel rather than executed by the dispatch itself
+    /// because the lease and the binding fence live inside this driver task: a
+    /// synchronous slash handler can reach neither, and a recovery it ran would have
+    /// to invent one. The token is not accepted from the slash command line for the
+    /// same reason it never enters argv -- shell history and transcripts keep it.
+    RecoverRoot(yi_agent_subagent::foreground::RecoveryAction),
+}
+
+/// Renders one recovery outcome for the transcript line.
+///
+/// Only `Committed` reads as success. `Preparing`, `Blocked` and `NeedsPreview` are
+/// explicitly *not* it: reporting "recovered" for a blocked preparation would tell the
+/// user work had been repaired while the daemon still refuses to confirm it.
+///
+/// The wording never carries a token or a capability. The preview's token is held in
+/// the confirming component's memory; a transcript line that echoed it would put a
+/// secret into the log the user later shares.
+fn describe_recovery(
+    action: &yi_agent_subagent::foreground::RecoveryAction,
+    outcome: Result<yi_agent_subagent::foreground::RecoveryOutcome, String>,
+) -> Option<String> {
+    use yi_agent_lifecycle::foreground::RecoveryOperationStatus;
+    use yi_agent_subagent::foreground::{RecoveryAction, RecoveryOutcome};
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(reason) => return Some(format!("恢复请求未完成：{reason}")),
+    };
+    Some(match (action, outcome) {
+        (RecoveryAction::Inspect, RecoveryOutcome::Impact(impact)) => {
+            let blocked = if impact.blocked_execution_ids.is_empty() {
+                "无".to_string()
+            } else {
+                impact.blocked_execution_ids.join("、")
+            };
+            format!(
+                "恢复影响（{root}/{attempt}）：原因 {reason}；将停止 {} 个执行；未能证明停止：{blocked}。确认前不会停止任何工作。",
+                impact.stopped_execution_ids.len(),
+                root = impact.root.root_id,
+                attempt = impact.root.attempt_id,
+                reason = impact.reason,
+            )
+        }
+        (RecoveryAction::Prepare { operation_id }, RecoveryOutcome::Status(status))
+        | (RecoveryAction::Confirm { operation_id }, RecoveryOutcome::Status(status)) => {
+            match status {
+                RecoveryOperationStatus::Preparing => {
+                    format!("恢复 {operation_id} 正在停止旧执行…")
+                }
+                RecoveryOperationStatus::NeedsPreview => {
+                    format!("恢复 {operation_id}：运行时已重启，需要重新准备（停止事实仍保留）")
+                }
+                RecoveryOperationStatus::Blocked(impact) => format!(
+                    "恢复 {operation_id} 无法确认：仍有执行未能证明停止（{}）",
+                    impact.blocked_execution_ids.join("、")
+                ),
+                RecoveryOperationStatus::Ready(preview) => format!(
+                    "恢复 {operation_id} 已准备就绪：旧执行已停止，可用 `/recover-root confirm {operation_id}` 确认；有效期至 {}",
+                    preview.expires_at.as_deref().unwrap_or("未给出")
+                ),
+                RecoveryOperationStatus::Committed(result) => format!(
+                    "已完成恢复：{operation_id}，新 attempt {}",
+                    result.successor.attempt_id
+                ),
+            }
+        }
+        (RecoveryAction::Operation { operation_id }, RecoveryOutcome::Operation(status)) => {
+            match status {
+                None => format!("运行时没有恢复操作 {operation_id} 的记录"),
+                Some(status) => describe_recovery(
+                    &RecoveryAction::Prepare {
+                        operation_id: operation_id.clone(),
+                    },
+                    Ok(RecoveryOutcome::Status(status)),
+                )
+                .unwrap_or_default(),
+            }
+        }
+        // The action and the answer are produced together by one call, so a mismatch
+        // is a programming error rather than something a user can reach.
+        _ => "恢复请求与结果类型不匹配".to_string(),
+    })
 }
 
 /// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
@@ -6728,6 +6949,46 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(seen, vec![a, b]);
     }
+    /// The TUI's foreground root must keep the two things the guardian path needs.
+    ///
+    /// A fixed binding deliberately has no repair plan, so the runtime directory is the
+    /// *only* thing that can tell a managed TUI where its guardian is. Dropping it
+    /// would make a managed deployment behave like an embedded one, silently, with no
+    /// error to notice -- which is exactly the kind of regression a test has to pin.
+    #[test]
+    fn tui_foreground_root_carries_its_runtime_directory_and_root_triple() {
+        let workdir = std::path::Path::new("/tmp/tui-foreground-project");
+        let socket = std::path::PathBuf::from("/tmp/tui-foreground-project/rt/runtime.sock");
+        let root = build_tui_foreground_root(
+            workdir,
+            socket.clone(),
+            crate::tui::subagents::AttachedRoot {
+                session_id: "session-1".into(),
+                task_id: "root-1".into(),
+                capability: "cap-1".into(),
+                workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                    lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                    repository_root: std::path::PathBuf::from("/tmp/tui-foreground-project"),
+                    path: std::path::PathBuf::from("/tmp/tui-foreground-project"),
+                    branch: String::new(),
+                    parent_branch: String::new(),
+                    base_commit: String::new(),
+                },
+            },
+        );
+
+        assert_eq!(
+            root.thread_id(),
+            "session-1",
+            "the conversation, not the root task, is what keys a foreground root"
+        );
+        assert_eq!(
+            root.root_task_id().as_deref(),
+            Some("root-1"),
+            "the already-attached root must be adopted, not re-minted"
+        );
+    }
+
     /// Both frontends must consult the bring-up policy before starting a daemon.
     ///
     /// A source assertion is the honest tool here: the property is "this exact

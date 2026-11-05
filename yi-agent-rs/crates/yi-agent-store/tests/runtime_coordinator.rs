@@ -4911,3 +4911,920 @@ async fn a_lost_observer_keeps_the_lease() {
     );
     assert_eq!(coordinator.unconfirmed_stops().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Foreground root lifecycle: startup reconciliation (Task 2)
+// ---------------------------------------------------------------------------
+
+/// Opens a database with two roots inside a live session, then reopens it through the
+/// daemon's real startup path with the foreground switch on.
+///
+/// The point is the *interaction*: the generic sweep parks live work, and the
+/// foreground reconciliation has to run in the same window without either of them
+/// contradicting the other. A unit test on `recover_inflight_tasks_with_activation`
+/// alone cannot show that ordering.
+#[test]
+fn foreground_root_lifecycle_daemon_startup_keeps_a_managed_container_and_parks_execution() {
+    use yi_agent_store::foreground::{ForegroundActivation, RootExecutionClass};
+    use yi_agent_store::repository::foreground::{
+        AdmissionState, ForegroundClassification, PersistedForegroundRoot,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let runtime_dir = directory.path().join("runtime");
+
+    let (managed, execution, session) = {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        let session = RootSessionId::new();
+        let managed = TaskId::new();
+        let managed_attempt = AttemptId::new();
+        repository
+            .create_task_with_attempt(&managed, &session, &managed_attempt, 1, "running")
+            .unwrap();
+        repository
+            .record_application_root_attachment(
+                "thread-key",
+                &session,
+                &managed,
+                "digest",
+                "secret",
+                "/tmp/workspace",
+            )
+            .unwrap();
+        repository
+            .record_foreground_root(&PersistedForegroundRoot {
+                root: managed.clone(),
+                classification: ForegroundClassification::Managed,
+                binding_epoch: 3,
+                driver_epoch: 2,
+                owner_client_id: Some("owner-a".into()),
+                admission: AdmissionState::Closed,
+                driver_bind_operation_id: Some("bind-1".into()),
+            })
+            .unwrap();
+
+        // A queued reservation whose prepare never finished.
+        let pending = TaskId::new();
+        let pending_attempt = AttemptId::new();
+        repository
+            .create_task_with_attempt(&pending, &session, &pending_attempt, 1, "running")
+            .unwrap();
+        repository
+            .record_foreground_root(&PersistedForegroundRoot {
+                root: pending.clone(),
+                classification: ForegroundClassification::Pending,
+                binding_epoch: 0,
+                driver_epoch: 0,
+                owner_client_id: None,
+                admission: AdmissionState::Closed,
+                driver_bind_operation_id: Some("abandoned".into()),
+            })
+            .unwrap();
+        // A child of the managed root: children keep the execution policy.
+        let execution = TaskId::new();
+        let execution_attempt = AttemptId::new();
+        repository
+            .create_child_task_with_attempt(
+                &execution,
+                &session,
+                &managed,
+                1,
+                &execution_attempt,
+                1,
+                "running",
+            )
+            .unwrap();
+        (managed, execution, session)
+    };
+    let _ = session;
+
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_and_activation(
+        &runtime_dir,
+        &database,
+        Arc::new(RecordingFactory),
+        ForegroundActivation::Enabled,
+    )
+    .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(
+        repository.foreground_class(&managed).unwrap(),
+        RootExecutionClass::ForegroundManaged,
+        "a managed container keeps its identity across a restart"
+    );
+    assert_eq!(repository.task_state(&managed).unwrap(), "running");
+    assert_eq!(
+        repository.foreground_class(&execution).unwrap(),
+        RootExecutionClass::Execution,
+        "a child is execution work even when its root is a container"
+    );
+    assert_eq!(
+        repository.task_state(&execution).unwrap(),
+        "recovery_required",
+        "a live child of a container is still parked: the watchdog does govern it"
+    );
+
+    let persisted = repository
+        .persisted_foreground_root(&managed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.admission,
+        AdmissionState::Closed,
+        "a new generation holds no authorization for a surviving root"
+    );
+    assert!(!persisted.admission.admits_business());
+    assert_eq!(persisted.binding_epoch, 3);
+    assert_eq!(persisted.driver_epoch, 2);
+
+    drop(daemon);
+}
+
+/// A root that is still pending authentication may not dispatch: it runs nothing,
+/// so a child created under it would be work in a tree with no owner to stop it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_pending_root_refuses_dispatch() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_pending().unwrap();
+    let refusal = fixture
+        .root_dispatch_refusal()
+        .expect_err("a pending root must refuse dispatch");
+    assert!(
+        matches!(refusal, RuntimeCoordinatorError::AdmissionClosed(_)),
+        "a pending root is a closed admission, not a supervisor failure, got {refusal:?}"
+    );
+    let spawned = fixture.spawn("never admitted").await;
+    assert!(
+        matches!(spawned, Err(RuntimeCoordinatorError::AdmissionClosed(_))),
+        "the spawn path must reach the same verdict as the guard, got {spawned:?}"
+    );
+    assert!(
+        fixture.child_ids().is_empty(),
+        "a refused dispatch must not persist a child row"
+    );
+    fixture.assert_no_started_workers();
+}
+
+/// A record that contradicts its own attachment is refused rather than exempted.
+/// Guessing an exemption is how an immortal container gets created.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_corrupt_root_refuses_dispatch() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_corrupt().unwrap();
+    let refusal = fixture
+        .root_dispatch_refusal()
+        .expect_err("a corrupt root must refuse dispatch");
+    assert!(
+        matches!(refusal, RuntimeCoordinatorError::AdmissionClosed(_)),
+        "a corrupt root is a closed admission, got {refusal:?}"
+    );
+    assert!(fixture.spawn("never admitted").await.is_err());
+    fixture.assert_no_started_workers();
+}
+
+/// One owner's release must not drain another's tree, and the other owner must still
+/// be able to dispatch afterwards.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_leaves_another_owner_alone() {
+    let fixture = ForegroundFixture::managed().await;
+    let (other_session, other_root) = fixture.bind_second_owner("tui").unwrap();
+
+    let before = fixture
+        .spawn_under(&other_session, &other_root, "before")
+        .await
+        .expect("the second owner may dispatch while both are open");
+    fixture.release_owner().await.unwrap();
+
+    // The released owner's tree is closed...
+    assert!(matches!(
+        fixture.spawn("after release").await,
+        Err(RuntimeCoordinatorError::AdmissionClosed(_))
+    ));
+    // ...and the other owner still dispatches.
+    let after = fixture
+        .spawn_under(&other_session, &other_root, "after")
+        .await
+        .expect("a release of app must not drain tui");
+    assert_ne!(before, after);
+    assert!(
+        fixture
+            .coordinator()
+            .authorize_work("tui", &other_root.to_string())
+            .is_ok(),
+        "the second owner's admission must still be open"
+    );
+}
+
+/// A release must not be held hostage by a long wait elsewhere in the runtime: it
+/// closes admission and settles its own slots without waiting for unrelated work.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_is_not_blocked_by_a_parked_start() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("parked").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-commit barrier");
+    let started = tokio::time::Instant::now();
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    // Admission closes *before* the parked slot is settled: the release must not wait
+    // for the factory that the barrier is holding.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closing admission must not wait for the parked start"
+    );
+    barrier.release();
+    let _ = tokio::time::timeout(Duration::from_secs(5), spawning).await;
+    tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish once the slot settles")
+        .unwrap()
+        .unwrap();
+    fixture.assert_all_owned();
+    fixture.assert_no_started_workers();
+}
+
+/// The third window: a handle exists but has not been published when the release
+/// lands. The cancel must reach that handle, not a token nobody is watching.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_during_factory_return_cancels_the_handle() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_factory_returned();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("racing factory").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-factory barrier");
+    // Release concurrently: awaiting it here would deadlock on the very slot the
+    // barrier is holding, and the release would honestly report StopUnproven after
+    // its bounded wait. Close admission first, then let the parked start answer.
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    barrier.release();
+    tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish once the parked start answers")
+        .unwrap()
+        .unwrap();
+    let spawned = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawning task must answer")
+        .unwrap();
+    assert!(
+        spawned.is_err(),
+        "a worker whose start was released must not be reported as started, got {spawned:?}"
+    );
+    // The window really was the interesting one: the factory did run (so a handle
+    // existed), and yet nothing was published.
+    assert_eq!(
+        fixture.started_workers().len(),
+        1,
+        "the barrier must sit after the factory ran, not before it"
+    );
+    assert!(
+        fixture.no_live_executions(),
+        "a cancelled handle must leave no live execution behind"
+    );
+    fixture.assert_all_owned();
+    assert!(
+        !fixture.child_ids().contains(fixture.root()),
+        "the root itself is not a spawned child"
+    );
+}
+
+/// A live foreground container is not settled by the worker budgets: no idle budget
+/// (300s) and no wall-time budget (2700s) may end it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_survives_idle_and_wall_time_without_progress() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture
+        .coordinator()
+        .record_foreground_class_for_test(
+            &fixture.root_task(),
+            yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+        )
+        .unwrap();
+    let started = Utc::now();
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    let state_before = fixture.initial_root_state();
+
+    // Past the idle budget, then past the wall-time budget. The owner's liveness is
+    // the guardian lease's business, not the watchdog's: this layer must require no
+    // progress at all, which is why the only clock that moves is the observation the
+    // budget is measured against.
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(started + chrono::Duration::seconds(301))
+            .await,
+        0,
+        "a container must not be settled for 301s of idleness"
+    );
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(started + chrono::Duration::seconds(2_701))
+            .await,
+        0,
+        "a container must not be settled by the wall-time budget"
+    );
+    assert_eq!(
+        fixture.root_state(),
+        state_before,
+        "a container's task state must be untouched by the watchdog"
+    );
+    assert!(
+        !fixture.root_has_watchdog_terminal(),
+        "no watchdog terminal may be recorded for a container"
+    );
+    assert_eq!(
+        fixture.root_meaningful_progress_count(),
+        0,
+        "skipping the decision must not manufacture progress"
+    );
+    assert!(fixture.spawn("still admitted").await.is_ok());
+}
+
+/// A child that makes progress and has budget left stays alive; the same child with
+/// no progress is still settled, so the exemption is confined to the container.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_child_keeps_its_execution_budget() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture
+        .coordinator()
+        .record_foreground_class_for_test(
+            &fixture.root_task(),
+            yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+        )
+        .unwrap();
+    let child = fixture.spawn("working child").await.unwrap();
+    let started = Utc::now();
+    fixture.seed_watchdog(&child, started);
+
+    // Progress resets the observation, so an old snapshot no longer trips the budget.
+    fixture.seed_watchdog(&child, Utc::now());
+    assert_eq!(
+        fixture
+            .advance_watchdog_to(Utc::now() + chrono::Duration::seconds(1))
+            .await,
+        0,
+        "a child with fresh progress must not be settled"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+
+    // The child's own budget still bites: past idle with no progress, it is settled.
+    let stale = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&child, stale);
+    assert_eq!(
+        fixture.advance_watchdog_to(Utc::now()).await,
+        1,
+        "a child with no progress past the idle budget is still stalled"
+    );
+}
+
+/// A pending root is not admissible, so the watchdog must neither settle it into a
+/// fake liveness verdict nor quietly ignore it. It refuses with a reason.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_pending_root_is_not_settled_by_the_watchdog() {
+    let fixture = ForegroundFixture::managed().await;
+    fixture.mark_root_pending().unwrap();
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    assert_eq!(
+        fixture.advance_watchdog_to(Utc::now()).await,
+        0,
+        "a pending root must not produce a watchdog terminal"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+    assert_eq!(
+        fixture.root_state(),
+        fixture.initial_root_state(),
+        "a refused verdict must not change the task state either way"
+    );
+    assert_eq!(fixture.root_meaningful_progress_count(), 0);
+}
+
+/// The snapshot can be older than the classification: a managed bind landing after
+/// the scan must still prevent the terminal, which is why the commit re-checks it.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_managed_bind_after_the_scan_still_wins() {
+    let fixture = ForegroundFixture::managed().await;
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+    // The scan lists the root while it is still an execution task, and the bind
+    // lands before the terminal commit. The SQL exclusion cannot help here (the
+    // candidate was already chosen); only the commit-time re-check can.
+    let coordinator = fixture.coordinator();
+    let root = fixture.root_task();
+    assert_eq!(
+        coordinator
+            .evaluate_watchdogs_with_stale_candidates(Utc::now(), || {
+                coordinator
+                    .record_foreground_class_for_test(
+                        &root,
+                        yi_agent_store::repository::foreground::ForegroundClassification::Managed,
+                    )
+                    .expect("the classification is rewritable between phases");
+            })
+            .await
+            .unwrap(),
+        0,
+        "the commit must observe the classification the scan did not"
+    );
+    assert!(!fixture.root_has_watchdog_terminal());
+    assert_eq!(fixture.root_state(), fixture.initial_root_state());
+}
+
+#[cfg(feature = "foreground-test-support")]
+mod foreground_support;
+
+#[cfg(feature = "foreground-test-support")]
+use foreground_support::ForegroundFixture;
+
+/// The release wins the race before the child row exists: the spawn must be refused,
+/// not admitted into a tree nobody owns.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_before_commit_refuses_spawn() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_before_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("late").await })
+    };
+    // Bounded waits everywhere: a RED run must fail the assertion, not hang the suite.
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the pre-commit barrier");
+    fixture.release_owner().await.unwrap();
+    barrier.release();
+    let spawned = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawn must answer after the barrier opens")
+        .unwrap();
+    assert!(
+        matches!(spawned, Err(RuntimeCoordinatorError::AdmissionClosed(_))),
+        "a spawn that lost the race to a release must be refused, got {spawned:?}"
+    );
+    assert!(
+        fixture.child_ids().is_empty(),
+        "a refused spawn must not persist a child row"
+    );
+    fixture.assert_no_started_workers();
+}
+
+/// The spawn wins the race to the commit: the child exists and its starting slot is
+/// registered, so the release must cancel it and leave nothing started.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_release_tracks_committed_pending_start() {
+    let fixture = std::sync::Arc::new(ForegroundFixture::managed().await);
+    let mut barrier = fixture.hold_after_admission_commit();
+    let spawning = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.spawn("admitted").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.arrived())
+        .await
+        .expect("the spawn must reach the post-commit barrier");
+    let releasing = {
+        let fixture = std::sync::Arc::clone(&fixture);
+        tokio::spawn(async move { fixture.release_owner().await })
+    };
+    fixture.wait_owner_admission_closed().await;
+    // Release only after the admission is confirmed closed: awaiting the release
+    // itself here would deadlock on the very starting slot it is waiting for.
+    barrier.release();
+    let _outcome = tokio::time::timeout(Duration::from_secs(5), spawning)
+        .await
+        .expect("the spawn must answer once the slot is cancelled")
+        .unwrap();
+    let released = tokio::time::timeout(Duration::from_secs(10), releasing)
+        .await
+        .expect("the release must finish")
+        .unwrap();
+    released.unwrap();
+    assert!(
+        !fixture.child_ids().is_empty(),
+        "the spawn committed before the release, so the child must exist"
+    );
+    fixture.assert_all_owned();
+    fixture.assert_no_started_workers();
+}
+
+/// Looking at a recovery must not perform it.
+///
+/// The inspect step exists so a user can read the impact before deciding, which means
+/// it must be observationally inert: no freeze, no stopped executions, no token. A
+/// version that froze while inspecting would stop the very conversation the user was
+/// still deciding whether to repair.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_inspect_reports_the_impact_without_freezing() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let starts = fixture.worker_start_count();
+    let count = fixture.attempt_count();
+
+    let impact = fixture
+        .inspect_recovery()
+        .expect("a stalled root is inspectable");
+    assert_eq!(impact.root.root_id, fixture.fence().root.root_id);
+    assert!(
+        !fixture.is_frozen(),
+        "inspecting must leave the root unfrozen: freezing stops the conversation"
+    );
+    // Nothing was repaired: the inspect reports what *would* stop, it does not stop it.
+    assert_eq!(
+        fixture.attempt_count(),
+        count,
+        "inspect creates no successor"
+    );
+    assert_eq!(
+        fixture.worker_start_count(),
+        starts,
+        "inspect restarts nothing"
+    );
+    // The preparation still works afterwards: an inspect that consumed the one
+    // allowed freeze would make the following prepare fail.
+    match fixture.prepare_recovery("recover-after-inspect").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => {
+            assert!(preview.confirmation_token.is_some());
+        }
+        other => panic!("prepare after inspect must still be ready, got {other:?}"),
+    }
+}
+
+/// A stalled root can be repaired exactly once, and the repair leaves no scar.
+///
+/// The assertions are the spec's C9 in one place: one successor, the old attempt's
+/// evidence untouched, children untouched, no worker restarted, root running again.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_is_idempotent_without_restarting_children() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let old_terminal = fixture.previous_terminal_json();
+    let old_children = fixture.child_ids();
+    let starts = fixture.worker_start_count();
+    let count = fixture.attempt_count();
+
+    let preview = match fixture.prepare_recovery("recover-1").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("a proven stop must produce a ready preview, got {other:?}"),
+    };
+    let first = fixture.recover(&preview).unwrap();
+    // The response was lost and the host retries the same operation. It must get the
+    // same receipt, not a second successor.
+    let second = fixture.recover(&preview).unwrap();
+
+    assert_eq!(first, second, "a replay returns the committed receipt");
+    assert_eq!(
+        fixture.attempt_count(),
+        count + 1,
+        "exactly one successor attempt"
+    );
+    assert_eq!(
+        fixture.previous_terminal_json(),
+        old_terminal,
+        "the settled attempt keeps its stall and its evidence"
+    );
+    assert_eq!(
+        fixture.child_ids(),
+        old_children,
+        "recovery re-points the root; it does not touch children"
+    );
+    assert_eq!(
+        fixture.worker_start_count(),
+        starts,
+        "recovery never restarts a worker"
+    );
+    assert_eq!(fixture.root_state(), "running");
+}
+
+/// Only a stalled root may be recovered.
+///
+/// A completed, failed or cancelled root is a real terminal state; reviving it would
+/// undo a decision the user or the system actually made.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_root_that_is_not_stalled() {
+    for state in ["completed", "failed", "cancelled", "recovery_required"] {
+        let fixture = ForegroundFixture::managed_live().await;
+        {
+            let repository = fixture
+                .coordinator()
+                .repository_for_test()
+                .expect("the repository lock is free");
+            repository
+                .execute_test_statement_params(
+                    "UPDATE tasks SET state_json = ?1 WHERE id = ?2",
+                    &[state, &fixture.root().to_string()],
+                )
+                .expect("the test can settle the root");
+            repository
+                .execute_test_statement_params(
+                    "UPDATE attempts SET state = ?1 WHERE id = (
+                         SELECT active_attempt_id FROM tasks WHERE id = ?2
+                     )",
+                    &[state, &fixture.root().to_string()],
+                )
+                .expect("the test can settle the attempt");
+        }
+        let refusal = fixture
+            .prepare_recovery(&format!("recover-{state}"))
+            .expect_err("only a stalled root is recoverable");
+        assert!(
+            matches!(
+                refusal,
+                RuntimeCoordinatorError::Repository(
+                    yi_agent_store::repository::RepositoryError::Foreground(
+                        yi_agent_store::foreground::ForegroundError::RecoveryRequired
+                    )
+                )
+            ),
+            "{state} must be refused as not-recoverable, got {refusal:?}"
+        );
+    }
+}
+
+/// A recovery scope may prepare and query, but may never own.
+///
+/// This is the boundary that makes `RecoveryOnly` safe to hand out before a stop: it
+/// cannot bind a driver, spawn, write activity or start a tool.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_scope_cannot_own_or_spawn() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let authorization = fixture.authorization();
+    let root = fixture.root().to_string();
+
+    // Prepare and query are allowed.
+    let status = fixture
+        .prepare_recovery("recover-scope")
+        .expect("a recovery scope may prepare");
+    assert!(
+        matches!(
+            status,
+            yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(_)
+        ),
+        "the fixture's single proven execution yields a ready preview, got {status:?}"
+    );
+    fixture
+        .coordinator()
+        .foreground_recovery_status(&authorization, &fixture.fence().root, "recover-scope")
+        .expect("a recovery scope may query");
+
+    // Binding is not.
+    let bound = fixture
+        .coordinator()
+        .bind_foreground_driver(&authorization, "recovery-scope-bind");
+    assert!(
+        matches!(bound, Err(RuntimeCoordinatorError::AuthorityDenied(_))),
+        "a recovery scope must not bind a driver, got {bound:?}"
+    );
+
+    // Spawning is not.
+    let spawned = fixture.spawn("must not start").await;
+    assert!(
+        spawned.is_err(),
+        "a stalled root under recovery authority must not admit a spawn, got {spawned:?}"
+    );
+    let _ = root;
+}
+
+/// A second operation cannot steal the same stalled attempt.
+///
+/// Two operations that both saw the same stalled root must not both commit: the CAS on
+/// the expected attempt is what turns "at most one successor" from a hope into a fact.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_only_one_recovery_operation_can_commit() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let count = fixture.attempt_count();
+    let first = match fixture.prepare_recovery("recover-a").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    // The second prepare is refused because the root is already frozen under the first
+    // operation's set, which is the honest answer: it did not get its own impact.
+    let second = fixture.prepare_recovery("recover-b");
+    assert!(
+        second.is_err(),
+        "a second freeze over the same root must be refused, got {second:?}"
+    );
+
+    let result = fixture.recover(&first).unwrap();
+    assert_eq!(result.operation_id, "recover-a");
+    assert_eq!(
+        fixture.attempt_count(),
+        count + 1,
+        "one committed operation, one successor"
+    );
+}
+
+/// A recovery receipt survives the token that produced it.
+///
+/// The host may lose the answer and ask later, possibly after the confirmation expired
+/// or the daemon restarted. The receipt is durable history, so the query must still
+/// answer — and it must still require authority.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_committed_receipt_outlives_its_token() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let preview = match fixture.prepare_recovery("recover-durable").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let committed = fixture.recover(&preview).unwrap();
+
+    let status = fixture
+        .coordinator()
+        .foreground_recovery_status(
+            &fixture.authorization(),
+            &preview.request.expected.root,
+            "recover-durable",
+        )
+        .expect("the query is authorized")
+        .expect("the operation exists");
+    match status {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(result) => {
+            assert_eq!(result, committed);
+        }
+        other => panic!("a committed operation must read back committed, got {other:?}"),
+    }
+
+    // An unknown operation is absent, not an error and not a false success.
+    let absent = fixture
+        .coordinator()
+        .foreground_recovery_status(
+            &fixture.authorization(),
+            &preview.request.expected.root,
+            "never-prepared",
+        )
+        .expect("the query is authorized");
+    assert!(absent.is_none());
+}
+
+/// A stale fence cannot prepare, and a forged token cannot commit.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_stale_fence_or_a_forged_token() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    let mut stale = fixture.fence();
+    stale.binding_epoch = stale.binding_epoch.saturating_sub(1);
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: stale,
+        operation_id: "recover-stale".into(),
+    };
+    let refused = fixture
+        .coordinator()
+        .prepare_foreground_recovery(&fixture.authorization(), &request)
+        .expect_err("a stale binding epoch must be refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::StaleDriver
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+
+    let preview = match fixture.prepare_recovery("recover-forged").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let forged = yi_agent_lifecycle::foreground::SecretCapability::new("not-the-token");
+    let refused = fixture
+        .coordinator()
+        .recover_foreground_root(&fixture.authorization(), &preview.request, &forged)
+        .expect_err("a wrong token must not commit");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::ConfirmationRequired
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// Recovering under another operation id with different parameters is a conflict.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_refuses_a_reused_operation_with_other_parameters() {
+    let fixture = ForegroundFixture::stalled_from_watchdog().await;
+    match fixture.prepare_recovery("recover-same-id").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(_) => {}
+        other => panic!("expected a ready preview, got {other:?}"),
+    }
+    // Same id, different fence (a moved attempt): the stored fingerprint disagrees.
+    let mut other = fixture.fence();
+    other.driver_epoch = other.driver_epoch.saturating_add(7);
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: other,
+        operation_id: "recover-same-id".into(),
+    };
+    let refused = fixture
+        .coordinator()
+        .prepare_foreground_recovery(&fixture.authorization(), &request)
+        .expect_err("reusing an id with other parameters must be refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeCoordinatorError::Repository(
+                yi_agent_store::repository::RepositoryError::Foreground(
+                    yi_agent_store::foreground::ForegroundError::StaleDriver
+                )
+            )
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// A committed recovery is a durable fact, and reopening the database agrees.
+///
+/// The successor, the root pointer and the receipt are all read back through a second
+/// coordinator: anything that only lived in memory would vanish here, which is the
+/// failure a "recovery" that cannot survive a restart would produce.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_recovery_survives_a_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let fixture = ForegroundFixture::stalled_from_watchdog_in(directory.path()).await;
+    let old_terminal = fixture.previous_terminal_json();
+    let preview = match fixture.prepare_recovery("recover-restart").unwrap() {
+        yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) => preview,
+        other => panic!("expected a ready preview, got {other:?}"),
+    };
+    let committed = fixture.recover(&preview).unwrap();
+    let successor = committed.successor.attempt_id.clone();
+    drop(fixture);
+
+    let reopened = RuntimeCoordinator::open_with_activation(
+        &database,
+        Arc::new(RecordingFactory),
+        yi_agent_store::foreground::ForegroundActivation::for_test(true),
+    )
+    .expect("the database reopens");
+    let root: TaskId = committed.previous.root_id.parse().unwrap();
+    // Read the durable pointer, not the live supervisor: a reopened daemon has not
+    // hydrated this session yet, and the question is what the database says.
+    assert_eq!(
+        reopened
+            .repository_for_test()
+            .expect("the repository lock is free")
+            .active_attempt_id(&root)
+            .expect("the root row is readable")
+            .to_string(),
+        successor,
+        "the active attempt is the successor after a reopen"
+    );
+    assert_eq!(
+        reopened.task_state(&root).unwrap(),
+        "running",
+        "the root is running, not falsely stalled"
+    );
+    let receipt = reopened
+        .repository_for_test()
+        .expect("the repository lock is free")
+        .foreground_recovery_result(&root, "recover-restart")
+        .expect("the receipt is readable")
+        .expect("the receipt persisted");
+    assert_eq!(receipt.successor.attempt_id, successor);
+    assert_eq!(
+        reopened
+            .repository_for_test()
+            .expect("the repository lock is free")
+            .first_attempt_terminal_json(&root)
+            .expect("the settled attempt is readable")
+            .expect("the settled attempt kept its terminal"),
+        old_terminal,
+        "the old attempt's evidence is history, not something recovery rewrites"
+    );
+}

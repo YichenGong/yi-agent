@@ -2814,6 +2814,58 @@ enum KeyOutcome {
     OpenAgentDetail(String),
 }
 
+/// Parses `/recover-root`'s argument.
+///
+/// Deliberately three shapes and no more:
+///
+/// * no argument / `status <id>` / `<id>` -- read the stored operation, or read the
+///   impact for this conversation. Neither stops anything.
+/// * `prepare <id>` -- the first mutating step, which is why it must be typed out.
+/// * `confirm <id>` -- commits a prepared operation.
+///
+/// No shape accepts a token. The driver keeps the token its own `prepare` was
+/// issued, in memory, so nothing secret ever becomes a command argument (and thus
+/// shell history, `ps` output, or a transcript that echoes the command).
+///
+/// The operation id is chosen by the user and reused across retries; this parser never
+/// invents one, because a lost answer must be resolved by asking about the *same*
+/// operation rather than by starting a second recovery.
+fn parse_recover_args(
+    args: Option<&str>,
+) -> Result<yi_agent_subagent::foreground::RecoveryAction, String> {
+    use yi_agent_subagent::foreground::RecoveryAction;
+
+    let usage = "用法: /recover-root [status <operation-id>] | /recover-root <operation-id> | /recover-root prepare <operation-id> | /recover-root confirm <operation-id>";
+    let text = args.unwrap_or("").trim();
+    if text.is_empty() {
+        return Ok(RecoveryAction::Inspect);
+    }
+    let mut parts = text.split_whitespace();
+    let head = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.collect();
+    match (head, rest.as_slice()) {
+        // A bare word is an operation id to look up: the read-only form.
+        (id, []) if id != "status" && id != "prepare" && id != "confirm" => {
+            Ok(RecoveryAction::Operation {
+                operation_id: id.to_string(),
+            })
+        }
+        ("status", [id]) => Ok(RecoveryAction::Operation {
+            operation_id: (*id).to_string(),
+        }),
+        ("status", _) => Err(usage.to_string()),
+        ("prepare", [id]) => Ok(RecoveryAction::Prepare {
+            operation_id: (*id).to_string(),
+        }),
+        ("prepare", _) => Err(usage.to_string()),
+        ("confirm", [id]) => Ok(RecoveryAction::Confirm {
+            operation_id: (*id).to_string(),
+        }),
+        ("confirm", _) => Err(usage.to_string()),
+        _ => Err(usage.to_string()),
+    }
+}
+
 fn starts_with_multi_segment_absolute_path(text: &str) -> bool {
     text.split_whitespace()
         .next()
@@ -4596,6 +4648,40 @@ fn execute_slash_command(
             }
             let _ = control_tx.blocking_send(crate::DriverControl::Clear);
             KeyOutcome::None
+        }
+        SlashCommand::RecoverRoot => {
+            // The lease and the binding fence live in the driver task, so this
+            // dispatch only parses the request and hands it over. A parse error is
+            // shown here; a runtime error comes back as a `Notice` from the driver,
+            // because only the driver knows what the daemon actually said.
+            match parse_recover_args(args.as_deref()) {
+                Ok(action) => {
+                    if control_tx
+                        .blocking_send(crate::DriverControl::RecoverRoot(action))
+                        .is_err()
+                    {
+                        history.push(
+                            HistoryCell::Separator {
+                                label: Some("恢复请求未送达 driver：控制通道已关闭".to_string()),
+                            },
+                            width,
+                        );
+                    }
+                    // No success line is written here: `prepare` is the first
+                    // mutating step and its outcome is the driver's to report. A line
+                    // written now would claim progress before the daemon answered.
+                    KeyOutcome::None
+                }
+                Err(reason) => {
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some(reason),
+                        },
+                        width,
+                    );
+                    KeyOutcome::None
+                }
+            }
         }
         SlashCommand::Help => {
             history.push(
@@ -15868,5 +15954,68 @@ mod notification_tests {
         let focused = std::sync::atomic::AtomicBool::new(true);
         apply_focus_event(&Event::Resize(80, 24), &focused);
         assert!(focused.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod foreground_recover_args_tests {
+    use super::parse_recover_args;
+    use yi_agent_subagent::foreground::RecoveryAction;
+
+    /// A bare invocation only reads. Opening the panel must not stop work the user
+    /// has not yet agreed to stop, which is the whole point of splitting inspect out.
+    #[test]
+    fn foreground_root_lifecycle_recover_root_bare_is_read_only() {
+        assert_eq!(parse_recover_args(None), Ok(RecoveryAction::Inspect));
+        assert_eq!(parse_recover_args(Some("  ")), Ok(RecoveryAction::Inspect));
+    }
+
+    /// A bare word is an operation lookup, never a prepare: the mutating step has to
+    /// be typed out, so a stray argument cannot freeze a conversation.
+    #[test]
+    fn foreground_root_lifecycle_recover_root_bare_id_only_queries() {
+        let expected = RecoveryAction::Operation {
+            operation_id: "op-1".to_string(),
+        };
+        assert_eq!(parse_recover_args(Some("op-1")), Ok(expected.clone()));
+        assert_eq!(parse_recover_args(Some("status op-1")), Ok(expected));
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_prepare_names_one_operation() {
+        assert_eq!(
+            parse_recover_args(Some("prepare op-1")),
+            Ok(RecoveryAction::Prepare {
+                operation_id: "op-1".to_string()
+            })
+        );
+        // Extra words are a mistake, not a second request: refusing beats guessing
+        // which of two ids the user meant.
+        assert!(parse_recover_args(Some("prepare op-1 op-2")).is_err());
+        assert!(parse_recover_args(Some("prepare")).is_err());
+    }
+
+    /// No shape takes a token. The driver holds the one its own prepare was issued,
+    /// so a token can never become a command argument -- and thus shell history,
+    /// `ps` output, or an echoed transcript.
+    #[test]
+    fn foreground_root_lifecycle_recover_root_confirm_takes_no_token() {
+        assert_eq!(
+            parse_recover_args(Some("confirm op-1")),
+            Ok(RecoveryAction::Confirm {
+                operation_id: "op-1".to_string(),
+            })
+        );
+        // A command line that carried a token is refused rather than silently
+        // ignored, so a user who believed they had supplied it is told otherwise.
+        assert!(parse_recover_args(Some("confirm op-1 secret-token")).is_err());
+        assert!(parse_recover_args(Some("confirm")).is_err());
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_rejects_unknown_shapes() {
+        assert!(parse_recover_args(Some("status")).is_err());
+        assert!(parse_recover_args(Some("confirm")).is_err());
+        assert!(parse_recover_args(Some("prepare op-1 extra")).is_err());
     }
 }

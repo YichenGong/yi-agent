@@ -573,5 +573,89 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
         transaction.commit()?;
     }
+
+    // v17：前台 root 生命周期的事实表。
+    //
+    // 三张表分别回答三个不同的问题，刻意不合并：
+    //   * `foreground_root_state`：这个 root 是谁的、什么分类、准入是否开着、活动快照是什么。
+    //     一行一个 root，`binding_epoch`/`driver_epoch` 是准入栅栏，必须持久化——重启后
+    //     旧代的报告不能落在一个新代上。
+    //   * `foreground_recovery_operations`：恢复操作的幂等记录。`request_fingerprint` 绑定
+    //     稳定 root/session、原 attempt 和动作；`CHECK((phase='committed') = (result_json
+    //     IS NOT NULL))` 让"已提交但没有结果"在数据库层面不可能存在。
+    //   * `foreground_stop_evidence`：停止证明，key 到 (root, attempt, execution)。
+    //     只记证据不记权限，恢复结果里也不带任何秘密。
+    //
+    // 迁移本身**不**给任何 root 写入分类行：旧 attachment 保留原样，`foreground_class`
+    // 读时按 legacy 策略解释（见 `repository::foreground`）。已存在的历史行也不会被
+    // 回填成 managed——那需要一个通过认证的 prepare 加必要停止边界，迁移做不到也不该假装做到。
+    if current_version < 17 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS foreground_root_state (
+                root_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                binding_epoch INTEGER NOT NULL CHECK(binding_epoch >= 0),
+                driver_epoch INTEGER NOT NULL CHECK(driver_epoch >= 0),
+                owner_client_id TEXT,
+                admission_state TEXT NOT NULL CHECK(admission_state IN ('closed', 'frozen')),
+                driver_bind_operation_id TEXT,
+                activity_json TEXT,
+                classification TEXT NOT NULL CHECK(classification IN ('legacy', 'pending', 'managed'))
+            );
+            CREATE TABLE IF NOT EXISTS foreground_recovery_operations (
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                operation_id TEXT NOT NULL,
+                expected_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+                request_fingerprint TEXT NOT NULL,
+                original_request_json TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('preparing','needs_preview','blocked','ready','committed')),
+                impact_json TEXT,
+                result_json TEXT,
+                PRIMARY KEY(root_task_id, operation_id),
+                CHECK((phase = 'committed') = (result_json IS NOT NULL))
+            );
+            CREATE TABLE IF NOT EXISTS foreground_stop_evidence (
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                attempt_id TEXT NOT NULL REFERENCES attempts(id),
+                execution_id TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                PRIMARY KEY(root_task_id, attempt_id, execution_id)
+            );",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
+        transaction.commit()?;
+    }
+
+    // v18：一次冻结对应的**封闭执行集合**。
+    //
+    // 停止证明的正确性取决于"证明的是同一批执行"。若集合只存在于内存，重启后 daemon
+    // 只剩一组证据，却不知道它们原本该覆盖谁——那样"集合里每个执行都有证明"就退化成
+    // "有证据的执行都停了"，冻结后新准入的东西会被静默漏掉。
+    //
+    // `foreground_freeze`：每个 root 当前那一次冻结，`execution_set_version` 单调递增，
+    // 旧证据只能匹配自己那一版。`foreground_frozen_executions`：集合成员，带不可复用的
+    // execution identity 与所属 attempt。二者与 v17 的 `foreground_stop_evidence`
+    // 一起，让"冻结、证明、核验"三步都能在重启后重放。
+    if current_version < 18 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS foreground_freeze (
+                root_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                execution_set_version INTEGER NOT NULL CHECK(execution_set_version > 0),
+                frozen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS foreground_frozen_executions (
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                execution_set_version INTEGER NOT NULL,
+                execution_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('driver', 'worker')),
+                PRIMARY KEY(root_task_id, execution_set_version, execution_id)
+            );",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }

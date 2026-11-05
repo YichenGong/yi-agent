@@ -1,5 +1,7 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
+pub(crate) mod foreground;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,6 +54,11 @@ const MAX_REMEMBERED_STOPS: usize = 1024;
 /// How long a reconcile pass waits for join observers to publish their proofs
 /// before returning with the lease still held.
 const STOP_CONFIRMATION_GRACE: Duration = Duration::from_millis(250);
+/// How long a recovery confirmation stays valid.
+///
+/// Short: the confirmation is for a specific frozen set, and a long-lived token would
+/// let a host commit a recovery against a conversation that has moved on since.
+const FOREGROUND_CONFIRMATION_WINDOW: Duration = Duration::from_secs(60);
 
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
 /// absent or unparsable.
@@ -104,6 +111,11 @@ pub enum RuntimeCoordinatorError {
     QueueCapacityExceeded,
     #[error("runtime root rejects new work: {0}")]
     AdmissionClosed(String),
+    #[error("the release could not prove that {outstanding} execution(s) under {roots:?} stopped")]
+    StopUnproven {
+        outstanding: usize,
+        roots: Vec<RootId>,
+    },
     #[error("runtime is draining and rejects new admissions")]
     Draining,
     #[error("fork payload of {total} bytes exceeds the {max}-byte limit")]
@@ -256,10 +268,51 @@ pub struct RuntimeCoordinator {
     /// through this coordinator's serialized entry points, which is what makes
     /// "check the lease, then spawn" atomic against a concurrent release.
     clients: Mutex<RuntimeClients>,
+    /// Permits for committed children whose factory has not been reached yet.
+    ///
+    /// The permit is the right to start user code for one task. It is parked here
+    /// between the commit and the factory call because those happen in different
+    /// functions, and it is taken out exactly once (`remove`), so the permission
+    /// cannot be reused for a second start.
+    foreground_starting: Mutex<HashMap<TaskId, crate::runtime::foreground::StartingPermit>>,
+    /// The commit gate: "check admission, register the starting execution, write the
+    /// child and its owner" is one step.
+    ///
+    /// Lock order is supervisor -> commit gate -> clients -> repository, and nothing
+    /// inside the gate may await: a network wait or a worker join held here would make
+    /// every release wait for unrelated work. The gate exits because the previous
+    /// shape read admission, dropped the lock, and wrote -- a release landing in that
+    /// window was followed by a child nobody owned and no slot to stop.
+    foreground_commit_gate: Arc<crate::runtime::foreground::ForegroundCommitGate>,
     generation: String,
     /// Monotonic ordinal for pending-stop entries, so old confirmed records can
     /// be pruned instead of accumulating for the daemon's whole life.
     stop_sequence: AtomicU64,
+    /// The daemon's end of the guardian's private authority bridge.
+    ///
+    /// Owned here rather than by the socket loop because a bind has to validate against
+    /// the same table the install wrote: two copies would let "authorized" and
+    /// "bindable" disagree. Lock order is bridge -> repository, never the reverse.
+    foreground_bridge: Mutex<crate::ipc::ForegroundBridge>,
+    /// Whether the foreground lifecycle semantics are on for this coordinator.
+    ///
+    /// Production entry points pass `Disabled` until the whole closed loop exists, so a
+    /// wire client cannot reach the new admission rules early. Bind refuses with
+    /// `admission_closed` in that mode rather than pretending to succeed.
+    foreground_activation: crate::foreground::ForegroundActivation,
+    /// Confirmation tokens for prepared recoveries, held only in memory.
+    ///
+    /// A token that could be read back from a row would let a restarted daemon honour
+    /// a confirmation the user granted to a process that no longer exists. Keeping it
+    /// in memory means a restart makes the host confirm again, which is the honest
+    /// reading of "the confirmation was for that daemon".
+    foreground_confirmations: Mutex<HashMap<String, PreparedRecovery>>,
+    /// The narrow driver capability of each root, held only in memory.
+    ///
+    /// The secret never reaches a row: a process that could read it back would inherit
+    /// the rights of a driver that is gone. A restart therefore issues a new secret on
+    /// the next bind, which is exactly what "the driver reconnects" means.
+    foreground_drivers: Mutex<HashMap<String, LiveDriver>>,
     /// Who may attach a root, when a guardian is watching.
     ///
     /// `Unmanaged` by default, and that default is the compatibility contract: a
@@ -273,6 +326,63 @@ pub struct RuntimeCoordinator {
     /// nothing is gated. `Some` holds a *verifier*, not a signer -- it can only
     /// accept capabilities the guardian actually minted.
     managed_authorizations: Mutex<Option<yi_agent_lifecycle::authorization::AuthorizationLedger>>,
+}
+
+/// A driver capability the daemon issued and has not revoked.
+/// One prepared recovery, waiting for the host's confirmation.
+#[derive(Clone)]
+struct PreparedRecovery {
+    fence: yi_agent_lifecycle::foreground::ForegroundFence,
+    fingerprint: String,
+    impact_version: u64,
+    token: String,
+    expires_at: Instant,
+}
+
+/// The in-memory key for one recovery operation of one root.
+fn key_of(root_id: &str, operation: &str) -> String {
+    format!("{root_id}\u{1f}{operation}")
+}
+
+/// The wire code for one coordinator failure, as the private bridge carries it.
+///
+/// Whitelisted mapping rather than `Display`: the bridge crosses a process boundary,
+/// and error text has leaked paths before. A `Repository(Foreground)` keeps the exact
+/// code the store produced; everything else collapses to `CorruptBinding`, which is
+/// what "the daemon could not do this and the caller must not retry blindly" means.
+fn foreground_code_of(
+    error: &RuntimeCoordinatorError,
+) -> yi_agent_lifecycle::foreground::ForegroundErrorCode {
+    use yi_agent_lifecycle::foreground::ForegroundErrorCode;
+    match error {
+        RuntimeCoordinatorError::Repository(RepositoryError::Foreground(foreground)) => {
+            crate::ipc::foreground_failure_code(foreground)
+        }
+        RuntimeCoordinatorError::AuthorityDenied(_) => ForegroundErrorCode::AuthorityDenied,
+        RuntimeCoordinatorError::AdmissionClosed(_) => ForegroundErrorCode::AdmissionClosed,
+        RuntimeCoordinatorError::Repository(RepositoryError::TaskNotFound { .. }) => {
+            ForegroundErrorCode::RecoveryAuthorityMissing
+        }
+        _ => ForegroundErrorCode::CorruptBinding,
+    }
+}
+
+struct LiveDriver {
+    driver_epoch: u64,
+    binding_epoch: u64,
+    /// The owner that was authorized when this driver bound.
+    ///
+    /// Kept so a release can drop exactly this owner's drivers without a repository
+    /// read: the bind already validated the owner, and re-reading it later would let a
+    /// re-bind between the two steps look like the same driver.
+    owner: String,
+    /// The bind operation that minted this capability.
+    ///
+    /// A caller that retries `bind` after losing the response must get the *same* secret
+    /// back, not a fresh one: minting again would revoke the capability the first answer
+    /// already delivered, and the caller has no way to know which copy is live.
+    operation_id: String,
+    capability: String,
 }
 
 /// A task whose terminal state is durable but whose execution is not yet proven
@@ -491,6 +601,27 @@ impl RuntimeCoordinator {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, RuntimeCoordinatorError> {
+        Self::open_with_activation(
+            database_path,
+            factory,
+            crate::foreground::ForegroundActivation::Disabled,
+        )
+    }
+
+    /// Hydrates the coordinator, with the foreground switch made explicit.
+    ///
+    /// The switch matters in exactly one place today: a `managed` foreground root is
+    /// deliberately left out of the startup sweep (it is the user's live conversation,
+    /// not a parked worker), so its children are parked *without* a recovered root
+    /// under them. `Disabled` keeps the original strictness — a recovered child with no
+    /// recovered parent is a corrupt database and must fail loudly — while `Enabled`
+    /// treats that shape as the expected consequence of a container that survived, and
+    /// leaves the child parked for its owner instead of failing the whole daemon.
+    pub fn open_with_activation(
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+    ) -> Result<Self, RuntimeCoordinatorError> {
         let mut repository = RuntimeRepository::open(database_path)?;
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
@@ -503,6 +634,10 @@ impl RuntimeCoordinator {
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator =
             ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
+        // Read before the moves below; the coordinator records the switch so every
+        // foreground entry point can refuse while production keeps it disabled.
+        let foreground_activation = activation;
+        let foreground_bridge = Mutex::new(crate::ipc::ForegroundBridge::new(generation.clone()));
         if let Some(cursor) = resident_cursor {
             resource_coordinator.restore_admission_cursor(
                 "resident:global",
@@ -543,11 +678,17 @@ impl RuntimeCoordinator {
                         ));
                     }
                 };
-                let supervisor = supervisors.get(&task.session_id).ok_or_else(|| {
-                    RuntimeCoordinatorError::Supervisor(
+                let Some(supervisor) = supervisors.get(&task.session_id) else {
+                    if activation.is_enabled() {
+                        // Only reachable when the session's root was a surviving
+                        // foreground container: the child stays parked and its session
+                        // hydrates once the root is re-authorized and bound.
+                        continue;
+                    }
+                    return Err(RuntimeCoordinatorError::Supervisor(
                         "persisted recovered child has no recovered root".into(),
-                    )
-                })?;
+                    ));
+                };
                 // Read the model and inherited sandbox before `task.task_id`
                 // is moved into the call.
                 let model = repository.task_model(&task.task_id)?;
@@ -671,8 +812,16 @@ impl RuntimeCoordinator {
             draining: AtomicBool::new(false),
             pending_stops: Mutex::new(HashMap::new()),
             clients: Mutex::new(RuntimeClients::new()),
+            foreground_starting: Mutex::new(HashMap::new()),
+            foreground_commit_gate: Arc::new(
+                crate::runtime::foreground::ForegroundCommitGate::new(),
+            ),
             generation,
             stop_sequence: AtomicU64::new(0),
+            foreground_bridge,
+            foreground_activation,
+            foreground_confirmations: Mutex::new(HashMap::new()),
+            foreground_drivers: Mutex::new(HashMap::new()),
             attach_authority: Mutex::new(
                 yi_agent_lifecycle::authorization::AttachAuthority::Unmanaged,
             ),
@@ -1794,23 +1943,111 @@ impl RuntimeCoordinator {
             }
             (child, depth, attempt)
         };
-        self.repository
+        // The commit step. Admission is re-checked *inside* the gate, the row is
+        // written, and the starting execution is registered before the gate is
+        // released -- so a release that lands during this window either sees the
+        // child and its slot (and can stop both) or closed admission first (and this
+        // commit is refused). Nothing here awaits: the factory is called later.
+        let session_root_key = session_root.to_string();
+        // Test hook: before the commit, so a test can release the owner and prove the
+        // spawn is then refused rather than admitted into a closed tree.
+        #[cfg(any(test, feature = "foreground-test-support"))]
+        self.foreground_commit_gate
+            .hold_at("before_admission_commit")
+            .await;
+        let (admitted, starting, ()) = {
+            let admitted = self.foreground_commit_gate.clone().commit(
+                || {
+                    self.ensure_admitting()?;
+                    self.ensure_root_open(&session_root_key)?;
+                    // A root that is only *pending* authentication, or whose
+                    // declaration contradicts its rows, may not dispatch. Keeping
+                    // this inside the commit check rather than in the caller means a
+                    // root cannot be reclassified between "the check passed" and
+                    // "the child row exists": `foreground_class` reads the same
+                    // durable facts the settlement path reads.
+                    self.ensure_root_dispatchable(&session_root)?;
+                    Ok(crate::runtime::foreground::AdmissionStamp {
+                        root: session_root_key.clone(),
+                        task: child.clone(),
+                        attempt: attempt.id.clone(),
+                        generation: self.generation.clone(),
+                        authority_sequence: 0,
+                    })
+                },
+                |stamp| -> Result<(), crate::repository::RepositoryError> {
+                    self.repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned")
+                        .create_child_task_with_attempt_and_objective(
+                            &stamp.task,
+                            session,
+                            parent,
+                            depth,
+                            &stamp.attempt,
+                            attempt.number,
+                            "queued",
+                            &objective,
+                            workspace_mode,
+                            model.clone(),
+                            thread_id.as_deref(),
+                            inherited_sandbox,
+                        )?;
+                    Ok(())
+                },
+            );
+            match admitted {
+                Ok((stamp, permit, ())) => (stamp, permit, ()),
+                Err(crate::runtime::foreground::CommitRefusal::Refused(error)) => {
+                    // The child was built in the supervisor but no row describes it.
+                    // Abandoning it is the only honest outcome: leaving it would make
+                    // work enumerable that was never admitted, and a later release
+                    // would try to stop a task that does not exist durably.
+                    supervisor
+                        .lock()
+                        .await
+                        .abandon_uncommitted_task(&child)
+                        .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    return Err(error);
+                }
+                Err(crate::runtime::foreground::CommitRefusal::Commit(error)) => {
+                    supervisor
+                        .lock()
+                        .await
+                        .abandon_uncommitted_task(&child)
+                        .map_err(RuntimeCoordinatorError::Supervisor)?;
+                    return Err(RuntimeCoordinatorError::Repository(error));
+                }
+            }
+        };
+        debug_assert_eq!(admitted.task, child);
+        // Ownership is recorded immediately after the row, before the gate's
+        // exclusion ends: `bind_child_root` takes the clients lock, so calling it
+        // inside `register` would nest a lock the caller may already hold.
+        //
+        // A parent root that was never bound is not a spawn failure. Root binding is
+        // an attach-time concern, and many callers (schedules, tests, headless runs)
+        // never bind a client at all; refusing the spawn would break every such path
+        // for a bookkeeping gap that a release's own enumeration is what defines.
+        if let Err(error) = self.bind_child_root(&session_root_key, &child.to_string()) {
+            tracing::debug!(
+                %child,
+                "child ownership was not recorded: {error}"
+            );
+        }
+        // Test hook: the window between "committed" and "factory asked" is where a
+        // release must be able to see the child. Nothing is installed in production.
+        #[cfg(any(test, feature = "foreground-test-support"))]
+        self.foreground_commit_gate
+            .hold_at("after_admission_commit")
+            .await;
+        // Parked until `start_worker` hands it to the factory wrapper. A child that
+        // is never started keeps the permit, which keeps the slot visible as
+        // starting -- and therefore cancellable by a release.
+        self.foreground_starting
             .lock()
-            .expect("runtime repository mutex poisoned")
-            .create_child_task_with_attempt_and_objective(
-                &child,
-                session,
-                parent,
-                depth,
-                &attempt.id,
-                attempt.number,
-                "queued",
-                &objective,
-                workspace_mode,
-                model.clone(),
-                thread_id.as_deref(),
-                inherited_sandbox,
-            )?;
+            .expect("foreground starting permit mutex poisoned")
+            .insert(child.clone(), starting);
         // Persisted beside the row above: an inherited set that lived only in
         // memory would be lost on restart while the row survived, and the two
         // would silently disagree. Skipped when empty so a no-roots spawn
@@ -1894,7 +2131,15 @@ impl RuntimeCoordinator {
         if self.factory.is_available() {
             match self.start_worker(session, &child).await {
                 Ok(()) | Err(RuntimeCoordinatorError::ResidentCapacityExhausted) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // The start failed before a factory was asked (workspace
+                    // provisioning, a recovery gate, capacity). The slot must not stay
+                    // "starting" for the daemon's life: nobody is going to answer for
+                    // it, and a release would then report an unproven stop for work
+                    // that never existed.
+                    self.abandon_foreground_start(&child);
+                    return Err(error);
+                }
             }
         }
         Ok(child)
@@ -2188,8 +2433,31 @@ impl RuntimeCoordinator {
             .as_ref()
             .map(|factory| factory as &dyn AgentWorkerFactory)
             .unwrap_or_else(|| self.factory.as_ref());
+        // The factory is wrapped so "user code may start" is a permission: the
+        // wrapper refuses before delegating when the slot was released, installs the
+        // slot's cancellation token on the worker it starts, and settles the slot on
+        // failure or cancellation. Without the wrapper a release could cancel a slot
+        // whose `Start` frame had already been sent.
+        let permit = match self
+            .foreground_starting
+            .lock()
+            .expect("foreground starting permit mutex poisoned")
+            .remove(task)
+        {
+            Some(permit) => permit,
+            // A root task is created by its supervisor rather than by a spawn, so it
+            // has no commit to ride on. It still gets a slot: otherwise the first
+            // execution of a session would be the one a release cannot see.
+            None => self
+                .foreground_commit_gate
+                .begin_root_start(task.clone(), session.to_string()),
+        };
+        let admitted_factory = crate::runtime::foreground::AdmittedWorkerFactory {
+            inner: worker_factory,
+            permit,
+        };
         let start_outcome = supervisor
-            .start_worker_with_provider_turn_gate(worker_factory, task, provider_turn_gate)
+            .start_worker_with_provider_turn_gate(&admitted_factory, task, provider_turn_gate)
             .await;
         if let Err(error) = start_outcome {
             let (message, affected) = match error {
@@ -2407,13 +2675,32 @@ impl RuntimeCoordinator {
             .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
             .active_attempt_id()
             .clone();
-        let committed = self
+        let outcome = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .record_watchdog_terminal(task, &attempt, terminal.clone(), &evidence)?;
-        if committed.is_none() {
-            return Ok(false);
+            .record_watchdog_terminal_with_policy(task, &attempt, terminal.clone(), &evidence)?;
+        match outcome {
+            crate::repository::WatchdogTerminalOutcome::Committed { .. } => {}
+            crate::repository::WatchdogTerminalOutcome::StaleSnapshot => return Ok(false),
+            // A container is not governed by worker budgets. Say so rather than
+            // reporting "nothing to do": a silent skip is indistinguishable from a
+            // watcher that never ran.
+            crate::repository::WatchdogTerminalOutcome::ForegroundContainer => {
+                tracing::debug!(
+                    %task,
+                    "watchdog verdict skipped: the root is a foreground container"
+                );
+                return Ok(false);
+            }
+            crate::repository::WatchdogTerminalOutcome::ClosedRoot { reason } => {
+                tracing::warn!(
+                    %task,
+                    %reason,
+                    "watchdog verdict refused: the root may not accept business"
+                );
+                return Ok(false);
+            }
         }
 
         // The repository transaction above durably recorded the watchdog
@@ -3725,6 +4012,42 @@ impl RuntimeCoordinator {
     ///
     /// Used at the task-entry points that create work (spawn). It needs no caller
     /// identity, so it cannot be bypassed by a self-reported client id.
+    /// Refuses dispatch under a root whose classification forbids it.
+    ///
+    /// `ForegroundPending` is a root that is being authenticated but is not yet
+    /// bound: it runs nothing, so delegating under it would create work in a tree
+    /// that has no owner to stop it. `Corrupt` is a record that contradicts its own
+    /// attachment, and guessing an exemption for it is how an immortal container
+    /// gets created. Only `Execution` and `ForegroundManaged` may dispatch.
+    ///
+    /// The class is read from the repository, not from a cached copy, so a
+    /// reclassification committed by the prepare path is observed here rather than
+    /// one admission later.
+    fn ensure_root_dispatchable(&self, root: &TaskId) -> Result<(), RuntimeCoordinatorError> {
+        // The root is passed in rather than re-derived: this runs inside the commit
+        // gate, and re-deriving it would take the supervisor map lock in the opposite
+        // order (gate -> supervisor) from the documented one.
+        let class = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .foreground_class(root)?;
+        match class {
+            crate::foreground::RootExecutionClass::Execution
+            | crate::foreground::RootExecutionClass::ForegroundManaged => Ok(()),
+            crate::foreground::RootExecutionClass::ForegroundPending => {
+                Err(RuntimeCoordinatorError::AdmissionClosed(
+                    "the foreground root is still pending authentication".into(),
+                ))
+            }
+            crate::foreground::RootExecutionClass::Corrupt => {
+                Err(RuntimeCoordinatorError::AdmissionClosed(
+                    "the foreground root's classification contradicts its rows".into(),
+                ))
+            }
+        }
+    }
+
     fn ensure_root_open(&self, root: &str) -> Result<(), RuntimeCoordinatorError> {
         self.clients
             .lock()
@@ -3771,16 +4094,1284 @@ impl RuntimeCoordinator {
             .map_err(RuntimeCoordinatorError::Supervisor)
     }
 
+    /// Installs authority for one root through the private bridge's own frames.
+    ///
+    /// Test support only, and deliberately shaped like the real two-phase install: a
+    /// `Prepare` is answered by a `Challenge`, and only the `Authority(Install)` frame
+    /// commits the managed row. A fixture that wrote the authority table directly would
+    /// let the bridge's validation rot while its tests kept passing.
+    ///
+    /// The returned authorization is what the *guardian* would hand the host, capability
+    /// included, so a test presents exactly what a real caller presents.
+    /// Whether the in-memory admission gate has frozen `root`.
+    ///
+    /// Test-only: production reads the admission state from the repository, which is
+    /// the durable answer. This exists so a test can assert that *inspecting* a root
+    /// left it unfrozen, which is a property of memory rather than of the row.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn is_foreground_root_frozen_for_test(&self, root: &RootId) -> bool {
+        self.foreground_commit_gate.is_frozen(root)
+    }
+
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_foreground_authority_for_test(
+        &self,
+        root_id: &str,
+        client_run_id: &str,
+        intent: yi_agent_lifecycle::foreground::RootBindIntent,
+    ) -> Result<yi_agent_lifecycle::types::RootAuthorization, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            AuthorityMessage, AuthorityStamp, BridgeFrame, RootAuthorityScope,
+        };
+
+        let now = Instant::now();
+        let nonce = Uuid::new_v4().to_string();
+        let capability = format!("cap-{}-{root_id}", Uuid::new_v4());
+        // The challenge (and therefore the deadline) is issued by the bridge itself, then
+        // the install answers with the nonce it was given. Awaiting the real pair is what
+        // exercises `consume_challenge`, the deadline and the tombstone checks.
+        let authority_seq = {
+            // Bridge before repository, the same order `bind_foreground_driver` takes
+            // them: two paths that disagree would be a deadlock waiting for a test that
+            // runs them concurrently.
+            let challenge = self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.handle(
+                    BridgeFrame::Prepare {
+                        nonce: nonce.clone(),
+                        root_id: root_id.to_string(),
+                        client_run_id: client_run_id.to_string(),
+                        scope_key: "test-scope".into(),
+                        generation: self.generation.clone(),
+                        requested_seq: 1,
+                        intent: intent.clone(),
+                        scope: RootAuthorityScope::Business,
+                    },
+                    &mut repository,
+                    now,
+                )
+            });
+            match challenge {
+                Some(BridgeFrame::Challenge { authority_seq, .. }) => authority_seq,
+                other => {
+                    return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                        "the bridge refused the prepare: {other:?}"
+                    )));
+                }
+            }
+        };
+
+        let authorization = yi_agent_lifecycle::types::RootAuthorization {
+            scope_key: "test-scope".into(),
+            daemon_instance_id: self.generation.clone(),
+            client_run_id: client_run_id.to_string(),
+            root_id: root_id.to_string(),
+            capability,
+        };
+        let stamp = AuthorityStamp {
+            scope_key: "test-scope".into(),
+            generation: self.generation.clone(),
+            owner: client_run_id.to_string(),
+            root_id: root_id.to_string(),
+            binding_epoch: 1,
+            authority_seq,
+            challenge_nonce: nonce,
+            remaining_lease_ms: 30_000,
+            authority_scope: RootAuthorityScope::Business,
+        };
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Authority(AuthorityMessage::Install {
+                    stamp,
+                    authorization: authorization.clone(),
+                }),
+                &mut repository,
+                now,
+            )
+        });
+        if let Some(BridgeFrame::Denied { code, .. }) = answer {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the install was refused: {code:?}"
+            )));
+        }
+        Ok(authorization)
+    }
+
+    /// Serves one frame from the guardian's private authority bridge.
+    ///
+    /// This is the production half that was missing: `ForegroundBridge::handle` existed
+    /// and was only ever called from test hooks, so a real daemon never installed any
+    /// authority and every managed root would have been refused at its first bind.
+    ///
+    /// Holds the bridge lock and then the repository lock, in that order, for the whole
+    /// frame. That order is the daemon's single rule for these two (`bind_foreground_driver`
+    /// takes them the same way); the reverse order somewhere else would be a deadlock
+    /// that only a concurrent install plus bind would ever surface.
+    pub fn serve_bridge_frame(
+        &self,
+        frame: yi_agent_lifecycle::foreground::BridgeFrame,
+    ) -> Option<yi_agent_lifecycle::foreground::BridgeFrame> {
+        use yi_agent_lifecycle::foreground::BridgeFrame;
+        // Recovery is peeled off before the bridge lock is taken. Its handlers call
+        // `ensure_foreground_authority`, which takes that same lock to check the
+        // capability; routing them through `with_foreground_bridge` below would
+        // re-enter a non-reentrant mutex and deadlock the bridge thread.
+        match frame {
+            BridgeFrame::Recovery(recovery) => Some(BridgeFrame::RecoveryAnswer(Box::new(
+                self.serve_recovery_frame(*recovery),
+            ))),
+            // A recovery answer only travels daemon -> guardian; the daemon never
+            // receives one, so silence is the honest reply.
+            BridgeFrame::RecoveryAnswer(_) => None,
+            frame => {
+                let now = Instant::now();
+                self.with_foreground_bridge(|bridge| {
+                    let mut repository = self
+                        .repository
+                        .lock()
+                        .expect("runtime repository mutex poisoned");
+                    bridge.handle(frame, &mut repository, now)
+                })
+            }
+        }
+    }
+
+    /// Answers one recovery control operation that arrived on the private bridge.
+    ///
+    /// Runs without the bridge lock held: the coordinator methods below take it
+    /// themselves to verify the capability. Every arm answers, including the failures:
+    /// the guardian's `round_trip` waits for exactly one frame, and a silent refusal
+    /// would be indistinguishable from a wedged daemon.
+    fn serve_recovery_frame(
+        &self,
+        recovery: yi_agent_lifecycle::foreground::BridgeRecovery,
+    ) -> yi_agent_lifecycle::foreground::BridgeRecoveryAnswer {
+        use yi_agent_lifecycle::foreground::{
+            BridgeRecovery, BridgeRecoveryAnswer, BridgeRecoveryOutcome, RecoveryOperationStatus,
+        };
+        let nonce = recovery.nonce().to_string();
+        let outcome = match recovery {
+            BridgeRecovery::Inspect {
+                authorization,
+                expected,
+                ..
+            } => match self.inspect_foreground_recovery(&authorization, &expected) {
+                Ok(impact) => BridgeRecoveryOutcome::Impact(impact),
+                Err(error) => BridgeRecoveryOutcome::Failed(foreground_code_of(&error)),
+            },
+            BridgeRecovery::Prepare {
+                authorization,
+                request,
+                ..
+            } => match self.prepare_foreground_recovery(&authorization, &request) {
+                Ok(status) => BridgeRecoveryOutcome::Status(Some(status)),
+                Err(error) => BridgeRecoveryOutcome::Failed(foreground_code_of(&error)),
+            },
+            BridgeRecovery::Confirm {
+                authorization,
+                request,
+                token,
+                ..
+            } => match self.recover_foreground_root(&authorization, &request, &token) {
+                Ok(result) => {
+                    BridgeRecoveryOutcome::Status(Some(RecoveryOperationStatus::Committed(result)))
+                }
+                Err(error) => BridgeRecoveryOutcome::Failed(foreground_code_of(&error)),
+            },
+            BridgeRecovery::Operation {
+                authorization,
+                root,
+                operation_id,
+                ..
+            } => match self.foreground_recovery_status(&authorization, &root, &operation_id) {
+                Ok(status) => BridgeRecoveryOutcome::Status(status),
+                Err(error) => BridgeRecoveryOutcome::Failed(foreground_code_of(&error)),
+            },
+        };
+        BridgeRecoveryAnswer { nonce, outcome }
+    }
+
+    /// Notes that a new bridge connection was accepted.
+    ///
+    /// Challenges issued to the previous connection are dropped by the table itself:
+    /// an answer to a question nobody is waiting for must not be honoured.
+    pub fn bridge_reconnected(&self) {
+        self.with_foreground_bridge(|bridge| bridge.bridge_reconnected());
+    }
+
+    /// Notes that the bridge reached EOF, closing admission for managed roots.
+    ///
+    /// Closing is one-way on purpose: a crashed guardian is not a decision to revoke,
+    /// so nothing is tombstoned, but nothing new is admitted either.
+    pub fn bridge_closed(&self) {
+        self.with_foreground_bridge(|bridge| bridge.bridge_eof());
+    }
+
+    /// Whether the foreground lifecycle semantics are enabled for this coordinator.
+    pub fn foreground_activation(&self) -> crate::foreground::ForegroundActivation {
+        self.foreground_activation
+    }
+
+    /// Runs `f` against the private authority bridge.
+    ///
+    /// One accessor so the socket loop and the business handlers share the table: a
+    /// second copy would let an install and a bind disagree about who owns a root.
+    pub(crate) fn with_foreground_bridge<R>(
+        &self,
+        f: impl FnOnce(&mut crate::ipc::ForegroundBridge) -> R,
+    ) -> R {
+        let mut bridge = self
+            .foreground_bridge
+            .lock()
+            .expect("foreground bridge mutex poisoned");
+        f(&mut bridge)
+    }
+
+    /// Binds the one driver that may report this root's activity.
+    ///
+    /// The authorization is validated against the daemon's own authority table, in the
+    /// same lock a revocation would take: a client that names a root and an owner is
+    /// not authority, and a table consulted *after* the bind could already have revoked
+    /// the client whose driver just took over.
+    ///
+    /// `operation_id` is the identity of the bind, not of the driver. A transport that
+    /// lost the answer retries with the same id and gets the same epoch and sequence
+    /// back; only a proven stop may mint a new epoch (Task 7), so a second operation
+    /// here is a refusal rather than a takeover.
+    /// Binds, or replays, the one driver allowed to report this root.
+    ///
+    /// Synchronous on purpose: every step is a lock-and-check, so an `async fn` would
+    /// only invite the caller to build a runtime around it (and the socket loop did).
+    pub fn bind_foreground_driver(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        operation_id: &str,
+    ) -> Result<yi_agent_lifecycle::foreground::DriverBinding, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            DriverBinding, ForegroundFence, RootRef, SecretCapability,
+        };
+        if !self.foreground_activation.is_enabled() {
+            // The switch exists so a wire client cannot reach the new admission rules
+            // before the whole loop is wired. Answering anything but a refusal would
+            // advertise a contract this build does not honour.
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        if operation_id.trim().is_empty() {
+            return Err(RuntimeCoordinatorError::Supervisor(
+                "a driver bind needs an operation id".into(),
+            ));
+        }
+        let root: TaskId = authorization
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        if authorization.daemon_instance_id != self.generation {
+            // An authorization minted by another daemon generation names a runtime this
+            // process is not: its authority table is gone, and accepting it would let a
+            // stale grant be spent twice (once per generation).
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                authorization.root_id.clone(),
+            ));
+        }
+        let now = Instant::now();
+        let binding_epoch = self.with_foreground_bridge(|bridge| {
+            if !bridge.presents_capability(
+                &authorization.root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) {
+                // Covers a revoked client, an expired lease, a capability for another
+                // root, and a capability the guardian never issued. They are one answer
+                // on purpose: telling them apart would describe the table.
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    authorization.root_id.clone(),
+                ));
+            }
+            if bridge
+                .authority()
+                .installed_identity(&authorization.root_id)
+                .is_none_or(|(_, scope_key, _, _)| scope_key != authorization.scope_key)
+            {
+                // The scope key is how the bridge remembers which project an authority
+                // belongs to. An authorization that carries a different one was issued
+                // for another scope, so binding through it would classify this root
+                // under a decision nobody made about it.
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    authorization.root_id.clone(),
+                ));
+            }
+            bridge
+                .authority()
+                .binding_epoch(&authorization.root_id)
+                .ok_or_else(|| {
+                    RuntimeCoordinatorError::AuthorityDenied(authorization.root_id.clone())
+                })
+        })?;
+        let record = {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.bind_foreground_driver(
+                &root,
+                &authorization.client_run_id,
+                binding_epoch,
+                operation_id,
+            )?
+        };
+        // The capability is minted here and kept only in this process. A row that could
+        // be read back would hand a future process the rights of a dead driver.
+        let capability = {
+            let mut drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            match drivers.get(&authorization.root_id) {
+                // Same operation, same driver epoch: this is the caller's retry of a bind
+                // whose answer it lost. Hand back the secret it was already given.
+                Some(live)
+                    if live.operation_id == operation_id
+                        && live.driver_epoch == record.driver_epoch
+                        && live.owner == authorization.client_run_id =>
+                {
+                    SecretCapability::new(live.capability.clone())
+                }
+                _ => {
+                    let capability = SecretCapability::new(format!(
+                        "{}:{}:{}",
+                        Uuid::new_v4(),
+                        record.driver_epoch,
+                        record.attempt
+                    ));
+                    drivers.insert(
+                        authorization.root_id.clone(),
+                        LiveDriver {
+                            driver_epoch: record.driver_epoch,
+                            binding_epoch,
+                            owner: authorization.client_run_id.clone(),
+                            operation_id: operation_id.to_string(),
+                            capability: capability.expose().to_string(),
+                        },
+                    );
+                    capability
+                }
+            }
+        };
+        Ok(DriverBinding {
+            fence: ForegroundFence {
+                root: RootRef {
+                    session_id: record.session,
+                    root_id: authorization.root_id.clone(),
+                    attempt_id: record.attempt,
+                },
+                generation: self.generation.clone(),
+                binding_epoch,
+                driver_epoch: record.driver_epoch,
+            },
+            last_seq: record.last_seq,
+            driver_capability: capability,
+        })
+    }
+
+    /// Applies one activity report from the driver that holds this root.
+    ///
+    /// The capability is checked against the live in-memory entry *and* the reported
+    /// fence, and then the repository re-checks everything against the persisted row.
+    /// Both are needed: the memory check gives a fast `stale_driver` without a write, the
+    /// persisted check is what stops a bind committed after either read.
+    pub fn set_foreground_activity(
+        &self,
+        driver_capability: &yi_agent_lifecycle::foreground::SecretCapability,
+        update: &yi_agent_lifecycle::foreground::ActivityUpdate,
+    ) -> Result<yi_agent_lifecycle::foreground::ActivitySnapshot, RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        {
+            let drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            let live = drivers.get(&update.fence.root.root_id).ok_or_else(|| {
+                // No driver was ever issued, or the daemon restarted. Either way this
+                // capability cannot be the current one.
+                RuntimeCoordinatorError::AuthorityDenied(update.fence.root.root_id.clone())
+            })?;
+            if live.driver_epoch != update.fence.driver_epoch
+                || live.binding_epoch != update.fence.binding_epoch
+            {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(crate::foreground::ForegroundError::StaleDriver),
+                ));
+            }
+            if live.capability != driver_capability.expose() {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    update.fence.root.root_id.clone(),
+                ));
+            }
+        }
+        if update.fence.generation != self.generation {
+            // A report minted for a previous daemon process: its epoch numbers mean
+            // nothing here, and accepting it would let a restart be overwritten by a
+            // message written before it.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StaleAttempt),
+            ));
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .apply_foreground_activity(update)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Reads what a freeze would stop, without freezing or stopping anything.
+    ///
+    /// The read-only twin of [`Self::freeze_foreground_root`], added so a user can see
+    /// the impact before deciding. It deliberately does not write the freeze: merely
+    /// looking at a conversation must not close its admission, or an accidental click
+    /// on "inspect" would silently halt the work the user is watching.
+    ///
+    /// The authority check is the same one prepare uses, so an observer cannot read
+    /// somebody else's impact.
+    pub fn inspect_foreground_recovery(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        expected: &yi_agent_lifecycle::foreground::ForegroundFence,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryImpact, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            ExecutionIdentity, ExecutionKind, RecoveryImpact, RootRef,
+        };
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        self.ensure_foreground_authority(authorization, &expected.root.root_id)?;
+        let task: TaskId =
+            expected.root.root_id.parse().map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("root id is not a task id".into())
+            })?;
+        // The fence's epochs must still describe the persisted row. An inspect for an
+        // attempt that has moved on would show an impact about a different
+        // conversation, which is worse than refusing.
+        {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let Some(persisted) = repository.persisted_foreground_root(&task)? else {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(
+                        crate::foreground::ForegroundError::RecoveryAuthorityMissing,
+                    ),
+                ));
+            };
+            if persisted.binding_epoch != expected.binding_epoch
+                || persisted.driver_epoch != expected.driver_epoch
+                || expected.generation != self.generation
+            {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(crate::foreground::ForegroundError::StaleAttempt),
+                ));
+            }
+        }
+        let slots = self
+            .foreground_commit_gate
+            .snapshot_root(&expected.root.root_id);
+        let mut executions: Vec<ExecutionIdentity> = Vec::new();
+        let mut child_ids: Vec<String> = Vec::new();
+        let mut push = |task: &TaskId, kind: ExecutionKind| {
+            let execution = ExecutionIdentity {
+                execution_id: format!("{kind:?}:{}:{}", task, expected.root.attempt_id),
+                task_id: task.to_string(),
+                attempt_id: expected.root.attempt_id.clone(),
+                kind,
+            };
+            if !executions.iter().any(|seen| seen == &execution) {
+                executions.push(execution);
+            }
+            let id = task.to_string();
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        };
+        for task in slots.starting.iter().chain(slots.running.iter()) {
+            push(task, ExecutionKind::Worker);
+        }
+        let session: RootSessionId = expected.root.session_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::Supervisor("session id is not a session".into())
+        })?;
+        for child in self.registered_tasks_of(&session)? {
+            if child == task {
+                continue;
+            }
+            push(&child, ExecutionKind::Worker);
+        }
+        child_ids.sort();
+        // Report the *stored* freeze when one exists: a second inspect after a prepare
+        // must describe the set the prepare is actually proving, not a fresh estimate
+        // that could differ by a slot. When nothing was frozen yet, the in-memory
+        // snapshot is the best available estimate -- and it is only an estimate, so it
+        // is written nowhere.
+        let stored = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.frozen_execution_set(&task)?
+        };
+        let (version, blocked) = match stored {
+            Some((version, frozen)) => (
+                version,
+                frozen
+                    .iter()
+                    .map(|execution| execution.execution_id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            None => (
+                0,
+                executions
+                    .iter()
+                    .map(|execution| execution.execution_id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        Ok(RecoveryImpact {
+            root: RootRef {
+                session_id: expected.root.session_id.clone(),
+                root_id: expected.root.root_id.clone(),
+                attempt_id: expected.root.attempt_id.clone(),
+            },
+            stopped_execution_ids: Vec::new(),
+            blocked_execution_ids: blocked,
+            child_ids,
+            version,
+            reason: "foreground recovery inspection".to_string(),
+        })
+    }
+
+    /// Reads the committed activity of one root, without writing anything.
+    ///
+    /// Read-only on purpose: a query must never refresh a deadline or a phase. The
+    /// caller's authorization is checked against the live table exactly like a bind, so
+    /// an observer cannot poll a conversation it does not own.
+    pub fn get_foreground_activity(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        root: &yi_agent_lifecycle::foreground::RootRef,
+    ) -> Result<Option<yi_agent_lifecycle::foreground::ActivitySnapshot>, RuntimeCoordinatorError>
+    {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        if root.root_id != authorization.root_id {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root.root_id.clone(),
+            ));
+        }
+        if authorization.daemon_instance_id != self.generation {
+            // A query answered across generations would describe a table this process
+            // does not have: the rows were written by a daemon that is gone, and the
+            // in-memory authority that justified them went with it.
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root.root_id.clone(),
+            ));
+        }
+        let now = Instant::now();
+        self.with_foreground_bridge(|bridge| {
+            if !bridge.presents_capability(
+                &authorization.root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root.root_id.clone(),
+                ));
+            }
+            if bridge
+                .authority()
+                .installed_identity(&authorization.root_id)
+                .is_none_or(|(_, scope_key, _, _)| scope_key != authorization.scope_key)
+            {
+                // Same rule as a bind: a capability carried under another scope's key
+                // was issued for a different project decision.
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root.root_id.clone(),
+                ));
+            }
+            Ok(())
+        })?;
+        let task: TaskId = root
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .foreground_activity(&task)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Freezes one root for a rebind and reports what it must stop.
+    ///
+    /// Three steps, and the order is the whole guarantee:
+    ///
+    /// 1. freeze the root in the gate, which refuses new admissions and cancels
+    ///    starting slots, and returns the live set the gate knows;
+    /// 2. merge that set with what the supervisor has registered, so a child that was
+    ///    admitted but whose factory has not been reached is still in the set;
+    /// 3. persist that closed set with a fresh version.
+    ///
+    /// The merge is why this cannot be "read the supervisors and freeze": between
+    /// those two reads a spawn would be admitted and land in neither view. Freezing
+    /// first means anything arriving later is refused, so the set read afterwards is
+    /// already closed.
+    ///
+    /// The gate is released before any waiting. Nothing here awaits, blocks on a
+    /// worker, or talks to a process: stopping is the caller's job, outside this call.
+    pub fn freeze_foreground_root(
+        &self,
+        root: &yi_agent_lifecycle::foreground::RootRef,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryImpact, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            ExecutionIdentity, ExecutionKind, ForegroundFence, RecoveryImpact, RootRef,
+        };
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let task: TaskId = root
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        if self.foreground_commit_gate.is_frozen(&root.root_id.clone()) {
+            // A second freeze would replace the set the first one is proving, and the
+            // caller would then be verifying evidence against a different set than the
+            // one its stop requests went out for.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::OperationConflict),
+            ));
+        }
+        // The persisted row is the fence: an attempt that has already moved on must not
+        // be frozen as if it were still current.
+        let persisted = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.persisted_foreground_root(&task)?
+        };
+        let Some(persisted) = persisted else {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(
+                    crate::foreground::ForegroundError::RecoveryAuthorityMissing,
+                ),
+            ));
+        };
+        let fence = ForegroundFence {
+            root: RootRef {
+                session_id: root.session_id.clone(),
+                root_id: root.root_id.clone(),
+                attempt_id: root.attempt_id.clone(),
+            },
+            generation: self.generation.clone(),
+            binding_epoch: persisted.binding_epoch,
+            driver_epoch: persisted.driver_epoch,
+        };
+        // Freeze first: from here on nothing new is admitted under this root, so the
+        // set collected next cannot grow.
+        let frozen_slots = self
+            .foreground_commit_gate
+            .freeze_root(&root.root_id.clone());
+        let mut executions: Vec<ExecutionIdentity> = Vec::new();
+        let mut child_ids: Vec<String> = Vec::new();
+        let mut push = |task: &TaskId, kind: ExecutionKind| {
+            // One identity per task *and* attempt. Restarting the same task mints a new
+            // attempt, so evidence written here can never match the new execution.
+            let attempt = root.attempt_id.clone();
+            let execution = ExecutionIdentity {
+                execution_id: format!("{kind:?}:{}:{attempt}", task),
+                task_id: task.to_string(),
+                attempt_id: attempt,
+                kind,
+            };
+            if !executions.iter().any(|seen| seen == &execution) {
+                executions.push(execution);
+            }
+            let id = task.to_string();
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        };
+        for task in frozen_slots
+            .starting
+            .iter()
+            .chain(frozen_slots.running.iter())
+        {
+            push(task, ExecutionKind::Worker);
+        }
+        // Registered children that never reached the gate still belong to the set.
+        // The root itself is *excluded*: it has no daemon worker, so demanding a
+        // worker join for it would invent evidence the spec forbids. Its foreground
+        // turn is stopped by the host and proven through its tool groups instead.
+        let session: RootSessionId = root.session_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::Supervisor("session id is not a session".into())
+        })?;
+        for child in self.registered_tasks_of(&session)? {
+            if child == task {
+                continue;
+            }
+            push(&child, ExecutionKind::Worker);
+        }
+        child_ids.sort();
+        let (version, frozen) = {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.freeze_foreground_root(&fence, &executions, "foreground recovery")?
+        };
+        Ok(RecoveryImpact {
+            root: fence.root.clone(),
+            stopped_execution_ids: Vec::new(),
+            blocked_execution_ids: frozen
+                .iter()
+                .map(|execution| execution.execution_id.clone())
+                .collect(),
+            child_ids,
+            version,
+            reason: "foreground recovery".to_string(),
+        })
+    }
+
+    /// Re-checks the stored evidence against the frozen set, inside one transaction.
+    ///
+    /// Called before a confirmation is issued and again inside the recovery commit,
+    /// because between those two moments the evidence could have been superseded. The
+    /// set is read from persistence rather than memory: after a restart the in-memory
+    /// set is gone, and "no pending stop" would otherwise read as "everything
+    /// stopped".
+    pub fn verify_foreground_quiescence(
+        &self,
+        fence: &yi_agent_lifecycle::foreground::ForegroundFence,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let task: TaskId =
+            fence.root.root_id.parse().map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("root id is not a task id".into())
+            })?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        let Some((version, frozen)) = repository.frozen_execution_set(&task)? else {
+            // No freeze at all: nothing was ever closed, so nothing can be verified.
+            // Reporting success here is what would let a rebind skip the stop proof.
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StopUnproven(
+                    vec![fence.root.root_id.clone()],
+                )),
+            ));
+        };
+        let _ = version;
+        let evidence = repository.stop_evidence_for(&task, &fence.root.attempt_id)?;
+        let report =
+            yi_agent_lifecycle::foreground::assess_quiescence(fence, version, &frozen, &evidence);
+        if !report.blocked.is_empty() {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StopUnproven(
+                    report
+                        .blocked
+                        .iter()
+                        .map(|execution| execution.execution_id.clone())
+                        .collect(),
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prepares a recovery: freeze, stop, and issue a confirmation only if proven.
+    ///
+    /// Authorization comes first, then the freeze. That order matters: a caller with
+    /// no authority must not be able to close a conversation's admission even
+    /// temporarily, and a freeze is not reversible.
+    ///
+    /// The token is withheld while any frozen execution is unproven, so "prepare
+    /// returned" never means "you may commit". It is bound to the request
+    /// fingerprint, the fence and the set version, and it expires.
+    pub fn prepare_foreground_recovery(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryOperationStatus, RuntimeCoordinatorError>
+    {
+        use yi_agent_lifecycle::foreground::{
+            RecoveryOperationStatus, RecoveryPreview, SecretCapability,
+        };
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        self.ensure_foreground_authority(authorization, &request.expected.root.root_id)?;
+        // The request names the attempt it expects; a fence whose attempt does not
+        // match the live row is stale, and stopping under it would close the wrong
+        // conversation.
+        let root_task: TaskId =
+            request.expected.root.root_id.parse().map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("root id is not a task id".into())
+            })?;
+        let persisted = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.persisted_foreground_root(&root_task)?
+        };
+        let Some(persisted) = persisted else {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(
+                    crate::foreground::ForegroundError::RecoveryAuthorityMissing,
+                ),
+            ));
+        };
+        if persisted.binding_epoch != request.expected.binding_epoch
+            || persisted.driver_epoch != request.expected.driver_epoch
+            || request.expected.generation != self.generation
+        {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(crate::foreground::ForegroundError::StaleDriver),
+            ));
+        }
+        {
+            // Refuse before freezing: a freeze is not reversible, so a caller must not
+            // be able to close a conversation's admission by asking to "recover" a root
+            // that is done.
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            if !repository.foreground_attempt_is_stalled(&root_task)? {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(
+                        crate::foreground::ForegroundError::RecoveryRequired,
+                    ),
+                ));
+            }
+        }
+        let impact = self.freeze_foreground_root(&request.expected.root)?;
+        // The freeze closed admission; now ask whether the set it closed is proven
+        // stopped. A failure here is information, not an error path: the caller gets
+        // `Blocked` with the entities it must deal with.
+        let unproven = self.verify_foreground_quiescence(&request.expected);
+        let fingerprint = format!(
+            "{}:{}:{}:{}",
+            request.operation_id,
+            request.expected.root.root_id,
+            request.expected.root.attempt_id,
+            impact.version
+        );
+        let request_json = serde_json::to_string(&request.expected)
+            .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
+        {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.record_foreground_recovery_prepare(
+                &root_task,
+                &request.operation_id,
+                &request.expected.root.attempt_id,
+                &fingerprint,
+                &request_json,
+                &impact,
+            )?;
+        }
+        match unproven {
+            Ok(()) => {
+                let token = SecretCapability::new(format!(
+                    "{}:{}:{}",
+                    Uuid::new_v4(),
+                    impact.version,
+                    request.operation_id
+                ));
+                let expires_at = Instant::now() + FOREGROUND_CONFIRMATION_WINDOW;
+                let preview = RecoveryPreview {
+                    request: request.clone(),
+                    impact: impact.clone(),
+                    confirmation_token: Some(SecretCapability::new(token.expose().to_string())),
+                    expires_at: Some(chrono::Utc::now().to_rfc3339()),
+                };
+                self.foreground_confirmations
+                    .lock()
+                    .expect("foreground confirmation mutex poisoned")
+                    .insert(
+                        key_of(&request.expected.root.root_id, &request.operation_id),
+                        PreparedRecovery {
+                            fence: request.expected.clone(),
+                            fingerprint,
+                            impact_version: impact.version,
+                            token: token.expose().to_string(),
+                            expires_at,
+                        },
+                    );
+                Ok(RecoveryOperationStatus::Ready(preview))
+            }
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(
+                crate::foreground::ForegroundError::StopUnproven(blocked),
+            ))) => Ok(RecoveryOperationStatus::Blocked(
+                yi_agent_lifecycle::foreground::RecoveryImpact {
+                    blocked_execution_ids: blocked,
+                    ..impact
+                },
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Commits a prepared recovery, or replays its receipt.
+    ///
+    /// The confirmation is consumed only after the transaction commits. Consuming it
+    /// first would let a rollback burn a token for a recovery that never happened.
+    pub fn recover_foreground_root(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+        token: &yi_agent_lifecycle::foreground::SecretCapability,
+    ) -> Result<yi_agent_lifecycle::foreground::RecoveryResult, RuntimeCoordinatorError> {
+        use crate::foreground::ForegroundError;
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        self.ensure_foreground_authority(authorization, &request.expected.root.root_id)?;
+        let root_task: TaskId =
+            request.expected.root.root_id.parse().map_err(|_| {
+                RuntimeCoordinatorError::Supervisor("root id is not a task id".into())
+            })?;
+        let key = key_of(&request.expected.root.root_id, &request.operation_id);
+        let prepared = self
+            .foreground_confirmations
+            .lock()
+            .expect("foreground confirmation mutex poisoned")
+            .get(&key)
+            .cloned();
+        // A replay of an already committed operation must work without a token: the
+        // token was consumed by the first call and the receipt is the answer.
+        let already = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.foreground_recovery_result(&root_task, &request.operation_id)?
+        };
+        if let Some(result) = already {
+            if prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.fence != request.expected)
+            {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(ForegroundError::OperationConflict),
+                ));
+            }
+            return Ok(result);
+        }
+        let _ = token;
+        let Some(prepared) = prepared else {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(ForegroundError::ConfirmationRequired),
+            ));
+        };
+        if prepared.fence != request.expected {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(ForegroundError::StaleAttempt),
+            ));
+        }
+        if prepared.token != token.expose() {
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(ForegroundError::ConfirmationRequired),
+            ));
+        }
+        if Instant::now() >= prepared.expires_at {
+            self.foreground_confirmations
+                .lock()
+                .expect("foreground confirmation mutex poisoned")
+                .remove(&key);
+            return Err(RuntimeCoordinatorError::Repository(
+                RepositoryError::Foreground(ForegroundError::ConfirmationExpired),
+            ));
+        }
+        // Re-verify immediately before the transaction: the confirmation was issued
+        // earlier, and evidence could have been withdrawn or the set replaced.
+        self.verify_foreground_quiescence(&request.expected)?;
+        let successor = Uuid::new_v4().to_string();
+        let result = {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            repository.commit_foreground_recovery(
+                &root_task,
+                &request.operation_id,
+                &prepared.fingerprint,
+                &request.expected.root.attempt_id,
+                &successor,
+            )?
+        };
+        // Committed: the token has served its purpose. Dropping the driver entry makes
+        // the old driver's capability stop working even before a new bind.
+        self.foreground_confirmations
+            .lock()
+            .expect("foreground confirmation mutex poisoned")
+            .remove(&key);
+        self.foreground_drivers
+            .lock()
+            .expect("foreground driver mutex poisoned")
+            .remove(&request.expected.root.root_id);
+        // The in-memory gate still holds the old root frozen. That is deliberate: the
+        // successor has no executions, and a later bind is what reopens admission.
+        Ok(result)
+    }
+
+    /// Reads one recovery operation's state, after re-authenticating the caller.
+    ///
+    /// A committed receipt outlives the token and the generation that wrote it, so a
+    /// host that lost the answer can still learn what happened -- but only with a
+    /// valid authorization for the root.
+    pub fn foreground_recovery_status(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        root: &yi_agent_lifecycle::foreground::RootRef,
+        operation: &str,
+    ) -> Result<
+        Option<yi_agent_lifecycle::foreground::RecoveryOperationStatus>,
+        RuntimeCoordinatorError,
+    > {
+        use yi_agent_lifecycle::foreground::{
+            RecoveryOperationStatus, RecoveryPreview, SecretCapability,
+        };
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        self.ensure_foreground_authority(authorization, &root.root_id)?;
+        let root_task: TaskId = root
+            .root_id
+            .parse()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("root id is not a task id".into()))?;
+        let repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        if let Some(result) = repository.foreground_recovery_result(&root_task, operation)? {
+            return Ok(Some(RecoveryOperationStatus::Committed(result)));
+        }
+        let phase = repository.foreground_recovery_phase(&root_task, operation)?;
+        let Some(phase) = phase else {
+            return Ok(None);
+        };
+        Ok(Some(match phase.as_str() {
+            "preparing" => RecoveryOperationStatus::Preparing,
+            "needs_preview" => RecoveryOperationStatus::NeedsPreview,
+            "blocked" | "ready" => {
+                // The preview itself lived in memory; after a restart only the phase
+                // survives, and the honest answer is "prepare again".
+                let prepared = self
+                    .foreground_confirmations
+                    .lock()
+                    .expect("foreground confirmation mutex poisoned")
+                    .get(&key_of(&root.root_id, operation))
+                    .cloned();
+                match prepared {
+                    Some(prepared) => RecoveryOperationStatus::Ready(RecoveryPreview {
+                        request: yi_agent_lifecycle::foreground::RecoveryRequest {
+                            expected: prepared.fence.clone(),
+                            operation_id: operation.to_string(),
+                        },
+                        impact: yi_agent_lifecycle::foreground::RecoveryImpact {
+                            root: prepared.fence.root.clone(),
+                            stopped_execution_ids: Vec::new(),
+                            blocked_execution_ids: Vec::new(),
+                            child_ids: Vec::new(),
+                            version: prepared.impact_version,
+                            reason: "foreground recovery".to_string(),
+                        },
+                        confirmation_token: Some(SecretCapability::new(prepared.token.clone())),
+                        expires_at: Some(chrono::Utc::now().to_rfc3339()),
+                    }),
+                    None => RecoveryOperationStatus::NeedsPreview,
+                }
+            }
+            _ => {
+                return Err(RuntimeCoordinatorError::Repository(
+                    RepositoryError::Foreground(crate::foreground::ForegroundError::CorruptBinding),
+                ));
+            }
+        }))
+    }
+
+    /// Checks a root authorization against the live bridge, the same way a bind does.
+    fn ensure_foreground_authority(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        root_id: &str,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if authorization.root_id != root_id {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root_id.to_string(),
+            ));
+        }
+        if authorization.daemon_instance_id != self.generation {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                root_id.to_string(),
+            ));
+        }
+        let now = Instant::now();
+        // Recovery is exactly the case a `RecoveryOnly` install exists for: the old
+        // owner is gone, so nobody holds business authority, but the guardian can still
+        // vouch for the same secret. Accepting only `Business` here would make recovery
+        // depend on the very authority it is trying to replace.
+        self.with_foreground_bridge(|bridge| {
+            if !bridge.presents_capability(
+                root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) && !bridge.presents_recovery_capability(
+                root_id,
+                &authorization.client_run_id,
+                &authorization.capability,
+                now,
+            ) {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root_id.to_string(),
+                ));
+            }
+            if bridge
+                .authority()
+                .installed_identity(root_id)
+                .is_none_or(|(_, scope_key, _, _)| scope_key != authorization.scope_key)
+            {
+                return Err(RuntimeCoordinatorError::AuthorityDenied(
+                    root_id.to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Records one trusted party's stop observation for a frozen execution.
+    ///
+    /// Not reachable from the business socket: the daemon's own join observer and the
+    /// guardian's private bridge are the only callers. A business client that could
+    /// reach this would be able to mint the very proof the freeze exists to demand.
+    pub fn record_foreground_stop_evidence(
+        &self,
+        evidence: &yi_agent_lifecycle::foreground::StopEvidence,
+    ) -> Result<yi_agent_lifecycle::foreground::StopEvidence, RuntimeCoordinatorError> {
+        if !self.foreground_activation.is_enabled() {
+            return Err(RuntimeCoordinatorError::AdmissionClosed(
+                "foreground root lifecycle is not enabled in this build".into(),
+            ));
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        repository
+            .record_stop_evidence(evidence)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Every task a session's supervisor has registered, sorted.
+    ///
+    /// Reads through `try_lock` rather than awaiting: this runs while a root is frozen
+    /// and a supervisor lock held across an await here would stall unrelated work. A
+    /// busy supervisor yields an empty list, which makes the freeze look smaller than
+    /// it is — so the caller must verify against persistence, not against this.
+    fn registered_tasks_of(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<Vec<TaskId>, RuntimeCoordinatorError> {
+        let mut tasks = {
+            let supervisors = self
+                .supervisors
+                .lock()
+                .expect("runtime supervisor mutex poisoned");
+            let Some(supervisor) = supervisors.get(session) else {
+                return Ok(Vec::new());
+            };
+            match supervisor.try_lock() {
+                Ok(supervisor) => supervisor.task_ids(),
+                // A busy supervisor is an error, not an empty list: a set that
+                // silently came back smaller would make the freeze look complete when
+                // it was not, and the missing children would never be proven stopped.
+                Err(_) => {
+                    return Err(RuntimeCoordinatorError::Supervisor(
+                        "the session is busy; the frozen execution set could not be enumerated"
+                            .into(),
+                    ));
+                }
+            }
+        };
+        tasks.sort_by_key(|task| task.to_string());
+        Ok(tasks)
+    }
+
     /// Closes one client's admission and returns the roots it owned.
     ///
     /// Idempotent. Only this client's tree is affected: other clients keep
     /// admitting work, which is the difference between a client drain and the
     /// project-level drain [`Self::begin_draining`] performs.
     pub fn close_client_admission(&self, client: &str) -> Vec<RootId> {
-        let roots = {
+        // Closing admission and cancelling the client's starting executions are one
+        // step, for the same reason commit is: a spawn that commits after this must
+        // be refused, and a spawn that committed before it must be cancelled rather
+        // than left running with nobody to ask. Nothing awaits inside.
+        let (roots, _starting) = {
             let mut clients = self.clients.lock().expect("runtime clients mutex poisoned");
-            clients.close_client_admission(client)
+            let roots = clients.close_client_admission(client);
+            let released = self.foreground_commit_gate.release_owner(client);
+            (roots, released)
         };
+        {
+            // A released owner's driver capability must stop working with its
+            // admission: leaving it in the map would let a driver that outlived the
+            // release keep writing activity for a root nobody owns.
+            let mut drivers = self
+                .foreground_drivers
+                .lock()
+                .expect("foreground driver mutex poisoned");
+            drivers.retain(|_, driver| driver.owner != client);
+        }
         let repository = self
             .repository
             .lock()
@@ -3810,6 +5401,369 @@ impl RuntimeCoordinator {
         } else {
             false
         }
+    }
+
+    /// Close admission, then stop everything the gate registered.
+    ///
+    /// The two halves are deliberately split. Closing and enumerating happens under
+    /// the gate, because that is what makes "nothing new is admitted" and "this is
+    /// the complete set" true together. Stopping happens *after* the gate is
+    /// released: a cancel, a join or a supervisor lock held here would make an
+    /// unrelated session's spawn wait for this client's teardown, and the plan
+    /// forbids exactly that.
+    ///
+    /// `starting` slots are cancelled by the gate already; this waits for their
+    /// answer. `running` slots already have a handle and are cancelled here.
+    pub async fn release_owner_and_stop(
+        &self,
+        client: &str,
+    ) -> Result<Vec<RootId>, RuntimeCoordinatorError> {
+        let roots = self.close_client_admission(client);
+        let released = self.foreground_commit_gate.release_owner(client);
+        for task in &released.running {
+            self.foreground_commit_gate.stopped(task);
+        }
+        for task in &released.starting {
+            // A starting slot may still be waiting for a factory. Its own token was
+            // cancelled under the gate, so the answer arrives without us holding
+            // anything; wait for the slot to settle rather than reporting success on
+            // an execution that may yet run.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.foreground_commit_gate.is_starting(task) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // A release must not claim more than it proved. Slots still live here either
+        // ignored their cancellation or are running and their stop has not been
+        // recorded; reporting them is what lets a caller retry instead of believing a
+        // teardown succeeded.
+        let outstanding = self.foreground_commit_gate.live_count();
+        if outstanding > 0 {
+            return Err(RuntimeCoordinatorError::StopUnproven {
+                outstanding,
+                roots: roots.clone(),
+            });
+        }
+        Ok(roots)
+    }
+
+    /// Every task the session's supervisor knows about, root included.
+    ///
+    /// Test hook: the assertions are about what was *registered*, so they must read
+    /// the live supervisor rather than a projection of it.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn children_of_root(&self, session: &RootSessionId) -> Vec<TaskId> {
+        self.supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .get(session)
+            .map(|supervisor| {
+                supervisor
+                    .try_lock()
+                    .map(|supervisor| supervisor.task_ids())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One watchdog scan that lists its candidates *before* the caller acts.
+    ///
+    /// Exists so a test can hold the scan's view of the world still while the
+    /// classification changes underneath it -- the exact shape of the race the
+    /// commit-time re-check defends against. Production calls
+    /// [`Self::evaluate_watchdogs`] directly; this only splits the two phases.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub async fn evaluate_watchdogs_with_stale_candidates(
+        &self,
+        now: DateTime<Utc>,
+        on_listed: impl FnOnce(),
+    ) -> Result<usize, RuntimeCoordinatorError> {
+        let watchdogs = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .active_attempt_watchdogs()?;
+        // The world changes after the scan read it.
+        on_listed();
+        let mut terminal_count = 0;
+        for watchdog in watchdogs {
+            let Some(outcome) = evaluate_watchdog(
+                &watchdog.snapshot.limits,
+                &watchdog.snapshot.observation,
+                now,
+            ) else {
+                continue;
+            };
+            let terminal = match outcome {
+                WatchdogOutcome::Stalled => WatchdogTerminal::Stalled,
+                WatchdogOutcome::TimedOut(kind) => WatchdogTerminal::TimedOut(kind),
+                WatchdogOutcome::BudgetExhausted(kind) => WatchdogTerminal::BudgetExhausted(kind),
+            };
+            let elapsed_secs = now
+                .signed_duration_since(watchdog.snapshot.observation.last_meaningful_at)
+                .num_seconds()
+                .max(0) as u64;
+            let evidence = WatchdogEvidence {
+                last_meaningful_event_id: watchdog.snapshot.last_meaningful_event_id,
+                last_meaningful_at: watchdog.snapshot.observation.last_meaningful_at,
+                elapsed_secs,
+                current_wait: watchdog.snapshot.current_wait.clone(),
+            };
+            if self
+                .record_watchdog_terminal(
+                    &watchdog.session_id,
+                    &watchdog.task_id,
+                    terminal,
+                    evidence,
+                )
+                .await?
+            {
+                terminal_count += 1;
+            }
+        }
+        Ok(terminal_count)
+    }
+
+    /// Imports a pre-fix `stalled` snapshot for a root, for recovery tests.
+    ///
+    /// The production writer refuses a managed container on purpose (Task 5), so no
+    /// production path can still produce this shape. What recovery has to handle is the
+    /// *history*: rows that a previous build settled before the exemption existed. This
+    /// hook writes exactly that history, through the repository's own terminal encoding,
+    /// so the recovery reader meets a faithful row rather than a hand-set flag.
+    ///
+    /// Test hook only, and it must stay that way: a production entry point that accepts
+    /// "please set this root stalled" would be the bypass the spec forbids.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn import_stalled_snapshot_for_test(
+        &self,
+        task: &TaskId,
+        evidence: crate::repository::WatchdogEvidence,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .import_stalled_snapshot(task, &evidence)
+            .map_err(RuntimeCoordinatorError::Repository)
+    }
+
+    /// Re-installs one root's authority as `RecoveryOnly`, keeping its capability.
+    ///
+    /// Test hook mirroring the guardian's own step: when an owner is revoked, the host
+    /// that still holds the conversation's capability may be issued a recovery scope to
+    /// break the stop/authorize cycle. Only the scope and owner change.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_recovery_authority_for_test(
+        &self,
+        previous: &yi_agent_lifecycle::types::RootAuthorization,
+    ) -> Result<yi_agent_lifecycle::types::RootAuthorization, RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            AuthorityMessage, AuthorityStamp, BridgeFrame, RootAuthorityScope,
+        };
+        let now = Instant::now();
+        let nonce = Uuid::new_v4().to_string();
+        let authority_seq = {
+            let challenge = self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.handle(
+                    BridgeFrame::Prepare {
+                        nonce: nonce.clone(),
+                        root_id: previous.root_id.clone(),
+                        client_run_id: previous.client_run_id.clone(),
+                        scope_key: previous.scope_key.clone(),
+                        generation: self.generation.clone(),
+                        requested_seq: 1,
+                        intent: yi_agent_lifecycle::foreground::RootBindIntent {
+                            operation_id: "recovery-scope".into(),
+                            thread_key: "recovery-thread".into(),
+                            workspace: std::path::PathBuf::from("/tmp"),
+                            extra_roots: Vec::new(),
+                            previous_root_capability: None,
+                        },
+                        scope: RootAuthorityScope::RecoveryOnly,
+                    },
+                    &mut repository,
+                    now,
+                )
+            });
+            match challenge {
+                Some(BridgeFrame::Challenge { authority_seq, .. }) => authority_seq,
+                other => {
+                    return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                        "the bridge refused the recovery prepare: {other:?}"
+                    )));
+                }
+            }
+        };
+        let stamp = AuthorityStamp {
+            scope_key: previous.scope_key.clone(),
+            generation: self.generation.clone(),
+            owner: previous.client_run_id.clone(),
+            root_id: previous.root_id.clone(),
+            binding_epoch: 1,
+            authority_seq,
+            challenge_nonce: nonce,
+            remaining_lease_ms: 30_000,
+            authority_scope: RootAuthorityScope::RecoveryOnly,
+        };
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Authority(AuthorityMessage::Install {
+                    stamp,
+                    authorization: previous.clone(),
+                }),
+                &mut repository,
+                now,
+            )
+        });
+        if let Some(BridgeFrame::Denied { code, .. }) = answer {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the recovery install was refused: {code:?}"
+            )));
+        }
+        Ok(previous.clone())
+    }
+
+    /// A task's active attempt, read from the live supervisor.
+    ///
+    /// Test hook: watchdog tests must name the attempt the durable row points at,
+    /// which is exactly the value a stale snapshot would disagree with.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn active_attempt_for_test(&self, task: &TaskId) -> Option<AttemptId> {
+        self.supervisors
+            .lock()
+            .expect("runtime supervisor mutex poisoned")
+            .values()
+            .find_map(|supervisor| {
+                supervisor.try_lock().ok().and_then(|supervisor| {
+                    supervisor
+                        .task(task)
+                        .map(|task| task.active_attempt_id().clone())
+                })
+            })
+    }
+
+    /// How many registered executions have not been proven stopped.
+    ///
+    /// Test hook: a cancelled handle that was never settled would still count here,
+    /// so the assertion is about the gate's own bookkeeping rather than a projection.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn live_execution_count(&self) -> usize {
+        self.foreground_commit_gate.live_count()
+    }
+
+    /// The fixture's direct repository handle, for building the durable
+    /// contradictions the reader must refuse.
+    ///
+    /// Test hook only: production code never reaches around the coordinator to the
+    /// repository, and doing so here is the point -- a corrupt row is something the
+    /// production path cannot produce, so a test must be able to.
+    ///
+    /// Contention here is expected: the daemon's own threads take this lock while
+    /// the test is between statements. A bare `try_lock()` therefore turned ordinary
+    /// scheduling into a spurious `None` (and a `unwrap()` panic under the full
+    /// workspace run). Waiting is bounded so a real same-thread re-entry -- which
+    /// would deadlock a plain `lock()` -- still fails loudly instead of hanging.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn repository_for_test(&self) -> Option<std::sync::MutexGuard<'_, RuntimeRepository>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.repository.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the test repository stayed locked for 10s; a test hook is being \
+                         called while the guard is already held on this thread"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// Marks a root's classification for the admission tests.
+    ///
+    /// Test hook only: the real writer is the authenticated prepare (Task 3/9). The
+    /// tests here need a root that is *already* pending or corrupt, and building one
+    /// through the real bridge would test the bridge instead of the gate.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn record_foreground_class_for_test(
+        &self,
+        root: &TaskId,
+        classification: crate::repository::foreground::ForegroundClassification,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .record_foreground_root(&crate::repository::foreground::PersistedForegroundRoot {
+                root: root.clone(),
+                classification,
+                binding_epoch: 0,
+                driver_epoch: 0,
+                owner_client_id: None,
+                admission: crate::repository::foreground::AdmissionState::Closed,
+                driver_bind_operation_id: None,
+            })?;
+        Ok(())
+    }
+
+    /// Runs the guard a spawn commit consults, without spawning.
+    ///
+    /// Exposed so a test can prove a pending or corrupt root is refused *by name*
+    /// instead of inferring it from a failed spawn that might have failed earlier.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn check_root_dispatchable_for_test(
+        &self,
+        session: &RootSessionId,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        // `session_root` awaits the supervisor, which a synchronous test hook cannot
+        // do. The assertion here is about the *dispatch guard*, not about waiting, so
+        // a momentary busy supervisor is reported as such rather than being hidden.
+        let supervisor = self.supervisor(session)?;
+        let guard = supervisor
+            .try_lock()
+            .map_err(|_| RuntimeCoordinatorError::Supervisor("session is busy".to_string()))?;
+        let root = guard.root_task_id().clone();
+        drop(guard);
+        self.ensure_root_dispatchable(&root)
+    }
+
+    /// Installs a test barrier inside the admission protocol.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_test_barrier(
+        &self,
+        point: &'static str,
+        barrier: Arc<crate::foreground::TestBarrier>,
+    ) {
+        self.foreground_commit_gate
+            .install_test_barrier(point, barrier);
+    }
+
+    /// Settles a start that will never be attempted.
+    ///
+    /// A committed child can fail before the factory is reached (workspace
+    /// provisioning, a recovery gate, a provider profile refusal). The row and the
+    /// slot already exist, so the honest outcome is to record that the execution is
+    /// over rather than leave a starting slot that no one will ever answer for. The
+    /// permit is dropped here too: a parked permit is a second claim on a slot that
+    /// has none.
+    fn abandon_foreground_start(&self, task: &TaskId) {
+        self.foreground_starting
+            .lock()
+            .expect("foreground starting permit mutex poisoned")
+            .remove(task);
+        self.foreground_commit_gate.stopped(task);
     }
 
     /// Every root a client owns, for reclamation and diagnostics.

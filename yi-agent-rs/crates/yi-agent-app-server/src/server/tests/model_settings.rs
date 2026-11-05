@@ -507,6 +507,7 @@ async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     let mut effective = crate::test_support::test_config();

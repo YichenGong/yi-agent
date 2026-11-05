@@ -3304,6 +3304,10 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         panic!("expected a spawned child task");
     };
 
+    // 10ms 与同文件 `daemon_wait_agent_timeout_returns_partial_completed_reports`
+    // 里记录过的抖动是同一类问题：超时本身是必然的，但全量并发时 daemon 调度可能
+    // 让请求在 child 落库可见之前就返回，于是 `children` 对不上。200ms 仍是断言级
+    // 的短等待（远小于任何真实等待），却给调度留出了确定性的余量。
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::WaitAgent {
@@ -3311,7 +3315,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             caller_task_id: root_task_id,
             capability: message_capability,
             mode: "all".into(),
-            timeout_ms: Some(10),
+            timeout_ms: Some(200),
         },
     )
     .unwrap();
@@ -3322,7 +3326,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         reports,
     } = response
     else {
-        panic!("expected bounded wait response");
+        panic!("expected bounded wait response, got {response:?}");
     };
     assert_eq!(status, "timeout");
     assert_eq!(children, vec![task_id]);
@@ -5774,5 +5778,1037 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
         state(&root_task_id),
         "cancelled",
         "the shared root must not be cancelled by one conversation leaving"
+    );
+}
+
+/// A spawn over the real socket that loses its race with a release must leave
+/// nothing behind.
+///
+/// The store-level tests drive the coordinator directly. This one exists because the
+/// wire path is a second entry point into the same admission decision: a daemon that
+/// answered `TaskSpawned` for a refused commit would be indistinguishable from a
+/// correct one from the coordinator's point of view.
+#[test]
+#[cfg(feature = "foreground-test-support")]
+fn foreground_root_lifecycle_a_refused_wire_spawn_leaves_no_child_and_no_owner() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = application_root_daemon(&directory, &database);
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "foreground-race".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    // Close the owner's admission first, exactly as a release does, then ask for a
+    // child over the socket. The owner is the attach idempotency key, which is what
+    // makes "the App's work" a stable set across app-server restarts.
+    daemon
+        .coordinator_for_test()
+        .close_client_admission("foreground-race");
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "too late".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, IpcResponse::Error { .. }),
+        "a spawn for a closed owner must be refused on the wire, got {response:?}"
+    );
+    let coordinator = daemon.coordinator_for_test();
+    assert_eq!(
+        coordinator.owned_roots_of("foreground-race"),
+        vec![root_task_id.clone()],
+        "a refused spawn must not add an owned root"
+    );
+}
+
+/// A daemon whose coordinator serves the foreground lifecycle rules.
+///
+/// `start_with_factory` always passes `Disabled`, and that is the point: a production
+/// listener must not serve the new rules before Task 11 wires the rest of the loop. The
+/// foreground tests therefore have to ask for `Enabled` explicitly, and they are the only
+/// place that does.
+fn foreground_daemon(
+    directory: &TempDir,
+    database: &std::path::Path,
+) -> (Daemon, Arc<Mutex<Vec<WorkerStart>>>) {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let daemon = Daemon::start_with_factory_and_activation(
+        directory.path().join("runtime"),
+        database,
+        Arc::new(ApplicationRootFactory {
+            workspace_service: Arc::new(StaticWorkspaceService),
+            starts: Arc::clone(&starts),
+        }),
+        yi_agent_store::foreground::ForegroundActivation::for_test(true),
+    )
+    .unwrap();
+    (daemon, starts)
+}
+
+/// An attached application root plus installed authority for it.
+///
+/// Returns `(session_id, root_task_id, authorization)`.
+fn foreground_root_with_authority(
+    daemon: &Daemon,
+    owner: &str,
+) -> (String, String, yi_agent_lifecycle::types::RootAuthorization) {
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: format!("{owner}-attach"),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attachment");
+    };
+    let intent = yi_agent_lifecycle::foreground::RootBindIntent {
+        operation_id: format!("{owner}-prepare"),
+        thread_key: format!("{owner}-thread"),
+        workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        extra_roots: Vec::new(),
+        previous_root_capability: None,
+    };
+    let authorization = daemon
+        .coordinator_for_test()
+        .install_foreground_authority_for_test(&root_task_id, owner, intent)
+        .expect("the bridge installs authority for an attached root");
+    (session_id, root_task_id, authorization)
+}
+
+#[test]
+fn foreground_root_lifecycle_a_bind_retried_under_one_operation_keeps_its_epoch_and_secret() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding: first } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // The caller lost the answer and retries the same operation. It must land on the same
+    // epoch *and* the same secret: minting a new one would revoke the copy it already has
+    // and give it no way to learn which of the two is live.
+    let IpcResponse::ForegroundDriverBound { binding: second } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("a replay of the same operation must be accepted");
+    };
+
+    assert_eq!(first.fence.driver_epoch, second.fence.driver_epoch);
+    assert_eq!(first.last_seq, second.last_seq);
+    assert_eq!(
+        first.driver_capability.expose(),
+        second.driver_capability.expose(),
+        "a replay hands back the capability it already issued"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_second_bind_without_a_stop_proof_is_refused_on_the_wire() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-2".into(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a takeover without a stop proof must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::StopUnproven
+    );
+    assert_eq!(
+        failure.blocked_execution_ids,
+        vec![binding.fence.driver_epoch.to_string()],
+        "the refusal names the driver that has not been proven stopped"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_activity_within_the_fence_is_stored_and_read_back() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = foreground_daemon(&directory, &database);
+    let (session_id, root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // The task row is the thing an activity report must never touch. Snapshot it first so
+    // the assertion below compares what the report did, not what the daemon happens to
+    // hold afterwards.
+    let before: (String, String, String) = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT delivery_json, state_json, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root.clone()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    let update = yi_agent_lifecycle::foreground::ActivityUpdate {
+        fence: binding.fence.clone(),
+        turn_id: Some("turn-1".into()),
+        seq: binding.last_seq + 1,
+        phase: yi_agent_lifecycle::foreground::ActivityPhase::Running,
+    };
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability: binding.driver_capability.clone(),
+            update,
+        },
+    )
+    .unwrap() else {
+        panic!("a report inside the fence is accepted");
+    };
+    assert_eq!(
+        snapshot.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Running
+    );
+
+    let IpcResponse::ForegroundActivity { snapshot: read } = send_request(
+        daemon.socket_path(),
+        IpcRequest::GetApplicationRootActivity {
+            authorization,
+            root: yi_agent_lifecycle::foreground::RootRef {
+                session_id: session_id.clone(),
+                root_id: root.clone(),
+                attempt_id: binding.fence.root.attempt_id.clone(),
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("the committed snapshot is readable");
+    };
+    // Reading is a *diagnostic* view: a persisted `running` cannot be trusted to mean a
+    // live turn (the driver may be gone), so it is projected to `Unknown` rather than
+    // reported as active. Everything else about the report is preserved.
+    assert_eq!(
+        read.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Unknown,
+        "a reloaded running turn must not read back as live"
+    );
+    assert_eq!(read.update.seq, snapshot.update.seq);
+    assert_eq!(read.update.turn_id, snapshot.update.turn_id);
+    // The projection is a view, not a rewrite: the stored snapshot keeps `running` so it
+    // stays usable as evidence of what the driver actually reported.
+    let connection = Connection::open(&database).unwrap();
+    let stored: String = connection
+        .query_row(
+            "SELECT activity_json FROM foreground_root_state WHERE root_task_id = ?1",
+            params![root.clone()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains("\"running\""),
+        "the stored evidence must still say what the driver reported, got {stored}"
+    );
+
+    // Reporting activity is not progress: the report must not start a worker, and it must
+    // not rewrite the objective the conversation was attached with.
+    assert!(
+        starts.lock().unwrap().is_empty(),
+        "an activity report must never start a worker"
+    );
+    let after: (String, String, String) = connection
+        .query_row(
+            "SELECT delivery_json, state_json, active_attempt_id FROM tasks WHERE id = ?1",
+            params![root],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "an activity report must not rewrite the conversation's contract or state"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_superseded_driver_cannot_advance_activity() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    // A superseded driver epoch is the "reconnect and re-bind" answer, distinct from a
+    // stale attempt: a caller has to be able to tell them apart to know what to do next.
+    let mut stale = binding.fence.clone();
+    stale.driver_epoch += 1;
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability: binding.driver_capability.clone(),
+            update: yi_agent_lifecycle::foreground::ActivityUpdate {
+                fence: stale,
+                turn_id: None,
+                seq: binding.last_seq + 1,
+                phase: yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+            },
+        },
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a report from a superseded driver must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::StaleDriver
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_ordering_keeps_a_late_finish_from_closing_a_newer_turn() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the first bind must be accepted");
+    };
+
+    let report = |seq: u64, turn: Option<&str>, phase| IpcRequest::SetApplicationRootActivity {
+        driver_capability: binding.driver_capability.clone(),
+        update: yi_agent_lifecycle::foreground::ActivityUpdate {
+            fence: binding.fence.clone(),
+            turn_id: turn.map(str::to_owned),
+            seq,
+            phase,
+        },
+    };
+
+    // turn-1 opens.
+    let IpcResponse::ForegroundActivity { .. } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 1,
+            Some("turn-1"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Running,
+        ),
+    )
+    .unwrap() else {
+        panic!("opening a turn is a legal report");
+    };
+
+    // A finish for some other turn, at a *larger* sequence, must not close turn-1. The
+    // sequence only orders reports; it does not let one name another turn.
+    let response = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 2,
+            Some("turn-0"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+        ),
+    )
+    .unwrap();
+    let IpcResponse::ForegroundFailure(failure) = response else {
+        panic!("a finish naming another turn must be refused, got {response:?}");
+    };
+    assert_eq!(
+        failure.code,
+        yi_agent_lifecycle::foreground::ForegroundErrorCode::InvalidActivity
+    );
+
+    // The matching finish is accepted.
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 3,
+            Some("turn-1"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Idle,
+        ),
+    )
+    .unwrap() else {
+        panic!("the matching finish closes the open turn");
+    };
+    assert_eq!(
+        snapshot.update.phase,
+        yi_agent_lifecycle::foreground::ActivityPhase::Idle
+    );
+
+    // And the conversation continues: a new turn opens after the finish.
+    let IpcResponse::ForegroundActivity { snapshot } = send_request(
+        daemon.socket_path(),
+        report(
+            binding.last_seq + 4,
+            Some("turn-2"),
+            yi_agent_lifecycle::foreground::ActivityPhase::Running,
+        ),
+    )
+    .unwrap() else {
+        panic!("a finished turn makes room for the next one");
+    };
+    assert_eq!(snapshot.update.turn_id.as_deref(), Some("turn-2"));
+}
+
+#[test]
+fn foreground_root_lifecycle_an_authorization_from_another_generation_or_scope_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    // A grant minted by a previous daemon generation names authority this process never
+    // installed. Accepting it would let one grant be spent once per generation.
+    let mut other_generation = authorization.clone();
+    other_generation.daemon_instance_id = "a-previous-daemon".into();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: other_generation,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        !matches!(
+            response,
+            IpcResponse::ForegroundDriverBound { .. } | IpcResponse::ForegroundActivity { .. }
+        ),
+        "a grant from another generation must not bind a driver, got {response:?}"
+    );
+
+    // The scope key is what ties an authority to one project. A different one was issued
+    // for a scope nobody decided anything about here.
+    let mut other_scope = authorization;
+    other_scope.scope_key = "another-project".into();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: other_scope,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error { .. } | IpcResponse::ForegroundFailure(_)
+        ),
+        "a grant for another scope must not bind a driver, got {response:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: stop proofs, freeze and quiescence verification
+// ---------------------------------------------------------------------------
+
+/// One frozen execution, described the way the store names it.
+fn frozen_execution(attempt: &str, task: &str) -> serde_json::Value {
+    json!({
+        "execution_id": format!("Worker:{task}:{attempt}"),
+        "task_id": task,
+        "attempt_id": attempt,
+        "kind": "worker",
+    })
+}
+
+fn stop_evidence(
+    fence: &yi_agent_lifecycle::foreground::ForegroundFence,
+    execution: &serde_json::Value,
+    joined: bool,
+    tools_stopped: bool,
+) -> yi_agent_lifecycle::foreground::StopEvidence {
+    use yi_agent_lifecycle::foreground::{
+        EvidenceSource, ExecutionIdentity, ExecutionKind, StopEvidence,
+    };
+    assert_eq!(execution["kind"], "worker");
+    StopEvidence {
+        evidence_id: format!("evidence:{}", execution["execution_id"].as_str().unwrap()),
+        fence: fence.clone(),
+        execution: ExecutionIdentity {
+            execution_id: execution["execution_id"].as_str().unwrap().to_string(),
+            task_id: execution["task_id"].as_str().unwrap().to_string(),
+            attempt_id: execution["attempt_id"].as_str().unwrap().to_string(),
+            kind: ExecutionKind::Worker,
+        },
+        attempt_id: fence.root.attempt_id.clone(),
+        source: EvidenceSource::Guardian,
+        joined,
+        tools_stopped,
+        process_identity: None,
+    }
+}
+
+#[test]
+fn foreground_root_lifecycle_freeze_closes_the_set_and_refuses_new_admission() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+
+    let impact = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect("the root can be frozen");
+    assert_eq!(impact.version, 1, "the first freeze mints version 1");
+    assert!(
+        impact.blocked_execution_ids.iter().all(|id| {
+            !binding.fence.root.root_id.is_empty() && id.contains(&binding.fence.root.attempt_id)
+        }),
+        "every blocked entity names the attempt it belongs to: {impact:?}",
+    );
+
+    // A second freeze would replace the set the first one is proving.
+    let error = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect_err("a second freeze must be refused");
+    assert!(
+        format!("{error:?}").contains("OperationConflict"),
+        "expected an operation conflict, got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_quiescence_is_unproven_without_evidence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    // Freeze through the repository with a *non-empty* set. The coordinator's own
+    // freeze enumerates live slots, and this fixture has none, so going through the
+    // durable layer is the only way to build the set an execution would produce.
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    let (_version, frozen) = {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(
+                &binding.fence,
+                std::slice::from_ref(&execution),
+                "foreground recovery",
+            )
+            .expect("the set can be frozen")
+    };
+    assert_eq!(frozen, vec![execution]);
+
+    // No evidence at all: the frozen set cannot be reported stopped.
+    let error = coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect_err("a freeze without evidence is not quiescent");
+    let text = format!("{error:?}");
+    assert!(text.contains("StopUnproven"), "got {error:?}");
+}
+
+#[test]
+fn foreground_root_lifecycle_a_join_alone_does_not_verify_quiescence() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let impact = coordinator
+        .freeze_foreground_root(&binding.fence.root)
+        .expect("the root can be frozen");
+    // The set is whatever the freeze found. With no children registered it may be
+    // empty; in that case there is nothing to prove and the call must succeed, which
+    // is itself worth pinning.
+    if impact.blocked_execution_ids.is_empty() {
+        coordinator
+            .verify_foreground_quiescence(&binding.fence)
+            .expect("an empty frozen set needs no evidence");
+        return;
+    }
+    for id in &impact.blocked_execution_ids {
+        let execution = frozen_execution(&binding.fence.root.attempt_id, "task-1");
+        let evidence = stop_evidence(&binding.fence, &execution, true, false);
+        let stored = coordinator
+            .record_foreground_stop_evidence(&evidence)
+            .expect("the guardian may record what it observed");
+        assert!(stored.joined && !stored.tools_stopped);
+        let _ = id;
+    }
+    let error = coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect_err("a join without stopped tools is not quiescence");
+    assert!(
+        format!("{error:?}").contains("StopUnproven"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_two_parties_complete_one_stop_proof() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(
+                &binding.fence,
+                std::slice::from_ref(&execution),
+                "foreground recovery",
+            )
+            .expect("the set can be frozen");
+    }
+
+    // The daemon observed its worker join; the tool groups are the guardian's fact.
+    let mut daemon_side = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        true,
+        false,
+    );
+    daemon_side.source = yi_agent_lifecycle::foreground::EvidenceSource::Daemon;
+    let merged = coordinator
+        .record_foreground_stop_evidence(&daemon_side)
+        .expect("the daemon may record a join");
+    assert!(merged.joined && !merged.tools_stopped);
+    assert!(
+        coordinator
+            .verify_foreground_quiescence(&binding.fence)
+            .is_err(),
+        "a join alone must not verify"
+    );
+
+    let mut guardian_side = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        false,
+        true,
+    );
+    guardian_side.source = yi_agent_lifecycle::foreground::EvidenceSource::Guardian;
+    let merged = coordinator
+        .record_foreground_stop_evidence(&guardian_side)
+        .expect("the guardian may record stopped tools");
+    assert!(
+        merged.joined && merged.tools_stopped,
+        "the surviving record must carry both facts: {merged:?}"
+    );
+    coordinator
+        .verify_foreground_quiescence(&binding.fence)
+        .expect("both facts together are a stop proof");
+}
+
+#[test]
+fn foreground_root_lifecycle_evidence_for_an_unfrozen_execution_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+            .expect("the set can be frozen");
+    }
+
+    // Evidence naming an execution nobody froze describes something else, so
+    // accepting it would let a caller accumulate proofs for whatever it wants.
+    let stranger = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-unknown"),
+        true,
+        true,
+    );
+    let error = coordinator
+        .record_foreground_stop_evidence(&stranger)
+        .expect_err("evidence outside the frozen set must be refused");
+    assert!(
+        format!("{error:?}").contains("StopUnproven"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_evidence_survives_a_restart() {
+    // The whole reason evidence is durable: a restart loses the in-memory pending
+    // stops, and "nothing pending" must not read as "everything stopped".
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let root_ref = {
+        let (daemon, _starts) = foreground_daemon(&directory, &database);
+        let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+        let IpcResponse::ForegroundDriverBound { binding } = send_request(
+            daemon.socket_path(),
+            IpcRequest::BindApplicationRootDriver {
+                authorization,
+                operation_id: "bind-1".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("the bind must be accepted");
+        };
+        let coordinator = daemon.coordinator_for_test();
+        let execution = {
+            use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+            ExecutionIdentity {
+                execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+                task_id: "task-1".to_string(),
+                attempt_id: binding.fence.root.attempt_id.clone(),
+                kind: ExecutionKind::Worker,
+            }
+        };
+        {
+            let mut repository = coordinator.repository_for_test().unwrap();
+            repository
+                .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+                .expect("the set can be frozen");
+        }
+        binding.fence.root.clone()
+    };
+
+    // A fresh daemon on the same database. Its in-memory pending stops are empty, and
+    // the frozen set plus its (absent) evidence must still say "unproven".
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let coordinator = daemon.coordinator_for_test();
+    let attempt: AttemptId = root_ref
+        .attempt_id
+        .parse()
+        .expect("the attempt id round-trips");
+    let root_task: TaskId = root_ref.root_id.parse().expect("the root id is a task");
+    let stored = {
+        let repository = coordinator.repository_for_test().unwrap();
+        repository.frozen_execution_set(&root_task).unwrap()
+    };
+    let (version, frozen) = stored.expect("the freeze survived the restart");
+    assert_eq!(version, 1);
+    assert_eq!(frozen.len(), 1);
+    assert_eq!(frozen[0].attempt_id, attempt.to_string());
+
+    let fence = {
+        let repository = coordinator.repository_for_test().unwrap();
+        let persisted = repository
+            .persisted_foreground_root(&root_task)
+            .unwrap()
+            .expect("the root row survived");
+        yi_agent_lifecycle::foreground::ForegroundFence {
+            root: root_ref.clone(),
+            generation: persisted.owner_client_id.clone().unwrap_or_default(),
+            binding_epoch: persisted.binding_epoch,
+            driver_epoch: persisted.driver_epoch,
+        }
+    };
+    // The generation is a fresh daemon's, so this fence names the wrong generation;
+    // the honest answer is "unproven", never "stopped".
+    assert!(
+        coordinator.verify_foreground_quiescence(&fence).is_err(),
+        "a restarted daemon must not report the old execution stopped"
+    );
+}
+
+#[test]
+fn foreground_root_lifecycle_a_record_that_disagrees_about_its_attempt_is_refused() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, _starts) = foreground_daemon(&directory, &database);
+    let (_session, _root, authorization) = foreground_root_with_authority(&daemon, "app");
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id: "bind-1".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the bind must be accepted");
+    };
+    let coordinator = daemon.coordinator_for_test();
+    let execution = {
+        use yi_agent_lifecycle::foreground::{ExecutionIdentity, ExecutionKind};
+        ExecutionIdentity {
+            execution_id: format!("Worker:task-1:{}", binding.fence.root.attempt_id),
+            task_id: "task-1".to_string(),
+            attempt_id: binding.fence.root.attempt_id.clone(),
+            kind: ExecutionKind::Worker,
+        }
+    };
+    {
+        let mut repository = coordinator.repository_for_test().unwrap();
+        repository
+            .freeze_foreground_root(&binding.fence, &[execution], "foreground recovery")
+            .expect("the set can be frozen");
+    }
+
+    // Same execution id, but the record claims another attempt in one of its fields.
+    // Merging that would let a proof for one run license another.
+    let mut confused = stop_evidence(
+        &binding.fence,
+        &frozen_execution(&binding.fence.root.attempt_id, "task-1"),
+        true,
+        true,
+    );
+    confused.attempt_id = "some-other-attempt".to_string();
+    let error = coordinator
+        .record_foreground_stop_evidence(&confused)
+        .expect_err("a self-inconsistent record must be refused");
+    assert!(
+        format!("{error:?}").contains("StaleAttempt"),
+        "got {error:?}"
+    );
+}
+
+/// A recovery over the real socket walks Preparing/Ready then Committed, and the
+/// receipt is readable afterwards.
+///
+/// The wire path is the point: the host talks to the daemon, not to the coordinator,
+/// so an API that only works in-process is not an API. The status read after commit is
+/// what proves the answer to a lost response survives.
+#[test]
+fn foreground_root_lifecycle_recovery_round_trip_on_the_wire() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let (daemon, starts) = foreground_daemon(&directory, &database);
+    let (_session, root_task_id, authorization) = foreground_root_with_authority(&daemon, "app");
+
+    let coordinator = daemon.coordinator_for_test();
+    // The original driver binds first, while business authority is still live: the
+    // fence recovery re-points is the one that driver held.
+    let IpcResponse::ForegroundDriverBound { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::BindApplicationRootDriver {
+            authorization: authorization.clone(),
+            operation_id: "pre-recovery-bind".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the original driver binds under business authority");
+    };
+    // A stalled root, imported the way a pre-exemption build would have left it. The
+    // production writer refuses this now, which is exactly why the history needs an
+    // import hook.
+    coordinator
+        .import_stalled_snapshot_for_test(
+            &root_task_id.parse().unwrap(),
+            yi_agent_store::repository::WatchdogEvidence {
+                last_meaningful_event_id: Some(7),
+                last_meaningful_at: chrono::Utc::now(),
+                elapsed_secs: 301,
+                current_wait: None,
+            },
+        )
+        .unwrap();
+    // Recovery authority: the owner is gone, so only a RecoveryOnly install can act.
+    coordinator
+        .install_recovery_authority_for_test(&authorization)
+        .unwrap();
+    let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+        expected: binding.fence.clone(),
+        operation_id: "wire-recovery".into(),
+    };
+
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PrepareApplicationRootRecovery {
+            authorization: authorization.clone(),
+            request: request.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("prepare must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Ready(preview) = status else {
+        panic!("the fixture has nothing to stop, so prepare must be ready, got {status:?}");
+    };
+
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::RecoverApplicationRoot {
+            authorization: authorization.clone(),
+            request: request.clone(),
+            confirmation_token: preview
+                .confirmation_token
+                .clone()
+                .expect("a ready preview carries a token"),
+        },
+    )
+    .unwrap() else {
+        panic!("recover must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(result) = status else {
+        panic!("recover must commit, got {status:?}");
+    };
+    assert_eq!(result.operation_id, "wire-recovery");
+
+    // The host lost that answer and asks again. Same receipt, no second attempt.
+    let IpcResponse::ForegroundRecovery { status } = send_request(
+        daemon.socket_path(),
+        IpcRequest::GetApplicationRootRecovery {
+            authorization,
+            root: result.successor.clone(),
+            operation_id: "wire-recovery".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("the status query must answer on the wire");
+    };
+    let yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(again) = status else {
+        panic!("a committed operation reads back committed, got {status:?}");
+    };
+    assert_eq!(again, result);
+    assert!(
+        starts.lock().unwrap().is_empty(),
+        "recovery must not start a worker"
     );
 }

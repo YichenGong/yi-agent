@@ -311,6 +311,8 @@ pub(crate) async fn handle(
                 subagent_rx,
                 mcp,
                 mcp_workdir,
+                // Resolved from the conversation's own root on the first turn.
+                None,
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。

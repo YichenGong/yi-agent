@@ -408,24 +408,55 @@ pub enum ControlRequest {
         /// skip a row.
         cursor: Option<String>,
     },
-    /// Mint the authority to attach one root on this client's behalf.
+    /// Ask the guardian for authority over one foreground root.
     ///
-    /// Owner-bound like every other state-changing request: `grant` must match the
-    /// live lease, and the lease must be [`LeaseMode::Business`]. That is the whole
-    /// security claim -- a `LeaseOnly` observer can watch and control upgrades but
-    /// can never name an owner, so it cannot obtain this.
+    /// This is a *host* operation. It is never registered as a model tool and never
+    /// reachable from the generic JSON-RPC surface: the capability it returns is the
+    /// only thing that may bind a driver, write activity or start a tool under that
+    /// root, so a model that could ask for one could grant itself the exemption.
     ///
-    /// Answering with a capability rather than a boolean is what makes the result
-    /// usable by a *different* process. The sidecar cannot hold the App's renewable
-    /// credential (`shell_authorization` is explicit about that), so "yes" would
-    /// leave it with nothing to present. The capability is not a credential: it
-    /// cannot register, renew, or spawn -- it names one root in one generation.
+    /// `grant` proves which client is asking. The guardian refuses unless that client
+    /// holds a live `Business` lease, so a `LeaseOnly` observer cannot mint authority.
+    /// `intent.thread_key` is never authority by itself: it is a lookup key, and the
+    /// answer carries a capability that cannot be derived from it.
     AuthorizeRoot {
         grant: ClientGrant,
-        /// The root this authority is for, exactly as the business attach will
-        /// name it. Deriving it here rather than at the attach is what makes the
-        /// binding checkable by the daemon, which never sees the grant.
-        root_id: RootId,
+        intent: crate::foreground::RootBindIntent,
+    },
+    /// Ask the daemon to prepare a recovery of a root whose attempt was settled.
+    ///
+    /// Same shape as [`Self::AuthorizeRoot`]: the guardian verifies the lease and its
+    /// own view of the root before the request reaches the daemon. The daemon then
+    /// does the authorize-and-freeze half, which is where the transaction boundary
+    /// lives.
+    PrepareRootRecovery {
+        grant: ClientGrant,
+        request: crate::foreground::RecoveryRequest,
+    },
+    /// Confirm a prepared recovery with the token the prepare returned.
+    ConfirmRootRecovery {
+        grant: ClientGrant,
+        request: crate::foreground::RecoveryRequest,
+        token: crate::foreground::SecretCapability,
+    },
+    /// Read the stored status of one recovery operation.
+    ///
+    /// Grant-bearing like the rest: a read that answered for any root would let a
+    /// client enumerate sessions it does not own.
+    RootRecoveryOperation {
+        grant: ClientGrant,
+        root: crate::foreground::RootRef,
+        operation_id: String,
+    },
+    /// Read what a recovery of this root would stop, without freezing anything.
+    ///
+    /// Split from [`Self::PrepareRootRecovery`] because looking must not stop work:
+    /// a user who opens the recovery panel and then walks away has not asked for
+    /// their conversation to be halted. `expected` is the fence the host believes is
+    /// current; the daemon refuses a stale one rather than describing another attempt.
+    InspectRootRecovery {
+        grant: ClientGrant,
+        expected: crate::foreground::ForegroundFence,
     },
 }
 
@@ -494,6 +525,19 @@ pub enum ControlResponse {
     /// every reply would otherwise be sized for the biggest one. The frame is
     /// encoded and dropped immediately, so one indirection costs nothing.
     Status(Box<RuntimeStatusSnapshot>),
+    /// The answer to [`ControlRequest::AuthorizeRoot`]: authority for this client to
+    /// bind, and nothing else. It cannot register, renew, or act for another client.
+    RootAuthorized(RootAuthorization),
+    /// The answer to the recovery requests. `None` means the daemon has no record of
+    /// that operation, which is *not* the same as "no recovery happened".
+    RootRecovery(Option<crate::foreground::RecoveryOperationStatus>),
+    /// The answer to [`ControlRequest::InspectRootRecovery`]: what a freeze would stop.
+    ///
+    /// Its own variant rather than a [`crate::foreground::RecoveryOperationStatus`]
+    /// because an impact is not a status: `Blocked` names a *reason a token is
+    /// withheld*, while an impact is what the user reads before deciding whether to
+    /// ask for one.
+    RootRecoveryImpact(crate::foreground::RecoveryImpact),
     /// The private channel was created; the descriptor travels beside this frame.
     ///
     /// Carrying the owner back is not a convenience: the client must build the
@@ -505,12 +549,6 @@ pub enum ControlResponse {
         /// The runtime generation the channel belongs to.
         generation: String,
     },
-    /// The requested authority, minted for this client, root and generation.
-    ///
-    /// The guardian answers with the full binding rather than a bare capability so
-    /// the caller can see *whose* authority it is: a guardian that bound a
-    /// different client would be visibly wrong instead of silently mislabelled.
-    RootAuthorized(RootAuthorization),
 }
 
 /// A portable description of a bundled daemon artifact, emitted at build time and

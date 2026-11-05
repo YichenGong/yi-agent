@@ -94,6 +94,7 @@ fn a_worker_that_ignores_cancel_is_stopped_only_by_killing_its_executor() {
         root: None,
         execution: None,
         bootstrap: None,
+        bridge: None,
     };
     registry
         .spawn(command, Deadline::after(Duration::from_secs(5)))
@@ -236,6 +237,7 @@ fn killing_the_executor_group_stops_its_children() {
         // A tool group is not an authorized managed role: it gets no bootstrap
         // descriptor, and must not be able to claim one.
         bootstrap: None,
+        bridge: None,
     };
     registry
         .spawn(command, Deadline::after(Duration::from_secs(5)))

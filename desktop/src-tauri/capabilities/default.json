@@ -25,6 +25,23 @@
     "allow-set-relay-url",
     "allow-open-plugin-view",
     "allow-close-plugin-view",
-    "allow-plugin-committed-activation"
+    "allow-plugin-committed-activation",
+    "allow-runtime-acquire-project",
+    "allow-runtime-release-project",
+    "allow-runtime-registered-projects",
+    "allow-runtime-quit-outcome",
+    "allow-runtime-status",
+    "allow-runtime-preview",
+    "allow-runtime-confirm",
+    "allow-runtime-operation",
+    "allow-runtime-active-operation",
+    "allow-runtime-known-scopes",
+    "allow-runtime-scope-for-project",
+    "allow-plugin-host-identity",
+    "allow-plugin-bind-host",
+    "allow-foreground-root-recovery-inspect",
+    "allow-foreground-root-recovery-prepare",
+    "allow-foreground-root-recovery-confirm",
+    "allow-foreground-root-recovery-operation"
   ]
 }

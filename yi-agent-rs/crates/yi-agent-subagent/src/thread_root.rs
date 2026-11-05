@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use yi_agent_lifecycle::types::RootAuthorization;
 use yi_agent_store::ipc::{IpcRequest, IpcResponse, send_request};
 
 use crate::AttachedRoot;
@@ -13,15 +14,47 @@ use crate::binding::{RuntimeBinding, RuntimeHandle, is_liveness_error, is_stale_
 /// 不可重放的请求（发消息、spawn）遇到陈旧 root 时，重放会产生真实的第二次副作用，
 /// 所以只做「丢弃缓存 + 修好运行时」，然后把下一步交给调用方。这句话必须说清
 /// 「已经修好了、再来一次就行」，否则模型会以为这个能力坏了。
+/// 传输层含糊失败时对模型说的话。
+///
+/// 修好运行时之后才走到这里，所以"再来一次"是真的可用；重点是先让调用方**检查**
+/// 上一次到底有没有发生，而不是闭着眼睛重放一个有副作用的请求。
+pub(crate) fn ambiguous_delivery_hint() -> &'static str {
+    "the runtime connection was replaced, but this request is not safe to replay: \
+     it may already have been applied before the response was lost. The conversation \
+     root has been re-attached; check whether the change happened before retrying."
+}
+
 pub(crate) fn stale_root_hint() -> &'static str {
     "the conversation root was replaced by a restarted runtime and has been \
      re-attached; the request was NOT re-sent because it changes daemon state. \
      Retry this call once."
 }
 
+/// 这是否一个"请求根本没写出去"的失败。
+///
+/// `connect` 在写任何字节之前就失败了，所以服务端不可能已经执行它。与之相对的
+/// `TimedOut` / `UnexpectedEof` / `TruncatedFrame` 都发生在写入之后：应答丢了，
+/// 副作用可能已经发生，那才是真正含糊的情形。
+fn never_left_the_client(error: &yi_agent_store::ipc::IpcError) -> bool {
+    use yi_agent_store::ipc::IpcError;
+    match error {
+        // Only the errors a `connect` on a unix socket can produce before the request
+        // is written. `ConnectionReset` / `ConnectionAborted` look similar but may
+        // happen *during* a write that already reached the peer, so they stay on the
+        // ambiguous side. `TimedOut` and `UnexpectedEof` are read-side by construction.
+        IpcError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
 /// 一条请求能否在身份层失败后被重发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RetryPolicy {
+pub enum RetryPolicy {
     /// 请求本身幂等（只读查询，或在 daemon 侧按稳定键幂等）：可以安全重发。
     Idempotent,
     /// 请求会改变 daemon 状态（发消息、spawn、fork 上传）：绝不重发，
@@ -224,6 +257,24 @@ impl ThreadRoot {
     }
 
     /// This conversation's root task id, once attached.
+    /// Where this conversation's runtime lives, when the binding knows.
+    ///
+    /// A host resolves the guardian through this. `None` is the honest answer for a
+    /// binding that never learned a directory -- the TUI used to be that, which is why
+    /// `RuntimeBinding::fixed_in` exists.
+    pub fn runtime_directory(&self) -> Option<PathBuf> {
+        self.binding.runtime_dir()
+    }
+
+    /// The conversation this root belongs to.
+    ///
+    /// Public because a host needs it to key per-conversation bookkeeping (the
+    /// foreground driver's authorization cache, for one) without reaching into the
+    /// struct's fields.
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
     pub fn root_task_id(&self) -> Option<String> {
         let generation = self.binding.generation();
         self.live_cached_root(generation).map(|root| root.task_id)
@@ -236,7 +287,11 @@ impl ThreadRoot {
     /// 七个工具过去各自 `handle()` + 裸 `send_request`，结果是**没人**处理失效。
     ///
     /// 三条分支：
-    /// 1. 传输层失败（`is_liveness_error`）：与过去一致，重取句柄后重发一次。
+    /// 1. 传输层失败（`is_liveness_error`）：`Idempotent` 修好运行时后重发一次；
+    ///    `SingleShot` **只修连接，不重发**。过去这里不看策略、无条件重发，等于把
+    ///    "请求根本没送达"当成已知事实——而 `is_liveness_error` 也覆盖
+    ///    `TimedOut` 和 `UnexpectedEof`：服务端可能已经执行完，只是应答没回来。
+    ///    对 spawn/发消息这类请求，重发的代价是真实的第二次副作用。
     /// 2. 身份层失败（`is_stale_root_response`）：丢弃缓存 root、修好运行时；
     ///    `Idempotent` 重发一次，`SingleShot` 返回 [`stale_root_hint`]。
     /// 3. 其余：原样返回，绝不重试。
@@ -270,10 +325,10 @@ impl ThreadRoot {
             }
             Ok(response) => Ok(response),
             Err(error) if is_liveness_error(&error) => {
-                // 传输层失败说明请求根本没送达，重发一次是安全的。但**不能**直接
-                // `handle()`：缓存 root 仍属于当前 generation，`attach()` 会短路
-                // 返回 Ok，重发于是又打向同一个死 socket——这正是要修的那个 bug。
-                // 必须先 `repair()`（它推进 generation，使缓存失效），再重挂。
+                // **不能**直接 `handle()`：缓存 root 仍属于当前 generation，
+                // `attach()` 会短路返回 Ok，重发于是又打向同一个死 socket——这正是
+                // 要修的那个 bug。必须先 `repair()`（它推进 generation，使缓存失效），
+                // 再重挂。
                 if let Err(repair_error) = self.binding.repair() {
                     // fixed binding 无从 repair（TUI / daemon worker 的情形）。
                     // 这里返回**原始传输错误**，不要把内部措辞泄漏给模型；
@@ -281,10 +336,121 @@ impl ThreadRoot {
                     tracing::debug!(%repair_error, "could not repair a dead runtime");
                     return Err(error.to_string());
                 }
+                if policy == RetryPolicy::SingleShot && !never_left_the_client(&error) {
+                    // 连接已修好，但这次请求的**结果未知**：服务端可能已执行而应答
+                    // 丢失。自动重发会让 spawn/发消息发生第二次。
+                    //
+                    // 例外是"连都没连上"：`connect` 失败意味着一个字节都没写出去，
+                    // 结果不可能是"未知"，重发是安全的。把它一并当成含糊失败会让
+                    // "终端被关掉"这种最常见的失效形态变成永远无法自愈。
+                    return Err(ambiguous_delivery_hint().to_string());
+                }
                 let handle = self.handle()?;
                 send_request(&handle.socket_path, build(&handle)).map_err(|e| e.to_string())
             }
             Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// [`Self::send_as_root`] for integration tests.
+    ///
+    /// The production callers are the seven tools in `lib.rs`, which are the wrong
+    /// layer for a test that only needs "what does this transport failure turn into
+    /// under this policy". Exposing the seam rather than re-implementing the branch
+    /// keeps the test honest: if the policy stops being consulted, this fails.
+    #[doc(hidden)]
+    pub fn send_as_root_for_test<F>(
+        &self,
+        policy: RetryPolicy,
+        build: F,
+    ) -> Result<IpcResponse, String>
+    where
+        F: Fn(&RuntimeHandle) -> IpcRequest,
+    {
+        self.send_as_root(policy, build)
+    }
+
+    /// Asks the guardian for authority over this conversation's root.
+    ///
+    /// A separate step from [`Self::bind_foreground_driver`] on purpose: the
+    /// authorization is the narrow secret the daemon will accept a bind with, and a
+    /// caller that fails to bind must be able to drop it rather than hold it.
+    ///
+    /// Every `None` here is a *normal* answer, not an error to paper over:
+    ///
+    /// * no runtime directory (a fixed binding: the TUI and daemon workers) -- this
+    ///   runtime has no guardian of ours to ask;
+    /// * no guardian serving that directory -- embedded mode;
+    /// * the guardian refused -- a lease-only observer, or a build without the
+    ///   capability.
+    ///
+    /// In all three the host should keep running the conversation with legacy
+    /// semantics. Treating them as failures would make a supported deployment look
+    /// broken, and the plan's promise is limited to managed runtimes.
+    pub fn authorize_foreground_root(
+        &self,
+        lease: &yi_agent_lifecycle::client::FrontendLease,
+        operation_id: &str,
+    ) -> Result<Option<RootAuthorization>, String> {
+        let Some(runtime_dir) = self.binding.runtime_dir() else {
+            return Ok(None);
+        };
+        let control_path = runtime_dir.join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+        if !control_path.exists() {
+            return Ok(None);
+        }
+        let intent = yi_agent_lifecycle::foreground::RootBindIntent {
+            operation_id: operation_id.to_string(),
+            thread_key: application_root_key(&self.thread_id),
+            workspace: self.project_dir.clone(),
+            // Linked roots are already part of the attach; re-sending them here would
+            // describe a second set and the daemon would compare it against the one it
+            // recorded at attach time.
+            extra_roots: Vec::new(),
+            previous_root_capability: None,
+        };
+        let deadline =
+            yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5));
+        match lease.authorize_root(&intent, &deadline) {
+            Ok(authorization) => Ok(Some(authorization)),
+            // A refusal is the guardian's policy answer: this host may run the turn
+            // without activity reporting. Only a transport failure is worth surfacing,
+            // and even then the caller decides -- the conversation is not lost.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!(%error, thread_id = %self.thread_id, "foreground authority refused");
+                Ok(None)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                tracing::debug!(%error, thread_id = %self.thread_id, "foreground lifecycle unsupported");
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Binds this host as the root's foreground driver, or reports why it cannot.
+    ///
+    /// `Ok(None)` means this runtime does not serve the contract; the caller keeps
+    /// legacy semantics. The driver itself is returned so the host can open and close
+    /// turns with it.
+    pub fn bind_foreground_driver(
+        self: &Arc<Self>,
+        authorization: RootAuthorization,
+        operation_id: &str,
+    ) -> Result<Option<crate::foreground::ForegroundTurn>, String> {
+        match crate::foreground::ForegroundTurn::bind(
+            // The driver holds the root for the life of the turn, so it takes the
+            // caller's handle rather than minting a second one: two `ThreadRoot`s for
+            // one conversation would each cache their own attach result.
+            Arc::clone(self),
+            authorization,
+            operation_id.to_string(),
+        ) {
+            Ok(turn) => Ok(Some(turn)),
+            Err(error) => {
+                tracing::debug!(%error, thread_id = %self.thread_id, "foreground driver unavailable");
+                Ok(None)
+            }
         }
     }
 
@@ -449,5 +615,399 @@ mod tests {
             application_root_key("thread-b"),
             "two conversations must not share one root"
         );
+    }
+    // ---------------------------------------------------------------------
+    // The guardian entry point, against a real guardian over a real socket.
+    //
+    // Everything below `authorize_foreground_root` is covered where it lives: the
+    // lease gate in `yi-agent-supervisors`, the capability minting in the guardian's
+    // root authority table, the bridge in the daemon. What is only here is the host's
+    // view: which key it asks for, what a refusal looks like, and what an absent
+    // guardian looks like. Those three answers are what a host branches on, so they
+    // are pinned against the production guardian rather than a stub.
+    // ---------------------------------------------------------------------
+
+    use std::path::PathBuf as TestPathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::time::{Duration as TestDuration, Instant as TestInstant};
+
+    use yi_agent_lifecycle::client::FrontendLease;
+    use yi_agent_lifecycle::deadline::Deadline;
+    use yi_agent_lifecycle::types::{ArtifactIdentity, ClientKind, LeaseMode, RuntimeScope};
+    use yi_agent_supervisors::lifecycle::guardian::{
+        GUARDIAN_SOCKET_FILE, serve_with_bridge_for_test,
+    };
+
+    /// A guardian served over a real socket, plus a daemon-side peer for the
+    /// authority bridge.
+    ///
+    /// The peer is not the real daemon on purpose: the daemon's own exchange is tested
+    /// against a real `Daemon` in `yi-agent-store`. Here it only has to answer the two
+    /// frames the guardian sends, so that a request that *should* succeed does.
+    struct GuardianFixture {
+        directory: tempfile::TempDir,
+        runtime_dir: TestPathBuf,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+        peer: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl GuardianFixture {
+        fn start() -> Self {
+            // `/tmp` keeps the socket path inside the platform's `sun_path` limit; the
+            // randomness lives in the directory name rather than the root.
+            let directory = tempfile::Builder::new()
+                .prefix("fgroot")
+                .tempdir_in("/tmp")
+                .expect("a temp dir");
+            let runtime_dir = directory.path().join("rt");
+            std::fs::create_dir_all(&runtime_dir).expect("the runtime dir");
+            let scope = RuntimeScope {
+                key: runtime_dir.to_string_lossy().into_owned(),
+                runtime_dir: runtime_dir.clone(),
+                project_key: directory.path().to_string_lossy().into_owned(),
+                instance_home: directory.path().join("instance"),
+            };
+
+            let (guardian_end, peer_end) =
+                std::os::unix::net::UnixStream::pair().expect("a socket pair");
+            // Production hands the guardian a non-blocking descriptor; a blocking one
+            // here could not catch a timeout that is silently ignored.
+            guardian_end
+                .set_nonblocking(true)
+                .expect("the guardian end is non-blocking");
+
+            let peer = std::thread::spawn(move || answer_bridge(peer_end));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                serve_with_bridge_for_test(
+                    scope,
+                    ArtifactIdentity {
+                        build_id: "test-build".into(),
+                        display_version: "0.0.0".into(),
+                        executable: "/usr/bin/true".into(),
+                        sha256: "00".into(),
+                        schema_min: 1,
+                        schema_max: 1,
+                        handover_version: 1,
+                        business_protocol_min: 1,
+                        business_protocol_max: 1,
+                        capabilities: Vec::new(),
+                    },
+                    move || server_stop.load(AtomicOrdering::SeqCst),
+                    guardian_end,
+                )
+            });
+
+            let socket = runtime_dir.join(GUARDIAN_SOCKET_FILE);
+            let readiness = TestInstant::now() + TestDuration::from_secs(10);
+            while !socket.exists() {
+                assert!(
+                    TestInstant::now() < readiness,
+                    "the guardian never bound its control socket"
+                );
+                std::thread::sleep(TestDuration::from_millis(5));
+            }
+
+            Self {
+                directory,
+                runtime_dir,
+                stop,
+                server: Some(server),
+                peer: Some(peer),
+            }
+        }
+
+        fn control_socket(&self) -> TestPathBuf {
+            self.runtime_dir.join(GUARDIAN_SOCKET_FILE)
+        }
+
+        /// A `ThreadRoot` whose binding points at this fixture's runtime directory.
+        fn root(&self, thread_id: &str) -> Arc<ThreadRoot> {
+            ThreadRoot::new(
+                RuntimeBinding::for_runtime_dir(
+                    test_config(self.directory.path()),
+                    self.runtime_dir.clone(),
+                    RuntimeHandle {
+                        socket_path: self.control_socket(),
+                        workspace_root: self.directory.path().to_path_buf(),
+                        session_id: thread_id.to_string(),
+                        task_id: "root".into(),
+                        capability: "cap".into(),
+                    },
+                ),
+                thread_id,
+                self.directory.path().to_path_buf(),
+                Vec::new(),
+            )
+        }
+
+        fn lease(&self, id: &str, mode: LeaseMode) -> FrontendLease {
+            FrontendLease::register(
+                &self.control_socket(),
+                id.to_string(),
+                ClientKind::App,
+                mode,
+                &Deadline::after(TestDuration::from_secs(5)),
+            )
+            .expect("the guardian admits the client")
+        }
+    }
+
+    impl Drop for GuardianFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, AtomicOrdering::SeqCst);
+            // Wake the accept loop so its stop check runs now, not on the next tick.
+            let _ = std::os::unix::net::UnixStream::connect(self.control_socket());
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            if let Some(peer) = self.peer.take() {
+                let _ = peer.join();
+            }
+        }
+    }
+
+    /// `RuntimeConfig` has no `Default`, so the test writes the fields out. Same shape
+    /// as `attach.rs`'s `base_config`, trimmed to what a path lookup could ever read.
+    fn test_config(workdir: &std::path::Path) -> yi_agent_runtime::config::RuntimeConfig {
+        yi_agent_runtime::config::RuntimeConfig {
+            provider: "openai".into(),
+            api_url: "http://127.0.0.1:9/v1".into(),
+            api_key: "k".into(),
+            model: "base-model".into(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
+            max_turns: 1,
+            max_resident_subagents: 0,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
+            workdir: workdir.to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+            model_injected: false,
+            ..yi_agent_runtime::config::RuntimeConfig::load_lenient(
+                &yi_agent_runtime::config::ConfigOverrides::default(),
+            )
+            .expect("a lenient config")
+        }
+    }
+
+    /// Answers the authority bridge the way the daemon does.
+    fn answer_bridge(mut stream: std::os::unix::net::UnixStream) {
+        use std::io::Write;
+        use yi_agent_lifecycle::foreground::BridgeFrame;
+
+        while let Ok(raw) = yi_agent_lifecycle::codec::read_frame(&mut stream) {
+            let Ok(frame) = yi_agent_lifecycle::codec::decode::<BridgeFrame>(&raw) else {
+                return;
+            };
+            let answer = match frame {
+                BridgeFrame::Prepare {
+                    nonce,
+                    root_id,
+                    requested_seq,
+                    ..
+                } => BridgeFrame::Challenge {
+                    nonce,
+                    root_id,
+                    authority_seq: requested_seq,
+                },
+                BridgeFrame::Authority(message) => {
+                    let stamp = match &message {
+                        yi_agent_lifecycle::foreground::AuthorityMessage::Install {
+                            stamp, ..
+                        }
+                        | yi_agent_lifecycle::foreground::AuthorityMessage::Renew { stamp } => {
+                            stamp
+                        }
+                        _ => return,
+                    };
+                    BridgeFrame::Committed {
+                        nonce: stamp.challenge_nonce.clone(),
+                        root_id: stamp.root_id.clone(),
+                        binding_epoch: 1,
+                    }
+                }
+                _ => return,
+            };
+            if yi_agent_lifecycle::codec::write_frame(&mut stream, &answer).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+        }
+    }
+
+    #[test]
+    fn foreground_root_entry_a_business_lease_obtains_authority_for_its_own_thread() {
+        let fixture = GuardianFixture::start();
+        let lease = fixture.lease("host-run", LeaseMode::Business);
+        let root = fixture.root("session-abc");
+
+        let authorization = root
+            .authorize_foreground_root(&lease, "op-1")
+            .expect("the request reaches the guardian")
+            .expect("a live business lease is authorized");
+
+        assert!(
+            !authorization.root_id.is_empty(),
+            "the guardian allocates a root id"
+        );
+        // A capability derived from the thread key would be guessable by anyone who
+        // knows the conversation; the whole point is that it is generated.
+        let thread_key = application_root_key("session-abc");
+        assert_ne!(authorization.capability, thread_key);
+        assert!(!authorization.capability.contains(&thread_key));
+    }
+
+    #[test]
+    fn foreground_root_entry_a_lease_only_observer_is_told_no_without_failing() {
+        let fixture = GuardianFixture::start();
+        let lease = fixture.lease("host-observer", LeaseMode::LeaseOnly);
+        let root = fixture.root("session-observer");
+
+        // `None`, not an error: the host can still run the conversation, it just cannot
+        // report activity for it. Turning this into `Err` would make a supported
+        // deployment look broken.
+        assert!(
+            root.authorize_foreground_root(&lease, "op-1")
+                .expect("a policy refusal is not a transport failure")
+                .is_none(),
+            "a lease-only observer must not obtain root authority"
+        );
+    }
+
+    #[test]
+    fn foreground_root_entry_a_runtime_without_a_guardian_answers_none() {
+        // The embedded deployment: a binding for a directory with no guardian. `None`
+        // means the contract is not offered here, which is where a host reads it.
+        let directory = tempfile::Builder::new()
+            .prefix("fgabs")
+            .tempdir_in("/tmp")
+            .expect("a temp dir");
+        let runtime_dir = directory.path().join("rt");
+        std::fs::create_dir_all(&runtime_dir).expect("the runtime dir");
+        let root = ThreadRoot::new(
+            RuntimeBinding::for_runtime_dir(
+                test_config(directory.path()),
+                runtime_dir.clone(),
+                RuntimeHandle {
+                    socket_path: runtime_dir.join(GUARDIAN_SOCKET_FILE),
+                    workspace_root: directory.path().to_path_buf(),
+                    session_id: "s".into(),
+                    task_id: "root".into(),
+                    capability: "cap".into(),
+                },
+            ),
+            "session-embedded",
+            directory.path().to_path_buf(),
+            Vec::new(),
+        );
+        // No runtime directory at all is the *other* way to have no guardian, and it
+        // must answer the same. A fixed binding is what the TUI holds.
+        let fixed = ThreadRoot::new(
+            fixed_binding(),
+            "session-tui",
+            TestPathBuf::from("/tmp/repo"),
+            Vec::new(),
+        );
+        // A lease cannot even be registered without a guardian, so this test uses a
+        // fixture's lease against a *different* runtime: the shape under test is the
+        // path lookup, not the gate.
+        let other = GuardianFixture::start();
+        let lease = other.lease("host-elsewhere", LeaseMode::Business);
+        assert!(
+            root.authorize_foreground_root(&lease, "op-1")
+                .expect("an absent guardian is not an error")
+                .is_none(),
+            "no guardian serving the directory means the contract is not offered"
+        );
+        assert!(
+            fixed
+                .authorize_foreground_root(&lease, "op-1")
+                .expect("a fixed binding is not an error")
+                .is_none(),
+            "a fixed binding never reaches a guardian at all"
+        );
+    }
+
+    #[test]
+    fn foreground_host_reuses_one_authorization_per_conversation() {
+        use crate::foreground::ForegroundHost;
+
+        let fixture = GuardianFixture::start();
+        let host = ForegroundHost::connect(
+            &fixture.runtime_dir,
+            yi_agent_lifecycle::types::ClientKind::App,
+            "host-app".to_string(),
+        )
+        .expect("connecting to a served runtime is not a failure")
+        .expect("the fixture serves a guardian");
+
+        let root = fixture.root("session-host");
+        let first = host
+            .authorization(&root, "bind-1")
+            .expect("the request reaches the guardian")
+            .expect("a live business lease is authorized");
+        // A second ask must not mint a second capability: the cached one is reused, so
+        // a transient refusal cannot disable a conversation that is already reporting.
+        let second = host
+            .authorization(&root, "bind-1")
+            .expect("the cached authorization is returned without asking again")
+            .expect("the cache is populated");
+        assert_eq!(
+            first.capability, second.capability,
+            "re-authorizing every turn would churn the guardian's authority table"
+        );
+
+        // A different conversation gets its own root: two conversations in one
+        // directory must never share one authorization.
+        let other = root_of(&fixture, "session-host-2");
+        let third = host
+            .authorization(&other, "bind-2")
+            .expect("a second conversation is served too")
+            .expect("a live business lease is authorized");
+        assert_ne!(
+            third.root_id, first.root_id,
+            "each conversation must key its own root"
+        );
+    }
+
+    #[test]
+    fn foreground_host_without_a_lease_offers_nothing() {
+        use crate::foreground::ForegroundHost;
+
+        // The embedded deployment: a runtime directory no guardian serves.
+        let directory = tempfile::Builder::new()
+            .prefix("fgnolease")
+            .tempdir_in("/tmp")
+            .expect("a temp dir");
+        let runtime_dir = directory.path().join("rt");
+        std::fs::create_dir_all(&runtime_dir).expect("the runtime dir");
+        assert!(
+            ForegroundHost::connect(
+                &runtime_dir,
+                yi_agent_lifecycle::types::ClientKind::App,
+                "host-embedded".to_string(),
+            )
+            .expect("an absent guardian is not an error")
+            .is_none(),
+            "no guardian means no host authority"
+        );
+    }
+
+    /// A second conversation on the same fixture runtime.
+    fn root_of(fixture: &GuardianFixture, thread_id: &str) -> Arc<ThreadRoot> {
+        fixture.root(thread_id)
     }
 }

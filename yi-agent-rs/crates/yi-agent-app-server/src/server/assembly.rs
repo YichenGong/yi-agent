@@ -613,3 +613,37 @@ pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() 
 pub(crate) fn current_session_extra_roots() -> Vec<PathBuf> {
     SESSION_EXTRA_ROOTS.with(|slot| slot.borrow().clone())
 }
+
+#[cfg(test)]
+mod foreground_root_lifecycle_tests {
+    /// The bring-up plan a repair reuses must be internally consistent.
+    ///
+    /// `RuntimeBinding` records the choice it was built with so a later `repair()`
+    /// cannot switch owners mid-session: handing it `managed()`'s default would make
+    /// the first heal replace a guardian-owned daemon with an embedded one, taking
+    /// the authority channel with it while the conversation kept running.
+    ///
+    /// A half-filled managed plan is the failure worth pinning: it fails every
+    /// repair with "needs the artifact identity" long after the launch that looked
+    /// fine, so the assertion is on coherence, not on which policy is chosen.
+    #[test]
+    fn foreground_root_lifecycle_bring_up_choice_is_coherent() {
+        let choice = yi_agent_subagent::attach::process_bringup_choice();
+        match choice.policy {
+            yi_agent_subagent::attach::BringUpPolicy::Managed => {
+                assert!(
+                    choice.expected.is_some(),
+                    "a managed plan with no expected artifact would be refused at every repair"
+                );
+                assert!(
+                    choice.instance_home.is_some(),
+                    "a managed plan with no instance home cannot resolve its scope"
+                );
+            }
+            yi_agent_subagent::attach::BringUpPolicy::Embedded => {
+                // Embedded ignores both fields; carrying them would imply a managed
+                // intent the policy does not act on.
+            }
+        }
+    }
+}

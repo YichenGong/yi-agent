@@ -140,6 +140,7 @@ pub(crate) mod assembly;
 pub(crate) mod turn;
 
 pub(crate) mod driver;
+pub(crate) mod foreground;
 
 pub(crate) mod transport;
 

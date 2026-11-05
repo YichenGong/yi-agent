@@ -45,6 +45,7 @@ pub enum SlashCommand {
     Mcp,
     Runtime,
     Plugins,
+    RecoverRoot,
 }
 
 impl SlashCommand {
@@ -76,7 +77,8 @@ impl SlashCommand {
             | Self::Compact
             | Self::Config
             | Self::Runtime
-            | Self::Plugins => {
+            | Self::Plugins
+            | Self::RecoverRoot => {
                 return None;
             }
         };
@@ -98,6 +100,7 @@ impl SlashCommand {
             SlashCommand::Config => "config",
             SlashCommand::Runtime => "runtime",
             SlashCommand::Plugins => "plugins",
+            SlashCommand::RecoverRoot => "recover-root",
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
         }
@@ -118,6 +121,9 @@ impl SlashCommand {
             SlashCommand::Config => "显示当前配置",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
             SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
+            SlashCommand::RecoverRoot => {
+                "恢复卡死的前台会话根（先预览影响，再确认；不可用时可查看状态）"
+            }
             // 其余变体都由上面的 `control_spec()` 提前返回。
             _ => unreachable!("control commands return their name from the catalog"),
         }
@@ -137,6 +143,13 @@ impl SlashCommand {
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
+            // Three separate steps, because each does strictly more than the last:
+            // no argument or `status <id>` only reads, `prepare <id>` is the first
+            // thing that stops work, and `confirm <id>` commits. A mistaken Enter
+            // therefore cannot get past the read-only step.
+            SlashCommand::RecoverRoot => Some(
+                "[status <operation-id>|<operation-id>|prepare <operation-id>|confirm <operation-id>]",
+            ),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
         }
@@ -178,6 +191,7 @@ impl SlashCommand {
             SlashCommand::Mcp,
             SlashCommand::Runtime,
             SlashCommand::Plugins,
+            SlashCommand::RecoverRoot,
         ]
     }
 
@@ -956,6 +970,62 @@ mod tests {
         assert_eq!(popup.selected().map(|c| c.name()), Some("clear"));
         popup.move_down();
         assert_eq!(popup.selected().map(|c| c.name()), Some("model"));
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_is_a_host_command() {
+        // Reaching recovery from the TUI must go through this host's own
+        // authorization, which is why the command is host-local: a supervisor
+        // control command would carry a task id, and a task id is exactly the thing
+        // that must not be enough to stop a conversation.
+        assert_eq!(
+            SlashCommand::from_name("recover-root"),
+            Some(SlashCommand::RecoverRoot)
+        );
+        assert!(
+            SlashCommand::RecoverRoot.control_spec().is_none(),
+            "recovery is not a supervisor control command"
+        );
+        let usage = SlashCommand::RecoverRoot
+            .argument_usage()
+            .expect("recover-root takes an operation id");
+        assert!(
+            usage.contains("status"),
+            "the usage must offer the read-only form, not only the mutating one"
+        );
+        // Each step stops strictly more than the previous one, so the usage has to
+        // name all three: a user who only saw `prepare` would not know `confirm`
+        // exists, and one who only saw `confirm` would think a token was an argument.
+        assert!(
+            usage.contains("prepare"),
+            "the usage must name the stop step"
+        );
+        assert!(
+            usage.contains("confirm"),
+            "the usage must name the commit step"
+        );
+        // Wired now: the driver holds the lease and the fence, so the command is
+        // usable and therefore offered.
+        assert!(
+            SlashCommand::RecoverRoot.unavailable_reason().is_none(),
+            "a wired command must not be reported as unusable"
+        );
+        assert!(
+            SlashCommand::completable().contains(&SlashCommand::RecoverRoot),
+            "completion must offer a command that has a backend"
+        );
+    }
+
+    #[test]
+    fn foreground_root_lifecycle_recover_root_help_explains_the_preview() {
+        let help = help_text(Some("recover-root"));
+        assert!(help.contains("/recover-root"));
+        assert!(
+            help.contains("预览"),
+            "help must say the impact is shown before confirming"
+        );
+        // The former `/agents` listing keeps working untouched.
+        assert!(help_text(Some("agents")).contains("/agents"));
     }
 
     #[test]

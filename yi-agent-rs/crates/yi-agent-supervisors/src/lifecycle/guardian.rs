@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use yi_agent_lifecycle::deadline::Deadline;
+use yi_agent_lifecycle::foreground::{BridgeFrame, BridgeRecovery, BridgeRecoveryOutcome};
 use yi_agent_lifecycle::types::{
     ArtifactIdentity, ClientRunId, DaemonInstanceId, ManagedProcessId, RootId, RuntimeScope,
 };
@@ -54,6 +55,13 @@ const DEDICATED_FD_BASE: i32 = 32;
 /// barrier is a one-byte permit to start, and the bootstrap is the inherited proof
 /// of who assigned the role. Sharing a number would let one read the other's bytes.
 pub const BOOTSTRAP_FD: RawFd = 8;
+
+/// The number the guardian's authority-bridge descriptor is installed on.
+///
+/// A third protocol, a third number. The bridge is duplex and long-lived, so it
+/// cannot borrow the bootstrap's one-shot proof slot or the ready barrier's permit
+/// slot without one side eventually reading the other's bytes.
+pub const BRIDGE_FD: RawFd = 7;
 /// Set when something in front of the program has already consumed the barrier.
 ///
 /// The tool launcher reads the barrier and then `exec`s, so the program must not
@@ -148,6 +156,14 @@ pub struct ManagedCommand {
     /// descriptor would refuse to run, and a descriptor passed to a path that forgot
     /// to record the process would be an unjournaled child.
     pub bootstrap: Option<std::os::fd::OwnedFd>,
+    /// The guardian's end of the private authority bridge, when this child is the
+    /// daemon that bridge talks to.
+    ///
+    /// Separate from `bootstrap` because the two are different protocols with
+    /// different lifetimes: the bootstrap is read once to prove who started the
+    /// process, and the bridge stays open for authorization frames. See
+    /// [`super::roles::BRIDGE_FD_ENV`].
+    pub bridge: Option<std::os::fd::OwnedFd>,
 }
 
 impl std::fmt::Debug for ManagedCommand {
@@ -166,6 +182,7 @@ impl std::fmt::Debug for ManagedCommand {
             .field("root", &self.root)
             .field("execution", &self.execution)
             .field("has_bootstrap", &self.bootstrap.is_some())
+            .field("has_bridge", &self.bridge.is_some())
             .finish()
     }
 }
@@ -460,6 +477,22 @@ impl ProcessRegistry {
             return Err(io::Error::last_os_error());
         }
         let bootstrap_raw = hoisted_bootstrap.as_ref().map(|fd| fd.0);
+        // The bridge descriptor is hoisted the same way and for the same reason: the
+        // close loop below decides what survives by *number*, so the source has to be
+        // above every reserved slot before the fork.
+        let hoisted_bridge = command.bridge.as_ref().and_then(|fd| {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+            let hoisted = unsafe { libc::fcntl(raw, libc::F_DUPFD, DEDICATED_FD_BASE) };
+            if hoisted < 0 {
+                return None;
+            }
+            unsafe { libc::fcntl(hoisted, libc::F_SETFD, 0) };
+            Some(OwnedFd::from_raw(hoisted))
+        });
+        if command.bridge.is_some() && hoisted_bridge.is_none() {
+            return Err(io::Error::last_os_error());
+        }
+        let bridge_raw = hoisted_bridge.as_ref().map(|fd| fd.0);
         // Computed before the fork: `pre_exec` may only do async-signal-safe work,
         // and the descriptor table size does not change between here and there.
         let descriptor_limit = unsafe { libc::getdtablesize() }.clamp(64, 1 << 17);
@@ -507,6 +540,29 @@ impl ProcessRegistry {
                 if libc::fcntl(READY_FD, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                if let Some(raw) = bridge_raw {
+                    // Same collision rule as the bootstrap: a bridge on the ready or
+                    // bootstrap number would let one protocol read another's bytes.
+                    if BRIDGE_FD == READY_FD
+                        || BRIDGE_FD == BOOTSTRAP_FD
+                        || raw <= 2
+                        || raw == READY_FD
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "a bridge descriptor must not share a number with stdio, the ready barrier or the bootstrap",
+                        ));
+                    }
+                    if libc::dup2(raw, BRIDGE_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::fcntl(BRIDGE_FD, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if raw != BRIDGE_FD && raw > 2 {
+                        libc::close(raw);
+                    }
+                }
                 if let Some(raw) = bootstrap_raw {
                     // Refuse a collision instead of silently closing one protocol
                     // with the other: a bootstrap on the ready number would make the
@@ -539,7 +595,10 @@ impl ProcessRegistry {
                     // them would leave the child without stdio. The caller's source
                     // descriptors were already closed above. The bootstrap number is
                     // kept only when this child was actually authorised with one.
-                    if fd != READY_FD && !(bootstrap_raw.is_some() && fd == BOOTSTRAP_FD) {
+                    if fd != READY_FD
+                        && !(bootstrap_raw.is_some() && fd == BOOTSTRAP_FD)
+                        && !(bridge_raw.is_some() && fd == BRIDGE_FD)
+                    {
                         libc::close(fd);
                     }
                 }
@@ -1181,9 +1240,9 @@ pub struct GuardianDaemon {
 }
 
 pub struct Guardian {
-    scope: RuntimeScope,
+    pub(super) scope: RuntimeScope,
     artifact: ArtifactIdentity,
-    generation: DaemonInstanceId,
+    pub(super) generation: DaemonInstanceId,
     /// The registry, kept alongside the reclaimer's backend.
     ///
     /// The backend is a trait object (`dyn ProcessBackend`) because reclamation only
@@ -1230,6 +1289,20 @@ pub struct Guardian {
     /// would let a release read a lease count that a concurrent registration had
     /// already changed.
     reclaim: super::reclaim::Reclaimer,
+    /// Roots this guardian has vouched for, plus the answers it owes the daemon.
+    ///
+    /// Separate from `reclaim` on purpose: a lease answers "may this client start
+    /// *any* work", while this answers "may this client bind *this* root". The two are
+    /// checked together at authorization time, but they expire and are revoked
+    /// independently.
+    pub(super) root_authority: super::root_authority::RootAuthorityTable,
+    /// The guardian's end of the private authority bridge, once its daemon is up.
+    ///
+    /// A *separate* descriptor from `daemon_lifeline`: the lifeline carries no
+    /// messages, and the bridge carries nothing else. Sharing one would make a
+    /// half-written frame look like a dropped lifeline, i.e. a live daemon reported
+    /// dead.
+    pub(super) bridge: Option<std::os::unix::net::UnixStream>,
     /// Authority to attach roots, minted for the daemon this guardian started.
     ///
     /// `None` until a daemon answers: authority that named no daemon could not be
@@ -1266,6 +1339,8 @@ impl Guardian {
             daemon_lifeline: None,
             switches: None,
             reclaim,
+            root_authority: super::root_authority::RootAuthorityTable::new(),
+            bridge: None,
             authorizations: None,
         }
     }
@@ -1323,6 +1398,10 @@ impl Guardian {
         {
             tracing::warn!(error = %error, "could not bound the lifeline write timeout");
         }
+        // A second pair for foreground authority frames. Sharing the lifeline would
+        // make a half-written frame look like a dropped daemon, and the lifeline's
+        // own reads are bounded by the hello handshake.
+        let (bridge_guardian_end, bridge_daemon_end) = std::os::unix::net::UnixStream::pair()?;
         let command = ManagedCommand {
             executable: program.to_path_buf(),
             args: vec!["internal-runtime".to_string(), "daemon".to_string()],
@@ -1350,12 +1429,19 @@ impl Guardian {
                     super::roles::BOOTSTRAP_FD_ENV.to_string(),
                     BOOTSTRAP_FD.to_string(),
                 ),
+                // Declared so the child knows which number to take; the number is
+                // fixed by `spawn`, not chosen by the child.
+                (
+                    super::roles::BRIDGE_FD_ENV.to_string(),
+                    BRIDGE_FD.to_string(),
+                ),
             ],
             cwd: self.scope.project_key.clone().into(),
             owner: ProcessOwner::daemon(instance_id.clone()),
             root: None,
             execution: None,
             bootstrap: Some(daemon_end.into()),
+            bridge: Some(bridge_daemon_end.into()),
         };
         // `spawn` consumes its deadline, and the wait below needs the same budget:
         // re-deriving it rather than shrinking it keeps "start plus bind" inside one
@@ -1408,6 +1494,12 @@ impl Guardian {
                 });
                 self.authorizations = Some(ledger);
                 self.daemon_lifeline = Some(guardian_end);
+                // Only now: a bridge attached to a daemon that never answered would
+                // invite the guardian to install authority into a process that is not
+                // serving anything. The pair is non-blocking so a wedged peer can never
+                // stall the control loop that owns it.
+                bridge_guardian_end.set_nonblocking(true)?;
+                self.attach_bridge(bridge_guardian_end);
                 return Ok(());
             }
             std::thread::sleep(deadline.clamp(Duration::from_millis(20)));
@@ -1475,7 +1567,7 @@ impl Guardian {
     /// A guardian with no daemon answers `Unsupported` rather than minting into a
     /// void: the binding names a `daemon_instance_id`, and authority for a daemon
     /// that is not serving could never be honoured by one.
-    pub fn authorize_root(
+    pub fn mint_root_capability(
         &mut self,
         grant: &yi_agent_lifecycle::types::ClientGrant,
         root_id: &str,
@@ -1631,6 +1723,28 @@ impl Guardian {
     /// The switch controller, when this guardian can perform a switch.
     pub fn switches(&self) -> Option<&std::sync::Arc<super::switch::SwitchController>> {
         self.switches.as_ref()
+    }
+
+    /// Attaches the daemon end of a private authority bridge, for tests only.
+    ///
+    /// Test entry, not a production seam: production attaches the bridge only after
+    /// the daemon answered its ready barrier (see `start_daemon`), because a bridge to
+    /// a process that is not serving would invite an install nobody can honour.
+    /// Named like `serve_one_for_test` for the same reason: the suffix is the warning.
+    /// Installs the authorization ledger a test guardian authorizes in.
+    ///
+    /// Test entry only: production sets this inside `start_daemon` after the daemon
+    /// answered, because a ledger naming a daemon nobody started would mint
+    /// capabilities for a process that cannot check them.
+    pub fn authorizations_for_test(
+        &mut self,
+        ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
+    ) {
+        self.authorizations = Some(ledger);
+    }
+
+    pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
+        self.bridge = Some(bridge);
     }
 
     /// Whether this guardian holds the handles needed to stop what it started.
@@ -2118,23 +2232,197 @@ fn runtime_identity(guardian: &Guardian) -> yi_agent_lifecycle::types::RuntimeId
         guardian_display_version: Some(guardian.artifact.display_version.clone()),
         // The intersection, not the union: a capability only one side has cannot be
         // used by a client that needs both halves to honour it.
-        capabilities: daemon.map_or_else(
-            || guardian.artifact.capabilities.clone(),
-            |daemon| {
-                guardian
-                    .artifact
-                    .capabilities
-                    .iter()
-                    .filter(|have| daemon.capabilities.iter().any(|their| their == *have))
-                    .cloned()
-                    .collect()
-            },
-        ),
+        capabilities: {
+            let intersection: Vec<String> = daemon.map_or_else(
+                || guardian.artifact.capabilities.clone(),
+                |daemon| {
+                    guardian
+                        .artifact
+                        .capabilities
+                        .iter()
+                        .filter(|have| daemon.capabilities.iter().any(|their| their == *have))
+                        .cloned()
+                        .collect()
+                },
+            );
+            // The foreground capability is advertised only when this runtime can honour
+            // it: the build supports it, the private bridge is attached (so an install
+            // can actually reach the daemon), and the schema carries the foreground
+            // rows. Any one missing and a registering client would be promised
+            // isolation that the first bind would refuse.
+            let bridge_ready = guardian.bridge.is_some();
+            // Only the upper side can be too high: `SUPPORTED_SCHEMA_MIN` is this
+            // type's floor, so "the daemon schema is at least that" is always true and
+            // clippy is right to refuse it. What actually can fail is a runtime whose
+            // database is newer than this build can read.
+            let schema_supported =
+                guardian.artifact.schema_min <= yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MAX;
+            advertise_capabilities(intersection, bridge_ready && schema_supported)
+        },
         schema_min: daemon.map_or(guardian.artifact.schema_min, |_| {
             guardian.artifact.schema_min
         }),
         schema_max: guardian.artifact.schema_max,
     }
+}
+
+/// Drops the foreground capability unless this runtime can actually honour it.
+///
+/// A capability is a promise, and this one promises that a registered root will be
+/// isolated from the worker watchdog. The guardian can only make that promise when
+/// its own build supports it, the private bridge is attached (so an install can
+/// reach the daemon at all), and the database can carry the foreground rows. Any
+/// one missing and a client that believed the advertisement would be refused at its
+/// first bind -- after it had already told the user delegation was available.
+///
+/// Split out from [`runtime_identity`] because it is a pure decision over two
+/// booleans, and the interesting cases ("bridge missing", "schema too new") should
+/// be testable without standing up a guardian.
+fn advertise_capabilities(capabilities: Vec<String>, foreground_ready: bool) -> Vec<String> {
+    capabilities
+        .into_iter()
+        .filter(|capability| {
+            capability != yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY
+                || foreground_ready
+        })
+        .collect()
+}
+
+/// Answers `ControlRequest::AuthorizeRoot`.
+///
+/// The order is the security property, so it is written once here rather than
+/// duplicated per caller:
+///
+/// 1. the client must hold a live `Business` lease (a `LeaseOnly` observer is refused
+///    with the same shape: the mode never authorizes work);
+/// 2. the root must not already belong to a different live client;
+/// 3. only then is authority minted, and the capability is generated rather than
+///    derived from `intent.thread_key`.
+///
+/// The answer is a *narrow* authorization: it binds one root in one generation and
+/// cannot register, renew, or act for another client.
+fn serve_authorize_root(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    intent: &yi_agent_lifecycle::foreground::RootBindIntent,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    let now = lease_now();
+    // A root id is derived from the operation so a retried prepare resolves to the
+    // same root instead of creating a second one.
+    let root_id = match guardian
+        .roots()
+        .reservation(&intent.operation_id)
+        .map(Ok)
+        .unwrap_or_else(|| Ok(derive_root_id(&guardian.scope.key, &intent.thread_key)))
+    {
+        Ok(root_id) => root_id,
+        Err(error) => {
+            return ControlResponse::Rejected {
+                code: ControlErrorCode::InvalidRequest,
+                reason: error,
+            };
+        }
+    };
+    let existing_owner = guardian
+        .roots()
+        .grant(&root_id)
+        .map(|granted| granted.client_run_id.clone());
+    let scope_key = guardian.scope.key.clone();
+    let generation = guardian.generation.to_string();
+    let request = super::root_authority::AuthorizeRequest {
+        intent,
+        root_id: &root_id,
+        client_run_id: &grant.client_run_id,
+        scope_key: &scope_key,
+        generation: &generation,
+        existing_owner: existing_owner.as_deref(),
+        scope: yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+    };
+    match guardian.authorize_root(grant, &request, now) {
+        // The minted capability is only half the answer. Until the daemon confirms it
+        // installed the authority, no client can bind a driver with it, so answering
+        // here would hand the host a secret it could not use. The exchange is what
+        // turns "the guardian vouched" into "the runtime admits this root".
+        Ok(authorization) => match guardian.exchange(
+            &authorization,
+            intent,
+            yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+            &intent.operation_id,
+        ) {
+            Ok(super::root_authority::BridgeOutcome::Committed { .. }) => {
+                ControlResponse::RootAuthorized(authorization)
+            }
+            Ok(super::root_authority::BridgeOutcome::NoBridge) => {
+                // Embedded or guardian-less runtimes keep the pre-existing behaviour
+                // and say so: the spec's promise is limited to supported managed
+                // entries, and pretending otherwise would make an unsupported runtime
+                // look like a managed one that silently forgot to authorize.
+                ControlResponse::Rejected {
+                    code: ControlErrorCode::InvalidRequest,
+                    reason: "foreground_lifecycle_unsupported: this runtime has no \
+                             authority bridge, so a managed root cannot be authorized"
+                        .to_string(),
+                }
+            }
+            Ok(outcome) => {
+                let error = outcome.into_error();
+                ControlResponse::Rejected {
+                    code: ControlErrorCode::InvalidRequest,
+                    reason: error.to_string(),
+                }
+            }
+            Err(error) => ControlResponse::Rejected {
+                code: ControlErrorCode::InvalidRequest,
+                reason: error.to_string(),
+            },
+        },
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            ControlResponse::Rejected {
+                code: ControlErrorCode::Unauthenticated,
+                reason: error.to_string(),
+            }
+        }
+        Err(error) => ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Derives the stable root id for a conversation key in a scope.
+///
+/// Deterministic on purpose *for the key*, but the result is only a lookup handle: it
+/// carries no authority, and the capability that does is generated at authorization
+/// time. Two clients naming the same key therefore resolve to the same root, which is
+/// what makes "another client cannot take it over" a check rather than a coincidence.
+fn derive_root_id(scope_key: &str, thread_key: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(scope_key.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(thread_key.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        digest[4],
+        digest[5],
+        digest[6],
+        digest[7],
+        digest[8],
+        digest[9],
+        digest[10],
+        digest[11],
+        digest[12],
+        digest[13],
+        digest[14],
+        digest[15]
+    )
 }
 
 /// Answers `ControlRequest::Preview`.
@@ -2207,6 +2495,360 @@ fn serve_preview(
         .previews_mut()
         .preview(grant, context, collected.input, now);
     ControlResponse::Preview(preview)
+}
+
+/// One recovery operation as the guardian forwards it.
+///
+/// Kept private: the wire shape is [`BridgeRecovery`], and this exists so the four
+/// control handlers can share one forwarding path instead of each spelling out the
+/// authorization lookup.
+enum RecoveryForward {
+    Inspect {
+        expected: yi_agent_lifecycle::foreground::ForegroundFence,
+    },
+    Prepare {
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+    },
+    Confirm {
+        request: yi_agent_lifecycle::foreground::RecoveryRequest,
+        token: yi_agent_lifecycle::foreground::SecretCapability,
+    },
+    Operation {
+        root: yi_agent_lifecycle::foreground::RootRef,
+        operation_id: String,
+    },
+}
+
+impl RecoveryForward {
+    /// The root this operation is about, so the ownership check has one input.
+    fn root_id(&self) -> &str {
+        match self {
+            Self::Inspect { expected } => &expected.root.root_id,
+            Self::Prepare { request } | Self::Confirm { request, .. } => {
+                &request.expected.root.root_id
+            }
+            Self::Operation { root, .. } => &root.root_id,
+        }
+    }
+}
+
+/// Forwards one recovery operation to the daemon over the private bridge.
+///
+/// Two things happen here that no other layer can do:
+///
+/// 1. **Ownership.** The grant says which client is asking. The guardian's own table
+///    says which client owns the root. A different live client must not read or
+///    repair a conversation it does not own, so this refuses before the daemon is
+///    asked anything.
+/// 2. **Authorization material.** The daemon re-checks the *capability*, not the
+///    grant, so the guardian must hand it the authorization it minted for that
+///    (client, root) pair. `issue` is deterministic, so re-deriving it here yields
+///    the same secret the host already holds rather than a second one.
+///
+/// Returns the daemon's outcome, or the wire code and a whitelisted reason when the
+/// request never reached it.
+fn forward_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    forward: RecoveryForward,
+) -> Result<BridgeRecoveryOutcome, (yi_agent_lifecycle::types::ControlErrorCode, String)> {
+    use yi_agent_lifecycle::types::ControlErrorCode;
+
+    let root_id = forward.root_id().to_string();
+    // An unowned root is not an error the guardian can explain further: either the
+    // table never knew it (so recovery would be an unauthenticated takeover) or it is
+    // owned by somebody else.
+    let owner = guardian
+        .roots()
+        .grant(&root_id)
+        .map(|granted| granted.client_run_id.clone());
+    if owner.as_deref() != Some(grant.client_run_id.as_str()) {
+        return Err((
+            ControlErrorCode::Unauthenticated,
+            "this client does not own the root it asked to recover".to_string(),
+        ));
+    }
+    let authorization = {
+        let Some(ledger) = guardian.authorizations.as_mut() else {
+            return Err((
+                ControlErrorCode::Unsupported,
+                "this guardian started no daemon, so there is no generation to recover in"
+                    .to_string(),
+            ));
+        };
+        ledger
+            .issue(&grant.client_run_id, &root_id, grant.mode)
+            .map_err(|reason| (ControlErrorCode::Unauthenticated, reason))?
+    };
+    if guardian.bridge.is_none() {
+        return Err((
+            ControlErrorCode::Unsupported,
+            "this runtime has no authority bridge, so a recovery cannot be run here".to_string(),
+        ));
+    }
+    let nonce = super::root_authority::new_capability_nonce();
+    let recovery = match forward {
+        RecoveryForward::Inspect { expected } => BridgeRecovery::Inspect {
+            nonce: nonce.clone(),
+            authorization,
+            expected,
+        },
+        RecoveryForward::Prepare { request } => BridgeRecovery::Prepare {
+            nonce: nonce.clone(),
+            authorization,
+            request,
+        },
+        RecoveryForward::Confirm { request, token } => BridgeRecovery::Confirm {
+            nonce: nonce.clone(),
+            authorization,
+            request,
+            token,
+        },
+        RecoveryForward::Operation { root, operation_id } => BridgeRecovery::Operation {
+            nonce: nonce.clone(),
+            authorization,
+            root,
+            operation_id,
+        },
+    };
+    let sent = BridgeFrame::Recovery(Box::new(recovery));
+    let answer = guardian
+        .round_trip(&sent)
+        .map_err(|error| (ControlErrorCode::Internal, error.to_string()))?
+        .ok_or_else(|| {
+            (
+                ControlErrorCode::Internal,
+                "the daemon did not answer the recovery in time".to_string(),
+            )
+        })?;
+    // The nonce check is what keeps one request's answer from answering another: the
+    // bridge is one stream, and a late frame from a timed-out request would otherwise
+    // be handed to the next caller.
+    let outcome = match answer {
+        BridgeFrame::RecoveryAnswer(answer) if answer.nonce == nonce => answer.outcome,
+        BridgeFrame::RecoveryAnswer(answer) => {
+            return Err((
+                ControlErrorCode::Internal,
+                format!(
+                    "the daemon answered a different recovery (asked {nonce}, got {})",
+                    answer.nonce
+                ),
+            ));
+        }
+        other => {
+            return Err((
+                ControlErrorCode::Internal,
+                format!("the daemon answered a recovery with {other:?}"),
+            ));
+        }
+    };
+    // A structured refusal is carried as a code, not as a string: the shell switches
+    // on the code to decide whether a retry is meaningful, and `Conflict` (this
+    // operation id already describes different work) must never look retryable.
+    match outcome {
+        BridgeRecoveryOutcome::Failed(code) => Err((
+            recovery_code_to_control(code),
+            recovery_code_to_reason(code).to_string(),
+        )),
+        outcome => Ok(outcome),
+    }
+}
+
+/// Maps a forwarded foreground failure onto the control channel's taxonomy.
+///
+/// Two enums because the control channel predates the foreground codes. The mapping
+/// is by kind, not by message: `StopUnproven` and `ConfirmationRequired` are both
+/// "not yet", while `OperationConflict` is "this cannot succeed as asked".
+fn recovery_code_to_control(
+    code: yi_agent_lifecycle::foreground::ForegroundErrorCode,
+) -> yi_agent_lifecycle::types::ControlErrorCode {
+    use yi_agent_lifecycle::foreground::ForegroundErrorCode as From;
+    use yi_agent_lifecycle::types::ControlErrorCode as To;
+    match code {
+        From::Unsupported => To::Unsupported,
+        From::AuthorityDenied | From::RecoveryAuthorityMissing => To::Unauthenticated,
+        From::AdmissionClosed | From::RecoveryRequired => To::Released,
+        From::StaleAttempt | From::StaleDriver => To::StaleEpoch,
+        From::OperationConflict | From::SequenceConflict => To::Conflict,
+        From::InvalidActivity | From::CorruptBinding => To::Internal,
+        From::ConfirmationRequired | From::ConfirmationExpired | From::StopUnproven => {
+            To::InvalidRequest
+        }
+    }
+}
+
+/// The whitelisted reason that accompanies a forwarded failure.
+///
+/// Fixed phrases only: this string crosses into the shell, and free-form error text
+/// has carried paths and secrets before.
+fn recovery_code_to_reason(
+    code: yi_agent_lifecycle::foreground::ForegroundErrorCode,
+) -> &'static str {
+    use yi_agent_lifecycle::foreground::ForegroundErrorCode as Code;
+    match code {
+        Code::Unsupported => "this runtime cannot run a foreground recovery",
+        Code::AuthorityDenied | Code::RecoveryAuthorityMissing => {
+            "no authorization for this root is available here"
+        }
+        Code::AdmissionClosed | Code::RecoveryRequired => {
+            "the root is closed to new work until it is recovered"
+        }
+        Code::StaleAttempt => "the root has moved on; inspect it again",
+        Code::StaleDriver => "a different driver holds this root now",
+        Code::InvalidActivity => "the activity update was rejected",
+        Code::SequenceConflict => "another update got there first",
+        Code::StopUnproven => "an execution under this root is not proven stopped",
+        Code::ConfirmationRequired => "this recovery needs a confirmation first",
+        Code::ConfirmationExpired => "the confirmation expired; prepare the recovery again",
+        Code::OperationConflict => {
+            "this operation id already describes different work; use a new one"
+        }
+        Code::CorruptBinding => "the stored binding for this root is inconsistent",
+    }
+}
+
+/// Answers `ControlRequest::InspectRootRecovery`.
+///
+/// The host asks what a freeze would stop before committing to one, so this must be
+/// read-only all the way down: the guardian checks the lease and forwards, and the
+/// daemon's inspect writes no freeze row.
+fn serve_inspect_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    expected: &yi_agent_lifecycle::foreground::ForegroundFence,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Inspect {
+            expected: expected.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Impact(impact) => ControlResponse::RootRecoveryImpact(impact),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered an inspect with {other:?}"),
+            },
+        },
+    )
+}
+
+/// Answers `ControlRequest::PrepareRootRecovery`.
+///
+/// The freeze/stop/preview transaction itself lives in the daemon; this handler's job
+/// is the part only the guardian can do: prove the asking client holds a live lease and
+/// owns (or may recover) the root, then carry the daemon's answer back unmodified.
+fn serve_prepare_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Prepare {
+            request: request.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered a prepare with {other:?}"),
+            },
+        },
+    )
+}
+
+/// Answers `ControlRequest::ConfirmRootRecovery`.
+fn serve_confirm_root_recovery(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    request: &yi_agent_lifecycle::foreground::RecoveryRequest,
+    token: &yi_agent_lifecycle::foreground::SecretCapability,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Confirm {
+            request: request.clone(),
+            token: token.clone(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered a confirm with {other:?}"),
+            },
+        },
+    )
+}
+
+/// Answers `ControlRequest::RootRecoveryOperation`.
+fn serve_root_recovery_operation(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    root: &yi_agent_lifecycle::foreground::RootRef,
+    operation_id: &str,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+    let now = lease_now();
+    if let Err(reason) = guardian.reclaimer().leases().admits_or_observes(grant, now) {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::Unauthenticated,
+            reason,
+        };
+    }
+    forward_recovery(
+        guardian,
+        grant,
+        RecoveryForward::Operation {
+            root: root.clone(),
+            operation_id: operation_id.to_string(),
+        },
+    )
+    .map_or_else(
+        |(code, reason)| ControlResponse::Rejected { code, reason },
+        |outcome| match outcome {
+            BridgeRecoveryOutcome::Status(status) => ControlResponse::RootRecovery(status),
+            other => ControlResponse::Rejected {
+                code: ControlErrorCode::Internal,
+                reason: format!("the daemon answered an operation read with {other:?}"),
+            },
+        },
+    )
 }
 
 /// Answers `ControlRequest::PreviewPage`: more rows, never a token.
@@ -2452,6 +3094,68 @@ fn lease_now() -> std::time::Duration {
         .unwrap_or_default()
 }
 
+/// Serves one guardian whose authority bridge is the given daemon end.
+///
+/// Exposed for the integration test that has to prove the *forward* path: an
+/// authorization is only handed out after the daemon confirmed the install, so a
+/// fixture with no bridge can only ever observe refusals. The peer here is the test's
+/// own daemon stand-in, not a stub of the guardian: the real handler, codec, and
+/// budget all run.
+pub fn serve_with_bridge_for_test(
+    scope: RuntimeScope,
+    selected: ArtifactIdentity,
+    shutdown: impl Fn() -> bool,
+    bridge: std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let generation = format!("guardian-{}", std::process::id());
+    // The ledger is what names a generation to authorize in, and a guardian without
+    // one cannot mint a root capability at all. Production installs it only after the
+    // daemon answered its ready barrier; this entry stands in for that daemon, so it
+    // installs one up front -- otherwise every recovery test would be asserting
+    // against "this guardian started no daemon" instead of the forwarding it exists
+    // to prove.
+    let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.key.clone(),
+        generation.clone(),
+    );
+    let mut guardian = Guardian::new(scope, selected, generation);
+    guardian.authorizations_for_test(ledger);
+    guardian.attach_bridge_for_test(bridge);
+    serve_control_loop(&mut guardian, shutdown)
+}
+
+/// The accept/maintenance loop both [`serve_with_daemon`] and the test entry share.
+///
+/// Split out so the two cannot drift: the test path must exercise the same lease
+/// maintenance and teardown as production, or it would pass while the real loop
+/// leaked a bridge.
+fn serve_control_loop(guardian: &mut Guardian, shutdown: impl Fn() -> bool) -> io::Result<()> {
+    let deadline = Deadline::after(Duration::from_secs(2));
+    let listener = guardian.bind_control(&deadline)?;
+    listener.set_nonblocking(true)?;
+    while !shutdown() {
+        if wait_for_connection(&listener, LEASE_MAINTENANCE_TICK)? {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if prepare_control_stream(&stream).is_ok() {
+                            serve_control_connection(guardian, stream);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let _ = guardian.maintain(lease_now());
+        if guardian.drained() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Prepares an accepted control connection for one request/response exchange.
 fn prepare_control_stream(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
     // `ControlClient::connect` leaves its side non-blocking; the accepted side can
@@ -2636,22 +3340,40 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             // connection (and the shell's explain-why path) unavailable exactly when
             // a frontend is quitting. The answer is therefore the *operation id*;
             // `ReclaimStatus` is how the result is collected.
-            let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
-            let released_client = grant.client_run_id.clone();
-            match guardian.reclaimer_mut().release(grant, budget) {
-                Ok(operation_id) => {
-                    // Authority must not outlive the lease that justified it: the
-                    // reclaimer has accepted the release, so the daemon is told to
-                    // stop honouring this client's capabilities *now*, not when the
-                    // teardown finishes.
-                    guardian.revoke_client_authority(&released_client);
-                    guardian.reclaimer_mut().expire_results();
-                    ControlResponse::ReleaseStarted { operation_id }
-                }
+            // Root authority is withdrawn *before* the lease goes away. A release
+            // that reclaimed processes while leaving root authority installed would
+            // let the daemon keep admitting work for a client that is leaving; the
+            // sequence issued here is what refuses anything already in flight.
+            match guardian.withdraw_root_authority(&grant.client_run_id) {
+                // A bridge we cannot write to means the daemon may still admit this
+                // client's roots. Reporting the release as completed would hide that.
                 Err(error) => ControlResponse::Rejected {
-                    code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
-                    reason: error.to_string(),
+                    code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
+                    reason: format!(
+                        "root authority could not be withdrawn, so the release was not \
+                         started: {error}"
+                    ),
                 },
+                Ok(_) => {
+                    let budget = Deadline::after(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT);
+                    let released_client = grant.client_run_id.clone();
+                    match guardian.reclaimer_mut().release(grant, budget) {
+                        Ok(operation_id) => {
+                            // Authority must not outlive the lease that justified it:
+                            // the reclaimer has accepted the release, so the daemon is
+                            // told to stop honouring this client's capabilities *now*,
+                            // not when the teardown finishes. Both channels carry the
+                            // same decision for the two subsystems that enforce it.
+                            guardian.revoke_client_authority(&released_client);
+                            guardian.reclaimer_mut().expire_results();
+                            ControlResponse::ReleaseStarted { operation_id }
+                        }
+                        Err(error) => ControlResponse::Rejected {
+                            code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                            reason: error.to_string(),
+                        },
+                    }
+                }
             }
         }
         ControlRequest::ReclaimStatus {
@@ -2707,26 +3429,24 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
                 }
             }
         }
-        ControlRequest::AuthorizeRoot { grant, root_id } => {
-            match guardian.authorize_root(&grant, &root_id) {
-                Ok(authorization) => ControlResponse::RootAuthorized(authorization),
-                Err(reason) => {
-                    // A released or mis-modelled lease is an authentication
-                    // failure, not a transient one: retrying with the same grant
-                    // cannot succeed, and the caller has to re-register.
-                    let code = if reason.contains("not registered")
-                        || reason.contains("released")
-                        || reason.contains("expired")
-                        || reason.contains("stale or forged")
-                        || reason.contains("never authorizes")
-                    {
-                        yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated
-                    } else {
-                        yi_agent_lifecycle::types::ControlErrorCode::Conflict
-                    };
-                    ControlResponse::Rejected { code, reason }
-                }
-            }
+        ControlRequest::AuthorizeRoot { grant, intent } => {
+            serve_authorize_root(guardian, &grant, &intent)
+        }
+        ControlRequest::PrepareRootRecovery { grant, request } => {
+            serve_prepare_root_recovery(guardian, &grant, &request)
+        }
+        ControlRequest::ConfirmRootRecovery {
+            grant,
+            request,
+            token,
+        } => serve_confirm_root_recovery(guardian, &grant, &request, &token),
+        ControlRequest::RootRecoveryOperation {
+            grant,
+            root,
+            operation_id,
+        } => serve_root_recovery_operation(guardian, &grant, &root, &operation_id),
+        ControlRequest::InspectRootRecovery { grant, expected } => {
+            serve_inspect_root_recovery(guardian, &grant, &expected)
         }
         ControlRequest::OpenManagedChannel { grant } => {
             // Answered here rather than as a plain `ControlResponse`, because the
@@ -2764,6 +3484,57 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
         },
     };
     let _ = yi_agent_lifecycle::codec::write_frame(&mut stream, &response);
+}
+
+#[cfg(test)]
+mod foreground_root_lifecycle_capability_tests {
+    use super::advertise_capabilities;
+
+    fn capability() -> String {
+        yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY.to_string()
+    }
+
+    /// A runtime that cannot honour the promise must not make it.
+    ///
+    /// Without this the first `AuthorizeRoot` would be refused -- after the client
+    /// had already told the user delegation was available, which is the failure
+    /// mode that reads as "spawn_agent is broken".
+    #[test]
+    fn foreground_root_lifecycle_capability_is_withheld_without_a_bridge() {
+        let advertised = advertise_capabilities(vec!["lease.v1".into(), capability()], false);
+        assert_eq!(advertised, vec!["lease.v1".to_string()]);
+        assert!(
+            !advertised.contains(&capability()),
+            "a guardian with no bridge cannot install authority, so it must not promise it"
+        );
+    }
+
+    /// With the bridge attached and the schema readable, the capability is offered.
+    #[test]
+    fn foreground_root_lifecycle_capability_is_offered_when_ready() {
+        let advertised = advertise_capabilities(vec!["lease.v1".into(), capability()], true);
+        assert!(
+            advertised.contains(&capability()),
+            "a ready runtime must advertise the capability it can honour"
+        );
+        assert!(
+            advertised.contains(&"lease.v1".to_string()),
+            "advertising the foreground capability must not drop the others"
+        );
+    }
+
+    /// The filter touches only its own capability.
+    #[test]
+    fn foreground_root_lifecycle_capability_filter_is_not_a_blanket_denial() {
+        let advertised = advertise_capabilities(
+            vec!["lease.v1".into(), "switch.preview.v1".into(), capability()],
+            false,
+        );
+        assert_eq!(
+            advertised,
+            vec!["lease.v1".to_string(), "switch.preview.v1".to_string()]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2850,7 +3621,7 @@ mod authorization_tests {
             )
             .unwrap();
 
-        let authorization = guardian.authorize_root(&grant, "/project").unwrap();
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
         assert_eq!(authorization.client_run_id, "app-run-1");
         assert_eq!(authorization.root_id, "/project");
 
@@ -2879,7 +3650,9 @@ mod authorization_tests {
             )
             .unwrap();
 
-        let error = guardian.authorize_root(&grant, "/project").unwrap_err();
+        let error = guardian
+            .mint_root_capability(&grant, "/project")
+            .unwrap_err();
         assert!(error.contains("never authorizes"), "{error}");
         // Nothing was sent: an observer must not even cause a frame to appear.
         peer.set_read_timeout(Some(Duration::from_millis(100)))
@@ -2905,7 +3678,7 @@ mod authorization_tests {
             )
             .unwrap();
         grant.credential = "not-the-credential".to_string();
-        assert!(guardian.authorize_root(&grant, "/project").is_err());
+        assert!(guardian.mint_root_capability(&grant, "/project").is_err());
     }
 
     /// A guardian with no daemon has no generation to authorize in, and says so
@@ -2927,7 +3700,9 @@ mod authorization_tests {
                 lease_now(),
             )
             .unwrap();
-        let error = guardian.authorize_root(&grant, "/project").unwrap_err();
+        let error = guardian
+            .mint_root_capability(&grant, "/project")
+            .unwrap_err();
         assert!(error.contains("no generation"), "{error}");
     }
 
@@ -2946,7 +3721,7 @@ mod authorization_tests {
                 lease_now(),
             )
             .unwrap();
-        let authorization = guardian.authorize_root(&grant, "/project").unwrap();
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
         // Drain the binding frame so the next read is the revocation.
         let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
         let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
@@ -2984,7 +3759,7 @@ mod authorization_tests {
                 lease_now(),
             )
             .unwrap();
-        guardian.authorize_root(&grant, "/project").unwrap();
+        guardian.mint_root_capability(&grant, "/project").unwrap();
         // Drain the binding so the next lifeline frame is the revocation.
         let frame = yi_agent_lifecycle::codec::read_frame(&mut &lifeline_peer).unwrap();
         let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
@@ -3036,7 +3811,7 @@ mod authorization_tests {
                 lease_now(),
             )
             .unwrap();
-        let authorization = guardian.authorize_root(&grant, "/project").unwrap();
+        let authorization = guardian.mint_root_capability(&grant, "/project").unwrap();
         let frame = yi_agent_lifecycle::codec::read_frame(&mut &peer).unwrap();
         let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
 

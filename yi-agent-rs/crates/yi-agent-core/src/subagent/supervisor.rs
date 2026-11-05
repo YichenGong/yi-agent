@@ -414,6 +414,15 @@ impl AgentSupervisor {
         self.tasks.get(task_id)
     }
 
+    /// Every task this supervisor knows, in no particular order.
+    ///
+    /// Exists so a caller can enumerate what is registered rather than projecting a
+    /// set from a side table that may disagree with it. Used by the foreground
+    /// lifecycle fixtures, which must assert about what was really registered.
+    pub fn task_ids(&self) -> Vec<TaskId> {
+        self.tasks.keys().cloned().collect()
+    }
+
     pub fn objective(&self, task_id: &TaskId) -> Option<&str> {
         self.objectives.get(task_id).map(String::as_str)
     }
@@ -1626,6 +1635,49 @@ impl AgentSupervisor {
         if recipient_task.state().is_terminal() {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
+        Ok(())
+    }
+
+    /// Removes a task that was created in memory but never committed to the
+    /// repository.
+    ///
+    /// The spawn path builds the child in the supervisor first and persists it
+    /// second, so a refused commit leaves a task that no row describes. Leaving it
+    /// would be worse than a leak: it is enumerable, so a later release would try to
+    /// stop work that was never admitted, and a caller could address it. This is the
+    /// inverse of `spawn_with_objective` and touches nothing durable.
+    ///
+    /// Only a task with no worker and no committed children may be abandoned; those
+    /// invariants are asserted rather than assumed, because abandoning a live task
+    /// would strand its worker outside every enumerable set.
+    pub fn abandon_uncommitted_task(&mut self, task_id: &TaskId) -> Result<(), String> {
+        if !self.tasks.contains_key(task_id) {
+            return Ok(());
+        }
+        if self.workers.contains_key(task_id) {
+            return Err("a task with a worker cannot be abandoned".into());
+        }
+        let has_children = self
+            .children
+            .get(task_id)
+            .is_some_and(|children| !children.is_empty());
+        if has_children {
+            return Err("a task with children cannot be abandoned".into());
+        }
+        if let Some(task) = self.tasks.remove(task_id) {
+            self.children
+                .entry(task.parent_id.unwrap_or_else(|| task_id.clone()))
+                .and_modify(|children| children.retain(|child| child != task_id));
+        }
+        self.children.remove(task_id);
+        self.objectives.remove(task_id);
+        self.mailboxes.remove(task_id);
+        self.workspace_modes.remove(task_id);
+        self.inherited_sandboxes.remove(task_id);
+        self.extra_roots.remove(task_id);
+        self.models.remove(task_id);
+        self.worker_message_capabilities.remove(task_id);
+        self.notify_update();
         Ok(())
     }
 

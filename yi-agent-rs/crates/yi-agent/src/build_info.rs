@@ -42,6 +42,12 @@ pub fn runtime_capabilities() -> Vec<String> {
         "control.v1".to_string(),
         "lease.v1".to_string(),
         "switch.preview.v1".to_string(),
+        // Static, not conditional: this is what the *build* can do. Whether this
+        // particular runtime may act on it is decided where the identity is assembled
+        // (`runtime_identity`), because advertising it from the artifact alone would
+        // let a client register for a guarantee this runtime's bridge has not
+        // established.
+        yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY.to_string(),
     ];
     capabilities.sort();
     capabilities

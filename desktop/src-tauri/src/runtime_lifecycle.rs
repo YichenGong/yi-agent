@@ -55,7 +55,7 @@ const STATUS_BUDGET: Duration = yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT;
 /// completes -- completion is what `runtime_operation` is for. The larger budget
 /// covers taking the coordination lock and writing the atomic selection record,
 /// both of which touch the filesystem.
-const SWITCH_BUDGET: Duration = Duration::from_secs(10);
+pub const SWITCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// The guardian's control socket file inside a runtime directory.
 ///
@@ -175,6 +175,22 @@ pub trait ControlBackend: Send + Sync + 'static {
         ))
     }
 
+    /// The live lease this backend holds for `scope`.
+    ///
+    /// Defaulted to `NotFound` so a fake that only models quitting does not have to
+    /// invent a lease. The real backend returns the one it registered, because
+    /// recovery is owner-bound and the App must present its own grant.
+    fn lease_for_scope(
+        &self,
+        scope: &RuntimeScope,
+    ) -> io::Result<Arc<Mutex<yi_agent_lifecycle::client::FrontendLease>>> {
+        let _ = scope;
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this control backend holds no lease",
+        ))
+    }
+
     /// One read of an operation's progress. `Ok(None)` = this runtime never ran it.
     fn operation(
         &self,
@@ -268,6 +284,13 @@ impl ControlBackend for SocketBackend {
         lease.start_heartbeat()?;
         leases.insert(scope.key.clone(), Arc::new(Mutex::new(lease)));
         Ok(true)
+    }
+
+    fn lease_for_scope(
+        &self,
+        scope: &RuntimeScope,
+    ) -> io::Result<Arc<Mutex<yi_agent_lifecycle::client::FrontendLease>>> {
+        self.lease_for(scope)
     }
 
     fn release(
@@ -501,6 +524,20 @@ impl DesktopRuntimeManager {
     /// The target is always `self.artifact`: a WebView must not be able to name an
     /// executable, because "restart into this binary you chose" is code execution
     /// with extra steps. An unverified shell has no target, and says so.
+    /// The live lease this App holds for one project, for a surface that must speak
+    /// to the runtime as itself.
+    ///
+    /// Deliberately not a general accessor: recovery is owner-bound at the runtime,
+    /// so the caller presents the App's own grant rather than asking the sidecar to
+    /// obtain one. A project with no live lease gets "open the project first", which
+    /// is the only fix the caller can apply.
+    pub fn lease_for_recovery(
+        &self,
+        scope: &RuntimeScope,
+    ) -> io::Result<Arc<Mutex<yi_agent_lifecycle::client::FrontendLease>>> {
+        self.backend.lease_for_scope(scope)
+    }
+
     pub async fn preview(
         &self,
         scope: &RuntimeScope,
@@ -2503,7 +2540,10 @@ pub fn runtime_known_scopes(state: tauri::State<'_, QuitState>) -> Vec<String> {
 
 /// The scope key for one project path, once this shell has resolved it.
 #[tauri::command]
-pub fn runtime_scope_for_project(state: tauri::State<'_, QuitState>, project: String) -> Option<String> {
+pub fn runtime_scope_for_project(
+    state: tauri::State<'_, QuitState>,
+    project: String,
+) -> Option<String> {
     let project = std::path::PathBuf::from(project);
     state
         .manager

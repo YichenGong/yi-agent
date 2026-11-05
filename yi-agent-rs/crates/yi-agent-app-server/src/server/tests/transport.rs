@@ -261,6 +261,7 @@ async fn driver_reports_finished_when_writer_fails() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     prompt_tx
@@ -339,6 +340,7 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
         None,
         std::env::temp_dir(),
+        None,
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。

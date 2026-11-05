@@ -235,7 +235,9 @@ fn pump_lifeline_authority(
 pub fn run_managed_daemon(
     invocation: yi_agent_runtime::config::RuntimeConfig,
 ) -> anyhow::Result<()> {
-    use yi_agent_supervisors::lifecycle::roles::{ManagedRole, inherited_bootstrap};
+    use yi_agent_supervisors::lifecycle::roles::{
+        ManagedRole, inherited_bootstrap, inherited_bridge,
+    };
     let bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
     // The guardian's first frame carries the generation secret. It is read before
     // the daemon serves because authority must be verifiable from the first attach:
@@ -274,6 +276,18 @@ pub fn run_managed_daemon(
             ));
         }
     };
+    // The guardian's half of the foreground authority bridge rides the *same*
+    // lifeline the hello arrived on. It is taken here, before the daemon starts,
+    // because a daemon that bound its socket first would spend a window accepting
+    // foreground frames it could not answer.
+    let bridge = match inherited_bridge() {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "could not take the foreground authority bridge: {error}"
+            ));
+        }
+    };
     // The instance's configuration is inherited from the process that started us,
     // not re-derived from the project cwd: a shared daemon must keep reading the
     // same `YI_AGENT_HOME` and model catalogue its launcher used. Only the workdir
@@ -293,7 +307,13 @@ pub fn run_managed_daemon(
         &runtime_dir,
         &database,
         factory,
+        // Enabled unconditionally: this is the *managed* daemon, the only entry
+        // whose guardian can vouch for a root. Not reachable from an environment
+        // variable, because a switch a user can flip would let a runtime classify
+        // containers without an authority channel to fence them.
+        yi_agent_store::foreground::ForegroundActivation::Enabled,
         ledger,
+        bridge,
     )
     .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;
     // Only now does listening for further authority make sense: the coordinator

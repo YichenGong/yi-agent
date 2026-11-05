@@ -1,4 +1,5 @@
 use super::*;
+use crate::repository::RepositoryError;
 
 pub(crate) const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
@@ -56,12 +57,92 @@ impl ConfirmationStore {
     }
 }
 
+/// Serves the guardian's private authority bridge until it reaches EOF.
+///
+/// Runs on its own thread rather than inside the accept loop, because the two have
+/// opposite cadences: the accept loop must answer clients promptly, while a bridge
+/// frame can sit waiting for a guardian that is busy with another client's lease. One
+/// loop for both would let a slow bridge stall every business request.
+///
+/// A frame the daemon does not answer (a `Challenge`, which only the daemon sends)
+/// yields nothing to write, and that is not an error. A write failure ends the loop:
+/// the peer is gone, and the bridge's EOF path is what closes admission.
+fn serve_authority_bridge(
+    stream: std::os::unix::net::UnixStream,
+    coordinator: std::sync::Arc<crate::runtime::RuntimeCoordinator>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    let mut stream = stream;
+    if let Err(error) = stream.set_read_timeout(Some(std::time::Duration::from_millis(200))) {
+        tracing::warn!(error = %error, "authority bridge could not be made pollable");
+        return;
+    }
+    coordinator.bridge_reconnected();
+    let mut reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(error = %error, "authority bridge could not be duplicated");
+            coordinator.bridge_closed();
+            return;
+        }
+    };
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let raw = match yi_agent_lifecycle::codec::read_frame(&mut reader) {
+            Ok(raw) => raw,
+            // A bounded read that produced nothing is the normal idle state; the bridge
+            // is a request/response channel that is silent most of the time.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            // EOF: the guardian is gone. Admission closes and stays closed, but no
+            // tombstone is written -- a crashed guardian is not a decision to revoke.
+            Err(_) => break,
+        };
+        let frame: yi_agent_lifecycle::foreground::BridgeFrame =
+            match yi_agent_lifecycle::codec::decode(&raw) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    // One malformed frame is that frame's problem, not the runtime's: the
+                    // guardian may still be healthy and simply speaking a newer protocol.
+                    tracing::warn!(error = %error, "authority bridge received an undecodable frame");
+                    continue;
+                }
+            };
+        let Some(answer) = coordinator.serve_bridge_frame(frame) else {
+            continue;
+        };
+        if let Err(error) = yi_agent_lifecycle::codec::write_frame(&mut stream, &answer) {
+            tracing::warn!(error = %error, "authority bridge answer could not be written");
+            break;
+        }
+        let _ = stream.flush();
+    }
+    coordinator.bridge_closed();
+}
+
 /// A manually owned, current-user-only local daemon socket.
 pub struct Daemon {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
     coordinator: Arc<RuntimeCoordinator>,
     listener: Option<JoinHandle<()>>,
+    /// The guardian authority bridge thread, when this daemon has one.
+    ///
+    /// Joined on teardown so a bridge answer cannot be written to a descriptor whose
+    /// socket has already been unlinked. `None` means "no guardian", which is the
+    /// embedded case and not a degraded managed one.
+    bridge_thread: Option<JoinHandle<()>>,
     /// Orphaned tasks the startup sweep reclaimed, reported to the caller
     /// instead of printed. Whoever owns the terminal must decide how this
     /// reaches the user: a bare write corrupts a live TUI frame, because the
@@ -93,7 +174,36 @@ impl Daemon {
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
     ) -> Result<Self, IpcError> {
-        Self::start_with_factory_and_authority(runtime_dir, database_path, factory, None)
+        Self::start_with_factory_and_authority(
+            runtime_dir,
+            database_path,
+            factory,
+            crate::foreground::ForegroundActivation::Disabled,
+            None,
+            None,
+        )
+    }
+
+    /// The real startup sequence, with the foreground switch made explicit.
+    ///
+    /// `Disabled` reproduces the historical order exactly; `Enabled` additionally
+    /// reconciles the persisted foreground facts *after* the generic sweeps and
+    /// *before* the coordinator hydrates, which is the only window where no work is
+    /// admitted yet and no in-memory authority exists to disagree with the rows.
+    pub fn start_with_factory_and_activation(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+    ) -> Result<Self, IpcError> {
+        Self::start_with_factory_and_authority(
+            runtime_dir,
+            database_path,
+            factory,
+            activation,
+            None,
+            None,
+        )
     }
 
     /// Starts the daemon with the guardian's authority already installed.
@@ -101,11 +211,24 @@ impl Daemon {
     /// Installed *before* the listener binds on purpose: an attach that raced the
     /// handshake would be judged by the unmanaged default and admitted with no
     /// authorization at all. `None` keeps the old behaviour exactly.
+    ///
+    /// `activation` and `managed` are independent: the first decides whether this
+    /// daemon reconciles persisted foreground facts at startup, the second is the
+    /// verifier half of the guardian's capability ledger. A managed daemon needs
+    /// both; an embedded one passes `Disabled` and `None`.
     pub fn start_with_factory_and_authority(
         runtime_dir: impl AsRef<Path>,
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
         managed: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
+        // The daemon's end of the guardian's *foreground* authority bridge. A
+        // separate descriptor from the lifeline that carried `managed`: the lifeline
+        // is the daemon's death monitor and capability feed, while this channel
+        // carries the challenge/answer exchange that installs a root. Sharing one
+        // descriptor would make a half-written foreground frame look like a dropped
+        // lifeline, i.e. a live daemon reported dead.
+        bridge: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self, IpcError> {
         raise_file_descriptor_limit();
         let runtime_dir = runtime_dir.as_ref();
@@ -127,7 +250,31 @@ impl Daemon {
         // before we bind our own listener.
         remove_if_exists(&socket_path)?;
         let mut repository = RuntimeRepository::open(database_path.as_ref())?;
-        repository.recover_inflight_tasks()?;
+        if activation.is_enabled() {
+            // Before the generic sweeps, because those are exactly the paths that would
+            // otherwise park a managed container or promote a half-prepared root. Both
+            // operations are idempotent and neither needs an authorization: they only
+            // ever *close* admission or cancel a reservation nothing can resume.
+            let cancelled_pending = repository.cancel_pending_foreground_roots()?;
+            if !cancelled_pending.is_empty() {
+                eprintln!(
+                    "yi-agent: cancelled {} abandoned foreground root reservation(s)",
+                    cancelled_pending.len()
+                );
+            }
+            // A new generation holds no authorization, so every persisted root starts
+            // closed. A `managed` root keeps its identity here and nothing more.
+            repository.close_foreground_admission()?;
+            // A `ready` operation's confirmation token lived in the dead process; the
+            // freeze survives, the token does not, so the host must prepare again.
+            let expired = repository.expire_uncommitted_recovery_operations()?;
+            if expired > 0 {
+                eprintln!(
+                    "yi-agent: {expired} foreground recovery operation(s) need a fresh preview"
+                );
+            }
+        }
+        repository.recover_inflight_tasks_with_activation(activation)?;
         // The sweep above parks interrupted work in `recovery_required`, which
         // is a terminal state, so anything that cannot actually resume would sit
         // there forever and pin its session's supervisor. Reclaim those, plus
@@ -145,7 +292,11 @@ impl Daemon {
             );
         }
         drop(repository);
-        let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
+        let coordinator = Arc::new(RuntimeCoordinator::open_with_activation(
+            database_path.as_ref(),
+            factory,
+            activation,
+        )?);
         if let Some(ledger) = managed {
             coordinator.adopt_managed_authority(ledger);
         }
@@ -170,6 +321,18 @@ impl Daemon {
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        // The bridge thread starts before the socket answers clients. A client that
+        // could reach the daemon but not a bounded authority channel would be told
+        // "managed" by a runtime that cannot install anything yet.
+        let bridge_thread = bridge.map(|fd| {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            // SAFETY: the descriptor came from the guardian's inherited handle, which
+            // proved it open; this is the only conversion and it takes ownership.
+            let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd.into_raw_fd()) };
+            let coordinator = Arc::clone(&coordinator);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || serve_authority_bridge(stream, coordinator, stop))
+        });
         let thread_stop = Arc::clone(&stop);
         let daemon_coordinator = Arc::clone(&coordinator);
         let confirmations = Arc::new(ConfirmationStore::default());
@@ -298,6 +461,7 @@ impl Daemon {
             stop,
             coordinator: daemon_coordinator,
             listener: Some(listener),
+            bridge_thread,
             reclaimed_orphans,
             _instance_lock: instance_lock,
         })
@@ -305,6 +469,17 @@ impl Daemon {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The coordinator this daemon serves.
+    ///
+    /// Test hook: the foreground lifecycle tests drive a real daemon over its socket
+    /// and then assert on coordinator state (which children exist, which are
+    /// attributable to an owner). Reading it from a projection instead would let the
+    /// two disagree, which is the failure class this work is about.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn coordinator_for_test(&self) -> &Arc<RuntimeCoordinator> {
+        &self.coordinator
     }
 
     /// 每分钟的周期维护。抽成方法是为了让测试能驱动**线程每分会调用的同一条
@@ -379,6 +554,12 @@ impl Daemon {
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
+        }
+        // After the listener, not before: a client mid-request may still need an
+        // install to land, and tearing the bridge down first would turn that request
+        // into a timeout it does not deserve.
+        if let Some(bridge) = self.bridge_thread.take() {
+            let _ = bridge.join();
         }
         Ok(())
     }
@@ -1147,6 +1328,81 @@ pub(crate) fn respond(
             // Running it on a detached thread looks harmless but is unbounded
             Ok(IpcResponse::ApplicationRootDetached)
         }
+        IpcRequest::BindApplicationRootDriver {
+            authorization,
+            operation_id,
+        } => {
+            match coordinator.bind_foreground_driver(&authorization, &operation_id) {
+                Ok(binding) => Ok(IpcResponse::ForegroundDriverBound { binding }),
+                // A foreground refusal is a policy answer with a code the client
+                // dispatches on, so it must not be flattened into `invalid_state`.
+                Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                    IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+                ),
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::SetApplicationRootActivity {
+            driver_capability,
+            update,
+        } => match coordinator.set_foreground_activity(&driver_capability, &update) {
+            Ok(snapshot) => Ok(IpcResponse::ForegroundActivity { snapshot }),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
+        IpcRequest::GetApplicationRootActivity {
+            authorization,
+            root,
+        } => match coordinator.get_foreground_activity(&authorization, &root) {
+            Ok(Some(snapshot)) => Ok(IpcResponse::ForegroundActivity { snapshot }),
+            Ok(None) => Ok(IpcResponse::ForegroundActivityAbsent),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
+        IpcRequest::PrepareApplicationRootRecovery {
+            authorization,
+            request,
+        } => match coordinator.prepare_foreground_recovery(&authorization, &request) {
+            Ok(status) => Ok(IpcResponse::ForegroundRecovery { status }),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
+        IpcRequest::RecoverApplicationRoot {
+            authorization,
+            request,
+            confirmation_token,
+        } => {
+            match coordinator.recover_foreground_root(&authorization, &request, &confirmation_token)
+            {
+                Ok(result) => Ok(IpcResponse::ForegroundRecovery {
+                    status: yi_agent_lifecycle::foreground::RecoveryOperationStatus::Committed(
+                        result,
+                    ),
+                }),
+                Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                    IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+                ),
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::GetApplicationRootRecovery {
+            authorization,
+            root,
+            operation_id,
+        } => match coordinator.foreground_recovery_status(&authorization, &root, &operation_id) {
+            Ok(Some(status)) => Ok(IpcResponse::ForegroundRecovery { status }),
+            Ok(None) => Ok(IpcResponse::ForegroundRecoveryAbsent),
+            Err(RuntimeCoordinatorError::Repository(RepositoryError::Foreground(error))) => Ok(
+                IpcResponse::ForegroundFailure(crate::ipc::foreground_failure(&error)),
+            ),
+            Err(error) => Err(error.into()),
+        },
         IpcRequest::CreateSchedule { cron, objective } => {
             let definition = ScheduleDefinition::new(cron, objective).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))

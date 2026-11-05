@@ -91,6 +91,7 @@ pub fn helper(
         // Fixture helpers are tools, not managed roles: they are authorised by the
         // registry that spawned them, never by an inherited bootstrap.
         bootstrap: None,
+        bridge: None,
     }
 }
 

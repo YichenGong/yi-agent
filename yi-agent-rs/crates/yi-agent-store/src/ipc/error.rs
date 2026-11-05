@@ -214,11 +214,16 @@ pub(crate) fn repository_error_code(error: &crate::repository::RepositoryError) 
         // the caller must report, not an internal defect: mapping it to `Internal`
         // would send it down the "daemon is broken, restart it" path.
         crate::repository::RepositoryError::SchemaIncompatible { .. } => IpcErrorCode::InvalidState,
+        // A foreground rejection is a policy answer, not a daemon fault: the client
+        // must see a stable code it can dispatch on (Task 3 turns the typed error
+        // into a wire `ForegroundFailure`), so it must not fall into `Internal`.
+        crate::repository::RepositoryError::Foreground(_) => IpcErrorCode::InvalidState,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
         | crate::repository::RepositoryError::InvalidAdmissionCursor { .. }
         | crate::repository::RepositoryError::InvalidWatchdogSnapshot { .. }
+        | crate::repository::RepositoryError::InvalidForegroundFact { .. }
         | crate::repository::RepositoryError::UnknownEventKind { .. } => IpcErrorCode::Internal,
     }
 }

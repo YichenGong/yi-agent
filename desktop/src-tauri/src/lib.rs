@@ -1,5 +1,7 @@
 #[cfg(desktop)]
 mod bridge;
+#[cfg(desktop)]
+mod foreground_root;
 // 正式容器与探针共用这一个入口：容器本身始终编译，`probe`/`run` 子模块
 // 由 `plugin-probe` feature 单独门控（见 `plugin_host/mod.rs`）。
 #[cfg(desktop)]
@@ -99,6 +101,10 @@ pub fn run() {
             runtime_lifecycle::runtime_active_operation,
             runtime_lifecycle::runtime_known_scopes,
             runtime_lifecycle::runtime_scope_for_project,
+            foreground_root::foreground_root_recovery_inspect,
+            foreground_root::foreground_root_recovery_prepare,
+            foreground_root::foreground_root_recovery_confirm,
+            foreground_root::foreground_root_recovery_operation,
             plugin_host::host::open_plugin_view,
             plugin_host::host::close_plugin_view,
             plugin_host::host::plugin_committed_activation,

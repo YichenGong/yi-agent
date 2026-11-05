@@ -347,6 +347,8 @@ where
             subagent_rx,
             mcp,
             mcp_workdir,
+            // Resolved from the conversation's own root on the first turn.
+            None,
         ));
 
         Ok(())

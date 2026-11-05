@@ -31,6 +31,7 @@ use helpers::{
 };
 mod application_root;
 mod event;
+pub mod foreground;
 mod mailbox;
 mod permission;
 mod read;
@@ -46,7 +47,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = 18;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -158,6 +159,16 @@ pub enum RepositoryError {
     /// it, keep the file) from "the database is corrupt".
     #[error("schema incompatible: {reason}")]
     SchemaIncompatible { reason: String },
+    /// A structured foreground rejection. Kept as a typed variant rather than a
+    /// flattened string: callers dispatch on [`ForegroundError::code`], and an
+    /// English message cannot be matched on without becoming a parsing problem.
+    #[error("foreground root lifecycle: {0}")]
+    Foreground(#[from] crate::foreground::ForegroundError),
+    /// A foreground fact that cannot be stored as asked (an out-of-range epoch, an
+    /// unknown enum spelling). Separate from `Foreground` because it is an internal
+    /// contract violation, not a client rejection.
+    #[error("foreground state for {root} is invalid: {reason}")]
+    InvalidForegroundFact { root: String, reason: String },
 }
 
 #[derive(Debug, Error)]
@@ -285,7 +296,43 @@ pub struct PersistedAttemptWatchdog {
     pub current_wait: Option<WatchdogResourceWait>,
 }
 
+/// What one watchdog terminal commit actually did.
+///
+/// The distinction is load-bearing: `StaleSnapshot` is "someone else already
+/// decided", `ForegroundContainer` is "this root is not governed by these budgets",
+/// and `ClosedRoot` is "this root is not admissible, so neither settling nor
+/// ignoring it is correct". Collapsing them into a bool would let a caller report
+/// "settled" for work it skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogTerminalOutcome {
+    /// The terminal was written and its audit event appended.
+    Committed { event_id: Option<i64> },
+    /// The attempt is no longer the task's active attempt, or the task is already
+    /// terminal: a later scan is a no-op rather than a second audit event.
+    StaleSnapshot,
+    /// The root is a confirmed foreground container. Its budgets are the host's,
+    /// not this watchdog's, so nothing is written and nothing is kept alive.
+    ForegroundContainer,
+    /// The root declares a foreground role but may not accept business (pending or
+    /// an unrecognised/corrupt classification). The caller must reclaim or diagnose
+    /// it; the watchdog must not manufacture a liveness verdict for it.
+    ClosedRoot { reason: String },
+}
+
+impl WatchdogTerminalOutcome {
+    /// The event id when the terminal was actually committed.
+    pub fn committed_event_id(&self) -> Option<i64> {
+        match self {
+            Self::Committed { event_id } => *event_id,
+            Self::StaleSnapshot | Self::ForegroundContainer | Self::ClosedRoot { .. } => None,
+        }
+    }
+
+    pub fn committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+}
+
 pub struct PersistedWatchdogTask {
     pub session_id: RootSessionId,
     pub task_id: TaskId,
@@ -496,6 +543,72 @@ impl RuntimeRepository {
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         migrate(&connection)?;
         Ok(Self { connection })
+    }
+
+    /// Runs one statement against the fixture database.
+    ///
+    /// Test-only escape hatch: `foreground_class` treats a hand-made contradiction
+    /// as `Corrupt`, and the production writer cannot make one (that is the point of
+    /// the migration writing no classification rows). A test that wants the reader's
+    /// verdict on a corrupt row therefore has to build the row itself.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_statement(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<(), RepositoryError> {
+        self.connection
+            .execute(statement, rusqlite::params![parameter])?;
+        Ok(())
+    }
+
+    /// Runs one query against the fixture database and returns a single number.
+    ///
+    /// Test-only, next to `execute_test_statement` and for the same reason: some
+    /// assertions are about what the writer left behind (how many attempts exist, what
+    /// a settled attempt's terminal says) and reading that back through a projection
+    /// the test is meant to distrust would defeat the purpose.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_scalar(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<i64, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(statement, rusqlite::params![parameter], |row| row.get(0))?)
+    }
+
+    /// Runs one statement against the fixture database with several parameters.
+    ///
+    /// The single-parameter variant covers most fixtures; settling a task *and* its
+    /// attempt in one statement needs more than one value, and splitting it would let
+    /// the two rows disagree between the two writes.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_statement_params(
+        &self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> Result<(), RepositoryError> {
+        let parameters: Vec<&dyn rusqlite::ToSql> = parameters
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect();
+        self.connection.execute(statement, parameters.as_slice())?;
+        Ok(())
+    }
+
+    /// The text twin of `execute_test_scalar`, for one optional column.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn execute_test_scalar_text(
+        &self,
+        statement: &str,
+        parameter: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .connection
+            .query_row(statement, rusqlite::params![parameter], |row| row.get(0))
+            .optional()?)
     }
 
     pub fn schema_version(&self) -> Result<i64, RepositoryError> {
@@ -1170,7 +1283,7 @@ mod extra_roots_tests {
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
-        assert_eq!(LATEST_SCHEMA_VERSION, 16);
+        assert_eq!(LATEST_SCHEMA_VERSION, 18);
     }
 
     /// v16 records who last owned a root and why it ended.
@@ -1180,18 +1293,21 @@ mod extra_roots_tests {
         let path = directory.path().join("runtime.sqlite");
         RuntimeRepository::open(&path).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
-        // Roll back to the v15 shape: drop the v16 table and its version row.
+        // Roll back to the v15 shape. `migrate` gates on `MAX(version)`, so deleting
+        // only the v16 row would leave a higher row behind and v16 would never re-run;
+        // every later version must go too. Written relative to the ceiling so each
+        // future migration does not have to edit this test.
         connection
             .execute_batch(
                 "DROP TABLE IF EXISTS root_owners;
-                 DELETE FROM schema_migrations WHERE version = 16;",
+                 DELETE FROM schema_migrations WHERE version >= 16;",
             )
             .unwrap();
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
         let version = repository.schema_version().unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let connection = rusqlite::Connection::open(&path).unwrap();
         let has_table: bool = connection
             .query_row(
@@ -1201,6 +1317,41 @@ mod extra_roots_tests {
             )
             .unwrap();
         assert!(has_table, "v16 must create root_owners");
+    }
+
+    /// v18 adds the freeze tables, and they survive a reopen.
+    ///
+    /// The point is not "the DDL ran" but "a restarted daemon can still learn what a
+    /// freeze covered": after a crash the in-memory set is gone, and without this the
+    /// only available answer would be "nothing was frozen", which reads as stopped.
+    #[test]
+    fn a_version_seventeen_database_gains_the_freeze_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS foreground_frozen_executions;
+                 DROP TABLE IF EXISTS foreground_freeze;
+                 DELETE FROM schema_migrations WHERE version >= 18;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for table in ["foreground_freeze", "foreground_frozen_executions"] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "v18 must create {table}");
+        }
     }
 
     /// Re-running the v16 step must not fail on the objects it already created.

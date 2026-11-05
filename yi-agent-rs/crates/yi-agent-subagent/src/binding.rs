@@ -87,6 +87,12 @@ struct BindingState {
 pub struct RuntimeBinding {
     state: Mutex<BindingState>,
     repair: Option<RepairPlan>,
+    /// Where this project's runtime lives, when the binding knows.
+    ///
+    /// Separate from `repair` because the two answer different questions: `repair` is
+    /// "can I bring it back", this is "where is it". A fixed binding (the TUI) can know
+    /// the second and must never do the first.
+    runtime_dir: Option<PathBuf>,
     /// Serialises repair so one thread starts the daemon while the others wait
     /// and then adopt its result instead of racing into a second start.
     flight: Mutex<()>,
@@ -132,6 +138,7 @@ impl RuntimeBinding {
                 runtime: Some(initial),
                 generation: 0,
             }),
+            runtime_dir: Some(runtime_dir.clone()),
             repair: Some(RepairPlan {
                 cfg: cfg.clone(),
                 runtime_dir,
@@ -150,6 +157,7 @@ impl RuntimeBinding {
                 runtime: None,
                 generation: 0,
             }),
+            runtime_dir: None,
             repair: None,
             flight: Mutex::new(()),
             last_active: Mutex::new(Instant::now()),
@@ -243,6 +251,70 @@ impl RuntimeBinding {
     /// cached against was replaced and whatever it cached is gone.
     pub fn generation(&self) -> u64 {
         self.lock_state().generation
+    }
+
+    /// The runtime directory whose guardian this binding's daemon belongs to.
+    ///
+    /// `None` for a fixed binding: the TUI and the daemon's own workers were handed
+    /// an already-attached root and never learned where its runtime lives. A caller
+    /// that needs to reach the guardian (to authorize a foreground root, say) must
+    /// treat `None` as "this runtime has no guardian of ours to ask" rather than
+    /// guessing a path from the socket name -- the socket can live in TMPDIR when
+    /// the runtime path is too long for `sun_path`.
+    pub fn runtime_dir(&self) -> Option<PathBuf> {
+        self.runtime_dir.clone()
+    }
+
+    /// A fixed binding that also knows where its runtime lives.
+    ///
+    /// The TUI owns its daemon for the whole session, so it must never repair -- but
+    /// its daemon can still have been started by a guardian, and its conversation then
+    /// has a foreground root to drive. Without the runtime directory the guardian is
+    /// unreachable and a managed deployment would silently fall back to legacy
+    /// semantics.
+    pub fn fixed_in(runtime_dir: PathBuf, handle: RuntimeHandle) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(BindingState {
+                handle,
+                runtime: None,
+                generation: 0,
+            }),
+            runtime_dir: Some(runtime_dir),
+            repair: None,
+            flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// A binding that only knows where its runtime lives.
+    ///
+    /// Test support. The production constructors all need a live attached runtime, and
+    /// an integration test cannot build one (its fields are crate-private), so a test
+    /// that only cares about the guardian path would otherwise have to start a real
+    /// daemon and attach to it -- for a test whose subject is a path lookup.
+    #[cfg(test)]
+    pub fn for_runtime_dir(
+        cfg: yi_agent_runtime::config::RuntimeConfig,
+        runtime_dir: PathBuf,
+        handle: RuntimeHandle,
+    ) -> Arc<Self> {
+        let plan = RepairPlan {
+            cfg,
+            runtime_dir,
+            models_path: PathBuf::new(),
+            bringup: BringUpChoice::default(),
+        };
+        Arc::new(Self {
+            state: Mutex::new(BindingState {
+                handle,
+                runtime: None,
+                generation: 0,
+            }),
+            runtime_dir: Some(plan.runtime_dir.clone()),
+            repair: Some(plan),
+            flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
+        })
     }
 
     /// The project directory this binding was created for. Used to decide

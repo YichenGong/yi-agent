@@ -310,7 +310,7 @@ finish未确认时下一普通聊天可以继续，但委派暂不可用，直�
 **Interfaces:** Produces §1 DTO、`worker_watchdog_applies`、`reduce_activity`、`ForegroundError`。
 Consumes 现有 RootAuthorization 和 serde；不接数据库、不启用能力。
 
-- [ ] **Step 1: 写失败单元测试。** 分类包含 Execution/Pending/Managed/Corrupt 四种。
+- [x] **Step 1: 写失败单元测试。** 分类包含 Execution/Pending/Managed/Corrupt 四种。
   在新模块内建立 `update(seq, turn, phase)` 辅助函数：固定 root/session/attempt/generation、两个 epoch 均为 1，
   仅由参数赋 seq/turn/phase；测试代码：
 
@@ -334,7 +334,7 @@ fn foreground_root_lifecycle_only_execution_uses_worker_watchdog() {
   idle 开始新 turn、matching turn 结束成功；running 开始第二 turn 拒绝；SecretCapability Debug 不含原文。
   Pending/Corrupt 不用 worker watchdog 的前提是它们同时不可接受业务，Task 4 必须证明此不变量。
 
-- [ ] **Step 2: 运行 RED。** 在 `yi-agent-rs/` 执行：
+- [x] **Step 2: 运行 RED。** 在 `yi-agent-rs/` 执行：
 
 ```bash
 cargo test -p yi-agent-lifecycle foreground_root_lifecycle
@@ -343,7 +343,7 @@ cargo test -p yi-agent-store --lib foreground_root_lifecycle
 
   预期新接口未定义或活动/分类断言失败；记录真实失败原因，不接受过滤器 0 tests。
 
-- [ ] **Step 3: 最小实现。** DTO 按 §1 建立；pure reducer 先比 fence、再比序号，再核验 turn 转移：
+- [x] **Step 3: 最小实现。** DTO 按 §1 建立；pure reducer 先比 fence、再比序号，再核验 turn 转移：
 
 ```rust
 pub fn worker_watchdog_applies(class: RootExecutionClass) -> bool {
@@ -361,8 +361,8 @@ pub fn worker_watchdog_applies(class: RootExecutionClass) -> bool {
   同一epoch Unknown不能直接begin新turn；Task 7证明旧执行停止并bind后由服务器初始化Idle。
   时间戳不参与准入；Duplicate/Stale不刷新changed_at。seq/epoch递增均checked_add，溢出拒绝，不能wrap。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 检查每个分支有断言且不读取真实时钟。
-- [ ] **Step 5: 更新模块证据并提交。** 保持总 feature `[ ]`；每次提交都先：
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 检查每个分支有断言且不读取真实时钟。
+- [x] **Step 5: 更新模块证据并提交。** 保持总 feature `[ ]`；每次提交都先：
 
 ```bash
 (cd yi-agent-rs && cargo fmt --all && just ci) &&
@@ -389,7 +389,7 @@ pub fn foreground_recovery_result(&self, root: &TaskId, operation: &str)
 
 `ForegroundError` 纳入 RepositoryError/RuntimeCoordinatorError 的结构化 variant，不只 to_string 丢类型。
 
-- [ ] **Step 1: 写 migration/reopen 失败测试。** 在临时旧 schema DB 建一个 application attachment
+- [x] **Step 1: 写 migration/reopen 失败测试。** 在临时旧 schema DB 建一个 application attachment
   和一个没有 attachment 的 scheduled root；迁移两次、关库重开，断言：
 
 ```rust
@@ -404,14 +404,14 @@ assert!(repo.foreground_recovery_result(&application, "not-created")?.is_none())
   已声明 pending/managed 的 root，legacy与后台执行保持基线行为；child 的原恢复行为保持。
   使用 Task 2 repository 测试 API 建立 managed 身份行只验证迁移/hydration，不宣称它已通过 Task 3 的授权。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-store --lib foreground_root_lifecycle
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 最小 migration 与存储实现。** 在 helpers.rs 的现有迁移链添加实施时下一个版本，更新
+- [x] **Step 3: 最小 migration 与存储实现。** 在 helpers.rs 的现有迁移链添加实施时下一个版本，更新
   LATEST_SCHEMA_VERSION 和 schema compatibility 测试。新增表的逻辑键与唯一性：
 
 ```sql
@@ -457,8 +457,8 @@ CREATE TABLE foreground_stop_evidence (
   startup sweep 仅在启用模式排除 pending/managed root，legacy与后台执行保留原策略；schema preflight 先于迁移。
   不要写 cap/grant/confirmation token 到新表。
 
-- [ ] **Step 4: 重跑 Step 2、现有 startup/schema 测试至 GREEN。** 比较 migration 前后旧 attempt 与 child rows。
-- [ ] **Step 5: fmt、just ci、登记测试并提交。** message：`feat: persist foreground root lifecycle facts`。
+- [x] **Step 4: 重跑 Step 2、现有 startup/schema 测试至 GREEN。** 比较 migration 前后旧 attempt 与 child rows。
+- [x] **Step 5: fmt、just ci、登记测试并提交。** message：`feat: persist foreground root lifecycle facts`。
 
 ## Task 3: 接通 guardian 的可信授权桥与 bootstrap
 
@@ -485,7 +485,7 @@ pub fn apply_authority_message(&self, message: AuthorityMessage)
 认证消息只允许此 reader 构造内部 VerifiedAuthority，不接受公开 JSON 的 verified 标志。
 所有请求沿用 deadline 总预算，不为每一 hop 重置。
 
-- [ ] **Step 1: 写真实 socket 失败测试。** 在 supervisors 新集成文件内启动真实 guardian/control loop 与 daemon listener，
+- [x] **Step 1: 写真实 socket 失败测试。** 在 supervisors 新集成文件内启动真实 guardian/control loop 与 daemon listener，
   采用 `tests/guardian_control.rs::identity_does_not_create_a_runtime` 的 `serve`+std thread+socket readiness 方式。
   `tests/managed_bringup.rs` 的 ScriptedProbe/RecordingLauncher 是模拟对象，不能当作真实授权桥证据。
   夹具用独立服务线程、真实 UnixStream::pair 和临时 Daemon::start_with_factory；进程继承 FD 的生产路径
@@ -525,7 +525,7 @@ fn foreground_root_lifecycle_public_keys_and_lease_only_cannot_authorize() {
   helper 应区分 Transport/Protocol 错误并让测试失败。夹具创建一个 scope、两个 business owner
   和一个 LeaseOnly，用现有 control request 注册；仅查询 Identity 不能增加租约计数。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-supervisors --features yi-agent-store/foreground-test-support --test foreground_root_lifecycle
@@ -533,7 +533,7 @@ cargo test -p yi-agent-lifecycle --test control_codec
 cargo test -p yi-agent-lifecycle --test control_client
 ```
 
-- [ ] **Step 3: 实现 prepare/bind 与私有桥。** 控制协议新增授权请求/响应，不把它注册为工具：
+- [x] **Step 3: 实现 prepare/bind 与私有桥。** 控制协议新增授权请求/响应，不把它注册为工具：
 
 ```rust
 // ControlRequest 新 variant
@@ -562,9 +562,9 @@ RootAuthorized(RootAuthorization)
   本任务负测试必须加入：延迟超过 TTL 的 Install、撤销后的旧 Renew、重复同 seq 不延长截止、
   prepare 返回前 owner 已 release、guardian 等待 daemon 时并行 expiry 仍能关闭准入。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 再跑已有 guardian_control/client_leases；断开真实 bridge，
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 再跑已有 guardian_control/client_leases；断开真实 bridge，
   证明不能仅修改两个模拟表就通过。桥撤销失败必须返回回收未完成，不报告成功。
-- [ ] **Step 5: fmt、just ci、登记 C13/C14 证据并提交。** message：`feat: bridge guardian authority to foreground roots`。
+- [x] **Step 5: fmt、just ci、登记 C13/C14 证据并提交。** message：`feat: bridge guardian authority to foreground roots`。
 
 ## Task 4: 将派发、撤销与提交变成原子准入
 
@@ -601,7 +601,7 @@ feature 只开放 fixture/hook 构造，不自动启用生产 ForegroundActivati
 fixture 运行 coordinator 的真实 spawn/release 代码，不在 helper 重实现准入规则；服务/worker
 Drop 时有界 cancel+join，TempDir 必须比服务线程活得更久。跨进程授权真实性仍由 Task 3/9 证明。
 
-- [ ] **Step 1: 写确定性竞态失败测试。**
+- [x] **Step 1: 写确定性竞态失败测试。**
 
 ```rust
 #[tokio::test]
@@ -635,14 +635,14 @@ async fn foreground_root_lifecycle_release_tracks_committed_pending_start() {
   防止RED阶段把整个测试进程挂住。`wait_owner_admission_closed` 读取真实gate状态watch，不能提前回报关闭。
   加 owner B 活跃不 drain、pending/corrupt root 拒派发、长 WaitAgent 不阻塞 release/status。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_ipc foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 实现短 gate。** 维持锁序 supervisor→commit gate→clients→repository：
+- [x] **Step 3: 实现短 gate。** 维持锁序 supervisor→commit gate→clients→repository：
 
 ```rust
 // 业务编排模板；prepare 不启动 worker、不运行用户命令。
@@ -673,8 +673,8 @@ start_only_if_still_admitted(child).await?;
   注意第三种交错允许 release 前已被准入的 worker 短暂执行；要求是它始终被跟踪且不能在回收完成后运行，
   而不是错误承诺“release 一开始就从未产生过任何执行”。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 每个竞态至少测两种交错，验证不是靠全局串行 WaitAgent。
-- [ ] **Step 5: fmt、just ci、登记 C7 证据并提交。** message：`fix: make foreground root admission atomic`。
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 每个竞态至少测两种交错，验证不是靠全局串行 WaitAgent。
+- [x] **Step 5: fmt、just ci、登记 C7 证据并提交。** message：`fix: make foreground root admission atomic`。
 
 ## Task 5: 隔离 worker watchdog 与前台容器
 
@@ -694,7 +694,7 @@ pub async fn wait_children(&self) -> Vec<TaskId>;
 `advance_watchdog` 用测试注入时钟推进 lease/heartbeat 与 watchdog：owner 存活测试按现有租约机制
 模拟成功 heartbeat，不能把租约期限硬写无限或只推进 watchdog 时间。执行 worker 预算观测使用同一时间轴。
 
-- [ ] **Step 1: 写回归 RED。**
+- [x] **Step 1: 写回归 RED。**
 
 ```rust
 #[tokio::test]
@@ -712,14 +712,14 @@ async fn foreground_root_lifecycle_survives_idle_and_wall_time_without_progress(
   另测 root 等待 child；child 有进展且预算未尽则保活；child/孙任务/无 attachment scheduled root
   无进展仍 stalled/timeout；显式父取消仍级联。旧候选快照在 managed bind 后提交不得落终态。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_ipc foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 实现双层保护。** 候选 SQL 排除已确认 foreground 容器；最终提交在 gate 内用
+- [x] **Step 3: 实现双层保护。** 候选 SQL 排除已确认 foreground 容器；最终提交在 gate 内用
   classification/expected attempt/binding epoch 再判。不能只修改 evaluate_watchdog 为“depth0跳过”。
   managed owner 失效走 revoke/reclaim，不退回 worker watchdog；legacy Execution 保留原判定。
   Pending/Corrupt 永不接受业务，不因没有 watchdog 而持有后台 worker。保留历史 watchdog 行，
@@ -733,8 +733,8 @@ match repository.foreground_class(task)? {
 }
 ```
 
-- [ ] **Step 4: 重跑 Step 2 及现有 scheduler 测试至 GREEN。** 检查 usage/progress 数据无伪造写入。
-- [ ] **Step 5: fmt、just ci、登记 C1/C3/C5/C6 并提交。** message：`fix: exclude managed foreground containers from worker watchdogs`。
+- [x] **Step 4: 重跑 Step 2 及现有 scheduler 测试至 GREEN。** 检查 usage/progress 数据无伪造写入。
+- [x] **Step 5: fmt、just ci、登记 C1/C3/C5/C6 并提交。** message：`fix: exclude managed foreground containers from worker watchdogs`。
 
 ## Task 6: driver epoch 与保序活动同步
 
@@ -760,7 +760,7 @@ pub enum ForegroundClientError { Rejected(ForegroundFailure), Transport(String),
 窄 capability 不暴露给 UI；`ThreadRoot` 的 application 写操作携带当前 fence/driver cap，
 历史 root capability 留作会话归属授权，不能代替当前 driver 的写权限。
 
-- [ ] **Step 1: 写失败测试。** bind 同 operation id 两次返回同 epoch/last seq；同 owner 新 driver
+- [x] **Step 1: 写失败测试。** bind 同 operation id 两次返回同 epoch/last seq；同 owner 新 driver
   未提交停止证明时一律拒绝（此任务不实现接替成功，成功分支放 Task 7）；旧 driver 的更大 seq finish 拒绝；
   matching turn finish 接受；活动不改 objective/TaskStarted。
 
@@ -777,14 +777,14 @@ assert!(driver.finish_turn("turn-1").is_err());
   传输测试在服务器已提交但响应丢失时，以同 seq/operation 重送活动/bind；验证不重放 spawn/message。
   对 ThreadRoot::send_as_root 的 transport-liveness 分支补 SingleShot 负测试，它当前存在可能无条件重发的路径。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_ipc foreground_root_lifecycle
 cargo test -p yi-agent-subagent foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 实现状态持久与客户端。** daemon 签发 driver epoch、last seq；只在证明旧 driver 停止
+- [x] **Step 3: 实现状态持久与客户端。** daemon 签发 driver epoch、last seq；只在证明旧 driver 停止
   后轮换。恢复/重启不依赖客户端从 0 开始猜序号。活动用 reducer + CAS 写单一快照；
   同 seq 异内容拒绝，旧 fence 拒绝，完成消息保留 matching turn id 供判重。
   ForegroundDriver 使用有界串行发送；只合并同 turn 中间 waiting，不跨 begin/finish 合并。
@@ -799,8 +799,8 @@ match retry_policy {
 
   拒绝 stale attempt 不自动恢复终态，不使用字符串匹配 InvalidState 触发 reattach/retry。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 加活动请求失败不续租/取消 child 的断言。
-- [ ] **Step 5: fmt、just ci、登记 C8/C11 并提交。** message：`feat: synchronize foreground driver activity with epoch fencing`。
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 加活动请求失败不续租/取消 child 的断言。
+- [x] **Step 5: fmt、just ci、登记 C8/C11 并提交。** message：`feat: synchronize foreground driver activity with epoch fencing`。
 
 ## Task 7: 前台停止证明、接替与 owner 回收闭环
 
@@ -826,7 +826,7 @@ pub fn verify_foreground_quiescence(&self, fence: &ForegroundFence)
 guardian 维护 driver/前台 turn/工具组的登记，登记绑定 owner/root/attempt/driver epoch；
 采用已有 managed process 身份，禁止 PID-only 证明。冻结后新的前台工具组也不得启动。
 
-- [ ] **Step 1: 写停止证明失败测试。** 用真实受管短命进程与可阻塞 mock worker：
+- [x] **Step 1: 写停止证明失败测试。** 用真实受管短命进程与可阻塞 mock worker：
   发 cancel 但不 join→StopUnproven；worker join 但工具组未停→StopUnproven；前台 root 无 worker
   且 host 已 await turn、工具停止→允许；无 registry 记录→拒绝；owner A release 不杀 B。
 
@@ -848,7 +848,7 @@ fn foreground_root_lifecycle_stop_requires_host_join_and_tool_evidence() {
 
   用 deadline 注入时钟检查总回收窗口不随 child 数量倍增；停止证明不可由公开业务 socket伪造。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-supervisors --features yi-agent-store/foreground-test-support --test foreground_root_lifecycle
@@ -856,7 +856,7 @@ cargo test -p yi-agent-supervisors --test client_reclamation
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 实现冻结与证明。** gate 内关闭 root/driver 写准入、取得封闭执行集合；gate 外
+- [x] **Step 3: 实现冻结与证明。** gate 内关闭 root/driver 写准入、取得封闭执行集合；gate 外
   请求 host cancel+await turn、worker join、工具组终止；可信通道记录证据再核验集合版本。
   同进程内多个 driver 不是多个 OS 进程：一会话停止只 await 对应 driver task 与该 root/attempt/driver epoch 的
   tool groups，不 kill 承载其他会话的整个 app-server。只有 owner级release允许按该owner回收整组进程。
@@ -879,8 +879,8 @@ verify_same_frozen_execution_set(&scope)?;
   driver EOF 只撤销该 driver 写权并显示 Unknown；owner 活跃时不单凭 EOF 取消 child。
   接替 driver 需要本任务证明，桥失效关闭写准入，但不把短 UI/relay EOF 当作生命周期消息。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 加进程退出后 PID 重用/证据身份不匹配拒绝测试；不杀用户真实进程。
-- [ ] **Step 5: fmt、just ci、登记 C7/C15/C16 并提交。** message：`feat: verify foreground execution quiescence before rebinding`。
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 加进程退出后 PID 重用/证据身份不匹配拒绝测试；不杀用户真实进程。
+- [x] **Step 5: fmt、just ci、登记 C7/C15/C16 并提交。** message：`feat: verify foreground execution quiescence before rebinding`。
 
 ## Task 8: 预览确认与 stalled 后继 attempt 事务恢复
 
@@ -903,7 +903,7 @@ pub fn worker_start_count(&self) -> usize;
 
 historical fixture 使用测试专用旧快照导入，不能让生产接口接受“请直接设 stalled”。
 
-- [ ] **Step 1: 写恢复 RED。**
+- [x] **Step 1: 写恢复 RED。**
 
 ```rust
 #[tokio::test]
@@ -929,14 +929,14 @@ async fn foreground_root_lifecycle_recovery_is_idempotent_without_restarting_chi
   缺原 cap、异活跃 owner、旧 generation/attempt、停止未确认、无确认/过期、同 operation 异参数。
   并发两 operation 竞争、响应丢失重送、提交前 rollback、提交后模拟进程重启各有测试。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_ipc foreground_root_lifecycle
 ```
 
-- [ ] **Step 3: 最小实现。** prepare 先鉴权再冻结/停止；返回阻塞实体，无证明不签 token。
+- [x] **Step 3: 最小实现。** prepare 先鉴权再冻结/停止；返回阻塞实体，无证明不签 token。
   token 内存索引绑定 request/fence/impact version/expiry；宿主确认后 recover 在 gate+transaction 中：
 
 ```sql
@@ -958,9 +958,9 @@ cargo test -p yi-agent-store --features foreground-test-support --test runtime_i
   guardian 能继续处理 Identity/Heartbeat/Release；查询已提交结果不因旧attempt/token过期被拒。
   对 prepare/recover/status 返回值的约束以 §1.1 为准，不把短响应超时等同回滚或停止失败。
 
-- [ ] **Step 4: 重跑 Step 2 至 GREEN。** 用实际临时 SQLite 重开验证 successor、旧证据、幂等结果；
+- [x] **Step 4: 重跑 Step 2 至 GREEN。** 用实际临时 SQLite 重开验证 successor、旧证据、幂等结果；
   新 turn bind 后可 spawn，旧 child 保持取消且旧 delivery/report 可读。
-- [ ] **Step 5: fmt、just ci、登记 C9/C10/C11/C16 并提交。** message：`feat: recover stalled foreground roots through confirmed successor attempts`。
+- [x] **Step 5: fmt、just ci、登记 C9/C10/C11/C16 并提交。** message：`feat: recover stalled foreground roots through confirmed successor attempts`。
 
 ## Task 9: 接入 app-server、TUI、headless 的每回合生命周期
 
@@ -969,7 +969,7 @@ app-server/server/driver/{mod.rs,turn_driver.rs}、yi-agent/src/{frontend_lease.
 desktop/src-tauri/src/{runtime_lifecycle.rs,bridge.rs}；Create desktop/src-tauri/src/foreground_root.rs。
 **Interfaces:** Consumes ForegroundDriver 与 host authorize_root。Produces 壳→sidecar 的窄授权、driver 停止/证明宿主通道。
 
-- [ ] **Step 1: 写三端失败测试。** app-server driver 单测放现有 driver 模块内，用 mock provider
+- [x] **Step 1: 写三端失败测试。** app-server driver 单测放现有 driver 模块内，用 mock provider
   按相同路径传普通/“Kanban” thread metadata，断言授权和活动序列完全相同：
 
   新增宿主测试夹具 `async fn run_two_mock_turns(kind: HostEntry) -> HostObservation`，HostEntry 包含
@@ -997,7 +997,7 @@ assert_eq!(kanban.wire_variant_names, ordinary.wire_variant_names);
   和 driver capability，拿不到 ClientGrant；legacy 无能力返回明确 unsupported，不改原预算。
   持续工具事件跨 2701 秒不报告 root progress，也可下一 turn spawn。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 cargo test -p yi-agent-app-server foreground_root_lifecycle
@@ -1008,7 +1008,7 @@ cargo test -p yi-agent-subagent foreground_root_lifecycle
   桌面壳测试在 `desktop/src-tauri/` 运行 `cargo test foreground_root_lifecycle`；
   如 build script 要求 externalBin，按项目说明建立本 worktree 的 sidecar symlink，仅供构建，不能启动正式实例。
 
-- [ ] **Step 3: 最小宿主接入。** bootstrap 探测与 business bind 分离；取得 lease 后 authorize，
+- [x] **Step 3: 最小宿主接入。** bootstrap 探测与 business bind 分离；取得 lease 后 authorize，
   app-server 只经私有 host channel 接收窄授权。首 turn 激活 objective；每 turn 使用共享驱动：
 
 ```rust
@@ -1025,8 +1025,8 @@ return outcome;
   waiting phase 只上报能观测到的状态；看不到权限等待细节可维持 Running。
   UI断连不关闭 driver/owner；线程删除显式 detach；lease release 影响其 owner 的全部 root，不能误用为单会话关闭。
 
-- [ ] **Step 4: 重跑 Step 2 与壳测试至 GREEN。** mock provider 断言工具调用次数，避免 activity 重试引起重复执行。
-- [ ] **Step 5: fmt、just ci、登记 C2/C4/C8/C12/C15 并提交。** message：`feat: wire foreground lifecycle across desktop tui and headless hosts`。
+- [x] **Step 4: 重跑 Step 2 与壳测试至 GREEN。** mock provider 断言工具调用次数，避免 activity 重试引起重复执行。
+- [x] **Step 5: fmt、just ci、登记 C2/C4/C8/C12/C15 并提交。** message：`feat: wire foreground lifecycle across desktop tui and headless hosts`。
 
 ## Task 10: 提供非模型的显式恢复入口
 
@@ -1075,7 +1075,7 @@ inspect只读；用户选择“准备恢复（停止旧执行）”后才prepare
 不逆转已完成的停止。没有旧cap/可用原owner的历史会话明确报authority_missing，不承诺凭名称恢复。
 本API不注册为 `yi-agent run` 内的模型工具。
 
-- [ ] **Step 1: 写入口 RED。** Vitest 渲染恢复面板，初始展示旧 attempt、原因、影响和停止缺口；
+- [x] **Step 1: 写入口 RED。** Vitest 渲染恢复面板，初始展示旧 attempt、原因、影响和停止缺口；
   有缺口不能确认，inspect页取消不启动prepare，prepare后取消最终确认不发recover且保留停止事实，
   连续点击只发一次同operation，响应丢失查询原operation，过期重新prepare，错误不显示成功。
 
@@ -1094,14 +1094,14 @@ inspect只读；用户选择“准备恢复（停止旧执行）”后才prepare
   TUI/桌面取消inspect不停止，取消prepare后的最终确认不创建后继、但保留停止事实；
   壳跨thread/workspace伪造映射拒绝；API不出现在模型 tool registry，不能用 LLM `confirmed=true` 触发。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 ```bash
 (cd desktop && npm test -- src/components/ForegroundRootRecovery.test.tsx)
 (cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent foreground_root_lifecycle)
 ```
 
-- [ ] **Step 3: 实现最小恢复面板与控制命令。** 显示 prepare 的真实影响、阻塞/到期信息，按钮仅在
+- [x] **Step 3: 实现最小恢复面板与控制命令。** 显示 prepare 的真实影响、阻塞/到期信息，按钮仅在
   确认 token 有效且 blocked为空时可点；确认 handler 锁住同 operation，超时先查询结果，不能新建 id
   猜测重试。没有历史 cap 提示 root_recovery_authority_missing，不提供 SQL/重启建议。
 
@@ -1155,8 +1155,8 @@ async function confirmOnce() {
   原始错误不展示/记录以免泄露秘密；机器code按白名单映射原因，不能匹配英文错误自动恢复。
   成功后新 driver bind，下一新 turn 才派发，不重跑失败工具。
 
-- [ ] **Step 4: 重跑 Step 2、桌面 `npm run build`、壳恢复测试至 GREEN。** 不启动/安装任何 app。
-- [ ] **Step 5: fmt、just ci、登记恢复入口证据并提交。** message：`feat: expose confirmed foreground root recovery controls`。
+- [x] **Step 4: 重跑 Step 2、桌面 `npm run build`、壳恢复测试至 GREEN。** 不启动/安装任何 app。
+- [x] **Step 5: fmt、just ci、登记恢复入口证据并提交。** message：`feat: expose confirmed foreground root recovery controls`。
 
 ## Task 11: 全矩阵回归、能力发布与收尾审查
 
@@ -1164,7 +1164,7 @@ async function confirmOnce() {
 以 `FOREGROUND_ROOT_CAPABILITY` 常量统一广告；不手写多处字符串。
 **Interfaces:** Consumes Tasks 1–10 完整闭环；Produces 对外 supported managed 能力和实现验收报告。
 
-- [ ] **Step 1: 补齐矩阵尚缺的 RED。** 对照下表检查有实际测试名称，不把一个 happy path 等同整行：
+- [x] **Step 1: 补齐矩阵尚缺的 RED。** 对照下表检查有实际测试名称，不把一个 happy path 等同整行：
 
 | Spec | 必需任务与测试重点 |
 |---|---|
@@ -1187,7 +1187,7 @@ async function confirmOnce() {
 
   新增缺失用例时先移除对应保护/注入错误，确认断言真的失败；恢复保护后 GREEN。
 
-- [ ] **Step 2: 运行完整定向验收并记录非零命中。** 在 yi-agent-rs/ 顺序执行：
+- [x] **Step 2: 运行完整定向验收并记录非零命中。** 在 yi-agent-rs/ 顺序执行：
 
 ```bash
 cargo test -p yi-agent-store --features foreground-test-support --test runtime_coordinator foreground_root_lifecycle
@@ -1209,7 +1209,7 @@ just ci
   每条新测试过滤命令须列出实际测试名称与数量，0 tests 视作未验收。构建锁排队按项目说明诊断，
   不删除 lock 文件，不杀其他会话的 cargo，不用 workspace 全量无限并行。
 
-- [ ] **Step 3: 完整闭环通过后才启用能力。**
+- [x] **Step 3: 完整闭环通过后才启用能力。**
 
 ```rust
 // 仅 managed 且私有授权桥已建立、schema/业务协议均支持时广告。
@@ -1224,13 +1224,13 @@ if managed && authority_bridge_ready && foreground_schema_supported {
   测试构造注入不自动进入ArtifactIdentity。能力探测失败/旧端继续明确降级；
   回归先探测再发 variant，确认旧 parser 不会导致偷偷重启或假成功。启用后重跑 Step 2。
 
-- [ ] **Step 4: 自检与独立 code review。** 加载 requesting-code-review，审查真实 diff，重点看
+- [x] **Step 4: 自检与独立 code review。** 加载 requesting-code-review，审查真实 diff，重点看
   可伪造授权、锁序、跨进程撤销确认、stop proof、recover CAS、SingleShot重发、秘密泄漏。
   问题逐项修复并重跑相关测试；没有证据的停止/授权不得以“设计上应该安全”放行。
   更新 subagent-runtime feature 为 `[x]` 仅在 C1–C16 全有证据时，README 索引同步；
   若有受环境阻塞项保持 `[ ]`，报告具体未验收项，不虚增完成计数。
 
-- [ ] **Step 5: 提交与受控合并。** 提交前再次 `cargo fmt --all && just ci`，提交 message：
+- [x] **Step 5: 提交与受控合并。** 提交前再次 `cargo fmt --all && just ci`，提交 message：
   `fix: enable verified foreground root lifecycle isolation`。加载 finishing-a-development-branch，
   经用户选择后才合并；如获准，main 上 `git merge --no-ff <implementation-branch>`，
   在合并结果再跑 `just ci`，然后移除已合并 worktree/分支。不部署或修改运行中实例。
@@ -1258,3 +1258,34 @@ if managed && authority_bridge_ready && foreground_schema_supported {
 - 修订回查：同步spec与进度登记；保留11个任务、55个待执行步骤与C1–C16追踪。
   本轮只进行文档检查与临时内存SQLite约束验证；未执行Rust/桌面实现测试，未提交或合并。
   自审未发现的实现问题仍须由RED/GREEN、故障注入和独立代码审查发现，不据此宣称运行时正确。
+
+## 执行结果与偏离（2026-11-04 实施记录）
+
+11 个任务、55 个步骤全部完成，C1–C16 逐条证据登记在
+`docs/project-management/subagent-runtime.md` 的「Task 11 验收矩阵」小节。
+
+**门禁结果**：`just ci` exit 0（`cargo nextest run --all-features --workspace --profile ci`
+5627 passed / 40 skipped，另有 44 passed 的第二 profile）；183 条 `foreground_root_lifecycle`
+用例全部命中；桌面 `vitest` 6 passed、`tsc --noEmit` 与 `npm run build` 通过、
+壳 `cargo test` 236 + 4 + 1 + 8 + 12 + 3 全过。
+
+**必要偏离（计划写错或写不到，不是偷懒）**：
+
+1. **Task 10 桌面命令入参：`scope_key` + 显式 `RecoveryTarget`，而非计划里的 `thread_id`。**
+   桌面壳没有 thread→root 映射，`thread_id` 在壳里无法解析成栅栏；而让壳去猜
+   attempt/generation 正是本设计拒绝的「caller 自造 id」。改为 `scope_key` 定位已开
+   项目，栅栏六个字段全部取自 daemon 已持久化的事实。
+2. **Task 10 TUI 确认 token 由 driver 内存持有，不用环境变量。**
+   初版按计划外的折中把 token 放 `YI_AGENT_RECOVERY_TOKEN`，实测发现无解：
+   `prepare` 拿到的 token 没有任何路径交给用户，`confirm` 永远拿不到 token，
+   恢复只能准备、不能完成。改为 `ForegroundHost` 在 prepare 成功后按 operation id
+   把 token 留在内存（复用同一 lease），`confirm` 只带 operation id。这比环境变量
+   更严：token 不进 argv、shell 历史、`ps`、转录；`ConfirmedRecovery` 的 `Debug` 脱敏；
+   未 prepare 就 confirm 返回 `ConfirmationRequired`，不伪造 token。
+3. **实施中修复三处基线缺陷**（在 main 上已存在，与本 feature 无关但会挡住验收）：
+   `desktop/src-tauri/Cargo.lock` 无法解析（合并丢了一个 `]]`，该 crate 任何 cargo
+   命令都跑不起来）；`build.rs` 的 `APP_COMMANDS` 漏登记 13 条 `invoke_handler` 已注册
+   命令（含 11 条 `runtime_*` 与 2 条 `plugin_*`），导致不生成 ACL 权限、窗口首次调用
+   即 `not allowed by ACL`；`RuntimeCoordinator::repository_for_test()` 用 `try_lock()`
+   把后台线程的正常争用变成偶发 `None`，全 workspace 高并发下会随机 panic，改为
+   有界等待（10s），真实同线程重入仍会明确报错而非挂起。
