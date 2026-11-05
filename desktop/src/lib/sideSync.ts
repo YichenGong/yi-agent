@@ -13,12 +13,16 @@
  *    被回答两次。
  */
 
+import { formatError } from "./errorMessage";
 import type { Item, SideReadItemsResult, SideTurnStartResult } from "./protocol";
 import type {
+  SideDraftSnapshot,
   SideHostBinding,
   SideHostKey,
   SideNotification,
   SideConversationStore,
+  SideSubmitReceipt,
+  SideTarget,
 } from "./sideConversation";
 
 /** 通知缓存上限（spec §8.2：256 帧 / 2 MiB）。 */
@@ -35,6 +39,9 @@ export const SIDE_TAIL_POLL_MS = 5000;
 
 /** 单页请求上限：服务端按字节切页，但一次抓太多页会长时间占住内存。 */
 export const SIDE_MAX_PAGES = 64;
+
+/** 控制器已经拆掉时的拒绝原因。不写 store，只回给调用方。 */
+const SIDE_DISPOSED_MESSAGE = "旁问连接已关闭";
 
 export interface SideSyncDeps {
   binding: SideHostBinding;
@@ -289,54 +296,97 @@ export class SideSyncController {
    * 只在已同步态放行：未同步时提交会与一个还没装上的基线打架，用户看到自己的
    * 问题消失（因为基线把它覆盖了）。
    *
+   * 返回值是**收据**而不是 boolean：成功、明确拒绝、应答丢失三种结果的后续动作
+   * 完全不同（清稿 / 还稿并报错 / 保留 pending 对账），压成 true/false 就会丢掉
+   * 用户正在写的东西（spec §5.2）。
+   *
    * 失败时把 pending 置为 `uncertain` 并**保留同一个 requestId**：重连后先用
    * `accepted_requests` 对账，或用同一个 id 重试。绝不生成新 id。
    */
-  async submit(sideId: string, text: string, clientRequestId: string): Promise<void> {
-    if (this.disposed) throw new SideSyncError("disposed", "side controller disposed");
+  async submit(
+    sideId: string,
+    text: string,
+    clientRequestId: string,
+  ): Promise<SideSubmitReceipt> {
+    // disposed 一律不写 store：控制器已经被拆掉，此时写进去的是另一个视图世界
+    // 的状态，调用方也没人接收 onChange。
+    if (this.disposed) return { kind: "rejected", requestId: clientRequestId, message: SIDE_DISPOSED_MESSAGE };
     const view = this.store.read(this.binding.key, sideId);
-    if (!view) throw new SideSyncError("side_not_found", "unknown side");
-    if (view.sync !== "synced") {
-      throw new SideSyncError("unsynced", "side view is not synced yet");
+    if (!view) {
+      return { kind: "rejected", requestId: clientRequestId, message: "这条旁问已经不存在了" };
     }
-    const snapshot = {
-      sideId,
-      generation: view.generation,
-      requestId: clientRequestId,
+    if (view.sync !== "synced") {
+      // 请求还没发出去，所以不是「不确定」：调用方可以放心保留原稿并提示重试。
+      return {
+        kind: "rejected",
+        requestId: clientRequestId,
+        message: "旁问还没同步完成，暂时不能发送",
+      };
+    }
+    // 目标与版本都在**发请求之前**抓齐：回包时再读 store 可能已经换了一代，
+    // 或者用户已经改了草稿。
+    const snapshot: SideDraftSnapshot & { requestId: string } = {
+      target: {
+        kind: "side",
+        hostKey: this.binding.key,
+        parentId: view.parentId,
+        sideId,
+        generation: view.generation,
+      },
       text,
+      draftVersion: view.draftVersion,
+      requestId: clientRequestId,
     };
+    if (view.draft.trim() === "" && text !== "") {
+      // 自动首问走这里：问题正文不是从输入框来的，得先落进草稿，回包才知道要
+      // 清掉的是哪一版。**草稿非空时不覆盖**——那是用户自己在写的东西，一句
+      // 后台发起的首问没有资格把它顶掉（spec §5.2）。
+      this.store.installQuestion(
+        this.binding.key,
+        sideId,
+        text,
+        snapshot.draftVersion + 1,
+      );
+      snapshot.draftVersion += 1;
+    }
     this.store.setPending(this.binding.key, sideId, {
       requestId: clientRequestId,
       text,
-      draftVersion: 0,
+      draftVersion: snapshot.draftVersion,
       state: "submitting",
     });
     this.onChange?.();
     try {
       await this.binding.client.request<SideTurnStartResult>("side/turnStart", {
-        sideId: snapshot.sideId,
+        sideId: snapshot.target.sideId,
         text: snapshot.text,
         clientRequestId: snapshot.requestId,
       });
-      this.clearPendingIfMatches(sideId, snapshot.requestId, snapshot.text);
+      this.clearSubmittedIfCurrent(sideId, snapshot);
+      return { kind: "accepted", requestId: snapshot.requestId };
     } catch (error) {
       if (!isNetworkFailure(error)) {
-        // 服务端明确拒绝：这不是「不确定」。把问题正文留在草稿里，让用户能看到
-        // 并重试；不保留 pending，否则会显示一个永远转圈的「发送中」。
+        // 服务端明确拒绝：这不是「不确定」。不保留 pending，否则会显示一个永远
+        // 转圈的「发送中」。
         this.store.setPending(this.binding.key, sideId, null);
-        this.restoreDraft(sideId, snapshot.text);
+        const message = formatError(error);
+        this.rejectSubmission(sideId, snapshot, message);
         this.onChange?.();
-        throw error;
+        return { kind: "rejected", requestId: snapshot.requestId, message };
       }
       // 结果不确定：保留同 id/text，标记待确认。
       const current = this.store.read(this.binding.key, sideId);
-      if (current?.pending?.requestId === snapshot.requestId) {
+      if (
+        current?.generation === snapshot.target.generation &&
+        current.pending?.requestId === snapshot.requestId
+      ) {
         this.store.setPending(this.binding.key, sideId, {
           ...current.pending,
           state: "uncertain",
         });
       }
       this.onChange?.();
+      return { kind: "uncertain", requestId: snapshot.requestId };
     }
   }
 
@@ -345,22 +395,39 @@ export class SideSyncController {
    *
    * 用 `accepted_requests` 判定：服务端受理过就会在那里有 `requestId -> turnId`。
    * 确认了就清 pending；没有则用**同一个** id 重试一次。
+   *
+   * 对账确认与正常成功走同一个清稿函数：条件完全相同（requestId、generation、
+   * text、draftVersion 全匹配），否则「断线后回来」会清掉一条正常路径不敢清的稿。
    */
   async confirmPending(parentId: string, sideId: string): Promise<void> {
     const view = this.store.read(this.binding.key, sideId);
     const pending = view?.pending;
-    if (!pending || pending.state !== "uncertain") return;
+    if (!view || !pending || pending.state !== "uncertain") return;
+    const target: SideTarget = {
+      kind: "side",
+      hostKey: this.binding.key,
+      parentId,
+      sideId,
+      generation: view.generation,
+    };
     await this.reconcile(parentId);
     const fresh = this.store.read(this.binding.key, sideId);
-    if (fresh?.closed) return;
+    // 对账期间换了一代：这一份 pending 属于上一代，不能拿来清新旁问。
+    if (!fresh || fresh.closed || fresh.generation !== target.generation) return;
     const accepted = await this.acceptedRequestIds(sideId);
     if (accepted) {
       if (accepted.has(pending.requestId)) {
-        this.store.setPending(this.binding.key, sideId, null);
-        this.onChange?.();
+        this.clearSubmittedIfCurrent(sideId, {
+          target,
+          text: pending.text,
+          draftVersion: pending.draftVersion,
+          requestId: pending.requestId,
+        });
         return;
       }
     }
+    // `accepted_requests` 读失败（null）时**不**生成新 id：这一轮只是「还不知道」，
+    // 拿同一个 id 再发一次是安全的（服务端按 requestId 幂等），换新 id 不是。
     await this.submit(sideId, pending.text, pending.requestId);
   }
 
@@ -570,23 +637,59 @@ export class SideSyncController {
     }
   }
 
-  private clearPendingIfMatches(sideId: string, requestId: string, text: string): void {
-    const view = this.store.read(this.binding.key, sideId);
-    if (!view?.pending) return;
-    if (view.pending.requestId !== requestId) return;
-    // 只清提交快照仍成立的那份草稿：用户在等待期间又编辑过，就不能拿旧文本
-    // 覆盖新编辑。
+  /**
+   * 成功与对账确认共用的清稿。
+   *
+   * 四个条件缺一不可：换代（generation）、这条提交仍是当前 pending
+   * （requestId）、用户没改过文字（text）、也没改回来过（draftVersion）。
+   * 少任何一条，一次迟到回包就会清掉用户此刻正在写的内容。
+   */
+  private clearSubmittedIfCurrent(
+    sideId: string,
+    snapshot: SideDraftSnapshot & { requestId: string },
+  ): void {
+    const current = this.store.read(this.binding.key, sideId);
+    if (current === undefined) return;
+    const matches =
+      current.generation === snapshot.target.generation &&
+      current.pending?.requestId === snapshot.requestId;
+    if (!matches) return;
     this.store.setPending(this.binding.key, sideId, null);
-    if (view.draft === text) this.store.setDraft(this.binding.key, sideId, "");
+    if (
+      current.draftVersion === snapshot.draftVersion &&
+      current.draft === snapshot.text
+    ) {
+      this.store.setDraft(this.binding.key, sideId, "");
+    }
     this.onChange?.();
   }
 
-  private restoreDraft(sideId: string, text: string): void {
-    const view = this.store.read(this.binding.key, sideId);
-    if (!view) return;
-    // 明确拒绝后把问题正文还给用户。若用户在等待期间已经写了新内容，保留新的
-    // 那份——丢一次提问远好于丢用户正在写的东西。
-    if (view.draft.length === 0) this.store.setDraft(this.binding.key, sideId, text);
+  /**
+   * 明确拒绝后的还稿。
+   *
+   * 原文还在、且用户没写过新东西 → 直接还回输入框，他改一改就能重发。
+   * 用户已经写了新稿 → 保留新稿，把这次提交记成 `rejectedSubmission`；悄悄丢掉
+   * 会让用户以为那句已经发出去了（spec §5.2）。
+   */
+  private rejectSubmission(
+    sideId: string,
+    snapshot: SideDraftSnapshot & { requestId: string },
+    message: string,
+  ): void {
+    const current = this.store.read(this.binding.key, sideId);
+    if (!current || current.generation !== snapshot.target.generation) return;
+    const untouched =
+      current.draftVersion === snapshot.draftVersion &&
+      current.draft === snapshot.text;
+    if (untouched) {
+      this.store.setDraft(this.binding.key, sideId, snapshot.text);
+      return;
+    }
+    current.rejectedSubmission = {
+      requestId: snapshot.requestId,
+      text: snapshot.text,
+      message,
+    };
   }
 }
 

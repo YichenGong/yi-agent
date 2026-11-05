@@ -490,26 +490,127 @@ const POPUP_MAX_ROWS: usize = 10;
 /// smaller area, which is why the draw path re-clamps rather than trusting it.
 const MIN_NON_POPUP_ROWS: usize = 6;
 
+/// One completion candidate.
+///
+/// A `Completion` is not a `SlashCommand`: the side view's popup offers
+/// `/back` and `/side-close`, which are routed by `classify_conversation_input`
+/// and have no `SlashCommand` variant. Keeping the popup on this small type is
+/// what lets the **candidate list and the executor** be the same list — the
+/// spec's "不能显示候选却由另一套输入分支忽略" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completion {
+    name: &'static str,
+    description: &'static str,
+}
+
+impl Completion {
+    pub const fn new(name: &'static str, description: &'static str) -> Self {
+        Self { name, description }
+    }
+
+    /// Command name **without** the leading slash.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// The text Tab writes into the visible input buffer.
+    pub fn insertion(&self) -> String {
+        format!("/{}", self.name)
+    }
+}
+
+/// Which view a [`CommandPopup`] belongs to.
+///
+/// The two views offer different commands because they execute different
+/// handlers: the side view is read-only and can only navigate, while the main
+/// view drives the parent session. Sharing one candidate list would mean the
+/// popup offers commands the executor must then refuse — exactly the
+/// "candidates the input branch ignores" failure the spec forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupScope {
+    Main,
+    Side,
+}
+
+impl PopupScope {
+    /// Completions offered in this view, in display order.
+    pub fn completions(self) -> &'static [Completion] {
+        match self {
+            Self::Main => to_completions(SlashCommand::completable()),
+            Self::Side => SIDE_COMPLETIONS,
+        }
+    }
+}
+
+fn to_completions(commands: &'static [SlashCommand]) -> &'static [Completion] {
+    // Built once per catalog: the popup filters on every keystroke.
+    static MAIN: std::sync::OnceLock<Vec<Completion>> = std::sync::OnceLock::new();
+    MAIN.get_or_init(|| {
+        commands
+            .iter()
+            .map(|cmd| Completion::new(cmd.name(), cmd.description()))
+            .collect()
+    })
+}
+
+/// Side-view completions.
+///
+/// Exactly the commands `classify_conversation_input` accepts inside a side:
+/// navigation (`/back`, `/side-close`), the three read-only local commands, and
+/// `/quit` (application exit stays reachable from every view — spec §6.2).
+/// `/btw` and `/side` are deliberately absent: a side cannot nest.
+pub const SIDE_COMPLETIONS: &[Completion] = &[
+    Completion::new("back", "返回主会话，保留旁问及其在途轮次"),
+    Completion::new("side-close", "关闭当前旁问（取消在途轮次）"),
+    Completion::new("help", "旁支里可用的命令与只读工具"),
+    Completion::new("config", "旁支继承的固定配置（只读）"),
+    Completion::new("cost", "只统计旁支自身的用量"),
+    Completion::new("quit", "退出程序"),
+    // `/q` 与 `/quit` 等价（既有主视图按键分支 `matches!(name, "quit" | "q")`）：
+    // 候选里不列它，用户就只能靠记忆，而输入 `/q` 又被当作普通问题发给模型。
+    Completion::new("q", "退出程序（/quit 的简写）"),
+];
+
 /// State for the slash command popup shown above the input area.
 pub struct CommandPopup {
-    filtered: Vec<SlashCommand>,
+    filtered: Vec<Completion>,
     selected: usize,
     /// Index of the first command drawn in the visible window. The filtered
     /// list can be taller than the popup, so this is what keeps the highlighted
     /// row on screen.
     offset: usize,
     last_filter: String,
+    /// The view this popup belongs to; filters candidates and is checked by the
+    /// Enter handler before executing anything.
+    scope: PopupScope,
 }
 
 impl CommandPopup {
     /// Create a new popup with every completable command visible.
     pub fn new() -> Self {
+        Self::with_scope(PopupScope::Main)
+    }
+
+    /// Popup for a given view. The scope decides **which commands exist** in
+    /// this view, so the visible candidates can never disagree with what the
+    /// Enter handler is willing to execute.
+    pub fn with_scope(scope: PopupScope) -> Self {
         Self {
-            filtered: SlashCommand::completable().to_vec(),
+            filtered: scope.completions().to_vec(),
             selected: 0,
             offset: 0,
             last_filter: String::new(),
+            scope,
         }
+    }
+
+    /// Which view this popup was built for.
+    pub fn scope(&self) -> PopupScope {
+        self.scope
     }
 
     /// Filter the command list by a prefix string (the text after `/`).
@@ -521,9 +622,11 @@ impl CommandPopup {
         }
         self.last_filter = text.to_string();
         if text.is_empty() {
-            self.filtered = SlashCommand::completable().to_vec();
+            self.filtered = self.scope.completions().to_vec();
         } else {
-            self.filtered = SlashCommand::completable()
+            self.filtered = self
+                .scope
+                .completions()
                 .iter()
                 .copied()
                 .filter(|cmd| cmd.name().starts_with(text))
@@ -536,7 +639,7 @@ impl CommandPopup {
     /// The filtered list of commands. Production draws through [`Self::visible`];
     /// this stays for assertions about the underlying list.
     #[cfg(test)]
-    pub fn filtered(&self) -> &[SlashCommand] {
+    pub fn filtered(&self) -> &[Completion] {
         &self.filtered
     }
 
@@ -562,8 +665,8 @@ impl CommandPopup {
         self.scroll_to_selection();
     }
 
-    /// The currently selected command, if any.
-    pub fn selected(&self) -> Option<SlashCommand> {
+    /// The currently selected completion, if any.
+    pub fn selected(&self) -> Option<Completion> {
         self.filtered.get(self.selected).copied()
     }
 
@@ -584,7 +687,7 @@ impl CommandPopup {
 
     /// The commands to draw, at most `height` of them: the effective window,
     /// which always contains the selection (unless the list is empty).
-    pub fn visible(&self, height: usize) -> &[SlashCommand] {
+    pub fn visible(&self, height: usize) -> &[Completion] {
         let start = self.clamped_start(self.effective_window(height));
         let end = (start + height).min(self.filtered.len());
         &self.filtered[start..end]
@@ -850,9 +953,9 @@ mod tests {
     fn selected_returns_correct_command() {
         let mut popup = CommandPopup::new();
         popup.move_down();
-        assert_eq!(popup.selected(), Some(SlashCommand::Clear));
+        assert_eq!(popup.selected().map(|c| c.name()), Some("clear"));
         popup.move_down();
-        assert_eq!(popup.selected(), Some(SlashCommand::Model));
+        assert_eq!(popup.selected().map(|c| c.name()), Some("model"));
     }
 
     #[test]

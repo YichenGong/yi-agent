@@ -42,6 +42,7 @@ export function StatusBar({
   subagentCount,
   fallbackUsage,
   usageId,
+  conversationLabel,
   actions,
   onRepair,
 }: {
@@ -70,6 +71,17 @@ export function StatusBar({
    * 不该从上一个会话的数字滚动过来。
    */
   usageId?: string | null;
+  /**
+   * 当前会话的标识（`/side · 只读 · /back 返回`），**替换**连接状态的文本位。
+   *
+   * 旁支没有自己的标题栏（spec §4.1），所以「你现在在哪条会话里」只能借这里
+   * 表达：输入框的 placeholder 会被用户正在写的字遮住，状态栏不会被遮。
+   * 圆点的颜色仍来自 `status`——它是连接状态，与会话身份是两件事。
+   *
+   * 断线时**不**替换：此刻「连接中断」比「你在旁支」更重要，且旁支的 `/back`
+   * 提示不能顶掉唯一的故障说明。
+   */
+  conversationLabel?: string | null;
   /**
    * 追加在右端的控件（用量之后）。给「重新打开某个可收起面板」这类常驻入口用：
    * 入口若跟着面板一起收起，就再也没有东西能把它打开。
@@ -124,7 +136,9 @@ export function StatusBar({
         原值，两边各取所需。
       */}
       <span className="text-fg-muted" title={status}>
-        {connectionStatusLabel(status)}
+        {conversationLabel !== undefined && conversationLabel !== null && connected
+          ? conversationLabel
+          : connectionStatusLabel(status)}
       </span>
       {cwd && <span className="truncate font-mono">{cwd}</span>}
       <div className="ml-auto flex items-center gap-3">

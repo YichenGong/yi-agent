@@ -225,4 +225,61 @@ describe("StatusBar", () => {
     expect(classes).toContain("bottom-full");
     expect(classes).not.toContain("top-full");
   });
+
+  /*
+   * 旁支没有自己的标题栏（spec §4.1）：当前会话只能借状态栏这个已有文本位
+   * 表达。三件事必须同时成立才算接对——替换的是**连接状态那句**、圆点仍是
+   * 连接状态、父的用量不叠进来。
+   */
+  it("replaces the status text with the conversation label while connected", () => {
+    const { container } = render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: null,
+        fallbackUsage: null,
+        conversationLabel: "/side · 只读 · /back 返回",
+      }),
+    );
+    expect(screen.getByText("/side · 只读 · /back 返回")).toBeTruthy();
+    expect(screen.queryByText("已连接")).toBeNull();
+    // 圆点是**连接**状态，不因为换了会话身份就变色。
+    const dot = container.querySelector("span.rounded-full");
+    expect(dot?.className).toContain("bg-emerald-500");
+  });
+
+  it("keeps the connection status when the label is absent or disconnected", () => {
+    const { rerender } = render(
+      bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }),
+    );
+    expect(screen.getByText("已连接")).toBeTruthy();
+
+    // 断线时「连接中断」比「你在哪条会话」更重要，标签不得顶掉唯一的故障说明。
+    rerender(
+      bar({
+        cwd: "/w",
+        status: "exited",
+        totals: null,
+        fallbackUsage: null,
+        conversationLabel: "/side · 只读 · /back 返回",
+      }),
+    );
+    expect(screen.queryByText("/side · 只读 · /back 返回")).toBeNull();
+    expect(screen.getByText("已断开，正在重连…")).toBeTruthy();
+  });
+
+  it("never mixes the parent totals into a side conversation's usage", () => {
+    // 同一时刻只渲染一组数字。旁支的用量由调用方按旁支自己的 map 传进来，
+    // 这里断言的是「标签不会顺手把父的数字也带过来」。
+    render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: null,
+        fallbackUsage: null,
+        conversationLabel: "/side · 只读 · /back 返回",
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "Token usage details" })).toBeNull();
+  });
 });

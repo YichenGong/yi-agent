@@ -145,6 +145,41 @@ export type ConversationKey =
       generation: number;
     };
 
+/** 一条旁支的**完整**身份。所有跨 `await` 的动作都只认它，不认「当前视图」。 */
+export type SideTarget = Extract<ConversationKey, { kind: "side" }>;
+
+/**
+ * 提交时捕获的草稿快照。
+ *
+ * `draftVersion` 是这里唯一能区分「同一段文字」与「用户改走又改回来」的东西：
+ * 只比正文的话，两次编辑回到原文看起来就是「没动过」，于是回包会把用户当下的
+ * 输入清掉（spec §5.2「身份和草稿修订均匹配才清稿」）。
+ */
+export interface SideDraftSnapshot {
+  target: SideTarget;
+  text: string;
+  draftVersion: number;
+}
+
+/**
+ * 一次提交的结果。
+ *
+ * 三种状态不能压成一个 boolean：`accepted` 可以清稿；`rejected` 要把原文还给
+ * 用户并给出原因；`uncertain`（应答在路上丢了）既不能清稿也不能当失败重发——
+ * 服务端可能已经受理，重发会让同一个问题被回答两次（spec §5.2、§8.3）。
+ */
+export type SideSubmitReceipt =
+  | { kind: "accepted"; requestId: string }
+  | { kind: "uncertain"; requestId: string }
+  | { kind: "rejected"; requestId: string; message: string };
+
+/** 一次被明确拒绝、且当时已有更新草稿，因而无处「还回」的提交。 */
+export interface RejectedSideSubmission {
+  requestId: string;
+  text: string;
+  message: string;
+}
+
 /** 旁支的同步态。`unsynced` 禁发；`synced` 才允许 `side/turnStart`。 */
 export type SideSyncState = "unsynced" | "syncing" | "synced";
 
@@ -174,6 +209,20 @@ export interface SideView {
   /** 线上 `Item` 形状（wire item），不是 runtime 内部的 `SideItem`。 */
   items: Item[];
   draft: string;
+  /**
+   * 草稿的修订号。只在文字真的变化时递增，且**基线与帧**都不得重置它。
+   *
+   * 基线替换的是正文（`items`/`usage`），不是用户此刻正在写的东西；把它一起
+   * 重置就等于每次对账后所有在途提交的「草稿未变」判定失效。
+   */
+  draftVersion: number;
+  /**
+   * 明确被拒、又因为用户已经写了新稿而无处归还的那次提交。
+   *
+   * 只在内存里留一条，用来告诉用户「你刚才那句没发出去」。绝不悄悄丢掉——那是
+   * spec §5.2 里「失败提交保留为独立临时待处理记录」的落点。
+   */
+  rejectedSubmission: RejectedSideSubmission | null;
   pending: PendingSideSubmission | null;
   usage: SideUsageWire;
   effectiveConfig: SideEffectiveConfigWire | null;
@@ -314,17 +363,57 @@ export class SideConversationStore {
   }
 
   /** 设置同步态（禁发/对账中/已同步）。 */
+  /**
+   * 记住这条旁支的阅读位置（最后可见 item id）。
+   *
+   * 只存在内存里：旁支没有持久化入口（见 `SideView` 的注释），删掉重建就该从头
+   * 开始。它是**浏览状态**，不该触发任何重渲染——滚动每帧都会写一次。
+   */
+  setAnchor(hostKey: SideHostKey, sideId: string, anchor: string | null): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.anchor = anchor;
+  }
+
   setSync(hostKey: SideHostKey, sideId: string, sync: SideSyncState): void {
     const view = this.views.get(hostKey)?.get(sideId);
     if (!view) return;
     view.sync = sync;
   }
 
-  /** 写某条旁支的草稿。草稿按旁支隔离，绝不与父会话共用。 */
+  /**
+   * 写某条旁支的草稿。草稿按旁支隔离，绝不与父会话共用。
+   *
+   * 版本只在**文字真的变了**时递增：同一个字重复写入（受控输入框在无关
+   * 重渲染时就会这样做）不该让一个已经在途的提交失去「草稿未被改写」的资格。
+   * 反过来，改走再改回同一段文字必须算两次变化——否则回包会清掉用户刚打好的
+   * 内容（spec §5.2）。
+   */
   setDraft(hostKey: SideHostKey, sideId: string, draft: string): void {
     const view = this.views.get(hostKey)?.get(sideId);
     if (!view) return;
+    if (view.draft === draft) return;
     view.draft = draft;
+    view.draftVersion += 1;
+  }
+
+  /**
+   * 直接安装草稿正文并把版本推到**至少** `draftVersion`。
+   *
+   * 只给「自动首问」用：那条问题不是用户敲进来的，但它必须带上一个确定的版本，
+   * 好让回包能判断「用户在这期间有没有改过它」。用户在首问安装前已经写了新稿时
+   * 调用方不该调这个（见 `SideSyncController.submit` 的 `installQuestion` 分支）。
+   */
+  installQuestion(
+    hostKey: SideHostKey,
+    sideId: string,
+    text: string,
+    draftVersion: number,
+  ): void {
+    const view = this.views.get(hostKey)?.get(sideId);
+    if (!view) return;
+    view.draft = text;
+    view.draftVersion = Math.max(view.draftVersion, draftVersion);
   }
 
   /**
@@ -386,6 +475,8 @@ export class SideConversationStore {
       },
       items: [],
       draft: "",
+      draftVersion: 0,
+      rejectedSubmission: null,
       pending: null,
       usage: page.usage,
       effectiveConfig: page.effective_config,
@@ -523,6 +614,8 @@ export class SideConversationStore {
       },
       items: [],
       draft: "",
+      draftVersion: 0,
+      rejectedSubmission: null,
       pending: null,
       usage: EMPTY_USAGE,
       effectiveConfig: null,
@@ -548,8 +641,12 @@ export class SideConversationStore {
       view.seq = 0;
       view.closed = false;
       view.sync = "unsynced";
+      // 换代 = 宿主动给的一条全新旁支。旧的 pending/rejected/草稿版本都属于上一
+      // 代的身份，搬进新视图会让一份已经作废的提交去清掉新旁问的稿子。
       view.pending = null;
+      view.rejectedSubmission = null;
       view.draft = "";
+      view.draftVersion = 0;
       view.error = null;
       view.summary = {
         ...view.summary,
