@@ -506,7 +506,17 @@ pub struct AgentTask {
 
 impl AgentTask {
     pub fn new_root(root_session_id: RootSessionId) -> Self {
-        let id = TaskId::new();
+        Self::new_root_with_id(root_session_id, TaskId::new())
+    }
+
+    /// Creates a fresh root under an id chosen by the caller.
+    ///
+    /// A managed runtime does not get to pick its own root identity: the guardian
+    /// derives it from the scope and thread key, installs authority for it *before*
+    /// the daemon attaches, and the attach then has to land on exactly that id.
+    /// Minting a random id here would put the authorized root and the created root in
+    /// two different namespaces.
+    pub fn new_root_with_id(root_session_id: RootSessionId, id: TaskId) -> Self {
         let attempt = TaskAttempt::initial(id.clone());
         Self {
             id,

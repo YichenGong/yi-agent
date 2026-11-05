@@ -72,6 +72,40 @@ pub fn application_root_key(thread_id: &str) -> String {
     format!("thread:{thread_id}")
 }
 
+/// 一次 root 授权操作的稳定 id。
+///
+/// 由会话自己派生，而不是进程级的 `app-server:{pid}`：同一个 id 落到两个会话上，
+/// guardian 会把第二次请求当成第一次的重试，两个会话于是争用同一个 root。会话 id
+/// 在重试与重连之间不变，所以一次授权丢了再问一次仍解析到同一个 root。
+pub fn managed_bind_operation_id(thread_id: &str) -> String {
+    format!("managed-root:{thread_id}")
+}
+
+/// Why a conversation's root could not be attached.
+///
+/// The two arms exist because they demand different responses: a managed admission
+/// failure means the *deployment* did not authorize this conversation, and retrying it
+/// unchanged cannot help; a daemon failure is the ordinary "the runtime said no" that
+/// the caller already knows how to report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RootAttachError {
+    /// Managed admission failed before any attach was attempted.
+    Managed(crate::managed_binding::ManagedAdmissionError),
+    /// The daemon (or the transport to it) refused or could not answer.
+    Daemon(String),
+}
+
+impl std::fmt::Display for RootAttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Managed(error) => write!(f, "{error}"),
+            Self::Daemon(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for RootAttachError {}
+
 /// One conversation's own root on a shared project runtime.
 ///
 /// The `RuntimeBinding` is shared (one daemon per project, self-healing); this
@@ -81,6 +115,14 @@ pub struct ThreadRoot {
     binding: Arc<RuntimeBinding>,
     thread_id: String,
     project_dir: PathBuf,
+    /// The shell-granted authority for this conversation, on a managed runtime.
+    ///
+    /// `None` is the embedded/TUI shape: there is no shell and no guardian broker, so
+    /// the attach presents its own stable key and the daemon treats it as unmanaged.
+    /// On a managed runtime the key it presents *is* a capability, so this must be the
+    /// only source of it -- a path lookup here is what used to hand one project's
+    /// capability to every conversation in it.
+    managed: Option<Arc<crate::managed_binding::ManagedContext>>,
     /// This conversation's linked roots (the primary root excluded). Fixed when
     /// the root is created and re-sent verbatim on every re-attach.
     extra_roots: Vec<PathBuf>,
@@ -120,8 +162,37 @@ impl ThreadRoot {
             thread_id: thread_id.into(),
             project_dir,
             extra_roots,
+            managed: None,
             cached: Mutex::new(None),
         })
+    }
+
+    /// The same conversation root, on a managed runtime that brokers authority.
+    ///
+    /// Separate constructor rather than an optional argument on [`Self::new`]: an
+    /// embedded caller must not be able to half-configure a managed root, and a
+    /// managed caller must not forget to. The two deployments fail differently and the
+    /// type says which one is in play.
+    pub fn managed(
+        binding: Arc<RuntimeBinding>,
+        thread_id: impl Into<String>,
+        project_dir: PathBuf,
+        extra_roots: Vec<PathBuf>,
+        context: Arc<crate::managed_binding::ManagedContext>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            binding,
+            thread_id: thread_id.into(),
+            project_dir,
+            extra_roots,
+            managed: Some(context),
+            cached: Mutex::new(None),
+        })
+    }
+
+    /// Whether this conversation attaches through shell-granted authority.
+    pub fn is_managed(&self) -> bool {
+        self.managed.is_some()
     }
 
     /// Wraps a root that already exists on a fixed runtime, without attaching.
@@ -174,6 +245,15 @@ impl ThreadRoot {
     /// Idempotent: the stable key means a second call adopts the root the first
     /// one created, including after a daemon restart.
     pub fn attach(&self) -> Result<(), String> {
+        self.attach_typed().map_err(|error| error.to_string())
+    }
+
+    /// [`Self::attach`] without flattening the two kinds of failure.
+    ///
+    /// Managed callers use this so "the shell never authorized this conversation"
+    /// stays distinguishable from "the daemon refused the attach": only the first
+    /// means the managed path itself is unusable.
+    pub fn attach_typed(&self) -> Result<(), RootAttachError> {
         // Resolve the runtime first, then check the cache against exactly that
         // runtime: the check and the mint must agree on which daemon mints the
         // root, or a repair between the two would leave a root pointed at a
@@ -187,21 +267,41 @@ impl ThreadRoot {
         // raw transport error. The generation comes back together with the answer,
         // naming the runtime that actually served this mint -- never a later one a
         // concurrent repair may have installed in the meantime.
-        let (response, generation) =
-            self.binding
-                .send_with_generation(|_handle| IpcRequest::AttachApplicationRoot {
-                    idempotency_key: application_root_key(&self.thread_id),
-                    workspace: self.project_dir.clone(),
-                    // Re-sent on every attach, including a reconnect after a
-                    // daemon replacement: the daemon records them on creation
-                    // and restores them on adoption, so the session's root set
-                    // cannot be lost by a retry.
-                    extra_roots: self
-                        .extra_roots
-                        .iter()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .collect(),
-                })?;
+        // On a managed runtime the attach key is the guardian's capability for *this
+        // conversation*. Everything else about the request is the same, so the rest of
+        // this function stays one path: only the key differs, and the difference is
+        // what makes the daemon able to say whose root this is.
+        let (attach_key, authorized_root) = match self.managed.as_ref() {
+            None => (application_root_key(&self.thread_id), None),
+            Some(context) => {
+                let intent = self.bind_intent();
+                // A failure here is terminal for this attach. Returning a legacy key
+                // instead would be an unattributed attach on a managed daemon, which
+                // the daemon refuses anyway -- and it would refuse it later, with a
+                // message that does not name the real cause.
+                let entry = context
+                    .resolve(&application_root_key(&self.thread_id), &intent)
+                    .map_err(RootAttachError::Managed)?;
+                let authorized = entry.key.root_id.clone();
+                (entry.capability.expose().to_string(), Some(authorized))
+            }
+        };
+        let (response, generation) = self
+            .binding
+            .send_with_generation(|_handle| IpcRequest::AttachApplicationRoot {
+                idempotency_key: attach_key.clone(),
+                workspace: self.project_dir.clone(),
+                // Re-sent on every attach, including a reconnect after a
+                // daemon replacement: the daemon records them on creation
+                // and restores them on adoption, so the session's root set
+                // cannot be lost by a retry.
+                extra_roots: self
+                    .extra_roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect(),
+            })
+            .map_err(RootAttachError::Daemon)?;
         let IpcResponse::ApplicationRootAttached {
             session_id,
             root_task_id,
@@ -209,10 +309,32 @@ impl ThreadRoot {
             workspace,
         } = response
         else {
-            return Err(format!(
+            return Err(RootAttachError::Daemon(format!(
                 "daemon rejected the conversation root: {response:?}"
-            ));
+            )));
         };
+        // The daemon names the root it actually attached. On a managed runtime that
+        // must be the root the shell authorized: a different id would mean the
+        // capability resolved to a binding issued for something else, and caching it
+        // would let this conversation act under an authority nobody granted it.
+        if let Some(authorized) = authorized_root
+            && root_task_id != authorized
+        {
+            // Forget the entry rather than keep it: it names a root the daemon will
+            // never report, so every later attempt would fail the same way.
+            if let Some(context) = self.managed.as_ref() {
+                // By conversation, not by a hand-built key: the key has five fields and
+                // a partial one matches nothing, which would leave the stale entry in
+                // place and make every retry fail identically.
+                context.revoke_thread(&application_root_key(&self.thread_id));
+            }
+            return Err(RootAttachError::Managed(
+                crate::managed_binding::ManagedAdmissionError::ActualRootMismatch {
+                    authorized,
+                    actual: root_task_id,
+                },
+            ));
+        }
         *self.lock_cached() = Some(CachedRoot {
             generation,
             root: AttachedRoot {
@@ -254,6 +376,25 @@ impl ThreadRoot {
     /// `Arc<RuntimeBinding>`，不摘掉这些引用，daemon 与监督线程根本不会停。
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
+    }
+
+    /// What this conversation asks the guardian to authorize.
+    ///
+    /// The stable thread key is what the daemon reserves the root id against, and the
+    /// workspace/extra_roots are the exact set this conversation will attach with. The
+    /// guardian compares them with the attach, so a disagreement here would be caught
+    /// at the daemon rather than silently binding one conversation's intent to
+    /// another's root.
+    fn bind_intent(&self) -> yi_agent_lifecycle::foreground::RootBindIntent {
+        yi_agent_lifecycle::foreground::RootBindIntent {
+            // Stable per conversation: a retried authorization resolves to the same
+            // root instead of minting a second one.
+            operation_id: managed_bind_operation_id(&self.thread_id),
+            thread_key: application_root_key(&self.thread_id),
+            workspace: self.project_dir.clone(),
+            extra_roots: self.extra_roots.clone(),
+            previous_root_capability: None,
+        }
     }
 
     /// This conversation's root task id, once attached.
@@ -599,6 +740,84 @@ mod tests {
             "attach must adopt the live cached root without a round trip"
         );
         assert_eq!(thread_root.root_task_id().as_deref(), Some("adopted-root"));
+    }
+
+    /// A managed conversation with no authority installed and no broker fails as a
+    /// *managed admission* error. It must not fall back to the legacy stable key:
+    /// that would be an unattributed attach on a daemon that refuses them, and the
+    /// caller would see a daemon rejection instead of the real cause.
+    #[test]
+    fn a_managed_root_without_authority_fails_as_managed_admission() {
+        let mut store = crate::managed_binding::RootAuthorityStore::new();
+        store
+            .bind_epoch("epoch-1")
+            .expect("the handshake fixed an epoch");
+        let context = Arc::new(crate::managed_binding::ManagedContext::new(
+            Arc::new(Mutex::new(store)),
+            "/tmp/project/.yi-agent/runtime",
+            "app-run-1",
+        ));
+        let thread_root = ThreadRoot::managed(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/project"),
+            Vec::new(),
+            context,
+        );
+        assert!(thread_root.is_managed());
+        match thread_root.attach_typed() {
+            Err(RootAttachError::Managed(
+                crate::managed_binding::ManagedAdmissionError::NoBroker,
+            )) => {}
+            other => panic!("expected a typed managed admission failure, got {other:?}"),
+        }
+        assert!(
+            thread_root.lock_cached().is_none(),
+            "a refused attach must not cache a root"
+        );
+    }
+
+    /// Before the bootstrap fixed an epoch, nothing the shell sent can be trusted, so
+    /// a managed attach refuses even when a broker is attached.
+    #[test]
+    fn a_managed_root_before_the_epoch_fails_closed() {
+        let context = Arc::new(crate::managed_binding::ManagedContext::new(
+            Arc::new(Mutex::new(crate::managed_binding::RootAuthorityStore::new())),
+            "/tmp/project/.yi-agent/runtime",
+            "app-run-1",
+        ));
+        let thread_root = ThreadRoot::managed(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/project"),
+            Vec::new(),
+            context,
+        );
+        match thread_root.attach_typed() {
+            Err(RootAttachError::Managed(
+                crate::managed_binding::ManagedAdmissionError::NoBootstrapEpoch,
+            )) => {}
+            other => panic!("expected NoBootstrapEpoch, got {other:?}"),
+        }
+    }
+
+    /// Each conversation asks under its own operation id. A shared process-wide id
+    /// would make the guardian treat the second conversation as a retry of the first.
+    #[test]
+    fn managed_operation_ids_are_per_conversation() {
+        assert_eq!(
+            managed_bind_operation_id("thread-a"),
+            "managed-root:thread-a"
+        );
+        assert_ne!(
+            managed_bind_operation_id("thread-a"),
+            managed_bind_operation_id("thread-b")
+        );
+        assert_ne!(
+            managed_bind_operation_id("thread-a"),
+            application_root_key("thread-a"),
+            "the reservation key and the attach key answer different questions"
+        );
     }
 
     #[test]

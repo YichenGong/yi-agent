@@ -23,6 +23,7 @@ use yi_agent_store::ipc::{
 use yi_agent_store::repository::{
     RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
 };
+use yi_agent_store::runtime::RuntimeCoordinator;
 
 struct RecordingWorkerFactory;
 
@@ -5904,6 +5905,176 @@ fn foreground_root_with_authority(
         .install_foreground_authority_for_test(&root_task_id, owner, intent)
         .expect("the bridge installs authority for an attached root");
     (session_id, root_task_id, authorization)
+}
+
+/// A managed daemon whose attach gate consults a guardian ledger the test drives.
+///
+/// Returns the coordinator and the *guardian's* ledger. Minting on the guardian side and
+/// pushing the binding into the verifier is the real two-party shape: a test that handed
+/// the daemon a capability it minted itself would prove nothing about the gate.
+fn managed_coordinator(
+    directory: &TempDir,
+) -> (
+    Arc<RuntimeCoordinator>,
+    yi_agent_lifecycle::authorization::AuthorizationLedger,
+    yi_agent_lifecycle::authorization::AuthorizationLedger,
+) {
+    let scope = directory.path().to_string_lossy().into_owned();
+    let coordinator = Arc::new(
+        RuntimeCoordinator::open_with_activation(
+            directory.path().join("runtime.sqlite"),
+            Arc::new(ApplicationRootFactory {
+                workspace_service: Arc::new(StaticWorkspaceService),
+                starts: Arc::new(Mutex::new(Vec::new())),
+            }),
+            yi_agent_store::foreground::ForegroundActivation::for_test(true),
+        )
+        .expect("a fresh database must open"),
+    );
+    // The ledger names the daemon generation the coordinator actually reports; a
+    // binding for another generation is refused, which is the cross-generation replay
+    // the design forbids -- not something a fixture should paper over.
+    let generation = coordinator.generation().to_string();
+    let guardian = yi_agent_lifecycle::authorization::AuthorizationLedger::new(
+        scope.clone(),
+        generation.clone(),
+    );
+    let verifier = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        scope,
+        generation,
+        guardian.generation_secret(),
+    );
+    (coordinator, guardian, verifier)
+}
+
+/// Mints one Business authorization and pushes it into the daemon's verifier.
+fn authorize_root(
+    coordinator: &RuntimeCoordinator,
+    guardian: &mut yi_agent_lifecycle::authorization::AuthorizationLedger,
+    verifier: &mut yi_agent_lifecycle::authorization::AuthorizationLedger,
+    client_run_id: &str,
+    root_id: &str,
+) -> yi_agent_lifecycle::types::RootAuthorization {
+    use yi_agent_lifecycle::authorization::AuthorizationUpdate;
+    use yi_agent_lifecycle::types::LeaseMode;
+    let authorization = guardian
+        .issue(client_run_id, root_id, LeaseMode::Business)
+        .expect("a business client is authorizable");
+    verifier
+        .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
+        .expect("the verifier accepts its guardian's binding");
+    coordinator.adopt_managed_authority(verifier.clone());
+    authorization
+}
+
+/// A managed attach lands on the root the guardian authorized, not on a fresh id.
+///
+/// The guardian derives a root id from the scope and thread key and installs authority
+/// for that id *before* the host attaches. The daemon therefore has to create the root
+/// under exactly that id: an id it minted itself would leave the authorized root
+/// nonexistent and attach the capability to a root nobody vouched for.
+#[tokio::test]
+async fn foreground_root_lifecycle_a_managed_attach_creates_the_authorized_root() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, mut guardian, mut verifier) = managed_coordinator(&directory);
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let root = "5c4a1f0e-2d3b-4a6c-8e7f-90a1b2c3d4e5";
+    let authorization = authorize_root(
+        &coordinator,
+        &mut guardian,
+        &mut verifier,
+        "app-run-1",
+        root,
+    );
+
+    // The install half of the exchange, with the secret this test will present. The
+    // root does not exist yet, which is exactly the order the guardian uses: the
+    // daemon must tolerate an install that precedes the attach.
+    coordinator
+        .install_given_authorization_for_test(
+            &authorization,
+            yi_agent_lifecycle::foreground::RootBindIntent {
+                operation_id: "managed-root:thread:a".into(),
+                thread_key: "thread:a".into(),
+                workspace: project.clone(),
+                extra_roots: Vec::new(),
+                previous_root_capability: None,
+            },
+        )
+        .expect("the bridge installs the guardian's authority");
+
+    let attached = coordinator
+        .attach_application_root(&authorization.capability, &project, &[])
+        .await
+        .expect("an authorized attach must be admitted");
+    assert_eq!(
+        attached.root_task_id.to_string(),
+        root,
+        "the attached root must be the root the guardian authorized"
+    );
+    // The classification an install had to defer is written once the root exists.
+    assert_eq!(
+        coordinator
+            .repository_for_test()
+            .unwrap()
+            .persisted_foreground_root(&root.parse().unwrap())
+            .unwrap()
+            .map(|row| row.classification),
+        Some(yi_agent_store::repository::foreground::ForegroundClassification::Managed),
+        "the attach must finish the classification the install deferred"
+    );
+}
+
+/// A capability reserved for one project cannot attach a different one.
+///
+/// The root id is a digest, so it cannot answer "which project was this issued for".
+/// The intent's workspace is what does, and it has to survive the install: the
+/// reservation is spent once authority lands, and the attach comes after.
+#[tokio::test]
+async fn foreground_root_lifecycle_a_capability_cannot_attach_another_project() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, mut guardian, mut verifier) = managed_coordinator(&directory);
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let other = directory.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let root = "a1b2c3d4-e5f6-0718-293a-4b5c6d7e8f90";
+    let authorization = authorize_root(
+        &coordinator,
+        &mut guardian,
+        &mut verifier,
+        "app-run-1",
+        root,
+    );
+
+    // The reservation is what records the project: prepare with the intent that names
+    // `project`, exactly as the guardian's exchange does before it installs.
+    coordinator
+        .reserve_foreground_root_for_test(
+            root,
+            "app-run-1",
+            &authorization.scope_key,
+            yi_agent_lifecycle::foreground::RootBindIntent {
+                operation_id: "managed-root:thread:a".into(),
+                thread_key: "thread:a".into(),
+                workspace: project.clone(),
+                extra_roots: Vec::new(),
+                previous_root_capability: None,
+            },
+            yi_agent_lifecycle::foreground::RootAuthorityScope::Business,
+        )
+        .expect("the bridge reserves the root for its project");
+
+    let error = coordinator
+        .attach_application_root(&authorization.capability, &other, &[])
+        .await
+        .expect_err("a capability issued for one project must not attach another");
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains("for ") && rendered.contains("requested"),
+        "the refusal must name both projects: {rendered}"
+    );
 }
 
 #[test]

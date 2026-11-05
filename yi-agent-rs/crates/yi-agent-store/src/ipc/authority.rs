@@ -65,6 +65,17 @@ struct InstalledAuthority {
     binding_epoch: u64,
     authority_seq: u64,
     scope: RootAuthorityScope,
+    /// The project the intent that produced this authority named.
+    ///
+    /// Carried past the install because the reservation is spent once it lands: the
+    /// attach that follows still has to answer "was this capability issued for *this*
+    /// project", and the root id (a digest) cannot answer it.
+    ///
+    /// `None` when the install arrived with no prepare behind it. Production never
+    /// does that -- `commit` refuses it -- but the table is also driven directly by
+    /// tests that only exercise the authority algebra, and inventing a project for
+    /// them would be worse than saying "unknown" and skipping the project check.
+    workspace: Option<std::path::PathBuf>,
     /// SHA-256 of the capability the guardian issued for this root.
     ///
     /// Only the digest is kept: the table has to *recognise* the capability a caller
@@ -198,6 +209,12 @@ impl AuthorityTable {
                 self.check_stamp(stamp, now)?;
                 self.check_authorization_matches_stamp(stamp, authorization)?;
                 self.consume_challenge(stamp, now)?;
+                // Read the project off the reservation before it is dropped: this is
+                // the last moment the pair "this root, this project" is still joined.
+                let workspace = self
+                    .reservations
+                    .get(&stamp.root_id)
+                    .map(|reservation| reservation.workspace.clone());
                 self.authorities.insert(
                     stamp.root_id.clone(),
                     InstalledAuthority {
@@ -206,6 +223,7 @@ impl AuthorityTable {
                         binding_epoch: stamp.binding_epoch,
                         authority_seq: stamp.authority_seq,
                         scope: stamp.authority_scope,
+                        workspace,
                         capability_digest: digest_of_capability(&authorization.capability),
                         expires_at: now + Duration::from_millis(stamp.remaining_lease_ms),
                     },
@@ -476,6 +494,24 @@ impl AuthorityTable {
             },
         );
         Ok(())
+    }
+
+    /// The workspace the guardian reserved `root` for, if this table still holds it.
+    ///
+    /// This is the answer to "does this capability belong to this project?" -- the
+    /// root id itself cannot answer it, because a root id is a daemon identity (a
+    /// digest the guardian derived), not a directory. Comparing it with a path would
+    /// refuse every managed attach once the id stopped looking like the path the
+    /// earlier code happened to mint it from.
+    pub fn reservation_workspace_for(&self, root: &str) -> Option<&std::path::Path> {
+        // A completed install keeps the answer: the reservation is gone by then, and
+        // the attach that follows still needs to check the project.
+        if let Some(reservation) = self.reservations.get(root) {
+            return Some(reservation.workspace.as_path());
+        }
+        self.authorities
+            .get(root)
+            .and_then(|authority| authority.workspace.as_deref())
     }
 
     pub fn reservation_owner(&self, root: &str) -> Option<&str> {

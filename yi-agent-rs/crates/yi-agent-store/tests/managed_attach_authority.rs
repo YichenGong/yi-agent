@@ -108,6 +108,9 @@ fn coordinator(directory: &TempDir) -> RuntimeCoordinator {
     .expect("a fresh database must open")
 }
 
+/// A root id shaped like the ones the guardian derives: a canonical UUID.
+const ROOT_ID: &str = "f3a91c48-2d6b-4e07-8a15-6c9b0d2e4f71";
+
 fn workspace(directory: &TempDir) -> std::path::PathBuf {
     let project = directory.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -165,12 +168,11 @@ async fn a_managed_daemon_admits_the_capability_its_guardian_minted() {
     // The guardian's half, in-process: same secret, same generation.
     let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
     let secret = guardian.generation_secret();
+    // The root id is a daemon task id, which is a UUID: a managed attach now creates
+    // exactly the root named here, so a fixture that passed a directory would be
+    // asserting an identity the daemon could never create.
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .expect("a business client must be authorizable");
 
     let mut daemon =
@@ -214,11 +216,7 @@ async fn a_released_client_cannot_attach_with_its_old_capability() {
     let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
     let secret = guardian.generation_secret();
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .unwrap();
     // A verifier only knows what its guardian tells it, so the binding can be
     // installed; the withdrawal is what has to arrive next. That ordering is also
@@ -287,11 +285,7 @@ async fn a_revocation_applied_while_serving_takes_effect() {
     let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
     let secret = guardian.generation_secret();
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .unwrap();
 
     let mut daemon =

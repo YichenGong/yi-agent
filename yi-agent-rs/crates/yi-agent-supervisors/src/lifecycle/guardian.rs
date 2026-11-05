@@ -2408,24 +2408,27 @@ fn derive_root_id(scope_key: &str, thread_key: &str) -> String {
     hasher.update([0u8]);
     hasher.update(thread_key.as_bytes());
     let digest = hasher.finalize();
+
+    // Rendered as a canonical UUID (8-4-4-4-12), not bare hex, because the daemon parses
+    // this id as a task id: `TaskId` wraps a `Uuid`, whose `Display` is the hyphenated
+    // form and whose `FromStr` accepts it. The four hyphens are the difference between
+    // "the root the daemon created" and "a root it could never have created", and the
+    // install, the attach and the driver bind all compare those two as strings.
+    //
+    // Formatted here rather than through a `uuid` dependency: this crate is
+    // deliberately dependency-light (it is linked by the desktop shell), and one
+    // sixteen-byte rendering does not justify pulling in a crate.
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0],
-        digest[1],
-        digest[2],
-        digest[3],
-        digest[4],
-        digest[5],
-        digest[6],
-        digest[7],
-        digest[8],
-        digest[9],
-        digest[10],
-        digest[11],
-        digest[12],
-        digest[13],
-        digest[14],
-        digest[15]
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
     )
 }
 

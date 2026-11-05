@@ -304,7 +304,12 @@ impl RuntimeRepository {
         ))
     }
 
-    fn task_exists(&self, task: &TaskId) -> Result<bool, RepositoryError> {
+    /// Whether the daemon has a task row for `task` yet.
+    ///
+    /// Exposed so a caller that writes a row referencing `tasks(id)` can tell
+    /// "this root does not exist yet" apart from "this write is corrupt", instead of
+    /// folding both into the same refusal.
+    pub fn task_exists(&self, task: &TaskId) -> Result<bool, RepositoryError> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
             params![task.to_string()],

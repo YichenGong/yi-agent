@@ -149,7 +149,23 @@ impl AgentSupervisor {
     }
 
     pub fn new_with_objective(root_session_id: RootSessionId, objective: String) -> Self {
-        let root = AgentTask::new_root(root_session_id);
+        Self::new_with_objective_and_root(root_session_id, objective, None)
+    }
+
+    /// Same as [`Self::new_with_objective`], with an optional caller-chosen root id.
+    ///
+    /// `None` mints a fresh id (the unmanaged behaviour). `Some` is used by a managed
+    /// attach, where the guardian has already authorized one specific root and the
+    /// daemon must create that exact identity.
+    pub fn new_with_objective_and_root(
+        root_session_id: RootSessionId,
+        objective: String,
+        root_id: Option<TaskId>,
+    ) -> Self {
+        let root = match root_id {
+            Some(root_id) => AgentTask::new_root_with_id(root_session_id, root_id),
+            None => AgentTask::new_root(root_session_id),
+        };
         let root_task_id = root.id.clone();
         let mut tasks = HashMap::new();
         tasks.insert(root_task_id.clone(), root);

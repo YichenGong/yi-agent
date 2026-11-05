@@ -19,6 +19,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use yi_agent_core::subagent::task::TaskId;
+
 use yi_agent_lifecycle::foreground::{
     AuthorityMessage, BridgeFrame, BridgeRecoveryAnswer, BridgeRecoveryOutcome,
     ForegroundErrorCode, RootAuthorityScope, RootBindIntent,
@@ -117,6 +119,71 @@ impl ForegroundBridge {
                 now,
                 yi_agent_lifecycle::foreground::RootAuthorityScope::RecoveryOnly,
             )
+    }
+
+    /// The workspace the guardian reserved `root` for.
+    ///
+    /// Exposed so the attach gate can check "this capability was issued for the
+    /// project being attached" without inventing a second notion of root identity: the
+    /// root id is the daemon's, and the workspace is what the intent named.
+    pub fn reservation_workspace_for(&self, root: &str) -> Option<&std::path::Path> {
+        self.authority.reservation_workspace_for(root)
+    }
+
+    /// Writes the classification an install deferred because the root did not exist.
+    ///
+    /// The guardian authorizes a root during prepare/commit, which is *before* the
+    /// host attaches and the daemon creates the task. The install therefore cannot
+    /// write `foreground_root_state` (it references `tasks(id)`), and this is the
+    /// other half: called by an attach that is about to create exactly that root.
+    ///
+    /// Refuses a root the bridge installed no `Business` authority for, so this is
+    /// not a way to classify a root by asking. An existing row is left alone: the
+    /// durable decision already there was authenticated, and re-deriving it from
+    /// memory would let a second install rewrite history.
+    pub fn classify_installed_root(
+        &mut self,
+        repository: &mut RuntimeRepository,
+        root: &str,
+    ) -> Result<(), ForegroundError> {
+        if self.closed {
+            return Err(ForegroundError::AuthorityDenied);
+        }
+        // No installed authority means this root was not authorized through the bridge:
+        // it is not a bridge-managed foreground root, so there is nothing to classify.
+        // Answering here rather than refusing keeps the ledger-only path (an attach
+        // authenticated by the guardian's authorization but with no foreground exchange)
+        // working instead of turning an absent feature into an error.
+        let Some((owner, _scope_key, binding_epoch, _seq)) =
+            self.authority.installed_identity(root)
+        else {
+            return Ok(());
+        };
+        let task: TaskId = root.parse().map_err(|_| ForegroundError::CorruptBinding)?;
+        if !repository
+            .task_exists(&task)
+            .map_err(|_| ForegroundError::CorruptBinding)?
+        {
+            return Err(ForegroundError::CorruptBinding);
+        }
+        if repository
+            .persisted_foreground_root(&task)
+            .map_err(|_| ForegroundError::CorruptBinding)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        repository
+            .record_foreground_root(&PersistedForegroundRoot {
+                root: task,
+                classification: ForegroundClassification::Managed,
+                binding_epoch,
+                driver_epoch: 0,
+                owner_client_id: Some(owner),
+                admission: crate::repository::foreground::AdmissionState::Closed,
+                driver_bind_operation_id: None,
+            })
+            .map_err(|_| ForegroundError::CorruptBinding)
     }
 
     /// Handles one frame from the guardian.
@@ -356,6 +423,18 @@ impl ForegroundBridge {
             {
                 return Err(ForegroundError::RecoveryAuthorityMissing);
             }
+            return Ok(());
+        }
+        // A managed root is authorized during the guardian's prepare/commit exchange,
+        // which runs *before* the host attaches and the daemon creates the task. The
+        // row references `tasks(id)`, so writing it now would fail the foreign key on
+        // a root that is merely early rather than wrong. The classification is not
+        // lost: the installed authority (owner, scope, binding epoch) stays in memory,
+        // and the attach that creates this exact root writes the row from it.
+        if !repository
+            .task_exists(&root)
+            .map_err(|_| ForegroundError::CorruptBinding)?
+        {
             return Ok(());
         }
         repository
