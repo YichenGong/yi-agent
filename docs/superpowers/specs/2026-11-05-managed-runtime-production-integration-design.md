@@ -2,7 +2,7 @@
 
 日期：2026-11-05
 基线：`7c32a47c`
-状态：用户已确认沿用既有生命周期语义；本文待书面审阅，尚未实施。
+状态：用户已确认沿用既有生命周期语义；已完成两轮作者自审，进入实施计划，尚未实施。
 
 ## 1. 已确认决策与范围
 
@@ -73,10 +73,23 @@
 规范 scope 与 App 身份，禁止 WebView 提交 executable、build id 或授权 capability。
 relay、websocket、SSH 槽位不接收本地壳授权，也不能触发本机迁移。
 
+管理帧采用保留方法命名空间，generic `rpc`/`rpc_respond` 必须拒绝伪造保留帧；
+app-server 只在本地 stdio 且通过壳启动时私有握手的会话接收。握手秘密只经继承
+FD 传递（本地 sidecar 启动后、开放 generic 写入前的原生私有 stdin 首帧），不进入
+argv、普通环境、WebView 或日志；`issued_by_shell` 布尔值不是
+鉴权。壳维护独立 request-id/sidecar epoch/pending 表，内部响应先截获、不广播
+前端；超时、换代、退出清 pending，旧响应不能完成新请求。业务侧上行的逐 root
+授权意图同样由壳截获并核实注册 scope/会话身份，不暴露给页面代答。
+
 准备操作只启动或观察 runtime，不 attach root、不恢复 worker、不获得 App 的
 可续租凭据。启动时使用现有协调锁、产物 pinning、schema/协议检查及 bootstrap
 FD 规则；不能裸执行 `internal-runtime guardian`、只传环境变量冒充受管角色，
 也不能将一次性 helper 的退出误当成完成生命周期交接。
+
+canonical 项目路径与 instance home 必须显式传给 guardian/daemon，并与启动
+claim、scope、generation 一致性核对；不能从 guardian 的 runtime-dir cwd 猜
+项目路径。managed daemon 缺失/静默/错 scope 的 lifeline hello 必须拒绝启动，
+不得转为无 ledger 模式。保留 guardian→daemon 的死亡监控和授权通道。
 
 ### 4.2 顺序与成功条件
 
@@ -87,16 +100,30 @@ FD 规则；不能裸执行 `internal-runtime guardian`、只传环境变量冒�
    则返回选择状态，不另起第二个 daemon，也不静默借用。
 3. 无现有 runtime 时，经统一 bring-up 启动 guardian 和 daemon。首客户端窗口内
    不调度任务或运行插件；就绪回包须匹配 scope、构建和 daemon 代际。
-4. 壳直接向 guardian 取得 App 租约并启动心跳，确认该租约实际存在。
-5. 壳使用该租约请求绑定 root、scope、代际及 App run id 的非续租授权，通过本地
-   bridge 更新 app-server 会话授权。沿用已有 root 授权协议，不另造 owner 体系。
-6. app-server 在授权对应代际 attach root；业务 daemon 验证授权及 live owner，
-   attach 成功后该 scope 才允许业务执行。
+4. 壳直接向 guardian 取得 Business 模式的 App 租约并启动心跳，确认该租约实际存在。
+   至此 scope 达到 `managedReady`（仅 lifecycleReady），不表示任何会话已获授权。
+5. 每个会话执行前，以稳定 `thread:{thread_id}`、workspace、extra_roots 发出
+   root 意图；壳用该 scope 的租约取得非续租 root 授权，送回对应 app-server 会话。
+6. 复用已有 guardian↔daemon prepare/commit 权威交换，在 attach 前解析实际
+   root id 并安装授权；app-server attach 对应 root、绑定 foreground driver 后，
+   仅该 root 达到 `rootReady`，才放行它的 turn、委派及工具执行。
+
+项目 binding 只代表共享连接，不能先创建一个无授权项目 root 再期待它授权所有
+会话；managed 路径移除这种预先 attach。root id 是 daemon root 身份，不是目录：
+授权表按 `(scope, daemon generation, client_run_id, thread_key, root_id)` 精确
+查找，不对 root id 做路径 canonicalize。意图与 attach 的 workspace/extra_roots
+须一致。不同会话独立授权；同一 root 的其他 live owner 拒绝接管，旧 owner 已离开
+时沿用既有 recovery-only/previous capability 恢复协议，不能按 thread key 猜授权。
+
+授权增量安装须带 sidecar epoch、scope 和单调 revision，原子替换对应 scope 的
+授权快照，拒绝旧 revision，不能清掉其他项目。秘密只在壳、app-server 与 daemon
+可信路径内存中流转。失败或代际变更即撤销对应 rootReady；managed 路径不得把
+`authorize_foreground_root` 或 driver bind 的 `None` 当 legacy 成功继续执行。
 
 不能依赖 React effect 和首次 `thread/start` / `thread/resume` 恰好按顺序完成。
-创建/恢复可执行 root、turn、委派及插件启动入口均等待同一 scope 的准备屏障；
-静态历史查看与只读状态查询不因此创建租约。用户尚未提交的输入可保留为草稿，
-不在准备完成后偷偷自动发送。
+创建/恢复可执行 root、turn、委派等待 scope lifecycleReady 和自己的 rootReady；
+插件只等 lifecycleReady 与真实 demand，不虚造会话 root。静态历史查看与只读状态
+查询不因此创建租约。用户尚未提交的输入可保留为草稿，不在准备完成后偷偷自动发送。
 
 ### 4.3 结果与前端状态
 
@@ -106,13 +133,14 @@ FD 规则；不能裸执行 `internal-runtime guardian`、只传环境变量冒�
 | 状态 | 权威含义 | 前端行为 |
 |---|---|---|
 | `starting` | 同 scope 的准备进行中 | 等待/显示进度，不标记已获取 |
-| `managedReady` | 壳租约成立，代际与 root 授权接线已确认 | 才加入 owned，放行业务 |
+| `managedReady` | 壳实际租约与心跳成立，runtime 身份/代际已确认 | 记录 lifecycleReady；逐 root 另等 rootReady |
 | `legacyChoiceRequired` | 已观测到 unmanaged runtime | 提供显式暂用或迁移预览 |
 | `blocked` | 兼容性、身份、路径或迁移条件不满足 | 显示具体原因，不降级 embedded |
 | `unknown` | 无法核实或应答丢失 | 只读对账，不推断失败/成功 |
 
-生命周期持有集合和业务 ready 状态分开：步骤 4 成功、步骤 5/6 失败时，壳仍必须
-记录并能释放已有租约；不能因尚未 ready 而使其从退出屏障消失。放弃项目准备时
+生命周期持有集合和业务 ready 状态分开：步骤 4 成功即记录 held 租约；步骤 5/6
+失败只阻塞对应 root，不删除 held。managedReady 不是 rootReady，也不能因此
+把插件需求等同于会话。放弃项目准备时
 有界释放已取得的资源；尚无租约的首次启动依既有首客户端超时规则自行退出。
 
 `useRuntimeLease` 不再乐观地把未持有结果当成成功。迟到结果必须核对 scope、
@@ -122,7 +150,11 @@ FD 规则；不能裸执行 `internal-runtime guardian`、只传环境变量冒�
 
 ### 4.4 sidecar 重启、代际变化及退出
 
-app-server 重启不改变 App run id、不重复 register、不释放壳租约。重连后壳从
+app-server 重启不改变 App run id、不重复 register、不释放壳租约。桌面 managed
+路径禁用现有 `ForegroundDispatch::connect` 经 ForegroundHost 以 app-server PID
+注册独立前端的分支，sidecar 只能消费壳下发的非续租 root 授权，不能另持 grant。
+逐 root driver 的 bind operation id 须包含 scope/root/sidecar epoch，不能把单个
+进程级 operation id 复用于所有会话。重连后壳从
 自己持有的租约和 guardian 当前代际重新提供适用 root 授权；新项目无需重启整个
 sidecar 才能取得授权。过期代际 capability 不能复用。
 
@@ -172,10 +204,41 @@ resident 循环、watchman、自动安装入口等复活来源。无法完整统
 已有 legacy 能力，不授予 managed 身份、不绕过协议/schema 不兼容、不冒充自动
 回收保证。未知身份不能作为“已兼容”的暂用路径。
 
+### 5.3 生产证据、锁序与持久操作约束
+
+`LegacyProbe` 的布尔测试输入不等于生产证据。现有业务 `Status` 只有事件水位，
+不证明 PID/build/实例归属、空闲或停止；进程名、PID、socket 不回答也不能单独证明。
+生产探测须保存可重核的 OS peer/进程启动身份、可执行文件路径及摘要、runtime
+运行锁归属、宿主模式、准入冻结与工作/子进程停止证据、全部复活来源及实例影响
+修订。平台不能证明其中必要条件时标记 unknown，迁移返回 manual，不强杀。
+
+本期自动迁移限于**已核实、宿主合作冻结新准入且能证明空闲和执行树已排空**的
+旧独立 daemon。不合作的旧版本即使某次看似空闲，也不能保证随后没有新工作，
+必须请用户退出其宿主/手工处理后重新探测。未知协议不能凭 Status 推断兼容暂用。
+preview 本身不创建 runtime 目录、锁、标记或操作文件；令牌短期仅存内存，绑定
+壳身份与全部证据摘要，确认前重新探测；同 operation 幂等，不同 operation 不得
+复用已消费 token。
+
+锁序固定为 instance 迁移/退役锁 → canonical scope 协调锁，多 scope 时按 key
+排序。迁移与 bring-up 共用显式持 guard 的内核，不能持有 `CoordinationGuard`
+再调用会重新 acquire 的公开 `ensure_managed_with`。持锁不能等待会重新进入
+这些锁的壳回调；停止/启动使用同一个总 deadline。旧自愈的“检查退役→ensure”
+必须进入共享 gate 并可 drain，在途 ensure 排空后才停止 daemon；只有写 marker
+不能阻止已越过检查的旧循环，不能证明其合作时同样转人工处理。
+
+确认接收先以原子写、fsync、0600 操作日志持久记录 operation，再做任何退役/
+停止副作用。记录阶段、脱敏证据、目标、实例影响修订与结果，不存 grant/capability。
+重启只对账，不自动继续破坏性步骤；显式重试重新核实进程启动身份和已完成阶段。
+进程 PID 重用不可继承原停止权限。干净项目不等于干净实例：只在确认实例没有旧
+复活来源时免迁移确认；本 App 不再启动旧 resident loop，已有外部 watchman 的
+实例级退役仍须预览确认，配置登记永远保留。
+
 ## 6. 统一生产入口与插件需求
 
 - App 项目 attach、repair、插件操作接入同一准备屏障。TUI/headless 的受管运行
-  选择相同 managed 策略，自持租约与授权，不依赖桌面壳。
+  选择相同 managed 策略，自持租约与授权，不依赖桌面壳。必须改为 bring-up →
+  Business 租约及心跳 → 逐 root 授权 → attach/driver；不能沿用先 attach 后租约。
+  managed 注册、心跳、私有 spawn 通道失败须拒绝新工作，不吞错后 direct spawn。
 - `daemon::ensure_running` 保留给明确手工/legacy 用途；新受管业务不能从插件
   RPC 或 repair 绕过去。所有调用点需逐一列出用途并以测试证明策略。
 - managed 接管后的 resident/watchman/自动安装路径继续检查退役栅栏；干净实例
@@ -186,6 +249,11 @@ resident 循环、watchman、自动安装入口等复活来源。无法完整统
   不能只看会话列表；否则无会话的看板页会被误回收。
 - 多客户端共享插件时只撤销离开客户端的 demand，最后一个需求撤销才停止对应
   插件；最后一个前端退出仍回收全部默认托管工作。
+- 现有 demand table 还须接入带 live grant 的可信获取/释放控制请求、guardian→
+  daemon 插件监督指令及 release/expiry 清理。managed daemon 不能无条件按配置
+  `supervise::serve` 启动插件。插件安装的配置落盘成功与 runtime queryable 分开
+  返回；没有 demand 时不能承诺 resident 后台重试。看板进入先登记真实使用意图，
+  驱动 scope 准备，再获取 demand，避免“等 demand 才准备/等准备才登记”循环。
 
 ## 7. 状态展示、可观测性与开发模式
 
@@ -224,6 +292,11 @@ bundle 校验失败或 dev 无已验证产物时给出 blocked/unknown 和原因
 | A14 | unknown/unmanaged/starting/不兼容 | 文案与权限相符，状态轮询不启动或续租 |
 | A15 | 最终独立 App，红叉/Dock/Cmd+Q | 隐藏保留工作、恢复原状、真退出回收；不共享正式实例状态 |
 | A16 | 数据保留及手工 CLI | 原历史/交付可读，手工 daemon 语义不变，受管入口无隐式 embedded 回退 |
+| A17 | 同项目多会话、同会话双客户端、关联根、恢复 | 授权按实际 root 独立安装；live owner 不被接管；关联根一致；recovery 不提权 |
+| A18 | 页面伪造管理帧、远端请求、旧 epoch/revision | 全部拒绝；管理响应/秘密不进前端；pending 在退出/换代后清理 |
+| A19 | guardian cwd 为 runtime 目录、软链、错/空 lifeline hello | 子进程仍使用 canonical 项目与实例配置；错身份拒绝且不监听业务 socket |
+| A20 | 两项目同时迁移、迁移内 bring-up、自愈在途 spawn | 锁序无自锁；gate 排空后停止，无双 daemon；总 deadline 不放大 |
+| A21 | 只答 Status、PID 重用、未知协议或无法证明空闲 | 不停止；manual/blocked 明示；不伪造 compatible 暂用 |
 
 实现提交需新增确定性回归，并运行相关 crate、Tauri、前端检查及项目规定的
 `cargo fmt --all`、`just ci`（提交前及合并后）。不能用 mock 测试代替 A04–A11、
@@ -235,4 +308,8 @@ A15 等进程/原生验收，也不以横幅消失作为成功判据。不调用
 实施顺序为：准备/租约/授权闭环 → 存量迁移与退役 → 插件及跨前端入口收口 →
 真实进程及最终 App 验收。各组可分 commit，但不能仅完成第一组就声称生产接入完成。
 本补充不将已有底层模块完成记录删除；另在 desktop 进度登记“默认生产接入”未完成。
-本文书面审阅通过后再编写实施计划，未获授权不改正式安装包、不停止当前 daemon。
+2026-11-05 已按用户要求完成两轮作者自审：第一轮逐项对照实际调用链，补齐
+逐会话授权、启动身份、迁移证据和锁序；第二轮检查状态/权限/失败恢复一致性，
+补清插件需求启动顺序与只读预览。子代理派发被当前运行时拒绝，未获得独立评审，
+不得称为多代理评审通过。实施计划见 [plan](../plans/2026-11-05-managed-runtime-production-integration-impl.md)。
+本轮仅文档交付，未获授权不改正式安装包、不停止当前 daemon。
