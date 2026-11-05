@@ -1,7 +1,7 @@
 # 会话 subagent 能力与执行状态解耦
 
 日期：2026-11-05
-状态：设计讨论已确认；书面 spec 待用户复核；未实施
+状态：已完成主会话三轮书面/代码对照复核；实施计划已编写；未实施
 
 ## 1. 问题与证据
 
@@ -97,6 +97,21 @@ embedded 使用已有 application capability 与本地 binding 生命周期，�
 - 无 guardian 的合法 embedded 部署不能因为缺少 managed 分类而被 worker 预算判死。
 - 角色本身不能授权新 owner、生成停止证明或证明旧执行已经结束。
 
+embedded 新建容器由宿主先生成随机接续凭证并安全落盘，再以其摘要参与原子创建；
+只有创建成功者获得该容器的身份，创建失败者不得覆盖既有摘要。命中既有 attachment
+时，公开 thread key 只能定位，不能取回秘密。宿主将接续凭证保存在自己的
+会话存储（私有字段、文件权限 0600），不能放进模型上下文、工具参数或公开查询。
+该长期凭证只授权身份接续，不直接授权 spawn；每代 daemon 仍须签发短期绑定/turn 能力。
+已持有的历史 application capability 可作为一次性升级证明，成功后撤销其业务写权限；
+若升级前未持有且无 guardian 授权，不得靠重新 attach 下载秘密，返回
+`session_identity_required`，由用户显式走既有受信恢复渠道。损坏/丢失凭证不自动强占。
+这不试图隔离本机同 UID 的恶意进程，但必须杜绝只知道 thread key 的业务调用者接管。
+managed 路径只接受现有 guardian 授权，绝不接受 embedded 凭证作为替代。
+
+新凭证只有摘要写入 runtime；正常应答中不返回长期秘密。创建/升级的 operation id
+与预存凭证绑定，应答丢失时同一宿主可证明身份并取得幂等结果；丢失宿主凭证则明确
+阻塞并走受信恢复，不能用安全性换“无条件恢复”。
+
 ### 4.3 执行状态与历史
 
 `TaskState` 和 attempt 继续描述 Execution 的运行结果，不作为容器能力的开关。
@@ -146,6 +161,14 @@ turn 栅栏变化不撤销仍合法运行的 child 自身能力。
 显式取消会话子树、关闭会话或释放 owner 时，仍按已有取消范围和停止证明回收，
 不能用“容器可继续使用”替代物理停止。
 
+具体语义必须区分：结束/中断当前 turn 只撤销该 turn 的写准入；`cancel_agent`
+撤销所选 child 的执行及后代，不永久关闭会话；临时 detach/宿主退出关闭当前绑定，
+可在身份和停止边界满足后重新绑定；明确的会话关闭/删除写入持久 tombstone，不能被
+普通 attach、begin-turn 或 daemon 重启清除。取消已接受的 spawn 按提交先后处理：
+关闭先提交则 spawn 拒绝，spawn 先提交则它属于之后取消/释放必须覆盖的执行集合。
+宿主本地先封禁本轮调用，daemon 在同一准入屏障内提交关闭；无法确认 daemon 已关闭
+时不能报告“关闭已生效”，更不能开放新回合。物理停止与资源释放仍另行验证。
+
 Execution 的请求继续使用自身 task/attempt 能力；已终止 child 即使仍持有旧 token
 也不能派生，且不得转走 application root 入口。
 
@@ -161,6 +184,13 @@ Execution 的请求继续使用自身 task/attempt 能力；已终止 child 即�
 
 store 预检查和 supervisor 权威检查使用同一角色规则，不能只改一层。
 fork 内容只有在必要校验通过后才消费，拒绝路径不白白丢弃上传上下文。
+
+容器不得借普通 `SpawnChild`、`SendMessage`、`BeginForkUpload` 或取消/交付等旧入口
+绕过 turn 准入；daemon 根据真实角色统一检查所有写路由。Execution 即使使用 application
+入口也不能通过鉴权。turn 的捕获点在 `Agent::run` 的不可变本轮上下文；工具开始执行时
+从该上下文取快照，不能从一个可被新回合覆盖的“current turn”槽位读取。上传的
+begin/chunk/finish/consume 都绑定同一 generation/binding/turn，跨回合 token 拒绝；
+关闭后只允许不产生业务副作用的上传清理。只读与后台 child 完成通知不要求旧 turn 仍开放。
 
 ### 6.2 watchdog、启动恢复与级联
 
@@ -198,6 +228,15 @@ recovery_required。Execution 仍走已有恢复流程，不自动续跑。
 daemon 退出不代表它启动的所有工具进程都已退出；有未知工具组或旧前台执行时，
 返回结构化阻塞原因，不能以缓存丢失或超时冒充停止证明。
 
+停止边界按代次与执行身份划分，而非“整棵会话树必须全停”：替换同一宿主绑定时，
+必须证明旧宿主前台执行/工具组已停止或从未启动；正常回合结束后仍合法运行的独立
+child 继续由 daemon 管理，不为新 turn 强行取消。daemon 重启后的旧 child 保持
+recovery_required 并隔离、继续占用未证明释放的资源；若其影响范围与新工作冲突则
+阻塞新写入（尤其共享目录写入），无冲突且停止边界独立时不把它当整个会话永久锁。
+unknown 执行登记必须保留，缺记录不是停止证明；显式破坏性恢复仍需确认。
+兼容 `RootRef.attempt_id` 对容器只用于核对历史快照/寻址，不创建或重开 attempt；
+容器授权栅栏以独立 binding/driver/turn 为准，Execution 的 attempt 栅栏不变。
+
 ### 7.3 幂等与并发
 
 容器绑定/历史兼容操作按稳定 operation id 幂等；同旧 epoch 的并发接续最多一个提交。
@@ -209,7 +248,8 @@ spawn 仍是有副作用的请求：应答丢失不自动重发，不把“已�
 
 ## 8. 历史 root 与迁移
 
-迁移在 watchdog/startup sweep 之前完成，仅回填角色及关闭的容器生命周期记录：
+迁移在 watchdog/startup sweep 之前完成，仅回填角色及准入关闭的容器记录；
+关闭准入不等于持久会话关闭，不能为升级批量写入关闭 tombstone：
 
 1. 有完整且一致 application attachment、task 为 root、session 对应正确的记录，
    标为 SessionContainer；detached attachment 不自动变 attached。
@@ -283,9 +323,25 @@ spawn 仍是有副作用的请求：应答丢失不自动重发，不把“已�
 
 ## 12. 交付与后续流程
 
-本次提交只包含书面 spec、模块需求记录和索引更新，不包含代码修复或已通过声明。
-用户复核书面 spec 后再写实施计划，拆分持久角色、容器策略、会话栅栏、历史接续、
-三端接线和回归验证等有依赖的步骤。
+本次交付只包含书面 spec、实施计划、模块需求记录和索引更新，不包含代码修复或已通过声明。
+按用户“反复检查 spec，无问题后写 plan”的要求，先完成三轮复核再编写计划；
+计划拆分持久角色、容器策略、会话栅栏、历史接续、三端接线和回归验证等有依赖的步骤。
 
 实现阶段遵循 worktree、TDD、代码审查和 `just ci` 门禁；真实 LLM 不作为默认测试依赖。
 完成必须以 C1–C17 的实际证据为准，不能仅凭当前会话一次 spawn 成功宣称修复。
+
+## 13. 2026-11-05 复核记录
+
+两条独立只读评审请求均被当前 daemon 以本问题拒绝，没有评审 agent 启动。
+以下为主会话三轮审查，不冒称独立评审或运行验证：
+
+| 轮次 | 代码对照与反例 | 发现与处理 |
+|---|---|---|
+| 1：角色与持久化 | `core/subagent/{task,supervisor}.rs`、`store/repository/{application_root,foreground,watchdog}.rs`、`store/runtime.rs` | 确认 worker 同样可包装 ThreadRoot；显式角色与历史状态分离不可省略；补清 RootRef 的旧 attempt 只作兼容寻址，不重开 attempt |
+| 2：授权、停止与重启 | `store/ipc/{authority,protocol,daemon}.rs`、`store/runtime/foreground.rs`、`lifecycle/foreground.rs` | 原文未明确接续凭证取得方式及停止集合；补入 embedded 私有凭证、只知 thread key 不可接管、旧能力一次性升级、独立 child 与旧宿主停止边界、冲突隔离 |
+| 3：回合与并发反例 | `core/{agent,tool}.rs`、`subagent/{lib,thread_root}.rs`、`app-server/server/driver/turn_driver.rs`、CLI `main.rs` | 补入 run 级不可变工具快照、全写路由/上传阶段栅栏、detach/close 区别、关闭提交先后及失联时不宣称成功；反查新文本未放松 Execution 终态与 guardian 授权 |
+
+复核后未发现阻止编写计划的设计矛盾。旧 embedded 会话缺少接续凭证时仍可能返回
+身份阻塞，这是安全边界，不承诺所有历史会话均能无条件自动恢复。该场景必须在实现
+验收中显式覆盖并清楚告知用户；不得改生产数据库或重新下载旧秘密来伪造恢复。
+实施中的接口可行性仍由编译、红绿测试和代码审查证明；若发现与这些约束冲突，先修订设计。
