@@ -180,7 +180,32 @@ impl ThreadRoot {
     /// through the wire. The fixed binding reports generation 0 forever, so the
     /// root stays live and no repair is ever attempted.
     pub fn from_handle(binding: Arc<RuntimeBinding>, root: AttachedRoot) -> Arc<Self> {
+        // The root's own session id is the only key available here, and for a
+        // single-root host it is also the right one: nothing will attach a second
+        // container for this process. A host that *does* know its conversation key
+        // must use [`Self::adopt`] instead.
         let thread_id = root.session_id.clone();
+        Self::adopt(binding, root, thread_id)
+    }
+
+    /// Wraps an already-attached root as *this conversation's* root.
+    ///
+    /// Separate from [`Self::from_handle`] because the two ids are not the same
+    /// thing: `AttachedRoot::session_id` is the daemon's root session, which is
+    /// minted fresh on every attach, while a conversation's container key is
+    /// `thread:<thread_id>` -- stable across restarts and retries. Adopting with
+    /// the session id would make this conversation's container a *second* task:
+    /// the root the host attached (keyed by the thread) plus one derived from the
+    /// session, and a turn's fence would name whichever the write happened to use.
+    ///
+    /// A host that keys its application root by the conversation passes that key
+    /// here, which is what makes the attached root and the container one task.
+    pub fn adopt(
+        binding: Arc<RuntimeBinding>,
+        root: AttachedRoot,
+        thread_id: impl Into<String>,
+    ) -> Arc<Self> {
+        let thread_id = thread_id.into();
         let project_dir = root.workspace.path.clone();
         // The TUI and the daemon's own workers are single-root by design: they
         // were handed one already-attached root, and there is no second root to

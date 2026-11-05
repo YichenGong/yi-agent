@@ -182,6 +182,29 @@ impl SessionHost {
         &self.attached
     }
 
+    /// The handle a turn's writes must carry: the **container**, not the root the
+    /// host attached through.
+    ///
+    /// `ThreadRoot::handle()` answers with the task the host attached as -- for a
+    /// TUI or `run` that is the application root, which is a different task from
+    /// this conversation's container. A turn's fence names the container, so a
+    /// write sent under the application root is refused as `authority_denied`
+    /// ("the turn belongs to another container"): the two have to be the same
+    /// task or the daemon cannot tell whose turn is writing.
+    ///
+    /// Only the identity differs; the socket and workspace still come from the
+    /// live runtime, and the capability stays the turn's own secret.
+    fn container_handle(&self) -> Result<RuntimeHandle, SessionClientError> {
+        let shared = self.root.handle().map_err(SessionClientError::Transport)?;
+        Ok(RuntimeHandle {
+            socket_path: shared.socket_path,
+            workspace_root: self.attached.workspace_root.clone(),
+            session_id: self.attached.session_id.clone(),
+            task_id: self.attached.root_id.clone(),
+            capability: shared.capability,
+        })
+    }
+
     pub fn root(&self) -> &Arc<ThreadRoot> {
         &self.root
     }
@@ -279,7 +302,7 @@ impl SessionHost {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .expect("a binding was just prepared");
-        let handle = self.root.handle().map_err(SessionClientError::Transport)?;
+        let handle = self.container_handle()?;
         let response = send_request(
             &handle.socket_path,
             IpcRequest::BeginSessionTurn {

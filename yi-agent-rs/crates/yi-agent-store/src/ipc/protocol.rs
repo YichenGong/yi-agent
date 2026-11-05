@@ -753,6 +753,30 @@ pub struct IpcTaskSummary {
     /// 双向兼容：老 daemon 不回时读出全零，而不是解析失败。
     #[serde(default)]
     pub usage: IpcTaskUsage,
+    /// `execution` or `session_container`.
+    ///
+    /// A container is where a conversation delegates from, not an attempt at work.
+    /// `serde(default)` keeps old peers readable: an absent role reads as an
+    /// execution, which is what every row written before containers was.
+    #[serde(default = "default_task_role")]
+    pub role: String,
+    /// `open` / `closed` for containers, `unknown` otherwise.
+    ///
+    /// Never derived from `state`: a container whose last attempt reads `stalled`
+    /// is still open. `unknown` is returned as-is rather than filled from history.
+    #[serde(default = "default_container_activity")]
+    pub container_activity: String,
+    /// A container's last attempt state, present only as history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_execution_state: Option<String>,
+}
+
+fn default_task_role() -> String {
+    "execution".to_string()
+}
+
+fn default_container_activity() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

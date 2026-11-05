@@ -62,40 +62,64 @@ impl RuntimeRepository {
         root_session_id: Option<&RootSessionId>,
         active_only: bool,
     ) -> Result<Vec<PersistedTaskSummary>, RepositoryError> {
-        let (sql, parameters): (&str, Vec<String>) = match (root_session_id, active_only) {
+        // A container's `state_json` is the state of its last attempt, which is
+        // history. Filtering "active" on it would hide a conversation that is
+        // still open for delegation just because its last turn ended badly --
+        // exactly the stalled-container case. So the two roles are filtered by
+        // their own evidence: executions by state, containers by the container row.
+        const ACTIVE: &str = "((t.role = 'session_container' AND COALESCE(c.closed, 0) = 0)
+                   OR (t.role <> 'session_container' AND t.state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')))";
+        let select = "SELECT t.id, t.state_json, t.parent_id IS NULL, t.parent_id, t.thread_id,
+                    t.role, c.closed
+             FROM tasks t LEFT JOIN session_containers c ON c.root_task_id = t.id";
+        let (sql, parameters): (String, Vec<String>) = match (root_session_id, active_only) {
             (Some(session), false) => (
-                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
-                 WHERE root_session_id = ?1 ORDER BY created_at, id",
+                format!("{select} WHERE t.root_session_id = ?1 ORDER BY t.created_at, t.id"),
                 vec![session.to_string()],
             ),
             (None, true) => (
-                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
-                 WHERE state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
-                 ORDER BY created_at, id",
+                format!("{select} WHERE {ACTIVE} ORDER BY t.created_at, t.id"),
                 Vec::new(),
             ),
-            (None, false) => (
-                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks ORDER BY created_at, id",
-                Vec::new(),
-            ),
+            (None, false) => (format!("{select} ORDER BY t.created_at, t.id"), Vec::new()),
             (Some(session), true) => (
-                "SELECT id, state_json, parent_id IS NULL, parent_id, thread_id FROM tasks
-                 WHERE root_session_id = ?1
-                   AND state_json NOT IN ('completed', 'completed_no_changes', 'failed', 'cancelled')
-                 ORDER BY created_at, id",
+                format!(
+                    "{select} WHERE t.root_session_id = ?1 AND {ACTIVE} ORDER BY t.created_at, t.id"
+                ),
                 vec![session.to_string()],
             ),
         };
-        let mut statement = self.connection.prepare(sql)?;
+        let mut statement = self.connection.prepare(&sql)?;
         let mut summaries = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
+                let state: String = row.get(1)?;
+                let role: String = row.get(5)?;
+                let closed: Option<i64> = row.get(6)?;
+                // The activity of a container comes only from its own row. A
+                // missing row is `unknown` on purpose: filling it from the
+                // historical state is how a stale `stalled` would be read as
+                // "this conversation is broken".
+                let is_container = role == "session_container";
+                let container_activity = if is_container {
+                    match closed {
+                        Some(0) => "open".to_string(),
+                        Some(_) => "closed".to_string(),
+                        None => "unknown".to_string(),
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                let historical_execution_state = is_container.then(|| state.clone());
                 Ok(PersistedTaskSummary {
                     task_id: row.get(0)?,
-                    state: row.get(1)?,
+                    state,
                     is_root: row.get(2)?,
                     parent_task_id: row.get(3)?,
                     thread_id: row.get(4)?,
                     usage: crate::ipc::IpcTaskUsage::default(),
+                    role,
+                    container_activity,
+                    historical_execution_state,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()

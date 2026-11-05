@@ -357,3 +357,93 @@ fn session_delegation_lifecycle_container_is_absent_from_worker_watchdog() {
         "a running execution must still be a watchdog candidate"
     );
 }
+
+/// A stalled container is still an open conversation.
+///
+/// The bug this pins: `active_only` filtered on `tasks.state_json`, so a
+/// conversation whose last attempt ended `stalled` vanished from every "active"
+/// list even though its container row was still open. Callers then read that
+/// absence as "this session is finished" -- which is how a restarted app decided
+/// the kanban session could no longer work. The role, not the historical state,
+/// decides whether a container is active.
+#[test]
+fn session_delegation_lifecycle_a_stalled_container_is_still_active() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, _attempt) = seed_legacy_v18(&mut repository, "thread:stalled");
+    // The seeded row is already `stalled`; the attachment made it a container,
+    // so `active_only` has to surface it anyway.
+    assert_eq!(
+        repository.task_role(&root).unwrap(),
+        TaskRole::SessionContainer
+    );
+
+    let active = repository.task_summaries(None, true).unwrap();
+    let row = active
+        .iter()
+        .find(|summary| summary.task_id == root.to_string())
+        .expect("an open container must not be hidden by its historical state");
+    assert_eq!(row.role, "session_container");
+    assert_eq!(row.state, "stalled", "history is reported verbatim");
+    assert_eq!(
+        row.container_activity, "open",
+        "the container row, not the state, says it is usable"
+    );
+    assert_eq!(
+        row.historical_execution_state.as_deref(),
+        Some("stalled"),
+        "the last attempt state is available, but labelled as history"
+    );
+
+    // Closing the container is what removes it -- and only that.
+    repository.close_session_container(&root).unwrap();
+    let active = repository.task_summaries(None, true).unwrap();
+    assert!(
+        active
+            .iter()
+            .all(|summary| summary.task_id != root.to_string()),
+        "a closed container is no longer active"
+    );
+    let all = repository.task_summaries(None, false).unwrap();
+    let row = all
+        .iter()
+        .find(|summary| summary.task_id == root.to_string())
+        .expect("a closed container is still listed without the filter");
+    assert_eq!(row.container_activity, "closed");
+}
+
+/// An execution's state still decides whether it is active.
+///
+/// The role split must not accidentally keep finished work in the list: an
+/// execution has no container row, so its own terminal state is all there is.
+#[test]
+fn session_delegation_lifecycle_a_finished_execution_is_not_active() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let session = RootSessionId::new();
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt(&task, &session, &attempt, 1, "completed")
+        .unwrap();
+
+    let active = repository.task_summaries(None, true).unwrap();
+    assert!(
+        active
+            .iter()
+            .all(|summary| summary.task_id != task.to_string()),
+        "a completed execution is not active"
+    );
+    let all = repository
+        .task_summaries(None, false)
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.task_id == task.to_string())
+        .expect("it is still listed without the filter");
+    assert_eq!(all.role, "execution");
+    assert_eq!(
+        all.container_activity, "unknown",
+        "an execution has no container activity; it must not be guessed"
+    );
+    assert_eq!(all.historical_execution_state, None);
+}

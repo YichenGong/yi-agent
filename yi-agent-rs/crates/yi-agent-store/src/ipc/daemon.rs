@@ -2160,6 +2160,9 @@ pub(crate) fn respond(
                     parent_task_id: task.parent_task_id,
                     thread_id: task.thread_id,
                     usage: task.usage,
+                    role: task.role,
+                    container_activity: task.container_activity,
+                    historical_execution_state: task.historical_execution_state,
                 })
                 .collect();
             Ok(IpcResponse::TaskSummaries { tasks })

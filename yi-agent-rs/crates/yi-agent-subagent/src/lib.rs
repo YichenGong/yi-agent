@@ -7,6 +7,7 @@
 
 pub mod attach;
 pub mod binding;
+pub mod delegation;
 pub mod executor;
 pub mod foreground;
 pub mod session_delegation;
@@ -724,9 +725,19 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
     ) -> bool {
-        git_output(workspace, &["rev-parse", "--show-toplevel"]).is_some_and(|repository_root| {
-            recorded.repository_root == std::path::Path::new(&repository_root)
-        })
+        // A tracked project is identified by its repository, so a worktree and its
+        // checkout are the same project even though their paths differ.
+        if let Some(repository_root) = git_output(workspace, &["rev-parse", "--show-toplevel"]) {
+            return recorded.repository_root == std::path::Path::new(&repository_root);
+        }
+        // Not a repository at all -- a plain directory, which is an ordinary
+        // workdir for a conversation that never asked for a worktree. There is no
+        // repository identity to compare, so the directory *is* the identity, and
+        // refusing the match would make re-attaching a root in such a directory
+        // impossible: the same root, under the same key, would be rejected as
+        // "another repository" forever. Canonicalized, because `$TMPDIR` reaches
+        // it as `/var/...` on one path and `/private/var/...` on another.
+        canonical_or_self(workspace) == canonical_or_self(&recorded.repository_root)
     }
 
     fn recovery_context(&self) -> WorkerRecoveryContext {
@@ -1328,6 +1339,15 @@ fn git_dir_for_worktree(workspace: &std::path::Path) -> Option<PathBuf> {
 fn current_git_branch(workdir: &std::path::Path) -> Option<String> {
     let branch = git_output(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     (!branch.trim().is_empty() && branch != "HEAD").then_some(branch)
+}
+
+/// The path with every symlink resolved, or as given when it cannot be.
+///
+/// A comparison helper, not a filesystem verdict: a path that does not resolve
+/// is still compared, so a diagnostic about a missing directory stays the
+/// caller's to make.
+fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -2938,6 +2958,38 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    /// A plain directory is still a project, so re-attaching its root must work.
+    ///
+    /// The repository check asked git for the top level, and a directory that is not
+    /// a repository has none. Reporting "not the same project" for a workdir that is
+    /// simply not under git made every re-attach of that root fail forever -- the
+    /// exact refusal a conversation saw as `application root workspace does not match
+    /// its recorded repository` when it delegated from a scratch directory.
+    #[test]
+    fn a_directory_that_is_not_a_repository_matches_itself() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let project = directory.path().join("plain-project");
+        std::fs::create_dir_all(&project).expect("a plain project directory");
+        let worker = tests::worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let recorded = yi_agent_core::subagent::worker::WorkerWorkspace {
+            lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+            repository_root: project.clone(),
+            path: project.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        assert!(
+            worker.project_workspace_matches(&project, &recorded),
+            "a non-repository directory must be identified by its own path"
+        );
+        assert!(
+            !worker.project_workspace_matches(directory.path(), &recorded),
+            "a different directory is still a different project"
+        );
+    }
+
     /// The whole point of the root refactor: the five application delegation tools
     /// share one conversation root instead of freezing their own socket.
     #[test]

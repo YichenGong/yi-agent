@@ -693,10 +693,32 @@ impl RuntimeCoordinator {
                     }
                 };
                 let Some(supervisor) = supervisors.get(&task.session_id) else {
-                    if activation.is_enabled() {
-                        // Only reachable when the session's root was a surviving
-                        // foreground container: the child stays parked and its session
-                        // hydrates once the root is re-authorized and bound.
+                    // A child can be parked while its root is not in the recovery set,
+                    // and that is not corruption when the root is a **session
+                    // container**: a container is a conversation, not an attempt, so
+                    // it is never swept into recovery (see `watchdog.rs`, which
+                    // excludes containers from the attempt sweep unconditionally). Its
+                    // historic execution can still be parked, and refusing the whole
+                    // daemon for that shape means a restarted host cannot start at all
+                    // -- the conversation's own subagent rows would make every later
+                    // launch fail with "persisted recovered child has no recovered
+                    // root".
+                    //
+                    // The child stays parked either way; whoever binds the container
+                    // next hydrates the session. Only the verdict differs, and the role
+                    // is what decides it: for an execution that is still corruption,
+                    // because an execution's root has to be recoverable.
+                    // The parent, not `session_id`: the latter is the root *session*
+                    // (a UUID minted per attach), while the role lives on the task.
+                    // For a first-level child the parent is the conversation's
+                    // container, which is what makes this the tolerated shape.
+                    let parent_is_container = match parent_id.to_string().parse() {
+                        Ok(parent) => repository
+                            .task_role(&parent)
+                            .is_ok_and(|role| role == TaskRole::SessionContainer),
+                        Err(_) => false,
+                    };
+                    if activation.is_enabled() || parent_is_container {
                         continue;
                     }
                     return Err(RuntimeCoordinatorError::Supervisor(

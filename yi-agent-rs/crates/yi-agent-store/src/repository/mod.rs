@@ -457,6 +457,24 @@ pub struct PersistedTaskSummary {
     ///
     /// 按 task 聚合而非取最后一次：重试是真实消耗，只算最新一次会低估。
     pub usage: crate::ipc::IpcTaskUsage,
+    /// `execution` or `session_container`.
+    ///
+    /// A container is a conversation's place to delegate from, not an attempt at
+    /// work: its `state` is history and says nothing about whether it may still
+    /// spawn. Readers that ask "can this go on?" must look at this role and at
+    /// [`Self::container_activity`], never at the state.
+    pub role: String,
+    /// What a container is doing *now*; `unknown` for executions.
+    ///
+    /// Deliberately not derived from `state`: a container whose historical state
+    /// reads `stalled` is still open and still usable. Only the container row can
+    /// answer this, so an absent row yields `unknown` rather than a guess.
+    pub container_activity: String,
+    /// The execution state, only for containers, and only as history.
+    ///
+    /// Kept separate so a UI can label it "last attempt" instead of showing a
+    /// stale `stalled` as if it described the conversation's capability.
+    pub historical_execution_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

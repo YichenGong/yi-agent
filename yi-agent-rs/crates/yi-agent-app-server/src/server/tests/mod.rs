@@ -1306,6 +1306,9 @@ fn summary(
         parent_task_id: Some("root".into()),
         thread_id: thread_id.map(str::to_string),
         usage: yi_agent_store::ipc::IpcTaskUsage::default(),
+        role: "execution".to_string(),
+        container_activity: "unknown".to_string(),
+        historical_execution_state: None,
     }
 }
 

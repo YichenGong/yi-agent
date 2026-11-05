@@ -272,9 +272,21 @@ pub(crate) async fn run_thread_driver(
             ));
         }
         // Resolve managed vs embedded *before* preparing: a guardian's refusal must
-        // be reported as such, not silently replaced by the host's own secret.
+        // be reported as such, not silently replaced by the host's own secret. Asked
+        // once per conversation, because it is a property of the host's lease rather
+        // than of the turn.
         let authority_failure = match (delegation.as_mut(), foreground_host.as_ref()) {
-            (Some(driver), Some(manager)) => driver.resolve_authority(manager).err(),
+            (Some(driver), Some(manager)) if driver.authority().is_none() => {
+                match manager.authority(&driver.root(), &format!("app-server:{}", turn_id)) {
+                    Ok(authority) => {
+                        driver.set_authority(authority);
+                        None
+                    }
+                    Err(reason) => Some(crate::server::delegation::DelegationFailure::Unavailable(
+                        reason,
+                    )),
+                }
+            }
             // No guardian manager: an embedded deployment, which is a normal answer.
             _ => None,
         };
@@ -282,7 +294,7 @@ pub(crate) async fn run_thread_driver(
             Some(failure) => crate::server::delegation::PreparedTurn::NotReady(failure),
             None => delegation
                 .as_mut()
-                .map(|driver| driver.prepare_turn_with(&turn_id, foreground_host.as_deref()))
+                .map(|driver| driver.prepare_turn(&turn_id))
                 .unwrap_or_else(|| {
                     crate::server::delegation::PreparedTurn::NotReady(
                         crate::server::delegation::DelegationFailure::Unavailable(
@@ -295,39 +307,29 @@ pub(crate) async fn run_thread_driver(
         // turn's tools still hold: that is what stops a slow call from borrowing
         // the authority of the turn that replaced it.
         let mut registry = (*agent.tools()).clone();
-        // Strip whatever delegation tools are there *before* deciding, so a turn
-        // that could not be prepared ends up with none at all.
-        for name in [
-            "spawn_agent",
-            "send_message",
-            "wait_agent",
-            "inspect_agent",
-            "cancel_agent",
-        ] {
-            registry.remove(name);
-        }
-        let failure = match prepared {
-            crate::server::delegation::PreparedTurn::Ready { turn, execution } => {
-                let caller = yi_agent_subagent::CallerContext::unbound();
-                caller.bind(agent.session_handle());
-                yi_agent_subagent::register_session_turn_tools(
-                    &mut registry,
-                    Arc::clone(&turn),
-                    sandbox.clone(),
-                    Some(thread_id.clone()),
-                    caller,
-                );
-                delegation_turn = Some((turn, execution));
+        let caller = yi_agent_subagent::CallerContext::unbound();
+        caller.bind(agent.session_handle());
+        let failure = match yi_agent_subagent::delegation::install_turn_tools(
+            &mut registry,
+            prepared,
+            sandbox.clone(),
+            Some(thread_id.clone()),
+            caller,
+        ) {
+            Ok(installed) => {
+                delegation_turn = Some(installed);
                 None
             }
-            crate::server::delegation::PreparedTurn::NotReady(failure) => Some(failure),
+            // Nothing was registered, so this turn ends up with no delegation
+            // tools at all -- the honest state for a turn that could not prepare.
+            Err(failure) => Some(failure),
         };
         agent.set_tools_for_next_run(Arc::new(registry));
         let notification = crate::protocol::Notification::DelegationStatusUpdated {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
             ready: failure.is_none(),
-            failure: failure.map(|failure| failure.payload()),
+            failure: failure.map(|failure| crate::server::delegation::payload(&failure)),
         };
         let _ = write_notification(&hub, &notification).await;
         // Every exit path below runs this. The turn's tools must stop writing the
