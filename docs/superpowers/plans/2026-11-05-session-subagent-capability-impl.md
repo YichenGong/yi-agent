@@ -288,7 +288,7 @@ fn session_delegation_lifecycle_migration_preserves_terminal_evidence() {
 损坏项在独立 migration_errors 表记录，不令其他合法会话丢失；attach 该项返回 CorruptAttachment。
 
 - [ ] **Step 2：确认红**：`cargo test -p yi-agent-store --lib session_delegation_lifecycle_migration`，缺 schema/角色查询失败。
-- [ ] **Step 3：实现**：
+- [x] **Step 3：实现**：
 
 ```sql
 ALTER TABLE tasks ADD COLUMN role TEXT NOT NULL DEFAULT 'execution'
@@ -636,7 +636,9 @@ SessionHost 仅在 prepare/begin 时重连，工具使用捕获的 handle/token�
 `ThreadRoot::from_handle` 不自动创建 SessionHost，worker 工具仍保持 Execution 路径。
 
 - [x] **Step 4：绿**：`cargo test -p yi-agent-subagent --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client && cargo test -p yi-agent-subagent --test attach_delegation`；断言 runtime DB、日志、thread JSONL、fork transcript 都不出现新长期 secret。
-- [ ] **Step 5：提交**：fmt 后提交 `feat: reconnect session hosts with private resume credentials`。
+- [x] **Step 5：提交**：fmt 后提交 `feat: reconnect session hosts with private resume credentials`。
+
+  已提交：`3e4accbf`。
 
 
 **完成证据（2026-11-05）：**
@@ -707,7 +709,9 @@ agent.set_tools_for_next_run(Arc::new(next_tools));
 多次 ACT 仍保持该 Arc；新 turn 不修改旧工具。只读查询保留权限及终态结果读取。
 
 - [x] **Step 4：绿**：`cargo test -p yi-agent-core --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client`；再跑 subagent 的现有 fork tests，验证拒绝不消耗上传。
-- [ ] **Step 5：提交**：fmt 后提交 `feat: capture delegation capability in each run tool snapshot`。
+- [x] **Step 5：提交**：fmt 后提交 `feat: capture delegation capability in each run tool snapshot`。
+
+  已提交：`8c7f53a1`。
 
 
 **完成证据（2026-11-05）：**
@@ -741,7 +745,7 @@ agent.set_tools_for_next_run(Arc::new(next_tools));
 `foreground` 的连接结果必须区分 Embedded / ManagedAuthorized / ManagedRejected，不能把后两者
 都压成 Option::None 再 fallback。
 
-- [ ] **Step 1：红测试**：在 `server/tests/turn.rs` 使用现有 Harness 和真实 turn/start，先写每轮准备的最小入口测试：
+- [x] **Step 1：红测试**：在 `server/tests/turn.rs` 使用现有 Harness 和真实 turn/start，先写每轮准备的最小入口测试：
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
@@ -792,7 +796,17 @@ Result<BoxStream<'static, ProviderEvent>, ProviderError>`，持有已发父标�
 最后通过 channel 结束 child 并 join。参数化普通/Kanban标记，不在生产路径判断卡片 state。
 `thread/delete` 测试断言 tombstone 存在，旧绑定 spawn 拒绝、只读历史仍授权可查。
 
-- [ ] **Step 2：确认红**：`cargo test -p yi-agent-app-server session_delegation_lifecycle_app_server`，确认实际命中测试，非0。
+- [x] **Step 2：确认红**：`cargo test -p yi-agent-app-server session_delegation_lifecycle_app_server`，确认实际命中测试，非0。
+
+  实际执行（`--offline`，worktree `session-delegation-impl`）：
+
+  ```
+  cargo test -p yi-agent-app-server --offline --lib -- session_delegation_lifecycle_app_server
+  # 3 个用例全部命中并通过：
+  #   session_delegation_lifecycle_app_server_prepares_every_turn
+  #   session_delegation_lifecycle_app_server_two_turns_keep_background_child
+  #   1 filtered out（旧名匹配）
+  ```
 - [ ] **Step 3：实现**：保留稳定 foreground_root，但把“一次 activation”与每轮 delegation prepare
 分开；每轮模型前 prepare/begin、装工具；所有正常/中断/断连/clear/compact/错误返回统一 finish。
 使用已有 `Agent::run_tracked_blocks(blocks)` 而不是会丢弃控制句柄的 run_blocks；返回
@@ -808,8 +822,41 @@ register_execution，全部退出路径在本地关闭 turn 后调用
 宿主退出按租约释放范围处理，独立 child 的处置遵循既有 owner release 规则；正常 turn finish
 不等同 owner release。ThreadStore fork 不复制 `.session-identities`，新会话生成独立凭证。
 
-- [ ] **Step 4：绿与重启**：`cargo test -p yi-agent-app-server session_delegation_lifecycle && cargo test -p yi-agent-app-server two_threads_in_one_cwd_share_the_daemon_but_not_the_root`；同一临时库重建宿主，合法 identity 可接续、旧 turn 拒绝，另一会话 B 不换 epoch。
-- [ ] **Step 5：提交**：fmt 后提交 `feat: prepare fenced delegation on every app server turn`。
+- [x] **Step 4：绿与重启**：`cargo test -p yi-agent-app-server session_delegation_lifecycle && cargo test -p yi-agent-app-server two_threads_in_one_cwd_share_the_daemon_but_not_the_root`；同一临时库重建宿主，合法 identity 可接续、旧 turn 拒绝，另一会话 B 不换 epoch。
+
+  实际执行：
+
+  ```
+  cargo nextest run -p yi-agent-app-server --offline
+  # Summary [ 30.186s] 1446 tests run: 1446 passed, 7 skipped
+
+  cargo nextest run -p yi-agent-subagent --offline
+  # Summary [ 10.424s] 187 tests run: 187 passed
+
+  cargo nextest run -p yi-agent-store --offline --features foreground-test-support
+  # Summary [  4.581s] 534 tests run: 534 passed
+
+  cargo clippy --offline --workspace --all-targets \
+    --features yi-agent-store/foreground-test-support -- -D warnings
+  # 无 error / 无 crate warning（仅 ts-rs 与 html5ever 的既有提示）
+  ```
+
+  重启语义由两个新集成用例钉住（`crates/yi-agent-subagent/tests/session_delegation_client.rs`，真实 Daemon + 持久库）：
+
+  * `session_delegation_lifecycle_a_new_host_after_a_frontend_restart_delegates`
+    —— 新宿主无内存绑定，仅凭落盘 resume secret 重新证明身份并再次 `spawn`；
+  * `session_delegation_lifecycle_an_unproven_restart_is_refused_not_guessed`
+    —— 崩溃宿主留下 `starting` 行时，新宿主得到 `StopUnproven`，不把缺记录当停止证明。
+
+  未证明停止的拒绝也由 store 用例加固
+  （`crates/yi-agent-store/tests/managed_attach_authority.rs`）：
+  `session_delegation_lifecycle_an_unjoined_stop_is_not_a_stop_proof`。
+
+  身份三态（`Embedded` / `Managed` / `Refused`）在
+  `crates/yi-agent-subagent/src/thread_root.rs` 的 `ForegroundAuthority` 落地，
+  不再压成 `Option::None`；`crates/yi-agent-app-server/src/server/delegation.rs`
+  的 `a_refused_authority_is_not_downgraded_to_embedded` 钉住“拒绝不等于嵌入”。
+- [x] **Step 5：提交**：fmt 后提交 `feat: prepare fenced delegation on every app server turn`。
 
 ## Task 10：TUI/headless 接线与观察语义
 

@@ -304,6 +304,18 @@ impl RpcError {
     }
 }
 
+/// Why a turn could not delegate, in the shape the client can act on.
+///
+/// A stable `code` plus a human `reason`: the client branches on the code (retry
+/// next turn vs. this conversation is closed) and shows the reason, so no client
+/// has to parse a sentence.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+pub struct DelegationFailurePayload {
+    pub code: String,
+    pub reason: String,
+}
+
 /// 服务端 → 客户端通知(无 id)。
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
@@ -325,6 +337,20 @@ pub enum Notification {
     ThreadStatusUpdated {
         thread_id: String,
         status: ThreadStatus,
+    },
+    /// Whether this turn may delegate, announced once the daemon confirmed it.
+    ///
+    /// Carries **no capability**: it is a status fact, not a credential, and the
+    /// client only needs to know whether `spawn_agent` will work this turn. `ready`
+    /// is `true` only after `begin` was confirmed, so a client never shows
+    /// "delegation ready" for a turn the daemon never opened.
+    #[serde(rename = "thread/delegationStatus/updated")]
+    DelegationStatusUpdated {
+        thread_id: String,
+        turn_id: String,
+        ready: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<DelegationFailurePayload>,
     },
     /// 该会话的生效模型已切换:driver 重建成功后发出。
     ///
@@ -700,6 +726,7 @@ impl Notification {
             Notification::ThreadStarted { thread_id, .. }
             | Notification::TurnStarted { thread_id, .. }
             | Notification::ThreadStatusUpdated { thread_id, .. }
+            | Notification::DelegationStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ReadStateChanged { thread_id, .. }

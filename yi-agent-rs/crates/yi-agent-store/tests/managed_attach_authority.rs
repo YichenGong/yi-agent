@@ -569,3 +569,209 @@ async fn session_delegation_lifecycle_replacement_requires_a_stop_proof() {
         "{blocked}"
     );
 }
+
+/// A stop proof the host reported on its own control stream must be readable by
+/// the next `prepare`.
+///
+/// The regression this pins: `record_host_control_stop` stores the proof on the
+/// execution row, while `prepare` used to look only in the foreground evidence
+/// table. Both writes succeeded, yet the replacement was refused `StopUnproven`
+/// forever -- the daemon held the proof and could not see it. That is exactly the
+/// shape of "restart the app and the session can never delegate again".
+#[tokio::test]
+async fn session_delegation_lifecycle_host_reported_stop_unblocks_the_next_driver() {
+    use yi_agent_lifecycle::foreground::{
+        EvidenceSource, ExecutionKind, ForegroundFence, RootRef, SecretCapability, StopEvidence,
+    };
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionIdentity, SessionRef, session_resume_digest,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:stop-host:/p:1", &workspace, &[])
+        .await
+        .unwrap();
+    let root = SessionRef {
+        session_id: attached.session_id.to_string(),
+        root_id: attached.root_task_id.to_string(),
+    };
+    let resume_secret = SecretCapability::new("resume-host-stop");
+    let binding = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-first".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                attached.message_capability.clone(),
+            )),
+            current_binding: None,
+            replacement_resume_digest: Some(session_resume_digest(&resume_secret)),
+            stopped: Vec::new(),
+        })
+        .expect("the first driver binds");
+
+    // The first driver starts a turn and then reports that it stopped, exactly as
+    // `SessionHost::record_stopped` does.
+    coordinator
+        .begin_session_turn(&binding, "turn-1")
+        .expect("the first driver opens its turn");
+    let execution = coordinator
+        .register_host_control_execution(&binding, "turn-1")
+        .expect("the execution registers");
+    coordinator
+        .record_host_control_stop(
+            &binding,
+            &StopEvidence {
+                evidence_id: "host-evidence".into(),
+                fence: ForegroundFence {
+                    root: RootRef {
+                        session_id: root.session_id.clone(),
+                        root_id: root.root_id.clone(),
+                        attempt_id: execution.attempt_id.clone(),
+                    },
+                    generation: binding.fence.generation.clone(),
+                    binding_epoch: binding.fence.binding_epoch,
+                    driver_epoch: binding.fence.driver_epoch,
+                },
+                execution: execution.clone(),
+                attempt_id: execution.attempt_id.clone(),
+                source: EvidenceSource::Host,
+                joined: true,
+                tools_stopped: true,
+                process_identity: None,
+            },
+        )
+        .expect("the host's own proof is recorded");
+
+    coordinator
+        .prepare_session(PrepareSession {
+            root,
+            operation_id: "op-second".into(),
+            host_run_id: "host-2".into(),
+            expected_binding_epoch: binding.fence.binding_epoch,
+            identity: SessionIdentity::Embedded(resume_secret),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .expect("a recorded stop proof must let the next driver take over");
+    assert_eq!(
+        execution.kind,
+        ExecutionKind::Driver,
+        "a session host registers its own turn as a driver execution"
+    );
+}
+
+/// A host that could not join its run must not be able to call that a stop.
+///
+/// The app-server now reports `joined: false` when `stop_and_join` errored or when
+/// no tracked run existed. That report has to be refused by the daemon: turning it
+/// into a settled row would let a process that may still be writing be treated as
+/// gone, and the next driver would take over underneath it.
+#[tokio::test]
+async fn session_delegation_lifecycle_an_unjoined_stop_is_not_a_stop_proof() {
+    use yi_agent_lifecycle::foreground::{
+        EvidenceSource, ForegroundFence, RootRef, SecretCapability, StopEvidence,
+    };
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionFailureCode, SessionIdentity, SessionRef, session_resume_digest,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:unjoined:/p:1", &workspace, &[])
+        .await
+        .unwrap();
+    let root = SessionRef {
+        session_id: attached.session_id.to_string(),
+        root_id: attached.root_task_id.to_string(),
+    };
+    let resume_secret = SecretCapability::new("resume-unjoined");
+    let binding = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-first".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                attached.message_capability.clone(),
+            )),
+            current_binding: None,
+            replacement_resume_digest: Some(session_resume_digest(&resume_secret)),
+            stopped: Vec::new(),
+        })
+        .expect("the first driver binds");
+
+    coordinator
+        .begin_session_turn(&binding, "turn-1")
+        .expect("the first driver opens its turn");
+    let execution = coordinator
+        .register_host_control_execution(&binding, "turn-1")
+        .expect("the execution registers");
+    let refused = coordinator
+        .record_host_control_stop(
+            &binding,
+            &StopEvidence {
+                evidence_id: "host-evidence-unjoined".into(),
+                fence: ForegroundFence {
+                    root: RootRef {
+                        session_id: root.session_id.clone(),
+                        root_id: root.root_id.clone(),
+                        attempt_id: execution.attempt_id.clone(),
+                    },
+                    generation: binding.fence.generation.clone(),
+                    binding_epoch: binding.fence.binding_epoch,
+                    driver_epoch: binding.fence.driver_epoch,
+                },
+                execution: execution.clone(),
+                attempt_id: execution.attempt_id.clone(),
+                source: EvidenceSource::Host,
+                // The run was never joined -- exactly what the driver reports when
+                // `stop_and_join` failed or no tracked control existed.
+                joined: false,
+                tools_stopped: true,
+                process_identity: None,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::StopUnproven,
+                ..
+            }
+        ),
+        "an unjoined execution must not be retired: {refused}"
+    );
+
+    // And the session is not silently left open: the next driver is refused too.
+    let blocked = coordinator
+        .prepare_session(PrepareSession {
+            root,
+            operation_id: "op-second".into(),
+            host_run_id: "host-2".into(),
+            expected_binding_epoch: binding.fence.binding_epoch,
+            identity: SessionIdentity::Embedded(resume_secret),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            blocked,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::StopUnproven,
+                ..
+            }
+        ),
+        "an unproven execution must keep blocking the next driver: {blocked}"
+    );
+}

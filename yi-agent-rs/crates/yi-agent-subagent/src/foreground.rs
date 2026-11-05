@@ -611,6 +611,9 @@ pub struct ForegroundHost {
     /// Authorizations by root key. The queue is per process because a bind needs the
     /// same authorization across a retry around the host's own reconnection.
     authorized: std::sync::Mutex<std::collections::HashMap<String, RootAuthorization>>,
+    /// Refusals by root key. A refusal is a decision, not a transient state: asking
+    /// again on the next turn would let one "no" be answered "yes" by retrying.
+    refused: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Confirmation tokens issued to this host by its own `prepare`, by operation id.
     ///
     /// Kept here rather than handed back to the caller because a token that crossed
@@ -649,6 +652,7 @@ impl ForegroundHost {
         Ok(Some(Self {
             lease,
             authorized: std::sync::Mutex::new(std::collections::HashMap::new()),
+            refused: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
@@ -664,19 +668,54 @@ impl ForegroundHost {
         root: &Arc<crate::thread_root::ThreadRoot>,
         operation_id: &str,
     ) -> Result<Option<RootAuthorization>, String> {
+        Ok(self.authority(root, operation_id)?.into_authorization())
+    }
+
+    /// The same question with the *reason* kept.
+    ///
+    /// Delegation needs it: "no guardian" is embedded mode and may fall back to this
+    /// host's own secret, while "the guardian refused" must not. Flattening both to
+    /// `None` is precisely how a policy refusal turned into permission.
+    pub fn authority(
+        &self,
+        root: &Arc<crate::thread_root::ThreadRoot>,
+        operation_id: &str,
+    ) -> Result<crate::thread_root::ForegroundAuthority, String> {
         let key = crate::thread_root::application_root_key(root.thread_id());
+        if let Some(existing) = self
+            .refused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(crate::thread_root::ForegroundAuthority::Refused(existing));
+        }
         let mut authorized = self
             .authorized
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = authorized.get(&key) {
-            return Ok(Some(existing.clone()));
+            return Ok(crate::thread_root::ForegroundAuthority::Managed(
+                existing.clone(),
+            ));
         }
-        let Some(fresh) = root.authorize_foreground_root(&self.lease, operation_id)? else {
-            return Ok(None);
-        };
-        authorized.insert(key, fresh.clone());
-        Ok(Some(fresh))
+        match root.foreground_authority(&self.lease, operation_id)? {
+            crate::thread_root::ForegroundAuthority::Managed(fresh) => {
+                authorized.insert(key, fresh.clone());
+                Ok(crate::thread_root::ForegroundAuthority::Managed(fresh))
+            }
+            crate::thread_root::ForegroundAuthority::Embedded => {
+                Ok(crate::thread_root::ForegroundAuthority::Embedded)
+            }
+            crate::thread_root::ForegroundAuthority::Refused(reason) => {
+                self.refused
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, reason.clone());
+                Ok(crate::thread_root::ForegroundAuthority::Refused(reason))
+            }
+        }
     }
 
     /// Runs one recovery action on this host's own lease.

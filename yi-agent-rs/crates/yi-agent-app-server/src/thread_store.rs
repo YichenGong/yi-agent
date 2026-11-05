@@ -386,6 +386,16 @@ impl ThreadStore {
     ///
     /// 测试与调用方要构造一份「cwd 与 store 对得上」的 meta：直接由 store 反推，
     /// 比再传一遍路径更不容易写错（写错的表现是冷读报「没有可继承的历史」）。
+    /// Where this workspace keeps the per-conversation resume credentials.
+    ///
+    /// Kept beside `threads/` rather than inside a thread directory: a fork copies
+    /// a thread wholesale, and a copied credential would let two conversations
+    /// claim one daemon container. `fork_thread` therefore never touches it, and a
+    /// forked conversation mints its own secret on first use.
+    pub fn session_identity_directory(&self) -> PathBuf {
+        self.workdir().join(".session-identities")
+    }
+
     pub fn workdir(&self) -> &Path {
         self.root
             .parent()

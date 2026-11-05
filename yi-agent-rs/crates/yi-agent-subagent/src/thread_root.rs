@@ -77,6 +77,31 @@ pub fn application_root_key(thread_id: &str) -> String {
 /// The `RuntimeBinding` is shared (one daemon per project, self-healing); this
 /// type owns only the root triple, so two conversations in one directory have
 /// two independent root tasks and two independent child budgets.
+/// What this conversation's runtime will let it be.
+///
+/// The three answers are deliberately distinct. Collapsing them into `None` was the
+/// bug that let a guardian's refusal look like embedded mode, so delegation fell
+/// back to a resume secret the policy had just declined to authorize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForegroundAuthority {
+    /// No guardian serves this runtime: the host may use its own resume secret.
+    Embedded,
+    /// The guardian authorized this host; delegation proceeds as managed.
+    Managed(yi_agent_lifecycle::types::RootAuthorization),
+    /// A guardian exists and refused; embedded semantics may **not** be used.
+    Refused(String),
+}
+
+impl ForegroundAuthority {
+    /// The authorization, for callers that only care whether one exists.
+    pub fn into_authorization(self) -> Option<yi_agent_lifecycle::types::RootAuthorization> {
+        match self {
+            Self::Managed(authorization) => Some(authorization),
+            Self::Embedded | Self::Refused(_) => None,
+        }
+    }
+}
+
 pub struct ThreadRoot {
     binding: Arc<RuntimeBinding>,
     thread_id: String,
@@ -492,12 +517,36 @@ impl ThreadRoot {
         lease: &yi_agent_lifecycle::client::FrontendLease,
         operation_id: &str,
     ) -> Result<Option<RootAuthorization>, String> {
+        Ok(self
+            .authority_decision(lease, operation_id)?
+            .into_authorization())
+    }
+
+    /// The same question, answered with the *reason*, not flattened to `None`.
+    ///
+    /// Delegation needs the difference: "no guardian exists" is embedded mode and
+    /// may use the host's own resume secret, while "a guardian exists and said no"
+    /// must never fall back to it -- that would turn a policy refusal into
+    /// permission. Both are normal outcomes and neither is an error.
+    pub fn foreground_authority(
+        &self,
+        lease: &yi_agent_lifecycle::client::FrontendLease,
+        operation_id: &str,
+    ) -> Result<crate::thread_root::ForegroundAuthority, String> {
+        self.authority_decision(lease, operation_id)
+    }
+
+    fn authority_decision(
+        &self,
+        lease: &yi_agent_lifecycle::client::FrontendLease,
+        operation_id: &str,
+    ) -> Result<crate::thread_root::ForegroundAuthority, String> {
         let Some(runtime_dir) = self.binding.runtime_dir() else {
-            return Ok(None);
+            return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         };
         let control_path = runtime_dir.join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
         if !control_path.exists() {
-            return Ok(None);
+            return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         }
         let intent = yi_agent_lifecycle::foreground::RootBindIntent {
             operation_id: operation_id.to_string(),
@@ -512,17 +561,22 @@ impl ThreadRoot {
         let deadline =
             yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5));
         match lease.authorize_root(&intent, &deadline) {
-            Ok(authorization) => Ok(Some(authorization)),
+            Ok(authorization) => Ok(crate::thread_root::ForegroundAuthority::Managed(
+                authorization,
+            )),
             // A refusal is the guardian's policy answer: this host may run the turn
-            // without activity reporting. Only a transport failure is worth surfacing,
-            // and even then the caller decides -- the conversation is not lost.
+            // without activity reporting, but it must not present itself as managed.
+            // Only a transport failure is worth surfacing, and even then the caller
+            // decides -- the conversation is not lost.
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::debug!(%error, thread_id = %self.thread_id, "foreground authority refused");
-                Ok(None)
+                Ok(crate::thread_root::ForegroundAuthority::Refused(
+                    error.to_string(),
+                ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                 tracing::debug!(%error, thread_id = %self.thread_id, "foreground lifecycle unsupported");
-                Ok(None)
+                Ok(crate::thread_root::ForegroundAuthority::Embedded)
             }
             Err(error) => Err(error.to_string()),
         }

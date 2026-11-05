@@ -24,6 +24,28 @@ use crate::server::{
     saturate_u32, update_status, write_notification,
 };
 
+/// Whether the process groups this turn started are all gone.
+///
+/// Only a real observation counts: a group this turn left behind is `false`, and
+/// the daemon then keeps the execution unsettled instead of letting a later
+/// driver take over while something may still be writing. Processes that were
+/// already alive when the turn began are not this turn's, so they are excluded --
+/// a long-lived server from an earlier turn must not make every later stop
+/// unprovable.
+fn tools_stopped_since(manager: &yi_agent_tools::ProcessManager, before: &[String]) -> bool {
+    manager.list().iter().all(|process| {
+        if before.iter().any(|id| id == &process.process_id) {
+            return true;
+        }
+        matches!(
+            process.status,
+            yi_agent_tools::ProcessStatus::Exited { .. }
+                | yi_agent_tools::ProcessStatus::Killed
+                | yi_agent_tools::ProcessStatus::FailedToStart { .. }
+        )
+    })
+}
+
 /// 单个 thread 的 driver task:串行消费 turn,驱动 `agent.run()` 的 stream,
 /// 经 `Translator` 写成协议通知。
 ///
@@ -75,6 +97,15 @@ pub(crate) async fn run_thread_driver(
     // The host is shared by every thread because the control channel accounts for
     // *clients*: one lease per thread would look like several frontends.
     foreground_host: Option<Arc<crate::server::foreground::ForegroundDispatch>>,
+    // The sandbox policy this thread's tools were built with. The per-turn delegation
+    // tool set is built from it, so the spawn tools read the same live YOLO switch as
+    // the rest of the registry instead of a second, drifting copy.
+    sandbox: yi_agent_tools::SandboxController,
+    // The process manager that builds this thread's shell/process tools. A turn's
+    // stop proof has to name whether the groups it started are actually gone, and
+    // this is the only place that knows. It is observed, never trusted blindly:
+    // see `tools_stopped_since`.
+    process_manager: Arc<yi_agent_tools::ProcessManager>,
 ) {
     // Foreground authority is per *process*, so it is resolved once -- lazily, from
     // the first root this thread is handed -- and kept for the life of the driver. A
@@ -87,6 +118,14 @@ pub(crate) async fn run_thread_driver(
     // activated it. Later turns carry `activate: None` (activation is once per thread),
     // so the driver has to remember instead of asking the prompt again.
     let mut foreground_root: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>> = None;
+    // Per-turn delegation. Built from the same root the foreground contract uses, so
+    // there is exactly one place that decides "can this conversation delegate".
+    //
+    // Deliberately *not* the same thing as activation: activation is a once-per-thread
+    // fact about the runtime, while delegation is re-decided every turn. A turn whose
+    // preparation fails runs the conversation without delegation and says so; it does
+    // not leave a hook for the next turn to inherit.
+    let mut delegation: Option<crate::server::delegation::ThreadDelegation> = None;
 
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
@@ -208,6 +247,154 @@ pub(crate) async fn run_thread_driver(
             foreground_turn = host.begin(root, &turn_id);
         }
 
+        // Delegation for this turn. Order is deliberate: prepare/begin first, then
+        // install the tools, then announce. A client that sees `ready: true` can be
+        // sure `spawn_agent` will be accepted by the daemon, and a client that sees a
+        // failure gets a stable code instead of a tool that fails only when called.
+        let mut delegation_turn: Option<(
+            Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+            yi_agent_lifecycle::foreground::ExecutionIdentity,
+        )> = None;
+        //
+        // This block runs for *every* turn, root or no root. A thread without a
+        // delegation root must end up with no delegation tools at all: the
+        // assembly installs legacy instances, and leaving them in place would hand
+        // the model a `spawn_agent` that still answers -- the very "a settled
+        // history stopped delegation, yet the tools kept working" hole this change
+        // closes. The status is announced either way, so "I have no delegation" is
+        // a visible fact rather than a silent gap.
+        if delegation.is_none()
+            && let Some(root) = foreground_root.as_ref()
+        {
+            delegation = Some(crate::server::delegation::ThreadDelegation::for_thread(
+                Arc::clone(root),
+                &store.session_identity_directory(),
+            ));
+        }
+        // Resolve managed vs embedded *before* preparing: a guardian's refusal must
+        // be reported as such, not silently replaced by the host's own secret.
+        let authority_failure = match (delegation.as_mut(), foreground_host.as_ref()) {
+            (Some(driver), Some(manager)) => driver.resolve_authority(manager).err(),
+            // No guardian manager: an embedded deployment, which is a normal answer.
+            _ => None,
+        };
+        let prepared = match authority_failure {
+            Some(failure) => crate::server::delegation::PreparedTurn::NotReady(failure),
+            None => delegation
+                .as_mut()
+                .map(|driver| driver.prepare_turn_with(&turn_id, foreground_host.as_deref()))
+                .unwrap_or_else(|| {
+                    crate::server::delegation::PreparedTurn::NotReady(
+                        crate::server::delegation::DelegationFailure::Unavailable(
+                            "this conversation has no delegation root".to_string(),
+                        ),
+                    )
+                }),
+        };
+        // A fresh registry per turn, never a mutation of the one a previous
+        // turn's tools still hold: that is what stops a slow call from borrowing
+        // the authority of the turn that replaced it.
+        let mut registry = (*agent.tools()).clone();
+        // Strip whatever delegation tools are there *before* deciding, so a turn
+        // that could not be prepared ends up with none at all.
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "wait_agent",
+            "inspect_agent",
+            "cancel_agent",
+        ] {
+            registry.remove(name);
+        }
+        let failure = match prepared {
+            crate::server::delegation::PreparedTurn::Ready { turn, execution } => {
+                let caller = yi_agent_subagent::CallerContext::unbound();
+                caller.bind(agent.session_handle());
+                yi_agent_subagent::register_session_turn_tools(
+                    &mut registry,
+                    Arc::clone(&turn),
+                    sandbox.clone(),
+                    Some(thread_id.clone()),
+                    caller,
+                );
+                delegation_turn = Some((turn, execution));
+                None
+            }
+            crate::server::delegation::PreparedTurn::NotReady(failure) => Some(failure),
+        };
+        agent.set_tools_for_next_run(Arc::new(registry));
+        let notification = crate::protocol::Notification::DelegationStatusUpdated {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            ready: failure.is_none(),
+            failure: failure.map(|failure| failure.payload()),
+        };
+        let _ = write_notification(&hub, &notification).await;
+        // Every exit path below runs this. The turn's tools must stop writing the
+        // moment the turn ends, whatever ended it.
+        //
+        // Two facts are reported, in this order, and the order is the point:
+        //
+        // 1. the turn closes **locally first**, so a tool that outlived the run
+        //    cannot write even if the daemon never answers;
+        // 2. the execution is retired with a stop proof built from what this driver
+        //    actually observed -- the run was joined, and the process groups the run
+        //    started are gone.
+        //
+        // A `false` here is not a bug to paper over: the daemon then keeps the
+        // execution unsettled and refuses a later driver, which is the correct
+        // answer for "a process may still be writing".
+        macro_rules! finish_delegation {
+            ($run:expr, $before:expr) => {
+                if let (Some((turn, execution)), Some(driver)) =
+                    (delegation_turn.as_ref(), delegation.as_mut())
+                {
+                    driver.finish_turn(turn);
+                    // `joined` is an observation, so it may only be claimed when the
+                    // control we hold really joined. Two cases are honestly *not*
+                    // joined:
+                    //
+                    // * `run_tracked_blocks` failed, so no control exists -- the
+                    //   execution never started, and "joined" would describe a task
+                    //   that was never created;
+                    // * `stop_and_join` returned an error (the root panicked), so the
+                    //   join has no result to point at.
+                    //
+                    // Reporting `joined: false` leaves the execution unsettled, which
+                    // is the correct answer: a later driver is refused instead of
+                    // being told a process that may still be writing is gone.
+                    let joined = match $run.as_mut() {
+                        Some(run) => run.stop_and_join(Duration::from_secs(2)).await.is_ok(),
+                        None => false,
+                    };
+                    let tools_stopped = tools_stopped_since(&process_manager, $before);
+                    if let Err(error) = driver.record_stopped(execution, joined, tools_stopped) {
+                        // Never silent: a stop that could not be reported is the
+                        // difference between "the next turn works" and "the next
+                        // turn is refused as StopUnproven".
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            turn_id = %turn.context().turn_id,
+                            %error,
+                            "the turn closed but its execution stop was not recorded"
+                        );
+                        let notice = crate::protocol::Notification::DelegationStatusUpdated {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn.context().turn_id.clone(),
+                            ready: false,
+                            failure: Some(crate::protocol::DelegationFailurePayload {
+                                code: "stop_unrecorded".to_string(),
+                                reason: format!(
+                                    "this turn's stop could not be reported to the daemon: {error}"
+                                ),
+                            }),
+                        };
+                        let _ = write_notification(&hub, &notice).await;
+                    }
+                }
+            };
+        }
+
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。
         // `last_usage` 记录的是本轮**最后一次** provider 调用的完整快照
         // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
@@ -316,8 +503,25 @@ pub(crate) async fn run_thread_driver(
             agent.set_system_prompt(Some(new_prompt));
         }
 
-        let mut stream = match agent.run_blocks(blocks).await {
-            Ok(s) => s,
+        // The process groups already alive when this turn starts. Anything this
+        // turn adds and still leaves running at exit is *not* proven stopped, and
+        // the daemon must be told so.
+        let processes_at_start = process_manager.list();
+        let processes_at_start: Vec<String> = processes_at_start
+            .into_iter()
+            .map(|process| process.process_id)
+            .collect();
+
+        // Tracked, not plain: the plain API detaches the run's real task, so a turn
+        // that ended would leave the loop unjoined and "the execution stopped" would
+        // be a claim rather than an observation.
+        let tracked = agent.run_tracked_blocks(blocks).await;
+        let mut run_control = None;
+        let mut stream = match tracked {
+            Ok(run) => {
+                run_control = Some(run.control);
+                run.events
+            }
             Err(e) => {
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
@@ -354,6 +558,12 @@ pub(crate) async fn run_thread_driver(
                 if let Some(mut turn) = foreground_turn.take() {
                     turn.finish();
                 }
+                // Same for delegation. `run_tracked_blocks` failed, so there is no
+                // control to join -- and that is exactly the honest evidence: the
+                // execution never started, so its tools cannot be running. Reporting
+                // `tools_stopped` from a real observation (the manager's list) still
+                // applies, and an exception is never invented.
+                finish_delegation!(run_control, processes_at_start.as_slice());
                 continue;
             }
         };
@@ -414,6 +624,7 @@ pub(crate) async fn run_thread_driver(
                                     if let Err(e) = store.clear_partial(&thread_id) {
                                         eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
                                     }
+                                    finish_delegation!(run_control, processes_at_start.as_slice());
                                     return;
                                 }
                             };
@@ -442,6 +653,7 @@ pub(crate) async fn run_thread_driver(
                                 if let Err(e) = store.clear_partial(&thread_id) {
                                     eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
                                 }
+                                finish_delegation!(run_control, processes_at_start.as_slice());
                                 return;
                             }
                             // 反向请求已写出:进入等待审批状态。
@@ -569,6 +781,7 @@ pub(crate) async fn run_thread_driver(
                                         if let Err(e) = store.clear_partial(&thread_id) {
                                             eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
                                         }
+                                        finish_delegation!(run_control, processes_at_start.as_slice());
                                         return;
                                     }
                                 }
@@ -642,6 +855,7 @@ pub(crate) async fn run_thread_driver(
                                 "[app-server] failed to clear turn checkpoint ({thread_id}): {e}"
                             );
                         }
+                        finish_delegation!(run_control, processes_at_start.as_slice());
                         return;
                     }
                 }
@@ -760,6 +974,7 @@ pub(crate) async fn run_thread_driver(
             if let Some(mut turn) = foreground_turn.take() {
                 turn.finish();
             }
+            finish_delegation!(run_control, processes_at_start.as_slice());
             continue;
         }
 
@@ -800,5 +1015,6 @@ pub(crate) async fn run_thread_driver(
         if let Some(mut turn) = foreground_turn.take() {
             turn.finish();
         }
+        finish_delegation!(run_control, processes_at_start.as_slice());
     }
 }

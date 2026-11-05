@@ -638,13 +638,37 @@ impl RuntimeCoordinator {
         let mut retired = Vec::new();
         let mut missing = Vec::new();
         for execution in &unsettled {
-            let proof = request
+            // Two places can hold this execution's proof, and both are legitimate:
+            //
+            // * the foreground evidence table, when the proof came from the
+            //   guardian's quiescence flow (the wire names it by `evidence_id`);
+            // * the execution row itself, when the host reported the stop on its own
+            //   control stream -- `record_host_execution_stop` writes it *there*, and
+            //   only there.
+            //
+            // Reading just the first table made every host-reported stop invisible,
+            // so a replaced driver was refused `StopUnproven` forever even though the
+            // daemon was holding the proof. Fall back to the row, and re-check every
+            // fence field below exactly as strictly: the row is data, not a permit.
+            let referenced = request
                 .stopped
                 .iter()
                 .find(|reference| reference.execution_id == execution.execution_id)
                 .map(|reference| repository.stop_evidence_by_id(root, &reference.evidence_id))
                 .transpose()?
                 .flatten();
+            let stored = match (referenced, execution.evidence_json.as_deref()) {
+                (Some(evidence), _) => Some(evidence),
+                (None, Some(json)) => Some(
+                    serde_json::from_str::<yi_agent_lifecycle::foreground::StopEvidence>(json)
+                        .map_err(|error| RuntimeCoordinatorError::SessionDelegation {
+                            code: SessionFailureCode::CorruptAttachment,
+                            reason: format!("a stored stop proof is unreadable: {error}"),
+                        })?,
+                ),
+                (None, None) => None,
+            };
+            let proof = stored;
             let proven = proof.as_ref().is_some_and(|evidence| {
                 may_replace_driver(evidence.joined, evidence.tools_stopped)
                     && evidence.execution.execution_id == execution.execution_id

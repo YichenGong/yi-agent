@@ -146,11 +146,32 @@ impl SessionHost {
         replacement_resume_digest: Option<String>,
         attached: SessionContainerAttachment,
     ) -> Self {
+        Self::new_for_run(
+            root,
+            identity,
+            replacement_resume_digest,
+            attached,
+            format!("host-{}", uuid::Uuid::new_v4()),
+        )
+    }
+
+    /// The same host, with the run id the *authorization* names.
+    ///
+    /// A managed identity is verified against `authorization.client_run_id ==
+    /// host_run_id`, so a random per-host id could never be authorized by the
+    /// guardian. Embedded hosts keep the random id: nothing ties them to a lease.
+    pub fn new_for_run(
+        root: Arc<ThreadRoot>,
+        identity: SessionIdentity,
+        replacement_resume_digest: Option<String>,
+        attached: SessionContainerAttachment,
+        host_run_id: String,
+    ) -> Self {
         Self {
             root,
             identity,
             replacement_resume_digest,
-            host_run_id: format!("host-{}", uuid::Uuid::new_v4()),
+            host_run_id,
             attached,
             live: Mutex::new(None),
             unclosed: Mutex::new(None),
@@ -352,8 +373,12 @@ impl SessionHost {
     }
 
     /// Reports the stop proof for an execution this stream registered.
+    ///
+    /// Takes `&self`: reporting a stop is not a change to the host's own identity,
+    /// and a caller often holds the host only behind a shared reference while the
+    /// turn it just joined is being retired.
     pub fn record_stopped(
-        &mut self,
+        &self,
         evidence: yi_agent_lifecycle::foreground::StopEvidence,
     ) -> Result<(), SessionClientError> {
         let binding = self.binding()?;
@@ -367,9 +392,12 @@ impl SessionHost {
         }
     }
 
-    /// The fence of the binding this host holds, for a caller that has to address
-    /// its own execution when it reports a stop.
-    pub fn binding_fence_for_test(&self) -> Option<SessionFence> {
+    /// The fence of the binding this host currently holds.
+    ///
+    /// A host that reports its own execution's stop has to name the fence it is
+    /// bound under, and only the host knows it: the caller observed a join, not a
+    /// generation. `None` means nothing is prepared, so there is nothing to retire.
+    pub fn binding_fence(&self) -> Option<SessionFence> {
         self.live
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

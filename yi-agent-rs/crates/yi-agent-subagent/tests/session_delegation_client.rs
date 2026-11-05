@@ -390,7 +390,7 @@ fn session_delegation_lifecycle_a_driver_is_replaced_only_with_a_stop_proof() {
 
     // The proof has to name the right fence: a well-formed record about some
     // other generation proves nothing about this one.
-    let fence = first.binding_fence_for_test().expect("a prepared binding");
+    let fence = first.binding_fence().expect("a prepared binding");
     let evidence = StopEvidence {
         evidence_id: "evidence-1".into(),
         fence: ForegroundFence {
@@ -799,4 +799,151 @@ fn session_delegation_lifecycle_a_lost_attach_reply_is_recovered_by_the_stored_s
         matches!(response, IpcResponse::TaskSpawned { .. }),
         "a recovered host must be able to delegate, got {response:?}"
     );
+}
+
+/// A frontend restart (daemon still alive): a *new* host, with no in-memory
+/// binding, proves the identity from the stored secret and delegates again.
+///
+/// This is the user-visible promise behind "restart the app and keep working":
+/// nothing about the previous host survives except the credential on disk.
+#[test]
+fn session_delegation_lifecycle_a_new_host_after_a_frontend_restart_delegates() {
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = daemon_in(&directory);
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let identities = SessionIdentityStore::new(directory.path().join("identities"));
+    let secret = identities.load_or_create("thread-restart").unwrap();
+    let root = conversation_root(&daemon, &workspace, "thread-restart");
+    let attachment = attach_container(&root, &secret, "op-attach", true);
+
+    // First host: a full turn that is *proven* stopped, which is what a normal
+    // finish does. Its only durable trace is the credential plus a settled row.
+    let mut first = SessionHost::new(
+        Arc::clone(&root),
+        SessionIdentity::Embedded(secret.clone()),
+        None,
+        attachment.clone(),
+    );
+    first.prepare("op-prepare-1").expect("first host prepares");
+    let first_turn = first.begin_turn("turn-1").expect("turn-1 opens");
+    let execution = first
+        .register_execution("turn-1")
+        .expect("the first execution is registered");
+    let fence = first.binding_fence().expect("a prepared binding");
+    first.finish_turn(&first_turn).expect("turn-1 closes");
+    assert!(!first.has_unconfirmed_turn());
+    first
+        .record_stopped(stop_evidence(&fence, &execution))
+        .expect("the first execution is retired");
+
+    // Second host: as if the app process had been restarted. It has the same
+    // credential and the same container, and nothing else.
+    let restarted = conversation_root(&daemon, &workspace, "thread-restart");
+    let adopted = attach_container(&restarted, &secret, "op-attach-2", false);
+    assert_eq!(
+        adopted.root_id, attachment.root_id,
+        "a restarted frontend must adopt the same container"
+    );
+
+    let mut second = SessionHost::new(restarted, SessionIdentity::Embedded(secret), None, adopted);
+    second
+        .prepare("op-prepare-2")
+        .expect("a proven stop lets a new host prepare");
+    let turn = second.begin_turn("turn-2").expect("a turn opens");
+    let response = turn
+        .send(|handle, turn| IpcRequest::SpawnApplicationChild {
+            session_id: handle.session_id.clone(),
+            parent_task_id: handle.task_id.clone(),
+            capability: handle.capability.clone(),
+            objective: "after a frontend restart".into(),
+            mode: None,
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+            session_turn: Some(turn.clone()),
+        })
+        .expect("the daemon answers");
+    assert!(
+        matches!(response, IpcResponse::TaskSpawned { .. }),
+        "a restarted frontend must delegate again, got {response:?}"
+    );
+}
+
+/// The honest refusal: a host that died with its turn still open leaves a
+/// `starting` row, and a new host must not pass that off as stopped.
+///
+/// The spec is explicit here (7.2): an unproven old execution blocks the new
+/// writer, and a missing record is not a stop proof.
+#[test]
+fn session_delegation_lifecycle_an_unproven_restart_is_refused_not_guessed() {
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = daemon_in(&directory);
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let identities = SessionIdentityStore::new(directory.path().join("identities"));
+    let secret = identities.load_or_create("thread-crashed").unwrap();
+    let root = conversation_root(&daemon, &workspace, "thread-crashed");
+    let attachment = attach_container(&root, &secret, "op-attach", true);
+
+    // The first host registers its execution and then "dies": no stop proof is
+    // ever reported, exactly like a process killed mid-turn.
+    let mut first = SessionHost::new(
+        Arc::clone(&root),
+        SessionIdentity::Embedded(secret.clone()),
+        None,
+        attachment.clone(),
+    );
+    first.prepare("op-prepare-1").expect("first host prepares");
+    first.begin_turn("turn-1").expect("turn-1 opens");
+    first
+        .register_execution("turn-1")
+        .expect("the first execution is registered");
+    drop(first);
+
+    let restarted = conversation_root(&daemon, &workspace, "thread-crashed");
+    let adopted = attach_container(&restarted, &secret, "op-attach-2", false);
+    let mut second = SessionHost::new(restarted, SessionIdentity::Embedded(secret), None, adopted);
+    let error = second
+        .prepare("op-prepare-2")
+        .expect_err("an unproven old execution must block the new driver");
+    match error {
+        SessionClientError::Rejected(failure) => assert_eq!(
+            failure.code,
+            SessionFailureCode::StopUnproven,
+            "the refusal must name the missing stop proof, got {failure:?}"
+        ),
+        other => panic!("a stop-unproven restart must be a daemon refusal, got {other:?}"),
+    }
+}
+
+/// A stop proof built the way the app-server builds one: host-reported, joined,
+/// with the tool groups observed gone.
+fn stop_evidence(
+    fence: &yi_agent_lifecycle::session_delegation::SessionFence,
+    execution: &yi_agent_lifecycle::foreground::ExecutionIdentity,
+) -> yi_agent_lifecycle::foreground::StopEvidence {
+    yi_agent_lifecycle::foreground::StopEvidence {
+        evidence_id: format!("host:{}:{}", execution.execution_id, fence.driver_epoch),
+        fence: yi_agent_lifecycle::foreground::ForegroundFence {
+            root: yi_agent_lifecycle::foreground::RootRef {
+                session_id: fence.root.session_id.clone(),
+                root_id: fence.root.root_id.clone(),
+                attempt_id: execution.attempt_id.clone(),
+            },
+            generation: fence.generation.clone(),
+            binding_epoch: fence.binding_epoch,
+            driver_epoch: fence.driver_epoch,
+        },
+        execution: execution.clone(),
+        attempt_id: execution.attempt_id.clone(),
+        source: yi_agent_lifecycle::foreground::EvidenceSource::Host,
+        joined: true,
+        tools_stopped: true,
+        process_identity: None,
+    }
 }

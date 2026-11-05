@@ -508,6 +508,8 @@ async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     let mut effective = crate::test_support::test_config();

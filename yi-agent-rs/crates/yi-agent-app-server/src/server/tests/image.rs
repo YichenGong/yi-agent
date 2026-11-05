@@ -81,6 +81,11 @@ async fn turn_start_prompt_reaching_the_model_contains_the_attachment_manifest()
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -525,6 +530,11 @@ async fn an_uploaded_image_reaches_the_model_as_a_content_block() {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -660,6 +670,11 @@ async fn turn_start_drops_an_unknown_upload_id_and_still_runs_the_turn() {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -1212,6 +1227,11 @@ async fn an_image_reaches_the_model_as_a_content_block() {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
