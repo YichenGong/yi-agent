@@ -520,6 +520,35 @@ impl ForegroundDriver {
     }
 }
 
+/// Recovery actions a host can run on its own lease.
+///
+/// A plain enum rather than four methods because the TUI's dispatch is synchronous
+/// and can only hand one value across its control channel; the driver then runs
+/// exactly one action under the lease it already holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Read what a freeze would stop. Never mutates.
+    Inspect,
+    /// Freeze and stop, then report whether a confirmation may be issued.
+    Prepare { operation_id: String },
+    /// Commit a prepared recovery.
+    Confirm { operation_id: String, token: String },
+    /// Read one operation's stored status.
+    Operation { operation_id: String },
+}
+
+/// What one recovery action produced, shaped for the host to render.
+///
+/// `None` from the daemon's operation read survives as `status: None` rather than
+/// becoming an error: "the runtime never ran this id" is an answer, and the caller
+/// must be able to tell it apart from "the call failed".
+#[derive(Clone, Debug)]
+pub enum RecoveryOutcome {
+    Impact(yi_agent_lifecycle::foreground::RecoveryImpact),
+    Status(yi_agent_lifecycle::foreground::RecoveryOperationStatus),
+    Operation(Option<yi_agent_lifecycle::foreground::RecoveryOperationStatus>),
+}
+
 /// One host process's authority to drive foreground roots.
 ///
 /// This exists so the three hosts do not each re-derive two things that are easy to
@@ -596,6 +625,71 @@ impl ForegroundHost {
         };
         authorized.insert(key, fresh.clone());
         Ok(Some(fresh))
+    }
+
+    /// Runs one recovery action on this host's own lease.
+    ///
+    /// Deliberately a method on the host rather than a separate type holding the
+    /// lease: `FrontendLease` is not `Clone` (a copy would renew and release
+    /// independently, and release is destructive), so the only way to run recovery on
+    /// the same credential the driver uses is to borrow it here.
+    ///
+    /// `fence` names the attempt the caller believes is current. It always comes from
+    /// what this host already learned (a binding the daemon issued), never from a
+    /// caller-supplied id: a fence built out of an id would describe a conversation
+    /// nobody verified.
+    pub fn recover(
+        &self,
+        fence: &yi_agent_lifecycle::foreground::ForegroundFence,
+        action: &RecoveryAction,
+    ) -> Result<RecoveryOutcome, ForegroundClientError> {
+        let deadline =
+            yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(10));
+        match action {
+            RecoveryAction::Inspect => self
+                .lease
+                .inspect_root_recovery(fence, &deadline)
+                .map(RecoveryOutcome::Impact)
+                .map_err(|error| ForegroundRecoveryHost::classify("inspect", error)),
+            RecoveryAction::Prepare { operation_id } => {
+                let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+                    expected: fence.clone(),
+                    operation_id: operation_id.clone(),
+                };
+                match self.lease.prepare_root_recovery(&request, &deadline) {
+                    Ok(Some(status)) => Ok(RecoveryOutcome::Status(status)),
+                    Ok(None) => Err(ForegroundClientError::Protocol(
+                        "the daemon has no record of this recovery operation".into(),
+                    )),
+                    Err(error) => Err(ForegroundRecoveryHost::classify("prepare", error)),
+                }
+            }
+            RecoveryAction::Confirm {
+                operation_id,
+                token,
+            } => {
+                let request = yi_agent_lifecycle::foreground::RecoveryRequest {
+                    expected: fence.clone(),
+                    operation_id: operation_id.clone(),
+                };
+                let secret = yi_agent_lifecycle::foreground::SecretCapability::new(token.clone());
+                match self
+                    .lease
+                    .confirm_root_recovery(&request, &secret, &deadline)
+                {
+                    Ok(Some(status)) => Ok(RecoveryOutcome::Status(status)),
+                    Ok(None) => Err(ForegroundClientError::Protocol(
+                        "the daemon has no record of this recovery operation".into(),
+                    )),
+                    Err(error) => Err(ForegroundRecoveryHost::classify("confirm", error)),
+                }
+            }
+            RecoveryAction::Operation { operation_id } => self
+                .lease
+                .root_recovery_operation(&fence.root, operation_id, &deadline)
+                .map(RecoveryOutcome::Operation)
+                .map_err(|error| ForegroundRecoveryHost::classify("operation", error)),
+        }
     }
 
     /// Opens a turn for `root`, binding this host as its driver on first use.
@@ -728,7 +822,7 @@ impl ForegroundRecoveryHost {
     /// not serve recovery, and a host that retried it would spin. The rest keeps the
     /// design's distinction between "refused" (act on it) and "unknown" (query the
     /// same operation).
-    fn classify(stage: &'static str, error: std::io::Error) -> ForegroundClientError {
+    pub(crate) fn classify(stage: &'static str, error: std::io::Error) -> ForegroundClientError {
         match error.kind() {
             std::io::ErrorKind::Unsupported => ForegroundClientError::Rejected(
                 yi_agent_lifecycle::foreground::ForegroundFailure::new(

@@ -5665,9 +5665,31 @@ impl RuntimeCoordinator {
     /// Test hook only: production code never reaches around the coordinator to the
     /// repository, and doing so here is the point -- a corrupt row is something the
     /// production path cannot produce, so a test must be able to.
+    ///
+    /// Contention here is expected: the daemon's own threads take this lock while
+    /// the test is between statements. A bare `try_lock()` therefore turned ordinary
+    /// scheduling into a spurious `None` (and a `unwrap()` panic under the full
+    /// workspace run). Waiting is bounded so a real same-thread re-entry -- which
+    /// would deadlock a plain `lock()` -- still fails loudly instead of hanging.
     #[cfg(any(test, feature = "foreground-test-support"))]
     pub fn repository_for_test(&self) -> Option<std::sync::MutexGuard<'_, RuntimeRepository>> {
-        self.repository.try_lock().ok()
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.repository.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the test repository stayed locked for 10s; a test hook is being \
+                         called while the guard is already held on this thread"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
     }
 
     /// Marks a root's classification for the admission tests.

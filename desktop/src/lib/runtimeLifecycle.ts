@@ -657,3 +657,120 @@ export function remoteRuntimeControl(status: (scopeKey: string) => Promise<Runti
     },
   };
 }
+
+/**
+ * The fence that names one foreground attempt, as the shell needs it.
+ *
+ * Every field comes from what the daemon already persisted; a caller that invented
+ * an epoch would be describing a conversation that does not exist, and the daemon
+ * refuses a stale fence rather than repairing the wrong attempt.
+ */
+export interface RecoveryTargetView {
+  sessionId: string;
+  rootId: string;
+  attemptId: string;
+  generation: string;
+  bindingEpoch: number;
+  driverEpoch: number;
+}
+
+/** The structured refusal the shell reports, shaped by `kind`. */
+export type HostRecoveryError =
+  | { kind: "rejected"; code: string; reason: string }
+  | { kind: "transport"; reason: string }
+  | { kind: "protocol"; reason: string }
+  | { kind: "sessionNotFound"; reason: string };
+
+/**
+ * One sentence per error kind, so a transport failure is never rendered as a
+ * refusal. The two need different user actions: "try again" versus "this will never
+ * work". The shell's `reason` is deliberately not shown -- it is host text for the
+ * log, and the DOM only ever gets the mapped sentence.
+ */
+export function describeRecoveryError(error: unknown): string {
+  const shaped = error as Partial<HostRecoveryError> | null;
+  const kind = shaped?.kind;
+  switch (kind) {
+    case "rejected":
+      return "运行时拒绝了这次恢复，请确认该项目仍属于本应用";
+    case "transport":
+      return "未能联系到运行时，请稍后重试";
+    case "protocol":
+      return "运行时返回了本版本无法识别的结果";
+    case "sessionNotFound":
+      return "该项目未在本应用中打开，没有可恢复的运行时";
+    default:
+      return "恢复请求失败";
+  }
+}
+
+/**
+ * The shell's confirmed foreground-root recovery commands.
+ *
+ * Separate from `RuntimeControl` on purpose: those calls describe a runtime restart,
+ * while these repair one conversation's attempt. Both go through the shell's own
+ * lease, and neither is exposed as a model tool -- a repair stops work, so it stays a
+ * local window action.
+ */
+export interface ForegroundRecoveryControl {
+  inspect(scopeKey: string, target: RecoveryTargetView): Promise<RecoveryImpactViewFromShell>;
+  prepare(
+    scopeKey: string,
+    target: RecoveryTargetView,
+    operationId: string,
+  ): Promise<RecoveryOperationView>;
+  confirm(
+    scopeKey: string,
+    target: RecoveryTargetView,
+    operationId: string,
+    token: string,
+  ): Promise<RecoveryOperationView>;
+  operation(
+    scopeKey: string,
+    target: RecoveryTargetView,
+    operationId: string,
+  ): Promise<RecoveryOperationView | null>;
+}
+
+import type {
+  RecoveryImpactView as RecoveryImpactViewFromShell,
+  RecoveryOperationView,
+} from "../components/ForegroundRootRecovery";
+
+/** The desktop implementation, over the shell's `foreground_root_recovery_*` commands. */
+export function localForegroundRecovery(): ForegroundRecoveryControl {
+  return {
+    async inspect(scopeKey, target) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return (await invoke("foreground_root_recovery_inspect", {
+        scopeKey,
+        target,
+      })) as RecoveryImpactViewFromShell;
+    },
+    async prepare(scopeKey, target, operationId) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return (await invoke("foreground_root_recovery_prepare", {
+        scopeKey,
+        target,
+        operationId,
+      })) as RecoveryOperationView;
+    },
+    async confirm(scopeKey, target, operationId, token) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return (await invoke("foreground_root_recovery_confirm", {
+        scopeKey,
+        target,
+        operationId,
+        token,
+      })) as RecoveryOperationView;
+    },
+    async operation(scopeKey, target, operationId) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return (await invoke("foreground_root_recovery_operation", {
+        scopeKey,
+        target,
+        operationId,
+      })) as RecoveryOperationView | null;
+    },
+  };
+}

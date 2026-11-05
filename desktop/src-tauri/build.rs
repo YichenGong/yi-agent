@@ -26,6 +26,15 @@ use std::process::Command;
 /// 声明 manifest 后，自定义命令默认不被任何窗口允许，必须在 capability 里逐个
 /// 列出——这正是不想让插件窗口拿到的能力。新增 `bridge::*` 命令时必须同步加到
 /// 这里和 `capabilities/default.json`，否则主窗口会调不动它。
+/// Every command `invoke_handler` exposes must be listed here: declaring an app ACL
+/// manifest makes every custom command denied by default, so a missing entry is not
+/// a cosmetic omission -- the window gets `not allowed by ACL` at the first call.
+///
+/// Two groups arrived later than the rest and were missing until now: the runtime
+/// lifecycle surface (the shell owns the lease) and confirmed foreground-root
+/// recovery (destructive by design, so a local window action only). Keep this list
+/// a flat array of string literals: the capability test parses it naively and a
+/// comment between entries would silently drop the entry that follows.
 const APP_COMMANDS: &[&str] = &[
     "rpc",
     "rpc_respond",
@@ -39,9 +48,26 @@ const APP_COMMANDS: &[&str] = &[
     "remote_list",
     "remote_upsert",
     "remote_remove",
+    "runtime_acquire_project",
+    "runtime_release_project",
+    "runtime_registered_projects",
+    "runtime_quit_outcome",
+    "runtime_status",
+    "runtime_preview",
+    "runtime_confirm",
+    "runtime_operation",
+    "runtime_active_operation",
+    "runtime_known_scopes",
+    "runtime_scope_for_project",
     "open_plugin_view",
     "close_plugin_view",
     "plugin_committed_activation",
+    "plugin_host_identity",
+    "plugin_bind_host",
+    "foreground_root_recovery_inspect",
+    "foreground_root_recovery_prepare",
+    "foreground_root_recovery_confirm",
+    "foreground_root_recovery_operation",
 ];
 
 fn main() {

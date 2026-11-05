@@ -143,10 +143,13 @@ impl SlashCommand {
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
-            // `status <id>` reads a stored operation without preparing anything;
-            // `<id>` alone starts the preview, and confirmation is a separate step
-            // so a mistaken Enter cannot stop a running conversation.
-            SlashCommand::RecoverRoot => Some("[status <operation-id>|<operation-id>]"),
+            // Three separate steps, because each does strictly more than the last:
+            // no argument or `status <id>` only reads, `prepare <id>` is the first
+            // thing that stops work, and `confirm <id>` commits. A mistaken Enter
+            // therefore cannot get past the read-only step.
+            SlashCommand::RecoverRoot => Some(
+                "[status <operation-id>|<operation-id>|prepare <operation-id>|confirm <operation-id>]",
+            ),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
         }
@@ -218,9 +221,6 @@ impl SlashCommand {
                 Some("子 agent 验收由父 agent 真实合并后 daemon 自动观察，无交互式权限审批")
             }
             Self::Budget | Self::Priority => Some("daemon 尚未提供预算/优先级写接口"),
-            Self::RecoverRoot => {
-                Some("TUI 的恢复入口尚未接到本进程的租约授权；恢复需要宿主已有 lease 才能确认")
-            }
             _ => None,
         }
     }
@@ -986,23 +986,33 @@ mod tests {
             SlashCommand::RecoverRoot.control_spec().is_none(),
             "recovery is not a supervisor control command"
         );
+        let usage = SlashCommand::RecoverRoot
+            .argument_usage()
+            .expect("recover-root takes an operation id");
         assert!(
-            SlashCommand::RecoverRoot
-                .argument_usage()
-                .expect("recover-root takes an operation id")
-                .contains("status"),
+            usage.contains("status"),
             "the usage must offer the read-only form, not only the mutating one"
         );
-        // It resolves and documents itself, but must not be offered in completion:
-        // a command the host cannot actually confirm would look usable and then
-        // refuse, which is worse than not listing it.
+        // Each step stops strictly more than the previous one, so the usage has to
+        // name all three: a user who only saw `prepare` would not know `confirm`
+        // exists, and one who only saw `confirm` would think a token was an argument.
         assert!(
-            SlashCommand::RecoverRoot.unavailable_reason().is_some(),
-            "an unwired command must not appear as usable in completion"
+            usage.contains("prepare"),
+            "the usage must name the stop step"
         );
         assert!(
-            !SlashCommand::completable().contains(&SlashCommand::RecoverRoot),
-            "completion must not offer a command with no backend"
+            usage.contains("confirm"),
+            "the usage must name the commit step"
+        );
+        // Wired now: the driver holds the lease and the fence, so the command is
+        // usable and therefore offered.
+        assert!(
+            SlashCommand::RecoverRoot.unavailable_reason().is_none(),
+            "a wired command must not be reported as unusable"
+        );
+        assert!(
+            SlashCommand::completable().contains(&SlashCommand::RecoverRoot),
+            "completion must offer a command that has a backend"
         );
     }
 

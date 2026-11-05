@@ -3392,6 +3392,41 @@ fn run_tui_agent(
                                 }
                             }
                         }
+                        DriverControl::RecoverRoot(action) => {
+                            // Recovery runs here, in the task that holds the lease and
+                            // the binding fence. The slash handler cannot: it is
+                            // synchronous and sees neither, so a recovery it attempted
+                            // would have to invent the fence -- which is exactly the
+                            // caller-supplied id this design refuses.
+                            let outcome = match (foreground_host.lock(), foreground.as_ref()) {
+                                (Ok(host), Some(turn)) => match host.as_ref() {
+                                    Some(host) => host
+                                        .recover(&turn.binding().fence, &action)
+                                        .map_err(|error| error.to_string()),
+                                    None => Err(
+                                        "this runtime serves no foreground contract for this conversation"
+                                            .to_string(),
+                                    ),
+                                },
+                                // No open turn means nothing is known to be current:
+                                // a fence built from a guess would describe an attempt
+                                // nobody verified, and the daemon would refuse it
+                                // anyway. Say so instead of asking.
+                                _ => Err(
+                                    "no foreground binding is open for this conversation; start a turn first"
+                                        .to_string(),
+                                ),
+                            };
+                            let text = describe_recovery(&action, outcome);
+                            if let Some(hint) = text {
+                                let _ = agent_tx
+                                    .send(yi_agent_core::AgentEvent::Notice {
+                                        level: yi_agent_core::NoticeLevel::Info,
+                                        text: hint,
+                                    })
+                                    .await;
+                            }
+                        }
                         DriverControl::SetReasoningEffort(effort) => {
                             // `effort` 已由 TUI 按七档白名单校验；`None` = 清
                             // 覆盖，回落当前条目默认（`apply_selection` 写回的
@@ -4042,6 +4077,90 @@ pub(crate) enum DriverControl {
     /// then rebuild the agent. Backs `/mcp reload`: the user may have edited the
     /// file themselves, so this cannot rely on `mcp/set` having been called.
     McpReload,
+    /// Run one foreground-root recovery action on this host's own lease.
+    ///
+    /// Carried over the control channel rather than executed by the dispatch itself
+    /// because the lease and the binding fence live inside this driver task: a
+    /// synchronous slash handler can reach neither, and a recovery it ran would have
+    /// to invent one. The token is not accepted from the slash command line for the
+    /// same reason it never enters argv -- shell history and transcripts keep it.
+    RecoverRoot(yi_agent_subagent::foreground::RecoveryAction),
+}
+
+/// Renders one recovery outcome for the transcript line.
+///
+/// Only `Committed` reads as success. `Preparing`, `Blocked` and `NeedsPreview` are
+/// explicitly *not* it: reporting "recovered" for a blocked preparation would tell the
+/// user work had been repaired while the daemon still refuses to confirm it.
+///
+/// The wording never carries a token or a capability. The preview's token is held in
+/// the confirming component's memory; a transcript line that echoed it would put a
+/// secret into the log the user later shares.
+fn describe_recovery(
+    action: &yi_agent_subagent::foreground::RecoveryAction,
+    outcome: Result<yi_agent_subagent::foreground::RecoveryOutcome, String>,
+) -> Option<String> {
+    use yi_agent_lifecycle::foreground::RecoveryOperationStatus;
+    use yi_agent_subagent::foreground::{RecoveryAction, RecoveryOutcome};
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(reason) => return Some(format!("恢复请求未完成：{reason}")),
+    };
+    Some(match (action, outcome) {
+        (RecoveryAction::Inspect, RecoveryOutcome::Impact(impact)) => {
+            let blocked = if impact.blocked_execution_ids.is_empty() {
+                "无".to_string()
+            } else {
+                impact.blocked_execution_ids.join("、")
+            };
+            format!(
+                "恢复影响（{root}/{attempt}）：原因 {reason}；将停止 {} 个执行；未能证明停止：{blocked}。确认前不会停止任何工作。",
+                impact.stopped_execution_ids.len(),
+                root = impact.root.root_id,
+                attempt = impact.root.attempt_id,
+                reason = impact.reason,
+            )
+        }
+        (RecoveryAction::Prepare { operation_id }, RecoveryOutcome::Status(status))
+        | (RecoveryAction::Confirm { operation_id, .. }, RecoveryOutcome::Status(status)) => {
+            match status {
+                RecoveryOperationStatus::Preparing => {
+                    format!("恢复 {operation_id} 正在停止旧执行…")
+                }
+                RecoveryOperationStatus::NeedsPreview => {
+                    format!("恢复 {operation_id}：运行时已重启，需要重新准备（停止事实仍保留）")
+                }
+                RecoveryOperationStatus::Blocked(impact) => format!(
+                    "恢复 {operation_id} 无法确认：仍有执行未能证明停止（{}）",
+                    impact.blocked_execution_ids.join("、")
+                ),
+                RecoveryOperationStatus::Ready(preview) => format!(
+                    "恢复 {operation_id} 已准备就绪：旧执行已停止，可用 `/recover-root confirm {operation_id}` 确认；有效期至 {}",
+                    preview.expires_at.as_deref().unwrap_or("未给出")
+                ),
+                RecoveryOperationStatus::Committed(result) => format!(
+                    "已完成恢复：{operation_id}，新 attempt {}",
+                    result.successor.attempt_id
+                ),
+            }
+        }
+        (RecoveryAction::Operation { operation_id }, RecoveryOutcome::Operation(status)) => {
+            match status {
+                None => format!("运行时没有恢复操作 {operation_id} 的记录"),
+                Some(status) => describe_recovery(
+                    &RecoveryAction::Prepare {
+                        operation_id: operation_id.clone(),
+                    },
+                    Ok(RecoveryOutcome::Status(status)),
+                )
+                .unwrap_or_default(),
+            }
+        }
+        // The action and the answer are produced together by one call, so a mismatch
+        // is a programming error rather than something a user can reach.
+        _ => "恢复请求与结果类型不匹配".to_string(),
+    })
 }
 
 /// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
