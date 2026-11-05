@@ -181,6 +181,23 @@ pub(crate) fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(_)) => {
             IpcErrorCode::AuthorityDenied
         }
+        // A delegation refusal is a policy answer with its own wire DTO. Mapping
+        // the codes here keeps the fallback path (an error frame rather than the
+        // typed response) from reading as a daemon fault.
+        IpcError::Runtime(RuntimeCoordinatorError::SessionDelegation { code, .. }) => match code {
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::AuthorityDenied => {
+                IpcErrorCode::AuthorityDenied
+            }
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::ProtocolMismatch => {
+                IpcErrorCode::Validation
+            }
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::SessionClosed
+            | yi_agent_lifecycle::session_delegation::SessionFailureCode::AdmissionClosed
+            | yi_agent_lifecycle::session_delegation::SessionFailureCode::StopUnproven => {
+                IpcErrorCode::InvalidState
+            }
+            _ => IpcErrorCode::Conflict,
+        },
         // A bad fork token or an oversized payload is the caller's error, not a
         // daemon fault: surface it as validation so the client can react.
         IpcError::Runtime(RuntimeCoordinatorError::CodingRequiresGit { .. })

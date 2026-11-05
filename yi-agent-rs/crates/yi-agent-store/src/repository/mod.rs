@@ -41,7 +41,10 @@ mod session_container;
 #[cfg(test)]
 mod session_container_tests;
 
-pub use session_container::{SessionBindingCommit, SessionContainerRecord};
+pub use session_container::{
+    RetiredHostExecution, SessionBindingCommit, SessionContainerRecord, SessionHostExecution,
+    SessionHostStop,
+};
 mod task;
 mod trace;
 mod watchdog;

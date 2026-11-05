@@ -38,6 +38,52 @@ pub struct SessionBindingCommit {
     pub owner_run_id: String,
     pub generation: String,
     pub resume_digest: Option<String>,
+    /// Set only for the one prepare that spends a legacy capability. Re-checked
+    /// inside the transaction so two concurrent upgrades cannot both succeed.
+    pub consume_legacy_upgrade: bool,
+    /// Executions of the driver being replaced, each with the trusted evidence
+    /// that retired it. Written in the same transaction as the new epochs: a
+    /// binding that moved while its predecessor still reads `running` would be
+    /// claiming a stop the daemon never proved.
+    pub retired_executions: Vec<RetiredHostExecution>,
+}
+
+/// One old-generation execution retired by the commit that replaces its driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredHostExecution {
+    pub execution_id: String,
+    pub evidence_json: String,
+    pub execution_set_version: u64,
+}
+
+/// The evidence one host records for one of its own executions.
+///
+/// A struct rather than seven arguments: the fence is the security-critical part,
+/// and a positional call site is exactly where the wrong epoch would slip in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHostStop {
+    pub execution_id: String,
+    pub root: String,
+    pub generation: String,
+    pub binding_epoch: u64,
+    pub driver_epoch: u64,
+    pub evidence_json: String,
+    pub execution_set_version: u64,
+}
+
+/// One row of the host execution set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHostExecution {
+    pub execution_id: String,
+    pub root_task_id: String,
+    pub generation: String,
+    pub binding_epoch: u64,
+    pub driver_epoch: u64,
+    pub turn_id: String,
+    pub identity_json: String,
+    pub phase: String,
+    pub evidence_json: Option<String>,
+    pub execution_set_version: u64,
 }
 
 impl RuntimeRepository {
@@ -154,6 +200,21 @@ impl RuntimeRepository {
             return Ok(record);
         }
 
+        let legacy_consumed: i64 = transaction
+            .query_row(
+                "SELECT legacy_upgrade_consumed FROM session_containers WHERE root_task_id = ?1",
+                params![commit.root.root_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if commit.consume_legacy_upgrade && legacy_consumed != 0 {
+            return Err(RepositoryError::SessionDelegation(SessionFailure::new(
+                SessionFailureCode::AuthorityDenied,
+                "this legacy capability was already consumed".to_string(),
+            )));
+        }
+
         let current: Option<(i64, i64, Option<String>)> = transaction
             .query_row(
                 "SELECT binding_epoch, driver_epoch, owner_run_id
@@ -182,7 +243,8 @@ impl RuntimeRepository {
         transaction.execute(
             "UPDATE session_containers
              SET binding_epoch = ?2, driver_epoch = ?3, owner_run_id = ?4,
-                 resume_digest = COALESCE(?5, resume_digest)
+                 resume_digest = COALESCE(?5, resume_digest),
+                 legacy_upgrade_consumed = legacy_upgrade_consumed | ?6
              WHERE root_task_id = ?1",
             params![
                 commit.root.root_id,
@@ -190,8 +252,33 @@ impl RuntimeRepository {
                 next_driver,
                 commit.owner_run_id,
                 commit.resume_digest,
+                i64::from(commit.consume_legacy_upgrade),
             ],
         )?;
+        for retired in &commit.retired_executions {
+            let changed = transaction.execute(
+                "UPDATE session_host_executions
+                 SET phase = 'stopped', evidence_json = ?2, execution_set_version = ?3
+                 WHERE execution_id = ?1
+                   AND root_task_id = ?4
+                   AND phase IN ('starting','running','unknown')",
+                params![
+                    retired.execution_id,
+                    retired.evidence_json,
+                    retired.execution_set_version,
+                    commit.root.root_id,
+                ],
+            )?;
+            if changed == 0 {
+                return Err(RepositoryError::SessionDelegation(SessionFailure::new(
+                    SessionFailureCode::CorruptAttachment,
+                    format!(
+                        "execution {} is not a live execution of this container",
+                        retired.execution_id
+                    ),
+                )));
+            }
+        }
         transaction.execute(
             "INSERT INTO session_binding_operations
                 (root_task_id, operation_id, request_digest, generation,
@@ -214,6 +301,24 @@ impl RuntimeRepository {
         })?;
         transaction.commit()?;
         Ok(record)
+    }
+
+    /// Writes the resume digest of a container that does not have one yet.
+    ///
+    /// Create-only on purpose: a second attach must not be able to replace the
+    /// secret a live host already holds, which is how "attach" would otherwise
+    /// become "take over".
+    pub fn set_session_resume_digest(
+        &mut self,
+        task: &TaskId,
+        digest: &str,
+    ) -> Result<bool, RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE session_containers SET resume_digest = ?2
+             WHERE root_task_id = ?1 AND resume_digest IS NULL",
+            params![task.to_string(), digest],
+        )?;
+        Ok(changed != 0)
     }
 
     /// Marks a session permanently closed and revokes admission.
@@ -273,6 +378,106 @@ impl RuntimeRepository {
             .optional()?
             .map(|value| value as u64))
     }
+}
+
+impl RuntimeRepository {
+    /// Executions of one container that are not proven stopped.
+    ///
+    /// `unknown` is included on purpose: it is the honest record of "we lost the
+    /// channel". Treating it as absent would turn a missing proof into permission.
+    pub fn unsettled_session_host_executions(
+        &self,
+        root: &TaskId,
+    ) -> Result<Vec<SessionHostExecution>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT execution_id, root_task_id, generation, binding_epoch, driver_epoch,
+                    turn_id, identity_json, phase, evidence_json, execution_set_version
+             FROM session_host_executions
+             WHERE root_task_id = ?1 AND phase IN ('starting','running','unknown')
+             ORDER BY execution_id",
+        )?;
+        let rows = statement.query_map(params![root.to_string()], read_host_execution)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(RepositoryError::from)
+    }
+
+    /// Registers one execution of the current driver before it starts.
+    ///
+    /// Written first, answered second: a host that dies between the two leaves a
+    /// `starting` row, which blocks the next driver rather than silently passing
+    /// for "never started".
+    pub fn register_session_host_execution(
+        &mut self,
+        execution: &SessionHostExecution,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "INSERT INTO session_host_executions
+                (execution_id, root_task_id, generation, binding_epoch, driver_epoch,
+                 turn_id, identity_json, phase, evidence_json, execution_set_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                execution.execution_id,
+                execution.root_task_id,
+                execution.generation,
+                execution.binding_epoch,
+                execution.driver_epoch,
+                execution.turn_id,
+                execution.identity_json,
+                execution.phase,
+                execution.evidence_json,
+                execution.execution_set_version,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records trusted evidence for exactly one execution of one fence.
+    ///
+    /// The fence is part of the `WHERE`: a host cannot retire an execution that
+    /// belongs to another generation, binding or driver, even by guessing its id.
+    pub fn record_session_host_stop(
+        &mut self,
+        stop: &SessionHostStop,
+    ) -> Result<(), RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE session_host_executions
+             SET phase = 'stopped', evidence_json = ?6, execution_set_version = ?7
+             WHERE execution_id = ?1 AND root_task_id = ?2 AND generation = ?3
+               AND binding_epoch = ?4 AND driver_epoch = ?5
+               AND phase IN ('starting','running','unknown')",
+            params![
+                stop.execution_id,
+                stop.root,
+                stop.generation,
+                stop.binding_epoch,
+                stop.driver_epoch,
+                stop.evidence_json,
+                stop.execution_set_version,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::SessionDelegation(SessionFailure::new(
+                SessionFailureCode::StaleBinding,
+                "no live execution matches this fence".to_string(),
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn read_host_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHostExecution> {
+    Ok(SessionHostExecution {
+        execution_id: row.get(0)?,
+        root_task_id: row.get(1)?,
+        generation: row.get(2)?,
+        binding_epoch: row.get::<_, i64>(3)? as u64,
+        driver_epoch: row.get::<_, i64>(4)? as u64,
+        turn_id: row.get(5)?,
+        identity_json: row.get(6)?,
+        phase: row.get(7)?,
+        evidence_json: row.get(8)?,
+        execution_set_version: row.get::<_, i64>(9)? as u64,
+    })
 }
 
 fn read_container(

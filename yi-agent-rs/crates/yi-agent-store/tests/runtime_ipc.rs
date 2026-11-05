@@ -367,6 +367,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -443,6 +444,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -543,6 +545,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -805,6 +808,7 @@ fn application_roots_use_their_attaching_project_workspace() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -971,6 +975,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
                 thread_id: None,
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -1366,6 +1371,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -1381,6 +1387,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
                 capability: message_capability,
                 recipient_task_id: child.clone(),
                 message: "please continue".into(),
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -1435,6 +1442,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();
@@ -1451,6 +1459,7 @@ fn application_root_can_spawn_multiple_direct_children() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();
@@ -1497,6 +1506,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -1518,6 +1528,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();
@@ -1576,6 +1587,7 @@ fn application_root_rejects_more_than_the_direct_child_limit() {
                     thread_id: None,
                     sandbox: None,
                     fork_token: None,
+                    session_turn: None,
                 },
             )
             .unwrap(),
@@ -1596,6 +1608,7 @@ fn application_root_rejects_more_than_the_direct_child_limit() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();
@@ -1652,6 +1665,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                     thread_id: None,
                     sandbox: None,
                     fork_token: None,
+                    session_turn: None,
                 },
             )
             .unwrap(),
@@ -1688,6 +1702,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
                 thread_id: None,
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -1790,6 +1805,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
                 thread_id: None,
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -1874,6 +1890,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
                 thread_id: None,
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -1949,6 +1966,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
                 thread_id: None,
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap(),
@@ -3062,6 +3080,7 @@ fn daemon_routes_session_spawn_and_recursive_cancel_to_its_coordinator() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3116,6 +3135,7 @@ fn daemon_rejects_unbound_agent_message_requests_without_persisting_them() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3215,6 +3235,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3298,6 +3319,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3373,6 +3395,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3394,6 +3417,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3476,6 +3500,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3497,6 +3522,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -3571,6 +3597,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3651,6 +3678,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3715,6 +3743,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3795,6 +3824,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3908,6 +3938,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -3998,6 +4029,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -4162,6 +4194,7 @@ fn daemon_admits_a_spawned_child_when_an_application_factory_is_available() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -4209,6 +4242,7 @@ fn daemon_returns_an_inspectable_task_detail_for_user_intervention() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -4259,6 +4293,7 @@ fn daemon_reads_ordered_events_for_only_the_requested_task_after_a_cursor() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -4421,6 +4456,7 @@ fn cancel_confirmation_is_single_use_and_bound_to_the_previewed_task_tree() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -4806,6 +4842,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -4858,6 +4895,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap()
@@ -5013,6 +5051,7 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
             model: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -5195,6 +5234,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -5511,6 +5551,7 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
             thread_id: Some("thread-a".into()),
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -5550,6 +5591,7 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
                         thread_id: Some("thread-b".into()),
                         sandbox: None,
                         fork_token: None,
+                        session_turn: None,
                     },
                 )
                 .unwrap(),
@@ -5618,6 +5660,7 @@ fn ending_one_conversation_reclaims_only_its_own_root() {
             thread_id: Some("thread-a".into()),
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();
@@ -5652,6 +5695,7 @@ fn ending_one_conversation_reclaims_only_its_own_root() {
                     thread_id: Some("thread-b".into()),
                     sandbox: None,
                     fork_token: None,
+                    session_turn: None,
                 },
             )
             .unwrap(),
@@ -5698,6 +5742,7 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
                 thread_id: Some(thread.into()),
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap();
@@ -5833,6 +5878,7 @@ fn foreground_root_lifecycle_a_refused_wire_spawn_leaves_no_child_and_no_owner()
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .unwrap();

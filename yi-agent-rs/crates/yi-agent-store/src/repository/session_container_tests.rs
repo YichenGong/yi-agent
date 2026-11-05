@@ -199,6 +199,8 @@ fn session_delegation_lifecycle_binding_cas_and_rollback() {
         owner_run_id: "host-run-1".into(),
         generation: "gen-1".into(),
         resume_digest: Some("resume-1".into()),
+        consume_legacy_upgrade: false,
+        retired_executions: Vec::new(),
     };
     let first = repository.commit_session_binding(&commit).unwrap();
     assert_eq!(first.binding_epoch, 1);

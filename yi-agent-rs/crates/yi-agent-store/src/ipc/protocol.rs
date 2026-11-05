@@ -124,6 +124,10 @@ pub enum IpcRequest {
         session_id: String,
         parent_task_id: String,
         objective: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
         #[serde(default)]
         mode: Option<String>,
         #[serde(default)]
@@ -143,6 +147,10 @@ pub enum IpcRequest {
         parent_task_id: String,
         capability: String,
         objective: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
         #[serde(default)]
         mode: Option<String>,
         #[serde(default)]
@@ -257,6 +265,10 @@ pub enum IpcRequest {
         capability: String,
         recipient_task_id: String,
         message: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     SendUserMessage {
         task_id: String,
@@ -358,6 +370,34 @@ pub enum IpcRequest {
         #[serde(default)]
         protocol: Option<u32>,
     },
+    /// Attaches a session *container*: a root that owns delegation instead of
+    /// running a worker. Separate from `AttachApplicationRoot` because the two
+    /// answer different questions, and because an old client must keep getting
+    /// the old answer.
+    AttachSessionContainer {
+        idempotency_key: String,
+        workspace: PathBuf,
+        #[serde(default)]
+        extra_roots: Vec<String>,
+        operation_id: String,
+        /// The resume digest this container should accept from now on, written
+        /// only when the container is created.
+        #[serde(default)]
+        creation_resume_digest: Option<String>,
+        #[serde(default)]
+        identity: Option<yi_agent_lifecycle::session_delegation::SessionIdentity>,
+    },
+    /// (Re)establishes the host binding and, only on success, returns the secret.
+    PrepareSessionDelegation {
+        request: yi_agent_lifecycle::session_delegation::PrepareSession,
+    },
+    BeginSessionTurn {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+        turn_id: String,
+    },
+    EndSessionTurn {
+        turn: yi_agent_lifecycle::session_delegation::SessionTurn,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +456,25 @@ pub enum IpcResponse {
     },
     /// No recovery operation exists under that id.
     ForegroundRecoveryAbsent,
+    /// A container exists at the given address. Carries no secret: this response
+    /// only proves the attach succeeded, and a capability is issued later by
+    /// `PrepareSessionDelegation` for a bound host.
+    SessionContainerAttached {
+        root: yi_agent_lifecycle::session_delegation::SessionRef,
+        workspace: WorkerWorkspace,
+    },
+    SessionPrepared {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    },
+    SessionTurnOpened {
+        turn: yi_agent_lifecycle::session_delegation::SessionTurn,
+    },
+    SessionTurnClosed,
+    /// A structured delegation refusal, so the client branches on a code rather
+    /// than on English text.
+    SessionDelegationRejected {
+        failure: yi_agent_lifecycle::session_delegation::SessionFailure,
+    },
     /// A structured foreground refusal.
     ///
     /// This is a response rather than an `Error` because the client has to dispatch on

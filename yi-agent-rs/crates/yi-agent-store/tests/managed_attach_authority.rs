@@ -319,3 +319,253 @@ async fn a_revocation_applied_while_serving_takes_effect() {
         .expect_err("the withdrawn capability must stop working");
     assert!(format!("{error}").contains("authorization"), "{error}");
 }
+
+/// A legacy capability is spent exactly once.
+///
+/// Replaying it must not be a second upgrade: the whole point of the one-shot is
+/// that an old application secret cannot be turned into a permanent resume
+/// credential every time an attacker repeats it.
+#[tokio::test]
+async fn session_delegation_lifecycle_legacy_identity_is_not_public_key() {
+    use yi_agent_lifecycle::foreground::SecretCapability;
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionFailureCode, SessionIdentity, SessionRef, session_resume_digest,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:legacy:/p:1", &workspace, &[])
+        .await
+        .expect("an unmanaged attach must keep working");
+    let root = SessionRef {
+        session_id: attached.session_id.to_string(),
+        root_id: attached.root_task_id.to_string(),
+    };
+    // The attach response is the only place the legacy capability ever travels.
+    let legacy_capability = attached.message_capability.clone();
+    let resume_secret = SecretCapability::new("resume-secret");
+    let resume_digest = session_resume_digest(&resume_secret);
+
+    // A key that was never minted buys nothing, not even a first upgrade.
+    let forged = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-forged".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new("not-the-secret")),
+            current_binding: None,
+            replacement_resume_digest: Some("resume-digest".into()),
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(forged.to_string().contains("AuthorityDenied"), "{forged}");
+
+    let upgraded = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-upgrade".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                legacy_capability.clone(),
+            )),
+            current_binding: None,
+            replacement_resume_digest: Some(resume_digest.clone()),
+            stopped: Vec::new(),
+        })
+        .expect("the holder of the attached capability may upgrade once");
+    assert_eq!(upgraded.fence.binding_epoch, 1);
+
+    let replay = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-replay".into(),
+            host_run_id: "host-2".into(),
+            expected_binding_epoch: 1,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                legacy_capability.clone(),
+            )),
+            current_binding: None,
+            replacement_resume_digest: Some("resume-digest-2".into()),
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            replay,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::AuthorityDenied,
+                ..
+            }
+        ),
+        "{replay}"
+    );
+
+    // After the upgrade the private resume secret is the identity that works.
+    let resumed = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-resume".into(),
+            host_run_id: "host-2".into(),
+            expected_binding_epoch: 1,
+            identity: SessionIdentity::Embedded(resume_secret.clone()),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .expect("the private resume secret resumes the container");
+    assert_eq!(resumed.fence.binding_epoch, 2);
+}
+
+/// A managed identity on a daemon with no guardian is refused, not trusted.
+#[tokio::test]
+async fn session_delegation_lifecycle_managed_identity_needs_a_guardian() {
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionFailureCode, SessionIdentity, SessionRef,
+    };
+    use yi_agent_lifecycle::types::RootAuthorization;
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    assert!(!coordinator.is_managed());
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:managed:/p:1", &workspace, &[])
+        .await
+        .unwrap();
+
+    let error = coordinator
+        .prepare_session(PrepareSession {
+            root: SessionRef {
+                session_id: attached.session_id.to_string(),
+                root_id: attached.root_task_id.to_string(),
+            },
+            operation_id: "op-managed".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::Managed(RootAuthorization {
+                scope_key: "scope".into(),
+                daemon_instance_id: "daemon".into(),
+                client_run_id: "host-1".into(),
+                root_id: attached.root_task_id.to_string(),
+                capability: "capability".into(),
+            }),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::AuthorityDenied,
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+/// An unsettled execution of the previous driver blocks a replacement.
+///
+/// The blocking is the feature: without it a new host could take over while the
+/// old one's tools may still be writing, which is exactly what "no stop proof"
+/// must never permit.
+#[tokio::test]
+async fn session_delegation_lifecycle_replacement_requires_a_stop_proof() {
+    use yi_agent_lifecycle::foreground::SecretCapability;
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionFailureCode, SessionIdentity, SessionRef, session_resume_digest,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:stop:/p:1", &workspace, &[])
+        .await
+        .unwrap();
+    let root = SessionRef {
+        session_id: attached.session_id.to_string(),
+        root_id: attached.root_task_id.to_string(),
+    };
+    let resume_secret = SecretCapability::new("resume-secret");
+    let resume_digest = session_resume_digest(&resume_secret);
+    let binding = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-1".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::Embedded(resume_secret.clone()),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    // The fresh container has no resume digest, so the first prepare must say so
+    // rather than silently accepting a secret it never stored.
+    assert!(
+        matches!(
+            binding,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::SessionIdentityRequired,
+                ..
+            }
+        ),
+        "{binding}"
+    );
+
+    let upgraded = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-upgrade".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                attached.message_capability.clone(),
+            )),
+            current_binding: None,
+            replacement_resume_digest: Some(resume_digest.clone()),
+            stopped: Vec::new(),
+        })
+        .expect("upgrade binds the first driver");
+
+    // Simulate a host that started a turn and vanished without a clean stop.
+    coordinator
+        .record_host_execution(
+            yi_agent_store::runtime::session_delegation::RegisterExecution {
+                root_task_id: attached.root_task_id,
+                fence: upgraded.fence.clone(),
+                turn_id: "turn-1".to_string(),
+            },
+        )
+        .expect("an execution is registered before it starts");
+
+    let blocked = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-2".into(),
+            host_run_id: "host-2".into(),
+            expected_binding_epoch: upgraded.fence.binding_epoch,
+            identity: SessionIdentity::Embedded(resume_secret.clone()),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            blocked,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::StopUnproven,
+                ..
+            }
+        ),
+        "{blocked}"
+    );
+}

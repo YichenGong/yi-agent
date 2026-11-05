@@ -1,6 +1,7 @@
 //! Process-local ownership of subagent supervisors and application workers.
 
 pub(crate) mod foreground;
+pub mod session_delegation;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,11 @@ pub enum RuntimeCoordinatorError {
     Supervisor(String),
     #[error("authority denied: {0}")]
     AuthorityDenied(String),
+    #[error("session delegation refused ({code:?}): {reason}")]
+    SessionDelegation {
+        code: yi_agent_lifecycle::session_delegation::SessionFailureCode,
+        reason: String,
+    },
     #[error(transparent)]
     Spawn(#[from] SpawnError),
     #[error("a settled parent task (state: {state}) cannot spawn descendants")]
@@ -326,6 +332,14 @@ pub struct RuntimeCoordinator {
     /// nothing is gated. `Some` holds a *verifier*, not a signer -- it can only
     /// accept capabilities the guardian actually minted.
     managed_authorizations: Mutex<Option<yi_agent_lifecycle::authorization::AuthorizationLedger>>,
+    /// Live session-container bindings and open turns, in memory only.
+    session_delegation: crate::runtime::session_delegation::State,
+    /// Whether a container write must name an open turn.
+    ///
+    /// Off until the hosts that mint turns are shipped (plan Task 11). While it is
+    /// off, every new route is additive and an old host keeps working; turning it
+    /// on without a host that prepares would refuse its own first write.
+    session_delegation_enforced: AtomicBool,
 }
 
 /// A driver capability the daemon issued and has not revoked.
@@ -826,6 +840,8 @@ impl RuntimeCoordinator {
                 yi_agent_lifecycle::authorization::AttachAuthority::Unmanaged,
             ),
             managed_authorizations: Mutex::new(None),
+            session_delegation: Mutex::new(Default::default()),
+            session_delegation_enforced: AtomicBool::new(activation.is_enabled()),
         })
     }
 

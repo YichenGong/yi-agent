@@ -184,6 +184,21 @@ impl Daemon {
         )
     }
 
+    /// Starts a daemon that refuses container writes without an open turn.
+    ///
+    /// Tests only: production turns this on with the activation switch once the
+    /// hosts that mint turns ship.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn start_with_factory_enforcing_session_turns(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory(runtime_dir, database_path, factory)?;
+        daemon.coordinator.enforce_session_turns_for_test();
+        Ok(daemon)
+    }
+
     /// The real startup sequence, with the foreground switch made explicit.
     ///
     /// `Disabled` reproduces the historical order exactly; `Enabled` additionally
@@ -1328,6 +1343,77 @@ pub(crate) fn respond(
             // Running it on a detached thread looks harmless but is unbounded
             Ok(IpcResponse::ApplicationRootDetached)
         }
+        IpcRequest::AttachSessionContainer {
+            idempotency_key,
+            workspace,
+            extra_roots,
+            operation_id,
+            creation_resume_digest,
+            identity,
+        } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let root = match runtime.block_on(coordinator.attach_session_container(
+                &idempotency_key,
+                &workspace,
+                &extra_roots,
+                &operation_id,
+                creation_resume_digest,
+                identity,
+            )) {
+                Ok(root) => root,
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    return Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            Ok(IpcResponse::SessionContainerAttached {
+                root: root.reference(),
+                workspace: root.workspace,
+            })
+        }
+        IpcRequest::PrepareSessionDelegation { request } => {
+            match coordinator.prepare_session(request) {
+                Ok(binding) => Ok(IpcResponse::SessionPrepared { binding }),
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::BeginSessionTurn { binding, turn_id } => {
+            match coordinator.begin_session_turn(&binding, &turn_id) {
+                Ok(turn) => Ok(IpcResponse::SessionTurnOpened { turn }),
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::EndSessionTurn { turn } => match coordinator.end_session_turn(&turn) {
+            Ok(()) => Ok(IpcResponse::SessionTurnClosed),
+            Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                Ok(IpcResponse::SessionDelegationRejected {
+                    failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                        code, reason,
+                    ),
+                })
+            }
+            Err(error) => Err(error.into()),
+        },
         IpcRequest::BindApplicationRootDriver {
             authorization,
             operation_id,
@@ -1457,6 +1543,7 @@ pub(crate) fn respond(
             session_id,
             parent_task_id,
             objective,
+            session_turn,
             mode,
             model,
             workdir,
@@ -1465,6 +1552,7 @@ pub(crate) fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())?;
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
@@ -1499,9 +1587,11 @@ pub(crate) fn respond(
             thread_id,
             sandbox,
             fork_token,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())?;
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
@@ -1694,9 +1784,11 @@ pub(crate) fn respond(
             capability,
             recipient_task_id,
             message,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let sender_task_id = parse_id::<TaskId>(&sender_task_id)?;
+            coordinator.admit_session_write(&sender_task_id, session_turn.as_ref())?;
             let recipient_task_id = parse_id::<TaskId>(&recipient_task_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
