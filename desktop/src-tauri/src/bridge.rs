@@ -1364,6 +1364,72 @@ fn clear_child(app: &AppHandle, key: &ProfileKey) {
 static REPORTED_CONNECTED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
 
+/// Answers one `_shell/authorizeRoot` from the sidecar.
+///
+/// Runs on its own task so the stdout reader keeps draining: the reply is written to
+/// this same stdin/stdout pair, and a reader that waited for it would be waiting on
+/// itself. A request that cannot be answered is answered with an error frame rather
+/// than dropped -- the sidecar's own wait would otherwise run to its deadline and look
+/// like a wedged shell.
+fn handle_authorize_request(app: &AppHandle, value: &serde_json::Value) {
+    let id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let epoch = value
+        .get("sidecar_epoch")
+        .and_then(|epoch| epoch.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let params = value.get("params").cloned().unwrap_or_default();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let reply = match serde_json::from_value::<yi_agent_lifecycle::production::RootIntentRequest>(
+            params,
+        ) {
+            Ok(request) => {
+                let manager = app
+                    .state::<crate::runtime_lifecycle::QuitState>()
+                    .manager
+                    .clone();
+                match manager
+                    .authorize_intent(
+                        request,
+                        yi_agent_lifecycle::deadline::Deadline::after(
+                            crate::runtime_management::MANAGEMENT_BUDGET,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(entry) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "sidecar_epoch": epoch,
+                        "result": entry,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "sidecar_epoch": epoch,
+                        "error": error,
+                    }),
+                }
+            }
+            Err(error) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "sidecar_epoch": epoch,
+                "error": format!("malformed authorize request: {error}"),
+            }),
+        };
+        let state = app.state::<Sidecar>();
+        if let Err(error) = write_line(&state, &ProfileKey::Local, &reply) {
+            eprintln!("[sidecar] could not answer an authorize request: {error}");
+        }
+    });
+}
+
 fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
@@ -1375,6 +1441,18 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
         return;
     };
 
+    // A management *request* from the sidecar, before the response interception
+    // below: this direction never existed until conversations could ask for their own
+    // root. It must be answered asynchronously -- the answer needs the runtime
+    // manager, which is async -- and never broadcast, because the params name a root
+    // and the reply carries its capability.
+    if *slot == ProfileKey::Local
+        && value.get("method").and_then(|method| method.as_str())
+            == Some(crate::runtime_management::AUTHORIZE_ROOT_METHOD)
+    {
+        handle_authorize_request(app, &value);
+        return;
+    }
     // 管理响应在**广播之前**截获。放在 `classify` 之前而不是之后，是因为一条
     // 管理响应完全可能看起来像一个普通响应；一旦它先被 emit 出去，页面就能
     // 读到 epoch 与授权结论，甚至能替它作答。

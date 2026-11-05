@@ -192,20 +192,28 @@ pub(crate) async fn run_thread_driver(
         // and reused afterwards; a failure here leaves the turn running with legacy
         // semantics rather than aborting a working conversation.
         let mut foreground_turn: Option<yi_agent_subagent::foreground::ForegroundTurn> = None;
-        if !foreground_host_resolved {
-            foreground_host_resolved = true;
-            if let Some(root) = foreground_root.as_ref() {
-                match crate::server::foreground::ForegroundDispatch::connect_root(root) {
-                    Ok(Some(host)) => foreground_host = Some(Arc::new(host)),
-                    Ok(None) => {}
-                    Err(cause) => {
-                        tracing::warn!(%cause, "foreground authority unavailable for this thread")
+        if let Some(root) = foreground_root.as_ref() {
+            if root.is_managed() {
+                // A managed conversation has no lease of its own to register with: the
+                // App's lease belongs to the desktop shell. It binds with the authority
+                // the shell brokered for *this* root, and only if that authority exists.
+                foreground_turn =
+                    crate::server::foreground::ForegroundDispatch::begin_authorized(root, &turn_id);
+            } else {
+                if !foreground_host_resolved {
+                    foreground_host_resolved = true;
+                    match crate::server::foreground::ForegroundDispatch::connect_root(root) {
+                        Ok(Some(host)) => foreground_host = Some(Arc::new(host)),
+                        Ok(None) => {}
+                        Err(cause) => {
+                            tracing::warn!(%cause, "foreground authority unavailable for this thread")
+                        }
                     }
                 }
+                if let Some(host) = foreground_host.as_ref() {
+                    foreground_turn = host.begin(root, &turn_id);
+                }
             }
-        }
-        if let (Some(host), Some(root)) = (foreground_host.as_ref(), foreground_root.as_ref()) {
-            foreground_turn = host.begin(root, &turn_id);
         }
 
         // 本轮累加器:最终 item 与最近一次用量(用于落盘)。

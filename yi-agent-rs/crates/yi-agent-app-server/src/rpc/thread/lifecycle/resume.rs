@@ -169,6 +169,7 @@ pub(crate) async fn handle(
                 state.runtimes,
                 state.thread_roots,
                 &runtime_dir,
+                crate::server::managed_snapshot(state.managed),
                 state.models_path,
                 state.cfg,
                 &cwd,

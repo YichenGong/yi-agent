@@ -215,6 +215,7 @@ where
             self.runtimes,
             self.thread_roots,
             &runtime_dir,
+            crate::server::managed_snapshot(self.managed),
             self.models_path,
             self.cfg,
             &cwd,

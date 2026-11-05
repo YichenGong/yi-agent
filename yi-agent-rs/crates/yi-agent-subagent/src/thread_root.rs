@@ -511,6 +511,30 @@ impl ThreadRoot {
         self.send_as_root(policy, build)
     }
 
+    /// The authority the shell already brokered for this conversation, in the shape
+    /// the foreground driver binds with.
+    ///
+    /// This is the managed counterpart of [`Self::authorize_foreground_root`]: there is
+    /// no lease to ask with, because the App's lease belongs to the desktop shell and
+    /// this process must not be able to register or renew one. The capability comes from
+    /// the session store, which only accepts entries the shell brokered under the
+    /// authenticated epoch.
+    ///
+    /// `None` when nothing has been brokered yet, or when this is not a managed root.
+    /// The caller keeps legacy semantics in that case; inventing an authorization here
+    /// would be an unattributed bind.
+    pub fn managed_root_authorization(&self) -> Option<RootAuthorization> {
+        let context = self.managed.as_ref()?;
+        let entry = context.resolve_existing(&application_root_key(&self.thread_id))?;
+        Some(RootAuthorization {
+            scope_key: entry.key.scope_key,
+            daemon_instance_id: entry.key.generation,
+            client_run_id: entry.key.client_run_id,
+            root_id: entry.key.root_id,
+            capability: entry.capability.expose().to_string(),
+        })
+    }
+
     /// Asks the guardian for authority over this conversation's root.
     ///
     /// A separate step from [`Self::bind_foreground_driver`] on purpose: the
@@ -799,6 +823,117 @@ mod tests {
             )) => {}
             other => panic!("expected NoBootstrapEpoch, got {other:?}"),
         }
+    }
+
+    /// A managed conversation with no brokered authority has nothing to bind a driver
+    /// with, and must say so instead of inventing one.
+    ///
+    /// This is the fail-closed half of "managedReady is not rootReady": the turn driver
+    /// asks for the authority the shell already granted, gets nothing, and runs without
+    /// activity reporting rather than registering itself as a frontend. Registering
+    /// would be the old `app-server:{pid}` client, which is the shape that keeps an
+    /// orphaned sidecar renewing after the window is gone.
+    #[test]
+    fn a_managed_root_without_brokered_authority_offers_no_driver_binding() {
+        let mut store = crate::managed_binding::RootAuthorityStore::new();
+        store
+            .bind_epoch("epoch-1")
+            .expect("the handshake fixed an epoch");
+        let thread_root = ThreadRoot::managed(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/project"),
+            Vec::new(),
+            Arc::new(crate::managed_binding::ManagedContext::new(
+                Arc::new(Mutex::new(store)),
+                "/tmp/project/.yi-agent/runtime",
+                "app-run-1",
+            )),
+        );
+        assert!(thread_root.is_managed());
+        assert!(
+            thread_root.managed_root_authorization().is_none(),
+            "an empty store must not yield an authorization"
+        );
+    }
+
+    /// The authority the shell brokered is handed to the driver in the daemon's own
+    /// shape, naming this conversation's root -- never a directory.
+    #[test]
+    fn a_managed_root_offers_the_brokered_authority_to_the_driver() {
+        let mut store = crate::managed_binding::RootAuthorityStore::new();
+        store
+            .bind_epoch("epoch-1")
+            .expect("the handshake fixed an epoch");
+        store
+            .install_entry(yi_agent_lifecycle::production::RootAuthorityEntry {
+                key: yi_agent_lifecycle::production::RootAuthorityKey {
+                    scope_key: "/tmp/project/.yi-agent/runtime".into(),
+                    generation: "guardian-7".into(),
+                    client_run_id: "app-run-1".into(),
+                    thread_key: application_root_key("thread-a"),
+                    root_id: "0f2b6f2e-0000-4000-8000-00000000000a".into(),
+                },
+                capability: yi_agent_lifecycle::foreground::SecretCapability::new("cap-a"),
+            })
+            .expect("the entry belongs to this session");
+        let thread_root = ThreadRoot::managed(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/project"),
+            Vec::new(),
+            Arc::new(crate::managed_binding::ManagedContext::new(
+                Arc::new(Mutex::new(store)),
+                "/tmp/project/.yi-agent/runtime",
+                "app-run-1",
+            )),
+        );
+        let authorization = thread_root
+            .managed_root_authorization()
+            .expect("the brokered entry is offered");
+        assert_eq!(
+            authorization.root_id,
+            "0f2b6f2e-0000-4000-8000-00000000000a"
+        );
+        assert_eq!(authorization.capability, "cap-a");
+        assert_eq!(authorization.client_run_id, "app-run-1");
+        assert_eq!(authorization.daemon_instance_id, "guardian-7");
+    }
+
+    /// A sibling conversation's authority is not offered to this one.
+    #[test]
+    fn a_managed_root_does_not_borrow_a_siblings_authority() {
+        let mut store = crate::managed_binding::RootAuthorityStore::new();
+        store
+            .bind_epoch("epoch-1")
+            .expect("the handshake fixed an epoch");
+        store
+            .install_entry(yi_agent_lifecycle::production::RootAuthorityEntry {
+                key: yi_agent_lifecycle::production::RootAuthorityKey {
+                    scope_key: "/tmp/project/.yi-agent/runtime".into(),
+                    generation: "guardian-7".into(),
+                    client_run_id: "app-run-1".into(),
+                    thread_key: application_root_key("thread-b"),
+                    root_id: "0f2b6f2e-0000-4000-8000-00000000000b".into(),
+                },
+                capability: yi_agent_lifecycle::foreground::SecretCapability::new("cap-b"),
+            })
+            .expect("the entry belongs to this session");
+        let thread_root = ThreadRoot::managed(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/project"),
+            Vec::new(),
+            Arc::new(crate::managed_binding::ManagedContext::new(
+                Arc::new(Mutex::new(store)),
+                "/tmp/project/.yi-agent/runtime",
+                "app-run-1",
+            )),
+        );
+        assert!(
+            thread_root.managed_root_authorization().is_none(),
+            "one conversation must never bind with another's capability"
+        );
     }
 
     /// Each conversation asks under its own operation id. A shared process-wide id

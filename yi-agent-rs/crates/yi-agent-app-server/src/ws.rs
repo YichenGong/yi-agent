@@ -144,6 +144,7 @@ where
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                managed: Arc::new(StdMutex::new(None)),
                 models_path: yi_agent_runtime::models::models_path(),
                 websearch_path: yi_agent_tools::websearch_path(),
                 settings_path: yi_agent_runtime::settings::settings_path(),

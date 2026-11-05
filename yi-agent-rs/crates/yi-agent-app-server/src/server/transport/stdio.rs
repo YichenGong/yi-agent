@@ -16,6 +16,10 @@ pub(crate) async fn read_lines<R>(
     // `None`:此时 EOF 直接体现为入站 channel 关闭(`tx` 随本任务结束而 drop),
     // 与改造前一致。
     eof_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    // 本会话的出站管理通道(若有)。授权应答在**这里**截获,不在主循环:
+    // 发起授权的会话正是在主循环任务上阻塞等待,由主循环去读自己的应答必然
+    // 自己等自己。本任务独占 reader,是唯一能同时看到应答的地方。
+    management: Option<std::sync::Arc<super::super::local_management::ManagementHandle>>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -23,6 +27,12 @@ pub(crate) async fn read_lines<R>(
     loop {
         match reader.next_line().await {
             Ok(Some(line)) => {
+                if let Some(handle) = management.as_ref()
+                    && let Some(outbound) = handle.outbound()
+                    && deliver_management_response(&outbound, &line)
+                {
+                    continue;
+                }
                 if tx.send((client.clone(), Ok(line))).await.is_err() {
                     break;
                 }
@@ -40,6 +50,21 @@ pub(crate) async fn read_lines<R>(
         let _ = eof_tx.send(());
     }
 }
+/// Consumes one line if it is a management response. Returns whether it was.
+///
+/// A frame that parses but is not a management response is left for the business loop.
+/// A frame that *is* one is never forwarded, even when nobody is waiting for it: it
+/// carries a capability, and the business path would hand it to the WebView.
+fn deliver_management_response(
+    management: &super::super::management_client::ManagementClient,
+    line: &str,
+) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    management.accept_response(&value)
+}
+
 /// 把该客户端的出站帧写到一条 `AsyncWrite`(stdio 场景即 stdout)。
 ///
 /// 写失败(对端已消失)时把该客户端从 hub 摘除:主循环之后经 `hub.reply` 定向写

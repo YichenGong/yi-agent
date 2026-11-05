@@ -41,6 +41,19 @@ pub const RESERVED_PREFIX: &str = "_shell/";
 /// 拒掉，随后的整条会话都认证不上。
 pub const BOOTSTRAP_METHOD: &str = "_shell/bootstrap";
 
+/// Requests one conversation's root authority from the shell.
+///
+/// The sidecar cannot mint this itself: the shell holds the lease, and the guardian
+/// only answers the party that holds it. This method is how a conversation asks; the
+/// answer is a `RootAuthorityEntry` the sidecar installs in its session store and never
+/// re-derives.
+pub const AUTHORIZE_ROOT_METHOD: &str = "_shell/authorizeRoot";
+
+// The direction matters for `AUTHORIZE_ROOT_METHOD` above: this module handles frames
+// the *shell* sends, and that one travels the other way. It lives here anyway because
+// it is part of the same wire namespace and both halves must agree on the spelling;
+// the outbound corridor that actually uses it is `super::management_client`.
+
 /// 管理会话的认证凭据。
 ///
 /// `sidecar_epoch` 在会话建立时固定，之后任何来包都不得切换它：一个可以自报
@@ -218,6 +231,19 @@ pub struct ManagementHandle {
     /// 而 `close_now` 必须能在同步上下文里清空它。用 async 锁会让"进程收尾时
     /// 清空"变成一件没法同步做完的事。
     inflight: std::sync::Mutex<HashMap<String, Arc<Inflight>>>,
+    /// 本会话的出站管理通道，bootstrap 成功后才有。
+    ///
+    /// 放在句柄里而不是传输层的局部变量：读取任务要在**每一帧**到达时问一次
+    /// 「这是不是一条管理应答」，而它先于 bootstrap 启动（第一帧就是凭据帧）。
+    /// 一个在握手完成后才填上的共享槽位，是唯一能让两者都与同一份会话状态对齐
+    /// 的形状。
+    outbound: std::sync::Mutex<Option<Arc<super::management_client::ManagementClient>>>,
+    /// The epoch fixed by the accepted bootstrap, mirrored out of the session.
+    ///
+    /// The session owns the authoritative copy; this one exists so the handshake can
+    /// read the epoch without awaiting the session lock, and it is written once, on
+    /// acceptance.
+    epoch: std::sync::Mutex<Option<String>>,
     backend: Arc<dyn PrepareBackend>,
 }
 
@@ -234,12 +260,77 @@ impl ManagementHandle {
         Self {
             session: Arc::new(Mutex::new(ManagementSession::new())),
             inflight: std::sync::Mutex::new(HashMap::new()),
+            outbound: std::sync::Mutex::new(None),
+            epoch: std::sync::Mutex::new(None),
             backend,
+        }
+    }
+
+    /// Installs the outbound channel once the bootstrap has fixed the credential.
+    ///
+    /// Replacing an existing one closes it first: a second bootstrap is refused by the
+    /// session, so this only ever happens when the caller is rebuilding the same
+    /// session, and a stale channel would answer into a generation that is gone.
+    pub fn install_outbound(
+        &self,
+        client: Arc<super::management_client::ManagementClient>,
+    ) -> Arc<super::management_client::ManagementClient> {
+        let mut slot = self
+            .outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = slot.replace(Arc::clone(&client)) {
+            previous.close();
+        }
+        client
+    }
+
+    /// The outbound channel, once the bootstrap installed one.
+    pub fn outbound(&self) -> Option<Arc<super::management_client::ManagementClient>> {
+        self.outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Forgets the outbound channel, releasing everyone waiting on it.
+    pub fn drop_outbound(&self) {
+        let mut slot = self
+            .outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(client) = slot.take() {
+            client.close();
         }
     }
 
     pub fn session(&self) -> Arc<Mutex<ManagementSession>> {
         Arc::clone(&self.session)
+    }
+
+    /// The epoch this session was bootstrapped under, if it was.
+    ///
+    /// A plain `std` lock rather than the session's async lock: the caller reads it
+    /// while deciding what to install after the handshake, and awaiting the session
+    /// lock there would make a synchronous decision depend on an async ordering. The
+    /// value never changes after bootstrap -- a second bootstrap is refused -- so a
+    /// second copy cannot drift from the session's.
+    pub fn session_epoch(&self) -> Option<String> {
+        self.epoch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Records the epoch the session was bootstrapped under.
+    pub fn fix_epoch(&self, epoch: &str) {
+        let mut slot = self
+            .epoch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(epoch.to_string());
+        }
     }
 
     /// 执行一次 `_shell/prepare`。
@@ -334,6 +425,11 @@ impl ManagementHandle {
         for (_, entry) in locks.drain() {
             let _ = entry.outcome.send(None);
         }
+        // The outbound corridor goes with the session. A waiter parked on a root
+        // authorization would otherwise burn its whole budget after the process had
+        // already decided to exit, and the reply it waits for could only come from a
+        // shell that is itself going away.
+        self.drop_outbound();
     }
 
     /// 关闭会话并清空进行中的槽位（异步调用点用）。
@@ -554,7 +650,6 @@ pub async fn dispatch(
         .map(str::to_owned)
         .unwrap_or_default();
     let id = request.id.clone();
-
     if !is_reserved(&request.method) {
         return ManagementResponse::err(&id, &epoch, "not a management method");
     }
@@ -891,6 +986,82 @@ mod tests {
         // The backend still finishes; the slot must be gone afterwards.
         let _ = waiter.await.unwrap();
         assert_eq!(handle.inflight_count(), 0);
+    }
+
+    /// A root authorization parked on the corridor must not outlive the session.
+    ///
+    /// The waiter's own budget is five seconds, and the reply it wants can only come
+    /// from a shell that is going away with us. Closing has to wake it *now*, with a
+    /// refusal, rather than let it sit out the whole budget after the reason is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closing_the_session_releases_a_waiting_root_authorization() {
+        use crate::server::management_client::{
+            ManagementClient, ManagementWrite, ShellRootAuthority,
+        };
+        use yi_agent_lifecycle::foreground::RootBindIntent;
+        use yi_agent_lifecycle::production::RootIntentRequest;
+        use yi_agent_subagent::managed_binding::ManagedRootAuthority;
+
+        struct Sink;
+
+        #[async_trait::async_trait]
+        impl ManagementWrite for Sink {
+            async fn write_frame(&self, _frame: &serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let handle = Arc::new(ManagementHandle::new(CountingBackend::new(
+            PrepareOutcome::Unknown {
+                reason: "unused".into(),
+            },
+        )));
+        let client = Arc::new(ManagementClient::new("s", "epoch-1", Arc::new(Sink)));
+        handle.install_outbound(Arc::clone(&client));
+
+        // Started on the multi-threaded test runtime because `ShellRootAuthority`
+        // parks its caller while another task answers; that is exactly the shape that
+        // must not be left waiting after the session closes.
+        let authority = ShellRootAuthority::new(Arc::clone(&client));
+        let waiting = tokio::spawn(async move {
+            let intent = RootIntentRequest {
+                sidecar_epoch: "epoch-1".into(),
+                scope_key: "/p/runtime".into(),
+                client_run_id: "run-1".into(),
+                intent: RootBindIntent {
+                    operation_id: "op".into(),
+                    thread_key: "thread:a".into(),
+                    workspace: "/p".into(),
+                    extra_roots: Vec::new(),
+                    previous_root_capability: None,
+                },
+            };
+            authority.authorize(&intent, Deadline::after(Duration::from_secs(30)))
+        });
+        // Let the request reach the pending table before closing.
+        let entered = tokio::time::timeout(Duration::from_secs(5), async {
+            while client.pending_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(entered.is_ok(), "the authorize never registered as pending");
+
+        let started = std::time::Instant::now();
+        handle.close_now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("closing must wake the waiter, not leave it to its budget")
+            .unwrap();
+        assert!(outcome.is_err(), "a closed session cannot grant authority");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the waiter must be released at close, not at its own deadline"
+        );
+        assert!(
+            handle.outbound().is_none(),
+            "the corridor must not outlive the session it belongs to"
+        );
     }
 
     #[test]

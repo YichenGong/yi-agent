@@ -240,6 +240,102 @@ async fn bootstrap_acks_with_the_session_epoch_and_then_admits_business() {
     h.shutdown().await;
 }
 
+/// After the bootstrap fixes an epoch and the shell names itself, the session holds
+/// exactly one authority record -- and it is keyed by the App run the shell named.
+///
+/// This is the wiring half of `managed_binding`'s unit tests: those prove the store
+/// refuses a foreign entry, this proves the handshake actually installs one, and that
+/// it installs the *authenticated* epoch rather than anything a request could name.
+#[tokio::test]
+async fn the_handshake_installs_the_session_authority_under_the_bootstrap_epoch() {
+    let backend = CountingBackend::new(Duration::from_millis(1), connected());
+    let handle = Arc::new(ManagementHandle::new(backend.clone()));
+    let mut h = Harness::with_management(handle).await;
+
+    h.send(&bootstrap_frame("s3cret", "epoch-7")).await;
+    let ack = next_private_frame(&mut h, "the bootstrap ack").await;
+    assert_eq!(
+        ack.get("sidecar_epoch").and_then(|v| v.as_str()),
+        Some("epoch-7")
+    );
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-42","scope_key":"/p/.yi-agent/runtime","issued_by_shell":true}}}"#,
+    )
+    .await;
+    let reply = next_business_frame(&mut h, 7).await;
+    assert!(
+        reply.get("result").is_some(),
+        "initialize must succeed: {reply}"
+    );
+
+    let authority = crate::server::managed_snapshot(&h.managed)
+        .expect("the handshake must install this session's authority");
+    assert_eq!(authority.client_run_id, "app-run-42");
+    // Read the epoch into a local and drop the guard before the await below: holding a
+    // std `Mutex` across an await is a lock-order hazard, even in a test.
+    let epoch = authority
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .epoch()
+        .map(str::to_string);
+    assert_eq!(
+        epoch.as_deref(),
+        Some("epoch-7"),
+        "the epoch comes from the bootstrap, never from the handshake body"
+    );
+    h.shutdown().await;
+}
+
+/// A session that never bootstrapped has no epoch, so nothing may be installed: a
+/// conversation in it attaches with its own key instead of pretending to be managed.
+#[tokio::test]
+async fn a_handshake_without_a_bootstrap_installs_no_authority() {
+    let mut h = Harness::new();
+    h.send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-42","issued_by_shell":true}}}"#,
+    )
+    .await;
+    let reply = next_business_frame(&mut h, 7).await;
+    assert!(reply.get("result").is_some(), "{reply}");
+    assert!(
+        crate::server::managed_snapshot(&h.managed).is_none(),
+        "without an authenticated bootstrap there is no epoch, and without an epoch          no authority may be trusted"
+    );
+    h.shutdown().await;
+}
+
+/// A shell that names itself without the bootstrap secret gets no authority either,
+/// even on the local channel: identity alone is not a credential.
+#[tokio::test]
+async fn an_unbootstrapped_identity_claim_installs_no_authority() {
+    let backend = CountingBackend::new(Duration::from_millis(1), connected());
+    let handle = Arc::new(ManagementHandle::new(backend.clone()));
+    let mut h = Harness::with_management(handle).await;
+
+    // No `_shell/bootstrap` first. The frame is refused before it reaches `initialize`.
+    h.send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-42","issued_by_shell":true}}}"#,
+    )
+    .await;
+    // The refusal echoes the request's own numeric id, because it is the business frame
+    // that was refused: it never became a management request, so it gets no private
+    // envelope.
+    let refused = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(7)))
+        .await;
+    assert!(
+        refused.get("error").is_some(),
+        "an unbootstrapped session must refuse the frame: {refused}"
+    );
+    assert!(
+        crate::server::managed_snapshot(&h.managed).is_none(),
+        "a refused frame must install nothing"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_second_bootstrap_does_not_take_over_the_session() {
     let backend = CountingBackend::new(Duration::from_millis(1), connected());
@@ -264,6 +360,86 @@ async fn a_second_bootstrap_does_not_take_over_the_session() {
     assert_eq!(
         second.get("sidecar_epoch").and_then(|v| v.as_str()),
         Some("epoch-1")
+    );
+    h.shutdown().await;
+}
+
+/// A project that opens after the handshake joins the same session.
+///
+/// The shell named itself once. A second project must not need a second
+/// `initialize`, a second App run id, or a second bootstrap: it is another scope
+/// under the *same* identity, and a prepare for it must be accepted under the
+/// epoch the first bootstrap fixed.
+#[tokio::test]
+async fn a_new_project_after_initialize_is_prepared_under_the_same_identity() {
+    let backend = CountingBackend::new(Duration::from_millis(1), connected());
+    let handle = Arc::new(ManagementHandle::new(backend.clone()));
+    let mut h = Harness::with_management(Arc::clone(&handle)).await;
+
+    h.send(&bootstrap_frame("s3cret", "epoch-1")).await;
+    next_private_frame(&mut h, "the ack").await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-42","issued_by_shell":true}}}"#,
+    )
+    .await;
+    next_business_frame(&mut h, 7).await;
+
+    let first_authority = crate::server::managed_snapshot(&h.managed)
+        .expect("initialize installs the session identity");
+    assert_eq!(first_authority.client_run_id, "app-run-42");
+
+    // The new project opens later, over the same stdio session. No second
+    // handshake is sent: if the design needed one, this prepare would be refused.
+    h.send(&management_frame(
+        "p-new",
+        "_shell/prepare",
+        "s3cret",
+        "epoch-1",
+        prepare_params("/tmp/project-b"),
+    ))
+    .await;
+    let reply = next_private_frame(&mut h, "the new project's prepare").await;
+    assert!(
+        reply.get("error").is_none(),
+        "a later project must be admitted under the session's own epoch: {reply}"
+    );
+    assert_eq!(backend.scopes(), vec!["/tmp/project-b".to_string()]);
+
+    // The session kept exactly the identity it was given. A second handshake would
+    // have replaced the record; nothing here may have moved it.
+    let still = crate::server::managed_snapshot(&h.managed).expect("the identity survives");
+    assert_eq!(still.client_run_id, "app-run-42");
+    let still_epoch = still
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .epoch()
+        .map(str::to_string);
+    assert_eq!(
+        still_epoch.as_deref(),
+        Some("epoch-1"),
+        "the epoch is fixed by the bootstrap and does not move for a new project"
+    );
+
+    // A prepare still naming a retired epoch is refused, so "joined the session"
+    // cannot be confused with "any epoch will do".
+    h.send(&management_frame(
+        "p-stale",
+        "_shell/prepare",
+        "s3cret",
+        "epoch-0",
+        prepare_params("/tmp/project-c"),
+    ))
+    .await;
+    let refused = next_private_frame(&mut h, "the stale prepare").await;
+    assert!(
+        refused.get("error").is_some(),
+        "a prepare from a previous epoch must be refused: {refused}"
+    );
+    assert_eq!(
+        backend.scopes(),
+        vec!["/tmp/project-b".to_string()],
+        "the refused prepare must not start a runtime"
     );
     h.shutdown().await;
 }

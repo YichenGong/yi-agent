@@ -40,6 +40,23 @@ pub(crate) struct Activation {
     /// 决定是报 `RestoreFailed` 还是接受无委派(见 `server/driver_resume.rs`)。
     pub(crate) tooling_error: Option<String>,
 }
+/// The scope key a conversation in `cwd` belongs to.
+///
+/// The same resolution the guardian, the shell and the runtime status all use: one
+/// rule, so a capability minted for this scope is matched here and nowhere else. It is
+/// a *scope* key, not a root id -- deriving a root id from a directory is the mistake
+/// this whole design removes.
+fn scope_key_for(cwd: &str) -> String {
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
+    yi_agent_lifecycle::scope::resolve(
+        &runtime_dir,
+        Path::new(cwd),
+        &crate::server::instance_home_dir(),
+    )
+    .map(|scope| scope.key)
+    .unwrap_or_else(|_| runtime_dir.to_string_lossy().into_owned())
+}
+
 /// 为该 cwd 的 agent 接上委派能力。失败即降级:保留原 agent,只记 trace。
 ///
 /// 调用方必须已拿到 `build_agent` 的产物,且**不得**在 `threads` 的可变借用内调用:
@@ -50,6 +67,9 @@ pub(crate) fn attach_delegation(
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
     runtime_dir: &Path,
+    // The shell-brokered authority for this session, when this sidecar serves one.
+    // `None` is the embedded shape and keeps the old behaviour byte for byte.
+    managed: Option<Arc<crate::server::ManagedAuthority>>,
     models_path: &Path,
     cfg: &RuntimeConfig,
     cwd: &str,
@@ -107,12 +127,33 @@ pub(crate) fn attach_delegation(
     // The same captured set that goes into the thread meta: a conversation's
     // delegation root must carry the same linked roots the rest of the session
     // was built with, or the two disagree with no way to notice.
-    let root = ThreadRoot::new(
-        Arc::clone(&binding),
-        thread_id,
-        PathBuf::from(cwd),
-        extra_roots.clone(),
-    );
+    // Which kind of root this conversation gets is a property of the deployment, not a
+    // preference: a managed session must ask the shell for its own authority, and an
+    // embedded one has nobody to ask. Taking the managed branch whenever the shell
+    // authorized this session is what keeps a managed conversation from silently
+    // falling back to a self-declared attach.
+    let root = match managed.as_ref() {
+        Some(authority) => ThreadRoot::managed(
+            Arc::clone(&binding),
+            thread_id,
+            PathBuf::from(cwd),
+            extra_roots.clone(),
+            Arc::new(
+                yi_agent_subagent::managed_binding::ManagedContext::new(
+                    Arc::clone(&authority.store),
+                    scope_key_for(cwd),
+                    authority.client_run_id.clone(),
+                )
+                .with_broker(Arc::clone(&authority.broker)),
+            ),
+        ),
+        None => ThreadRoot::new(
+            Arc::clone(&binding),
+            thread_id,
+            PathBuf::from(cwd),
+            extra_roots.clone(),
+        ),
+    };
     if let Err(cause) = root.attach() {
         tracing::warn!(
             stage = "attach_root",

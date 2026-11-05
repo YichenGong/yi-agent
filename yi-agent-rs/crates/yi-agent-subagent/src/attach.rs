@@ -1249,56 +1249,19 @@ pub fn attach_managed_project_runtime(
         }
         Err(error) => return Err(AttachFailure::new("runtime bring-up", error)),
     }
-    // The shell's capability, if it sent one. On a daemon whose guardian signed
-    // this root, it is required; on an unmanaged one the daemon ignores it and the
-    // generated key is used, which keeps the embedded path byte-for-byte unchanged.
-    let capability = managed_root_capability(&cfg.workdir);
+    // No capability here on purpose. This is the *project* attach: it opens the
+    // connection a conversation will later attach its own root over. Minting or
+    // carrying a root capability at this level is exactly the coupling this design
+    // removes -- a project-wide credential would be the "pre-attach a root for the
+    // whole project and hope every conversation inherits it" shape, and the daemon
+    // would see one root shared by conversations that must not share one.
     attach_to_answer(
         cfg,
         &runtime_dir,
         // The managed path never owns the daemon, so it never supervises plugins.
         None,
-        capability,
+        None,
     )
-}
-
-/// Root capabilities the desktop shell minted, keyed by project path.
-///
-/// Filled on `initialize` rather than at start-up: a capability is bound to one App
-/// run and one generation, so it cannot outlive the handshake that carried it. The
-/// store is replaced wholesale on each handshake, never merged -- a reconnect to a
-/// restarted guardian must not leave the previous generation's keys attachable.
-static ROOT_CAPABILITIES: std::sync::Mutex<Vec<(String, String)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Records what the shell authorized for this process.
-pub fn install_root_capabilities(capabilities: Vec<(String, String)>) {
-    let mut stored = ROOT_CAPABILITIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *stored = capabilities;
-}
-
-/// The root capability the desktop shell handed this process, if any.
-///
-/// Read from the shared store rather than from an argument, for the same reason
-/// `expected` is: the shell speaks once, on `initialize`, and every attach this
-/// sidecar performs afterwards has to use the same answer. A project the shell never
-/// authorized yields `None`, and the attach then fails on the daemon's gate with a
-/// reason that names the missing authorization.
-pub fn managed_root_capability(workdir: &Path) -> Option<String> {
-    let wanted = canonical_or_self(workdir);
-    let stored = ROOT_CAPABILITIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    stored
-        .iter()
-        .find(|(root, _)| canonical_or_self(Path::new(root)) == wanted)
-        .map(|(_, capability)| capability.clone())
-}
-
-fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Attaches one root over an already-decided runtime.

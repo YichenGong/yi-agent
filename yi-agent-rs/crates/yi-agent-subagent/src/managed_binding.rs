@@ -129,13 +129,13 @@ impl RootAuthorityStore {
             return Err("the snapshot names no scope".to_string());
         }
 
-        if let Some(existing) = self.scopes.get(&snapshot.scope_key) {
-            if snapshot.revision <= existing.revision {
-                return Err(format!(
-                    "scope {} already has revision {}, which is not older than {}",
-                    snapshot.scope_key, existing.revision, snapshot.revision
-                ));
-            }
+        if let Some(existing) = self.scopes.get(&snapshot.scope_key)
+            && snapshot.revision <= existing.revision
+        {
+            return Err(format!(
+                "scope {} already has revision {}, which is not older than {}",
+                snapshot.scope_key, existing.revision, snapshot.revision
+            ));
         }
 
         // The snapshot's own generation comes from its entries. An empty snapshot
@@ -496,29 +496,37 @@ impl ManagedContext {
         thread_key: &str,
         intent: &RootBindIntent,
     ) -> Result<RootAuthorityEntry, ManagedAdmissionError> {
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if store.epoch().is_none() {
-            return Err(ManagedAdmissionError::NoBootstrapEpoch);
-        }
-        if let Some(entry) = store.entry_for(&self.scope_key, &self.client_run_id, thread_key) {
-            return Ok(entry);
-        }
+        // The store lock is held only for the lookups and the install, never across the
+        // broker call. The broker waits for a reply delivered by the very task that
+        // serves this session (the stdio reader), so holding the lock while it waits
+        // would make every other conversation in this session queue behind one round
+        // trip -- and any future reader-side touch of the store would deadlock outright.
+        let epoch = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(epoch) = store.epoch().map(str::to_string) else {
+                return Err(ManagedAdmissionError::NoBootstrapEpoch);
+            };
+            if let Some(entry) = store.entry_for(&self.scope_key, &self.client_run_id, thread_key) {
+                return Ok(entry);
+            }
+            epoch
+        };
         let Some(broker) = self.broker.as_ref() else {
             return Err(ManagedAdmissionError::NoBroker);
         };
-        let epoch = store.epoch().expect("checked above").to_string();
         let request = RootIntentRequest {
             sidecar_epoch: epoch,
             scope_key: self.scope_key.clone(),
             client_run_id: self.client_run_id.clone(),
             intent: intent.clone(),
         };
-        // Five seconds: the shell has already prepared the runtime, so this is one
-        // guardian round trip, not a bring-up.
-        let deadline = Deadline::after(std::time::Duration::from_secs(5));
+        // One guardian round trip, not a bring-up: the shell has already prepared the
+        // runtime. The budget is the app-server's own published constant so the two
+        // sides cannot drift into a sidecar that waits less than the shell allows.
+        let deadline = Deadline::after(yi_agent_lifecycle::AUTHORIZE_BUDGET);
         let entry = broker
             .authorize(&request, deadline)
             .map_err(ManagedAdmissionError::BrokerRefused)?;
@@ -540,10 +548,28 @@ impl ManagedContext {
                 got: entry.key.thread_key,
             });
         }
-        store
+        // Re-lock to install. Another conversation may have installed its own entry in
+        // the meantime, which is fine -- entries are keyed by conversation, and the
+        // generation rule inside `install_entry` keeps them from mixing.
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .install_entry(entry.clone())
             .map_err(ManagedAdmissionError::InstallRefused)?;
         Ok(entry)
+    }
+
+    /// The entry this conversation already has, without asking for one.
+    ///
+    /// Used by paths that must not start a guardian round trip of their own -- binding
+    /// the foreground driver is the main one, because it runs inside the turn and a
+    /// round trip there would hold the turn open on the shell. Asking for authority is
+    /// the attach path's job, and it has already happened by the time a turn runs.
+    pub fn resolve_existing(&self, thread_key: &str) -> Option<RootAuthorityEntry> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry_for(&self.scope_key, &self.client_run_id, thread_key)
     }
 
     /// Forgets one conversation's authority by naming the conversation.
@@ -923,6 +949,100 @@ mod tests {
                 .map(|c| c.expose()),
             Some("cap-gen2"),
             "the conversation's next attach uses the new generation"
+        );
+    }
+
+    /// A project that opens *after* the handshake joins the same session.
+    ///
+    /// Identity is per App run, not per project: the shell named itself once in
+    /// `initialize`, and a second project opening later must not need a second
+    /// handshake, a second App run id, or a second lease. Each project gets its own
+    /// scope, and neither can reach the other's capability.
+    #[test]
+    fn a_new_project_joins_the_session_without_a_second_identity() {
+        let mut store = bound();
+        store
+            .replace(snapshot(
+                SCOPE_A,
+                1,
+                vec![entry(SCOPE_A, "thread:a", "root-a", "cap-a")],
+            ))
+            .unwrap();
+
+        // Same epoch, same client -- the scope is the only thing that differs.
+        store
+            .replace(snapshot(
+                SCOPE_B,
+                1,
+                vec![entry(SCOPE_B, "thread:b", "root-b", "cap-b")],
+            ))
+            .unwrap();
+
+        assert_eq!(store.epoch(), Some(EPOCH), "one identity for the session");
+        assert_eq!(
+            store
+                .capability_for(SCOPE_A, CLIENT, "thread:a")
+                .map(|c| c.expose()),
+            Some("cap-a")
+        );
+        assert_eq!(
+            store
+                .capability_for(SCOPE_B, CLIENT, "thread:b")
+                .map(|c| c.expose()),
+            Some("cap-b")
+        );
+        assert!(
+            store.capability_for(SCOPE_B, CLIENT, "thread:a").is_none(),
+            "a conversation in one project must not resolve in another"
+        );
+    }
+
+    /// A sidecar that comes back under a new epoch cannot reuse what the old one held.
+    ///
+    /// The epoch is the generation marker: `cap-old` was minted for a process that no
+    /// longer exists. Neither half of the handover may accept it -- the new store never
+    /// learns it, a snapshot still naming the old epoch is refused whole, and the old
+    /// store cannot be re-pointed to keep serving.
+    #[test]
+    fn a_capability_from_a_previous_epoch_is_never_accepted() {
+        let mut store = bound();
+        store
+            .replace(snapshot(
+                SCOPE_A,
+                1,
+                vec![entry(SCOPE_A, "thread:a", "root-a", "cap-old")],
+            ))
+            .unwrap();
+        let old = key(SCOPE_A, "thread:a", "root-a");
+        assert_eq!(store.get(&old).map(|c| c.expose()), Some("cap-old"));
+
+        // The restart: a fresh store bound to the epoch it was actually bootstrapped
+        // with. Nothing survives the process boundary.
+        let mut restarted = RootAuthorityStore::new();
+        restarted.bind_epoch("epoch-2").unwrap();
+        assert_eq!(restarted.epoch(), Some("epoch-2"));
+        assert!(restarted.get(&old).is_none());
+
+        let stale = RootAuthoritySnapshot {
+            sidecar_epoch: EPOCH.to_string(),
+            scope_key: SCOPE_A.to_string(),
+            revision: 2,
+            entries: vec![entry(SCOPE_A, "thread:a", "root-a", "cap-old")],
+        };
+        assert!(
+            restarted.replace(stale).is_err(),
+            "a snapshot naming the retired epoch must be refused, not installed"
+        );
+        assert!(
+            restarted.get(&old).is_none(),
+            "a refused snapshot must leave nothing behind"
+        );
+
+        // And the old store would rather fail than silently start speaking for the
+        // new epoch.
+        assert!(
+            store.bind_epoch("epoch-2").is_err(),
+            "the epoch is fixed once per session"
         );
     }
 

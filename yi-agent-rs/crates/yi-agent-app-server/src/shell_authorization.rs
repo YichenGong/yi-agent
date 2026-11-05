@@ -54,35 +54,6 @@ pub struct ShellAuthorization {
     /// gets a wrong banner about its own project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_runtime: Option<ExpectedRuntime>,
-    /// Authority to attach one project root, minted by the guardian for this App
-    /// run.
-    ///
-    /// Per project, not per session: the guardian signs a capability for a root in
-    /// a generation, and the App may have several projects open. Each entry is
-    /// exactly one such capability, and the daemon accepts an attach only when the
-    /// key it presents resolves to a binding its own guardian pushed.
-    ///
-    /// This is the piece the plan calls for at "the shell passes a non-renewable,
-    /// root- and generation-bound authorization on the existing local stdio
-    /// `initialize`". It is not a credential: it cannot register, renew, or spawn,
-    /// and an orphaned sidecar that kept it could not extend the App's lease.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub root_authorizations: Vec<RootAuthorization>,
-}
-
-/// One root's authority, as the sidecar receives it.
-///
-/// A local mirror of `yi_agent_lifecycle::types::RootAuthorization`, for the same
-/// reason [`ExpectedRuntime`] is a mirror: the app-server must not export lifecycle
-/// wire types to TypeScript, and this value never crosses that boundary. It is read
-/// on the handshake and handed to the attach path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RootAuthorization {
-    pub scope_key: String,
-    pub daemon_instance_id: String,
-    pub client_run_id: String,
-    pub root_id: String,
-    pub capability: String,
 }
 
 /// The artifact identity the shell was built against, as the sidecar needs it.
@@ -114,23 +85,7 @@ impl ShellAuthorization {
             daemon_instance_id: None,
             issued_by_shell: true,
             expected_runtime: None,
-            root_authorizations: Vec::new(),
         }
-    }
-
-    /// The capability this session may attach `root` with, when the shell sent one.
-    ///
-    /// Matched on the canonical project path because that is what the guardian
-    /// signed: a capability for `/p` must not attach `/q`, and comparing here means
-    /// the attach path does not have to re-derive the rule.
-    pub fn capability_for_root(&self, root: &std::path::Path) -> Option<&str> {
-        let wanted = canonical_or_self(root);
-        self.root_authorizations
-            .iter()
-            .find(|authorization| {
-                canonical_or_self(std::path::Path::new(&authorization.root_id)) == wanted
-            })
-            .map(|authorization| authorization.capability.as_str())
     }
 
     /// The same authorization, carrying the artifact this shell shipped with.
@@ -168,24 +123,6 @@ impl ShellAuthorization {
         {
             return Err("shell authorization has an empty scope key".to_string());
         }
-        // A capability that names nothing cannot be matched to a root, and accepting
-        // it would leave the attach path silently unauthenticated. Refusing the whole
-        // field is right: a half-broken authorization is worse than none, because the
-        // session would look authorized and fail at the first attach.
-        for authorization in &self.root_authorizations {
-            if authorization.root_id.trim().is_empty() {
-                return Err("a root authorization names no root".to_string());
-            }
-            if authorization.capability.trim().is_empty() {
-                return Err("a root authorization carries no capability".to_string());
-            }
-            if authorization.client_run_id != self.client_run_id {
-                return Err(format!(
-                    "a root authorization is for client {}, not {}",
-                    authorization.client_run_id, self.client_run_id
-                ));
-            }
-        }
         // An expectation with an empty build id would classify every runtime as a
         // mismatch; better to have no opinion than a wrong one.
         if self
@@ -208,16 +145,6 @@ impl ShellAuthorization {
 pub fn from_initialize_params(params: &serde_json::Value) -> Option<ShellAuthorization> {
     let value = params.get("shellAuthorization")?;
     serde_json::from_value(value.clone()).ok()
-}
-
-/// Resolves a project path for comparison, falling back to the raw path.
-///
-/// The shell records the project as the user picked it and the guardian signs that
-/// same string, so usually the comparison is textual. Canonicalising both sides
-/// covers the case where one went through a symlink: silently treating two names of
-/// one directory as different roots would refuse an attach that should work.
-fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -352,57 +279,49 @@ mod tests {
         assert!(authorization.accept(true).is_err());
     }
 
-    /// A capability the shell minted is forwarded to the attach path for its root.
+    /// The handshake carries who this session speaks for, and nothing that could be
+    /// looked up by directory.
+    ///
+    /// The old shape matched a capability to a *project path*, which is precisely the
+    /// coupling that let two conversations in one directory share one root. What the
+    /// sidecar needs from the handshake is identity; the roots themselves are asked
+    /// for, one conversation at a time, over the private management channel.
     #[test]
-    fn a_root_capability_is_matched_to_its_project() {
-        let root = std::env::temp_dir();
-        let mut authorization = good();
-        authorization.root_authorizations.push(RootAuthorization {
-            scope_key: "/p/.yi-agent/runtime".to_string(),
-            daemon_instance_id: "daemon-7".to_string(),
-            client_run_id: "app-run-1".to_string(),
-            root_id: root.to_string_lossy().into_owned(),
-            capability: "rootcap1:abc".to_string(),
-        });
-        authorization.accept(true).unwrap();
-        assert_eq!(
-            authorization.capability_for_root(&root),
-            Some("rootcap1:abc")
-        );
-        // A different project must not borrow this one's authority.
-        assert_eq!(
-            authorization.capability_for_root(std::path::Path::new("/definitely/not/this")),
-            None
-        );
+    fn the_handshake_carries_identity_and_no_root_capability() {
+        let authorization = good();
+        assert_eq!(authorization.client_run_id, "app-run-1");
+        let wire = serde_json::to_value(&authorization).unwrap();
+        assert_eq!(wire["client_run_id"], "app-run-1");
+        // There is no field on this struct through which a capability could arrive:
+        // accepting one here would be a project-wide credential, and the daemon
+        // would then see one root shared by conversations that must not share one.
+        assert!(wire.get("root_authorizations").is_none());
     }
 
-    /// A capability for a *different* client is a contradiction: the shell speaks
-    /// for one run, and accepting both would let two App runs' authority mix.
+    /// A shell that nevertheless sends root capabilities in the handshake does not
+    /// get them installed by accident.
+    ///
+    /// Silently dropping an unknown field is the right answer here: the field is not
+    /// part of this contract any more, so nothing may be inferred from it. What must
+    /// *not* happen is the old fallback, where a path-keyed capability made the
+    /// attach path believe the session was authorized.
     #[test]
-    fn a_capability_for_another_client_is_refused() {
-        let mut authorization = good();
-        authorization.root_authorizations.push(RootAuthorization {
-            scope_key: "/p/.yi-agent/runtime".to_string(),
-            daemon_instance_id: "daemon-7".to_string(),
-            client_run_id: "someone-else".to_string(),
-            root_id: "/p".to_string(),
-            capability: "rootcap1:abc".to_string(),
-        });
-        let error = authorization.accept(true).unwrap_err();
-        assert!(error.contains("not app-run-1"), "{error}");
-    }
-
-    #[test]
-    fn an_empty_capability_is_refused() {
-        let mut authorization = good();
-        authorization.root_authorizations.push(RootAuthorization {
-            scope_key: "/p/.yi-agent/runtime".to_string(),
-            daemon_instance_id: "daemon-7".to_string(),
-            client_run_id: "app-run-1".to_string(),
-            root_id: "/p".to_string(),
-            capability: "  ".to_string(),
-        });
-        assert!(authorization.accept(true).is_err());
+    fn a_root_capability_in_the_handshake_is_ignored() {
+        let authorization = good();
+        let mut wire = serde_json::to_value(&authorization).unwrap();
+        wire["root_authorizations"] = serde_json::json!([{
+            "scope_key": "/p/.yi-agent/runtime",
+            "daemon_instance_id": "daemon-7",
+            "client_run_id": "app-run-1",
+            "root_id": "/p",
+            "capability": "rootcap1:abc",
+        }]);
+        let parsed = from_initialize_params(&serde_json::json!({
+            "shellAuthorization": wire
+        }))
+        .expect("the identity half is still well formed");
+        assert!(parsed.accept(true).is_ok());
+        assert_eq!(parsed.client_run_id, "app-run-1");
     }
 
     /// No credential may cross the pipe: what the shell sends is identity, and a

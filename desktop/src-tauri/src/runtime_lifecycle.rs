@@ -1598,11 +1598,18 @@ impl DesktopRuntimeManager {
     /// request comes from the session we bootstrapped), and the App's own client
     /// run id (nobody may act for another client). Deliberately not a Tauri
     /// command: the page must never be able to ask for a root capability.
+    /// Authorizes one conversation's root, returning the entry the sidecar installs.
+    ///
+    /// The entry, not the bare `RootAuthorization`: the sidecar's store is keyed by
+    /// scope, generation, client, conversation and root, and the authorization the
+    /// guardian hands back does not carry the conversation. Filling it in here is
+    /// honest -- this side is the one that received the intent and validated it -- and
+    /// keeps the secret in one place instead of asking the caller to re-derive a key.
     pub async fn authorize_intent(
         &self,
         request: RootIntentRequest,
         deadline: Deadline,
-    ) -> Result<RootAuthorization, String> {
+    ) -> Result<yi_agent_lifecycle::production::RootAuthorityEntry, String> {
         if self.quitting.load(Ordering::SeqCst) {
             return Err("the app is quitting; no root may be authorized".to_string());
         }
@@ -1648,11 +1655,24 @@ impl DesktopRuntimeManager {
         }
         let backend = Arc::clone(&self.backend);
         let intent = request.intent.clone();
-        run_bounded(budget, move || {
+        let thread_key = intent.thread_key.clone();
+        let authorization = run_bounded(budget, move || {
             backend.authorize_root(&scope, &intent, budget)
         })
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        Ok(yi_agent_lifecycle::production::RootAuthorityEntry {
+            key: yi_agent_lifecycle::production::RootAuthorityKey {
+                scope_key: authorization.scope_key.clone(),
+                generation: authorization.daemon_instance_id.clone(),
+                client_run_id: authorization.client_run_id.clone(),
+                thread_key,
+                root_id: authorization.root_id.clone(),
+            },
+            capability: yi_agent_lifecycle::foreground::SecretCapability::new(
+                authorization.capability,
+            ),
+        })
     }
 
     /// Releases one project within `deadline`.
@@ -4201,9 +4221,9 @@ mod tests {
             .authorize_intent(root_intent(&project.key, "thread:a"), once_deadline())
             .await
             .unwrap();
-        assert_eq!(authorization.root_id, "root-thread:a");
-        assert_eq!(authorization.client_run_id, "app-run");
-        assert_eq!(authorization.scope_key, project.key);
+        assert_eq!(authorization.key.root_id, "root-thread:a");
+        assert_eq!(authorization.key.client_run_id, "app-run");
+        assert_eq!(authorization.key.scope_key, project.key);
     }
 
     /// Cancelling the version choice leaves the project blocked, and a quit still

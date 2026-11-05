@@ -448,6 +448,12 @@ pub(crate) struct AppState<'a> {
     /// 每会话自己的 root 表。`thread/resume` 经 `attach_delegation` 挂 root,
     /// `thread/delete` 摘掉该会话的 root 并 `detach`。搬移前臂里的 `thread_roots`。
     pub(crate) thread_roots: &'a ThreadRoots,
+    /// The shell-brokered authority for this session, once the bootstrap installed it.
+    ///
+    /// A slot rather than a value because the credential arrives after the server is
+    /// built. `None` inside means "no shell": the conversation then attaches with its
+    /// own key, which is the embedded path.
+    pub(crate) managed: &'a crate::server::ManagedSlot,
     /// 每 thread 一个进程状态守望者。`thread/start`/`thread/resume`/`thread/delete`
     /// 增删它,`agent/trace/unwatch` 停它。搬移前臂里的 `process_watches`,按 `&mut`
     /// 借用。

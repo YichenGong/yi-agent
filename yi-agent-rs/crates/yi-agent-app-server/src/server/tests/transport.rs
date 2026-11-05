@@ -107,6 +107,7 @@ async fn agent_factory_failure_returns_internal_error() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            managed: Arc::new(StdMutex::new(None)),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),

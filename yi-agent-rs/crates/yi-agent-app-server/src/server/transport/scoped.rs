@@ -69,6 +69,7 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
+            managed: Arc::new(StdMutex::new(None)),
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),
@@ -162,6 +163,7 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
+            managed: Arc::new(StdMutex::new(None)),
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),
@@ -378,6 +380,7 @@ where
         local.clone(),
         inbound_tx.clone(),
         if merged { Some(stdio_eof_tx) } else { None },
+        management.clone(),
     ));
     // scope 随连接登记一次;主循环按 `client` id 查它。stdio 会话只此一条,故
     // 传入的表就是一张只装 `local` 的注册表(与 ws 的动态注册同型,便于共享)。

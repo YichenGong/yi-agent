@@ -30,6 +30,14 @@ pub const MAX_MANAGEMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// 本地准备方法名。与 app-server 的 `dispatch` 分支同名：线协议的一部分。
 pub const PREPARE_METHOD: &str = "_shell/prepare";
 
+/// Asks the shell to broker one conversation's root authority.
+///
+/// A request *from* the sidecar, not a response to one: the sidecar holds no lease, so
+/// it cannot mint authority and has to ask the party that does. The reply is written
+/// back to the sidecar's stdin and never broadcast, for the same reason a prepare
+/// response is not: it carries a capability.
+pub const AUTHORIZE_ROOT_METHOD: &str = "_shell/authorizeRoot";
+
 /// 保留方法前缀。与 app-server 的常量同名同值，两侧各存一份是有意的：
 /// 壳不依赖 app-server（它是另一个进程），所以这个字符串是**线协议**的一部分，
 /// 由两侧的测试同时钉住。

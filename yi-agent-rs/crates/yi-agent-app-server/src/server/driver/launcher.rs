@@ -98,6 +98,8 @@ pub(crate) struct ServeLauncher<'a, F> {
     pub(crate) uploads: &'a mut crate::image_upload::UploadRegistry,
     pub(crate) runtimes: &'a ProjectRuntimes,
     pub(crate) thread_roots: &'a ThreadRoots,
+    /// The shell-brokered authority for this session, once the bootstrap installed it.
+    pub(crate) managed: &'a crate::server::ManagedSlot,
     /// 机器级模型清单路径:被驱动的会话的委派链路与手工会话读同一份,而非各自
     /// 重读 `$HOME`。
     pub(crate) models_path: &'a Path,
@@ -326,6 +328,7 @@ where
             self.process_watches,
             self.runtimes,
             self.thread_roots,
+            self.managed,
             self.models_path,
             self.cfg,
             workdir,
@@ -728,6 +731,7 @@ where
             self.process_watches,
             self.runtimes,
             self.thread_roots,
+            self.managed,
             self.models_path,
             self.cfg,
             &target.cwd,

@@ -570,6 +570,12 @@ pub(crate) struct Harness {
     pub(crate) lead_control: crate::lead_control::LeadControlInbox,
     pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
     pub(crate) view_frames: crate::server::ViewFrames,
+    /// The shell-brokered authority slot, shared with the server.
+    ///
+    /// Same technique as `view_frames`: the server writes it, the test observes it. A
+    /// second `Arc` here would be a second slot, and every assertion about "the
+    /// handshake installed this session's identity" would pass against an empty one.
+    pub(crate) managed: crate::server::ManagedSlot,
     pub(crate) plugins_dir: tempfile::TempDir,
     pub(crate) daemon_calls: DaemonCalls,
 }
@@ -1030,6 +1036,9 @@ impl Harness {
         // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
         let view_frames: crate::server::ViewFrames =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // 与 `view_frames` 同一手法:服务端写入、测试观察。自造一份会让
+        // 「握手装上了本会话的身份」这条断言在空槽位上永远成立。
+        let managed: crate::server::ManagedSlot = Arc::new(StdMutex::new(None));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1041,6 +1050,7 @@ impl Harness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                managed: Arc::clone(&managed),
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
@@ -1104,6 +1114,7 @@ impl Harness {
             lead_control,
             lead_control_replies,
             view_frames,
+            managed,
             plugins_dir,
             daemon_calls,
         }
@@ -2716,6 +2727,7 @@ impl MergedHarness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                managed: Arc::new(StdMutex::new(None)),
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 settings_path: PathBuf::new(),

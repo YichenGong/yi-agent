@@ -54,6 +54,18 @@ pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
 /// remains of the operation's total budget.
 pub const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long one *root authorization* round trip may take.
+///
+/// Five seconds, and deliberately not the managed-channel budget: the shell has already
+/// prepared the runtime by the time a conversation asks for a root, so what remains is a
+/// single guardian round trip. Waiting longer would keep a conversation parked behind a
+/// shell that is itself waiting on a stuck daemon, which is the failure this bounds.
+///
+/// Defined here because both sides of the round trip need it: the app-server bounds its
+/// wait with it, and the subagent (which cannot see the app-server) builds the deadline
+/// from it. Two private copies would drift apart silently.
+pub const AUTHORIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long one managed spawn channel may idle before it is closed.
 ///
 /// Not a session limit: a channel serves exactly one owner for as long as that

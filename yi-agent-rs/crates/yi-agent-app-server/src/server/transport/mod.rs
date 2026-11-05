@@ -7,12 +7,20 @@ pub(crate) mod notifications;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 /// 唯一一条会真的等外部进程的管理方法。
 ///
 /// 单独判定而不是"所有管理方法都 spawn"：其余方法只读内存状态，内联处理让
 /// 拒绝顺序与读入顺序一致，便于排障；把顺序丢掉换来的只是一个更大的并发面。
 const SLOW_MANAGEMENT_METHOD: &str = "_shell/prepare";
+
+/// The other management method that leaves the read loop.
+///
+/// An authorization is a guardian round trip the shell performs on this sidecar's
+/// behalf. Awaiting it inline would stall the one loop that has to keep serving the
+/// response -- the answer arrives on this very stdio -- so it runs as its own task.
+const SLOW_AUTHORIZE_METHOD: &str = crate::server::local_management::AUTHORIZE_ROOT_METHOD;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -53,6 +61,47 @@ pub(crate) use scoped::{parse_relay_url, serve_scoped, serve_scoped_core, serve_
 pub use scoped::{run, serve_stdio_with_relay};
 #[allow(unused_imports)]
 pub(crate) use stdio::{pump_stdout, read_lines};
+
+/// Records the identity this session was authorized under, for the managed attach path.
+///
+/// Only the *identity* comes from the handshake: the epoch was fixed by the authenticated
+/// bootstrap, and the roots are asked for later, one conversation at a time. Installing an
+/// authority object here is what makes `attach_delegation` take the managed branch at all
+/// -- and it is why that branch cannot be taken on a session the shell never spoke to.
+///
+/// A missing management handle means this is not a shell-launched session, so there is no
+/// one to ask for a root: the slot stays empty and the conversation attaches with its own
+/// key, which is the embedded path.
+fn install_managed_identity(
+    slot: &crate::server::ManagedSlot,
+    authorization: &crate::shell_authorization::ShellAuthorization,
+    management: Option<&Arc<crate::server::local_management::ManagementHandle>>,
+) {
+    let Some(handle) = management else {
+        return;
+    };
+    let Some(outbound) = handle.outbound() else {
+        // Bootstrapped but no corridor: without it a root request could never be
+        // answered, and installing an authority that can only fail would turn every
+        // conversation in this session into a managed admission error.
+        return;
+    };
+    let Some(epoch) = handle.session_epoch() else {
+        return;
+    };
+    let mut store = yi_agent_subagent::managed_binding::RootAuthorityStore::new();
+    if store.bind_epoch(epoch).is_err() {
+        return;
+    }
+    let authority = Arc::new(crate::server::ManagedAuthority {
+        store: Arc::new(StdMutex::new(store)),
+        broker: Arc::new(crate::server::management_client::ShellRootAuthority::new(
+            outbound,
+        )),
+        client_run_id: authorization.client_run_id.clone(),
+    });
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(authority);
+}
 
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
@@ -116,6 +165,7 @@ where
     let RuntimeAttachments {
         runtimes,
         thread_roots,
+        managed,
         models_path,
         websearch_path,
         settings_path,
@@ -465,6 +515,30 @@ where
                                     ack,
                                     session.sidecar_epoch(),
                                 );
+                                // The outbound half of the channel exists only after the
+                                // credential is fixed: before that there is no epoch to
+                                // name in a request, and the shell would refuse it.
+                                if admission
+                                    == crate::server::local_management::Admission::Accepted
+                                {
+                                    // The epoch is fixed here, once, by the frame that was
+                                    // authenticated. Nothing later may move it: a snapshot
+                                    // that could name its own epoch would be able to install
+                                    // authority for a generation the shell never spoke for.
+                                    handle.fix_epoch(&frame.sidecar_epoch);
+                                    handle.install_outbound(Arc::new(
+                                        crate::server::management_client::ManagementClient::new(
+                                            frame.secret.clone(),
+                                            frame.sidecar_epoch.clone(),
+                                            Arc::new(
+                                                crate::server::management_client::HubWrite::new(
+                                                    Arc::clone(&hub),
+                                                    client.clone(),
+                                                ),
+                                            ),
+                                        ),
+                                    ));
+                                }
                                 hub.reply(&client, serde_json::to_value(&reply)?)
                                     .await
                                     .ok();
@@ -505,7 +579,8 @@ where
                     // 会被占满：壳既发不出取消，也没法对第二个 scope 发起准备，
                     // 而"同 scope 并发只启动一次"这条去重根本不会发生——请求
                     // 被串行化之后永远不重叠。其余管理方法很快，保持内联即可。
-                    let slow = request.method == SLOW_MANAGEMENT_METHOD;
+                    let slow = request.method == SLOW_MANAGEMENT_METHOD
+                        || request.method == SLOW_AUTHORIZE_METHOD;
                     // 后台任务需要 `'static`：先克隆一份句柄，别借用外层绑定。
                     let owned_handle = Arc::clone(handle);
                     let deadline = yi_agent_lifecycle::deadline::Deadline::after(
@@ -705,6 +780,7 @@ where
                             pending_activation: &mut pending_activation,
                             runtimes: &runtimes,
                             thread_roots: &thread_roots,
+                            managed: &managed,
                             process_watches: &mut process_watches,
                             trace_watches: &mut trace_watches,
                             children_watches: &mut children_watches,
@@ -832,19 +908,17 @@ where
                             let is_local = client == crate::broadcast::ClientId::local();
                             match authorization.accept(is_local) {
                                 Ok(authorization) => {
-                                    // Hand the attach path what the shell authorized.
-                                    // The app-server speaks for one App run, so the
-                                    // set is replaced rather than merged: an older
-                                    // generation's capabilities must stop working the
-                                    // moment a new handshake arrives.
-                                    yi_agent_subagent::attach::install_root_capabilities(
-                                        authorization
-                                            .root_authorizations
-                                            .iter()
-                                            .map(|root| {
-                                                (root.root_id.clone(), root.capability.clone())
-                                            })
-                                            .collect(),
+                                    // Identity only, and installed where the attach path
+                                    // reads it: scope and client come from this
+                                    // authenticated handshake, so a conversation cannot
+                                    // name a different project or App run to reach
+                                    // someone else's authority. The roots themselves are
+                                    // asked for one at a time -- there is no
+                                    // project-wide capability to inherit here.
+                                    install_managed_identity(
+                                        &managed,
+                                        authorization,
+                                        management.as_ref(),
                                     );
                                     shell_authorizations
                                         .lock()
@@ -1018,6 +1092,7 @@ where
                     &mut uploads,
                     &runtimes,
                     &thread_roots,
+                    &managed,
                     &models_path,
                     &cfg,
                     &hub,
@@ -1094,6 +1169,7 @@ where
                         uploads: &mut uploads,
                         runtimes: &runtimes,
                         thread_roots: &thread_roots,
+                        managed: &managed,
                         models_path: &models_path,
                         lead_agent_enabled,
                         cfg: &cfg,
@@ -1156,6 +1232,7 @@ where
                     uploads: &mut uploads,
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
+                    managed: &managed,
                     models_path: &models_path,
                     lead_agent_enabled,
                     cfg: &cfg,
@@ -1208,6 +1285,7 @@ where
                     uploads: &mut uploads,
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
+                    managed: &managed,
                     models_path: &models_path,
                     lead_agent_enabled,
                     cfg: &cfg,
