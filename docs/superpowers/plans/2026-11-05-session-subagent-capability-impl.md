@@ -668,7 +668,7 @@ SessionHost 仅在 prepare/begin 时重连，工具使用捕获的 handle/token�
 binding，但不要求该 turn 仍开放；新 turn 建立后旧只读 token 可失效，由新工具继续查询。
 不使用旧 ThreadRoot::handle() 重新领身份。恢复新 binding 后由新 turn 工具表承接只读查询。
 
-- [ ] **Step 1：红测试**，在 core agent.rs 内部测试直接检验旧快照：
+- [x] **Step 1：红测试**，在 core agent.rs 内部测试直接检验旧快照：
 
 ```rust
 #[test]
@@ -689,8 +689,8 @@ fn session_delegation_lifecycle_run_tools_are_an_immutable_snapshot() {
 和 barrier，让 A 的工具等到 B 已开启才执行；断言 A 返回 StaleTurn/本地 closed，wire 捕获中
 没有 B 的 secret，B spawn 成功；fork begin 也使用同一个 A 上下文而不是另取 handle。
 
-- [ ] **Step 2：确认红**：`cargo test -p yi-agent-core --lib session_delegation_lifecycle_run_tools_are_an_immutable_snapshot`。
-- [ ] **Step 3：实现**：
+- [x] **Step 2：确认红**：`cargo test -p yi-agent-core --lib session_delegation_lifecycle_run_tools_are_an_immutable_snapshot`。
+- [x] **Step 3：实现**：
 
 ```rust
 pub fn set_tools_for_next_run(&mut self, tools: Arc<ToolRegistry>) {
@@ -706,8 +706,31 @@ agent.set_tools_for_next_run(Arc::new(next_tools));
 的旧 spawn/fork/cancel 对象。核心 start_run_inner 已克隆 Arc，确认 provider 自动重试/同 run
 多次 ACT 仍保持该 Arc；新 turn 不修改旧工具。只读查询保留权限及终态结果读取。
 
-- [ ] **Step 4：绿**：`cargo test -p yi-agent-core --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client`；再跑 subagent 的现有 fork tests，验证拒绝不消耗上传。
+- [x] **Step 4：绿**：`cargo test -p yi-agent-core --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client`；再跑 subagent 的现有 fork tests，验证拒绝不消耗上传。
 - [ ] **Step 5：提交**：fmt 后提交 `feat: capture delegation capability in each run tool snapshot`。
+
+
+**完成证据（2026-11-05）：**
+
+- core `crates/yi-agent-core/src/agent.rs`：`Agent::set_tools_for_next_run` 只替换下一次 run 的结果，
+  `start_run_inner` 仍在运行时克隆一次 `Arc`；测试
+  `session_delegation_lifecycle_run_tools_are_an_immutable_snapshot` 用 `Arc::ptr_eq` 钉住。
+- subagent `register_session_turn_tools`（`crates/yi-agent-subagent/src/lib.rs`）：五个委派工具
+  （spawn/send/wait/inspect/cancel）全部持有 `Arc<SessionTurnClient>`，不再走 `ThreadRoot::handle()`
+  的旧 application capability；spawn 的 fork 上传也改用本轮 turn（`upload_forked_context_via_turn`）。
+- 写工具先过本地 `ensure_open()`，再由 daemon 复核 turn；读工具用 `SessionTurnClient::send_read`，
+  不要求 turn 仍开放，所以一个已结束的回合仍能读自己启动的 child 结果。
+- store：`RuntimeCoordinator::is_issued_session_turn` + `authorize_issued_session_turn` 让 wait/inspect
+  接受本代次签发的 turn secret；`EndSessionTurn` 改为标记关闭而非删除记录，否则"关闭"会等于
+  "本轮历史不可读"。`CancelChild` / `BeginForkUpload` 补 `session_turn` 并按容器写准入检查。
+- 行为测试 `session_delegation_lifecycle_delayed_old_tool_cannot_borrow_new_turn`：A 回合的 spawn
+  工具在 B 开启后调用被拒，A 关闭后 inspect 仍可读，B 的工具仍可 spawn。
+- 变异验证：去掉本地 `ensure_open` 后 daemon 仍以 `StaleTurn` 拒绝；去掉
+  `authorize_issued_session_turn` 后关闭回合的 inspect 立刻 `authority_denied`。两者都退化为失败，
+  证明断言不是空转。
+- 测试：`cargo test -p yi-agent-subagent --offline`、`-p yi-agent-store --offline --features
+  foreground-test-support`、`-p yi-agent-core --offline --lib`、`-p yi-agent-app-server`、`-p yi-agent
+  --jobs 2` 全绿；`cargo clippy --workspace --all-targets` 无警告。
 
 ## Task 9：app-server/desktop/Kanban 每回合接线
 

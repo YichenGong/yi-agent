@@ -3382,6 +3382,9 @@ impl RuntimeCoordinator {
         caller: &TaskId,
         capability: &str,
     ) -> Result<(), RuntimeCoordinatorError> {
+        if self.authorize_issued_session_turn(session, caller, capability)? {
+            return Ok(());
+        }
         if self
             .authorize_application_root(session, caller, capability)
             .is_err()
@@ -3398,6 +3401,38 @@ impl RuntimeCoordinator {
                 })?;
         }
         Ok(())
+    }
+
+    /// Whether a read may proceed because the caller holds a turn secret this
+    /// daemon minted for the container it is acting as.
+    ///
+    /// Only the container itself, never an execution: an execution has its own
+    /// worker capability and must keep using it. Returns `false` rather than an
+    /// error for "not this kind of caller", so the caller falls through to the
+    /// legacy capability check and its own, more specific refusal.
+    fn authorize_issued_session_turn(
+        &self,
+        session: &RootSessionId,
+        caller: &TaskId,
+        capability: &str,
+    ) -> Result<bool, RuntimeCoordinatorError> {
+        let role = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_role(caller)
+            .or_else(|error| match error {
+                crate::repository::RepositoryError::TaskNotFound { .. } => Ok(TaskRole::Execution),
+                other => Err(other),
+            })?;
+        let _ = session;
+        if role != TaskRole::SessionContainer {
+            return Ok(false);
+        }
+        // A binding only ever exists for a container root, so a task that has one
+        // is the root of its session by construction; no extra lookup can make
+        // this stricter, it can only disagree with the binding table.
+        self.is_issued_session_turn(caller, capability)
     }
 
     /// Reads one task's detail, but only when it lies in the caller's own
@@ -3461,9 +3496,10 @@ impl RuntimeCoordinator {
         capability: &str,
         mode: WaitMode,
     ) -> Result<WaitOutcome, RuntimeCoordinatorError> {
-        if self
-            .authorize_application_root(session, caller, capability)
-            .is_err()
+        if !self.authorize_issued_session_turn(session, caller, capability)?
+            && self
+                .authorize_application_root(session, caller, capability)
+                .is_err()
         {
             let supervisor = self.supervisor(session)?;
             supervisor

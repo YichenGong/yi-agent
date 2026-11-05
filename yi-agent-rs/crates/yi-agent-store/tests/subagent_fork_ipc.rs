@@ -220,6 +220,7 @@ fn upload_history(
             caller_task_id: caller.into(),
             capability: capability.into(),
             total_bytes: payload.len() as u64,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -379,6 +380,7 @@ fn a_spawn_with_an_incomplete_upload_is_refused() {
             caller_task_id: root.clone(),
             capability: capability.clone(),
             total_bytes: payload.len() as u64 + 4,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -611,6 +613,7 @@ fn a_child_presenting_a_foreign_capability_is_denied() {
             caller_task_id: child,
             capability: root_capability,
             total_bytes: 4,
+            session_turn: None,
         },
     )
     .unwrap();

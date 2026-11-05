@@ -72,6 +72,11 @@ pub(crate) fn may_replace_driver(joined: bool, tools_stopped: bool) -> bool {
 #[derive(Clone, Debug)]
 struct OpenTurn {
     turn: SessionTurn,
+    /// Whether new writes may use this turn. A closed turn is kept, not dropped:
+    /// the run that held it may still need to read the results of the children it
+    /// started, and dropping the secret would turn "the turn ended" into "the
+    /// tools' own history became unreadable".
+    open: bool,
 }
 
 /// Live bindings and turns for session containers.
@@ -405,7 +410,10 @@ impl RuntimeCoordinator {
         };
         state.turns.insert(
             binding.fence.root.root_id.clone(),
-            OpenTurn { turn: turn.clone() },
+            OpenTurn {
+                turn: turn.clone(),
+                open: true,
+            },
         );
         Ok(turn)
     }
@@ -417,11 +425,14 @@ impl RuntimeCoordinator {
             .session_delegation_state()
             .lock()
             .expect("session delegation mutex poisoned");
-        let Some(open) = state.turns.get(&turn.fence.root.root_id) else {
+        let Some(open) = state.turns.get_mut(&turn.fence.root.root_id) else {
             return Ok(());
         };
         if open.turn.fence == turn.fence && open.turn.turn_id == turn.turn_id {
-            state.turns.remove(&turn.fence.root.root_id);
+            // Kept, not removed: a closed turn is still a secret this daemon
+            // minted, and reads of the children it started must keep working.
+            // Only writes stop, which `authorize_session_write` decides.
+            open.open = false;
         }
         Ok(())
     }
@@ -556,12 +567,46 @@ impl RuntimeCoordinator {
                 reason: "no turn is open for this session".to_string(),
             });
         };
-        validate_turn(&open.turn, turn, true).map_err(|code| {
+        validate_turn(&open.turn, turn, open.open).map_err(|code| {
             RuntimeCoordinatorError::session_delegation(
                 code,
                 "the presented turn is not the open one".to_string(),
             )
         })
+    }
+
+    /// Whether `capability` is a turn secret this daemon issued for this container.
+    ///
+    /// Read-only use only. A turn secret is what a tool holds, and a run that has
+    /// ended must still be able to read the results of the children it started --
+    /// that is exactly what makes a conversation resumable instead of amnesiac.
+    /// So the check does *not* require the turn to still be open; it requires the
+    /// secret to be one this daemon minted, whose fence still names the live
+    /// binding and this generation. A replacement driver mints a new binding
+    /// epoch, which invalidates every older turn secret by construction.
+    pub(crate) fn is_issued_session_turn(
+        &self,
+        root_task_id: &TaskId,
+        capability: &str,
+    ) -> Result<bool, RuntimeCoordinatorError> {
+        let state = self
+            .session_delegation_state()
+            .lock()
+            .expect("session delegation mutex poisoned");
+        let Some(live) = state.bindings.get(&root_task_id.to_string()) else {
+            return Ok(false);
+        };
+        if live.fence.generation != self.generation {
+            return Ok(false);
+        }
+        let issued = match state.turns.get(&root_task_id.to_string()) {
+            Some(open) => &open.turn,
+            None => return Ok(false),
+        };
+        if issued.fence != live.fence {
+            return Ok(false);
+        }
+        Ok(constant_time_eq(issued.capability.expose(), capability))
     }
 
     /// Verifies the stop proofs a prepare presents for the old driver's

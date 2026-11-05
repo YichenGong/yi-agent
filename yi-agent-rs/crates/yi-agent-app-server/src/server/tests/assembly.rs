@@ -104,6 +104,7 @@ fn a_git_project_gets_the_delegation_tools() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("the runtime socket must answer");
@@ -509,6 +510,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("the runtime socket answers");
@@ -536,6 +538,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("the runtime socket answers even when it refuses");

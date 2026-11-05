@@ -218,7 +218,129 @@ fn session_delegation_lifecycle_a_container_spawns_through_a_prepared_turn() {
     ));
 }
 
-/// A replacement driver is admitted only after the previous execution is proven
+/// A tool call that started under turn A must not be able to act under turn B.
+///
+/// Two turns of one conversation are sequential, not concurrent, so the daemon
+/// replaces A with B. A tool holding A's client has A's secret and nothing else:
+/// it cannot see B, and its spawn is refused rather than being upgraded into a
+/// write under the newer turn.
+#[tokio::test]
+async fn session_delegation_lifecycle_delayed_old_tool_cannot_borrow_new_turn() {
+    use serde_json::json;
+    use yi_agent_core::ToolRegistry;
+    use yi_agent_subagent::{CallerContext, register_session_turn_tools};
+
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = daemon_in(&directory);
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let secret = SecretCapability::new("resume-old-tool");
+    let root = conversation_root(&daemon, &workspace, "thread-old-tool");
+    let attachment = attach_container(&root, &secret, "op-attach", true);
+    let mut host = SessionHost::new(
+        Arc::clone(&root),
+        SessionIdentity::Embedded(secret),
+        None,
+        attachment,
+    );
+    host.prepare("op-prepare").unwrap();
+
+    // Turn A: the tool set a slow model call would be holding while it thinks.
+    let turn_a = Arc::new(host.begin_turn("turn-a").unwrap());
+    host.register_execution("turn-a").unwrap();
+    let mut tools_a = ToolRegistry::new();
+    register_session_turn_tools(
+        &mut tools_a,
+        Arc::clone(&turn_a),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        None,
+        CallerContext::unbound(),
+    );
+
+    // A starts one child, then ends.
+    let spawn_a = tools_a.get("spawn_agent").expect("A has spawn_agent");
+    let spawned = spawn_a
+        .call(json!({ "task": "work for turn A", "fork": false }))
+        .await;
+    assert!(
+        !spawned.is_error,
+        "turn A must spawn its child, got {spawned:?}"
+    );
+    let child = match &spawned.content[0] {
+        yi_agent_core::ContentBlock::Text(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|value| value["task_id"].as_str().map(str::to_owned))
+            .expect("the spawn names the child"),
+        other => panic!("a spawn answers with JSON text, got {other:?}"),
+    };
+    host.finish_turn(&turn_a).unwrap();
+
+    // Reading is not gated on "still open": a run that ended must be able to read
+    // what its children produced, so this must still work while no newer turn
+    // exists.
+    let old_inspect = tools_a.get("inspect_agent").expect("A has inspect_agent");
+    let read = old_inspect
+        .call(json!({ "task_id": child, "include_diff": false }))
+        .await;
+    assert!(
+        !read.is_error,
+        "a closed turn must still be able to read its child, got {read:?}"
+    );
+
+    // B opens -- and B gets a tool set of its own.
+    let turn_b = host.begin_turn("turn-b").unwrap();
+    let mut tools_b = ToolRegistry::new();
+    register_session_turn_tools(
+        &mut tools_b,
+        Arc::new(turn_b),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        None,
+        CallerContext::unbound(),
+    );
+
+    // The delayed call now lands, through A's tool. It must be refused and must
+    // not carry B's secret: nothing in A's tool can name B.
+    let old_spawn = tools_a.get("spawn_agent").expect("A has spawn_agent");
+    let refusal = old_spawn
+        .call(json!({ "task": "too late", "fork": false }))
+        .await;
+    assert!(
+        refusal.is_error,
+        "a tool from a finished turn must not spawn, got {refusal:?}"
+    );
+    // Either layer may speak first -- the local gate knows the turn closed, the
+    // daemon knows a newer turn replaced it -- and both are the same fact. What
+    // matters is that A's tool cannot write, and that nothing in it could name B.
+    let message = format!("{:?}", refusal.content);
+    assert!(
+        message.contains("turn-a") || message.contains("closed") || message.contains("StaleTurn"),
+        "the refusal must be about A's ended turn, got {message}"
+    );
+
+    // A newer turn supersedes the older read token, which is allowed: the plan
+    // promises reads survive *the turn ending*, not that they survive the next
+    // turn. B's tools take over the querying, and B works.
+    // B, opened after A, still works -- the refusal was A's, not the session's.
+    let fresh_spawn = tools_b.get("spawn_agent").expect("B has spawn_agent");
+    let accepted = fresh_spawn
+        .call(json!({ "task": "on time", "fork": false }))
+        .await;
+    assert!(
+        !accepted.is_error,
+        "the current turn must still be able to spawn, got {accepted:?}"
+    );
+}
+
+/// A replacement driver is admitted only after the previous execution is proven/// A replacement driver is admitted only after the previous execution is proven
 /// stopped, and the proof has to name *that* execution and fence.
 ///
 /// This is the other half of "a settled conversation may always delegate": it may,

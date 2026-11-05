@@ -577,6 +577,24 @@ impl SessionTurnClient {
         Ok(())
     }
 
+    /// Sends one read-only request, even after this turn was closed.
+    ///
+    /// Reads are deliberately not gated on "still open": a run that ended must
+    /// still be able to read the results of the children it started, otherwise a
+    /// finished turn would make its own work unreadable. The daemon re-checks the
+    /// secret against the live binding, so a replaced driver's turn still fails.
+    pub fn send_read(
+        &self,
+        build: impl Fn(&RuntimeHandle, &SessionTurn) -> IpcRequest,
+    ) -> Result<IpcResponse, SessionClientError> {
+        let handle = self.handle();
+        let request = build(&handle, &self.turn);
+        match send_request(&handle.socket_path, request) {
+            Ok(response) => Ok(response),
+            Err(error) => Err(SessionClientError::Transport(error.to_string())),
+        }
+    }
+
     /// Sends one business request as this turn.
     pub fn send(
         &self,

@@ -6142,6 +6142,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap();

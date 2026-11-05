@@ -178,6 +178,10 @@ pub enum IpcRequest {
         caller_task_id: String,
         capability: String,
         total_bytes: u64,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     /// Appends one base64 chunk to an open upload. `seq` is strict, so a gap,
     /// a replay, or a chunk past the declared length is rejected rather than
@@ -301,6 +305,10 @@ pub enum IpcRequest {
         task_id: String,
         #[serde(default)]
         recursive: bool,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]

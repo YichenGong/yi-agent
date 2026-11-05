@@ -1753,9 +1753,15 @@ pub(crate) fn respond(
             caller_task_id,
             capability,
             total_bytes,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&caller_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             // Authorization reaches the supervisor (root capability, or the
             // caller's own worker capability when a subagent forks itself), so
             // it must run on a runtime the same way the spawn arms do.
@@ -2110,10 +2116,16 @@ pub(crate) fn respond(
             capability,
             task_id,
             recursive,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
             let task_id = parse_id::<TaskId>(&task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&caller_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
