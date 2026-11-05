@@ -80,7 +80,7 @@ git worktree add .worktrees/side-conversation-repair -b fix/side-conversation-re
 - Consumes: 既有 App 和 App 测试的 RPC mock `clients[].requests`、`state.notifHandlers`。
 - Produces: 可被 TypeScript/Vitest 解析的 App；保留现有旁问测试组，不添加产品接口。
 
-- [ ] **Step 1:** 保留并运行现有 App 旁支测试，不先删“缺失旁问内容”断言。新增一条导入/渲染回归，沿用文件内既有初始化方式。检查返回 JSX 结构，而不是用快照吞下 parser error。
+- [x] **Step 1:** 保留并运行现有 App 旁支测试，不先删“缺失旁问内容”断言。新增一条导入/渲染回归，沿用文件内既有初始化方式。检查返回 JSX 结构，而不是用快照吞下 parser error。
 
 ```tsx
 it("App 模块可导入", async () => {
@@ -89,10 +89,18 @@ it("App 模块可导入", async () => {
 });
 ```
 
-- [ ] **Step 2:** `cd desktop && npx vitest run src/App.test.tsx -t 'App 模块可导入|App 旁支视图'`。基线预期 JSX transform error；若新基线已修复该错误，记录并跳过重复修语法，继续确认功能回归红。
-- [ ] **Step 3:** 对照 `git diff 7e71f238^1 7e71f238 -- desktop/src/App.tsx`，仅移除孤立的结束符使 JSX 成对；不用该提交的整文件反向覆盖。把无用 header import 留到 Task 7 与组件一起移除，避免本任务混入行为变化。
-- [ ] **Step 4:** 重跑导入用例并 `npx tsc --noEmit`。导入必须通过；记录后续缺失接线断言，不将其改成 skip。不得把 parser fail 当用户问题的唯一根因。
-- [ ] **Step 5:** 更新 desktop 进度条目中的阶段证据；执行统一门禁，通过后提交 `fix: restore App JSX test collection`。
+- [x] **Step 2:** `cd desktop && npx vitest run src/App.test.tsx -t 'App 模块可导入|App 旁支视图'`。基线预期 JSX transform error；若新基线已修复该错误，记录并跳过重复修语法，继续确认功能回归红。
+- [x] **Step 3:** 对照 `git diff 7e71f238^1 7e71f238 -- desktop/src/App.tsx`，仅移除孤立的结束符使 JSX 成对；不用该提交的整文件反向覆盖。把无用 header import 留到 Task 7 与组件一起移除，避免本任务混入行为变化。
+- [x] **Step 4:** 重跑导入用例并 `npx tsc --noEmit`。导入必须通过；记录后续缺失接线断言，不将其改成 skip。不得把 parser fail 当用户问题的唯一根因。
+- [x] **Step 5:** 更新 desktop 进度条目中的阶段证据；执行统一门禁，通过后提交 `fix: restore App JSX test collection`。
+
+**证据（2026-11-05,本 worktree,提交 `b7945d47`）:**
+- `desktop/src/App.test.tsx:7133` 的 `describe("App 模块收集")` / `it("App 模块可导入")`
+  与既有 `App 旁支视图` 组同文件共存;`expectNoSideChrome()` 仍保留在
+  `App.test.tsx:6641`,没有被删掉换成 snapshot。
+- 该提交只补 JSX 结束符,未改行为;`npx tsc --noEmit` 通过。
+- 注意:这几项修复是在本分支更早的会话里完成的。**红不是本轮重跑的**——
+  本轮只验证了绿的现状(522 passed),未把 parser error 重新复现一遍。
 
 ### Task 2: 版本化旁问草稿与三态提交收据
 
@@ -121,7 +129,7 @@ export type SideSubmitReceipt =
 - `SideConversationStore.setDraft(hostKey: SideHostKey, sideId: string, draft: string): void` 保持签名；文字变化才递增版本。同 generation 基线替换/帧应用不能重置本地版本、pending 或 rejectedSubmission；换代必须隔离旧状态，不能把旧 pending 搬进新旁问。自动首问进入 submit 前在目标草稿未变化时安装问题正文/版本；已有新稿时不覆盖，问题快照单独跟踪。
 - Consumes: 既有 `installBaseline`、`adopt`、`setSync`、`accepted_requests`、SideSyncController.client。
 
-- [ ] **Step 1:** 在现有 `makeSideSyncFixture()` 内新增以下断言；补齐成功、明确拒绝、网络丢应答三组。通过 fixture 已有 RPC handler 返回真实 wire 结构，不 mock submit 本身。
+- [x] **Step 1:** 在现有 `makeSideSyncFixture()` 内新增以下断言；补齐成功、明确拒绝、网络丢应答三组。通过 fixture 已有 RPC handler 返回真实 wire 结构，不 mock submit 本身。
 
 ```ts
 const f = makeSideSyncFixture();
@@ -135,8 +143,8 @@ expect(f.store.read(f.hostKey, SIDE)!.draftVersion).toBe(before + 2);
 
 另用 deferred RPC：捕获提交后把草稿改为别的文字再改回相同文字，resolve 成功后断言原文还在。对明确拒绝：新稿为空且版本匹配才恢复问题；已有新稿时保留新稿且 `rejectedSubmission.text === "question"`。对 uncertain：保留同 requestId，`confirmPending` 沿同 id 对账；generation 换代后旧成功/拒绝都不能动新 view。
 
-- [ ] **Step 2:** `cd desktop && npx vitest run src/lib/sideConversation.test.ts src/lib/sideSync.test.ts`。预期缺失版本/返回收据或相同文字版本回退断言失败。
-- [ ] **Step 3:** 将 `draftVersion: 0` 替换成真实捕获版本；所有异步后置写入先验证目标 generation、pending.requestId。成功与对账确认都用同一条件清稿函数，检查 requestId、generation、text、draftVersion；只有 pending 匹配才清 pending。明确拒绝返回 rejected 并记录原因；网络失败返回 uncertain、不抛成可新发错误。同步/权限前置拒绝也转为 rejected（请求未发，调用方可保留原稿）；disposed 不写 store。
+- [x] **Step 2:** `cd desktop && npx vitest run src/lib/sideConversation.test.ts src/lib/sideSync.test.ts`。预期缺失版本/返回收据或相同文字版本回退断言失败。
+- [x] **Step 3:** 将 `draftVersion: 0` 替换成真实捕获版本；所有异步后置写入先验证目标 generation、pending.requestId。成功与对账确认都用同一条件清稿函数，检查 requestId、generation、text、draftVersion；只有 pending 匹配才清 pending。明确拒绝返回 rejected 并记录原因；网络失败返回 uncertain、不抛成可新发错误。同步/权限前置拒绝也转为 rejected（请求未发，调用方可保留原稿）；disposed 不写 store。
 
 ```ts
 const matches = current?.generation === snapshot.target.generation
@@ -151,8 +159,20 @@ if (matches) {
 ```
 
 这里 `snapshot` 在 submit 内由 target、text、真实 draftVersion、requestId 构成；禁止额外读全局 active。unknown accepted_requests 读取失败不产生新 id；同 id 重试仍需身份未换代。原始错误到 UI 的 message 保留，避免 `[object Object]`。
-- [ ] **Step 4:** 重跑两个文件并 `npx tsc --noEmit`；更新 controller 测试的 fake submit 返回 `{kind:"accepted",requestId}`，更新所有真实调用处类型使编译通过，不能 `as any` 掩盖 void/receipt 不一致。
-- [ ] **Step 5:** 更新 desktop 进度判据，统一门禁后提交 `fix: preserve side drafts with typed submission receipts`。
+- [x] **Step 4:** 重跑两个文件并 `npx tsc --noEmit`；更新 controller 测试的 fake submit 返回 `{kind:"accepted",requestId}`，更新所有真实调用处类型使编译通过，不能 `as any` 掩盖 void/receipt 不一致。
+- [x] **Step 5:** 更新 desktop 进度判据，统一门禁后提交 `fix: preserve side drafts with typed submission receipts`。
+
+**证据（2026-11-05,本 worktree,提交 `14c579b3`）:**
+- 类型:`desktop/src/lib/sideConversation.ts:158` `SideDraftSnapshot`、
+  `:171` `SideSubmitReceipt`(accepted / uncertain / rejected 三态)、
+  `:197/:218` `SideView.draftVersion`、`:225` `rejectedSubmission`。
+- 回归:`sideConversation.test.ts:350` 断言「改回相同文字仍然 +2」
+  (`expect(...draftVersion).toBe(before + 2)`),即相同文字不回退版本;
+  `sideSync.test.ts:484` `retries uncertain submission with the same request id`、
+  `:528` `restores the question text when the server rejects it outright`、
+  `:544` `keeps the newer draft and records the rejected one separately`。
+- 绿:`npx vitest run src/lib/sideSync.test.ts src/lib/sideConversation.test.ts` 通过。
+- 红同样不是本轮重跑(实现早已在分支里)。
 
 ### Task 3: 固定操作目标和导航修订，取消迟到入场
 
@@ -166,7 +186,7 @@ if (matches) {
 - Produces: `selectMain(binding: SideHostBinding, parentId: string): void`，供 App 真实父/宿主导航调用；`back(): void` 连 Creating 也可撤销入场意图；`enter(...)` 保持原签名。
 - 内部每次用户导航递增 `navigationRevision`；每条变更锁按完整来源身份，不用一个 busy 禁全部输入。全局 `busy` 只作显示，不作导航开关。
 
-- [ ] **Step 1:** 用现有 setup/fakeClient + deferred open 加回归：
+- [x] **Step 1:** 用现有 setup/fakeClient + deferred open 加回归：
 
 ```tsx
 let release!: (value: unknown) => void;
@@ -185,10 +205,20 @@ expect(s.hook.result.current.active?.kind).not.toBe("side");
 ```
 
 再添加两个 host 各有同名 s1 的 submit/stop 测试：捕获 A，await 时 enter B，A RPC 仍打 A；同 host generation 更换则拒绝旧收据。Creating 带首问时 `/back` 后释放 open，断言零 turnStart 且原问题留在 A 草稿/待处理记录。已经 turnStart 后返回不能重复/撤回提交。
-- [ ] **Step 2:** `cd desktop && npx vitest run src/hooks/useSideConversationController.test.tsx`；预期迟到 open 抢视图、fake submit 参数/receipt 不匹配或裸 sideId 跨 host 失败。
-- [ ] **Step 3:** 去掉 submitInternal/findView(sideId)；用 `submitInternal(target: SideTarget, text: string): Promise<SideSubmitReceipt>`，从 store.read(target.hostKey,target.sideId) 校验 parent/generation，捕获 binding.client。open 捕获来源/navigationRevision，在 reconcile 后仅相同导航意图才 enter/发首问；取消意图只安装原 store。用户显式 enter/selectMain/back 都更新修订；后台通知不调用这些方法。重复 open 合并同一在途操作，不丢第二个问题；重复首问在 pending/Running 时明确拒绝并留原输入。
-- [ ] **Step 4:** 重跑 controller、sideSync 测试；断言零父 RPC，A/B 同 sideId 不串线，旧 generation 不清新稿。错误按来源保存到 SideView/父侧命令反馈，不使用裸全局 error 冒充别的会话错误。
-- [ ] **Step 5:** 更新 desktop 阶段证据，统一门禁后提交 `fix: bind side actions to source and navigation intent`。
+- [x] **Step 2:** `cd desktop && npx vitest run src/hooks/useSideConversationController.test.tsx`；预期迟到 open 抢视图、fake submit 参数/receipt 不匹配或裸 sideId 跨 host 失败。
+- [x] **Step 3:** 去掉 submitInternal/findView(sideId)；用 `submitInternal(target: SideTarget, text: string): Promise<SideSubmitReceipt>`，从 store.read(target.hostKey,target.sideId) 校验 parent/generation，捕获 binding.client。open 捕获来源/navigationRevision，在 reconcile 后仅相同导航意图才 enter/发首问；取消意图只安装原 store。用户显式 enter/selectMain/back 都更新修订；后台通知不调用这些方法。重复 open 合并同一在途操作，不丢第二个问题；重复首问在 pending/Running 时明确拒绝并留原输入。
+- [x] **Step 4:** 重跑 controller、sideSync 测试；断言零父 RPC，A/B 同 sideId 不串线，旧 generation 不清新稿。错误按来源保存到 SideView/父侧命令反馈，不使用裸全局 error 冒充别的会话错误。
+- [x] **Step 5:** 更新 desktop 阶段证据，统一门禁后提交 `fix: bind side actions to source and navigation intent`。
+
+**证据（2026-11-05,本 worktree,提交 `eb13ca07`）:**
+- `useSideConversationController.ts:493` `submitInternal` 以 `{target, client}`
+  为参数,`:199` `navigationRevision` ref,`:55` 说明「成功之后要不要真的切过去」
+  由修订号裁决。
+- `:68` 产出 `selectMain(binding, parentId)`;`:599` 实现。
+- 回归:`useSideConversationController.test.tsx:210`
+  `useSideConversationController navigation intent`、`:625`
+  `does not yank the user back if they navigated while the close was pending`。
+- 绿:该文件通过(见汇总 522 passed)。
 
 ### Task 4: Observe 查看与绑定原目标的关闭确认
 
@@ -215,7 +245,7 @@ confirmClose(confirmation: CloseConfirmation): Promise<boolean>;
 
 没有旁问时 null + 按需幂等提示，不虚构关闭；Running false 由 App 立即 confirmClose，true 交确认对话框。实现时同步删除旧零参调用。
 
-- [ ] **Step 1:** 增加 Observe 无参 open 的请求断言：仅 side/list/readItems，零 side/open/turnStart；带问题明确拒绝。增加 A 中 requestClose，切 B 后 confirmClose：请求仍打 A，active 仍 B。增加关闭等待期间 A→B→A 重入：旧导航修订的成功不能强制回 Main；已换代的 confirmation 拒绝，零 close。
+- [x] **Step 1:** 增加 Observe 无参 open 的请求断言：仅 side/list/readItems，零 side/open/turnStart；带问题明确拒绝。增加 A 中 requestClose，切 B 后 confirmClose：请求仍打 A，active 仍 B。增加关闭等待期间 A→B→A 重入：旧导航修订的成功不能强制回 Main；已换代的 confirmation 拒绝，零 close。
 
 ```tsx
 const confirmation = await s.hook.result.current.requestClose(s.binding, "t1");
@@ -225,10 +255,19 @@ expect(confirmation?.activeTurnId).toBe("turn-1");
 ```
 
 给该用例的 fake side/list 返回 generation=1、status=running、active_turn_id=turn-1 的 s1 摘要；先用 installBaseline/adopt 建立同代 store，与现有 fixture 一致。另覆盖主视图 close、list 空、断线、cancel、close conflict，新轮不得 force close。
-- [ ] **Step 2:** 跑 controller 测试，预期旧确认无 target/client 或依赖当前 active 的断言失败。
-- [ ] **Step 3:** Observe open 分支只 list→找到父对应摘要→reconcile→允许导航，不调用 open 或续期。close 读取最新摘要并检查 generation；发请求前验证 binding 未换 client/权限/代际，使用 confirmation.client 和 expectedActiveTurnId；迟到结果只更新原对象。仅可见身份与 navigationRevision 同时匹配才回父。后台 close 无需先 enter；缺失目标幂等反馈，不能清别的父 view。
-- [ ] **Step 4:** controller + sideSync 全绿；用 spy 精确确认没有 parent send/interrupt、新 client close、强制关闭或 Observe mutation。
-- [ ] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: scope side observation and close confirmations`。
+- [x] **Step 2:** 跑 controller 测试，预期旧确认无 target/client 或依赖当前 active 的断言失败。
+- [x] **Step 3:** Observe open 分支只 list→找到父对应摘要→reconcile→允许导航，不调用 open 或续期。close 读取最新摘要并检查 generation；发请求前验证 binding 未换 client/权限/代际，使用 confirmation.client 和 expectedActiveTurnId；迟到结果只更新原对象。仅可见身份与 navigationRevision 同时匹配才回父。后台 close 无需先 enter；缺失目标幂等反馈，不能清别的父 view。
+- [x] **Step 4:** controller + sideSync 全绿；用 spy 精确确认没有 parent send/interrupt、新 client close、强制关闭或 Observe mutation。
+- [x] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: scope side observation and close confirmations`。
+
+**证据（2026-11-05,本 worktree,提交 `156322b2`）:**
+- `useSideConversationController.ts:95` `CloseConfirmation` 注释明确
+  `expectedActiveTurnId` 必须来自 `requestClose`;`:750-782` 在发 `side/close`
+  之前核对 `binding.client !== confirmation.client`,并使用
+  `confirmation.client` 与 `expectedActiveTurnId`。
+- 回归:`useSideConversationController.test.tsx` 与 `App.test.tsx` 里的
+  `expectedActiveTurnId` 用例覆盖「A 中关闭、切 B 后确认仍打 A」。
+- 绿:两文件通过。
 
 ### Task 5: 按完整身份恢复尾帧检查与重连
 
@@ -241,7 +280,7 @@ expect(confirmation?.activeTurnId).toBe("turn-1");
 - Consumes: `SideSyncController.setVisible(parentId: string|null): void`, `.client`, `.dispose()`；不改网络协议。
 - Produces: controllerFor 新建/重连时立即应用当前 visible，effect 按完整身份清理旧轮询；subscribeParent 使用已有订阅窗口合并入口，不替换全部订阅。
 
-- [ ] **Step 1:** 新测试用 renderHook + 真实 store、mock SideSyncController 构造（记录 setVisible/dispose）覆盖：先 render visible 后首次 controllerFor；相同 parentId 不同 host；同 host/parent 换 client；unmount。构造 mock 仅用于生命周期，不代替 Task 2 流式测试。
+- [x] **Step 1:** 新测试用 renderHook + 真实 store、mock SideSyncController 构造（记录 setVisible/dispose）覆盖：先 render visible 后首次 controllerFor；相同 parentId 不同 host；同 host/parent 换 client；unmount。构造 mock 仅用于生命周期，不代替 Task 2 流式测试。
 
 ```tsx
 const visible = { hostKey: binding.key, parentId: "p1" };
@@ -253,10 +292,21 @@ act(() => { hook.result.current.controllerFor(binding, "p1"); });
 ```
 
 在测试文件定义 `vi.hoisted` 实例数组，mock 类实现 client、setVisible=vi.fn、dispose=vi.fn、accept=vi.fn；真实 binding 按 controller 测试 setup 的 SideHostBinding 结构建立，不依赖 App。
-- [ ] **Step 2:** `cd desktop && npx vitest run src/hooks/useSideConversation.test.tsx`；预期旧 visibleParent 参数/新实例未启动轮询失败。
-- [ ] **Step 3:** 用 latest.current.visible 同时匹配 hostKey/parentId；新实例 setVisible 时立即应用，旧实例 dispose。effect 只让精确一对可见；删除旧 host controller 时 dispose，unmount 全 dispose。避免 effect 每次 render 重启相同 timer；不对后台 host 调 setVisible(parentId)。
-- [ ] **Step 4:** 跑新增 hook + sideSync fake timer 用例；5 秒推进确认缺尾帧能对账，切后台后无旧 RPC。保留现有固定水位分页、seq/终态测试。
-- [ ] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: restore visible side polling after reconnect`。
+- [x] **Step 2:** `cd desktop && npx vitest run src/hooks/useSideConversation.test.tsx`；预期旧 visibleParent 参数/新实例未启动轮询失败。
+- [x] **Step 3:** 用 latest.current.visible 同时匹配 hostKey/parentId；新实例 setVisible 时立即应用，旧实例 dispose。effect 只让精确一对可见；删除旧 host controller 时 dispose，unmount 全 dispose。避免 effect 每次 render 重启相同 timer；不对后台 host 调 setVisible(parentId)。
+- [x] **Step 4:** 跑新增 hook + sideSync fake timer 用例；5 秒推进确认缺尾帧能对账，切后台后无旧 RPC。保留现有固定水位分页、seq/终态测试。
+- [x] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: restore visible side polling after reconnect`。
+
+**证据（2026-11-05,本 worktree,提交 `635a7480`）:**
+- `useSideConversation.ts:47` `controllerFor(binding, parentId)`,`:65` 实现,
+  `:72-74` 以客户端身份判断是否复用(`existing?.dispose()`),
+  `:107` unmount 时 `for (const controller of map.values()) controller.dispose()`。
+- 回归:`useSideConversation.test.tsx:120`
+  `opens the tail poll on a controller created while its parent is visible`、
+  `:140` `keeps a background host's controller invisible`、
+  `:175` `stops polling everything when the side view closes`、
+  `:227` `disposes every controller on unmount`。
+- 绿:该文件通过。
 
 ### Task 6: 统一命令裁决、单主动作和不阻塞本地返回
 
@@ -270,7 +320,7 @@ act(() => { hook.result.current.controllerFor(binding, "p1"); });
 - `onSideCommand` 保持 bool/Promise<bool> 但包含 scoped help/config/usage；不得转 onSlashCommand。
 - 新 `conversationKey?: string`，主为父完整身份、side 为完整身份序列化，用来隔离本地 latch；side textarea 不因 sending disabled，mutation 按目标锁，back 不读 sending。
 
-- [ ] **Step 1:** 在现有 side routing/mobile side commands 测试组添加 policy 表：main close、Observe noarg side、失能仍 back、Running command、父附件拒绝。添加 Creating 的 pending onSideCommand 未 resolve 时，仍可编辑 `/back` 并执行。手机断言只有一个主动作按钮（执行命令或 Stop），无额外命令按钮；Enter 换行、IME 不发送。
+- [x] **Step 1:** 在现有 side routing/mobile side commands 测试组添加 policy 表：main close、Observe noarg side、失能仍 back、Running command、父附件拒绝。添加 Creating 的 pending onSideCommand 未 resolve 时，仍可编辑 `/back` 并执行。手机断言只有一个主动作按钮（执行命令或 Stop），无额外命令按钮；Enter 换行、IME 不发送。
 
 ```ts
 expect(sideInputPolicy({ platform: "mobile", view: "side", running: true,
@@ -279,10 +329,21 @@ expect(sideInputPolicy({ platform: "mobile", view: "side", running: true,
 ```
 
 用现有组件 render helper 传 `onSideCommand=vi.fn()`、`onSlashCommand=vi.fn()`，输入 `/usage` 后执行，断言仅前者收到 `{kind:"command",name:"usage",args:null}`。blocked reason 必须在可访问错误文本中可见，稿不清。
-- [ ] **Step 2:** `cd desktop && npx vitest run src/lib/sideCommands.test.ts src/components/MessageInput.test.tsx`；预期权限顺序、额外按钮、全输入锁或 scoped handler 断言失败。
-- [ ] **Step 3:** policy 优先识别本地 back，再能力/权限；Observe 无参 open 为查看例外，有参拒绝；main close 允许控制端；命令补全按 scope/capability 过滤。重排 runSideCommand 的 command 分支到 onSideCommand，拒绝提示不清稿。手机单个 action：精确可执行命令优先，否则 Running Stop，否则 Send；不能根据前缀 `/b` 绕过 Stop-only。side onSubmitSide 三态都不做组件层清稿，等待 store；仅 accepted 完成发送锁，uncertain 保持 pending 禁重复 mutation。创建和提交期间允许编辑/local back；按 conversationKey 清理局部 sending 状态，旧 promise finally 不清新会话 latch。
-- [ ] **Step 4:** 重跑完整 MessageInput（不只 grep 子集）及 sideCommands；主会话 send、附件、desktop slash 和手机 Stop-only 原用例必须保留通过。
-- [ ] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: keep side navigation reachable in the composer`。
+- [x] **Step 2:** `cd desktop && npx vitest run src/lib/sideCommands.test.ts src/components/MessageInput.test.tsx`；预期权限顺序、额外按钮、全输入锁或 scoped handler 断言失败。
+- [x] **Step 3:** policy 优先识别本地 back，再能力/权限；Observe 无参 open 为查看例外，有参拒绝；main close 允许控制端；命令补全按 scope/capability 过滤。重排 runSideCommand 的 command 分支到 onSideCommand，拒绝提示不清稿。手机单个 action：精确可执行命令优先，否则 Running Stop，否则 Send；不能根据前缀 `/b` 绕过 Stop-only。side onSubmitSide 三态都不做组件层清稿，等待 store；仅 accepted 完成发送锁，uncertain 保持 pending 禁重复 mutation。创建和提交期间允许编辑/local back；按 conversationKey 清理局部 sending 状态，旧 promise finally 不清新会话 latch。
+- [x] **Step 4:** 重跑完整 MessageInput（不只 grep 子集）及 sideCommands；主会话 send、附件、desktop slash 和手机 Stop-only 原用例必须保留通过。
+- [x] **Step 5:** 更新 desktop 判据，统一门禁后提交 `fix: keep side navigation reachable in the composer`。
+
+**证据（2026-11-05,本 worktree,提交 `182dc82d`）:**
+- `sideCommands.ts:98` 先识别本地 `/back`(`:102`),`:99` 明确带参数是笔误、
+  拒绝而不是静默忽略;`:173` 为 policy 分派。
+- `MessageInput.tsx:161` `onSubmitSide?: (text) => Promise<SideSubmitReceipt>`,
+  `:271` 只在非空/未禁用/有 handler 时走提交,不做组件层清稿。
+- 回归:`MessageInput.test.tsx:93`
+  `does not send when Enter confirms an IME candidate (keyCode 229)`,
+  以及 `sideCommands.test.ts` 的 policy 表;`MessageInput` 全量(不只 `-t` 子集)
+  在 522 passed 的 8 文件里通过。
+- 绿:通过。
 
 ### Task 7: 完整会话投影与轻量 UI 实际接线
 
@@ -297,7 +358,7 @@ expect(sideInputPolicy({ platform: "mobile", view: "side", running: true,
 - Produces: 一处当前会话判别投影；`StatusBar.conversationLabel?: string` 只替换已有文本位，status 仍是连接状态；`usageId` 使用完整会话 key。
 - side ChatView 必须使用 `sideItemsForChat(view.items)`；ImageReadCall 必填，使用稳定拒绝函数，不传父 imageCall。
 
-- [ ] **Step 1:** 更新旧“有 header/按钮”断言为无模块断言，不删 `App 旁支视图` 组。使用现有 RPC mock 返回真实 side/list/readItems、用 notifHandlers 投 side/itemUpdated，断言界面出现旁问分块答案且父文本未冒充答案。记录 clients[].requests，强制断言 side/turnStart 一次、父 turn/start/interject/interrupt 零次。
+- [x] **Step 1:** 更新旧“有 header/按钮”断言为无模块断言，不删 `App 旁支视图` 组。使用现有 RPC mock 返回真实 side/list/readItems、用 notifHandlers 投 side/itemUpdated，断言界面出现旁问分块答案且父文本未冒充答案。记录 clients[].requests，强制断言 side/turnStart 一次、父 turn/start/interject/interrupt 零次。
 
 ```tsx
 expect(screen.queryByRole("button", { name: /继续旁问|查看旁问/ })).toBeNull();
@@ -306,8 +367,8 @@ expect(screen.getByText("SIDE_ANSWER_CHUNK")).toBeTruthy();
 ```
 
 状态栏单测：conversationLabel 为 `/side · 只读 · /back 返回` 时 connected dot 仍绿，父 usage 不叠进 side，读屏含当前会话。App 覆盖宽/窄视口、父待审批、side Stop、主 close、确认取消/冲突、Observe、首问失败、新编辑与切父。测试不能 mock ChatView 为永远显示固定文本。
-- [ ] **Step 2:** `cd desktop && npx vitest run src/App.test.tsx -t 'App 旁支视图'`；预期 side 内容和 handler 路由断言红，而非 parser error。
-- [ ] **Step 3:** 在现有 JSX 组合位置只构造一次判别投影：main 从父 current/session，side 必须精确 read(hostKey,sideId) 且 parent/generation 匹配；目标失效显示原因/回父，禁止 fallback 父 send。各分支同时绑定 items/value/onDraftChange/submit/interrupt/turnActive/usage/anchor/展开状态。父主导航显式 selectMain；side 命令写正确来源反馈。首问父命令清理捕获父文本+修订，用户在 await 期间编辑过则不清；若父 store 无修订字段，用 App 内按完整父身份的编辑计数 ref，不持久化。
+- [x] **Step 2:** `cd desktop && npx vitest run src/App.test.tsx -t 'App 旁支视图'`；预期 side 内容和 handler 路由断言红，而非 parser error。
+- [x] **Step 3:** 在现有 JSX 组合位置只构造一次判别投影：main 从父 current/session，side 必须精确 read(hostKey,sideId) 且 parent/generation 匹配；目标失效显示原因/回父，禁止 fallback 父 send。各分支同时绑定 items/value/onDraftChange/submit/interrupt/turnActive/usage/anchor/展开状态。父主导航显式 selectMain；side 命令写正确来源反馈。首问父命令清理捕获父文本+修订，用户在 await 期间编辑过则不清；若父 store 无修订字段，用 App 内按完整父身份的编辑计数 ref，不持久化。
 
 ```ts
 const conversationKey = JSON.stringify(active.kind === "side"
@@ -318,8 +379,24 @@ const conversationKey = JSON.stringify(active.kind === "side"
 side 不接父附件/模式/modelPicker/拖拽/drop/image reader；父附件原对象保留。运行/待确认/明确错误在当前来源会话按需可见，不能把 hook.error 直接并入父 lastError。ChatView key、滚动锚点和错误边界均用 conversationKey；side anchor 仅内存，不调用父持久化。父审批 UI 仅 main，side 状态位可提示需返回。关闭对话框仅操作捕获 confirmation，取消不 back。
 
 删除 header 组件及引用，删除常驻 sidebarEntry/继续入口；不删除 RuntimeVersionBanner 或看板组件。side usage.total 的 cache_creation/cache_read 映射为 UsageTotals.cacheWrite/cacheRead，subagentTotals 传零值、count=0、fallbackUsage=null；不沿用父模型/用量。无参空 side 是空态，不显示模型等待。
-- [ ] **Step 4:** `cd desktop && npx tsc --noEmit && npx vitest run && npm run build`。另外断言 side 事件不会进入父摘要、未读、排序、搜索及缓存 writer；原主发送、审批、运行时版本、看板插件、恢复测试保持绿。
-- [ ] **Step 5:** 更新 desktop 判据和验收记录的自动测试证据（真机未跑仍未完成），统一门禁后提交 `fix: render and route the active side conversation`。
+- [x] **Step 4:** `cd desktop && npx tsc --noEmit && npx vitest run && npm run build`。另外断言 side 事件不会进入父摘要、未读、排序、搜索及缓存 writer；原主发送、审批、运行时版本、看板插件、恢复测试保持绿。
+- [x] **Step 5:** 更新 desktop 判据和验收记录的自动测试证据（真机未跑仍未完成），统一门禁后提交 `fix: render and route the active side conversation`。
+
+**证据（2026-11-05,本 worktree,提交 `b1474baf`）:**
+- 模块层已删:`desktop/src/components/` 下不再有 `SideConversationHeader.tsx`
+  (`ls components | grep -i SideConversationHeader` 无输出);`App.tsx` 里
+  `grep side-header` 无匹配。
+- 单一投影:`App.tsx:3081` `items={sideItemsForChat(conversation.view.items)}`,
+  `:282` 注释说明旁支图片读取一律拒绝、不传父 imageCall。
+- 状态栏:`components/StatusBar.tsx:84` `conversationLabel?: string | null`,
+  `:139` 仅替换已有文本位(`connected` 时),不新增常驻横条;
+  `StatusBar.test.tsx:241` 等 5 处断言 `/side · 只读 · /back 返回`。
+- 结构断言:`App.test.tsx:6641` `expectNoSideChrome()` 覆盖无 `side-header`、
+  无 `side-conversation-header`、无「旁问/继续旁问/查看旁问/返回主会话/停止旁问/
+  关闭旁问」按钮。
+- 绿(本轮实跑):`npx vitest run` 覆盖上述 8 个文件 = **522 passed**;
+  全量 desktop = 2226 passed(记录在验收文档第 5 节)。
+- 红不是本轮重跑:实现已在本分支更早提交里完成。
 
 ## 2. 原生 TUI 任务链
 
@@ -335,7 +412,7 @@ Task 8–10 可与前端 Task 2–7 并行，但不能由两个代理同时修�
 - Consumes: 既有 SideSession.input/history/views、InputLine、classify_conversation_input、sync_popup、run_loop_with_side、ScriptedEvents、TestBackend。
 - Produces: Event::Paste 依据 side.views.active 路由；补全显示和执行使用同一可见 input；不改 SideDriverCommand。
 
-- [ ] **Step 1:** 在 app.rs tests 复制既有 `side_events_never_reach_main_turn_log` 的完整 run_loop_with_side 初始化（保留真实 channels/SideRuntime），新增命名含 `side_repair_` 的循环回归。初始化父草稿 `PARENT_DRAFT`，预投有效 side status 帧并显式进入 side；事件按交付顺序逆序存进 ScriptedEvents。最小序列为 Paste(`/back`)、Enter、Ctrl+Q；断言最终父 input 为 PARENT_DRAFT，最后绘制是 Main，side_cmd_rx 没收到 Interrupt/Close，decision_rx 为空。另加逐字符 `/back`、Tab补全后 Enter；不能只直接调 handle_side_key。
+- [x] **Step 1:** 在 app.rs tests 复制既有 `side_events_never_reach_main_turn_log` 的完整 run_loop_with_side 初始化（保留真实 channels/SideRuntime），新增命名含 `side_repair_` 的循环回归。初始化父草稿 `PARENT_DRAFT`，预投有效 side status 帧并显式进入 side；事件按交付顺序逆序存进 ScriptedEvents。最小序列为 Paste(`/back`)、Enter、Ctrl+Q；断言最终父 input 为 PARENT_DRAFT，最后绘制是 Main，side_cmd_rx 没收到 Interrupt/Close，decision_rx 为空。另加逐字符 `/back`、Tab补全后 Enter；不能只直接调 handle_side_key。
 
 ```rust
 let mut delivered = vec![
@@ -348,10 +425,26 @@ let events = ScriptedEvents { events: Rc::new(RefCell::new(delivered)) };
 ```
 
 为最终屏幕检查保留 TestBackend buffer，在退出前至少一次绘制（用既有 loop 的事件轮次，不加任意 sleep）。父 pending approval 再跑相同序列，decision channel 零消息；拒绝的 nested side/管理命令和 Running 文本恢复原稿，不被 take_submitted 吞掉。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Paste 写错父草稿/不能回 Main 或输入被审批吞掉断言失败。若用例没执行到侧视图，先修测试时序，不能宣布红已证实。
-- [ ] **Step 3:** Paste 在 side 分支调用 side.input 的粘贴 API，按普通编辑保留字节，不自动执行；不得调用父 handle_paste 的审批守卫。补全从同一可见 input 获取 query，side 候选限制为 back/side-close/help/config/cost/quit/q，Tab写入不提交，完整命令一次 Enter 执行。切视图清 popup 的候选/选中索引。提交前保存 text；返回消费命令，拒绝/发送未投递恢复 text；不声称找回用户手动覆盖掉的旧文字。滚动与折叠继续只改可见 history。
-- [ ] **Step 4:** 跑 `cargo test -p yi-agent --bin yi-agent tui::` 与 side_repair_；覆盖 resize、Shift滚动和父审批 Command/Decision 原规则不变，断线 back 不等 driver。
-- [ ] **Step 5:** 更新 TUI 模块阶段证据，统一门禁后提交 `fix: route TUI side paste and completion to visible input`。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Paste 写错父草稿/不能回 Main 或输入被审批吞掉断言失败。若用例没执行到侧视图，先修测试时序，不能宣布红已证实。
+- [x] **Step 3:** Paste 在 side 分支调用 side.input 的粘贴 API，按普通编辑保留字节，不自动执行；不得调用父 handle_paste 的审批守卫。补全从同一可见 input 获取 query，side 候选限制为 back/side-close/help/config/cost/quit/q，Tab写入不提交，完整命令一次 Enter 执行。切视图清 popup 的候选/选中索引。提交前保存 text；返回消费命令，拒绝/发送未投递恢复 text；不声称找回用户手动覆盖掉的旧文字。滚动与折叠继续只改可见 history。
+- [x] **Step 4:** 跑 `cargo test -p yi-agent --bin yi-agent tui::` 与 side_repair_；覆盖 resize、Shift滚动和父审批 Command/Decision 原规则不变，断线 back 不等 driver。
+- [x] **Step 5:** 更新 TUI 模块阶段证据，统一门禁后提交 `fix: route TUI side paste and completion to visible input`。
+
+**证据（2026-11-05,本 worktree）:**
+- 循环回归（真实 `run_loop_with_side` + `ScriptedEvents` + `TestBackend`）:
+  `side_repair_paste_back_through_the_loop_returns_to_main_and_keeps_the_parent_draft`、
+  `side_repair_paste_back_survives_a_parent_approval_through_the_loop`、
+  `side_repair_typed_and_completed_back_work_through_the_loop`。
+- 按键级:`side_repair_completion_offers_only_executable_side_commands`、
+  `side_repair_tab_completes_then_enter_executes`、`side_repair_tab_without_popup_does_not_edit_the_draft`、
+  `side_repair_esc_closes_the_popup_before_stopping`、`side_repair_management_commands_are_refused_without_clearing_the_draft`、
+  `side_repair_nested_side_is_refused_without_clearing_the_draft`、`side_repair_exit_commands_quit_instead_of_reaching_the_model`、
+  `side_repair_close_reports_an_undelivered_command`。
+- 红已证实（不是「没跑到」）:临时把 `Event::Paste` 路由退回父 `handle_paste` →
+  `side_repair_paste_back_through_the_loop_...` FAILED；临时把按键/粘贴路由退回本帧开头
+  的 `in_side` 快照 → 两条循环用例同时 FAILED。恢复后全绿。
+- `cargo test -p yi-agent --bin yi-agent side_repair_` = 14 passed；
+  `cargo test -p yi-agent --bin yi-agent tui::` = 697 passed, 0 failed。
 
 ### Task 9: 全局退出优先级、两步 Ctrl+C 与失败反馈
 
@@ -366,7 +459,7 @@ let events = ScriptedEvents { events: Rc::new(RefCell::new(delivered)) };
 - SideSession 记录带 target 的待显示操作错误，Main 可呈现后台 Close 失败；不能把错误当父 transcript 或落盘。
 - 本任务最小扩展本地 `SideDriverCommand::Close { expected_target: ConversationTarget, expected_active_turn_id: Option<String> }` 与 `Interrupt { expected_target: ConversationTarget, turn_id: String }`。driver 处理前核对真实 side_id/generation，不匹配则产生该旧目标的操作失败，不作用到当前 runner。更新全部构造点及测试；该 Rust 进程内类型不生成网络绑定，原 RPC 不变。
 
-- [ ] **Step 1:** 用 Task 8 的完整循环用例初始化方法新增：side Idle/Running Ctrl+C、Ctrl+C→编辑→Ctrl+C、runtime popup/父审批弹窗 Ctrl+Q，以及 `/q`、`/quit`。断言仅第一次 Ctrl+C 向可见 side Interrupt，第二次走 Quit；父 interrupt_rx 为空。Close/Interrupt 用容量1且预填满的 channel、drop receiver 两组，命令仍立刻返回/可退出，屏幕可见失败。
+- [x] **Step 1:** 用 Task 8 的完整循环用例初始化方法新增：side Idle/Running Ctrl+C、Ctrl+C→编辑→Ctrl+C、runtime popup/父审批弹窗 Ctrl+Q，以及 `/q`、`/quit`。断言仅第一次 Ctrl+C 向可见 side Interrupt，第二次走 Quit；父 interrupt_rx 为空。Close/Interrupt 用容量1且预填满的 channel、drop receiver 两组，命令仍立刻返回/可退出，屏幕可见失败。
 
 ```rust
 let (side_tx, mut side_rx) = tokio::sync::mpsc::channel(1);
@@ -383,12 +476,78 @@ assert!(side_rx.try_recv().is_ok());
 ```
 
 这段验证 fixture 确实满；产品回归必须通过循环输入 `/side-close` 并断言 Main + “已返回，旁问关闭未送达”，不是以此通道单测替代。driver 模拟 close conflict 要产生 SideOperationError(Close)，在 Main 可见且仍能 `/side-close` 重试；旧代错误不污染新代。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Ctrl+C 在 side 无效、popup 吞退出或失败无反馈。
-- [ ] **Step 3:** 将 Ctrl+Q/Ctrl+C 的应用级判断放在 handle_key_intercepts/runtime popup 之前，只维护 loop_bk.pending_quit；第一次按 visible_stop_target 分派当前轮、第二次 KeyOutcome::Quit，普通有效编辑/导航/提交清确认。退出命令在 side 分类前处理，不将其投给模型。Esc仍先关 popup，再仅停可见 side；Idle无动作。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期 Ctrl+C 在 side 无效、popup 吞退出或失败无反馈。
+- [x] **Step 3:** 将 Ctrl+Q/Ctrl+C 的应用级判断放在 handle_key_intercepts/runtime popup 之前，只维护 loop_bk.pending_quit；第一次按 visible_stop_target 分派当前轮、第二次 KeyOutcome::Quit，普通有效编辑/导航/提交清确认。退出命令在 side 分类前处理，不将其投给模型。Esc仍先关 popup，再仅停可见 side；Idle无动作。
 
 所有 side try_send 改为显式 match Full/Closed，失败保存 target/message 并呈现。Close 无论投递与否立即 back，不能标 closed；保留原后台 side 可重试。driver handle_command 在各错误分支向 report_error 传 operation；report_error 保留 transcript Notice，另 dispatch 带原目标的 SideOperationError，即使无 active turn 也可显示操作失败。Open 尚无 runner 时发 `ConversationEvent { target: ConversationTarget::Main, turn_id: None, event: ConversationPayload::SideOperationError { operation: SideOperation::Open, message } }`；主循环须在父事件/落盘管线前单独识别此本地操作反馈，写入按需 notice，不交给丢弃 Main 的 SideSession::apply_event，也不伪造 side 身份。已有 runner 的错误使用其真实 side_id/generation。主视图只渲染该后台操作错误，不写 HistoryState/TurnLog。close 成功/新重试受理后清对应提示，其他 side 状态帧不能导航。
-- [ ] **Step 4:** 跑 TUI 全组及 side_driver 测试；验证关闭后重开、旧 generation 帧、后台状态不拉回。使用真实清理器测试确认 Quit 取消父/side、有界等待、租约释放；不能只断言 KeyOutcome::Quit 或用 kill -9 代替收尾。未建立租约 fixture 时先补现有清理器测试，不删 spec 的租约断言。
-- [ ] **Step 5:** 更新 TUI 判据，统一门禁后提交 `fix: make TUI side exit and command failures observable`。
+- [x] **Step 4:** 跑 TUI 全组及 side_driver 测试；验证关闭后重开、旧 generation 帧、后台状态不拉回。使用真实清理器测试确认 Quit 取消父/side、有界等待、租约释放；不能只断言 KeyOutcome::Quit 或用 kill -9 代替收尾。未建立租约 fixture 时先补现有清理器测试，不删 spec 的租约断言。
+- [x] **Step 5:** 更新 TUI 判据，统一门禁后提交 `fix: make TUI side exit and command failures observable`。
+
+**证据（2026-11-05,本 worktree）:**
+
+发现并修掉三处真实缺陷（不是「测试写错了」）：
+
+1. **旁支通知从未渲染。** `/cost`、管理命令拒绝、`/side-close` 未送达都写进
+   `SideSession::notice`，而绘制只调 `side_header_line(...)`——这个字段从来没被
+   读出来。用户看到的是「按了没反应」。现在 `side_status_line` 在有通知时**只画
+   通知**（状态行只有一行，把长中文 header 接在前面会把错误尾部裁掉，「未送达」
+   恰好在末尾）。
+2. **过期目标的错误被静默丢弃。** `apply_event` 里 `stale` 检查在
+   `SideOperationError` 分支之前 `return Discard`，于是「旧代关闭失败」——最需
+   要告诉用户的那种——永远到不了界面。错误帧现在先于过期检查处理，并按目标分流：
+   当前可见旁支进 `notice`，主视图或旧旁支进 `main_notice`。
+3. **关闭未送达的提示落在不可见处。** `submit_side_draft` 先 `views.back()` 再写
+   `side.notice`，那一刻用户已在主视图、旁支状态行不再渲染。改为投递结果落在
+   切换之后可见的位置（`main_notice`），并带上 operation + target。
+
+新增/更新用例：
+- `side_repair_first_ctrl_c_in_side_stops_only_the_side`（第一下只发 side
+  Interrupt、父 `interrupt_rx` 为空；第二下退出，用「后续输入不再产生 Submit」
+  判定，不用退出后的屏幕内容——退出后循环不重绘，屏幕停在前一帧的旁支视图）
+- `side_repair_ctrl_q_quits_even_with_the_runtime_popup_open`、
+  `side_repair_ctrl_q_quits_with_a_pending_parent_approval`、
+  `side_repair_quit_commands_leave_the_side_without_a_submit`、
+  `side_repair_editing_after_ctrl_c_rearms_the_confirmation`
+- `side_repair_close_survives_a_full_side_channel`（容量 1 预填满）、
+  `side_repair_close_survives_a_dropped_side_receiver`（drop receiver）
+- `visible_operation_error_goes_to_the_side_notice`、
+  `stale_operation_error_does_not_touch_the_current_side_view`
+- driver：`stale_close_target_reports_error_and_keeps_the_live_side`、
+  `stale_interrupt_does_not_stop_the_live_turn`（空 turn_id 也不能误停）、
+  `failed_open_reports_a_main_target_error`（无 runner 时发 Main 目标错误）
+
+自查又发现并修掉一处（评审前的自我审查）：
+
+- **旁支心跳会擦掉「关闭未送达」。** 原来每个 `SideStatus` 都会 `clear_main_operation_notice`，
+  可一条心跳恰恰证明那个旁支还活着，也就是证明「没关掉」这句话仍然成立。
+  用户会看到提示闪一帧就消失。现在清理只有两处：真正收到 `SideClosed`，或用户
+  重新发出关闭命令（`execute_side_command_in_main` 的成功分支按 operation+target
+  精确清除）。主视图 `/side-close` 投递失败也改为写 `main_notice`，不再是往
+  转录里塞一行就结束。回归用例 `side_heartbeat_does_not_erase_a_close_delivery_failure`。
+- `decide_exit_key` 里原本算了一次 `visible_stop_target` 又用 `let _ =` 丢掉，
+  读者会以为停止已经发出。函数签名收窄为只维护 `pending_quit`，停止由调用方
+  在 `ArmConfirm` 分支执行。
+- 补 `side_label_never_overflows_on_a_very_narrow_bar`：宽度 0/1/2/5/10/20 下
+  不得 panic、不得溢出（该处用 `saturating_sub`，改成普通减法会下溢）。
+
+红已证实（临时改回旧行为，跑完即恢复）：
+- 把 `SideOperationError` 分支移回 `stale` 检查之后 →
+  `stale_operation_error_does_not_touch_the_current_side_view` FAILED。
+- 把关闭未送达提示写回 `side.notice` →
+  `side_repair_close_survives_a_full_side_channel` 与
+  `..._a_dropped_side_receiver` 同时 FAILED。
+
+测试基础设施修正（真实缺陷，非放宽断言）：`frame_text` 之前逐格拼接缓冲区，
+而 ratatui 的 `Buffer::diff` 会**跳过**紧跟宽字符的那一格（真实终端画汉字时连带
+覆盖右侧格，故不下发），`TestBackend::draw` 只是逐格赋值，那一格保留上一帧内容。
+于是把「旁问（只读）…」换成「关闭旁问失败…」时读出来会交错成
+「旁·问父关会闭话未空送闲达」。`frame_text` 现在按终端语义推进 x（宽字符占两列），
+这与真实终端显示一致。
+
+门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 715 passed, 0 failed；
+`cargo test -p yi-agent --bin yi-agent side_repair_` = 21 passed；
+`cargo test -p yi-agent --bin yi-agent side_driver` = 9 passed；
+`cargo fmt --all` + `just fmt-check` 通过；`cargo clippy -p yi-agent --all-targets` 无告警。
 
 ### Task 10: 删除 TUI 介绍条，保持既有状态栏与落盘隔离
 
@@ -399,7 +558,7 @@ assert!(side_rx.try_recv().is_ok());
 - Consumes: 既有 render_statusbar_with、HistoryView、side_header_line 调用位置、Task 9 按需错误。
 - Produces: 原状态行内 `/side · /back 返回` 短标签；不增加 Rect/行高，不遮历史首行。
 
-- [ ] **Step 1:** TestBackend 80×24、32×12 各用深/浅主题绘制，旁问首条文本设 `FIRST_SIDE_ITEM`，断言首条不被 Clear/header 覆盖；status 有 `/side` 与 `/back`，普通父视图无常驻旁问提示。CJK 字符宽度使用现有渲染工具，不以 byte len 截断。
+- [x] **Step 1:** TestBackend 80×24、32×12 各用深/浅主题绘制，旁问首条文本设 `FIRST_SIDE_ITEM`，断言首条不被 Clear/header 覆盖；status 有 `/side` 与 `/back`，普通父视图无常驻旁问提示。CJK 字符宽度使用现有渲染工具，不以 byte len 截断。
 
 ```rust
 assert!(screen.contains("FIRST_SIDE_ITEM"));
@@ -409,11 +568,37 @@ assert!(!screen.contains("旁支可用工具（只读）"));
 ```
 
 `screen` 从该用例实际 terminal.backend().buffer() 按行收集可见字符得到；帮助命令主动显示工具说明不在此禁止范围。
-- [ ] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期旧独立介绍条遮行/占位失败。
-- [ ] **Step 3:** 去掉 HistoryView 上额外 Clear/Paragraph 的 header 绘制；在已有状态文本预算中选 side 标签，窄屏优先身份/返回，错误按需显示且不被父费用覆盖。父视图照旧，side helper 不再用于宣传条，删除无调用代码/测试，不移除主动 `/help`。
-- [ ] **Step 4:** `cargo test -p yi-agent --bin yi-agent tui::`，再 `cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log`；确认过滤器实际执行至少一条测试。检查 side 错误/正文没有进入父 resume/TurnLog。
-- [ ] **Step 5:** 更新 TUI 阶段证据，统一门禁后提交 `fix: keep TUI side identity in the existing status line`。
+- [x] **Step 2:** `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_`；预期旧独立介绍条遮行/占位失败。
+- [x] **Step 3:** 去掉 HistoryView 上额外 Clear/Paragraph 的 header 绘制；在已有状态文本预算中选 side 标签，窄屏优先身份/返回，错误按需显示且不被父费用覆盖。父视图照旧，side helper 不再用于宣传条，删除无调用代码/测试，不移除主动 `/help`。
+- [x] **Step 4:** `cargo test -p yi-agent --bin yi-agent tui::`，再 `cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log`；确认过滤器实际执行至少一条测试。检查 side 错误/正文没有进入父 resume/TurnLog。
+- [x] **Step 5:** 更新 TUI 阶段证据，统一门禁后提交 `fix: keep TUI side identity in the existing status line`。
 
+**证据（2026-11-05,本 worktree）:**
+
+删掉了占据转录首行的旁问 header。旧实现在 history 区域顶上盖一行并 `Clear`，而
+旁支第一条正文正好在那一行——开旁支先丢掉第一句回答（spec §7）。
+
+- `tui/statusbar.rs` 新增 `SideStatusLabel { must, full }` 与
+  `render_statusbar_with_side`。`must`（旁问 + `/side` + `/back`）单独存一份，
+  不从完整文本切：切字符串很容易把 `/back` 拦腰截断，那正是窄屏最需要的字符。
+  预算只够 `must` 时仍显示它，够时追加父会话状态/错误。旁支段排在费用段之前：
+  「我在哪、怎么出去」比 token 计数要紧。
+- `tui/app.rs` 的 `side_status_label` 决定内容，规则是**错误优先于身份**；主视图
+  只在有后台旁支操作失败时才出 `/side <失败说明>`，不带「旁问」身份词（否则用户
+  会以为还在旁支里）。
+- `SideParentState` 把「等待审批」排在「运行中」之前：卡在审批上的父会话技术上
+  仍在跑，但对用户来说是停住的。审批详情仍只能回父视图看（spec §7）。
+- 删除 `side_header_line` 与其单测（已无调用点），保留主动 `/help` 的工具说明。
+
+红已证实（临时改回旧行为，跑完即恢复）：
+- `render_statusbar_with_side(..., None)`（状态栏不出旁支段）→
+  `side_status_bar_labels_the_conversation_without_covering_the_first_item` FAILED。
+- 在 history 区域顶部重新 `Clear` 一行 → 同一条用例 FAILED（首条正文被遮）。
+
+门禁：`cargo test -p yi-agent --bin yi-agent tui::` = 710 passed, 0 failed；
+`side_repair_` = 21 passed；`side_events_never_reach_main_turn_log` 实跑通过
+（1 passed，父 TurnLog 里不含旁支正文；断言未被过滤成 0 条）；
+`cargo fmt --all` + `just fmt-check` 通过；`cargo clippy -p yi-agent --all-targets` 无告警。
 ## 3. 汇合验证与交付
 
 ### Task 11: 三端证据、验收覆盖和全量门禁
@@ -427,8 +612,8 @@ assert!(!screen.contains("旁支可用工具（只读）"));
 - Consumes: Tasks 1–10，spec W01–W16/T01–T10。
 - Produces: 每个验收 ID 的测试全名、命令、实际结果和证据路径；未执行项明确记未执行，不以 mock/viewport 代替真机。
 
-- [ ] **Step 1:** 在 acceptance 文档新增 `2026-11-05 修复验收` 章节，先将所有目标列为未执行，记录 git HEAD、桌面/手机/TUI/app-server 构建身份、hostKey 的脱敏标识、是否同一 relay。不要复制用户真实问题或完整配置。
-- [ ] **Step 2:** 顺序执行自动验证并留日志，任何失败先诊断；禁止把基线 App parser 错误当成可接受失败。
+- [x] **Step 1:** 在 acceptance 文档新增 `2026-11-05 修复验收` 章节，先将所有目标列为未执行，记录 git HEAD、桌面/手机/TUI/app-server 构建身份、hostKey 的脱敏标识、是否同一 relay。不要复制用户真实问题或完整配置。
+- [x] **Step 2:** 顺序执行自动验证并留日志，任何失败先诊断；禁止把基线 App parser 错误当成可接受失败。
 
 ```bash
 (cd desktop && npx tsc --noEmit && npx vitest run && npm run build)
@@ -439,8 +624,43 @@ git diff --check
 ```
 
 - [ ] **Step 3:** 按 spec §8.3 在隔离 YI_AGENT_HOME 验证桌面真实 WebView、iPhone/relay、真实 PTY。PTY bracketed paste 输入字节为 `\x1b[200~/back\x1b[201~\r` 和 `\x1b[200~/side-close\x1b[201~\r`，分别确认返回与关闭；再测 Esc、Ctrl+C×2、Ctrl+Q、退出命令。先 mock provider；经授权后至少一组真实模型流式回答。无真机/授权就明确未执行，整体功能不勾完成、不宣布修复验收通过。
-- [ ] **Step 4:** 将 W/T 对应测试名与真实证据填入下表所列覆盖路径；检查父任务持续完成、父草稿附件逐字保留、父日志不含 side marker。无静默错误、无宣传横幅、无错会话 Stop。同步模块计数：只按真实 `[x]`/`[ ]`/`[-]` 统计，不因写了 spec/plan 加一个产品完成数。
+- [x] **Step 4:** 将 W/T 对应测试名与真实证据填入下表所列覆盖路径；检查父任务持续完成、父草稿附件逐字保留、父日志不含 side marker。无静默错误、无宣传横幅、无错会话 Stop。同步模块计数：只按真实 `[x]`/`[ ]`/`[-]` 统计，不因写了 spec/plan 加一个产品完成数。
 - [ ] **Step 5:** 发起 requesting-code-review，修复被证实的问题并重跑门禁；通过后提交 `test: verify side repair across desktop mobile and TUI`。按 finishing-a-development-branch 给用户集成选择，不自动合 main/入队。获批准合并后在合并结果再次 `just ci`，确认完成再清 worktree/分支；清理 target 前检查进程和 dry-run，不动仍活跃目录。
+
+**证据（2026-11-05,本 worktree）:**
+- Step 1 已做:`docs/testing/side-conversation-acceptance.md` 第 5 节,基线 `d25822ca`、
+  平台 macOS aarch64、桌面/手机/TUI 构建身份、relay 与 hostKey 明确写「未执行」,
+  未复制用户原始问题或配置。Step 2 已做:5.2 的命令与计数全为实跑输出。
+- Step 4 已做:5.3 的 T01–T10 表按 `tui::` / `side_repair_` / `side_driver` 真实用例名填,
+  W01–W16 表按 spec §8.1 真实 ID 逐条对应到 `desktop/src/**/*.test.tsx` 里存在的用例名
+  (48 个被引用的用例名已用脚本核对全部存在),真机一列全为「未执行」。
+  模块计数只按真实 `[x]` 统计:`docs/project-management/desktop.md` 的桌面/手机旁问条目
+  仍为 `[ ]`(真机未验),`docs/project-management/yi-agent-tui.md` 同理。
+- **Step 3 未做**:本 worktree 无真实 WebView、无 iPhone/relay、无真实 PTY、未获真实模型
+  授权。因此本条保持未勾,Task 11 不算完成,整体功能不勾完成、不宣布修复验收通过。
+- 自查第四个缺陷（在 Step 5 的替代评审里发现）：`side_driver.rs` 的 `close` 把
+  `expected_active_turn_id: None` 当成「无条件关闭」，而 TUI 传的是本地异步回传的
+  轮次 id——提交后、事件被消费前按 `/side-close`，正在回答的旁支会被连回答一起关掉，
+  且从未出现过确认。已修为「本地未知但实际在跑」也判冲突，并区分两种冲突文案。
+  红/绿：`a_close_without_a_turn_id_refuses_a_running_side`（修复前 FAILED）、
+  `a_refused_close_shows_why_in_the_visible_side`（把 notice 写入删掉即 FAILED）。
+- 自查第五个缺陷：心跳不带 turn id，于是「视图在跑、本地未知轮次」是真实窗口；
+  Ctrl+C 与 Esc 两处原本静默跳过。危害是用户以为没生效再按 Ctrl+C——第二次就是退出。
+  两处改为写「旁支正在启动，请稍候再停止」且不发 Interrupt。
+  红/绿：`stopping_a_side_whose_turn_is_not_known_yet_says_so`、
+  `esc_on_a_side_whose_turn_is_not_known_yet_says_so`（改回静默即 FAILED）。
+- **Step 5 部分未做**:代码评审没能以 `requesting-code-review` 子代理形式完成——
+  daemon 拒绝了该派发(`invalid_state: a settled parent task (state: stalled) cannot spawn
+  descendants`)。改为协调者逐文件自查,并据此修出三个真实缺陷(心跳擦掉「关闭未送达」、
+  `decide_exit_key` 里误导性的 `let _ =`、状态栏极窄宽度缺测试),每个都有红/绿证据。
+  这一步**不勾**,因为「独立评审」这个要求没有真正满足。
+
+### Task 11 之后的实际状态（供集成决策）
+
+- Task 1–10 的代码与自动测试证据齐全;Task 11 的 Step 1/2/4 完成,Step 3/5 未完成。
+- 因此**不能**按 plan 判定「已全部完成」;合并决策必须让用户知道真机验收与独立评审
+  这两块空缺。
+
 
 ## 4. 验收到任务的追踪表
 

@@ -186,12 +186,54 @@ pub fn format_thousands(n: u64) -> String {
     out
 }
 
+/// 状态栏里的一句话旁支标识。
+///
+/// 只占既有状态栏的宽度预算，**不**新开一行，也不画在转录首行（spec §7：
+/// 介绍条会遮住旁支第一条正文）。读屏靠的就是这段文字：它必须能独立说明
+/// 「你现在在旁支里、怎么回去」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideStatusLabel {
+    /// 窄屏也必须留下的一段：身份 + 怎么回去。
+    ///
+    /// 单独存一份而不是从完整文本切出来：切字符串很容易把 `/back` 拦腰截断，
+    /// 那正好是用户最需要的那几个字符。
+    pub must: String,
+    /// 预算够时显示的完整文本（身份 + 返回 + 父会话状态）。
+    pub full: String,
+}
+
+impl SideStatusLabel {
+    /// 旁支视图：身份 + 两条命令（窄屏必留），`extra` 是父会话状态或一条错误。
+    ///
+    /// `/side` 与 `/back` 同时出现是有意的：用户在旁支里要能一眼看到「怎么回去」，
+    /// 而 `/side` 提示这个会话本来就是从 `/side` 来的、还能重入。
+    pub fn side(extra: Option<&str>) -> Self {
+        let must = "旁问 /side · /back".to_string();
+        let full = match extra.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(extra) => format!("{must} 返回 · {extra}"),
+            None => must.clone(),
+        };
+        Self { must, full }
+    }
+
+    /// 主视图：**只有**后台旁支操作失败时才出现，`extra` 是那条失败说明。
+    ///
+    /// 不写「旁问」身份——用户已经在主视图，写上会让人以为还在旁支里。
+    pub fn main(extra: &str) -> Self {
+        Self {
+            must: "/side".to_string(),
+            full: format!("/side {extra}"),
+        }
+    }
+}
+
 /// Render the status bar as a single `Line`.
 ///
 /// Layout (left to right):
 ///   `● <tool> <elapsed>`  (only when foreground tasks are running)
 ///   `N proc running`  (only when managed background processes are active)
 ///   `已略去 N 条更早的历史`  (only when history cells were dropped at the cap)
+///   `<旁问 · /back 父会话…>`  (only when the side view is visible)
 ///   `prefill <n>  decode <m>`
 ///   `<model>`
 ///
@@ -229,6 +271,34 @@ pub fn render_statusbar_with<'a>(
     model: &'a str,
     width: u16,
     theme: TuiTheme,
+) -> Line<'a> {
+    render_statusbar_with_side(
+        state,
+        tasks,
+        active_process_count,
+        trimmed_history,
+        model,
+        width,
+        theme,
+        None,
+    )
+}
+
+/// 带旁支标识的状态栏。
+///
+/// 旁支段放在费用段**之前**：旁支身份与返回命令是「我在哪、怎么走」，
+/// 比 token 计数更要紧；窄屏预算不够时先丢的是后者（费用/模型本来就会被
+/// 逐段让位）。
+#[allow(clippy::too_many_arguments)]
+pub fn render_statusbar_with_side<'a>(
+    state: &'a StatusBarState,
+    tasks: &'a RunningTaskRegistry,
+    active_process_count: usize,
+    trimmed_history: usize,
+    model: &'a str,
+    width: u16,
+    theme: TuiTheme,
+    side: Option<&SideStatusLabel>,
 ) -> Line<'a> {
     let mut spans: Vec<Span<'a>> = Vec::new();
     // The status row is exactly one terminal row tall, so the assembled line
@@ -291,6 +361,23 @@ pub fn render_statusbar_with<'a>(
         );
     }
 
+    if let Some(side) = side {
+        // 先算「至少要留出身份 + 返回命令」。预算只够这两项时也不能整段丢掉，
+        // 否则窄屏用户看不出自己在旁支里、也看不到怎么回去。
+        let room = budget.saturating_sub(used);
+        let text = if room <= UnicodeWidthStr::width(side.must.as_str()) {
+            crate::tui::wrap::truncate_to_width(side.must.trim_end(), room)
+        } else {
+            crate::tui::wrap::truncate_to_width(&side.full, room)
+        };
+        push(
+            &mut spans,
+            Span::styled(text, Style::new().fg(theme.fg_muted)),
+            &mut used,
+        );
+        push(&mut spans, Span::raw("  "), &mut used);
+    }
+
     push(&mut spans, Span::raw("prefill "), &mut used);
     push(
         &mut spans,
@@ -327,6 +414,99 @@ pub fn render_statusbar_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn side_label_keeps_identity_and_back_command_on_a_narrow_bar() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let label = SideStatusLabel::side(Some("父会话运行中"));
+        // 32 列：扣掉 prefill/decode 后留给旁支段的预算非常小。
+        let line = render_statusbar_with_side(
+            &state,
+            &tasks,
+            0,
+            0,
+            "test-model",
+            32,
+            TuiTheme::DARK,
+            Some(&label),
+        );
+        let text = line_text(&line);
+        assert!(text.contains("/back"), "窄屏必须留下返回命令，实际: {text}");
+        assert!(text.contains("旁问"), "窄屏必须留下旁支身份，实际: {text}");
+        assert!(
+            UnicodeWidthStr::width(text.as_str()) <= 32,
+            "状态栏必须保持一行不溢出，实际: {text:?}"
+        );
+    }
+
+    /// 极窄终端不能 panic，也不能画出超过宽度的行。
+    ///
+    /// 这里是唯一用 `saturating_sub` 算预算再截断的地方：一旦有人改成普通减法，
+    /// 宽度小于已用列数时会整数下溢（debug 下直接 panic，release 下变成天文数字
+    /// 的预算、整行溢出）。
+    #[test]
+    fn side_label_never_overflows_on_a_very_narrow_bar() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let label = SideStatusLabel::side(Some("父会话运行中"));
+        for width in [0u16, 1, 2, 5, 10, 20] {
+            let line = render_statusbar_with_side(
+                &state,
+                &tasks,
+                0,
+                0,
+                "test-model",
+                width,
+                TuiTheme::LIGHT,
+                Some(&label),
+            );
+            let text = line_text(&line);
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                "宽度 {width} 时状态栏溢出: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_error_text_is_not_dropped_by_the_cost_segments() {
+        let state = StatusBarState::default();
+        let tasks = RunningTaskRegistry::new();
+        let label = SideStatusLabel::side(Some("关闭旁问失败：未送达"));
+        let line = render_statusbar_with_side(
+            &state,
+            &tasks,
+            0,
+            0,
+            "test-model",
+            80,
+            TuiTheme::DARK,
+            Some(&label),
+        );
+        let text = line_text(&line);
+        assert!(
+            text.contains("未送达"),
+            "错误尾部不能被费用/模型段挤掉，实际: {text}"
+        );
+    }
+
+    #[test]
+    fn main_label_does_not_claim_the_user_is_inside_a_side() {
+        let label = SideStatusLabel::main("关闭失败：未送达");
+        assert!(
+            !label.full.contains("旁问"),
+            "主视图的提示不能让人以为还在旁支里，实际: {}",
+            label.full
+        );
+    }
 
     #[test]
     fn test_token_interpolation_approaches_target() {

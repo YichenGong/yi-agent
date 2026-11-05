@@ -224,3 +224,131 @@ $ grep -c "布尔代数" *.jsonl
 未执行原因：需要至少一台真实手机、relay 宿主与移动端工程；Vitest 的 jsdom
 视口不能替代真实设备。桌面端本轮只到单测 + 构建 + `just desktop-check`，
 §12.5 真机部分仍未验收。
+
+## 5. 2026-11-05 修复验收
+
+本轮修的是「旁问进去以后退不出来 / 按了没反应」这一类可见性缺陷，
+spec 与 plan：`docs/superpowers/specs/2026-11-05-side-conversation-repair-design.md`、
+`docs/superpowers/plans/2026-11-05-side-conversation-repair-impl.md`。
+
+### 5.1 构建身份与执行环境
+
+| 项 | 值 |
+| --- | --- |
+| 基线 commit | `d25822ca`（Task 10 提交后），修复起点 `f35b2066` |
+| 平台 | macOS aarch64（本机 worktree，未打包 .app） |
+| 桌面端 | 源码 + `npx tsc --noEmit` + `npx vitest run`（未跑真实 WebView） |
+| 移动端 | **未执行**：本 worktree 无移动端工程、无真机 |
+| relay / hostKey | **未执行**：未连接任何 relay 宿主，无脱敏标识可记 |
+| TUI | 源码级 TestBackend（80×24、32×12）与 `just ci`；**未跑真实 PTY** |
+
+按要求不复制用户原始问题、不记录完整配置。
+
+### 5.2 自动验证（已执行，全部通过）
+
+```bash
+(cd desktop && npx tsc --noEmit && npx vitest run)     # 159 files / 2226 tests passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent tui::)              # 715 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_repair_)       # 21 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_driver)        # 9 passed
+(cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent side_events_never_reach_main_turn_log)
+(cd yi-agent-rs && just desktop-check)                 # 2226 passed
+(cd yi-agent-rs && just ci)                            # 16 道门禁，CI passed（5428 tests）
+git diff --check                                        # 无输出
+```
+
+一次说明：首轮 `just ci` 出现 `yi-agent-app-server ws::tests::a_client_leaving_does_not_kill_the_shared_loop` 单条失败。
+该用例依赖真实 socket + 300ms sleep，单独重跑连跑 5 次全部通过，
+随后完整 `just ci` 重跑通过；与本次改动无关（改动集中在 `crates/yi-agent/src/tui/`、
+`side_driver`）。**不把基线 parser 错误或该类偶发项当成可接受失败**，此处只记录
+已复现通过的事实。
+
+### 5.3 W/T 覆盖
+
+自动侧覆盖（测试全名见 plan Task 8–10 证据）。补充两条自查用例：
+`side_heartbeat_does_not_erase_a_close_delivery_failure`（心跳不得擦掉「关闭未送达」）、
+`side_label_never_overflows_on_a_very_narrow_bar`（0/1/2/5/10/20 列不 panic 不溢出）。
+
+| 验收 ID | 自动证据 | 真机/真实 PTY |
+| --- | --- | --- |
+| T01 | `side_repair_paste_stays_in_the_visible_side_draft`、`side_repair_typed_and_completed_back_work_through_the_loop`、`side_repair_tab_completes_then_enter_executes` | 未执行 |
+| T02 | `side_repair_close_survives_a_full_side_channel`、`side_repair_close_survives_a_dropped_side_receiver` | 未执行 |
+| T03 | `side_repair_paste_back_survives_a_parent_approval_through_the_loop` | 未执行 |
+| T04 | `side_repair_paste_back_through_the_loop_returns_to_main_and_keeps_the_parent_draft`、`a_new_side_can_open_after_the_previous_one_closed` | 未执行 |
+| T05 | `side_repair_tab_without_popup_does_not_edit_the_draft`、`side_repair_esc_closes_the_popup_before_stopping` | 未执行 |
+| T06 | `side_repair_first_ctrl_c_in_side_stops_only_the_side`、`side_repair_editing_after_ctrl_c_rearms_the_confirmation` | 未执行（真实清理器/租约未单测覆盖，见 5.4） |
+| T07 | `side_repair_ctrl_q_quits_even_with_the_runtime_popup_open`、`side_repair_ctrl_q_quits_with_a_pending_parent_approval`、`side_repair_quit_commands_leave_the_side_without_a_submit` | 未执行 |
+| T08 | `side_repair_esc_closes_the_popup_before_stopping` | 未执行 |
+| T09 | 上列两条 Full/Closed 用例 + driver 的 `stale_close_target_reports_error_and_keeps_the_live_side`、`stale_interrupt_does_not_stop_the_live_turn`、`failed_open_reports_a_main_target_error`、`a_close_without_a_turn_id_refuses_a_running_side`、`a_refused_close_shows_why_in_the_visible_side`；`stopping_a_side_whose_turn_is_not_known_yet_says_so`、`esc_on_a_side_whose_turn_is_not_known_yet_says_so` | 未执行 |
+| T10 | `side_status_bar_labels_the_conversation_without_covering_the_first_item`（80×24 与 32×12 × 深/浅）、`main_view_has_no_standalone_side_banner`、`side_events_never_reach_main_turn_log` | 未执行 |
+
+W01–W16（桌面/手机）的自动证据来自本分支七个修复提交（`b7945d47`、`14c579b3`、`eb13ca07`、
+`156322b2`、`635a7480`、`182dc82d`、`b1474baf`）。ID 定义见 spec §8.1，逐条对应到真实用例：
+
+| ID | 自动证据（真实用例名） | 真机 |
+| --- | --- | --- |
+| W01 | `App.test.tsx`：`expectNoSideChrome()`（无 `side-header` / `side-conversation-header` / 六个入口按钮）；`StatusBar.test.tsx:241` `conversationLabel` 显示 `/side · 只读 · /back 返回` 且 connected 点仍绿 | 未执行 |
+| W02 | `App.test.tsx`：`opens an empty side from /side without a module or a model call`、`opens with the question typed after /btw, and only once`；`useSideConversationController.test.tsx:161` `merges a repeated open into the same side instead of opening twice` | 未执行 |
+| W03 | `App.test.tsx`：`renders the side transcript without reading parent images`；`sideSync.test.ts:323` `applies only contiguous sequence numbers`、`:332` `re-reconciles instead of skipping a gap` | 未执行 |
+| W04 | `App.test.tsx`：`does not interrupt a running parent when opening a side`、`stops only the side's own turn`、`keeps the parent's approval dialog out of the side view`；`useSideConversationController.test.tsx:495` `interrupts the side's own turn, never the parent` | 未执行 |
+| W05 | `App.test.tsx`：`keeps each conversation's draft to itself`、`returns to the parent without stopping or closing the running side`、`marks a vanished side as lost instead of falling back to the parent`；`useSideConversationController.test.tsx:462` | 未执行 |
+| W06 | `useSideConversationController.test.tsx:289` `routes a submission to the side and host it was captured from`、`:339` `rejects a submission aimed at a generation that has already been replaced`、`:397` `only surfaces an error for the side that produced it`、`:426` `does not let one host's failure show up as another host's` | 未执行 |
+| W07 | `sideSync.test.ts:270` `keeps the placeholder and marks unsynced on a network failure`；`useSideConversationController.test.tsx:327` `returns a receipt from submit and rejects when no side is open`；`App.test.tsx`：`keeps the typed question when the side's first turn is refused` | 未执行 |
+| W08 | `sideSync.test.ts:484` `retries uncertain submission with the same request id`；`sideConversation.test.ts:350` 相同文字仍 +2 | 未执行 |
+| W09 | `useSideConversation.test.tsx:120` `opens the tail poll on a controller created while its parent is visible`、`:140` `keeps a background host's controller invisible`、`:175` `stops polling everything when the side view closes`、`:227` `disposes every controller on unmount` | 未执行 |
+| W10 | `MessageInput.test.tsx:364` `keeps mobile running turns Stop-only and Enter inert`、`:334` `sends from a separate Send button while retaining Stop`、`:93` `does not send when Enter confirms an IME candidate (keyCode 229)` | 未执行 |
+| W11 | `useSideConversationController.test.tsx:762` `lists existing sides instead of opening one`、`:810` `rejects an observe-only request to start a conversation`、`:819` `still lets a read-only device return locally`、`:721` `refuses to close on an observe-only host`；`App.test.tsx`：`hides every side entry point when the host lacks the capability` | 未执行 |
+| W12 | `MessageInput.test.tsx:898` `runs /help inside the side scope through the side handler, never the parent`、`:873` `dispatches /back through onSideCommand without touching onSlashCommand`；`App.test.tsx`：`explains a /back taken from the main view` | 未执行 |
+| W13 | `useSideConversationController.test.tsx:226` `does not yank the user back into a side that opened after they left`、`:248` `re-enters a side the user explicitly asked for after the open landed`、`:266` `keeps the automatic first question as a draft when the user left first`、`:362` `keeps a local return independent from an in-flight submission lock` | 未执行 |
+| W14 | `useSideConversationController.test.tsx:565` `reads the server's current turn before confirming`、`:587` `closes the side it was confirmed for, not the one now on screen`、`:625` `does not yank the user back if they navigated while the close was pending`、`:687` `refuses a confirmation whose connection has been replaced`、`:705` `refuses a confirmation from a generation that has been replaced`、`:734` `does not force a close when the turn changed after confirmation` | 未执行 |
+| W15 | `App.test.tsx`：`keeps the parent's pending attachments out of the side`、`renders the side transcript without reading parent images`、`never routes side notifications into the parent's mark-read or resume` | 未执行 |
+| W16 | `App.test.tsx`：`closes a background side from the main view`、`says so instead of pretending when there is nothing to close`；`useSideConversationController.test.tsx:654`、`:673` `is idempotent when there is nothing to close` | 未执行 |
+
+这些是源码级断言（`npx vitest run` = 159 files / 2226 passed，其中相关八个文件 522 passed）。
+**真机一列全部未执行**，所以本表只证明「自动侧有覆盖」，不宣称 W01–W16 验收通过。
+
+### 5.4 自查发现的第四个缺陷：不知道轮次 id 时仍会关掉在跑的旁支
+
+`side_driver.rs` 的 `close` 原本写成「带了 `expected_active_turn_id` 才做冲突检查」，
+于是 `None` 等价于「无条件关闭」。TUI 的 `/side-close` 传的是**本地**那份
+`active_turn_id`，而 turn id 是 driver 通过事件异步回传的：用户提交问题后、那条事件
+被消费前按 `/side-close`，本地就是 `None`。此时一个正在回答的旁支会被连回答一起
+关掉，而界面上从未出现过任何确认。
+
+- 修复：`unconfirmed_while_running = expected_active_turn_id.is_none() && actual.is_some()`
+  也判为冲突；两种情况给不同的文案（「确认过期」vs「正在回答」），因为下一步动作不同。
+- 红已证实：`side_driver::tests::a_close_without_a_turn_id_refuses_a_running_side`
+  在修复前 FAILED（`本地不知道轮次 id 时关闭了正在运行的旁支`），修复后通过，
+  并断言冲突错误回到**发起关闭的那个旁支**且文案含「正在回答」。
+- 可见性已验证：`tui::app::notification_tests::a_refused_close_shows_why_in_the_visible_side`。
+  临时把 `apply_operation_error` 的 `notice` 写入删掉 → 该用例 FAILED，恢复后通过。
+- 门禁：`tui::` = 713 passed（修完该缺陷当时）、`side_driver` = 10 passed、`side_repair_` = 21 passed、
+  `just ci` = CI passed。
+
+### 5.5 自查发现的第五个缺陷：轮次 id 未回传时停止键静默
+
+同一条因果链的另一半。心跳 `SideStatus` 帧**不带** turn id（`side_driver.rs:337/430/441`
+都传 `None`），只有提交那一刻 `report_turn_id` 发一次（`:638`）。于是「视图显示在跑、
+本地 `active_turn_id` 还是 `None`」是一个真实存在的窗口。
+
+- `stop_visible_conversation` 原来是 `let Some(turn_id) = ... else { return; }`；
+  Esc 路径是 `if let ... && let Some(turn_id)`。两处都静默跳过。
+- 危害不只是「没反应」：用户按 Ctrl+C 见无反应会再按一次，**而第二次 Ctrl+C 是退出**。
+  「停掉这个回答」于是变成「关掉整个应用」。
+- 修复：两处都在轮次未知时写 `旁支正在启动，请稍候再停止`，并且不发出 Interrupt。
+- 红已证实：`stopping_a_side_whose_turn_is_not_known_yet_says_so`、
+  `esc_on_a_side_whose_turn_is_not_known_yet_says_so`，各自把提示改回静默即 FAILED。
+- 门禁：`tui::` = 715 passed、`just ci` = CI passed。
+
+### 5.6 明确未执行项
+
+- 真实 WebView 桌面验收（本 worktree 只跑源码级测试，未打包 `.app`）。
+- iPhone / relay / 双端同一 side id、后台唤醒重连、close 冲突二次确认。
+- 真实 PTY 的 bracketed paste（`\x1b[200~/back\x1b[201~\r`、
+  `\x1b[200~/side-close\x1b[201~\r`）、Esc、Ctrl+C×2、Ctrl+Q、退出命令。
+- 真实模型流式回答（未取得授权，未调用真实 LLM）。
+- 退出清理器/租约释放的真进程用例：当前无对应 fixture，本轮以源码级退出路径
+  测试代替，**不作为已验收**。
+
+因此本轮**不宣布修复验收通过**，`docs/project-management/yi-agent-tui.md` 中该条
+保持未勾。
