@@ -164,3 +164,11 @@ spec 编写完成不代表修复完成，本轮不更新为已修复、不合并
 - 两轮审查已核对代码、测试入口、Tailwind 留白、移动端复用、键盘前提和隔离验收；补齐 CSS 作用域回归的具体判据。
 - 子代理审查因运行时 `invalid_state: a settled parent task (state: stalled) cannot spawn descendants` 未能启动；两轮核对由本会话完成，不宣称有独立审查结论。
 - 无未决设计占位项。用户已授权审查无阻塞后编写实施计划，见 [实施计划](../plans/2026-11-05-sidebar-search-clear-impl.md)；用户已进一步授权将文档先合入 main，再正式投入看板，由看板调度实施；不在文档会话直接实施。
+
+## 11. 执行状态（2026-11-05）
+
+代码修复与自动化验证已完成，**真实 WebView 验收未完成**，故本修复按 §8 仍不算完成。
+
+- **已实现**：`desktop/src/components/ThreadSidebar.tsx` 的侧栏 input 增加 `thread-search-input` 与 `pr-8`；`desktop/src/index.css` 增加唯一一条受专用类约束的 `::-webkit-search-cancel-button` 隐藏规则。`type="search"`、`aria-label`、`value`、事件、按钮属性与定位、移动端字号/最小高度/间距均未改动。
+- **自动化**：组件回归 3 组用例 + 新增 `desktop/src/sidebarSearchCss.test.ts`；RED 4 failed / 154 passed（失败点精确为类与规则缺失），GREEN 指定 5 文件 193/193，全量 1927/1927。`just ci` 通过。
+- **未完成**：`npm run build` 被 main 基线自带的故障挡住 —— `desktop/src/App.tsx:3009` 的孤立 `)}`（合并 `7e71f238` 解错冲突引入），以及 `desktop/src/lib/kanbanObservation.ts` import 了 main 上已删除的 `./superpowersKanbanState`。两者在卡片基线 `5142ed74` 即存在，与本修复无关。无法产出 `.app`，故 §7 的 macOS WKWebView 矩阵与移动端真机**全部未验**，未提交、未声明完成。
