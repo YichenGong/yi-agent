@@ -10,8 +10,7 @@
 use super::*;
 use yi_agent_core::subagent::task::TaskRole;
 use yi_agent_lifecycle::session_delegation::{
-    PrepareSession, SessionBinding, SessionBinding as BindingDto, SessionFailure,
-    SessionFailureCode, SessionRef,
+    PrepareSession, SessionFailure, SessionFailureCode, SessionRef,
 };
 
 /// One container's durable facts.
@@ -235,6 +234,7 @@ impl RuntimeRepository {
     }
 
     /// The container facts a prepare decision reads, plus the task role.
+    #[allow(dead_code)] // consumed by the coordinator's prepare path (plan Task 5)
     pub(crate) fn session_prepare_facts(
         &self,
         request: &PrepareSession,
@@ -258,6 +258,7 @@ impl RuntimeRepository {
     }
 
     /// The live binding, if any, for a container.
+    #[allow(dead_code)] // consumed by the coordinator's prepare path (plan Task 5)
     pub(crate) fn session_binding_epoch(
         &self,
         root_task_id: &str,

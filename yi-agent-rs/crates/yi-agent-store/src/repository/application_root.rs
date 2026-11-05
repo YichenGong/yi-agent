@@ -210,7 +210,7 @@ impl RuntimeRepository {
         let mut statement = self.connection.prepare(
             "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
                     tasks.active_attempt_id, attempts.number, tasks.state_json,
-                    tasks.delivery_json, attempts.terminal_json
+                    tasks.delivery_json, attempts.terminal_json, tasks.role
              FROM tasks
              JOIN attempts ON attempts.id = tasks.active_attempt_id
              WHERE tasks.root_session_id = ?1
@@ -228,6 +228,7 @@ impl RuntimeRepository {
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })?
             .map(|row| {
@@ -241,6 +242,7 @@ impl RuntimeRepository {
                     state,
                     delivery_json,
                     terminal_json,
+                    role,
                 ) = row?;
                 Ok(PersistedHydrationTask {
                     session_id: session
@@ -278,6 +280,16 @@ impl RuntimeRepository {
                     state,
                     delivery_json,
                     terminal_json,
+                    role: match role.as_str() {
+                        "execution" => TaskRole::Execution,
+                        "session_container" => TaskRole::SessionContainer,
+                        other => {
+                            return Err(RepositoryError::InvalidForegroundFact {
+                                root: task,
+                                reason: format!("unknown task role {other}"),
+                            });
+                        }
+                    },
                 })
             })
             .collect()

@@ -134,6 +134,15 @@ pub(crate) fn ipc_error_message(error: &IpcError) -> Option<String> {
         IpcError::Runtime(error @ RuntimeCoordinatorError::ParentSettled { .. }) => {
             Some(error.to_string())
         }
+        // The supervisor returns the same verdict as its own `SpawnError`, and the
+        // store pre-check can be skipped by a stale in-memory role. Without this arm
+        // the client gets `invalid_state` with no reason at all, which is exactly the
+        // unhelpful shape that hides which state blocked the spawn.
+        IpcError::Runtime(RuntimeCoordinatorError::Spawn(
+            yi_agent_core::subagent::supervisor::SpawnError::ParentSettled { state },
+        )) => Some(format!(
+            "a settled parent task (state: {state}) cannot spawn descendants"
+        )),
         // A fork rejection is the caller's mistake (unknown, incomplete, or
         // mismatched token), so the reason is safe to hand back verbatim rather
         // than leaving the client with only a bare code.

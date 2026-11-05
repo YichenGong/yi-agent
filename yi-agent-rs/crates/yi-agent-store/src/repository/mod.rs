@@ -6,7 +6,8 @@ pub(crate) use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub(crate) use yi_agent_core::subagent::task::{
-    BudgetKind, DeliveryReport, MessageId, PermissionDecision, PermissionRequestId, TimeoutKind,
+    BudgetKind, DeliveryReport, MessageId, PermissionDecision, PermissionRequestId, TaskRole,
+    TimeoutKind,
 };
 pub(crate) use yi_agent_core::subagent::worker::{
     WorkerRecoveryAttestation, WorkerRecoveryContext,
@@ -527,6 +528,10 @@ pub struct PersistedHydrationTask {
     pub state: String,
     pub delivery_json: String,
     pub terminal_json: Option<String>,
+    /// The persisted role. Hydration must restore it rather than assume
+    /// `Execution`: a restarted daemon that rebuilt a container as an execution
+    /// would refuse every later spawn on the strength of a historical state.
+    pub role: TaskRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

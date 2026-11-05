@@ -4,12 +4,13 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::{DeliveryReport, TaskId, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::{DeliveryReport, TaskId, TaskRole, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
+use yi_agent_store::repository::RuntimeRepository;
 
 #[derive(Clone, Default)]
 struct DeliveryFactory {
@@ -390,6 +391,112 @@ fn delivery_survives_restart_without_restarting_worker() {
         .unwrap(),
         before
     );
+}
+
+/// 容器角色必须跨越重启存活。
+///
+/// 这就是用户最初遇到的故障形状：一个会话的历史执行被标成 `stalled`，daemon
+/// 重启后 hydration 只按 `state_json` 重建 root；如果角色没有一起读回，root 会
+/// 变成 Execution，之后任何 `spawn` 都会被 `ParentSettled` 拒绝，而错误文本恰好
+/// 是 “a settled parent task (state: stalled) cannot spawn descendants”。
+///
+/// 因此本测试：切换历史 state 为 stalled → 重启 daemon → 重新 attach → 断言容器
+/// 角色仍在、且能继续 spawn。仅让 attach 能返回成功是不够的。
+#[test]
+fn a_stalled_session_container_still_spawns_after_a_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("runtime.sqlite");
+    let runtime = dir.path().join("runtime");
+    let factory = Arc::new(DeliveryFactory::default());
+    let daemon = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-stalled-container".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attached application root");
+    };
+    let root: TaskId = root_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_role(&root)
+            .unwrap(),
+        TaskRole::SessionContainer,
+        "an application root is created as a container, not an execution"
+    );
+
+    // A previous build could still settle a container. Reproduce that history
+    // verbatim: the state column is what hydration reads, and it must no longer
+    // decide whether the container may delegate.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET state_json = 'stalled' WHERE id = ?1",
+            [root.to_string()],
+        )
+        .unwrap();
+
+    drop(daemon);
+    let restarted = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+
+    // Re-attaching hydrates the persisted task rows. This is the path that used to
+    // lose the role.
+    let IpcResponse::ApplicationRootAttached {
+        session_id: reattached_session,
+        root_task_id: reattached_root,
+        message_capability: reattached_capability,
+        ..
+    } = send_request(
+        restarted.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-stalled-container".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected the same application root back");
+    };
+    assert_eq!(reattached_session, session_id);
+    assert_eq!(reattached_root, root_task_id);
+
+    let response = send_request(
+        restarted.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: reattached_session,
+            parent_task_id: reattached_root,
+            capability: reattached_capability,
+            objective: "spawn after restart".into(),
+            mode: Some("coding".into()),
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .unwrap();
+    match response {
+        IpcResponse::TaskSpawned { .. } => {}
+        IpcResponse::Error { code, message, .. } => panic!(
+            "a stalled container must still delegate after a restart; got {code:?}: {message:?}"
+        ),
+        other => panic!("expected a spawned child, got {other:?}"),
+    }
+    drop(restarted);
+    let _ = message_capability;
 }
 
 /// 重启后重新挂载时，父级必须仍能从 `WaitAgent` 读到子任务交付的 commit。

@@ -29,7 +29,7 @@ use yi_agent_core::subagent::supervisor::{TerminalKind, classify_terminal};
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
     MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskFailure, TaskId, TaskState, TimeoutKind,
+    RootSessionId, TaskFailure, TaskId, TaskRole, TaskState, TimeoutKind,
     WatchdogEvidence as CoreWatchdogEvidence, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::trace::TraceFact;
@@ -869,11 +869,42 @@ impl RuntimeCoordinator {
         workspace_mode: ChildWriteMode,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
+        self.create_session_root(
+            objective,
+            workspace_mode,
+            inherited_sandbox,
+            TaskRole::Execution,
+        )
+    }
+
+    /// The one root-creation path, told explicitly whether the root is a session
+    /// container.
+    ///
+    /// A container root exists to own delegation: it never starts a daemon worker,
+    /// so its historical `TaskState` says nothing about whether it may spawn. The
+    /// role therefore has to be chosen here, at creation, and travel into both the
+    /// in-memory supervisor and the row; deriving it later from `parent_id IS
+    /// NULL`, a cwd or a managed classification is exactly what this feature
+    /// removes.
+    fn create_session_root(
+        &self,
+        objective: String,
+        workspace_mode: ChildWriteMode,
+        inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
+        role: TaskRole,
+    ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
-        let mut supervisor =
-            AgentSupervisor::new_with_objective(session_id.clone(), objective.clone())
-                .with_max_direct_children(self.max_direct_children);
+        let supervisor = match role {
+            TaskRole::SessionContainer => AgentSupervisor::new_session_container_with_objective(
+                session_id.clone(),
+                objective.clone(),
+            ),
+            TaskRole::Execution => {
+                AgentSupervisor::new_with_objective(session_id.clone(), objective.clone())
+            }
+        };
+        let mut supervisor = supervisor.with_max_direct_children(self.max_direct_children);
         let root_id = supervisor.root_task_id().clone();
         supervisor.set_workspace_mode(&root_id, workspace_mode);
         if let Some(inherited_sandbox) = inherited_sandbox {
@@ -887,7 +918,7 @@ impl RuntimeCoordinator {
         self.repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .create_task_with_attempt_and_objective(
+            .create_task_with_attempt_and_objective_and_role(
                 &root_id,
                 &session_id,
                 &root_attempt.id,
@@ -897,6 +928,7 @@ impl RuntimeCoordinator {
                 workspace_mode,
                 None,
                 inherited_sandbox,
+                role,
             )?;
         self.supervisors
             .lock()
@@ -1075,10 +1107,15 @@ impl RuntimeCoordinator {
 
         let capability = new_application_root_capability();
         let capability_digest = digest_hex(&capability);
-        let session_id = self.create_session_with_objective_and_mode(
+        // An application root IS the session container: it owns delegation and
+        // never runs a daemon worker (design §4.1). Chosen at creation so the
+        // supervisor and the row agree from the first instant; the pending
+        // activation objective is only a placeholder for the first turn.
+        let session_id = self.create_session_root(
             "TUI application root pending activation.".into(),
             root_mode,
             None,
+            TaskRole::SessionContainer,
         )?;
         self.application_root_workspace_services
             .lock()
@@ -1200,7 +1237,7 @@ impl RuntimeCoordinator {
                     .then(|| serde_json::from_str::<DeliveryReport>(&task.delivery_json).ok())
                     .flatten();
             let task_id = task.task_id.clone();
-            let hydrated = AgentTask::hydrated_review_task(
+            let mut hydrated = AgentTask::hydrated_review_task(
                 task.session_id.clone(),
                 task_id.clone(),
                 task.parent_id.clone(),
@@ -1209,6 +1246,13 @@ impl RuntimeCoordinator {
                 task.attempt_number,
                 state,
             );
+            // The role is restored from the row, never re-derived. Without this a
+            // restarted daemon rebuilds a container as an Execution, and the
+            // supervisor then refuses every spawn because the historical state
+            // (stalled/completed/...) reads as a settled parent.
+            hydrated
+                .hydrate_session_role(task.role)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
             if task.parent_id.is_none() {
                 let mut supervisor =
                     AgentSupervisor::from_hydrated_review_root(hydrated, objective)
@@ -1819,8 +1863,19 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .task_state(parent);
+        // The role decides whether the historical state is an admission verdict:
+        // for a `SessionContainer` it is history, for an `Execution` it is final.
+        // The lookup is read inside the same pre-check so a container that is
+        // merely stale is not refused, while an unknown/missing role falls
+        // through to the supervisor's authoritative check.
+        let parent_role = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_role(parent);
         if let Ok(parent_state) = parent_state
             && let Some(state) = TaskState::from_state_label(&parent_state)
+            && !matches!(parent_role, Ok(TaskRole::SessionContainer))
             && classify_terminal(&state) == TerminalKind::Settled
         {
             return Err(RuntimeCoordinatorError::ParentSettled {
@@ -6050,16 +6105,32 @@ fn sync_foreground_root_running(
     supervisor: &mut AgentSupervisor,
     root_task: &TaskId,
 ) -> Result<(), RuntimeCoordinatorError> {
-    let state = supervisor
+    let task = supervisor
         .task(root_task)
-        .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?
-        .state()
-        .clone();
+        .ok_or_else(|| RuntimeCoordinatorError::Supervisor("task does not exist".into()))?;
+    let state = task.state().clone();
+    // A container begins a turn, not a worker. `start_task` refuses it on purpose
+    // (a container must never run as a worker), so the row and the in-memory task
+    // are advanced through the container-only admission instead. The persisted
+    // `running` here is still a historical execution label: it says the first turn
+    // opened, never that a worker is alive.
+    let is_container = task.role() == TaskRole::SessionContainer;
     match state {
         TaskState::Running => Ok(()),
+        TaskState::Queued if is_container => supervisor
+            .admit_session_container(root_task)
+            .map_err(RuntimeCoordinatorError::Supervisor),
         TaskState::Queued => supervisor
             .start_task(root_task)
             .map_err(RuntimeCoordinatorError::Supervisor),
+        TaskState::Paused(_) if is_container => {
+            supervisor
+                .resume_task(root_task)
+                .map_err(RuntimeCoordinatorError::Supervisor)?;
+            supervisor
+                .admit_session_container(root_task)
+                .map_err(RuntimeCoordinatorError::Supervisor)
+        }
         TaskState::Paused(_) => {
             supervisor
                 .resume_task(root_task)

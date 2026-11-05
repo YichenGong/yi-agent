@@ -503,6 +503,21 @@ pub enum TaskRole {
     SessionContainer,
 }
 
+impl TaskRole {
+    /// The stable label persisted in `tasks.role`.
+    ///
+    /// Matches the serde representation, so a row written by this build and one
+    /// decoded from JSON name a role identically. Readers still validate the label
+    /// rather than defaulting an unknown value, so a future role cannot be silently
+    /// read as `Execution` by an older binary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::SessionContainer => "session_container",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub id: TaskId,

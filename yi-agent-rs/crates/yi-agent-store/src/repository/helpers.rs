@@ -748,7 +748,7 @@ fn backfill_session_container_roles(transaction: &Transaction<'_>) -> Result<(),
          LEFT JOIN tasks t ON t.id = a.root_task_id
          ORDER BY a.idempotency_key",
     )?;
-    let rows: Vec<(
+    type AttachmentRow = (
         String,
         String,
         String,
@@ -756,7 +756,8 @@ fn backfill_session_container_roles(transaction: &Transaction<'_>) -> Result<(),
         Option<String>,
         Option<String>,
         Option<i64>,
-    )> = statement
+    );
+    let rows: Vec<AttachmentRow> = statement
         .query_map([], |row| {
             Ok((
                 row.get(0)?,

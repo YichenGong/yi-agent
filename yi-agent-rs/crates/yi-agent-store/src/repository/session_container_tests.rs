@@ -259,3 +259,99 @@ fn downgrade_to_v18(repository: &mut RuntimeRepository) {
         )
         .unwrap();
 }
+
+#[test]
+fn session_delegation_lifecycle_container_is_absent_from_worker_watchdog() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+    let (_session, root, attempt) = seed_legacy_v18(&mut repository, "thread:watchdog");
+    // The attachment path already wrote the active attempt's watchdog row; make
+    // the task look exactly like a quiet running worker (309s, no progress).
+    repository
+        .connection
+        .execute(
+            "UPDATE tasks SET state_json = 'running' WHERE id = ?1",
+            params![root.to_string()],
+        )
+        .unwrap();
+    repository
+        .connection
+        .execute(
+            "UPDATE attempt_watchdogs
+             SET last_meaningful_at = datetime('now', '-309 seconds'),
+                 last_meaningful_event_id = NULL
+             WHERE attempt_id = ?1",
+            params![attempt.to_string()],
+        )
+        .unwrap();
+
+    let candidates = repository.active_attempt_watchdogs().unwrap();
+    assert!(
+        candidates.iter().all(|task| task.task_id != root),
+        "a session container must never be a worker-budget candidate"
+    );
+
+    // The commit side must reach the same verdict from a stale candidate.
+    let outcome = repository
+        .record_watchdog_terminal_with_policy(
+            &root,
+            &attempt,
+            WatchdogTerminal::Stalled,
+            &WatchdogEvidence {
+                last_meaningful_event_id: None,
+                last_meaningful_at: chrono::Utc::now(),
+                elapsed_secs: 309,
+                current_wait: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, WatchdogTerminalOutcome::ForegroundContainer),
+        "a stale candidate must not settle the container: {outcome:?}"
+    );
+    assert_eq!(
+        repository
+            .connection
+            .query_row(
+                "SELECT state_json FROM tasks WHERE id = ?1",
+                params![root.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "running",
+        "a refusal must not rewrite the historical row"
+    );
+
+    // An execution in the same database is still an ordinary candidate, so the
+    // exclusion is about the role and not about the whole table.
+    let execution_session = RootSessionId::new();
+    let execution = TaskId::new();
+    let execution_attempt = AttemptId::new();
+    repository
+        .create_task_with_attempt(
+            &execution,
+            &execution_session,
+            &execution_attempt,
+            1,
+            "running",
+        )
+        .unwrap();
+    repository
+        .connection
+        .execute(
+            "UPDATE attempt_watchdogs
+             SET last_meaningful_at = datetime('now', '-309 seconds'),
+                 last_meaningful_event_id = NULL
+             WHERE attempt_id = ?1",
+            params![execution_attempt.to_string()],
+        )
+        .unwrap();
+    assert!(
+        repository
+            .active_attempt_watchdogs()
+            .unwrap()
+            .iter()
+            .any(|task| task.task_id == execution),
+        "a running execution must still be a watchdog candidate"
+    );
+}

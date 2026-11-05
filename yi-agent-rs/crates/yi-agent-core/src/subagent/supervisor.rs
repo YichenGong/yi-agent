@@ -1883,6 +1883,26 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Admits a session container for its current turn.
+    ///
+    /// The container has no worker to start, so [`Self::start_task`] must keep
+    /// refusing it; but its row still records "the first turn began", and the
+    /// in-memory task must agree with that row or the next hydration would read
+    /// two different states. This performs only the reducer transition.
+    pub fn admit_session_container(&mut self, task_id: &TaskId) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "task does not exist".to_string())?;
+        if task.role() != TaskRole::SessionContainer {
+            return Err("only a session container is admitted without a worker".into());
+        }
+        let attempt_id = task.active_attempt_id().clone();
+        self.reduce_task(task_id, TaskEvent::AdmissionGranted { attempt_id })?;
+        self.notify_update();
+        Ok(())
+    }
+
     /// Places a running task in its reducer-owned permission wait state.
     pub fn request_permission(
         &mut self,

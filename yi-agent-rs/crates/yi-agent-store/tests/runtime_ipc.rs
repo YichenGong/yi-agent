@@ -5125,10 +5125,13 @@ fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
     .unwrap();
 
     let repository = RuntimeRepository::open(&database).unwrap();
+    // A detached application root is the session container: detach closes the
+    // current binding, not the session (design §5.3). Only an explicit close
+    // writes the tombstone, so the sweep must leave it alone here.
     assert_eq!(
         repository.task_state(&detached_task).unwrap(),
-        "cancelled",
-        "a detached root's task can never progress"
+        "paused",
+        "a detached container is not a reclaimable orphan"
     );
     assert_eq!(
         repository.task_state(&orphan_task).unwrap(),
@@ -5145,8 +5148,8 @@ fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
     // an embedded daemon shares the terminal with the front end that started it.
     assert_eq!(
         daemon.reclaimed_orphans(),
-        2,
-        "the daemon must report the two tasks the sweep reclaimed"
+        1,
+        "only the unowned task is reclaimed; the detached container is not"
     );
     drop(daemon);
 }
