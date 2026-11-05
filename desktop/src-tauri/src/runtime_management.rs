@@ -1,0 +1,322 @@
+//! 壳侧的本地管理会话：凭据、epoch、pending 表与响应截获。
+//!
+//! 这个模块存在的理由只有一个：**管理帧不是业务帧**。把它们当业务帧处理会在
+//! 四个地方出错，而每一处都曾经是真实的误判来源：
+//!
+//! 1. **id 命名空间。** 管理响应带字符串 id，业务的权限响应按数字 id 路由。
+//!    混在一起时，一条迟到的管理响应会被 `rpc_respond` 当成某个权限请求的结果。
+//! 2. **广播可见性。** 管理响应携带 epoch 与授权结论。让它经 `app.emit` 出去，
+//!    页面不仅能读，还能代答。
+//! 3. **重放。** 业务 RPC 的自动重连重放队列对"查询"是对的，对"启动一个
+//!    runtime"是错的：重连重放会让一次用户操作启动两次。
+//! 4. **代际。** sidecar 重启后 epoch 必须变。旧 epoch 的迟到响应不得完成新
+//!    请求——判定依据是**发起时**记下的 epoch，不是响应里自报的那个。
+//!
+//! 因此这里不共享任何业务状态：pending 表是本模块私有的，key 是字符串 id，
+//! 每一项都记下发起时的 epoch，超时/关闭/换代一律清空而不是重发。
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use yi_agent_lifecycle::deadline::Deadline;
+
+/// 管理响应允许的最大字节数。
+///
+/// 与传输层既有的帧上限同量级：一个管理响应和业务帧一样不该无限大。超限直接
+/// 丢弃并让调用方超时，而不是截断——截断的 JSON 无法被任何一方安全解析。
+pub const MAX_MANAGEMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// 保留方法前缀。与 app-server 的常量同名同值，两侧各存一份是有意的：
+/// 壳不依赖 app-server（它是另一个进程），所以这个字符串是**线协议**的一部分，
+/// 由两侧的测试同时钉住。
+pub const RESERVED_PREFIX: &str = "_shell/";
+
+/// 要求 sidecar 打开本地管理面的环境变量。
+///
+/// 与 app-server 的 `MANAGEMENT_ENV` 同名同值：这是两侧的线协议约定，各存一份
+/// 是因为壳不依赖 app-server 的 crate。它是"是否尝试握手"的开关，不是鉴权。
+pub const MANAGEMENT_ENV: &str = "YI_AGENT_LOCAL_MANAGEMENT";
+
+/// 业务面写入口的守卫。
+///
+/// 在写 stdout 之前调用：任何 `_shell/` 方法一律拒绝，因此 WebView 无法伪造
+/// 私有帧，也无法把私有响应当作业务响应消费。
+pub fn reject_reserved_method(method: &str) -> Result<(), String> {
+    if method.starts_with(RESERVED_PREFIX) {
+        return Err("reserved native management method".into());
+    }
+    Ok(())
+}
+
+/// 一条待完成的管理请求。
+#[derive(Debug)]
+struct Pending {
+    /// 发起时的 epoch。完成时必须与它相等，否则说明这是上一代的迟到响应。
+    epoch: String,
+}
+
+/// 壳侧的本地管理会话。
+///
+/// `secret` 只经继承的 stdin 送给 sidecar：不进 argv、不进普通环境、不进
+/// WebView、也不进日志。它是唯一把"壳"和"任何别的本地进程"区分开的东西。
+pub struct ManagementSession {
+    secret: String,
+    epoch: String,
+    pending: Mutex<HashMap<String, Pending>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// 手写 `Debug`：秘密绝不能因为一次 `{:?}`（日志、panic 消息、错误上下文）
+/// 就出现在任何地方。`derive` 会把它原样打印，而这类打印通常发生在崩溃路径上，
+/// 恰恰是最容易被收集走的时刻。
+impl std::fmt::Debug for ManagementSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagementSession")
+            .field("secret", &"<redacted>")
+            .field("epoch", &self.epoch)
+            .field("pending", &self.pending_count())
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+impl ManagementSession {
+    /// 新建一次会话。`epoch` 由调用方为**每一次 sidecar 启动**新生成。
+    pub fn new(secret: impl Into<String>, epoch: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            epoch: epoch.into(),
+            pending: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 生成一个新的随机秘密。32 字节足够：它只在一条本机管道上活一次。
+    pub fn mint_secret() -> String {
+        uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// bootstrap 第一帧。
+    ///
+    /// 没有 `id`：它是凭据，不是请求。写成请求会诱使调用方拿一个 id 去 correlate
+    /// 一件不属于任何业务 id 的事。
+    pub fn bootstrap_frame(&self) -> serde_json::Value {
+        serde_json::json!({"secret": self.secret, "sidecar_epoch": self.epoch})
+    }
+
+    /// 构造一条管理请求。
+    pub fn request_frame(
+        &self,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "sidecar_epoch": self.epoch,
+            "secret": self.secret,
+            "params": params,
+        })
+    }
+
+    /// 登记一条请求。返回 `false` 表示会话已关闭，调用方不应写下这一帧。
+    pub fn register(&self, id: &str) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.insert(
+            id.to_string(),
+            Pending {
+                epoch: self.epoch.clone(),
+            },
+        );
+        true
+    }
+
+    /// 尝试截获一条来自 sidecar 的帧。
+    ///
+    /// 返回 `true` 表示"这条帧已被管理面消费，**不要**再广播给前端"。判据是
+    /// 字符串 id 命中本模块的 pending 表——不是"看起来像 jsonrpc"，那会把一条
+    /// 恰好带字符串 id 的业务响应也吞掉。
+    pub fn intercept(&self, frame: &serde_json::Value) -> bool {
+        let Some(id) = frame.get("id").and_then(|id| id.as_str()) else {
+            return false;
+        };
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(expected) = pending.remove(id) else {
+            return false;
+        };
+        // 迟到的上一代响应：仍然算"已消费"（不能让前端看到它），但调用方会
+        // 在自己那一侧的超时里得到结论，而不是在这里拿到一个旧结果。
+        let arrived_epoch = frame
+            .get("sidecar_epoch")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        arrived_epoch == expected.epoch
+    }
+
+    /// 一条请求超时。
+    ///
+    /// 只是把槽位清掉。**不**重发：这是启动 runtime 的请求，重发等于第二次启动。
+    pub fn timeout(&self, id: &str) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.remove(id);
+    }
+
+    /// 关闭会话，清空全部待完成请求。
+    ///
+    /// 用于 sidecar 退出/换代与应用退出：这些时刻再等旧响应没有意义，而且
+    /// 保留槽位会让下一次请求复用一个已经不存在的 id。
+    pub fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.clear();
+    }
+
+    /// 这个字符串 id 是否属于管理面。
+    ///
+    /// 用于拦住"页面替管理请求作答"：`rpc_respond` 收到一个命中的字符串 id 时
+    /// 必须拒绝，而不是把它写回 sidecar 当成结果。
+    pub fn owns(&self, id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
+    /// 当前待完成请求数。关闭后必须回到 0。
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// 一次管理请求的预算。准备可能要真的启动进程，所以不能按业务 RPC 的
+    /// 短超时来算。
+    pub fn deadline(&self) -> Deadline {
+        Deadline::after(MANAGEMENT_BUDGET)
+    }
+}
+
+/// 一次管理请求的预算。
+///
+/// 30 秒与传输层的启动预算同值：比它短会在一次合法的冷启动上超时，比它长只是
+/// 让用户在真失败时多等。两处必须同值，否则"壳说超时了但 runtime 其实起来了"
+/// 会变成一条无法解释的状态。
+pub const MANAGEMENT_BUDGET: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> ManagementSession {
+        ManagementSession::new("secret-1", "epoch-1")
+    }
+
+    #[test]
+    fn reserved_methods_cannot_be_forwarded() {
+        assert!(reject_reserved_method("_shell/prepare").is_err());
+        assert!(reject_reserved_method("_shell/newFutureMethod").is_err());
+        assert!(reject_reserved_method("thread/resume").is_ok());
+        // Near-misses stay business: a prefix check that is too eager would break
+        // real calls, and `_shell` alone is a name no method uses.
+        assert!(reject_reserved_method("_shell").is_ok());
+        assert!(reject_reserved_method("shell/prepare").is_ok());
+    }
+
+    #[test]
+    fn the_bootstrap_frame_carries_the_secret_and_no_id() {
+        let frame = session().bootstrap_frame();
+        assert_eq!(frame["secret"], "secret-1");
+        assert_eq!(frame["sidecar_epoch"], "epoch-1");
+        // A credential must not look like a request: an `id` here would invite
+        // correlating it with a business response.
+        assert!(frame.get("id").is_none());
+    }
+
+    #[test]
+    fn a_management_response_is_intercepted_before_the_frontend_sees_it() {
+        let session = session();
+        assert!(session.register("m-1"));
+        let response =
+            serde_json::json!({"jsonrpc": "2.0", "id": "m-1", "sidecar_epoch": "epoch-1"});
+        assert!(session.intercept(&response));
+        assert_eq!(session.pending_count(), 0, "the slot is consumed once");
+        // A second delivery of the same frame is not ours any more, so it would
+        // fall through to the frontend -- which is exactly why the shell must not
+        // re-deliver frames.
+        assert!(!session.intercept(&response));
+    }
+
+    #[test]
+    fn a_numeric_id_is_never_intercepted() {
+        let session = session();
+        assert!(session.register("1"));
+        // Business permission responses carry numbers. Reading them as strings
+        // would let a management id shadow a permission id.
+        let business = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}});
+        assert!(!session.intercept(&business));
+        assert_eq!(session.pending_count(), 1);
+    }
+
+    #[test]
+    fn a_late_response_from_an_old_epoch_is_consumed_but_not_accepted() {
+        let session = session();
+        assert!(session.register("m-1"));
+        let stale = serde_json::json!({"jsonrpc": "2.0", "id": "m-1", "sidecar_epoch": "epoch-0"});
+        // Consumed (the frontend must not see it) but not accepted (the caller
+        // gets its own timeout rather than a result from a previous generation).
+        assert!(!session.intercept(&stale));
+        assert_eq!(session.pending_count(), 0);
+    }
+
+    #[test]
+    fn a_timeout_clears_the_slot_without_resending() {
+        let session = session();
+        assert!(session.register("m-1"));
+        session.timeout("m-1");
+        assert_eq!(session.pending_count(), 0);
+        // Nothing was re-queued: a start must not become a second start.
+        assert!(session.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_drains_pending_and_refuses_new_requests() {
+        let session = session();
+        assert!(session.register("m-1"));
+        assert!(session.register("m-2"));
+        session.close();
+        assert_eq!(session.pending_count(), 0);
+        assert!(!session.register("m-3"), "a closed session takes no work");
+        assert!(session.is_closed());
+    }
+
+    #[test]
+    fn the_secret_is_never_printed() {
+        let session = session();
+        assert!(!format!("{session:?}").contains("secret-1"));
+        assert!(!format!("{:?}", session.bootstrap_frame()).is_empty());
+    }
+
+    #[test]
+    fn minted_secrets_do_not_repeat() {
+        let first = ManagementSession::mint_secret();
+        let second = ManagementSession::mint_secret();
+        assert_ne!(first, second);
+        assert!(first.len() >= 32);
+    }
+}

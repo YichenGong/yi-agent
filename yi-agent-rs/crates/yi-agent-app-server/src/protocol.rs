@@ -118,6 +118,15 @@ impl RpcError {
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self::new(-32602, msg)
     }
+
+    /// 命中保留命名空间（`_shell/*`）的方法。
+    ///
+    /// 单独一个构造函数而不是复用 `method_not_found`：这条拒绝的语义是"你不
+    /// 该碰这个前缀"，与"我不知道这个方法"不同。混在一起会让排障时看不出
+    /// 是一次权限拒绝还是一次拼写错误。
+    pub fn reserved_method() -> Self {
+        Self::new(-32601, "reserved native management method")
+    }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(-32603, msg)
     }

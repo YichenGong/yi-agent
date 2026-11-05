@@ -181,6 +181,9 @@ where
             // 纯 ws 入口没有 `--relay`:它是「别人连进来」的入口,不是中继客户
             // 端。手机端清单里的 session 一律为 null,与事实相符。
             None,
+            // 纯 ws 也没有本地 stdio,故没有本地管理面。远端客户端更不能拿到它:
+            // 那条通道的凭据是「第一帧」,而第一帧在网络上谁都能发。
+            None,
         )
         .await
     });
@@ -639,9 +642,16 @@ mod tests {
             .with_header("Authorization", format!("Bearer {token}"))
             .into_client_request()
             .unwrap();
-        let (ws, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .expect("authenticated ws connect");
+        // 握手必须有界。没有超时时，一条卡住的连接会把用例挂到 nextest 的
+        // 180s 强制终止，而那时现场只剩一个 enter_runtime 的栈——看不出是
+        // 握手没完成还是断言等错了帧，等于把一次可诊断的失败变成一次哑超时。
+        let (ws, _) = tokio::time::timeout(
+            crate::test_support::EVENT_WAIT,
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("the ws handshake must finish inside the test budget")
+        .expect("authenticated ws connect");
         ws
     }
 

@@ -142,6 +142,7 @@ pub(crate) mod turn;
 pub(crate) mod driver;
 pub(crate) mod foreground;
 
+pub(crate) mod local_management;
 pub(crate) mod transport;
 
 // `lib.rs` 以 `pub use server::{run, serve_stdio_with_relay}` 把它们交给 CLI，

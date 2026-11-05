@@ -43,7 +43,13 @@ where
     ))
     .await
     .unwrap();
-    let msg = ws.next().await.unwrap().unwrap();
+    // 有界读取：没有超时会把"服务端没回"变成一场哑挂起，而它最常见的成因
+    // （连接在握手后立刻被摘除）在栈上完全看不出来。
+    let msg = tokio::time::timeout(EVENT_WAIT, ws.next())
+        .await
+        .expect("initialize must be answered inside the test budget")
+        .unwrap()
+        .unwrap();
     let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(v["id"], 1, "initialize must respond with the request id");
 }

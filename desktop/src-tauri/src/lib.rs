@@ -14,6 +14,7 @@ mod remote;
 /// sidecar 也不能替一个已经退出的 App 续租。
 #[cfg(desktop)]
 pub mod runtime_lifecycle;
+pub mod runtime_management;
 mod runtime_manifest;
 #[cfg(desktop)]
 pub mod window;

@@ -687,6 +687,44 @@ impl Harness {
             false,
             None,
             Some(home.to_path_buf()),
+            None,
+        )
+    }
+
+    /// 带一个本地管理面的 harness。
+    ///
+    /// 管理面是**每连接一份**，所以它从这里进 `serve()`，而不是进程级全局：
+    /// 后者会让并行用例共用一条会话，bootstrap 只有第一个能成功。
+    pub(crate) async fn with_management(
+        handle: Arc<crate::server::local_management::ManagementHandle>,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            None,
+            Some(handle),
         )
     }
 
@@ -877,6 +915,7 @@ impl Harness {
             lead_agent_enabled,
             side_registry,
             None,
+            None,
         )
     }
 
@@ -894,6 +933,7 @@ impl Harness {
         lead_agent_enabled: bool,
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
         instance_home_override: Option<PathBuf>,
+        management: Option<Arc<crate::server::local_management::ManagementHandle>>,
     ) -> Self
     where
         F: Fn(
@@ -1042,6 +1082,7 @@ impl Harness {
             },
             build,
             scope,
+            management,
         ));
         Self {
             client_w,
@@ -3036,6 +3077,8 @@ mod assembly;
 mod image;
 #[cfg(test)]
 mod lead;
+#[cfg(test)]
+mod management;
 #[cfg(test)]
 mod model_settings;
 #[cfg(test)]

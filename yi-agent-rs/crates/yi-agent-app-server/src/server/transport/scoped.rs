@@ -199,6 +199,7 @@ where
         Scope::Admin,
         Some(listener),
         Some(relay_url),
+        managed_prepare_handle(),
     )
     .await
 }
@@ -245,8 +246,23 @@ where
         build_agent,
         // 桌面 stdio 是 Admin:所有既有 RPC 行为不变。
         Scope::Admin,
+        // 手工 `app-server` 与测试都没有壳标记,于是拿到 `None`,语义不变。
+        managed_prepare_handle(),
     )
     .await
+}
+
+/// 本地 stdio 的管理面:只有壳启动的 sidecar 才有。
+///
+/// 判断依据是壳在 spawn 前写进环境的标记。手工 `yi-agent app-server`、
+/// `--listen`、relay 桥与全部测试都拿不到它,因此**不会**凭空多出一个
+/// 「永远等在未认证状态」的会话——那种会话会把所有业务帧静默挡掉。
+fn managed_prepare_handle() -> Option<Arc<crate::server::local_management::ManagementHandle>> {
+    crate::server::local_management::requested_by_launcher().then(|| {
+        Arc::new(crate::server::local_management::ManagementHandle::new(
+            Arc::new(crate::server::local_management::ManagedPrepareBackend),
+        ))
+    })
 }
 pub(crate) fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
     yi_agent_relay::parse_relay_parts(relay_url)
@@ -268,6 +284,7 @@ pub(crate) async fn serve_scoped<R, W, F>(
     attachments: RuntimeAttachments,
     build_agent: F,
     client_scope: Scope,
+    management: Option<Arc<crate::server::local_management::ManagementHandle>>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -295,6 +312,7 @@ where
         client_scope,
         None,
         None,
+        management,
     )
     .await
 }
@@ -320,6 +338,7 @@ pub(crate) async fn serve_scoped_core<R, W, F>(
     client_scope: Scope,
     listener: Option<tokio::net::TcpListener>,
     relay_url: Option<String>,
+    management: Option<std::sync::Arc<crate::server::local_management::ManagementHandle>>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -447,6 +466,7 @@ where
         client_shell_authorizations,
         stdio_eof_rx.take(),
         relay_url_for_targets,
+        management,
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
