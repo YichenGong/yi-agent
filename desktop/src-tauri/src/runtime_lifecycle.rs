@@ -25,9 +25,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use yi_agent_lifecycle::deadline::{Clock, Deadline};
+use yi_agent_lifecycle::foreground::RootBindIntent;
+use yi_agent_lifecycle::production::{PrepareOutcome, PrepareRequest, RootIntentRequest};
 use yi_agent_lifecycle::types::{
     ArtifactIdentity, ClientKind, LeaseMode, OperationId, OperationStatus, ReclaimResult,
-    RestartPreview, RuntimeScope, RuntimeStatusSnapshot,
+    RestartPreview, RootAuthorization, RuntimeScope, RuntimeStatusSnapshot,
 };
 
 /// The global graceful budget for one quit, shared by every project.
@@ -42,6 +44,14 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(10);
 /// Budget for one acquisition. Acquisition only registers a lease; the runtime's
 /// own 30-second first-client window belongs to the daemon, not to this call.
 const ACQUIRE_BUDGET: Duration = yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT;
+
+/// Budget for starting the renewal thread.
+///
+/// Spawning a thread is local work, so this only has to cover opening the lease's
+/// record and handing it to the thread -- not a network round trip. It exists at
+/// all because the call crosses `spawn_blocking`, and an unbounded wait there would
+/// let a poisoned lock hold the whole acquisition open.
+const HEARTBEAT_START_BUDGET: Duration = Duration::from_secs(5);
 
 /// Budget for one read-only request (status, preview, operation poll).
 ///
@@ -103,19 +113,70 @@ impl Clock for TokioClock {
 /// answers on command. The real implementation drives the blocking client; a
 /// fake never touches a socket.
 pub trait ControlBackend: Send + Sync + 'static {
-    /// Register (and keep renewing) this shell's lease for one project.
+    /// Register this shell's lease for one project, without starting the renewal.
+    ///
+    /// Registration and renewal are separate calls because they are separate
+    /// facts, and the order between them is part of the contract: a heartbeat
+    /// started before a registration succeeds would renew a grant that does not
+    /// exist yet. Keeping them apart lets a caller (and a test) observe
+    /// `register` -> `start_heartbeat` rather than infer it.
     ///
     /// Returns whether a lease is actually now held. `Ok(false)` is the honest
     /// answer when no guardian serves this scope (embedded or legacy runtime):
     /// there is then nothing the quit could release, and registering the project
     /// anyway would make every exit report a reclaim failure that never happened.
-    fn acquire(
+    fn register(
         &self,
         client_run_id: &str,
         scope: &RuntimeScope,
         mode: LeaseMode,
         budget: Duration,
     ) -> io::Result<bool>;
+
+    /// Begin renewing the lease [`Self::register`] just took for `scope`.
+    ///
+    /// Fails when no registration is live: renewing nothing is not a success, and
+    /// a lease that is never renewed looks held until the guardian expires it,
+    /// which is exactly the window where the shell would believe it may work.
+    fn start_heartbeat(&self, scope: &RuntimeScope) -> io::Result<()>;
+
+    /// The mode of the lease currently held for `scope`, when one is held.
+    ///
+    /// `None` means "no lease, or it cannot be read". Readiness must check this
+    /// rather than remember the mode it asked for: a guardian may answer a
+    /// registration with a *queued* grant (`WaitingNextGeneration`) when a switch
+    /// is in progress, and a queued client is the one thing that is certainly not
+    /// ready.
+    fn lease_mode(&self, scope: &RuntimeScope) -> Option<LeaseMode> {
+        let _ = scope;
+        None
+    }
+
+    /// Whether the lease for `scope` is still honoured by its guardian.
+    ///
+    /// Fail-closed by default: a backend that cannot answer is not evidence of a
+    /// live lease, and readiness must never be inferred from silence.
+    fn lease_is_live(&self, scope: &RuntimeScope) -> bool {
+        let _ = scope;
+        false
+    }
+
+    /// Ask the guardian for a non-renewable root authorization on `scope`.
+    ///
+    /// Only reachable through the native gate: a WebView must not be able to ask
+    /// for a root, because the answer is the capability a tool process runs under.
+    fn authorize_root(
+        &self,
+        scope: &RuntimeScope,
+        intent: &RootBindIntent,
+        budget: Duration,
+    ) -> io::Result<RootAuthorization> {
+        let _ = (scope, intent, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot authorize a root",
+        ))
+    }
 
     /// Release the project and wait for the verified teardown, bounded by
     /// `budget`. A result that did not observe a stop must say `stopped: false`.
@@ -248,7 +309,7 @@ impl Default for SocketBackend {
 }
 
 impl ControlBackend for SocketBackend {
-    fn acquire(
+    fn register(
         &self,
         client_run_id: &str,
         scope: &RuntimeScope,
@@ -268,7 +329,7 @@ impl ControlBackend for SocketBackend {
         leases.remove(&scope.key);
 
         let deadline = Deadline::after(budget);
-        let mut lease = match yi_agent_lifecycle::client::FrontendLease::register_if_served(
+        let lease = match yi_agent_lifecycle::client::FrontendLease::register_if_served(
             &path,
             client_run_id.to_string(),
             ClientKind::App,
@@ -281,9 +342,40 @@ impl ControlBackend for SocketBackend {
             None => return Ok(false),
             Some(lease) => lease,
         };
-        lease.start_heartbeat()?;
         leases.insert(scope.key.clone(), Arc::new(Mutex::new(lease)));
         Ok(true)
+    }
+
+    fn start_heartbeat(&self, scope: &RuntimeScope) -> io::Result<()> {
+        let lease = self.lease_for(scope)?;
+        let mut lease = lock_lease(&lease)?;
+        lease.start_heartbeat()
+    }
+
+    fn lease_mode(&self, scope: &RuntimeScope) -> Option<LeaseMode> {
+        let lease = self.lease_for(scope).ok()?;
+        let lease = lock_lease(&lease).ok()?;
+        Some(lease.grant().mode)
+    }
+
+    fn lease_is_live(&self, scope: &RuntimeScope) -> bool {
+        match self.lease_for(scope) {
+            Ok(lease) => lock_lease(&lease)
+                .map(|lease| !lease.is_lost())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    fn authorize_root(
+        &self,
+        scope: &RuntimeScope,
+        intent: &RootBindIntent,
+        budget: Duration,
+    ) -> io::Result<RootAuthorization> {
+        let lease = self.lease_for(scope)?;
+        let lease = lock_lease(&lease)?;
+        lease.authorize_root(intent, &Deadline::after(budget))
     }
 
     fn lease_for_scope(
@@ -434,6 +526,193 @@ fn poisoned() -> io::Error {
     io::Error::other("the lifecycle lease table is poisoned")
 }
 
+// ---------------------------------------------------------------------------
+// Project acquisition: what the user is told vs what the shell actually holds
+// ---------------------------------------------------------------------------
+
+/// Where a project's preparation stands, as the page is allowed to see it.
+///
+/// A judgement, not a boolean: `starting` is not `failed`, and `unknown` is not
+/// `blocked`. Collapsing them into `Result<(), _>` is what once made "the runtime
+/// is still starting" render as "your project is broken", and it is also what made
+/// the page believe a lease existed because a call had returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AcquireState {
+    /// A preparation for this scope is in flight. Nothing is held yet.
+    Starting,
+    /// The shell holds a live, renewing lease and the runtime identity matches
+    /// this build. This is `lifecycleReady` only -- every session still needs its
+    /// own `rootReady` before it may run.
+    ManagedReady,
+    /// An unmanaged runtime is serving this project. Only an explicit user choice
+    /// may use it; the shell does not silently adopt it.
+    LegacyChoiceRequired,
+    /// A condition failed: incompatibility, identity mismatch, a refused lease.
+    /// Never to be downgraded to an embedded runtime.
+    Blocked,
+    /// Something could not be verified, or the answer was lost. Read-only
+    /// reconciliation -- not evidence of failure and not evidence of success.
+    Unknown,
+}
+
+/// What a caller may do next, in terms the page can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RetryClass {
+    /// Retrying later is safe: the attempt never started any runtime work.
+    Backoff,
+    /// Retrying now would duplicate a side effect that is already underway.
+    DoNotRetry,
+    /// Requires a user decision (version switch, legacy adoption, migration).
+    UserAction,
+    /// Nothing is wrong; wait for the in-flight attempt to finish.
+    WhenIdle,
+}
+
+/// The only project-acquisition shape that crosses to the WebView.
+///
+/// Deliberately carries no grant, no capability and no daemon path: the page needs
+/// to know *whether* it may expect a runtime, not what credential proves it. The
+/// id names this attempt so a late answer cannot be mistaken for a newer one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAcquireView {
+    pub scope_key: String,
+    pub attempt_id: String,
+    pub state: AcquireState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub retry: RetryClass,
+}
+
+/// What one project's preparation actually produced, kept apart from the view.
+///
+/// `held` and `ready` are two different facts and are stored as two different
+/// fields on purpose:
+///
+/// * `held` is set the moment a lease is registered, and survives a later failure
+///   (a root that cannot be authorized does not revoke the lease).
+/// * `ready` is only set after the heartbeat is confirmed *and* the identity is
+///   still current. Losing either clears it.
+///
+/// A `blocked` view with `held == true` is a normal state: a compatible build
+/// mismatch may preview and confirm a switch using the lease it holds, while
+/// business work stays shut until the switch completes.
+#[derive(Clone, Debug)]
+pub struct ProjectState {
+    pub scope: RuntimeScope,
+    /// The attempt whose result this state describes. A result from any other
+    /// attempt is discarded rather than applied.
+    pub attempt_id: String,
+    pub view: ProjectAcquireView,
+    pub held: bool,
+    pub ready: bool,
+}
+
+/// One in-flight acquisition per scope, so concurrent callers share one attempt.
+type AttemptSlot = tokio::sync::Mutex<()>;
+
+/// Where the current local management session comes from.
+///
+/// A lookup rather than a stored handle: the session is created when the sidecar
+/// spawns and replaced on every restart, while the manager is installed before the
+/// first spawn. Handing the channel one session at construction would leave it
+/// talking to a generation that has already exited.
+pub trait ManagementSessions: Send + Sync + 'static {
+    fn current(&self) -> Option<Arc<crate::runtime_management::ManagementSession>>;
+    fn transport(&self) -> Arc<dyn crate::runtime_management::PrepareTransport>;
+}
+
+/// The preparation channel the packaged shell uses: the private stdio management
+/// session of its own local sidecar.
+pub struct LocalPrepareChannel {
+    sessions: Arc<dyn ManagementSessions>,
+    manager: std::sync::Weak<DesktopRuntimeManager>,
+}
+
+impl LocalPrepareChannel {
+    pub fn new(sessions: Arc<dyn ManagementSessions>) -> Self {
+        Self {
+            sessions,
+            manager: std::sync::Weak::new(),
+        }
+    }
+
+    /// Points the channel at the manager whose epoch it should record.
+    pub fn with_manager(mut self, manager: std::sync::Weak<DesktopRuntimeManager>) -> Self {
+        self.manager = manager;
+        self
+    }
+}
+
+impl PrepareChannel for LocalPrepareChannel {
+    fn prepare(&self, request: PrepareRequest, budget: Duration) -> io::Result<PrepareOutcome> {
+        // Read the session now, not at construction: a sidecar restart between two
+        // preparations must be visible here, and the old session's pending table is
+        // already closed by then.
+        let Some(session) = self.sessions.current() else {
+            return Ok(PrepareOutcome::Unknown {
+                reason: "this shell has no local management session".to_string(),
+            });
+        };
+        let transport = self.sessions.transport();
+        let reply = session
+            .prepare(transport.as_ref(), &request, budget)
+            .map_err(io::Error::other)?;
+        let frame = match reply {
+            crate::runtime_management::ManagementReply::Answered(frame) => frame,
+            // No answer is `Unknown`, not `Blocked`: the project may well be fine,
+            // and calling it blocked would invite a retry that starts it twice.
+            crate::runtime_management::ManagementReply::Abandoned => {
+                return Ok(PrepareOutcome::Unknown {
+                    reason: "the local management channel did not answer the preparation"
+                        .to_string(),
+                });
+            }
+        };
+        if let Some(error) = frame.get("error").and_then(|error| error.as_str()) {
+            return Ok(PrepareOutcome::Blocked {
+                reason: error.to_string(),
+            });
+        }
+        // The epoch the session fixed is the only one this shell may trust: a frame
+        // reporting a different one describes a generation we are not talking to, so
+        // its result is not ours to apply.
+        if let Some(epoch) = frame.get("sidecar_epoch").and_then(|epoch| epoch.as_str()) {
+            if epoch != session.epoch() {
+                return Ok(PrepareOutcome::Unknown {
+                    reason: "the preparation answer came from a different sidecar generation"
+                        .to_string(),
+                });
+            }
+            if let Some(manager) = self.manager.upgrade() {
+                manager.note_sidecar_epoch(epoch);
+            }
+        }
+        let Some(result) = frame.get("result") else {
+            return Ok(PrepareOutcome::Unknown {
+                reason: "the preparation answer carried neither a result nor an error".to_string(),
+            });
+        };
+        serde_json::from_value(result.clone()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the preparation outcome was not understood: {error}"),
+            )
+        })
+    }
+}
+
+/// Sends one `_shell/prepare` to this shell's own sidecar and waits for its answer.
+///
+/// A trait so the state machine can be tested without a sidecar: the transitions
+/// (register only after Connected, hold before heartbeat, release on an abandoned
+/// attempt) are what must be pinned, and none of them needs a process.
+pub trait PrepareChannel: Send + Sync + 'static {
+    fn prepare(&self, request: PrepareRequest, budget: Duration) -> io::Result<PrepareOutcome>;
+}
+
 /// Owns this App run's identity and its per-project registrations.
 pub struct DesktopRuntimeManager {
     client_run_id: String,
@@ -462,6 +741,32 @@ pub struct DesktopRuntimeManager {
     /// answer to "did my restart happen?". The id is chosen before the click, so a
     /// lost response is recovered by querying this id -- never by clicking again.
     operations: Mutex<BTreeMap<String, OperationId>>,
+    /// Per-scope acquisition result: what was attempted, what is held, what is
+    /// ready.
+    ///
+    /// Kept apart from `projects` (which answers "does the quit have something to
+    /// release") because the two must be able to disagree. A compatible build
+    /// mismatch holds a lease while remaining blocked; a lease that was just
+    /// registered is held but not yet ready.
+    states: Mutex<BTreeMap<String, ProjectState>>,
+    /// Serialises attempts per scope so two concurrent ensure calls share one
+    /// preparation instead of racing to start the runtime twice.
+    attempts: Mutex<BTreeMap<String, Arc<AttemptSlot>>>,
+    /// The local management channel, when this shell has one.
+    ///
+    /// `None` is a real state: a build with no sidecar (or a test that only
+    /// exercises the lease half) cannot prepare anything, and `ensure_project`
+    /// reports that as blocked rather than inventing a runtime.
+    ///
+    /// Behind a lock rather than a plain field because the channel needs a
+    /// `Weak` handle on this very manager (to record the sidecar epoch it sees),
+    /// and the manager must therefore exist before the channel does.
+    prepare: Mutex<Option<Arc<dyn PrepareChannel>>>,
+    /// The authenticated epoch of the sidecar this shell bootstrapped.
+    ///
+    /// Set from the bootstrap answer, never from an incoming request: a caller
+    /// that could name its own epoch could make a stale sidecar look current.
+    sidecar_epoch: Mutex<Option<String>>,
 }
 
 impl DesktopRuntimeManager {
@@ -482,6 +787,10 @@ impl DesktopRuntimeManager {
             artifact: None,
             known: Mutex::new(BTreeMap::new()),
             operations: Mutex::new(BTreeMap::new()),
+            states: Mutex::new(BTreeMap::new()),
+            attempts: Mutex::new(BTreeMap::new()),
+            prepare: Mutex::new(None),
+            sidecar_epoch: Mutex::new(None),
         }
     }
 
@@ -492,6 +801,23 @@ impl DesktopRuntimeManager {
     pub fn with_artifact(mut self, artifact: Option<ArtifactIdentity>) -> Self {
         self.artifact = artifact;
         self
+    }
+
+    /// The same manager, preparing projects over a local management channel.
+    pub fn with_prepare(self, prepare: Arc<dyn PrepareChannel>) -> Self {
+        self.attach_prepare(prepare);
+        self
+    }
+
+    /// Installs the preparation channel after the manager is already shared.
+    ///
+    /// Needed because the real channel holds a `Weak` handle on this manager: it
+    /// records the sidecar epoch, and the epoch belongs to the manager, so the
+    /// manager has to exist first.
+    pub fn attach_prepare(&self, prepare: Arc<dyn PrepareChannel>) {
+        if let Ok(mut guard) = self.prepare.lock() {
+            *guard = Some(prepare);
+        }
     }
 
     /// The artifact this shell expects, when it could verify one.
@@ -678,7 +1004,7 @@ impl DesktopRuntimeManager {
         let id = self.client_run_id.clone();
         let scope_for_io = scope.clone();
         let held = run_bounded(ACQUIRE_BUDGET, move || {
-            backend.acquire(&id, &scope_for_io, mode, ACQUIRE_BUDGET)
+            backend.register(&id, &scope_for_io, mode, ACQUIRE_BUDGET)
         })
         .await
         .map_err(|error| {
@@ -692,13 +1018,7 @@ impl DesktopRuntimeManager {
         // flight would otherwise be followed by a lease nobody releases.
         if self.quitting.load(Ordering::SeqCst) {
             if held {
-                let backend = Arc::clone(&self.backend);
-                let id = self.client_run_id.clone();
-                let scope_for_io = scope.clone();
-                let _ = run_bounded(ACQUIRE_BUDGET, move || {
-                    backend.release(&id, &scope_for_io, ACQUIRE_BUDGET)
-                })
-                .await;
+                self.release_quietly(&scope).await;
             }
             return Err(io::Error::other(
                 "the app began quitting while this project was being registered",
@@ -712,11 +1032,627 @@ impl DesktopRuntimeManager {
             return Ok(());
         }
 
+        // Recorded *before* the heartbeat: from this moment the quit has something
+        // to release, and a heartbeat failure must not make the lease disappear
+        // from the drain's point of view.
         self.projects
             .lock()
             .map_err(|_| poisoned())?
-            .insert(key, scope);
+            .insert(key.clone(), scope.clone());
+
+        let backend = Arc::clone(&self.backend);
+        let scope_for_io = scope.clone();
+        if let Err(error) = run_bounded(HEARTBEAT_START_BUDGET, move || {
+            backend.start_heartbeat(&scope_for_io)
+        })
+        .await
+        {
+            // A lease that nobody renews will be expired by the guardian, but until
+            // then the shell must not pretend it is usable. Dropping the record
+            // makes the state honest and leaves the reclaim to the guardian's own
+            // expiry, which is already the designed outcome for an abandoned client.
+            self.projects.lock().map_err(|_| poisoned())?.remove(&key);
+            self.release_quietly(&scope).await;
+            return Err(io::Error::other(format!(
+                "project {} was registered but its lease cannot be renewed: {error}",
+                scope.key
+            )));
+        }
         Ok(())
+    }
+
+    /// Releases one scope, ignoring every error.
+    ///
+    /// Used on paths where the caller is already reporting a failure: the release
+    /// is best-effort cleanup, and its error must not replace the reason the
+    /// attempt was abandoned.
+    async fn release_quietly(&self, scope: &RuntimeScope) {
+        let backend = Arc::clone(&self.backend);
+        let id = self.client_run_id.clone();
+        let scope_for_io = scope.clone();
+        let _ = run_bounded(ACQUIRE_BUDGET, move || {
+            backend.release(&id, &scope_for_io, ACQUIRE_BUDGET)
+        })
+        .await;
+    }
+
+    /// Prepares one project and, only if that succeeds, takes a real lease.
+    ///
+    /// The three steps are ordered because each depends on the previous one being
+    /// true, not merely having been requested:
+    ///
+    /// 1. `prepare` — is there a managed runtime for this scope, and is it ours?
+    /// 2. `register` — the guardian grants a lease; the shell records it as held.
+    /// 3. `start_heartbeat` — the lease is being renewed; only then is it ready.
+    ///
+    /// `managedReady` is reached only when all three hold *and* the identity is
+    /// still the one preparation observed. Any failure leaves `ready == false`;
+    /// a held lease stays held (and stays in the quit barrier) unless the attempt
+    /// itself is abandoned.
+    pub async fn ensure_project(
+        &self,
+        scope: &RuntimeScope,
+        budget: Duration,
+    ) -> Result<ProjectAcquireView, String> {
+        if self.quitting.load(Ordering::SeqCst) {
+            return Ok(blocked_view(
+                &scope.key,
+                "",
+                "the app is quitting; no project may be prepared",
+                RetryClass::DoNotRetry,
+            ));
+        }
+
+        // One attempt per scope at a time. Two windows opening the same project
+        // must share one preparation, not start the runtime twice.
+        let slot = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .map_err(|_| "the project attempt table is poisoned".to_string())?;
+            Arc::clone(
+                attempts
+                    .entry(scope.key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _serialised = slot.lock().await;
+
+        // Already there: a repeat call must not prepare or register again.
+        if let Some(state) = self.state_for(&scope.key) {
+            if state.ready && self.backend.lease_is_live(scope) {
+                return Ok(state.view);
+            }
+        }
+
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        // Admission is published before any work starts, so a caller arriving now
+        // sees `starting` rather than a stale `blocked` from the previous attempt.
+        self.record_view(
+            scope,
+            &attempt_id,
+            false,
+            false,
+            starting_view(&scope.key, &attempt_id),
+        );
+
+        let channel = self.prepare.lock().ok().and_then(|guard| guard.clone());
+        let Some(channel) = channel else {
+            return Ok(self.settle(
+                scope,
+                &attempt_id,
+                blocked_view(
+                    &scope.key,
+                    &attempt_id,
+                    "this shell has no local management channel to prepare a project",
+                    RetryClass::DoNotRetry,
+                ),
+            ));
+        };
+        let Some(expected) = self.artifact.clone() else {
+            // No verified artifact means the build identity cannot be compared, and
+            // a runtime whose build nobody can name must not be declared ready.
+            return Ok(self.settle(
+                scope,
+                &attempt_id,
+                blocked_view(
+                    &scope.key,
+                    &attempt_id,
+                    "this build has no verified runtime artifact, so its runtime cannot be identified",
+                    RetryClass::DoNotRetry,
+                ),
+            ));
+        };
+
+        let request = PrepareRequest {
+            scope: scope.clone(),
+            expected: expected.clone(),
+            attempt_id: attempt_id.clone(),
+        };
+        let prepared = {
+            let channel = Arc::clone(&channel);
+            let request = request.clone();
+            tokio::task::spawn_blocking(move || channel.prepare(request, budget)).await
+        };
+        let outcome = match prepared {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                return Ok(self.settle(
+                    scope,
+                    &attempt_id,
+                    unknown_view(
+                        &scope.key,
+                        &attempt_id,
+                        format!("the preparation channel did not answer: {error}"),
+                    ),
+                ));
+            }
+            Err(join) => {
+                return Ok(self.settle(
+                    scope,
+                    &attempt_id,
+                    unknown_view(
+                        &scope.key,
+                        &attempt_id,
+                        format!("the preparation task failed: {join}"),
+                    ),
+                ));
+            }
+        };
+
+        // Whether this outcome permits taking a lease at all. A version mismatch
+        // that is protocol-compatible may hold one for the existing preview and
+        // confirm flow; it still may not be ready.
+        let lease_permitted = match &outcome {
+            PrepareOutcome::Connected(identity) => {
+                if identity.scope_key != scope.key {
+                    return Ok(self.settle(
+                        scope,
+                        &attempt_id,
+                        blocked_view(
+                            &scope.key,
+                            &attempt_id,
+                            format!(
+                                "the runtime answered for a different scope ({})",
+                                identity.scope_key
+                            ),
+                            RetryClass::DoNotRetry,
+                        ),
+                    ));
+                }
+                true
+            }
+            PrepareOutcome::VersionChoiceRequired(identity) => {
+                if identity.scope_key != scope.key {
+                    return Ok(self.settle(
+                        scope,
+                        &attempt_id,
+                        blocked_view(
+                            &scope.key,
+                            &attempt_id,
+                            format!(
+                                "the runtime answered for a different scope ({})",
+                                identity.scope_key
+                            ),
+                            RetryClass::DoNotRetry,
+                        ),
+                    ));
+                }
+                // Only a verified-compatible control protocol earns a held lease:
+                // preview/confirm speak it, and nothing else may start.
+                protocols_overlap(&expected, identity)
+            }
+            _ => false,
+        };
+
+        let mut held = false;
+        if lease_permitted {
+            let backend = Arc::clone(&self.backend);
+            let id = self.client_run_id.clone();
+            let scope_for_io = scope.clone();
+            let registered = run_bounded(budget, move || {
+                backend.register(&id, &scope_for_io, LeaseMode::Business, budget)
+            })
+            .await;
+            match registered {
+                Ok(true) => {
+                    // Held is recorded immediately: from here on a quit must release
+                    // this lease even if everything after it fails.
+                    held = true;
+                    if let Ok(mut guard) = self.projects.lock() {
+                        guard.insert(scope.key.clone(), scope.clone());
+                    }
+                }
+                Ok(false) => {
+                    return Ok(self.settle(
+                        scope,
+                        &attempt_id,
+                        unknown_view(
+                            &scope.key,
+                            &attempt_id,
+                            "the runtime answered a preparation but no guardian accepted a lease",
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(self.settle(
+                        scope,
+                        &attempt_id,
+                        blocked_view(
+                            &scope.key,
+                            &attempt_id,
+                            format!("the runtime refused a lease: {error}"),
+                            RetryClass::Backoff,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // A quit may have started while registration was in flight. The lease is
+        // released at once and the result is refused, so a late attempt cannot
+        // hand the user a runtime the quit is already reclaiming.
+        if held && self.quitting.load(Ordering::SeqCst) {
+            self.release_quietly(scope).await;
+            self.forget_held(&scope.key);
+            return Ok(self.settle(
+                scope,
+                &attempt_id,
+                blocked_view(
+                    &scope.key,
+                    &attempt_id,
+                    "the app began quitting while this project was being registered",
+                    RetryClass::DoNotRetry,
+                ),
+            ));
+        }
+
+        // The view for a non-ready outcome is decided before the heartbeat, so a
+        // blocked project never touches a renewal it does not need.
+        let not_ready = match &outcome {
+            PrepareOutcome::Connected(identity) => {
+                let _ = identity;
+                None
+            }
+            PrepareOutcome::VersionChoiceRequired(identity) => Some(blocked_view(
+                &scope.key,
+                &attempt_id,
+                format!(
+                    "a runtime of version {} is serving this project; choosing to switch updates it",
+                    identity
+                        .daemon_display_version
+                        .clone()
+                        .unwrap_or_else(|| "an unknown build".to_string())
+                ),
+                RetryClass::UserAction,
+            )),
+            PrepareOutcome::LegacyChoiceRequired { reason } => Some(ProjectAcquireView {
+                scope_key: scope.key.clone(),
+                attempt_id: attempt_id.clone(),
+                state: AcquireState::LegacyChoiceRequired,
+                reason: Some(reason.clone()),
+                retry: RetryClass::UserAction,
+            }),
+            PrepareOutcome::Blocked { reason } => Some(blocked_view(
+                &scope.key,
+                &attempt_id,
+                reason.clone(),
+                RetryClass::Backoff,
+            )),
+            PrepareOutcome::Unknown { reason } => Some(unknown_view(
+                &scope.key,
+                &attempt_id,
+                reason.clone(),
+            )),
+        };
+
+        // Renewal starts the moment a lease is held, not when readiness is decided.
+        // A compatible version mismatch keeps its lease while blocked so that
+        // preview and confirm can speak to the runtime the user is deciding about --
+        // but a person may take minutes to read that, and `LEASE_EXPIRY` is seconds.
+        // Renewing only on the ready path would hand the switch flow a lease that
+        // had already expired.
+        if held {
+            let backend = Arc::clone(&self.backend);
+            let scope_for_io = scope.clone();
+            if let Err(error) = run_bounded(HEARTBEAT_START_BUDGET, move || {
+                backend.start_heartbeat(&scope_for_io)
+            })
+            .await
+            {
+                self.release_quietly(scope).await;
+                self.forget_held(&scope.key);
+                return Ok(self.settle(
+                    scope,
+                    &attempt_id,
+                    blocked_view(
+                        &scope.key,
+                        &attempt_id,
+                        format!("the lease was granted but could not be renewed: {error}"),
+                        RetryClass::Backoff,
+                    ),
+                ));
+            }
+        }
+
+        if let Some(view) = not_ready {
+            return Ok(self.settle_with(scope, &attempt_id, held, view));
+        }
+
+        // A queued grant is not a business lease. The guardian hands one out while a
+        // switch is in progress, and treating it as ready would let work run on a
+        // runtime that is actively being replaced. The lease is still the quit's to
+        // release, so it stays held.
+        if self.backend.lease_mode(scope) != Some(LeaseMode::Business) {
+            self.forget_ready(&scope.key);
+            return Ok(self.settle_with(
+                scope,
+                &attempt_id,
+                held,
+                blocked_view(
+                    &scope.key,
+                    &attempt_id,
+                    "the runtime queued this client behind a switch instead of granting a business lease",
+                    RetryClass::Backoff,
+                ),
+            ));
+        }
+
+        // Last gate: the identity must still be the one preparation saw. A daemon
+        // that was replaced between the answer and this point is a different
+        // runtime, and ready must not describe it.
+        if !self.identity_is_current(scope, &outcome, budget).await {
+            self.forget_ready(&scope.key);
+            return Ok(self.settle_with(
+                scope,
+                &attempt_id,
+                held,
+                unknown_view(
+                    &scope.key,
+                    &attempt_id,
+                    "the runtime identity changed after the lease was taken",
+                ),
+            ));
+        }
+        if !self.backend.lease_is_live(scope) {
+            self.forget_ready(&scope.key);
+            return Ok(self.settle_with(
+                scope,
+                &attempt_id,
+                held,
+                blocked_view(
+                    &scope.key,
+                    &attempt_id,
+                    "the granted lease is not being renewed, so this project is not ready",
+                    RetryClass::Backoff,
+                ),
+            ));
+        }
+
+        Ok(self.settle_with(
+            scope,
+            &attempt_id,
+            held,
+            ProjectAcquireView {
+                scope_key: scope.key.clone(),
+                attempt_id: attempt_id.clone(),
+                state: AcquireState::ManagedReady,
+                reason: None,
+                retry: RetryClass::DoNotRetry,
+            },
+        ))
+    }
+
+    /// Whether the runtime serving `scope` is still the generation preparation saw.
+    ///
+    /// Only a positive answer counts. A status read that fails or times out leaves
+    /// the caller unable to prove sameness, and "cannot prove" is not "current".
+    async fn identity_is_current(
+        &self,
+        scope: &RuntimeScope,
+        outcome: &PrepareOutcome,
+        budget: Duration,
+    ) -> bool {
+        let PrepareOutcome::Connected(prepared) = outcome else {
+            return false;
+        };
+        let backend = Arc::clone(&self.backend);
+        let scope_for_io = scope.clone();
+        let read = run_bounded(budget, move || backend.status(&scope_for_io, budget)).await;
+        match read {
+            Ok(Some(snapshot)) => {
+                snapshot.identity.daemon_instance_id == prepared.daemon_instance_id
+                    && snapshot.identity.scope_key == prepared.scope_key
+            }
+            _ => false,
+        }
+    }
+
+    /// Records a view, keeping the previous held/ready flags unless told otherwise.
+    fn record_view(
+        &self,
+        scope: &RuntimeScope,
+        attempt_id: &str,
+        held: bool,
+        ready: bool,
+        view: ProjectAcquireView,
+    ) {
+        if let Ok(mut guard) = self.states.lock() {
+            guard.insert(
+                scope.key.clone(),
+                ProjectState {
+                    scope: scope.clone(),
+                    attempt_id: attempt_id.to_string(),
+                    view,
+                    held,
+                    ready,
+                },
+            );
+        }
+    }
+
+    /// Settles an attempt that holds nothing.
+    fn settle(
+        &self,
+        scope: &RuntimeScope,
+        attempt_id: &str,
+        view: ProjectAcquireView,
+    ) -> ProjectAcquireView {
+        // A held lease from an earlier attempt is *not* cleared here: this
+        // attempt's failure says nothing about a lease another attempt took.
+        let (held, ready) = self
+            .state_for(&scope.key)
+            .map(|state| (state.held, state.ready))
+            .unwrap_or((false, false));
+        self.record_view(scope, attempt_id, held, ready, view.clone());
+        view
+    }
+
+    /// Settles an attempt whose own outcome decides what is held.
+    fn settle_with(
+        &self,
+        scope: &RuntimeScope,
+        attempt_id: &str,
+        held: bool,
+        view: ProjectAcquireView,
+    ) -> ProjectAcquireView {
+        let ready = view.state == AcquireState::ManagedReady;
+        self.record_view(scope, attempt_id, held, ready, view.clone());
+        view
+    }
+
+    /// Records that this scope no longer holds a lease.
+    ///
+    /// Both halves must go: `states` is what readiness reads, and `projects` is
+    /// what the quit releases. Clearing only the first would leave the drain
+    /// asking a runtime to release a lease this shell already released.
+    fn forget_held(&self, scope_key: &str) {
+        if let Ok(mut guard) = self.states.lock() {
+            if let Some(state) = guard.get_mut(scope_key) {
+                state.held = false;
+                state.ready = false;
+            }
+        }
+        if let Ok(mut guard) = self.projects.lock() {
+            guard.remove(scope_key);
+        }
+    }
+
+    fn forget_ready(&self, scope_key: &str) {
+        if let Ok(mut guard) = self.states.lock() {
+            if let Some(state) = guard.get_mut(scope_key) {
+                state.ready = false;
+            }
+        }
+    }
+
+    /// One scope's acquisition state, if it has been attempted.
+    fn state_for(&self, scope_key: &str) -> Option<ProjectState> {
+        self.project_state(scope_key)
+    }
+
+    /// One scope's acquisition state, if it has been attempted.
+    pub fn project_state(&self, scope_key: &str) -> Option<ProjectState> {
+        self.states
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(scope_key).cloned())
+    }
+
+    /// Whether `scope` reached `lifecycleReady` for this attempt.
+    ///
+    /// Re-checked against the live lease: a heartbeat that died after ready was
+    /// recorded must not keep authorizing work, because the guardian has by then
+    /// withdrawn the client.
+    pub fn is_lifecycle_ready(&self, scope: &RuntimeScope) -> bool {
+        let ready = self
+            .project_state(&scope.key)
+            .map(|state| state.ready)
+            .unwrap_or(false);
+        if !ready {
+            return false;
+        }
+        if !self.backend.lease_is_live(scope) {
+            self.forget_ready(&scope.key);
+            return false;
+        }
+        true
+    }
+
+    /// Notes the epoch of the sidecar this shell is currently talking to.
+    ///
+    /// The epoch is what makes a root intent attributable to one app-server
+    /// generation: a request forwarded by a previous sidecar must not be honoured
+    /// by the next one, even though both speak for the same App run.
+    pub fn note_sidecar_epoch(&self, epoch: &str) {
+        if let Ok(mut guard) = self.sidecar_epoch.lock() {
+            *guard = Some(epoch.to_string());
+        }
+    }
+
+    /// Turns one session's intent into a root authorization, or refuses.
+    ///
+    /// Every condition here is a precondition for the *capability*, not a
+    /// convenience: a live lease (the runtime still counts this shell), lifecycle
+    /// readiness (the identity is confirmed), the authenticated sidecar epoch (the
+    /// request comes from the session we bootstrapped), and the App's own client
+    /// run id (nobody may act for another client). Deliberately not a Tauri
+    /// command: the page must never be able to ask for a root capability.
+    pub async fn authorize_intent(
+        &self,
+        request: RootIntentRequest,
+        deadline: Deadline,
+    ) -> Result<RootAuthorization, String> {
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err("the app is quitting; no root may be authorized".to_string());
+        }
+        if request.client_run_id != self.client_run_id {
+            return Err("this intent names a different client run".to_string());
+        }
+        let expected_epoch = self
+            .sidecar_epoch
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| "this shell has no authenticated sidecar epoch".to_string())?;
+        if request.sidecar_epoch != expected_epoch {
+            return Err(
+                "this intent comes from a sidecar generation that is no longer current".to_string(),
+            );
+        }
+        let scope = self
+            .known_scopes()
+            .into_iter()
+            .find(|scope| scope.key == request.scope_key)
+            .ok_or_else(|| {
+                format!(
+                    "{} is not a project this shell has opened",
+                    request.scope_key
+                )
+            })?;
+        if !self.is_lifecycle_ready(&scope) {
+            return Err(format!(
+                "{} is not lifecycle-ready, so no root may be authorized there",
+                request.scope_key
+            ));
+        }
+        if request.intent.thread_key.trim().is_empty() {
+            return Err("a root intent must name the session it belongs to".to_string());
+        }
+        if request.intent.workspace.as_os_str().is_empty() {
+            return Err("a root intent must name a workspace".to_string());
+        }
+        let budget = deadline.remaining();
+        if budget.is_zero() {
+            return Err("no budget remains to authorize this root".to_string());
+        }
+        let backend = Arc::clone(&self.backend);
+        let intent = request.intent.clone();
+        run_bounded(budget, move || {
+            backend.authorize_root(&scope, &intent, budget)
+        })
+        .await
+        .map_err(|error| error.to_string())
     }
 
     /// Releases one project within `deadline`.
@@ -815,6 +1751,63 @@ impl DesktopRuntimeManager {
         results.sort_by(|a, b| a.client_run_id.cmp(&b.client_run_id));
         results
     }
+}
+
+/// A `starting` view: nothing is held yet, and waiting is the right move.
+fn starting_view(scope_key: &str, attempt_id: &str) -> ProjectAcquireView {
+    ProjectAcquireView {
+        scope_key: scope_key.to_string(),
+        attempt_id: attempt_id.to_string(),
+        state: AcquireState::Starting,
+        reason: None,
+        retry: RetryClass::WhenIdle,
+    }
+}
+
+/// A `blocked` view with the reason the caller can act on.
+fn blocked_view(
+    scope_key: &str,
+    attempt_id: &str,
+    reason: impl Into<String>,
+    retry: RetryClass,
+) -> ProjectAcquireView {
+    ProjectAcquireView {
+        scope_key: scope_key.to_string(),
+        attempt_id: attempt_id.to_string(),
+        state: AcquireState::Blocked,
+        reason: Some(reason.into()),
+        retry,
+    }
+}
+
+/// An `unknown` view: the answer was lost, so neither outcome may be assumed.
+fn unknown_view(
+    scope_key: &str,
+    attempt_id: &str,
+    reason: impl Into<String>,
+) -> ProjectAcquireView {
+    ProjectAcquireView {
+        scope_key: scope_key.to_string(),
+        attempt_id: attempt_id.to_string(),
+        state: AcquireState::Unknown,
+        reason: Some(reason.into()),
+        retry: RetryClass::Backoff,
+    }
+}
+
+/// Whether the observed runtime's control protocol overlaps this build's.
+///
+/// A version mismatch that still speaks a common protocol may use the existing
+/// preview/confirm flow to switch, so it may hold a lease. A mismatch whose
+/// protocol window does not overlap cannot even ask for a switch here.
+fn protocols_overlap(
+    expected: &ArtifactIdentity,
+    observed: &yi_agent_lifecycle::types::RuntimeIdentity,
+) -> bool {
+    let Some(theirs) = observed.business_protocol else {
+        return false;
+    };
+    expected.business_protocol_min <= theirs && theirs <= expected.business_protocol_max
 }
 
 fn failed(client_run_id: String, scope: &RuntimeScope, reason: &str) -> ReclaimResult {
@@ -993,9 +1986,14 @@ pub fn install(app: &tauri::AppHandle) {
     // expensive step (hashing the sidecar) happens before the first status poll and
     // never again.
     let artifact = artifact_identity_for(app);
-    app.manage(QuitState::new(Arc::new(
-        DesktopRuntimeManager::new(id).with_artifact(artifact),
-    )));
+    let manager = Arc::new(DesktopRuntimeManager::new(id).with_artifact(artifact));
+    // The channel looks the session up per preparation, because `install` runs
+    // before the sidecar has even spawned.
+    let sessions = Arc::new(crate::bridge::LocalSessions::new(app.clone()));
+    manager.attach_prepare(Arc::new(
+        LocalPrepareChannel::new(sessions).with_manager(Arc::downgrade(&manager)),
+    ));
+    app.manage(QuitState::new(manager));
 }
 
 /// The runtime artifact this App shipped with, in the lifecycle crate's shape.
@@ -1179,7 +2177,7 @@ mod tests {
     }
 
     impl ControlBackend for FakeControl {
-        fn acquire(
+        fn register(
             &self,
             _client_run_id: &str,
             _scope: &RuntimeScope,
@@ -1187,6 +2185,10 @@ mod tests {
             _budget: Duration,
         ) -> io::Result<bool> {
             Ok(true)
+        }
+
+        fn start_heartbeat(&self, _scope: &RuntimeScope) -> io::Result<()> {
+            Ok(())
         }
 
         fn release(
@@ -1237,7 +2239,7 @@ mod tests {
     }
 
     impl ControlBackend for RecordingControl {
-        fn acquire(
+        fn register(
             &self,
             _client_run_id: &str,
             _scope: &RuntimeScope,
@@ -1245,6 +2247,10 @@ mod tests {
             _budget: Duration,
         ) -> io::Result<bool> {
             Ok(true)
+        }
+
+        fn start_heartbeat(&self, _scope: &RuntimeScope) -> io::Result<()> {
+            Ok(())
         }
 
         fn release(
@@ -1812,7 +2818,7 @@ mod tests {
         struct NoGuardian;
 
         impl ControlBackend for NoGuardian {
-            fn acquire(
+            fn register(
                 &self,
                 _client_run_id: &str,
                 _scope: &RuntimeScope,
@@ -1820,6 +2826,10 @@ mod tests {
                 _budget: Duration,
             ) -> io::Result<bool> {
                 Ok(false)
+            }
+
+            fn start_heartbeat(&self, _scope: &RuntimeScope) -> io::Result<()> {
+                Ok(())
             }
 
             fn release(
@@ -1916,7 +2926,7 @@ mod tests {
     }
 
     impl ControlBackend for PeakCounter {
-        fn acquire(
+        fn register(
             &self,
             _client_run_id: &str,
             _scope: &RuntimeScope,
@@ -1924,6 +2934,10 @@ mod tests {
             _budget: Duration,
         ) -> io::Result<bool> {
             Ok(true)
+        }
+
+        fn start_heartbeat(&self, _scope: &RuntimeScope) -> io::Result<()> {
+            Ok(())
         }
 
         fn release(
@@ -1970,6 +2984,1293 @@ mod tests {
             "releases ran one at a time"
         );
         std::mem::forget(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Project acquisition: prepare -> register -> heartbeat -> ready
+    // -----------------------------------------------------------------------
+
+    /// Knobs a test flips to make the fake refuse at a chosen step.
+    struct Knobs {
+        served: bool,
+        heartbeat_fails: bool,
+        generation: Option<&'static str>,
+        refuse: Vec<String>,
+        /// When true, `register` blocks until `release_register` is called.
+        hold_register: bool,
+        register_released: bool,
+    }
+
+    impl Default for Knobs {
+        fn default() -> Self {
+            Self {
+                served: true,
+                heartbeat_fails: false,
+                generation: Some("gen-1"),
+                refuse: Vec::new(),
+                hold_register: false,
+                register_released: false,
+            }
+        }
+    }
+
+    /// A control backend that records the order of the calls it sees.
+    ///
+    /// The order *is* the property under test. Registering before preparation
+    /// would take a lease on a runtime nobody identified; renewing before
+    /// registering would renew a grant that does not exist.
+    struct TracingControl {
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        knobs: Mutex<Knobs>,
+    }
+
+    impl TracingControl {
+        fn record(&self, label: &'static str) {
+            self.trace.lock().unwrap().push(label);
+        }
+    }
+
+    impl ControlBackend for TracingControl {
+        fn register(
+            &self,
+            _client_run_id: &str,
+            scope: &RuntimeScope,
+            _mode: LeaseMode,
+            _budget: Duration,
+        ) -> io::Result<bool> {
+            self.record("register_business");
+            // A test can park the registration here to hold it in flight; the
+            // production path never sets `hold_register`.
+            loop {
+                {
+                    let knobs = self.knobs.lock().unwrap();
+                    if !knobs.hold_register || knobs.register_released {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let knobs = self.knobs.lock().unwrap();
+            if knobs.refuse.iter().any(|key| key == &scope.key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the guardian refused this client",
+                ));
+            }
+            Ok(knobs.served)
+        }
+
+        fn start_heartbeat(&self, _scope: &RuntimeScope) -> io::Result<()> {
+            self.record("start_heartbeat");
+            if self.knobs.lock().unwrap().heartbeat_fails {
+                return Err(io::Error::other("the renewal thread could not start"));
+            }
+            Ok(())
+        }
+
+        fn lease_mode(&self, _scope: &RuntimeScope) -> Option<LeaseMode> {
+            Some(LeaseMode::Business)
+        }
+
+        fn lease_is_live(&self, _scope: &RuntimeScope) -> bool {
+            let knobs = self.knobs.lock().unwrap();
+            knobs.served && !knobs.heartbeat_fails
+        }
+
+        fn release(
+            &self,
+            client_run_id: &str,
+            _scope: &RuntimeScope,
+            _budget: Duration,
+        ) -> io::Result<ReclaimResult> {
+            self.record("release");
+            Ok(ReclaimResult {
+                client_run_id: client_run_id.to_string(),
+                stopped: true,
+                failures: Vec::new(),
+            })
+        }
+
+        fn status(
+            &self,
+            scope: &RuntimeScope,
+            _budget: Duration,
+        ) -> io::Result<Option<RuntimeStatusSnapshot>> {
+            self.record("status");
+            let generation = self.knobs.lock().unwrap().generation;
+            Ok(Some(status_snapshot(scope, generation)))
+        }
+    }
+
+    fn status_snapshot(scope: &RuntimeScope, generation: Option<&str>) -> RuntimeStatusSnapshot {
+        status_snapshot_for(&scope.key, generation)
+    }
+
+    fn status_snapshot_for(scope_key: &str, generation: Option<&str>) -> RuntimeStatusSnapshot {
+        RuntimeStatusSnapshot {
+            identity: yi_agent_lifecycle::types::RuntimeIdentity {
+                scope_key: scope_key.to_string(),
+                daemon_instance_id: generation.map(str::to_string),
+                guardian_build_id: Some("build-b".to_string()),
+                daemon_build_id: Some("build-b".to_string()),
+                mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
+                business_protocol: Some(1),
+                daemon_display_version: Some("0.3.0".to_string()),
+                guardian_display_version: Some("0.3.0".to_string()),
+                capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+                schema_min: 1,
+                schema_max: 16,
+            },
+            counts: yi_agent_lifecycle::types::ImpactCounts {
+                clients: 1,
+                pending_clients: 0,
+                running: 0,
+                queued: 0,
+                plugins: 0,
+                complete: false,
+            },
+            clients: Vec::new(),
+            clients_next_cursor: None,
+            active_operation: None,
+            local_restart_available: true,
+        }
+    }
+
+    /// How the fake preparation channel should answer.
+    enum Reply {
+        /// The same outcome for every request.
+        Fixed(PrepareOutcome),
+        /// `Connected` with the request's own scope, as a real runtime would.
+        ConnectedToRequest,
+    }
+
+    /// A preparation channel that records the call and answers as told.
+    struct FakePrepare {
+        reply: Reply,
+        trace: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl PrepareChannel for FakePrepare {
+        fn prepare(
+            &self,
+            request: PrepareRequest,
+            _budget: Duration,
+        ) -> io::Result<PrepareOutcome> {
+            self.trace.lock().unwrap().push("prepare");
+            Ok(match &self.reply {
+                Reply::Fixed(outcome) => outcome.clone(),
+                Reply::ConnectedToRequest => {
+                    PrepareOutcome::Connected(managed_identity(&request.scope.key, "gen-1"))
+                }
+            })
+        }
+    }
+
+    fn managed_identity(
+        scope_key: &str,
+        generation: &str,
+    ) -> yi_agent_lifecycle::types::RuntimeIdentity {
+        yi_agent_lifecycle::types::RuntimeIdentity {
+            scope_key: scope_key.to_string(),
+            daemon_instance_id: Some(generation.to_string()),
+            guardian_build_id: Some("build-b".to_string()),
+            daemon_build_id: Some("build-b".to_string()),
+            mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
+            business_protocol: Some(1),
+            daemon_display_version: Some("0.3.0".to_string()),
+            guardian_display_version: Some("0.3.0".to_string()),
+            capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+            schema_min: 1,
+            schema_max: 16,
+        }
+    }
+
+    /// Everything a Task 3 test needs: the manager, the fake, and the shared trace.
+    struct Wired {
+        manager: Arc<DesktopRuntimeManager>,
+        control: Arc<TracingControl>,
+        trace: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Wired {
+        fn new(outcome: PrepareOutcome) -> Self {
+            Self::with_reply(Reply::Fixed(outcome))
+        }
+
+        fn connected() -> Self {
+            Self::with_reply(Reply::ConnectedToRequest)
+        }
+
+        fn with_reply(reply: Reply) -> Self {
+            let trace = Arc::new(Mutex::new(Vec::new()));
+            let control = Arc::new(TracingControl {
+                trace: Arc::clone(&trace),
+                knobs: Mutex::new(Knobs::default()),
+            });
+            let prepare = Arc::new(FakePrepare {
+                reply,
+                trace: Arc::clone(&trace),
+            });
+            let manager = DesktopRuntimeManager::with_backend(
+                "app-run",
+                Arc::clone(&control) as Arc<dyn ControlBackend>,
+            )
+            .with_prepare(prepare)
+            .with_artifact(Some(artifact()));
+            Self {
+                manager: Arc::new(manager),
+                control,
+                trace,
+            }
+        }
+
+        fn trace(&self) -> Vec<&'static str> {
+            self.trace.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connected_runtime_is_prepared_registered_then_renewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::Connected(managed_identity(
+            &project.key,
+            "gen-1",
+        )));
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wired.trace(),
+            ["prepare", "register_business", "start_heartbeat", "status"],
+            "the lease may only be taken after preparation identified the runtime, \
+             and renewal may only start once the lease exists"
+        );
+        assert_eq!(view.state, AcquireState::ManagedReady);
+        assert_eq!(view.scope_key, project.key);
+        assert!(!view.attempt_id.is_empty());
+        // Ready is lifecycle-ready, and the quit has something to release.
+        assert!(wired.manager.is_lifecycle_ready(&project));
+        assert_eq!(wired.manager.registered_projects(), vec![project.clone()]);
+        std::mem::forget(dir);
+    }
+
+    /// A project the runtime does not serve holds nothing and claims nothing.
+    ///
+    /// `Ok(false)` is the honest answer from a backend with no guardian. Treating
+    /// it as a lease would make every exit report a reclaim failure that never
+    /// happened, and would let ready describe a runtime nobody manages.
+    #[tokio::test]
+    async fn no_lease_never_becomes_ready_or_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::Connected(managed_identity(
+            &project.key,
+            "gen-1",
+        )));
+        wired.control.knobs.lock().unwrap().served = false;
+
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_ne!(view.state, AcquireState::ManagedReady);
+        assert_eq!(view.state, AcquireState::Unknown);
+        assert!(!wired.manager.is_lifecycle_ready(&project));
+        assert!(
+            wired.manager.registered_projects().is_empty(),
+            "a scope with no lease must not appear in the quit's work list"
+        );
+        assert!(
+            !wired.trace().contains(&"start_heartbeat"),
+            "there is nothing to renew: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// A renewal that cannot start leaves no usable ready view *and* no lease.
+    ///
+    /// A lease whose heartbeat never started looks held until the guardian expires
+    /// it, which is exactly the window where the shell would wrongly let work run.
+    #[tokio::test]
+    async fn a_failed_heartbeat_leaves_no_ready_view_and_releases_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::Connected(managed_identity(
+            &project.key,
+            "gen-1",
+        )));
+        wired.control.knobs.lock().unwrap().heartbeat_fails = true;
+
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert!(view
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("renewed")));
+        assert!(!wired.manager.is_lifecycle_ready(&project));
+        assert!(wired.manager.registered_projects().is_empty());
+        assert!(
+            wired.trace().contains(&"release"),
+            "the abandoned lease must be released, not left to expire: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// One blocked project must not block another: each scope has its own attempt.
+    #[tokio::test]
+    async fn a_blocked_scope_does_not_block_a_healthy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = scope(dir.path(), "alpha");
+        let beta = scope(dir.path(), "beta");
+        let wired = Wired::connected();
+        wired.control.knobs.lock().unwrap().refuse = vec![alpha.key.clone()];
+        let manager = &wired.manager;
+
+        let alpha_view = manager
+            .ensure_project(&alpha, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let beta_view = manager
+            .ensure_project(&beta, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(alpha_view.state, AcquireState::Blocked);
+        assert!(
+            beta_view.state != AcquireState::Blocked,
+            "one project's refusal must not become another's: {beta_view:?}"
+        );
+        assert_eq!(manager.registered_projects(), vec![beta]);
+        std::mem::forget(dir);
+    }
+
+    /// A compatible build mismatch may hold a lease so the existing preview/confirm
+    /// flow can offer a switch, but it is never ready: no root, no business, no
+    /// plugin demand.
+    #[tokio::test]
+    async fn a_compatible_version_mismatch_holds_a_lease_without_becoming_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(view.state, AcquireState::ManagedReady);
+        // Now the same project, but the runtime in front of it is another build.
+        let mismatch = Wired::with_reply(Reply::Fixed(PrepareOutcome::VersionChoiceRequired(
+            managed_identity(&project.key, "gen-1"),
+        )));
+        let view = mismatch
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert_eq!(view.retry, RetryClass::UserAction);
+        // The lease is held (the mismatch is protocol-compatible)...
+        let state = mismatch.manager.project_state(&project.key).unwrap();
+        assert!(
+            state.held,
+            "a compatible mismatch may use its lease to switch"
+        );
+        // ...and it is being renewed, because a person deciding may take longer
+        // than the lease window. A held-but-unrenewed lease would expire under the
+        // very preview the user is reading.
+        assert!(
+            mismatch.trace.lock().unwrap().contains(&"start_heartbeat"),
+            "a held lease must be renewed from the moment it is taken: {:?}",
+            mismatch.trace.lock().unwrap()
+        );
+        // ...and preview/confirm work off that held lease...
+        assert_eq!(
+            mismatch.manager.registered_projects(),
+            vec![project.clone()]
+        );
+        // ...while nothing that runs work is allowed.
+        assert!(!mismatch.manager.is_lifecycle_ready(&project));
+        std::mem::forget(dir);
+    }
+
+    /// A mismatch whose control protocol does not overlap cannot even hold a lease.
+    #[tokio::test]
+    async fn an_incompatible_version_mismatch_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let mut identity = managed_identity(&project.key, "gen-1");
+        identity.business_protocol = Some(99);
+        let wired = Wired::new(PrepareOutcome::VersionChoiceRequired(identity));
+
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert!(wired.manager.registered_projects().is_empty());
+        assert!(
+            !wired.trace().contains(&"register_business"),
+            "an incompatible runtime must not be registered against: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// An unmanaged runtime is a user decision, never something to adopt silently.
+    #[tokio::test]
+    async fn an_unmanaged_runtime_asks_the_user_instead_of_adopting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::LegacyChoiceRequired {
+            reason: "a manually started daemon serves this project".to_string(),
+        });
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::LegacyChoiceRequired);
+        assert_eq!(view.retry, RetryClass::UserAction);
+        assert!(wired.manager.registered_projects().is_empty());
+        std::mem::forget(dir);
+    }
+
+    /// Ready is only claimed for the generation preparation actually observed.
+    ///
+    /// A generation change between the answer and the check means a different
+    /// runtime now serves the scope, and ready must not describe it.
+    #[tokio::test]
+    async fn a_generation_change_after_the_lease_prevents_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::Connected(managed_identity(
+            &project.key,
+            "gen-1",
+        )));
+        wired.control.knobs.lock().unwrap().generation = Some("gen-2");
+
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Unknown);
+        assert!(!wired.manager.is_lifecycle_ready(&project));
+        std::mem::forget(dir);
+    }
+
+    /// A scope the shell never opened cannot be authorized, whatever the intent says.
+    #[tokio::test]
+    async fn an_intent_for_an_unopened_scope_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired.manager.note_sidecar_epoch("epoch-1");
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::ManagedReady);
+
+        // A scope the shell has neither opened nor leased. Being leased counts as
+        // "known" by design (the quit and the status banner both need it), so the
+        // negative case must use a key the shell never resolved.
+        let error = wired
+            .manager
+            .authorize_intent(root_intent("/no/such/scope", "thread:a"), once_deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not a project this shell has opened"),
+            "unexpected error: {error}"
+        );
+        std::mem::forget(dir);
+    }
+
+    /// A ready project still refuses a root intent from a stale sidecar generation.
+    #[tokio::test]
+    async fn an_intent_from_a_stale_sidecar_epoch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired.manager.note_open(&project);
+        wired.manager.note_sidecar_epoch("epoch-2");
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let mut intent = root_intent(&project.key, "thread:a");
+        intent.sidecar_epoch = "epoch-1".to_string();
+        let error = wired
+            .manager
+            .authorize_intent(intent, once_deadline())
+            .await
+            .unwrap_err();
+        assert!(error.contains("no longer current"), "unexpected: {error}");
+
+        // The current epoch passes the epoch gate: it reaches the backend, which
+        // here has no `authorize_root` and therefore says so. This is what makes
+        // the assertion above about the *epoch*, not about any refusal.
+        let mut current = root_intent(&project.key, "thread:a");
+        current.sidecar_epoch = "epoch-2".to_string();
+        let error = wired
+            .manager
+            .authorize_intent(current, once_deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("cannot authorize a root"),
+            "the current epoch must get past the gate: {error}"
+        );
+        std::mem::forget(dir);
+    }
+
+    /// A project that never became lifecycle-ready cannot authorize a root, even
+    /// while its lease is still held.
+    #[tokio::test]
+    async fn a_held_but_blocked_project_cannot_authorize_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::new(PrepareOutcome::VersionChoiceRequired(managed_identity(
+            &project.key,
+            "gen-1",
+        )));
+        wired.manager.note_open(&project);
+        wired.manager.note_sidecar_epoch("epoch-1");
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(wired.manager.project_state(&project.key).unwrap().held);
+
+        let error = wired
+            .manager
+            .authorize_intent(root_intent(&project.key, "thread:a"), once_deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("not lifecycle-ready"),
+            "held is not ready: {error}"
+        );
+        std::mem::forget(dir);
+    }
+
+    /// An intent that speaks for another client run is refused.
+    #[tokio::test]
+    async fn an_intent_for_another_client_run_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired.manager.note_open(&project);
+        wired.manager.note_sidecar_epoch("epoch-1");
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let mut intent = root_intent(&project.key, "thread:a");
+        intent.client_run_id = "someone-else".to_string();
+        let error = wired
+            .manager
+            .authorize_intent(intent, once_deadline())
+            .await
+            .unwrap_err();
+        assert!(error.contains("different client run"), "got: {error}");
+        std::mem::forget(dir);
+    }
+
+    /// Cmd+Q while a registration is in flight: the late lease must be released
+    /// and must never become a ready view.
+    ///
+    /// The window is real: `register` is a socket round trip, and the user may hit
+    /// Cmd+Q inside it. Leaving the lease behind would resurrect a runtime the quit
+    /// is already draining.
+    #[tokio::test]
+    async fn a_quit_during_registration_releases_the_late_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired.control.knobs.lock().unwrap().hold_register = true;
+
+        let manager = Arc::clone(&wired.manager);
+        let scope_for_task = project.clone();
+        let task = tokio::spawn(async move {
+            manager
+                .ensure_project(&scope_for_task, Duration::from_secs(10))
+                .await
+        });
+
+        // Wait until the registration is genuinely in flight, so the quit below
+        // really lands inside the window rather than before or after it.
+        loop {
+            if wired.trace().contains(&"register_business") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let manager = Arc::clone(&wired.manager);
+        let drain = tokio::spawn(async move {
+            manager
+                .shutdown(Deadline::after(Duration::from_secs(5)))
+                .await
+        });
+        // Let `shutdown` set the quit flag before the registration is allowed home.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        {
+            let mut knobs = wired.control.knobs.lock().unwrap();
+            knobs.register_released = true;
+        }
+        let _ = drain.await;
+
+        let view = task.await.unwrap().unwrap();
+        assert_eq!(view.state, AcquireState::Blocked, "{view:?}");
+        assert!(!wired.manager.is_lifecycle_ready(&project));
+        assert!(
+            wired.manager.registered_projects().is_empty(),
+            "a lease taken during the quit must not stay registered"
+        );
+        assert!(
+            wired.trace().contains(&"release"),
+            "the late lease must be released: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// A project prepared after the quit began is refused without touching a runtime.
+    #[tokio::test]
+    async fn no_project_is_prepared_after_the_quit_has_begun() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired
+            .manager
+            .shutdown(Deadline::after(Duration::from_secs(1)))
+            .await;
+
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert_eq!(view.retry, RetryClass::DoNotRetry);
+        assert_eq!(
+            wired.trace(),
+            Vec::<&'static str>::new(),
+            "quitting must not start a preparation: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// The view is the only thing the page sees, and it carries no credential.
+    #[tokio::test]
+    async fn the_page_view_round_trips_and_carries_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        let view = wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["scopeKey"], project.key);
+        assert_eq!(json["attemptId"], view.attempt_id);
+        assert_eq!(json["state"], "managedReady");
+        assert_eq!(json["retry"], "doNotRetry");
+        for forbidden in [
+            "grant",
+            "capability",
+            "secret",
+            "rootId",
+            "daemonInstanceId",
+        ] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "{forbidden} must never reach the page: {json}"
+            );
+        }
+        let back: ProjectAcquireView = serde_json::from_value(json).unwrap();
+        assert_eq!(back, view);
+        std::mem::forget(dir);
+    }
+
+    /// A ready project that loses its lease stops being ready on the next check.
+    #[tokio::test]
+    async fn readiness_is_rechecked_against_the_live_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+        wired
+            .manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(wired.manager.is_lifecycle_ready(&project));
+
+        // The guardian withdraws this client: the lease is no longer live.
+        wired.control.knobs.lock().unwrap().served = false;
+        assert!(
+            !wired.manager.is_lifecycle_ready(&project),
+            "a lease the guardian no longer honours must not stay ready"
+        );
+        std::mem::forget(dir);
+    }
+
+    /// Two windows opening one project share one preparation.
+    #[tokio::test]
+    async fn concurrent_attempts_on_one_scope_prepare_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = scope(dir.path(), "alpha");
+        let wired = Wired::connected();
+
+        let first = {
+            let manager = Arc::clone(&wired.manager);
+            let project = project.clone();
+            tokio::spawn(async move {
+                manager
+                    .ensure_project(&project, Duration::from_secs(2))
+                    .await
+            })
+        };
+        let second = {
+            let manager = Arc::clone(&wired.manager);
+            let project = project.clone();
+            tokio::spawn(async move {
+                manager
+                    .ensure_project(&project, Duration::from_secs(2))
+                    .await
+            })
+        };
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(a.unwrap().unwrap().state, AcquireState::ManagedReady);
+        assert_eq!(b.unwrap().unwrap().state, AcquireState::ManagedReady);
+
+        let preparations = wired
+            .trace()
+            .iter()
+            .filter(|label| **label == "prepare")
+            .count();
+        assert_eq!(
+            preparations,
+            1,
+            "one project, one preparation: {:?}",
+            wired.trace()
+        );
+        let registrations = wired
+            .trace()
+            .iter()
+            .filter(|label| **label == "register_business")
+            .count();
+        assert_eq!(
+            registrations,
+            1,
+            "one App, one lease per project: {:?}",
+            wired.trace()
+        );
+        std::mem::forget(dir);
+    }
+
+    /// A deadline with no budget left cannot authorize anything.
+    fn once_deadline() -> Deadline {
+        paused_deadline(Duration::from_secs(5))
+    }
+
+    fn root_intent(scope_key: &str, thread_key: &str) -> RootIntentRequest {
+        RootIntentRequest {
+            sidecar_epoch: "epoch-1".to_string(),
+            scope_key: scope_key.to_string(),
+            client_run_id: "app-run".to_string(),
+            intent: RootBindIntent {
+                operation_id: format!("op-{thread_key}"),
+                thread_key: thread_key.to_string(),
+                workspace: std::path::PathBuf::from("/tmp/workspace"),
+                extra_roots: Vec::new(),
+                previous_root_capability: None,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Against the real lease table
+    // -----------------------------------------------------------------------
+
+    /// A control socket that speaks the real protocol over the real `LeaseTable`.
+    ///
+    /// The table is the authority on what "registered", "resumed" and "released"
+    /// mean, so a fake hand-rolled to the test's expectation could agree with a
+    /// wrong shell. Using it makes "the shell registered twice" a real refusal
+    /// ("already registered; call resume") rather than a count in a mock.
+    struct LeaseGuardian {
+        table: Arc<Mutex<yi_agent_lifecycle::leases::LeaseTable>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LeaseGuardian {
+        /// Binds `scope`'s own control socket, so the manager under test talks to it
+        /// through the same resolution the packaged shell uses.
+        fn start(scope: &RuntimeScope) -> Self {
+            std::fs::create_dir_all(&scope.runtime_dir).unwrap();
+            let path = yi_agent_lifecycle::scope::control_path(&scope.runtime_dir);
+            let _ = std::fs::remove_file(&path);
+            let table = Arc::new(Mutex::new(yi_agent_lifecycle::leases::LeaseTable::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+
+            let table_for_thread = Arc::clone(&table);
+            let stop_for_thread = Arc::clone(&stop);
+            let scope_key = scope.key.clone();
+            let thread = std::thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                            serve_one(&mut stream, &table_for_thread, &scope_key);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            Self {
+                table,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn live_clients(&self) -> Vec<String> {
+            self.table
+                .lock()
+                .unwrap()
+                .snapshot()
+                .into_iter()
+                .map(|(client_run_id, _mode, _connected)| client_run_id)
+                .collect()
+        }
+    }
+
+    impl Drop for LeaseGuardian {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// One request on one connection, answered from the real table.
+    fn serve_one(
+        stream: &mut std::os::unix::net::UnixStream,
+        table: &Arc<Mutex<yi_agent_lifecycle::leases::LeaseTable>>,
+        scope_key: &str,
+    ) {
+        use yi_agent_lifecycle::types::{ControlRequest, ControlResponse};
+        let frame = match yi_agent_lifecycle::codec::read_frame(stream) {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+        let Ok(request) = yi_agent_lifecycle::codec::decode::<ControlRequest>(&frame) else {
+            return;
+        };
+        let response = match request {
+            ControlRequest::Identity => {
+                ControlResponse::Identity(yi_agent_lifecycle::types::RuntimeIdentity {
+                    scope_key: scope_key.to_string(),
+                    daemon_instance_id: Some("gen-1".to_string()),
+                    guardian_build_id: Some("build-b".to_string()),
+                    daemon_build_id: Some("build-b".to_string()),
+                    mode: yi_agent_lifecycle::types::RuntimeMode::Managed,
+                    business_protocol: Some(1),
+                    daemon_display_version: Some("0.3.0".to_string()),
+                    guardian_display_version: Some("0.3.0".to_string()),
+                    capabilities: vec!["lease.v1".to_string(), "control.v1".to_string()],
+                    schema_min: 1,
+                    schema_max: 16,
+                })
+            }
+            ControlRequest::Register {
+                client_run_id,
+                kind,
+                mode,
+            } => match table
+                .lock()
+                .unwrap()
+                .register(client_run_id, kind, mode, Duration::ZERO)
+            {
+                Ok(grant) => ControlResponse::Granted(grant),
+                Err(reason) => ControlResponse::Rejected {
+                    code: yi_agent_lifecycle::types::ControlErrorCode::Conflict,
+                    reason,
+                },
+            },
+            ControlRequest::Resume { grant } => {
+                match table.lock().unwrap().resume(&grant, Duration::ZERO) {
+                    Ok(renewed) => ControlResponse::Granted(renewed),
+                    Err(reason) => ControlResponse::Rejected {
+                        code: yi_agent_lifecycle::types::ControlErrorCode::Unauthenticated,
+                        reason,
+                    },
+                }
+            }
+            ControlRequest::Heartbeat { grant } => {
+                match table.lock().unwrap().heartbeat(&grant, Duration::ZERO) {
+                    Ok(()) => ControlResponse::Ack,
+                    Err(reason) => ControlResponse::Rejected {
+                        code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                        reason,
+                    },
+                }
+            }
+            ControlRequest::Release { grant } => match table.lock().unwrap().release(&grant) {
+                Ok(_) => ControlResponse::ReleaseStarted {
+                    operation_id: "op-release".to_string(),
+                },
+                Err(reason) => ControlResponse::Rejected {
+                    code: yi_agent_lifecycle::types::ControlErrorCode::StaleEpoch,
+                    reason,
+                },
+            },
+            ControlRequest::Status { .. } => {
+                // Readiness re-reads this after the lease is taken, so a fake that
+                // stays silent here would fail the identity gate for the wrong
+                // reason: silence is not a mismatch.
+                ControlResponse::Status(Box::new(status_snapshot_for(scope_key, Some("gen-1"))))
+            }
+            ControlRequest::ReclaimStatus { operation_id, .. } => ControlResponse::ReclaimStatus {
+                operation_id,
+                result: Some(yi_agent_lifecycle::types::ReclaimResult {
+                    client_run_id: "app-run".to_string(),
+                    stopped: true,
+                    failures: Vec::new(),
+                }),
+            },
+            ControlRequest::AuthorizeRoot { intent, .. } => {
+                ControlResponse::RootAuthorized(yi_agent_lifecycle::types::RootAuthorization {
+                    scope_key: scope_key.to_string(),
+                    daemon_instance_id: "gen-1".to_string(),
+                    client_run_id: "app-run".to_string(),
+                    root_id: format!("root-{}", intent.thread_key),
+                    capability: "root-capability".to_string(),
+                })
+            }
+            other => ControlResponse::Unsupported {
+                detail: format!("this fake does not answer {other:?}"),
+            },
+        };
+        let _ = yi_agent_lifecycle::codec::write_frame(stream, &response);
+    }
+
+    /// A manager bound to a real control socket and a fixed preparation answer.
+    fn real_socket_manager(
+        _guardian: &LeaseGuardian,
+        outcome: PrepareOutcome,
+    ) -> Arc<DesktopRuntimeManager> {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let prepare = Arc::new(FakePrepare {
+            reply: Reply::Fixed(outcome),
+            trace,
+        });
+        Arc::new(
+            DesktopRuntimeManager::with_backend("app-run", Arc::new(SocketBackend::new()))
+                .with_prepare(prepare)
+                .with_artifact(Some(artifact())),
+        )
+    }
+
+    /// A short-lived directory under `/tmp`.
+    ///
+    /// Not `tempfile::tempdir()`: its default root is under `/var/folders/...`,
+    /// and once the runtime directory and the socket name are appended the path
+    /// exceeds `SUN_LEN`, so binding the control socket fails with `InvalidInput`
+    /// rather than telling us anything about leases.
+    fn short_dir() -> tempfile::TempDir {
+        std::fs::create_dir_all("/tmp").unwrap();
+        tempfile::Builder::new()
+            .prefix("yil")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    /// A scope with a real directory under `root`, ready to be served.
+    fn real_scope(root: &std::path::Path, name: &str) -> RuntimeScope {
+        RuntimeScope {
+            key: format!("{}/{name}", root.display()),
+            runtime_dir: root.join(name).join(".yi-agent/runtime"),
+            project_key: root.join(name).display().to_string(),
+            instance_home: root.join("home"),
+        }
+    }
+
+    /// The happy path over a real socket: one registration, a renewing heartbeat,
+    /// and a lease the quit can actually release.
+    #[tokio::test]
+    async fn a_real_registration_and_heartbeat_reach_ready() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+
+        let view = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::ManagedReady, "{view:?}");
+        assert_eq!(guardian.live_clients(), vec!["app-run".to_string()]);
+        assert!(manager.is_lifecycle_ready(&project));
+
+        // A repeat call must not register again: the real table refuses a second
+        // registration of a live id, so this would surface as a blocked view.
+        let again = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(again.state, AcquireState::ManagedReady, "{again:?}");
+        assert_eq!(
+            guardian.live_clients().len(),
+            1,
+            "one App, one lease per project"
+        );
+    }
+
+    /// The same App run is never a second client.
+    ///
+    /// `client_run_id` is minted once per launch. Re-entering `ensure_project` on
+    /// the same shell therefore finds its own live lease and never registers again,
+    /// and a *second* shell claiming the same id is refused by the real table
+    /// ("already registered; call resume") rather than silently owning a duplicate
+    /// lease. The refusal is the invariant: re-registering a live id would let a
+    /// stale process hold lifetime on a runtime it no longer fronts.
+    #[tokio::test]
+    async fn a_second_shell_for_the_same_run_is_refused_not_registered_twice() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+
+        let ready = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(ready.state, AcquireState::ManagedReady, "{ready:?}");
+
+        // The same shell re-entering the path keeps its own lease and does not go
+        // to the guardian at all, so the table still holds exactly one client.
+        let again = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(again.state, AcquireState::ManagedReady, "{again:?}");
+        assert_eq!(guardian.live_clients(), vec!["app-run".to_string()]);
+
+        // A second shell that presents the same id meets a real refusal. It must
+        // not become ready on a lease it does not hold.
+        let duplicate = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+        let view = duplicate
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked, "{view:?}");
+        assert!(
+            view.reason
+                .unwrap_or_default()
+                .contains("already registered"),
+            "the refusal must name the reason"
+        );
+    }
+
+    /// A quit releases the lease it really holds, over the real socket.
+    #[tokio::test]
+    async fn a_quit_releases_a_real_lease() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+        manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(guardian.live_clients().len(), 1);
+
+        let results = manager
+            .shutdown(Deadline::after(Duration::from_secs(2)))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            guardian.live_clients(),
+            Vec::<String>::new(),
+            "the lease must be gone from the real table after the quit"
+        );
+    }
+
+    /// A compatible mismatch holds a real lease, and that lease is what the
+    /// existing preview/confirm flow presents.
+    #[tokio::test]
+    async fn a_compatible_mismatch_holds_a_real_lease_while_blocked() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::VersionChoiceRequired(managed_identity(&project.key, "gen-1")),
+        );
+
+        let view = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked);
+        assert_eq!(
+            guardian.live_clients(),
+            vec!["app-run".to_string()],
+            "the mismatch may use its own lease to switch"
+        );
+        // The lease is real, so a preview could be requested with it.
+        assert!(manager.lease_for_recovery(&project).is_ok());
+        // But nothing that runs work may pass.
+        assert!(!manager.is_lifecycle_ready(&project));
+        manager.note_open(&project);
+        manager.note_sidecar_epoch("epoch-1");
+        let error = manager
+            .authorize_intent(root_intent(&project.key, "thread:a"), once_deadline())
+            .await
+            .unwrap_err();
+        assert!(error.contains("not lifecycle-ready"), "got: {error}");
+    }
+
+    /// A ready project authorizes a root through the real socket.
+    #[tokio::test]
+    async fn a_ready_project_can_authorize_a_root() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+        manager.note_open(&project);
+        manager.note_sidecar_epoch("epoch-1");
+        manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let authorization = manager
+            .authorize_intent(root_intent(&project.key, "thread:a"), once_deadline())
+            .await
+            .unwrap();
+        assert_eq!(authorization.root_id, "root-thread:a");
+        assert_eq!(authorization.client_run_id, "app-run");
+        assert_eq!(authorization.scope_key, project.key);
+    }
+
+    /// Cancelling the version choice leaves the project blocked, and a quit still
+    /// releases the lease that was held for the preview.
+    #[tokio::test]
+    async fn a_cancelled_version_choice_keeps_the_lease_for_the_quit_to_release() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::VersionChoiceRequired(managed_identity(&project.key, "gen-1")),
+        );
+        manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // The user does nothing: no switch, no adoption. The state must stay
+        // blocked, but the lease is still real and still the quit's to release.
+        let state = manager.project_state(&project.key).unwrap();
+        assert_eq!(state.view.state, AcquireState::Blocked);
+        assert!(state.held);
+        let results = manager
+            .shutdown(Deadline::after(Duration::from_secs(2)))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(guardian.live_clients(), Vec::<String>::new());
+    }
+
+    /// A waiting-next-generation grant is never a lease this shell is ready on.
+    ///
+    /// The mode means "you are queued behind a switch", which is the opposite of
+    /// ready: the runtime is actively being replaced.
+    #[tokio::test]
+    async fn a_waiting_next_generation_grant_is_never_ready() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        // Pre-register the App in the real table with the waiting mode, so the
+        // shell's later attempt meets the queued grant the table really hands out.
+        guardian
+            .table
+            .lock()
+            .unwrap()
+            .register(
+                "app-run".to_string(),
+                ClientKind::App,
+                LeaseMode::WaitingNextGeneration,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+
+        let view = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_ne!(
+            view.state,
+            AcquireState::ManagedReady,
+            "a queued client is not a ready one: {view:?}"
+        );
+        assert!(!manager.is_lifecycle_ready(&project));
     }
 }
 
@@ -2465,16 +4766,21 @@ pub fn runtime_active_operation(
     state.manager.operation_for(&scope_key)
 }
 
-/// Registers this App run's lease for `project`.
+/// Prepares and leases `project` for this App run, reporting the outcome.
 ///
 /// Called when the user actually starts using a project (opening it, or working
 /// in it). A project merely present in an index is never acquired: a historical
 /// entry must not keep a runtime alive after everyone has left.
+///
+/// The answer is the *view*, not `()`. Acquiring used to be fire-and-forget, which
+/// meant the page treated "the command returned" as "this project is ready" -- so a
+/// blocked or unknown outcome silently looked like a live runtime. `managedReady` is
+/// the only state that means work may start.
 #[tauri::command]
 pub async fn runtime_acquire_project(
     state: tauri::State<'_, QuitState>,
     project: String,
-) -> Result<(), String> {
+) -> Result<ProjectAcquireView, String> {
     let manager = Arc::clone(&state.manager);
     let home = instance_home().map_err(|error| error.to_string())?;
     let project = std::path::PathBuf::from(project);
@@ -2484,10 +4790,11 @@ pub async fn runtime_acquire_project(
     // Readable before it is leased: a runtime that refuses registration (embedded,
     // legacy) still has a version the banner must be able to report.
     manager.note_open(&scope);
+    // The management budget, not the control timeout: preparation has to cold-start
+    // a runtime, and the 2s control round-trip would time out on every first launch.
     manager
-        .acquire_project(scope, yi_agent_lifecycle::types::LeaseMode::Business)
+        .ensure_project(&scope, crate::runtime_management::MANAGEMENT_BUDGET)
         .await
-        .map_err(|error| error.to_string())
 }
 
 /// Releases one project's lease, without quitting.

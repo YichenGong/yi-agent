@@ -72,6 +72,52 @@ pub struct Sidecar {
         Mutex<HashMap<ProfileKey, std::sync::Arc<crate::runtime_management::ManagementSession>>>,
 }
 
+/// 允许壳从**管理面**往本地 sidecar 的 stdin 写一帧。
+///
+/// 与页面的 `rpc` 共用同一条写入路径（同一把槽位锁、同一份"槽位必须有活进程"
+/// 判定），但走的不是同一个入口：页面写不进来，因为 `_shell/` 在 `rpc` 里就被
+/// 拒了；这里绕开的是命令层，不是那条守卫。
+pub struct LocalTransport {
+    app: AppHandle,
+}
+
+impl LocalTransport {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+/// 壳对「当前本地管理会话」的查询入口。
+///
+/// 每次准备都重新问一次，而不是在启动时把会话存进通道：session 随每次 sidecar
+/// 启动重建，存下来的那个一定会在第一次重启之后过期。
+pub struct LocalSessions {
+    app: AppHandle,
+}
+
+impl LocalSessions {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl crate::runtime_lifecycle::ManagementSessions for LocalSessions {
+    fn current(&self) -> Option<std::sync::Arc<crate::runtime_management::ManagementSession>> {
+        self.app.state::<Sidecar>().management_session()
+    }
+
+    fn transport(&self) -> std::sync::Arc<dyn crate::runtime_management::PrepareTransport> {
+        std::sync::Arc::new(LocalTransport::new(self.app.clone()))
+    }
+}
+
+impl crate::runtime_management::PrepareTransport for LocalTransport {
+    fn write_frame(&self, frame: &serde_json::Value) -> Result<(), String> {
+        let state = self.app.state::<Sidecar>();
+        write_line(&state, &ProfileKey::Local, frame)
+    }
+}
+
 impl Sidecar {
     pub fn new() -> Self {
         Self {
@@ -1463,7 +1509,6 @@ mod tests {
         assert_eq!(classify(&json!({"hello":"world"})), Frame::Garbage);
     }
 
-    #[test]
     /// 保留命名空间不得从页面的 `rpc` 进入 sidecar。
     ///
     /// 这条断言测的是**结构**：`_shell/` 的拒绝必须发生在 `write_line` 之前。
@@ -1494,6 +1539,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn sidecar_args_add_relay_only_when_configured() {
         assert_eq!(sidecar_args(None), ["app-server", "--listen", "stdio://"]);
         assert_eq!(

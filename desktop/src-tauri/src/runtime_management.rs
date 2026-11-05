@@ -27,6 +27,9 @@ use yi_agent_lifecycle::deadline::Deadline;
 /// 丢弃并让调用方超时，而不是截断——截断的 JSON 无法被任何一方安全解析。
 pub const MAX_MANAGEMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// 本地准备方法名。与 app-server 的 `dispatch` 分支同名：线协议的一部分。
+pub const PREPARE_METHOD: &str = "_shell/prepare";
+
 /// 保留方法前缀。与 app-server 的常量同名同值，两侧各存一份是有意的：
 /// 壳不依赖 app-server（它是另一个进程），所以这个字符串是**线协议**的一部分，
 /// 由两侧的测试同时钉住。
@@ -54,6 +57,36 @@ pub fn reject_reserved_method(method: &str) -> Result<(), String> {
 struct Pending {
     /// 发起时的 epoch。完成时必须与它相等，否则说明这是上一代的迟到响应。
     epoch: String,
+    /// 应答的投递点。`None` 表示这条请求只关心"被消费"，不关心内容
+    /// （拨测、或者调用方已经放弃）。
+    ///
+    /// `std::sync::mpsc` 而不是 tokio 的：投递发生在读取 sidecar stdout 的线程里，
+    /// 那里是同步上下文；而且它的 `send` 不需要 await，关闭会话时也不会留下
+    /// 一个必须被 poll 才能推进的 future。
+    reply: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+}
+
+/// 一次管理请求的结果。
+///
+/// 三种而不是两种：超时与"对方明确拒绝"必须分开。把超时报成拒绝会让调用方
+/// 以为 runtime 拒绝了这个项目，而实际上只是没等到回话——那正好会诱使它
+/// 重试一次已经开始的启动。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManagementReply {
+    /// 对端接受了这条请求并给出了结果。
+    Answered(serde_json::Value),
+    /// 会话关闭或换代：这一次没有结论。
+    Abandoned,
+}
+
+/// 一次 `_shell/prepare` 的实际往返。
+///
+/// 与 [`ManagementSession::register`] 分开，是因为"登记一个 id"和"把一帧写进
+/// stdin 并等回话"是两件事：前者是纯内存的，后者要经过进程边界，失败点也
+/// 完全不同。
+pub trait PrepareTransport: Send + Sync + 'static {
+    /// 写一帧到本地 sidecar 的 stdin。
+    fn write_frame(&self, frame: &serde_json::Value) -> Result<(), String>;
 }
 
 /// 壳侧的本地管理会话。
@@ -136,6 +169,18 @@ impl ManagementSession {
 
     /// 登记一条请求。返回 `false` 表示会话已关闭，调用方不应写下这一帧。
     pub fn register(&self, id: &str) -> bool {
+        self.register_with(id, None)
+    }
+
+    /// 登记一条请求，并把它的应答投递到 `reply`。
+    ///
+    /// 先登记再写帧：反过来会有一个窗口，响应在等待者存在之前就到达，于是被
+    /// 当成"不属于任何请求"广播给页面。
+    pub fn register_with(
+        &self,
+        id: &str,
+        reply: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    ) -> bool {
         if self.is_closed() {
             return false;
         }
@@ -144,6 +189,7 @@ impl ManagementSession {
             id.to_string(),
             Pending {
                 epoch: self.epoch.clone(),
+                reply,
             },
         );
         true
@@ -168,7 +214,52 @@ impl ManagementSession {
             .get("sidecar_epoch")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        arrived_epoch == expected.epoch
+        let accepted = arrived_epoch == expected.epoch;
+        if let Some(reply) = expected.reply {
+            // 旧代的响应也投递：投递方按"没拿到结果"处理，与超时同一条路径。
+            // 丢掉它只会让等待者多等一整个 deadline。
+            let _ = reply.send(frame.clone());
+        }
+        accepted
+    }
+
+    /// 发出一次 `_shell/prepare` 并等待它的应答。
+    ///
+    /// 超时不重发：这条请求会启动一个 runtime，重发等于第二次启动。超时只是
+    /// 把槽位清掉并返回"没有结论"，让上层把项目报成 `unknown`。
+    pub fn prepare(
+        &self,
+        transport: &dyn PrepareTransport,
+        request: &yi_agent_lifecycle::production::PrepareRequest,
+        budget: std::time::Duration,
+    ) -> Result<ManagementReply, String> {
+        let id = format!("prepare-{}-{}", self.epoch, uuid::Uuid::new_v4().simple());
+        let (tx, rx) = std::sync::mpsc::channel();
+        if !self.register_with(&id, Some(tx)) {
+            return Ok(ManagementReply::Abandoned);
+        }
+        let frame = self.request_frame(
+            &id,
+            PREPARE_METHOD,
+            serde_json::to_value(request).map_err(|error| error.to_string())?,
+        );
+        if let Err(error) = transport.write_frame(&frame) {
+            // 写不进去等于这次请求从未存在：槽位必须清掉，否则它会一直占着
+            // 一个 id，下一次请求永远等不到自己的应答。
+            self.timeout(&id);
+            return Err(error);
+        }
+        match rx.recv_timeout(budget) {
+            Ok(value) => Ok(ManagementReply::Answered(value)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.timeout(&id);
+                Ok(ManagementReply::Abandoned)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.timeout(&id);
+                Ok(ManagementReply::Abandoned)
+            }
+        }
     }
 
     /// 一条请求超时。
@@ -183,6 +274,9 @@ impl ManagementSession {
     ///
     /// 用于 sidecar 退出/换代与应用退出：这些时刻再等旧响应没有意义，而且
     /// 保留槽位会让下一次请求复用一个已经不存在的 id。
+    ///
+    /// 投递点随槽位一起被丢弃，接收端因此立刻看到断开而不是等到自己的超时——
+    /// 这是"退出时不要等满 30 秒"的实际来源。
     pub fn close(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
