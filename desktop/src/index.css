@@ -1,6 +1,13 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
+/* 侧栏保留自定义清除按钮，避免与 WebKit 原生搜索清除控件重复。 */
+.thread-search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
 /* 语义色 token。组件只引用这些语义名，不写字面色阶，切 data-theme 即整体换肤。 */
 :root {
   --surface: #0a0a0a;

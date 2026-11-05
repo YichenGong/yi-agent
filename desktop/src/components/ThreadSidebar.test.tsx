@@ -1250,6 +1250,66 @@ describe("ThreadSidebar 搜索", () => {
     expect(container.querySelector("[data-rename-input]")).not.toBeNull();
     expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
   });
+
+  it.each([
+    { name: "桌面", isMobile: false },
+    { name: "手机", isMobile: true },
+  ])("$name 搜索框保留 search 语义及独立清除控件样式", ({ isMobile }) => {
+    renderSidebar({ isMobile });
+    const box = searchBox();
+    expect(box.type).toBe("search");
+    expect(box.classList.contains("thread-search-input")).toBe(true);
+    expect(box.classList.contains("pr-8")).toBe(true);
+  });
+
+  it.each([
+    { name: "桌面", isMobile: false },
+    { name: "手机", isMobile: true },
+  ])("$name 清除按钮相对输入框垂直居中", ({ isMobile }) => {
+    // `top-1/2` 的 50% 是相对**定位父级**算的。若父级仍是带 `pb-2` 的外层容器，
+    // 它比输入框高 8px，按钮就会偏低 4px。这条钉住父级必须是输入框那一层。
+    renderSidebar({ isMobile });
+    fireEvent.change(searchBox(), { target: { value: "beta" } });
+    const box = searchBox();
+    const button = screen.getByRole("button", { name: "清除搜索" });
+    const anchor = button.parentElement!;
+
+    expect(anchor).toBe(box.parentElement);
+    expect(anchor.classList.contains("relative")).toBe(true);
+    expect(anchor.classList.contains("pb-2")).toBe(false);
+    expect(button.classList.contains("top-1/2")).toBe(true);
+    expect(button.classList.contains("-translate-y-1/2")).toBe(true);
+  });
+
+  it.each(["beta", "   "])("非空查询 %j 仅渲染一个自定义清除按钮", (value) => {
+    renderSidebar();
+    expect(screen.queryAllByRole("button", { name: "清除搜索" })).toHaveLength(0);
+    fireEvent.change(searchBox(), { target: { value } });
+    const buttons = screen.getAllByRole("button", { name: "清除搜索" });
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].getAttribute("type")).toBe("button");
+    expect(buttons[0].getAttribute("title")).toBe("清除搜索");
+    expect((buttons[0] as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(buttons[0]);
+    expect(searchBox().value).toBe("");
+    expect(screen.queryAllByRole("button", { name: "清除搜索" })).toHaveLength(0);
+    expect(screen.queryByText("alpha-thread")).not.toBeNull();
+  });
+
+  it.each(["button", "escape"] as const)("%s 清空后保持搜索前的分组折叠状态", (via) => {
+    const { container } = renderSidebar();
+    fireEvent.click(container.querySelector('[aria-label="Collapse"]')!);
+    expect(container.textContent).not.toContain("alpha-thread");
+    fireEvent.change(searchBox(), { target: { value: "alpha" } });
+    expect(container.textContent).toContain("alpha-thread");
+    if (via === "button") {
+      fireEvent.click(screen.getByRole("button", { name: "清除搜索" }));
+    } else {
+      fireEvent.keyDown(searchBox(), { key: "Escape" });
+    }
+    expect(searchBox().value).toBe("");
+    expect(container.textContent).not.toContain("alpha-thread");
+  });
 });
 
 describe("ThreadSidebar linked folders", () => {

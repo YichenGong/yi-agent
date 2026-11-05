@@ -1720,30 +1720,34 @@ export function ThreadSidebar({
   );
 
   const searchBar = (
-    <div className="relative px-2 pb-2">
-      <input
-        type="search"
-        aria-label="搜索会话"
-        placeholder="搜索会话…"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        onKeyDown={(e) => {
-          // 清空是幂等动作，不做 IME 特判：输入法组合期按 Esc 取消候选也不会损坏状态。
-          if (e.key === "Escape") clearQuery();
-        }}
-        className="w-full rounded-md border border-line bg-surface px-2 py-1.5 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none"
-      />
-      {query !== "" && (
-        <button
-          type="button"
-          aria-label="清除搜索"
-          title="清除搜索"
-          onClick={clearQuery}
-          className="absolute top-1/2 right-3.5 -translate-y-1/2 rounded px-1 text-fg-subtle hover:text-fg"
-        >
-          ×
-        </button>
-      )}
+    <div className="px-2 pb-2">
+      {/* 按钮的定位父级必须是输入框自身这一层：外层 `pb-2` 会让 `top-1/2`
+          落在「输入框 + 8px 下留白」的中心，按钮因此在视觉上偏低 4px。 */}
+      <div className="relative">
+        <input
+          type="search"
+          aria-label="搜索会话"
+          placeholder="搜索会话…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            // 清空是幂等动作，不做 IME 特判：输入法组合期按 Esc 取消候选也不会损坏状态。
+            if (e.key === "Escape") clearQuery();
+          }}
+          className="thread-search-input w-full rounded-md border border-line bg-surface px-2 pr-8 py-1.5 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none"
+        />
+        {query !== "" && (
+          <button
+            type="button"
+            aria-label="清除搜索"
+            title="清除搜索"
+            onClick={clearQuery}
+            className="absolute top-1/2 right-3.5 -translate-y-1/2 rounded px-1 text-fg-subtle hover:text-fg"
+          >
+            ×
+          </button>
+        )}
+      </div>
     </div>
   );
 

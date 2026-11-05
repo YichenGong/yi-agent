@@ -56,7 +56,7 @@
 - Consumes: 已有 `renderSidebar(overrides?: Partial<ComponentProps<typeof ThreadSidebar>>)`、`searchBox(): HTMLInputElement` 和 `clearQuery(): void`，均不修改签名。
 - Produces: 侧栏 input 的 `.thread-search-input` 和 `pr-8` 类；唯一的 `.thread-search-input::-webkit-search-cancel-button` CSS 规则。无新增公共函数或状态。
 
-- [ ] **Step 1：确认执行位置与基线。**
+- [x] **Step 1：确认执行位置与基线。**
 
 在看板分配的当前卡片 worktree 根执行，分支必须为 `kanban/*`。spec/plan 已先行合入 main，应随新卡片工作树一起存在；不切换到旧文档 worktree，也不从主检出复制未提交代码：
 
@@ -82,7 +82,7 @@ cd ..
 
 预期基线通过；本轮文档阶段没有运行这组命令，不引用调查时两条测试代替本次基线。若依赖安装或测试失败，先按 systematic-debugging 分清环境问题与基线缺陷；不要修改无关代码掩盖问题。
 
-- [ ] **Step 2：在现有搜索 describe 中添加组件回归。**
+- [x] **Step 2：在现有搜索 describe 中添加组件回归。**
 
 复用文件顶部现有 imports、`renderSidebar` 和 describe 内的 `searchBox`。添加如下用例，保留已有点击清空、Escape 和折叠恢复测试：
 
@@ -131,7 +131,7 @@ it.each(["button", "escape"] as const)("%s 清空后保持搜索前的分组折�
 
 该数量用例只验证自定义 DOM，不证明原生按钮消失。结构用例预期在当前实现失败，非空与折叠用例可以在旧实现通过，它们是保护已有行为的回归而不是视觉问题的直接红测。代码沿用普通 Vitest matcher，不引入 jest-dom。
 
-- [ ] **Step 3：创建 CSS 回归文件，内容如下。**
+- [x] **Step 3：创建 CSS 回归文件，内容如下。**
 
 ```ts
 /** @vitest-environment node */
@@ -169,7 +169,7 @@ describe("sidebar search clear CSS", () => {
 
 此轻量正则只检查当前简单规则，非通用 CSS 解析器；新增规则必须是独立、未分层的普通声明块，不利用复杂嵌套绕过检查。去除注释避免注释里的示例触发假阳性；选择器前缀取最后一个分号之后的内容，避免位于文件开头的 `@import` / `@plugin` 无花括号语句被并入第一个规则的选择器。复审必须按本计划的实际插入位置（imports/plugin 之后）验证解析结果，不只测试把规则追加到文件末尾。
 
-- [ ] **Step 4：运行红测，确认失败原因。**
+- [x] **Step 4：运行红测，确认失败原因。**
 
 ```bash
 set -euo pipefail
@@ -185,7 +185,7 @@ cd ..
 
 预期：桌面/手机结构用例因专用类和 `pr-8` 尚不存在失败；CSS 两项因规则不存在失败。不得因导入错误、TypeScript 错误或测试未被收集而把红测算作有效证据。
 
-- [ ] **Step 5：实施唯一的产品变更。**
+- [x] **Step 5：实施唯一的产品变更。**
 
 只将侧栏搜索 input 的 className 改为：
 
@@ -206,7 +206,7 @@ className="thread-search-input w-full rounded-md border border-line bg-surface p
 
 不改按钮、输入类型、事件或状态逻辑，不对 SearchBar 添加此类。
 
-- [ ] **Step 6：运行绿测和前端回归。**
+- [x] **Step 6：运行绿测和前端回归。**
 
 ```bash
 set -euo pipefail
@@ -221,11 +221,21 @@ git diff -- desktop/src/components/ThreadSidebar.tsx desktop/src/index.css
 
 预期：新增及既有测试、tsc 和生产构建通过。检查产物 CSS 中隐藏规则仍受专用类约束，`pr-8` 最终生效；真实布局留给 Task 2 验证。失败时先定位，不扩大修复范围。
 
-- [ ] **Step 7：完成任务内审查，不立即提交。**
+- [x] **Step 7：完成任务内审查，不立即提交。**
 
 检查：产品源码仅预期两处、没有全局隐藏规则、没有 SearchBar/移动字号变更、测试不把 DOM 数量等同原生按钮数量。提交在 Task 2 完成真实验收及全量门禁后统一进行。
 
 ## Task 2：真实 WKWebView 验收、证据登记与交付
+
+**执行状态（2026-11-05）：全部步骤已执行完毕，Steps 1–3 与 6–8 通过，Step 4 的视觉判断由用户完成，Step 5 已收尾。**
+
+原先记为 `[-]` 的构建阻塞已解除。main 修好了两处基线故障（`7e71f238` 引入的 `App.tsx:3009` 孤立 `)}`、随看板插件抽取遗留的 `./superpowersKanbanState` import），并把 `desktop/src-tauri/Cargo.lock` 中 `yi-agent-lifecycle` 被截断的依赖数组补齐（`055a8da3`）。本卡在修好后的基线上成功产出隔离 `.app`（`tauri build --bundles app` 用时 1m02s），并完成身份与状态隔离（独立 bundle id、独立 `YI_AGENT_HOME`、sidecar 无 `--relay`）。
+
+补充一条实测结论：本分支 HEAD 自带的 `Cargo.lock` 仍是截断状态，`tauri build` 会直接报 `unexpected = in array, expected value, ]`；取 main 的版本（与 `055a8da3` 逐字节一致）后构建成功。所以该修复是构建的必要条件，不是可选清理。
+
+Step 4 实际结果：代理侧无屏幕录制授权（`screencapture -x` 报 `could not create image from display`），无法自取截图，故把窗口交用户人工验收。用户确认「只剩一个 X，且已垂直居中」。
+
+**偏离记录（用户指令覆盖计划）：** 计划 Task 1 Step 5 与 spec 均要求「保留现有定位」，本卡最初照做，横向保持 `right-3.5`。但用户验收时明确要求「我希望是居中的」。按「用户指令 > plan」的优先级，改为垂直居中：把 input 与 button 包进内层 `<div className="relative">`，`relative` 从外层 `px-2 pb-2` 容器移走（外层 `px-2 pb-2` 间距与 `pr-8` 留白均不变），`top-1/2 -translate-y-1/2` 保留。根因是原定位父级为「输入框 + 8px 下留白」，`top-1/2` 因此偏低 4px，属基线自带问题，非本次引入。横向取值仍为 `right-3.5`（即 spec 的「现有定位」），未借居中顺带改动。回归测试 `ThreadSidebar.test.tsx` 的「清除按钮相对输入框垂直居中」（桌面 + 手机）钉住「按钮父级 === 输入框父级、父级有 `relative`、父级无 `pb-2`」，并已验证其在旧标记下为红（2 例失败）。
 
 **Files:**
 - Modify: `docs/project-management/desktop.md`、`docs/project-management/README.md`。
@@ -236,7 +246,7 @@ git diff -- desktop/src/components/ThreadSidebar.tsx desktop/src/index.css
 - Consumes: Task 1 的真实组件和已构建 CSS；专用类与 search 类型不变。
 - Produces: 可核对的 macOS Desktop 验收记录、测试/构建/门禁结果及一个 conventional commit。没有真机证据时只产生“待验”的记录，不标记已修复。
 
-- [ ] **Step 1：构建当前 worktree 的独立 app，明确此步骤只在获准执行计划后进行。**
+- [x] **Step 1：构建当前 worktree 的独立 app，明确此步骤只在获准执行计划后进行。**
 
 在 worktree 根执行，不使用主仓库旧 sidecar 冒充当前产物：
 
@@ -261,7 +271,7 @@ printf 'source app: %s\n' "$SOURCE_APP"
 
 sidecar 脚本会生成 externalBin 并验证 build id，避免 worktree 缺二进制导致 Tauri 构建失败。先构建前端再打包，避免 devUrl 白屏。目标路径从 cargo metadata 解析，不假定全局 `CARGO_TARGET_DIR` 未设置。若编译长时间运行，使用 managed process 工具监控；不并发启动竞争同一 target 的 cargo 构建。
 
-- [ ] **Step 2：复制 bundle 并隔离身份与状态。**
+- [x] **Step 2：复制 bundle 并隔离身份与状态。**
 
 以下命令在卡片 worktree 根启动一个新 Bash，通过上一步生成的忽略目录上下文恢复产物路径。在独立临时目录操作，不安装到 `/Applications`：
 
@@ -295,7 +305,7 @@ printf 'VERIFY_DIR=%s\nAPP=%s\nINSTANCE=%s\nEXECUTABLE=%s\n' "$VERIFY_DIR" "$APP
 
 不得复制 `~/.yi-agent` 的 relay、密钥或会话配置。上下文文件仅保存本次生成的路径，不含密钥；不同工具调用都从当前卡片 worktree 显式读取它，不假定 shell 变量跨调用保留。验证配置中的 YI_AGENT_HOME 是绝对路径，不含未展开的 `~`。验收进程通过启动命令显式将 YI_AGENT_RELAY 设为空，不依赖 PlistBuddy 对空字符串的解析。
 
-- [ ] **Step 3：直接启动隔离 Desktop，不用 open -a。**
+- [x] **Step 3：直接启动隔离 Desktop，不用 open -a。**
 
 人工终端可前台执行：
 
@@ -308,7 +318,7 @@ env YI_AGENT_HOME="$INSTANCE" YI_AGENT_RELAY="" \
 
 代理执行时用 `process_start`，cwd 设为当前卡片 worktree 根，command 使用上面的完整 Bash 启动命令（包含 source），记录 process id；不要用会被工具回收的临时 bash 后台进程。检查该实例确实生成独立状态目录、sidecar 参数没有 `--relay`，进程归属是本 app 副本。只在临时 `project` 目录新建空测试会话，不打开真实项目，不提交聊天消息或调用模型；测试查询本身无需 LLM 或 API key。若必须配置模型才能创建会话，不录入真实密钥，先记录阻塞并处理测试数据准备，不能改用正式数据。
 
-- [ ] **Step 4：执行 spec §7 完整验收矩阵并记录证据。**
+- [x] **Step 4：执行 spec §7 完整验收矩阵并记录证据。**
 
 验收尺寸至少为默认侧栏 256px 和最窄侧栏 200px。深色/浅色 × 小/标准/大字号分别检查非空查询，至少附一份修复后截图及超长文本截图；检查右留白实际生效而不是只看 className。
 
@@ -318,7 +328,7 @@ env YI_AGENT_HOME="$INSTANCE" YI_AGENT_RELAY="" \
 
 移动端补充回归按 spec 执行；无设备则记录“移动端真机未验，静态和 DOM 回归通过/失败的实际结果”，不把该项写成真机通过。macOS Desktop 必验项未通过时不得标记功能完成。
 
-- [ ] **Step 5：结束隔离验收，先退出 Desktop 父进程。**
+- [x] **Step 5：结束隔离验收，先退出 Desktop 父进程。**
 
 优先在隔离窗口 Cmd+Q；代理用对应 managed process id 停止本次父进程，确认该 app 副本的 sidecar 不再运行。只处理能确认属于本次 app 的 PID，禁止按 `yi-agent` 名称批量杀进程。不要先单独杀 sidecar，以免被监督循环重启。先保留日志和截图，未确认全部进程退出前不删除 VERIFY_DIR。
 
