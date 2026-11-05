@@ -1360,6 +1360,58 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Whether a container write is authorised by its turn instead of a capability.
+    ///
+    /// A tool holds the turn secret, never the host's binding or the legacy
+    /// application capability: those two are the host's identity, and handing one
+    /// to a model would let it act after the turn it belonged to ended. So when the
+    /// presented `capability` *is* the open turn's secret, the turn is the whole
+    /// authority.
+    ///
+    /// Every other shape returns `Ok(false)` and keeps the legacy capability check
+    /// exactly as it was -- including for a container whose host has not migrated
+    /// yet and still presents the application capability alongside its turn. That
+    /// is not a bypass: the daemon entry points already require the open turn for a
+    /// container, so the legacy capability only ever adds a check, never removes
+    /// one.
+    fn authorize_container_write(
+        &self,
+        parent: &TaskId,
+        capability: &str,
+        turn: Option<&yi_agent_lifecycle::session_delegation::SessionTurn>,
+    ) -> Result<bool, RuntimeCoordinatorError> {
+        let Some(turn) = turn else {
+            return Ok(false);
+        };
+        let role = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_role(parent)
+            .or_else(|error| match error {
+                crate::repository::RepositoryError::TaskNotFound { .. } => Ok(TaskRole::Execution),
+                other => Err(other),
+            })?;
+        if role != TaskRole::SessionContainer {
+            // An execution may not borrow the container admission; the legacy
+            // capability check below gives it its own verdict.
+            return Ok(false);
+        }
+        if turn.fence.root.root_id != parent.to_string() {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(
+                "the turn belongs to another container".into(),
+            ));
+        }
+        if turn.capability.expose() != capability {
+            // Not the turn secret: let the caller fall back to the application
+            // capability path, which the daemon entry point already fenced with
+            // this same turn.
+            return Ok(false);
+        }
+        self.authorize_session_write(turn)?;
+        Ok(true)
+    }
+
     fn authorize_application_root(
         &self,
         session: &RootSessionId,
@@ -1638,8 +1690,11 @@ impl RuntimeCoordinator {
         thread_id: Option<String>,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
         fork_token: Option<String>,
+        session_turn: Option<&yi_agent_lifecycle::session_delegation::SessionTurn>,
     ) -> Result<TaskId, RuntimeCoordinatorError> {
-        self.authorize_application_root(session, parent, capability)?;
+        if !self.authorize_container_write(parent, capability, session_turn)? {
+            self.authorize_application_root(session, parent, capability)?;
+        }
         self.spawn_child_and_admit(
             session,
             parent,
@@ -3208,13 +3263,16 @@ impl RuntimeCoordinator {
         capability: &str,
         recipient: TaskId,
         message: String,
+        session_turn: Option<&yi_agent_lifecycle::session_delegation::SessionTurn>,
     ) -> Result<(), RuntimeCoordinatorError> {
         if message.trim().is_empty() {
             return Err(RuntimeCoordinatorError::Supervisor(
                 "message must be non-empty".into(),
             ));
         }
-        self.authorize_application_root(session, sender, capability)?;
+        if !self.authorize_container_write(sender, capability, session_turn)? {
+            self.authorize_application_root(session, sender, capability)?;
+        }
         let supervisor = self.supervisor(session)?;
         let mut supervisor = supervisor.lock().await;
         // Reuse supervisor adjacency and terminal-state checks without requiring

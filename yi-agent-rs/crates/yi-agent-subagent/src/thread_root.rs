@@ -89,12 +89,35 @@ pub struct ThreadRoot {
     /// can never be read apart: a root is only ever paired with the runtime that
     /// created it.
     cached: Mutex<Option<CachedRoot>>,
+    /// The container address minted for this conversation, per generation.
+    ///
+    /// Kept apart from `cached` because a container root is *not* an
+    /// `AttachedRoot`: it carries no capability, and mixing the two would make it
+    /// far too easy to hand a container's address to a legacy path that expects one.
+    container: Mutex<Option<SessionContainerAttachment>>,
 }
 
 /// A conversation root plus the runtime generation that minted it.
 struct CachedRoot {
     generation: u64,
     root: AttachedRoot,
+}
+
+/// One attached container's address, and nothing else.
+///
+/// Deliberately not an [`AttachedRoot`]: a container attach never returns a
+/// capability, so there is no field here a caller could mistake for one. The
+/// binding that authorises writes is issued separately by `prepare`, and only to
+/// a host that proved an identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionContainerAttachment {
+    pub session_id: String,
+    pub root_id: String,
+    /// Where the container's root runs. Cached so a re-attach can be skipped
+    /// without re-deriving it from the request.
+    pub workspace_root: PathBuf,
+    /// The daemon generation this address was resolved against.
+    pub generation: u64,
 }
 
 /// Whether a cached root still belongs to the runtime the binding is currently
@@ -121,6 +144,7 @@ impl ThreadRoot {
             project_dir,
             extra_roots,
             cached: Mutex::new(None),
+            container: Mutex::new(None),
         })
     }
 
@@ -223,6 +247,82 @@ impl ThreadRoot {
             },
         });
         Ok(())
+    }
+
+    /// Attaches (or adopts) this conversation's *container* on the shared daemon.
+    ///
+    /// Separate from [`Self::attach`] on purpose. The legacy attach hands back a
+    /// capability, which is exactly what a restarted host must not be able to lift
+    /// by naming a thread key; this one answers with an address only, and the
+    /// authority comes later from [`Self::prepare_session`] against an identity.
+    ///
+    /// `creation_resume_digest` is sent only for the call that *creates* the
+    /// container. Sending it on an adopt would propose a new digest to an existing
+    /// container, which is how one host would take over another's session.
+    pub fn attach_session_container(
+        &self,
+        identity: &yi_agent_lifecycle::session_delegation::SessionIdentity,
+        operation_id: &str,
+        creation_resume_digest: Option<String>,
+    ) -> Result<SessionContainerAttachment, crate::session_delegation::SessionClientError> {
+        use crate::session_delegation::SessionClientError;
+
+        let generation = self.binding.generation();
+        if let Some(cached) = self.live_session_container(generation) {
+            return Ok(cached);
+        }
+        let (response, generation) = self
+            .binding
+            .send_with_generation(|_handle| IpcRequest::AttachSessionContainer {
+                idempotency_key: application_root_key(&self.thread_id),
+                workspace: self.project_dir.clone(),
+                extra_roots: self
+                    .extra_roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect(),
+                operation_id: operation_id.to_string(),
+                creation_resume_digest: creation_resume_digest.clone(),
+                identity: Some(identity.clone()),
+            })
+            .map_err(SessionClientError::Transport)?;
+        let IpcResponse::SessionContainerAttached { root, workspace } = response else {
+            return Err(match response {
+                IpcResponse::SessionDelegationRejected { failure } => {
+                    SessionClientError::Rejected(failure)
+                }
+                other => SessionClientError::Protocol(format!(
+                    "the daemon did not attach a session container: {other:?}"
+                )),
+            });
+        };
+        let attachment = SessionContainerAttachment {
+            session_id: root.session_id,
+            root_id: root.root_id,
+            workspace_root: workspace.path,
+            generation,
+        };
+        *self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(attachment.clone());
+        Ok(attachment)
+    }
+
+    /// The cached container address for the live generation, if any.
+    fn live_session_container(&self, generation: u64) -> Option<SessionContainerAttachment> {
+        let mut cached = self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cached.as_ref() {
+            Some(entry) if entry.generation == generation => Some(entry.clone()),
+            Some(_) => {
+                *cached = None;
+                None
+            }
+            None => None,
+        }
     }
 
     /// The handle a delegation call should act as: the shared socket plus this

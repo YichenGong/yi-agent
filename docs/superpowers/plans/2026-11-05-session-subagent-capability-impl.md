@@ -594,7 +594,7 @@ impl SessionIdentityStore {
 拒绝 symlink/非法 thread id，使用 create_new 和原子 rename/fsync；并发创建 loser 读取 winner，
 不能覆盖。现有文件损坏/权限不安全时拒绝，不当“无文件”重建。
 
-- [ ] **Step 1：红测试**，在 session_identity.rs：
+- [x] **Step 1：红测试**，在 session_identity.rs：
 
 ```rust
 #[test]
@@ -615,8 +615,8 @@ fn session_delegation_lifecycle_resume_secret_is_private_and_stable() {
 spawn、记录 child 创建、丢响应；客户端不得再发第二个 spawn，不将旧调用换 turn 重试。
 server 线程必须 join，超时 socket 释放后清理，不留下悬挂测试。
 
-- [ ] **Step 2：确认红**：`cargo test -p yi-agent-subagent session_delegation_lifecycle_resume_secret_is_private_and_stable`。
-- [ ] **Step 3：实现**：使用 Task 6 的 AttachSessionContainer；先在宿主0600存储落盘凭证，
+- [x] **Step 2：确认红**：`cargo test -p yi-agent-subagent session_delegation_lifecycle_resume_secret_is_private_and_stable`。
+- [x] **Step 3：实现**：使用 Task 6 的 AttachSessionContainer；先在宿主0600存储落盘凭证，
 新建才提交 `creation_resume_digest`，既有容器用 identity prepare，不用旧公开 attach 领秘密。
 为 ThreadRoot 添加 `pub fn attach_session_container(&self, identity: &SessionIdentity,
 operation_id: &str, creation_resume_digest: Option<String>) -> Result<SessionRef, SessionClientError>`：
@@ -635,8 +635,27 @@ SessionHost 仅在 prepare/begin 时重连，工具使用捕获的 handle/token�
 和未确认状态。创建应答丢失后用预存凭证证明身份，不新增容器。
 `ThreadRoot::from_handle` 不自动创建 SessionHost，worker 工具仍保持 Execution 路径。
 
-- [ ] **Step 4：绿**：`cargo test -p yi-agent-subagent --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client && cargo test -p yi-agent-subagent --test attach_delegation`；断言 runtime DB、日志、thread JSONL、fork transcript 都不出现新长期 secret。
+- [x] **Step 4：绿**：`cargo test -p yi-agent-subagent --lib session_delegation_lifecycle && cargo test -p yi-agent-subagent --test session_delegation_client && cargo test -p yi-agent-subagent --test attach_delegation`；断言 runtime DB、日志、thread JSONL、fork transcript 都不出现新长期 secret。
 - [ ] **Step 5：提交**：fmt 后提交 `feat: reconnect session hosts with private resume credentials`。
+
+
+**完成证据（2026-11-05）：**
+
+- 私有凭证存储 `crates/yi-agent-subagent/src/session_identity.rs`：目录 0700、文件 0600、
+  `create_new` + 临时文件 + 原子 rename/fsync、并发 loser 读 winner、拒 symlink 与非法 thread id、
+  损坏或不安全权限拒绝而非重建；`resume_digest`/`fingerprint` 供线上使用。
+- 客户端 `crates/yi-agent-subagent/src/session_delegation.rs`：`SessionHost`（prepare / begin_turn /
+  finish_turn / register_execution / record_stopped）、`SessionTurnClient`（固定 handle + 本地关闭闸门）、
+  `HostControl`（独立控制流，binding capability 才能打开）。turn capability 只放本轮 `RuntimeHandle`，
+  宿主 binding 不出 `SessionHost`。
+- `ThreadRoot::attach_session_container` 只返回无秘密 `SessionContainerAttachment`；`creation_resume_digest`
+  只在新建容器时发送，接管既有容器不发送（避免身份劫持）。
+- 泄漏断言：`session_delegation_lifecycle_resume_secret_never_reaches_durable_state` 递归扫描运行目录
+  （runtime DB 及 WAL/SHM、其余运行产物），豁免项只有 0600 凭证目录本身；同时断言 DB 内确实存在
+  resume digest，避免"扫了个空目录"式的假通过。
+- 测试：`cargo test -p yi-agent-subagent --offline --test session_delegation_client` 8 passed；
+  `cargo test -p yi-agent-subagent --offline` 全绿；`cargo test -p yi-agent-store --offline
+  --features foreground-test-support` 全绿。
 
 ## Task 8：run 级工具快照，不让旧调用偷取新能力
 

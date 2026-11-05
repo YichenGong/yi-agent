@@ -398,6 +398,40 @@ pub enum IpcRequest {
     EndSessionTurn {
         turn: yi_agent_lifecycle::session_delegation::SessionTurn,
     },
+    /// Opens the host-private control stream for one bound session.
+    ///
+    /// Not a model tool. It must be opened with the *binding* capability, which
+    /// never leaves the host; a turn secret is refused, so a tool process cannot
+    /// register an execution or claim one stopped.
+    OpenSessionHostControl {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    },
+}
+
+/// One frame on the host control stream, after `OpenSessionHostControl`.
+///
+/// The stream has its own request DTO on purpose: echoing it as an `IpcRequest`
+/// would make the control operations reachable on any ordinary connection, which
+/// is exactly the bypass the capability gate exists to prevent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionHostControlFrame {
+    pub request_id: String,
+    pub request: SessionHostControlRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
+pub enum SessionHostControlRequest {
+    /// Registers the current turn's execution before it can do any work.
+    Register { turn_id: String },
+    /// Reports a stop proof for an execution this stream registered.
+    ///
+    /// Boxed because a `StopEvidence` is far larger than the other variant and
+    /// every control frame would otherwise be sized for it.
+    Stopped {
+        evidence: Box<yi_agent_lifecycle::foreground::StopEvidence>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +504,13 @@ pub enum IpcResponse {
         turn: yi_agent_lifecycle::session_delegation::SessionTurn,
     },
     SessionTurnClosed,
+    /// The control stream is open; only this connection may send
+    /// `SessionHostControlFrame`s after it.
+    SessionHostControlReady,
+    SessionHostExecutionRegistered {
+        execution: yi_agent_lifecycle::foreground::ExecutionIdentity,
+    },
+    SessionHostStopRecorded,
     /// A structured delegation refusal, so the client branches on a code rather
     /// than on English text.
     SessionDelegationRejected {

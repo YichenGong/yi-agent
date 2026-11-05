@@ -167,6 +167,7 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("the runtime socket must accept a delegated child");
@@ -294,6 +295,7 @@ fn a_spawned_child_inherits_the_conversations_linked_roots() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("the runtime socket must accept a delegated child");
@@ -458,6 +460,7 @@ fn delegation_tools_act_as_the_conversations_own_root() {
             thread_id: Some("thread-a".into()),
             sandbox: None,
             fork_token: None,
+            session_turn: None,
         },
     )
     .expect("A's child must be admitted");

@@ -426,6 +426,112 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
+    /// Verifies a control stream may act for this container.
+    ///
+    /// The binding capability never leaves the host, so a caller holding one is
+    /// that host in this generation. Equality against the live binding is the
+    /// whole check: a turn secret is not a binding, and cannot get here.
+    pub fn open_host_control(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        if binding.fence.generation != self.generation {
+            return Err(RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::StaleGeneration,
+                reason: "the control stream belongs to an older daemon generation".to_string(),
+            });
+        }
+        let state = self
+            .session_delegation_state()
+            .lock()
+            .expect("session delegation mutex poisoned");
+        let Some(live) = state.bindings.get(&binding.fence.root.root_id) else {
+            return Err(RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::StaleBinding,
+                reason: "this container has no live binding".to_string(),
+            });
+        };
+        if live != binding {
+            // A turn secret is the one capability a tool holds, so it is worth
+            // naming explicitly rather than reporting the generic "not the live
+            // binding": the host needs to know a tool tried to open the control
+            // stream, not that its own binding looked odd.
+            let turn_secret = state
+                .turns
+                .get(&binding.fence.root.root_id)
+                .is_some_and(|open| open.turn.capability == binding.capability);
+            return Err(RuntimeCoordinatorError::SessionDelegation {
+                code: if turn_secret {
+                    SessionFailureCode::AuthorityDenied
+                } else {
+                    SessionFailureCode::StaleBinding
+                },
+                reason: if turn_secret {
+                    "a turn secret cannot open the host control stream".to_string()
+                } else {
+                    "the presenting binding is not the live one".to_string()
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// Registers one execution of a bound host's current turn.
+    ///
+    /// The turn has to be the open one: registering after a later turn opened
+    /// would let an abandoned run leave a `starting` row that blocks every
+    /// future driver for no reason.
+    pub fn register_host_control_execution(
+        &self,
+        binding: &SessionBinding,
+        turn_id: &str,
+    ) -> Result<yi_agent_lifecycle::foreground::ExecutionIdentity, RuntimeCoordinatorError> {
+        self.open_host_control(binding)?;
+        {
+            let state = self
+                .session_delegation_state()
+                .lock()
+                .expect("session delegation mutex poisoned");
+            let Some(open) = state.turns.get(&binding.fence.root.root_id) else {
+                return Err(RuntimeCoordinatorError::SessionDelegation {
+                    code: SessionFailureCode::AdmissionClosed,
+                    reason: "no turn is open for this session".to_string(),
+                });
+            };
+            if open.turn.turn_id != turn_id || open.turn.fence != binding.fence {
+                return Err(RuntimeCoordinatorError::SessionDelegation {
+                    code: SessionFailureCode::StaleTurn,
+                    reason: "the execution does not name the open turn".to_string(),
+                });
+            }
+        }
+        let root: TaskId = binding.fence.root.root_id.parse().map_err(|_| {
+            RuntimeCoordinatorError::session_delegation(
+                SessionFailureCode::CorruptAttachment,
+                format!("{} is not a task id", binding.fence.root.root_id),
+            )
+        })?;
+        self.record_host_execution(RegisterExecution {
+            root_task_id: root,
+            fence: binding.fence.clone(),
+            turn_id: turn_id.to_string(),
+        })
+    }
+
+    /// Records a stop proof on the host control stream.
+    ///
+    /// The evidence must describe this host's own fence; the repository's
+    /// conditional update then refuses an execution id that is not live under
+    /// that fence, so naming someone else's execution cannot retire it.
+    pub fn record_host_control_stop(
+        &self,
+        binding: &SessionBinding,
+        evidence: &yi_agent_lifecycle::foreground::StopEvidence,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        self.open_host_control(binding)?;
+        self.record_host_execution_stop(&binding.fence, evidence)
+    }
+
     /// Pre-checks that a write may proceed under this turn.
     ///
     /// A pre-check only. A caller must re-check inside the gate that performs the

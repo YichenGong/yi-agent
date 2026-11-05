@@ -9,6 +9,8 @@ pub mod attach;
 pub mod binding;
 pub mod executor;
 pub mod foreground;
+pub mod session_delegation;
+pub mod session_identity;
 pub mod thread_root;
 
 use std::collections::HashMap;
@@ -1494,6 +1496,7 @@ impl Tool for DaemonApplicationSendMessageTool {
                     capability: handle.capability.clone(),
                     recipient_task_id: recipient.clone(),
                     message: message.clone(),
+                    session_turn: None,
                 }
             }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
@@ -2168,6 +2171,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                         sandbox: sandbox.clone(),
                         fork_token: fork_token.clone(),
                         thread_id: thread_id.clone(),
+                        session_turn: None,
                     }
                 });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
@@ -2433,6 +2437,7 @@ impl Tool for DaemonSpawnAgentTool {
                         workdir: workdir.clone(),
                         sandbox: sandbox.clone(),
                         fork_token: fork_token.clone(),
+                        session_turn: None,
                     }
                 });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
@@ -4922,6 +4927,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap()
@@ -4976,6 +4982,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap()

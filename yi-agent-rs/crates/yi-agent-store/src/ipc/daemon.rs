@@ -852,6 +852,12 @@ pub(crate) fn handle_client(
                     subscription,
                 );
             }
+            IpcRequest::OpenSessionHostControl { binding } => {
+                // A control stream, not a request: it owns this connection for as
+                // long as the host keeps it open, so it is dispatched before the
+                // one-shot reply path below and answered in place.
+                return stream_session_host_control(&mut stream, coordinator, binding, &request_id);
+            }
             IpcRequest::SubscribeEvents {
                 after_event_id,
                 filters,
@@ -912,6 +918,100 @@ pub(crate) fn handle_client(
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
+}
+
+/// Serves the host control stream until the host closes it.
+///
+/// One frame at a time, each answered with the same `request_id` so a host can
+/// correlate replies with what it sent. A refusal is answered, never silently
+/// dropped: a host that cannot register an execution has to learn that before it
+/// starts doing work, not by a later write failing for an unexplained reason.
+pub(crate) fn stream_session_host_control(
+    stream: &mut UnixStream,
+    coordinator: &Arc<RuntimeCoordinator>,
+    binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    request_id: &str,
+) -> Result<(), IpcError> {
+    if let Err(error) = coordinator.open_host_control(&binding) {
+        let error = IpcError::from(error);
+        log_request_failure(request_id, &error);
+        write_response_frame(stream, request_id, None, &error_response(&error))?;
+        return Ok(());
+    }
+    write_response_frame(
+        stream,
+        request_id,
+        None,
+        &IpcResponse::SessionHostControlReady,
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    // The accepted socket inherits `O_NONBLOCK` from the listener, so a plain
+    // read reports `WouldBlock` whenever no frame is queued yet. A control stream
+    // is idle most of its life by design, so the wait is explicit rather than
+    // "treat it as a disconnect": the latter would kill every control stream on
+    // its first quiet moment.
+    reader
+        .get_ref()
+        .set_nonblocking(false)
+        .map_err(IpcError::Io)?;
+    loop {
+        let frame = match read_limited_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            // A host that goes away is the normal end of this stream and says
+            // nothing about the container: its durable `starting` rows are what
+            // keep the next driver honest.
+            Ok(None) | Err(_) => return Ok(()),
+        };
+        let Ok(frame) = serde_json::from_slice::<SessionHostControlFrame>(&frame) else {
+            write_response_frame(
+                stream,
+                request_id,
+                None,
+                &IpcResponse::Error {
+                    code: IpcErrorCode::Validation,
+                    message: None,
+                },
+            )?;
+            continue;
+        };
+        let response = match frame.request {
+            SessionHostControlRequest::Register { turn_id } => {
+                match coordinator.register_host_control_execution(&binding, &turn_id) {
+                    Ok(execution) => IpcResponse::SessionHostExecutionRegistered { execution },
+                    Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                        IpcResponse::SessionDelegationRejected {
+                            failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                                code, reason,
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        let error = IpcError::from(error);
+                        log_request_failure(request_id, &error);
+                        error_response(&error)
+                    }
+                }
+            }
+            SessionHostControlRequest::Stopped { evidence } => {
+                match coordinator.record_host_control_stop(&binding, &evidence) {
+                    Ok(()) => IpcResponse::SessionHostStopRecorded,
+                    Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                        IpcResponse::SessionDelegationRejected {
+                            failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                                code, reason,
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        let error = IpcError::from(error);
+                        log_request_failure(request_id, &error);
+                        error_response(&error)
+                    }
+                }
+            }
+        };
+        write_response_frame(stream, request_id, None, &response)?;
+    }
 }
 
 pub(crate) fn respond_to_subscription_result(
@@ -1257,6 +1357,22 @@ fn plugin_maintenance(plugin: String, protocol: Option<u32>) -> Result<IpcRespon
     })
 }
 
+/// A session-delegation refusal, as the typed response the client branches on.
+///
+/// Without this, a refusal raised inside a coordinator call would be flattened by
+/// `error_response` into a bare `Conflict` frame, and the model would learn only
+/// "something was wrong" instead of "this turn is stale, open a new one".
+pub(crate) fn session_rejection(error: RuntimeCoordinatorError) -> IpcResponse {
+    match error {
+        RuntimeCoordinatorError::SessionDelegation { code, reason } => {
+            IpcResponse::SessionDelegationRejected {
+                failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(code, reason),
+            }
+        }
+        other => error_response(&IpcError::from(other)),
+    }
+}
+
 pub(crate) fn respond(
     context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
@@ -1517,6 +1633,12 @@ pub(crate) fn respond(
                 })
                 .collect(),
         }),
+        // Handled by `handle_client` before this one-shot dispatcher: the control
+        // stream owns its connection, so reaching here means it was not opened.
+        IpcRequest::OpenSessionHostControl { .. } => Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a host control stream cannot be opened on the one-shot request path",
+        ))),
         // Forwarded verbatim: the daemon never inspects `method` or `params`,
         // and never invents a socket path - only a supervised plugin's declared
         // socket is reachable, so this cannot serve as a local socket proxy.
@@ -1552,7 +1674,11 @@ pub(crate) fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
-            coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())?;
+            if let Err(error) =
+                coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
@@ -1591,14 +1717,18 @@ pub(crate) fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
-            coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())?;
+            if let Err(error) =
+                coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let task_id = runtime.block_on(coordinator.spawn_application_child(
+            let task_id = match runtime.block_on(coordinator.spawn_application_child(
                 &session_id,
                 &parent_task_id,
                 &capability,
@@ -1609,7 +1739,11 @@ pub(crate) fn respond(
                 thread_id,
                 inherited_sandbox,
                 fork_token,
-            ))?;
+                session_turn.as_ref(),
+            )) {
+                Ok(task_id) => task_id,
+                Err(error) => return Ok(session_rejection(error)),
+            };
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
             })
@@ -1788,18 +1922,25 @@ pub(crate) fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let sender_task_id = parse_id::<TaskId>(&sender_task_id)?;
-            coordinator.admit_session_write(&sender_task_id, session_turn.as_ref())?;
+            if let Err(error) =
+                coordinator.admit_session_write(&sender_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let recipient_task_id = parse_id::<TaskId>(&recipient_task_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(coordinator.send_application_message(
+            if let Err(error) = runtime.block_on(coordinator.send_application_message(
                 &session_id,
                 &sender_task_id,
                 &capability,
                 recipient_task_id,
                 message,
-            ))?;
+                session_turn.as_ref(),
+            )) {
+                return Ok(session_rejection(error));
+            }
             Ok(IpcResponse::MessageQueued)
         }
         IpcRequest::SendUserMessage { task_id, message } => {
