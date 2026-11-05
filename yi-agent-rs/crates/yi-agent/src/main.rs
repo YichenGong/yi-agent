@@ -380,7 +380,11 @@ fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> R
 fn run_internal_guardian() -> Result<()> {
     // Authorization first: the descriptor is what proves this role was assigned by
     // a launcher, so its absence must be the reported reason.
-    let _bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    // Watched, not merely held. Holding the descriptor only proves the launcher was
+    // alive at `exec`; reading it is what makes "the launcher is gone" observable,
+    // and a guardian that never reads it serves forever after its launcher exits.
+    let bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    let launcher = yi_agent_supervisors::lifecycle::guardian::LauncherLifeline::watch(bootstrap);
     let key = yi_agent_supervisors::lifecycle::roles::scope_key()?;
     let runtime_dir = std::path::PathBuf::from(&key);
     let instance_home = std::env::var_os("YI_AGENT_INSTANCE_HOME")
@@ -394,7 +398,7 @@ fn run_internal_guardian() -> Result<()> {
         &project,
         &instance_home,
     )?;
-    managed_runtime::run_guardian(scope)
+    managed_runtime::run_guardian(scope, launcher)
 }
 
 /// Serves one runtime's business daemon as the managed role.

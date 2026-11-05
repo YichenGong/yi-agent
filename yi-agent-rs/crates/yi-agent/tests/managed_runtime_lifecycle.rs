@@ -192,13 +192,15 @@ impl RuntimeHarness {
     }
 
     /// The guardian's pid, read from the runtime's own records.
+    /// The guardian's own pid, never a managed child's.
+    ///
+    /// This used to read the first entry of `processes.json`, which is the *daemon*:
+    /// the journal exists to record managed children, and a guardian is not one of
+    /// them. Killing that pid stopped the daemon while leaving the guardian alive, and
+    /// a live guardian restarts its daemon -- so the cleanup looked like it worked and
+    /// then silently undid itself.
     fn guardian_pid(&self) -> Option<i32> {
-        let text = std::fs::read_to_string(self.runtime_dir.join("processes.json")).ok()?;
-        let records: Vec<serde_json::Value> = serde_json::from_str(&text).ok()?;
-        records
-            .first()
-            .and_then(|record| record["pid"].as_i64())
-            .map(|pid| pid as i32)
+        yi_agent_supervisors::lifecycle::guardian::recorded_guardian_pid(&self.scope())
     }
 
     /// Registers one frontend and returns its id.
@@ -269,9 +271,7 @@ impl RuntimeHarness {
         let deadline = Instant::now() + budget;
         loop {
             match self.guardian_pid() {
-                // Signal 0 asks "does this process exist", which is the honest
-                // question: a detached guardian leaves no `Child` to wait on.
-                Some(pid) if unsafe { libc::kill(pid, 0) } != 0 => return Ok(()),
+                Some(pid) if guardian_has_exited(pid) => return Ok(()),
                 None => return Ok(()),
                 _ => {}
             }
@@ -305,6 +305,29 @@ impl Drop for RuntimeHarness {
                 .status();
         }
     }
+}
+
+/// Whether a guardian this test started has really exited.
+///
+/// `kill(pid, 0)` is not the right question here: the launch path drops the `Child`
+/// handle on purpose (a guardian must outlive the client that started it), so when it
+/// exits nobody waits for it and it stays a zombie. A zombie still answers
+/// `kill(pid, 0)`, so an existence check would report "still running" forever and the
+/// test would only pass if it happened to watch a different pid.
+///
+/// `waitpid(WNOHANG)` is the honest check: it returns the pid once it has been reaped,
+/// which is what "exited" actually means for our own child.
+fn guardian_has_exited(pid: i32) -> bool {
+    let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    if reaped == pid {
+        return true;
+    }
+    if reaped == -1 {
+        // Not our child any more (`ECHILD`): it was already reaped, or it was never
+        // ours. Existence is all that is left to ask.
+        return unsafe { libc::kill(pid, 0) } != 0;
+    }
+    false
 }
 
 /// The identity of the binary this test was built with.

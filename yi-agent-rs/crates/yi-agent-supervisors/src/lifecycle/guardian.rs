@@ -70,6 +70,16 @@ pub const BRIDGE_FD: RawFd = 7;
 pub const READY_CONSUMED_ENV: &str = "YI_AGENT_MANAGED_READY_CONSUMED";
 /// Where the ownership journal lives inside the runtime directory.
 pub const JOURNAL_FILE: &str = "processes.json";
+
+/// File naming the guardian process itself.
+///
+/// The journal records *managed children*, and its first entry is the daemon, not
+/// the guardian. A caller that wants to stop a guardian it started therefore cannot
+/// read it from `processes.json`: doing so kills the daemon and leaves the guardian
+/// running (it then restarts the daemon, which looks like "the stop did nothing").
+/// This file is the missing piece, and it holds a pid plus the birth time so a
+/// recycled pid is detectable.
+pub const GUARDIAN_PID_FILE: &str = "guardian.pid";
 /// The guardian's control socket name.
 ///
 /// Re-exported from `yi-agent-lifecycle`: the desktop shell resolves the same
@@ -1119,6 +1129,87 @@ impl Drop for ProcessRegistry {
     }
 }
 
+/// Records this guardian's own pid, so a launcher can stop exactly it.
+///
+/// Written only after the control socket is bound: before that, the guardian is not
+/// serving and a launcher that read the file would be racing a process that may still
+/// fail to start. The birth time is included for the same reason the journal records
+/// it -- a pid alone cannot tell a live guardian from a recycled number.
+pub fn record_guardian_pid(scope: &RuntimeScope) -> io::Result<()> {
+    let path = scope.runtime_dir.join(GUARDIAN_PID_FILE);
+    let pid = std::process::id();
+    let birth = ProcessBirth::of(pid as i32)
+        .map(|birth| birth.started_at())
+        .unwrap_or(0);
+    let body = format!("{{\"pid\":{pid},\"start_micros\":{birth}}}");
+    std::fs::write(&path, body)
+}
+
+/// Reads the guardian pid this runtime recorded, if any.
+///
+/// `None` covers both "no guardian ever recorded itself" and "the file is unreadable
+/// or malformed". Neither is an error for the caller: a guardian that cannot be
+/// identified is one that must not be signalled on a guess.
+pub fn recorded_guardian_pid(scope: &RuntimeScope) -> Option<i32> {
+    let text = std::fs::read_to_string(scope.runtime_dir.join(GUARDIAN_PID_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value["pid"].as_i64().map(|pid| pid as i32)
+}
+
+/// Watches the launcher's end of the bootstrap socketpair for EOF.
+///
+/// The launcher holds its end open for exactly as long as it lives, so a socketpair
+/// only produces EOF here when that process is gone. Reading is the whole mechanism:
+/// taking the descriptor and never reading it cannot observe a peer closing, which
+/// is why a guardian in that state had no way to learn its launcher had exited.
+///
+/// The descriptor is *kept open* in this process. Closing it would send the peer an
+/// EOF the launcher never intended, so the launcher's own liveness check would fire
+/// while it is still running.
+pub struct LauncherLifeline {
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LauncherLifeline {
+    /// Starts a detached reader on `peer`, returning the flag it will set.
+    ///
+    /// Detached on purpose: there is nothing to join, and joining would block until
+    /// the launcher exits. A read error other than EOF is treated as EOF because a
+    /// lifeline that cannot be read can no longer prove the launcher is alive, and
+    /// "cannot prove alive" must not be reported as alive.
+    pub fn watch(peer: std::os::fd::OwnedFd) -> Self {
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&gone);
+        let stream = std::os::unix::net::UnixStream::from(peer);
+        std::thread::Builder::new()
+            .name("launcher-lifeline".to_string())
+            .spawn(move || {
+                use std::io::Read;
+                let mut sink = [0u8; 64];
+                let mut stream = stream;
+                // No frame is ever expected in either direction: this descriptor is
+                // a lifeline, and accepting a payload would quietly turn it into a
+                // command channel that the launcher never agreed to serve.
+                loop {
+                    match stream.read(&mut sink) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .ok();
+        Self { gone }
+    }
+
+    /// Whether the launcher that started this guardian is gone.
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// What one managed group currently looks like.
 enum GroupState {
     /// No live member remains, and the group was proven ours.
@@ -1242,6 +1333,11 @@ pub struct GuardianDaemon {
 pub struct Guardian {
     pub(super) scope: RuntimeScope,
     artifact: ArtifactIdentity,
+    /// The launcher's lifeline, when this guardian was started by one.
+    ///
+    /// `None` for a guardian started inside its own process (the in-process tests),
+    /// which has no launcher to outlive or to notice.
+    launcher: Option<LauncherLifeline>,
     pub(super) generation: DaemonInstanceId,
     /// The registry, kept alongside the reclaimer's backend.
     ///
@@ -1330,6 +1426,7 @@ impl Guardian {
         Self {
             scope,
             artifact,
+            launcher: None,
             generation,
             registry: None,
             demands: None,
@@ -1670,6 +1767,37 @@ impl Guardian {
             && !self.reclaim.has_running_operations()
     }
 
+    /// Attaches the launcher's lifeline, so this guardian can notice it is gone.
+    ///
+    /// A guardian whose launcher exited is *not* automatically done: a runtime being
+    /// served by another App or TUI must not be torn down because the process that
+    /// happened to start it quit. That is why this only makes the fact observable;
+    /// the exit decision also requires that no business client is left.
+    pub fn attach_launcher(&mut self, lifeline: LauncherLifeline) {
+        self.launcher = Some(lifeline);
+    }
+
+    /// Whether no business client holds a lease right now.
+    ///
+    /// Deliberately weaker than [`Self::drained`]: that one also requires a global
+    /// drain to have *started*, which only happens after somebody releases. A
+    /// launcher that dies never releases anything -- it simply stops existing -- so a
+    /// guardian waiting for `drained` waits forever. An in-flight reclaim still
+    /// counts as work here, for the same reason `drained` excludes it: exiting would
+    /// cut off the thread that is proving the stop.
+    pub fn no_business_client(&self) -> bool {
+        self.reclaim.leases().business_active_count() == 0 && !self.reclaim.has_running_operations()
+    }
+
+    /// Whether the launcher that started this guardian has exited.
+    ///
+    /// `false` when there is no launcher: an in-process guardian has nobody to lose.
+    pub fn launcher_gone(&self) -> bool {
+        self.launcher
+            .as_ref()
+            .is_some_and(LauncherLifeline::is_gone)
+    }
+
     /// Points reclamation at the registry that really owns the process groups.
     ///
     /// Called once, before the control loop starts accepting: a release that ran
@@ -1956,8 +2084,28 @@ pub fn serve_with_daemon(
     coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
     daemon_program: Option<&Path>,
 ) -> io::Result<()> {
+    serve_with_lifeline(scope, selected, shutdown, coordinator, daemon_program, None)
+}
+
+/// [`serve_with_daemon`] with the launcher's lifeline attached.
+///
+/// Split rather than given a default argument so every existing caller keeps its
+/// behaviour: a guardian with no lifeline cannot conclude its launcher is gone, and
+/// `None` is what says that explicitly instead of leaving a boolean that reads as
+/// "probably still alive".
+pub fn serve_with_lifeline(
+    scope: RuntimeScope,
+    selected: ArtifactIdentity,
+    shutdown: impl Fn() -> bool,
+    coordinator: std::sync::Arc<dyn super::preview::CoordinatorProbe>,
+    daemon_program: Option<&Path>,
+    launcher: Option<LauncherLifeline>,
+) -> io::Result<()> {
     let generation = format!("guardian-{}", std::process::id());
     let mut guardian = Guardian::new(scope, selected, generation);
+    if let Some(lifeline) = launcher {
+        guardian.attach_launcher(lifeline);
+    }
     guardian.attach_coordinator(coordinator);
     let (registry, report) = guardian.open_registry()?;
     if !report.is_safe() {
@@ -1970,6 +2118,9 @@ pub fn serve_with_daemon(
     }
     let deadline = Deadline::after(Duration::from_secs(2));
     let listener = guardian.bind_control(&deadline)?;
+    // Bound and about to serve: this is the earliest moment the pid is useful, and
+    // the latest at which a failure still reports "this guardian never started".
+    let _ = record_guardian_pid(&guardian.scope);
 
     // Reclamation must talk to the real registry, and it must be attached before
     // the first connection: a release that ran earlier could not have verified any
@@ -2025,6 +2176,17 @@ pub fn serve_with_daemon(
         // convention someone has to remember. The database is untouched: history is
         // the project's, not this generation's.
         if guardian.drained() {
+            break;
+        }
+        // The launcher exited and nobody is left to serve. A guardian whose launcher
+        // is gone is normally still needed -- another App or TUI may be attached, and
+        // tearing the runtime down because the process that started it quit would be
+        // the very "restart the launcher and the runtime dies" bug the invariant
+        // forbids. The exception is a runtime with no business client at all: nobody
+        // can observe it, nobody can attach without starting a new one, and its
+        // runtime directory may already be deleted. Exiting there is what keeps a
+        // test-spawned guardian from serving a scope that no longer exists.
+        if guardian.launcher_gone() && guardian.no_business_client() {
             break;
         }
     }
@@ -3854,5 +4016,38 @@ mod authorization_tests {
         assert!(hello.secret().is_err());
         hello.generation_secret = "zz".repeat(32);
         assert!(hello.secret().is_err());
+    }
+}
+
+#[cfg(test)]
+mod launcher_lifeline_tests {
+    use super::*;
+
+    #[test]
+    fn a_launcher_lifeline_reports_eof_when_the_launcher_is_gone() {
+        use std::os::unix::net::UnixStream;
+
+        let (launcher_end, guardian_end) = UnixStream::pair().unwrap();
+        let lifeline = LauncherLifeline::watch(guardian_end.into());
+
+        // While the launcher holds its end open, the guardian must not believe it
+        // was abandoned: a guardian that stopped here would die the moment it was
+        // started, which is the opposite of outliving its client.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !lifeline.is_gone(),
+            "an open launcher end must not read as abandoned"
+        );
+
+        drop(launcher_end);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lifeline.is_gone() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closing the launcher end must be observable as EOF"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
