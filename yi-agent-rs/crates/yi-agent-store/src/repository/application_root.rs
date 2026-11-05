@@ -48,7 +48,13 @@ impl RuntimeRepository {
         capability_secret: &str,
         workspace_root: &str,
     ) -> Result<(), RepositoryError> {
-        self.connection.execute(
+        // The attachment, the role and the container record are one fact about
+        // one session, so they commit together. A crash between them would leave
+        // either a promoted root with no record (no admission, forever blocked)
+        // or a record with an attachment still claiming an execution (a session
+        // the sweeps may settle).
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "INSERT INTO application_root_attachments
                 (idempotency_key, root_session_id, root_task_id, capability_digest,
                  capability_secret, workspace_root, state)
@@ -62,6 +68,18 @@ impl RuntimeRepository {
                 workspace_root
             ],
         )?;
+        transaction.execute(
+            "UPDATE tasks SET role = 'session_container'
+             WHERE id = ?1 AND parent_id IS NULL AND depth = 0",
+            params![root_task_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_containers (root_task_id, root_session_id, closed)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(root_task_id) DO NOTHING",
+            params![root_task_id.to_string(), root_session_id.to_string()],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 

@@ -218,6 +218,10 @@ pub(crate) fn repository_error_code(error: &crate::repository::RepositoryError) 
         // must see a stable code it can dispatch on (Task 3 turns the typed error
         // into a wire `ForegroundFailure`), so it must not fall into `Internal`.
         crate::repository::RepositoryError::Foreground(_) => IpcErrorCode::InvalidState,
+        // A session-delegation rejection is likewise a stable policy answer. The
+        // wire carries the typed `SessionFailure`; this only keeps it out of the
+        // "daemon is broken" bucket.
+        crate::repository::RepositoryError::SessionDelegation(_) => IpcErrorCode::InvalidState,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }

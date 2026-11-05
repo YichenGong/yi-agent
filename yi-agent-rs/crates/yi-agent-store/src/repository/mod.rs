@@ -36,6 +36,11 @@ mod mailbox;
 mod permission;
 mod read;
 mod schedule;
+mod session_container;
+#[cfg(test)]
+mod session_container_tests;
+
+pub use session_container::{SessionBindingCommit, SessionContainerRecord};
 mod task;
 mod trace;
 mod watchdog;
@@ -47,7 +52,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 18;
+pub const LATEST_SCHEMA_VERSION: i64 = 19;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -169,6 +174,12 @@ pub enum RepositoryError {
     /// contract violation, not a client rejection.
     #[error("foreground state for {root} is invalid: {reason}")]
     InvalidForegroundFact { root: String, reason: String },
+    /// A structured session-delegation rejection. Typed for the same reason as
+    /// `Foreground`: every caller branches on [`SessionFailureCode`], and matching
+    /// on an English message would turn a stable contract into a parsing
+    /// exercise.
+    #[error("session delegation: {0:?}")]
+    SessionDelegation(yi_agent_lifecycle::session_delegation::SessionFailure),
 }
 
 #[derive(Debug, Error)]
@@ -1283,7 +1294,7 @@ mod extra_roots_tests {
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
-        assert_eq!(LATEST_SCHEMA_VERSION, 18);
+        assert_eq!(LATEST_SCHEMA_VERSION, 19);
     }
 
     /// v16 records who last owned a root and why it ended.
@@ -1351,6 +1362,48 @@ mod extra_roots_tests {
                 )
                 .unwrap();
             assert!(present, "v18 must create {table}");
+        }
+    }
+
+    /// v19 persists the container role and its admission record.
+    ///
+    /// Rolled back to the v18 shape so this exercises the real upgrade an existing
+    /// installation performs, not a fresh database that was never anything else.
+    #[test]
+    fn a_version_eighteen_database_gains_session_container_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS session_host_executions;
+                 DROP TABLE IF EXISTS session_migration_errors;
+                 DROP TABLE IF EXISTS session_binding_operations;
+                 DROP TABLE IF EXISTS session_containers;
+                 ALTER TABLE tasks DROP COLUMN role;
+                 DELETE FROM schema_migrations WHERE version >= 19;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for table in [
+            "session_containers",
+            "session_binding_operations",
+            "session_migration_errors",
+            "session_host_executions",
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "v19 must create {table}");
         }
     }
 
