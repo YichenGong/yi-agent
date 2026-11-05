@@ -16,7 +16,7 @@
 
 ## Managed runtime 默认生产接入
 
-- [ ] 默认生产路径接通 guardian、壳租约与 root 授权，并安全迁移存量 unmanaged runtime — 用户已确认沿用既有退出语义；当前仅完成调查、两轮作者自审与实施计划，未改代码、未迁移正式实例。缺口包括无 guardian 时 acquire 返回成功、sidecar 默认 Embedded、壳未接通逐会话 root 授权、resident/插件入口仍可直接启动旧 daemon。设计与可验证完成判据见 [接入 spec](../superpowers/specs/2026-11-05-managed-runtime-production-integration-design.md) §4–§8 及 [实施 plan](../superpowers/plans/2026-11-05-managed-runtime-production-integration-impl.md)：A01–A21 全部覆盖，特别是默认启动无手工环境变量、sidecar 重启不丢 App 身份、多前端隔离、最后客户端退出无复活、迁移中断安全以及最终独立 App 验收。底层模块的历史测试记录不等于本条生产接入完成。
+- [ ] 默认生产路径接通 guardian、壳租约与 root 授权，并安全迁移存量 unmanaged runtime — 用户已确认沿用既有退出语义；当前仅完成调查、spec/plan 多轮作者自审与实施计划（已补齐版本选择态实际租约、快照换代和看板合并门禁），未改代码、未迁移正式实例。缺口包括无 guardian 时 acquire 返回成功、sidecar 默认 Embedded、壳未接通逐会话 root 授权、resident/插件入口仍可直接启动旧 daemon。设计与可验证完成判据见 [接入 spec](../superpowers/specs/2026-11-05-managed-runtime-production-integration-design.md) §4–§8 及 [实施 plan](../superpowers/plans/2026-11-05-managed-runtime-production-integration-impl.md)：A01–A21 全部覆盖，特别是默认启动无手工环境变量、sidecar 重启不丢 App 身份、多前端隔离、最后客户端退出无复活、迁移中断安全以及最终独立 App 验收。底层模块的历史测试记录不等于本条生产接入完成。
 
 ## 范围边界
 

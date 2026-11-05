@@ -101,7 +101,14 @@ claim、scope、generation 一致性核对；不能从 guardian 的 runtime-dir 
 3. 无现有 runtime 时，经统一 bring-up 启动 guardian 和 daemon。首客户端窗口内
    不调度任务或运行插件；就绪回包须匹配 scope、构建和 daemon 代际。
 4. 壳直接向 guardian 取得 Business 模式的 App 租约并启动心跳，确认该租约实际存在。
-   至此 scope 达到 `managedReady`（仅 lifecycleReady），不表示任何会话已获授权。
+   scope/build 已匹配时才达到 `managedReady`（仅 lifecycleReady），不表示任何会话已获授权。
+   若仅构建不同且已验证控制协议兼容，允许持有同一种 Business 租约用于现有 owner-bound
+   版本预览/确认，但状态仍为 `blocked`（VersionChoiceRequired），不得签发 root 授权、
+   接受插件 demand 或执行业务。不引入 LeaseOnly→Business 升级或重复 register：现有协议
+   没有这种升级；同代际恢复只能凭 grant resume。用户确认切换后，核实新代际/构建，
+   在新 guardian 登记实际租约再达到 ready；取消选择不自动切换，关闭项目/退出释放实际租约。
+   控制协议不兼容、身份未知或租约模式被降为 WaitingNextGeneration 时均不能进入 ready。
+   版本选择态的 held lease 与 ready 状态分开记录，现有预览命令只使用该实际持有的租约。
 5. 每个会话执行前，以稳定 `thread:{thread_id}`、workspace、extra_roots 发出
    root 意图；壳用该 scope 的租约取得非续租 root 授权，送回对应 app-server 会话。
 6. 复用已有 guardian↔daemon prepare/commit 权威交换，在 attach 前解析实际
@@ -116,7 +123,10 @@ claim、scope、generation 一致性核对；不能从 guardian 的 runtime-dir 
 时沿用既有 recovery-only/previous capability 恢复协议，不能按 thread key 猜授权。
 
 授权增量安装须带 sidecar epoch、scope 和单调 revision，原子替换对应 scope 的
-授权快照，拒绝旧 revision，不能清掉其他项目。秘密只在壳、app-server 与 daemon
+授权快照，拒绝旧 revision，不能清掉其他项目。期望 sidecar epoch 由认证 bootstrap
+固定，不能从来包自行切换；revision 按 scope 单调，空快照撤销该 scope 全部授权。
+每个 entry 必须匹配当前 scope、generation 和 client，换代先撤销旧授权。
+秘密只在壳、app-server 与 daemon
 可信路径内存中流转。失败或代际变更即撤销对应 rootReady；managed 路径不得把
 `authorize_foreground_root` 或 driver bind 的 `None` 当 legacy 成功继续执行。
 

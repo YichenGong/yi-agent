@@ -60,7 +60,7 @@
 
 ```rust
 // yi-agent-lifecycle/src/production.rs
-use crate::{deadline::Deadline, foreground::{RootBindIntent, SecretCapability},
+use crate::{foreground::{RootBindIntent, SecretCapability},
     types::{ArtifactIdentity, RuntimeIdentity, RuntimeScope}};
 use serde::{Deserialize, Serialize};
 
@@ -110,7 +110,7 @@ pub struct RootIntentRequest {
 
 私有管理方法固定为 `_shell/bootstrap`、`_shell/prepare`、`_shell/rootIntent`、`_shell/replaceRoots`、`_shell/migrationPreview`、`_shell/migrationConfirm`、`_shell/migrationOperation`。request id 为带 epoch 的字符串，业务页面仍使用数字 id。bootstrap 第一帧由原生端直接写 stdin，携带仅该 session 使用的随机 `SecretCapability`；后续私有帧校验它。`_shell/` 全命名空间在 generic `rpc`/`rpc_respond` 拒绝，不仅上述七个方法。bootstrap 未完成时不开放 generic 写入。
 
-页面只得到脱敏 `ProjectAcquireView { scope_key, attempt_id, state, reason, retry }`；`state` 为 `starting | managedReady | legacyChoiceRequired | blocked | unknown`。已识别 managed 构建不同时仍进入既有版本预览/切换 UI，不混称 legacy；准备先返回 blocked 并保留对应 VersionChoiceRequired 详情，不自动切换。
+页面只得到脱敏 `ProjectAcquireView { scope_key, attempt_id, state, reason, retry }`；Rust DTO 必须声明 `#[serde(rename_all = "camelCase")]`，页面字段为 `scopeKey/attemptId`，由同一 DTO 生成绑定并做 JSON round-trip 测试，不手写另一份镜像。`state` 为 `starting | managedReady | legacyChoiceRequired | blocked | unknown`。已识别 managed 构建不同时仍进入既有版本预览/切换 UI，不混称 legacy；准备先返回 blocked 并保留对应 VersionChoiceRequired 详情，不自动切换。仅控制协议已验证兼容时，Task 3 登记实际 Business 租约供现有 owner-bound preview/confirm 使用，持有不等于 ready；root 授权、业务和插件 demand 仍关闭。不采用不存在的 mode 升级：同代际凭 grant resume，不重复 register；成功切换后核实新代际并在新 guardian 注册，取消/关闭/退出按实际 held 集合处理。未知/不兼容控制协议仅 blocked/unknown，不为显示 UI 强行登记。
 
 ### Task 1: 固定启动 scope、lifeline 与共享 DTO
 
@@ -199,7 +199,7 @@ pub struct RootIntentRequest {
 - Modify: `desktop/src-tauri/build.rs`
 - Modify: `desktop/src-tauri/capabilities/default.json`
 
-**Interfaces:** Consumes Task 2 prepare. Produces `ProjectAcquireView` from §1 and `DesktopRuntimeManager::ensure_project(...)` coordinated by existing acquire command, plus a native `authorize_intent(RootIntentRequest, Deadline)` used in Task 4. No grant crosses stdio. Native held leases separate from ready views; ClientKind::App lease mode Business.
+**Interfaces:** Consumes Task 2 prepare. Produces `ProjectAcquireView` from §1 and `DesktopRuntimeManager::ensure_project(&self, scope: &RuntimeScope, budget: Duration) -> Result<ProjectAcquireView, String>` coordinated by existing acquire command, plus a native `authorize_intent(RootIntentRequest, Deadline)` used in Task 4. No grant crosses stdio. Native held leases separate from ready views; ClientKind::App lease mode Business. Compatible version-choice may hold a lease while blocked; every business authorization also requires lifecycleReady, never held alone.
 
 - [ ] **Step 1: RED.** Extend injected ControlBackend tests: held=false never managedReady/owned; prepare→register→heartbeat ordering; heartbeat thread failure leaves no usable ready view; scope A blocked does not block B; root failure after lease success leaves lease in quit barrier. Paused-clock tests: Cmd+Q while prepare or register is in flight, late acquired lease released without root execution; single 15s quit budget.
   ```rust
@@ -218,7 +218,7 @@ pub struct RootIntentRequest {
   any failure -> blocked/unknown; release held on abandoned attempt
   shutdown -> reject prepares and root intents; revoke late results
   ```
-  Map VersionChoiceRequired to the existing version switch flow; no legacy flag for a managed mismatch. Native authorize_intent validates live held scope/client, app-server epoch and server-origin thread/workspace intent. Commands accept registered scope keys only; update lib/build/capability command manifests together if adding query commands. Never expose authorize_intent itself as a page invoke.
+  Map VersionChoiceRequired to the existing version switch flow; no legacy flag for a managed mismatch. Add tests against the real lease table: compatible mismatch→Business registration→preview/confirm allowed while rootIntent/demand/turn refused; same-generation reconnect uses resume; cancelled choice stays blocked and quit releases held; new generation registers once; WaitingNextGeneration never ready. Do not invent LeaseOnly promotion or re-register a live/released run id. Native authorize_intent validates lifecycleReady in addition to live held scope/client, app-server epoch and server-origin thread/workspace intent. Commands accept registered scope keys only; update lib/build/capability command manifests together if adding query commands. Never expose authorize_intent itself as a page invoke.
 - [ ] **Step 4:** Re-run Step 2, `cargo test --manifest-path desktop/src-tauri/Cargo.toml --test app_command_capability`; `cargo tree --manifest-path desktop/src-tauri/Cargo.toml` must still contain no rusqlite/store/supervisors dependency.
 - [ ] **Step 5:** Update progress, workspace fmt/CI plus `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all`; commit `fix: require real shell leases before project readiness`.
 
@@ -236,7 +236,7 @@ pub struct RootIntentRequest {
 - Modify: `yi-agent-rs/crates/yi-agent-app-server/src/server/local_management.rs`
 - Modify: `desktop/src-tauri/src/runtime_management.rs`
 
-**Interfaces:** Consumes RootIntentRequest/RootAuthoritySnapshot. Produces `RootAuthorityStore::replace(snapshot) -> Result<(), String>` and `get(&RootAuthorityKey) -> Option<SecretCapability>`, scoped to the app-server session, never process-global. New subagent trait:
+**Interfaces:** Consumes RootIntentRequest/RootAuthoritySnapshot. Produces `RootAuthorityStore::replace(snapshot) -> Result<(), String>` and `get(&RootAuthorityKey) -> Option<SecretCapability>`, scoped to the app-server session, never process-global. Expected epoch is fixed by authenticated bootstrap, not adopted from incoming snapshots; revisions are per scope, empty entries revoke that scope, every entry matches current scope/generation/client, and generation change revokes old entries before reuse. Tests must reject a higher-revision snapshot from the wrong epoch as well as an empty stale snapshot. New subagent trait:
 ```rust
 pub trait ManagedRootAuthority: Send + Sync {
     fn authorize(&self, intent: &yi_agent_lifecycle::production::RootIntentRequest,
@@ -353,7 +353,7 @@ App-server provider brokers through Task 2/3; CLI provider uses its own Frontend
 - Test: `yi-agent-rs/crates/yi-agent-supervisors/tests/runtime_migration.rs`
 - Test: `yi-agent-rs/crates/yi-agent-supervisors/tests/managed_bringup.rs`
 
-**Interfaces:** Consumes LegacyEvidence/preview. Produces `MigrationCoordinator::{confirm, operation, reconcile}` with explicit `MigrationPhase` and journal. Phases: Accepted, SelfHealFrozen, WatchmanRetired, LegacyStopped, ManagedConnected, Completed, Failed. Completed only after Task 3/4 required ownership readiness is acknowledged; ManagedConnected alone is not business-ready. Add `ensure_managed_under_guard(&CoordinationGuard, ...)` using the same parameters/dependencies as existing ensure_managed_with except for acquiring the guard; public wrapper acquires then delegates. Add instance `RetirementGate` with fixed-inode lock shared by every cooperating check→ensure and migration; old noncooperating host remains manual.
+**Interfaces:** Consumes LegacyEvidence/preview. Produces `MigrationCoordinator::{confirm, operation, reconcile}` with explicit `MigrationPhase` and journal. Phases: Accepted, SelfHealFrozen, WatchmanRetired, LegacyStopped, ManagedConnected, Completed, Failed. Completed only after Task 3/4 required ownership readiness is acknowledged; ManagedConnected alone is not business-ready. Add `ensure_managed_under_guard(guard: &CoordinationGuard, scope: &RuntimeScope, expected: &ArtifactIdentity, intent: BringUpIntent, deadline: Deadline, probe: &dyn ControlProbe, launcher: &dyn GuardianLauncher, required_capabilities: &[String]) -> io::Result<BringUpResult>`; validate guard belongs to scope and do not reacquire its lock. The public wrapper acquires then delegates. Add instance `RetirementGate` with fixed-inode lock shared by every cooperating check→ensure and migration; old noncooperating host remains manual.
 
 - [ ] **Step 1: RED.** Fault-inject before/after each journal write and side effect. Assert accepted record fsynced before any marker/bootout/stop, same op id returns existing result, token reused by another id rejected. Race watch::once_unattended paused after checking marker against migration: gate must drain it before stop. Parallel two-scope migration + bring-up must finish within one deadline, never self-lock. PID start identity change between preview/confirm blocks stopping.
   ```text
@@ -479,7 +479,7 @@ App-server provider brokers through Task 2/3; CLI provider uses its own Frontend
       fixture.assert_runtime_and_plugins_stopped();
   }
   ```
-  Define each fixture method in this file using real private/bootstrap/control channels from earlier tasks; `same_process_alive` compares start identity, not PID alone. Use fixed marker child process, not LLM. Add original-launcher sidecar kill while App+TUI leases remain, same App run id after reconnect, last-client no resurrection across at least two configured watch ticks. Cancellation/timeout is failure, not successful cleanup.
+  Define each fixture method in this file using real private/bootstrap/control channels from earlier tasks; `connect_tui` must spawn the actual default TUI entry (PTY if required), headless tests must spawn the actual run entry, and `connect_app` must exercise the native bridge manager plus real app-server bootstrap. Manually calling FrontendLease::register is permitted only for helper/protocol tests and cannot satisfy production-entry acceptance. `same_process_alive` compares start identity, not PID alone. Use fixed marker child process, not LLM. Add original-launcher sidecar kill while App+TUI leases remain, same App run id after reconnect, last-client no resurrection across at least two configured watch ticks. Cancellation/timeout is failure, not successful cleanup.
 - [ ] **Step 2:** Run `(cd yi-agent-rs && cargo test -p yi-agent --test managed_production_integration -- --test-threads=1)` and record each A-id result. Before product edits, failures must identify missing wiring; if all pass, add an intentionally stale-capability negative test and verify it rejects. No implementation claim from mock-only tests.
 - [ ] **Step 3:** Audit exact call sites with:
   ```sh
@@ -509,7 +509,7 @@ App-server provider brokers through Task 2/3; CLI provider uses its own Frontend
 - [ ] **Step 2:** Build in worktree: `(cd desktop && npm ci && npm run sidecar:release && npm run build && npx tauri build --bundles app)`. Resolve target_directory using cargo metadata; follow existing finalize-runtime-bundle.sh ordering. Copy generated bundle to a project-local `.artifacts/managed-integration/` test location, set distinct bundle id/name and absolute `YI_AGENT_HOME`, then finalize/re-sign using the actual packaging script interface. Any post-sign Info.plist/binary change requires rerunning finalization; verify sidecar digest and strict signature afterward. Never use `codesign --deep`.
 - [ ] **Step 3:** Launch the isolated `Contents/MacOS/desktop` directly with no relay and a temporary project. Record real Wry/macOS checks: red close hides without lease release, Dock reopen restores input/output, Cmd+Q drains only App work, coexisting isolated TUI survives, last TUI exit drains daemon/plugin, no resurrection over watch ticks. Reboot sidecar separately while shell lives and verify guardian/other client remain alive. Keep PID/start-time/scope/build/lease evidence redacted. If a native case is not run, mark unexecuted and keep feature `[ ]`.
 - [ ] **Step 4:** Match every A01–A21 to evidence in acceptance doc; root auth failures and unknown states must be exercised, not just happy path. Verify no formal home/relay/job changed. Review diff with requesting-code-review skill; fix review findings through TDD. Only all gates passed permit desktop feature `[x]` and index count update.
-- [ ] **Step 5:** Commit only honest acceptance documentation after diff check. Use finishing-a-development-branch when authorized to integrate: `git merge --no-ff <implementation-branch>`, repeat `just ci` on merged result, remove merged worktree/branch. If native tests are pending, leave uncompleted and report them explicitly; do not merge on a false completed claim. Inspect disk/processes before optional clean; no cargo clean while builds/other work are using target.
+- [ ] **Step 5:** Commit only honest acceptance documentation after diff check. 本计划正式入队后的实施分支遵循 superpowers-kanban 合并名额：交付完成先 `state --self awaiting_merge`；等待用户确认，再 `merge-request <card-id>`。只有 daemon 排到并明确授予本卡合并回合后，才按该回合提示执行 no-ff 合并并在合并结果上重跑 `just ci`，声明成功/失败；不得在普通开发回合自行 `git merge`，不得自行释放别人的名额。清理本卡 worktree/branch 须在成功且不妨碍看板恢复后按合并回合要求完成。若 native tests 未执行，保持 feature 未完成并报告，不伪装成完成。非看板普通分支才适用 finishing-a-development-branch 的本地合并路径。Inspect disk/processes before optional clean; no cargo clean while builds/other work are using target.
 
 ## Spec 覆盖与作者复核记录
 
@@ -530,4 +530,6 @@ App-server provider brokers through Task 2/3; CLI provider uses its own Frontend
 
 1. 代码对照审查发现并修订 spec：root 与项目路径混淆、先 attach 后租约、Status 无身份、迁移锁重入、项目 cwd 传播、插件 table 未接监督控制、旧自愈在途竞争。
 2. 一致性审查收紧：scope lifecycleReady/逐 rootReady 分离；no-session 看板先登记使用意图；ManagedConnected 与 Completed 分开且不持 scope 锁等待壳；preview 严格只读；未知协议/不合作旧 host 明确 manual；私有 stdin bootstrap 不需要重造进程启动框架。
-3. 本计划为新增实现契约，不是测试报告。上述所有代码/测试任务当前均未执行；正式实例未迁移。编写期仅检查文档、路径、覆盖矩阵及格式，不把既有底层测试当最终产品接入证据。
+3. 本轮 plan 复审对照现有 `FrontendLease::preview`、`LeaseTable::register/resume` 与控制协议，修复版本选择态无租约导致无法预览的死路：兼容构建差异可实际持 Business 租约但不 ready，不虚构 mode 升级；补充 WaitingNextGeneration 与取消/退出测试。
+4. 交叉复审补齐 DTO camelCase 真源、bootstrap 固定期望 epoch/逐 scope revision/空快照撤销、真实 TUI/headless/native bridge 入口验收，并将实施合并改为看板 awaiting_merge→用户确认→merge-request→获授合并回合。
+5. 本计划为新增实现契约，不是测试报告。上述所有代码/测试任务当前均未执行；正式实例未迁移。编写期仅检查文档、路径、覆盖矩阵及格式，不把既有底层测试当最终产品接入证据。
