@@ -894,7 +894,14 @@ test("a dev build .app is unproven, not a failure", () => {
     mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
     writeFileSync(
       path.join(app, "Contents", "MacOS", "desktop"),
-      "binary with http://localhost:1420 baked in",
+      // dev 构建：前端资源没嵌进来。这里刻意不出现 entry 文件名——写进注释
+      // 里也会让 includes() 命中，测出来的就不是真实判据了。
+      "binary with http://localhost:1420 baked in, but no bundle payload",
+    );
+    mkdirSync(path.join(root, "desktop", "dist"), { recursive: true });
+    writeFileSync(
+      path.join(root, "desktop", "dist", "index.html"),
+      '<script type="module" src="/assets/index-abc.js"></script>',
     );
     const caseSpec = {
       id: "A07",
@@ -921,8 +928,19 @@ test("a release .app is not mistaken for a dev build", () => {
   try {
     const app = path.join(root, "yi-agent.app");
     mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
-    writeFileSync(path.join(app, "Contents", "MacOS", "desktop"), "a real release binary");
-    assert.equal(isDevBuild(app), false);
+    // 正式构建：dist 的入口 JS 已被嵌进二进制。这里刻意也带上 localhost:1420，
+    // 因为整个 tauri.conf.json 会被编进去，那个字样在正式产物里同样存在——
+    // 用它判断会把正式构建误判成 dev 构建。
+    writeFileSync(
+      path.join(app, "Contents", "MacOS", "desktop"),
+      "a real release binary embed=assets/index-abc.js devUrl=localhost:1420",
+    );
+    mkdirSync(path.join(root, "desktop", "dist"), { recursive: true });
+    writeFileSync(
+      path.join(root, "desktop", "dist", "index.html"),
+      '<script type="module" src="/assets/index-abc.js"></script>',
+    );
+    assert.equal(isDevBuild(app, { root }), false);
     const caseSpec = {
       id: "A07",
       commands: [{ kind: "command", run: "true", needs: ["yi-agent.app"] }],

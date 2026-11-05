@@ -428,13 +428,27 @@ export function missingPrerequisites(command, { root = process.cwd() } = {}) {
 /// 没打进去，二进制里写死 `http://localhost:1420`）。探针启动它，页面永远加载
 /// 不出来，于是干等到超时被杀，报告记成 A07/A08「实现失败」——真正缺的是一次
 /// 正式构建。文件在、但内容不是正式产物，光看路径存在判断不出来。
-export function isDevBuild(appPath) {
+export function isDevBuild(appPath, { root = process.cwd() } = {}) {
   const binary = path.join(appPath, "Contents", "MacOS", "desktop");
   if (!existsSync(binary)) return false;
+  // Tauri 把前端资源**嵌进二进制**，不放在 Contents/Resources——所以我最初用
+  // 「Resources 里有没有 index.html」判断是错的。也不能查 `localhost:1420`：
+  // 整个 tauri.conf.json 被编进二进制，devUrl 字样永远在，正式构建里也有。
+  //
+  // 唯一可靠的判据是「dist 的入口 JS 有没有真的被嵌进去」：正式构建会把
+  // dist/index.html 里引用的 assets 文件名一起写进二进制，dev 构建则不会。
+  let entry;
   try {
-    return readFileSync(binary).includes("localhost:1420");
+    const html = readFileSync(path.join(root, "desktop", "dist", "index.html"), "utf8");
+    entry = /assets\/[A-Za-z0-9._-]+\.js/.exec(html)?.[0];
   } catch {
-    // 读不到二进制就不下结论：当成可用，让真正的问题自己暴露。
+    // 没有 dist 就无从比对，不做判断。
+    return false;
+  }
+  if (!entry) return false;
+  try {
+    return !readFileSync(binary).includes(entry);
+  } catch {
     return false;
   }
 }
@@ -443,7 +457,9 @@ export function isDevBuild(appPath) {
 export function devBuildPrerequisites(command, { root = process.cwd() } = {}) {
   return (command.needs ?? [])
     .map((relative) => path.resolve(root, relative))
-    .filter((absolute) => absolute.endsWith(".app") && existsSync(absolute) && isDevBuild(absolute));
+    .filter(
+      (absolute) => absolute.endsWith(".app") && existsSync(absolute) && isDevBuild(absolute, { root }),
+    );
 }
 
 /// 从一次失败里取出最能说明问题的一行。
