@@ -43,7 +43,16 @@ where
     ))
     .await
     .unwrap();
-    let msg = ws.next().await.unwrap().unwrap();
+    // Bounded like every other receive in these tests. Without the timeout a server
+    // that never answers (a rejected token, a wedged dispatch) hangs the read
+    // forever, and a hung test binary keeps its ports and child processes alive long
+    // after the run it belonged to is gone -- that is how one was found still
+    // running three and a half hours later.
+    let msg = tokio::time::timeout(EVENT_WAIT, ws.next())
+        .await
+        .expect("initialize must be answered before the test gives up")
+        .expect("the stream must not end before initialize is answered")
+        .expect("transport error while waiting for the initialize response");
     let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(v["id"], 1, "initialize must respond with the request id");
 }

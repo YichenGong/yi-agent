@@ -930,7 +930,13 @@ async fn a_websocket_handshake_cannot_claim_the_desktop_shell() {
     .await
     .unwrap();
 
-    let msg = ws.next().await.unwrap().unwrap();
+    // Bounded: an unanswered handshake would otherwise block this read forever and
+    // leave the test binary (and its ports and children) alive after the run.
+    let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
+        .await
+        .expect("the handshake must be answered before the test gives up")
+        .expect("the stream must not end before the handshake is answered")
+        .expect("transport error while waiting for the handshake response");
     let response: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(response["id"], 1);
     assert!(
