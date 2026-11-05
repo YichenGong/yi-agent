@@ -76,10 +76,12 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json",
-          "needs": [
-            "desktop/src-tauri/target/release/bundle/macos/yi-agent.app"
-          ]
+          "run": "CARGO_TARGET_DIR=target-probe npm run tauri -- build --bundles app --features plugin-probe",
+          "cwd": "desktop"
+        },
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
         }
       ],
       "unsupportedWithout": null
@@ -89,10 +91,12 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json",
-          "needs": [
-            "desktop/src-tauri/target/release/bundle/macos/yi-agent.app"
-          ]
+          "run": "CARGO_TARGET_DIR=target-probe npm run tauri -- build --bundles app --features plugin-probe",
+          "cwd": "desktop"
+        },
+        {
+          "kind": "command",
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
         }
       ],
       "unsupportedWithout": null
