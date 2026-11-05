@@ -21,6 +21,19 @@ pub const BOOTSTRAP_FD_ENV: &str = "YI_AGENT_BOOTSTRAP_FD";
 /// The scope key a managed role must serve, passed alongside the descriptor.
 pub const SCOPE_KEY_ENV: &str = "YI_AGENT_SCOPE_KEY";
 
+/// The canonical project path a managed role must serve.
+///
+/// Passed explicitly, never derived from the guardian's working directory: the
+/// launcher starts the guardian inside the *runtime* directory, so a process that
+/// guessed its project from `current_dir()` would resolve whichever project happens
+/// to own that runtime directory. Those are the same directory in the ordinary case
+/// and two different projects the moment someone points `YI_AGENT_RUNTIME_DIR` at a
+/// shared location.
+///
+/// When absent, the role refuses: a fallback to the working directory is exactly the
+/// guess this variable exists to remove.
+pub const PROJECT_KEY_ENV: &str = "YI_AGENT_PROJECT_KEY";
+
 /// Environment variable naming the inherited *authority bridge* descriptor.
 ///
 /// A second descriptor, not the bootstrap one: the bootstrap is a one-shot proof of
@@ -138,6 +151,19 @@ pub fn inherited_bridge() -> io::Result<Option<std::os::fd::OwnedFd>> {
     // SAFETY: the descriptor is open and was dup'd into this child by the launcher;
     // taking ownership here is what closes it on exit.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+/// The canonical project path a managed role must serve.
+pub fn project_key() -> io::Result<String> {
+    std::env::var(PROJECT_KEY_ENV).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{PROJECT_KEY_ENV} is not set; a managed role is told which project it \
+                 serves by the process that started it"
+            ),
+        )
+    })
 }
 
 /// The scope key a managed role must serve.

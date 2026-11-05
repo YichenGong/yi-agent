@@ -8,6 +8,8 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
+type Output = std::process::Output;
+
 fn binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_yi-agent"))
 }
@@ -98,6 +100,141 @@ fn a_role_without_a_scope_key_still_refuses() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("YI_AGENT_SCOPE_KEY"), "{stderr}");
+}
+
+/// A launched managed role whose bootstrap peer answers EOF before greeting it
+/// must exit nonzero, and must never have bound the business socket.
+///
+/// Silence is not "unmanaged" for the managed role: a launcher that died between
+/// the fork and the handshake proves nothing about who authorized this process.
+#[test]
+fn a_bootstrap_eof_refuses_the_managed_daemon_before_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("project");
+    let runtime_dir = dir.path().join("runtime");
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let (parent_end, child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let child_fd = child_end.as_raw_fd();
+    let mut command = Command::new(binary());
+    command
+        .args(["internal-runtime", "daemon"])
+        .current_dir(&workdir)
+        .env_remove("YI_AGENT_AUTHORITY_BRIDGE_FD")
+        .env(
+            "YI_AGENT_SCOPE_KEY",
+            runtime_dir.to_string_lossy().to_string(),
+        )
+        .env(
+            "YI_AGENT_INSTANCE_HOME",
+            dir.path().join("home").to_string_lossy().to_string(),
+        )
+        .env(
+            "YI_AGENT_RUNTIME_DIR",
+            runtime_dir.to_string_lossy().to_string(),
+        )
+        .env("YI_AGENT_BOOTSTRAP_FD", "9")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `pre_exec` only rearranges this fork's descriptor table before `exec`.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_fd, 9) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    // The signal: the launcher's end closes without ever writing a hello.
+    drop(parent_end);
+    drop(child_end);
+
+    let output = wait_bounded(child, std::time::Duration::from_secs(30));
+    assert!(
+        !output.status.success(),
+        "a managed daemon without a hello must not run: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("scope") || stderr.contains("handshake") || stderr.contains("guardian"),
+        "the refusal must say why: {stderr}"
+    );
+    assert!(
+        !runtime_dir.join("runtime.sock").exists(),
+        "a refused managed daemon must not leave a business socket behind"
+    );
+}
+
+/// A launcher that opens the channel and then says nothing past the read budget
+/// must produce the same refusal: a silent peer is not an authorization.
+#[test]
+fn a_silent_bootstrap_peer_refuses_the_managed_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("project");
+    let runtime_dir = dir.path().join("runtime");
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let (parent_end, child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let child_fd = child_end.as_raw_fd();
+    let mut command = Command::new(binary());
+    command
+        .args(["internal-runtime", "daemon"])
+        .current_dir(&workdir)
+        .env_remove("YI_AGENT_AUTHORITY_BRIDGE_FD")
+        .env(
+            "YI_AGENT_SCOPE_KEY",
+            runtime_dir.to_string_lossy().to_string(),
+        )
+        .env(
+            "YI_AGENT_INSTANCE_HOME",
+            dir.path().join("home").to_string_lossy().to_string(),
+        )
+        .env(
+            "YI_AGENT_RUNTIME_DIR",
+            runtime_dir.to_string_lossy().to_string(),
+        )
+        .env("YI_AGENT_BOOTSTRAP_FD", "9")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: as above.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_fd, 9) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(child_end);
+    // Hold the peer open but silent, past the lifeline read budget.
+    let output = wait_bounded(child, std::time::Duration::from_secs(40));
+    drop(parent_end);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        !runtime_dir.join("runtime.sock").exists(),
+        "a silent launcher must not leave a business socket behind"
+    );
+}
+
+/// Runs `child` to completion, killing it if it outlives `budget`.
+fn wait_bounded(mut child: std::process::Child, budget: std::time::Duration) -> Output {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                return child.wait_with_output().unwrap();
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
 }
 
 /// The managed roles are hidden from the command list: a user must not be led to

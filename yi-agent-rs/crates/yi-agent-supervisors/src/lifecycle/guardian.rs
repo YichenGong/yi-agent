@@ -1411,6 +1411,10 @@ impl Guardian {
                     self.scope.key.clone(),
                 ),
                 (
+                    super::roles::PROJECT_KEY_ENV.to_string(),
+                    self.scope.project_key.clone(),
+                ),
+                (
                     "YI_AGENT_INSTANCE_HOME".to_string(),
                     self.scope.instance_home.to_string_lossy().into_owned(),
                 ),

@@ -30,6 +30,11 @@ pub mod leases;
 pub mod managed;
 /// 只读影响快照与一次性确认。
 pub mod preview;
+/// 共享的非业务管理 DTO：项目准备、逐 root 授权索引与授权快照。
+///
+/// 只有线上类型，没有 I/O：桌面壳、app-server 与 supervisor 必须按同一套字段
+/// 讲话，而壳只允许依赖本 crate。
+pub mod production;
 pub mod scope;
 pub mod types;
 

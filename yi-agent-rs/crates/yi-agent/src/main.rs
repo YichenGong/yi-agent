@@ -388,12 +388,26 @@ fn run_internal_guardian() -> Result<()> {
         .unwrap_or_else(|| {
             yi_agent_store::paths::instance_home().unwrap_or_else(|| runtime_dir.clone())
         });
-    let project = std::env::current_dir()?;
+    // The project is taken from the launcher's explicit declaration, never from
+    // this process's working directory: the launcher starts the guardian inside the
+    // runtime directory, so `current_dir()` describes the runtime and only
+    // coincidentally describes the project.
+    let project = std::path::PathBuf::from(yi_agent_supervisors::lifecycle::roles::project_key()?);
     let scope = yi_agent_supervisors::lifecycle::bringup::scope_for_existing(
         &runtime_dir,
         &project,
         &instance_home,
     )?;
+    // The resolved scope must agree with the key the launcher named. A disagreement
+    // means the two sides canonicalised different paths, and serving would attach
+    // this guardian's control socket to a scope nobody is looking for.
+    if !yi_agent_supervisors::lifecycle::bringup::scope_keys_agree(&key, &scope.key) {
+        anyhow::bail!(
+            "the launcher named scope {key}, but {} resolves to {}",
+            project.display(),
+            scope.key
+        );
+    }
     managed_runtime::run_guardian(scope)
 }
 

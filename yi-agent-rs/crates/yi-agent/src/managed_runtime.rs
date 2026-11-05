@@ -108,13 +108,33 @@ pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::R
     .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
 }
 
+/// Refuses a hello that does not name the runtime this process was told to serve.
+///
+/// The comparison is what connects "a launcher authorized me" to "it authorized me
+/// *for this runtime*". Without it a misconfigured launcher could leave this
+/// process serving one project's database while the guardian believes it authorized
+/// another -- and every later authority check would be made against the wrong scope.
+///
+/// An absent key is a refusal, not "unknown, carry on": a managed role is always
+/// told which runtime it serves (see [`yi_agent_supervisors::lifecycle::roles`]),
+/// so an empty observed scope means the frame is not a valid hello.
+pub(crate) fn validate_managed_hello(expected: &str, observed: &str) -> io::Result<()> {
+    if observed.is_empty() || expected != observed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the guardian authorized a different runtime scope",
+        ));
+    }
+    Ok(())
+}
+
 /// Reads the guardian's opening frame, if one arrives in time.
 ///
-/// `Ok(None)` means "no greeting, treat as unmanaged". Silence is deliberately not
-/// a refusal: the only way to see none is a guardian from an older build, or one
-/// that failed to write before we asked. Refusing there would turn a compatibility
-/// case into a broken runtime, and the design's security claim is about *managed*
-/// daemons.
+/// `Ok(None)` means "no greeting arrived". For the *managed* role that is a startup
+/// refusal (see [`read_required_lifeline_hello`]): a launcher that assigned a
+/// private role but never proved which runtime it was assigning proves nothing, and
+/// treating silence as "unmanaged" would let a broken launch keep serving. The
+/// public `daemon serve` keeps its own unmanaged semantics and never calls this.
 ///
 /// The guardian writes this frame right after a successful spawn, before it waits
 /// for the socket. That ordering is load-bearing: this daemon reads the greeting
@@ -181,6 +201,23 @@ fn read_lifeline_hello(
     Ok(Some(hello))
 }
 
+/// Reads the greeting a *managed* role requires, refusing when none arrives.
+///
+/// Split from [`read_lifeline_hello`] on purpose: the reader is also used to answer
+/// "is there a greeting at all", and only the managed entry points may turn
+/// silence into a startup refusal.
+fn read_required_lifeline_hello(
+    lifeline: &std::os::fd::OwnedFd,
+) -> io::Result<yi_agent_lifecycle::authorization::LifelineHello> {
+    read_lifeline_hello(lifeline)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the launcher sent no guardian authorization hello; a managed role must \
+             never start without one",
+        )
+    })
+}
+
 /// Applies every authority update the guardian sends, until the channel closes.
 ///
 /// The loop ending *is* the daemon's notice that its guardian is gone; the caller
@@ -242,40 +279,66 @@ pub fn run_managed_daemon(
     // The guardian's first frame carries the generation secret. It is read before
     // the daemon serves because authority must be verifiable from the first attach:
     // a daemon that bound its socket first would spend a window admitting calls it
-    // could not check. A guardian that says nothing leaves the daemon unmanaged
-    // rather than broken -- the handshake is on a channel the guardian owns, and
-    // treating silence as "refuse everything" would make a launch race look like a
-    // permission bug.
-    let managed = match read_lifeline_hello(&bootstrap) {
-        Ok(Some(hello)) => {
-            let secret = hello.secret().map_err(|error| anyhow::anyhow!(error))?;
-            if hello.scope_key
-                != yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir)
-                    .to_string_lossy()
-                    .into_owned()
-                && hello.scope_key.is_empty()
-            {
-                return Err(anyhow::anyhow!(
-                    "the guardian authorized a different runtime scope"
-                ));
-            }
-            let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
-                hello.scope_key.clone(),
-                hello.daemon_instance_id.clone(),
-                secret,
-            );
-            // The channel stays open for the daemon's whole life: it is both the
-            // death monitor and the authority feed, and closing it early would tell
-            // the guardian the daemon is gone.
-            Some((ledger, bootstrap))
-        }
-        Ok(None) => None,
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "the guardian's authorization handshake failed: {error}"
-            ));
-        }
-    };
+    // could not check.
+    //
+    // A greeting that never arrives is a *refusal*, not "run unmanaged". This
+    // process was started as the managed daemon role by something that held the
+    // inherited descriptor; only that launcher could have chosen the scope, so
+    // silence means the launch is broken or unauthorized. Falling back to unmanaged
+    // would hand the exit guarantees the role exists for to a process nobody can
+    // account for.
+    let hello = read_required_lifeline_hello(&bootstrap).map_err(|error| {
+        anyhow::anyhow!("the guardian's authorization handshake failed: {error}")
+    })?;
+    let secret = hello.secret().map_err(|error| anyhow::anyhow!(error))?;
+    // The expected scope is the daemon's own resolved runtime directory, which the
+    // guardian named in this process's environment at launch and which the guardian
+    // resolved the same way. Comparing against it (rather than against a workdir
+    // guessed here) is what makes a symlinked or redirected project unable to
+    // produce two scopes for one runtime.
+    let expected_scope = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir)
+        .to_string_lossy()
+        .into_owned();
+    // Two independent agreements are required. The launcher's declared scope key
+    // must match this process's own resolution (otherwise the two sides canonicalised
+    // different paths), and the authenticated hello must name that same scope. Checking
+    // only the hello would let a launcher that declared one scope in the environment
+    // and another in the frame go unnoticed.
+    let declared_scope = yi_agent_supervisors::lifecycle::roles::scope_key()
+        .map_err(|error| anyhow::anyhow!("the launcher named no scope: {error}"))?;
+    validate_managed_hello(&declared_scope, &expected_scope).map_err(|error| {
+        anyhow::anyhow!(
+            "the launcher named scope {declared_scope}, but {} resolves to {expected_scope}: {error}",
+            invocation.workdir.display()
+        )
+    })?;
+    validate_managed_hello(&expected_scope, &hello.scope_key).map_err(|error| {
+        anyhow::anyhow!("the guardian authorized a different runtime scope: {error}")
+    })?;
+    // The project is checked the same way as the scope: the guardian names it in the
+    // environment, and this process's own working directory is what the guardian set.
+    // A disagreement means the daemon would answer for a project the guardian is not
+    // supervising -- the same failure one level down.
+    let declared_project = yi_agent_supervisors::lifecycle::roles::project_key()
+        .map_err(|error| anyhow::anyhow!("the guardian named no project: {error}"))?;
+    let observed_project = invocation.workdir.to_string_lossy().into_owned();
+    if !yi_agent_supervisors::lifecycle::bringup::scope_keys_agree(
+        &declared_project,
+        &observed_project,
+    ) {
+        anyhow::bail!(
+            "the guardian named project {declared_project}, but this daemon stands in {observed_project}"
+        );
+    }
+    let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        hello.scope_key.clone(),
+        hello.daemon_instance_id.clone(),
+        secret,
+    );
+    // The channel stays open for the daemon's whole life: it is both the death
+    // monitor and the authority feed, and closing it early would tell the guardian
+    // the daemon is gone.
+    let managed = Some((ledger, bootstrap));
     // The guardian's half of the foreground authority bridge rides the *same*
     // lifeline the hello arrived on. It is taken here, before the daemon starts,
     // because a daemon that bound its socket first would spend a window accepting
@@ -452,5 +515,18 @@ mod tests {
             reported.contains("InvalidInput"),
             "expected a bad-descriptor refusal, got {reported}"
         );
+    }
+
+    /// A managed daemon whose launcher authorized a different scope must refuse.
+    ///
+    /// The hello is the only thing that connects "the guardian started me" to
+    /// "the guardian started me *for this runtime*". Without the comparison a
+    /// misconfigured launcher would have the daemon serve one project's database
+    /// while the guardian believes it authorized another.
+    #[test]
+    fn mismatching_nonempty_scope_is_refused() {
+        assert!(validate_managed_hello("scope-a", "scope-b").is_err());
+        assert!(validate_managed_hello("scope-a", "").is_err());
+        assert!(validate_managed_hello("scope-a", "scope-a").is_ok());
     }
 }
