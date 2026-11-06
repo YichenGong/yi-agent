@@ -237,11 +237,23 @@ File or directory, default root (the session working directory).
 新增 `yi-agent-tools/src/fs/walk.rs`，供 `grep` 与 `glob` 共用：
 
 ```rust
-/// What a walk is allowed to spend.
+/// What a walk yields, and whether it crosses symlinks.
+///
+/// 两个工具**不能**共用一套：旧 `glob()` 返回目录且跟随符号链接，旧 `WalkDir`
+/// 两者都不做。合并成一个策略会静默改变其中一个工具的结果集（实测见下）。
 pub(crate) struct WalkOptions {
-    /// 绝对截止时间点。`None` 表示不设上限（仅测试会用）。
-    pub deadline: Option<Instant>,
+    /// 除常规文件外，是否也产出目录。
+    pub include_dirs: bool,
+    /// 是否跨符号链接（环由 `ignore` 检测并跳过）。
+    pub follow_links: bool,
 }
+
+/// `grep` 的策略。
+pub(crate) const FILES: WalkOptions = WalkOptions { include_dirs: false, follow_links: false };
+
+/// `glob` 的策略：目录算匹配，且跨链接——这正是重写前 `glob::glob()` 的行为。
+pub(crate) const MATCH_TARGETS: WalkOptions =
+    WalkOptions { include_dirs: true, follow_links: true };
 
 /// What a walk produced.
 pub(crate) struct WalkOutcome {
@@ -270,23 +282,44 @@ pub(crate) enum Truncated {
   显式忽略：
 
   ```rust
-  let mut overrides = OverrideBuilder::new(base)?;
+  // `OverrideBuilder::new` 直接返回 builder，不是 `Result`（`overrides.rs:122`）。
+  let mut overrides = OverrideBuilder::new(base);
   overrides.add("!.git")?;   // override 里 `!` 表示忽略
   builder.overrides(overrides.build()?);
   ```
 
   override 的优先级高于一切其它规则（`dir.rs:380-389`），因此不受 `.gitignore`
   内容影响。`!.git` 只匹配名为 `.git` 的目录组件，不会牵连 `.github/`。
-- 只产出常规文件（`file_type().is_file()`）。
+- 产出什么由 `WalkOptions` 决定（见上）。`grep` 传 `FILES`，`glob` 传 `MATCH_TARGETS`。
 - 遍历错误（权限、消失的目录）一律跳过，与现状 `filter_map(|e| e.ok())` 一致。
 - `deadline` 用 `Instant` 判定，检查点在每个条目迭代处；超时立即停止并置
   `Truncated::Deadline`。
-- 不产出目录本身，不产出符号链接目标（`follow_links` 保持默认 false）。
+- 跳过 depth 0（搜索根本身）**仅当它是目录**。`grep` 的 `path` 可以是单个文件，
+  旧 `WalkDir::new(file)` 会把该文件作为 depth 0 条目产出；无条件跳过 depth 0
+  会让「对单个文件 grep」返回空。
+- 不产出搜索根目录本身。
+
+**`glob` 必须用 `MATCH_TARGETS`，这是 spec 早期版本的错误，此处更正。** 早先写的
+「不产出目录、不跟随符号链接」是按 `WalkDir` 的行为推的，与 `glob()` 的实际行为
+不符。实测（`glob 0.3.4` + `ignore 0.4.23`，同一棵临时目录）：
+
+```
+旧 glob `**/*`                    -> ["src", "src/a.rs", "src/x", "top.rs"]   含目录
+只收文件的 walker                 -> ["src/a.rs", "top.rs"]                   少两个目录
+旧 glob `**/*.rs`（含符号链接）   -> ["link.rs", "linkdir/real.rs", "plain.rs"]
+follow_links(false) 的 walker     -> ["plain.rs"]                            整条链接丢失
+follow_links(true) 的 walker      -> ["link.rs", "linkdir/real.rs", "plain.rs"]  与旧行为一致
+```
+
+`follow_links(true)` 不会打转：`ignore` 自带祖先检测，实测自引用链接报
+`File system loop found: ... points to an ancestor ...` 并跳过该条，遍历正常结束。
 
 ### 4.5 grep 改造
 
 - `call` 内把整个 `grep_search` 移入 `tokio::task::spawn_blocking`。
-- `grep_search` 的 `WalkDir::new(base)` 替换为 `walk::walk(base, opts)`。
+- `grep_search` 的 `WalkDir::new(base)` 替换为
+  `walk::walk_with_deadline(base, walk::FILES, deadline)`（deadline 从 `call`
+  传入，因为取时间点必须在 `spawn_blocking` 闭包内部，见 §4.9）。
 - 保留既有输出契约：`MAX_OUTPUT_ENTRIES = 200`、`MAX_OUTPUT_BYTES = 32 KiB`、
   `TRUNCATION_NOTICE` 文案不变。
 - 新增 deadline 截断提示，与既有条目截断提示可同时出现，各占一行：
@@ -476,8 +509,12 @@ tokio = { version = "1", features = ["process", "time", "fs", "io-util", "rt"] }
   （本仓库 `.git` 下 10,345 个文件）。
 - 全局 gitignore 不生效（用一个临时 HOME 或显式断言行为）。
 - 非 git 仓库目录下 `git_ignore` 规则仍生效（`require_git(false)`）。
-- deadline：用极短 deadline（如 1ms）配合人造大目录，断言返回
-  `Truncated::Deadline` 且 `paths` 非空（部分结果）。
+- deadline：传入**已过期**的 `Instant`（`Instant::now().checked_sub(1s)`），断言返回
+  `Truncated::Deadline` 且 `paths` 为空。写死「已过期」而不是「1ms」是因为后者在
+  磁盘缓存命中时可能整棵树都读完了，测试会间歇性失败。
+- 以单个文件为 base 时，该文件本身必须出现在结果里（`grep` 的 `path` 可为文件）。
+- `glob` 专用：以 `MATCH_TARGETS` 走一遍，`**/*` 必须同时返回目录与文件；
+  符号链接目标也必须被访问到。
 
 ### 5.4 grep
 
@@ -485,7 +522,8 @@ tokio = { version = "1", features = ["process", "time", "fs", "io-util", "rt"] }
   多根相对路径）。
 - `target/` 下放置命中文件，断言结果中不出现。
 - `.github/` 下放置命中文件，断言结果中出现。
-- 极短 deadline 下断言出现 `[scan stopped after 10s:` 提示。
+- 已过期的 deadline 下断言出现 `[scan stopped after 10s:` 提示，且返回的
+  `timed_out` 为 `true`。
 
 ### 5.5 glob
 
