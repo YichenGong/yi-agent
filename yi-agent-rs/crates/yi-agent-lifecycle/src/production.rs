@@ -92,6 +92,97 @@ pub struct RootIntentRequest {
     pub intent: RootBindIntent,
 }
 
+/// A read-only statement of what a legacy-runtime migration would affect.
+///
+/// Field shapes are the wire contract between the shell and its sidecar, so they
+/// carry no `Instant`: the token's lifetime is enforced where the evidence lives.
+/// A preview that outlived its evidence would authorise a migration of whatever the
+/// instance looks like now, so the shell is told when it expires and re-previews
+/// instead of extending it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationPreviewRequest {
+    pub scope: RuntimeScope,
+    /// The build the runtime must become. Supplied by the sidecar's own verified
+    /// artifact, never by the caller naming an executable.
+    pub target: ArtifactIdentity,
+}
+
+/// One project the migration would affect, and what is provable about its workload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationWorkload {
+    /// The runtime proved it has nothing running.
+    VerifiedIdle,
+    /// Work is running and a migration would interrupt it.
+    Running,
+    /// Nobody could prove either way. This is *not* idle.
+    Unverified(String),
+}
+
+/// One affected project in a preview.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationAffected {
+    /// The canonical scope key, so the UI can name the project without re-deriving it.
+    pub scope_key: String,
+    pub workload: MigrationWorkload,
+}
+
+/// The read-only answer a preview hands to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationPreviewView {
+    /// Short-lived and bound to the evidence digest. Presented back on confirm.
+    pub token: String,
+    pub evidence_digest: String,
+    pub scope_key: String,
+    /// Every project this instance's retirement would touch, not just the one asked
+    /// about: the retirement marker is instance-wide.
+    pub affected: Vec<MigrationAffected>,
+    /// Reasons a confirmation must not proceed. Empty means "a human may confirm".
+    pub blockers: Vec<String>,
+    /// When the token stops authorising, so the UI can re-preview instead of guessing.
+    pub expires_at_unix: u64,
+}
+
+/// One migration operation, as the sidecar can report it.
+///
+/// `phase` is a string rather than an enum on purpose: the journal already stores a
+/// phase name, and a third spelling of the same set would be one more thing to keep
+/// in sync. Unknown values are reported verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationOperationView {
+    pub operation_id: String,
+    pub phase: String,
+    /// One line, no capability and no key material.
+    pub detail: Option<String>,
+}
+
+/// A confirmation to run, or the same id to reconcile after a lost answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationConfirmRequest {
+    pub scope: RuntimeScope,
+    /// The build the runtime must become. Required rather than defaulted: a
+    /// confirmation that named no target would have to guess one, and "migrate into
+    /// whatever this process is" is exactly the guess nobody verified.
+    pub target: ArtifactIdentity,
+    pub token: String,
+    /// Chosen by the caller **before** the request goes out. A repeat of an id that
+    /// already exists returns that operation instead of running the phases again.
+    pub operation_id: String,
+    /// The user's explicit choice to keep using the old runtime instead of migrating.
+    ///
+    /// Scoped to this confirmation: it is never remembered as a grant, and it cannot
+    /// complete a retirement (the old install stays visible as an exception).
+    #[serde(default)]
+    pub temporary_use: bool,
+}
+
+/// One read of an operation, so a lost confirm answer is reconciled rather than retried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationOperationRequest {
+    pub scope_key: String,
+    pub operation_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +329,99 @@ mod tests {
                 .as_ref()
                 .map(SecretCapability::expose),
             Some("old-cap")
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_dto_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn artifact() -> ArtifactIdentity {
+        ArtifactIdentity {
+            build_id: "build-1".into(),
+            display_version: "0.1.13".into(),
+            executable: PathBuf::from("/tmp/yi-agent"),
+            sha256: "abc".into(),
+            schema_min: 0,
+            schema_max: 15,
+            handover_version: 1,
+            business_protocol_min: 2,
+            business_protocol_max: 2,
+            capabilities: vec!["admission.freeze".into()],
+        }
+    }
+
+    fn scope() -> RuntimeScope {
+        RuntimeScope {
+            key: "/tmp/runtime".into(),
+            runtime_dir: PathBuf::from("/tmp/runtime"),
+            project_key: "/tmp/project".into(),
+            instance_home: PathBuf::from("/tmp/home"),
+        }
+    }
+
+    /// The preview crosses a process boundary: it has to round-trip, and it must not
+    /// smuggle a deadline the receiver would be tempted to honour.
+    #[test]
+    fn a_preview_round_trips_without_a_deadline() {
+        let view = MigrationPreviewView {
+            token: "tok".into(),
+            evidence_digest: "digest".into(),
+            scope_key: "/tmp/runtime".into(),
+            affected: vec![MigrationAffected {
+                scope_key: "/tmp/other/.yi-agent/runtime".into(),
+                workload: MigrationWorkload::Unverified("no answer".into()),
+            }],
+            blockers: vec!["the old runtime still holds its instance lock".into()],
+            expires_at_unix: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("deadline"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<MigrationPreviewView>(&json).unwrap(),
+            view
+        );
+    }
+
+    /// `unverified` must not deserialize into anything that reads as idle.
+    #[test]
+    fn an_unverified_workload_keeps_its_reason() {
+        let json = serde_json::to_string(&MigrationWorkload::Unverified("silence".into())).unwrap();
+        let decoded: MigrationWorkload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, MigrationWorkload::Unverified("silence".into()));
+        assert_ne!(decoded, MigrationWorkload::VerifiedIdle);
+    }
+
+    /// The confirm request carries the id chosen before the click, so a lost answer
+    /// can be reconciled against the same operation.
+    #[test]
+    fn a_confirm_request_round_trips_and_defaults_temporary_use_off() {
+        let json = serde_json::json!({
+            "scope": scope(),
+            "target": artifact(),
+            "token": "tok",
+            "operation_id": "op-1",
+        });
+        let decoded: MigrationConfirmRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.operation_id, "op-1");
+        assert!(
+            !decoded.temporary_use,
+            "a default must never mean temporary use"
+        );
+    }
+
+    #[test]
+    fn a_preview_request_names_a_verified_target() {
+        let request = MigrationPreviewRequest {
+            scope: scope(),
+            target: artifact(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MigrationPreviewRequest>(&json).unwrap(),
+            request
         );
     }
 }

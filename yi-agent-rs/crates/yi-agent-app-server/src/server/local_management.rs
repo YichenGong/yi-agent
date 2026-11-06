@@ -26,7 +26,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use yi_agent_lifecycle::deadline::Deadline;
 use yi_agent_lifecycle::foreground::SecretCapability;
-use yi_agent_lifecycle::production::{PrepareOutcome, PrepareRequest};
+use yi_agent_lifecycle::production::{
+    MigrationConfirmRequest, MigrationOperationRequest, MigrationPreviewRequest, PrepareOutcome,
+    PrepareRequest,
+};
 
 /// 保留方法命名空间。
 ///
@@ -40,6 +43,19 @@ pub const RESERVED_PREFIX: &str = "_shell/";
 /// 传输层必须先按它判定，再走普通管理分发，否则凭据帧会被当成"未知管理方法"
 /// 拒掉，随后的整条会话都认证不上。
 pub const BOOTSTRAP_METHOD: &str = "_shell/bootstrap";
+
+/// Read-only legacy-migration preview.
+///
+/// A separate method from `prepare` on purpose: a preview must be answerable for an
+/// instance whose runtime this build cannot start, and it must never be the thing that
+/// starts one.
+pub const MIGRATION_PREVIEW_METHOD: &str = "_shell/migrationPreview";
+
+/// Runs a confirmed migration, or reconciles the operation the caller already named.
+pub const MIGRATION_CONFIRM_METHOD: &str = "_shell/migrationConfirm";
+
+/// Reads one migration operation's progress without changing anything.
+pub const MIGRATION_OPERATION_METHOD: &str = "_shell/migrationOperation";
 
 /// Requests one conversation's root authority from the shell.
 ///
@@ -217,6 +233,40 @@ pub const MAX_MANAGEMENT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[async_trait::async_trait]
 pub trait PrepareBackend: Send + Sync {
     async fn prepare(&self, request: PrepareRequest) -> PrepareOutcome;
+
+    /// Read-only: mints a preview over a fresh probe of the instance.
+    ///
+    /// Defaulted to an explicit refusal so a backend that never implemented
+    /// migration cannot answer "there is nothing to migrate" by accident.
+    async fn migration_preview(
+        &self,
+        request: MigrationPreviewRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        Err("this backend cannot preview a legacy migration".to_string())
+    }
+
+    /// Runs or reconciles one migration.
+    ///
+    /// The operation id is supplied by the caller and is checked against existing
+    /// journals first, so a repeated request after a lost answer reconciles instead of
+    /// stopping anything twice.
+    async fn migration_confirm(
+        &self,
+        request: MigrationConfirmRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        Err("this backend cannot confirm a legacy migration".to_string())
+    }
+
+    /// One read of an operation. `Ok(None)` means "no record", never "it did not run".
+    async fn migration_operation(
+        &self,
+        request: MigrationOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        Err("this backend cannot read a legacy migration operation".to_string())
+    }
 }
 
 /// 已认证的管理操作执行器。
@@ -401,6 +451,63 @@ impl ManagementHandle {
         Ok(outcome)
     }
 
+    /// Runs one authenticated migration operation.
+    ///
+    /// Authentication is the same check `prepare` uses, and it happens before
+    /// anything touches the instance: an unauthenticated frame must not be able to
+    /// make a migration observable, let alone run one.
+    async fn authorised(&self, secret: &str, sidecar_epoch: &str) -> Result<(), String> {
+        if self.session.lock().await.admit(secret, sidecar_epoch) != Admission::Accepted {
+            return Err("unauthorized".into());
+        }
+        Ok(())
+    }
+
+    /// Read-only migration preview.
+    pub async fn migration_preview(
+        &self,
+        secret: &str,
+        sidecar_epoch: &str,
+        request: MigrationPreviewRequest,
+        deadline: Deadline,
+    ) -> Result<serde_json::Value, String> {
+        self.authorised(secret, sidecar_epoch).await?;
+        if deadline.is_expired() {
+            return Err("the management deadline expired before the preview started".into());
+        }
+        self.backend.migration_preview(request).await
+    }
+
+    /// Confirms or reconciles one migration.
+    pub async fn migration_confirm(
+        &self,
+        secret: &str,
+        sidecar_epoch: &str,
+        request: MigrationConfirmRequest,
+        deadline: Deadline,
+    ) -> Result<serde_json::Value, String> {
+        self.authorised(secret, sidecar_epoch).await?;
+        if deadline.is_expired() {
+            return Err("the management deadline expired before the confirmation started".into());
+        }
+        self.backend.migration_confirm(request).await
+    }
+
+    /// Reads one migration operation.
+    pub async fn migration_operation(
+        &self,
+        secret: &str,
+        sidecar_epoch: &str,
+        request: MigrationOperationRequest,
+        deadline: Deadline,
+    ) -> Result<serde_json::Value, String> {
+        self.authorised(secret, sidecar_epoch).await?;
+        if deadline.is_expired() {
+            return Err("the management deadline expired before the read started".into());
+        }
+        self.backend.migration_operation(request).await
+    }
+
     fn lock_inflight(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Inflight>>> {
         self.inflight
             .lock()
@@ -493,6 +600,67 @@ impl PrepareBackend for ManagedPrepareBackend {
             BringUpResult::ManualActionRequired { reason } => PrepareOutcome::Blocked { reason },
         }
     }
+
+    async fn migration_preview(
+        &self,
+        request: MigrationPreviewRequest,
+    ) -> Result<serde_json::Value, String> {
+        let gateway = production_gateway()?;
+        // Blocking: the probe asks the platform (launchd, peer credentials, process
+        // starts). Running it on the async runtime would stall every other management
+        // frame for the length of a probe.
+        let view = tokio::task::spawn_blocking(move || gateway.preview(&request))
+            .await
+            .map_err(|error| format!("the preview task did not finish: {error}"))??;
+        serde_json::to_value(view).map_err(|error| format!("unserialisable preview: {error}"))
+    }
+
+    async fn migration_confirm(
+        &self,
+        request: MigrationConfirmRequest,
+    ) -> Result<serde_json::Value, String> {
+        let gateway = production_gateway()?;
+        let view = tokio::task::spawn_blocking(move || gateway.confirm(&request))
+            .await
+            .map_err(|error| format!("the confirmation task did not finish: {error}"))??;
+        serde_json::to_value(view).map_err(|error| format!("unserialisable operation: {error}"))
+    }
+
+    async fn migration_operation(
+        &self,
+        request: MigrationOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        let gateway = production_gateway()?;
+        let operation_id = request.operation_id.clone();
+        let view = tokio::task::spawn_blocking(move || gateway.operation(&operation_id))
+            .await
+            .map_err(|error| format!("the operation read did not finish: {error}"))??;
+        serde_json::to_value(view).map_err(|error| format!("unserialisable operation: {error}"))
+    }
+}
+
+/// The migration gateway for this sidecar's own instance.
+///
+/// One per process, not one per call: a preview token is an in-memory fact, and a
+/// gateway rebuilt per call would always answer "this preview is not known here" --
+/// turning every confirmation into a refusal that looks like a stale token. The
+/// instance home is fixed for the life of the process (`YI_AGENT_HOME` is read at
+/// startup by the launcher), so caching it cannot answer for a different home.
+fn production_gateway()
+-> Result<&'static yi_agent_supervisors::lifecycle::migration_gateway::Gateway, String> {
+    use std::sync::OnceLock;
+    static GATEWAY: OnceLock<
+        Result<yi_agent_supervisors::lifecycle::migration_gateway::Gateway, String>,
+    > = OnceLock::new();
+    GATEWAY
+        .get_or_init(|| {
+            let home = yi_agent_store::paths::instance_home().ok_or_else(|| {
+                "this process has no instance home, so it cannot manage a migration".to_string()
+            })?;
+            Ok(yi_agent_supervisors::lifecycle::migration_gateway::Gateway::system(home))
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
 }
 
 /// 壳启动 sidecar 时设置的环境标记。/// 壳启动 sidecar 时设置的环境标记。
@@ -650,6 +818,10 @@ pub async fn dispatch(
         .map(str::to_owned)
         .unwrap_or_default();
     let id = request.id.clone();
+    // Read before the match consumes `request`: every arm authenticates with the
+    // frame's own secret and epoch, never with a value the handler invents.
+    let request_secret = request.secret.clone();
+    let request_epoch = request.sidecar_epoch.clone();
     if !is_reserved(&request.method) {
         return ManagementResponse::err(&id, &epoch, "not a management method");
     }
@@ -676,6 +848,66 @@ pub async fn dispatch(
                         ManagementResponse::err(&id, &epoch, format!("unserialisable: {error}"))
                     }
                 },
+                Err(error) => ManagementResponse::err(&id, &epoch, error),
+            }
+        }
+        MIGRATION_PREVIEW_METHOD => {
+            let request: MigrationPreviewRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ManagementResponse::err(
+                            &id,
+                            &epoch,
+                            format!("malformed migration preview request: {error}"),
+                        );
+                    }
+                };
+            match handle
+                .migration_preview(&request_secret, &request_epoch, request, deadline)
+                .await
+            {
+                Ok(value) => ManagementResponse::ok(&id, &epoch, value),
+                Err(error) => ManagementResponse::err(&id, &epoch, error),
+            }
+        }
+        MIGRATION_CONFIRM_METHOD => {
+            let request: MigrationConfirmRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ManagementResponse::err(
+                            &id,
+                            &epoch,
+                            format!("malformed migration confirm request: {error}"),
+                        );
+                    }
+                };
+            match handle
+                .migration_confirm(&request_secret, &request_epoch, request, deadline)
+                .await
+            {
+                Ok(value) => ManagementResponse::ok(&id, &epoch, value),
+                Err(error) => ManagementResponse::err(&id, &epoch, error),
+            }
+        }
+        MIGRATION_OPERATION_METHOD => {
+            let request: MigrationOperationRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ManagementResponse::err(
+                            &id,
+                            &epoch,
+                            format!("malformed migration operation request: {error}"),
+                        );
+                    }
+                };
+            match handle
+                .migration_operation(&request_secret, &request_epoch, request, deadline)
+                .await
+            {
+                Ok(value) => ManagementResponse::ok(&id, &epoch, value),
                 Err(error) => ManagementResponse::err(&id, &epoch, error),
             }
         }

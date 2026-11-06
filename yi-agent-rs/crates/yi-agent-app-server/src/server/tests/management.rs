@@ -21,7 +21,10 @@ use super::Harness;
 use crate::server::local_management::{ManagementHandle, PrepareBackend};
 // DTO 的权威定义在 lifecycle crate；这里只是把它带进作用域，不另造镜像。
 use yi_agent_lifecycle::deadline::Deadline;
-use yi_agent_lifecycle::production::{PrepareOutcome, PrepareRequest};
+use yi_agent_lifecycle::production::{
+    MigrationConfirmRequest, MigrationOperationRequest, MigrationPreviewRequest,
+    MigrationPreviewView, MigrationWorkload, PrepareOutcome, PrepareRequest,
+};
 use yi_agent_lifecycle::types::{ArtifactIdentity, RuntimeScope};
 
 /// 数调用次数的后端。`delay` 用来把"并发"做成真的并发。
@@ -64,6 +67,113 @@ impl PrepareBackend for CountingBackend {
             .push(request.scope.key.clone());
         tokio::time::sleep(self.delay).await;
         self.outcome.clone()
+    }
+}
+
+/// A migration backend that counts what it was asked to do.
+///
+/// The counts are the assertion: "the preview was refused" is proven by the backend
+/// never being reached, not by the wording of an error frame.
+#[derive(Default)]
+struct MigrationBackendCalls {
+    previews: AtomicUsize,
+    confirms: AtomicUsize,
+    operations: AtomicUsize,
+}
+
+struct MigratingBackend {
+    calls: Arc<MigrationBackendCalls>,
+    preview: Result<MigrationPreviewView, String>,
+}
+
+impl MigratingBackend {
+    fn new(
+        preview: Result<MigrationPreviewView, String>,
+    ) -> (Arc<Self>, Arc<MigrationBackendCalls>) {
+        let calls = Arc::new(MigrationBackendCalls::default());
+        (
+            Arc::new(Self {
+                calls: Arc::clone(&calls),
+                preview,
+            }),
+            calls,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl PrepareBackend for MigratingBackend {
+    async fn prepare(&self, request: PrepareRequest) -> PrepareOutcome {
+        let _ = request;
+        PrepareOutcome::Unknown {
+            reason: "this backend only migrates".into(),
+        }
+    }
+
+    async fn migration_preview(
+        &self,
+        request: MigrationPreviewRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        self.calls.previews.fetch_add(1, Ordering::SeqCst);
+        let view = self.preview.clone()?;
+        serde_json::to_value(view).map_err(|error| error.to_string())
+    }
+
+    async fn migration_confirm(
+        &self,
+        request: MigrationConfirmRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        self.calls.confirms.fetch_add(1, Ordering::SeqCst);
+        Err("the test backend does not run migrations".into())
+    }
+
+    async fn migration_operation(
+        &self,
+        request: MigrationOperationRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _ = request;
+        self.calls.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::Value::Null)
+    }
+}
+
+fn migration_preview_params(scope_key: &str) -> serde_json::Value {
+    serde_json::to_value(MigrationPreviewRequest {
+        scope: RuntimeScope {
+            key: scope_key.to_string(),
+            runtime_dir: std::path::PathBuf::from(scope_key),
+            project_key: "/tmp/project-a".into(),
+            instance_home: "/tmp/instance".into(),
+        },
+        target: ArtifactIdentity {
+            build_id: "build-1".into(),
+            display_version: "0.1.13".into(),
+            executable: "/Applications/yi-agent.app/Contents/MacOS/yi-agent".into(),
+            sha256: String::new(),
+            schema_min: 0,
+            schema_max: 15,
+            handover_version: 1,
+            business_protocol_min: 2,
+            business_protocol_max: 2,
+            capabilities: vec![],
+        },
+    })
+    .expect("migration preview params serialize")
+}
+
+fn preview_view(scope_key: &str) -> MigrationPreviewView {
+    MigrationPreviewView {
+        token: "tok-1".into(),
+        evidence_digest: "digest-1".into(),
+        scope_key: scope_key.to_string(),
+        affected: vec![yi_agent_lifecycle::production::MigrationAffected {
+            scope_key: "/tmp/other".into(),
+            workload: MigrationWorkload::Unverified("the registration file says nothing".into()),
+        }],
+        blockers: vec![],
+        expires_at_unix: 0,
     }
 }
 
@@ -592,4 +702,135 @@ async fn the_default_deadline_budget_is_bounded() {
         "control budget {budget:?}"
     );
     let _ = Deadline::after(budget);
+}
+
+/// A migration is not reachable before the credential is established.
+///
+/// The count is the assertion: an unauthenticated frame must not even reach the
+/// backend, so "nothing ran" cannot be confused with "the wording was right".
+#[tokio::test]
+async fn an_unbootstrapped_session_cannot_preview_a_migration() {
+    let (backend, calls) = MigratingBackend::new(Ok(preview_view("/tmp/runtime")));
+    let handle = Arc::new(ManagementHandle::new(backend));
+    let mut h = Harness::with_management(handle).await;
+
+    h.send(&management_frame(
+        "m-1",
+        "_shell/migrationPreview",
+        "s3cret",
+        "epoch-1",
+        migration_preview_params("/tmp/runtime"),
+    ))
+    .await;
+    let frame = next_private_frame(&mut h, "the migration preview refusal").await;
+    assert!(
+        frame
+            .get("error")
+            .and_then(|error| error.as_str())
+            .is_some(),
+        "an unbootstrapped preview must be refused: {frame}"
+    );
+    assert_eq!(
+        calls.previews.load(Ordering::SeqCst),
+        0,
+        "an unauthenticated frame reached the migration backend"
+    );
+    h.shutdown().await;
+}
+
+/// The preview is answered by the backend, and it is answerable for an instance whose
+/// runtime could not be started: nothing here takes a lease or launches anything.
+#[tokio::test]
+async fn a_bootstrapped_session_can_preview_a_migration() {
+    let (backend, calls) = MigratingBackend::new(Ok(preview_view("/tmp/runtime")));
+    let handle = Arc::new(ManagementHandle::new(backend));
+    let mut h = Harness::with_management(handle).await;
+
+    h.send(&bootstrap_frame("s3cret", "epoch-1")).await;
+    let ack = next_private_frame(&mut h, "the bootstrap ack").await;
+    assert_eq!(
+        ack.get("bootstrap").and_then(|v| v.as_str()),
+        Some("accepted")
+    );
+
+    h.send(&management_frame(
+        "m-2",
+        "_shell/migrationPreview",
+        "s3cret",
+        "epoch-1",
+        migration_preview_params("/tmp/runtime"),
+    ))
+    .await;
+    let frame = next_private_frame(&mut h, "the migration preview").await;
+    assert!(frame.get("error").is_none(), "the preview failed: {frame}");
+    let result = frame.get("result").expect("a preview result");
+    assert_eq!(result.get("token"), Some(&serde_json::json!("tok-1")));
+    // An unverifiable workload must survive the wire as "unverified", never as idle.
+    let affected = result
+        .get("affected")
+        .and_then(|value| value.as_array())
+        .expect("affected projects");
+    assert_eq!(affected.len(), 1);
+    assert!(
+        affected[0]
+            .get("workload")
+            .and_then(|workload| workload.get("unverified"))
+            .is_some(),
+        "an unverified workload was flattened into something else: {affected:?}"
+    );
+    assert_eq!(calls.previews.load(Ordering::SeqCst), 1);
+    h.shutdown().await;
+}
+
+/// A confirmation with nothing to confirm is refused by the backend, and the refusal
+/// is carried back rather than reported as success.
+#[tokio::test]
+async fn a_migration_confirmation_carries_the_backend_refusal() {
+    let (backend, calls) = MigratingBackend::new(Ok(preview_view("/tmp/runtime")));
+    let handle = Arc::new(ManagementHandle::new(backend));
+    let mut h = Harness::with_management(handle).await;
+
+    h.send(&bootstrap_frame("s3cret", "epoch-1")).await;
+    let _ = next_private_frame(&mut h, "the bootstrap ack").await;
+
+    let params = serde_json::json!({
+        "scope": {
+            "key": "/tmp/runtime",
+            "runtime_dir": "/tmp/runtime",
+            "project_key": "/tmp/project-a",
+            "instance_home": "/tmp/instance",
+        },
+        "target": {
+            "build_id": "build-1",
+            "display_version": "0.1.13",
+            "executable": "/Applications/yi-agent.app/Contents/MacOS/yi-agent",
+            "sha256": "",
+            "schema_min": 0,
+            "schema_max": 15,
+            "handover_version": 1,
+            "business_protocol_min": 2,
+            "business_protocol_max": 2,
+            "capabilities": [],
+        },
+        "token": "tok-1",
+        "operation_id": "op-1",
+    });
+    h.send(&management_frame(
+        "m-3",
+        "_shell/migrationConfirm",
+        "s3cret",
+        "epoch-1",
+        params,
+    ))
+    .await;
+    let frame = next_private_frame(&mut h, "the migration confirmation").await;
+    assert!(
+        frame
+            .get("error")
+            .and_then(|error| error.as_str())
+            .is_some_and(|error| error.contains("does not run migrations")),
+        "the backend refusal was not carried back: {frame}"
+    );
+    assert_eq!(calls.confirms.load(Ordering::SeqCst), 1);
+    h.shutdown().await;
 }

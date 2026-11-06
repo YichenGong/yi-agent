@@ -520,7 +520,9 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
                 eprintln!("[{}] no longer desired; supervisor stops", key.as_str());
                 return;
             }
-            drop(state);
+            // `tauri::State` is a handle, not a lock guard: dropping it releases
+            // nothing, so the borrow ends here instead of pretending to unlock.
+            let _ = &state;
             match spawn_once(&app, &key) {
                 Ok(mut rx) => {
                     // A successful launch resets the backoff: the previous exit

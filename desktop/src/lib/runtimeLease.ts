@@ -8,12 +8,15 @@
  * forever, and a project the user left while it is still working must not be
  * released out from under that work.
  *
- * The rule is therefore exactly two sources of demand:
+ * The rule is therefore exactly three sources of demand:
  *
  * 1. the project of the **currently open** thread (the one the user is looking
- *    at), and
+ *    at),
  * 2. any project that has a thread **still working** (`running` or awaiting
- *    approval) — background work is a real reason to stay attached.
+ *    approval) — background work is a real reason to stay attached, and
+ * 3. any project whose plugin view is on screen — a board-only view has no
+ *    thread, so without this it would wait forever for a service no lease keeps
+ *    alive.
  *
  * Everything else is not demand, including "it is in the recent list".
  */
@@ -26,8 +29,32 @@ export interface LeaseInput {
   activeProject: string | null;
   /** Every known thread's project and status (status may be missing). */
   threads: ReadonlyArray<{ cwd: string; status?: string }>;
+  /** Projects with a plugin view on screen. */
+  pluginProjects?: ReadonlyArray<string>;
   /** Projects this run already holds a lease for. */
   owned: ReadonlyArray<string>;
+}
+
+/** The window's answer to "may I treat this project as leased". */
+export interface AcquireView {
+  scopeKey: string;
+  attemptId: string;
+  state: string;
+  retry?: string;
+  reason?: string | null;
+}
+
+/**
+ * Whether an acquisition result is an actual lease.
+ *
+ * Only `managedReady` is: the shell holds a live, renewing lease and the runtime
+ * identity matches this build. `starting` means a preparation is in flight — the
+ * command returned, nothing is held — and the other three are refusals or
+ * unknowns. Recording any of them as "owned" is how a blocked project silently
+ * looked like a working runtime.
+ */
+export function isHeldLease(view: AcquireView): boolean {
+  return view.state === "managedReady";
 }
 
 export interface LeaseDecision {
@@ -59,6 +86,7 @@ export function normalizeProject(path: string): string {
 export function wantedProjects(input: {
   activeProject: string | null;
   threads: ReadonlyArray<{ cwd: string; status?: string }>;
+  pluginProjects?: ReadonlyArray<string>;
 }): string[] {
   const wanted = new Set<string>();
   if (input.activeProject) wanted.add(normalizeProject(input.activeProject));
@@ -66,6 +94,9 @@ export function wantedProjects(input: {
     if (thread.status && BUSY.has(thread.status)) {
       wanted.add(normalizeProject(thread.cwd));
     }
+  }
+  for (const project of input.pluginProjects ?? []) {
+    wanted.add(normalizeProject(project));
   }
   return [...wanted].sort();
 }

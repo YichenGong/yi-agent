@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import type { RpcCall } from "../lib/rpcCall";
 import { stateAllowsWrite, type PluginState } from "../hooks/usePlugins";
+import { registerPluginConsumer } from "../lib/pluginDemandRegistry";
 
 /**
  * 受管插件视图。
@@ -25,6 +26,14 @@ export interface PluginViewProps {
   plugin: string;
   version: string | null;
   view: string;
+  /**
+   * The project this view serves.
+   *
+   * Present so the view can register itself as demand: a window that shows only a
+   * plugin has no conversation, so without this nothing would ask for a runtime and
+   * the plugin would wait for a service no lease keeps alive.
+   */
+  project?: string;
   state: PluginState;
   /** 宿主提供的 open/close 命令。缺省时不渲染业务 iframe。 */
   openView?: (args: { plugin: string; version: string; view: string }) => Promise<{
@@ -37,9 +46,27 @@ export interface PluginViewProps {
   embedded?: boolean;
 }
 
-export function PluginView({ plugin, version, view, state, openView, closeView, embedded = false }: PluginViewProps) {
+export function PluginView({ plugin, project, version, view, state, openView, closeView, embedded = false }: PluginViewProps) {
   const [current, setCurrent] = useState<PluginViewState>({ kind: "idle" });
   const handleRef = useRef<string | null>(null);
+
+  // Demand follows the mounted view, not the open window: the service has to be
+  // asked for before the handle exists, and it must stop when this view goes away.
+  //
+  // Only a state that can actually render a view registers. A plugin that is merely
+  // installed-but-disabled has nobody to serve, and claiming demand for it would keep
+  // a runtime alive for a project with no work in it.
+  //
+  // The consumer name is per (project, plugin, view), so a second view of the same
+  // plugin registers separately and neither can withdraw the other's demand.
+  const servable =
+    state.kind === "running" || state.kind === "read-only" || state.kind === "failing";
+  useEffect(() => {
+    if (!project || !servable) return;
+    const consumer = `view:${project}:${plugin}:${view}`;
+    const release = registerPluginConsumer({ project, plugin, consumer });
+    return release;
+  }, [project, plugin, view, servable]);
 
   // 状态不再是"可渲染"时，收掉已经打开的视图。项目切换、停用、卸载都走这里。
   useEffect(() => {

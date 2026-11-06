@@ -1,7 +1,13 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { isRemoteClient } from "../lib/platform";
-import { leaseDecision, type LeaseDecision } from "../lib/runtimeLease";
+import {
+  isHeldLease,
+  leaseDecision,
+  wantedProjects,
+  type AcquireView,
+  type LeaseDecision,
+} from "../lib/runtimeLease";
 
 /**
  * Keeps the desktop shell's runtime leases aligned with what the user is doing.
@@ -23,6 +29,14 @@ export interface LeaseDeps {
   activeProject: string | null;
   /** Every known thread's project and status. */
   threads: ReadonlyArray<{ cwd: string; status?: string }>;
+  /**
+   * Projects with a plugin view on screen.
+   *
+   * A board-only window has no thread, so this is the only reason its project is
+   * wanted at all. Omitting it would make the plugin wait for a runtime nobody
+   * kept alive.
+   */
+  pluginProjects?: ReadonlyArray<string>;
   /** A value that changes whenever the wanted set may have changed. */
   revision: string;
 }
@@ -30,7 +44,15 @@ export interface LeaseDeps {
 export function useRuntimeLease(deps: LeaseDeps) {
   // What this shell believes it holds. Kept in a ref, not state: it is not
   // rendered, and making it state would re-render the whole app on every switch.
+  //
+  // The single source of truth is still the native side (`runtime_registered_projects`);
+  // this set only decides *when to ask*, so a stale entry costs one refused
+  // release, never a wrong "this project is ready".
   const owned = useRef<Set<string>>(new Set());
+  // The wanted set as of the latest decision. A preparation that finishes later
+  // compares against this: a project the user has since left must not be recorded
+  // as held, or it would never be released.
+  const wanted = useRef<Set<string>>(new Set());
   // The scope key the shell resolved for each project. Release needs the key, not
   // the path: the key is the canonical runtime directory, and the shell refuses to
   // act on a key it never resolved. Asking the shell keeps one canonicalisation
@@ -45,26 +67,54 @@ export function useRuntimeLease(deps: LeaseDeps) {
     const decision: LeaseDecision = leaseDecision({
       activeProject: deps.activeProject,
       threads: deps.threads,
+      pluginProjects: deps.pluginProjects,
       owned: [...owned.current],
     });
+    wanted.current = new Set(
+      wantedProjects({
+        activeProject: deps.activeProject,
+        threads: deps.threads,
+        pluginProjects: deps.pluginProjects,
+      }),
+    );
+
     if (decision.acquire.length === 0 && decision.release.length === 0) return;
 
-    // Optimistically reserve: a second run before the first finishes must not
-    // decide to release a project whose acquire is still in flight.
+    // Reserve the *intent*, not a lease: a second run before the first finishes
+    // must not decide to release a project whose acquire is still in flight. The
+    // reservation is released again if the answer is not `managedReady`.
     for (const project of decision.acquire) owned.current.add(project);
     for (const project of decision.release) owned.current.delete(project);
 
     chain.current = chain.current.then(async () => {
       for (const project of decision.acquire) {
         try {
-          await invoke("runtime_acquire_project", { project });
-          // Recorded only after the shell accepted it: the shell holds the resolved
-          // scope from this point on, so it can answer status reads for a runtime
-          // that refused a lease (embedded or legacy) as well.
+          const view = (await invoke("runtime_acquire_project", {
+            project,
+          })) as AcquireView;
+          if (!isHeldLease(view)) {
+            // The shell answered, but not with a lease. Dropping the reservation
+            // is what makes the next decision retry: neither `starting` nor
+            // `blocked` is something that may be released.
+            owned.current.delete(project);
+            continue;
+          }
+          // Recorded only after the shell reported a live lease: the shell holds
+          // the resolved scope from this point on, so it can answer status reads
+          // for a runtime that refused a lease (embedded or legacy) as well.
           const scopeKey = await invoke<string | null>("runtime_scope_for_project", {
             project,
           });
           if (scopeKey) scopes.current.set(project, scopeKey);
+          // A late answer for a project the decision has since dropped must not
+          // resurrect it: release it now instead of leaving a lease with no owner.
+          if (!wanted.current.has(project)) {
+            owned.current.delete(project);
+            if (scopeKey) {
+              await invoke("runtime_release_project", { scopeKey }).catch(() => {});
+              scopes.current.delete(project);
+            }
+          }
         } catch {
           // Not fatal: the runtime simply stays unleased, which is the state the
           // app was in before this feature existed.

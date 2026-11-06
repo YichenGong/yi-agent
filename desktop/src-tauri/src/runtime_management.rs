@@ -38,6 +38,15 @@ pub const PREPARE_METHOD: &str = "_shell/prepare";
 /// response is not: it carries a capability.
 pub const AUTHORIZE_ROOT_METHOD: &str = "_shell/authorizeRoot";
 
+/// Legacy-migration preview. Read-only, and answered from the sidecar's own probe.
+pub const MIGRATION_PREVIEW_METHOD: &str = "_shell/migrationPreview";
+
+/// Runs or reconciles one legacy migration.
+pub const MIGRATION_CONFIRM_METHOD: &str = "_shell/migrationConfirm";
+
+/// Reads one migration operation without changing anything.
+pub const MIGRATION_OPERATION_METHOD: &str = "_shell/migrationOperation";
+
 /// 保留方法前缀。与 app-server 的常量同名同值，两侧各存一份是有意的：
 /// 壳不依赖 app-server（它是另一个进程），所以这个字符串是**线协议**的一部分，
 /// 由两侧的测试同时钉住。
@@ -241,16 +250,37 @@ impl ManagementSession {
         request: &yi_agent_lifecycle::production::PrepareRequest,
         budget: std::time::Duration,
     ) -> Result<ManagementReply, String> {
-        let id = format!("prepare-{}-{}", self.epoch, uuid::Uuid::new_v4().simple());
+        self.call(
+            transport,
+            "prepare",
+            PREPARE_METHOD,
+            serde_json::to_value(request).map_err(|error| error.to_string())?,
+            budget,
+        )
+    }
+
+    /// 发出一次管理请求并等待它的应答，由调用方选择方法名与本地的 id 前缀。
+    ///
+    /// 与 [`Self::prepare`] 是同一条路径，不是两套：登记、写帧、等应答、超时
+    /// 清槽的次序才是这个模块的全部正确性所在，复制一份迟早会有一份漏掉其中
+    /// 一步。`purpose` 只影响 id 的可读前缀，不参与任何判定。
+    ///
+    /// 仍然**不重发**：管理方法是幂等查询还是"启动/停止某个东西"由对端决定，
+    /// 这一层不知道，所以它统一不重发，把"要不要再来一次"留给知道语义的调用方。
+    pub fn call(
+        &self,
+        transport: &dyn PrepareTransport,
+        purpose: &str,
+        method: &str,
+        params: serde_json::Value,
+        budget: std::time::Duration,
+    ) -> Result<ManagementReply, String> {
+        let id = format!("{purpose}-{}-{}", self.epoch, uuid::Uuid::new_v4().simple());
         let (tx, rx) = std::sync::mpsc::channel();
         if !self.register_with(&id, Some(tx)) {
             return Ok(ManagementReply::Abandoned);
         }
-        let frame = self.request_frame(
-            &id,
-            PREPARE_METHOD,
-            serde_json::to_value(request).map_err(|error| error.to_string())?,
-        );
+        let frame = self.request_frame(&id, method, params);
         if let Err(error) = transport.write_frame(&frame) {
             // 写不进去等于这次请求从未存在：槽位必须清掉，否则它会一直占着
             // 一个 id，下一次请求永远等不到自己的应答。

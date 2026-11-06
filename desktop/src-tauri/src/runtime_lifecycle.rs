@@ -67,6 +67,13 @@ const STATUS_BUDGET: Duration = yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT;
 /// both of which touch the filesystem.
 pub const SWITCH_BUDGET: Duration = Duration::from_secs(10);
 
+/// Budget for one legacy-migration step.
+///
+/// Larger than a control round trip on purpose: a preview probes the platform
+/// (launchd, peer credentials, process starts), and confirm re-probes before it
+/// touches anything. Both are local work with a fixed upper bound, not network.
+pub const MIGRATION_BUDGET: Duration = Duration::from_secs(30);
+
 /// The guardian's control socket file inside a runtime directory.
 ///
 /// The definition is shared (`yi_agent_lifecycle::GUARDIAN_SOCKET_FILE`), not
@@ -175,6 +182,29 @@ pub trait ControlBackend: Send + Sync + 'static {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "this control backend cannot authorize a root",
+        ))
+    }
+
+    /// Tells the guardian that somebody does (or no longer does) want `plugin`.
+    ///
+    /// Uses the lease this shell already holds: demand is owner-bound, and a
+    /// "demand" that named its own owner would be a way to keep somebody else's
+    /// service alive. Returns `(wanted_after, changed)`.
+    ///
+    /// Defaulted to `Unsupported`, because a backend with no lease has nobody to
+    /// speak for -- that is the embedded/legacy runtime, where plugins are started
+    /// by the old supervisor rather than by demand.
+    fn note_plugin_demand(
+        &self,
+        scope: &RuntimeScope,
+        plugin: &str,
+        acquire: bool,
+        budget: Duration,
+    ) -> io::Result<(bool, bool)> {
+        let _ = (scope, plugin, acquire, budget);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this control backend cannot carry plugin demand",
         ))
     }
 
@@ -348,7 +378,7 @@ impl ControlBackend for SocketBackend {
 
     fn start_heartbeat(&self, scope: &RuntimeScope) -> io::Result<()> {
         let lease = self.lease_for(scope)?;
-        let mut lease = lock_lease(&lease)?;
+        let lease = lock_lease(&lease)?;
         lease.start_heartbeat()
     }
 
@@ -378,6 +408,23 @@ impl ControlBackend for SocketBackend {
         lease.authorize_root(intent, &Deadline::after(budget))
     }
 
+    fn note_plugin_demand(
+        &self,
+        scope: &RuntimeScope,
+        plugin: &str,
+        acquire: bool,
+        budget: Duration,
+    ) -> io::Result<(bool, bool)> {
+        let lease = self.lease_for(scope)?;
+        let lease = lock_lease(&lease)?;
+        let deadline = Deadline::after(budget);
+        if acquire {
+            lease.acquire_plugin_demand(plugin, &deadline)
+        } else {
+            lease.release_plugin_demand(plugin, &deadline)
+        }
+    }
+
     fn lease_for_scope(
         &self,
         scope: &RuntimeScope,
@@ -404,7 +451,7 @@ impl ControlBackend for SocketBackend {
             ));
         };
         let deadline = Deadline::after(budget);
-        let mut lease = lock_lease(&lease)?;
+        let lease = lock_lease(&lease)?;
         let operation = lease.release(&deadline)?;
         match lease.await_result(&operation, budget)? {
             Some(result) => Ok(result),
@@ -713,6 +760,91 @@ pub trait PrepareChannel: Send + Sync + 'static {
     fn prepare(&self, request: PrepareRequest, budget: Duration) -> io::Result<PrepareOutcome>;
 }
 
+/// Sends one legacy-migration request to this shell's own sidecar.
+///
+/// Deliberately *not* a `ControlBackend` method: migration talks to the sidecar's
+/// private management face, not to the guardian, because it is the sidecar that
+/// owns the journal and the platform probe. Keeping it a separate trait also means
+/// a test can prove the "one confirmation, then poll the same id" rule without a
+/// process, which is the rule that costs a user their running work when it breaks.
+pub trait MigrationChannel: Send + Sync + 'static {
+    /// One request. `Ok(None)` means the session gave no answer (closed, replaced,
+    /// or out of budget); the caller must not retry a confirmation in that case.
+    fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        budget: Duration,
+    ) -> io::Result<Option<serde_json::Value>>;
+}
+
+/// The packaged shell's migration channel: the private stdio session of its own
+/// local sidecar.
+pub struct LocalMigrationChannel {
+    sessions: Arc<dyn ManagementSessions>,
+    manager: std::sync::Weak<DesktopRuntimeManager>,
+}
+
+impl LocalMigrationChannel {
+    pub fn new(sessions: Arc<dyn ManagementSessions>) -> Self {
+        Self {
+            sessions,
+            manager: std::sync::Weak::new(),
+        }
+    }
+
+    pub fn with_manager(mut self, manager: std::sync::Weak<DesktopRuntimeManager>) -> Self {
+        self.manager = manager;
+        self
+    }
+}
+
+impl MigrationChannel for LocalMigrationChannel {
+    fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        budget: Duration,
+    ) -> io::Result<Option<serde_json::Value>> {
+        // Looked up per call, never cached: a sidecar restart between a preview and
+        // its confirmation must be visible here, and the old pending table is closed
+        // by then.
+        let Some(session) = self.sessions.current() else {
+            return Err(io::Error::other(
+                "this shell has no local management session to migrate with",
+            ));
+        };
+        let transport = self.sessions.transport();
+        let reply = session
+            .call(transport.as_ref(), "migration", method, params, budget)
+            .map_err(io::Error::other)?;
+        let frame = match reply {
+            crate::runtime_management::ManagementReply::Answered(frame) => frame,
+            crate::runtime_management::ManagementReply::Abandoned => return Ok(None),
+        };
+        if let Some(error) = frame.get("error").and_then(|error| error.as_str()) {
+            return Err(io::Error::other(error.to_string()));
+        }
+        // An answer from another generation is not ours to apply: it was computed
+        // by a process this shell is no longer talking to.
+        if let Some(epoch) = frame.get("sidecar_epoch").and_then(|epoch| epoch.as_str()) {
+            if epoch != session.epoch() {
+                return Ok(None);
+            }
+            if let Some(manager) = self.manager.upgrade() {
+                manager.note_sidecar_epoch(epoch);
+            }
+        }
+        match frame.get("result") {
+            Some(result) => Ok(Some(result.clone())),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the migration answer carried neither a result nor an error",
+            )),
+        }
+    }
+}
+
 /// Owns this App run's identity and its per-project registrations.
 pub struct DesktopRuntimeManager {
     client_run_id: String,
@@ -762,11 +894,34 @@ pub struct DesktopRuntimeManager {
     /// `Weak` handle on this very manager (to record the sidecar epoch it sees),
     /// and the manager must therefore exist before the channel does.
     prepare: Mutex<Option<Arc<dyn PrepareChannel>>>,
+    /// The legacy-migration channel, when this shell has one.
+    ///
+    /// `None` is a real state and must stay distinguishable from "there is nothing
+    /// to migrate": the latter is a preview that lists nothing, the former is a
+    /// refusal to answer at all.
+    migration: Mutex<Option<Arc<dyn MigrationChannel>>>,
+    /// Legacy migrations this shell started, keyed by scope.
+    ///
+    /// Kept apart from `operations` on purpose: that map answers "is a *version
+    /// switch* in flight here?", and a migration id in it would make the switch
+    /// dialog poll an id the switch machinery never issued.
+    migrations: Mutex<BTreeMap<String, String>>,
     /// The authenticated epoch of the sidecar this shell bootstrapped.
     ///
     /// Set from the bootstrap answer, never from an incoming request: a caller
     /// that could name its own epoch could make a stale sidecar look current.
     sidecar_epoch: Mutex<Option<String>>,
+    /// Which consumers currently want a plugin service, per `(scope, plugin)`.
+    ///
+    /// The native side is where demand is aggregated because the guardian's demand
+    /// table stops a service when its *last* holder releases. A WebView that sent a
+    /// release per view would stop a service another view still uses, so the page
+    /// names consumers and the shell decides when "the last one" has left.
+    ///
+    /// Keeping it here also means a WebView reload does not drop demand it never
+    /// released: the consumers die with the page, but the shell still knows which
+    /// ones it was told about.
+    plugin_demand: Mutex<BTreeMap<String, BTreeMap<String, std::collections::BTreeSet<String>>>>,
 }
 
 impl DesktopRuntimeManager {
@@ -790,7 +945,10 @@ impl DesktopRuntimeManager {
             states: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
             prepare: Mutex::new(None),
+            migration: Mutex::new(None),
+            migrations: Mutex::new(BTreeMap::new()),
             sidecar_epoch: Mutex::new(None),
+            plugin_demand: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -817,6 +975,122 @@ impl DesktopRuntimeManager {
     pub fn attach_prepare(&self, prepare: Arc<dyn PrepareChannel>) {
         if let Ok(mut guard) = self.prepare.lock() {
             *guard = Some(prepare);
+        }
+    }
+
+    /// Installs the migration channel. Same reason as `attach_prepare`: it needs a
+    /// `Weak` handle on this manager to record the sidecar epoch.
+    pub fn attach_migration(&self, migration: Arc<dyn MigrationChannel>) {
+        if let Ok(mut guard) = self.migration.lock() {
+            *guard = Some(migration);
+        }
+    }
+
+    /// Replaces the migration channel. Only tests need this.
+    pub fn with_migration(self, migration: Arc<dyn MigrationChannel>) -> Self {
+        self.attach_migration(migration);
+        self
+    }
+
+    /// Records the migration operation this shell just started for `scope`.
+    pub fn note_migration_operation(&self, scope_key: &str, operation_id: &str) {
+        if let Ok(mut guard) = self.migrations.lock() {
+            guard.insert(scope_key.to_string(), operation_id.to_string());
+        }
+    }
+
+    /// The migration this shell last started for `scope`, if any.
+    ///
+    /// Exists so a WebView reload resumes polling instead of forgetting that a
+    /// migration is in flight -- and, more importantly, so it does not offer a
+    /// second confirmation for one already sent.
+    pub fn migration_operation_for(&self, scope_key: &str) -> Option<String> {
+        self.migrations
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(scope_key).cloned())
+    }
+
+    /// Forgets a finished migration. A terminal phase is the only thing that clears
+    /// it: an in-flight one must stay visible so it is not confirmed twice.
+    pub fn forget_migration(&self, scope_key: &str) {
+        if let Ok(mut guard) = self.migrations.lock() {
+            guard.remove(scope_key);
+        }
+    }
+
+    /// The migration channel, when this build has one.
+    pub fn migration_channel(&self) -> Option<Arc<dyn MigrationChannel>> {
+        self.migration.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Records that one consumer wants `plugin` for `scope`.
+    ///
+    /// Returns whether the plugin became wanted *at all*, which is the only moment
+    /// the guardian has to be told to acquire: a second consumer is a local fact
+    /// and does not change the service.
+    pub fn note_plugin_demand(&self, scope_key: &str, plugin: &str, consumer: &str) -> bool {
+        let Ok(mut demand) = self.plugin_demand.lock() else {
+            return false;
+        };
+        let consumers = demand
+            .entry(scope_key.to_string())
+            .or_default()
+            .entry(plugin.to_string())
+            .or_default();
+        let was_wanted = !consumers.is_empty();
+        consumers.insert(consumer.to_string());
+        !was_wanted
+    }
+
+    /// Removes one consumer's demand.
+    ///
+    /// Returns whether that was the last consumer of that plugin, i.e. whether the
+    /// guardian must now be told to release. A consumer that never registered is
+    /// "not the last one", so an unbalanced release cannot stop a shared service.
+    pub fn drop_plugin_demand(&self, scope_key: &str, plugin: &str, consumer: &str) -> bool {
+        let Ok(mut demand) = self.plugin_demand.lock() else {
+            return false;
+        };
+        let Some(plugins) = demand.get_mut(scope_key) else {
+            return false;
+        };
+        let Some(consumers) = plugins.get_mut(plugin) else {
+            return false;
+        };
+        if !consumers.remove(consumer) {
+            return false;
+        }
+        if consumers.is_empty() {
+            plugins.remove(plugin);
+            if plugins.is_empty() {
+                demand.remove(scope_key);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Every plugin this shell believes is wanted for `scope`, for reconciliation.
+    pub fn wanted_plugins(&self, scope_key: &str) -> Vec<String> {
+        self.plugin_demand
+            .lock()
+            .map(|demand| {
+                demand
+                    .get(scope_key)
+                    .map(|plugins| plugins.keys().cloned().collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forgets a whole scope's demand, without telling anyone.
+    ///
+    /// Used by the quit path: the releases it sends already stop the services, and
+    /// re-sending a demand release after the lease is gone would only fail.
+    pub fn forget_plugin_demand(&self, scope_key: &str) {
+        if let Ok(mut demand) = self.plugin_demand.lock() {
+            demand.remove(scope_key);
         }
     }
 
@@ -1718,6 +1992,14 @@ impl DesktopRuntimeManager {
             guard.clear();
             values
         };
+        // The leases are released below, which stops the services they were keeping
+        // alive. The local demand table would otherwise still claim those plugins are
+        // wanted: nothing reads it again after a quit, but a table left naming
+        // consumers that no longer exist is exactly the kind of stale state a later
+        // "why did this start?" investigation cannot explain.
+        for scope in &projects {
+            self.forget_plugin_demand(&scope.key);
+        }
 
         let mut set = tokio::task::JoinSet::new();
         for scope in projects {
@@ -2009,9 +2291,13 @@ pub fn install(app: &tauri::AppHandle) {
     let manager = Arc::new(DesktopRuntimeManager::new(id).with_artifact(artifact));
     // The channel looks the session up per preparation, because `install` runs
     // before the sidecar has even spawned.
-    let sessions = Arc::new(crate::bridge::LocalSessions::new(app.clone()));
+    let sessions: Arc<dyn ManagementSessions> =
+        Arc::new(crate::bridge::LocalSessions::new(app.clone()));
     manager.attach_prepare(Arc::new(
-        LocalPrepareChannel::new(sessions).with_manager(Arc::downgrade(&manager)),
+        LocalPrepareChannel::new(Arc::clone(&sessions)).with_manager(Arc::downgrade(&manager)),
+    ));
+    manager.attach_migration(Arc::new(
+        LocalMigrationChannel::new(sessions).with_manager(Arc::downgrade(&manager)),
     ));
     app.manage(QuitState::new(manager));
 }
@@ -2137,7 +2423,6 @@ mod tests {
         inner: Mutex<FakeInner>,
         gate: Condvar,
         arrived: tokio::sync::Notify,
-        root: PathBuf,
     }
 
     #[derive(Default)]
@@ -2148,12 +2433,11 @@ mod tests {
     }
 
     impl FakeControl {
-        fn new(root: PathBuf) -> Arc<Self> {
+        fn new(_root: PathBuf) -> Arc<Self> {
             Arc::new(Self {
                 inner: Mutex::new(FakeInner::default()),
                 gate: Condvar::new(),
                 arrived: tokio::sync::Notify::new(),
-                root,
             })
         }
 
@@ -2624,6 +2908,262 @@ mod tests {
         let error = registered_scope(&state, "/somewhere/else").unwrap_err();
         assert!(error.contains("not open in this app"), "{error}");
         let _ = dir;
+    }
+
+    /// Demand is per consumer here because the guardian's rule is "the last holder
+    /// releases". If the shell forwarded every view's acquire, two views would make
+    /// the guardian believe two clients want one service.
+    #[test]
+    fn only_the_first_consumer_acquires_and_only_the_last_one_releases() {
+        let manager = DesktopRuntimeManager::new("app-run");
+        let scope_key = "/p/a/.yi-agent/runtime";
+
+        assert!(
+            manager.note_plugin_demand(scope_key, "board", "view-1"),
+            "the first consumer is the only one that changes the wanted set"
+        );
+        assert!(
+            !manager.note_plugin_demand(scope_key, "board", "view-2"),
+            "a second view joining must not be forwarded as a new acquire"
+        );
+        assert_eq!(manager.wanted_plugins(scope_key), vec!["board".to_string()]);
+
+        // One view closes: the service must stay, because the other still uses it.
+        assert!(
+            !manager.drop_plugin_demand(scope_key, "board", "view-1"),
+            "another consumer still wants it, so there is nothing to release"
+        );
+        assert_eq!(manager.wanted_plugins(scope_key), vec!["board".to_string()]);
+
+        assert!(
+            manager.drop_plugin_demand(scope_key, "board", "view-2"),
+            "the last consumer leaving is what releases the service"
+        );
+        assert!(manager.wanted_plugins(scope_key).is_empty());
+    }
+
+    /// An unbalanced release must not stop a service somebody else is using.
+    #[test]
+    fn a_consumer_that_never_registered_cannot_release() {
+        let manager = DesktopRuntimeManager::new("app-run");
+        let scope_key = "/p/a/.yi-agent/runtime";
+        assert!(manager.note_plugin_demand(scope_key, "board", "view-1"));
+        assert!(
+            !manager.drop_plugin_demand(scope_key, "board", "ghost"),
+            "an unknown consumer is not the last one"
+        );
+        assert_eq!(manager.wanted_plugins(scope_key), vec!["board".to_string()]);
+    }
+
+    /// Two projects with the same plugin name are two services.
+    #[test]
+    fn demand_is_scoped_per_project_not_per_plugin_name() {
+        let manager = DesktopRuntimeManager::new("app-run");
+        assert!(manager.note_plugin_demand("/p/a/.yi-agent/runtime", "board", "a"));
+        assert!(manager.note_plugin_demand("/p/b/.yi-agent/runtime", "board", "b"));
+        assert_eq!(
+            manager.wanted_plugins("/p/a/.yi-agent/runtime"),
+            vec!["board".to_string()]
+        );
+        assert!(manager.drop_plugin_demand("/p/a/.yi-agent/runtime", "board", "a"));
+        assert_eq!(
+            manager.wanted_plugins("/p/b/.yi-agent/runtime"),
+            vec!["board".to_string()],
+            "releasing one project's demand must not touch another's"
+        );
+    }
+
+    // -- legacy migration ---------------------------------------------------
+
+    /// A migration channel whose answers the test names, and which records calls.
+    struct FakeMigration {
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+        /// One answer per call, in order. `None` means "no answer at all".
+        answers: Mutex<Vec<Option<serde_json::Value>>>,
+    }
+
+    impl FakeMigration {
+        fn answering(answers: Vec<Option<serde_json::Value>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                answers: Mutex::new(answers),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, serde_json::Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl MigrationChannel for FakeMigration {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+            _budget: Duration,
+        ) -> io::Result<Option<serde_json::Value>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
+            let mut answers = self.answers.lock().unwrap();
+            if answers.is_empty() {
+                return Ok(None);
+            }
+            Ok(answers.remove(0))
+        }
+    }
+
+    fn migration_manager(channel: Arc<FakeMigration>) -> DesktopRuntimeManager {
+        DesktopRuntimeManager::new("app-run")
+            .with_artifact(Some(artifact()))
+            .with_migration(channel)
+    }
+
+    /// A confirmation names the shell's own artifact, never one the page supplied.
+    #[tokio::test]
+    async fn a_confirmation_is_sent_with_the_shells_own_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = FakeMigration::answering(vec![Some(serde_json::json!({
+            "operation_id": "op-1",
+            "phase": "migrating",
+            "detail": null,
+        }))]);
+        let manager = migration_manager(Arc::clone(&channel));
+
+        let view = confirm_migration(&manager, scope(dir.path(), "a"), "tok-1", "op-1", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            view.get("phase").and_then(|p| p.as_str()),
+            Some("migrating")
+        );
+
+        let calls = channel.calls();
+        assert_eq!(calls.len(), 1, "one click must send one confirmation");
+        assert_eq!(
+            calls[0].0,
+            crate::runtime_management::MIGRATION_CONFIRM_METHOD
+        );
+        assert_eq!(
+            calls[0].1.get("target").and_then(|t| t.get("build_id")),
+            Some(&serde_json::json!("build-b")),
+            "the target must be this App's verified artifact"
+        );
+        assert_eq!(
+            calls[0].1.get("operation_id").and_then(|id| id.as_str()),
+            Some("op-1")
+        );
+    }
+
+    /// A confirmation needs a token and an id that existed before the click.
+    #[tokio::test]
+    async fn a_confirmation_without_a_token_or_an_id_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = FakeMigration::answering(vec![]);
+        let manager = migration_manager(Arc::clone(&channel));
+
+        assert!(
+            confirm_migration(&manager, scope(dir.path(), "a"), "  ", "op-1", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            confirm_migration(&manager, scope(dir.path(), "a"), "tok", "", false)
+                .await
+                .is_err()
+        );
+        assert!(channel.calls().is_empty(), "{:?}", channel.calls());
+    }
+
+    /// An answer lost in flight keeps the id, and says `unknown` rather than failing.
+    ///
+    /// This is the state that must lead to reconciliation: the migration may be
+    /// running, so "failed" would invite a second click.
+    #[tokio::test]
+    async fn a_lost_confirmation_answer_keeps_the_operation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = FakeMigration::answering(vec![None]);
+        let manager = migration_manager(Arc::clone(&channel));
+
+        let view = confirm_migration(&manager, scope(dir.path(), "a"), "tok", "op-9", false)
+            .await
+            .unwrap();
+        assert_eq!(view.get("phase").and_then(|p| p.as_str()), Some("unknown"));
+        assert_eq!(
+            view.get("operationId").and_then(|id| id.as_str()),
+            Some("op-9")
+        );
+        assert_eq!(
+            manager.migration_operation_for(&scope(dir.path(), "a").key),
+            Some("op-9".to_string()),
+            "an unanswered confirmation must stay resumable"
+        );
+    }
+
+    /// A terminal phase clears the record; a running one does not.
+    #[tokio::test]
+    async fn only_a_terminal_phase_clears_the_recorded_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = FakeMigration::answering(vec![
+            Some(serde_json::json!({
+                "operation_id": "op-1",
+                "phase": "stopping_legacy",
+                "detail": null,
+            })),
+            Some(serde_json::json!({
+                "operation_id": "op-1",
+                "phase": "completed",
+                "detail": null,
+            })),
+        ]);
+        let manager = migration_manager(Arc::clone(&channel));
+        let key = scope(dir.path(), "a").key;
+        manager.note_migration_operation(&key, "op-1");
+
+        read_migration_operation(&manager, &key, "op-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.migration_operation_for(&key),
+            Some("op-1".to_string()),
+            "a migration still stopping something must stay visible"
+        );
+
+        read_migration_operation(&manager, &key, "op-1")
+            .await
+            .unwrap();
+        assert_eq!(manager.migration_operation_for(&key), None);
+    }
+
+    /// The terminal set is the shell's contract with the UI, so it is pinned.
+    #[test]
+    fn terminal_phases_are_exactly_the_ones_that_end_an_operation() {
+        for phase in [
+            "completed",
+            "failed",
+            "temporary_use",
+            "manual_action_required",
+        ] {
+            assert!(is_terminal_migration_phase(phase), "{phase}");
+        }
+        for phase in ["accepted", "stopping_legacy", "starting_target", "unknown"] {
+            assert!(!is_terminal_migration_phase(phase), "{phase}");
+        }
+    }
+
+    /// A build with no verified artifact refuses to migrate rather than guessing one.
+    #[tokio::test]
+    async fn a_build_without_a_verified_artifact_cannot_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = FakeMigration::answering(vec![]);
+        let manager = DesktopRuntimeManager::new("app-run").with_migration(channel.clone());
+
+        let error = confirm_migration(&manager, scope(dir.path(), "a"), "tok", "op-1", false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no verified runtime artifact"), "{error}");
+        assert!(channel.calls().is_empty());
     }
 
     fn scope(root: &std::path::Path, name: &str) -> RuntimeScope {
@@ -4138,6 +4678,37 @@ mod tests {
         );
     }
 
+    /// A quit forgets the demand it was told about.
+    ///
+    /// The release below stops the services; a local table still naming consumers
+    /// that no longer exist would describe demand nothing can ever withdraw.
+    #[tokio::test]
+    async fn a_quit_forgets_local_plugin_demand() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::Connected(managed_identity(&project.key, "gen-1")),
+        );
+        manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            manager.note_plugin_demand(&project.key, "board", "view-1"),
+            "the first consumer must be recorded as the first"
+        );
+
+        manager
+            .shutdown(Deadline::after(Duration::from_secs(2)))
+            .await;
+
+        // A new consumer after the quit starts a fresh count: the old one is gone,
+        // so this is again "the first".
+        assert!(manager.note_plugin_demand(&project.key, "board", "view-2"));
+    }
+
     /// A quit releases the lease it really holds, over the real socket.
     #[tokio::test]
     async fn a_quit_releases_a_real_lease() {
@@ -4162,6 +4733,45 @@ mod tests {
             guardian.live_clients(),
             Vec::<String>::new(),
             "the lease must be gone from the real table after the quit"
+        );
+    }
+
+    /// A held lease is released on quit even when the project is not usable.
+    ///
+    /// The failure this pins: quitting only the projects that reached
+    /// `managedReady` would leave a real registration behind on every blocked
+    /// project. The user quit, so the runtime must not stay alive on their behalf --
+    /// the reason the project was blocked says nothing about whether we still want it.
+    #[tokio::test]
+    async fn a_quit_releases_a_held_lease_that_never_became_ready() {
+        let dir = short_dir();
+        let project = real_scope(dir.path(), "alpha");
+        let guardian = LeaseGuardian::start(&project);
+        let manager = real_socket_manager(
+            &guardian,
+            PrepareOutcome::VersionChoiceRequired(managed_identity(&project.key, "gen-1")),
+        );
+
+        let view = manager
+            .ensure_project(&project, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(view.state, AcquireState::Blocked, "{view:?}");
+        // The lease is real even though the project is not ready: that is the point.
+        assert_eq!(guardian.live_clients(), vec!["app-run".to_string()]);
+
+        let results = manager
+            .shutdown(Deadline::after(Duration::from_secs(2)))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].stopped,
+            "a quit that leaves a blocked project registered did not stop it"
+        );
+        assert_eq!(
+            guardian.live_clients(),
+            Vec::<String>::new(),
+            "a blocked project still owed its lease back on quit"
         );
     }
 
@@ -4846,6 +5456,323 @@ pub fn runtime_registered_projects(state: tauri::State<'_, QuitState>) -> Vec<St
         .into_iter()
         .map(|scope| scope.key)
         .collect()
+}
+
+/// Declares that one UI consumer now wants `plugin`'s service for a project.
+///
+/// The page names a *consumer*, not a lease: demand has no credential and cannot
+/// keep a runtime alive on its own. The shell forwards only when this consumer is
+/// the first for that `(scope, plugin)` -- a second view joining changes nothing
+/// about the service, and a per-view acquire would make the native side's "last
+/// holder releases" rule mean something else.
+#[tauri::command]
+pub async fn runtime_plugin_demand_acquire(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    plugin: String,
+    consumer: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    let manager = Arc::clone(&state.manager);
+    if plugin.trim().is_empty() || consumer.trim().is_empty() {
+        return Err("plugin demand needs both a plugin and a consumer".to_string());
+    }
+    let first = manager.note_plugin_demand(&scope.key, &plugin, &consumer);
+    let (wanted, changed) = if first {
+        let backend = Arc::clone(&manager.backend);
+        let scope_for_call = scope.clone();
+        let plugin_for_call = plugin.clone();
+        match tokio::task::spawn_blocking(move || {
+            backend.note_plugin_demand(&scope_for_call, &plugin_for_call, true, ACQUIRE_BUDGET)
+        })
+        .await
+        {
+            Ok(Ok(answer)) => answer,
+            // The local intent is kept even when the guardian cannot be told: the
+            // runtime may be coming up, and a dropped intent would leave the view
+            // waiting for a service nobody asked for.
+            Ok(Err(error)) => {
+                return Ok(serde_json::json!({
+                    "plugin": plugin,
+                    "wanted": true,
+                    "changed": true,
+                    "deferred": error.to_string(),
+                }))
+            }
+            Err(join) => {
+                return Ok(serde_json::json!({
+                    "plugin": plugin,
+                    "wanted": true,
+                    "changed": true,
+                    "deferred": format!("the demand task failed: {join}"),
+                }))
+            }
+        }
+    } else {
+        (true, false)
+    };
+    Ok(serde_json::json!({
+        "plugin": plugin,
+        "wanted": wanted,
+        "changed": changed,
+    }))
+}
+
+/// Withdraws one consumer's demand.
+///
+/// Only the last consumer of a plugin is forwarded as a release. A view closing
+/// while another view still uses the same service must not stop it.
+#[tauri::command]
+pub async fn runtime_plugin_demand_release(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    plugin: String,
+    consumer: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    let manager = Arc::clone(&state.manager);
+    let last = manager.drop_plugin_demand(&scope.key, &plugin, &consumer);
+    if !last {
+        // Either another consumer still wants it, or this one never registered.
+        // Both mean "nothing to tell the guardian", and both must NOT be reported
+        // as a stop.
+        return Ok(serde_json::json!({
+            "plugin": plugin,
+            "wanted": true,
+            "changed": false,
+        }));
+    }
+    let backend = Arc::clone(&manager.backend);
+    let scope_for_call = scope.clone();
+    let plugin_for_call = plugin.clone();
+    let (wanted, changed) = match tokio::task::spawn_blocking(move || {
+        backend.note_plugin_demand(&scope_for_call, &plugin_for_call, false, ACQUIRE_BUDGET)
+    })
+    .await
+    {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(error)) => {
+            return Ok(serde_json::json!({
+                "plugin": plugin,
+                "wanted": false,
+                "changed": true,
+                "deferred": error.to_string(),
+            }))
+        }
+        Err(join) => {
+            return Ok(serde_json::json!({
+                "plugin": plugin,
+                "wanted": false,
+                "changed": true,
+                "deferred": format!("the demand task failed: {join}"),
+            }))
+        }
+    };
+    Ok(serde_json::json!({
+        "plugin": plugin,
+        "wanted": wanted,
+        "changed": changed,
+    }))
+}
+
+/// Read-only preview of migrating this project's legacy runtime to the shell's own.
+///
+/// The target comes from the shell's verified manifest, never from the WebView: a
+/// caller-supplied executable would be "replace the runtime with this binary".
+#[tauri::command]
+pub async fn runtime_migration_preview(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    preview_migration(&state.manager, scope).await
+}
+
+/// Consumes a preview token and runs (or reconciles) one migration.
+///
+/// `operation_id` is chosen by the caller before the request goes out, and recorded
+/// here before the frame is written. That ordering is the whole safety property: if
+/// this call's answer is lost, the caller polls [`runtime_migration_operation`] with
+/// the same id. Sending a second confirmation would be a second migration.
+#[tauri::command]
+pub async fn runtime_migration_confirm(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    token: String,
+    operation_id: String,
+    temporary_use: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let scope = registered_scope(&state, &scope_key)?;
+    confirm_migration(
+        &state.manager,
+        scope,
+        &token,
+        &operation_id,
+        temporary_use.unwrap_or(false),
+    )
+    .await
+}
+
+/// One read of a migration operation. Changes nothing.
+#[tauri::command]
+pub async fn runtime_migration_operation(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+    operation_id: String,
+) -> Result<serde_json::Value, String> {
+    let _ = registered_scope(&state, &scope_key)?;
+    read_migration_operation(&state.manager, &scope_key, &operation_id).await
+}
+
+/// The migration target: this App's own verified artifact.
+///
+/// Refusing without one is deliberate. "Migrate to whatever is running" is exactly
+/// the guess that a version string would let us make silently.
+fn migration_target(manager: &DesktopRuntimeManager) -> Result<ArtifactIdentity, String> {
+    manager.artifact().cloned().ok_or_else(|| {
+        "this build has no verified runtime artifact, so it cannot migrate one".to_string()
+    })
+}
+
+fn migration_channel(manager: &DesktopRuntimeManager) -> Result<Arc<dyn MigrationChannel>, String> {
+    manager.migration_channel().ok_or_else(|| {
+        "this build has no local management channel, so it cannot inspect a migration".to_string()
+    })
+}
+
+/// The preview, with no side effects at all.
+async fn preview_migration(
+    manager: &DesktopRuntimeManager,
+    scope: RuntimeScope,
+) -> Result<serde_json::Value, String> {
+    let target = migration_target(manager)?;
+    let channel = migration_channel(manager)?;
+    let request = yi_agent_lifecycle::production::MigrationPreviewRequest { scope, target };
+    let params = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let answer = tokio::task::spawn_blocking(move || {
+        channel.call(
+            crate::runtime_management::MIGRATION_PREVIEW_METHOD,
+            params,
+            MIGRATION_BUDGET,
+        )
+    })
+    .await
+    .map_err(|error| format!("the migration preview task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    answer.ok_or_else(|| {
+        "the local management channel did not answer the preview, so this runtime cannot say what a migration would touch".to_string()
+    })
+}
+
+/// One confirmation, or a reconciliation of the id it names.
+async fn confirm_migration(
+    manager: &DesktopRuntimeManager,
+    scope: RuntimeScope,
+    token: &str,
+    operation_id: &str,
+    temporary_use: bool,
+) -> Result<serde_json::Value, String> {
+    if token.trim().is_empty() {
+        return Err("a migration needs the token from the preview it was shown".to_string());
+    }
+    if operation_id.trim().is_empty() {
+        return Err("a migration needs the operation id chosen before the click".to_string());
+    }
+    let target = migration_target(manager)?;
+    let channel = migration_channel(manager)?;
+    // Recorded before the request is sent: a WebView reload must be able to find the
+    // operation it started, and an answer lost in flight must be reconcilable.
+    manager.note_migration_operation(&scope.key, operation_id);
+    let request = yi_agent_lifecycle::production::MigrationConfirmRequest {
+        scope,
+        target,
+        token: token.to_string(),
+        operation_id: operation_id.to_string(),
+        temporary_use,
+    };
+    let params = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let answer = tokio::task::spawn_blocking(move || {
+        channel.call(
+            crate::runtime_management::MIGRATION_CONFIRM_METHOD,
+            params,
+            MIGRATION_BUDGET,
+        )
+    })
+    .await
+    .map_err(|error| format!("the migration confirmation task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    Ok(match answer {
+        Some(result) => result,
+        // No answer is not a failure: the migration may well be running. Report the
+        // id so the caller reconciles instead of confirming again.
+        None => serde_json::json!({
+            "operationId": operation_id,
+            "phase": "unknown",
+            "detail": "the local management channel did not answer; poll this operation id",
+        }),
+    })
+}
+
+/// One read of an operation, plus the bookkeeping that ends a recorded one.
+async fn read_migration_operation(
+    manager: &DesktopRuntimeManager,
+    scope_key: &str,
+    operation_id: &str,
+) -> Result<serde_json::Value, String> {
+    let channel = migration_channel(manager)?;
+    let request = yi_agent_lifecycle::production::MigrationOperationRequest {
+        scope_key: scope_key.to_string(),
+        operation_id: operation_id.to_string(),
+    };
+    let params = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let answer = tokio::task::spawn_blocking(move || {
+        channel.call(
+            crate::runtime_management::MIGRATION_OPERATION_METHOD,
+            params,
+            STATUS_BUDGET,
+        )
+    })
+    .await
+    .map_err(|error| format!("the migration read task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let Some(result) = answer else {
+        return Ok(serde_json::Value::Null);
+    };
+    // A terminal phase ends the operation, so the shell stops offering to resume it.
+    // Everything else stays recorded: an in-flight migration must remain visible,
+    // which is what prevents a second confirmation.
+    if result
+        .get("phase")
+        .and_then(|phase| phase.as_str())
+        .is_some_and(is_terminal_migration_phase)
+    {
+        manager.forget_migration(scope_key);
+    }
+    Ok(result)
+}
+
+/// Whether a migration phase means the operation is over.
+///
+/// Named rather than inlined because "is it done" and "is it still moving"
+/// disagreeing is how a UI ends up polling forever -- or, worse, offering to confirm
+/// a migration that is still stopping something.
+fn is_terminal_migration_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "completed" | "failed" | "temporary_use" | "manual_action_required"
+    )
+}
+
+/// The migration this shell last started for `scope_key`, if any.
+///
+/// Exists so a WebView reload resumes polling instead of forgetting that a migration
+/// is in flight, and so it does not offer a second confirmation for one already sent.
+#[tauri::command]
+pub fn runtime_active_migration(
+    state: tauri::State<'_, QuitState>,
+    scope_key: String,
+) -> Option<String> {
+    state.manager.migration_operation_for(&scope_key)
 }
 
 /// The scope keys this shell can answer for.

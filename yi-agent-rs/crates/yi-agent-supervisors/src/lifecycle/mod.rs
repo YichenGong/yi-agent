@@ -27,6 +27,7 @@ pub mod handover;
 pub mod legacy_evidence;
 pub mod managed_channel;
 pub mod migration;
+pub mod migration_gateway;
 pub mod migration_operation;
 pub mod preview;
 pub mod processes;
