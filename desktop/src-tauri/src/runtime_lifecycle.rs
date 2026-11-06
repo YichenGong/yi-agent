@@ -2346,6 +2346,22 @@ pub fn artifact_identity_at(bundle_root: &std::path::Path) -> Option<ArtifactIde
     }
 }
 
+/// Releases the barrier if the drain task never reaches its own `release()`.
+///
+/// Why this exists: the phase is advanced to `Draining` by `decide()`, and only the
+/// spawn body moves it to `Released`. If that task panics -- or is dropped because
+/// the runtime is shutting down -- nothing else ever releases it, every later
+/// `ExitRequested` is held, and the app becomes impossible to quit, including via a
+/// second Cmd+Q. A drop guard cannot be forgotten, and `release()` is an idempotent
+/// store, so the normal path still releases explicitly before it asks Tauri to exit.
+struct ReleaseOnDrop(Arc<QuitBarrier>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// The `ExitRequested` half of the quit barrier.
 ///
 /// `CloseRequested` is deliberately absent: the red button hides the window, and
@@ -2374,6 +2390,9 @@ pub fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &ta
             crate::bridge::begin_shutdown(app);
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                // Backstop for the phase: if this body panics or is dropped mid-drain,
+                // the guard releases the barrier on the way out.
+                let _release_on_drop = ReleaseOnDrop(Arc::clone(&barrier));
                 let results = manager.shutdown(Deadline::after(QUIT_GRACE)).await;
                 let outcome = QuitOutcome::from_results(results);
                 for result in &outcome.results {
@@ -3366,6 +3385,28 @@ mod tests {
         assert_eq!(barrier.decide(), ExitDecision::KeepHolding);
         barrier.release();
         // The `app.exit(0)` issued by the drain task arrives here.
+        assert_eq!(barrier.decide(), ExitDecision::Allow);
+        assert!(barrier.is_released());
+    }
+
+    /// A drain task that dies without releasing must not wedge the quit.
+    ///
+    /// The phase moves to `Draining` in `decide()`, and reaching `Released` is the
+    /// spawned body's job. If that body panics or is dropped, the guard is the only
+    /// thing standing between the user and an app that answers every later Cmd+Q
+    /// with `KeepHolding` -- i.e. one that cannot be quit at all.
+    #[test]
+    fn a_drain_that_dies_still_leaves_the_app_quittable() {
+        let barrier = Arc::new(QuitBarrier::new());
+        assert_eq!(barrier.decide(), ExitDecision::BeginDrain);
+        assert_eq!(barrier.decide(), ExitDecision::KeepHolding);
+
+        {
+            let _guard = ReleaseOnDrop(Arc::clone(&barrier));
+            // The drain body never gets to run its own `release()`.
+        }
+
+        // The next Cmd+Q passes instead of being held forever.
         assert_eq!(barrier.decide(), ExitDecision::Allow);
         assert!(barrier.is_released());
     }

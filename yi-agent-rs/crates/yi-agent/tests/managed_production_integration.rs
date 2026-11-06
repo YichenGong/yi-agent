@@ -32,7 +32,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use yi_agent_lifecycle::deadline::Deadline;
@@ -804,13 +804,44 @@ fn an_unbootstrapped_management_call_starts_nothing() -> anyhow::Result<()> {
 
     // The refusal has to be about the *side effect*, not the message: a runtime that
     // started anyway would be running work nobody asked for.
-    std::thread::sleep(Duration::from_millis(500));
+    //
+    // A bare `sleep` then `assert!(!exists)` would be a fixed-delay negative
+    // assertion, which cannot distinguish "never started" from "not started yet": a
+    // runtime created at 600 ms passes a 500 ms window while still violating the
+    // property. Close the channel instead and wait for the process to be gone -- a
+    // sidecar that never reaches its own exit is itself a failure, so the deadline
+    // below always resolves to a real observation.
+    drop(stdin);
+    let status = wait_for_exit(&mut child, Duration::from_secs(20))?;
+    assert!(
+        !status.success() || status.code() == Some(0),
+        "the sidecar exited abnormally after the refusal: {status}"
+    );
     assert!(
         !fixture.runtime_dir.join("runtime.sqlite").exists(),
         "a refused prepare started a runtime anyway"
     );
-    let _ = child.kill();
     Ok(())
+}
+
+/// Waits for a child to exit, killing it if the budget runs out.
+///
+/// Used where the test asserts something *did not* happen: after the process is
+/// gone, no later side effect can still arrive, so "still absent" is a fact rather
+/// than a guess about how long to wait.
+fn wait_for_exit(child: &mut Child, budget: Duration) -> anyhow::Result<ExitStatus> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("the sidecar did not exit inside {budget:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// The runtime a frontend asks for must match its own artifact, or the prepare says
@@ -924,11 +955,11 @@ impl TuiTerminal {
                 // client finished attaching: `attach_root`, `bind_driver` and
                 // `open_managed_channel` all precede the socket being usable by it.
                 //
-                // `admit_turn` is deliberately not waited for. The TUI writes that
-                // stage when the user's first turn is admitted, and several tests in
-                // this file wait here before typing anything -- waiting for it would
-                // hang them, and pretending a client admitted work it was never asked
-                // for is exactly what the design forbids.
+                // The short pause is not the assertion -- callers that care about a
+                // specific later stage wait for that stage themselves (see the TUI and
+                // headless cases, which poll the trace). It only lets the observer's
+                // last lines land on disk so a caller reading the trace immediately
+                // does not race the writer.
                 std::thread::sleep(Duration::from_millis(500));
                 return Ok(());
             }

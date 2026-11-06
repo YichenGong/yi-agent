@@ -497,24 +497,34 @@ where
                         >(value.clone())
                         {
                             Ok(frame) => {
+                                // The session guard must not outlive this block. It is
+                                // the same lock every `prepare`, every migration call
+                                // and the per-frame business gate take (see below), and
+                                // the reply write at the end of this arm is an `.await`
+                                // on the outbound hub: a client that stops draining its
+                                // fd would otherwise stall every authenticated request on
+                                // this connection behind one unrelated bootstrap ack.
                                 let session = handle.session();
-                                let mut session = session.lock().await;
-                                let admission = session.bootstrap(&frame);
-                                let ack = match admission {
-                                    crate::server::local_management::Admission::Accepted => {
-                                        "accepted"
-                                    }
-                                    crate::server::local_management::Admission::AlreadyBootstrapped => {
-                                        "already-bootstrapped"
-                                    }
-                                    crate::server::local_management::Admission::Unauthorized => {
-                                        "unauthorized"
-                                    }
+                                let (admission, reply) = {
+                                    let mut session = session.lock().await;
+                                    let admission = session.bootstrap(&frame);
+                                    let ack = match admission {
+                                        crate::server::local_management::Admission::Accepted => {
+                                            "accepted"
+                                        }
+                                        crate::server::local_management::Admission::AlreadyBootstrapped => {
+                                            "already-bootstrapped"
+                                        }
+                                        crate::server::local_management::Admission::Unauthorized => {
+                                            "unauthorized"
+                                        }
+                                    };
+                                    let reply = crate::server::local_management::bootstrap_ack(
+                                        ack,
+                                        session.sidecar_epoch(),
+                                    );
+                                    (admission, reply)
                                 };
-                                let reply = crate::server::local_management::bootstrap_ack(
-                                    ack,
-                                    session.sidecar_epoch(),
-                                );
                                 // The outbound half of the channel exists only after the
                                 // credential is fixed: before that there is no epoch to
                                 // name in a request, and the shell would refuse it.

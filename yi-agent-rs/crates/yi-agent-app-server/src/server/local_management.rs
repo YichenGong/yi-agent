@@ -117,12 +117,25 @@ pub struct ManagementSession {
 }
 
 /// bootstrap 第一帧。
-#[derive(Debug, serde::Deserialize)]
+///
+/// 手写 `Debug` 而不是 derive：这个结构体只在这个文件里被解析，但它是
+/// 「秘密进了内存」的唯一入口，未来一行 `tracing::debug!(?frame)` 就足以把
+/// 凭据写进日志。存储侧的 `ManagementCredential` 已经脱敏，入口也必须是。
+#[derive(serde::Deserialize)]
 pub struct BootstrapFrame {
     pub secret: String,
     /// 发起方自认的 sidecar 代际。壳每次都新生成，用来把旧响应挡在新请求之外。
     #[serde(default)]
     pub sidecar_epoch: String,
+}
+
+impl std::fmt::Debug for BootstrapFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapFrame")
+            .field("secret", &"<redacted>")
+            .field("sidecar_epoch", &self.sidecar_epoch)
+            .finish()
+    }
 }
 
 /// 一条管理请求进入后的判定结果。
@@ -174,6 +187,12 @@ impl ManagementSession {
         }
         if frame.secret.is_empty() {
             // 空凭据等于没有凭据：任何进程都能用空串通过。
+            return Admission::Unauthorized;
+        }
+        if frame.sidecar_epoch.trim().is_empty() {
+            // 没有代际的会话无法授权任何 root（`bind_epoch` 会拒绝空代际），
+            // 但 ACK 里若回 "accepted"，壳会据此认为自己握着一个可用的管理面，
+            // 直到第一次授权才失败。这里直接拒绝，让失败发生在握手而非授权。
             return Admission::Unauthorized;
         }
         self.credential = Some(ManagementCredential::new(
@@ -1446,6 +1465,42 @@ mod tests {
             Admission::Unauthorized
         );
         assert!(!session.is_bootstrapped());
+    }
+
+    /// 没有代际的 bootstrap 不能被回答成 "accepted"。
+    ///
+    /// 空代际无法授权任何 root（`bind_epoch` 会拒空），所以放它过握手只是把失败
+    /// 推迟到第一次授权。握手阶段就拒，壳才知道这条管理面从未可用。
+    #[test]
+    fn an_empty_epoch_does_not_establish_a_session() {
+        let mut session = ManagementSession::new();
+        for epoch in ["", "   "] {
+            assert_eq!(
+                session.bootstrap(&BootstrapFrame {
+                    secret: "s".into(),
+                    sidecar_epoch: epoch.into(),
+                }),
+                Admission::Unauthorized,
+                "epoch {epoch:?} must not produce an accepted handshake"
+            );
+            assert!(!session.is_bootstrapped());
+        }
+    }
+
+    /// `Debug` 是秘密最容易漏出去的一条路：这里断言它已经被脱敏。
+    #[test]
+    fn the_bootstrap_frame_never_prints_its_secret() {
+        let frame = BootstrapFrame {
+            secret: "s3cret-do-not-print".into(),
+            sidecar_epoch: "epoch-1".into(),
+        };
+        let printed = format!("{frame:?}");
+        assert!(
+            !printed.contains("s3cret-do-not-print"),
+            "the bootstrap secret must not appear in Debug: {printed}"
+        );
+        // The epoch is not a secret and stays readable, so the log is still useful.
+        assert!(printed.contains("epoch-1"), "{printed}");
     }
 
     #[test]

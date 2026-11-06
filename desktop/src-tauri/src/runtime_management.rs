@@ -69,6 +69,27 @@ pub fn reject_reserved_method(method: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 一条要被写进日志的帧，秘密已脱敏。
+///
+/// 存在的理由很具体：bootstrap 帧的形状是「没有 method、没有 id」，正好落进
+/// `bridge` 的 `Frame::Garbage`，而那条分支会把整帧 `eprintln!` 出去。于是在
+/// 别处都刻意脱敏的秘密，会从这一条日志漏回 stderr。这里把承载秘密的键换成
+/// 固定字符串，其余字段原样保留——日志仍然有用，凭据不再出现。
+pub fn redact_frame(value: &serde_json::Value) -> serde_json::Value {
+    /// 已知会携带凭据的键。加新键比放宽匹配更安全：宁可多打一个字段。
+    const SECRET_KEYS: [&str; 2] = ["secret", "bootstrap_secret"];
+
+    let mut redacted = value.clone();
+    if let Some(object) = redacted.as_object_mut() {
+        for key in SECRET_KEYS {
+            if object.contains_key(key) {
+                object.insert(key.into(), serde_json::Value::from("<redacted>"));
+            }
+        }
+    }
+    redacted
+}
+
 /// 一条待完成的管理请求。
 #[derive(Debug)]
 struct Pending {
@@ -368,6 +389,27 @@ mod tests {
         // real calls, and `_shell` alone is a name no method uses.
         assert!(reject_reserved_method("_shell").is_ok());
         assert!(reject_reserved_method("shell/prepare").is_ok());
+    }
+
+    /// 落进日志的帧不能带秘密。
+    ///
+    /// 这条测的是 `Frame::Garbage` 那条 `eprintln!` 之前的一步：bootstrap 帧的
+    /// 形状正是「没有 method、没有 id」，所以它真的会走到那里。
+    #[test]
+    fn a_logged_frame_does_not_carry_the_secret() {
+        let frame = session().bootstrap_frame();
+        let redacted = redact_frame(&frame);
+        let printed = redacted.to_string();
+        assert!(
+            !printed.contains("secret-1"),
+            "the bootstrap secret must not survive redaction: {printed}"
+        );
+        assert_eq!(redacted["secret"], "<redacted>");
+        // Non-secret fields stay readable, so the log still says which epoch.
+        assert_eq!(redacted["sidecar_epoch"], "epoch-1");
+        // A frame with nothing to hide is returned unchanged.
+        let business = serde_json::json!({"hello": "world"});
+        assert_eq!(redact_frame(&business), business);
     }
 
     #[test]

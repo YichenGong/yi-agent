@@ -1492,7 +1492,17 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
         Frame::Notification | Frame::Response => {
             let _ = app.emit(&event_name("message", slot), &value);
         }
-        Frame::Garbage => eprintln!("[{}] dropping non-protocol frame: {value}", slot.as_str()),
+        Frame::Garbage => {
+            // 整帧打印是有代价的：bootstrap 帧的形状恰好就是「没有 method、没有
+            // id」（`{"secret":…,"sidecar_epoch":…}`），于是它一旦从 sidecar 回流
+            // 就会被归到这一类，凭据也会随之进入 stderr。秘密在别处都刻意脱敏
+            // （`ManagementSession` 的 `Debug`），这条日志不能成为唯一的例外。
+            eprintln!(
+                "[{}] dropping non-protocol frame: {}",
+                slot.as_str(),
+                crate::runtime_management::redact_frame(&value)
+            );
+        }
     }
 }
 
