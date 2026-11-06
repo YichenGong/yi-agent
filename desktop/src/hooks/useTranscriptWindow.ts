@@ -137,7 +137,14 @@ export function useTranscriptWindow({
 
   useEffect(
     () => () => {
-      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+        // **必须置空**：`cancelAnimationFrame` 不会清掉帧号。应用根部是
+        // `<React.StrictMode>`，开发期每个 effect 都会 挂载→卸载→再挂载；
+        // 若这里留着作废帧号，再挂载时 `recompute` 的 `!== null` 守卫会永久
+        // 提前返回，翻页/focus/nudge 全部失效。
+        frameRef.current = null;
+      }
     },
     [],
   );
@@ -160,9 +167,11 @@ export function useTranscriptWindow({
   }, [recompute]);
 
   return {
-    // 首帧同步给一个合法窗口，避免渲染出空列表再跳。
+    // 首帧同步给一个合法窗口，避免渲染出空列表再跳。用**调用方**的
+    // `initialSize`（已解出），否则传了自定义值时首帧会是 60 条、下一帧再跳成
+    // 目标值，产生一次可见闪烁。
     window: state ?? {
-      start: Math.max(itemCount - DEFAULT_LIMITS.initialSize, 0),
+      start: Math.max(itemCount - initialSize, 0),
       end: itemCount,
       following: true,
     },

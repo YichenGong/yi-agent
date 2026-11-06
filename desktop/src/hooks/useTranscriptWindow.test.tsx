@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, beforeEach } from "vitest";
-import { useCallback, useState } from "react";
+import { StrictMode, useCallback, useState } from "react";
 import { render, cleanup, act } from "@testing-library/react";
 import { useTranscriptWindow } from "./useTranscriptWindow";
 import { createHeightBook } from "../lib/heightBook";
@@ -181,5 +181,28 @@ describe("useTranscriptWindow", () => {
     render(<Harness itemCount={10} />);
     await tick();
     expect(last).toEqual({ start: 0, end: 10, following: true });
+  });
+  it("StrictMode 下挂载→卸载→再挂载后仍能翻页（cleanup 必须清掉 frameRef）", async () => {
+    // 应用根部是 `<React.StrictMode>`（`main.tsx:15`），开发期每个 effect 都会
+    // 跑一遍 挂载→卸载→再挂载。若 cleanup 只 `cancelAnimationFrame` 而不把
+    // `frameRef.current` 置回 null，再挂载时 `recompute` 会因「已排帧」永久提前
+    // 返回：翻页、focus、nudge 全部失效，而窗口停在冷启动那 60 条上。
+    // 不开 StrictMode 的用例结构性地看不见这个缺陷。
+    render(
+      <StrictMode>
+        <Harness itemCount={600} />
+      </StrictMode>,
+    );
+    await tick();
+    expect(last.end - last.start).toBe(60);
+
+    // 触顶：必须真的能追加一页。若 frameRef 被作废帧号粘住，这里恒为 60。
+    // `gapTopPx: 0` 即「挂载区顶边贴住视口顶」，与真实触顶一致。
+    measure = () => ({ first: 0, last: 10, gapTopPx: 0, gapBottomPx: -5000 });
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    expect(last.end - last.start).toBe(260);
   });
 });
