@@ -5673,6 +5673,52 @@ describe("App reasoning rendering", () => {
   });
 });
 
+describe("App keeps following a reply the CoT block displaced", () => {
+  it("passes the visible-text counter down so the transcript follows a non-tail stream", async () => {
+    // 这条用例守的是**接线**：`Session.textVersion` 必须真的传到 `ChatView`。
+    // 单纯在 `ChatView` 里加依赖不够——宿主忘了传，行为就退回旧样子（回答被
+    // CoT 块顶到非尾部后视口冻住），而组件级测试仍然全绿。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const notify = (n: unknown) =>
+      act(() => {
+        for (const cb of state.notifHandlers) cb(n);
+      });
+    const scroller = await waitFor(() => {
+      const el = document.querySelector<HTMLElement>("[data-thread-id].overflow-y-auto");
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    const metrics = { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 };
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => metrics.scrollHeight });
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => metrics.clientHeight });
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => metrics.scrollTop,
+      set: (v: number) => {
+        metrics.scrollTop = v;
+      },
+    });
+
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "userMessage", id: "user-1", text: "q1" } } });
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "agentMessage", id: "a1", text: "" } } });
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: "answer" } });
+    fireEvent.scroll(scroller);
+
+    // CoT resumes after the answer started: the block lands at the tail and the
+    // still-streaming reply is displaced to `length - 2`.
+    notify({ method: "thread/reasoningDelta", params: { thread_id: "t1", text: "thinking", kind: "Content" } });
+
+    // Only the text grows now. Item count, tail text and error are all unchanged.
+    metrics.scrollHeight = 1200;
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: " and more" } });
+
+    expect(metrics.scrollTop).toBe(1200);
+  });
+});
+
 describe("App 后台进程接线", () => {
   const runningProcess = {
     process_id: "proc_1",

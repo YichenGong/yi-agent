@@ -157,6 +157,29 @@ export class Session {
   structuralVersion = 0;
 
   /**
+   * Bumped whenever **visible text** grows in place: a streamed `item/delta`
+   * appended to an agent message, or reasoning text appended to the open CoT
+   * block. A structural change does NOT move it (that is `structuralVersion`'s
+   * job) and this counter deliberately does not rebuild the frozen prefix.
+   *
+   * Why it exists at all: `ChatView` has to know "something the user can see got
+   * longer" in order to follow the bottom. It used to derive that from *the tail
+   * item's text*, which silently stops working the moment the still-streaming
+   * reply is no longer the tail — the server inserts a CoT block or a tool card
+   * after it (`translate.rs`, the `ThinkingBlock` / `ToolCall` arms), and the
+   * derived signal freezes at `""`. The viewport then stopped following, so the
+   * answer kept growing *below* the visible area while the transcript itself was
+   * fine: leaving and re-entering the thread appeared to "fix" it because a
+   * remount scrolls to the bottom unconditionally.
+   *
+   * Keep it separate from `structuralVersion`: that one is the frozen prefix's
+   * reset key, and bumping it on every delta would rebuild the prefix of a long
+   * transcript on every chunk (see the perf design in
+   * `docs/project-management/desktop.md`).
+   */
+  textVersion = 0;
+
+  /**
    * The server's content generation for this thread, as last learned from
    * `syncPlan` / `ThreadSummary`. `null` means we have not learned one yet
    * (first sighting this session) — which must NOT be treated as "matches"
@@ -270,6 +293,7 @@ export class Session {
 
   reset(): void {
     this.items = [];
+    this.textVersion = 0;
     this.turnActive = false;
     this.lastStatus = null;
     this.lastError = null;
@@ -643,10 +667,14 @@ export class Session {
         if (index < 0) {
           this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
           visible = true;
+          this.textVersion += 1;
         } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;
           visible = true;
+          // Visible text grew in place: the host follows the bottom off this.
+          // Structural bumps below are unrelated (they rebuild the prefix).
+          this.textVersion += 1;
           // The append is in place, so the frozen prefix cannot see it through
           // `items`. `ChatView` lifts the *tail* item's text out as a prop on
           // every render, so only a non-tail target needs the prefix rebuilt:
@@ -679,6 +707,9 @@ export class Session {
           this.items.push(block);
         }
         visible = true;
+        // 推理块常在尾部就地长高（不 bump `structuralVersion`，前缀无需重建），
+        // 但它是用户看得见的文本增长，跟随贴底的宿主必须知道。
+        this.textVersion += 1;
         break;
       }
       case "thread/notice":

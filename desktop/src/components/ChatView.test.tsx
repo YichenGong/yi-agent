@@ -820,6 +820,32 @@ describe("ChatView auto-scroll", () => {
     expect(state.scrollTop).toBe(1100);
   });
 
+  it("keeps following a reply that is no longer the transcript tail", () => {
+    // 服务端会在正文之后插入 CoT 块 / 工具卡（`translate.rs` 的 ThinkingBlock
+    // 与 ToolCall 两条臂都会走 `item/started`）。此时仍在流式的回答被顶到
+    // `length - 2`，它不再是尾部项。旧实现的跟随信号只取「尾部是 agentMessage
+    // 时的文本」，于是依赖数组不变、effect 不跑，视口冻住，新增长的全落在可视区
+    // 下方——用户看到的就是「回复不出现，切走再切回才看得到」（重挂载会强制贴底）。
+    const list: Array<Item | ReasoningItem> = [
+      { type: "userMessage", id: "u1", text: "do the thing" },
+      { type: "agentMessage", id: "a1", text: "" },
+      { type: "reasoning", id: "local-r1", text: "thinking" },
+    ];
+    const { container, rerender } = render(<ChatView items={list} threadId="t1" textVersion={0} />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 });
+    fireEvent.scroll(scroller);
+
+    for (let i = 1; i <= 3; i += 1) {
+      (list[1] as { text: string }).text = "chunk ".repeat(i);
+      state.scrollHeight += 100; // content grew below the viewport
+      // Only the text counter moves: item count, tail text and structure are all
+      // unchanged, which is exactly the live non-tail streaming case.
+      rerender(<ChatView items={list} threadId="t1" textVersion={i} />);
+    }
+    expect(state.scrollTop).toBe(state.scrollHeight);
+  });
+
   it("jumps to a new error banner even when the user scrolled up", () => {
     // 错误横幅是一次性事件，用户必须看到；它不能被「上翻历史」吞掉。
     const { list, rerender, state } = setup({ scrollTop: 100 });
