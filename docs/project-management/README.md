@@ -27,12 +27,12 @@
 | yi-agent-subagent | 12 / 12 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 85 / 85 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 64 / 75 | [详情](./subagent-runtime.md) · [会话委派解耦 spec](../superpowers/specs/2026-11-05-session-subagent-capability-design.md) · [实施计划（未实施）](../superpowers/plans/2026-11-05-session-subagent-capability-impl.md) · [前台根生命周期 spec](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [plan](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md) |
-| yi-agent-lifecycle | 19 / 19 | [详情](./yi-agent-lifecycle.md) |
+| yi-agent-lifecycle | 22 / 22 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 19 / 22 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |
 | desktop | 121 / 136 | [详情](./desktop.md) · [managed 生产接入 spec](../superpowers/specs/2026-11-05-managed-runtime-production-integration-design.md) · [接入 plan](../superpowers/plans/2026-11-05-managed-runtime-production-integration-impl.md) · [运行中插话设计](../superpowers/specs/2026-11-03-desktop-mid-turn-input-design.md) · [搜索框清除按钮修复 spec](../superpowers/specs/2026-11-05-sidebar-search-clear-design.md) · [plan](../superpowers/plans/2026-11-05-sidebar-search-clear-impl.md) · [旁问修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md) · [修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md) |
 | permission | 9 / 9 | [详情](./permission.md) |
 | ci-cd | 41 / 43 | [详情](./ci-cd.md) |
-| tooling | 11 / 11 | [详情](./tooling.md) |
+| tooling | 12 / 12 | [详情](./tooling.md) |
 | magpie-agent | 5 / 5 | [详情](./magpie-agent.md) |
 | remote-ssh | 31 / 34 | [详情](./remote-ssh.md) |
 临时旁问（三端）：[原设计基线](../superpowers/specs/2026-11-03-side-conversation-design.md) · [原实施计划](../superpowers/plans/2026-11-03-side-conversation-impl.md)。已有实现及历史验证，真实联合验收未完成；当前 UI 接线与 TUI 输入/退出存在已确认缺陷。[2026-11-05 修复 spec](../superpowers/specs/2026-11-05-side-conversation-repair-design.md) 已书面复核，已有[修复 plan](../superpowers/plans/2026-11-05-side-conversation-repair-impl.md)，代码未修，分别登记在 desktop 与 yi-agent-tui 模块。
