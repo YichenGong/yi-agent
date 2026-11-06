@@ -1205,8 +1205,9 @@ describe("useTranscriptWindow", () => {
     measure = () => ({
       first: last.start,
       last: last.start + 10,
-      gapTopPx: last.start === initialStart ? 0 : 5000,
-      gapBottomPx: 5000,
+      // 有符号：翻页后挂载区顶边在被翻到视口上方 -> 负值；底边远在视口下方 -> 负值。
+      gapTopPx: last.start === initialStart ? 0 : -5000,
+      gapBottomPx: -5000,
     });
     await tick();
     expect(last.end - last.start).toBe(260);
@@ -2523,7 +2524,8 @@ async function renderWindowed(items, label) {
       current: win,
       itemCount,
       limits: DEFAULT_LIMITS,
-      visible: { first: win.start, last: win.start + 10, gapTopPx: 0, gapBottomPx: 5000 },
+      // 贴住顶边（0），底部远在视口下方（负）。
+      visible: { first: win.start, last: win.start + 10, gapTopPx: 0, gapBottomPx: -5000 },
     });
     if (win.start === 0) break; // 已经到顶
     draw();
