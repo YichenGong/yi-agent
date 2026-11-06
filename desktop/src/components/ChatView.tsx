@@ -7,6 +7,7 @@ import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { useStickToBottom } from "../lib/useStickToBottom";
 import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
+import { itemText } from "../lib/itemText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
@@ -110,30 +111,6 @@ const ToolCallRow = memo(ToolCallCard);
  * 箭头，`ChatItem` 每次渲染都会换新引用，`ToolCallRow` 的 memo 就永远不命中。
  */
 const NO_CALL: ImageReadCall = () => Promise.reject(new Error("image/read unavailable"));
-
-/**
- * The text an item renders, lifted out as a primitive.
- *
- * For a prefix item this is the written-once value and it never moves again.
- * For the tail it is re-read on every render from the very object `Session`
- * mutates in place — and it is what `ChatItem`'s comparator compares, and what
- * the agent-message branch renders. The comparator must never read
- * `item.text`; see `ChatItem` for why.
- */
-function itemText(item: Item | NoticeItem | ReasoningItem): string {
-  switch (item.type) {
-    case "agentMessage":
-    case "userMessage":
-    case "reasoning":
-    // `display:"omitted"` 的 thinking 明文是空串，呈现由 `redacted` 决定；text 仍
-    // 要照传，好让就地追加能被比较器看见。
-    case "thinking":
-      return item.text;
-    default:
-      // `toolCall` 无 text；`notice` 的正文由上面的 notice 分支单独渲染。
-      return "";
-  }
-}
 
 /**
  * One transcript item.
