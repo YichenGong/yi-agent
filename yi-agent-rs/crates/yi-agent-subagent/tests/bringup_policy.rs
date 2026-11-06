@@ -227,3 +227,39 @@ fn foreground_root_lifecycle_an_explicit_selector_wins_both_ways() {
         BringUpPolicy::default_for_build()
     );
 }
+
+/// A frontend that declared itself gets the managed policy with **no** environment
+/// variable, and the build default stays embedded beside it.
+///
+/// These two facts are the change, and they must hold together: the earlier attempt
+/// applied the managed policy to anyone holding a context, which swept a manual
+/// `daemon` into a guardian-owned runtime and broke the refusal the managed path is
+/// supposed to make. An explicit declaration keeps them separable.
+///
+/// Asserted as a pure mapping because `install_managed_context` is one-shot per
+/// process and the other tests in this binary must run without it.
+#[test]
+fn a_declared_frontend_selects_managed_while_the_build_default_stays_embedded() {
+    assert_eq!(
+        BringUpPolicy::for_managed_frontend(),
+        BringUpPolicy::Managed,
+        "a declared frontend must ask the guardian to own its runtime"
+    );
+    assert_eq!(
+        BringUpPolicy::default_for_build(),
+        BringUpPolicy::Embedded,
+        "an unconfigured build must not be handed a guardian-owned runtime"
+    );
+    // The resolver's precedence, stated as the function that carries it: an explicit
+    // selector wins in both directions, and only the declaration is consulted
+    // otherwise.
+    assert_eq!(
+        BringUpPolicy::from_value(Some("managed")),
+        BringUpPolicy::Managed
+    );
+    assert_eq!(
+        BringUpPolicy::from_value(Some("embedded")),
+        BringUpPolicy::Embedded
+    );
+    assert_eq!(BringUpPolicy::from_value(None), BringUpPolicy::Embedded);
+}

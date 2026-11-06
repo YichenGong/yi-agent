@@ -1167,6 +1167,19 @@ pub struct ManagedContext {
     pub expected: yi_agent_lifecycle::types::ArtifactIdentity,
     /// The instance home the scope is resolved against.
     pub instance_home: PathBuf,
+    /// Whether the *entry point* this process is running has declared itself a
+    /// managed frontend.
+    ///
+    /// This is not "a context exists": the binary installs a context for every
+    /// command so the artifact identity is available everywhere, and `daemon`
+    /// installs it too while deliberately owning its own runtime. The declaration
+    /// is the entry point's own statement -- the TUI, a headless `run`, and a
+    /// shell-launched sidecar say yes; a manual daemon and the one-shot helpers say
+    /// no. The design requires exactly this: supported frontends select
+    /// [`BringUpPolicy::for_managed_frontend`] explicitly, while
+    /// [`BringUpPolicy::default_for_build`] stays embedded so an unconfigured
+    /// caller cannot be swept into a guardian-owned runtime by accident.
+    pub managed_frontend: bool,
 }
 
 static MANAGED_CONTEXT: std::sync::OnceLock<ManagedContext> = std::sync::OnceLock::new();
@@ -1191,8 +1204,27 @@ pub fn managed_context() -> Option<&'static ManagedContext> {
 /// binding's repair) cannot disagree about which policy or which expectation to use.
 /// When no context was installed this still returns the policy, with `expected: None`
 /// — which is precisely what makes a managed bring-up refuse instead of guess.
+///
+/// Precedence, in order:
+///
+/// 1. `YI_AGENT_BRINGUP` when set, in both directions: an operator can pin either
+///    behaviour, which is what makes the other two rules debuggable.
+/// 2. The entry point's own declaration. A shipped frontend (the TUI, a headless
+///    `run`, a shell-launched sidecar) installs its context with
+///    `managed_frontend: true` and so gets [`BringUpPolicy::for_managed_frontend`].
+/// 3. [`BringUpPolicy::default_for_build`], which stays `Embedded`.
+///
+/// The order matters: a default that came first would make rule 2 unreachable, and a
+/// context-presence rule (rather than an explicit declaration) would sweep a manual
+/// `daemon` into a guardian-owned runtime it never asked for.
 pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
-    let policy = BringUpPolicy::from_env();
+    let declared = managed_context().is_some_and(|context| context.managed_frontend);
+    let policy = match std::env::var("YI_AGENT_BRINGUP").ok().as_deref() {
+        Some("managed") => BringUpPolicy::Managed,
+        Some("embedded") => BringUpPolicy::Embedded,
+        _ if declared => BringUpPolicy::for_managed_frontend(),
+        _ => BringUpPolicy::default_for_build(),
+    };
     match managed_context() {
         Some(context) => crate::binding::BringUpChoice {
             policy,

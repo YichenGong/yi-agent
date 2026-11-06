@@ -55,7 +55,7 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 /// Best effort, like everything else about *optional* delegation: without a home
 /// directory there is no instance to scope to, and refusing to start the CLI over
 /// that would be worse than an embedded runtime.
-fn install_managed_context() {
+fn install_managed_context(managed_frontend: bool) {
     let Some(instance_home) = yi_agent_store::paths::instance_home() else {
         return;
     };
@@ -69,7 +69,60 @@ fn install_managed_context() {
     yi_agent_subagent::attach::install_managed_context(yi_agent_subagent::attach::ManagedContext {
         expected: build_info::artifact_identity(executable),
         instance_home,
+        // The declaration is the entry point's own: `main` derives it from the
+        // command it is about to run, before anything can consult the policy.
+        managed_frontend,
     });
+}
+
+/// Whether the command the user invoked is a *supported managed frontend*.
+///
+/// The design's rule is explicit: the desktop sidecar, the TUI and a headless `run`
+/// select the managed policy; a manual `daemon`, the one-shot helpers and the
+/// internal runtime subcommands keep owning (or joining) their runtime the way they
+/// always did. That list lives here, in the binary, because it is a statement about
+/// which entry points ship as managed -- not about what any process holding a lease
+/// must do, which is the inference that was reverted for good reason.
+///
+/// `app-server` is included deliberately: the shell starts it with
+/// `--listen stdio://` and speaks the private channel, and that channel *is* the
+/// managed preparation path. A manually started `app-server --listen ws://` also
+/// lands here, and that is correct: it still refuses to start anything until a
+/// bootstrap-authenticated `_shell/prepare` asks it to, which is stricter than the
+/// embedded path, not looser.
+fn is_managed_frontend_entry(command: Option<&Command>) -> bool {
+    match command {
+        // The TUI: no subcommand at all.
+        None => true,
+        Some(Command::Run { .. }) => true,
+        Some(Command::AppServer { listen, .. }) => {
+            // Only the local stdio transport is a frontend of a local runtime. A
+            // relay-only server forwards to a phone and owns no runtime of its own,
+            // and a ws server is reached from the network -- neither should acquire
+            // guardian-owned local work on the strength of a command name.
+            parse_listen(listen)
+                .map(|listen| matches!(listen, Listen::Stdio))
+                .unwrap_or(false)
+        }
+        Some(
+            Command::Daemon { .. }
+            | Command::Web { .. }
+            | Command::Resume { .. }
+            | Command::Agents { .. }
+            | Command::Agent { .. }
+            | Command::Schedule { .. }
+            | Command::Resident { .. }
+            | Command::Pair { .. }
+            | Command::Completions { .. }
+            | Command::Flags { .. }
+            | Command::InternalRuntime { .. }
+            | Command::Plugins { .. },
+        ) => false,
+        // Any subcommand added later is not a managed frontend until somebody says
+        // it is. Over-including is the failure that hands a manual command a
+        // guardian-owned runtime.
+        Some(_) => false,
+    }
 }
 
 fn main() -> Result<()> {
@@ -83,7 +136,11 @@ fn main() -> Result<()> {
     // and where this instance keeps its state. Install both once, before any
     // command runs, so the app-server's project attach can consult the bring-up
     // policy without every transport signature growing two parameters.
-    install_managed_context();
+    //
+    // Whether this command is a *supported managed frontend* is a property of the
+    // entry point, so it is decided here from the parsed command rather than inferred
+    // from a process global later.
+    install_managed_context(is_managed_frontend_entry(cli.command.as_ref()));
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their
@@ -4405,6 +4462,46 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The managed-frontend list is a product decision, so it is pinned here.
+    ///
+    /// Two failures are worth preventing, and they are opposite:
+    ///
+    /// * a shipped frontend (TUI, headless `run`, the shell's stdio sidecar) that
+    ///   forgot to declare itself would fall back to an embedded runtime, which has
+    ///   no guardian to authorize a root -- the original bug this contract fixes;
+    /// * a manual command (`daemon`, the helpers, a relay-only server) that acquired
+    ///   the managed policy would be handed a guardian-owned runtime it never asked
+    ///   for, and `yi-agent daemon status` would stop describing what it started.
+    #[test]
+    fn only_the_supported_frontends_declare_managed() {
+        for (arguments, expected) in [
+            // The TUI: no subcommand.
+            (vec!["yi-agent"], true),
+            (vec!["yi-agent", "run", "hi"], true),
+            (vec!["yi-agent", "app-server", "--listen", "stdio://"], true),
+            // Manual and internal entry points keep their own semantics.
+            (vec!["yi-agent", "daemon", "status"], false),
+            (vec!["yi-agent", "resident", "watch"], false),
+            (vec!["yi-agent", "web"], false),
+            (vec!["yi-agent", "agents"], false),
+            (vec!["yi-agent", "completions", "zsh"], false),
+            (vec!["yi-agent", "internal-runtime", "identity"], false),
+            // A relay-only or ws server owns no local runtime: it forwards.
+            (
+                vec!["yi-agent", "app-server", "--listen", "ws://127.0.0.1:1"],
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&arguments)
+                .unwrap_or_else(|error| panic!("{arguments:?} must parse: {error}"));
+            assert_eq!(
+                is_managed_frontend_entry(cli.command.as_ref()),
+                expected,
+                "{arguments:?} took the wrong side of the managed-frontend line"
+            );
+        }
+    }
 
     /// 启动时发布的旁支来源必须携带 resume 进来的真实历史。
     ///

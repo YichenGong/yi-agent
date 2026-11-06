@@ -732,7 +732,11 @@ fn an_embedded_run_never_reports_a_managed_stage() -> anyhow::Result<()> {
     let _gateway = spawn_mock_gateway(listener);
     let runtime_dir = project.runtime_dir();
 
-    // Deliberately *no* `YI_AGENT_BRINGUP`: this is the default, embedded launch.
+    // `run` is a *managed frontend now*, so the embedded policy has to be asked for
+    // explicitly. That is the design's split: the shipped entry points select managed,
+    // and the embedded path stays reachable and unchanged for a caller that says so.
+    // This test exists to prove the second half; without the declaration it would be
+    // asserting that a managed run is embedded, which is the opposite of the contract.
     let output = Command::new(common::yi_agent_bin())
         .arg("--workdir")
         .arg(&project.workdir)
@@ -744,6 +748,7 @@ fn an_embedded_run_never_reports_a_managed_stage() -> anyhow::Result<()> {
         .env("YI_AGENT_RUNTIME_DIR", &runtime_dir)
         .env("YI_AGENT_HOME", &project.instance_home)
         .env("HOME", &project.home)
+        .env("YI_AGENT_BRINGUP", "embedded")
         .env("YI_AGENT_STARTUP_TRACE", project.trace())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
