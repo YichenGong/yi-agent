@@ -42,7 +42,7 @@ backend，也不使用测试自己 `FrontendLease::register` 冒充生产客户�
 | A03 | `a_prepare_over_the_private_channel_brings_up_one_managed_runtime` | 首次 prepare 在无 guardian 时可完成并给出 identity（不虚报 owned/ready：`Connected` 只表示身份匹配） | PASS（prepare 语义半边；壳侧持有租约/ready 由 A04 进程证据覆盖） |
 | A04 | `quitting_one_frontend_leaves_the_others_work_running` | TUI 与 headless run 同时持有租约；TUI 退出后，其阻塞 marker 进程消失，run 的 marker 进程启动身份不变 | PASS |
 | A06 | `quitting_one_frontend_leaves_the_others_work_running` | 同上：退出一个前端只回收它自己的工作。前提条件改为等 guardian journal 出现两个不同的 live frontend owner，不再靠固定 sleep | PASS |
-| A07 | `the_last_frontend_leaving_stops_the_runtime_for_real` | 唯一前端退出后同时满足：进程树消失（启动身份比对）、`runtime.lock` 可获取、control socket 不再应答 | PASS |
+| A07 | `the_last_frontend_leaving_stops_the_runtime_for_real` | 唯一前端退出后同时满足：进程树消失（启动身份比对）、`runtime.lock` 可获取、control socket 不再应答。合并 `main` 后此用例一度稳定红（`run` 多注册了一条 `run-foreground` business 租约，见 2.3.1），修复后 PASS | PASS |
 | A07/A12 | `a_retired_instance_does_not_resurrect_a_daemon_across_watch_ticks` | 已退役实例 + 仅配置型 resident 登记，连续 3 个 watch tick 均 `once_unattended == None`、ensure 调用 0 次、无 `runtime.sqlite` | PASS |
 | A16 | `the_headless_entry_point_is_a_managed_frontend` | 真实 `run` 在无环境变量下逐行走完 `prepare → register_business → heartbeat → authorize_root → attach_root → bind_driver → open_managed_channel → admit_turn`，并产出 `run:` 的 reclaim 记录（`stopped=true`） | PASS |
 | A16 | `the_tui_entry_point_is_a_managed_frontend` | 真实默认 TUI（pty）同样走完八段，Ctrl+Q 后产出 `tui:` 的 reclaim 记录（`stopped=true`） | PASS |
@@ -178,6 +178,56 @@ cd yi-agent-rs && cargo test -p yi-agent-supervisors --test runtime_migration
 >   进程边界，全组跑仍有测试超时，别再往这里加锁"。
 >
 > 这是既有的负载敏感问题，登记在案，不在本任务范围内修改。
+
+### 2.3.1 合并 main 后暴露的真实回归：`run` 注册了第二个 business 租约
+
+把 `main` 合进本分支后，`the_last_frontend_leaving_stops_the_runtime_for_real`
+从 PASS 变成稳定失败（连跑 5 次 5 次红），失败信息是
+`tree_gone=true, lock_free=false, service_quiet=false`：夹具记录的进程都走了，
+`runtime.lock` 仍被持有、socket 仍在应答。
+
+定位过程中排除了两个错误方向，记下来免得重复走：
+
+- **不是夹具判定错误**。`tree_gone` 只比对夹具自己启动的进程（`owned` 列表），
+  而 daemon 由 guardian 启动、不在其中；`lock_free` 直接问内核要 `flock`，
+  两者都不是"看文件是否存在"这种弱检查。
+- **不是负载下的偶发**。单独串行连跑 5 次全红，耗时 19.79s–28.67s，
+  没有一次通过。
+
+真正的原因在 guardian 的每 tick 探针里一次看清（把
+`drained() = global_drain_started() && business_active_count()==0 && !has_running_operations()`
+三段写进文件后读回来）：
+
+```
+drain=false business=1 ops=false leases=[("run-foreground:5676:...", Business, true)]
+```
+
+`run` 的退出路径**确实**发了 release，`run:` 的 reclaim 记录也写了
+`stopped=true`，但表里始终留着第二条 business 租约 `run-foreground`。
+它来自 `run_headless` 里开 delegation 宿主的那一行：
+
+```rust
+ForegroundHost::connect(&runtime_dir, ClientKind::Tui, "...run-foreground")
+```
+
+`connect` 是**注册新租约**的构造函数（`LeaseMode::Business`），而
+`FrontendLease::drop` 只停心跳、**不** release（那是刻意的：panic 不该看起来
+像退出）。于是这条租约在 `run` 退出后还要活满一个 30s 过期窗口，
+`business_active_count()` 一直为 1，`drained()` 永远不成立，guardian 不退出，
+daemon 连同它的 `runtime.lock` 和 control socket 就留了下来——正是
+"最后一个前端离开没能停掉 runtime"这个断言的否定面。
+
+`ForegroundHost` 自己的文档早就写明这条约束："a frontend that already
+registered (the TUI, a managed CLI) must hand this host *that* lease.
+Registering a second one here would make one process look like two clients,
+and the guardian would then reclaim this host's work only when the other copy
+also left." TUI 分支（`main.rs` 的 `tui-foreground`）遵守了它，走
+`from_lease(lease.shared())`；`run` 分支漏了。
+
+修复（`5f6d26fe`）：`run` 优先用本次调用的启动租约
+（`ForegroundHost::from_lease(lease.shared())`），只在拿不到租约的嵌入式场景
+才回退到 `connect`（那里没有 guardian，`connect` 返回 `None`，不会注册）。
+修复后同一用例 3.10s 通过，`managed_production_integration` 16/16 绿。
 
 ### 2.4 Task 11：隔离打包 App 的原生证据（A15）
 
