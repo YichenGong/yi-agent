@@ -1605,9 +1605,14 @@ describe("planCompensation", () => {
     const plan = planCompensation({
       ...base,
       wasFollowing: true,
-      scrollTop: 9_200,
+      scrollTop: 9_000,
       nextScrollHeight: 11_000,
     });
+    // `scrollTop: 9_000` 是刻意的：旧底部是 9_200，用户被标记为跟随但还差
+    // 200px（内容刚长高、滚动事件未落地时的真实瞬态）。此时「直接贴底」与
+    // 「按差值补」结果不同（10_200 vs 10_000）。若用正好 9_200，两式代数恒等，
+    // 这条断言就退化成空断言——注入「按差值补」照样通过（已实测）。
+    expect(plan.scrollTop).toBe(11_000 - 800);
     expect(plan.follow).toBe("to-bottom");
   });
 
