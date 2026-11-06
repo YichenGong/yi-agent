@@ -1190,7 +1190,7 @@ git commit -m "feat(desktop): index search over session items instead of the DOM
 - Consumes: `nextWindow` / `DEFAULT_LIMITS` / `WindowState` / `FocusRequest` / `VisibleRange`（`../lib/transcriptWindow`）、`HeightBook`（`../lib/heightBook`）
 - Produces:
   - `interface UseTranscriptWindowArgs { itemCount: number; measure: () => VisibleRange | null; focus: FocusRequest | null; limits?: Partial<WindowLimits>; book: HeightBook }`
-  - `function useTranscriptWindow(args: UseTranscriptWindowArgs): { window: WindowState; requestFocus: (f: FocusRequest) => void; clearFocus: () => void }`
+  - `function useTranscriptWindow(args: UseTranscriptWindowArgs): { window: WindowState; requestFocus: (f: FocusRequest) => void; clearFocus: () => void; nudge: () => void }`
 
 **关键设计**：`measure` 由调用方注入。真实 `ChatView` 传一个读 DOM 的函数，测试传一个受控假函数——这样 hook 的翻页/跟随/收缩全部可在 jsdom 下确定性验证。
 
@@ -1201,7 +1201,7 @@ Create `desktop/src/hooks/useTranscriptWindow.test.tsx`:
 ```tsx
 /** @vitest-environment jsdom */
 import { describe, it, expect, beforeEach } from "vitest";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { render, cleanup, act } from "@testing-library/react";
 import { useTranscriptWindow } from "./useTranscriptWindow";
 import { createHeightBook } from "../lib/heightBook";
@@ -1209,6 +1209,7 @@ import type { FocusRequest, VisibleRange, WindowState } from "../lib/transcriptW
 
 let last: WindowState = { start: 0, end: 0, following: true };
 let requestFocus: (f: FocusRequest) => void = () => {};
+let nudge: () => void = () => {};
 let measure: () => VisibleRange | null = () => null;
 let currentFocus: FocusRequest | null = null;
 
@@ -1216,14 +1217,19 @@ function Harness({ itemCount }: { itemCount: number }) {
   // `book` 必须稳定：内联新建会让它每次渲染都是新对象，`merged`/`recompute`
   // 的身份随之改变，依赖它的 effect 就会每次渲染都重跑。
   const [book] = useState(() => createHeightBook(40));
+  // `measure` 必须是**稳定引用**，与 `ChatView` 里 `useCallback(measureVisible, [])`
+  // 一致。若这里每次渲染都新建箭头函数，`recompute` 的身份就会变，依赖它的 effect
+  // 每帧重跑——那样即使 hook 根本不支持滚动触发，测试也会「碰巧」通过。
+  const measureStable = useCallback(() => measure(), []);
   const state = useTranscriptWindow({
     itemCount,
-    measure: () => measure(),
+    measure: measureStable,
     focus: currentFocus,
     book,
   });
   last = state.window;
   requestFocus = state.requestFocus;
+  nudge = state.nudge;
   return <div />;
 }
 
@@ -1267,17 +1273,62 @@ describe("useTranscriptWindow", () => {
     // 贴顶只在**还没翻页**时成立：翻出一页后，新挂载的 200 条落到了视口上方，
     // topGap 自然变大。桩必须模拟这件事，否则每帧都会被判定为「仍在顶端」
     // 而无限翻页——真实 DOM 里不会这样。
+    //
+    // `first`/`last` 是**挂载区相对序号**（组件层数不出前面还有多少条），
+    // 由 hook 加上 `window.start` 变成绝对 index。
     measure = () => ({
-      first: last.start,
-      last: last.start + 10,
+      first: 0,
+      last: 10,
       // 有符号：翻页后挂载区顶边在被翻到视口上方 -> 负值；底边远在视口下方 -> 负值。
       gapTopPx: last.start === initialStart ? 0 : -5000,
       gapBottomPx: -5000,
+    });
+    // 真实场景里「贴顶」是用户滚出来的：滚动事件驱动 `nudge`。
+    await act(async () => {
+      nudge();
     });
     await tick();
     expect(last.end - last.start).toBe(260);
     expect(last.start).toBe(initialStart - 200);
     expect(last.following).toBe(false);
+  });
+
+  it("滚动本身不会重算：必须显式 nudge，否则永远不翻页", async () => {
+    render(<Harness itemCount={3000} />);
+    await tick();
+    const initialStart = last.start;
+    measure = () => ({
+      first: 0,
+      last: 10,
+      gapTopPx: last.start === initialStart ? 0 : -5000,
+      gapBottomPx: -5000,
+    });
+    // 只有 `measure` 变了，没有任何 React 依赖变化：不调用 nudge 就不该翻页。
+    await tick();
+    expect(last.start).toBe(initialStart);
+
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    expect(last.start).toBe(initialStart - 200);
+  });
+
+  it("nudge 每帧最多触发一次重算", async () => {
+    render(<Harness itemCount={3000} />);
+    await tick();
+    let calls = 0;
+    measure = () => {
+      calls += 1;
+      return null;
+    };
+    await act(async () => {
+      nudge();
+      nudge();
+      nudge();
+    });
+    await tick();
+    expect(calls).toBe(1);
   });
 
   it("itemCount 增长时跟随尾部", async () => {
@@ -1343,6 +1394,15 @@ export interface TranscriptWindowApi {
   window: WindowState;
   requestFocus: (f: FocusRequest) => void;
   clearFocus: () => void;
+  /**
+   * 告诉 hook「视口可能变了，请重新测量」。
+   *
+   * **必须由调用方在滚动时调用。** 翻页的触发条件（`gapTopPx` / `gapBottomPx`）
+   * 只存在于 `measure()` 的返回值里，而滚动既不改变 `itemCount` 也不改变 `focus`，
+   * 没有任何 React 依赖会因此变化。少了这个入口，向上翻页永远不会发生——
+   * 窗口会停在冷启动那 60 条上。
+   */
+  nudge: () => void;
 }
 
 /**
@@ -1457,12 +1517,16 @@ export function useTranscriptWindow({
     appliedRef.current = null;
     pendingRef.current = null;
   }, []);
+  const nudge = useCallback(() => {
+    recompute();
+  }, [recompute]);
 
   return {
     // 首帧同步给一个合法窗口，避免渲染出空列表再跳。
     window: state ?? { start: Math.max(itemCount - DEFAULT_LIMITS.initialSize, 0), end: itemCount, following: true },
     requestFocus,
     clearFocus,
+    nudge,
   };
 }
 ```
