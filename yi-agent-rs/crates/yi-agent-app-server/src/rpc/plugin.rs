@@ -329,11 +329,25 @@ pub(crate) async fn handle_shared(
             // so every arm assigns `startup`; there is no "unknown" to fall back to.
             let startup;
             let mut queryable = false;
-            if state.managed_session {
+            // Two separate questions, and either "no" is enough to stop:
+            //
+            // * `managed_session` — did a shell authorize *this connection*, i.e. is
+            //   there anyone who will actually run what we install?
+            // * the retirement marker — does this instance still allow an
+            //   unsupervised daemon at all?
+            //
+            // The watchman install, `ui/settings/write` and `once_unattended` all consult
+            // the marker. Leaving it out here lets one plain client reconnect after a
+            // migration and put back exactly the daemon those three paths just stopped.
+            let retired =
+                yi_agent_supervisors::lifecycle::retirement::is_retired(&state.plugin_home);
+            if state.managed_session || retired {
                 startup = "awaiting-demand";
                 tracing::info!(
                     project = %project.display(),
                     plugin = %plugin,
+                    managed_session = state.managed_session,
+                    retired,
                     "installed under managed lifecycle; the plugin starts when a client demands it"
                 );
             } else {

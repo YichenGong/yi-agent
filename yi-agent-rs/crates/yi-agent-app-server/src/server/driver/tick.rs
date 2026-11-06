@@ -81,6 +81,21 @@ pub(crate) async fn driver_tick<F>(
         crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent>,
 {
+    // 驱动起的是**会话**，不是 daemon，但问的是同一个自愈问题：一个已经把
+    // 自己交给 managed runtime 的实例，不该继续按旧的常驻登记听旧插件的指挥。
+    // `ensure_daemons` 那条启动路径已经查 `may_start_unattended`；缺了这一句，
+    // 驱动就成了**唯一**还会在已退役/迁移中的实例上起工作的通道——而且每 3 秒
+    // 一次，起出来的是带工具、带 shell 的真会话。
+    if !yi_agent_supervisors::watch::may_start_unattended(instance_home) {
+        return;
+    }
+    // 迁移可能正要停掉这个实例的进程。此时再向插件要"下一步"并起会话，等于在
+    // 关机的机器上开新工地。`ensure` 那条路径用同一把闸排空在途 tick，这里保持
+    // 同一个答案：闸被持有就这一拍什么都不做，下一拍重新读标记。
+    if yi_agent_supervisors::lifecycle::migration_operation::RetirementGate::is_held(instance_home)
+    {
+        return;
+    }
     // 驱动闸门只装配一次，本拍所有 (项目, 插件) 共用。取不到实例根时
     // **不放行任何驱动动作**：一个猜不出的实例根意味着读不到真实授权表，
     // 而"读不到就放行"正是这套闸门要防的事。

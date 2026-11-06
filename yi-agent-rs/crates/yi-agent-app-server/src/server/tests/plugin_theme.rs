@@ -664,6 +664,61 @@ async fn re_enabling_the_watchman_on_a_retired_instance_installs_nothing() {
     h.shutdown().await;
 }
 
+/// 实例已经交给 managed 之后，一次**非壳**连接装插件也不得拉起 daemon。
+///
+/// 判据刻意分开两件事：`managed_session` 回答「这次连接有没有人能负责把插件
+/// 真正跑起来」，退役标记回答「这个实例还允不允许旧的无人监督自愈」。已经完成
+/// 迁移的实例对第二个问题的答案永远是「不」——否则一次旧客户端安装就能在
+/// managed 接管之后重新放一个没人监督的 daemon 进同一个 scope，而
+/// `ensure_watchman_installed` / `ui/settings/write` / `once_unattended` 三条
+/// 路径都已经按这个标记停手了，只剩安装这一条还在起进程。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_instance_does_not_start_a_daemon_on_a_plain_install() {
+    let instance = tempfile::TempDir::new().unwrap();
+    let mut h = Harness::with_scope_and_instance_home(Scope::Admin, instance.path()).await;
+    // 普通本地连接（没有壳授权）：`managed_session` 为 false，旧路径会拉起 daemon。
+    initialize(&mut h).await;
+    yi_agent_supervisors::lifecycle::retirement::retire(
+        instance.path(),
+        "managed runtime took over",
+    )
+    .unwrap();
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "args": [],
+        "switch_key": "demo_plugin_on",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "installing still installs on a retired instance: {response}"
+    );
+    assert_eq!(
+        response["result"]["installed"], true,
+        "the manifest must stay durable: {response}"
+    );
+    // 与受管会话同一句实话：没人负责把这个插件跑起来，就不许说它起来了。
+    assert_eq!(
+        response["result"]["startup"], "awaiting-demand",
+        "a retired instance must not start an unsupervised daemon: {response}"
+    );
+    assert!(
+        h.daemon_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "no daemon may be started on an instance the managed runtime took over"
+    );
+
+    h.shutdown().await;
+}
+
 /// 受管会话下，装完只到"落盘"，进程要等真实 demand。
 ///
 /// 三件事必须同时成立，缺任何一条都会让 managed 的插件门控形同虚设：
