@@ -412,3 +412,104 @@ test("repeated connect reflects model add/remove and selection change", () => {
   assert.equal(loadModels(path).subagent_model, "magpie/b");
   cleanupModels(path);
 });
+
+// ---- version compatibility declaration ------------------------------------
+
+// The plugin cannot detect the installed Yi Agent at runtime (moejs has no
+// filesystem or process access), so compatibility is a *documented promise*
+// rather than a check. These tests keep that promise honest in three ways: the
+// declared floor covers every field the mapping writes, the declared
+// full-support version covers the optional ones, and the README matrix names
+// exactly the same fields.
+
+const PKG = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
+);
+
+// `models.json` plus the three top-level keys exist since 0.1.4.
+const BASELINE_FIELDS = ["name", "provider", "api_url", "api_key", "model"];
+// Optional fields, and the first Yi Agent release that reads each one.
+const OPTIONAL_FIELDS = {
+  context_length: "0.1.7",
+  api_style: "0.1.5",
+  reasoning_capabilities: "0.1.8",
+};
+
+function cmp(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i += 1) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+  }
+  return 0;
+}
+
+function manifestFields() {
+  const input = {
+    gateway: { v1: "https://gw.test/v1", key: "sk-test" },
+    models: [
+      {
+        id: "anthropic/claude-sonnet-4-5",
+        context: 200000,
+        native_endpoints: ["/chat/completions"],
+        efforts: ["low", "high"],
+      },
+    ],
+    agent: {},
+  };
+  return Object.keys(connect(input).models[0]);
+}
+
+test("declared minVersion covers every field the mapping writes", () => {
+  const declared = PKG.yiAgent;
+  assert.ok(declared, "package.json must declare a yiAgent compatibility block");
+  assert.equal(declared.minVersion, "0.1.4");
+
+  // Every field the plugin emits is either baseline or listed as optional.
+  const known = new Set([...BASELINE_FIELDS, ...Object.keys(OPTIONAL_FIELDS)]);
+  for (const field of manifestFields()) {
+    assert.ok(known.has(field), `undeclared field ${field}: update OPTIONAL_FIELDS and the README`);
+  }
+  // The optional fields are really emitted, so the table is not aspirational.
+  for (const field of Object.keys(OPTIONAL_FIELDS)) {
+    assert.ok(manifestFields().includes(field), `mapping no longer writes ${field}`);
+  }
+});
+
+test("declared fullFieldsSince is the newest optional-field release", () => {
+  const declared = PKG.yiAgent;
+  const newest = Object.values(OPTIONAL_FIELDS).reduce((a, b) => (cmp(a, b) >= 0 ? a : b));
+  // If a new optional field needs a newer Yi Agent than the declared
+  // full-support version, the declaration is wrong (minVersion may stay).
+  assert.equal(declared.fullFieldsSince, newest);
+  assert.ok(cmp(declared.minVersion, declared.fullFieldsSince) <= 0);
+  // verifiedWith must be a real, already-shipped release the floor trusts.
+  assert.ok(cmp(declared.verifiedWith, declared.fullFieldsSince) >= 0);
+});
+
+test("README documents the same compatibility floor as package.json", () => {
+  const readme = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "README.md"),
+    "utf8",
+  );
+  const declared = PKG.yiAgent;
+  // The prose must quote the same numbers, so a version bump cannot leave the
+  // README telling users a different story than the metadata.
+  assert.ok(
+    readme.includes(`"minVersion": "${declared.minVersion}"`),
+    "README must quote the declared minVersion",
+  );
+  assert.ok(
+    readme.includes(`"fullFieldsSince": "${declared.fullFieldsSince}"`),
+    "README must quote the declared fullFieldsSince",
+  );
+  assert.ok(
+    readme.includes(`"verifiedWith": "${declared.verifiedWith}"`),
+    "README must quote the declared verifiedWith",
+  );
+  // Each optional field's owning release should be cited in the table.
+  for (const [field, since] of Object.entries(OPTIONAL_FIELDS)) {
+    assert.ok(readme.includes(field), `README compatibility table must list ${field}`);
+    assert.ok(readme.includes(`v${since}`), `README must cite v${since} for ${field}`);
+  }
+});

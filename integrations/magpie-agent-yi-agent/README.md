@@ -80,6 +80,69 @@ Two related facts about paths:
   and Yi Agent will not see them. (Model entries are unaffected: those live in
   `models.json`, see the next section.)
 
+## Version compatibility
+
+This package is versioned independently of Yi Agent, but not arbitrarily:
+what it writes has to mean something to the Yi Agent that reads it. The two are
+**coupled by declaration, decoupled by release** — the plugin states which Yi
+Agent it is built against, and each side ships on its own schedule.
+
+`package.json` carries the machine-readable claim:
+
+```json
+"yiAgent": { "minVersion": "0.1.4", "fullFieldsSince": "0.1.8", "verifiedWith": "0.1.13" }
+```
+
+Magpie and npm both ignore unknown top-level fields, so this is metadata only.
+Nothing enforces it at runtime: the plugin cannot detect the installed Yi Agent
+version (Magpie's agent runtime has no filesystem or process access), so the
+declaration is a promise kept by the release process, not a check.
+
+### What each field needs
+
+`models.json` and the three top-level keys (`models`, `default_model`,
+`subagent_model`) exist since **v0.1.4**. The per-entry fields arrived later:
+
+| Written field | Needs Yi Agent | Effect on an older Yi Agent |
+| --- | --- | --- |
+| `name`, `provider`, `api_url`, `api_key`, `model` | v0.1.4 | — |
+| `context_length` | v0.1.7 | Ignored; compaction threshold falls back to the built-in 200000 default |
+| `api_style` | v0.1.5 | Ignored; `auto` detection runs, costing one extra probe round-trip per model |
+| `reasoning_capabilities` | v0.1.8 | Ignored; effort tiers are treated as unknown and stripped at request time |
+
+Unknown fields are **silently ignored**, not rejected: `ModelEntry` has no
+`#[serde(deny_unknown_fields)]` in any released version. So one plugin build
+works against every Yi Agent from 0.1.4 on — it just degrades as the table
+says. `verifiedWith` is the release this build was actually exercised against.
+
+Two degradations are worth stating plainly rather than hiding in a table:
+
+- **Before 0.1.7, `context_length` is not read at all.** Yi Agent assumes
+  200000 tokens, so a Magpie model with a smaller real window will only be
+  compacted past 200k — requests can be rejected for exceeding the model's
+  context. If you use such models, run Yi Agent 0.1.7 or newer.
+- **Before 0.1.8, reasoning efforts are not declared.** Yi Agent lists all
+  tiers and relies on stripping-and-retrying, so an unsupported effort fails a
+  request before it succeeds. It still works; it is just noisier.
+
+### When to publish which version
+
+The plugin and Yi Agent are released on separate tracks. Which track a change
+belongs to follows from what actually changed:
+
+| Change | Yi Agent release? | Plugin release? |
+| --- | --- | --- |
+| Fix a mapping bug, a notice string, or docs | No | Patch (`0.2.x`) |
+| Add support for a Yi Agent field that already shipped | No | Patch (`0.2.x`), update `minVersion`/`fullFieldsSince` |
+| Adapt to a **new** Yi Agent field | Yes | Minor (`0.x.0`), same cycle, bump `verifiedWith` |
+| Yi Agent ships features the plugin does not map | Yes | **No** — nothing in the plugin changed |
+| Breaking change to a field this plugin writes | Yes | Major, and raise `minVersion` |
+
+The third and fourth rows are the ones people get wrong in both directions: a
+plugin minor only exists to follow a new field, and a Yi Agent release alone is
+never a reason to republish the plugin. Publishing a new plugin version
+therefore means "the mapping changed", never "the agent moved".
+
 ## Things to know
 
 - **Two icons, two sources.** Magpie's *Installed* list draws a plugin's logo
