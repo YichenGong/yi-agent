@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 设计依据：[spec](../specs/2026-11-07-desktop-subagent-trace-redesign-design.md)；审查依据：[review](../specs/2026-11-07-desktop-subagent-trace-redesign-review.md)。冲突时以 spec 为准，先修订计划再实现。
+- 设计依据：[spec](../specs/2026-11-07-desktop-subagent-trace-redesign-design.md)；spec 审查依据：[review](../specs/2026-11-07-desktop-subagent-trace-redesign-review.md)；本计划的独立复审与修订见 [plan review](../reviews/2026-11-07-desktop-subagent-trace-plan-review.md)。冲突时以 spec 为准，先修订计划再实现。
 - 只做 desktop，不新增手机入口，不修改 Git Diff/后台进程的内容布局。
 - 保留三个 Tab、栏宽持久化与拖拽（260–720px，默认 360px）。
 - 不增加 RPC 方法、字段或第三方依赖；不手改 generated bindings，不补 daemon 目标元数据。
@@ -51,6 +51,7 @@
 | `desktop/src/hooks/useSessionState.ts`、`.test.tsx` | 修改 | 移走 trace 状态和旧 read→watch，只保留会话/rail/面板编排 |
 | `desktop/src/hooks/useNotificationRouter.ts`、`.test.ts` | 修改/新建测试 | 带源 client/slot 委派 trace、终态与断开通知 |
 | `desktop/src/hooks/connectionLifecycle.ts`、`desktop/src/hooks/connectionLifecycle.test.ts` | 修改/新建测试 | 每次新 client 登记连接代际，不把重连当换绑 |
+| `desktop/src/hooks/useHandshakeRecovery.ts`、`.test.ts` | 修改/新建测试 | 本地 trace 握手就绪回调，与连接登记分离；失败不可发动作 |
 | `desktop/scripts/browser/subagent-trace.{html,tsx}`、`subagent-trace-check.mjs` | 新建 | 真实组件/CSS 的独立浏览器验收 |
 | `desktop/package.json`、`desktop/scripts/browser/README.md` | 修改 | 浏览器脚本入口与运行说明，不增加依赖 |
 | `yi-agent-rs/crates/yi-agent-app-server/src/server.rs` | 修改 | 显式 re-export 两个清理 helper |
@@ -87,7 +88,7 @@ export function mergeTraceSnapshot(
 ): AgentTraceRow[];
 export function mergeTraceEvent(
   taskId: string, rows: readonly AgentTraceRow[], event: AgentTraceRow,
-): AgentTraceRow[];
+): readonly AgentTraceRow[];
 export function summarizeTrace(text: string): SummaryPreview;
 export function cancelDeadline(startedAt: number, ttlSeconds: number): number | null;
 ```
@@ -189,6 +190,8 @@ cd desktop && npm ci && npx tsc --noEmit
 npx vitest run src/lib/subagents.test.ts src/components/SubagentRail.test.tsx src/components/SubagentTrace.test.tsx src/components/ThreadDetailPanel.test.tsx
 ```
 
+所有新增 React/DOM 测试文件首行写 `/** @vitest-environment jsdom */`；显式 import Vitest/Testing Library API，使用 `afterEach(cleanup)`。定时测试每例收尾清理 controller/订阅/动作并恢复 real timers；deferred RPC 必须 settle 或通过显式 dispose reject，不把未处理 rejection 当成功。引用的类型从 §0 指定模块导入，示例的 target/client/sub/actions 在各例 beforeEach 构建，不借用上一用例状态。
+
 预期：依赖安装/类型检查/现有定向测试成功；若环境或基线失败，先使用 systematic-debugging 找根因，不声称本次红测已建立。查源码调用点用 `grep -R -n` 限定 desktop/src，跳过 node_modules/dist；本机无 rg 时不扩大到系统目录搜索。
 
 ### Task 1: 统一状态呈现与真实元数据降级（A01）
@@ -207,6 +210,7 @@ it("classifies paused, terminal waits and unknown without counting them active",
   expect(subagentState("waiting_for_permission")).toMatchObject({ label: "等待授权", active: true });
   expect(subagentState("future_state")).toMatchObject({ label: "future_state", active: false, finished: false });
   expect(subagentState("").label).toBe("状态未知");
+  expect(subagentState("constructor")).toMatchObject({ label: "constructor", active: false, finished: false });
 });
 ```
 
@@ -216,7 +220,9 @@ it("classifies paused, terminal waits and unknown without counting them active",
 ```ts
 const UNKNOWN = { label: "状态未知", tone: "neutral", finished: false, active: false } as const;
 export function subagentState(state: string) {
-  return STATE_PRESENTATION[state] ?? { ...UNKNOWN, label: state || UNKNOWN.label };
+  return Object.prototype.hasOwnProperty.call(STATE_PRESENTATION, state)
+    ? STATE_PRESENTATION[state]
+    : { ...UNKNOWN, label: state || UNKNOWN.label };
 }
 export function isFinished(state: string): boolean {
   return subagentState(state).finished;
@@ -229,9 +235,9 @@ export function isFinished(state: string): boolean {
 
 ### Task 2: 严格解析事件、合并快照与摘要（A02/A03/A06/A10）
 
-**Files:** 新建 `desktop/src/lib/subagentTraceModel.ts`、`.test.ts`、`desktop/src/test/subagentTraceFixtures.ts`；迁移 `desktop/src/lib/subagents.ts`、`.test.ts` 的旧 trace helper；修改旧组件 import 保持本任务结束可编译。
+**Files:** 新建 `desktop/src/lib/subagentTraceModel.ts`、`.test.ts`、`desktop/src/test/subagentTraceFixtures.ts`；迁移 `desktop/src/lib/subagents.ts`、`.test.ts` 的旧 trace helper；修改 `desktop/src/components/SubagentTrace.tsx`、`.test.tsx` 的 import 和显示适配，保持本任务结束可编译且旧组件测试通过。
 
-**Interfaces:** 实现 §0 的 model 契约；fixture 导出 `traceRow(eventId, kind, payload, taskId = "task-a")`、`deferred<T>()`。旧 `toTraceLine` 删除并迁移所有调用点，不保留会吞载荷的兼容分支。
+**Interfaces:** 实现 §0 的 model 契约；fixture 导出 `traceRow(eventId, kind, payload, taskId = "task-a")`、`deferred<T>()`。旧 `toTraceLine` 删除并迁移所有调用点，不保留会吞载荷的兼容分支。旧组件同时改为接收新 block 的 primitive 字段 name/sourceKind/rawPayload：tool_call 仍显示 `${name}(${text})`，state_note 的显示前缀在组件添加，raw 显示原文，不让新模型的纯摘要 text 丢掉工具名。Task 2 同步修改 `SubagentTrace.tsx/.test.tsx`，保留其旧整体展开门和旧 props 到 Task 10；运行旧组件测试，不能只改 import 然后只查类型。
 
 - [ ] **Step 1: 写失败测试与 fixture。**
 
@@ -242,8 +248,10 @@ export function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-export function traceRow(eventId: number, kind: string, payload: unknown, taskId = "task-a") {
-  return { eventId, taskId, kind, payloadJson: JSON.stringify(payload) };
+export function traceRow(eventId: number, kind: string, payload: unknown, taskId = "task-a"): AgentTraceRow {
+  const payloadJson = JSON.stringify(payload);
+  if (payloadJson === undefined) throw new Error("fixture payload must be JSON serializable");
+  return { eventId, taskId, kind, payloadJson };
 }
 ```
 
@@ -285,7 +293,7 @@ export function cancelDeadline(startedAt: number, ttlSeconds: number): number | 
 ```
 
 - [ ] **Step 4: 确认 GREEN。** 测试 snapshot 自身重复/乱序、wrong task、空水位0、不同 ID 不连续正常；结果自身 name、不配对；两段有效文本合并/坏载荷隔断；空摘要/首行空、240/241、3/4行、CRLF；TTL 0/负数/NaN/Infinity/已延迟过期。
-- [ ] **Step 5: 更新模块证据、门禁与提交。** `git commit -m "refactor: model subagent trace events without data loss"`。提交前 `npx tsc --noEmit` 确认旧组件调用点迁移完整，然后执行全局提交门禁。
+- [ ] **Step 5: 更新模块证据、门禁与提交。** `git commit -m "refactor: model subagent trace events without data loss"`。提交前在 desktop 跑 `npx tsc --noEmit && npx vitest run src/lib/subagentTraceModel.test.ts src/lib/subagents.test.ts src/components/SubagentTrace.test.tsx src/components/ThreadDetailPanel.test.tsx` 确认旧组件适配没有丢名称/raw或破坏旧 props，然后执行全局提交门禁。
 
 ### Task 3: 修正服务端 watcher 清理边界（A08）
 
@@ -415,7 +423,7 @@ it("discards a preview that arrives after the task finishes", async () => {
 - [ ] **Step 2: 确认 RED。** `cd desktop && npx vitest run src/lib/subagentTraceActions.test.ts`。
 - [ ] **Step 3: 实现记录与操作。** setDraft 内容真变时 revision+1；请求前同步设置 operationId 防双击，捕获 client/target/lifetime/revision/text；finally 仅相同 operationId 清锁。成功清稿还需 revision 未变且未超时；失败 formatError 归原key。空白不发。消息无 thread/task/client/匹配绑定均 reject ConnectionError，不允许可选链假成功。
 
-preview 捕获 performance.now，响应后复查可见身份/预览代际/终态，使用 cancelDeadline 并设到期timer；实际请求参数 `{threadId,taskId}`，确认额外 `{confirmationToken}`，不添加 recursive 参数。taskIds 去重；0禁确认、多个只防御呈现。confirm 前再验期限、token、client与target；调用 `agent/cancel` 一次，成功 notice「取消请求已提交」，失败清token并必须重preview。pending confirm 的 dismiss 无效，不暗示可撤销。
+preview 捕获 performance.now，响应后复查可见身份/预览代际/终态，使用 cancelDeadline 并设到期timer；实际请求参数 `{threadId,taskId}`，确认额外 `{confirmationToken}`，不添加 recursive 参数。taskIds 去重；0禁确认、多个只防御呈现。确认 UI 只公开 token/taskIds/deadline；内部 confirmation 必须额外保存 preview 捕获的 client、connectionGeneration、target 和 previewEpoch。confirm 不从新 connection 借用旧 token，必须核对同一原 client/代际；current+ready 门禁由 Task 6 controller 在传参前保证，TraceActions 不复制连接注册表，再验期限、token、target；调用 `agent/cancel` 一次，成功 notice「取消请求已提交」，失败清token并必须重preview。pending confirm 的 dismiss 无效，不暗示可撤销。preview/confirm 操作都捕获发起时的 visible/previewEpoch；导航、Tab、关闭或请求代际使其失效后，即使用户又打开同一 task key，迟到 confirm 回包也只结算原 operationId 的 pending，不发布 notice/error、不清新 token、不重开确认。消息回执仍按原有效草稿记录结算，不与此取消 UI 代际规则混淆。
 
 ```ts
 const submission = { lifetime: record.lifetime, operationId: ++nextOperationId,
@@ -423,8 +431,8 @@ const submission = { lifetime: record.lifetime, operationId: ++nextOperationId,
 // 只在同 record 生命周期、同 operationId 且未超时、revision 未改时清稿。
 ```
 
-15秒timer只发布结果不确定并标 timedOut，不清真实pending；迟到preview token丢弃。setVisible离开使预览代际失效，保留草稿和在途operation。dropThread/dropSlot/clear先让生命周期失效再删除；迟到回包只读现存记录，禁止重新创建。普通 disconnect结算该client已销毁请求的锁但保草稿；换绑走drop，不把旧failure写新记录。
-- [ ] **Step 4: 确认 GREEN。** 加 A→B→A在途守卫、提交后改回同文案revision仍不清、删除后迟到/重配同ID、任务/slot同ID不串稿、超时后成功留稿、预览TTL请求起点与NaN/0/延迟过期、终态/Tab作废、确认在途不得放弃、取消失败强制重preview；双Enter/双击RPC恰1次。每例清timer并恢复real timers；TTL用 `vi.useFakeTimers({toFake:["setTimeout","clearTimeout","performance"]})` 同步控制performance.now与计时器，不能只推进Date。
+15秒timer只发布结果不确定并标 timedOut，不清真实pending；迟到preview token丢弃。setVisible离开使预览代际失效，保留草稿和在途operation。dropThread/dropSlot/clear先让生命周期失效再删除；迟到回包只读现存记录，禁止重新创建。disconnect 立即作废该 client 的 preview/token、使在途 previewEpoch 过期，保草稿；pending 守卫仍等底层 settle，不能因标断开就提前允许重复写。真实 RpcClient.dispose 会 reject pending，收到该 settle 后仅原 operationId 解锁；测试也必须显式模拟 dispose reject。换绑走drop，不把旧failure写新记录。
+- [ ] **Step 4: 确认 GREEN。** 加 A→B→A在途守卫、提交后改回同文案revision仍不清、删除后迟到/重配同ID、任务/slot同ID不串稿、超时后成功留稿、预览TTL请求起点与NaN/0/延迟过期、终态/Tab作废、确认在途不得放弃、取消失败强制重preview；补 A→B→A 后旧 confirm 成功/失败仅解原锁而不发布新视图提示；双Enter/双击RPC恰1次。每例清timer并恢复real timers；TTL用 `vi.useFakeTimers({toFake:["setTimeout","clearTimeout","performance"]})` 同步控制performance.now与计时器，不能只推进Date。
 - [ ] **Step 5: 文档、门禁、提交。** 记录定向命令，执行全局提交门禁，`git commit -m "fix: preserve subagent drafts and scope task actions"`。
 
 ### Task 6: 组合专用 React controller（A06–A10）
@@ -438,7 +446,8 @@ interface SubagentTraceController {
   subscribe(listener: () => void): () => void;
   getSnapshot(): SubagentTraceView;
   setConnection(connection: TraceConnection): void;
-  connectionFor(client: TraceClient, slot: string): TraceConnection | null;
+  setConnectionReady(connection: TraceConnection, ready: boolean): void;
+  connectionFor(client: TraceClient, slot?: string): TraceConnection | null;
   open(target: TraceTarget): void;
   retry(): void;
   close(): void;
@@ -465,6 +474,7 @@ it("retains draft while closing the panel but not its selection", () => {
   const { result } = renderHook(() => useSubagentTrace());
   act(() => {
     result.current.controller.setConnection(connection);
+    result.current.controller.setConnectionReady(connection, true);
     result.current.controller.open(target);
     result.current.controller.setDraft(target, "resume later");
     result.current.controller.close();
@@ -476,13 +486,13 @@ it("retains draft while closing the panel but not its selection", () => {
 ```
 
 - [ ] **Step 2: 确认 RED。** `cd desktop && npx vitest run src/hooks/useSubagentTrace.test.tsx`。
-- [ ] **Step 3: 实现组合，不复制算法。** controller 按slot保存当前connection，并按client对象登记源记录供connectionFor查询；未知client/slot返回null，不能回退当前连接。connectionGeneration由App持有的递增ref分配，普通重连不改变serverBindingGeneration。只给匹配target的当前连接发动作。hook用稳定实例、`useSyncExternalStore`和缓存view，变更由两子模块统一emit；无变化不能无限新建snapshot。订阅记录的requestGeneration变化使可见预览失效，但不清草稿。task更新透传原target，不能读取当前任务替代来源。
+- [ ] **Step 3: 实现组合，不复制算法。** controller 按slot保存当前connection，并按client对象登记源记录供connectionFor查询；未知client/slot返回null，不能回退当前连接。setConnection 只登记来源、默认 not-ready，替换该 slot 的旧 client 时同步使旧订阅 owner/预览失效、保留选择/历史/草稿。setConnectionReady 仅接纳仍为该 slot 当前对象及代际的 connection：false 使旧 owner/预览失效并禁止新 watch/动作；true 才开放手动 retry/新动作，不自动 watch。connectionFor 按 client 对象 identity 查询不可变来源；slot 可省略，提供时还须相等；绝不使用 activeSlotRef 推测来源。它只查询来源，返回来源不代表可发请求。open/retry/send/preview/confirm 的可用连接必须同时匹配 target、当前连接、ready=true，缺任一条件按原记录展示 ConnectionError。connectionGeneration由App持有的递增ref分配，普通重连不改变serverBindingGeneration。只给匹配target的当前连接发动作。hook用稳定实例、`useSyncExternalStore`和缓存view，变更由两子模块统一emit；无变化不能无限新建snapshot。订阅记录的requestGeneration变化使可见预览失效，但不清草稿。task更新透传原target，不能读取当前任务替代来源。
 
 ```tsx
 const view = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 ```
 
-effect清理dispose只取消局部listener/timer/selection并排旧client清理，不dispose主client；StrictMode setup-cleanup-setup必须可重新挂接或重建实例，不能复用永久destroyed实例。无选择或传入target与当前可见target不一致的send/preview/confirm reject ConnectionError；UI调用处catch而非沉默返回undefined。setDraft始终写显式传入的有效绑定target，不读取可变current选择；旧渲染的回调不得把A草稿写入B。
+固定 StrictMode 生命周期策略：hook 用稳定实例；effect setup 增加 mountEpoch，cleanup 当场 close 使 owner/选择失效并排旧 client 清理，再 queueMicrotask 检查捕获 epoch 是否仍最新，只有未发生 setup 才最终 dispose。StrictMode 的同步 setup-cleanup-setup 取消该次最终销毁，不复用永久 destroyed 实例；组件构造/render 不发 watch。真正卸载的最终 dispose 清两模块 timer/listener/动作记录，不 dispose 主 client。测试先 flush 微任务确认真正卸载完成，再解决旧 ack，不能留下永久计时器。无选择或传入target与当前可见target不一致的send/preview/confirm reject ConnectionError；UI调用处catch而非沉默返回undefined。setDraft始终写显式传入的有效绑定target，不读取可变current选择；旧渲染的回调不得把A草稿写入B。
 - [ ] **Step 4: 确认 GREEN。** hooks测试与Task4/5测试同时跑，确认组合不改变独立状态机语义；clear/drop保存在途记录的失效代际规则。
 - [ ] **Step 5: 文档、门禁、提交。** `git commit -m "refactor: isolate subagent trace controller lifecycle"`，先执行全局提交门禁。
 
@@ -490,7 +500,7 @@ effect清理dispose只取消局部listener/timer/selection并排旧client清理�
 
 **Files:** 修改 `SubagentRail.tsx`、`.test.tsx`、`index.css`、`themeTokens.test.ts`；新建 `TraceEvent.tsx`、`.test.tsx`（均在 desktop/src 对应目录）。
 
-**Interfaces:** Rail 保留现有 row/onOpen API，新增可选 `headingRef` 供返回焦点；`TraceEvent({block}: {block:TraceBlock})`。memo比较所有primitive字段，不能只比较对象引用，也不能比较key后忽略流式text。
+**Interfaces:** Rail 保留现有 row/onOpen API，新增可选 `headingRef:Ref<HTMLHeadingElement>`、`rowRef:(taskId:string,node:HTMLButtonElement|null)=>void` 供返回焦点；`TracePreserve = (change:()=>void)=>void` 导出于 `TraceEvent.tsx`；`TraceEvent({block,onPreserve}: {block:TraceBlock;onPreserve?:TracePreserve})`。没有 onPreserve 的独立测试直接执行 change；Timeline 必须传稳定的 preserve 函数，摘要/raw 展开调用 `onPreserve(() => setExpanded(...))`，在 DOM 变化前捕获锚点。memo比较 onPreserve 引用及所有primitive字段，不能只比较对象引用，也不能比较key后忽略流式text。
 
 - [ ] **Step 1: 写 RED。** 列表metadata null显示ID和中文状态、没有假步骤、active count只计五态；事件默认Markdown、结果标题含自身name、错误首行可见、raw通过原文按钮可达。
 
@@ -514,6 +524,8 @@ it("keeps a finalised result expanded when another block arrives", () => {
 ```css
 .subagent-trace { min-width: 0; overflow-x: hidden; }
 .subagent-trace .trace-prose { min-width: 0; overflow-wrap: anywhere; }
+.subagent-trace .trace-prose .prose { font-size: inherit; line-height: inherit; min-width: 0; }
+.subagent-trace .trace-prose img { max-width: 100%; height: auto; }
 .subagent-trace .trace-prose pre { max-width: 100%; overflow-x: auto; }
 .subagent-trace .trace-prose table { max-width: 100%; }
 ```
@@ -526,7 +538,36 @@ it("keeps a finalised result expanded when another block arrives", () => {
 
 **Files:** 新建 `desktop/src/components/TraceTimeline.tsx`、`.test.tsx`、`desktop/src/hooks/useTraceScroll.ts`、`.test.tsx`。
 
-**Interfaces:** `TraceTimelineProps = {identityKey:string; phase:TraceSubscriptionSnapshot["phase"]; blocks:readonly TraceBlock[]; taskInfo:{taskId:string;objective:string|null;lastStep:string|null}; after:ReactNode}`。用ref导出 `TraceTimelineHandle = {showTaskInfo():void}`。`after` 是子任务区/尾部状态，位于同一滚动区。`useTraceScroll(identityKey:string, ready:boolean)`返回 `{ref,contentRef,followIfAtBottom,scrollToBottom,isFollowing, preserve(change:()=>void):void, showTaskInfo(reveal:()=>void):void, restoreTaskInfo(hide:()=>void):void}`，其中ref沿用共享sticky hook；contentRef观察内容高度。
+**Interfaces:**
+
+```ts
+// TracePreserve 从 TraceEvent 导入；ReactNode/RefObject 从 react 导入。
+interface TraceTimelineProps {
+  identityKey: string;
+  phase: TraceSubscriptionSnapshot["phase"];
+  blocks: readonly TraceBlock[];
+  taskInfo: {taskId:string; objective:string|null; lastStep:string|null};
+  status: ReactNode;
+  onFallbackFocus(): void;
+  after: (preserve: TracePreserve) => ReactNode;
+}
+interface TraceTimelineHandle { showTaskInfo(entry: HTMLButtonElement): void }
+interface TraceScroll {
+  ref: RefObject<HTMLDivElement | null>;
+  contentRef: RefObject<HTMLDivElement | null>;
+  taskInfoRef: RefObject<HTMLDivElement | null>;
+  taskInfoHeadingRef: RefObject<HTMLHeadingElement | null>;
+  following: boolean;
+  followIfAtBottom(): void;
+  scrollToBottom(): void;
+  preserve: TracePreserve;
+  showTaskInfo(reveal:()=>void, entry:HTMLButtonElement): void;
+  restoreTaskInfo(hide:()=>void): void;
+}
+// useTraceScroll(identityKey:string, ready:boolean, onFallbackFocus:()=>void): TraceScroll
+```
+
+`status` 由详情层唯一生成 loading/empty/error/disconnected/刷新提示，不在 Timeline 另造一套空态；有历史时即使 phase=error/loading 仍渲染 blocks。`after(preserve)` 生成子任务区/尾部状态，子任务折叠也经 preserve。二者及完整信息、ol 全在同一正文滚动容器内。Timeline 持有完整信息 expanded，内部收起按钮调用 restoreTaskInfo；头部入口通过 handle 传自身 DOM 节点，保存焦点返回目标。ref 沿用共享 sticky hook，contentRef 观察全部滚动内容，taskInfoRef/HeadingRef 对应信息区及 tabIndex=-1 标题。
 
 - [ ] **Step 1: 写 RED。**
 
@@ -536,7 +577,7 @@ it("initially mounts 200 blocks and never shrinks the visible suffix on append",
     traceRow(i + 1, "state_note", { note: `event ${i + 1}` }),
   ));
   const props = { identityKey: "a", phase: "ready" as const, blocks,
-    taskInfo: { taskId: "task-a", objective: null, lastStep: null }, after: null };
+    taskInfo: { taskId: "task-a", objective: null, lastStep: null }, status: null, onFallbackFocus: vi.fn(), after: () => null };
   const { rerender } = render(<TraceTimeline {...props} />);
   expect(screen.getAllByRole("listitem")).toHaveLength(200);
   const appended = Array.from({ length: 100 }, (_, i) => decodeTraceRow(
@@ -551,12 +592,16 @@ it("initially mounts 200 blocks and never shrinks the visible suffix on append",
 
 scroll测试用`Object.defineProperty`给真实scroll div定义可控scrollHeight/clientHeight/scrollTop；render初始loading后rerender ready证明首次布局后贴底；同block.text增长证明不只依赖length。
 - [ ] **Step 2: 确认 RED。** `cd desktop && npx vitest run src/components/TraceTimeline.test.tsx src/hooks/useTraceScroll.test.tsx`。
-- [ ] **Step 3: 实现窗口和锚点。** 全量fold后按稳定首key保存visibleStart，而不是每次`slice(-200)`；新增块不前移start，载早向前最多200。组件key使用identityKey，切任务/Tab重挂重置。首个ready useLayoutEffect一次scrollToBottom，后续按block内容变化followIfAtBottom。
+- [ ] **Step 3: 实现窗口和锚点。** 全量 fold 后按稳定首 key 保存窗口起点，而不是每次 slice(-200)。identityKey 的初始 loading/空 blocks 不初始化窗口；**首次成功 ready** 时原子建立最近200窗口（成功空快照也记为已初始化），useLayoutEffect 在该窗口 DOM 提交后贴底一次。先前失败/15秒超时 error 不算成功，error→ready 的迟到成功或失败后重试同样执行这首次初始化。此后同一 identityKey 的 loading/error→ready 不重置窗口、不强制贴底；已有 ready 历史的刷新只尊重阅读意图。首次成功为空、后续到达事件属于追加，不反复重置为200。若快照替换移除起点 key，用旧 firstEventId 定位最近保留边界并 clamp，不退成全部挂载。
 
-锚点为 `{eventKey, offsetPx}`，取首个与scroll viewport相交的 `[data-trace-key]`，`offsetPx = itemRect.top - viewportRect.top`；变高/载早后恢复为 `scrollTop += newOffset - oldOffset`，找不到key时选最近保留key并clamp至合法scroll范围。preserve先capture、releaseFollow、变更后layout恢复，并在程序scroll后再次releaseFollow，防误回跟随。观察content wrapper和viewport的ResizeObserver；图片load、字号/宽度变化触发同一路径，清理observer/rAF/listener。不要改useStickToBottom文件。
+新增块不前移 start，载早向前最多200；稳定事件 key 保留 local expanded，无窗口尾部淘汰，不必为此提升所有展开态。组件 key 使用 identityKey，切任务/Tab重挂重置。后续按 blocks 内容变化而非仅 length 调 followIfAtBottom。
 
-showTaskInfo捕获阅读锚点、releaseFollow、展开后scrollIntoView+focus标题；收起恢复先前锚点，这是显式导航例外。其它展开保持当前锚点。载早入口消失且持焦时聚焦新批次首段 `tabIndex=-1`；不移动用户正在编辑的textarea焦点。按钮悬浮而非正文流，尾部留安全空隙。
-- [ ] **Step 4: 确认 GREEN。** 持续追加+暂停、4px回底、宽度/字号ResizeObserver、图片load、展开/收起、载早锚点、完整任务信息往返、卸载清理。`npx vitest run src/lib/useStickToBottom.test.ts`确认共享行为未改；真实几何留Task11。
+`following` 必须为 React state。useTraceScroll 在调用 useStickToBottom 后声明自身 effect，在共享 scroll listener **之后**给同一 ref 元素注册监听，读取 stick.isFollowing() 更新 state；scrollToBottom/releaseFollow/preserve 的包装也同步它。不能在渲染里直接读一个不触发更新的 ref 来决定浮钮是否出现，不修改共享 hook。
+
+锚点为 `{eventKey, firstEventId, offsetPx}`，取首个与scroll viewport相交的 `[data-trace-key]`，`offsetPx = itemRect.top - viewportRect.top`；变高/载早后恢复为 `scrollTop += newOffset - oldOffset`，找不到key时选最近保留key并clamp至合法scroll范围。preserve先capture、releaseFollow、变更后layout恢复，并在程序scroll后再次releaseFollow，防误回跟随。为异步高度变化，不能在 ResizeObserver 回调中才首次 capture（此时布局已变）。每次用户 scroll、成功恢复/贴底后的 layout 都更新 cachedAnchor；已知 React toggle/载早用 preserve 在 setState 前 capture。observer 观察 content wrapper 和 viewport 的宽高，按变更前 cachedAnchor 恢复，跟随时则贴底；图片 load 同一路径。暂停时本栏容器设 overflow-anchor:none，避免浏览器原生补偿叠加。程序恢复后 releaseFollow，并在浏览器异步 scroll 派发时保持 programmatic pause guard：无真实 wheel/touch/滚动键或滚动条拖动意图前不恢复跟随；用户主动回到4px或点最新才解除 guard。事件监听与 state 更新不得复写 pre-layout 锚点；回调合帧且清理 observer/rAF/listener。不要改 useStickToBottom 文件。
+
+showTaskInfo 捕获并单独保存阅读锚点和入口 DOM、releaseFollow，展开布局后只滚动本栏 ref 到 taskInfoRef（不让 scrollIntoView 连带滚动外层主对话），focus taskInfoHeadingRef 并用 preventScroll。信息区内收起调用 restoreTaskInfo，隐藏布局后恢复该保存锚点，只有焦点在被卸载信息区内才返回仍 connected 的入口，否则保持原焦点；不存在入口则调用 onFallbackFocus；详情层用任务标题 ref 提供该 callback，传给 Timeline 并转入 useTraceScroll，不让 hook 查主对话 DOM。恢复不恢复跟随，这是显式导航例外。其它展开保持当前锚点。载早入口消失且持焦时聚焦新批次首段 `tabIndex=-1`；不移动用户正在编辑的textarea焦点。按钮悬浮而非正文流，尾部留安全空隙。
+- [ ] **Step 4: 确认 GREEN。** 持续追加+暂停、4px回底、宽度/字号ResizeObserver、图片load、展开/收起、载早锚点、完整任务信息往返、卸载清理；专测 loading空→ready1000 仅200、error→首次ready、ready后刷新不重置窗口/不抢阅读、follow浮钮随真实scroll状态切换、程序scroll后仍暂停。`npx vitest run src/lib/useStickToBottom.test.ts`确认共享行为未改；真实几何留Task11。
 - [ ] **Step 5: 文档、门禁、提交。** `git commit -m "feat: preserve reading position in subagent timeline"`，先执行全局提交门禁。
 
 ### Task 9: 常驻消息区与紧凑详情组合（A05/A09/A10/A12）
@@ -576,11 +621,11 @@ it("shows the timeline immediately instead of a whole-trace expansion gate", () 
 });
 ```
 
-`traceProps`在测试内按上述完整契约创建：subscription ready包含textRow、actions全false/空串/null、row running、parent null、children []，所有Promise callback用`vi.fn().mockResolvedValue(undefined)`，其它callback `vi.fn()`。另测failed send不清受控value；compositionStart/Enter/keyCode229不发，compositionEnd后普通Enter发、ShiftEnter不发。
+`traceProps`在测试内按上述完整契约创建：subscription ready包含textRow、actions 的 draft=""、draftRevision=0、三个 pending=false、confirmation/error/notice=null，row running、parent null、children []，所有Promise callback用`vi.fn().mockResolvedValue(undefined)`，其它callback `vi.fn()`。另测failed send不清受控value；compositionStart/Enter/keyCode229不发，compositionEnd后普通Enter发、ShiftEnter不发。
 - [ ] **Step 2: 确认 RED。** `cd desktop && npx vitest run src/components/SubagentDetailView.test.tsx src/components/TraceComposer.test.tsx`。
-- [ ] **Step 3: 实现详情布局与受控输入。** 外层flex-col/min-h-0，header和composer shrink-0，Timeline flex-1/min-h-0；header标题3行/step2行/短ID+完整信息入口，父链接只在列表找到非自身时显示。childrenOf过滤自身，子任务默认展开、同一滚动区；尾部文案只看共享状态表。loading/empty/error/disconnected分别展示，ready保留刷新入口。
+- [ ] **Step 3: 实现详情布局与受控输入。** 外层flex-col/min-h-0，header和composer shrink-0，Timeline flex-1/min-h-0；header标题3行/step2行/短ID+完整信息入口，父链接只在列表找到非自身时显示。childrenOf过滤自身，子任务默认展开、同一滚动区；尾部文案只看共享状态表。loading/empty/error/disconnected 分别生成 Timeline.status，唯一位置展示，带历史的错误/刷新不隐藏历史。ready 保留刷新入口。子任务折叠经 Timeline.after(preserve) 执行，头部完整信息按钮调用 timelineRef.current.showTaskInfo(e.currentTarget)。
 
-Composer label独立；两行起、高度上限四行、内容内滚。复用useImeGuard/isImeEnter。事件handler调用Promise必须catch，错误已由原key记录展示，不能加主会话error。发送中仍能编辑；禁发空白/重复发送。确认区替代动作行，textarea不卸载；预览显示真实scope，confirmPending禁放弃；deadline到期UI禁确认。单个polite status，错误alert。仅焦点在消失/禁用确认控件时回停止或标题，正常terminal通知不得抢textarea焦点。
+Composer label独立；两行起、高度上限四行、内容内滚。复用 useImeGuard/isImeEnter，textarea 的 onCompositionStart/onCompositionEnd 接对应 guard，onBlur 必须 resetComposition；测试 compositionStart→blur→重新聚焦→Enter 能正常发送。事件handler调用Promise必须catch，错误已由原key记录展示，不能加主会话error。发送中仍能编辑；禁发空白/重复发送。确认区替代动作行，textarea不卸载；预览显示真实scope，confirmPending禁放弃；deadline到期UI禁确认。单个polite status，错误alert。仅焦点在消失/禁用确认控件时回停止或标题，正常terminal通知不得抢textarea焦点。
 
 新详情的导航进入聚焦标题tabIndex=-1；父/子统一onDrill，不恢复虚构历史栈。ThreadDetailPanel 的返回列表焦点与 Tab 接线留在 Task 10，本任务独立渲染新组件测试。
 - [ ] **Step 4: 确认 GREEN。** 完整跑上述两个文件+Rail/Timeline；加缺父/自引用、关闭确认/终态/过期焦点、pending不撤回、Tab前后草稿、未给row不声称运行、键盘button空间/Enter。新测试覆盖原消息/取消/连续文本能力，并记录 Task 10 需替换的旧“最近步骤/展开整个轨迹/read回灌”断言，不提前删除旧测试。
@@ -588,11 +633,17 @@ Composer label独立；两行起、高度上限四行、内容内滚。复用use
 
 ### Task 10: App、router 与所有退出路径接线（A05–A10）
 
-**Files:** 将 Task 9 的 `SubagentDetailView.tsx` 实现迁入 `desktop/src/components/SubagentTrace.tsx` 并改导出名，测试迁入 `SubagentTrace.test.tsx`，移除两个临时文件；修改 `ThreadDetailPanel.tsx`、`.test.tsx`、`desktop/src/App.tsx`、`.test.tsx`、`desktop/src/hooks/useSessionState.ts`、`.test.tsx`、`desktop/src/hooks/useNotificationRouter.ts`、`.test.ts`、`desktop/src/hooks/connectionLifecycle.ts`；新建 `desktop/src/hooks/connectionLifecycle.test.ts` 和 `desktop/src/hooks/useNotificationRouter.test.ts`（当前基线没有这两份测试）；引用Task6 controller。
+**Files:** 将 Task 9 的 `SubagentDetailView.tsx` 实现迁入 `desktop/src/components/SubagentTrace.tsx` 并改导出名，测试迁入 `SubagentTrace.test.tsx`，移除两个临时文件；修改 `ThreadDetailPanel.tsx`、`.test.tsx`、`desktop/src/App.tsx`、`.test.tsx`、`desktop/src/hooks/useSessionState.ts`、`.test.tsx`、`desktop/src/hooks/useNotificationRouter.ts`、`.test.ts`、`desktop/src/hooks/connectionLifecycle.ts`、`desktop/src/hooks/useHandshakeRecovery.ts`；新建 `desktop/src/hooks/useHandshakeRecovery.test.ts`、`desktop/src/hooks/connectionLifecycle.test.ts` 和 `desktop/src/hooks/useNotificationRouter.test.ts`（当前基线无这三份测试）；引用Task6 controller。
 
-**Interfaces:** NotificationRouterDeps新增 `trace: SubagentTraceController`；ConnectionLifecycleDeps新增 `onTraceConnection(connection: TraceConnection):void`、`traceBindingGeneration(slot:Slot):number`、`nextTraceConnectionGeneration():number`。connectSlot每次创建新client分配递增connectionGeneration，通过 onTraceConnection 登记捕获的 `{slot,serverBindingGeneration,connectionGeneration,client}`，登记必须先于wireClient，router的wireClient闭包使用这一来源而非读取当前clientRef。App持有serverBindingGeneration Map与单调递增connectionGeneration ref；前者仅pairingVersion/slot绑定目标改变递增（普通重连不变）。wireClient被实际调用时立即用Task6的 `trace.connectionFor(client,slot)`捕获来源记录，后续回调使用这份常量；即使router工厂先构造，也不能在每帧读取当前client。未知源拒绝。
+**Interfaces:** NotificationRouterDeps新增 `trace: SubagentTraceController`；ConnectionLifecycleDeps新增 `onTraceConnection(connection: TraceConnection):void`、`traceBindingGeneration(slot:Slot):number`、`nextTraceConnectionGeneration():number`、`onTraceHandshakeStart(client:RpcClient):number`、`onTraceHandshakeReady(client:RpcClient,epoch:number):void`（与下述 HandshakeRecoveryDeps 共用 App 的同一回调）。connectSlot每次创建新client分配递增connectionGeneration，通过 onTraceConnection 登记捕获的 `{slot,serverBindingGeneration,connectionGeneration,client}`，登记必须先于wireClient，router的wireClient闭包使用这一来源而非读取当前clientRef。App持有serverBindingGeneration Map与单调递增connectionGeneration ref；前者仅pairingVersion/slot绑定目标改变递增（普通重连不变）。wireClient被实际调用时立即用Task6的 `trace.connectionFor(client,slot)`捕获来源记录，后续回调使用这份常量；即使router工厂先构造，也不能在每帧读取当前client。未知源拒绝。
 
-- [ ] **Step 1: 写集成 RED。** 把 `App.test.tsx` 现有“点子agent卡片…” fake从read改watch返回完整snapshot，并断言默认见轨迹、`agent/trace/read`零次；两个关闭入口/切thread/new/delete/重配分别让旧deferred回包不污染。加返回列表后children/process仍更新的前端回归，不用重新订阅掩盖后端问题。
+HandshakeRecoveryDeps 新增 `onTraceHandshakeStart(client:RpcClient):number`、`onTraceHandshakeReady(client:RpcClient, epoch:number):void`：App 用按 client 的 WeakMap 维护局部握手 epoch，start 递增并返回 epoch，同时用已登记来源调用 setConnectionReady(source,false)。握手函数 try 前捕获 start 返回值，整次握手成功、现有 setStatus("connected") 前把该 epoch 传 ready；只有该 client 最新 epoch 才调 true，避免同 client 旧握手覆盖较新的未就绪状态；失败不调 ready。迟到旧握手的 ready 由 controller 当前 client/代际门禁拒绝，不能把新连接提早标好。同 client 的既有 -32010 recovery 是 raw initialize 的独立路径，App 的 recoveryRef 回调也必须捕获同样 start epoch/成功 ready（失败保持 false），不能只改 createHandshakeRecovery。登记、transport connected、initialize 发出都不代表握手就绪；只新增本地回调，不改 RPC。
+
+raw recovery 必须知道发起 client：把 App 与 ConnectionLifecycleDeps 的 recoveryRef 类型同步改为 `((raw:RequestFn, client:RpcClient, slot:Slot)=>Promise<void>)|null`。connectSlot 的 RpcClient recover 闭包捕获其创建的 client/slot，调用 `recoveryRef.current!(raw,client,slot)`；connectRemoteTargets 直接创建 next 的旁路也捕获 next/target.profileId，不改 RpcClient 构造函数公开签名。App recoveryRef 的 start/ready 查询 `trace.connectionFor(client,slot)`，不读 clientRef/activeSlotRef；常规 HandshakeRecovery 回调查询 `trace.connectionFor(client)`，使用登记时 slot。旁路新建也必须先登记 onTraceConnection 再 wireClient，完成其 initialize/绑定后携 start epoch 通知 ready；失败保持 not-ready 并按既有 registry.remove 清理。补全这两处 new RpcClient 调用点的测试，避免只覆盖 connectSlot。
+
+统一 Tab 入口也作为显式依赖：NotificationRouterDeps 新增 `changeDetailTab(tab:"subagents"|"diff"|"processes"):void`，由 App 提供先失效 preview 后 setTab 的包装。router 不直接调用裸 sess.setDetailTab。
+
+- [ ] **Step 1: 写集成 RED。** 把 `App.test.tsx` 现有“点子agent卡片…” fake从read改watch返回完整snapshot，保留可到达的 agent/children/list 返回卡片前置数据，并断言默认见轨迹、`agent/trace/read`零次；两个关闭入口/切thread/new/delete/重配分别让旧deferred回包不污染。加返回列表后children/process仍更新的前端回归，不用重新订阅掩盖后端问题。
 
 ```ts
 expect(calls.filter(c => c.method === "agent/trace/read")).toHaveLength(0);
@@ -606,7 +657,7 @@ await waitFor(() => expect(screen.queryByText("stale")).toBeNull());
 - [ ] **Step 2: 确认 RED。** `cd desktop && npx vitest run src/App.test.tsx -t '子agent|子 agent|trace'`，同时运行router/lifecycle目标文件，确认新测试确实收集（不能0 tests当通过）。
 - [ ] **Step 3: 移动责任并同步失效。** 先完成新详情迁移与旧测试替换；ThreadDetailPanel保持Tab顺序/宽度/isMobile约定，避免和详情重复渲染旧返回导航。返回列表聚焦来源任务按钮或列表标题。useSessionState移除detailStack/traceRows/openTaskId/旧openDetail与closeDetail的RPC，不移railRows/refreshSubagents/面板宽度。App通过controller打开目标，传受控view到Trace。router对trace/event调用trace.accept(source,params)，不能setTraceRows；children更新后用来源target同步终态给actions；断开先trace.disconnected(source)再既有dispose/reconnect。
 
-所有路径在任何await、setCurrentId或setPanelOpen前先close/invalidate：详情返回、面板X、状态栏toggle关闭、selectThread、newThread、delete当前thread、slot变更、重配、App卸载。删除任意thread还dropThread；移除slot先dropSlot；重配resetBindings。Tab切diff/process只tabChanged(false)（保watch/选择，清预览），回Tab tabChanged(true)，组件重挂重置最新位置。普通重连保选中/历史/草稿并提示手动retry，不在新client上unwatch旧thread。
+所有路径在任何await、setCurrentId或setPanelOpen前先close/invalidate：详情返回、面板X、状态栏toggle关闭、selectThread、newThread、delete当前thread、slot变更、重配、App卸载。删除任意thread还dropThread；移除slot先dropSlot；重配resetBindings。Tab 切换走同步统一入口 changeDetailTab(tab)：先 tabChanged(tab==="subagents") 再 sess.setDetailTab(tab)，UI 点击和 router 的 ui/gitDiff/focus 程序跳转必须都用它；搜查所有 setDetailTab 生产调用点，不能只改 onTabChange。切 diff/process 保 watch/选择、清预览，回 Tab 组件重挂重置最新位置。普通重连保选中/历史/草稿并提示手动retry，不在新client上unwatch旧thread。
 
 ```ts
 const closeSubagentPanel = () => {
@@ -616,14 +667,14 @@ const closeSubagentPanel = () => {
 ```
 
 写动作不再由App可选链代理RPC；统一controller.send(target)/preview(target)/confirm(target)，各回调闭包捕获当时渲染的selected target；onDraftChange同样传捕获target。missing或不再可见的动作target必须reject ConnectionError，不能在回调时偷读新选择。删除 trace 消息、预览与确认中所有 `clientRef.current?.request` 路径；children/list 等无关读取不扩大改动。不要动主会话draft/搜索/旁问路由。
-- [ ] **Step 4: 确认 GREEN。** 运行App/router/lifecycle/useSessionState/useSubagentTrace定向全量，再`npx tsc --noEmit && npm test && npm run build`。grep确认旧`setTraceRows/openTaskId/trace/read`不在生产trace入口；read保留协议类型不删除。增加旧client相同thread/task通知、普通重连草稿保留、换绑同ID清理测试。
+- [ ] **Step 4: 确认 GREEN。** 运行App/router/lifecycle/useSessionState/useSubagentTrace定向全量，再`npx tsc --noEmit && npm test && npm run build`。grep确认旧`setTraceRows/openTaskId/trace/read`不在生产trace入口；read保留协议类型不删除。增加旧client相同thread/task通知、普通重连草稿保留、换绑同ID清理测试；新 client 登记但握手 deferred 时 retry/动作拒绝且零 watch，ready 后仅手动 retry 发新 watch，迟到旧 ready 无效；普通与 raw recovery 两条握手路径、程序 diff focus 清预览且不 unwatch 都必须测。
 - [ ] **Step 5: 文档、门禁、提交。** 更新desktop未完成条目的实际测试证据；执行全局提交门禁，`git commit -m "feat: wire subagent trace ownership into desktop navigation"`。
 
 ### Task 11: 真实浏览器矩阵与最终验收记录（A01–A12）
 
 **Files:** 新建 `desktop/scripts/browser/subagent-trace.html`、`subagent-trace.tsx`、`subagent-trace-check.mjs`；修改 `desktop/package.json`、`desktop/scripts/browser/README.md`；新建 `docs/superpowers/reviews/2026-11-07-desktop-subagent-trace-acceptance.md`；同步 `docs/project-management/{desktop.md,README.md}`。
 
-**Interfaces:** fixture `window.traceProbe` 暴露 `setTheme("dark"|"light")`、`setScale("small"|"standard"|"large")`、`setPanelWidth(260|360|720)`、`appendText(text:string)`、`appendEvents(count:number)`、`loadScenario(name:"long"|"emptyMetadata"|"error"|"children"|"images")`、`metrics(): {panelOverflow:number;bodyHeight:number;bottomGap:number;anchorKey:string|null;anchorOffset:number;messageReachable:boolean}`。渲染真实SubagentTrace/ThreadDetailPanel与index.css，用mock controller/action数据，不启动sidecar。fixture不注册生产事件listener。
+**Interfaces:** fixture `window.traceProbe` 暴露 `setTheme("dark"|"light")`、`setScale("small"|"standard"|"large")`、`setPanelWidth(260|360|720)`、`appendText(text:string)`、`appendEvents(count:number)`、`loadScenario(name:"long"|"emptyMetadata"|"error"|"children"|"images")`、`metrics(): {panelOverflow:number;bodyHeight:number;bottomGap:number;anchorKey:string|null;anchorOffset:number;messageReachable:boolean}`。渲染真实SubagentTrace/ThreadDetailPanel与index.css，用mock controller/action数据，不启动sidecar。fixture不注册生产事件listener。messageReachable 不是常量：实际 label 对应 textarea、当前可用发送/停止或确认动作的 rect 均须与 viewport/固定 composer 可视范围相交且不被裁剪，textarea 本体 top>=0、bottom<=innerHeight、width/height>0，DOM connected/可聚焦且无 inert/aria-hidden 祖先；用 elementFromPoint 检查其可点区域不被浮钮/外层遮挡。disabled 仅按场景合法 pending/空白判断，不把自然禁发空白当不可达。bodyHeight 取唯一正文 scroll div 的 clientHeight。panelOverflow 同时检查 panel.scrollWidth-clientWidth 与非局部代码/表格容器的子节点 rect 越界，不能靠 overflow-x:hidden 把内容裁掉伪通过。
 
 - [ ] **Step 1: 写 browser RED断言并先验证能失败。** 沿用现有stream-live-check.mjs的Vite+Chrome+原生WebSocket方式，独立profile，端口环境变量 `SUBAGENT_TRACE_PORT` 默认1449、`SUBAGENT_TRACE_DEBUG_PORT` 默认9359，支持CHROME_BIN。
 
@@ -639,7 +690,7 @@ assert.ok(Math.abs(after.anchorOffset - before.anchorOffset) <= 2, "paused ancho
 
 滚动独立序列：ready贴底→append同块text贴底→真实wheel/PageUp暂停→连续append不移动anchor→摘要展开/载早保持→图片异步变高保持→resize/字体保持→点回最新恢复；完整信息显式导航往返单测和浏览器均验证。1000块初始200、追加100为300，载早最终可访问1100，不宣称固定DOM上界。用CDP键盘测试Tab/Enter/Space、取消focus、textarea焦点不被terminal抢、reduced-motion模拟。
 
-所有spawn均push到children，finally关闭ws、先TERM后超时KILL子进程并删临时profile；每个等待有界，stderr/Runtime.exceptionThrown保留。脚本把矩阵metrics与失败case输出JSON到调用者指定的 `SUBAGENT_TRACE_REPORT` 文件；默认放desktop/.artifacts下并确认ignored，不提交截图/巨型日志。
+所有spawn均push到children，finally关闭ws、先TERM后超时KILL子进程并删临时profile；每个等待有界，stderr/Runtime.exceptionThrown保留。脚本把矩阵metrics与失败case输出JSON到调用者指定的 `SUBAGENT_TRACE_REPORT` 文件；默认放仓库根 `.artifacts/desktop-subagent-trace/report.json`（从 desktop 运行时为 `../.artifacts/desktop-subagent-trace/report.json`），用 `git check-ignore .artifacts/desktop-subagent-trace/report.json` 在仓库根验证；不提交截图/巨型日志。
 - [ ] **Step 3: 跑真实验证。** package.json新增 `"test:browser:subagent-trace": "node scripts/browser/subagent-trace-check.mjs"`。运行 `cd desktop && npm run test:browser:subagent-trace`；保存18组合结果、锚点误差、对比度和使用的Chrome/Node版本。缺Chrome必须明确失败/未验，不回退jsdom伪通过。
 - [ ] **Step 4: 全量门禁与人工边界。**
 
@@ -672,5 +723,7 @@ cargo fmt --all && just ci
 | A12 | 7、8、9、11 | 语义/label/焦点/status、原文入口、键盘与reduced-motion |
 
 执行依赖：1→2；3可独立；2→4→5→6；1/2→7；7→8；6/8→9；3/6/9→10；10→11。4与5即使可技术并行，也按顺序定义共享身份类型后再实现；App接线单任务单作者，避免共享文件冲突。
+
+步骤完成规则：每个大任务的五个步骤是检查点，Step 1/3/4 内列出的独立 case 按单一行为循环 RED→最小实现→GREEN 后再做下一个，不一次堆全部红测后实现大包。Step 5 是该任务的可编译/可测试提交边界。
 
 计划自审须逐项确认：spec每条能映射至上表；所有新函数/props均在本文件定义；旧trace helper调用点全部迁移；没有新增协议或依赖；没有把手工/浏览器检查当作已执行证据。本计划完成不等于代码完成。

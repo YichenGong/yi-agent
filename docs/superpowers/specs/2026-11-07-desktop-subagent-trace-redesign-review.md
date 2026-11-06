@@ -3,6 +3,8 @@
 日期：2026-11-07
 范围：[设计](2026-11-07-desktop-subagent-trace-redesign-design.md)，不实施产品代码。
 
+后续用户要求独立复审 plan，修订及检查记录见 [plan 复审](../reviews/2026-11-07-desktop-subagent-trace-plan-review.md)；本页既有 spec 结论不替代 plan 复审。
+
 ## 审查方法
 
 按用户要求先反复检查 spec，再编写 [实施计划](../plans/2026-11-07-desktop-subagent-trace-redesign-impl.md)。使用真实源码核对、独立 UX/协议审查、逐项修订及最终一致性自审，不以最初的示意图代替协议事实。
