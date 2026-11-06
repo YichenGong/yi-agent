@@ -26,6 +26,8 @@
 
 ## Features
 
+- [ ] 运行参数全会话即时生效（spec / plan 完成，功能未实现）— [spec](../superpowers/specs/2026-11-04-runtime-settings-live-apply-design.md) · [plan](../superpowers/plans/2026-11-04-runtime-settings-live-apply-impl.md)。覆盖同实例 app-server、CLI/TUI、daemon/现存子代理及旁问；保存后下个对应安全执行点采用，不打断已开始操作；默认沙箱只影响新会话。完成判据：spec §10 T01–T28 的自动化证据、§11 全部条件及 `cd yi-agent-rs && cargo fmt --all && just ci`；本项统一计数，相关模块实施时交叉引用，不重复计数。
+
 - [x] crate 骨架 + workspace 注册 — `yi-agent-rs/crates/yi-agent-runtime/`；`Cargo.toml` members 含 `crates/yi-agent-runtime`
 - [x] `RuntimeConfig` + `ConfigOverrides` + `load()`（env/.env 层级合并，不依赖 clap）— `src/config.rs:13` / `src/config.rs:34` / `src/config.rs:169`
 - [x] sandbox 手写解析 + 变体漂移编译器守卫 — `src/config.rs:64`，测试 `src/config.rs:486`
