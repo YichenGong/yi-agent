@@ -73,6 +73,26 @@ export type NoticeBody =
   | { kind: "usage"; report: UsageReport };
 
 /**
+ * notice 里哪些 kind 渲染成**卡片**（正文不是 `text`）。
+ *
+ * 存在理由：`ChatView` 按这张表分派卡片，`itemText` 据此决定该 notice 能否被搜索。
+ * 两处若各写一份判据，将来加第 4 种 kind 时渲染层会落到"文本胶囊"分支画出
+ * `item.text`，而搜索层仍返回空串——**看得见、搜不到**，且类型系统不报错。
+ *
+ * 所以这里用 `Record<NoticeBody["kind"], true>` 而不是数组：漏写新 kind 会编译失败。
+ */
+const CARD_KINDS: Record<NoticeBody["kind"], true> = {
+  config: true,
+  help: true,
+  usage: true,
+};
+
+/** 该 notice 是否渲染成卡片（正文不是 `text`，因此不可搜索）。 */
+export function noticeRendersAsCard(notice: NoticeItem): boolean {
+  return notice.body !== undefined && CARD_KINDS[notice.body.kind];
+}
+
+/**
  * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端在实时期间
  * 只以 `thread/reasoningDelta` 流式推送，好让前端保留流式手感；一旦块级
  * `item/thinking`（服务端权威条目）到达，本块即被**就地接管**（见 `apply`）。

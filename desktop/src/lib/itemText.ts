@@ -1,5 +1,5 @@
 import type { Item } from "./protocol";
-import type { NoticeItem, ReasoningItem } from "./session";
+import { noticeRendersAsCard, type NoticeItem, type ReasoningItem } from "./session";
 
 /**
  * The text an item renders, lifted out as a primitive.
@@ -22,10 +22,11 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
     // 要照传，好让就地追加能被比较器看见。
     case "thinking":
       return item.text;
-    // 普通文本 notice（缺省 `body`）在 `ChatView` 里就渲染 `item.text`，所以它必须
-    // 可搜；带结构化载荷的 notice 渲染成卡片，正文不是 `text`，按空串处理。
+    // 普通文本 notice 在 `ChatView` 里就渲染 `item.text`，所以它必须可搜；卡片型
+    // notice 的正文不是 `text`，按空串处理。判据来自 `session.noticeRendersAsCard`，
+    // 与渲染层共用同一张 kind 表——各写一份的话，加新 kind 时这里会静默分叉。
     case "notice":
-      return item.body ? "" : item.text;
+      return noticeRendersAsCard(item) ? "" : item.text;
     default:
       // `toolCall` 无 text。
       // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成

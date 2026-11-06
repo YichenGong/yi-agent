@@ -154,28 +154,40 @@ const ChatItem = memo(
     // 保留子消息 self-start/self-end 的对齐，禁止收缩以保持可滚动的自然高度。
     const node = (() => {
       switch (item.type) {
-        case "notice":
-        // 结构化载荷按 `kind` 分派；没有载荷的就是普通文本提示（胶囊）。
-        return item.body?.kind === "config" ? (
-          <ConfigCard config={item.body.data} error={item.body.error} />
-        ) : item.body?.kind === "help" ? (
-          <HelpCard target={item.body.target} error={item.body.error} />
-        ) : item.body?.kind === "usage" ? (
-          <UsageCard report={item.body.report} />
-        ) : (
+        case "notice": {
+          // 卡片型 notice 按 `kind` 分派。用**穷尽 switch** 而不是 `?.kind ===` 链：
+          // `NoticeBody` 加新 kind 时，下面 `never` 那行会直接编译失败，逼我们同时
+          // 更新 `session.CARD_KINDS`，否则搜索层会把卡片当成文本（看得见搜不到）。
+          const body = item.body;
+          switch (body?.kind) {
+            case "config":
+              return <ConfigCard config={body.data} error={body.error} />;
+            case "help":
+              return <HelpCard target={body.target} error={body.error} />;
+            case "usage":
+              return <UsageCard report={body.report} />;
+            default:
+              if (body !== undefined) {
+                const unhandled: never = body;
+                void unhandled;
+              }
+          }
+          // 没有载荷的就是普通文本提示（胶囊）。
           // 服务端 `thread/notice` 带 level：Warn（通道回退 / effort 降级）用琥珀色
           // 让人一眼看出「走了别的路」；本地 `/命令` 提示与 Info 保持既有中性胶囊。
-          <div
-            data-testid="notice"
-            className={
-              item.level === "Warn"
-                ? "my-1 self-center rounded-md bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
-                : "my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted"
-            }
-          >
-            {item.text}
-          </div>
-        );
+          return (
+            <div
+              data-testid="notice"
+              className={
+                item.level === "Warn"
+                  ? "my-1 self-center rounded-md bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
+                  : "my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted"
+              }
+            >
+              {item.text}
+            </div>
+          );
+        }
       case "reasoning":
         return <ReasoningBlock text={item.text} />;
       case "thinking":
