@@ -204,6 +204,16 @@ pub struct FrontendLease {
     lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Which way a plugin demand request goes.
+///
+/// Two request variants rather than a boolean on one: the wire already has two
+/// distinct methods, and a flag would let a caller "release" by passing `false`
+/// where they meant to acquire.
+enum PluginDemandChange {
+    Acquire,
+    Release,
+}
+
 struct Heartbeat {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -380,6 +390,82 @@ impl FrontendLease {
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the runtime answered a release with {other:?}"),
+            )),
+        }
+    }
+
+    /// Declares that this frontend is waiting on `plugin`.
+    ///
+    /// Presented on this lease's own grant, never one taken from a request: the
+    /// owner of a demand is whichever live lease asks, so a caller cannot acquire
+    /// demand on another client's behalf. Demand is not a renewal and authorises no
+    /// work -- it only answers "must this shared plugin keep running".
+    ///
+    /// Returns `(wanted_after, changed)`: the whole state after the call, and whether
+    /// this call moved it. A retry is therefore visible as a retry rather than as new
+    /// demand, and "nobody wants it" stays distinguishable from "the reply was lost".
+    pub fn acquire_plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+    ) -> io::Result<(bool, bool)> {
+        self.plugin_demand(plugin, deadline, PluginDemandChange::Acquire)
+    }
+
+    /// Says this frontend is done with `plugin`.
+    ///
+    /// The plugin stops only when the last holder releases; releasing one this client
+    /// never held changes nothing, so an unbalanced release cannot stop a service
+    /// another client is still using.
+    pub fn release_plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+    ) -> io::Result<(bool, bool)> {
+        self.plugin_demand(plugin, deadline, PluginDemandChange::Release)
+    }
+
+    fn plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+        change: PluginDemandChange,
+    ) -> io::Result<(bool, bool)> {
+        let request = match change {
+            PluginDemandChange::Acquire => types::ControlRequest::AcquirePluginDemand {
+                grant: self.grant.clone(),
+                plugin: plugin.to_string(),
+            },
+            PluginDemandChange::Release => types::ControlRequest::ReleasePluginDemand {
+                grant: self.grant.clone(),
+                plugin: plugin.to_string(),
+            },
+        };
+        let mut client = ControlClient::connect(&self.control_path, deadline)?;
+        match client.request(&request, deadline)? {
+            types::ControlResponse::PluginDemand {
+                plugin: answered,
+                wanted,
+                changed,
+            } if answered == plugin => Ok((wanted, changed)),
+            // A reply about a different plugin cannot be about this request: taking
+            // its `wanted` would report somebody else's plugin as ours.
+            types::ControlResponse::PluginDemand {
+                plugin: answered, ..
+            } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered for plugin {answered:?}, not {plugin:?}"),
+            )),
+            types::ControlResponse::Rejected { code, reason } => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the runtime refused this plugin demand: {code:?}: {reason}"),
+            )),
+            types::ControlResponse::Unsupported { detail } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, detail))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered a plugin demand with {other:?}"),
             )),
         }
     }

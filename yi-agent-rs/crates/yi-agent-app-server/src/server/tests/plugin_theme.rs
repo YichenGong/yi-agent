@@ -121,6 +121,11 @@ async fn plugin_install_resolves_the_command_and_writes_what_the_plugin_describe
         response["result"]["queryable"], true,
         "a manifest without a query channel is queryable at once"
     );
+    // 旧路径（未受管会话）由自己拉起 daemon，所以它可以说 `running`。
+    assert_eq!(
+        response["result"]["startup"], "running",
+        "an unmanaged install answers with what it actually did: {response}"
+    );
 
     // `project_arg` 会 canonicalize（macOS 上 `/var` → `/private/var`），故期望
     // 路径也必须先规范化，否则比的是同一个目录的两种写法。
@@ -656,5 +661,73 @@ async fn re_enabling_the_watchman_on_a_retired_instance_installs_nothing() {
     );
     // 用户的偏好仍按他的意图落盘：迁移回滚后不应丢失原本的选择。
     assert!(crate::settings_store::load_watchman_enabled(dir.path()));
+    h.shutdown().await;
+}
+
+/// 受管会话下，装完只到"落盘"，进程要等真实 demand。
+///
+/// 三件事必须同时成立，缺任何一条都会让 managed 的插件门控形同虚设：
+/// daemon 不是被这次安装拉起来的、旧自愈值守没有被装回来、回包没有承诺一个
+/// 不存在的后台重试。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_install_waits_for_demand_instead_of_starting_a_daemon() {
+    let mut h = Harness::new();
+    // 本会话由桌面的壳代表：只有这种连接才走受管语义。
+    h.send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"shellAuthorization":{"client_run_id":"app-run-42","issued_by_shell":true}}}"#,
+    )
+    .await;
+    let _ = read_response(&mut h, 1).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "args": [],
+        "switch_key": "demo_plugin_on",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "a managed install still installs: {response}"
+    );
+    assert_eq!(response["result"]["installed"], true);
+    assert_eq!(
+        response["result"]["startup"], "awaiting-demand",
+        "a managed install must not claim the plugin is running: {response}"
+    );
+    assert_eq!(
+        response["result"]["queryable"], false,
+        "nothing is listening until a client demands the plugin: {response}"
+    );
+
+    // 落盘仍然是持久的：调用方随后登记 demand 时，清单与开关必须在。
+    let written = std::fs::canonicalize(project.path())
+        .unwrap()
+        .join(".yi-agent")
+        .join("supervisors")
+        .join("demo-plugin.json");
+    assert!(written.is_file(), "the manifest must still be durable");
+
+    // 受管路径不得拉起一个没人监督的 daemon：那正是 managed 要消掉的后台自启。
+    assert!(
+        h.daemon_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "a managed install must not start a daemon of its own"
+    );
+    // 也不得把旧自愈值守装回来：装一次插件就让实例切不过去 managed。
+    assert!(
+        h.watchman_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "a managed install must not reinstall the legacy resident watchman"
+    );
+
     h.shutdown().await;
 }

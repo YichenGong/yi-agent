@@ -21,6 +21,52 @@ pub struct SuperviseHandle {
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
     supervising: bool,
+    /// The demand set this supervisor lives under, when it is managed.
+    ///
+    /// `None` for manual and legacy runtimes: the switch alone decides there, and
+    /// introducing demand would change behaviour that was never part of the managed
+    /// contract. A managed runtime gets `Some(shared set)` and can be told, from
+    /// anywhere in the process, that the set has changed.
+    wanted: Option<std::sync::Arc<WantedPlugins>>,
+}
+
+/// The wanted-plugin set, shared between whoever learns about demand and the
+/// supervisor thread that acts on it.
+///
+/// A lock rather than a channel because the supervisor reads it once per reconcile
+/// tick: a queue would need draining rules, and a missed message would leave a
+/// plugin running (or not) for a whole tick. The set is small and read often, which
+/// is what a mutex is for.
+#[derive(Debug, Default)]
+pub struct WantedPlugins {
+    inner: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl WantedPlugins {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the whole set, as a snapshot from the guardian does.
+    ///
+    /// A snapshot rather than a delta: a client that reconnects has no way to apply
+    /// changes it never saw, and the guardian is the one place that knows the full
+    /// answer.
+    pub fn replace(&self, wanted: impl IntoIterator<Item = String>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = wanted.into_iter().collect();
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.iter().cloned().collect()
+    }
 }
 
 impl SuperviseHandle {
@@ -42,6 +88,14 @@ impl SuperviseHandle {
     /// 显式停止。等价于把它 drop 掉，只为让调用点读起来有意图。
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// The demand set this supervisor is serving, when it is managed.
+    ///
+    /// Exposed so the code that learns about demand has one handle to publish
+    /// through instead of threading a second value alongside this one.
+    pub fn wanted(&self) -> Option<&std::sync::Arc<WantedPlugins>> {
+        self.wanted.as_ref()
     }
 }
 
@@ -101,6 +155,7 @@ pub fn idle() -> SuperviseHandle {
         stop: Arc::new(AtomicBool::new(false)),
         join: None,
         supervising: false,
+        wanted: None,
     }
 }
 
@@ -164,6 +219,20 @@ pub fn serve_without_manifest_refresh(
     serve_inner(workdir, runtime_dir, flags_path, build_kind, None)
 }
 
+/// [`serve_managed`] without the manifest refresh, for tests that start fake plugins.
+///
+/// Same reasoning as [`serve_without_manifest_refresh`]: the fake children ignore
+/// their argv, so treating them as manifests would both write a false marker and
+/// burn the whole description budget waiting for an answer that never comes.
+pub fn serve_managed_without_manifest_refresh(
+    workdir: &Path,
+    runtime_dir: &Path,
+    wanted: std::sync::Arc<WantedPlugins>,
+    build_kind: Option<&str>,
+) -> SuperviseHandle {
+    serve_inner_with_demand(workdir, runtime_dir, None, build_kind, None, Some(wanted))
+}
+
 /// [`serve_with_environment`], but with the startup description budget spelled out.
 ///
 /// Same rule as [`serve_without_manifest_refresh`]: a seam for tests, not a
@@ -191,6 +260,39 @@ pub fn serve_with_manifest_budget(
     )
 }
 
+/// The managed entry point: plugins run only while somebody wants them.
+///
+/// A separate function rather than another parameter on [`serve`] because the two
+/// are different contracts, not two settings of one. A manual runtime's supervisor
+/// answers "which plugins are switched on", and changing that answer would break
+/// installs that never opted into managed lifecycle. This one answers "which
+/// plugins does a client need right now", and returns the handle that lets the
+/// caller publish a new answer as demand comes and goes.
+pub fn serve_managed(
+    workdir: &Path,
+    runtime_dir: &Path,
+    wanted: std::sync::Arc<WantedPlugins>,
+) -> SuperviseHandle {
+    serve_managed_with(workdir, runtime_dir, wanted, None)
+}
+
+/// [`serve_managed`] with the startup description budget spelled out.
+pub fn serve_managed_with(
+    workdir: &Path,
+    runtime_dir: &Path,
+    wanted: std::sync::Arc<WantedPlugins>,
+    describe_timeout: Option<std::time::Duration>,
+) -> SuperviseHandle {
+    serve_inner_with_demand(
+        workdir,
+        runtime_dir,
+        None,
+        None,
+        describe_timeout,
+        Some(wanted),
+    )
+}
+
 fn serve_inner(
     workdir: &Path,
     runtime_dir: &Path,
@@ -198,6 +300,29 @@ fn serve_inner(
     build_kind: Option<&str>,
     // The startup description budget; `None` means "do not refresh at all".
     describe_timeout: Option<std::time::Duration>,
+) -> SuperviseHandle {
+    serve_inner_with_demand(
+        workdir,
+        runtime_dir,
+        flags_path,
+        build_kind,
+        describe_timeout,
+        None,
+    )
+}
+
+/// [`serve_inner`] with the demand set decided *before* the thread starts.
+///
+/// That ordering is the requirement, not a detail: the first reconcile happens
+/// inside the spawned thread, so a gate installed after the spawn would leave that
+/// first pass ungated -- and an ungated first pass starts every switched-on plugin.
+fn serve_inner_with_demand(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+    describe_timeout: Option<std::time::Duration>,
+    wanted: Option<std::sync::Arc<WantedPlugins>>,
 ) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -209,31 +334,41 @@ fn serve_inner(
     let kind = build_kind
         .map(str::to_string)
         .unwrap_or_else(|| yi_agent_flags::build_kind().to_string());
+    let thread_wanted = wanted.as_ref().map(std::sync::Arc::clone);
     let join = std::thread::spawn(move || {
-        drive_supervision(layout, &scope, kind, flags_path, &flag, |dir, stop| {
-            // 先校准清单再进循环。
-            //
-            // 清单是**安装那一刻**的快照，插件升级后没有任何东西会刷新它。旧快照
-            // 会让新逻辑读旧结论（`stop_when_disabled` 就是这样：用户关掉开关、进程
-            // 却还在跑，界面上也看不出原因）。放在循环外只做一次：自述要起子进程，
-            // 每 500ms 跑一遍是浪费；而"装完就改清单"的窗口由安装路径自己覆盖。
-            //
-            // 停止请求必须传进去：一次卡住的自述会让 handle 的 join 白等满
-            // 15 秒（后代持写端时更久）。刷新在 catch 之内，所以它在展开路上
-            // 留下的资源也由执行器的 guard 收口。
-            if let Some(describe_timeout) = describe_timeout {
-                yi_agent_supervisors::refresh::refresh_and_log_with_budget(
-                    dir,
-                    describe_timeout,
-                    || stop.load(Ordering::SeqCst),
-                );
-            }
-        });
+        drive_supervision_with(
+            layout,
+            &scope,
+            kind,
+            flags_path,
+            thread_wanted,
+            &flag,
+            |dir, stop| {
+                // 先校准清单再进循环。
+                //
+                // 清单是**安装那一刻**的快照，插件升级后没有任何东西会刷新它。旧快照
+                // 会让新逻辑读旧结论（`stop_when_disabled` 就是这样：用户关掉开关、进程
+                // 却还在跑，界面上也看不出原因）。放在循环外只做一次：自述要起子进程，
+                // 每 500ms 跑一遍是浪费；而"装完就改清单"的窗口由安装路径自己覆盖。
+                //
+                // 停止请求必须传进去：一次卡住的自述会让 handle 的 join 白等满
+                // 15 秒（后代持写端时更久）。刷新在 catch 之内，所以它在展开路上
+                // 留下的资源也由执行器的 guard 收口。
+                if let Some(describe_timeout) = describe_timeout {
+                    yi_agent_supervisors::refresh::refresh_and_log_with_budget(
+                        dir,
+                        describe_timeout,
+                        || stop.load(Ordering::SeqCst),
+                    );
+                }
+            },
+        );
     });
     SuperviseHandle {
         stop,
         join: Some(join),
         supervising: true,
+        wanted,
     }
 }
 
@@ -241,11 +376,17 @@ fn serve_inner(
 ///
 /// `catch_unwind` 的位置**不在测试分支里**：真实刷新和生产对账循环共用同一条
 /// 展开保护，所以「刷新 panic 时清掉本项目的路由」不是只在测试里成立的行为。
-fn drive_supervision(
+/// The supervision thread: refresh, reconcile on a timer, then clean up.
+///
+/// `wanted` is `None` for a manual or legacy runtime, where the switch alone decides
+/// -- the historical contract, which this function must not quietly change -- and
+/// `Some(shared set)` for a managed one.
+fn drive_supervision_with(
     layout: Layout,
     scope: &Path,
     kind: String,
     flags_path: Option<std::path::PathBuf>,
+    wanted: Option<std::sync::Arc<WantedPlugins>>,
     flag: &AtomicBool,
     refresh: impl FnOnce(&Path, &AtomicBool),
 ) {
@@ -257,7 +398,18 @@ fn drive_supervision(
         if let Some(path) = flags_path {
             supervisor = supervisor.with_flags_path(path);
         }
+        if wanted.is_some() {
+            // Start empty: a managed daemon that started every switched-on plugin
+            // before any client asked would recreate the background load the managed
+            // runtime exists to remove.
+            supervisor = supervisor.with_wanted_plugins(std::iter::empty());
+        }
         while !flag.load(Ordering::SeqCst) {
+            if let Some(wanted) = wanted.as_ref() {
+                // A snapshot, so a reconcile always acts on one coherent answer
+                // rather than on whatever half of a change it happened to see.
+                supervisor.set_wanted_plugins(wanted.snapshot());
+            }
             supervisor.reconcile();
             // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
             // 每轮整体替换**本项目的分区**，停止或未声明的插件自然消失，
@@ -427,6 +579,62 @@ mod tests {
             wait_for(&marker, SETTLE_BUDGET),
             "a switched-on manifest must have its child started"
         );
+        handle.stop();
+    }
+
+    /// A managed daemon must not start plugins nobody has asked for yet.
+    ///
+    /// This is the whole point of the demand gate, and the startup window is where
+    /// it is easiest to get wrong: the first reconcile happens inside the spawned
+    /// thread, so a gate installed after the spawn would leave exactly that first
+    /// pass ungated. A switched-on manifest plus an empty demand set must therefore
+    /// produce no child, and publishing demand must then start it.
+    #[test]
+    fn a_managed_supervisor_starts_nothing_until_demand_arrives() {
+        let _guard = exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
+        let marker = dir.path().join("child.pid");
+        let (_child, flags) = armed_project(dir.path(), &marker);
+
+        let wanted = std::sync::Arc::new(WantedPlugins::new());
+        let handle = serve_inner_with_demand(
+            dir.path(),
+            &scope_of(dir.path()),
+            Some(flags),
+            Some("dev"),
+            None,
+            Some(std::sync::Arc::clone(&wanted)),
+        );
+
+        // Give the loop several ticks: "nothing started" must be a stable fact, not
+        // a race won by asserting early.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !marker.exists(),
+            "a switched-on plugin with no demand must not start"
+        );
+
+        wanted.replace(["demo".to_string()]);
+        assert!(
+            wait_for(&marker, SETTLE_BUDGET),
+            "demand must start the plugin the client asked for"
+        );
+
+        // Dropping demand must stop it again: the managed contract is that the
+        // process lives exactly as long as somebody needs it.
+        wanted.replace(std::iter::empty());
+        let gone = {
+            let deadline = Instant::now() + SETTLE_BUDGET;
+            while Instant::now() < deadline {
+                if yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none()
+        };
+        assert!(gone, "withdrawing demand must stop the plugin");
         handle.stop();
     }
 
@@ -786,10 +994,11 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        drive_supervision(
+        drive_supervision_with(
             Layout::for_workdir(a.path()),
             &a_scope,
             "dev".into(),
+            None,
             None,
             &AtomicBool::new(true),
             |_, _| panic!("injected refresh panic"),
@@ -826,10 +1035,11 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        drive_supervision(
+        drive_supervision_with(
             Layout::for_workdir(a.path()),
             &a_scope,
             "dev".into(),
+            None,
             None,
             &AtomicBool::new(true),
             |_, _| {},

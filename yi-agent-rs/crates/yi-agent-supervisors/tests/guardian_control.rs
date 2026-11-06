@@ -181,3 +181,68 @@ fn release_reclaims_before_answering() {
     let _ = LeaseMode::Business;
     let _ = ControlErrorCode::Unsupported;
 }
+
+/// The production entry point must be able to honour plugin demand.
+///
+/// A guardian that tracked no demand table would answer `Unsupported` to every
+/// `AcquirePluginDemand`, and a managed client would then fall back to a private
+/// daemon -- the behaviour managed mode exists to remove. The unit tests build the
+/// guardian by hand, so only this test can catch the entry point forgetting to
+/// attach the table.
+#[test]
+fn the_serving_guardian_honours_plugin_demand() {
+    let directory = TempDir::new().unwrap();
+    let runtime_scope = scope(&directory);
+    let path = runtime_scope.runtime_dir.join("guardian-control.sock");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_server = stop.clone();
+    let served_scope = runtime_scope.clone();
+    let server = std::thread::spawn(move || {
+        yi_agent_supervisors::lifecycle::guardian::serve_with_daemon(
+            served_scope,
+            artifact(),
+            move || stop_for_server.load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::Arc::new(yi_agent_supervisors::lifecycle::preview::NoCoordinator),
+            // No daemon program: this test is about the control channel, and a real
+            // daemon would only add a process to clean up.
+            None,
+        )
+    });
+
+    let wait_until = std::time::Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < wait_until,
+            "the guardian never bound its control socket"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let deadline = Deadline::after(Duration::from_secs(5));
+    let lease = yi_agent_lifecycle::client::FrontendLease::register(
+        &path,
+        "app-run-1".to_string(),
+        ClientKind::App,
+        LeaseMode::Business,
+        &deadline,
+    )
+    .expect("a serving guardian must grant a business lease");
+
+    let (wanted, changed) = lease
+        .acquire_plugin_demand("demo", &deadline)
+        .expect("the production guardian must accept demand instead of calling it unsupported");
+    assert!(wanted, "the acquiring client wants it");
+    assert!(changed, "the first acquire changes the answer");
+
+    let (wanted, changed) = lease
+        .release_plugin_demand("demo", &deadline)
+        .expect("releasing demand is answered the same way");
+    assert!(!wanted, "the last holder leaving means nobody wants it");
+    assert!(changed, "this client did hold it");
+
+    drop(lease);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Unblock the accept loop with one more connection attempt.
+    let _ = std::os::unix::net::UnixStream::connect(&path);
+    server.join().unwrap().unwrap();
+}

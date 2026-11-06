@@ -848,6 +848,15 @@ where
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
                             ensure_daemon: std::sync::Arc::clone(&ensure_daemon),
                             plugin_gate: crate::plugin_gate::Gate::from_process_environment(),
+                            // Read per request, like the shell authorization above:
+                            // `initialize` may arrive after this connection was
+                            // registered, and a cached value would tell the install
+                            // path "not managed" for a session the shell owns.
+                            managed_session: shell_authorizations
+                                .lock()
+                                .await
+                                .get(&client)
+                                .is_some(),
                             fatal_tx: fatal_tx.clone(),
                         });
                         let req = req.clone();

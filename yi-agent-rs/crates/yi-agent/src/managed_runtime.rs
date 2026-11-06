@@ -227,6 +227,8 @@ fn read_required_lifeline_hello(
 fn pump_lifeline_authority(
     lifeline: std::os::fd::OwnedFd,
     coordinator: std::sync::Arc<yi_agent_store::runtime::RuntimeCoordinator>,
+    demand: std::sync::Arc<yi_agent_runtime::supervise::WantedPlugins>,
+    generation: String,
 ) {
     use std::os::fd::{AsRawFd, FromRawFd};
     // SAFETY: this thread is the sole owner of `lifeline` now, and the stream takes
@@ -234,9 +236,23 @@ fn pump_lifeline_authority(
     let mut stream = std::mem::ManuallyDrop::new(unsafe {
         std::os::unix::net::UnixStream::from_raw_fd(lifeline.as_raw_fd())
     });
+    let mut sequence = 0u64;
     loop {
         match yi_agent_lifecycle::codec::read_frame(&mut &mut *stream) {
             Ok(frame) => {
+                // Two frame types share this channel, and they must not be confused:
+                // authority decides what a client may do, demand decides what the
+                // machine runs. `AuthorizationUpdate` is externally tagged, so a
+                // snapshot matches no variant and falls through to the second
+                // attempt; the reverse fails on required fields. Neither direction
+                // guesses at the other's meaning.
+                if let Ok(snapshot) = yi_agent_lifecycle::codec::decode::<
+                    yi_agent_lifecycle::authorization::DemandSnapshot,
+                >(&frame)
+                {
+                    apply_demand_snapshot(&snapshot, &generation, &demand, &mut sequence);
+                    continue;
+                }
                 match yi_agent_lifecycle::codec::decode::<
                     yi_agent_lifecycle::authorization::AuthorizationUpdate,
                 >(&frame)
@@ -261,6 +277,39 @@ fn pump_lifeline_authority(
             }
         }
     }
+}
+
+/// Applies one demand snapshot, refusing the ones that describe another world.
+///
+/// Two checks, both load-bearing. A snapshot for a different generation was made by
+/// a guardian that is not this daemon's, so its plugin list says nothing about this
+/// process. A snapshot at or below the last applied sequence is older than what is
+/// already in force; applying it would resurrect a demand a later snapshot
+/// withdrew, which reads as "the plugin came back by itself".
+fn apply_demand_snapshot(
+    snapshot: &yi_agent_lifecycle::authorization::DemandSnapshot,
+    generation: &str,
+    demand: &yi_agent_runtime::supervise::WantedPlugins,
+    last_sequence: &mut u64,
+) {
+    if snapshot.daemon_instance_id != generation {
+        tracing::warn!(
+            snapshot = %snapshot.daemon_instance_id,
+            generation,
+            "ignored a demand snapshot from another daemon generation"
+        );
+        return;
+    }
+    if snapshot.sequence <= *last_sequence {
+        tracing::warn!(
+            snapshot = snapshot.sequence,
+            applied = *last_sequence,
+            "ignored a demand snapshot that is not newer than the applied one"
+        );
+        return;
+    }
+    *last_sequence = snapshot.sequence;
+    demand.replace(snapshot.plugins.iter().cloned());
 }
 
 /// Serves one runtime's business daemon under its guardian.
@@ -383,22 +432,37 @@ pub fn run_managed_daemon(
     // exists, so a binding frame has somewhere to land. Until the daemon stops, this
     // loop also *is* the death monitor -- it returns when the guardian closes the
     // channel, which is the signal that nothing supervises this process any more.
-    if let Some(lifeline) = lifeline {
-        let coordinator = std::sync::Arc::clone(daemon.coordinator());
-        std::thread::Builder::new()
-            .name("lifeline-authority".to_string())
-            .spawn(move || pump_lifeline_authority(lifeline, coordinator))
-            .map_err(|error| anyhow::anyhow!("could not watch the guardian lifeline: {error}"))?;
-    }
     // The business daemon supervises its own plugin children -- that is not handed
     // to the guardian, which knows process groups but not plugin manifests. The
     // second argument is the *runtime directory*: the route table is partitioned by
     // it, and passing the socket path would publish every route into a partition
     // nobody reads.
-    let _supervisor = yi_agent_runtime::supervise::serve(&invocation.workdir, &runtime_dir);
-    daemon
+    //
+    // This is the *managed* entry, so plugins run only while a client wants them.
+    // A daemon that supervised from configuration alone would start every enabled
+    // plugin at launch -- before the first client could possibly ask for one -- and
+    // the runtime would still carry the background load it was introduced to remove.
+    let demand = std::sync::Arc::new(yi_agent_runtime::supervise::WantedPlugins::new());
+    let supervisor = yi_agent_runtime::supervise::serve_managed(
+        &invocation.workdir,
+        &runtime_dir,
+        std::sync::Arc::clone(&demand),
+    );
+    if let Some(lifeline) = lifeline {
+        let coordinator = std::sync::Arc::clone(daemon.coordinator());
+        let generation = hello.daemon_instance_id.clone();
+        std::thread::Builder::new()
+            .name("lifeline-authority".to_string())
+            .spawn(move || pump_lifeline_authority(lifeline, coordinator, demand, generation))
+            .map_err(|error| anyhow::anyhow!("could not watch the guardian lifeline: {error}"))?;
+    }
+    let waited = daemon
         .wait()
-        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"))
+        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"));
+    // Explicit, so the plugin children are stopped before this function reports the
+    // daemon gone; `Drop` would do it too, but only after the error value was built.
+    drop(supervisor);
+    waited
 }
 
 #[cfg(test)]
@@ -419,10 +483,21 @@ mod tests {
             .split("pub fn run_managed_daemon")
             .nth(1)
             .expect("the managed daemon entry point must exist");
-        let call = body
-            .lines()
-            .find(|line| line.contains("supervise::serve("))
-            .expect("the managed daemon must supervise plugin children");
+        // The *managed* entry point, not the plain one: a daemon that supervised from
+        // configuration alone would start every enabled plugin at launch, before any
+        // client could ask for one. Matching on `supervise::serve(` would have gone on
+        // passing after the switch to managed mode, checking a call site that no
+        // longer carries the behaviour.
+        // The whole call, not one line: the arguments are broken across lines by the
+        // formatter, and a single-line check would silently assert on a prefix.
+        let start = body
+            .find("supervise::serve_managed(")
+            .expect("the managed daemon must supervise plugin children from live demand");
+        let call = &body[start
+            ..body[start..]
+                .find(");")
+                .map(|end| start + end)
+                .expect("the supervise call must be terminated")];
         assert!(
             call.contains("&runtime_dir"),
             "plugin routes are partitioned by runtime directory: {call}"
@@ -431,6 +506,76 @@ mod tests {
             !call.contains("socket"),
             "passing the socket path partitions routes where nothing reads them: {call}"
         );
+    }
+
+    /// A snapshot from another generation describes a world this daemon is not in.
+    #[test]
+    fn a_demand_snapshot_from_another_generation_is_ignored() {
+        let demand = yi_agent_runtime::supervise::WantedPlugins::new();
+        let mut sequence = 0;
+        apply_demand_snapshot(
+            &snapshot("daemon-other", 7, &["demo"]),
+            "daemon-mine",
+            &demand,
+            &mut sequence,
+        );
+        assert!(
+            demand.snapshot().is_empty(),
+            "another generation's plugins must not start here"
+        );
+        assert_eq!(
+            sequence, 0,
+            "an ignored snapshot must not advance the sequence"
+        );
+    }
+
+    /// An old snapshot must not resurrect demand a newer one already withdrew.
+    #[test]
+    fn a_demand_snapshot_that_is_not_newer_is_ignored() {
+        let demand = yi_agent_runtime::supervise::WantedPlugins::new();
+        let mut sequence = 0;
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 5, &["demo"]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert_eq!(demand.snapshot(), vec!["demo".to_string()]);
+
+        // Same sequence, different content: older than what is in force.
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 5, &["other"]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert_eq!(
+            demand.snapshot(),
+            vec!["demo".to_string()],
+            "a replay must not change the answer"
+        );
+
+        // A genuinely newer one replaces the whole set, including removals.
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 6, &[]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert!(demand.snapshot().is_empty(), "newer wins, including empty");
+        assert_eq!(sequence, 6);
+    }
+
+    fn snapshot(
+        generation: &str,
+        sequence: u64,
+        plugins: &[&str],
+    ) -> yi_agent_lifecycle::authorization::DemandSnapshot {
+        yi_agent_lifecycle::authorization::DemandSnapshot {
+            daemon_instance_id: generation.to_string(),
+            sequence,
+            plugins: plugins.iter().map(|plugin| plugin.to_string()).collect(),
+        }
     }
 
     /// Runs this test binary again in a child, invoking `probe` as the only test.

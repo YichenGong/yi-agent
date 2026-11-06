@@ -386,6 +386,28 @@ pub enum ControlRequest {
     OpenManagedChannel {
         grant: ClientGrant,
     },
+    /// Declares that this client is waiting on a plugin service.
+    ///
+    /// Demand is not a lease: it does not expire, renew, or authorise anything, and
+    /// it cannot keep a runtime alive. It exists so a shared plugin service runs
+    /// while somebody wants it and stops when the last of them leaves -- which is
+    /// the difference between "enabled in configuration" and "needed right now".
+    ///
+    /// `grant` makes it owner-bound: the owner of the demand is the live lease, not
+    /// a name the caller chose, so a released client cannot add demand it could
+    /// never remove.
+    AcquirePluginDemand {
+        grant: ClientGrant,
+        plugin: String,
+    },
+    /// Says this client is done with a plugin service.
+    ///
+    /// The service stops only after the last holder releases; an unbalanced release
+    /// from one client must not stop a service another is using.
+    ReleasePluginDemand {
+        grant: ClientGrant,
+        plugin: String,
+    },
     /// Read-only status: identity, whole-runtime counts, one page of clients, and
     /// any switch in flight.
     ///
@@ -525,6 +547,19 @@ pub enum ControlResponse {
     /// every reply would otherwise be sized for the biggest one. The frame is
     /// encoded and dropped immediately, so one indirection costs nothing.
     Status(Box<RuntimeStatusSnapshot>),
+    /// The answer to a plugin demand request: who still wants the plugin, and
+    /// whether this call changed that.
+    ///
+    /// `wanted` is the whole set after the change rather than a delta: a client that
+    /// reconnects has no way to apply a delta it never saw, and "nobody wants it"
+    /// must be distinguishable from "the answer was lost".
+    PluginDemand {
+        plugin: String,
+        wanted: bool,
+        /// Whether this call started or stopped wanting it, so a retry is visibly a
+        /// retry instead of looking like new demand.
+        changed: bool,
+    },
     /// The answer to [`ControlRequest::AuthorizeRoot`]: authority for this client to
     /// bind, and nothing else. It cannot register, renew, or act for another client.
     RootAuthorized(RootAuthorization),
