@@ -394,6 +394,7 @@ export function ChatView({
   threadId = null,
   call,
   structuralVersion = 0,
+  textVersion = 0,
   query = "",
   scrollerRef,
   captureViewRef,
@@ -421,6 +422,18 @@ export function ChatView({
    * append skips it entirely; a `key` would remount it and wipe child state.
    */
   structuralVersion?: number;
+  /**
+   * Bumped by `Session` when **visible text grows in place** (a streamed delta on
+   * an agent message, or reasoning text on the open CoT block).
+   *
+   * 跟随贴底需要「用户看得见的东西变长了」这个信号，而它**不能**从尾部项的
+   * 文本推导：服务端会在仍在流式的回答之后插入 CoT 块 / 工具卡（`translate.rs`
+   * 的 `ThinkingBlock` / `ToolCall` 两条臂），此时回答被顶到 `length - 2`，
+   * 「尾部文本」恒为空，effect 不再重跑，视口就冻在原地——新内容全落在可视区
+   * 下方，切走再切回（重挂载强制贴底）才又出现。传 `0` 表示「不跟踪纯文本」，
+   * 旁支（服务端只读快照）用这个值。
+   */
+  textVersion?: number;
   /** 搜索关键词（已防抖）。空串表示未在搜索，不产生任何 mark。 */
   query?: string;
   /**
@@ -759,7 +772,17 @@ export function ChatView({
     if (firstRun || sentByUser || newError) scrollToBottom();
     else if (threadChanged) scrollToBottom();
     else followIfAtBottom();
-  }, [items.length, lastText, error, threadId, anchor, syncing, scrollToBottom, followIfAtBottom]);
+  }, [
+    items.length,
+    lastText,
+    textVersion,
+    error,
+    threadId,
+    anchor,
+    syncing,
+    scrollToBottom,
+    followIfAtBottom,
+  ]);
 
   return (
     <div

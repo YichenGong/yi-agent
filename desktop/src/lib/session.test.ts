@@ -1238,6 +1238,91 @@ describe("Session.adoptEpoch", () => {
   });
 });
 
+describe("Session textVersion", () => {
+  it("starts at zero and resets to zero", () => {
+    const s = new Session();
+    expect(s.textVersion).toBe(0);
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "x" } });
+    expect(s.textVersion).toBeGreaterThan(0);
+    s.reset();
+    expect(s.textVersion).toBe(0);
+  });
+
+  it("counts a delta appended to the trailing reply", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    const before = s.textVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "x" } });
+    // 尾部正文的就地追加不改变结构，但它**必须**让「跟随内容增长」的宿主知道
+    // 可见文本变了：仅靠 `structuralVersion` 与尾部文本是覆盖不到非尾部场景的。
+    expect(s.textVersion).toBeGreaterThan(before);
+  });
+
+  it("counts a delta appended to a reply that is no longer the tail", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "first " } });
+    // CoT 块落到尾部，仍在流式的回答被顶到 `length - 2`。
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "hmm", kind: "Content" },
+    });
+    const before = s.textVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "second " } });
+    expect(s.textVersion).toBeGreaterThan(before);
+  });
+
+  it("counts reasoning text growth in both a new and an open block", () => {
+    const s = new Session();
+    const before = s.textVersion;
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "first", kind: "Content" },
+    });
+    // 新建块也是「可见文本变长了」：CoT 块就长在尾部时，用户同样要看到它。
+    expect(s.textVersion).toBeGreaterThan(before);
+    const afterNew = s.textVersion;
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: " more", kind: "Content" },
+    });
+    expect(s.textVersion).toBeGreaterThan(afterNew);
+  });
+
+  it("does not move when a delta is ignored (streamed tool output)", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: {
+        thread_id: "t",
+        item: {
+          type: "toolCall",
+          id: "tc1",
+          call_id: "c1",
+          name: "bash",
+          input: {},
+          status: "running",
+        },
+      },
+    });
+    const before = s.textVersion;
+    // bash 每 4 KiB 一帧，界面不渲染工具输出增量；这类帧不能把整棵树唤起来。
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "tc1", delta: "4KiB" } });
+    expect(s.textVersion).toBe(before);
+  });
+
+});
+
 describe("Session structuralVersion", () => {
   it("does not change when streamed text is appended in place", () => {
     const s = new Session();

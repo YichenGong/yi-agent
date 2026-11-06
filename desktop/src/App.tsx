@@ -3132,6 +3132,10 @@ export default function App() {
                         // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                         call={imageCall}
                         structuralVersion={current?.session.structuralVersion ?? 0}
+                        // 纯文本增长（流式 delta / CoT 摘要）不会动结构版本，但
+                        // 跟随贴底必须知道它：回答被 CoT 块或工具卡顶到非尾部时，
+                        // 「尾部文本」信号恒为空，视口会冻住（真机可复现）。
+                        textVersion={current?.session.textVersion ?? 0}
                         query={searchQuery}
                         anchor={
                           sess.currentId
