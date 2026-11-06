@@ -2,7 +2,7 @@
 
 对应 [设计](../superpowers/specs/2026-11-05-managed-runtime-production-integration-design.md)
 §8 与 [实施 plan](../superpowers/plans/2026-11-05-managed-runtime-production-integration-impl.md)
-Task 10。
+Task 10–11。
 
 本文件只写**实际执行过的**观测。未执行的用例一律标 `UNEXECUTED` 并写明原因，
 对应功能保持未完成状态——不把"计划要测"写成"已经通过"。
@@ -11,6 +11,9 @@ Task 10。
 - Worktree：`.worktrees/kanban/2026-11-05-managed-runtime-production-integration-design-2026-11-05-managed-runtime-production-integration-impl`
 - 平台：macOS（arm64），真实子进程 + pty，mock gateway（不调用真实 LLM）
 - 日期：2026-11-06
+- 原生 App 证据采集于隔离 bundle
+  `.artifacts/managed-integration/yi-agent-managed.app`（`com.gongyichen.desktop.managedint`），
+  从未覆盖 `/Applications/yi-agent.app`
 
 ## 1. 新增的真实进程验收套件
 
@@ -52,8 +55,11 @@ backend，也不使用测试自己 `FrontendLease::register` 冒充生产客户�
 | A13 | `a_replacement_sidecar_adopts_the_runtime_without_a_second_bringup` | 首个 sidecar prepare 拉起 runtime；换成新 secret + 新 epoch 的第二个 sidecar 再次 prepare 后：guardian `generation` 未变（未重启）、journal 中 daemon 条目仍为 1（未二次 bring-up）、两个 sidecar pid 不同（确实发生了替换）。旧 capability 拒绝由下一行的存储层用例覆盖 | PASS（进程级重用 + 换代半边） |
 | A13（旧 capability） | `a_capability_from_a_previous_epoch_is_never_accepted`、`a_generation_change_retires_the_old_capability`（`yi-agent-subagent/src/managed_binding.rs:1059`、`:968`） | 上一 epoch 铸造的 capability 不被新 store 接受；换代时旧代 capability 整体退役 | PASS（存储层） |
 | A14 | `RuntimeVersionBanner` 组：`explains that a runtime without the control surface must be updated`、`asks the user to refresh when the outcome is unknown`、`refuses to claim nothing is running when the count is incomplete`、`says the exit guarantee is not in effect for a legacy runtime and offers no restart` | unknown / 无控制面 / 影响面不完整 / legacy 四类状态的文案与可执行动作相符；unknown 时要求刷新而不是断言成功 | PASS（前端文案层） |
-| A15 | — | 最终独立 App 的红叉 / Dock / Cmd+Q —— 属 Task 11，需要打包产物 | UNEXECUTED |
-| A18（部分） | `a_stale_epoch_or_foreign_secret_is_refused_after_bootstrap` | 完成 bootstrap 后，旧 epoch 帧与他人 secret 帧都被拒绝，且拒绝后 `runtime.sqlite` 仍不存在——拒绝是副作用层面的，不只是文案 | PASS（认证半边） |
+| A15（原生打包证据） | 本节 2.4 的记录 | 隔离 bundle 真实 launch：无 `--relay`、独立 instance home、sidecar 被杀后壳存活并重拉、正式实例完全不受影响 | PASS（原生层）；红叉/Dock/Cmd+Q 的用户交互 **UNEXECUTED** |
+| A18（认证） | `a_stale_epoch_or_foreign_secret_is_refused_after_bootstrap` | 完成 bootstrap 后，旧 epoch 帧与他人 secret 帧都被拒绝，且拒绝后 `runtime.sqlite` 仍不存在——拒绝是副作用层面的，不只是文案 | PASS |
+| A18（页面伪造管理帧） | `the_frontend_cannot_write_into_the_reserved_namespace`（`desktop/src-tauri/src/bridge.rs`） | `_shell/prepare`、`_shell/bootstrap`、`_shell/rootIntent`、`_shell/replaceRoots`、`_shell/migration*` 及**将来新增**的 `_shell/*` 一律在 `write_line` 之前被拒；普通业务方法不受影响。测的是结构（拒绝发生在写入之前），不是错误文案 | PASS |
+| A18（秘密不外泄） | `the_secret_is_never_printed`、`the_bootstrap_frame_carries_the_secret_and_no_id` | `Debug` 输出不含 secret；bootstrap 帧带 secret 且**不带 id**（不构成可被页面应答的请求） | PASS |
+| A18（非协议帧） | `garbage_is_dropped` | 非 JSON-RPC 形状的帧被归为 `Garbage` 丢弃并记录，绝不 panic，也不被当成响应 | PASS |
 | A17 | `two_roots_in_one_project_stay_distinct`(`:706`)、`a_project_path_is_not_a_root_id`(`:740`)、`a_scope_update_preserves_the_other_scope`(`:764`)、`revoking_one_conversation_keeps_its_sibling`(`:1103`)、`a_conversation_finds_only_its_own_capability`(`:1127`) | 同项目两个会话得到不同 root/capability；项目路径不能当 root id；一个会话的撤销不影响兄弟会话；跨会话解析不到别人的 capability | PASS（授权存储层） |
 | A17（live owner / recovery） | `foreground_root_lifecycle_a_managed_runtime_advertises_the_contract`、`foreground_root_lifecycle_recovery_requests_are_not_silently_successful` | recovery 请求对未持有该 root 的客户端返回拒绝，而不是"没有这个操作"的假安全态 | PASS |
 | A19 | `the_launcher_names_the_project_scope_and_instance_explicitly`、`a_real_child_reports_the_identity_the_launcher_declared`（`--test runtime_scope`）、`a_guardian_without_a_named_project_has_no_fallback` | launcher 显式命名 canonical project/scope/instance；真实子进程 cwd 是 runtime 目录仍报出被声明的身份；无名的 guardian 没有 fallback | PASS |
@@ -100,6 +106,64 @@ cargo test -p yi-agent-subagent
 这类固定 sleep 是"在快机器上永远绿、在慢机器上随机红"的典型，改成等真实事实才
 是这条断言该有的形状。
 
+同一类问题随后又出现在 `the_tui_entry_point_is_a_managed_frontend`：它在
+`await_runtime_attached` 返回（控制通道开始应答）后再固定 `sleep(500ms)` 才断言八段
+全部走完。控制通道应答是 **runtime** 的事件，`admit_turn` 是 **本前端**最后一段，
+负载高时会晚于这 500ms 写入，于是断言拿到 7 段。复查时再读一次 trace，八段齐全，
+证明产品没有漏段，是测试在猜时长。
+
+现已改为等待事实本身（`af94cce9`）：
+
+- 轮询 trace 直到八段齐全；
+- 观察者写出 `refused:<stage>` 时**立刻**失败并带上该拒绝，而不是耗完启动预算只报
+  "少一段"；
+- 失败信息同时附上 trace 与屏幕文本。
+
+这里要特别记下一条被否掉的改法：曾按 `main.rs` 顶部注释以为 `admit_turn` 是"用户
+输入第一轮时才写入"，于是让测试先输入一轮再断言。实际 `admit()` 在 TUI 会话建立时
+就调用（`yi-agent-rs/crates/yi-agent/src/main.rs:1763`），trace 里启动期即有
+`admit_turn`，该改法属于基于注释的误判，已撤回。
+
+### 2.3 全量门禁在本机的实际结论
+
+```sh
+cd yi-agent-rs && just ci
+# CI passed（16 道门禁全过）
+
+cargo nextest 全量（just ci 的 test 关）：
+# Summary [77.558s] 5813 tests run: 5813 passed, 40 skipped
+```
+
+前两次全量 nextest 各红 1 条，但都在本文件之外、且都不是产品缺陷：
+
+| 失败 | 现象 | 判定依据 |
+|---|---|---|
+| `yi-agent-app-server ws::tests::a_revoked_device_is_disconnected_and_its_token_invalidated` | `initialize` 等待期 `Protocol(ResetWithoutClosingHandshake)`，0.029s | 同 crate 的 ci profile 全跑连做两轮 1484/1484 全绿；`ws::` 过滤 12/12 全绿；最终全量 5813/5813 绿 |
+| `the_tui_entry_point_is_a_managed_frontend` | 8 段只到 7 段 | 见 2.2，测试自身固定 sleep，已如实修复 |
+
+`audit` 关出现 `couldn't check if the package is yanked: registry: request could not be
+completed in the allotted timeframe` 属 `scripts/audit-deps.sh` 设计好的网络降级路径
+（该脚本明确区分"网络失败"与"真漏洞"，只有后者才红）；`chacha20 0.10.1 yanked` 在
+`yi-agent-rs/.cargo/audit.toml` 里有记录且按 cargo audit 语义只是 warning。**结论是
+通过，而不是把红绕过。**
+
+桌面侧与其它 crate（Task 11 Step 1 完整清单）：
+
+```sh
+cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all -- --check   # clean
+cargo test --manifest-path desktop/src-tauri/Cargo.toml                  # 全部 0 failed
+cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib            # 281 passed
+cd desktop && npx tsc --noEmit                                           # exit 0
+cd desktop && npx vitest run        # Test Files 166 passed / Tests 2300 passed
+cd desktop && npm run build         # built in 623ms（pre-existing chunk-size warning）
+cd yi-agent-rs && cargo test -p yi-agent-supervisors --test runtime_migration
+                                    # 51 passed, 0 failed
+```
+
+只用 `--lib` 跑 desktop 时 281 条全绿；全量 `cargo test` 因含集成测试二进制，
+逐个 `test result` 也都是 `0 failed`。
+
+
 > 同一轮 nextest 全量里，`yi-agent-supervisors --test supervisor` 的 3 条
 > （`a_childs_exit_is_recorded_once_not_once_per_tick`、
 > `a_crashed_child_is_restarted_after_the_backoff`、
@@ -114,6 +178,75 @@ cargo test -p yi-agent-subagent
 >   进程边界，全组跑仍有测试超时，别再往这里加锁"。
 >
 > 这是既有的负载敏感问题，登记在案，不在本任务范围内修改。
+
+### 2.4 Task 11：隔离打包 App 的原生证据（A15）
+
+打包在 worktree 内完成，**没有**覆盖 `/Applications/yi-agent.app` 的二进制，也没有迁移
+用户正式 runtime（正式实例全程 `desktop` / `app-server --relay session=fe42addbfed2...`
+/ `daemon serve` 三个进程 pid 未变）。
+
+产物与身份：
+
+```sh
+cd desktop
+npm run sidecar:release
+# sidecar -> src-tauri/binaries/yi-agent-aarch64-apple-darwin
+# build id -> 98a0d5a300ca516f42b21e482fb1d27a
+npm run build            # dist/ 先于 tauri build，避免产出 dev 版连 localhost:1420
+npx tauri build --bundles app
+# 产物：desktop/src-tauri/target/release/bundle/macos/yi-agent.app
+
+cp -R .../yi-agent.app .artifacts/managed-integration/yi-agent-managed.app
+# CFBundleIdentifier -> com.gongyichen.desktop.managedint（与正式版不同，避免互踢）
+# CFBundleName/DisplayName -> yi-agent-managedint
+# LSEnvironment:YI_AGENT_HOME -> /Users/<user>/.yi-agent-managed-int-verify
+
+bash desktop/scripts/finalize-runtime-bundle.sh .artifacts/managed-integration/yi-agent-managed.app
+# finalized ... (98a0d5a300ca516f42b21e482fb1d27a)
+codesign -v .artifacts/managed-integration/yi-agent-managed.app   # exit 0
+shasum -a 256 Contents/MacOS/yi-agent == Resources/runtime-sidecar.json 的 sha256
+# 991a7069e534f98f522ee7de6c47bfa678486924df66db644f69c47021e14d5b（两者一致）
+```
+
+`finalize-runtime-bundle.sh` 按 sidecar → 清单 → 外层 的顺序执行，全程未使用
+`codesign --deep`。
+
+真实 launch 结果（直接跑 `Contents/MacOS/desktop`）：
+
+| 检查 | 结果 | 证据 |
+|---|---|---|
+| 独立 instance home | PASS | `~/.yi-agent-managed-int-verify/.yi-agent/` 下生成 `trace/`、`side-conversations/`、`instance-migration.lock` |
+| 不与正式实例共用 relay 会话 | PASS | 隔离实例的 sidecar **完全没有** `--relay` 参数；正式实例仍是 `session=fe42addbfed2...` |
+| 正式实例不受影响 | PASS | 两次隔离 launch 期间，`/Applications/yi-agent.app` 的 desktop/app-server/daemon 三进程 pid 未变 |
+| sidecar 被杀后壳存活并重拉 | PASS | `kill -9` 隔离实例的 `app-server` 后，`desktop` 仍在，并出现新的 `yi-agent app-server --listen stdio://` |
+| quit 事件后进程干净退出 | PASS | Apple Event `quit` 后 `desktop` 与 sidecar 全部消失，无残留 |
+
+**踩到的坑（值得记下，会重复发生）：**
+
+1. 直接 `Contents/MacOS/desktop` 启动时 `Info.plist` 的 `LSEnvironment` **不会**生效，
+   于是 `YI_AGENT_HOME` 没设上，实例读到了真实 `~/.yi-agent`，还拿到了与正式实例
+   **相同**的 relay session（同一 session 双连接）。发现后立即 kill，未造成写入。
+   结论：命令行验收必须显式 `YI_AGENT_HOME=... desktop`，`LSEnvironment` 只有在
+   LaunchServices（`open -a`/Finder）启动时才展开。
+2. `bridge::spawn_local_once` 会把 sidecar 的 cwd 设成 `YI_AGENT_HOME`；该目录**不存在**
+   时 spawn 报 `No such file or directory (os error 2)`，错误信息里不带路径，很容易被
+   误读成 sidecar 缺失。先 `mkdir -p` 再启动。
+3. `system_profiler`/`AX` 权限 `AXIsProcessTrusted=false`（AX error -25211），
+   `osascript ... keystroke` 也被拒（error 1002），`CGEvent.postToPid` 投递成功但合成
+   键盘事件不被 Wry 视图接受。
+
+**UNEXECUTED（没有伪造，也没有用单测结果代替）：**
+
+- 红叉点击后「隐藏而非退出、不释放租约」的真实 UI 操作。产品代码
+  `runtime_lifecycle.rs:2351` 明确写了 `CloseRequested is deliberately absent: the red
+  button hides the window, and hiding is not quitting`，这与「Cmd+W 无任何反应」的观测
+  一致，但**点击红叉本身**未执行。
+- Dock 图标点击恢复窗口。
+- 真实 Cmd+Q 在「有项目、有在途 work」时的 drain 行为（本环境无辅助功能权限，无法设置
+  项目；未开项目时 quit 无工作可回收，不能作为 A15 的正面证据）。
+- A05 的「准备中 Cmd+Q」真实 App 场景同上。
+
+这些项依赖一次有 GUI 权限的人工操作，因此 desktop 对应 feature 保持 `[ ]`。
 
 ## 3. 生产调用点审计
 
