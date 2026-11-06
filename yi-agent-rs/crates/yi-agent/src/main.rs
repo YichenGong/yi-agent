@@ -2815,13 +2815,36 @@ fn run_headless(
             // `run` is one invocation, so the guardian is asked here once rather
             // than per turn. A refusal is recorded verbatim and never downgraded to
             // the embedded resume secret.
-            let runtime_dir = runtime_directory_for(&runtime.attached_root.workspace.path);
-            if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
-                &runtime_dir,
-                yi_agent_lifecycle::types::ClientKind::Tui,
-                crate::frontend_lease::new_client_run_id("run-foreground"),
-            ) && let Ok(authority) =
-                host.authority(&root, &format!("run-delegation:{}", std::process::id()))
+            //
+            // The host must act *as this frontend*, never register a second one.
+            // A `:Tui` lease named `run-foreground` was created here and released
+            // by nobody: it lives for a full expiry window after `run` exits, so
+            // the guardian still counted a business client and never drained -- the
+            // daemon outlived the last frontend by design violation. Reusing the
+            // invocation's lease keeps one process equal to one client, which is
+            // exactly what "the last frontend leaving stops the runtime" depends on.
+            let foreground_host = runtime
+                .frontend_lease
+                .as_ref()
+                .map(|lease| {
+                    yi_agent_subagent::foreground::ForegroundHost::from_lease(lease.shared())
+                })
+                .or_else(|| {
+                    // Embedded mode has no leased frontend to lend; the guardian
+                    // is not there, so `connect` answers `None` and nothing is
+                    // registered.
+                    let runtime_dir = runtime_directory_for(&runtime.attached_root.workspace.path);
+                    yi_agent_subagent::foreground::ForegroundHost::connect(
+                        &runtime_dir,
+                        yi_agent_lifecycle::types::ClientKind::Tui,
+                        crate::frontend_lease::new_client_run_id("run-foreground"),
+                    )
+                    .ok()
+                    .flatten()
+                });
+            if let Some(host) = foreground_host
+                && let Ok(authority) =
+                    host.authority(&root, &format!("run-delegation:{}", std::process::id()))
             {
                 driver.set_authority(authority);
             }
