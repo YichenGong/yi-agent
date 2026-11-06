@@ -80,6 +80,9 @@ class Server:
         self.p.stdin.flush()
         first_frame = None
         items = 0
+        # Only `items/completed` frames: the reply also carries `thread/started`
+        # and `token/usage` notifications, so counting every line overstates the
+        # replay frame count (observed 26 chunks reported as 29).
         frames = 0
         while True:
             line = self.p.stdout.readline()
@@ -89,8 +92,8 @@ class Server:
                 value = json.loads(line)
             except ValueError:
                 continue
-            frames += 1
             if value.get("method") == "items/completed":
+                frames += 1
                 items += len(value["params"]["items"])
                 if first_frame is None:
                     first_frame = time.perf_counter() - t0

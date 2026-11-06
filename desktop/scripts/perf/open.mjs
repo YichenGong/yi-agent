@@ -5,9 +5,9 @@
  * session logs). This file measures what the desktop transcript costs after the
  * items have arrived — which the design shows is the dominant half:
  *
- *     1361 markdown items, full render        768 ms
- *     same, paged 200/frame (real replay)    1506 ms
- *     only the most recent 60                   54 ms
+ *     3251 items, full render, one shot       773 ms
+ *     same, real chunked replay (26 frames)   822 ms
+ *     only the most recent 60                  21 ms
  *
  * It consumes the **real** production rendering stack (`react-markdown` +
  * `remark-gfm` + `rehype-highlight` from `desktop/node_modules`) and a **real**
@@ -229,24 +229,56 @@ async function renderOnce(items, limit, label) {
 }
 
 /**
- * Paged replay: the *actual* cold-open path today. The server sends history as
- * `items/completed` frames of 200 items, and each frame re-reconciles a longer
- * list.
+ * Mirrors the server's `chunk_items_for_replay`
+ * (yi-agent-rs/crates/yi-agent-app-server/src/server/turn/replay.rs):
+ * a frame closes when adding the next item would exceed 256 KiB **or** the frame
+ * already holds 200 items, whichever comes first. Chunking by count alone is
+ * wrong here — tool-call JSON is large, so real logs get ~112 items/frame.
  */
-async function renderPaged(items, chunk, label) {
+const REPLAY_CHUNK_BYTES = 256 * 1024;
+const REPLAY_CHUNK_MAX_ITEMS = 200;
+
+function chunkItemsForReplay(items) {
+  const chunks = [];
+  let cur = [];
+  let curBytes = 0;
+  for (const item of items) {
+    const approx = Buffer.byteLength(JSON.stringify(item));
+    if (cur.length > 0 && curBytes + approx > REPLAY_CHUNK_BYTES) {
+      chunks.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push(item);
+    curBytes += approx;
+    if (cur.length >= REPLAY_CHUNK_MAX_ITEMS) {
+      chunks.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+  }
+  if (cur.length > 0) chunks.push(cur);
+  return chunks;
+}
+
+/**
+ * Paged replay: the *actual* cold-open path today. The server sends history as
+ * `items/completed` frames (see `chunkItemsForReplay`), and each frame
+ * re-reconciles a longer list.
+ */
+async function renderPaged(items, chunks, label) {
   const el = document.createElement("div");
   document.body.appendChild(el);
   const root = createRoot(el);
   const t0 = process.hrtime.bigint();
   let frames = 0;
-  for (let n = chunk; n < items.length; n += chunk) {
+  let n = 0;
+  for (const chunk of chunks) {
+    n += chunk.length;
     root.render(h(View, { items: items.slice(0, n), limit: null }));
     await new Promise((r) => setTimeout(r, 0));
     frames += 1;
   }
-  root.render(h(View, { items, limit: null }));
-  await new Promise((r) => setTimeout(r, 0));
-  frames += 1;
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   console.log(
     `${label.padEnd(46)} ${ms.toFixed(0).padStart(6)} ms   ` +
@@ -280,7 +312,7 @@ console.log(
 console.log("");
 
 await renderOnce(items, null, "today: full render, one shot");
-await renderPaged(items, 200, "today: paged replay 200 items/frame");
+await renderPaged(items, chunkItemsForReplay(items), "today: real paged replay (byte-or-count chunks)");
 console.log("");
 await renderOnce(items, 60, "proposed: window = last 60");
 await renderOnce(items, 400, "proposed: window = last 400 (unload cap)");
