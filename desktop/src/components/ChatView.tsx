@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
@@ -8,6 +8,9 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { itemText } from "../lib/itemText";
+import { createHeightBook } from "../lib/heightBook";
+import { useTranscriptWindow } from "../hooks/useTranscriptWindow";
+import type { VisibleRange } from "../lib/transcriptWindow";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
@@ -296,18 +299,18 @@ function LiveTail({
 }
 
 /**
- * The settled history above the streaming tail.
+ * The mounted slice of settled history, `[start, end)`, above the streaming tail.
  *
  * Its whole purpose is to *not* re-render while only the tail grows. It bails
- * out whenever `items`, `count` and `structuralVersion` are all unchanged; a
- * pure text append touches none of them, so a long session performs no work
- * proportional to its length per delta. (`items` is mutated in place, so the
- * array identity never changes and this memo is what makes the prefix a frozen
- * subtree rather than a re-rendered one.)
+ * out whenever `items`, the window bounds and `structuralVersion` are all
+ * unchanged; a pure text append touches none of them, so a long session performs
+ * no work proportional to its length per delta. (`items` is mutated in place, so
+ * the array identity never changes and this memo is what makes the window a
+ * frozen subtree rather than a re-rendered one.)
  *
- * `count` is explicit because `items` is mutated in place: its length changes
- * without the array identity changing, so the memo cannot rely on the array
- * reference alone to notice that a new item appeared.
+ * `start`/`end`/`total` are explicit because `items` is mutated in place: its
+ * length changes without the array identity changing, so the memo cannot rely on
+ * the array reference alone to notice that a new item appeared.
  *
  * `structuralVersion` is a **prop, not a `key`**: it only has to make this
  * component re-render *in place*. Keying it would remount the subtree instead
@@ -319,16 +322,23 @@ function LiveTail({
  * so only the items that actually moved re-render, whereas a remount re-parses
  * every prefix message's markdown.
  */
-const HistoryPrefix = memo(
-  function HistoryPrefix({
+const HistoryWindow = memo(
+  function HistoryWindow({
     items,
-    count,
+    total,
+    start,
+    end,
     threadId,
     call,
     query,
   }: {
     items: (Item | NoticeItem | ReasoningItem)[];
-    count: number;
+    /** `items.length`。数组原地变更，长度变而身份不变，必须单独传。 */
+    total: number;
+    /** 挂载区起点（含）。 */
+    start: number;
+    /** 逻辑终点（**排他**），可等于 `total`（此时含尾部那条）。 */
+    end: number;
     threadId: string | null;
     call: ImageReadCall;
     /**
@@ -340,9 +350,17 @@ const HistoryPrefix = memo(
     /** 搜索关键词，透传给每条消息。 */
     query: string;
   }) {
+    // `end` 是逻辑终点，**含**尾部那条；尾部恒由 `LiveTail` 单独渲染，
+    // 所以这里要 `Math.min(end, total - 1)`。漏掉这个 clamp，`end === total` 时
+    // 最后一条会被渲染两次（React key 相同，控制台直接报错）。
+    const stop = Math.min(end, total - 1);
+    const from = Math.min(start, stop);
     const out = [];
-    for (let i = 0; i < count; i += 1) {
+    for (let i = from; i < stop; i += 1) {
       const it = items[i];
+      // 窗口边界可能落在一次原地替换的中间帧上；`undefined` 直接跳过，
+      // 不要渲染出一个没有 id 的空条目。
+      if (!it) continue;
       out.push(
         <ChatItem
           key={it.id ?? i}
@@ -356,10 +374,12 @@ const HistoryPrefix = memo(
     }
     return <>{out}</>;
   },
-  // `items`/`count` unchanged + no structural change ⇒ nothing above moved.
+  // `items`/window bounds unchanged + no structural change ⇒ nothing above moved.
   (prev, next) =>
     prev.items === next.items &&
-    prev.count === next.count &&
+    prev.total === next.total &&
+    prev.start === next.start &&
+    prev.end === next.end &&
     prev.structuralVersion === next.structuralVersion &&
     prev.threadId === next.threadId &&
     prev.call === next.call &&
@@ -492,6 +512,63 @@ export function ChatView({
   // otherwise never see it move.
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
+
+  // 未挂载区的高度估算：一条会话只建一本，存活到会话结束。
+  const windowBook = useMemo(() => createHeightBook(), []);
+
+  // 测量当前视口。`elRef` 在下面才声明，但闭包只在 rAF 里执行，那时已赋值。
+  const measureVisible = useCallback((): VisibleRange | null => {
+    const el = elRef.current;
+    // 未布局（jsdom、首帧、`scrollHeight` 为 0）时返回 null：`nextWindow` 会保持
+    // 跟随且不翻页。这条守卫同时让测试能确定地断言首屏条数。
+    if (!el || el.scrollHeight === 0 || el.clientHeight === 0) return null;
+    const rows = el.querySelectorAll<HTMLElement>("[data-item-id]");
+    if (rows.length === 0) return null;
+    const viewTop = el.scrollTop;
+    const viewBottom = viewTop + el.clientHeight;
+    const firstNode = rows[0];
+    const lastNode = rows[rows.length - 1];
+    // 相对内容顶部的坐标系：减去容器自身的文档偏移，再加上 scrollTop。
+    const base = el.getBoundingClientRect().top - el.scrollTop;
+    const firstTop = firstNode.getBoundingClientRect().top - base;
+    const lastBottom = lastNode.getBoundingClientRect().bottom - base;
+    // `first`/`last` 是**挂载区相对序号**：这一层数不出前面还有多少条，
+    // `useTranscriptWindow` 会加上 `window.start` 变成绝对 index。
+    return {
+      first: 0,
+      last: rows.length - 1,
+      // **不要夹到 >=0**：`gapTopPx` 为负表示顶边已在视口上方，这是「用户在窗口
+      // 内部」的正常状态，必须与「顶边贴住视口顶（0）」区分。夹掉符号会让底部
+      // 跟随被误判成翻到顶，窗口逐帧抖动。
+      gapTopPx: firstTop - viewTop,
+      gapBottomPx: viewBottom - lastBottom,
+    };
+  }, []);
+
+  // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走
+  // 命令式的一次性 `requestFocus()`。传 `focus={ref.current}` 属于渲染期读可变
+  // 值，且值恒为 null，等于给 hook 加一条走不通的分支。
+  // `requestFocus` 由 Task 10（锚点恢复）与 Task 11（搜索跳转）消费；现在不取，
+  // 否则 `noUnusedLocals` 会报错。
+  const { window: win, nudge } = useTranscriptWindow({
+    itemCount: items.length,
+    measure: measureVisible,
+    book: windowBook,
+  });
+
+  // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
+  // 没有任何 React 依赖会因此变化——不在这里接上滚动事件，窗口会永远停在首屏那
+  // 60 条，用户滚到顶也加载不出更早的历史。`nudge` 内部按帧去重，可逐帧调用。
+  //
+  // 与 `useStickToBottom` 各挂一个 `scroll` 监听：职责不同（一个管贴底意图、一个
+  // 管窗口翻页），都走 passive，开销可忽略。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const onScroll = () => nudge();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [nudge]);
 
   // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -773,6 +850,16 @@ export function ChatView({
     followIfAtBottom,
   ]);
 
+  // 未挂载区间的高度估算。`win.end` 是**排他**终点且含尾部那条，而
+  // `HistoryWindow` 只渲染到 `stop = min(end, total - 1)`（尾部恒由 `LiveTail`
+  // 渲染）。所以尾部下方未挂载的只有 `[stop, total - 1)` 这一段：
+  //   - `end === total`（跟随中）-> `stop === total - 1` -> 下方为 0
+  //   - `end < total`          -> `stop === end`         -> 下方 `total - 1 - end` 条
+  const medianH = windowBook.median();
+  const spacerTop = win.start * medianH;
+  const windowStop = Math.min(win.end, Math.max(items.length - 1, 0));
+  const spacerBottom = Math.max(0, items.length - 1 - windowStop) * medianH;
+
   return (
     <div
       ref={setScroller}
@@ -796,9 +883,13 @@ export function ChatView({
           <TranscriptPlaceholder kind="loading" />
         )
       ) : null}
-      <HistoryPrefix
+      {/* 未挂载历史的占位高度：滚动条比例因此真实，滚动仍由浏览器原生完成。 */}
+      <div data-spacer="top" aria-hidden="true" style={{ height: spacerTop }} />
+      <HistoryWindow
         items={items}
-        count={items.length - 1}
+        total={items.length}
+        start={win.start}
+        end={win.end}
         structuralVersion={structuralVersion}
         threadId={threadId}
         call={effectiveCall}
@@ -813,6 +904,7 @@ export function ChatView({
           query={query}
         />
       )}
+      <div data-spacer="bottom" aria-hidden="true" style={{ height: spacerBottom }} />
       {retrying && (
         <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
           {RETRY_CAUSE_LABELS[retrying.cause]} — retrying {retrying.attempt}/

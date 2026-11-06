@@ -451,7 +451,10 @@ describe("ChatView frozen prefix", () => {
 
     const { rerender } = render(<ChatView items={list} />);
     const settled = calls.text;
-    expect(settled).toBe(201); // every item rendered once on mount
+    // 窗口化之后只有首屏 60 条会挂载（`initialSize`），而不是全部 201 条。
+    // 本用例真正要钉的是「流式增量不重渲染已挂载的历史」，首屏条数随窗口策略
+    // 变化，所以这里按实际挂载数断言，避免把窗口大小写死进一条无关的用例。
+    expect(settled).toBe(60);
 
     // Stream 5 deltas *in place*, exactly like `Session.apply` does.
     for (let i = 1; i <= 5; i += 1) {
@@ -459,7 +462,7 @@ describe("ChatView frozen prefix", () => {
       rerender(<ChatView items={list} />);
     }
 
-    // Only the tail may have re-rendered. The 200 history items must not have.
+    // Only the tail may have re-rendered. The mounted history items must not have.
     expect(calls.text - settled).toBeLessThanOrEqual(5);
   });
 
@@ -1440,5 +1443,66 @@ describe("ChatView keeps reporting 'bottom' while the stream grows", () => {
 
     // 视口一行都没动，仍在底部 ⇒ 必须记成 null（贴底），而不是某条消息的锚点。
     expect(seen[seen.length - 1]).toEqual(["t1", null]);
+  });
+});
+
+describe("transcript windowing", () => {
+  /** 建 n 条 agentMessage，id 稳定。 */
+  function manyItems(n: number): Item[] {
+    return Array.from({ length: n }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+  }
+
+  function renderWith(list: Item[]) {
+    return render(
+      <ChatView
+        items={list}
+        threadId="t1"
+        structuralVersion={1}
+        query=""
+        call={() => Promise.reject(new Error("no images"))}
+      />,
+    );
+  }
+
+  it("3000 条会话冷启动只挂载 60 个 item 节点", () => {
+    const { container } = renderWith(manyItems(3000));
+    expect(container.querySelectorAll("[data-item-id]")).toHaveLength(60);
+  });
+
+  it("渲染上下的 spacer，未挂载区间不是真空", () => {
+    const { container } = renderWith(manyItems(3000));
+    const top = container.querySelector("[data-spacer='top']") as HTMLElement | null;
+    const bottom = container.querySelector("[data-spacer='bottom']") as HTMLElement | null;
+    expect(top).not.toBeNull();
+    expect(bottom).not.toBeNull();
+    // 冷启动跟随的是尾部：上方必须撑出 3000-60 条的高度，下方为 0。
+    expect(parseFloat(top!.style.height)).toBeGreaterThan(0);
+    expect(parseFloat(bottom!.style.height)).toBe(0);
+  });
+
+  it("尾部那条只渲染一次（HistoryWindow 与 LiveTail 不重复）", () => {
+    const { container } = renderWith(manyItems(3000));
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+    expect(ids[ids.length - 1]).toBe("m2999");
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("短会话（少于首屏）全挂且没有重复", () => {
+    const { container } = renderWith(manyItems(7));
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map((n) =>
+      n.getAttribute("data-item-id"),
+    );
+    expect(ids).toEqual(["m0", "m1", "m2", "m3", "m4", "m5", "m6"]);
+  });
+
+  it("空会话不崩", () => {
+    const { container } = renderWith([]);
+    expect(container.querySelectorAll("[data-item-id]")).toHaveLength(0);
   });
 });
