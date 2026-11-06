@@ -59,7 +59,7 @@ find . -name "*.rs" -prune target/.git  排除后         → 0.033 s，568 个�
 
 1. `fs/grep.rs:76` 的 `call` 是 `async fn`，内部同步调用 `grep_search`
    （`:103`），用 `WalkDir` + `std::fs::read_to_string`（`:168`、`:186`）；
-   `fs/glob.rs:53` 同理使用同步的 `glob::glob()`。**均无 `spawn_blocking`**，
+   `fs/glob.rs:73` 同理使用同步的 `glob::glob()`。**均无 `spawn_blocking`**，
    遍历期间占住 tokio worker。
 2. 两者均不跳过 `target/`、`.worktrees/`、`node_modules/`、`.git/`。
 
@@ -140,6 +140,13 @@ find . -name "*.rs" -prune target/.git  排除后         → 0.033 s，568 个�
 | `git_ignore: true` | 99% 收益来源（`target/`、`.worktrees/`、`node_modules/`） | 保留 |
 | `git_exclude: true` | 尊重 `.git/info/exclude` | 保留 |
 | `parents: true` | 与 `git_ignore` 配合读取上层规则 | 保留（默认） |
+
+**关闭 `hidden` 带来一个必须补偿的副作用**：`hidden` 是 `ignore` 唯一的点目录
+过滤机制（`walk.rs:476` 第五步），关掉后 `.git/` 也会被遍历。`ignore` 并不内建
+跳过 `.git`，只用它作为「此处是 git 仓库」的探测标记（`dir.rs:215`、`:250`）。
+本仓库 `.git` 下有 10,345 个文件、134 MB，因此必须显式加 override `!.git`
+（见 4.4）。`.` 与 `..` 不受影响：`ignore` 的遍历基于 `walkdir`，不会产出这两个
+条目。
 
 已知代价：`hidden(false)` 会让 `.env` 等敏感文件也进入搜索结果。用户已明确
 接受「搜到」，理由是搜索工具应当忠实反映目录内容；不因此增加隐式过滤。
@@ -230,11 +237,13 @@ File or directory, default root (the session working directory).
 新增 `yi-agent-tools/src/fs/walk.rs`，供 `grep` 与 `glob` 共用：
 
 ```rust
+/// What a walk is allowed to spend.
 pub(crate) struct WalkOptions {
-    pub max_depth: Option<usize>,
-    pub deadline: Option<Duration>,
+    /// 绝对截止时间点。`None` 表示不设上限（仅测试会用）。
+    pub deadline: Option<Instant>,
 }
 
+/// What a walk produced.
 pub(crate) struct WalkOutcome {
     pub paths: Vec<PathBuf>,
     pub truncated: Truncated,
@@ -246,11 +255,28 @@ pub(crate) enum Truncated {
 }
 ```
 
+不预留 `max_depth`：现状 `grep`/`glob` 都没有深度限制，`glob` 的深度由模式本身
+决定（`**` 递归、固定组件数固定）。加一个没人用的字段只会让人以为有档位可调。
+
 行为：
 
 - 内部使用 `ignore::WalkBuilder::new(base)`，配置为
   `hidden(false)`、`require_git(false)`、`git_global(false)`、
   `git_ignore(true)`、`git_exclude(true)`。
+- **必须显式排除 `.git/`**。`hidden(false)` 关掉了 `ignore` 唯一的点目录过滤
+  （`walk.rs:476` 的第五步），而 `ignore` **没有**针对 `.git` 的内建跳过：它只用
+  `.git` 作为「此处是 git 仓库」的探测标记（`dir.rs:215`、`:250`）。因此
+  不加约束时 `.git/` 会被完整遍历（本仓库 10,345 个文件）。做法是用 override
+  显式忽略：
+
+  ```rust
+  let mut overrides = OverrideBuilder::new(base)?;
+  overrides.add("!.git")?;   // override 里 `!` 表示忽略
+  builder.overrides(overrides.build()?);
+  ```
+
+  override 的优先级高于一切其它规则（`dir.rs:380-389`），因此不受 `.gitignore`
+  内容影响。`!.git` 只匹配名为 `.git` 的目录组件，不会牵连 `.github/`。
 - 只产出常规文件（`file_type().is_file()`）。
 - 遍历错误（权限、消失的目录）一律跳过，与现状 `filter_map(|e| e.ok())` 一致。
 - `deadline` 用 `Instant` 判定，检查点在每个条目迭代处；超时立即停止并置
@@ -265,10 +291,10 @@ pub(crate) enum Truncated {
   `TRUNCATION_NOTICE` 文案不变。
 - 新增 deadline 截断提示，与既有条目截断提示可同时出现，各占一行：
 
-```
-[truncated: narrow path, glob, or pattern; use files_with_matches or count]
-[scan stopped after 10s: narrow path or glob, some matches were not reached]
-```
+  ```
+  [truncated: narrow path, glob, or pattern; use files_with_matches or count]
+  [scan stopped after 10s: narrow path or glob, some matches were not reached]
+  ```
 
 - deadline 常量 `SCAN_DEADLINE = Duration::from_secs(10)`，置于 `fs/walk.rs`，
   两个工具共用。
@@ -281,8 +307,8 @@ pub(crate) enum Truncated {
 
 - `call` 内把遍历移入 `spawn_blocking`。
 - 现有实现依赖 `glob::glob(full_pattern)` 的**模式内嵌目录展开**：它把模式按
-  分隔符切成逐级组件，一层层 `read_dir` 匹配（`glob-0.3.4/src/lib.rs:236-250`、
-  `:400-440`）。改为：用 walker 遍历 `base` 下所有文件，再用 `glob::Pattern`
+  分隔符切成逐级组件，一层层 `read_dir` 匹配（`glob-0.3.4/src/lib.rs:250-252` 切分组件、
+  `:889-942` 逐层 `read_dir`）。改为：用 walker 遍历 `base` 下所有文件，再用 `glob::Pattern`
   对路径整体匹配。
 
 **语义对齐（本节是本设计最容易写错的地方，结论来自核对 `glob` 源码）：**
@@ -316,6 +342,23 @@ const MATCH: glob::MatchOptions = glob::MatchOptions {
 用 `glob::Pattern::matches_with(rel, MATCH)` 匹配「相对 `base` 的路径」。这样
 **不需要新增 `globset` 直接依赖**：`glob` 已是既有依赖，且直接用同一引擎，语义
 差异风险最小。
+
+上述常量已用一次性实验程序在 `glob 0.3.4` 上实测确认（11 条断言全通过）：
+
+```
+require_literal_separator: true
+**/Cargo.toml  vs Cargo.toml              => true    （** 零层）
+**/Cargo.toml  vs a/b/c/Cargo.toml        => true
+*.rs           vs a.rs                    => true
+*.rs           vs a/b.rs                  => false   ← 与 glob() 逐段展开一致
+src/**/*.rs    vs src/a.rs                => true
+src/**/*.rs    vs src/x/y/a.rs            => true
+*              vs .gitignore              => true    （点文件仍可命中）
+**/Cargo.toml  vs yi-agent-rs/Cargo.toml  => true
+```
+
+对照：同一组用例在 **默认** `MatchOptions` 下 `*.rs vs a/b.rs => true`，即会把
+根级 glob 的匹配范围扩大成整棵树。这正是必须显式设 `true` 的原因。
 
 `require_literal_leading_dot: false` 是保持现行为所必需的。核对
 `glob-0.3.4/src/lib.rs:963-966`：该选项为 `false` 时，`glob()` **不**过滤点
@@ -363,10 +406,31 @@ tokio = { version = "1", features = ["process", "time", "fs", "io-util", "rt"] }
   `matches_with`，语义与 `glob()` 逐段展开等价（见 4.6）。
 - `rt` 是 `spawn_blocking` 所需。workspace 已声明 `tokio = { features = ["full"] }`，
   因此不引入新版本。
-- `ignore` 的完整传递依赖（`globset`、`bstr`、`crossbeam-deque`、
-  `crossbeam-utils`、`same-file`、`regex-automata`、`walkdir`、`memchr`、
-  `aho-corasick`、`log`）已确认存在于本机 cargo 缓存，可离线编译。注意 `globset`
-  会作为 `ignore` 的传递依赖出现，但本设计不直接使用它。
+
+**版本与 lock 影响（已核对 Cargo.toml 与本地 cache）：**
+
+`ignore` 会引入 `globset`、`bstr`、`crossbeam-deque`、`memchr`、`log`、
+`regex-automata`、`same-file`、`walkdir` 等传递依赖。当前 `Cargo.lock` 中
+**没有** `ignore`、`globset`、`bstr`，因此 lock 一定会新增这三个包。
+
+选版本时的关键约束：
+
+| 包 | 约束 | 结论 |
+|---|---|---|
+| `ignore` | 0.4.23 要求 `globset >= 0.4.15`；0.4.25 要求 `>= 0.4.18` | 用 `ignore = "0.4"` 即可 |
+| `globset` | 0.4.18 要求 `regex-automata >= 0.4.0`；0.4.20 要求 `>= 0.4.18` | 解析到 0.4.18 可复用 lock 里已有的 `regex-automata 0.4.16` |
+| `bstr` | 非 optional，必然引入 | lock 新增一项 |
+
+本地 cache 同时存在 `ignore-0.4.23/0.4.25`、`globset-0.4.16/0.4.18/0.4.20`、
+`regex-automata-0.4.9/0.4.13/0.4.14/0.4.16/0.4.18`、`bstr-1.11.3/1.12.1/1.13.1`，
+**可以离线解析**。实施时若解析出 `globset 0.4.20`，会连带把 `regex-automata`
+升到 0.4.18；那也是 cache 内已有版本，可接受。
+
+**MSRV 核对**：仓库 `rust-version = "1.89"`。`ignore 0.4.23` 未声明
+`rust-version`，`globset 0.4.18` 未声明，`bstr 1.13.1` 声明 1.65，
+`crossbeam-deque 0.8.8` 声明 1.61，`regex-automata 0.4.14` 声明 1.65 ——
+均低于 1.89，`msrv-check` 不会因此失败。实施后须实际跑一次 `just msrv-check`
+确认，因为 `rust-version` 只声明不校验。
 - `glob` 依赖是否保留：`glob::Pattern` 仍在 `grep` 的 `glob` 过滤参数中使用，
   因此**保留** `glob = "0.3"`。
 - `walkdir` 依赖：`fs/grep.rs` 改造后不再直接使用；`side_read/file_tools.rs`
@@ -407,9 +471,13 @@ tokio = { version = "1", features = ["process", "time", "fs", "io-util", "rt"] }
 
 - `.gitignore` 中的目录（`target/`、`node_modules/`）被跳过。
 - 点目录（`.github/`）**不**被跳过。
+- **`.git/` 必须被跳过**：在 `.git/` 内放置一个可被 pattern 命中的文件，断言它
+  不出现在 walk 结果里。这是 `hidden(false)` 的必配约束，缺了它搜索会重新变慢
+  （本仓库 `.git` 下 10,345 个文件）。
 - 全局 gitignore 不生效（用一个临时 HOME 或显式断言行为）。
 - 非 git 仓库目录下 `git_ignore` 规则仍生效（`require_git(false)`）。
-- deadline：构造大量文件或用极短 deadline，断言返回 `Truncated::Deadline`。
+- deadline：用极短 deadline（如 1ms）配合人造大目录，断言返回
+  `Truncated::Deadline` 且 `paths` 非空（部分结果）。
 
 ### 5.4 grep
 
@@ -442,6 +510,11 @@ cd yi-agent-rs && cargo test -p yi-agent-runtime
 cd yi-agent-rs && cargo fmt --all && just ci
 ```
 
+`just ci` 里必须特别关注 `msrv-check` 与 `audit`：前者验证 `ignore` 依赖树在
+`rust-version = "1.89"` 下真能编译，后者对新增依赖做漏洞检查（豁免清单在
+`yi-agent-rs/.cargo/audit.toml`）。若 `audit` 报出新依赖的公告，按既有流程评估
+是否加豁免，不得直接忽略。
+
 ## 6. 文档更新
 
 - `docs/project-management/yi-agent-tools.md`：登记 walker 模块、deadline、
@@ -456,22 +529,28 @@ cd yi-agent-rs && cargo fmt --all && just ci
 1. **被 gitignore 命中但被 Git 跟踪的文件会漏报**。当前仓库无此情况，但这是
    `git_ignore(true)` 的固有语义。若日后出现，用 Overrides 白名单补救；本次不做。
 2. **`hidden(false)` 会让 `.env` 等敏感文件进入搜索结果**。已获用户明确同意。
-3. **无协作式取消**。10 s deadline 是唯一上界；一次超长扫描最坏占用
-   `spawn_blocking` 线程 10 s。
-4. **bash 持久 cwd 与文件工具 `roots[0]` 不一致**：`cd` 之后 `grep`/`glob`/
+3. **`hidden(false)` 必须配 `.git` 显式排除**（见 4.4）。若实现时漏掉这条，
+   `.git/` 下的上万文件会重新进入遍历，收益大幅缩水且不易察觉——因此 5.3 有专门
+   的回归测试钉住它。
+4. **无协作式取消**。10 s deadline 是唯一上界；一次超长扫描最坏占用
+   `spawn_blocking` 线程 10 s（deadline 在阻塞闭包内实现，见 4.9）。
+5. **bash 持久 cwd 与文件工具 `roots[0]` 不一致**：`cd` 之后 `grep`/`glob`/
    `read` 的相对路径仍以 `roots[0]` 为基准。本设计只如实描述，不做统一；这是一处
    既有的语义缺口，统一它属于独立的行为变更。
-5. **环境段不反映会话中途的 `cd`**。system prompt 只在会话开始组装一次；中途
+6. **环境段不反映会话中途的 `cd`**。system prompt 只在会话开始组装一次；中途
    位置变化靠 4.2 的 `cwd:` 回显传递。
-6. **`glob` 的绝对路径退化路径**：`pattern` 为绝对路径时，新实现需要从静态前缀
+7. **`glob` 的绝对路径退化路径**：`pattern` 为绝对路径时，新实现需要从静态前缀
    开始 walk，而不是像 `glob()` 那样从根展开。若静态前缀计算有误，绝对模式可能
    漏匹配；必须在测试中覆盖绝对路径形式（见 5.5）。
-7. **`glob` 的匹配语义由本设计显式钉住**：`require_literal_separator: true` 与
-   `require_literal_leading_dot: false`。前者与 `glob()` 的逐段展开等价，后者保持
-   「`*` 可命中点文件」。若实现者改动这两个开关，会静默改变 glob 结果集。
-8. **`grep` 的 `glob` 过滤参数不受 walker 影响**：它仍用
-   `glob::Pattern::new(g).matches(file_name)` 只匹配**文件名**（`fs/grep.rs:171-175`），
+8. **`glob` 的匹配语义由本设计显式钉住**：`require_literal_separator: true` 与
+   `require_literal_leading_dot: false`。前者与 `glob()` 的逐段展开等价（已实测
+   11 条断言，见 4.6），后者保持「`*` 可命中点文件」。若实现者改动这两个开关，
+   会静默改变 glob 结果集。
+9. **`grep` 的 `glob` 过滤参数不受 walker 影响**：它仍用
+   `glob::Pattern::new(g).matches(file_name)` 只匹配**文件名**（`fs/grep.rs:174-179`），
    不匹配路径。本次不改这一语义。
+10. **新增依赖会改 `Cargo.lock`**：`ignore`、`globset`、`bstr` 三项新增，可能连带
+    升级 `regex-automata` 到 0.4.18（见 4.8）。这是引入 gitignore 语义的必要代价。
 
 ## 8. 验收判据
 
