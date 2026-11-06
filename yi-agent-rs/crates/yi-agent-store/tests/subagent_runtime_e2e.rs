@@ -4,12 +4,76 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tempfile::TempDir;
-use yi_agent_core::subagent::task::{DeliveryReport, TaskId, WorkspaceLeaseId};
+use yi_agent_core::subagent::task::RootSessionId;
+use yi_agent_core::subagent::task::{DeliveryReport, TaskId, TaskRole, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
+use yi_agent_store::repository::RuntimeRepository;
+
+/// Binds one host to a freshly attached container and returns the binding.
+///
+/// Container writes need an open turn from this point on, so every test that
+/// spawns goes through here rather than inventing its own binding.
+fn bind_container(
+    socket: &std::path::Path,
+    session_id: &str,
+    root_task_id: &str,
+    legacy_capability: &str,
+    host: &str,
+) -> yi_agent_lifecycle::session_delegation::SessionBinding {
+    use yi_agent_lifecycle::foreground::SecretCapability;
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionIdentity, SessionRef, session_resume_digest,
+    };
+    let IpcResponse::SessionPrepared { binding } = send_request(
+        socket,
+        IpcRequest::PrepareSessionDelegation {
+            request: PrepareSession {
+                root: SessionRef {
+                    session_id: session_id.to_string(),
+                    root_id: root_task_id.to_string(),
+                },
+                operation_id: format!("bind-{host}-{session_id}"),
+                host_run_id: host.to_string(),
+                expected_binding_epoch: 0,
+                identity: SessionIdentity::LegacyUpgrade(SecretCapability::new(
+                    legacy_capability.to_string(),
+                )),
+                current_binding: None,
+                replacement_resume_digest: Some(session_resume_digest(&SecretCapability::new(
+                    format!("resume-{host}-{session_id}"),
+                ))),
+                stopped: Vec::new(),
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("a bound host must be able to prepare a session");
+    };
+    binding
+}
+
+/// Opens one turn for `binding`.
+fn open_turn(
+    socket: &std::path::Path,
+    binding: &yi_agent_lifecycle::session_delegation::SessionBinding,
+    turn_id: &str,
+) -> yi_agent_lifecycle::session_delegation::SessionTurn {
+    let IpcResponse::SessionTurnOpened { turn } = send_request(
+        socket,
+        IpcRequest::BeginSessionTurn {
+            binding: binding.clone(),
+            turn_id: turn_id.into(),
+        },
+    )
+    .unwrap() else {
+        panic!("a bound host must be able to open a turn");
+    };
+    turn
+}
 
 #[derive(Clone, Default)]
 struct DeliveryFactory {
@@ -107,12 +171,14 @@ impl AgentWorkerFactory for DeliveryFactory {
 
 #[test]
 fn concurrent_cancel_confirmation_has_one_winner() {
-    let (_directory, daemon, factory, session_id, root_task_id, capability) = active_runtime();
+    let (_directory, daemon, factory, session_id, root_task_id, capability, binding) =
+        active_runtime();
     let task_id = spawn_child(
         &daemon,
         &session_id,
         &root_task_id,
         &capability,
+        &binding,
         "cancel concurrently",
     );
     let IpcResponse::CancelPreview {
@@ -209,6 +275,7 @@ fn active_runtime() -> (
     String,
     String,
     String,
+    yi_agent_lifecycle::session_delegation::SessionBinding,
 ) {
     let directory = TempDir::new().unwrap();
     let factory = Arc::new(DeliveryFactory::default());
@@ -248,6 +315,13 @@ fn active_runtime() -> (
         .unwrap(),
         IpcResponse::ApplicationRootActivated
     ));
+    let binding = bind_container(
+        daemon.socket_path(),
+        &session_id,
+        &root_task_id,
+        &message_capability,
+        "active-host",
+    );
     (
         directory,
         daemon,
@@ -255,6 +329,7 @@ fn active_runtime() -> (
         session_id,
         root_task_id,
         message_capability,
+        binding,
     )
 }
 
@@ -263,8 +338,10 @@ fn spawn_child(
     session_id: &str,
     root_task_id: &str,
     capability: &str,
+    binding: &yi_agent_lifecycle::session_delegation::SessionBinding,
     objective: &str,
 ) -> String {
+    let turn = open_turn(daemon.socket_path(), binding, objective);
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
@@ -278,6 +355,7 @@ fn spawn_child(
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: Some(turn),
         },
     )
     .unwrap();
@@ -324,6 +402,14 @@ fn delivery_survives_restart_without_restarting_worker() {
         .unwrap(),
         IpcResponse::ApplicationRootActivated
     ));
+    let binding = bind_container(
+        daemon.socket_path(),
+        &session_id,
+        &root_task_id,
+        &message_capability,
+        "delivery-host",
+    );
+    let turn = open_turn(daemon.socket_path(), &binding, "deliver");
     let response = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
@@ -337,6 +423,7 @@ fn delivery_survives_restart_without_restarting_worker() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: Some(turn),
         },
     )
     .unwrap();
@@ -392,6 +479,141 @@ fn delivery_survives_restart_without_restarting_worker() {
     );
 }
 
+/// 容器角色必须跨越重启存活。
+///
+/// 这就是用户最初遇到的故障形状：一个会话的历史执行被标成 `stalled`，daemon
+/// 重启后 hydration 只按 `state_json` 重建 root；如果角色没有一起读回，root 会
+/// 变成 Execution，之后任何 `spawn` 都会被 `ParentSettled` 拒绝，而错误文本恰好
+/// 是 “a settled parent task (state: stalled) cannot spawn descendants”。
+///
+/// 因此本测试：切换历史 state 为 stalled → 重启 daemon → 重新 attach → 断言容器
+/// 角色仍在、且能继续 spawn。仅让 attach 能返回成功是不够的。
+#[test]
+fn a_stalled_session_container_still_spawns_after_a_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("runtime.sqlite");
+    let runtime = dir.path().join("runtime");
+    let factory = Arc::new(DeliveryFactory::default());
+    let daemon = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-stalled-container".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attached application root");
+    };
+    let root: TaskId = root_task_id.parse().unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_role(&root)
+            .unwrap(),
+        TaskRole::SessionContainer,
+        "an application root is created as a container, not an execution"
+    );
+
+    // A previous build could still settle a container. Reproduce that history
+    // verbatim: the state column is what hydration reads, and it must no longer
+    // decide whether the container may delegate.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET state_json = 'stalled' WHERE id = ?1",
+            [root.to_string()],
+        )
+        .unwrap();
+
+    drop(daemon);
+    let restarted = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+
+    // Re-attaching hydrates the persisted task rows. This is the path that used to
+    // lose the role.
+    let IpcResponse::ApplicationRootAttached {
+        session_id: reattached_session,
+        root_task_id: reattached_root,
+        message_capability: reattached_capability,
+        ..
+    } = send_request(
+        restarted.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-stalled-container".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected the same application root back");
+    };
+    assert_eq!(reattached_session, session_id);
+    assert_eq!(reattached_root, root_task_id);
+
+    // A restart is a new generation: the old binding is gone, and the host proves
+    // itself again with the capability it already holds.
+    let IpcResponse::SessionPrepared { binding } = send_request(
+        restarted.socket_path(),
+        IpcRequest::PrepareSessionDelegation {
+            request: yi_agent_lifecycle::session_delegation::PrepareSession {
+                root: yi_agent_lifecycle::session_delegation::SessionRef {
+                    session_id: reattached_session.clone(),
+                    root_id: reattached_root.clone(),
+                },
+                operation_id: "resume-after-restart".into(),
+                host_run_id: "restart-host".into(),
+                expected_binding_epoch: 1,
+                identity: yi_agent_lifecycle::session_delegation::SessionIdentity::LegacyUpgrade(
+                    yi_agent_lifecycle::foreground::SecretCapability::new(
+                        reattached_capability.clone(),
+                    ),
+                ),
+                current_binding: None,
+                replacement_resume_digest: None,
+                stopped: Vec::new(),
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("a restarting host must resume with its private secret");
+    };
+    let turn = open_turn(restarted.socket_path(), &binding, "after-restart");
+    let response = send_request(
+        restarted.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: reattached_session,
+            parent_task_id: reattached_root,
+            capability: reattached_capability,
+            objective: "spawn after restart".into(),
+            mode: Some("coding".into()),
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+            session_turn: Some(turn),
+        },
+    )
+    .unwrap();
+    match response {
+        IpcResponse::TaskSpawned { .. } => {}
+        IpcResponse::Error { code, message, .. } => panic!(
+            "a stalled container must still delegate after a restart; got {code:?}: {message:?}"
+        ),
+        other => panic!("expected a spawned child, got {other:?}"),
+    }
+    drop(restarted);
+    let _ = message_capability;
+}
+
 /// 重启后重新挂载时，父级必须仍能从 `WaitAgent` 读到子任务交付的 commit。
 ///
 /// `delivery_survives_restart_without_restarting_worker` 里 root 处于 running，
@@ -425,6 +647,14 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
     };
     // root 停在 queued（不 activate），这样它的状态不属于 recover_inflight_tasks
     // 的扫描范围，重启后只能靠 attach 水合把它和孩子一起重建。
+    let binding = bind_container(
+        daemon.socket_path(),
+        &session_id,
+        &root_task_id,
+        &message_capability,
+        "report-host",
+    );
+    let turn = open_turn(daemon.socket_path(), &binding, "deliver");
     let IpcResponse::TaskSpawned { task_id } = send_request(
         daemon.socket_path(),
         IpcRequest::SpawnApplicationChild {
@@ -438,6 +668,7 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
             thread_id: None,
             sandbox: None,
             fork_token: None,
+            session_turn: Some(turn),
         },
     )
     .unwrap() else {
@@ -513,4 +744,153 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
         "重启水合必须把交付 commit 补回 attempt，否则父级会丢掉子任务的交付"
     );
     assert_eq!(reattached_root, root_task_id);
+}
+
+/// A container write must name the open turn.
+///
+/// Three refusals are pinned here because each is a different bypass: a missing
+/// turn (the old shape), a turn that was already replaced, and a child borrowing
+/// the application entry point to spawn under a container it does not own.
+#[test]
+fn session_delegation_lifecycle_no_legacy_write_bypass() {
+    use yi_agent_lifecycle::foreground::SecretCapability;
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionIdentity, SessionRef, session_resume_digest,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(DeliveryFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let resume_secret = SecretCapability::new("resume-secret");
+    let resume_digest = session_resume_digest(&resume_secret);
+    let attached = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachSessionContainer {
+            idempotency_key: "project:turn:/p:1".into(),
+            workspace: workspace.clone(),
+            extra_roots: Vec::new(),
+            operation_id: "op-attach".into(),
+            creation_resume_digest: Some(resume_digest),
+            identity: None,
+        },
+    )
+    .unwrap();
+    // The attach response must not be a way to lift a capability.
+    let debug = format!("{attached:?}");
+    let IpcResponse::SessionContainerAttached { root, .. } = attached else {
+        panic!("expected a container attach, got {debug}");
+    };
+    assert!(!debug.contains("resume-secret"), "{debug}");
+
+    let prepared = send_request(
+        daemon.socket_path(),
+        IpcRequest::PrepareSessionDelegation {
+            request: PrepareSession {
+                root: SessionRef {
+                    session_id: root.session_id.clone(),
+                    root_id: root.root_id.clone(),
+                },
+                operation_id: "op-prepare".into(),
+                host_run_id: "host-1".into(),
+                expected_binding_epoch: 0,
+                identity: SessionIdentity::Embedded(resume_secret.clone()),
+                current_binding: None,
+                replacement_resume_digest: None,
+                stopped: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let IpcResponse::SessionPrepared { binding } = prepared else {
+        panic!("expected a binding, got {prepared:?}");
+    };
+
+    let opened = send_request(
+        daemon.socket_path(),
+        IpcRequest::BeginSessionTurn {
+            binding: binding.clone(),
+            turn_id: "turn-1".into(),
+        },
+    )
+    .unwrap();
+    let IpcResponse::SessionTurnOpened { turn } = opened else {
+        panic!("expected an open turn, got {opened:?}");
+    };
+
+    // 1. The old shape: a container spawn with no turn at all.
+    let no_turn = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: root.session_id.clone(),
+            parent_task_id: root.root_id.clone(),
+            capability: "not-a-capability".into(),
+            objective: "no turn".into(),
+            mode: None,
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+            session_turn: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            no_turn,
+            IpcResponse::SessionDelegationRejected { .. } | IpcResponse::Error { .. }
+        ),
+        "{no_turn:?}"
+    );
+
+    // 2. A superseded turn cannot be replayed after a new one opened.
+    let second = send_request(
+        daemon.socket_path(),
+        IpcRequest::BeginSessionTurn {
+            binding: binding.clone(),
+            turn_id: "turn-2".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(second, IpcResponse::SessionTurnOpened { .. }));
+
+    let stale = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            session_id: root.session_id.clone(),
+            parent_task_id: root.root_id.clone(),
+            capability: "not-a-capability".into(),
+            objective: "old turn".into(),
+            mode: None,
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+            session_turn: Some(turn.clone()),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            stale,
+            IpcResponse::SessionDelegationRejected { .. } | IpcResponse::Error { .. }
+        ),
+        "{stale:?}"
+    );
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    let session: RootSessionId = root.session_id.parse().unwrap();
+    let summaries = repository.task_summaries(Some(&session), false).unwrap();
+    let children = summaries
+        .iter()
+        .filter(|summary| summary.parent_task_id.as_deref() == Some(root.root_id.as_str()))
+        .count();
+    assert_eq!(children, 0, "a refused spawn must not create a child");
 }

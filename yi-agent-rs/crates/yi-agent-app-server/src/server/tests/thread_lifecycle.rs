@@ -400,6 +400,11 @@ async fn thread_resume_replays_history_and_restores_context() {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -763,6 +768,11 @@ async fn thread_compact_reports_failure_without_breaking_the_connection() {
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
             mcp: None,
+            sandbox: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                true,
+            ),
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -1379,6 +1389,11 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     };
     let rebuilt = wrap_for_delegation(built, tooling);
     assert!(

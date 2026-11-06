@@ -163,3 +163,70 @@ fn malformed_and_oversized_clients_do_not_stop_healthy_requests() {
     let _ = read_response(stream);
     assert_healthy(daemon.socket_path());
 }
+
+/// An old envelope must not reach a write handler at all.
+///
+/// `session_turn` is additive and optional so an older client still *decodes*,
+/// which is exactly the danger: a v2 client that omits the fence would otherwise
+/// look like a legitimate unfenced write. The version is therefore decided
+/// before the command is parsed, and a fencing write from an older envelope is
+/// refused with the same structured code a bound host would see.
+#[test]
+fn session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write() {
+    let directory = TempDir::new().unwrap();
+    let daemon = Daemon::start(
+        directory.path().join("runtime"),
+        directory.path().join("runtime.sqlite"),
+    )
+    .unwrap();
+    let request = json!({
+        "protocol_version": 2,
+        "request_id": "old",
+        "command": {
+            "type": "SpawnApplicationChild",
+            "session_id": "s",
+            "parent_task_id": "p",
+            "capability": "old",
+            "objective": "x"
+        }
+    });
+    let frame = serde_json::to_vec(&request).unwrap();
+    let response = send_in_chunks(daemon.socket_path(), &frame, frame.len());
+
+    assert_eq!(response["request_id"], "old");
+    assert_eq!(response["result"]["type"], "SessionDelegationRejected");
+    assert_eq!(response["result"]["failure"]["code"], "protocol_mismatch");
+    assert_healthy(daemon.socket_path());
+}
+
+/// A v3 envelope with an unknown field in the command is a validation error.
+///
+/// The point is that the two failures stay distinguishable: a version mismatch is
+/// "upgrade the client", a bad field is "fix the request". Collapsing both into a
+/// bare parse error is what forces callers to match English text.
+#[test]
+fn session_delegation_lifecycle_v3_unknown_command_field_is_validation() {
+    let directory = TempDir::new().unwrap();
+    let daemon = Daemon::start(
+        directory.path().join("runtime"),
+        directory.path().join("runtime.sqlite"),
+    )
+    .unwrap();
+    let request = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": "bad-field",
+        "command": {
+            "type": "ListTaskSummaries",
+            "session_id": null,
+            "active_only": false,
+            "not_a_field": true
+        }
+    });
+    let frame = serde_json::to_vec(&request).unwrap();
+    let response = send_in_chunks(daemon.socket_path(), &frame, frame.len());
+
+    assert_eq!(response["request_id"], "bad-field");
+    assert_eq!(response["result"]["type"], "Error");
+    assert_eq!(response["result"]["code"], "validation");
+    assert_healthy(daemon.socket_path());
+}

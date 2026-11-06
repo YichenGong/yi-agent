@@ -229,6 +229,67 @@ test_helper_pids() {
   done
 }
 
+# 已成孤儿的测试二进制：`ppid=1` 且名字形如 `target/{debug,release}/deps/<name>-<hash>`。
+#
+# 与上面 `test_helper_pids` 覆盖的不是同一类东西。那一类是被测代码故意
+# `setsid()` 出去的 helper 子进程；这一类是**测试二进制本体**卡死或被杀后没人
+# 收的壳。典型成因是某条读路径没有超时：服务端不回帧，`ws.next().await` 就
+# 永远挂着，测试进程连同它占的端口、临时目录和子进程一起活到下次开机。
+# 实测见过一个跑了 3 小时 32 分、CPU 0%、21 个线程的 `yi_agent_app_server`
+# 测试二进制，`rebuild.sh` 的旧规则一条都不匹配它。
+#
+# 只认 `ppid=1` 是关键：正在跑的 `cargo test` 的子进程 ppid 是 cargo，
+# 被终端直接起的是 shell，都不会被这里选中。父进程还在就不算孤儿，不碰。
+orphaned_test_binary_pids() {
+  ps -axo pid=,ppid=,command= 2>/dev/null | while IFS= read -r line; do
+    # 前导空格 + pid + ppid，之后是 command。
+    local pid ppid command
+    pid="$(printf '%s' "$line" | awk '{print $1}')"
+    ppid="$(printf '%s' "$line" | awk '{print $2}')"
+    [ -n "$pid" ] && [ "$ppid" = "1" ] || continue
+    command="$(printf '%s' "$line" | awk '{$1=""; $2=""; sub(/^ +/, ""); print}')"
+    case "$command" in
+      */target/debug/deps/*|*/target/release/deps/*) ;;
+      *) continue ;;
+    esac
+    # 测试二进制是 `<crate_name>-<16 位十六进制>`。要求这个形态，是为了不把
+    # `deps/` 下任何别的产物（构建脚本、示例）一起算进来。
+    local exe base
+    exe="${command%% *}"
+    base="${exe##*/}"
+    case "$base" in
+      *-*) ;;
+      *) continue ;;
+    esac
+    case "${base##*-}" in
+      *[!0-9a-f]*|'') continue ;;
+    esac
+    [ "${#base}" -gt 17 ] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+# 停止孤儿测试二进制。返回已停止的个数（供日志用）。
+stop_orphaned_test_binaries() {
+  local pids count=0 pid
+  pids="$(orphaned_test_binary_pids | tr '\n' ' ')"
+  [ -n "${pids// /}" ] || return 0
+  for pid in $pids; do
+    # 同理先 CONT：被挂起（`T`）的进程收 SIGTERM 只会挂起信号。
+    kill -CONT "$pid" 2>/dev/null || true
+    if kill -TERM "$pid" 2>/dev/null; then
+      count=$((count + 1))
+    fi
+  done
+  wait_gone 5 $pids || true
+  for pid in $pids; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  if [ "$count" -gt 0 ]; then
+    echo "测试残留 -> 已停止 $count 个孤儿测试二进制"
+  fi
+}
+
 # 停止测试二进制留下的 helper。返回已停止的个数（供日志用）。
 stop_test_helpers() {
   local pids count=0
@@ -259,6 +320,7 @@ stop_dependents() {
   log "停止依附旧二进制的进程"
 
   stop_test_helpers
+  stop_orphaned_test_binaries
 
   # ① 先 bootout 值守。KeepAlive=true：先 kill 会在 10s 内复活一个新的
   #    resident watch，而它的第一个动作就是把刚杀掉的 daemon 拉回来。

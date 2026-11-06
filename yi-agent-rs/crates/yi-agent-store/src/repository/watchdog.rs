@@ -272,26 +272,26 @@ impl RuntimeRepository {
     pub fn active_attempt_watchdogs(&self) -> Result<Vec<PersistedWatchdogTask>, RepositoryError> {
         let rows = {
             let mut statement = self.connection.prepare(
-                // A confirmed foreground container is excluded here, not filtered
-                // afterwards: the candidate query and the terminal commit must share
-                // one policy, or a root could be skipped by the scan and still be
-                // settled by a stale snapshot.
+                // A container is excluded here, not filtered afterwards: the
+                // candidate query and the terminal commit must share one policy, or
+                // a root could be skipped by the scan and still be settled by a
+                // stale snapshot.
                 //
-                // Only `managed` is excluded. `pending` and `corrupt` still appear,
-                // because their verdict is "refuse the terminal", not "might be a
-                // container". A pending root must not be quietly kept alive by
-                // looking like something the watchdog has no opinion about.
+                // The exclusion is the persisted *role*, not the managed
+                // classification. `legacy`/`pending` application roots are
+                // containers too; keying on `managed` is exactly the bug that let an
+                // embedded session be settled after 300 seconds of quiet. `pending`
+                // roots still appear when their role is `execution`, because their
+                // verdict is "refuse the terminal", not "might be a container".
                 "SELECT tasks.root_session_id, tasks.id, attempt_watchdogs.attempt_id
                  FROM attempt_watchdogs
                  JOIN tasks ON tasks.id = attempt_watchdogs.task_id
-                 LEFT JOIN foreground_root_state AS foreground
-                        ON foreground.root_task_id = tasks.id
                  WHERE tasks.active_attempt_id = attempt_watchdogs.attempt_id
                    AND tasks.state_json IN (
                        'queued', 'running', 'waiting_for_resource',
                        'waiting_for_permission', 'waiting_for_children'
                    )
-                   AND COALESCE(foreground.classification, '') <> 'managed'",
+                   AND tasks.role = 'execution'",
             )?;
             statement
                 .query_map([], |row| {
@@ -415,6 +415,20 @@ impl RuntimeRepository {
         // containers, but a snapshot can be minutes old: a root may have become
         // managed after the scan listed it, and settling it then would kill a live
         // conversation over a budget it no longer has.
+        //
+        // The role is re-read first and independently of the classification: a
+        // session container is never a worker, whatever its authorization state.
+        let role: Option<String> = transaction
+            .query_row(
+                "SELECT role FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get(0),
+            )
+            .ok();
+        if role.as_deref() == Some("session_container") {
+            transaction.commit()?;
+            return Ok(WatchdogTerminalOutcome::ForegroundContainer);
+        }
         let classification = {
             let mut statement = transaction.prepare(
                 "SELECT classification FROM foreground_root_state WHERE root_task_id = ?1",
@@ -658,9 +672,13 @@ impl RuntimeRepository {
         } else {
             ""
         };
+        // Role is enforced whether or not the foreground switch is on: a session
+        // container never had a worker to recover, and parking it as
+        // `recovery_required` would end a conversation that is fine.
+        let role_exclusion = " AND tasks.role = 'execution'";
         let task_ids = {
             let mut statement = transaction.prepare(&format!(
-                "SELECT id FROM tasks WHERE state_json IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children'){exclusion}"
+                "SELECT id FROM tasks WHERE state_json IN ('running', 'waiting_for_resource', 'waiting_for_permission', 'waiting_for_children'){exclusion}{role_exclusion}"
             ))?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
@@ -757,13 +775,22 @@ impl RuntimeRepository {
         // Attempts follow their task. Without this guard an excluded managed root would
         // keep a live task row while its attempt was parked, and every later query that
         // joins the two would disagree with `foreground_class`.
-        let attempt_exclusion = if activation.is_enabled() {
+        //
+        // Session containers are excluded unconditionally: their attempt belongs to
+        // a finished historical execution, and marking it `recovery_required` would
+        // both misdescribe the container and invite a worker resume that must never
+        // happen.
+        let attempt_exclusion = format!(
             " AND task_id NOT IN (
-                  SELECT f.root_task_id FROM foreground_root_state f
-                  WHERE f.classification IN ('pending', 'managed'))"
-        } else {
-            ""
-        };
+                  SELECT id FROM tasks WHERE role = 'session_container'){}",
+            if activation.is_enabled() {
+                " AND task_id NOT IN (
+                      SELECT f.root_task_id FROM foreground_root_state f
+                      WHERE f.classification IN ('pending', 'managed'))"
+            } else {
+                ""
+            }
+        );
         transaction.execute(
             &format!(
                 "UPDATE attempts SET state = 'recovery_required', ended_at = CURRENT_TIMESTAMP
@@ -807,9 +834,15 @@ impl RuntimeRepository {
             .join(", ");
         Ok(self.connection.execute(
             &format!(
+                // A container's historical `stalled` is not "this workspace is
+                // free": the session may rebind and continue in it, and an
+                // unproven old execution may still hold it. Only executions
+                // release their lease on sight.
                 "UPDATE resource_leases SET state = 'released', released_at = CURRENT_TIMESTAMP
                  WHERE state = 'active'
-                   AND task_id IN (SELECT id FROM tasks WHERE state_json IN ({settled}))"
+                   AND task_id IN (
+                       SELECT id FROM tasks
+                       WHERE state_json IN ({settled}) AND role = 'execution')"
             ),
             [],
         )?)
@@ -853,13 +886,25 @@ impl RuntimeRepository {
                  AND ({orphaned_because_detached} OR {orphaned_because_unowned}))"
         );
 
+        // The container *root* is governed by its record, not by the attachment's
+        // momentary state: `detached` is a temporary binding closure the host may
+        // rebind from, and reaping the session task on sight would end a
+        // conversation nobody closed (an explicit close writes the tombstone).
+        //
+        // Children keep the existing reclaim rules: they are ordinary executions
+        // whose owner really can be gone, and refusing to reclaim them would leak
+        // worker rows forever.
+        let owned_by_container = "NOT EXISTS(
+                 SELECT 1 FROM session_containers c
+                 WHERE c.root_task_id = tasks.id)";
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let orphaned = transaction
             .prepare(&format!(
                 "SELECT id, state_json FROM tasks WHERE {reclaimable_state} \
-                 AND ({orphaned_because_detached} OR {orphaned_because_unowned})"
+                 AND ({orphaned_because_detached} OR {orphaned_because_unowned}) \
+                 AND {owned_by_container}"
             ))?
             .query_map(params![grace_seconds], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -867,7 +912,8 @@ impl RuntimeRepository {
             .collect::<Result<Vec<_>, _>>()?;
         let abandoned = transaction
             .prepare(&format!(
-                "SELECT id, state_json FROM tasks WHERE {abandoned_recovery}"
+                "SELECT id, state_json FROM tasks WHERE {abandoned_recovery} \
+                 AND {owned_by_container}"
             ))?
             .query_map(params![grace_seconds], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

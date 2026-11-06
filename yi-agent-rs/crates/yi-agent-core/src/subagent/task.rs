@@ -488,6 +488,36 @@ impl InheritedSandbox {
     }
 }
 
+/// What a task is *for*, independent of how its last execution ended.
+///
+/// A session's root is a container that owns delegation, mailbox and reports; it
+/// never runs a daemon worker. Every child, grandchild, scheduled root and plain
+/// execution root is an `Execution`. The role is persisted so a historical
+/// `stalled`/`failed` root does not lose the ability to delegate, while a settled
+/// `Execution` still may not spawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRole {
+    #[default]
+    Execution,
+    SessionContainer,
+}
+
+impl TaskRole {
+    /// The stable label persisted in `tasks.role`.
+    ///
+    /// Matches the serde representation, so a row written by this build and one
+    /// decoded from JSON name a role identically. Readers still validate the label
+    /// rather than defaulting an unknown value, so a future role cannot be silently
+    /// read as `Execution` by an older binary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::SessionContainer => "session_container",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub id: TaskId,
@@ -502,6 +532,10 @@ pub struct AgentTask {
     pause_request: Option<PauseReason>,
     pub workspace: Option<WorkspaceLeaseId>,
     attempts: Vec<TaskAttempt>,
+    /// Persisted independently of `state`; `Execution` for every constructor that
+    /// predates session containers and for everything a worker can create.
+    #[serde(default)]
+    role: TaskRole,
 }
 
 impl AgentTask {
@@ -531,6 +565,7 @@ impl AgentTask {
             pause_request: None,
             workspace: None,
             attempts: vec![attempt],
+            role: TaskRole::Execution,
         }
     }
 
@@ -572,6 +607,7 @@ impl AgentTask {
             pause_request: None,
             workspace: None,
             attempts: vec![attempt],
+            role: TaskRole::Execution,
         }
     }
 
@@ -658,6 +694,7 @@ impl AgentTask {
             pause_request: None,
             workspace: None,
             attempts: vec![attempt],
+            role: TaskRole::Execution,
         }
     }
 
@@ -671,6 +708,49 @@ impl AgentTask {
     pub fn with_workspace(mut self, workspace: WorkspaceLeaseId) -> Self {
         self.workspace = Some(workspace);
         self
+    }
+
+    /// A session container: a root that owns delegation but runs no worker.
+    ///
+    /// Its `state` starts `Queued` like any task; only the daemon's container
+    /// record decides admission, never this execution state.
+    pub fn new_session_container(root_session_id: RootSessionId) -> Self {
+        Self::new_session_container_with_id(root_session_id, TaskId::new())
+    }
+
+    /// A session container under an id chosen by the caller.
+    ///
+    /// Same reason as [`Self::new_root_with_id`]: a managed attach was authorized
+    /// for one specific root, and the container it creates has to be that root.
+    pub fn new_session_container_with_id(root_session_id: RootSessionId, id: TaskId) -> Self {
+        let mut task = Self::new_root_with_id(root_session_id, id);
+        task.role = TaskRole::SessionContainer;
+        task
+    }
+
+    pub fn role(&self) -> TaskRole {
+        self.role
+    }
+
+    /// Restores a *verified* persisted role during hydration.
+    ///
+    /// Only a root can be a container: promoting a child would let any execution
+    /// that happens to be a root of its own `ThreadRoot` wrapper escape
+    /// `ParentSettled`. The caller is the daemon reading its own record, never a
+    /// client declaring what it would like to be.
+    pub fn hydrate_session_role(&mut self, role: TaskRole) -> Result<(), String> {
+        if role == TaskRole::SessionContainer
+            && !(self.parent_id.is_none() && self.depth == TaskDepth::Root)
+        {
+            return Err(format!(
+                "task {} is a {} at depth {:?}; only a root can be a session container",
+                self.id,
+                self.parent_id.is_some(),
+                self.depth
+            ));
+        }
+        self.role = role;
+        Ok(())
     }
 
     pub fn active_attempt(&self) -> &TaskAttempt {
@@ -1510,6 +1590,22 @@ mod state_label_tests {
                 "{label} must not parse as RecoveryRequired"
             );
         }
+    }
+
+    #[test]
+    fn session_delegation_lifecycle_role_is_not_root_depth() {
+        let execution = AgentTask::new_root(RootSessionId::new());
+        assert_eq!(execution.role(), TaskRole::Execution);
+        let container = AgentTask::new_session_container(RootSessionId::new());
+        assert_eq!(container.role(), TaskRole::SessionContainer);
+        assert_eq!(container.state(), &TaskState::Queued);
+        let mut child =
+            AgentTask::new_child(container.root_session_id.clone(), container.id.clone());
+        assert!(
+            child
+                .hydrate_session_role(TaskRole::SessionContainer)
+                .is_err()
+        );
     }
 
     #[test]

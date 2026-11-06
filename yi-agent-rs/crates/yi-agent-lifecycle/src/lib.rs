@@ -36,6 +36,8 @@ pub mod preview;
 /// 讲话，而壳只允许依赖本 crate。
 pub mod production;
 pub mod scope;
+/// 会话容器委派的 wire DTO 与接续摘要。
+pub mod session_delegation;
 pub mod types;
 
 /// Control protocol version. Evolves independently of the business protocol.

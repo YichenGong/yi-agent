@@ -400,6 +400,11 @@ pub(crate) fn build_test_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -429,6 +434,11 @@ pub(crate) fn build_test_agent_with_provider(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -472,6 +482,11 @@ pub(crate) fn build_slow_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -498,6 +513,11 @@ fn build_delayed_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -526,6 +546,11 @@ fn build_checkpoint_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -1333,6 +1358,9 @@ fn summary(
         parent_task_id: Some("root".into()),
         thread_id: thread_id.map(str::to_string),
         usage: yi_agent_store::ipc::IpcTaskUsage::default(),
+        role: "execution".to_string(),
+        container_activity: "unknown".to_string(),
+        historical_execution_state: None,
     }
 }
 
@@ -1573,6 +1601,11 @@ fn build_slow_call_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -1641,6 +1674,11 @@ fn build_long_tool_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(true),
         process_manager: Arc::clone(&registry.process_manager),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -1676,6 +1714,11 @@ fn build_permission_agent(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 
@@ -2365,6 +2408,11 @@ fn compactable_factory(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 

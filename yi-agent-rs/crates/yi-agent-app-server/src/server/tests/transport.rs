@@ -264,6 +264,8 @@ async fn driver_reports_finished_when_writer_fails() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     prompt_tx
@@ -343,6 +345,8 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。
@@ -932,7 +936,13 @@ async fn a_websocket_handshake_cannot_claim_the_desktop_shell() {
     .await
     .unwrap();
 
-    let msg = ws.next().await.unwrap().unwrap();
+    // Bounded: an unanswered handshake would otherwise block this read forever and
+    // leave the test binary (and its ports and children) alive after the run.
+    let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
+        .await
+        .expect("the handshake must be answered before the test gives up")
+        .expect("the stream must not end before the handshake is answered")
+        .expect("transport error while waiting for the handshake response");
     let response: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(response["id"], 1);
     assert!(

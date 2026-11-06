@@ -92,18 +92,22 @@ pub fn take_guardian_bootstrap() -> anyhow::Result<std::os::fd::OwnedFd> {
 /// The scope comes from the environment the launcher set, never from an argument:
 /// a guardian that parsed a path from its command line could be pointed at another
 /// project's process journal and would then adopt groups it does not own.
-pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::Result<()> {
+pub fn run_guardian(
+    scope: yi_agent_lifecycle::types::RuntimeScope,
+    launcher: yi_agent_supervisors::lifecycle::guardian::LauncherLifeline,
+) -> anyhow::Result<()> {
     let executable = std::env::current_exe()?;
     let artifact = crate::build_info::artifact_identity(executable.clone());
     // The guardian starts the daemon from *this* executable, which is what makes the
     // pinned selection meaningful: the bytes the guardian was authorised with are the
     // bytes the daemon runs, and a bundle replaced afterwards cannot change them.
-    yi_agent_supervisors::lifecycle::guardian::serve_with_daemon(
+    yi_agent_supervisors::lifecycle::guardian::serve_with_lifeline(
         scope,
         artifact,
         || false,
         std::sync::Arc::new(yi_agent_supervisors::lifecycle::preview::NoCoordinator),
         Some(&executable),
+        Some(launcher),
     )
     .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
 }
@@ -415,7 +419,7 @@ pub fn run_managed_daemon(
         Some((ledger, lifeline)) => (Some(ledger), Some(lifeline)),
         None => (None, None),
     };
-    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_and_authority(
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_authority_enforcing_session_turns(
         &runtime_dir,
         &database,
         factory,

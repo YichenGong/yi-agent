@@ -6142,6 +6142,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap();
@@ -6288,6 +6289,9 @@ mod tests {
                     parent_task_id: None,
                     thread_id: None,
                     usage: Default::default(),
+                    role: "execution".to_string(),
+                    container_activity: "unknown".to_string(),
+                    historical_execution_state: None,
                 },
                 yi_agent_store::ipc::IpcTaskSummary {
                     task_id: "child".into(),
@@ -6296,6 +6300,9 @@ mod tests {
                     parent_task_id: Some("root".into()),
                     thread_id: None,
                     usage: Default::default(),
+                    role: "execution".to_string(),
+                    container_activity: "unknown".to_string(),
+                    historical_execution_state: None,
                 },
             ],
             Some("root"),
@@ -6318,6 +6325,9 @@ mod tests {
                 parent_task_id: None,
                 thread_id: None,
                 usage: Default::default(),
+                role: "execution".to_string(),
+                container_activity: "unknown".to_string(),
+                historical_execution_state: None,
             }],
             None,
             "暂无任务",

@@ -139,6 +139,7 @@ pub(crate) mod assembly;
 
 pub(crate) mod turn;
 
+pub(crate) mod delegation;
 pub(crate) mod driver;
 pub(crate) mod foreground;
 
@@ -252,6 +253,13 @@ pub(crate) struct BuiltAgent {
     pub(crate) process_manager: Arc<yi_agent_tools::ProcessManager>,
     /// MCP 管理器;配置缺失时为 `None`。`mcp/set` 与每轮配置变更检查用它。
     pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    /// The sandbox policy the current registry's tools were built with.
+    ///
+    /// Carried alongside the agent so a turn that installs its own delegation
+    /// tools can build them from the same policy as the rest of the set. A
+    /// controller created ad hoc per turn would silently diverge from the yolo
+    /// switch the session's other tools read.
+    pub(crate) sandbox: yi_agent_tools::SandboxController,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目

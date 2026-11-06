@@ -199,3 +199,23 @@
   客户端读超时按自身 deadline 放宽，服务端提前 `REPLY_MARGIN = 100ms` 收尾，避免"服务端刚写完"与"客户端刚好读超时"撞在一起。
   判据：`cargo test -p yi-agent-supervisors --test managed_channel`（7 passed + 1 ignored），
   `a_wait_is_bounded_by_the_requests_own_budget` 用 1s 请求预算对抗 120s 通道预算
+- [x] guardian 感知启动者退出，且测试不再留下孤儿 guardian — 此前 `main.rs` 用
+  `let _bootstrap = take_guardian_bootstrap()?` 只**持有** bootstrap socketpair 却从不读它，而
+  socketpair 的 EOF 正是「启动者已退出」的信号；不读就永远收不到。叠加主循环唯一退出条件
+  `while !shutdown()`（生产路径传 `|| false`），guardian 一旦起来就不走。结果是每跑一次
+  `managed_runtime_lifecycle` 留 3 个 guardian，实测 42 个全部 `ppid=1` 且指向已删除的 `TempDir`。
+  修复分三层：**(1)** `LauncherLifeline::watch(fd)` 起 detached 线程读该 fd，EOF（`Ok(0)`）或不可恢复
+  读错误即置位 `is_gone()`；`Ok(_)` 继续读——这条 fd 是生命线，不接受任何载荷，否则它会悄悄变成
+  启动者从未同意服务的命令通道。**(2)** 主循环新增退出条件 `launcher_gone() && no_business_client()`。
+  只看 lifeline 是不够的：spec A04 要求「重启最初启动者的 sidecar，其他客户端、guardian/daemon
+  不误停」，所以启动者退出不能拆掉别的 App/TUI 正在用的 runtime。`no_business_client()` 刻意**弱于**
+  `drained()`——后者要求 `global_drain_started()`，而那只在有人 release 之后才置位，启动者猝死时
+  没人 release，等 `drained()` 会永远等下去；同时也排除 `has_running_operations()`，因为正在进行的回收
+  就是「证明停止」的那条线程，退出会把它切断。**(3)** guardian 在 `bind_control` 成功之后写
+  `runtime/guardian.pid`（`{"pid":N,"start_micros":M}`，带出生时间防 pid 复用），因为
+  `processes.json` 记的是 managed 子进程、第一条是 daemon 而不是 guardian：测试原先读它做兜底清理，
+  杀掉的是 daemon，而 guardian 会把 daemon 重新拉起，清理看似成功实则自我撤销。
+  判据：`cargo test -p yi-agent --test managed_runtime_lifecycle`（9 passed + 1 ignored，跑完
+  `ps -axo command= | grep -c 'internal-runtime guardian'` 由 3 降为 0）；
+  `cargo test -p yi-agent-supervisors launcher_lifeline`（1 passed，验证在对端存活时 `is_gone()` 为
+  false、关闭后 10s 内变 true）

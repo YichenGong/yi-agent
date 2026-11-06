@@ -117,6 +117,12 @@ pub struct ToolSetup {
     /// 四个工具的进程管理器。**必须与 `tools` 里的进程工具同行**：调用方要按
     /// 「哪个注册表生效」选中对应的 manager，否则会查到一个空列表而工具明明可用。
     pub process_manager: Arc<yi_agent_tools::ProcessManager>,
+    /// The controller the builtin tools were given.
+    ///
+    /// Exposed so a caller that adds tools later (the per-turn delegation set)
+    /// builds them from the same live YOLO switch the rest of the set reads.
+    /// Re-deriving one from config would silently fork the policy.
+    pub sandbox: yi_agent_tools::SandboxController,
 }
 
 /// 注册内置工具(含 sandbox 配置)。
@@ -244,6 +250,7 @@ pub fn build_tool_setup_owned(
             system_prompt: None,
             mcp: None,
             process_manager,
+            sandbox: controller,
         });
     }
 
@@ -276,8 +283,11 @@ pub fn build_tool_setup_owned(
         managed.clone(),
     );
 
-    let process_manager =
-        yi_agent_tools::ProcessManager::with_controller(primary, controller, sandbox_writable);
+    let process_manager = yi_agent_tools::ProcessManager::with_controller(
+        primary,
+        controller.clone(),
+        sandbox_writable,
+    );
     let process_manager = match &managed {
         Some((policy, spawner)) => {
             Arc::clone(&process_manager).into_managed(policy.clone(), spawner.clone())
@@ -336,6 +346,7 @@ pub fn build_tool_setup_owned(
         system_prompt: prompt.system_prompt,
         mcp,
         process_manager,
+        sandbox: controller,
     })
 }
 
@@ -381,6 +392,9 @@ pub struct AgentBootstrap {
     /// 配置缺失时是 `None`——此时工具仍在(挂在 `tools` 里),只是没有可重载的
     /// server,`reload` 会把新建的配置读进来。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    /// The sandbox controller this bootstrap's tools were built with, so a caller
+    /// rebuilding the agent can keep the same live policy.
+    pub sandbox: yi_agent_tools::SandboxController,
 }
 
 /// 由运行时配置构造 [`yi_agent_core::AgentConfig`](集中一处,避免各调用点漂移)。
@@ -455,6 +469,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_rx: Some(rx_arc),
                 yolo: switch.clone(),
                 mcp: setup.mcp,
+                sandbox: setup.sandbox,
             })
         }
         PermissionMode::AutoAllow => {
@@ -475,6 +490,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_rx: None,
                 yolo: switch.clone(),
                 mcp: setup.mcp,
+                sandbox: setup.sandbox,
             })
         }
     }

@@ -157,6 +157,9 @@ async fn turn_start_emits_full_notification_sequence() {
             "item/completed",
             // turn/start 在 turn/started 之后立刻推 Running 状态,先于 turn 正文。
             "thread/status/updated",
+            // 委派就绪与否在本轮正文之前宣告:客户端必须在模型开始产出前知道
+            // `spawn_agent` 这一轮能不能用,而不是等工具调用失败才发现。
+            "thread/delegationStatus/updated",
             "item/started",
             "item/delta",
             // `Done` 会先 finalize 打开的 agentMessage,故 turn/completed
@@ -605,6 +608,8 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -1263,6 +1268,8 @@ async fn driver_uses_unique_item_ids_across_turns() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -1520,6 +1527,8 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     prompt_tx
@@ -2276,6 +2285,8 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     prompt_tx
@@ -3605,6 +3616,421 @@ async fn a_failed_append_still_records_the_completion() {
         meta["last_completed_at"].as_u64().unwrap_or(0),
         broadcast_at,
         "a failed append must not swallow the completion stamp: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// Every turn must (re)prepare delegation with the daemon and announce it.
+///
+/// The bug this pins is the one users hit as
+/// "a settled parent task (state: stalled) cannot spawn descendants": delegation
+/// used to be decided once per process. A turn now prepares the container's
+/// binding, opens a turn, registers the turn's execution and installs the turn's
+/// own tool set -- so the second turn proves a *new* turn is admitted after the
+/// first one ended, not that one activation happened to succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_delegation_lifecycle_app_server_prepares_every_turn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let mut announced_turns: Vec<String> = Vec::new();
+    for id in [31, 32] {
+        // Starting a turn back to back is refused with "turn already in progress"
+        // until the server clears `active_turn_id`, which happens after the
+        // completion notification is broadcast. Retrying is the honest way for a
+        // test to express "the previous turn is over", instead of guessing at the
+        // relative order of two independent events.
+        // `active_turn_id` is cleared when the driver's finished event is consumed,
+        // which can be after `thread/status/updated: idle` is broadcast. A refusal
+        // therefore means "the previous turn is still being retired", and the test
+        // retries instead of asserting on that unrelated race.
+        let mut attempt = 0;
+        loop {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            ))
+            .await;
+            let mut refused = false;
+            loop {
+                let value = h.read_value().await;
+                if value.get("id") == Some(&serde_json::json!(id)) {
+                    if value.get("error").is_some() {
+                        refused = true;
+                    }
+                    break;
+                }
+                if value["method"] == "turn/started" {
+                    break;
+                }
+            }
+            if !refused {
+                break;
+            }
+            attempt += 1;
+            assert!(attempt < 100, "turn {id} was never accepted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The announcement must arrive before the turn's own items: a client that
+        // learns `spawn_agent` is unusable only after a call failed has already
+        // given the model a tool it could not use.
+        let mut announced: Option<serde_json::Value> = None;
+        let mut saw_agent_item = false;
+        loop {
+            let value = h.read_value().await;
+            match value["method"].as_str() {
+                Some("thread/delegationStatus/updated") => {
+                    assert!(
+                        !saw_agent_item,
+                        "delegation readiness must precede the turn's own items"
+                    );
+                    announced = Some(value["params"].clone());
+                }
+                Some("item/started") if value["params"]["item"]["type"] == "agentMessage" => {
+                    saw_agent_item = true;
+                }
+                Some("turn/completed") => break,
+                _ => {}
+            }
+            // A refusal is the previous turn's cleanup, not this test's subject.
+            if value.get("error").is_some() {
+                panic!("turn {id} was refused: {value}");
+            }
+        }
+        let announced =
+            announced.unwrap_or_else(|| panic!("turn {id} must announce delegation readiness"));
+        assert_eq!(
+            announced["ready"],
+            serde_json::json!(true),
+            "turn {id} must be admitted by the daemon, got {announced}"
+        );
+        assert!(
+            announced["failure"].is_null(),
+            "a ready turn carries no failure: {announced}"
+        );
+        announced_turns.push(
+            announced["turn_id"]
+                .as_str()
+                .expect("the announcement names its own turn")
+                .to_string(),
+        );
+    }
+    assert!(
+        !announced_turns.iter().any(|turn| turn.is_empty()),
+        "each announcement must name a turn: {announced_turns:?}"
+    );
+    assert_ne!(
+        announced_turns[0], announced_turns[1],
+        "each turn gets its own turn id, so delegation is re-decided rather than reused"
+    );
+    h.shutdown().await;
+}
+
+/// A model that really calls `spawn_agent` once per turn, twice.
+///
+/// The first turn spawns with a marker only it sends; the second turn inspects
+/// the id the first turn produced. Both are scripted as real `ProviderEvent`s so
+/// the tools run through the same `Tool` path a model's call does -- nothing is
+/// stubbed at the tool boundary.
+struct DelegationProvider {
+    /// How many tool uses this provider has *emitted*, not how many calls it got:
+    /// every tool use costs two calls (emit, then read the result).
+    emitted: std::sync::atomic::AtomicUsize,
+    /// The child id produced by the first turn's tool result, once known.
+    spawned: Arc<std::sync::Mutex<Option<String>>>,
+    /// The second turn reports how the child was attributed.
+    inspected: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// Marker the first turn sends, so the second turn never repeats it.
+    first_marker: String,
+}
+
+impl DelegationProvider {
+    fn new(first_marker: &str) -> Self {
+        Self {
+            emitted: std::sync::atomic::AtomicUsize::new(0),
+            spawned: Arc::new(std::sync::Mutex::new(None)),
+            inspected: Arc::new(std::sync::Mutex::new(None)),
+            first_marker: first_marker.to_string(),
+        }
+    }
+
+    /// Reads the `task_id` out of a `spawn_agent` tool result already in history.
+    fn spawned_child(req: &yi_agent_core::provider::ProviderRequest) -> Option<String> {
+        req.messages.iter().rev().find_map(|message| {
+            message.content.iter().rev().find_map(|block| {
+                let yi_agent_core::ContentBlock::ToolResult {
+                    content, is_error, ..
+                } = block
+                else {
+                    return None;
+                };
+                if *is_error {
+                    return None;
+                }
+                content.iter().find_map(|inner| {
+                    let yi_agent_core::ContentBlock::Text(text) = inner else {
+                        return None;
+                    };
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|value| value["task_id"].as_str().map(str::to_string))
+                })
+            })
+        })
+    }
+
+    /// Reads the `inspect_agent` tool result already in history.
+    fn inspected_child(
+        req: &yi_agent_core::provider::ProviderRequest,
+    ) -> Option<serde_json::Value> {
+        req.messages.iter().rev().find_map(|message| {
+            message.content.iter().rev().find_map(|block| {
+                let yi_agent_core::ContentBlock::ToolResult { content, .. } = block else {
+                    return None;
+                };
+                content.iter().find_map(|inner| {
+                    let yi_agent_core::ContentBlock::Text(text) = inner else {
+                        return None;
+                    };
+                    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+                    // Only a tool result that really carries the inspected id is
+                    // this provider's inspect answer; the spawn result has one too,
+                    // so the "state" field is what separates them.
+                    value.get("state").is_some().then_some(value)
+                })
+            })
+        })
+    }
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for DelegationProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+        // A title request is not a conversation turn.
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(futures::stream::iter(vec![
+                E::TextDelta("t".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
+        // An inspect answer ends the second turn. Checked first: the spawn result
+        // from the *first* turn is still in history, so testing it first would
+        // make the second turn end before it ever inspected anything.
+        if let Some(detail) = Self::inspected_child(&req) {
+            *self.inspected.lock().unwrap_or_else(|p| p.into_inner()) = Some(detail);
+            return Ok(futures::stream::iter(vec![
+                E::TextDelta("inspected".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
+        // A spawn result that has not been recorded yet ends the first turn. Once
+        // it *is* recorded the same history entry must not end a later turn.
+        if self
+            .spawned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+            && let Some(child) = Self::spawned_child(&req)
+        {
+            *self.spawned.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
+            return Ok(futures::stream::iter(vec![
+                E::TextDelta("spawned".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
+        let n = self
+            .emitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let events = if n == 0 {
+            vec![
+                E::ToolUseStart {
+                    id: "spawn-a".into(),
+                    name: "spawn_agent".into(),
+                },
+                E::ToolUseDelta {
+                    id: "spawn-a".into(),
+                    partial_json: serde_json::json!({
+                        "task": format!("child for {}", self.first_marker),
+                        "fork": false
+                    })
+                    .to_string(),
+                },
+                E::ToolUseEnd {
+                    id: "spawn-a".into(),
+                },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        } else {
+            let child = self
+                .spawned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .expect("the first turn must have produced a child id");
+            vec![
+                E::ToolUseStart {
+                    id: "inspect-a".into(),
+                    name: "inspect_agent".into(),
+                },
+                E::ToolUseDelta {
+                    id: "inspect-a".into(),
+                    partial_json: serde_json::json!({ "task_id": child }).to_string(),
+                },
+                E::ToolUseEnd {
+                    id: "inspect-a".into(),
+                },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        };
+        Ok(futures::stream::iter(events).boxed())
+    }
+}
+
+/// Drives one turn to its completion, collecting the delegation announcement.
+///
+/// Retrying `turn/start` is how a test says "the previous turn is retired": the
+/// server clears `active_turn_id` after broadcasting completion, so a refusal here
+/// is that unrelated race, not this test's subject.
+async fn run_delegation_turn(
+    h: &mut Harness,
+    tid: &str,
+    request_id: u64,
+    text: &str,
+) -> serde_json::Value {
+    let mut attempt = 0;
+    loop {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{request_id},"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
+        ))
+        .await;
+        let mut refused = false;
+        loop {
+            let value = h.read_value().await;
+            if value.get("id") == Some(&serde_json::json!(request_id)) {
+                if value.get("error").is_some() {
+                    refused = true;
+                }
+                break;
+            }
+            if value["method"] == "turn/started" {
+                break;
+            }
+        }
+        if !refused {
+            break;
+        }
+        attempt += 1;
+        assert!(attempt < 100, "turn {request_id} was never accepted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut announced = serde_json::Value::Null;
+    let mut tool_errors: Vec<serde_json::Value> = Vec::new();
+    loop {
+        let value = h.read_value().await;
+        match value["method"].as_str() {
+            Some("thread/delegationStatus/updated") => announced = value["params"].clone(),
+            Some("item/completed")
+                if value["params"]["item"]["type"] == serde_json::json!("toolCall") =>
+            {
+                let item = &value["params"]["item"];
+                if item["status"].as_str() == Some("error") {
+                    tool_errors.push(item.clone());
+                }
+            }
+            Some("turn/completed") => break,
+            _ => {}
+        }
+    }
+    assert!(
+        tool_errors.is_empty(),
+        "a prepared turn's delegation tools must not fail: {tool_errors:?}"
+    );
+    announced
+}
+
+/// Two turns of one conversation really delegate, and the second finds the first
+/// turn's child still attributed to this conversation.
+///
+/// This is the acceptance test for the reported bug: a conversation that spawned
+/// under turn 1 must be able to spawn and inspect again under turn 2, and the
+/// normal end of turn 1 must not cancel the child it created.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_delegation_lifecycle_app_server_two_turns_keep_background_child() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let marker = format!("marker-{}", std::process::id());
+    let provider = Arc::new(DelegationProvider::new(&marker));
+    let spawned = Arc::clone(&provider.spawned);
+    let inspected = Arc::clone(&provider.inspected);
+    let factory_provider: Arc<dyn yi_agent_core::Provider> = provider;
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(Arc::clone(&factory_provider), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    let tid = start_thread(&mut h).await;
+
+    let first = run_delegation_turn(&mut h, &tid, 41, &marker).await;
+    assert_eq!(
+        first["ready"],
+        serde_json::json!(true),
+        "turn 1 must be admitted by the daemon: {first}"
+    );
+    assert!(
+        spawned.lock().unwrap_or_else(|p| p.into_inner()).is_some(),
+        "the first turn's spawn_agent call must have produced a child"
+    );
+
+    let second = run_delegation_turn(&mut h, &tid, 42, "now inspect it").await;
+    assert_eq!(
+        second["ready"],
+        serde_json::json!(true),
+        "turn 2 must be admitted after turn 1 ended normally: {second}"
+    );
+    let detail = inspected
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .expect("the second turn must have inspected the first turn's child");
+    assert!(
+        detail["task_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "inspect must name the child: {detail}"
+    );
+    // A normal turn end closes *this turn*, not the child: the child is a
+    // background task the conversation keeps, so it must still be inspectable.
+    assert!(
+        detail.get("state").is_some(),
+        "a kept child must still report a state: {detail}"
     );
 
     h.shutdown().await;

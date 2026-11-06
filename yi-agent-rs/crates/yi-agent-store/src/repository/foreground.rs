@@ -786,6 +786,32 @@ impl RuntimeRepository {
         Ok(records)
     }
 
+    /// The proof a caller referenced, as the daemon itself stored it.
+    ///
+    /// A `QuiescenceRef` is only an address. The coordinator must not believe the
+    /// address alone: it reads back the record and re-checks the fence, the
+    /// execution and the two facts, so a caller cannot mint "stopped" by naming a
+    /// row that either does not exist or proves only half of it.
+    pub fn stop_evidence_by_id(
+        &self,
+        root: &TaskId,
+        evidence_id: &str,
+    ) -> Result<Option<StopEvidence>, RepositoryError> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM foreground_stop_evidence
+                 WHERE root_task_id = ?1 AND execution_id = ?2",
+                params![root.to_string(), evidence_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The committed activity snapshot, if one exists.
     ///
     /// A historical `running` phase is projected to `Unknown`: after a restart the

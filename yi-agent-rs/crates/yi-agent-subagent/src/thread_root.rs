@@ -111,6 +111,31 @@ impl std::error::Error for RootAttachError {}
 /// The `RuntimeBinding` is shared (one daemon per project, self-healing); this
 /// type owns only the root triple, so two conversations in one directory have
 /// two independent root tasks and two independent child budgets.
+/// What this conversation's runtime will let it be.
+///
+/// The three answers are deliberately distinct. Collapsing them into `None` was the
+/// bug that let a guardian's refusal look like embedded mode, so delegation fell
+/// back to a resume secret the policy had just declined to authorize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForegroundAuthority {
+    /// No guardian serves this runtime: the host may use its own resume secret.
+    Embedded,
+    /// The guardian authorized this host; delegation proceeds as managed.
+    Managed(yi_agent_lifecycle::types::RootAuthorization),
+    /// A guardian exists and refused; embedded semantics may **not** be used.
+    Refused(String),
+}
+
+impl ForegroundAuthority {
+    /// The authorization, for callers that only care whether one exists.
+    pub fn into_authorization(self) -> Option<yi_agent_lifecycle::types::RootAuthorization> {
+        match self {
+            Self::Managed(authorization) => Some(authorization),
+            Self::Embedded | Self::Refused(_) => None,
+        }
+    }
+}
+
 pub struct ThreadRoot {
     binding: Arc<RuntimeBinding>,
     thread_id: String,
@@ -131,12 +156,35 @@ pub struct ThreadRoot {
     /// can never be read apart: a root is only ever paired with the runtime that
     /// created it.
     cached: Mutex<Option<CachedRoot>>,
+    /// The container address minted for this conversation, per generation.
+    ///
+    /// Kept apart from `cached` because a container root is *not* an
+    /// `AttachedRoot`: it carries no capability, and mixing the two would make it
+    /// far too easy to hand a container's address to a legacy path that expects one.
+    container: Mutex<Option<SessionContainerAttachment>>,
 }
 
 /// A conversation root plus the runtime generation that minted it.
 struct CachedRoot {
     generation: u64,
     root: AttachedRoot,
+}
+
+/// One attached container's address, and nothing else.
+///
+/// Deliberately not an [`AttachedRoot`]: a container attach never returns a
+/// capability, so there is no field here a caller could mistake for one. The
+/// binding that authorises writes is issued separately by `prepare`, and only to
+/// a host that proved an identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionContainerAttachment {
+    pub session_id: String,
+    pub root_id: String,
+    /// Where the container's root runs. Cached so a re-attach can be skipped
+    /// without re-deriving it from the request.
+    pub workspace_root: PathBuf,
+    /// The daemon generation this address was resolved against.
+    pub generation: u64,
 }
 
 /// Whether a cached root still belongs to the runtime the binding is currently
@@ -164,6 +212,7 @@ impl ThreadRoot {
             extra_roots,
             managed: None,
             cached: Mutex::new(None),
+            container: Mutex::new(None),
         })
     }
 
@@ -187,6 +236,7 @@ impl ThreadRoot {
             extra_roots,
             managed: Some(context),
             cached: Mutex::new(None),
+            container: Mutex::new(None),
         })
     }
 
@@ -216,6 +266,7 @@ impl ThreadRoot {
             extra_roots,
             managed: Some(context),
             cached: Mutex::new(None),
+            container: Mutex::new(None),
         });
         *thread_root.lock_cached() = Some(CachedRoot { generation, root });
         thread_root
@@ -233,7 +284,32 @@ impl ThreadRoot {
     /// through the wire. The fixed binding reports generation 0 forever, so the
     /// root stays live and no repair is ever attempted.
     pub fn from_handle(binding: Arc<RuntimeBinding>, root: AttachedRoot) -> Arc<Self> {
+        // The root's own session id is the only key available here, and for a
+        // single-root host it is also the right one: nothing will attach a second
+        // container for this process. A host that *does* know its conversation key
+        // must use [`Self::adopt`] instead.
         let thread_id = root.session_id.clone();
+        Self::adopt(binding, root, thread_id)
+    }
+
+    /// Wraps an already-attached root as *this conversation's* root.
+    ///
+    /// Separate from [`Self::from_handle`] because the two ids are not the same
+    /// thing: `AttachedRoot::session_id` is the daemon's root session, which is
+    /// minted fresh on every attach, while a conversation's container key is
+    /// `thread:<thread_id>` -- stable across restarts and retries. Adopting with
+    /// the session id would make this conversation's container a *second* task:
+    /// the root the host attached (keyed by the thread) plus one derived from the
+    /// session, and a turn's fence would name whichever the write happened to use.
+    ///
+    /// A host that keys its application root by the conversation passes that key
+    /// here, which is what makes the attached root and the container one task.
+    pub fn adopt(
+        binding: Arc<RuntimeBinding>,
+        root: AttachedRoot,
+        thread_id: impl Into<String>,
+    ) -> Arc<Self> {
+        let thread_id = thread_id.into();
         let project_dir = root.workspace.path.clone();
         // The TUI and the daemon's own workers are single-root by design: they
         // were handed one already-attached root, and there is no second root to
@@ -376,6 +452,130 @@ impl ThreadRoot {
             },
         });
         Ok(())
+    }
+
+    /// Attaches (or adopts) this conversation's *container* on the shared daemon.
+    ///
+    /// Separate from [`Self::attach`] on purpose. The legacy attach hands back a
+    /// capability, which is exactly what a restarted host must not be able to lift
+    /// by naming a thread key; this one answers with an address only, and the
+    /// authority comes later from [`Self::prepare_session`] against an identity.
+    ///
+    /// `creation_resume_digest` is sent only for the call that *creates* the
+    /// container. Sending it on an adopt would propose a new digest to an existing
+    /// container, which is how one host would take over another's session.
+    pub fn attach_session_container(
+        &self,
+        identity: &yi_agent_lifecycle::session_delegation::SessionIdentity,
+        operation_id: &str,
+        creation_resume_digest: Option<String>,
+    ) -> Result<SessionContainerAttachment, crate::session_delegation::SessionClientError> {
+        use crate::session_delegation::SessionClientError;
+
+        let generation = self.binding.generation();
+        if let Some(cached) = self.live_session_container(generation) {
+            return Ok(cached);
+        }
+        // A revive is tried here rather than inside the binding so the failure stays
+        // classifiable: only a request that provably never left this process may be
+        // sent again, and a repair+retry has to know that. Repair first when the
+        // answered cleanup left no live runtime behind.
+        let (shared, generation) = self.binding.current_with_generation();
+        let response = match crate::attach::probe_runtime(&shared.socket_path) {
+            crate::attach::RuntimeProbe::Healthy => send_request(
+                &shared.socket_path,
+                IpcRequest::AttachSessionContainer {
+                    idempotency_key: application_root_key(&self.thread_id),
+                    workspace: self.project_dir.clone(),
+                    extra_roots: self
+                        .extra_roots
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect(),
+                    operation_id: operation_id.to_string(),
+                    creation_resume_digest: creation_resume_digest.clone(),
+                    identity: Some(identity.clone()),
+                },
+            )
+            .map_err(|error| match error {
+                yi_agent_store::ipc::IpcError::Io(io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    SessionClientError::Connect(io.to_string())
+                }
+                other => SessionClientError::Transport(other.to_string()),
+            }),
+            probe => Err(SessionClientError::Connect(format!(
+                "the runtime at {} is {probe:?}",
+                shared.socket_path.display()
+            ))),
+        }?;
+        let generation = self.binding.generation().max(generation);
+        let IpcResponse::SessionContainerAttached { root, workspace } = response else {
+            return Err(match response {
+                IpcResponse::SessionDelegationRejected { failure } => {
+                    SessionClientError::Rejected(failure)
+                }
+                other => SessionClientError::Protocol(format!(
+                    "the daemon did not attach a session container: {other:?}"
+                )),
+            });
+        };
+        let attachment = SessionContainerAttachment {
+            session_id: root.session_id,
+            root_id: root.root_id,
+            workspace_root: workspace.path,
+            generation,
+        };
+        *self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(attachment.clone());
+        Ok(attachment)
+    }
+
+    /// Drops the cached container address.
+    ///
+    /// A container attach is cached per generation so a turn does not re-attach
+    /// every time. When the daemon this address belongs to turns out to be gone,
+    /// the cache is exactly what would keep the host from ever recovering: the
+    /// next attach would find a "live" generation and short-circuit onto a socket
+    /// nobody serves. Dropping it is what lets the repair+mint happen once.
+    pub fn forget_session_container(&self) {
+        *self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// The runtime binding this conversation resolves through.
+    ///
+    /// Exposed so a host that must recover from a dead daemon can repair the one
+    /// binding the cache, the attach and the tools all read -- repairing a copy
+    /// would advance a generation nobody else observes.
+    pub fn binding(&self) -> &Arc<RuntimeBinding> {
+        &self.binding
+    }
+
+    /// The cached container address for the live generation, if any.
+    fn live_session_container(&self, generation: u64) -> Option<SessionContainerAttachment> {
+        let mut cached = self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cached.as_ref() {
+            Some(entry) if entry.generation == generation => Some(entry.clone()),
+            Some(_) => {
+                *cached = None;
+                None
+            }
+            None => None,
+        }
     }
 
     /// The handle a delegation call should act as: the shared socket plus this
@@ -588,12 +788,36 @@ impl ThreadRoot {
         lease: &yi_agent_lifecycle::client::FrontendLease,
         operation_id: &str,
     ) -> Result<Option<RootAuthorization>, String> {
+        Ok(self
+            .authority_decision(lease, operation_id)?
+            .into_authorization())
+    }
+
+    /// The same question, answered with the *reason*, not flattened to `None`.
+    ///
+    /// Delegation needs the difference: "no guardian exists" is embedded mode and
+    /// may use the host's own resume secret, while "a guardian exists and said no"
+    /// must never fall back to it -- that would turn a policy refusal into
+    /// permission. Both are normal outcomes and neither is an error.
+    pub fn foreground_authority(
+        &self,
+        lease: &yi_agent_lifecycle::client::FrontendLease,
+        operation_id: &str,
+    ) -> Result<crate::thread_root::ForegroundAuthority, String> {
+        self.authority_decision(lease, operation_id)
+    }
+
+    fn authority_decision(
+        &self,
+        lease: &yi_agent_lifecycle::client::FrontendLease,
+        operation_id: &str,
+    ) -> Result<crate::thread_root::ForegroundAuthority, String> {
         let Some(runtime_dir) = self.binding.runtime_dir() else {
-            return Ok(None);
+            return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         };
         let control_path = runtime_dir.join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
         if !control_path.exists() {
-            return Ok(None);
+            return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         }
         let intent = yi_agent_lifecycle::foreground::RootBindIntent {
             operation_id: operation_id.to_string(),
@@ -608,17 +832,22 @@ impl ThreadRoot {
         let deadline =
             yi_agent_lifecycle::deadline::Deadline::after(std::time::Duration::from_secs(5));
         match lease.authorize_root(&intent, &deadline) {
-            Ok(authorization) => Ok(Some(authorization)),
+            Ok(authorization) => Ok(crate::thread_root::ForegroundAuthority::Managed(
+                authorization,
+            )),
             // A refusal is the guardian's policy answer: this host may run the turn
-            // without activity reporting. Only a transport failure is worth surfacing,
-            // and even then the caller decides -- the conversation is not lost.
+            // without activity reporting, but it must not present itself as managed.
+            // Only a transport failure is worth surfacing, and even then the caller
+            // decides -- the conversation is not lost.
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::debug!(%error, thread_id = %self.thread_id, "foreground authority refused");
-                Ok(None)
+                Ok(crate::thread_root::ForegroundAuthority::Refused(
+                    error.to_string(),
+                ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                 tracing::debug!(%error, thread_id = %self.thread_id, "foreground lifecycle unsupported");
-                Ok(None)
+                Ok(crate::thread_root::ForegroundAuthority::Embedded)
             }
             Err(error) => Err(error.to_string()),
         }

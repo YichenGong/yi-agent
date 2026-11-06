@@ -438,7 +438,11 @@ fn run_internal_executor(owner: String, models: Option<std::path::PathBuf>) -> R
 fn run_internal_guardian() -> Result<()> {
     // Authorization first: the descriptor is what proves this role was assigned by
     // a launcher, so its absence must be the reported reason.
-    let _bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    // Watched, not merely held. Holding the descriptor only proves the launcher was
+    // alive at `exec`; reading it is what makes "the launcher is gone" observable,
+    // and a guardian that never reads it serves forever after its launcher exits.
+    let bootstrap = managed_runtime::take_guardian_bootstrap()?;
+    let launcher = yi_agent_supervisors::lifecycle::guardian::LauncherLifeline::watch(bootstrap);
     let key = yi_agent_supervisors::lifecycle::roles::scope_key()?;
     let runtime_dir = std::path::PathBuf::from(&key);
     let instance_home = std::env::var_os("YI_AGENT_INSTANCE_HOME")
@@ -466,7 +470,7 @@ fn run_internal_guardian() -> Result<()> {
             scope.key
         );
     }
-    managed_runtime::run_guardian(scope)
+    managed_runtime::run_guardian(scope, launcher)
 }
 
 /// Serves one runtime's business daemon as the managed role.
@@ -1059,7 +1063,7 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // invoked `serve` must record the same self-ignore so the project
             // state it creates never dirties the checkout.
             ignore_project_local_runtime_state(&workdir);
-            let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
+            let daemon = yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
                 &runtime_dir,
                 &database,
                 build_daemon_worker_factory(
@@ -1270,20 +1274,32 @@ impl HeadlessRuntimeSession {
     }
 }
 
+/// The attach request for an application root.
+///
+/// `conversation` is the stable key of the conversation this root *is*: when the
+/// caller has one, the root and that conversation's container are the same task,
+/// because a turn's writes name the container and a second root would be a parent
+/// the daemon never opened a turn for. `fallback_key` is used only when there is no
+/// conversation at all, which is the case for a process that will never delegate.
 fn attach_application_root_request(
-    idempotency_key: String,
+    conversation: Option<String>,
+    fallback_key: String,
     workspace: std::path::PathBuf,
 ) -> yi_agent_store::ipc::IpcRequest {
     yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
-        idempotency_key,
+        idempotency_key: conversation.unwrap_or(fallback_key),
         workspace,
         // The headless runtime runs single-root: it links no extra folders.
         extra_roots: Vec::new(),
     }
 }
 
-fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<HeadlessRuntimeSession> {
-    if let Some(session) = attach_managed_headless_runtime(config) {
+fn attach_headless_runtime(
+    cli: &Cli,
+    config: &config::Config,
+    conversation: Option<&str>,
+) -> Result<HeadlessRuntimeSession> {
+    if let Some(session) = attach_managed_headless_runtime(config, conversation) {
         return session;
     }
     let runtime_dir = runtime_directory_for(&config.workdir);
@@ -1296,18 +1312,24 @@ fn attach_headless_runtime(cli: &Cli, config: &config::Config) -> Result<Headles
     // in the project directory, so it would outlive any restart. Retire it so
     // the `start_with_factory` below replaces it with a working one.
     replace_wedged_daemon(&socket_path);
-    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
-        &runtime_dir,
-        &database,
-        build_daemon_worker_factory(cli, socket_path.clone())?,
-    ) {
-        Ok(daemon) => Some(daemon),
-        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
-        Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
-    };
+    let embedded_daemon =
+        match yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
+            &runtime_dir,
+            &database,
+            build_daemon_worker_factory(cli, socket_path.clone())?,
+        ) {
+            Ok(daemon) => Some(daemon),
+            Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+            Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
+        };
     let response = yi_agent_store::ipc::send_request(
         &socket_path,
         attach_application_root_request(
+            // The root *is* this conversation's container, so it is keyed the same
+            // way: a `run` that delegates must attach the container its turn will
+            // write as, not a second, process-specific root. A retry or a resumed
+            // thread therefore adopts the same container instead of minting one.
+            conversation.map(yi_agent_subagent::thread_root::application_root_key),
             format!(
                 "headless:{}:{}:{}",
                 std::process::id(),
@@ -1611,6 +1633,7 @@ fn startup_intent_for(
 /// must not be silently swapped for an embedded one either.
 fn attach_managed_headless_runtime(
     config: &config::Config,
+    _conversation: Option<&str>,
 ) -> Option<Result<HeadlessRuntimeSession>> {
     use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
 
@@ -1800,10 +1823,22 @@ fn attach_managed_tui_runtime(
     })))
 }
 
-fn attach_tui_runtime(cli: &Cli, config: &config::Config, thread_key: &str) -> TuiRuntimeSession {
+fn attach_tui_runtime(
+    cli: &Cli,
+    config: &config::Config,
+    conversation: Option<&str>,
+) -> TuiRuntimeSession {
+    // The per-conversation key a managed start authorizes a root under. It has to be
+    // stable for the whole conversation, so it comes from the store that outlives
+    // individual turns. A conversation with no store (persistence failed) still gets
+    // one key; `attach_managed_tui_runtime` mints it once rather than per attach.
+    let thread_key = conversation
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
+
     // The policy decides *who owns the daemon*; everything below this branch is
     // the embedded path, which stays byte-for-byte as it was.
-    if let Some(session) = attach_managed_tui_runtime(config, thread_key) {
+    if let Some(session) = attach_managed_tui_runtime(config, &thread_key) {
         return session;
     }
     let runtime_dir = runtime_directory_for(&config.workdir);
@@ -1840,7 +1875,11 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config, thread_key: &str) -> T
         }
     };
     let embedded_daemon =
-        match yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory) {
+        match yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
+            &runtime_dir,
+            &database,
+            factory,
+        ) {
             Ok(daemon) => Some(daemon),
             Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
             Err(error) => {
@@ -1860,7 +1899,11 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config, thread_key: &str) -> T
     );
     let response = match yi_agent_store::ipc::send_request(
         &socket_path,
-        attach_application_root_request(idempotency_key, config.workdir.clone()),
+        attach_application_root_request(
+            conversation.map(yi_agent_subagent::thread_root::application_root_key),
+            idempotency_key,
+            config.workdir.clone(),
+        ),
     ) {
         Ok(response) => response,
         Err(error) => {
@@ -1917,6 +1960,7 @@ fn build_tui_foreground_root(
     workdir: &std::path::Path,
     socket_path: std::path::PathBuf,
     attached_root: crate::tui::subagents::AttachedRoot,
+    conversation: Option<&str>,
 ) -> Arc<yi_agent_subagent::thread_root::ThreadRoot> {
     let handle = yi_agent_subagent::binding::RuntimeHandle {
         socket_path,
@@ -1932,7 +1976,50 @@ fn build_tui_foreground_root(
     // The root is already attached -- the TUI got it from `attach_tui_runtime` -- so
     // this must adopt rather than re-attach: a second attach would be a new session
     // for the same conversation.
-    yi_agent_subagent::thread_root::ThreadRoot::from_handle(binding, attached_root)
+    //
+    // Adopted under the *conversation's* key when the host has one. The attached
+    // root's own session id is minted per attach, so adopting under it would
+    // describe a different container than the one this conversation's turns fence
+    // their writes with.
+    match conversation {
+        Some(thread_id) => {
+            yi_agent_subagent::thread_root::ThreadRoot::adopt(binding, attached_root, thread_id)
+        }
+        None => yi_agent_subagent::thread_root::ThreadRoot::from_handle(binding, attached_root),
+    }
+}
+
+/// Prepares one TUI turn's delegation: the only place a turn is opened for the
+/// interactive host.
+///
+/// A turn is a *turn* fact, not an attach fact, so this runs on every turn:
+/// the previous turn's capability is retired with it, and a new one is prepared
+/// against the same container. What is **not** refreshed per turn is the worker
+/// identity -- the delegation tools never act as a worker, and a second
+/// registration would make one conversation look like two.
+///
+/// Extracted rather than inlined so the per-turn rule is testable without
+/// standing up the whole event loop.
+fn prepare_tui_turn_delegation(
+    root: Arc<yi_agent_subagent::thread_root::ThreadRoot>,
+    delegation: &mut Option<yi_agent_subagent::delegation::ThreadDelegation>,
+    identity_directory: &std::path::Path,
+    turn_id: &str,
+    authority: impl FnOnce() -> Option<yi_agent_subagent::thread_root::ForegroundAuthority>,
+) -> yi_agent_subagent::delegation::PreparedTurn {
+    if delegation.is_none() {
+        *delegation = Some(yi_agent_subagent::delegation::ThreadDelegation::for_thread(
+            Arc::clone(&root),
+            identity_directory,
+        ));
+    }
+    let driver = delegation.as_mut().expect("just built");
+    if driver.authority().is_none()
+        && let Some(authority) = authority()
+    {
+        driver.set_authority(authority);
+    }
+    driver.prepare_turn(turn_id)
 }
 
 fn detach_tui_runtime_root(
@@ -2555,8 +2642,44 @@ fn run_headless(
         anyhow::bail!("--subagents cannot be combined with --naked");
     }
 
+    // 会话存储：resume 用既有的那份，否则新开一条。与 TUI 同一套 store，
+    // 所以 `run` 跑过的会话之后能被 `resume` / TUI 接上。
+    //
+    // 建失败不阻断：headless 的首要职责是把这一问跑完并输出，落盘是附加价值。
+    //
+    // Built **before** the runtime attach, because the runtime root is this
+    // conversation's container: attaching needs the conversation's stable key, and
+    // a second, process-keyed root would be a parent no turn was ever opened for.
+    let session_store = match resume.as_deref() {
+        Some(spec) => {
+            let store = yi_agent_app_server::thread_store::ThreadStore::new(&config.workdir);
+            let id = resume::resolve_thread_id(&store, spec)?;
+            Some(
+                crate::session_store::TuiSessionStore::open(&config.workdir, &id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        }
+        None => {
+            let model = config.model.clone();
+            match crate::session_store::TuiSessionStore::create_new(
+                &config.workdir,
+                &model,
+                yi_agent_app_server::thread_store::ThreadMode::Normal,
+            ) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    eprintln!("[yi-agent] 本次会话不落盘: {e}");
+                    None
+                }
+            }
+        }
+    };
+    let conversation_key = session_store
+        .as_ref()
+        .map(|store| store.thread_id().to_string());
+
     let headless_runtime = if subagents {
-        let runtime = attach_headless_runtime(&cli, &config)?;
+        let runtime = attach_headless_runtime(&cli, &config, conversation_key.as_deref())?;
         // `yi-agent run` owns the terminal and streams its own diagnostics, so
         // the reclaim line keeps its historical home here.
         if let Some(reclaimed) = runtime
@@ -2606,39 +2729,14 @@ fn run_headless(
         None => build_headless_setup(&config, naked)?,
     };
     let tools = setup.tools;
+    // The process manager this run's shell/process tools actually use. A turn's
+    // stop proof names whether the groups it started are gone, and this is the only
+    // place that knows -- so it is captured here, next to the tools it belongs to.
+    let process_manager = Arc::clone(&setup.process_manager);
 
     let agent_config =
         yi_agent_runtime::bootstrap::build_agent_config(&config, setup.system_prompt);
     let mcp = setup.mcp;
-
-    // 会话存储：resume 用既有的那份，否则新开一条。与 TUI 同一套 store，
-    // 所以 `run` 跑过的会话之后能被 `resume` / TUI 接上。
-    //
-    // 建失败不阻断：headless 的首要职责是把这一问跑完并输出，落盘是附加价值。
-    let session_store = match resume.as_deref() {
-        Some(spec) => {
-            let store = yi_agent_app_server::thread_store::ThreadStore::new(&workdir);
-            let id = resume::resolve_thread_id(&store, spec)?;
-            Some(
-                crate::session_store::TuiSessionStore::open(&workdir, &id)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-            )
-        }
-        None => {
-            let model = config.model.clone();
-            match crate::session_store::TuiSessionStore::create_new(
-                &workdir,
-                &model,
-                yi_agent_app_server::thread_store::ThreadMode::Normal,
-            ) {
-                Ok(store) => Some(store),
-                Err(e) => {
-                    eprintln!("[yi-agent] 本次会话不落盘: {e}");
-                    None
-                }
-            }
-        }
-    };
 
     // resume 的种子：先升格崩溃残留的轮次，再读转录。顺序固定——反过来会
     // 读到未合流的旧状态。升格失败只记日志：`load` 自己也会合流 partial，
@@ -2657,6 +2755,7 @@ fn run_headless(
     }
 
     let rt = tokio::runtime::Runtime::new()?;
+    let headless_runtime_ref = headless_runtime.as_ref();
     let exit_code = rt.block_on(async move {
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
 
@@ -2682,13 +2781,111 @@ fn run_headless(
             .unwrap_or(0);
         let prompt_for_log = prompt_text.clone();
 
-        let stream = match agent.run(prompt_text).await {
-            Ok(s) => s,
+        // The same per-turn delegation the TUI and app-server prepare. `run` is a
+        // single turn, so this happens once -- but it is still a *turn* fact: the
+        // capability lives in this turn's tool set and is retired when the run ends,
+        // which is what stops a slow call from spawning after the process is done.
+        let turn_id_for_delegation = format!("run-turn-{}", uuid::Uuid::new_v4());
+        let mut delegation: Option<yi_agent_subagent::delegation::ThreadDelegation> = None;
+        let mut delegation_turn: Option<(
+            std::sync::Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+            yi_agent_lifecycle::foreground::ExecutionIdentity,
+        )> = None;
+        if let Some(runtime) = headless_runtime_ref {
+            let root = build_tui_foreground_root(
+                &runtime.attached_root.workspace.path,
+                runtime.socket_path.clone(),
+                runtime.attached_root.clone(),
+                session_store.as_ref().map(|store| store.thread_id()),
+            );
+            let identity_directory = session_store
+                .as_ref()
+                .map(|store| store.session_identity_directory())
+                .unwrap_or_else(|| {
+                    runtime
+                        .attached_root
+                        .workspace
+                        .path
+                        .join(".session-identities")
+                });
+            let mut driver = yi_agent_subagent::delegation::ThreadDelegation::for_thread(
+                Arc::clone(&root),
+                &identity_directory,
+            );
+            // `run` is one invocation, so the guardian is asked here once rather
+            // than per turn. A refusal is recorded verbatim and never downgraded to
+            // the embedded resume secret.
+            let runtime_dir = runtime_directory_for(&runtime.attached_root.workspace.path);
+            if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
+                &runtime_dir,
+                yi_agent_lifecycle::types::ClientKind::Tui,
+                crate::frontend_lease::new_client_run_id("run-foreground"),
+            ) && let Ok(authority) =
+                host.authority(&root, &format!("run-delegation:{}", std::process::id()))
+            {
+                driver.set_authority(authority);
+            }
+            let prepared = driver.prepare_turn(&turn_id_for_delegation);
+            delegation = Some(driver);
+
+            let mut registry = (*agent.tools()).clone();
+            let caller = yi_agent_subagent::CallerContext::unbound();
+            caller.bind(agent.session_handle());
+            let controller = yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+                config.sandbox,
+                config.sandbox_promotable,
+            );
+            match yi_agent_subagent::delegation::install_turn_tools(
+                &mut registry,
+                prepared,
+                controller,
+                session_store
+                    .as_ref()
+                    .map(|store| store.thread_id().to_string()),
+                caller,
+            ) {
+                Ok(installed) => delegation_turn = Some(installed),
+                Err(failure) => {
+                    eprintln!(
+                        "[yi-agent] 本轮无法委派子 agent ({}): {}",
+                        failure.code(),
+                        failure.reason()
+                    );
+                }
+            }
+            agent.set_tools_for_next_run(std::sync::Arc::new(registry));
+        }
+        let processes_at_start: Vec<String> = process_manager
+            .list()
+            .into_iter()
+            .map(|process| process.process_id)
+            .collect();
+        // Tracked, not plain: "the execution stopped" must be an observation this
+        // process can back up, not a claim made while dropping a stream.
+        let tracked = match agent
+            .run_tracked_blocks(vec![yi_agent_core::ContentBlock::Text(prompt_text)])
+            .await
+        {
+            Ok(tracked) => tracked,
             Err(e) => {
                 eprintln!("error: {e}");
+                // The execution that could not start still has to be retired: it was
+                // registered before the run, so leaving it unsettled would refuse the
+                // next host for a turn that never ran. `joined: false` says exactly
+                // that, and the daemon keeps it as unproven rather than believing a
+                // stop nobody observed.
+                if let (Some((turn, execution)), Some(driver)) =
+                    (delegation_turn.take(), delegation.as_mut())
+                {
+                    driver.finish_turn(&turn);
+                    let _ = driver.record_stopped(&execution, false, false);
+                }
                 return 1;
             }
         };
+        let mut run_control = Some(tracked.control);
+        let stream = tracked.events;
 
         let mut turn_log = crate::turn_log::TurnLog::new(session_store.as_ref().map(|s| {
             yi_agent_app_server::translate::Translator::new(
@@ -2704,6 +2901,39 @@ fn run_headless(
         let mut err = stderr.lock();
         let code =
             drain_with_signals(stream, &mut out, &mut err, json, &agent, &mut turn_log).await;
+
+        // Retire this run's execution on every path, in the order that matters: the
+        // turn closes locally first (so a tool that outlived the drain cannot
+        // write), then the stop is reported with what this process observed -- the
+        // run was joined, and the process groups it started are gone. Reporting a
+        // `false` is legitimate: the daemon then keeps the execution unproven rather
+        // than believing a stop nobody saw.
+        if let (Some((turn, execution)), Some(driver)) =
+            (delegation_turn.take(), delegation.as_mut())
+        {
+            driver.finish_turn(&turn);
+            let joined = match run_control.as_mut() {
+                Some(control) => control
+                    .stop_and_join(std::time::Duration::from_secs(2))
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            let tools_stopped = process_manager.list().iter().all(|process| {
+                if processes_at_start.contains(&process.process_id) {
+                    return true;
+                }
+                matches!(
+                    process.status,
+                    yi_agent_tools::ProcessStatus::Exited { .. }
+                        | yi_agent_tools::ProcessStatus::Killed
+                        | yi_agent_tools::ProcessStatus::FailedToStart { .. }
+                )
+            });
+            if let Err(error) = driver.record_stopped(&execution, joined, tools_stopped) {
+                eprintln!("[yi-agent] 本轮已结束，但停止状态未能上报: {error}");
+            }
+        }
 
         // 落盘。与 TUI 一样挂在 stream 结束上而不是 `Done`：取消路径不发 Done。
         if let Some(store) = session_store.as_ref() {
@@ -3221,14 +3451,6 @@ fn run_tui_agent(
                 }
             };
         let session_store_for_driver = session_store.clone();
-        // The per-conversation key a managed start authorizes a root under. It must be
-        // stable for the whole conversation, so it comes from the store that outlives
-        // individual turns; a conversation with no store (persistence failed) still gets
-        // one key, generated once here rather than per attach.
-        let thread_key_for_driver = session_store_for_driver
-            .as_ref()
-            .map(|store| store.thread_id().to_string())
-            .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
 
         // 旁支:一份 source 发布器 + 一个独立调度任务。
         //
@@ -3311,6 +3533,23 @@ fn run_tui_agent(
                 None::<yi_agent_subagent::foreground::ForegroundHost>,
             ));
             let mut current_runtime: Option<TuiRuntimeSession> = None;
+            // Per-turn delegation for this conversation.
+            //
+            // Its root is the *conversation's* container (`thread:<id>`), not the
+            // project root the TUI attached for display: a turn's fence and the
+            // parent a spawn is written under have to be the same task, or the
+            // daemon refuses the write as `authority_denied`.
+            //
+            // Re-decided every turn on purpose: activation is a once-per-conversation
+            // fact about the runtime, while delegation is a fact about *this* turn.
+            // Nothing is inherited, so a turn that could not prepare cannot leave a
+            // hook for the next one.
+            let mut delegation: Option<yi_agent_subagent::delegation::ThreadDelegation> = None;
+            // The turn's capability and execution, retired on every exit path.
+            let mut delegation_turn: Option<(
+                std::sync::Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+                yi_agent_lifecycle::foreground::ExecutionIdentity,
+            )> = None;
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
             // 跨轮存活：committed 累计要连续，重建会把用量断在每轮边界上。
             let mut turn_log = crate::turn_log::TurnLog::new(session_store_for_driver.as_ref().map(
@@ -3710,7 +3949,13 @@ fn run_tui_agent(
                 if let DriverInput::RuntimeChoice(choice) = input {
                     match choice {
                         Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
-                            match attach_tui_runtime(&cli, &config, &thread_key_for_driver) {
+                            match attach_tui_runtime(
+                                &cli,
+                                &config,
+                                session_store_for_driver
+                                    .as_ref()
+                                    .map(|store| store.thread_id()),
+                            ) {
                                 TuiRuntimeSession::Unavailable { reason } => {
                                     tracing::warn!(
                                         cause = %reason,
@@ -3879,12 +4124,26 @@ fn run_tui_agent(
                                                     },
                                                 )));
                                             root_activated = false;
+                                            // A managed start already built this
+                                            // conversation's root from the authority it
+                                            // obtained, so use that one: rebuilding it here
+                                            // would attach the same conversation twice.
                                             foreground_root = Some(match managed_root {
                                                 Some(root) => root,
+                                                // Embedded: the runtime is attached, so
+                                                // this conversation now has a root a host
+                                                // could drive. Whether it *may* is the
+                                                // guardian's answer, asked on the first
+                                                // turn (the authorization carries the
+                                                // objective's operation, which does not
+                                                // exist yet).
                                                 None => build_tui_foreground_root(
                                                     &runtime_workdir_for_foreground,
                                                     socket_path_for_foreground.clone(),
                                                     attached_root_for_foreground.clone(),
+                                                    session_store_for_driver
+                                                        .as_ref()
+                                                        .map(|store| store.thread_id()),
                                                 ),
                                             });
                                             foreground = None;
@@ -4018,6 +4277,104 @@ fn run_tui_agent(
                     }
                 }
 
+                // Delegation for this turn, decided here and only here.
+                //
+                // Order matters: prepare the container binding, open the turn, and
+                // only then hand the tools back a capability. A turn that could not
+                // prepare still runs (the conversation must stay usable) but ends up
+                // with *no* delegation tools -- the legacy instances installed at
+                // attach time are stripped either way, so nothing keeps answering
+                // `spawn_agent` after its own turn closed.
+                let turn_id_for_delegation = format!("tui-turn-{}", uuid::Uuid::new_v4());
+                let (tool_registry, delegation_failure) = {
+                    let mut registry = (*current_tools).clone();
+                    let prepared = match foreground_root.as_ref() {
+                        Some(root) => {
+                            // The store owns where this credential lives: a fork
+                            // copies the transcripts root, so the secret must sit
+                            // outside it and only this one place may decide that.
+                            let identity_directory = session_store_for_driver
+                                .as_ref()
+                                .map(|store| store.session_identity_directory())
+                                .unwrap_or_else(|| driver_workdir.join(".session-identities"));
+                            prepare_tui_turn_delegation(
+                                Arc::clone(root),
+                                &mut delegation,
+                                &identity_directory,
+                                &turn_id_for_delegation,
+                                // Asked once: it is a property of the host's lease, not
+                                // of the turn. A refusal is recorded verbatim and later
+                                // turns report it instead of quietly falling back to the
+                                // secret.
+                                || {
+                                    let slot = foreground_host.lock().ok()?;
+                                    let host = slot.as_ref()?;
+                                    host.authority(
+                                        root,
+                                        &format!("tui-delegation:{}", std::process::id()),
+                                    )
+                                    .ok()
+                                },
+                            )
+                        }
+                        // No root or no store: this conversation cannot delegate. The
+                        // tools are still stripped below, so nothing keeps answering
+                        // `spawn_agent` from a stale assembly.
+                        _ => yi_agent_subagent::delegation::PreparedTurn::NotReady(
+                            yi_agent_subagent::delegation::DelegationFailure::Unavailable(
+                                "this conversation has no delegation root".to_string(),
+                            ),
+                        ),
+                    };
+                    let caller = caller_for_attach.clone();
+                    caller.bind(agent.session_handle());
+                    let delegation_controller = yi_agent_tools::SandboxController::new(
+                        yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
+                        config.sandbox,
+                        config.sandbox_promotable,
+                    );
+                    match yi_agent_subagent::delegation::install_turn_tools(
+                        &mut registry,
+                        prepared,
+                        delegation_controller,
+                        session_store_for_driver
+                            .as_ref()
+                            .map(|store| store.thread_id().to_string()),
+                        caller,
+                    ) {
+                        Ok(installed) => {
+                            delegation_turn = Some(installed);
+                            (registry, None)
+                        }
+                        Err(failure) => (registry, Some(failure)),
+                    }
+                };
+                if let Some(failure) = &delegation_failure {
+                    // A visible fact, not a silent gap: the model may still try to
+                    // delegate, so the reason is what tells the user why it cannot.
+                    tracing::warn!(
+                        code = %failure.code(),
+                        reason = %failure.reason(),
+                        "delegation unavailable for this turn"
+                    );
+                    let _ = agent_tx
+                        .send(yi_agent_core::AgentEvent::Notice {
+                            level: yi_agent_core::NoticeLevel::Warn,
+                            text: format!("本轮无法委派子 agent: {}", failure.reason()),
+                        })
+                        .await;
+                }
+                agent.set_tools_for_next_run(std::sync::Arc::new(tool_registry));
+
+                // The process groups already alive when this turn starts. Anything
+                // this turn adds and still leaves running at exit is *not* proven
+                // stopped, and the daemon must be told so.
+                let processes_at_start: Vec<String> = process_manager_for_driver
+                    .list()
+                    .into_iter()
+                    .map(|process| process.process_id)
+                    .collect();
+
                 // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
                 // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
                 if mcp_for_driver.needs_reload(&driver_workdir, yi_agent_mcp::now_unix()) {
@@ -4061,9 +4418,16 @@ fn run_tui_agent(
                 // `agent.run(text)` 会 move 掉 text；落盘与 touch 都需要它。
                 let prompt_for_log = text.clone();
 
-                match agent.run(text).await {
-                    Ok(stream) => {
-                        let mut stream = Box::pin(stream);
+                // Tracked, not plain: a plain run detaches the loop's real task, so
+                // "the execution stopped" would be a claim instead of an observation
+                // the daemon can check. This is what makes a stop proof possible at
+                // all, and it is why the TUI does not simply drop the stream.
+                let mut run_control: Option<yi_agent_core::managed_run::ManagedRunControl> = None;
+                let run = agent.run_tracked_blocks(vec![yi_agent_core::ContentBlock::Text(text)]).await;
+                match run {
+                    Ok(tracked) => {
+                        run_control = Some(tracked.control);
+                        let mut stream = Box::pin(tracked.events);
                         // 每次 run() 之后取一次：句柄只在本次 stream 的生命期内有效，
                         // 下一轮重新取（run() 内部会重建 inbox）。
                         let inbox = agent.inbox_handle();
@@ -4171,6 +4535,63 @@ fn run_tui_agent(
                 // statement about a turn that never ended.
                 if let Some(mut turn) = foreground.take() {
                     turn.finish();
+                }
+                // Retirement runs on every path, and the order inside it is the point:
+                //
+                // 1. the turn closes **locally first**, so a tool that outlived the run
+                //    cannot write even if the daemon never answers;
+                // 2. the execution is retired with evidence this driver actually
+                //    observed -- the run was joined, and the process groups it started
+                //    are gone.
+                //
+                // A `false` is not papered over: the daemon then keeps the execution
+                // unsettled and refuses the next driver, which is the correct answer
+                // for "a process may still be writing".
+                if let (Some((turn, execution)), Some(driver)) =
+                    (delegation_turn.take(), delegation.as_mut())
+                {
+                    driver.finish_turn(&turn);
+                    let joined = match run_control.as_mut() {
+                        Some(control) => control
+                            .stop_and_join(std::time::Duration::from_secs(2))
+                            .await
+                            .is_ok(),
+                        // The run never started, so no control exists and no join can
+                        // be claimed: `true` would describe a task that was never made.
+                        None => false,
+                    };
+                    let tools_stopped = process_manager_for_driver
+                        .list()
+                        .iter()
+                        .all(|process| {
+                            if processes_at_start.contains(&process.process_id) {
+                                return true;
+                            }
+                            matches!(
+                                process.status,
+                                yi_agent_tools::ProcessStatus::Exited { .. }
+                                    | yi_agent_tools::ProcessStatus::Killed
+                                    | yi_agent_tools::ProcessStatus::FailedToStart { .. }
+                            )
+                        });
+                    if let Err(error) = driver.record_stopped(&execution, joined, tools_stopped) {
+                        // Never silent: an unrecorded stop is the difference between
+                        // "the next turn works" and "the next turn is refused as
+                        // StopUnproven".
+                        tracing::warn!(
+                            turn_id = %turn.context().turn_id,
+                            %error,
+                            "the turn closed but its execution stop was not recorded"
+                        );
+                        let _ = agent_tx
+                            .send(yi_agent_core::AgentEvent::Notice {
+                                level: yi_agent_core::NoticeLevel::Warn,
+                                text: format!(
+                                    "本轮已结束，但停止状态未能上报给 daemon: {error}"
+                                ),
+                            })
+                            .await;
+                    }
                 }
                 is_running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
 
@@ -4500,6 +4921,123 @@ mod tests {
                 expected,
                 "{arguments:?} took the wrong side of the managed-frontend line"
             );
+        }
+    }
+
+    /// TUI 每轮都换 turn，但不换 worker 身份。
+    ///
+    /// 两个层面必须分开：turn 是**回合**事实（这轮的写权限随本轮结束而失效），
+    /// worker 是**会话**事实（一个会话只有一个容器，不该因为换了轮次就多出一个）。
+    /// 把它们混在一起的旧写法只在 attach 时装一次工具，于是第二轮要么沿用上一轮
+    /// 已关闭的 turn（写不进去），要么把同一会话注册成第二个 worker。
+    ///
+    /// 这条用例跑真实 daemon：两轮都准备成功、拿到的是**不同**的 turn、且执行
+    /// 身份始终是本会话的容器任务、种类恒为 driver（不是 worker）。
+    #[test]
+    fn session_delegation_lifecycle_tui_entry_refreshes_turn_not_worker_identity() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=T",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .expect("git commit");
+
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+        let models = repo.path().join("models.json");
+        let attached = yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo attaches");
+        let root = build_tui_foreground_root(
+            repo.path(),
+            attached.socket_path.clone(),
+            attached.attached_root.clone(),
+            Some("thread-tui"),
+        );
+
+        let mut delegation: Option<yi_agent_subagent::delegation::ThreadDelegation> = None;
+        let identities = repo.path().join(".session-identities");
+
+        let first = prepare_tui_turn_delegation(
+            Arc::clone(&root),
+            &mut delegation,
+            &identities,
+            "tui-turn-1",
+            || None,
+        );
+        let yi_agent_subagent::delegation::PreparedTurn::Ready {
+            turn: first_turn,
+            execution: first_execution,
+        } = first
+        else {
+            panic!("the first TUI turn must prepare");
+        };
+        // 第二轮：同一个 driver、同一个容器，换的是 turn。
+        let second = prepare_tui_turn_delegation(
+            Arc::clone(&root),
+            &mut delegation,
+            &identities,
+            "tui-turn-2",
+            || None,
+        );
+        // A turn fences its writes against the **container** task, which is a
+        // different task from the application root the host attached through.
+        // Asserting they differ is what pins "acts as the container" rather than
+        // "acts as whatever the attach handed back".
+        let application_root = delegation
+            .as_ref()
+            .expect("the prepares built the driver")
+            .root()
+            .root_task_id()
+            .expect("the application root is attached");
+        match second {
+            yi_agent_subagent::delegation::PreparedTurn::Ready { turn, execution } => {
+                assert_ne!(
+                    first_turn.context().turn_id,
+                    turn.context().turn_id,
+                    "each turn must carry its own turn id, not borrow the previous one"
+                );
+                assert_ne!(
+                    first_execution.execution_id, execution.execution_id,
+                    "each turn registers its own execution"
+                );
+                assert_eq!(
+                    first_execution.task_id, execution.task_id,
+                    "both turns belong to one container: the worker identity must not change"
+                );
+                assert_ne!(
+                    execution.task_id, application_root,
+                    "a turn must act as the conversation's container, not as the \
+                     application root the attach minted"
+                );
+                assert_eq!(
+                    execution.kind,
+                    yi_agent_lifecycle::foreground::ExecutionKind::Driver,
+                    "a foreground turn is a driver, never a worker"
+                );
+            }
+            yi_agent_subagent::delegation::PreparedTurn::NotReady(failure) => {
+                panic!("the second TUI turn must prepare: {failure:?}")
+            }
         }
     }
 
@@ -6087,7 +6625,7 @@ mod tests {
         // them. That is the whole point of the infallible return type: the old
         // test had to panic on an escaped error, which is a runtime guard where
         // the type should have been the guard.
-        match attach_tui_runtime(&cli, &config, "test-conversation") {
+        match attach_tui_runtime(&cli, &config, None) {
             TuiRuntimeSession::Unavailable { reason } => {
                 assert!(
                     !reason.trim().is_empty(),
@@ -6789,6 +7327,7 @@ mod tests {
             workspace,
             extra_roots,
         } = attach_application_root_request(
+            None,
             "test-key".into(),
             std::path::PathBuf::from("/projects/b"),
         )
@@ -7293,6 +7832,7 @@ mod tests {
                     base_commit: String::new(),
                 },
             },
+            None,
         );
 
         assert_eq!(
@@ -7305,6 +7845,50 @@ mod tests {
             Some("root-1"),
             "the already-attached root must be adopted, not re-minted"
         );
+    }
+
+    /// A conversation-keyed foreground root must key itself by the *conversation*.
+    ///
+    /// `AttachedRoot::session_id` is minted per attach, so adopting under it makes
+    /// the conversation's container a different task from the root the host
+    /// attached. The symptom is the reported bug: a turn fences its writes with one
+    /// task and `spawn_agent` names the other, and the daemon refuses the spawn as
+    /// `authority_denied` even though the conversation is open.
+    #[test]
+    fn tui_foreground_root_keys_itself_by_the_conversation() {
+        let workdir = std::path::Path::new("/tmp/tui-conversation-project");
+        let socket = std::path::PathBuf::from("/tmp/tui-conversation-project/rt/runtime.sock");
+        let attached = || crate::tui::subagents::AttachedRoot {
+            session_id: "session-minted-per-attach".into(),
+            task_id: "root-1".into(),
+            capability: "cap-1".into(),
+            workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                repository_root: std::path::PathBuf::from("/tmp/tui-conversation-project"),
+                path: std::path::PathBuf::from("/tmp/tui-conversation-project"),
+                branch: String::new(),
+                parent_branch: String::new(),
+                base_commit: String::new(),
+            },
+        };
+
+        let keyed =
+            build_tui_foreground_root(workdir, socket.clone(), attached(), Some("thread-42"));
+        assert_eq!(
+            keyed.thread_id(),
+            "thread-42",
+            "a conversation-keyed root must not fall back to the per-attach session id"
+        );
+        assert_eq!(
+            keyed.root_task_id().as_deref(),
+            Some("root-1"),
+            "the attached root is still the task this conversation delegates from"
+        );
+
+        // Without a conversation there is nothing better to key by, so the old
+        // behaviour stands rather than inventing a key.
+        let unkeyed = build_tui_foreground_root(workdir, socket, attached(), None);
+        assert_eq!(unkeyed.thread_id(), "session-minted-per-attach");
     }
 
     /// Both frontends must consult the bring-up policy before starting a daemon.
@@ -7356,15 +7940,19 @@ mod tests {
         // The dispatch has to be *called*. Defining it and forgetting to invoke it
         // is the exact failure this whole change exists to fix, so assert the call
         // site in each entry point rather than only the helper's body.
+        // Anchored on the `fn` name only: the parameter list is allowed to grow
+        // (it carries the conversation now), and a needle that pins the old
+        // one-line signature would fail for that reason rather than for a missing
+        // dispatch.
         for (name, anchor, call) in [
             (
                 "attach_tui_runtime",
-                ["fn attach_tui", "_runtime(cli"].concat(),
+                ["fn attach_tui", "_runtime("].concat(),
                 ["attach_managed_tui", "_runtime(config"].concat(),
             ),
             (
                 "attach_headless_runtime",
-                ["fn attach_headless", "_runtime(cli"].concat(),
+                ["fn attach_headless", "_runtime("].concat(),
                 ["attach_managed_headless", "_runtime(config"].concat(),
             ),
         ] {

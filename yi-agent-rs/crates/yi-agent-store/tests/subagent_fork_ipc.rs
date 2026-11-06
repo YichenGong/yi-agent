@@ -107,7 +107,13 @@ struct ForkDaemon {
 
 /// Starts a real daemon whose factory records worker starts, attaches one
 /// application root, and returns its capability so the caller can fork.
-fn forked_daemon() -> (ForkDaemon, String, String, String) {
+fn forked_daemon() -> (
+    ForkDaemon,
+    String,
+    String,
+    String,
+    yi_agent_lifecycle::session_delegation::SessionBinding,
+) {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let project = directory.path().join("project");
@@ -135,6 +141,37 @@ fn forked_daemon() -> (ForkDaemon, String, String, String) {
     else {
         panic!("expected an application root attachment");
     };
+    // A container write now needs an open turn, so the fixture binds one host
+    // once. The legacy capability is spent here, which is also the only chance to
+    // spend it: every later test works from the binding.
+    let resume_secret = yi_agent_lifecycle::foreground::SecretCapability::new("fork-resume");
+    let IpcResponse::SessionPrepared { binding } = send_request(
+        daemon.socket_path(),
+        IpcRequest::PrepareSessionDelegation {
+            request: yi_agent_lifecycle::session_delegation::PrepareSession {
+                root: yi_agent_lifecycle::session_delegation::SessionRef {
+                    session_id: session_id.clone(),
+                    root_id: root_task_id.clone(),
+                },
+                operation_id: "fork-ipc-bind".into(),
+                host_run_id: "fork-host".into(),
+                expected_binding_epoch: 0,
+                identity: yi_agent_lifecycle::session_delegation::SessionIdentity::LegacyUpgrade(
+                    yi_agent_lifecycle::foreground::SecretCapability::new(
+                        message_capability.clone(),
+                    ),
+                ),
+                current_binding: None,
+                replacement_resume_digest: Some(
+                    yi_agent_lifecycle::session_delegation::session_resume_digest(&resume_secret),
+                ),
+                stopped: Vec::new(),
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("the fixture must bind a host");
+    };
     (
         ForkDaemon {
             _directory: directory,
@@ -144,7 +181,27 @@ fn forked_daemon() -> (ForkDaemon, String, String, String) {
         session_id,
         root_task_id,
         message_capability,
+        binding,
     )
+}
+
+/// Opens one turn for the fixture's binding.
+fn open_turn(
+    socket: &std::path::Path,
+    binding: &yi_agent_lifecycle::session_delegation::SessionBinding,
+    turn_id: &str,
+) -> yi_agent_lifecycle::session_delegation::SessionTurn {
+    let IpcResponse::SessionTurnOpened { turn } = send_request(
+        socket,
+        IpcRequest::BeginSessionTurn {
+            binding: binding.clone(),
+            turn_id: turn_id.into(),
+        },
+    )
+    .unwrap() else {
+        panic!("a bound host must be able to open a turn");
+    };
+    turn
 }
 
 /// Uploads `messages` for `session`/`caller` and returns the fork token.
@@ -163,6 +220,7 @@ fn upload_history(
             caller_task_id: caller.into(),
             capability: capability.into(),
             total_bytes: payload.len() as u64,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -200,8 +258,10 @@ fn spawn_with_token(
     session: &str,
     parent: &str,
     capability: &str,
+    binding: &yi_agent_lifecycle::session_delegation::SessionBinding,
     fork_token: Option<String>,
 ) -> IpcResponse {
+    let turn = open_turn(socket, binding, "fork-turn");
     send_request(
         socket,
         IpcRequest::SpawnApplicationChild {
@@ -215,6 +275,7 @@ fn spawn_with_token(
             thread_id: None,
             sandbox: None,
             fork_token,
+            session_turn: Some(turn),
         },
     )
     .unwrap()
@@ -238,7 +299,7 @@ fn session_task_count(socket: &std::path::Path, session: &str) -> usize {
 
 #[test]
 fn a_forked_spawn_carries_the_history_to_the_child_worker() {
-    let (fixture, session, root, capability) = forked_daemon();
+    let (fixture, session, root, capability, binding) = forked_daemon();
     let history = vec![Message::user("parent said"), Message::user("and more")];
     let token = upload_history(
         fixture.daemon.socket_path(),
@@ -253,6 +314,7 @@ fn a_forked_spawn_carries_the_history_to_the_child_worker() {
         &session,
         &root,
         &capability,
+        &binding,
         Some(token),
     ) else {
         panic!("a valid fork token must spawn the child");
@@ -272,7 +334,7 @@ fn a_forked_spawn_carries_the_history_to_the_child_worker() {
 
 #[test]
 fn a_spawn_with_an_unknown_token_is_refused() {
-    let (fixture, session, root, capability) = forked_daemon();
+    let (fixture, session, root, capability, binding) = forked_daemon();
     let before = session_task_count(fixture.daemon.socket_path(), &session);
 
     let response = spawn_with_token(
@@ -280,6 +342,7 @@ fn a_spawn_with_an_unknown_token_is_refused() {
         &session,
         &root,
         &capability,
+        &binding,
         Some("bogus".into()),
     );
 
@@ -306,7 +369,7 @@ fn a_spawn_with_an_unknown_token_is_refused() {
 
 #[test]
 fn a_spawn_with_an_incomplete_upload_is_refused() {
-    let (fixture, session, root, capability) = forked_daemon();
+    let (fixture, session, root, capability, binding) = forked_daemon();
     let payload = serde_json::to_vec(&[Message::user("parent said")]).unwrap();
     // Declare more than is sent: the token must not be usable until every byte
     // named at begin has arrived.
@@ -317,6 +380,7 @@ fn a_spawn_with_an_incomplete_upload_is_refused() {
             caller_task_id: root.clone(),
             capability: capability.clone(),
             total_bytes: payload.len() as u64 + 4,
+            session_turn: None,
         },
     )
     .unwrap() else {
@@ -337,6 +401,7 @@ fn a_spawn_with_an_incomplete_upload_is_refused() {
         &session,
         &root,
         &capability,
+        &binding,
         Some(fork_token),
     );
     assert!(
@@ -354,7 +419,7 @@ fn a_spawn_with_an_incomplete_upload_is_refused() {
 
 #[test]
 fn a_token_is_consumed_exactly_once_so_a_replay_is_refused() {
-    let (fixture, session, root, capability) = forked_daemon();
+    let (fixture, session, root, capability, binding) = forked_daemon();
     let history = vec![Message::user("parent said")];
     let token = upload_history(
         fixture.daemon.socket_path(),
@@ -370,6 +435,7 @@ fn a_token_is_consumed_exactly_once_so_a_replay_is_refused() {
             &session,
             &root,
             &capability,
+            &binding,
             Some(token.clone()),
         ),
         IpcResponse::TaskSpawned { .. }
@@ -380,6 +446,7 @@ fn a_token_is_consumed_exactly_once_so_a_replay_is_refused() {
         &session,
         &root,
         &capability,
+        &binding,
         Some(token),
     );
     assert!(
@@ -396,13 +463,14 @@ fn a_token_is_consumed_exactly_once_so_a_replay_is_refused() {
 
 #[test]
 fn a_spawn_without_a_token_spawns_unforked() {
-    let (fixture, session, root, capability) = forked_daemon();
+    let (fixture, session, root, capability, binding) = forked_daemon();
 
     let IpcResponse::TaskSpawned { task_id } = spawn_with_token(
         fixture.daemon.socket_path(),
         &session,
         &root,
         &capability,
+        &binding,
         None,
     ) else {
         panic!("an unforked spawn still works");
@@ -420,7 +488,14 @@ fn a_spawn_without_a_token_spawns_unforked() {
 }
 
 /// Spawns an ordinary (unforked) child and returns its task id.
-fn spawn_child(socket: &std::path::Path, session: &str, parent: &str, objective: &str) -> String {
+fn spawn_child(
+    socket: &std::path::Path,
+    session: &str,
+    parent: &str,
+    objective: &str,
+    binding: &yi_agent_lifecycle::session_delegation::SessionBinding,
+) -> String {
+    let turn = open_turn(socket, binding, "fork-child-turn");
     let IpcResponse::TaskSpawned { task_id } = send_request(
         socket,
         IpcRequest::SpawnChild {
@@ -432,6 +507,7 @@ fn spawn_child(socket: &std::path::Path, session: &str, parent: &str, objective:
             workdir: None,
             sandbox: None,
             fork_token: None,
+            session_turn: Some(turn),
         },
     )
     .unwrap() else {
@@ -461,8 +537,14 @@ fn child_capability(starts: &Arc<Mutex<Vec<WorkerStart>>>, task: &str) -> String
 /// root's - open the upload, and the token seeds a forked grandchild.
 #[test]
 fn a_child_caller_forks_its_own_child_over_the_socket() {
-    let (fixture, session, root, _root_capability) = forked_daemon();
-    let child = spawn_child(fixture.daemon.socket_path(), &session, &root, "child");
+    let (fixture, session, root, _root_capability, binding) = forked_daemon();
+    let child = spawn_child(
+        fixture.daemon.socket_path(),
+        &session,
+        &root,
+        "child",
+        &binding,
+    );
     let capability = child_capability(&fixture.starts, &child);
 
     let history = vec![Message::user("the child's own history")];
@@ -486,6 +568,11 @@ fn a_child_caller_forks_its_own_child_over_the_socket() {
                 workdir: None,
                 sandbox: None,
                 fork_token: Some(token),
+                session_turn: Some(open_turn(
+                    fixture.daemon.socket_path(),
+                    &binding,
+                    "fork-grandchild-turn",
+                )),
             },
         )
         .unwrap() else {
@@ -510,8 +597,14 @@ fn a_child_caller_forks_its_own_child_over_the_socket() {
 /// capability that is not its own is still refused, and no token is created.
 #[test]
 fn a_child_presenting_a_foreign_capability_is_denied() {
-    let (fixture, session, root, root_capability) = forked_daemon();
-    let child = spawn_child(fixture.daemon.socket_path(), &session, &root, "child");
+    let (fixture, session, root, root_capability, binding) = forked_daemon();
+    let child = spawn_child(
+        fixture.daemon.socket_path(),
+        &session,
+        &root,
+        "child",
+        &binding,
+    );
 
     let response = send_request(
         fixture.daemon.socket_path(),
@@ -520,6 +613,7 @@ fn a_child_presenting_a_foreign_capability_is_denied() {
             caller_task_id: child,
             capability: root_capability,
             total_bytes: 4,
+            session_turn: None,
         },
     )
     .unwrap();

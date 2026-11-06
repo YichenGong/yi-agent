@@ -3437,6 +3437,11 @@ fn build_cold_bash_agent(
         yolo,
         process_manager: Arc::clone(&registry.process_manager),
         mcp: None,
+        sandbox: yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
     })
 }
 

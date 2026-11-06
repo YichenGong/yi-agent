@@ -201,6 +201,7 @@ pub(crate) async fn handle(
                 yolo,
                 process_manager,
                 mcp,
+                sandbox,
                 ..
             } = activation.built;
             state
@@ -314,6 +315,8 @@ pub(crate) async fn handle(
                 mcp_workdir,
                 // Resolved from the conversation's own root on the first turn.
                 None,
+                sandbox,
+                Arc::clone(&process_manager),
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。
