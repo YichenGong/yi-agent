@@ -291,6 +291,58 @@ pub fn ensure_managed_with(
     // Business/lease callers get the full budget; the inspection ceiling only
     // applies to reads, never to a start that may legitimately take 30 seconds.
     let guard = CoordinationGuard::acquire(scope, deadline.clone())?;
+    ensure_managed_under_guard(
+        &HeldScope { guard, deadline },
+        expected,
+        intent,
+        probe,
+        launcher,
+        required_capabilities,
+    )
+}
+
+/// A runtime whose coordination lock the caller already holds.
+///
+/// The scope is reached *through* the guard instead of being a sibling field, so the
+/// two cannot name different scopes -- a mistake the earlier shape allowed. It also
+/// owns the guard, because the case this type exists for is a migration: that one
+/// stops holding the lock after the managed runtime is connected, and it releases the
+/// lock by dropping this value rather than by remembering to.
+pub struct HeldScope {
+    pub guard: CoordinationGuard,
+    pub deadline: Deadline,
+}
+
+/// [`ensure_managed_with`] for a caller that already owns this scope's guard.
+///
+/// The guard is the reason this entry point exists: a migration holds the instance
+/// gate *and* the scope guards, and re-acquiring a scope lock it already holds would
+/// block on itself until the deadline. Passing the guard in makes that impossible by
+/// construction instead of by a rule somebody has to remember.
+pub fn ensure_managed_under_guard(
+    held: &HeldScope,
+    expected: &ArtifactIdentity,
+    intent: BringUpIntent,
+    probe: &dyn ControlProbe,
+    launcher: &dyn GuardianLauncher,
+    required_capabilities: &[String],
+) -> io::Result<BringUpResult> {
+    let guard = &held.guard;
+    let deadline = held.deadline.clone();
+    let scope = guard.scope();
+    let path = control_path(scope);
+    // A guard for another scope would serialise the wrong runtime and then check the
+    // wrong claim, so it is refused here rather than producing a confusing answer.
+    if guard.scope().key != scope.key || guard.scope().runtime_dir != scope.runtime_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the coordination guard belongs to {}, not {}",
+                guard.scope().runtime_dir.display(),
+                scope.runtime_dir.display()
+            ),
+        ));
+    }
     // Re-check inside the lock: the peer that held it may have just started the
     // runtime we were about to start.
     //
@@ -330,7 +382,7 @@ pub fn ensure_managed_with(
     // The directory may belong to another project or configuration instance. That
     // cannot be repaired by starting a daemon here: it would serve one database to
     // two scopes, so it is reported and the check happens while the lock is held.
-    match claim_is_ours(&guard, scope) {
+    match claim_is_ours(guard, scope) {
         Ok(()) => {}
         Err(reason) => return Ok(BringUpResult::ManualActionRequired { reason }),
     }
@@ -346,7 +398,7 @@ pub fn ensure_managed_with(
     // Record what this runtime is supposed to run before starting it, so a crash
     // between launch and handshake leaves an explainable selection rather than
     // silence.
-    record_selection(&guard, expected)?;
+    record_selection(guard, expected)?;
 
     if let Err(error) = launcher.launch(scope, expected) {
         return Ok(BringUpResult::ManualActionRequired {

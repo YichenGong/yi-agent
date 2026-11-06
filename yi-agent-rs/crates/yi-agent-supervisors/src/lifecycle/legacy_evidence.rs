@@ -866,7 +866,12 @@ fn peer_pid_of(socket: &Path) -> Result<u32, String> {
 }
 
 /// Kernel-reported start identity and executable path for a pid.
-fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
+/// The kernel's answer for one pid: its start identity and executable path.
+///
+/// Public because the migration has to re-ask the same question *after* a preview:
+/// a pid that matches a recorded number proves nothing if the process behind the
+/// number was replaced in between.
+pub fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let read = unsafe {
@@ -909,7 +914,12 @@ fn process_identity_of(pid: u32) -> Result<(String, PathBuf), String> {
 ///
 /// Takes and immediately releases the lock, which is the only way to ask the kernel
 /// the same question a starting daemon asks. It changes nothing the daemon wrote.
-fn probe_lock(path: &Path) -> Result<bool, String> {
+/// Whether an advisory lock on `path` is currently held by someone else.
+///
+/// Public for the same reason as [`process_identity_of`]: a migration has to re-ask
+/// after it asked for a stop, and "the daemon said it stopped" is a claim, not a
+/// release of the kernel lock.
+pub fn probe_lock(path: &Path) -> Result<bool, String> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .read(true)

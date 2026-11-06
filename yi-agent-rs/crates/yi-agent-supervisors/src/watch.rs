@@ -37,9 +37,23 @@ pub fn ensure_daemons_with(
 /// daemon when a frontend is around. It is not an instruction to keep one alive
 /// with no frontend at all. Once an instance has migrated to the managed runtime,
 /// "no client" must mean "no daemon", so every unattended starter consults this.
+///
+/// Two markers mean two different things and both stop this loop. Retired is the
+/// finished migration; frozen is a migration that is running now, or one that failed
+/// and is waiting for the user. A failed migration must not quietly reopen the
+/// unattended path while an operator still has to look at the machine.
 pub fn may_start_unattended(instance_home: &Path) -> bool {
     !crate::lifecycle::retirement::is_retired(instance_home)
+        && !crate::lifecycle::retirement::is_frozen(instance_home)
 }
+
+/// How long this tick will wait for a migration before standing down.
+///
+/// Short on purpose: a migration is about to stop the very daemons this loop would
+/// start, so waiting is pointless once it is already running. What the wait buys is
+/// the *drain* -- a tick that got the gate first finishes its `ensure` before the
+/// migration stops anything, instead of a daemon appearing in the middle of a stop.
+const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The unattended loop: read the registration and ensure each project has a daemon,
 /// **unless** this instance no longer restarts itself.
@@ -48,6 +62,13 @@ pub fn may_start_unattended(instance_home: &Path) -> bool {
 /// from `Some(0)` (nothing registered): the first means "this is not my job any
 /// more", the second means "my job found no work". Collapsing them would make a
 /// retired loop look like an idle one and keep sleeping forever.
+///
+/// The marker check and the `ensure` it authorises happen under the instance
+/// migration gate. That ordering is the whole point: a loop that checked the marker
+/// and then waited for the gate would start a daemon *after* a migration had already
+/// decided the instance was clear, which is the resurrection the marker is supposed
+/// to prevent. Holding the gate also means a migration waits for in-flight `ensure`
+/// calls to finish rather than racing them.
 pub fn once_unattended(
     instance_home: &Path,
     resident_dir: &Path,
@@ -56,7 +77,25 @@ pub fn once_unattended(
     if !may_start_unattended(instance_home) {
         return None;
     }
-    Some(once(resident_dir, ensure))
+    let deadline = yi_agent_lifecycle::deadline::Deadline::after(GATE_WAIT);
+    let gate = match crate::lifecycle::migration_operation::RetirementGate::acquire(
+        instance_home,
+        deadline,
+    ) {
+        Ok(gate) => gate,
+        // A migration holds the gate: it is either stopping daemons right now or
+        // about to. Starting one here would be the resurrection this is meant to
+        // prevent, so this tick does nothing. The next tick re-reads the markers.
+        Err(_) => return None,
+    };
+    // Re-check under the gate: the marker may have been written between the first
+    // check and the acquire.
+    if !may_start_unattended(instance_home) {
+        return None;
+    }
+    let count = once(resident_dir, ensure);
+    drop(gate);
+    Some(count)
 }
 
 /// 读通用登记并交给 `ensure`；返回登记项目数。CLI 与 app-server 共用这一份，
@@ -97,6 +136,27 @@ mod tests {
     }
 
     /// 「没有登记」与「不再是我负责」必须是两个不同答案。
+    /// A running (or failed) migration freezes unattended starting without claiming
+    /// the migration finished.
+    #[test]
+    fn a_frozen_instance_starts_nothing_unattended_either() {
+        let instance = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::lifecycle::retirement::freeze(instance.path(), "a migration is running").unwrap();
+        assert!(!crate::lifecycle::retirement::is_retired(instance.path()));
+        let seen = RefCell::new(Vec::new());
+
+        let outcome = once_unattended(instance.path(), dir.path(), &mut |projects| {
+            seen.borrow_mut().push(projects.len());
+        });
+
+        assert_eq!(outcome, None);
+        assert!(
+            seen.borrow().is_empty(),
+            "a frozen instance does not ensure"
+        );
+    }
+
     #[test]
     fn an_empty_registry_still_reports_that_it_ran() {
         let instance = tempfile::tempdir().unwrap();
