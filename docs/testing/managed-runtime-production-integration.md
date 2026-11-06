@@ -239,14 +239,46 @@ shasum -a 256 Contents/MacOS/yi-agent == Resources/runtime-sidecar.json 的 sha2
 
 - 红叉点击后「隐藏而非退出、不释放租约」的真实 UI 操作。产品代码
   `runtime_lifecycle.rs:2351` 明确写了 `CloseRequested is deliberately absent: the red
-  button hides the window, and hiding is not quitting`，这与「Cmd+W 无任何反应」的观测
-  一致，但**点击红叉本身**未执行。
+  button hides the window, and hiding is not quitting`，`window::hide_on_close` 走的是
+  `api.prevent_close()` + `window.hide()`，确实不碰 `DesktopRuntimeManager`。这与
+  「Cmd+W 无任何反应」的观测一致，但**点击红叉本身**未执行。
+  注意范围：`window::handle_run_event` 带 `#[cfg(target_os = "macos")]`
+  （`lib.rs:149-150`），所以「红叉只隐藏」**只在 macOS 成立**；其它平台红叉就是真正
+  关窗并走完整 drain（`lib.rs:145` 的注释也这么写）。不要把这条当成跨平台性质。
 - Dock 图标点击恢复窗口。
 - 真实 Cmd+Q 在「有项目、有在途 work」时的 drain 行为（本环境无辅助功能权限，无法设置
   项目；未开项目时 quit 无工作可回收，不能作为 A15 的正面证据）。
 - A05 的「准备中 Cmd+Q」真实 App 场景同上。
 
 这些项依赖一次有 GUI 权限的人工操作，因此 desktop 对应 feature 保持 `[ ]`。
+
+### 2.5 两轮独立代码评审
+
+Task 11 Step 4 要求 diff 评审。第一次派发的评审子代理读了约 42 分钟仍无产出，
+`send_message` 返回 `invalid_state: terminal tasks cannot send mailbox messages`
+而 `inspect_agent` 仍报 running（运行时状态不一致），遂取消，改为两个**有明确
+工具调用预算**的只读评审并行重发。两者都完成并给出了 file:line 证据。
+
+结论：**均无阻塞项**；共 5 处已修，2 处记录为已知范围限制。
+
+已修（`172c0827`，每处都有测试）：
+
+| 问题 | 位置 | 为什么算缺陷 |
+|---|---|---|
+| 会话锁跨越 bootstrap 回包写入 | `app-server/src/server/transport/mod.rs:501-543` | guard 活到 `hub.reply(..).await`，客户端不排空 fd 时，这条连接上所有已认证的 prepare/migration 都排在一个无关 ACK 后面 |
+| 空 epoch 的 bootstrap 被答 "accepted" | `app-server/src/server/local_management.rs:175` | 无 epoch 无法安装任何 root authority，壳却在握手时被告知可用，失败被推迟到第一次授权 |
+| bootstrap secret 可能进 stderr | `desktop/src-tauri/src/bridge.rs:1495` | bootstrap 帧无 method 无 id，正好落进 `Frame::Garbage` 的整帧 `eprintln!`；别处都脱敏，这条是唯一例外 |
+| drain 任务异常死亡后 App 无法退出 | `desktop/src-tauri/src/runtime_lifecycle.rs:2377` | phase 停在 `Draining`，之后每次 Cmd+Q 都被 `KeepHolding` 拦下，没有回退路径 |
+| 固定 500 ms + 「数据库仍不存在」 | `tests/managed_production_integration.rs:807` | 负向断言无法用任何 sleep 长度成立：600 ms 才创建的 runtime 能骗过 500 ms 窗口 |
+
+记录为已知范围限制（未改代码，理由如下）：
+
+- `ManagedStart::step` 只保证**顺序**，不保证**数据流**：`AttachRoot` 可以拿到任意
+  root id，靠调用方（`yi-agent/src/managed_startup.rs`）保持二者一致。评审也确认
+  了它声称的两条性质（拒绝后不再执行、乱序被拒）属实。改成类型级串联是更大的
+  重构，不属于本卡范围。
+- `_shell/` 前缀守卫依赖 sidecar 方法派发是精确匹配；评审未验证 sidecar 侧，
+  本轮也未验证。风险面是「名字规范化差异」，不是当前可触发的绕过。
 
 ## 3. 生产调用点审计
 
