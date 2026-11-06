@@ -24,6 +24,7 @@ pub mod demands;
 pub mod foreground_executions;
 pub mod guardian;
 pub mod handover;
+pub mod legacy_evidence;
 pub mod managed_channel;
 pub mod migration;
 pub mod preview;
