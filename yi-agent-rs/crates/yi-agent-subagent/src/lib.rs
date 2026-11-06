@@ -10,6 +10,7 @@ pub mod binding;
 pub mod executor;
 pub mod foreground;
 pub mod managed_binding;
+pub mod managed_startup;
 pub mod thread_root;
 
 use std::collections::HashMap;

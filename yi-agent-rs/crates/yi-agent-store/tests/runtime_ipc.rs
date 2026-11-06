@@ -5963,7 +5963,9 @@ fn authorize_root(
     verifier
         .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
         .expect("the verifier accepts its guardian's binding");
-    coordinator.adopt_managed_authority(verifier.clone());
+    coordinator
+        .adopt_managed_authority(verifier.clone())
+        .expect("the ledger names this coordinator\'s generation");
     authorization
 }
 

@@ -370,6 +370,58 @@ impl RootAuthorityStore {
     }
 }
 
+/// The lease a CLI frontend holds, as a broker the managed path can ask with.
+///
+/// The desktop shell brokers over the private management channel because its lease
+/// belongs to the shell process, not to the sidecar. A TUI or a headless run *is* the
+/// frontend, so it brokers with the lease it already registered -- and this type is
+/// what lets [`ManagedContext`] treat the two deployments the same way.
+///
+/// One lease, deliberately not a second registration: two leases for one process would
+/// make "the last frontend left" compute the wrong answer, and the guardian keys roots
+/// by the client run that asked, so a second one would also produce a capability the
+/// daemon attributes to nobody this process speaks for.
+pub struct LeaseRootAuthority {
+    lease: std::sync::Arc<yi_agent_lifecycle::client::FrontendLease>,
+}
+
+impl LeaseRootAuthority {
+    pub fn new(lease: std::sync::Arc<yi_agent_lifecycle::client::FrontendLease>) -> Self {
+        Self { lease }
+    }
+}
+
+impl ManagedRootAuthority for LeaseRootAuthority {
+    /// Forwards this conversation's intent to the guardian on the frontend's own lease.
+    ///
+    /// `RootIntentRequest` carries the sidecar epoch and the shell's scope because the
+    /// desktop brokers on behalf of a sidecar it bootstrapped. A CLI has no bootstrap
+    /// and no shell-issued epoch, so those three fields would be values nobody
+    /// authenticated. What actually travels is the intent plus *which lease asks*, and
+    /// the guardian derives everything else from the grant it verifies -- the same rule
+    /// it applies to the desktop, just without a sidecar in the middle.
+    fn authorize(
+        &self,
+        intent: &RootIntentRequest,
+        deadline: Deadline,
+    ) -> Result<RootAuthorityEntry, String> {
+        let authorization = self
+            .lease
+            .authorize_root(&intent.intent, &deadline)
+            .map_err(|error| error.to_string())?;
+        Ok(RootAuthorityEntry {
+            key: RootAuthorityKey {
+                scope_key: authorization.scope_key.clone(),
+                generation: authorization.daemon_instance_id.clone(),
+                client_run_id: authorization.client_run_id.clone(),
+                thread_key: intent.intent.thread_key.clone(),
+                root_id: authorization.root_id.clone(),
+            },
+            capability: SecretCapability::new(authorization.capability),
+        })
+    }
+}
+
 /// Why a managed conversation could not obtain authority for its root.
 ///
 /// Typed rather than a string because the managed path must never degrade to legacy

@@ -622,6 +622,22 @@ impl RuntimeCoordinator {
         factory: Arc<dyn AgentWorkerFactory>,
         activation: crate::foreground::ForegroundActivation,
     ) -> Result<Self, RuntimeCoordinatorError> {
+        Self::open_with_activation_and_generation(database_path, factory, activation, None)
+    }
+
+    /// [`Self::open_with_activation`] with the generation decided by the caller.
+    ///
+    /// A managed daemon must use the generation its guardian named, because every
+    /// authority frame the guardian sends carries that name: a daemon that invented
+    /// its own would refuse the first `Install` as a stale attempt, and the whole
+    /// managed foreground contract would be unreachable while looking merely "not
+    /// supported". Embedded daemons pass `None` and keep the per-process UUID.
+    pub fn open_with_activation_and_generation(
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+        generation: Option<String>,
+    ) -> Result<Self, RuntimeCoordinatorError> {
         let mut repository = RuntimeRepository::open(database_path)?;
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
@@ -630,7 +646,7 @@ impl RuntimeCoordinator {
         // generation are recorded in `root_owners` for explanation, but never
         // authorize work here: a restart must not resurrect an identity whose
         // lease was already gone.
-        let generation = Uuid::new_v4().to_string();
+        let generation = generation.unwrap_or_else(|| Uuid::new_v4().to_string());
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator =
             ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
@@ -3945,12 +3961,25 @@ impl RuntimeCoordinator {
     pub fn adopt_managed_authority(
         &self,
         ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
-    ) {
+    ) -> Result<(), String> {
+        // The ledger names the generation its capabilities are bound to. A daemon
+        // whose own generation differed would verify those capabilities and then
+        // refuse them at the first bind, so the mismatch is refused here -- at the one
+        // moment both values exist -- rather than surfacing as an unexplained
+        // `StaleAttempt` per request.
+        if ledger.daemon_instance_id() != self.generation {
+            return Err(format!(
+                "the guardian authorized generation {}, but this daemon is {}",
+                ledger.daemon_instance_id(),
+                self.generation
+            ));
+        }
         *self
             .managed_authorizations
             .lock()
             .expect("managed authorizations mutex poisoned") = Some(ledger);
         self.refresh_attach_authority();
+        Ok(())
     }
 
     /// Applies one authority update from the guardian.
@@ -4544,13 +4573,53 @@ impl RuntimeCoordinator {
             BridgeFrame::RecoveryAnswer(_) => None,
             frame => {
                 let now = Instant::now();
-                self.with_foreground_bridge(|bridge| {
+                // Kept so a committed install can also teach the *attach* gate. The
+                // daemon has two views of authority and only one of them was being
+                // written here: the bridge table learns from the private exchange, the
+                // attach ledger learns from the lifeline. Those arrive over different
+                // sockets, so relying on the lifeline alone would let a client attach
+                // in the window after the guardian answered and before the frame was
+                // consumed -- and the guardian answers only after this call returns.
+                let install = match &frame {
+                    BridgeFrame::Authority(
+                        yi_agent_lifecycle::foreground::AuthorityMessage::Install {
+                            authorization,
+                            stamp,
+                        },
+                    ) => Some((authorization.clone(), stamp.root_id.clone())),
+                    _ => None,
+                };
+                let answer = self.with_foreground_bridge(|bridge| {
                     let mut repository = self
                         .repository
                         .lock()
                         .expect("runtime repository mutex poisoned");
                     bridge.handle(frame, &mut repository, now)
-                })
+                });
+                // The bridge's `Install` is the authority the daemon commits; the attach
+                // gate reads a different table fed by the lifeline. Those two sockets
+                // are independent, so a client could attach in the window between the
+                // committed answer and the lifeline frame being consumed. Recording the
+                // binding here closes that window: the guardian only answers after this
+                // call returns.
+                let installed = match (&answer, install) {
+                    (
+                        Some(BridgeFrame::Committed { root_id, .. }),
+                        Some((authorization, installed)),
+                    ) if root_id == &installed => Some((authorization, root_id.clone())),
+                    _ => None,
+                };
+                if let Some((authorization, _)) = installed {
+                    // Best effort on purpose: an unmanaged daemon has no ledger, and a
+                    // refused update is already a refusal the guardian will see. Making
+                    // this fatal would turn a bookkeeping failure into a lost install.
+                    let _ = self.apply_authority_update(
+                        yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(
+                            authorization,
+                        )),
+                    );
+                }
+                answer
             }
         }
     }

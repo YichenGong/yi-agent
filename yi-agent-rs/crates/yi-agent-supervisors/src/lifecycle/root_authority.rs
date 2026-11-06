@@ -124,6 +124,17 @@ impl RootAuthorityTable {
         revoked
     }
 
+    /// Forgets a grant this guardian could not finish handing out.
+    ///
+    /// Used when minting or pushing fails after `authorize` already recorded the
+    /// grant. Leaving it behind would be worse than a plain leak: the next attempt
+    /// for the same root would see an owner and bump its binding epoch, so a retried
+    /// prepare would look like a takeover of a root that never existed.
+    pub fn forget(&mut self, root_id: &str) {
+        self.granted.remove(root_id);
+        self.installed.remove(root_id);
+    }
+
     /// Grants authority for `intent`, or refuses.
     ///
     /// `existing_owner` is what an already-bound root reports: a root bound to a live
@@ -213,6 +224,25 @@ impl RootAuthorityTable {
             root_id: grant.root_id.clone(),
             capability: grant.capability.expose().to_string(),
         })
+    }
+
+    /// Replaces the capability this table minted for `root_id`.
+    ///
+    /// The table can generate a unique secret, but it cannot generate the *right* one:
+    /// the daemon verifies a capability by re-deriving it from the generation secret
+    /// it shares with the guardian's authorization ledger. Handing a client the value
+    /// minted here would therefore produce an authorization that no daemon accepts --
+    /// the attach gate answers "the guard an never issued this capability" and the
+    /// failure surfaces as an opaque refusal at attach time.
+    ///
+    /// So the ledger mints, and this table adopts. The grant stays the local record of
+    /// ownership, binding epoch and scope; only the secret is replaced.
+    pub fn adopt_capability(&mut self, root_id: &str, capability: &str) -> Result<(), String> {
+        let Some(grant) = self.granted.get_mut(root_id) else {
+            return Err(format!("no grant for root {root_id}"));
+        };
+        grant.capability = yi_agent_lifecycle::foreground::SecretCapability::new(capability);
+        Ok(())
     }
 
     /// Whether this root has ever been installed into a daemon, as far as this
@@ -340,13 +370,34 @@ impl Guardian {
             .roots_mut()
             .authorize(&request)
             .map_err(|reason| std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason))?;
-        Ok(yi_agent_lifecycle::types::RootAuthorization {
-            scope_key: granted.scope_key,
-            daemon_instance_id: request.generation.to_string(),
-            client_run_id: granted.client_run_id,
-            root_id: granted.root_id,
-            capability: granted.capability.expose().to_string(),
-        })
+
+        // The capability has to be the one the *daemon* can verify, and the daemon
+        // verifies by re-deriving it from the generation secret it shares with this
+        // guardian's authorization ledger. A secret the table invents is unique but
+        // unwitnessed: the attach gate would answer "the guardian never issued this
+        // capability", which reads as a policy refusal and hides the real defect.
+        //
+        // So the ledger mints and the table adopts. Ownership, binding epoch and scope
+        // stay in the table; only the secret comes from the ledger.
+        let root_id = granted.root_id.clone();
+        let authorization =
+            match self.issue_authorization(&root_id, &granted.client_run_id, grant.mode) {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    // A grant the daemon never learned must not be left behind: the next
+                    // attempt would see an owner and read the retry as a takeover.
+                    self.roots_mut().forget(&root_id);
+                    return Err(error);
+                }
+            };
+        if let Err(reason) = self
+            .roots_mut()
+            .adopt_capability(&root_id, &authorization.capability)
+        {
+            self.roots_mut().forget(&root_id);
+            return Err(std::io::Error::other(reason));
+        }
+        Ok(authorization)
     }
 
     /// The one place a client proves it may hold root authority.
@@ -383,7 +434,14 @@ impl Guardian {
         if revoked.is_empty() {
             return Ok(None);
         }
-        let frame = revocation_frame(client_run_id, &revoked, &self.generation.to_string());
+        // The daemon's generation, exactly like the authorization that installed the
+        // root: its revocation handler refuses a frame stamped with a generation it
+        // does not serve. Using the guardian's own id here would leave the daemon
+        // admitting a client this guardian has already forgotten.
+        let generation = self
+            .authority_generation()
+            .unwrap_or_else(|| self.generation.to_string());
+        let frame = revocation_frame(client_run_id, &revoked, &generation);
         if let Some(frame) = frame.clone() {
             self.send_bridge_frame(&frame)?;
         }

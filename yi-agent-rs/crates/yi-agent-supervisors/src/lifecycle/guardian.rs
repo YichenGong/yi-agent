@@ -1633,6 +1633,54 @@ impl Guardian {
         let _ = self.push_authorization(update);
     }
 
+    /// Mints the capability the daemon will verify for one client's root.
+    ///
+    /// The ledger is the *only* place a capability may come from. The daemon verifies
+    /// a capability by re-deriving it from the generation secret it received in the
+    /// lifeline hello, so a secret minted anywhere else -- including the root authority
+    /// table, which can generate a unique string but not the one the daemon expects --
+    /// would be answered "the guardian never issued this capability" at the attach.
+    ///
+    /// Returns the authorization to hand the client. On failure the local grant is
+    /// rolled back, because a grant that never reached the daemon must not make the
+    /// retried prepare look like a takeover of a root that never existed.
+    pub(crate) fn issue_authorization(
+        &mut self,
+        root_id: &str,
+        client_run_id: &str,
+        mode: yi_agent_lifecycle::types::LeaseMode,
+    ) -> io::Result<yi_agent_lifecycle::types::RootAuthorization> {
+        let authorization = {
+            let Some(ledger) = self.authorizations.as_mut() else {
+                return Err(io::Error::other(
+                    "this guardian started no daemon, so it has no generation to authorize in",
+                ));
+            };
+            ledger
+                .issue(client_run_id, root_id, mode)
+                .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))?
+        };
+        if let Err(error) = self.push_authorization(
+            yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(
+                authorization.clone(),
+            )),
+        ) {
+            // Withdraw it from memory too: a capability the daemon never learned could
+            // only be spent against a runtime that would refuse it.
+            if let Some(ledger) = self.authorizations.as_mut() {
+                let _ = ledger.apply(
+                    yi_agent_lifecycle::authorization::AuthorizationUpdate::RevokeRoot {
+                        root_id: root_id.to_string(),
+                    },
+                );
+            }
+            return Err(io::Error::other(format!(
+                "the daemon could not be told: {error}"
+            )));
+        }
+        Ok(authorization)
+    }
+
     /// Publishes one update on the daemon's lifeline.
     ///
     /// The lifeline is the daemon's death monitor as well as its authorization
@@ -1656,6 +1704,26 @@ impl Guardian {
     /// Whether this guardian has a daemon it started and has not stopped.
     pub fn daemon(&self) -> Option<&GuardianDaemon> {
         self.daemon.as_ref()
+    }
+
+    /// The generation every authority this guardian hands out is minted in.
+    ///
+    /// That is the *daemon's* instance id, never the guardian's own. The daemon
+    /// compares a generation against the one its authorization table was built with
+    /// (`daemon-{pid}-{nanos}`) and refuses anything else as a stale attempt, so a
+    /// guardian that named itself here would have every install refused -- and the
+    /// failure would surface as "the runtime refused the root authorization", which
+    /// points nowhere near the real cause.
+    ///
+    /// Read from the ledger rather than from [`Self::daemon`] because the ledger is
+    /// what the capability is actually bound to: the two agree in production, and a
+    /// test entry can install a ledger without a daemon record. `None` means no
+    /// daemon was ever started, and authority minted in a generation no daemon
+    /// serves could never be honoured.
+    pub fn authority_generation(&self) -> Option<String> {
+        self.authorizations
+            .as_ref()
+            .map(|ledger| ledger.daemon_instance_id().to_string())
     }
 
     /// Whether every *business* client is gone and the scope is draining.
@@ -1740,11 +1808,34 @@ impl Guardian {
     /// Test entry only: production sets this inside `start_daemon` after the daemon
     /// answered, because a ledger naming a daemon nobody started would mint
     /// capabilities for a process that cannot check them.
+    ///
+    /// Installs a lifeline peer beside it. In production the two are inseparable --
+    /// the ledger exists because the daemon greeting arrived *on* the lifeline -- and
+    /// minting a capability now publishes a `Bind` over that lifeline. A fixture that
+    /// had a ledger and no lifeline would be describing a state production cannot
+    /// reach, and would fail on the write rather than on the behaviour under test.
     pub fn authorizations_for_test(
         &mut self,
         ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
     ) {
         self.authorizations = Some(ledger);
+        if self.daemon_lifeline.is_none() {
+            let Ok((guardian_end, mut daemon_end)) = std::os::unix::net::UnixStream::pair() else {
+                // A fixture that cannot build its own peer is already broken; keeping
+                // an unsendable ledger would only move the failure further away.
+                return;
+            };
+            let _ =
+                guardian_end.set_write_timeout(Some(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT));
+            // A real reader, because a publish is a *frame write*: closing the peer
+            // would make the write fail for a transport reason that has nothing to do
+            // with the behaviour under test. Draining keeps the fixture honest -- the
+            // frames really are written, and nothing asserts on them here.
+            std::thread::spawn(move || {
+                while yi_agent_lifecycle::codec::read_frame(&mut daemon_end).is_ok() {}
+            });
+            self.daemon_lifeline = Some(guardian_end);
+        }
     }
 
     pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
@@ -2334,7 +2425,17 @@ fn serve_authorize_root(
         .grant(&root_id)
         .map(|granted| granted.client_run_id.clone());
     let scope_key = guardian.scope.key.clone();
-    let generation = guardian.generation.to_string();
+    // The daemon's generation, not this guardian's: the daemon keys its authority
+    // table by the instance id it announced, and an install stamped with anything
+    // else is refused as stale before it can be honoured.
+    let Some(generation) = guardian.authority_generation() else {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: "foreground_lifecycle_unsupported: this guardian started no daemon, \
+                     so it has no generation to authorize in"
+                .to_string(),
+        };
+    };
     let request = super::root_authority::AuthorizeRequest {
         intent,
         root_id: &root_id,

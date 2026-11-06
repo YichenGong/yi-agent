@@ -190,6 +190,37 @@ impl ThreadRoot {
         })
     }
 
+    /// The same conversation root, already attached under brokered authority.
+    ///
+    /// A managed frontend authorizes and attaches *before* it builds its tools, so the
+    /// root it hands them already exists. Going through [`Self::attach_typed`] again
+    /// would be a second attach for one conversation; filling the cache is what makes
+    /// the tools adopt what the start already proved.
+    ///
+    /// `generation` comes from the binding the caller attached through, so the cached
+    /// root is paired with the runtime that minted it. A later repair moves the
+    /// generation on and the cache expires exactly like any other.
+    pub fn managed_attached(
+        binding: Arc<RuntimeBinding>,
+        thread_id: impl Into<String>,
+        project_dir: PathBuf,
+        extra_roots: Vec<PathBuf>,
+        context: Arc<crate::managed_binding::ManagedContext>,
+        root: AttachedRoot,
+        generation: u64,
+    ) -> Arc<Self> {
+        let thread_root = Arc::new(Self {
+            binding,
+            thread_id: thread_id.into(),
+            project_dir,
+            extra_roots,
+            managed: Some(context),
+            cached: Mutex::new(None),
+        });
+        *thread_root.lock_cached() = Some(CachedRoot { generation, root });
+        thread_root
+    }
+
     /// Whether this conversation attaches through shell-granted authority.
     pub fn is_managed(&self) -> bool {
         self.managed.is_some()

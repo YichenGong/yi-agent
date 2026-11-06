@@ -421,7 +421,7 @@ fn one_frontend_leaving_does_not_reclaim_anothers_work() {
     let fixture = Fixture::new();
     let _guardian = GuardianFixture::start(&fixture);
     let socket = fixture.control_socket();
-    let mut tui = register(&socket, "tui:1", ClientKind::Tui, LeaseMode::Business);
+    let tui = register(&socket, "tui:1", ClientKind::Tui, LeaseMode::Business);
     let headless = register(&socket, "run:1", ClientKind::Headless, LeaseMode::Business);
 
     let deadline = Deadline::after(Duration::from_secs(5));

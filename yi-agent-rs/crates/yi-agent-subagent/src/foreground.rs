@@ -607,7 +607,13 @@ pub enum RecoveryOutcome {
 /// runtime does not serve the foreground contract for this root" and the host should
 /// keep legacy semantics; it is never an error to surface to the user.
 pub struct ForegroundHost {
-    lease: yi_agent_lifecycle::client::FrontendLease,
+    /// The lease this host acts with.
+    ///
+    /// Shared rather than owned: a frontend that already registered (the TUI, a
+    /// managed CLI) must hand this host *that* lease. Registering a second one here
+    /// would make one process look like two clients, and the guardian would then
+    /// reclaim this host's work only when the other copy also left.
+    lease: std::sync::Arc<yi_agent_lifecycle::client::FrontendLease>,
     /// Authorizations by root key. The queue is per process because a bind needs the
     /// same authorization across a retry around the host's own reconnection.
     authorized: std::sync::Mutex<std::collections::HashMap<String, RootAuthorization>>,
@@ -646,11 +652,20 @@ impl ForegroundHost {
         else {
             return Ok(None);
         };
-        Ok(Some(Self {
+        Ok(Some(Self::from_lease(std::sync::Arc::new(lease))))
+    }
+
+    /// A host that acts with a lease the caller already holds.
+    ///
+    /// This is the managed path's constructor. There is deliberately no "register if
+    /// needed" variant: whether a lease exists is the caller's decision, and a host that
+    /// silently made one would be the second frontend this type exists to avoid.
+    pub fn from_lease(lease: std::sync::Arc<yi_agent_lifecycle::client::FrontendLease>) -> Self {
+        Self {
             lease,
             authorized: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }))
+        }
     }
 
     /// This root's authorization, asking the guardian only the first time.
@@ -671,6 +686,18 @@ impl ForegroundHost {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = authorized.get(&key) {
             return Ok(Some(existing.clone()));
+        }
+        // A managed root already holds the authority the shell brokered for it. Asking
+        // the guardian a second time would mint another capability for the same root
+        // and -- on a frontend that registered once -- look like a second client.
+        if root.is_managed() {
+            let Some(fresh) = root.managed_root_authorization() else {
+                // Nothing brokered yet: the attach that would have installed the entry
+                // has not happened, so there is nothing to bind with. Legacy semantics.
+                return Ok(None);
+            };
+            authorized.insert(key, fresh.clone());
+            return Ok(Some(fresh));
         }
         let Some(fresh) = root.authorize_foreground_root(&self.lease, operation_id)? else {
             return Ok(None);

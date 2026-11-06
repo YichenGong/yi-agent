@@ -1216,6 +1216,65 @@ pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
 ///
 /// `expected` describes the artifact this caller wants. A runtime that answers with
 /// anything else comes back as a version choice rather than being used silently.
+/// The first half of a managed start: make sure a guardian-supervised runtime exists.
+///
+/// Split from the attach because a managed frontend must be a *frontend first*: the
+/// lease has to exist, and the conversation's root has to be authorized, before any
+/// attach is attempted. Attaching first would let a runtime the guardian knows nothing
+/// about hand out a root, and the reclaim that follows would then target work it never
+/// agreed to supervise.
+///
+/// Nothing here attaches a root or registers a client. It only answers "is a runtime
+/// this build may use running there now".
+pub fn prepare_managed_runtime(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    instance_home: &Path,
+    expected: &yi_agent_lifecycle::types::ArtifactIdentity,
+    intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
+    deadline: yi_agent_lifecycle::deadline::Deadline,
+) -> Result<(), AttachFailure> {
+    use yi_agent_supervisors::lifecycle::bringup::{
+        BringUpResult, ensure_managed, scope_for_existing,
+    };
+
+    let scope = scope_for_existing(runtime_dir, &cfg.workdir, instance_home)
+        .map_err(|error| AttachFailure::new("runtime scope", error))?;
+    match ensure_managed(&scope, expected, intent, deadline) {
+        Ok(BringUpResult::Connected { .. }) => Ok(()),
+        Ok(BringUpResult::VersionChoiceRequired { identity }) => {
+            // Not a failure to work around: the user has to choose. Reporting it as
+            // a plain attach error would look like a bug rather than a decision.
+            Err(AttachFailure::new(
+                "runtime version",
+                format!(
+                    "the running runtime is build {} and differs from this client; \
+                     it must be switched or temporarily accepted explicitly",
+                    identity.daemon_build_id.as_deref().unwrap_or("unknown")
+                ),
+            ))
+        }
+        Ok(BringUpResult::ManualActionRequired { reason }) => {
+            Err(AttachFailure::new("runtime bring-up", reason))
+        }
+        Err(error) => Err(AttachFailure::new("runtime bring-up", error)),
+    }
+}
+
+/// Attaches one root with an authorization the caller already obtained.
+///
+/// The capability *is* the attach key on a managed daemon: it is what tells the daemon
+/// whose root this is, and it is the only key it will attribute. A caller that invented
+/// its own key here would be asking for an unattributed root, which a managed daemon
+/// refuses -- so this entry point exists rather than a flag on the project attach.
+pub fn attach_authorized_root(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    capability: &str,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    attach_to_answer(cfg, runtime_dir, None, Some(capability.to_string()))
+}
+
 pub fn attach_managed_project_runtime(
     cfg: &RuntimeConfig,
     runtime_dir: PathBuf,
@@ -1224,31 +1283,7 @@ pub fn attach_managed_project_runtime(
     intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
     deadline: yi_agent_lifecycle::deadline::Deadline,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    use yi_agent_supervisors::lifecycle::bringup::{
-        BringUpResult, ensure_managed, scope_for_existing,
-    };
-
-    let scope = scope_for_existing(&runtime_dir, &cfg.workdir, instance_home)
-        .map_err(|error| AttachFailure::new("runtime scope", error))?;
-    match ensure_managed(&scope, expected, intent, deadline) {
-        Ok(BringUpResult::Connected { .. }) => {}
-        Ok(BringUpResult::VersionChoiceRequired { identity }) => {
-            // Not a failure to work around: the user has to choose. Reporting it as
-            // a plain attach error would look like a bug rather than a decision.
-            return Err(AttachFailure::new(
-                "runtime version",
-                format!(
-                    "the running runtime is build {} and differs from this client; \
-                     it must be switched or temporarily accepted explicitly",
-                    identity.daemon_build_id.as_deref().unwrap_or("unknown")
-                ),
-            ));
-        }
-        Ok(BringUpResult::ManualActionRequired { reason }) => {
-            return Err(AttachFailure::new("runtime bring-up", reason));
-        }
-        Err(error) => return Err(AttachFailure::new("runtime bring-up", error)),
-    }
+    prepare_managed_runtime(cfg, &runtime_dir, instance_home, expected, intent, deadline)?;
     // No capability here on purpose. This is the *project* attach: it opens the
     // connection a conversation will later attach its own root over. Minting or
     // carrying a root capability at this level is exactly the coupling this design

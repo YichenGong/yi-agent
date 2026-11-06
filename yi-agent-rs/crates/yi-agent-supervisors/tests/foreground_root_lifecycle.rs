@@ -551,7 +551,12 @@ fn foreground_root_lifecycle_bootstrap_before_business_binding() {
     let first = fixture.authorize_business(&intent).unwrap();
     let second = fixture.authorize_business(&intent).unwrap();
     assert_eq!(first.root_id, second.root_id);
-    assert_ne!(first.capability, second.capability);
+    // The capability is *stable* for one (client, root), and that is load-bearing: it
+    // is the attach key, so a re-request that minted a new one would make the daemon
+    // see a second attach and create a second root for the same conversation. The
+    // secret stays unguessable because it is derived from the ledger's generation
+    // secret, not because it changes on every call.
+    assert_eq!(first.capability, second.capability);
 }
 
 #[test]

@@ -192,7 +192,13 @@ impl std::fmt::Debug for ManagedChannel {
 pub struct FrontendLease {
     control_path: std::path::PathBuf,
     grant: types::ClientGrant,
-    heartbeat: Option<Heartbeat>,
+    /// The renewal thread, guarded rather than owned exclusively.
+    ///
+    /// `&self` on `start_heartbeat`/`release` is what lets one lease be shared with
+    /// the parties that act *as* this frontend (a root-authority broker, a foreground
+    /// host) instead of each minting a second lease for the same process. Two leases
+    /// for one process would make "the last frontend left" compute the wrong answer.
+    heartbeat: std::sync::Mutex<Option<Heartbeat>>,
     /// Set when a renewal was refused: the lease is gone (released, expired, or
     /// superseded), and the owner should stop expecting its work to survive.
     lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -279,7 +285,7 @@ impl FrontendLease {
         Self {
             control_path,
             grant,
-            heartbeat: None,
+            heartbeat: std::sync::Mutex::new(None),
             lost,
         }
     }
@@ -311,8 +317,12 @@ impl FrontendLease {
     /// Separate from [`Self::register`] so a caller can hold a lease without a
     /// thread (a test, or a frontend whose runtime outlives the call), and because
     /// a thread that is never joined is worse than one that was never started.
-    pub fn start_heartbeat(&mut self) -> io::Result<()> {
-        if self.heartbeat.is_some() {
+    pub fn start_heartbeat(&self) -> io::Result<()> {
+        let mut slot = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
             return Ok(());
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -342,7 +352,7 @@ impl FrontendLease {
             .map_err(|error| {
                 io::Error::other(format!("could not start the lease heartbeat: {error}"))
             })?;
-        self.heartbeat = Some(Heartbeat {
+        *slot = Some(Heartbeat {
             stop,
             join: Some(join),
         });
@@ -353,7 +363,7 @@ impl FrontendLease {
     ///
     /// Idempotent at the runtime: a second release of the same run returns the same
     /// operation id rather than a new teardown nobody will observe.
-    pub fn release(&mut self, deadline: &Deadline) -> io::Result<types::OperationId> {
+    pub fn release(&self, deadline: &Deadline) -> io::Result<types::OperationId> {
         self.stop_heartbeat();
         let mut client = ControlClient::connect(&self.control_path, deadline)?;
         match client.request(
@@ -741,8 +751,12 @@ impl FrontendLease {
         }
     }
 
-    fn stop_heartbeat(&mut self) {
-        if let Some(mut heartbeat) = self.heartbeat.take() {
+    fn stop_heartbeat(&self) {
+        let mut slot = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut heartbeat) = slot.take() {
             heartbeat
                 .stop
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -989,7 +1003,7 @@ mod tests {
     fn a_registered_lease_releases_and_reads_its_result() {
         let _serial = socket_test_lock();
         let fixture = Fixture::new();
-        let mut lease = FrontendLease::register_if_served(
+        let lease = FrontendLease::register_if_served(
             &fixture.path,
             "tui:test".to_string(),
             types::ClientKind::Tui,
@@ -1085,7 +1099,7 @@ mod tests {
             }
         });
 
-        let mut lease = FrontendLease::register(
+        let lease = FrontendLease::register(
             &path,
             "app:1".to_string(),
             types::ClientKind::App,
