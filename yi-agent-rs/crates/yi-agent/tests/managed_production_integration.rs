@@ -1823,6 +1823,111 @@ fn a_dead_launcher_sidecar_does_not_stop_a_working_runtime() -> anyhow::Result<(
     Ok(())
 }
 
+/// A sidecar that replaces the first one adopts the same runtime instead of a new one.
+///
+/// A13 says a sidecar restart must not require restarting the whole App: the user's
+/// work lives in the runtime, and the replacement sidecar is a new *generation* of
+/// the management channel, not a new instance. Three observations make that claim
+/// falsifiable rather than rhetorical:
+///
+/// * the guardian generation is unchanged -- a restarted runtime would mint a new one;
+/// * the journal still lists exactly one daemon -- a second bring-up would add one;
+/// * the second sidecar authenticates under an epoch the first never used, which is
+///   the generation marker the design relies on to retire old capabilities.
+///
+/// The old capability half of A13 is covered where capabilities actually live: the
+/// store refuses entries minted under a previous epoch
+/// (`a_capability_from_a_previous_epoch_is_never_accepted`) and retires the old
+/// generation on replacement (`a_generation_change_retires_the_old_capability`). This
+/// test does not restate that logic; it proves the process-level handover that feeds it.
+#[test]
+fn a_replacement_sidecar_adopts_the_runtime_without_a_second_bringup() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    // Built up-front rather than in a closure: the two sidecars borrow the fixture
+    // mutably, so a closure capturing it would keep the immutable borrow alive.
+    let scope = fixture.scope();
+    let expected = fixture.artifact().clone();
+    let prepare_params = || -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            yi_agent_lifecycle::production::PrepareRequest {
+                scope: scope.clone(),
+                expected: expected.clone(),
+                attempt_id: format!("attempt-{}", uuid_like()),
+            },
+        )?)
+    };
+
+    let mut first = Sidecar::spawn(&mut fixture)?;
+    let before = first.call("_shell/prepare", prepare_params()?, START_BUDGET)?;
+    anyhow::ensure!(
+        before.get("error").is_none()
+            && (before.to_string().contains("\"Connected\"")
+                || before.to_string().contains("VersionChoiceRequired")),
+        "the first sidecar never reached a runtime: {before}"
+    );
+
+    let generation_before = journal_generation(&fixture.runtime_dir);
+    anyhow::ensure!(
+        generation_before.is_some(),
+        "the runtime recorded no guardian generation to compare against"
+    );
+    let daemons_before = count_daemon_records(&fixture.runtime_dir);
+    assert_eq!(
+        daemons_before, 1,
+        "the first prepare left {daemons_before} daemons"
+    );
+
+    let first_epoch = first.epoch.clone();
+    let first_pid = first.child.id() as i32;
+    drop(first);
+
+    // The replacement is a genuinely new channel: new secret, new epoch. Reusing the
+    // old ones would make this test unable to tell adoption from a cached session.
+    let mut second = Sidecar::spawn(&mut fixture)?;
+    assert_ne!(
+        second.epoch, first_epoch,
+        "the replacement sidecar reused the previous generation's epoch"
+    );
+
+    let after = second.call("_shell/prepare", prepare_params()?, START_BUDGET)?;
+    anyhow::ensure!(
+        after.get("error").is_none(),
+        "the replacement sidecar refused a runtime its predecessor had started: {after}"
+    );
+
+    // The runtime was adopted, not restarted: same guardian, same single daemon.
+    assert_eq!(
+        journal_generation(&fixture.runtime_dir),
+        generation_before,
+        "the replacement sidecar restarted the runtime instead of adopting it"
+    );
+    assert_eq!(
+        count_daemon_records(&fixture.runtime_dir),
+        1,
+        "a second sidecar brought up a second daemon"
+    );
+    assert_ne!(
+        first_pid,
+        second.child.id() as i32,
+        "the replacement must be a different process; otherwise nothing was replaced"
+    );
+    Ok(())
+}
+
+/// How many daemon-process records the guardian journal holds.
+fn count_daemon_records(runtime_dir: &Path) -> usize {
+    journal_records(runtime_dir)
+        .iter()
+        .filter(|record| {
+            record
+                .get("owner")
+                .and_then(|owner| owner.get("daemon"))
+                .is_some()
+        })
+        .count()
+}
+
 /// The guardian generation recorded in the journal, if any.
 fn journal_generation(runtime_dir: &Path) -> Option<String> {
     journal_records(runtime_dir).iter().find_map(|record| {
