@@ -12,7 +12,7 @@
 //   - 任何一项的测试有缺失或失败，该项 verdict 为 fail。
 //
 // 用法（工作目录必须是 yi-agent-rs，nextest 从这里发现 crate）：
-//   node scripts/plugins/fault-matrix.mjs [--output .artifacts/plugins/fault-matrix.json]
+//   node scripts/plugins/fault-matrix.mjs [--output .artifacts/plugins/fault-matrix.json] [--acceptance A12]
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -124,11 +124,12 @@ export function runMatrix(matrix, { cwd = process.cwd(), runner = execFileSync }
 }
 
 /// 把执行结果折进矩阵，产出可复核的报告。
-export function buildReport(matrix, results, { cwd = process.cwd() } = {}) {
+export function buildReport(matrix, results, { cwd = process.cwd(), acceptance = null } = {}) {
   return {
     buildKind: "probe",
     generatedAt: new Date().toISOString(),
     cwd,
+    ...(acceptance ? { acceptance } : {}),
     items: matrix.map((item) => {
       const outcomes = item.tests.map((testName) => {
         const key = canonicalTestName(testName);
@@ -163,9 +164,25 @@ export function summarise(report) {
 function main(argv) {
   const outIndex = argv.indexOf("--output");
   const output = outIndex === -1 ? null : argv[outIndex + 1];
+  const acceptanceIndex = argv.indexOf("--acceptance");
+  const acceptance = acceptanceIndex === -1 ? null : argv[acceptanceIndex + 1];
+
   const matrix = loadMatrix();
-  const results = runMatrix(matrix);
-  const report = buildReport(matrix, results);
+  // 每条验收判据只判**自己归属**的矩阵项。此前 A09-A19 九条用例跑的是同一份
+  // 完整矩阵，于是同一个整体结果被记成九条独立证据：既无法把失败定位到具体
+  // 判据，也让「9 条通过」看起来比真实证据多 9 倍。矩阵项本身已声明归属
+  // （fault-matrix.json 的 `acceptance` 字段），按它筛。
+  const scoped = acceptance
+    ? matrix.filter((item) => (item.acceptance ?? []).includes(acceptance))
+    : matrix;
+  if (acceptance && scoped.length === 0) {
+    process.stderr.write(
+      `fault matrix: no matrix item claims acceptance ${acceptance}\n`,
+    );
+    return 1;
+  }
+  const results = runMatrix(scoped);
+  const report = buildReport(scoped, results, { acceptance });
   const summary = summarise(report);
 
   if (output) {

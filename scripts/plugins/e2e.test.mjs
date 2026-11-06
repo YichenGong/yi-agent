@@ -970,3 +970,88 @@ test("a command that could not start explains itself", () => {
   assert.match(report.cases[0].reason, /cargo/);
   assert.ok(!/no command output was captured/.test(report.cases[0].reason));
 });
+
+test("a declared unsupported exit code is not read as an implementation failure", () => {
+  // 探针在非 macOS 上 exit 2 并明说「没有 launcher adapter」。不声明的话
+  // 「这台机器验不了」会被记成「实现坏了」——环境限制伪装成产品缺陷。
+  const runner = () => {
+    const error = new Error("Command failed");
+    error.status = 2;
+    error.stdout = "";
+    error.stderr = "probe: unsupported platform `linux` — no launcher adapter exists\n";
+    throw error;
+  };
+  const caseSpec = {
+    id: "A07",
+    commands: [
+      { kind: "command", run: "node probe.mjs", unsupportedExitCodes: [2] },
+    ],
+  };
+  const result = runCase(caseSpec, { cwd: "/tmp", runner, capabilities: {} });
+  assert.equal(result.outcome, "missing", "a declared unsupported exit code must not become fail");
+  assert.match(result.reason, /no launcher adapter/);
+});
+
+test("an undeclared non-zero exit code stays a failure", () => {
+  // 反面：没有声明的退出码不能被顺手放宽。声明是白名单，不是「非零即跳过」。
+  const runner = () => {
+    const error = new Error("Command failed");
+    error.status = 2;
+    error.stdout = "";
+    error.stderr = "boom\n";
+    throw error;
+  };
+  const caseSpec = {
+    id: "A07",
+    commands: [{ kind: "command", run: "node probe.mjs" }],
+  };
+  const result = runCase(caseSpec, { cwd: "/tmp", runner, capabilities: {} });
+  assert.equal(result.outcome, "fail");
+});
+
+test("a declared unsupported exit code that did not occur still passes", () => {
+  const runner = () => "fine\n";
+  const caseSpec = {
+    id: "A07",
+    commands: [
+      { kind: "command", run: "node probe.mjs", unsupportedExitCodes: [2] },
+    ],
+  };
+  const result = runCase(caseSpec, { cwd: "/tmp", runner, capabilities: {} });
+  assert.equal(result.outcome, "pass");
+});
+
+test("a permanent gap is reported as a gap, not as a missing environment", () => {
+  // A17 的真实情况是代码里没有远程资产拉取（FetchRequest 零调用点）。报成
+  // 「没有远端主机」会让读者以为补台机器就能过——把功能缺口说成环境限制。
+  const caseSpec = {
+    id: "A17",
+    commands: [{ kind: "remote", run: "node e2e-remote.mjs --case A17" }],
+    unsupportedWithout: "remote",
+    permanentGap:
+      "remote asset fetch is not implemented (FetchRequest has no caller); " +
+      "providing a remote host cannot make this pass",
+  };
+  const result = runCase(caseSpec, {
+    cwd: "/tmp",
+    runner: () => {
+      const error = new Error("no host");
+      error.status = 1;
+      throw error;
+    },
+    capabilities: {},
+  });
+  const report = assembleReport({
+    buildKind: "probe",
+    results: [result],
+    capabilities: {},
+    now: "2026-11-05T00:00:00Z",
+  });
+  assert.equal(report.cases[0].verdict, "unsupported");
+  assert.match(report.cases[0].reason, /not implemented/);
+  assert.match(report.cases[0].reason, /cannot make this pass/);
+  assert.ok(
+    !/no remote host was provided/.test(report.cases[0].reason),
+    "the generic missing-environment wording must not hide an implementation gap",
+  );
+});

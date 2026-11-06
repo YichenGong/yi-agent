@@ -81,7 +81,10 @@
         },
         {
           "kind": "command",
-          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json",
+          "unsupportedExitCodes": [
+            2
+          ]
         }
       ],
       "unsupportedWithout": null
@@ -96,7 +99,10 @@
         },
         {
           "kind": "command",
-          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json"
+          "run": "node desktop/scripts/plugins/probe.mjs --suite isolation --app desktop/src-tauri/target-probe/release/bundle/macos/yi-agent.app --output .artifacts/plugins/probe.json",
+          "unsupportedExitCodes": [
+            2
+          ]
         }
       ],
       "unsupportedWithout": null
@@ -106,7 +112,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A09",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -117,7 +123,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A10",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -128,7 +134,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A11",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -139,7 +145,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A12",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -150,7 +156,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A13",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -161,7 +167,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A14",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -172,7 +178,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A15",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -198,14 +204,15 @@
           "emitsRemoteIdentity": true
         }
       ],
-      "unsupportedWithout": "remote"
+      "unsupportedWithout": "remote",
+      "permanentGap": "remote asset fetch and offline cache are not implemented (plugin_host/remote_assets.rs FetchRequest has no caller); providing a remote host cannot make this pass"
     },
     {
       "id": "A18",
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A18",
           "cwd": "yi-agent-rs"
         }
       ],
@@ -216,7 +223,7 @@
       "commands": [
         {
           "kind": "command",
-          "run": "node ../scripts/plugins/fault-matrix.mjs",
+          "run": "node ../scripts/plugins/fault-matrix.mjs --acceptance A19",
           "cwd": "yi-agent-rs"
         }
       ],
