@@ -1,6 +1,6 @@
 {
   "name": "@yi-agent/magpie-agent-yi-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Magpie agent plugin: connect Yi Agent to Magpie's gateway.",
   "type": "module",
   "files": [

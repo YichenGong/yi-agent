@@ -59,6 +59,27 @@ plugin declares that directory as its Library `skills`, so skills the user
 turns on in Magpie's Library are written there and picked up by Yi Agent with
 no further configuration.
 
+The plugin declares **only** `skills`, because the other three Library targets
+have no machine-wide location in Yi Agent — a declared path would point Magpie
+at a file Yi Agent never reads:
+
+| Library target | Why it is not declared |
+| --- | --- |
+| `instructions` | Yi Agent reads only `<project>/AGENTS.md`, and deliberately does not search parent directories. There is no home-directory instructions file. |
+| `mcp` | The MCP config is per project: `<project>/.yi-agent/mcp.json`. It is not a fixed path. |
+| `mcpFormat` | Only meaningful together with `mcp`. |
+
+Two related facts about paths:
+
+- `format: "json"` is declared explicitly even though Magpie infers the format
+  from the `.json` file name. The declaration pins the reading, so an inferred
+  format can never make Magpie write `models.json` as something else.
+- The skills directory follows `YI_AGENT_SKILLS_DIR` when that variable is set;
+  the plugin always declares the default `~/.yi-agent/skills`. If you set
+  `YI_AGENT_SKILLS_DIR`, Magpie's Library writes go to the default directory
+  and Yi Agent will not see them. (Model entries are unaffected: those live in
+  `models.json`, see the next section.)
+
 ## Things to know
 
 - **Two icons, two sources.** Magpie's *Installed* list draws a plugin's logo
@@ -84,10 +105,12 @@ no further configuration.
   this plugin does not: it declares the literal `~/.yi-agent/models.json`, so
   setting `YI_AGENT_HOME` for both programs does not help — a Yi Agent started
   with it reads `$YI_AGENT_HOME/models.json` and never sees what Magpie writes.
-  Declaring `$YI_AGENT_HOME/models.json` instead is not an option either:
-  Magpie expands a `$VAR` in a declared path, and an unset variable expands to
-  an empty string, which would leave Magpie writing `/models.json`. Use the
-  default location, or leave this plugin off.
+  (An override that does not end in `.yi-agent` gets `.yi-agent` appended, so
+  `YI_AGENT_HOME=/opt/yi` reads `/opt/yi/.yi-agent/models.json`; none of those
+  layouts match the literal path either.) Declaring `$YI_AGENT_HOME/models.json`
+  instead is not an option either: Magpie expands a `$VAR` in a declared path,
+  and an unset variable expands to an empty string, which would leave Magpie
+  writing `/models.json`. Use the default location, or leave this plugin off.
 - **A running TUI does not hot-reload the model.** Yi Agent's TUI reads
   `models.json` at startup, and its `/model` list is that startup snapshot — it
   never re-reads the file while running. After connecting, switching models, or

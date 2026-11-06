@@ -54,6 +54,11 @@ export const agent = {
   config: "~/.yi-agent/models.json",
   // The key of the model in models.json.
   model: "default_model",
+  // Magpie infers the format from the file name, but says to write `format`
+  // explicitly when it cannot. Naming it pins the reading: models.json is JSON,
+  // and an inferred `yaml` (or a future extension change) would make Magpie
+  // rewrite the file in the wrong format.
+  format: "json",
   prefix: PREFIX,
   // Words of Yi Agent's User-Agent, so Magpie names its requests in Usage when
   // they come without the agent's own key.
@@ -68,6 +73,16 @@ export const agent = {
   // yi-agent-runtime/src/bootstrap.rs `build_skills_service`). Declaring it in
   // the Library lets Magpie write its own skills there too, where Yi Agent
   // picks them up with no further configuration.
+  //
+  // Only `skills` is declared. The other three Library targets have no
+  // machine-wide path in Yi Agent, so naming either one would point Magpie at
+  // the wrong file:
+  //   - `instructions`: Yi Agent reads only `<workdir>/AGENTS.md` per project
+  //     (`bootstrap.rs`), and deliberately does not search parent directories,
+  //     so no fixed home-directory path exists.
+  //   - `mcp`: the config is per project, `<workdir>/.yi-agent/mcp.json`
+  //     (`bootstrap.rs`), not a fixed path either.
+  //   - `mcpFormat`: only meaningful together with `mcp`.
   library: { skills: "~/.yi-agent/skills" },
   notice:
     "A running yi-agent TUI does not hot-reload models.json — restart it, or run /model default to fall back to the newly written default_model. To switch to a magpie/* entry by name in an already-running TUI, restart it first: its /model list is a snapshot taken at startup.",

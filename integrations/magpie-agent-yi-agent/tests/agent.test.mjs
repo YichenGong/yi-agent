@@ -41,7 +41,18 @@ test("agent declaration uses the models.json convention", () => {
   assert.equal(agent.id, "yi-agent");
   assert.equal(agent.config, "~/.yi-agent/models.json");
   assert.equal(agent.model, "default_model");
+  // Magpie can infer the format from the `.json` name, but declaring it pins
+  // the reading so an inferred format can never rewrite models.json as YAML.
+  assert.equal(agent.format, "json");
   assert.equal(agent.prefix, _internal.PREFIX);
+});
+
+test("agent declares only the Library target Yi Agent has a fixed path for", () => {
+  // Yi Agent's user skills root is `~/.yi-agent/skills`; it has no
+  // machine-wide instructions file (`AGENTS.md` is per project) nor a fixed
+  // MCP config (`<project>/.yi-agent/mcp.json` is per project). Declaring
+  // either would make Magpie write to a file Yi Agent never reads.
+  assert.deepEqual(agent.library, { skills: "~/.yi-agent/skills" });
 });
 
 test("toEntry maps a Magpie model to an openai gateway entry", () => {
