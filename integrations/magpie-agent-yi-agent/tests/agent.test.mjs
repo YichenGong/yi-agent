@@ -98,7 +98,7 @@ test("toEntry accepts u32::MAX as a valid context length", () => {
   assert.equal(entry.context_length, 4294967295);
 });
 
-test("toEntry writes api_style from native_endpoints chat-completions", () => {
+test("toEntry pins api_style to the strongest native endpoint", () => {
   const gateway = { v1: "g/v1", key: "k" };
   const chat = _internal.toEntry(
     { id: "a", native_endpoints: ["/v1/chat/completions"] },
@@ -106,19 +106,32 @@ test("toEntry writes api_style from native_endpoints chat-completions", () => {
   );
   assert.equal(chat.api_style, "chat");
 
-  // Non-chat native endpoints (responses / messages) leave api_style unset,
-  // so Yi Agent's `auto` detection runs instead of pinning a wrong channel.
   const responses = _internal.toEntry(
     { id: "b", native_endpoints: ["/v1/responses"] },
     gateway,
   );
-  assert.equal(responses.api_style, undefined);
+  assert.equal(responses.api_style, "responses");
+
+  // Magpie lists every protocol a provider has a base URL for, so both is the
+  // normal case (presets give OpenAI and DeepSeek a chat and a responses base).
+  // Both pass through untranslated; Responses is stronger — it carries sealed
+  // reasoning (Magpie's claudeseal, Yi Agent's ThinkingToken::Encrypted), Chat
+  // flattens thinking to plain text and drops the signature.
+  const both = _internal.toEntry(
+    { id: "c", native_endpoints: ["/v1/chat/completions", "/v1/responses"] },
+    gateway,
+  );
+  assert.equal(both.api_style, "responses");
+
+  // Messages-only and empty stay unset: `api_style` only means anything for an
+  // `openai` provider and there is no anthropic pin, while `auto` already
+  // resolves to Responses.
   const messages = _internal.toEntry(
-    { id: "c", native_endpoints: ["/v1/messages"] },
+    { id: "d", native_endpoints: ["/v1/messages"] },
     gateway,
   );
   assert.equal(messages.api_style, undefined);
-  const none = _internal.toEntry({ id: "d" }, gateway);
+  const none = _internal.toEntry({ id: "e" }, gateway);
   assert.equal(none.api_style, undefined);
 });
 

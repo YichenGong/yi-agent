@@ -27,7 +27,7 @@ agent is connected, Magpie rewrites that file:
 | `models[].api_key` | the key Magpie assigned to Yi Agent |
 | `models[].model` | the Magpie model id, passed through unchanged |
 | `models[].context_length` | filled in when Magpie reports a valid positive context length |
-| `models[].api_style` | `chat` when Magpie reports a native `/chat/completions` endpoint, else unset (Yi Agent's `auto` detection runs) |
+| `models[].api_style` | the strongest native endpoint Magpie reports: `responses` when `/responses` is listed (including alongside `/chat/completions`), else `chat`, else unset |
 | `models[].reasoning_capabilities` | the model's reasoning-effort tiers on the channel Yi Agent will use, when Magpie reports any |
 | `default_model` | written by Magpie as `magpie/` + the selected model id |
 | `subagent_model` | `magpie/` + the selected model id while connected |
@@ -38,8 +38,8 @@ talks to every Magpie model through one OpenAI-compatible endpoint.
 ### Reasoning efforts and the native endpoint
 
 Magpie already knows each model's reasoning-effort tiers (`model.efforts`) and
-its native gateway path (`model.native_endpoints`). The plugin folds both into
-the catalog entry so Yi Agent doesn't have to discover them by round-tripping:
+its native gateway paths (`model.native_endpoints`). The plugin folds both into
+the catalog entry so Yi Agent doesn't have to discover them:
 
 - `model.efforts` is mapped to `reasoning_capabilities` on the channel Yi Agent
   resolves for the entry (`chat` when `api_style` is pinned to chat, else
@@ -47,10 +47,21 @@ the catalog entry so Yi Agent doesn't have to discover them by round-tripping:
   (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) are kept; a value like
   `ultra` that Magpie reports for some models is dropped. `probed_at` is written
   as `0`: Yi Agent reads trust from a non-error record, not from the timestamp.
-- `model.native_endpoints` containing `/chat/completions` pins `api_style` to
-  `chat`, so Yi Agent skips its `/responses`-first probe for those models.
-  Responses- or Messages-native models are left unset (that is Yi Agent's
-  `auto` default already).
+  That record is what fills the picker at all — Magpie writes `models.json`
+  directly, so nothing goes through `model/upsert`, the RPC that probes a bare
+  entry.
+- `model.native_endpoints` lists the paths a request is **passed straight
+  through** on; the gateway serves all three routes and translates whatever a
+  model doesn't speak natively. A model often lists both `/v1/chat/completions`
+  and `/v1/responses` — a provider has a base URL for both — and then either
+  passes through, so the stronger one is pinned: `responses`. Magpie keeps
+  Claude's signed thinking inside a reasoning item's `encrypted_content` on
+  Responses only (`internal/claudeseal`); on Chat it is flattened to plain
+  `reasoning_content` and the signature is lost, which breaks reasoning
+  continuity across a tool loop. Responses-first also matches Yi Agent's own
+  `auto` preference. `/chat/completions` alone pins `chat`; Messages-only and
+  empty stay unset (there is no anthropic pin, and `auto` already resolves to
+  Responses).
 
 ### Library skills
 
@@ -140,7 +151,7 @@ not strip them.
 | --- | --- | --- |
 | `name`, `provider`, `api_url`, `api_key`, `model` | v0.1.4 | — |
 | `context_length` | v0.1.7 | Ignored; compaction threshold falls back to the built-in 200000 default |
-| `api_style` | v0.1.5 | Ignored; `auto` detection runs, costing one extra probe round-trip per model |
+| `api_style` | v0.1.5 | Ignored; Yi Agent's `auto` resolves to `responses`, which is the right channel anyway, but a chat-only model then goes through one translation |
 | `reasoning_capabilities` | v0.1.8 | Ignored; effort tiers are treated as unknown and stripped at request time |
 
 Unknown fields are **silently ignored**, not rejected: `ModelEntry` has no

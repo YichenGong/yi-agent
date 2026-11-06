@@ -110,10 +110,11 @@ function toEntry(model, gateway) {
   ) {
     entry.context_length = context;
   }
-  // Pin the gateway's native API so Yi Agent skips its `/responses`-first
-  // probe (which would otherwise round-trip once per unknown model). When the
-  // gateway exposes a model on native chat-completions, speak Chat; otherwise
-  // leave `api_style` unset so Yi Agent's `auto` detection runs.
+  // Pin the gateway's native API to the strongest one Magpie reports. Pinning
+  // is not about probing: Magpie writes `models.json` directly, which never
+  // triggers Yi Agent's `model/upsert` probe. It is about choosing the channel,
+  // because `api_style` also decides which channel `capabilities()` records
+  // and which endpoint the request goes on.
   const style = nativeApiStyle(model);
   if (style !== "") {
     entry.api_style = style;
@@ -128,30 +129,51 @@ function toEntry(model, gateway) {
   return entry;
 }
 
-// The gateway's native endpoint for this model, when Magpie reports one, else
-// "". `native_endpoints` lists gateway paths a request for the model goes on
-// untranslated, such as `["/v1/chat/completions"]`.
+// The API style to pin for this model, else "". `native_endpoints` lists the
+// gateway paths a request for it goes on *untranslated* (Magpie's
+// `provider.NativeEndpoints`), such as `["/v1/chat/completions"]`. The gateway
+// always serves all three routes and translates what a model doesn't speak
+// natively, so this is not "which routes exist" but "which ones skip the
+// translation".
+//
+// A model may list both chat-completions and responses: both pass straight
+// through, so either is valid and Responses is the stronger pick. Magpie keeps
+// Claude's signed thinking in a reasoning item's `encrypted_content` on the
+// Responses channel only (internal/claudeseal); on Chat it is flattened into
+// `reasoning_content` and the signature is gone. Yi Agent surfaces that same
+// split (ThinkingToken::Encrypted on Responses, ThinkingToken::None on Chat) and
+// replays it, so pinning Chat silently drops reasoning continuity in a tool
+// loop. Responses-first also matches Yi Agent's own `auto` preference
+// (`effective_channel` in yi-agent-runtime/src/models.rs).
+//
+// Messages-only and empty endpoints stay unset: `api_style` only means anything
+// for `provider: "openai"` and there is no "anthropic" pin, while `auto` already
+// resolves to Responses, which is the right channel for a translated Claude.
 function nativeApiStyle(model) {
   const eps = model && Array.isArray(model.native_endpoints) ? model.native_endpoints : [];
   const has = (suffix) => eps.some((p) => typeof p === "string" && p.includes(suffix));
+  if (has("/responses")) {
+    return "responses";
+  }
+  // Chat-only: the model speaks chat-completions natively, so pinning it keeps
+  // the request untranslated, which is what `native_endpoints` is telling us.
   if (has("/chat/completions")) {
     return "chat";
   }
-  // "/responses" and "/v1/messages" are the `auto` default already; only
-  // chat-completions is worth pinning to avoid Yi Agent's responses-first probe.
   return "";
 }
 
 // Build a `reasoning_capabilities` object carrying the Magpie-reported effort
 // tiers on the channel Yi Agent will resolve for this entry (see
 // `effective_channel` in yi-agent-runtime/src/models.rs). Returns undefined when
-// Magpie reports no usable efforts, so the entry stays "unprobed" and Yi Agent's
-// own probe runs.
+// Magpie reports no usable efforts.
 //
 // `probed_at` is 0: Yi Agent never reads the timestamp for trust — it only
 // checks that a channel has a non-error record (`has_trustworthy`), so a
 // zeroed value is both deterministic here (the plugin has no clock) and read
-// as trustworthy, exactly like a fresh probe.
+// as trustworthy, exactly like a fresh probe. That record is what keeps the
+// picker populated: Magpie writes the file directly, so nothing here goes
+// through `model/upsert`, which is what would otherwise probe a bare entry.
 function capabilities(model, entry) {
   const efforts = (model && Array.isArray(model.efforts) ? model.efforts : [])
     .filter((e) => typeof e === "string" && REASONING_TIERS.includes(e));
