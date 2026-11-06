@@ -64,10 +64,15 @@ export function useTranscriptWindow({
       pageSize,
       buffer,
       maxMounted,
-      // 像素阈值随真实中位数走：重尾分布下按条数判断会误触发。
-      bufferPx: buffer * book.median(),
+      // `bufferPx` 在这里只是占位，真正取值在 `recompute` 里按当时的 `book.median()`
+      // 现算（见下）。**不能**把它写进 memo：`book` 的身份是稳定的（调用方
+      // `useMemo(() => createHeightBook(), [])`），所以 `book.median()` 后来变了
+      // memo 也不会重算 —— 中位数会一直停留在冷启动的 fallback 上。反过来，若把
+      // 中位数拉进依赖，它每帧都可能变，`merged` 变 -> `recompute` 变 -> effect
+      // 每帧重跑，又变成空转。放在 rAF 回调里读，两个坑都避开。
+      bufferPx: DEFAULT_LIMITS.bufferPx,
     }),
-    [initialSize, pageSize, buffer, maxMounted, book],
+    [initialSize, pageSize, buffer, maxMounted],
   );
 
   const [state, setState] = useState<WindowState | null>(null);
@@ -95,7 +100,9 @@ export function useTranscriptWindow({
       const next = nextWindow({
         current: stateRef.current,
         itemCount: itemCountRef.current,
-        limits: merged,
+        // 像素阈值随**当时**的真实中位数走：重尾分布下按条数判断会误触发。
+        // 每次重算都重新取，中位数随测量收敛后阈值自动跟上。
+        limits: { ...merged, bufferPx: merged.buffer * book.median() },
         visible,
         focus: pendingRef.current,
       });
@@ -113,7 +120,7 @@ export function useTranscriptWindow({
       stateRef.current = next;
       setState(next);
     });
-  }, [measure, merged]);
+  }, [measure, merged, book]);
 
   // 条数变化（回放、流式增长、clear）都要重算。
   useEffect(() => {

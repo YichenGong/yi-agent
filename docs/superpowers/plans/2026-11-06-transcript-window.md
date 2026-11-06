@@ -1433,10 +1433,13 @@ export function useTranscriptWindow({
       pageSize,
       buffer,
       maxMounted,
-      // 像素阈值随真实中位数走：重尾分布下按条数判断会误触发。
-      bufferPx: buffer * book.median(),
+      // `bufferPx` 在这里只是占位，真正取值在 `recompute` 里按当时的 `book.median()`
+      // 现算。**不能**把它写进 memo：`book` 身份稳定（调用方 useMemo 建一次），
+      // 中位数后来变了 memo 也不会重算，阈值会冻结在冷启动 fallback 上。反过来把
+      // 中位数拉进依赖，它每帧都可能变，`recompute` 身份随之变，effect 每帧重跑。
+      bufferPx: DEFAULT_LIMITS.bufferPx,
     }),
-    [initialSize, pageSize, buffer, maxMounted, book],
+    [initialSize, pageSize, buffer, maxMounted],
   );
 
   const [state, setState] = useState<WindowState | null>(null);
@@ -1464,7 +1467,7 @@ export function useTranscriptWindow({
       const next = nextWindow({
         current: stateRef.current,
         itemCount: itemCountRef.current,
-        limits: merged,
+        limits: { ...merged, bufferPx: merged.buffer * book.median() },
         visible,
         focus: pendingRef.current,
       });
@@ -1482,7 +1485,7 @@ export function useTranscriptWindow({
       stateRef.current = next;
       setState(next);
     });
-  }, [measure, merged]);
+  }, [measure, merged, book]);
 
   // 条数变化（回放、流式增长、clear）与 focus 变化都要重算。
   useEffect(() => {

@@ -12,10 +12,12 @@ let nudge: () => void = () => {};
 let measure: () => VisibleRange | null = () => null;
 let currentFocus: FocusRequest | null = null;
 
+let externalBook: ReturnType<typeof createHeightBook> | null = null;
+
 function Harness({ itemCount }: { itemCount: number }) {
   // `book` 必须稳定：内联新建会让它每次渲染都是新对象，`merged`/`recompute`
   // 的身份随之改变，依赖它的 effect 就会每次渲染都重跑。
-  const [book] = useState(() => createHeightBook(40));
+  const [book] = useState(() => externalBook ?? createHeightBook(40));
   // `measure` 必须是**稳定引用**，与 `ChatView` 里 `useCallback(measureVisible, [])`
   // 一致。若这里每次渲染都新建箭头函数，`recompute` 的身份就会变，依赖它的 effect
   // 每帧重跑——那样即使 hook 根本不支持滚动触发，测试也会「碰巧」通过（重算被
@@ -54,6 +56,7 @@ async function tick(frames = 3) {
 
 beforeEach(() => {
   cleanup();
+  externalBook = null;
   currentFocus = null;
   measure = () => null;
 });
@@ -150,6 +153,28 @@ describe("useTranscriptWindow", () => {
     expect(last.start).toBe(480);
     expect(last.end).toBe(561);
     expect(last.following).toBe(false);
+  });
+
+  it("中位数变大后像素阈值跟着变（bufferPx 不能冻结在冷启动值）", async () => {
+    // 冷启动 fallback = 40px/条 -> bufferPx = 20*40 = 800。
+    // 记录 50 条 400px 的高项后中位数变 400 -> bufferPx = 20*400 = 8000。
+    // gap 取 -2000：旧阈值下 -2000 >= -800 不成立，不翻页；新阈值下成立，翻页。
+    externalBook = createHeightBook(40);
+    const book = externalBook;
+    render(<Harness itemCount={3000} />);
+    await tick();
+    expect(last.end - last.start).toBe(60);
+
+    for (let i = 0; i < 50; i += 1) book.record(`h${i}`, 400);
+    expect(book.median()).toBe(400);
+
+    measure = () => ({ first: 0, last: 10, gapTopPx: -2000, gapBottomPx: -5000 });
+    await act(async () => {
+      nudge();
+    });
+    await tick();
+    expect(last.end - last.start).toBe(260);
+    externalBook = null;
   });
 
   it("measure 返回 null（尚未布局）时保持跟随，不越界", async () => {
