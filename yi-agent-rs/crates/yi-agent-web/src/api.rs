@@ -151,6 +151,18 @@ pub async fn put_config(
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({ "code": "invalid_setting", "key": key, "error": reason })),
         ),
+        Err(SettingsError::InvalidDocument { keys }) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "invalid_document", "keys": keys })),
+        ),
+        Err(SettingsError::LockTimeout) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "code": "settings_lock_timeout" })),
+        ),
+        Err(SettingsError::TooLarge) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "code": "settings_too_large" })),
+        ),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error.to_string() })),

@@ -27,6 +27,13 @@
 ## Features
 
 - [ ] 运行参数全会话即时生效（spec / plan 完成，功能未实现）— [spec](../superpowers/specs/2026-11-04-runtime-settings-live-apply-design.md) · [plan](../superpowers/plans/2026-11-04-runtime-settings-live-apply-impl.md)。覆盖同实例 app-server、CLI/TUI、daemon/现存子代理及旁问；保存后下个对应安全执行点采用，不打断已开始操作；默认沙箱只影响新会话。完成判据：spec §10 T01–T28 的自动化证据、§11 全部条件及 `cd yi-agent-rs && cargo fmt --all && just ci`；本项统一计数，相关模块实施时交叉引用，不重复计数。
+  - 已落地（Task 1/14，仅严格文档校验与采用策略；**热更新链路尚未接线**，整项仍为 `[ ]`）：
+    `src/settings/document.rs` 提供 `ValidatedSettingsDocument { raw, settings, revision }`（`:16`）、`validate_document(raw: Value) -> Result<_, SettingsError>`（`:53`）、`ApplyPolicy`（`:31`，序列化仅 `next_safe_point` / `next_session`）与 `apply_policy(key) -> Option<ApplyPolicy>`（`:152`，`startup.sandbox` 是唯一 `next_session`）。
+    语义：已知字段非法整份拒绝并一次列全非法键（分组名 + `group.field`，错误只带键名不带取值）；已知分组不是对象直接拒绝；旧键 `agent.prevent_idle_sleep` 只在目标分组形状可解释时搬运、双键并存取 `power` 且旧键从规范原文删除；数字字符串先转规范 number 再构造 typed `Settings`（否则保存成功但值悄悄变 `None`）；跨字段 `power.remote_touch_minutes <= power.idle_grace_minutes`（未设置一侧按默认参与）；`revision` = 已识别 16 字段（含未设置 = null）的排序 JSON 的 SHA-256，不含未知键 / env / 提示词原文，故 A→B→A 可复用。
+    `SettingsError` 新增 `InvalidDocument { keys }` / `LockTimeout` / `TooLarge`（`src/settings.rs:765`/`:769`/`:771`），app-server `settings_rpc.rs:109` 与 web `api.rs:154` 给出受控 code（`invalid_document` / `settings_lock_timeout` / `settings_too_large`），Task 10 再补健康/采用协议。
+  - 判据：`cargo test -p yi-agent-runtime --lib settings::document` → 14 passed（含 `live_document_rejects_bad_known_field_instead_of_defaulting`、`every_runtime_field_has_one_apply_policy`、`revision_repeats_for_a_b_a`、`numeric_strings_become_numbers_in_the_typed_settings`、`new_power_key_wins_and_unknown_keys_survive`、`a_legacy_alias_with_a_non_object_target_group_is_rejected`）
+  - 判据：`cargo test -p yi-agent-runtime --lib settings` → 95 passed（含既有 `.env` 解析与宽容启动读取回归，未被替换）
+  - 判据：`cd yi-agent-rs && cargo fmt --all` 干净、`just ci` exit 0（`LC_ALL=C LANG=C`，见 `.superpowers/sdd/2026-11-04-runtime-settings-live-apply-impl/logs/full-ci-c-locale.log`）
 
 - [x] crate 骨架 + workspace 注册 — `yi-agent-rs/crates/yi-agent-runtime/`；`Cargo.toml` members 含 `crates/yi-agent-runtime`
 - [x] `RuntimeConfig` + `ConfigOverrides` + `load()`（env/.env 层级合并，不依赖 clap）— `src/config.rs:13` / `src/config.rs:34` / `src/config.rs:169`

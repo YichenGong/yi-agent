@@ -104,6 +104,23 @@ pub fn write_error(error: SettingsError) -> RpcError {
             data: Some(json!({ "code": "settings_corrupt" })),
         },
         SettingsError::Io(reason) => RpcError::internal(reason),
+        // Task 1 只保证枚举穷尽匹配可编译并给出受控错误码；精确的健康/采用
+        // 协议由 Task 10 补齐。
+        SettingsError::InvalidDocument { keys } => RpcError {
+            code: -32602,
+            message: format!("invalid settings.json keys: {}", keys.join(", ")),
+            data: Some(json!({ "code": "invalid_document", "keys": keys })),
+        },
+        SettingsError::LockTimeout => RpcError {
+            code: -32603,
+            message: "settings.json is locked by another writer; try again later".to_string(),
+            data: Some(json!({ "code": "settings_lock_timeout" })),
+        },
+        SettingsError::TooLarge => RpcError {
+            code: -32602,
+            message: "settings.json exceeds the 1 MiB limit".to_string(),
+            data: Some(json!({ "code": "settings_too_large" })),
+        },
     }
 }
 

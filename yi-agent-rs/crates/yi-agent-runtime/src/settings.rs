@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 
+pub mod document;
+
 /// 解析一行 `.env`，口径与 `dotenvy` 对齐。
 ///
 /// 对齐的四条：
@@ -758,6 +760,15 @@ pub enum SettingsError {
     /// 文件存在，但读不出来 / 不是 JSON 对象。拒绝覆盖。
     Corrupt(String),
     Io(String),
+    /// 整份文档有多个非法已知字段。**只带键名**：错误会进日志、RPC 和前端，
+    /// 不能把用户填的原文（可能含密钥）带出去。
+    InvalidDocument {
+        keys: Vec<String>,
+    },
+    /// 等实例写锁超过单调时钟上限（5 秒）。
+    LockTimeout,
+    /// 完整文件超过 1 MiB 上限。
+    TooLarge,
 }
 
 impl std::fmt::Display for SettingsError {
@@ -768,6 +779,16 @@ impl std::fmt::Display for SettingsError {
             }
             SettingsError::Corrupt(reason) => write!(f, "settings.json is not writable: {reason}"),
             SettingsError::Io(reason) => write!(f, "settings.json io error: {reason}"),
+            SettingsError::InvalidDocument { keys } => {
+                write!(f, "invalid settings.json keys: {}", keys.join(", "))
+            }
+            SettingsError::LockTimeout => {
+                write!(
+                    f,
+                    "settings.json is locked by another writer; try again later"
+                )
+            }
+            SettingsError::TooLarge => write!(f, "settings.json exceeds the 1 MiB limit"),
         }
     }
 }
