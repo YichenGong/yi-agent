@@ -1506,3 +1506,47 @@ describe("transcript windowing", () => {
     expect(container.querySelectorAll("[data-item-id]")).toHaveLength(0);
   });
 });
+
+describe("capture() only measures the mounted window", () => {
+  it("3000 条会话单次采集的 getBoundingClientRect 次数不超过挂载区两倍", () => {
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+    const { container } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    const scroller = container.querySelector("[data-thread-id]") as HTMLElement;
+    spy.mockClear();
+    fireEvent.scroll(scroller);
+    // 只挂载 60 条，再加上容器与首尾节点的测量，远小于 3000。
+    expect(container.querySelectorAll("[data-item-id]").length).toBe(60);
+    expect(spy.mock.calls.length).toBeLessThan(200);
+    spy.mockRestore();
+  });
+
+  it("挂载区高度写回 HeightBook 后 spacer 跟着收敛（0 高度必须被忽略）", () => {
+    // jsdom 的 `getBoundingClientRect().height` 恒为 0，正是「未布局」的真实形状。
+    // 若没有 `if (h > 0)` 守卫，这 60 条会被记成 0 高度，中位数塌到 0，spacer
+    // 归零 —— 滚动条比例整个失真。
+    //
+    // 断言必须发生在**一次重渲染之后**：`windowBook.record` 不是 state，写入本身
+    // 不触发渲染，spacer 只在下次渲染时才用新中位数重算。所以这里改
+    // `structuralVersion` 强制重渲染，否则断言读的还是首次渲染的快照，注入缺陷
+    // 也照样通过（已实测：无守卫时本用例曾经是空断言）。
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    rerender(<ChatView items={many} threadId="t1" structuralVersion={2} query="" />);
+    const top = container.querySelector("[data-spacer='top']") as HTMLElement;
+    // fallback 中位数 40 -> 2940 条未挂载 * 40 = 117600。塌到 0 时会读到 0。
+    expect(parseFloat(top.style.height)).toBe(117600);
+  });
+});

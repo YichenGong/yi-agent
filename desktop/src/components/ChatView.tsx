@@ -570,6 +570,22 @@ export function ChatView({
     return () => el.removeEventListener("scroll", onScroll);
   }, [nudge]);
 
+  // 把挂载区的真实高度写回 `HeightBook`：中位数越准，spacer 越准，分页后的视觉
+  // 跳动越小（设计 §2.4 的螺旋收敛）。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    for (const node of el.querySelectorAll<HTMLElement>("[data-item-id]")) {
+      const id = node.dataset.itemId;
+      if (!id) continue;
+      const h = node.getBoundingClientRect().height;
+      // **必须过滤 0**：未布局（首帧、jsdom、刚挂载还没排版）时高度是 0，而
+      // `HeightBook.record` 认为 0 合法（折叠条目确实可能为 0）会照收。大量 0
+      // 进来会把中位数拉到 0，spacer 归零，滚动条比例整个失真。
+      if (h > 0) windowBook.record(id, h);
+    }
+  }, [win.start, win.end, windowBook]);
+
   // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
   const elRef = useRef<HTMLDivElement | null>(null);
   // 回调每次渲染都可能换身份（宿主内联箭头），用 ref 读最新的，避免把采集
@@ -714,7 +730,10 @@ export function ChatView({
     let observer: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
       observer = new ResizeObserver(schedule);
-      // 观察整个内容流：任何一条消息变高（图片加载、卡片展开）都会回调。
+      // 观察 spacer：它们的高度代表「未挂载区间」的布局变化。未挂载区没有节点
+      // 可观察，spacer 是唯一可用的信号。
+      for (const sp of el.querySelectorAll("[data-spacer]")) observer.observe(sp);
+      // 观察挂载区：图片异步加载、工具卡展开会让已挂载条目变高。
       for (const child of el.querySelectorAll("[data-item-id]")) observer.observe(child);
     }
     // 没有 `ResizeObserver` 的环境（旧 WebView、测试）退化为轮询：只比总高度，

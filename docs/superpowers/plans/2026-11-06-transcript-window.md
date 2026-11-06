@@ -2013,6 +2013,24 @@ describe("capture() only measures the mounted window", () => {
     expect(spy.mock.calls.length).toBeLessThan(200);
     spy.mockRestore();
   });
+
+  it("挂载区高度写回 HeightBook 后 spacer 跟着收敛（0 高度必须被忽略）", () => {
+    // jsdom 的 height 恒为 0，正是「未布局」的真实形状。没有 `if (h > 0)` 守卫时
+    // 中位数会塌到 0、spacer 归零。断言必须在**一次重渲染之后**：`record` 不是
+    // state，写入本身不触发渲染，否则读到的是首帧快照，注入缺陷也照样通过。
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      type: "agentMessage",
+      id: `m${i}`,
+      text: `row ${i}`,
+    })) as Item[];
+    const { container, rerender } = render(
+      <ChatView items={many} threadId="t1" structuralVersion={1} query="" />,
+    );
+    rerender(<ChatView items={many} threadId="t1" structuralVersion={2} query="" />);
+    const top = container.querySelector("[data-spacer='top']") as HTMLElement;
+    // fallback 中位数 40 -> 2940 条未挂载 * 40 = 117600。塌到 0 时读到 0。
+    expect(parseFloat(top.style.height)).toBe(117600);
+  });
 });
 ```
 
