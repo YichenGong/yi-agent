@@ -1882,11 +1882,25 @@ const HistoryWindow = memo(
   // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走
   // `requestFocus()`，是命令式的一次性请求。传 `focus={ref.current}` 读 ref 属于
   // 渲染期读可变值，而且值永远是 null，等于给 hook 加了一条走不通的分支。
-  const { window: win, requestFocus } = useTranscriptWindow({
+  const { window: win, requestFocus, nudge } = useTranscriptWindow({
     itemCount: items.length,
     measure: measureVisible,
     book: windowBook,
   });
+
+  // **翻页必须由滚动驱动。** 滚动既不改变 `itemCount` 也不改变 `focus`，hook 内部
+  // 没有任何 React 依赖会因此变化——不在这里把滚动事件接上，窗口会永远停在首屏
+  // 那 60 条，用户滚到顶也加载不出更早的历史。`nudge` 内部已按帧去重，可以逐帧调。
+  //
+  // 与 `useStickToBottom` 各挂一个 `scroll` 监听：两者职责不同（一个管贴底意图、
+  // 一个管窗口翻页），合并不划算；都走 passive 监听，开销可忽略。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const onScroll = () => nudge();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [nudge]);
 ```
 
 > `first`/`last` 在这一层是**挂载区相对序号**（0 到 mounted-1），因为组件数不出
