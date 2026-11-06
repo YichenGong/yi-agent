@@ -98,6 +98,39 @@ Nothing enforces it at runtime: the plugin cannot detect the installed Yi Agent
 version (Magpie's agent runtime has no filesystem or process access), so the
 declaration is a promise kept by the release process, not a check.
 
+### What to call it
+
+The four spellings are not alternatives for one thing — they are four different
+identifiers with four different jobs. Mixing them up is what makes the name look
+arbitrary:
+
+| Role | Standard spelling | Where it appears |
+| --- | --- | --- |
+| npm package (registry id) | `@yi-agent/yi-agent` | `dependencies`, `npm install`, `require` |
+| Display name (read by people) | `Yi Agent` | docs, UI, `agent.name` |
+| Machine identifier (binary, id, directory) | `yi-agent` | `agent.id`, `bin`, `~/.yi-agent`, repo name, `YI_AGENT_*` env prefix |
+| JSON key (metadata namespace) | `yiAgent` | this package's top-level metadata |
+
+So the field is `yiAgent`, and the reason is the fourth row: it is a **JSON
+key**, not a package name and not a display name. package.json spells its own
+multi-word keys in camelCase (`devDependencies`, `peerDependencies`,
+`publishConfig`, `optionalDependencies`); a hyphenated top-level key would be
+the only one in the file. `@yi-agent/yi-agent` is the registry identifier — it
+names what you install, and would be meaningless here. `Yi Agent` is prose.
+
+Two places the metadata must **not** go:
+
+- **Not inside `magpie`.** That object is Magpie's namespace (`magpie.agent`,
+  `magpie.icon`); putting our data there claims another project's keys.
+- **Not in `engines`.** It looks tempting — `engines` is the standard field for
+  "runtimes this works with" — but it can only express one range, and package
+  managers are allowed to *enforce* it. Bun installs this plugin (`bun add`),
+  so an unknown engine key that some future version decides to check would turn
+  a compatibility note into a failed install. A key nothing reads cannot fail.
+
+Verified: `npm pack` keeps both custom blocks in the tarball, so publishing does
+not strip them.
+
 ### What each field needs
 
 `models.json` and the three top-level keys (`models`, `default_model`,

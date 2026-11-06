@@ -513,3 +513,25 @@ test("README documents the same compatibility floor as package.json", () => {
     assert.ok(readme.includes(`v${since}`), `README must cite v${since} for ${field}`);
   }
 });
+
+test("each identifier uses its own spelling", () => {
+  // Four roles, four spellings. The JSON metadata key is camelCase because
+  // package.json spells its own multi-word keys that way; the npm package name
+  // is the registry id; `yi-agent` is the machine identifier the binary, the
+  // config directory and the env prefix all use; `Yi Agent` is prose.
+  assert.equal(typeof PKG.yiAgent, "object", "metadata key must be camelCase `yiAgent`");
+  assert.equal(PKG.name, "@yi-agent/magpie-agent-yi-agent", "package name is the registry id");
+  assert.equal(agent.id, "yi-agent", "agent.id is the machine identifier");
+  assert.equal(agent.bin, "yi-agent");
+  assert.equal(agent.name, "Yi Agent", "display name is prose");
+  assert.equal(agent.config, "~/.yi-agent/models.json");
+
+  // The metadata must not squat in Magpie's namespace: `magpie` holds only
+  // Magpie's own documented fields.
+  assert.deepEqual(Object.keys(PKG.magpie).sort(), ["agent", "icon"]);
+
+  // ...and must not be an `engines` entry. Bun installs this plugin, and
+  // `engines` is enforceable, so an unknown key there could fail an install
+  // instead of merely documenting a version.
+  assert.equal(PKG.engines, undefined, "compatibility metadata must not be in `engines`");
+});
