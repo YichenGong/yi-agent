@@ -4,6 +4,58 @@ pub(crate) const COMMAND_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 pub(crate) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Slack added on top of a request's own blocking window.
+///
+/// The budget must outlive the window *and* the round trip that follows it, or
+/// the client gives up in the one moment the daemon is about to answer.
+const REPLY_BUDGET_SLACK: Duration = Duration::from_secs(15);
+
+/// How long a client should wait for this request's reply.
+///
+/// The default [`CLIENT_REQUEST_TIMEOUT`] is a *liveness* bound: it exists so a
+/// wedged daemon cannot hang a caller forever. A request that legitimately asks
+/// the daemon to block (`WaitAgent` carries its own `timeout_ms`) is slower than
+/// that by design, so the generic bound would fire while the daemon is still
+/// doing exactly what it was asked to do -- and the caller reads "still
+/// working" as "the daemon is broken".
+///
+/// Deriving the budget from the request keeps the tight bound everywhere else:
+/// only a request that declares a longer window gets a longer deadline. An
+/// unbounded wait keeps the default, because no finite budget could cover it.
+pub fn reply_budget(request: &IpcRequest) -> Duration {
+    match request {
+        IpcRequest::WaitAgent {
+            timeout_ms: Some(window_ms),
+            ..
+        } => Duration::from_millis(*window_ms).saturating_add(REPLY_BUDGET_SLACK),
+        _ => CLIENT_REQUEST_TIMEOUT,
+    }
+}
+
+/// Maps a socket read deadline onto the timeout it actually is.
+///
+/// macOS reports a unix-socket read deadline as `EAGAIN`
+/// ([`std::io::ErrorKind::WouldBlock`], `os error 35`) while Linux reports
+/// `TimedOut`; both mean "no reply within the deadline". Passing `EAGAIN`
+/// through unchanged made a plain deadline look like an opaque transport fault
+/// -- and `IpcError::Io` is `#[error(transparent)]`, so the literal
+/// "Resource temporarily unavailable (os error 35)" reached the model.
+///
+/// Only `WouldBlock` is rewritten: a genuine `TimedOut` is already correct, and
+/// rewriting it would discard whatever detail the OS attached.
+fn classify_reply_error(error: std::io::Error, deadline: Duration) -> IpcError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "the daemon did not answer within {}s (it may still be working)",
+                deadline.as_secs_f32().round() as u64
+            ),
+        ));
+    }
+    IpcError::Io(error)
+}
+
 /// The longest socket path `sockaddr_un.sun_path` accepts, excluding the
 /// terminating NUL. Linux allows 108; macOS and the BSDs allow 104. Taking the
 /// smaller bound keeps one behaviour across platforms.
@@ -57,12 +109,13 @@ pub fn send_request_with_version(
     protocol_version: u32,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
-    send_request_with_version_timeout(
-        socket_path,
-        protocol_version,
-        request,
-        CLIENT_REQUEST_TIMEOUT,
-    )
+    // The deadline follows the request: a plain query keeps the tight liveness
+    // bound, while a request that asks the daemon to block gets a budget that
+    // outlives its own window. Taking the default unconditionally here is what
+    // turned every `wait_agent` longer than 30s into a transport failure while
+    // the child was still running.
+    let reply_timeout = reply_budget(&request);
+    send_request_with_version_timeout(socket_path, protocol_version, request, reply_timeout)
 }
 
 /// `send_request_with_version` with an explicit reply deadline.
@@ -84,12 +137,19 @@ pub fn send_request_with_version_timeout(
     stream.set_read_timeout(Some(reply_timeout))?;
     let request_id = next_request_id();
     write_request(&mut stream, protocol_version, request_id.clone(), request)?;
-    let response = read_limited_frame(&mut BufReader::new(stream))?.ok_or_else(|| {
-        IpcError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "daemon closed request connection",
-        ))
-    })?;
+    let response = read_limited_frame(&mut BufReader::new(stream))
+        .map_err(|error| match error {
+            // A deadline that fired must read as a deadline, not as whatever
+            // errno this platform happens to use for `EAGAIN`.
+            IpcError::Io(io) => classify_reply_error(io, reply_timeout),
+            other => other,
+        })?
+        .ok_or_else(|| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon closed request connection",
+            ))
+        })?;
     let envelope: ResponseEnvelope = serde_json::from_slice(&response)?;
     if envelope.protocol_version != PROTOCOL_VERSION || envelope.request_id != request_id {
         return Err(IpcError::Io(std::io::Error::new(
@@ -205,6 +265,108 @@ mod kanban_observation_frame_limit_tests {
             matches!(error, IpcError::FrameTooLarge),
             "expected FrameTooLarge, got {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod late_reply_tests {
+    use super::*;
+
+    /// A reply that arrives after the deadline must be reported as a *timeout*,
+    /// not as an opaque syscall error.
+    ///
+    /// macOS reports a unix-socket read deadline as `EAGAIN`
+    /// (`ErrorKind::WouldBlock`, `os error 35`), and `IpcError::Io` is
+    /// `#[error(transparent)]`, so the model used to see the literal
+    /// "Resource temporarily unavailable (os error 35)". A caller holding a
+    /// long-running request (a `wait_agent` that legitimately blocks for two
+    /// minutes) read that as "the daemon is broken".
+    #[test]
+    fn a_reply_after_the_deadline_is_reported_as_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Accept, read the request, and stay busy: the daemon is *working*,
+        // just not done within this client's budget.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let mut discard = [0_u8; 128];
+            let _ = std::io::Read::read(&mut stream, &mut discard);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let error = send_request_with_version_timeout(
+            &socket,
+            PROTOCOL_VERSION,
+            IpcRequest::Status,
+            Duration::from_millis(150),
+        )
+        .expect_err("a late reply must fail the client");
+
+        match &error {
+            IpcError::Io(io) => assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut,
+                "a read deadline is a timeout, not a generic io failure: {error}"
+            ),
+            other => panic!("expected IpcError::Io, got {other:?}"),
+        }
+        let text = error.to_string();
+        assert!(
+            text.contains("did not answer within"),
+            "the message must say the daemon did not answer in time: {text}"
+        );
+        assert!(
+            !text.contains("os error"),
+            "a raw errno is an implementation detail, not a model-visible fact: {text}"
+        );
+        drop(server);
+    }
+}
+
+#[cfg(test)]
+mod reply_budget_tests {
+    use super::*;
+
+    fn wait(timeout_ms: Option<u64>) -> IpcRequest {
+        IpcRequest::WaitAgent {
+            session_id: "s".into(),
+            caller_task_id: "t".into(),
+            capability: "c".into(),
+            mode: "any".into(),
+            timeout_ms,
+        }
+    }
+
+    /// A client deadline must never fire before the request's own budget does.
+    ///
+    /// `wait_agent` asks the daemon to block for up to two minutes, but the
+    /// shared client deadline is 30 seconds. Every wait longer than that came
+    /// back as "Resource temporarily unavailable (os error 35)" while the child
+    /// was still working: "still running" was being reported as "the daemon is
+    /// broken".
+    #[test]
+    fn a_wait_budget_outlives_the_window_the_daemon_blocks_for() {
+        let window = Duration::from_millis(120_000);
+        let budget = reply_budget(&wait(Some(120_000)));
+        assert!(
+            budget > window,
+            "the client must still be waiting when the daemon's window ends: {budget:?}"
+        );
+    }
+
+    /// An unbounded wait cannot be covered by any deadline, so it keeps the
+    /// default: this method must not silently unbound the client.
+    #[test]
+    fn an_unbounded_wait_keeps_the_default_budget() {
+        assert_eq!(reply_budget(&wait(None)), CLIENT_REQUEST_TIMEOUT);
+    }
+
+    /// The budget is derived from the request, not a blanket raise: a plain
+    /// query keeps the shared default so a wedged daemon still fails fast.
+    #[test]
+    fn a_plain_request_keeps_the_default_budget() {
+        assert_eq!(reply_budget(&IpcRequest::Status), CLIENT_REQUEST_TIMEOUT);
     }
 }
 

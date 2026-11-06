@@ -3900,6 +3900,103 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
     );
 }
 
+/// A wait that outlives the shared 30s client deadline must still succeed.
+///
+/// This is the regression for the observed failure:
+///
+/// ```text
+/// error: daemon rejected wait request: session delegation transport:
+///        Resource temporarily unavailable (os error 35)
+/// ```
+///
+/// `wait_agent` asks the daemon to block for up to two minutes, but the client
+/// read deadline was the flat 30s liveness bound. The wait below blocks for
+/// ~31s and then reports, so it crosses the old deadline while the daemon is
+/// doing exactly what it was asked to do. Before the fix this returned an
+/// `EAGAIN` from the read side on macOS (and `TimedOut`/a timeout elsewhere);
+/// after it, the completion must come through intact.
+#[test]
+fn a_wait_longer_than_the_client_deadline_still_completes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(TextCompletionFactory::default());
+    let daemon =
+        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
+            .unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "tui-wait-past-deadline".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected an attached root");
+    };
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "Inspect child behavior slowly".into(),
+            mode: None,
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+            session_turn: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child task");
+    };
+
+    // The child finishes only after the old 30s bound has passed.
+    let handles = Arc::clone(&factory.handles);
+    let reporter = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(31_000));
+        handles.lock().unwrap()[0].report_completed("finished after the old deadline");
+    });
+
+    let started = std::time::Instant::now();
+    let response = send_request(
+        daemon.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id,
+            caller_task_id: root_task_id,
+            capability: message_capability,
+            mode: "all".into(),
+            timeout_ms: Some(120_000),
+        },
+    );
+    let elapsed = started.elapsed();
+    reporter.join().unwrap();
+
+    assert!(
+        elapsed > std::time::Duration::from_secs(30),
+        "this test only proves anything if the wait crossed the old bound: {elapsed:?}"
+    );
+    let response = response.expect("the wait must not fail while the child is still working");
+    match &response {
+        IpcResponse::WaitCompleted {
+            status, children, ..
+        } => {
+            assert_eq!(status, "completed");
+            assert_eq!(children, &vec![task_id]);
+        }
+        other => panic!("expected the completed child, got {other:?}"),
+    }
+}
+
 #[test]
 fn daemon_wait_agent_returns_completed_child_reports() {
     let directory = TempDir::new().unwrap();

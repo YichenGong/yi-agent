@@ -1737,6 +1737,11 @@ fn session_tool_error(
     action: &str,
     error: crate::session_delegation::SessionClientError,
 ) -> ToolResult {
+    // A wait that has not answered has not been rejected: saying "daemon
+    // rejected" would send the model hunting for a decision nobody made.
+    if error.is_timeout() {
+        return ToolResult::error(format!("{action} timed out: {error}"));
+    }
     ToolResult::error(format!("daemon rejected {action}: {error}"))
 }
 
@@ -2958,6 +2963,31 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    /// An expired wait is not a refusal, and it is not a dead daemon.
+    ///
+    /// The model sees this text. "daemon rejected wait request: ... Resource
+    /// temporarily unavailable (os error 35)" reads as a broken daemon, so a
+    /// `wait_agent` whose child was still working sent the model looking for a
+    /// fault that did not exist. The wait simply outlived the client's budget.
+    #[test]
+    fn an_expired_wait_is_not_reported_as_a_refusal() {
+        let result = super::session_tool_error(
+            "wait request",
+            crate::session_delegation::SessionClientError::Timeout(
+                "the daemon did not answer in time (it may still be working)".into(),
+            ),
+        );
+        let text = format!("{result:?}");
+        assert!(
+            text.contains("timed out"),
+            "the reason must name what actually happened: {text}"
+        );
+        assert!(
+            !text.contains("daemon rejected"),
+            "a wait that has not answered has not been rejected: {text}"
+        );
+    }
+
     /// A plain directory is still a project, so re-attaching its root must work.
     ///
     /// The repository check asked git for the top level, and a directory that is not

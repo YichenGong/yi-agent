@@ -48,6 +48,14 @@ pub enum SessionClientError {
     Rejected(SessionFailure),
     /// The request did not complete. For a write, the outcome is unknown.
     Transport(String),
+    /// The client's own reply deadline fired before the daemon answered.
+    ///
+    /// Kept apart from [`Self::Transport`] because it says nothing about the
+    /// daemon's health: a `wait_agent` that blocks for two minutes is *supposed*
+    /// to be quiet, so a deadline here means "not finished yet", not "broken".
+    /// For a read that is retryable; for a write it is still ambiguous, which is
+    /// why the kind is reported rather than silently retried.
+    Timeout(String),
     /// The request never reached a daemon: `connect` itself failed.
     ///
     /// Kept apart from [`Self::Transport`] because it is the one transport failure
@@ -95,6 +103,14 @@ impl SessionClientError {
             })
         )
     }
+
+    /// Whether this failure is only "the daemon had not answered yet".
+    ///
+    /// A read may be sent again: it changes nothing, so a second wait is just a
+    /// second wait. A write must not be, which is why the caller decides.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
 }
 
 impl std::fmt::Display for SessionClientError {
@@ -109,6 +125,9 @@ impl std::fmt::Display for SessionClientError {
             }
             Self::Transport(message) => {
                 write!(formatter, "session delegation transport: {message}")
+            }
+            Self::Timeout(message) => {
+                write!(formatter, "session delegation timed out: {message}")
             }
             Self::Connect(message) => {
                 write!(
@@ -138,6 +157,18 @@ fn never_connected(error: &yi_agent_store::ipc::IpcError) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether the client's own reply deadline fired.
+///
+/// Read-side by construction: the request was written, so this says nothing
+/// about whether the daemon has done it -- only that no answer arrived in time.
+fn is_deadline(error: &yi_agent_store::ipc::IpcError) -> bool {
+    matches!(
+        error,
+        yi_agent_store::ipc::IpcError::Io(io)
+            if io.kind() == std::io::ErrorKind::TimedOut
+    )
 }
 
 fn failure_from_response(response: IpcResponse) -> SessionClientError {
@@ -562,6 +593,7 @@ impl HostControl {
             SessionClientError::Protocol(_) => error,
             SessionClientError::Rejected(failure) => SessionClientError::Rejected(failure),
             SessionClientError::Transport(message) => SessionClientError::Transport(message),
+            SessionClientError::Timeout(message) => SessionClientError::Timeout(message),
             SessionClientError::Connect(message) => SessionClientError::Connect(message),
         })
     }
@@ -689,6 +721,11 @@ impl SessionTurnClient {
         let request = build(&handle, &self.turn);
         match send_request(&handle.socket_path, request) {
             Ok(response) => Ok(response),
+            // A deadline is not a transport fault: the wait may simply outlive
+            // the client's budget while the daemon is doing what it was asked.
+            Err(error) if is_deadline(&error) => {
+                Err(SessionClientError::Timeout(error.to_string()))
+            }
             Err(error) => Err(SessionClientError::Transport(error.to_string())),
         }
     }
@@ -703,6 +740,12 @@ impl SessionTurnClient {
         let request = build(&handle, &self.turn);
         match send_request(&handle.socket_path, request) {
             Ok(response) => Ok(response),
+            // A write whose deadline fired is ambiguous, not a connection
+            // fault: the daemon may have applied it and only the reply went
+            // missing. That is exactly the case this path must not retry.
+            Err(error) if is_deadline(&error) => Err(SessionClientError::Timeout(
+                "the request was NOT retried: it may already have been applied.".to_string(),
+            )),
             Err(error) if is_liveness_error(&error) => Err(SessionClientError::Transport(
                 "the runtime connection failed and the request was NOT retried: it may \
                  already have been applied."
