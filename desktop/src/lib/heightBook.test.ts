@@ -13,6 +13,15 @@ describe("HeightBook", () => {
     expect(book.estimate("a")).toBe(120);
   });
 
+  it("偶数个样本取中间两值的均值", () => {
+    // 这条专门锁 `median()` 的偶数分支：若误取 sortedCache[mid] 而不是两值均值，
+    // 结果是 100 而不是 70，立刻失败。
+    const book = createHeightBook(40);
+    book.record("a", 40);
+    book.record("b", 100);
+    expect(book.median()).toBe(70);
+  });
+
   it("中位数对重尾分布比平均值稳", () => {
     const book = createHeightBook();
     // 绝大多数是两三行，少数是超长工具卡

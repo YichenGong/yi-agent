@@ -654,6 +654,15 @@ describe("HeightBook", () => {
     expect(book.estimate("a")).toBe(120);
   });
 
+  it("偶数个样本取中间两值的均值", () => {
+    // 这条专门锁 `median()` 的偶数分支：若误取 sortedCache[mid] 而不是两值均值，
+    // 结果是 100 而不是 70，立刻失败。
+    const book = createHeightBook(40);
+    book.record("a", 40);
+    book.record("b", 100);
+    expect(book.median()).toBe(70);
+  });
+
   it("中位数对重尾分布比平均值稳", () => {
     const book = createHeightBook();
     // 绝大多数是两三行，少数是超长工具卡
@@ -1910,7 +1919,11 @@ Expected: FAIL — 收集到 3000 次调用。
     for (const node of nodes) {
       const id = node.dataset.itemId;
       if (!id) continue;
-      windowBook.record(id, node.getBoundingClientRect().height);
+      const h = node.getBoundingClientRect().height;
+      // **必须过滤 0**：未布局（首帧、jsdom、刚挂载还没排版）时高度是 0，
+      // `HeightBook.record` 认为 0 合法（折叠条目确实可能为 0），会照收。
+      // 大量 0 进来会把中位数拉到 0，spacer 高度归零，滚动条比例整个失真。
+      if (h > 0) windowBook.record(id, h);
     }
   }, [win.start, win.end, windowBook]);
 ```
