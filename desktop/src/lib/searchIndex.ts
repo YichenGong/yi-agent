@@ -25,8 +25,23 @@ export interface SearchHit {
 type AnyItem = Item | NoticeItem | ReasoningItem;
 
 /**
- * 在全部 items 上找命中。与 `rehypeSearchMark` 用同一套 `findMatches`
- * （大小写不敏感、允许重叠），所以「计数」与「画出来的 mark 数」一致。
+ * 在全部 items 上找命中。与 `rehypeSearchMark` 用**同一套 `findMatches`**
+ * （大小写不敏感、允许重叠，一条匹配一个 `SearchHit`）。
+ *
+ * **注意这不是「命中数 == 可见 mark 数」的保证。** 这里匹配的是 `itemText`
+ * 返回的**源文本**，而渲染层匹配的是 markdown 解析后的文本节点，两者会分叉：
+ *
+ * - markdown 语法字符（`**`、`#`、反引号）与链接 URL 在源文本里存在，
+ *   渲染后不存在 → 有命中但没有 mark。实测 `"**bold** and **more**"` 搜 `**`
+ *   得 4 个命中、0 个 mark。
+ * - `reasoning` / `thinking` 走 `ReasoningBlock` 的纯文本渲染，不经过
+ *   `rehypeSearchMark`，且默认折叠 → 有命中但没有 mark。
+ * - 普通文本 `notice` 在 `ChatView` 里渲染 `{item.text}`（不套 `HighlightText`）
+ *   → 有命中但没有 mark；带结构化载荷的 notice 走卡片，`itemText` 返回 `""`。
+ * - `toolCall` 两边都不匹配。
+ *
+ * 所以跳转到这类命中时「高亮看不见」，需要挂载后可能还要展开块。这是设计接受的
+ * 取舍（覆盖面优先），但调用方不能假设计数等于可见高亮数。
  */
 export function collectHits(items: readonly AnyItem[], query: string): SearchHit[] {
   const out: SearchHit[] = [];

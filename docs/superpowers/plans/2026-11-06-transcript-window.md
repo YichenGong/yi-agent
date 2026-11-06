@@ -862,8 +862,20 @@ describe("itemText", () => {
     expect(itemText(tool)).toBe("");
   });
 
-  it("notice 的正文走结构化载荷，返回空串", () => {
-    expect(itemText({ type: "notice", id: "n1", text: "x" })).toBe("");
+  it("普通文本 notice 渲染的就是 text，因此必须可搜", () => {
+    expect(itemText({ type: "notice", id: "n1", text: "通道回退到 backup" })).toBe(
+      "通道回退到 backup",
+    );
+  });
+
+  it("结构化 notice 渲染成卡片，正文不是 text，返回空串", () => {
+    const n = {
+      type: "notice",
+      id: "n2",
+      text: "/config",
+      body: { kind: "config", data: { model: "m" } },
+    } as unknown as Item;
+    expect(itemText(n)).toBe("");
   });
 
   it("thinking 有明文时返回明文（不能用空串用例代替）", () => {
@@ -915,10 +927,14 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
     // 要照传，好让就地追加能被比较器看见。
     case "thinking":
       return item.text;
+    // 普通文本 notice（缺省 `body`）在 `ChatView` 里就渲染 `item.text`，所以它必须
+    // 可搜；带结构化载荷的 notice 渲染成卡片，正文不是 `text`，按空串处理。
+    case "notice":
+      return item.body ? "" : item.text;
     default:
-      // `toolCall` 无 text；`notice` 的正文由 `ChatView` 的 notice 分支单独渲染。
-    // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成
-    // `userMessage`（见 `Session.upsertItems` / `Session.apply`），无需单独处理。
+      // `toolCall` 无 text。
+      // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成
+      // `userMessage`（见 `Session.upsertItems` / `Session.apply`），无需单独处理。
       return "";
   }
 }
@@ -994,6 +1010,20 @@ describe("collectHits", () => {
     const hits = collectHits(items, "needle");
     expect(hits).toHaveLength(1);
     expect(hits[0].index).toBe(10);
+  });
+
+  it("匹配的是源文本：markdown 语法字符会命中，但渲染层无对应 mark", () => {
+    // 这条钉住「命中数 != 可见高亮数」这个设计取舍，防止后人把它当 bug 改掉，
+    // 也防止调用方假设计数等于总能高亮出来。
+    expect(collectHits([msg("a", "**bold** and **more**")], "**")).toHaveLength(4);
+  });
+
+  it("reasoning / thinking 计入命中（ReasoningBlock 不产生 mark）", () => {
+    const items = [
+      { type: "reasoning", id: "r1", text: "deep thought" },
+      { type: "thinking", id: "k1", text: "hidden thought" },
+    ] as unknown as Item[];
+    expect(collectHits(items, "thought")).toHaveLength(2);
   });
 
   it("命中总数覆盖全量历史，与挂载区间无关", () => {
@@ -1072,8 +1102,23 @@ export interface SearchHit {
 type AnyItem = Item | NoticeItem | ReasoningItem;
 
 /**
- * 在全部 items 上找命中。与 `rehypeSearchMark` 用同一套 `findMatches`
- * （大小写不敏感、允许重叠），所以「计数」与「画出来的 mark 数」一致。
+ * 在全部 items 上找命中。与 `rehypeSearchMark` 用**同一套 `findMatches`**
+ * （大小写不敏感、允许重叠，一条匹配一个 `SearchHit`）。
+ *
+ * **注意这不是「命中数 == 可见 mark 数」的保证。** 这里匹配的是 `itemText`
+ * 返回的**源文本**，而渲染层匹配的是 markdown 解析后的文本节点，两者会分叉：
+ *
+ * - markdown 语法字符（`**`、`#`、反引号）与链接 URL 在源文本里存在，
+ *   渲染后不存在 → 有命中但没有 mark。实测 `"**bold** and **more**"` 搜 `**`
+ *   得 4 个命中、0 个 mark。
+ * - `reasoning` / `thinking` 走 `ReasoningBlock` 的纯文本渲染，不经过
+ *   `rehypeSearchMark`，且默认折叠 → 有命中但没有 mark。
+ * - 普通文本 `notice` 在 `ChatView` 里渲染 `{item.text}`（不套 `HighlightText`）
+ *   → 有命中但没有 mark；带结构化载荷的 notice 走卡片，`itemText` 返回 `""`。
+ * - `toolCall` 两边都不匹配。
+ *
+ * 所以跳转到这类命中时「高亮看不见」，需要挂载后可能还要展开块。这是设计接受的
+ * 取舍（覆盖面优先），但调用方不能假设计数等于可见高亮数。
  */
 export function collectHits(items: readonly AnyItem[], query: string): SearchHit[] {
   const out: SearchHit[] = [];

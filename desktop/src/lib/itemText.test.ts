@@ -24,8 +24,22 @@ describe("itemText", () => {
     expect(itemText(tool)).toBe("");
   });
 
-  it("notice 的正文走结构化载荷，返回空串", () => {
-    expect(itemText({ type: "notice", id: "n1", text: "x" })).toBe("");
+  it("普通文本 notice 渲染的就是 text，因此必须可搜", () => {
+    // `ChatView` 的 notice 分支对缺省 `body` 直接渲染 `{item.text}`（琥珀色胶囊）。
+    // 若这里返回空串，用户在界面上看得见的提示却搜不到——搜索与渲染分叉。
+    expect(itemText({ type: "notice", id: "n1", text: "通道回退到 backup" })).toBe(
+      "通道回退到 backup",
+    );
+  });
+
+  it("结构化 notice 渲染成卡片，正文不是 text，返回空串", () => {
+    const n = {
+      type: "notice",
+      id: "n2",
+      text: "/config",
+      body: { kind: "config", data: { model: "m" } },
+    } as unknown as Item;
+    expect(itemText(n)).toBe("");
   });
 
   it("thinking 有明文时返回明文（不能用空串用例代替）", () => {

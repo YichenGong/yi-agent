@@ -22,8 +22,12 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
     // 要照传，好让就地追加能被比较器看见。
     case "thinking":
       return item.text;
+    // 普通文本 notice（缺省 `body`）在 `ChatView` 里就渲染 `item.text`，所以它必须
+    // 可搜；带结构化载荷的 notice 渲染成卡片，正文不是 `text`，按空串处理。
+    case "notice":
+      return item.body ? "" : item.text;
     default:
-      // `toolCall` 无 text；`notice` 的正文由 `ChatView` 的 notice 分支单独渲染。
+      // `toolCall` 无 text。
       // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成
       // `userMessage`（见 `Session.upsertItems` / `Session.apply`），无需单独处理。
       return "";
