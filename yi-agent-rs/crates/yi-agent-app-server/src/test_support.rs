@@ -43,13 +43,15 @@ where
     ))
     .await
     .unwrap();
-    // 有界读取：没有超时会把"服务端没回"变成一场哑挂起，而它最常见的成因
-    // （连接在握手后立刻被摘除）在栈上完全看不出来。
+    // Bounded like every other receive here, but with distinct messages per failure
+    // mode: a timeout, a clean end of stream and a transport reset are three
+    // different bugs, and a chain of bare `unwrap()`s reports them all as
+    // "Protocol(ResetWithoutClosingHandshake)" with no clue which step it was.
     let msg = tokio::time::timeout(EVENT_WAIT, ws.next())
         .await
         .expect("initialize must be answered inside the test budget")
-        .unwrap()
-        .unwrap();
+        .expect("the stream must not end before initialize is answered")
+        .expect("transport error while waiting for the initialize response");
     let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(v["id"], 1, "initialize must respond with the request id");
 }

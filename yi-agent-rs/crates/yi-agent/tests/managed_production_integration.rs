@@ -448,6 +448,46 @@ fn wait_for_reclaim(
     }
 }
 
+/// Waits until the guardian's journal lists two *distinct* live frontend owners.
+///
+/// This is the condition the "one client's exit leaves the other's work alone" claim
+/// actually depends on: if the guardian has not journaled the run's process yet, a
+/// reclaim cannot know it is somebody else's. Asserting the fact beats sleeping a
+/// constant -- a constant that hides a slow machine makes every other case slower,
+/// and one that does not hides a real ordering bug.
+fn await_two_owners_in_journal(runtime_dir: &Path, budget: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let owners = live_frontend_owners(runtime_dir);
+        if owners.len() >= 2 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the guardian never journaled two live frontend owners (saw {owners:?})"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The distinct frontend owners whose processes the journal still calls running.
+fn live_frontend_owners(runtime_dir: &Path) -> Vec<String> {
+    let mut owners: Vec<String> = journal_records(runtime_dir)
+        .iter()
+        .filter(|record| record.get("state").and_then(|v| v.as_str()) == Some("running"))
+        .filter_map(|record| {
+            record
+                .get("owner")
+                .and_then(|owner| owner.get("frontend"))
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
 /// The guardian's process journal, as the values it wrote.
 fn journal_records(runtime_dir: &Path) -> Vec<serde_json::Value> {
     let path = runtime_dir.join(yi_agent_supervisors::lifecycle::guardian::JOURNAL_FILE);
@@ -610,6 +650,26 @@ impl Drop for Sidecar {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Reads frames until the one carrying `id`, so a caller can send several requests
+/// first and only then wait.
+fn read_until_id(
+    sidecar: &mut Sidecar,
+    id: &str,
+    budget: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let frame = sidecar.read_frame(Duration::from_secs(5))?;
+        if frame.get("id").and_then(|v| v.as_str()) == Some(id) {
+            return Ok(frame);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no answer to {id}: last frame was {frame}"
+        );
     }
 }
 
@@ -918,6 +978,9 @@ impl Drop for TuiTerminal {
 struct HeadlessRun {
     child: Child,
     stderr: Option<std::process::ChildStderr>,
+    /// Captured at spawn so a later assertion can ask about *this* process rather
+    /// than about whatever holds its pid.
+    identity: StartIdentity,
 }
 
 impl HeadlessRun {
@@ -942,7 +1005,13 @@ impl HeadlessRun {
         let mut child = command.spawn()?;
         fixture.own(&child, "headless")?;
         let stderr = child.stderr.take();
-        Ok(Self { child, stderr })
+        let identity = start_identity(child.id() as i32)
+            .ok_or_else(|| anyhow::anyhow!("the headless run exited before it was identified"))?;
+        Ok(Self {
+            child,
+            stderr,
+            identity,
+        })
     }
 
     fn wait_exit(&mut self, budget: Duration) -> anyhow::Result<std::process::ExitStatus> {
@@ -951,12 +1020,30 @@ impl HeadlessRun {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Ok(status);
             }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "the headless run did not exit within {budget:?}"
-            );
+            if Instant::now() >= deadline {
+                // A timed-out run is a failure, never a clean stop. Attach whatever
+                // the child said so the report points at the real cause instead of
+                // "it did not exit".
+                anyhow::bail!(
+                    "the headless run did not exit within {budget:?}; stderr: {}",
+                    self.take_stderr()
+                );
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Reads what the child wrote to stderr, so a failed assertion can quote it.
+    ///
+    /// Only called on a path that already decided to fail, so draining here cannot
+    /// hide output a passing test would have wanted.
+    fn take_stderr(&mut self) -> String {
+        let Some(mut stderr) = self.stderr.take() else {
+            return "<already drained>".to_string();
+        };
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
     }
 }
 
@@ -1001,11 +1088,15 @@ fn the_headless_entry_point_is_a_managed_frontend() -> anyhow::Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
         fixture.own(&child, "headless-explicit")?;
+        let stderr = child.stderr.take();
+        let identity = start_identity(child.id() as i32)
+            .ok_or_else(|| anyhow::anyhow!("the headless run exited before it was identified"))?;
         HeadlessRun {
             child,
-            stderr: None,
+            stderr,
+            identity,
         }
     };
 
@@ -1124,7 +1215,8 @@ fn the_tui_entry_point_is_a_managed_frontend() -> anyhow::Result<()> {
     assert_eq!(
         stages,
         MANAGED_STAGES.to_vec(),
-        "the shipped TUI entry must walk every managed stage in order; trace: {trace}"
+        "the shipped TUI entry must walk every managed stage in order; trace: {trace}; screen: {:?}",
+        screen_text(&terminal)
     );
 
     terminal.quit()?;
@@ -1261,7 +1353,18 @@ fn quitting_one_frontend_leaves_the_others_work_running() -> anyhow::Result<()> 
 
     // Let the runtime record both clients before either leaves: a reclaim can only
     // leave alone work it knows is somebody else's.
-    std::thread::sleep(Duration::from_millis(500));
+    //
+    // Waiting for the *fact* rather than a fixed sleep: under load the guardian can
+    // take far longer than any constant to journal both owners, and a sleep long
+    // enough to hide that would make the suite slow for every other case.
+    await_two_owners_in_journal(&fixture.runtime_dir, Duration::from_secs(60)).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "{error}; journal: {:?}",
+                journal_records(&fixture.runtime_dir)
+            )
+        },
+    )?;
 
     terminal.quit()?;
     terminal.wait_exit(RELEASE_BUDGET)?;
@@ -1283,11 +1386,23 @@ fn quitting_one_frontend_leaves_the_others_work_running() -> anyhow::Result<()> 
         "the TUI's owned process {} survived its own reclaim",
         tui_work.pid
     );
+
+    // Before blaming the TUI for the run's work, rule out the two ways the run could
+    // have stopped it itself: its process exiting, or its own frontend releasing.
+    // Conflating those with a theft would make this test accuse the runtime of a bug
+    // whenever the *other* frontend simply finished or failed.
+    let run_alive = fixture.same_process_alive(&run.identity);
+    let run_reclaim = reclaim_records(&fixture.runtime_dir)
+        .into_iter()
+        .find(|record| record.result.client_run_id.starts_with("run:"));
     assert_eq!(
         start_identity(run_work.pid).as_ref(),
         Some(&run_work),
-        "quitting the TUI reclaimed the headless run's work: {}",
-        run_work.pid
+        "quitting the TUI reclaimed the headless run's work: pid {}; \
+         run process alive={run_alive}; run's own reclaim={run_reclaim:?}; \
+         journal={:?}",
+        run_work.pid,
+        journal_records(&fixture.runtime_dir)
     );
 
     // And this fixture cleans up its own run rather than leaving it to the runtime.
@@ -1315,10 +1430,31 @@ fn type_prompt(terminal: &mut TuiTerminal, text: &str) -> anyhow::Result<()> {
 }
 
 /// Reads the TUI's screen so a failure reports what the user would have seen.
-fn screen_text(_terminal: &TuiTerminal) -> String {
-    // The pty is drained by the child; nothing is buffered here. Kept as a named
-    // seam so a future failure message can attach output without touching callers.
-    String::new()
+fn screen_text(terminal: &TuiTerminal) -> String {
+    // The master side sees every byte the child writes, but reads would block once
+    // the buffer is drained. `FIONREAD` says whether anything is queued *now*: zero
+    // means "no output yet", not "no output".
+    let mut available: libc::c_int = 0;
+    // SAFETY: `master` is an open descriptor owned by the terminal value, and the
+    // out-parameter points at a live `c_int`.
+    let ready = unsafe { libc::ioctl(terminal.master, libc::FIONREAD, &mut available) };
+    if ready != 0 || available <= 0 {
+        return String::new();
+    }
+    let mut buffer = vec![0u8; available as usize];
+    // SAFETY: the buffer is `available` bytes long, matching the length passed.
+    let read = unsafe {
+        libc::read(
+            terminal.master,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len(),
+        )
+    };
+    if read <= 0 {
+        return String::new();
+    }
+    buffer.truncate(read as usize);
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,10 +1497,10 @@ fn the_last_frontend_leaving_stops_the_runtime_for_real() -> anyhow::Result<()> 
     let journal = journal_records(&fixture.runtime_dir);
     let mut recorded = Vec::new();
     for entry in &journal {
-        if let Some(pid) = entry.get("pid").and_then(|value| value.as_i64()) {
-            if let Some(identity) = start_identity(pid as i32) {
-                recorded.push(format!("{}({pid})", identity.started));
-            }
+        if let Some(pid) = entry.get("pid").and_then(|value| value.as_i64())
+            && let Some(identity) = start_identity(pid as i32)
+        {
+            recorded.push(format!("{}({pid})", identity.started));
         }
     }
     fixture.assert_runtime_stopped(RELEASE_BUDGET)?;
@@ -1422,4 +1558,277 @@ fn a_retired_instance_does_not_resurrect_a_daemon_across_watch_ticks() -> anyhow
         "no daemon may start unattended after retirement"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A02: two windows, one project, one runtime -- including through a symlink.
+// ---------------------------------------------------------------------------
+
+/// Two sidecars preparing the same project at once still end up on one runtime.
+///
+/// The failure this guards is not a crash but a duplicate: two guardians, or two
+/// daemons serving one database, each believing it is the project's runtime. So the
+/// assertion is on *counts* read from the runtime's own journal, not on "both said
+/// Connected" -- an implementation that started two runtimes and reported the
+/// second one would pass the weaker check.
+#[test]
+fn two_concurrent_prepares_yield_one_runtime() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    let mut first = Sidecar::spawn(&mut fixture)?;
+    let mut second = Sidecar::spawn(&mut fixture)?;
+
+    let params = || -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            yi_agent_lifecycle::production::PrepareRequest {
+                scope: fixture.scope(),
+                expected: fixture.artifact().clone(),
+                attempt_id: format!("attempt-{}", uuid_like()),
+            },
+        )?)
+    };
+
+    // Both requests are in flight before either answer is read: issuing them one at
+    // a time would only prove the second observes a *finished* start, which is the
+    // easy half.
+    first.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "race-a",
+        "method": "_shell/prepare",
+        "secret": first.secret.clone(),
+        "sidecar_epoch": first.epoch.clone(),
+        "params": params()?,
+    }))?;
+    second.write(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "race-b",
+        "method": "_shell/prepare",
+        "secret": second.secret.clone(),
+        "sidecar_epoch": second.epoch.clone(),
+        "params": params()?,
+    }))?;
+
+    let answer_a = read_until_id(&mut first, "race-a", START_BUDGET)?;
+    let answer_b = read_until_id(&mut second, "race-b", START_BUDGET)?;
+    for (label, answer) in [("a", &answer_a), ("b", &answer_b)] {
+        anyhow::ensure!(
+            answer.get("error").is_none(),
+            "sidecar {label} refused the concurrent prepare: {answer}"
+        );
+        let rendered = answer.to_string();
+        assert!(
+            rendered.contains("\"Connected\"") || rendered.contains("VersionChoiceRequired"),
+            "sidecar {label} did not reach a runtime: {answer}"
+        );
+    }
+
+    // The journal is the runtime's own record, so one daemon entry means one daemon
+    // and two would mean the race produced a duplicate.
+    let daemons = journal_records(&fixture.runtime_dir)
+        .iter()
+        .filter(|record| record.get("owner").and_then(|o| o.get("daemon")).is_some())
+        .count();
+    assert_eq!(
+        daemons, 1,
+        "two concurrent prepares started {daemons} daemons; one project owns one runtime"
+    );
+    Ok(())
+}
+
+/// A project reached through a symlink is the same scope, not a second runtime.
+///
+/// This is the multi-window case in its most common disguise: one window opened the
+/// real path and another opened a symlink to it. If the scope were the lexical path,
+/// the two windows would get two runtimes over one database -- and the damage would
+/// only show up later, as a locked or corrupted store.
+#[test]
+fn a_symlinked_project_path_resolves_to_the_same_scope() -> anyhow::Result<()> {
+    let fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    let link = fixture.root.path().join("repository-link");
+    std::os::unix::fs::symlink(&fixture.workdir, &link)?;
+
+    // The resolution the guardian does, applied to both spellings of one project.
+    let real = yi_agent_lifecycle::scope::resolve(
+        &fixture.runtime_dir,
+        &fixture.workdir,
+        &fixture.instance_home,
+    )?;
+    let via_link =
+        yi_agent_lifecycle::scope::resolve(&fixture.runtime_dir, &link, &fixture.instance_home)?;
+
+    assert_eq!(
+        real.project_key, via_link.project_key,
+        "a symlinked project path resolved to a different project; two windows would \
+         each start their own runtime for one repository"
+    );
+    assert_eq!(
+        real.key, via_link.key,
+        "a symlinked project path resolved to a different runtime directory"
+    );
+    // Not a tautology: the link text itself differs, so a lexical comparison would
+    // have produced two keys.
+    assert_ne!(
+        link.to_string_lossy(),
+        fixture.workdir.to_string_lossy(),
+        "the fixture did not actually create a divergent path"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A18: a stale or forged management frame reaches nothing.
+// ---------------------------------------------------------------------------
+
+/// After a real bootstrap, a frame with another epoch or another secret is refused.
+///
+/// The two rejects are different attacks and both matter:
+///
+/// * a *wrong epoch* is a stale frame from a previous sidecar generation -- the
+///   design's rule is that a frame cannot nominate which generation its answer
+///   belongs to;
+/// * a *wrong secret* is a local process that guessed, or read an old log. The
+///   private channel is the only thing separating the shell from every other local
+///   process, so this rejection is load-bearing rather than cosmetic.
+#[test]
+fn a_stale_epoch_or_foreign_secret_is_refused_after_bootstrap() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+
+    let prepare_params = || -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            yi_agent_lifecycle::production::PrepareRequest {
+                scope: fixture.scope(),
+                expected: fixture.artifact().clone(),
+                attempt_id: format!("attempt-{}", uuid_like()),
+            },
+        )?)
+    };
+
+    for (label, secret, epoch) in [
+        (
+            "stale epoch",
+            sidecar.secret.clone(),
+            "epoch-from-a-previous-sidecar".to_string(),
+        ),
+        (
+            "foreign secret",
+            "not-the-secret".to_string(),
+            sidecar.epoch.clone(),
+        ),
+    ] {
+        let id = format!("forged-{}", uuid_like());
+        sidecar.write(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "_shell/prepare",
+            "secret": secret,
+            "sidecar_epoch": epoch,
+            "params": prepare_params()?,
+        }))?;
+        let answer = read_until_id(&mut sidecar, &id, START_BUDGET)?;
+        assert!(
+            answer.get("error").is_some(),
+            "a frame with a {label} was admitted: {answer}"
+        );
+        assert!(
+            !answer.to_string().contains("\"Connected\""),
+            "a frame with a {label} reached a runtime: {answer}"
+        );
+    }
+
+    // A rejected frame must not have started anything: a refusal that still ran the
+    // side effect would be the worst of both.
+    assert!(
+        !fixture.runtime_dir.join("runtime.sqlite").exists(),
+        "a forged management frame started a runtime"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A04: the sidecar that launched the runtime is not its lifeline.
+// ---------------------------------------------------------------------------
+
+/// Killing the sidecar that originally started the runtime does not disturb a
+/// frontend that is still attached and working.
+///
+/// Design §4.4 makes this a process-level requirement, not an API promise: the
+/// launcher's descriptor is a bootstrap proof, so the runtime must not treat "whoever
+/// started me is gone" as "stop". A TUI holding a lease and running a real process is
+/// the witness; the three observations are that its work is untouched, the control
+/// channel still answers, and the guardian is the same process it was.
+#[test]
+fn a_dead_launcher_sidecar_does_not_stop_a_working_runtime() -> anyhow::Result<()> {
+    let mut fixture = IsolatedRuntimeFixture::start_without_bringup_env()?;
+
+    // The sidecar brings the runtime up, exactly as the desktop's first prepare does.
+    let mut sidecar = Sidecar::spawn(&mut fixture)?;
+    let params = serde_json::to_value(yi_agent_lifecycle::production::PrepareRequest {
+        scope: fixture.scope(),
+        expected: fixture.artifact().clone(),
+        attempt_id: format!("attempt-{}", uuid_like()),
+    })?;
+    let answer = sidecar.call("_shell/prepare", params, START_BUDGET)?;
+    anyhow::ensure!(
+        answer.get("error").is_none() && answer.to_string().contains("\"Connected\""),
+        "the runtime never came up: {answer}"
+    );
+    let guardian_before = journal_generation(&fixture.runtime_dir);
+    anyhow::ensure!(
+        guardian_before.is_some(),
+        "the runtime recorded no guardian generation"
+    );
+
+    // A frontend that is attached and doing work.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let marker = fixture.root.path().join("survivor-work.pid");
+    let _gateway = spawn_tool_calling_gateway(listener, marker_work_command(&marker));
+    let mut terminal = TuiTerminal::spawn(&mut fixture, port)?;
+    terminal.await_runtime_attached(&fixture)?;
+    type_prompt(&mut terminal, "run the command")?;
+    let work = await_marker_pid(&marker, Duration::from_secs(60))?;
+
+    // Now the launcher dies. `SIGKILL`, because a graceful exit could let an
+    // implementation pass by cleaning up while the abrupt case -- the one a crash
+    // produces -- still failed.
+    let sidecar_pid = sidecar.child.id() as i32;
+    let sidecar_identity = start_identity(sidecar_pid);
+    // SAFETY: the pid names a child this fixture owns; killing it is the test's whole
+    // intent.
+    unsafe { libc::kill(sidecar_pid, libc::SIGKILL) };
+    let _ = sidecar.child.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while start_identity(sidecar_pid) == sidecar_identity && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Give a supervisor that wrongly ties the runtime to its launcher time to act.
+    std::thread::sleep(Duration::from_secs(2));
+
+    assert_eq!(
+        start_identity(work.pid).as_ref(),
+        Some(&work),
+        "the launcher's death stopped work a still-attached frontend was running"
+    );
+    assert!(
+        service_answers(&fixture.runtime_dir),
+        "the runtime stopped serving after its launcher died"
+    );
+    assert_eq!(
+        journal_generation(&fixture.runtime_dir),
+        guardian_before,
+        "the guardian was replaced after its launcher died; the runtime was restarted, \
+         not preserved"
+    );
+    Ok(())
+}
+
+/// The guardian generation recorded in the journal, if any.
+fn journal_generation(runtime_dir: &Path) -> Option<String> {
+    journal_records(runtime_dir).iter().find_map(|record| {
+        record
+            .get("generation")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    })
 }
