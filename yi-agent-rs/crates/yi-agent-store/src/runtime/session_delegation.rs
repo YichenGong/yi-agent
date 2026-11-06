@@ -63,6 +63,33 @@ pub(crate) fn may_replace_driver(joined: bool, tools_stopped: bool) -> bool {
     joined && tools_stopped
 }
 
+/// Turns a repository-level session refusal into the coordinator's structured one.
+///
+/// The store keeps the typed `SessionFailure` (it is the layer that owns the
+/// transaction), but the daemon's rejection path only knows
+/// `RuntimeCoordinatorError::SessionDelegation`. Without this lift a `StaleBinding`
+/// from a lost CAS reaches the wire as a bare `InvalidState`, which tells the caller
+/// "the daemon is broken" instead of "somebody else committed first".
+/// Surfaces a repository *policy* refusal as the structured code it already is.
+///
+/// Every repository call on the delegation path can answer with
+/// `RepositoryError::SessionDelegation`. Letting that fall through `From` turns it
+/// into `RuntimeCoordinatorError::Repository`, which the daemon reports as an
+/// opaque `InvalidState` -- the caller then reads "the daemon is broken" instead of
+/// "re-read the binding" / "this attachment is corrupt". Apply this at every such
+/// call site, not just the one that was first observed failing.
+fn lift_session_failure(error: crate::repository::RepositoryError) -> RuntimeCoordinatorError {
+    match error {
+        crate::repository::RepositoryError::SessionDelegation(failure) => {
+            RuntimeCoordinatorError::SessionDelegation {
+                code: failure.code,
+                reason: failure.reason,
+            }
+        }
+        other => RuntimeCoordinatorError::Repository(other),
+    }
+}
+
 /// One open turn, held only in memory.
 ///
 /// A turn is a live fence: persisting its secret would let a restarted daemon
@@ -142,7 +169,9 @@ impl RuntimeCoordinator {
                 .repository
                 .lock()
                 .expect("runtime repository mutex poisoned");
-            repository.session_prepare_facts(&request)?
+            repository
+                .session_prepare_facts(&request)
+                .map_err(lift_session_failure)?
         };
         if role != TaskRole::SessionContainer {
             // An execution may not borrow the container identity. Without this a
@@ -204,11 +233,18 @@ impl RuntimeCoordinator {
             consume_legacy_upgrade: matches!(request.identity, SessionIdentity::LegacyUpgrade(_)),
             retired_executions: retired,
         };
+        // The CAS lives in the transaction, so a race is decided there. Its refusal
+        // is a *policy* answer for the caller -- "someone else committed first" --
+        // and has to travel as the structured `SessionDelegation` code, not as an
+        // opaque repository failure. Without this lift the loser of a concurrent
+        // prepare saw only `InvalidState`, i.e. "the daemon is broken", and had no
+        // way to know it should re-read the binding instead of restarting.
         let committed = self
             .repository
             .lock()
             .expect("runtime repository mutex poisoned")
-            .commit_session_binding(&commit)?;
+            .commit_session_binding(&commit)
+            .map_err(lift_session_failure)?;
         let binding = SessionBinding {
             fence: SessionFence {
                 root: request.root.clone(),
@@ -363,7 +399,8 @@ impl RuntimeCoordinator {
                 driver_epoch: fence.driver_epoch,
                 evidence_json,
                 execution_set_version: 0,
-            })?;
+            })
+            .map_err(lift_session_failure)?;
         Ok(())
     }
 
@@ -631,7 +668,9 @@ impl RuntimeCoordinator {
             .repository
             .lock()
             .expect("runtime repository mutex poisoned");
-        let unsettled = repository.unsettled_session_host_executions(root)?;
+        let unsettled = repository
+            .unsettled_session_host_executions(root)
+            .map_err(lift_session_failure)?;
         if unsettled.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -695,15 +734,38 @@ impl RuntimeCoordinator {
         Ok((missing, retired))
     }
 
-    /// Turns on turn enforcement for tests that must prove a bypass is refused.
+    /// Turns on turn enforcement.
     ///
-    /// `cfg(test)`-style hook: a production daemon can only get here through the
-    /// foreground activation, which is what Task 11 flips. Keeping it explicit
-    /// means a test cannot pass by accident on a daemon that never enforces.
+    /// Called by the daemon constructor every shipping host uses, and by tests
+    /// that must prove a bypass is refused. It is deliberately not a default: a
+    /// daemon driven by IPC tests of budgets or delivery never claimed the fenced
+    /// contract, and flipping the default would make those tests assert a rule
+    /// they were not written for instead of what they were.
+    ///
+    /// Set before the listener binds, so no request can observe the old answer
+    /// and then be re-judged later.
+    pub fn enforce_session_turns(&self, ordering: std::sync::atomic::Ordering) {
+        self.session_delegation_enforced.store(true, ordering);
+    }
+
+    /// Test alias, kept so the existing regression reads as what it is.
     #[cfg(any(test, feature = "foreground-test-support"))]
     pub fn enforce_session_turns_for_test(&self) {
-        self.session_delegation_enforced
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.enforce_session_turns(std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this process still holds a live binding for a container.
+    ///
+    /// The capability table is memory-only, so a durable assertion cannot see it.
+    /// A commit that failed must leave it empty: an entry here would be authority
+    /// this process hands out but no transaction ever recorded.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn has_live_binding_for_test(&self, root: &str) -> bool {
+        self.session_delegation_state()
+            .lock()
+            .expect("session delegation mutex poisoned")
+            .bindings
+            .contains_key(root)
     }
 
     /// Checks that a write names the open turn, when the root is a container.
@@ -727,17 +789,42 @@ impl RuntimeCoordinator {
         {
             return Ok(());
         }
-        let role = self
-            .repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .task_role(root_task_id)
-            .or_else(|error| match error {
-                crate::repository::RepositoryError::TaskNotFound { .. } => Ok(TaskRole::Execution),
-                other => Err(other),
-            })?;
+        let (role, closed) = {
+            let repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            let role = repository
+                .task_role(root_task_id)
+                .or_else(|error| match error {
+                    crate::repository::RepositoryError::TaskNotFound { .. } => {
+                        Ok(TaskRole::Execution)
+                    }
+                    other => Err(other),
+                })?;
+            // Only a container can be closed, and the tombstone is a separate fact
+            // from the historical state: a container that was closed keeps its
+            // `stalled`/`completed` history and still refuses writes. Reading it in
+            // the same lock as the role keeps the two from disagreeing.
+            let closed = if role == TaskRole::SessionContainer {
+                repository
+                    .session_container(root_task_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.closed)
+            } else {
+                false
+            };
+            (role, closed)
+        };
         if role != TaskRole::SessionContainer {
             return Ok(());
+        }
+        if closed {
+            return Err(RuntimeCoordinatorError::session_delegation(
+                SessionFailureCode::SessionClosed,
+                format!("session {root_task_id} is closed"),
+            ));
         }
         let Some(turn) = turn else {
             return Err(RuntimeCoordinatorError::session_delegation(

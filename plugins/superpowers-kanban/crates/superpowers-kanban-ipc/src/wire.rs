@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// 变版本号只是为了拒绝旧 daemon 时给出清晰错误而非解析错误。
 /// 版本号的单一对照物是 `plugins/contracts/fixtures/ipc-protocol.json`：
 /// 宿主与插件各自读同一份公共夹具，侧改一侧而没同步就会测试失败。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

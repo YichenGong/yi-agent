@@ -43,6 +43,80 @@ fn init_git_repo(dir: &Path) {
     }
 }
 
+/// A host prepared for a fenced turn over `thread`.
+///
+/// A production daemon enforces the turn contract, so a write that names no turn
+/// is refused; these tests therefore drive the same sequence the hosts do --
+/// attach the container with a private resume digest, prepare the binding, open a
+/// turn, register its execution -- instead of asserting the unfenced shape the
+/// contract exists to forbid.
+fn prepared_turn(
+    thread: &Arc<ThreadRoot>,
+    thread_id: &str,
+    identity_directory: &Path,
+    turn_id: &str,
+) -> (
+    std::sync::Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+    yi_agent_lifecycle::foreground::ExecutionIdentity,
+    yi_agent_subagent::session_delegation::SessionHost,
+) {
+    use yi_agent_lifecycle::session_delegation::{SessionIdentity, session_resume_digest};
+    use yi_agent_subagent::session_delegation::SessionHost;
+    use yi_agent_subagent::session_identity::SessionIdentityStore;
+
+    let secret = SessionIdentityStore::new(identity_directory.to_path_buf())
+        .load_or_create(thread_id)
+        .expect("the conversation mints a resume secret");
+    let attachment = thread
+        .attach_session_container(
+            &SessionIdentity::Embedded(secret.clone()),
+            &format!("op-attach-{turn_id}"),
+            Some(session_resume_digest(&secret)),
+        )
+        .expect("the container attaches");
+    let mut host = SessionHost::new(
+        Arc::clone(thread),
+        SessionIdentity::Embedded(secret),
+        None,
+        attachment,
+    );
+    host.prepare(&format!("op-prepare-{turn_id}"))
+        .expect("the embedded identity prepares its binding");
+    let turn = host.begin_turn(turn_id).expect("the turn opens");
+    let execution = host
+        .register_execution(turn_id)
+        .expect("the turn registers its execution before it writes");
+    (std::sync::Arc::new(turn), execution, host)
+}
+
+/// The fenced spawn a turn issues, in one place so every migrated test sends the
+/// same request shape.
+fn spawn_under_turn(
+    turn: &yi_agent_subagent::session_delegation::SessionTurnClient,
+    objective: &str,
+    mode: Option<&str>,
+    thread_id: Option<&str>,
+) -> yi_agent_store::ipc::IpcResponse {
+    let request =
+        |handle: &yi_agent_subagent::binding::RuntimeHandle,
+         context: &yi_agent_lifecycle::session_delegation::SessionTurn| {
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: handle.session_id.clone(),
+                parent_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                objective: objective.to_string(),
+                mode: mode.map(str::to_string),
+                model: None,
+                workdir: None,
+                thread_id: thread_id.map(str::to_string),
+                sandbox: None,
+                fork_token: None,
+                session_turn: Some(context.clone()),
+            }
+        };
+    turn.send(request).expect("the runtime socket answers")
+}
+
 fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
     yi_agent_runtime::config::RuntimeConfig {
         provider: "anthropic".into(),
@@ -125,8 +199,9 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
     .expect("a second activation must be a no-op, not an error");
 
     // The tools the applications register over this runtime are exactly the ones
-    // the model calls, so exercise the spawn they share.
-    let mut registry = yi_agent_core::ToolRegistry::new();
+    // the model calls, so exercise the spawn they share. A production daemon
+    // enforces the turn contract, so the tools are installed for a prepared turn
+    // rather than straight from the attach.
     let root = ThreadRoot::from_handle(
         yi_agent_subagent::binding::RuntimeBinding::fixed(
             yi_agent_subagent::binding::RuntimeHandle {
@@ -139,38 +214,44 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
         ),
         attached.attached_root.clone(),
     );
-    yi_agent_subagent::register_attached_root_tools(
+    // The host is kept alive: it owns the binding the turn writes through.
+    let (turn, execution, _host) = prepared_turn(
+        &root,
+        root.thread_id(),
+        &repo.path().join(".session-identities"),
+        "turn-attach",
+    );
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    let installed = yi_agent_subagent::delegation::install_turn_tools(
         &mut registry,
-        root,
+        yi_agent_subagent::delegation::PreparedTurn::Ready {
+            turn: std::sync::Arc::clone(&turn),
+            execution,
+        },
         yi_agent_tools::SandboxController::new(
             yi_agent_core::autonomy::YoloSwitch::new(false),
             yi_agent_tools::SandboxMode::WorkspaceWrite,
             false,
         ),
+        None,
         yi_agent_subagent::CallerContext::unbound(),
+    );
+    assert!(
+        installed.is_ok(),
+        "a prepared turn installs the delegation tools: {:?}",
+        installed.err()
     );
     assert!(
         registry.names().contains(&"spawn_agent".to_string()),
         "an attached root exposes the delegation tools, got {:?}",
         registry.names()
     );
-    let response = yi_agent_store::ipc::send_request(
-        &attached.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: attached.attached_root.session_id.clone(),
-            parent_task_id: attached.attached_root.task_id.clone(),
-            capability: attached.attached_root.capability.clone(),
-            objective: "a delegated read-only investigation".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            workdir: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-            session_turn: None,
-        },
-    )
-    .expect("the runtime socket must accept a delegated child");
+    let response = spawn_under_turn(
+        &turn,
+        "a delegated read-only investigation",
+        Some("read_only"),
+        None,
+    );
     let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id } = response else {
         panic!("a delegated child must be admitted, got {response:?}");
     };
@@ -279,26 +360,18 @@ fn a_spawned_child_inherits_the_conversations_linked_roots() {
     // `attach_project_runtime` 起的是应用级 root，而承载关联根的是每个会话自己的
     // `ThreadRoot`。拿前者去 spawn 会被 capability 检查拒掉（`AuthorityDenied`），
     // 因为它的 root task id 不是 `thread.attach()` 铸出的那一个。
-    let handle = thread
-        .handle()
-        .expect("the attached conversation resolves a handle");
-    let spawned = yi_agent_store::ipc::send_request(
-        &handle.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: handle.session_id.clone(),
-            parent_task_id: handle.task_id.clone(),
-            capability: handle.capability.clone(),
-            objective: "a delegated read-only investigation".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            workdir: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-            session_turn: None,
-        },
-    )
-    .expect("the runtime socket must accept a delegated child");
+    let (turn, _execution, _host) = prepared_turn(
+        &thread,
+        thread.thread_id(),
+        &repo.path().join(".session-identities"),
+        "turn-linked",
+    );
+    let spawned = spawn_under_turn(
+        &turn,
+        "a delegated read-only investigation",
+        Some("read_only"),
+        None,
+    );
     let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id: child_id } = spawned else {
         panic!("a delegated child must be admitted, got {spawned:?}");
     };
@@ -446,24 +519,18 @@ fn delegation_tools_act_as_the_conversations_own_root() {
 
     // A child spawned as conversation A is out of reach for conversation B:
     // separate roots are separate authorization scopes.
-    let a_handle = thread_a.handle().expect("A resolves a handle");
-    let spawned = yi_agent_store::ipc::send_request(
-        &a_handle.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: a_handle.session_id.clone(),
-            parent_task_id: a_handle.task_id.clone(),
-            capability: a_handle.capability.clone(),
-            objective: "conversation A's child".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            workdir: None,
-            thread_id: Some("thread-a".into()),
-            sandbox: None,
-            fork_token: None,
-            session_turn: None,
-        },
-    )
-    .expect("A's child must be admitted");
+    let (a_turn, _a_execution, _a_host) = prepared_turn(
+        &thread_a,
+        "thread-a",
+        &repo.path().join(".session-identities"),
+        "turn-a",
+    );
+    let spawned = spawn_under_turn(
+        &a_turn,
+        "conversation A's child",
+        Some("read_only"),
+        Some("thread-a"),
+    );
     let yi_agent_store::ipc::IpcResponse::TaskSpawned {
         task_id: child_of_a,
     } = spawned
@@ -913,11 +980,17 @@ async fn a_tool_repairs_a_daemon_that_died() {
     );
 }
 
-/// `spawn_agent` 同样必须自愈。fork 上传必须先于 spawn，所以句柄在
-/// `send_as_root` 之前就要拿到——这条测试同时钉住「自愈后 socket 换过，
-/// fork token 仍然有效」。
-#[tokio::test]
-async fn a_spawn_tool_repairs_a_daemon_that_died() {
+/// 一个回合正常结束后 daemon 死掉，**下一个回合**必须仍能委派。
+///
+/// 这是重启场景里最容易漏掉的一条：daemon 不是在本进程的修复流程里死的，而是
+/// 在两次回合之间被外部停掉/替换。没有回合级的修复，`prepare_turn` 会一直拿着
+/// 属于死 daemon 的容器地址与 socket，此后每一轮都是 transport 失败——会话看起来
+/// 还活着，却再也无法 spawn，直到用户重启应用。
+///
+/// 断言三件事实：第二轮真的 ready、真的 spawn 成功、generation 真的推进
+/// （后者证明确实重建了运行时，而不是复用了旧地址）。
+#[test]
+fn a_prepared_turn_repairs_a_daemon_that_died() {
     let repo = tempfile::TempDir::new().unwrap();
     let runtime = tempfile::TempDir::new().unwrap();
     init_git_repo(repo.path());
@@ -940,22 +1013,32 @@ async fn a_spawn_tool_repairs_a_daemon_that_died() {
         Arc::clone(&attached),
     );
     let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
-    let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_subagent::register_application_subagent_tools(
-        &mut registry,
+    let mut driver = yi_agent_subagent::delegation::ThreadDelegation::for_thread(
         Arc::clone(&root),
-        yi_agent_tools::SandboxController::new(
-            yi_agent_core::autonomy::YoloSwitch::new(false),
-            yi_agent_tools::SandboxMode::WorkspaceWrite,
-            false,
-        ),
-        yi_agent_subagent::CallerContext::unbound(),
+        &repo.path().join(".session-identities"),
     );
-    let tool = registry
-        .get("spawn_agent")
-        .expect("spawn_agent is registered");
-    let generation_before = binding.generation();
 
+    // 第一轮照正常顺序走完：准备、spawn、关闭、登记停止证据。
+    let (turn, execution) = match driver.prepare_turn("turn-1") {
+        yi_agent_subagent::delegation::PreparedTurn::Ready { turn, execution } => (turn, execution),
+        yi_agent_subagent::delegation::PreparedTurn::NotReady(failure) => {
+            panic!("the first turn must prepare: {failure:?}")
+        }
+    };
+    assert!(
+        matches!(
+            spawn_under_turn(&turn, "child of turn one", Some("read_only"), None),
+            yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
+        ),
+        "the first turn must be able to spawn"
+    );
+    driver.finish_turn(&turn);
+    driver
+        .record_stopped(&execution, true, true)
+        .expect("a joined turn with stopped tool groups is a stop proof");
+
+    // daemon 在两次回合之间死掉：不是本进程 repair 触发的，是本进程根本不知道。
+    let generation_before = binding.generation();
     let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while matches!(
@@ -966,29 +1049,25 @@ async fn a_spawn_tool_repairs_a_daemon_that_died() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let result = tool
-        .call(serde_json::json!({ "task": "say hello", "fork": false }))
-        .await;
-
-    let text = format!("{:?}", result.content);
+    let (turn, execution) = match driver.prepare_turn("turn-2") {
+        yi_agent_subagent::delegation::PreparedTurn::Ready { turn, execution } => (turn, execution),
+        yi_agent_subagent::delegation::PreparedTurn::NotReady(failure) => panic!(
+            "a host that lost its daemon must repair and prepare the next turn, got {failure:?}"
+        ),
+    };
     assert!(
-        !text.contains("daemon is unavailable"),
-        "spawn must repair a dead runtime instead of surfacing a transport error: {text}"
+        binding.generation() > generation_before,
+        "the runtime must have been rebuilt, not reused"
     );
-    assert!(binding.generation() > generation_before);
     assert!(
         matches!(
-            yi_agent_subagent::attach::probe_runtime(&socket),
-            yi_agent_subagent::attach::RuntimeProbe::Healthy
+            spawn_under_turn(&turn, "child of turn two", Some("read_only"), None),
+            yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
         ),
-        "the runtime must be up again after the call"
+        "a healed runtime must accept the next turn's spawn"
     );
-    // 自愈后必须真的能 spawn：成功时载荷里带 `"status":"queued"`，
-    // 失败时是拒绝原因。这不依赖 recipient/task 的具体校验规则。
-    assert!(
-        text.contains("queued"),
-        "a healed runtime must accept the spawn, got {text}"
-    );
+    driver.finish_turn(&turn);
+    let _ = driver.record_stopped(&execution, true, true);
 }
 
 /// 形态 B：daemon 被**同伴**替换。socket 全程健康，所以不出现 liveness 错误，
@@ -1106,18 +1185,20 @@ async fn a_replaced_daemon_invalidates_the_cached_root() {
     );
 }
 
-/// 不可重放的请求在陈旧 root 上**只能发一次**：重放会造出第二个子任务。
-/// 同时错误必须说清「已修好、再试一次」，而不是裸 `not_found`。
+/// 旧回合的工具抓着一个已被替换的 daemon，**不能被自动重试成第二次 spawn**。
 ///
-/// 这里用形态 B（daemon 被同伴替换）：第一次 `spawn` 已送达并被旧身份拒绝，
-/// 若实现重放，新 runtime 会真的建出一个子任务，于是「子任务数为 0」就失败。
-/// 形态 A 测不出这件事——那边重发是必要的，且恰好只产生一个子任务。
+/// 这是 fenced 路径对「陈旧 root」的回答，与 legacy 的 `SingleShot` 不同：
+/// legacy 在身份层失败后会重挂 root 并提示模型重试；而一个回合的写权限属于它
+/// 自己的容器与 turn secret——daemon 换了，这个回合就该结束。它能做的最诚实的
+/// 事是**明确失败且不重放**，由宿主在下一个回合重建。
+///
+/// 断言：调用报错、错误可读（不是裸 io error）、没有产生子任务、该回合保持关闭。
+/// 「不重放」的**计数**证据由 `a_single_shot_request_is_not_replayed_after_an_ambiguous_failure`
+/// 用假服务端钉住；这一条钉的是 fenced 工具在 daemon 被替换时的对外语义。
 #[tokio::test]
-async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
-    /// 当前缓存 root 名下的子任务数。
+async fn a_turn_whose_daemon_was_replaced_fails_instead_of_replaying() {
+    /// 当前容器名下的子任务数。
     fn child_count(root: &ThreadRoot) -> usize {
-        // integration test 是外部 crate，只能走公开的 `handle()`；这里只是
-        // 只读计数，不需要自愈通道。
         let handle = root.handle().expect("the root is attached");
         let response = yi_agent_store::ipc::send_request(
             &handle.socket_path,
@@ -1127,13 +1208,13 @@ async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
             },
         )
         .expect("the socket answers");
-        match response {
-            yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } => tasks
-                .iter()
-                .filter(|task| task.parent_task_id.as_deref() == Some(handle.task_id.as_str()))
-                .count(),
-            other => panic!("unexpected response: {other:?}"),
-        }
+        let yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } = response else {
+            panic!("expected task summaries, got {response:?}");
+        };
+        tasks
+            .iter()
+            .filter(|task| task.parent_task_id.as_deref() == Some(handle.task_id.as_str()))
+            .count()
     }
 
     let repo = tempfile::TempDir::new().unwrap();
@@ -1159,23 +1240,34 @@ async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
         Arc::clone(&attached),
     );
     let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
-    let mut registry = yi_agent_core::ToolRegistry::new();
-    yi_agent_subagent::register_application_subagent_tools(
-        &mut registry,
+    let mut driver = yi_agent_subagent::delegation::ThreadDelegation::for_thread(
         Arc::clone(&root),
+        &repo.path().join(".session-identities"),
+    );
+    let (turn, _execution) = match driver.prepare_turn("turn-1") {
+        yi_agent_subagent::delegation::PreparedTurn::Ready { turn, execution } => (turn, execution),
+        yi_agent_subagent::delegation::PreparedTurn::NotReady(failure) => {
+            panic!("the first turn must prepare: {failure:?}")
+        }
+    };
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_session_turn_tools(
+        &mut registry,
+        std::sync::Arc::clone(&turn),
         yi_agent_tools::SandboxController::new(
             yi_agent_core::autonomy::YoloSwitch::new(false),
             yi_agent_tools::SandboxMode::WorkspaceWrite,
             false,
         ),
+        None,
         yi_agent_subagent::CallerContext::unbound(),
     );
     let spawn = registry
         .get("spawn_agent")
         .expect("spawn_agent is registered");
 
-    // 停掉本进程的 daemon，由同伴在同一 runtime 目录起一个新的 ⇒ 缓存 root 过期，
-    // 但 socket 全程健康（形态 B）。
+    // 停掉本进程的 daemon，由同伴在同一 runtime 目录起一个新的 ⇒ 这个回合的
+    // 容器与 turn secret 属于已经不存在的运行时，而 socket 全程健康。
     let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while matches!(
@@ -1197,27 +1289,30 @@ async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
     assert_ne!(fresh.attached_root.session_id, old_session);
     let _fresh = Arc::new(fresh);
 
-    // 注意：这里**不要**先 `root.attach()`。那会把缓存刷成同伴的 root，形态 B
-    // 的前提就没了。直接调用即可。
     let result = spawn
         .call(serde_json::json!({ "task": "must not run twice", "fork": false }))
         .await;
 
     assert!(
         result.is_error,
-        "a stale-root spawn must not silently succeed: {:?}",
+        "a spawn under a replaced runtime must not silently succeed: {:?}",
         result.content
     );
     let text = format!("{:?}", result.content);
     assert!(
-        text.contains("Retry this call once"),
-        "the error must tell the model to retry once: {text}"
+        !text.contains("os error") && !text.contains("No such file"),
+        "the model needs a decision it can act on, not a raw io error: {text}"
     );
-    // 调用已经触发了 repair + 重挂，此时 `handle()` 拿到的是新 runtime 上的 root。
     assert_eq!(
         child_count(&root),
         0,
         "the spawn must NOT have been replayed: no child may exist under the new root"
+    );
+    // 这个回合已不可再用：它的工具必须拒绝继续写，而不是在别处偷偷生效。
+    turn.close_locally();
+    assert!(
+        turn.is_closed(),
+        "the replaced turn must stay closed for further writes"
     );
 }
 

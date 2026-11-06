@@ -1369,9 +1369,23 @@ impl RuntimeCoordinator {
                 hydrate_delivered_child(supervisor, &task_id, delivery)?;
             }
         }
-        let supervisor = hydrated_supervisor.ok_or_else(|| {
+        let mut supervisor = hydrated_supervisor.ok_or_else(|| {
             RuntimeCoordinatorError::Supervisor("application root hydration found no root".into())
         })?;
+        // The tombstone is durable and must survive the restart that rehydrates the
+        // root. Without this, a closed conversation would come back open: the row's
+        // `closed` flag would still be 1, but the supervisor would hold no memory of
+        // it, and every `spawn`/delivery check that reads the in-memory set would
+        // answer "open".
+        let closed = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .session_container(&supervisor.root_task_id().clone())?
+            .is_some_and(|record| record.closed);
+        if closed {
+            supervisor.hydrate_session_container_closed();
+        }
         self.supervisors
             .lock()
             .expect("runtime supervisor mutex poisoned")
@@ -1973,6 +1987,24 @@ impl RuntimeCoordinator {
         {
             return Err(RuntimeCoordinatorError::ParentSettled {
                 state: parent_state,
+            });
+        }
+        // The other half of the same rule: a container is exempt from its
+        // *history*, not from an explicit close. The tombstone outranks the role,
+        // so the pre-check reads it beside the role rather than trusting the
+        // supervisor's in-memory copy, which a restart rebuilds from this row.
+        if matches!(parent_role, Ok(TaskRole::SessionContainer))
+            && self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .session_container(parent)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.closed)
+        {
+            return Err(RuntimeCoordinatorError::ParentSettled {
+                state: "session_closed".to_string(),
             });
         }
         // A parent names the directory from its own position, so a relative

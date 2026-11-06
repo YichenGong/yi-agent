@@ -248,7 +248,14 @@ pub fn attach_project_runtime_with_environment(
     ignore_project_local_runtime_state(&cfg.workdir);
     let factory = worker_factory(cfg, socket_path.clone(), models_path)
         .map_err(|error| AttachFailure::new("worker factory", error))?;
-    let embedded_daemon = match Daemon::start_with_factory(&runtime_dir, &database, factory) {
+    // A host that drives a conversation claims the fenced contract, so its daemon
+    // is started with turn enforcement on. The IPC test constructors keep the old
+    // answer: they assert budgets and delivery, not this gate.
+    let embedded_daemon = match Daemon::start_with_factory_enforcing_session_turns(
+        &runtime_dir,
+        &database,
+        factory,
+    ) {
         Ok(daemon) => Some(daemon),
         Err(IpcError::AlreadyRunning { .. }) => None,
         Err(error) => return Err(AttachFailure::new("daemon start", error)),

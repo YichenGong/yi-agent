@@ -184,12 +184,56 @@ impl Daemon {
         )
     }
 
+    /// Starts the daemon every shipping host uses: container writes must name an
+    /// open turn.
+    ///
+    /// This is a separate constructor rather than a flipped default because the
+    /// two behaviours answer different questions. A test that drives the IPC of a
+    /// *provider* runtime -- budgets, delivery, restart hydration -- is not
+    /// exercising the fenced contract and would only be rewritten to satisfy a
+    /// gate it never claimed. A host that drives a conversation does claim it, so
+    /// each of them calls this explicitly and a new host cannot inherit the old
+    /// answer by accident.
+    pub fn start_with_factory_enforcing_session_turns(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory(runtime_dir, database_path, factory)?;
+        daemon
+            .coordinator
+            .enforce_session_turns(std::sync::atomic::Ordering::Release);
+        Ok(daemon)
+    }
+
+    /// The same, with the guardian's authority already installed.
+    pub fn start_with_factory_authority_enforcing_session_turns(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+        managed: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
+        bridge: Option<std::os::fd::OwnedFd>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory_and_authority(
+            runtime_dir,
+            database_path,
+            factory,
+            activation,
+            managed,
+            bridge,
+        )?;
+        daemon
+            .coordinator
+            .enforce_session_turns(std::sync::atomic::Ordering::Release);
+        Ok(daemon)
+    }
+
     /// Starts a daemon that refuses container writes without an open turn.
     ///
-    /// Tests only: production turns this on with the activation switch once the
-    /// hosts that mint turns ship.
+    /// Tests only: production uses [`Self::start_with_factory_enforcing_session_turns`].
     #[cfg(any(test, feature = "foreground-test-support"))]
-    pub fn start_with_factory_enforcing_session_turns(
+    pub fn start_with_factory_enforcing_session_turns_for_test(
         runtime_dir: impl AsRef<Path>,
         database_path: impl AsRef<Path>,
         factory: Arc<dyn AgentWorkerFactory>,
@@ -765,6 +809,48 @@ pub(crate) const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
 /// 10ms accept poll would stat a directory every tick for nothing.
 pub(crate) const DAEMON_RUNTIME_DIR_CHECK: Duration = Duration::from_secs(1);
 
+/// The `protocol_version` a frame declares, read without parsing the command.
+///
+/// `None` means the frame is not even shaped like an envelope; the ordinary parse
+/// path then reports it as a validation failure with a request id where possible.
+fn envelope_version(frame: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()?
+        .get("protocol_version")?
+        .as_u64()
+        .map(|version| version as u32)
+}
+
+/// Whether a frame's command is one that must carry a turn fence.
+///
+/// Matched on the raw JSON rather than on `IpcRequest` on purpose: the whole
+/// point is to answer an old envelope whose command would otherwise parse into a
+/// perfectly ordinary unfenced write.
+fn is_fenced_write(frame: &[u8]) -> bool {
+    const FENCED: [&str; 10] = [
+        "SpawnApplicationChild",
+        "SpawnChild",
+        "BeginForkUpload",
+        "SendApplicationMessage",
+        "CancelChild",
+        "PrepareSessionDelegation",
+        "BeginSessionTurn",
+        "EndSessionTurn",
+        "OpenSessionHostControl",
+        "AttachSessionContainer",
+    ];
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")?
+                .get("type")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| FENCED.contains(&kind.as_str()))
+}
+
 pub(crate) fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
@@ -794,13 +880,33 @@ pub(crate) fn handle_client(
         Some(IncomingFrame::Complete(frame)) => frame,
     };
     let request_id = request_id_from_frame(&frame);
-    let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
-        Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
-            IpcResponse::UnsupportedProtocol {
-                supported_min: PROTOCOL_VERSION,
-                supported_max: PROTOCOL_VERSION,
-            }
+    // The version is decided from the raw frame, before the command is parsed.
+    // `session_turn` is additive and optional, so an old envelope still decodes;
+    // deciding afterwards would let a v2 write look like a legitimate unfenced
+    // one. Reading the version first makes "upgrade the client" a different
+    // answer from "fix the request" no matter what the command contains.
+    if let Some(version) = envelope_version(&frame)
+        && version != PROTOCOL_VERSION
+    {
+        {
+            let response = if is_fenced_write(&frame) {
+                session_rejection(RuntimeCoordinatorError::session_delegation(
+                    yi_agent_lifecycle::session_delegation::SessionFailureCode::ProtocolMismatch,
+                    format!(
+                        "protocol version {version} cannot issue a fenced session write; \
+                         this daemon speaks {PROTOCOL_VERSION}"
+                    ),
+                ))
+            } else {
+                IpcResponse::UnsupportedProtocol {
+                    supported_min: PROTOCOL_VERSION,
+                    supported_max: PROTOCOL_VERSION,
+                }
+            };
+            return write_response_frame(&mut stream, &request_id, None, &response);
         }
+    }
+    let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
         Ok(envelope) => match envelope.command {
             IpcRequest::Stop => {
                 prepare_coordinator_for_stop(coordinator)?;

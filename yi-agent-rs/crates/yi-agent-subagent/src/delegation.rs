@@ -84,7 +84,12 @@ impl DelegationFailure {
     pub fn from_client(error: SessionClientError) -> Self {
         match error {
             SessionClientError::Rejected(failure) => Self::Refused(failure),
-            SessionClientError::Transport(message) => Self::Unavailable(message),
+            // Both transport kinds mean "no usable runtime" to a host that only
+            // reports why it could not prepare; the distinction matters to the
+            // recovery logic above, not to the model.
+            SessionClientError::Transport(message) | SessionClientError::Connect(message) => {
+                Self::Unavailable(message)
+            }
             SessionClientError::Protocol(message) => Self::Unavailable(message),
         }
     }
@@ -320,15 +325,45 @@ impl ThreadDelegation {
             SessionIdentity::Managed(_) => None,
             _ => Some(session_resume_digest(&secret)),
         };
-        let attached = match self
-            .root
-            .attach_session_container(&identity, turn_id, creation_digest)
-        {
-            Ok(attached) => attached,
-            Err(error) => {
-                return PreparedTurn::NotReady(DelegationFailure::from_client(error));
+        // A host that lost its daemon must be able to prepare the *next* turn: the
+        // four steps below are attempted once, and only when the failure provably
+        // happened before any request was delivered (the daemon was down, so
+        // nothing was written) is the runtime repaired and the same four steps
+        // tried exactly once more. An ambiguous failure is never retried here --
+        // `prepare`/`begin` mint authority, and a lost reply may already have
+        // installed it.
+        match self.establish(&identity, &secret, creation_digest.clone(), turn_id) {
+            Ok(ready) => ready,
+            Err(error) if error.never_reached_a_daemon() => {
+                // The cached container address belongs to the daemon that died, and
+                // the repair is what advances the generation: dropping the address
+                // here is what stops the retry from short-circuiting onto a socket
+                // that is gone.
+                self.root.forget_session_container();
+                if let Err(repair) = self.root.binding().repair() {
+                    tracing::debug!(%repair, "could not repair the runtime for a session prepare");
+                    return PreparedTurn::NotReady(DelegationFailure::from_client(error));
+                }
+                match self.establish(&identity, &secret, creation_digest.clone(), turn_id) {
+                    Ok(ready) => ready,
+                    Err(error) => PreparedTurn::NotReady(DelegationFailure::from_client(error)),
+                }
             }
-        };
+            Err(error) => PreparedTurn::NotReady(DelegationFailure::from_client(error)),
+        }
+    }
+
+    /// Attaches, prepares, opens and registers one turn; no retrying here.
+    fn establish(
+        &mut self,
+        identity: &SessionIdentity,
+        secret: &SecretCapability,
+        creation_digest: Option<String>,
+        turn_id: &str,
+    ) -> Result<PreparedTurn, SessionClientError> {
+        let attached = self
+            .root
+            .attach_session_container(identity, turn_id, creation_digest)?;
         // A host is reused across turns: a new `SessionHost` per turn would look like
         // a driver replacement every time and demand a stop proof that has nothing to
         // prove. It is rebuilt when the daemon generation moved -- a restarted daemon
@@ -342,50 +377,45 @@ impl ThreadDelegation {
             // A managed binding is verified against the authorization's own
             // `client_run_id`, so the host must carry exactly that id. Reusing a
             // random one would be refused as "another root or host".
-            let (identity, run_id) = match (&identity, self.managed_run_id.clone()) {
+            let (host_identity, run_id) = match (identity, self.managed_run_id.clone()) {
                 (SessionIdentity::Managed(authorization), Some(run_id)) => {
                     (SessionIdentity::Managed(authorization.clone()), run_id)
                 }
                 _ => (
-                    SessionIdentity::Embedded(secret),
+                    SessionIdentity::Embedded(secret.clone()),
                     format!("host-{}", uuid::Uuid::new_v4()),
                 ),
             };
             self.host = Some(SessionHost::new_for_run(
                 Arc::clone(&self.root),
-                identity,
+                host_identity,
                 None,
                 attached,
                 run_id,
             ));
         }
         let host = self.host.as_mut().expect("a host was just built");
-        if let Err(error) = host.prepare(turn_id) {
-            // A stale binding after a restart is exactly what `prepare` fixes, so a
-            // failure here is reported but the host is kept: the next turn retries
-            // against the same root rather than rebuilding from scratch.
-            return PreparedTurn::NotReady(DelegationFailure::from_client(error));
-        }
-        let turn = match host.begin_turn(turn_id) {
-            Ok(turn) => turn,
-            Err(error) => return PreparedTurn::NotReady(DelegationFailure::from_client(error)),
-        };
+        // A stale binding after a restart is exactly what `prepare` fixes, so a
+        // failure here is reported but the host is kept: the next turn retries
+        // against the same root rather than rebuilding from scratch.
+        host.prepare(turn_id)?;
+        let turn = host.begin_turn(turn_id)?;
         // Register *before* the tools exist. The durable `starting` row is what
         // keeps the next driver honest if this process dies mid-turn: without it a
         // successor would see "nothing was running" and take over while this turn's
         // tools might still be writing. Failing here therefore aborts the turn's
         // delegation rather than proceeding unregistered.
         match host.register_execution(turn_id) {
-            Ok(execution) => PreparedTurn::Ready {
+            Ok(execution) => Ok(PreparedTurn::Ready {
                 turn: Arc::new(turn),
                 execution,
-            },
+            }),
             Err(error) => {
                 // The turn opened but cannot be accounted for: close it, so a
                 // registered-nothing turn does not linger as an open write window.
                 turn.close_locally();
                 let _ = host.finish_turn(&turn);
-                PreparedTurn::NotReady(DelegationFailure::from_client(error))
+                Err(error)
             }
         }
     }
@@ -495,6 +525,34 @@ mod tests {
             prepared.failure(),
             Some(DelegationFailure::Refused(failure)) if failure.reason == "closed by the user"
         ));
+    }
+
+    /// Only a failure that provably never reached a daemon may be retried.
+    ///
+    /// This is the whole safety argument for the prepare-time recovery: a host that
+    /// lost its daemon repairs and tries once, but it must not do that for a lost
+    /// reply, which may already have installed a binding or a turn. The
+    /// classification therefore lives on the error, not on a guess about the socket.
+    #[test]
+    fn only_an_undelivered_request_is_recoverable() {
+        let undelivered = SessionClientError::Connect("No such file or directory".into());
+        assert!(
+            undelivered.never_reached_a_daemon(),
+            "a failed connect wrote nothing, so a repair+retry cannot duplicate it"
+        );
+        for ambiguous in [
+            SessionClientError::Transport("the daemon closed the stream".into()),
+            SessionClientError::Protocol("another request was answered".into()),
+            SessionClientError::Rejected(SessionFailure::new(
+                yi_agent_lifecycle::session_delegation::SessionFailureCode::StaleTurn,
+                "a newer turn replaced this one",
+            )),
+        ] {
+            assert!(
+                !ambiguous.never_reached_a_daemon(),
+                "{ambiguous:?} may already have been applied; it must not be re-sent"
+            );
+        }
     }
 
     /// A guardian's refusal is a decision, not a missing feature.

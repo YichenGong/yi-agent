@@ -321,21 +321,46 @@ impl ThreadRoot {
         if let Some(cached) = self.live_session_container(generation) {
             return Ok(cached);
         }
-        let (response, generation) = self
-            .binding
-            .send_with_generation(|_handle| IpcRequest::AttachSessionContainer {
-                idempotency_key: application_root_key(&self.thread_id),
-                workspace: self.project_dir.clone(),
-                extra_roots: self
-                    .extra_roots
-                    .iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect(),
-                operation_id: operation_id.to_string(),
-                creation_resume_digest: creation_resume_digest.clone(),
-                identity: Some(identity.clone()),
-            })
-            .map_err(SessionClientError::Transport)?;
+        // A revive is tried here rather than inside the binding so the failure stays
+        // classifiable: only a request that provably never left this process may be
+        // sent again, and a repair+retry has to know that. Repair first when the
+        // answered cleanup left no live runtime behind.
+        let (shared, generation) = self.binding.current_with_generation();
+        let response = match crate::attach::probe_runtime(&shared.socket_path) {
+            crate::attach::RuntimeProbe::Healthy => send_request(
+                &shared.socket_path,
+                IpcRequest::AttachSessionContainer {
+                    idempotency_key: application_root_key(&self.thread_id),
+                    workspace: self.project_dir.clone(),
+                    extra_roots: self
+                        .extra_roots
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect(),
+                    operation_id: operation_id.to_string(),
+                    creation_resume_digest: creation_resume_digest.clone(),
+                    identity: Some(identity.clone()),
+                },
+            )
+            .map_err(|error| match error {
+                yi_agent_store::ipc::IpcError::Io(io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    SessionClientError::Connect(io.to_string())
+                }
+                other => SessionClientError::Transport(other.to_string()),
+            }),
+            probe => Err(SessionClientError::Connect(format!(
+                "the runtime at {} is {probe:?}",
+                shared.socket_path.display()
+            ))),
+        }?;
+        let generation = self.binding.generation().max(generation);
         let IpcResponse::SessionContainerAttached { root, workspace } = response else {
             return Err(match response {
                 IpcResponse::SessionDelegationRejected { failure } => {
@@ -357,6 +382,29 @@ impl ThreadRoot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(attachment.clone());
         Ok(attachment)
+    }
+
+    /// Drops the cached container address.
+    ///
+    /// A container attach is cached per generation so a turn does not re-attach
+    /// every time. When the daemon this address belongs to turns out to be gone,
+    /// the cache is exactly what would keep the host from ever recovering: the
+    /// next attach would find a "live" generation and short-circuit onto a socket
+    /// nobody serves. Dropping it is what lets the repair+mint happen once.
+    pub fn forget_session_container(&self) {
+        *self
+            .container
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// The runtime binding this conversation resolves through.
+    ///
+    /// Exposed so a host that must recover from a dead daemon can repair the one
+    /// binding the cache, the attach and the tools all read -- repairing a copy
+    /// would advance a generation nobody else observes.
+    pub fn binding(&self) -> &Arc<RuntimeBinding> {
+        &self.binding
     }
 
     /// The cached container address for the live generation, if any.

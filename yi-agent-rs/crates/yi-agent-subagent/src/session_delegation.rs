@@ -48,6 +48,14 @@ pub enum SessionClientError {
     Rejected(SessionFailure),
     /// The request did not complete. For a write, the outcome is unknown.
     Transport(String),
+    /// The request never reached a daemon: `connect` itself failed.
+    ///
+    /// Kept apart from [`Self::Transport`] because it is the one transport failure
+    /// that is *not* ambiguous. Nothing was written, so a repair followed by a
+    /// single retry cannot duplicate a side effect -- which is what makes a host
+    /// that lost its daemon able to prepare the next turn instead of failing for
+    /// the rest of the process's life.
+    Connect(String),
     /// The daemon does not speak this lifecycle, or answered something else.
     Protocol(String),
 }
@@ -58,6 +66,15 @@ impl SessionClientError {
             Self::Rejected(failure) => Some(failure.code),
             _ => None,
         }
+    }
+
+    /// Whether the request provably never reached a daemon.
+    ///
+    /// True only for a failure that happened before any byte was written, so the
+    /// caller may repair the runtime and send the same request once more without
+    /// risking a second real side effect.
+    pub fn never_reached_a_daemon(&self) -> bool {
+        matches!(self, Self::Connect(_))
     }
 
     /// Whether the caller may retry the *same* request safely.
@@ -93,12 +110,35 @@ impl std::fmt::Display for SessionClientError {
             Self::Transport(message) => {
                 write!(formatter, "session delegation transport: {message}")
             }
+            Self::Connect(message) => {
+                write!(
+                    formatter,
+                    "session delegation could not reach a daemon: {message}"
+                )
+            }
             Self::Protocol(message) => write!(formatter, "session delegation protocol: {message}"),
         }
     }
 }
 
 impl std::error::Error for SessionClientError {}
+
+/// Whether an IPC failure happened before any byte reached a daemon.
+///
+/// Same classification the legacy root path uses: a `connect` that never
+/// happened means the request was never delivered, so repairing and resending is
+/// safe, while `TimedOut` / `UnexpectedEof` are read-side and stay ambiguous.
+fn never_connected(error: &yi_agent_store::ipc::IpcError) -> bool {
+    match error {
+        yi_agent_store::ipc::IpcError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
 
 fn failure_from_response(response: IpcResponse) -> SessionClientError {
     match response {
@@ -444,6 +484,12 @@ impl SessionHost {
     /// daemon state or mints a capability, and a lost reply means it may already
     /// have happened. The message says so, so a model checks before trying again.
     fn transport_failure(&self, error: &yi_agent_store::ipc::IpcError) -> SessionClientError {
+        // A failed `connect` wrote nothing, so the request cannot have happened.
+        // That is the difference between "the daemon is gone, fix it and continue"
+        // and "the answer was lost, so this write is unknown".
+        if never_connected(error) {
+            return SessionClientError::Connect(error.to_string());
+        }
         if is_liveness_error(error) {
             return SessionClientError::Transport(
                 "the runtime connection failed and the request was NOT retried: it may \
@@ -516,6 +562,7 @@ impl HostControl {
             SessionClientError::Protocol(_) => error,
             SessionClientError::Rejected(failure) => SessionClientError::Rejected(failure),
             SessionClientError::Transport(message) => SessionClientError::Transport(message),
+            SessionClientError::Connect(message) => SessionClientError::Connect(message),
         })
     }
 }

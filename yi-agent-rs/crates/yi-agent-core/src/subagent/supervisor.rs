@@ -208,11 +208,24 @@ impl AgentSupervisor {
         root_session_id: RootSessionId,
         objective: String,
     ) -> Self {
-        let mut supervisor = Self::new_with_objective(root_session_id.clone(), objective);
-        let root_id = supervisor.root_task_id.clone();
+        // The container's own `id` must be the key it is stored under and the id
+        // every fence compares against. Inserting it under a *different*
+        // `root_task_id` leaves `task(&root).id != root` for the rest of the
+        // supervisor's life, which silently disables every identity comparison:
+        // a closed container would never look closed, and a role check keyed on
+        // the root id would never match the task it just fetched.
+        let root = AgentTask::new_session_container(root_session_id.clone());
+        let root_id = root.id.clone();
+        let mut supervisor = Self::new_with_objective(root_session_id, objective.clone());
+        supervisor.root_task_id = root_id.clone();
+        supervisor.tasks.clear();
+        supervisor.tasks.insert(root_id.clone(), root);
+        supervisor.mailboxes.clear();
         supervisor
-            .tasks
-            .insert(root_id, AgentTask::new_session_container(root_session_id));
+            .mailboxes
+            .insert(root_id.clone(), Mailbox::default());
+        supervisor.objectives.clear();
+        supervisor.objectives.insert(root_id, objective);
         supervisor
     }
 
@@ -231,7 +244,7 @@ impl AgentSupervisor {
         {
             return Err("this supervisor's root is not a session container".into());
         }
-        self.closed_containers.insert(root.clone());
+        self.mark_session_container_closed();
         let mut changed = Vec::new();
         for id in self.collect_subtree(&root) {
             if id == root {
@@ -262,6 +275,32 @@ impl AgentSupervisor {
         }
         self.notify_update();
         Ok(changed)
+    }
+
+    /// Restores the durable tombstone without re-running the close.
+    ///
+    /// Hydration must know a container was closed, but it must not cancel the
+    /// subtree again: those rows are already settled, and re-cancelling them would
+    /// rewrite history the restart is supposed to preserve. This is the read half
+    /// of the close, and it is idempotent.
+    pub fn hydrate_session_container_closed(&mut self) {
+        self.mark_session_container_closed();
+    }
+
+    /// Marks the container closed without touching its subtree.
+    ///
+    /// The one place "closed" is represented, shared by the close and by
+    /// hydration, so the two cannot drift. A non-container has no tombstone to
+    /// set; that requirement is the same one `close_session_container` refuses
+    /// on, so the check lives here rather than being repeated.
+    fn mark_session_container_closed(&mut self) {
+        if self
+            .tasks
+            .get(&self.root_task_id)
+            .is_some_and(|task| task.role() == TaskRole::SessionContainer)
+        {
+            self.closed_containers.insert(self.root_task_id.clone());
+        }
     }
 
     /// Whether this container is explicitly closed.
@@ -1511,15 +1550,10 @@ impl AgentSupervisor {
             .get(&recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
         // A container's historical terminal state is evidence about an old
-        // execution, not "this mailbox is gone". Only an execution's terminal
-        // state closes its mailbox; a closed container is refused by the daemon's
-        // admission check (and by `close_session_container` here).
-        if recipient_task.role() == TaskRole::Execution && recipient_task.state().is_terminal() {
-            return Err(MessageDeliveryError::RecipientTerminal);
-        }
-        if recipient_task.role() == TaskRole::SessionContainer
-            && self.closed_containers.contains(&recipient)
-        {
+        // execution, not "this mailbox is gone". `recipient_is_closed` is the one
+        // rule every delivery path shares, so this cannot drift from the
+        // worker-capability path again.
+        if recipient_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         let is_parent = self
@@ -1687,7 +1721,12 @@ impl AgentSupervisor {
             .tasks
             .get(recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
-        if recipient_task.state().is_terminal() {
+        // The same rule `deliver_message` follows: an execution's terminal state
+        // closes its mailbox, a container's does not. A child reporting to the
+        // conversation it belongs to has to keep working after that conversation's
+        // last *execution* ended, or a restarted session could never receive the
+        // work its own children finished.
+        if recipient_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         let is_parent = sender_task.parent_id.as_ref() == Some(recipient);
@@ -1701,8 +1740,14 @@ impl AgentSupervisor {
         Ok(())
     }
 
-    /// User controls may cross the task tree, but may never target a terminal
-    /// task. The persisted sender is `None`, preserving the external actor.
+    /// User controls may cross the task tree, but may never target a closed
+    /// mailbox. What "closed" means follows the role, exactly as it does for
+    /// agent-to-agent delivery: an `Execution`'s terminal state ends it, a
+    /// `SessionContainer`'s does not -- otherwise a restarted session that still
+    /// carries its last execution's `stalled` outcome could never be told to
+    /// continue, and the user would have no way back in.
+    ///
+    /// The persisted sender is `None`, preserving the external actor.
     pub fn send_user_override(
         &mut self,
         recipient: TaskId,
@@ -1743,7 +1788,7 @@ impl AgentSupervisor {
             .tasks
             .get(recipient)
             .ok_or(MessageDeliveryError::RecipientNotFound)?;
-        if recipient_task.state().is_terminal() {
+        if recipient_is_closed(recipient_task, &self.closed_containers) {
             return Err(MessageDeliveryError::RecipientTerminal);
         }
         Ok(())
@@ -2188,6 +2233,21 @@ pub enum TerminalKind {
     RecoveryRequired,
 }
 
+/// Whether a recipient's mailbox is closed to new messages.
+///
+/// One rule for every delivery path: only an `Execution`'s terminal state closes a
+/// mailbox. A container's state describes its last execution, and an explicitly
+/// closed container is that tombstone -- never the historical state.
+fn recipient_is_closed(
+    recipient: &AgentTask,
+    closed_containers: &std::collections::HashSet<TaskId>,
+) -> bool {
+    match recipient.role() {
+        TaskRole::Execution => recipient.state().is_terminal(),
+        TaskRole::SessionContainer => closed_containers.contains(&recipient.id),
+    }
+}
+
 /// The single rule for "this task may not spawn because its execution ended".
 ///
 /// A settled `Execution` is finished; a `SessionContainer` is not, however its
@@ -2496,6 +2556,98 @@ mod tests {
                 .unwrap_err(),
             MessageDeliveryError::RecipientTerminal
         );
+    }
+
+    /// A container whose history says `completed` still takes reports from its own
+    /// child, on the worker-capability path as well as the mailbox path.
+    ///
+    /// `state().is_terminal()` is the *execution* rule. Applying it to a container
+    /// is what makes a restarted session unable to hear the children it spawned:
+    /// the persisted container row carries the last execution's outcome forever,
+    /// so every later report is refused as `RecipientTerminal`.
+    #[test]
+    fn session_delegation_lifecycle_terminal_container_regains_its_children() {
+        let result = (RootSessionId::new(), TaskId::new(), AttemptId::new());
+        let (session, root, attempt) = result;
+        let historical = AgentTask::hydrated_review_task(
+            session,
+            root.clone(),
+            None,
+            super::super::task::TaskDepth::Root,
+            attempt,
+            1,
+            TaskState::Completed,
+        );
+        let mut historical = historical;
+        historical
+            .hydrate_session_role(TaskRole::SessionContainer)
+            .unwrap();
+        let mut supervisor =
+            AgentSupervisor::from_hydrated_review_root(historical, "restarted".into());
+        let child = supervisor.spawn(root.clone()).unwrap();
+        let capability = "worker-capability-of-the-child".to_string();
+        supervisor
+            .worker_message_capabilities
+            .insert(child.clone(), capability.clone());
+
+        assert!(
+            supervisor
+                .can_send_worker_message(&child, &capability, &root)
+                .is_ok(),
+            "a completed container must still accept its child's report"
+        );
+
+        // The exemption is the role plus the tombstone, never the shape of the
+        // mailbox call: closing the container is what closes it, and the historical
+        // `completed` state is untouched by that.
+        supervisor.close_session_container().unwrap();
+        let closed = supervisor.task(&root).unwrap();
+        assert!(
+            recipient_is_closed(closed, &supervisor.closed_containers),
+            "closing the container must close the mailbox even though its persisted \
+             state stays `completed`"
+        );
+        assert_eq!(closed.state(), &TaskState::Completed);
+    }
+
+    /// The user's own way back in follows the same role rule as agent delivery.
+    ///
+    /// A kanban session that comes back as `stalled` (or `completed`, or `failed`)
+    /// is still a conversation: the user must be able to type the next instruction,
+    /// and that instruction is what restarts the work. Judging it by the historical
+    /// state strands the session with no reachable recovery path.
+    #[test]
+    fn session_delegation_lifecycle_user_override_reaches_a_settled_container() {
+        for (label, state) in settled_states() {
+            let mut root = AgentTask::hydrated_review_task(
+                RootSessionId::new(),
+                TaskId::new(),
+                None,
+                super::super::task::TaskDepth::Root,
+                AttemptId::new(),
+                1,
+                state,
+            );
+            let root_id = root.id.clone();
+            root.hydrate_session_role(TaskRole::SessionContainer)
+                .unwrap();
+            let mut supervisor =
+                AgentSupervisor::from_hydrated_review_root(root, "objective".into());
+
+            supervisor
+                .send_user_override(root_id.clone(), "continue from here".into())
+                .unwrap_or_else(|error| {
+                    panic!("a {label} container must accept a user override: {error:?}")
+                });
+
+            // Closing is the only thing that closes it.
+            supervisor.close_session_container().unwrap();
+            assert_eq!(
+                supervisor.can_accept_user_override(&root_id).unwrap_err(),
+                MessageDeliveryError::RecipientTerminal,
+                "a closed container in {label} must refuse"
+            );
+        }
     }
 
     fn settled_states() -> Vec<(&'static str, TaskState)> {

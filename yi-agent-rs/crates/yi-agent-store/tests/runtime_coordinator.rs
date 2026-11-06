@@ -5396,6 +5396,51 @@ async fn foreground_root_lifecycle_a_managed_bind_after_the_scan_still_wins() {
     assert_eq!(fixture.root_state(), fixture.initial_root_state());
 }
 
+/// Mutation guard for the commit-time role re-check.
+///
+/// The candidate query already excludes containers, so deleting the re-check inside
+/// `record_watchdog_terminal_with_policy` cannot be caught by a scan that starts at a
+/// container -- it never lists one. The only way to reach the re-check is the race it
+/// exists for: the scan lists an execution, and the root becomes a container before
+/// the terminal commit. That is a real shape (the app attaches a root while a scan is
+/// in flight), and it must not settle the freshly attached conversation.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_container_after_the_scan_still_wins() {
+    let fixture = ForegroundFixture::managed().await;
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+
+    let coordinator = fixture.coordinator();
+    let root = fixture.root_task();
+    assert_eq!(
+        coordinator
+            .evaluate_watchdogs_with_stale_candidates(Utc::now(), || {
+                // The row's role changes between the scan and the commit. This is
+                // written straight to the row because no supported API demotes an
+                // execution to a container: the point is to exercise the guard, not
+                // to endorse the transition.
+                coordinator
+                    .repository_for_test()
+                    .expect("the test hook owns the repository")
+                    .execute_test_statement_params(
+                        "UPDATE tasks SET role = 'session_container' WHERE id = ?1",
+                        &[&root.to_string()],
+                    )
+                    .expect("the role is rewritable between phases");
+            })
+            .await
+            .unwrap(),
+        0,
+        "the commit must observe the role the scan did not"
+    );
+    assert!(
+        !fixture.root_has_watchdog_terminal(),
+        "a container must never carry a watchdog terminal, however late it became one"
+    );
+    assert_eq!(fixture.root_state(), fixture.initial_root_state());
+}
+
 #[cfg(feature = "foreground-test-support")]
 mod foreground_support;
 
@@ -5868,4 +5913,134 @@ async fn foreground_root_lifecycle_recovery_survives_a_reopen() {
         old_terminal,
         "the old attempt's evidence is history, not something recovery rewrites"
     );
+}
+
+/// C2: the reported bug, end to end.
+///
+/// A kanban session that stays quiet is spawned from long after both worker budgets
+/// have elapsed -- for an embedded session and a guardian-managed one alike. The
+/// watchdog scan is real (`evaluate_watchdogs`), the progress count is real (zero),
+/// and the spawn goes through the production admission path.
+///
+/// Before the role was separated from the state this is exactly what failed: the
+/// scan settled the root, the settled root read as a settled parent, and every later
+/// `spawn_agent` was refused with "a settled parent task (state: stalled) cannot
+/// spawn descendants" -- including after an app restart, because the settled state
+/// was durable.
+#[tokio::test]
+async fn session_delegation_lifecycle_managed_and_embedded_survive_worker_deadlines() {
+    use yi_agent_store::repository::foreground::ForegroundClassification;
+
+    for (label, classification) in [
+        ("embedded", ForegroundClassification::Legacy),
+        ("managed", ForegroundClassification::Managed),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace_position = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: workspace.clone(),
+            path: workspace.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+        let factory = Arc::new(WorkspaceObservingFactory {
+            starts: Arc::new(Mutex::new(Vec::new())),
+            handles: Arc::new(Mutex::new(Vec::new())),
+            workspace_service: Arc::new(StaticWorkspaceService {
+                workspace: workspace_position,
+            }),
+            workspace_registry: None,
+        });
+        let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+        let attached = coordinator
+            .attach_session_container(
+                &format!("project:{label}:1"),
+                &workspace,
+                &[],
+                "op-attach",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let root: yi_agent_core::TaskId = attached.root.root_id.parse().unwrap();
+        let session: RootSessionId = attached.root.session_id.parse().unwrap();
+        coordinator
+            .record_foreground_class_for_test(&root, classification)
+            .unwrap();
+
+        let attempt: AttemptId = {
+            let repository = coordinator.repository_for_test().unwrap();
+            repository
+                .execute_test_scalar_text(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    &root.to_string(),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: the container has an active attempt"))
+                .parse()
+                .unwrap()
+        };
+        // Zero progress: the observation never moves, which is the state a session
+        // sits in while the user is away. The budgets are measured against it.
+        let started = Utc::now();
+        coordinator
+            .repository_for_test()
+            .unwrap()
+            .save_attempt_watchdog_snapshot(
+                &root,
+                &attempt,
+                &WatchdogLimits::default(),
+                &WatchdogUsage::default(),
+                None,
+                started,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            coordinator
+                .evaluate_watchdogs(started + ChronoDuration::seconds(301))
+                .await
+                .unwrap(),
+            0,
+            "{label}: 301s of idleness must not settle a session container"
+        );
+        assert_eq!(
+            coordinator
+                .evaluate_watchdogs(started + ChronoDuration::seconds(2_701))
+                .await
+                .unwrap(),
+            0,
+            "{label}: the 2700s wall-time budget must not settle a session container"
+        );
+        assert_eq!(
+            coordinator.task_state(&root).unwrap(),
+            "queued",
+            "{label}: the container's durable state must be untouched by the watchdog"
+        );
+
+        // The actual failing call from the bug report.
+        let child = coordinator
+            .spawn_child_and_admit(
+                &session,
+                &root,
+                format!("{label}: work after a long quiet period"),
+                yi_agent_core::subagent::task::ChildWriteMode::ReadOnly,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{label}: a live session must still spawn after quiet time: {error}")
+            });
+        assert_ne!(child, root);
+    }
 }

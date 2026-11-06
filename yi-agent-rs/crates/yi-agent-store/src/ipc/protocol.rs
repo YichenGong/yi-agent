@@ -1,10 +1,16 @@
 use super::*;
 
 /// Bumped whenever the request/response wire shape changes. `PluginQuery` is an
-/// additive variant, but `IpcRequest` is `deny_unknown_fields`, so a v1 daemon
-/// would reject a v2 request outright. Bumping makes the mismatch explicit and
-/// reachable through `UnsupportedProtocol` rather than a bare parse failure.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// additive variant, but `IpcRequest` is `deny_unknown_fields`, so an older
+/// daemon would reject a newer request outright. Bumping makes the mismatch
+/// explicit rather than a bare parse failure.
+///
+/// v3 is the fenced-write contract: `session_turn` is additive and optional, so
+/// a v2 envelope still *decodes*, and that is precisely why the version has to
+/// be refused on its own. An unfenced write from an old envelope is
+/// indistinguishable from a legitimate one once it is parsed, so the daemon
+/// decides the version before it looks at the command.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 

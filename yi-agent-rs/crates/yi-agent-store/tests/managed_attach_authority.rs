@@ -470,6 +470,92 @@ async fn session_delegation_lifecycle_managed_identity_needs_a_guardian() {
     );
 }
 
+/// A refused managed identity is terminal, not a cue to try the weaker one.
+///
+/// The dangerous shape is a fallback: a daemon that cannot verify the guardian's
+/// answer and then quietly accepts the caller's own resume secret instead, which
+/// turns "the guardian said no" into "anyone holding a secret may drive this root".
+/// Both attempts must be refused, and the container must stay unbound -- a
+/// fallback that "works" is only visible as a binding that should not exist.
+#[tokio::test]
+async fn session_delegation_lifecycle_managed_denial_never_falls_back_to_embedded() {
+    use yi_agent_lifecycle::foreground::SecretCapability;
+    use yi_agent_lifecycle::session_delegation::{
+        PrepareSession, SessionFailureCode, SessionIdentity, SessionRef,
+    };
+    use yi_agent_lifecycle::types::RootAuthorization;
+
+    let directory = TempDir::new().unwrap();
+    let coordinator = coordinator(&directory);
+    assert!(!coordinator.is_managed(), "this fixture has no guardian");
+    let workspace = workspace(&directory);
+    let attached = coordinator
+        .attach_application_root("project:fallback:/p:1", &workspace, &[])
+        .await
+        .expect("an unmanaged attach is admitted");
+    let root = SessionRef {
+        session_id: attached.session_id.to_string(),
+        root_id: attached.root_task_id.to_string(),
+    };
+
+    // A managed claim on a daemon that has no guardian is refused before anything
+    // is written: the authority cannot be checked, so it cannot be trusted.
+    let managed = coordinator
+        .prepare_session(PrepareSession {
+            root: root.clone(),
+            operation_id: "op-managed".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::Managed(RootAuthorization {
+                scope_key: "scope".into(),
+                daemon_instance_id: coordinator.generation().to_string(),
+                client_run_id: "host-1".into(),
+                root_id: root.root_id.clone(),
+                capability: "capability".into(),
+            }),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            managed,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::AuthorityDenied,
+                ..
+            }
+        ),
+        "{managed}"
+    );
+
+    // Presenting a self-issued secret afterwards must not be a downgrade path: this
+    // container has no embedded digest, so there is nothing to match it against.
+    let fallback = SecretCapability::new("caller-issued-secret");
+    let embedded = coordinator
+        .prepare_session(PrepareSession {
+            root,
+            operation_id: "op-embedded".into(),
+            host_run_id: "host-1".into(),
+            expected_binding_epoch: 0,
+            identity: SessionIdentity::Embedded(fallback),
+            current_binding: None,
+            replacement_resume_digest: None,
+            stopped: Vec::new(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            embedded,
+            yi_agent_store::runtime::RuntimeCoordinatorError::SessionDelegation {
+                code: SessionFailureCode::SessionIdentityRequired,
+                ..
+            }
+        ),
+        "{embedded}"
+    );
+}
+
 /// An unsettled execution of the previous driver blocks a replacement.
 ///
 /// The blocking is the feature: without it a new host could take over while the

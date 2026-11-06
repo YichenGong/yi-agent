@@ -987,7 +987,7 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // invoked `serve` must record the same self-ignore so the project
             // state it creates never dirties the checkout.
             ignore_project_local_runtime_state(&workdir);
-            let daemon = yi_agent_store::ipc::Daemon::start_with_factory(
+            let daemon = yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
                 &runtime_dir,
                 &database,
                 build_daemon_worker_factory(
@@ -1189,15 +1189,16 @@ fn attach_headless_runtime(
     // in the project directory, so it would outlive any restart. Retire it so
     // the `start_with_factory` below replaces it with a working one.
     replace_wedged_daemon(&socket_path);
-    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
-        &runtime_dir,
-        &database,
-        build_daemon_worker_factory(cli, socket_path.clone())?,
-    ) {
-        Ok(daemon) => Some(daemon),
-        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
-        Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
-    };
+    let embedded_daemon =
+        match yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
+            &runtime_dir,
+            &database,
+            build_daemon_worker_factory(cli, socket_path.clone())?,
+        ) {
+            Ok(daemon) => Some(daemon),
+            Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+            Err(error) => anyhow::bail!("could not start subagent runtime: {error}"),
+        };
     let response = yi_agent_store::ipc::send_request(
         &socket_path,
         attach_application_root_request(
@@ -1636,7 +1637,11 @@ fn attach_tui_runtime(
         }
     };
     let embedded_daemon =
-        match yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory) {
+        match yi_agent_store::ipc::Daemon::start_with_factory_enforcing_session_turns(
+            &runtime_dir,
+            &database,
+            factory,
+        ) {
             Ok(daemon) => Some(daemon),
             Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
             Err(error) => {
@@ -1743,6 +1748,39 @@ fn build_tui_foreground_root(
         }
         None => yi_agent_subagent::thread_root::ThreadRoot::from_handle(binding, attached_root),
     }
+}
+
+/// Prepares one TUI turn's delegation: the only place a turn is opened for the
+/// interactive host.
+///
+/// A turn is a *turn* fact, not an attach fact, so this runs on every turn:
+/// the previous turn's capability is retired with it, and a new one is prepared
+/// against the same container. What is **not** refreshed per turn is the worker
+/// identity -- the delegation tools never act as a worker, and a second
+/// registration would make one conversation look like two.
+///
+/// Extracted rather than inlined so the per-turn rule is testable without
+/// standing up the whole event loop.
+fn prepare_tui_turn_delegation(
+    root: Arc<yi_agent_subagent::thread_root::ThreadRoot>,
+    delegation: &mut Option<yi_agent_subagent::delegation::ThreadDelegation>,
+    identity_directory: &std::path::Path,
+    turn_id: &str,
+    authority: impl FnOnce() -> Option<yi_agent_subagent::thread_root::ForegroundAuthority>,
+) -> yi_agent_subagent::delegation::PreparedTurn {
+    if delegation.is_none() {
+        *delegation = Some(yi_agent_subagent::delegation::ThreadDelegation::for_thread(
+            Arc::clone(&root),
+            identity_directory,
+        ));
+    }
+    let driver = delegation.as_mut().expect("just built");
+    if driver.authority().is_none()
+        && let Some(authority) = authority()
+    {
+        driver.set_authority(authority);
+    }
+    driver.prepare_turn(turn_id)
 }
 
 fn detach_tui_runtime_root(
@@ -3959,38 +3997,32 @@ fn run_tui_agent(
                     let mut registry = (*current_tools).clone();
                     let prepared = match foreground_root.as_ref() {
                         Some(root) => {
-                            if delegation.is_none() {
-                                // The store owns where this credential lives: a fork
-                                // copies the transcripts root, so the secret must sit
-                                // outside it and only this one place may decide that.
-                                let identity_directory = session_store_for_driver
-                                    .as_ref()
-                                    .map(|store| store.session_identity_directory())
-                                    .unwrap_or_else(|| {
-                                        driver_workdir.join(".session-identities")
-                                    });
-                                delegation = Some(
-                                    yi_agent_subagent::delegation::ThreadDelegation::for_thread(
-                                        Arc::clone(root),
-                                        &identity_directory,
-                                    ),
-                                );
-                            }
-                            let driver = delegation.as_mut().expect("just built");
-                            // Asked once: it is a property of the host's lease, not of
-                            // the turn. A refusal is recorded verbatim and later turns
-                            // report it instead of quietly falling back to the secret.
-                            if driver.authority().is_none()
-                                && let Ok(slot) = foreground_host.lock()
-                                && let Some(host) = slot.as_ref()
-                                && let Ok(authority) = host.authority(
-                                    root,
-                                    &format!("tui-delegation:{}", std::process::id()),
-                                )
-                            {
-                                driver.set_authority(authority);
-                            }
-                            driver.prepare_turn(&turn_id_for_delegation)
+                            // The store owns where this credential lives: a fork
+                            // copies the transcripts root, so the secret must sit
+                            // outside it and only this one place may decide that.
+                            let identity_directory = session_store_for_driver
+                                .as_ref()
+                                .map(|store| store.session_identity_directory())
+                                .unwrap_or_else(|| driver_workdir.join(".session-identities"));
+                            prepare_tui_turn_delegation(
+                                Arc::clone(root),
+                                &mut delegation,
+                                &identity_directory,
+                                &turn_id_for_delegation,
+                                // Asked once: it is a property of the host's lease, not
+                                // of the turn. A refusal is recorded verbatim and later
+                                // turns report it instead of quietly falling back to the
+                                // secret.
+                                || {
+                                    let slot = foreground_host.lock().ok()?;
+                                    let host = slot.as_ref()?;
+                                    host.authority(
+                                        root,
+                                        &format!("tui-delegation:{}", std::process::id()),
+                                    )
+                                    .ok()
+                                },
+                            )
                         }
                         // No root or no store: this conversation cannot delegate. The
                         // tools are still stripped below, so nothing keeps answering
@@ -4558,6 +4590,123 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TUI 每轮都换 turn，但不换 worker 身份。
+    ///
+    /// 两个层面必须分开：turn 是**回合**事实（这轮的写权限随本轮结束而失效），
+    /// worker 是**会话**事实（一个会话只有一个容器，不该因为换了轮次就多出一个）。
+    /// 把它们混在一起的旧写法只在 attach 时装一次工具，于是第二轮要么沿用上一轮
+    /// 已关闭的 turn（写不进去），要么把同一会话注册成第二个 worker。
+    ///
+    /// 这条用例跑真实 daemon：两轮都准备成功、拿到的是**不同**的 turn、且执行
+    /// 身份始终是本会话的容器任务、种类恒为 driver（不是 worker）。
+    #[test]
+    fn session_delegation_lifecycle_tui_entry_refreshes_turn_not_worker_identity() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=T",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .expect("git commit");
+
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+        let models = repo.path().join("models.json");
+        let attached = yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo attaches");
+        let root = build_tui_foreground_root(
+            repo.path(),
+            attached.socket_path.clone(),
+            attached.attached_root.clone(),
+            Some("thread-tui"),
+        );
+
+        let mut delegation: Option<yi_agent_subagent::delegation::ThreadDelegation> = None;
+        let identities = repo.path().join(".session-identities");
+
+        let first = prepare_tui_turn_delegation(
+            Arc::clone(&root),
+            &mut delegation,
+            &identities,
+            "tui-turn-1",
+            || None,
+        );
+        let yi_agent_subagent::delegation::PreparedTurn::Ready {
+            turn: first_turn,
+            execution: first_execution,
+        } = first
+        else {
+            panic!("the first TUI turn must prepare");
+        };
+        // 第二轮：同一个 driver、同一个容器，换的是 turn。
+        let second = prepare_tui_turn_delegation(
+            Arc::clone(&root),
+            &mut delegation,
+            &identities,
+            "tui-turn-2",
+            || None,
+        );
+        // A turn fences its writes against the **container** task, which is a
+        // different task from the application root the host attached through.
+        // Asserting they differ is what pins "acts as the container" rather than
+        // "acts as whatever the attach handed back".
+        let application_root = delegation
+            .as_ref()
+            .expect("the prepares built the driver")
+            .root()
+            .root_task_id()
+            .expect("the application root is attached");
+        match second {
+            yi_agent_subagent::delegation::PreparedTurn::Ready { turn, execution } => {
+                assert_ne!(
+                    first_turn.context().turn_id,
+                    turn.context().turn_id,
+                    "each turn must carry its own turn id, not borrow the previous one"
+                );
+                assert_ne!(
+                    first_execution.execution_id, execution.execution_id,
+                    "each turn registers its own execution"
+                );
+                assert_eq!(
+                    first_execution.task_id, execution.task_id,
+                    "both turns belong to one container: the worker identity must not change"
+                );
+                assert_ne!(
+                    execution.task_id, application_root,
+                    "a turn must act as the conversation's container, not as the \
+                     application root the attach minted"
+                );
+                assert_eq!(
+                    execution.kind,
+                    yi_agent_lifecycle::foreground::ExecutionKind::Driver,
+                    "a foreground turn is a driver, never a worker"
+                );
+            }
+            yi_agent_subagent::delegation::PreparedTurn::NotReady(failure) => {
+                panic!("the second TUI turn must prepare: {failure:?}")
+            }
+        }
+    }
 
     /// 启动时发布的旁支来源必须携带 resume 进来的真实历史。
     ///

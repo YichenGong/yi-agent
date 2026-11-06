@@ -1006,7 +1006,7 @@ CLI `tests/session_delegation_lifecycle.rs`、`tests/managed_runtime_lifecycle.r
 SESSION_DELEGATION_CAPABILITY。旧版本写入返回 SessionFailureCode::ProtocolMismatch，
 envelope 版本先于 command 解析，不能仅得到 opaque JSON parse error。
 
-- [ ] **Step 1：红测试**：新集成测试覆盖真实 Daemon 临时 socket 与持久库：
+- [x] **Step 1：红测试**：新集成测试覆盖真实 Daemon 临时 socket 与持久库：
 
 ```rust
 #[test]
@@ -1030,8 +1030,8 @@ fn session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write() {
 业务 socket 实际为 newline-delimited JSON，不能误写长度前缀协议；EOF/超时不算正确拒绝。
 同一组测试对合法 v3 envelope 的未知 command 字段另断言 Validation，证明版本和结构错误分流。
 
-- [ ] **Step 2：确认红**：`cargo test -p yi-agent-store --test subagent_ipc_protocol session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write`。
-- [ ] **Step 3：加入确定性故障与并发回归后启用**：
+- [x] **Step 2：确认红**：`cargo test -p yi-agent-store --test subagent_ipc_protocol session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write`。
+- [x] **Step 3：加入确定性故障与并发回归后启用**：
 
 ```text
 barrier 1: spawn 已鉴权、未提交 -> close 提交 -> spawn 复核失败，child 数不增
@@ -1050,7 +1050,7 @@ delivery: 新 turn inspect/wait 得到旧 child 报告，历史 terminal 容器�
 不降 schema。升级丢凭证测试返回 SessionIdentityRequired，不获取旧 capability。
 最后将三端 capability 检测切为强制新模式并广告；不足条件委派明确不可用、对话仍可继续。
 
-- [ ] **Step 4：完整验证与变异验证**：按下表运行每个 crate 的过滤测试，保存非零命中日志；
+- [x] **Step 4：完整验证与变异验证**：按下表运行每个 crate 的过滤测试，保存非零命中日志；
 随后 `cargo fmt --all && just ci`。变异在本 worktree 临时应用并逐个撤销：
 (a) 删 role 分流、(b) 恢复容器 ParentSettled、(c) 忽略 turn secret/epoch、(d) 容器 RecipientTerminal、
 (e) watchdog commit 不复核 role。每次对应回归必须失败，撤销后绿；不提交变异。
@@ -1061,38 +1061,59 @@ delivery: 新 turn inspect/wait 得到旧 child 报告，历史 terminal 容器�
 在 main `git merge --no-ff <implementation-branch>`，合并后再跑 `just ci`；通过才清理自己的
 worktree/分支，不停止其他会话的编译或删除它们的 target。
 
-## C1–C17 证据映射（均待实施运行）
+**当前停点（2026-11-06）**：实现与全部门禁已完成，提交已落在实现分支上，但**按用户要求停在合并之前**，等用户确认后才执行 `git merge --no-ff`。因此本 Step 保持 `[ ]`，不代表实现未完成。
+
+## C1–C17 证据映射（已实际运行）
 
 每个表格测试名必须成为真实 `#[test]`/`#[tokio::test]` 函数，不能只出现在文档或注释。
 `cargo test -p <crate> <name> -- --nocapture` 运行前先 `-- --list` 确认该名；零命中视为失败。
 Task 11 负责补齐此前任务未直接给出完整代码的集成场景，使用真实 coordinator/socket/host，
 不能用纯 DTO equality 冒充流程验收。
 
-| 判据 | 任务 | crate 与实际测试名（实施时创建） |
+实测命令基线（均在 `yi-agent-rs/` 下，`export PATH` 略）：`cargo test -p <crate> <target> --offline <features> <name>`。
+下表“实际位置”一列是运行后核对的结果，与早期计划草稿的 crate 归属不同处已按实测修正。
+
+| 判据 | 任务 | 实际位置与运行结果 |
 |---|---|---|
-| C1 | 1–4、9 | core `session_delegation_lifecycle_role_is_not_root_depth`；app-server `session_delegation_lifecycle_app_server_roles_for_normal_and_kanban` |
-| C2 | 4、11 | store `session_delegation_lifecycle_managed_and_embedded_survive_worker_deadlines`：两模式×301/2701秒×零progress，之后真实 spawn 成功 |
-| C3 | 3、4 | store `session_delegation_lifecycle_worker_budget_and_scheduled_root_unchanged`；core `session_delegation_lifecycle_execution_stays_settled` |
-| C4 | 2、5、11 | store `session_delegation_lifecycle_historical_root_rebind_preserves_evidence`：stalled/completed/failed/recovery_required 的真实库，身份有效+停止证明后 spawn，旧行逐字不变 |
-| C5 | 2、5 | store `session_delegation_lifecycle_closed_and_revoked_sessions_stay_closed`：closed/deleted/cancelled+关闭事实/owner revoke，普通 attach 不清 tombstone |
-| C6 | 5、11 | store `session_delegation_lifecycle_unproven_old_execution_blocks_rebind`：未知工具组，inspect 不发 stop；完整证据才接续 |
-| C7 | 6–8 | store `session_delegation_lifecycle_no_legacy_write_bypass`；subagent `session_delegation_lifecycle_delayed_old_tool_cannot_borrow_new_turn` |
-| C8 | 3、6 | store `session_delegation_lifecycle_execution_cannot_use_application_routes`：child/grandchild 八种 Settled、两 spawn 入口、伪造 root id 均拒绝 |
-| C9 | 3、9 | app-server `session_delegation_lifecycle_app_server_two_turns_keep_background_child`：正常 finish 后 wait/inspect/review/cancel 的权限与归属 |
-| C10 | 3、11 | store `session_delegation_lifecycle_terminal_history_container_receives_delivery`：真实 mailbox/报告持久化及 restart，再对照 Execution recipient |
-| C11 | 5、7、9–11 | yi-agent `session_delegation_lifecycle_frontend_and_daemon_restart`：稳定容器、两次 generation、旧身份拒绝、worker start 计数不自动增 |
-| C12 | 5、7、11 | store `session_delegation_lifecycle_binding_cas_and_rollback`；subagent `session_delegation_lifecycle_single_shot_lost_response` |
-| C13 | 4、6、11 | store `session_delegation_lifecycle_old_watchdog_and_close_spawn_races`：五道 barrier 场景、unknown lease 不提前释放 |
-| C14 | 3、6、9、11 | store `session_delegation_lifecycle_two_sessions_keep_permissions_and_quotas`：A/B同目录、直接child上限、叶子深度、Git/cwd/sandbox拒绝，接续A不换B epoch |
-| C15 | 8–10 | yi-agent `session_delegation_lifecycle_headless_entry_uses_container_context`、`session_delegation_lifecycle_tui_entry_refreshes_turn_not_worker_identity`；app-server 两轮入口用例 |
-| C16 | 5–7、11 | store `session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write`、`session_delegation_lifecycle_managed_denial_never_falls_back_to_embedded`；合法embedded无guardian成功 |
-| C17 | 2、4 | store `session_delegation_lifecycle_migration_preserves_terminal_evidence`、`session_delegation_lifecycle_migration_rejects_corrupt_attachment`；启动sweep前role已存在 |
+| C1 | 1–4、9 | core `--lib session_delegation_lifecycle_role_is_not_root_depth` PASS；**store**（非 app-server）`--test session_delegation_lifecycle --features foreground-test-support session_delegation_lifecycle_app_server_roles_for_normal_and_kanban` PASS。该用例直接建真实 daemon，覆盖普通项目目录与 `.worktrees/kanban/card-1` 均为 `SessionContainer`，但**不在** app-server crate 内 |
+| C2 | 4、11 | store `--test runtime_coordinator --features foreground-test-support session_delegation_lifecycle_managed_and_embedded_survive_worker_deadlines` PASS |
+| C3 | 3、4 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_worker_budget_and_scheduled_root_unchanged` PASS；core `--lib session_delegation_lifecycle_execution_stays_settled` PASS |
+| C4 | 2、5、11 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_historical_root_rebind_preserves_evidence` PASS |
+| C5 | 2、5 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_closed_and_revoked_sessions_stay_closed` PASS |
+| C6 | 5、11 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_unproven_old_execution_blocks_rebind` PASS |
+| C7 | 6–8 | store `--test subagent_runtime_e2e --features foreground-test-support session_delegation_lifecycle_no_legacy_write_bypass` PASS；subagent `--test session_delegation_client session_delegation_lifecycle_delayed_old_tool_cannot_borrow_new_turn` PASS |
+| C8 | 3、6 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_execution_cannot_use_application_routes` PASS |
+| C9 | 3、9 | app-server `--lib session_delegation_lifecycle_app_server_two_turns_keep_background_child` PASS |
+| C10 | 3、11 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_terminal_history_container_receives_delivery` PASS |
+| C11 | 5、7、9–11 | **store**（非 yi-agent）`--test session_delegation_lifecycle ... session_delegation_lifecycle_frontend_and_daemon_restart` PASS：真实 socket + 重启 daemon，断言复用同一 root、`binding_epoch` 前进、旧 turn secret 失效、容器不启动 worker |
+| C12 | 5、7、11 | store `--lib --features foreground-test-support session_delegation_lifecycle_binding_cas_and_rollback` PASS；**store**（非 subagent）`--test session_delegation_lifecycle ... session_delegation_lifecycle_single_shot_lost_response` PASS：同 op 重试返回同一 epoch，`session_binding_operations` 仅 1 行 |
+| C13 | 4、6、11 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_old_watchdog_and_close_spawn_races` PASS（barrier 1：turn 已发、close 后 spawn 被拒、child 数不增、worker 不启动、后续 prepare 返回 `SessionClosed`）；barrier 2 释放在 `--test runtime_coordinator foreground_root_lifecycle_release_*`；barrier 3 `session_delegation_lifecycle_a_failed_binding_commit_leaves_no_capability` PASS 且已做变异验证；barrier 4 `session_delegation_lifecycle_concurrent_prepare_commits_once` + C12 |
+| C14 | 3、6、9、11 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_two_sessions_keep_permissions_and_quotas` PASS |
+| C15 | 8–10 | yi-agent `--test session_delegation_lifecycle session_delegation_lifecycle_headless_entry_uses_container_context` PASS；yi-agent `--bin yi-agent session_delegation_lifecycle_tui_entry_refreshes_turn_not_worker_identity` PASS（yi-agent 无 lib target，必须用 `--bin`） |
+| C16 | 5–7、11 | store `--test subagent_ipc_protocol --features foreground-test-support session_delegation_lifecycle_v2_envelope_cannot_issue_unfenced_write` PASS；store `--test managed_attach_authority --features foreground-test-support session_delegation_lifecycle_managed_denial_never_falls_back_to_embedded` PASS |
+| C17 | 2、4 | store `--lib --features foreground-test-support session_delegation_lifecycle_migration_preserves_terminal_evidence` PASS；同 target `..._migration_rejects_corrupt_attachment` PASS |
+
+补充回归（不在 C 表内但被本次改动直接覆盖）：
+
+| 场景 | 位置与结果 |
+|---|---|
+| 关闭容器的 tombstone 跨重启恢复 | store `--test session_delegation_lifecycle ... session_delegation_lifecycle_closed_container_stays_closed_across_restart` PASS；变异“删掉 hydration 的 `hydrate_session_container_closed`”后该用例失败于 `a restarted daemon must not deliver into a closed mailbox, got MessageQueued`，恢复后绿 |
+| spawn 预检识别 closed | store `spawn_child_with_objective` 的 role 判定旁新增 tombstone 读取，`ParentSettled { state: "session_closed" }`；C13 用例覆盖 |
+
+### 本次补上的两处真实缺口
+
+1. **准入层不看 closed**。`admit_session_write` 只按 role + turn 放行，`spawn_child_with_objective` 的预检也只看历史 state 与 role。于是“容器已关闭、turn 仍握在手里”的窗口能让 spawn 成功。修复：两处都在同一把 repository 锁内读取 `session_containers.closed`，容器关闭即拒绝（准入返回 `SessionClosed`，预检返回 `ParentSettled { state: "session_closed" }`）。
+2. **hydration 不恢复 closed**。`ensure_application_root_supervisor` 只恢复 role，重启后 supervisor 的 `closed_containers` 为空，而 `can_accept_user_override` / `recipient_is_closed` 只读内存。修复：hydration 读取容器记录并调用新增的 `AgentSupervisor::hydrate_session_container_closed()`（只恢复 tombstone、不重跑取消，历史行逐字不变）。
+
+### 与用户原始报错的关系
+
+`a settled parent task (state: stalled) cannot spawn descendants` 来自 `SpawnError::ParentSettled`。根因是 `AgentTask.role` 在 hydration 时若没有恢复成 `SessionContainer`，历史 `stalled` 会被当成“父任务已结算”。`hydrate_session_role` 已在 Task 4 修复；本次补的两处是同一规则的另一半（显式关闭必须压过角色豁免），否则“重启后容器仍能工作”与“关闭后容器仍能工作”会互相矛盾。
 
 ## 执行自检与停点
 
-- [ ] Task 1–11 每项测试红→绿、提交、审查；接口改动同步所有消费者，不留下 compile-only stub。
-- [ ] 确认每个 C 编号有真实运行日志，尤其 embedded、TUI、headless，不用 managed 单例代替全覆盖。
-- [ ] 主会话审查当前 spec/plan；若旧会话没有可信凭证，报告身份阻塞而非声称自动修好。
+- [x] Task 1–11 每项测试红→绿、提交、审查；接口改动同步所有消费者，不留下 compile-only stub。
+- [x] 确认每个 C 编号有真实运行日志，尤其 embedded、TUI、headless，不用 managed 单例代替全覆盖。
+- [x] 主会话审查当前 spec/plan；若旧会话没有可信凭证，报告身份阻塞而非声称自动修好。
 - [ ] `just ci` 在实现分支与 main 合并结果各全绿一次；默认不运行真实 LLM。
 - [ ] 只有完成实现与证据后才标记模块需求完成；本次文档提交保持 `[ ]`，计数仍为64/75。
 
