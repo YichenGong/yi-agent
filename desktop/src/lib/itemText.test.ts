@@ -28,6 +28,14 @@ describe("itemText", () => {
     expect(itemText({ type: "notice", id: "n1", text: "x" })).toBe("");
   });
 
+  it("thinking 有明文时返回明文（不能用空串用例代替）", () => {
+    // 空串用例与 `default: return ""` 的结果无法区分，钉不住 `thinking` 落在
+    // `return item.text` 分组里这个事实；而 CoT 就地追加能否被比较器看见，
+    // 正取决于此。所以必须用非空明文。
+    const t = { type: "thinking", id: "k2", text: "真实摘要", redacted: false } as unknown as Item;
+    expect(itemText(t)).toBe("真实摘要");
+  });
+
   it("thinking 的明文（display omitted 时为空串）原样返回", () => {
     const t = { type: "thinking", id: "k1", text: "", redacted: true } as unknown as Item;
     expect(itemText(t)).toBe("");

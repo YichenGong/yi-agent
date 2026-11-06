@@ -8,7 +8,7 @@ import type { NoticeItem, ReasoningItem } from "./session";
  * For the tail it is re-read on every render from the very object `Session`
  * mutates in place — and it is what `ChatItem`'s comparator compares, and what
  * the agent-message branch renders. The comparator must never read
- * `item.text`; see `ChatItem` for why.
+ * `item.text`; see `ChatItem` in `components/ChatView.tsx` for why.
  *
  * 也供搜索索引使用：搜索必须在数据层产出与渲染完全一致的文本，
  * 否则「搜到的文案」与「画出来的文案」会分叉。
@@ -23,7 +23,9 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
     case "thinking":
       return item.text;
     default:
-      // `toolCall` 无 text；`notice` 的正文由上面的 notice 分支单独渲染。
+      // `toolCall` 无 text；`notice` 的正文由 `ChatView` 的 notice 分支单独渲染。
+      // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成
+      // `userMessage`（见 `Session.upsertItems` / `Session.apply`），无需单独处理。
       return "";
   }
 }

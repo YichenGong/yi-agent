@@ -866,6 +866,14 @@ describe("itemText", () => {
     expect(itemText({ type: "notice", id: "n1", text: "x" })).toBe("");
   });
 
+  it("thinking 有明文时返回明文（不能用空串用例代替）", () => {
+    // 空串用例与 `default: return ""` 的结果无法区分，钉不住 `thinking` 落在
+    // `return item.text` 分组里这个事实；而 CoT 就地追加能否被比较器看见，
+    // 正取决于此。所以必须用非空明文。
+    const t = { type: "thinking", id: "k2", text: "真实摘要", redacted: false } as unknown as Item;
+    expect(itemText(t)).toBe("真实摘要");
+  });
+
   it("thinking 的明文（display omitted 时为空串）原样返回", () => {
     const t = { type: "thinking", id: "k1", text: "", redacted: true } as unknown as Item;
     expect(itemText(t)).toBe("");
@@ -893,7 +901,7 @@ import type { NoticeItem, ReasoningItem } from "./session";
  * For the tail it is re-read on every render from the very object `Session`
  * mutates in place — and it is what `ChatItem`'s comparator compares, and what
  * the agent-message branch renders. The comparator must never read
- * `item.text`; see `ChatItem` for why.
+ * `item.text`; see `ChatItem` in `components/ChatView.tsx` for why.
  *
  * 也供搜索索引使用：搜索必须在数据层产出与渲染完全一致的文本，
  * 否则「搜到的文案」与「画出来的文案」会分叉。
@@ -908,7 +916,9 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
     case "thinking":
       return item.text;
     default:
-      // `toolCall` 无 text；`notice` 的正文由 notice 分支单独渲染。
+      // `toolCall` 无 text；`notice` 的正文由 `ChatView` 的 notice 分支单独渲染。
+    // `userInterjection` 也落到这里，但它在进入 `items` 前已被归一化成
+    // `userMessage`（见 `Session.upsertItems` / `Session.apply`），无需单独处理。
       return "";
   }
 }
