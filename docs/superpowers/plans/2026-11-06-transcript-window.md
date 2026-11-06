@@ -72,7 +72,7 @@
 - Produces:
   - `interface WindowState { start: number; end: number; following: boolean }`
   - `interface FocusRequest { index: number; before: number; after: number }`
-  - `interface VisibleRange { first: number; last: number; gapTopPx: number; gapBottomPx: number }`
+  - `interface VisibleRange { first: number; last: number; gapTopPx: number; gapBottomPx: number }`（两个 gap 都是**有符号**像素距离，见下方类型注释）
   - `interface WindowLimits { initialSize: number; pageSize: number; maxMounted: number; buffer: number; bufferPx: number }`
   - `interface NextWindowInput { current: WindowState | null; itemCount: number; limits: WindowLimits; visible: VisibleRange | null; focus?: FocusRequest | null }`
   - `const DEFAULT_LIMITS: WindowLimits`
@@ -96,20 +96,27 @@ import {
 
 const L: WindowLimits = DEFAULT_LIMITS;
 
-/** 视口停在挂载区底部：顶边很远，底边贴住。 */
-const atWindowBottom = (w: WindowState): VisibleRange => ({
-  first: w.end - 10,
-  last: w.end - 1,
-  gapTopPx: 5000,
-  gapBottomPx: 0,
-});
+/* 两个 helper 都必须被用例真正引用：`tsconfig.json` 开了 `noUnusedLocals`，
+   留一个没人用的 helper，`npx tsc --noEmit` 会直接报 TS6133。 */
 
-/** 视口停在挂载区顶部：顶边贴住，底边很远。 */
+/* gap 是**有符号**的：`gapTopPx = firstTop - viewTop`，`gapBottomPx =
+   viewBottom - lastBottom`。0 表示贴住边界，负值表示视口已越过边界。
+   所以「离得很远」在两侧都写成负数，不要抄旧的无符号距离写法。 */
+
+/** 视口停在挂载区顶部：顶边贴住（0），底边还在视口下方很远（负）。 */
 const atWindowTop = (w: WindowState): VisibleRange => ({
   first: w.start,
   last: w.start + 10,
   gapTopPx: 0,
-  gapBottomPx: 5000,
+  gapBottomPx: -5000,
+});
+
+/** 视口停在挂载区底部：顶边已在视口上方很远（负），底边贴住（0）。 */
+const atWindowBottom = (w: WindowState): VisibleRange => ({
+  first: w.end - 10,
+  last: w.end - 1,
+  gapTopPx: -5000,
+  gapBottomPx: 0,
 });
 
 describe("nextWindow / 冷启动", () => {
@@ -131,13 +138,14 @@ describe("nextWindow / 冷启动", () => {
     });
   });
 
-  it("冷启动不翻页：初始 gapTopPx 约等于窗口高度，远大于 bufferPx", () => {
+  it("冷启动不翻页：用户在底部，顶边在视口上方（gapTopPx 为负）", () => {
     const w = nextWindow({ current: null, itemCount: 3000, limits: L, visible: null });
+    // 60 条 * 40px = 2400px，视口 800px，所以顶边在视口上方 1600px。
     const grown = nextWindow({
       current: w,
       itemCount: 3000,
       limits: L,
-      visible: { first: 2990, last: 2999, gapTopPx: 1200, gapBottomPx: 0 },
+      visible: { first: 2990, last: 2999, gapTopPx: -1600, gapBottomPx: 0 },
     });
     expect(grown).toEqual(w);
   });
@@ -160,7 +168,9 @@ describe("nextWindow / 向上分页", () => {
       current: paged,
       itemCount: 3000,
       limits: L,
-      visible: { first: 2860, last: 2870, gapTopPx: 2500, gapBottomPx: 900 },
+      // 补偿后视口仍在原来那几条上：上方新挂载的 200 条在视口上方（负），
+      // 下方还有内容在视口下方（负）。
+      visible: { first: 2860, last: 2870, gapTopPx: -2500, gapBottomPx: -900 },
     });
     expect(again).toEqual(paged);
   });
@@ -189,7 +199,7 @@ describe("nextWindow / 卸载", () => {
     expect(
       decideTrimStart({
         following: true,
-        visible: { first: 100, last: 110, gapTopPx: 0, gapBottomPx: 5000 },
+        visible: { first: 100, last: 110, gapTopPx: -5000, gapBottomPx: -5000 },
         start: 0,
         end: 500,
         limits: L,
@@ -203,16 +213,84 @@ describe("nextWindow / 卸载", () => {
     );
   });
 
+  it("decideTrimStart: 刚向下分页（底边贴住）-> 截 start", () => {
+    // 覆盖 `gapBottomPx` 分支：底边贴住视口底，说明用户刚往下翻，
+    // 上方那批旧内容才是该让位的。
+    expect(
+      decideTrimStart({
+        following: false,
+        visible: { first: 2500, last: 2510, gapTopPx: -5000, gapBottomPx: 0 },
+        start: 0,
+        end: 3000,
+        limits: L,
+      }),
+    ).toBe(true);
+  });
+
+  it("decideTrimStart: 两端都远离 -> 截掉离视口更远的一侧", () => {
+    // 覆盖距离比较分支。视口在 2500：上方 2500 条、下方 490 条 -> 上方更远 -> 截 start。
+    expect(
+      decideTrimStart({
+        following: false,
+        visible: { first: 2500, last: 2510, gapTopPx: -5000, gapBottomPx: -5000 },
+        start: 0,
+        end: 3000,
+        limits: L,
+      }),
+    ).toBe(true);
+  });
+
+  it("decideTrimStart: 视口靠近 start -> 截 end（方向必须反过来）", () => {
+    // 同一分支的反向用例。缺了这条，比较符号写反也测不出来。
+    // 视口在 200：上方 200 条、下方 2790 条 -> 下方更远 -> 截 end。
+    expect(
+      decideTrimStart({
+        following: false,
+        visible: { first: 200, last: 210, gapTopPx: -5000, gapBottomPx: -5000 },
+        start: 0,
+        end: 3000,
+        limits: L,
+      }),
+    ).toBe(false);
+  });
+
   it("decideTrimStart: 刚向上分页 -> 截 end（即使视口离 start 更近）", () => {
     expect(
       decideTrimStart({
         following: false,
-        visible: { first: 5, last: 15, gapTopPx: 0, gapBottomPx: 9000 },
+        visible: { first: 5, last: 15, gapTopPx: 0, gapBottomPx: -9000 },
         start: 0,
         end: 500,
         limits: L,
       }),
     ).toBe(false);
+  });
+});
+
+describe("nextWindow / 底部跟随稳定性（回归）", () => {
+  it("用户不滚动时连续多次测量必须稳定，不得自己上翻", () => {
+    // 回归用例：gap 一旦被夹到 ≥0，「顶边在视口上方」就会被读成「翻到顶了」，
+    // 窗口逐帧上翻再跳回，形成永不收敛的抖动。
+    const ROW = 40;
+    const VIEWPORT = 800;
+    let w = nextWindow({ current: null, itemCount: 3251, limits: L, visible: null });
+    const first = { ...w };
+    let scrollTop = (w.end - w.start) * ROW - VIEWPORT; // 贴底
+
+    for (let i = 0; i < 6; i += 1) {
+      const mounted = w.end - w.start;
+      const visible = {
+        first: w.start,
+        last: w.end - 1,
+        gapTopPx: 0 - scrollTop, // 顶边相对视口顶（负 = 已在视口上方）
+        gapBottomPx: scrollTop + VIEWPORT - mounted * ROW,
+      };
+      const next = nextWindow({ current: w, itemCount: 3251, limits: L, visible });
+      expect(next).toEqual(w); // 每一次都必须原地不动
+      w = next;
+    }
+    expect(w).toEqual(first);
+    expect(w.following).toBe(true);
   });
 });
 
@@ -264,7 +342,7 @@ describe("nextWindow / focus 定点开窗", () => {
       current: focused,
       itemCount: 3000,
       limits: L,
-      visible: { first: 490, last: 520, gapTopPx: 5000, gapBottomPx: 3000 },
+      visible: { first: 490, last: 520, gapTopPx: -5000, gapBottomPx: -3000 },
     });
     expect(next).toEqual(focused);
   });
@@ -283,7 +361,7 @@ describe("nextWindow / focus 定点开窗", () => {
         current: w,
         itemCount: 800,
         limits: L,
-        visible: { first: w.end - 10, last: w.end - 1, gapTopPx: 5000, gapBottomPx: 0 },
+        visible: atWindowBottom(w),
       });
     }
     expect(w.end).toBe(800);
@@ -390,9 +468,15 @@ export interface VisibleRange {
   first: number;
   /** 视口内最后一条的绝对 item index。 */
   last: number;
-  /** 挂载区顶边到视口顶的距离（px，≥0）。0 表示顶边已进入视口。 */
+  /**
+   * 挂载区顶边相对视口顶的有符号距离（px）：`firstTop - viewTop`。
+   *
+   * 必须**有符号**，不能夹到 ≥0：「顶边正好在视口顶」与「顶边已在视口上方」
+   * 是两件事。60 条消息通常比视口高，用户停在底部时第一条挂载行本就在视口
+   * 上方（负值）。夹成 0 会被读成「用户翻到顶了」，于是自己往上分页并逐帧抖动。
+   */
   gapTopPx: number;
-  /** 挂载区底边到视口底的距离（px，≥0）。0 表示底边已进入视口。 */
+  /** 挂载区底边相对视口底的有符号距离（px）：`viewBottom - lastBottom`。负值 = 视口已越过底边。 */
   gapBottomPx: number;
 }
 
@@ -448,11 +532,11 @@ export function decideTrimStart(args: {
   const { following, visible, start, end, limits } = args;
   if (following) return true; // 用户在看最新
   if (!visible) return true; // 尚未测量，保守保住尾部
-  if (visible.gapTopPx <= limits.bufferPx) return false; // 刚向上分页 -> 截 end
-  if (visible.gapBottomPx <= limits.bufferPx) return true; // 刚向下分页 -> 截 start
+  if (visible.gapTopPx >= -limits.bufferPx) return false; // 刚向上分页 -> 截 end
+  if (visible.gapBottomPx >= -limits.bufferPx) return true; // 刚向下分页 -> 截 start
   const nearStart = visible.first - start;
   const nearEnd = end - visible.last;
-  return nearEnd >= nearStart;
+  return nearStart > nearEnd; // 截离视口更远的一侧
 }
 
 /** 算出下一个窗口。纯函数：不读 DOM、不读时间、无副作用。 */
@@ -497,11 +581,11 @@ export function nextWindow(input: NextWindowInput): WindowState {
       if (following) end = itemCount;
 
       if (visible) {
-        if (start > 0 && visible.gapTopPx <= limits.bufferPx) {
+        if (start > 0 && visible.gapTopPx >= -limits.bufferPx) {
           start = Math.max(start - limits.pageSize, 0);
           following = false; // 用户明确往上读了
         }
-        if (end < itemCount && visible.gapBottomPx <= limits.bufferPx) {
+        if (end < itemCount && visible.gapBottomPx >= -limits.bufferPx) {
           end = Math.min(end + limits.pageSize, itemCount);
           // 滚回底部就是「要继续看最新」，与 useStickToBottom 里
           // 「gap 回到阈值内则恢复跟随」是同一条语义，两处必须一致。
@@ -1658,8 +1742,11 @@ const HistoryWindow = memo(
     return {
       first: 0,
       last: rows.length - 1,
-      gapTopPx: Math.max(0, firstTop - viewTop),
-      gapBottomPx: Math.max(0, viewBottom - lastBottom),
+      // **不要夹到 ≥0**：`gapTopPx` 为负表示顶边已在视口上方，这正是
+      // 「用户在窗口内部」的正常状态，必须与「顶边贴住视口顶（0）」区分开。
+      // 夹掉符号会让底部跟随被误判成翻到顶，窗口逐帧抖动。
+      gapTopPx: firstTop - viewTop,
+      gapBottomPx: viewBottom - lastBottom,
     };
   }, []);
   // 这里**不传** `focus` prop：锚点恢复（Task 10）与搜索跳转（Task 11）都走

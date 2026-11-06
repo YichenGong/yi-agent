@@ -47,9 +47,20 @@ export interface VisibleRange {
   first: number;
   /** 视口内最后一条的绝对 item index。 */
   last: number;
-  /** 挂载区顶边到视口顶的距离（px，≥0）。0 表示顶边已进入视口。 */
+  /**
+   * 挂载区顶边相对视口顶的有符号距离（px）：`firstTop - viewTop`。
+   *
+   * 用有符号而不是夹到 ≥0，是因为「顶边正好在视口顶」与「顶边已在视口上方」
+   * 必须区分开：60 条消息通常比视口高，用户停在底部时第一条挂载行本来就在
+   * 视口**上方**（负值）。把它夹成 0，规则会读成「用户翻到顶了」，于是自己
+   * 往上分页并逐帧来回抖动。负值 = 视口已越过顶边多少像素。
+   */
   gapTopPx: number;
-  /** 挂载区底边到视口底的距离（px，≥0）。0 表示底边已进入视口。 */
+  /**
+   * 挂载区底边相对视口底的有符号距离（px）：`viewBottom - lastBottom`。
+   *
+   * 同 `gapTopPx`：负值 = 视口已越过底边多少像素，0 = 底边正好贴住视口底。
+   */
   gapBottomPx: number;
 }
 
@@ -105,11 +116,11 @@ export function decideTrimStart(args: {
   const { following, visible, start, end, limits } = args;
   if (following) return true; // 用户在看最新
   if (!visible) return true; // 尚未测量，保守保住尾部
-  if (visible.gapTopPx <= limits.bufferPx) return false; // 刚向上分页 -> 截 end
-  if (visible.gapBottomPx <= limits.bufferPx) return true; // 刚向下分页 -> 截 start
+  if (visible.gapTopPx >= -limits.bufferPx) return false; // 刚向上分页 -> 截 end
+  if (visible.gapBottomPx >= -limits.bufferPx) return true; // 刚向下分页 -> 截 start
   const nearStart = visible.first - start;
   const nearEnd = end - visible.last;
-  return nearEnd >= nearStart;
+  return nearStart > nearEnd; // 截离视口更远的一侧
 }
 
 /** 算出下一个窗口。纯函数：不读 DOM、不读时间、无副作用。 */
@@ -154,11 +165,11 @@ export function nextWindow(input: NextWindowInput): WindowState {
       if (following) end = itemCount;
 
       if (visible) {
-        if (start > 0 && visible.gapTopPx <= limits.bufferPx) {
+        if (start > 0 && visible.gapTopPx >= -limits.bufferPx) {
           start = Math.max(start - limits.pageSize, 0);
           following = false; // 用户明确往上读了
         }
-        if (end < itemCount && visible.gapBottomPx <= limits.bufferPx) {
+        if (end < itemCount && visible.gapBottomPx >= -limits.bufferPx) {
           end = Math.min(end + limits.pageSize, itemCount);
           // 滚回底部就是「要继续看最新」，与 useStickToBottom 里
           // 「gap 回到阈值内则恢复跟随」是同一条语义，两处必须一致。
