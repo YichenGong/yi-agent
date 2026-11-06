@@ -262,6 +262,8 @@ async fn driver_reports_finished_when_writer_fails() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     prompt_tx
@@ -341,6 +343,8 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         None,
         std::env::temp_dir(),
         None,
+        built.sandbox.clone(),
+        Arc::clone(&built.process_manager),
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。

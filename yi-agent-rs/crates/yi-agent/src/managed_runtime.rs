@@ -307,7 +307,7 @@ pub fn run_managed_daemon(
         Some((ledger, lifeline)) => (Some(ledger), Some(lifeline)),
         None => (None, None),
     };
-    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_and_authority(
+    let daemon = yi_agent_store::ipc::Daemon::start_with_factory_authority_enforcing_session_turns(
         &runtime_dir,
         &database,
         factory,

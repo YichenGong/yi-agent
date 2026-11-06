@@ -3245,7 +3245,8 @@ async fn non_git_read_only_child_starts_and_completes() {
         .unwrap();
     let session = attached.session_id.clone();
     let root = attached.root_task_id.clone();
-    coordinator.start_worker(&session, &root).await.unwrap();
+    // The attached root is the session container: it owns delegation and never
+    // runs a daemon worker (design §4.1). Only the child below is an execution.
 
     let child = coordinator.spawn_child(&session, &root).await.unwrap();
     coordinator
@@ -3258,8 +3259,8 @@ async fn non_git_read_only_child_starts_and_completes() {
     // `one_supervisors_failure_does_not_discard_another_sessions_completion`),
     // and the child is the second start because the root started first.
     let handles = factory.handles.lock().unwrap().clone();
-    assert_eq!(handles.len(), 2, "root plus the read-only child");
-    handles[1].report_completed("the investigation finished");
+    assert_eq!(handles.len(), 1, "only the read-only child runs a worker");
+    handles[0].report_completed("the investigation finished");
     coordinator.reconcile_worker_events().await.unwrap();
 
     let state = RuntimeRepository::open(&database)
@@ -3295,7 +3296,7 @@ async fn non_git_read_only_child_accepts_an_explicit_workdir() {
         .unwrap();
     let session = attached.session_id;
     let root = attached.root_task_id;
-    coordinator.start_worker(&session, &root).await.unwrap();
+    // No root worker: the container is not an execution.
 
     let child = coordinator
         .spawn_child_with_objective(
@@ -3378,6 +3379,25 @@ fn seed_orphan(
     (task, attempt)
 }
 
+/// An execution child under a session root.
+///
+/// Orphan reclaim applies to executions, not to the container root: the root is
+/// governed by its container record (a `detached` binding may be rebound), while
+/// a child's owner really can be gone.
+fn seed_orphan_child(
+    repository: &mut RuntimeRepository,
+    session: &RootSessionId,
+    parent: &TaskId,
+    state: &str,
+) -> (TaskId, AttemptId) {
+    let task = TaskId::new();
+    let attempt = AttemptId::new();
+    repository
+        .create_child_task_with_attempt(&task, session, parent, 1, &attempt, 1, state)
+        .unwrap();
+    (task, attempt)
+}
+
 #[test]
 fn reclaim_cancels_tasks_whose_application_root_detached() {
     let directory = TempDir::new().unwrap();
@@ -3385,18 +3405,23 @@ fn reclaim_cancels_tasks_whose_application_root_detached() {
     let mut repository = RuntimeRepository::open(&database).unwrap();
 
     let session = RootSessionId::new();
-    let (task, attempt) = seed_orphan(
+    let (root, _) = seed_orphan(
         &mut repository,
         &session,
         "paused",
         "detached-project",
         Some("detached"),
     );
+    let (task, attempt) = seed_orphan_child(&mut repository, &session, &root, "paused");
 
     assert_eq!(repository.task_state(&task).unwrap(), "paused");
     assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 1);
     assert_eq!(repository.task_state(&task).unwrap(), "cancelled");
     assert_eq!(repository.attempt_state(&attempt).unwrap(), "cancelled");
+    // The session root itself is not an orphan: detach closes the current binding,
+    // it does not close the session (design §5.3). Reaping it here would delete
+    // the container a rebinding host is about to reuse.
+    assert_eq!(repository.task_state(&root).unwrap(), "paused");
     // Idempotent: a second sweep finds nothing left to reclaim.
     assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 0);
 }
@@ -3444,13 +3469,14 @@ fn reclaim_preserves_the_partial_report_and_releases_leases() {
     let mut repository = RuntimeRepository::open(&database).unwrap();
 
     let session = RootSessionId::new();
-    let (task, attempt) = seed_orphan(
+    let (root, _) = seed_orphan(
         &mut repository,
         &session,
         "paused",
         "half-done",
         Some("detached"),
     );
+    let (task, attempt) = seed_orphan_child(&mut repository, &session, &root, "paused");
     repository
         .transition_task_and_attempt_with_terminal(
             &task,
@@ -3482,23 +3508,29 @@ fn reclaim_abandons_recovery_required_tasks_with_nothing_to_resume() {
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
 
-    // A detached root parks its interrupted task in `recovery_required`, a
-    // terminal state, with no checkpoint and no workspace lease: nothing can
-    // ever resume it and nothing owns it.
+    // A detached session parks its interrupted *execution* in
+    // `recovery_required`, a terminal state, with no checkpoint and no workspace
+    // lease: nothing can ever resume it and nothing owns it.
     let session = RootSessionId::new();
-    let (task, _) = seed_orphan(
+    let (root, _) = seed_orphan(
         &mut repository,
         &session,
-        "running",
+        "queued",
         "empty-recovery",
         Some("attached"),
     );
+    let (task, _) = seed_orphan_child(&mut repository, &session, &root, "running");
     repository.recover_inflight_tasks().unwrap();
     assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
-    repository.detach_application_root(&session, &task).unwrap();
+    repository.detach_application_root(&session, &root).unwrap();
 
     assert_eq!(repository.reclaim_orphaned_tasks(0).unwrap(), 1);
     assert_eq!(repository.task_state(&task).unwrap(), "cancelled");
+    assert_eq!(
+        repository.task_state(&root).unwrap(),
+        "queued",
+        "the container root survives a detached binding"
+    );
 }
 
 #[test]
@@ -3507,16 +3539,17 @@ fn reclaim_keeps_recovery_required_tasks_under_a_live_root() {
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
 
-    // The root is still attached, so hydration revives this task and a user can
-    // resume it even though it carries no checkpoint yet.
+    // The root is still attached, so hydration revives this execution and a user
+    // can resume it even though it carries no checkpoint yet.
     let session = RootSessionId::new();
-    let (task, _) = seed_orphan(
+    let (root, _) = seed_orphan(
         &mut repository,
         &session,
-        "running",
+        "queued",
         "live-recovery",
         Some("attached"),
     );
+    let (task, _) = seed_orphan_child(&mut repository, &session, &root, "running");
     repository.recover_inflight_tasks().unwrap();
     assert_eq!(repository.task_state(&task).unwrap(), "recovery_required");
 
@@ -3535,21 +3568,14 @@ fn reclaim_keeps_recovery_required_tasks_that_can_still_resume() {
     let mut repository = RuntimeRepository::open(&database).unwrap();
 
     let session = RootSessionId::new();
-    let task = TaskId::new();
-    let attempt = AttemptId::new();
-    repository
-        .create_task_with_attempt(&task, &session, &attempt, 1, "running")
-        .unwrap();
-    repository
-        .record_application_root_attachment(
-            "resumable",
-            &session,
-            &task,
-            "digest",
-            "secret",
-            "/tmp/project",
-        )
-        .unwrap();
+    let (root, _) = seed_orphan(
+        &mut repository,
+        &session,
+        "queued",
+        "resumable",
+        Some("attached"),
+    );
+    let (task, attempt) = seed_orphan_child(&mut repository, &session, &root, "running");
     repository
         .record_recovery_context(
             &task,
@@ -4035,7 +4061,7 @@ async fn a_child_inherits_its_parents_linked_roots_transitively() {
         .unwrap();
     let session = attached.session_id.clone();
     let root = attached.root_task_id.clone();
-    coordinator.start_worker(&session, &root).await.unwrap();
+    // The container root has no worker; only executions below it do.
 
     let child = coordinator
         .spawn_child_with_objective(
@@ -4087,11 +4113,7 @@ async fn a_child_inherits_its_parents_linked_roots_transitively() {
 
     let expected: Vec<std::path::PathBuf> = linked.iter().map(std::path::PathBuf::from).collect();
     let starts = factory.starts.lock().unwrap();
-    for (task, label) in [
-        (&root, "root"),
-        (&child, "child"),
-        (&grandchild, "grandchild"),
-    ] {
+    for (task, label) in [(&child, "child"), (&grandchild, "grandchild")] {
         let start = starts
             .iter()
             .find(|start| start.task_id == *task)
@@ -4117,7 +4139,7 @@ async fn a_session_without_linked_roots_threads_nothing_to_its_workers() {
         .unwrap();
     let session = attached.session_id.clone();
     let root = attached.root_task_id.clone();
-    coordinator.start_worker(&session, &root).await.unwrap();
+    // The container root has no worker; only executions below it do.
     let child = coordinator
         .spawn_child_with_objective(
             &session,
@@ -4139,7 +4161,7 @@ async fn a_session_without_linked_roots_threads_nothing_to_its_workers() {
     assert!(repository.task_extra_roots(&child).unwrap().is_empty());
 
     let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
+    assert_eq!(starts.len(), 1, "only the child execution starts a worker");
     assert!(
         starts.iter().all(|start| start.extra_roots.is_empty()),
         "an unlinked tree must stay single-root byte for byte"
@@ -4242,18 +4264,37 @@ async fn reattaching_a_root_session_restores_its_linked_roots_on_the_supervisor(
         .await
         .unwrap();
     assert_eq!(reattached.session_id, attached.session_id);
+    // The container never runs a daemon worker, so the restored root set cannot be
+    // observed through a `WorkerStart`. It must still be restored: a child spawn
+    // reads its parent's row, and the supervisor's own view has to agree with it.
+    // Spawning a child is therefore the observable proof here, and its worker must
+    // carry the recorded set rather than the empty reattach request.
+    let child = reopened
+        .spawn_child_with_objective(
+            &reattached.session_id,
+            &reattached.root_task_id,
+            "reader".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     reopened
-        .start_worker(&reattached.session_id, &reattached.root_task_id)
+        .start_worker(&reattached.session_id, &child)
         .await
         .unwrap();
 
     let starts = factory.starts.lock().unwrap();
-    let root_start = starts
+    let child_start = starts
         .iter()
-        .find(|start| start.task_id == reattached.root_task_id)
-        .expect("the reattached root worker started");
+        .find(|start| start.task_id == child)
+        .expect("the child worker started");
     assert_eq!(
-        root_start.extra_roots,
+        child_start.extra_roots,
         vec![std::path::PathBuf::from("/w/linked-b")],
         "a reattach must restore the recorded roots, not the empty request"
     );
@@ -5355,6 +5396,51 @@ async fn foreground_root_lifecycle_a_managed_bind_after_the_scan_still_wins() {
     assert_eq!(fixture.root_state(), fixture.initial_root_state());
 }
 
+/// Mutation guard for the commit-time role re-check.
+///
+/// The candidate query already excludes containers, so deleting the re-check inside
+/// `record_watchdog_terminal_with_policy` cannot be caught by a scan that starts at a
+/// container -- it never lists one. The only way to reach the re-check is the race it
+/// exists for: the scan lists an execution, and the root becomes a container before
+/// the terminal commit. That is a real shape (the app attaches a root while a scan is
+/// in flight), and it must not settle the freshly attached conversation.
+#[tokio::test]
+#[cfg(feature = "foreground-test-support")]
+async fn foreground_root_lifecycle_a_container_after_the_scan_still_wins() {
+    let fixture = ForegroundFixture::managed().await;
+    let started = Utc::now() - chrono::Duration::seconds(400);
+    fixture.seed_watchdog(&fixture.root_task(), started);
+
+    let coordinator = fixture.coordinator();
+    let root = fixture.root_task();
+    assert_eq!(
+        coordinator
+            .evaluate_watchdogs_with_stale_candidates(Utc::now(), || {
+                // The row's role changes between the scan and the commit. This is
+                // written straight to the row because no supported API demotes an
+                // execution to a container: the point is to exercise the guard, not
+                // to endorse the transition.
+                coordinator
+                    .repository_for_test()
+                    .expect("the test hook owns the repository")
+                    .execute_test_statement_params(
+                        "UPDATE tasks SET role = 'session_container' WHERE id = ?1",
+                        &[&root.to_string()],
+                    )
+                    .expect("the role is rewritable between phases");
+            })
+            .await
+            .unwrap(),
+        0,
+        "the commit must observe the role the scan did not"
+    );
+    assert!(
+        !fixture.root_has_watchdog_terminal(),
+        "a container must never carry a watchdog terminal, however late it became one"
+    );
+    assert_eq!(fixture.root_state(), fixture.initial_root_state());
+}
+
 #[cfg(feature = "foreground-test-support")]
 mod foreground_support;
 
@@ -5827,4 +5913,134 @@ async fn foreground_root_lifecycle_recovery_survives_a_reopen() {
         old_terminal,
         "the old attempt's evidence is history, not something recovery rewrites"
     );
+}
+
+/// C2: the reported bug, end to end.
+///
+/// A kanban session that stays quiet is spawned from long after both worker budgets
+/// have elapsed -- for an embedded session and a guardian-managed one alike. The
+/// watchdog scan is real (`evaluate_watchdogs`), the progress count is real (zero),
+/// and the spawn goes through the production admission path.
+///
+/// Before the role was separated from the state this is exactly what failed: the
+/// scan settled the root, the settled root read as a settled parent, and every later
+/// `spawn_agent` was refused with "a settled parent task (state: stalled) cannot
+/// spawn descendants" -- including after an app restart, because the settled state
+/// was durable.
+#[tokio::test]
+async fn session_delegation_lifecycle_managed_and_embedded_survive_worker_deadlines() {
+    use yi_agent_store::repository::foreground::ForegroundClassification;
+
+    for (label, classification) in [
+        ("embedded", ForegroundClassification::Legacy),
+        ("managed", ForegroundClassification::Managed),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace_position = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: workspace.clone(),
+            path: workspace.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+        let factory = Arc::new(WorkspaceObservingFactory {
+            starts: Arc::new(Mutex::new(Vec::new())),
+            handles: Arc::new(Mutex::new(Vec::new())),
+            workspace_service: Arc::new(StaticWorkspaceService {
+                workspace: workspace_position,
+            }),
+            workspace_registry: None,
+        });
+        let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+        let attached = coordinator
+            .attach_session_container(
+                &format!("project:{label}:1"),
+                &workspace,
+                &[],
+                "op-attach",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let root: yi_agent_core::TaskId = attached.root.root_id.parse().unwrap();
+        let session: RootSessionId = attached.root.session_id.parse().unwrap();
+        coordinator
+            .record_foreground_class_for_test(&root, classification)
+            .unwrap();
+
+        let attempt: AttemptId = {
+            let repository = coordinator.repository_for_test().unwrap();
+            repository
+                .execute_test_scalar_text(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    &root.to_string(),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: the container has an active attempt"))
+                .parse()
+                .unwrap()
+        };
+        // Zero progress: the observation never moves, which is the state a session
+        // sits in while the user is away. The budgets are measured against it.
+        let started = Utc::now();
+        coordinator
+            .repository_for_test()
+            .unwrap()
+            .save_attempt_watchdog_snapshot(
+                &root,
+                &attempt,
+                &WatchdogLimits::default(),
+                &WatchdogUsage::default(),
+                None,
+                started,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            coordinator
+                .evaluate_watchdogs(started + ChronoDuration::seconds(301))
+                .await
+                .unwrap(),
+            0,
+            "{label}: 301s of idleness must not settle a session container"
+        );
+        assert_eq!(
+            coordinator
+                .evaluate_watchdogs(started + ChronoDuration::seconds(2_701))
+                .await
+                .unwrap(),
+            0,
+            "{label}: the 2700s wall-time budget must not settle a session container"
+        );
+        assert_eq!(
+            coordinator.task_state(&root).unwrap(),
+            "queued",
+            "{label}: the container's durable state must be untouched by the watchdog"
+        );
+
+        // The actual failing call from the bug report.
+        let child = coordinator
+            .spawn_child_and_admit(
+                &session,
+                &root,
+                format!("{label}: work after a long quiet period"),
+                yi_agent_core::subagent::task::ChildWriteMode::ReadOnly,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{label}: a live session must still spawn after quiet time: {error}")
+            });
+        assert_ne!(child, root);
+    }
 }

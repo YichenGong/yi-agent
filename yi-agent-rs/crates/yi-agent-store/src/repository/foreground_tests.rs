@@ -313,9 +313,12 @@ fn foreground_root_lifecycle_startup_leaves_pending_and_managed_roots_alone_when
     let recovered = repository
         .recover_inflight_tasks_with_activation(ForegroundActivation::Enabled)
         .unwrap();
-    // Only the legacy and the unattached scheduled root are swept; the excluded count
-    // is therefore two fewer than the total.
-    assert_eq!(recovered, 2);
+    // Only the unattached scheduled root is swept. `legacy` is now a session
+    // container by persisted role, and the role — not the old managed
+    // classification — decides whether a root had a worker to recover. This is the
+    // boundary this feature deliberately replaces (design §6.2/§9): a legacy
+    // application root used to be parked here like an execution.
+    assert_eq!(recovered, 1);
 
     let state = |repository: &RuntimeRepository, task: &TaskId| -> String {
         repository
@@ -329,15 +332,21 @@ fn foreground_root_lifecycle_startup_leaves_pending_and_managed_roots_alone_when
     };
     assert_eq!(state(&repository, &pending), "running");
     assert_eq!(state(&repository, &managed), "running");
-    assert_eq!(state(&repository, &legacy), "recovery_required");
+    assert_eq!(
+        state(&repository, &legacy),
+        "running",
+        "a container is never parked as recovery_required"
+    );
     assert_eq!(state(&repository, &scheduled), "recovery_required");
 }
 
 #[test]
 fn foreground_root_lifecycle_disabled_startup_is_the_historical_sweep() {
-    // The production default until Task 11. Every live root is parked, including one
-    // that carries a managed row: with the feature off, nothing about classification
-    // may change behaviour.
+    // The production default until Task 11. An execution root is parked, including
+    // one that carries a managed row: with the feature off, nothing about the
+    // managed classification may change behaviour. A session container is still
+    // excluded, because that exclusion comes from the persisted role, not from the
+    // foreground switch and not from the classification.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite");
     let (managed_a, managed_b) = {
@@ -360,18 +369,30 @@ fn foreground_root_lifecycle_disabled_startup_is_the_historical_sweep() {
         (managed_a, managed_b)
     };
     let mut repository = RuntimeRepository::open(&path).unwrap();
-    assert_eq!(repository.recover_inflight_tasks().unwrap(), 2);
-    for root in [managed_a, managed_b] {
+    // `managed_a` is attached, so it now carries the session-container role and is
+    // excluded even with the foreground switch off: the sweep's role check is not
+    // a feature flag, because no worker ever existed for that root to recover.
+    assert_eq!(repository.recover_inflight_tasks().unwrap(), 1);
+    {
         let state: String = repository
             .connection
             .query_row(
                 "SELECT state_json FROM tasks WHERE id = ?1",
-                params![root.to_string()],
+                params![managed_a.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state, "recovery_required");
+        assert_eq!(state, "running", "the attached container is not swept");
     }
+    let state: String = repository
+        .connection
+        .query_row(
+            "SELECT state_json FROM tasks WHERE id = ?1",
+            params![managed_b.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "recovery_required");
 }
 
 #[test]

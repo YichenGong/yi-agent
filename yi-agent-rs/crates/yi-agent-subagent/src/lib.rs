@@ -7,8 +7,11 @@
 
 pub mod attach;
 pub mod binding;
+pub mod delegation;
 pub mod executor;
 pub mod foreground;
+pub mod session_delegation;
+pub mod session_identity;
 pub mod thread_root;
 
 use std::collections::HashMap;
@@ -722,9 +725,19 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         workspace: &std::path::Path,
         recorded: &WorkerWorkspace,
     ) -> bool {
-        git_output(workspace, &["rev-parse", "--show-toplevel"]).is_some_and(|repository_root| {
-            recorded.repository_root == std::path::Path::new(&repository_root)
-        })
+        // A tracked project is identified by its repository, so a worktree and its
+        // checkout are the same project even though their paths differ.
+        if let Some(repository_root) = git_output(workspace, &["rev-parse", "--show-toplevel"]) {
+            return recorded.repository_root == std::path::Path::new(&repository_root);
+        }
+        // Not a repository at all -- a plain directory, which is an ordinary
+        // workdir for a conversation that never asked for a worktree. There is no
+        // repository identity to compare, so the directory *is* the identity, and
+        // refusing the match would make re-attaching a root in such a directory
+        // impossible: the same root, under the same key, would be rejected as
+        // "another repository" forever. Canonicalized, because `$TMPDIR` reaches
+        // it as `/var/...` on one path and `/private/var/...` on another.
+        canonical_or_self(workspace) == canonical_or_self(&recorded.repository_root)
     }
 
     fn recovery_context(&self) -> WorkerRecoveryContext {
@@ -1328,6 +1341,15 @@ fn current_git_branch(workdir: &std::path::Path) -> Option<String> {
     (!branch.trim().is_empty() && branch != "HEAD").then_some(branch)
 }
 
+/// The path with every symlink resolved, or as given when it cannot be.
+///
+/// A comparison helper, not a filesystem verdict: a path that does not resolve
+/// is still compared, so a diagnostic about a missing directory stays the
+/// caller's to make.
+fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn git_output(directory: &std::path::Path, args: &[&str]) -> Option<String> {
     git_command_output(directory, args)
         .ok()
@@ -1494,6 +1516,7 @@ impl Tool for DaemonApplicationSendMessageTool {
                     capability: handle.capability.clone(),
                     recipient_task_id: recipient.clone(),
                     message: message.clone(),
+                    session_turn: None,
                 }
             }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
@@ -1672,6 +1695,496 @@ pub fn register_application_subagent_tools_in_thread(
     }));
 }
 
+/// Installs the five delegation tools bound to **one run's** turn.
+///
+/// The capability a tool needs is the turn secret, and a turn is a run: the
+/// daemon refuses a write from a turn that is no longer open, and refuses a read
+/// from a secret it did not mint. So the host replaces this tool set for the run
+/// it is about to start, and never mutates the set a running turn already holds.
+/// That is what stops a slow tool call from borrowing the authority of the turn
+/// that replaced it -- it simply cannot see that turn.
+pub fn register_session_turn_tools(
+    registry: &mut ToolRegistry,
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+    controller: yi_agent_tools::SandboxController,
+    thread_id: Option<String>,
+    caller: CallerContext,
+) {
+    registry.register(Arc::new(SessionTurnSpawnAgentTool {
+        turn: Arc::clone(&turn),
+        controller,
+        thread_id,
+        caller,
+    }));
+    registry.register(Arc::new(SessionTurnSendMessageTool {
+        turn: Arc::clone(&turn),
+    }));
+    registry.register(Arc::new(SessionTurnWaitAgentTool {
+        turn: Arc::clone(&turn),
+    }));
+    registry.register(Arc::new(SessionTurnInspectAgentTool {
+        turn: Arc::clone(&turn),
+    }));
+    registry.register(Arc::new(SessionTurnCancelAgentTool { turn }));
+}
+
+/// Turns a session-client failure into what the model should see.
+///
+/// A rejection is a decision and keeps its stable code, so a model can tell
+/// "this turn ended" from "the daemon is unreachable". A transport failure on a
+/// write says explicitly that it was not retried, because it may have landed.
+fn session_tool_error(
+    action: &str,
+    error: crate::session_delegation::SessionClientError,
+) -> ToolResult {
+    ToolResult::error(format!("daemon rejected {action}: {error}"))
+}
+
+struct SessionTurnSpawnAgentTool {
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+    controller: yi_agent_tools::SandboxController,
+    thread_id: Option<String>,
+    caller: CallerContext,
+}
+
+struct SessionTurnSendMessageTool {
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+}
+
+struct SessionTurnWaitAgentTool {
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+}
+
+struct SessionTurnInspectAgentTool {
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+}
+
+struct SessionTurnCancelAgentTool {
+    turn: Arc<crate::session_delegation::SessionTurnClient>,
+}
+
+/// Uploads a forked context over **this turn**, not over the root's old handle.
+///
+/// The upload is a write: the daemon fences it with the turn, so it has to be
+/// opened with the turn's own secret. Using the root handle here would work only
+/// while the legacy capability is still accepted, and would break the moment the
+/// host enforces turns -- exactly the ambiguity this task removes.
+fn upload_forked_context_via_turn(
+    turn: &crate::session_delegation::SessionTurnClient,
+    caller: &CallerContext,
+) -> Result<String, ToolResult> {
+    let Some(messages) = caller.snapshot() else {
+        return Err(ToolResult::error(
+            "fork requested but no caller context available",
+        ));
+    };
+    let payload = serde_json::to_vec(&messages)
+        .map_err(|error| ToolResult::error(format!("could not encode forked context: {error}")))?;
+    let response = turn
+        .send(
+            |handle, session_turn| yi_agent_store::ipc::IpcRequest::BeginForkUpload {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                total_bytes: payload.len() as u64,
+                session_turn: Some(session_turn.clone()),
+            },
+        )
+        .map_err(|error| session_tool_error("fork upload", error))?;
+    let token = match response {
+        yi_agent_store::ipc::IpcResponse::ForkUploadStarted { fork_token } => fork_token,
+        other => {
+            return Err(ToolResult::error(format_ipc_rejection(
+                "fork upload",
+                &other,
+            )));
+        }
+    };
+    for (seq, chunk) in payload.chunks(FORK_CHUNK_BYTES).enumerate() {
+        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let response = turn.send(|_, _| yi_agent_store::ipc::IpcRequest::AppendForkChunk {
+            fork_token: token.clone(),
+            seq: seq as u64,
+            // `send` takes an `Fn` so the same builder can be reused after a
+            // transport repair; the payload is cloned, not moved.
+            data: data.clone(),
+        });
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::ForkChunkAccepted { .. }) => {}
+            Ok(other) => {
+                let _ = turn.send(|_, _| yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+                    fork_token: token.clone(),
+                });
+                return Err(ToolResult::error(format_ipc_rejection(
+                    "fork chunk",
+                    &other,
+                )));
+            }
+            Err(error) => {
+                let _ = turn.send(|_, _| yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+                    fork_token: token.clone(),
+                });
+                return Err(session_tool_error("fork chunk", error));
+            }
+        }
+    }
+    Ok(token)
+}
+
+fn session_fork_token(
+    args: &Value,
+    turn: &crate::session_delegation::SessionTurnClient,
+    caller: &CallerContext,
+) -> Result<Option<String>, ToolResult> {
+    match spawn_fork(args)? {
+        ForkChoice::No => Ok(None),
+        ForkChoice::Yes => upload_forked_context_via_turn(turn, caller).map(Some),
+        ForkChoice::Default => match upload_forked_context_via_turn(turn, caller) {
+            Ok(token) => Ok(Some(token)),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "default fork is unavailable; spawning without inherited context"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+#[async_trait]
+impl Tool for SessionTurnSpawnAgentTool {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        spawn_agent_description()
+    }
+
+    fn schema(&self) -> Value {
+        spawn_agent_schema()
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task) = args.get("task").and_then(Value::as_str) else {
+            return ToolResult::error("task is required");
+        };
+        if task.trim().is_empty() {
+            return ToolResult::error("task must not be empty");
+        }
+        let mode = match spawn_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
+        let model = match spawn_model(&args) {
+            Ok(model) => model,
+            Err(error) => return error,
+        };
+        let workdir = match spawn_workdir(&args) {
+            Ok(workdir) => workdir,
+            Err(error) => return error,
+        };
+        let sandbox = match spawn_sandbox(&args, self.controller.effective()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return error,
+        };
+        // The local gate first, so a tool from a finished turn says so without a
+        // round trip; the daemon re-checks the same turn regardless.
+        if let Err(error) = self.turn.ensure_open() {
+            return session_tool_error("spawn request", error);
+        }
+        let objective = task.to_string();
+        let fork_token = match session_fork_token(&args, &self.turn, &self.caller) {
+            Ok(token) => token,
+            Err(error) => return error,
+        };
+        let thread_id = self.thread_id.clone();
+        let mode = mode.as_str().to_string();
+        let response = self.turn.send(|handle, session_turn| {
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: handle.session_id.clone(),
+                parent_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                objective: objective.clone(),
+                mode: Some(mode.clone()),
+                model: model.clone(),
+                workdir: workdir.clone(),
+                sandbox: sandbox.clone(),
+                fork_token: fork_token.clone(),
+                thread_id: thread_id.clone(),
+                session_turn: Some(session_turn.clone()),
+            }
+        });
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
+                json!({
+                    "task_id": task_id,
+                    "objective": objective,
+                    "status": "queued",
+                    "forked": fork_token.is_some(),
+                })
+                .to_string(),
+            ),
+            Ok(other) => {
+                // The spawn did not create a child, so nothing will ever take the
+                // token; drop the upload rather than leave its payload in the
+                // daemon for the rest of the generation.
+                if let Some(token) = fork_token.as_ref() {
+                    let _ =
+                        self.turn
+                            .send(|_, _| yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+                                fork_token: token.clone(),
+                            });
+                }
+                let message = format_ipc_rejection("spawn request", &other);
+                ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
+            }
+            Err(error) => session_tool_error("spawn request", error),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionTurnSendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a direct message to an adjacent agent."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "recipient": { "type": "string", "description": "Recipient task ID." },
+                "message": { "type": "string", "description": "Message body." }
+            },
+            "required": ["recipient", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(recipient) = args.get("recipient").and_then(Value::as_str) else {
+            return ToolResult::error("recipient is required");
+        };
+        let Some(message) = args.get("message").and_then(Value::as_str) else {
+            return ToolResult::error("message is required");
+        };
+        if message.trim().is_empty() {
+            return ToolResult::error("message must be non-empty");
+        }
+        let recipient = recipient.to_owned();
+        let message = message.to_owned();
+        match self.turn.send(|handle, session_turn| {
+            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                session_id: handle.session_id.clone(),
+                sender_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                recipient_task_id: recipient.clone(),
+                message: message.clone(),
+                session_turn: Some(session_turn.clone()),
+            }
+        }) {
+            Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
+                ToolResult::text("message queued")
+            }
+            Ok(other) => ToolResult::error(format_ipc_rejection("message", &other)),
+            Err(error) => session_tool_error("message", error),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionTurnWaitAgentTool {
+    fn name(&self) -> &str {
+        "wait_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for one, all, or any direct child to report a terminal result."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string", "enum": ["one", "all", "any"] } },
+            "required": ["mode"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(mode) = args.get("mode").and_then(Value::as_str) else {
+            return ToolResult::error("mode is required");
+        };
+        if !matches!(mode, "one" | "any" | "all") {
+            return ToolResult::error("mode must be one, any, or all");
+        }
+        let mode = mode.to_owned();
+        // A read: it must keep working after this turn closed, so it uses
+        // `send_read` rather than the write gate.
+        let response =
+            self.turn
+                .send_read(|handle, _| yi_agent_store::ipc::IpcRequest::WaitAgent {
+                    session_id: handle.session_id.clone(),
+                    caller_task_id: handle.task_id.clone(),
+                    capability: handle.capability.clone(),
+                    mode: mode.clone(),
+                    timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
+                });
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted {
+                status,
+                children,
+                reports,
+            }) => ToolResult::text(
+                json!({ "status": status, "children": children, "reports": reports }).to_string(),
+            ),
+            Ok(other) => ToolResult::error(format_ipc_rejection("wait request", &other)),
+            Err(error) => session_tool_error("wait request", error),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionTurnInspectAgentTool {
+    fn name(&self) -> &str {
+        "inspect_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Read one descendant's state, delivery and report, and optionally its diff. The task must be in your own subtree, and it may already be finished."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The child task to inspect." },
+                "include_diff": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also return the child's delivered diff. Off by default."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let include_diff = args
+            .get("include_diff")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let task_id = task_id.to_owned();
+        let response =
+            self.turn
+                .send_read(|handle, _| yi_agent_store::ipc::IpcRequest::InspectChild {
+                    session_id: handle.session_id.clone(),
+                    caller_task_id: handle.task_id.clone(),
+                    capability: handle.capability.clone(),
+                    task_id: task_id.clone(),
+                });
+        let detail = match response {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
+            Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
+            Err(error) => return session_tool_error("inspect request", error),
+        };
+        let delivery: Value = serde_json::from_str(&detail.delivery_json).unwrap_or(Value::Null);
+        let report = text_completion_report(detail.terminal_json.as_deref());
+        let mut payload = json!({
+            "task_id": detail.task_id,
+            "state": detail.state,
+            "delivery": delivery,
+            "report": report,
+        });
+        if include_diff {
+            let diff = self
+                .turn
+                .send_read(|_, _| yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+                    task_id: task_id.clone(),
+                });
+            // A missing diff is not an inspect failure: the report above already
+            // answered the question, and the diff is an optional extra.
+            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff {
+                diff: Some(diff), ..
+            }) = diff
+            {
+                payload["diff"] = json!(diff);
+            }
+        }
+        ToolResult::text(payload.to_string())
+    }
+}
+
+#[async_trait]
+impl Tool for SessionTurnCancelAgentTool {
+    fn name(&self) -> &str {
+        "cancel_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Cancel one of your descendants. Use recursive to cancel its whole subtree. Only tasks in your own subtree may be cancelled."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The descendant task to cancel." },
+                "recursive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also cancel the target's own descendants."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+            return ToolResult::error("task_id is required");
+        };
+        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
+            return ToolResult::error("task_id must be a task UUID");
+        }
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let task_id = task_id.to_owned();
+        match self.turn.send(
+            |handle, session_turn| yi_agent_store::ipc::IpcRequest::CancelChild {
+                session_id: handle.session_id.clone(),
+                caller_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                task_id: task_id.clone(),
+                recursive,
+                session_turn: Some(session_turn.clone()),
+            },
+        ) {
+            Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
+                ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
+            }
+            Ok(other) => ToolResult::error(format_ipc_rejection("cancel request", &other)),
+            Err(error) => session_tool_error("cancel request", error),
+        }
+    }
+}
+
 fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcResponse) -> String {
     match response {
         yi_agent_store::ipc::IpcResponse::Error {
@@ -1815,6 +2328,7 @@ fn drive_fork_upload(
         caller_task_id,
         capability,
         total_bytes: payload.len() as u64,
+        session_turn: None,
     }) {
         Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted { fork_token }) => fork_token,
         Ok(other) => {
@@ -2168,6 +2682,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                         sandbox: sandbox.clone(),
                         fork_token: fork_token.clone(),
                         thread_id: thread_id.clone(),
+                        session_turn: None,
                     }
                 });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
@@ -2306,6 +2821,7 @@ impl Tool for DaemonCancelAgentTool {
                         capability: handle.capability.clone(),
                         task_id: task_id.clone(),
                         recursive,
+                        session_turn: None,
                     }
                 });
         match response {
@@ -2433,6 +2949,7 @@ impl Tool for DaemonSpawnAgentTool {
                         workdir: workdir.clone(),
                         sandbox: sandbox.clone(),
                         fork_token: fork_token.clone(),
+                        session_turn: None,
                     }
                 });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
@@ -2441,6 +2958,38 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    /// A plain directory is still a project, so re-attaching its root must work.
+    ///
+    /// The repository check asked git for the top level, and a directory that is not
+    /// a repository has none. Reporting "not the same project" for a workdir that is
+    /// simply not under git made every re-attach of that root fail forever -- the
+    /// exact refusal a conversation saw as `application root workspace does not match
+    /// its recorded repository` when it delegated from a scratch directory.
+    #[test]
+    fn a_directory_that_is_not_a_repository_matches_itself() {
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let project = directory.path().join("plain-project");
+        std::fs::create_dir_all(&project).expect("a plain project directory");
+        let worker = tests::worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let recorded = yi_agent_core::subagent::worker::WorkerWorkspace {
+            lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+            repository_root: project.clone(),
+            path: project.clone(),
+            branch: String::new(),
+            parent_branch: String::new(),
+            base_commit: String::new(),
+        };
+
+        assert!(
+            worker.project_workspace_matches(&project, &recorded),
+            "a non-repository directory must be identified by its own path"
+        );
+        assert!(
+            !worker.project_workspace_matches(directory.path(), &recorded),
+            "a different directory is still a different project"
+        );
+    }
+
     /// The whole point of the root refactor: the five application delegation tools
     /// share one conversation root instead of freezing their own socket.
     #[test]
@@ -4922,6 +5471,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap()
@@ -4976,6 +5526,7 @@ mod tests {
 
                 sandbox: None,
                 fork_token: None,
+                session_turn: None,
             },
         )
         .unwrap()

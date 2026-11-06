@@ -6,7 +6,8 @@ pub(crate) use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub(crate) use yi_agent_core::subagent::task::{
-    BudgetKind, DeliveryReport, MessageId, PermissionDecision, PermissionRequestId, TimeoutKind,
+    BudgetKind, DeliveryReport, MessageId, PermissionDecision, PermissionRequestId, TaskRole,
+    TimeoutKind,
 };
 pub(crate) use yi_agent_core::subagent::worker::{
     WorkerRecoveryAttestation, WorkerRecoveryContext,
@@ -36,6 +37,14 @@ mod mailbox;
 mod permission;
 mod read;
 mod schedule;
+mod session_container;
+#[cfg(test)]
+mod session_container_tests;
+
+pub use session_container::{
+    RetiredHostExecution, SessionBindingCommit, SessionContainerRecord, SessionHostExecution,
+    SessionHostStop,
+};
 mod task;
 mod trace;
 mod watchdog;
@@ -47,7 +56,7 @@ mod watchdog;
 /// any migration, task recovery, or orphan reclamation. The old check
 /// (`current_version >= LATEST` means success) silently accepted a future schema
 /// and then ran statements against columns that may not mean what it assumes.
-pub const LATEST_SCHEMA_VERSION: i64 = 18;
+pub const LATEST_SCHEMA_VERSION: i64 = 19;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -169,6 +178,12 @@ pub enum RepositoryError {
     /// contract violation, not a client rejection.
     #[error("foreground state for {root} is invalid: {reason}")]
     InvalidForegroundFact { root: String, reason: String },
+    /// A structured session-delegation rejection. Typed for the same reason as
+    /// `Foreground`: every caller branches on [`SessionFailureCode`], and matching
+    /// on an English message would turn a stable contract into a parsing
+    /// exercise.
+    #[error("session delegation: {0:?}")]
+    SessionDelegation(yi_agent_lifecycle::session_delegation::SessionFailure),
 }
 
 #[derive(Debug, Error)]
@@ -442,6 +457,24 @@ pub struct PersistedTaskSummary {
     ///
     /// 按 task 聚合而非取最后一次：重试是真实消耗，只算最新一次会低估。
     pub usage: crate::ipc::IpcTaskUsage,
+    /// `execution` or `session_container`.
+    ///
+    /// A container is a conversation's place to delegate from, not an attempt at
+    /// work: its `state` is history and says nothing about whether it may still
+    /// spawn. Readers that ask "can this go on?" must look at this role and at
+    /// [`Self::container_activity`], never at the state.
+    pub role: String,
+    /// What a container is doing *now*; `unknown` for executions.
+    ///
+    /// Deliberately not derived from `state`: a container whose historical state
+    /// reads `stalled` is still open and still usable. Only the container row can
+    /// answer this, so an absent row yields `unknown` rather than a guess.
+    pub container_activity: String,
+    /// The execution state, only for containers, and only as history.
+    ///
+    /// Kept separate so a UI can label it "last attempt" instead of showing a
+    /// stale `stalled` as if it described the conversation's capability.
+    pub historical_execution_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +549,10 @@ pub struct PersistedHydrationTask {
     pub state: String,
     pub delivery_json: String,
     pub terminal_json: Option<String>,
+    /// The persisted role. Hydration must restore it rather than assume
+    /// `Execution`: a restarted daemon that rebuilt a container as an execution
+    /// would refuse every later spawn on the strength of a historical state.
+    pub role: TaskRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1283,7 +1320,7 @@ mod extra_roots_tests {
             LATEST_SCHEMA_VERSION as u32,
             crate::schema_compat::SUPPORTED_SCHEMA_MAX
         );
-        assert_eq!(LATEST_SCHEMA_VERSION, 18);
+        assert_eq!(LATEST_SCHEMA_VERSION, 19);
     }
 
     /// v16 records who last owned a root and why it ended.
@@ -1351,6 +1388,48 @@ mod extra_roots_tests {
                 )
                 .unwrap();
             assert!(present, "v18 must create {table}");
+        }
+    }
+
+    /// v19 persists the container role and its admission record.
+    ///
+    /// Rolled back to the v18 shape so this exercises the real upgrade an existing
+    /// installation performs, not a fresh database that was never anything else.
+    #[test]
+    fn a_version_eighteen_database_gains_session_container_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS session_host_executions;
+                 DROP TABLE IF EXISTS session_migration_errors;
+                 DROP TABLE IF EXISTS session_binding_operations;
+                 DROP TABLE IF EXISTS session_containers;
+                 ALTER TABLE tasks DROP COLUMN role;
+                 DELETE FROM schema_migrations WHERE version >= 19;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for table in [
+            "session_containers",
+            "session_binding_operations",
+            "session_migration_errors",
+            "session_host_executions",
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "v19 must create {table}");
         }
     }
 

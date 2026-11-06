@@ -134,6 +134,15 @@ pub(crate) fn ipc_error_message(error: &IpcError) -> Option<String> {
         IpcError::Runtime(error @ RuntimeCoordinatorError::ParentSettled { .. }) => {
             Some(error.to_string())
         }
+        // The supervisor returns the same verdict as its own `SpawnError`, and the
+        // store pre-check can be skipped by a stale in-memory role. Without this arm
+        // the client gets `invalid_state` with no reason at all, which is exactly the
+        // unhelpful shape that hides which state blocked the spawn.
+        IpcError::Runtime(RuntimeCoordinatorError::Spawn(
+            yi_agent_core::subagent::supervisor::SpawnError::ParentSettled { state },
+        )) => Some(format!(
+            "a settled parent task (state: {state}) cannot spawn descendants"
+        )),
         // A fork rejection is the caller's mistake (unknown, incomplete, or
         // mismatched token), so the reason is safe to hand back verbatim rather
         // than leaving the client with only a bare code.
@@ -172,6 +181,23 @@ pub(crate) fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(_)) => {
             IpcErrorCode::AuthorityDenied
         }
+        // A delegation refusal is a policy answer with its own wire DTO. Mapping
+        // the codes here keeps the fallback path (an error frame rather than the
+        // typed response) from reading as a daemon fault.
+        IpcError::Runtime(RuntimeCoordinatorError::SessionDelegation { code, .. }) => match code {
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::AuthorityDenied => {
+                IpcErrorCode::AuthorityDenied
+            }
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::ProtocolMismatch => {
+                IpcErrorCode::Validation
+            }
+            yi_agent_lifecycle::session_delegation::SessionFailureCode::SessionClosed
+            | yi_agent_lifecycle::session_delegation::SessionFailureCode::AdmissionClosed
+            | yi_agent_lifecycle::session_delegation::SessionFailureCode::StopUnproven => {
+                IpcErrorCode::InvalidState
+            }
+            _ => IpcErrorCode::Conflict,
+        },
         // A bad fork token or an oversized payload is the caller's error, not a
         // daemon fault: surface it as validation so the client can react.
         IpcError::Runtime(RuntimeCoordinatorError::CodingRequiresGit { .. })
@@ -218,6 +244,10 @@ pub(crate) fn repository_error_code(error: &crate::repository::RepositoryError) 
         // must see a stable code it can dispatch on (Task 3 turns the typed error
         // into a wire `ForegroundFailure`), so it must not fall into `Internal`.
         crate::repository::RepositoryError::Foreground(_) => IpcErrorCode::InvalidState,
+        // A session-delegation rejection is likewise a stable policy answer. The
+        // wire carries the typed `SessionFailure`; this only keeps it out of the
+        // "daemon is broken" bucket.
+        crate::repository::RepositoryError::SessionDelegation(_) => IpcErrorCode::InvalidState,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }

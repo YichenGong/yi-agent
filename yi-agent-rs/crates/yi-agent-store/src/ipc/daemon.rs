@@ -184,6 +184,65 @@ impl Daemon {
         )
     }
 
+    /// Starts the daemon every shipping host uses: container writes must name an
+    /// open turn.
+    ///
+    /// This is a separate constructor rather than a flipped default because the
+    /// two behaviours answer different questions. A test that drives the IPC of a
+    /// *provider* runtime -- budgets, delivery, restart hydration -- is not
+    /// exercising the fenced contract and would only be rewritten to satisfy a
+    /// gate it never claimed. A host that drives a conversation does claim it, so
+    /// each of them calls this explicitly and a new host cannot inherit the old
+    /// answer by accident.
+    pub fn start_with_factory_enforcing_session_turns(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory(runtime_dir, database_path, factory)?;
+        daemon
+            .coordinator
+            .enforce_session_turns(std::sync::atomic::Ordering::Release);
+        Ok(daemon)
+    }
+
+    /// The same, with the guardian's authority already installed.
+    pub fn start_with_factory_authority_enforcing_session_turns(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+        managed: Option<yi_agent_lifecycle::authorization::AuthorizationLedger>,
+        bridge: Option<std::os::fd::OwnedFd>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory_and_authority(
+            runtime_dir,
+            database_path,
+            factory,
+            activation,
+            managed,
+            bridge,
+        )?;
+        daemon
+            .coordinator
+            .enforce_session_turns(std::sync::atomic::Ordering::Release);
+        Ok(daemon)
+    }
+
+    /// Starts a daemon that refuses container writes without an open turn.
+    ///
+    /// Tests only: production uses [`Self::start_with_factory_enforcing_session_turns`].
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn start_with_factory_enforcing_session_turns_for_test(
+        runtime_dir: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+    ) -> Result<Self, IpcError> {
+        let daemon = Self::start_with_factory(runtime_dir, database_path, factory)?;
+        daemon.coordinator.enforce_session_turns_for_test();
+        Ok(daemon)
+    }
+
     /// The real startup sequence, with the foreground switch made explicit.
     ///
     /// `Disabled` reproduces the historical order exactly; `Enabled` additionally
@@ -750,6 +809,48 @@ pub(crate) const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
 /// 10ms accept poll would stat a directory every tick for nothing.
 pub(crate) const DAEMON_RUNTIME_DIR_CHECK: Duration = Duration::from_secs(1);
 
+/// The `protocol_version` a frame declares, read without parsing the command.
+///
+/// `None` means the frame is not even shaped like an envelope; the ordinary parse
+/// path then reports it as a validation failure with a request id where possible.
+fn envelope_version(frame: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()?
+        .get("protocol_version")?
+        .as_u64()
+        .map(|version| version as u32)
+}
+
+/// Whether a frame's command is one that must carry a turn fence.
+///
+/// Matched on the raw JSON rather than on `IpcRequest` on purpose: the whole
+/// point is to answer an old envelope whose command would otherwise parse into a
+/// perfectly ordinary unfenced write.
+fn is_fenced_write(frame: &[u8]) -> bool {
+    const FENCED: [&str; 10] = [
+        "SpawnApplicationChild",
+        "SpawnChild",
+        "BeginForkUpload",
+        "SendApplicationMessage",
+        "CancelChild",
+        "PrepareSessionDelegation",
+        "BeginSessionTurn",
+        "EndSessionTurn",
+        "OpenSessionHostControl",
+        "AttachSessionContainer",
+    ];
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")?
+                .get("type")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| FENCED.contains(&kind.as_str()))
+}
+
 pub(crate) fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
@@ -779,13 +880,33 @@ pub(crate) fn handle_client(
         Some(IncomingFrame::Complete(frame)) => frame,
     };
     let request_id = request_id_from_frame(&frame);
-    let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
-        Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
-            IpcResponse::UnsupportedProtocol {
-                supported_min: PROTOCOL_VERSION,
-                supported_max: PROTOCOL_VERSION,
-            }
+    // The version is decided from the raw frame, before the command is parsed.
+    // `session_turn` is additive and optional, so an old envelope still decodes;
+    // deciding afterwards would let a v2 write look like a legitimate unfenced
+    // one. Reading the version first makes "upgrade the client" a different
+    // answer from "fix the request" no matter what the command contains.
+    if let Some(version) = envelope_version(&frame)
+        && version != PROTOCOL_VERSION
+    {
+        {
+            let response = if is_fenced_write(&frame) {
+                session_rejection(RuntimeCoordinatorError::session_delegation(
+                    yi_agent_lifecycle::session_delegation::SessionFailureCode::ProtocolMismatch,
+                    format!(
+                        "protocol version {version} cannot issue a fenced session write; \
+                         this daemon speaks {PROTOCOL_VERSION}"
+                    ),
+                ))
+            } else {
+                IpcResponse::UnsupportedProtocol {
+                    supported_min: PROTOCOL_VERSION,
+                    supported_max: PROTOCOL_VERSION,
+                }
+            };
+            return write_response_frame(&mut stream, &request_id, None, &response);
         }
+    }
+    let response = match serde_json::from_slice::<RequestEnvelope>(&frame) {
         Ok(envelope) => match envelope.command {
             IpcRequest::Stop => {
                 prepare_coordinator_for_stop(coordinator)?;
@@ -836,6 +957,12 @@ pub(crate) fn handle_client(
                     &envelope.request_id,
                     subscription,
                 );
+            }
+            IpcRequest::OpenSessionHostControl { binding } => {
+                // A control stream, not a request: it owns this connection for as
+                // long as the host keeps it open, so it is dispatched before the
+                // one-shot reply path below and answered in place.
+                return stream_session_host_control(&mut stream, coordinator, binding, &request_id);
             }
             IpcRequest::SubscribeEvents {
                 after_event_id,
@@ -897,6 +1024,100 @@ pub(crate) fn handle_client(
         },
     };
     write_response_frame(&mut stream, &request_id, None, &response)
+}
+
+/// Serves the host control stream until the host closes it.
+///
+/// One frame at a time, each answered with the same `request_id` so a host can
+/// correlate replies with what it sent. A refusal is answered, never silently
+/// dropped: a host that cannot register an execution has to learn that before it
+/// starts doing work, not by a later write failing for an unexplained reason.
+pub(crate) fn stream_session_host_control(
+    stream: &mut UnixStream,
+    coordinator: &Arc<RuntimeCoordinator>,
+    binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    request_id: &str,
+) -> Result<(), IpcError> {
+    if let Err(error) = coordinator.open_host_control(&binding) {
+        let error = IpcError::from(error);
+        log_request_failure(request_id, &error);
+        write_response_frame(stream, request_id, None, &error_response(&error))?;
+        return Ok(());
+    }
+    write_response_frame(
+        stream,
+        request_id,
+        None,
+        &IpcResponse::SessionHostControlReady,
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    // The accepted socket inherits `O_NONBLOCK` from the listener, so a plain
+    // read reports `WouldBlock` whenever no frame is queued yet. A control stream
+    // is idle most of its life by design, so the wait is explicit rather than
+    // "treat it as a disconnect": the latter would kill every control stream on
+    // its first quiet moment.
+    reader
+        .get_ref()
+        .set_nonblocking(false)
+        .map_err(IpcError::Io)?;
+    loop {
+        let frame = match read_limited_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            // A host that goes away is the normal end of this stream and says
+            // nothing about the container: its durable `starting` rows are what
+            // keep the next driver honest.
+            Ok(None) | Err(_) => return Ok(()),
+        };
+        let Ok(frame) = serde_json::from_slice::<SessionHostControlFrame>(&frame) else {
+            write_response_frame(
+                stream,
+                request_id,
+                None,
+                &IpcResponse::Error {
+                    code: IpcErrorCode::Validation,
+                    message: None,
+                },
+            )?;
+            continue;
+        };
+        let response = match frame.request {
+            SessionHostControlRequest::Register { turn_id } => {
+                match coordinator.register_host_control_execution(&binding, &turn_id) {
+                    Ok(execution) => IpcResponse::SessionHostExecutionRegistered { execution },
+                    Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                        IpcResponse::SessionDelegationRejected {
+                            failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                                code, reason,
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        let error = IpcError::from(error);
+                        log_request_failure(request_id, &error);
+                        error_response(&error)
+                    }
+                }
+            }
+            SessionHostControlRequest::Stopped { evidence } => {
+                match coordinator.record_host_control_stop(&binding, &evidence) {
+                    Ok(()) => IpcResponse::SessionHostStopRecorded,
+                    Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                        IpcResponse::SessionDelegationRejected {
+                            failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                                code, reason,
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        let error = IpcError::from(error);
+                        log_request_failure(request_id, &error);
+                        error_response(&error)
+                    }
+                }
+            }
+        };
+        write_response_frame(stream, request_id, None, &response)?;
+    }
 }
 
 pub(crate) fn respond_to_subscription_result(
@@ -1242,6 +1463,22 @@ fn plugin_maintenance(plugin: String, protocol: Option<u32>) -> Result<IpcRespon
     })
 }
 
+/// A session-delegation refusal, as the typed response the client branches on.
+///
+/// Without this, a refusal raised inside a coordinator call would be flattened by
+/// `error_response` into a bare `Conflict` frame, and the model would learn only
+/// "something was wrong" instead of "this turn is stale, open a new one".
+pub(crate) fn session_rejection(error: RuntimeCoordinatorError) -> IpcResponse {
+    match error {
+        RuntimeCoordinatorError::SessionDelegation { code, reason } => {
+            IpcResponse::SessionDelegationRejected {
+                failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(code, reason),
+            }
+        }
+        other => error_response(&IpcError::from(other)),
+    }
+}
+
 pub(crate) fn respond(
     context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
@@ -1328,6 +1565,77 @@ pub(crate) fn respond(
             // Running it on a detached thread looks harmless but is unbounded
             Ok(IpcResponse::ApplicationRootDetached)
         }
+        IpcRequest::AttachSessionContainer {
+            idempotency_key,
+            workspace,
+            extra_roots,
+            operation_id,
+            creation_resume_digest,
+            identity,
+        } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let root = match runtime.block_on(coordinator.attach_session_container(
+                &idempotency_key,
+                &workspace,
+                &extra_roots,
+                &operation_id,
+                creation_resume_digest,
+                identity,
+            )) {
+                Ok(root) => root,
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    return Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            Ok(IpcResponse::SessionContainerAttached {
+                root: root.reference(),
+                workspace: root.workspace,
+            })
+        }
+        IpcRequest::PrepareSessionDelegation { request } => {
+            match coordinator.prepare_session(request) {
+                Ok(binding) => Ok(IpcResponse::SessionPrepared { binding }),
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::BeginSessionTurn { binding, turn_id } => {
+            match coordinator.begin_session_turn(&binding, &turn_id) {
+                Ok(turn) => Ok(IpcResponse::SessionTurnOpened { turn }),
+                Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                    Ok(IpcResponse::SessionDelegationRejected {
+                        failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                            code, reason,
+                        ),
+                    })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        IpcRequest::EndSessionTurn { turn } => match coordinator.end_session_turn(&turn) {
+            Ok(()) => Ok(IpcResponse::SessionTurnClosed),
+            Err(RuntimeCoordinatorError::SessionDelegation { code, reason }) => {
+                Ok(IpcResponse::SessionDelegationRejected {
+                    failure: yi_agent_lifecycle::session_delegation::SessionFailure::new(
+                        code, reason,
+                    ),
+                })
+            }
+            Err(error) => Err(error.into()),
+        },
         IpcRequest::BindApplicationRootDriver {
             authorization,
             operation_id,
@@ -1431,6 +1739,12 @@ pub(crate) fn respond(
                 })
                 .collect(),
         }),
+        // Handled by `handle_client` before this one-shot dispatcher: the control
+        // stream owns its connection, so reaching here means it was not opened.
+        IpcRequest::OpenSessionHostControl { .. } => Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a host control stream cannot be opened on the one-shot request path",
+        ))),
         // Forwarded verbatim: the daemon never inspects `method` or `params`,
         // and never invents a socket path - only a supervised plugin's declared
         // socket is reachable, so this cannot serve as a local socket proxy.
@@ -1457,6 +1771,7 @@ pub(crate) fn respond(
             session_id,
             parent_task_id,
             objective,
+            session_turn,
             mode,
             model,
             workdir,
@@ -1465,6 +1780,11 @@ pub(crate) fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
@@ -1499,16 +1819,22 @@ pub(crate) fn respond(
             thread_id,
             sandbox,
             fork_token,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&parent_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let workspace_mode = parse_workspace_mode(mode)?;
             let inherited_sandbox = parse_inherited_sandbox(sandbox)?;
             let workdir = workdir.map(std::path::PathBuf::from);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let task_id = runtime.block_on(coordinator.spawn_application_child(
+            let task_id = match runtime.block_on(coordinator.spawn_application_child(
                 &session_id,
                 &parent_task_id,
                 &capability,
@@ -1519,7 +1845,11 @@ pub(crate) fn respond(
                 thread_id,
                 inherited_sandbox,
                 fork_token,
-            ))?;
+                session_turn.as_ref(),
+            )) {
+                Ok(task_id) => task_id,
+                Err(error) => return Ok(session_rejection(error)),
+            };
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
             })
@@ -1529,9 +1859,15 @@ pub(crate) fn respond(
             caller_task_id,
             capability,
             total_bytes,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&caller_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             // Authorization reaches the supervisor (root capability, or the
             // caller's own worker capability when a subagent forks itself), so
             // it must run on a runtime the same way the spawn arms do.
@@ -1694,20 +2030,29 @@ pub(crate) fn respond(
             capability,
             recipient_task_id,
             message,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let sender_task_id = parse_id::<TaskId>(&sender_task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&sender_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let recipient_task_id = parse_id::<TaskId>(&recipient_task_id)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(coordinator.send_application_message(
+            if let Err(error) = runtime.block_on(coordinator.send_application_message(
                 &session_id,
                 &sender_task_id,
                 &capability,
                 recipient_task_id,
                 message,
-            ))?;
+                session_turn.as_ref(),
+            )) {
+                return Ok(session_rejection(error));
+            }
             Ok(IpcResponse::MessageQueued)
         }
         IpcRequest::SendUserMessage { task_id, message } => {
@@ -1877,10 +2222,16 @@ pub(crate) fn respond(
             capability,
             task_id,
             recursive,
+            session_turn,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
             let task_id = parse_id::<TaskId>(&task_id)?;
+            if let Err(error) =
+                coordinator.admit_session_write(&caller_task_id, session_turn.as_ref())
+            {
+                return Ok(session_rejection(error));
+            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -1915,6 +2266,9 @@ pub(crate) fn respond(
                     parent_task_id: task.parent_task_id,
                     thread_id: task.thread_id,
                     usage: task.usage,
+                    role: task.role,
+                    container_activity: task.container_activity,
+                    historical_execution_state: task.historical_execution_state,
                 })
                 .collect();
             Ok(IpcResponse::TaskSummaries { tasks })

@@ -60,6 +60,40 @@ impl RuntimeRepository {
         model: Option<String>,
         inherited_sandbox: Option<InheritedSandbox>,
     ) -> Result<(), RepositoryError> {
+        self.create_task_with_attempt_and_objective_and_role(
+            task,
+            root,
+            attempt,
+            attempt_number,
+            state,
+            objective,
+            workspace_mode,
+            model,
+            inherited_sandbox,
+            TaskRole::Execution,
+        )
+    }
+
+    /// Creates a root task whose role is chosen by the daemon, not by the caller.
+    ///
+    /// The role is written in the same INSERT as the row, so there is no window in
+    /// which a container exists as an execution: every sweep, candidate scan and
+    /// hydration reads the column, and a row that briefly said `execution` would be
+    /// settleable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_with_attempt_and_objective_and_role(
+        &mut self,
+        task: &TaskId,
+        root: &RootSessionId,
+        attempt: &AttemptId,
+        attempt_number: u32,
+        state: &str,
+        objective: &str,
+        workspace_mode: ChildWriteMode,
+        model: Option<String>,
+        inherited_sandbox: Option<InheritedSandbox>,
+        role: TaskRole,
+    ) -> Result<(), RepositoryError> {
         let transaction = self.connection.transaction()?;
         let delivery_json = serde_json::to_string(&serde_json::json!({ "objective": objective }))?;
         transaction.execute(
@@ -67,8 +101,8 @@ impl RuntimeRepository {
             params![root.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox)
-             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO tasks (id, root_session_id, parent_id, depth, state_json, contract_version, active_attempt_id, delivery_json, workspace_mode, model, inherited_sandbox, role)
+             VALUES (?1, ?2, NULL, 0, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 task.to_string(),
                 root.to_string(),
@@ -78,6 +112,7 @@ impl RuntimeRepository {
                 workspace_mode.as_str(),
                 model,
                 inherited_sandbox.map(|value| value.as_str()),
+                role.as_str(),
             ],
         )?;
         insert_attempt(&transaction, attempt, task, attempt_number, state)?;

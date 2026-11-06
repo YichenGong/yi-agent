@@ -117,6 +117,15 @@ impl TuiSessionStore {
         })
     }
 
+    /// Where this conversation's private resume credential lives.
+    ///
+    /// Delegated to `ThreadStore` rather than rebuilt here: `fork_thread` copies
+    /// the transcripts root and must never copy a credential, so the location has
+    /// to be the one store-level place that knows that.
+    pub fn session_identity_directory(&self) -> std::path::PathBuf {
+        self.store.session_identity_directory()
+    }
+
     pub fn thread_id(&self) -> &str {
         &self.thread_id
     }

@@ -29,6 +29,9 @@ pub(crate) struct RuntimeTooling {
     pub(crate) caller: yi_agent_subagent::CallerContext,
     /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
     pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    /// The controller this registry's builtin and delegation tools were given.
+    /// Handed on to `BuiltAgent` so a per-turn tool set uses the same policy.
+    pub(crate) sandbox: yi_agent_tools::SandboxController,
 }
 /// Turn one bring-up choice into a binding, or the failure that explains why not.
 ///
@@ -296,7 +299,7 @@ pub(crate) fn build_runtime_tooling(
     yi_agent_subagent::register_attached_root_tools_in_thread(
         &mut registry,
         Arc::clone(root),
-        controller,
+        controller.clone(),
         Some(thread_id.to_string()),
         caller.clone(),
     );
@@ -396,6 +399,7 @@ pub(crate) fn build_runtime_tooling(
         permission,
         process_manager,
         caller,
+        sandbox: controller,
         // `build_tool_setup_with_controller` 已经把 `mcp_reload` 注册进 registry，
         // 这里把同一份 manager 带出去，换根之后仍指向同一份状态。
         mcp: setup.mcp,
@@ -447,6 +451,7 @@ pub(crate) fn rebuild_thread_agent_with_theme(
         yolo,
         process_manager,
         mcp,
+        sandbox,
         ..
     } = built;
     let mut config = agent.config().clone();
@@ -478,6 +483,10 @@ pub(crate) fn rebuild_thread_agent_with_theme(
         yolo,
         process_manager,
         mcp,
+        // Carried from the bootstrap this rebuild started from: the rebuilt
+        // registry's tools were built with that controller, and a per-turn tool set
+        // built from a different one would read a different live YOLO switch.
+        sandbox,
     }
 }
 /// 把 thread 的工具集与权限根换成 attached runtime 的,其余部件沿用。
@@ -520,6 +529,9 @@ pub(crate) fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) ->
         // MCP 管理器跟着 registry 走:换根目录后 `mcp_reload` 要改的是**新根**
         // 下的 `.yi-agent/mcp.json`。
         mcp: tooling.mcp,
+        // The controller goes with the registry: the per-turn tool set must be
+        // built from the same policy as the tools already in this set.
+        sandbox: tooling.sandbox,
     }
 }
 thread_local! {

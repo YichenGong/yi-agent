@@ -657,5 +657,166 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (18)", [])?;
         transaction.commit()?;
     }
+
+    // v19：会话容器角色与委派事实。
+    //
+    // 关键约束是**角色必须是持久字段**，不能从 `parent_id IS NULL`、cwd、thread
+    // 字符串或 watchdog 分类推导：那些判据要么把 worker 误当容器，要么让历史
+    // `stalled` 永久封禁一个仍然开放的会话。
+    //
+    // 迁移只做两件事：回填已验证的 application root 为 `session_container`，
+    // 并为它们建一条**准入**记录（`closed = 0`）。`closed = 0` 不表示准入此刻是
+    // 开放的——开放要当前身份 + 绑定/turn 栅栏 + 停止边界，迁移一概不猜。
+    // 尤其不能为升级批量写 tombstone：历史 `cancelled` 无法区分预算级联与用户
+    // 关闭，把它当永久关闭会把合法会话锁死。
+    //
+    // 损坏的 attachment（同 root 多线程 key、root/session 不匹配、指向 child、
+    // 非 root 深度、session 不存在）只记进 `session_migration_errors`，合法项照常
+    // 迁移，其余任务保留 `execution` 默认值。不修改 attempt/event/terminal 证据。
+    if current_version < 19 {
+        let transaction = connection.unchecked_transaction()?;
+        // `ALTER TABLE` cannot be rolled back with the version row in every crash
+        // window (the same hazard v16 documents), so probe before adding: a
+        // replay must succeed instead of failing on "duplicate column name".
+        let has_role: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'role')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_role {
+            transaction.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN role TEXT NOT NULL DEFAULT 'execution'
+                    CHECK(role IN ('execution','session_container'));",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_containers (
+                root_task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                root_session_id TEXT NOT NULL,
+                closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1)),
+                binding_epoch INTEGER NOT NULL DEFAULT 0 CHECK(binding_epoch >= 0),
+                driver_epoch INTEGER NOT NULL DEFAULT 0 CHECK(driver_epoch >= 0),
+                owner_run_id TEXT,
+                resume_digest TEXT,
+                legacy_upgrade_consumed INTEGER NOT NULL DEFAULT 0
+                    CHECK(legacy_upgrade_consumed IN (0,1))
+            );
+            CREATE TABLE IF NOT EXISTS session_binding_operations (
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                binding_epoch INTEGER NOT NULL,
+                driver_epoch INTEGER NOT NULL,
+                PRIMARY KEY(root_task_id, operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_migration_errors (
+                attachment_key TEXT PRIMARY KEY,
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_host_executions (
+                execution_id TEXT PRIMARY KEY,
+                root_task_id TEXT NOT NULL REFERENCES tasks(id),
+                generation TEXT NOT NULL,
+                binding_epoch INTEGER NOT NULL,
+                driver_epoch INTEGER NOT NULL,
+                turn_id TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('starting','running','unknown','stopped')),
+                evidence_json TEXT,
+                execution_set_version INTEGER NOT NULL
+            );",
+        )?;
+        backfill_session_container_roles(&transaction)?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// Promotes exactly the application roots whose persisted attachment is coherent.
+///
+/// The validation runs inside the migration transaction so a crash cannot leave a
+/// task marked as a container without its record (or the reverse). Anything that
+/// does not validate is *diagnosed*, never repaired: guessing ownership here is
+/// how a session silently gets handed to the wrong thread.
+fn backfill_session_container_roles(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    let mut statement = transaction.prepare(
+        "SELECT a.idempotency_key, a.root_session_id, a.root_task_id, a.state,
+                t.root_session_id, t.parent_id, t.depth
+         FROM application_root_attachments a
+         LEFT JOIN tasks t ON t.id = a.root_task_id
+         ORDER BY a.idempotency_key",
+    )?;
+    type AttachmentRow = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let rows: Vec<AttachmentRow> = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    // One root may not be claimed by two thread keys: the second key would be a
+    // public alias able to locate (and later try to resume) someone's session.
+    let mut by_root: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (key, _, root, _, _, _, _) in &rows {
+        by_root.entry(root.as_str()).or_default().push(key.as_str());
+    }
+
+    for (key, session, root, state, task_session, parent, depth) in &rows {
+        let reason = if task_session.is_none() {
+            Some("attachment references a task that does not exist".to_string())
+        } else if task_session.as_deref() != Some(session.as_str()) {
+            Some(format!(
+                "attachment session {session} does not match task session {}",
+                task_session.as_deref().unwrap_or("<none>")
+            ))
+        } else if parent.is_some() || *depth != Some(0) {
+            Some("attachment points at a non-root task".to_string())
+        } else if !matches!(state.as_str(), "attached" | "detached") {
+            Some(format!("attachment has unknown state {state}"))
+        } else {
+            by_root
+                .get(root.as_str())
+                .filter(|keys| keys.len() > 1)
+                .map(|keys| format!("root is claimed by multiple thread keys: {keys:?}"))
+        };
+        if let Some(reason) = reason {
+            transaction.execute(
+                "INSERT INTO session_migration_errors (attachment_key, reason)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(attachment_key) DO UPDATE SET reason = excluded.reason",
+                params![key, reason],
+            )?;
+            continue;
+        }
+        transaction.execute(
+            "UPDATE tasks SET role = 'session_container' WHERE id = ?1",
+            params![root],
+        )?;
+        // `closed = 0` is *admission-closed-until-proven*: it records that the
+        // migration did not observe a close, not that this host may delegate now.
+        transaction.execute(
+            "INSERT INTO session_containers (root_task_id, root_session_id, closed)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(root_task_id) DO NOTHING",
+            params![root, session],
+        )?;
+    }
     Ok(())
 }

@@ -1,10 +1,16 @@
 use super::*;
 
 /// Bumped whenever the request/response wire shape changes. `PluginQuery` is an
-/// additive variant, but `IpcRequest` is `deny_unknown_fields`, so a v1 daemon
-/// would reject a v2 request outright. Bumping makes the mismatch explicit and
-/// reachable through `UnsupportedProtocol` rather than a bare parse failure.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// additive variant, but `IpcRequest` is `deny_unknown_fields`, so an older
+/// daemon would reject a newer request outright. Bumping makes the mismatch
+/// explicit rather than a bare parse failure.
+///
+/// v3 is the fenced-write contract: `session_turn` is additive and optional, so
+/// a v2 envelope still *decodes*, and that is precisely why the version has to
+/// be refused on its own. An unfenced write from an old envelope is
+/// indistinguishable from a legitimate one once it is parsed, so the daemon
+/// decides the version before it looks at the command.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -124,6 +130,10 @@ pub enum IpcRequest {
         session_id: String,
         parent_task_id: String,
         objective: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
         #[serde(default)]
         mode: Option<String>,
         #[serde(default)]
@@ -143,6 +153,10 @@ pub enum IpcRequest {
         parent_task_id: String,
         capability: String,
         objective: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
         #[serde(default)]
         mode: Option<String>,
         #[serde(default)]
@@ -170,6 +184,10 @@ pub enum IpcRequest {
         caller_task_id: String,
         capability: String,
         total_bytes: u64,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     /// Appends one base64 chunk to an open upload. `seq` is strict, so a gap,
     /// a replay, or a chunk past the declared length is rejected rather than
@@ -257,6 +275,10 @@ pub enum IpcRequest {
         capability: String,
         recipient_task_id: String,
         message: String,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     SendUserMessage {
         task_id: String,
@@ -289,6 +311,10 @@ pub enum IpcRequest {
         task_id: String,
         #[serde(default)]
         recursive: bool,
+        /// The turn that authorizes this write. Optional only so an older client
+        /// still decodes; a container write without it is refused, never admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_turn: Option<yi_agent_lifecycle::session_delegation::SessionTurn>,
     },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,6 +384,68 @@ pub enum IpcRequest {
         #[serde(default)]
         protocol: Option<u32>,
     },
+    /// Attaches a session *container*: a root that owns delegation instead of
+    /// running a worker. Separate from `AttachApplicationRoot` because the two
+    /// answer different questions, and because an old client must keep getting
+    /// the old answer.
+    AttachSessionContainer {
+        idempotency_key: String,
+        workspace: PathBuf,
+        #[serde(default)]
+        extra_roots: Vec<String>,
+        operation_id: String,
+        /// The resume digest this container should accept from now on, written
+        /// only when the container is created.
+        #[serde(default)]
+        creation_resume_digest: Option<String>,
+        #[serde(default)]
+        identity: Option<yi_agent_lifecycle::session_delegation::SessionIdentity>,
+    },
+    /// (Re)establishes the host binding and, only on success, returns the secret.
+    PrepareSessionDelegation {
+        request: yi_agent_lifecycle::session_delegation::PrepareSession,
+    },
+    BeginSessionTurn {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+        turn_id: String,
+    },
+    EndSessionTurn {
+        turn: yi_agent_lifecycle::session_delegation::SessionTurn,
+    },
+    /// Opens the host-private control stream for one bound session.
+    ///
+    /// Not a model tool. It must be opened with the *binding* capability, which
+    /// never leaves the host; a turn secret is refused, so a tool process cannot
+    /// register an execution or claim one stopped.
+    OpenSessionHostControl {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    },
+}
+
+/// One frame on the host control stream, after `OpenSessionHostControl`.
+///
+/// The stream has its own request DTO on purpose: echoing it as an `IpcRequest`
+/// would make the control operations reachable on any ordinary connection, which
+/// is exactly the bypass the capability gate exists to prevent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionHostControlFrame {
+    pub request_id: String,
+    pub request: SessionHostControlRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
+pub enum SessionHostControlRequest {
+    /// Registers the current turn's execution before it can do any work.
+    Register { turn_id: String },
+    /// Reports a stop proof for an execution this stream registered.
+    ///
+    /// Boxed because a `StopEvidence` is far larger than the other variant and
+    /// every control frame would otherwise be sized for it.
+    Stopped {
+        evidence: Box<yi_agent_lifecycle::foreground::StopEvidence>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +504,32 @@ pub enum IpcResponse {
     },
     /// No recovery operation exists under that id.
     ForegroundRecoveryAbsent,
+    /// A container exists at the given address. Carries no secret: this response
+    /// only proves the attach succeeded, and a capability is issued later by
+    /// `PrepareSessionDelegation` for a bound host.
+    SessionContainerAttached {
+        root: yi_agent_lifecycle::session_delegation::SessionRef,
+        workspace: WorkerWorkspace,
+    },
+    SessionPrepared {
+        binding: yi_agent_lifecycle::session_delegation::SessionBinding,
+    },
+    SessionTurnOpened {
+        turn: yi_agent_lifecycle::session_delegation::SessionTurn,
+    },
+    SessionTurnClosed,
+    /// The control stream is open; only this connection may send
+    /// `SessionHostControlFrame`s after it.
+    SessionHostControlReady,
+    SessionHostExecutionRegistered {
+        execution: yi_agent_lifecycle::foreground::ExecutionIdentity,
+    },
+    SessionHostStopRecorded,
+    /// A structured delegation refusal, so the client branches on a code rather
+    /// than on English text.
+    SessionDelegationRejected {
+        failure: yi_agent_lifecycle::session_delegation::SessionFailure,
+    },
     /// A structured foreground refusal.
     ///
     /// This is a response rather than an `Error` because the client has to dispatch on
@@ -645,6 +759,30 @@ pub struct IpcTaskSummary {
     /// 双向兼容：老 daemon 不回时读出全零，而不是解析失败。
     #[serde(default)]
     pub usage: IpcTaskUsage,
+    /// `execution` or `session_container`.
+    ///
+    /// A container is where a conversation delegates from, not an attempt at work.
+    /// `serde(default)` keeps old peers readable: an absent role reads as an
+    /// execution, which is what every row written before containers was.
+    #[serde(default = "default_task_role")]
+    pub role: String,
+    /// `open` / `closed` for containers, `unknown` otherwise.
+    ///
+    /// Never derived from `state`: a container whose last attempt reads `stalled`
+    /// is still open. `unknown` is returned as-is rather than filled from history.
+    #[serde(default = "default_container_activity")]
+    pub container_activity: String,
+    /// A container's last attempt state, present only as history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_execution_state: Option<String>,
+}
+
+fn default_task_role() -> String {
+    "execution".to_string()
+}
+
+fn default_container_activity() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

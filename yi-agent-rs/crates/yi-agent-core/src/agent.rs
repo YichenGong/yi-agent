@@ -573,6 +573,16 @@ impl Agent {
         Arc::clone(&self.tools)
     }
 
+    /// Replaces the tool registry a **later** run will start with.
+    ///
+    /// The run in flight keeps the `Arc` it cloned at start, so nothing a host
+    /// installs here can reach a tool call that is already executing. That is the
+    /// whole contract: delegation capability lives inside the tools, and a run
+    /// must never be able to borrow the capability of the run that replaced it.
+    pub fn set_tools_for_next_run(&mut self, tools: Arc<ToolRegistry>) {
+        self.tools = tools;
+    }
+
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
     }
@@ -2229,6 +2239,27 @@ mod tests {
     use crate::tool::{Tool, ToolMetadata, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+
+    /// A host swaps the tool set for the *next* run; the run already in flight
+    /// must keep the registry it started with.
+    ///
+    /// This is what stops a tool call that began under one turn from using a
+    /// newer turn's delegation capability: the capability lives in the tools, and
+    /// the tools are captured once, at run start.
+    #[test]
+    fn session_delegation_lifecycle_run_tools_are_an_immutable_snapshot() {
+        let first = Arc::new(ToolRegistry::new());
+        let second = Arc::new(ToolRegistry::new());
+        let provider = ScriptedProvider::new(vec![]);
+        let mut agent = Agent::new(Arc::new(provider), first.clone(), AgentConfig::default());
+        let captured = agent.tools();
+        agent.set_tools_for_next_run(second.clone());
+        assert!(
+            Arc::ptr_eq(&captured, &first),
+            "the handle taken before the swap must still name the run's own registry"
+        );
+        assert!(Arc::ptr_eq(&agent.tools(), &second));
+    }
 
     #[test]
     fn model_changed_event_is_constructible() {

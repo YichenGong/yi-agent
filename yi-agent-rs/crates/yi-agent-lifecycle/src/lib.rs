@@ -31,6 +31,8 @@ pub mod managed;
 /// 只读影响快照与一次性确认。
 pub mod preview;
 pub mod scope;
+/// 会话容器委派的 wire DTO 与接续摘要。
+pub mod session_delegation;
 pub mod types;
 
 /// Control protocol version. Evolves independently of the business protocol.

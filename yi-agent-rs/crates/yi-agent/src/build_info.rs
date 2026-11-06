@@ -48,6 +48,12 @@ pub fn runtime_capabilities() -> Vec<String> {
         // let a client register for a guarantee this runtime's bridge has not
         // established.
         yi_agent_lifecycle::foreground::FOREGROUND_ROOT_CAPABILITY.to_string(),
+        // The fenced-write contract. Every host in this build starts its daemon
+        // with `enforce_session_turns`, so the promise this names is already kept
+        // before it is made -- advertising it from the artifact alone is safe for
+        // the same reason the foreground one is listed here: the capability says
+        // what the build can do, not what a particular runtime is configured for.
+        yi_agent_lifecycle::session_delegation::SESSION_DELEGATION_CAPABILITY.to_string(),
     ];
     capabilities.sort();
     capabilities
@@ -114,6 +120,20 @@ mod tests {
         assert_eq!(
             identity.schema_min,
             yi_agent_store::schema_compat::SUPPORTED_SCHEMA_MIN
+        );
+    }
+
+    /// The build must name the fenced-write contract it actually enforces.
+    ///
+    /// A client that checks this advertisement before offering delegation would
+    /// otherwise be told "not available" by a daemon that would honour every fenced
+    /// write it sent.
+    #[test]
+    fn the_session_delegation_capability_is_advertised() {
+        assert!(
+            runtime_capabilities().iter().any(|capability| capability
+                == yi_agent_lifecycle::session_delegation::SESSION_DELEGATION_CAPABILITY),
+            "a build that fences every container write must advertise that contract"
         );
     }
 

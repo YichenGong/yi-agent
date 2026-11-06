@@ -59,6 +59,19 @@ impl ForegroundDispatch {
         }
     }
 
+    /// Whether this conversation's runtime authorizes *delegation* for this host.
+    ///
+    /// Separate from [`Self::begin`], which only opens activity reporting: the
+    /// answers are deliberately not flattened, because a guardian's refusal must not
+    /// be read as "no guardian" and silently replaced by a resume secret.
+    pub(crate) fn authority(
+        &self,
+        root: &Arc<ThreadRoot>,
+        operation_id: &str,
+    ) -> Result<yi_agent_subagent::thread_root::ForegroundAuthority, String> {
+        self.host.authority(root, operation_id)
+    }
+
     /// Opens the turn, or reports that this conversation cannot be driven.
     ///
     /// `operation_id` identifies the *bind*, not the turn: it is stable for the life of

@@ -15,6 +15,77 @@ fn the_app_side_loop_ensures_every_registered_project() {
     assert_eq!(seen, vec![a]);
 }
 
+/// A prepared turn over `root`, for tests that must drive the fenced spawn path.
+///
+/// A production daemon refuses a write that names no turn, so a test that sends
+/// `SpawnApplicationChild` straight from the attach would be asserting a shape the
+/// contract exists to forbid. This is the same sequence every host runs: attach the
+/// container with its own resume digest, prepare, open the turn, register it.
+fn prepared_turn(
+    root: &Arc<ThreadRoot>,
+    identity_directory: &std::path::Path,
+    turn_id: &str,
+) -> (
+    Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+    yi_agent_lifecycle::foreground::ExecutionIdentity,
+    yi_agent_subagent::session_delegation::SessionHost,
+) {
+    use yi_agent_lifecycle::session_delegation::{SessionIdentity, session_resume_digest};
+    use yi_agent_subagent::session_delegation::SessionHost;
+    use yi_agent_subagent::session_identity::SessionIdentityStore;
+
+    let secret = SessionIdentityStore::new(identity_directory.to_path_buf())
+        .load_or_create(root.thread_id())
+        .expect("the conversation mints a resume secret");
+    let attachment = root
+        .attach_session_container(
+            &SessionIdentity::Embedded(secret.clone()),
+            &format!("op-attach-{turn_id}"),
+            Some(session_resume_digest(&secret)),
+        )
+        .expect("the container attaches");
+    let mut host = SessionHost::new(
+        Arc::clone(root),
+        SessionIdentity::Embedded(secret),
+        None,
+        attachment,
+    );
+    host.prepare(&format!("op-prepare-{turn_id}"))
+        .expect("the embedded identity prepares its binding");
+    let turn = host.begin_turn(turn_id).expect("the turn opens");
+    let execution = host
+        .register_execution(turn_id)
+        .expect("the turn registers its execution before it writes");
+    (Arc::new(turn), execution, host)
+}
+
+/// The fenced spawn a turn issues.
+fn spawn_under_turn(
+    turn: &Arc<yi_agent_subagent::session_delegation::SessionTurnClient>,
+    objective: &str,
+    mode: Option<&str>,
+) -> yi_agent_store::ipc::IpcResponse {
+    turn.send(
+        |handle: &yi_agent_subagent::binding::RuntimeHandle,
+         context: &yi_agent_lifecycle::session_delegation::SessionTurn| {
+            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                session_id: handle.session_id.clone(),
+                parent_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                objective: objective.to_string(),
+                mode: mode.map(str::to_string),
+                model: None,
+                workdir: None,
+                thread_id: None,
+                sandbox: None,
+                fork_token: None,
+                session_turn: Some(context.clone()),
+            }
+        },
+    )
+    .expect("the runtime socket answers")
+}
+
 /// The five tools a root agent needs to delegate.
 const DELEGATION_TOOLS: [&str; 5] = [
     "spawn_agent",
@@ -91,22 +162,16 @@ fn a_git_project_gets_the_delegation_tools() {
         "investigate the build",
     )
     .expect("activation must succeed");
-    let spawned = yi_agent_store::ipc::send_request(
-        &attached.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: attached.attached_root.session_id.clone(),
-            parent_task_id: attached.attached_root.task_id.clone(),
-            capability: attached.attached_root.capability.clone(),
-            objective: "a delegated read-only investigation".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            workdir: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .expect("the runtime socket must answer");
+    let (turn, _execution, _host) = prepared_turn(
+        &root,
+        &runtime.path().join(".session-identities"),
+        "turn-assembly-git",
+    );
+    let spawned = spawn_under_turn(
+        &turn,
+        "a delegated read-only investigation",
+        Some("read_only"),
+    );
     let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id } = spawned else {
         panic!("a git project must admit a delegated child, got {spawned:?}");
     };
@@ -496,22 +561,12 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
     // there is no worktree to recover into and no delivery to validate. The
     // desktop app's default cwd is $HOME, so this is the ordinary case, not an
     // edge one.
-    let read_only = yi_agent_store::ipc::send_request(
-        &attached.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: attached.attached_root.session_id.clone(),
-            parent_task_id: attached.attached_root.task_id.clone(),
-            capability: attached.attached_root.capability.clone(),
-            objective: "a read-only investigation".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            workdir: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .expect("the runtime socket answers");
+    let (turn, _execution, _host) = prepared_turn(
+        &root,
+        &runtime.path().join(".session-identities"),
+        "turn-assembly-in-place",
+    );
+    let read_only = spawn_under_turn(&turn, "a read-only investigation", Some("read_only"));
     assert!(
         matches!(
             read_only,
@@ -523,22 +578,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
     // Coding is where it stops: a commit is the recovery boundary a coding
     // child cannot work without. The refusal must be recognizable rather than a
     // bare internal error, so the model can explain it and offer to initialize.
-    let coding = yi_agent_store::ipc::send_request(
-        &attached.socket_path,
-        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-            session_id: attached.attached_root.session_id.clone(),
-            parent_task_id: attached.attached_root.task_id.clone(),
-            capability: attached.attached_root.capability.clone(),
-            objective: "change the plain directory".into(),
-            mode: Some("coding".into()),
-            model: None,
-            workdir: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .expect("the runtime socket answers even when it refuses");
+    let coding = spawn_under_turn(&turn, "change the plain directory", Some("coding"));
     let yi_agent_store::ipc::IpcResponse::Error { code, message } = coding else {
         panic!("a plain directory must refuse a coding child, got {coding:?}");
     };

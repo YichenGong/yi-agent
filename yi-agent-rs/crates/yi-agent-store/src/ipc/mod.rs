@@ -76,8 +76,8 @@ pub use protocol::{
     IpcCancelDelivery, IpcCancelLease, IpcCompletedChildReport, IpcErrorCode, IpcEvent,
     IpcEventPayload, IpcMailboxMessage, IpcPermissionDecision, IpcRequest, IpcResponse,
     IpcSchedule, IpcTask, IpcTaskDetail, IpcTaskSummary, IpcTaskUsage, IpcTraceRow,
-    PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, SubscriptionFilters, SubscriptionSnapshot,
-    TraceSnapshot,
+    PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, SessionHostControlFrame,
+    SessionHostControlRequest, SubscriptionFilters, SubscriptionSnapshot, TraceSnapshot,
 };
 pub use subscription::Subscription;
 pub use trace::{TraceSubscription, read_task_trace, subscribe_trace};
