@@ -920,6 +920,15 @@ impl TuiTerminal {
         let deadline = Instant::now() + START_BUDGET;
         loop {
             if service_answers(&fixture.runtime_dir) {
+                // Answering the control channel means the runtime is up and *this*
+                // client finished attaching: `attach_root`, `bind_driver` and
+                // `open_managed_channel` all precede the socket being usable by it.
+                //
+                // `admit_turn` is deliberately not waited for. The TUI writes that
+                // stage when the user's first turn is admitted, and several tests in
+                // this file wait here before typing anything -- waiting for it would
+                // hang them, and pretending a client admitted work it was never asked
+                // for is exactly what the design forbids.
                 std::thread::sleep(Duration::from_millis(500));
                 return Ok(());
             }
@@ -1206,18 +1215,39 @@ fn the_tui_entry_point_is_a_managed_frontend() -> anyhow::Result<()> {
 
     terminal.await_runtime_attached(&fixture)?;
 
-    let trace = startup_trace(&fixture);
-    let stages = trace
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        stages,
-        MANAGED_STAGES.to_vec(),
-        "the shipped TUI entry must walk every managed stage in order; trace: {trace}; screen: {:?}",
-        screen_text(&terminal)
-    );
+    // `await_runtime_attached` returns when the *runtime* answers the client, which is
+    // an earlier event than this entry's last stage being written. A fixed sleep after
+    // it is a guess: on a loaded machine `admit_turn` lands later than any constant
+    // short enough to keep the suite fast, and the earlier version of this test failed
+    // exactly that way while the trace, read a moment later, had all eight stages.
+    //
+    // So wait for the fact. A start that genuinely refused a stage is not waited out
+    // either: the observer records `refused:<stage>`, and that must fail at once with
+    // the refusal in hand rather than after a 90 s budget.
+    let deadline = Instant::now() + START_BUDGET;
+    loop {
+        let trace = startup_trace(&fixture);
+        let stages = trace
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if stages == MANAGED_STAGES.to_vec() {
+            break;
+        }
+        if let Some(refusal) = stages.iter().find(|line| line.starts_with("refused:")) {
+            anyhow::bail!(
+                "the shipped TUI entry refused a managed stage: {refusal}; trace: {trace}"
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the shipped TUI entry stopped before walking every managed stage; trace: {trace}; \
+             screen: {:?}",
+            screen_text(&terminal)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     terminal.quit()?;
     terminal.wait_exit(RELEASE_BUDGET)?;
