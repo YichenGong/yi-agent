@@ -45,6 +45,25 @@ pub enum ProjectionStep {
     Placeheld,
 }
 
+/// 把一张内联图片缩小到指定长边。
+///
+/// 实现放在能依赖图像编解码库的 crate（`yi-agent-tools`）里；`core` 只声明
+/// 接口，未注入时第 2 级自动退化为第 3 级（占位）。
+pub trait ImageDownscaler: Send + Sync {
+    /// 返回 `(新 base64, 新 media_type)`；`None` 表示这张图无法缩放。
+    fn downscale(&self, data: &str, media_type: &str, max_edge: u32) -> Option<(String, String)>;
+}
+
+impl std::fmt::Debug for dyn ImageDownscaler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 具体实现可能在 tools 侧、且持有缓存，打印类型名意义不大。
+        f.write_str("<dyn ImageDownscaler>")
+    }
+}
+
+/// 第 2 级缩放的目标长边。
+pub const DOWNSCALE_MAX_EDGE: u32 = 1024;
+
 /// 投影判定结果。`messages` 是可直接拿去序列化的副本。
 #[derive(Debug, Clone)]
 pub struct Projection {
@@ -155,6 +174,15 @@ fn placeholder_at(
 ///
 /// 传入的 `messages` 不会被修改。
 pub fn project(messages: &[Message], limits: &ProjectionLimits) -> Projection {
+    project_with(messages, limits, None)
+}
+
+/// 带缩放实现的投影。`downscaler` 为 `None` 时跳过第 2 级直接走占位。
+pub fn project_with(
+    messages: &[Message],
+    limits: &ProjectionLimits,
+    downscaler: Option<&dyn ImageDownscaler>,
+) -> Projection {
     let mut projected = messages.to_vec();
     let bytes_before = serde_json::to_vec(&projected).map(|v| v.len()).unwrap_or(0);
 
@@ -179,42 +207,112 @@ pub fn project(messages: &[Message], limits: &ProjectionLimits) -> Projection {
         }
     }
 
-    let after_dedup = bytes_before.saturating_sub(freed);
     let step = if bytes_before <= limits.soft_limit {
         ProjectionStep::AsIs
     } else {
         ProjectionStep::Deduped
     };
 
-    // 级别 2：仍超硬阈值时，只保留最近的若干张完整图。
+    // 级别 2/3：仍超硬阈值时，从**最旧**的图开始逐张降级，每降一张就检查
+    // 是否已回到硬阈值内，收敛即停 —— 降级是有损的，能少降一张就少降一张。
+    //
+    // 先缩小、缩不动才占位（占位等于让模型彻底看不见这张图）。`keep_full_images`
+    // 只用于**第一轮**：最近 N 张不同 path 的图优先保住原分辨率，但若缩小其余
+    // 图片仍不收敛，这些「受保护」的图也按同一顺序降级——否则在「每张图都
+    // 3.9 MB、硬阈值 8 MB」的形状下，保住 3 张原图就已 11.7 MB，阶梯不收敛，
+    // 413 照旧发生。
     let mut step = step;
-    if after_dedup > limits.hard_limit {
-        let mut kept = std::collections::HashSet::new();
-        let occurrences = collect_images(&projected);
-        for occurrence in occurrences.iter().rev() {
-            let Some(path) = image_path_at(&projected, occurrence) else {
-                continue;
-            };
-            if kept.len() < limits.keep_full_images && kept.insert(path.clone()) {
-                continue;
+    let mut downscaled = 0usize;
+    let mut remaining = bytes_before.saturating_sub(freed);
+    if remaining > limits.hard_limit {
+        let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 从最新往旧数出受保护的 path（第一轮跳过它们）。
+        for occurrence in collect_images(&projected).iter().rev() {
+            if protected.len() >= limits.keep_full_images {
+                break;
             }
-            if let Some(bytes) = placeholder_at(&mut projected, occurrence, &placeholder(&path)) {
-                freed += bytes;
-                placeheld += 1;
-                step = ProjectionStep::Placeheld;
+            if let Some(path) = image_path_at(&projected, occurrence) {
+                protected.insert(path);
+            }
+        }
+
+        // 两轮：第一轮跳过受保护的原图，第二轮连它们一起降级。
+        for allow_protected in [false, true] {
+            if remaining <= limits.hard_limit {
+                break;
+            }
+            for occurrence in collect_images(&projected) {
+                if remaining <= limits.hard_limit {
+                    break;
+                }
+                if !allow_protected
+                    && let Some(path) = image_path_at(&projected, &occurrence)
+                    && protected.contains(&path)
+                {
+                    continue;
+                }
+                if let Some(downscaler) = downscaler
+                    && let Some(saved) = downscale_at(&mut projected, &occurrence, downscaler)
+                {
+                    remaining = remaining.saturating_sub(saved);
+                    downscaled += 1;
+                    step = ProjectionStep::Downscaled;
+                    continue;
+                }
+                // 缩不了（无实现 / 解码失败 / 缩了不省字节）才占位。
+                if let Some(path) = image_path_at(&projected, &occurrence)
+                    && let Some(bytes) =
+                        placeholder_at(&mut projected, &occurrence, &placeholder(&path))
+                {
+                    remaining = remaining.saturating_sub(bytes);
+                    placeheld += 1;
+                    step = ProjectionStep::Placeheld;
+                }
             }
         }
     }
 
-    let bytes_after = bytes_before.saturating_sub(freed);
+    let bytes_after = remaining;
     Projection {
         messages: projected,
         step,
         bytes_before,
         bytes_after,
         placeheld,
-        downscaled: 0,
+        downscaled,
     }
+}
+/// 就地缩小一处图片块，返回释放的字节数。
+fn downscale_at(
+    messages: &mut [Message],
+    occurrence: &ImageOccurrence,
+    downscaler: &dyn ImageDownscaler,
+) -> Option<usize> {
+    let message = messages.get_mut(occurrence.message)?;
+    let outer = message.content.get_mut(occurrence.block)?;
+    let slot = match occurrence.inner {
+        None => outer,
+        Some(inner) => match outer {
+            ContentBlock::ToolResult { content, .. } => content.get_mut(inner)?,
+            _ => return None,
+        },
+    };
+    let ContentBlock::Image {
+        source: ImageSource::Base64 { media_type, data },
+        ..
+    } = slot
+    else {
+        return None;
+    };
+    let before = data.len();
+    let (new_data, new_media_type) = downscaler.downscale(data, media_type, DOWNSCALE_MAX_EDGE)?;
+    if new_data.len() >= before {
+        return None; // 缩小反而没省字节，不值得降质
+    }
+    let saved = before - new_data.len();
+    *data = new_data;
+    *media_type = new_media_type;
+    Some(saved)
 }
 
 fn placeholder(path: &str) -> String {
@@ -446,6 +544,174 @@ mod tests {
             before,
             serde_json::to_vec(&messages).unwrap(),
             "the on-disk authority must stay byte-identical"
+        );
+    }
+
+    /// 假降级器：把 payload 截到 1/100，用来验证「缩得动就不占位」。
+    struct HalvingDownscaler;
+
+    impl ImageDownscaler for HalvingDownscaler {
+        fn downscale(
+            &self,
+            data: &str,
+            media_type: &str,
+            max_edge: u32,
+        ) -> Option<(String, String)> {
+            assert_eq!(max_edge, DOWNSCALE_MAX_EDGE, "level 2 must use 1024");
+            Some((data[..data.len() / 100].to_string(), media_type.to_string()))
+        }
+    }
+
+    /// 缩不动的降级器：用来验证「缩不动就退到占位」。
+    struct UnsupportedDownscaler;
+
+    impl ImageDownscaler for UnsupportedDownscaler {
+        fn downscale(&self, _: &str, _: &str, _: u32) -> Option<(String, String)> {
+            None
+        }
+    }
+
+    #[test]
+    fn downscales_instead_of_placeholder_when_an_implementation_is_injected() {
+        let limits = ProjectionLimits {
+            soft_limit: 10,
+            hard_limit: 100_000,
+            keep_full_images: 0,
+        };
+        let mut messages = vec![Message::user("look")];
+        messages.extend(tool_round_trip("t1", "a.png", 300_000));
+
+        let projection = project_with(&messages, &limits, Some(&HalvingDownscaler));
+
+        assert_eq!(projection.step, ProjectionStep::Downscaled);
+        assert_eq!(
+            projection.downscaled, 1,
+            "the image must be shrunk, not dropped"
+        );
+        assert_eq!(projection.placeheld, 0);
+        assert!(
+            projection.bytes_after <= limits.hard_limit,
+            "body {} must fit {}",
+            projection.bytes_after,
+            limits.hard_limit
+        );
+    }
+
+    #[test]
+    fn downscaler_absent_falls_back_to_placeholder() {
+        let limits = ProjectionLimits {
+            soft_limit: 10,
+            hard_limit: 1000,
+            keep_full_images: 0,
+        };
+        let mut messages = vec![Message::user("look")];
+        messages.extend(tool_round_trip("t1", "a.png", 300_000));
+
+        let projection = project_with(&messages, &limits, None);
+
+        assert_eq!(projection.step, ProjectionStep::Placeheld);
+        assert_eq!(projection.placeheld, 1);
+        assert_eq!(projection.downscaled, 0);
+    }
+
+    #[test]
+    fn unsupported_downscaler_falls_back_to_placeholder() {
+        let limits = ProjectionLimits {
+            soft_limit: 10,
+            hard_limit: 1000,
+            keep_full_images: 0,
+        };
+        let mut messages = vec![Message::user("look")];
+        messages.extend(tool_round_trip("t1", "a.png", 300_000));
+
+        let projection = project_with(&messages, &limits, Some(&UnsupportedDownscaler));
+
+        assert_eq!(projection.step, ProjectionStep::Placeheld);
+        assert_eq!(projection.placeheld, 1, "an unscalable image is placeheld");
+    }
+
+    /// 缩后每张图都变成 1/100。
+    fn payload_sizes(projection: &Projection) -> Vec<(Option<String>, usize)> {
+        projection
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .flat_map(|c| c.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { data, .. },
+                    path,
+                    ..
+                } => Some((path.clone(), data.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 第一轮只降旧图；若这样就能收敛，最新 N 张必须逐字保留原分辨率。
+    #[test]
+    fn newest_images_keep_full_resolution_while_it_suffices() {
+        let limits = ProjectionLimits {
+            soft_limit: 10,
+            hard_limit: 320_000, // 缩掉一张（省 297k）即可收敛
+            keep_full_images: 1,
+        };
+        let mut messages = vec![Message::user("look")];
+        messages.extend(tool_round_trip("t1", "old.png", 300_000));
+        messages.extend(tool_round_trip("t2", "new.png", 300_000));
+
+        let projection = project_with(&messages, &limits, Some(&HalvingDownscaler));
+
+        let sizes = payload_sizes(&projection);
+        let newest = sizes
+            .iter()
+            .find(|(path, _)| path.as_deref() == Some("new.png"))
+            .expect("newest image present");
+        assert_eq!(newest.1, 300_000, "newest image stays full size");
+        assert!(
+            projection.bytes_after <= limits.hard_limit,
+            "body {} must converge to {}",
+            projection.bytes_after,
+            limits.hard_limit
+        );
+    }
+
+    /// 保护最近 N 张是**优先**而非**绝对**：只降旧图不收敛时，受保护的图也要降，
+    /// 否则阶梯停在一个仍超硬阈值的请求体上，413 照旧发生。
+    ///
+    /// 这正对应实测故障形状：每张 3.9 MB、硬阈值 8 MB，保住 3 张原图就是
+    /// 11.7 MB —— 不放弃保护就永远收敛不了。
+    #[test]
+    fn protection_yields_when_downscaling_the_rest_does_not_converge() {
+        let limits = ProjectionLimits {
+            soft_limit: 10,
+            hard_limit: 100_000,
+            keep_full_images: 1,
+        };
+        let mut messages = vec![Message::user("look")];
+        messages.extend(tool_round_trip("t1", "old.png", 300_000));
+        messages.extend(tool_round_trip("t2", "new.png", 300_000));
+
+        let projection = project_with(&messages, &limits, Some(&HalvingDownscaler));
+
+        let sizes = payload_sizes(&projection);
+        let newest = sizes
+            .iter()
+            .find(|(path, _)| path.as_deref() == Some("new.png"))
+            .expect("newest image present");
+        assert_eq!(
+            newest.1, 3_000,
+            "the newest image must also be downscaled to converge"
+        );
+        assert!(
+            projection.bytes_after <= limits.hard_limit,
+            "body {} must converge to {}",
+            projection.bytes_after,
+            limits.hard_limit
         );
     }
 }

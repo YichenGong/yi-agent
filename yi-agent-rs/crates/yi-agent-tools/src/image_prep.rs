@@ -80,7 +80,7 @@ fn media_type_for(format: image::ImageFormat) -> &'static str {
 }
 
 /// 在 `cap` 内等比缩放；不放大。返回 Cow 以便未缩放时零拷贝。
-fn resize_to_cap<'a>(
+pub(crate) fn resize_to_cap<'a>(
     decoded: &'a image::DynamicImage,
     cap: u32,
 ) -> std::borrow::Cow<'a, image::DynamicImage> {
@@ -120,7 +120,7 @@ fn lossless_encode(
 }
 
 /// 有损 JPEG 编码；alpha 由 `write_with_encoder` 自动丢弃。
-fn jpeg_encode(image: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, ToolsError> {
+pub(crate) fn jpeg_encode(image: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, ToolsError> {
     let mut buffer = Vec::new();
     image
         .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(

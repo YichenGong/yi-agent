@@ -138,6 +138,11 @@ pub struct AgentConfig {
     pub request_body_hard_limit: usize,
     /// 硬阈值降级时保留原始分辨率的最近图片张数（按不同 path 计）。默认 3。
     pub request_keep_full_images: usize,
+    /// 第 2 级降级用的图片缩放器。`None` = 无法缩放，直接退到占位（第 3 级）。
+    ///
+    /// 实现放在能依赖图像编解码库的 crate（`yi-agent-tools`）：`core` 不引
+    /// `image`，故此处只持有 trait 对象。
+    pub image_downscaler: Option<Arc<dyn crate::image_projection::ImageDownscaler>>,
     /// Whether thinking blocks from *previous* turns are replayed verbatim in
     /// each provider request (and kept on disk). Default `true` = today's
     /// behaviour, so the request body is byte-identical.
@@ -169,6 +174,7 @@ impl Default for AgentConfig {
             request_body_soft_limit: 2 * 1024 * 1024,
             request_body_hard_limit: 8 * 1024 * 1024,
             request_keep_full_images: 3,
+            image_downscaler: None,
             preserve_thinking: true,
         }
     }
@@ -494,6 +500,13 @@ pub enum AgentError {
     /// The turn stops instead of accumulating without bound (spec §5.3).
     #[error("side conversation budget exhausted: {0}")]
     Budget(#[from] crate::run_budget::BudgetExceeded),
+    /// 请求体降级到底后仍超过硬阈值。此时发出去必然被网关以 413 拒绝，
+    /// 与其让用户看到一个来自上游的晦涩错误，不如在本地说清楚原因和出路。
+    #[error(
+        "request body {bytes} bytes still exceeds the {limit}-byte limit after degrading \
+         history images; start a new conversation or compact this one"
+    )]
+    RequestTooLarge { bytes: usize, limit: usize },
 }
 
 impl Agent {
@@ -1170,13 +1183,14 @@ async fn think_phase(
     // token 触发，长会话里内联图片的 base64 能让两者相差三个数量级。这里只在
     // 请求副本上降级：`session` 与落盘的 `.jsonl` 逐字不变（桌面端按 path 读回
     // 原图渲染，故界面零影响）。
-    let projected = crate::image_projection::project(
+    let projected = crate::image_projection::project_with(
         &request_messages,
         &crate::image_projection::ProjectionLimits {
             soft_limit: config.request_body_soft_limit,
             hard_limit: config.request_body_hard_limit,
             keep_full_images: config.request_keep_full_images,
         },
+        config.image_downscaler.as_deref(),
     );
     if projected.step != crate::image_projection::ProjectionStep::AsIs {
         tracing::info!(
@@ -1184,18 +1198,31 @@ async fn think_phase(
             bytes_before = projected.bytes_before,
             bytes_after = projected.bytes_after,
             placeheld = projected.placeheld,
+            downscaled = projected.downscaled,
             turn,
             "request images projected to fit the body budget"
         );
         let _ = tx.try_send(AgentEvent::Notice {
             level: NoticeLevel::Info,
             text: format!(
-                "请求体 {} → {}（省略 {} 张历史图片）",
+                "请求体 {} → {}（省略 {} 张、缩放 {} 张历史图片）",
                 human_bytes(projected.bytes_before),
                 human_bytes(projected.bytes_after),
-                projected.placeheld
+                projected.placeheld,
+                projected.downscaled
             ),
         });
+    }
+    // 兜底（阶梯最后一级）：降级到底仍超硬阈值时**不发**，本地说明原因。
+    // 发出去只会换来网关的 413，错误信息还远离真正的成因。
+    if projected.bytes_after > config.request_body_hard_limit {
+        let _ = tx
+            .send(AgentEvent::Error(AgentError::RequestTooLarge {
+                bytes: projected.bytes_after,
+                limit: config.request_body_hard_limit,
+            }))
+            .await;
+        return ThinkOutcome::Stopped;
     }
     let req = ProviderRequest {
         model: config.model.clone(),
@@ -2900,6 +2927,65 @@ mod tests {
             body.len() <= 100_000,
             "request body {} must be projected under the 100000-byte hard limit",
             body.len()
+        );
+    }
+
+    /// 阶梯最后一级：降级到底仍超硬阈值时必须**本地报错且不发送**。
+    ///
+    /// 场景：图片没有 `path`（旧数据）→ 既不能去重也不能占位（占位等于永久
+    /// 丢失，模型无法重取）；又没有可用缩放器 → 无从降级。此时发出去只会
+    /// 换来网关的 413，错误信息还远离真正成因。
+    #[tokio::test]
+    async fn oversized_body_is_refused_locally_instead_of_hitting_the_gateway() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let config = AgentConfig {
+            request_body_soft_limit: 100_000,
+            request_body_hard_limit: 100_000,
+            request_keep_full_images: 0,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        // 无 path 的图片：不去重、不占位，因此降级无从下手。
+        session.replace_messages(vec![
+            Message::user("look"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "view_image".into(),
+                input: serde_json::json!({ "path": "a.png" }),
+            }]),
+            Message {
+                role: crate::message::Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: vec![
+                        ContentBlock::Text("viewed".into()),
+                        ContentBlock::Image {
+                            source: crate::message::ImageSource::Base64 {
+                                media_type: "image/png".into(),
+                                data: "A".repeat(3_000_000),
+                            },
+                            detail: Default::default(),
+                            path: None,
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+        ]);
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config)
+            .with_session(session);
+
+        let events = collect_events_async(agent.run("continue".into()).await.unwrap()).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::RequestTooLarge { .. }))),
+            "must report the oversized body locally, got {events:?}"
+        );
+        assert!(
+            provider.recorded_requests().is_empty(),
+            "an over-limit body must not be sent to the provider"
         );
     }
 
@@ -5564,6 +5650,7 @@ mod tests {
             request_body_soft_limit: 2 * 1024 * 1024,
             request_body_hard_limit: 8 * 1024 * 1024,
             request_keep_full_images: 3,
+            image_downscaler: None,
             preserve_thinking: true,
         };
         assert_eq!(config.model, "custom-model");

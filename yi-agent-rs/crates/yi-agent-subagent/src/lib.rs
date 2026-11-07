@@ -672,7 +672,8 @@ fn provider_retry_failure(error: &AgentError) -> Option<RetryFailure> {
         AgentError::Provider(ProviderError::Auth(_) | ProviderError::InvalidRequest(_))
         | AgentError::ProviderTurnAdmission(_)
         | AgentError::Compact(_)
-        | AgentError::Budget(_) => None,
+        | AgentError::Budget(_)
+        | AgentError::RequestTooLarge { .. } => None,
     }
 }
 

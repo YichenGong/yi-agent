@@ -14,6 +14,7 @@ mod shell;
 mod skill_tool;
 mod web;
 
+pub mod image_downscale;
 pub mod image_prep;
 pub mod side_read;
 pub mod worktree;

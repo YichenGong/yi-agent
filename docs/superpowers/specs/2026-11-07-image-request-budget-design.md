@@ -133,10 +133,20 @@ POST，超限只能等网关拒绝。`compact.rs:428` 在生成摘要时把图�
 |---|---|---|---|
 | 0 | 原样发送 | 无 | body ≤ 软阈值 |
 | 1 | 同 path 去重（旧的换 `[图片已省略: path]`） | **无** | body > 软阈值（2 MB） |
-| 2 | 超出「最近 3 张」的图缩到 1024 长边 | 0.31% | 仍 > 硬阈值（8 MB） |
-| 3 | 更旧的图换占位文字 | 只剩路径 | 仍 > 硬阈值 |
-| 4 | 触发压缩（`compact_session`） | 摘要化 | 仍 > 硬阈值 |
-| 5 | 明确报错，提示新建会话 | — | 压缩后仍超 |
+| 2 | 从最旧开始逐张缩到 1024 长边，每降一张检查是否收敛，收敛即停 | 0.31% | 仍 > 硬阈值（8 MB） |
+| 3 | 缩不动的图（无实现 / 解码失败 / 缩了不省字节）换占位 | 只剩路径 | 仍 > 硬阈值 |
+| 4 | 降级到底仍超限 → 本地报错，**不发送** | — | 仍 > 硬阈值 |
+
+**关键修正（实现期发现）**：最初设计的「保留最近 3 张原图」在第 2 级里是**硬保护**，
+这会让阶梯不收敛。用实测形状量化：每张图 3.91 MB base64、6 个不同 path、硬阈值 8 MB，
+去重后仍 23.5 MB；保住 3 张原图已 11.7 MB > 8 MB，而阶梯没有下一步 —— 请求照旧发出去，
+413 照旧发生。**「保留最近 N 张」必须是优先级而非绝对约束**：第一轮跳过它们，若缩小
+其余图片仍不收敛，第二轮连受保护的图一起降级。代价是极端形状下最新几张也会掉到
+1024 长边，但 0.31% 的像素差远好于 413 让整轮对话彻底卡死。
+
+原设计的「第 4 级触发 `compact_session`」被**移除**：`compact_session` 会永久替换
+会话历史（`compact.rs:449`，且不归档原文），用它来救一次请求体超限的代价过大，
+不该在「只是发送超限」这个层次上自动触发。压缩仍由既有的 token 阈值路径负责。
 
 ### 5.1 阈值
 
@@ -152,13 +162,15 @@ POST，超限只能等网关拒绝。`compact.rs:428` 在生成摘要时把图�
 
 ### 5.2 「最近 3 张」的判定
 
-按 `ContentBlock::Image.path` 从历史末尾向前数，前 3 个**不同 path** 保留
-原始分辨率；同一 path 的早期副本已在第 1 级被去重，故此处只剩唯一一份。
+按 `ContentBlock::Image.path` 从历史末尾向前数，前 3 个**不同 path** 记录为
+「受保护」；第一轮降级跳过它们。
 
-无 `path` 的图片（旧序列化数据、直接构造的测试数据）不参与去重，但参与
-「最近 3 张」计数，避免老数据被无声降级。
+同一 path 的早期副本已在第 1 级被去重，故此处只剩唯一一份。无 `path` 的图片
+（旧序列化数据、直接构造的测试数据）不参与去重，也**永不占位**——模型无法
+重取，丢掉等于永久丢失。这类图只能靠缩放降级；连缩放都不可用时，由第 4 级
+本地报错兜底。
 
-### 5.3 第 4 级为什么可行
+### 5.3 为什么可以把压缩排除在阶梯之外
 
 `compact.rs:428` 的 `format_messages_for_summary` 把图片统一写成
 `[图片]`，摘要请求是**纯文本单条消息**。实测该会话 172 条历史（69 MB 图片）
@@ -181,17 +193,29 @@ pub struct ProjectionLimits {
 
 pub enum ProjectionStep { AsIs, Deduped, Downscaled, Placeheld }
 
-pub struct ProjectionPlan {
-    pub steps: Vec<ProjectionStep>,   // 实际执行了哪几级，供日志/事件
-    pub dedup_targets: Vec<usize>,    // 要替换为占位符的 (msg, block) 下标
-    pub downscale_targets: Vec<usize>,
+pub struct Projection {
+    pub messages: Vec<Message>,   // 可直接序列化的降级副本
+    pub step: ProjectionStep,     // 实际走到第几级（取最重的一步），供日志/事件
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+    pub placeheld: usize,
+    pub downscaled: usize,
 }
 
-pub fn plan_projection(messages: &[Message], limits: &ProjectionLimits) -> ProjectionPlan;
+pub fn project(messages: &[Message], limits: &ProjectionLimits) -> Projection;
+pub fn project_with(
+    messages: &[Message],
+    limits: &ProjectionLimits,
+    downscaler: Option<&dyn ImageDownscaler>,
+) -> Projection;
 ```
 
-`plan_projection` 只做**判定**，不碰图像字节；字节大小的估算用 base64 长度
-（无损，无需解码）。
+**与初稿的差异**：初稿是 `plan_projection` 返回
+`dedup_targets` / `downscale_targets` 两个下标向量，由调用方执行。实现改为
+**就地改写副本并返回结果**，因为判定与执行要交替进行——每降一张图都得重新
+量字节才能知道要不要继续，先算完整计划再执行无法表达「收敛即停」。
+
+字节大小直接量 base64 长度（无损，无需解码）。
 
 ### 6.2 图像降级的注入点
 
@@ -206,13 +230,24 @@ pub trait ImageDownscaler: Send + Sync {
 }
 ```
 
-实现放 `yi-agent-tools::image_prep`（已有 `encode_within_budget` 全套阶梯，
-`image_prep.rs:134`），core 侧 `AgentConfig` 持有
+实现放 `yi-agent-tools::image_downscale::ImagePrepDownscaler`（复用
+`image_prep.rs` 已有的 `resize_to_cap` + `jpeg_encode`，两者为此上调为
+`pub(crate)`），core 侧 `AgentConfig` 持有
 `Option<Arc<dyn ImageDownscaler>>`；未注入时第 2 级自动退化为第 3 级。
 
-**缓存**：实现内部以 `(path, 原始 base64 长度, max_edge)` 为键记忆化。
-3 MB PNG 解码+缩放约 100~300 ms，25 张就是几秒；不缓存会让「按需缩图」
-变成每轮卡几秒，比 413 更糟。
+**唯一装配点**：`yi-agent-runtime::bootstrap::build_agent_config`
+（`bootstrap.rs:417`）。该函数是所有 `AgentConfig` 的集中构造处，在此注入
+`Some(Arc::new(ImagePrepDownscaler::new()))`，其余调用点走
+`..Default::default()` 不重复设置——避免各入口漂移。
+
+输出统一为 JPEG q80、长边 ≤1024。选 JPEG 而非 PNG：无损格式在
+「1700×2160 → 1024」这个尺度上仍需 ~1 MB，而有损只剩 50 KB 量级，对
+「让模型还能认出图里画的是哪个房间」足够（实测像素差 0.31%）。
+
+**缓存**：以 `(base64 长度, 前 64 字符哈希, max_edge)` 为键记忆化，`None`
+结果同样缓存。3 MB PNG 解码+缩放约 100~300 ms，25 张就是几秒；不缓存会让
+「按需缩图」变成每轮卡几秒，比 413 更糟。用前 64 字符哈希而非全量哈希，是为
+了避免对整段 base64 做一次 O(n) 计算。
 
 ### 6.3 与 `view_image` 的关系
 
@@ -253,41 +288,55 @@ think_phase
 
 TDD，先写失败测试。全部为纯逻辑测试，不需要真实网关。
 
-### 8.1 `image_projection` 单测
+### 8.1 `image_projection` 单测（12 个，全绿）
 
 1. `under_soft_limit_returns_as_is` —— 小历史零改动（**验证默认不缩**）
-2. `dedup_keeps_newest_copy_per_path` —— 9 份同 path 只留 1 份
-3. `dedup_is_lossless_no_downscale_when_soft_suffices` —— 去重后达标就不再缩
-4. `keeps_newest_three_images_at_full_resolution` —— 第 4 张起才缩
-5. `images_without_path_are_counted_but_not_deduped`
-6. `plan_matches_measured_failure` —— 用真实会话的 172 条形状（6 个 path、
-   25 块）构造，断言 69.3 MB → 8 MB 以下
+2. `dedup_keeps_newest_copy_per_path` —— 同 path 只留最新 1 份
+3. `dedup_is_lossless_when_soft_threshold_is_the_only_trigger` —— 去重达标即停，不缩
+4. `keeps_newest_three_images_at_full_resolution` —— 第一轮保住最近 3 张
+5. `images_without_path_are_counted_but_never_placeheld` —— 无 path 永不被替换
+6. `projection_never_mutates_the_source_messages` —— 入参不被修改
+7. `plan_matches_measured_failure_shape` —— 复刻真实失败轮（6 个 path、25 块、
+   69.3 MB），断言压到 8 MB 以下
+8. `downscales_instead_of_placeholder_when_an_implementation_is_injected`
+9. `downscaler_absent_falls_back_to_placeholder`
+10. `unsupported_downscaler_falls_back_to_placeholder`
+11. `newest_images_keep_full_resolution_while_it_suffices` —— 只需降旧图即可收敛时，
+    最新图逐字保留
+12. `protection_yields_when_downscaling_the_rest_does_not_converge` ——
+    **不收敛时保护让位**（这条守的是阶梯必然收敛）
 
 ### 8.2 集成测试（core，mock provider）
 
-7. `request_body_stays_under_hard_limit_with_many_images` —— 驱动
-   `run_loop`，捕获 `ProviderRequest`，断言序列化后 < 硬阈值
-8. `session_history_is_not_mutated_by_projection` —— 投影后
-   `session.messages()` 与投影前逐字相等（**归档保真**）
-9. `notice_is_emitted_when_images_are_degraded` —— 降级必须可见
-10. `downscaler_absent_falls_back_to_placeholder` —— 未注入实现时退到第 3 级
+13. `request_body_stays_under_hard_limit_with_many_images` —— 驱动 `run`，
+    捕获 `ProviderRequest`，断言序列化后 ≤ 硬阈值
+14. `session_history_is_not_mutated_by_projection` —— 投影后
+    `session.messages()` 的**既有前缀**逐字不变（运行会正常追加本轮消息），
+    且三张图的 payload 长度仍是原始值（**归档保真**）
+15. `oversized_body_is_refused_locally_instead_of_hitting_the_gateway` ——
+    降级到底仍超限时本地报 `AgentError::RequestTooLarge`，且
+    `recorded_requests()` 为空（**没有发出去**）
 
-### 8.3 tools 侧
+### 8.3 tools 侧（4 个，全绿）
 
-11. `downscale_cache_returns_same_bytes_for_repeated_calls` —— 记忆化生效
-12. `downscale_1024_keeps_labels_readable` —— 用真图缩放后断言体积在预算内
-    （可读性属人工验收，见 §9）
+16. `downscales_a_large_image_within_the_edge_cap` —— 3000×3000 → 长边 ≤1024，
+    且输出更小
+17. `repeated_calls_hit_the_cache` —— 记忆化生效，缓存只 1 条
+18. `a_small_image_is_not_worth_downscaling` —— 小图重编码会变大，返回 `None`
+19. `invalid_base64_is_reported_as_unsupported`
 
 ## 9. 未决与风险
 
-1. **网关真实字节上限未知。** 只知 69 MB 被拒、2 MB 以下从未被拒。因此第 3
-   级剥图是**唯一确定的硬兜底**，不能省。实施后应从 trace 的
-   `body_bytes_before` 分布反推真实上限，再回调阈值。
-2. **保留最近 3 张是经验值。** 未做实验验证「3」是否够。风险是当前任务需要
-   同时对照 4 张以上图时，第 4 张起细节变弱。可调，先按 3 实施。
-3. **压缩可能仍不够。** 压缩保留最近 12000 token 的完整工具记录，图片按
-   1844 token/张计约保留 6 张——若这 6 张都是 4 MB 原图仍有 24 MB。故第
-   2/3 级必须在压缩**之前**生效，顺序不能颠倒。
+1. **网关真实字节上限未知。** 只知 69 MB 被拒、2 MB 以下从未被拒。因此硬阈值
+   取保守的 8 MB，且第 4 级「本地报错」是唯一确定的兜底。实施后应从 trace 的
+   `bytes_before` 分布反推真实上限，再回调阈值。
+2. **保留最近 3 张是经验值，且是可让位的优先级。** 未做实验验证「3」是否够。
+   在不收敛的形状下最新几张也会被缩到 1024——这是刻意取舍：0.31% 像素差
+   vs 413 让整轮对话卡死。
+3. **缩放器未注入时的行为。** `AgentConfig::image_downscaler` 默认 `None`，
+   此时第 2 级不可用，只能靠占位（会丢图）。生产路径已在
+   `build_agent_config` 注入，但直接构造 `AgentConfig::default()` 的代码
+   （测试、side conversation）没有缩放能力——这符合预期，测试不需要真缩图。
 
 ## 10. 旧会话的处理决策
 
@@ -310,9 +359,20 @@ resume 时仍要全量读取。写一次迁移虽能压小文件，但收益不�
 
 ```bash
 cd yi-agent-rs
-cargo test -p yi-agent-core image_projection
-cargo test -p yi-agent-core --lib
-cargo test -p yi-agent-tools image_prep
+cargo test -p yi-agent-core --lib image_projection      # 12 个单测
+cargo test -p yi-agent-core --lib                       # 388 passed
+cargo test -p yi-agent-tools --lib image_downscale       # 4 个
 cargo fmt --all -- --check
 just ci
 ```
+
+已实测通过（2026-11-07）：core 388 passed / 0 failed，tools 4 passed / 0 failed，
+`cargo clippy -p yi-agent-core -p yi-agent-tools -p yi-agent-runtime --all-targets`
+零警告。
+
+验收判据（人工）：
+
+1. 在「根据户型图在 Blender 复刻 A 反户型平面」这类会话里继续多轮 view_image，
+   不再出现 413；状态栏出现 `请求体 X → Y（省略 N 张、缩放 M 张历史图片）`。
+2. 桌面端聊天里的历史图片仍正常显示（按 `path` 读回原图，不受降级影响）。
+3. 落盘 `.jsonl` 里的图片 base64 仍是原始大小（`wc -c` 对比降级前后不变）。
