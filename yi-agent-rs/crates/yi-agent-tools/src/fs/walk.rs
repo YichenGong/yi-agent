@@ -257,20 +257,61 @@ mod tests {
 
     #[test]
     fn does_not_read_the_global_gitignore() {
-        // git_global(false)：用户 ~/.config/git/ignore 里的规则不得改写结果。
-        // 本机那里有 `**/.claude/settings.local.json`，这里用一个同名路径
-        // 断言它仍然出现。
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        fs::write(tmp.path().join(".claude/settings.local.json"), "{}").unwrap();
+        // git_global(false)：用户全局 git 配置里的 excludes 不得改写结果。
+        //
+        // 本用例自带一份全局配置，不依赖本机 `~/.config/git/ignore` 的内容：
+        // `GIT_CONFIG_GLOBAL` 指向临时 gitconfig，其 `core.excludesFile` 指向
+        // 一份会隐藏下面那个文件的 ignore 文件。`ignore` 在同一次 walk 里现读
+        // 该变量（无缓存），所以这份配置就是本次 walk 看到的「用户全局规则」。
+        // 谁把 `git_global` 改成 `true`，walk 就会吞掉该文件，断言随即失败——
+        // 在任何机器上都一样，包括没有那条全局规则的 CI runner。
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join(".claude")).unwrap();
+        fs::write(root.path().join(".claude/settings.local.json"), "{}").unwrap();
 
-        let files = rel(&walk(tmp.path(), FILES));
+        // 配置放在 walk root 之外，免得它自己进结果集。
+        //
+        // 规则刻意用不带 `/` 的裸文件名：`ignore` 把全局 gitignore 的根设在
+        // **进程 CWD**（`GlobalGitignore::build_with_cwd` 传的是
+        // `current_dir()`），带 `/` 的规则会锚定到 CWD 下面，而 walk root 是
+        // 一个与 CWD 无关的临时目录，锚定规则永远匹配不上——那样断言就又变成
+        // 空转。裸文件名按 git 的语义匹配任意层级，故与 walk root 位置无关。
+        let config = TempDir::new().unwrap();
+        let excludes = config.path().join("global-ignore");
+        fs::write(&excludes, "settings.local.json\n").unwrap();
+        let gitconfig = config.path().join("gitconfig");
+        fs::write(
+            &gitconfig,
+            format!("[core]\n\texcludesFile = \"{}\"\n", excludes.display()),
+        )
+        .unwrap();
+
+        // 只在这个块里 `GIT_CONFIG_GLOBAL` 生效；guard 在块尾恢复原值，所以
+        // 即使断言失败也不会把变量泄漏给其它测试。
+        let files = {
+            struct Restore(Option<std::ffi::OsString>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    // SAFETY: 本用例独占该变量，drop 时立刻恢复原值。
+                    match self.0.take() {
+                        Some(v) => unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", v) },
+                        None => unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") },
+                    }
+                }
+            }
+            // SAFETY: 同上——先存旧值再改，由 guard 负责恢复。
+            let _restore = Restore(std::env::var_os("GIT_CONFIG_GLOBAL"));
+            unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
+            rel(&walk(root.path(), FILES))
+        };
 
         assert!(
             files
                 .iter()
                 .any(|p| p.ends_with(".claude/settings.local.json")),
-            "global gitignore must not apply, got {files:?}"
+            "git_global(false) must ignore the user's global gitconfig excludes; \
+             if this fails, the walker is honouring the global excludes. \
+             got {files:?}"
         );
     }
 
