@@ -307,6 +307,52 @@ kill <pid>
   `--jobs 2` 降低并行度。本机 128G 内存实测 4 个并发 crate 测试压力可忽略,但
   低配机器/CI 上全量跑仍要留余量。
 
+## 分级测试入口(L0/L1/L2)
+
+> **本节与下面的「真实 LLM 测试 Tier 0-3」是两套不同维度,别混。**
+> 本节按**改动范围**选测试深度,只跑 mock;下面的 Tier 按**是否需要真实 LLM** 分。
+
+### 用法
+
+| 场景 | 命令 |
+|---|---|
+| 改完想看能不能编过 | `just check-fast` |
+| 只改了一个 crate | `just test-crate <crate>` |
+| 改了几处,想知道牵动谁 | `just test-affected [ref]` |
+| 收尾 / 合并前 | `just test` |
+
+- `just test-affected` 默认对比 `$(git merge-base main HEAD)`,**含未提交改动**;
+  传 ref 则对比该 ref,例如 `just test-affected origin/main`。
+- 只想跑单个测试: `cargo nextest run --all-features -p <crate> -E 'test(<name>)'`。
+- 映射不出来时退出码 1 并说明原因(纯 docs / 全非 crate 路径 / 空 diff),
+  不会静默跑 0 个测试。nextest 零匹配时 rc=4,原样透传并附说明。
+
+### 设计原则(改动这些命令前必读)
+
+- **分级的意义是「不同场景测不同的东西」,不是把全量测试加速。** L0-L2 各自省掉
+  不同成本,都不等价于 `just test`;合并前仍要跑全量。
+- **`--all-targets` 不能省(L0)。** 默认不检查 `tests/`,而本仓有 108 个集成测试
+  target。实测在 `crates/*/tests/` 放类型错误,不带该 flag 报 0 error(漏检)。
+- **`--all-features` 不能省(L1/L2)。** `yi-agent-store` 的
+  `foreground-test-support` feature 门控了测试辅助方法,漏掉直接 `error[E0599]`。
+- **L2 用 nextest 原生 `rdeps()`,不手工算闭包**,依赖图漂移交给 nextest。
+  闭包条数是验收依据: 改 `core` 得 12 个、`relay` 得 3 个、`flags` 得 8 个。
+- **L2 默认基准必须是 merge-base 的两点 diff**,不是三点 `main...HEAD`: 三点会漏
+  未提交改动,而「刚改完想跑相关测试」正是最常用场景;直接对 `main` 两点 diff 又会
+  混进别人在 main 上的提交。
+- **判据写错不会报错,只会少测。** 路径→crate 的映射是本设计的承重环节: 写宽了跑错
+  crate,写窄了静默少测。所以映射链上任何失败(cargo 缺失、`cargo metadata` 非零、
+  解析失败、workspace 报零成员)都必须显式 exit 非零,不能退化成「全部 unmapped」
+  后返回 0——那是最难发现的失败模式。
+- **判据自测: `just affected-check`**(29 条断言,已进 `just ci`)。改映射逻辑必须
+  同步改它;新增断言要做「回退修复后必须变红」的验证,否则断言可能空转。
+- **`just test` 前的并发预检只警告不阻断。** 跨会话并发是假红的真因,在 nextest
+  配置层修不掉(`spawn-heavy` 的 `max-threads` 只约束单次运行内的并发),所以让它
+  在发生时可见。看到 WARN 且失败是超时类时,**先独占复跑再判断**,别急着改代码。
+
+实现: `yi-agent-rs/scripts/test-tiers.sh`(映射与子命令)+ `test_test_tiers.sh`(自测)。
+设计与实测依据: `docs/superpowers/specs/2026-11-07-graded-test-tiers-design.md`
+
 ## 真实 LLM 测试
 
 - 默认 `cargo test` / `just test` / `just ci` 只跑 mock 测试(wiremock 模拟),
