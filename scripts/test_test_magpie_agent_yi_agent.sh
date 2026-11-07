@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Self-test for scripts/test-magpie-agent.sh: pins down the paths where the
+# Self-test for scripts/test-magpie-agent-yi-agent.sh: pins down the paths where the
 # check itself must fail, above all "no Node" having to exit 2 (an
 # infrastructure failure) rather than pass green.
 #
 # Run it with bash, by absolute path if you like — it does not depend on
 # being found through PATH:
 #
-#   bash scripts/test_test_magpie_agent.sh
+#   bash scripts/test_test_magpie_agent_yi_agent.sh
 #
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$HERE/test-magpie-agent.sh"
+SCRIPT="$HERE/test-magpie-agent-yi-agent.sh"
 [ -x "$SCRIPT" ] || { echo "FAIL: $SCRIPT not executable"; exit 1; }
 
 pass=0

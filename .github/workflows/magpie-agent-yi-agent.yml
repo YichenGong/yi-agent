@@ -4,23 +4,23 @@ name: Magpie Agent Plugin
 # npm 发布。与 Rust 侧 `just ci` 分开——GitLab MR 的 `rust:latest` 镜像没有 Node，
 # 这个检查必须跑在有 Node 的环境里。
 #
-# 触发条件（都只认 `integrations/magpie/**` 有变化）：
+# 触发条件（都只认 `integrations/magpie-agent-yi-agent/**` 有变化）：
 #   - PR → 跑 CI
 #   - push 到 main → 跑 CI，然后按版本 gating 发布 npm
 #
 # 版本与 Yi Agent 主包 `@yi-agent/yi-agent` 完全独立：改
-# `integrations/magpie/package.json` 的 version 再合到 main 即发布（与 Magpie
+# `integrations/magpie-agent-yi-agent/package.json` 的 version 再合到 main 即发布（与 Magpie
 # 社区插件「推版本 bump 到 main 即发布」的约定一致）；已发布的版本自动跳过，
 # 所以「没改版本号就合入」不会重复发布。
 on:
   pull_request:
     branches: [main]
     paths:
-      - "integrations/magpie/**"
+      - "integrations/magpie-agent-yi-agent/**"
   push:
     branches: [main]
     paths:
-      - "integrations/magpie/**"
+      - "integrations/magpie-agent-yi-agent/**"
 
 jobs:
   ci:
@@ -34,7 +34,7 @@ jobs:
           node-version: "20"
 
       - name: Test the Magpie agent plugin
-        run: bash scripts/test-magpie-agent.sh
+        run: bash scripts/test-magpie-agent-yi-agent.sh
 
   npm-publish:
     if: github.event_name == 'push'
@@ -49,12 +49,12 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish @yi-agent/magpie-agent (version gated)
-        working-directory: integrations/magpie
+      - name: Publish @yi-agent/magpie-agent-yi-agent (version gated)
+        working-directory: integrations/magpie-agent-yi-agent
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PKG="@yi-agent/magpie-agent@$(node -p "require('./package.json').version")"
+          PKG="@yi-agent/magpie-agent-yi-agent@$(node -p "require('./package.json').version")"
           if npm view "$PKG" >/dev/null 2>&1; then
             echo "→ $PKG already published, skipping"
           else
