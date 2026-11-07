@@ -271,8 +271,22 @@ impl SideConversationRunner {
                 "旁支没有可用的继承模型",
             ));
         }
+        // The hidden boundary is appended **here**, once, on the copy that only
+        // this side owns. Doing it on the parent's handle or again on every turn
+        // would either leak side-only text into the parent or stack the marker.
+        //
+        // Reusing `snapshot_for_side` keeps trimming and marker insertion in the
+        // one place core defines them, instead of open-coding the same rule in the
+        // runner and letting the two drift.
+        let side_snapshot = yi_agent_core::snapshot_for_side(&Session::from_messages(snapshot))
+            .map_err(|_| {
+                SideError::new(
+                    SideErrorReason::ParentNotStarted,
+                    "父会话还没有可继承的历史",
+                )
+            })?;
         let mut session = Session::new();
-        for message in snapshot {
+        for message in side_snapshot.messages {
             session.push(message);
         }
         let generation = source.generation;
@@ -335,6 +349,20 @@ impl SideConversationRunner {
 
     pub fn access(&self) -> &Arc<SideReadAccess> {
         &self.resources.access
+    }
+
+    /// A copy of the side's own history, marker included.
+    ///
+    /// Exists so a test can assert on what the model actually receives (the
+    /// inherited prefix **and** the hidden boundary) instead of on the source it
+    /// was built from: the whole failure this guards against was a runner that
+    /// looked correct but never appended the marker.
+    pub fn session_snapshot(&self) -> Vec<yi_agent_core::Message> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages()
+            .to_vec()
     }
 
     /// Accept one turn and hand back its event stream.

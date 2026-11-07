@@ -42,6 +42,7 @@ import {
 
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
+import { SideBackBar } from "./components/SideBackBar";
 import { TranscriptPlaceholder } from "./components/TranscriptPlaceholder";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { CacheNotice } from "./components/CacheNotice";
@@ -2871,9 +2872,25 @@ export default function App() {
       parentId: a?.parentId ?? sess.currentId,
     };
   })();
+
   /** 当前正在显示的旁支视图；主会话与失效目标都是 `null`。 */
   const activeSide: SideView | null =
     conversation.kind === "side" ? conversation.view : null;
+
+  /**
+   * 旁支所属父会话的标题，只用于返回条的副标题。
+   *
+   * 从侧栏那份列表里取，与 `modeForThread` 同一口径（置顶与分组两个来源都扫）：
+   * 列表还没到时为 `null`，返回条就只显示「返回主会话」，不编一个假标题。
+   */
+  const sideParentTitle: string | null = (() => {
+    if (activeSide === null) return null;
+    const parentId = activeSide.parentId;
+    const summary =
+      sess.pinned.find((th) => th.thread_id === parentId) ??
+      sess.groups.flatMap((g) => g.threads).find((th) => th.thread_id === parentId);
+    return summary?.title ?? null;
+  })();
 
   // 用「长度 + id 序列」识别旁支正文的结构变化（纯文本追加不算）：与父
   // `Session` 的 `structuralVersion` 同一判据，避免流式每个 delta 都重建前缀。
@@ -3257,6 +3274,21 @@ export default function App() {
                 `flex-1` 的转录列，输入区仍在它下面可用。
               */}
                 <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                  {/*
+                   旁支的返回出口。此前只有 `/back` 一条路，而提示只写在
+                   placeholder 与状态栏里——placeholder 一被打字遮住，GUI 上就
+                   等于没有出口（用户报的「没有返回按钮」）。
+
+                   放在转录区**之上**而不是给它自己的整行：返回条与消息列共享
+                   同一条垂直流，标题栏不让会话内容整体下移一个系统栏的高度。
+                   返回是纯本地动作，不停旁支也不发 RPC（spec §1 第 7 条）。
+                  */}
+                  {conversation.kind === "side" && (
+                    <SideBackBar
+                      parentTitle={sideParentTitle}
+                      onBack={() => sideConversationRef.current.back()}
+                    />
+                  )}
                   <ErrorBoundary
                     // 切会话必须清掉错误位，否则切到好会话仍是错误页。
                     // 用 resetKey 而不是 key：key 会连 ChatView 一起重挂，

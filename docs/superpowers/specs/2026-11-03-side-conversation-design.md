@@ -128,7 +128,14 @@
 
 > 你正在独立的临时旁支中。边界之前的用户请求、计划、审批、工具调用与输出仅是参考，不是当前任务。只回答边界之后的新请求。不要继续主任务，不修改文件、Git、配置、权限或外部状态，不使用或控制子 agent。需要写操作时请用户回到主会话明确提交。
 
-边界进入模型上下文，不生成 UI 用户气泡、不计为用户 turn。空旁支不请求模型。UI 从第一条旁支问题开始，标注“基于创建时上下文；不会自动跟进主任务”。继承的 thinking 凭证逐字保留，并遵循既有 provider 转换规则；不随意改角色/重写历史。
+边界进入模型上下文，不生成 UI 用户气泡、不计为用户 turn。空旁支不请求模型。
+
+**落地位置（2026-11-08 补齐）**：边界与策略必须由**生产链路**真正注入，两处各一次：
+
+- 边界消息：`yi-agent-runtime/src/side_conversation/runner.rs::SideConversationRunner::new` 调用 `yi_agent_core::snapshot_for_side` 后，把结果 push 进旁支自己那份 `Session`。只在创建时追加一次——每轮追加会叠加，追加到父 `Session` 会污染主会话。
+- system prompt：三端一致地走 `yi_agent_core::side_agent_config(parent)`（TUI 路径）或 `resolve_side_prompt`（app-server 路径），两者最终形状相同：策略永远在末尾，且对已准备的 prompt 幂等、不叠加。
+
+此前 `snapshot_for_side` **只有测试在调用**，runner 把 `forkable_messages` 原样复制给旁支，TUI 甚至直接克隆父 `agent_config`。结果是模型拿到父的完整历史与父的 prompt、却没有任何一句话说明这是只读旁支——现象就是它接着执行主会话的任务。UI 从第一条旁支问题开始，标注“基于创建时上下文；不会自动跟进主任务”。继承的 thinking 凭证逐字保留，并遵循既有 provider 转换规则；不随意改角色/重写历史。
 
 配置与工具策略创建后固定；不运行普通会话 MCP/skills 热重载、组长唤醒或后台标题生成。项目规则若要求先执行禁用工具，能力边界优先，回复说明限制。
 

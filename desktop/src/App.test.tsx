@@ -7037,6 +7037,11 @@ describe("App 旁支视图", () => {
    *
    * 放在这里反复调用，是因为它比任何功能断言都更容易在后续改动里被悄悄破坏：
    * 有人想「给旁支加个头」时，这几条会立刻红。
+   *
+   * 例外是旁支视图里的**返回条**（`SideBackBar`）：它是用户在 GUI 上离开旁支
+   * 的唯一出口，用户明确要求保留（2026-11-05 规格 §4.1 的「不另造标题栏」在此
+   * 被覆盖，只覆盖返回这一个动作）。所以这里**不**断言它不存在，只断言那些
+   * 已经被删掉的入口不要回来。
    */
   function expectNoSideChrome() {
     expect(screen.queryByTestId("side-header")).toBeNull();
@@ -7044,7 +7049,6 @@ describe("App 旁支视图", () => {
     expect(screen.queryByRole("button", { name: "旁问" })).toBeNull();
     expect(screen.queryByRole("button", { name: "继续旁问" })).toBeNull();
     expect(screen.queryByRole("button", { name: "查看旁问" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
     expect(screen.queryByRole("button", { name: "停止旁问" })).toBeNull();
     expect(screen.queryByRole("button", { name: "关闭旁问" })).toBeNull();
   }
@@ -7137,7 +7141,12 @@ describe("App 旁支视图", () => {
 
     // 用**侧栏**切回父会话（而不是再敲一次 `/back`——那会把命令文本打进同一个
     // 输入框、覆盖掉正在测的那份草稿）。
-    fireEvent.click(screen.getByText("one"));
+    //
+    // 限定在侧栏内：旁支的返回条也会显示父会话标题，全局 `getByText` 会同时
+    // 命中"侧栏里的会话行"和"返回条上的副标题"两处，那是同一件事的两个控件，
+    // 不是重复渲染。
+    const sidebar = document.querySelector("aside") as HTMLElement;
+    fireEvent.click(within(sidebar).getByText("one"));
     await waitFor(() => expect(box().value).toBe(""));
     fireEvent.change(box(), { target: { value: "parent draft" } });
     expect(box().value).toBe("parent draft");
@@ -7233,6 +7242,44 @@ describe("App 旁支视图", () => {
     expect(methods()).not.toContain("side/turnInterrupt");
     expect(methods()).not.toContain("side/close");
     expect(methods()).not.toContain("turn/interrupt");
+  });
+
+  /**
+   * 用户报的「旁支里没有返回按钮」：`/back` 之外必须有可点的出口。
+   *
+   * 这条读的是真实按钮而不是命令文本，所以它同时证明三件事：按钮存在、
+   * 点它回到主会话、以及**没**顺手停掉仍在回答的旁支（返回 ≠ 关闭）。
+   */
+  it("gets back to the parent from the visible back button", async () => {
+    await readyWithSide({ sideSummaries: [runningSummary("side-turn-1")] });
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    reset();
+
+    // 按钮在旁支视图里可见；主视图不应该有它（它不是常驻入口）。
+    const back = screen.getByRole("button", { name: "返回主会话" });
+    fireEvent.click(back);
+
+    await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
+    expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
+    // 纯本地动作：不打断正在回答的那一轮，也不关闭旁支。
+    expect(methods()).not.toContain("side/turnInterrupt");
+    expect(methods()).not.toContain("side/close");
+    expect(methods()).not.toContain("turn/interrupt");
+  });
+
+  /**
+   * 主视图里没有这条返回条：它只表达"从旁支回来"，在主会话里出现会暗示
+   * 「上面还有一层」，而实际上没有。
+   */
+  it("shows no back bar in the main view", async () => {
+    await readyWithSide();
+    await command("/side");
+    await waitFor(() => expect(screen.getByText(/^\/side · /)).toBeTruthy());
+    await command("/back");
+    await waitFor(() => expect(screen.queryByText(/^\/side · /)).toBeNull());
+
+    expect(screen.queryByRole("button", { name: "返回主会话" })).toBeNull();
   });
 
   it("stops only the side's own turn", async () => {

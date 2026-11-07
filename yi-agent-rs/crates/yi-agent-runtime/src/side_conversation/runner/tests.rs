@@ -533,3 +533,43 @@ impl yi_agent_core::Provider for UsageProvider {
         ])))
     }
 }
+
+/// 旁支的模型必须**知道**自己在旁支里。
+///
+/// 这条测的是真实装配出来的 Session，而不是 `side_context` 自己的单元测试：
+/// 那个模块的测试证明 `snapshot_for_side` 会追加边界，却证明不了 runner 真的
+/// 调用了它。此前 runner 只是把 `forkable_messages` 原样 push 进新 Session，
+/// 于是模型拿到父的完整历史 + 父的 system prompt、**没有任何一句话**说明这是
+/// 一条只读旁支——现象就是它接着干主会话的活。
+#[tokio::test]
+async fn side_runner_injects_the_hidden_boundary_once() {
+    let fixture = Fixture::new();
+    let (source, _provider) = source_with_pending_provider();
+    let runner = fixture.runner(source).await;
+
+    let messages = runner.session_snapshot();
+    let boundary_count = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|block| {
+            matches!(block, ContentBlock::Text(text)
+                if text == yi_agent_core::SIDE_BOUNDARY)
+        })
+        .count();
+    assert_eq!(
+        boundary_count, 1,
+        "exactly one boundary: appending it per turn would stack, and skipping it \
+         leaves the model with no idea it is a side conversation"
+    );
+    // 边界必须是**最后一条**：它之后的消息才是当前任务。
+    assert_eq!(
+        messages.last().unwrap().content,
+        vec![ContentBlock::Text(yi_agent_core::SIDE_BOUNDARY.to_string())],
+        "the inherited history must end on the boundary marker"
+    );
+    // 继承的父历史仍在边界之前，没有被裁剪掉。
+    assert!(
+        messages.len() > 1,
+        "the parent's safe history must be inherited, not replaced by the marker"
+    );
+}

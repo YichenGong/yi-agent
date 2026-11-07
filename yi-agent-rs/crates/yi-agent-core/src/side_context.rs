@@ -4,7 +4,7 @@
 //! hidden boundary message that marks everything before it as reference only.
 //! The snapshot is pure in-memory data: no tools, no RPC, no disk.
 
-use crate::agent::{Session, forkable_messages};
+use crate::agent::{AgentConfig, Session, forkable_messages};
 use crate::message::{ContentBlock, Message, Role};
 
 /// Hidden boundary marker appended after the inherited history (spec §5.2).
@@ -33,6 +33,32 @@ fn prompt_with_policy(parent: &str) -> String {
         return SIDE_SYSTEM_POLICY.to_owned();
     }
     format!("{parent}\n\n{SIDE_SYSTEM_POLICY}")
+}
+
+/// Derive the side's config from a **parent `AgentConfig` that is already
+/// assembled** (the TUI path, where the parent prompt and skills catalog have
+/// been resolved by the main assembly).
+///
+/// The app-server path resolves its own prompt through
+/// `resolve_side_prompt`, which already appends the policy; this helper exists
+/// for hosts that hold a finished `AgentConfig` and would otherwise run the side
+/// with the parent's prompt **verbatim** — that is, with no statement at all that
+/// this conversation is a read-only side branch. Without it the model reads the
+/// inherited transcript as its own pending work and continues the main task,
+/// which is precisely the failure the hidden boundary alone does not prevent
+/// (a prompt that says "keep going" beats a transcript marker).
+///
+/// Appending is skipped when the prompt already ends with the policy, so calling
+/// this on a config that went through `resolve_side_prompt` cannot stack it.
+pub fn side_agent_config(parent: &AgentConfig) -> AgentConfig {
+    let mut config = parent.clone();
+    match config.system_prompt.as_deref() {
+        Some(existing) if existing.ends_with(SIDE_SYSTEM_POLICY) => {}
+        other => {
+            config.system_prompt = Some(prompt_with_policy(other.unwrap_or_default()));
+        }
+    }
+    config
 }
 
 /// Safe, provider-valid copy of the parent history for a side conversation.
@@ -273,6 +299,67 @@ mod tests {
             prompt.len() > parent.len(),
             "policy must be appended, not replace the parent"
         );
+    }
+
+    /// A host that holds a finished parent `AgentConfig` must not run the side
+    /// with that prompt verbatim: it says "you own this task", and the model then
+    /// continues the main session's work.
+    #[test]
+    fn side_agent_config_appends_the_policy_to_a_finished_parent_config() {
+        let parent = AgentConfig {
+            model: "parent-model".into(),
+            system_prompt: Some("你是主会话的助手，负责推进当前任务。".into()),
+            ..Default::default()
+        };
+
+        let side = side_agent_config(&parent);
+
+        let prompt = side.system_prompt.as_deref().unwrap();
+        assert!(
+            prompt.starts_with("你是主会话的助手，负责推进当前任务。"),
+            "the parent prompt must be preserved verbatim, got: {prompt}"
+        );
+        assert!(
+            prompt.ends_with(SIDE_SYSTEM_POLICY),
+            "the read-only policy must be the tail so nothing can displace it"
+        );
+        // Everything else is inherited untouched.
+        assert_eq!(side.model, parent.model);
+        assert_eq!(side.compact_threshold, parent.compact_threshold);
+        // The parent value is not mutated: a side must never reach into the
+        // config the main session keeps running on.
+        assert_eq!(
+            parent.system_prompt.as_deref(),
+            Some("你是主会话的助手，负责推进当前任务。")
+        );
+    }
+
+    /// Calling it on an already-prepared side prompt must not stack the policy.
+    #[test]
+    fn side_agent_config_does_not_stack_the_policy() {
+        let once = AgentConfig {
+            system_prompt: Some(side_system_prompt(Some("parent rules"))),
+            ..Default::default()
+        };
+
+        let twice = side_agent_config(&once);
+
+        assert_eq!(
+            twice.system_prompt, once.system_prompt,
+            "an already-prepared prompt must be left exactly as it is"
+        );
+    }
+
+    #[test]
+    fn side_agent_config_works_without_a_parent_prompt() {
+        let parent = AgentConfig {
+            system_prompt: None,
+            ..Default::default()
+        };
+
+        let side = side_agent_config(&parent);
+
+        assert_eq!(side.system_prompt.as_deref(), Some(SIDE_SYSTEM_POLICY));
     }
 
     #[test]
