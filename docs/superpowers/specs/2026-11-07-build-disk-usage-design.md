@@ -295,7 +295,18 @@ $ find $T/debug/deps -name '*.rcgu.o' -delete && cargo build -p yi-agent-tools
 ### 5.1 已定位：nextest 挂起不是 nextest 的 bug
 
 实验期间多次遇到 `cargo nextest ... --workspace` 挂住几十分钟。已彻底定位，
-**与 `--cargo-profile` 无关**（前一版 spec 归因错误，见下）。
+**与 profile 无关**。前一版把原因写成「自定义 `--cargo-profile ci` 导致挂起」，
+这是双重误解，一并纠正：
+
+- `[profile.ci]` 在 `yi-agent-rs/Cargo.toml` 里**根本不存在**（那里只有
+  `[profile.dev]`）。实测 `cargo build --cargo-profile ci` 直接报
+  `unexpected argument '--cargo-profile'` —— 这个选项是 **nextest 的**，
+  不会传给 cargo。
+- `just test` 里的 `--profile ci` 是 nextest 自己的 profile，定义在
+  `.config/nextest.toml`（`inherits = "default"`），只影响 runner 行为
+  （junit、retries、test-group），与 cargo 的编译 profile 是两回事。
+
+所以那次实验实际用的就是 `dev` profile，挂起与 profile 选择毫无关系。
 
 **现象**：30+ 个子进程 `<test-binary> --list --format terse` 卡住不动。
 
@@ -340,6 +351,9 @@ cargo   98826 ...   ← 本会话
 - **判定方法**：`ps ax | grep 'deps/.*--list'` + `vmmap --summary` 看是否
   `launched-suspended`；`lsof target/debug/.cargo-build-lock` 看谁持锁。
 - **不要**把它当成 nextest 或 profile 的问题，也不要为此改 `nextest.toml`。
+- `just test` 的 `--profile ci` 是 nextest runner profile（`.config/nextest.toml`），
+  cargo 编译 profile 只有 `[profile.dev]` 一个，改它就会同时影响 `just build`、
+  `just test`、`just lint` 三者。
 - 本 spec 的所有改动都不依赖"并发跑全量 nextest"，不受影响。
 
 ## 6. 未做的事（明确取舍）
@@ -443,7 +457,7 @@ yi_agent_tools-bbce49c9b91c28aa : OSO -> deps/ = 1213, OSO -> incremental/ = 0
 | 「删 `.o` 完全安全」 | 对**编译**安全（零重编），但 `unpacked` 下 `.o` 就是 DWARF：删除后 lldb 行断点从 3 locations 变 no locations |
 | 「`off` + `debug = "full"` 能保留调试」 | `off` 在 macOS 上直接丢弃 DWARF，`debug` 级别改不动它 |
 | 「清理只做 deps 就够了」 | 已链接产物只引用 `deps/.o`，但 `incremental/` 陈旧会话才是更大的可回收块（18.70 GiB 真实） |
-| 「nextest 在自定义 profile 下会挂起」 | 与 profile 无关。是多会话共用 `target/` 导致 `.cargo-build-lock` 争抢，nextest 卡在读 cargo stdout。栈已逐层确认（§5.1） |
+| 「nextest 在自定义 profile 下会挂起」 | 与 profile 无关。`[profile.ci]` 根本不存在（`--cargo-profile` 是 nextest 的选项，不传给 cargo）；真因是多会话共用 `target/` 导致 `.cargo-build-lock` 争抢，nextest 卡在读 cargo stdout。栈已逐层确认（§5.1） |
 
 ## 9. 决策记录
 
