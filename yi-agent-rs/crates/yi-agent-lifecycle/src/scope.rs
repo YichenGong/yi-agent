@@ -20,7 +20,14 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::types::RuntimeScope;
+
+/// The longest socket path `sockaddr_un.sun_path` accepts, excluding the
+/// terminating NUL. Linux allows 108; macOS and the BSDs allow 104. Taking the
+/// smaller bound keeps one behaviour across platforms.
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Resolve `runtime` and `project` into the scope they identify.
 ///
@@ -165,9 +172,86 @@ pub fn runtime_directory(project: &Path) -> PathBuf {
 }
 
 /// The guardian's control socket inside a runtime directory.
+///
+/// This is the **only** place the path is computed. Every component — the guardian
+/// that binds it, the frontends that lease from it, the desktop shell that reads
+/// status through it — must resolve it here, because a disagreement means one side
+/// listens where nobody connects.
+///
+/// The raw join is not always bindable: `sockaddr_un.sun_path` is capped (104 bytes
+/// on macOS/BSD, 108 on Linux) while the default runtime directory is
+/// `<workdir>/.yi-agent/runtime`, so a checkout deeper than about 85 bytes produces
+/// a path `bind` rejects with `AF_UNIX path too long`. That failure used to be
+/// invisible in the worst way: the guardian is spawned with its stderr discarded,
+/// so it exited immediately and every caller saw only "the managed runtime did not
+/// become ready" after waiting out the full 30-second startup budget — a stall on
+/// session start followed by delegation being switched off for that session.
+///
+/// So an over-long path falls back to a short, stable name under the platform
+/// temporary directory, derived from the runtime directory so guardian and clients
+/// independently compute the same location. Distinct projects keep distinct
+/// sockets; an explicitly shared runtime directory keeps being shared.
 pub fn control_path(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join(crate::GUARDIAN_SOCKET_FILE)
+    let direct = runtime_dir.join(crate::GUARDIAN_SOCKET_FILE);
+    if direct.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
+        return direct;
+    }
+    // Hashed over the *canonical* directory, not the spelling this caller happens to
+    // hold. The launcher and the guardian do not always name the same directory the
+    // same way -- macOS's `/var` and `/private/var` are one directory, and the TUI's
+    // runtime directory can reach the launcher before anyone canonicalises it. Two
+    // spellings would otherwise produce two names, the guardian would bind one and
+    // every client would poll the other, and the symptom would be the very timeout
+    // this function exists to remove.
+    let canonical =
+        canonicalize_allowing_missing(runtime_dir).unwrap_or_else(|_| runtime_dir.into());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::env::temp_dir().join(format!("guardian-{}.sock", &hex[..16]))
 }
+
+/// [`control_path`], but refusing when even the fallback cannot be bound.
+///
+/// A gateway this deep (`$TMPDIR` itself near the `sun_path` cap) is pathological,
+/// yet silently returning a path `bind` will reject is exactly the failure mode this
+/// module exists to end. Callers that bind — in practice the guardian — use this so
+/// the reason is reported instead of inferred from a timeout.
+pub fn control_socket(runtime_dir: &Path) -> Result<PathBuf, SocketPathTooLong> {
+    let path = control_path(runtime_dir);
+    if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(SocketPathTooLong {
+            path: path.display().to_string(),
+            limit: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(path)
+}
+
+/// A socket path that is still too long after falling back to the temp directory.
+///
+/// Reachable only when `TMPDIR` itself is absurdly deep. It is a distinct type
+/// rather than a bare `io::Error` so a caller can report the two numbers that
+/// explain it instead of a bind failure's unhelpful "path too long".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketPathTooLong {
+    pub path: String,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for SocketPathTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the guardian control socket is {} bytes even after falling back to the temp \
+             directory, over the {}-byte sun_path limit: {}",
+            self.path.len(),
+            self.limit,
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for SocketPathTooLong {}
 
 #[cfg(test)]
 mod tests {
@@ -252,6 +336,137 @@ mod tests {
         assert_eq!(
             control_path(Path::new("/r")),
             Path::new("/r").join(crate::GUARDIAN_SOCKET_FILE)
+        );
+    }
+
+    /// The real checkout that produced the silent failure in practice. Its direct
+    /// control socket is 121 bytes, so `bind` refuses it on macOS (104-byte cap).
+    const DEEP_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
+
+    #[test]
+    fn a_short_runtime_directory_keeps_the_control_socket_inside_it() {
+        let runtime_dir = Path::new("/tmp/project/.yi-agent/runtime");
+
+        let socket = control_path(runtime_dir);
+
+        assert_eq!(
+            socket,
+            runtime_dir.join(crate::GUARDIAN_SOCKET_FILE),
+            "a runtime directory that fits must keep its existing layout"
+        );
+    }
+
+    #[test]
+    fn a_deep_runtime_directory_yields_a_control_socket_that_fits_the_limit() {
+        let runtime_dir = Path::new(DEEP_RUNTIME_DIR);
+        assert!(
+            runtime_dir
+                .join(crate::GUARDIAN_SOCKET_FILE)
+                .as_os_str()
+                .len()
+                > MAX_SOCKET_PATH_BYTES,
+            "precondition: the direct control socket must overflow the limit"
+        );
+
+        let socket = control_path(runtime_dir);
+
+        assert!(
+            socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
+            "socket must fit sockaddr_un.sun_path, got {} bytes: {}",
+            socket.as_os_str().len(),
+            socket.display()
+        );
+    }
+
+    /// The regression itself, stated as a fact rather than as a comment: the direct
+    /// path really is unbindable, so the fallback is what stands between a user and
+    /// a 30-second stall followed by delegation being switched off.
+    #[test]
+    fn the_direct_control_path_for_a_deep_checkout_cannot_be_bound() {
+        let direct = Path::new(DEEP_RUNTIME_DIR).join(crate::GUARDIAN_SOCKET_FILE);
+
+        let bound = std::os::unix::net::UnixListener::bind(&direct);
+
+        // Either the OS refuses the length outright, or (on a platform with a larger
+        // cap) the directory does not exist. Both mean "not usable as-is"; the length
+        // check is what makes the first case impossible to reach in production.
+        assert!(
+            bound.is_err(),
+            "precondition: binding {direct:?} must fail so the fallback is meaningful"
+        );
+    }
+
+    /// The resolved path must really be bindable, not merely short: this is the whole
+    /// point of the fallback, and a test that only measured bytes could pass while
+    /// `bind` still failed.
+    #[test]
+    fn the_resolved_control_socket_for_a_deep_checkout_can_be_bound() {
+        let socket = control_socket(Path::new(DEEP_RUNTIME_DIR)).expect("resolves");
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket);
+        assert!(
+            listener.is_ok(),
+            "the resolved socket must bind for real, got {:?} on {}",
+            listener.err(),
+            socket.display()
+        );
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn the_control_socket_fallback_is_deterministic_and_per_runtime_directory() {
+        let deep_one = Path::new(DEEP_RUNTIME_DIR);
+        let deep_two = Path::new(
+            "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/other-repo/.yi-agent/runtime",
+        );
+
+        let first = control_path(deep_one);
+        let second = control_path(deep_one);
+        let other = control_path(deep_two);
+
+        assert_eq!(first, second, "one runtime directory must mean one socket");
+        assert_ne!(
+            first, other,
+            "distinct projects must not share a guardian socket"
+        );
+        assert!(
+            !first.starts_with(deep_one),
+            "the fallback must leave the overflowing directory"
+        );
+    }
+
+    /// The launcher and the guardian must agree *even when they spell the directory
+    /// differently*, and they really do: macOS's `/var` and `/private/var` are one
+    /// directory, and a runtime directory can reach the launcher before anything has
+    /// canonicalised it while the guardian resolves its scope from a canonical path.
+    ///
+    /// Hashing the spelling rather than the directory would give two names, the
+    /// guardian would bind one and every client would poll the other — which is
+    /// indistinguishable from the timeout this module exists to remove.
+    #[test]
+    fn two_spellings_of_one_deep_runtime_directory_share_one_control_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        // Deep enough that the fallback is taken, so the name is actually hashed.
+        let deep = directory.path().join("d".repeat(90)).join("runtime");
+        std::fs::create_dir_all(&deep).unwrap();
+        let canonical = std::fs::canonicalize(&deep).unwrap();
+        assert!(
+            deep.as_os_str().len() > MAX_SOCKET_PATH_BYTES,
+            "precondition: the fallback must be in play, got {} bytes: {}",
+            deep.as_os_str().len(),
+            deep.display()
+        );
+
+        // The two spellings differ only if the platform has a symlinked root, which is
+        // exactly the macOS case; skip the assertion where they are identical.
+        if deep == canonical {
+            return;
+        }
+
+        assert_eq!(
+            control_path(&deep),
+            control_path(&canonical),
+            "one directory must mean one socket no matter how it is spelled"
         );
     }
 }

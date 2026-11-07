@@ -826,7 +826,7 @@ impl ThreadRoot {
         let Some(runtime_dir) = self.binding.runtime_dir() else {
             return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         };
-        let control_path = runtime_dir.join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+        let control_path = yi_agent_lifecycle::scope::control_path(&runtime_dir);
         if !control_path.exists() {
             return Ok(crate::thread_root::ForegroundAuthority::Embedded);
         }

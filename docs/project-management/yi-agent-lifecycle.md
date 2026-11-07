@@ -219,3 +219,22 @@
   `ps -axo command= | grep -c 'internal-runtime guardian'` 由 3 降为 0）；
   `cargo test -p yi-agent-supervisors launcher_lifeline`（1 passed，验证在对端存活时 `is_gone()` 为
   false、关闭后 10s 内变 true）
+- [x] guardian 控制 socket 不再因 `sun_path` 超长而静默起不来（深路径项目）— `sockaddr_un.sun_path`
+  只有 104 字节（macOS/BSD），而 runtime 目录默认是 `<workdir>/.yi-agent/runtime`。项目路径深于
+  约 85 字节时 `<runtime_dir>/guardian-control.sock` 就越界，`bind` 直接失败
+  `AF_UNIX path too long`。本仓库自身的 runtime 目录 99 字节，控制 socket 121 字节，**必然触发**。
+  致命之处在于失败是静默的：launcher 用 `Stdio::null()` 丢弃 guardian 的 stderr，guardian 立刻退出，
+  没人应答控制 socket，调用方于是等满 `STARTUP_BUDGET`（30s）才报
+  `the managed runtime did not become ready within 30s`，并顺带关掉本会话的子 agent 委派。
+  用户可见症状正是「TUI 里说句话要等几十秒」「提示不能用 subagent」。
+  修复：把路径计算收敛到 `yi-agent-lifecycle::scope::control_path` 一处，超长时回退到
+  `$TMPDIR/guardian-<sha256(运行目录)[..16]>.sock`；哈希对象是 **canonicalize 后的**目录，
+  否则 macOS 的 `/var` 与 `/private/var` 两种拼写会算出两个名字，guardian 绑一个、客户端轮询另一个，
+  症状与原 bug 完全相同。`control_socket` 是 panic-free 的严格版，供真正要 `bind` 的一方拿诊断。
+  embedded 路径早已有同类兜底（`yi-agent-store::ipc::socket_path_for`），漏的只有 managed 的
+  guardian 控制 socket。判据：`cargo test -p yi-agent-lifecycle --lib scope`（14 passed，含
+  「深路径解析出的 socket 真能 bind」与「两种拼写同名」）；
+  `cargo test -p yi-agent --test managed_runtime_lifecycle`（13 passed + 1 ignored，新增
+  `a_guardian_starts_for_a_runtime_directory_too_deep_for_a_direct_socket`，用 90 字符深的
+  runtime 目录跑真实 `ensure_managed`）。实测 A/B：未修复二进制 `refused:prepare:...did not become
+  ready within 30s`（30.3s），修复后 8 个启动阶段全过（14.4s，`run --subagents` 与真实 TUI pty 两条路径各验一次）

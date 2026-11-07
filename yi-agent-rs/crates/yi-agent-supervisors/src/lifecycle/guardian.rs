@@ -2132,7 +2132,13 @@ impl Guardian {
         deadline: &Deadline,
     ) -> io::Result<std::os::unix::net::UnixListener> {
         use std::os::unix::fs::FileTypeExt;
-        let path = self.scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+        // Resolved through the lifecycle crate so this agrees with every client, and
+        // so an over-long path moves out of the runtime directory instead of failing
+        // `bind` with an error whose text never reaches a user (this process's stderr
+        // is discarded by the launcher).
+        let path = yi_agent_lifecycle::scope::control_socket(&self.scope.runtime_dir).map_err(
+            |too_long| io::Error::new(io::ErrorKind::InvalidInput, too_long.to_string()),
+        )?;
         std::fs::create_dir_all(&self.scope.runtime_dir)?;
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
             if !metadata.file_type().is_socket() {

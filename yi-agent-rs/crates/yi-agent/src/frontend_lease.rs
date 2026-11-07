@@ -282,7 +282,7 @@ pub fn mode_for(kind: ClientKind) -> LeaseMode {
 /// its own path would talk to a socket nobody is listening on, and the symptom
 /// (lease silently absent) is indistinguishable from embedded mode.
 pub fn control_path(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join(yi_agent_supervisors::lifecycle::guardian::GUARDIAN_SOCKET_FILE)
+    yi_agent_lifecycle::scope::control_path(runtime_dir)
 }
 
 /// A client run id unique to this process and launch.
