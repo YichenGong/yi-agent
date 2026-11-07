@@ -177,11 +177,20 @@ yi-agent-rs/target        162 GB
    并带 10 秒 deadline；截断会显式回一条
    `[scan stopped after 10s: ...]`，不会把不完整的扫描伪装成「没有匹配」。
 
-改造后实测（本分支 worktree 根，含 2.6 GB `target/`，`FILES` 策略）：
+改造后实测（本分支 worktree 根，`FILES` 策略）：
 
 ```
 walk /…/.worktrees/docs-latency-search-spec -> 2046 files in 50.978416ms
 ```
+
+复测一次（同一 worktree，此时 `target/` 已增长到 31 GB）：
+
+```
+walk /…/.worktrees/docs-latency-search-spec -> 2046 files in 65.520833ms
+```
+
+两次都是 2046 个文件，与 `target/` 的体积无关——因为它被整棵排除了。
+这正是本条要证明的性质：**构建产物有多大都不再支付遍历成本**。
 
 对照修复前：同一类根目录遍历是 **126.4 秒 / 178 秒**，且结果里含大量
 `target/` 命中。现在是 **约 51 毫秒、2046 个文件、0 个 `target/` 路径、0 个
@@ -220,7 +229,7 @@ cargo test -p yi-agent-tools --lib fs::walk -- --ignored --nocapture
      的 5~6 次往返。
    - system prompt 目前 5041 token（其中 skills/工具 schema 占大头），
      每轮都重发。对简单轮次可考虑裁剪到与任务相关的 skills。
-2. **修 `grep` / `glob` 的同步遍历**（`fs/grep.rs:103`、`fs/glob.rs:53`）
+2. **修 `grep` / `glob` 的同步遍历**（`fs/grep.rs:103`、`fs/glob.rs:53`）——**已实现（2026-11-07），见 §3.1「修复结果」**
    - 把 `grep_search` 与 glob 遍历挪进 `tokio::task::spawn_blocking`；
    - 遍历时默认跳过 `.worktrees/`、`node_modules/`、`target/`、`.git/`
      （可复用 `.gitignore` 语义）。仅 `target/` 一项就是 162 GB，
