@@ -13,7 +13,12 @@ import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { useSpinPhase } from "../lib/useSpinPhase";
 import { countRunningSessions, runningSessionsLabel } from "../lib/runningSessions";
 import { supportsWaapi } from "../lib/spinPhase";
-import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
+import {
+  clampSidebarWidth,
+  loadSidebarWidth,
+  publishSidebarWidth,
+  saveSidebarWidth,
+} from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
@@ -335,6 +340,11 @@ export function ThreadSidebar({
   const rippleSeq = useRef(0);
   const [width, setWidth] = useState(loadSidebarWidth);
   const widthRef = useRef(width);
+  // 把宽度广播出去：旁支的返回条要跟这颗「+ New thread」一样宽，而它只能靠
+  // 广播拿到拖动中的实时值（落盘的 `loadSidebarWidth()` 要等松手才更新）。
+  useEffect(() => {
+    publishSidebarWidth(width);
+  }, [width]);
   const cleanupDrag = useRef<(() => void) | null>(null);
   // The rename field is a plain text input, so an IME confirm-Enter must not
   // commit the draft (and unmount the field) mid-composition.

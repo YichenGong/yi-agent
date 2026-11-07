@@ -3198,7 +3198,9 @@ fn publish_side_source(
     let mut source = yi_agent_runtime::side_conversation::EffectiveSideSource {
         session: Arc::clone(session),
         provider: Arc::clone(&live.provider),
-        config: live.config.clone(),
+        // 与启动路径同一条规则:父 config 是主会话的口吻,旁支必须在末尾追加
+        // 只读策略,否则模型会把继承来的父任务当成自己的待办继续执行。
+        config: yi_agent_core::side_agent_config(&live.config),
         primary: primary.to_path_buf(),
         roots: roots.clone(),
         current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),
@@ -3251,7 +3253,10 @@ fn side_source_snapshot_with_session(
     yi_agent_runtime::side_conversation::EffectiveSideSource {
         session,
         provider,
-        config: agent_config.clone(),
+        // 父的 config 是**主会话**的:它的 prompt 里写着"你负责推进这个任务"。
+        // 原样交给旁支,模型就会接着干父任务。`side_agent_config` 在末尾追加
+        // 只读策略,与 app-server 路径的 `resolve_side_prompt` 得到同一形状。
+        config: yi_agent_core::side_agent_config(agent_config),
         primary: primary.clone(),
         roots: roots.clone(),
         current_roots: Arc::new(yi_agent_tools::StaticSideRoots::new(roots)),

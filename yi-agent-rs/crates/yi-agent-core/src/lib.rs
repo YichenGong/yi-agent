@@ -39,8 +39,8 @@ pub use run_budget::{
     measure_messages, measure_side_history,
 };
 pub use side_context::{
-    SIDE_BOUNDARY, SIDE_SYSTEM_POLICY, SideContextError, SideContextSnapshot, side_system_prompt,
-    snapshot_for_side,
+    SIDE_BOUNDARY, SIDE_SYSTEM_POLICY, SideContextError, SideContextSnapshot, side_agent_config,
+    side_system_prompt, snapshot_for_side,
 };
 pub use subagent::task::{
     AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,
