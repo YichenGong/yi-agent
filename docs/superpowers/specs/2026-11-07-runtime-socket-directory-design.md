@@ -7,7 +7,7 @@
 
 TUI 启动时弹窗「子 Agent runtime 未启用；重启 yi-agent 后即可用」，重启无效。
 
-根因不是配置、不是二进制、不是 SQLite，而是 **unix socket 路径超出平台上限**：
+根因不是配置、不是模型栈、不是 SQLite，而是 **unix socket 路径超出平台上限**：
 
 ```
 /Users/.../personalProjects/yi-agent/.yi-agent/runtime/guardian-control.sock
@@ -17,6 +17,9 @@ macOS sockaddr_un.sun_path 上限（本仓取 MAX_SOCKET_PATH_BYTES）= 103 字�
 
 `bind()` 失败，managed 模式依赖的 guardian 根本起不来。前端等满 30 秒预算后，
 把「启动期路径问题」降级显示成那句通用的「重启即可用」。
+
+**但「重启没用」还有一层原因**：用户手上那个二进制根本不含修复。见 §1.1——它不是
+配置问题，却是版本问题，所以重启多少次结果都一样。
 
 ### 1.1 已经有一层修复在 main 上（重要前提）
 
