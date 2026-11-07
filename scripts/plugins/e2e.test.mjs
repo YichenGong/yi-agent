@@ -5,8 +5,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import {
@@ -266,6 +267,40 @@ test("parseCommand splits an executable, its args, and leading env assignments",
     env: { FOO: "1", BAR: "a b" },
   });
   assert.throws(() => parseCommand(""), /non-empty/);
+});
+
+// 命令字符串要能直接复制到终端复算，所以映射表里写 `$VAR` 是有意义的。
+// 但执行层不过 shell，`$VAR` 会被原样当参数传下去——A03 的
+// `bash scripts/verify-plugin-update.sh "$YI_AGENT_ACCEPTANCE_APP" .`
+// 于是把字面量 `$YI_AGENT_ACCEPTANCE_APP` 交给脚本，脚本拿到的不是路径。
+test("parseCommand expands $VAR references from the given environment", () => {
+  const env = { YI_AGENT_ACCEPTANCE_APP: "/Applications/yi-agent.app" };
+  assert.deepEqual(parseCommand('bash x.sh "$APP_DIR" .', { env: { APP_DIR: "/a b" } }), {
+    command: "bash",
+    args: ["x.sh", "/a b", "."],
+    env: {},
+  });
+  assert.deepEqual(
+    parseCommand('bash scripts/verify-plugin-update.sh "$YI_AGENT_ACCEPTANCE_APP" .', { env }),
+    {
+      command: "bash",
+      args: ["scripts/verify-plugin-update.sh", "/Applications/yi-agent.app", "."],
+      env: {},
+    },
+  );
+  // `${VAR}` 与 $VAR 都要认，否则写命令的人得记住两套规则。
+  assert.deepEqual(parseCommand("echo ${FOO}", { env: { FOO: "bar" } }), {
+    command: "echo",
+    args: ["bar"],
+    env: {},
+  });
+});
+
+// 未定义变量不能展开成空串：`--remote-path ""` 会被下游读成「没给」，
+// 与真的没给混在一起，报告里就看不出是漏配还是故意留空。
+test("parseCommand rejects an undefined variable instead of passing it through", () => {
+  assert.throws(() => parseCommand("echo $NOT_SET_ANYWHERE", { env: {} }), /NOT_SET_ANYWHERE/);
+  assert.throws(() => parseCommand("echo ${ALSO_MISSING}", { env: {} }), /ALSO_MISSING/);
 });
 
 test("runCommand reports a non-zero exit as fail, not missing", () => {
@@ -1053,5 +1088,75 @@ test("a permanent gap is reported as a gap, not as a missing environment", () =>
   assert.ok(
     !/no remote host was provided/.test(report.cases[0].reason),
     "the generic missing-environment wording must not hide an implementation gap",
+  );
+});
+
+// A03 曾经指向一个不存在的路径：命令写 `scripts/verify-plugin-update.sh`，
+// 而脚本实际在 `yi-agent-rs/scripts/`。执行层只把它当成「bash 找不到文件」，
+// 判词落成 fail，读报告的人于是去查插件更新实现——真正错的只是一个前缀。
+// 这条断言把「映射表里的脚本必须真的存在」钉住，不再靠人眼核对。
+test("every shell script named by the command map exists on disk", () => {
+  const named = [];
+  // 这条断言只关心脚本路径，与变量展开无关：给任何 `$VAR` 一个占位值，
+  // 免得测试因为本机没配环境变量而失败（那是另一件事，另有断言守）。
+  const placeholderEnv = new Proxy({}, { get: () => "/placeholder" });
+  for (const entry of map.cases) {
+    for (const command of entry.commands) {
+      const { command: executable, args } = parseCommand(command.run, { env: placeholderEnv });
+      if (!["bash", "sh"].includes(executable)) continue;
+      const script = args.find((arg) => arg.endsWith(".sh"));
+      if (script) named.push({ id: entry.id, script });
+    }
+  }
+  assert.ok(named.length > 0, "expected at least one case to run a shell script");
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  for (const { id, script } of named) {
+    assert.ok(
+      existsSync(path.resolve(root, script)),
+      `${id} runs ${script}, which does not exist under the repository root`,
+    );
+  }
+});
+
+// A07 与 A08 曾经指向**同一条**命令（`--suite isolation`），于是 A08 的
+// `pass` 只是 A07 的 12 个安全用例顺带跑出来的：它自己那条判据里唯一没被
+// 任何用例覆盖的「滥发消息被限流」（Rust 侧没有任何限流实现）从来没被检查过，
+// 却被记成通过。这与 A17 是同一类错误——把功能缺口说成已满足。
+//
+// 断言两件事：A07/A08 不能再是同一条命令；A08 必须显式声明它证明不了的缺口。
+test("A08 is not a copy of A07 and declares the requirement it cannot prove", () => {
+  const a07 = map.cases.find((entry) => entry.id === "A07");
+  const a08 = map.cases.find((entry) => entry.id === "A08");
+  assert.ok(a07 && a08);
+
+  const runs = (entry) => entry.commands.map((command) => command.run).join(" ; ");
+  assert.notEqual(runs(a07), runs(a08), "A07 and A08 must not run identical commands");
+
+  // 未实现的部分必须写明，且措辞要指出「这是代码缺口，不是缺环境」。
+  assert.match(
+    a08.permanentGap ?? "",
+    /rate.?limit|限流/i,
+    "A08 must name the rate-limit requirement as a permanent gap",
+  );
+});
+
+// 一条用例只要声明了 `permanentGap`，它就不可能整体通过：缺口是代码里还没
+// 有的那段，命令跑绿只证明「已实现的部分没问题」。以前 permanentGap 只影响
+// 文案，判词照样能是 pass——A08 因此把「限流未实现」记成了通过。
+test("a case that declares a permanent gap can never be recorded as a pass", () => {
+  const caseSpec = {
+    id: "A08",
+    commands: [{ kind: "command", run: "true" }],
+    permanentGap: "rate limiting is not implemented",
+  };
+  assert.equal(
+    verdictFor({ caseSpec, outcome: "pass", capabilities: {} }),
+    "unsupported",
+    "a green command cannot turn a declared gap into a pass",
+  );
+  // 没有声明的用例不受影响。
+  assert.equal(
+    verdictFor({ caseSpec: { id: "A01", commands: [] }, outcome: "pass", capabilities: {} }),
+    "pass",
   );
 });
