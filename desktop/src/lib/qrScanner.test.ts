@@ -10,6 +10,17 @@ function fakeStream(): MediaStream {
 }
 const frame = {} as ImageData;
 
+/** 本文件局部的可控 Promise；后续组件测试各自声明，不抽成生产工具。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("startCameraScan", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
@@ -128,5 +139,110 @@ describe("startCameraScan", () => {
     });
     await vi.advanceTimersByTimeAsync(50);
     expect(onError).toHaveBeenCalled();
+  });
+
+  // ---- 扫描结果接收契约（A06/A09/A10/A17）------------------------------
+
+  it("A06 keeps rejected text alive and stops on acceptance", async () => {
+    const trackStop = vi.fn();
+    const stream = { getTracks: () => [{ stop: trackStop }] } as unknown as MediaStream;
+    const result = vi
+      .fn<(text: string) => boolean | void>()
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const decode = vi.fn(() => "text");
+    const stop = startCameraScan(fakeVideo(), result, vi.fn(), {
+      getUserMedia: async () => stream,
+      grabFrame: () => frame,
+      decode,
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(result).toHaveBeenCalledTimes(1);
+    expect(trackStop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(result).toHaveBeenCalledTimes(2);
+    expect(trackStop).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(decode).toHaveBeenCalledTimes(2);
+    stop();
+    expect(trackStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("A09 releases late streams without assigning video", async () => {
+    const pending = deferred<MediaStream>();
+    const stops = [vi.fn(), vi.fn()];
+    const stream = {
+      getTracks: () => stops.map((stop) => ({ stop })),
+    } as unknown as MediaStream;
+    const video = fakeVideo();
+    const before = video.srcObject;
+    const result = vi.fn();
+    const error = vi.fn();
+    const stop = startCameraScan(video, result, error, {
+      getUserMedia: () => pending.promise,
+    });
+    stop();
+    pending.resolve(stream);
+    await vi.advanceTimersByTimeAsync(400);
+    for (const s of stops) expect(s).toHaveBeenCalledTimes(1);
+    expect(video.srcObject).toBe(before);
+    expect(video.play).not.toHaveBeenCalled();
+    expect(result).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["get-stop-reject", 0],
+    ["play-stop-reject", 0],
+    ["play-accept-reject", 0],
+    ["get-current-reject", 1],
+    ["play-current-reject", 1],
+    ["play-sync-throw", 1],
+    ["result-sync-throw", 1],
+  ] as const)("A10/A17 %s errors=%s", async (scenario, expectedErrors) => {
+    const pendingStream = deferred<MediaStream>();
+    const pendingPlay = deferred<void>();
+    const trackStop = vi.fn();
+    const stream = { getTracks: () => [{ stop: trackStop }] } as unknown as MediaStream;
+    const error = vi.fn();
+    const decode = vi.fn(() => "hit");
+    const result = vi.fn(() => {
+      if (scenario === "result-sync-throw") throw new Error("result failed");
+      return scenario === "play-accept-reject";
+    });
+    const video = fakeVideo();
+    video.play = vi.fn(() => {
+      if (scenario === "play-sync-throw") throw new Error("play failed");
+      return pendingPlay.promise;
+    });
+    const usesPendingStream = scenario.startsWith("get-");
+    const stop = startCameraScan(video, result, error, {
+      getUserMedia: () => (usesPendingStream ? pendingStream.promise : Promise.resolve(stream)),
+      grabFrame: () => frame,
+      decode,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    if (scenario === "get-stop-reject") {
+      stop();
+      pendingStream.reject(new Error("old get"));
+    }
+    if (scenario === "get-current-reject") pendingStream.reject(new Error("current get"));
+    if (scenario === "play-stop-reject") {
+      stop();
+      pendingPlay.reject(new Error("old play"));
+    }
+    if (scenario === "play-current-reject") pendingPlay.reject(new Error("current play"));
+    if (scenario === "play-accept-reject") {
+      await vi.advanceTimersByTimeAsync(200);
+      expect(result).toHaveBeenCalledTimes(1);
+      pendingPlay.reject(new Error("accepted scan play"));
+    }
+    await vi.advanceTimersByTimeAsync(400);
+    expect(error).toHaveBeenCalledTimes(expectedErrors);
+    expect(trackStop).toHaveBeenCalledTimes(usesPendingStream ? 0 : 1);
+    const calls = decode.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(600);
+    expect(decode).toHaveBeenCalledTimes(calls);
+    stop();
   });
 });

@@ -2,14 +2,23 @@
  * iOS 配对页的相机扫码循环（S4）。
  *
  * 逻辑与 DOM 解耦：整个过程依赖三件事——拿视频流、抓一帧、解码一帧——都可由
- * `deps` 注入。于是「命中即停」「多帧才命中」「解码抛错继续」「无相机即报错」
- * 都能在 jsdom 里用假实现测。真实 `getUserMedia` 只能真机手验。
+ * `deps` 注入。于是「接受即停」「拒绝继续扫」「多帧才命中」「解码抛错继续」
+ * 「无相机即报错」都能在 jsdom 里用假实现测。真实 `getUserMedia` 只能真机手验。
  */
 
 import jsQR from "jsqr";
 
 /** 默认逐帧间隔（毫秒）。 */
 export const SCAN_INTERVAL_MS = 200;
+
+/**
+ * 扫描结果接收契约：`false` 表示这一帧不算数、继续扫描；`true` 或 `undefined`
+ * 表示接受该结果并停止本次扫描。
+ *
+ * 刻意是同步签名：扫码循环在帧回调里直接判返回值，异步结果无法在这一帧决定
+ * 是否继续，会把「已接受」与「还在扫」混在一起。
+ */
+export type ScanResultHandler = (text: string) => boolean | void;
 
 export interface ScanDeps {
   /** 默认 `navigator.mediaDevices.getUserMedia`。 */
@@ -64,7 +73,8 @@ function defaultDecode(data: ImageData): string | null {
 }
 
 /**
- * 打开相机并逐帧解码，命中即调 `onResult` 并停止。返回 `stop()` 用于清理。
+ * 打开相机并逐帧解码，调 `onResult` 接收结果：返回 `false` 则继续扫描，返回
+ * `true`/`undefined` 则接受并停止。返回 `stop()` 用于清理（幂等）。
  * `getUserMedia` 失败时调 `onError` 且不启动循环（表单仍可手输）。
  *
  * 取流与 `play()` 都**不会**同步抛：任何失败一律走 `onError`，调用方（React effect）
@@ -72,7 +82,7 @@ function defaultDecode(data: ImageData): string | null {
  */
 export function startCameraScan(
   video: HTMLVideoElement,
-  onResult: (text: string) => void,
+  onResult: ScanResultHandler,
   onError: (e: unknown) => void,
   deps: ScanDeps = {},
 ): () => void {
@@ -93,6 +103,15 @@ export function startCameraScan(
       timer = null;
     }
     stream?.getTracks().forEach((t) => t.stop());
+    // 只在 `srcObject` 仍属于本实例时清空：晚到的 `stop()` 不能抹掉别的实例接上的流。
+    if (stream && video.srcObject === stream) video.srcObject = null;
+  };
+
+  /** 唯一失败出口：已停则静默丢弃，否则先停机再上报**恰好一次**。 */
+  const fail = (error: unknown) => {
+    if (stopped) return;
+    stop();
+    onError(error);
   };
 
   /** 接入取流：注入的实现可能同步抛，故连同调用一起包住，同步异常也归到 onError。 */
@@ -113,11 +132,9 @@ export function startCameraScan(
       stream = s;
       video.srcObject = s;
       // `play()` 的失败也要上报：iOS 上元数据未就绪时它可能 reject，此前被 `void`
-      // 丢弃，于是预览停在第一帧（黑屏）而用户得不到任何反馈。
-      Promise.resolve(video.play()).catch((e) => {
-        stop();
-        onError(e);
-      });
+      // 丢弃，于是预览停在第一帧（黑屏）而用户得不到任何反馈。同步 throw 留给
+      // 外层 `.catch(fail)` 收敛，`fail` 保证停止后不再重复上报。
+      Promise.resolve(video.play()).catch(fail);
       timer = setInterval(() => {
         if (stopped) return;
         const frame = grabFrame(video);
@@ -129,15 +146,17 @@ export function startCameraScan(
           return; // 单帧解码失败不是致命错误，继续。
         }
         if (text) {
-          stop();
-          onResult(text);
+          try {
+            // `false` = 这一帧不算数，继续扫；`true`/`undefined` = 接受即停。
+            if (onResult(text) !== false) stop();
+          } catch (error) {
+            // 结果处理方同步抛错：收敛为一次可见失败，而不是从 interval 逃逸。
+            fail(error);
+          }
         }
       }, intervalMs);
     })
-    .catch((e) => {
-      stop();
-      onError(e);
-    });
+    .catch(fail);
 
   return stop;
 }

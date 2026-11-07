@@ -16,7 +16,7 @@
 
 ## iOS 扫码识别后黑屏修复
 
-- [ ] 有效二维码识别后立即退出相机覆盖层并显示配对进度；稳定真实 `QrScanner` 生命周期，保留无效码连续扫描、单次兑换及旧异步回调隔离 — 已完成调查、多轮审查与 [修复 spec](../superpowers/specs/2026-11-07-ios-qr-recognition-black-screen-design.md)、[实施 plan](../superpowers/plans/2026-11-07-ios-qr-recognition-black-screen-impl.md)，[审查记录](../superpowers/reports/2026-11-07-ios-qr-recognition-spec-review.md) · [plan 审查记录](../superpowers/reports/2026-11-07-ios-qr-recognition-plan-review.md) 无未解决意见；代码未实现、真机未验收。完成判据：该 spec §6 A01–A18 与 §7 I01–I07；关键回归必须走真实 `PairingScreen` + `QrScanner`，验证 pending 兑换期间覆盖层移除、无新增取流调用，不得仅用 `scan` 接缝判定完成。
+- [ ] 有效二维码识别后立即退出相机覆盖层并显示配对进度；稳定真实 `QrScanner` 生命周期，保留无效码连续扫描、单次兑换及旧异步回调隔离 — 已完成调查、多轮审查与 [修复 spec](../superpowers/specs/2026-11-07-ios-qr-recognition-black-screen-design.md)、[实施 plan](../superpowers/plans/2026-11-07-ios-qr-recognition-black-screen-impl.md)，[审查记录](../superpowers/reports/2026-11-07-ios-qr-recognition-spec-review.md) · [plan 审查记录](../superpowers/reports/2026-11-07-ios-qr-recognition-plan-review.md) 无未解决意见。**代码门禁阶段（Task 1/5 已完成，2026-11-07）**：`desktop/src/lib/qrScanner.ts` 导出 `ScanResultHandler = (text: string) => boolean | void`，扫描循环改为 `onResult(text) !== false` 才停机（`false` 保留循环与轨道继续扫），并把取流、`play()`、结果回调三处失败收敛到唯一的 `fail()`（已停则丢弃，否则停机并 `onError` 恰好一次），晚到的流/播放 rejection 不再污染已接受的实例。判据：`cd desktop && npm test -- --environment jsdom src/lib/qrScanner.test.ts src/components/PairingScreen.test.tsx`（38 passed，新增 A06/A09/A10/A17 共 9 例，改前 5 例行为红）+ `npx tsc --noEmit`，证据见 [实施验证记录](../superpowers/reports/2026-11-07-ios-qr-recognition-implementation-verification.md)。**其余任务（稳定回调 QrScanner、覆盖层退出、App 接线）未实现、真机未验收**，故本条仍不勾选。完成判据：该 spec §6 A01–A18 与 §7 I01–I07；关键回归必须走真实 `PairingScreen` + `QrScanner`，验证 pending 兑换期间覆盖层移除、无新增取流调用，不得仅用 `scan` 接缝判定完成。
 
 ## Managed runtime 默认生产接入
 
