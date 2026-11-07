@@ -4035,3 +4035,213 @@ async fn session_delegation_lifecycle_app_server_two_turns_keep_background_child
 
     h.shutdown().await;
 }
+
+/// 捕获每轮 provider 请求里的工具名,供下面的 MCP 热重载回归测试断言。
+struct ToolListProvider {
+    seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for ToolListProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        // 标题生成会在回合结束后并发打一次 provider;它不挂工具,若也记进
+        // `seen`,`rounds.last()` 可能落到它身上而误判「工具表为空」。
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        self.seen
+            .lock()
+            .unwrap()
+            .push(req.tools.iter().map(|t| t.name.clone()).collect());
+        Ok(Box::pin(futures::stream::iter(vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+/// **本轮 `mcp_reload` 用自身 manager 做完 reload 之后,下一轮必须能看到新工具。**
+///
+/// 这是真实 bug 的端到端现场:工具在轮内调 `McpManager::reload()`,把 `last_seen`
+/// 指纹推进到最新;下一轮开跑前 driver 只看 `needs_reload`(磁盘变没变)就会返回
+/// false,registry 永不重建,新工具在进程重启前都不出现。
+///
+/// 这里用真实的 `run_thread_driver` 与真实的 `McpManager`:第 1 轮前把新 server
+/// 写进 `mcp.json` 并**预先 reload**(等价于工具在本轮内做过的事),然后断言第 2 轮
+/// provider 收到的工具清单里出现了它。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_reloaded_during_a_turn_reaches_the_registry_on_the_next_turn() {
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let workdir = dir.path().to_path_buf();
+    let agent_dir = workdir.join(".yi-agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // fs 从一开始就在配置里(探测命令会立刻失败,但 server 条目存在);
+    // gh 是「本轮才加上的」那个。
+    std::fs::write(
+        agent_dir.join("mcp.json"),
+        r#"{"mcpServers":{"fs":{"command":"true"}}}"#,
+    )
+    .unwrap();
+
+    let manager = yi_agent_mcp::McpManager::load_and_probe(
+        yi_agent_mcp::McpConfig::load(&workdir).unwrap().unwrap(),
+        &workdir,
+    )
+    .await
+    .unwrap();
+
+    // registry 是装配时那份:此时快照与它一致。
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    manager.refresh_registry(&mut registry);
+    assert!(!manager.needs_registry_refresh(&registry), "starts in sync");
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(ToolListProvider {
+        seen: Arc::clone(&seen),
+    });
+    let config = yi_agent_core::AgentConfig {
+        model: crate::test_support::TEST_MODEL.to_string(),
+        ..yi_agent_core::AgentConfig::default()
+    };
+    let agent = yi_agent_core::Agent::new(
+        Arc::clone(&provider),
+        Arc::new(registry.clone()),
+        config.clone(),
+    );
+
+    let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+    let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
+    let (_session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+    let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+    let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+    drop(client_r);
+    let (hub, client) = test_hub(server_w);
+    let store = Arc::new(crate::thread_store::ThreadStore::new(dir.path()));
+    let mcp = Some(Arc::clone(&manager));
+    let mcp_workdir = workdir.clone();
+    let handle = tokio::spawn(run_thread_driver(
+        "thread-mcp".into(),
+        agent,
+        prompt_rx,
+        interrupt_rx,
+        interject_rx,
+        session_rx,
+        hub,
+        client,
+        turn_tx,
+        None,
+        Arc::new(Mutex::new(HashMap::new())),
+        Duration::from_secs(60),
+        Arc::new(AtomicU64::new(1)),
+        None,
+        Arc::clone(&store),
+        ThreadSession::new_status(),
+        Arc::clone(&provider),
+        config.clone(),
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        mcp.clone(),
+        mcp_workdir.clone(),
+        None,
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        ),
+        yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+    ));
+
+    // ---- 本轮:模型调用 mcp_reload → 写盘 + 探测(这里直接做等价动作) ----
+    // gh 的清单先放进缓存,让 reload 走 `Fresh` 而不是失败的冷探测。
+    let mut cache = yi_agent_mcp::test_support::cache_with(&workdir);
+    cache.put(
+        "gh",
+        &yi_agent_mcp::ServerConfig {
+            kind: yi_agent_mcp::ServerKind::Stdio,
+            command: Some("true".into()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
+        },
+        vec![yi_agent_mcp::test_support::cached_tool(
+            "create_issue",
+            false,
+        )],
+        yi_agent_mcp::now_unix(),
+    );
+    cache.save(&workdir).unwrap();
+    std::fs::write(
+        agent_dir.join("mcp.json"),
+        r#"{"mcpServers":{"fs":{"command":"true"},"gh":{"command":"true"}}}"#,
+    )
+    .unwrap();
+    manager.reload(&workdir, yi_agent_mcp::now_unix()).await;
+    assert!(
+        !manager.needs_reload(&workdir, yi_agent_mcp::now_unix()),
+        "precondition: the in-turn reload already advanced the on-disk fingerprint"
+    );
+
+    let send_turn = |n: u32| {
+        let prompt_tx = prompt_tx.clone();
+        async move {
+            prompt_tx
+                .send(TurnPrompt {
+                    turn_id: format!("turn-{n}"),
+                    prompt: "hi".into(),
+                    activate: None,
+                    attachments: Vec::new(),
+                    image_blocks: Vec::new(),
+                    image_refs: Vec::new(),
+                    display_text: "hi".into(),
+                    lead_request_id: None,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    send_turn(1).await;
+    let _ = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
+        .await
+        .expect("turn 1 must finish")
+        .expect("driver must report the turn");
+    send_turn(2).await;
+    let _ = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
+        .await
+        .expect("turn 2 must finish")
+        .expect("driver must report the turn");
+
+    let rounds = seen.lock().unwrap().clone();
+    assert!(
+        rounds.len() >= 2,
+        "two turns must each reach the model: {rounds:?}"
+    );
+    assert!(
+        rounds
+            .last()
+            .unwrap()
+            .iter()
+            .any(|n| n == "mcp__gh__create_issue"),
+        "the server added during turn 1 must be visible to the model on turn 2; got {:?}",
+        rounds.last()
+    );
+
+    drop(prompt_tx);
+    let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
+}

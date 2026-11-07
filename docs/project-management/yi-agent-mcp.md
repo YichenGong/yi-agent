@@ -39,13 +39,17 @@ yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MC
 - [x] 会话内自助配置（`mcp_reload`）
   - 工具：`yi-agent-rs/crates/yi-agent-mcp/src/reload_tool.rs`，四个 action（`add`/`enable`/`disable`/`remove`），结构化参数，元数据 `requires_confirmation: true`
   - 纯逻辑：`yi-agent-rs/crates/yi-agent-mcp/src/reload.rs`（名字规则、`${VAR}` 必须已定义、header 名校验、add 重名需 `overwrite`；失败不改配置）
-  - 热重载：`yi-agent-rs/crates/yi-agent-mcp/src/manager.rs` 的 `McpManager::reload`（只探测新增/指纹变化的 server；单个失败原文进 `ServerOutcome::error`，不吞）、`needs_reload`（每轮变更检测：一次读盘同时拿到指纹与配置，指纹变了或有「已过期且不在退避窗口」的启用 server 就重载）
+  - 热重载：`yi-agent-rs/crates/yi-agent-mcp/src/manager.rs` 的 `McpManager::reload`（只探测新增/指纹变化的 server；单个失败原文进 `ServerOutcome::error`，不吞）、`needs_reload`（每轮变更检测：一次读盘同时拿到指纹与配置，指纹变了或有「已过期且不在退避窗口」的启用 server 就重载）、`needs_registry_refresh(registry)`（见下一条「下一轮生效」）
   - 原子写盘：`McpConfig::save`（临时文件 + rename，见 `config.rs`）
   - 孤儿清理：`refresh_registry` 按 **registry 自身的实际内容**（`ToolSource::Mcp`）摘除 MCP 工具，再注册当前生效的那批；不能用 manager 上的全局记账集合——app-server 每个 thread 各持一份 registry、共用一个 `McpManager`，全局集合被先刷新的 thread drain 空后，后刷新的 thread 摘不掉自己那份旧工具，远端工具改名后它会一直用旧名调上游并收到 `-32603`。回归测试：`refresh_registry_clears_stale_names_in_a_second_thread`（`manager.rs`）
   - 开关优先级：`reload` 里 server 的 `enabled` **以磁盘为准**，仅当磁盘值未变时沿用内存里的运行时开关（TUI 的 `/mcp disable` 只动内存）；`mcp_reload` 的 enable/disable 会同步内存开关
   - 注册：`register_mcp_reload_tool` **无条件注册**（无 `mcp.json` 时也有入口），接在 `yi-agent-runtime/src/bootstrap.rs` 与 `yi-agent/src/main.rs` 两处
   - 权限：`mcp_reload` 始终 `NeedConfirm`，**不受 yolo 豁免**（`yi-agent-rs/crates/yi-agent-core/src/permission.rs`）
   - 生效时机：下一轮生效（不改 `ToolRegistry` 为 `RwLock`）；返回文案固定写「新工具从下一条消息起可用」
+  - **下一轮真能生效的两个前提**（缺任一都表现为「加了 MCP 但模型看不见」，且要重启进程才好）：
+    1. driver 每轮开跑前的判定不能只看磁盘指纹——`mcp_reload` 在**本轮内**已经调过 `reload()`，会把 `last_seen` 推进到最新，下一轮 `needs_reload` 必然 false，而 registry 还是旧的。故改为 `needs_reload(..) || needs_registry_refresh(&registry)`，后者直接比对「manager 当前生效工具名集合」与「registry 里 `ToolSource::Mcp` 的名字集合」（`manager.rs::needs_registry_refresh`）。接线：`yi-agent-app-server/src/server/driver/turn_driver.rs`、`yi-agent/src/main.rs`
+    2. 没有 `mcp.json` 时 bootstrap 也必须交出 manager：`yi-agent-runtime/src/bootstrap.rs::build_tool_setup_owned` 在 `Ok(None)`/`Err` 时返回 `McpManager::empty_with_launcher(launcher)` 而非 `None`，否则 `mcp_reload` 拿着一份只有自己知道的一次性 manager，driver 手上是 `None`，第一次加 MCP 永远不生效。受管运行时保留 launcher，避免后续探测绕过 guardian
+  - 回归测试：`yi-agent-mcp/src/manager.rs::a_tool_added_in_turn_is_missed_by_needs_reload_but_caught_by_registry_check` 等 6 个 `needs_registry_refresh*`；`yi-agent-runtime/src/bootstrap.rs::mcp_reload_writes_into_the_same_manager_the_driver_gets`（无配置时工具写盘后 driver 的 manager 能看到）；`yi-agent-app-server/src/server/tests/turn.rs::a_server_reloaded_during_a_turn_reaches_the_registry_on_the_next_turn`（真实 driver 跑两轮，断言第 2 轮 provider 收到新工具名；去掉第 1 条判定即失败）
   - 验证：`cargo test -p yi-agent-mcp`（当前 122 个 lib 测试，含 `reload_does_not_reprobe_an_unchanged_server`、`reload_reprobes_a_changed_server_and_reports_the_error`、`reload_removes_a_deleted_server`、`reload_honors_a_server_disabled_on_disk`、`reload_keeps_an_in_memory_switch_when_disk_did_not_change`、`disabling_a_server_after_startup_removes_its_tools`、`enable_after_a_runtime_only_disable_takes_effect`、`config_changed_on_disk_*`、`reload_tool::tests::*`）
 - [x] 工具清单按 24h TTL 自动重探，失败按 5 分钟退避
   - 判定：`yi-agent-rs/crates/yi-agent-mcp/src/cache.rs` 的 `lookup`（四步顺序：指纹不匹配→`Stale`、`Fresh`、`BackedOff`、`Stale`；**指纹判定必须先于退避**，否则改 `mcp.json` 要等 5 分钟）

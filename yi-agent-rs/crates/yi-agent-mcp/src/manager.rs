@@ -166,6 +166,15 @@ impl McpManager {
         Self::from_parts(HashMap::new(), false)
     }
 
+    /// 空快照、总开关关闭,但保留 `launcher`。
+    ///
+    /// 受管运行时用它交出一份「还没有任何 server,但将来探测也要走 guardian」的
+    /// manager:直接用 [`empty`](Self::empty) 会让之后 `mcp_reload` 的探测绕过
+    /// 启动器直接 spawn,留下不受 guardian 登记的孤儿进程。
+    pub fn empty_with_launcher(launcher: Option<Arc<dyn StdioLauncher>>) -> Arc<Self> {
+        Self::from_parts_with(HashMap::new(), false, launcher)
+    }
+
     fn from_parts(servers: HashMap<String, Arc<ServerEntry>>, master: bool) -> Arc<Self> {
         Self::from_parts_with(servers, master, None)
     }
@@ -614,6 +623,36 @@ impl McpManager {
             }
         }
         out
+    }
+
+    /// `registry` 是否落后于当前内存快照(也就是「生效的 MCP 工具集合」)。
+    ///
+    /// `needs_reload` 只看「磁盘配置是否变过」,但那是一个**代理指标**,会被
+    /// 「别处已经 reload 过」骗过:`mcp_reload` 工具在**本轮内**就调用了
+    /// [`reload`](Self::reload),把 `last_seen` 指纹推进到最新值。下一轮开跑前
+    /// `needs_reload` 因此返回 `false`,而 agent 手里的 `ToolRegistry` 还是旧的
+    /// ——新工具明明已经在快照里,却永远注册不进去,只有等缓存过期(24h)或进程
+    /// 重启才自愈。
+    ///
+    /// 这里直接比较「生效工具名集合」与 registry 里 `ToolSource::Mcp` 的名字,
+    /// 不依赖任何指纹代理:无论快照是被这个工具、设置页还是另一个 thread 更新的,
+    /// 只要 registry 与它不一致就返回 `true`。
+    pub fn needs_registry_refresh(self: &Arc<Self>, registry: &ToolRegistry) -> bool {
+        let expected: std::collections::BTreeSet<String> = self
+            .enabled_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let actual: std::collections::BTreeSet<String> = registry
+            .names()
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|t| matches!(t.metadata().source, ToolSource::Mcp { .. }))
+            })
+            .collect();
+        expected != actual
     }
 
     /// Sync `registry` with the effective MCP tools: unregister every MCP tool
@@ -1981,6 +2020,146 @@ mod tests {
     }
 
     // ---- reload 分派 ----
+
+    /// 是否真的「本轮内 reload 过之后,下一轮的 needs_reload 会漏掉它」——
+    /// 这正是 bug 的现场。用真实文件与真实 reload 复现,而不是模拟中间态。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_tool_added_in_turn_is_missed_by_needs_reload_but_caught_by_registry_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_failing_connector();
+        let mgr = manager_in_sync(dir.path()).await;
+
+        // registry 是启动时那份:只有 fs 的工具(探测失败 ⇒ 0 个)。
+        let mut registry = ToolRegistry::new();
+        mgr.refresh_registry(&mut registry);
+        assert!(!mgr.needs_registry_refresh(&registry));
+
+        // 本轮 `mcp_reload` 写盘(新增 gh)并自己调 reload —— 与工具实现同序。
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx"},"gh":{"command":"uvx"}}}"#,
+        );
+        // 预置 gh 的缓存,让 reload 走 `Fresh` 拿到真实工具清单,而不是撞上
+        // 失败探测(那会让两边都是空集,测不出差异)。这与 `mcp_reload add`
+        // 之后通常命中探测缓存的情形同构。
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "gh",
+            &cfg("uvx"),
+            vec![CachedTool {
+                name: "create_issue".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+            }],
+            now_unix(),
+        );
+        cache.save(dir.path()).unwrap();
+        mgr.reload(dir.path(), now_unix()).await;
+
+        // 下一轮开跑前:磁盘指纹已经被本轮的 reload 推平了。
+        assert!(
+            !mgr.needs_reload(dir.path(), now_unix()),
+            "this is the bug's precondition: the tool's own reload already advanced the fingerprint"
+        );
+        // 但快照与 registry 确实不一致 —— 新 server 的条目进了快照。
+        assert!(
+            mgr.needs_registry_refresh(&registry),
+            "the registry must still be recognized as stale, or the new tools never appear"
+        );
+
+        mgr.refresh_registry(&mut registry);
+        assert!(!mgr.needs_registry_refresh(&registry));
+    }
+
+    // ---- needs_registry_refresh ----
+    //
+    // 本组钉住的是**真实 bug**:`mcp_reload` 工具在轮内自己调了 `reload()`,
+    // 于是下一轮开跑前 `needs_reload` 返回 false,driver 不再重建 registry,
+    // 新工具永远进不了 `ToolRegistry`。只看磁盘指纹是会被自己骗过的代理指标。
+
+    /// 快照里有新工具、registry 里没有 ⇒ 必须刷新。这正是「本轮 mcp_reload
+    /// 写盘 + 探测完,下一轮该把工具装进 registry」的那一刻。
+    #[test]
+    fn needs_registry_refresh_when_the_snapshot_has_tools_the_registry_lacks() {
+        let m = manager_with_fs_read();
+        let registry = ToolRegistry::new(); // 还没装任何 MCP 工具
+        assert!(
+            m.needs_registry_refresh(&registry),
+            "a registry missing the snapshot's tools must be reported stale"
+        );
+
+        let mut refreshed = registry.clone();
+        m.refresh_registry(&mut refreshed);
+        assert!(
+            !m.needs_registry_refresh(&refreshed),
+            "after refresh the registry matches the snapshot"
+        );
+    }
+
+    /// 远端工具改名后,registry 里留着旧名 ⇒ 也必须刷新(否则模型会拿旧名调用)。
+    #[test]
+    fn needs_registry_refresh_when_the_registry_keeps_a_renamed_tool() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+
+        m.replace_server_tools_for_test(
+            "fs",
+            vec![CachedTool {
+                name: "read_v2".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+        );
+        assert!(
+            m.needs_registry_refresh(&registry),
+            "an old tool name must count as stale"
+        );
+    }
+
+    /// 停用某个 server 后,registry 里残留它的工具 ⇒ 必须刷新。
+    #[test]
+    fn needs_registry_refresh_after_a_server_is_disabled() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        m.refresh_registry(&mut registry);
+        m.set_server("fs", false).unwrap();
+        assert!(
+            m.needs_registry_refresh(&registry),
+            "tools of a now-disabled server must be reported stale"
+        );
+    }
+
+    /// 非 MCP 工具不该被算进「落后」的判定里:只有 `ToolSource::Mcp` 是 manager
+    /// 的责任范围,别的工具(内置/skills/插件)它管不着也不算错。
+    #[test]
+    fn needs_registry_refresh_ignores_non_mcp_tools() {
+        let m = manager_with_fs_read();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LocalTool));
+        assert!(m.needs_registry_refresh(&registry));
+
+        m.refresh_registry(&mut registry);
+        assert!(
+            !m.needs_registry_refresh(&registry),
+            "an unrelated local tool must not be treated as a stale MCP tool"
+        );
+    }
+
+    /// 空快照 + 空 MCP 工具集 ⇒ 不必刷新。否则每轮都会无谓重建一次 agent。
+    #[test]
+    fn needs_registry_refresh_is_false_for_an_empty_snapshot() {
+        let m = McpManager::empty();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LocalTool));
+        assert!(!m.needs_registry_refresh(&registry));
+    }
 
     /// 过期 + 探测失败 ⇒ 工具沿用、error 非空、failed_at 被写。
     #[tokio::test]
