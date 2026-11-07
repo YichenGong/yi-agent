@@ -84,7 +84,9 @@ pub(crate) async fn run_thread_driver(
     // subagent 用量汇总。由 `watch_children` 写入，本 driver 读出来推给客户端。
     mut subagent_rx: tokio::sync::watch::Receiver<SubagentTotals>,
     // MCP 管理器。driver 每轮开跑前用它检查 `.yi-agent/mcp.json` 是否被改过，
-    // `SessionCommand::ReloadMcp` 也靠它重新读盘。配置缺失时是 `None`。
+    // `SessionCommand::ReloadMcp` 也靠它重新读盘。**非 naked 路径恒为 `Some`**：
+    // 配置缺失时是一份空快照的 manager，`mcp_reload` 与它是同一个 `Arc`，用户
+    // 在对话里第一次加 MCP 也能生效。
     mcp: Option<Arc<yi_agent_mcp::McpManager>>,
     // 该 thread 的 cwd：`config.workdir` 在 driver 里被 clone 过多次，但
     // MCP 配置固定在 thread cwd 下的 `.yi-agent/mcp.json`，故显式传入更清楚。
@@ -480,9 +482,18 @@ pub(crate) async fn run_thread_driver(
 
         // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
         // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
+        //
+        // 第二个条件是**必须**的:`mcp_reload` 工具在**本轮内**就自己调过
+        // `reload()`,把 `last_seen` 指纹推进到最新值。于是下一轮这里
+        // `needs_reload` 返回 false,而 agent 的 registry 仍是旧的(工具在自己
+        // 执行期间加不进本轮工具表),新工具永远注册不进来。只看「磁盘变没变」
+        // 是个会被自己骗过的代理指标,必须再比一次「registry 与快照是否一致」。
         if let Some(mcp) = &mcp
-            && mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix())
+            && (mcp.needs_reload(&mcp_workdir, yi_agent_mcp::now_unix())
+                || mcp.needs_registry_refresh(&agent.tools()))
         {
+            // 只读盘重载:快照若已是最新(上面的第二种情形),`reload` 会逐条
+            // 走缓存短路,不会重新探测,也不产生进程。
             let report = mcp.reload(&mcp_workdir, yi_agent_mcp::now_unix()).await;
             for s in &report.servers {
                 if let Some(err) = &s.error {
@@ -502,7 +513,7 @@ pub(crate) async fn run_thread_driver(
                 rebuilt = rebuilt.with_permission(checker, rx);
             }
             agent = rebuilt;
-            tracing::info!("MCP config changed on disk; thread registry reloaded");
+            tracing::info!("MCP registry refreshed for this turn");
         }
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的

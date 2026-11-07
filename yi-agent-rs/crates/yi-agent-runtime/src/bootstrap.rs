@@ -109,9 +109,11 @@ pub struct ToolSetup {
     pub tools: Arc<yi_agent_core::ToolRegistry>,
     pub catalog: Option<SkillsCatalogHandle>,
     pub system_prompt: Option<String>,
-    /// MCP 管理器;配置缺失/不可用或注册失败时为 `None`。返回它以便**负责生命
-    /// 周期的调用方**(headless / TUI)在退出前应调用 `shutdown()` 关闭 stdio 子
-    /// 进程;不负责生命周期的调用方可以丢弃它。
+    /// MCP 管理器。非 naked 路径**恒为 `Some`**:配置缺失或损坏时交出的是一份
+    /// 空快照的 manager(而不是 `None`),这样 `mcp_reload` 与 driver 共用同一个
+    /// 实例,用户第一次在对话里加 MCP 也能生效。只有 naked 路径(空工具集)为
+    /// `None`。返回它以便**负责生命周期的调用方**(headless / TUI)在退出前调用
+    /// `shutdown()` 关闭 stdio 子进程;不负责生命周期的调用方可以丢弃它。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
     /// 支撑 `process_start` / `process_list` / `process_read` / `process_kill`
     /// 四个工具的进程管理器。**必须与 `tools` 里的进程工具同行**：调用方要按
@@ -315,26 +317,38 @@ pub fn build_tool_setup_owned(
         // here is exactly the leak that must not be quiet.
         anyhow::bail!("a managed session must launch MCP servers through its owner");
     }
-    let mcp = match yi_agent_mcp::register_mcp_tools_with(&mut registry, &cfg.workdir, launcher) {
-        Ok(manager) => manager,
+    // 没有 `mcp.json` 时也要交出一份 manager(空快照),而不是 `None`。
+    //
+    // 这不是洁癖:driver 每轮开跑前靠这个 manager 判断「registry 是否要刷新」,
+    // 而 `mcp_reload` 工具**也**用它写盘并探测。若这里返回 `None`,`mcp_reload`
+    // 就会拿到一个只有它自己知道的一次性空 manager——用户第一次在对话里说
+    // 「帮我加一个 MCP」时,配置确实写进盘了,但 driver 手上没有 manager,既不会
+    // 重载也不会重建 registry,新工具在进程重启前永远不出现。
+    //
+    // 配置损坏(`Err`)同样退回空 manager:一份坏掉的 JSON 不该把「修好它」的
+    // 唯一入口(`mcp_reload`)一起废掉。
+    let mcp = match yi_agent_mcp::register_mcp_tools_with(
+        &mut registry,
+        &cfg.workdir,
+        launcher.clone(),
+    ) {
+        Ok(Some(manager)) => manager,
+        Ok(None) => yi_agent_mcp::McpManager::empty_with_launcher(launcher),
         Err(err) => {
-            tracing::warn!("MCP disabled: {err:#}");
-            None
+            tracing::warn!("MCP config unavailable; starting with an empty manager: {err:#}");
+            yi_agent_mcp::McpManager::empty_with_launcher(launcher)
         }
     };
 
     // `mcp_reload` 无条件注册:还没有 mcp.json 时必须也有入口,否则"第一次
-    // 加一个 MCP"就无从下手。它与上面探测用的 manager 共享同一份状态。
+    // 加一个 MCP"就无从下手。它与上面探测用的 manager 是**同一个 Arc**,
+    // 否则它改完配置后 driver 手上的那份快照不会跟着变,下一轮也就无从重建。
     {
-        let manager = match &mcp {
-            Some(m) => Arc::clone(m),
-            None => yi_agent_mcp::McpManager::empty(),
-        };
         let blocklist_fn: yi_agent_core::permission::BlocklistFn =
             Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string));
         yi_agent_mcp::register_mcp_reload_tool(
             &mut registry,
-            manager,
+            Arc::clone(&mcp),
             &cfg.workdir,
             Some(blocklist_fn),
         );
@@ -344,7 +358,7 @@ pub fn build_tool_setup_owned(
         tools: Arc::new(registry),
         catalog: prompt.catalog,
         system_prompt: prompt.system_prompt,
-        mcp,
+        mcp: Some(mcp),
         process_manager,
         sandbox: controller,
     })
@@ -388,9 +402,9 @@ pub struct AgentBootstrap {
     pub catalog: Option<SkillsCatalogHandle>,
     /// 本次装配的共享 yolo 开关(clone 自沙箱与权限共用的同一 `Arc`)。
     pub yolo: yi_agent_core::autonomy::YoloSwitch,
-    /// 本次装配的 MCP 管理器。`mcp_reload` 工具与每轮配置变更检查都靠它；
-    /// 配置缺失时是 `None`——此时工具仍在(挂在 `tools` 里),只是没有可重载的
-    /// server,`reload` 会把新建的配置读进来。
+    /// 本次装配的 MCP 管理器。`mcp_reload` 工具与每轮配置变更检查都靠它,
+    /// 两者是**同一个 `Arc`**。非 naked 路径恒为 `Some`:配置缺失时是空快照的
+    /// manager,`reload` 会把新建的配置读进来;只有 naked 路径为 `None`。
     pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
     /// The sandbox controller this bootstrap's tools were built with, so a caller
     /// rebuilding the agent can keep the same live policy.
@@ -1494,10 +1508,15 @@ mod tests {
         assert!(naked.system_prompt.is_none());
     }
 
-    /// 无 `.yi-agent/mcp.json` 时 MCP 装配应返回 `None`,且不注册任何 MCP 工具。
-    /// 锁定「未配置 MCP 不影响既有工具集」,并覆盖 naked 分支。
+    /// 无 `.yi-agent/mcp.json` 时 MCP 装配**仍要交出一份空 manager**,且不注册
+    /// 任何 MCP 工具。
+    ///
+    /// 这里刻意不写「no config => None」:driver 每轮开跑前靠 manager 判断
+    /// registry 是否要刷新,`mcp_reload` 也用它写盘与探测。返回 `None` 会让
+    /// 「用户第一次在对话里说『帮我加一个 MCP』」这条链路断掉——配置确实写进了
+    /// 盘,但 driver 手上没有 manager,既不会重载也不会重建 registry。
     #[test]
-    fn build_tool_setup_without_mcp_config_has_no_manager() {
+    fn build_tool_setup_without_mcp_config_still_yields_a_manager() {
         // 用全新 TempDir 而非 `sample_config()` 的固定 `/tmp/test-workdir`:后者若
         // 意外存在 `.yi-agent/mcp.json`(如被其他测试遗落)会让本测试失真。
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1505,7 +1524,15 @@ mod tests {
         cfg.workdir = tmp.path().to_path_buf();
 
         let setup = build_tool_setup(&cfg, false).expect("build setup");
-        assert!(setup.mcp.is_none(), "no mcp.json => no manager");
+        let manager = setup
+            .mcp
+            .as_ref()
+            .expect("no mcp.json must still yield an empty manager for the driver");
+        assert!(
+            manager.server_names().is_empty(),
+            "the empty manager must have no servers; got {:?}",
+            manager.server_names()
+        );
         assert!(
             setup.tools.names().iter().all(|n| !n.starts_with("mcp__")),
             "no MCP tools should be registered without config; got {:?}",
@@ -1525,6 +1552,48 @@ mod tests {
         let naked = build_tool_setup(&cfg, true).expect("build naked setup");
         assert!(naked.mcp.is_none(), "naked setup never has a manager");
         assert!(naked.tools.is_empty());
+    }
+
+    /// 没有 `mcp.json` 时,`mcp_reload` 改完配置之后,**driver 手上那份 manager
+    /// 必须能看到它**。
+    ///
+    /// 这是「第一次加 MCP」链路的完整闭环:工具写盘 + 探测 → 同一份 manager 的
+    /// 快照更新 → 下一轮 driver 的 `needs_registry_refresh` 才会返回 true 并重建
+    /// registry。若两处各拿一个空 manager,配好也永远不生效——这正是修复前的情形。
+    #[tokio::test]
+    async fn mcp_reload_writes_into_the_same_manager_the_driver_gets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = sample_config();
+        cfg.workdir = tmp.path().to_path_buf();
+
+        let setup = build_tool_setup(&cfg, false).expect("build setup");
+        let manager = setup.mcp.clone().expect("empty manager must be handed out");
+        assert!(manager.server_names().is_empty(), "starts empty");
+
+        let tool = setup
+            .tools
+            .get("mcp_reload")
+            .expect("mcp_reload must be registered");
+        // command 用 `true`:它不触发黑名单/路径校验,进程启动后立刻退出,
+        // 探测会当场失败——但配置**已经写盘**,快照也照样记录了这个 server。
+        let result = tool
+            .call(serde_json::json!({
+                "action": "add",
+                "name": "fs",
+                "kind": "stdio",
+                "command": "true"
+            }))
+            .await;
+        assert!(
+            !result.is_error,
+            "writing the config must succeed; got {result:?}"
+        );
+
+        assert!(
+            manager.server_names().iter().any(|n| n == "fs"),
+            "the manager handed to the driver must see the new server; got {:?}",
+            manager.server_names()
+        );
     }
 
     /// 与上一条互补的正向用例:`.yi-agent/mcp.json` 存在时必须返回 `Some(manager)`。

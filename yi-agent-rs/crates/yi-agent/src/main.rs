@@ -4400,7 +4400,15 @@ fn run_tui_agent(
 
                 // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
                 // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
-                if mcp_for_driver.needs_reload(&driver_workdir, yi_agent_mcp::now_unix()) {
+                //
+                // 第二项判定不能省:`mcp_reload` 工具在**本轮内**就调过
+                // `reload()`,把 `last_seen` 指纹推到最新值;下一轮 `needs_reload`
+                // 因此返回 false,而 `current_tools` 仍是旧的(工具在本轮执行期间
+                // 加不进本轮工具表),新工具永远注册不进来。只看「磁盘变没变」是会
+                // 被自己骗过的代理指标,必须再比一次「registry 与快照是否一致」。
+                if mcp_for_driver.needs_reload(&driver_workdir, yi_agent_mcp::now_unix())
+                    || mcp_for_driver.needs_registry_refresh(&current_tools)
+                {
                     let report = mcp_for_driver.reload(&driver_workdir, yi_agent_mcp::now_unix()).await;
                     for s in &report.servers {
                         if let Some(err) = &s.error {
