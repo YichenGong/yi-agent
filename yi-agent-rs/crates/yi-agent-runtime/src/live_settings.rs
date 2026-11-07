@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod binding;
+pub mod sources;
+
 use crate::settings::document::validate_document;
 use crate::settings::store::{CommitReceipt, MAX_DOCUMENT_BYTES, PatchMode, lock_for_commit};
 use crate::settings::{Settings, SettingsError};
@@ -208,6 +211,25 @@ impl RefreshState {
         snapshot
     }
 
+    /// 一次成功提交的**权威**结果：它已经过严格校验，直接成为缓存与 LKG。
+    ///
+    /// 只在提交的 gate 内调用。提交与「下一次读取」之间没有任何窗口：即便外部
+    /// 进程随后把文件写坏，刷新也会退到这次的 settings/revision，而不是提交前
+    /// 的旧 LKG。字节摘要缓存一并作废：内容已换，旧摘要不再描述当前文件。
+    fn publish_committed(&mut self, receipt: &CommitReceipt) -> Arc<SettingsSnapshot> {
+        let snapshot = Arc::new(SettingsSnapshot {
+            settings: receipt.settings.clone(),
+            revision: receipt.revision.clone(),
+            origin: SnapshotOrigin::Current,
+            health: SettingsHealth::healthy(),
+        });
+        self.last_good = Some(Arc::clone(&snapshot));
+        self.published = Some(Arc::clone(&snapshot));
+        self.cached_digest = None;
+        self.cached_result = None;
+        snapshot
+    }
+
     /// 候选失败：优先复用 LKG，否则对已读原文做无日志的宽容归一化。
     ///
     /// 启动期回退**不**成为 LKG：重复的坏 bytes 必须继续报 `StartupFallback`，
@@ -320,15 +342,22 @@ impl LiveSettings {
     /// 与 [`crate::settings::write_to`] 共用同一把写锁与同一个提交点。
     ///
     /// 锁顺序：实例写锁 → refresh gate。持 gate 期间只做「重读 + 合并 + 校验 +
-    /// rename」，不调用任何会再取写锁的函数。
+    /// rename」，不调用任何会再取写锁的函数。提交成功后，同一段 gate 内把
+    /// 校验好的快照发布成缓存与 LKG——否则「提交 → 文件被外部写坏 → 下一次
+    /// 读取」会退回到提交前的旧内容。
     pub fn commit(&self, patch: &Value, mode: PatchMode) -> Result<CommitReceipt, SettingsError> {
         let writer = lock_for_commit(&self.path, patch)?;
         let outcome = {
-            let _gate = self
+            let mut state = self
                 .gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::settings::store::commit_patch_locked(&self.path, patch, mode)
+            crate::settings::store::commit_patch_locked(&self.path, patch, mode).inspect(
+                |receipt| {
+                    // 提交点已在同一段 gate 内完成：新快照立刻成为缓存与 LKG。
+                    state.publish_committed(receipt);
+                },
+            )
         };
         drop(writer);
         if outcome.is_ok() {
@@ -355,26 +384,31 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<LiveSettings>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 在已登记实例的 refresh gate 内执行 `body`；没有实例时返回 `None`。
+/// 已登记实例在其 refresh gate 内提交，并把提交结果发布成缓存与 LKG。
 ///
-/// 调用方必须**已经持有**该路径的实例写锁（锁顺序：写锁 → gate）。
-pub(crate) fn with_source_gate<T>(path: &Path, body: impl FnOnce(()) -> T) -> Option<T> {
+/// 没有登记实例时返回 `None`（没有读者，也就没有缓存需要发布）。调用方必须
+/// **已经持有**该路径的实例写锁（锁顺序：写锁 → gate）。这是所有公共写入
+/// facade 的同一扇门：旧 `write_to` / RPC / web 表单 / 迁移都经这里。
+pub(crate) fn commit_on_registered_source(
+    path: &Path,
+    patch: &Value,
+    mode: PatchMode,
+) -> Option<Result<CommitReceipt, SettingsError>> {
     let source = registered_source(path)?;
-    let _gate = source
+    let mut state = source
         .gate
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Some(body(()))
-}
-
-/// 已提交路径的登记实例收到一次失效唤醒；没有实例时是空操作。
-///
-/// 不取 gate、不阻塞：旧入口（[`crate::settings::write_to`]）也必须能唤醒
-/// 已存在的源，但写入者不能因为读者慢而被拖住。
-pub(crate) fn notify_committed(path: &Path) {
-    if let Some(source) = registered_source(path) {
+    let outcome = crate::settings::store::commit_patch_locked(&source.path, patch, mode);
+    if let Ok(receipt) = &outcome {
+        state.publish_committed(receipt);
+    }
+    drop(state);
+    if outcome.is_ok() {
+        // 提交点已过；唤醒失败不能把成功伪装成失败。
         source.notify();
     }
+    Some(outcome)
 }
 
 fn registered_source(path: &Path) -> Option<Arc<LiveSettings>> {
@@ -760,6 +794,102 @@ mod tests {
         super::test_hooks::clear();
 
         assert_eq!(live.refresh().settings.agent.max_turns, Some(6));
+    }
+
+    /// 提交必须**当场**把新快照发布成缓存与 LKG，而不是只发一次唤醒。
+    ///
+    /// 抓的破坏：`LiveSettings::commit` 只 `notify()`，没有把 `commit_patch_locked`
+    /// 已经校验好的 settings/revision 写回 `RefreshState`。于是「提交成功 → 外部
+    /// 把文件写坏 → 下一次刷新」会退回到**提交前**的 LKG，把刚保存的值丢掉。
+    #[test]
+    fn commit_publishes_the_new_snapshot_as_last_known_good() {
+        let (_dir, path) = temp_path();
+        std::fs::write(&path, br#"{"agent":{"max_turns":7}}"#).unwrap();
+        let live = LiveSettings::shared(path.clone());
+        let before = live.refresh();
+        assert_eq!(before.settings.agent.max_turns, Some(7));
+
+        let receipt = live
+            .commit(
+                &serde_json::json!({"agent.max_turns": 8}),
+                PatchMode::ReplaceProvided,
+            )
+            .unwrap();
+        assert_ne!(receipt.revision, before.revision);
+
+        // 提交后、下一次刷新前，外部把文件写坏。没有 gate 内发布时，LKG 仍是 7。
+        std::fs::write(&path, b"{not-json").unwrap();
+        let degraded = live.refresh();
+        assert_eq!(
+            degraded.settings.agent.max_turns,
+            Some(8),
+            "the committed value must be the last good snapshot, not the pre-commit one"
+        );
+        assert_eq!(degraded.revision, receipt.revision);
+        assert_eq!(degraded.origin, SnapshotOrigin::LastKnownGood);
+    }
+
+    /// 公共写入 facade（`write_to` / `commit_patch`）走同一扇门、同一次发布。
+    ///
+    /// 抓的破坏：只修 `LiveSettings::commit`，旧入口仍然只取 gate 不发布，
+    /// 于是 RPC / web 表单 / 迁移保存之后同样会退回旧 LKG。
+    #[test]
+    fn every_write_facade_publishes_under_the_same_gate() {
+        let (_dir, path) = temp_path();
+        std::fs::write(&path, br#"{"agent":{"max_turns":7}}"#).unwrap();
+        let live = LiveSettings::shared(path.clone());
+        assert_eq!(live.refresh().settings.agent.max_turns, Some(7));
+
+        let receipt = crate::settings::store::commit_patch(
+            &path,
+            &serde_json::json!({"agent.max_turns": 9}),
+            PatchMode::ReplaceProvided,
+        )
+        .unwrap();
+
+        std::fs::write(&path, b"{not-json").unwrap();
+        let degraded = live.refresh();
+        assert_eq!(degraded.settings.agent.max_turns, Some(9));
+        assert_eq!(degraded.revision, receipt.revision);
+        assert_eq!(degraded.origin, SnapshotOrigin::LastKnownGood);
+    }
+
+    /// 提交后文件保持好状态时下一次读取是 `Current`，读不了时仍退到提交值。
+    ///
+    /// 抓的破坏：提交只更新文件与唤醒，不刷新缓存/LKG，于是「提交 → 下一次读
+    /// 失败」会给出提交前的 revision。
+    #[test]
+    fn commit_leaves_the_committed_revision_as_the_cache_and_lkg() {
+        let (_dir, path) = temp_path();
+        std::fs::write(&path, br#"{"agent":{"max_turns":7}}"#).unwrap();
+        let live = LiveSettings::shared(path.clone());
+        live.refresh();
+
+        let receipt = live
+            .commit(
+                &serde_json::json!({"compact.ratio": 70}),
+                PatchMode::ReplaceProvided,
+            )
+            .unwrap();
+
+        let unchanged = live.refresh();
+        assert_eq!(unchanged.origin, SnapshotOrigin::Current);
+        assert_eq!(unchanged.health.state, HealthState::Healthy);
+        assert_eq!(unchanged.revision, receipt.revision);
+        assert_eq!(
+            unchanged.settings.agent.max_turns,
+            Some(7),
+            "replace-provided keeps the untouched key"
+        );
+        assert_eq!(unchanged.settings.compact.ratio, Some(70));
+
+        // 让后续读取失败（对目录 read 返回 EISDIR），LKG 必须是刚提交的版本。
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let degraded = live.refresh();
+        assert_eq!(degraded.origin, SnapshotOrigin::LastKnownGood);
+        assert_eq!(degraded.revision, receipt.revision);
+        assert_eq!(degraded.settings.compact.ratio, Some(70));
     }
 
     /// 旧的 `write_to` 也必须经注册表唤醒已存在的源。

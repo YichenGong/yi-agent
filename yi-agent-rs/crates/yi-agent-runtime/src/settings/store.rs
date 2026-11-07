@@ -67,22 +67,24 @@ pub struct CommitReceipt {
 ///
 /// 锁顺序是实例写锁 → 同路径 [`crate::live_settings`] 的 refresh gate。存在
 /// 已登记实例时必须先取它的 gate，否则一个正在 gate 内读旧文件的读者会把
-/// 过期内容发布回缓存；不存在实例时没有读者，也就没有 gate 可取。
+/// 过期内容发布回缓存；不存在实例时没有读者，也就没有 gate 可取。成功提交的
+/// 快照在同一段 gate 内发布成缓存与 LKG，因此提交后的第一次读取（哪怕文件
+/// 已被外部写坏）拿到的是提交值，而不是提交前的旧内容。
 pub fn commit_patch(
     path: &Path,
     patch: &Value,
     mode: PatchMode,
 ) -> Result<CommitReceipt, SettingsError> {
     let writer = lock_for_commit(path, patch)?;
-    let receipt = match crate::live_settings::with_source_gate(path, |()| {
-        commit_patch_locked(path, patch, mode)
-    }) {
+    // 有登记实例时，在它的 gate 内提交并**发布**提交结果；没有实例时只是一次
+    // 纯写入（没有缓存需要发布）。
+    let receipt = match crate::live_settings::commit_on_registered_source(path, patch, mode) {
         Some(outcome) => outcome?,
         None => commit_patch_locked(path, patch, mode)?,
     };
     drop(writer);
-    // rename 之后唤醒已存在的同路径源；提交结果已经确定，唤醒失败不影响它。
-    crate::live_settings::notify_committed(path);
+    // 唤醒已在 gate 内由 `commit_on_registered_source` 发出；这里只保留写入
+    // 结果本身。
     Ok(receipt)
 }
 
