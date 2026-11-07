@@ -260,11 +260,31 @@ where
 /// `--listen`、relay 桥与全部测试都拿不到它,因此**不会**凭空多出一个
 /// 「永远等在未认证状态」的会话——那种会话会把所有业务帧静默挡掉。
 fn managed_prepare_handle() -> Option<Arc<crate::server::local_management::ManagementHandle>> {
-    crate::server::local_management::requested_by_launcher().then(|| {
-        Arc::new(crate::server::local_management::ManagementHandle::new(
-            Arc::new(crate::server::local_management::ManagedPrepareBackend),
-        ))
-    })
+    management_surface(crate::server::local_management::requested_by_launcher())
+}
+
+/// `requested` 为真时才给管理面,且**测试构建恒不给**。
+///
+/// 上一版直接信任 `requested_by_launcher()`,而它读的是**进程环境**:在
+/// yi-agent 自己的会话里跑 `cargo test`,测试进程会继承壳写进去的
+/// `YI_AGENT_LOCAL_MANAGEMENT=1`,于是 `serve_stdio` 凭空多出一个未认证的
+/// 管理面,所有业务帧被 bootstrap 闸挡成
+/// `the local session has not completed its bootstrap`
+/// (`agent_factory_failure_returns_internal_error` 实测因此恒失败)。这条
+/// 路径的承诺本就是「全部测试都拿不到它」,所以测试构建里短路掉,而不是让
+/// 每个用例去清环境。管理面自己的用例一律经 `Harness::with_management`
+/// 显式注入,不经过这里。
+fn management_surface(
+    requested: bool,
+) -> Option<Arc<crate::server::local_management::ManagementHandle>> {
+    if cfg!(test) || !requested {
+        return None;
+    }
+    Some(Arc::new(
+        crate::server::local_management::ManagementHandle::new(Arc::new(
+            crate::server::local_management::ManagedPrepareBackend,
+        )),
+    ))
 }
 pub(crate) fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
     yi_agent_relay::parse_relay_parts(relay_url)
@@ -488,4 +508,34 @@ where
         relay_task.abort();
     }
     result
+}
+
+#[cfg(test)]
+mod managed_surface_tests {
+    use super::*;
+
+    /// 测试构建**恒不**从环境派生管理面。
+    ///
+    /// 回归：一次真实的 `just ci` 失败——在 yi-agent 自己的会话里跑测试,进程
+    /// 继承了壳的 `YI_AGENT_LOCAL_MANAGEMENT=1`,`serve_stdio` 于是多出一个
+    /// 未认证的管理面,`thread/start` 被 bootstrap 闸挡掉,
+    /// `agent_factory_failure_returns_internal_error` 拿到的拒绝体只有字符串
+    /// `error`、没有数字 `code`(实测 `left: Null, right: -32603`)。
+    #[test]
+    fn a_test_build_never_invents_a_management_surface() {
+        assert!(
+            management_surface(true).is_none(),
+            "a test build must not derive a management surface from the \
+             inherited environment; management tests inject one explicitly"
+        );
+    }
+
+    /// 没有壳标记时不给管理面——这条在两种构建里都成立。
+    ///
+    /// 它校验的是入参这一侧；测试构建里 `cfg!(test)` 恒真，release 侧
+    /// 「标记为真就给」的分支只能靠上面的用例间接保证，故不在此重复断言。
+    #[test]
+    fn no_marker_means_no_management_surface() {
+        assert!(management_surface(false).is_none());
+    }
 }
