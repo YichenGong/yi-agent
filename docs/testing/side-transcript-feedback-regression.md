@@ -89,7 +89,17 @@
 - 清理后的完整 CI：5913 run / 5911 passed / 2 failed / 40 skipped。失败是插件官方源测试的本地 Node 服务器未输出端口，以及 executor 子进程组清理预算耗尽。两项随后以 `--test-threads 1` 单独 nextest 复验均通过（2/2）；这只证明单项复验，不证明完整 CI 已通过。
 - 最终门禁使用 `NEXTEST_TEST_THREADS=2 CARGO_BUILD_JOBS=2 just ci`，保留所有测试、原 `ci` profile 和原超时：5913/5913 nextest 通过，40 项按既有 ignore gate 跳过；build、bindings、各脚本门禁、MSRV 1.89、32 项 eval 基线均通过，最终 `CI passed` / 退出 0。eval 二进制曾在 `_dyld_start` 启动阶段等待，采样占用 96 KB 且未进入测试入口；其磁盘签名有效，随后原 CI 正常继续完成，同一二进制独立复验也 32/32 通过，没有关闭系统签名机制。
 - 两道依赖审计因网络更新 advisory-db 失败，按仓库既有 fallback 使用本地缓存并给出 stale 警告；`chacha20 0.10.1` 的 yanked 警告由既有策略允许。本轮未修改审计策略，缓存结果不代表检查了最新披露漏洞。
-- 合并后的完整 `just ci` 将在 main 上再次运行，结果另行记录。
+- 合并提交 `11905c86` 在固定 HEAD 的 worktree 中再次运行完整 `NEXTEST_TEST_THREADS=2 CARGO_BUILD_JOBS=2 just ci`：5913/5913 nextest、45 项 bindings 导出、MSRV 1.89、32 项 eval 基线与其余门禁均通过，`CI passed` / 退出 0。这轮 audit 成功联网更新 advisory-db，仅保留既有允许的 yanked 警告；不是 stale-cache 降级。
+- main 上的合并后完整 CI 最终也 `CI passed` / 退出 0，MSRV 与在线审计通过；运行期间另一会话合入了开发构建调试信息配置（`a62e6b64`），没有修改 `/side` 代码。固定 `11905c86` 的完整复验独立于移动中的 main，用于明确本次修复合并提交的验证边界。
+
+### 合并版本交付包
+
+- 修复提交 `17b0d199`，代码合并 `11905c86`，均在本地 main 历史中。
+- 重新构建 sidecar、frontend dist 与独立 Tauri debug bundle，包不依赖 localhost 开发服务器；版本为 `0.1.13-dev+11905c86`，build ID `58ae85e893cf0485f93ab3d626510580`。
+- 独立 bundle ID `com.gongyichen.desktop.side-fix`，设置专用 `YI_AGENT_HOME`，不共享正式实例的会话、relay 或模型凭据。
+- 首次打包流水线在最后的身份查询退出 137，不能算整条命令通过。交付副本独立查询退出 0，版本/build ID 正确，sidecar SHA256 已记录；`codesign --verify --deep --strict` 确认三层签名有效。包内及 Mach-O 动态库引用中无临时探针。
+- 对该合并版本包再次隔离原生验收：问题、完成前流式回答、最终回答、安全失败提示四项均通过，`NATIVE_EXIT=0`；原生截图与事件证据已保存。
+- 本机交付包及日志保存在项目 `.artifacts/side-feedback/`（忽略构建产物，不提交二进制）。正式 `/Applications/yi-agent.app` 未替换、未关闭或重启；独立包不自动复制正式配置。
 
 ## 审查记录的非阻断后续风险（本轮未修改）
 
@@ -101,7 +111,7 @@
 ## 交付边界
 
 - 修复 worktree 的完整 `just ci` 退出 0，三次独立静态审查无阻断项，原生 WKWebView 四项验收通过。
-- 合并结果必须再执行完整 `just ci`。
+- 合并提交 `11905c86` 的固定 HEAD 完整 `just ci` 已再次退出 0，合并版本独立包原生验收四项再次通过。
 - 正式 App 尚未替换或重启，不能把代码完成表述为正在运行的旧 App 已更新。
 
 ## 复验命令
