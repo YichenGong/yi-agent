@@ -13,7 +13,7 @@
 | 命令 | 结果 |
 |---|---|
 | `cd desktop && npx tsc --noEmit` | exit 0 |
-| `cd desktop && npx vitest run` | 172 文件 / 2522 tests passed |
+| `cd desktop && npx vitest run` | 173 文件 / 2536 tests passed |
 | `cd desktop && npm run build` | 成功（256ms，仅有既有的 chunk 体积警告） |
 | `cd desktop && npm run test:browser:subagent-trace` | 87 checks / 18 matrix cells，全部通过 |
 | `cd yi-agent-rs && cargo test -p yi-agent-app-server trace_unwatch_` | 3 passed |
@@ -127,14 +127,26 @@ composer 一起落在面板可视范围内。
 |---|---|---|
 | 深色 `--fg-subtle` | `#9b9b9b` | 5.44（raised） |
 | 深色 `--fg-faint` | `#8f8f8f` | 4.68（raised） |
-| 浅色 `--fg-subtle` | `#5c5c5c` | ≥6.2（panel） |
-| 浅色 `--fg-faint` | `#6b6b6b` | ≥5.3（panel） |
+| 浅色 `--fg-subtle` | `#5c5c5c` | 5.31（raised） |
+| 浅色 `--fg-faint` | `#656565` | 4.63（raised） |
 | 浅色 `.hljs-comment` | `#5f676e` | 4.57（raised） |
 | 浅色 `.hljs-keyword` | `#c21e2b` | 4.74（raised） |
 
-两档之间仍保留层级差（`fg` 7.85 / `fg-muted` 7.11 / `fg-subtle` 5.44 /
-`fg-faint` 4.68 on raised 的 dark 主题）。这是**全局 token**，会影响主对话的次级
+两档之间仍保留层级差（raised 底上：dark `fg` 13.88 / `fg-muted` 6.00 /
+`fg-subtle` 5.44 / `fg-faint` 4.68；light `fg` 14.23 / `fg-muted` 6.20 /
+`fg-subtle` 5.31 / `fg-faint` 4.63）。这是**全局 token**，会影响主对话的次级
 文字，属于有意的可读性修正，不是只给面板打补丁。
+
+**复查时抓到的一处自身错误**：本表最初把浅色 `--fg-faint` 写成 `#6b6b6b` 且
+标注「≥5.3（panel）」。实际 `#6b6b6b` 在 `--raised #e5e5e5` 上只有 **4.23:1**，
+不达标；文档里的 5.3 也是把 panel(4.89) 记错了。已改为 `#656565`（raised
+4.63 / panel 5.35 / white 5.83），仍比 `--fg-subtle #5c5c5c` 浅一档。为了让这类
+错误不再只靠肉眼发现，新增单测 `desktop/src/themeContrast.test.ts`（14 条）直接
+读 `index.css` 与 `highlight-light.css`，断言 `fg`/`fg-muted`/`fg-subtle`/`fg-faint`
+在每个主题的 `surface`/`panel`/`raised` 三种底色上都 ≥4.5:1，代码高亮注释与关键字
+在 `panel`/`raised` 上同样达标，并断言四档明度单调（极性随主题翻转）。变异验证：
+把 `#656565` 改回 `#6b6b6b`，该测试立即报
+`light --fg-faint=#6b6b6b on --raised=#e5e5e5: expected 4.23057075471515 to be greater than or equal to 4.5`。
 
 证据：修复前浏览器 `dark theme text meets its contrast floor` 报 13 处不达标、
 `light theme text meets its contrast floor` 报 5 处不达标；修复后两者均为 0 处，
@@ -168,7 +180,7 @@ A12 要求「取消确认打开时焦点落在『放弃』而非危险动作」�
 
 **`just ci` 不含桌面端门禁**（`justfile:230` 起说明：CI 镜像没有 Node，塞进去会
 拖垮流水线），所以前端另外单独跑了 `just desktop-check`（`npm ci` +
-`npx tsc --noEmit` + `npx vitest run`）：**exit 0，172 文件 / 2522 tests passed**。
+`npx tsc --noEmit` + `npx vitest run`）：**exit 0，173 文件 / 2536 tests passed**。
 真实浏览器脚本也复跑了一次：87 checks / 18 matrix cells 全通过。
 
 ## 6. 未验项（明确记录，不当作已通过）

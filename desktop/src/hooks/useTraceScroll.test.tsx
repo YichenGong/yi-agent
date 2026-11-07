@@ -156,7 +156,10 @@ function following(): string | undefined {
 let resizeCallbacks: ResizeObserverCallback[] = [];
 
 class StubResizeObserver {
+  /** 记下本次实例的 callback，`disconnect` 才有东西可删。 */
+  private readonly callback: ResizeObserverCallback;
   constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
     resizeCallbacks.push(callback);
   }
   observe(): void {}
@@ -164,7 +167,6 @@ class StubResizeObserver {
   disconnect(): void {
     resizeCallbacks = resizeCallbacks.filter((callback) => callback !== this.callback);
   }
-  private readonly callback: ResizeObserverCallback | null = null;
 }
 
 /** Fire every registered observer callback, as the browser would after a layout change. */
