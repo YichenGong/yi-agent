@@ -625,10 +625,19 @@ async fn a_child_caller_opens_a_fork_upload_and_forks_its_own_child() {
         .await
         .unwrap();
     let grandchild_start = worker_start_for(&fixture.starts, &grandchild);
+    let seed = grandchild_start
+        .fork_messages
+        .as_deref()
+        .expect("the child's uploaded history reaches the forked grandchild worker");
     assert_eq!(
-        grandchild_start.fork_messages.as_deref(),
-        Some(history.as_slice()),
-        "the child's uploaded history reaches the forked grandchild worker"
+        &seed[..history.len()],
+        history.as_slice(),
+        "the child's uploaded history reaches the forked grandchild worker verbatim"
+    );
+    assert_eq!(
+        seed.len(),
+        history.len() + 1,
+        "the daemon closes the grandchild's seed with exactly one task boundary"
     );
 }
 

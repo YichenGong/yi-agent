@@ -325,10 +325,19 @@ fn a_forked_spawn_carries_the_history_to_the_child_worker() {
         .iter()
         .find(|start| start.task_id.to_string() == task_id)
         .expect("the forked child's worker started");
+    let seed = start
+        .fork_messages
+        .as_deref()
+        .expect("the uploaded history reaches the child worker");
     assert_eq!(
-        start.fork_messages.as_deref(),
-        Some(history.as_slice()),
-        "the uploaded history reaches the child worker"
+        &seed[..history.len()],
+        history.as_slice(),
+        "the uploaded history reaches the child worker verbatim"
+    );
+    assert_eq!(
+        seed.len(),
+        history.len() + 1,
+        "the daemon closes the seed with exactly one task boundary"
     );
 }
 
@@ -586,10 +595,19 @@ fn a_child_caller_forks_its_own_child_over_the_socket() {
         .iter()
         .find(|start| start.task_id.to_string() == grandchild)
         .expect("the forked grandchild's worker started");
+    let seed = start
+        .fork_messages
+        .as_deref()
+        .expect("the child's uploaded history reaches the forked grandchild worker");
     assert_eq!(
-        start.fork_messages.as_deref(),
-        Some(history.as_slice()),
-        "the child's uploaded history reaches the forked grandchild worker"
+        &seed[..history.len()],
+        history.as_slice(),
+        "the child's uploaded history reaches the forked grandchild worker verbatim"
+    );
+    assert_eq!(
+        seed.len(),
+        history.len() + 1,
+        "the daemon closes the grandchild's seed with exactly one task boundary"
     );
 }
 
