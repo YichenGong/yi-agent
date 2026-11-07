@@ -8,7 +8,8 @@
  */
 import { memo, useEffect, useState } from "react";
 import type { AgentCancelPreviewResult, AgentTraceSnapshotResult } from "../lib/protocol";
-import { foldTraceRows, type SubagentRow, type TraceBlock } from "../lib/subagents";
+import type { SubagentRow } from "../lib/subagents";
+import { foldTraceRows, type TraceBlock } from "../lib/subagentTraceModel";
 
 /**
  * One trace block, memoized on its **values**, not on the block object.
@@ -21,27 +22,52 @@ import { foldTraceRows, type SubagentRow, type TraceBlock } from "../lib/subagen
  */
 const TraceRowView = memo(function TraceRowView({
   kind,
+  sourceKind,
   text,
+  name,
   isError,
+  rawPayload,
 }: {
   kind: TraceBlock["kind"];
+  sourceKind: string;
   text: string;
+  name: string | null;
   isError: boolean;
+  rawPayload: string | null;
 }) {
   if (kind === "assistant_text") {
     return <p className="my-1 whitespace-pre-wrap text-sm text-fg">{text}</p>;
   }
   if (kind === "tool_call") {
-    return <p className="my-1 font-mono text-xs text-sky-300">{text}</p>;
+    // The model keeps the tool's name out of `text` (it is a summary, not a
+    // sentence); the call's identity is part of what the user reads, so it is
+    // composed here rather than dropped.
+    return (
+      <p className="my-1 font-mono text-xs text-sky-300">
+        {`${name ?? ""}(${text})`}
+      </p>
+    );
   }
   if (kind === "tool_result") {
     return (
       <p className={`my-1 font-mono text-xs ${isError ? "text-red-300" : "text-fg-subtle"}`}>
+        {name ? `${name}: ` : ""}
         {text}
       </p>
     );
   }
-  return <p className="my-1 text-xs text-fg-subtle">{text}</p>;
+  if (kind === "state_note") {
+    // The leading dot is presentation; the model's text stays plain.
+    return <p className="my-1 text-xs text-fg-subtle">· {text}</p>;
+  }
+  // A raw block is a row that did not fit its kind's schema. Showing the
+  // original payload (and which kind it claimed) is the only honest rendering:
+  // an empty line would hide output the daemon did send.
+  return (
+    <p className="my-1 whitespace-pre-wrap font-mono text-xs text-amber-300">
+      [{sourceKind}] {rawPayload ?? text}
+    </p>
+  );
 });
 
 /**
@@ -124,7 +150,15 @@ export function SubagentTrace({
           <p className="text-sm text-fg-subtle">该任务暂无轨迹</p>
         ) : (
           blocks.map((block) => (
-            <TraceRowView key={block.key} kind={block.kind} text={block.text} isError={block.isError} />
+            <TraceRowView
+              key={block.key}
+              kind={block.kind}
+              sourceKind={block.sourceKind}
+              text={block.text}
+              name={block.name}
+              isError={block.isError}
+              rawPayload={block.rawPayload}
+            />
           ))
         )}
       </div>

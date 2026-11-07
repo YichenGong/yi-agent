@@ -6,7 +6,7 @@
  * shape is a rendering bug, but a rail that folds notifications wrongly is a
  * state bug, and the two deserve separate tests.
  */
-import type { AgentChild, AgentTraceRow } from "./protocol";
+import type { AgentChild } from "./protocol";
 
 /** A child as the rail shows it: identity, progress, and whether it is done. */
 export interface SubagentRow {
@@ -180,88 +180,4 @@ export function childrenOf<T extends { taskId: string; parentTaskId?: string | n
   taskId: string,
 ): T[] {
   return children.filter((child) => (child.parentTaskId ?? null) === taskId);
-}
-
-/**
- * One block of the trace detail: what the user reads, not what was persisted.
- *
- * A run of assistant text rows is one block (the writer flushes text every 512
- * bytes or 200ms, so consecutive rows are one message split by its flush
- * threshold, not two messages). Tool calls and results stay separate blocks so
- * a tool's state is visible without expanding anything.
- */
-export interface TraceBlock {
-  /** Stable within a view; the first row id that produced the block. */
-  key: string;
-  kind: "assistant_text" | "tool_call" | "tool_result" | "state_note" | string;
-  text: string;
-  isError: boolean;
-}
-
-/**
- * Fold trace rows into blocks, merging consecutive assistant text.
- *
- * The fold is a pure function of the whole row list. A streaming client that
- * appended to a mutable block would have to know which block the previous frame
- * ended on; folding the list it already holds cannot drift, and the memoization
- * upstream keeps it from re-running per delta.
- */
-export function foldTraceRows(rows: AgentTraceRow[]): TraceBlock[] {
-  const blocks: TraceBlock[] = [];
-  for (const row of rows) {
-    const line = toTraceLine(row);
-    const last = blocks[blocks.length - 1];
-    if (line.kind === "assistant_text" && last?.kind === "assistant_text") {
-      blocks[blocks.length - 1] = { ...last, text: last.text + line.text };
-      continue;
-    }
-    blocks.push({
-      key: `row-${row.eventId}`,
-      kind: line.kind,
-      text: line.text,
-      isError: line.isError,
-    });
-  }
-  return blocks;
-}
-
-/**
- * Fold a trace row into a display line.
- *
- * The payload is the fact's own serde encoding (an internal `type` tag), so the
- * kind column is only used to pick a label: a row whose payload does not parse
- * still renders its raw text rather than disappearing.
- */
-export interface TraceLine {
-  kind: string;
-  text: string;
-  isError: boolean;
-}
-
-export function toTraceLine(row: AgentTraceRow): TraceLine {
-  let payload: Record<string, unknown> | null = null;
-  try {
-    payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
-  } catch {
-    payload = null;
-  }
-  const asString = (v: unknown): string => (typeof v === "string" ? v : "");
-  switch (row.kind) {
-    case "assistant_text":
-      return { kind: row.kind, text: asString(payload?.text), isError: false };
-    case "tool_call": {
-      const name = asString(payload?.name);
-      const summary = asString(payload?.summary);
-      return { kind: row.kind, text: `${name}(${summary})`, isError: false };
-    }
-    case "tool_result": {
-      const isError = payload?.is_error === true;
-      const summary = asString(payload?.summary);
-      return { kind: row.kind, text: summary, isError };
-    }
-    case "state_note":
-      return { kind: row.kind, text: `· ${asString(payload?.note)}`, isError: false };
-    default:
-      return { kind: row.kind, text: row.payloadJson, isError: false };
-  }
 }

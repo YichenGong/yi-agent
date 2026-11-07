@@ -146,6 +146,42 @@ describe("SubagentTrace", () => {
     expect(screen.queryByRole("button", { name: "关闭详情" })).toBeNull();
   });
 
+  it("composes the tool name and the note prefix from primitive fields", () => {
+    const rows: AgentTraceRow[] = [
+      {
+        eventId: 1,
+        taskId: "task-1",
+        kind: "tool_call",
+        payloadJson: JSON.stringify({ type: "tool_call", name: "bash", summary: "cargo test" }),
+      },
+      {
+        eventId: 2,
+        taskId: "task-1",
+        kind: "state_note",
+        payloadJson: JSON.stringify({ type: "state_note", note: "completed" }),
+      },
+    ];
+    render(<SubagentTrace {...baseProps} rows={rows} />);
+    fireEvent.click(screen.getByRole("button", { name: /展开轨迹/ }));
+    // The model's text is the bare summary; the name must still be on screen.
+    expect(screen.getByText("bash(cargo test)")).toBeTruthy();
+    expect(screen.getByText("· completed")).toBeTruthy();
+  });
+
+  it("shows a malformed known row as its original payload, never blank", () => {
+    const broken: AgentTraceRow = {
+      eventId: 3,
+      taskId: "task-1",
+      kind: "assistant_text",
+      payloadJson: JSON.stringify({ text: 42, marker: "raw-marker" }),
+    };
+    const { container } = render(<SubagentTrace {...baseProps} rows={[broken]} />);
+    fireEvent.click(screen.getByRole("button", { name: /展开轨迹/ }));
+    // Both the claimed kind and the original payload must be on screen.
+    expect(container.textContent).toContain("[assistant_text]");
+    expect(container.textContent).toContain(broken.payloadJson);
+  });
+
   it("says the trace is empty instead of rendering nothing", () => {
     render(<SubagentTrace {...baseProps} rows={[]} />);
     fireEvent.click(screen.getByRole("button", { name: /展开轨迹/ }));
