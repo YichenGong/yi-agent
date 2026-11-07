@@ -194,8 +194,9 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 
 1. **`incremental/<crate>-<suffix>/`**：同一 crate 前缀下只保留 mtime 最新的
    一个会话目录，其余整目录删除。**这是最大收益**（实测 21.96 GiB / 603 个）。
-2. **`deps/<crate>-<hash>.<mid>.<idx>.rcgu.o`**（**需 `deps=1` 显式开启**，
-   原因见 §7.2：`unpacked` 下这些文件就是调试信息）：
+2. **`deps/<crate>-<hash>.<mid>.<idx>.rcgu.o`**：采纳 §4.2 的 A 之后默认执行
+   （`split-debuginfo = "off"` 让 `.o` 不再承载 DWARF）。脚本先抽样确认该目录
+   的 `.o` 不含 `__DWARF`（见 §7.3），命中则跳过并提示 `deps=1`：
    - 孤儿 key（无同名 `.rlib`）：整个 key 的 `.o` 全删。
    - 同一 key 内只保留 mtime 最新 mid 的 `.o`，其余删除。
    - **必须先判 `st_nlink == 1` 才计入「将释放」体积**，否则会像第一版那样
@@ -210,32 +211,37 @@ cargo 只在**同一次编译的链接步骤**里读这些 `.o`，产物落盘�
 
 ```bash
 just clean-target                            # 预演，打印分项收益
-just clean-target apply=1                    # 执行（只清 incremental 陈旧会话）
-just clean-target apply=1 deps=1             # 连 deps 的 .o 一起（放弃历史调试）
+just clean-target apply=1                    # 执行（incremental 陈旧会话 + deps 垃圾）
 just clean-target apply=1 worktrees=1        # 连 .worktrees/*/yi-agent-rs/target
 just clean-target apply=1 min-age=0          # 解除 600s 保护（确认无并发编译时）
+just clean-target apply=1 deps=keep          # 显式保留 deps 不动
 ```
 
-### 4.2 `[profile.dev]` 的取值：**待定**（§9）
+### 4.2 `[profile.dev]` 的取值：**已定 A**
 
-三个候选（`--all-features --workspace` 全量测试构建实测）：
+**决定（2026-11-07）：选 A。**
 
 ```toml
-# A. 不落 DWARF，体积最小
 [profile.dev]
-split-debuginfo = "off"     # 9.7 G，无累积，零调试信息
-
-# B. 连符号都省
-[profile.dev]
-debug = 0                   # 6.65 G，无累积，零调试信息
-
-# C. 保留完整调试能力，接受一次性 dSYM
-[profile.dev]
-split-debuginfo = "packed"  # 18.2 G，无累积，源码级调试可用（dSYM 7.9 G）
+split-debuginfo = "off"
 ```
 
-A 与 B 的调试能力相同（都是 0），B 只再省 3 G。A 与 B 都**不产生 `.o`**，
-因此 §7.2 的顾虑消失；C 把 DWARF 挪进 dSYM，`.o` 也不再承载调试信息。
+三个候选的实测（`--all-features --workspace` 全量测试构建）：
+
+| | 配置 | 总量 | 调试能力 | 累积 |
+|---|---|---|---|---|
+| **A（采纳）** | `split-debuginfo = "off"` | 9.7 G | 无 | 无 |
+| B | `debug = 0` | 6.65 G | 无 | 无 |
+| C | `split-debuginfo = "packed"` | 18.2 G | 源码级可用 | 无 |
+
+选 A 的理由：C 多花 8.5 G 只为保留调试信息，而改一行代码重编只需秒级，
+调试刚编的产物不依赖历史 `.o`；B 只比 A 再省 3 G 却连符号表都省掉，排查
+panic 时连函数名都没有，不划算。A 恰好卡在「不再产出 `.o`/`.dSYM`」与
+「保留符号」之间。
+
+**A 的副作用**：`split-debuginfo = "off"` 在 macOS 上会连 DWARF 一起丢弃
+（§3 已实测），所以 `.o` 不再承载调试信息 —— 这正意味着 §7.2 对 `deps=1`
+的顾虑消失，`deps=1` 可以成为默认清理行为。
 
 `line-tables-only` 两种组合均已排除（见 §3）。
 
@@ -272,26 +278,69 @@ A 与 B 的调试能力相同（都是 0），B 只再省 3 G。A 与 B 都**不
 $ bash scripts/test_reclaim_target.sh
 8 passed          ← 现状；需按 §4.4 扩充
 
-$ just clean-target            # 当前主仓库预期（默认只清 incremental）
-   incremental 陈旧会话 : 603 个目录，真实释放 18.70 GiB
-
-$ just clean-target deps=1     # 再加 deps
+$ just clean-target            # 当前主仓库预期（两段都默认执行）
+   incremental 陈旧会话 : 603 个目录
    deps 垃圾 .o         : 258,634 个
-   两段合计（去重 177,199 inode）: 45.17 GiB
+   去重后唯一 inode     : 177,199
+   合计真实可释放       : 45.17 GiB
+
+$ just clean-target            # 切换 profile 并重编之后的稳态
+   两段合计             : 接近 0（新产物不再累积）
+   target/debug 总量    : ~9.7 G（不再是 91.4 G）
 
 $ find $T/debug/deps -name '*.rcgu.o' -delete && cargo build -p yi-agent-tools
    Compiling 行数 0，rlib mtime 未变，.o 不再生成
 ```
 
-### 5.1 一个已踩到的坑：自定义 profile 跑 nextest
+### 5.1 已定位：nextest 挂起不是 nextest 的 bug
 
-实验中发现 `cargo nextest run --cargo-profile ci` 在编译完成后，30+ 个子进程
-`<test-binary> --list --format terse` 全部挂起 35 分钟不动，杀掉后无法定位原因
-（不是磁盘满，`df` 当时有 193 G 空闲）。普通 `dev` profile 无此现象。
+实验期间多次遇到 `cargo nextest ... --workspace` 挂住几十分钟。已彻底定位，
+**与 `--cargo-profile` 无关**（前一版 spec 归因错误，见下）。
 
-**结论：本 spec 不建议引入自定义 profile 跑测试。** 若 plan 里要动这个，
-必须先在干净环境复现确认。§4.2 的三个候选都改的是 `[profile.dev]` 本身，
-不涉及新增 profile，所以不受影响。
+**现象**：30+ 个子进程 `<test-binary> --list --format terse` 卡住不动。
+
+**关键证据**：
+
+```
+$ vmmap --summary <pid>
+Process exists but has not started -- it is launched-suspended
+
+$ sample <pid>
+Call graph:  _dyld_start   ← 无任何线程推进
+Physical footprint: 96K    ← 连 dyld 绑定都没做完
+```
+
+**根因链**（逐层抓栈确认）：
+
+1. nextest 主线程阻塞在 `BaseApp::build_binary_list_with_scope`
+   → `CargoBuildSettings::compute_binary_list`
+   → `BufReader<duct::ReaderHandle>::read_line` → `read()`。
+   它在**读 `cargo` 子进程的 stdout**，而那行永远不来。
+2. 那个 `cargo test --no-run` 卡在
+   `Layout::new` → `Filesystem::open_rw_exclusive_create` → `flock::acquire`，
+   即**等 `.cargo-build-lock`**。
+3. 持锁的是**另一个会话的** `cargo test -p yi-agent-runtime --lib`，
+   它的主线程停在 `__wait4` —— 等它自己的测试进程。
+4. 而它的测试进程正是第 1 步那批 `launched-suspended` 的进程，永远不开始。
+
+**闭环**：`suspended 子进程 → 另一个 cargo 永不返回 → 锁不释放 →
+我的 cargo 排队 → nextest 读不到 stdout → 看起来"卡死"。**
+
+**真正的触发条件是「多个会话并发使用同一个 `target/`」**，本仓库常见：
+
+```
+$ lsof target/debug/.cargo-build-lock
+cargo   26139 ...   ← 另一个会话 (cwd = 主仓库 yi-agent-rs)
+cargo   98826 ...   ← 本会话
+```
+
+**实践结论**：
+- 单 crate（`-p X`）、无并发时正常，实测秒级完成。
+- 有别的会话在编译时，全 workspace 会排队甚至挂数十分钟。
+- **判定方法**：`ps ax | grep 'deps/.*--list'` + `vmmap --summary` 看是否
+  `launched-suspended`；`lsof target/debug/.cargo-build-lock` 看谁持锁。
+- **不要**把它当成 nextest 或 profile 的问题，也不要为此改 `nextest.toml`。
+- 本 spec 的所有改动都不依赖"并发跑全量 nextest"，不受影响。
 
 ## 6. 未做的事（明确取舍）
 
@@ -362,10 +411,22 @@ yi_agent_tools-bbce49c9b91c28aa : OSO -> deps/ = 1213, OSO -> incremental/ = 0
 所以删会话目录对已链接产物的调试能力毫无影响，这是默认路径安全的硬证据。
 
 **因此清理必须显式承认这一点**：
-- 默认只清 `incremental/` 的陈旧会话（§7.3 已证明不影响编译与调试）。
-- 清 `deps/` 的 `.o` 需显式开关 `deps=1`（脚本层 `--include-deps`）。
-- 若选了 §4.2 的 `packed`/`off`，DWARF 不再依赖 `.o`（落 `.dSYM` 或不落），
-  该顾虑消失，`deps=1` 可作为默认。
+- **采纳 A 之后**：`split-debuginfo = "off"` 让 `.o` 不再含 DWARF，删 `deps/`
+  的 `.o` 对调试无影响，因此**两段判据都默认执行**（§4.2 决策）。
+- **过渡期与外部单元**：切换 profile 前留下的 `.o` 是 `unpacked` 产物、仍含
+  DWARF；`desktop/` 与 `plugins/` 也可能仍是 `unpacked`。删这些会丢掉调试信息。
+  脚本因此**抽样检测**（不是查 `.fingerprint`，它只存 profile 哈希，实测
+  `profile` 字段是一个 u64，读不出 `split_debuginfo`）：
+
+  ```
+  抽 3 个 .o 跑 `otool -l`，若 __DWARF 段数 > 0 → 判定为仍承载调试信息
+  ```
+
+  实测判据有效：`unpacked` 的 `.o` 命中 9~11 个 `__DWARF` 段，`off` 的目录
+  里根本没有 `.o`。命中时打印警告并**跳过该目录的 deps 清理**，除非显式
+  `deps=1`。
+- **`incremental/` 任何时候都可清**：§7.3 用 N_OSO debug map 证明已链接产物
+  只引用 `deps/`（1213 个 OSO 指向 deps，0 个指向 incremental）。
 
 ## 8. 已证伪的早期结论
 
@@ -382,13 +443,13 @@ yi_agent_tools-bbce49c9b91c28aa : OSO -> deps/ = 1213, OSO -> incremental/ = 0
 | 「删 `.o` 完全安全」 | 对**编译**安全（零重编），但 `unpacked` 下 `.o` 就是 DWARF：删除后 lldb 行断点从 3 locations 变 no locations |
 | 「`off` + `debug = "full"` 能保留调试」 | `off` 在 macOS 上直接丢弃 DWARF，`debug` 级别改不动它 |
 | 「清理只做 deps 就够了」 | 已链接产物只引用 `deps/.o`，但 `incremental/` 陈旧会话才是更大的可回收块（18.70 GiB 真实） |
+| 「nextest 在自定义 profile 下会挂起」 | 与 profile 无关。是多会话共用 `target/` 导致 `.cargo-build-lock` 争抢，nextest 卡在读 cargo stdout。栈已逐层确认（§5.1） |
 
-## 9. 待决问题
+## 9. 决策记录
 
-**§4.2 的 `[profile.dev]` 取哪个？**
+| 问题 | 决定 | 日期 |
+|---|---|---|
+| `[profile.dev]` 取哪个 | **A：`split-debuginfo = "off"`**（§4.2） | 2026-11-07 |
+| 默认是否清 `deps/` 的 `.o` | **是**。选 A 后 `.o` 不含 DWARF，§7.2 的顾虑消失 | 2026-11-07 |
 
-- A. `split-debuginfo = "off"`（9.7 G）——不产出 `.o`/`.dSYM`，但无调试信息
-- B. `debug = 0`（6.65 G）——磁盘最小，panic 无行号
-- C. 维持默认（10.4 G）——只靠 §4.1 的清理兜底
-
-§4.1、§4.3、§4.4 的改动与该选择无关，可先实施。
+剩无待决项，可进入实现计划。
