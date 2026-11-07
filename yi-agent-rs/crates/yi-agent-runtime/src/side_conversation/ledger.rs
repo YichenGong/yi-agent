@@ -35,7 +35,7 @@ pub struct AcceptedRequest {
 }
 
 /// The set of requests one side has already accepted.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SideRequestLedger {
     requests: BTreeMap<String, AcceptedRequest>,
 }

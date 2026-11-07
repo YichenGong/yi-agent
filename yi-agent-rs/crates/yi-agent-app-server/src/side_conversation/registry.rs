@@ -632,18 +632,23 @@ impl SideRegistry {
         }
 
         let turn_id = uuid::Uuid::new_v4().to_string();
-        // Record the acceptance before starting: a crash mid-start must leave a
-        // dedup entry, not an accepted-but-unrecorded request.
-        guard.ledger.accept(request_id, &text, turn_id.clone())?;
+        // Prepare acceptance and the desktop's shared transcript before starting
+        // the runner. A budget/wire failure must neither spend a provider turn
+        // nor leave an accepted request or a partially recorded question behind.
+        // Transcript bodies are Arc-backed: cloning only copies the index/handles.
+        let mut ledger = guard.ledger.clone();
+        ledger.accept(request_id, &text, turn_id.clone())?;
+        let mut transcript = guard.transcript.clone();
+        let question_items = transcript.begin_turn(&turn_id, &text)?;
+        let question_items = question_items
+            .iter()
+            .filter(|item| item.turn_id == turn_id)
+            .map(|item| super::wire_item(item))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let stream = match guard.runner.start_turn(turn_id.clone(), text).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                // The turn never started, so it must not stay in the ledger as if it
-                // had: a retry would then report a turn id that does not exist.
-                return Err(error);
-            }
-        };
+        let stream = guard.runner.start_turn(turn_id.clone(), text).await?;
+        guard.ledger = ledger;
+        guard.transcript = transcript;
         guard.deadline.touch(tokio::time::Instant::now());
         // 受理与「Running 已发布」在同一临界区内完成:客户端只有在收到这条
         // changed 之后才敢认为自己发的这条消息被受理了。推迟到模型启动之后发,
@@ -652,9 +657,25 @@ impl SideRegistry {
             side_id: entry.side_id.clone(),
             summary: entry.summary(),
         });
+        // Publish the accepted question before draining any provider output.
+        let mut question_updates = Vec::new();
+        for item in question_items {
+            if let Some(update) =
+                Self::stage(&mut guard, |entry| super::SidePublishedUpdate::Item {
+                    side_id: entry.side_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item,
+                })
+            {
+                question_updates.push(update);
+            }
+        }
         drop(guard);
         if let Some(staged) = accepted {
             self.deliver(staged).await;
+        }
+        for update in question_updates {
+            self.deliver(update).await;
         }
 
         // Drain the stream off the request path. The pump already joined the core

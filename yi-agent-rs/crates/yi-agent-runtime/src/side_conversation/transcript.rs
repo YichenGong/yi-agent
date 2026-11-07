@@ -133,12 +133,14 @@ impl Kind {
 /// A streaming message owns several parts (its split items); a tool call owns
 /// exactly one. Entries — not items — define order, so replacing a part never
 /// reorders anything.
+#[derive(Clone)]
 struct Entry {
     ordinal: u64,
     parts: Vec<Arc<SideItem>>,
 }
 
 /// One side's transcript.
+#[derive(Clone)]
 pub struct SideTranscript {
     limit_bytes: usize,
     max_item_bytes: usize,

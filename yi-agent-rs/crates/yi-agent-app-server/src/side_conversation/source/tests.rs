@@ -74,13 +74,84 @@ fn seed(store: &ThreadStore, id: &str, question: &str, answer: &str) {
         .unwrap();
 }
 
+#[test]
+fn side_cold_config_resolves_the_catalog_instead_of_the_display_model() {
+    use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+
+    let dir = TempDir::new().unwrap();
+    let store = ThreadStore::new(dir.path());
+    seed(&store, "p1", "question", "answer");
+    let entry = |name: &str, url: &str, model: &str| ModelEntry {
+        name: name.into(),
+        provider: ModelProvider::Openai,
+        api_url: url.into(),
+        model: model.into(),
+        api_key: "local-test-placeholder".into(),
+        api_style: Some("chat".into()),
+        reasoning_effort: Some("low".into()),
+        reasoning_capabilities: None,
+        context_length: Some(100_000),
+    };
+    let catalog = ModelCatalog {
+        models: vec![
+            entry(
+                "default entry",
+                "http://127.0.0.1:19001/v1",
+                "default-wire-model",
+            ),
+            entry(
+                "session entry",
+                "http://127.0.0.1:19002/v1",
+                "session-wire-model",
+            ),
+        ],
+        default_model: Some("default entry".into()),
+        subagent_model: None,
+    };
+    let base = base_config(dir.path());
+    for (model_ref, want_url, want_model) in [
+        (None, "http://127.0.0.1:19001/v1", "default-wire-model"),
+        (
+            Some("session entry"),
+            "http://127.0.0.1:19002/v1",
+            "session-wire-model",
+        ),
+    ] {
+        store.set_model_ref("p1", model_ref).unwrap();
+        let cold = read_cold_parent(&store, "p1", &base, &catalog).unwrap();
+        assert_eq!(cold.config.provider, "openai");
+        assert_eq!(cold.config.api_url, want_url);
+        assert_eq!(
+            cold.config.model, want_model,
+            "model_ref selects a catalog entry; meta.model is only a display value"
+        );
+        assert_eq!(cold.config.api_style.as_str(), "chat");
+        assert_eq!(cold.config.reasoning_effort.as_deref(), Some("high"));
+    }
+    store.set_model_ref("p1", None).unwrap();
+    store.set_reasoning_effort("p1", None).unwrap();
+    let cold = read_cold_parent(&store, "p1", &base, &catalog).unwrap();
+    assert_eq!(cold.config.reasoning_effort.as_deref(), Some("low"));
+
+    let mut injected = base.clone();
+    injected.model_injected = true;
+    let cold = read_cold_parent(&store, "p1", &injected, &catalog).unwrap();
+    assert_eq!(cold.config.provider, "anthropic");
+    assert_eq!(cold.config.api_url, "http://127.0.0.1:1");
+    assert_eq!(cold.config.model, "parent-model");
+    store.set_model_ref("p1", Some("session entry")).unwrap();
+    let cold = read_cold_parent(&store, "p1", &injected, &catalog).unwrap();
+    assert_eq!(cold.config.api_url, "http://127.0.0.1:19002/v1");
+    assert_eq!(cold.config.model, "session-wire-model");
+}
+
 #[tokio::test]
 async fn side_open_cold_parent_has_no_resume_side_effects() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(dir.path()));
     seed(&store, "p1", "q1", "a1");
     let cfg = base_config(dir.path());
-    let resolver = ThreadStoreResolver::new(store.clone(), cfg.clone());
+    let resolver = ThreadStoreResolver::new(store.clone(), cfg.clone(), Default::default());
 
     let paths = [
         store.meta_path("p1"),
@@ -133,7 +204,8 @@ async fn side_open_cold_parent_inherits_the_parents_history() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(dir.path()));
     seed(&store, "p1", "父问题", "父回答");
-    let resolver = ThreadStoreResolver::new(store.clone(), base_config(dir.path()));
+    let resolver =
+        ThreadStoreResolver::new(store.clone(), base_config(dir.path()), Default::default());
 
     let source = resolver.resolve("p1").await.unwrap();
     let session = source
@@ -151,7 +223,7 @@ async fn side_open_cold_parent_fails_on_an_empty_history() {
     store
         .create(&meta("p1", dir.path()))
         .expect("meta-only thread");
-    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()));
+    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()), Default::default());
 
     let error = resolver
         .resolve("p1")
@@ -164,7 +236,7 @@ async fn side_open_cold_parent_fails_on_an_empty_history() {
 async fn side_open_unknown_parent_reports_not_found() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(dir.path()));
-    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()));
+    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()), Default::default());
 
     let error = resolver.resolve("nobody").await.unwrap_err();
     assert_eq!(error.reason, SideErrorReason::UnknownThread);
@@ -181,7 +253,7 @@ async fn side_open_corrupt_parent_is_refused_not_skipped() {
         .unwrap()
         .write_all(b"{bad\n")
         .unwrap();
-    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()));
+    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()), Default::default());
 
     let error = resolver
         .resolve("p1")
@@ -224,7 +296,8 @@ async fn side_open_cold_parent_bounds_retries_when_the_parent_keeps_changing() {
         file.write_all(b"\n").unwrap();
     });
 
-    let resolver = ThreadStoreResolver::new(store, base_config(dir.path())).with_churn(churn);
+    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()), Default::default())
+        .with_churn(churn);
     let error = resolver
         .resolve("p1")
         .await
@@ -242,7 +315,7 @@ async fn side_published_source_is_a_consistent_snapshot() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(dir.path()));
     seed(&store, "p1", "q1", "a1");
-    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()));
+    let resolver = ThreadStoreResolver::new(store, base_config(dir.path()), Default::default());
     let source = resolver.resolve("p1").await.unwrap();
 
     let publisher = SideSourcePublisher::new(source);
