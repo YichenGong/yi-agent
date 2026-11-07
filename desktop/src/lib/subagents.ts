@@ -6,7 +6,7 @@
  * shape is a rendering bug, but a rail that folds notifications wrongly is a
  * state bug, and the two deserve separate tests.
  */
-import type { AgentChild, AgentTraceRow } from "./protocol";
+import type { AgentChild } from "./protocol";
 
 /** A child as the rail shows it: identity, progress, and whether it is done. */
 export interface SubagentRow {
@@ -14,20 +14,84 @@ export interface SubagentRow {
   objective: string | null;
   state: string;
   lastStep: string | null;
-  /** True once the child can no longer make progress. */
+  /** True once the child's current execution state is terminal. */
   finished: boolean;
   /** The row's own parent, used to find a task's direct children for drilling. */
   parentTaskId: string | null;
 }
 
+/** How one execution state reads in the rail and the detail header. */
+export interface StatePresentation {
+  /** The Chinese label; the daemon's states are an internal vocabulary. */
+  label: string;
+  /** Which emphasis token the row uses. Never the only signal (label always shows). */
+  tone: "neutral" | "success" | "warning" | "danger";
+  /** True when this execution state is terminal (see `TERMINAL_STATES`). */
+  finished: boolean;
+  /** True when the task counts toward "进行中" in the rail header. */
+  active: boolean;
+}
+
 /**
- * The states a task never leaves. Mirrors the daemon's own terminal vocabulary
- * so the rail agrees with `agent/children/list` and the TUI tab.
+ * The one table both the rail and the detail read.
+ *
+ * It mirrors the core's `TaskState::is_terminal` and the supervisor's
+ * `task_state_label` one-for-one, so the desktop cannot drift from the TUI:
+ * `queued` is live but not yet doing work, `paused` is live-but-idle (it must
+ * not read as "working", nor be counted as in progress), and every wait state
+ * is active because the task is still going to progress on its own.
+ *
+ * Terminal here describes the current execution state only — it says nothing
+ * about the container's lifetime, and whether a message can still be delivered
+ * stays the server's call.
  */
-export const TERMINAL_STATES = ["completed", "completed_no_changes", "failed", "cancelled"];
+const STATE_PRESENTATION: Readonly<Record<string, StatePresentation>> = {
+  queued: { label: "排队中", tone: "neutral", finished: false, active: true },
+  running: { label: "运行中", tone: "warning", finished: false, active: true },
+  waiting_for_resource: { label: "等待资源", tone: "warning", finished: false, active: true },
+  waiting_for_permission: { label: "等待授权", tone: "warning", finished: false, active: true },
+  waiting_for_children: { label: "等待子任务", tone: "warning", finished: false, active: true },
+  paused: { label: "已暂停", tone: "neutral", finished: false, active: false },
+  completed: { label: "已完成", tone: "success", finished: true, active: false },
+  completed_no_changes: { label: "已完成，无变更", tone: "success", finished: true, active: false },
+  blocked: { label: "已阻塞", tone: "danger", finished: true, active: false },
+  stalled: { label: "已停滞", tone: "danger", finished: true, active: false },
+  timed_out: { label: "已超时", tone: "danger", finished: true, active: false },
+  budget_exhausted: { label: "预算耗尽", tone: "danger", finished: true, active: false },
+  failed: { label: "失败", tone: "danger", finished: true, active: false },
+  cancelled: { label: "已取消", tone: "neutral", finished: true, active: false },
+  recovery_required: { label: "需要恢复", tone: "danger", finished: true, active: false },
+};
+
+/** What an unrecognised state reads as: unknown, neither terminal nor active. */
+const UNKNOWN = { label: "状态未知", tone: "neutral", finished: false, active: false } as const;
+
+/**
+ * How one state reads, looked up in the shared table.
+ *
+ * The lookup is an own-property check on purpose: a state named `constructor`
+ * or `toString` must fall through to "unknown" rather than answer with a
+ * prototype member. An unrecognised state keeps its raw value as the label so
+ * a newer daemon is visible rather than silently indistinguishable.
+ */
+export function subagentState(state: string): StatePresentation {
+  return Object.prototype.hasOwnProperty.call(STATE_PRESENTATION, state)
+    ? STATE_PRESENTATION[state]
+    : { ...UNKNOWN, label: state || UNKNOWN.label };
+}
+
+/**
+ * The states a task's current execution can end in.
+ *
+ * Derived from `STATE_PRESENTATION` so the terminal list and the labels cannot
+ * disagree; adding a state to the table cannot leave the rail behind.
+ */
+export const TERMINAL_STATES: string[] = Object.keys(STATE_PRESENTATION).filter(
+  (state) => STATE_PRESENTATION[state].finished,
+);
 
 export function isFinished(state: string): boolean {
-  return TERMINAL_STATES.includes(state);
+  return subagentState(state).finished;
 }
 
 /**
@@ -36,6 +100,10 @@ export function isFinished(state: string): boolean {
  * A finished child stays in the rail (the user may still want to read what it
  * did) but stops advertising a current step: showing "running tests" next to a
  * cancelled task reads as if it were still working.
+ *
+ * `objective` and `lastStep` are passed through as the server sent them,
+ * including `null`: production does not populate them today, and inventing a
+ * title or a step would be a lie the rail cannot back up.
  */
 export function toRow(child: AgentChild): SubagentRow {
   const finished = isFinished(child.state);
@@ -115,85 +183,18 @@ export function childrenOf<T extends { taskId: string; parentTaskId?: string | n
 }
 
 /**
- * One block of the trace detail: what the user reads, not what was persisted.
+ * The row that names this task as its child, if the conversation's list has it.
  *
- * A run of assistant text rows is one block (the writer flushes text every 512
- * bytes or 200ms, so consecutive rows are one message split by its flush
- * threshold, not two messages). Tool calls and results stay separate blocks so
- * a tool's state is visible without expanding anything.
+ * Returning the row rather than its id keeps the "is this a different task"
+ * question in one place: a self-parented malformed row would otherwise make the
+ * header offer a link back to itself.
  */
-export interface TraceBlock {
-  /** Stable within a view; the first row id that produced the block. */
-  key: string;
-  kind: "assistant_text" | "tool_call" | "tool_result" | "state_note" | string;
-  text: string;
-  isError: boolean;
-}
-
-/**
- * Fold trace rows into blocks, merging consecutive assistant text.
- *
- * The fold is a pure function of the whole row list. A streaming client that
- * appended to a mutable block would have to know which block the previous frame
- * ended on; folding the list it already holds cannot drift, and the memoization
- * upstream keeps it from re-running per delta.
- */
-export function foldTraceRows(rows: AgentTraceRow[]): TraceBlock[] {
-  const blocks: TraceBlock[] = [];
-  for (const row of rows) {
-    const line = toTraceLine(row);
-    const last = blocks[blocks.length - 1];
-    if (line.kind === "assistant_text" && last?.kind === "assistant_text") {
-      blocks[blocks.length - 1] = { ...last, text: last.text + line.text };
-      continue;
-    }
-    blocks.push({
-      key: `row-${row.eventId}`,
-      kind: line.kind,
-      text: line.text,
-      isError: line.isError,
-    });
-  }
-  return blocks;
-}
-
-/**
- * Fold a trace row into a display line.
- *
- * The payload is the fact's own serde encoding (an internal `type` tag), so the
- * kind column is only used to pick a label: a row whose payload does not parse
- * still renders its raw text rather than disappearing.
- */
-export interface TraceLine {
-  kind: string;
-  text: string;
-  isError: boolean;
-}
-
-export function toTraceLine(row: AgentTraceRow): TraceLine {
-  let payload: Record<string, unknown> | null = null;
-  try {
-    payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
-  } catch {
-    payload = null;
-  }
-  const asString = (v: unknown): string => (typeof v === "string" ? v : "");
-  switch (row.kind) {
-    case "assistant_text":
-      return { kind: row.kind, text: asString(payload?.text), isError: false };
-    case "tool_call": {
-      const name = asString(payload?.name);
-      const summary = asString(payload?.summary);
-      return { kind: row.kind, text: `${name}(${summary})`, isError: false };
-    }
-    case "tool_result": {
-      const isError = payload?.is_error === true;
-      const summary = asString(payload?.summary);
-      return { kind: row.kind, text: summary, isError };
-    }
-    case "state_note":
-      return { kind: row.kind, text: `· ${asString(payload?.note)}`, isError: false };
-    default:
-      return { kind: row.kind, text: row.payloadJson, isError: false };
-  }
+export function parentOf<T extends { taskId: string; parentTaskId?: string | null }>(
+  children: T[],
+  taskId: string,
+): T | null {
+  const self = children.find((child) => child.taskId === taskId);
+  const parentId = self?.parentTaskId ?? null;
+  if (parentId === null || parentId === taskId) return null;
+  return children.find((child) => child.taskId === parentId) ?? null;
 }

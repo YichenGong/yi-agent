@@ -14,6 +14,7 @@ import {
   parseSideHandshake,
   type SideConversationStore,
 } from "../lib/sideConversation";
+import type { TraceConnection } from "../lib/subagentTraceSubscription";
 
 /**
  * 连接生命周期（原 `App.tsx` 巨型 effect 内的建连/重连/前台唤醒，约 250 行）。
@@ -40,11 +41,32 @@ export interface ConnectionLifecycleDeps {
   toppedUp: React.MutableRefObject<Set<string>>;
   setStatus: (v: string) => void;
   transportFactory: (opts: { slot: Slot }) => Transport;
-  recoveryRef: React.MutableRefObject<((raw: RequestFn) => Promise<void>) | null>;
+  /**
+   * 中继自愈的裸请求钩子。
+   *
+   * 必须带上**发起它的那条连接**：服务端把连接判为未初始化时，重放 initialize
+   * 是对那一条连接做的事。只给 `raw` 的话，重放期间的握手就绪通知无从归属，
+   * 子 agent 轨迹会一直停在「未就绪」。
+   */
+  recoveryRef: React.MutableRefObject<
+    ((raw: RequestFn, client: RpcClient, slot: Slot) => Promise<void>) | null
+  >;
   /** 由 `createHandshakeRecovery` 提供：新客户端建好后要做的握手。 */
   handshake: (client: RpcClient) => Promise<void>;
   /** 由 `createNotificationRouter` 提供：给新客户端挂回调。 */
   wireClient: (client: RpcClient, slot: Slot) => void;
+  /**
+   * 登记一条新连接（槽位 + 服务端绑定代际 + 连接代际）。
+   *
+   * **必须先于 `wireClient`**：路由的回调闭包依赖「这条 client 属于哪个来源」，
+   * 而来源只能从登记里查。反了就变成「先收帧、后知道帧该归谁」，早期帧会被
+   * 当成未知来源丢掉——恰好是握手后第一段轨迹。
+   */
+  onTraceConnection: (connection: TraceConnection) => void;
+  /** 本槽位当前的服务端绑定代际：换绑（重新配对）才递增，普通重连不变。 */
+  serverBindingGeneration: (slot: Slot) => number;
+  /** 下一条连接的代际号（单调递增，跨槽位共享）。 */
+  nextTraceConnectionGeneration: () => number;
   /**
    * 旁支绑定登记处。
    *
@@ -98,6 +120,9 @@ export function createConnectionLifecycle(
     handshake,
     wireClient,
     sideStore,
+    onTraceConnection,
+    serverBindingGeneration,
+    nextTraceConnectionGeneration,
   } = deps;
 
   /**
@@ -111,9 +136,16 @@ export function createConnectionLifecycle(
   const connectSlot = (slot: Slot = LOCAL_SLOT): RpcClient => {
     // 新连接 = 新的对账周期：为「none 缓存会话」的静默补齐重新开账（见 `toppedUp`）。
     toppedUp.current.clear();
-    const client = new RpcClient(transportFactory({ slot }), (raw) =>
-      recoveryRef.current!(raw),
+    const client: RpcClient = new RpcClient(transportFactory({ slot }), (raw) =>
+      recoveryRef.current!(raw, client, slot),
     );
+    // 登记先于 wireClient：路由拿到帧时按 client 反查来源，晚一步就会丢帧。
+    onTraceConnection({
+      slot,
+      serverBindingGeneration: serverBindingGeneration(slot),
+      connectionGeneration: nextTraceConnectionGeneration(),
+      client,
+    });
     registryRef.current.put(slot, client);
     wireClient(client, slot);
     return client;
@@ -161,9 +193,15 @@ export function createConnectionLifecycle(
           ? relayUrlForTarget(config.url, target.session)
           : target.session;
         if (!config) continue;
-        const next = new RpcClient(wsTransport(url, config.token), (r) =>
-          recoveryRef.current!(r),
+        const next: RpcClient = new RpcClient(wsTransport(url, config.token), (r) =>
+          recoveryRef.current!(r, next, target.profileId),
         );
+        onTraceConnection({
+          slot: target.profileId,
+          serverBindingGeneration: serverBindingGeneration(target.profileId),
+          connectionGeneration: nextTraceConnectionGeneration(),
+          client: next,
+        });
         registryRef.current.put(target.profileId, next);
         wireClient(next, target.profileId);
         // 与主连接同样握手：不做 `initialize` 的话该连接上任何 `thread/*` 都

@@ -18,7 +18,8 @@ use crate::rpc::{AppState, Flow};
 use crate::server::{
     ChildrenWatch, TraceWatch, children_for_thread, err_response, forward_to_daemon,
     list_task_summaries, ok_response, read_task_trace, require_known_thread, require_thread_id,
-    snapshot_for_watch, socket_for_thread, stream_trace, watch_children, write_response,
+    snapshot_for_watch, socket_for_thread, stop_trace_watch, stream_trace, watch_children,
+    write_response,
 };
 /// 处理本域的一个 RPC 请求。
 ///
@@ -410,15 +411,9 @@ pub(crate) async fn handle(
             {
                 return Ok(Flow::Continue);
             }
-            if let Some(watch) = state.trace_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
-            if let Some(watch) = state.children_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
-            if let Some(watch) = state.process_watches.remove(&thread_id) {
-                watch.stop().await;
-            }
+            // 只停轨迹流:这个请求的语义是「离开任务详情」。子任务列表与
+            // 进程状态流属于整个会话,由 `thread/delete` 统一收尾。
+            stop_trace_watch(&thread_id, state.trace_watches).await;
             write_response(
                 state.hub,
                 state.client,

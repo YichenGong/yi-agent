@@ -858,3 +858,398 @@ async fn sleep_hardening_process_dtos_expose_the_retained_intent() {
     let _ = held.shutdown().await;
     h.shutdown().await;
 }
+
+/// 一个「收到 ping 就回 ack」的替身守望者 task。
+///
+/// 用真实 spawn 的 task 而不是桩:要断言的正是「task 还在跑」,只有真 task 才
+/// 能证明 `stop()` 有没有 abort 它。容量 1 + 测试外层 timeout,失败不会永等。
+type PingAck = (
+    tokio::sync::mpsc::Sender<()>,
+    tokio::sync::mpsc::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+);
+
+fn ping_ack() -> PingAck {
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let task = tokio::spawn(async move {
+        while ping_rx.recv().await.is_some() {
+            if ack_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    (ping_tx, ack_rx, task)
+}
+
+/// 等一个已被 `stop()` 的 task 真的结束。
+///
+/// `JoinHandle::abort` 只是投递取消请求:被 abort 的任务要等到下一次被调度才观察
+/// 到取消,故紧接着调 `is_finished()` 可能仍读到 `false`。这里在既有外层 timeout
+/// 之内做**有界让步等待**而不是固定 sleep——正常情况下第一两次 `yield_now` 就够。
+async fn wait_until_finished(handle: &tokio::task::AbortHandle) {
+    for _ in 0..10_000 {
+        if handle.is_finished() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the watcher task must finish once it is stopped");
+}
+
+/// 只 unwatch 轨迹，不得顺手停掉同一个 thread 的子任务列表与进程守望者。
+///
+/// 返回任务详情页即 `agent/trace/unwatch`；旧实现把它当成「关掉这个 thread 的
+/// 一切」，于是子 agent 列表和后台进程流一起断掉。这里用「ping 能收到 ack、
+/// abort 未完成」证明两个兄弟守望者仍在运行，并另放 thread-b 证明没误清别人。
+#[tokio::test]
+async fn trace_unwatch_preserves_children_and_process_watchers() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (children_ping, mut children_ack, children_task) = ping_ack();
+        let (process_ping, mut process_ack, process_task) = ping_ack();
+        let (other_children_ping, mut other_children_ack, other_children_task) = ping_ack();
+        // 三个 ping 端都活到测试结束:循环因 `recv()` 返回 `None` 自然退出是
+        // 「自己结束」,那样 `is_finished()` 就证明不了 `stop()` 是否调过。
+        let (_trace_ping, _, trace_task) = ping_ack();
+        let (other_trace_ping, mut other_trace_ack, other_trace_task) = ping_ack();
+        let (_other_process_ping, _, other_process_task) = ping_ack();
+        let children_abort = children_task.abort_handle();
+        let process_abort = process_task.abort_handle();
+        let other_children_abort = other_children_task.abort_handle();
+        let trace_abort = trace_task.abort_handle();
+        let other_trace_abort = other_trace_task.abort_handle();
+
+        let mut traces = HashMap::new();
+        traces.insert("thread-a".to_string(), TraceWatch { task: trace_task });
+        traces.insert(
+            "thread-b".to_string(),
+            TraceWatch {
+                task: other_trace_task,
+            },
+        );
+        let mut children = HashMap::new();
+        children.insert(
+            "thread-a".to_string(),
+            ChildrenWatch {
+                task: children_task,
+            },
+        );
+        children.insert(
+            "thread-b".to_string(),
+            ChildrenWatch {
+                task: other_children_task,
+            },
+        );
+        let mut processes = HashMap::new();
+        processes.insert("thread-a".to_string(), ProcessWatch { task: process_task });
+        processes.insert(
+            "thread-b".to_string(),
+            ProcessWatch {
+                task: other_process_task,
+            },
+        );
+
+        stop_trace_watch("thread-a", &mut traces).await;
+
+        assert!(!traces.contains_key("thread-a"), "trace watch is removed");
+        assert!(
+            children.contains_key("thread-a"),
+            "children watch must survive a trace unwatch"
+        );
+        assert!(
+            processes.contains_key("thread-a"),
+            "process watch must survive a trace unwatch"
+        );
+        children_ping.send(()).await.unwrap();
+        process_ping.send(()).await.unwrap();
+        assert_eq!(children_ack.recv().await, Some(()));
+        assert_eq!(process_ack.recv().await, Some(()));
+        assert!(!children_abort.is_finished());
+        assert!(!process_abort.is_finished());
+
+        // 被 unwatch 的那条轨迹自己必须真的停掉。它的 ping 端仍在,所以只有
+        // `stop()` 的 abort 能让它结束。
+        wait_until_finished(&trace_abort).await;
+
+        // thread-b 一点没动。
+        assert!(traces.contains_key("thread-b"), "thread-b keeps its trace");
+        assert!(
+            children.contains_key("thread-b"),
+            "thread-b keeps its children watch"
+        );
+        assert!(
+            processes.contains_key("thread-b"),
+            "thread-b keeps its process watch"
+        );
+        other_trace_ping.send(()).await.unwrap();
+        other_children_ping.send(()).await.unwrap();
+        assert_eq!(other_trace_ack.recv().await, Some(()));
+        assert_eq!(other_children_ack.recv().await, Some(()));
+        assert!(!other_trace_abort.is_finished());
+        assert!(!other_children_abort.is_finished());
+    })
+    .await
+    .expect("watcher assertions must not hang");
+}
+
+/// 删除会话时三类守望者都要停：与只 unwatch 轨迹相反，这里必须全清。
+#[tokio::test]
+async fn thread_delete_stops_all_watchers() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        // 三个 ping 端都活到测试结束:否则三个循环会因通道关闭自行退出,
+        // `is_finished()` 就与 `stop_thread_watches` 到底有没有 abort 无关。
+        let (_trace_ping, _, trace_task) = ping_ack();
+        let (_children_ping, _, children_task) = ping_ack();
+        let (_process_ping, _, process_task) = ping_ack();
+        let (other_trace_ping, mut other_trace_ack, other_trace_task) = ping_ack();
+        // thread-b 的两条流只用来断言「没被误清」,故保留 ping 端不丢,
+        // 让它们的循环一直活着。
+        let (_other_children_ping, _, other_children_task) = ping_ack();
+        let (_other_process_ping, _, other_process_task) = ping_ack();
+        let trace_abort = trace_task.abort_handle();
+        let children_abort = children_task.abort_handle();
+        let process_abort = process_task.abort_handle();
+        let other_trace_abort = other_trace_task.abort_handle();
+        let other_children_abort = other_children_task.abort_handle();
+        let other_process_abort = other_process_task.abort_handle();
+
+        let mut traces = HashMap::new();
+        traces.insert("thread-a".to_string(), TraceWatch { task: trace_task });
+        traces.insert(
+            "thread-b".to_string(),
+            TraceWatch {
+                task: other_trace_task,
+            },
+        );
+        let mut children = HashMap::new();
+        children.insert(
+            "thread-a".to_string(),
+            ChildrenWatch {
+                task: children_task,
+            },
+        );
+        children.insert(
+            "thread-b".to_string(),
+            ChildrenWatch {
+                task: other_children_task,
+            },
+        );
+        let mut processes = HashMap::new();
+        processes.insert("thread-a".to_string(), ProcessWatch { task: process_task });
+        processes.insert(
+            "thread-b".to_string(),
+            ProcessWatch {
+                task: other_process_task,
+            },
+        );
+
+        stop_thread_watches("thread-a", &mut traces, &mut children, &mut processes).await;
+
+        assert!(!traces.contains_key("thread-a"), "trace watch is removed");
+        assert!(!children.contains_key("thread-a"), "children watch stops");
+        assert!(!processes.contains_key("thread-a"), "process watch stops");
+        // 三个 ping 端都还活着,故只有 `stop()` 真 abort 了它们才会结束。
+        wait_until_finished(&trace_abort).await;
+        wait_until_finished(&children_abort).await;
+        wait_until_finished(&process_abort).await;
+
+        // 另一个 thread 不受影响。
+        assert!(traces.contains_key("thread-b"), "thread-b keeps its trace");
+        assert!(
+            children.contains_key("thread-b"),
+            "thread-b keeps its children watch"
+        );
+        assert!(
+            processes.contains_key("thread-b"),
+            "thread-b keeps its process watch"
+        );
+        other_trace_ping.send(()).await.unwrap();
+        assert_eq!(other_trace_ack.recv().await, Some(()));
+        assert!(!other_trace_abort.is_finished());
+        assert!(!other_children_abort.is_finished());
+        assert!(!other_process_abort.is_finished());
+    })
+    .await
+    .expect("watcher assertions must not hang");
+}
+
+/// `agent/trace/unwatch` 走真实 RPC 臂时也不得碰兄弟守望者。
+///
+/// 上面两个用例直接调 helper，证明不了「臂里又被加回一句 children/process 清理」
+/// ——那种回归只在 `rpc/agent.rs` 的请求分派里。这里改用真实 `AppState` 驱动同一个
+/// `handle`：children 守望者的 task 由本测试持有（挂着的 task，不依赖 daemon），
+/// 发完请求后既要看到 `{"stopped": true}`，也要看到它仍在 map 里、仍未被 abort。
+#[tokio::test]
+async fn trace_unwatch_rpc_preserves_children_watch() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        use crate::protocol::{RequestEnvelope, RequestId, Scope};
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::AtomicU64;
+        use tokio::sync::{Mutex, oneshot};
+
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let client = crate::broadcast::ClientId::local();
+        let mut outbox = hub.register(client.clone());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_path = dir.path().join("models.json");
+        let settings_path = dir.path().join("settings.json");
+        let websearch_path = dir.path().join("websearch.json");
+        let theme = crate::theme_tool::ThemeHandle::new(dir.path().to_path_buf());
+        let cfg = test_config();
+        let projects = dir.path().join("runtime");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let mut threads = HashMap::new();
+        threads.insert(
+            "thread-a".to_string(),
+            tick_test_session(dir.path(), "thread-a", crate::protocol::ThreadStatus::Idle),
+        );
+        let mut uploads = crate::image_upload::UploadRegistry::new();
+        let mut pending_activation = HashMap::new();
+        let runtimes = Arc::new(StdMutex::new(HashMap::new()));
+        let thread_roots = Arc::new(StdMutex::new(HashMap::new()));
+        let mut trace_watches: HashMap<String, TraceWatch> = HashMap::new();
+        let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
+        let mut process_watches: HashMap<String, ProcessWatch> = HashMap::new();
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let perm_seq = Arc::new(AtomicU64::new(0));
+        let (turn_tx, mut turn_rx) = mpsc::channel(1);
+        let mut pending_lead_replies = HashMap::new();
+        let mut side_tasks = tokio::task::JoinSet::new();
+        let side_replay = crate::side_conversation::shared_replay_store();
+        let side_registry = test_side_registry(dir.path(), None);
+        let probes = crate::model_rpc::ProbeRegistry::default();
+        let workspaces = Arc::new(WorkspaceIndex::new(dir.path().join("workspaces.json")));
+        let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            dir.path().join("devices.json"),
+        )));
+        let git_diff = crate::git_diff_tool::GitDiffHandle::new();
+        let view_frames: crate::server::ViewFrames = Arc::new(Mutex::new(HashMap::new()));
+        let lead_inbox = crate::lead::LeadInbox::new();
+        let lead_replies = crate::lead::LeadReplies::new();
+        let lead_control = crate::lead_control::LeadControlInbox::new();
+        let lead_control_replies = crate::lead_control::LeadControlReplies::new();
+        let watchman: crate::server::WatchmanInstall = Arc::new(|_, _| Ok(()));
+        let unwatchman: crate::server::WatchmanUninstall = Arc::new(|_| Ok(()));
+        let build_agent = build_test_agent;
+
+        // 两个兄弟守望者的 task:收 ping 直到 ping 端被丢的循环。本测试持有 ping
+        // 端,故它们一直挂着;断言 `!is_finished()` 才与「有没有被 abort」等价。
+        let (children_ping, mut children_ack, children_task) = ping_ack();
+        let children_abort = children_task.abort_handle();
+        children_watches.insert(
+            "thread-a".to_string(),
+            ChildrenWatch {
+                task: children_task,
+            },
+        );
+        let (_process_ping, _, process_task) = ping_ack();
+        let process_abort = process_task.abort_handle();
+        process_watches.insert("thread-a".to_string(), ProcessWatch { task: process_task });
+
+        let req = RequestEnvelope {
+            jsonrpc: Some("2.0".to_string()),
+            id: RequestId::Num(7),
+            method: "agent/trace/unwatch".to_string(),
+            params: json!({ "threadId": "thread-a" }),
+        };
+
+        let flow = {
+            let mut state = crate::rpc::AppState {
+                hub: &hub,
+                client: &client,
+                is_remote: false,
+                shell_authorization: None,
+                client_scope: Scope::Admin,
+                cfg: &cfg,
+                theme_handle: &theme,
+                models_path: &models_path,
+                websearch_path: &websearch_path,
+                settings_path: &settings_path,
+                probes: &probes,
+                onboarding_preferences_path: &dir.path().join("preferences.json"),
+                watchman_home: dir.path(),
+                resident_dir: dir.path(),
+                instance_home: dir.path(),
+                watchman_install: &watchman,
+                watchman_uninstall: &unwatchman,
+                uploads: &mut uploads,
+                threads: &mut threads,
+                workspaces: &workspaces,
+                pairing: &pairing,
+                pending_activation: &mut pending_activation,
+                runtimes: &runtimes,
+                thread_roots: &thread_roots,
+                process_watches: &mut process_watches,
+                trace_watches: &mut trace_watches,
+                children_watches: &mut children_watches,
+                pending: &pending,
+                perm_seq: &perm_seq,
+                permission_timeout: PERMISSION_TIMEOUT,
+                turn_rx: &mut turn_rx,
+                turn_tx: &turn_tx,
+                build_agent: &build_agent,
+                git_diff_handle: &git_diff,
+                view_frames: &view_frames,
+                skills_home: dir.path(),
+                lead_inbox: &lead_inbox,
+                lead_replies: &lead_replies,
+                pending_lead_replies: &mut pending_lead_replies,
+                lead_control: &lead_control,
+                lead_control_replies: &lead_control_replies,
+                lead_agent_enabled: false,
+                side_registry: &side_registry,
+                side_tasks: &mut side_tasks,
+                side_replay: &side_replay,
+                remote_dir: &projects,
+                relay_url: None,
+            };
+            crate::rpc::agent::handle(&mut state, &req, req.id.clone())
+                .await
+                .expect("the unwatch arm must answer")
+        };
+        assert!(
+            matches!(flow, crate::rpc::Flow::Continue),
+            "the unwatch arm consumes the request"
+        );
+
+        // 应答真的写到了这个客户端。
+        let reply = outbox.recv().await.expect("a response frame");
+        assert_eq!(reply["id"], serde_json::json!(7));
+        assert_eq!(
+            reply["result"],
+            serde_json::json!({ "stopped": true }),
+            "unwatch answers stopped:true: {reply}"
+        );
+
+        // 回归点:臂里若又加回 children/process 的 remove+stop,这里就红。
+        assert!(
+            children_watches.contains_key("thread-a"),
+            "agent/trace/unwatch must not drop the children watch"
+        );
+        assert!(
+            !children_abort.is_finished(),
+            "agent/trace/unwatch must not abort the children watch task"
+        );
+        assert!(
+            process_watches.contains_key("thread-a"),
+            "agent/trace/unwatch must not drop the process watch"
+        );
+        assert!(
+            !process_abort.is_finished(),
+            "agent/trace/unwatch must not abort the process watch task"
+        );
+
+        children_ping.send(()).await.unwrap();
+        assert_eq!(
+            children_ack.recv().await,
+            Some(()),
+            "the children watch loop is still serving"
+        );
+    })
+    .await
+    .expect("the RPC assertions must not hang");
+}

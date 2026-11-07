@@ -202,3 +202,36 @@ pub(crate) fn subagent_totals(children: &[crate::protocol::AgentChild]) -> Subag
             acc
         })
 }
+
+/// 停掉一个 thread 的 trace 守望者。
+///
+/// 只碰 `traces`：`agent/trace/unwatch` 的含义是「客户端离开这个任务的详情」，
+/// 不是「关掉这个会话的一切」。子任务列表与进程状态流各有自己的生命周期，
+/// 由 `thread/delete`（经 [`stop_thread_watches`]）负责收尾。
+pub(crate) async fn stop_trace_watch(
+    thread_id: &str,
+    traces: &mut std::collections::HashMap<String, crate::server::TraceWatch>,
+) {
+    if let Some(watch) = traces.remove(thread_id) {
+        watch.stop().await;
+    }
+}
+
+/// 拆掉一个 thread 的三类守望者：`thread/delete` 用。
+///
+/// 会话都没了，它的轨迹流、子任务列表和进程状态流都必须结束；先复用
+/// [`stop_trace_watch`] 停轨迹，再停另外两类。
+pub(crate) async fn stop_thread_watches(
+    thread_id: &str,
+    traces: &mut std::collections::HashMap<String, crate::server::TraceWatch>,
+    children: &mut std::collections::HashMap<String, crate::server::ChildrenWatch>,
+    processes: &mut std::collections::HashMap<String, crate::server::ProcessWatch>,
+) {
+    stop_trace_watch(thread_id, traces).await;
+    if let Some(watch) = children.remove(thread_id) {
+        watch.stop().await;
+    }
+    if let Some(watch) = processes.remove(thread_id) {
+        watch.stop().await;
+    }
+}

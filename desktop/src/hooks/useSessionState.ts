@@ -4,7 +4,6 @@ import { writeListCache, type ThreadListCache } from "../lib/sessionCache";
 import { formatError } from "../lib/errorMessage";
 import type {
   AgentChildrenListResult,
-  AgentTraceSnapshotResult,
   ThreadSummary,
   Workspace,
   WorkspaceGroup,
@@ -15,14 +14,18 @@ import type { ThreadStore } from "../lib/threadStore";
 import type { ViewAnchor } from "../lib/viewAnchor";
 
 /**
- * 会话关注点：会话列表（分组 + 置顶）、最近目录、侧栏抽屉、子 agent 详情栈与
- * 右侧详情栏的开合，以及维持这些状态所需的 ref 影子与读取器。
+ * 会话关注点：会话列表（分组 + 置顶）、最近目录、侧栏抽屉、右侧详情栏的开合，
+ * 以及维持这些状态所需的 ref 影子与读取器。
  *
- * 归属是这里唯一的硬约束：分组、置顶、最近目录、详情栈、栏的开合都必须答得出
+ * 归属是这里唯一的硬约束：分组、置顶、最近目录、栏的开合都必须答得出
  * 「这是**哪条**会话 / 哪个视图的」，故它们与 `currentId` 同属一处。`currentId`
- * 本身也由本 hook 持有并对内消费：`railRows` 用它取暂留区、`openDetail` 的调用点
- * 用它点名会话；对外则要供 `useProcessState`、diff 的归属判据 `currentIdRef`、
- * 以及 App 的会话 JSX（`changeThreadModel` 的 id 等都从这里读）使用。
+ * 本身也由本 hook 持有并对内消费：`railRows` 用它取暂留区；对外则要供
+ * `useProcessState`、diff 的归属判据 `currentIdRef`、以及 App 的会话 JSX
+ * （`changeThreadModel` 的 id 等都从这里读）使用。
+ *
+ * **子 agent 详情不在这里**：它的选中任务、轨迹行、草稿与两阶段取消属于
+ * `hooks/useSubagentTrace.ts` 的控制器。放回本 hook 就必然要在这里再存一份
+ * 「当前打开的任务」，而两份状态一旦不同步，通知就会落进错误的视图。
  *
  * `rpc` 是 4a/4b 那条「取客户端」的 getter：未连接时返回 null，动作**静默返回**。
  * 这条语义逐字保留自搬移前（原为 `const c = clientRef.current; if (!c) return;`）：
@@ -30,7 +33,7 @@ import type { ViewAnchor } from "../lib/viewAnchor";
  * rejection；`refreshThreads` 另把 null 用作「未知」的返回值，调用方必须按未知
  * 处理（见它的注释）。
  *
- * `setCurrentError`/`railStore`/`force` 都不是本关注点的状态，而是 `openDetail` 与
+ * `setCurrentError`/`railStore`/`force` 都不是本关注点的状态，而是
  * `refreshSubagents` 落回 App 层的那几笔写入（对话里的红字、子 agent 暂留区、
  * 强制重渲染 tick），故由调用方注入，不在这里另起影子。`initialListCache` 同理：
  * 它是手机端首屏缓存，本 hook 只拿它给 `groups`/`pinned` 播种（`useRef(...).current`
@@ -56,7 +59,7 @@ export function useSessionState({
   store: ThreadStore;
   /** App 的强制重渲染 tick（附属视图就地更新后需要它）。 */
   force: (updater: (v: number) => number) => void;
-  /** 往当前会话的 session 上写一条错误（`openDetail` 的失败路径）。 */
+  /** 往当前会话的 session 上写一条错误（分组写动作的失败路径）。 */
   setCurrentError: (msg: string) => void;
   /** App 的子 agent 暂留区（`refreshSubagents` 的回包落盘处），也是 `railRows` 的数据源。 */
   railStore: SubagentRailStore;
@@ -72,19 +75,9 @@ export function useSessionState({
   const [pinned, setPinned] = useState<ThreadSummary[]>(initialListCache?.pinned ?? []);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
-  // 与 TUI 页签同一语义。
-  const [detailStack, setDetailStack] = useState<string[]>([]);
-  const [traceRows, setTraceRows] = useState<AgentTraceSnapshotResult["rows"]>([]);
-  const openSubagent = detailStack.length > 0 ? detailStack[detailStack.length - 1] : null;
-  // 通知回调在 effect 里注册一次,读不到最新的 state,所以当前打开的任务放在 ref。
-  const openTaskId = useRef<string | null>(null);
-  useEffect(() => {
-    openTaskId.current = openSubagent;
-  }, [openSubagent]);
   // 通知回调在 `wireClient` 的闭包里只注册一次，读不到渲染期最新的 currentId；
   // `ui/gitDiff/focus` 允许 threadId 为 null（"聚焦当前会话"），此时必须知道此刻
-  // 选中的是谁，故与 openTaskId 一样放进 ref。
+  // 选中的是谁，故与 `groupsRef` 一样放进 ref。
   const currentIdRef = useRef<string | null>(null);
   useEffect(() => {
     currentIdRef.current = currentId;
@@ -138,10 +131,6 @@ export function useSessionState({
     setGroups([]);
     setPinned([]);
     setWorkspaces([]);
-    // 详情栈与轨迹行里存的是上一台机器的 subagent id：不清就会点进一个
-    // 在 B 上不存在的任务，一路报 -32602。
-    setDetailStack([]);
-    setTraceRows([]);
     setPanelOpen(false);
     // 阅读位置按 thread_id 记，A 的 id 在 B 上没有意义，留着只是占内存。
     viewAnchors.current.clear();
@@ -178,43 +167,6 @@ export function useSessionState({
       setWorkspaces(r.workspaces);
     } catch {
       // 最近目录刷新失败不影响当前对话。
-    }
-  };
-
-  /**
-   * 打开某任务的详情:回灌历史,然后开一条流。
-   *
-   * 关闭(或换任务)时先 unwatch 再开新的,任何时刻只有一路流:否则换任务后
-   * 旧任务的 `agent/trace/event` 仍会到达,把两个任务的轨迹混进一个视图。
-   */
-  const openDetail = async (threadId: string, taskId: string) => {
-    const c = rpc();
-    if (!c) return;
-    // 点卡片即回到右栏：打开栏并把 Tab 拨回「子 agent」（它可能正停在 Git Diff）。
-    setPanelOpen(true);
-    setDetailTab("subagents");
-    setDetailStack([taskId]);
-    setTraceRows([]);
-    try {
-      const snapshot = await c.request<AgentTraceSnapshotResult>("agent/trace/read", {
-        threadId,
-        taskId,
-      });
-      setTraceRows(snapshot.rows);
-      await c.request("agent/trace/watch", { threadId, taskId });
-    } catch (e) {
-      setCurrentError(formatError(e));
-      force((v) => v + 1);
-    }
-  };
-
-  const closeDetail = async (threadId: string) => {
-    setDetailStack([]);
-    setTraceRows([]);
-    try {
-      await rpc()?.request("agent/trace/unwatch", { threadId });
-    } catch {
-      // 关闭是本地动作:即使 unwatch 失败也不把详情留在屏幕上。
     }
   };
 
@@ -323,9 +275,6 @@ export function useSessionState({
     pinned,
     workspaces,
     sidebarOpen,
-    detailStack,
-    traceRows,
-    openSubagent,
     // 当前对话的子 agent 行。状态栏入口（数量徽标、是否有内容）与右侧面板共用同一份，
     // 故在此派生一次，不在 JSX 里重复取。
     railRows: currentId ? railStore.get(currentId) : [],
@@ -337,21 +286,17 @@ export function useSessionState({
     setPinned,
     setWorkspaces,
     setSidebarOpen,
-    setDetailStack,
-    setTraceRows,
     setPanelOpen,
     setDetailTab,
-    // refs：App 的一次性通知闭包直接读——`agent/trace/event` 认领当前任务，
-    // `ui/gitDiff/focus` 认领当前会话，`thread/titleChanged` 认领当前列表。
-    openTaskId,
+    // refs：App 的一次性通知闭包直接读——`ui/gitDiff/focus` 认领当前会话，
+    // `thread/titleChanged` 认领当前列表。子 agent 详情不再经过这里：它的归属
+    // 判据在 `useSubagentTrace` 的控制器里，闭包读不到 React state 也照样安全。
     currentIdRef,
     groupsRef,
     pinnedRef,
     // readers：App 的动作与生命周期 effect 都要调（切会话刷新、进详情、拉目录）。
     refreshThreads,
     refreshWorkspaces,
-    openDetail,
-    closeDetail,
     rememberView,
     anchorFor,
     forgetView,

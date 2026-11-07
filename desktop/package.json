@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:browser:session-view": "node scripts/browser/session-view-check.mjs",
     "test:browser:stream-live": "node scripts/browser/stream-live-check.mjs",
+    "test:browser:subagent-trace": "node scripts/browser/subagent-trace-check.mjs",
     "probe:plugin": "node scripts/plugins/probe.mjs --suite isolation --output .artifacts/plugins/probe.json",
     "sidecar": "bash scripts/build-sidecar.sh",
     "sidecar:release": "bash scripts/build-sidecar.sh release",

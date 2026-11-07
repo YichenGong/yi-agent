@@ -9,14 +9,44 @@ afterEach(cleanup);
 // `SubagentTrace` no longer carries its own close button (the panel owns the
 // frame and the close action), so its props have no `onClose`.
 const traceProps = {
-  taskId: "t1",
+  identityKey: '["local",0,"t1","task-1"]',
+  taskId: "task-1",
   row: null,
+  parent: null,
   children: [],
-  rows: [],
+  subscription: {
+    owner: null,
+    phase: "ready" as const,
+    rows: [
+      {
+        eventId: 1,
+        taskId: "task-1",
+        kind: "assistant_text",
+        payloadJson: JSON.stringify({ type: "assistant_text", text: "first line" }),
+      },
+    ],
+    error: null,
+    disconnected: false,
+    waitingForPriorRequest: false,
+  },
+  actions: {
+    draft: "",
+    draftRevision: 0,
+    messagePending: false,
+    previewPending: false,
+    confirmPending: false,
+    confirmation: null,
+    error: null,
+    notice: null,
+  },
   onDrill: () => {},
-  onMessage: async () => {},
-  onCancel: async () => ({ confirmationToken: "x", taskIds: [], expiresInSecs: 30 }),
-  onConfirmCancel: async () => {},
+  onBack: () => {},
+  onRetry: () => {},
+  onDraftChange: () => {},
+  onSend: async () => {},
+  onPreview: async () => {},
+  onConfirm: async () => {},
+  onDismiss: () => {},
 };
 
 const diffProps = {
@@ -95,8 +125,8 @@ describe("ThreadDetailPanel", () => {
         onLeaveTask={onLeaveTask}
       />,
     );
-    // 轨迹主体的摘要态在，且不显示卡片列表。
-    expect(screen.getByText(/最近步骤/)).toBeTruthy();
+    // 轨迹正文直接可见（不再有整条轨迹的展开门），且不显示卡片列表。
+    expect(screen.getByText("first line")).toBeTruthy();
     expect(screen.queryByText("暂无子 agent")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /返回子 agent 列表/ }));
     expect(onLeaveTask).toHaveBeenCalled();

@@ -465,15 +465,19 @@ pub(crate) struct AppState<'a> {
     /// built. `None` inside means "no shell": the conversation then attaches with its
     /// own key, which is the embedded path.
     pub(crate) managed: &'a crate::server::ManagedSlot,
-    /// 每 thread 一个进程状态守望者。`thread/start`/`thread/resume`/`thread/delete`
-    /// 增删它,`agent/trace/unwatch` 停它。搬移前臂里的 `process_watches`,按 `&mut`
-    /// 借用。
+    /// 每 thread 一个进程状态守望者。`thread/start` 与 `thread/resume` 建立或
+    /// 替换它(换掉生效 manager 时先停旧的,见 `server/turn/start.rs` 与
+    /// `rpc/thread/lifecycle/resume.rs`),`thread/delete` 停它。
+    /// `agent/trace/unwatch` **不**碰它:离开任务详情只该停轨迹流,后台进程状态
+    /// 流仍属于这个会话。搬移前臂里的 `process_watches`,按 `&mut` 借用。
     pub(crate) process_watches: &'a mut HashMap<String, crate::server::ProcessWatch>,
     /// 每 thread 至多一条被关注的轨迹流。`agent/trace/watch` 换它,
-    /// `agent/trace/unwatch`/`thread/delete` 停它。搬移前臂里的 `trace_watches`。
+    /// `agent/trace/unwatch`/`thread/delete` 停它(唯一的 unwatch 清理对象)。
+    /// 搬移前臂里的 `trace_watches`。
     pub(crate) trace_watches: &'a mut HashMap<String, crate::server::TraceWatch>,
-    /// 每 thread 至多一个子任务列表守望者。`agent/children/list` 建立它,
-    /// `agent/trace/unwatch`/`thread/delete` 停它。搬移前臂里的 `children_watches`。
+    /// 每 thread 至多一个子任务列表守望者。`agent/children/list` 建立它
+    /// (已有则复用),`thread/delete` 停它。`agent/trace/unwatch` **不**碰它:
+    /// 关闭任务详情不得让子 agent 列表停止更新。搬移前臂里的 `children_watches`。
     pub(crate) children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
     /// 反向权限请求的等待登记表。`thread/start`/`thread/resume` 交给
     /// `start_thread_core`/`run_thread_driver`。搬移前臂里的 `pending`。

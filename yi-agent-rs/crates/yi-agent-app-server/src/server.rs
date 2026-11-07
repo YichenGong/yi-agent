@@ -93,7 +93,8 @@ pub(crate) use task_bridge::{
 };
 #[allow(unused_imports)]
 pub(crate) use watchers::{
-    children_for_thread, stream_trace, subagent_totals, trace_rows, watch_children, watch_processes,
+    children_for_thread, stop_thread_watches, stop_trace_watch, stream_trace, subagent_totals,
+    trace_rows, watch_children, watch_processes,
 };
 
 pub(crate) mod thread_index;
