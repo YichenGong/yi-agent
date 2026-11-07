@@ -113,4 +113,61 @@ n=$((n + 1)); pass "lists available crate names on rejection"
 [ $? -eq 2 ] || fail "missing arg should exit 2"
 n=$((n + 1)); pass "missing crate arg exits 2"
 
+# --- affected 子命令 ---
+# 用假 git 输出来驱动：通过 FAKE_DIFF 环境变量注入改动文件列表。
+out="$(FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs' "$SCRIPT" affected ref 2>&1)"
+[ $? -eq 0 ] || fail "affected with mapped crate should exit 0"
+grep -qx 'rdeps(yi-agent-core)' <<<"$out" || { printf '%s\n' "$out" >&2; fail "wrong expression"; }
+n=$((n + 1)); pass "emits rdeps() for a single mapped crate"
+
+out="$(FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs
+yi-agent-rs/crates/yi-agent-flags/src/b.rs' "$SCRIPT" affected ref 2>&1)"
+grep -qx 'rdeps(yi-agent-core) | rdeps(yi-agent-flags)' <<<"$out" \
+  || { printf '%s\n' "$out" >&2; fail "multi-crate expression wrong"; }
+n=$((n + 1)); pass "joins multiple crates with ' | '"
+
+# 全 docs -> exit 0 且说「无需测试」（文档优先于错误分支）
+FAKE_DIFF='docs/x.md' "$SCRIPT" affected ref >/dev/null 2>&1
+[ $? -eq 0 ] || fail "docs-only diff should exit 0"
+n=$((n + 1)); pass "docs-only diff exits 0"
+
+msg="$(FAKE_DIFF='docs/x.md' "$SCRIPT" affected ref 2>&1)"
+grep -q 'no tests needed' <<<"$msg" || { printf '%s\n' "$msg" >&2; fail "docs case did not explain itself"; }
+n=$((n + 1)); pass "docs-only diff prints 'no tests needed'"
+
+# 全 unmapped -> exit 1
+FAKE_DIFF='desktop/src/app.ts' "$SCRIPT" affected ref >/dev/null 2>&1
+[ $? -eq 1 ] || fail "all-unmapped diff should exit 1"
+n=$((n + 1)); pass "all-unmapped diff exits 1"
+
+# 部分映射 -> exit 0，表达式只含映射项，且 stderr 报未映射路径
+errf="$(mktemp)"
+out="$(FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs
+desktop/src/app.ts' "$SCRIPT" affected ref 2>"$errf")"
+grep -qx 'rdeps(yi-agent-core)' <<<"$out" || { printf '%s\n' "$out" >&2; fail "partial: expression wrong"; }
+grep -q 'desktop/src/app.ts' "$errf" || { cat "$errf" >&2; fail "partial: unmapped path not reported"; }
+n=$((n + 1)); pass "partial mapping runs crates and reports the rest"
+
+# 未映射路径含空格时必须原样一行，不能被拆成多行
+errf2="$(mktemp)"
+FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs
+desktop/my app/main.ts' "$SCRIPT" affected ref >/dev/null 2>"$errf2"
+grep -qx '  desktop/my app/main.ts' "$errf2" \
+  || { cat "$errf2" >&2; fail "unmapped path with spaces was mangled"; }
+n=$((n + 1)); pass "reports unmapped paths with spaces verbatim"
+rm -f "$errf2"
+
+# 空 diff -> exit 1
+FAKE_DIFF='' "$SCRIPT" affected ref >/dev/null 2>&1
+[ $? -eq 1 ] || fail "empty diff should exit 1"
+n=$((n + 1)); pass "empty diff exits 1"
+
+# 成员读失败时必须失败，不能退化成「无改动」或「全 unmapped」
+FAKE_DIFF='yi-agent-rs/crates/yi-agent-core/src/a.rs' env PATH=/usr/bin:/bin "$SCRIPT" affected ref >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] || fail "affected must fail when crate mapping is unavailable"
+n=$((n + 1)); pass "affected fails when the crate mapping is unavailable"
+
+rm -f "$errf"
+
 printf '\n%d passed\n' "$n"
