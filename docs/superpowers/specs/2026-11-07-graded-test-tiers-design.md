@@ -94,8 +94,14 @@ nextest 为了枚举用例，会对**每个测试二进制**执行 `--list --for
 - **不做**环境治理：`target/` 尺寸、Spotlight 排除、`[profile.dev]` debuginfo、`msrv-check` 的
   `CARGO_TARGET_DIR`、`just gc` 均由另一条独立工作线负责，本文不碰（见「与另一条工作线的边界」）
 - **不做** CI 分片：`.github/workflows/ci.yml` 与 `.gitlab-ci.yml` 不改
-- **不改** `just ci` 的命令与依赖列表；`just test` 的命令与退出码也不变
-  （唯一改动是在 `test` 前加一段只读并发预检输出，见「并发检测」节）
+- **不改** `just ci` 的既有门禁命令；`just test` 的命令与退出码也不变
+  （`test` 的唯一改动是在前面加一段只读并发预检输出，见「并发检测」节）
+- **例外（必须做，理由见下）**：新增 1 个 ci 门禁 `affected-check`，
+  跑新脚本的自测。这是本仓既定惯例——`scripts/` 下所有自测脚本都在 `ci` 依赖里
+  （现有 21 项中约 17 项是这类自测），且 `reclaim-check` 的注释写明了判据为什么必须钉住：
+  「判据写宽了会删掉活跃编译单元，写窄了等于没清理。两种错误都不会报错」。
+  本设计的 `test-affected` 的「路径 → crate」映射完全同类：映射漏了 = **静默少测**，
+  正是本设计要消除的失败模式，不能只靠人工试一次
 - **不改** `.config/nextest.toml` 的任何现有内容（D4 已决定不改 `max-threads`；
   L0/L1/L2 是新增 recipe，不触碰既有配置）
 - **不做**「按 git diff 自动推断受影响测试」的更深推断：只到 crate 粒度，不到测试用例粒度
@@ -449,7 +455,8 @@ D3 的结论是假红无法在配置层修掉，因此改为**让它在发生时
 
 **冲突点**：`justfile` 两边都会改。本文对 `justfile` 的改动分两类，必须区分：
 
-1. **纯新增 recipe**（`check-fast`、`test-crate`、`test-affected`）——零冲突风险
+1. **纯新增 recipe**（`check-fast`、`test-crate`、`test-affected`、`affected-check`）
+   以及 1 行 `ci:` 依赖追加——冲突风险低（只在 `ci:` 那一行上碰）
 2. **在 `test` recipe 前加一段只读并发预检**——这是本文唯一触碰既有 rule 的地方，
    且只增加输出、**不改命令与退出码**。合并时若冲突，后合者 rebase
 
@@ -458,3 +465,7 @@ D3 的结论是假红无法在配置层修掉，因此改为**让它在发生时
 
 **其它需要同步的位置**：`just --list` 的分组注释、`CLAUDE.md` 的「cargo test 执行」小节
 若要点明档位入口，也属可选增强，不阻塞本设计。
+
+**`ci:` 依赖追加与本设计的取舍**：这会让 `just ci` 多花约 1 秒（纯 bash 断言，不编译）。
+本设计的非目标里写「不改 ci」是怕动它的既有门禁，不是拒绝新增——两者要分清：
+**既有 21 项一个都不动**，只在末尾追加 `affected-check`。
