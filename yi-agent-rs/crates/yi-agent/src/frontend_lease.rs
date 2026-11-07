@@ -320,12 +320,30 @@ mod tests {
     }
 
     #[test]
-    fn the_control_path_is_the_guardians_socket_in_the_runtime_directory() {
-        let path = control_path(Path::new("/tmp/project/runtime"));
+    fn the_control_path_lives_in_the_shared_socket_directory() {
+        // Only the shape is asserted here: this entry point resolves the instance home
+        // from the environment, so pinning the prefix would make the test depend on
+        // whoever runs it. What matters is that the runtime directory no longer
+        // contributes its own depth to the path — that was the overflow.
+        let path = control_path(Path::new("/tmp/project/a/deep/runtime"));
         assert_eq!(
-            path,
-            Path::new("/tmp/project/runtime")
-                .join(yi_agent_supervisors::lifecycle::guardian::GUARDIAN_SOCKET_FILE)
+            path.file_name(),
+            Some(std::ffi::OsStr::new(
+                yi_agent_supervisors::lifecycle::guardian::GUARDIAN_SOCKET_FILE
+            ))
+        );
+        let digest = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .expect("the socket sits one directory below a digest");
+        assert_eq!(digest.len(), 16, "got {digest:?}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("sockets"))
         );
     }
 }

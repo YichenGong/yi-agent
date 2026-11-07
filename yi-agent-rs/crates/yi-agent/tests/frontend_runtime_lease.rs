@@ -23,7 +23,7 @@ use yi_agent_lifecycle::types::{
     ArtifactIdentity, ClientKind, ControlErrorCode, ControlRequest, ControlResponse, LeaseMode,
     RuntimeScope,
 };
-use yi_agent_supervisors::lifecycle::guardian::{GUARDIAN_SOCKET_FILE, serve};
+use yi_agent_supervisors::lifecycle::guardian::serve;
 
 /// How long a *quitting* frontend has to show up in the guardian's records.
 ///
@@ -108,7 +108,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::TempDir::new().expect("tempdir");
+        // `/private/tmp` rather than the default temp dir: the control socket lives at
+        // `<instance_home>/sockets/<16 hex>/guardian-control.sock`, and macOS's default
+        // temp dir (68 bytes) plus that 47-byte tail is already past `sun_path`. Using
+        // the canonical spelling also keeps the scope key from disagreeing with a
+        // child process that canonicalises `/tmp` for us.
+        let root = tempfile::Builder::new()
+            .prefix("frl")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
         let workdir = root.path().join("repository");
         let runtime_dir = root.path().join("runtime");
         let home = root.path().join("home");
@@ -175,12 +183,16 @@ impl Fixture {
             key: self.runtime_dir.to_string_lossy().into_owned(),
             runtime_dir: self.runtime_dir.clone(),
             project_key: self.workdir.to_string_lossy().into_owned(),
-            instance_home: self.root.path().to_path_buf(),
+            // The `.yi-agent` directory, matching what `YI_AGENT_HOME`'s derived form
+            // is; the bare parent would claim a different instance home than the
+            // child processes this fixture launches.
+            instance_home: self.root.path().join("instance/.yi-agent"),
         }
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.runtime_dir.join(GUARDIAN_SOCKET_FILE)
+        let scope = self.scope();
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home)
     }
 }
 
@@ -653,7 +665,9 @@ impl PtyTerminal {
     /// The settle wait after it covers the few hundred microseconds in between;
     /// quitting before the attach would only prove the TUI can exit.
     fn await_runtime_attached(&mut self, fixture: &Fixture) {
-        let socket = fixture.runtime_dir.join("runtime.sock");
+        let scope = fixture.scope();
+        let socket =
+            yi_agent_lifecycle::scope::daemon_socket(&scope.runtime_dir, &scope.instance_home);
         let deadline = Instant::now() + Duration::from_secs(60);
         while !socket.exists() {
             if matches!(self.child.try_wait(), Ok(Some(_))) {

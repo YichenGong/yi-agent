@@ -5096,7 +5096,12 @@ fn a_failed_start_does_not_leave_a_lock_that_blocks_the_next_attempt() {
 /// path, so a leftover socket would otherwise wedge the runtime forever.
 #[test]
 fn a_stale_socket_left_by_a_killed_daemon_does_not_block_a_new_daemon() {
-    let directory = TempDir::new().unwrap();
+    // `/private/tmp`: the socket sits under `<instance_home>/sockets/<16 hex>/`, and
+    // the default temp dir's 68 bytes plus that tail already overflows `sun_path`.
+    let directory = tempfile::Builder::new()
+        .prefix("stale")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     std::fs::create_dir_all(&runtime).unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -5108,6 +5113,9 @@ fn a_stale_socket_left_by_a_killed_daemon_does_not_block_a_new_daemon() {
     drop(first);
     assert!(!socket_path.exists(), "a clean stop removes its own socket");
 
+    // The clean stop removed its now-empty socket directory too, and a crash would
+    // have left both behind; recreate both halves of what a killed process leaves.
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
     std::fs::write(&socket_path, b"").unwrap();
     assert!(socket_path.exists(), "the stale socket node is in place");
 

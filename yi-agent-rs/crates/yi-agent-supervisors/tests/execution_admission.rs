@@ -16,7 +16,9 @@ use yi_agent_lifecycle::types::{
     ClientKind, ControlRequest, ControlResponse, ExecutionAdmission, LeaseMode, RuntimeScope,
 };
 use yi_agent_supervisors::lifecycle::admission::GuardianAdmission;
-use yi_agent_supervisors::lifecycle::guardian::{GUARDIAN_SOCKET_FILE, Guardian};
+use yi_agent_supervisors::lifecycle::guardian::Guardian;
+
+mod support;
 
 fn artifact() -> ArtifactIdentity {
     ArtifactIdentity {
@@ -38,7 +40,7 @@ fn scope(directory: &std::path::Path) -> RuntimeScope {
         key: directory.to_string_lossy().into_owned(),
         runtime_dir: directory.to_path_buf(),
         project_key: "/project".into(),
-        instance_home: directory.to_path_buf(),
+        instance_home: support::short_instance_home(directory),
     }
 }
 
@@ -58,7 +60,8 @@ fn spawn_guardian(
     // `accept` would leave the test's `join` waiting for a connection that never
     // comes.
     listener.set_nonblocking(true).unwrap();
-    let socket = scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+    let socket =
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let handle = std::thread::spawn(move || {
         let mut guardian = guardian;
         while !stop.load(Ordering::SeqCst) {
@@ -105,7 +108,11 @@ fn a_registered_client_is_admitted() {
     let (socket, handle) = spawn_guardian(scope(directory.path()), "gen-1", Arc::clone(&stop));
     let grant = register(&socket, "app");
 
-    let admission = GuardianAdmission::new(directory.path(), grant);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        grant,
+    );
     assert!(admission.admit("gen-1", "task-1", "attempt-1").is_ok());
     stop.store(true, Ordering::SeqCst);
     let _ = handle.join();
@@ -130,7 +137,11 @@ fn a_released_client_is_refused() {
         )
         .unwrap();
 
-    let admission = GuardianAdmission::new(directory.path(), grant);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        grant,
+    );
     let refused = admission.admit("gen-1", "task-1", "attempt-1");
     assert!(
         refused.is_err(),
@@ -147,7 +158,11 @@ fn a_stale_generation_is_refused() {
     let (socket, handle) = spawn_guardian(scope(directory.path()), "gen-2", Arc::clone(&stop));
     let grant = register(&socket, "app");
 
-    let admission = GuardianAdmission::new(directory.path(), grant);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        grant,
+    );
     let refused = admission.admit("gen-1", "task-1", "attempt-1");
     assert!(
         refused.is_err(),
@@ -166,7 +181,11 @@ fn a_forged_grant_is_refused() {
     let mut grant = register(&socket, "app");
     grant.credential = "0".repeat(64);
 
-    let admission = GuardianAdmission::new(directory.path(), grant);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        grant,
+    );
     assert!(
         admission.admit("gen-1", "task-1", "attempt-1").is_err(),
         "a forged credential must not be admitted"
@@ -191,7 +210,11 @@ fn an_unknown_owner_is_refused() {
         epoch: grant.epoch,
         mode: grant.mode,
     };
-    let admission = GuardianAdmission::new(directory.path(), other);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        other,
+    );
     assert!(admission.admit("gen-1", "task-1", "attempt-1").is_err());
     stop.store(true, Ordering::SeqCst);
     let _ = handle.join();
@@ -219,7 +242,11 @@ fn a_lease_only_client_is_refused() {
         ControlResponse::Granted(grant) => grant,
         other => panic!("expected a grant, got {other:?}"),
     };
-    let admission = GuardianAdmission::new(directory.path(), grant);
+    let admission = GuardianAdmission::with_instance_home(
+        directory.path(),
+        &support::short_instance_home(directory.path()),
+        grant,
+    );
     assert!(
         admission.admit("gen-1", "task-1", "attempt-1").is_err(),
         "a lease-only client must never be admitted for work"

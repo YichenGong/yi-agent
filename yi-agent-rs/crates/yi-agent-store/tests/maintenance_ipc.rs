@@ -47,7 +47,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Fixture {
         let guard = serial_env();
-        let temp = TempDir::new().unwrap();
+        // `/private/tmp` 而非默认临时目录：socket 位于
+        // `<instance_home>/sockets/<16 hex>/runtime.sock`，macOS 默认临时目录本身
+        // 就 68 字节，加上 `.yi-agent` 与尾部 40 字节会超过 103 字节的 `sun_path`。
+        let temp = tempfile::Builder::new()
+            .prefix("mipc")
+            .tempdir_in("/private/tmp")
+            .unwrap();
         let home = temp.path().join(".yi-agent");
         std::fs::create_dir_all(&home).unwrap();
         // SAFETY: 环境变量在整个二进制内共享，但这里持有全局锁，本文件的

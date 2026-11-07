@@ -29,11 +29,34 @@ pub struct GuardianAdmission {
 
 impl GuardianAdmission {
     /// Binds one client's grant to the guardian socket of `runtime_dir`.
+    ///
+    /// The instance home is taken from the environment. A caller that already holds
+    /// it — a fixture, or anything carrying a `RuntimeScope` — must use
+    /// [`Self::with_instance_home`] instead: the guardian derives its socket from the
+    /// scope it was handed, and only the caller knows whether that matches the
+    /// environment.
     pub fn new(runtime_dir: &Path, grant: ClientGrant) -> Self {
         Self {
             // Through the lifecycle resolver: the control socket can move out of the
             // runtime directory when its path overflows `sun_path`.
             socket: yi_agent_lifecycle::scope::control_path(runtime_dir),
+            grant,
+        }
+    }
+
+    /// [`Self::new`], but against an explicitly known instance home.
+    ///
+    /// Same socket the guardian computed from `instance_home`, without re-reading
+    /// the environment. Tests need this: they build a scope with a chosen home, and
+    /// resolving from the environment instead would look for the socket in the
+    /// developer's real `~/.yi-agent`.
+    pub fn with_instance_home(
+        runtime_dir: &Path,
+        instance_home: &Path,
+        grant: ClientGrant,
+    ) -> Self {
+        Self {
+            socket: yi_agent_lifecycle::scope::guardian_socket(runtime_dir, instance_home),
             grant,
         }
     }

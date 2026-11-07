@@ -123,7 +123,11 @@ fn scope(directory: &TempDir) -> RuntimeScope {
         key: directory.path().to_string_lossy().into_owned(),
         runtime_dir: directory.path().to_path_buf(),
         project_key: "/project".to_string(),
-        instance_home: directory.path().to_path_buf(),
+        // Not the temp directory: on macOS it resolves to
+        // `/private/var/folders/<...>/T/.tmpXXXXXX` (68 bytes) and the 47-byte socket
+        // tail pushes that past the 103-byte sun_path cap. `/tmp` (68 bytes after
+        // canonicalisation) leaves room for the sockets/ directory and the file name.
+        instance_home: std::path::PathBuf::from(format!("/tmp/ya-reclaim-{}", std::process::id())),
     }
 }
 
@@ -629,7 +633,7 @@ fn a_traversal_shaped_operation_id_reads_nothing() {
 
 use yi_agent_lifecycle::client::ControlClient;
 use yi_agent_lifecycle::types::{ArtifactIdentity, ControlRequest, ControlResponse};
-use yi_agent_supervisors::lifecycle::guardian::{GUARDIAN_SOCKET_FILE, Guardian};
+use yi_agent_supervisors::lifecycle::guardian::Guardian;
 
 fn artifact() -> ArtifactIdentity {
     ArtifactIdentity {
@@ -655,7 +659,8 @@ fn spawn_guardian(
     let deadline = Deadline::after(Duration::from_secs(2));
     let listener = guardian.bind_control(&deadline).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let socket = scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+    let socket =
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let handle = std::thread::spawn(move || {
         let mut guardian = guardian;
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {

@@ -1368,7 +1368,9 @@ pub fn attach_managed_project_runtime(
         cfg,
         &runtime_dir,
         // The managed path never owns the daemon, so it never supervises plugins.
-        None,
+        // It does know the instance home, so it passes it rather than letting the
+        // attach re-derive it from the environment.
+        Some(instance_home),
         None,
     )
 }
@@ -1383,8 +1385,32 @@ fn attach_to_answer(
     instance_home: Option<&Path>,
     idempotency_key: Option<String>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    let socket_path = yi_agent_store::ipc::socket_path_for(runtime_dir)
-        .map_err(|error| AttachFailure::new("runtime directory", error))?;
+    // A caller that knows the instance home is authoritative: re-deriving it from the
+    // environment would target a different instance than the daemon it just brought
+    // up, and the attach would fail against a socket that does not exist. Callers that
+    // only hold a runtime directory keep the environment lookup.
+    let socket_path = match instance_home {
+        Some(home) => {
+            let socket = yi_agent_lifecycle::scope::daemon_socket(runtime_dir, home);
+            if socket.as_os_str().len() > yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES {
+                return Err(AttachFailure::new(
+                    "runtime directory",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "the daemon socket would be {} bytes, over the {}-byte sun_path limit: {}",
+                            socket.as_os_str().len(),
+                            yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES,
+                            socket.display()
+                        ),
+                    ),
+                ));
+            }
+            socket
+        }
+        None => yi_agent_store::ipc::socket_path_for(runtime_dir)
+            .map_err(|error| AttachFailure::new("runtime directory", error))?,
+    };
     // When the guardian minted authority for this root, the capability *is* the
     // attach key: the daemon resolves it to the binding the guardian pushed, and
     // that is the only way it can learn whose root this is. Inventing a key here
@@ -1418,7 +1444,6 @@ fn attach_to_answer(
     else {
         return Err(AttachFailure::new("attach", describe_rejection(&response)));
     };
-    let _ = instance_home;
     Ok(AttachedProjectRuntime {
         socket_path,
         workspace_root: workspace.path.clone(),

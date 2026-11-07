@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 pub(crate) use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 pub(crate) use yi_agent_core::subagent::task::{

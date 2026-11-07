@@ -374,7 +374,26 @@ impl Daemon {
         // them as soon as it reconciles. Only this project's routes are dropped:
         // another project's daemon in the same process keeps serving.
         clear_plugin_sockets(runtime_dir);
-        let listener = UnixListener::bind(&socket_path)?;
+        // The socket now lives under the instance home, in a directory nothing else
+        // creates; without it the bind fails with ENOENT, a worse failure than the
+        // over-long path this layout replaced because ENOENT does not name its cause.
+        //
+        // Created here rather than beside `socket_path_for` so that every earlier
+        // refusal (lock, schema preflight, repository open) leaves no directory
+        // behind: those returns are common in tests and on a mismatched build.
+        if let Some(socket_dir) = socket_path.parent() {
+            fs::create_dir_all(socket_dir)?;
+            fs::set_permissions(socket_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                if let Some(socket_dir) = socket_path.parent() {
+                    let _ = fs::remove_dir(socket_dir);
+                }
+                return Err(error.into());
+            }
+        };
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         // Record the socket node's identity so the exit path can tell our node
         // apart from a replacement bound at the same path after this directory
@@ -524,6 +543,12 @@ impl Daemon {
                 let _ = handler.join();
             }
             remove_socket_if_same_inode(&cleanup_socket, cleanup_socket_identity);
+            // Only removes the directory when it is empty. The guardian shares
+            // `sockets/<hash>/`, so on a normal teardown its control socket is still
+            // present and this fails with ENOTEMPTY -- deliberately ignored.
+            if let Some(socket_dir) = cleanup_socket.parent() {
+                let _ = fs::remove_dir(socket_dir);
+            }
             let _ = remove_if_exists(&cleanup_lock);
         });
         Ok(Self {

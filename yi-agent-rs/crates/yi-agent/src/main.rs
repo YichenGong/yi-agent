@@ -6689,9 +6689,17 @@ mod tests {
             reason.contains("socket"),
             "the reason must name the failing mechanism, got: {reason}"
         );
+        // The old remedy ("shorten the project path", "set YI_AGENT_RUNTIME_DIR") is
+        // gone: the socket now lives under the instance home, so neither knob changes
+        // its length. What is left is the fact — bytes over the limit — and a stale
+        // suggestion here would be worse than none.
         assert!(
-            reason.contains("YI_AGENT_RUNTIME_DIR"),
-            "the reason must offer an actionable remedy, got: {reason}"
+            reason.contains("103") && reason.contains("/very/long/path/runtime.sock"),
+            "the reason must state the limit and the path, got: {reason}"
+        );
+        assert!(
+            !reason.contains("YI_AGENT_RUNTIME_DIR") && !reason.contains("restart"),
+            "the reason must not suggest a remedy that no longer applies, got: {reason}"
         );
     }
 
@@ -7610,6 +7618,11 @@ mod tests {
 
     impl InternalErrorDaemon {
         fn start(socket: &std::path::Path) -> Self {
+            // The real daemon creates `<instance_home>/sockets/<hash>/` right before
+            // binding; this stand-in has to do the same or `bind` fails with ENOENT.
+            if let Some(parent) = socket.parent() {
+                std::fs::create_dir_all(parent).expect("socket directory");
+            }
             let listener = UnixListener::bind(socket).expect("probe socket binds");
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let thread_stop = std::sync::Arc::clone(&stop);
@@ -7766,11 +7779,48 @@ mod tests {
     /// to fail.
     #[test]
     fn retiring_a_wedged_daemon_lets_the_next_launch_start_a_working_runtime() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // `/private/tmp` and an explicit instance home: the socket now lives at
+        // `<instance_home>/sockets/<16 hex>/runtime.sock`, which neither fits under
+        // the default (68-byte) temp dir nor should be resolved from the developer's
+        // real `YI_AGENT_HOME`.
+        let dir = tempfile::Builder::new()
+            .prefix("wedged")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let instance_home = dir.path().join("instance/.yi-agent");
         let runtime_dir = dir.path().join(".yi-agent/runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
         let database = runtime_dir.join("runtime.sqlite");
-        let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
+        // `Daemon::start` resolves the socket from the environment, so the variable is
+        // pinned here too: the probe and the replacement daemon must agree on one path,
+        // and the process's real instance home has no business hosting a test socket.
+        // `YI_AGENT_INSTANCE_HOME` wins over `YI_AGENT_HOME`/`HOME` and is taken
+        // verbatim, so the path below is exactly what the daemon will bind.
+        //
+        // SAFETY: set_var is unsafe because concurrent reads of the environment are
+        // UB. Nothing else in this binary's tests reads these variables, and this is
+        // the only writer.
+        let previous_instance_home = std::env::var_os("YI_AGENT_INSTANCE_HOME");
+        unsafe {
+            std::env::set_var("YI_AGENT_INSTANCE_HOME", &instance_home);
+        }
+        // Restored on the way out: other tests in this binary build scopes of their
+        // own, and a leaked instance home would silently redirect them.
+        struct RestoreInstanceHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreInstanceHome {
+            fn drop(&mut self) {
+                // SAFETY: same single-writer argument as the `set_var` above.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("YI_AGENT_INSTANCE_HOME", value),
+                        None => std::env::remove_var("YI_AGENT_INSTANCE_HOME"),
+                    }
+                }
+            }
+        }
+        let _restore_instance_home = RestoreInstanceHome(previous_instance_home);
+        let socket = yi_agent_lifecycle::scope::daemon_socket(&runtime_dir, &instance_home);
 
         let probe = InternalErrorDaemon::start(&socket);
         assert!(
@@ -7787,6 +7837,11 @@ mod tests {
 
         let daemon =
             yi_agent_store::ipc::Daemon::start(&runtime_dir, &database).expect("fresh daemon");
+        assert_eq!(
+            daemon.socket_path(),
+            socket.as_path(),
+            "the replacement daemon must bind where the probe and the client look"
+        );
         let response =
             yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Status)
                 .expect("the replacement daemon answers");

@@ -27,7 +27,31 @@ use yi_agent_subagent::thread_root::ThreadRoot;
 /// deadline instead of being masked.
 const CHILD_START_BUDGET: Duration = Duration::from_secs(20);
 
+/// Points `socket_path_for` at a throwaway instance home.
+///
+/// The business socket now lives under the instance home, so a test that never
+/// touches `YI_AGENT_HOME` would bind inside the developer's real `~/.yi-agent` and
+/// leave a node there for every run. Set once for the whole binary: every fixture
+/// already has a unique `runtime_dir`, so the derived socket paths stay distinct.
+fn isolate_instance_home() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let home =
+            std::path::PathBuf::from(format!("/private/tmp/ya-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create isolated instance home");
+        // SAFETY: single writer, before any test that reads the variable runs, and
+        // never written again.
+        unsafe {
+            std::env::set_var("YI_AGENT_INSTANCE_HOME", &home);
+        }
+    });
+}
+
 fn init_git_repo(dir: &Path) {
+    // Every test in this file starts here, which is what makes this the one place
+    // that can pin the instance home before any of them resolves a socket path.
+    isolate_instance_home();
     for args in [
         vec!["init", "-q"],
         vec!["config", "user.email", "test@example.com"],
@@ -1448,6 +1472,11 @@ fn a_peer_that_never_binds_fails_instead_of_retrying_forever() {
 ///
 /// Returns the observed commands, so a test can prove how many times a request was sent.
 fn serve_probes_but_drop_requests(socket: &Path) -> std::sync::mpsc::Receiver<String> {
+    // The socket now lives under `<instance_home>/sockets/<hash>/`, which the *daemon*
+    // creates. A stand-in peer has to make it too, or `bind` fails with ENOENT.
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent).expect("the socket directory");
+    }
     let _ = std::fs::remove_file(socket);
     let listener = std::os::unix::net::UnixListener::bind(socket).expect("the fake peer binds");
     let (sender, receiver) = std::sync::mpsc::channel();
