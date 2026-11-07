@@ -467,3 +467,19 @@ A01–A18 全部通过，见上文各节。
 - 代码门禁：通过（唯一失败为 main 既有基线测试）。
 - 真机：未验收。
 - 因此 `docs/project-management/desktop.md` 本条保持 `[ ]`，desktop 模块计数不增加。
+
+## 收尾：Task 1 遗留 Minor
+
+Task 1 审查提出的三项 Minor 中，两项可低成本收尾，已在最终审查前处理：
+
+1. `desktop/src/lib/qrScanner.ts` 文件头改为「停机前的失败一律走 `onError`；停机后到达的
+   取流/播放 rejection 静默丢弃」，与 `fail()` 的 `stopped` 早退一致（原文「任何失败
+   一律走 onError」不准确）。
+2. `fail()` 在结果处理方已自行 `stop()` 后抛错时静默，已就地加注释说明这是刻意行为
+   （没有仍在运行的实例需要收尾，也就无处上报），不再像是漏报。
+3. 新增 `startCameraScan` 的 `srcObject` 正路径断言：接受结果后本实例的 `video.srcObject`
+   必须被清空。变异验证（删掉 `video.srcObject = null`）→ 该测试单独变红，还原后 17/17
+   通过，证明断言有判别力。
+
+第三项（`srcObject` 归属清理）在 Task 2 的 A11 中已有跨实例方向覆盖，本次补齐本实例
+正路径。此改动后前端全量 `npm test` = **2424 passed**，`npx tsc --noEmit` 干净。

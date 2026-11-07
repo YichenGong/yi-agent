@@ -77,8 +77,9 @@ function defaultDecode(data: ImageData): string | null {
  * `true`/`undefined` 则接受并停止。返回 `stop()` 用于清理（幂等）。
  * `getUserMedia` 失败时调 `onError` 且不启动循环（表单仍可手输）。
  *
- * 取流与 `play()` 都**不会**同步抛：任何失败一律走 `onError`，调用方（React effect）
- * 因此不会因为一个异常而连累整棵树。
+ * 取流与 `play()` 都**不会**同步抛：停机前的失败一律走 `onError`，调用方（React
+ * effect）因此不会因为一个异常而连累整棵树。停机（含已接受结果）之后到达的
+ * 取流/播放 rejection 静默丢弃，不再打扰已经离开的调用方。
  */
 export function startCameraScan(
   video: HTMLVideoElement,
@@ -151,6 +152,8 @@ export function startCameraScan(
             if (onResult(text) !== false) stop();
           } catch (error) {
             // 结果处理方同步抛错：收敛为一次可见失败，而不是从 interval 逃逸。
+            // 若它其实已经自己停过（`stopped` 为真），`fail` 会静默——此时没有
+            // 还在扫的实例需要收尾，也就无处上报；这是刻意的，不是漏报。
             fail(error);
           }
         }

@@ -143,6 +143,20 @@ describe("startCameraScan", () => {
 
   // ---- 扫描结果接收契约（A06/A09/A10/A17）------------------------------
 
+  it("clears srcObject on acceptance when the stream is ours", async () => {
+    const stream = {
+      getTracks: () => [{ stop: vi.fn() }],
+    } as unknown as MediaStream;
+    const video = fakeVideo();
+    startCameraScan(video, () => true, vi.fn(), {
+      getUserMedia: async () => stream,
+      grabFrame: () => frame,
+      decode: () => "text",
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(video.srcObject).toBeNull();
+  });
+
   it("A06 keeps rejected text alive and stops on acceptance", async () => {
     const trackStop = vi.fn();
     const stream = { getTracks: () => [{ stop: trackStop }] } as unknown as MediaStream;
