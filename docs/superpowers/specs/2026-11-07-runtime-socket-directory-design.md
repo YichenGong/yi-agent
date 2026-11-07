@@ -522,6 +522,17 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
    进程，但两者都要能过。`maintenance_ipc.rs:55` 用全局 `Mutex` + `unsafe set_var`
    绕过这个限制，不要再复制到别处。
 
+4. **`tempfile::TempDir` 不能当 `instance_home`（实测 2026-11-07）。**
+   macOS 上 `TempDir` 解析到 `/private/var/folders/<2+22>/T/.tmpXXXXXX`，实长
+   **68 字节**；加上 `sockets/<16hex>/guardian-control.sock` 的 **47 字节**尾部等于
+   **115**，超过 103 上限，`bind` 直接 `path must be shorter than SUN_LEN`。
+   `/tmp` 规范化后是 `/private/tmp`（68 字节 `…/T` 那层没有了），实测
+   `<home>/sockets/<hash>/guardian-control.sock` = **68 字节**，装得下。
+   — **处理：凡是需要真正 `bind` 的用例，`instance_home` 用
+   `/tmp/ya-<用途>-<pid>` 并在结尾 `remove_dir_all`；不要用 `TempDir`。**
+   只做纯路径字符串断言的用例不受影响。这条约束本身也说明长度预算是真实的：
+   连系统临时目录都装不下，用户把项目放深一点当然装不下。
+
 **结论：不做「给 `Daemon::start` 加 `instance_home` 参数」的改造。** 早先版本的
 spec 提出过这个方案，但它把生产签名为了测试而变复杂，而实际问题只有第 1 条
 （空目录残留），改实现即可解决。
@@ -578,7 +589,7 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 |---|---|
 | `socket_directory` 能放下（正常） | 无错误 |
 | `instance_home` 使得路径超限（>56 字节） | `control_socket` / `socket_path_for` 返回 `SocketPathTooLong`，由 bring-up 转成可读拒绝 |
-| 三个 instance_home 来源全缺失 | `socket_path_for` 返回 `IpcError::InstanceHomeUnavailable`（它会 bind，必须报错）；`control_path` 返回占位路径并 `tracing::error!`（详见 §3.3，它不 bind） |
+| 三个 instance_home 来源全缺失 | `socket_path_for` 返回 `IpcError::InstanceHomeUnavailable`（它会 bind，必须报错）；`control_path` 返回占位路径 `<unknown-instance-home>/sockets/...` 并在 stderr 打一行诊断（详见 §3.3，它不 bind） |
 
 第 3 行的用户可见文案（替换现有的 30 秒超时弹窗）：
 
@@ -593,8 +604,14 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 建议——重启只会重复同样的失败。测试断言超长场景的错误信息**不含**"重启"、**不含**
 "移到更短的路径"（后者已不是解法，§2 让 socket 与项目深度无关）。
 
-提示应留在日志而不是弹窗：`tracing::error!` 里记完整路径与三个来源
-（`YI_AGENT_INSTANCE_HOME` / `YI_AGENT_HOME` / 默认），排查时能看到是哪来的。
+提示应留在日志而不是弹窗：调用方（`bringup` / `guardian`，它们有 `tracing`）在拿到
+`SocketPathTooLong` 时记完整路径与三个来源（`YI_AGENT_INSTANCE_HOME` /
+`YI_AGENT_HOME` / 默认），排查时能看到是哪来的。
+
+`lifecycle` 本身没有 `tracing` 依赖（desktop 壳链接它，要保持轻），所以 `control_path`
+在三个来源全缺失的分支里用 `eprintln!` 打一行诊断。该分支在正常主机上不可达
+（launchd、容器、SSH 都会设 `HOME`），`eprintln!` 只在"真的什么都没有"时出现，
+不需要日志框架支撑。
 
 **两个现有的错误文案都要改**，它们现在的措辞会把用户往错方向引：
 
@@ -617,6 +634,7 @@ itself is absurdly deep"，随兜底删除一并更新。）
    `daemon_socket` 都 ≤ `MAX_SOCKET_PATH_BYTES`。改回直接 join 即红。
 2. **能真正 bind**：对 `socket_directory` 下的两个名字实际 `UnixListener::bind`，
    断言成功。这条是本次故障的正面回归——只断言长度不够，`bind` 才是真判据。
+   注意 `instance_home` 必须用 `/tmp` 下的短目录，`TempDir` 装不下（见 §3.6 第 4 条）。
 3. **同源性**：断言 launcher（`bringup::control_path`）、guardian（`bind_control`）、
    `admission`、`thread_root`、`frontend_lease` 五处算出的路径两两相等。
    这几处是 §3.3 表格里最容易被改回 `runtime_dir.join(...)` 的；任一改动即红。
