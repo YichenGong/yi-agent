@@ -364,3 +364,106 @@ cd desktop && npx tsc --noEmit  → 无输出，exit 0
 - 完整 `just ci` 仍被既有基线测试
   `yi-agent-app-server server::tests::transport::agent_factory_failure_returns_internal_error`
   阻塞（main 上同样 3/3 失败），与本任务无关。
+
+## Task 5：回退判别性、完整门禁与真机交付
+
+### 5.1 A05 单故障 mutation
+
+临时把 `desktop/src/components/QrScanner.tsx` 的 effect 恢复为旧写法
+（`startCameraScan(video, onText, onError, deps)`，依赖 `[onText, onError, deps]`）：
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/QrScanner.test.tsx
+```
+
+```
+ → expected "spy" to be called 1 times, but got 2 times
+ Failed Tests 1
+ FAIL  A05 callback refresh does not reopen camera
+      Tests  1 failed | 2 passed (3)
+```
+
+即父组件回调刷新会重开相机（`getUserMedia` 2 次）。还原后 3/3 通过。
+
+### 5.2 A07 复合 mutation
+
+同时做三处回退（只撤一道不算）：
+
+1. 删除 `runRedeem` 里 `await` 之前的 `scanActive.current = false; setScanning(false)`；
+2. 把 `setScanning(false)` 搬回异步 `finally`；
+3. 渲染条件恢复为 `scanning && (`（去掉 `!busy`）。
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/PairingScreen.test.tsx
+```
+
+```
+ Failed Tests 5
+ FAIL  A01 accepted QR removes overlay while redeem is pending
+ FAIL  A07/A14 pending recognition leaves the camera strict=false
+ FAIL  A07/A14 pending recognition leaves the camera strict=true
+ FAIL  A08 invalid then valid stays in one live stream strict=false
+ FAIL  A08 invalid then valid stays in one live stream strict=true
+      Tests  5 failed | 35 passed (40)
+```
+
+失败点是「pending 兑换期间覆盖层与相机预览仍在」——正是用户报告的「扫上码之后黑屏」。
+还原后 40/40 通过，`git diff --stat` 对两个生产文件均为空（无临时回退残留）。
+
+### 5.3 全量前端与门禁
+
+```sh
+cd desktop && npm test              # 173 files / 2423 tests passed
+cd desktop && npx tsc --noEmit      # 无输出，exit 0
+cd desktop && npm run build         # 成功，产出 dist/
+git diff --check                    # 无输出
+```
+
+- `cargo fmt --all` 已执行。
+- `just ci`：**rc=100**，唯一失败为
+  `yi-agent-app-server server::tests::transport::agent_factory_failure_returns_internal_error`
+  （`left: Null, right: -32603`）。该测试在 main（`cec4dfc0`，未含本分支改动）上同样
+  稳定失败；本分支未改动任何 Rust 源码（diff 仅 desktop TS/TSX 与文档）。另有
+  `yi-agent-tools shell::bash::tests::dropping_bash_call_stops_the_child_process` 在首次
+  全量运行时偶发失败，单独复跑 3/3 通过，第二次全量 `just ci` 未复现。
+- 第二次 `just ci`：5928 tests，5927 passed / 1 failed（同一基线测试）/ 40 skipped。
+
+结论：**代码门禁通过（除既有基线失败），真机未验收**。
+
+### 5.4 iOS 构建
+
+```sh
+cd desktop && npm run sidecar:release   # rc=0，build id 3ecc7c15…
+cd desktop && npm run build             # rc=0
+cd desktop && npm run ios:build         # 第二次 rc=0，** BUILD SUCCEEDED **
+```
+
+首次 `ios:build` 因 SwiftPM 拉取 `swift-rs` 网络超时（HTTP 28）失败，非代码问题；
+重试成功并产出 `desktop/src-tauri/gen/apple/build/arm64/yi-agent.ipa`。
+`git diff -- desktop/src-tauri` 为空：`ios:build` 未产生版本文件漂移。
+
+### 5.5 真机验收 I01–I07
+
+设备检查：`xcrun devicectl list devices` 显示 `Yichen iPhone (iPhone 14 Pro)`,
+状态 **unavailable**（未连接）；无已启动模拟器，且模拟器不提供可扫码的摄像头。
+
+因此 I01–I07 **未验收**，不虚构通过：
+
+| 编号 | 场景 | 状态 |
+|---|---|---|
+| I01 | 正常中继配对，扫码后立即离开相机并显示进度 | 未验收（无可用真机） |
+| I02 | 可控 3 秒慢响应下覆盖层已移除、进度可见 | 未验收 |
+| I03 | 过期/离线/网络失败给出正确文案并保留表单 | 未验收 |
+| I04 | 普通码→合法码在同一路相机内连续扫描 | 未验收 |
+| I05 | 返回后再次扫码 5 次不残留旧回调 | 未验收 |
+| I06 | 重配 pending 时返回、晚成功不覆盖旧配置 | 未验收 |
+| I07 | 直连与首启路径 | 未验收 |
+
+对应的代码级证据（jsdom + 真实 `PairingScreen`/`QrScanner`，只 mock 浏览器媒体边界）：
+A01–A18 全部通过，见上文各节。
+
+### 5.6 交付状态
+
+- 代码门禁：通过（唯一失败为 main 既有基线测试）。
+- 真机：未验收。
+- 因此 `docs/project-management/desktop.md` 本条保持 `[ ]`，desktop 模块计数不增加。
