@@ -32,6 +32,27 @@ pub(crate) fn apply_session(
             .set_last_input_tokens(s.last_input_tokens());
     }
 }
+/// Carry the live-settings bindings from `source` onto a freshly rebuilt agent.
+///
+/// Every rebuild below (`SetModel`, `SetReasoningEffort`, `ReloadMcp`,
+/// `SetPreserveThinking`) replaces the `Agent` value. The session `Arc`, the
+/// tool registry and the permission path are already preserved one by one; the
+/// live-settings source and the provider admission gate must be too. Dropping
+/// them would silently freeze the thread's runtime settings at the values it
+/// was started with, and a manual `/compact` would stop taking its own lease.
+fn carry_live_bindings(
+    mut rebuilt: yi_agent_core::Agent,
+    source: &yi_agent_core::Agent,
+) -> yi_agent_core::Agent {
+    if let Some(live) = source.live_settings_source() {
+        rebuilt.set_live_settings(live);
+    }
+    if let Some(gate) = source.provider_turn_gate() {
+        rebuilt = rebuilt.with_provider_turn_gate(gate);
+    }
+    rebuilt
+}
+
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
 ///
 /// 清空与压缩都**就地**替换会话内容(`set_session_messages`),不换 `Arc`:同一
@@ -110,7 +131,23 @@ pub(crate) async fn apply_session_command(
         }
         SessionCommand::Compact { reply } => {
             let session = agent.session();
-            let outcome = match yi_agent_core::compact_session(provider, config, &session).await {
+            // A manual compaction is its own provider operation: it takes an
+            // independent lease from the same gate the run uses and reads the
+            // compaction fields of the latest settings (never the normal system
+            // prompt, never the previous turn's consumed budget). Both bindings
+            // are read from the agent so a host that injects them later needs no
+            // change here; unbound agents keep the static behaviour.
+            let live_source = agent.live_settings_source();
+            let gate = agent.provider_turn_gate();
+            let outcome = match yi_agent_core::compact::compact_session_with_live_settings(
+                provider,
+                config,
+                &session,
+                live_source.as_deref(),
+                gate.as_deref(),
+            )
+            .await
+            {
                 Ok(Some(compacted)) => {
                     // Replace the contents in place so the session `Arc` — and
                     // any `CallerContext` bound to it — stays valid.
@@ -182,6 +219,7 @@ pub(crate) async fn apply_session_command(
             if let (Some(checker), Some(rx)) = (permission, decision) {
                 rebuilt = rebuilt.with_permission(checker, rx);
             }
+            rebuilt = carry_live_bindings(rebuilt, &agent);
             tracing::info!(model = %effective.model, ?model_ref, "session model switched");
             // Design §5.3 step 4:重建成功后广播本会话的生效模型,让所有订阅该
             // thread 的客户端(桌面 + 手机)立刻刷新,无需轮询。
@@ -218,6 +256,7 @@ pub(crate) async fn apply_session_command(
             if let (Some(checker), Some(rx)) = (permission, decision) {
                 rebuilt = rebuilt.with_permission(checker, rx);
             }
+            rebuilt = carry_live_bindings(rebuilt, &agent);
             tracing::info!(?effort, "session reasoning effort switched");
             let _ = reply.send(Ok(()));
             agent = rebuilt;
@@ -253,6 +292,7 @@ pub(crate) async fn apply_session_command(
                 if let (Some(checker), Some(rx)) = (permission, decision) {
                     rebuilt = rebuilt.with_permission(checker, rx);
                 }
+                rebuilt = carry_live_bindings(rebuilt, &agent);
                 tracing::info!(
                     servers = report.servers.len(),
                     failed = failures.len(),
@@ -293,6 +333,7 @@ pub(crate) async fn apply_session_command(
             if let (Some(checker), Some(rx)) = (permission, decision) {
                 rebuilt = rebuilt.with_permission(checker, rx);
             }
+            rebuilt = carry_live_bindings(rebuilt, &agent);
             tracing::info!(preserve, "session preserve-thinking switched");
             agent = rebuilt;
             // 立即把（可能已剥离的）会话状态落盘：否则「关闭后、下一轮开始前」

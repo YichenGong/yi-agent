@@ -2855,10 +2855,18 @@ fn run_tui_agent(
                             let handle = agent.session_handle();
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
-                            match yi_agent_core::compact_session(
+                            // Manual compaction is its own provider operation:
+                            // independent lease from the run's gate, and the
+                            // compaction fields come from the latest settings
+                            // rather than the static config captured at rebuild.
+                            let live_source = agent.live_settings_source();
+                            let gate = agent.provider_turn_gate();
+                            match yi_agent_core::compact::compact_session_with_live_settings(
                                 &live.provider,
                                 &live.config,
                                 &session,
+                                live_source.as_deref(),
+                                gate.as_deref(),
                             )
                             .await
                             {

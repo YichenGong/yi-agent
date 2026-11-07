@@ -2137,3 +2137,144 @@ async fn kanban_observation_plain_rpc_resume_is_discovered() {
     drop(daemon);
     h.shutdown().await;
 }
+
+/// `thread/compact` 必须走带活设置的手动压缩入口，而不是只调 core 的静态封装。
+///
+/// 用真实 `apply_session_command` 链路：agent 绑定一个"预算极紧"的 source 和一个
+/// 计数 gate，压一条很长的历史。若宿主仍调静态入口，(1) source 不会被咨询，
+/// (2) gate 上不会出现独立 lease。两条断言分别钉住这两点。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_compact_uses_the_live_entry_point() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use yi_agent_core::live_settings::{LiveAgentSnapshot, LiveSettingsError};
+
+    struct CountingSource {
+        calls: StdArc<AtomicUsize>,
+    }
+    impl yi_agent_core::AgentSettingsSource for CountingSource {
+        fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LiveAgentSnapshot {
+                revision: "rev-1".into(),
+                max_turns: None,
+                compact_threshold: Some(1),
+                // Tight budget: only the most recent short user message is kept,
+                // so a static-default compaction would retain more history.
+                compact_user_budget_tokens: 8,
+                compact_tool_budget_tokens: 1,
+                system_prompt: Some("live prompt".into()),
+            })
+        }
+    }
+
+    struct CountingGate {
+        leases: StdArc<AtomicUsize>,
+        acquisitions: StdArc<AtomicUsize>,
+    }
+    impl yi_agent_core::ProviderTurnGate for CountingGate {
+        fn acquire(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Box<dyn yi_agent_core::ProviderTurnLease>, String>,
+        > {
+            self.acquisitions.fetch_add(1, Ordering::SeqCst);
+            let leases = StdArc::clone(&self.leases);
+            leases.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Box::new(Lease(leases)) as Box<dyn yi_agent_core::ProviderTurnLease>)
+            })
+        }
+    }
+    struct Lease(StdArc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let calls = StdArc::new(AtomicUsize::new(0));
+    let leases = StdArc::new(AtomicUsize::new(0));
+    let acquisitions = StdArc::new(AtomicUsize::new(0));
+    let gate_leases = StdArc::clone(&leases);
+    let factory_calls = StdArc::clone(&calls);
+    let factory_gate = StdArc::clone(&gate_leases);
+    let factory_acquisitions = StdArc::clone(&acquisitions);
+    let factory = move |session: Option<yi_agent_core::Session>,
+                        _cwd: &std::path::Path,
+                        _mode: crate::thread_store::ThreadMode|
+          -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let session = session.unwrap_or_else(|| {
+            let mut s = yi_agent_core::Session::new();
+            // One long user message plus a short recent one: the tight live
+            // budget keeps only the short one.
+            s.replace_messages(vec![
+                yi_agent_core::Message::user("long ".repeat(300)),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "ok".into(),
+                )]),
+                yi_agent_core::Message::user("short"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "ok2".into(),
+                )]),
+            ]);
+            s
+        });
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        )
+        .with_session(session)
+        .with_provider_turn_gate(StdArc::new(CountingGate {
+            leases: StdArc::clone(&factory_gate),
+            acquisitions: StdArc::clone(&factory_acquisitions),
+        }));
+        agent.set_live_settings(StdArc::new(CountingSource {
+            calls: StdArc::clone(&factory_calls),
+        }));
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
+        })
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let before = calls.load(Ordering::SeqCst);
+    let v = compact_thread(&mut h, &tid).await;
+    assert_eq!(
+        v["result"]["status"], "compacted",
+        "the tight live budget must still compact: {v}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > before,
+        "thread/compact must consult the bound live settings source: a start-up \
+         rebuild (delegation/theme wiring) must not drop the binding"
+    );
+    assert_eq!(
+        acquisitions.load(Ordering::SeqCst),
+        1,
+        "a manual compaction must take exactly one independent lease"
+    );
+    assert_eq!(
+        leases.load(Ordering::SeqCst),
+        0,
+        "the manual compaction lease must be released when it returns"
+    );
+    h.shutdown().await;
+}

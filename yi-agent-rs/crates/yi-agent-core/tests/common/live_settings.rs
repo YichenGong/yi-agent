@@ -23,27 +23,75 @@ use yi_agent_core::{
 
 /// Provider that records every request it receives and replays scripted events.
 ///
+/// All state is behind `Arc`, so `Clone` shares one recording — a test can keep
+/// a handle for barrier control after handing the provider to the agent.
+///
 /// `reject_remaining` lets a test fail the first N calls with a retryable
 /// error while still recording their request, so "when was the request built"
 /// and "does a retry rebuild it" are observable from the requests alone.
+#[derive(Clone)]
 pub struct RecordingProvider {
     pub requests: Arc<Mutex<Vec<ProviderRequest>>>,
-    pub scripts: Mutex<VecDeque<Vec<ProviderEvent>>>,
-    reject_remaining: AtomicUsize,
+    pub scripts: Arc<Mutex<VecDeque<Vec<ProviderEvent>>>>,
+    reject_remaining: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    block_from: usize,
+    block_until: usize,
 }
 
 impl RecordingProvider {
     pub fn new(scripts: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
-            scripts: Mutex::new(scripts.into()),
-            reject_remaining: AtomicUsize::new(0),
+            scripts: Arc::new(Mutex::new(scripts.into())),
+            reject_remaining: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            block_from: usize::MAX,
+            block_until: usize::MAX,
         }
+    }
+
+    /// Park every call from index `n` until the test releases it, so a save can
+    /// be published while that call is in flight without racing wall-clock time.
+    pub fn blocking_from(mut self, n: usize) -> Self {
+        self.block_from = n;
+        self
+    }
+
+    /// Park calls in the half-open range `[from, until)` only. Everything
+    /// outside it proceeds, so a test can park exactly the summary call.
+    pub fn blocking_range(mut self, from: usize, until: usize) -> Self {
+        self.block_from = from;
+        self.block_until = until;
+        self
+    }
+
+    /// Wait until a call is parked inside the provider.
+    pub async fn wait_entered(&self) {
+        let permit = self
+            .entered
+            .acquire()
+            .await
+            .expect("provider barrier entered semaphore closed");
+        permit.forget();
+    }
+
+    /// Let exactly one parked call proceed.
+    pub fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     /// Reject the first `count` calls with `ProviderError::RateLimited`.
     pub fn rejecting_first(mut self, count: usize) -> Self {
-        self.reject_remaining = AtomicUsize::new(count);
+        self.reject_remaining = Arc::new(AtomicUsize::new(count));
         self
     }
 
@@ -68,6 +116,15 @@ impl Provider for RecordingProvider {
         req: ProviderRequest,
     ) -> Result<futures::stream::BoxStream<'static, ProviderEvent>, ProviderError> {
         self.requests.lock().unwrap().push(req);
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        if index >= self.block_from && index < self.block_until {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| ProviderError::Network("provider barrier closed".into()))?
+                .forget();
+        }
         if self
             .reject_remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

@@ -444,3 +444,113 @@ async fn rebinding_the_source_replaces_it_for_the_next_run() {
         "the replaced source must be the one consulted by the next operation"
     );
 }
+
+/// A transport retry must resend the *same* semantic request. The backoff is a
+/// long wait with no admission in it, so a naive "re-read after every wait"
+/// would rebuild the request from the newer settings — the brief and spec §5.2
+/// both forbid that. The next semantic operation is what picks the new value up.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn transport_retry_keeps_its_request_when_settings_change_during_backoff() {
+    let provider = RecordingProvider::new(vec![end_turn_text("second-op")]).rejecting_first(1);
+    let requests = provider.requests.clone();
+    let settings = MutableSettings::new(snapshot("rev-1", "before"));
+    let mut config = static_config();
+    // Long enough that the paused clock cannot auto-advance past it before the
+    // test has published the new value.
+    config.think_stall_backoff_base = Duration::from_secs(5);
+    config.provider_error_retry_limit = 3;
+    let mut agent = Agent::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::default()),
+        config,
+    );
+    agent.set_live_settings(settings.as_source());
+
+    let mut stream = agent.run("one".into()).await.unwrap();
+
+    // Drive the stream until the first rejection has been retried: the first
+    // request is recorded before the backoff begins, so waiting for the retry
+    // event means the rejection already happened.
+    loop {
+        let event = timeout(
+            Duration::from_secs(10),
+            futures::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("run stalled")
+        .expect("stream ended before the retry");
+        if matches!(event, AgentEvent::ProviderRetry { .. }) {
+            break;
+        }
+    }
+
+    // Publish a different prompt *during* the backoff, then let the clock pass.
+    settings.set(snapshot("rev-2", "after-backoff"));
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    let mut events = vec![];
+    let mut rest = stream;
+    while let Some(event) = timeout(Duration::from_secs(10), futures::StreamExt::next(&mut rest))
+        .await
+        .expect("run stalled after the backoff")
+    {
+        events.push(event);
+    }
+    assert_no_errors(&events);
+
+    let recorded = requests.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2, "the retry must be the only extra call");
+    assert_eq!(
+        recorded[1].system, recorded[0].system,
+        "a retry must resend the original request, byte for byte"
+    );
+    assert_eq!(
+        recorded[1].system,
+        s("before"),
+        "a backoff save must not leak into the retried request"
+    );
+    assert_eq!(
+        format!("{:?}", recorded[1]),
+        format!("{:?}", recorded[0]),
+        "the whole retried request, not just the prompt, must be unchanged"
+    );
+}
+
+/// A controlled stop from a failing source must still hand queued interjections
+/// back. `flush_unconsumed` is not a rollback: it only returns text the user
+/// typed, so a source outage can never silently swallow it.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_failure_returns_queued_interjections() {
+    struct Failing;
+    impl AgentSettingsSource for Failing {
+        fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError> {
+            Err(LiveSettingsError::new("snapshot_unavailable"))
+        }
+    }
+
+    let provider = RecordingProvider::new(vec![end_turn_text("never")]);
+    let mut agent = Agent::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::default()),
+        static_config(),
+    );
+    agent.set_live_settings(Arc::new(Failing));
+
+    // `run` installs the inbox, so queue after it starts but before anything
+    // consumes it: the very first safe point fails, so nothing will.
+    let stream = agent.run("hello".into()).await.unwrap();
+    let inbox = agent.inbox_handle().expect("interjection inbox");
+    inbox.interject("do not lose me".into(), None).unwrap();
+
+    let events = drain(stream).await;
+    assert_error_code(&events, "snapshot_unavailable");
+    let returned = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::InterjectionsReturned { items } => Some(items.clone()),
+            _ => None,
+        })
+        .expect("a controlled stop must return the queued interjection");
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].text, "do not lose me");
+}

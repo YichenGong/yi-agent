@@ -446,16 +446,81 @@ pub fn build_summary_prompt(messages: &[Message]) -> String {
 /// Summarize the full original history and rebuild it through the safe planner.
 /// `Ok(None)` means no valid replacement can shorten the session, so the
 /// provider is never contacted.
+///
+/// The static facade: the budgets come from `config`. A live-settings caller
+/// uses [`compact_session_with_live_settings`] instead.
 pub async fn compact_session(
     provider: &Arc<dyn Provider>,
     config: &AgentConfig,
     session: &Session,
 ) -> Result<Option<Session>, AgentError> {
-    let Some(plan) = plan_compaction(
-        session.messages(),
+    compact_session_with_budgets(
+        provider,
+        config,
+        session,
         config.compact_user_budget_tokens,
         config.compact_tool_budget_tokens,
-    ) else {
+    )
+    .await
+}
+
+/// Compact a session for an external (manual) entry point with live settings.
+///
+/// Unlike [`compact_session`], this waits for provider admission *before*
+/// reading the budgets, so a save that lands while the entry point is queued is
+/// honoured. The compaction fields come from [`LiveCompactSnapshot`], never from
+/// the normal system prompt, and the old turn's consumed budget is irrelevant
+/// here — a manual compaction is its own operation.
+///
+/// The caller's control (Stop) is expected to wrap this future; every error
+/// path drops the lease with the scope.
+pub async fn compact_session_with_live_settings(
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    session: &Session,
+    source: Option<&dyn crate::live_settings::AgentSettingsSource>,
+    gate: Option<&dyn crate::ProviderTurnGate>,
+) -> Result<Option<Session>, AgentError> {
+    // Independent lease: a manual compaction is a separate provider operation
+    // and must not borrow (or bypass) the run's admission.
+    let _lease = match gate {
+        Some(gate) => Some(
+            gate.acquire()
+                .await
+                .map_err(AgentError::ProviderTurnAdmission)?,
+        ),
+        None => None,
+    };
+
+    // Safe point: admission has completed, so a save that raced it is visible.
+    let compact = match source {
+        Some(source) => Some(
+            source
+                .compact_snapshot()
+                .map_err(|error| AgentError::LiveSettings(error.code))?,
+        ),
+        None => None,
+    };
+    let user_budget = compact
+        .as_ref()
+        .map(|value| value.user_budget_tokens)
+        .unwrap_or(config.compact_user_budget_tokens);
+    let tool_budget = compact
+        .as_ref()
+        .map(|value| value.tool_budget_tokens)
+        .unwrap_or(config.compact_tool_budget_tokens);
+
+    compact_session_with_budgets(provider, config, session, user_budget, tool_budget).await
+}
+
+async fn compact_session_with_budgets(
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    session: &Session,
+    user_budget: usize,
+    tool_budget: usize,
+) -> Result<Option<Session>, AgentError> {
+    let Some(plan) = plan_compaction(session.messages(), user_budget, tool_budget) else {
         tracing::info!(msg_count = session.len(), "compact: no safe reduction");
         return Ok(None);
     };

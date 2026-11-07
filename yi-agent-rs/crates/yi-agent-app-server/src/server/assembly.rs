@@ -374,12 +374,24 @@ pub(crate) fn rebuild_thread_agent_with_theme(
     // bound to this thread's live conversation must keep seeing the same
     // session across the rebuild.
     let session_handle = agent.session_handle();
+    // A rebuild replaces the `Agent` value, so the live-settings source and the
+    // provider admission gate have to be carried over explicitly. Losing them
+    // here would freeze this thread's runtime settings at start-up values and
+    // make a manual `/compact` skip its own admission lease.
+    let live_settings = agent.live_settings_source();
+    let provider_turn_gate = agent.provider_turn_gate();
     let registry = registry_with_theme_tool(&tools, theme);
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
             .with_session_arc(session_handle);
     if let (Some(checker), Some(rx)) = (permission, decision) {
         rebuilt = rebuilt.with_permission(checker, rx);
+    }
+    if let Some(source) = live_settings {
+        rebuilt.set_live_settings(source);
+    }
+    if let Some(gate) = provider_turn_gate {
+        rebuilt = rebuilt.with_provider_turn_gate(gate);
     }
     apply_session(&mut rebuilt, session);
     BuiltAgent {
@@ -411,11 +423,19 @@ pub(crate) fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) ->
     // bound just below, survives the rebuild and keeps reading the thread's
     // current transcript rather than a snapshot taken here.
     let session_handle = agent.session_handle();
+    let live_settings = agent.live_settings_source();
+    let provider_turn_gate = agent.provider_turn_gate();
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), tooling.registry.clone(), config.clone())
             .with_session_arc(session_handle.clone());
     if let Some(rx) = decision_rx.clone() {
         rebuilt = rebuilt.with_permission(tooling.permission.clone(), rx);
+    }
+    if let Some(source) = live_settings {
+        rebuilt.set_live_settings(source);
+    }
+    if let Some(gate) = provider_turn_gate {
+        rebuilt = rebuilt.with_provider_turn_gate(gate);
     }
     // Bind the caller to the rebuilt agent's *live* session handle. `tooling`'s
     // `caller` and the registry's tool instances share one inner slot, so this

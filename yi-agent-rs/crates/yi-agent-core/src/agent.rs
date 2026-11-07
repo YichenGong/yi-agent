@@ -558,6 +558,15 @@ impl Agent {
         self.live_settings.clone()
     }
 
+    /// The provider admission gate currently bound to this agent, if any.
+    ///
+    /// Host entry points that start their own provider operation (a manual
+    /// `/compact`) must take an independent lease from the same gate the run
+    /// uses, so they never overlap a normal THINK.
+    pub fn provider_turn_gate(&self) -> Option<Arc<dyn ProviderTurnGate>> {
+        self.provider_turn_gate.clone()
+    }
+
     /// Attach a permission checker and decision channel for tool gating.
     ///
     /// `decision_rx` is shared via `Arc<Mutex<Receiver>>` so that the same
@@ -1160,6 +1169,10 @@ async fn think_phase(
     cancel_token: &CancellationToken,
     provider_turn_gate: &Option<Arc<dyn ProviderTurnGate>>,
     live_settings: &Option<Arc<dyn AgentSettingsSource>>,
+    // The snapshot the caller already took for this iteration, before the cap
+    // check. It is the authoritative read when there is no admission wait to
+    // survive; with a gate, the post-admission read below replaces it.
+    pre_iteration: Option<&crate::live_settings::LiveAgentSnapshot>,
     messages: &mut Vec<Message>,
     turn: u32,
     payload_leases: &mut Vec<crate::run_budget::BudgetLease>,
@@ -1216,19 +1229,48 @@ async fn think_phase(
         // is a controlled, recoverable stop: the lease drops with this scope
         // and no request is built from unknown settings.
         if operation.is_none() {
-            let live_snapshot = match live_settings {
-                Some(source) => match source.snapshot() {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        let _ = tx
-                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
-                            .await;
-                        return ThinkOutcome::Stopped;
-                    }
-                },
-                None => None,
+            // Without an admission gate there was no wait between the caller's
+            // snapshot and this point, so that snapshot *is* the post-wait read:
+            // consulting the source again would only sample the same safe point
+            // twice. With a gate, admission may have parked for a long time, so
+            // the value must be refreshed here (spec §5.2).
+            let live_snapshot = if provider_turn_gate.is_some() {
+                match live_settings {
+                    Some(source) => match source.snapshot() {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(error) => {
+                            // Same contract as the admission-error path above:
+                            // hand queued interjections back before reporting, so
+                            // a controlled stop never swallows the user's text.
+                            flush_unconsumed(tx, inbox).await;
+                            let _ = tx
+                                .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                                .await;
+                            return ThinkOutcome::Stopped;
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                pre_iteration.cloned()
             };
             let effective = merge_static_and_live(config, live_snapshot.as_ref());
+            // Waiting for admission is not "the iteration has started": a cap
+            // lowered during that wait must stop this iteration here, before a
+            // request exists. The turn index was already counted by the caller,
+            // so this neither adds nor rewinds a turn.
+            if let Some(max) = effective.max_turns
+                && u64::from(turn) > u64::from(max)
+            {
+                info!(turn, max, "live max turns reached after admission wait");
+                flush_unconsumed(tx, inbox).await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        reason: DoneReason::MaxTurns,
+                    })
+                    .await;
+                return ThinkOutcome::Stopped;
+            }
             let request_messages = if effective.preserve_thinking {
                 messages.clone()
             } else {
@@ -1874,7 +1916,76 @@ async fn run_loop(
             return;
         }
 
-        let compacted = maybe_auto_compact(&tx, &provider, &config, &session, &cancel_token).await;
+        // Live settings are sampled once per semantic iteration, before the
+        // max-turns check and before any auto-compaction: an iteration that is
+        // already over the cap must not spend a summary request. A save
+        // therefore applies to the next iteration only: it never rewinds
+        // consumed turns and never replays an operation that already started.
+        //
+        // A failing source is a controlled stop, but *where* it surfaces
+        // depends on admission. With a gate, the first safe point of this
+        // iteration is the post-admission read in `think_phase`: surfacing the
+        // failure here would skip admission entirely, so the error would be
+        // reported without the lease that `think_phase` must release. In that
+        // case this iteration simply cannot decide on compaction or on the cap
+        // yet and defers to `think_phase`, which re-reads after admission and
+        // reports the same error with the lease in hand. Without a gate there
+        // is no later read to defer to, so the error is final right here.
+        let live = match &live_settings {
+            Some(source) => match source.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    if provider_turn_gate.is_some() {
+                        warn!(
+                            code = %error.code,
+                            "live settings unavailable before admission; deferring to the post-admission read"
+                        );
+                        None
+                    } else {
+                        flush_unconsumed(&tx, &inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return;
+                    }
+                }
+            },
+            None => None,
+        };
+        let effective = merge_static_and_live(&config, live.as_ref());
+
+        // Check the cap *before* compaction: an iteration that will not run must
+        // not spend a summary request. `u64` avoids overflow at `u32::MAX`.
+        let next = u64::from(turn) + 1;
+        if let Some(max) = effective.max_turns
+            && next > u64::from(max)
+        {
+            info!(turn, max, "agent loop reached max turns");
+            flush_unconsumed(&tx, &inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::MaxTurns,
+                })
+                .await;
+            return;
+        }
+
+        // Auto-compaction uses the same snapshot's threshold and budgets, and
+        // re-checks the cap after its own admission/provider wait: a save that
+        // lands while the summary is in flight is applied to the next decision
+        // point, not to the operation already running.
+        let (compacted, compaction_waited) = maybe_auto_compact(
+            &tx,
+            &inbox,
+            &provider,
+            &config,
+            &effective,
+            turn.saturating_add(1),
+            &session,
+            &cancel_token,
+            &live_settings,
+        )
+        .await;
         if matches!(compacted, AutoCompact::Cancelled) {
             // A Stop pressed while the summary was in flight. The compaction
             // future was dropped at its await, so nothing was replaced; keep the
@@ -1882,6 +1993,16 @@ async fn run_loop(
             // cancel during the provider call).
             info!(turn, "agent loop cancelled during auto-compact");
             abort_run(&tx, &inbox, &session).await;
+            return;
+        }
+        if matches!(compacted, AutoCompact::MaxTurns) {
+            info!(turn, "agent loop reached max turns after compaction wait");
+            flush_unconsumed(&tx, &inbox).await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    reason: DoneReason::MaxTurns,
+                })
+                .await;
             return;
         }
         if let AutoCompact::Compacted(new_messages) = compacted {
@@ -1903,23 +2024,49 @@ async fn run_loop(
             }
         }
 
-        turn += 1;
-        if let Some(max) = config.max_turns
-            && turn > max
+        // A summary is an unbounded wait with no admission of ours in it. The
+        // snapshot taken at the top of this iteration predates that wait, so the
+        // THINK below must re-read: otherwise a save that landed during the
+        // summary would be silently applied one iteration late. Re-reading here
+        // also re-checks the cap against the same `next` iteration, so a cap
+        // lowered during the summary still stops the run.
+        let live = if compaction_waited {
+            match &live_settings {
+                Some(source) => match source.snapshot() {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        flush_unconsumed(&tx, &inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            live
+        };
+        let effective = if compaction_waited {
+            merge_static_and_live(&config, live.as_ref())
+        } else {
+            effective
+        };
+        if compaction_waited
+            && let Some(max) = effective.max_turns
+            && u64::from(turn) + 1 > u64::from(max)
         {
-            info!(turn, max, "agent loop reached max turns");
+            info!(turn, max, "live max turns reached after the summary wait");
             flush_unconsumed(&tx, &inbox).await;
-            if tx
+            let _ = tx
                 .send(AgentEvent::Done {
                     reason: DoneReason::MaxTurns,
                 })
-                .await
-                .is_err()
-            {
-                return; // Receiver dropped, stop the loop
-            }
+                .await;
             return;
         }
+
+        turn += 1;
 
         // Fold in anything the user sent while the previous request/tools ran.
         // Placed after the max_turns check (so an interjection consumes a turn)
@@ -1949,6 +2096,7 @@ async fn run_loop(
             &cancel_token,
             &provider_turn_gate,
             &live_settings,
+            live.as_ref(),
             &mut messages,
             turn,
             &mut payload_leases,
@@ -2115,22 +2263,61 @@ enum AutoCompact {
     Compacted(Vec<Message>),
     Skipped,
     Cancelled,
+    /// The refreshed snapshot forbids the next iteration; end on the cap
+    /// instead of spending the iteration (and its summary) on nothing.
+    MaxTurns,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_auto_compact(
     tx: &EventTx,
+    inbox: &Option<InboxHandle>,
     provider: &Arc<dyn Provider>,
-    config: &AgentConfig,
+    static_config: &AgentConfig,
+    effective: &AgentConfig,
+    next_turn: u32,
     session: &Arc<Mutex<Session>>,
     cancel_token: &CancellationToken,
-) -> AutoCompact {
-    let Some(threshold) = config.compact_threshold.filter(|threshold| *threshold > 0) else {
-        return AutoCompact::Skipped;
+    live_settings: &Option<Arc<dyn AgentSettingsSource>>,
+) -> (AutoCompact, bool) {
+    // The bool says "the provider was actually awaited in this call". A wait is
+    // a long, unbounded gap: a save that lands inside it must be visible to the
+    // next normal THINK, so the caller has to treat its own pre-iteration
+    // snapshot as stale. Nothing else re-samples the source, so without this
+    // flag the loop would build the post-summary request from the pre-wall
+    // settings (spec §5.2: re-read after a long admission/wait).
+    let Some(threshold) = effective
+        .compact_threshold
+        .filter(|threshold| *threshold > 0)
+    else {
+        return (AutoCompact::Skipped, false);
     };
     let snapshot = session.lock().unwrap().clone();
     match snapshot.last_input_tokens() {
         Some(tokens) if tokens >= threshold => {}
-        _ => return AutoCompact::Skipped,
+        _ => return (AutoCompact::Skipped, false),
+    }
+
+    // The compaction fields come from the same operation snapshot: a compaction
+    // never renders the normal prompt and never inspects the old turn's used
+    // budget. A failing source is a controlled stop, not a silent skip.
+    let compact = match live_settings {
+        Some(source) => match source.compact_snapshot() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                flush_unconsumed(tx, inbox).await;
+                let _ = tx
+                    .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                    .await;
+                return (AutoCompact::Cancelled, false);
+            }
+        },
+        None => None,
+    };
+    let mut compaction_config = effective.clone();
+    if let Some(compact) = &compact {
+        compaction_config.compact_user_budget_tokens = compact.user_budget_tokens;
+        compaction_config.compact_tool_budget_tokens = compact.tool_budget_tokens;
     }
 
     let old_count = snapshot.len();
@@ -2140,11 +2327,76 @@ async fn maybe_auto_compact(
     // Stop button while "the model was running". Winning the race by cancel
     // drops the future at the await, so the session is still untouched.
     let compacted = tokio::select! {
-        result = crate::compact::compact_session(provider, config, &snapshot) => result,
-        _ = cancel_token.cancelled() => return AutoCompact::Cancelled,
+        result = crate::compact::compact_session(provider, &compaction_config, &snapshot) => result,
+        _ = cancel_token.cancelled() => return (AutoCompact::Cancelled, true),
     };
     match compacted {
-        Ok(Some(new_session)) if new_session.len() < old_count => {
+        Ok(None) => (AutoCompact::Skipped, true),
+        Err(error) => {
+            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
+            (AutoCompact::Skipped, true)
+        }
+        Ok(Some(new_session)) => {
+            // The summary can take long enough for the limit to change. Re-check
+            // the *same* next iteration against a fresh snapshot before
+            // committing: if the cap now forbids it, nothing should be dropped
+            // for it, so the original history is kept and the run ends on the
+            // cap. The already-started summary is not replayed and its own
+            // snapshot is respected.
+            let refreshed = match live_settings {
+                Some(source) => match source.snapshot() {
+                    Ok(refreshed) => Some(refreshed),
+                    Err(error) => {
+                        flush_unconsumed(tx, inbox).await;
+                        let _ = tx
+                            .send(AgentEvent::Error(AgentError::LiveSettings(error.code)))
+                            .await;
+                        return (AutoCompact::Cancelled, true);
+                    }
+                },
+                None => None,
+            };
+            let after = merge_static_and_live(static_config, refreshed.as_ref());
+            if let Some(max) = after.max_turns
+                && u64::from(next_turn) > u64::from(max)
+            {
+                // Nothing was swapped out, so no lease is held to release: the
+                // summary future already finished. End on the cap.
+                return (AutoCompact::MaxTurns, true);
+            }
+            // Re-check the compaction trigger against that same fresh snapshot:
+            // the summary may have taken long enough for a save to change it.
+            // The summary that already ran keeps the budgets it started with
+            // (spec §5.2 — a started operation is never rolled back), but the
+            // *decision to install* it is made against the latest settings. If
+            // the history would no longer be compacted now, keep the original
+            // messages. Using `after` instead of a second `compact_snapshot()`
+            // read keeps the cap check and this one derived from one snapshot,
+            // so they can never disagree.
+            if after.compact_threshold != effective.compact_threshold {
+                info!(
+                    old = ?effective.compact_threshold,
+                    new = ?after.compact_threshold,
+                    "auto-compaction trigger changed while the summary was in flight"
+                );
+            }
+            let still_over_threshold = after
+                .compact_threshold
+                .filter(|threshold| *threshold > 0)
+                .is_some_and(|threshold| {
+                    session
+                        .lock()
+                        .unwrap()
+                        .last_input_tokens()
+                        .is_some_and(|tokens| tokens >= threshold)
+                });
+            if !still_over_threshold {
+                info!("history no longer needs compaction under the live settings");
+                return (AutoCompact::Skipped, true);
+            }
+            if new_session.len() >= old_count {
+                return (AutoCompact::Skipped, true);
+            }
             let new_messages = new_session.messages().to_vec();
             {
                 let mut current = session.lock().unwrap();
@@ -2157,12 +2409,7 @@ async fn maybe_auto_compact(
                     new_msg_count: new_messages.len(),
                 })
                 .await;
-            AutoCompact::Compacted(new_messages)
-        }
-        Ok(Some(_)) | Ok(None) => AutoCompact::Skipped,
-        Err(error) => {
-            tracing::warn!(error = %error, "auto-compact failed, will retry next think");
-            AutoCompact::Skipped
+            (AutoCompact::Compacted(new_messages), true)
         }
     }
 }

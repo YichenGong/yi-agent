@@ -24,11 +24,11 @@ pub use agent::{
 };
 pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
-    DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
+    DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session, compact_session_with_live_settings,
 };
 pub use live_settings::{
     AdmissionLimits, AdmissionLimitsSource, AgentSettingsSource, LiveAgentSnapshot,
-    LiveSettingsError, SharedSettingsSource,
+    LiveCompactSnapshot, LiveSettingsError, SharedSettingsSource,
 };
 pub use managed_run::{
     BudgetedAgentEvent, ManagedAgentRun, ManagedRunControl, ManagedRunLimits, TrackedAgentRun,

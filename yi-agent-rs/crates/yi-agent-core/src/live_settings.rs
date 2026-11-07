@@ -32,6 +32,24 @@ pub struct LiveAgentSnapshot {
     pub system_prompt: Option<String>,
 }
 
+/// The compaction-owned subset of a [`LiveAgentSnapshot`].
+///
+/// A compaction operation is not a normal THINK: it must not render the user
+/// prompt, must not inspect the old turn's consumed budget, and must use its own
+/// admission lease. Giving it a narrower snapshot makes that structural instead
+/// of a convention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveCompactSnapshot {
+    /// Content identity of the settings this snapshot was produced from.
+    pub revision: String,
+    /// Token threshold that triggers automatic compaction, `None` = disabled.
+    pub compact_threshold: Option<u32>,
+    /// Real user input token budget retained by this compaction.
+    pub user_budget_tokens: usize,
+    /// Complete raw tool interaction token budget retained by this compaction.
+    pub tool_budget_tokens: usize,
+}
+
 /// A live settings operation failed in a way the current operation cannot use.
 ///
 /// Only a stable code crosses the boundary: never a prompt, a key or raw
@@ -57,6 +75,22 @@ impl LiveSettingsError {
 /// called after admission, before the request is built, never per token.
 pub trait AgentSettingsSource: Send + Sync {
     fn snapshot(&self) -> Result<LiveAgentSnapshot, LiveSettingsError>;
+
+    /// The compaction-owned subset of the current snapshot.
+    ///
+    /// The default derives it from [`Self::snapshot`], so a source that cannot
+    /// distinguish the two stays correct. The runtime overrides it when the
+    /// compaction prompt segment must be composed differently from the normal
+    /// system prompt.
+    fn compact_snapshot(&self) -> Result<LiveCompactSnapshot, LiveSettingsError> {
+        let value = self.snapshot()?;
+        Ok(LiveCompactSnapshot {
+            revision: value.revision,
+            compact_threshold: value.compact_threshold,
+            user_budget_tokens: value.compact_user_budget_tokens,
+            tool_budget_tokens: value.compact_tool_budget_tokens,
+        })
+    }
 }
 
 /// Convenience alias used by [`crate::Agent`] bindings.

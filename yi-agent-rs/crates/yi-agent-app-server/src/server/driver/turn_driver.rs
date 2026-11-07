@@ -255,11 +255,23 @@ pub(crate) async fn run_thread_driver(
             let session_handle = agent.session_handle();
             let permission = agent.permission_checker();
             let decision = agent.decision_rx();
+            // Carry the live bindings across the rebuild: a rebuilt agent that
+            // silently dropped them would keep serving the settings it was
+            // started with, and a manual `/compact` would stop taking its own
+            // admission lease. Both are cheap `Arc` clones.
+            let live_settings = agent.live_settings_source();
+            let provider_turn_gate = agent.provider_turn_gate();
             let mut rebuilt =
                 yi_agent_core::Agent::new(Arc::clone(&provider), Arc::new(refreshed), next_config)
                     .with_session_arc(session_handle);
             if let (Some(checker), Some(rx)) = (permission, decision) {
                 rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            if let Some(source) = live_settings {
+                rebuilt.set_live_settings(source);
+            }
+            if let Some(gate) = provider_turn_gate {
+                rebuilt = rebuilt.with_provider_turn_gate(gate);
             }
             agent = rebuilt;
             tracing::info!("MCP config changed on disk; thread registry reloaded");
