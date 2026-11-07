@@ -36,7 +36,7 @@ printf 'z%.0s' {1..500} >"$deps/baz-cccccccccccccccc.0.rcgu.o"
 printf 'd' >"$deps/bar-bbbbbbbbbbbbbbbb.0.d"
 printf 'other' >"$deps/unrelated.txt"
 
-out="$(bash "$SCRIPT" --target "$tmp")" || fail "dry-run exited nonzero"
+out="$(bash "$SCRIPT" --target "$tmp" 2>/dev/null)" || fail "dry-run exited nonzero"
 grep -q "孤儿 .o         : 5 个文件 / 2 个编译单元" <<<"$out" \
   || { printf '%s\n' "$out" >&2; fail "dry-run did not report 5 orphan files in 2 units"; }
 n=$((n + 1)); pass "dry-run identifies 5 orphan files across 2 units"
@@ -79,7 +79,7 @@ printf 'lock' >"$inc/alpha-1111/s-old/s-old.lock"
 touch -t 202601010000 "$inc/alpha-1111/s-old"
 touch -t 202601020000 "$inc/alpha-1111/s-new"
 
-out="$(bash "$SCRIPT" --target "$tmp")" || fail "dry-run exited nonzero"
+out="$(bash "$SCRIPT" --target "$tmp" 2>/dev/null)" || fail "dry-run exited nonzero"
 grep -q "incremental 旧会话" <<<"$out" || { printf '%s\n' "$out" >&2; fail "dry-run does not report incremental"; }
 
 bash "$SCRIPT" --apply --target "$tmp" >/dev/null || fail "--apply exited nonzero"
@@ -97,6 +97,129 @@ touch -t 202512010000 "$inc/alpha-1111/s-old2"
 bash "$SCRIPT" --apply --target "$tmp" --skip-incremental >/dev/null || fail "--skip-incremental exited nonzero"
 [ -d "$inc/alpha-1111/s-old2" ] || fail "--skip-incremental still deleted"
 n=$((n + 1)); pass "D1 honours --skip-incremental"
+
+# ---- D2: N_OSO 引用集 ----
+# 用独立的 target 根目录，避免和前面 D1 的 fixture 互相干扰。
+d2="$tmp/t2/debug/deps"
+mkdir -p "$d2"
+# 活跃单元 foo：有 rlib，3 个 mid；只有 mid0 被二进制引用
+for i in 0 1 2; do printf 'x%.0s' {1..1000} >"$d2/foo-aaaaaaaaaaaaaaaa.mid$i.0.rcgu.o"; done
+printf 'r%.0s' {1..100} >"$d2/libfoo-aaaaaaaaaaaaaaaa.rlib"
+# 孤儿单元 bar：无 rlib，应被整组删掉
+printf 'y%.0s' {1..2000} >"$d2/bar-bbbbbbbbbbbbbbbb.mid0.0.rcgu.o"
+
+# 一个可执行文件（名字不带 '.'，cargo 产物即如此）
+: >"$d2/foo_bin-1234"; chmod +x "$d2/foo_bin-1234"
+
+# 假 nm：只报告引用了 foo 的 mid0
+stub="$tmp/stubbin"; mkdir -p "$stub"
+cat >"$stub/nm" <<NMEOF
+#!/bin/sh
+echo "0000000100000000-0000000100000010 OSO $d2/foo-aaaaaaaaaaaaaaaa.mid0.0.rcgu.o"
+NMEOF
+chmod +x "$stub/nm"
+
+out="$(PATH="$stub:$PATH" bash "$SCRIPT" --target "$tmp/t2" 2>/dev/null)" || fail "dry-run exited nonzero"
+grep -q "未被引用" <<<"$out" || { printf '%s\n' "$out" >&2; fail "dry-run does not report unreferenced .o"; }
+n=$((n + 1)); pass "D2 reports unreferenced .o"
+
+# 预演不删
+[ "$(find "$d2" -name '*.rcgu.o' | wc -l | tr -d ' ')" = "4" ] || fail "dry-run deleted .o"
+n=$((n + 1)); pass "D2 dry-run deletes nothing"
+
+PATH="$stub:$PATH" bash "$SCRIPT" --apply --target "$tmp/t2" >/dev/null || fail "D2 --apply failed"
+[ -f "$d2/foo-aaaaaaaaaaaaaaaa.mid0.0.rcgu.o" ] || fail "deleted the OSO-referenced .o"
+n=$((n + 1)); pass "D2 keeps OSO-referenced .o"
+[ -f "$d2/foo-aaaaaaaaaaaaaaaa.mid1.0.rcgu.o" ] && fail "kept an unreferenced .o in a live unit"
+n=$((n + 1)); pass "D2 removes unreferenced .o in a live unit"
+[ -f "$d2/bar-bbbbbbbbbbbbbbbb.mid0.0.rcgu.o" ] && fail "kept an orphan-key .o"
+n=$((n + 1)); pass "D2 removes orphan-key .o"
+[ -f "$d2/libfoo-aaaaaaaaaaaaaaaa.rlib" ] || fail "deleted an rlib"
+n=$((n + 1)); pass "D2 leaves rlib alone"
+
+# 幂等
+PATH="$stub:$PATH" bash "$SCRIPT" --apply --target "$tmp/t2" >/dev/null || fail "2nd apply failed"
+n=$((n + 1)); pass "D2 idempotent"
+
+# 没有任何可执行文件时必须退化为只清孤儿 key，不误删活跃单元
+d3="$tmp/t3/debug/deps"; mkdir -p "$d3"
+printf 'a' >"$d3/solo-bbbbbbbbbbbbbbbb.mid0.0.rcgu.o"
+printf 'b' >"$d3/libsolo-bbbbbbbbbbbbbbbb.rlib"
+printf 'c' >"$d3/orphan-dddddddddddddddd.mid0.0.rcgu.o"
+bash "$SCRIPT" --apply --target "$tmp/t3" >/dev/null || fail "no-binary case failed"
+[ -f "$d3/solo-bbbbbbbbbbbbbbbb.mid0.0.rcgu.o" ] || fail "no-binary fallback deleted a live unit"
+n=$((n + 1)); pass "D2 falls back to orphan-key-only when no binaries exist"
+[ -f "$d3/orphan-dddddddddddddddd.mid0.0.rcgu.o" ] && fail "fallback did not clean orphan key"
+n=$((n + 1)); pass "D2 fallback still cleans orphan keys"
+
+# --skip-deps：完全不碰 deps
+d4="$tmp/t4/debug/deps"; mkdir -p "$d4"
+printf 'c' >"$d4/orphan-eeeeeeeeeeeeeeee.mid0.0.rcgu.o"
+bash "$SCRIPT" --apply --target "$tmp/t4" --skip-deps >/dev/null || fail "--skip-deps failed"
+[ -f "$d4/orphan-eeeeeeeeeeeeeeee.mid0.0.rcgu.o" ] || fail "--skip-deps still cleaned deps"
+n=$((n + 1)); pass "D2 honours --skip-deps"
+
+# ---- 引用集零交集：必须整体放弃引用判据（这是 47 GB 误删的唯一防线）----
+# 真实场景：split-debuginfo 从 unpacked 切到 packed 后，存量的 unpacked .o
+# 与新一代二进制的 N_OSO 名字格式完全不同，交集为 0。此时若照用引用判据，
+# 会把 100% 的 .o 判成"未被引用"（实测 268,571/268,571）。
+t8="$tmp/t8/debug/deps"; mkdir -p "$t8"
+printf 'r' >"$t8/livc-1111111111111111.rlib"
+printf '%.0sA' {1..100} >"$t8/livc-1111111111111111.mid0.0.rcgu.o"
+: >"$t8/livc_bin-8888"; chmod +x "$t8/livc_bin-8888"
+# 桩 nm：返回一个完全不存在于磁盘的名字 —— 精确模拟跨代际零交集
+mkdir -p "$tmp/nmstub-zero"
+cat >"$tmp/nmstub-zero/nm" <<'NM'
+#!/bin/sh
+echo "0000-1111 OSO /nowhere/ghost-9999999999999999.mid9.9.rcgu.o"
+NM
+chmod +x "$tmp/nmstub-zero/nm"
+PATH="$tmp/nmstub-zero:$PATH" bash "$SCRIPT" --apply --target "$tmp/t8" >/dev/null \
+  || fail "zero-overlap case failed"
+[ -f "$t8/livc-1111111111111111.mid0.0.rcgu.o" ] \
+  || fail "zero-overlap deleted a live .o (this is the 47GB failure mode)"
+n=$((n + 1)); pass "D2 abandons N_OSO when reference set does not intersect disk"
+outz="$(PATH="$tmp/nmstub-zero:$PATH" bash "$SCRIPT" --target "$tmp/t8" 2>/dev/null)" \
+  || fail "zero-overlap dry-run failed"
+grep -qiE "跳过|skip|0 命中|no overlap|无交集" <<<"$outz" \
+  || { printf '%s\n' "$outz" >&2; fail "zero-overlap not explained in output"; }
+n=$((n + 1)); pass "D2 explains why N_OSO was skipped"
+
+# 硬链接：文件照删（另半边可能是 incremental 会话），但 nlink>1 时不计入释放量
+d5="$tmp/t5/debug/deps"; mkdir -p "$d5"
+# 必须有一个**真实存在且被引用**的文件，否则 referenced ∩ objs == 0，
+# use_ref 会是 False，活跃 key 的 .o 一个都不会被删，nlink 逻辑测不到。
+printf 'k' >"$d5/keep-eeeeeeeeeeeeeeee.mid0.0.rcgu.o"
+printf 'r' >"$d5/libkeep-eeeeeeeeeeeeeeee.rlib"
+# 同一 key 的两个名字共享 inode —— 必须落在「活跃单元 + 未被引用」这一分支
+printf 'z%.0s' {1..4000} >"$d5/lnk-ffffffffffffffff.mid0.0.rcgu.o"
+printf 'r' >"$d5/liblnk-ffffffffffffffff.rlib"
+ln "$d5/lnk-ffffffffffffffff.mid0.0.rcgu.o" "$d5/lnk-ffffffffffffffff.mid0.1.rcgu.o"
+ln "$d5/lnk-ffffffffffffffff.mid0.0.rcgu.o" "$tmp/hardlinked_elsewhere"
+: >"$d5/lnk_bin-9999"; chmod +x "$d5/lnk_bin-9999"
+mkdir -p "$tmp/nmstub-lnk"
+cat >"$tmp/nmstub-lnk/nm" <<NMEOF
+#!/bin/sh
+echo "0000-1111 OSO $d5/keep-eeeeeeeeeeeeeeee.mid0.0.rcgu.o"
+NMEOF
+chmod +x "$tmp/nmstub-lnk/nm"
+
+out="$(PATH="$tmp/nmstub-lnk:$PATH" bash "$SCRIPT" --target "$tmp/t5" 2>/dev/null)" || fail "hardlink dry-run failed"
+grep -q "未被引用的 .o   : 2 个文件" <<<"$out" \
+  || { printf '%s\n' "$out" >&2; fail "hardlinked .o pair not reported as 2 unreferenced files"; }
+n=$((n + 1)); pass "D2 reports both hardlinked names as unreferenced"
+
+outa="$(PATH="$tmp/nmstub-lnk:$PATH" bash "$SCRIPT" --apply --target "$tmp/t5" 2>/dev/null)" || fail "hardlink apply failed"
+[ -e "$d5/lnk-ffffffffffffffff.mid0.0.rcgu.o" ] && fail "hardlinked .o was not deleted"
+[ -e "$d5/lnk-ffffffffffffffff.mid0.1.rcgu.o" ] && fail "second hardlinked name was not deleted"
+[ -f "$tmp/hardlinked_elsewhere" ] || fail "hardlink outside target was removed"
+n=$((n + 1)); pass "D2 deletes hardlinked .o but spares its external link"
+# nlink>1 的删除不释放空间，所以「回收」必须是 0 —— 这是计数规则的直接断言
+grep -q "D2 已删除       : 2 个，回收 0.0 B" <<<"$outa" \
+  || { printf '%s\n' "$outa" >&2; fail "nlink>1 deletions were counted as freed bytes"; }
+n=$((n + 1)); pass "D2 does not count hardlinked deletions as freed bytes"
+[ -f "$d5/keep-eeeeeeeeeeeeeeee.mid0.0.rcgu.o" ] || fail "deleted the referenced .o"
+n=$((n + 1)); pass "D2 keeps the referenced .o alongside hardlinks"
 
 # 参数校验。
 bash "$SCRIPT" --bogus >/dev/null 2>&1 && fail "accepted an unknown option"
