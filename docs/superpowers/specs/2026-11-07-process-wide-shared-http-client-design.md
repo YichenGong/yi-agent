@@ -262,8 +262,13 @@ pub fn channel_cache() -> ChannelCache {
 `reqwest::Client` 的内部连接池无法从外部直接比较（没有 `PtrEq` 之类的出口），
 所以「是否复用」必须靠**可观测的连接数**来断言，而不是比较对象相等。
 
-为此新增一个测试辅助：`tests/common/conn_counter.rs`，在后台跑一个极简 HTTP/1.1
+为此新增一个测试辅助：`tests/common/mod.rs`，在后台跑一个极简 HTTP/1.1
 keep-alive 服务，**记录 `accept()` 被调用了几次**。
+
+放 `tests/common/mod.rs` 而不是 `tests/common/conn_counter.rs`：Rust 的
+`tests/` 下每个 `.rs` 都是一份独立测试 crate，只有 `tests/common/mod.rs` 能被
+各 crate 用 `mod common;` 共享（这也是本仓 `crates/yi-agent/tests/common/mod.rs`
+的既有做法）。用 `tests/common/conn_counter.rs` 会让它被当作独立测试目标编译。
 
 选择裸 TCP 而不是 wiremock 的理由：wiremock 不暴露连接计数（已核实 0.6.5 没有
 相关 API），而「只建立了一条连接」正是本次要验证的核心事实，必须能直接观测。
@@ -283,13 +288,20 @@ tokio 版本便于在 `#[tokio::test]` 内运行，不必引入线程与跨线�
 再回响应。
 
 响应格式必须**严格合法**，否则客户端不会复用连接：
-`HTTP/1.1 200 OK` + `content-length: N` + `\[empty line\]` + 恰好 N 字节 body。
+`HTTP/1.1 200 OK` + `content-length: N` + `[空行]` + 恰好 N 字节 body。
 **不用 chunked**：裸 socket 手写 chunked 极易出错，而 `Content-Length` 已足以让
-一条 HTTP/1.1 连接保持可复用。响应体按 SSE 构造（`content-type: text/event-stream`，
-body 为 `data: {...}\n\ndata: [DONE]\n\n`），因为 `Provider::call()` 会
-`accumulate_stream`，要求流中出现 `finish_reason` 或 `[DONE]` 才正常结束
-（见 `openai/stream.rs:145`）；body 不合法会让测试以 `StreamError` 失败，
-掩盖真正要验证的连接复用。
+一条 HTTP/1.1 连接保持可复用。
+
+响应体要分两种情形：
+
+- **只验证连接复用的测试（1–4、5）**：只调 `shared_client(...).post(...).send()`
+  然后 `drop(resp)`，**不消费流**，因此 body 是否合法 SSE 无关紧要。
+  用 `content-length: 0` 的 200 即可，最简单也最不容易出错。
+- **必须消费 provider 流的测试（6）**：`ChannelCache` 那条要走
+  `Provider::call_stream`，此时 body 必须是合法 SSE，否则
+  `accumulate_stream` 会以 `StreamError` 结束、掩盖真正要验证的事实。
+  OpenAI chat 认 `data: [DONE]`（`openai/stream.rs:145`）或 `finish_reason`；
+  Anthropic 认 `event: message_stop`（`anthropic/stream.rs:265`）。
 
 服务端需按顺序处理同一连接上的**多个**请求（keep-alive 语义），并把每个请求的
 `路径 → 次数` 记进共享计数表。
@@ -342,9 +354,13 @@ timeout 都是 300s），共享 client 会命中一条已经死掉的连接池�
 方式失败，或更糟——假通过。
 
 缓解不依赖端口随机性，而是让每个用例的 `base_url` 在缓存键上天然唯一：在
-`base_url` 的**路径**里追加一个进程内唯一的测试段，例如 `{server.uri()}/v1/t{n}`，
-wiremock 的 matcher 用 `path_regex("^/v1/t\\d+/")` 而不是精确路径。缓存键不同，
-路由仍然匹配。
+`base_url` 的**路径**里追加一个进程内唯一的测试段（`/t0`、`/t1`…）。实现方式是把
+唯一段做进辅助服务的 `uri()` 里（`ConnCounter` 内部用 `AtomicUsize` 分配），
+服务端在匹配路由前先剥掉该前缀，所以测试代码仍按裸路径（
+`/v1/chat/completions`）声明路由，不必关心前缀。缓存键不同，路由仍然匹配。
+
+（若改用 wiremock，等价做法是 matcher 用 `path_regex` 而不是精确路径；本次实现
+选裸 TCP，故不涉及。）
 
 不用查询串（`?t=n`）的原因：`base_url` 会被直接拼成 `format!("{base}{path}")`，
 带查询串时拼出的是 `...?t=1/chat/completions`，路径会解析错乱。
@@ -360,18 +376,17 @@ wiremock 的 matcher 用 `path_regex("^/v1/t\\d+/")` 而不是精确路径。缓
 `timeout: 400ms`，与其它用例的 `5s` / `30s` 天然分键。因此这些现有测试**不需要**
 改，只有新增测试要遵守上面的唯一 `base_url` 规则。
 
-**SSE 格式差异**：辅助计数服务要分别满足两个 provider 的终止条件——
-OpenAI chat 认 `data: [DONE]`（`openai/stream.rs:145`）或
-`finish_reason`；Anthropic 认 `event: message_stop`
-（`anthropic/stream.rs:265`）。辅助服务按请求路径
-（`/chat/completions`、`/v1/messages`、`/responses`）返回对应格式，
-否则测试会以 `StreamError` 失败而不是验证连接复用。
+**SSE 格式差异**：只有需要消费 provider 流的测试（第 6 条）才需要合法 SSE ——
+OpenAI chat 认 `data: [DONE]`（`openai/stream.rs:145`）或 `finish_reason`；
+Anthropic 认 `event: message_stop`（`anthropic/stream.rs:265`）。第 1–5 条只
+`send()` 后丢弃响应、不消费流，用 `content-length: 0` 的空 200 即可。详见
+「测试」一节的响应体说明。
 
 ## 实现顺序（TDD）
 
 严格按测试先行，避免「先改代码再补测试」让测试沦为对实现的描述：
 
-1. **先写 `tests/common/conn_counter.rs`** 与第 1 条测试（同键复用 → `accept() == 1`）。
+1. **先写 `tests/common/mod.rs`** 与第 1 条测试（同键复用 → `accept() == 1`）。
 2. **在未改动实现时运行，确认它失败**（此时每个 provider 各建 client，
    必然出现 2 次 `accept()`）。失败是这一步的验收标准。
 3. 实现 `http.rs` 并接入两个 provider，让第 1 条通过。
