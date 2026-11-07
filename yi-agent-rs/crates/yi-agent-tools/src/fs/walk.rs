@@ -17,15 +17,6 @@
 //!   hits it gets `Truncated::Deadline` and must tell the user, rather than
 //!   returning a partial result as if it were complete.
 
-// 临时的 `dead_code` 豁免，**Task 3 落地后请删掉这一行**。
-//
-// `grep` / `glob` 分别在 Task 2、Task 3 才改接到本模块，所以本次提交里
-// 非测试构建没有任何东西引用它，`clippy --all-targets -D warnings`（`just
-// lint`）会报 8 个 "never used"。这里不用 `#[cfg(test)]` 把它排除在二进制
-// 之外：它确实是生产代码，只是还没有调用方，而测试构建需要它参与编译。
-// 也不用 per-item 的 `#[allow(dead_code)]`：那是 8 处重复，且看不出整体意图。
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -411,6 +402,56 @@ mod tests {
         assert!(
             files.iter().any(|p| p.ends_with("link.rs")),
             "symlinked files must be visited, got {files:?}"
+        );
+    }
+
+    /// `FILES` 是 `grep` 的策略：不跟随符号链接。旧 `WalkDir` 也不跟随，
+    /// 所以这是 parity，而不是新行为；这条测试钉住它，免得有人把两个策略
+    /// 合成一个后 grep 开始跟着链接读到根目录之外。
+    #[test]
+    fn files_mode_does_not_follow_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("real.rs"), "needle\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("real.rs"), tmp.path().join("link.rs"))
+            .unwrap();
+        fs::write(tmp.path().join("plain.rs"), "needle\n").unwrap();
+
+        let files = rel(&walk(tmp.path(), FILES));
+
+        assert!(
+            files.iter().any(|p| p.ends_with("plain.rs")),
+            "real files must still be found, got {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("link.rs")),
+            "FILES must not follow symlinks, got {files:?}"
+        );
+    }
+
+    /// 已知 parity 缺口：旧 `glob()` 会把断链当作一条匹配返回，而
+    /// `MATCH_TARGETS`（follow_links = true）解析链接时 `fs::metadata` 失败，
+    /// 该条目以 `Err` 形式产出，被 walker 跳过。这里把「跳过且不中断整趟遍历」
+    /// 钉成明确契约：断链本身不可读，报告它只会让调用方读到错误。
+    #[test]
+    fn a_broken_symlink_is_skipped_without_aborting_the_walk() {
+        let tmp = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("does-not-exist"),
+            tmp.path().join("dangling.rs"),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("real.rs"), "x").unwrap();
+
+        let files = rel(&walk(tmp.path(), MATCH_TARGETS));
+
+        assert!(
+            files.iter().any(|p| p.ends_with("real.rs")),
+            "a dangling link must not abort the walk, got {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("dangling.rs")),
+            "a dangling link is not yieldable, got {files:?}"
         );
     }
 
