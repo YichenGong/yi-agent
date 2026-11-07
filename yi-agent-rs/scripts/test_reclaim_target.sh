@@ -67,6 +67,37 @@ n=$((n + 1)); pass "non-.o files untouched"
 bash "$SCRIPT" --apply --target "$tmp" >/dev/null || fail "second --apply exited nonzero"
 n=$((n + 1)); pass "idempotent on an already-clean target"
 
+# ---- D1: incremental 单元内的旧会话 ----
+inc="$tmp/debug/incremental"
+mkdir -p "$inc/alpha-1111/s-old" "$inc/alpha-1111/s-new" "$inc/beta-2222/s-only"
+printf 'x%.0s' {1..3000} >"$inc/alpha-1111/s-old/obj.o"
+printf 'x%.0s' {1..1000} >"$inc/alpha-1111/s-new/obj.o"
+printf 'x%.0s' {1..500}  >"$inc/beta-2222/s-only/obj.o"
+# 会话目录里还有 .lock，删目录时要一并带走且不报错
+printf 'lock' >"$inc/alpha-1111/s-old/s-old.lock"
+# 人为让 s-new 比 s-old 新（判据用 mtime）
+touch -t 202601010000 "$inc/alpha-1111/s-old"
+touch -t 202601020000 "$inc/alpha-1111/s-new"
+
+out="$(bash "$SCRIPT" --target "$tmp")" || fail "dry-run exited nonzero"
+grep -q "incremental 旧会话" <<<"$out" || { printf '%s\n' "$out" >&2; fail "dry-run does not report incremental"; }
+
+bash "$SCRIPT" --apply --target "$tmp" >/dev/null || fail "--apply exited nonzero"
+
+[ -d "$inc/alpha-1111/s-old" ] && fail "kept the stale session dir"
+n=$((n + 1)); pass "D1 removes the stale session inside a unit"
+[ -f "$inc/alpha-1111/s-new/obj.o" ] || fail "removed the newest session"
+n=$((n + 1)); pass "D1 keeps the newest session in a unit"
+[ -f "$inc/beta-2222/s-only/obj.o" ] || fail "removed a single-session unit"
+n=$((n + 1)); pass "D1 leaves single-session units alone"
+
+# --skip-incremental 时完全不碰
+mkdir -p "$inc/alpha-1111/s-old2"; printf 'y' >"$inc/alpha-1111/s-old2/obj.o"
+touch -t 202512010000 "$inc/alpha-1111/s-old2"
+bash "$SCRIPT" --apply --target "$tmp" --skip-incremental >/dev/null || fail "--skip-incremental exited nonzero"
+[ -d "$inc/alpha-1111/s-old2" ] || fail "--skip-incremental still deleted"
+n=$((n + 1)); pass "D1 honours --skip-incremental"
+
 # 参数校验。
 bash "$SCRIPT" --bogus >/dev/null 2>&1 && fail "accepted an unknown option"
 n=$((n + 1)); pass "rejects unknown options"

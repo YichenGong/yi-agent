@@ -34,10 +34,14 @@ set -uo pipefail
 MODE="dry-run"
 INCLUDE_WORKTREES=0
 EXPLICIT_TARGET=""
+SKIP_DEPS=0
+SKIP_INCREMENTAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) MODE="apply" ;;
     --include-worktrees) INCLUDE_WORKTREES=1 ;;
+    --skip-deps) SKIP_DEPS=1 ;;
+    --skip-incremental) SKIP_INCREMENTAL=1 ;;
     --target) shift; EXPLICIT_TARGET="${1:-}"; [ -n "$EXPLICIT_TARGET" ] || { echo "reclaim-target: --target 需要一个目录参数" >&2; exit 1; } ;;
     -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "reclaim-target: unknown option '$1'（见 --help）" >&2; exit 1 ;;
@@ -121,6 +125,79 @@ print(f"{orphan_count}\t{orphan_files}\t{orphan_bytes}\t{total_o}\t{total_files}
 PY
 }
 
+# D1：incremental/<crate>-<hash>/s-<id> —— 每个「编译单元目录」内只留 mtime
+# 最新的一个会话，其余整目录删。
+#
+# 注意层级：<crate>-<hash> 是编译单元（hash 覆盖 feature 组合/依赖/profile），
+# s-<id> 才是会话。只删会话、不动单元目录本身，因此零重编代价（spec §7.3）。
+scan_incremental() { # $1 = target dir -> "dirs\tfiles\tbytes"
+  python3 - "$1" <<'PY'
+import os, sys
+root = sys.argv[1]
+dirs = 0
+files = 0
+size = 0
+for prof in os.listdir(root):
+    inc = os.path.join(root, prof, "incremental")
+    if not os.path.isdir(inc):
+        continue
+    for unit in os.scandir(inc):
+        if not unit.is_dir():
+            continue
+        sess = [s for s in os.scandir(unit.path)
+                if s.is_dir() and s.name.startswith("s-")]
+        if len(sess) < 2:
+            continue
+        sess.sort(key=lambda s: s.stat().st_mtime)
+        for stale in sess[:-1]:
+            dirs += 1
+            for r, _ds, fs in os.walk(stale.path):
+                for f in fs:
+                    try:
+                        files += 1
+                        size += os.lstat(os.path.join(r, f)).st_size
+                    except OSError:
+                        pass
+print(f"{dirs}\t{files}\t{size}")
+PY
+}
+
+apply_incremental() { # $1 = target dir -> "removed_dirs\tfreed_bytes"
+  python3 - "$1" <<'PY'
+import os, shutil, sys
+root = sys.argv[1]
+removed = 0
+freed = 0
+for prof in os.listdir(root):
+    inc = os.path.join(root, prof, "incremental")
+    if not os.path.isdir(inc):
+        continue
+    for unit in os.scandir(inc):
+        if not unit.is_dir():
+            continue
+        sess = [s for s in os.scandir(unit.path)
+                if s.is_dir() and s.name.startswith("s-")]
+        if len(sess) < 2:
+            continue
+        sess.sort(key=lambda s: s.stat().st_mtime)
+        for stale in sess[:-1]:
+            size = 0
+            for r, _ds, fs in os.walk(stale.path):
+                for f in fs:
+                    try:
+                        size += os.lstat(os.path.join(r, f)).st_size
+                    except OSError:
+                        pass
+            try:
+                shutil.rmtree(stale.path)
+                removed += 1
+                freed += size
+            except OSError:
+                pass
+print(f"{removed}\t{freed}")
+PY
+}
+
 apply_clean() { # $1 = target dir, $2 = 保留的编译单元数
   python3 - "$1" <<'PY'
 import os, sys
@@ -164,27 +241,55 @@ PY
 }
 
 grand_freed=0
+grand_d1_dirs=0
 for t in "${TARGETS[@]}"; do
   [ -d "$t" ] || continue
-  line="$(scan_target "$t")" || { say "!! 扫描失败：$t"; continue; }
-  IFS=$'\t' read -r oc of ob to tf <<<"$line"
   whole="$(du -sm "$t" 2>/dev/null | cut -f1)"
   say ""
   say "== $t"
   say "   目录总大小      : $(human $((whole * 1024 * 1024)))"
-  say "   .rcgu.o 文件数  : $tf（属 $to 个编译单元）"
-  say "   孤儿 .o         : $of 个文件 / $oc 个编译单元，$(human "$ob")"
+
+  # ---- D1: incremental 旧会话 ----
+  d1_files=0; d1_bytes=0; d1_dirs=0
+  if [ "$SKIP_INCREMENTAL" = "0" ]; then
+    line="$(scan_incremental "$t")" || { say "!! D1 扫描失败：$t"; line=$'0\t0\t0'; }
+    IFS=$'\t' read -r d1_dirs d1_files d1_bytes <<<"$line"
+    say "   incremental 旧会话: $d1_dirs 个目录 / $d1_files 个文件，$(human "$d1_bytes")"
+  else
+    say "   incremental 旧会话: 已跳过（--skip-incremental）"
+  fi
+
+  # ---- D2: deps 孤儿 .o ----
+  oc=0; of=0; ob=0; to=0; tf=0
+  if [ "$SKIP_DEPS" = "0" ]; then
+    line="$(scan_target "$t")" || { say "!! 扫描失败：$t"; line=$'0\t0\t0\t0\t0'; }
+    IFS=$'\t' read -r oc of ob to tf <<<"$line"
+    say "   .rcgu.o 文件数  : $tf（属 $to 个编译单元）"
+    say "   孤儿 .o         : $of 个文件 / $oc 个编译单元，$(human "$ob")"
+  else
+    say "   deps 孤儿 .o    : 已跳过（--skip-deps）"
+  fi
+
   if [ "$MODE" = "apply" ]; then
-    if [ "$of" -eq 0 ]; then
-      say "   结论            : 无需清理"
-      continue
+    if [ "$d1_dirs" -gt 0 ]; then
+      res="$(apply_incremental "$t")" || { say "!! D1 清理失败：$t"; res=$'0\t0'; }
+      IFS=$'\t' read -r rm1 fr1 <<<"$res"
+      say "   D1 已删除       : $rm1 个会话目录，回收 $(human "$fr1")"
+      grand_freed=$((grand_freed + fr1))
+      grand_d1_dirs=$((grand_d1_dirs + rm1))
     fi
-    res="$(apply_clean "$t")" || { say "!! 清理失败：$t"; continue; }
-    IFS=$'\t' read -r rm fr <<<"$res"
-    after="$(du -sm "$t" 2>/dev/null | cut -f1)"
-    say "   已删除          : $rm 个，回收 $(human "$fr")"
-    say "   目录现在        : $(human $((after * 1024 * 1024)))"
-    grand_freed=$((grand_freed + fr))
+    if [ "$of" -gt 0 ]; then
+      res="$(apply_clean "$t")" || { say "!! 清理失败：$t"; res=$'0\t0'; }
+      IFS=$'\t' read -r rm fr <<<"$res"
+      say "   D2 已删除       : $rm 个，回收 $(human "$fr")"
+      grand_freed=$((grand_freed + fr))
+    fi
+    if [ "$d1_dirs" -eq 0 ] && [ "$of" -eq 0 ]; then
+      say "   结论            : 无需清理"
+    else
+      after="$(du -sm "$t" 2>/dev/null | cut -f1)"
+      say "   目录现在        : $(human $((after * 1024 * 1024)))"
+    fi
   fi
 done
 
