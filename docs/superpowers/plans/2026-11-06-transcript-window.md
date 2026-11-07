@@ -79,7 +79,7 @@
   - `function nextWindow(input: NextWindowInput): WindowState`
   - `function decideTrimStart(args: { following: boolean; visible: VisibleRange | null; start: number; end: number; limits: WindowLimits }): boolean`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/lib/transcriptWindow.test.ts`:
 
@@ -409,12 +409,12 @@ describe("nextWindow / 不变量", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/transcriptWindow.test.ts`
 Expected: FAIL — `Failed to resolve import "./transcriptWindow"`.
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Create `desktop/src/lib/transcriptWindow.ts`:
 
@@ -607,12 +607,12 @@ export function nextWindow(input: NextWindowInput): WindowState {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/transcriptWindow.test.ts`
 Expected: PASS（全部用例）
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -634,7 +634,7 @@ git commit -m "feat(desktop): add pure windowing core for the transcript"
   - `interface HeightBook { record(id: string, height: number): void; estimate(id: string): number; estimateRange(ids: readonly string[]): number; median(): number; delta(ids: readonly string[], actualTotal: number): number }`
   - `function createHeightBook(fallback = 40): HeightBook`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/lib/heightBook.test.ts`:
 
@@ -730,12 +730,12 @@ describe("HeightBook", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/heightBook.test.ts`
 Expected: FAIL — 模块不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Create `desktop/src/lib/heightBook.ts`:
 
@@ -805,12 +805,12 @@ export function createHeightBook(fallback = 40): HeightBook {
 
 > 注意：`delta` 里用了 `this.estimateRange`。若实现者把它写成独立函数而不是对象方法，改成闭包内的 `estimateRange` 调用即可；测试只看行为。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/heightBook.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -831,7 +831,7 @@ git commit -m "feat(desktop): add median-based height book for unmounted items"
 - Consumes: `Item`（`../lib/protocol`）、`NoticeItem` / `ReasoningItem`（`../lib/session`）
 - Produces: `function itemText(item: Item | NoticeItem | ReasoningItem): string`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/lib/itemText.test.ts`:
 
@@ -893,12 +893,12 @@ describe("itemText", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/itemText.test.ts`
 Expected: FAIL — 模块不存在。
 
-- [ ] **Step 3: 实现并把 `ChatView` 改为引用它**
+- [x] **Step 3: 实现并把 `ChatView` 改为引用它**
 
 Create `desktop/src/lib/itemText.ts`（把 `ChatView.tsx:112-136` 的注释与函数整体搬过来）:
 
@@ -947,12 +947,12 @@ export function itemText(item: Item | NoticeItem | ReasoningItem): string {
 import { itemText } from "../lib/itemText";
 ```
 
-- [ ] **Step 4: 跑测试 + 既有回归**
+- [x] **Step 4: 跑测试 + 既有回归**
 
 Run: `cd desktop && npx vitest run src/lib/itemText.test.ts src/components/ChatView.test.tsx`
 Expected: 两个文件都 PASS（`ChatView.test.tsx` 全绿证明抽取没改变行为）
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -976,7 +976,7 @@ git commit -m "refactor(desktop): extract itemText so search and render share it
   - `function prefixTops(items: readonly unknown[], book: HeightBook): number[]`
   - `function estimatedRects(hits: readonly SearchHit[], prefixTops: readonly number[], book: HeightBook): RelRect[]`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/lib/searchIndex.test.ts`:
 
@@ -1066,12 +1066,12 @@ describe("estimatedRects", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/searchIndex.test.ts`
 Expected: FAIL — 模块不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Create `desktop/src/lib/searchIndex.ts`:
 
@@ -1165,12 +1165,12 @@ export function estimatedRects(
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/searchIndex.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -1194,7 +1194,7 @@ git commit -m "feat(desktop): index search over session items instead of the DOM
 
 **关键设计**：`measure` 由调用方注入。真实 `ChatView` 传一个读 DOM 的函数，测试传一个受控假函数——这样 hook 的翻页/跟随/收缩全部可在 jsdom 下确定性验证。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/hooks/useTranscriptWindow.test.tsx`:
 
@@ -1358,12 +1358,12 @@ describe("useTranscriptWindow", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/hooks/useTranscriptWindow.test.tsx`
 Expected: FAIL — 模块不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Create `desktop/src/hooks/useTranscriptWindow.ts`:
 
@@ -1541,14 +1541,14 @@ export function useTranscriptWindow({
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/hooks/useTranscriptWindow.test.tsx`
 Expected: PASS
 
 > 若「视口触顶时追加一页」因 rAF 次数不足而不通过：把 `tick()` 里的 `requestAnimationFrame` 改成等待两帧的 `await new Promise(r => setTimeout(r, 32))`。这是测试时序问题，不是实现问题；不要为了让它通过而改 `nextWindow`。
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -1573,7 +1573,7 @@ git commit -m "feat(desktop): add transcript window hook with injected measureme
 
 **为什么需要它**：WKWebView / Safari **不实现 scroll anchoring**（`useStickToBottom.ts:66-68` 记录了本项目实测的 4346px 漂移）。所以在视口上方挂载/卸载内容时，必须自己补 `scrollTop`，否则用户看到的内容会整体位移；而「从下方卸载」会让 `scrollHeight` 变小、`scrollTop` 被浏览器往下夹，`useStickToBottom.onScroll` 会把这读成「用户上翻」并永久关闭跟随（`useStickToBottom.ts:171`）。这段算术必须是纯函数，才测得动。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `desktop/src/lib/scrollCompensation.test.ts`:
 
@@ -1644,12 +1644,12 @@ describe("planCompensation", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/scrollCompensation.test.ts`
 Expected: FAIL — 模块不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Create `desktop/src/lib/scrollCompensation.ts`:
 
@@ -1701,12 +1701,12 @@ export function planCompensation(input: CompensationInput): CompensationPlan {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/scrollCompensation.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -1729,7 +1729,7 @@ git commit -m "feat(desktop): add pure scroll compensation for window changes"
 
 > **实现方式选择**：`ChatItem` 目前是 `ChatView.tsx` 的模块内常量（`ChatView.tsx:240` 附近）。为了不制造循环依赖，**把 `HistoryWindow` 放在 `ChatView.tsx` 内部**，只把 `HistoryPrefix` 改名并改签名。这样 `ChatItem` 的 memo 比较器不用动，也不会多一个文件的导出面。本任务因此**不新建** `HistoryWindow.tsx`，只改 `ChatView.tsx`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `desktop/src/components/ChatView.test.tsx` 末尾追加：
 
@@ -1791,12 +1791,12 @@ describe("transcript windowing", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx -t "transcript windowing"`
 Expected: FAIL — 挂载 3000 条，第一条断言得到 3000 而不是 60。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `desktop/src/components/ChatView.tsx` 里：
 
@@ -1965,12 +1965,12 @@ const HistoryWindow = memo(
   const spacerBottom = Math.max(0, items.length - 1 - stop) * medianH;
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx`
 Expected: PASS（含既有全部用例与新加的 5 个）
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -1990,7 +1990,7 @@ git commit -m "feat(desktop): window the transcript with top and bottom spacers"
 - Consumes: Task 7 的 `[data-spacer]` 节点
 - Produces: 无新导出（行为变更）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `ChatView.test.tsx` 追加：
 
@@ -2036,12 +2036,12 @@ describe("capture() only measures the mounted window", () => {
 
 > 若 `[data-thread-id]` 在 jsdom 下取不到，改用 `container.querySelector("div")` 找到滚动容器，或在渲染时传入 `scrollerRef` 并用它派发事件。断言的是**调用次数上界**，不是精确值。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx -t "only measures the mounted window"`
 Expected: FAIL — 收集到 3000 次调用。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `capture()`（`ChatView.tsx:703`）改为只遍历挂载区，并补一条注释说明唯一的语义差异：
 
@@ -2095,12 +2095,12 @@ Expected: FAIL — 收集到 3000 次调用。
   }, [win.start, win.end, windowBook]);
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx`
 Expected: PASS
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -2120,7 +2120,7 @@ git commit -m "perf(desktop): measure and observe only the mounted window"
 - Consumes: `planCompensation`（`../lib/scrollCompensation`）、`useStickToBottom` 的 `scrollToBottom` / `releaseFollow` / `isFollowing`
 - Produces: 无新导出
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `ChatView.test.tsx` 追加（jsdom 里高度恒为 0，所以这里验证的是**事务被调用且顺序正确**，用 spy）：
 
@@ -2153,12 +2153,12 @@ describe("window change compensates scrollTop", () => {
 > `planCompensation.test.ts` 覆盖——这也正是把它抽成纯函数的原因。
 > **不要在 jsdom 里假装测出真实像素位移**，那只会得到一个假绿的测试。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx -t "compensates scrollTop"`
 Expected: FAIL 或报「区间变化后 DOM 顺序错乱」；若已通过，说明还没接线——继续下一步并把断言保留为回归。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `ChatView.tsx` 加：
 
@@ -2200,12 +2200,12 @@ Expected: FAIL 或报「区间变化后 DOM 顺序错乱」；若已通过，说
   }, [win.start, win.end, isFollowing, scrollToBottom, releaseFollow]);
 ```
 
-- [ ] **Step 4: 跑测试确认通过 + 既有贴底测试回归**
+- [x] **Step 4: 跑测试确认通过 + 既有贴底测试回归**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx src/lib/useStickToBottom.test.ts`
 Expected: 两个文件都 PASS。**特别检查既有的「流式跟随」「上翻历史后不被拽回底部」用例仍然绿**——它们是这次改动最可能打坏的地方。
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -2227,7 +2227,7 @@ git commit -m "fix(desktop): compensate scrollTop when the window changes"
 
 **要消除的行为退化**：现在 `restoreScrollTop` 在找不到节点时返回 `null`，调用方**回退到底部**（`viewAnchor.ts:59-62`）。窗口化后「锚点没挂载」会静默变成「跳到底部」。必须把两种语义分开：**没挂载**（先开窗）与**真的没了**（`index === -1`）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `ChatView.test.tsx` 追加：
 
@@ -2277,12 +2277,12 @@ describe("anchor restore with windowing", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx -t "anchor restore with windowing"`
 Expected: 第一条 FAIL（`m500` 不在挂载区，因为没有开窗）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 把 `ChatView.tsx:519-598` 那个 `useLayoutEffect` 的**查找部分**改成数据层定位：
 
@@ -2356,12 +2356,12 @@ Expected: 第一条 FAIL（`m500` 不在挂载区，因为没有开窗）。
   const pendingAnchorRef = useRef<ViewAnchor | null>(null);
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx`
 Expected: PASS（既有锚点恢复用例同样保持绿）
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -2393,7 +2393,7 @@ git commit -m "fix(desktop): restore reading position by index, not by DOM looku
 > `structuralVersion`；尾部正文的原地增长只改尾部那一条，而尾部不属于历史窗口，
 > 不影响全量命中计数。少一个用不上的参数，测起来也更干净。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 改写 `desktop/src/hooks/useTranscriptSearch.test.tsx`（保留原文件的 jsdom 头与 `beforeEach`）：
 
@@ -2511,12 +2511,12 @@ describe("useTranscriptSearch (data layer)", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/hooks/useTranscriptSearch.test.tsx`
 Expected: FAIL — 新入参 `items` / `book` 不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 改写 `desktop/src/hooks/useTranscriptSearch.ts` 的核心（保留 `SEARCH_DEBOUNCE_MS`、`SEARCH_HIT_SELECTOR` 导出）：
 
@@ -2599,7 +2599,7 @@ Expected: FAIL — 新入参 `items` / `book` 不存在。
 第 `active` 个命中加属性。为保持本任务边界清晰，这里只把「计数/当前序号/跳转」
 换成数据层，`data-search-active` 的 DOM 标注留给后续（不是本设计的关键路径）。
 
-- [ ] **Step 4: 跑测试确认通过 + `App` 接线**
+- [x] **Step 4: 跑测试确认通过 + `App` 接线**
 
 `App.tsx:864` 的调用改为：
 
@@ -2627,7 +2627,7 @@ Expected: FAIL — 新入参 `items` / `book` 不存在。
 Run: `cd desktop && npx vitest run src/hooks/useTranscriptSearch.test.tsx src/App.test.tsx`
 Expected: PASS
 
-- [ ] **Step 5: 类型检查并提交**
+- [x] **Step 5: 类型检查并提交**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -2647,7 +2647,7 @@ git commit -m "feat(desktop): search the item data layer so history stays findab
 - Consumes: 无（独立脚本）
 - Produces: 无
 
-- [ ] **Step 1: 在脚本里加「窗口化 + 分页」联合场景**
+- [x] **Step 1: 在脚本里加「窗口化 + 分页」联合场景**
 
 **必须复用生产的 `nextWindow`，不要在脚本里手写一遍翻页规则。** 手写一份等于
 在测量一个和生产不同的算法，数字再漂亮也是假的。Node 23 的类型剥离默认开启，
@@ -2732,14 +2732,14 @@ async function renderWindowed(items, label) {
 await renderWindowed(items, "proposed: windowed open + page up till cap");
 ```
 
-- [ ] **Step 2: 跑脚本记录数字**
+- [x] **Step 2: 跑脚本记录数字**
 
 Run: `cd desktop && node scripts/perf/open.mjs`
 Expected: 输出里出现 `proposed: windowed open + page up till cap` 一行，`mounted`
 恰为 `DEFAULT_LIMITS.maxMounted`（400），耗时明显低于 ~800 ms。**只看结构
 （mounted 数、frames 数）与量级，不要把某一个毫秒数写成断言。**
 
-- [ ] **Step 3: 把实测数字写进 spec §6.2**
+- [x] **Step 3: 把实测数字写进 spec §6.2**
 
 在 `docs/superpowers/specs/2026-11-06-transcript-window-design.md` 的 §6.2 末尾加：
 
@@ -2751,7 +2751,7 @@ Expected: 输出里出现 `proposed: windowed open + page up till cap` 一行，
 
 把 `<待填实测值>` 换成 Step 2 跑出来的真实数字——**不许估**。
 
-- [ ] **Step 4: 全量回归**
+- [x] **Step 4: 全量回归**
 
 ```bash
 cd desktop && npx tsc --noEmit
@@ -2765,7 +2765,7 @@ Expected: 全部 PASS。特别确认：
 - `ChatView.test.tsx` 里既有的贴底/跟随/锚点/搜索用例全绿（窗口化最可能打坏这些）；
 - `App.test.tsx` 全绿（宿主接线没断）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd .. && git add desktop/scripts/perf/open.mjs docs/superpowers/specs/2026-11-06-transcript-window-design.md
