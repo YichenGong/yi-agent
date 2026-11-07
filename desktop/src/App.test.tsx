@@ -1678,6 +1678,46 @@ describe("App slash commands", () => {
     await screen.findByText(/压缩/);
   });
 
+  it("keeps Send enabled in another thread while /compact is in flight", async () => {
+    // `/compact` 是一次长请求（要调 provider 生成摘要）。它挂起期间，输入框的
+    // 「提交未回包」状态必须是**按会话**的：用户切到 B 之后，B 的 Send 不能因为
+    // A 还在等压缩结果而变灰——那会让整个应用看起来被一个会话锁死了。
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let accept!: (value: unknown) => void;
+    state.dataSources["thread/compact"] = () =>
+      new Promise<unknown>((resolve) => {
+        accept = resolve;
+      });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "/compact" } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/compact")).toBe(true),
+    );
+
+    const box = () => screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+    // 切到 t2 之后再输入：草稿按会话走，空着的就是 t2。
+    await waitFor(() => expect(box().value).toBe(""));
+    fireEvent.change(box(), { target: { value: "hi from t2" } });
+    await waitFor(() => expect(box().value).toBe("hi from t2"));
+    const send = screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+
+    await act(async () => {
+      accept({ status: "compacted" });
+    });
+  });
+
   it("creates a copy from the sidebar without switching threads", async () => {
     // fork 之后 App 会 `refreshThreads()`：桩的 `thread/listAll` 只回 `state.threads`，
     // 新会话不在里面就会被当成「已不存在」。故 fork 时要把它推进 seed。
