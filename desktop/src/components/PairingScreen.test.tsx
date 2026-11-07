@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -17,6 +18,7 @@ import {
   type StorageLike,
   storedRemoteConfig,
 } from "../lib/remoteConfig";
+import type { ScanResultHandler } from "../lib/qrScanner";
 
 /** In-memory stand-in for `localStorage`; same shape `remoteConfig.test.ts` uses. */
 function storages(entries: Record<string, string> = {}): StorageLike {
@@ -464,5 +466,374 @@ describe("PairingScreen optional cancel", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "返回" }));
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+/** A promise whose settlement the test controls (Task 1/2 deferred shape). */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function scanPayload(code = "ABCD-EFGH") {
+  return `yiagent://pair?v=1&relay=${encodeURIComponent(URL)}&code=${code}`;
+}
+
+/** Injects a scan seam that hands the test the live result handler. */
+function captureScan() {
+  const box: { emit?: ScanResultHandler; error?: (e: unknown) => void } = {};
+  const scan = vi.fn((onText: ScanResultHandler, onError: (e: unknown) => void) => {
+    box.emit = onText;
+    box.error = onError;
+    return vi.fn();
+  });
+  return { box, scan };
+}
+
+describe("PairingScreen pairing admission", () => {
+  it("A01 accepted QR removes overlay while redeem is pending", async () => {
+    const pending = deferred<typeof PAIRED>();
+    const redeem = vi.fn(() => pending.promise);
+    const { box, scan } = captureScan();
+    render(
+      <PairingScreen
+        enableScan
+        scan={scan}
+        redeem={redeem}
+        storage={storages()}
+        notice="已被桌面移除"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    let accepted: boolean | void = undefined;
+    act(() => {
+      accepted = box.emit!(scanPayload());
+    });
+    // 先检查用户可见行为：旧实现覆盖层残留，会先红在这里。
+    expect(
+      screen.queryByRole("dialog", { name: "扫描二维码" }),
+    ).toBeNull();
+    expect(accepted).toBe(true);
+    expect(
+      screen.getByRole("status", { name: "配对进度" }).textContent,
+    ).toBe("已识别二维码，正在连接桌面…");
+    expect(
+      (screen.getByLabelText("服务器地址") as HTMLInputElement).value,
+    ).toBe(URL);
+    expect(redeem).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      pending.reject(new Error("offline"));
+    });
+    expect(screen.queryByRole("status", { name: "配对进度" })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe(CONNECT_FAILED_TEXT);
+  });
+
+  it("A02 synchronous manual submit admission survives stale busy closure", async () => {
+    const pending = deferred<typeof PAIRED>();
+    const redeem = vi.fn(() => pending.promise);
+    render(<PairingScreen enableScan storage={storages()} redeem={redeem} />);
+    const f = fields();
+    fill(f);
+    const form = screen.getByRole("form", { name: "配对" });
+    act(() => {
+      fireEvent.submit(form);
+      fireEvent.submit(form); // 同一 React 批次，busy 闭包尚未提交
+      fireEvent.change(f.url, { target: { value: "wss://other.test/ws" } });
+      fireEvent.change(f.code, { target: { value: "ZZZZ-YYYY" } });
+      fireEvent.change(f.name, { target: { value: "other phone" } });
+    });
+    expect(redeem).toHaveBeenCalledTimes(1);
+    expect([f.url.value, f.code.value, f.name.value]).toEqual([
+      URL,
+      "ABCD-EFGH",
+      "我的 iPhone",
+    ]);
+    expect([f.url.disabled, f.code.disabled, f.name.disabled]).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    fireEvent.submit(form); // pending 全周期仍不得重新准入
+    expect(redeem).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "扫码" })).toBeNull();
+    await act(async () => {
+      pending.reject(new Error("offline"));
+    });
+    expect([f.url.disabled, f.code.disabled, f.name.disabled]).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("A02/A18 first accepted code wins and later frames are not forwarded", async () => {
+    const pending = deferred<typeof PAIRED>();
+    const redeem = vi.fn(() => pending.promise);
+    const { box, scan } = captureScan();
+    render(<PairingScreen enableScan scan={scan} redeem={redeem} storage={storages()} />);
+    const f = fields(); // busy 后按钮名变为“配对中…”，必须提前缓存
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    const results: (boolean | void)[] = [];
+    act(() => {
+      results.push(box.emit!("https://example.com/not-a-pairing-code"));
+      results.push(box.emit!(scanPayload()));
+      results.push(box.emit!(scanPayload()));
+      results.push(box.emit!(scanPayload("ZZZZ-YYYY")));
+      results.push(box.emit!("garbage"));
+    });
+    expect(results).toEqual([false, true, true, true, true]);
+    expect(redeem).toHaveBeenCalledTimes(1);
+    expect([f.url.value, f.code.value]).toEqual([URL, "ABCD-EFGH"]);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(f.url.disabled).toBe(true);
+    await act(async () => {
+      pending.resolve(PAIRED);
+    });
+  });
+
+  it("A03 invalid and network failures restore the form and keep the code", async () => {
+    const redeem = vi
+      .fn()
+      .mockRejectedValueOnce({ code: 4401, message: "no token" })
+      .mockRejectedValueOnce({ code: -32001, message: "invalid or expired pairing code" })
+      .mockRejectedValueOnce(new Error("pairing socket closed (1006)"))
+      .mockResolvedValueOnce(PAIRED);
+    const onPaired = vi.fn();
+    render(
+      <PairingScreen redeem={redeem} storage={storages()} onPaired={onPaired} />,
+    );
+    const f = fields();
+    for (const expected of [
+      INVALID_CODE_TEXT,
+      INVALID_CODE_TEXT,
+      CONNECT_FAILED_TEXT,
+    ]) {
+      fill(f);
+      fireEvent.click(f.submit);
+      await waitFor(() =>
+        expect(screen.getByRole("alert").textContent).toBe(expected),
+      );
+      expect(screen.queryByRole("status", { name: "配对进度" })).toBeNull();
+      expect([f.url.disabled, f.code.disabled, f.name.disabled]).toEqual([
+        false,
+        false,
+        false,
+      ]);
+      expect([f.url.value, f.code.value]).toEqual([URL, "ABCD-EFGH"]);
+    }
+    fill(f);
+    fireEvent.click(f.submit);
+    await waitFor(() => expect(onPaired).toHaveBeenCalledTimes(1));
+  });
+
+  it("A04 host onSubmit bypasses storage and is notified once", async () => {
+    const setItem = vi.fn();
+    const storage: StorageLike = { ...storages(), setItem };
+    const redeem = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const onPaired = vi.fn();
+    render(
+      <PairingScreen
+        onSubmit={onSubmit}
+        redeem={redeem}
+        storage={storage}
+        onPaired={onPaired}
+      />,
+    );
+    fill(fields());
+    fireEvent.click(fields().submit);
+    await waitFor(() => expect(onPaired).toHaveBeenCalledTimes(1));
+    expect(onSubmit).toHaveBeenCalledWith(URL, "ABCD-EFGH", "我的 iPhone");
+    expect(redeem).not.toHaveBeenCalled();
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  it("A04 persisted config is visible before onPaired fires (once)", async () => {
+    const storage = storages();
+    const redeem = vi.fn().mockResolvedValue({ ...PAIRED, scope: "observe" });
+    const seen: unknown[] = [];
+    const onPaired = vi.fn(() => {
+      seen.push(storedRemoteConfig(storage));
+    });
+    render(
+      <PairingScreen redeem={redeem} storage={storage} onPaired={onPaired} />,
+    );
+    fill(fields());
+    fireEvent.click(fields().submit);
+    await waitFor(() => expect(onPaired).toHaveBeenCalledTimes(1));
+    expect(seen).toEqual([
+      { url: URL, token: "yia_tok", scope: "observe", projects: [] },
+    ]);
+    expect(storedRemoteConfig(storage)).toEqual(seen[0]);
+  });
+
+  it("A15 completed scan leaves no overlay and reports the source text", async () => {
+    const storage = storages();
+    const onPaired = vi.fn();
+    const { box, scan } = captureScan();
+    const view = render(
+      <PairingScreen
+        enableScan
+        scan={scan}
+        redeem={vi.fn().mockResolvedValue(PAIRED)}
+        storage={storage}
+        onPaired={onPaired}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    await act(async () => {
+      box.emit!(scanPayload());
+    });
+    expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+    expect(onPaired).toHaveBeenCalledTimes(1);
+    expect(storedRemoteConfig(storage)?.token).toBe("yia_tok");
+    view.unmount();
+
+    const failing = captureScan();
+    render(
+      <PairingScreen
+        enableScan
+        scan={failing.scan}
+        redeem={vi.fn().mockRejectedValue(new Error("offline"))}
+        storage={storages()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    await act(async () => {
+      failing.box.emit!(scanPayload());
+    });
+    expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+    expect(screen.getByRole("alert").textContent).toBe(CONNECT_FAILED_TEXT);
+  });
+
+  it("A15 manual pending shows its own progress text and no cancel reminder by default", async () => {
+    const pending = deferred<typeof PAIRED>();
+    render(
+      <PairingScreen
+        enableScan
+        storage={storages()}
+        redeem={() => pending.promise}
+      />,
+    );
+    const f = fields();
+    fill(f);
+    fireEvent.click(f.submit);
+    expect(
+      screen.getByRole("status", { name: "配对进度" }).textContent,
+    ).toBe("正在连接桌面…");
+    expect(screen.queryByText("返回不会撤销已发出的配对请求")).toBeNull();
+    await act(async () => {
+      pending.resolve(PAIRED);
+    });
+  });
+
+  const leaveCases = [
+    ["return-without-unmount", "resolve"],
+    ["return-without-unmount", "reject"],
+    ["unmount-new-page", "resolve"],
+    ["unmount-new-page", "reject"],
+  ] as const;
+
+  it.each(leaveCases)(
+    "A16 %s ignores late %s",
+    async (leave, outcome) => {
+      const oldRaw = JSON.stringify(
+        { url: URL, token: "yia_old", scope: "observe", projects: [] },
+        null,
+        2,
+      );
+      const storage = storages({ [REMOTE_STORAGE_KEY]: oldRaw });
+      expect(storedRemoteConfig(storage)?.token).toBe("yia_old");
+      const pending = deferred<typeof PAIRED>();
+      const onPaired = vi.fn();
+      const onCancel = vi.fn();
+      const view = render(
+        <PairingScreen
+          enableScan={false}
+          storage={storage}
+          redeem={() => pending.promise}
+          onPaired={onPaired}
+          onCancel={onCancel}
+        />,
+      );
+      const f = fields(); // busy 后按钮名变为“配对中…”，必须在 busy 前缓存
+      fill(f);
+      fireEvent.click(f.submit);
+      expect(screen.getByText("返回不会撤销已发出的配对请求")).toBeTruthy();
+      if (leave === "return-without-unmount") {
+        fireEvent.click(screen.getByRole("button", { name: "返回" }));
+        expect(onCancel).toHaveBeenCalledTimes(1);
+        // 宿主尚未卸载：必须由返回 handler 自身失效，不能靠 cleanup 掩盖。
+      } else {
+        view.unmount();
+        render(<PairingScreen storage={storage} enableScan={false} />);
+      }
+      await act(async () => {
+        if (outcome === "resolve") pending.resolve(PAIRED);
+        else pending.reject(new Error("old request failed"));
+      });
+      expect(storage.getItem(REMOTE_STORAGE_KEY)).toBe(oldRaw);
+      expect(onPaired).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).toBeNull();
+    },
+  );
+
+  it("A18 stale handlers after returning cannot touch the reopened scanner", async () => {
+    const redeem = vi.fn().mockResolvedValue(PAIRED);
+    const { box, scan } = captureScan();
+    render(
+      <PairingScreen enableScan scan={scan} redeem={redeem} storage={storages()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    const staleText = box.emit!;
+    const staleError = box.error!;
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
+    let staleResult: boolean | void = undefined;
+    act(() => {
+      staleResult = staleText("https://example.com/stale");
+      staleError(new Error("stale camera"));
+    });
+    expect(staleResult).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(redeem).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    const freshText = box.emit!;
+    act(() => {
+      staleText(scanPayload());
+      staleError(new Error("stale camera again"));
+    });
+    expect(redeem).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    act(() => {
+      freshText(scanPayload());
+      staleError(new Error("stale after accept"));
+    });
+    expect(redeem).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("A18 injected scan reporting two errors handles only the first", async () => {
+    const scan = vi.fn(
+      (_onText: ScanResultHandler, onError: (e: unknown) => void) => {
+        onError(new Error("first camera failure"));
+        onError(new Error("second camera failure"));
+        return vi.fn();
+      },
+    );
+    render(<PairingScreen enableScan scan={scan} storage={storages()} />);
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+    });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "无法访问相机，可手输配对码",
+    );
+    expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
   });
 });

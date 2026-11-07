@@ -193,3 +193,101 @@ cd desktop && npx tsc --noEmit
 
 - 既有 `PairingScreen` 测试（启动异常回表单不黑屏、安全区 `.scan-overlay-bar`、手输回退、取消、覆盖层内错误提示）全部保留且通过，本次一条未改、未删。
 - `ScanHost` 仍无终止规则：`useEffect(() => scan((t) => ref.current.onText(t), (e) => ref.current.onError(e)), [scan])` 与改动前逐字节一致，仅 `onText` 的类型从内联函数类型换成 `ScanResultHandler`。
+
+## Task 3：同步配对准入、可见进度与离开失效
+
+改动文件：
+
+- `desktop/src/components/PairingScreen.tsx`
+- `desktop/src/components/PairingScreen.test.tsx`
+- `docs/project-management/desktop.md`（补代码门禁证据，条目仍 `[ ]`）
+- 本文件
+
+### 3.1 实现要点
+
+- **同步准入**：`runRedeem(u, c, origin): boolean` 首行检查 `mounted` / `attempt`，
+  然后立刻写入 `attempt.current = { active: true }`——在任何 `setState`、外部调用、
+  `await` 之前。React 的 `busy` 要到下一次渲染才可见，仅靠它挡不住同一批次内的
+  第二次提交（连点提交、扫码帧连发都会各发一次兑换）。
+- **识别即离开相机**：`runRedeem` 在 `await` 之前 `scanActive=false; setScanning(false)`，
+  覆盖层条件改为 `scanning && !busy`。此前覆盖层要等 `finally` 里 `setScanning(false)`
+  才消失，兑换 pending 期间一直全屏黑——即用户报的「扫上码之后黑屏」。
+- **晚到结果隔离**：`live()` 同时校验 `mounted`、本次 `active`、以及
+  `attempt.current === current`。resolve/reject 晚到只丢弃，不落盘、不 `onPaired`、
+  不写 UI。`invalidate()` 在卸载与「返回」时置 `active=false` 并清空 `attempt`。
+- **保存与通知同块**：`saveRemoteConfig` 之后紧跟 `if (live()) onPaired?.()`，中间无
+  `await`，不产生「已落盘但页面已离开」的窗口。
+- **扫码结果契约**：`handleScanText` 在非 mounted / 非 scanActive / 已有 attempt 时返回
+  `true`（本次帧被接管或忽略，循环停机）；非法码同步返回 `false` 让循环继续；有效码
+  `runRedeem` 后返回 `true`。`handleScanError` 同样三重守卫，只处理第一次。
+- **ScanHost 终止规则**（与 boolean handler 原子交付）：`active` 局部变量在 effect 内
+  维护，`accepted !== false` 或抛错后不再转发；cleanup 先置 `active=false` 再 `stop()`。
+- **输入与出口**：三个输入 `disabled={busy}`，`onChange` 也带 mounted/attempt 守卫；
+  submit 同步 `preventDefault` + 三重闸；「返回」先 `invalidate()`、`mounted=false`，
+  再 `onCancel()`，不清已有 storage。
+- **进度可见**：`{busy && <p role="status" aria-label="配对进度">}`，扫码来源文案
+  `已识别二维码，正在连接桌面…`，手输文案 `正在连接桌面…`；有 `onCancel` 且 busy 时
+  额外提示 `返回不会撤销已发出的配对请求`。
+
+### 3.2 RED（新测试，未改实现）
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/PairingScreen.test.tsx
+```
+
+```
+ Failed Tests 9
+ FAIL  A01 accepted QR removes overlay while redeem is pending
+ FAIL  A02 synchronous manual submit admission survives stale busy closure
+ FAIL  A02/A18 first accepted code wins and later frames are not forwarded
+ FAIL  A15 manual pending shows its own progress text and no cancel reminder by default
+ FAIL  A16 return-without-unmount ignores late resolve
+ FAIL  A16 return-without-unmount ignores late reject
+ FAIL  A16 unmount-new-page ignores late resolve
+ FAIL  A16 unmount-new-page ignores late reject
+ FAIL  A18 stale handlers after returning cannot touch the reopened scanner
+      Tests  9 failed | 27 passed (36)
+```
+
+A01 红在「覆盖层残留」这一用户可见断言（不是先被 `undefined` 返回值截断）；
+A02 红在 `redeem` 被同一批次调用 2 次；A16 四个分支全部独立红；A18 红在旧 handler
+返回 `undefined` 且会串到新实例。
+
+### 3.3 GREEN
+
+```sh
+cd desktop && npm test -- --environment jsdom src/components/PairingScreen.test.tsx
+```
+
+```
+ Test Files  1 passed (1)
+      Tests  36 passed (36)
+```
+
+定向三文件：
+
+```sh
+cd desktop && npm test -- --environment jsdom \
+  src/lib/qrScanner.test.ts src/components/QrScanner.test.tsx src/components/PairingScreen.test.tsx
+```
+
+```
+ Test Files  3 passed (3)
+      Tests  55 passed (55)
+```
+
+前端全量回归：`cd desktop && npm test` → **173 files / 2416 tests passed**。
+类型检查：`npx tsc --noEmit` — 无输出，exit 0。
+
+### 3.4 门禁
+
+- `cd yi-agent-rs && cargo fmt --all` 已执行。
+- 除 `test` 外的全部 `just ci` 门禁 → **rc=0**（日志 `/tmp/ios-qr-task3-gates.log`）。
+- 完整 `just ci` 仍被既有基线测试
+  `yi-agent-app-server server::tests::transport::agent_factory_failure_returns_internal_error`
+  阻塞；该测试在未含本改动的 main 上同样稳定失败（3/3），与本任务无关，如实记录。
+
+### 3.5 覆盖的验收项
+
+A01、A02、A03、A04、A15、A16（四个分支）、A18；既有 A12 启动错误、ErrorBoundary
+就地收敛、安全区、桌面手输、返回目标断言全部保留并通过。

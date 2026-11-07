@@ -144,6 +144,36 @@ export function PairingScreen({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  const [source, setSource] = useState<"scan" | "manual">("manual");
+
+  /**
+   * 当前这次兑换的令牌。**同步占用**：任何 `setState`、外部调用、`await` 之前就
+   * 写进 ref——React 的 `busy` 状态要等下一次渲染才可见，同一批次里的第二次
+   * 提交（连点两次、扫码帧连发）否则会各发一次兑换请求。
+   *
+   * 用对象 identity 判断「还是不是我这一次」：返回/卸载会把 `active` 置 false，
+   * 晚到的 resolve/reject 因此不能再落盘或跳转。
+   */
+  const attempt = useRef<{ active: boolean } | null>(null);
+  const mounted = useRef(true);
+  /** 扫描器当前是否还该接收结果；与 `scanning`（UI）分开，避免渲染延迟。 */
+  const scanActive = useRef(false);
+
+  const invalidate = () => {
+    if (attempt.current) attempt.current.active = false;
+    attempt.current = null;
+    scanActive.current = false;
+  };
+
+  useEffect(() => {
+    // StrictMode 会 setup-cleanup-setup；cleanup 已把 mounted 置 false，
+    // 第二次 setup 必须重新启用，否则表单永远拒绝提交。
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      invalidate();
+    };
+  }, []);
 
   const trimmedUrl = url.trim();
   const trimmedCode = code.trim();
@@ -151,60 +181,107 @@ export function PairingScreen({
   const canSubmit = trimmedUrl.length > 0 && trimmedCode.length > 0 && !busy;
   const canScan = (enableScan ?? isIos()) && !busy;
 
-  /** 实际兑换：表单与扫码两条路径都走它。 */
-  const runRedeem = async (u: string, c: string) => {
+  /**
+   * 实际兑换：表单与扫码两条路径都走它。
+   *
+   * 返回值是**同步准入结果**：`false` 表示这次没被接受（已卸载 / 已有兑换在
+   * 进行），调用方据此决定扫码帧要不要继续。异步结果只通过 `live()` 落地。
+   */
+  const runRedeem = (u: string, c: string, origin: "scan" | "manual"): boolean => {
+    if (!mounted.current || attempt.current) return false;
+    const current: { active: boolean } = { active: true };
+    attempt.current = current; // 先占用，再做任何有副作用的事
+    const live = () =>
+      mounted.current && current.active && attempt.current === current;
     const name = deviceName.trim() || inferDeviceName();
-    setBusy(true);
-    setError(null);
-    try {
-      if (onSubmit) {
-        await onSubmit(u, c, name);
-      } else {
-        const device = await (redeem ?? defaultRedeem)(u, c, name);
-        const config: RemoteConfig = {
-          url: u,
-          token: device.token,
-          scope: parsePairScope(device.scope),
-        };
-        saveRemoteConfig(storage ?? defaultStorage(), config);
-      }
-      onPaired?.();
-    } catch (err) {
-      setError(isInvalidCode(err) ? INVALID_CODE_TEXT : CONNECT_FAILED_TEXT);
-    } finally {
-      setBusy(false);
-      setScanning(false);
+
+    // 识别成功即离开相机：覆盖层必须在 `await` 之前消失。留着它等兑换结果，
+    // 用户看到的就是「扫上码之后黑屏」。
+    scanActive.current = false;
+    setScanning(false);
+    if (origin === "scan") {
+      setUrl(u);
+      setCode(c);
     }
+    setSource(origin);
+    setError(null);
+    setBusy(true);
+
+    void (async () => {
+      try {
+        if (onSubmit) {
+          await onSubmit(u, c, name);
+        } else {
+          const device = await (redeem ?? defaultRedeem)(u, c, name);
+          if (!live()) return;
+          const config: RemoteConfig = {
+            url: u,
+            token: device.token,
+            scope: parsePairScope(device.scope),
+          };
+          saveRemoteConfig(storage ?? defaultStorage(), config);
+        }
+        // save 与通知放在同一个同步块里：中间不得再让出执行权，否则「已落盘但
+        // 用户已返回」的窗口会让宿主重建 transport 到一个已离开的页面。
+        if (live()) onPaired?.();
+      } catch (err) {
+        if (live()) {
+          setError(isInvalidCode(err) ? INVALID_CODE_TEXT : CONNECT_FAILED_TEXT);
+        }
+      } finally {
+        if (live()) {
+          attempt.current = null;
+          current.active = false;
+          setBusy(false);
+        }
+      }
+    })();
+    return true;
   };
 
-  const submit = async (e: FormEvent) => {
+  const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (!canSubmit) return;
-    await runRedeem(trimmedUrl, trimmedCode);
+    // 三道同步闸：`canSubmit` 里的是渲染期快照，挡不住同一批次里的第二次提交。
+    if (!canSubmit || attempt.current || !mounted.current) return;
+    runRedeem(trimmedUrl, trimmedCode, "manual");
   };
 
-  /** 扫到一帧文本：解析成功则回填并**自动配对**；失败则提示且扫描器保持打开。 */
-  const handleScanText = (text: string) => {
-    const parsed = parsePairUri(text);
+  /**
+   * 扫到一帧文本：解析成功则回填并**自动配对**；失败返回 `false` 让扫描器继续。
+   *
+   * 返回 `true` 覆盖「本次帧已被接管或忽略」：扫码循环据此停机，避免同一码被
+   * 连续送入、或在离开后继续回调。
+   */
+  const handleScanText: ScanResultHandler = (text) => {
+    if (!mounted.current || !scanActive.current || attempt.current) return true;
+    const parsed = parsePairUri(text); // 同步纯函数，中间没有让出执行权
     if (!parsed) {
       setError(NOT_A_PAIRING_QR_TEXT);
-      return; // 扫描器保持打开，可重试
+      return false; // 扫描器保持打开，可重试
     }
-    setUrl(parsed.relay);
-    setCode(parsed.code);
-    void runRedeem(parsed.relay, parsed.code);
+    runRedeem(parsed.relay, parsed.code, "scan");
+    return true;
   };
 
   const handleScanError = () => {
+    if (!mounted.current || !scanActive.current || attempt.current) return;
+    scanActive.current = false;
     setError(CAMERA_UNAVAILABLE_TEXT);
     setScanning(false);
+  };
+
+  const cancel = () => {
+    // 先失效再通知宿主：宿主可能在 `onCancel` 里立刻卸载本组件。
+    invalidate();
+    mounted.current = false;
+    onCancel?.();
   };
 
   return (
     <div className="flex h-screen items-center justify-center bg-surface p-4 text-fg">
       <form
         aria-label="配对"
-        onSubmit={(e) => void submit(e)}
+        onSubmit={submit}
         className="w-full max-w-sm rounded-lg border border-line bg-panel p-5"
       >
         <h1 className="text-sm font-medium text-fg">连接桌面</h1>
@@ -229,7 +306,10 @@ export function PairingScreen({
             spellCheck={false}
             placeholder="wss://relay.example.com/ws?session=..."
             value={url}
-            onChange={(e) => setUrl(e.target.value)}
+            disabled={busy}
+            onChange={(e) => {
+              if (mounted.current && !attempt.current) setUrl(e.target.value);
+            }}
             className="mt-1 w-full rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
         </label>
@@ -244,7 +324,10 @@ export function PairingScreen({
             spellCheck={false}
             placeholder="XXXX-XXXX"
             value={code}
-            onChange={(e) => setCode(e.target.value)}
+            disabled={busy}
+            onChange={(e) => {
+              if (mounted.current && !attempt.current) setCode(e.target.value);
+            }}
             className="mt-1 w-full rounded-md border border-line-strong bg-surface px-3 py-2 text-sm tracking-widest text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
         </label>
@@ -255,7 +338,12 @@ export function PairingScreen({
             id="pairing-name"
             type="text"
             value={deviceName}
-            onChange={(e) => setDeviceName(e.target.value)}
+            disabled={busy}
+            onChange={(e) => {
+              if (mounted.current && !attempt.current) {
+                setDeviceName(e.target.value);
+              }
+            }}
             className="mt-1 w-full rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
         </label>
@@ -263,6 +351,16 @@ export function PairingScreen({
         {error !== null && !scanning && (
           <p role="alert" className="mt-3 text-xs text-red-400">
             {error}
+          </p>
+        )}
+
+        {busy && (
+          <p
+            role="status"
+            aria-label="配对进度"
+            className="mt-3 text-xs text-fg-muted"
+          >
+            {source === "scan" ? "已识别二维码，正在连接桌面…" : "正在连接桌面…"}
           </p>
         )}
 
@@ -274,10 +372,16 @@ export function PairingScreen({
           {busy ? "配对中…" : "配对"}
         </button>
 
+        {onCancel && busy && (
+          <p className="mt-2 text-xs text-fg-subtle">
+            返回不会撤销已发出的配对请求
+          </p>
+        )}
+
         {onCancel && (
           <button
             type="button"
-            onClick={onCancel}
+            onClick={cancel}
             className="mt-3 w-full rounded-md border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
           >
             返回
@@ -288,6 +392,8 @@ export function PairingScreen({
           <button
             type="button"
             onClick={() => {
+              if (!mounted.current || attempt.current) return;
+              scanActive.current = true;
               setError(null);
               setScanning(true);
             }}
@@ -297,7 +403,7 @@ export function PairingScreen({
           </button>
         )}
 
-        {scanning && (
+        {scanning && !busy && (
           <div
             role="dialog"
             aria-label="扫描二维码"
@@ -312,7 +418,10 @@ export function PairingScreen({
               <span className="text-xs text-white/70">对准桌面端显示的二维码</span>
               <button
                 type="button"
-                onClick={() => setScanning(false)}
+                onClick={() => {
+                  scanActive.current = false;
+                  setScanning(false);
+                }}
                 // 明确的出口，且触控目标 ≥44px：12px 的「取消」在手机上又小又靠边。
                 className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded px-3 text-sm text-white/90 hover:text-white"
               >
@@ -364,7 +473,32 @@ function ScanHost({
 }) {
   const ref = useRef({ onText, onError });
   ref.current = { onText, onError };
-  useEffect(() => scan((t) => ref.current.onText(t), (e) => ref.current.onError(e)), [scan]);
+  useEffect(() => {
+    let active = true;
+    const stop = scan(
+      (text) => {
+        if (!active) return true;
+        try {
+          const accepted = ref.current.onText(text);
+          if (accepted !== false) active = false;
+          return accepted;
+        } catch (error) {
+          active = false;
+          ref.current.onError(error);
+          return true;
+        }
+      },
+      (error) => {
+        if (!active) return;
+        active = false;
+        ref.current.onError(error);
+      },
+    );
+    return () => {
+      active = false;
+      stop();
+    };
+  }, [scan]);
   return null;
 }
 
