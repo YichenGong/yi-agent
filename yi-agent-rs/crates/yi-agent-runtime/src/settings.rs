@@ -513,6 +513,13 @@ fn migrate_legacy_keys(value: &mut serde_json::Value) {
         return;
     };
 
+    // 目标分组存在但不是对象（例如手改成 `"power": null`）时不能搬：下面的
+    // `expect("just inserted an object")` 会 panic。启动期的一条 breach 不能
+    // 让进程崩掉，坏形状留给调用方按字段/分组诊断。
+    if value.get(NEW_GROUP).is_some_and(|group| !group.is_object()) {
+        return;
+    }
+
     // 新键已存在就不动：用户显式设的值优先。
     let already_set = value
         .get(NEW_GROUP)
@@ -556,6 +563,7 @@ fn migrate_legacy_keys(value: &mut serde_json::Value) {
 /// `FIELDS` 校验，越界或枚举非法的值置 `None` 并 `warn`。用户手改 `sandbox`
 /// 拼错时不该连 `max_turns` 一起回默认。
 pub fn load_from(path: &Path) -> Settings {
+    count_load_from_call();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
@@ -593,6 +601,31 @@ pub fn load_from(path: &Path) -> Settings {
     settings.normalized()
 }
 
+/// 运行期有界读取绝不该转调无界加载器；测试用它钉住这条边界。
+#[cfg(test)]
+pub(crate) fn reset_load_from_calls() {
+    LOAD_FROM_CALLS.with(|slot| slot.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn load_from_calls() -> usize {
+    LOAD_FROM_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOAD_FROM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_load_from_call() {
+    LOAD_FROM_CALLS.with(|slot| slot.set(slot.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn count_load_from_call() {}
+
 /// 读实例目录下的 `settings.json`。
 pub fn load() -> Settings {
     load_from(&settings_path())
@@ -605,7 +638,22 @@ impl Settings {
     /// 2. **单字段非法只清掉那一个**：按 [`FIELDS`] 校验数值边界与枚举白名单，
     ///    不合法就置 `None` 并 `warn`。整份文件丢掉会让用户「改错一个字段、
     ///    全盘回默认」——spec 的错误处理一节明确要求逐字段降级。
-    fn normalized(mut self) -> Settings {
+    ///
+    /// 这是启动期的宽容入口；运行期有界读取走 [`Settings::normalized_silently`]，
+    /// 后者不写日志（原文可能含提示词），把键名交给快照健康诊断。
+    fn normalized(self) -> Settings {
+        let (settings, invalid_keys) = self.normalized_silently();
+        log_normalization(&invalid_keys);
+        settings
+    }
+
+    /// 与 [`Settings::normalized`] 同一套规则，但不写任何一条日志。
+    ///
+    /// 供运行期有界读取使用：那里拿到的原文可能包含提示词与其它用户值，
+    /// 逐字段 `warn` 会把取值写进日志。返回的键名只描述「哪些字段回退了」，
+    /// 交给快照的健康诊断，不进日志。
+    pub(crate) fn normalized_silently(mut self) -> (Settings, Vec<String>) {
+        let mut invalid_keys: Vec<String> = Vec::new();
         self.agent.system_prompt = self
             .agent
             .system_prompt
@@ -621,11 +669,7 @@ impl Settings {
             ($key:literal, $field:expr) => {{
                 if let Some(value) = $field {
                     if !within($key, value as u64) {
-                        tracing::warn!(
-                            key = $key,
-                            value,
-                            "settings.json value is out of range; falling back to the default"
-                        );
+                        invalid_keys.push($key.to_string());
                         $field = None;
                     }
                 }
@@ -657,37 +701,25 @@ impl Settings {
         );
 
         // 枚举白名单：只认 `parse_sandbox_mode` 那份映射，不另写一遍。
-        // 该函数当前是 `config.rs` 里的私有 `fn`，本任务需把它的可见性改成
-        // `pub(crate) fn parse_sandbox_mode(...)`（`settings.rs` 与 `config.rs`
-        // 同 crate，`pub(crate)` 足够）。
-        if let Some(enabled) = self.tui.notifications.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown tui.notifications; falling back to the default"
-            );
-            self.tui.notifications = None;
-        }
-        if let Some(enabled) = self.tui.terminal_title.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown tui.terminal_title; falling back to the default"
-            );
-            self.tui.terminal_title = None;
-        }
+        let mut invalid_two_state = |key: &str, slot: &mut Option<String>| {
+            if let Some(value) = slot.as_deref()
+                && !matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
+            {
+                invalid_keys.push(key.to_string());
+                *slot = None;
+            }
+        };
+        invalid_two_state("tui.notifications", &mut self.tui.notifications);
+        invalid_two_state("tui.terminal_title", &mut self.tui.terminal_title);
+        invalid_two_state(PREVENT_IDLE_SLEEP_KEY, &mut self.power.prevent_idle_sleep);
+
         if let Some(method) = self.tui.notification_method.as_deref()
             && !matches!(
                 method.to_ascii_lowercase().as_str(),
                 "auto" | "osc9" | "bel"
             )
         {
-            tracing::warn!(
-                value = method,
-                "settings.json has an unknown tui.notification_method; falling back to the default"
-            );
+            invalid_keys.push("tui.notification_method".to_string());
             self.tui.notification_method = None;
         }
         if let Some(condition) = self.tui.notification_condition.as_deref()
@@ -696,28 +728,13 @@ impl Settings {
                 "unfocused" | "always"
             )
         {
-            tracing::warn!(
-                value = condition,
-                "settings.json has an unknown tui.notification_condition; falling back to the default"
-            );
+            invalid_keys.push("tui.notification_condition".to_string());
             self.tui.notification_condition = None;
-        }
-        if let Some(enabled) = self.power.prevent_idle_sleep.as_deref()
-            && !matches!(enabled.to_ascii_lowercase().as_str(), "true" | "false")
-        {
-            tracing::warn!(
-                value = enabled,
-                "settings.json has an unknown power.prevent_idle_sleep; falling back to the default"
-            );
-            self.power.prevent_idle_sleep = None;
         }
         if let Some(sandbox) = self.startup.sandbox.as_deref()
             && crate::config::parse_sandbox_mode(sandbox).is_none()
         {
-            tracing::warn!(
-                value = sandbox,
-                "settings.json has an unknown startup.sandbox; falling back to the default"
-            );
+            invalid_keys.push("startup.sandbox".to_string());
             self.startup.sandbox = None;
         }
 
@@ -729,15 +746,84 @@ impl Settings {
             self.power.idle_grace_minutes,
         ) && remote > grace
         {
-            tracing::warn!(
-                remote,
-                grace,
-                "power.remote_touch_minutes exceeds power.idle_grace_minutes; falling back to the defaults"
-            );
+            invalid_keys.push("power.remote_touch_minutes".to_string());
+            invalid_keys.push("power.idle_grace_minutes".to_string());
             self.power.remote_touch_minutes = None;
             self.power.idle_grace_minutes = None;
         }
-        self
+        invalid_keys.dedup();
+        (self, invalid_keys)
+    }
+}
+
+/// 启动期宽容归一化的结果。
+pub(crate) struct StartupFallback {
+    pub settings: Settings,
+    pub invalid_keys: Vec<String>,
+}
+
+/// 只用**已经读进内存的字节**做宽容归一化，绝不回头再读文件。
+///
+/// 可行时返回部分有效设置与回退过的键名；连 JSON 都无法解释时返回 `None`，
+/// 由调用方回退到全默认。`strict_keys` 是严格校验已诊断出的坏键，一并并入
+/// 诊断，保证「启动期没有严格快照也能说清哪里坏了」。
+///
+/// 与 [`load_from`] 的差别只有一处：解析失败不再静默回全默认。它不记录取值，
+/// 也不调用会输出字段值的 [`Settings::normalized`]。
+pub(crate) fn lenient_startup_fallback(
+    bytes: &[u8],
+    strict_keys: Vec<String>,
+) -> Option<StartupFallback> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    migrate_legacy_keys(&mut value);
+
+    let mut invalid_keys = strict_keys;
+    // 已知分组存在但不是对象（`"power": null`）时整组丢弃并记名。留着它会让
+    // 整份反序列化失败，把同一文件里**其它合法分组**也一起丢掉——而启动期
+    // 宽容回退的整个价值就在于保住那些合法字段。
+    let mut drop_groups: Vec<&str> = Vec::new();
+    for field in FIELDS {
+        let group = field.group;
+        if value
+            .get(group)
+            .is_some_and(|group_value| !group_value.is_object())
+            && !drop_groups.contains(&group)
+        {
+            drop_groups.push(group);
+        }
+    }
+    for group in drop_groups {
+        if let Some(object) = value.as_object_mut() {
+            object.remove(group);
+        }
+        if !invalid_keys.iter().any(|key| key == group) {
+            invalid_keys.push(group.to_string());
+        }
+    }
+
+    let settings = serde_json::from_value::<Settings>(value).ok()?;
+    let (settings, normalized_keys) = settings.normalized_silently();
+    for key in normalized_keys {
+        if !invalid_keys.contains(&key) {
+            invalid_keys.push(key);
+        }
+    }
+    Some(StartupFallback {
+        settings,
+        invalid_keys,
+    })
+}
+
+/// 启动期归一化的诊断：只记键名，不记取值，也不记提示词原文。
+fn log_normalization(invalid_keys: &[String]) {
+    for key in invalid_keys {
+        tracing::warn!(
+            key = key.as_str(),
+            "settings.json has an invalid value; falling back to the default"
+        );
     }
 }
 

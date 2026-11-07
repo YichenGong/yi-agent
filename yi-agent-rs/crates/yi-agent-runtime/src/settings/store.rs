@@ -60,15 +60,70 @@ pub struct CommitReceipt {
     pub settings: Settings,
 }
 
-/// 提交一次 patch。
+/// 提交一次 patch（公共入口）。
 ///
 /// `path` 应是实例目录下的稳定路径；同一路径的所有写入共享进程内锁与相邻的
 /// 锁文件。返回的 receipt 描述本次提交的逻辑变化。
+///
+/// 锁顺序是实例写锁 → 同路径 [`crate::live_settings`] 的 refresh gate。存在
+/// 已登记实例时必须先取它的 gate，否则一个正在 gate 内读旧文件的读者会把
+/// 过期内容发布回缓存；不存在实例时没有读者，也就没有 gate 可取。
 pub fn commit_patch(
     path: &Path,
     patch: &Value,
     mode: PatchMode,
 ) -> Result<CommitReceipt, SettingsError> {
+    let writer = lock_for_commit(path, patch)?;
+    let receipt = match crate::live_settings::with_source_gate(path, |()| {
+        commit_patch_locked(path, patch, mode)
+    }) {
+        Some(outcome) => outcome?,
+        None => commit_patch_locked(path, patch, mode)?,
+    };
+    drop(writer);
+    // rename 之后唤醒已存在的同路径源；提交结果已经确定，唤醒失败不影响它。
+    crate::live_settings::notify_committed(path);
+    Ok(receipt)
+}
+
+/// 提交前的固定顺序：先校验 patch（零写入可拒绝），再建目录，最后取写锁。
+///
+/// 目录必须在取锁**之前**建好：`flock` 文件就住在同一目录里，目录不存在时
+/// 连锁都打不开。校验仍排在目录创建之前，坏 patch 不会留下任何副作用。
+pub(crate) fn lock_for_commit(path: &Path, patch: &Value) -> Result<WriterGuard, SettingsError> {
+    validate_patch(patch)?;
+    ensure_parent_directory(path)?;
+    acquire_writer_lock(path)
+}
+
+/// 校验 patch 的形状与每个提供的值；任何一项失败都零写入。
+pub(crate) fn validate_patch(patch: &Value) -> Result<(), SettingsError> {
+    let object = patch
+        .as_object()
+        .ok_or_else(|| SettingsError::InvalidSetting {
+            key: "<root>".to_string(),
+            reason: "patch must be a JSON object".to_string(),
+        })?;
+    for (key, value) in object {
+        let spec = find_spec(key).ok_or_else(|| SettingsError::InvalidSetting {
+            key: key.clone(),
+            reason: "unknown setting".to_string(),
+        })?;
+        validate_value(spec, value)?;
+    }
+    Ok(())
+}
+
+/// 已持实例写锁（与可选 gate）的内部提交。
+///
+/// [`commit_patch`] 与 [`crate::live_settings::LiveSettings::commit`] 共用本函数：
+/// 整个 crate 只有这一份原子写实现，不得再写第二个。
+pub(crate) fn commit_patch_locked(
+    path: &Path,
+    patch: &Value,
+    mode: PatchMode,
+) -> Result<CommitReceipt, SettingsError> {
+    // 调用方必须已持锁（见 [`lock_for_commit`]）；这里只做合并与提交。
     let patch = patch
         .as_object()
         .ok_or_else(|| SettingsError::InvalidSetting {
@@ -76,18 +131,7 @@ pub fn commit_patch(
             reason: "patch must be a JSON object".to_string(),
         })?;
 
-    // 全部提供的值先校验：任何一项失败都零写入，且不会先取锁。
-    for (key, value) in patch {
-        let spec = find_spec(key).ok_or_else(|| SettingsError::InvalidSetting {
-            key: key.clone(),
-            reason: "unknown setting".to_string(),
-        })?;
-        validate_value(spec, value)?;
-    }
-
     ensure_parent_directory(path)?;
-
-    let _writer = acquire_writer_lock(path)?;
 
     let old = read_bounded_document(path)?.unwrap_or_else(empty_document);
     let mut candidate = old.clone();
@@ -256,8 +300,8 @@ fn writer_registry() -> &'static Mutex<std::collections::HashMap<PathBuf, &'stat
     REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 规范化绝对路径：同一文件的不同写法必须映射到同一把锁。
-fn lock_key(path: &Path) -> PathBuf {
+/// 规范化绝对路径：同一文件的不同写法必须映射到同一把锁、同一个实例。
+pub(crate) fn lock_key(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -272,14 +316,14 @@ fn writer_mutex(path: &Path) -> &'static Mutex<()> {
 }
 
 /// 写锁守卫：进程内 mutex + 文件锁 fd，析构即释放（锁文件不 unlink）。
-struct WriterGuard {
+pub(crate) struct WriterGuard {
     _process_guard: std::sync::MutexGuard<'static, ()>,
     /// 持有文件锁的 fd；drop 即关闭，`flock` 随之释放。
     _file: std::fs::File,
 }
 
 /// 先取进程内 writer 锁，再取 `flock`；两次等待共用一个 deadline。
-fn acquire_writer_lock(path: &Path) -> Result<WriterGuard, SettingsError> {
+pub(crate) fn acquire_writer_lock(path: &Path) -> Result<WriterGuard, SettingsError> {
     let deadline = std::time::Instant::now() + lock_wait_limit();
     let process = writer_mutex(path);
 
