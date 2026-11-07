@@ -5609,7 +5609,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "unicode-normalization",
- "walkdir",
  "wiremock",
  "yi-agent-core",
  "yi-agent-lifecycle",

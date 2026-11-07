@@ -1,17 +1,20 @@
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
+use crate::fs::walk;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use walkdir::WalkDir;
+use std::time::Instant;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 const MAX_OUTPUT_ENTRIES: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const TRUNCATION_NOTICE: &str =
     "[truncated: narrow path, glob, or pattern; use files_with_matches or count]\n";
+const DEADLINE_NOTICE: &str =
+    "[scan stopped after 10s: narrow path or glob, some matches were not reached]\n";
 
 pub struct GrepTool {
     ctx: Arc<ToolsContext>,
@@ -60,7 +63,7 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regex pattern" },
-                "path": { "type": "string", "description": "File or directory, default root" },
+                "path": { "type": "string", "description": "File or directory, default root (the session working directory)" },
                 "glob": { "type": "string", "description": "Filter files by glob, e.g. *.rs" },
                 "output_mode": {
                     "type": "string",
@@ -100,22 +103,37 @@ impl Tool for GrepTool {
         let mode = args.output_mode.unwrap_or_default();
         let context = args.context.unwrap_or(0);
 
-        match grep_search(
-            &base,
-            &re,
-            glob_pattern.as_ref(),
-            mode,
-            context,
-            self.ctx.roots(),
-        ) {
-            Ok(output) => {
+        // The walk is synchronous and can touch thousands of files. Running it
+        // on a tokio worker would park that thread for the whole scan and slow
+        // down every other tool call in the same turn.
+        let base_for_scan = base.clone();
+        let roots = self.ctx.roots().to_vec();
+        let glob_for_scan = glob_pattern.clone();
+        let deadline = walk::deadline_from_now();
+
+        let joined = tokio::task::spawn_blocking(move || {
+            grep_search(
+                &base_for_scan,
+                &re,
+                glob_for_scan.as_ref(),
+                mode,
+                context,
+                &roots,
+                Some(deadline),
+            )
+        })
+        .await;
+
+        match joined {
+            Ok(Ok((output, _timed_out))) => {
                 if output.is_empty() {
                     ToolResult::text("no matches")
                 } else {
                     ToolResult::text(output)
                 }
             }
-            Err(e) => e.into(),
+            Ok(Err(e)) => e.into(),
+            Err(e) => ToolResult::error(format!("grep worker failed: {e}")),
         }
     }
 
@@ -159,17 +177,18 @@ fn grep_search(
     mode: OutputMode,
     context: usize,
     roots: &[PathBuf],
-) -> Result<String, ToolsError> {
+    deadline: Option<Instant>,
+) -> Result<(String, bool), ToolsError> {
     let mut output = String::new();
     let mut found_any = false;
     let mut entry_count = 0;
     let mut truncated = false;
 
-    'walk: for entry in WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
+    let walked = walk::walk_with_deadline(base, walk::FILES, deadline);
+    let timed_out = matches!(walked.truncated, walk::Truncated::Deadline);
+
+    'walk: for path in walked.paths.iter() {
+        let path = path.as_path();
 
         // Apply glob filter (matches file name).
         if let Some(pat) = glob_filter {
@@ -259,11 +278,20 @@ fn grep_search(
     if truncated {
         output.push_str(TRUNCATION_NOTICE);
     }
+    if timed_out {
+        output.push_str(DEADLINE_NOTICE);
+    }
 
     if !found_any {
-        Ok(String::new())
+        // 即使一条都没找到，只要扫描被 deadline 截断，也必须说明，
+        // 否则 "no matches" 会被误读为「确实没有」。
+        Ok(if timed_out {
+            (DEADLINE_NOTICE.to_string(), true)
+        } else {
+            (String::new(), false)
+        })
     } else {
-        Ok(output)
+        Ok((output, timed_out))
     }
 }
 
@@ -435,5 +463,107 @@ mod tests {
         let text = text_result(&result);
         assert!(text.contains("[truncated:"));
         assert!(text.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_gitignored_build_output() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        fs::create_dir(tmp.path().join("target")).unwrap();
+        fs::write(tmp.path().join("target/generated.rs"), "needle\n").unwrap();
+        fs::write(tmp.path().join("src.rs"), "needle\n").unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool
+            .call(serde_json::json!({"pattern": "needle", "output_mode": "files_with_matches"}))
+            .await;
+
+        let text = text_result(&result);
+        assert!(
+            text.contains("src.rs"),
+            "the real source file must still match, got: {text}"
+        );
+        assert!(
+            !text.contains("target/generated.rs"),
+            "gitignored build output must be skipped, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_finds_matches_inside_dot_directories() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "run: cargo test\n",
+        )
+        .unwrap();
+        let tool = make_tool(&tmp);
+
+        let result = tool
+            .call(serde_json::json!({"pattern": "cargo test", "output_mode": "files_with_matches"}))
+            .await;
+
+        let text = text_result(&result);
+        assert!(
+            text.contains(".github/workflows/ci.yml"),
+            "hidden(false) keeps dot directories searchable, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_reports_deadline_truncation() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..200 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let tool = make_tool(&tmp);
+
+        // 正常 deadline 下不得 panic、不得误报截断。
+        // 真正的「过期 deadline」路径由下面的同步测试精确覆盖。
+        let result = tool
+            .call(serde_json::json!({"pattern": "needle", "output_mode": "files_with_matches"}))
+            .await;
+        let text = text_result(&result);
+        assert!(!result.is_error);
+        assert!(
+            !text.contains("[scan stopped after 10s:"),
+            "a 200-file walk must finish well inside 10s, got: {text}"
+        );
+    }
+
+    #[test]
+    fn grep_reports_deadline_truncation_with_expired_deadline() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..200 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let re = regex::Regex::new("needle").unwrap();
+
+        let (output, timed_out) = grep_search(
+            tmp.path(),
+            &re,
+            None,
+            OutputMode::FilesWithMatches,
+            0,
+            &[tmp.path().to_path_buf()],
+            // `Instant` 由模块顶部的 `use std::time::Instant` 带入；
+            // `Duration` 这里用全路径，避免测试模块再加一行 import。
+            Some(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .expect("clock is at least 1s past boot"),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            timed_out,
+            "an expired deadline must be reported to the caller"
+        );
+        assert!(
+            output.contains("[scan stopped after 10s:"),
+            "the user must be told the scan was cut short, got: {output}"
+        );
     }
 }
