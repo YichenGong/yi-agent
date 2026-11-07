@@ -31,7 +31,7 @@ use yi_agent_lifecycle::types::{
     RootAuthorization, RuntimeScope,
 };
 use yi_agent_supervisors::lifecycle::guardian::{
-    GUARDIAN_SOCKET_FILE, Guardian, serve_one_for_test, serve_with_bridge_for_test,
+    Guardian, serve_one_for_test, serve_with_bridge_for_test,
 };
 
 /// Why a fixture operation failed.
@@ -104,7 +104,8 @@ impl BridgeFixture {
     fn start() -> Self {
         let directory = short_temp_dir();
         let scope = scope_for(&directory);
-        let socket = scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+        let socket =
+            yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
         let selected = artifact();
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
@@ -701,7 +702,8 @@ fn foreground_root_lifecycle_without_a_registry_a_release_cannot_claim_a_stop() 
 fn foreground_root_lifecycle_a_silent_bridge_times_out_instead_of_hanging() {
     let directory = short_temp_dir();
     let scope = scope_for(&directory);
-    let socket = scope.runtime_dir.join(GUARDIAN_SOCKET_FILE);
+    let socket =
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = Arc::clone(&stop);
     let (guardian_end, peer_end) = std::os::unix::net::UnixStream::pair().unwrap();

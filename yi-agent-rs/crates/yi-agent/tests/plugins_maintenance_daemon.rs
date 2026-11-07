@@ -56,7 +56,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Fixture {
-        let temp = TempDir::new().unwrap();
+        // `/private/tmp` rather than the default temp dir: a socket path is
+        // `<instance_home>/sockets/<16 hex>/runtime.sock`, and macOS's default temp
+        // dir (68 bytes) plus `.yi-agent` and that 40-byte tail overflows `sun_path`.
+        let temp = tempfile::Builder::new()
+            .prefix("pmd")
+            .tempdir_in("/private/tmp")
+            .unwrap();
         let home = temp.path().join(".yi-agent");
         let project = temp.path().join("project");
         let runtime = temp.path().join("rt");
@@ -150,7 +156,10 @@ impl Fixture {
     }
 
     fn socket(&self) -> PathBuf {
-        yi_agent_store::ipc::socket_path_for(&self.runtime).expect("socket path")
+        // Derived from this fixture's own `YI_AGENT_HOME`, not from the environment:
+        // only the child daemon gets that variable, so a lookup here would resolve
+        // against the developer's real `~/.yi-agent` and watch a socket nobody binds.
+        yi_agent_lifecycle::scope::daemon_socket(&self.runtime, &self.home)
     }
 }
 

@@ -88,7 +88,12 @@ impl IsolatedRuntimeFixture {
     /// a lifecycle that only appears when `YI_AGENT_BRINGUP=managed` is present is
     /// not the lifecycle that ships.
     fn start_without_bringup_env() -> anyhow::Result<Self> {
-        let root = tempfile::TempDir::new()?;
+        // `/private/tmp` rather than the default temp dir: the guardian control socket
+        // and the business socket both live under `<instance_home>/sockets/<hash>/`,
+        // and macOS's default temp dir (68 bytes) plus that tail overflows `sun_path`.
+        let root = tempfile::Builder::new()
+            .prefix("mpi")
+            .tempdir_in("/private/tmp")?;
         let workdir = root.path().join("repository");
         let runtime_dir = root.path().join("runtime");
         let instance_home = root.path().join("instance");
@@ -173,7 +178,10 @@ impl IsolatedRuntimeFixture {
             key: self.runtime_dir.to_string_lossy().into_owned(),
             runtime_dir: self.runtime_dir.clone(),
             project_key: self.workdir.to_string_lossy().into_owned(),
-            instance_home: self.instance_home.clone(),
+            // The `.yi-agent` directory itself, matching what a child derives from
+            // `YI_AGENT_HOME` above; the bare parent would claim a different instance
+            // home than the processes this fixture launches.
+            instance_home: self.instance_home.join(".yi-agent"),
         }
     }
 
@@ -227,7 +235,7 @@ impl IsolatedRuntimeFixture {
                 .iter()
                 .all(|owned| !self.same_process_alive(&owned.identity));
             let lock_free = runtime_lock_is_free(&self.runtime_dir);
-            let service_quiet = !service_answers(&self.runtime_dir);
+            let service_quiet = !service_answers(&self.runtime_dir, &self.instance_home);
             if tree_gone && lock_free && service_quiet {
                 return Ok(());
             }
@@ -368,8 +376,15 @@ fn runtime_lock_is_free(runtime_dir: &Path) -> bool {
 ///
 /// A socket file on disk is not a service. Connecting is the honest question, and a
 /// connect that is refused means the runtime is not serving.
-fn service_answers(runtime_dir: &Path) -> bool {
-    let socket = runtime_dir.join("runtime.sock");
+fn service_answers(runtime_dir: &Path, instance_home: &Path) -> bool {
+    // The business socket lives under the instance home, not beside the runtime
+    // directory: `<instance_home>/sockets/<16 hex>/runtime.sock`.
+    let instance_home = if instance_home.ends_with(".yi-agent") {
+        instance_home.to_path_buf()
+    } else {
+        instance_home.join(".yi-agent")
+    };
+    let socket = yi_agent_lifecycle::scope::daemon_socket(runtime_dir, &instance_home);
     if !socket.exists() {
         return false;
     }
@@ -950,7 +965,7 @@ impl TuiTerminal {
     fn await_runtime_attached(&mut self, fixture: &IsolatedRuntimeFixture) -> anyhow::Result<()> {
         let deadline = Instant::now() + START_BUDGET;
         loop {
-            if service_answers(&fixture.runtime_dir) {
+            if service_answers(&fixture.runtime_dir, &fixture.instance_home) {
                 // Answering the control channel means the runtime is up and *this*
                 // client finished attaching: `attach_root`, `bind_driver` and
                 // `open_managed_channel` all precede the socket being usable by it.
@@ -1872,7 +1887,7 @@ fn a_dead_launcher_sidecar_does_not_stop_a_working_runtime() -> anyhow::Result<(
         "the launcher's death stopped work a still-attached frontend was running"
     );
     assert!(
-        service_answers(&fixture.runtime_dir),
+        service_answers(&fixture.runtime_dir, &fixture.instance_home),
         "the runtime stopped serving after its launcher died"
     );
     assert_eq!(

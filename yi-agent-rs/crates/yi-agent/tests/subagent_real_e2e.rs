@@ -14,6 +14,9 @@ struct RealRuntimeFixture {
     fixture_root: tempfile::TempDir,
     repository: PathBuf,
     runtime_dir: PathBuf,
+    /// Where the daemon actually bound: `<instance_home>/sockets/<hash>/runtime.sock`.
+    /// Carrying it here keeps every caller off the old `<runtime_dir>/runtime.sock`.
+    socket: PathBuf,
     daemon: Child,
 }
 
@@ -25,7 +28,10 @@ impl Drop for RealRuntimeFixture {
 }
 
 fn start_real_runtime_fixture(config: Option<&RealLlmTestConfig>) -> RealRuntimeFixture {
-    let fixture_root = tempfile::TempDir::new().expect("fixture tempdir");
+    let fixture_root = tempfile::Builder::new()
+        .prefix("sre")
+        .tempdir_in("/private/tmp")
+        .expect("fixture tempdir");
     let repository = fixture_root.path().join("repository");
     std::fs::create_dir(&repository).expect("create fixture repository directory");
     initialize_repository(&repository);
@@ -35,21 +41,56 @@ fn start_real_runtime_fixture(config: Option<&RealLlmTestConfig>) -> RealRuntime
     if let Some(config) = config {
         config.apply_to_command(&mut command);
     } else {
+        // `--model` is not optional once the instance home is isolated: with no
+        // catalog to fall back on, an empty model name stops the daemon at
+        // *模型未配置* before it binds.
         command
             .arg("--provider")
             .arg("anthropic")
             .arg("--api-url")
             .arg("http://127.0.0.1:9")
             .arg("--api-key")
-            .arg("test-only-runtime-key");
+            .arg("test-only-runtime-key")
+            .arg("--model")
+            .arg("fixture-model");
     }
+    // Its own instance home, so this fixture never touches the developer's
+    // `~/.yi-agent`: with the socket under `<instance_home>/sockets/`, an inherited
+    // home would put a test socket in a real installation.
+    let instance_home = fixture_root.path().join("instance/.yi-agent");
+    std::fs::create_dir_all(&instance_home).expect("create fixture instance home");
+    // An isolated instance home starts empty, and an empty catalog sends the daemon
+    // down the interactive onboarding path (*模型未配置*) before it ever binds. Write
+    // the catalog that prompt would have produced: nothing listens at `api_url` on
+    // purpose, these tests need a live runtime, not an answer.
+    std::fs::write(
+        instance_home.join("models.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "models": [{
+                "name": "fixture",
+                "provider": "openai",
+                "api_url": "http://127.0.0.1:9",
+                "model": "gpt-4o",
+                "api_key": "test-key"
+            }],
+            "default_model": "fixture"
+        }))
+        .expect("serialise fixture catalog"),
+    )
+    .expect("write fixture catalog");
+    std::fs::write(
+        instance_home.join("preferences.json"),
+        br#"{"onboarding_dismissed":true}"#,
+    )
+    .expect("write fixture preferences");
     let daemon = command
         .arg("daemon")
         .arg("serve")
         .env("YI_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("YI_AGENT_HOME", &instance_home)
         .spawn()
         .expect("start isolated runtime daemon");
-    let socket = runtime_dir.join("runtime.sock");
+    let socket = yi_agent_lifecycle::scope::daemon_socket(&runtime_dir, &instance_home);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if matches!(
@@ -68,6 +109,7 @@ fn start_real_runtime_fixture(config: Option<&RealLlmTestConfig>) -> RealRuntime
         fixture_root,
         repository,
         runtime_dir,
+        socket,
         daemon,
     }
 }
@@ -122,7 +164,10 @@ fn initialize_repository(repository: &Path) {
 }
 
 fn temporary_repository() -> tempfile::TempDir {
-    let repository = tempfile::TempDir::new().expect("tempdir");
+    let repository = tempfile::Builder::new()
+        .prefix("srr")
+        .tempdir_in("/private/tmp")
+        .expect("tempdir");
     initialize_repository(repository.path());
     repository
 }
@@ -330,11 +375,11 @@ fn await_child_completion(
 #[test]
 fn local_runtime_fixture_uses_a_tempdir_socket() {
     let fixture = start_real_runtime_fixture(None);
-    let socket = fixture.runtime_dir.join("runtime.sock");
+    let socket = &fixture.socket;
     assert!(socket.exists(), "fixture daemon must create a socket");
     assert!(fixture.runtime_dir.starts_with(fixture.fixture_root.path()));
     assert!(matches!(
-        send_request(&socket, IpcRequest::Status).expect("fixture daemon status"),
+        send_request(socket, IpcRequest::Status).expect("fixture daemon status"),
         IpcResponse::Status { .. }
     ));
 }
@@ -342,9 +387,9 @@ fn local_runtime_fixture_uses_a_tempdir_socket() {
 #[test]
 fn temporary_repository_allows_an_application_root_worktree() {
     let fixture = start_real_runtime_fixture(None);
-    let socket = fixture.runtime_dir.join("runtime.sock");
+    let socket = &fixture.socket;
     let response = send_request(
-        &socket,
+        socket,
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "fixture-root-worktree".into(),
             workspace: fixture.repository.clone(),
@@ -401,9 +446,9 @@ fn real_subagent_merges_delivery_into_parent_history() {
         &fixture,
         "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Call wait_agent with mode \"all\" and then merge the delivered commit into the history of the checkout you started the run in with git merge --no-ff <commit> from the child's completion report. Run that merge yourself in that same checkout, not in delivery-worktree; do not leave the delivered commit unmerged.",
     );
-    let socket = fixture.runtime_dir.join("runtime.sock");
-    let child_id = await_direct_child(&socket, &mut run);
-    let delivery = await_child_completion(&socket, &fixture.repository, &child_id);
+    let socket = &fixture.socket;
+    let child_id = await_direct_child(socket, &mut run);
+    let delivery = await_child_completion(socket, &fixture.repository, &child_id);
     let delivery_json: serde_json::Value =
         serde_json::from_str(&delivery.delivery_json).expect("child delivery JSON");
     let child_head = delivery_json["commit"]

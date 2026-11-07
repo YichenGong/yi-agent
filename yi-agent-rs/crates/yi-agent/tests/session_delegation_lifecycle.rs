@@ -235,7 +235,10 @@ fn run_headless_once(
 
 #[test]
 fn session_delegation_lifecycle_headless_entry_uses_container_context() {
-    let directory = tempfile::tempdir().expect("a temp dir");
+    let directory = tempfile::Builder::new()
+        .prefix("sdl")
+        .tempdir_in("/private/tmp")
+        .expect("a temp dir");
     let gateway = SpawnGateway::start();
     let runtime = directory.path().join("runtime");
     let output = run_headless_once(directory.path(), &gateway, PARENT_SPAWN_ONCE, None);
@@ -315,7 +318,10 @@ fn session_delegation_lifecycle_headless_entry_uses_container_context() {
 /// ever runs one process cannot see it.
 #[test]
 fn session_delegation_lifecycle_restarted_host_still_spawns_in_the_same_conversation() {
-    let directory = tempfile::tempdir().expect("a temp dir");
+    let directory = tempfile::Builder::new()
+        .prefix("sdl")
+        .tempdir_in("/private/tmp")
+        .expect("a temp dir");
     let gateway = SpawnGateway::start();
     let runtime = directory.path().join("runtime");
 

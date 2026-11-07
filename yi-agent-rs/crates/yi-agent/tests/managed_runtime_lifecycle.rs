@@ -82,7 +82,14 @@ impl RuntimeHarness {
     }
 
     fn start_with_layout(layout: Layout) -> anyhow::Result<Self> {
-        let root = tempfile::TempDir::new()?;
+        // `/tmp` rather than the default temp dir: the socket lives at
+        // `<instance_home>/sockets/<16 hex>/guardian-control.sock`, and macOS's
+        // default temp dir resolves to `/private/var/folders/<...>/T/.tmpXXXXXX`
+        // (68 bytes) — plus `instance` and the 47-byte tail that is already past
+        // the 103-byte `sun_path` cap. `/tmp` gives the same guard ~30 bytes nimbler.
+        let root = tempfile::Builder::new()
+            .prefix("mrl")
+            .tempdir_in("/private/tmp")?;
         let workdir = root.path().join("repository");
         // `Deep` reproduces the production shape `$tempdir/<90 bytes>/runtime`, whose
         // `guardian-control.sock` overflows `sockaddr_un.sun_path`. `Flat` keeps the
@@ -161,20 +168,30 @@ impl RuntimeHarness {
         Ok(harness)
     }
 
+    /// The instance directory itself, as `YI_AGENT_HOME`'s derived form.
+    fn agent_root(&self) -> PathBuf {
+        self.instance_home.join(".yi-agent")
+    }
+
     fn scope(&self) -> RuntimeScope {
         RuntimeScope {
             key: self.runtime_dir.to_string_lossy().into_owned(),
             runtime_dir: self.runtime_dir.clone(),
             project_key: self.workdir.to_string_lossy().into_owned(),
-            instance_home: self.instance_home.clone(),
+            // The `.yi-agent` directory itself, matching what a child process derives
+            // from `YI_AGENT_HOME` (`store::paths::instance_home()` appends it). A
+            // scope carrying the bare parent would record a different instance home
+            // than the binary it launches, and the claim check refuses that.
+            instance_home: self.agent_root(),
         }
     }
 
     fn control_socket(&self) -> PathBuf {
-        // Resolved the way production resolves it: for a deep runtime directory the
-        // socket lives outside it, and a harness that joined the file name itself
-        // would wait forever for a socket nobody was going to create there.
-        yi_agent_lifecycle::scope::control_path(&self.runtime_dir)
+        // Derived from the same home production derives from `YI_AGENT_HOME`, not
+        // from a fresh environment read: the harness starts real child processes
+        // with that variable set to this directory, and re-reading it would make the
+        // test depend on the machine it runs on.
+        yi_agent_lifecycle::scope::guardian_socket(&self.runtime_dir, &self.agent_root())
     }
 
     /// Starts the runtime through the *production* bring-up path.
@@ -751,7 +768,14 @@ struct IsolatedProject {
 
 impl IsolatedProject {
     fn new() -> anyhow::Result<Self> {
-        let root = tempfile::TempDir::new()?;
+        // `/tmp` rather than the default temp dir: the socket lives at
+        // `<instance_home>/sockets/<16 hex>/guardian-control.sock`, and macOS's
+        // default temp dir resolves to `/private/var/folders/<...>/T/.tmpXXXXXX`
+        // (68 bytes) — plus `instance` and the 47-byte tail that is already past
+        // the 103-byte `sun_path` cap. `/tmp` gives the same guard ~30 bytes nimbler.
+        let root = tempfile::Builder::new()
+            .prefix("mrl")
+            .tempdir_in("/private/tmp")?;
         let workdir = root.path().join("repository");
         let instance_home = root.path().join("instance");
         let home = root.path().join("home");

@@ -38,7 +38,7 @@ fn scope(directory: &TempDir) -> RuntimeScope {
         key: directory.path().to_string_lossy().into_owned(),
         runtime_dir: directory.path().to_path_buf(),
         project_key: "/project".to_string(),
-        instance_home: directory.path().to_path_buf(),
+        instance_home: support::short_instance_home(directory.path()),
     }
 }
 
@@ -51,7 +51,7 @@ fn guardian(directory: &TempDir) -> Guardian {
 fn identity_does_not_create_a_runtime() {
     let directory = TempDir::new().unwrap();
     let scope = scope(&directory);
-    let path = scope.runtime_dir.join("guardian-control.sock");
+    let path = yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let artifact = artifact();
     let deadline = Deadline::after(Duration::from_secs(5));
 
@@ -114,7 +114,9 @@ fn a_second_guardian_cannot_steal_the_control_socket() {
 #[test]
 fn a_non_socket_path_is_never_replaced() {
     let directory = TempDir::new().unwrap();
-    let path = directory.path().join("guardian-control.sock");
+    let scope = scope(&directory);
+    let path = yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"not a socket").unwrap();
     let deadline = Deadline::after(Duration::from_secs(2));
     let error = guardian(&directory).bind_control(&deadline).unwrap_err();
@@ -193,7 +195,10 @@ fn release_reclaims_before_answering() {
 fn the_serving_guardian_honours_plugin_demand() {
     let directory = TempDir::new().unwrap();
     let runtime_scope = scope(&directory);
-    let path = runtime_scope.runtime_dir.join("guardian-control.sock");
+    let path = yi_agent_lifecycle::scope::guardian_socket(
+        &runtime_scope.runtime_dir,
+        &runtime_scope.instance_home,
+    );
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_server = stop.clone();
     let served_scope = runtime_scope.clone();

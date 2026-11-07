@@ -55,9 +55,7 @@ fn start_guardian(
     std::thread::JoinHandle<std::io::Result<()>>,
 ) {
     let scope = scope(directory);
-    let path = scope
-        .runtime_dir
-        .join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+    let path = yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let artifact = artifact();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_server = stop.clone();
@@ -93,7 +91,10 @@ fn stop_guardian(
 /// owner the guardian bound rather than the one the caller claimed.
 #[test]
 fn a_business_lease_opens_a_channel_bound_to_its_own_owner() {
-    let directory = TempDir::new().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("mca")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let (path, stop, server) = start_guardian(&directory);
     let deadline = Deadline::after(Duration::from_secs(5));
 
@@ -127,7 +128,10 @@ fn a_business_lease_opens_a_channel_bound_to_its_own_owner() {
 /// channel here would make the mode advisory.
 #[test]
 fn a_lease_only_observer_is_refused_a_channel() {
-    let directory = TempDir::new().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("mca")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let (path, stop, server) = start_guardian(&directory);
     let deadline = Deadline::after(Duration::from_secs(5));
 
@@ -158,7 +162,10 @@ fn a_lease_only_observer_is_refused_a_channel() {
 /// an identity the guardian already withdrew.
 #[test]
 fn a_released_client_cannot_open_a_channel() {
-    let directory = TempDir::new().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("mca")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let (path, stop, server) = start_guardian(&directory);
     let deadline = Deadline::after(Duration::from_secs(5));
 

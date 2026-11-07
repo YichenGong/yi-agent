@@ -18,6 +18,8 @@ use yi_agent_lifecycle::types::{
 };
 use yi_agent_supervisors::lifecycle::guardian::{Guardian, STATUS_CLIENT_PAGE, serve_one_for_test};
 
+mod support;
+
 fn artifact() -> ArtifactIdentity {
     ArtifactIdentity {
         build_id: "test-build".into(),
@@ -38,7 +40,7 @@ fn scope(directory: &std::path::Path) -> RuntimeScope {
         key: directory.to_string_lossy().into_owned(),
         runtime_dir: directory.to_path_buf(),
         project_key: "/project".into(),
-        instance_home: directory.to_path_buf(),
+        instance_home: support::short_instance_home(directory),
     }
 }
 
@@ -52,7 +54,8 @@ fn spawn_guardian(
     let deadline = Deadline::after(Duration::from_secs(2));
     let listener = guardian.bind_control(&deadline).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let socket = scope.runtime_dir.join("guardian-control.sock");
+    let socket =
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let handle = std::thread::spawn(move || {
         let mut guardian = guardian;
         while !stop.load(Ordering::SeqCst) {

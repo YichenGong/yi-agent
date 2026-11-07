@@ -120,12 +120,16 @@ impl Harness {
     /// Starts a guardian whose control loop serves a real socket, then registers
     /// this test as a client through that socket.
     fn start(clients: &[&str]) -> Self {
-        let directory = TempDir::new().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("rrp")
+            .tempdir_in("/private/tmp")
+            .unwrap();
         let runtime_scope = scope(&directory);
         let artifact = artifact();
-        let socket = runtime_scope
-            .runtime_dir
-            .join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+        let socket = yi_agent_lifecycle::scope::guardian_socket(
+            &runtime_scope.runtime_dir,
+            &runtime_scope.instance_home,
+        );
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_server = stop.clone();
         let scope_for_server = runtime_scope.clone();
@@ -509,7 +513,10 @@ fn a_refused_confirmation_leaves_no_barrier() {
 #[test]
 fn a_vanished_target_is_refused_before_anything_starts() {
     let harness = Harness::start(&["app"]);
-    let directory = TempDir::new().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("rrp")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let missing = directory.path().join("no-such-binary");
     let mut target = target_artifact();
     target.executable = missing;
@@ -554,12 +561,14 @@ fn a_confirmation_without_an_operation_id_is_refused() {
 /// lets an incompatible build still guide the user through an upgrade.
 #[test]
 fn a_lease_only_client_can_preview() {
-    let directory = TempDir::new().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("rrp")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let scope = scope(&directory);
     let artifact = artifact();
-    let socket = scope
-        .runtime_dir
-        .join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+    let socket =
+        yi_agent_lifecycle::scope::guardian_socket(&scope.runtime_dir, &scope.instance_home);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_server = stop.clone();
     let scope_for_server = scope.clone();
