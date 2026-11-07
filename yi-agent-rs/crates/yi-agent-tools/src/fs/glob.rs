@@ -360,8 +360,11 @@ mod tests {
             .await;
 
         let text = text_result(&result);
+        // Line equality, not `contains`: `contains("Cargo.toml")` is already
+        // satisfied by the deep `a/b/c/Cargo.toml`, so it would keep passing
+        // even if zero-depth matching broke.
         assert!(
-            text.contains("Cargo.toml"),
+            text.lines().any(|line| line == "Cargo.toml"),
             "zero depth must match, got: {text}"
         );
         assert!(
