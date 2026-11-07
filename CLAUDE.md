@@ -142,11 +142,12 @@ codesign -v "$APP"   # 应 exit 0
   执行或在 commit 前先 `cargo fmt --all && git add ...`。
 - **提交前必须自检 `just ci` 全绿**(在 `yi-agent-rs/` 下),合并到 `main` 后再
   在合并结果上跑一次。它是 CI 的唯一入口(GitHub PR / GitLab MR 都只跑它),
-  涵盖 16 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
+  涵盖 22 道门禁:`fmt-check`、`lint`(`clippy --all-targets`,含测试代码)、
   `test`、`build`、`bindings-check`、`secret-check`、`msrv-check`(用
   `rust-version` 声明的工具链真编一遍,脚本 `yi-agent-rs/scripts/check-msrv.sh`)、
-  `audit`(`cargo audit`,豁免清单在 `yi-agent-rs/.cargo/audit.toml`)
-  等。实际清单以 `yi-agent-rs/justfile` 的 `ci:` 行为准(共 16 项依赖)。少跑
+  `reclaim-check`、`affected-check`、`audit`(`cargo audit`,豁免清单在
+  `yi-agent-rs/.cargo/audit.toml`)等。实际清单以 `yi-agent-rs/justfile` 的
+  `ci:` 行为准(共 22 项依赖,**改了 `ci:` 的依赖务必同步这一行**)。少跑
   一次就可能让 `main` 直接变红;本地几分钟,比事后回滚便宜。
 
   **改依赖后必须同步 `rust-version`**:它只声明、不校验,写错了没有门禁会报
@@ -172,6 +173,22 @@ Cargo 的 `target/` 不会自动回收,长时间不清理单仓库就能吃掉�
   du -sh .worktrees/*/yi-agent-rs/target      # 各 worktree
   df -h .                                     # 剩余空间
   ```
+
+- **首选 `just reclaim`,不要整体 `cargo clean`。** 它会按判据只删真垃圾,
+  保留活跃产物(整体 `cargo clean` 要全量重编十几分钟):
+
+  ```bash
+  cd yi-agent-rs
+  just reclaim                              # 预演,只报告不删
+  just reclaim --apply                      # 真删
+  just reclaim --apply --include-worktrees  # 连 .worktrees/* 的 target 一起
+  just reclaim --apply --prune-units 1      # 额外裁掉多余单元目录(会增加重编)
+  ```
+
+  四个判据: D1 旧增量会话、D2 孤儿与未被引用的 `.o`、D3 `--prune-units=N`
+  多余单元目录(默认关)、D4 陈旧二进制与 dSYM。带 `--min-age 600`(跳过刚
+  写出的文件)和 `.cargo-build-lock` 并发护栏,`--apply` 时才真删;有编译在跑
+  会拒绝执行,要强行跑加 `--force`。
 
 - **粒度选择**(在 `yi-agent-rs/` 下执行):
 

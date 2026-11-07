@@ -77,3 +77,11 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# macOS 上 dev profile 默认 split-debuginfo = "unpacked"，会把每个 CGU 的
+# DWARF 落成 deps/*.rcgu.o。文件名带 hash，旧 hash 的 .o 永不回收，目录会
+# 随重编无限膨胀。实测本目录曾有 7,044 个 .o（642 MB），target 合计 12 GB。
+# packed 把 DWARF 直接打包进 rlib，不再落 .o。详见 yi-agent-rs/Cargo.toml
+# 同名注释与 docs/superpowers/specs/2026-11-07-build-disk-usage-design.md。
+[profile.dev]
+split-debuginfo = "packed"
