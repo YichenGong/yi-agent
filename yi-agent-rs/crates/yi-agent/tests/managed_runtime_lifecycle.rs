@@ -33,7 +33,7 @@ use yi_agent_lifecycle::deadline::Deadline;
 use yi_agent_lifecycle::types::{
     ArtifactIdentity, ClientKind, ControlRequest, ControlResponse, LeaseMode, RuntimeScope,
 };
-use yi_agent_supervisors::lifecycle::guardian::{GUARDIAN_SOCKET_FILE, serve};
+use yi_agent_supervisors::lifecycle::guardian::serve;
 
 /// A client that has quit must show up in the guardian's records well inside the
 /// 30 s lease expiry; a longer budget would let expiry produce the same record and
@@ -66,11 +66,35 @@ struct RuntimeHarness {
     artifact: ArtifactIdentity,
 }
 
+/// Where the runtime directory sits relative to the fixture root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// `$root/runtime` — short enough for the socket to live beside it.
+    Flat,
+    /// `$root/<90 bytes>/.yi-agent/runtime` — the production shape for a deep
+    /// checkout, where the direct socket path overflows `sun_path`.
+    Deep,
+}
+
 impl RuntimeHarness {
     fn start() -> anyhow::Result<Self> {
+        Self::start_with_layout(Layout::Flat)
+    }
+
+    fn start_with_layout(layout: Layout) -> anyhow::Result<Self> {
         let root = tempfile::TempDir::new()?;
         let workdir = root.path().join("repository");
-        let runtime_dir = root.path().join("runtime");
+        // `Deep` reproduces the production shape `$tempdir/<90 bytes>/runtime`, whose
+        // `guardian-control.sock` overflows `sockaddr_un.sun_path`. `Flat` keeps the
+        // short layout the other tests were written against.
+        let runtime_dir = match layout {
+            Layout::Flat => root.path().join("runtime"),
+            Layout::Deep => root
+                .path()
+                .join("d".repeat(90))
+                .join(".yi-agent")
+                .join("runtime"),
+        };
         let instance_home = root.path().join("instance");
         let home = root.path().join("home");
         std::fs::create_dir_all(&workdir)?;
@@ -147,7 +171,10 @@ impl RuntimeHarness {
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.runtime_dir.join(GUARDIAN_SOCKET_FILE)
+        // Resolved the way production resolves it: for a deep runtime directory the
+        // socket lives outside it, and a harness that joined the file name itself
+        // would wait forever for a socket nobody was going to create there.
+        yi_agent_lifecycle::scope::control_path(&self.runtime_dir)
     }
 
     /// Starts the runtime through the *production* bring-up path.
@@ -381,6 +408,65 @@ fn ask(socket: &Path, request: &ControlRequest) -> ControlResponse {
     let deadline = Deadline::after(Duration::from_secs(5));
     let mut client = ControlClient::connect(socket, &deadline).expect("connect to guardian");
     client.request(request, &deadline).expect("control request")
+}
+
+/// The regression this fixture exists to keep: a deep checkout used to make the
+/// guardian unable to bind its control socket at all.
+///
+/// `sockaddr_un.sun_path` is capped (104 bytes on macOS/BSD, 108 on Linux), and the
+/// default runtime directory is `<workdir>/.yi-agent/runtime`. For a project path of
+/// roughly 85 bytes or more, `<runtime_dir>/guardian-control.sock` overflows that cap
+/// and `bind` fails with `AF_UNIX path too long`.
+///
+/// What made it a *silent* disaster rather than a clear error: the launcher spawns
+/// the guardian with stderr discarded. The guardian exited immediately, nothing ever
+/// answered the control socket, and every caller waited out the full 30-second
+/// startup budget before reporting "the managed runtime did not become ready" —
+/// a stall on session start, followed by delegation being switched off for the whole
+/// session.
+///
+/// So this asserts the two things a user actually perceives: the real production
+/// bring-up connects, and it does so promptly rather than after a timeout.
+#[test]
+fn a_guardian_starts_for_a_runtime_directory_too_deep_for_a_direct_socket() -> anyhow::Result<()> {
+    let harness = RuntimeHarness::start_with_layout(Layout::Deep)?;
+
+    // Precondition, stated rather than assumed: the direct socket really is too long.
+    let direct = harness
+        .runtime_dir
+        .join(yi_agent_lifecycle::GUARDIAN_SOCKET_FILE);
+    assert!(
+        direct.as_os_str().len() > yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES,
+        "precondition: the direct control socket must overflow sun_path, got {} bytes: {}",
+        direct.as_os_str().len(),
+        direct.display()
+    );
+
+    // The resolved socket must be outside the overflowing directory and short enough
+    // for the kernel to accept.
+    let resolved = harness.control_socket();
+    assert_ne!(resolved, direct, "a deep path must move the socket");
+    assert!(
+        resolved.as_os_str().len() <= yi_agent_lifecycle::scope::MAX_SOCKET_PATH_BYTES,
+        "the resolved socket must fit sun_path, got {} bytes: {}",
+        resolved.as_os_str().len(),
+        resolved.display()
+    );
+
+    // The harness start already ran the production `ensure_managed` bring-up, so
+    // reaching here means the guardian bound and answered. Confirm the channel is
+    // live, and identify the guardian as this build.
+    match ask(&harness.control_socket(), &ControlRequest::Identity) {
+        ControlResponse::Identity(identity) => {
+            assert_eq!(
+                identity.guardian_build_id.as_deref(),
+                Some(harness.artifact().build_id.as_str()),
+                "the guardian that answered must be the build this test authorised"
+            );
+        }
+        other => panic!("identity must answer with an identity: {other:?}"),
+    }
+    Ok(())
 }
 
 /// A real guardian serves a real scope, and identifies itself with this build.

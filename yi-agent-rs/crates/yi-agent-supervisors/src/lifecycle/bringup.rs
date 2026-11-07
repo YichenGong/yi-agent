@@ -222,10 +222,12 @@ pub fn interpret(
 }
 
 /// The control socket for a scope.
+///
+/// Delegates to `yi-agent-lifecycle` rather than joining the file name again: the
+/// lifecycle crate owns the `sun_path` fallback, and a second copy of that rule here
+/// would eventually disagree with the one the guardian binds.
 pub fn control_path(scope: &RuntimeScope) -> PathBuf {
-    scope
-        .runtime_dir
-        .join(super::guardian::GUARDIAN_SOCKET_FILE)
+    yi_agent_lifecycle::scope::control_path(&scope.runtime_dir)
 }
 
 /// Brings a runtime up (or reports why it cannot) using the real process,

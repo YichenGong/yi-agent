@@ -29,6 +29,11 @@
 # (unix socket, instance lock, runtime.sqlite and its -wal/-shm sidecars)
 .yi-agent/
 
+# Per-thread resume secrets the app-server writes under the workdir. Each file
+# holds a live `resume-*` capability, so committing one would publish a working
+# credential; they are runtime state, never source.
+.session-identities/
+
 # Git worktrees (isolated workspaces)
 .worktrees/
 

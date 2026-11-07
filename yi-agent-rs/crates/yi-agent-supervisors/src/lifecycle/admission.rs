@@ -17,8 +17,6 @@ use yi_agent_lifecycle::client::ControlClient;
 use yi_agent_lifecycle::deadline::Deadline;
 use yi_agent_lifecycle::types::{ClientGrant, ControlRequest, ControlResponse, ExecutionAdmission};
 
-use super::guardian::GUARDIAN_SOCKET_FILE;
-
 /// Per-ask budget. Admission sits in the path of a Start, so it must be short: a
 /// wedged guardian should refuse work, not stall the coordinator.
 pub const ADMISSION_BUDGET: Duration = Duration::from_secs(2);
@@ -33,7 +31,9 @@ impl GuardianAdmission {
     /// Binds one client's grant to the guardian socket of `runtime_dir`.
     pub fn new(runtime_dir: &Path, grant: ClientGrant) -> Self {
         Self {
-            socket: runtime_dir.join(GUARDIAN_SOCKET_FILE),
+            // Through the lifecycle resolver: the control socket can move out of the
+            // runtime directory when its path overflows `sun_path`.
+            socket: yi_agent_lifecycle::scope::control_path(runtime_dir),
             grant,
         }
     }
