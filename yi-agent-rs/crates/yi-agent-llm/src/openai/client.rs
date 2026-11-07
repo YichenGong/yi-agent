@@ -135,10 +135,9 @@ impl OpenaiProvider {
 
         // 同 anthropic：连接与「无输出」各有时限，但一条正在持续输出的流不设
         // 总期限（`.timeout()` 会在 300 秒处把长回答硬砍断）。
-        let client = reqwest::Client::builder()
-            .connect_timeout(timeout)
-            .read_timeout(timeout)
-            .build()
+        // 归一化已在上面完成（`trim_end_matches('/')`），这里直接用。
+        // 共享池让新会话不再重付 TCP+TLS 握手。
+        let client = crate::http::shared_client(&base_url, timeout)
             .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))?;
 
         Ok(Self {
@@ -151,6 +150,15 @@ impl OpenaiProvider {
             channel_cache: Arc::new(Mutex::new(HashMap::new())),
             effort_reject_cache: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// 内部 client 的只读访问，供测试断言连接复用。
+    ///
+    /// 生产代码一律走 `call_stream`，不直接用它——暴露引用而不是 clone，
+    /// 避免调用方误以为拿到的是独立池。
+    #[doc(hidden)]
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     /// Decide which endpoint this request should target.

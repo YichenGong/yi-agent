@@ -108,3 +108,39 @@ async fn different_base_urls_are_isolated() {
     assert_eq!(one.path_hits("/chat/completions"), 1);
     assert_eq!(two.path_hits("/chat/completions"), 1);
 }
+
+use yi_agent_llm::{OpenaiProvider, OpenaiProviderOpts};
+
+/// 真正的验收点：两个 provider（不同 api_key）共用同一条 TCP 连接。
+#[tokio::test]
+async fn two_providers_share_one_connection() {
+    let server = ConnCounter::start(vec![("/v1/chat/completions", 200, Body::Empty)]).await;
+    let base = format!("{}/v1", server.uri());
+
+    for key in ["key-one", "key-two"] {
+        let provider = OpenaiProvider::new(OpenaiProviderOpts {
+            base_url: Some(base.clone()),
+            api_key: Some(key.to_string()),
+            timeout: Some(Duration::from_secs(5)),
+            api_style: Some("chat".into()),
+            ..Default::default()
+        })
+        .expect("provider construction");
+
+        // 只发请求不消费流：body 是否合法 SSE 与连接复用无关。
+        let _ = provider
+            .client()
+            .post(format!("{base}/chat/completions"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("request should succeed");
+    }
+
+    assert_eq!(
+        server.accepts(),
+        1,
+        "two providers with the same base_url and timeout must share one connection"
+    );
+}
