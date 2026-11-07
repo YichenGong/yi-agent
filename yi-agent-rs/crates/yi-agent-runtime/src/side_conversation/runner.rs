@@ -577,6 +577,7 @@ impl Pump {
         let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(deadline);
         let mut timed_out = false;
+        let mut run_error = None;
         // `CancellationToken::cancelled()` stays ready forever once cancelled: without
         // this latch the biased branch would win every iteration and the pump would
         // never read the run's terminal event (so it could never join). The token is
@@ -599,6 +600,20 @@ impl Pump {
                 next = events.next() => {
                     let Some(queued) = next else { break };
                     self.account(queued.event());
+                    if let AgentEvent::Error(error) = queued.event() {
+                        // Provider errors can contain response bodies and credentials.
+                        // Preserve the failed state, but publish only a safe summary.
+                        run_error = Some(match error {
+                            yi_agent_core::AgentError::Budget(_) => SideError::new(
+                                SideErrorReason::ResourceLimit,
+                                "旁问本轮已达到资源上限，请关闭后重新开启旁问",
+                            ),
+                            _ => SideError::new(
+                                SideErrorReason::TurnFailed,
+                                "旁问本轮调用失败，请检查模型配置或稍后重试",
+                            ),
+                        });
+                    }
                     let terminal = is_terminal(queued.event());
                     if self.consumer_open {
                         let frame = SideRunnerEvent {
@@ -632,7 +647,7 @@ impl Pump {
                 "旁支本轮超过 10 分钟上限，已停止",
             ))
         } else {
-            None
+            run_error
         };
         let saw_usage = self
             .shared

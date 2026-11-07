@@ -26,6 +26,8 @@
 
 ## Features
 
+- [x] 旁问失败终态与安全反馈修复 — `src/side_conversation/runner.rs::Pump::run` 保留 `AgentEvent::Error`，不再把失败标成 Idle；仅发布安全摘要。runtime 定向回归 90 passed，app-server 105 passed，同步 main 后前端全套 2390 passed；真实后端与 React App 的 Chrome/隔离原生 WKWebView 安全失败提示均验收通过。完整 `just ci` 退出 0（依赖审计因网络失败使用既有缓存 fallback 并警告），正式 App 未部署。复验：`cargo test -p yi-agent-runtime --lib side_`；证据与剩余门禁见 [回归记录](../testing/side-transcript-feedback-regression.md)。
+
 - [x] crate 骨架 + workspace 注册 — `yi-agent-rs/crates/yi-agent-runtime/`；`Cargo.toml` members 含 `crates/yi-agent-runtime`
 - [x] `RuntimeConfig` + `ConfigOverrides` + `load()`（env/.env 层级合并，不依赖 clap）— `src/config.rs:13` / `src/config.rs:34` / `src/config.rs:169`
 - [x] sandbox 手写解析 + 变体漂移编译器守卫 — `src/config.rs:64`，测试 `src/config.rs:486`

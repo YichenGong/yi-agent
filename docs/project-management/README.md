@@ -21,11 +21,11 @@
 | yi-agent-mcp | 6 / 6 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 13 / 14 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
-| yi-agent-runtime | 27 / 28 | [详情](./yi-agent-runtime.md) · [清单刷新 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) |
+| yi-agent-runtime | 28 / 29 | [详情](./yi-agent-runtime.md) · [清单刷新 plan](../superpowers/plans/2026-11-03-supervisor-manifest-describe-bounds-impl.md) |
 | yi-agent-power | 12 / 12 | [详情](./yi-agent-power.md) |
 | yi-agent-plugins | 86 / 86 | [详情](./yi-agent-plugins.md) |
 | yi-agent-subagent | 12 / 12 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 85 / 85 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 86 / 86 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 66 / 76 | [详情](./subagent-runtime.md) · [会话委派解耦 spec](../superpowers/specs/2026-11-05-session-subagent-capability-design.md) · [实施计划](../superpowers/plans/2026-11-05-session-subagent-capability-impl.md) · [前台根生命周期 spec](../superpowers/specs/2026-11-03-foreground-root-lifecycle-design.md) · [plan](../superpowers/plans/2026-11-03-foreground-root-lifecycle-impl.md) |
 | yi-agent-lifecycle | 22 / 22 | [详情](./yi-agent-lifecycle.md) |
 | superpowers-kanban | 19 / 22 | [详情](./superpowers-kanban.md) · [查询 IPC 修复 spec](../superpowers/specs/2026-11-03-kanban-query-io-design.md) · [会话观测误报 spec](../superpowers/specs/2026-11-03-kanban-stale-observation-design.md) · [plan（已执行，待真机验收）](../superpowers/plans/2026-11-03-kanban-stale-observation-impl.md) |

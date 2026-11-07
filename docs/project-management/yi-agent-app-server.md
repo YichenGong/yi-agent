@@ -61,6 +61,8 @@ app-server 架构。本 crate 依赖 `yi-agent-core` / `yi-agent-runtime`，把 
 
 ## Features
 
+- [x] Desktop `/side` 正文与失败反馈修复 — `src/side_conversation/registry.rs::turn_start` 在启动前准备 ledger/transcript，成功后提交并广播问题；`source.rs::read_cold_parent` 按父会话模型选择与当前清单解析完整 provider 配置，而非复制显示模型串。runtime 定向回归 90 passed、app-server 105 passed；同步 main 后前端全套 2390 passed。真实 CLI → React App → Chrome 及隔离原生 WKWebView 均已验收问题、流式回答、完成回答及安全失败提示。三次独立审查无桌面路径阻断项；完整 `just ci` 退出 0（依赖审计因网络失败使用既有缓存 fallback 并警告），正式 App 未部署。复验：`cargo test -p yi-agent-app-server --lib side_`；见 [回归记录](../testing/side-transcript-feedback-regression.md)。
+
 - [x] **长历史 WebSocket 出口有界背压** — `broadcast.rs::Broadcaster::broadcast_await` 对历史与关键通知并发等待客户端入队：本地出口保持可靠等待，WebSocket 最多等待 10 秒，持续停滞才摘除，并由 `ws.rs` 的连接检测关闭；实时逐字流策略不变。判据：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib a_critical_notification_survives_a_full_outbound_queue`（本地/WS 满队列后关键帧完整送达）、`cargo test -p yi-agent-app-server --lib a_stalled_ws_is_removed_after_fast_clients_receive_the_critical_frame`（快端先收到当前帧、慢端有界剔除）。长历史完整生效还需更新中继和手机前端，见 [升级说明](../../deploy/relay/README.md)。真机弱网验收尚未执行。
 
 - [x] **驱动动作恢复原会话后续跑** — 设计见 [2026-11-03-kanban-merge-original-session-design.md](../superpowers/specs/2026-11-03-kanban-merge-original-session-design.md)，设计复核与[实施计划](../superpowers/plans/2026-11-03-kanban-merge-original-session.md)已完成，尚未实现。完成判据：通用 `resume_append` 保持原 thread ID，热会话不重建，冷会话恢复历史/配置并接入驱动观测；恢复失败不创建替代会话；宿主不解释看板业务。验证入口：`cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver`

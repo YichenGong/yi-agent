@@ -458,6 +458,52 @@ fn side_token_totals_saturate_instead_of_wrapping() {
     );
 }
 
+#[tokio::test]
+async fn side_provider_failure_is_failed_with_a_safe_error() {
+    struct RefusingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for RefusingProvider {
+        async fn call_stream(
+            &self,
+            _request: yi_agent_core::ProviderRequest,
+        ) -> Result<BoxStream<'static, yi_agent_core::ProviderEvent>, yi_agent_core::ProviderError>
+        {
+            Err(yi_agent_core::ProviderError::InvalidRequest(
+                "private provider response must not be published".into(),
+            ))
+        }
+    }
+
+    let fixture = Fixture::new();
+    let mut source =
+        crate::side_conversation::test_support::source_with_history("父问题", "父回答");
+    source.provider = Arc::new(RefusingProvider);
+    let mut runner = fixture.runner(source).await;
+    let stream = runner
+        .start_turn("turn-a".into(), "问题".into())
+        .await
+        .unwrap();
+    let events = drain(stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|frame| matches!(frame.event.event(), AgentEvent::Error(_)))
+    );
+    runner.wait_quiescent().await.unwrap();
+    assert_eq!(
+        runner.status(),
+        SideStatus::Failed,
+        "provider failure must not look idle"
+    );
+    let error = runner
+        .last_error()
+        .expect("failure must have visible feedback");
+    assert!(!error.message.is_empty());
+    assert!(!error.message.contains("private provider response"));
+    assert!(runner.last_turn_was_joined());
+}
+
 /// Provider that reports a fixed usage per reply.
 #[derive(Default)]
 struct UsageProvider {

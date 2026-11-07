@@ -108,6 +108,7 @@ pub enum SideErrorReason {
     SideCreating,
     RequestLimit,
     ResourceLimit,
+    TurnFailed,
     // --- reused generic reasons ---
     InvalidParams,
     TurnInProgress,
@@ -131,6 +132,7 @@ impl SideErrorReason {
             Self::SideCreating => "side_creating",
             Self::RequestLimit => "request_limit",
             Self::ResourceLimit => "resource_limit",
+            Self::TurnFailed => "turn_failed",
             Self::InvalidParams => "invalid_params",
             Self::TurnInProgress => "turn_in_progress",
             Self::InsufficientScope => "insufficient_scope",
