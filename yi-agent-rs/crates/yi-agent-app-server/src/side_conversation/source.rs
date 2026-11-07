@@ -83,9 +83,13 @@ impl SideParentResolver for WorkspaceResolver {
     fn resolve<'a>(&'a self, parent: &'a str) -> BoxFuture<'a, SideResult<EffectiveSideSource>> {
         Box::pin(async move {
             let store = crate::server::store_for(&self.workspaces, &self.base, parent);
-            ThreadStoreResolver::new(store, self.base.clone())
-                .resolve(parent)
-                .await
+            ThreadStoreResolver::new(
+                store,
+                self.base.clone(),
+                yi_agent_runtime::models::load_catalog(),
+            )
+            .resolve(parent)
+            .await
         })
     }
 }
@@ -231,6 +235,7 @@ pub fn read_cold_parent(
     store: &ThreadStore,
     parent: &str,
     base: &RuntimeConfig,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
 ) -> SideResult<ColdParent> {
     let snapshot = match store.read_side_snapshot_strict(parent) {
         Ok(Some(snapshot)) => snapshot,
@@ -258,10 +263,18 @@ pub fn read_cold_parent(
     };
 
     let cwd = PathBuf::from(&snapshot.meta.cwd);
-    let config = resolve_side_config(
+    // Match production_factory: the catalog display name selects a complete
+    // provider configuration. meta.model is only the last displayed wire model;
+    // copying it onto the unresolved base can send a side to the wrong endpoint.
+    let effective = yi_agent_runtime::models::resolve_effective(
         base,
+        catalog,
+        snapshot.meta.model_ref.as_deref(),
+    );
+    let config = resolve_side_config(
+        &effective,
         &cwd,
-        Some(&snapshot.meta.model),
+        None,
         snapshot.meta.reasoning_effort.as_deref(),
         snapshot.meta.preserve_thinking,
     )
@@ -354,6 +367,7 @@ pub fn source_from_live_agent(
 pub struct ThreadStoreResolver {
     store: Arc<ThreadStore>,
     base: RuntimeConfig,
+    catalog: yi_agent_runtime::models::ModelCatalog,
     /// 在每次「读前 / 装配后」两次取指纹之间运行。生产恒为 `None`。
     ///
     /// 存在的理由：重试路径只在「父恰好在读的窗口里变了」时才走到，靠真的起一个
@@ -363,10 +377,15 @@ pub struct ThreadStoreResolver {
 }
 
 impl ThreadStoreResolver {
-    pub fn new(store: Arc<ThreadStore>, base: RuntimeConfig) -> Self {
+    pub fn new(
+        store: Arc<ThreadStore>,
+        base: RuntimeConfig,
+        catalog: yi_agent_runtime::models::ModelCatalog,
+    ) -> Self {
         Self {
             store,
             base,
+            catalog,
             churn: None,
         }
     }
@@ -383,7 +402,7 @@ impl SideParentResolver for ThreadStoreResolver {
     fn resolve<'a>(&'a self, parent: &'a str) -> BoxFuture<'a, SideResult<EffectiveSideSource>> {
         Box::pin(async move {
             for attempt in 0..SIDE_COLD_ATTEMPTS {
-                let cold = read_cold_parent(&self.store, parent, &self.base)?;
+                let cold = read_cold_parent(&self.store, parent, &self.base, &self.catalog)?;
                 // 内容读完之后才让父变得「又不一样」：钩子正好落在
                 // 「读到内容」与「取指纹确认」之间，也就是真实竞态发生的那个窗口。
                 if let Some(churn) = &self.churn {

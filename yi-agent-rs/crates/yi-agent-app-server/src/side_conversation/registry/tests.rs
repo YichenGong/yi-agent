@@ -70,6 +70,35 @@ fn seed_parent(store: &ThreadStore, id: &str) {
 /// Returns the temp dirs so the caller keeps them alive: the store and the
 /// resource root both live under them.
 async fn registry_fixture() -> (TempDir, TempDir, SideRegistry) {
+    registry_fixture_with_provider(None).await
+}
+
+struct ProviderResolver {
+    inner: ThreadStoreResolver,
+    provider: Arc<dyn yi_agent_core::Provider>,
+}
+
+impl super::SideParentResolver for ProviderResolver {
+    fn resolve<'a>(
+        &'a self,
+        parent: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        yi_agent_runtime::side_conversation::SideResult<
+            yi_agent_runtime::side_conversation::EffectiveSideSource,
+        >,
+    > {
+        Box::pin(async move {
+            let mut source = self.inner.resolve(parent).await?;
+            source.provider = Arc::clone(&self.provider);
+            Ok(source)
+        })
+    }
+}
+
+async fn registry_fixture_with_provider(
+    provider: Option<Arc<dyn yi_agent_core::Provider>>,
+) -> (TempDir, TempDir, SideRegistry) {
     let project = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let store = Arc::new(ThreadStore::new(project.path()));
@@ -78,7 +107,11 @@ async fn registry_fixture() -> (TempDir, TempDir, SideRegistry) {
     let mut cfg = crate::test_support::test_config();
     cfg.model = "parent-model".into();
     cfg.workdir = project.path().to_path_buf();
-    let resolver = Arc::new(ThreadStoreResolver::new(store, cfg));
+    let inner = ThreadStoreResolver::new(store, cfg, Default::default());
+    let resolver: Arc<dyn super::SideParentResolver> = match provider {
+        Some(provider) => Arc::new(ProviderResolver { inner, provider }),
+        None => Arc::new(inner),
+    };
 
     let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
     let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
@@ -88,6 +121,185 @@ async fn registry_fixture() -> (TempDir, TempDir, SideRegistry) {
     .expect("host resources");
     let registry = SideRegistry::new(resolver, resources, pool);
     (project, home, registry)
+}
+
+struct ReplyProvider {
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl yi_agent_core::Provider for ReplyProvider {
+    async fn call_stream(
+        &self,
+        _request: yi_agent_core::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::ProviderEvent>,
+        yi_agent_core::ProviderError,
+    > {
+        if self.fail {
+            return Err(yi_agent_core::ProviderError::InvalidRequest(
+                "private response".into(),
+            ));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            yi_agent_core::ProviderEvent::TextDelta("旁问回答".into()),
+            yi_agent_core::ProviderEvent::Stop {
+                reason: yi_agent_core::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+async fn published_turn(fail: bool) -> (serde_json::Value, Vec<serde_json::Value>, SideSnapshot) {
+    let (_project, _home, registry) =
+        registry_fixture_with_provider(Some(Arc::new(ReplyProvider { fail }))).await;
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    registry.attach_hub(Arc::clone(&hub));
+    let client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+    let mut rx = hub.register(client.clone());
+    hub.subscribe(&client, vec!["p1".into()]);
+    let side = registry.open("p1").await.unwrap();
+    let turn = registry
+        .turn_start(&side.side_id, "旁问问题".into(), uuid())
+        .await
+        .unwrap();
+    let (completed, items) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut items = Vec::new();
+        loop {
+            let frame = rx.recv().await.expect("broadcast remains open");
+            if frame["method"] == "side/itemUpdated" {
+                items.push(frame["params"]["item"].clone());
+            }
+            if frame["method"] == "side/turnCompleted" && frame["params"]["turn_id"] == turn {
+                break (frame["params"].clone(), items);
+            }
+        }
+    })
+    .await
+    .expect("turn must complete");
+    let snapshot = registry.snapshot(&side.side_id).await.unwrap();
+    registry.shutdown().await;
+    (completed, items, snapshot)
+}
+
+#[tokio::test]
+async fn side_provider_reply_reaches_broadcast_and_snapshot() {
+    let (completed, items, snapshot) = published_turn(false).await;
+    assert_eq!(completed["status"], "idle");
+    for (kind, expected) in [("userMessage", "旁问问题"), ("agentMessage", "旁问回答")] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item["type"] == kind && item["text"] == expected),
+            "missing {kind}: {items:?}"
+        );
+    }
+    assert!(snapshot.items.iter().any(|item| matches!(
+        &item.content,
+        yi_agent_runtime::side_conversation::SideItemContent::AgentMessage { text } if text == "旁问回答"
+    )));
+}
+
+#[tokio::test]
+async fn side_provider_failure_publishes_feedback_instead_of_idle() {
+    let (completed, items, _snapshot) = published_turn(true).await;
+    assert!(items.iter().any(|item| item["type"] == "userMessage"));
+    assert_eq!(completed["status"], "failed");
+    assert!(
+        completed["error"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty() && !text.contains("private response"))
+    );
+}
+
+#[tokio::test]
+async fn side_transcript_refusal_does_not_start_or_accept_a_turn() {
+    let (_project, _home, registry) =
+        registry_fixture_with_provider(Some(Arc::new(ReplyProvider { fail: false }))).await;
+    let side = registry.open("p1").await.unwrap();
+    let entry = registry.entry(&side.side_id).await.unwrap();
+    entry.lock().await.transcript = SideTranscript::new(1, 1);
+    let request = uuid();
+    assert!(
+        registry
+            .turn_start(&side.side_id, "问题".into(), request.clone())
+            .await
+            .is_err()
+    );
+    {
+        let guard = entry.lock().await;
+        assert!(
+            guard.runner.active_turn_id().is_none(),
+            "refused transcript must not leave a running turn"
+        );
+        assert!(
+            guard.ledger.lookup(&request, "问题").unwrap().is_none(),
+            "refusal must not accept the request"
+        );
+        assert!(guard.transcript.items().is_empty());
+    }
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn side_accepted_question_is_in_snapshot_and_published_once() {
+    let (_project, _home, registry) =
+        registry_fixture_with_provider(Some(Arc::new(ReplyProvider { fail: false }))).await;
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    registry.attach_hub(Arc::clone(&hub));
+    let client = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+    let mut rx = hub.register(client.clone());
+    hub.subscribe(&client, vec!["p1".to_string()]);
+    let summary = registry.open("p1").await.unwrap();
+    let request = uuid();
+    let turn = registry
+        .turn_start(&summary.side_id, "旁支问题".into(), request.clone())
+        .await
+        .unwrap();
+    let snapshot = registry.snapshot(&summary.side_id).await.unwrap();
+    assert!(
+        snapshot.items.iter().any(|item| matches!(
+            &item.content,
+            yi_agent_runtime::side_conversation::SideItemContent::UserMessage { text }
+                if text == "旁支问题" && item.turn_id == turn
+        )),
+        "an accepted question must be readable before the provider replies"
+    );
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = rx.recv().await.expect("channel open");
+            if frame["method"] == "side/itemUpdated"
+                && frame["params"]["item"]["type"] == "userMessage"
+            {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("the accepted question must be broadcast");
+    assert_eq!(frame["params"]["item"]["text"], "旁支问题");
+    assert_eq!(frame["params"]["turn_id"], turn);
+    assert_eq!(
+        registry
+            .turn_start(&summary.side_id, "旁支问题".into(), request)
+            .await
+            .unwrap(),
+        turn
+    );
+    let snapshot = registry.snapshot(&summary.side_id).await.unwrap();
+    assert_eq!(
+        snapshot
+            .items
+            .iter()
+            .filter(|item| matches!(
+                &item.content,
+                yi_agent_runtime::side_conversation::SideItemContent::UserMessage { .. }
+            ))
+            .count(),
+        1,
+        "retrying must not duplicate the question"
+    );
+    registry.shutdown().await;
 }
 
 #[tokio::test]
@@ -149,7 +361,11 @@ async fn side_open_during_a_parent_turn_does_not_touch_parent_files() {
     let mut cfg = crate::test_support::test_config();
     cfg.model = "parent-model".into();
     cfg.workdir = project.path().to_path_buf();
-    let resolver = Arc::new(ThreadStoreResolver::new(Arc::clone(&store), cfg));
+    let resolver = Arc::new(ThreadStoreResolver::new(
+        Arc::clone(&store),
+        cfg,
+        Default::default(),
+    ));
     let pool = Arc::new(yi_agent_tools::SideBlockingPool::new(2, 1, 8, 4));
     let resources = yi_agent_runtime::side_conversation::SideHostResources::new(
         home.path().to_path_buf(),
