@@ -226,6 +226,46 @@ cmd_affected() {
     return 0
 }
 
+# 只警告，不阻断。跨会话并发是假红的根因（spec D3），但在配置层修不掉，
+# 所以让它在发生时可见。阻断会让 CI 失效、并让人养成绕过习惯。
+# 注意 pgrep -x 匹配整机进程，无法判断对方是否用同一个 CARGO_TARGET_DIR，
+# 所以文案说的是「本机上」，不是「同一个 target」。
+cmd_concurrency() {
+    local name pid list
+    local -a pids=()
+    for name in cargo cargo-nextest rustc; do
+        list="$(pgrep -x "$name" 2>/dev/null)" || continue
+        for pid in $list; do
+            pids+=("$pid")
+        done
+    done
+    if [ "${#pids[@]}" -gt 0 ]; then
+        printf 'WARN: 本机上另有 %d 个 cargo/rustc 进程（PID: %s）\n' \
+            "${#pids[@]}" "${pids[*]}" >&2
+        printf '      若本次出现超时类失败，先用独占运行复跑对应 crate 再判断\n' >&2
+    fi
+    return 0
+}
+
+cmd_check() {
+    cargo check --all-targets --all-features
+}
+
+# 跑 nextest 并解释退出码。
+# nextest 在「0 个用例匹配」时返回 4（实测），不是 0。原样透传会让人以为是
+# 崩溃；改写成 0 又会让「其实一个测试都没跑」变成绿灯。所以透传 4，
+# 但补一句说明，把注意力引向映射而不是被测代码。
+cmd_run() {
+    local expr="$1"
+    cargo nextest run --all-features --profile ci -E "$expr"
+    local rc=$?
+    if [ "$rc" -eq 4 ]; then
+        printf '\nnote: nextest exited 4 = no tests matched the filter.\n' >&2
+        printf '      the path-to-crate mapping may be off, or these crates have no tests.\n' >&2
+    fi
+    return "$rc"
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: test-tiers.sh <command> [args]
@@ -243,6 +283,9 @@ main() {
         map) cmd_map ;;
         crate) shift; cmd_crate "$@" ;;
         affected) shift; cmd_affected "$@" ;;
+        concurrency) cmd_concurrency ;;
+        check) cmd_check ;;
+        run) shift; cmd_run "$@" ;;
         *) usage ;;
     esac
 }

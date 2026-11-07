@@ -170,4 +170,63 @@ n=$((n + 1)); pass "affected fails when the crate mapping is unavailable"
 
 rm -f "$errf"
 
+# --- concurrency 子命令 ---
+# 注入一个假的 pgrep，避免依赖本机真实进程状态。
+fakebin="$(mktemp -d)"
+trap 'rm -rf "$fakebin"' EXIT
+cat >"$fakebin/pgrep" <<'FAKE'
+#!/usr/bin/env bash
+# 只对 cargo 返回两个 pid
+[ "$2" = "cargo" ] && { printf '111\n222\n'; exit 0; }
+exit 1
+FAKE
+chmod +x "$fakebin/pgrep"
+
+out="$(PATH="$fakebin:$PATH" "$SCRIPT" concurrency 2>&1)"
+[ $? -eq 0 ] || fail "concurrency must always exit 0"
+grep -q 'WARN' <<<"$out" || { printf '%s\n' "$out" >&2; fail "no warning when processes present"; }
+grep -q '111' <<<"$out" || fail "warning did not list pids"
+grep -q '222' <<<"$out" || fail "warning did not list all pids"
+n=$((n + 1)); pass "warns and lists pids when cargo processes exist"
+
+grep -q '独占' <<<"$out" || { printf '%s\n' "$out" >&2; fail "warning lacks the 'rerun alone' guidance"; }
+n=$((n + 1)); pass "warning tells the user to rerun alone before judging"
+
+# 没有进程时静默通过
+cat >"$fakebin/pgrep" <<'FAKE'
+#!/usr/bin/env bash
+exit 1
+FAKE
+chmod +x "$fakebin/pgrep"
+out="$(PATH="$fakebin:$PATH" "$SCRIPT" concurrency 2>&1)"
+[ $? -eq 0 ] || fail "concurrency should exit 0 when quiet"
+grep -q 'WARN' <<<"$out" && { printf '%s\n' "$out" >&2; fail "warned with no processes"; }
+n=$((n + 1)); pass "stays quiet and exits 0 when no cargo processes"
+
+# --- run 子命令：rc=4 必须透传并给出说明 ---
+cat >"$fakebin/cargo" <<'FAKE'
+#!/usr/bin/env bash
+exit 4
+FAKE
+chmod +x "$fakebin/cargo"
+runerr="$(mktemp)"
+PATH="$fakebin:$PATH" "$SCRIPT" run 'rdeps(x)' >/dev/null 2>"$runerr"
+rc=$?
+[ "$rc" -eq 4 ] || { cat "$runerr" >&2; fail "run must propagate rc=4, not swallow it"; }
+grep -q 'no tests matched' "$runerr" || { cat "$runerr" >&2; fail "run did not explain rc=4"; }
+n=$((n + 1)); pass "propagates rc=4 with an explanatory note"
+
+# rc=0 时不得输出 rc=4 的说明
+cat >"$fakebin/cargo" <<'FAKE'
+#!/usr/bin/env bash
+exit 0
+FAKE
+chmod +x "$fakebin/cargo"
+PATH="$fakebin:$PATH" "$SCRIPT" run 'rdeps(x)' >/dev/null 2>"$runerr"
+rc=$?
+[ "$rc" -eq 0 ] || fail "run must propagate rc=0"
+grep -q 'no tests matched' "$runerr" && fail "explained rc=4 on a successful run"
+n=$((n + 1)); pass "stays silent on rc=0"
+rm -f "$runerr"
+
 printf '\n%d passed\n' "$n"

@@ -624,7 +624,7 @@ cmd_affected() {
 cd yi-agent-rs && bash scripts/test_test_tiers.sh
 ```
 
-预期：`24 passed`，退出码 0。
+预期：`29 passed`，退出码 0。
 
 - [ ] **Step 5: 提交**
 
@@ -727,17 +727,17 @@ cd yi-agent-rs && bash scripts/test_test_tiers.sh
 # 注意 pgrep -x 匹配整机进程，无法判断对方是否用同一个 CARGO_TARGET_DIR，
 # 所以文案说的是「本机上」，不是「同一个 target」。
 cmd_concurrency() {
-    local name pid list pids=() count=0
+    local name pid list
+    local -a pids=()
     for name in cargo cargo-nextest rustc; do
         list="$(pgrep -x "$name" 2>/dev/null)" || continue
         for pid in $list; do
             pids+=("$pid")
-            count=$((count + 1))
         done
     done
-    if [ "$count" -gt 0 ]; then
+    if [ "${#pids[@]}" -gt 0 ]; then
         printf 'WARN: 本机上另有 %d 个 cargo/rustc 进程（PID: %s）\n' \
-            "$count" "${pids[*]}" >&2
+            "${#pids[@]}" "${pids[*]}" >&2
         printf '      若本次出现超时类失败，先用独占运行复跑对应 crate 再判断\n' >&2
     fi
     return 0
@@ -777,7 +777,7 @@ cmd_run() {
 cd yi-agent-rs && bash scripts/test_test_tiers.sh
 ```
 
-预期：`27 passed`，退出码 0。
+预期：`29 passed`，退出码 0。
 
 - [ ] **Step 5: 手动验证 check 覆盖 tests/**
 
