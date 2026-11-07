@@ -56,7 +56,8 @@ control socket under sun_path」（2026-11-07 20:05）。它给 `lifecycle::scop
   无人能找到的孤儿。`~/.yi-agent` 不会被回收。
 - **`$TMPDIR` 里已经堆了 10 个 `guardian-*.sock`**（实测 `ls $TMPDIR/guardian-*.sock`），
   同一个项目在不同拼法/不同实例下历史残留全部可见，排查一次连接问题要在多处找。
-- **三类 socket 散在三处**：项目目录 / `$TMPDIR` / 将来的别处。
+- **三类 socket 散在不同地方**：项目目录 / `$TMPDIR` / 插件声明的 `{state_dir}`。
+  本期先把 #1 #2 收进一个地方，#3 仍是例外（§7）。
 
 用户的要求正是「真正支持长路径」，所以本期把 socket 挪到长度恒定的实例目录，
 让路径与项目深度彻底无关。
@@ -69,11 +70,9 @@ control socket under sun_path」（2026-11-07 20:05）。它给 `lifecycle::scop
 | 2 | guardian | `<runtime_dir>/guardian-control.sock` | `$TMPDIR/guardian-<hash>.sock` | 是（<103） |
 | 3 | 插件查询 | `{state_dir}/<plugin>.sock` | `$TMPDIR/plugin-<hash>.sock` | 是（<103） |
 
-本期对第 1、2 类：路径改到 `<instance_home>/sockets/<hash>/`，**并删掉 `$TMPDIR`
-兜底**（理由见 §3.2）——新布局下它不该再被触发。第 3 类一期不动。
-
-三者都有兜底了，所以「挂掉」不再是症状；剩下的症状是 §1.2 那四条。本期把 #1 #2
-统一到恒定路径，#3 保持现状（理由见 §7）。
+三者都有兜底，所以「挂掉」不再是症状；剩下的症状是 §1.2 那四条。本期把 #1 #2
+统一到 `<instance_home>/sockets/<hash>/` 并**删掉 `$TMPDIR` 兜底**（§3.2），
+#3 保持现状（§7）。
 
 ### 1.4 实证（2026-11-07）
 
@@ -102,6 +101,11 @@ socket 统一放到实例目录下的派生目录里，路径长度恒定：
 实测（`instance_home = /Users/gongyichen/.yi-agent`）workdir 从 200 到 900 字符，
 guardian socket 恒为 74 字节。
 
+一个边界要知道：workdir 本身仍受 `PATH_MAX`（macOS 1024）约束，超长时 `create_dir_all`
+会先失败。那是**项目目录**的限制，与 socket 无关——本设计只保证「socket 不再额外吃掉
+sun_path 的 103 字节预算」，不承诺任意深度的项目目录可用。§5 第 1 条用 200/500/900
+正好避开这条边界（900 + `/.yi-agent/runtime` ≈ 919 < 1024）。
+
 非目标（本期明确不做）：
 
 - 插件查询 socket（§1.3 第 3 类）保持现状，理由见 §7。
@@ -120,16 +124,19 @@ guardian socket 恒为 74 字节。
 ///
 /// 两个入参都先规范化，理由见下。
 pub fn socket_directory(runtime_dir: &Path, instance_home: &Path) -> PathBuf {
-    instance_home
+    canonicalize_or_self(instance_home)
         .join("sockets")
         .join(&digest16(runtime_dir))
 }
 
 /// 16 个十六进制字符，取自规范化后的路径。
 fn digest16(path: &Path) -> String {
-    let canonical = canonicalize_allowing_missing(path).unwrap_or_else(|_| path.to_path_buf());
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let digest = Sha256::digest(canonical_or_self(path).as_os_str().as_encoded_bytes());
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    canonicalize_allowing_missing(path).unwrap_or_else(|_| path.to_path_buf())
 }
 ```
 
@@ -139,20 +146,28 @@ fn digest16(path: &Path) -> String {
 两种拼法，直接哈希原始字符串会让同一个项目算出两个目录。实测：
 
 ```
-/var/folders/.../.yi-agent/runtime        -> 2079023ec68df46a
-/private/var/folders/.../.yi-agent/runtime -> 0baed1ca4c1afe33   ⚠ 不同
+/var/folders/6j/2p7261x15r58tyqc4zwlf2_m0000gn/T/.yi-agent/runtime         -> 7227763425bcbd38
+/private/var/folders/6j/2p7261x15r58tyqc4zwlf2_m0000gn/T/.yi-agent/runtime -> 8b62dfd465df5c9d   ⚠ 不同
 ```
 
-这不是假想风险：`lifecycle::scope::control_path`（`:200-210`）**已经**在兜底分支里
-做了 `canonicalize_allowing_missing`，注释还专门记下了这个教训。新函数必须继承，
-否则等于把一个修过的 bug 重新引入。
+（上为本机 2026-11-07 实算值：`sha256(path)[..16]`。同一目录、两种拼法，两个哈希。）
+
+这不是假想风险：`lifecycle::scope::control_path`（`:194-211`，规范化在 `:207`）**已经**在兜底分支里
+做了 `canonicalize_allowing_missing`，注释还专门记下了这个教训（见下面 `scope.rs` 的
+注释原文：两套拼法会让 guardian bind 一个、客户端轮询另一个，症状正是这个 bug）。
+新函数必须继承，否则等于把一个修过的 bug 重新引入。
+
+**注意迁移方向**：老代码只在「已经超长、走兜底」时才规范化，因为短路径直接
+`runtime_dir.join(...)`、无需哈希。新布局**每条路径都要哈希**，所以规范化必须
+无条件执行——不能照搬「在兜底分支里 canonicalize」的结构。`socket_directory`
+（§3.1 开头）就是无条件规范化后的版本。
 
 *`instance_home` 的规范化：* 把规范化放在 `socket_directory` **内部**，而不是要求
 每个调用方自己先规范——因为调用方有三条来源，规范化程度不一：
 
 | 来源 | 是否 canonicalize |
 |---|---|
-| `lifecycle::scope::resolve()`（`scope.rs:40`） | 是 |
+| `lifecycle::scope::resolve()`（`scope.rs:39`） | 是 |
 | `store::paths::instance_home()`（`paths.rs:20`） | **否**，只做 `YI_AGENT_HOME` 归一化 |
 | `YI_AGENT_HOME` 原样传入 | 否 |
 
@@ -160,7 +175,7 @@ fn digest16(path: &Path) -> String {
 目录随之分叉，guardian bind 一处、客户端连另一处——症状与本 bug 一模一样。在函数
 内部规范一次，三条来源自动一致，调用方不需要知道这件事。
 
-`canonicalize_allowing_missing` 是 `pub`（`scope.rs:56`），同文件内直接调用。
+`canonicalize_allowing_missing` 是 `pub`（`scope.rs:58`），同文件内直接调用。
 
 放 `lifecycle` 的理由是依赖方向：`store → lifecycle` 单向（`store/Cargo.toml:14`），
 `lifecycle` 已依赖 `sha2`（`Cargo.toml:17`），且它承诺不拉 SQLite / 模型栈。
@@ -178,14 +193,23 @@ pub fn daemon_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf;
 `<instance_home>` 本身理论上也可能被指到深路径，但**本期去掉 `$TMPDIR` 兜底**，
 只保留「放不下就报明确错误」这一条：
 
-| `instance_home` | guardian socket 长度 | |
-|---|---|---|
-| `/Users/<user>/.yi-agent`（27） | 74 | OK，余量 29 |
-| `/root/.yi-agent`（15） | 62 | OK，余量 41 |
-| `/home/<user>/.yi-agent`（19） | 66 | OK，余量 37 |
+布局是 `<instance_home>/sockets/<16 hex>/guardian-control.sock`，`instance_home`
+之后的固定开销是 47 字节（`/sockets/` 9 + 哈希 16 + `/` 1 + `guardian-control.sock`
+21）。三个典型位置的实测值（`MAX_SOCKET_PATH_BYTES = 103`，`client.rs:62`）：
 
-上限推算：`instance_home` 可以长到 **56 字节**才触顶，这已经覆盖了正常机器和容器的
-所有情况。
+| `instance_home` | 字节数 | guardian socket 总长 | 余量 |
+|---|---|---|---|
+| `/Users/gongyichen/.yi-agent` | 27 | 74 | 29 |
+| `/root/.yi-agent` | 15 | 62 | 41 |
+| `/home/alice/.yi-agent` | 21 | 68 | 35 |
+
+**阈值：`instance_home` 长到 56 字节时触顶**（103 − 47）。这已覆盖正常机器与容器的
+所有情况；能越过的只有用户显式把 `YI_AGENT_HOME` 指到极深处，那种情况下报错比静默
+改地址更诚实。
+
+daemon 的 `runtime.sock` 尾部是 `/sockets/` 9 + 哈希 16 + `/` 1 + `runtime.sock` 12
+= 38 字节，同样场景下总长 65（余量 38），比 guardian 更宽松——所以**约束由 guardian
+决定**，`socket_path_for` 的阈值检查不是多余的，只是不会先触发。
 
 去掉的理由：
 
@@ -202,7 +226,7 @@ pub fn daemon_socket(runtime_dir: &Path, instance_home: &Path) -> PathBuf;
 行为：超限时 `control_socket` 返回 `SocketPathTooLong`，`socket_path_for` 返回
 `IpcError::SocketPathTooLong`（两者都已存在），由 bring-up 转成 §4 的可读提示。
 
-现成的错误类型不要重复造：`scope::control_socket(runtime_dir)`（`scope.rs:216`）
+现成的错误类型不要重复造：`scope::control_socket(runtime_dir)`（`scope.rs:219`）
 已经实现了「返回路径，超限则给 `SocketPathTooLong`」。guardian 侧继续走它，只把
 内部的路径计算换掉；`socket_path_for`（`client.rs:74`）同理。
 
@@ -213,60 +237,257 @@ socket 不再在项目里」，所以这条用例要改写而不是删除，见 
 ### 3.3 调用点：只有一个 choke point，不需要改签名
 
 `7bc611ac` 已经把全部控制 socket 解析统一到 `lifecycle::scope::control_path`。实测
-生产代码里只有 7 处引用，且全部经过这一个函数：
+生产代码（不含 `#[cfg(test)]`）里 `control_path` / `control_socket` 的**解析点**共
+14 处、分布在 8 个文件，全部经过这两个函数：
 
 | 位置 | 现状 |
 |---|---|
 | `supervisors/src/lifecycle/guardian.rs:2139` | `control_socket(&scope.runtime_dir)` —— bind，唯一的 bind 方 |
-| `supervisors/src/lifecycle/bringup.rs:230` | 转发 `control_path(&scope.runtime_dir)` |
+| `supervisors/src/lifecycle/bringup.rs:230` | `control_path(&scope.runtime_dir)`（定义） |
+| `supervisors/src/lifecycle/bringup.rs:269`、`:335` | 经本地 `control_path(scope)` 两次解析 |
 | `supervisors/src/lifecycle/admission.rs:36` | `control_path(runtime_dir)` |
-| `supervisors/src/lifecycle/legacy_evidence.rs:27` | `use` 后间接调用 |
+| `supervisors/src/lifecycle/legacy_evidence.rs:527` | `use` 后调用（`:27` 是 `use` 行） |
 | `supervisors/src/lifecycle/migration_operation.rs:915` | 经 `bringup::control_path` |
 | `supervisors/src/lifecycle/switch_managed.rs:404` | 经 `bringup::control_path` |
 | `app-server/src/rpc/runtime.rs:50` | `control_path(&runtime_dir)` |
 | `subagent/src/foreground.rs:645` | `control_path(runtime_dir)` |
 | `subagent/src/thread_root.rs:829` | `control_path(&runtime_dir)` |
-| `yi-agent/src/frontend_lease.rs:285` | 转发 `control_path(runtime_dir)` |
+| `yi-agent/src/frontend_lease.rs:64`、`:101` | 经本地 `control_path(runtime_dir)` 两次解析 |
+| `yi-agent/src/frontend_lease.rs:285` | 本地 `control_path` 的定义（转发到 `scope::control_path`） |
 
-（后 3 行的行为一致；`thread_root.rs:1348/1530` 剩下的是测试 fixture，不是生产路径。）
+`bringup.rs:82/105/196/206/211/517/521/524` 与 `app-server/src/runtime_status.rs:519`
+等处出现的 `control_path` 是**结构体字段名 / 函数参数名**，不是解析调用——
+`lifecycle/src/client.rs` 里也有同名的 `ControlClient` 字段（`:193`）与参数（`:228`）。
+改名时不要把它们一起动。
+
+（`thread_root.rs:1348/1530` 剩下的 `runtime_dir.join(...)` 在 `#[cfg(test)]` 的
+fixture 里，不是生产路径，本期不动。）
+
+已验证「唯一 choke point」不是估计：`rg 'GUARDIAN_SOCKET_FILE|guardian-control'` 在
+生产代码里只有 `scope.rs:195`（`control_path` 内部）一处拼接，其余命中全在
+`#[cfg(test)]` 与 `lifecycle/src/client.rs` 的测试（`:1021/:1060/:1136`）。也就是说
+改 `control_path` 的实现体会同时覆盖上表全部解析点，不存在绕过它的生产路径。
 
 **因此不改 `control_path` 的签名。** 早先设想过改收 `&RuntimeScope` 靠编译器穷举，
-在 10 处未收敛时是对的；现在只有一个实现体，改签名会把「一处实现」变成「十个调用方
-各自决定 `instance_home`」，正是要避免的分歧来源。
+在解析点未收敛时那是对的；现在只剩两个实现体（`control_path` 与 `control_socket`），
+改签名会把「一处实现」变成「十几个调用方各自决定 `instance_home`」，正是要避免的
+分歧来源。
 
-做法：`control_path(runtime_dir)` 签名保持不变，内部改成
-`guardian_socket(runtime_dir, &instance_home_or_default())`。调用方零改动，
-`guardian.rs` 的 `control_socket` 同理。
+做法：`control_path(runtime_dir)` **签名与返回类型都不变**（`PathBuf`），内部改成
+`guardian_socket(runtime_dir, &instance_home_for_sockets())`。
+
+**`control_path` 不引入 `Result` 的理由**：它有 14 个调用点，其中
+`GuardianAdmission::new`（`admission.rs:32`）返回 `Self`、`bringup::control_path`
+（`bringup.rs:229`）返回 `PathBuf`、`runtime.rs:50` 在 `async fn` 里——改成 `Result`
+会迫使这些签名连锁变化，而**唯一真正 bind 的一方（guardian）根本不走这条路**
+（下面一段）。
+
+所以 `instance_home_for_sockets()` 返回 `Option<PathBuf>`（定义见 §3.5），
+`control_path` 在 `None` 时**不 panic、不返回 `$TMPDIR`**，而是：
+
+```rust
+let home = instance_home_for_sockets().unwrap_or_else(|| {
+    // 只用于诊断展示：三源全缺失在正常机器上不可达（launchd / 容器 / SSH 都设 HOME）。
+    // 这里给一个有意义的占位，让日志能说清"不知道实例根在哪"，而不是假装知道。
+    tracing::error!("instance home is unknown; socket path is a placeholder");
+    PathBuf::from("<unknown-instance-home>")
+});
+guardian_socket(runtime_dir, &home)
+```
+
+`<unknown-instance-home>` 含 `<` / `>`，**任何 `bind` 都会失败**（非法路径字符
+未必，但目录不存在必然 `ENOENT`），所以它不会变成一个能连上却被误用的 socket。
+这比引入 `$TMPDIR` 兜底好：后者会「看起来能用」，掩盖配置错误。
+
+**真正 bind 的一方也根本不走这条路**：`bind_control` 手上有
+`self.scope.instance_home`（§3.5 情况 A），直接调
+`guardian_socket(&scope.runtime_dir, &scope.instance_home)`，不经过 `control_path`、
+不读 env。
+
+`socket_path_for` 不同：它返回 `Result`，且确实被用来 bind（daemon 侧）。所以它用
+`InstanceHomeUnavailable` 显式报错，而不是静默兜底。
 
 测试侧需要同步的只有断言旧布局的用例，见 §6.1。
 
 ### 3.4 业务 socket 调用点
 
-`socket_path_for(runtime_dir)` 有 20+ 调用点（含测试）。业务 socket 的调用方大多
-只有 `runtime_dir`，没有 `instance_home`。
+`socket_path_for(runtime_dir)` 实测 44 个调用点（13 个文件的非测试代码 + 测试），
+业务 socket 的调用方大多只有 `runtime_dir`，没有 `instance_home`。
 
-处理方式：`store::ipc::socket_path_for` **保持签名不变**，内部改为
-`socket_directory(runtime_dir, &instance_home_or_default())` 拼 `runtime.sock`。
-这样 20+ 调用点一行不改。
+处理方式：`store::ipc::socket_path_for` **保持签名不变**，内部改为先取
+`instance_home_for_sockets().ok_or(IpcError::InstanceHomeUnavailable)?`，
+再 `daemon_socket(runtime_dir, &home)`。这样 44 个调用点一行不改。
+`instance_home_for_sockets` 的定义与优先级见 §3.5。
 
-`instance_home` 由 `store::paths::instance_home()`（`paths.rs:20`）提供。它不做
-canonicalize，但 §3.1 已把规范化放进 `socket_directory` 内部，所以这里**不需要**
-额外处理——这正是把规范化放函数内而不是放调用方的理由。
+`instance_home` 的来源不是直接调 `store::paths::instance_home()`——那样会让 guardian
+起的 daemon 与它的 launcher 分叉，见 §3.5。规范化的责任在 `socket_directory` 内部
+（§3.1），所以这里**不需要**额外处理。
 
-`instance_home()` 返回 `None`（既无 `YI_AGENT_HOME` 也无 `HOME`）时不能直接报错——
-那是原先能工作的场景。既然 `$TMPDIR` 兜底一并去掉，这里改为返回
-`IpcError::SocketPathTooLong` 之外的独立错误（`instance home unavailable`），
-而不是悄悄落回临时目录。实测这个分支在正常环境不可达，只为不 panic。
+三个来源都取不到时（`YI_AGENT_INSTANCE_HOME`、`YI_AGENT_HOME`、`HOME` 全无）
+返回独立错误 `IpcError::InstanceHomeUnavailable`，**不**落回临时目录。这与
+`control_path` 的占位路径处理（§3.3）不同是**有意的**：`socket_path_for` 的结果
+会被 daemon 拿去 bind，静默给一个假路径只会把错误推到更难懂的地方（`ENOENT`
+而不是「实例根未知」）。
 
-可行性已核对：`store` 已有 `paths::instance_home()`（`paths.rs:20`），且 `store` 已
-依赖 `lifecycle`（`Cargo.toml:14`）——不新增依赖边。
+可行性已核对：`store` 已依赖 `lifecycle`（`Cargo.toml:14`），所以
+`socket_path_for` 能直接调 `lifecycle::scope` 的 `instance_home_for_sockets` /
+`daemon_socket`——不新增依赖边。反向不行（`lifecycle` 不依赖 `store`），这也决定了
+`instance_home_for_sockets` 必须住在 `lifecycle`（§3.5）。
 
 **`socket_file_name` 直接删除**。它（`client.rs:94`）唯一的用途是生成 `$TMPDIR`
 兜底文件名，§3.2 去掉兜底后没有调用者。它本身还有不规范的哈希（直接哈希原始入参，
 在 `/var` vs `/private/var` 下给出两个名字），删掉比修它干净。`socket_path_for` 里
 引用它的两行（`:79`、`:94`）一并去掉。
 
-### 3.4.1 测试侧影响
+### 3.5 instance_home 的跨进程一致性（本设计最危险的假设）
+
+新布局让 socket 路径多了一个输入：`instance_home`。此前两侧只要同意 `runtime_dir`
+就能找到对方；现在还必须同意 `instance_home`。而进程间取它的方式**不一样**：
+
+| 进程 | 从哪取 instance_home |
+|---|---|
+| 前端 / launcher（TUI、`run`、app-server） | `store::paths::instance_home()` → 读 **`YI_AGENT_HOME`** |
+| guardian | `main.rs:448` 读 **`YI_AGENT_INSTANCE_HOME`**（launcher 在 `bringup.rs:627` 显式传入） |
+| guardian 起的 daemon | 同一个 `YI_AGENT_INSTANCE_HOME`（`guardian.rs:1523`）；**不传 `YI_AGENT_HOME`** |
+
+现状为什么不出问题：`paths::instance_home()` 与 launcher 传给 guardian 的
+`scope.instance_home` 在**正常环境**下是同一个目录。
+
+但新布局把这个假设变成承重的，而它有两处会破：
+
+1. **`YI_AGENT_HOME=/var/foo`（未规范化）。** launcher 侧规范化后得
+   `/private/var/foo/...`，guardian 拿到的是 `scope.instance_home`（`resolve()` 已
+   canonicalize，`scope.rs:39`），两者相同——**这一层 §3.1 的规范化已经兜住**。
+2. **`YI_AGENT_HOME` 靠继承，`YI_AGENT_INSTANCE_HOME` 靠显式传递。** guardian 起的
+   daemon 只被显式设了 `YI_AGENT_INSTANCE_HOME`（`guardian.rs:1523`），
+   `YI_AGENT_HOME` 是**继承**来的——`spawn` 不清环境（`guardian.rs:461` 只
+   `process.env(key, value)` 追加，全文无 `env_clear`）。这条继承不是巧合，是被
+   代码明确依赖的：`managed_runtime.rs:407-410` 的注释写着「instance's
+   configuration is inherited from the process that started us ... a shared daemon
+   must keep reading the same `YI_AGENT_HOME`」。
+
+   所以只要 launcher 的 `YI_AGENT_HOME` 与它传给 guardian 的
+   `scope.instance_home` 指同一目录，全链路一致——**在正常环境下两者确实来自同一个
+   输入**（`managed_startup.rs:222` 就是拿 `paths::instance_home()` 去 resolve）。
+   风险在于这条一致性目前是**隐式**的：没有任何断言把它固定住，而新布局让
+   socket 路径依赖它。
+
+**结论分两种情况，取决于调用方手上有没有准确值。**
+
+**情况 A：手上有 `RuntimeScope`（guardian 及其下游）。** 直接用
+`scope.instance_home`，**完全不读环境变量**。`RuntimeScope` 已含
+`instance_home: PathBuf`（`types.rs:32`），且 `resolve()` 里已 canonicalize
+（`scope.rs:39`）。所以：
+
+```rust
+// guardian.rs:bind_control —— 已经有 self.scope
+let path = yi_agent_lifecycle::scope::guardian_socket(
+    &self.scope.runtime_dir,
+    &self.scope.instance_home,   // 不是读 env
+);
+```
+
+daemon 由 guardian 起，`YI_AGENT_INSTANCE_HOME` 由 guardian 显式传入
+（`guardian.rs:1523`），这正是 `scope.instance_home` 的来源——所以**整条 managed
+链路根本不需要 §3.5 的 env 优先级兜底**，它只在情况 B 生效。
+
+**情况 B：手上只有 `runtime_dir`（前端、`socket_path_for` 的多数调用方）。**
+这时才需要 env 兜底。优先读 `YI_AGENT_INSTANCE_HOME`（进程内已有显式声明时用它），
+否则退回 `YI_AGENT_HOME`，再退回 `$HOME/.yi-agent`：
+
+```rust
+/// socket 路径要用的 instance_home。三个来源按优先级取第一个可用的，
+/// 全缺失时返回 `None`，由调用方转成 `InstanceHomeUnavailable`。
+///
+/// 放在 `lifecycle::scope`：`store` 已经依赖 `lifecycle`，反向不行；而这个函数
+/// 两边都要用（`store::ipc::socket_path_for` 与 `lifecycle::scope::control_path`）。
+/// `lifecycle` 已经在读环境变量（`scope.rs:168` 读 `YI_AGENT_RUNTIME_DIR`），
+/// 不新增依赖。
+pub fn instance_home_for_sockets() -> Option<PathBuf> {
+    std::env::var_os("YI_AGENT_INSTANCE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(instance_home_from_env)
+}
+
+/// `YI_AGENT_HOME` → `$HOME/.yi-agent`，含 `.yi-agent` 归一化。
+/// 必须与 `store::paths::instance_home()` 逐字同义，否则两侧算出不同目录。
+fn instance_home_from_env() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+    match std::env::var_os("YI_AGENT_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            Some(if dir.file_name() == Some(OsStr::new(".yi-agent")) {
+                dir
+            } else {
+                dir.join(".yi-agent")
+            })
+        }
+        None => home.map(|h| h.join(".yi-agent")),
+    }
+}
+```
+
+**`.yi-agent` 归一化这一条不能漏。** `store::paths::instance_home()`（`paths.rs:20-40`）
+在 `YI_AGENT_HOME=/foo` 时返回 `/foo/.yi-agent`，而不是 `/foo`。如果 socket 侧直接
+`PathBuf::from(env)`，就会出现 store 说 `/foo/.yi-agent`、socket 说 `/foo` 的分叉。
+这段逻辑重复两处是**有意的坏味道**：写测试钉住两者等价（§5 第 7 条），比把
+`lifecycle` 反向依赖 `store` 便宜。
+
+返回 `Option` 而不是 `Result`：这里是纯取值，错误类型留在各自调用方
+（`socket_path_for` 映射成 `InstanceHomeUnavailable`；`control_path` 走占位路径，
+见 §3.3）。
+
+**为什么不用改成"只读 `YI_AGENT_HOME`"**：那会让 guardian 起的 daemon（只被显式设了
+`YI_AGENT_INSTANCE_HOME`）与前端（只读 `YI_AGENT_HOME`）在使用者给两者设了不同值时
+算出两个目录。优先级读法下，前端和 daemon 都先看 `YI_AGENT_INSTANCE_HOME`，结果一致。
+§5 第 11 条用「两者指向不同目录」的用例钉住这一点。
+
+注意情况 B 只是**加固**，不是修 bug：现有代码在正常环境下已经一致，§3.5.1 才是真正
+需要动手的地方。
+
+#### 3.5.1 已经手上有 instance_home 的地方不要再去猜
+
+`subagent/src/attach.rs:1380` 的 `attach_to_answer` 签名里就有
+`instance_home: Option<&Path>`（`:1383`），但函数体现在是 `let _ = instance_home;`
+（`:1421`）把它丢掉，改用 `socket_path_for(runtime_dir)`（`:1386`）靠环境变量反推。
+
+**两个调用方都传 `None`**，包括明明手上有 `instance_home: &Path` 的那个：
+
+| 调用点 | 传的 instance_home | 手上有没有 |
+|---|---|---|
+| `:1349` `attach_authorized_root` | `None` | 没有（只有 capability） |
+| `:1371` `attach_managed_project_runtime` | `None` | **有**，参数 `:1355` 就是 `&Path` |
+
+这个写法现在无害，因为 `socket_path_for` 只依赖 `runtime_dir`；改布局后它就成了
+「明明有准确值却去读环境」的分歧点。`attach_managed_project_runtime` 那条尤其要改：
+它在 `prepare_managed_runtime` 里用的 `instance_home` 与实际算 socket 用的 env 可能
+不是同一个（§3.5 第 2 条），而它本身就是 managed 链路，正是出问题的那条。
+
+**实施时的改法**（与 §3.4 的「签名不变」不冲突）：
+
+1. `attach_to_answer` 内部改成用参数：
+   ```rust
+   let home = match instance_home {
+       Some(path) => path.to_path_buf(),
+       None => yi_agent_store::paths::instance_home_for_sockets()
+           .ok_or_else(|| AttachFailure::new("runtime directory", IpcError::InstanceHomeUnavailable))?,
+   };
+   let socket_path = yi_agent_lifecycle::scope::daemon_socket(runtime_dir, &home);
+   ```
+   ——即「有显式值就用，没有才读 env」。
+2. `attach_managed_project_runtime` 把 `Some(instance_home)` 传下去（`:1371` 的
+   `None` 改成 `Some(instance_home)`）。
+3. `attach_authorized_root` 保持 `None`：它确实没有该信息，走 env 兜底是唯一选择。
+
+`store::ipc::socket_path_for(runtime_dir)` 的**公开签名保持不变**（§3.4），
+新增的是 `lifecycle` 侧的 `daemon_socket(runtime_dir, instance_home)`——本身就要
+新增（§3.1），所以这里只是直接调它，不构成签名变更。
+
+排查方法：`rg 'let _ = instance_home'`，以及 `socket_path_for(runtime_dir)` 在已有
+`instance_home` 变量作用域内的调用点。
+
+### 3.6 测试侧影响
 
 `socket_path_for` 改用 `instance_home()` 之后，socket 路径**不再跟随 `runtime_dir`
 的父目录**，只跟它的哈希有关。仓里 130 处 `Daemon::start` 调用绝大多数传
@@ -287,6 +508,8 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
    一次 `just test` 会在 `~/.yi-agent/sockets/` 留下几十上百个空目录。
    — 无害，但会让人误以为有泄漏。**处理：在 `Daemon::start` 的退出路径里，若
    socket 目录为空则尝试 `remove_dir`，失败忽略。** 这一条不改测试写法，改实现。
+   只删**空**目录是有意的：guardian 与 daemon 共用 `sockets/<hash>/`，daemon 退出时
+   guardian 的 socket 可能还在，`remove_dir` 会因 `ENOTEMPTY` 失败并被忽略，正好。
 2. **写死路径的用例会互相踩（只影响少数）。** `TempDir` 保证 runtime_dir 唯一，
    所以哈希唯一、socket 唯一——这类用例是安全的。真正有风险的是拿**同一个写死
    字符串**作 runtime_dir 的用例：它们现在争同一个 socket 文件。实测只有
@@ -294,9 +517,10 @@ let daemon = Daemon::start(&runtime, &database).unwrap();
    的**纯函数**测试使用，不 bind，所以当前零冲突。
    — **处理：不需要引入 `instance_home` 注入参数。** 只要守住「测试不 bind 写死
    路径」这条现状即可。
-3. **`std::env::set_var` 不能用来做隔离。** edition 2024 下它是 `unsafe`，且
-   `runtime_ipc.rs` 的用例在进程内并行跑。`maintenance_ipc.rs:33` 已经用全局
-   `Mutex` + `unsafe set_var` 做过这件事，不要再复制这种写法到别处。
+3. **`std::env::set_var` 不能用来做隔离。** edition 2024 下它是 `unsafe`；
+   `cargo test` 在同进程内多线程跑用例，`just test` 用的 nextest 虽然每用例一个
+   进程，但两者都要能过。`maintenance_ipc.rs:55` 用全局 `Mutex` + `unsafe set_var`
+   绕过这个限制，不要再复制到别处。
 
 **结论：不做「给 `Daemon::start` 加 `instance_home` 参数」的改造。** 早先版本的
 spec 提出过这个方案，但它把生产签名为了测试而变复杂，而实际问题只有第 1 条
@@ -304,7 +528,7 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 
 验收方式见 §5 第 10 条：跑完测试后 `~/.yi-agent/sockets/` 不应留下新目录。
 
-### 3.5 目录创建与权限
+### 3.7 目录创建与权限
 
 新布局引入了一个中间目录 `~/.yi-agent/sockets/<hash>/`，现有代码**没有任何地方
 创建它**——`bind_control`（`guardian.rs:2139`）只 `create_dir_all(&self.scope.runtime_dir)`（`:2142`），
@@ -326,14 +550,16 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 - 业务 socket 目前未显式设权限（继承 umask）。既然搬进 0700 目录，实际访问已被
   目录权限挡住，**本期不为它新增 chmod**，避免扩大改动面。
 
-新增目录不必清理：每个项目一个 `<16hex>` 子目录，长期累积量级是项目数，
-不会无限增长。确实要清时 `rm -rf ~/.yi-agent/sockets` 是安全的（都是运行期产物）。
+目录清理只做「删空目录」这一种，见 §3.6 第 1 条：daemon / guardian 退出时若
+`sockets/<hash>/` 已空就 `remove_dir`，失败（典型是 `ENOTEMPTY`）忽略。不写按
+时间或数量的回收逻辑——每个项目一个 `<16hex>` 子目录，累积量级是项目数，且退出
+时基本都会自清。手工整目录删除也安全：里面全是运行期产物。
 
-### 3.6 旧位置清理
+### 3.8 旧位置清理
 
 老布局的 socket 文件会留在 `<runtime_dir>/` 下。处理：
 
-- **不需要写清理代码**。`bind_control` 的护栏（`guardian.rs:2148-2190`）只在**新路径**
+- **不需要写清理代码**。`bind_control` 的护栏（`guardian.rs:2143-2197`）只在**新路径**
   上生效，旧路径的文件不会被自动删除——但它也不会造成故障：旧路径不再被 bind，也
   不再被任何客户端连接，只是一个死文件。
 - 因此本条**不做**：为一堆一次性残留文件引入删除逻辑，风险（误删别的实例仍在使用
@@ -352,19 +578,36 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 |---|---|
 | `socket_directory` 能放下（正常） | 无错误 |
 | `instance_home` 使得路径超限（>56 字节） | `control_socket` / `socket_path_for` 返回 `SocketPathTooLong`，由 bring-up 转成可读拒绝 |
-| `instance_home()` 返回 `None` | 返回独立错误，不落回临时目录 |
+| 三个 instance_home 来源全缺失 | `socket_path_for` 返回 `IpcError::InstanceHomeUnavailable`（它会 bind，必须报错）；`control_path` 返回占位路径并 `tracing::error!`（详见 §3.3，它不 bind） |
 
 第 3 行的用户可见文案（替换现有的 30 秒超时弹窗）：
 
-> 无法为这个项目创建 runtime socket：实例目录太长（`<path>`，上限 103 字节）。
-> 请把 `YI_AGENT_HOME` 指向更短的目录。
+> 无法为这个项目创建 runtime socket：实例目录路径过长
+> （`<path>`，上限 103 字节，实际 `<n>` 字节）。
 
-**注意旧文案不该再出现**。`busy` 弹窗里的「重启 yi-agent 后即可用」在当前故障下
-是错的建议——重启只会重复同样的失败。测试要覆盖这一点：超长场景断言错误信息里
-不含"重启"，含 `YI_AGENT_HOME`。
+只给事实，不教怎么改。理由是：56 字节的门槛在正常机器和容器里都碰不到，能触发它的
+只有用户显式把 `YI_AGENT_HOME` 指到极深的位置——这时他比程序更清楚自己在做什么，
+一句「换个短点的目录」既没有信息量，也像是程序在替人做主。
 
-另外，`socket_directory` 不再依赖项目路径长度，所以"把项目移到更短的路径"这条建议
-**已不再是解法**，文案里应当去掉，否则误导用户做大量无用功。
+**旧文案不该再出现。** `busy` 弹窗里的「重启 yi-agent 后即可用」在当前故障下是错的
+建议——重启只会重复同样的失败。测试断言超长场景的错误信息**不含**"重启"、**不含**
+"移到更短的路径"（后者已不是解法，§2 让 socket 与项目深度无关）。
+
+提示应留在日志而不是弹窗：`tracing::error!` 里记完整路径与三个来源
+（`YI_AGENT_INSTANCE_HOME` / `YI_AGENT_HOME` / 默认），排查时能看到是哪来的。
+
+**两个现有的错误文案都要改**，它们现在的措辞会把用户往错方向引：
+
+| 位置 | 现在的文案 | 问题 |
+|---|---|---|
+| `store/src/ipc/error.rs:34-38` | "...shorten the project path or set `YI_AGENT_RUNTIME_DIR` to a short directory" | 两条建议在 §2 的新布局下**都已失效**：socket 不再在项目目录里，`YI_AGENT_RUNTIME_DIR` 只影响 runtime_dir（仍参与哈希，但不影响长度） |
+| `lifecycle/src/scope.rs:241-248` | "the guardian control socket is {} bytes **even after falling back to the temp directory**" | 兜底已删（§3.2），这句话描述的分支不存在了 |
+
+两处都改为「实例目录路径过长」+ 实际字节数 + 上限，不附建议。§5 第 9 条断言新旧
+措辞都不再出现。
+
+（顺带：`lifecycle` 的 doc comment `:232` 也写着 "Reachable only when `TMPDIR`
+itself is absurdly deep"，随兜底删除一并更新。）
 
 ## 5. 测试策略
 
@@ -376,7 +619,7 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
    断言成功。这条是本次故障的正面回归——只断言长度不够，`bind` 才是真判据。
 3. **同源性**：断言 launcher（`bringup::control_path`）、guardian（`bind_control`）、
    `admission`、`thread_root`、`frontend_lease` 五处算出的路径两两相等。
-   把任一处改回 `runtime_dir.join(...)` 即红。
+   这几处是 §3.3 表格里最容易被改回 `runtime_dir.join(...)` 的；任一改动即红。
 4. **项目隔离**：两个不同 runtime_dir 得到不同 `socket_directory`。
 5. **超限失败**：把 `instance_home` 指到 57 字节以上，断言返回 `SocketPathTooLong`
    而非 panic、也**不**落回 `$TMPDIR`。去掉兜底后，这条是「不静默降级」的钉子。
@@ -386,18 +629,24 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
    `/var` 下的项目会静默分裂成两个 socket 目录。
 7. **instance_home 三源等价**：`YI_AGENT_HOME` 设成同一个目录的 `/var/...` 与
    `/private/var/...` 两种拼法，断言 `socket_directory` 结果相同；再断言
-   `stores::paths::instance_home()`（不 canonicalize）与 `scope::resolve()`
-   （canonicalize）两条来源经 `socket_directory` 后算出同一路径。把 §3.1 里
-   `instance_home` 的规范化去掉即红。
+   `store::paths::instance_home()` 与 `lifecycle::scope::instance_home_for_sockets()`
+   在 `YI_AGENT_INSTANCE_HOME` 未设时返回**逐字相同**的路径——这条钉住 §3.5 的
+   `.yi-agent` 归一化复刻，漏写 `join(".yi-agent")` 即红。
 8. **目录自动创建**：`sockets/<hash>/` 不存在时，`bind_control` 与 daemon 启动都能
-   自己建出来并 bind 成功。删掉 §3.5 要求的 `create_dir_all` 即红——这条是"新布局
+   自己建出来并 bind 成功。删掉 §3.7 要求的 `create_dir_all` 即红——这条是"新布局
    比旧故障更糟"的防线。
-9. **错误文案**：`instance_home` 超限时，断言错误信息含 `YI_AGENT_HOME` 且**不含**
-   "重启"。这条直接钉住 §4 的表述。
+9. **错误文案**：`instance_home` 超限时，断言错误信息含实际字节数与上限，且**不含**
+   "重启"、"shorten the project path"、"YI_AGENT_RUNTIME_DIR"、"falling back to
+   the temp directory"。后四条分别对应旧弹窗文案与两处过时的 `Display` 实现（§4）。
 10. **测试不留垃圾**：跑完 `cargo test -p yi-agent-store` 后，断言
-    `~/.yi-agent/sockets/` 下没有新增**空目录**。这条防的是 §3.4.1 第 1 条——
+    `~/.yi-agent/sockets/` 下没有新增**空目录**。这条防的是 §3.6 第 1 条——
     它不会让任何测试变红，只会悄悄往开发者 home 里堆目录。
-11. **真机验收**：本项目启动后 socket 出现在 `~/.yi-agent/sockets/<hash>/`，
+11. **instance_home 跨进程一致**：同时设 `YI_AGENT_HOME=A` 与
+    `YI_AGENT_INSTANCE_HOME=B`（两个不同目录），断言 `instance_home_for_sockets()`
+    返回 `B`（不是 `A`），且 guardian 用 `scope.instance_home` 算出的路径与 daemon
+    用 `instance_home_for_sockets()` 算出的相同。把优先级写反（先读 `YI_AGENT_HOME`）
+    即红——这条锁住 §3.5。
+12. **真机验收**：本项目启动后 socket 出现在 `~/.yi-agent/sockets/<hash>/`，
     `/agents` 可用。
 
 ## 6. 风险
@@ -406,8 +655,9 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 |---|---|
 | 未来有人新增调用点绕过 `control_path` 直接 join | §5 第 3 条断言五处同源；新增点若绕过会立刻红 |
 | 旧 socket 残留导致 `AddrInUse` | 复用现有「探测无应答才删」护栏 |
-| `/var` vs `/private/var` 使同一项目算出两个 socket 目录 | 哈希输入先 `canonicalize_allowing_missing`；见 §3.1、§3.4 |
+| `/var` vs `/private/var` 使同一项目算出两个 socket 目录 | 两个哈希输入都先 `canonicalize_allowing_missing`；见 §3.1 |
 | `store::paths::instance_home()` 与 `scope.instance_home` 规范化程度不同 | 规范化收在 `socket_directory` 内部，三条来源自动一致；见 §3.1 |
+| `instance_home` 在进程间取法不同（`YI_AGENT_HOME` vs `YI_AGENT_INSTANCE_HOME`），两侧算出不同 socket 目录 | guardian 用 `scope.instance_home`（不读 env）；其余统一经 `instance_home_for_sockets()`，它优先读 `YI_AGENT_INSTANCE_HOME`。见 §3.5、§5 第 11 条 |
 | 数据库仍在项目目录，删目录后 socket 存活 | **已核实不受影响**：自停判据是 `watched_runtime_dir.exists()`（`ipc/daemon.rs:442`），监视的是项目内那个含 `runtime.sqlite` 的目录，与 socket 落在哪里无关。`bug-list.md:128` 的机制仍生效，`runtime_ipc.rs:2893` 的用例（它显式断言 socket 不在 runtime_dir 内）在改布局后仍然绿 |
 
 ### 6.1 已知需要同步修改的既有测试
@@ -444,11 +694,15 @@ spec 提出过这个方案，但它把生产签名为了测试而变复杂，而
 - [ ] `lifecycle::scope` 提供 `socket_directory` / `guardian_socket` / `daemon_socket`，
       且哈希输入先规范化
 - [ ] `control_path` / `control_socket` 签名不变，内部改用新布局（调用方零改动）
-- [ ] `socket_path_for` 签名不变，内部改用 `daemon_socket(runtime_dir, &instance_home())`
+- [ ] `socket_path_for` 签名不变，内部改用 `daemon_socket` + `instance_home_for_sockets()`（§3.5 情况 B）
+- [ ] `bind_control` 用 `scope.instance_home`，不读 env（§3.5 情况 A）
+- [ ] `attach_to_answer` 不再 `let _ = instance_home`，且 `attach_managed_project_runtime` 传 `Some(instance_home)`（§3.5.1）
 - [ ] `bind_control` 与 daemon 在 bind 前创建 `sockets/<hash>/` 并设 0700
 - [ ] §6.1 列出的 4 个既有用例已逐条确认语义（不是简单改成能过）
-- [ ] §5 十一条测试全绿，且每条都做过「回退即红」验证
-- [ ] §3.4.1 已处理：daemon 退出时清空 `sockets/<hash>/`，测试不留空目录
+- [ ] §5 十二条测试全绿，且每条都做过「回退即红」验证
+- [ ] `instance_home_for_sockets()` 与 `store::paths::instance_home()` 的 `.yi-agent` 归一化逐字一致（§5 第 7 条）
+- [ ] §3.6 已处理：退出路径对空的 `sockets/<hash>/` 做 `remove_dir`（`ENOTEMPTY`
+      忽略），跑完 `cargo test -p yi-agent-store` 不在 `~/.yi-agent/sockets/` 留新空目录
 - [ ] 本项目真机启动：socket 出现在 `~/.yi-agent/sockets/<hash>/`，`/agents` 可用
 - [ ] `just ci` 全绿
 
