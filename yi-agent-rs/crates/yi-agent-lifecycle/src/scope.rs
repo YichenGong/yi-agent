@@ -205,6 +205,53 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     canonicalize_allowing_missing(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The instance home a socket path should be derived from.
+///
+/// Priority: `YI_AGENT_INSTANCE_HOME` (a process that was told which instance it
+/// serves), then `YI_AGENT_HOME`, then `$HOME/.yi-agent`.
+///
+/// Why not just `YI_AGENT_HOME`: a guardian spawns its daemon with
+/// `YI_AGENT_INSTANCE_HOME` set explicitly and `YI_AGENT_HOME` only inherited. If
+/// the two ever disagreed, reading only `YI_AGENT_HOME` would put the daemon's
+/// socket somewhere the frontend never looks.
+pub fn instance_home_for_sockets() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("YI_AGENT_INSTANCE_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|v| !v.is_empty());
+    instance_home_from_env(override_value.as_deref(), home.as_deref())
+}
+
+/// `YI_AGENT_HOME` / `$HOME` -> instance home, including the `.yi-agent` suffix
+/// normalisation.
+///
+/// This must stay semantically identical to `store::paths::instance_home()`
+/// (`paths.rs:20`). It is duplicated here because `lifecycle` cannot depend on
+/// `store` (the dependency runs the other way). A test in `store` pins the two
+/// together, which is why this is `#[doc(hidden)] pub` rather than private.
+#[doc(hidden)]
+pub fn instance_home_from_env(
+    override_value: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(dir) = override_value {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() {
+            return Some(
+                if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+                    dir
+                } else {
+                    dir.join(".yi-agent")
+                },
+            );
+        }
+    }
+    home.map(|home| home.join(".yi-agent"))
+}
+
 /// The runtime directory a project uses.
 ///
 /// `YI_AGENT_RUNTIME_DIR` overrides it, which is what lets a development instance
@@ -355,6 +402,39 @@ mod tests {
             socket_directory(&runtime, home),
             socket_directory(&alias_runtime, home),
             "both spellings of one directory must hash to one socket directory"
+        );
+    }
+
+    #[test]
+    fn a_bare_yi_agent_home_gains_the_dot_yi_agent_suffix() {
+        // 必须与 `store::paths::instance_home()` 同义：`/foo` -> `/foo/.yi-agent`。
+        assert_eq!(
+            instance_home_from_env(
+                Some(std::ffi::OsStr::new("/tmp/dev-a")),
+                Some(Path::new("/home/me"))
+            ),
+            Some(PathBuf::from("/tmp/dev-a/.yi-agent"))
+        );
+    }
+
+    #[test]
+    fn an_instance_home_already_ending_in_dot_yi_agent_is_kept_verbatim() {
+        assert_eq!(
+            instance_home_from_env(Some(std::ffi::OsStr::new("/tmp/dev-a/.yi-agent")), None),
+            Some(PathBuf::from("/tmp/dev-a/.yi-agent"))
+        );
+    }
+
+    #[test]
+    fn no_override_and_no_home_yields_none() {
+        assert_eq!(instance_home_from_env(None, None), None);
+    }
+
+    #[test]
+    fn an_empty_override_falls_through_to_home() {
+        assert_eq!(
+            instance_home_from_env(Some(std::ffi::OsStr::new("")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.yi-agent"))
         );
     }
 
