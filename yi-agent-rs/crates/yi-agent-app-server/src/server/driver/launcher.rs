@@ -101,6 +101,10 @@ pub(crate) struct ServeLauncher<'a, F> {
     /// 机器级模型清单路径:被驱动的会话的委派链路与手工会话读同一份,而非各自
     /// 重读 `$HOME`。
     pub(crate) models_path: &'a Path,
+    /// 进程级运行期设置绑定:交给 `start_thread_core` → `attach_delegation`，
+    /// 使被驱动会话所在项目的内嵌 daemon 也跟随设置保存。`None` = 静态行为。
+    pub(crate) live_settings:
+        Option<&'a yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     pub(crate) cfg: &'a RuntimeConfig,
     pub(crate) hub: &'a Arc<crate::broadcast::Broadcaster>,
     pub(crate) turn_tx: &'a mpsc::Sender<TurnEvent>,
@@ -309,6 +313,8 @@ where
             self.lead_control_replies,
             Some(self.lead_agent_enabled),
             env,
+            // 进程级运行期设置绑定:被驱动会话所在项目的内嵌 daemon 也跟随保存。
+            self.live_settings,
         )
         .await?;
 
@@ -692,6 +698,7 @@ where
             Some(self.lead_agent_enabled),
             // 组长会话不是驱动会话，没有插件句柄可注入。
             Vec::new(),
+            self.live_settings,
         )
         .await?;
 

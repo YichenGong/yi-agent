@@ -107,6 +107,8 @@ async fn agent_factory_failure_returns_internal_error() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),
+            // 这些用例不涉运行期设置：静态装配。
+            live_settings: None,
             lead_agent_enabled: false,
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),

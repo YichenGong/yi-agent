@@ -181,6 +181,9 @@ pub fn assemble_cold_source(
         generation: 1,
         provider_gate: None,
         web_policy: SideWebPolicy::default(),
+        // Filled in by the caller that holds the parent agent's live source; a
+        // side created from persisted state alone has none.
+        live: None,
     })
 }
 
@@ -346,6 +349,9 @@ pub fn source_from_live_agent(
         generation: 1,
         provider_gate: None,
         web_policy: SideWebPolicy::default(),
+        // Filled in by the caller that holds the parent agent's live source; a
+        // side created from persisted state alone has none.
+        live: None,
     })
 }
 

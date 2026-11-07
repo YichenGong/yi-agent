@@ -83,6 +83,25 @@ pub struct AttachedProjectRuntime {
     supervisor: yi_agent_runtime::supervise::SuperviseHandle,
 }
 
+impl AttachedProjectRuntime {
+    /// An attached runtime that owns nothing, for plan-level tests.
+    ///
+    /// `supervisor` is private because only this module may decide who supervises
+    /// a daemon; tests still need a value that drops cleanly (`idle` stops
+    /// nothing), so the constructor lives here instead of being widened.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(directory: &Path, attached_root: crate::AttachedRoot) -> Self {
+        Self {
+            socket_path: directory.join("runtime.sock"),
+            workspace_root: directory.to_path_buf(),
+            project_root: directory.to_path_buf(),
+            attached_root,
+            embedded_daemon: None,
+            supervisor: yi_agent_runtime::supervise::idle(),
+        }
+    }
+}
+
 /// The project-local runtime directory. The TUI's slash commands and the CLI
 /// resolve the same location, so everything goes through here.
 pub fn project_runtime_directory(workdir: &Path) -> PathBuf {
@@ -127,12 +146,35 @@ pub fn worker_factory(
     runtime_socket: PathBuf,
     models_path: &Path,
 ) -> anyhow::Result<std::sync::Arc<dyn AgentWorkerFactory>> {
-    Ok(std::sync::Arc::new(build_worker_factory(
+    worker_factory_with_binding(cfg, runtime_socket, models_path, None)
+}
+
+/// [`worker_factory`], plus the process-wide live-settings binding.
+///
+/// Every worker this factory starts adopts the same shared settings source, so a
+/// runtime-settings save reaches an already-running worker at its next safe
+/// point instead of at the next delegation. `None` is byte-for-byte today's
+/// static behaviour.
+///
+/// The binding is handed over only after the factory's catalog is configured,
+/// so the composer used for a live refresh is the one that rendered the static
+/// prompt -- that is what keeps the stable context identical across a save.
+pub fn worker_factory_with_binding(
+    cfg: &RuntimeConfig,
+    runtime_socket: PathBuf,
+    models_path: &Path,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> anyhow::Result<std::sync::Arc<dyn AgentWorkerFactory>> {
+    let mut factory = build_worker_factory(
         cfg,
         runtime_socket,
         &yi_agent_runtime::models::load_catalog_from(models_path),
         models_path,
-    )?))
+    )?;
+    if let Some(binding) = binding {
+        factory = factory.with_live_settings(cfg.clone(), binding);
+    }
+    Ok(std::sync::Arc::new(factory))
 }
 
 /// Builds the factory from an already-loaded catalog.
@@ -226,6 +268,34 @@ pub fn attach_project_runtime(
     attach_project_runtime_with_environment(cfg, runtime_dir, models_path, None, None)
 }
 
+/// [`attach_project_runtime`], plus the caller's live-settings binding.
+///
+/// An *embedded* daemon runs inside this process, so its worker factory is built
+/// right here and can be handed the same shared settings source every session
+/// uses. Without it, a subagent worker started before a save would keep running
+/// the values it was built with until the next delegation.
+///
+/// A *managed* daemon is a separate process: nothing in memory crosses that
+/// boundary, and that process resolves the same `settings.json` itself (see
+/// `run_internal_daemon`). Passing a binding here is therefore only meaningful
+/// for the embedded policy, and harmless otherwise -- the factory this builds is
+/// simply never used.
+pub fn attach_project_runtime_with_binding(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    attach_project_runtime_with_environment_and_binding(
+        cfg,
+        runtime_dir,
+        models_path,
+        None,
+        None,
+        binding,
+    )
+}
+
 /// [`attach_project_runtime`] 的可注入版本：`flags_path` 覆盖 `flags.json` 的位置，
 /// `build_kind` 覆盖监督器读开关时用的构建类型。
 ///
@@ -240,13 +310,36 @@ pub fn attach_project_runtime_with_environment(
     flags_path: Option<PathBuf>,
     build_kind: Option<&str>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
+    attach_project_runtime_with_environment_and_binding(
+        cfg,
+        runtime_dir,
+        models_path,
+        flags_path,
+        build_kind,
+        None,
+    )
+}
+
+/// [`attach_project_runtime_with_environment`] plus the caller's binding.
+///
+/// The two seams exist for the same reason as their binding-less twins: tests
+/// need to override the flags location and the build kind. The binding rides
+/// along unchanged into the worker factory.
+pub fn attach_project_runtime_with_environment_and_binding(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    flags_path: Option<PathBuf>,
+    build_kind: Option<&str>,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
     let database = runtime_dir.join("runtime.sqlite");
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
         .map_err(|error| AttachFailure::new("runtime directory", error))?;
     // Record the project-local state before the daemon creates it, otherwise the
     // root provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&cfg.workdir);
-    let factory = worker_factory(cfg, socket_path.clone(), models_path)
+    let factory = worker_factory_with_binding(cfg, socket_path.clone(), models_path, binding)
         .map_err(|error| AttachFailure::new("worker factory", error))?;
     let embedded_daemon = match Daemon::start_with_factory(&runtime_dir, &database, factory) {
         Ok(daemon) => Some(daemon),
@@ -495,6 +588,21 @@ pub fn ensure_owned_runtime(
     runtime_dir: PathBuf,
     models_path: &Path,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
+    ensure_owned_runtime_with_binding(cfg, runtime_dir, models_path, None)
+}
+
+/// [`ensure_owned_runtime`], plus the caller's live-settings binding.
+///
+/// The binding is only ever consumed by a daemon started *inside this process*
+/// (see [`attach_project_runtime_with_binding`]); it is threaded through the
+/// retry loop so a bring-up that has to try again still hands the same source to
+/// the factory it eventually builds.
+pub fn ensure_owned_runtime_with_binding(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
         .map_err(|error| AttachFailure::new("runtime directory", error))?;
     match probe_runtime(&socket_path) {
@@ -527,7 +635,12 @@ pub fn ensure_owned_runtime(
     // the failure real.
     let deadline = Instant::now() + PEER_START_TIMEOUT;
     loop {
-        match attach_project_runtime(cfg, runtime_dir.clone(), models_path) {
+        match attach_project_runtime_with_binding(
+            cfg,
+            runtime_dir.clone(),
+            models_path,
+            binding.clone(),
+        ) {
             Ok(attached) => return Ok(attached),
             Err(failure) if failure.retryable => {
                 // Do not spin: wait for the peer's socket to answer, then retry
@@ -573,8 +686,35 @@ pub fn ensure_owned_runtime_with_policy(
     policy: BringUpPolicy,
     expected: Option<&yi_agent_lifecycle::types::ArtifactIdentity>,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
+    ensure_owned_runtime_with_policy_and_binding(
+        cfg,
+        runtime_dir,
+        models_path,
+        instance_home,
+        policy,
+        expected,
+        None,
+    )
+}
+
+/// [`ensure_owned_runtime_with_policy`], plus the caller's live-settings binding.
+///
+/// Only the embedded branch can use it: the managed branch starts a daemon in
+/// its own process, which resolves the same `settings.json` itself.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_owned_runtime_with_policy_and_binding(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    instance_home: &Path,
+    policy: BringUpPolicy,
+    expected: Option<&yi_agent_lifecycle::types::ArtifactIdentity>,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
     match policy {
-        BringUpPolicy::Embedded => ensure_owned_runtime(cfg, runtime_dir, models_path),
+        BringUpPolicy::Embedded => {
+            ensure_owned_runtime_with_binding(cfg, runtime_dir, models_path, binding)
+        }
         BringUpPolicy::Managed => {
             let Some(expected) = expected else {
                 // A managed start that cannot say what it expects would have to guess
@@ -958,6 +1098,53 @@ mod tests {
         let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
         assert_eq!(probe_runtime(&socket), RuntimeProbe::Healthy);
         drop(daemon);
+    }
+
+    /// The attach path must actually spend the binding it is handed.
+    ///
+    /// A factory built with `None` is indistinguishable from one built with a
+    /// source until a worker is spawned, so a dropped argument here would only
+    /// show up as "saves do not reach subagents" in production. Assert on the
+    /// concrete factory instead, and assert the *same* shared source survived,
+    /// because a copy would stop seeing writes.
+    #[test]
+    fn the_attach_factory_keeps_the_live_settings_binding() {
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = catalog_file(
+            directory.path(),
+            r#"{"models":[{"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-one","api_key":"k"}],"subagent_model":"S1"}"#,
+        );
+        let cfg = base_config(directory.path());
+        let live = yi_agent_runtime::live_settings::LiveSettings::shared(
+            directory.path().join("settings.json"),
+        );
+        let binding = RuntimeSettingsBinding {
+            live: std::sync::Arc::clone(&live),
+            sources: std::sync::Arc::new(FrozenRuntimeSources::default()),
+        };
+
+        // 走生产装配路径，并保留具体类型以便断言内部字段。
+        let factory = super::build_worker_factory(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &yi_agent_runtime::models::load_catalog_from(&path),
+            &path,
+        )
+        .expect("factory");
+        assert!(
+            !factory.has_live_settings_for_test(),
+            "without a binding the factory must stay static"
+        );
+
+        let cfg_with_binding = cfg.clone();
+        let factory = factory.with_live_settings(cfg_with_binding, binding);
+        assert!(
+            factory.has_live_settings_for_test(),
+            "an attached factory must carry the live-settings source"
+        );
     }
 
     /// 生产装配路径必须装上刷新器：改 `models.json` 的 `subagent_model` 后，

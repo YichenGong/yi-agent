@@ -109,6 +109,7 @@ fn source_from_session(session: Session) -> EffectiveSideSource {
         generation: 1,
         provider_gate: None,
         web_policy: SideWebPolicy::default(),
+        live: None,
     }
 }
 

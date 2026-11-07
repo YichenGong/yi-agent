@@ -460,6 +460,23 @@ pub fn load_lenient(cli: &Cli) -> Result<Config> {
     yi_agent_runtime::config::RuntimeConfig::load_lenient(&cli.into())
 }
 
+/// 与 [`load_lenient`] 同一份装配，但额外交出本进程的运行期设置绑定。
+///
+/// app-server 的三个生产入口都从这里取配置：把绑定一并交给 agent 工厂，
+/// 保存的运行参数才会对**已存在**的会话生效。settings 路径必须在这里（cwd
+/// 尚未漂移时）解析成稳定绝对路径，之后不再随工作目录变化。
+pub fn load_lenient_with_binding(
+    cli: &Cli,
+) -> Result<(
+    Config,
+    yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+)> {
+    yi_agent_runtime::config::RuntimeConfig::load_lenient_with_binding(
+        &cli.into(),
+        &yi_agent_runtime::settings::settings_path(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

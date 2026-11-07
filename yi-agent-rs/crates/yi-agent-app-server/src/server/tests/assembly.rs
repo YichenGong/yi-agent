@@ -637,6 +637,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         None,
         // 这些用例不涉注入：空集与 RPC 路径一致。
         Vec::new(),
+        // 这些用例不涉运行期设置：静态装配。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -661,6 +663,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         None,
         // 这些用例不涉注入：空集与 RPC 路径一致。
         Vec::new(),
+        // 这些用例不涉运行期设置：静态装配。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -697,6 +701,8 @@ fn a_dead_runtime_is_repaired_on_the_next_tool_call() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     )
     .expect("a git project must attach");
     let socket = binding.current().unwrap().socket_path.clone();
@@ -717,6 +723,8 @@ fn a_dead_runtime_is_repaired_on_the_next_tool_call() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     )
     .expect("a dead runtime must be replaced, not cached as a failure");
     assert_eq!(
@@ -746,6 +754,8 @@ fn a_vanished_project_directory_is_refused_and_not_recreated() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     ) {
         Ok(_) => panic!("a vanished project directory must not attach"),
         Err(error) => error,
@@ -766,6 +776,8 @@ fn a_vanished_project_directory_is_refused_and_not_recreated() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     )
     .expect("a restored project directory must attach on the next call");
 }
@@ -804,6 +816,8 @@ fn a_transient_attach_failure_is_not_cached_as_a_permanent_one() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     )
     .expect("a transient attach failure must be retried, not replayed from the cache");
 
@@ -840,6 +854,8 @@ fn a_non_transient_failure_is_still_cached() {
         runtime.path(),
         &cfg,
         &isolated_models_path(runtime.path()),
+        // 这些用例不涉及运行期设置：静态装配，与历史行为一致。
+        None,
     ) {
         Ok(_) => panic!("a cached non-transient failure must be replayed"),
         Err(error) => error,
@@ -864,8 +880,14 @@ fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
     let runtime = workdir.join(".yi-agent/runtime");
 
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
-    let binding = attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
-        .expect("a git project must attach");
+    let binding = attach_cwd_runtime(
+        &runtimes,
+        &runtime,
+        &cfg,
+        &isolated_models_path(&runtime),
+        None,
+    )
+    .expect("a git project must attach");
     let socket = binding.current().unwrap().socket_path.clone();
     assert_eq!(
         yi_agent_subagent::attach::probe_runtime(&socket),
@@ -880,8 +902,13 @@ fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
     drop(binding);
     std::fs::remove_dir_all(&workdir).unwrap();
 
-    let error = match attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
-    {
+    let error = match attach_cwd_runtime(
+        &runtimes,
+        &runtime,
+        &cfg,
+        &isolated_models_path(&runtime),
+        None,
+    ) {
         Ok(_) => panic!("a reclaimed worktree must not attach"),
         Err(error) => error,
     };
@@ -910,7 +937,14 @@ fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
 
     for _ in 0..5 {
         assert!(
-            attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime)).is_err(),
+            attach_cwd_runtime(
+                &runtimes,
+                &runtime,
+                &cfg,
+                &isolated_models_path(&runtime),
+                None
+            )
+            .is_err(),
             "a reclaimed worktree stays refused"
         );
     }
@@ -1130,6 +1164,85 @@ fn the_non_delegation_registry_carries_the_theme_tool() {
     assert!(
         registry.get("bash").is_some(),
         "cloning the bootstrap registry must keep its original tools"
+    );
+}
+
+/// A rebuild replaces the `Agent` value, so every place that rebuilds has to
+/// carry the live-settings source across explicitly. This pins the app-server
+/// path: a rebuilt thread agent must still read the shared source, and a save
+/// after the rebuild must be visible without another rebuild.
+#[test]
+fn rebuilt_agent_keeps_live_settings_binding() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let settings_path = dir.path().join("settings.json");
+    // The document is nested; `commit` accepts dotted keys but the file reader
+    // expects the nested shape (the same one the settings UI writes).
+    std::fs::write(&settings_path, r#"{"agent": {"max_turns": 5}}"#).unwrap();
+    let overrides = yi_agent_runtime::config::ConfigOverrides {
+        provider: Some("anthropic".to_string()),
+        api_key: Some("sk-test".to_string()),
+        model: Some("test-model".to_string()),
+        workdir: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+    let (cfg, binding) = yi_agent_runtime::config::RuntimeConfig::load_lenient_with_binding(
+        &overrides,
+        &settings_path,
+    )
+    .expect("test config loads");
+
+    let built = yi_agent_runtime::bootstrap::bootstrap_agent_with_binding(
+        &cfg,
+        yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        binding.clone(),
+    )
+    .expect("a binding-backed bootstrap");
+    let source = built
+        .agent
+        .live_settings_source()
+        .expect("the bootstrap must attach the source");
+    assert_eq!(
+        source.snapshot().expect("snapshot").max_turns,
+        Some(5),
+        "the attached source must read the shared settings"
+    );
+
+    let rebuilt = rebuild_thread_agent_with_theme(built, None, test_theme());
+    let carried = rebuilt
+        .agent
+        .live_settings_source()
+        .expect("the rebuild must carry the live-settings source");
+    assert_eq!(
+        carried.snapshot().expect("snapshot").max_turns,
+        Some(5),
+        "a rebuilt agent must keep reading the same source"
+    );
+
+    binding
+        .live
+        .commit(
+            &serde_json::json!({"agent.max_turns": 11}),
+            yi_agent_runtime::settings::store::PatchMode::ReplaceProvided,
+        )
+        .expect("commit");
+    assert_eq!(
+        rebuilt
+            .agent
+            .live_settings_source()
+            .expect("still attached")
+            .snapshot()
+            .expect("snapshot")
+            .max_turns,
+        Some(11),
+        "a save after the rebuild must reach the same agent"
+    );
+    assert!(
+        binding
+            .sources
+            .resolve(&binding.live.refresh().settings)
+            .values
+            .contains_key("agent.max_turns"),
+        "the frozen table must still resolve runtime keys"
     );
 }
 

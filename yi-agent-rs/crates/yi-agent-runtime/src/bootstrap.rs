@@ -447,8 +447,101 @@ pub fn build_agent_config(
     }
 }
 
-/// 组装 provider + 工具 + 权限通道,返回可运行的 agent。
+/// 组装 provider + 工具 + 权限通道,返回可运行的 agent(**静态**装配)。
+///
+/// 生产宿主应改用 [`bootstrap_agent_with_binding`]：本 facade 不挂运行期设置
+/// 来源，因此会话一旦启动就固定在本次装配的取值上。它保留给只读测试与不关心
+/// 热更新的调用方，行为与历史逐字一致。
 pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<AgentBootstrap> {
+    bootstrap_agent_inner(cfg, mode, None)
+}
+
+/// 同 [`bootstrap_agent`]，但把每会话的运行期设置来源挂到 agent 上。
+///
+/// 这是生产入口：装配完成后，agent 会在每个安全执行点读取 `binding`，因此
+/// 保存设置后的下一次语义操作就采用新值，无需重建 agent。提示词经同一个
+/// [`crate::live_settings::prompt::LivePromptComposer`] 组合，稳定上下文（默认
+/// 指令、`AGENTS.md`、日期）仍只在装配时取一次。
+pub fn bootstrap_agent_with_binding(
+    cfg: &RuntimeConfig,
+    mode: PermissionMode,
+    binding: crate::live_settings::binding::RuntimeSettingsBinding,
+) -> Result<AgentBootstrap> {
+    bootstrap_agent_inner(cfg, mode, Some(binding))
+}
+
+/// Build the per-session live source from an already-assembled catalog handle.
+///
+/// Hosts that assemble their own agent (the CLI's TUI/headless paths do) must
+/// bind through this instead of duplicating the composer choice: the prompt the
+/// static assembly produced and the prompt a live refresh produces have to come
+/// from the *same* composer, otherwise every save would silently change the
+/// stable context too.
+///
+/// The composer is the catalog handle's own when skills are enabled; without
+/// skills a skill-less composer still yields the identical stable context, so a
+/// live user-segment change keeps working.
+pub fn live_source_for(
+    cfg: &RuntimeConfig,
+    catalog: Option<&SkillsCatalogHandle>,
+    binding: Option<&crate::live_settings::binding::RuntimeSettingsBinding>,
+) -> Option<yi_agent_core::live_settings::SharedSettingsSource> {
+    let binding = binding?;
+    let prompt = composer_for(cfg, catalog);
+    Some(
+        binding.agent_source(crate::live_settings::binding::AgentSettingsContext {
+            // The declared window when present; otherwise the same 200k the start-up
+            // threshold computation uses.
+            model_context_length: cfg
+                .model_context_length
+                .unwrap_or(crate::live_settings::binding::FALLBACK_MODEL_CONTEXT_LENGTH),
+            prompt,
+        }),
+    )
+}
+
+/// The composer a session's prompts are composed by.
+///
+/// A catalog handle already owns one (built with the skills service and the
+/// static budget policy); without skills a skill-less composer still yields the
+/// identical stable context, which is what keeps a live user-segment refresh
+/// from also rewriting the default instructions or the project file.
+pub fn composer_for(
+    cfg: &RuntimeConfig,
+    catalog: Option<&SkillsCatalogHandle>,
+) -> Arc<crate::live_settings::prompt::LivePromptComposer> {
+    match catalog {
+        Some(handle) => Arc::clone(handle.composer()),
+        None => Arc::new(
+            crate::live_settings::prompt::LivePromptComposer::new(
+                cfg,
+                crate::live_settings::prompt::PromptRole::Normal,
+                None,
+                crate::live_settings::prompt::InitialCatalogPolicy::Bounded,
+            )
+            .expect("a composer without skills cannot fail"),
+        ),
+    }
+}
+
+/// Attach an assembled live source to an agent, if there is one.
+///
+/// A no-op for `None`, so static callers keep byte-identical behaviour.
+pub fn attach_live_source(
+    mut agent: yi_agent_core::Agent,
+    source: Option<yi_agent_core::live_settings::SharedSettingsSource>,
+) -> yi_agent_core::Agent {
+    if let Some(source) = source {
+        agent.set_live_settings(source);
+    }
+    agent
+}
+
+fn bootstrap_agent_inner(
+    cfg: &RuntimeConfig,
+    mode: PermissionMode,
+    binding: Option<crate::live_settings::binding::RuntimeSettingsBinding>,
+) -> Result<AgentBootstrap> {
     let provider = build_provider(cfg)?;
 
     // 唯一一份共享开关:同时交给沙箱与控制权限的 PermissionChecker,并由
@@ -477,21 +570,29 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
 
     let agent_config = build_agent_config(cfg, setup.system_prompt);
 
+    // The live source is built from the same composer the static prompt came
+    // from, so a hot refresh replaces exactly the user segment and the catalog
+    // segment and keeps every other block byte-identical.
+    let live_source = live_source_for(cfg, setup.catalog.as_ref(), binding.as_ref());
+    let attach_live = |agent: yi_agent_core::Agent| attach_live_source(agent, live_source.clone());
+
     let provider_handle = Arc::clone(&provider);
     let tools = Arc::clone(&setup.tools);
-    let catalog = setup.catalog;
+    let catalog_for_bootstrap = setup.catalog;
     let process_manager = Arc::clone(&setup.process_manager);
     match mode {
         PermissionMode::Interactive => {
-            let agent = yi_agent_core::Agent::new(provider, setup.tools, agent_config)
-                .with_permission(checker.clone(), rx_arc.clone());
+            let agent = attach_live(
+                yi_agent_core::Agent::new(provider, setup.tools, agent_config)
+                    .with_permission(checker.clone(), rx_arc.clone()),
+            );
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
                 provider: provider_handle,
                 tools,
                 process_manager: Arc::clone(&process_manager),
-                catalog,
+                catalog: catalog_for_bootstrap,
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
                 yolo: switch.clone(),
@@ -503,15 +604,17 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
             // `recv()` 会立即返回 `None`,黑名单命令据此解析为 Deny,而不是
             // 永久阻塞等待一个不会到来的决定。
             drop(decision_tx);
-            let agent = yi_agent_core::Agent::new(provider, setup.tools, agent_config)
-                .with_permission(checker.clone(), rx_arc);
+            let agent = attach_live(
+                yi_agent_core::Agent::new(provider, setup.tools, agent_config)
+                    .with_permission(checker.clone(), rx_arc),
+            );
             Ok(AgentBootstrap {
                 agent,
                 permission: checker,
                 provider: provider_handle,
                 tools,
                 process_manager: Arc::clone(&process_manager),
-                catalog,
+                catalog: catalog_for_bootstrap,
                 decision_tx: None,
                 decision_rx: None,
                 yolo: switch.clone(),
@@ -1651,6 +1754,71 @@ mod tests {
             anthropic.max_tokens.is_some(),
             "max_tokens 是 Anthropic 必填字段，转换后绝不为 None"
         );
+    }
+
+    /// 生产入口必须把运行期设置来源挂到 agent 上；静态 facade 必须不挂。
+    ///
+    /// 这条钉住的是「接线是否存在」：一个装配了 binding 却没有把来源交给
+    /// `Agent` 的宿主，其会话会静默地停在启动值上，任何设置界面都看不出异常。
+    #[test]
+    fn bootstrap_with_binding_attaches_the_shared_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({"agent": {"max_turns": 7}}).to_string(),
+        )
+        .unwrap();
+        // The overrides pin provider/model/key so the assembly is independent of
+        // the developer's own environment; they contain no FIELDS key, so the
+        // frozen source table stays empty and settings remain authoritative.
+        let overrides = crate::config::ConfigOverrides {
+            provider: Some("anthropic".to_string()),
+            api_key: Some("sk-test".to_string()),
+            model: Some("test-model".to_string()),
+            workdir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let (cfg, binding) =
+            crate::config::RuntimeConfig::load_lenient_with_binding(&overrides, &settings_path)
+                .unwrap();
+
+        let live = bootstrap_agent_with_binding(&cfg, PermissionMode::AutoAllow, binding.clone())
+            .expect("bootstrap");
+        assert!(
+            live.agent.live_settings_source().is_some(),
+            "binding 入口必须把来源挂到 agent 上"
+        );
+        let snapshot = live
+            .agent
+            .live_settings_source()
+            .unwrap()
+            .snapshot()
+            .expect("snapshot");
+        assert_eq!(snapshot.max_turns, Some(7), "来源必须读到共享设置");
+
+        let stat = bootstrap_agent(&cfg, PermissionMode::AutoAllow).expect("bootstrap");
+        assert!(
+            stat.agent.live_settings_source().is_none(),
+            "静态 facade 不得挂来源（旧测试与无热更新调用方的行为必须不变）"
+        );
+
+        // The same binding is meant to be cloned to every session: a second
+        // save must be visible without rebuilding anything.
+        binding
+            .live
+            .commit(
+                &serde_json::json!({"agent.max_turns": 9}),
+                crate::settings::store::PatchMode::ReplaceProvided,
+            )
+            .expect("commit");
+        let snapshot = live
+            .agent
+            .live_settings_source()
+            .unwrap()
+            .snapshot()
+            .expect("snapshot");
+        assert_eq!(snapshot.max_turns, Some(9), "保存后同一 agent 应读到新值");
     }
 
     /// 上一条只钉住「不为 `None`」，这条钉住「缺席时落到哪个值」：`GenParams` 显式

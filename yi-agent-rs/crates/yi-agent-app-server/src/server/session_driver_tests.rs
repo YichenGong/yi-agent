@@ -247,6 +247,8 @@ impl Host {
             runtimes: &self.runtimes,
             thread_roots: &self.thread_roots,
             models_path: &self.models_path,
+            // 本测试宿主不涉运行期设置：静态装配。
+            live_settings: None,
             cfg: &self.cfg,
             hub: &self.hub,
             turn_tx: &self.turn_tx,
@@ -343,6 +345,7 @@ impl Host {
             &self.git_diff,
             &self.workspaces,
             build_agent,
+            None,
             &self.lead_inbox,
             &self.lead_replies,
             &self.lead_control,

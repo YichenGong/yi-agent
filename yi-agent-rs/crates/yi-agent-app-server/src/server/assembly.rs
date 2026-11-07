@@ -36,6 +36,7 @@ pub(crate) fn attach_cwd_runtime(
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
     models_path: &Path,
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
     // A project directory that no longer exists has nothing to bring up, and the
@@ -70,17 +71,24 @@ pub(crate) fn attach_cwd_runtime(
     // one. The binding it returns heals itself on later calls, so a daemon that
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
-    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(
+    // The binding only reaches a daemon this process starts itself; a managed
+    // (separate-process) daemon resolves the same file independently. Passing it
+    // here is therefore the embedded half of the live-settings contract, and a
+    // no-op otherwise.
+    let outcome = yi_agent_subagent::attach::ensure_owned_runtime_with_binding(
         cfg,
         runtime_dir.to_path_buf(),
         models_path,
+        live_settings.cloned(),
     )
     .map(|attached| {
-        RuntimeBinding::managed(
+        RuntimeBinding::managed_with_live_settings(
             cfg,
             runtime_dir.to_path_buf(),
             models_path.to_path_buf(),
             Arc::new(attached),
+            yi_agent_subagent::binding::BringUpChoice::default(),
+            live_settings.cloned(),
         )
     });
     let mut cache = runtimes.lock().unwrap_or_else(|p| p.into_inner());

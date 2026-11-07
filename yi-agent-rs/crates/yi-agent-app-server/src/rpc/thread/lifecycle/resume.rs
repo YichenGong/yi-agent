@@ -189,6 +189,7 @@ pub(crate) async fn handle(
                 // resume 不重注环境变量：`session_env` 在会话装配期定值，
                 // 重开时沿用同一口径（空集），与 `thread/start` 一致。
                 Vec::new(),
+                state.live_settings,
                 built,
             );
             let BuiltAgent {

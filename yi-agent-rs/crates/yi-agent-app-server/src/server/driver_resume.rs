@@ -231,6 +231,7 @@ where
             loaded.meta.anchor_sha.clone(),
             Some(self.lead_agent_enabled),
             env.clone(),
+            self.live_settings,
             built,
         );
         // spec §5.1:冷装配必须在**实际构造 bash 工具**时应用 env;装配失败就

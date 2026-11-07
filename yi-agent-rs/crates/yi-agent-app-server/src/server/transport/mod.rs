@@ -44,7 +44,9 @@ pub(crate) use notifications::{pump_git_diff_notifications, pump_theme_notificat
 // `run` 与 `serve_stdio_with_relay` 由 `lib.rs` 以 `pub use` 再导出给 CLI，故这里
 // 必须同样是 `pub`；其余仅在 crate 内使用。
 pub(crate) use scoped::{parse_relay_url, serve_scoped, serve_scoped_core, serve_stdio};
-pub use scoped::{run, serve_stdio_with_relay};
+pub use scoped::{
+    run, run_with_binding, serve_stdio_with_relay, serve_stdio_with_relay_and_binding,
+};
 #[allow(unused_imports)]
 pub(crate) use stdio::{pump_stdout, read_lines};
 
@@ -129,6 +131,9 @@ where
         // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
+        // 进程级运行期设置绑定:只给本项目自己起的 daemon 的 worker 工厂用
+        // (见 `attach_cwd_runtime`)。`None` = 历史静态行为。
+        live_settings,
     } = attachments;
     // 旁支注册表:一个进程一份。注入的那份(测试)已经带好替身 resolver;生产
     // 在这里自建,resolver 用「按 threadId 定位 store 后严格冷读」那条路径。
@@ -494,6 +499,7 @@ where
                             models_path: &models_path,
                             websearch_path: &websearch_path,
                             settings_path: &settings_path,
+                            live_settings: live_settings.as_ref(),
                             probes: &probes,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
@@ -816,6 +822,7 @@ where
                     &git_diff_handle,
                     &workspaces,
                     &build_agent,
+                    live_settings.as_ref(),
                     &lead_inbox,
                     &lead_replies,
                     &lead_control,
@@ -881,6 +888,7 @@ where
                         runtimes: &runtimes,
                         thread_roots: &thread_roots,
                         models_path: &models_path,
+                        live_settings: live_settings.as_ref(),
                         lead_agent_enabled,
                         cfg: &cfg,
                         hub: &hub,
@@ -938,6 +946,7 @@ where
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
                     models_path: &models_path,
+                    live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,
@@ -985,6 +994,7 @@ where
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
                     models_path: &models_path,
+                    live_settings: live_settings.as_ref(),
                     lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,

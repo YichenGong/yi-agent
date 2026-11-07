@@ -71,8 +71,8 @@ pub(crate) mod runtime_binding;
 #[allow(unused_imports)]
 pub(crate) use runtime_binding::{
     SESSION_PRESERVE_THINKING, current_session_preserve_thinking, extract_prompt, home_dir,
-    instance_home_dir, production_factory, project_key, skills_home_dir,
-    with_session_preserve_thinking,
+    instance_home_dir, production_factory, production_factory_with_binding, project_key,
+    skills_home_dir, with_session_preserve_thinking,
 };
 
 pub(crate) mod rpc_io;
@@ -154,7 +154,9 @@ pub(crate) use transport::{
 // 这条链路必须一路 `pub`。`cargo fix` 会把它当"未用"删掉（lib target 里确实没
 // 有用到它的地方，用的是 lib.rs 的再导出），故放行。
 #[allow(unused_imports)]
-pub use transport::{run, serve_stdio_with_relay};
+pub use transport::{
+    run, run_with_binding, serve_stdio_with_relay, serve_stdio_with_relay_and_binding,
+};
 
 #[allow(unused_imports)]
 pub(crate) use driver::{
@@ -297,6 +299,17 @@ pub(crate) struct RuntimeAttachments {
     /// `models_path` is: the runtime settings panel must be testable without
     /// writing the developer's real machine-level config.
     pub(crate) settings_path: PathBuf,
+    /// The process-wide live-settings binding, if this host has one.
+    ///
+    /// It is handed to every project daemon this process starts *itself* (the
+    /// embedded policy), so the subagent workers that daemon runs follow a save
+    /// at their next safe point. A managed daemon is a separate process and
+    /// resolves the same file on its own; the binding is simply unused there.
+    ///
+    /// `None` is the historical static behaviour, which is what tests and the
+    /// `serve_scoped`/`serve_stdio` shims keep using.
+    pub(crate) live_settings:
+        Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
     /// 组长开关的**生效值**，装配时算一次。
     ///
     /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，

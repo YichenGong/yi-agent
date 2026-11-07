@@ -82,6 +82,9 @@ pub(crate) async fn start_thread_core(
     // 调用方额外注入给本会话 shell 的环境变量。被驱动的会话用它带插件给的卡片
     // 句柄；RPC 起的会话传空集（与改动前逐字一致）。
     extra_session_env: Vec<(String, String)>,
+    // 进程级运行期设置绑定。只影响本进程自起的项目 daemon 的 worker 工厂；
+    // `None` 与历史行为逐字一致。
+    live_settings: Option<&yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -116,6 +119,7 @@ pub(crate) async fn start_thread_core(
         anchor_sha.clone(),
         lead_agent_enabled,
         extra_session_env,
+        live_settings,
         built,
     );
     let BuiltAgent {

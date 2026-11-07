@@ -40,6 +40,14 @@ struct RepairPlan {
     /// switched from embedded to managed would change *who owns the daemon* in the
     /// middle of a session.
     bringup: BringUpChoice,
+    /// The live-settings binding the first bring-up used.
+    ///
+    /// A repaired *embedded* daemon builds its own worker factory, so without
+    /// this the replacement would silently fall back to static assembly: every
+    /// session would keep its old parameters after any daemon death, even though
+    /// the settings UI still says the new values. The managed path resolves
+    /// `settings.json` in its own process and ignores this.
+    live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 }
 
 /// The bring-up a binding uses, together with the artifact a managed one expects.
@@ -126,6 +134,22 @@ impl RuntimeBinding {
         initial: Arc<AttachedProjectRuntime>,
         bringup: BringUpChoice,
     ) -> Arc<Self> {
+        Self::managed_with_live_settings(cfg, runtime_dir, models_path, initial, bringup, None)
+    }
+
+    /// [`Self::managed_with`], plus the live-settings binding a repair must reuse.
+    ///
+    /// The binding is what makes "settings apply to every session" survive a
+    /// daemon replacement. Passing it here is the only way a repaired embedded
+    /// daemon can keep the same shared source instead of a static factory.
+    pub fn managed_with_live_settings(
+        cfg: &RuntimeConfig,
+        runtime_dir: PathBuf,
+        models_path: PathBuf,
+        initial: Arc<AttachedProjectRuntime>,
+        bringup: BringUpChoice,
+        live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BindingState {
                 handle: Self::handle_of(&initial),
@@ -137,6 +161,7 @@ impl RuntimeBinding {
                 runtime_dir,
                 models_path,
                 bringup,
+                live_settings,
             }),
             flight: Mutex::new(()),
             last_active: Mutex::new(Instant::now()),
@@ -308,7 +333,7 @@ impl RuntimeBinding {
                 return Ok((state.handle.clone(), state.generation));
             }
         }
-        let fresh = attach::ensure_owned_runtime_with_policy(
+        let fresh = attach::ensure_owned_runtime_with_policy_and_binding(
             &plan.cfg,
             plan.runtime_dir.clone(),
             &plan.models_path,
@@ -318,6 +343,7 @@ impl RuntimeBinding {
                 .unwrap_or_else(|| std::path::Path::new("")),
             plan.bringup.policy,
             plan.bringup.expected.as_ref(),
+            plan.live_settings.clone(),
         )
         .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
         let handle = Self::handle_of(&fresh);
@@ -446,6 +472,63 @@ mod tests {
     use std::io::{Error as IoError, ErrorKind};
     use yi_agent_store::ipc::IpcError;
 
+    /// A `RuntimeConfig` for plan-level tests. Spelled out because the struct has
+    /// no `Default`; only the fields a repair reads (`workdir`) matter here.
+    fn repair_test_config(workdir: &std::path::Path) -> yi_agent_runtime::config::RuntimeConfig {
+        yi_agent_runtime::config::RuntimeConfig {
+            provider: "anthropic".into(),
+            api_url: "https://api.anthropic.com".into(),
+            api_key: String::new(),
+            model: "base-model".into(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
+            max_turns: 4,
+            max_resident_subagents: 8,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
+            workdir: workdir.to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+            model_injected: false,
+            notifications: true,
+            notification_method: "auto".to_string(),
+            notification_condition: "unfocused".to_string(),
+            terminal_title: true,
+        }
+    }
+
+    /// A detachable `AttachedProjectRuntime` over a temp dir.
+    ///
+    /// Only the handle fields matter for these plan-level tests; the runtime is
+    /// never started, so no daemon is left behind.
+    fn attached(directory: &std::path::Path) -> crate::attach::AttachedProjectRuntime {
+        crate::attach::AttachedProjectRuntime::detached_for_test(
+            directory,
+            crate::AttachedRoot {
+                session_id: "s".into(),
+                task_id: "t".into(),
+                capability: "c".into(),
+                workspace: yi_agent_core::subagent::worker::WorkerWorkspace {
+                    lease_id: yi_agent_core::subagent::task::WorkspaceLeaseId::new(),
+                    repository_root: directory.to_path_buf(),
+                    path: directory.to_path_buf(),
+                    branch: String::new(),
+                    parent_branch: String::new(),
+                    base_commit: String::new(),
+                },
+            },
+        )
+    }
+
     fn handle(socket: &str) -> RuntimeHandle {
         RuntimeHandle {
             socket_path: socket.into(),
@@ -462,6 +545,79 @@ mod tests {
         assert_eq!(
             binding.current().unwrap().socket_path,
             PathBuf::from("/tmp/frozen.sock")
+        );
+    }
+
+    /// A repair must reuse the *same* shared source, not a snapshot of it.
+    ///
+    /// The failure this pins is silent: a repaired embedded daemon builds a new
+    /// worker factory, so if the plan drops the binding every later subagent goes
+    /// back to static assembly and keeps running pre-save parameters while the
+    /// settings UI shows the new ones. Pointer equality is the strongest thing
+    /// checkable without spawning a provider; a copied source would pass a mere
+    /// `is_some` check and still stop seeing writes.
+    ///
+    /// Built through the real constructor on purpose: a test that fills the
+    /// private plan by hand only proves the struct has a field.
+    #[test]
+    fn a_managed_binding_carries_the_shared_settings_source_into_its_repair_plan() {
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let live = yi_agent_runtime::live_settings::LiveSettings::shared(
+            directory.path().join("settings.json"),
+        );
+        let settings = RuntimeSettingsBinding {
+            live: std::sync::Arc::clone(&live),
+            sources: std::sync::Arc::new(FrozenRuntimeSources::default()),
+        };
+        let cfg = repair_test_config(directory.path());
+
+        let binding = RuntimeBinding::managed_with_live_settings(
+            &cfg,
+            directory.path().join("runtime"),
+            directory.path().join("models.json"),
+            std::sync::Arc::new(attached(directory.path())),
+            BringUpChoice::default(),
+            Some(settings.clone()),
+        );
+
+        let carried = binding
+            .repair
+            .as_ref()
+            .expect("a managed binding always has a repair plan")
+            .live_settings
+            .as_ref()
+            .expect("the plan must carry the binding");
+        assert!(
+            std::sync::Arc::ptr_eq(&carried.live, &settings.live),
+            "a repaired daemon must read the same source instance it started with"
+        );
+    }
+
+    /// The historical four-argument constructor stays static.
+    ///
+    /// Callers that never opted into live settings must not start reading a
+    /// `settings.json` they never asked for, so this pins the default.
+    #[test]
+    fn a_plain_managed_binding_has_no_live_settings() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let cfg = repair_test_config(directory.path());
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            directory.path().join("runtime"),
+            directory.path().join("models.json"),
+            std::sync::Arc::new(attached(directory.path())),
+        );
+        assert!(
+            binding
+                .repair
+                .as_ref()
+                .expect("a managed binding always has a repair plan")
+                .live_settings
+                .is_none(),
+            "without an explicit binding the repair plan must stay static"
         );
     }
 

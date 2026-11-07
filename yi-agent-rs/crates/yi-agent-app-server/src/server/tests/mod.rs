@@ -917,6 +917,8 @@ impl Harness {
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
+                // 这些用例不涉运行期设置：静态装配。
+                live_settings: None,
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
@@ -1537,6 +1539,8 @@ pub(crate) async fn serve_ws_with_permission_agent(
         workspaces,
         pairing,
         theme,
+        // 这条测试接缝没有设置来源：静态装配，与历史行为一致。
+        None,
         build_permission_agent,
     )
     .await
@@ -2572,6 +2576,8 @@ impl MergedHarness {
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 settings_path: PathBuf::new(),
+                // 这些用例不涉运行期设置：静态装配。
+                live_settings: None,
                 lead_agent_enabled: false,
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),

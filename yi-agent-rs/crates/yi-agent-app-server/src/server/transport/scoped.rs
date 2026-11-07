@@ -16,15 +16,32 @@ use crate::server::{
     BuiltAgent, ClientInitialized, ClientScopes, ClientShellAuthorizations, PERMISSION_TIMEOUT,
     ProjectRuntimes, RuntimeAttachments, ThreadRoots, home_dir, install_device_registry,
     instance_home_dir, migrate_legacy_model_keys_on_startup,
-    migrate_legacy_resident_requests_on_startup, production_factory, production_watchman_install,
-    production_watchman_uninstall, pump_stdout, read_lines, serve, skills_home_dir,
-    spawn_resident_watch_loop,
+    migrate_legacy_resident_requests_on_startup, production_factory_with_binding,
+    production_watchman_install, production_watchman_uninstall, pump_stdout, read_lines, serve,
+    skills_home_dir, spawn_resident_watch_loop,
 };
 
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
 ///
 /// `cfg` 同时用于 `config/read` 响应与(每个 thread 的)`bootstrap_agent`。
 pub async fn run<R, W>(reader: R, writer: W, cfg: RuntimeConfig) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    run_with_binding(reader, writer, cfg, None).await
+}
+
+/// [`run`]，并把进程级运行期设置绑定交给该进程创建的每个会话。
+///
+/// 生产入口用它：`None` 与历史行为逐字一致（静态装配），`Some` 则让保存后的
+/// 运行参数对**已存在**的会话在下一次安全执行点生效。
+pub async fn run_with_binding<R, W>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
+) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -72,6 +89,8 @@ where
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),
+            // 本进程的绑定:内嵌项目 daemon 的 worker 工厂据此跟随保存。
+            live_settings: binding.clone(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -97,7 +116,7 @@ where
             lead_control: crate::lead_control::LeadControlInbox::new(),
             lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
-        production_factory(cfg, theme_for_factory, catalog),
+        production_factory_with_binding(cfg, theme_for_factory, catalog, binding),
     )
     .await
 }
@@ -122,6 +141,25 @@ pub async fn serve_stdio_with_relay<R, W>(
     writer: W,
     cfg: RuntimeConfig,
     relay_url: String,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_stdio_with_relay_and_binding(reader, writer, cfg, relay_url, None).await
+}
+
+/// [`serve_stdio_with_relay`]，并把进程级运行期设置绑定交给每个会话。
+///
+/// `None` 与历史行为逐字一致；生产入口传 `Some`，使保存的运行参数对已存在的
+/// 会话也生效（与 [`run_with_binding`] 同一契约，只是这一条路径还多接一条环回
+/// ws 前端）。
+pub async fn serve_stdio_with_relay_and_binding<R, W>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    relay_url: String,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -161,6 +199,8 @@ where
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
             settings_path: yi_agent_runtime::settings::settings_path(),
+            // 本进程的绑定:内嵌项目 daemon 的 worker 工厂据此跟随保存。
+            live_settings: binding.clone(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
@@ -186,7 +226,7 @@ where
             lead_control: crate::lead_control::LeadControlInbox::new(),
             lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
-        production_factory(cfg, theme_for_factory, catalog),
+        production_factory_with_binding(cfg, theme_for_factory, catalog, binding),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
         Scope::Admin,
         Some(listener),

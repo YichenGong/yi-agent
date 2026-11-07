@@ -116,6 +116,7 @@ pub fn run_guardian(scope: yi_agent_lifecycle::types::RuntimeScope) -> anyhow::R
 /// change.
 pub fn run_managed_daemon(
     invocation: yi_agent_runtime::config::RuntimeConfig,
+    live_settings: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<()> {
     use yi_agent_supervisors::lifecycle::roles::{ManagedRole, inherited_bootstrap};
     let _bootstrap = inherited_bootstrap(ManagedRole::Daemon)?;
@@ -125,10 +126,14 @@ pub fn run_managed_daemon(
     // (the *root* being served) is taken from the invocation.
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir);
     let database = runtime_dir.join("runtime.sqlite");
-    let factory = yi_agent_subagent::attach::worker_factory(
+    // The daemon resolves its own source (the launcher passes one in) so every
+    // worker it starts follows a settings save at its next safe point. `None`
+    // keeps the historical static factory for callers that have no binding.
+    let factory = yi_agent_subagent::attach::worker_factory_with_binding(
         &invocation,
         runtime_dir.clone(),
         &yi_agent_runtime::models::models_path(),
+        live_settings,
     )?;
     let daemon = yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory)
         .map_err(|error| anyhow::anyhow!("could not start the managed daemon: {error}"))?;

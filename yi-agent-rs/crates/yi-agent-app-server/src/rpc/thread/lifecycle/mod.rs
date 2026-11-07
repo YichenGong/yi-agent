@@ -163,6 +163,7 @@ pub(crate) async fn handle(
                 Some(state.lead_agent_enabled),
                 // RPC 起的会话没有驱动方句柄，不额外注入环境变量。
                 Vec::new(),
+                state.live_settings,
             )
             .await?;
 

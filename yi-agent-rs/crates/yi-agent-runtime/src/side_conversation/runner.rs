@@ -386,6 +386,13 @@ impl SideConversationRunner {
         if let Some(gate) = &self.source.provider_gate {
             agent = agent.with_provider_turn_gate(Arc::clone(gate));
         }
+        // The parent's live source, not a copy of its values: a settings save
+        // reaches this turn's next safe point. The side's own hard limits
+        // (`ManagedRunLimits::side_defaults`) and its already-spent budget stay
+        // exactly as they are, so a save never resets or reopens a side.
+        if let Some(live) = &self.source.live {
+            agent.set_live_settings(Arc::clone(live));
+        }
 
         let run = agent
             .run_managed_blocks(

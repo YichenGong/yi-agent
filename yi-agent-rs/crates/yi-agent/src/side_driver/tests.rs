@@ -90,6 +90,7 @@ fn source(provider: Arc<CountingProvider>, root: &std::path::Path) -> EffectiveS
         generation: 1,
         provider_gate: None,
         web_policy: SideWebPolicy::default(),
+        live: None,
     }
 }
 

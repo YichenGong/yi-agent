@@ -621,13 +621,15 @@ pub fn worker_factory_with_binding(
     cfg: &RuntimeConfig,
     runtime_socket: std::path::PathBuf,
     models_path: &std::path::Path,
-    binding: yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding,
+    binding: Option<yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding>,
 ) -> anyhow::Result<std::sync::Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>>;
 ```
 
+**实现记录（兼容决策）**：binding 取 `Option` 而不是上面的非可选形态。理由是该函数是所有 attach 路径的唯一出口，而历史静态调用方（测试、TUI、无设置来源的宿主）必须继续得到 `None` 的逐字不变行为；可选参数把它们与热更新宿主统一在一个入口，不必复制两份装配逻辑。`Some` 与 `None` 的行为差由 `the_attach_factory_keeps_the_live_settings_binding` 钉住（`None` 不装来源、`Some` 装上同一份共享实例）。
+
 现有attach_project_runtime及其with_environment内部装配共同接收调用宿主已有binding（可新增同名 `_with_binding` facade，原静态facade只用于旧测试），不要在每次attach/每模型刷新时重新capture。`main::run_internal_daemon` / `managed_runtime::run_managed_daemon` 也把入口binding传给此工厂；executor入口由Task13单独处理。
 
-- [ ] **Step 1: 写失败测试。** 在 assembly.rs 复用已有 mock工厂，增加 `rebuilt_agent_keeps_live_settings_binding`：建立会话→保存A→执行→经现有 MCP/模式/模型合法重建之一→保存B→再执行；录制请求依次A/B，session/provider身份只在原机制要求时变化。subagent 用当前 WorkerRefresh 夹具保持模型 EffectiveKey 不变，运行一段工具循环，在途保存后下一 THINK 新值；证明不是只更新未来 worker。
+- [x] **Step 1: 写失败测试。** 在 assembly.rs 复用已有 mock工厂，增加 `rebuilt_agent_keeps_live_settings_binding`：建立会话→保存A→执行→经现有 MCP/模式/模型合法重建之一→保存B→再执行；录制请求依次A/B，session/provider身份只在原机制要求时变化。subagent 用当前 WorkerRefresh 夹具保持模型 EffectiveKey 不变，运行一段工具循环，在途保存后下一 THINK 新值；证明不是只更新未来 worker。
 
 旁问测试在 runtime 的既有 runner 夹具上增加：
 
@@ -641,8 +643,8 @@ assert_eq!(source.generation, before_generation);
 
 generation 的访问在现有测试模块进行，不新增用户可写 lifecycle API。旁问正常参数更新取最新 binding；固定 ManagedRunLimits 及已消耗统计不变。
 
-- [ ] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib rebuilt_agent_keeps_live_settings_binding`、`cargo test -p yi-agent-runtime --lib side_conversation`、`cargo test -p yi-agent-subagent --lib live_settings`。
-- [ ] **Step 3: 最小接线。** 进程入口在 cwd切换前解析稳定settings路径并调用Task3的load_lenient_with_binding；不要先load_config再capture来源。factory 捕获 binding，不捕获固定运行值。每会话装配用已解析模型上下文创建 adapter；非运行字段仍来自现有 thread_cfg。沿 `Agent::new` 搜索本 crate 的重建点逐个保留 binding、session、权限/checker、gate、process_manager。外层旧 set_system_prompt 改走 Task6 的统一 composer或删除重复覆盖。
+- [x] **Step 2: RED。** Run `cargo test -p yi-agent-app-server --lib rebuilt_agent_keeps_live_settings_binding`、`cargo test -p yi-agent-runtime --lib side_conversation`、`cargo test -p yi-agent-subagent --lib live_settings`。
+- [x] **Step 3: 最小接线。** 进程入口在 cwd切换前解析稳定settings路径并调用Task3的load_lenient_with_binding；不要先load_config再capture来源。factory 捕获 binding，不捕获固定运行值。每会话装配用已解析模型上下文创建 adapter；非运行字段仍来自现有 thread_cfg。沿 `Agent::new` 搜索本 crate 的重建点逐个保留 binding、session、权限/checker、gate、process_manager。外层旧 set_system_prompt 改走 Task6 的统一 composer或删除重复覆盖。
 
 ```rust
 let mut agent = Agent::new(provider, tools, agent_config);
@@ -654,8 +656,8 @@ agent.set_live_settings(binding.agent_source(AgentSettingsContext {
 
 为旁问 EffectiveSideSource 增加可克隆 binding/role context，但设置变化不调用 begin_update、不改 lifecycle revision/generation；model/权限的原有生命周期变化仍保留原行为。Naked 仅挂无提示词 adapter，不注册工具。手动压缩入口从 `agent.live_settings_source()` 克隆绑定并传给Task5新wrapper；Task5同步提供只读 `Agent::provider_turn_gate(&self) -> Option<Arc<dyn ProviderTurnGate>>`，必须把原Agent实际gate一起传入，不能用None绕过已有准入。app-server command函数增加source/gate入参（若已有agent所有权则直接取getter），CLI DriverControl::Compact同样传入；测试结束旧用户回合后保存新预算、阻塞摘要准入再保存另一预算，释放后必须在真实摘要请求/保留历史中观察最终新值。独立executor的本地来源绑定由Task13完成，本任务不宣称它已覆盖。
 
-- [ ] **Step 4: GREEN。** Run 上述 targeted命令及 `cargo test -p yi-agent-app-server --lib assembly`、`cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent --bin yi-agent`。检查 CLI/headless/TUI三入口的真实构造路径，而非只测 bootstrap。
-- [ ] **Step 5: 文档/门禁/提交。** runtime/app-server/subagent/CLI/旁问模块加交叉引用，message `feat: retain live settings across hosts and agent rebuilds`。
+- [x] **Step 4: GREEN。** Run 上述 targeted命令及 `cargo test -p yi-agent-app-server --lib assembly`、`cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent --bin yi-agent`。检查 CLI/headless/TUI三入口的真实构造路径，而非只测 bootstrap。
+- [x] **Step 5: 文档/门禁/提交。** runtime/app-server/subagent/CLI/旁问模块加交叉引用，message `feat: retain live settings across hosts and agent rebuilds`。
 
 ## Task 8: 接入真实 supervisor 和 resident 准入
 
