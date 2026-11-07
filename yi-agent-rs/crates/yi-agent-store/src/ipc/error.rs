@@ -31,11 +31,16 @@ pub enum IpcError {
     FrameWriteTimeout { written: usize, total: usize },
     #[error("daemon listener thread panicked during shutdown")]
     ListenerPanicked,
-    #[error(
-        "socket path {path} exceeds this platform's {limit}-byte limit; \
-         shorten the project path or set YI_AGENT_RUNTIME_DIR to a short directory"
-    )]
+    #[error("socket path {path} exceeds this platform's {limit}-byte sun_path limit")]
     SocketPathTooLong { path: String, limit: usize },
+    /// No environment source can name the instance home, so the socket directory
+    /// cannot be derived. Reported rather than falling back to a temp directory: a
+    /// socket nobody else can find is worse than a clear error.
+    #[error(
+        "cannot derive the instance home: none of YI_AGENT_INSTANCE_HOME, \
+         YI_AGENT_HOME or HOME is set"
+    )]
+    InstanceHomeUnavailable,
     /// The daemon answered with an error frame. The code is its stable
     /// category and the message is whatever it chose to disclose; both are
     /// already sanitized at the wire boundary.

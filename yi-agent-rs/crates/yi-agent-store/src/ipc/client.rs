@@ -61,40 +61,27 @@ fn classify_reply_error(error: std::io::Error, deadline: Duration) -> IpcError {
 /// smaller bound keeps one behaviour across platforms.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
-/// A runtime directory normally owns its socket (`<runtime_dir>/runtime.sock`).
-/// That layout cannot always work: `sun_path` is capped at
-/// [`MAX_SOCKET_PATH_BYTES`], so a deep project path — the default runtime
-/// directory is `<workdir>/.yi-agent/runtime` — overflows it and `bind` fails
-/// with `AF_UNIX path too long`, silently disabling subagent delegation.
+/// The business daemon's socket for a runtime directory.
 ///
-/// When the direct path does not fit, the socket moves to a short, stable name
-/// under the platform temporary directory, derived from the runtime directory
-/// so that the daemon and every client agree on one location. Distinct projects
-/// keep distinct sockets; an explicitly shared runtime directory keeps sharing.
+/// `<instance_home>/sockets/<hash>/runtime.sock` — the length depends on where the
+/// instance lives, never on how deep the project is. The previous layout put it
+/// beside the runtime directory, which overflowed `sun_path` on a deep checkout and
+/// failed `bind` with `AF_UNIX path too long`.
+///
+/// The instance home is resolved from the environment because most callers hold
+/// only a `runtime_dir`. A caller that already knows it should pass it to
+/// `yi_agent_lifecycle::scope::daemon_socket` directly rather than relying on this.
 pub fn socket_path_for(runtime_dir: &Path) -> Result<PathBuf, IpcError> {
-    let direct = runtime_dir.join("runtime.sock");
-    if direct.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
-        return Ok(direct);
-    }
-    let name = socket_file_name(runtime_dir);
-    let fallback_dir = std::env::temp_dir();
-    let fallback = fallback_dir.join(&name);
-    if fallback.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+    let home = yi_agent_lifecycle::scope::instance_home_for_sockets()
+        .ok_or(IpcError::InstanceHomeUnavailable)?;
+    let socket = yi_agent_lifecycle::scope::daemon_socket(runtime_dir, &home);
+    if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
         return Err(IpcError::SocketPathTooLong {
-            path: fallback.display().to_string(),
+            path: socket.display().to_string(),
             limit: MAX_SOCKET_PATH_BYTES,
         });
     }
-    Ok(fallback)
-}
-
-/// The stable file name used when a socket cannot live beside its runtime
-/// directory. Derived from the runtime directory, not the working directory, so
-/// callers that share a runtime directory also share its socket.
-pub(crate) fn socket_file_name(runtime_dir: &Path) -> String {
-    let digest = Sha256::digest(runtime_dir.as_os_str().as_encoded_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("yi-agent-{}.sock", &hex[..16])
+    Ok(socket)
 }
 
 pub fn send_request(
@@ -379,38 +366,41 @@ mod socket_path_tests {
     const LONG_RUNTIME_DIR: &str = "/Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.yi-agent/runtime";
 
     #[test]
-    fn a_short_runtime_directory_keeps_the_socket_inside_it() {
+    fn the_socket_lives_in_the_shared_directory_not_the_runtime_directory() {
         let runtime_dir = Path::new("/tmp/project/.yi-agent/runtime");
 
-        let socket = socket_path_for(runtime_dir).expect("short paths resolve");
-
-        assert_eq!(
-            socket,
-            runtime_dir.join("runtime.sock"),
-            "a runtime directory that fits must keep its existing layout"
-        );
-    }
-
-    #[test]
-    fn a_long_runtime_directory_yields_a_socket_that_fits_the_platform_limit() {
-        let runtime_dir = Path::new(LONG_RUNTIME_DIR);
-        assert!(
-            runtime_dir.join("runtime.sock").as_os_str().len() > MAX_SOCKET_PATH_BYTES,
-            "precondition: the direct socket path must overflow the limit"
-        );
-
-        let socket = socket_path_for(runtime_dir).expect("long paths fall back, not fail");
+        let socket = socket_path_for(runtime_dir).expect("resolves");
 
         assert!(
-            socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
-            "socket must fit sockaddr_un.sun_path, got {} bytes: {}",
-            socket.as_os_str().len(),
+            socket.to_string_lossy().contains("/sockets/"),
+            "socket must move to the shared directory: {}",
             socket.display()
         );
+        assert!(
+            !socket.starts_with(runtime_dir),
+            "socket must no longer sit inside the runtime directory: {}",
+            socket.display()
+        );
+        assert_eq!(socket.file_name().unwrap(), "runtime.sock");
     }
 
     #[test]
-    fn the_fallback_is_deterministic_for_one_runtime_directory() {
+    fn a_deep_runtime_directory_does_not_lengthen_the_socket() {
+        let shallow =
+            socket_path_for(Path::new("/tmp/p/.yi-agent/runtime")).expect("shallow resolves");
+        let deep = socket_path_for(Path::new(&format!("/tmp/{}", "x".repeat(600))))
+            .expect("deep resolves");
+
+        assert_eq!(
+            shallow.as_os_str().len(),
+            deep.as_os_str().len(),
+            "length must depend only on the instance home"
+        );
+        assert!(deep.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
+    }
+
+    #[test]
+    fn the_socket_is_deterministic_for_one_runtime_directory() {
         let runtime_dir = Path::new(LONG_RUNTIME_DIR);
 
         let first = socket_path_for(runtime_dir).expect("resolves");
