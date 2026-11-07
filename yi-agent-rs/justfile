@@ -642,11 +642,15 @@ clean:
 # `--include-worktrees` 会一起清 `.worktrees/*` 的 target——那些目录常常被
 # 遗忘，且各自是完整的一份。
 # 用法：
-#   just reclaim                     预演，只报告不删
-#   just reclaim apply=1             真的删
-#   just reclaim apply=1 worktrees=1 连 .worktrees/* 的 target 一起
-reclaim apply="" worktrees="": reclaim-check
-    bash scripts/reclaim-target.sh {{ if apply != "" { "--apply" } else { "" } }} {{ if worktrees != "" { "--include-worktrees" } else { "" } }}
+#   just reclaim                                 预演，只报告不删
+#   just reclaim --apply                         真的删
+#   just reclaim --apply --include-worktrees     连 .worktrees/* 的 target 一起
+#   just reclaim --apply --prune-units 1         额外裁掉每个 crate 多余的单元目录
+#
+# 用变参 `*flags` 而不是具名参数：`just reclaim --apply` 会把 `--apply` 当成
+# 位置参数塞给具名形参，静默变成「预演」——看着成功、其实一个文件都没删。
+reclaim *flags: reclaim-check
+    bash scripts/reclaim-target.sh {{ flags }}
 
 # reclaim-target.sh 的判据自测（假文件驱动，不编译、秒级）。
 # 进 `ci`：该脚本的动作是 rm，判据写宽会删掉活跃编译单元、写窄等于没清理，
