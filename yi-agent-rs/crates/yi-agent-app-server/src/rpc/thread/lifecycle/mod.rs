@@ -134,6 +134,7 @@ pub(crate) async fn handle(
                 state.process_watches,
                 state.runtimes,
                 state.thread_roots,
+                state.managed,
                 state.models_path,
                 state.cfg,
                 &cwd,

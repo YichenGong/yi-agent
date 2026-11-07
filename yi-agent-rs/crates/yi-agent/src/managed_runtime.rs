@@ -112,13 +112,33 @@ pub fn run_guardian(
     .map_err(|error| anyhow::anyhow!("the managed guardian stopped: {error}"))
 }
 
+/// Refuses a hello that does not name the runtime this process was told to serve.
+///
+/// The comparison is what connects "a launcher authorized me" to "it authorized me
+/// *for this runtime*". Without it a misconfigured launcher could leave this
+/// process serving one project's database while the guardian believes it authorized
+/// another -- and every later authority check would be made against the wrong scope.
+///
+/// An absent key is a refusal, not "unknown, carry on": a managed role is always
+/// told which runtime it serves (see [`yi_agent_supervisors::lifecycle::roles`]),
+/// so an empty observed scope means the frame is not a valid hello.
+pub(crate) fn validate_managed_hello(expected: &str, observed: &str) -> io::Result<()> {
+    if observed.is_empty() || expected != observed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the guardian authorized a different runtime scope",
+        ));
+    }
+    Ok(())
+}
+
 /// Reads the guardian's opening frame, if one arrives in time.
 ///
-/// `Ok(None)` means "no greeting, treat as unmanaged". Silence is deliberately not
-/// a refusal: the only way to see none is a guardian from an older build, or one
-/// that failed to write before we asked. Refusing there would turn a compatibility
-/// case into a broken runtime, and the design's security claim is about *managed*
-/// daemons.
+/// `Ok(None)` means "no greeting arrived". For the *managed* role that is a startup
+/// refusal (see [`read_required_lifeline_hello`]): a launcher that assigned a
+/// private role but never proved which runtime it was assigning proves nothing, and
+/// treating silence as "unmanaged" would let a broken launch keep serving. The
+/// public `daemon serve` keeps its own unmanaged semantics and never calls this.
 ///
 /// The guardian writes this frame right after a successful spawn, before it waits
 /// for the socket. That ordering is load-bearing: this daemon reads the greeting
@@ -185,6 +205,23 @@ fn read_lifeline_hello(
     Ok(Some(hello))
 }
 
+/// Reads the greeting a *managed* role requires, refusing when none arrives.
+///
+/// Split from [`read_lifeline_hello`] on purpose: the reader is also used to answer
+/// "is there a greeting at all", and only the managed entry points may turn
+/// silence into a startup refusal.
+fn read_required_lifeline_hello(
+    lifeline: &std::os::fd::OwnedFd,
+) -> io::Result<yi_agent_lifecycle::authorization::LifelineHello> {
+    read_lifeline_hello(lifeline)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the launcher sent no guardian authorization hello; a managed role must \
+             never start without one",
+        )
+    })
+}
+
 /// Applies every authority update the guardian sends, until the channel closes.
 ///
 /// The loop ending *is* the daemon's notice that its guardian is gone; the caller
@@ -194,6 +231,8 @@ fn read_lifeline_hello(
 fn pump_lifeline_authority(
     lifeline: std::os::fd::OwnedFd,
     coordinator: std::sync::Arc<yi_agent_store::runtime::RuntimeCoordinator>,
+    demand: std::sync::Arc<yi_agent_runtime::supervise::WantedPlugins>,
+    generation: String,
 ) {
     use std::os::fd::{AsRawFd, FromRawFd};
     // SAFETY: this thread is the sole owner of `lifeline` now, and the stream takes
@@ -201,9 +240,23 @@ fn pump_lifeline_authority(
     let mut stream = std::mem::ManuallyDrop::new(unsafe {
         std::os::unix::net::UnixStream::from_raw_fd(lifeline.as_raw_fd())
     });
+    let mut sequence = 0u64;
     loop {
         match yi_agent_lifecycle::codec::read_frame(&mut &mut *stream) {
             Ok(frame) => {
+                // Two frame types share this channel, and they must not be confused:
+                // authority decides what a client may do, demand decides what the
+                // machine runs. `AuthorizationUpdate` is externally tagged, so a
+                // snapshot matches no variant and falls through to the second
+                // attempt; the reverse fails on required fields. Neither direction
+                // guesses at the other's meaning.
+                if let Ok(snapshot) = yi_agent_lifecycle::codec::decode::<
+                    yi_agent_lifecycle::authorization::DemandSnapshot,
+                >(&frame)
+                {
+                    apply_demand_snapshot(&snapshot, &generation, &demand, &mut sequence);
+                    continue;
+                }
                 match yi_agent_lifecycle::codec::decode::<
                     yi_agent_lifecycle::authorization::AuthorizationUpdate,
                 >(&frame)
@@ -230,6 +283,39 @@ fn pump_lifeline_authority(
     }
 }
 
+/// Applies one demand snapshot, refusing the ones that describe another world.
+///
+/// Two checks, both load-bearing. A snapshot for a different generation was made by
+/// a guardian that is not this daemon's, so its plugin list says nothing about this
+/// process. A snapshot at or below the last applied sequence is older than what is
+/// already in force; applying it would resurrect a demand a later snapshot
+/// withdrew, which reads as "the plugin came back by itself".
+fn apply_demand_snapshot(
+    snapshot: &yi_agent_lifecycle::authorization::DemandSnapshot,
+    generation: &str,
+    demand: &yi_agent_runtime::supervise::WantedPlugins,
+    last_sequence: &mut u64,
+) {
+    if snapshot.daemon_instance_id != generation {
+        tracing::warn!(
+            snapshot = %snapshot.daemon_instance_id,
+            generation,
+            "ignored a demand snapshot from another daemon generation"
+        );
+        return;
+    }
+    if snapshot.sequence <= *last_sequence {
+        tracing::warn!(
+            snapshot = snapshot.sequence,
+            applied = *last_sequence,
+            "ignored a demand snapshot that is not newer than the applied one"
+        );
+        return;
+    }
+    *last_sequence = snapshot.sequence;
+    demand.replace(snapshot.plugins.iter().cloned());
+}
+
 /// Serves one runtime's business daemon under its guardian.
 ///
 /// This is the only daemon start that carries the exit guarantees. It is
@@ -246,40 +332,66 @@ pub fn run_managed_daemon(
     // The guardian's first frame carries the generation secret. It is read before
     // the daemon serves because authority must be verifiable from the first attach:
     // a daemon that bound its socket first would spend a window admitting calls it
-    // could not check. A guardian that says nothing leaves the daemon unmanaged
-    // rather than broken -- the handshake is on a channel the guardian owns, and
-    // treating silence as "refuse everything" would make a launch race look like a
-    // permission bug.
-    let managed = match read_lifeline_hello(&bootstrap) {
-        Ok(Some(hello)) => {
-            let secret = hello.secret().map_err(|error| anyhow::anyhow!(error))?;
-            if hello.scope_key
-                != yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir)
-                    .to_string_lossy()
-                    .into_owned()
-                && hello.scope_key.is_empty()
-            {
-                return Err(anyhow::anyhow!(
-                    "the guardian authorized a different runtime scope"
-                ));
-            }
-            let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
-                hello.scope_key.clone(),
-                hello.daemon_instance_id.clone(),
-                secret,
-            );
-            // The channel stays open for the daemon's whole life: it is both the
-            // death monitor and the authority feed, and closing it early would tell
-            // the guardian the daemon is gone.
-            Some((ledger, bootstrap))
-        }
-        Ok(None) => None,
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "the guardian's authorization handshake failed: {error}"
-            ));
-        }
-    };
+    // could not check.
+    //
+    // A greeting that never arrives is a *refusal*, not "run unmanaged". This
+    // process was started as the managed daemon role by something that held the
+    // inherited descriptor; only that launcher could have chosen the scope, so
+    // silence means the launch is broken or unauthorized. Falling back to unmanaged
+    // would hand the exit guarantees the role exists for to a process nobody can
+    // account for.
+    let hello = read_required_lifeline_hello(&bootstrap).map_err(|error| {
+        anyhow::anyhow!("the guardian's authorization handshake failed: {error}")
+    })?;
+    let secret = hello.secret().map_err(|error| anyhow::anyhow!(error))?;
+    // The expected scope is the daemon's own resolved runtime directory, which the
+    // guardian named in this process's environment at launch and which the guardian
+    // resolved the same way. Comparing against it (rather than against a workdir
+    // guessed here) is what makes a symlinked or redirected project unable to
+    // produce two scopes for one runtime.
+    let expected_scope = yi_agent_subagent::attach::project_runtime_directory(&invocation.workdir)
+        .to_string_lossy()
+        .into_owned();
+    // Two independent agreements are required. The launcher's declared scope key
+    // must match this process's own resolution (otherwise the two sides canonicalised
+    // different paths), and the authenticated hello must name that same scope. Checking
+    // only the hello would let a launcher that declared one scope in the environment
+    // and another in the frame go unnoticed.
+    let declared_scope = yi_agent_supervisors::lifecycle::roles::scope_key()
+        .map_err(|error| anyhow::anyhow!("the launcher named no scope: {error}"))?;
+    validate_managed_hello(&declared_scope, &expected_scope).map_err(|error| {
+        anyhow::anyhow!(
+            "the launcher named scope {declared_scope}, but {} resolves to {expected_scope}: {error}",
+            invocation.workdir.display()
+        )
+    })?;
+    validate_managed_hello(&expected_scope, &hello.scope_key).map_err(|error| {
+        anyhow::anyhow!("the guardian authorized a different runtime scope: {error}")
+    })?;
+    // The project is checked the same way as the scope: the guardian names it in the
+    // environment, and this process's own working directory is what the guardian set.
+    // A disagreement means the daemon would answer for a project the guardian is not
+    // supervising -- the same failure one level down.
+    let declared_project = yi_agent_supervisors::lifecycle::roles::project_key()
+        .map_err(|error| anyhow::anyhow!("the guardian named no project: {error}"))?;
+    let observed_project = invocation.workdir.to_string_lossy().into_owned();
+    if !yi_agent_supervisors::lifecycle::bringup::scope_keys_agree(
+        &declared_project,
+        &observed_project,
+    ) {
+        anyhow::bail!(
+            "the guardian named project {declared_project}, but this daemon stands in {observed_project}"
+        );
+    }
+    let ledger = yi_agent_lifecycle::authorization::AuthorizationLedger::verifier(
+        hello.scope_key.clone(),
+        hello.daemon_instance_id.clone(),
+        secret,
+    );
+    // The channel stays open for the daemon's whole life: it is both the death
+    // monitor and the authority feed, and closing it early would tell the guardian
+    // the daemon is gone.
+    let managed = Some((ledger, bootstrap));
     // The guardian's half of the foreground authority bridge rides the *same*
     // lifeline the hello arrived on. It is taken here, before the daemon starts,
     // because a daemon that bound its socket first would spend a window accepting
@@ -324,22 +436,37 @@ pub fn run_managed_daemon(
     // exists, so a binding frame has somewhere to land. Until the daemon stops, this
     // loop also *is* the death monitor -- it returns when the guardian closes the
     // channel, which is the signal that nothing supervises this process any more.
-    if let Some(lifeline) = lifeline {
-        let coordinator = std::sync::Arc::clone(daemon.coordinator());
-        std::thread::Builder::new()
-            .name("lifeline-authority".to_string())
-            .spawn(move || pump_lifeline_authority(lifeline, coordinator))
-            .map_err(|error| anyhow::anyhow!("could not watch the guardian lifeline: {error}"))?;
-    }
     // The business daemon supervises its own plugin children -- that is not handed
     // to the guardian, which knows process groups but not plugin manifests. The
     // second argument is the *runtime directory*: the route table is partitioned by
     // it, and passing the socket path would publish every route into a partition
     // nobody reads.
-    let _supervisor = yi_agent_runtime::supervise::serve(&invocation.workdir, &runtime_dir);
-    daemon
+    //
+    // This is the *managed* entry, so plugins run only while a client wants them.
+    // A daemon that supervised from configuration alone would start every enabled
+    // plugin at launch -- before the first client could possibly ask for one -- and
+    // the runtime would still carry the background load it was introduced to remove.
+    let demand = std::sync::Arc::new(yi_agent_runtime::supervise::WantedPlugins::new());
+    let supervisor = yi_agent_runtime::supervise::serve_managed(
+        &invocation.workdir,
+        &runtime_dir,
+        std::sync::Arc::clone(&demand),
+    );
+    if let Some(lifeline) = lifeline {
+        let coordinator = std::sync::Arc::clone(daemon.coordinator());
+        let generation = hello.daemon_instance_id.clone();
+        std::thread::Builder::new()
+            .name("lifeline-authority".to_string())
+            .spawn(move || pump_lifeline_authority(lifeline, coordinator, demand, generation))
+            .map_err(|error| anyhow::anyhow!("could not watch the guardian lifeline: {error}"))?;
+    }
+    let waited = daemon
         .wait()
-        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"))
+        .map_err(|error| anyhow::anyhow!("the managed daemon stopped: {error}"));
+    // Explicit, so the plugin children are stopped before this function reports the
+    // daemon gone; `Drop` would do it too, but only after the error value was built.
+    drop(supervisor);
+    waited
 }
 
 #[cfg(test)]
@@ -360,10 +487,21 @@ mod tests {
             .split("pub fn run_managed_daemon")
             .nth(1)
             .expect("the managed daemon entry point must exist");
-        let call = body
-            .lines()
-            .find(|line| line.contains("supervise::serve("))
-            .expect("the managed daemon must supervise plugin children");
+        // The *managed* entry point, not the plain one: a daemon that supervised from
+        // configuration alone would start every enabled plugin at launch, before any
+        // client could ask for one. Matching on `supervise::serve(` would have gone on
+        // passing after the switch to managed mode, checking a call site that no
+        // longer carries the behaviour.
+        // The whole call, not one line: the arguments are broken across lines by the
+        // formatter, and a single-line check would silently assert on a prefix.
+        let start = body
+            .find("supervise::serve_managed(")
+            .expect("the managed daemon must supervise plugin children from live demand");
+        let call = &body[start
+            ..body[start..]
+                .find(");")
+                .map(|end| start + end)
+                .expect("the supervise call must be terminated")];
         assert!(
             call.contains("&runtime_dir"),
             "plugin routes are partitioned by runtime directory: {call}"
@@ -372,6 +510,76 @@ mod tests {
             !call.contains("socket"),
             "passing the socket path partitions routes where nothing reads them: {call}"
         );
+    }
+
+    /// A snapshot from another generation describes a world this daemon is not in.
+    #[test]
+    fn a_demand_snapshot_from_another_generation_is_ignored() {
+        let demand = yi_agent_runtime::supervise::WantedPlugins::new();
+        let mut sequence = 0;
+        apply_demand_snapshot(
+            &snapshot("daemon-other", 7, &["demo"]),
+            "daemon-mine",
+            &demand,
+            &mut sequence,
+        );
+        assert!(
+            demand.snapshot().is_empty(),
+            "another generation's plugins must not start here"
+        );
+        assert_eq!(
+            sequence, 0,
+            "an ignored snapshot must not advance the sequence"
+        );
+    }
+
+    /// An old snapshot must not resurrect demand a newer one already withdrew.
+    #[test]
+    fn a_demand_snapshot_that_is_not_newer_is_ignored() {
+        let demand = yi_agent_runtime::supervise::WantedPlugins::new();
+        let mut sequence = 0;
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 5, &["demo"]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert_eq!(demand.snapshot(), vec!["demo".to_string()]);
+
+        // Same sequence, different content: older than what is in force.
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 5, &["other"]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert_eq!(
+            demand.snapshot(),
+            vec!["demo".to_string()],
+            "a replay must not change the answer"
+        );
+
+        // A genuinely newer one replaces the whole set, including removals.
+        apply_demand_snapshot(
+            &snapshot("daemon-1", 6, &[]),
+            "daemon-1",
+            &demand,
+            &mut sequence,
+        );
+        assert!(demand.snapshot().is_empty(), "newer wins, including empty");
+        assert_eq!(sequence, 6);
+    }
+
+    fn snapshot(
+        generation: &str,
+        sequence: u64,
+        plugins: &[&str],
+    ) -> yi_agent_lifecycle::authorization::DemandSnapshot {
+        yi_agent_lifecycle::authorization::DemandSnapshot {
+            daemon_instance_id: generation.to_string(),
+            sequence,
+            plugins: plugins.iter().map(|plugin| plugin.to_string()).collect(),
+        }
     }
 
     /// Runs this test binary again in a child, invoking `probe` as the only test.
@@ -456,5 +664,18 @@ mod tests {
             reported.contains("InvalidInput"),
             "expected a bad-descriptor refusal, got {reported}"
         );
+    }
+
+    /// A managed daemon whose launcher authorized a different scope must refuse.
+    ///
+    /// The hello is the only thing that connects "the guardian started me" to
+    /// "the guardian started me *for this runtime*". Without the comparison a
+    /// misconfigured launcher would have the daemon serve one project's database
+    /// while the guardian believes it authorized another.
+    #[test]
+    fn mismatching_nonempty_scope_is_refused() {
+        assert!(validate_managed_hello("scope-a", "scope-b").is_err());
+        assert!(validate_managed_hello("scope-a", "").is_err());
+        assert!(validate_managed_hello("scope-a", "scope-a").is_ok());
     }
 }

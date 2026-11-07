@@ -108,6 +108,31 @@ fn coordinator(directory: &TempDir) -> RuntimeCoordinator {
     .expect("a fresh database must open")
 }
 
+/// The guardian's half of the handshake, pinned to the daemon it will talk to.
+///
+/// A managed daemon now refuses a ledger whose generation is not its own, so a
+/// fixture cannot invent one: the guardian must be told the daemon's generation,
+/// which is exactly the value the real bring-up passes down from the guardian's
+/// ledger. `verifier` is used on both sides so the secret is the daemon's too.
+fn guardian_for(directory: &TempDir, coordinator: &RuntimeCoordinator) -> AuthorizationLedger {
+    AuthorizationLedger::new(directory.path().to_string_lossy(), coordinator.generation())
+}
+
+fn verifier_for(
+    directory: &TempDir,
+    coordinator: &RuntimeCoordinator,
+    secret: [u8; 32],
+) -> AuthorizationLedger {
+    AuthorizationLedger::verifier(
+        directory.path().to_string_lossy(),
+        coordinator.generation(),
+        secret,
+    )
+}
+
+/// A root id shaped like the ones the guardian derives: a canonical UUID.
+const ROOT_ID: &str = "f3a91c48-2d6b-4e07-8a15-6c9b0d2e4f71";
+
 fn workspace(directory: &TempDir) -> std::path::PathBuf {
     let project = directory.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -141,9 +166,10 @@ async fn a_managed_daemon_refuses_an_attach_the_guardian_never_authorized() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
 
-    let ledger =
-        AuthorizationLedger::verifier(directory.path().to_string_lossy(), "daemon-1", [3u8; 32]);
-    coordinator.adopt_managed_authority(ledger);
+    let ledger = verifier_for(&directory, &coordinator, [3u8; 32]);
+    coordinator
+        .adopt_managed_authority(ledger)
+        .expect("the ledger names this coordinator\'s generation");
     assert!(coordinator.is_managed());
 
     let error = coordinator
@@ -163,22 +189,22 @@ async fn a_managed_daemon_admits_the_capability_its_guardian_minted() {
     let workspace = workspace(&directory);
 
     // The guardian's half, in-process: same secret, same generation.
-    let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
+    let mut guardian = guardian_for(&directory, &coordinator);
     let secret = guardian.generation_secret();
+    // The root id is a daemon task id, which is a UUID: a managed attach now creates
+    // exactly the root named here, so a fixture that passed a directory would be
+    // asserting an identity the daemon could never create.
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .expect("a business client must be authorizable");
 
-    let mut daemon =
-        AuthorizationLedger::verifier(directory.path().to_string_lossy(), "daemon-1", secret);
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
     daemon
         .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
         .expect("the verifier must accept its guardian's binding");
-    coordinator.adopt_managed_authority(daemon);
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator\'s generation");
 
     let attached = coordinator
         .attach_application_root(&authorization.capability, &workspace, &[])
@@ -211,24 +237,21 @@ async fn a_released_client_cannot_attach_with_its_old_capability() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
 
-    let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
+    let mut guardian = guardian_for(&directory, &coordinator);
     let secret = guardian.generation_secret();
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .unwrap();
     // A verifier only knows what its guardian tells it, so the binding can be
     // installed; the withdrawal is what has to arrive next. That ordering is also
     // the realistic one: the release happens while the daemon is serving.
-    let mut daemon =
-        AuthorizationLedger::verifier(directory.path().to_string_lossy(), "daemon-1", secret);
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
     daemon
         .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
         .unwrap();
-    coordinator.adopt_managed_authority(daemon);
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator\'s generation");
     coordinator
         .apply_authority_update(AuthorizationUpdate::RevokeClient {
             client_run_id: "app-run-1".to_string(),
@@ -252,7 +275,7 @@ async fn a_capability_for_another_project_is_refused() {
     let elsewhere = directory.path().join("other");
     std::fs::create_dir_all(&elsewhere).unwrap();
 
-    let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
+    let mut guardian = guardian_for(&directory, &coordinator);
     let secret = guardian.generation_secret();
     let authorization = guardian
         .issue(
@@ -262,12 +285,13 @@ async fn a_capability_for_another_project_is_refused() {
         )
         .unwrap();
 
-    let mut daemon =
-        AuthorizationLedger::verifier(directory.path().to_string_lossy(), "daemon-1", secret);
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
     daemon
         .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
         .unwrap();
-    coordinator.adopt_managed_authority(daemon);
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator\'s generation");
 
     let error = coordinator
         .attach_application_root(&authorization.capability, &workspace, &[])
@@ -284,22 +308,19 @@ async fn a_revocation_applied_while_serving_takes_effect() {
     let coordinator = coordinator(&directory);
     let workspace = workspace(&directory);
 
-    let mut guardian = AuthorizationLedger::new(directory.path().to_string_lossy(), "daemon-1");
+    let mut guardian = guardian_for(&directory, &coordinator);
     let secret = guardian.generation_secret();
     let authorization = guardian
-        .issue(
-            "app-run-1",
-            &workspace.to_string_lossy(),
-            LeaseMode::Business,
-        )
+        .issue("app-run-1", ROOT_ID, LeaseMode::Business)
         .unwrap();
 
-    let mut daemon =
-        AuthorizationLedger::verifier(directory.path().to_string_lossy(), "daemon-1", secret);
+    let mut daemon = verifier_for(&directory, &coordinator, secret);
     daemon
         .apply(AuthorizationUpdate::Bind(Box::new(authorization.clone())))
         .unwrap();
-    coordinator.adopt_managed_authority(daemon);
+    coordinator
+        .adopt_managed_authority(daemon)
+        .expect("the ledger names this coordinator\'s generation");
 
     // Authorized now...
     coordinator

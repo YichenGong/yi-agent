@@ -35,7 +35,7 @@ struct RecordingControl {
 }
 
 impl ControlBackend for RecordingControl {
-    fn acquire(
+    fn register(
         &self,
         _client_run_id: &str,
         _scope: &RuntimeScope,
@@ -43,6 +43,10 @@ impl ControlBackend for RecordingControl {
         _budget: Duration,
     ) -> std::io::Result<bool> {
         Ok(true)
+    }
+
+    fn start_heartbeat(&self, _scope: &RuntimeScope) -> std::io::Result<()> {
+        Ok(())
     }
 
     fn release(

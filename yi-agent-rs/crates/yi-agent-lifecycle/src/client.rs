@@ -192,10 +192,26 @@ impl std::fmt::Debug for ManagedChannel {
 pub struct FrontendLease {
     control_path: std::path::PathBuf,
     grant: types::ClientGrant,
-    heartbeat: Option<Heartbeat>,
+    /// The renewal thread, guarded rather than owned exclusively.
+    ///
+    /// `&self` on `start_heartbeat`/`release` is what lets one lease be shared with
+    /// the parties that act *as* this frontend (a root-authority broker, a foreground
+    /// host) instead of each minting a second lease for the same process. Two leases
+    /// for one process would make "the last frontend left" compute the wrong answer.
+    heartbeat: std::sync::Mutex<Option<Heartbeat>>,
     /// Set when a renewal was refused: the lease is gone (released, expired, or
     /// superseded), and the owner should stop expecting its work to survive.
     lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Which way a plugin demand request goes.
+///
+/// Two request variants rather than a boolean on one: the wire already has two
+/// distinct methods, and a flag would let a caller "release" by passing `false`
+/// where they meant to acquire.
+enum PluginDemandChange {
+    Acquire,
+    Release,
 }
 
 struct Heartbeat {
@@ -279,7 +295,7 @@ impl FrontendLease {
         Self {
             control_path,
             grant,
-            heartbeat: None,
+            heartbeat: std::sync::Mutex::new(None),
             lost,
         }
     }
@@ -311,8 +327,12 @@ impl FrontendLease {
     /// Separate from [`Self::register`] so a caller can hold a lease without a
     /// thread (a test, or a frontend whose runtime outlives the call), and because
     /// a thread that is never joined is worse than one that was never started.
-    pub fn start_heartbeat(&mut self) -> io::Result<()> {
-        if self.heartbeat.is_some() {
+    pub fn start_heartbeat(&self) -> io::Result<()> {
+        let mut slot = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
             return Ok(());
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -342,7 +362,7 @@ impl FrontendLease {
             .map_err(|error| {
                 io::Error::other(format!("could not start the lease heartbeat: {error}"))
             })?;
-        self.heartbeat = Some(Heartbeat {
+        *slot = Some(Heartbeat {
             stop,
             join: Some(join),
         });
@@ -353,7 +373,7 @@ impl FrontendLease {
     ///
     /// Idempotent at the runtime: a second release of the same run returns the same
     /// operation id rather than a new teardown nobody will observe.
-    pub fn release(&mut self, deadline: &Deadline) -> io::Result<types::OperationId> {
+    pub fn release(&self, deadline: &Deadline) -> io::Result<types::OperationId> {
         self.stop_heartbeat();
         let mut client = ControlClient::connect(&self.control_path, deadline)?;
         match client.request(
@@ -370,6 +390,82 @@ impl FrontendLease {
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the runtime answered a release with {other:?}"),
+            )),
+        }
+    }
+
+    /// Declares that this frontend is waiting on `plugin`.
+    ///
+    /// Presented on this lease's own grant, never one taken from a request: the
+    /// owner of a demand is whichever live lease asks, so a caller cannot acquire
+    /// demand on another client's behalf. Demand is not a renewal and authorises no
+    /// work -- it only answers "must this shared plugin keep running".
+    ///
+    /// Returns `(wanted_after, changed)`: the whole state after the call, and whether
+    /// this call moved it. A retry is therefore visible as a retry rather than as new
+    /// demand, and "nobody wants it" stays distinguishable from "the reply was lost".
+    pub fn acquire_plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+    ) -> io::Result<(bool, bool)> {
+        self.plugin_demand(plugin, deadline, PluginDemandChange::Acquire)
+    }
+
+    /// Says this frontend is done with `plugin`.
+    ///
+    /// The plugin stops only when the last holder releases; releasing one this client
+    /// never held changes nothing, so an unbalanced release cannot stop a service
+    /// another client is still using.
+    pub fn release_plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+    ) -> io::Result<(bool, bool)> {
+        self.plugin_demand(plugin, deadline, PluginDemandChange::Release)
+    }
+
+    fn plugin_demand(
+        &self,
+        plugin: &str,
+        deadline: &Deadline,
+        change: PluginDemandChange,
+    ) -> io::Result<(bool, bool)> {
+        let request = match change {
+            PluginDemandChange::Acquire => types::ControlRequest::AcquirePluginDemand {
+                grant: self.grant.clone(),
+                plugin: plugin.to_string(),
+            },
+            PluginDemandChange::Release => types::ControlRequest::ReleasePluginDemand {
+                grant: self.grant.clone(),
+                plugin: plugin.to_string(),
+            },
+        };
+        let mut client = ControlClient::connect(&self.control_path, deadline)?;
+        match client.request(&request, deadline)? {
+            types::ControlResponse::PluginDemand {
+                plugin: answered,
+                wanted,
+                changed,
+            } if answered == plugin => Ok((wanted, changed)),
+            // A reply about a different plugin cannot be about this request: taking
+            // its `wanted` would report somebody else's plugin as ours.
+            types::ControlResponse::PluginDemand {
+                plugin: answered, ..
+            } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered for plugin {answered:?}, not {plugin:?}"),
+            )),
+            types::ControlResponse::Rejected { code, reason } => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the runtime refused this plugin demand: {code:?}: {reason}"),
+            )),
+            types::ControlResponse::Unsupported { detail } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, detail))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runtime answered a plugin demand with {other:?}"),
             )),
         }
     }
@@ -741,8 +837,12 @@ impl FrontendLease {
         }
     }
 
-    fn stop_heartbeat(&mut self) {
-        if let Some(mut heartbeat) = self.heartbeat.take() {
+    fn stop_heartbeat(&self) {
+        let mut slot = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut heartbeat) = slot.take() {
             heartbeat
                 .stop
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -989,7 +1089,7 @@ mod tests {
     fn a_registered_lease_releases_and_reads_its_result() {
         let _serial = socket_test_lock();
         let fixture = Fixture::new();
-        let mut lease = FrontendLease::register_if_served(
+        let lease = FrontendLease::register_if_served(
             &fixture.path,
             "tui:test".to_string(),
             types::ClientKind::Tui,
@@ -1085,7 +1185,7 @@ mod tests {
             }
         });
 
-        let mut lease = FrontendLease::register(
+        let lease = FrontendLease::register(
             &path,
             "app:1".to_string(),
             types::ClientKind::App,

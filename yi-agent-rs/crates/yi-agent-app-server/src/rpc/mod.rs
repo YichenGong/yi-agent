@@ -229,6 +229,17 @@ pub(crate) struct PluginChannelState {
     /// 字段,与安装句柄成对,保留以免日后加「卸载值守」方法时又要动本结构的形状。
     #[allow(dead_code)]
     pub(crate) watchman_uninstall: crate::server::WatchmanUninstall,
+    /// 本次连接是否是受管会话（本地 stdio 且带壳授权）。
+    ///
+    /// 受管会话的插件生命周期由 guardian + 真实 demand 决定，所以安装路径
+    /// **不能**再走 `ensure_daemon` 这条旧自愈通道：那条通道会拉起一个没人
+    /// 监督的 daemon，也正是 managed 要消掉的"后台自己起来"。同样不能承诺
+    /// "常驻值守会重试"——受管下没有那个重试，说了就是假话。
+    ///
+    /// 用「有没有壳授权」而不是「实例有没有迁移标记」作为判据：标记说的是这个
+    /// 实例以后归 managed 管，而这条连接此刻是否由一个持租约的壳代表，是另一件
+    /// 事；后者才决定这次安装有没有人能负责把插件真正跑起来。
+    pub(crate) managed_session: bool,
     /// 供 `plugin/query` 判断"插件是否被自己的 flag 关着"。
     ///
     /// `None` = 不判定。测试装配就是 `None`；要用真判定时注入一个指向临时
@@ -448,6 +459,12 @@ pub(crate) struct AppState<'a> {
     /// 每会话自己的 root 表。`thread/resume` 经 `attach_delegation` 挂 root,
     /// `thread/delete` 摘掉该会话的 root 并 `detach`。搬移前臂里的 `thread_roots`。
     pub(crate) thread_roots: &'a ThreadRoots,
+    /// The shell-brokered authority for this session, once the bootstrap installed it.
+    ///
+    /// A slot rather than a value because the credential arrives after the server is
+    /// built. `None` inside means "no shell": the conversation then attaches with its
+    /// own key, which is the embedded path.
+    pub(crate) managed: &'a crate::server::ManagedSlot,
     /// 每 thread 一个进程状态守望者。`thread/start`/`thread/resume`/`thread/delete`
     /// 增删它,`agent/trace/unwatch` 停它。搬移前臂里的 `process_watches`,按 `&mut`
     /// 借用。

@@ -143,6 +143,8 @@ pub(crate) mod delegation;
 pub(crate) mod driver;
 pub(crate) mod foreground;
 
+pub(crate) mod local_management;
+pub(crate) mod management_client;
 pub(crate) mod transport;
 
 // `lib.rs` 以 `pub use server::{run, serve_stdio_with_relay}` 把它们交给 CLI，
@@ -280,6 +282,59 @@ pub(crate) type ProjectRuntimes =
 /// 一份预算,这正是桌面端「一个会话满了、全目录都满」的成因。
 pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 
+/// What the shell has told this sidecar it may attach.
+///
+/// Per session, never process-global. The key is the five-part
+/// [`yi_agent_lifecycle::production::RootAuthorityKey`]: scope, runtime generation,
+/// client, conversation, root. A path map cannot express that -- two conversations in
+/// one directory have different roots -- so there is deliberately no way to look an
+/// entry up by directory.
+pub(crate) type RootAuthorities =
+    Arc<StdMutex<yi_agent_subagent::managed_binding::RootAuthorityStore>>;
+
+/// The managed path's two halves: where authority is installed, and who to ask.
+///
+/// One value so the pair cannot be half-wired. Built by the bootstrap handler, because
+/// until the credential is fixed there is no epoch to name in a request and no
+/// authority a snapshot could legitimately carry.
+pub(crate) struct ManagedAuthority {
+    pub(crate) store: RootAuthorities,
+    pub(crate) broker: Arc<dyn yi_agent_subagent::managed_binding::ManagedRootAuthority>,
+    /// The App run this sidecar speaks for, fixed by the authenticated handshake.
+    ///
+    /// Not read from the intent: a conversation that could name its own client could
+    /// reach another App run's authority.
+    pub(crate) client_run_id: String,
+}
+
+impl std::fmt::Debug for ManagedAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAuthority")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where the managed authority lands once the bootstrap authenticates.
+///
+/// A shared slot rather than a plain field on [`RuntimeAttachments`] because the
+/// credential it depends on arrives *after* the server is constructed: `serve` builds
+/// the management handle, then the first frame bootstraps it. A plain field would have
+/// to be `None` forever, and the attach path would silently keep taking the embedded
+/// branch on a managed deployment -- the exact failure this task removes.
+pub(crate) type ManagedSlot = Arc<StdMutex<Option<Arc<ManagedAuthority>>>>;
+
+/// Reads the managed authority out of its slot.
+///
+/// The lock is held only to clone the `Arc`, never across an attach: the slot is written
+/// once, by the bootstrap, and an attach that held the lock while talking to a guardian
+/// would block the handshake that could replace it.
+pub(crate) fn managed_snapshot(slot: &ManagedSlot) -> Option<Arc<ManagedAuthority>> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// 模型驱动的视图帧表：每会话一帧，**内存态**（不落盘，重启即空）。
 ///
 /// 与 `git_diff` 句柄并列为 [`RuntimeAttachments`] 字段，理由同 `theme` /
@@ -294,6 +349,19 @@ pub(crate) type ViewFrames = Arc<tokio::sync::Mutex<HashMap<String, crate::git_d
 pub(crate) struct RuntimeAttachments {
     pub(crate) runtimes: ProjectRuntimes,
     pub(crate) thread_roots: ThreadRoots,
+    /// The shell-brokered root authority, when this sidecar serves a desktop shell.
+    ///
+    /// `None` is the embedded/CLI shape: there is no shell and no broker, so a
+    /// conversation attaches with its own stable key. `Some` means the managed path is
+    /// in force, and then a conversation that has no entry must be refused rather than
+    /// falling back -- the fallback is exactly the unattributed attach this design
+    /// exists to remove.
+    ///
+    /// The store and the broker travel together because a conversation needs both: the
+    /// store answers "may I attach?", the broker answers "may I have one?". Splitting
+    /// them into two optional fields would let a caller install one and forget the
+    /// other, which reads as an authorized session that cannot ever ask for a root.
+    pub(crate) managed: ManagedSlot,
     /// Where `models.json` lives. Injectable for the same reason `resident_dir`
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).

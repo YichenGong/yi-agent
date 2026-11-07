@@ -64,6 +64,58 @@ pub struct Sidecar {
     /// 这里一旦置位就不可撤销，因为退出流程已经在向各 runtime 请求释放租约，
     /// 此时把 sidecar 拉起来等于让一个正在被回收的客户端重新出现。
     shutting_down: std::sync::atomic::AtomicBool,
+    /// 本地槽位的管理会话。
+    ///
+    /// 一次 sidecar 启动一个会话：epoch 随重启变化，旧 epoch 的迟到响应因此
+    /// 无法完成新请求。远端槽位永远没有会话——壳不向远端发送本地授权。
+    management:
+        Mutex<HashMap<ProfileKey, std::sync::Arc<crate::runtime_management::ManagementSession>>>,
+}
+
+/// 允许壳从**管理面**往本地 sidecar 的 stdin 写一帧。
+///
+/// 与页面的 `rpc` 共用同一条写入路径（同一把槽位锁、同一份"槽位必须有活进程"
+/// 判定），但走的不是同一个入口：页面写不进来，因为 `_shell/` 在 `rpc` 里就被
+/// 拒了；这里绕开的是命令层，不是那条守卫。
+pub struct LocalTransport {
+    app: AppHandle,
+}
+
+impl LocalTransport {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+/// 壳对「当前本地管理会话」的查询入口。
+///
+/// 每次准备都重新问一次，而不是在启动时把会话存进通道：session 随每次 sidecar
+/// 启动重建，存下来的那个一定会在第一次重启之后过期。
+pub struct LocalSessions {
+    app: AppHandle,
+}
+
+impl LocalSessions {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl crate::runtime_lifecycle::ManagementSessions for LocalSessions {
+    fn current(&self) -> Option<std::sync::Arc<crate::runtime_management::ManagementSession>> {
+        self.app.state::<Sidecar>().management_session()
+    }
+
+    fn transport(&self) -> std::sync::Arc<dyn crate::runtime_management::PrepareTransport> {
+        std::sync::Arc::new(LocalTransport::new(self.app.clone()))
+    }
+}
+
+impl crate::runtime_management::PrepareTransport for LocalTransport {
+    fn write_frame(&self, frame: &serde_json::Value) -> Result<(), String> {
+        let state = self.app.state::<Sidecar>();
+        write_line(&state, &ProfileKey::Local, frame)
+    }
 }
 
 impl Sidecar {
@@ -76,6 +128,41 @@ impl Sidecar {
             desired: Mutex::new(std::collections::HashSet::from([ProfileKey::Local])),
             last_errors: Mutex::new(HashMap::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            management: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 本地槽位的管理会话（若已建立）。
+    fn management_session(
+        &self,
+    ) -> Option<std::sync::Arc<crate::runtime_management::ManagementSession>> {
+        self.management
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&ProfileKey::Local).cloned())
+    }
+
+    /// 登记本地槽位的新会话，替换上一个（若有）。
+    ///
+    /// 替换前必须关闭旧的：它的 pending 表属于上一代 sidecar，留着会让下一次
+    /// 请求复用一条已经不存在的 id。
+    fn set_management_session(
+        &self,
+        session: std::sync::Arc<crate::runtime_management::ManagementSession>,
+    ) {
+        if let Ok(mut guard) = self.management.lock() {
+            if let Some(previous) = guard.insert(ProfileKey::Local, session) {
+                previous.close();
+            }
+        }
+    }
+
+    /// 清掉本地会话（sidecar 退出时）。
+    fn clear_management_session(&self) {
+        if let Ok(mut guard) = self.management.lock() {
+            if let Some(previous) = guard.remove(&ProfileKey::Local) {
+                previous.close();
+            }
         }
     }
 
@@ -190,6 +277,15 @@ fn slot_key(raw: &str) -> ProfileKey {
 fn write_line(state: &Sidecar, slot: &ProfileKey, value: &serde_json::Value) -> Result<(), String> {
     let mut buf = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     buf.push(b'\n');
+    write_bytes(state, slot, &buf)
+}
+
+/// 把一段已编码的字节写进槽位的 stdin。
+///
+/// 与 [`write_line`] 共用同一把槽位锁与同一条"槽位必须有活进程"的判定：bootstrap
+/// 第一帧是**唯一**一条不是 JSON-RPC 请求的写入，它必须和业务写入走同一条路径，
+/// 否则"进程还在不在"会被判两次、也可能判得不一样。
+fn write_bytes(state: &Sidecar, slot: &ProfileKey, buf: &[u8]) -> Result<(), String> {
     // 外层锁已在这一行内释放；下面只持本槽位的锁。
     let cell = state
         .slot(slot)
@@ -198,7 +294,7 @@ fn write_line(state: &Sidecar, slot: &ProfileKey, value: &serde_json::Value) -> 
     let child = guard
         .as_mut()
         .ok_or_else(|| format!("sidecar not running for slot `{}`", slot.as_str()))?;
-    child.write(&buf).map_err(|e| e.to_string())
+    child.write(buf).map_err(|e| e.to_string())
 }
 
 /// Frontend → sidecar: write one JSON-RPC request line.
@@ -211,6 +307,10 @@ pub fn rpc(
     method: String,
     params: serde_json::Value,
 ) -> Result<(), String> {
+    // 业务面写入口守卫：`_shell/` 是保留命名空间，WebView 既不能伪造私有帧，
+    // 也不能把私有响应当成业务结果消费。这一条必须在 `write_line` 之前，否则
+    // 拒绝就只是文案而不是边界。
+    crate::runtime_management::reject_reserved_method(&method)?;
     let key = slot_key(&slot);
     let params = match shell_identity_for(&app) {
         Some(identity) => stamp_shell_identity(&key, &method, params, &identity),
@@ -347,6 +447,13 @@ pub fn rpc_respond(
     id: String,
     result: serde_json::Value,
 ) -> Result<(), String> {
+    // 一个字符串 id 若命中管理面，说明这是页面在替管理请求作答。管理请求的
+    // 结论只来自 sidecar 的私有响应，不能由页面代答。
+    if let Some(session) = state.management_session() {
+        if session.owns(&id) {
+            return Err("reserved native management request".into());
+        }
+    }
     write_line(
         &state,
         &slot_key(&slot),
@@ -413,7 +520,9 @@ pub fn spawn(app: &AppHandle, key: ProfileKey) -> Result<(), String> {
                 eprintln!("[{}] no longer desired; supervisor stops", key.as_str());
                 return;
             }
-            drop(state);
+            // `tauri::State` is a handle, not a lock guard: dropping it releases
+            // nothing, so the borrow ends here instead of pretending to unlock.
+            let _ = &state;
             match spawn_once(&app, &key) {
                 Ok(mut rx) => {
                     // A successful launch resets the backoff: the previous exit
@@ -1177,6 +1286,13 @@ fn spawn_local_once(
         .map_err(|e| format!("sidecar not found: {e}"))?
         .args(sidecar_args(configured_relay().as_deref()));
 
+    // 让 sidecar 打开本地管理面。
+    //
+    // 这个变量**不是**鉴权：任何人设一个环境变量都能设它。它只决定"是否尝试
+    // 私有握手"，真正的边界是第一帧的秘密。远端槽位不设它——壳不向远端发送
+    // 本地授权，也不该让远端进程出现一个永远等不到凭据的管理会话。
+    cmd = cmd.env(crate::runtime_management::MANAGEMENT_ENV, "1");
+
     // A bundled app launched from Finder inherits `/` as its cwd, which would
     // make the agent's workdir (and its runtime directory) the filesystem root.
     // Anchor the sidecar to the instance home so packaged and dev launches
@@ -1191,6 +1307,25 @@ fn spawn_local_once(
     let (rx, child) = cmd
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
+
+    // 管理会话的第一帧必须在**任何业务写入之前**送到 sidecar 的 stdin。
+    //
+    // 先建会话、再写第一帧、最后登记槽位：登记槽位会让前端拿到"可以发 rpc"的
+    // 信号，而服务端在 bootstrap 完成前会拒绝业务帧。顺序反了会表现为"刚启动
+    // 就报 unauthorized"，看起来像权限 bug 而不是时序 bug。
+    let session = Arc::new(crate::runtime_management::ManagementSession::new(
+        crate::runtime_management::ManagementSession::mint_secret(),
+        uuid::Uuid::new_v4().simple().to_string(),
+    ));
+    let mut child = child;
+    let bootstrap = serde_json::to_vec(&session.bootstrap_frame())
+        .map_err(|error| format!("bootstrap frame: {error}"))?;
+    child
+        .write(&bootstrap)
+        .and_then(|()| child.write(b"\n"))
+        .map_err(|error| format!("bootstrap write failed: {error}"))?;
+    app.state::<Sidecar>()
+        .set_management_session(Arc::clone(&session));
 
     app.state::<Sidecar>()
         .set_slot(key.clone(), Arc::new(Mutex::new(Some(child))));
@@ -1213,6 +1348,12 @@ fn clear_child(app: &AppHandle, key: &ProfileKey) {
         }
         publish_status(key, crate::remote::status::SlotStatus::Disconnected);
     }
+    if *key == ProfileKey::Local {
+        // 会话随进程消失：清掉 pending 并关闭，下一次启动会拿到新 epoch。
+        // 保留它会让下一次请求复用一个已经不存在的 id，而那条请求永远不会
+        // 有人应答——表现为"点了准备，界面一直转圈"。
+        app.state::<Sidecar>().clear_management_session();
+    }
     if let Some(cell) = app.state::<Sidecar>().slot(key) {
         if let Ok(mut guard) = cell.lock() {
             *guard = None;
@@ -1225,6 +1366,72 @@ fn clear_child(app: &AppHandle, key: &ProfileKey) {
 static REPORTED_CONNECTED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
 
+/// Answers one `_shell/authorizeRoot` from the sidecar.
+///
+/// Runs on its own task so the stdout reader keeps draining: the reply is written to
+/// this same stdin/stdout pair, and a reader that waited for it would be waiting on
+/// itself. A request that cannot be answered is answered with an error frame rather
+/// than dropped -- the sidecar's own wait would otherwise run to its deadline and look
+/// like a wedged shell.
+fn handle_authorize_request(app: &AppHandle, value: &serde_json::Value) {
+    let id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let epoch = value
+        .get("sidecar_epoch")
+        .and_then(|epoch| epoch.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let params = value.get("params").cloned().unwrap_or_default();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let reply = match serde_json::from_value::<yi_agent_lifecycle::production::RootIntentRequest>(
+            params,
+        ) {
+            Ok(request) => {
+                let manager = app
+                    .state::<crate::runtime_lifecycle::QuitState>()
+                    .manager
+                    .clone();
+                match manager
+                    .authorize_intent(
+                        request,
+                        yi_agent_lifecycle::deadline::Deadline::after(
+                            crate::runtime_management::MANAGEMENT_BUDGET,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(entry) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "sidecar_epoch": epoch,
+                        "result": entry,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "sidecar_epoch": epoch,
+                        "error": error,
+                    }),
+                }
+            }
+            Err(error) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "sidecar_epoch": epoch,
+                "error": format!("malformed authorize request: {error}"),
+            }),
+        };
+        let state = app.state::<Sidecar>();
+        if let Err(error) = write_line(&state, &ProfileKey::Local, &reply) {
+            eprintln!("[sidecar] could not answer an authorize request: {error}");
+        }
+    });
+}
+
 fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let line = text.trim();
@@ -1235,6 +1442,37 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
         eprintln!("[sidecar] dropping non-JSON line: {line}");
         return;
     };
+
+    // A management *request* from the sidecar, before the response interception
+    // below: this direction never existed until conversations could ask for their own
+    // root. It must be answered asynchronously -- the answer needs the runtime
+    // manager, which is async -- and never broadcast, because the params name a root
+    // and the reply carries its capability.
+    if *slot == ProfileKey::Local
+        && value.get("method").and_then(|method| method.as_str())
+            == Some(crate::runtime_management::AUTHORIZE_ROOT_METHOD)
+    {
+        handle_authorize_request(app, &value);
+        return;
+    }
+    // 管理响应在**广播之前**截获。放在 `classify` 之前而不是之后，是因为一条
+    // 管理响应完全可能看起来像一个普通响应；一旦它先被 emit 出去，页面就能
+    // 读到 epoch 与授权结论，甚至能替它作答。
+    if *slot == ProfileKey::Local {
+        let session = app.state::<Sidecar>().management_session();
+        if let Some(session) = session {
+            // `intercept` 为真 = 命中并接受；为假但状态被消费（旧 epoch）时
+            // 也不能广播。两种"已消费"都必须吞掉，所以先看是否还是 pending。
+            let was_pending = value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| session.owns(id));
+            let accepted = session.intercept(&value);
+            if accepted || was_pending {
+                return;
+            }
+        }
+    }
     // 第一帧能解析 = 远端 app-server 真的在说话（ssh 已连上且进程已 exec）。
     // 真正的 `initialize` 由前端发，桥接层只凭「有合法协议帧」判定可用。
     if let ProfileKey::Remote(id) = slot {
@@ -1254,7 +1492,17 @@ fn forward_stdout(app: &AppHandle, slot: &ProfileKey, bytes: &[u8]) {
         Frame::Notification | Frame::Response => {
             let _ = app.emit(&event_name("message", slot), &value);
         }
-        Frame::Garbage => eprintln!("[{}] dropping non-protocol frame: {value}", slot.as_str()),
+        Frame::Garbage => {
+            // 整帧打印是有代价的：bootstrap 帧的形状恰好就是「没有 method、没有
+            // id」（`{"secret":…,"sidecar_epoch":…}`），于是它一旦从 sidecar 回流
+            // 就会被归到这一类，凭据也会随之进入 stderr。秘密在别处都刻意脱敏
+            // （`ManagementSession` 的 `Debug`），这条日志不能成为唯一的例外。
+            eprintln!(
+                "[{}] dropping non-protocol frame: {}",
+                slot.as_str(),
+                crate::runtime_management::redact_frame(&value)
+            );
+        }
     }
 }
 
@@ -1349,6 +1597,36 @@ mod tests {
     #[test]
     fn garbage_is_dropped() {
         assert_eq!(classify(&json!({"hello":"world"})), Frame::Garbage);
+    }
+
+    /// 保留命名空间不得从页面的 `rpc` 进入 sidecar。
+    ///
+    /// 这条断言测的是**结构**：`_shell/` 的拒绝必须发生在 `write_line` 之前。
+    /// 只测错误文案是不够的——真正要防的是"先写了、再报错"，那已经是一条
+    /// 伪造成功的私有帧。
+    #[test]
+    fn the_frontend_cannot_write_into_the_reserved_namespace() {
+        use crate::runtime_management::reject_reserved_method;
+
+        for method in [
+            "_shell/prepare",
+            "_shell/bootstrap",
+            "_shell/rootIntent",
+            "_shell/replaceRoots",
+            "_shell/migrationPreview",
+            "_shell/migrationConfirm",
+            "_shell/migrationOperation",
+            "_shell/anythingAddedLater",
+        ] {
+            assert!(
+                reject_reserved_method(method).is_err(),
+                "{method} must be refused before it reaches the sidecar"
+            );
+        }
+        // Business methods keep working: an over-eager guard would break the app.
+        for method in ["thread/resume", "turn/start", "runtime/status"] {
+            assert!(reject_reserved_method(method).is_ok(), "{method}");
+        }
     }
 
     #[test]

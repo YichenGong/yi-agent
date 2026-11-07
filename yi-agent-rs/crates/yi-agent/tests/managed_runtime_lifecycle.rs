@@ -532,6 +532,300 @@ fn wait_for_reclaim(runtime_dir: &Path, prefix: &str, budget: Duration) -> bool 
     }
 }
 
+/// A real `yi-agent run` on a managed runtime walks the start in the only order
+/// that lets the guardian vouch for the work it is about to receive.
+///
+/// The trace is written by the binary itself (`YI_AGENT_STARTUP_TRACE`), so this
+/// asserts what a *process* did, not what a helper was told to do. Two failures
+/// would each look like success from the outside and are caught here:
+///
+/// * attaching a root before the lease -- the guardian then authorizes a root for a
+///   client it has never seen, which the managed daemon refuses;
+/// * opening the spawn channel after admission -- the run would report itself
+///   ready and only discover at the first tool call that nothing may spawn.
+#[test]
+fn a_managed_headless_run_walks_the_startup_stages_in_order() -> anyhow::Result<()> {
+    let harness = RuntimeHarness::start()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let _gateway = spawn_mock_gateway(listener);
+    let trace = harness.root.path().join("startup-trace.log");
+
+    let output = Command::new(common::yi_agent_bin())
+        .arg("--workdir")
+        .arg(&harness.workdir)
+        .args(["--provider", "openai"])
+        .arg("--api-url")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--api-key", "test-key", "--model", "gpt-4o", "--yolo"])
+        .args(["run", "--subagents", "say done"])
+        .env("YI_AGENT_RUNTIME_DIR", &harness.runtime_dir)
+        .env("YI_AGENT_HOME", &harness.instance_home)
+        .env("HOME", &harness.home)
+        .env("YI_AGENT_BRINGUP", "managed")
+        .env("YI_AGENT_STARTUP_TRACE", &trace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let recorded = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "the managed run must finish cleanly; stdout: {}; stderr: {}; trace: {recorded}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stages = recorded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages,
+        vec![
+            "prepare",
+            "register_business",
+            "heartbeat",
+            "authorize_root",
+            "attach_root",
+            "bind_driver",
+            "open_managed_channel",
+            "admit_turn",
+        ],
+        "the managed start must run every stage in the plan's order; trace: {recorded}"
+    );
+    Ok(())
+}
+
+/// A managed start that cannot bring a runtime up ends the command.
+///
+/// The failure mode this rules out is the quiet one: treat "no managed runtime" as
+/// "no guardian" and start an embedded daemon instead. That would hand the user a
+/// runtime under a policy that forbids it, and every child it spawned would belong
+/// to nobody -- unreclaimable, and invisible to `stop`.
+#[test]
+fn a_refused_managed_start_never_falls_back_to_an_embedded_daemon() -> anyhow::Result<()> {
+    let project = IsolatedProject::new()?;
+
+    // A regular file where the runtime directory must be: bring-up cannot create a
+    // scope for it, so the very first stage refuses -- before anything could attach
+    // a root, open a channel, or start a daemon.
+    let runtime_dir = project.runtime_dir();
+    std::fs::write(&runtime_dir, b"not a directory")?;
+
+    // Nothing listens on that port; this refusal happens strictly before any model
+    // call, so an unreachable gateway is the honest fixture.
+    let output = project.run_managed(9, &runtime_dir)?;
+    let trace = project.trace();
+
+    let recorded = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !output.status.success(),
+        "a managed start that cannot prepare must fail the command; stdout: {}; stderr: {}; trace: {recorded}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        recorded.contains("refused:prepare"),
+        "the refusal must be recorded at the stage that refused; trace: {recorded}"
+    );
+    // The point of the test: no later stage ran, so nothing was attached or spawned
+    // under a policy that promised a guardian.
+    for later in [
+        "register_business",
+        "heartbeat",
+        "authorize_root",
+        "attach_root",
+        "bind_driver",
+        "open_managed_channel",
+        "admit_turn",
+    ] {
+        assert!(
+            !recorded.lines().any(|line| line.trim() == later),
+            "a refused start must not report {later}; trace: {recorded}"
+        );
+    }
+    Ok(())
+}
+
+/// An isolated project the real binary can be pointed at.
+///
+/// Extracted so the refusal tests share one honest setup: a git repository (the
+/// runtime refuses a non-git root), a model catalog (otherwise the first launch stops
+/// on the onboarding prompt and never reaches a runtime), and a fake `$HOME` so no
+/// test can read the developer's own configuration.
+struct IsolatedProject {
+    root: tempfile::TempDir,
+    workdir: PathBuf,
+    instance_home: PathBuf,
+    home: PathBuf,
+}
+
+impl IsolatedProject {
+    fn new() -> anyhow::Result<Self> {
+        let root = tempfile::TempDir::new()?;
+        let workdir = root.path().join("repository");
+        let instance_home = root.path().join("instance");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&workdir)?;
+        std::fs::create_dir_all(instance_home.join(".yi-agent"))?;
+        std::fs::create_dir_all(&home)?;
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Yi"],
+            vec!["config", "user.email", "yi@example.test"],
+        ] {
+            let status = Command::new("git")
+                .current_dir(&workdir)
+                .args(&arguments)
+                .status()?;
+            anyhow::ensure!(status.success(), "git {arguments:?} failed");
+        }
+        std::fs::write(workdir.join("README.md"), "refusal fixture\n")?;
+        std::fs::write(
+            instance_home.join(".yi-agent/models.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "models": [{
+                    "name": "fixture",
+                    "provider": "openai",
+                    "api_url": "http://127.0.0.1:9",
+                    "model": "gpt-4o",
+                    "api_key": "test-key"
+                }],
+                "default_model": "fixture"
+            }))?,
+        )?;
+        std::fs::write(
+            instance_home.join(".yi-agent/preferences.json"),
+            br#"{"onboarding_dismissed":true}"#,
+        )?;
+        Ok(Self {
+            root,
+            workdir,
+            instance_home,
+            home,
+        })
+    }
+
+    fn runtime_dir(&self) -> PathBuf {
+        self.root.path().join("runtime")
+    }
+
+    fn trace(&self) -> PathBuf {
+        self.root.path().join("startup-trace.log")
+    }
+
+    /// One `yi-agent run` against the mock gateway, with the managed policy on.
+    fn run_managed(&self, port: u16, runtime_dir: &Path) -> anyhow::Result<std::process::Output> {
+        Ok(Command::new(common::yi_agent_bin())
+            .arg("--workdir")
+            .arg(&self.workdir)
+            .args(["--provider", "openai"])
+            .arg("--api-url")
+            .arg(format!("http://127.0.0.1:{port}"))
+            .args(["--api-key", "test-key", "--model", "gpt-4o", "--yolo"])
+            .args(["run", "--subagents", "say done"])
+            .env("YI_AGENT_RUNTIME_DIR", runtime_dir)
+            .env("YI_AGENT_HOME", &self.instance_home)
+            .env("HOME", &self.home)
+            .env("YI_AGENT_BRINGUP", "managed")
+            .env("YI_AGENT_STARTUP_TRACE", self.trace())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?)
+    }
+}
+
+/// A run that did not ask for the managed policy must not walk the managed gate.
+///
+/// The plan's other half of the fail-closed contract: making the managed path strict
+/// is only safe if the manual and embedded paths keep the behaviour they had. The
+/// observable proof is the trace: a stage label can only come from the managed gate,
+/// so an embedded run that produced one would have entered a start it never asked
+/// for -- and would then be holding a lease and a root under a policy the user did
+/// not choose.
+#[test]
+fn an_embedded_run_never_reports_a_managed_stage() -> anyhow::Result<()> {
+    let project = IsolatedProject::new()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let _gateway = spawn_mock_gateway(listener);
+    let runtime_dir = project.runtime_dir();
+
+    // `run` is a *managed frontend now*, so the embedded policy has to be asked for
+    // explicitly. That is the design's split: the shipped entry points select managed,
+    // and the embedded path stays reachable and unchanged for a caller that says so.
+    // This test exists to prove the second half; without the declaration it would be
+    // asserting that a managed run is embedded, which is the opposite of the contract.
+    let output = Command::new(common::yi_agent_bin())
+        .arg("--workdir")
+        .arg(&project.workdir)
+        .args(["--provider", "openai"])
+        .arg("--api-url")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--api-key", "test-key", "--model", "gpt-4o", "--yolo"])
+        .args(["run", "--subagents", "say done"])
+        .env("YI_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("YI_AGENT_HOME", &project.instance_home)
+        .env("HOME", &project.home)
+        .env("YI_AGENT_BRINGUP", "embedded")
+        .env("YI_AGENT_STARTUP_TRACE", project.trace())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let recorded = std::fs::read_to_string(project.trace()).unwrap_or_default();
+    for managed in [
+        "prepare",
+        "register_business",
+        "heartbeat",
+        "authorize_root",
+        "attach_root",
+        "bind_driver",
+        "open_managed_channel",
+        "admit_turn",
+    ] {
+        assert!(
+            !recorded.lines().any(|line| line.trim() == managed),
+            "an embedded run must not run the managed gate, but it reported {managed}; \
+             trace: {recorded}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// One OpenAI-compatible chat completion: the turn ends immediately.
+fn spawn_mock_gateway(listener: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+    use std::io::{Read as _, Write as _};
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = vec![0u8; 65536];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let body = String::from_utf8_lossy(&buffer[..read]).to_string();
+            if body.lines().next().unwrap_or("").contains("/responses") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            out.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n");
+            out.push_str("data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n");
+            out.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(out.as_bytes());
+            let _ = stream.flush();
+        }
+    })
+}
+
 /// The managed bring-up adopts a runtime this build started, and refuses to
 /// pretend a different build is the one it asked for.
 #[test]

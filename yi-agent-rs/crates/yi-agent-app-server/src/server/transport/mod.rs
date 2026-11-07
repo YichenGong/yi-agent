@@ -7,6 +7,20 @@ pub(crate) mod notifications;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+
+/// 唯一一条会真的等外部进程的管理方法。
+///
+/// 单独判定而不是"所有管理方法都 spawn"：其余方法只读内存状态，内联处理让
+/// 拒绝顺序与读入顺序一致，便于排障；把顺序丢掉换来的只是一个更大的并发面。
+const SLOW_MANAGEMENT_METHOD: &str = "_shell/prepare";
+
+/// The other management method that leaves the read loop.
+///
+/// An authorization is a guardian round trip the shell performs on this sidecar's
+/// behalf. Awaiting it inline would stall the one loop that has to keep serving the
+/// response -- the answer arrives on this very stdio -- so it runs as its own task.
+const SLOW_AUTHORIZE_METHOD: &str = crate::server::local_management::AUTHORIZE_ROOT_METHOD;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -47,6 +61,47 @@ pub(crate) use scoped::{parse_relay_url, serve_scoped, serve_scoped_core, serve_
 pub use scoped::{run, serve_stdio_with_relay};
 #[allow(unused_imports)]
 pub(crate) use stdio::{pump_stdout, read_lines};
+
+/// Records the identity this session was authorized under, for the managed attach path.
+///
+/// Only the *identity* comes from the handshake: the epoch was fixed by the authenticated
+/// bootstrap, and the roots are asked for later, one conversation at a time. Installing an
+/// authority object here is what makes `attach_delegation` take the managed branch at all
+/// -- and it is why that branch cannot be taken on a session the shell never spoke to.
+///
+/// A missing management handle means this is not a shell-launched session, so there is no
+/// one to ask for a root: the slot stays empty and the conversation attaches with its own
+/// key, which is the embedded path.
+fn install_managed_identity(
+    slot: &crate::server::ManagedSlot,
+    authorization: &crate::shell_authorization::ShellAuthorization,
+    management: Option<&Arc<crate::server::local_management::ManagementHandle>>,
+) {
+    let Some(handle) = management else {
+        return;
+    };
+    let Some(outbound) = handle.outbound() else {
+        // Bootstrapped but no corridor: without it a root request could never be
+        // answered, and installing an authority that can only fail would turn every
+        // conversation in this session into a managed admission error.
+        return;
+    };
+    let Some(epoch) = handle.session_epoch() else {
+        return;
+    };
+    let mut store = yi_agent_subagent::managed_binding::RootAuthorityStore::new();
+    if store.bind_epoch(epoch).is_err() {
+        return;
+    }
+    let authority = Arc::new(crate::server::ManagedAuthority {
+        store: Arc::new(StdMutex::new(store)),
+        broker: Arc::new(crate::server::management_client::ShellRootAuthority::new(
+            outbound,
+        )),
+        client_run_id: authorization.client_run_id.clone(),
+    });
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(authority);
+}
 
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
@@ -90,6 +145,12 @@ pub(crate) async fn serve<F>(
     // 传**原始串**而不是剥掉 session 的 base：桌面侧 `derive_relay` 的种子是
     // 「原有 session」，两边输入必须同形才能派生出同一个 session。
     relay_url: Option<String>,
+    // 本地 stdio 的管理面（`None` = 这个进程不是壳启动的）。
+    //
+    // 作为参数而不是进程级全局：一个进程里可能同时跑多个 `serve()`（测试与
+    // 合并模式），而管理会话本来就是**每连接一份**——第一帧凭据属于那条 stdio，
+    // 不属于这个进程。
+    management: Option<Arc<crate::server::local_management::ManagementHandle>>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -104,6 +165,7 @@ where
     let RuntimeAttachments {
         runtimes,
         thread_roots,
+        managed,
         models_path,
         websearch_path,
         settings_path,
@@ -377,6 +439,220 @@ where
                         continue;
                     }
                 };
+                // ---- 保留命名空间：`_shell/*` ------------------------------------
+                //
+                // 必须在任何业务解析之前判定：`_shell/` 的影子请求不能以"解析
+                // 失败"的形式流进业务分支，否则一个保留前缀的方法名就能借畸形
+                // 帧路径绕开命名空间判定。
+                //
+                // 两种情况都不许落进业务路由：
+                // 1. 本地 stdio 且装了管理面 —— 交给管理面；
+                // 2. 其它一切（远端 ws/relay/ssh、unmanaged stdio、测试）——
+                //    显式拒绝。远端根本拿不到壳的第一帧凭据，按构造就不可能
+                //    认证成功；而"管理面缺失"绝不能悄悄退化成"前缀无人看管"。
+                let local_managed =
+                    client == crate::broadcast::ClientId::local() && management.is_some();
+                let reserved = value
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .filter(|method| crate::server::local_management::is_reserved(method));
+                if let Some(method) = reserved
+                    && !local_managed
+                {
+                    let id = value
+                        .get("id")
+                        .and_then(|id| id.as_i64())
+                        .map(RequestId::Num)
+                        .unwrap_or(RequestId::Num(0));
+                    tracing::warn!(
+                        client = client.as_str(),
+                        method,
+                        "refused a reserved management method outside the local channel"
+                    );
+                    write_response(&hub, &client, err_response(id, RpcError::reserved_method()))
+                        .await?;
+                    continue;
+                }
+                if local_managed
+                    && let Some(handle) = management.as_ref()
+                {
+                    // bootstrap 必须**先于**普通管理请求判定：它是唯一一条没有
+                    // `id`、也不是请求的帧，而它的方法名同样落在 `_shell/` 前缀
+                    // 里。反过来写就会让凭据帧被当成"未知管理方法"拒掉，然后
+                    // 一个永远认证不上的会话把所有业务帧一起挡在门外。
+                    //
+                    // 判定条件刻意写成「没有 id + 带 secret」而不只看方法名：
+                    // 凭据帧不该有机会冒充一条带 id 的请求。
+                    let is_bootstrap = value.get("id").is_none()
+                        && value.get("secret").is_some()
+                        && value
+                            .get("method")
+                            .and_then(|m| m.as_str())
+                            .is_none_or(|method| {
+                                method == crate::server::local_management::BOOTSTRAP_METHOD
+                            });
+                    if is_bootstrap {
+                        match serde_json::from_value::<
+                            crate::server::local_management::BootstrapFrame,
+                        >(value.clone())
+                        {
+                            Ok(frame) => {
+                                // The session guard must not outlive this block. It is
+                                // the same lock every `prepare`, every migration call
+                                // and the per-frame business gate take (see below), and
+                                // the reply write at the end of this arm is an `.await`
+                                // on the outbound hub: a client that stops draining its
+                                // fd would otherwise stall every authenticated request on
+                                // this connection behind one unrelated bootstrap ack.
+                                let session = handle.session();
+                                let (admission, reply) = {
+                                    let mut session = session.lock().await;
+                                    let admission = session.bootstrap(&frame);
+                                    let ack = match admission {
+                                        crate::server::local_management::Admission::Accepted => {
+                                            "accepted"
+                                        }
+                                        crate::server::local_management::Admission::AlreadyBootstrapped => {
+                                            "already-bootstrapped"
+                                        }
+                                        crate::server::local_management::Admission::Unauthorized => {
+                                            "unauthorized"
+                                        }
+                                    };
+                                    let reply = crate::server::local_management::bootstrap_ack(
+                                        ack,
+                                        session.sidecar_epoch(),
+                                    );
+                                    (admission, reply)
+                                };
+                                // The outbound half of the channel exists only after the
+                                // credential is fixed: before that there is no epoch to
+                                // name in a request, and the shell would refuse it.
+                                if admission
+                                    == crate::server::local_management::Admission::Accepted
+                                {
+                                    // The epoch is fixed here, once, by the frame that was
+                                    // authenticated. Nothing later may move it: a snapshot
+                                    // that could name its own epoch would be able to install
+                                    // authority for a generation the shell never spoke for.
+                                    handle.fix_epoch(&frame.sidecar_epoch);
+                                    handle.install_outbound(Arc::new(
+                                        crate::server::management_client::ManagementClient::new(
+                                            frame.secret.clone(),
+                                            frame.sidecar_epoch.clone(),
+                                            Arc::new(
+                                                crate::server::management_client::HubWrite::new(
+                                                    Arc::clone(&hub),
+                                                    client.clone(),
+                                                ),
+                                            ),
+                                        ),
+                                    ));
+                                }
+                                hub.reply(&client, serde_json::to_value(&reply)?)
+                                    .await
+                                    .ok();
+                            }
+                            Err(error) => {
+                                let refused = crate::server::local_management::refusal_for(
+                                    value.get("id"),
+                                    format!("malformed bootstrap frame: {error}"),
+                                );
+                                hub.reply(&client, serde_json::to_value(&refused)?)
+                                    .await
+                                    .ok();
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if local_managed
+                    && let Some(handle) = management.as_ref()
+                    && crate::server::local_management::is_reserved_method(&value)
+                {
+                    let parsed: Option<crate::server::local_management::ManagementRequest> =
+                        serde_json::from_value(value.clone()).ok();
+                    let Some(request) = parsed else {
+                        // 占用了保留前缀却没有合法形状：同样不回落，直接拒绝。
+                        let refused = crate::server::local_management::refusal_for(
+                            value.get("id"),
+                            "malformed management frame",
+                        );
+                        hub.reply(&client, serde_json::to_value(&refused)?)
+                            .await
+                            .ok();
+                        continue;
+                    };
+                    // prepare 走后台任务，**不**在读取循环里 await。
+                    //
+                    // 一次 bring-up 的预算是 30s。若在这里同步等，整条 stdio
+                    // 会被占满：壳既发不出取消，也没法对第二个 scope 发起准备，
+                    // 而"同 scope 并发只启动一次"这条去重根本不会发生——请求
+                    // 被串行化之后永远不重叠。其余管理方法很快，保持内联即可。
+                    let slow = request.method == SLOW_MANAGEMENT_METHOD
+                        || request.method == SLOW_AUTHORIZE_METHOD;
+                    // 后台任务需要 `'static`：先克隆一份句柄，别借用外层绑定。
+                    let owned_handle = Arc::clone(handle);
+                    let deadline = yi_agent_lifecycle::deadline::Deadline::after(
+                        yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT,
+                    );
+                    let reply_to = client.clone();
+                    let reply_hub = Arc::clone(&hub);
+                    let work = async move {
+                        let response = crate::server::local_management::dispatch(
+                            owned_handle.as_ref(),
+                            request,
+                            deadline,
+                        )
+                        .await;
+                        let Ok(frame) = serde_json::to_value(&response) else {
+                            return;
+                        };
+                        // 私有响应同样受帧上限约束：不该比业务帧多出一条不受限
+                        // 的通道。
+                        if frame.to_string().len()
+                            > crate::server::local_management::MAX_MANAGEMENT_RESPONSE_BYTES
+                        {
+                            let refused = crate::server::local_management::refusal(
+                                "management response exceeds the frame limit",
+                            );
+                            if let Ok(refused) = serde_json::to_value(&refused) {
+                                reply_hub.reply(&reply_to, refused).await.ok();
+                            }
+                            return;
+                        }
+                        // 私有响应直接定向回写，**不**经 hub 广播、也不进
+                        // `app.emit`：它携带 epoch 与授权相关结果，前端页面
+                        // 不该看见，更不该能代答。
+                        reply_hub.reply(&reply_to, frame).await.ok();
+                    };
+                    if slow {
+                        tokio::spawn(work);
+                    } else {
+                        work.await;
+                    }
+                    continue;
+                }
+                if local_managed
+                    && let Some(handle) = management.as_ref()
+                {
+                    // 壳在 ACK 之前不发业务帧。服务端这一半把"壳忘了等 ACK"
+                    // 变成一个立刻可见的错误，而不是一段在未认证会话上跑起来
+                    // 的业务流量。
+                    if handle.session().lock().await.admit_business()
+                        != crate::server::local_management::Admission::Accepted
+                    {
+                        let refused = crate::server::local_management::refusal_for(
+                            value.get("id"),
+                            "the local session has not completed its bootstrap",
+                        );
+                        hub.reply(&client, serde_json::to_value(&refused)?)
+                            .await
+                            .ok();
+                        continue;
+                    }
+                }
+
                 let req: RequestEnvelope = match serde_json::from_value(value.clone()) {
                     Ok(r) => r,
                     Err(_) => {
@@ -514,6 +790,7 @@ where
                             pending_activation: &mut pending_activation,
                             runtimes: &runtimes,
                             thread_roots: &thread_roots,
+                            managed: &managed,
                             process_watches: &mut process_watches,
                             trace_watches: &mut trace_watches,
                             children_watches: &mut children_watches,
@@ -581,6 +858,15 @@ where
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
                             ensure_daemon: std::sync::Arc::clone(&ensure_daemon),
                             plugin_gate: crate::plugin_gate::Gate::from_process_environment(),
+                            // Read per request, like the shell authorization above:
+                            // `initialize` may arrive after this connection was
+                            // registered, and a cached value would tell the install
+                            // path "not managed" for a session the shell owns.
+                            managed_session: shell_authorizations
+                                .lock()
+                                .await
+                                .get(&client)
+                                .is_some(),
                             fatal_tx: fatal_tx.clone(),
                         });
                         let req = req.clone();
@@ -641,19 +927,17 @@ where
                             let is_local = client == crate::broadcast::ClientId::local();
                             match authorization.accept(is_local) {
                                 Ok(authorization) => {
-                                    // Hand the attach path what the shell authorized.
-                                    // The app-server speaks for one App run, so the
-                                    // set is replaced rather than merged: an older
-                                    // generation's capabilities must stop working the
-                                    // moment a new handshake arrives.
-                                    yi_agent_subagent::attach::install_root_capabilities(
-                                        authorization
-                                            .root_authorizations
-                                            .iter()
-                                            .map(|root| {
-                                                (root.root_id.clone(), root.capability.clone())
-                                            })
-                                            .collect(),
+                                    // Identity only, and installed where the attach path
+                                    // reads it: scope and client come from this
+                                    // authenticated handshake, so a conversation cannot
+                                    // name a different project or App run to reach
+                                    // someone else's authority. The roots themselves are
+                                    // asked for one at a time -- there is no
+                                    // project-wide capability to inherit here.
+                                    install_managed_identity(
+                                        &managed,
+                                        authorization,
+                                        management.as_ref(),
                                     );
                                     shell_authorizations
                                         .lock()
@@ -827,6 +1111,7 @@ where
                     &mut uploads,
                     &runtimes,
                     &thread_roots,
+                    &managed,
                     &models_path,
                     &cfg,
                     &hub,
@@ -903,6 +1188,7 @@ where
                         uploads: &mut uploads,
                         runtimes: &runtimes,
                         thread_roots: &thread_roots,
+                        managed: &managed,
                         models_path: &models_path,
                         lead_agent_enabled,
                         cfg: &cfg,
@@ -965,6 +1251,7 @@ where
                     uploads: &mut uploads,
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
+                    managed: &managed,
                     models_path: &models_path,
                     lead_agent_enabled,
                     cfg: &cfg,
@@ -1017,6 +1304,7 @@ where
                     uploads: &mut uploads,
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
+                    managed: &managed,
                     models_path: &models_path,
                     lead_agent_enabled,
                     cfg: &cfg,
@@ -1071,6 +1359,13 @@ where
     // 进程退出前断开所有项目 root。同步调用:已经不在热路径上,而进程即将结束。
     for binding in attached_runtimes(&runtimes) {
         binding.detach();
+    }
+
+    // 管理面收尾：摘掉进行中的 prepare，让还在等结果的调用方立刻看到「被
+    // 放弃」，而不是等满自己的 deadline 之后再超时。会话本来就要随这条 stdio
+    // 结束，留着那些槽位只会让退出变慢。
+    if let Some(handle) = management.as_ref() {
+        handle.close_now();
     }
 
     Ok(())

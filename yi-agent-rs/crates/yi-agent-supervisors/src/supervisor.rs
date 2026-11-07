@@ -162,6 +162,18 @@ pub struct Supervisor {
     managed_projects: BTreeMap<String, yi_agent_plugins::ProjectId>,
     /// 受管插件的常驻 argv（`--` 之后的参数）。
     managed_argv: BTreeMap<String, Vec<std::ffi::OsString>>,
+    /// 受管模式下"现在真的有人要用"的插件集合。
+    ///
+    /// `None` means *no demand gate*: this supervisor serves a manual or legacy
+    /// runtime, where a switch that is on is the whole answer, and demanding a
+    /// frontend would change behaviour nobody asked to change. `Some(set)` means
+    /// managed: configuration says what *may* run, and this says what *must*.
+    ///
+    /// The distinction matters most at startup. A managed daemon that trusted the
+    /// switch alone would start every enabled plugin before any client had a chance
+    /// to ask for one, which is precisely the "background process nobody wanted"
+    /// the managed runtime exists to remove.
+    wanted: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Supervisor {
@@ -176,6 +188,40 @@ impl Supervisor {
             managed: BTreeMap::new(),
             managed_projects: BTreeMap::new(),
             managed_argv: BTreeMap::new(),
+            wanted: None,
+        }
+    }
+
+    /// Serve managed plugins from a live demand set instead of from the switches.
+    ///
+    /// A switch stays the *permission*; demand is the reason. A plugin that is on but
+    /// not wanted must not run, and one that is wanted but off must not either --
+    /// the second is not a bug to paper over, it is the user's configuration.
+    pub fn with_wanted_plugins(mut self, wanted: impl IntoIterator<Item = String>) -> Self {
+        self.wanted = Some(wanted.into_iter().collect());
+        self
+    }
+
+    /// Replace the wanted set, as a demand snapshot arriving mid-life would.
+    pub fn set_wanted_plugins(&mut self, wanted: impl IntoIterator<Item = String>) {
+        if let Some(current) = self.wanted.as_mut() {
+            *current = wanted.into_iter().collect();
+        }
+    }
+
+    /// Whether this manifest should run right now.
+    ///
+    /// Two independent questions, both required: the switch is the user's
+    /// permission, and the wanted set is somebody actually waiting. Conflating them
+    /// in either direction is wrong -- "on" is not demand, and demand cannot
+    /// override "off".
+    pub fn should_run(&self, manifest: &SupervisorManifest) -> bool {
+        if !self.desired_on(manifest) {
+            return false;
+        }
+        match self.wanted.as_ref() {
+            None => true,
+            Some(wanted) => wanted.contains(&manifest.name),
         }
     }
 
@@ -262,6 +308,12 @@ impl Supervisor {
                     continue;
                 }
                 self.stop(&manifest.name, "switch off");
+                continue;
+            }
+            // On, but nobody is waiting: in managed mode a plugin exists because a
+            // client asked for it, not because it is installed.
+            if !self.should_run(&manifest) {
+                self.stop(&manifest.name, "no client demand");
                 continue;
             }
             self.ensure_running(&manifest);
@@ -548,6 +600,42 @@ mod tests {
         let manifest = SupervisorManifest::parse(&json).unwrap();
         std::fs::write(dir.join(format!("{name}.json")), &json).unwrap();
         manifest
+    }
+
+    /// Managed means "installed" is not "needed".
+    ///
+    /// A managed daemon that started every enabled plugin would spawn background
+    /// processes before any client could ask for one -- the exact thing the managed
+    /// runtime removes. The switch still has to be on, though: demand is not a way
+    /// to override the user's configuration.
+    #[test]
+    fn a_managed_plugin_runs_only_when_a_client_wants_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(dir.path(), "demo", "");
+        let mut supervisor = Supervisor::new(Layout::for_workdir(dir.path()), "dev".to_string());
+
+        // No demand gate at all (manual/legacy): the switch alone decides.
+        supervisor.wanted = None;
+        assert!(
+            !supervisor.should_run(&manifest),
+            "the switch is off here, so nothing may run"
+        );
+
+        // A demand gate with an empty set: installed and switched on is still not
+        // enough.
+        supervisor.wanted = Some(std::collections::BTreeSet::new());
+        assert!(
+            !supervisor.should_run(&manifest),
+            "a switched-on plugin nobody asked for must not run"
+        );
+
+        // Wanted, but the switch is off: the user's configuration wins.
+        supervisor.desired_on(&manifest);
+        supervisor.wanted = Some(["demo".to_string()].into_iter().collect());
+        assert!(
+            !supervisor.should_run(&manifest),
+            "demand cannot override a switch the user turned off"
+        );
     }
 
     #[test]

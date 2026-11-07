@@ -28,6 +28,16 @@ use serde::{Deserialize, Serialize};
 /// Marker file inside the instance directory (beside `resident-daemons.json`).
 pub const RETIREMENT_FILE: &str = "self-heal-retired.json";
 
+/// Marker written while a migration is in progress.
+///
+/// Separate from [`RETIREMENT_FILE`] because the two say different things. Retired
+/// means "a migration finished; nobody restarts this install any more". Frozen means
+/// "a migration is running; do not start anything *now*". A failed migration stays
+/// frozen on purpose -- the spec requires that the old self-healing does not come
+/// back while the user has an unfinished migration to look at -- but it must not
+/// claim to be retired, because nothing has been taken over yet.
+pub const FREEZE_FILE: &str = "self-heal-frozen.json";
+
 /// What the record contains. Only explanatory fields: nothing here is a credential
 /// or a liveness claim, so a stale file cannot break a later start on its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +51,44 @@ pub struct SelfHealRetirement {
 
 pub fn path(instance_home: &Path) -> PathBuf {
     instance_home.join(RETIREMENT_FILE)
+}
+
+pub fn freeze_path(instance_home: &Path) -> PathBuf {
+    instance_home.join(FREEZE_FILE)
+}
+
+/// Whether a migration is currently holding self-healing down.
+///
+/// Existence decides, for the same reason [`is_retired`] does: a damaged file must
+/// keep the old loops stopped rather than release them on a parse error.
+pub fn is_frozen(instance_home: &Path) -> bool {
+    freeze_path(instance_home).exists()
+}
+
+/// Stands the old self-healing loops down for the duration of a migration.
+///
+/// Idempotent, and written atomically: a half-written freeze file would be read as
+/// "not frozen" by an existence check at exactly the wrong moment.
+pub fn freeze(instance_home: &Path, reason: &str) -> std::io::Result<SelfHealRetirement> {
+    if let Some(existing) = read_freeze(instance_home) {
+        return Ok(existing);
+    }
+    let record = SelfHealRetirement {
+        retired_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+        reason: reason.to_string(),
+    };
+    std::fs::create_dir_all(instance_home)?;
+    write_atomically(&freeze_path(instance_home), FREEZE_FILE, &record)?;
+    Ok(record)
+}
+
+/// Reads the freeze record, or `None` when absent or unreadable.
+pub fn read_freeze(instance_home: &Path) -> Option<SelfHealRetirement> {
+    let bytes = std::fs::read(freeze_path(instance_home)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Whether every self-healing path must stand down.
@@ -70,9 +118,19 @@ pub fn retire(instance_home: &Path, reason: &str) -> std::io::Result<SelfHealRet
         reason: reason.to_string(),
     };
     std::fs::create_dir_all(instance_home)?;
-    let final_path = path(instance_home);
-    let temp_path = instance_home.join(format!(".{RETIREMENT_FILE}.{}.tmp", std::process::id()));
-    let body = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+    write_atomically(&path(instance_home), RETIREMENT_FILE, &record)?;
+    Ok(record)
+}
+
+/// Temp-write, fsync, rename. A record that appeared before its bytes were durable
+/// would be read as a decision the migration has not actually made.
+fn write_atomically(
+    final_path: &Path,
+    file_name: &str,
+    record: &SelfHealRetirement,
+) -> std::io::Result<()> {
+    let temp_path = final_path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let body = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
     {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -83,8 +141,8 @@ pub fn retire(instance_home: &Path, reason: &str) -> std::io::Result<SelfHealRet
         file.write_all(&body)?;
         file.sync_all()?;
     }
-    std::fs::rename(&temp_path, &final_path)?;
-    Ok(record)
+    std::fs::rename(&temp_path, final_path)?;
+    Ok(())
 }
 
 /// Reads the record, or `None` when it is absent or unreadable.

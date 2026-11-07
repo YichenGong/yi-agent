@@ -161,6 +161,8 @@ struct Host {
     uploads: crate::image_upload::UploadRegistry,
     runtimes: ProjectRuntimes,
     thread_roots: ThreadRoots,
+    /// No shell in these tests, so the conversation attaches with its own key.
+    managed: crate::server::ManagedSlot,
     cfg: RuntimeConfig,
     hub: Arc<crate::broadcast::Broadcaster>,
     turn_tx: mpsc::Sender<TurnEvent>,
@@ -209,6 +211,7 @@ impl Host {
             uploads: crate::image_upload::UploadRegistry::new(),
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            managed: Arc::new(StdMutex::new(None)),
             cfg: test_config(),
             hub: Arc::new(crate::broadcast::Broadcaster::new()),
             turn_tx,
@@ -260,6 +263,7 @@ impl Host {
             uploads: &mut self.uploads,
             runtimes: &self.runtimes,
             thread_roots: &self.thread_roots,
+            managed: &self.managed,
             models_path: &self.models_path,
             cfg: &self.cfg,
             hub: &self.hub,
@@ -347,6 +351,7 @@ impl Host {
             &mut self.uploads,
             &self.runtimes,
             &self.thread_roots,
+            &self.managed,
             &self.models_path,
             &self.cfg,
             &self.hub,
@@ -1083,6 +1088,105 @@ mod driver_gate {
         assert!(
             reason.contains("not accepting new sessions"),
             "the refusal must say the barrier closed, not blame the grant: {reason}"
+        );
+    }
+
+    /// 已经迁移到 managed 的实例上，驱动 tick 不能再按常驻登记起会话。
+    ///
+    /// 这是 spec §6 的「managed 接管后的自愈路径继续检查退役栅栏」在**驱动**这条
+    /// 路径上的落点。它与 `ensure_daemons` 是两条独立的启动通道：那条拉起的是
+    /// daemon，这条起的是会话（会话会带着工具、shell 与插件绑定真跑起来）。
+    /// 只看前者会让一个已退役实例在桌面打开后每 3 秒被驱动插件重新起活。
+    ///
+    /// 「最近生效」的判据是**插件根本没被问**，而不是「问了、被拒了」：一个已经
+    /// 交给 managed 的实例不该继续向旧插件要下一步，那等于让旧编排继续指挥新运行时。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_instance_never_asks_a_driver_plugin_for_work() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let work_path = workdir.path().to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => Ok(json!({
+                "action_id": "a1",
+                "kind": "launch",
+                "workdir": work_path,
+                "title": "driven · card-1",
+                "objective": "do the first thing",
+            })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_authorized_driver_plugin(
+            &daemon.project,
+            workdir.path(),
+            resident_dir.path(),
+            DRIVER_PLUGIN,
+            &host.instance_home,
+        );
+        // 迁移完成留下的标记，与启动路径、watchman 安装路径读的是同一个文件。
+        yi_agent_supervisors::lifecycle::retirement::retire(
+            &host.instance_home,
+            "test: instance migrated to the managed runtime",
+        )
+        .unwrap();
+
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert!(
+            host.threads.is_empty(),
+            "a retired instance must not start driven sessions"
+        );
+        assert!(
+            daemon.calls_to("driver/next").is_empty(),
+            "a retired instance must not ask legacy driver plugins for work: {:?}",
+            daemon.calls_to("driver/next")
+        );
+    }
+
+    /// 迁移**进行中**（冻结）时同理：此刻停 daemon 与起会话在同一实例上同时发生，
+    /// 起了就等于在关机的机器上开新工地。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frozen_instance_never_asks_a_driver_plugin_for_work() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let work_path = workdir.path().to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "driver/next" => Ok(json!({
+                "action_id": "a1",
+                "kind": "launch",
+                "workdir": work_path,
+                "title": "driven · card-1",
+                "objective": "do the first thing",
+            })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let mut host = Host::new();
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_authorized_driver_plugin(
+            &daemon.project,
+            workdir.path(),
+            resident_dir.path(),
+            DRIVER_PLUGIN,
+            &host.instance_home,
+        );
+        yi_agent_supervisors::lifecycle::retirement::freeze(
+            &host.instance_home,
+            "test: migration in progress",
+        )
+        .unwrap();
+
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
+        assert!(
+            host.threads.is_empty(),
+            "a frozen instance must not start driven sessions"
+        );
+        assert!(
+            daemon.calls_to("driver/next").is_empty(),
+            "a frozen instance must not ask legacy driver plugins for work"
         );
     }
 

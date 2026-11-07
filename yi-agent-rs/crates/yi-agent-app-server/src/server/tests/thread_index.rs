@@ -580,6 +580,7 @@ async fn eof_exits_gracefully() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            managed: Arc::new(StdMutex::new(None)),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),
@@ -674,6 +675,7 @@ async fn oversized_frame_returns_err() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            managed: Arc::new(StdMutex::new(None)),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),

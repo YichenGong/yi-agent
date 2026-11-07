@@ -317,73 +317,117 @@ pub(crate) async fn handle_shared(
                 .await;
                 return Ok(Flow::Continue);
             }
-            // 拉起 daemon 是 best-effort：清单与开关已经落盘，常驻监视线程每
-            // ~30s 会再扫一遍。这里失败只是「这次没立刻起来」，不该让一次已经
-            // 成功的安装回滚成失败。
-            let ensure = std::sync::Arc::clone(&state.ensure_daemon);
-            let daemon_project = project.clone();
-            match tokio::task::spawn_blocking(move || ensure(&daemon_project)).await {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => tracing::warn!(
-                    project = %project.display(),
-                    plugin = %plugin,
-                    "installed the plugin but its daemon did not become ready; the resident watch will retry"
-                ),
-                Ok(Err(error)) => tracing::warn!(
-                    project = %project.display(),
-                    plugin = %plugin,
-                    "installed the plugin but could not start its daemon: {error}"
-                ),
-                Err(error) => tracing::warn!(
-                    project = %project.display(),
-                    plugin = %plugin,
-                    "the daemon-start task failed: {error}"
-                ),
-            }
-            // 等插件自己的查询通道就绪。只等 daemon 的 `Status` 不够：转发表由
-            // daemon 的监督循环每 500ms 登记一次，插件还要 bind socket；调用方
-            // （桌面建看板）紧接着就发 `plugin/query`。
+            // 受管会话到此为止：清单与开关已经落盘，但"让它跑起来"不属于这次
+            // 安装。受管下插件只在真实 demand 到来时启动，demand 由持租约的壳按
+            // 实际使用意图申请；在安装路径里拉起 daemon 会直接绕过那道门，把一个
+            // 没人要的进程放进同一个 scope。旧自愈值守同理——它正是 managed 要
+            // 收敛掉的东西，装一个插件就把它装回来会让实例永远切不过去。
             //
-            // 阻塞轮询放进 blocking 池。超时不算失败：清单与开关已落盘，常驻
-            // 监督会继续重试；回包用 `queryable` 如实告诉调用方。
-            let queryable = {
-                let ready_project = project.clone();
-                let manifest = ready_manifest;
-                match tokio::task::spawn_blocking(move || {
-                    crate::server::wait_for_plugin_query_socket(&ready_project, &manifest)
-                })
-                .await
-                {
-                    Ok(ready) => ready,
+            // 因此这里既不等就绪、也不承诺"稍后会自动起来"。回包如实说
+            // `startup: "awaiting-demand"`，调用方据此知道该在真正要用时登记需求。
+            // `installed` is already true by here (manifest and switch are on disk),
+            // so every arm assigns `startup`; there is no "unknown" to fall back to.
+            let startup;
+            let mut queryable = false;
+            // Two separate questions, and either "no" is enough to stop:
+            //
+            // * `managed_session` — did a shell authorize *this connection*, i.e. is
+            //   there anyone who will actually run what we install?
+            // * the retirement marker — does this instance still allow an
+            //   unsupervised daemon at all?
+            //
+            // The watchman install, `ui/settings/write` and `once_unattended` all consult
+            // the marker. Leaving it out here lets one plain client reconnect after a
+            // migration and put back exactly the daemon those three paths just stopped.
+            let retired =
+                yi_agent_supervisors::lifecycle::retirement::is_retired(&state.plugin_home);
+            if state.managed_session || retired {
+                startup = "awaiting-demand";
+                tracing::info!(
+                    project = %project.display(),
+                    plugin = %plugin,
+                    managed_session = state.managed_session,
+                    retired,
+                    "installed under managed lifecycle; the plugin starts when a client demands it"
+                );
+            } else {
+                // 拉起 daemon 是 best-effort：清单与开关已经落盘，常驻监视线程每
+                // ~30s 会再扫一遍。这里失败只是「这次没立刻起来」，不该让一次已经
+                // 成功的安装回滚成失败。
+                let ensure = std::sync::Arc::clone(&state.ensure_daemon);
+                let daemon_project = project.clone();
+                match tokio::task::spawn_blocking(move || ensure(&daemon_project)).await {
+                    Ok(Ok(true)) => startup = "running",
+                    Ok(Ok(false)) => {
+                        startup = "retrying";
+                        tracing::warn!(
+                            project = %project.display(),
+                            plugin = %plugin,
+                            "installed the plugin but its daemon did not become ready; the resident watch will retry"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        startup = "retrying";
+                        tracing::warn!(
+                            project = %project.display(),
+                            plugin = %plugin,
+                            "installed the plugin but could not start its daemon: {error}"
+                        );
+                    }
                     Err(error) => {
-                        tracing::warn!(%error, "the plugin-readiness task failed");
-                        true
+                        startup = "retrying";
+                        tracing::warn!(
+                            project = %project.display(),
+                            plugin = %plugin,
+                            "the daemon-start task failed: {error}"
+                        );
                     }
                 }
-            };
-            if !queryable {
-                tracing::warn!(
-                    project = %project.display(),
-                    plugin = %plugin,
-                    "installed the plugin but its query channel was not ready in time; the resident watch will retry"
-                );
-            }
-            // 值守的登录项：`board/create` 时代由建板路径 best-effort 安装，那
-            // 条路径随域删除后没有替代落点。安装一个需要常驻的插件正是它的通用
-            // 对应物——开关为开、plist 未指向当前 exe 时装一次。
-            //
-            // 放在安装收尾：`launchctl` 是同步子进程，别让一次安装卡住 async worker。
-            // 失败只 warn：清单与开关已经落盘，登录自启装不上不该把成功改成失败。
-            {
-                let workdir = state.theme_handle.workdir().to_path_buf();
-                let home = state.watchman_home.clone();
-                let install = std::sync::Arc::clone(&state.watchman_install);
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    crate::server::ensure_watchman_installed(&workdir, &home, &install)
-                })
-                .await
+                // 等插件自己的查询通道就绪。只等 daemon 的 `Status` 不够：转发表由
+                // daemon 的监督循环每 500ms 登记一次，插件还要 bind socket；调用方
+                // （桌面建看板）紧接着就发 `plugin/query`。
+                //
+                // 阻塞轮询放进 blocking 池。超时不算失败：清单与开关已落盘，常驻
+                // 监督会继续重试；回包用 `queryable` 如实告诉调用方。
+                queryable = {
+                    let ready_project = project.clone();
+                    let manifest = ready_manifest;
+                    match tokio::task::spawn_blocking(move || {
+                        crate::server::wait_for_plugin_query_socket(&ready_project, &manifest)
+                    })
+                    .await
+                    {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            tracing::warn!(%error, "the plugin-readiness task failed");
+                            true
+                        }
+                    }
+                };
+                if !queryable {
+                    tracing::warn!(
+                        project = %project.display(),
+                        plugin = %plugin,
+                        "installed the plugin but its query channel was not ready in time; the resident watch will retry"
+                    );
+                }
+                // 值守的登录项：`board/create` 时代由建板路径 best-effort 安装，那
+                // 条路径随域删除后没有替代落点。安装一个需要常驻的插件正是它的通用
+                // 对应物——开关为开、plist 未指向当前 exe 时装一次。
+                //
+                // 放在安装收尾：`launchctl` 是同步子进程，别让一次安装卡住 async worker。
+                // 失败只 warn：清单与开关已经落盘，登录自启装不上不该把成功改成失败。
                 {
-                    tracing::warn!(%error, "the watchman-install task failed");
+                    let workdir = state.theme_handle.workdir().to_path_buf();
+                    let home = state.watchman_home.clone();
+                    let install = std::sync::Arc::clone(&state.watchman_install);
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        crate::server::ensure_watchman_installed(&workdir, &home, &install)
+                    })
+                    .await
+                    {
+                        tracing::warn!(%error, "the watchman-install task failed");
+                    }
                 }
             }
             write_or_fatal(
@@ -396,7 +440,18 @@ pub(crate) async fn handle_shared(
                         // 装完这一刻插件能不能被查询。调用方据此决定是立刻发
                         // `plugin/query`，还是先等监督补上（超时为 false，但安装
                         // 本身是成功的）。
+                        //
+                        // 与 `installed` 分开是契约的一部分：`installed` 说的是
+                        // "清单与开关已落盘"，与插件此刻是否在跑无关。受管会话下
+                        // 它恒为 false（没有 demand 就没有进程），这不是失败。
                         "queryable": queryable,
+                        // 谁负责让插件跑起来，以及这次安装有没有做到。
+                        //   `running`         legacy：daemon 与查询通道都已就绪
+                        //   `retrying`        legacy：已落盘，常驻监督会再试
+                        //   `awaiting-demand` managed：已落盘，等真实客户端登记需求
+                        // 三者不可合并：把 managed 说成 retrying 就是在承诺一个不
+                        // 存在的后台重试。
+                        "startup": startup,
                         // `PathBuf` 的 `Serialize` 在非 UTF-8 路径上会直接报错；
                         // 回包里的路径是给客户端看的，lossy 比整条响应失败好。
                         "manifest": yi_agent_supervisors::install::manifests_dir(&project)

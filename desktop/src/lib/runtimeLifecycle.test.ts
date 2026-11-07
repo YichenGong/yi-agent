@@ -535,3 +535,34 @@ describe("error classification", () => {
     expect(isControlUnavailable(new Error("socket closed"))).toBe(false);
   });
 });
+
+describe("an unidentified runtime claims nothing", () => {
+  it("does not say an unknown runtime was started by an older version", () => {
+    // `unknown` means "could not be identified". Borrowing the legacy sentence
+    // would state a fact about a process nobody managed to read.
+    const summary = summarise(status({ compatibility: "unknown", message: null }));
+    expect(summary.cannotRestartReason ?? "").not.toContain("not started by");
+    expect(summary.canRestart).toBe(false);
+  });
+
+  it("does not call an unknown runtime's workload empty", () => {
+    // The impact counts of an unidentified runtime are absent, not zero. Saying
+    // "nothing is running" would invite a restart that interrupts real work.
+    const summary = summarise(
+      status({
+        compatibility: "unknown",
+        message: null,
+        identity: {
+          ...status().identity,
+          daemonDisplayVersion: null,
+          daemonBuildId: null,
+          guardianDisplayVersion: null,
+          guardianBuildId: null,
+        },
+      }),
+    );
+    expect(summary.currentVersion).toBeNull();
+    expect(summary.message).toContain("could not be identified");
+    expect(summary.message).not.toContain("nothing is running");
+  });
+});

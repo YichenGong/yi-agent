@@ -7,6 +7,7 @@ mod flags_cmd;
 mod frontend_lease;
 mod llm_prefix;
 mod managed_runtime;
+mod managed_startup;
 mod onboarding_prompt;
 mod plugins_cmd;
 mod resume;
@@ -54,7 +55,7 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 /// Best effort, like everything else about *optional* delegation: without a home
 /// directory there is no instance to scope to, and refusing to start the CLI over
 /// that would be worse than an embedded runtime.
-fn install_managed_context() {
+fn install_managed_context(managed_frontend: bool) {
     let Some(instance_home) = yi_agent_store::paths::instance_home() else {
         return;
     };
@@ -68,7 +69,60 @@ fn install_managed_context() {
     yi_agent_subagent::attach::install_managed_context(yi_agent_subagent::attach::ManagedContext {
         expected: build_info::artifact_identity(executable),
         instance_home,
+        // The declaration is the entry point's own: `main` derives it from the
+        // command it is about to run, before anything can consult the policy.
+        managed_frontend,
     });
+}
+
+/// Whether the command the user invoked is a *supported managed frontend*.
+///
+/// The design's rule is explicit: the desktop sidecar, the TUI and a headless `run`
+/// select the managed policy; a manual `daemon`, the one-shot helpers and the
+/// internal runtime subcommands keep owning (or joining) their runtime the way they
+/// always did. That list lives here, in the binary, because it is a statement about
+/// which entry points ship as managed -- not about what any process holding a lease
+/// must do, which is the inference that was reverted for good reason.
+///
+/// `app-server` is included deliberately: the shell starts it with
+/// `--listen stdio://` and speaks the private channel, and that channel *is* the
+/// managed preparation path. A manually started `app-server --listen ws://` also
+/// lands here, and that is correct: it still refuses to start anything until a
+/// bootstrap-authenticated `_shell/prepare` asks it to, which is stricter than the
+/// embedded path, not looser.
+fn is_managed_frontend_entry(command: Option<&Command>) -> bool {
+    match command {
+        // The TUI: no subcommand at all.
+        None => true,
+        Some(Command::Run { .. }) => true,
+        Some(Command::AppServer { listen, .. }) => {
+            // Only the local stdio transport is a frontend of a local runtime. A
+            // relay-only server forwards to a phone and owns no runtime of its own,
+            // and a ws server is reached from the network -- neither should acquire
+            // guardian-owned local work on the strength of a command name.
+            parse_listen(listen)
+                .map(|listen| matches!(listen, Listen::Stdio))
+                .unwrap_or(false)
+        }
+        Some(
+            Command::Daemon { .. }
+            | Command::Web { .. }
+            | Command::Resume { .. }
+            | Command::Agents { .. }
+            | Command::Agent { .. }
+            | Command::Schedule { .. }
+            | Command::Resident { .. }
+            | Command::Pair { .. }
+            | Command::Completions { .. }
+            | Command::Flags { .. }
+            | Command::InternalRuntime { .. }
+            | Command::Plugins { .. },
+        ) => false,
+        // Any subcommand added later is not a managed frontend until somebody says
+        // it is. Over-including is the failure that hands a manual command a
+        // guardian-owned runtime.
+        Some(_) => false,
+    }
 }
 
 fn main() -> Result<()> {
@@ -82,7 +136,11 @@ fn main() -> Result<()> {
     // and where this instance keeps its state. Install both once, before any
     // command runs, so the app-server's project attach can consult the bring-up
     // policy without every transport signature growing two parameters.
-    install_managed_context();
+    //
+    // Whether this command is a *supported managed frontend* is a property of the
+    // entry point, so it is decided here from the parsed command rather than inferred
+    // from a process global later.
+    install_managed_context(is_managed_frontend_entry(cli.command.as_ref()));
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their
@@ -392,12 +450,26 @@ fn run_internal_guardian() -> Result<()> {
         .unwrap_or_else(|| {
             yi_agent_store::paths::instance_home().unwrap_or_else(|| runtime_dir.clone())
         });
-    let project = std::env::current_dir()?;
+    // The project is taken from the launcher's explicit declaration, never from
+    // this process's working directory: the launcher starts the guardian inside the
+    // runtime directory, so `current_dir()` describes the runtime and only
+    // coincidentally describes the project.
+    let project = std::path::PathBuf::from(yi_agent_supervisors::lifecycle::roles::project_key()?);
     let scope = yi_agent_supervisors::lifecycle::bringup::scope_for_existing(
         &runtime_dir,
         &project,
         &instance_home,
     )?;
+    // The resolved scope must agree with the key the launcher named. A disagreement
+    // means the two sides canonicalised different paths, and serving would attach
+    // this guardian's control socket to a scope nobody is looking for.
+    if !yi_agent_supervisors::lifecycle::bringup::scope_keys_agree(&key, &scope.key) {
+        anyhow::bail!(
+            "the launcher named scope {key}, but {} resolves to {}",
+            project.display(),
+            scope.key
+        );
+    }
     managed_runtime::run_guardian(scope, launcher)
 }
 
@@ -1104,10 +1176,7 @@ fn build_headless_root_tools(
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
-    managed: Option<(
-        yi_agent_tools::ManagedProcessPolicy,
-        yi_agent_tools::ManagedSpawner,
-    )>,
+    managed: Option<&ManagedRunOwnership>,
 ) -> Result<HeadlessSetup> {
     // Both the builtin tools and the process manager are built from the same owner:
     // `build_tool_setup_owned` wires the managed spawner into `bash`, the process
@@ -1124,10 +1193,15 @@ fn build_headless_root_tools(
             config.sandbox_promotable,
         ),
         Vec::new(),
-        managed,
+        managed.map(|ownership| ownership.owner.clone()),
     )?;
     let mut registry = (*setup.tools).clone();
-    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    // A managed session brings the root the guardian authorized; building a second
+    // one here would mean the tools act on a root nobody vouched for. Embedded
+    // sessions have nothing to reuse and keep building one from the attach handle.
+    let binding = managed
+        .and_then(|ownership| ownership.root.as_ref().map(Arc::clone))
+        .unwrap_or_else(|| crate::tui::subagents::root_binding(runtime_socket, attached_root));
     let delegation_controller = yi_agent_tools::SandboxController::new(
         yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
         config.sandbox,
@@ -1153,6 +1227,51 @@ struct HeadlessRuntimeSession {
     /// shared runtime even when it fans out to many subagents, and its exit is what
     /// says "stop reclaiming on my behalf".
     frontend_lease: Option<crate::frontend_lease::FrontendLeaseHandle>,
+    /// What the managed start granted, or `None` under embedded mode.
+    ///
+    /// One field for the whole grant: the spawn owner and the authorized root come
+    /// from the same start, and a session that carried only one of them would hand
+    /// its tools a spawner with no authority behind it.
+    managed: Option<ManagedRunOwnership>,
+}
+
+/// The runtime-owned half of a managed start: who may spawn, and under which root.
+///
+/// Cloned per tool rebuild rather than moved, because the `run` path rebuilds its
+/// registry for every conversation root while the start itself happens once.
+#[derive(Clone)]
+struct ManagedRunOwnership {
+    owner: (
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    ),
+    /// The root the guardian authorized, when this run walked the managed start.
+    ///
+    /// `None` for an embedded run whose lease found a serving guardian: the spawn
+    /// owner is real, but no authority was obtained for a root, so the delegation
+    /// binding still comes from the attach handle.
+    root: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
+}
+
+impl HeadlessRuntimeSession {
+    /// Who owns this run's tool processes, and which root they must act on.
+    ///
+    /// The managed start is authoritative when there is one: it already opened the
+    /// channel its admission gated on, and asking the lease again would open a
+    /// second one no stage gated. An embedded run has no start, but it still
+    /// registers as a frontend when a guardian happens to serve this scope -- its
+    /// children must then belong to this run rather than to nobody, which is the
+    /// behaviour the embedded path has always had.
+    fn ownership(&self) -> Option<ManagedRunOwnership> {
+        if let Some(start) = &self.managed {
+            return Some(start.clone());
+        }
+        let owner = self
+            .frontend_lease
+            .as_ref()
+            .and_then(|lease| lease.managed_owner())?;
+        Some(ManagedRunOwnership { owner, root: None })
+    }
 }
 
 /// The attach request for an application root.
@@ -1251,6 +1370,7 @@ fn attach_headless_runtime(
         },
         embedded_daemon,
         frontend_lease,
+        managed: None,
     })
 }
 
@@ -1270,10 +1390,10 @@ fn build_tui_root_tools(
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
     mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
-    managed: Option<(
-        yi_agent_tools::ManagedProcessPolicy,
-        yi_agent_tools::ManagedSpawner,
-    )>,
+    // One value, not two `Option`s: the spawn owner and the authorized root always
+    // come from the same start, and passing them separately let a caller supply
+    // one without the other -- a managed spawner over an unauthorized root.
+    managed: Option<&ManagedTuiStart>,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
     // `base_registry` 只有 skills,`mcp_reload` 是在主注册表上登记的;切根目录
@@ -1304,9 +1424,14 @@ fn build_tui_root_tools(
         controller,
         config.sandbox_writable_roots.clone(),
         Vec::new(),
-        managed,
+        managed.map(|start| start.owner.clone()),
     );
-    let binding = crate::tui::subagents::root_binding(runtime_socket, attached_root);
+    // Same rule as the headless builder: a managed start already holds an authorized
+    // root, and the delegation tools must act on that one.
+    let binding = match managed {
+        Some(start) => Arc::clone(&start.root),
+        None => crate::tui::subagents::root_binding(runtime_socket, attached_root),
+    };
     let delegation_controller = yi_agent_tools::SandboxController::new(
         yi_agent_core::autonomy::YoloSwitch::new(config.yolo),
         config.sandbox,
@@ -1338,6 +1463,32 @@ struct AttachedTuiRuntime {
     /// 插件监督句柄。本 TUI 起了 daemon 才真的监督；借用别人的 daemon 时是空转。
     /// 生命周期交给 Drop：会话结束即停止监督，不必依赖调用点的纪律。
     supervisor: yi_agent_runtime::supervise::SuperviseHandle,
+    /// The ordered managed start this session came from, when the policy was managed.
+    ///
+    /// Present means the lease, the root authorization and the spawn channel were all
+    /// taken *before* the attach, in that order, and the session may bind its foreground
+    /// driver on the same lease. `None` is the embedded path, which keeps its historical
+    /// shape: no guardian, so no lease and no authorization to reuse.
+    managed: Option<Box<ManagedTuiStart>>,
+}
+
+/// A managed TUI start that ran every startup stage, including admission.
+struct ManagedTuiStart {
+    /// The admitted session: the lease, the root authority and the scope that were
+    /// granted in that order. Held for the process lifetime.
+    admitted: crate::managed_startup::AdmittedManagedStart,
+    /// Opened during the start so a refused channel stops the session before the first
+    /// turn rather than at the first tool call.
+    owner: (
+        yi_agent_tools::ManagedProcessPolicy,
+        yi_agent_tools::ManagedSpawner,
+    ),
+    /// The conversation root this start attached.
+    ///
+    /// Built here, not per turn: the authority store, the scope key and the client run
+    /// must be the ones the authorization was obtained with, and three call sites
+    /// assembling them would eventually disagree.
+    root: Arc<yi_agent_subagent::thread_root::ThreadRoot>,
 }
 
 impl TuiRuntimeSession {
@@ -1501,35 +1652,46 @@ fn attach_managed_headless_runtime(
         let deadline = yi_agent_lifecycle::deadline::Deadline::after(
             yi_agent_subagent::attach::MANAGED_START_BUDGET,
         );
-        let attached = yi_agent_subagent::attach::attach_managed_project_runtime(
-            config,
-            runtime_dir.clone(),
-            &instance_home,
-            &expected,
-            yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
-            deadline,
+        // One conversation per `run` invocation. The key is stable for its lifetime,
+        // which is what makes a retried authorization resolve to the same root.
+        let thread_key = format!("run:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+        let observer = std::sync::Arc::new(crate::managed_startup::FileTraceObserver::from_env());
+        // The whole start, in order, before any tool or turn exists: a refusal at any
+        // stage must end the command instead of degrading it to a direct spawn.
+        let started = crate::managed_startup::start_managed_run(
+            crate::managed_startup::ManagedStartRequest {
+                cfg: config,
+                runtime_dir: runtime_dir.clone(),
+                instance_home,
+                expected,
+                client_kind: yi_agent_lifecycle::types::ClientKind::Headless,
+                client_run_id: crate::frontend_lease::new_client_run_id("run"),
+                thread_key: thread_key.clone(),
+                workspace: config.workdir.clone(),
+                extra_roots: Vec::new(),
+                deadline,
+            },
+            observer,
+            // The conversation key doubles as the root's thread id: `run` has one
+            // conversation per invocation, and delegation tagging must name the same
+            // one the authority was obtained for.
+            &thread_key,
         )
-        .map_err(|failure| anyhow::anyhow!("managed runtime: {}", failure.cause))?;
-        // The lease goes on only after the attach succeeded: registering for a
-        // project this process never joined would make the guardian wait for a
-        // frontend that has no work.
-        let frontend_lease = crate::frontend_lease::FrontendLeaseHandle::register(
-            &runtime_dir,
-            yi_agent_lifecycle::types::ClientKind::Headless,
-            crate::frontend_lease::new_client_run_id("run"),
-        )
-        .ok()
-        .flatten();
+        .map_err(|refusal| anyhow::anyhow!("managed runtime: {refusal}"))?;
         Ok(HeadlessRuntimeSession {
-            socket_path: attached.socket_path.clone(),
+            socket_path: started.admitted.attached.socket_path.clone(),
             attached_root: crate::tui::subagents::AttachedRoot {
-                session_id: attached.attached_root.session_id,
-                task_id: attached.attached_root.task_id,
-                capability: attached.attached_root.capability,
-                workspace: attached.attached_root.workspace,
+                session_id: started.admitted.attached.attached_root.session_id.clone(),
+                task_id: started.admitted.attached.attached_root.task_id.clone(),
+                capability: started.admitted.attached.attached_root.capability.clone(),
+                workspace: started.admitted.attached.attached_root.workspace.clone(),
             },
             embedded_daemon: None,
-            frontend_lease,
+            frontend_lease: Some(started.admitted.lease.clone()),
+            managed: Some(ManagedRunOwnership {
+                owner: started.owner,
+                root: Some(started.root),
+            }),
         })
     })())
 }
@@ -1540,7 +1702,10 @@ fn attach_managed_headless_runtime(
 /// caller falls through to the embedded path on `None`, while `Unavailable` is the
 /// managed path's own verdict and has to reach the user. Folding them together
 /// would silently start an embedded daemon under a policy that forbids one.
-fn attach_managed_tui_runtime(config: &config::Config) -> Option<TuiRuntimeSession> {
+fn attach_managed_tui_runtime(
+    config: &config::Config,
+    thread_key: &str,
+) -> Option<TuiRuntimeSession> {
     use yi_agent_subagent::attach::{BringUpPolicy, process_bringup_choice};
 
     let choice = process_bringup_choice();
@@ -1562,39 +1727,100 @@ fn attach_managed_tui_runtime(config: &config::Config) -> Option<TuiRuntimeSessi
     let deadline = yi_agent_lifecycle::deadline::Deadline::after(
         yi_agent_subagent::attach::MANAGED_START_BUDGET,
     );
-    match yi_agent_subagent::attach::attach_managed_project_runtime(
-        config,
-        runtime_dir,
-        &instance_home,
-        &expected,
-        yi_agent_supervisors::lifecycle::bringup::BringUpIntent::Business,
-        deadline,
+    // Ordered start: bring-up, then *this process's* lease and heartbeat, then the
+    // conversation's root authority, then the attach. Attaching first -- what this path
+    // used to do -- asks a managed daemon for a root the guardian never authorized.
+    let observer = std::sync::Arc::new(crate::managed_startup::FileTraceObserver::from_env());
+    let pending = match crate::managed_startup::begin_managed_frontend(
+        crate::managed_startup::ManagedStartRequest {
+            cfg: config,
+            runtime_dir: runtime_dir.clone(),
+            instance_home,
+            expected,
+            client_kind: yi_agent_lifecycle::types::ClientKind::Tui,
+            client_run_id: crate::frontend_lease::new_client_run_id("tui"),
+            thread_key: thread_key.to_string(),
+            workspace: config.workdir.clone(),
+            extra_roots: Vec::new(),
+            deadline,
+        },
+        observer,
     ) {
-        Ok(attached) => Some(TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
-            socket_path: attached.socket_path.clone(),
-            attached_root: crate::tui::subagents::AttachedRoot {
-                session_id: attached.attached_root.session_id,
-                task_id: attached.attached_root.task_id,
-                capability: attached.attached_root.capability,
-                workspace: attached.attached_root.workspace,
-            },
-            // Managed mode never owns the daemon; the guardian does.
-            embedded_daemon: None,
-            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
-                &attached.project_root,
-                // The directory, not the socket: supervision reads the flags file
-                // beside it. `owns_daemon` is false here, so this only decides what
-                // an idle handle would have looked at.
-                &runtime_directory_for(&attached.project_root),
-                false,
-            ),
-        }))),
-        Err(failure) => {
-            let reason = format!("managed runtime: {}", failure.cause);
-            tracing::warn!(stage = failure.stage, cause = %failure.cause, "{reason}");
-            Some(TuiRuntimeSession::unavailable(reason))
+        Ok(pending) => pending,
+        Err(refusal) => {
+            let reason = format!("managed runtime: {refusal}");
+            tracing::warn!(stage = ?refusal.stage, cause = %refusal.cause, "{reason}");
+            return Some(TuiRuntimeSession::unavailable(reason));
         }
+    };
+    // The conversation root is built from the authorization the start just obtained, so
+    // the foreground driver binds on that authority instead of asking the guardian for a
+    // second one (and a second client) later.
+    let root = match pending.managed_root(config, thread_key) {
+        Ok(root) => root,
+        Err(cause) => {
+            let reason = format!("managed runtime: {cause}");
+            tracing::warn!(%cause, "{reason}");
+            return Some(TuiRuntimeSession::unavailable(reason));
+        }
+    };
+    let mut pending = pending;
+    // The order is the contract: a driver may only bind after a root is attached, and
+    // only a bound driver may be given a channel. Binding proves the driver contract
+    // before the session claims it has one; the returned handle is dropped deliberately
+    // because a driver with no open turn reports nothing, and each turn re-binds with the
+    // same stable operation id -- the pattern the app-server uses per turn.
+    if let Err(refusal) = pending.bind_driver(&root) {
+        let reason = format!("managed runtime: {refusal}");
+        tracing::warn!(stage = ?refusal.stage, cause = %refusal.cause, "{reason}");
+        return Some(TuiRuntimeSession::unavailable(reason));
     }
+    let owner = match pending.open_managed_channel() {
+        Ok(owner) => owner,
+        Err(refusal) => {
+            let reason = format!("managed runtime: {refusal}");
+            tracing::warn!(stage = ?refusal.stage, cause = %refusal.cause, "{reason}");
+            return Some(TuiRuntimeSession::unavailable(reason));
+        }
+    };
+    let admitted = match pending.admit() {
+        Ok(admitted) => admitted,
+        Err(refusal) => {
+            let reason = format!("managed runtime: {refusal}");
+            tracing::warn!(stage = ?refusal.stage, cause = %refusal.cause, "{reason}");
+            return Some(TuiRuntimeSession::unavailable(reason));
+        }
+    };
+    // `AttachedProjectRuntime` owns a daemon handle and a supervision handle, so it is
+    // moved into the session rather than cloned: the handles must be dropped by whoever
+    // ends the session.
+    let socket_path = admitted.attached.socket_path.clone();
+    let project_root = admitted.attached.project_root.clone();
+    let attached_root = crate::tui::subagents::AttachedRoot {
+        session_id: admitted.attached.attached_root.session_id.clone(),
+        task_id: admitted.attached.attached_root.task_id.clone(),
+        capability: admitted.attached.attached_root.capability.clone(),
+        workspace: admitted.attached.attached_root.workspace.clone(),
+    };
+    Some(TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
+        socket_path,
+        attached_root,
+        // Managed mode never owns the daemon; the guardian does.
+        embedded_daemon: None,
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &project_root,
+            // The directory, not the socket: supervision reads the flags file
+            // beside it. `owns_daemon` is false here, so this only decides what
+            // an idle handle would have looked like.
+            &runtime_directory_for(&project_root),
+            false,
+        ),
+        managed: Some(Box::new(ManagedTuiStart {
+            admitted,
+            owner,
+            root,
+        })),
+    })))
 }
 
 fn attach_tui_runtime(
@@ -1602,9 +1828,17 @@ fn attach_tui_runtime(
     config: &config::Config,
     conversation: Option<&str>,
 ) -> TuiRuntimeSession {
+    // The per-conversation key a managed start authorizes a root under. It has to be
+    // stable for the whole conversation, so it comes from the store that outlives
+    // individual turns. A conversation with no store (persistence failed) still gets
+    // one key; `attach_managed_tui_runtime` mints it once rather than per attach.
+    let thread_key = conversation
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
+
     // The policy decides *who owns the daemon*; everything below this branch is
     // the embedded path, which stays byte-for-byte as it was.
-    if let Some(session) = attach_managed_tui_runtime(config) {
+    if let Some(session) = attach_managed_tui_runtime(config, &thread_key) {
         return session;
     }
     let runtime_dir = runtime_directory_for(&config.workdir);
@@ -1703,6 +1937,7 @@ fn attach_tui_runtime(
             &runtime_dir,
             owns_daemon,
         ),
+        managed: None,
     }))
 }
 
@@ -2480,16 +2715,13 @@ fn run_headless(
             // after the agent is built below. A `fork:true` spawn in `run` mode
             // reads this handle at call time.
             let caller = crate::tui::subagents::CallerContext::unbound();
-            let managed_owner = runtime
-                .frontend_lease
-                .as_ref()
-                .and_then(|lease| lease.managed_owner());
+            let ownership = runtime.ownership();
             let setup = build_headless_root_tools(
                 &config,
                 runtime.socket_path.clone(),
                 &runtime.attached_root,
                 caller.clone(),
-                managed_owner,
+                ownership.as_ref(),
             )?;
             runtime_caller = Some(caller);
             setup
@@ -2583,13 +2815,36 @@ fn run_headless(
             // `run` is one invocation, so the guardian is asked here once rather
             // than per turn. A refusal is recorded verbatim and never downgraded to
             // the embedded resume secret.
-            let runtime_dir = runtime_directory_for(&runtime.attached_root.workspace.path);
-            if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
-                &runtime_dir,
-                yi_agent_lifecycle::types::ClientKind::Tui,
-                crate::frontend_lease::new_client_run_id("run-foreground"),
-            ) && let Ok(authority) =
-                host.authority(&root, &format!("run-delegation:{}", std::process::id()))
+            //
+            // The host must act *as this frontend*, never register a second one.
+            // A `:Tui` lease named `run-foreground` was created here and released
+            // by nobody: it lives for a full expiry window after `run` exits, so
+            // the guardian still counted a business client and never drained -- the
+            // daemon outlived the last frontend by design violation. Reusing the
+            // invocation's lease keeps one process equal to one client, which is
+            // exactly what "the last frontend leaving stops the runtime" depends on.
+            let foreground_host = runtime
+                .frontend_lease
+                .as_ref()
+                .map(|lease| {
+                    yi_agent_subagent::foreground::ForegroundHost::from_lease(lease.shared())
+                })
+                .or_else(|| {
+                    // Embedded mode has no leased frontend to lend; the guardian
+                    // is not there, so `connect` answers `None` and nothing is
+                    // registered.
+                    let runtime_dir = runtime_directory_for(&runtime.attached_root.workspace.path);
+                    yi_agent_subagent::foreground::ForegroundHost::connect(
+                        &runtime_dir,
+                        yi_agent_lifecycle::types::ClientKind::Tui,
+                        crate::frontend_lease::new_client_run_id("run-foreground"),
+                    )
+                    .ok()
+                    .flatten()
+                });
+            if let Some(host) = foreground_host
+                && let Ok(authority) =
+                    host.authority(&root, &format!("run-delegation:{}", std::process::id()))
             {
                 driver.set_authority(authority);
             }
@@ -3739,6 +3994,7 @@ fn run_tui_agent(
                                         attached_root,
                                         embedded_daemon,
                                         supervisor,
+                                        managed,
                                     } = *attached;
                                     // Captured before the fields are consumed by the
                                     // tooling rebuild below: the foreground root needs
@@ -3780,22 +4036,37 @@ fn run_tui_agent(
                                         attached_root.clone(),
                                     );
                                     let runtime_workdir = attached_root.workspace.path.clone();
-                                    // The lease is taken *before* the tools are built:
-                                    // a managed tool spawn needs the owner this process
-                                    // registered as, and a tool set built first would
-                                    // have to spawn directly with no owner to reclaim
-                                    // for. Embedded mode still answers `None` here.
-                                    let lease_handle =
-                                        crate::frontend_lease::FrontendLeaseHandle::register(
-                                            &runtime_directory_for(&runtime_workdir),
-                                            yi_agent_lifecycle::types::ClientKind::Tui,
-                                            crate::frontend_lease::new_client_run_id("tui"),
-                                        )
-                                        .ok()
-                                        .flatten();
-                                    let managed_owner = lease_handle
-                                        .as_ref()
-                                        .and_then(|lease| lease.managed_owner());
+                                    // A managed session already holds its lease, its root
+                                    // authority and its spawn channel: they were taken in
+                                    // order by `attach_managed_tui_runtime`, *before* any
+                                    // root was attached. Registering here would be a second
+                                    // frontend for one process, and asking for a channel
+                                    // again would open one the start did not gate on -- so
+                                    // the managed arm reuses what the start proved.
+                                    //
+                                    // The embedded arm keeps its historical shape: no
+                                    // guardian answers, so `register` reports `None` and the
+                                    // tools spawn directly, which is correct when this
+                                    // process owns the daemon.
+                                    let (lease_handle, managed_owner) = match &managed {
+                                        Some(start) => (
+                                            Some(start.admitted.lease.clone()),
+                                            Some(start.owner.clone()),
+                                        ),
+                                        None => {
+                                            let lease = crate::frontend_lease::FrontendLeaseHandle::register(
+                                                &runtime_directory_for(&runtime_workdir),
+                                                yi_agent_lifecycle::types::ClientKind::Tui,
+                                                crate::frontend_lease::new_client_run_id("tui"),
+                                            )
+                                            .ok()
+                                            .flatten();
+                                            let owner = lease
+                                                .as_ref()
+                                                .and_then(|lease| lease.managed_owner());
+                                            (lease, owner)
+                                        }
+                                    };
                                     // The process manager is upgraded only after the
                                     // rebuild succeeds (see below). Upgrading it here
                                     // would leave it owned by a lease this arm may
@@ -3810,7 +4081,7 @@ fn run_tui_agent(
                                         &attached_root,
                                         caller_for_attach.clone(),
                                         &mcp_for_driver,
-                                        managed_owner,
+                                        managed.as_deref(),
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
@@ -3855,6 +4126,16 @@ fn run_tui_agent(
                                                     .expect("frontend lease mutex poisoned") =
                                                     Some(lease);
                                             }
+                                            // On the managed path the root was built from
+                                            // the authorization the start already holds, so
+                                            // the foreground driver binds on that authority
+                                            // rather than asking for a second one. The
+                                            // embedded path keeps building a root from the
+                                            // attached handle, exactly as before.
+                                            let managed_root =
+                                                managed.as_ref().map(|start| {
+                                                    Arc::clone(&start.root)
+                                                });
                                             current_runtime =
                                                 Some(TuiRuntimeSession::Attached(Box::new(
                                                     AttachedTuiRuntime {
@@ -3862,23 +4143,32 @@ fn run_tui_agent(
                                                         attached_root,
                                                         embedded_daemon,
                                                         supervisor,
+                                                        managed,
                                                     },
                                                 )));
                                             root_activated = false;
-                                            // The runtime is attached, so this
-                                            // conversation now has a root a host could
-                                            // drive. Whether it *may* is the guardian's
-                                            // answer, asked on the first turn (the
-                                            // authorization carries the objective's
-                                            // operation, which does not exist yet).
-                                            foreground_root = Some(build_tui_foreground_root(
-                                                &runtime_workdir_for_foreground,
-                                                socket_path_for_foreground.clone(),
-                                                attached_root_for_foreground.clone(),
-                                                session_store_for_driver
-                                                    .as_ref()
-                                                    .map(|store| store.thread_id()),
-                                            ));
+                                            // A managed start already built this
+                                            // conversation's root from the authority it
+                                            // obtained, so use that one: rebuilding it here
+                                            // would attach the same conversation twice.
+                                            foreground_root = Some(match managed_root {
+                                                Some(root) => root,
+                                                // Embedded: the runtime is attached, so
+                                                // this conversation now has a root a host
+                                                // could drive. Whether it *may* is the
+                                                // guardian's answer, asked on the first
+                                                // turn (the authorization carries the
+                                                // objective's operation, which does not
+                                                // exist yet).
+                                                None => build_tui_foreground_root(
+                                                    &runtime_workdir_for_foreground,
+                                                    socket_path_for_foreground.clone(),
+                                                    attached_root_for_foreground.clone(),
+                                                    session_store_for_driver
+                                                        .as_ref()
+                                                        .map(|store| store.thread_id()),
+                                                ),
+                                            });
                                             foreground = None;
                                         }
                                         Err(error) => {
@@ -3964,14 +4254,36 @@ fn run_tui_agent(
                         .lock()
                         .expect("foreground host mutex poisoned");
                     if host_slot.is_none() {
-                        // A missing lease is normal (embedded mode) and means the
+                        // A managed start already holds the one lease this process may
+                        // have. Registering a second `tui-foreground` client here would
+                        // make the guardian count one terminal twice, and its reclaim
+                        // would then target work the other lease still owns; so the
+                        // managed arm drives the foreground on the startup lease.
+                        //
+                        // A missing lease is normal on the embedded path and means the
                         // conversation keeps legacy semantics.
-                        if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
-                            &runtime_directory_for(&driver_workdir),
-                            yi_agent_lifecycle::types::ClientKind::Tui,
-                            crate::frontend_lease::new_client_run_id("tui-foreground"),
-                        ) {
-                            *host_slot = Some(host);
+                        let managed_lease = match current_runtime.as_ref() {
+                            Some(TuiRuntimeSession::Attached(attached)) => attached
+                                .managed
+                                .as_ref()
+                                .map(|start| start.admitted.lease.shared()),
+                            _ => None,
+                        };
+                        match managed_lease {
+                            Some(lease) => {
+                                *host_slot = Some(
+                                    yi_agent_subagent::foreground::ForegroundHost::from_lease(lease),
+                                );
+                            }
+                            None => {
+                                if let Ok(Some(host)) = yi_agent_subagent::foreground::ForegroundHost::connect(
+                                    &runtime_directory_for(&driver_workdir),
+                                    yi_agent_lifecycle::types::ClientKind::Tui,
+                                    crate::frontend_lease::new_client_run_id("tui-foreground"),
+                                ) {
+                                    *host_slot = Some(host);
+                                }
+                            }
                         }
                     }
                     if let Some(host) = host_slot.as_ref() {
@@ -4594,6 +4906,46 @@ fn manual_compaction_outcome_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The managed-frontend list is a product decision, so it is pinned here.
+    ///
+    /// Two failures are worth preventing, and they are opposite:
+    ///
+    /// * a shipped frontend (TUI, headless `run`, the shell's stdio sidecar) that
+    ///   forgot to declare itself would fall back to an embedded runtime, which has
+    ///   no guardian to authorize a root -- the original bug this contract fixes;
+    /// * a manual command (`daemon`, the helpers, a relay-only server) that acquired
+    ///   the managed policy would be handed a guardian-owned runtime it never asked
+    ///   for, and `yi-agent daemon status` would stop describing what it started.
+    #[test]
+    fn only_the_supported_frontends_declare_managed() {
+        for (arguments, expected) in [
+            // The TUI: no subcommand.
+            (vec!["yi-agent"], true),
+            (vec!["yi-agent", "run", "hi"], true),
+            (vec!["yi-agent", "app-server", "--listen", "stdio://"], true),
+            // Manual and internal entry points keep their own semantics.
+            (vec!["yi-agent", "daemon", "status"], false),
+            (vec!["yi-agent", "resident", "watch"], false),
+            (vec!["yi-agent", "web"], false),
+            (vec!["yi-agent", "agents"], false),
+            (vec!["yi-agent", "completions", "zsh"], false),
+            (vec!["yi-agent", "internal-runtime", "identity"], false),
+            // A relay-only or ws server owns no local runtime: it forwards.
+            (
+                vec!["yi-agent", "app-server", "--listen", "ws://127.0.0.1:1"],
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&arguments)
+                .unwrap_or_else(|error| panic!("{arguments:?} must parse: {error}"));
+            assert_eq!(
+                is_managed_frontend_entry(cli.command.as_ref()),
+                expected,
+                "{arguments:?} took the wrong side of the managed-frontend line"
+            );
+        }
+    }
 
     /// TUI 每轮都换 turn，但不换 worker 身份。
     ///

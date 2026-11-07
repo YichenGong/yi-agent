@@ -10,6 +10,8 @@ pub mod binding;
 pub mod delegation;
 pub mod executor;
 pub mod foreground;
+pub mod managed_binding;
+pub mod managed_startup;
 pub mod session_delegation;
 pub mod session_identity;
 pub mod thread_root;

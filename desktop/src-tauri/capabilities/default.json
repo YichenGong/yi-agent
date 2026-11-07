@@ -42,6 +42,12 @@
     "allow-foreground-root-recovery-inspect",
     "allow-foreground-root-recovery-prepare",
     "allow-foreground-root-recovery-confirm",
-    "allow-foreground-root-recovery-operation"
+    "allow-foreground-root-recovery-operation",
+    "allow-runtime-plugin-demand-acquire",
+    "allow-runtime-plugin-demand-release",
+    "allow-runtime-migration-preview",
+    "allow-runtime-migration-confirm",
+    "allow-runtime-migration-operation",
+    "allow-runtime-active-migration"
   ]
 }

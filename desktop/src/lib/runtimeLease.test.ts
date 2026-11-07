@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { leaseDecision, normalizeProject } from "./runtimeLease";
+import {
+  isHeldLease,
+  leaseDecision,
+  normalizeProject,
+  wantedProjects,
+  type AcquireView,
+} from "./runtimeLease";
 
 describe("normalizeProject", () => {
   it("drops trailing slashes so two spellings compare equal", () => {
@@ -101,5 +107,47 @@ describe("leaseDecision", () => {
       owned: [],
     });
     expect(decision.acquire).toEqual([]);
+  });
+});
+
+describe("acquire results are not leases", () => {
+  it("treats only managedReady as a held lease", () => {
+    // The four other states each mean "this project has no lease I may count on".
+    // `starting` in particular is the one that used to be mistaken for success:
+    // the command returned, so the old code recorded a lease it did not have.
+    const starting: AcquireView = {
+      scopeKey: "/p/a/.yi-agent/runtime",
+      attemptId: "attempt-1",
+      state: "starting",
+      retry: "whenIdle",
+    };
+    expect(isHeldLease(starting)).toBe(false);
+    for (const state of ["starting", "legacyChoiceRequired", "blocked", "unknown"] as const) {
+      expect(isHeldLease({ ...starting, state })).toBe(false);
+    }
+    expect(isHeldLease({ ...starting, state: "managedReady" })).toBe(true);
+  });
+});
+
+describe("a plugin view is demand for its project", () => {
+  it("makes the project wanted before any thread exists", () => {
+    // A board-only view has no thread, so nothing else would ask for a runtime.
+    // Without this the plugin could never be started: the view waits for a
+    // service that no lease keeps alive.
+    const wanted = wantedProjects({
+      activeProject: null,
+      threads: [],
+      pluginProjects: ["/p/a"],
+    });
+    expect(wanted).toEqual(["/p/a"]);
+  });
+
+  it("still ignores projects that only appear in the index", () => {
+    const wanted = wantedProjects({
+      activeProject: null,
+      threads: [{ cwd: "/p/a", status: "idle" }],
+      pluginProjects: [],
+    });
+    expect(wanted).toEqual([]);
   });
 });

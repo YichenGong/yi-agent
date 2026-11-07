@@ -14,6 +14,7 @@ mod remote;
 /// sidecar 也不能替一个已经退出的 App 续租。
 #[cfg(desktop)]
 pub mod runtime_lifecycle;
+pub mod runtime_management;
 mod runtime_manifest;
 #[cfg(desktop)]
 pub mod window;
@@ -101,6 +102,12 @@ pub fn run() {
             runtime_lifecycle::runtime_active_operation,
             runtime_lifecycle::runtime_known_scopes,
             runtime_lifecycle::runtime_scope_for_project,
+            runtime_lifecycle::runtime_plugin_demand_acquire,
+            runtime_lifecycle::runtime_plugin_demand_release,
+            runtime_lifecycle::runtime_migration_preview,
+            runtime_lifecycle::runtime_migration_confirm,
+            runtime_lifecycle::runtime_migration_operation,
+            runtime_lifecycle::runtime_active_migration,
             foreground_root::foreground_root_recovery_inspect,
             foreground_root::foreground_root_recovery_prepare,
             foreground_root::foreground_root_recovery_confirm,

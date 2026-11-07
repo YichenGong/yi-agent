@@ -45,18 +45,57 @@ fn internal_worker_is_not_a_frontend_kind() {
     );
 }
 
+/// The identity of the binary these tests launch.
+///
+/// It used to be a fabricated `test-build`. That was fine while the launched binary
+/// never asked the guardian what it was, and it stopped being fine the moment the TUI
+/// and `run` became explicit managed frontends: they now send their own artifact to
+/// the guardian, and a guardian advertising `test-build` correctly refuses them with
+/// "the running runtime ... differs from this client". Weakening that refusal would
+/// remove the check the whole managed contract rests on, so the fixture tells the
+/// truth instead. Read from the binary for the same reason: a hand-written id would
+/// silently drift from the build under test.
 fn artifact() -> ArtifactIdentity {
+    let output = Command::new(common::yi_agent_bin())
+        .args(["internal-runtime", "identity", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("read the identity of the binary under test");
+    assert!(
+        output.status.success(),
+        "identity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let identity: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("identity is JSON");
     ArtifactIdentity {
-        build_id: "test-build".to_string(),
-        display_version: "0.0.0".to_string(),
-        executable: "/usr/bin/true".into(),
-        sha256: "00".to_string(),
-        schema_min: 1,
-        schema_max: 1,
-        handover_version: 1,
-        business_protocol_min: 1,
-        business_protocol_max: 1,
-        capabilities: Vec::new(),
+        build_id: identity["build_id"]
+            .as_str()
+            .expect("identity has build_id")
+            .to_string(),
+        display_version: identity["display_version"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        executable: identity["executable"]
+            .as_str()
+            .map(PathBuf::from)
+            .expect("identity has executable"),
+        sha256: identity["sha256"].as_str().unwrap_or_default().to_string(),
+        schema_min: identity["schema_min"].as_u64().unwrap_or(1) as u32,
+        schema_max: identity["schema_max"].as_u64().unwrap_or(1) as u32,
+        handover_version: identity["handover_version"].as_u64().unwrap_or(1) as u16,
+        business_protocol_min: identity["business_protocol_min"].as_u64().unwrap_or(1) as u32,
+        business_protocol_max: identity["business_protocol_max"].as_u64().unwrap_or(1) as u32,
+        capabilities: identity["capabilities"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -246,6 +285,14 @@ fn headless_command(fixture: &Fixture, port: u16, prompt: &str) -> Command {
         .env("YI_AGENT_RUNTIME_DIR", &fixture.runtime_dir)
         .env("YI_AGENT_HOME", fixture.root.path().join("instance"))
         .env("HOME", &fixture.home)
+        // This file is about the *lease table*, and its guardian is a bare control
+        // server with no business daemon -- so it is not a managed runtime, and a
+        // shipped frontend is right to refuse it with "build unknown". Pinning the
+        // legacy policy keeps the subject here (register, release, do not reclaim
+        // another client's work) instead of making every case a managed bring-up.
+        // The managed entries' own lease behaviour is covered by
+        // `managed_production_integration.rs`, against a real guardian and daemon.
+        .env("YI_AGENT_BRINGUP", "embedded")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -421,7 +468,7 @@ fn one_frontend_leaving_does_not_reclaim_anothers_work() {
     let fixture = Fixture::new();
     let _guardian = GuardianFixture::start(&fixture);
     let socket = fixture.control_socket();
-    let mut tui = register(&socket, "tui:1", ClientKind::Tui, LeaseMode::Business);
+    let tui = register(&socket, "tui:1", ClientKind::Tui, LeaseMode::Business);
     let headless = register(&socket, "run:1", ClientKind::Headless, LeaseMode::Business);
 
     let deadline = Deadline::after(Duration::from_secs(5));
@@ -585,6 +632,9 @@ impl PtyTerminal {
             .env("YI_AGENT_RUNTIME_DIR", &fixture.runtime_dir)
             .env("YI_AGENT_HOME", fixture.root.path().join("instance"))
             .env("HOME", &fixture.home)
+            // Same reason as `headless_command`: this fixture's guardian has no
+            // daemon, so it is a legacy runtime by construction.
+            .env("YI_AGENT_BRINGUP", "embedded")
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave_for_child))
             .stdout(Stdio::null())

@@ -131,6 +131,34 @@ pub enum AuthorizationUpdate {
     RevokeRoot { root_id: RootId },
 }
 
+/// The guardian's answer to "which plugins does somebody need right now".
+///
+/// It travels on the same lifeline as [`AuthorizationUpdate`] but is a *different*
+/// frame type, and deliberately so. Authority and demand are different questions
+/// with different failure modes: an update can be refused per binding, while a
+/// snapshot is the whole truth at one instant. Folding demand into
+/// `AuthorizationUpdate` would invite readers to treat a plugin list as a grant.
+///
+/// The two cannot be confused on the wire. `AuthorizationUpdate` is an
+/// externally-tagged enum (`{"Bind": ...}`), so a snapshot has no variant name it
+/// could match, and this struct has required fields no update frame carries. A
+/// reader tries one and then the other without guessing.
+///
+/// `daemon_instance_id` and `sequence` exist for the same reason they do on
+/// authority: a snapshot made in another generation, or one that arrives out of
+/// order after a newer one, describes a world the daemon is not in any more.
+/// Applying it would start a plugin because a client that has already left used to
+/// want it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DemandSnapshot {
+    /// The daemon this snapshot was made for.
+    pub daemon_instance_id: DaemonInstanceId,
+    /// Strictly increasing per guardian; the daemon keeps only newer values.
+    pub sequence: u64,
+    /// Plugins with at least one live client. Order is stable, not semantic.
+    pub plugins: Vec<String>,
+}
+
 /// The generation secret plus the bindings minted under it.
 ///
 /// Both sides hold one of these. The guardian's copy is authoritative and

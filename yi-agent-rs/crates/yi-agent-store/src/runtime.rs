@@ -636,6 +636,22 @@ impl RuntimeCoordinator {
         factory: Arc<dyn AgentWorkerFactory>,
         activation: crate::foreground::ForegroundActivation,
     ) -> Result<Self, RuntimeCoordinatorError> {
+        Self::open_with_activation_and_generation(database_path, factory, activation, None)
+    }
+
+    /// [`Self::open_with_activation`] with the generation decided by the caller.
+    ///
+    /// A managed daemon must use the generation its guardian named, because every
+    /// authority frame the guardian sends carries that name: a daemon that invented
+    /// its own would refuse the first `Install` as a stale attempt, and the whole
+    /// managed foreground contract would be unreachable while looking merely "not
+    /// supported". Embedded daemons pass `None` and keep the per-process UUID.
+    pub fn open_with_activation_and_generation(
+        database_path: impl AsRef<Path>,
+        factory: Arc<dyn AgentWorkerFactory>,
+        activation: crate::foreground::ForegroundActivation,
+        generation: Option<String>,
+    ) -> Result<Self, RuntimeCoordinatorError> {
         let mut repository = RuntimeRepository::open(database_path)?;
         // Provider-turn leases are process-local. A restarted daemon must not
         // count an abandoned request against the new process's capacity.
@@ -644,7 +660,7 @@ impl RuntimeCoordinator {
         // generation are recorded in `root_owners` for explanation, but never
         // authorize work here: a restart must not resurrect an identity whose
         // lease was already gone.
-        let generation = Uuid::new_v4().to_string();
+        let generation = generation.unwrap_or_else(|| Uuid::new_v4().to_string());
         let resident_cursor = repository.admission_cursor("resident:global")?;
         let mut resource_coordinator =
             ResourceCoordinator::with_resident_capacity(factory.max_resident_subagents());
@@ -912,11 +928,12 @@ impl RuntimeCoordinator {
             workspace_mode,
             inherited_sandbox,
             TaskRole::Execution,
+            None,
         )
     }
 
     /// The one root-creation path, told explicitly whether the root is a session
-    /// container.
+    /// container, and optionally under a caller-chosen root id.
     ///
     /// A container root exists to own delegation: it never starts a daemon worker,
     /// so its historical `TaskState` says nothing about whether it may spawn. The
@@ -924,25 +941,37 @@ impl RuntimeCoordinator {
     /// in-memory supervisor and the row; deriving it later from `parent_id IS
     /// NULL`, a cwd or a managed classification is exactly what this feature
     /// removes.
+    ///
+    /// `root_id` is the managed-attach case: the guardian authorized one specific
+    /// root, the bridge installed authority for it, and the driver bind later
+    /// compares the attached root against that authorization. The identity has to be
+    /// the same one, so the daemon may not mint its own here. `None` is the ordinary
+    /// unmanaged path.
     fn create_session_root(
         &self,
         objective: String,
         workspace_mode: ChildWriteMode,
         inherited_sandbox: Option<yi_agent_core::InheritedSandbox>,
         role: TaskRole,
+        root_id: Option<yi_agent_core::TaskId>,
     ) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
-        let supervisor = match role {
-            TaskRole::SessionContainer => AgentSupervisor::new_session_container_with_objective(
+        let mut supervisor = match role {
+            TaskRole::SessionContainer => {
+                AgentSupervisor::new_session_container_with_objective_and_root(
+                    session_id.clone(),
+                    objective.clone(),
+                    root_id,
+                )
+            }
+            TaskRole::Execution => AgentSupervisor::new_with_objective_and_root(
                 session_id.clone(),
                 objective.clone(),
+                root_id,
             ),
-            TaskRole::Execution => {
-                AgentSupervisor::new_with_objective(session_id.clone(), objective.clone())
-            }
-        };
-        let mut supervisor = supervisor.with_max_direct_children(self.max_direct_children);
+        }
+        .with_max_direct_children(self.max_direct_children);
         let root_id = supervisor.root_task_id().clone();
         supervisor.set_workspace_mode(&root_id, workspace_mode);
         if let Some(inherited_sandbox) = inherited_sandbox {
@@ -1047,16 +1076,29 @@ impl RuntimeCoordinator {
             .as_ref()
             .map(|authorization| authorization.client_run_id.clone())
             .unwrap_or_else(|| idempotency_key.to_string());
-        if let Some(authorization) = authorized.as_ref()
-            && !same_root(&authorization.root_id, requested_workspace)
-        {
-            // A capability from another project names a root that does not exist
-            // here; attaching it would be work in the wrong runtime.
-            return Err(RuntimeCoordinatorError::AdmissionClosed(format!(
-                "root authorization names {} but this attach requested {}",
-                authorization.root_id,
-                requested_workspace.display()
-            )));
+        // Which project a capability belongs to is a question about the *intent* the
+        // guardian reserved, not about the root id. A root id is a daemon identity
+        // (the guardian derives it as a digest of scope and thread key), so treating
+        // it as a path would refuse every managed attach whose id does not happen to
+        // spell the directory -- and would accept one whose id happens to spell a
+        // different directory that shares the string.
+        if let Some(authorization) = authorized.as_ref() {
+            let reserved = self.with_foreground_bridge(|bridge| {
+                bridge
+                    .reservation_workspace_for(&authorization.root_id)
+                    .map(std::path::Path::to_path_buf)
+            });
+            if let Some(reserved) = reserved
+                && !same_path(&reserved, requested_workspace)
+            {
+                // The capability was issued for another project: attaching it would be
+                // work in the wrong runtime, under an owner that never asked for it.
+                return Err(RuntimeCoordinatorError::AdmissionClosed(format!(
+                    "root authorization is for {} but this attach requested {}",
+                    reserved.display(),
+                    requested_workspace.display()
+                )));
+            }
         }
         self.ensure_owner_open(&owner)?;
         if idempotency_key.trim().is_empty() {
@@ -1143,17 +1185,33 @@ impl RuntimeCoordinator {
             });
         }
 
+        // A managed attach creates the root the guardian already authorized, not a
+        // fresh one: the install wrote authority for that id and the bridge's foreign
+        // key wants the task row to carry it. An unmanaged attach keeps minting its own.
+        let authorized_root = authorized
+            .as_ref()
+            .map(|authorization| authorization.root_id.parse::<yi_agent_core::TaskId>())
+            .transpose()
+            .map_err(|_| {
+                RuntimeCoordinatorError::AdmissionClosed(
+                    "root authorization names a root id the daemon cannot parse".into(),
+                )
+            })?;
         let capability = new_application_root_capability();
         let capability_digest = digest_hex(&capability);
         // An application root IS the session container: it owns delegation and
         // never runs a daemon worker (design §4.1). Chosen at creation so the
         // supervisor and the row agree from the first instant; the pending
         // activation objective is only a placeholder for the first turn.
+        //
+        // `authorized_root` is the managed case: when the guardian authorized a
+        // root, the container has to be created under exactly that id.
         let session_id = self.create_session_root(
             "TUI application root pending activation.".into(),
             root_mode,
             None,
             TaskRole::SessionContainer,
+            authorized_root,
         )?;
         self.application_root_workspace_services
             .lock()
@@ -1218,6 +1276,24 @@ impl RuntimeCoordinator {
             &root_task_id,
             extra_roots.iter().map(PathBuf::from).collect(),
         );
+        // The root row exists now, so an install that had to defer its classification
+        // (the guardian authorizes before the attach creates the task) can be written.
+        // Only for a managed attach: an unmanaged one installed no authority, and
+        // asking the bridge to classify it would be refused -- correctly so.
+        if authorized.is_some() {
+            self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.classify_installed_root(&mut repository, &root_task_id.to_string())
+            })
+            .map_err(|error| {
+                RuntimeCoordinatorError::AdmissionClosed(format!(
+                    "the attached root could not be classified: {error:?}"
+                ))
+            })?;
+        }
         self.bind_root(&owner, &root_task_id.to_string())?;
         Ok(AttachedApplicationRoot {
             session_id,
@@ -4099,12 +4175,25 @@ impl RuntimeCoordinator {
     pub fn adopt_managed_authority(
         &self,
         ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
-    ) {
+    ) -> Result<(), String> {
+        // The ledger names the generation its capabilities are bound to. A daemon
+        // whose own generation differed would verify those capabilities and then
+        // refuse them at the first bind, so the mismatch is refused here -- at the one
+        // moment both values exist -- rather than surfacing as an unexplained
+        // `StaleAttempt` per request.
+        if ledger.daemon_instance_id() != self.generation {
+            return Err(format!(
+                "the guardian authorized generation {}, but this daemon is {}",
+                ledger.daemon_instance_id(),
+                self.generation
+            ));
+        }
         *self
             .managed_authorizations
             .lock()
             .expect("managed authorizations mutex poisoned") = Some(ledger);
         self.refresh_attach_authority();
+        Ok(())
     }
 
     /// Applies one authority update from the guardian.
@@ -4332,6 +4421,51 @@ impl RuntimeCoordinator {
         self.foreground_commit_gate.is_frozen(root)
     }
 
+    /// Reserves one root through the bridge's own `Prepare`, as a guardian does.
+    ///
+    /// Test support only. A reservation is the only place the pair "this root, this
+    /// project" is recorded before an install spends it, so a fixture that wants to
+    /// prove the attach gate reads it has to create a real one.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn reserve_foreground_root_for_test(
+        &self,
+        root_id: &str,
+        client_run_id: &str,
+        scope_key: &str,
+        intent: yi_agent_lifecycle::foreground::RootBindIntent,
+        scope: yi_agent_lifecycle::foreground::RootAuthorityScope,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::BridgeFrame;
+
+        let now = Instant::now();
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Prepare {
+                    nonce: Uuid::new_v4().to_string(),
+                    root_id: root_id.to_string(),
+                    client_run_id: client_run_id.to_string(),
+                    scope_key: scope_key.to_string(),
+                    generation: self.generation.clone(),
+                    requested_seq: 1,
+                    intent,
+                    scope,
+                },
+                &mut repository,
+                now,
+            )
+        });
+        match answer {
+            Some(BridgeFrame::Challenge { .. }) => Ok(()),
+            other => Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the bridge refused the reservation: {other:?}"
+            ))),
+        }
+    }
+
     #[cfg(any(test, feature = "foreground-test-support"))]
     pub fn install_foreground_authority_for_test(
         &self,
@@ -4423,6 +4557,208 @@ impl RuntimeCoordinator {
         Ok(authorization)
     }
 
+    /// Installs one already-minted authorization through the bridge, as the guardian
+    /// does between `Prepare` and the host's attach.
+    ///
+    /// Test support only. The difference from
+    /// [`Self::install_foreground_authority_for_test`] is the capability: this one
+    /// installs the secret the caller will present, so a fixture can follow the real
+    /// order -- mint, reserve, install, attach -- without inventing a second secret.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn install_given_authorization_for_test(
+        &self,
+        authorization: &yi_agent_lifecycle::types::RootAuthorization,
+        intent: yi_agent_lifecycle::foreground::RootBindIntent,
+    ) -> Result<(), RuntimeCoordinatorError> {
+        use yi_agent_lifecycle::foreground::{
+            AuthorityMessage, AuthorityStamp, BridgeFrame, RootAuthorityScope,
+        };
+
+        let now = Instant::now();
+        let nonce = Uuid::new_v4().to_string();
+        let authority_seq = {
+            let challenge = self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.handle(
+                    BridgeFrame::Prepare {
+                        nonce: nonce.clone(),
+                        root_id: authorization.root_id.clone(),
+                        client_run_id: authorization.client_run_id.clone(),
+                        scope_key: authorization.scope_key.clone(),
+                        generation: self.generation.clone(),
+                        requested_seq: 1,
+                        intent,
+                        scope: RootAuthorityScope::Business,
+                    },
+                    &mut repository,
+                    now,
+                )
+            });
+            match challenge {
+                Some(BridgeFrame::Challenge { authority_seq, .. }) => authority_seq,
+                other => {
+                    return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                        "the bridge refused the prepare: {other:?}"
+                    )));
+                }
+            }
+        };
+        let stamp = AuthorityStamp {
+            scope_key: authorization.scope_key.clone(),
+            generation: self.generation.clone(),
+            owner: authorization.client_run_id.clone(),
+            root_id: authorization.root_id.clone(),
+            binding_epoch: 1,
+            authority_seq,
+            challenge_nonce: nonce,
+            remaining_lease_ms: 30_000,
+            authority_scope: RootAuthorityScope::Business,
+        };
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Authority(AuthorityMessage::Install {
+                    stamp,
+                    authorization: authorization.clone(),
+                }),
+                &mut repository,
+                now,
+            )
+        });
+        match answer {
+            Some(BridgeFrame::Committed { .. }) => Ok(()),
+            Some(BridgeFrame::Denied { code, .. }) => {
+                Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                    "the install was refused: {code:?}"
+                )))
+            }
+            other => Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the bridge gave an unexpected answer to an install: {other:?}"
+            ))),
+        }
+    }
+
+    /// Authorizes, installs and attaches one managed conversation root.
+    ///
+    /// The steps are the production ones and in the production order -- prepare,
+    /// challenge, install, then attach -- so the fixture exercises the reservation,
+    /// the install commit and the attach gate together. The root id is a digest of
+    /// scope and thread key, exactly as the guardian derives it, which is what makes
+    /// the fixture able to catch a gate that mistakes the id for a directory.
+    ///
+    /// Test hook only: a production entry point that minted authority from a thread
+    /// key would be the "guess the thread key" bypass the spec forbids.
+    #[cfg(any(test, feature = "foreground-test-support"))]
+    pub fn admit_managed_root_for_test(
+        &self,
+        thread_key: &str,
+        workspace: &std::path::Path,
+        client_run_id: &str,
+    ) -> Result<yi_agent_lifecycle::types::RootAuthorization, RuntimeCoordinatorError> {
+        use sha2::{Digest as _, Sha256};
+        use yi_agent_lifecycle::foreground::{
+            AuthorityMessage, AuthorityStamp, BridgeFrame, RootAuthorityScope, RootBindIntent,
+        };
+
+        // The same derivation the guardian uses, down to the rendering: 16 digest bytes
+        // as a canonical UUID. The rendering is not cosmetic -- the daemon parses a root
+        // id as a task id, so a bare-hex digest would be refused as a corrupt binding
+        // and this fixture would be testing a shape no deployment produces.
+        let mut hasher = Sha256::new();
+        hasher.update(b"test-scope");
+        hasher.update([0u8]);
+        hasher.update(thread_key.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        let root_id = Uuid::from_bytes(bytes).to_string();
+
+        let now = Instant::now();
+        let nonce = Uuid::new_v4().to_string();
+        let intent = RootBindIntent {
+            operation_id: format!("managed-root:{thread_key}"),
+            thread_key: thread_key.to_string(),
+            workspace: workspace.to_path_buf(),
+            extra_roots: Vec::new(),
+            previous_root_capability: None,
+        };
+        let authority_seq = {
+            let challenge = self.with_foreground_bridge(|bridge| {
+                let mut repository = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned");
+                bridge.handle(
+                    BridgeFrame::Prepare {
+                        nonce: nonce.clone(),
+                        root_id: root_id.clone(),
+                        client_run_id: client_run_id.to_string(),
+                        scope_key: "test-scope".into(),
+                        generation: self.generation.clone(),
+                        requested_seq: 1,
+                        intent,
+                        scope: RootAuthorityScope::Business,
+                    },
+                    &mut repository,
+                    now,
+                )
+            });
+            match challenge {
+                Some(BridgeFrame::Challenge { authority_seq, .. }) => authority_seq,
+                other => {
+                    return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                        "the bridge refused the prepare: {other:?}"
+                    )));
+                }
+            }
+        };
+
+        let authorization = yi_agent_lifecycle::types::RootAuthorization {
+            scope_key: "test-scope".into(),
+            daemon_instance_id: self.generation.clone(),
+            client_run_id: client_run_id.to_string(),
+            root_id: root_id.clone(),
+            capability: format!("cap-{}-{}", Uuid::new_v4(), root_id),
+        };
+        let stamp = AuthorityStamp {
+            scope_key: "test-scope".into(),
+            generation: self.generation.clone(),
+            owner: client_run_id.to_string(),
+            root_id,
+            binding_epoch: 1,
+            authority_seq,
+            challenge_nonce: nonce,
+            remaining_lease_ms: 30_000,
+            authority_scope: RootAuthorityScope::Business,
+        };
+        let answer = self.with_foreground_bridge(|bridge| {
+            let mut repository = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned");
+            bridge.handle(
+                BridgeFrame::Authority(AuthorityMessage::Install {
+                    stamp,
+                    authorization: authorization.clone(),
+                }),
+                &mut repository,
+                now,
+            )
+        });
+        if let Some(BridgeFrame::Denied { code, .. }) = answer {
+            return Err(RuntimeCoordinatorError::AuthorityDenied(format!(
+                "the install was refused: {code:?}"
+            )));
+        }
+        Ok(authorization)
+    }
+
     /// Serves one frame from the guardian's private authority bridge.
     ///
     /// This is the production half that was missing: `ForegroundBridge::handle` existed
@@ -4451,13 +4787,53 @@ impl RuntimeCoordinator {
             BridgeFrame::RecoveryAnswer(_) => None,
             frame => {
                 let now = Instant::now();
-                self.with_foreground_bridge(|bridge| {
+                // Kept so a committed install can also teach the *attach* gate. The
+                // daemon has two views of authority and only one of them was being
+                // written here: the bridge table learns from the private exchange, the
+                // attach ledger learns from the lifeline. Those arrive over different
+                // sockets, so relying on the lifeline alone would let a client attach
+                // in the window after the guardian answered and before the frame was
+                // consumed -- and the guardian answers only after this call returns.
+                let install = match &frame {
+                    BridgeFrame::Authority(
+                        yi_agent_lifecycle::foreground::AuthorityMessage::Install {
+                            authorization,
+                            stamp,
+                        },
+                    ) => Some((authorization.clone(), stamp.root_id.clone())),
+                    _ => None,
+                };
+                let answer = self.with_foreground_bridge(|bridge| {
                     let mut repository = self
                         .repository
                         .lock()
                         .expect("runtime repository mutex poisoned");
                     bridge.handle(frame, &mut repository, now)
-                })
+                });
+                // The bridge's `Install` is the authority the daemon commits; the attach
+                // gate reads a different table fed by the lifeline. Those two sockets
+                // are independent, so a client could attach in the window between the
+                // committed answer and the lifeline frame being consumed. Recording the
+                // binding here closes that window: the guardian only answers after this
+                // call returns.
+                let installed = match (&answer, install) {
+                    (
+                        Some(BridgeFrame::Committed { root_id, .. }),
+                        Some((authorization, installed)),
+                    ) if root_id == &installed => Some((authorization, root_id.clone())),
+                    _ => None,
+                };
+                if let Some((authorization, _)) = installed {
+                    // Best effort on purpose: an unmanaged daemon has no ledger, and a
+                    // refused update is already a refusal the guardian will see. Making
+                    // this fatal would turn a bookkeeping failure into a lost install.
+                    let _ = self.apply_authority_update(
+                        yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(
+                            authorization,
+                        )),
+                    );
+                }
+                answer
             }
         }
     }
@@ -7297,18 +7673,23 @@ fn truncate_diff(diff: String) -> String {
 
 /// Whether a root authorization names this workspace.
 ///
+/// Whether two spellings name one project directory.
+///
 /// Canonicalised when both paths resolve, because the shell records the project as
 /// it sees it while the sidecar derives the same directory from its own invocation:
 /// `/p`, `/p/` and a symlinked alias are one root. Falls back to a textual
 /// comparison when a path does not resolve, rather than claiming a mismatch it
 /// cannot prove.
-fn same_root(recorded: &str, requested: &std::path::Path) -> bool {
-    let requested_path = std::path::Path::new(recorded);
+///
+/// This compares *directories*, never root ids. `same_root` used to be called with a
+/// root id as its first argument, which silently made the check's answer depend on
+/// whether the id happened to look like a path.
+fn same_path(reserved: &std::path::Path, requested: &std::path::Path) -> bool {
     match (
-        std::fs::canonicalize(requested_path),
+        std::fs::canonicalize(reserved),
         std::fs::canonicalize(requested),
     ) {
         (Ok(a), Ok(b)) => a == b,
-        _ => requested_path == requested,
+        _ => reserved == requested,
     }
 }

@@ -659,6 +659,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &runtimes,
         &thread_roots,
         runtime.path(),
+        // No shell in these tests: the embedded attach path.
+        None,
         &isolated_models_path(runtime.path()),
         &cfg,
         &cwd,
@@ -683,6 +685,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &runtimes,
         &thread_roots,
         runtime.path(),
+        // No shell in these tests: the embedded attach path.
+        None,
         &isolated_models_path(runtime.path()),
         &cfg,
         &cwd,

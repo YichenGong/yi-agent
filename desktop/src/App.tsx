@@ -119,6 +119,7 @@ import {
 import { resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { useRuntimeLease } from "./hooks/useRuntimeLease";
+import { usePluginDemand } from "./hooks/usePluginDemand";
 import { localRuntimeControl } from "./lib/runtimeLifecycle";
 import { useRuntimeScopeKey } from "./hooks/useRuntimeLifecycle";
 import { RuntimeVersionBanner } from "./components/RuntimeVersionBanner";
@@ -644,12 +645,18 @@ export default function App() {
     return cwd ? [{ cwd, status: view?.status }] : [];
   });
   const leaseActiveProject = store.current()?.info?.cwd ?? null;
+  // 屏幕上的插件视图也是需求来源：只有看板的窗口没有会话，别的判据都不会替
+  // 它的项目申请 runtime。消费者聚合在 native 侧（按「最后一个离开才停」），
+  // 这里只负责把「谁在看」交给壳。
+  const pluginProjects = usePluginDemand();
   useRuntimeLease({
     activeProject: leaseActiveProject,
     threads: leaseThreads,
+    pluginProjects,
     revision: wantedProjects({
       activeProject: leaseActiveProject,
       threads: leaseThreads,
+      pluginProjects,
     }).join("\n"),
   });
 

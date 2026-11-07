@@ -30,6 +30,11 @@ pub mod leases;
 pub mod managed;
 /// 只读影响快照与一次性确认。
 pub mod preview;
+/// 共享的非业务管理 DTO：项目准备、逐 root 授权索引与授权快照。
+///
+/// 只有线上类型，没有 I/O：桌面壳、app-server 与 supervisor 必须按同一套字段
+/// 讲话，而壳只允许依赖本 crate。
+pub mod production;
 pub mod scope;
 /// 会话容器委派的 wire DTO 与接续摘要。
 pub mod session_delegation;
@@ -50,6 +55,18 @@ pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
 /// Per-request ceiling for a single control request, further capped by whatever
 /// remains of the operation's total budget.
 pub const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long one *root authorization* round trip may take.
+///
+/// Five seconds, and deliberately not the managed-channel budget: the shell has already
+/// prepared the runtime by the time a conversation asks for a root, so what remains is a
+/// single guardian round trip. Waiting longer would keep a conversation parked behind a
+/// shell that is itself waiting on a stuck daemon, which is the failure this bounds.
+///
+/// Defined here because both sides of the round trip need it: the app-server bounds its
+/// wait with it, and the subagent (which cannot see the app-server) builds the deadline
+/// from it. Two private copies would drift apart silently.
+pub const AUTHORIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long one managed spawn channel may idle before it is closed.
 ///

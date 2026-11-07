@@ -595,6 +595,12 @@ pub(crate) struct Harness {
     pub(crate) lead_control: crate::lead_control::LeadControlInbox,
     pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
     pub(crate) view_frames: crate::server::ViewFrames,
+    /// The shell-brokered authority slot, shared with the server.
+    ///
+    /// Same technique as `view_frames`: the server writes it, the test observes it. A
+    /// second `Arc` here would be a second slot, and every assertion about "the
+    /// handshake installed this session's identity" would pass against an empty one.
+    pub(crate) managed: crate::server::ManagedSlot,
     pub(crate) plugins_dir: tempfile::TempDir,
     pub(crate) daemon_calls: DaemonCalls,
 }
@@ -712,6 +718,44 @@ impl Harness {
             false,
             None,
             Some(home.to_path_buf()),
+            None,
+        )
+    }
+
+    /// 带一个本地管理面的 harness。
+    ///
+    /// 管理面是**每连接一份**，所以它从这里进 `serve()`，而不是进程级全局：
+    /// 后者会让并行用例共用一条会话，bootstrap 只有第一个能成功。
+    pub(crate) async fn with_management(
+        handle: Arc<crate::server::local_management::ManagementHandle>,
+    ) -> Self {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman_in(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            false,
+            None,
+            None,
+            Some(handle),
         )
     }
 
@@ -902,6 +946,7 @@ impl Harness {
             lead_agent_enabled,
             side_registry,
             None,
+            None,
         )
     }
 
@@ -919,6 +964,7 @@ impl Harness {
         lead_agent_enabled: bool,
         side_registry: Option<Arc<crate::side_conversation::SideRegistry>>,
         instance_home_override: Option<PathBuf>,
+        management: Option<Arc<crate::server::local_management::ManagementHandle>>,
     ) -> Self
     where
         F: Fn(
@@ -1015,6 +1061,9 @@ impl Harness {
         // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
         let view_frames: crate::server::ViewFrames =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // 与 `view_frames` 同一手法:服务端写入、测试观察。自造一份会让
+        // 「握手装上了本会话的身份」这条断言在空槽位上永远成立。
+        let managed: crate::server::ManagedSlot = Arc::new(StdMutex::new(None));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1026,6 +1075,7 @@ impl Harness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                managed: Arc::clone(&managed),
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
                 settings_path: models_dir.path().join("settings.json"),
@@ -1067,6 +1117,7 @@ impl Harness {
             },
             build,
             scope,
+            management,
         ));
         Self {
             client_w,
@@ -1088,6 +1139,7 @@ impl Harness {
             lead_control,
             lead_control_replies,
             view_frames,
+            managed,
             plugins_dir,
             daemon_calls,
         }
@@ -2723,6 +2775,7 @@ impl MergedHarness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                managed: Arc::new(StdMutex::new(None)),
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 settings_path: PathBuf::new(),
@@ -3084,6 +3137,8 @@ mod assembly;
 mod image;
 #[cfg(test)]
 mod lead;
+#[cfg(test)]
+mod management;
 #[cfg(test)]
 mod model_settings;
 #[cfg(test)]

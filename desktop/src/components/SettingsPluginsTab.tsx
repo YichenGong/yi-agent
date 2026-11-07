@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listPlugins, type PluginRpc, type PluginSummary } from "../lib/pluginSettings";
+import { registerPluginConsumer } from "../lib/pluginDemandRegistry";
 import { PluginCatalog } from "./PluginCatalog";
 
 /**
@@ -53,6 +54,37 @@ export function SettingsPluginsTab({
   const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string>(() => defaultProject ?? projects[0] ?? "");
+  /** Views opened from this tab, so the shell can be told demand exists. */
+  const releases = useRef(new Map<string, () => void>());
+
+  /**
+   * Opens a plugin's settings view and registers it as a demand consumer.
+   *
+   * The registration is what keeps the plugin's service alive: the shell only
+   * forwards an acquire for the *first* consumer of a `(project, plugin)`, and it
+   * decides "stop" by counting. A view that never registered could not be
+   * distinguished from one that left, so the settings view would keep running for
+   * nobody.
+   */
+  const openView = useCallback(
+    (plugin: string, view: string) => {
+      const project = projectRef.current.trim();
+      if (!project) return;
+      const consumer = `settings:${project}:${plugin}:${view}`;
+      releases.current.get(consumer)?.();
+      releases.current.set(consumer, registerPluginConsumer({ project, plugin, consumer }));
+    },
+    [],
+  );
+
+  // The tab itself going away withdraws exactly the views it opened.
+  useEffect(
+    () => () => {
+      for (const release of releases.current.values()) release();
+      releases.current.clear();
+    },
+    [],
+  );
 
   // 接缝在运行时就是 PluginRpc 的形状；这里一次性补回调用方自选返回类型的
   // 泛型能力，供下面的加载器与面板共用——模块里只保留这一处断言。
@@ -116,7 +148,7 @@ export function SettingsPluginsTab({
       {projectHandle && (
         <section className="border-b border-line">
           <h2 className="px-4 pt-4 text-sm font-medium text-fg">受管插件</h2>
-          <PluginCatalog call={rpc} project={projectHandle} />
+          <PluginCatalog call={rpc} project={projectHandle} onOpenView={openView} />
         </section>
       )}
       {options.length > 0 && (

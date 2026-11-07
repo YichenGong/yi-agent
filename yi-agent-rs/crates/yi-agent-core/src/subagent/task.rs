@@ -540,7 +540,17 @@ pub struct AgentTask {
 
 impl AgentTask {
     pub fn new_root(root_session_id: RootSessionId) -> Self {
-        let id = TaskId::new();
+        Self::new_root_with_id(root_session_id, TaskId::new())
+    }
+
+    /// Creates a fresh root under an id chosen by the caller.
+    ///
+    /// A managed runtime does not get to pick its own root identity: the guardian
+    /// derives it from the scope and thread key, installs authority for it *before*
+    /// the daemon attaches, and the attach then has to land on exactly that id.
+    /// Minting a random id here would put the authorized root and the created root in
+    /// two different namespaces.
+    pub fn new_root_with_id(root_session_id: RootSessionId, id: TaskId) -> Self {
         let attempt = TaskAttempt::initial(id.clone());
         Self {
             id,
@@ -705,7 +715,15 @@ impl AgentTask {
     /// Its `state` starts `Queued` like any task; only the daemon's container
     /// record decides admission, never this execution state.
     pub fn new_session_container(root_session_id: RootSessionId) -> Self {
-        let mut task = Self::new_root(root_session_id);
+        Self::new_session_container_with_id(root_session_id, TaskId::new())
+    }
+
+    /// A session container under an id chosen by the caller.
+    ///
+    /// Same reason as [`Self::new_root_with_id`]: a managed attach was authorized
+    /// for one specific root, and the container it creates has to be that root.
+    pub fn new_session_container_with_id(root_session_id: RootSessionId, id: TaskId) -> Self {
+        let mut task = Self::new_root_with_id(root_session_id, id);
         task.role = TaskRole::SessionContainer;
         task
     }

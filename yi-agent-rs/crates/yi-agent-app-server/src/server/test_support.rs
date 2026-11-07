@@ -52,6 +52,8 @@ where
         client_scope,
         listener,
         relay_url,
+        // 测试默认没有管理面;需要它的用例经 `serve_scoped_with_management` 注入。
+        None,
     )
     .await
 }

@@ -33,6 +33,7 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
         ensure_daemon: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
         watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
         plugin_gate: None,
+        managed_session: false,
         fatal_tx,
     };
 
@@ -107,6 +108,7 @@ async fn agent_factory_failure_returns_internal_error() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+            managed: Arc::new(StdMutex::new(None)),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             settings_path: PathBuf::new(),

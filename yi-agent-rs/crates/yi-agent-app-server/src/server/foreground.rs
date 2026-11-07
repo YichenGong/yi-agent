@@ -28,6 +28,43 @@ pub(crate) struct ForegroundDispatch {
 }
 
 impl ForegroundDispatch {
+    /// Opens a driver for a conversation whose authority the shell already brokered.
+    ///
+    /// Deliberately bypasses [`ForegroundHost`], and with it `FrontendLease::register`:
+    /// on a managed deployment the App's lease belongs to the desktop shell, and a
+    /// sidecar that registered its own `app-server:{pid}` client would become a second
+    /// App frontend -- exactly the shape that lets an orphaned sidecar keep renewing
+    /// after the window is gone. The capability it binds with comes from the root's own
+    /// session store, which only accepts what the shell brokered.
+    pub(crate) fn begin_authorized(
+        root: &Arc<ThreadRoot>,
+        turn_id: &str,
+    ) -> Option<yi_agent_subagent::foreground::ForegroundTurn> {
+        let authorization = root.managed_root_authorization()?;
+        // One bind operation per conversation, stable across turns: the daemon refuses a
+        // second driver for the same root until the first is proven stopped, so a fresh
+        // id per turn would make the second turn unpublishable.
+        let operation_id =
+            yi_agent_subagent::thread_root::managed_bind_operation_id(root.thread_id());
+        match root.bind_foreground_driver(authorization, &operation_id) {
+            Ok(Some(mut turn)) => {
+                // Open the turn on the same driver, exactly as `ForegroundHost::begin`
+                // does: a driver that never hears about the turn reports activity
+                // against nothing, and the daemon would then see a sequence it cannot
+                // attribute to any turn.
+                turn.begin(turn_id);
+                Some(turn)
+            }
+            Ok(None) => None,
+            Err(cause) => {
+                // Losing activity reporting must not lose the turn: the conversation
+                // still works, it just stops being observable.
+                tracing::warn!(%cause, "foreground driver unavailable for a managed root");
+                None
+            }
+        }
+    }
+
     /// Registers this app-server as a frontend of `runtime_dir`'s runtime.
     ///
     /// `Ok(None)` for an embedded runtime and for a runtime with no guardian. Both are

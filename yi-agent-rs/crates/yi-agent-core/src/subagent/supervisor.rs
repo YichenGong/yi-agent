@@ -154,7 +154,23 @@ impl AgentSupervisor {
     }
 
     pub fn new_with_objective(root_session_id: RootSessionId, objective: String) -> Self {
-        let root = AgentTask::new_root(root_session_id);
+        Self::new_with_objective_and_root(root_session_id, objective, None)
+    }
+
+    /// Same as [`Self::new_with_objective`], with an optional caller-chosen root id.
+    ///
+    /// `None` mints a fresh id (the unmanaged behaviour). `Some` is used by a managed
+    /// attach, where the guardian has already authorized one specific root and the
+    /// daemon must create that exact identity.
+    pub fn new_with_objective_and_root(
+        root_session_id: RootSessionId,
+        objective: String,
+        root_id: Option<TaskId>,
+    ) -> Self {
+        let root = match root_id {
+            Some(root_id) => AgentTask::new_root_with_id(root_session_id, root_id),
+            None => AgentTask::new_root(root_session_id),
+        };
         let root_task_id = root.id.clone();
         let mut tasks = HashMap::new();
         tasks.insert(root_task_id.clone(), root);
@@ -208,13 +224,31 @@ impl AgentSupervisor {
         root_session_id: RootSessionId,
         objective: String,
     ) -> Self {
+        Self::new_session_container_with_objective_and_root(root_session_id, objective, None)
+    }
+
+    /// A session container whose root id the caller chose.
+    ///
+    /// `None` mints a fresh id (the unmanaged behaviour). `Some` is the managed
+    /// attach: the guardian authorized that exact root, so the container has to be
+    /// created under it or the attach lands on a root nobody authorized.
+    pub fn new_session_container_with_objective_and_root(
+        root_session_id: RootSessionId,
+        objective: String,
+        root_id: Option<TaskId>,
+    ) -> Self {
         // The container's own `id` must be the key it is stored under and the id
         // every fence compares against. Inserting it under a *different*
         // `root_task_id` leaves `task(&root).id != root` for the rest of the
         // supervisor's life, which silently disables every identity comparison:
         // a closed container would never look closed, and a role check keyed on
         // the root id would never match the task it just fetched.
-        let root = AgentTask::new_session_container(root_session_id.clone());
+        let root = match root_id {
+            Some(root_id) => {
+                AgentTask::new_session_container_with_id(root_session_id.clone(), root_id)
+            }
+            None => AgentTask::new_session_container(root_session_id.clone()),
+        };
         let root_id = root.id.clone();
         let mut supervisor = Self::new_with_objective(root_session_id, objective.clone());
         supervisor.root_task_id = root_id.clone();

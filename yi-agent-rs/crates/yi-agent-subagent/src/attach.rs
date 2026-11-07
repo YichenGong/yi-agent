@@ -1209,6 +1209,19 @@ pub struct ManagedContext {
     pub expected: yi_agent_lifecycle::types::ArtifactIdentity,
     /// The instance home the scope is resolved against.
     pub instance_home: PathBuf,
+    /// Whether the *entry point* this process is running has declared itself a
+    /// managed frontend.
+    ///
+    /// This is not "a context exists": the binary installs a context for every
+    /// command so the artifact identity is available everywhere, and `daemon`
+    /// installs it too while deliberately owning its own runtime. The declaration
+    /// is the entry point's own statement -- the TUI, a headless `run`, and a
+    /// shell-launched sidecar say yes; a manual daemon and the one-shot helpers say
+    /// no. The design requires exactly this: supported frontends select
+    /// [`BringUpPolicy::for_managed_frontend`] explicitly, while
+    /// [`BringUpPolicy::default_for_build`] stays embedded so an unconfigured
+    /// caller cannot be swept into a guardian-owned runtime by accident.
+    pub managed_frontend: bool,
 }
 
 static MANAGED_CONTEXT: std::sync::OnceLock<ManagedContext> = std::sync::OnceLock::new();
@@ -1233,8 +1246,27 @@ pub fn managed_context() -> Option<&'static ManagedContext> {
 /// binding's repair) cannot disagree about which policy or which expectation to use.
 /// When no context was installed this still returns the policy, with `expected: None`
 /// — which is precisely what makes a managed bring-up refuse instead of guess.
+///
+/// Precedence, in order:
+///
+/// 1. `YI_AGENT_BRINGUP` when set, in both directions: an operator can pin either
+///    behaviour, which is what makes the other two rules debuggable.
+/// 2. The entry point's own declaration. A shipped frontend (the TUI, a headless
+///    `run`, a shell-launched sidecar) installs its context with
+///    `managed_frontend: true` and so gets [`BringUpPolicy::for_managed_frontend`].
+/// 3. [`BringUpPolicy::default_for_build`], which stays `Embedded`.
+///
+/// The order matters: a default that came first would make rule 2 unreachable, and a
+/// context-presence rule (rather than an explicit declaration) would sweep a manual
+/// `daemon` into a guardian-owned runtime it never asked for.
 pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
-    let policy = BringUpPolicy::from_env();
+    let declared = managed_context().is_some_and(|context| context.managed_frontend);
+    let policy = match std::env::var("YI_AGENT_BRINGUP").ok().as_deref() {
+        Some("managed") => BringUpPolicy::Managed,
+        Some("embedded") => BringUpPolicy::Embedded,
+        _ if declared => BringUpPolicy::for_managed_frontend(),
+        _ => BringUpPolicy::default_for_build(),
+    };
     match managed_context() {
         Some(context) => crate::binding::BringUpChoice {
             policy,
@@ -1258,6 +1290,65 @@ pub fn process_bringup_choice() -> crate::binding::BringUpChoice {
 ///
 /// `expected` describes the artifact this caller wants. A runtime that answers with
 /// anything else comes back as a version choice rather than being used silently.
+/// The first half of a managed start: make sure a guardian-supervised runtime exists.
+///
+/// Split from the attach because a managed frontend must be a *frontend first*: the
+/// lease has to exist, and the conversation's root has to be authorized, before any
+/// attach is attempted. Attaching first would let a runtime the guardian knows nothing
+/// about hand out a root, and the reclaim that follows would then target work it never
+/// agreed to supervise.
+///
+/// Nothing here attaches a root or registers a client. It only answers "is a runtime
+/// this build may use running there now".
+pub fn prepare_managed_runtime(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    instance_home: &Path,
+    expected: &yi_agent_lifecycle::types::ArtifactIdentity,
+    intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
+    deadline: yi_agent_lifecycle::deadline::Deadline,
+) -> Result<(), AttachFailure> {
+    use yi_agent_supervisors::lifecycle::bringup::{
+        BringUpResult, ensure_managed, scope_for_existing,
+    };
+
+    let scope = scope_for_existing(runtime_dir, &cfg.workdir, instance_home)
+        .map_err(|error| AttachFailure::new("runtime scope", error))?;
+    match ensure_managed(&scope, expected, intent, deadline) {
+        Ok(BringUpResult::Connected { .. }) => Ok(()),
+        Ok(BringUpResult::VersionChoiceRequired { identity }) => {
+            // Not a failure to work around: the user has to choose. Reporting it as
+            // a plain attach error would look like a bug rather than a decision.
+            Err(AttachFailure::new(
+                "runtime version",
+                format!(
+                    "the running runtime is build {} and differs from this client; \
+                     it must be switched or temporarily accepted explicitly",
+                    identity.daemon_build_id.as_deref().unwrap_or("unknown")
+                ),
+            ))
+        }
+        Ok(BringUpResult::ManualActionRequired { reason }) => {
+            Err(AttachFailure::new("runtime bring-up", reason))
+        }
+        Err(error) => Err(AttachFailure::new("runtime bring-up", error)),
+    }
+}
+
+/// Attaches one root with an authorization the caller already obtained.
+///
+/// The capability *is* the attach key on a managed daemon: it is what tells the daemon
+/// whose root this is, and it is the only key it will attribute. A caller that invented
+/// its own key here would be asking for an unattributed root, which a managed daemon
+/// refuses -- so this entry point exists rather than a flag on the project attach.
+pub fn attach_authorized_root(
+    cfg: &RuntimeConfig,
+    runtime_dir: &Path,
+    capability: &str,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
+    attach_to_answer(cfg, runtime_dir, None, Some(capability.to_string()))
+}
+
 pub fn attach_managed_project_runtime(
     cfg: &RuntimeConfig,
     runtime_dir: PathBuf,
@@ -1266,81 +1357,20 @@ pub fn attach_managed_project_runtime(
     intent: yi_agent_supervisors::lifecycle::bringup::BringUpIntent,
     deadline: yi_agent_lifecycle::deadline::Deadline,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
-    use yi_agent_supervisors::lifecycle::bringup::{
-        BringUpResult, ensure_managed, scope_for_existing,
-    };
-
-    let scope = scope_for_existing(&runtime_dir, &cfg.workdir, instance_home)
-        .map_err(|error| AttachFailure::new("runtime scope", error))?;
-    match ensure_managed(&scope, expected, intent, deadline) {
-        Ok(BringUpResult::Connected { .. }) => {}
-        Ok(BringUpResult::VersionChoiceRequired { identity }) => {
-            // Not a failure to work around: the user has to choose. Reporting it as
-            // a plain attach error would look like a bug rather than a decision.
-            return Err(AttachFailure::new(
-                "runtime version",
-                format!(
-                    "the running runtime is build {} and differs from this client; \
-                     it must be switched or temporarily accepted explicitly",
-                    identity.daemon_build_id.as_deref().unwrap_or("unknown")
-                ),
-            ));
-        }
-        Ok(BringUpResult::ManualActionRequired { reason }) => {
-            return Err(AttachFailure::new("runtime bring-up", reason));
-        }
-        Err(error) => return Err(AttachFailure::new("runtime bring-up", error)),
-    }
-    // The shell's capability, if it sent one. On a daemon whose guardian signed
-    // this root, it is required; on an unmanaged one the daemon ignores it and the
-    // generated key is used, which keeps the embedded path byte-for-byte unchanged.
-    let capability = managed_root_capability(&cfg.workdir);
+    prepare_managed_runtime(cfg, &runtime_dir, instance_home, expected, intent, deadline)?;
+    // No capability here on purpose. This is the *project* attach: it opens the
+    // connection a conversation will later attach its own root over. Minting or
+    // carrying a root capability at this level is exactly the coupling this design
+    // removes -- a project-wide credential would be the "pre-attach a root for the
+    // whole project and hope every conversation inherits it" shape, and the daemon
+    // would see one root shared by conversations that must not share one.
     attach_to_answer(
         cfg,
         &runtime_dir,
         // The managed path never owns the daemon, so it never supervises plugins.
         None,
-        capability,
+        None,
     )
-}
-
-/// Root capabilities the desktop shell minted, keyed by project path.
-///
-/// Filled on `initialize` rather than at start-up: a capability is bound to one App
-/// run and one generation, so it cannot outlive the handshake that carried it. The
-/// store is replaced wholesale on each handshake, never merged -- a reconnect to a
-/// restarted guardian must not leave the previous generation's keys attachable.
-static ROOT_CAPABILITIES: std::sync::Mutex<Vec<(String, String)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Records what the shell authorized for this process.
-pub fn install_root_capabilities(capabilities: Vec<(String, String)>) {
-    let mut stored = ROOT_CAPABILITIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *stored = capabilities;
-}
-
-/// The root capability the desktop shell handed this process, if any.
-///
-/// Read from the shared store rather than from an argument, for the same reason
-/// `expected` is: the shell speaks once, on `initialize`, and every attach this
-/// sidecar performs afterwards has to use the same answer. A project the shell never
-/// authorized yields `None`, and the attach then fails on the daemon's gate with a
-/// reason that names the missing authorization.
-pub fn managed_root_capability(workdir: &Path) -> Option<String> {
-    let wanted = canonical_or_self(workdir);
-    let stored = ROOT_CAPABILITIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    stored
-        .iter()
-        .find(|(root, _)| canonical_or_self(Path::new(root)) == wanted)
-        .map(|(_, capability)| capability.clone())
-}
-
-fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Attaches one root over an already-decided runtime.

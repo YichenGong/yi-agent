@@ -162,7 +162,7 @@ fn a_released_client_cannot_open_a_channel() {
     let (path, stop, server) = start_guardian(&directory);
     let deadline = Deadline::after(Duration::from_secs(5));
 
-    let mut lease = FrontendLease::register(
+    let lease = FrontendLease::register(
         &path,
         "gone".to_string(),
         ClientKind::Headless,

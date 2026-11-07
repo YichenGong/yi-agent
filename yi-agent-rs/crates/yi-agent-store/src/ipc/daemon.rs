@@ -351,13 +351,24 @@ impl Daemon {
             );
         }
         drop(repository);
-        let coordinator = Arc::new(RuntimeCoordinator::open_with_activation(
+        // A managed daemon takes its generation from the guardian's ledger: every
+        // authority frame names that value, so a daemon that made up its own would
+        // refuse the first install as stale and never serve a managed root.
+        let generation = managed
+            .as_ref()
+            .map(|ledger| ledger.daemon_instance_id().to_string());
+        let coordinator = Arc::new(RuntimeCoordinator::open_with_activation_and_generation(
             database_path.as_ref(),
             factory,
             activation,
+            generation,
         )?);
         if let Some(ledger) = managed {
-            coordinator.adopt_managed_authority(ledger);
+            coordinator
+                .adopt_managed_authority(ledger)
+                .map_err(|error| {
+                    IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                })?;
         }
         // A fresh daemon starts with no plugin routes; the supervisor republishes
         // them as soon as it reconciles. Only this project's routes are dropped:

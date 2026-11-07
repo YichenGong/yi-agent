@@ -37,6 +37,8 @@ pub(crate) async fn start_thread_core(
     process_watches: &mut HashMap<String, ProcessWatch>,
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
+    // The shell-brokered authority, when this sidecar serves a desktop shell.
+    managed: &crate::server::ManagedSlot,
     models_path: &Path,
     cfg: &RuntimeConfig,
     cwd: &str,
@@ -105,6 +107,7 @@ pub(crate) async fn start_thread_core(
         runtimes,
         thread_roots,
         &runtime_dir,
+        crate::server::managed_snapshot(managed),
         models_path,
         cfg,
         cwd,

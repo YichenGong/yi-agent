@@ -1350,6 +1350,13 @@ pub struct Guardian {
     /// Plugin demand this guardian tracks. `None` for a guardian that only serves
     /// leases (tests, and a runtime with no plugins configured).
     demands: Option<super::demands::PluginDemandTable>,
+    /// Monotonic counter for [`yi_agent_lifecycle::authorization::DemandSnapshot`].
+    ///
+    /// Kept here rather than derived from the table so two snapshots with the same
+    /// contents still order correctly: the daemon drops an older sequence even when
+    /// the plugin lists happen to look equal, and a counter that restarted would make
+    /// a stale snapshot indistinguishable from a fresh one with no plugins.
+    demand_sequence: u64,
     /// Impact snapshots and their one-shot tokens.
     previews: yi_agent_lifecycle::preview::PreviewStore,
     /// How to ask the business daemon what only it knows.
@@ -1430,6 +1437,7 @@ impl Guardian {
             generation,
             registry: None,
             demands: None,
+            demand_sequence: 0,
             previews: yi_agent_lifecycle::preview::PreviewStore::new(),
             coordinator: std::sync::Arc::new(super::preview::NoCoordinator),
             daemon: None,
@@ -1506,6 +1514,10 @@ impl Guardian {
                 (
                     super::roles::SCOPE_KEY_ENV.to_string(),
                     self.scope.key.clone(),
+                ),
+                (
+                    super::roles::PROJECT_KEY_ENV.to_string(),
+                    self.scope.project_key.clone(),
                 ),
                 (
                     "YI_AGENT_INSTANCE_HOME".to_string(),
@@ -1709,6 +1721,56 @@ impl Guardian {
         Ok(authorization)
     }
 
+    /// Tells the daemon which plugins somebody still wants.
+    ///
+    /// Best effort, like every other lifeline push: a write failure means the daemon
+    /// may be gone, and the reclaimer's leases are what stop work in that case. The
+    /// sequence advances whether or not the write lands, so a retry after a failure
+    /// is *newer* than the attempt it replaces rather than a duplicate the daemon
+    /// would drop.
+    fn push_demand_snapshot(&mut self) -> io::Result<()> {
+        let Some(demands) = self.demands.as_ref() else {
+            return Ok(());
+        };
+        let Some(generation) = self.authority_generation() else {
+            // No daemon, nobody to tell. Not an error: the guardian serves leases
+            // before a daemon answers, and demand collected then is published by the
+            // first snapshot after the daemon is up.
+            return Ok(());
+        };
+        let plugins = demands.wanted_plugins();
+        self.demand_sequence = self.demand_sequence.saturating_add(1);
+        let snapshot = yi_agent_lifecycle::authorization::DemandSnapshot {
+            daemon_instance_id: generation,
+            sequence: self.demand_sequence,
+            plugins,
+        };
+        let Some(lifeline) = self.daemon_lifeline.as_mut() else {
+            return Ok(());
+        };
+        lifeline.set_write_timeout(Some(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT))?;
+        yi_agent_lifecycle::codec::write_frame(&mut &*lifeline, &snapshot)
+            .map_err(|error| io::Error::other(format!("lifeline write failed: {error}")))
+    }
+
+    /// Drops one client's plugin demand, then publishes the result.
+    ///
+    /// Called from release and expiry, because both mean "this client is gone". A
+    /// demand table that forgot that would keep a shared plugin alive for a client
+    /// that no longer exists -- the exact leak the table exists to prevent, and one
+    /// that looks like a working feature until the machine runs out of processes.
+    fn withdraw_client_demand(&mut self, client_run_id: &str) {
+        let Some(demands) = self.demands.as_mut() else {
+            return;
+        };
+        if demands.release_client(client_run_id).is_empty() {
+            // Nothing this client wanted was left unowned: either it held no demand,
+            // or another client still waits. Either way the daemon's view is correct.
+            return;
+        }
+        let _ = self.push_demand_snapshot();
+    }
+
     /// Withdraws one client's authority and tells the daemon.
     ///
     /// Called on release and on lease expiry -- both are "this owner is gone", and
@@ -1724,6 +1786,58 @@ impl Guardian {
             let _ = ledger.apply(update.clone());
         }
         let _ = self.push_authorization(update);
+        // A client that lost its authority cannot still need a plugin: demand is
+        // justified by a live lease, so it goes with the lease rather than lingering
+        // until the client happens to release.
+        self.withdraw_client_demand(client_run_id);
+    }
+
+    /// Mints the capability the daemon will verify for one client's root.
+    ///
+    /// The ledger is the *only* place a capability may come from. The daemon verifies
+    /// a capability by re-deriving it from the generation secret it received in the
+    /// lifeline hello, so a secret minted anywhere else -- including the root authority
+    /// table, which can generate a unique string but not the one the daemon expects --
+    /// would be answered "the guardian never issued this capability" at the attach.
+    ///
+    /// Returns the authorization to hand the client. On failure the local grant is
+    /// rolled back, because a grant that never reached the daemon must not make the
+    /// retried prepare look like a takeover of a root that never existed.
+    pub(crate) fn issue_authorization(
+        &mut self,
+        root_id: &str,
+        client_run_id: &str,
+        mode: yi_agent_lifecycle::types::LeaseMode,
+    ) -> io::Result<yi_agent_lifecycle::types::RootAuthorization> {
+        let authorization = {
+            let Some(ledger) = self.authorizations.as_mut() else {
+                return Err(io::Error::other(
+                    "this guardian started no daemon, so it has no generation to authorize in",
+                ));
+            };
+            ledger
+                .issue(client_run_id, root_id, mode)
+                .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))?
+        };
+        if let Err(error) = self.push_authorization(
+            yi_agent_lifecycle::authorization::AuthorizationUpdate::Bind(Box::new(
+                authorization.clone(),
+            )),
+        ) {
+            // Withdraw it from memory too: a capability the daemon never learned could
+            // only be spent against a runtime that would refuse it.
+            if let Some(ledger) = self.authorizations.as_mut() {
+                let _ = ledger.apply(
+                    yi_agent_lifecycle::authorization::AuthorizationUpdate::RevokeRoot {
+                        root_id: root_id.to_string(),
+                    },
+                );
+            }
+            return Err(io::Error::other(format!(
+                "the daemon could not be told: {error}"
+            )));
+        }
+        Ok(authorization)
     }
 
     /// Publishes one update on the daemon's lifeline.
@@ -1749,6 +1863,26 @@ impl Guardian {
     /// Whether this guardian has a daemon it started and has not stopped.
     pub fn daemon(&self) -> Option<&GuardianDaemon> {
         self.daemon.as_ref()
+    }
+
+    /// The generation every authority this guardian hands out is minted in.
+    ///
+    /// That is the *daemon's* instance id, never the guardian's own. The daemon
+    /// compares a generation against the one its authorization table was built with
+    /// (`daemon-{pid}-{nanos}`) and refuses anything else as a stale attempt, so a
+    /// guardian that named itself here would have every install refused -- and the
+    /// failure would surface as "the runtime refused the root authorization", which
+    /// points nowhere near the real cause.
+    ///
+    /// Read from the ledger rather than from [`Self::daemon`] because the ledger is
+    /// what the capability is actually bound to: the two agree in production, and a
+    /// test entry can install a ledger without a daemon record. `None` means no
+    /// daemon was ever started, and authority minted in a generation no daemon
+    /// serves could never be honoured.
+    pub fn authority_generation(&self) -> Option<String> {
+        self.authorizations
+            .as_ref()
+            .map(|ledger| ledger.daemon_instance_id().to_string())
     }
 
     /// Whether every *business* client is gone and the scope is draining.
@@ -1864,11 +1998,34 @@ impl Guardian {
     /// Test entry only: production sets this inside `start_daemon` after the daemon
     /// answered, because a ledger naming a daemon nobody started would mint
     /// capabilities for a process that cannot check them.
+    ///
+    /// Installs a lifeline peer beside it. In production the two are inseparable --
+    /// the ledger exists because the daemon greeting arrived *on* the lifeline -- and
+    /// minting a capability now publishes a `Bind` over that lifeline. A fixture that
+    /// had a ledger and no lifeline would be describing a state production cannot
+    /// reach, and would fail on the write rather than on the behaviour under test.
     pub fn authorizations_for_test(
         &mut self,
         ledger: yi_agent_lifecycle::authorization::AuthorizationLedger,
     ) {
         self.authorizations = Some(ledger);
+        if self.daemon_lifeline.is_none() {
+            let Ok((guardian_end, mut daemon_end)) = std::os::unix::net::UnixStream::pair() else {
+                // A fixture that cannot build its own peer is already broken; keeping
+                // an unsendable ledger would only move the failure further away.
+                return;
+            };
+            let _ =
+                guardian_end.set_write_timeout(Some(yi_agent_lifecycle::CONTROL_REQUEST_TIMEOUT));
+            // A real reader, because a publish is a *frame write*: closing the peer
+            // would make the write fail for a transport reason that has nothing to do
+            // with the behaviour under test. Draining keeps the fixture honest -- the
+            // frames really are written, and nothing asserts on them here.
+            std::thread::spawn(move || {
+                while yi_agent_lifecycle::codec::read_frame(&mut daemon_end).is_ok() {}
+            });
+            self.daemon_lifeline = Some(guardian_end);
+        }
     }
 
     pub fn attach_bridge_for_test(&mut self, bridge: std::os::unix::net::UnixStream) {
@@ -2107,6 +2264,10 @@ pub fn serve_with_lifeline(
         guardian.attach_launcher(lifeline);
     }
     guardian.attach_coordinator(coordinator);
+    // A serving guardian always tracks demand, even with no plugin configured yet:
+    // a build that answered `Unsupported` here would make every managed client fall
+    // back to a private daemon, which is the behaviour managed mode exists to remove.
+    guardian.attach_demands(super::demands::PluginDemandTable::new());
     let (registry, report) = guardian.open_registry()?;
     if !report.is_safe() {
         // Refuse to serve rather than let the next generation schedule work beside
@@ -2140,6 +2301,14 @@ pub fn serve_with_lifeline(
         // the daemon did not start.
         if let Err(error) = guardian.start_daemon(program, START_DAEMON_BUDGET) {
             tracing::warn!(error = %error, "the managed daemon did not start; serving without it");
+        } else {
+            // Demand collected before the daemon answered has never been published:
+            // `push_demand_snapshot` has no generation until now. Without this first
+            // snapshot a client that asked while the runtime was coming up would wait
+            // on a plugin the daemon was never told about.
+            if let Err(error) = guardian.push_demand_snapshot() {
+                tracing::warn!(error = %error, "the first plugin demand snapshot did not land");
+            }
         }
     }
 
@@ -2492,7 +2661,17 @@ fn serve_authorize_root(
         .grant(&root_id)
         .map(|granted| granted.client_run_id.clone());
     let scope_key = guardian.scope.key.clone();
-    let generation = guardian.generation.to_string();
+    // The daemon's generation, not this guardian's: the daemon keys its authority
+    // table by the instance id it announced, and an install stamped with anything
+    // else is refused as stale before it can be honoured.
+    let Some(generation) = guardian.authority_generation() else {
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: "foreground_lifecycle_unsupported: this guardian started no daemon, \
+                     so it has no generation to authorize in"
+                .to_string(),
+        };
+    };
     let request = super::root_authority::AuthorizeRequest {
         intent,
         root_id: &root_id,
@@ -2566,24 +2745,27 @@ fn derive_root_id(scope_key: &str, thread_key: &str) -> String {
     hasher.update([0u8]);
     hasher.update(thread_key.as_bytes());
     let digest = hasher.finalize();
+
+    // Rendered as a canonical UUID (8-4-4-4-12), not bare hex, because the daemon parses
+    // this id as a task id: `TaskId` wraps a `Uuid`, whose `Display` is the hyphenated
+    // form and whose `FromStr` accepts it. The four hyphens are the difference between
+    // "the root the daemon created" and "a root it could never have created", and the
+    // install, the attach and the driver bind all compare those two as strings.
+    //
+    // Formatted here rather than through a `uuid` dependency: this crate is
+    // deliberately dependency-light (it is linked by the desktop shell), and one
+    // sixteen-byte rendering does not justify pulling in a crate.
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0],
-        digest[1],
-        digest[2],
-        digest[3],
-        digest[4],
-        digest[5],
-        digest[6],
-        digest[7],
-        digest[8],
-        digest[9],
-        digest[10],
-        digest[11],
-        digest[12],
-        digest[13],
-        digest[14],
-        digest[15]
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
     )
 }
 
@@ -3340,6 +3522,102 @@ fn prepare_control_stream(stream: &std::os::unix::net::UnixStream) -> io::Result
 ///
 /// The refusal is written as an ordinary frame, so a client that cannot have a
 /// channel learns *why* instead of seeing a bare EOF.
+/// Whether this request adds or removes demand.
+///
+/// One helper for both because the authentication is identical: a release must be
+/// exactly as owner-bound as an acquire, or a client could stop a service another is
+/// using by naming it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemandChange {
+    Acquire,
+    Release,
+}
+
+/// Records or removes one client's demand for a plugin.
+///
+/// Demand is *not* a lease and cannot become one: it requires a live lease to exist,
+/// never renews it, and a released client is refused rather than allowed to add
+/// demand it could no longer remove.
+fn serve_plugin_demand(
+    guardian: &mut Guardian,
+    grant: &yi_agent_lifecycle::types::ClientGrant,
+    plugin: &str,
+    change: DemandChange,
+) -> yi_agent_lifecycle::types::ControlResponse {
+    use yi_agent_lifecycle::types::{ControlErrorCode, ControlResponse};
+
+    if let Err(reason) = guardian.reclaimer().leases().admits(grant, lease_now()) {
+        return ControlResponse::Rejected {
+            code: refusal_code(&reason),
+            reason,
+        };
+    }
+    if plugin.trim().is_empty() || plugin.len() > MAX_PLUGIN_NAME {
+        // An empty name would put every plugin and no plugin in one bucket; an
+        // over-long one is a sign the caller is passing something else (a command
+        // line, a path) that this table must not start indexing.
+        return ControlResponse::Rejected {
+            code: ControlErrorCode::InvalidRequest,
+            reason: "a plugin demand must name one plugin".to_string(),
+        };
+    }
+    let Some(demands) = guardian.demands.as_mut() else {
+        return ControlResponse::Unsupported {
+            detail: "this runtime tracks no plugin demand, so it cannot honour one".to_string(),
+        };
+    };
+
+    // The owner is the *live lease*, never a name in the request: a caller that
+    // could choose its demand's owner could release somebody else's.
+    let client = grant.client_run_id.clone();
+    let changed = match change {
+        DemandChange::Acquire => demands.acquire(&client, plugin),
+        // `NotHeld` means this client never had it: nothing changed, and the plugin
+        // keeps whatever owners it already had.
+        DemandChange::Release => !matches!(
+            demands.release(&client, plugin),
+            super::demands::DemandRelease::NotHeld
+        ),
+    };
+    // Read after the change, so the answer describes the table the caller now lives
+    // in rather than the one it was looking at when it asked.
+    let wanted = demands.is_wanted(plugin);
+    // Publish regardless of `changed`: a duplicate acquire still tells the daemon the
+    // current truth, and re-publishing costs one small frame while a missed publish
+    // leaves a plugin running for nobody.
+    let _ = guardian.push_demand_snapshot();
+    ControlResponse::PluginDemand {
+        plugin: plugin.to_string(),
+        wanted,
+        changed,
+    }
+}
+
+/// The refusal code for a lease that does not admit the request.
+///
+/// One place, because the managed channel and plugin demand answer the same
+/// question and two copies would eventually disagree about what a client is told --
+/// and a client that cannot tell "your lease is wrong" from "this build cannot do
+/// that" retries the wrong thing forever.
+fn refusal_code(reason: &str) -> yi_agent_lifecycle::types::ControlErrorCode {
+    use yi_agent_lifecycle::types::ControlErrorCode;
+    if reason.contains("lease is") {
+        // The lease exists but is the wrong kind: the caller authenticated, and what
+        // it asked for is not permitted at its level.
+        ControlErrorCode::Unauthenticated
+    } else {
+        // Unknown client, forged credential, or expired lease: the guardian has no
+        // live lease it could attach this to.
+        ControlErrorCode::StaleEpoch
+    }
+}
+
+/// The longest plugin name this table will index.
+///
+/// Plugin names are identifiers, not messages: a kilobyte of text here would be a
+/// caller passing something else.
+const MAX_PLUGIN_NAME: usize = 256;
+
 fn serve_open_channel(
     guardian: &mut Guardian,
     stream: &mut std::os::unix::net::UnixStream,
@@ -3371,12 +3649,7 @@ fn serve_open_channel(
 
     let now = lease_now();
     if let Err(reason) = guardian.reclaimer().leases().admits(grant, now) {
-        let code = if reason.contains("lease is") {
-            ControlErrorCode::Unauthenticated
-        } else {
-            ControlErrorCode::StaleEpoch
-        };
-        refuse(stream, code, reason);
+        refuse(stream, refusal_code(&reason), reason);
         return;
     }
 
@@ -3618,6 +3891,12 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
             serve_open_channel(guardian, &mut stream, &grant);
             return;
         }
+        ControlRequest::AcquirePluginDemand { grant, plugin } => {
+            serve_plugin_demand(guardian, &grant, &plugin, DemandChange::Acquire)
+        }
+        ControlRequest::ReleasePluginDemand { grant, plugin } => {
+            serve_plugin_demand(guardian, &grant, &plugin, DemandChange::Release)
+        }
         ControlRequest::Preview { grant, target } => serve_preview(guardian, &grant, target),
         ControlRequest::PreviewPage {
             grant,
@@ -3646,6 +3925,365 @@ fn serve_control_connection(guardian: &mut Guardian, mut stream: std::os::unix::
         },
     };
     let _ = yi_agent_lifecycle::codec::write_frame(&mut stream, &response);
+}
+
+#[cfg(test)]
+mod demand_tests {
+    //! Plugin demand over the real control channel.
+    //!
+    //! The property that matters is not "the table stored a string" but "the daemon
+    //! was told". A demand table that only mutates itself would keep the guardian's
+    //! own preview honest while the supervisor, which acts on the snapshot, kept
+    //! running every configured plugin -- the exact behaviour managed mode removes.
+
+    use super::*;
+    use std::time::Duration;
+    use yi_agent_lifecycle::authorization::{
+        AuthorizationLedger, AuthorizationUpdate, DemandSnapshot,
+    };
+    use yi_agent_lifecycle::types::{
+        ClientGrant, ClientKind, ControlErrorCode, ControlResponse, LeaseMode, RuntimeScope,
+    };
+
+    fn scope(directory: &std::path::Path) -> RuntimeScope {
+        RuntimeScope {
+            key: directory.to_string_lossy().into_owned(),
+            runtime_dir: directory.to_path_buf(),
+            project_key: "/project".to_string(),
+            instance_home: directory.to_path_buf(),
+        }
+    }
+
+    fn artifact() -> ArtifactIdentity {
+        ArtifactIdentity {
+            build_id: "test-build".to_string(),
+            display_version: "0.0.0".to_string(),
+            executable: "/usr/bin/true".into(),
+            sha256: "00".to_string(),
+            schema_min: 1,
+            schema_max: 1,
+            handover_version: 1,
+            business_protocol_min: 1,
+            business_protocol_max: 1,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// A guardian with a demand table, a live peer on its lifeline and a ledger.
+    ///
+    /// The ledger is what gives the guardian a daemon generation to stamp snapshots
+    /// with; without one every snapshot would be silently skipped, which is the
+    /// condition [`Guardian::push_demand_snapshot`] reports as "nobody to tell".
+    fn guardian_with_lifeline(
+        directory: &std::path::Path,
+    ) -> (
+        Guardian,
+        std::os::unix::net::UnixStream,
+        AuthorizationLedger,
+    ) {
+        let mut guardian = Guardian::new(scope(directory), artifact(), "gen-1".to_string());
+        guardian.attach_demands(super::super::demands::PluginDemandTable::new());
+        let (guardian_end, daemon_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon_end
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        guardian.daemon_lifeline = Some(guardian_end);
+        let ledger =
+            AuthorizationLedger::new(guardian.scope.key.clone(), guardian.generation.clone());
+        guardian.authorizations = Some(ledger.clone());
+        (guardian, daemon_end, ledger)
+    }
+
+    fn register(guardian: &mut Guardian, client: &str, mode: LeaseMode) -> ClientGrant {
+        guardian
+            .reclaimer_mut()
+            .register(
+                client.to_string(),
+                ClientKind::App,
+                mode,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Reads the next frame as a snapshot, so a test that expected an authority
+    /// frame instead fails loudly rather than reading a mis-shaped message as one.
+    fn next_snapshot(peer: &mut std::os::unix::net::UnixStream) -> DemandSnapshot {
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &mut *peer).unwrap();
+        yi_agent_lifecycle::codec::decode(&frame).expect("a demand snapshot")
+    }
+
+    /// Demand requires a live lease. Otherwise any process that can open the
+    /// control socket could keep a plugin service running forever.
+    #[test]
+    fn demand_is_refused_without_a_live_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, _peer, _ledger) = guardian_with_lifeline(directory.path());
+        let forged = ClientGrant {
+            client_run_id: "app-run-1".to_string(),
+            credential: "made-up".to_string(),
+            epoch: 1,
+            mode: LeaseMode::Business,
+        };
+        // The code is the one the managed channel already used for this refusal
+        // (`refusal_code`): a forged or expired grant is a stale epoch, not a mode
+        // denial, and the two entry points must not drift apart.
+        match serve_plugin_demand(&mut guardian, &forged, "demo", DemandChange::Acquire) {
+            ControlResponse::Rejected { code, .. } => {
+                assert_eq!(code, ControlErrorCode::StaleEpoch)
+            }
+            other => panic!("a forged grant must be refused, got {other:?}"),
+        }
+        assert!(
+            guardian
+                .demands()
+                .expect("demands attached")
+                .wanted_plugins()
+                .is_empty()
+        );
+    }
+
+    /// A lease-only observer may not demand a plugin: observers never authorize
+    /// work, and a plugin service is work.
+    #[test]
+    fn a_lease_only_client_cannot_demand_a_plugin() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, _peer, _ledger) = guardian_with_lifeline(directory.path());
+        let grant = register(&mut guardian, "observer-1", LeaseMode::LeaseOnly);
+        match serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire) {
+            ControlResponse::Rejected { code, .. } => {
+                assert_eq!(code, ControlErrorCode::Unauthenticated)
+            }
+            other => panic!("an observer must not demand work, got {other:?}"),
+        }
+    }
+
+    /// The answer describes the state *after* the change, and a retry is visibly a
+    /// retry. Both matter to a client that has to decide whether to start anything.
+    #[test]
+    fn acquiring_the_same_demand_twice_is_idempotent_and_reports_no_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let grant = register(&mut guardian, "app-run-1", LeaseMode::Business);
+
+        match serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire) {
+            ControlResponse::PluginDemand {
+                plugin,
+                wanted,
+                changed,
+            } => {
+                assert_eq!(plugin, "demo");
+                assert!(wanted, "after the acquire somebody wants it");
+                assert!(changed, "the first acquire is a change");
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(next_snapshot(&mut peer).plugins, vec!["demo".to_string()]);
+
+        match serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire) {
+            ControlResponse::PluginDemand {
+                wanted, changed, ..
+            } => {
+                assert!(wanted);
+                assert!(!changed, "a retry must not look like new demand");
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        // Publishing on a retry is deliberate: it costs one frame, while a missed
+        // publish leaves a plugin running for nobody.
+        assert_eq!(next_snapshot(&mut peer).plugins, vec!["demo".to_string()]);
+    }
+
+    /// Two clients, one service: the second join must neither start a second copy
+    /// nor survive the first client leaving.
+    #[test]
+    fn a_shared_plugin_survives_until_the_last_client_releases_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let first = register(&mut guardian, "app-run-1", LeaseMode::Business);
+        let second = register(&mut guardian, "app-run-2", LeaseMode::Business);
+
+        serve_plugin_demand(&mut guardian, &first, "demo", DemandChange::Acquire);
+        let _ = next_snapshot(&mut peer);
+        match serve_plugin_demand(&mut guardian, &second, "demo", DemandChange::Acquire) {
+            ControlResponse::PluginDemand { changed, .. } => assert!(
+                !changed,
+                "a second client joining an already-wanted plugin changes nothing about the service"
+            ),
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        let _ = next_snapshot(&mut peer);
+
+        // The first leaves: the plugin stays, because the second still waits.
+        match serve_plugin_demand(&mut guardian, &first, "demo", DemandChange::Release) {
+            ControlResponse::PluginDemand {
+                wanted, changed, ..
+            } => {
+                assert!(wanted, "another client still wants it");
+                assert!(changed, "this client did hold it");
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(
+            next_snapshot(&mut peer).plugins,
+            vec!["demo".to_string()],
+            "the daemon must still be told somebody wants it"
+        );
+
+        // The last one leaves: now the service may stop.
+        match serve_plugin_demand(&mut guardian, &second, "demo", DemandChange::Release) {
+            ControlResponse::PluginDemand { wanted, .. } => assert!(!wanted),
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert!(
+            next_snapshot(&mut peer).plugins.is_empty(),
+            "the last release must publish an empty set"
+        );
+    }
+
+    /// An unbalanced release must not count as "held and dropped": a client that
+    /// never had the plugin cannot stop a service another is using.
+    #[test]
+    fn releasing_demand_never_held_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let holder = register(&mut guardian, "app-run-1", LeaseMode::Business);
+        let stranger = register(&mut guardian, "app-run-2", LeaseMode::Business);
+
+        serve_plugin_demand(&mut guardian, &holder, "demo", DemandChange::Acquire);
+        let _ = next_snapshot(&mut peer);
+
+        match serve_plugin_demand(&mut guardian, &stranger, "demo", DemandChange::Release) {
+            ControlResponse::PluginDemand {
+                wanted, changed, ..
+            } => {
+                assert!(wanted, "the real holder is untouched");
+                assert!(!changed, "nothing was released");
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(next_snapshot(&mut peer).plugins, vec!["demo".to_string()]);
+    }
+
+    /// A client that loses its authority cannot still need a plugin. Otherwise the
+    /// runtime keeps a service alive for a client that no longer exists.
+    #[test]
+    fn revoking_a_client_withdraws_its_demand_and_tells_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let grant = register(&mut guardian, "app-run-1", LeaseMode::Business);
+
+        serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire);
+        let _ = next_snapshot(&mut peer);
+
+        guardian.revoke_client_authority("app-run-1");
+
+        // The first frame is the authority revocation, the second the snapshot.
+        // Reading them in that order is what proves the daemon learns both, and that
+        // the plugin was not quietly forgotten on our side only.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &mut peer).unwrap();
+        let update: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert_eq!(
+            update,
+            AuthorizationUpdate::RevokeClient {
+                client_run_id: "app-run-1".to_string()
+            }
+        );
+        assert!(
+            next_snapshot(&mut peer).plugins.is_empty(),
+            "a revoked client must not keep a plugin wanted"
+        );
+        assert!(
+            guardian
+                .demands()
+                .expect("demands attached")
+                .wanted_plugins()
+                .is_empty()
+        );
+    }
+
+    /// Expiry is a client going silent; it must clear demand exactly like a release.
+    ///
+    /// Driven through `maintain` with a future clock rather than by sleeping, because
+    /// the property is "the sweep clears demand", not "the machine is fast".
+    #[test]
+    fn an_expired_lease_clears_the_clients_demand() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let grant = register(&mut guardian, "app-run-1", LeaseMode::Business);
+        serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire);
+        let _ = next_snapshot(&mut peer);
+
+        // `maintain` takes an absolute clock reading, not an offset. Far enough ahead
+        // that no lease registered a moment ago can still be live.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        guardian.maintain(now + Duration::from_secs(24 * 60 * 60));
+
+        assert!(
+            guardian
+                .demands()
+                .expect("demands attached")
+                .wanted_plugins()
+                .is_empty(),
+            "an expired client must not keep its demand"
+        );
+        // The frames are the revocation and the snapshot, in that order.
+        let frame = yi_agent_lifecycle::codec::read_frame(&mut &mut peer).unwrap();
+        let _: AuthorizationUpdate = yi_agent_lifecycle::codec::decode(&frame).unwrap();
+        assert!(next_snapshot(&mut peer).plugins.is_empty());
+    }
+
+    /// A guardian with no daemon has nobody to tell, and that is not an error:
+    /// demand collected before the daemon answers is published by the first snapshot
+    /// after it does.
+    #[test]
+    fn demand_before_a_daemon_exists_is_kept_locally_not_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut guardian = Guardian::new(scope(directory.path()), artifact(), "gen-1".to_string());
+        guardian.attach_demands(super::super::demands::PluginDemandTable::new());
+        let grant = register(&mut guardian, "app-run-1", LeaseMode::Business);
+
+        match serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire) {
+            ControlResponse::PluginDemand { wanted, .. } => assert!(wanted),
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(
+            guardian
+                .demands()
+                .expect("demands attached")
+                .wanted_plugins(),
+            vec!["demo".to_string()],
+            "the guardian's own answer must not depend on a daemon being up"
+        );
+    }
+
+    /// Snapshots carry a strictly increasing sequence, so the daemon can drop an
+    /// older one instead of resurrecting a demand that was already withdrawn.
+    #[test]
+    fn consecutive_snapshots_carry_increasing_sequences() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut guardian, mut peer, _ledger) = guardian_with_lifeline(directory.path());
+        let grant = register(&mut guardian, "app-run-1", LeaseMode::Business);
+
+        serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Acquire);
+        let first = next_snapshot(&mut peer);
+        serve_plugin_demand(&mut guardian, &grant, "demo", DemandChange::Release);
+        let second = next_snapshot(&mut peer);
+
+        assert!(
+            second.sequence > first.sequence,
+            "sequences must increase: {} then {}",
+            first.sequence,
+            second.sequence
+        );
+        assert_eq!(second.daemon_instance_id, "gen-1");
+        assert!(first.plugins == vec!["demo".to_string()]);
+        assert!(second.plugins.is_empty());
+    }
 }
 
 #[cfg(test)]

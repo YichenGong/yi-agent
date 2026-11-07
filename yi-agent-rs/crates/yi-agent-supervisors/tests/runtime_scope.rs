@@ -230,6 +230,250 @@ fn an_exhausted_budget_refuses_to_wait_instead_of_blocking() {
     );
 }
 
+// ---- launcher identity ----------------------------------------------------
+
+/// The launcher names the project explicitly instead of leaving the guardian to
+/// infer it from its working directory.
+///
+/// This is the A19 failure mode made testable: the guardian's `current_dir()` is
+/// the *runtime* directory, so a guardian that derived its project from the working
+/// directory would resolve a scope belonging to whoever owns that directory. The
+/// assertion is on the environment the launcher builds, because that environment is
+/// the entire contract between the two processes.
+#[test]
+fn the_launcher_names_the_project_scope_and_instance_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let linked = dir.path().join("project-alias");
+    std::os::unix::fs::symlink(&project, &linked).unwrap();
+    let runtime = dir.path().join("runtime");
+    let instance_home = dir.path().join("home");
+    std::fs::create_dir_all(&instance_home).unwrap();
+
+    // The scope is resolved through the *symlink* spelling; `resolve` must collapse
+    // it to the canonical project before the launcher ever sees it.
+    let scope = resolve(&runtime, &linked, &instance_home).unwrap();
+    assert_eq!(
+        scope.project_key,
+        std::fs::canonicalize(&project).unwrap().to_string_lossy()
+    );
+
+    let launcher = yi_agent_supervisors::lifecycle::bringup::ProcessGuardian {
+        instance_home: instance_home.clone(),
+    };
+    let (command, _parent, _child) = yi_agent_supervisors::lifecycle::bringup::guardian_command(
+        &launcher,
+        &scope,
+        &artifact("b1"),
+    )
+    .unwrap();
+
+    let environment: std::collections::HashMap<String, Option<std::ffi::OsString>> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|v| v.to_owned()),
+            )
+        })
+        .collect();
+    let read = |name: &str| {
+        environment
+            .get(name)
+            .and_then(|value| value.as_ref())
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+
+    assert_eq!(
+        read("YI_AGENT_PROJECT_KEY").as_deref(),
+        Some(scope.project_key.as_str()),
+        "the project must be named, not inferred from the runtime cwd"
+    );
+    assert_eq!(
+        read("YI_AGENT_SCOPE_KEY").as_deref(),
+        Some(scope.key.as_str())
+    );
+    assert_eq!(
+        read("YI_AGENT_INSTANCE_HOME").as_deref(),
+        Some(scope.instance_home.to_string_lossy().as_ref())
+    );
+    // The control cwd is the runtime directory, and that is exactly why the project
+    // cannot be derived from it.
+    assert_eq!(command.get_current_dir(), Some(scope.runtime_dir.as_path()));
+}
+
+/// A real child, launched with the launcher's own cwd and environment, reports the
+/// identity it was given on an isolated pipe.
+///
+/// The environment assertion above proves what the launcher *declares*. This proves
+/// the declaration survives into a running process whose working directory is the
+/// runtime directory -- the A19 shape. A shell stands in for the guardian because
+/// the guardian's own bootstrap handshake is covered by `managed_runtime_lifecycle`;
+/// what matters here is that no step in between rewrites or drops the identity, and
+/// that the identity cannot have been derived from where the child stands.
+#[test]
+fn a_real_child_reports_the_identity_the_launcher_declared() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let linked = dir.path().join("project-alias");
+    std::os::unix::fs::symlink(&project, &linked).unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let instance_home = dir.path().join("home");
+    std::fs::create_dir_all(&instance_home).unwrap();
+
+    // Resolved through the symlink; the launcher must still name the real project.
+    let scope = resolve(&runtime, &linked, &instance_home).unwrap();
+    let launcher = yi_agent_supervisors::lifecycle::bringup::ProcessGuardian {
+        instance_home: instance_home.clone(),
+    };
+    let (declared, _parent, _child) = yi_agent_supervisors::lifecycle::bringup::guardian_command(
+        &launcher,
+        &scope,
+        &artifact("b1"),
+    )
+    .unwrap();
+
+    let child_cwd = declared
+        .get_current_dir()
+        .expect("the launcher sets the runtime cwd")
+        .to_path_buf();
+    let canonical_project = std::fs::canonicalize(&project).unwrap();
+    // The premise of the whole check: a child standing in the runtime directory
+    // cannot name the project by looking down.
+    assert_ne!(child_cwd, canonical_project);
+
+    // The shell stands in for the guardian; the cwd and every environment binding
+    // are taken from the launcher verbatim, so this test cannot pass by agreeing
+    // with itself.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(
+            "printf 'project=%s\\nscope=%s\\ninstance=%s\\ncwd=%s\\n' \
+             \"$YI_AGENT_PROJECT_KEY\" \"$YI_AGENT_SCOPE_KEY\" \
+             \"$YI_AGENT_INSTANCE_HOME\" \"$(pwd -P)\" >&3",
+        )
+        .current_dir(&child_cwd)
+        .stderr(std::process::Stdio::inherit());
+    for (key, value) in declared.get_envs() {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+
+    // An isolated pipe on descriptor 3, not stdout: the guardian's stdout is a log,
+    // and a report that shared it would be unreadable the moment anything else
+    // wrote a line.
+    let mut ends = [0i32; 2];
+    assert_eq!(
+        unsafe { libc::pipe(ends.as_mut_ptr()) },
+        0,
+        "pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let (read_end, write_end) = (ends[0], ends[1]);
+    // SAFETY: `pre_exec` runs between fork and exec in a single-threaded child; it
+    // only rearranges that child's own descriptor table.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(write_end, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    };
+
+    let mut child = command.spawn().unwrap();
+    // Our copy of the child's end must go, or the read never reaches EOF.
+    assert_eq!(unsafe { libc::close(write_end) }, 0);
+    let mut report = String::new();
+    // SAFETY: `read_end` came from `pipe` above and is owned by this test.
+    unsafe { std::fs::File::from_raw_fd(read_end) }
+        .read_to_string(&mut report)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(status.success(), "the reporting child failed: {report}");
+    let field = |name: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("no {name} in {report:?}"))
+    };
+    assert_eq!(field("project"), canonical_project.to_string_lossy());
+    assert_eq!(field("scope"), scope.key);
+    assert_eq!(
+        field("instance"),
+        scope.instance_home.to_string_lossy().as_ref()
+    );
+    assert_eq!(field("cwd"), scope.runtime_dir.to_string_lossy().as_ref());
+}
+
+/// A guardian that cannot be told its project refuses instead of guessing one.
+///
+/// Run in a child process because the environment is process-global: the claim is
+/// "when the variable is absent, the role refuses", which no in-process assertion
+/// can make.
+#[test]
+fn a_guardian_without_a_named_project_has_no_fallback() {
+    use std::process::{Command, Stdio};
+    let binary = std::env::var("CARGO_BIN_EXE_yi-agent").ok();
+    let Some(binary) = binary else {
+        // `runtime_scope` is a supervisors test binary; the CLI binary is not built
+        // for it. The refusal is covered by yi-agent's own `managed_roles` tests.
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let filler = std::fs::File::open("/dev/null").unwrap();
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let raw = filler.as_raw_fd();
+    let mut command = Command::new(binary);
+    command
+        .args(["internal-runtime", "guardian"])
+        .current_dir(&runtime)
+        .env_remove("YI_AGENT_PROJECT_KEY")
+        .env("YI_AGENT_SCOPE_KEY", runtime.to_string_lossy().to_string())
+        .env("YI_AGENT_BOOTSTRAP_FD", "9")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `pre_exec` only rearranges this fork's descriptor table before `exec`.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(raw, 9) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("YI_AGENT_PROJECT_KEY"),
+        "the refusal must name the missing declaration: {stderr}"
+    );
+}
+
 // ---- build selection ------------------------------------------------------
 
 fn selection(build_id: &str) -> RuntimeSelection {

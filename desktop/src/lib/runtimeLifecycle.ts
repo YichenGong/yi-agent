@@ -164,16 +164,21 @@ export function summarise(status: RuntimeStatusView): StatusSummary {
     comparable && compareVersions(current as string, expected as string) < 0;
 
   const cannotRestartReason =
-    // A legacy runtime is not ours to switch: it may be shared with a version of
-    // yi-agent that knows nothing about this protocol, so "restart" would mean
-    // killing someone else's process.
-    status.compatibility === "legacyTemporaryChoiceRequired" || !status.lifecycleManaged
-    ? "this runtime was not started by the version of yi-agent that manages restarts"
-    : !status.localRestartAvailable
-      ? "this app cannot restart the runtime from here"
-      : status.expectedBuildId === null
-        ? "this build cannot verify the runtime it would switch to"
-        : null;
+    // `unknown` first: this runtime could not be identified at all, so nothing may
+    // be asserted about who started it. Falling through to the legacy sentence
+    // would state a fact about a process nobody managed to read.
+    status.compatibility === "unknown"
+      ? "this runtime could not be identified, so it cannot be restarted from here"
+      : // A legacy runtime is not ours to switch: it may be shared with a version of
+        // yi-agent that knows nothing about this protocol, so "restart" would mean
+        // killing someone else's process.
+        status.compatibility === "legacyTemporaryChoiceRequired" || !status.lifecycleManaged
+        ? "this runtime was not started by the version of yi-agent that manages restarts"
+        : !status.localRestartAvailable
+          ? "this app cannot restart the runtime from here"
+          : status.expectedBuildId === null
+            ? "this build cannot verify the runtime it would switch to"
+            : null;
 
   return {
     currentVersion: current,

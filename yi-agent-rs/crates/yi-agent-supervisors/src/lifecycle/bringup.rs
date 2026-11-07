@@ -291,6 +291,58 @@ pub fn ensure_managed_with(
     // Business/lease callers get the full budget; the inspection ceiling only
     // applies to reads, never to a start that may legitimately take 30 seconds.
     let guard = CoordinationGuard::acquire(scope, deadline.clone())?;
+    ensure_managed_under_guard(
+        &HeldScope { guard, deadline },
+        expected,
+        intent,
+        probe,
+        launcher,
+        required_capabilities,
+    )
+}
+
+/// A runtime whose coordination lock the caller already holds.
+///
+/// The scope is reached *through* the guard instead of being a sibling field, so the
+/// two cannot name different scopes -- a mistake the earlier shape allowed. It also
+/// owns the guard, because the case this type exists for is a migration: that one
+/// stops holding the lock after the managed runtime is connected, and it releases the
+/// lock by dropping this value rather than by remembering to.
+pub struct HeldScope {
+    pub guard: CoordinationGuard,
+    pub deadline: Deadline,
+}
+
+/// [`ensure_managed_with`] for a caller that already owns this scope's guard.
+///
+/// The guard is the reason this entry point exists: a migration holds the instance
+/// gate *and* the scope guards, and re-acquiring a scope lock it already holds would
+/// block on itself until the deadline. Passing the guard in makes that impossible by
+/// construction instead of by a rule somebody has to remember.
+pub fn ensure_managed_under_guard(
+    held: &HeldScope,
+    expected: &ArtifactIdentity,
+    intent: BringUpIntent,
+    probe: &dyn ControlProbe,
+    launcher: &dyn GuardianLauncher,
+    required_capabilities: &[String],
+) -> io::Result<BringUpResult> {
+    let guard = &held.guard;
+    let deadline = held.deadline.clone();
+    let scope = guard.scope();
+    let path = control_path(scope);
+    // A guard for another scope would serialise the wrong runtime and then check the
+    // wrong claim, so it is refused here rather than producing a confusing answer.
+    if guard.scope().key != scope.key || guard.scope().runtime_dir != scope.runtime_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the coordination guard belongs to {}, not {}",
+                guard.scope().runtime_dir.display(),
+                scope.runtime_dir.display()
+            ),
+        ));
+    }
     // Re-check inside the lock: the peer that held it may have just started the
     // runtime we were about to start.
     //
@@ -330,7 +382,7 @@ pub fn ensure_managed_with(
     // The directory may belong to another project or configuration instance. That
     // cannot be repaired by starting a daemon here: it would serve one database to
     // two scopes, so it is reported and the check happens while the lock is held.
-    match claim_is_ours(&guard, scope) {
+    match claim_is_ours(guard, scope) {
         Ok(()) => {}
         Err(reason) => return Ok(BringUpResult::ManualActionRequired { reason }),
     }
@@ -346,7 +398,7 @@ pub fn ensure_managed_with(
     // Record what this runtime is supposed to run before starting it, so a crash
     // between launch and handshake leaves an explainable selection rather than
     // silence.
-    record_selection(&guard, expected)?;
+    record_selection(guard, expected)?;
 
     if let Err(error) = launcher.launch(scope, expected) {
         return Ok(BringUpResult::ManualActionRequired {
@@ -494,40 +546,13 @@ pub struct ProcessGuardian {
 
 impl GuardianLauncher for ProcessGuardian {
     fn launch(&self, scope: &RuntimeScope, expected: &ArtifactIdentity) -> io::Result<()> {
-        let program = pinned_program(&self.instance_home, expected)?;
-        // The guardian refuses to run without an inherited descriptor, and that
-        // refusal is the whole security boundary: "my parent started me as a managed
-        // role" must be unfalsifiable by the child. A launcher that only set the
-        // variable would hand the guardian a number that is not open (which aborts it
-        // on `from_raw_fd`) or teach it to accept a hand-started process.
-        //
-        // A socketpair rather than a pipe because the descriptor is a *lifeline*, not
-        // a message: the parent keeps its end open for exactly as long as it lives,
-        // so EOF means "whoever assigned me this role is gone". A single byte could
-        // express "started" but never "still here".
-        let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()?;
+        let (mut command, parent_end, child_end) = guardian_command(self, scope, expected)?;
+        // The guardian must outlive the client that started it: an App that quits
+        // must not take down the daemon a TUI still uses.
         let child_fd = {
             use std::os::fd::AsRawFd;
             child_end.as_raw_fd()
         };
-        let mut command = std::process::Command::new(&program);
-        command
-            .args(["internal-runtime", "guardian"])
-            .current_dir(&scope.runtime_dir)
-            .env("YI_AGENT_SCOPE_KEY", &scope.key)
-            .env("YI_AGENT_INSTANCE_HOME", &scope.instance_home)
-            // The number, not the descriptor: `pre_exec` installs it on a fixed
-            // number, because a descriptor inherited at an arbitrary number could
-            // collide with one the child opens before reading the variable.
-            .env(
-                super::roles::BOOTSTRAP_FD_ENV,
-                BOOTSTRAP_CHILD_FD.to_string(),
-            )
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // The guardian must outlive the client that started it: an App that quits
-        // must not take down the daemon a TUI still uses.
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(move || {
@@ -556,6 +581,79 @@ impl GuardianLauncher for ProcessGuardian {
         // starting, the exact opposite of outliving its client.
         hold_lifeline(parent_end, child.id());
         Ok(())
+    }
+}
+
+/// Builds the guardian launch command and both ends of its bootstrap lifeline.
+///
+/// Split out of [`ProcessGuardian::launch`] so the *declared identity* can be
+/// asserted without spawning: the environment it sets is the whole contract between
+/// launcher and guardian, and "which project did you start me for" must not be a
+/// value the guardian is expected to infer.
+pub fn guardian_command(
+    guardian: &ProcessGuardian,
+    scope: &RuntimeScope,
+    expected: &ArtifactIdentity,
+) -> io::Result<(
+    std::process::Command,
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
+    let program = pinned_program(&guardian.instance_home, expected)?;
+    // The guardian refuses to run without an inherited descriptor, and that
+    // refusal is the whole security boundary: "my parent started me as a managed
+    // role" must be unfalsifiable by the child. A launcher that only set the
+    // variable would hand the guardian a number that is not open (which aborts it
+    // on `from_raw_fd`) or teach it to accept a hand-started process.
+    //
+    // A socketpair rather than a pipe because the descriptor is a *lifeline*, not
+    // a message: the parent keeps its end open for exactly as long as it lives,
+    // so EOF means "whoever assigned me this role is gone". A single byte could
+    // express "started" but never "still here".
+    let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()?;
+    let mut command = std::process::Command::new(&program);
+    command
+        .args(["internal-runtime", "guardian"])
+        .current_dir(&scope.runtime_dir)
+        .env("YI_AGENT_SCOPE_KEY", &scope.key)
+        // The project is named explicitly. The guardian runs inside the runtime
+        // directory, so `current_dir()` is the runtime -- deriving the project from
+        // it would attribute this scope to whatever project owns that directory,
+        // which is a different project whenever the runtime directory is shared or
+        // overridden.
+        .env(super::roles::PROJECT_KEY_ENV, scope.project_key.as_str())
+        .env("YI_AGENT_INSTANCE_HOME", &scope.instance_home)
+        // The number, not the descriptor: `pre_exec` installs it on a fixed
+        // number, because a descriptor inherited at an arbitrary number could
+        // collide with one the child opens before reading the variable.
+        .env(
+            super::roles::BOOTSTRAP_FD_ENV,
+            BOOTSTRAP_CHILD_FD.to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok((command, parent_end, child_end))
+}
+
+/// Whether two spellings of a runtime scope name the same directory.
+///
+/// The scope key is a path, and a path has more than one spelling: `/var` and
+/// `/private/var` are one directory on macOS, and the launcher and the guardian can
+/// hold different ones depending on which was canonicalised first. Comparing the raw
+/// strings would call two identical scopes different -- and the guarded code reads
+/// that disagreement as "someone swapped the scope", refusing a launch that is in
+/// fact correct. Canonicalising both sides is what makes the comparison about the
+/// directory rather than about the spelling.
+pub fn scope_keys_agree(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        // An uncanonicalisable scope cannot be shown to agree, and guessing "yes"
+        // would let two genuinely different scopes pass the check.
+        _ => false,
     }
 }
 

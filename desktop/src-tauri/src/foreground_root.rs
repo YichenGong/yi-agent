@@ -322,9 +322,7 @@ pub async fn foreground_root_recovery_inspect(
             .lock()
             .map_err(|_| io::Error::other("the recovery lease is poisoned"))?;
         let deadline = yi_agent_lifecycle::deadline::Deadline::after(READ_BUDGET);
-        lease
-            .inspect_root_recovery(&fence, &deadline)
-            .map_err(|error| error)
+        lease.inspect_root_recovery(&fence, &deadline)
     })
     .await?;
     Ok(impact.into())
