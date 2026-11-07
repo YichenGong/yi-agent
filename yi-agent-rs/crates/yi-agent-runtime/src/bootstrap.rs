@@ -603,6 +603,19 @@ fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String>
         base.push_str("\n\nProject instructions (AGENTS.md):\n");
         base.push_str(&instructions);
     }
+    // 位置信息只在会话开始拼一次。放进 system prompt 而不是每轮 user 消息，
+    // 是为了让前缀稳定、provider 的 prompt cache 继续命中（实测缓存命中
+    // 4992/5038 token）。
+    base.push_str("\n\n## Environment\n\n");
+    base.push_str(&format!("Working directory: {}\n", workdir.display()));
+    base.push_str(
+        "All file tools (read/edit/write/grep/glob) resolve relative paths against this directory.\n\
+         The bash tool starts in this directory and keeps its working directory across calls.\n\
+         Run `pwd` once when you need to confirm a location after `cd`.\n\n\
+         Do not probe for the project location. If this directory looks wrong, say so instead of\n\
+         guessing other paths.",
+    );
+
     let today = chrono::Local::now().format("%Y-%m-%d");
     Some(format!("{base}\n\nCurrent date: {today}"))
 }
@@ -1278,6 +1291,64 @@ mod tests {
                 < prompt.find("Current date:").unwrap(),
             "project instructions come before the date"
         );
+    }
+
+    #[test]
+    fn resolve_system_prompt_states_the_working_directory() {
+        let project = tempfile::TempDir::new().unwrap();
+        // 不 canonicalize：`resolve_system_prompt` 用 `workdir.display()` 原样输出，
+        // macOS 上 TempDir 的 `/var/folders/...` 与 `/private/var/...` 字符串不同。
+        let workdir = project.path().to_path_buf();
+
+        let prompt = resolve_system_prompt(None, &workdir).expect("prompt");
+
+        assert!(
+            prompt.contains("## Environment"),
+            "prompt must name the environment section, got: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("Working directory: {}", workdir.display())),
+            "prompt must state the absolute working directory, got: {prompt}"
+        );
+    }
+
+    /// 顺序契约：环境段在项目指令之后、日期之前。
+    #[test]
+    fn environment_section_sits_between_project_instructions_and_the_date() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "Always run focused tests.",
+        )
+        .expect("write AGENTS.md");
+
+        let prompt =
+            resolve_system_prompt(Some("Be brief.".into()), project.path()).expect("prompt");
+
+        let custom = prompt.find("User-provided instructions:").unwrap();
+        let project_rules = prompt.find("Project instructions (AGENTS.md):").unwrap();
+        let environment = prompt.find("## Environment").unwrap();
+        let date = prompt.find("Current date:").unwrap();
+
+        assert!(custom < project_rules, "got: {prompt}");
+        assert!(
+            project_rules < environment,
+            "environment follows project rules, got: {prompt}"
+        );
+        assert!(
+            environment < date,
+            "environment precedes the date, got: {prompt}"
+        );
+    }
+
+    /// 没有 AGENTS.md 时环境段照常出现。
+    #[test]
+    fn environment_section_appears_without_project_instructions() {
+        let project = tempfile::TempDir::new().unwrap();
+        let prompt = resolve_system_prompt(None, project.path()).expect("prompt");
+
+        assert!(prompt.contains("## Environment"));
+        assert!(!prompt.contains("Project instructions"));
     }
 
     /// 缺失时不得注入任何标记，也不得报错（非 git / 无 AGENTS.md 的项目照常工作）。
