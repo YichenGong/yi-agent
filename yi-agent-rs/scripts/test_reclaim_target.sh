@@ -281,6 +281,76 @@ PATH="$stub2:$PATH" bash "$SCRIPT" --target "$tmp/t7" --min-age 0 >/dev/null 2>&
   || fail "dry-run was refused by the lock check"
 n=$((n + 1)); pass "dry-run ignores the lock check"
 
+# ---- D4: 陈旧二进制 + dSYM ----
+# 分组键必须是 (crate, 目标类型)。只用 crate 前缀会把 bin 和 test-bin 当成
+# 同一组 —— 实测真实仓库 plugin_pack 的两个哈希 mtime 只差 0.338s，但它们
+# 分别是 bin-plugin-pack 和 test-bin-plugin-pack，两个都必须保留。
+t9="$tmp/t9"
+d9="$t9/debug/deps"; mkdir -p "$d9"
+fp="$t9/debug/.fingerprint"
+
+# 同一 crate、同一目标(bin) 的两个 hash：旧的删、新的留
+mkdir -p "$fp/demo-aaaaaaaaaaaaaaaa" "$fp/demo-bbbbbbbbbbbbbbbb"
+: >"$fp/demo-aaaaaaaaaaaaaaaa/bin-demo.json"
+: >"$fp/demo-bbbbbbbbbbbbbbbb/bin-demo.json"
+printf 'old' >"$d9/demo-aaaaaaaaaaaaaaaa"; chmod +x "$d9/demo-aaaaaaaaaaaaaaaa"
+printf 'new' >"$d9/demo-bbbbbbbbbbbbbbbb"; chmod +x "$d9/demo-bbbbbbbbbbbbbbbb"
+mkdir -p "$d9/demo-aaaaaaaaaaaaaaaa.dSYM/Contents/Resources/DWARF"
+printf 'dsym-old' >"$d9/demo-aaaaaaaaaaaaaaaa.dSYM/Contents/Resources/DWARF/demo"
+# 同名 .d / .rlib 也算「该目标的产物」，但只有二进制和 dSYM 在回收范围
+printf 'dep' >"$d9/demo-aaaaaaaaaaaaaaaa.d"
+touch -t 202601010000 "$d9/demo-aaaaaaaaaaaaaaaa" "$d9/demo-aaaaaaaaaaaaaaaa.dSYM"
+touch -t 202601020000 "$d9/demo-bbbbbbbbbbbbbbbb"
+
+# 同一 crate、不同目标(bin vs test-bin)：mtime 相同，两个都必须留
+mkdir -p "$fp/multi-cccccccccccccccc" "$fp/multi-dddddddddddddddd"
+: >"$fp/multi-cccccccccccccccc/bin-multi.json"
+: >"$fp/multi-dddddddddddddddd/test-bin-multi.json"
+printf 'a' >"$d9/multi-cccccccccccccccc"; chmod +x "$d9/multi-cccccccccccccccc"
+printf 'b' >"$d9/multi-dddddddddddddddd"; chmod +x "$d9/multi-dddddddddddddddd"
+touch -t 202601030000 "$d9/multi-cccccccccccccccc" "$d9/multi-dddddddddddddddd"
+
+out="$(bash "$SCRIPT" --target "$t9" --min-age 0 2>/dev/null)" || fail "D4 dry-run failed"
+grep -q "陈旧二进制" <<<"$out" || { printf '%s\n' "$out" >&2; fail "dry-run does not report stale binaries"; }
+n=$((n + 1)); pass "D4 reports stale binaries in dry-run"
+[ -e "$d9/demo-aaaaaaaaaaaaaaaa" ] || fail "D4 dry-run deleted a binary"
+n=$((n + 1)); pass "D4 dry-run deletes nothing"
+
+bash "$SCRIPT" --apply --target "$t9" --min-age 0 >/dev/null 2>&1 || fail "D4 apply failed"
+[ -e "$d9/demo-aaaaaaaaaaaaaaaa" ] && fail "D4 kept a stale binary"
+n=$((n + 1)); pass "D4 deletes a stale binary (same crate + same target)"
+[ -e "$d9/demo-aaaaaaaaaaaaaaaa.dSYM" ] && fail "D4 kept the stale dSYM"
+n=$((n + 1)); pass "D4 deletes the stale binary's dSYM"
+[ -x "$d9/demo-bbbbbbbbbbbbbbbb" ] || fail "D4 deleted the newest binary"
+n=$((n + 1)); pass "D4 keeps the newest binary"
+[ -x "$d9/multi-cccccccccccccccc" ] && [ -x "$d9/multi-dddddddddddddddd" ] \
+  || fail "D4 confused two different targets of the same crate"
+n=$((n + 1)); pass "D4 keeps bin and test-bin of the same crate separately"
+# 无 fingerprint 的二进制一律保留（判不了就不动）
+printf 'x' >"$d9/nofp-eeeeeeeeeeeeeeee"; chmod +x "$d9/nofp-eeeeeeeeeeeeeeee"
+bash "$SCRIPT" --apply --target "$t9" --min-age 0 >/dev/null 2>&1 || fail "D4 second apply failed"
+[ -x "$d9/nofp-eeeeeeeeeeeeeeee" ] || fail "D4 deleted a binary without fingerprint evidence"
+n=$((n + 1)); pass "D4 keeps binaries that have no fingerprint entry"
+
+# 回归：fingerprint 目录用连字符、deps 二进制用下划线，哈希相同。
+# 实测真实仓库就是这种形式（.fingerprint/yi-agent-d89cb... vs deps/yi_agent-d89cb...）。
+# 若索引键拼上包名，这类二进制全部匹配不上 → D4 静默失效、一个都删不掉。
+t10="$tmp/t10"; d10="$t10/debug/deps"; mkdir -p "$d10"
+f10="$t10/debug/.fingerprint"
+h_old=1111111111111111; h_new=2222222222222222
+mkdir -p "$f10/my-crate-$h_old" "$f10/my-crate-$h_new"
+: >"$f10/my-crate-$h_old/bin-my-crate.json"
+: >"$f10/my-crate-$h_new/bin-my-crate.json"
+printf 'old' >"$d10/my_crate-$h_old"; chmod +x "$d10/my_crate-$h_old"
+printf 'new' >"$d10/my_crate-$h_new"; chmod +x "$d10/my_crate-$h_new"
+touch -t 202601010000 "$d10/my_crate-$h_old"
+touch -t 202601020000 "$d10/my_crate-$h_new"
+bash "$SCRIPT" --apply --target "$t10" --min-age 0 >/dev/null 2>&1 || fail "hyphen/underscore case failed"
+[ -e "$d10/my_crate-$h_old" ] && fail "D4 failed to match hyphenated fingerprint to underscore binary"
+n=$((n + 1)); pass "D4 matches fingerprint hashes across hyphen/underscore name forms"
+[ -x "$d10/my_crate-$h_new" ] || fail "D4 deleted the newest binary in hyphen/underscore case"
+n=$((n + 1)); pass "D4 keeps the newest binary in hyphen/underscore case"
+
 # 参数校验。
 bash "$SCRIPT" --bogus >/dev/null 2>&1 && fail "accepted an unknown option"
 n=$((n + 1)); pass "rejects unknown options"

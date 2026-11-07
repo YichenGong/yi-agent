@@ -239,6 +239,114 @@ has_active_build() { # $1 = target dir
   return 1
 }
 
+# D4：陈旧二进制 + 对应 dSYM。
+#
+# 根因是 cargo 对「同一 crate 同一目标」在依赖或 profile 变化时新开一个
+# -<hash> 文件名，旧二进制永不删除。实测 target/debug/deps 里 574 个二进制
+# 占 12.95 GB，其中 449 个陈旧占 10.6 GB；dSYM 339 个占 27.56 GB，陈旧 19.8 GB。
+#
+# 分组键必须是 (crate, 目标类型)：只用 crate 前缀会误删。实测 plugin_pack 的
+# plugin_pack-28129df3848e2374(3.8MB, bin-plugin-pack) 与
+# plugin_pack-f90c9159d28d6eaf(1.0MB, test-bin-plugin-pack) mtime 只差 0.338s，
+# 两个都是活的。目标类型从 .fingerprint/<pkg>-<hash>/*.json 的**文件名**读
+# （文件名即 "bin-demo" / "test-bin-demo" / "lib"），多个目标按排序拼成键。
+#
+# 安全阀：没有 fingerprint 证据的二进制**一律保留**。判不了就不动。
+_run_stale() { python3 - "$1" "$2" "$3" <<'PY'
+import os, shutil, sys, time
+root, min_age, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+now = time.time()
+
+def dir_size(d):
+    tot = 0
+    for r, _ds, fs in os.walk(d):
+        for f in fs:
+            try:
+                tot += os.lstat(os.path.join(r, f)).st_size
+            except OSError:
+                pass
+    return tot
+
+sb = sby = sd = sdy = 0
+for prof in sorted(os.listdir(root)):
+    deps = os.path.join(root, prof, "deps")
+    froot = os.path.join(root, prof, ".fingerprint")
+    if not os.path.isdir(deps) or not os.path.isdir(froot):
+        continue
+
+    # fingerprint 索引：hash -> "target1|target2"
+    #
+    # 只按 hash 索引，不按 (pkg, hash)。实测真实仓库里两侧的包名形式不同：
+    # .fingerprint 用连字符（yi-agent-d89cb4ada82b13a9），deps 里的二进制用
+    # 下划线（yi_agent-d89cb4ada82b13a9），哈希完全一致。若按 pkg 拼接做键，
+    # 所有真实二进制都会匹配不上、被当成「无证据」而全部保留 —— D4 静默失效。
+    # 哈希是 16 位，足够唯一。
+    fpmap = {}
+    for ent in os.scandir(froot):
+        if not ent.is_dir() or "-" not in ent.name:
+            continue
+        _pkg, _, h = ent.name.rpartition("-")
+        if len(h) != 16:
+            continue
+        kinds = sorted({f[:-5] for f in os.listdir(ent.path) if f.endswith(".json")})
+        if kinds:
+            fpmap[h] = "|".join(kinds)
+
+    bins = []
+    for e in os.scandir(deps):
+        if not e.is_file(follow_symlinks=False):
+            continue
+        if "." in e.name or not os.access(e.path, os.X_OK):
+            continue
+        pkg, _, h = e.name.rpartition("-")
+        if len(h) != 16:
+            continue
+        kind = fpmap.get(h)
+        if kind is None:
+            continue                      # 无证据，保留
+        try:
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if min_age > 0 and now - st.st_mtime < min_age:
+            continue
+        bins.append((pkg, kind, e.name, e.path, st.st_mtime, st.st_size))
+
+    groups = {}
+    for item in bins:
+        groups.setdefault((item[0], item[1]), []).append(item)
+
+    for _key, items in groups.items():
+        items.sort(key=lambda x: -x[4])   # 新 -> 旧
+        for _pkg, _kind, name, path, _mt, size in items[1:]:
+            dsym = path + ".dSYM"
+            ds = dir_size(dsym) if os.path.isdir(dsym) else 0
+            if mode == "apply":
+                try:
+                    os.unlink(path)
+                    sb += 1
+                    sby += size
+                    if os.path.isdir(dsym):
+                        shutil.rmtree(dsym)
+                        sd += 1
+                        sdy += ds
+                except OSError:
+                    pass
+            else:
+                sb += 1
+                sby += size
+                if os.path.isdir(dsym):
+                    sd += 1
+                    sdy += ds
+
+print(f"{sb}\t{sby}\t{sd}\t{sdy}")
+PY
+}
+
+scan_stale_bins() { _run_stale "$1" "${2:-0}" dry; }
+
+apply_stale_bins() { _run_stale "$1" "${2:-0}" apply; }
+
 scan_deps() { # $1 = target root, $2 = min_age -> "orphan_keys\torphan_files\torphan_bytes\tunref_files\tunref_bytes\ttotal_keys\ttotal_files\tskipped"
   python3 - "$1" "${2:-0}" <<'PY'
 import os, subprocess, sys, time
@@ -482,6 +590,14 @@ for t in "${TARGETS[@]}"; do
     say "   deps            : 已跳过（--skip-deps）"
   fi
 
+  # ---- D4: 陈旧二进制 + dSYM ----
+  sb=0; sby=0; sd=0; sdy=0
+  if [ "$SKIP_DEPS" = "0" ]; then
+    line="$(scan_stale_bins "$t" "$MIN_AGE")" || { say "!! D4 扫描失败：$t"; line=$'0\t0\t0\t0'; }
+    IFS=$'\t' read -r sb sby sd sdy <<<"$line"
+    say "   陈旧二进制      : $sb 个（含 dSYM $sd 个），$(human $((sby + sdy)))"
+  fi
+
   if [ "$MODE" = "apply" ]; then
     if [ "$d1_dirs" -gt 0 ]; then
       res="$(apply_incremental "$t")" || { say "!! D1 清理失败：$t"; res=$'0\t0'; }
@@ -496,6 +612,12 @@ for t in "${TARGETS[@]}"; do
       say "   D2 已删除       : $rm 个，回收 $(human "$fr")"
       grand_freed=$((grand_freed + fr))
     fi
+    if [ "$sb" -gt 0 ]; then
+      res="$(apply_stale_bins "$t" "$MIN_AGE")" || { say "!! D4 清理失败：$t"; res=$'0\t0\t0\t0'; }
+      IFS=$'\t' read -r rm4 fr4 d4n d4b <<<"$res"
+      say "   D4 已删除       : $rm4 个二进制 + $d4n 个 dSYM，回收 $(human $((fr4 + d4b)))"
+      grand_freed=$((grand_freed + fr4 + d4b))
+    fi
     if [ "$PRUNE_UNITS" -gt 0 ]; then
       res="$(prune_units "$t" "$PRUNE_UNITS")" || { say "!! D3 清理失败：$t"; res=$'0\t0'; }
       IFS=$'\t' read -r rm3 fr3 <<<"$res"
@@ -504,7 +626,7 @@ for t in "${TARGETS[@]}"; do
         grand_freed=$((grand_freed + fr3))
       fi
     fi
-    if [ "$d1_dirs" -eq 0 ] && [ "$of" -eq 0 ] && [ "$uf" -eq 0 ] && [ "$PRUNE_UNITS" -eq 0 ]; then
+    if [ "$d1_dirs" -eq 0 ] && [ "$of" -eq 0 ] && [ "$uf" -eq 0 ] && [ "$PRUNE_UNITS" -eq 0 ] && [ "$sb" -eq 0 ]; then
       say "   结论            : 无需清理"
     else
       after="$(du -sm "$t" 2>/dev/null | cut -f1)"
