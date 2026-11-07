@@ -248,7 +248,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check affected-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -653,3 +653,9 @@ reclaim apply="" worktrees="": reclaim-check
 # 两种错误都不报错、只能靠断言发现。
 reclaim-check:
     bash scripts/test_reclaim_target.sh
+
+# test-tiers.sh 的判据自测（假 git 输出驱动，不编译、秒级）。
+# 进 ci 的理由同 reclaim-check：判据写宽会把 desktop/ 当 crate 跑，
+# 写窄会静默少测——两种都不报错，只能靠断言发现。
+affected-check:
+    bash scripts/test_test_tiers.sh
