@@ -77,3 +77,29 @@ node scripts/plugins/e2e-report.mjs .artifacts/plugins/acceptance.json
 
 第一条写报告，第二条判它能不能算全绿。当前第二条会以非零退出并列出 6 条
 非通过项——这是设计要的结果，不是缺陷。
+
+## 事后更正：A04 的判词当时是误判（2026-11-07 实测）
+
+上表 A04 的 `pass` 不成立。当时执行的过滤器是 `-E 'test(managed_launch)'`，
+而 nextest 的 `test()` 匹配的是**整条测试路径**，不是函数名，所以它并没有像
+预期那样按文件选测试：
+
+- `binary(managed_launch)` 选中 **7** 个测试（该文件全部）。
+- `test(managed_launch)` 只选中 **1** 个——`a_legacy_manifest_cannot_override_
+  the_managed_launcher`，因为它的函数名末尾含 `_managed_launcher` 这一子串。
+- 其余 6 个测试从未在 A04 名下执行过，判词却是 `pass`。
+
+补充两点实测事实，避免把结论说过头：
+
+1. `test(managed_launch)` 选中的**不是 0 个，而是 1 个**。此前描述为「零个
+   测试」不准确；准确的表述是「7 个里只有 1 个，且是子串误撞上的」。
+
+2. `cargo nextest run -p yi-agent-supervisors -E 'test(managed_launch)'` 在
+   不带 `--all-features` 时仍能编译并跑完这 1 个测试，所以 A04 当时是「跑了
+   一点点」，不是「完全没跑」。真正会因缺少 `--all-features` 而编译失败的
+   是 `yi-agent-store`（34 处 `E0599`，`execute_test_scalar_text` 挂在
+   `foreground-test-support` 后面），影响的是 fault-matrix 驱动的
+   A09–A15、A18–A19，而不是 A04。
+
+当前 `acceptance-commands.json` 已把 A04 改为 `binary(managed_launch)`，
+实跑 7/7 通过。
