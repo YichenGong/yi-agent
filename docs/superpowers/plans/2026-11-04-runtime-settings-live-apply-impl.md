@@ -670,7 +670,7 @@ agent.set_live_settings(binding.agent_source(AgentSettingsContext {
 
 **Interfaces:** Produces core AdmissionLimitsSource/AdmissionLimits、AgentWorkerFactory.live_admission_limits的真实消费者（trait签名由Task4先建立，binding适配由Task6实现，本任务不重复定义）；AgentSupervisor 新增 `set_max_direct_children(&mut self, limit: usize)`；store RuntimeCoordinator 新增 `pub async fn refresh_live_admission(&self) -> Result<(), RuntimeCoordinatorError>` 及 `live_admission_receiver(&self) -> Option<watch::Receiver<u64>>`。source挂在factory，store不依赖runtime。supervisor按session分组且使用异步锁；主动刷新先克隆所需session/handle列表并释放映射锁，再逐个await取得supervisor并更新，不跨await持std MutexGuard，也不同时锁多个supervisor。现存start_worker等async准入路径在原保护区内同步读取短source，避免两次取得同一supervisor锁。测试调用refresh时使用.await，daemon同步循环用已有runtime.block_on驱动。
 
-- [ ] **Step 1: 写失败测试。** 在现有 store 测试工厂包装动态 source，容量初始2、已有2 worker、降到1；断言现存未取消、第三个排队。升到3并调用真实刷新调度入口，断言原排队 worker被启动。直接子上限以父 supervisor 的真实 nonterminal孩子计数测降/升，并发 spawn 以屏障同时提交，不能超发。
+- [x] **Step 1: 写失败测试。** 在现有 store 测试工厂包装动态 source，容量初始2、已有2 worker、降到1；断言现存未取消、第三个排队。升到3并调用真实刷新调度入口，断言原排队 worker被启动。直接子上限以父 supervisor 的真实 nonterminal孩子计数测降/升，并发 spawn 以屏障同时提交，不能超发。
 
 ```rust
 // 测试 source 的最小实现，watch只是唤醒。
@@ -688,15 +688,15 @@ impl AdmissionLimitsSource for LimitsSource {
 
 复用 store 现有 runtime 测试的 workspace/task/StopWitness 工厂，不新增替代调度器。对恢复/重新接纳也用同一 source。
 
-- [ ] **Step 2: RED。** Run `cargo test -p yi-agent-store --test live_admission`；`cargo test -p yi-agent-core --test subagent_supervisor`。旧“构造时 with_max_direct_children / with_resident_capacity”不刷新时必须失败。
-- [ ] **Step 3: 最小实现。** 真正创建/接纳前在现有父/准入受保护区域中 snapshot：更新 supervisor 限额并检查父状态/计数，resident在 actual resource lock内按最新source set_capacity 后 reserve/grant。禁止只改 factory返回常数；根不占resident额度，已有占用不减计数，降额采用saturating可用数。错误不得先造worker后再失败。
+- [x] **Step 2: RED。** Run `cargo test -p yi-agent-store --test live_admission`；`cargo test -p yi-agent-core --test subagent_supervisor`。旧“构造时 with_max_direct_children / with_resident_capacity”不刷新时必须失败。
+- [x] **Step 3: 最小实现。** 真正创建/接纳前在现有父/准入受保护区域中 snapshot：更新 supervisor 限额并检查父状态/计数，resident在 actual resource lock内按最新source set_capacity 后 reserve/grant。禁止只改 factory返回常数；根不占resident额度，已有占用不减计数，降额采用saturating可用数。错误不得先造worker后再失败。
 
 源码在实际grant处已持supervisor再取resource_coordinator锁；新路径沿用该方向，不得在refresh中反向持resource等待supervisor。配置source只读短refresh gate，不能回调调度器或在其锁内发送阻塞通知。`refresh_live_admission`按相同锁顺序更新，或分别更新并在真正grant点重新snapshot，不依赖一次预读永久生效。新增受控 `RuntimeCoordinatorError::LiveSettings { code: &'static str }`，适配所有穷尽匹配；派生失败阻止本次新准入而不取消现存worker，文件故障仍由LKG承接。
 
 `refresh_live_admission` 读取一次limits，更新实际 coordinator并唤醒现有调度循环；待授予任务在grant点再读取，保存期间已经预留的lease视为已开始，不撤销。watch驱动由Task11安装，Task8直接调用刷新入口证明实际队列可重试。保持现有fairness/deadline/cursor持久化与取消释放口径。
 
-- [ ] **Step 4: GREEN。** Run `cargo test -p yi-agent-store --test live_admission`、`cargo test -p yi-agent-core --test subagent_scheduler`、`cargo test -p yi-agent-core --test subagent_supervisor`、`cargo test -p yi-agent-store --lib runtime`；同时测试 ProcessWorkerFactory 使用 daemon本地source，并不要求控制通道把trait对象序列化。
-- [ ] **Step 5: 文档/门禁/提交。** store/core/subagent模块记录真实准入证据，message `feat: apply live subagent limits at actual admission`。
+- [x] **Step 4: GREEN。** Run `cargo test -p yi-agent-store --test live_admission`、`cargo test -p yi-agent-core --test subagent_scheduler`、`cargo test -p yi-agent-core --test subagent_supervisor`、`cargo test -p yi-agent-store --lib runtime`；同时测试 ProcessWorkerFactory 使用 daemon本地source，并不要求控制通道把trait对象序列化。
+- [x] **Step 5: 文档/门禁/提交。** store/core/subagent模块记录真实准入证据，message `feat: apply live subagent limits at actual admission`。
 
 ## Task 9: 固化默认沙箱基线和安全历史恢复
 

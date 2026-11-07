@@ -754,6 +754,16 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         self.max_direct_children
     }
 
+    fn live_admission_limits(
+        &self,
+    ) -> Option<std::sync::Arc<dyn yi_agent_core::live_settings::AdmissionLimitsSource>> {
+        // Only a factory that was handed a live binding has a source; the
+        // static fields above stay authoritative otherwise.
+        self.live_settings
+            .as_ref()
+            .map(|binding| binding.admission_source())
+    }
+
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         self.workspace_service
             .as_ref()
@@ -2982,6 +2992,65 @@ mod tests {
             "model-two",
             "the next call must use the new catalog, not the startup snapshot"
         );
+    }
+
+    /// The factory must expose its live limits, otherwise the store's admission
+    /// path silently falls back to the static fields and every save is ignored.
+    ///
+    /// Both directions matter: a factory with no binding must expose nothing
+    /// (static callers keep working), and one with a binding must see a save
+    /// without being re-created.
+    #[test]
+    fn a_live_factory_exposes_admission_limits_that_follow_a_save() {
+        use yi_agent_runtime::live_settings::binding::RuntimeSettingsBinding;
+        use yi_agent_runtime::live_settings::sources::FrozenRuntimeSources;
+        use yi_agent_runtime::settings::store::PatchMode;
+
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"agent": {"max_direct_children": 3, "max_resident_subagents": 5}}"#,
+        )
+        .unwrap();
+
+        let static_factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        );
+        assert!(
+            AgentWorkerFactory::live_admission_limits(&static_factory).is_none(),
+            "a factory without a binding must keep the static fields authoritative"
+        );
+
+        let live = yi_agent_runtime::live_settings::LiveSettings::shared(settings_path);
+        let binding = RuntimeSettingsBinding {
+            live: Arc::clone(&live),
+            sources: Arc::new(FrozenRuntimeSources::default()),
+        };
+        let factory =
+            static_factory.with_live_settings(watcher_test_config(directory.path()), binding);
+
+        let source = AgentWorkerFactory::live_admission_limits(&factory)
+            .expect("a live factory must expose its source");
+        let limits = source.snapshot().unwrap();
+        assert_eq!(limits.direct_children, 3);
+        assert_eq!(limits.resident_subagents, 5);
+
+        // One save, no re-creation: the same source reads the new values.
+        live.commit(
+            &serde_json::json!({
+                "agent.max_direct_children": 1,
+                "agent.max_resident_subagents": 2,
+            }),
+            PatchMode::ReplaceProvided,
+        )
+        .unwrap();
+        let limits = source.snapshot().unwrap();
+        assert_eq!(limits.direct_children, 1);
+        assert_eq!(limits.resident_subagents, 2);
     }
 
     /// 未装 watcher 的工厂行为必须逐字节不变（零回归门禁）。
