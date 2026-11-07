@@ -147,7 +147,7 @@ async fn live_source_wins_over_static_prompt_and_refreshes_between_runs() {
         Arc::new(ToolRegistry::default()),
         static_config(),
     );
-    agent.set_live_settings(Some(settings.as_source()));
+    agent.set_live_settings(settings.as_source());
     let session = agent.session_handle();
 
     assert_no_errors(&drain(agent.run("hello".into()).await.unwrap()).await);
@@ -205,10 +205,10 @@ async fn failing_source_reports_controlled_error_without_provider_call() {
         Arc::new(ToolRegistry::default()),
         static_config(),
     );
-    agent.set_live_settings(Some(Arc::new(Failing {
+    agent.set_live_settings(Arc::new(Failing {
         code: "snapshot_unavailable",
         calls: calls.clone(),
-    })));
+    }));
 
     let events = drain(agent.run("hello".into()).await.unwrap()).await;
 
@@ -253,7 +253,7 @@ async fn source_error_releases_the_admission_lease() {
         static_config(),
     )
     .with_provider_turn_gate(gate.clone());
-    agent.set_live_settings(Some(Arc::new(Failing)));
+    agent.set_live_settings(Arc::new(Failing));
 
     let stream = agent.run("hello".into()).await.unwrap();
     gate.wait_entered().await;
@@ -286,7 +286,7 @@ async fn snapshot_is_read_after_first_admission_and_lease_is_reused() {
         static_config(),
     )
     .with_provider_turn_gate(gate.clone());
-    agent.set_live_settings(Some(settings.as_source()));
+    agent.set_live_settings(settings.as_source());
 
     let stream = agent.run("hello".into()).await.unwrap();
     // Park inside the first admission, then publish. The operation has not
@@ -329,7 +329,7 @@ async fn transport_retry_reuses_the_same_request_snapshot() {
         config,
     )
     .with_provider_turn_gate(gate.clone());
-    agent.set_live_settings(Some(settings.as_source()));
+    agent.set_live_settings(settings.as_source());
 
     let stream = agent.run("hello".into()).await.unwrap();
     let first = wait_for_requests(&requests, 1).await;
@@ -363,7 +363,7 @@ async fn edit_during_inflight_tool_applies_to_next_think_without_replay() {
     let requests = provider.requests.clone();
     let settings = MutableSettings::new(snapshot("rev-1", "before"));
     let mut agent = Agent::new(Arc::new(provider), Arc::new(registry), static_config());
-    agent.set_live_settings(Some(settings.as_source()));
+    agent.set_live_settings(settings.as_source());
 
     let stream = agent.run("go".into()).await.unwrap();
     let first = wait_for_requests(&requests, 1).await;
@@ -396,7 +396,7 @@ async fn source_is_sampled_once_per_think_operation() {
         Arc::new(ToolRegistry::default()),
         static_config(),
     );
-    agent.set_live_settings(Some(counting.clone() as _));
+    agent.set_live_settings(counting.clone() as _);
 
     assert_no_errors(&drain(agent.run("one".into()).await.unwrap()).await);
     assert_eq!(counting.calls(), 1);
@@ -404,27 +404,43 @@ async fn source_is_sampled_once_per_think_operation() {
     assert_eq!(counting.calls(), 2);
 }
 
-/// A missing source after `set_live_settings(None)` falls back to static config.
+/// The exact contract takes an `Arc`. A second `set` must replace the binding
+/// (not silently keep the first one), and the getter must hand back the same
+/// source instance the caller injected.
 #[tokio::test(flavor = "multi_thread")]
-async fn clearing_the_source_restores_static_behaviour() {
+async fn rebinding_the_source_replaces_it_for_the_next_run() {
     let provider = RecordingProvider::new(vec![end_turn_text("a"), end_turn_text("b")]);
     let requests = provider.requests.clone();
-    let settings = MutableSettings::new(snapshot("rev-1", "live"));
+    let first = MutableSettings::new(snapshot("rev-1", "first"));
+    let second = MutableSettings::new(snapshot("rev-2", "second"));
     let mut agent = Agent::new(
         Arc::new(provider),
         Arc::new(ToolRegistry::default()),
         static_config(),
     );
-    agent.set_live_settings(Some(settings.as_source()));
+
+    let first_source = first.as_source();
+    agent.set_live_settings(first_source.clone());
+    assert!(
+        Arc::ptr_eq(&agent.live_settings_source().expect("bound"), &first_source),
+        "the getter must return the injected source instance"
+    );
     assert_no_errors(&drain(agent.run("one".into()).await.unwrap()).await);
 
-    agent.set_live_settings(None);
-    assert!(agent.live_settings_source().is_none());
+    let second_source = second.as_source();
+    agent.set_live_settings(second_source.clone());
+    assert!(
+        Arc::ptr_eq(
+            &agent.live_settings_source().expect("bound"),
+            &second_source
+        ),
+        "a second set must replace the binding"
+    );
     assert_no_errors(&drain(agent.run("two".into()).await.unwrap()).await);
 
     assert_eq!(
         systems(&requests.lock().unwrap()),
-        vec![s("live"), s("old")],
-        "clearing the source must restore the static prompt"
+        vec![s("first"), s("second")],
+        "the replaced source must be the one consulted by the next operation"
     );
 }

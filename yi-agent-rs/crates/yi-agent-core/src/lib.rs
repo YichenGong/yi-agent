@@ -27,7 +27,8 @@ pub use compact::{
     DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
 };
 pub use live_settings::{
-    AgentSettingsSource, LiveAgentSnapshot, LiveSettingsError, SharedSettingsSource,
+    AdmissionLimits, AdmissionLimitsSource, AgentSettingsSource, LiveAgentSnapshot,
+    LiveSettingsError, SharedSettingsSource,
 };
 pub use managed_run::{
     BudgetedAgentEvent, ManagedAgentRun, ManagedRunControl, ManagedRunLimits, TrackedAgentRun,

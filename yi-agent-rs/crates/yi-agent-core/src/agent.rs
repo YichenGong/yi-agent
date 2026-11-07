@@ -545,11 +545,12 @@ impl Agent {
     /// boundaries.
     ///
     /// This only binds the source. It does not swap the session, the tools or
-    /// the provider, and it does not change `AgentConfig`: a static run keeps
-    /// using the config, while the next normal THINK re-reads the source after
-    /// its first admission. Passing `None` restores static behaviour.
-    pub fn set_live_settings(&mut self, source: Option<Arc<dyn AgentSettingsSource>>) {
-        self.live_settings = source;
+    /// the provider, and it does not change `AgentConfig`: the next normal THINK
+    /// re-reads the source after its first admission. Call it again to replace
+    /// the binding; an agent that was never bound (or was built by `new` alone)
+    /// keeps its static behaviour.
+    pub fn set_live_settings(&mut self, source: Arc<dyn AgentSettingsSource>) {
+        self.live_settings = Some(source);
     }
 
     /// The live-settings source currently bound to this agent, if any.
