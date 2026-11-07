@@ -21,6 +21,7 @@ import { applyTagChange, applyTitleChange } from "../lib/threadListUpdate";
 import { resolveTagNames } from "../lib/threadTags";
 import { isRemoteClient } from "../lib/platform";
 import { REPAIR_REMOVED_TEXT } from "../lib/repairCopy";
+import type { SubagentTraceController } from "./useSubagentTrace";
 
 type SettingsState = ReturnType<typeof useSettingsState>;
 type SessionState = ReturnType<typeof useSessionState>;
@@ -82,6 +83,22 @@ export interface NotificationRouterDeps {
    * 一段」的正文，而这正是旁支最难被用户描述的那类故障。
    */
   acceptSideNotification: (client: RpcClient, slot: Slot, n: SideNotification) => void;
+  /**
+   * 子 agent 轨迹的唯一入口。
+   *
+   * 通知带着**送它来的那条连接**，所以归属判定在控制器里按 client 身份做，而不是
+   * 读「当前打开的任务」。后者是一份 React state 的影子，漏同步一次就会把别的
+   * 任务的帧画进这一条视图。
+   */
+  trace: SubagentTraceController;
+  /**
+   * Tab 的唯一入口。
+   *
+   * 直接调 `sess.setDetailTab` 会漏掉「离开子 agent Tab 先失效预览」这一步，
+   * 于是模型推来的 `ui/gitDiff/focus` 与用户点击会得到两种行为。所有生产调用点
+   * 都走这里，Tab 的副作用只有一处。
+   */
+  changeDetailTab: (tab: "subagents" | "diff" | "processes") => void;
 }
 
 export function createNotificationRouter(deps: NotificationRouterDeps) {
@@ -106,6 +123,8 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
     scheduleReconnect,
     sideStore,
     acceptSideNotification,
+    trace,
+    changeDetailTab,
   } = deps;
 
   const sideRouter = new SideConversationRouter(sideStore);
@@ -167,6 +186,17 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
         // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
         if (n.method === "agent/children/updated") {
           railStore.applyNotification(n.params.threadId, n.params.children);
+          // 详情头部的状态徽章读的是同一份行：列表刷新后要把这条任务的最新
+          // 状态交给动作记录，否则任务已经失败，头部还停在「运行中」。
+          if (trace.getSnapshot().selected !== null) {
+            const selected = trace.getSnapshot().selected!;
+            trace.updateTask(
+              selected,
+              railStore
+                .get(selected.threadId)
+                .find((row) => row.taskId === selected.taskId) ?? null,
+            );
+          }
           force((v) => v + 1);
           return;
         }
@@ -203,7 +233,7 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
           // 静默的错配）。`loadThreadDiff` 的归属门挡得住写入，但推送**本身**
           // 不该先劫持当前视图，所以门设在这里。
           if (target === null || target !== sess.currentIdRef.current) return;
-          sess.setDetailTab("diff");
+          changeDetailTab("diff");
           sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
           diff.setPendingDiffNote(n.params.note ?? null);
@@ -219,13 +249,12 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
           return;
         }
         if (n.method === "agent/trace/event") {
-          // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
-          // 把两个任务的轨迹拼在一起安全。
-          sess.setTraceRows((prev) =>
-            n.params.taskId === sess.openTaskId.current
-              ? [...prev, n.params.row]
-              : prev,
-          );
+          // 帧只在**它所属的那条连接**仍持有该任务的订阅时才落地；控制器按
+          // (slot, 服务端绑定代际, thread, task) 逐项核对，换任务/换会话/换连接
+          // 之后的迟到帧一律丢弃，而不是拼进眼前这条轨迹。
+          const source = trace.connectionFor(client, slot);
+          if (source === null) return;
+          trace.accept(source, n.params);
           return;
         }
         if (n.method === "process/updated") {
@@ -330,6 +359,10 @@ export function createNotificationRouter(deps: NotificationRouterDeps) {
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
         if (s.state === "exited" && !disposed) {
+          // 先让轨迹知道这条连接没了：它的在途 watch 与预览都随连接作废，
+          // 但已读到的历史与草稿留着——用户没走，等重连后手动 retry 即可。
+          const traceSource = trace.connectionFor(client, slot);
+          if (traceSource !== null) trace.disconnected(traceSource);
           // 这个客户端已经死了：立刻注销它的 transport 监听。Tauri 的
           // `app-server://message` 是全局事件名，宿主拉起新侧车后，陈旧监听照样
           // 会收到新进程的帧——不摘掉就会与重连后的新客户端各应用一遍（逐字流

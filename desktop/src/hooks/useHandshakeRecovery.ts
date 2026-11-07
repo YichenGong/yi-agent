@@ -60,6 +60,16 @@ export interface HandshakeRecoveryDeps {
   buildResumeHints: () => unknown;
   /** 旁支绑定登记处。每条连接各自解析能力与宿主 id，不借 globalReader。 */
   sideStore: SideConversationStore;
+  /**
+   * 一次握手的开始：返回这一轮的 epoch。
+   *
+   * 同一条 client 上可能先后跑两次握手（重连很快，前一轮的回包还没到）。只有
+   * 最新一轮能宣布「就绪」；否则上一轮的迟到成功会把一条还没初始化完的连接
+   * 标成就绪，子 agent 的 watch 就会在 `-32010` 上反复失败。
+   */
+  onTraceHandshakeStart: (client: RpcClient) => number;
+  /** 这一轮握手成功：只有 epoch 仍是最新时才把连接标为就绪。 */
+  onTraceHandshakeReady: (client: RpcClient, epoch: number) => void;
 }
 
 export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
@@ -87,9 +97,14 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
     resetAttempt,
     buildResumeHints,
     sideStore,
+    onTraceHandshakeStart,
+    onTraceHandshakeReady,
   } = deps;
 
   return async (client: RpcClient) => {
+      // 在第一个 await 之前取 epoch：此后这条 client 上开始的更新一轮握手
+      // 会让本轮的结果失效。
+      const epoch = onTraceHandshakeStart(client);
       try {
         const initialized = await client.request<Record<string, unknown>>(
           "initialize",
@@ -292,6 +307,9 @@ export function createHandshakeRecovery(deps: HandshakeRecoveryDeps) {
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         resetAttempt();
+        // 就绪必须在「真的初始化完」之后：登记、transport 连上、发出 initialize
+        // 都不算——这之前的任何 watch 只会拿到 -32010。
+        onTraceHandshakeReady(client, epoch);
         setStatus("connected");
         // 上一条「连接已断开」现在过期了：自动重连常常几秒就成功，留着那条红条
         // 会让人以为问题还在、还在等。只收连接类文案——服务端拒绝、参数错误那类

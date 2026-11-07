@@ -15,6 +15,7 @@ import { createHandshakeRecovery } from "./hooks/useHandshakeRecovery";
 import { createConnectionLifecycle } from "./hooks/connectionLifecycle";
 import { useProcessState } from "./hooks/useProcessState";
 import { useSessionState } from "./hooks/useSessionState";
+import { useSubagentTrace } from "./hooks/useSubagentTrace";
 import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
@@ -50,7 +51,6 @@ import { ThreadSidebar } from "./components/ThreadSidebar";
 import { ThreadDetailPanel } from "./components/ThreadDetailPanel";
 import { TitleBar } from "./components/TitleBar";
 import type {
-  AgentCancelPreviewResult,
   Item,
   ThreadStatus,
   ThreadSummary,
@@ -64,7 +64,8 @@ import {
   wireTotalsToTotals,
   wireUsageToUsage,
 } from "./lib/protocol";
-import { childrenOf, SubagentRailStore } from "./lib/subagents";
+import { childrenOf, parentOf, SubagentRailStore } from "./lib/subagents";
+import { traceTargetKey } from "./lib/subagentTraceSubscription";
 import {
   DEFAULT_TAG_NAMES,
   type TagId,
@@ -339,7 +340,9 @@ export default function App() {
   // client after the relay bridge restarts (see `RpcClient.request`). A ref, not
   // a closure over `clientRef`, so the client created inside the effect captures
   // the latest one.
-  const recoveryRef = useRef<((raw: RequestFn) => Promise<void>) | null>(null);
+  const recoveryRef = useRef<
+    ((raw: RequestFn, client: RpcClient, slot: Slot) => Promise<void>) | null
+  >(null);
   const inited = useRef(false);
   /**
    * 取当前的 RPC 客户端；未连接即 null。
@@ -629,6 +632,127 @@ export default function App() {
     initialListCache,
     pairingVersion: prefs.pairingVersion,
   });
+  /**
+   * 子 agent 轨迹的唯一状态机（订阅 + 动作 + 归属门禁）。
+   *
+   * 它取代了 `useSessionState` 里的 `detailStack`/`traceRows`/`openTaskId` 三份
+   * 状态：那三份只能回答「现在画什么」，答不出「这一帧是哪个连接、哪次绑定、
+   * 哪条会话送来的」。控制器按完整身份核对，所以迟到帧天然被丢弃，不需要在每个
+   * 关闭路径上再手动清一次数组。
+   */
+  const trace = useSubagentTrace();
+  /**
+   * 服务端绑定代际：只有「换了台服务端」（重新配对/重配）才递增，普通重连不变。
+   *
+   * 判据是 `prefs.pairingVersion`。控制器用它让「同一 taskId 在另一台机器上」
+   * 变成另一个视图；普通重连时保持不变，轨迹与草稿原地刷新而不是被清空。
+   */
+  const serverBindingRef = useRef(new Map<Slot, number>());
+  const bindingVersionRef = useRef(prefs.pairingVersion);
+  if (bindingVersionRef.current !== prefs.pairingVersion) {
+    bindingVersionRef.current = prefs.pairingVersion;
+    // 换绑即所有槽位递增代际：沿用旧值会让旧连接的接受判据继续成立。
+    for (const slot of [...serverBindingRef.current.keys()]) {
+      serverBindingRef.current.set(slot, (serverBindingRef.current.get(slot) ?? 0) + 1);
+    }
+  }
+  /** 连接代际：每条新 client 递增，跨槽位共享，用来区分「同一个 slot 的新旧连接」。 */
+  const connectionGenerationRef = useRef(0);
+  /**
+   * 每条 client 的握手 epoch。
+   *
+   * 用 WeakMap 而不是计数器：epoch 只对那一条连接有意义，连接被换掉后条目
+   * 自然回收。同一条连接上先后两轮握手（快速重连、raw recovery）靠它分出
+   * 胜负——只有最新一轮能宣布「就绪」。
+   */
+  const handshakeEpoch = useRef(new WeakMap<RpcClient, number>());
+
+  /**
+   * 开始一轮握手：递增 epoch、立刻把连接退回未就绪，并返回本轮编号。
+   *
+   * 退回是必须的：上一轮已成功的「就绪」若留在控制器里，新一轮初始化期间发起的
+   * watch 会撞上 `-32010`，而界面还在放行动作按钮。
+   */
+  const handshakeEpochFor = useCallback(
+    (client: RpcClient) => {
+      const epoch = (handshakeEpoch.current.get(client) ?? 0) + 1;
+      handshakeEpoch.current.set(client, epoch);
+      const source = trace.controller.connectionFor(client);
+      if (source !== null) trace.controller.setConnectionReady(source, false);
+      return epoch;
+    },
+    [trace.controller],
+  );
+
+  /** 某槽位当前的服务端绑定代际；首次出现即 0，无需预置。 */
+  const serverBindingGeneration = useCallback(
+    (slot: Slot) => serverBindingRef.current.get(slot) ?? 0,
+    [],
+  );
+
+  /**
+   * 打开某任务的详情。
+   *
+   * 目标身份取自**这次调用时**的槽位与绑定代际：闭包捕获它们，之后用户切走
+   * 也不会把动作发到新选择上（控制器的动作回调同样传捕获值）。
+   */
+  const openSubagentTask = useCallback(
+    (threadId: string, taskId: string) => {
+      // 点卡片即回到右栏：打开栏并把 Tab 拨回「子 agent」（它可能正停在 Git Diff）。
+      sess.setPanelOpen(true);
+      sess.setDetailTab("subagents");
+      trace.controller.open({
+        slot: activeSlotRef.current,
+        serverBindingGeneration: serverBindingGeneration(activeSlotRef.current),
+        threadId,
+        taskId,
+      });
+    },
+    // `sess` 的 setter 身份稳定（useState 的 setter），故无需进依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [serverBindingGeneration, trace.controller],
+  );
+
+  /**
+   * 退回任务列表：只失效选择，栏保持打开。
+   *
+   * 与「关闭详情栏」是两件事：列表还在这个 Tab 里，用户只是不下钻了。把它们
+   * 合成一个动作会让「返回」顺手把整个栏收起来，`Git Diff` 的入口也随之消失。
+   */
+  const leaveSubagentTask = useCallback(() => {
+    trace.controller.close();
+  }, [trace.controller]);
+
+  /** 关掉详情栏：先失效选择（同步），再隐藏 UI。 */
+  const closeSubagentPanel = useCallback(() => {
+    trace.controller.close();
+    sess.setPanelOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trace.controller]);
+
+  /**
+   * Tab 的唯一入口：离开「子 agent」先让预览/确认失效，其它副作用按目标 Tab 收尾。
+   *
+   * UI 点击、router 的程序跳转（`ui/gitDiff/focus`）都走这里；只要有一处直接调
+   * `sess.setDetailTab`，两条路的行为就会分叉。
+   */
+  const changeDetailTab = useCallback(
+    (tab: "subagents" | "diff" | "processes") => {
+      trace.controller.tabChanged(tab === "subagents");
+      sess.setDetailTab(tab);
+      if (tab === "diff" && sess.currentIdRef.current !== null) {
+        void diff.loadThreadDiff(sess.currentIdRef.current, diff.diffBase);
+      }
+      // 切走进程 tab 即离开当前进程详情:留着会让详情盖住别的 tab 的列表。
+      if (tab !== "processes") {
+        proc.setOpenProcessId(null);
+        proc.setProcessOutput(null);
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    [trace.controller],
+  );
+
   /**
    * 本机项目租约跟随「用户真的在用哪个项目」，而不是侧栏里出现过什么。
    *
@@ -1059,6 +1183,9 @@ export default function App() {
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
     if (changed) {
+      // 换会话 = 换视图：轨迹的选中、watch 与草稿之外的一切都随之作废。
+      // 先失效再收栏，任何在途回包都不会落进新会话的视图。
+      trace.controller.close();
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
     }
@@ -1407,7 +1534,8 @@ export default function App() {
       store.select(t.thread_id);
       sess.setCurrentId(t.thread_id);
       writeSelectedThread(localStorage, t.thread_id);
-      // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
+      // 新会话同样是「当前会话变了」：旧 diff 与旧轨迹都必须退场。
+      trace.controller.close();
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
       force((v) => v + 1);
@@ -1520,6 +1648,8 @@ export default function App() {
       } catch (e) {
         setCurrentError(formatError(e));
       }
+      // 这个 profile 的连接与它名下的轨迹都随项目一起消失。
+      trace.controller.dropSlot(profileId);
       await refreshRemoteProfiles();
       force((v) => v + 1);
       return;
@@ -1684,6 +1814,13 @@ export default function App() {
     syncWatchdogs.current.delete(id);
     warm.current.delete(id);
     sess.forgetView(id);
+    // 这条会话不存在了：它的轨迹记录（含草稿与令牌）一并丢弃。按槽位 + 绑定
+    // 代际定点删除，别的绑定上同名的 thread id 不受影响。
+    trace.controller.dropThread(
+      activeSlotRef.current,
+      serverBindingGeneration(activeSlotRef.current),
+      id,
+    );
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
     // 服务端已经没有的会话画回侧栏里。
     deleteCachedContent(id);
@@ -1694,6 +1831,7 @@ export default function App() {
       // 记住值也一并清掉：否则下次冷启动会去找一个已经不存在的会话。
       writeSelectedThread(localStorage, null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
+      trace.controller.close();
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
     }
@@ -1848,6 +1986,8 @@ export default function App() {
       scheduleReconnect: () => scheduleReconnectRef(),
       sideStore: sideStoreRef.current,
       acceptSideNotification: sideApi.accept,
+      trace: trace.controller,
+      changeDetailTab,
     });
     const handshake = createHandshakeRecovery({
       activeSlotRef,
@@ -1875,6 +2015,14 @@ export default function App() {
       },
       buildResumeHints,
       sideStore: sideStoreRef.current,
+      // 按 client 的握手 epoch：同一条连接上后一轮握手会让前一轮的「就绪」失效。
+      onTraceHandshakeStart: (client) => handshakeEpochFor(client),
+      onTraceHandshakeReady: (client, epoch) => {
+        // 只有该 client 的最新一轮可以宣布就绪：旧回包的 epoch 必然小于当前值。
+        if (handshakeEpoch.current.get(client) !== epoch) return;
+        const source = trace.controller.connectionFor(client);
+        if (source !== null) trace.controller.setConnectionReady(source, true);
+      },
     });
 
     const lifecycle = createConnectionLifecycle({
@@ -1891,6 +2039,14 @@ export default function App() {
       handshake,
       wireClient,
       sideStore: sideStoreRef.current,
+      onTraceConnection: (connection) => {
+        trace.controller.setConnection(connection);
+      },
+      serverBindingGeneration,
+      nextTraceConnectionGeneration: () => {
+        connectionGenerationRef.current += 1;
+        return connectionGenerationRef.current;
+      },
     });
     connectRemoteTargetsRef = lifecycle.connectRemoteTargets;
     scheduleReconnectRef = lifecycle.scheduleReconnect;
@@ -1906,10 +2062,23 @@ export default function App() {
     // 新进程的记忆是空的，所以要重放的不只是 `initialize`：服务端只在订阅过的
     // 会话上推送内容，不重放 `thread/subscribe` 会让后台会话静默停更。`raw` 是
     // 不触发自动恢复的裸请求，重放过程中再被拒就直接失败，不会自等待。
-    recoveryRef.current = async (raw) => {
-      await raw("initialize", {});
-      const win = subWindow.current.current();
-      if (win.length > 0) await raw("thread/subscribe", { threadIds: win });
+    recoveryRef.current = async (raw, client, slot) => {
+      // raw recovery 是一条独立于常规握手的初始化路径：它同样要让「就绪」按
+      // 该 client 的 epoch 走，否则恢复成功后子 agent 仍以为自己不可用。
+      const epoch = handshakeEpochFor(client);
+      try {
+        await raw("initialize", {});
+        const win = subWindow.current.current();
+        if (win.length > 0) await raw("thread/subscribe", { threadIds: win });
+      } catch (e) {
+        // 恢复失败：连接保持未就绪，等下次重连；错误照旧抛出给调用方。
+        throw e;
+      }
+      // 只有本轮仍是最新时才宣布就绪（`handshakeEpochFor` 已保证是新一轮）。
+      if (handshakeEpoch.current.get(client) === epoch) {
+        const source = trace.controller.connectionFor(client, slot);
+        if (source !== null) trace.controller.setConnectionReady(source, true);
+      }
     };
 
     void handshake(lifecycle.connect());
@@ -3490,61 +3659,42 @@ export default function App() {
           {sess.currentId && sess.panelOpen && !isMobile && (
             <ThreadDetailPanel
               tab={sess.detailTab}
-              onTabChange={(t) => {
-                sess.setDetailTab(t);
-                // 切到 diff 就取一份当前快照；轨迹侧的行由 openDetail/watch 维护。
-                if (t === "diff")
-                  void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
-                // 切走进程 tab 即离开当前进程详情:留着会让详情盖住别的 tab 的列表。
-                if (t !== "processes") {
-                  proc.setOpenProcessId(null);
-                  proc.setProcessOutput(null);
-                }
-              }}
-              onClose={() => {
-                sess.setPanelOpen(false);
-                void sess.closeDetail(sess.currentId!);
-              }}
+              onTabChange={changeDetailTab}
+              onClose={() => closeSubagentPanel()}
               railRows={railStore.get(sess.currentId)}
-              selectedTaskId={sess.openSubagent}
-              onOpenTask={(taskId) =>
-                void sess.openDetail(sess.currentId!, taskId)
-              }
-              onLeaveTask={() => void sess.closeDetail(sess.currentId!)}
+              selectedTaskId={trace.view.selected?.taskId ?? null}
+              onOpenTask={(taskId) => openSubagentTask(sess.currentId!, taskId)}
+              onLeaveTask={leaveSubagentTask}
               traceProps={
-                sess.openSubagent
+                trace.view.selected !== null && trace.view.actions !== null
                   ? {
-                      taskId: sess.openSubagent,
+                      // 身份键带槽位与服务端绑定代际：换机器后即使 taskId 相同，
+                      // 也是另一个视图（折叠状态、滚动窗都重来）。
+                      identityKey: traceTargetKey(trace.view.selected),
+                      taskId: trace.view.selected.taskId,
                       row:
                         railStore
-                          .get(sess.currentId)
-                          .find((r) => r.taskId === sess.openSubagent) ?? null,
+                          .get(trace.view.selected.threadId)
+                          .find((r) => r.taskId === trace.view.selected!.taskId) ?? null,
+                      parent: parentOf(railStore.get(trace.view.selected.threadId), trace.view.selected.taskId),
                       children: childrenOf(
-                        railStore.get(sess.currentId),
-                        sess.openSubagent,
+                        railStore.get(trace.view.selected.threadId),
+                        trace.view.selected.taskId,
                       ),
-                      rows: sess.traceRows,
-                      onDrill: (taskId) =>
-                        void sess.openDetail(sess.currentId!, taskId),
-                      onMessage: async (taskId, message) => {
-                        await clientRef.current?.request("agent/message", {
-                          threadId: sess.currentId,
-                          taskId,
-                          message,
-                        });
-                      },
-                      onCancel: async (taskId) =>
-                        await clientRef.current!.request<AgentCancelPreviewResult>(
-                          "agent/cancel/preview",
-                          { threadId: sess.currentId, taskId },
-                        ),
-                      onConfirmCancel: async (taskId, token) => {
-                        await clientRef.current?.request("agent/cancel", {
-                          threadId: sess.currentId,
-                          taskId,
-                          confirmationToken: token,
-                        });
-                      },
+                      subscription: trace.view.subscription,
+                      actions: trace.view.actions,
+                      onDrill: (taskId: string) =>
+                        openSubagentTask(trace.view.selected!.threadId, taskId),
+                      onBack: leaveSubagentTask,
+                      onRetry: () => trace.controller.retry(),
+                      // 动作一律传**捕获的**目标：回调里的 `trace.view.selected`
+                      // 可能已经是下一次选择了，拿它去写就是把消息发给别人。
+                      onDraftChange: (text: string) =>
+                        trace.controller.setDraft(trace.view.selected!, text),
+                      onSend: () => trace.controller.send(trace.view.selected!),
+                      onPreview: () => trace.controller.preview(trace.view.selected!),
+                      onConfirm: () => trace.controller.confirm(trace.view.selected!),
+                      onDismiss: () => trace.controller.dismiss(trace.view.selected!),
                     }
                   : null
               }

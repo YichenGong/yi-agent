@@ -1,280 +1,275 @@
 /**
- * 子 agent 详情:摘要态起步,展开看完整轨迹;可下钻,可发消息与取消。
+ * 子 agent 详情：头部 + 时间线 + 子任务 + 常驻消息区。
  *
- * 轨迹块是"不可变的定稿"——每块的内容由它对应的行决定,不随后续行变化。因此
- * 用 `memo` 把块边界钉在值上:流式追加时只有新增的那个块会渲染,定稿的块不动。
- * 这与主对话里 `ToolCallCard`/`AgentMessage` 的记忆化是同一个理由(见
- * `ChatView.tsx` 的注释):否则每来一行都要重渲染整条轨迹。
- */
-import { memo, useEffect, useState } from "react";
-import type { AgentCancelPreviewResult, AgentTraceSnapshotResult } from "../lib/protocol";
-import type { SubagentRow } from "../lib/subagents";
-import { foldTraceRows, type TraceBlock } from "../lib/subagentTraceModel";
-
-/**
- * One trace block, memoized on its **values**, not on the block object.
+ * 这个组件只负责**组合与布局**，不推断任务状态：
  *
- * `foldTraceRows` is a fold over the whole row list, so every call builds a new
- * block object: a memo keyed on identity would never hit and every streamed row
- * would re-render the entire trace. Primitives let React's shallow comparison
- * see that an already-settled block is unchanged, so only the tail re-renders —
- * the same reasoning as `ChatView`'s leaf memo boundaries.
+ * * 头部三行标题、两行步骤、短 ID、「查看完整任务信息」入口。完整目标 / 完整 ID /
+ *   完整步骤都在主滚动区里展开——header 不放 `title` 悬停提示，因为触屏和键盘都
+ *   拿不到它。
+ * * 时间线是唯一主纵向滚动区。子任务区也在这个滚动区里（`after` 槽），不额外造
+ *   第二个滚动区：两个滚动区会争夺滚轮，读长轨迹时最容易迷路。
+ * * 「等待新的执行进展」只在**已知活动状态**下出现。paused 说已暂停、终态说终态、
+ *   row 缺失说状态未知——否则会给用户一个永远不动的假象。
+ * * loading / empty / error / disconnected 文案只在这里生成一次（作为
+ *   `TraceTimeline` 的 `status`），Timeline 自己不再造第二套空态。
  */
-const TraceRowView = memo(function TraceRowView({
-  kind,
-  sourceKind,
-  text,
-  name,
-  isError,
-  rawPayload,
-}: {
-  kind: TraceBlock["kind"];
-  sourceKind: string;
-  text: string;
-  name: string | null;
-  isError: boolean;
-  rawPayload: string | null;
-}) {
-  if (kind === "assistant_text") {
-    return <p className="my-1 whitespace-pre-wrap text-sm text-fg">{text}</p>;
-  }
-  if (kind === "tool_call") {
-    // The model keeps the tool's name out of `text` (it is a summary, not a
-    // sentence); the call's identity is part of what the user reads, so it is
-    // composed here rather than dropped.
-    return (
-      <p className="my-1 font-mono text-xs text-sky-300">
-        {`${name ?? ""}(${text})`}
-      </p>
-    );
-  }
-  if (kind === "tool_result") {
-    return (
-      <p className={`my-1 font-mono text-xs ${isError ? "text-red-300" : "text-fg-subtle"}`}>
-        {name ? `${name}: ` : ""}
-        {text}
-      </p>
-    );
-  }
-  if (kind === "state_note") {
-    // The leading dot is presentation; the model's text stays plain.
-    return <p className="my-1 text-xs text-fg-subtle">· {text}</p>;
-  }
-  // A raw block is a row that did not fit its kind's schema. Showing the
-  // original payload (and which kind it claimed) is the only honest rendering:
-  // an empty line would hide output the daemon did send.
-  return (
-    <p className="my-1 whitespace-pre-wrap font-mono text-xs text-amber-300">
-      [{sourceKind}] {rawPayload ?? text}
-    </p>
-  );
-});
+import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-/**
- * 本组件不自带外框与关闭：`ThreadDetailPanel` 提供 `<section>` 与页眉的「关闭」
- * （面板要把它和 Git Diff 摆进同一排 Tab，框架只能由面板统一出）。这里只渲染
- * 轨迹主体，故根节点是一个 Fragment，直接落进面板的 flex 列里。
- */
+import { TraceComposer } from "./TraceComposer";
+import { TraceTimeline, type TraceTimelineHandle } from "./TraceTimeline";
+import type { TraceActionSnapshot } from "../lib/subagentTraceActions";
+import { foldTraceRows } from "../lib/subagentTraceModel";
+import type { TraceSubscriptionSnapshot } from "../lib/subagentTraceSubscription";
+import { subagentState, type SubagentRow } from "../lib/subagents";
+
+export interface SubagentTraceProps {
+  /** The target key; a new key is a new view (window, disclosure state). */
+  identityKey: string;
+  taskId: string;
+  row: SubagentRow | null;
+  parent: SubagentRow | null;
+  children: SubagentRow[];
+  subscription: TraceSubscriptionSnapshot;
+  actions: TraceActionSnapshot;
+  onDrill(taskId: string): void;
+  onBack(): void;
+  onRetry(): void;
+  onDraftChange(text: string): void;
+  onSend(): Promise<void>;
+  onPreview(): Promise<void>;
+  onConfirm(): Promise<void>;
+  onDismiss(): void;
+}
+
+const NOT_PROVIDED = "服务端未提供";
+const NO_TRACE = "该任务暂无轨迹";
+const LOADING = "正在加载轨迹…";
+const DISCONNECTED = "连接已断开";
+const WAITING = "等待新的执行进展…";
+
+/** Enough of the id to recognise it; the full value lives in the info region. */
+const SHORT_ID_CHARS = 8;
+
+function shortId(taskId: string): string {
+  return taskId.length <= SHORT_ID_CHARS ? taskId : taskId.slice(0, SHORT_ID_CHARS);
+}
+
+const TONE: Record<string, string> = {
+  neutral: "text-fg-muted",
+  success: "text-success",
+  warning: "text-warning",
+  danger: "text-danger",
+};
+
 export function SubagentTrace({
+  identityKey,
   taskId,
   row,
+  parent,
   children,
-  rows,
+  subscription,
+  actions,
   onDrill,
-  onMessage,
-  onCancel,
-  onConfirmCancel,
-}: {
-  taskId: string;
-  /** The rail row this task came from, for the summary level. */
-  row: SubagentRow | null;
-  /** This task's direct children, which can be drilled into. */
-  children: SubagentRow[];
-  /** The task's trace rows, backfilled then appended live by the caller. */
-  rows: AgentTraceSnapshotResult["rows"];
-  onDrill: (taskId: string) => void;
-  onMessage: (taskId: string, message: string) => Promise<void>;
-  /** Two steps by contract: preview returns a token, confirm carries it. */
-  onCancel: (taskId: string) => Promise<AgentCancelPreviewResult>;
-  onConfirmCancel: (taskId: string, token: string) => Promise<void>;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [composing, setComposing] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [pendingCancel, setPendingCancel] = useState<string | null>(null);
-  const [status, setStatus] = useState<string | null>(null);
+  onBack,
+  onRetry,
+  onDraftChange,
+  onSend,
+  onPreview,
+  onConfirm,
+  onDismiss,
+}: SubagentTraceProps) {
+  const timelineRef = useRef<TraceTimelineHandle | null>(null);
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  const childrenToggleRef = useRef<HTMLButtonElement | null>(null);
+  const childrenId = useId();
+  const [childrenOpen, setChildrenOpen] = useState(true);
 
-  // A different task is a different view: the expanded/composing state belongs
-  // to the task it was set on, not to the panel.
-  useEffect(() => {
-    setExpanded(false);
-    setComposing(false);
-    setDraft("");
-    setPendingCancel(null);
-    setStatus(null);
-  }, [taskId]);
+  // 折叠状态属于上一条轨迹：切任务要回到默认展开。
+  const [seenIdentity, setSeenIdentity] = useState(identityKey);
+  if (seenIdentity !== identityKey) {
+    setSeenIdentity(identityKey);
+    setChildrenOpen(true);
+  }
 
-  const blocks = foldTraceRows(rows);
+  // 进入即把焦点交给标题：键盘用户需要落在面板里，而不是留在列表按钮上。
+  useLayoutEffect(() => {
+    headingRef.current?.focus({ preventScroll: true });
+  }, [identityKey]);
 
-  return (
-    <>
-      <div className="flex items-center justify-between px-3 py-2">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-fg-muted">[{row?.state ?? "unknown"}]</span>
-          <span className="truncate text-sm text-fg">
-            {row?.objective ?? taskId}
-          </span>
-          <span className="text-xs text-fg-faint">{taskId}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            className="text-xs text-fg-muted hover:text-fg"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((v) => !v)}
-          >
-            {expanded ? "收起轨迹" : "展开轨迹"}
+  const blocks = useMemo(() => foldTraceRows(subscription.rows), [subscription.rows]);
+
+  const presentation = row === null ? null : subagentState(row.state);
+  const finished = row?.finished === true;
+  // 只按共享状态表判断「还在等进展」：paused 与未知状态都不算。
+  const waiting = presentation?.active === true;
+
+  const status = (() => {
+    if (subscription.phase === "loading" && blocks.length === 0) {
+      return <p className="text-xs text-fg-subtle">{LOADING}</p>;
+    }
+    if (subscription.disconnected) {
+      return (
+        <div className="flex items-center gap-2 text-xs text-warning">
+          <span>{DISCONNECTED}</span>
+          <button type="button" onClick={onRetry} className="underline hover:text-fg">
+            重新订阅
           </button>
         </div>
-      </div>
+      );
+    }
+    if (subscription.phase === "error") {
+      return (
+        <div className="flex items-center gap-2 text-xs text-danger">
+          <span>{subscription.error ?? DISCONNECTED}</span>
+          <button type="button" onClick={onRetry} className="underline hover:text-fg">
+            重新订阅
+          </button>
+        </div>
+      );
+    }
+    if (subscription.phase === "ready" && blocks.length === 0) {
+      return <p className="text-xs text-fg-subtle">{NO_TRACE}</p>;
+    }
+    return null;
+  })();
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
-        {!expanded ? (
-          <div className="text-sm text-fg-muted">
-            <p>最近步骤：{row?.finished ? "已结束" : (row?.lastStep ?? "工作中")}</p>
-            <p className="mt-1 text-xs text-fg-faint">
-              轨迹 {rows.length} 行（展开查看完整轨迹）
+  const focusHeading = useCallback(() => {
+    headingRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  const parentIsOther = parent !== null && parent.taskId !== taskId;
+  const visibleChildren = children.filter((child) => child.taskId !== taskId);
+
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <header className="shrink-0 border-b border-line px-3 py-2">
+        <div className="flex min-w-0 items-start justify-between gap-2">
+          <div className="flex min-w-0 flex-col gap-1">
+            {parentIsOther ? (
+              <button
+                type="button"
+                onClick={() => onDrill(parent.taskId)}
+                aria-label={`返回父任务 ${parent.objective ?? parent.taskId}`}
+                className="self-start text-xs text-fg-subtle hover:text-fg"
+              >
+                ‹ {parent.objective ?? parent.taskId}
+              </button>
+            ) : null}
+
+            <h2
+              ref={headingRef}
+              tabIndex={-1}
+              className="line-clamp-3 min-w-0 break-words text-sm font-medium text-fg"
+            >
+              {row?.objective ?? NOT_PROVIDED}
+            </h2>
+
+            <p className="line-clamp-2 min-w-0 break-words text-xs text-fg-muted">
+              {row?.lastStep ?? NOT_PROVIDED}
             </p>
-          </div>
-        ) : blocks.length === 0 ? (
-          <p className="text-sm text-fg-subtle">该任务暂无轨迹</p>
-        ) : (
-          blocks.map((block) => (
-            <TraceRowView
-              key={block.key}
-              kind={block.kind}
-              sourceKind={block.sourceKind}
-              text={block.text}
-              name={block.name}
-              isError={block.isError}
-              rawPayload={block.rawPayload}
-            />
-          ))
-        )}
-      </div>
 
-      {children.length > 0 && (
-        <div className="border-t border-line px-3 py-2">
-          <p className="text-xs text-fg-subtle">子任务</p>
-          <ul className="mt-1 flex flex-wrap gap-2">
-            {children.map((child) => (
-              <li key={child.taskId}>
+            <div className="flex min-w-0 items-center gap-2 text-xs text-fg-subtle">
+              <span className={presentation ? TONE[presentation.tone] : TONE.neutral}>
+                {presentation?.label ?? "状态未知"}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono">{shortId(taskId)}</span>
+              <button
+                type="button"
+                onClick={(event) => timelineRef.current?.showTaskInfo(event.currentTarget)}
+                className="text-fg-muted underline hover:text-fg"
+              >
+                查看完整任务信息
+              </button>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
+            {subscription.phase === "ready" ? (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="text-xs text-fg-subtle hover:text-fg"
+              >
+                刷新轨迹
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={onBack}
+              className="text-xs text-fg-muted hover:text-fg"
+            >
+              返回任务列表
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <TraceTimeline
+        ref={timelineRef}
+        identityKey={identityKey}
+        phase={subscription.phase}
+        blocks={blocks}
+        taskInfo={{ taskId, objective: row?.objective ?? null, lastStep: row?.lastStep ?? null }}
+        status={status}
+        onFallbackFocus={focusHeading}
+        after={(preserve) => (
+          <>
+            {visibleChildren.length > 0 ? (
+              <section className="border-t border-line pt-2">
                 <button
                   type="button"
-                  aria-label={`进入子任务 ${child.taskId}`}
-                  className="rounded border border-line px-2 py-1 text-xs text-fg-muted hover:border-line-strong"
-                  onClick={() => onDrill(child.taskId)}
+                  ref={childrenToggleRef}
+                  aria-expanded={childrenOpen}
+                  aria-controls={childrenId}
+                  onClick={() => preserve(() => setChildrenOpen((open) => !open))}
+                  className="text-xs text-fg-muted hover:text-fg"
                 >
-                  {child.objective ?? child.taskId}
+                  子任务 {visibleChildren.length}
+                  <span aria-hidden="true">{childrenOpen ? " 收起" : " 展开"}</span>
                 </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+                <ul id={childrenId} hidden={!childrenOpen} className="mt-1 flex flex-col gap-1">
+                  {visibleChildren.map((child) => (
+                    <li key={child.taskId}>
+                      <button
+                        type="button"
+                        aria-label={`进入子任务 ${child.objective ?? child.taskId}`}
+                        onClick={() => onDrill(child.taskId)}
+                        className="flex w-full min-w-0 items-center gap-2 rounded px-1 py-1 text-left text-xs hover:bg-panel"
+                      >
+                        <span className={TONE[subagentState(child.state).tone]}>
+                          {subagentState(child.state).label}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-fg">
+                          {child.objective ?? child.taskId}
+                        </span>
+                        <span aria-hidden="true" className="text-fg-faint">
+                          ›
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
 
-      <div className="border-t border-line px-3 py-2">
-        {status && <p className="mb-1 text-xs text-amber-300">{status}</p>}
-        {pendingCancel ? (
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-red-300">确认取消该子 agent？</span>
-            <button
-              type="button"
-              className="text-xs text-red-300 hover:text-red-200"
-              onClick={async () => {
-                try {
-                  await onConfirmCancel(taskId, pendingCancel);
-                  setStatus("已取消");
-                } catch (e) {
-                  setStatus(e instanceof Error ? e.message : String(e));
-                } finally {
-                  setPendingCancel(null);
-                }
-              }}
-            >
-              确认取消
-            </button>
-            <button
-              type="button"
-              className="text-xs text-fg-muted hover:text-fg"
-              onClick={() => setPendingCancel(null)}
-            >
-              放弃
-            </button>
-          </div>
-        ) : composing ? (
-          <form
-            className="flex items-center gap-2"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (!draft.trim()) return;
-              try {
-                await onMessage(taskId, draft);
-                setStatus("已发送");
-              } catch (err) {
-                setStatus(err instanceof Error ? err.message : String(err));
-              } finally {
-                setDraft("");
-                setComposing(false);
-              }
-            }}
-          >
-            <input
-              aria-label="发给子 agent 的消息"
-              className="min-w-0 flex-1 rounded border border-line bg-panel px-2 py-1 text-sm text-fg"
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-            />
-            <button type="submit" className="text-xs text-sky-300 hover:text-sky-200">
-              发送
-            </button>
-            <button
-              type="button"
-              className="text-xs text-fg-muted hover:text-fg"
-              onClick={() => {
-                setDraft("");
-                setComposing(false);
-              }}
-            >
-              取消
-            </button>
-          </form>
-        ) : (
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              className="text-xs text-sky-300 hover:text-sky-200"
-              onClick={() => setComposing(true)}
-            >
-              发消息
-            </button>
-            <button
-              type="button"
-              className="text-xs text-red-300 hover:text-red-200"
-              onClick={async () => {
-                try {
-                  const preview = await onCancel(taskId);
-                  setPendingCancel(preview.confirmationToken);
-                } catch (e) {
-                  setStatus(e instanceof Error ? e.message : String(e));
-                }
-              }}
-            >
-              取消该任务
-            </button>
-          </div>
+            {waiting ? (
+              <p className="px-1 text-xs text-fg-faint">{WAITING}</p>
+            ) : null}
+          </>
         )}
-      </div>
-    </>
+      />
+
+      <TraceComposer
+        value={actions}
+        finished={finished}
+        onDraftChange={onDraftChange}
+        onSend={onSend}
+        onPreview={onPreview}
+        onConfirm={onConfirm}
+        onDismiss={onDismiss}
+        onFallbackFocus={focusHeading}
+      />
+    </div>
   );
 }

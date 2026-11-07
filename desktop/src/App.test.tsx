@@ -3824,7 +3824,8 @@ describe("App 会话详情栏的开合", () => {
     state.dataSources["agent/children/list"] = () => ({
       children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: "读文件" }],
     });
-    state.dataSources["agent/trace/read"] = () => ({
+    // 轨迹由 watch 的完整快照一次送到：`agent/trace/read` 不再是入口。
+    state.dataSources["agent/trace/watch"] = () => ({
       rows: [
         {
           eventId: 1,
@@ -3840,22 +3841,204 @@ describe("App 会话详情栏的开合", () => {
     fireEvent.click(await screen.findByLabelText("会话详情面板"));
     fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
 
-    expect(await screen.findByText(/最近步骤/)).toBeTruthy();
+    // 轨迹正文直接可见，没有「展开轨迹」这道门。
+    expect(await screen.findByText("开始工作")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /展开轨迹/ })).toBeNull();
+    expect(
+      clients[0].requests.filter((r) => r.method === "agent/trace/read"),
+    ).toHaveLength(0);
     expect(clients[0].requests).toContainEqual({
-      method: "agent/trace/read",
+      method: "agent/trace/watch",
       params: { threadId: "t1", taskId: "task-1" },
     });
 
-    // 返回列表：卡片重新出现，且该任务的流已停（换/退任务都要 unwatch）。
-    fireEvent.click(screen.getByRole("button", { name: /返回子 agent 列表/ }));
+    // 返回列表：卡片重新出现，且该任务的流已停。
+    fireEvent.click(screen.getByRole("button", { name: /返回任务列表/ }));
     expect(await screen.findByRole("button", { name: "查看子 agent task-1" })).toBeTruthy();
-    expect(screen.queryByText(/最近步骤/)).toBeNull();
+    expect(screen.queryByText("开始工作")).toBeNull();
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
         method: "agent/trace/unwatch",
         params: { threadId: "t1" },
       }),
     );
+  });
+
+  /**
+   * 轨迹的归属门禁：迟到帧不得落进别的任务/别的会话。
+   *
+   * 这些用例都在**App 层**跑而不是只测控制器，因为它们要证的是「接线」：
+   * 通知带的那条连接是否真的被判成订阅的持有者。控制器自己的单测覆盖不到
+   * 「router 把 client 传错了」这一类错误。
+   */
+  it("迟到的轨迹帧不会落进另一个任务", async () => {
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-2", objective: "新任务", state: "running", lastStep: null }],
+    });
+    state.dataSources["agent/trace/watch"] = () => ({ rows: [], highWaterId: 0 });
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-2" }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "agent/trace/watch")).toBe(true),
+    );
+
+    // 一帧属于 task-1 的事件（例如上一个任务的在途流）不得出现在当前视图。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({
+          method: "agent/trace/event",
+          params: {
+            threadId: "t1",
+            taskId: "task-1",
+            row: {
+              eventId: 1,
+              taskId: "task-1",
+              kind: "assistant_text",
+              payloadJson: JSON.stringify({ type: "assistant_text", text: "别处的内容" }),
+            },
+          },
+        });
+      }
+    });
+    expect(screen.queryByText("别处的内容")).toBeNull();
+
+    // 属于当前任务的帧照常落地。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({
+          method: "agent/trace/event",
+          params: {
+            threadId: "t1",
+            taskId: "task-2",
+            row: {
+              eventId: 2,
+              taskId: "task-2",
+              kind: "assistant_text",
+              payloadJson: JSON.stringify({ type: "assistant_text", text: "本任务的进展" }),
+            },
+          },
+        });
+      }
+    });
+    expect(await screen.findByText("本任务的进展")).toBeTruthy();
+  });
+
+  it("切换会话后旧任务在途的轨迹回包不再出现", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    let release: ((value: unknown) => void) | null = null;
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: null }],
+    });
+    state.dataSources["agent/trace/watch"] = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
+
+    // 换会话：面板收起，轨迹视图作废。
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(screen.queryByLabelText("会话详情")).toBeNull());
+    expect(screen.queryByLabelText("向这个 agent 发送消息")).toBeNull();
+
+    // 旧连接的 watch 这时才回来：不许把内容画回屏幕。
+    await act(async () => {
+      release?.({
+        rows: [
+          {
+            eventId: 9,
+            taskId: "task-1",
+            kind: "assistant_text",
+            payloadJson: JSON.stringify({ type: "assistant_text", text: "过期内容" }),
+          },
+        ],
+        highWaterId: 9,
+      });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("过期内容")).toBeNull();
+  });
+
+  it("普通重连保留草稿，只把轨迹标成断开", async () => {
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: null }],
+    });
+    state.dataSources["agent/trace/watch"] = () => ({ rows: [], highWaterId: 0 });
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
+    const box = (await screen.findByLabelText("向这个 agent 发送消息")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "别丢我" } });
+    expect(box.value).toBe("别丢我");
+
+    // sidecar 退出：连接没了，但用户没走。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+
+    // 草稿还在，连接状态明确报出来。
+    expect(
+      ((await screen.findByLabelText("向这个 agent 发送消息")) as HTMLTextAreaElement).value,
+    ).toBe("别丢我");
+    expect(await screen.findByText(/连接已断开/)).toBeTruthy();
+  });
+
+  it("重配时清掉上一个服务端的轨迹绑定", async () => {
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: null }],
+    });
+    state.dataSources["agent/trace/watch"] = () => ({ rows: [], highWaterId: 0 });
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
+    expect(await screen.findByLabelText("向这个 agent 发送消息")).toBeTruthy();
+
+    // 换一台服务端：新实例的列表里没有这条会话，轨迹视图必须跟着作废。
+    state.threads = [{ thread_id: "z1", title: "other", permission_mode: "normal" }];
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+    await waitFor(() => expect(screen.queryByLabelText("向这个 agent 发送消息")).toBeNull());
+  });
+
+  it("离开子 agent Tab 让取消预览失效，回来时不残留", async () => {
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: null }],
+    });
+    state.dataSources["agent/trace/watch"] = () => ({ rows: [], highWaterId: 0 });
+    state.dataSources["agent/cancel/preview"] = () => ({
+      confirmationToken: "tok-1",
+      taskIds: ["task-1"],
+      expiresInSecs: 30,
+    });
+    state.dataSources["thread/diff/read"] = () => ({
+      base: null,
+      baseKind: "none",
+      mergeBase: null,
+      commits: [],
+      files: [],
+      unifiedDiff: "",
+      truncated: false,
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止任务" }));
+    expect(await screen.findByRole("button", { name: "确认停止" })).toBeTruthy();
+
+    // 切到 Git Diff：确认区必须消失（它只属于可见的那一栏）。
+    fireEvent.click(screen.getByRole("tab", { name: "Git Diff" }));
+    expect(screen.queryByRole("button", { name: "确认停止" })).toBeNull();
+
+    // 回到子 agent Tab：不残留旧令牌，需要重新预览。
+    fireEvent.click(screen.getByRole("tab", { name: "子 agent" }));
+    expect(await screen.findByRole("button", { name: "停止任务" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "确认停止" })).toBeNull();
   });
 
   it("threadId 为 null 的 focus 落在当前会话上", async () => {

@@ -181,3 +181,20 @@ export function childrenOf<T extends { taskId: string; parentTaskId?: string | n
 ): T[] {
   return children.filter((child) => (child.parentTaskId ?? null) === taskId);
 }
+
+/**
+ * The row that names this task as its child, if the conversation's list has it.
+ *
+ * Returning the row rather than its id keeps the "is this a different task"
+ * question in one place: a self-parented malformed row would otherwise make the
+ * header offer a link back to itself.
+ */
+export function parentOf<T extends { taskId: string; parentTaskId?: string | null }>(
+  children: T[],
+  taskId: string,
+): T | null {
+  const self = children.find((child) => child.taskId === taskId);
+  const parentId = self?.parentTaskId ?? null;
+  if (parentId === null || parentId === taskId) return null;
+  return children.find((child) => child.taskId === parentId) ?? null;
+}
