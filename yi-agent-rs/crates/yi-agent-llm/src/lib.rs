@@ -4,6 +4,7 @@
 //! 架构上预留多 provider 扩展能力。
 
 pub mod anthropic;
+pub mod http;
 pub mod openai;
 pub mod probe;
 pub mod sse;
