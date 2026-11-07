@@ -218,7 +218,7 @@ audit-deps-check:
 nightly-workflow-check:
     bash ../scripts/test_nightly_workflow.sh
 
-ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check audit
+ci: fmt-check lint test build bindings-check secret-check npm-version-check ios-version-check release-env-check tag-gate-check plugin-release-check build-env-check model-setup-docs-check desktop-target-dir-check rebuild-install-check msrv-check eval-baseline-check nightly-workflow-check audit-deps-check reclaim-check audit
     @echo "CI passed"
 
 # Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
@@ -596,3 +596,30 @@ clean:
     cargo clean
     rm -rf dist
     rm -rf "{{ npm-dir }}/platforms"/*/binaries
+
+# 回收 target 里可证明无用的产物，不整体 `cargo clean`。
+#
+# `cargo clean` 会把编译缓存一起丢掉，下一次从零编（全量约十几分钟）；
+# 而 target 里真正无限增长的是**孤儿 `.o`**：macOS dev/test profile 默认
+# `split-debuginfo = "unpacked"`，每个 codegen unit 的 DWARF 落在
+# `deps/<crate>-<hash>.<mid>.<idx>.rcgu.o`，hash 随依赖/feature 变化，
+# 旧 hash 的文件 cargo 再也不碰。实测主仓库曾积到 78 万个、135 GiB。
+#
+# cargo 从不读取这些 `.o`（删光后 `cargo build` 1.6 秒完成且不重编），
+# 所以回收它们是纯收益。新构建不再产生 `.o` 由 Cargo.toml 的
+# `[profile.dev] split-debuginfo = "packed"` 保证，本 recipe 只清存量。
+#
+# `--include-worktrees` 会一起清 `.worktrees/*` 的 target——那些目录常常被
+# 遗忘，且各自是完整的一份。
+# 用法：
+#   just reclaim                     预演，只报告不删
+#   just reclaim apply=1             真的删
+#   just reclaim apply=1 worktrees=1 连 .worktrees/* 的 target 一起
+reclaim apply="" worktrees="": reclaim-check
+    bash scripts/reclaim-target.sh {{ if apply != "" { "--apply" } else { "" } }} {{ if worktrees != "" { "--include-worktrees" } else { "" } }}
+
+# reclaim-target.sh 的判据自测（假文件驱动，不编译、秒级）。
+# 进 `ci`：该脚本的动作是 rm，判据写宽会删掉活跃编译单元、写窄等于没清理，
+# 两种错误都不报错、只能靠断言发现。
+reclaim-check:
+    bash scripts/test_reclaim_target.sh
