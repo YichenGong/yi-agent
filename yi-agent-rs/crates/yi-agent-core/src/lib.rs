@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod autonomy;
 pub mod compact;
+pub mod image_projection;
 pub mod managed_run;
 pub mod message;
 pub mod permission;
